@@ -6228,6 +6228,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "gpui-kit",
+ "log",
  "serde_json",
  "synaps-client",
 ]
