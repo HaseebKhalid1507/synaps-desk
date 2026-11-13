@@ -162,6 +162,8 @@ impl Bubble {
 
 const TYPE_TICK: Duration = Duration::from_millis(35);
 const HEARTS_MS: u64 = 1_150;
+/// First effect layer of the hearts (the bolt uses 0 and 1): a rim and a fill per heart.
+const HEART_LAYER: usize = 2;
 const FRAME_FAST: Duration = Duration::from_millis(16);
 const FRAME_FX: Duration = Duration::from_millis(33);
 const FRAME_GLINT: Duration = Duration::from_millis(90);
@@ -1534,6 +1536,14 @@ impl Render for Avatar {
                                 }
                             }
                             None => {
+                                // Squashed: the unsquashed frame goes underneath. Outside the
+                                // (squashed) bounding shape it's invisible, but it fills the
+                                // window's backing pixels there, so the band the shape grows
+                                // back into on the rebound shows hair, not stale black.
+                                if plan2.sy < 1.0 || plan2.sx < 1.0 {
+                                    let full = rect(0.0, 0.0, aw as f32, ah as f32);
+                                    window.paint_image(full, full, Corners::default(), img.clone(), 0, false).ok();
+                                }
                                 window.paint_image(ib, ib, Corners::default(), img, 0, false).ok();
                             }
                             Some(bands) => {
@@ -1914,11 +1924,12 @@ impl Render for Avatar {
         let t_start = self.t_start;
         let ground_px = (l.ground_x as i16, (l.ground_y - 1) as i16, 1u16, 1u16);
         let hearts = self.hearts.filter(|_| hud).map(|(t0, at)| (now.saturating_duration_since(t0).as_secs_f32() * 1000.0, at));
+        let worigin = self.origin;
         let tag_clickable = collapsed;
         root.child(
             canvas(
                 |_, _, _| (),
-                move |_, _, window, _| {
+                move |_, _, _, _| {
                     let mut input: Vec<ShapeRect> =
                         if hidden { Vec::new() } else { rects.iter().map(|r| (r.0 + ax, r.1 + ay, r.2, r.3)).collect() };
                     let mut visible: Vec<ShapeRect> = body_shape.iter().map(|r| (r.0 + ax, r.1 + ay, r.2, r.3)).collect();
@@ -1937,14 +1948,33 @@ impl Render for Avatar {
                             input.push(to_device(b, sf));
                         }
                     }
-                    if let Some((t, at)) = hearts {
-                        let (ox, oy) = (f32::from(at.x), f32::from(at.y));
-                        // Rise from the click to clear air above the hair.
-                        let target = (top_l - 22.0).max(16.0);
-                        for (i, (dx, size, delay, colour)) in HEARTS.iter().enumerate() {
+                    // Hearts are solid-colour shaped X windows, like the teleport bolt, not
+                    // pixels in this window. This ARGB window is implicitly redirected (its
+                    // depth differs from the root's), and presents only reach the backing
+                    // pixmap inside the bounding shape. So wherever the shape grows, stale
+                    // pixmap content shows (dark blobs on rising hearts) until the next present
+                    // lands. The server paints a window's background together with its shape.
+                    let heart_win = |layer: usize, rgb: u32, pts: &[(f32, f32)]| {
+                        let root: Vec<(f32, f32)> =
+                            pts.iter().map(|&(x, y)| (x * sf + worigin.0 as f32, y * sf + worigin.1 as f32)).collect();
+                        let x0 = root.iter().map(|p| p.0).fold(f32::MAX, f32::min).floor() as i32;
+                        let y0 = root.iter().map(|p| p.1).fold(f32::MAX, f32::min).floor() as i32;
+                        let x1 = root.iter().map(|p| p.0).fold(f32::MIN, f32::max).ceil() as i32;
+                        let y1 = root.iter().map(|p| p.1).fold(f32::MIN, f32::max).ceil() as i32;
+                        let local: Vec<(f32, f32)> = root.iter().map(|&(x, y)| (x - x0 as f32, y - y0 as f32)).collect();
+                        let mut r = Vec::new();
+                        shape::poly_rows(&local, &mut r);
+                        x11.fx_set(layer, rgb, (x0, y0), (x1 - x0, y1 - y0), &r).ok();
+                    };
+                    // Rise from the click to clear air above the hair.
+                    let target = (top_l - 22.0).max(16.0);
+                    for (i, (dx, size, delay, colour)) in HEARTS.iter().enumerate() {
+                        let (rim, fill) = (HEART_LAYER + 2 * i, HEART_LAYER + 2 * i + 1);
+                        let geom = hearts.and_then(|(t, at)| {
+                            let (ox, oy) = (f32::from(at.x), f32::from(at.y));
                             let p = ((t - delay) / 950.0).clamp(0.0, 1.0);
                             if p <= 0.0 || p >= 1.0 {
-                                continue;
+                                return None;
                             }
                             let ease = 1.0 - (1.0 - p).powi(3);
                             let x = ox + dx * ease;
@@ -1956,21 +1986,20 @@ impl Render for Avatar {
                             } else {
                                 1.0 - (p - 0.72) / 0.28
                             };
-                            if scale < 0.1 {
-                                continue;
+                            (scale >= 0.1).then_some((x, y, size * scale))
+                        });
+                        match geom {
+                            Some((x, y, s)) => {
+                                heart_win(rim, 0xffffff, &shape::heart(x, y, s + 5.0));
+                                heart_win(fill, *colour, &shape::heart(x, y, s));
                             }
-                            let s = size * scale;
-                            let outer = shape::heart(x, y, s + 5.0);
-                            for (pts, c) in [(&outer, 0xffffffu32), (&shape::heart(x, y, s), *colour)] {
-                                let mut pb = PathBuilder::fill();
-                                pb.add_polygon(&pts.iter().map(|&(x, y)| point(px(x), px(y))).collect::<Vec<_>>(), true);
-                                if let Ok(path) = pb.build() {
-                                    window.paint_path(path, rgb(c));
-                                }
+                            None => {
+                                x11.fx_unmap(rim);
+                                x11.fx_unmap(fill);
                             }
-                            shape::poly_rows(&dev(&outer), &mut visible);
                         }
                     }
+                    x11.flush();
                     // Never an empty bounding shape: X then reports the window fully obscured
                     // and GPUI stops drawing it for good.
                     if visible.is_empty() {

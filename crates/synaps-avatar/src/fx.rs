@@ -294,7 +294,9 @@ pub fn squash(age: Duration) -> Option<(f32, f32)> {
         let t = t - 80.0;
         1.0 - 0.07 * (-t / 120.0).exp() * (2.0 * PI * t / 280.0).cos()
     };
-    Some((1.0 + (1.0 - sy) * 0.55, sy))
+    // Never past the rest silhouette (no stretch, no widening): without a compositor the
+    // shape may only grow back into pixels the view has painted (see the body canvas).
+    Some((1.0, sy.min(1.0)))
 }
 
 /// Breathing bob, device px upward: 0..=px on a cosine.

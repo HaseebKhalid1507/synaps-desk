@@ -271,6 +271,13 @@ impl X11 {
     /// Show effect layer `layer` (solid `rgb`) at root `origin` with the bounding shape
     /// `rects` (relative to `origin`). Input passes through. Created on first use.
     pub fn fx_show(&self, layer: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: &[ShapeRect]) -> Result<()> {
+        self.fx_set(layer, rgb, origin, size, rects)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// `fx_show` without the flush, to batch several layers into one write.
+    pub fn fx_set(&self, layer: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: &[ShapeRect]) -> Result<()> {
         let mut fx = self.fx.lock().map_err(|_| anyhow::anyhow!("fx lock"))?;
         while fx.len() <= layer {
             let id = self.conn.generate_id()?;
@@ -302,7 +309,6 @@ impl X11 {
             if mapped {
                 self.conn.unmap_window(id)?;
                 fx[layer].1 = false;
-                self.conn.flush()?;
             }
             return Ok(());
         }
@@ -321,8 +327,22 @@ impl X11 {
             self.conn.map_window(id)?;
             fx[layer].1 = true;
         }
-        self.conn.flush()?;
         Ok(())
+    }
+
+    pub fn flush(&self) {
+        self.conn.flush().ok();
+    }
+
+    /// Unmap one effect layer if it exists and is up.
+    pub fn fx_unmap(&self, layer: usize) {
+        if let Ok(mut fx) = self.fx.lock()
+            && let Some(f) = fx.get_mut(layer)
+            && f.1
+        {
+            self.conn.unmap_window(f.0).ok();
+            f.1 = false;
+        }
     }
 
     pub fn fx_hide(&self) {
