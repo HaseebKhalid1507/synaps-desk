@@ -50,20 +50,48 @@ const WELL_MAX: f32 = 18. * 12.;
 
 /// The prompt the authorization card shows.
 pub(crate) struct PromptCard {
-    /// `(attach_seq, prompt id)`.
+    /// [`Model::card_key`]: `(epoch, prompt id)`.
     pub(crate) key: (u64, u64),
     shown: Instant,
     /// The body, verbatim (blank lines kept).
-    body: SharedString,
+    pub(crate) body: SharedString,
+    /// What the top bar says about it ([`crate::chrome::prompt_gist`]).
+    pub(crate) gist: SharedString,
     scroll: ScrollHandle,
     /// The well was scrolled to its end (or never needed to be).
     read: bool,
     /// Repaints once the arm delay is over.
-    _arm: Task<()>,
+    _arm: Option<Task<()>>,
 }
 
 impl PromptCard {
-    fn armed(&self) -> bool {
+    /// Keep `card` with the prompt on top of `m` ([`Model::card_key`]): the
+    /// same key keeps its arm and read state; a new prompt, the same id in
+    /// another attachment or after a reconnect (a restarted daemon numbers
+    /// its prompts from 1 again) starts over, unarmed and unread, at `now`.
+    /// True when the card is new.
+    pub(crate) fn sync(card: &mut Option<PromptCard>, m: &Model, now: Instant) -> bool {
+        match (m.card_key(), card.as_mut()) {
+            (Some(k), Some(c)) if c.key == k => {
+                if c.below().is_some_and(|b| b <= 1.) {
+                    c.read = true;
+                }
+                false
+            }
+            (Some(k), _) => {
+                let pr = &m.transcript.pending_prompts()[0];
+                let (body, gist) = (well_body(&pr.prompt), crate::chrome::prompt_gist(&pr.title, &pr.prompt).into());
+                *card = Some(PromptCard { key: k, shown: now, body, gist, scroll: ScrollHandle::new(), read: false, _arm: None });
+                true
+            }
+            (None, _) => {
+                *card = None;
+                false
+            }
+        }
+    }
+
+    pub(crate) fn armed(&self) -> bool {
         self.shown.elapsed() >= ARM
     }
 
@@ -115,9 +143,10 @@ pub struct AppView {
     pub(crate) filter: Filter,
     pub picker_open: bool,
     pub(crate) picker_note: Option<SharedString>,
-    /// When a click outside closed the picker: that click must not reopen
-    /// it on its trigger.
-    pub(crate) picker_dismissed: Option<Instant>,
+    /// Where the mouse-down that closed the picker from outside was: the
+    /// click it starts must not reopen it on its trigger, however long it
+    /// is held.
+    pub(crate) picker_dismissed: Option<Point<Pixels>>,
     /// Where the launch accent came from (a flag or env wins over the picker's file).
     pub accent_source: theme::Source,
     /// The authorization card's prompt (see [`PromptCard`]).
@@ -444,11 +473,16 @@ impl AppView {
         self.client.is_some() && self.model.can_send()
     }
 
+    /// The card, if it shows the attached session's first pending prompt.
+    pub(crate) fn current_card(&self) -> Option<&PromptCard> {
+        self.card.as_ref().filter(|c| self.model.card_key() == Some(c.key))
+    }
+
     /// The prompt the card shows, if it is still the attached session's and
     /// armed: what a click or Enter on the card answers.
     fn card_target(&self) -> Option<u64> {
         let c = self.card.as_ref().filter(|c| c.armed())?;
-        (self.model.active.as_ref()?.attach_seq == c.key.0).then_some(c.key.1)
+        (self.model.card_key() == Some(c.key)).then_some(c.key.1)
     }
 
     /// Answer the card's prompt (`Client::answer`), if it is the one shown
@@ -494,28 +528,38 @@ impl AppView {
         cx.notify();
     }
 
-    /// Keep the card's state with the prompt it shows: a new prompt (or the
-    /// same id in another attachment) starts unarmed and unread, and clears
-    /// a half-typed secret meant for the previous one.
+    /// Keep the card's state with the prompt it shows ([`PromptCard::sync`]);
+    /// a new card also clears a half-typed secret meant for the previous one.
     fn sync_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let key = self.model.active.as_ref().zip(self.model.transcript.pending_prompts().first()).map(|(a, p)| (a.attach_seq, p.id));
-        match (key, self.card.as_mut()) {
-            (Some(k), Some(c)) if c.key == k => {
-                if c.below().is_some_and(|b| b <= 1.) {
-                    c.read = true;
-                }
-            }
-            (Some(k), _) => {
-                let body = well_body(&self.model.transcript.pending_prompts()[0].prompt);
-                let arm = cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(ARM).await;
-                    let _ = this.update(cx, |_, cx| cx.notify());
-                });
-                self.card = Some(PromptCard { key: k, shown: Instant::now(), body, scroll: ScrollHandle::new(), read: false, _arm: arm });
-                self.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
-            }
-            (None, _) => self.card = None,
+        if PromptCard::sync(&mut self.card, &self.model, Instant::now())
+            && let Some(c) = self.card.as_mut()
+        {
+            c._arm = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(ARM).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            }));
+            self.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
         }
+    }
+
+    /// Open the picker with the focus on this view, so Esc reaches the
+    /// root's key listener even if the focused input has since gone
+    /// (a card answered, a name bar closed): GPUI dispatches a vanished
+    /// focus at the window's root, above this view.
+    pub(crate) fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker_open = true;
+        self.picker_note = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Close the picker; focus in its hex field moves back to this view.
+    pub(crate) fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker_open = false;
+        if self.hex_input.read(cx).focus_handle(cx).is_focused(window) {
+            window.focus(&self.focus, cx);
+        }
+        cx.notify();
     }
 
     pub(crate) fn set_accent(&mut self, hex: u32, cx: &mut Context<Self>) {
@@ -732,8 +776,9 @@ impl AppView {
         let cwd = self.model.stats.cwd.as_deref().or(self.model.active_meta().and_then(|s| s.cwd.as_deref())).map(home_short);
         let busy = self.model.transcript.busy() && self.drives();
         let detached = self.model.active.is_none() && self.model.stats.detached;
-        // The display face is Latin only: other scripts read better in the text face.
-        let face = if title.chars().all(|c| (c as u32) < 0x250) { fonts::DISPLAY } else { fonts::SANS };
+        // The display face stops at Latin-1 (U+00FF): Polish, Czech or Turkish
+        // titles, and other scripts, are set whole in the text face.
+        let face = if title.chars().all(fonts::display_covers) { fonts::DISPLAY } else { fonts::SANS };
         let actions = h_flex()
             .flex_none()
             .gap(px(22.))
@@ -843,7 +888,7 @@ impl AppView {
         let prompts = self.model.transcript.pending_prompts();
         let pr = prompts.first()?;
         let secret = pr.is_secret();
-        let card = self.card.as_ref().filter(|c| c.key.1 == pr.id);
+        let card = self.current_card();
         let key = card.map(|c| c.key);
         let sent = self.model.prompt_answered(pr.id);
         let armed = card.is_some_and(|c| c.armed());
@@ -1183,11 +1228,10 @@ impl Render for AppView {
             .id("root")
             .track_focus(&self.focus)
             // Esc closes the picker, wherever the focus is.
-            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if this.picker_open && ev.keystroke.key == "escape" {
-                    this.picker_open = false;
+                    this.close_picker(window, cx);
                     cx.stop_propagation();
-                    cx.notify();
                 }
             }))
             .relative()

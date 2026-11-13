@@ -52,6 +52,9 @@ pub mod neutral {
     pub const SEG: u32 = 0x151518;
 }
 
+/// The OKLCH lightness a lift must add before the picker calls the accent
+/// too dark (~2 % is about the smallest step the eye picks out).
+pub const LIFT_NOTICE: f64 = 0.02;
 /// Minimum WCAG contrast of accent used as text (`hi`, `soft`).
 pub const TEXT_CONTRAST: f64 = 4.5;
 /// Minimum WCAG contrast of accent fills (dots, bars, gauge segments), on
@@ -215,7 +218,9 @@ pub struct Derived {
     pub bg: u32,
     /// Low-chroma accent text (deleted diff lines), ≥ [`TEXT_CONTRAST`].
     pub soft: u32,
-    /// `accent` had to be lifted to stay visible.
+    /// `accent` had to be lifted visibly (by more than [`LIFT_NOTICE`]) to
+    /// stay visible: the picker says so. A vivid colour floored by a hair
+    /// on the card is not "too dark".
     pub lifted: bool,
 }
 
@@ -233,7 +238,7 @@ impl Derived {
             mid: floor_contrast(Lch { l: base.l * 0.72, c: base.c * 0.78, ..base }, BORDER_CONTRAST, &fill_bgs),
             bg,
             soft: floor_contrast(Lch { l: base.l.max(0.70), c: base.c * 0.42, ..base }, TEXT_CONTRAST, &text_bgs),
-            lifted: fill != accent & 0xff_ffff,
+            lifted: to_oklch(fill).l - base.l > LIFT_NOTICE,
         }
     }
 }
@@ -495,7 +500,8 @@ pub fn load_accent(path: &Path) -> Option<String> {
 /// Save the accent, keeping the file's other keys. A file that is not a
 /// JSON object is kept as `settings.json.bad` (hand edits are not lost),
 /// then replaced. Written to a temporary file of this process (two windows
-/// never share one), flushed to disk, then renamed over the old one; the
+/// never share one), flushed to disk, then renamed over the old one (and,
+/// on Unix, the directory synced so the rename survives a crash); the
 /// temporary file never outlives a failure.
 pub fn save_accent(path: &Path, hex: u32) -> std::io::Result<()> {
     use std::io::Write;
@@ -519,6 +525,13 @@ pub fn save_accent(path: &Path, hex: u32) -> std::io::Result<()> {
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
+    }
+    #[cfg(unix)]
+    if written.is_ok()
+        && let Some(dir) = path.parent()
+    {
+        // Best effort: the file itself is already complete.
+        let _ = std::fs::File::open(if dir.as_os_str().is_empty() { Path::new(".") } else { dir }).and_then(|d| d.sync_all());
     }
     written
 }
@@ -621,6 +634,12 @@ mod tests {
             let d = Derived::of(c);
             assert!(!d.lifted, "{c:06x}");
             assert_eq!(d.accent, c);
+        }
+        // N6: vivid colours floored by a hair on the card are not "too dark".
+        for c in [0x2941f3, 0xb60c4b] {
+            let d = check_floors(c);
+            assert_ne!(d.accent, c, "floored on the card");
+            assert!(!d.lifted, "{c:06x} -> {:06x}", d.accent);
         }
         // A lifted navy keeps its hue: still blue.
         let d = Derived::of(0x0a1a40);
