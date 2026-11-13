@@ -1,6 +1,7 @@
-//! synaps-avatar: a desktop companion overlay. Phase 1 is the body: a transparent,
-//! click-through, always-on-top window that animates a character pack and takes dev
-//! commands on a Unix socket in place of the Synaps session it will attach to later.
+//! synaps-avatar: a desktop companion overlay. A transparent, click-through,
+//! always-on-top window animates a character pack; one Synaps daemon session drives it
+//! (moods from turn events, the reply in the bubble, a text field that submits to the
+//! session). A dev control socket takes commands for testing and overrides.
 
 mod anim;
 mod control;
@@ -30,9 +31,27 @@ struct Args {
     name: Option<String>,
     threads: usize,
     check: bool,
+    /// Daemon profile (`None`: `$SYNAPS_PROFILE`, else the default daemon).
+    profile: Option<String>,
+    target: session::Target,
+    cwd: Option<PathBuf>,
+    model: Option<String>,
+    no_session: bool,
+    sleepy_after: std::time::Duration,
 }
 
-const USAGE: &str = "usage: synaps-avatar [--pack DIR] [--height PX] [--name NAME] [--threads N] [--no-verify] [--focus-probe] [--check]
+const USAGE: &str = "usage: synaps-avatar [--profile P] [--session NAME|ID | --new [--cwd DIR] [--model M]] [--no-session]
+                     [--sleepy-after MIN] [--pack DIR] [--height PX] [--name NAME] [--threads N] [--no-verify]
+                     [--focus-probe] [--check]
+
+Session (one Synaps daemon session drives the body):
+  --profile P     daemon profile (default $SYNAPS_PROFILE, else the default daemon)
+  --session S     attach to this live session (name or id)
+  --new           create a new session (--cwd: its working directory, absolute;
+                  --model: its model); afterwards follow it
+                  with neither: attach to the session named `avatar`, or create it
+  --no-session    the body alone (dev control only)
+  --sleepy-after MIN   sleepy after this many minutes without a turn (default 10)
 
   --pack DIR      character pack (default $XDG_DATA_HOME/synaps-avatar/packs/capri)
   --height PX     standing body height in logical pixels (default 340)
@@ -46,7 +65,8 @@ Dev control: newline commands on $XDG_RUNTIME_DIR/synaps-avatar.sock
   mood <idle|thinking|working|talking|needs_you|done|annoyed|sleepy|away>
   clip <clip, action or frame id>   say <text>   page next|prev   collapse   expand
   pos <x> <y> [now]   perch [sit|stand] [window id]   perch off
-  glitch   state   hide   quit";
+  music on|off   glitch   state   hide   quit
+  submit <text>   abort   prompt confirm|secret [text]   (session / dev)";
 
 fn parse_args() -> Result<Args> {
     let data = std::env::var_os("XDG_DATA_HOME")
@@ -62,7 +82,14 @@ fn parse_args() -> Result<Args> {
         name: None,
         threads: (cores / 2).clamp(1, 8),
         check: false,
+        profile: None,
+        target: session::Target::Default,
+        cwd: None,
+        model: None,
+        no_session: false,
+        sleepy_after: std::time::Duration::from_secs(600),
     };
+    let (mut session, mut new) = (None, false);
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut val = |what: &str| it.next().with_context(|| format!("{arg} needs {what}"));
@@ -74,6 +101,19 @@ fn parse_args() -> Result<Args> {
             "--no-verify" => a.verify = false,
             "--focus-probe" => a.focus_probe = true,
             "--check" => a.check = true,
+            "--profile" => a.profile = Some(val("a profile name")?),
+            "--session" => session = Some(val("a session name or id")?),
+            "--new" => new = true,
+            "--cwd" => a.cwd = Some(PathBuf::from(val("a directory")?)),
+            "--model" => a.model = Some(val("a model")?),
+            "--no-session" => a.no_session = true,
+            "--sleepy-after" => {
+                let m: f64 = val("minutes")?.parse().context("--sleepy-after: not a number")?;
+                if !(m > 0.0 && m < 1e6) {
+                    bail!("--sleepy-after must be a positive number of minutes");
+                }
+                a.sleepy_after = std::time::Duration::from_secs_f64(m * 60.0);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -83,6 +123,20 @@ fn parse_args() -> Result<Args> {
     }
     if !(120.0..=1200.0).contains(&a.height) {
         bail!("--height {} is out of range (120..1200)", a.height);
+    }
+    a.target = match (session, new) {
+        (Some(_), true) => bail!("--session and --new exclude each other"),
+        (Some(s), false) => {
+            if a.cwd.is_some() || a.model.is_some() {
+                bail!("--cwd and --model apply to a session the avatar creates, not to --session");
+            }
+            session::Target::Session(s)
+        }
+        (None, true) => session::Target::New,
+        (None, false) => session::Target::Default,
+    };
+    if a.cwd.as_ref().is_some_and(|c| !c.is_absolute()) {
+        bail!("--cwd must be an absolute path (it is resolved on the daemon's machine)");
     }
     Ok(a)
 }
@@ -289,7 +343,7 @@ fn run(t_start: Instant) -> Result<()> {
                 x11.composited()
             );
             let init = view::Init { pack: pack2.clone(), layout, x11, name, origin, t_start, focus_probe: args.focus_probe };
-            let view = cx.new(|cx| view::Avatar::new(init, cx));
+            let view = cx.new(|cx| view::Avatar::new(init, window, cx));
             built = Some(view.clone());
             view
         });
@@ -345,6 +399,10 @@ fn run(t_start: Instant) -> Result<()> {
         })
         .detach();
 
+        if !args.no_session {
+            connect_session(&args, &view, cx);
+        }
+
         control::serve(listener, tx);
         cx.spawn(async move |cx| {
             while let Ok((cmd, reply)) = rx.recv().await {
@@ -355,6 +413,60 @@ fn run(t_start: Instant) -> Result<()> {
         .detach();
     });
     Ok(())
+}
+
+/// Start the session client and pump its events into the view. The pump drains the
+/// channel whether or not the window draws (lynx's H4: a hidden overlay that only
+/// applied events in render would let the queue grow without bound).
+fn connect_session(args: &Args, view: &Entity<view::Avatar>, cx: &mut App) {
+    let identity = match synaps_client::Identity::new("avatar") {
+        Ok(i) => i,
+        Err(e) => fatal(anyhow::anyhow!("identity: {e}")),
+    };
+    let (client, rx) = match synaps_client::Client::connect(args.profile.as_deref(), identity) {
+        Ok(c) => c,
+        Err(e) => fatal(anyhow::anyhow!("cannot start the session client: {e}")),
+    };
+    eprintln!(
+        "synaps-avatar: session: profile {}, target {:?}",
+        args.profile.clone().or_else(|| std::env::var("SYNAPS_PROFILE").ok()).unwrap_or_else(|| "default".into()),
+        args.target
+    );
+    let opts = session::Options { target: args.target.clone(), cwd: args.cwd.clone(), model: args.model.clone(), sleepy_after: args.sleepy_after };
+    let link = session::Link::new(opts, Instant::now());
+    view.update(cx, |v, cx| v.connect_session(client, link, cx));
+    let view = view.downgrade();
+    cx.spawn(async move |cx| {
+        while let Ok(first) = rx.recv().await {
+            let mut batch = Vec::with_capacity(rx.len() + 1);
+            batch.push(first);
+            while batch.len() < 1024
+                && let Ok(e) = rx.try_recv()
+            {
+                batch.push(e);
+            }
+            if view.update(cx, |v, cx| v.session_events(batch, cx)).is_err() {
+                return;
+            }
+            YieldNow(false).await;
+        }
+        view.update(cx, |v, cx| v.session_closed(cx)).ok();
+    })
+    .detach();
+}
+
+/// Pending once, so a frame can run between two event batches.
+struct YieldNow(bool);
+
+impl std::future::Future for YieldNow {
+    type Output = ();
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if std::mem::replace(&mut self.0, true) {
+            return std::task::Poll::Ready(());
+        }
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
 }
 
 /// Run `f` on a plain thread and await its result. GPUI's background executor can be

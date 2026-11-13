@@ -211,6 +211,13 @@ impl X11 {
         Ok(())
     }
 
+    /// Hand the keyboard to `w` (back to the window that had it).
+    pub fn give_focus(&self, w: u32) -> Result<()> {
+        self.conn.set_input_focus(xproto::InputFocus::PARENT, w, x11rb::CURRENT_TIME)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
     pub fn focused_window(&self) -> Result<u32> {
         Ok(self.conn.get_input_focus()?.reply()?.focus)
     }

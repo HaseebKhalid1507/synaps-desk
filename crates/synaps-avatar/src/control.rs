@@ -36,6 +36,12 @@ pub enum Command {
     Collapse(bool),
     /// Internal: from the X watcher thread.
     Watch(crate::platform::x11::WatchEvent),
+    /// Send text to the session, as if typed (submit, or steer while a turn runs).
+    Submit(String),
+    /// Abort the running turn.
+    Abort,
+    /// Dev: show a prompt panel (confirm or secret) that answers nowhere.
+    FakePrompt { secret: bool, text: String },
 }
 
 impl Command {
@@ -90,11 +96,22 @@ impl Command {
                 "off" => Command::Music(false),
                 _ => bail!("usage: music on|off"),
             },
+            "submit" if !rest.is_empty() => Command::Submit(rest.to_owned()),
+            "abort" => Command::Abort,
+            "prompt" => {
+                let (kind, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                let text = if text.trim().is_empty() { "Allow the bash tool to run `ls ~`?".to_string() } else { text.trim().to_string() };
+                match kind {
+                    "confirm" => Command::FakePrompt { secret: false, text },
+                    "secret" => Command::FakePrompt { secret: true, text },
+                    _ => bail!("usage: prompt confirm|secret [text]"),
+                }
+            }
             "state" => Command::State,
             "hide" => Command::Hide,
             "quit" => Command::Quit,
             _ => bail!(
-                "unknown command `{line}` (mood <name> | clip <id> | say <text> | pos <x> <y> [now] | perch [sit|stand] [win] | perch off | page next|prev | collapse | expand | music on|off | glitch | state | hide | quit)"
+                "unknown command `{line}` (mood <name> | clip <id> | say <text> | pos <x> <y> [now] | perch [sit|stand] [win] | perch off | page next|prev | collapse | expand | music on|off | glitch | submit <text> | abort | prompt confirm|secret [text] | state | hide | quit)"
             ),
         })
     }

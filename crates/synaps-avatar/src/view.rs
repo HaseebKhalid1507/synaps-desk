@@ -9,6 +9,7 @@ use crate::frames::{Frame, Geometry, NoteMasks};
 use crate::fx::{self, BodyPlan, Bolt, Glint, Glitch, GlitchKind};
 use crate::pack::{MoodSpec, MusicSpec, Pack, PerchSpec, Steps};
 use crate::platform::x11::{WatchEvent, WinRect, X11};
+use crate::session::{Act, Body, Link, Once, PromptView};
 use crate::shape::{self, ShapeRect};
 use crate::state;
 use crate::ticker::Ticker;
@@ -18,6 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use synaps_client::{AttachMode, Client};
 
 /// Window layout in device pixels (X11 works in these; GPUI gets them / scale factor).
 #[derive(Clone, Copy, Debug)]
@@ -138,7 +140,55 @@ struct Bubble {
     /// Page picked with ‹ ›; None follows the newest text.
     page: Option<usize>,
     collapsed: bool,
+    /// A session reply: it collapses to the chip instead of vanishing, and the mood is the
+    /// session's business.
+    stream: bool,
+    /// The turn still runs: more text may come.
+    more: bool,
 }
+
+/// How long a typed-out bubble stays open.
+fn hold_for(chars: usize) -> Duration {
+    Duration::from_millis((3_000 + 45 * chars.min(240) as u64).min(12_000))
+}
+
+/// The attached Synaps session.
+pub struct SessionLink {
+    pub client: Client,
+    pub link: Link,
+    /// The body as last applied.
+    shown: Option<Body>,
+    /// Shutting down: Detach + Bye are on their way.
+    closing: bool,
+}
+
+/// The text field in the bubble.
+struct InputBox {
+    text: String,
+    /// The window that had the keyboard (`_NET_ACTIVE_WINDOW`): it gets it back.
+    prev: Option<u32>,
+    /// Escape pressed once while a turn runs: a second one within a second aborts.
+    esc_at: Option<Instant>,
+    /// Answering this secret prompt (masked) instead of sending a message.
+    secret: Option<u64>,
+}
+
+struct PromptUi {
+    view: PromptView,
+    shown_at: Instant,
+    /// Escape or the chevron: hidden behind the chip, still pending.
+    dismissed: bool,
+    /// From the dev `prompt` command: answers go nowhere.
+    fake: bool,
+}
+
+/// Buttons of a prompt ignore clicks this long after it shows (a click meant for
+/// something else must not answer it).
+const PROMPT_ARM: Duration = Duration::from_millis(400);
+/// Escape twice within this, while a turn runs, aborts it. One Escape closes the field
+/// when it runs out.
+const ESC_AGAIN: Duration = Duration::from_millis(1_000);
+const INPUT_MAX: usize = 4_000;
 
 impl Bubble {
     /// (current page, page count). Before wrapping: (0, 1).
@@ -305,6 +355,18 @@ pub struct Avatar {
     glints_shown: usize,
     /// Breath/sway/nod as last drawn.
     pose_last: fx::Pose,
+    session: Option<SessionLink>,
+    input: Option<InputBox>,
+    /// Text typed but not sent (closed field, refused input).
+    draft: String,
+    prompt_ui: Option<PromptUi>,
+    /// The user's line of the running turn.
+    echo: Option<String>,
+    /// Status label for one mood (`WORKING · bash`).
+    label_override: Option<(Mood, String)>,
+    /// A short note in the input footer, until then.
+    hint: Option<(String, Instant)>,
+    _subs: Vec<Subscription>,
 }
 
 pub struct Init {
@@ -323,7 +385,7 @@ fn jitter(rng: &mut Rng, ms: u64) -> Duration {
 }
 
 impl Avatar {
-    pub fn new(init: Init, cx: &mut Context<Self>) -> Avatar {
+    pub fn new(init: Init, window: &mut Window, cx: &mut Context<Self>) -> Avatar {
         let pack = init.pack;
         let default = pack.frame(&pack.catalog.default_sprite).unwrap_or(0);
         let font = pack.behaviour.font.clone().unwrap_or_else(|| "Fira Sans".into());
@@ -334,6 +396,15 @@ impl Avatar {
                 if this.update(cx, |v, cx| v.tick(cx)).is_err() {
                     break;
                 }
+            }
+        });
+        // Keyboard focus went elsewhere (a click on another window): close the field,
+        // keep the text.
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() && this.input.is_some() {
+                this.close_input(false);
+                cx.notify();
+                this.schedule(cx);
             }
         });
         let l = init.layout;
@@ -394,6 +465,14 @@ impl Avatar {
             notes_shown: 0,
             glints_shown: 0,
             pose_last: fx::Pose::default(),
+            session: None,
+            input: None,
+            draft: String::new(),
+            prompt_ui: None,
+            echo: None,
+            label_override: None,
+            hint: None,
+            _subs: vec![activation],
         }
     }
 
@@ -646,6 +725,11 @@ impl Avatar {
             self.set_mood(Mood::Idle, now);
             self.next_glint = Some(now + Duration::from_millis(700));
             self.bob_t0 = now;
+            // Moods held back until the frames were in.
+            if let Some(s) = &mut self.session {
+                s.shown = None;
+            }
+            self.sync_body(now);
         }
         cx.notify();
         self.schedule(cx);
@@ -786,7 +870,13 @@ impl Avatar {
                 glyph: spec.glyph.clone().unwrap_or_else(|| "note".into()),
             };
         }
-        self.status_of(self.mood)
+        let mut s = self.status_of(self.mood);
+        if let Some((m, l)) = &self.label_override
+            && *m == self.mood
+        {
+            s.label = l.clone();
+        }
+        s
     }
 
     // ---- perch shadow ---------------------------------------------------------------
@@ -914,6 +1004,12 @@ impl Avatar {
         }
         take(self.reaction_until);
         take(self.menu.map(|m| m.1));
+        if let Some(s) = &self.session {
+            take(s.link.deadline(now));
+        }
+        take(self.hint.as_ref().map(|h| h.1));
+        take(self.input.as_ref().and_then(|i| i.esc_at).map(|t| t + ESC_AGAIN));
+        take(self.prompt_ui.as_ref().map(|p| p.shown_at + PROMPT_ARM).filter(|&t| t > now));
         if self.glitch.is_some() {
             // As often as GPUI presents, so every presented frame has a new pattern.
             take(Some(now + FRAME_FAST));
@@ -982,17 +1078,22 @@ impl Avatar {
             dirty = true;
         }
         let mut typed_out = false;
+        let mut stream = false;
         if let Some(b) = &mut self.bubble {
+            stream = b.stream;
             if let Some(at) = b.next_char
                 && at <= now
             {
-                b.shown = (b.shown + b.per_tick).min(b.text.len());
+                // A stream keeps pace with the text as it arrives.
+                let step = if b.stream { ((b.text.len() - b.shown) / 6).max(b.per_tick) } else { b.per_tick };
+                b.shown = (b.shown + step).min(b.text.len());
                 dirty = true;
                 if b.shown == b.text.len() {
                     b.next_char = None;
                     typed_out = true;
-                    let hold = (3_000 + 45 * b.text.len().min(240) as u64).min(12_000);
-                    b.hide_at = Some(now + Duration::from_millis(hold));
+                    if !b.more {
+                        b.hide_at = Some(now + hold_for(b.text.len()));
+                    }
                 } else {
                     b.next_char = Some(now + TYPE_TICK);
                 }
@@ -1000,12 +1101,18 @@ impl Avatar {
             if let Some(at) = b.hide_at
                 && at <= now
             {
-                self.bubble = None;
+                if b.stream {
+                    // The last reply stays behind the chip.
+                    b.collapsed = true;
+                    b.hide_at = None;
+                } else {
+                    self.bubble = None;
+                }
                 dirty = true;
             }
         }
         // Keep SPEAKING up a beat after the last word, then settle.
-        if typed_out && self.mood == Mood::Talking {
+        if typed_out && !stream && self.mood == Mood::Talking {
             self.mood_then = Some((now + Duration::from_millis(1_400), Mood::Idle));
         }
         if let Some((t0, _)) = self.hearts {
@@ -1025,6 +1132,24 @@ impl Avatar {
         {
             self.menu = None;
             dirty = true;
+        }
+        if self.hint.as_ref().is_some_and(|h| h.1 <= now) {
+            self.hint = None;
+            dirty = true;
+        }
+        // One Escape during a turn: the field closes when the second didn't come.
+        if self.input.as_ref().and_then(|i| i.esc_at).is_some_and(|t| t + ESC_AGAIN <= now) {
+            self.close_input(true);
+            dirty = true;
+        }
+        if self.prompt_ui.as_ref().is_some_and(|p| p.shown_at + PROMPT_ARM <= now && p.shown_at + PROMPT_ARM + FRAME_FAST > now) {
+            dirty = true;
+        }
+        if let Some(acts) = self.session.as_mut().map(|s| s.link.tick(now)) {
+            self.run_acts(acts);
+            let before = self.mood;
+            self.sync_body(now);
+            dirty |= self.mood != before;
         }
 
         // Effects.
@@ -1318,6 +1443,23 @@ impl Avatar {
                 self.watch(ev, now);
                 "ok".into()
             }
+            Command::Submit(text) => match self.send(text) {
+                Ok(()) => "ok".into(),
+                Err(e) => format!("error: {e}"),
+            },
+            Command::Abort => match &self.session {
+                Some(s) => {
+                    s.client.abort().ok();
+                    "ok".into()
+                }
+                None => "error: no session".into(),
+            },
+            Command::FakePrompt { secret, text } => {
+                let view = PromptView { id: 0, title: if secret { "password required".into() } else { "Confirm tool call".into() }, text, secret };
+                self.prompt_ui = Some(PromptUi { view, shown_at: now, dismissed: false, fake: true });
+                self.set_mood(Mood::NeedsYou, now);
+                "ok".into()
+            }
         };
         if let Some(t) = self.next_activity
             && t < now + Duration::from_secs(4)
@@ -1342,6 +1484,8 @@ impl Avatar {
             wrap: None,
             page: None,
             collapsed: false,
+            stream: false,
+            more: false,
         });
         if self.mood != Mood::Talking {
             self.set_mood(Mood::Talking, now);
@@ -1370,6 +1514,38 @@ impl Avatar {
     }
 
     fn quit(&mut self, cx: &mut Context<Self>) {
+        // Detach + Bye first, so the daemon drops us from the roster now; the pump ends
+        // when the connection thread stops (or give it 800 ms).
+        if let Some(s) = &mut self.session {
+            if s.closing {
+                return;
+            }
+            s.closing = true;
+            if s.client.shutdown().is_ok() {
+                let (tx, rx) = async_channel::bounded::<()>(1);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(800));
+                    tx.send_blocking(()).ok();
+                });
+                cx.spawn(async move |this, cx| {
+                    rx.recv().await.ok();
+                    this.update(cx, |v, cx| v.finish_quit(cx)).ok();
+                })
+                .detach();
+                return;
+            }
+        }
+        self.finish_quit(cx);
+    }
+
+    /// The session's connection thread stopped.
+    pub fn session_closed(&mut self, cx: &mut Context<Self>) {
+        if self.session.as_ref().is_some_and(|s| s.closing) {
+            self.finish_quit(cx);
+        }
+    }
+
+    fn finish_quit(&mut self, cx: &mut Context<Self>) {
         if self.placement == Placement::Ground && self.teleport.is_none() {
             state::save(self.ground());
         }
@@ -1410,8 +1586,297 @@ impl Avatar {
             "scale_factor": self.layout.sf,
             "focus_probe": self.focus_probe,
             "music": self.music.is_some(),
+            "session": self.session.as_ref().map(|s| {
+                let b = s.link.body(Instant::now());
+                serde_json::json!({ "live": b.live, "busy": b.busy, "mood": b.mood.key(), "label": b.label, "reply": b.reply,
+                                    "echo": b.echo, "prompt": b.prompt.map(|p| p.title) })
+            }),
+            "input": self.input.as_ref().map(|i| serde_json::json!({ "len": i.text.chars().count(), "secret": i.secret.is_some(),
+                                                                       "prev": i.prev, "esc": i.esc_at.is_some() })),
+            "draft": self.draft.chars().count(),
+            "prompt_ui": self.prompt_ui.as_ref().map(|p| serde_json::json!({ "title": p.view.title, "dismissed": p.dismissed })),
         })
         .to_string()
+    }
+
+
+    // ---- session ---------------------------------------------------------------------
+
+    pub fn connect_session(&mut self, client: Client, link: Link, cx: &mut Context<Self>) {
+        self.session = Some(SessionLink { client, link, shown: None, closing: false });
+        self.sync_body(Instant::now());
+        cx.notify();
+        self.schedule(cx);
+    }
+
+    /// A batch of daemon events (the pump drains the channel whether or not we draw).
+    pub fn session_events(&mut self, batch: Vec<synaps_client::Event>, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let Some(s) = &mut self.session else { return };
+        let mut acts = Vec::new();
+        for ev in batch {
+            acts.extend(s.link.on_event(ev, now));
+        }
+        self.run_acts(acts);
+        self.sync_body(now);
+        cx.notify();
+        self.schedule(cx);
+    }
+
+    fn run_acts(&mut self, acts: Vec<Act>) {
+        let Some(s) = &mut self.session else { return };
+        for a in acts {
+            let r = match a {
+                Act::Attach(id) => s.client.attach(id, AttachMode::Mirror).map(|seq| s.link.attaching(seq)),
+                Act::Create(o) => s.client.create(o).map(|seq| s.link.attaching(seq)),
+                Act::Resume(name, o) => s.client.resume(name, o).map(|seq| s.link.attaching(seq)),
+                Act::List => s.client.list_sessions(),
+                Act::Resync => s.client.resync(),
+            };
+            if let Err(e) = r {
+                eprintln!("synaps-avatar: {e}");
+            }
+        }
+    }
+
+    /// Bring the body in line with the session: a mood only when the session's changes (so
+    /// an entry clip or glitch plays once per real change), the reply into the bubble, the
+    /// pending prompt into its panel.
+    fn sync_body(&mut self, now: Instant) {
+        let Some(s) = &mut self.session else { return };
+        if s.closing {
+            return;
+        }
+        let b = s.link.body(now);
+        let once = s.link.take_once();
+        let prev = s.shown.replace(b.clone());
+        for o in once {
+            match o {
+                Once::Appear => {
+                    if self.loaded {
+                        self.glitch = Some(Glitch::new(GlitchKind::Appear, now, self.rng.next()));
+                    }
+                }
+                Once::Restore(t) => {
+                    eprintln!("synaps-avatar: input not accepted; kept as a draft");
+                    match &mut self.input {
+                        Some(i) if i.secret.is_none() && i.text.is_empty() => i.text = t,
+                        _ => self.draft = t,
+                    }
+                    self.hint = Some(("NOT SENT · TEXT KEPT".into(), now + Duration::from_secs(4)));
+                }
+            }
+        }
+        if self.loaded && prev.as_ref().map(|p| p.mood) != Some(b.mood) {
+            self.set_mood(b.mood, now);
+        }
+        self.label_override = b.label.clone().map(|l| (b.mood, l));
+        self.echo = b.echo.clone();
+        if prev.as_ref().map(|p| &p.prompt) != Some(&b.prompt) {
+            match (&mut self.prompt_ui, &b.prompt) {
+                (Some(u), Some(p)) if u.view.id == p.id && !u.fake => u.view = p.clone(),
+                _ => {
+                    if self.input.as_ref().is_some_and(|i| i.secret.is_some() && i.secret != b.prompt.as_ref().map(|p| p.id)) {
+                        self.close_input(true);
+                    }
+                    self.prompt_ui = b.prompt.clone().map(|view| PromptUi { view, shown_at: now, dismissed: false, fake: false });
+                }
+            }
+        }
+        let new_turn = prev.as_ref().map(|p| p.turn) != Some(b.turn);
+        if new_turn || prev.as_ref().is_some_and(|p| p.reply != b.reply || p.busy != b.busy) {
+            self.stream_reply(&b, new_turn, now);
+        }
+    }
+
+    /// The session's reply into the bubble: a new turn opens a new one (an old reply, on
+    /// attach, goes straight behind the chip); growing text types on from what is shown.
+    fn stream_reply(&mut self, b: &Body, new_turn: bool, now: Instant) {
+        if new_turn {
+            if b.reply.is_empty() && !b.busy {
+                self.bubble = self.bubble.take().filter(|x| !x.stream);
+                return;
+            }
+            self.bubble = Some(Bubble {
+                text: Vec::new(),
+                shown: 0,
+                per_tick: 2,
+                next_char: None,
+                hide_at: None,
+                wrap: None,
+                page: None,
+                collapsed: !b.busy,
+                stream: true,
+                more: b.busy,
+            });
+        }
+        let annoyed = b.mood == Mood::Annoyed;
+        let Some(bb) = self.bubble.as_mut().filter(|x| x.stream) else { return };
+        let text: Vec<char> = b.reply.chars().collect();
+        let same = bb.text.iter().zip(&text).take_while(|(a, c)| a == c).count();
+        if same != bb.text.len() || text.len() != bb.text.len() {
+            bb.wrap = None;
+        }
+        bb.shown = if new_turn && !b.busy { text.len() } else { bb.shown.min(same) };
+        bb.text = text;
+        bb.more = b.busy;
+        if annoyed && !b.busy {
+            // The reason (aborted, error) must be seen.
+            bb.collapsed = false;
+        }
+        if bb.shown < bb.text.len() {
+            bb.next_char = Some(bb.next_char.unwrap_or(now));
+            bb.hide_at = None;
+        } else if b.busy {
+            bb.hide_at = None;
+        } else if bb.hide_at.is_none() && !bb.collapsed {
+            bb.hide_at = Some(now + hold_for(bb.text.len()));
+        }
+    }
+
+    // ---- input -----------------------------------------------------------------------
+
+    /// Open the text field (or a masked one for a secret prompt) and take the keyboard.
+    fn open_input(&mut self, secret: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.input.as_ref().is_some_and(|i| i.secret != secret) {
+            self.close_input(false);
+        }
+        if self.input.is_none() {
+            let ours = self.x11.win;
+            let prev = self.x11.active_window().or_else(|| self.x11.focused_window().ok()).filter(|&w| w > 1 && w != ours);
+            let text = if secret.is_some() { String::new() } else { std::mem::take(&mut self.draft) };
+            self.input = Some(InputBox { text, prev, esc_at: None, secret });
+        }
+        if let Err(e) = self.x11.take_focus() {
+            eprintln!("synaps-avatar: cannot take the keyboard: {e:#}");
+        }
+        window.focus(&self.focus, cx);
+        cx.notify();
+        self.schedule(cx);
+    }
+
+    /// Close the field. Its text stays as the draft (never a secret's). `restore`: give
+    /// the keyboard back to the window that had it.
+    fn close_input(&mut self, restore: bool) {
+        let Some(i) = self.input.take() else { return };
+        if i.secret.is_none() {
+            self.draft = i.text;
+        }
+        if restore && let Some(w) = i.prev {
+            self.x11.give_focus(w).ok();
+        }
+    }
+
+    /// Send a message (submit, or steer while a turn runs).
+    fn send(&mut self, text: String) -> Result<(), String> {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Err("empty".into());
+        }
+        let Some(s) = &mut self.session else { return Err("no session (--no-session)".into()) };
+        if !s.link.live() {
+            return Err("not attached to a session".into());
+        }
+        let r = if s.link.busy() { s.client.steer(text.clone()) } else { s.client.submit(text.clone()) };
+        r.map_err(|e| e.to_string())?;
+        s.link.submitted(text);
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        if let Some(s) = &self.session {
+            s.client.abort().ok();
+        }
+    }
+
+    fn answer(&mut self, value: Option<String>) {
+        let Some(u) = self.prompt_ui.take() else { return };
+        if !u.fake
+            && let Some(s) = &self.session
+        {
+            s.client.answer(u.view.id, value).ok();
+        } else {
+            // A dev prompt: back to the session's mood (or idle).
+            let m = self.session.as_ref().and_then(|s| s.shown.as_ref()).map_or(Mood::Idle, |b| b.mood);
+            self.set_mood(m, Instant::now());
+        }
+    }
+
+    fn input_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let busy = self.session.as_ref().is_some_and(|s| s.link.busy());
+        let k = &ev.keystroke;
+        let ctrl = k.modifiers.control || k.modifiers.platform;
+        let Some(i) = &mut self.input else { return };
+        if k.key != "escape" {
+            i.esc_at = None;
+        }
+        match k.key.as_str() {
+            "escape" => {
+                if i.secret.is_some() {
+                    // No answer: it stays pending behind the chip.
+                    if let Some(u) = &mut self.prompt_ui {
+                        u.dismissed = true;
+                    }
+                    self.close_input(true);
+                } else if busy && i.esc_at.is_some() {
+                    self.abort();
+                    self.close_input(true);
+                } else if busy {
+                    i.esc_at = Some(now);
+                } else {
+                    self.close_input(true);
+                }
+            }
+            "enter" if !k.modifiers.shift => {
+                let text = std::mem::take(&mut i.text);
+                if let Some(id) = i.secret {
+                    if !text.is_empty() && self.prompt_ui.as_ref().is_some_and(|u| u.view.id == id) {
+                        self.answer(Some(text));
+                    }
+                    self.close_input(true);
+                } else if text.trim().is_empty() {
+                    self.close_input(true);
+                } else {
+                    match self.send(text.clone()) {
+                        Ok(()) => self.close_input(true),
+                        Err(e) => {
+                            if let Some(i) = &mut self.input {
+                                i.text = text;
+                            }
+                            self.hint = Some((format!("NOT SENT · {}", e.to_uppercase()), now + Duration::from_secs(4)));
+                        }
+                    }
+                }
+            }
+            "backspace" if ctrl => {
+                let t = i.text.trim_end().len();
+                let cut = i.text[..t].rfind(char::is_whitespace).map_or(0, |p| p + 1);
+                i.text.truncate(cut);
+            }
+            "backspace" => {
+                i.text.pop();
+            }
+            "u" if ctrl => i.text.clear(),
+            "v" if ctrl => {
+                if let Some(t) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                    let room = INPUT_MAX.saturating_sub(i.text.chars().count());
+                    i.text.extend(t.chars().map(|c| if c.is_control() { ' ' } else { c }).take(room));
+                }
+            }
+            _ => {
+                if let Some(c) = &k.key_char
+                    && !ctrl
+                    && !c.chars().any(char::is_control)
+                    && i.text.chars().count() < INPUT_MAX
+                {
+                    i.text.push_str(c);
+                }
+            }
+        }
+        let _ = window;
+        cx.notify();
+        self.schedule(cx);
     }
 
     // ---- placement -------------------------------------------------------------------
@@ -1682,7 +2147,7 @@ impl Avatar {
         self.move_to(o, false);
     }
 
-    fn mouse_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
+    fn mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if ev.button != MouseButton::Left {
             return;
         }
@@ -1733,10 +2198,33 @@ impl Avatar {
         let len: u64 = seq.iter().map(|s| s.1 as u64).sum();
         self.anim.play(seq, now);
         self.squash = Some(now);
+        // A tap on the body (not a headpat) opens the field to talk to the session.
+        if !p.head && self.session.is_some() {
+            self.open_input(None, window, cx);
+        }
         let hold = if self.hearts.is_some() { len.max(HEARTS_MS) } else { len.max(600) };
         self.reaction_until = Some(now + Duration::from_millis(hold));
         if self.next_activity.is_some() {
             self.next_activity = Some(now + self.autonomy_gap());
+        }
+        cx.notify();
+        self.schedule(cx);
+    }
+
+    /// The status tag: reopen what is behind the chip (a prompt put off, the last reply),
+    /// else open the field.
+    fn chip_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if let Some(p) = self.prompt_ui.as_mut().filter(|p| p.dismissed) {
+            p.dismissed = false;
+            p.shown_at = now;
+        } else if let Some(b) = self.bubble.as_mut().filter(|b| b.collapsed) {
+            b.collapsed = false;
+            if b.next_char.is_none() && !b.more {
+                b.hide_at = Some(now + Duration::from_secs(10));
+            }
+        } else if self.session.is_some() {
+            self.open_input(None, window, cx);
         }
         cx.notify();
         self.schedule(cx);
@@ -1829,8 +2317,13 @@ fn probed(child: impl IntoElement, cell: &Cell2) -> Div {
         .child(canvas(move |b, _, _| cell.set(Some(b)), |_, _, _, _| {}).absolute().top_0().left_0().size_full())
 }
 
-/// Bubble lines, the current page (first, count) and whether it is the input field.
-type BubbleContent = (Vec<String>, Option<(usize, usize)>, bool);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PanelMode {
+    Reply,
+    Input { secret: bool },
+    Prompt,
+    Probe,
+}
 
 fn to_device(b: Bounds<Pixels>, sf: f32) -> ShapeRect {
     let x0 = (f32::from(b.origin.x) * sf).floor();
@@ -2289,9 +2782,9 @@ impl Render for Avatar {
                         }
                     });
                     let e = entity.clone();
-                    window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
+                    window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
                         if phase == DispatchPhase::Bubble {
-                            e.update(cx, |v, cx| v.mouse_up(ev, cx));
+                            e.update(cx, |v, cx| v.mouse_up(ev, window, cx));
                         }
                     });
                 },
@@ -2305,8 +2798,24 @@ impl Render for Avatar {
 
         let hud = !hidden && self.teleport.is_none() && !self.quitting;
         let Status { label, tone, invert, glyph: glyph_kind } = self.status();
-        let bubble_open = self.focus_probe.is_some() || self.bubble.as_ref().is_some_and(|b| !b.collapsed);
-        let collapsed = self.bubble.as_ref().is_some_and(|b| b.collapsed);
+        // What the bubble shows: the text field, a pending prompt, the reply, or the probe.
+        let mode = if !hud {
+            None
+        } else if let Some(i) = &self.input {
+            Some(PanelMode::Input { secret: i.secret.is_some() })
+        } else if self.prompt_ui.as_ref().is_some_and(|p| !p.dismissed) {
+            Some(PanelMode::Prompt)
+        } else if self.focus_probe.is_some() {
+            Some(PanelMode::Probe)
+        } else if self.bubble.as_ref().is_some_and(|b| !b.collapsed) {
+            Some(PanelMode::Reply)
+        } else {
+            None
+        };
+        let bubble_open = mode.is_some();
+        // The chip: a collapsed reply or a prompt put off, one click away.
+        let collapsed =
+            !bubble_open && (self.bubble.as_ref().is_some_and(|b| b.collapsed) || self.prompt_ui.as_ref().is_some_and(|p| p.dismissed));
 
         // Status tag above the hair, unless the bubble carries the status or a reaction
         // needs the space.
@@ -2384,27 +2893,21 @@ impl Render for Avatar {
             let ring = make_ring();
             let mut row = div().id("tag").flex().items_end().gap(px(3.0));
             if collapsed {
-                row = row
-                    .child(
-                        div()
-                            .p(px(1.0))
-                            .bg(rgb(0x02060a))
-                            .child(div().w(px(20.0)).h(px(19.0)).flex().items_center().justify_center().border_1().border_color(rgb(tone)).bg(rgb(pal.surface)).child(chevron(Chevron::Up, rgb(tone)))),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            if let Some(b) = &mut this.bubble {
-                                b.collapsed = false;
-                                if b.next_char.is_none() {
-                                    b.hide_at = Some(Instant::now() + Duration::from_secs(10));
-                                }
-                            }
-                            cx.notify();
-                            this.schedule(cx);
-                        }),
-                    );
+                row = row.child(
+                    div()
+                        .p(px(1.0))
+                        .bg(rgb(0x02060a))
+                        .child(div().w(px(20.0)).h(px(19.0)).flex().items_center().justify_center().border_1().border_color(rgb(tone)).bg(rgb(pal.surface)).child(chevron(Chevron::Up, rgb(tone)))),
+                );
+            }
+            if collapsed || self.session.is_some() {
+                row = row.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.chip_click(window, cx);
+                    }),
+                );
             }
             row = row.child(ring);
             let centre = head_l;
@@ -2425,28 +2928,71 @@ impl Render for Avatar {
             root = root.child(holder.child(probed(row, &tag_cell)));
         }
 
-        // Speech bubble (or the focus-probe input).
+        // Speech bubble: the text field, a pending prompt, the reply (or the focus probe).
         let mut panel_geom: Option<PanelGeom> = None;
-        let content: Option<BubbleContent> = if !hud {
-            None
-        } else if let Some(text) = &self.focus_probe {
-            let body = if text.is_empty() { "click here, then type".to_string() } else { text.clone() };
-            Some((vec![body], None, true))
-        } else {
-            self.bubble.as_ref().filter(|b| !b.collapsed).map(|b| (b.page_lines(), Some(b.pages()), false))
-        };
-        if let Some((lines, pages, probe)) = content {
+        let busy = self.session.as_ref().is_some_and(|sess| sess.link.busy());
+        if let Some(mode) = mode {
+            let line_strings = |chars: &[char], w: &Wrapped| -> Vec<String> {
+                w.lines.iter().map(|&(a, b)| chars[a..b.min(chars.len())].iter().collect::<String>().trim_end().to_string()).collect()
+            };
+            // (lines, pages, text width, all lines, header label, placeholder)
+            let mut placeholder: Option<String> = None;
+            let (lines, pages, text_w, total_lines, header_label): (Vec<String>, Option<(usize, usize)>, f32, usize, String) = match mode {
+                PanelMode::Reply => {
+                    let b = self.bubble.as_ref().expect("reply mode has a bubble");
+                    let lines = b.page_lines();
+                    if lines.is_empty() {
+                        placeholder = Some("…".into());
+                    }
+                    let label = match &self.echo {
+                        Some(e) => format!("YOU › {}", crate::session::one_line(e, 26)),
+                        None => "INCOMING TRANSMISSION".into(),
+                    };
+                    (lines, Some(b.pages()), b.wrap.as_ref().map_or(260.0, |w| w.width), b.wrap.as_ref().map_or(1, |w| w.lines.len()), label)
+                }
+                PanelMode::Input { secret } => {
+                    let i = self.input.as_ref().expect("input mode has a field");
+                    let shown: Vec<char> = if secret { i.text.chars().map(|_| '•').collect() } else { i.text.chars().collect() };
+                    let w = self.wrap_text(&shown, window, cx);
+                    let all = line_strings(&shown, &w);
+                    let lines: Vec<String> = all[all.len().saturating_sub(LINES_PER_PAGE)..].to_vec();
+                    if i.text.is_empty() {
+                        placeholder = Some(if secret { "type the answer (hidden)".into() } else { format!("say something to {}", self.name.to_lowercase()) });
+                    }
+                    let label = if secret { "SECRET ANSWER" } else { "TRANSMIT" };
+                    let n = lines.len().max(1);
+                    (lines, None, w.width.max(260.0), n, label.into())
+                }
+                PanelMode::Prompt => {
+                    let u = self.prompt_ui.as_ref().expect("prompt mode has a prompt");
+                    let chars: Vec<char> = u.view.text.chars().collect();
+                    let w = self.wrap_text(&chars, window, cx);
+                    let mut lines = line_strings(&chars, &w);
+                    if lines.len() > LINES_PER_PAGE {
+                        lines.truncate(LINES_PER_PAGE);
+                        if let Some(l) = lines.last_mut() {
+                            l.push('…');
+                        }
+                    }
+                    let n = lines.len().max(1);
+                    (lines, None, w.width.max(260.0), n, crate::session::one_line(&u.view.title.to_uppercase(), 28))
+                }
+                PanelMode::Probe => {
+                    let text = self.focus_probe.clone().unwrap_or_default();
+                    let body = if text.is_empty() { "click here, then type".to_string() } else { text };
+                    (vec![body], None, 260.0, 1, "FOCUS PROBE // CLICK ME".into())
+                }
+            };
+            let probe = mode == PanelMode::Probe;
             let (vis_l, vis_r) = (self.vis.0 as f32 / sf, self.vis.1 as f32 / sf);
             let max_w = (vis_r - vis_l - 2.0 * MARGIN).min(PANEL_MAX_W);
-            let text_w = self.bubble.as_ref().and_then(|b| b.wrap.as_ref()).map_or(260.0, |w| w.width);
             // Never narrower than the header line (name / label .. glyph status).
-            let header_label = if probe { "FOCUS PROBE // CLICK ME" } else { "INCOMING TRANSMISSION" };
             let header_w = PAD_L
                 + PAD_R
                 + self.tracked_width(&self.name, 10.5, FontWeight::BOLD, 1.8, window)
                 + 4.0
                 + self.tracked_width("/", 10.5, FontWeight::BOLD, 0.0, window)
-                + self.tracked_width(header_label, 9.5, FontWeight::SEMIBOLD, 1.5, window)
+                + self.tracked_width(&header_label, 9.5, FontWeight::SEMIBOLD, 1.5, window)
                 + self.tracked_width(&label, 9.5, FontWeight::BOLD, 1.5, window)
                 + 3.0 * 8.0
                 + 11.0
@@ -2454,12 +3000,10 @@ impl Render for Avatar {
                 + 32.0;
             let min_w = PANEL_MIN_W.max(header_w).min(max_w);
             let w = (text_w + PAD_L + PAD_R + 2.0).clamp(min_w, max_w);
-            let total_lines = self.bubble.as_ref().and_then(|b| b.wrap.as_ref()).map_or(1, |w| w.lines.len());
             // Fit the page: the lines it will hold once typed out (so it doesn't grow while
             // streaming), never an empty band above the footer.
             let rows = match pages {
                 Some((cur, n)) if n > 1 => total_lines.saturating_sub(cur * LINES_PER_PAGE).clamp(1, LINES_PER_PAGE),
-                _ if probe => 1,
                 _ => total_lines.clamp(1, LINES_PER_PAGE),
             };
             let footer = !probe;
@@ -2499,9 +3043,9 @@ impl Render for Avatar {
             .left_0()
             .size_full();
             let header_label = if probe {
-                if self.focus.is_focused(window) { "FOCUS PROBE // KEYS OK" } else { "FOCUS PROBE // CLICK ME" }
+                if self.focus.is_focused(window) { "FOCUS PROBE // KEYS OK".to_string() } else { header_label }
             } else {
-                "INCOMING TRANSMISSION"
+                header_label
             };
             let header = div()
                 .absolute()
@@ -2521,7 +3065,7 @@ impl Render for Avatar {
                         .child(tracked(&self.name, 1.8).text_color(rgb(pal.name)))
                         .child(div().ml(px(4.0)).text_color(rgb(pal.slash)).child("/")),
                 )
-                .child(tracked(header_label, 1.5).text_size(px(9.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.dim)))
+                .child(tracked(&header_label, 1.5).text_size(px(9.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.dim)))
                 .child(div().flex_1())
                 .child(
                     div()
@@ -2531,7 +3075,10 @@ impl Render for Avatar {
                         .child(glyph(&glyph_kind, tone, pal.surface))
                         .child(tracked(&label, 1.5).text_size(px(9.5)).font_weight(FontWeight::BOLD).text_color(rgb(tone))),
                 );
-            let body = div()
+            let caret = matches!(mode, PanelMode::Input { .. });
+            let n_lines = lines.len();
+            let text_c = pal.text;
+            let mut body = div()
                 .absolute()
                 .top(px(PAD_T + HEADER_H + HEADER_GAP))
                 .left(px(PAD_L))
@@ -2541,71 +3088,192 @@ impl Render for Avatar {
                 .text_size(px(BODY_FONT))
                 .line_height(px(LINE_H))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(pal.text))
-                .children(lines.into_iter().map(|t| div().h(px(LINE_H)).whitespace_nowrap().child(t)));
-            let mut panel = div().id("bubble").absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).child(bg).child(header).child(body);
-            if footer {
-                let (cur, total) = pages.unwrap_or((0, 1));
-                let line_c = |on: bool| with_alpha(frame_c, if on { 0.7 } else { 0.22 });
-                let btn = |id: &'static str, dir: Chevron, on: bool| {
-                    div()
-                        .id(id)
-                        .w(px(24.0))
-                        .h(px(19.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .border_1()
-                        .border_color(line_c(on))
-                        .child(chevron(dir, with_alpha(pal.text, if on { 0.95 } else { 0.3 })))
-                };
-                let mut row = div().absolute().bottom(px(PAD_B)).right(px(PAD_R - 4.0)).h(px(FOOTER_H)).flex().items_center().gap(px(4.0));
-                if total > 1 {
-                    row = row
-                        .child(btn("prev", Chevron::Left, cur > 0).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.page(-1, Instant::now());
-                                cx.notify();
-                                this.schedule(cx);
-                            }),
-                        ))
-                        .child(
-                            div()
-                                .min_w(px(40.0))
-                                .flex()
-                                .justify_center()
-                                .text_size(px(10.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(pal.text))
-                                .child(format!("{} / {}", cur + 1, total)),
-                        )
-                        .child(btn("next", Chevron::Right, cur + 1 < total).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.page(1, Instant::now());
-                                cx.notify();
-                                this.schedule(cx);
-                            }),
-                        ))
-                        .child(div().w(px(4.0)));
+                .text_color(rgb(pal.text));
+            let caret_bar = move || div().ml(px(1.0)).w(px(2.0)).h(px(BODY_FONT)).bg(rgb(text_c));
+            if let Some(ph) = &placeholder {
+                let mut row = div().h(px(LINE_H)).flex().items_center();
+                if caret {
+                    row = row.child(caret_bar());
                 }
-                row = row.child(btn("collapse", Chevron::Down, true).on_mouse_down(
+                body = body.child(row.child(div().ml(px(4.0)).text_color(with_alpha(pal.dim, 0.55)).whitespace_nowrap().child(ph.clone())));
+            } else {
+                for (k, t) in lines.into_iter().enumerate() {
+                    let mut row = div().h(px(LINE_H)).flex().items_center().whitespace_nowrap().child(t);
+                    if caret && k + 1 == n_lines {
+                        row = row.child(caret_bar());
+                    }
+                    body = body.child(row);
+                }
+            }
+            let mut panel = div().id("bubble").absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).child(bg).child(header).child(body);
+            let line_c = |on: bool| with_alpha(frame_c, if on { 0.7 } else { 0.22 });
+            let btn = |id: &'static str, dir: Chevron, on: bool| {
+                div()
+                    .id(id)
+                    .w(px(24.0))
+                    .h(px(19.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_1()
+                    .border_color(line_c(on))
+                    .child(chevron(dir, with_alpha(pal.text, if on { 0.95 } else { 0.3 })))
+            };
+            let tbtn = |id: &'static str, text: &str, colour: u32, on: bool| {
+                div()
+                    .id(id)
+                    .h(px(19.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .border_1()
+                    .border_color(with_alpha(colour, if on { 0.85 } else { 0.3 }))
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(with_alpha(colour, if on { 1.0 } else { 0.4 }))
+                    .child(tracked(text, 1.2))
+            };
+            let abort_btn = |cx: &mut Context<Self>| {
+                tbtn("abort", "✕ ABORT", pal.slash, true).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
-                        if let Some(b) = &mut this.bubble {
+                        this.abort();
+                        cx.notify();
+                    }),
+                )
+            };
+            let collapse_btn = |cx: &mut Context<Self>| {
+                btn("collapse", Chevron::Down, true).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        if this.prompt_ui.as_ref().is_some_and(|p| !p.dismissed) && this.input.is_none() {
+                            if let Some(p) = &mut this.prompt_ui {
+                                p.dismissed = true;
+                            }
+                        } else if let Some(b) = &mut this.bubble {
                             b.collapsed = true;
                         }
                         cx.notify();
                         this.schedule(cx);
                     }),
-                ));
+                )
+            };
+            let mut row = div().absolute().bottom(px(PAD_B)).right(px(PAD_R - 4.0)).h(px(FOOTER_H)).flex().items_center().gap(px(4.0));
+            match mode {
+                PanelMode::Reply => {
+                    let (cur, total) = pages.unwrap_or((0, 1));
+                    if busy {
+                        row = row.child(abort_btn(cx)).child(div().w(px(4.0)));
+                    }
+                    if total > 1 {
+                        row = row
+                            .child(btn("prev", Chevron::Left, cur > 0).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.page(-1, Instant::now());
+                                    cx.notify();
+                                    this.schedule(cx);
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .min_w(px(40.0))
+                                    .flex()
+                                    .justify_center()
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(pal.text))
+                                    .child(format!("{} / {}", cur + 1, total)),
+                            )
+                            .child(btn("next", Chevron::Right, cur + 1 < total).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.page(1, Instant::now());
+                                    cx.notify();
+                                    this.schedule(cx);
+                                }),
+                            ))
+                            .child(div().w(px(4.0)));
+                    }
+                    row = row.child(collapse_btn(cx));
+                }
+                PanelMode::Input { secret } => {
+                    let i = self.input.as_ref().expect("input mode has a field");
+                    let note = match &self.hint {
+                        Some((h, _)) => h.clone(),
+                        None if secret => "ENTER ANSWER · ESC LATER".into(),
+                        None if i.esc_at.is_some() => "ESC AGAIN · ABORT".into(),
+                        None if busy => "ENTER STEER · ESC ESC ABORT".into(),
+                        None => "ENTER SEND · ESC CLOSE".into(),
+                    };
+                    let warn = self.hint.is_some() || i.esc_at.is_some();
+                    panel = panel.child(
+                        div()
+                            .absolute()
+                            .bottom(px(PAD_B))
+                            .left(px(PAD_L))
+                            .h(px(FOOTER_H))
+                            .flex()
+                            .items_center()
+                            .child(tracked(&note, 1.3).text_size(px(9.5)).font_weight(FontWeight::BOLD).text_color(rgb(if warn { pal.slash } else { pal.dim }))),
+                    );
+                    if busy && !secret {
+                        row = row.child(abort_btn(cx));
+                    }
+                }
+                PanelMode::Prompt => {
+                    let u = self.prompt_ui.as_ref().expect("prompt mode has a prompt");
+                    let armed = now >= u.shown_at + PROMPT_ARM;
+                    if u.view.secret {
+                        row = row.child(tbtn("answer", "ANSWER", pal.frame, armed).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                let Some(u) = &this.prompt_ui else { return };
+                                if Instant::now() >= u.shown_at + PROMPT_ARM {
+                                    let id = u.view.id;
+                                    this.open_input(Some(id), window, cx);
+                                }
+                            }),
+                        ));
+                    } else {
+                        row = row.child(tbtn("allow", "ALLOW", pal.frame, armed).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                if this.prompt_ui.as_ref().is_some_and(|u| Instant::now() >= u.shown_at + PROMPT_ARM) {
+                                    this.answer(Some("y".into()));
+                                    cx.notify();
+                                    this.schedule(cx);
+                                }
+                            }),
+                        ));
+                    }
+                    row = row
+                        .child(tbtn("deny", "DENY", pal.slash, armed).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                if this.prompt_ui.as_ref().is_some_and(|u| Instant::now() >= u.shown_at + PROMPT_ARM) {
+                                    this.answer(None);
+                                    cx.notify();
+                                    this.schedule(cx);
+                                }
+                            }),
+                        ))
+                        .child(div().w(px(4.0)))
+                        .child(collapse_btn(cx));
+                }
+                PanelMode::Probe => {}
+            }
+            if footer {
                 panel = panel.child(row);
             }
-            if probe {
+            if matches!(mode, PanelMode::Input { .. } | PanelMode::Probe) {
                 panel = panel
                     .track_focus(&self.focus)
                     .on_mouse_down(
@@ -2614,12 +3282,18 @@ impl Render for Avatar {
                             cx.stop_propagation();
                             let r = this.x11.take_focus();
                             window.focus(&this.focus, cx);
-                            let fw = this.x11.focused_window().unwrap_or(0);
-                            eprintln!("focus-probe: SetInputFocus err={:?}; X focus now 0x{fw:x} (ours 0x{:x})", r.err(), this.x11.win);
+                            if this.focus_probe.is_some() {
+                                let fw = this.x11.focused_window().unwrap_or(0);
+                                eprintln!("focus-probe: SetInputFocus err={:?}; X focus now 0x{fw:x} (ours 0x{:x})", r.err(), this.x11.win);
+                            }
                             cx.notify();
                         }),
                     )
-                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                        if this.input.is_some() {
+                            this.input_key(ev, window, cx);
+                            return;
+                        }
                         eprintln!("focus-probe: key down `{}` char {:?}", ev.keystroke.key, ev.keystroke.key_char);
                         if let Some(t) = &mut this.focus_probe {
                             match ev.keystroke.key.as_str() {
@@ -2696,7 +3370,7 @@ impl Render for Avatar {
         let ground_px = (l.ground_x as i16, (l.ground_y - 1) as i16, 1u16, 1u16);
         let hearts = self.hearts.filter(|_| hud).map(|(t0, at)| (now.saturating_duration_since(t0).as_secs_f32() * 1000.0, at));
         let worigin = self.origin;
-        let tag_clickable = collapsed;
+        let tag_clickable = collapsed || self.session.is_some();
         let tag_w = self.tag_w.clone();
         let tag_box = self.tag_box.clone();
         root.child(
