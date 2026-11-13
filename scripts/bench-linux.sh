@@ -33,11 +33,20 @@ def walk(n, fl=False):
         print("floating" if fl else "tiled")
     for c in n.get("nodes", []) + n.get("floating_nodes", []): walk(c, fl)
 walk(json.load(sys.stdin))' > "$out/.wm" 2>/dev/null ) &
+# BENCH_WORKSPACE=<name> (i3): put the window on that workspace as soon as it
+# maps, e.g. a visible one when the focused workspace has a fullscreen window
+# on top. Focus stays where it was.
+if [ -n "${BENCH_WORKSPACE:-}" ] && command -v i3-msg >/dev/null; then
+  ( for _ in $(seq 1 200); do
+      i3-msg -q "[class=\"^synaps-desktop$\"] move container to workspace $BENCH_WORKSPACE" 2>/dev/null && break
+      sleep 0.025
+    done ) &
+fi
 systemd-run --user --scope --quiet -p MemoryMax=2G -p MemorySwapMax=0 \
   timeout 35 "$bin" --bench "$@" > "$out/$stamp.json" 2> "$out/$stamp.err" || echo "exit=$?" >> "$out/$stamp.err"
 wait
 load_after=$(cut -d' ' -f1-3 /proc/loadavg)
-python3 - "$out/$stamp.json" "$launch_ns" "$load_before" "$load_after" "${rustc_before:-0}" "$(cat "$out/.wm" 2>/dev/null)" <<'PY'
+python3 - "$out/$stamp.json" "$launch_ns" "$load_before" "$load_after" "${rustc_before:-0}" "$(cat "$out/.wm" 2>/dev/null)" "${BENCH_WORKSPACE:-}" <<'PY'
 import json, sys
 p, launch = sys.argv[1], int(sys.argv[2]) / 1e6
 try:
@@ -46,7 +55,7 @@ except Exception as e:
     print("no JSON:", e); sys.exit(1)
 if d.get("first_frame_epoch_ms"):
     d["launch_to_first_frame_ms"] = round(d["first_frame_epoch_ms"] - launch, 1)
-d["host"] = {"loadavg_before": sys.argv[3], "loadavg_after": sys.argv[4], "rustc_procs_before": int(sys.argv[5] or 0), "wm_placement": sys.argv[6] or None}
+d["host"] = {"loadavg_before": sys.argv[3], "loadavg_after": sys.argv[4], "rustc_procs_before": int(sys.argv[5] or 0), "wm_placement": sys.argv[6] or None, "workspace": sys.argv[7] or None}
 json.dump(d, open(p, "w"), indent=1)
 print(p)
 PY

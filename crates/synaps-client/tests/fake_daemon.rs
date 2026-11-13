@@ -164,8 +164,12 @@ impl Fake {
                         match f["type"].as_str() {
                             Some("sessions") => write(&w, json!({"type": "session_list", "sessions": []})).await,
                             Some("saved_sessions") if opts.saved && opts.saved_error => {
-                                write(&w, json!({"type": "error", "session_id": null,
-                                    "message": "saved sessions: Permission denied (os error 13)"})).await;
+                                write(
+                                    &w,
+                                    json!({"type": "error", "session_id": null,
+                                    "message": "saved sessions: Permission denied (os error 13)"}),
+                                )
+                                .await;
                             }
                             Some("saved_sessions") if opts.saved => {
                                 let mut list: Value = serde_json::from_str(fixture("saved_session_list.json").trim()).unwrap();
@@ -173,14 +177,22 @@ impl Fake {
                                 write(&w, list).await;
                             }
                             Some("saved_sessions") => {
-                                write(&w, json!({"type": "error", "session_id": null,
-                                    "message": "malformed frame: unknown variant `saved_sessions`"})).await;
+                                write(
+                                    &w,
+                                    json!({"type": "error", "session_id": null,
+                                    "message": "malformed frame: unknown variant `saved_sessions`"}),
+                                )
+                                .await;
                             }
                             Some("rename") => match rename_reply(opts, &f) {
                                 Some(reply) => write(&w, reply).await,
                                 None => {
-                                    write(&w, json!({"type": "refused", "reason": {"reason": "unknown_session"},
-                                        "message": format!("no live session {}", f["session_id"])})).await;
+                                    write(
+                                        &w,
+                                        json!({"type": "refused", "reason": {"reason": "unknown_session"},
+                                        "message": format!("no live session {}", f["session_id"])}),
+                                    )
+                                    .await;
                                     return;
                                 }
                             },
@@ -243,9 +255,11 @@ async fn h1_digest_drift_resyncs_the_history() {
     let seq = client.attach(SID, AttachMode::Mirror).unwrap();
     let mut conn = attached(&mut fake, &events, 2).await;
 
-    let resumed = vec![json!({"content": "What is 2+2?", "role": "user"}), json!({"content": [{"text": "4", "type": "text"}], "role": "assistant"})];
+    let resumed =
+        vec![json!({"content": "What is 2+2?", "role": "user"}), json!({"content": [{"text": "4", "type": "text"}], "role": "assistant"})];
     conn.event(10, json!({"ev": "resumed", "id": 7, "old_id": SID, "new_id": "r", "via": null, "clamp_notice": null})).await;
-    conn.event(11, json!({"ev": "conversation", "digest": {"messages_len": 2, "messages_hash": messages_hash(&resumed), "cost": 0.1}})).await;
+    conn.event(11, json!({"ev": "conversation", "digest": {"messages_len": 2, "messages_hash": messages_hash(&resumed), "cost": 0.1}}))
+        .await;
     let q = conn.recv_cmd().await;
     assert_eq!(q["cmd"], "query");
     assert_eq!(q["query"]["query"], "messages");
@@ -940,13 +954,13 @@ async fn a_missing_folder_falls_back_to_home_once() {
     let mut fake = Fake::start("gonecwd").await;
     let (client, events) = fake.client();
     let gone = "/home/u/Projects/gone";
-    let seq = client
-        .resume("20261110-202033-e5f6", CreateOptions::new().cwd(Cwd::Path(gone.into())).fallback_cwd(Cwd::Home))
-        .unwrap();
+    let seq = client.resume("20261110-202033-e5f6", CreateOptions::new().cwd(Cwd::Path(gone.into())).fallback_cwd(Cwd::Home)).unwrap();
     let first = fake.next_attach().await;
     assert_eq!(first.attach["config"]["cwd"], gone);
     // daemon/conn.rs: `format!("cwd must be an absolute existing directory: {}", cwd.display())`.
-    first.send(json!({"type": "error", "session_id": null, "message": format!("cwd must be an absolute existing directory: {gone}")})).await;
+    first
+        .send(json!({"type": "error", "session_id": null, "message": format!("cwd must be an absolute existing directory: {gone}")}))
+        .await;
     first.send(json!({"type": "bye", "reason": null})).await;
     let second = fake.next_attach().await;
     assert_eq!(second.attach["attach"], "create");
@@ -972,5 +986,38 @@ async fn a_missing_folder_falls_back_to_home_once() {
     })
     .await;
     assert!(reason.starts_with(synaps_client::MISSING_CWD), "{reason}");
+    client.shutdown().unwrap();
+}
+
+/// A pending prompt reaches the consumer, and `answer` sends the daemon's
+/// `Answer { prompt_id, value }`: a confirm's "y" / "n", a cancel as `null`.
+#[tokio::test]
+async fn prompts_are_answered_on_the_wire() {
+    let mut fake = Fake::start("prompt").await;
+    let (client, events) = fake.client();
+    client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    conn.event(
+        30,
+        json!({"ev": "prompt", "request": {"id": 7, "kind": "confirm", "title": "Confirm tool call",
+        "prompt": "bash: cargo test", "raised_at": "2026-11-13T07:34:27Z"}}),
+    )
+    .await;
+    let (id, title) = wait(&events, "prompt", |e| match e {
+        Event::Session { event: synaps_client::SessionEvent::Prompt { request }, .. } => Some((request.id, request.title.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!((id, title.as_str()), (7, "Confirm tool call"));
+    client.answer(7, Some("y".into())).unwrap();
+    let cmd = conn.recv_cmd().await;
+    assert_eq!(cmd, json!({"cmd": "answer", "prompt_id": 7, "value": "y"}));
+    client.answer(8, None).unwrap();
+    assert_eq!(conn.recv_cmd().await, json!({"cmd": "answer", "prompt_id": 8, "value": null}));
+    conn.event(31, json!({"ev": "prompt_resolved", "prompt_id": 7})).await;
+    wait(&events, "resolved", |e| {
+        matches!(e, Event::Session { event: synaps_client::SessionEvent::PromptResolved { prompt_id: 7 }, .. }).then_some(())
+    })
+    .await;
     client.shutdown().unwrap();
 }

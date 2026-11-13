@@ -42,11 +42,7 @@ pub struct InvalidName(pub String);
 
 impl std::fmt::Display for InvalidName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "invalid client name {:?}: use 1-{CLIENT_NAME_MAX} letters, digits, '-' or '_', starting with a letter or digit",
-            self.0
-        )
+        write!(f, "invalid client name {:?}: use 1-{CLIENT_NAME_MAX} letters, digits, '-' or '_', starting with a letter or digit", self.0)
     }
 }
 
