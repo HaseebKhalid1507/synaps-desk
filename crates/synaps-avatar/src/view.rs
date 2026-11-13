@@ -2112,6 +2112,7 @@ impl Render for Avatar {
         let ghost_rects = if !plan.has_ghosts() || hidden { Vec::new() } else { plan.ghost_rects(&rects) };
         let solid_rects = if plan.solid.iter().all(Option::is_none) || hidden { Vec::new() } else { plan.solid_rects(&rects) };
         let tint_rects = if plan.tint.is_some() && !hidden { plan.body_rects(&rects) } else { Vec::new() };
+        let bar_rects = if hidden || plan.tint.is_some() { Vec::new() } else { plan.bar_rects(&rects) };
         let entity = cx.entity();
         let warm: Vec<Arc<RenderImage>> = if self.loaded && !self.warmed {
             self.warmed = true;
@@ -2204,7 +2205,7 @@ impl Render for Avatar {
                                 y += (3.0 * sf).round() as i32;
                             }
                         }
-                        for &(r, c) in &plan2.cells {
+                        for &(r, c) in &bar_rects {
                             window.paint_quad(fill(rect(r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32), rgb(c)));
                         }
                     }

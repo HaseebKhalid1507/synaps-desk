@@ -32,11 +32,12 @@ pub enum GlitchKind {
     Vanish,
 }
 
-/// Stutter envelopes: `(start, strength)` steps over 0..1. A main hit (the pattern
-/// re-rolls every 50 ms inside it), then 2–3 short stutter frames with clean gaps, then
-/// settled. The last step fades out.
-const STUTTER_MINOR: [(f32, f32); 6] = [(0.0, 0.85), (0.5, 0.0), (0.6, 0.6), (0.69, 0.0), (0.8, 0.45), (0.88, 0.0)];
-const STUTTER_BIG: [(f32, f32); 8] = [(0.0, 1.0), (0.64, 0.0), (0.71, 0.7), (0.76, 0.0), (0.83, 0.55), (0.88, 0.0), (0.93, 0.4), (0.97, 0.0)];
+/// Glitch envelopes: `(start, strength)` steps over 0..1. Build-up (small offsets), a
+/// hard peak (the biggest offsets, the thickest bars), then smaller aftershocks with clean
+/// gaps between them, then settled. The pattern re-rolls every frame throughout.
+const STUTTER_MINOR: [(f32, f32); 6] = [(0.0, 0.32), (0.18, 0.9), (0.52, 0.0), (0.64, 0.5), (0.75, 0.0), (0.85, 0.0)];
+const STUTTER_BIG: [(f32, f32); 9] =
+    [(0.0, 0.3), (0.1, 0.5), (0.2, 1.0), (0.62, 0.0), (0.68, 0.6), (0.76, 0.0), (0.84, 0.35), (0.89, 0.0), (0.95, 0.0)];
 const STUTTER_APPEAR: [(f32, f32); 6] = [(0.0, 1.0), (0.6, 0.0), (0.68, 0.65), (0.74, 0.0), (0.83, 0.45), (0.89, 0.0)];
 
 fn stutter(table: &[(f32, f32)], u: f32, seed: u64) -> f32 {
@@ -152,9 +153,9 @@ impl Glitch {
         }
     }
 
-    /// The pattern re-rolls every 50 ms, like a bad signal.
+    /// The pattern re-rolls every frame (33 ms), like a bad signal.
     pub fn step_seed(&self, now: Instant) -> u64 {
-        self.seed ^ ((ms(now.saturating_duration_since(self.t0)) / 50.0) as u64).wrapping_mul(0x9e37_79b9)
+        self.seed ^ ((ms(now.saturating_duration_since(self.t0)) / 33.0) as u64).wrapping_mul(0x9e37_79b9)
     }
 }
 
@@ -196,8 +197,9 @@ pub struct BodyPlan {
     pub split: Vec<i32>,
     /// Per band (parallel to `slices`; empty = none): draw the band as this solid colour.
     pub solid: Vec<Option<u32>>,
-    /// Corruption cells and chroma bars, drawn over the body.
-    pub cells: Vec<(ShapeRect, u32)>,
+    /// Chroma bars and corruption cells `(rect, rgb)`, drawn over the body and clipped to
+    /// it (`bar_rects`), so none poke out past the outline.
+    pub bars: Vec<(ShapeRect, u32)>,
     /// Scanline darkness 0..1 (half in the face rows).
     pub scan: f32,
     pub face: Option<(i32, i32)>,
@@ -217,7 +219,7 @@ impl BodyPlan {
             slices: None,
             split: Vec::new(),
             solid: Vec::new(),
-            cells: Vec::new(),
+            bars: Vec::new(),
             scan: 0.0,
             face: None,
             tint: None,
@@ -225,33 +227,35 @@ impl BodyPlan {
     }
 
     pub fn is_plain(&self) -> bool {
-        self.sx == 1.0 && self.sy == 1.0 && self.slices.is_none() && self.cells.is_empty()
+        self.sx == 1.0 && self.sy == 1.0 && self.slices.is_none() && self.bars.is_empty()
     }
 
     pub fn has_ghosts(&self) -> bool {
         self.split.iter().any(|&d| d != 0)
     }
 
-    /// Glitch layout for one step. The whole silhouette stays drawn: 6–12 bands of random
-    /// height across the figure, each moved sideways 10–40 px, each with its own 4–8 px
-    /// red/blue split; 1–2 chroma bars across the torso; faint scanlines. The face rows
-    /// are one band with at most a few px of shift and no split. Rows above the figure
-    /// (the status tag) tear in two more bands.
+    /// Glitch layout for one step (a new random pattern every step). The whole silhouette
+    /// stays drawn: 6–14 bands of random height across the figure, each moved sideways (up
+    /// to 10–40 px at the peak, a few px in the build-up), each with its own red/blue split
+    /// (4–8 px at the peak); chroma bars 4–10 px tall and corruption cells, clipped to the
+    /// figure; faint scanlines. The face rows are one band with at most a few px of shift
+    /// and no split. The status tag is cut inside, so it tears with the body.
     pub fn glitch(&mut self, g: GlitchStep) {
         let mut rng = Rng::new(g.seed | 1);
         let s = g.strength;
-        let amp = (s * 1.25).min(1.0);
+        let amp = (s * 1.15).min(1.0);
         let (bx, by, bw, bh) = g.body;
         let top = by.clamp(g.y0, g.h);
-        // Band edges: two over the HUD, 6–12 over the figure, the face's own edges.
+        // Band edges: the tag (or the HUD) cut once, n over the figure, the face's edges.
         let mut cuts = vec![g.y0, top, g.h];
         match g.tag {
             Some((t0, t1)) if t1 - t0 > 6 && t0 >= g.y0 && t1 <= top => cuts.push(t0 + (t1 - t0) * rng.range(35.0, 65.0) as i32 / 100),
             _ if top - g.y0 > 8 => cuts.push(g.y0 + (top - g.y0) * rng.range(30.0, 70.0) as i32 / 100),
             _ => {}
         }
-        let n = 6 + rng.pick(7);
-        let min_h = (10.0 * g.sf) as i32;
+        // Some steps tear into a few tall blocks, others into many thin strips.
+        let n = 6 + rng.pick(9);
+        let min_h = (rng.range(6.0, 14.0) * g.sf) as i32;
         for _ in 1..n {
             cuts.push(rng.range(top as f32, g.h as f32) as i32);
         }
@@ -275,6 +279,8 @@ impl BodyPlan {
         let mut split = Vec::new();
         let mut solid = Vec::new();
         let mut sign = if rng.range(0.0, 1.0) < 0.5 { -1.0 } else { 1.0 };
+        // At the peak the shifts reach further (the floor rises with the strength).
+        let lo = 10.0 + 8.0 * amp;
         for (k, w) in merged.windows(2).enumerate() {
             let (y0, y1) = (w[0], w[1]);
             if y1 <= y0 {
@@ -287,8 +293,8 @@ impl BodyPlan {
             }
             let (dx, d) = if face {
                 ((sign * rng.range(0.0, 3.0) * g.sf * amp).round() as i32, 0)
-            } else if rng.range(0.0, 1.0) < 0.88 {
-                ((sign * rng.range(10.0, 40.0) * g.sf * amp).round() as i32, (rng.range(4.0, 8.0) * g.sf * amp).round() as i32)
+            } else if rng.range(0.0, 1.0) < 0.85 {
+                ((sign * rng.range(lo, 40.0) * g.sf * amp).round() as i32, (rng.range(4.0, 8.0) * g.sf * amp).round() as i32)
             } else {
                 (0, (rng.range(4.0, 8.0) * g.sf * amp).round() as i32)
             };
@@ -307,32 +313,35 @@ impl BodyPlan {
         self.split = split;
         self.solid = solid;
         self.face = g.face;
-        let in_face = |y: i32| g.face.is_some_and(|(f0, f1)| y >= f0 && y < f1);
-        // A few corruption cells (never on the face).
-        for i in 0..(s * 8.0) as usize {
-            let cw = (rng.range(6.0, 22.0) * g.sf) as u16;
-            let ch = (rng.range(1.0, 3.0) * g.sf).max(1.0) as u16;
-            let x = bx + (rng.range(-0.1, 1.1) * bw as f32) as i32;
+        let in_face = |y0: i32, y1: i32| g.face.is_some_and(|(f0, f1)| y1 > f0 && y0 < f1);
+        let palette = [YELLOW, VIOLET, CYAN, PINK];
+        // Chroma bars: 1 in the build-up and the aftershocks, 1–3 at the peak; 4–10 px tall,
+        // thicker with the strength; anywhere from below the face to the knees.
+        if s > 0.2 {
+            let bars = if s > 0.8 { 1 + rng.pick(3) } else { 1 };
+            let t0 = g.face.map_or(by + bh / 5, |f| f.1 + (4.0 * g.sf) as i32);
+            let t1 = (by + bh * 4 / 5).max(t0 + 1);
+            let first = rng.pick(palette.len());
+            for i in 0..bars {
+                let hh = (4.0 + 6.0 * amp * rng.range(0.55, 1.0)).round().clamp(4.0, 10.0) as i32;
+                let y = rng.range(t0 as f32, (t1 - hh) as f32) as i32;
+                let x0 = bx + (rng.range(-0.1, 0.4) * bw as f32) as i32;
+                let w = (rng.range(0.35, 1.0) * bw as f32) as u16;
+                self.bars.push(((x0 as i16, y as i16, w, hh as u16), palette[(first + i) % palette.len()]));
+            }
+        }
+        // Corruption cells, 2–4 px tall (never on the face).
+        for i in 0..(s * 7.0) as usize {
+            let cw = (rng.range(8.0, 30.0) * g.sf) as u16;
+            let ch = rng.range(2.0, 4.99) as u16;
+            let x = bx + (rng.range(0.0, 1.0) * bw as f32) as i32;
             let y = by + (rng.range(0.0, 1.0) * bh as f32) as i32;
-            if in_face(y) || in_face(y + ch as i32) {
+            if in_face(y, y + ch as i32) {
                 continue;
             }
-            self.cells.push(((x as i16, y as i16, cw, ch), [CYAN, PINK, VIOLET, YELLOW][i % 4]));
+            self.bars.push(((x as i16, y as i16, cw, ch), palette[(i + 1) % palette.len()]));
         }
-        // 1–2 solid chroma bars crossing the body (below the face, above the hips).
-        if s > 0.4 {
-            let t0 = g.face.map_or(by + bh / 4, |f| f.1 + (6.0 * g.sf) as i32);
-            let t1 = (by + bh * 3 / 5).max(t0 + 1);
-            let bars = if rng.range(0.0, 1.0) < 0.5 { 1 } else { 2 };
-            for colour in [YELLOW, VIOLET].into_iter().take(bars) {
-                let y = rng.range(t0 as f32, t1 as f32) as i32;
-                let hh = (rng.range(3.0, 6.0) * g.sf) as u16;
-                let x0 = bx + (rng.range(-0.12, 0.25) * bw as f32) as i32;
-                let w = (rng.range(0.6, 1.0) * bw as f32) as u16;
-                self.cells.push(((x0 as i16, y as i16, w, hh), colour));
-            }
-        }
-        self.scan = 0.3 * s;
+        self.scan = 0.32 * s;
     }
 
     /// Squash/stretch a rect about the pivot without opening gaps between bands.
@@ -429,7 +438,26 @@ impl BodyPlan {
         let mut out = Vec::with_capacity(scaled.len() * 3);
         self.banded(&scaled, 0, 0, None, &mut out);
         out.extend(self.ghost_rects(rects).into_iter().map(|g| g.0));
-        out.extend(self.cells.iter().map(|c| c.0));
+        out
+    }
+
+    /// The bars and cells clipped to the body as drawn (squashed, banded, shifted).
+    pub fn bar_rects(&self, rects: &[ShapeRect]) -> Vec<(ShapeRect, u32)> {
+        if self.bars.is_empty() {
+            return Vec::new();
+        }
+        let body = self.body_rects(rects);
+        let mut out = Vec::new();
+        for &((bx, by, bw, bh), c) in &self.bars {
+            let (bx0, by0, bx1, by1) = (bx as i32, by as i32, bx as i32 + bw as i32, by as i32 + bh as i32);
+            for &(x, y, w, h) in &body {
+                let (x0, y0) = (bx0.max(x as i32), by0.max(y as i32));
+                let (x1, y1) = (bx1.min(x as i32 + w as i32), by1.min(y as i32 + h as i32));
+                if x1 > x0 && y1 > y0 {
+                    out.push(((x0 as i16, y0 as i16, (x1 - x0) as u16, (y1 - y0) as u16), c));
+                }
+            }
+        }
         out
     }
 }
@@ -889,16 +917,78 @@ mod tests {
     }
 
     #[test]
-    fn big_glitch_stutters() {
+    fn glitch_builds_peaks_and_echoes() {
         let t = Instant::now();
-        let g = Glitch::new(GlitchKind::Big, t, 5);
-        let v: Vec<f32> = (0..85).map(|i| g.strength(t + Duration::from_millis(i * 10))).collect();
-        let flips = v.windows(2).filter(|w| (w[0] > 0.3) != (w[1] > 0.3)).count();
-        assert!(flips >= 5, "{flips}");
-        // Main hit 0.5–0.6 s.
-        let hit = v.iter().take_while(|&&x| x > 0.3).count();
-        assert!((50..=60).contains(&hit), "{hit}");
-        assert!(g.ms >= 800.0);
+        for (kind, aftershocks) in [(GlitchKind::Big, 2), (GlitchKind::Burst, 1)] {
+            let g = Glitch::new(kind, t, 5);
+            let v: Vec<f32> = (0..g.ms as u64 / 10).map(|i| g.strength(t + Duration::from_millis(i * 10))).collect();
+            // Build-up below the peak, then a hard peak.
+            let peak = v.iter().cloned().fold(0.0, f32::max);
+            assert!(peak >= 0.8, "{kind:?} {peak}");
+            let first_peak = v.iter().position(|&x| x >= peak * 0.95).unwrap();
+            assert!(first_peak >= 6 && v[..first_peak].iter().all(|&x| x > 0.15 && x < peak * 0.7), "{kind:?} build-up {:?}", &v[..first_peak]);
+            // Main hit (build-up + peak) 0.4–0.6 s for the big one.
+            let hit = v.iter().take_while(|&&x| x > 0.05).count();
+            if kind == GlitchKind::Big {
+                assert!((40..=60).contains(&hit), "{hit}");
+            }
+            // Then `aftershocks` echoes, each smaller than the peak, with clean gaps.
+            let mut echoes = Vec::new();
+            let mut i = hit;
+            while i < v.len() {
+                if v[i] > 0.05 {
+                    let j = (i..v.len()).find(|&j| v[j] <= 0.05).unwrap_or(v.len());
+                    echoes.push(v[i..j].iter().cloned().fold(0.0, f32::max));
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+            assert_eq!(echoes.len(), aftershocks, "{kind:?} {echoes:?}");
+            assert!(echoes.iter().all(|&e| e < peak * 0.75), "{echoes:?}");
+            assert!(echoes.windows(2).all(|w| w[1] < w[0]), "{echoes:?}");
+        }
+    }
+
+    #[test]
+    fn glitch_pattern_changes_every_frame_and_bars_stay_inside() {
+        let t = Instant::now();
+        let g = Glitch::new(GlitchKind::Big, t, 9);
+        // A 200 x 300 body: rows 0..300, x 50..250.
+        let body: Vec<ShapeRect> = (0..300).map(|y| (50, y as i16, 200, 1)).collect();
+        let mut prev: Option<Vec<(i32, i32, i32, i32)>> = None;
+        for f in 0..20u64 {
+            let at = t + Duration::from_millis(f * 34);
+            let mut plan = BodyPlan::plain();
+            plan.glitch(GlitchStep {
+                strength: g.strength(at),
+                coverage: 1.0,
+                seed: g.step_seed(at),
+                order: g.seed(),
+                y0: -40,
+                h: 300,
+                body: (50, 0, 200, 300),
+                face: Some((40, 70)),
+                solid: 0.0,
+                tag: None,
+                sf: 1.0,
+            });
+            let bands = plan.slices.clone().unwrap();
+            if g.strength(at) > 0.05 {
+                if let Some(p) = &prev {
+                    assert_ne!(p, &bands, "frame {f}: same pattern as the last");
+                }
+                prev = Some(bands);
+            }
+            let drawn = plan.body_rects(&body);
+            for (r, _) in plan.bar_rects(&body) {
+                // Every bar pixel row-run lies inside some drawn body run.
+                assert!(drawn.iter().any(|d| r.0 >= d.0 && r.0 as i32 + r.2 as i32 <= d.0 as i32 + d.2 as i32 && r.1 >= d.1 && r.1 as i32 + r.3 as i32 <= d.1 as i32 + d.3 as i32), "{r:?}");
+            }
+            for &((_, _, _, h), _) in plan.bars.iter().filter(|b| b.0.3 >= 4) {
+                assert!((4..=10).contains(&h), "bar height {h}");
+            }
+        }
     }
 
     #[test]
