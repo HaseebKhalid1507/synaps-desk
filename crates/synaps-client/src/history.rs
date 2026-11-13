@@ -75,8 +75,9 @@ pub struct HistoryMirror {
     len: usize,
     hash: u64,
     /// Cleared when a fresh `Messages` result still disagrees with the
-    /// digest on the hash alone: then only lengths are compared, rather
-    /// than re-querying on every round.
+    /// digest on the hash alone: then digests are compared by length only
+    /// (rather than re-querying on every round) and every history is a
+    /// `Replace` (as `absorb` does), until a digest matches by hash again.
     hash_ok: bool,
 }
 
@@ -115,11 +116,12 @@ impl HistoryMirror {
     }
 
     /// Classify a full `MessageHistory`: an append when its first `len`
-    /// messages hash to the mirror's state, else a replacement.
+    /// messages hash to the mirror's state, else a replacement. While the
+    /// hash is distrusted nothing can be told apart: always a replacement.
     pub fn update(&mut self, mut messages: Vec<Value>) -> HistoryUpdate {
-        if messages.len() >= self.len {
+        if self.hash_ok && messages.len() >= self.len {
             let prefix = feed(FNV_OFFSET, &messages[..self.len]);
-            if prefix == self.hash || !self.hash_ok {
+            if prefix == self.hash {
                 let base_len = self.len;
                 let suffix = messages.split_off(base_len);
                 self.hash = feed(prefix, &suffix);
@@ -143,9 +145,16 @@ impl HistoryMirror {
         HistoryUpdate::Replace { messages }
     }
 
-    /// Whether `digest` describes the mirrored messages.
-    pub fn matches(&self, digest: &ConversationDigest) -> bool {
-        digest.messages_len == self.len && (!self.hash_ok || digest.messages_hash == self.hash)
+    /// Whether `digest` describes the mirrored messages. A digest that
+    /// matches by hash re-arms a distrusted hash.
+    pub fn matches(&mut self, digest: &ConversationDigest) -> bool {
+        if digest.messages_len != self.len {
+            return false;
+        }
+        if digest.messages_hash == self.hash {
+            self.hash_ok = true;
+        }
+        !self.hash_ok || digest.messages_hash == self.hash
     }
 }
 
@@ -197,5 +206,30 @@ mod tests {
         assert!(!mirror.hash_trusted());
         assert!(mirror.matches(&same_len_other));
         assert!(!mirror.matches(&ConversationDigest { messages_len: 4, ..Default::default() }));
+    }
+
+    /// N1: under distrust no history is append-shaped: a same-length or a
+    /// longer rewrite is a `Replace`, never folded onto the old rows. A
+    /// digest that matches by hash again restores appends.
+    #[test]
+    fn distrust_replaces_every_history_until_a_hash_matches() {
+        let m = msgs(3);
+        let mut mirror = HistoryMirror::new(&m);
+        let off = ConversationDigest { messages_len: 3, messages_hash: 7, ..Default::default() };
+        let _ = mirror.resynced(m.clone(), Some(&off));
+        assert!(!mirror.hash_trusted());
+
+        let mut same_len = m.clone();
+        same_len[2] = json!({"role": "user", "content": "repaired"});
+        assert_eq!(mirror.update(same_len.clone()), HistoryUpdate::Replace { messages: same_len.clone() });
+        let mut longer: Vec<Value> = (0..5).map(|i| json!({"role": "user", "content": format!("rewritten {i}")})).collect();
+        assert_eq!(mirror.update(longer.clone()), HistoryUpdate::Replace { messages: longer.clone() });
+        assert_eq!(mirror.len(), 5);
+
+        let good = ConversationDigest { messages_len: 5, messages_hash: messages_hash(&longer), ..Default::default() };
+        assert!(mirror.matches(&good));
+        assert!(mirror.hash_trusted());
+        longer.push(json!({"role": "assistant", "content": "next"}));
+        assert!(matches!(mirror.update(longer), HistoryUpdate::Append { base_len: 5, .. }));
     }
 }

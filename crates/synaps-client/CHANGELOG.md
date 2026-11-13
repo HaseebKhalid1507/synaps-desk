@@ -1,5 +1,20 @@
 # synaps-client changelog
 
+## API changes since f2529da
+
+Follow-up to the PR #2 re-review (PR #3). Old → new, one line each.
+
+- `Attached.pending_prompts` / `clients` / `roster` dropped undecodable entries silently → still skipped, but counted in the new `Attached.rejected: Rejected` (per list, `total()`), and the client emits `Event::Error { error: Error::Decode { kind: "attached", .. } }` right after that `Attached`.
+- `Event::Session` could carry `SessionEvent::QueryResult` (other clients' replies, the daemon's reserved ids) → never does; `Client` drops every `QueryResult` that is not its own resync.
+- `history::HistoryMirror::matches(&self, ..)` → `matches(&mut self, ..)`: a digest that matches by hash re-arms a distrusted hash.
+- `HistoryMirror::update` under hash distrust returned `Append` for anything at least as long → always `Replace` until the hash is trusted again (as `absorb`).
+- `Event::Detached` after `detach()` / a replacing attach had `session_id: None` → the session's id when known; a detach that cuts a create short says "it may exist now".
+- `Event::Attached.mode` doc said `Takeover` after a reload → it is (and was) always the mode asked for.
+- `Attached::may_drive` documented as an attach-time hint only (stale after `Event::InputOwner`, blind to owned sessions).
+- `SessionEvent::Conversation` documented: in `Full` mode it can arrive ahead of the `Event::History` that resyncs to it.
+- Reconnect backoff reset on every successful connect → only after the connection stayed up 10 s (control and session connections); a session connection that keeps dropping gives up after the reconnect budget.
+- `attach()` / `create()` from several threads could enqueue `attach_seq`s out of order → enqueued in `attach_seq` order.
+
 ## API changes since 10ebfe7
 
 For the synaps-avatar author: everything that changed shape, old → new, one line each.

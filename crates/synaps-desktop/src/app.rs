@@ -91,20 +91,17 @@ impl AppView {
         }
     }
 
-    /// Drain an event channel and apply each batch to the model at once,
-    /// whether or not the window renders (minimized, hidden, occluded): the
-    /// queue can never grow behind a window that gets no frames. Only the
-    /// row rebuild and remeasure wait for the next frame (`sync_list`), and
-    /// the transcript coalesces those into one splice.
+    /// Drain an event channel ([`crate::model::pump`]) and apply each batch
+    /// to the model at once, whether or not the window renders (minimized,
+    /// hidden, occluded): the queue can never grow behind a window that
+    /// gets no frames. Only the row rebuild and remeasure wait for the next
+    /// frame (`sync_list`), and the transcript coalesces those into one
+    /// splice.
     pub fn pump(&mut self, rx: async_channel::Receiver<Event>, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |this, cx| {
-            while let Ok(first) = rx.recv().await {
-                let mut batch = vec![first];
-                while let Ok(e) = rx.try_recv() {
-                    batch.push(e);
-                }
+            crate::model::pump(rx, |batch| {
                 let now = Instant::now();
-                let alive = this.update(cx, |this, cx| {
+                this.update(cx, |this, cx| {
                     if let Some(b) = this.bench.as_mut() {
                         b.on_received(&batch, now);
                     }
@@ -114,11 +111,10 @@ impl AppView {
                         }
                     }
                     cx.notify();
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
+                })
+                .is_ok()
+            })
+            .await;
         });
         self._tasks.push(task);
     }

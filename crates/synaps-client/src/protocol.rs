@@ -281,8 +281,9 @@ pub fn lenient<T: DeserializeOwned>(raw: Vec<Value>) -> (Vec<T>, usize) {
     (ok, rejected)
 }
 
-fn lenient_vec<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
-    Ok(lenient(Option::<Vec<Value>>::deserialize(d)?.unwrap_or_default()).0)
+/// A missing or `null` list is empty.
+fn null_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Value>, D::Error> {
+    Ok(Option::<Vec<Value>>::deserialize(d)?.unwrap_or_default())
 }
 
 /// Decode one NDJSON line. Never fails on a well-formed JSON object: an
@@ -469,33 +470,105 @@ pub struct ClientInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(from = "RawAttached")]
 #[non_exhaustive]
 pub struct Attached {
     /// This connection's client id in the session.
     pub client: u64,
     pub meta: SessionMeta,
-    #[serde(default)]
     pub view: Value,
-    #[serde(default)]
     pub conversation: ConversationSnapshot,
-    #[serde(default)]
     pub streaming: bool,
-    #[serde(default)]
     pub replay: Vec<Envelope>,
-    #[serde(default, deserialize_with = "lenient_vec")]
     pub pending_prompts: Vec<PromptRequest>,
-    #[serde(default, deserialize_with = "lenient_vec")]
     pub clients: Vec<(u64, ClientKind)>,
-    #[serde(default, deserialize_with = "lenient_vec")]
     pub roster: Vec<ClientInfo>,
-    #[serde(default = "exclusive")]
     pub client_input: ClientInput,
-    #[serde(default)]
     pub input_owner: Option<u64>,
+    /// Entries of the lists above that did not decode (skipped). The client
+    /// also reports them as an `Error::Decode`: a skipped prompt is one the
+    /// user would otherwise never see.
+    pub rejected: Rejected,
+}
+
+/// Per list, how many entries of an `Attached` snapshot did not decode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Rejected {
+    pub pending_prompts: usize,
+    pub clients: usize,
+    pub roster: usize,
+}
+
+impl Rejected {
+    pub fn total(&self) -> usize {
+        self.pending_prompts + self.clients + self.roster
+    }
+}
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parts: Vec<String> = [("pending_prompts", self.pending_prompts), ("clients", self.clients), ("roster", self.roster)]
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(k, n)| format!("{n} {k}"))
+            .collect();
+        write!(f, "{} attach snapshot entries did not decode (skipped)", parts.join(", "))
+    }
+}
+
+#[derive(Deserialize)]
+struct RawAttached {
+    client: u64,
+    meta: SessionMeta,
+    #[serde(default)]
+    view: Value,
+    #[serde(default)]
+    conversation: ConversationSnapshot,
+    #[serde(default)]
+    streaming: bool,
+    #[serde(default)]
+    replay: Vec<Envelope>,
+    #[serde(default, deserialize_with = "null_vec")]
+    pending_prompts: Vec<Value>,
+    #[serde(default, deserialize_with = "null_vec")]
+    clients: Vec<Value>,
+    #[serde(default, deserialize_with = "null_vec")]
+    roster: Vec<Value>,
+    #[serde(default = "exclusive")]
+    client_input: ClientInput,
+    #[serde(default)]
+    input_owner: Option<u64>,
+}
+
+impl From<RawAttached> for Attached {
+    fn from(a: RawAttached) -> Self {
+        let (pending_prompts, p) = lenient(a.pending_prompts);
+        let (clients, c) = lenient(a.clients);
+        let (roster, r) = lenient(a.roster);
+        Attached {
+            client: a.client,
+            meta: a.meta,
+            view: a.view,
+            conversation: a.conversation,
+            streaming: a.streaming,
+            replay: a.replay,
+            pending_prompts,
+            clients,
+            roster,
+            client_input: a.client_input,
+            input_owner: a.input_owner,
+            rejected: Rejected { pending_prompts: p, clients: c, roster: r },
+        }
+    }
 }
 
 impl Attached {
-    /// Whether this client may send input now without being refused.
+    /// Whether this client could send input **at attach time**, by the
+    /// snapshot's `client_input` / `input_owner` alone. It goes stale at
+    /// the first `Event::InputOwner`, and it does not know about owned
+    /// sessions, which refuse non-owners even when input is shared. Treat
+    /// it as a hint; a refusal still comes back as `Error::Refused`.
     pub fn may_drive(&self, mode: AttachMode) -> bool {
         mode != AttachMode::Observe && (self.client_input == ClientInput::Shared || self.input_owner == Some(self.client))
     }
@@ -639,7 +712,10 @@ pub enum SessionEvent {
     },
     /// After every change to the conversation. A mirror whose length or
     /// hash differs from `digest` has drifted (clear, resume, compaction,
-    /// abort repair) and must re-query `Messages`.
+    /// abort repair) and must re-query `Messages`. From [`crate::Client`]
+    /// in `Full` mode this passes through at once, so it can run ahead of
+    /// the history: when it disagrees, an `Event::History` with the
+    /// `Replace` follows. Compare lengths only after that.
     Conversation {
         #[serde(default)]
         digest: ConversationDigest,
@@ -665,7 +741,10 @@ pub enum SessionEvent {
         #[serde(default)]
         text: String,
     },
-    /// The reply to a `Query`. Broadcast: check `id`.
+    /// The reply to a `Query`. Broadcast: check `id`. [`crate::Client`]
+    /// never passes these on (it sends no queries of yours; its own resync
+    /// arrives as `Event::History`, and other clients' replies and the
+    /// daemon's reserved ids are dropped).
     QueryResult {
         id: u64,
         #[serde(default)]
