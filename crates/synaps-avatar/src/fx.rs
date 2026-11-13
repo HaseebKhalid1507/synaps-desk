@@ -652,37 +652,8 @@ pub const BOLT_ARRIVE: f32 = 0.4;
 pub const BOLT_LAND: f32 = 0.5;
 /// …and the trail drains into her for a few more frames (no empty frame in between).
 pub const BOLT_END: f32 = 0.66;
-/// How the travelling line looks. Both travel the same way (the tip races from the
-/// origin to the target with the trail behind it); only the drawing differs. Two looks
-/// are kept only until Haseeb picks one (shots/r4/teleport-compare.mp4); then the other
-/// goes, with this enum.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LineStyle {
-    /// One flat red ribbon (the bar's bolt red); no core, glow, split or flicker.
-    #[allow(dead_code)]
-    Plain,
-    /// A red bolt with a light core, two stacked glow halos and a blue/cyan split; the
-    /// zig-zag, width, glow and forks re-roll every frame.
-    Glow,
-}
-
-pub const BOLT_STYLE: LineStyle = LineStyle::Glow;
-
-/// Plain: the bar's bolt red.
+/// The travelling line: one flat layer in the bar's bolt red.
 pub const BOLT_LINE: u32 = 0xff1738;
-/// Glow layers, outside in: lighter toward the core, no dark outline.
-pub const BOLT_GLOW: [u32; 4] = [0xe8163c, 0xff5274, 0xffa3b6, 0xfff4f7];
-/// Glow: the split ghosts either side of the bolt.
-pub const BOLT_SPLIT: [u32; 2] = [0x2e7bff, 0x00ffdd];
-/// Glow: the zig-zag re-rolls every frame at this period.
-const BOLT_STEP_MS: f32 = 33.0;
-
-/// One bolt layer: colour, edge grid (device px), polygons (root px).
-pub struct BoltLayer {
-    pub rgb: u32,
-    pub grid: i32,
-    pub polys: Vec<Vec<(f32, f32)>>,
-}
 
 #[derive(Clone, Copy, Debug)]
 struct RoutePt {
@@ -691,14 +662,14 @@ struct RoutePt {
     t: f32,
 }
 
-/// A jagged strike from `a` to `b` (root px).
+/// A jagged strike from `a` to `b` (root px): a plain red ribbon whose tip races from the
+/// origin to the target with the trail behind it.
 pub struct Bolt {
     a: (f32, f32),
     axis: (f32, f32),
     len: f32,
     seed: u64,
     scale: f32,
-    style: LineStyle,
     bbox: (i32, i32, i32, i32),
 }
 
@@ -707,8 +678,8 @@ fn along(p: (f32, f32), axis: (f32, f32), fwd: f32, across: f32) -> (f32, f32) {
 }
 
 impl Bolt {
-    /// `scale`: figure size in px (bolt thickness and branch reach follow it).
-    pub fn new(a: (f32, f32), b: (f32, f32), seed: u64, scale: f32, style: LineStyle) -> Bolt {
+    /// `scale`: figure size in px (the bolt's thickness follows it).
+    pub fn new(a: (f32, f32), b: (f32, f32), seed: u64, scale: f32) -> Bolt {
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let len = (dx * dx + dy * dy).sqrt().max(1.0);
         let axis = (dx / len, dy / len);
@@ -716,29 +687,22 @@ impl Bolt {
         let pad = scale * 0.6 + amp * 1.6 + 24.0;
         let (x0, x1) = (a.0.min(b.0) - pad, a.0.max(b.0) + pad);
         let (y0, y1) = (a.1.min(b.1) - pad, a.1.max(b.1) + pad);
-        Bolt { a, axis, len, seed, scale, style, bbox: (x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32) }
+        Bolt { a, axis, len, seed, scale, bbox: (x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32) }
     }
 
-    fn amp(&self) -> f32 {
-        (self.len * 0.11).clamp(16.0, 90.0)
-    }
-
-    /// The zig-zag route. `step`: re-jitter the elbows for this frame (glow); `None` =
-    /// the plain route (the jitter's midpoint), the same every frame.
-    fn route(&self, step: Option<u64>) -> Vec<RoutePt> {
+    /// The zig-zag route, fixed for the whole strike.
+    fn route(&self) -> Vec<RoutePt> {
         let mut rng = Rng::new(self.seed | 1);
-        let mut jit = step.map(|st| Rng::new((self.seed ^ st.wrapping_mul(0x9e37_79b9_7f4a_7c15)) | 1));
-        let mut j = |lo: f32, hi: f32| jit.as_mut().map_or((lo + hi) / 2.0, |r| r.range(lo, hi));
-        let amp = self.amp();
+        let amp = (self.len * 0.11).clamp(16.0, 90.0);
         let a = self.a;
         let mirror = if rng.range(0.0, 1.0) < 0.5 { -1.0 } else { 1.0 };
         let mut route = vec![RoutePt { x: a.0, y: a.1, t: 0.0 }];
         for &(base, off) in &[(0.13, -0.3), (0.27, 0.66), (0.41, -0.6), (0.55, 0.78), (0.69, -0.26), (0.8, 0.7), (0.91, -0.16)] {
-            let t = base + rng.range(-0.02, 0.02) + j(-0.012, 0.012);
-            let bend = off * amp * mirror * rng.range(0.73, 1.18) * j(0.7, 1.3);
+            let t = base + rng.range(-0.02, 0.02);
+            let bend = off * amp * mirror * rng.range(0.73, 1.18);
             let prev = *route.last().expect("route start");
             let corner = along(a, self.axis, t * self.len, bend);
-            let crack = rng.range(0.18, 0.34) * amp * 0.6 * j(0.6, 1.4);
+            let crack = rng.range(0.18, 0.34) * amp * 0.6;
             let mid = ((prev.x + (corner.0 - prev.x) * 0.62), (prev.y + (corner.1 - prev.y) * 0.62));
             let mid = along(mid, self.axis, 0.0, -bend.signum() * crack);
             route.push(RoutePt { x: mid.0, y: mid.1, t: prev.t + (t - prev.t) * 0.62 });
@@ -772,17 +736,14 @@ impl Bolt {
         (ease(0.06 + u / 0.4), ease((u - 0.13) / 0.55))
     }
 
-    /// The bolt at time `u`, bottom layer first (empty before/after the strike).
-    /// `grid`: edge grid for the glow halos, device px.
-    pub fn frame(&self, u: f32, grid: i32) -> Vec<BoltLayer> {
+    /// The bolt at time `u` as one polygon, root px (empty before/after the strike):
+    /// thickest just behind the tip, tapering to the trail.
+    pub fn frame(&self, u: f32) -> Vec<(f32, f32)> {
         let (head, tail) = Bolt::span(u);
         if head <= tail + 0.004 {
             return Vec::new();
         }
-        let glow = self.style == LineStyle::Glow;
-        let step = (u * BOLT_MS / BOLT_STEP_MS) as u64;
-        let route = self.route(glow.then_some(step));
-        let mut fl = Rng::new((self.seed ^ 0xb017 ^ step.wrapping_mul(0x2545_f491_4f6c_dd1d)) | 1);
+        let route = self.route();
         let travelled = head - tail;
         let mut seg: Vec<(f32, f32, f32)> = vec![{
             let p = Bolt::at(&route, tail);
@@ -791,61 +752,14 @@ impl Bolt {
         seg.extend(route.iter().filter(|p| p.t > tail && p.t < head).map(|p| (p.x, p.y, p.t)));
         let hp = Bolt::at(&route, head);
         seg.push((hp.0, hp.1, head));
-        let pts: Vec<(f32, f32)> = seg.iter().map(|p| (p.0, p.1)).collect();
+        let radius = (self.scale * 0.07).clamp(4.0, 18.0);
         let n = seg.len();
-        // Thickest just behind the tip.
-        let taper = |radius: f32, zig: bool| -> Vec<f32> {
-            seg.iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    if i == 0 || i == n - 1 {
-                        0.6
-                    } else {
-                        let k = if !zig { 1.0 } else if i % 2 == 1 { 1.12 } else { 0.86 };
-                        radius * (0.45 + 0.6 * (p.2 - tail) / travelled) * k
-                    }
-                })
-                .collect()
-        };
-        if !glow {
-            let widths = taper((self.scale * 0.07).clamp(4.0, 18.0), false);
-            return vec![BoltLayer { rgb: BOLT_LINE, grid: 2, polys: vec![ribbon(&pts, &widths)] }];
-        }
-        let widths = taper((self.scale * 0.09).clamp(5.0, 24.0) * fl.range(0.7, 1.25), true);
-        let halo = fl.range(0.8, 1.2);
-        let grow = |k: f32, add: f32| widths.iter().map(|w| w * k + add).collect::<Vec<_>>();
-        // The split: the bolt again either side, across the strike, 4–8 px.
-        let d = fl.range(4.0, 8.0) * (self.scale / 220.0).clamp(0.8, 1.6);
-        let shift = |s: f32| pts.iter().map(|&p| along(p, self.axis, 0.0, s)).collect::<Vec<_>>();
-        // Halos at the bottom, the split fringes over them, then the bolt and its core.
-        let mut out = vec![
-            BoltLayer { rgb: BOLT_GLOW[0], grid, polys: vec![ribbon(&pts, &grow(1.9 * halo, 4.0))] },
-            BoltLayer { rgb: BOLT_GLOW[1], grid, polys: vec![ribbon(&pts, &grow(1.35 * halo, 1.5))] },
-            BoltLayer { rgb: BOLT_SPLIT[0], grid: 2, polys: vec![ribbon(&shift(d), &widths)] },
-            BoltLayer { rgb: BOLT_SPLIT[1], grid: 2, polys: vec![ribbon(&shift(-d), &widths)] },
-            BoltLayer { rgb: BOLT_GLOW[2], grid: 2, polys: vec![ribbon(&pts, &widths)] },
-            BoltLayer { rgb: BOLT_GLOW[3], grid: 2, polys: vec![ribbon(&pts, &grow(0.38, 0.0))] },
-        ];
-        // 0–3 small forks off the travelled part; they come and go frame to frame.
-        if travelled > 0.08 {
-            for k in 0..fl.pick(4) {
-                let t = tail + travelled * fl.range(0.15, 0.85);
-                let side = if (k + step as usize) % 2 == 1 { 1.0 } else { -1.0 };
-                let o = Bolt::at(&route, t);
-                let (p0, p1) = (Bolt::at(&route, t - 0.04), Bolt::at(&route, t + 0.04));
-                let (ax, ay) = (p1.0 - p0.0, p1.1 - p0.1);
-                let al = (ax * ax + ay * ay).sqrt().max(1e-3);
-                let axis = (ax / al, ay / al);
-                let reach = self.scale * fl.range(0.12, 0.3);
-                let fork = |f: f32, a: f32| along(o, axis, reach * f, side * reach * a);
-                let stem = [o, fork(0.1, 0.25), fork(0.05, 0.45), fork(0.4, 0.62), fork(0.32, 0.85), fork(0.7, 1.05)];
-                let th = (self.scale * 0.012).clamp(1.6, 3.6);
-                let w: Vec<f32> = [1.3, 1.6, 1.25, 0.9, 0.55, 0.1].iter().map(|v| v * th).collect();
-                out[1].polys.push(ribbon(&stem, &w.iter().map(|v| v * 1.6 + 1.0).collect::<Vec<_>>()));
-                out[4].polys.push(ribbon(&stem, &w));
-            }
-        }
-        out
+        let widths: Vec<f32> = seg
+            .iter()
+            .enumerate()
+            .map(|(i, p)| if i == 0 || i == n - 1 { 0.6 } else { radius * (0.45 + 0.6 * (p.2 - tail) / travelled) })
+            .collect();
+        ribbon(&seg.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(), &widths)
     }
 }
 
@@ -867,25 +781,18 @@ fn ribbon(pts: &[(f32, f32)], widths: &[f32]) -> Vec<(f32, f32)> {
     upper
 }
 
-/// Polygons (root px) → shape rects relative to `origin`.
-/// Polygons → shape rows, edges snapped to a `step` px grid (Capri's bolt is blocky).
-pub fn polys_to_rects(polys: &[Vec<(f32, f32)>], origin: (i32, i32), step: i32) -> Vec<ShapeRect> {
+/// The bolt polygon (root px) → shape rows relative to `origin`, run edges snapped to a
+/// 2 px grid with a little per-row jitter, so the outline stair-steps like Capri's bolt.
+pub fn bolt_rects(poly: &[(f32, f32)], origin: (i32, i32)) -> Vec<ShapeRect> {
+    const STEP: i32 = 2;
     let mut rows = Vec::new();
-    for p in polys {
-        let local: Vec<(f32, f32)> = p.iter().map(|&(x, y)| (x - origin.0 as f32, y - origin.1 as f32)).collect();
-        shape::poly_rows(&local, &mut rows);
-    }
-    if step <= 1 {
-        return rows;
-    }
-    // Snap each run to the grid, per band of `step / 2` rows, so the edge stair-steps.
-    let band = (step / 2).max(1);
+    let local: Vec<(f32, f32)> = poly.iter().map(|&(x, y)| (x - origin.0 as f32, y - origin.1 as f32)).collect();
+    shape::poly_rows(&local, &mut rows);
     rows.into_iter()
         .filter_map(|(x, y, w, h)| {
-            let b = (y as i32).div_euclid(band) as u32;
-            let jitter = (hash01(b, x as u32 / step as u32) * step as f32) as i32;
-            let x0 = (x as i32 + jitter / 2).div_euclid(step) * step;
-            let x1 = (x as i32 + w as i32 + jitter / 2).div_euclid(step) * step;
+            let jitter = (hash01(y as u32, x as u32 / STEP as u32) * STEP as f32) as i32;
+            let x0 = (x as i32 + jitter / 2).div_euclid(STEP) * STEP;
+            let x1 = (x as i32 + w as i32 + jitter / 2).div_euclid(STEP) * STEP;
             (x1 > x0).then_some((x0 as i16, y, (x1 - x0) as u16, h))
         })
         .collect()
@@ -1027,25 +934,15 @@ mod tests {
 
     #[test]
     fn bolt_reaches_both_ends() {
-        for style in [LineStyle::Plain, LineStyle::Glow] {
-            let b = Bolt::new((0.0, 0.0), (400.0, 100.0), 3, 300.0, style);
-            let r = b.route(None);
-            assert_eq!(Bolt::at(&r, 0.0), (0.0, 0.0));
-            let end = Bolt::at(&r, 1.0);
-            assert!((end.0 - 400.0).abs() < 0.01 && (end.1 - 100.0).abs() < 0.01);
-            let layers = b.frame(0.3, 3);
-            assert_eq!(layers.len(), if style == LineStyle::Plain { 1 } else { 6 });
-            assert!(layers.iter().all(|l| !l.polys.is_empty()));
-            assert!(b.frame(1.0, 3).is_empty());
-        }
-        // Plain: one flat red, the same shape every frame (no flicker).
-        let p = Bolt::new((0.0, 0.0), (400.0, 100.0), 3, 300.0, LineStyle::Plain);
-        assert_eq!(p.frame(0.30, 3)[0].polys, p.frame(0.30, 3)[0].polys);
-        assert_eq!(p.route(None)[3].x, p.route(None)[3].x);
-        assert_eq!(p.frame(0.3, 3)[0].rgb, BOLT_LINE);
-        // Glow: the zig-zag re-rolls from frame to frame.
-        let g = Bolt::new((0.0, 0.0), (400.0, 100.0), 3, 300.0, LineStyle::Glow);
-        assert_ne!(g.route(Some(1))[3].x, g.route(Some(2))[3].x);
+        let b = Bolt::new((0.0, 0.0), (400.0, 100.0), 3, 300.0);
+        let r = b.route();
+        assert_eq!(Bolt::at(&r, 0.0), (0.0, 0.0));
+        let end = Bolt::at(&r, 1.0);
+        assert!((end.0 - 400.0).abs() < 0.01 && (end.1 - 100.0).abs() < 0.01);
+        assert!(!b.frame(0.3).is_empty());
+        assert!(b.frame(1.0).is_empty());
+        // No flicker: the same shape for the same time, the same route every frame.
+        assert_eq!(b.frame(0.3), b.frame(0.3));
         // The tip travels: it advances over 3–5 frames at 30 fps before reaching the target.
         let frames = (BOLT_MS / 33.3) as usize;
         let tips: Vec<f32> = (0..frames).map(|i| Bolt::span(i as f32 * 33.3 / BOLT_MS).0).collect();

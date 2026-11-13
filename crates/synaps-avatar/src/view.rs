@@ -166,10 +166,10 @@ impl Bubble {
 
 const TYPE_TICK: Duration = Duration::from_millis(35);
 const HEARTS_MS: u64 = 1_150;
-/// First effect layer of the hearts (the bolt uses 0 and 1): a rim and a fill per heart.
+/// Effect layer of the teleport bolt.
+const BOLT_LAYER: usize = 0;
+/// First effect layer of the hearts: a rim and a fill per heart.
 const HEART_LAYER: usize = 6;
-/// Effect layers 0..BOLT_LAYERS are the teleport bolt.
-const BOLT_LAYERS: usize = 6;
 /// The contact shadow under a perch, stacked right below the avatar window.
 const SHADOW_LAYER: usize = 14;
 /// Music notes: an outline and a fill layer each, at most seven notes.
@@ -871,9 +871,7 @@ impl Avatar {
     }
 
     fn fx_hide_bolt(&self) {
-        for i in 0..BOLT_LAYERS {
-            self.x11.fx_unmap(i);
-        }
+        self.x11.fx_unmap(BOLT_LAYER);
         self.x11.flush();
     }
 
@@ -1131,7 +1129,7 @@ impl Avatar {
                 let from = self.center_root(self.origin);
                 let to = self.center_root(to);
                 let seed = self.teleport.as_ref().map_or(0, |t| t.seed) ^ 0xb017_5eed;
-                let bolt = Bolt::new(from, to, seed, 220.0 * self.layout.sf, fx::BOLT_STYLE);
+                let bolt = Bolt::new(from, to, seed, 220.0 * self.layout.sf);
                 if let Some(tp) = &mut self.teleport {
                     tp.bolt = Some(bolt);
                     tp.leg = Leg::Bolt(now);
@@ -1169,10 +1167,7 @@ impl Avatar {
         }
         // The trail has drained into her: the landing glitch finishes the teleport.
         if u >= fx::BOLT_END {
-            for i in 0..BOLT_LAYERS {
-                self.x11.fx_unmap(i);
-            }
-            self.x11.flush();
+            self.fx_hide_bolt();
             if self.glitch.is_none() {
                 // The landing already finished (a stalled frame): done.
                 self.teleport = None;
@@ -1188,19 +1183,8 @@ impl Avatar {
         if let Some(b) = &tp.bolt {
             let (bx, by, bw, bh) = b.bbox();
             let o = (bx, by);
-            let layers = b.frame(u, (3.0 * self.layout.sf).round() as i32);
-            // Top layer first, each lower one right under the one above it.
-            for (i, layer) in layers.iter().enumerate().rev() {
-                let rects = fx::polys_to_rects(&layer.polys, o, layer.grid);
-                if i + 1 == layers.len() {
-                    self.x11.fx_set(i, layer.rgb, o, (bw, bh), &rects).ok();
-                } else {
-                    self.x11.fx_set_below(i, i + 1, layer.rgb, o, (bw, bh), &rects).ok();
-                }
-            }
-            for i in layers.len()..BOLT_LAYERS {
-                self.x11.fx_unmap(i);
-            }
+            let rects = fx::bolt_rects(&b.frame(u), o);
+            self.x11.fx_set(BOLT_LAYER, fx::BOLT_LINE, o, (bw, bh), &rects).ok();
             self.x11.flush();
         }
         if u >= fx::BOLT_ARRIVE && !moved {
