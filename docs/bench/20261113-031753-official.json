@@ -1,0 +1,241 @@
+{
+ "bench": "synaps-desktop",
+ "version": "0.0.1",
+ "exec_to_main_ms": 0.0,
+ "main_to_first_frame_ms": 294.57,
+ "first_frame_epoch_ms": 1794557873561.6,
+ "exec_to_first_frame_ms_approx": 294.6,
+ "mem_idle": {
+  "rss_kb": 197784,
+  "pss_kb": 176009,
+  "uss_kb": 161348,
+  "anon_kb": 47984,
+  "gpu_driver_mappings": {
+   "rss_kb": 95460,
+   "pss_kb": 79656,
+   "uss_kb": 66544,
+   "anon_kb": 9688
+  },
+  "excluding_gpu_driver": {
+   "rss_kb": 102324,
+   "pss_kb": 96353,
+   "uss_kb": 94804,
+   "anon_kb": 38296
+  },
+  "rollup": {
+   "rss_kb": 198276,
+   "pss_kb": 176537,
+   "uss_kb": 161840
+  }
+ },
+ "stream": {
+  "duration_s": 5.1,
+  "frames_presented": 732,
+  "fps": 143.5,
+  "refresh_hz": 143.86,
+  "refresh_source": "--refresh-hz",
+  "refreshes_in_window": 733,
+  "dropped_frames": 6,
+  "draw_ms": {
+   "n": 732,
+   "p50": 1.07,
+   "p95": 1.64,
+   "p99": 2.68,
+   "max": 12.42,
+   "mean": 1.17
+  },
+  "draw_phases_p50_ms": {
+   "request_layout": 0.1,
+   "prepaint": 0.63,
+   "paint": 0.27
+  },
+  "draw_phases_p95_ms": {
+   "request_layout": 0.15,
+   "prepaint": 0.98,
+   "paint": 0.46
+  },
+  "present_submit_ms": {
+   "n": 732,
+   "p50": 0.15,
+   "p95": 0.17,
+   "p99": 0.2,
+   "max": 1.14,
+   "mean": 0.15
+  },
+  "frame_interval_ms": {
+   "n": 731,
+   "p50": 6.96,
+   "p95": 7.19,
+   "p99": 8.63,
+   "max": 18.77,
+   "mean": 6.97
+  },
+  "draws_over_budget": 2,
+  "deltas_sent": 1000,
+  "deltas_per_s": 200.2,
+  "deltas_received": 1000,
+  "streamed_chars": 9037
+ },
+ "mem_after_stream": {
+  "rss_kb": 246528,
+  "pss_kb": 224497,
+  "uss_kb": 209708,
+  "anon_kb": 91664,
+  "gpu_driver_mappings": {
+   "rss_kb": 97352,
+   "pss_kb": 81491,
+   "uss_kb": 68372,
+   "anon_kb": 9688
+  },
+  "excluding_gpu_driver": {
+   "rss_kb": 149176,
+   "pss_kb": 143006,
+   "uss_kb": 141336,
+   "anon_kb": 81976
+  },
+  "rollup": {
+   "rss_kb": 246944,
+   "pss_kb": 224946,
+   "uss_kb": 210124
+  }
+ },
+ "mem_long_transcript_loaded": {
+  "rss_kb": 248684,
+  "pss_kb": 226730,
+  "uss_kb": 211912,
+  "anon_kb": 93820,
+  "gpu_driver_mappings": {
+   "rss_kb": 97352,
+   "pss_kb": 81491,
+   "uss_kb": 68372,
+   "anon_kb": 9688
+  },
+  "excluding_gpu_driver": {
+   "rss_kb": 151332,
+   "pss_kb": 145239,
+   "uss_kb": 143540,
+   "anon_kb": 84132
+  },
+  "rollup": {
+   "rss_kb": 249108,
+   "pss_kb": 227186,
+   "uss_kb": 212336
+  }
+ },
+ "scroll": {
+  "duration_s": 6.0,
+  "frames_presented": 864,
+  "fps": 144.0,
+  "refresh_hz": 143.86,
+  "refresh_source": "--refresh-hz",
+  "refreshes_in_window": 863,
+  "dropped_frames": 0,
+  "draw_ms": {
+   "n": 864,
+   "p50": 0.85,
+   "p95": 1.87,
+   "p99": 2.35,
+   "max": 3.2,
+   "mean": 0.96
+  },
+  "draw_phases_p50_ms": {
+   "request_layout": 0.1,
+   "prepaint": 0.42,
+   "paint": 0.25
+  },
+  "draw_phases_p95_ms": {
+   "request_layout": 0.15,
+   "prepaint": 1.42,
+   "paint": 0.32
+  },
+  "present_submit_ms": {
+   "n": 864,
+   "p50": 0.15,
+   "p95": 0.18,
+   "p99": 0.2,
+   "max": 0.25,
+   "mean": 0.15
+  },
+  "frame_interval_ms": {
+   "n": 863,
+   "p50": 6.95,
+   "p95": 7.97,
+   "p99": 8.55,
+   "max": 9.4,
+   "mean": 6.95
+  },
+  "draws_over_budget": 0,
+  "rows": 2197,
+  "messages": 2000,
+  "px_per_s": 4000.0,
+  "reached_row": 178
+ },
+ "mem_after_scroll": {
+  "rss_kb": 249868,
+  "pss_kb": 227919,
+  "uss_kb": 213096,
+  "anon_kb": 95004,
+  "gpu_driver_mappings": {
+   "rss_kb": 97352,
+   "pss_kb": 81491,
+   "uss_kb": 68372,
+   "anon_kb": 9688
+  },
+  "excluding_gpu_driver": {
+   "rss_kb": 152516,
+   "pss_kb": 146428,
+   "uss_kb": 144724,
+   "anon_kb": 85316
+  },
+  "rollup": {
+   "rss_kb": 249868,
+   "pss_kb": 227951,
+   "uss_kb": 213096
+  }
+ },
+ "daemon_turn": {
+  "attach_ms": 5.5,
+  "ttft_ms": 1324.2,
+  "ttft_painted_ms": 1326.6,
+  "turn_ms": 1464.2,
+  "rows": 3
+ },
+ "mem_end": {
+  "rss_kb": 249964,
+  "pss_kb": 228015,
+  "uss_kb": 213192,
+  "anon_kb": 95100,
+  "gpu_driver_mappings": {
+   "rss_kb": 97352,
+   "pss_kb": 81491,
+   "uss_kb": 68372,
+   "anon_kb": 9688
+  },
+  "excluding_gpu_driver": {
+   "rss_kb": 152612,
+   "pss_kb": 146524,
+   "uss_kb": 144820,
+   "anon_kb": 85412
+  },
+  "rollup": {
+   "rss_kb": 249964,
+   "pss_kb": 228047,
+   "uss_kb": 213192
+  }
+ },
+ "startup_marks_ms": {
+  "before_application": 0.13,
+  "app_run_callback": 16.61,
+  "kit_init_done": 17.86,
+  "first_render": 274.36,
+  "window_opened": 285.17
+ },
+ "total_s": 16.38,
+ "launch_to_first_frame_ms": 311.5,
+ "host": {
+  "loadavg_before": "3.32 8.21 11.50",
+  "loadavg_after": "2.95 7.89 11.34",
+  "rustc_procs_before": 0,
+  "wm_placement": "floating"
+ }
+}
