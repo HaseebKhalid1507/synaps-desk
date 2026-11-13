@@ -177,7 +177,11 @@ const NOTE_LAYER: usize = 15;
 const NOTES_MAX: usize = 7;
 /// Notes are drawn this much larger than Capri's canvas sizes (our figure is smaller).
 const NOTE_SCALE: f32 = 1.15;
-/// The farthest a pose step moves any row (nod, breath, sway), logical px.
+/// The farthest a pose step moves any row (nod, breath, sway), logical px. Posed frames
+/// paint the art at this reach (and half of it) in 8 directions underneath the bands: the
+/// bounding shape is set when a frame paints but its present lands up to a frame later, so
+/// where a nod or sway step grows the shape, the strip shows the previous present (black
+/// rim on the hair for one frame without this).
 const POSE_REACH: f32 = 5.0;
 /// Notes fade toward this tint (no alpha without a compositor).
 const NOTE_TINT: u32 = 0x3a4656;
@@ -273,8 +277,8 @@ pub struct Avatar {
     hop: Option<Instant>,
     next_hop: Option<Instant>,
     glitch: Option<Glitch>,
-    /// Glitch frames drawn so far: each one gets a new pattern.
-    glitch_step: Cell<u64>,
+    /// Frames drawn in the current glitch (keyed by its start): each gets a new pattern.
+    glitch_step: Cell<(Option<Instant>, u64)>,
     next_glitch: Option<Instant>,
     squash: Option<Instant>,
     glints: Vec<Glint>,
@@ -370,7 +374,7 @@ impl Avatar {
             hop: None,
             next_hop: None,
             glitch: None,
-            glitch_step: Cell::new(0),
+            glitch_step: Cell::new((None, 0)),
             next_glitch: None,
             squash: None,
             glints: Vec::new(),
@@ -2067,29 +2071,53 @@ impl Render for Avatar {
             plan.sx = sx;
             plan.sy = sy;
         }
+        // The next frame's plan, painted underneath this one. The bounding shape is set when
+        // a frame paints, but its present lands up to a frame later, so wherever the next
+        // shape grows, this frame's pixels show for a moment. Without an underlay they're
+        // transparent (black slabs without a compositor); with it, they're what comes next.
+        let mut next: Option<BodyPlan> = None;
         if let Some(g) = self.glitch {
             let (top, face, bx0, bx1) = frame.map_or((0, None, 0, aw), |f| {
                 let (x0, x1) = f.profile.iter().enumerate().filter(|p| *p.1 != i16::MAX).fold((aw, 0), |a, (i, _)| (a.0.min(i as i32), a.1.max(i as i32)));
                 (f.top, g.keeps_face().then_some(f.face), x0, x1.max(x0 + 1))
             });
-            plan.glitch(fx::GlitchStep {
-                strength: g.strength(now),
-                coverage: g.coverage(now),
-                seed: g.step_seed(self.glitch_step.replace(self.glitch_step.get() + 1)),
-                order: g.seed(),
-                y0: -l.avatar_y,
-                h: ah,
-                body: (bx0, top, bx1 - bx0, ah - top),
-                face,
-                solid: g.solid(now),
-                // Last frame's tag rows (avatar-local device px), so a cut tears the plate.
-                tag: self.tag_box.get().map(|b| {
-                    let y = f32::from(b.origin.y) * sf - l.avatar_y as f32;
-                    (y as i32, (y + f32::from(b.size.height) * sf) as i32)
-                }),
-                sf,
+            // Last frame's tag rows (avatar-local device px), so a cut tears the plate.
+            let tag = self.tag_box.get().map(|b| {
+                let y = f32::from(b.origin.y) * sf - l.avatar_y as f32;
+                (y as i32, (y + f32::from(b.size.height) * sf) as i32)
             });
-            plan.tint = g.tint(now);
+            let step = match self.glitch_step.get() {
+                (Some(t0), n) if t0 == g.t0 => n,
+                _ => 0,
+            };
+            self.glitch_step.set((Some(g.t0), step + 1));
+            let base = plan.clone();
+            let lay = |at: Instant, step: u64| {
+                let mut p = base.clone();
+                p.glitch(fx::GlitchStep {
+                    strength: g.strength(at),
+                    coverage: g.coverage(at),
+                    seed: g.step_seed(step),
+                    order: g.seed(),
+                    y0: -l.avatar_y,
+                    h: ah,
+                    body: (bx0, top, bx1 - bx0, ah - top),
+                    face,
+                    solid: g.solid(at),
+                    tag,
+                    sf,
+                });
+                p.tint = g.tint(at);
+                p
+            };
+            // Out of a still figure, the first frame stays still and lays the first pattern
+            // underneath (one frame late, no black slabs on the onset).
+            let pre_roll = step == 0 && matches!(g.kind, GlitchKind::Burst | GlitchKind::Big | GlitchKind::Vanish);
+            if !pre_roll {
+                plan = lay(now, step);
+            }
+            let at = now + FRAME_FX;
+            next = Some(if g.done(at) { base } else { lay(at.max(g.t0), step + 1) });
         }
         // Device px the art is also painted at underneath the posed bands (see the body).
         let mut under = 0.0f32;
@@ -2103,6 +2131,21 @@ impl Render for Avatar {
                 under = (POSE_REACH * sf).ceil();
             }
         }
+        // The glitch ends next frame: the plain or posed figure comes back.
+        if next.as_ref().is_some_and(|n| n.slices.is_none()) {
+            under = (POSE_REACH * sf).ceil();
+        }
+        let next_ghosts = next.as_ref().filter(|n| n.has_ghosts() && !hidden).map(|n| n.ghost_rects(&rects)).unwrap_or_default();
+        let next_fill: Vec<(ShapeRect, u32)> = next
+            .as_ref()
+            .filter(|_| !hidden)
+            .map(|n| match n.tint {
+                Some(c) => n.body_rects(&rects).into_iter().map(|r| (r, c)).collect(),
+                None => n.solid_rects(&rects),
+            })
+            .unwrap_or_default();
+        let next = next.filter(|_| !hidden).map(Rc::new);
+        let next_tag = next.clone();
         let plan = Rc::new(plan);
         let body_shape: Vec<ShapeRect> = if hidden {
             Vec::new()
@@ -2145,6 +2188,40 @@ impl Render for Avatar {
                     let lp = |v: f32| v / sf;
                     let rect = |x: f32, y: f32, w: f32, h: f32| Bounds::new(point(px(ax + lp(x)), px(ay + lp(y))), size(px(lp(w)), px(lp(h))));
                     if let (Some(img), false) = (image, hidden) {
+                        // Underlays first: invisible outside this frame's shape and covered
+                        // inside it, they fill the strips the next shape grows into.
+                        if under > 0.0 {
+                            let (ix, iy, iw, ih) = plan2.image_rect(aw, ah);
+                            for k in [1.0, 0.5] {
+                                for (ox, oy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
+                                    let r = rect(ix + ox * under * k, iy + oy * under * k, iw, ih);
+                                    window.paint_image(r, r, Corners::default(), img.clone(), 0, false).ok();
+                                }
+                            }
+                        }
+                        if let Some(n) = &next {
+                            for &(r, c) in next_ghosts.iter().chain(&next_fill) {
+                                window.paint_quad(fill(rect(r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32), rgb(c)));
+                            }
+                            let (nx, ny, nw, nh) = n.image_rect(aw, ah);
+                            match (&n.slices, n.tint) {
+                                (_, Some(_)) => {}
+                                (None, None) => {
+                                    let r = rect(nx, ny, nw, nh);
+                                    window.paint_image(r, r, Corners::default(), img.clone(), 0, false).ok();
+                                }
+                                (Some(bands), None) => {
+                                    for (i, &(y0, y1, dx, dy)) in bands.iter().enumerate() {
+                                        if n.solid.get(i).is_some_and(Option::is_some) {
+                                            continue;
+                                        }
+                                        let shifted = rect(nx + dx as f32, ny + dy as f32, nw, nh);
+                                        let clip = rect(nx + dx as f32, (y0 + dy) as f32, nw, (y1 - y0) as f32);
+                                        window.paint_image(clip, shifted, Corners::default(), img.clone(), 0, false).ok();
+                                    }
+                                }
+                            }
+                        }
                         for &(r, c) in &ghost_rects {
                             window.paint_quad(fill(rect(r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32), rgb(c)));
                         }
@@ -2169,21 +2246,6 @@ impl Render for Avatar {
                                 window.paint_image(ib, ib, Corners::default(), img, 0, false).ok();
                             }
                             Some(bands) => {
-                                // Posed: the frame at the pose's reach (and half of it) in 8 directions goes
-                                // underneath. The bounding shape is set when this frame paints
-                                // but the present lands up to a frame later, so where a nod or
-                                // sway step grows the shape, the strip it grows into shows the
-                                // previous present. Without this that was transparent (black
-                                // outline on the hair for one frame); with it, it's hair.
-                                // Outside the shape it's invisible; inside, the bands cover it.
-                                if under > 0.0 {
-                                    for k in [1.0, 0.5] {
-                                        for (ox, oy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
-                                            let r = rect(ix + ox * under * k, iy + oy * under * k, iw, ih);
-                                            window.paint_image(r, r, Corners::default(), img.clone(), 0, false).ok();
-                                        }
-                                    }
-                                }
                                 for (r, c) in &solid_rects {
                                     window.paint_quad(fill(rect(r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32), rgb(*c)));
                                 }
@@ -2276,6 +2338,27 @@ impl Render for Avatar {
                 let (bx, by) = (f32::from(b.origin.x), f32::from(b.origin.y));
                 let (bw, bh) = (f32::from(b.size.width), f32::from(b.size.height));
                 let t0 = by * sf - l.avatar_y as f32;
+                // Next frame's strips first (underneath, same reason as the body's underlay),
+                // then this frame's on top. Only this frame's go into the shape.
+                let under_bands: Vec<(i32, i32, i32, i32)> =
+                    next_tag.as_ref().and_then(|n| n.slices.clone()).unwrap_or_else(|| vec![(i32::MIN / 2, i32::MAX / 2, 0, 0)]);
+                for &(y0, y1, dx, _) in &under_bands {
+                    let (a, c) = ((y0 as f32).max(t0), (y1 as f32).min(t0 + bh * sf));
+                    if c <= a {
+                        continue;
+                    }
+                    let (s0, s1, dx) = ((a - t0) / sf, (c - t0) / sf, dx as f32 / sf);
+                    root = root.child(
+                        div()
+                            .absolute()
+                            .left(px(bx + dx))
+                            .top(px(by + s0))
+                            .w(px(bw))
+                            .h(px(s1 - s0))
+                            .overflow_hidden()
+                            .child(div().absolute().left_0().top(px(-s0)).w(px(bw)).h(px(bh)).child(make_ring())),
+                    );
+                }
                 for &(y0, y1, dx, _) in bands {
                     let (a, c) = ((y0 as f32).max(t0), (y1 as f32).min(t0 + bh * sf));
                     if c <= a {
