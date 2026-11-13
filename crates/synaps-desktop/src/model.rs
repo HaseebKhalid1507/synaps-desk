@@ -3,8 +3,53 @@
 //! hidden or minimized window holds the current transcript and nothing
 //! else; the view only turns the transcript's splice into rows per frame.
 
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use synaps_client::protocol::SessionMeta;
 use synaps_client::{AttachMode, Error, Event, SessionEvent, Status, Transcript};
+
+/// Most events the pump applies before it yields to the UI (a frame can run
+/// between batches; a backlog never becomes one unbounded `Vec`).
+pub const MAX_BATCH: usize = 1024;
+
+/// The event pump. Waits for an event, takes whatever else is already
+/// queued (up to [`MAX_BATCH`]) and hands the batch to `apply` at once,
+/// then yields. Nothing here waits for a frame: a minimized or hidden
+/// window drains the channel as fast as one that renders, so the channel
+/// stays empty and the model is the only state. Ends when the channel
+/// closes or `apply` returns `false` (the view is gone).
+pub async fn pump(rx: async_channel::Receiver<Event>, mut apply: impl FnMut(Vec<Event>) -> bool) {
+    while let Ok(first) = rx.recv().await {
+        let mut batch = Vec::with_capacity((rx.len() + 1).min(MAX_BATCH));
+        batch.push(first);
+        while batch.len() < MAX_BATCH
+            && let Ok(e) = rx.try_recv()
+        {
+            batch.push(e);
+        }
+        if !apply(batch) {
+            break;
+        }
+        YieldNow(false).await;
+    }
+}
+
+/// Pending once, so the executor runs other tasks (a frame) in between.
+struct YieldNow(bool);
+
+impl Future for YieldNow {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if std::mem::replace(&mut self.0, true) {
+            return Poll::Ready(());
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
 
 /// The connection pill.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,9 +90,9 @@ pub struct Model {
     pub last_error: Option<String>,
     /// The session connection is being re-made (reload).
     pub reattaching: bool,
-    /// Sent, not yet confirmed by `TurnStarted` / `Steered`: given back to
-    /// the user on a refusal or a detach.
-    in_flight: Option<String>,
+    /// Sent, not yet confirmed by `TurnStarted` / `Steered`, oldest first:
+    /// given back to the user on a refusal (the oldest) or a detach (all).
+    in_flight: VecDeque<String>,
 }
 
 impl Model {
@@ -60,7 +105,7 @@ impl Model {
             transcript: Transcript::new(),
             last_error: None,
             reattaching: false,
-            in_flight: None,
+            in_flight: VecDeque::new(),
         }
     }
 
@@ -83,16 +128,24 @@ impl Model {
 
     /// `text` went to the daemon.
     pub fn sent(&mut self, text: String) {
-        self.in_flight = Some(text);
+        self.in_flight.push_back(text);
     }
 
     fn current(&self, attach_seq: u64) -> bool {
         self.wanted == Some(attach_seq)
     }
 
-    fn give_back(&mut self, effects: &mut Vec<Effect>) {
-        if let Some(t) = self.in_flight.take() {
+    /// A refusal: the oldest unconfirmed text was refused (the daemon
+    /// handles input in order, and earlier echoes confirmed the rest).
+    fn give_back_oldest(&mut self, effects: &mut Vec<Effect>) {
+        if let Some(t) = self.in_flight.pop_front() {
             effects.push(Effect::Restore(t));
+        }
+    }
+
+    fn give_back_all(&mut self, effects: &mut Vec<Effect>) {
+        if !self.in_flight.is_empty() {
+            effects.push(Effect::Restore(Vec::from(std::mem::take(&mut self.in_flight)).join("\n")));
         }
     }
 
@@ -126,10 +179,10 @@ impl Model {
             Event::Reattaching { attach_seq, .. } if self.current(attach_seq) => self.reattaching = true,
             Event::Session { attach_seq, event, .. } if self.current(attach_seq) => {
                 match &event {
-                    SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. }
-                        if self.in_flight.as_deref() == Some(t.trim()) =>
-                    {
-                        self.in_flight = None;
+                    SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. } => {
+                        if let Some(i) = self.in_flight.iter().position(|s| s.trim() == t.trim()) {
+                            self.in_flight.remove(i);
+                        }
                     }
                     _ => {}
                 }
@@ -145,7 +198,7 @@ impl Model {
                 self.reattaching = false;
                 self.transcript.set_detached();
                 self.last_error = Some(format!("detached: {reason}"));
-                self.give_back(&mut effects);
+                self.give_back_all(&mut effects);
             }
             Event::Error { attach_seq, error } if attach_seq.is_none_or(|s| self.current(s)) => {
                 let input = matches!(
@@ -153,7 +206,7 @@ impl Model {
                     Error::Refused { command: None, .. } | Error::NotAttached { .. }
                 ) || matches!(&error, Error::Refused { command: Some(c), .. } if c == "submit" || c == "steer");
                 if input {
-                    self.give_back(&mut effects);
+                    self.give_back_oldest(&mut effects);
                 }
                 self.last_error = Some(error.to_string());
             }
@@ -228,6 +281,24 @@ mod tests {
         assert_eq!(m.apply(Event::Error { attach_seq: Some(1), error: drain }), vec![Effect::Restore("third".into())]);
     }
 
+    /// N5: two sends before the first echo: the echo confirms the one it
+    /// echoes (whitespace aside), a refusal gives back the oldest left, a
+    /// detach everything left.
+    #[test]
+    fn several_sends_in_flight_are_tracked() {
+        let mut m = Model::new(ConnState::Connecting);
+        attach(&mut m, 1);
+        for t in ["one", "two", "three"] {
+            m.sent(t.into());
+        }
+        m.apply(session(1, SessionEvent::Steered { text: " two\n".into(), delivered: true }));
+        let refused = Error::Refused { command: Some("submit".into()), reason: "busy".into() };
+        assert_eq!(m.apply(Event::Error { attach_seq: Some(1), error: refused }), vec![Effect::Restore("one".into())]);
+        m.sent("four".into());
+        let fx = m.apply(Event::Detached { attach_seq: 1, session_id: None, reason: "gone".into() });
+        assert_eq!(fx, vec![Effect::Restore("three\nfour".into())]);
+    }
+
     /// H3: `Detached` leaves no active session (the composer is disabled)
     /// and gives unconfirmed input back; a stale `Detached` is ignored.
     #[test]
@@ -259,5 +330,92 @@ mod tests {
         assert!(m.can_send());
         m.apply(Event::Reattaching { attach_seq: 4, session_id: "s".into(), reason: "reload".into() });
         assert!(!m.can_send());
+    }
+
+    /// Drive a future to completion on this thread.
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Arc::new(Unpark(std::thread::current())).into();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+                return out;
+            }
+            std::thread::park();
+        }
+    }
+
+    fn delta(text: &str) -> Event {
+        session(1, SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { text: text.into() }) })
+    }
+
+    /// H4, the pump itself: a backlog (what piles up behind a window that
+    /// got no frames) is coalesced into batches of at most `MAX_BATCH`,
+    /// each applied to the model the moment it is taken, so the channel is
+    /// drained to the cap on every delivery and ends empty. No render, no
+    /// GPUI: the pump does not wait for one.
+    #[test]
+    fn the_pump_coalesces_a_backlog_into_bounded_batches_and_drains_it() {
+        let (tx, rx) = async_channel::unbounded();
+        let mut m = Model::new(ConnState::Connecting);
+        attach(&mut m, 1);
+        m.apply(session(1, SessionEvent::TurnStarted { turn_baseline: 0, trigger: "user".into(), user_text: None }));
+        let n = 2 * MAX_BATCH + 100;
+        for _ in 0..n {
+            tx.try_send(delta("x")).unwrap();
+        }
+        drop(tx);
+        let (mut sizes, mut left) = (Vec::new(), Vec::new());
+        let probe = rx.clone();
+        block_on(pump(rx, |batch| {
+            sizes.push(batch.len());
+            left.push(probe.len());
+            for ev in batch {
+                m.apply(ev);
+            }
+            true
+        }));
+        assert_eq!(sizes, vec![MAX_BATCH, MAX_BATCH, 100]);
+        assert_eq!(left, vec![n - MAX_BATCH, 100, 0]);
+        assert_eq!(probe.len(), 0);
+        assert_eq!(m.transcript.items().last().unwrap().text.len(), n);
+    }
+
+    /// The pump stops when the view is gone, leaving the rest unapplied,
+    /// and applies events that arrive while it waits one batch at a time.
+    #[test]
+    fn the_pump_stops_with_the_view_and_follows_a_live_stream() {
+        let (tx, rx) = async_channel::unbounded();
+        for _ in 0..MAX_BATCH + 5 {
+            tx.try_send(delta("x")).unwrap();
+        }
+        let mut calls = 0;
+        block_on(pump(rx.clone(), |_| {
+            calls += 1;
+            false
+        }));
+        assert_eq!((calls, rx.len()), (1, 5));
+
+        let (tx2, rx2) = async_channel::unbounded();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..5000 {
+                tx2.send_blocking(delta("y")).unwrap();
+            }
+        });
+        let mut total = 0;
+        block_on(pump(rx2.clone(), |b| {
+            assert!(b.len() <= MAX_BATCH);
+            total += b.len();
+            true
+        }));
+        producer.join().unwrap();
+        assert_eq!((total, rx2.len()), (5000, 0));
+        drop(tx);
     }
 }

@@ -73,5 +73,5 @@ pub mod transcript;
 pub use client::{Client, ClientClosed, ClientOptions, Command, CreateOptions, Cwd, Error, Event, Status};
 pub use conn::{Endpoint, Identity, Incompatible, InvalidName};
 pub use history::HistoryUpdate;
-pub use protocol::{AttachMode, Attached, ClientInput, ClientKind, HistoryMode, SessionEvent, SessionMeta};
+pub use protocol::{AttachMode, Attached, ClientInput, ClientKind, HistoryMode, Rejected, SessionEvent, SessionMeta};
 pub use transcript::{Transcript, TranscriptError};

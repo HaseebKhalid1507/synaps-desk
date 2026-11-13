@@ -275,14 +275,18 @@ pub enum Endpoint {
 impl Endpoint {
     /// `$SYNAPS_PROFILE` (as the TUI's `config::get_profile`), else default.
     pub fn from_env() -> Self {
-        Endpoint::Profile(std::env::var("SYNAPS_PROFILE").ok().filter(|p| !p.trim().is_empty()))
+        Self::profile_with(None, |k| std::env::var(k).ok())
     }
 
     /// `Some(profile)`, else [`Endpoint::from_env`].
     pub fn profile(profile: Option<&str>) -> Self {
+        Self::profile_with(profile, |k| std::env::var(k).ok())
+    }
+
+    fn profile_with(profile: Option<&str>, env: impl Fn(&str) -> Option<String>) -> Self {
         match profile {
             Some(p) => Endpoint::Profile(Some(p.to_string())),
-            None => Self::from_env(),
+            None => Endpoint::Profile(env("SYNAPS_PROFILE").filter(|p| !p.trim().is_empty())),
         }
     }
 
@@ -362,9 +366,14 @@ mod tests {
         assert_eq!(v["client"]["name"], "avatar");
     }
 
+    /// L6: no explicit profile means `$SYNAPS_PROFILE` (blank: the default
+    /// daemon); an explicit one wins over it.
     #[test]
     fn endpoint_profile_falls_back_to_the_env() {
-        assert_eq!(Endpoint::profile(Some("x")), Endpoint::Profile(Some("x".into())));
-        assert!(matches!(Endpoint::profile(None), Endpoint::Profile(_)));
+        let env = |v: &'static str| move |k: &str| (k == "SYNAPS_PROFILE").then(|| v.to_string());
+        assert_eq!(Endpoint::profile_with(None, env("work")), Endpoint::Profile(Some("work".into())));
+        assert_eq!(Endpoint::profile_with(Some("x"), env("work")), Endpoint::Profile(Some("x".into())));
+        assert_eq!(Endpoint::profile_with(None, env("  ")), Endpoint::Profile(None));
+        assert_eq!(Endpoint::profile_with(None, |_: &str| None), Endpoint::Profile(None));
     }
 }
