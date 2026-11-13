@@ -42,18 +42,21 @@ struct Args {
     sleepy_after: std::time::Duration,
 }
 
-const USAGE: &str = "usage: synaps-avatar [--profile P] [--session NAME|ID | --new [--cwd DIR] [--model M]] [--no-session]
+const USAGE: &str = "usage: synaps-avatar [--profile P | --socket PATH] [--session NAME|ID | --new [--cwd DIR] [--model M]] [--no-session]
                      [--sleepy-after MIN] [--pack DIR] [--height PX] [--name NAME] [--threads N] [--no-verify]
                      [--focus-probe] [--check]
 
 Session (one Synaps daemon session drives the body):
   --profile P     daemon profile (default $SYNAPS_PROFILE, else the default daemon)
-  --session S     attach to this live session (name or id)
-  --new           create a new session (--cwd: its working directory, absolute;
-                  --model: its model); afterwards follow it
-                  with neither: attach to the session named `avatar`, or create it
+  --socket PATH   this daemon socket instead (e.g. an ssh-forwarded remote daemon:
+                  synaps-avatar-remote)
+  --session S     ride this live session (name or id; never `subconscious`)
+  --new           create a new session (--cwd: its working directory, absolute, on the
+                  daemon's machine; --model: its model); afterwards follow it
+                  with neither: her own session, named after the pack's character
+                  (`capri`): attached if live, else resumed, else created
   --no-session    the body alone (dev control only)
-  --socket PATH   connect to this daemon socket instead of a profile's (test daemons)
+  She watches in Observe and attaches Mirror only to send, answer or abort.
   --sleepy-after MIN   sleepy after this many minutes without a turn (default 10)
 
   --pack DIR      character pack (default $XDG_DATA_HOME/synaps-avatar/packs/capri)
