@@ -25,9 +25,13 @@ pub const PREVIEW_LINES: usize = 48;
 const LINE_CHARS: usize = 240;
 /// Unchanged lines shown around a change.
 const CONTEXT: usize = 2;
-/// Above this many `old × new` cells the diff is one block (removed, added):
-/// at most ~20 µs per edit, so folding a long history at attach stays cheap.
+/// Above this many `old × new` cells the preview is one block (removed,
+/// added): at most ~20 µs per edit, so folding a long history at attach
+/// stays cheap. The counts do not depend on it ([`changed_lines`]).
 const LCS_CELLS: usize = 20_000;
+/// The work ([`changed_lines`]'s `(old + new) × D`) the exact count may take
+/// above [`LCS_CELLS`] before it falls back to counting lines as a multiset.
+const COUNT_WORK: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
@@ -111,7 +115,11 @@ struct Change {
 #[derive(Debug)]
 struct Analysed {
     preview: Arc<Preview>,
+    /// Per file.
     changes: Vec<Change>,
+    /// A `multi_edit`'s changes per op (its index in `edits`): an op its
+    /// `unless_present` skipped is left out once the result says so.
+    ops: Vec<(usize, Change)>,
 }
 
 #[derive(Debug, Default)]
@@ -163,8 +171,16 @@ impl Ledger {
                             && tool_result_outcome(b) == ToolOutcome::Ok
                             && let Some(call) = self.calls.get(id).cloned()
                         {
-                            for c in &call.changes {
-                                self.commit(c);
+                            let skipped =
+                                if call.ops.is_empty() { Vec::new() } else { skipped_ops(b.get("content").unwrap_or(&Value::Null)) };
+                            if skipped.is_empty() {
+                                for c in &call.changes {
+                                    self.commit(c);
+                                }
+                            } else {
+                                for (_, c) in call.ops.iter().filter(|(i, _)| !skipped.contains(i)) {
+                                    self.commit(c);
+                                }
                             }
                         }
                     }
@@ -181,14 +197,15 @@ impl Ledger {
             return;
         }
         if !self.calls.contains_key(id) {
-            let (mut preview, changes) = analyse(name, input);
+            let (mut preview, changes, ops) = analyse(name, input);
             let changes: Vec<Change> = changes.into_iter().map(|c| Change { path: self.relative(&c.path), ..c }).collect();
+            let ops: Vec<(usize, Change)> = ops.into_iter().map(|(i, c)| (i, Change { path: self.relative(&c.path), ..c })).collect();
             preview.title = match changes.as_slice() {
                 [] => String::new(),
                 [one] => one.path.clone(),
                 [first, rest @ ..] => format!("{} +{} files", first.path, rest.len()),
             };
-            self.calls.insert(id.to_string(), Arc::new(Analysed { preview: Arc::new(preview), changes }));
+            self.calls.insert(id.to_string(), Arc::new(Analysed { preview: Arc::new(preview), changes, ops }));
         }
         self.pending.insert(id.to_string());
     }
@@ -247,10 +264,29 @@ fn count_lines(s: &str) -> u32 {
     s.lines().count() as u32
 }
 
-/// The preview and per-file changes of one tool input.
-fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>) {
+/// The ops a `multi_edit` result says its `unless_present` skipped
+/// (`[i] <path> <op> skipped: unless_present found at L<n>`, agent-engine
+/// `tools/multi_edit/mod.rs`).
+fn skipped_ops(content: &Value) -> Vec<usize> {
+    let texts: Vec<&str> = match content {
+        Value::String(s) => vec![s],
+        Value::Array(parts) => parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect(),
+        _ => Vec::new(),
+    };
+    texts
+        .iter()
+        .flat_map(|t| t.lines())
+        .filter(|l| l.contains(" skipped: unless_present found at L"))
+        .filter_map(|l| l.strip_prefix('[')?.split_once(']')?.0.parse().ok())
+        .collect()
+}
+
+/// The preview, per-file changes and (`multi_edit`) per-op changes of one
+/// tool input.
+fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>, Vec<(usize, Change)>) {
     let mut p = Preview::default();
     let mut changes = Vec::new();
+    let mut ops = Vec::new();
     match name {
         "edit" => {
             let path = str_of(input, "path");
@@ -268,7 +304,7 @@ fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>) {
         }
         "multi_edit" => {
             let mut last_path = "";
-            for e in input.get("edits").and_then(Value::as_array).into_iter().flatten() {
+            for (i, e) in input.get("edits").and_then(Value::as_array).into_iter().flatten().enumerate() {
                 let path = str_of(e, "path");
                 if path != last_path {
                     push(&mut p, LineKind::Note, path);
@@ -296,11 +332,12 @@ fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>) {
                     }
                     None => changes.push(Change { path: path.into(), kind: FileKind::Modified, added: a, removed: r }),
                 }
+                ops.push((i, Change { path: path.into(), kind: FileKind::Modified, added: a, removed: r }));
             }
         }
         _ => {}
     }
-    (p, changes)
+    (p, changes, ops)
 }
 
 fn push(p: &mut Preview, kind: LineKind, text: &str) {
@@ -328,6 +365,10 @@ fn diff_into(p: &mut Preview, old: &str, new: &str) -> (u32, u32) {
     for l in &a[pre.saturating_sub(CONTEXT)..pre] {
         push(p, LineKind::Context, l);
     }
+    let aligned = am.len() * bm.len() <= LCS_CELLS;
+    if !aligned && !am.is_empty() && !bm.is_empty() {
+        push(p, LineKind::Note, "too long to align: the old lines, then the new");
+    }
     let ops = middle(am, bm);
     let (mut added, mut removed) = (0, 0);
     for (kind, l) in ops {
@@ -338,6 +379,9 @@ fn diff_into(p: &mut Preview, old: &str, new: &str) -> (u32, u32) {
         }
         push(p, kind, l);
     }
+    if !aligned {
+        (added, removed) = changed_lines(am, bm);
+    }
     for l in &a[a.len() - suf..][..suf.min(CONTEXT)] {
         push(p, LineKind::Context, l);
     }
@@ -346,6 +390,51 @@ fn diff_into(p: &mut Preview, old: &str, new: &str) -> (u32, u32) {
     }
     p.added += added;
     p.removed += removed;
+    (added, removed)
+}
+
+/// Lines added and removed by the shortest edit `a` → `b`: Myers'
+/// O((N+M)·D) greedy search, within [`COUNT_WORK`]; past it, the lines of
+/// each that the other lacks, counted as multisets (exact for pure inserts
+/// and deletes, a lower bound when lines also move).
+fn changed_lines(a: &[&str], b: &[&str]) -> (u32, u32) {
+    let (n, m) = (a.len(), b.len());
+    let max_d = (COUNT_WORK / (n + m).max(1)).min(n + m);
+    // `v[off + k]`: the furthest `x` on diagonal `k = x - y`.
+    let off = max_d as isize + 1;
+    let mut v = vec![0isize; 2 * max_d + 3];
+    for d in 0..=max_d as isize {
+        for k in (-d..=d).step_by(2) {
+            let i = (off + k) as usize;
+            let mut x = if k == -d || (k != d && v[i - 1] < v[i + 1]) { v[i + 1] } else { v[i - 1] + 1 };
+            let mut y = x - k;
+            while (x as usize) < n && (y as usize) < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            v[i] = x;
+            if x as usize >= n && y as usize >= m {
+                // added - removed = m - n, added + removed = d.
+                let d = d as usize;
+                return (((d + m - n) / 2) as u32, ((d + n - m) / 2) as u32);
+            }
+        }
+    }
+    let mut count: HashMap<&str, i64> = HashMap::new();
+    for l in a {
+        *count.entry(l).or_default() += 1;
+    }
+    for l in b {
+        *count.entry(l).or_default() -= 1;
+    }
+    let (mut added, mut removed) = (0, 0);
+    for c in count.into_values() {
+        if c > 0 {
+            removed += c as u32;
+        } else {
+            added += (-c) as u32;
+        }
+    }
     (added, removed)
 }
 
@@ -525,6 +614,24 @@ mod tests {
         assert_eq!(notes, ["a.md", "b.jsonl", "c.rs", "line_regex: ^fn (old)"]);
         assert!(!p.lines.iter().any(|l| l.kind == LineKind::Del && l.text.contains("fn")));
         assert_eq!(p.title, "a.md +2 files");
+        // The same call with `[1]` skipped by its `unless_present`, as the
+        // result says it (agent-engine `tools/multi_edit/mod.rs`).
+        let skipped = "multi_edit: 3 file(s) written, 3 edit(s) applied, 1 skipped (line numbers are as of each edit)\n\
+            [0] a.md replace L1 -3 +3 B\n\
+            [1] a.md append skipped: unless_present found at L4\n\
+            [2] b.jsonl append_jsonl L1 +8 B\n\
+            [3] c.rs replace L1 -6 +3 B";
+        let mut l = Ledger::default();
+        let input = json!({"edits": [
+            {"path": "a.md", "op": "replace", "anchor": "one", "text": "uno"},
+            {"path": "a.md", "op": "append", "text": "tail\nmore", "unless_present": "tail"},
+            {"path": "b.jsonl", "op": "append_jsonl", "value": {"k": 1}},
+            {"path": "c.rs", "op": "replace", "anchor_mode": "line_regex", "anchor": "^fn (old)", "text": "new"},
+        ]});
+        l.append(&[tool_use("m", "multi_edit", input), result("m", skipped)]);
+        let f = l.files();
+        assert_eq!((f[0].path.as_str(), f[0].added, f[0].removed), ("a.md", 1, 1));
+        assert_eq!(l.totals(), (3, 1));
     }
 
     #[test]
@@ -542,6 +649,43 @@ mod tests {
         let new = (0..3000).map(|i| format!("n{i}")).collect::<Vec<_>>().join("\n");
         let mut p = Preview::default();
         assert_eq!(diff_into(&mut p, &old, &new), (3000, 3000));
+    }
+
+    /// N1: an edit past the preview's alignment cap still counts what changed,
+    /// not every line as removed and added.
+    #[test]
+    fn counts_do_not_depend_on_the_preview_cap() {
+        let old: Vec<String> = (0..160).map(|i| format!("line {i}")).collect();
+        let mut new = old.clone();
+        new[1] = "changed near the top".into();
+        new[158] = "changed near the end".into();
+        new.insert(80, "one more in the middle".into());
+        let (old, new) = (old.join("\n"), new.join("\n"));
+        let mut p = Preview::default();
+        assert_eq!(diff_into(&mut p, &old, &new), (3, 2));
+        assert_eq!((p.added, p.removed), (3, 2));
+        assert!(p.lines.iter().any(|l| l.kind == LineKind::Note && l.text.starts_with("too long to align")));
+        let mut l = Ledger::default();
+        l.append(&[tool_use("e", "edit", json!({"path": "a.rs", "old_string": old, "new_string": new})), result("e", OK)]);
+        assert_eq!(l.totals(), (3, 2));
+        // The exact count agrees with the aligned (LCS) one where both run.
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..300 {
+            let (n, m) = (next() as usize % 12, next() as usize % 12);
+            let a: Vec<String> = (0..n).map(|_| (next() % 4).to_string()).collect();
+            let b: Vec<String> = (0..m).map(|_| (next() % 4).to_string()).collect();
+            let (a, b): (Vec<&str>, Vec<&str>) = (a.iter().map(String::as_str).collect(), b.iter().map(String::as_str).collect());
+            let ops = middle(&a, &b);
+            let lcs =
+                (ops.iter().filter(|o| o.0 == LineKind::Add).count() as u32, ops.iter().filter(|o| o.0 == LineKind::Del).count() as u32);
+            assert_eq!(changed_lines(&a, &b), lcs, "{a:?} -> {b:?}");
+        }
     }
 
     #[test]

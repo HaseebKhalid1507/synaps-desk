@@ -1,5 +1,12 @@
 # synaps-client changelog
 
+## Since 2ae846d
+
+No API change. Two behaviour fixes in `transcript::tool_outcome` (PR `fix/review-pr5`):
+
+- An `activate_tools` call whose confirmation was denied (`Tool execution failed: tool activation denied: …`, agent-engine `tools/discovery.rs` `activation_denied`) is `Denied`, not `Failed`. A guessed id (`… tool activation denied: unknown tool id …`) stays `Failed`.
+- `Unknown tool` matches only the daemon's `Unknown tool: ` (with the colon), so a result that merely starts with the words is not a failure.
+
 ## API changes since deabaf1
 
 Additive only (the hybrid UI, PR #5 `feat/hybrid-ui`), plus one behaviour fix (tool status from the result text).

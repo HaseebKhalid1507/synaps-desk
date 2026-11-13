@@ -108,6 +108,10 @@ pub enum ConnState {
 pub struct Active {
     pub session_id: String,
     pub attach_seq: u64,
+    /// Bumped on every `Attached`, reconnects included: a reconnect keeps
+    /// the `attach_seq`, and a restarted daemon numbers its prompts from 1
+    /// again, so `(attach_seq, prompt id)` could name a different prompt.
+    pub epoch: u64,
     pub mode: AttachMode,
 }
 
@@ -233,9 +237,12 @@ pub struct Model {
     /// comes with `Attached`).
     wanted_session: Option<String>,
     /// Prompts answered from here that the daemon has not resolved yet, as
-    /// `(attach_seq, prompt id)`: prompt ids are per session and start at 1,
-    /// so an id alone would carry over to the next session's prompt.
+    /// `(epoch, prompt id)` ([`Active::epoch`]): prompt ids are per session
+    /// and start at 1 (again after a daemon restart), so an id alone would
+    /// carry over to the next attachment's prompt.
     answered: HashSet<(u64, u64)>,
+    /// The last [`Active::epoch`] handed out.
+    epoch: u64,
     pub transcript: Transcript,
     pub last_error: Option<String>,
     /// The session connection is being re-made (reload).
@@ -260,6 +267,7 @@ impl Model {
             wanted: None,
             wanted_session: None,
             answered: HashSet::new(),
+            epoch: 0,
             transcript: Transcript::new(),
             last_error: None,
             reattaching: false,
@@ -385,6 +393,8 @@ impl Model {
         self.named.error = None;
         self.named.notice = None;
         match action {
+            // Already the one on screen (or on its way): nothing to do.
+            RowAction::Attach(id) if self.is_wanted(id) => Vec::new(),
             RowAction::Attach(id) => vec![Effect::Attach { session_id: id.clone(), fallback: self.journal_of(id), open: false }],
             RowAction::Resume(req) => vec![Effect::Resume { req: req.clone(), open: false }],
         }
@@ -578,7 +588,8 @@ impl Model {
     pub fn set_local_session(&mut self, session_id: &str) {
         self.wanted = Some(LOCAL_SEQ);
         self.wanted_session = Some(session_id.into());
-        self.active = Some(Active { session_id: session_id.into(), attach_seq: LOCAL_SEQ, mode: AttachMode::Mirror });
+        self.epoch += 1;
+        self.active = Some(Active { session_id: session_id.into(), attach_seq: LOCAL_SEQ, epoch: self.epoch, mode: AttachMode::Mirror });
         self.stats = Stats::default();
     }
 
@@ -595,6 +606,12 @@ impl Model {
         self.wanted.is_some() && self.wanted != self.active.as_ref().map(|a| a.attach_seq)
     }
 
+    /// The prompt the authorization card shows, as `(epoch, prompt id)`:
+    /// the attached session's first pending one.
+    pub fn card_key(&self) -> Option<(u64, u64)> {
+        Some((self.active.as_ref()?.epoch, self.transcript.pending_prompts().first()?.id))
+    }
+
     /// Prompt `id` of the session on screen may be answered now.
     pub fn may_answer(&self, prompt_id: u64) -> bool {
         self.can_send() && !self.prompt_answered(prompt_id) && self.transcript.pending_prompts().iter().any(|p| p.id == prompt_id)
@@ -602,13 +619,13 @@ impl Model {
 
     /// An answer to prompt `id` of the session on screen went out.
     pub fn prompt_answered(&self, prompt_id: u64) -> bool {
-        self.active.as_ref().is_some_and(|a| self.answered.contains(&(a.attach_seq, prompt_id)))
+        self.active.as_ref().is_some_and(|a| self.answered.contains(&(a.epoch, prompt_id)))
     }
 
     /// The answer to prompt `id` went to the daemon.
     pub fn answer_sent(&mut self, prompt_id: u64) {
         if let Some(a) = &self.active {
-            self.answered.insert((a.attach_seq, prompt_id));
+            self.answered.insert((a.epoch, prompt_id));
         }
     }
 
@@ -753,7 +770,9 @@ impl Model {
                     self.named.opened = true;
                 }
                 self.named.error = None;
-                self.active = Some(Active { session_id: attached.meta.id.clone(), attach_seq, mode });
+                // A new epoch even on a reconnect (see `Active::epoch`).
+                self.epoch += 1;
+                self.active = Some(Active { session_id: attached.meta.id.clone(), attach_seq, epoch: self.epoch, mode });
                 self.wanted_session = Some(attached.meta.id.clone());
                 // Whatever was answered belongs to the attachment before.
                 self.answered.clear();
@@ -1353,6 +1372,25 @@ mod tests {
         assert_eq!(m.last_error.as_deref(), Some("detached: daemon closed the connection"));
     }
 
+    /// A click on the row of the session on screen (or on its way) does not
+    /// attach it again (re-attaching would reload it and drop the card).
+    #[test]
+    fn the_attached_sessions_row_does_not_reattach() {
+        let t0 = Instant::now();
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply_at(connected(&[]), t0);
+        m.apply_at(Event::Sessions(metas(json!([{"id": "l3", "name": "axel", "lifecycle": "live"}]))), t0);
+        let row = m.named_rows().remove(0);
+        assert_eq!(m.open_row(&row.action).len(), 1);
+        m.attaching(4, None, false);
+        m.asked_for("l3");
+        assert_eq!(m.open_row(&row.action), vec![], "on its way");
+        m.apply_at(attached_ev(4, attached("l3")), t0);
+        assert_eq!(m.open_row(&row.action), vec![], "on screen");
+        m.apply_at(detached(4, "detached"), t0);
+        assert_eq!(m.open_row(&row.action).len(), 1, "after a detach it attaches again");
+    }
+
     /// M4 / L2 / L7: a failed saved list stays in the Named section (not
     /// the transcript), frees the slot and is asked again 30 s later; a
     /// forced refresh during a flight goes out when it lands; skipped
@@ -1621,11 +1659,16 @@ mod fake_daemon {
     }
 
     fn attached_with_prompt(sid: &str, prompt_id: u64) -> Value {
+        attached_with(sid, prompt_id, sid)
+    }
+
+    /// `Attached` with one pending confirm whose guard message is `message`.
+    fn attached_with(sid: &str, prompt_id: u64, message: &str) -> Value {
         json!({"type": "attached", "client": 2, "input_owner": 2, "client_input": "shared",
                "meta": {"id": sid, "model": "m", "lifecycle": "live", "awaiting_input": 1},
                "conversation": {"api_messages": [], "messages_len": 0},
                "pending_prompts": [{"id": prompt_id, "kind": "confirm", "title": "Confirm tool call",
-                   "prompt": format!("Extension: guard\nTool: edit\n\nMessage from guard:\n{sid}\n\nAllow this tool call?")}]})
+                   "prompt": format!("Extension: guard\nTool: edit\n\nMessage from guard:\n{message}\n\nAllow this tool call?")}]})
     }
 
     /// Accepts connections: `Hello` → `Welcome`, a session list for the
@@ -1760,5 +1803,39 @@ mod fake_daemon {
         assert!(m.may_answer(1), "B's card is live, not 'answer sent'");
         client.shutdown().unwrap();
         let _ = b.cmds(Duration::from_millis(100));
+    }
+
+    /// N2: the daemon restarts while prompt #1 is on the card, armed and
+    /// read. The client reconnects under the same `attach_seq`, and the
+    /// restarted daemon (prompt ids from 1 again) has a different prompt #1
+    /// by then: the card shows that one's text, unarmed, and an answer
+    /// waits for it to arm.
+    #[test]
+    fn a_restarted_daemons_prompt_1_is_a_new_card() {
+        use crate::app::{ARM, PromptCard};
+        let (client, events, attaches, mut m) = connect("restart");
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with(A, 1, "edit README.md"));
+        pump(&mut m, &events, "A attached", |m| m.may_answer(1));
+        let mut card = None;
+        assert!(PromptCard::sync(&mut card, &m, Instant::now() - ARM), "a new card");
+        assert!(card.as_ref().is_some_and(|c| c.armed() && c.body.contains("edit README.md")));
+        assert!(!PromptCard::sync(&mut card, &m, Instant::now()), "the same prompt keeps its card");
+        // The daemon goes away; the client reconnects (same attach_seq).
+        let seq = m.active.as_ref().unwrap().attach_seq;
+        drop(a);
+        pump(&mut m, &events, "reattaching", |m| m.reattaching);
+        assert!(!m.may_answer(1), "nothing answers while reconnecting");
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with(A, 1, "rm -rf ~/work"));
+        pump(&mut m, &events, "A reattached", |m| !m.reattaching && m.may_answer(1));
+        assert_eq!(m.active.as_ref().unwrap().attach_seq, seq, "a reconnect keeps the attach_seq");
+        assert!(PromptCard::sync(&mut card, &m, Instant::now()), "the restarted daemon's #1 is a new card");
+        let c = card.as_ref().unwrap();
+        assert!(c.body.contains("rm -rf ~/work") && !c.body.contains("README"), "the new text: {}", c.body);
+        assert!(!c.armed(), "unarmed");
+        client.shutdown().unwrap();
+        let _ = a.cmds(Duration::from_millis(100));
     }
 }

@@ -99,15 +99,23 @@ const CANCEL_PHRASES: [&str; 5] = [
     "Canceled (session driver revoked)",
 ];
 
+/// `activation_denied` (agent-engine `tools/discovery.rs`) as a tool error.
+const ACTIVATION_DENIED: &str = "Tool execution failed: tool activation denied:";
+
 /// Classify a tool result's text (`is_error` as the block carries it).
 pub fn tool_outcome(result: &str, is_error: bool) -> ToolOutcome {
     // `RuntimeError::Tool` and the activation gate's `Unknown tool:` (the
     // TUI's own test), the budget's `Tool call not executed`, and a
     // checkpoint refusal.
-    const FAILED: [&str; 4] = ["Tool execution failed", "Unknown tool", "Tool call not executed", "No tools executed:"];
+    const FAILED: [&str; 4] = ["Tool execution failed", "Unknown tool: ", "Tool call not executed", "No tools executed:"];
     // An extension's `Block` (`Tool call blocked by extension: Tool call
-    // confirmation denied: …` after a denied prompt) and `GateDenial`.
+    // confirmation denied: …` after a denied prompt), `GateDenial`, and an
+    // `activate_tools` the user did not confirm (`tools/discovery.rs`
+    // `activation_denied`, a `RuntimeError::Tool`) but not its guessed id.
     const DENIED: [&str; 2] = ["Tool call blocked by extension", "Tool call denied:"];
+    if let Some(why) = result.strip_prefix(ACTIVATION_DENIED) {
+        return if why.starts_with(" unknown tool id") { ToolOutcome::Failed } else { ToolOutcome::Denied };
+    }
     if DENIED.iter().any(|p| result.starts_with(p)) {
         return ToolOutcome::Denied;
     }
@@ -789,6 +797,16 @@ mod outcome_tests {
             // `tools/activation.rs` GateDenial.
             ("Tool call denied: tool is not activated for this session: shell_start", Denied),
             ("Unknown tool: shell_strat", Failed),
+            // `tools/discovery.rs` `activation_denied`: the prompt was denied
+            // (the live sandbox's text), or the model guessed an id.
+            (
+                "Tool execution failed: tool activation denied: tool activation requires host confirmation authority; model-initiated activation was not confirmed",
+                Denied,
+            ),
+            (
+                "Tool execution failed: tool activation denied: unknown tool id 'x:y'; nothing was activated. activate_tools needs exact ids (namespace:name) as search_tools returns them: search for the tool instead of guessing its id.",
+                Failed,
+            ),
             // `RuntimeError::Tool` from `tools/edit.rs`.
             (
                 "Tool execution failed: old_string not found in '/w/a.rs'. Make sure it matches exactly, including whitespace and indentation.",
