@@ -46,14 +46,94 @@ pub enum ToolStatus {
     Running,
     Done,
     Failed,
-    /// The turn ended (abort, interruption) before the tool reported.
+    /// The turn ended (abort, interruption) before the tool reported, or
+    /// the result says the call was canceled.
     Cancelled,
+    /// Not run: an extension blocked it (a denied confirmation included) or
+    /// the session's tool gate refused it.
+    Denied,
 }
 
 impl ToolStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, ToolStatus::Done | ToolStatus::Failed | ToolStatus::Cancelled)
+        matches!(self, ToolStatus::Done | ToolStatus::Failed | ToolStatus::Cancelled | ToolStatus::Denied)
     }
+}
+
+/// How a finished tool call ended, read from its `tool_result`.
+///
+/// The engine sets `is_error` only on budget, parse and checkpoint refusals
+/// (agent-engine `runtime/stream.rs`). A tool that failed, a call an
+/// extension blocked (a denied confirmation is one), a gate denial and a
+/// canceled call all come back as plain text, so the result is classified by
+/// its text as the Synaps TUI does (`agent-tui render.rs`: a result starting
+/// `Tool execution failed` or `Unknown tool` is an error), extended to the
+/// engine's other non-success texts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolOutcome {
+    Ok,
+    Failed,
+    Denied,
+    Cancelled,
+}
+
+impl ToolOutcome {
+    pub fn status(self) -> ToolStatus {
+        match self {
+            ToolOutcome::Ok => ToolStatus::Done,
+            ToolOutcome::Failed => ToolStatus::Failed,
+            ToolOutcome::Denied => ToolStatus::Denied,
+            ToolOutcome::Cancelled => ToolStatus::Cancelled,
+        }
+    }
+}
+
+/// `CancelCause::phrase()` (agent-engine `runtime/types.rs`): a canceled
+/// call's whole result, or `<phrase>.` plus a side-effect warning.
+const CANCEL_PHRASES: [&str; 5] = [
+    "Canceled by user",
+    "Canceled (session cost cap reached)",
+    "Canceled (Synaps restarted)",
+    "Canceled (session stopped by the host)",
+    "Canceled (session driver revoked)",
+];
+
+/// Classify a tool result's text (`is_error` as the block carries it).
+pub fn tool_outcome(result: &str, is_error: bool) -> ToolOutcome {
+    // `RuntimeError::Tool` and the activation gate's `Unknown tool:` (the
+    // TUI's own test), the budget's `Tool call not executed`, and a
+    // checkpoint refusal.
+    const FAILED: [&str; 4] = ["Tool execution failed", "Unknown tool", "Tool call not executed", "No tools executed:"];
+    // An extension's `Block` (`Tool call blocked by extension: Tool call
+    // confirmation denied: …` after a denied prompt) and `GateDenial`.
+    const DENIED: [&str; 2] = ["Tool call blocked by extension", "Tool call denied:"];
+    if DENIED.iter().any(|p| result.starts_with(p)) {
+        return ToolOutcome::Denied;
+    }
+    if FAILED.iter().any(|p| result.starts_with(p)) {
+        return ToolOutcome::Failed;
+    }
+    let canceled = CANCEL_PHRASES.iter().any(|p| result.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with('.')))
+        || result == "Operation canceled"
+        // Partial output, then `[<phrase> before the tool finished; …]`.
+        || result.trim_end().rsplit('\n').next().is_some_and(|l| {
+            l.starts_with('[') && CANCEL_PHRASES.iter().any(|p| l[1..].starts_with(p)) && l.contains("before the tool finished")
+        });
+    if canceled {
+        ToolOutcome::Cancelled
+    } else if is_error {
+        ToolOutcome::Failed
+    } else {
+        ToolOutcome::Ok
+    }
+}
+
+/// [`tool_outcome`] of a history `tool_result` block (`content` a string or
+/// text parts, `is_error` optional).
+pub fn tool_result_outcome(block: &Value) -> ToolOutcome {
+    let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+    tool_outcome(&result_text(block.get("content").unwrap_or(&Value::Null)), is_error)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -444,12 +524,12 @@ impl Transcript {
                         "tool_result" => {
                             flush(self, &mut text, reuse);
                             let id = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-                            let failed = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                            let is_error = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                             let result = result_text(b.get("content").unwrap_or(&Value::Null));
                             if let Some(&ix) = self.tools.get(id) {
                                 if let Some(t) = self.items[ix].tool.as_mut() {
+                                    t.status = Some(tool_outcome(&result, is_error).status());
                                     t.result = preview(&result);
-                                    t.status = Some(if failed { ToolStatus::Failed } else { ToolStatus::Done });
                                 }
                                 self.touch(ix);
                             }
@@ -631,7 +711,7 @@ impl Transcript {
                     if let Some(ix) = self.tool_mut(tool_id) {
                         if let Some(t) = self.items[ix].tool.as_mut() {
                             t.result = preview(result);
-                            t.status = Some(ToolStatus::Done);
+                            t.status = Some(tool_outcome(result, false).status());
                         }
                         self.items[ix].streaming = false;
                         self.touch(ix);
@@ -674,11 +754,7 @@ fn compact(v: &Value) -> String {
 fn result_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        Value::Array(parts) => parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"),
         Value::Null => String::new(),
         other => other.to_string(),
     }
@@ -693,4 +769,83 @@ fn preview(s: &str) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// The engine's own result texts (agent-engine origin/dev): none of them
+    /// sets `is_error`.
+    #[test]
+    fn results_are_classified_by_the_daemons_texts() {
+        use ToolOutcome::*;
+        let cases = [
+            // `runtime/stream.rs` Block after `runtime/mod.rs` denied a Confirm.
+            ("Tool call blocked by extension: Tool call confirmation denied: guard wants to check this edit", Denied),
+            ("Tool call blocked by extension: Tool call requires confirmation but no interactive prompt is available: x", Denied),
+            // `tools/activation.rs` GateDenial.
+            ("Tool call denied: tool is not activated for this session: shell_start", Denied),
+            ("Unknown tool: shell_strat", Failed),
+            // `RuntimeError::Tool` from `tools/edit.rs`.
+            (
+                "Tool execution failed: old_string not found in '/w/a.rs'. Make sure it matches exactly, including whitespace and indentation.",
+                Failed,
+            ),
+            ("Tool execution failed: Failed to read file '/w/gone.rs': No such file or directory (os error 2)", Failed),
+            // `runtime/budget.rs`.
+            ("Tool call not executed: turn tool-call budget exhausted", Failed),
+            // `CancelCause::phrase()` and `canceled_tool_result_content`.
+            ("Canceled by user", Cancelled),
+            ("Canceled (session cost cap reached)", Cancelled),
+            ("Canceled by user. It had already started and may have partially applied its effects.", Cancelled),
+            ("line 1\nline 2\n\n[Canceled by user before the tool finished; the output above is partial.]", Cancelled),
+            ("Operation canceled", Cancelled),
+            // Successes, including ones that mention the phrases.
+            ("Edited /w/a.rs", Ok),
+            ("Successfully wrote 3 lines", Ok),
+            ("grep: Tool execution failed appears in this log", Ok),
+            ("Canceled by users of the old API", Ok),
+            ("", Ok),
+        ];
+        for (text, want) in cases {
+            assert_eq!(tool_outcome(text, false), want, "{text:?}");
+        }
+        assert_eq!(tool_outcome("anything", true), Failed);
+        assert_eq!(tool_outcome("Canceled by user", true), Cancelled);
+        let block = json!({"type": "tool_result", "tool_use_id": "t", "content": [{"type": "text", "text": "Tool call denied: x"}]});
+        assert_eq!(tool_result_outcome(&block), Denied);
+        assert_eq!(tool_result_outcome(&json!({"type": "tool_result", "content": "ok", "is_error": true})), Failed);
+    }
+
+    #[test]
+    fn the_transcript_marks_rows_from_the_result_text() {
+        let mut t = Transcript::new();
+        let call = |id: &str| json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "edit", "input": {}}]});
+        let result =
+            |id: &str, text: &str| json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": text}]});
+        t.apply_history(&[
+            call("a"),
+            result("a", "Edited /w/a.rs"),
+            call("b"),
+            result("b", "Tool call blocked by extension: Tool call confirmation denied: guard"),
+            call("c"),
+            result("c", "Tool execution failed: old_string not found in '/w/c.rs'."),
+            call("d"),
+            result("d", "Canceled by user"),
+        ]);
+        let st: Vec<Option<ToolStatus>> = t.items().iter().filter_map(|i| i.tool.as_ref().map(|t| t.status)).collect();
+        assert_eq!(st, [Some(ToolStatus::Done), Some(ToolStatus::Denied), Some(ToolStatus::Failed), Some(ToolStatus::Cancelled)]);
+        // The live result: the same classification.
+        let ev = |v: Value| crate::protocol::decode_event(&v).unwrap();
+        t.apply(&ev(
+            json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "edit", "tool_id": "e", "input": {}}}),
+        ));
+        t.apply(&ev(json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": "e",
+            "result": "Tool call blocked by extension: Tool call confirmation denied: guard"}})));
+        let last = t.items().iter().rev().find_map(|i| i.tool.as_ref()).unwrap();
+        assert_eq!((last.tool_id.as_str(), last.status), ("e", Some(ToolStatus::Denied)));
+    }
 }

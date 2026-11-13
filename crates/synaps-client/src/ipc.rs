@@ -62,10 +62,7 @@ mod imp {
         let client = loop {
             match ClientOptions::new().open(&name) {
                 Ok(c) => break c,
-                Err(e)
-                    if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32)
-                        && Instant::now() < deadline =>
-                {
+                Err(e) if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32) && Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 Err(e) => return Err(e),
@@ -80,11 +77,9 @@ mod imp {
         use std::ptr::null_mut;
 
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-        use windows_sys::Win32::Security::{EqualSid, GetTokenInformation, TokenUser, PSID, TOKEN_QUERY, TOKEN_USER};
+        use windows_sys::Win32::Security::{EqualSid, GetTokenInformation, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser};
         use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
 
         struct Handle(HANDLE);
         impl Drop for Handle {
@@ -138,10 +133,7 @@ mod imp {
                 return Err(io::Error::last_os_error());
             }
             let refuse = |why: String| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("daemon pipe is served by pid {pid}, {why}; refusing to connect"),
-                )
+                io::Error::new(io::ErrorKind::PermissionDenied, format!("daemon pipe is served by pid {pid}, {why}; refusing to connect"))
             };
             // SAFETY: plain OpenProcess; null on failure.
             let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };

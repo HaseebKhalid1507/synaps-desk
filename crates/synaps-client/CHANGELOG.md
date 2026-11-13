@@ -1,5 +1,14 @@
 # synaps-client changelog
 
+## API changes since deabaf1
+
+Additive only (the hybrid UI, PR #5 `feat/hybrid-ui`), plus one behaviour fix (tool status from the result text).
+
+- `ConversationSnapshot` gained `tokens: Value` (`serde(default)`): the attach snapshot's `ConversationTokens` (`{input, output, cache_read, cache_creation}`), which `ConversationDigest::tokens` already carried on every later `Conversation` event. `Null` from a daemon that omits it. A struct literal needs `..Default::default()` (nothing in this workspace builds one).
+- `ConversationSnapshot` gained `keepwarm_tokens: Value` (`serde(default)`): the keep-warm ping tokens the daemon says are already included in `tokens`. `Null` from a daemon that predates them. (Not on `ConversationDigest`: that would grow every `Event::Session`; read it from the event's `raw` JSON, `digest.keepwarm_tokens`.)
+- New `transcript::ToolOutcome { Ok, Failed, Denied, Cancelled }` (`#[non_exhaustive]`), `transcript::tool_outcome(text, is_error)` and `transcript::tool_result_outcome(&block)`: a finished tool call classified by its result text, as the Synaps TUI does. The engine leaves `is_error` unset on a failed tool (`Tool execution failed: …`), an extension block (a denied confirmation: `Tool call blocked by extension: …`), a gate denial (`Tool call denied: …`, `Unknown tool: …`) and a canceled call (`Canceled by user`, …), so `is_error` alone called all of them successes.
+- New `ToolStatus::Denied` (`ToolStatus` is `#[non_exhaustive]`; `is_terminal()` includes it). **Behaviour:** `Transcript` now sets a tool row's status from `tool_outcome` (history and live `ToolResult`): those results were `Done`, now `Failed` / `Denied` / `Cancelled`.
+
 ## API changes since 355242c
 
 Named and saved sessions (PR #4). Old → new, one line each. **Breaking** for struct literals and exhaustive matches: `Status::Connected`, `CreateConfig`, `SessionMeta`; and for anyone who built on this PR's first push (ebf3f73): `rename`, `saved_sessions`, `Event::SavedSessions`.

@@ -41,9 +41,7 @@ static LOGGER: Logger = Logger;
 
 impl log::Log for Logger {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        m.level() <= *LEVEL.get().unwrap_or(&log::LevelFilter::Off)
-            && !m.target().starts_with("zbus")
-            && !m.target().starts_with("tracing")
+        m.level() <= *LEVEL.get().unwrap_or(&log::LevelFilter::Off) && !m.target().starts_with("zbus") && !m.target().starts_with("tracing")
     }
     fn log(&self, r: &log::Record) {
         if self.enabled(r.metadata()) {

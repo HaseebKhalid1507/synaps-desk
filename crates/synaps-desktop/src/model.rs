@@ -3,7 +3,7 @@
 //! hidden or minimized window holds the current transcript and nothing
 //! else; the view only turns the transcript's splice into rows per frame.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -16,6 +16,7 @@ use synaps_client::{
 };
 
 use crate::named::{Marker, NamedRow, ResumeRequest, RowAction};
+use crate::stats::Stats;
 
 /// The saved list is re-asked at most this often on its own (on startup,
 /// after a rename and after a resume it is asked at once).
@@ -63,6 +64,36 @@ impl Future for YieldNow {
     }
 }
 
+/// A tool-call confirmation's answers, as the daemon reads them
+/// (`session/actor.rs` `answer`: approved on "y" / "yes", any other text
+/// denies; `None` cancels).
+pub const CONFIRM_YES: &str = "y";
+pub const CONFIRM_NO: &str = "n";
+
+/// The rail's filter tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Filter {
+    #[default]
+    All,
+    /// A turn (or a resume) is running.
+    Live,
+    /// Waiting on the user.
+    Needs,
+    /// Everything else: idle, pinned, parked, saved.
+    Idle,
+}
+
+impl Filter {
+    pub fn admits(self, m: Marker) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Live => matches!(m, Marker::Busy | Marker::Resuming),
+            Filter::Needs => m == Marker::Awaiting,
+            Filter::Idle => matches!(m, Marker::Idle | Marker::Pinned | Marker::Parked | Marker::Saved),
+        }
+    }
+}
+
 /// The connection pill.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnState {
@@ -93,9 +124,16 @@ pub enum Effect {
     /// Attach to a live session, then [`Model::attaching`]. `fallback`: a
     /// named session's journal, resumed if it ended meanwhile. `open`: an
     /// Open by name.
-    Attach { session_id: String, fallback: Option<ResumeRequest>, open: bool },
+    Attach {
+        session_id: String,
+        fallback: Option<ResumeRequest>,
+        open: bool,
+    },
     /// `Client::resume(req.target, req.options())`, then [`Model::resuming`].
-    Resume { req: ResumeRequest, open: bool },
+    Resume {
+        req: ResumeRequest,
+        open: bool,
+    },
     /// Leave the current attachment (`Client::detach`).
     Detach,
 }
@@ -191,6 +229,13 @@ pub struct Model {
     pub active: Option<Active>,
     /// The attachment asked for last: events of any other are stale.
     wanted: Option<u64>,
+    /// The session it asked for (`None`: a create or a resume, whose id
+    /// comes with `Attached`).
+    wanted_session: Option<String>,
+    /// Prompts answered from here that the daemon has not resolved yet, as
+    /// `(attach_seq, prompt id)`: prompt ids are per session and start at 1,
+    /// so an id alone would carry over to the next session's prompt.
+    answered: HashSet<(u64, u64)>,
     pub transcript: Transcript,
     pub last_error: Option<String>,
     /// The session connection is being re-made (reload).
@@ -199,6 +244,11 @@ pub struct Model {
     /// given back to the user on a refusal (the oldest) or a detach (all).
     in_flight: VecDeque<String>,
     pub named: Named,
+    /// The attached session's numbers (header, right-hand panel).
+    pub stats: Stats,
+    /// Bumped whenever what the rail lists may have changed (anything but
+    /// a session's own stream): the view rebuilds its rows only then.
+    pub rail_gen: u64,
 }
 
 impl Model {
@@ -208,11 +258,15 @@ impl Model {
             sessions: Vec::new(),
             active: None,
             wanted: None,
+            wanted_session: None,
+            answered: HashSet::new(),
             transcript: Transcript::new(),
             last_error: None,
             reattaching: false,
             in_flight: VecDeque::new(),
             named: Named { daemon: "the daemon's machine".into(), ..Named::default() },
+            stats: Stats::default(),
+            rail_gen: 0,
         }
     }
 
@@ -238,6 +292,7 @@ impl Model {
 
     /// The saved list did not come (or could not be asked for).
     pub fn saved_failed(&mut self, reason: &str) -> Vec<Effect> {
+        self.rail_gen += 1;
         let mut effects = Vec::new();
         self.on_saved_failed(reason, &mut effects);
         effects
@@ -270,8 +325,45 @@ impl Model {
     }
 
     /// The live sessions without a name (the list below Named).
+    #[cfg(test)]
     pub fn unnamed_sessions(&self) -> impl Iterator<Item = &SessionMeta> {
         crate::named::unnamed(&self.sessions)
+    }
+
+    /// A live session's state. The attached one is read from its own
+    /// transcript (answered prompts, a turn that just ended), which runs
+    /// ahead of the 3-second session poll.
+    pub fn marker(&self, s: &SessionMeta) -> Marker {
+        if !self.is_active(&s.id) {
+            return Marker::of(s);
+        }
+        if !self.transcript.pending_prompts().is_empty() {
+            Marker::Awaiting
+        } else if self.transcript.busy() {
+            Marker::Busy
+        } else if s.is_parked() {
+            Marker::Parked
+        } else if s.pinned {
+            Marker::Pinned
+        } else {
+            Marker::Idle
+        }
+    }
+
+    pub fn is_active(&self, session_id: &str) -> bool {
+        self.active.as_ref().is_some_and(|a| a.session_id == session_id)
+    }
+
+    /// Live sessions waiting on the user (a question, a secret, a tool-call
+    /// confirmation), in list order.
+    pub fn attention(&self) -> impl Iterator<Item = &SessionMeta> {
+        self.sessions.iter().filter(|s| self.marker(s) == Marker::Awaiting)
+    }
+
+    /// The active session's list entry.
+    pub fn active_meta(&self) -> Option<&SessionMeta> {
+        let a = self.active.as_ref()?;
+        self.sessions.iter().find(|s| s.id == a.session_id)
     }
 
     /// The active session's name, if it has one.
@@ -459,6 +551,8 @@ impl Model {
     /// its answer.
     pub fn want(&mut self, attach_seq: u64) {
         self.wanted = Some(attach_seq);
+        self.wanted_session = None;
+        self.rail_gen += 1;
         let n = &mut self.named;
         n.resuming.take_if(|r| r.attach_seq != attach_seq);
         n.attaching.take_if(|(s, _)| *s != attach_seq);
@@ -469,15 +563,53 @@ impl Model {
         n.rename_error = None;
     }
 
+    /// The attach just asked for (after [`Model::want`]) is of this session.
+    pub fn asked_for(&mut self, session_id: &str) {
+        self.wanted_session = Some(session_id.to_string());
+    }
+
+    /// The last attach asked for this session (attached or on its way): a
+    /// click on it again has nothing to do.
+    pub fn is_wanted(&self, session_id: &str) -> bool {
+        self.wanted_session.as_deref() == Some(session_id)
+    }
+
     /// A local session (benches): its events carry [`LOCAL_SEQ`].
     pub fn set_local_session(&mut self, session_id: &str) {
         self.wanted = Some(LOCAL_SEQ);
+        self.wanted_session = Some(session_id.into());
         self.active = Some(Active { session_id: session_id.into(), attach_seq: LOCAL_SEQ, mode: AttachMode::Mirror });
+        self.stats = Stats::default();
     }
 
-    /// Attached, connected and allowed to drive.
+    /// Attached, connected and allowed to drive, and no switch under way:
+    /// while another attachment is on its way (`wanted` is not the active
+    /// one), input, answers and HALT would reach that one, not the session
+    /// on screen (the connection thread routes them to its latest attach).
     pub fn can_send(&self) -> bool {
-        self.active.as_ref().is_some_and(|a| a.mode != AttachMode::Observe) && !self.reattaching
+        self.active.as_ref().is_some_and(|a| a.mode != AttachMode::Observe && self.wanted == Some(a.attach_seq)) && !self.reattaching
+    }
+
+    /// A switch to another attachment is under way.
+    pub fn switching(&self) -> bool {
+        self.wanted.is_some() && self.wanted != self.active.as_ref().map(|a| a.attach_seq)
+    }
+
+    /// Prompt `id` of the session on screen may be answered now.
+    pub fn may_answer(&self, prompt_id: u64) -> bool {
+        self.can_send() && !self.prompt_answered(prompt_id) && self.transcript.pending_prompts().iter().any(|p| p.id == prompt_id)
+    }
+
+    /// An answer to prompt `id` of the session on screen went out.
+    pub fn prompt_answered(&self, prompt_id: u64) -> bool {
+        self.active.as_ref().is_some_and(|a| self.answered.contains(&(a.attach_seq, prompt_id)))
+    }
+
+    /// The answer to prompt `id` went to the daemon.
+    pub fn answer_sent(&mut self, prompt_id: u64) {
+        if let Some(a) = &self.active {
+            self.answered.insert((a.attach_seq, prompt_id));
+        }
     }
 
     /// `text` went to the daemon.
@@ -506,6 +638,9 @@ impl Model {
     /// Apply one event; `now` paces the saved-list refresh.
     pub fn apply_at(&mut self, ev: Event, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if !matches!(ev, Event::Session { .. } | Event::History { .. }) {
+            self.rail_gen += 1;
+        }
         match ev {
             Event::Status(s) => {
                 // A reply in flight died with the old connection.
@@ -525,11 +660,9 @@ impl Model {
                 }
                 self.conn = match s {
                     Status::Connecting => ConnState::Connecting,
-                    Status::Connected { daemon_version, profile, .. } => ConnState::Connected(format!(
-                        "{}{}",
-                        daemon_version,
-                        profile.map(|p| format!(" · {p}")).unwrap_or_default()
-                    )),
+                    Status::Connected { daemon_version, profile, .. } => {
+                        ConnState::Connected(format!("{}{}", daemon_version, profile.map(|p| format!(" · {p}")).unwrap_or_default()))
+                    }
                     Status::Reconnecting { .. } => ConnState::Reconnecting,
                     Status::Offline(e) => ConnState::Off(e),
                     Status::Incompatible(e) => ConnState::Incompatible(e.to_string()),
@@ -621,15 +754,20 @@ impl Model {
                 }
                 self.named.error = None;
                 self.active = Some(Active { session_id: attached.meta.id.clone(), attach_seq, mode });
+                self.wanted_session = Some(attached.meta.id.clone());
+                // Whatever was answered belongs to the attachment before.
+                self.answered.clear();
                 self.reattaching = false;
                 self.last_error = None;
                 if let Err(e) = self.transcript.load_attached(&attached) {
                     self.last_error = Some(e.to_string());
                 }
+                self.stats.on_attached(&attached);
                 effects.push(Effect::ListSessions);
             }
             Event::Reattaching { attach_seq, .. } if self.current(attach_seq) => self.reattaching = true,
-            Event::Session { attach_seq, event, .. } if self.current(attach_seq) => {
+            Event::Session { attach_seq, event, raw, .. } if self.current(attach_seq) => {
+                self.stats.on_session(&event, &raw);
                 match &event {
                     SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. } => {
                         if let Some(i) = self.in_flight.iter().position(|s| s.trim() == t.trim()) {
@@ -639,16 +777,25 @@ impl Model {
                     _ => {}
                 }
                 self.transcript.apply(&event);
+                if !self.answered.is_empty() {
+                    let pending = self.transcript.pending_prompts();
+                    self.answered.retain(|(_, id)| pending.iter().any(|p| p.id == *id));
+                }
             }
             Event::History { attach_seq, update, .. } if self.current(attach_seq) => {
                 if self.transcript.apply_update(&update).is_err() {
                     effects.push(Effect::Resync);
+                } else {
+                    self.stats.on_history(&update);
                 }
             }
             Event::Detached { attach_seq, reason, .. } if self.current(attach_seq) => {
                 self.active = None;
+                self.wanted_session = None;
+                self.answered.clear();
                 self.reattaching = false;
                 self.transcript.set_detached();
+                self.stats.on_detached();
                 self.give_back_all(&mut effects);
                 let n = &mut self.named;
                 if n.discard.take_if(|s| *s == attach_seq).is_some() {
@@ -684,10 +831,16 @@ impl Model {
                 }
             }
             Event::Error { attach_seq, error } if attach_seq.is_none_or(|s| self.current(s)) => {
-                let input = matches!(
-                    &error,
-                    Error::Refused { command: None, .. } | Error::NotAttached { .. }
-                ) || matches!(&error, Error::Refused { command: Some(c), .. } if c == "submit" || c == "steer");
+                // An answer the daemon may not have got (a refusal that names
+                // no command could be one): the card asks again. A repeat is
+                // harmless, the daemon takes the first answer per prompt.
+                let answer = matches!(&error, Error::Refused { command: Some(c), .. } if c == "answer")
+                    || matches!(&error, Error::NotAttached { command: "answer" });
+                if answer || matches!(&error, Error::Refused { command: None, .. }) {
+                    self.answered.clear();
+                }
+                let input = !answer && matches!(&error, Error::Refused { command: None, .. } | Error::NotAttached { .. })
+                    || matches!(&error, Error::Refused { command: Some(c), .. } if c == "submit" || c == "steer");
                 if input {
                     self.give_back_oldest(&mut effects);
                 }
@@ -735,6 +888,32 @@ mod tests {
         m.apply(Event::Attached { attach_seq: seq, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
     }
 
+    #[test]
+    fn filters_and_the_attached_sessions_own_state() {
+        let mk = |id: &str, busy: bool, awaiting: usize, lifecycle: &str| -> SessionMeta {
+            serde_json::from_value(json!({"id": id, "busy": busy, "awaiting_input": awaiting, "lifecycle": lifecycle})).unwrap()
+        };
+        let mut m = Model::new(ConnState::Connecting);
+        m.sessions = vec![mk("s", true, 1, "live"), mk("b", true, 0, "live"), mk("w", false, 2, "live"), mk("p", false, 0, "parked")];
+        let markers: Vec<Marker> = m.sessions.iter().map(|s| m.marker(s)).collect();
+        assert_eq!(markers, [Marker::Awaiting, Marker::Busy, Marker::Awaiting, Marker::Parked]);
+        assert_eq!(m.attention().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s", "w"]);
+        // Attached to "s": its transcript says idle, nothing pending (the
+        // poll has not caught up yet).
+        attach(&mut m, 1);
+        assert!(m.is_active("s"));
+        assert_eq!(m.marker(&m.sessions[0]), Marker::Idle);
+        assert_eq!(m.attention().count(), 1);
+        assert_eq!(m.active_meta().map(|s| s.id.as_str()), Some("s"));
+        for (f, admitted) in
+            [(Filter::All, vec!["s", "b", "w", "p"]), (Filter::Live, vec!["b"]), (Filter::Needs, vec!["w"]), (Filter::Idle, vec!["s", "p"])]
+        {
+            let got: Vec<&str> = m.sessions.iter().filter(|s| f.admits(m.marker(s))).map(|s| s.id.as_str()).collect();
+            assert_eq!(got, admitted, "{f:?}");
+        }
+        assert!(Filter::Live.admits(Marker::Resuming) && Filter::Idle.admits(Marker::Saved));
+    }
+
     /// H4: a window that never renders applies every event as it comes;
     /// the only state is the transcript, which holds one history, however
     /// many rounds (each a full-history refold) arrive meanwhile.
@@ -743,8 +922,9 @@ mod tests {
         let mut m = Model::new(ConnState::Connecting);
         attach(&mut m, 1);
         for round in 0..400 {
-            let messages: Vec<Value> =
-                (0..50).map(|i| json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("round {round} msg {i}")})).collect();
+            let messages: Vec<Value> = (0..50)
+                .map(|i| json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("round {round} msg {i}")}))
+                .collect();
             m.apply(session(1, SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { text: "delta ".repeat(20) }) }));
             m.apply(Event::History { attach_seq: 1, session_id: "s".into(), seq: 0, update: HistoryUpdate::Replace { messages } });
         }
@@ -810,6 +990,75 @@ mod tests {
         // Stale events of the old attachment change nothing.
         m.apply(session(1, SessionEvent::TurnStarted { turn_baseline: 0, trigger: "user".into(), user_text: Some("x".into()) }));
         assert!(!m.transcript.busy());
+    }
+
+    fn prompt(id: u64) -> SessionEvent {
+        synaps_client::protocol::decode_event(
+            &json!({"ev": "prompt", "request": {"id": id, "kind": "confirm", "title": "t", "prompt": "p"}}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn nothing_drives_while_switching_and_answers_are_per_attachment() {
+        let mut m = Model::new(ConnState::Connected("x".into()));
+        attach(&mut m, 1);
+        m.apply(session(1, prompt(1)));
+        assert!(m.can_send() && m.may_answer(1));
+        assert!(!m.may_answer(2), "not pending");
+        m.answer_sent(1);
+        assert!(m.prompt_answered(1) && !m.may_answer(1), "sent once");
+        // A switch: A's card is still on screen, nothing may answer it.
+        m.want(2);
+        assert!(m.switching());
+        assert!(!m.can_send() && !m.may_answer(1));
+        // B lands with its own prompt #1: not "answered" (that was A's).
+        m.apply(Event::Attached { attach_seq: 2, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
+        m.apply(session(2, prompt(1)));
+        assert!(!m.switching());
+        assert!(!m.prompt_answered(1) && m.may_answer(1));
+    }
+
+    #[test]
+    fn an_answer_that_did_not_arrive_lets_the_card_ask_again() {
+        for error in [
+            Error::Refused { command: Some("answer".into()), reason: "not connected to the session (attaching or reconnecting)".into() },
+            Error::NotAttached { command: "answer" },
+            Error::Refused { command: None, reason: "daemon reloading; retry in a moment".into() },
+        ] {
+            let mut m = Model::new(ConnState::Connected("x".into()));
+            attach(&mut m, 1);
+            m.apply(session(1, prompt(3)));
+            m.answer_sent(3);
+            assert!(!m.may_answer(3));
+            m.apply(Event::Error { attach_seq: Some(1), error });
+            assert!(m.may_answer(3), "the card is not stuck at 'answer sent'");
+        }
+        // A detach drops them too; the resolved prompt drops its own.
+        let mut m = Model::new(ConnState::Connected("x".into()));
+        attach(&mut m, 1);
+        m.apply(session(1, prompt(4)));
+        m.answer_sent(4);
+        m.apply(session(1, synaps_client::protocol::decode_event(&json!({"ev": "prompt_resolved", "prompt_id": 4})).unwrap()));
+        assert!(m.answered.is_empty());
+        m.apply(session(1, prompt(5)));
+        m.answer_sent(5);
+        m.apply(Event::Detached { attach_seq: 1, session_id: None, reason: "gone".into() });
+        assert!(m.answered.is_empty() && !m.may_answer(5));
+        assert!(m.stats.detached, "the numbers are the last seen, not live");
+    }
+
+    #[test]
+    fn asking_for_a_session_again_is_by_the_last_ask() {
+        let mut m = Model::new(ConnState::Connected("x".into()));
+        m.want(1);
+        m.asked_for("a");
+        m.apply(Event::Attached { attach_seq: 1, attached: attached("a"), mode: AttachMode::Mirror, reconnect: false });
+        assert!(m.is_wanted("a"));
+        // Click B, then A again before B lands: A is asked for again.
+        m.want(2);
+        m.asked_for("b");
+        assert!(m.is_active("a") && !m.is_wanted("a"));
     }
 
     #[test]
@@ -918,7 +1167,9 @@ mod tests {
             ]))),
             t0,
         );
-        let fixture = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../synaps-client/tests/fixtures/saved_session_list.json")).unwrap();
+        let fixture =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../synaps-client/tests/fixtures/saved_session_list.json"))
+                .unwrap();
         let DaemonFrame::SavedSessionList { sessions, truncated, .. } = decode_frame(fixture.trim()).unwrap() else { panic!() };
         m.apply_at(Event::SavedSessions { sessions, truncated, rejected: 0 }, t0);
         let rows: Vec<(String, Marker)> = m.named_rows().into_iter().map(|r| (r.name, r.marker)).collect();
@@ -1002,7 +1253,10 @@ mod tests {
         let t0 = Instant::now();
         let mut m = Model::new(ConnState::Connecting);
         m.apply_at(connected(&["saved_sessions"]), t0);
-        m.apply_at(Event::Sessions(metas(json!([{"id": "l1", "name": "live-one", "journal_id": "j-l1", "cwd": "/w", "lifecycle": "live"}]))), t0);
+        m.apply_at(
+            Event::Sessions(metas(json!([{"id": "l1", "name": "live-one", "journal_id": "j-l1", "cwd": "/w", "lifecycle": "live"}]))),
+            t0,
+        );
         let axel = json!({"id": "20261110-202033-e5f6", "name": "axel", "cwd": "/home/u/axel", "live": false});
         m.apply_at(saved_list(json!([axel])), t0);
 
@@ -1079,7 +1333,9 @@ mod tests {
         let mut m = Model::new(ConnState::Connecting);
         m.apply_at(connected(&[]), t0);
         m.apply_at(
-            Event::Sessions(metas(json!([{"id": "l3", "name": "axel", "journal_id": "j-axel", "cwd": "/home/u/axel", "lifecycle": "parked"}]))),
+            Event::Sessions(metas(
+                json!([{"id": "l3", "name": "axel", "journal_id": "j-axel", "cwd": "/home/u/axel", "lifecycle": "parked"}]),
+            )),
             t0,
         );
         let row = m.named_rows().remove(0);
@@ -1306,5 +1562,203 @@ mod tests {
         producer.join().unwrap();
         assert_eq!((total, rx2.len()), (5000, 0));
         drop(tx);
+    }
+}
+
+/// The model against a client on a real socket: a fake daemon (std threads,
+/// no runtime) that hands each attach to the test.
+#[cfg(all(test, unix))]
+mod fake_daemon {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Value, json};
+    use synaps_client::{AttachMode, Client, ClientOptions, Endpoint, Identity};
+
+    use super::*;
+
+    const A: &str = "20261113-080000-aaaa";
+    const B: &str = "20261113-080000-bbbb";
+    const T: Duration = Duration::from_secs(10);
+
+    struct Conn {
+        r: BufReader<UnixStream>,
+        w: UnixStream,
+    }
+
+    impl Conn {
+        fn send(&mut self, v: Value) {
+            let _ = writeln!(self.w, "{v}");
+        }
+
+        fn event(&mut self, sid: &str, seq: u64, event: Value) {
+            self.send(json!({"type": "event", "session_id": sid, "seq": seq, "ts": "t", "event": event}));
+        }
+
+        /// The next frame; `None` at EOF or after `wait` of silence.
+        fn recv(&mut self, wait: Duration) -> Option<Value> {
+            self.r.get_ref().set_read_timeout(Some(wait)).ok()?;
+            let mut line = String::new();
+            match self.r.read_line(&mut line) {
+                Ok(n) if n > 0 => serde_json::from_str(&line).ok(),
+                _ => None,
+            }
+        }
+
+        /// The session commands among the next frames, until EOF or `wait` of silence.
+        fn cmds(&mut self, wait: Duration) -> Vec<Value> {
+            std::iter::from_fn(|| self.recv(wait)).filter(|f| f["type"] == "cmd").map(|f| f["cmd"].clone()).collect()
+        }
+    }
+
+    fn welcome() -> Value {
+        json!({"type": "welcome", "protocol_version": 3, "daemon_version": "0.0.0-fake", "pid": 1, "profile": null,
+               "sessions": [{"id": A, "model": "m", "lifecycle": "live"}, {"id": B, "model": "m", "lifecycle": "live"}],
+               "progressive_tool_disclosure": false, "generation": 1, "features": ["owned_sessions"]})
+    }
+
+    fn attached_with_prompt(sid: &str, prompt_id: u64) -> Value {
+        json!({"type": "attached", "client": 2, "input_owner": 2, "client_input": "shared",
+               "meta": {"id": sid, "model": "m", "lifecycle": "live", "awaiting_input": 1},
+               "conversation": {"api_messages": [], "messages_len": 0},
+               "pending_prompts": [{"id": prompt_id, "kind": "confirm", "title": "Confirm tool call",
+                   "prompt": format!("Extension: guard\nTool: edit\n\nMessage from guard:\n{sid}\n\nAllow this tool call?")}]})
+    }
+
+    /// Accepts connections: `Hello` → `Welcome`, a session list for the
+    /// control connection, and every `Attach` handed to the test.
+    fn start(name: &str) -> (PathBuf, mpsc::Receiver<Conn>) {
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-fake-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut c = Conn { w: stream.try_clone().unwrap(), r: BufReader::new(stream) };
+                    if c.recv(T).is_none() {
+                        return;
+                    }
+                    c.send(welcome());
+                    let _ = c.r.get_ref().set_read_timeout(None);
+                    let mut line = String::new();
+                    while c.r.read_line(&mut line).is_ok_and(|n| n > 0) {
+                        let f: Value = serde_json::from_str(&line).unwrap_or_default();
+                        line.clear();
+                        match f["type"].as_str() {
+                            Some("sessions") => c.send(json!({"type": "session_list", "sessions": []})),
+                            Some("attach") => {
+                                let _ = tx.send(c);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        (path, rx)
+    }
+
+    /// Apply the client's events to `m` until `done(m)`.
+    fn pump(m: &mut Model, events: &async_channel::Receiver<Event>, what: &str, done: impl Fn(&Model) -> bool) {
+        let until = Instant::now() + T;
+        loop {
+            while let Ok(ev) = events.try_recv() {
+                m.apply(ev);
+            }
+            if done(m) {
+                return;
+            }
+            assert!(Instant::now() < until, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn connect(name: &str) -> (Client, async_channel::Receiver<Event>, mpsc::Receiver<Conn>, Model) {
+        let (path, attaches) = start(name);
+        let (client, events) = Client::spawn(ClientOptions::new(Endpoint::Socket(path), Identity::new("tester").unwrap())).unwrap();
+        let mut m = Model::new(ConnState::Connecting);
+        pump(&mut m, &events, "connected", |m| matches!(m.conn, ConnState::Connected(_)));
+        (client, events, attaches, m)
+    }
+
+    /// The UI's attach (`AppView::attach`).
+    fn ui_attach(m: &mut Model, client: &Client, sid: &str) {
+        let seq = client.attach(sid, AttachMode::Mirror).unwrap();
+        m.want(seq);
+        m.asked_for(sid);
+    }
+
+    /// The UI's AUTHORIZE (`AppView::answer`): only what the model allows goes out.
+    fn ui_authorize(m: &mut Model, client: &Client, prompt_id: u64) -> bool {
+        if !m.may_answer(prompt_id) {
+            return false;
+        }
+        client.answer(prompt_id, Some(CONFIRM_YES.into())).unwrap();
+        m.answer_sent(prompt_id);
+        true
+    }
+
+    /// H2: JUMP from A (prompt #1 on screen) to B (its own prompt #1). Until
+    /// B's `Attached` is applied, A's card cannot answer: the client routes
+    /// every command to its latest attach, so that answer would approve B's
+    /// tool call unseen. Then B's own prompt is answered, once, on B's
+    /// connection; A's connection never sees an answer.
+    #[test]
+    fn a_switch_never_answers_the_other_sessions_prompt() {
+        let (client, events, attaches, mut m) = connect("switch");
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.may_answer(1));
+        // JUMP.
+        ui_attach(&mut m, &client, B);
+        assert!(!ui_authorize(&mut m, &client, 1), "A's card while switching");
+        let mut b = attaches.recv_timeout(T).unwrap();
+        b.send(attached_with_prompt(B, 1));
+        // The connection thread has B; the window still shows A (race (b)).
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(m.is_active(A) && !ui_authorize(&mut m, &client, 1), "A's card after B attached on the wire");
+        pump(&mut m, &events, "B attached", |m| m.is_active(B));
+        assert!(!m.prompt_answered(1), "B's prompt #1 is not A's");
+        assert!(ui_authorize(&mut m, &client, 1));
+        assert!(!ui_authorize(&mut m, &client, 1), "a second click sends nothing");
+        let on_b: Vec<Value> = b.cmds(Duration::from_millis(300)).into_iter().filter(|c| c["cmd"] == "answer").collect();
+        assert_eq!(on_b, [json!({"cmd": "answer", "prompt_id": 1, "value": "y"})]);
+        client.shutdown().unwrap();
+        let on_a = a.cmds(Duration::from_millis(300));
+        assert!(!on_a.iter().any(|c| c["cmd"] == "answer"), "{on_a:?}");
+    }
+
+    /// H2: an answer the daemon refused does not leave the card stuck at
+    /// "answer sent", and an answered prompt id does not carry over to the
+    /// next session's prompt with the same id.
+    #[test]
+    fn a_refused_answer_does_not_leave_the_card_stuck() {
+        let (client, events, attaches, mut m) = connect("stuck");
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.may_answer(1));
+        assert!(ui_authorize(&mut m, &client, 1));
+        assert!(a.cmds(Duration::from_millis(300)).iter().any(|c| c["cmd"] == "answer"));
+        a.event(A, 5, json!({"ev": "refused", "client": 2, "command": "answer", "reason": "input is owned by client #1"}));
+        pump(&mut m, &events, "the refusal", |m| m.may_answer(1));
+        // Answered again (it went out), then a switch before it resolved.
+        assert!(ui_authorize(&mut m, &client, 1));
+        ui_attach(&mut m, &client, B);
+        let mut b = attaches.recv_timeout(T).unwrap();
+        b.send(attached_with_prompt(B, 1));
+        pump(&mut m, &events, "B attached", |m| m.is_active(B));
+        assert!(m.may_answer(1), "B's card is live, not 'answer sent'");
+        client.shutdown().unwrap();
+        let _ = b.cmds(Duration::from_millis(100));
     }
 }
