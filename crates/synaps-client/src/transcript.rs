@@ -674,11 +674,7 @@ fn compact(v: &Value) -> String {
 fn result_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        Value::Array(parts) => parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"),
         Value::Null => String::new(),
         other => other.to_string(),
     }

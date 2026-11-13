@@ -7,14 +7,14 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, h_flex, v_flex};
-use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use synaps_client::transcript::{ItemKind, ToolStatus};
 use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError};
 
 use crate::bench::BenchState;
-use crate::model::{ConnState, Effect, Model, SAVED_LIMIT};
 use crate::model::RenameRequest;
+use crate::model::{ConnState, Effect, Model, SAVED_LIMIT};
 use crate::named::{Marker, ResumeRequest};
 
 /// Per-row strings derived from a transcript item, rebuilt only when the
@@ -51,11 +51,7 @@ pub struct AppView {
 }
 
 impl AppView {
-    pub fn new(
-        client: Option<(Client, async_channel::Receiver<Event>)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(client: Option<(Client, async_channel::Receiver<Event>)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
@@ -400,14 +396,7 @@ impl AppView {
             ItemKind::Error => div().text_sm().text_color(theme.danger).child(row.text.clone()).into_any_element(),
             _ => div().text_sm().child(row.text.clone()).into_any_element(),
         };
-        div()
-            .w_full()
-            .flex()
-            .justify_center()
-            .px_6()
-            .py_1p5()
-            .child(div().w_full().max_w(px(860.)).child(body))
-            .into_any_element()
+        div().w_full().flex().justify_center().px_6().py_1p5().child(div().w_full().max_w(px(860.)).child(body)).into_any_element()
     }
 
     fn render_named(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -434,17 +423,15 @@ impl AppView {
                         cx.notify();
                     })),
             )
-            .child(Button::new("open-by-name").ghost().compact().label("Open by name…").on_click(cx.listener(
-                |this, _, window, cx| {
-                    this.open_shown = !this.open_shown;
-                    this.named_collapsed = false;
-                    if this.open_shown {
-                        this.model.open_shown();
-                        this.open_input.update(cx, |s, cx| s.focus(window, cx));
-                    }
-                    cx.notify();
-                },
-            )));
+            .child(Button::new("open-by-name").ghost().compact().label("Open by name…").on_click(cx.listener(|this, _, window, cx| {
+                this.open_shown = !this.open_shown;
+                this.named_collapsed = false;
+                if this.open_shown {
+                    this.model.open_shown();
+                    this.open_input.update(cx, |s, cx| s.focus(window, cx));
+                }
+                cx.notify();
+            })));
         let mut section = v_flex().gap_0p5().child(header);
         if self.open_shown {
             section = section.child(div().px_2().pb_1().child(Input::new(&self.open_input)));
@@ -474,8 +461,12 @@ impl AppView {
                 Marker::Parked | Marker::Saved => theme.muted_foreground,
             };
             let when = row.activity.as_deref().map(|t| crate::named::relative(t, now)).unwrap_or_default();
-            let detail: SharedString =
-                [row.marker.label(), row.model.as_str(), when.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ").into();
+            let detail: SharedString = [row.marker.label(), row.model.as_str(), when.as_str()]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ")
+                .into();
             let action = row.action.clone();
             section = section.child(
                 h_flex()
@@ -519,38 +510,17 @@ impl AppView {
 
     fn render_rail(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let mut rail = v_flex()
-            .w(px(250.))
-            .h_full()
-            .flex_none()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_3()
-                    .justify_between()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Synaps"))
-                    .child(Button::new("new").ghost().compact().label("+ New").on_click(cx.listener(|this, _, _, _| this.create()))),
-            );
-        let mut list = v_flex()
-            .id("sessions")
-            .flex_1()
-            .overflow_y_scroll()
-            .px_2()
-            .gap_0p5()
-            .child(self.render_named(cx))
-            .child(
-                div()
-                    .px_2()
-                    .pt_2()
-                    .pb_0p5()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.muted_foreground)
-                    .child("SESSIONS"),
-            );
+        let mut rail = v_flex().w(px(250.)).h_full().flex_none().bg(theme.sidebar).border_r_1().border_color(theme.sidebar_border).child(
+            h_flex()
+                .px_3()
+                .py_3()
+                .justify_between()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Synaps"))
+                .child(Button::new("new").ghost().compact().label("+ New").on_click(cx.listener(|this, _, _, _| this.create()))),
+        );
+        let mut list = v_flex().id("sessions").flex_1().overflow_y_scroll().px_2().gap_0p5().child(self.render_named(cx)).child(
+            div().px_2().pt_2().pb_0p5().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(theme.muted_foreground).child("SESSIONS"),
+        );
         let mut unnamed = 0;
         for (i, s) in self.model.unnamed_sessions().enumerate() {
             unnamed += 1;
@@ -573,15 +543,7 @@ impl AppView {
                     } else {
                         theme.muted_foreground
                     }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_sm()
-                            .child(s.label()),
-                    )
+                    .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_ellipsis().text_sm().child(s.label()))
                     .on_click(cx.listener(move |this, _, _, _| this.attach(id.clone()))),
             );
         }
@@ -612,14 +574,7 @@ impl AppView {
             .border_color(theme.border)
             .when_some(self.model.active_name(), |d, n| {
                 d.child(
-                    div()
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .bg(theme.secondary)
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(n.to_string()),
+                    div().px_2().py_0p5().rounded_md().bg(theme.secondary).text_xs().font_weight(FontWeight::SEMIBOLD).child(n.to_string()),
                 )
             })
             .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_ellipsis().child(title))
@@ -641,17 +596,7 @@ impl AppView {
             .when(self.model.transcript.cost_usd() > 0.0, |d| {
                 d.child(div().text_sm().text_color(theme.muted_foreground).child(format!("${:.4}", self.model.transcript.cost_usd())))
             })
-            .child(
-                div()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(theme.border)
-                    .text_xs()
-                    .text_color(color)
-                    .child(label),
-            )
+            .child(div().px_2().py_0p5().rounded_full().border_1().border_color(theme.border).text_xs().text_color(color).child(label))
     }
 }
 
@@ -688,7 +633,9 @@ impl AppView {
             row = row.child(div().text_xs().text_color(theme.danger).child(e.clone()));
         }
         // Only for the session it was made for (a switch drops it).
-        if let Some(r) = self.model.named.replace.as_ref().filter(|r| self.model.active.as_ref().is_some_and(|a| a.session_id == r.session_id)) {
+        if let Some(r) =
+            self.model.named.replace.as_ref().filter(|r| self.model.active.as_ref().is_some_and(|a| a.session_id == r.session_id))
+        {
             row = row.child(
                 Button::new("name-replace")
                     .danger()
@@ -740,8 +687,7 @@ impl Render for AppView {
         let busy = self.model.transcript.busy();
         let can_send = self.model.can_send();
         let prompts = self.model.transcript.pending_prompts().len();
-        let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_row(ix, cx)))
-            .size_full();
+        let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_row(ix, cx))).size_full();
         let main = v_flex()
             .flex_1()
             .h_full()
@@ -762,9 +708,7 @@ impl Render for AppView {
                         .child(format!("{}: {}  (answer in the TUI; prompts are not wired here yet)", p.title, p.prompt)),
                 )
             })
-            .when_some(self.model.last_error.clone(), |d, e| {
-                d.child(div().px_6().text_xs().text_color(theme.danger).child(e))
-            })
+            .when_some(self.model.last_error.clone(), |d, e| d.child(div().px_6().text_xs().text_color(theme.danger).child(e)))
             .child(
                 h_flex()
                     .px_6()
@@ -787,11 +731,6 @@ impl Render for AppView {
                         }))
                     }),
             );
-        h_flex()
-            .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .child(self.render_rail(cx))
-            .child(main)
+        h_flex().size_full().bg(theme.background).text_color(theme.foreground).child(self.render_rail(cx)).child(main)
     }
 }

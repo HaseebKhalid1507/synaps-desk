@@ -14,8 +14,21 @@ struct Acc {
 
 fn is_gpu(path: &str) -> bool {
     const PATTERNS: &[&str] = &[
-        "/dev/dri", "/dev/nvidia", "libnvidia", "libGLX_nvidia", "libEGL_nvidia", "libcuda", "libvulkan",
-        "nvidia_icd", "libVkLayer", "libdrm", "iris_dri", "radeonsi", "libgallium", "intel_icd", "libvulkan_",
+        "/dev/dri",
+        "/dev/nvidia",
+        "libnvidia",
+        "libGLX_nvidia",
+        "libEGL_nvidia",
+        "libcuda",
+        "libvulkan",
+        "nvidia_icd",
+        "libVkLayer",
+        "libdrm",
+        "iris_dri",
+        "radeonsi",
+        "libgallium",
+        "intel_icd",
+        "libvulkan_",
     ];
     PATTERNS.iter().any(|p| path.contains(p))
 }

@@ -57,10 +57,16 @@ pub enum ClientFrame {
     Ping,
     Sessions,
     Attach(Attach),
-    Cmd { session_id: String, cmd: SessionCommand },
+    Cmd {
+        session_id: String,
+        cmd: SessionCommand,
+    },
     /// Control fast path: the saved sessions on disk, newest first. Only to
     /// a daemon that lists [`FEATURE_SAVED_SESSIONS`]. Reply: `SavedSessionList`.
-    SavedSessions { named_only: bool, limit: u32 },
+    SavedSessions {
+        named_only: bool,
+        limit: u32,
+    },
     /// Control fast path: name (`Some`) or unname (`None`) a live or parked
     /// session (`/saveas` rules). `expect`: absent = replace any name,
     /// `Some(None)` = only if unnamed, `Some(Some(x))` = only if named `x`.
@@ -207,26 +213,37 @@ pub struct CreateConfig {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SessionCommand {
-    Submit { text: String, attachments: Vec<Value> },
-    Steer { text: String },
+    Submit {
+        text: String,
+        attachments: Vec<Value>,
+    },
+    Steer {
+        text: String,
+    },
     Cancel,
-    Answer { prompt_id: u64, value: Option<String> },
+    Answer {
+        prompt_id: u64,
+        value: Option<String>,
+    },
     /// Reply: `QueryResult{id, value}`, broadcast to every attached client,
     /// so pick an id below [`RESERVED_QUERY_ID_BASE`] that others won't.
-    Query { id: u64, query: SessionQuery },
+    Query {
+        id: u64,
+        query: SessionQuery,
+    },
     /// A clean detach (then `Bye`); the turn keeps running.
-    Detach { client: u64 },
+    Detach {
+        client: u64,
+    },
 }
 
 impl std::fmt::Debug for SessionCommand {
     /// `Submit`/`Steer`/`Answer` print `<redacted>`, no lengths (as Synaps).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Submit { attachments, .. } => f
-                .debug_struct("Submit")
-                .field("text", &format_args!("<redacted>"))
-                .field("attachments", &attachments.len())
-                .finish(),
+            Self::Submit { attachments, .. } => {
+                f.debug_struct("Submit").field("text", &format_args!("<redacted>")).field("attachments", &attachments.len()).finish()
+            }
             Self::Steer { .. } => f.debug_struct("Steer").field("text", &format_args!("<redacted>")).finish(),
             Self::Cancel => f.write_str("Cancel"),
             Self::Answer { prompt_id, .. } => {
@@ -258,22 +275,46 @@ pub enum DaemonFrame {
     Welcome(Welcome),
     /// `reason` is `RefuseReason` raw (`{"reason":"busy"}`, ...); see
     /// [`refuse_kind`]. The daemon closes after it.
-    Refused { reason: Value, message: String },
-    Pong { pid: u32, uptime_s: u64, sessions: usize },
+    Refused {
+        reason: Value,
+        message: String,
+    },
+    Pong {
+        pid: u32,
+        uptime_s: u64,
+        sessions: usize,
+    },
     /// `rejected`: entries that did not decode (skipped, not fatal).
-    SessionList { sessions: Vec<SessionMeta>, rejected: usize },
+    SessionList {
+        sessions: Vec<SessionMeta>,
+        rejected: usize,
+    },
     Attached(Box<Attached>),
     Event(Envelope),
-    Error { session_id: Option<String>, message: String },
+    Error {
+        session_id: Option<String>,
+        message: String,
+    },
     /// Reply to `SavedSessions`. `rejected`: entries that did not decode.
-    SavedSessionList { sessions: Vec<SavedSession>, truncated: bool, rejected: usize },
+    SavedSessionList {
+        sessions: Vec<SavedSession>,
+        truncated: bool,
+        rejected: usize,
+    },
     /// Reply to `Rename`: the session's name is now `name` (`None`: cleared).
-    Renamed { session_id: String, name: Option<String>, in_memory_only: bool },
+    Renamed {
+        session_id: String,
+        name: Option<String>,
+        in_memory_only: bool,
+    },
     /// Reply to `Rename`: not renamed.
     RenameFailed(RenameFailure),
     Bye(Option<ByeReason>),
     Unknown(String),
-    Malformed { kind: String, error: String },
+    Malformed {
+        kind: String,
+        error: String,
+    },
 }
 
 /// `RefuseReason`'s tag (`busy`, `version`, `unknown_session`, ...), or "".
@@ -503,10 +544,7 @@ pub struct SessionMeta {
 
 impl SessionMeta {
     pub fn label(&self) -> String {
-        self.name
-            .clone()
-            .or_else(|| self.title.clone().filter(|t| !t.is_empty()))
-            .unwrap_or_else(|| self.id.clone())
+        self.name.clone().or_else(|| self.title.clone().filter(|t| !t.is_empty())).unwrap_or_else(|| self.id.clone())
     }
 
     pub fn is_parked(&self) -> bool {
@@ -1064,17 +1102,42 @@ pub enum StreamEvent {
 #[serde(tag = "llm", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum LlmEvent {
-    Thinking { text: String },
-    Text { text: String },
-    ToolUseStart { tool_name: String, tool_id: String },
-    ToolUseDelta { tool_id: String, delta: String },
-    ToolUse { tool_name: String, tool_id: String, #[serde(default)] input: Value },
-    ToolResult { tool_id: String, result: String },
-    ToolResultDelta { tool_id: String, delta: String },
+    Thinking {
+        text: String,
+    },
+    Text {
+        text: String,
+    },
+    ToolUseStart {
+        tool_name: String,
+        tool_id: String,
+    },
+    ToolUseDelta {
+        tool_id: String,
+        delta: String,
+    },
+    ToolUse {
+        tool_name: String,
+        tool_id: String,
+        #[serde(default)]
+        input: Value,
+    },
+    ToolResult {
+        tool_id: String,
+        result: String,
+    },
+    ToolResultDelta {
+        tool_id: String,
+        delta: String,
+    },
     ResponseStart,
     ResponseReset,
-    ToolQueued { tool_id: String },
-    ToolStarted { tool_id: String },
+    ToolQueued {
+        tool_id: String,
+    },
+    ToolStarted {
+        tool_id: String,
+    },
     #[serde(other)]
     Unknown,
 }

@@ -93,9 +93,16 @@ pub enum Effect {
     /// Attach to a live session, then [`Model::attaching`]. `fallback`: a
     /// named session's journal, resumed if it ended meanwhile. `open`: an
     /// Open by name.
-    Attach { session_id: String, fallback: Option<ResumeRequest>, open: bool },
+    Attach {
+        session_id: String,
+        fallback: Option<ResumeRequest>,
+        open: bool,
+    },
     /// `Client::resume(req.target, req.options())`, then [`Model::resuming`].
-    Resume { req: ResumeRequest, open: bool },
+    Resume {
+        req: ResumeRequest,
+        open: bool,
+    },
     /// Leave the current attachment (`Client::detach`).
     Detach,
 }
@@ -525,11 +532,9 @@ impl Model {
                 }
                 self.conn = match s {
                     Status::Connecting => ConnState::Connecting,
-                    Status::Connected { daemon_version, profile, .. } => ConnState::Connected(format!(
-                        "{}{}",
-                        daemon_version,
-                        profile.map(|p| format!(" · {p}")).unwrap_or_default()
-                    )),
+                    Status::Connected { daemon_version, profile, .. } => {
+                        ConnState::Connected(format!("{}{}", daemon_version, profile.map(|p| format!(" · {p}")).unwrap_or_default()))
+                    }
                     Status::Reconnecting { .. } => ConnState::Reconnecting,
                     Status::Offline(e) => ConnState::Off(e),
                     Status::Incompatible(e) => ConnState::Incompatible(e.to_string()),
@@ -684,10 +689,8 @@ impl Model {
                 }
             }
             Event::Error { attach_seq, error } if attach_seq.is_none_or(|s| self.current(s)) => {
-                let input = matches!(
-                    &error,
-                    Error::Refused { command: None, .. } | Error::NotAttached { .. }
-                ) || matches!(&error, Error::Refused { command: Some(c), .. } if c == "submit" || c == "steer");
+                let input = matches!(&error, Error::Refused { command: None, .. } | Error::NotAttached { .. })
+                    || matches!(&error, Error::Refused { command: Some(c), .. } if c == "submit" || c == "steer");
                 if input {
                     self.give_back_oldest(&mut effects);
                 }
@@ -743,8 +746,9 @@ mod tests {
         let mut m = Model::new(ConnState::Connecting);
         attach(&mut m, 1);
         for round in 0..400 {
-            let messages: Vec<Value> =
-                (0..50).map(|i| json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("round {round} msg {i}")})).collect();
+            let messages: Vec<Value> = (0..50)
+                .map(|i| json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("round {round} msg {i}")}))
+                .collect();
             m.apply(session(1, SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { text: "delta ".repeat(20) }) }));
             m.apply(Event::History { attach_seq: 1, session_id: "s".into(), seq: 0, update: HistoryUpdate::Replace { messages } });
         }
@@ -918,7 +922,9 @@ mod tests {
             ]))),
             t0,
         );
-        let fixture = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../synaps-client/tests/fixtures/saved_session_list.json")).unwrap();
+        let fixture =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../synaps-client/tests/fixtures/saved_session_list.json"))
+                .unwrap();
         let DaemonFrame::SavedSessionList { sessions, truncated, .. } = decode_frame(fixture.trim()).unwrap() else { panic!() };
         m.apply_at(Event::SavedSessions { sessions, truncated, rejected: 0 }, t0);
         let rows: Vec<(String, Marker)> = m.named_rows().into_iter().map(|r| (r.name, r.marker)).collect();
@@ -1002,7 +1008,10 @@ mod tests {
         let t0 = Instant::now();
         let mut m = Model::new(ConnState::Connecting);
         m.apply_at(connected(&["saved_sessions"]), t0);
-        m.apply_at(Event::Sessions(metas(json!([{"id": "l1", "name": "live-one", "journal_id": "j-l1", "cwd": "/w", "lifecycle": "live"}]))), t0);
+        m.apply_at(
+            Event::Sessions(metas(json!([{"id": "l1", "name": "live-one", "journal_id": "j-l1", "cwd": "/w", "lifecycle": "live"}]))),
+            t0,
+        );
         let axel = json!({"id": "20261110-202033-e5f6", "name": "axel", "cwd": "/home/u/axel", "live": false});
         m.apply_at(saved_list(json!([axel])), t0);
 
@@ -1079,7 +1088,9 @@ mod tests {
         let mut m = Model::new(ConnState::Connecting);
         m.apply_at(connected(&[]), t0);
         m.apply_at(
-            Event::Sessions(metas(json!([{"id": "l3", "name": "axel", "journal_id": "j-axel", "cwd": "/home/u/axel", "lifecycle": "parked"}]))),
+            Event::Sessions(metas(
+                json!([{"id": "l3", "name": "axel", "journal_id": "j-axel", "cwd": "/home/u/axel", "lifecycle": "parked"}]),
+            )),
             t0,
         );
         let row = m.named_rows().remove(0);
