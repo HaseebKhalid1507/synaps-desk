@@ -96,13 +96,25 @@ impl Glitch {
         let u = self.u(now);
         match self.kind {
             GlitchKind::Burst => 1.0,
-            GlitchKind::Appear => (u / 0.6).min(1.0),
-            GlitchKind::Vanish => 1.0 - (u / 0.85).min(1.0),
+            // Starts a quarter in, so the body never blinks out between bolt and arrival.
+            GlitchKind::Appear => 0.25 + 0.75 * (u / 0.55).min(1.0),
+            GlitchKind::Vanish => 1.0 - 0.8 * u,
         }
     }
 
     pub fn seed(&self) -> u64 {
         self.seed
+    }
+
+    /// Teleport legs turn the figure into a red silhouette: late in the dissolve, early
+    /// in the landing.
+    pub fn tint(&self, now: Instant) -> Option<u32> {
+        let u = self.u(now);
+        match self.kind {
+            GlitchKind::Vanish if u > 0.45 => Some(BOLT_RED),
+            GlitchKind::Appear if u < 0.3 => Some(BOLT_RED),
+            _ => None,
+        }
     }
 
     /// The pattern re-rolls every 50 ms, like a bad signal.
@@ -126,11 +138,13 @@ pub struct BodyPlan {
     pub cells: Vec<(ShapeRect, u32)>,
     /// Scanline darkness 0..1.
     pub scan: f32,
+    /// Draw the body as a solid silhouette of this colour (teleport dissolve/land).
+    pub tint: Option<u32>,
 }
 
 impl BodyPlan {
     pub fn plain() -> BodyPlan {
-        BodyPlan { sx: 1.0, sy: 1.0, pivot: (0.0, 0.0), slices: None, ghosts: Vec::new(), cells: Vec::new(), scan: 0.0 }
+        BodyPlan { sx: 1.0, sy: 1.0, pivot: (0.0, 0.0), slices: None, ghosts: Vec::new(), cells: Vec::new(), scan: 0.0, tint: None }
     }
 
     pub fn is_plain(&self) -> bool {
@@ -201,31 +215,57 @@ impl BodyPlan {
         (x0, y0, w as f32 * self.sx, h as f32 * self.sy)
     }
 
-    /// The squashed body rects (no slicing), for ghosts.
+    /// The squashed body rects (no slicing).
     pub fn scaled(&self, rects: &[ShapeRect]) -> Vec<ShapeRect> {
         rects.iter().map(|&r| self.scale_rect(r)).filter(|r| r.3 > 0).collect()
+    }
+
+    /// `scaled` cut to the drawn bands and shifted with them (plus `dx`, `dy`).
+    fn banded(&self, scaled: &[ShapeRect], dx: i32, dy: i32, out: &mut Vec<ShapeRect>) {
+        let mv = |x: i16, y: i32, w: u16, h: i32, sx: i32| ((x as i32 + sx + dx) as i16, (y + dy) as i16, w, h as u16);
+        match &self.slices {
+            None => out.extend(scaled.iter().map(|&(x, y, w, h)| mv(x, y as i32, w, h as i32, 0))),
+            Some(bands) => {
+                for &(x, y, w, h) in scaled {
+                    let (ry0, ry1) = (y as i32, y as i32 + h as i32);
+                    for &(b0, b1, sx) in bands {
+                        let (y0, y1) = (ry0.max(b0), ry1.min(b1));
+                        if y1 > y0 {
+                            out.push(mv(x, y0, w, y1 - y0, sx));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The body as drawn (squashed, banded, shifted), no ghosts or cells.
+    pub fn body_rects(&self, rects: &[ShapeRect]) -> Vec<ShapeRect> {
+        let mut out = Vec::new();
+        self.banded(&self.scaled(rects), 0, 0, &mut out);
+        out
+    }
+
+    /// The RGB-split silhouettes, following the drawn bands: `(rect, rgb)`.
+    pub fn ghost_rects(&self, rects: &[ShapeRect]) -> Vec<(ShapeRect, u32)> {
+        let scaled = self.scaled(rects);
+        let mut out = Vec::new();
+        let mut tmp = Vec::new();
+        for &(dx, dy, c) in &self.ghosts {
+            tmp.clear();
+            self.banded(&scaled, dx, dy, &mut tmp);
+            out.extend(tmp.iter().map(|&r| (r, c)));
+        }
+        out
     }
 
     /// Everything this plan draws, as shape rects (avatar-local).
     pub fn shape(&self, rects: &[ShapeRect]) -> Vec<ShapeRect> {
         let scaled = self.scaled(rects);
         let mut out = Vec::with_capacity(scaled.len() * (1 + self.ghosts.len()));
-        match &self.slices {
-            None => out.extend_from_slice(&scaled),
-            Some(bands) => {
-                for &(x, y, w, h) in &scaled {
-                    let (ry0, ry1) = (y as i32, y as i32 + h as i32);
-                    for &(b0, b1, dx) in bands {
-                        let (y0, y1) = (ry0.max(b0), ry1.min(b1));
-                        if y1 > y0 {
-                            out.push(((x as i32 + dx) as i16, y0 as i16, w, (y1 - y0) as u16));
-                        }
-                    }
-                }
-            }
-        }
+        self.banded(&scaled, 0, 0, &mut out);
         for &(dx, dy, _) in &self.ghosts {
-            out.extend(scaled.iter().map(|&(x, y, w, h)| ((x as i32 + dx) as i16, (y as i32 + dy) as i16, w, h)));
+            self.banded(&scaled, dx, dy, &mut out);
         }
         out.extend(self.cells.iter().map(|c| c.0));
         out
@@ -336,7 +376,7 @@ pub fn star(cx: f32, cy: f32, r: f32, spin: f32) -> Vec<(f32, f32)> {
 
 // ---- teleport bolt ------------------------------------------------------------------
 
-pub const BOLT_MS: f32 = 300.0;
+pub const BOLT_MS: f32 = 340.0;
 
 #[derive(Clone, Copy, Debug)]
 struct RoutePt {
@@ -403,7 +443,7 @@ impl Bolt {
     /// shoots out, the tail chases it in.
     pub fn span(u: f32) -> (f32, f32) {
         let ease = |v: f32| 1.0 - (1.0 - v.clamp(0.0, 1.0)).powi(3);
-        (ease(u / 0.55), ease((u - 0.3) / 0.7))
+        (ease(0.06 + u / 0.5), ease((u - 0.32) / 0.6))
     }
 
     /// Ribbon polygons `(main, branches)` between tail and head, root px.
@@ -422,7 +462,7 @@ impl Bolt {
         seg.extend(self.route.iter().filter(|p| p.t > tail && p.t < head).map(|p| (p.x, p.y, p.t)));
         let hp = self.at(head);
         seg.push((hp.0, hp.1, head));
-        let radius = (self.scale * 0.034).clamp(3.0, 9.0);
+        let radius = (self.scale * 0.1).clamp(6.0, 28.0);
         let n = seg.len();
         let widths: Vec<f32> = seg
             .iter()
@@ -454,13 +494,13 @@ impl Bolt {
                 let al = (ax * ax + ay * ay).sqrt().max(1e-3);
                 let axis = (ax / al, ay / al);
                 let growth = ((t - tail) / 0.07).min((head - t) / 0.08).min(1.0);
-                let reach = self.scale * 0.22 * growth * var;
+                let reach = self.scale * 0.3 * growth * var;
                 if reach < 3.0 {
                     continue;
                 }
                 let fork = |f: f32, a: f32| along(o, axis, reach * f, side * reach * a);
                 let stem = [o, fork(-0.16, 0.22), fork(-0.12, 0.4), fork(-0.49, 0.48), fork(-0.39, 0.68), fork(-0.86, 0.88), fork(-1.15, 1.04)];
-                let th = growth * 1.6;
+                let th = growth * (self.scale * 0.012).clamp(1.6, 3.4);
                 let w: Vec<f32> = [1.45, 2.05, 1.65, 1.2, 0.8, 0.55, 0.12].iter().map(|v| v * th).collect();
                 branches.push(ribbon(&stem, &w));
             }
@@ -488,13 +528,27 @@ fn ribbon(pts: &[(f32, f32)], widths: &[f32]) -> Vec<(f32, f32)> {
 }
 
 /// Polygons (root px) → shape rects relative to `origin`.
-pub fn polys_to_rects(polys: &[Vec<(f32, f32)>], origin: (i32, i32)) -> Vec<ShapeRect> {
-    let mut out = Vec::new();
+/// Polygons → shape rows, edges snapped to a `step` px grid (Capri's bolt is blocky).
+pub fn polys_to_rects(polys: &[Vec<(f32, f32)>], origin: (i32, i32), step: i32) -> Vec<ShapeRect> {
+    let mut rows = Vec::new();
     for p in polys {
         let local: Vec<(f32, f32)> = p.iter().map(|&(x, y)| (x - origin.0 as f32, y - origin.1 as f32)).collect();
-        shape::poly_rows(&local, &mut out);
+        shape::poly_rows(&local, &mut rows);
     }
-    out
+    if step <= 1 {
+        return rows;
+    }
+    // Snap each run to the grid, per band of `step / 2` rows, so the edge stair-steps.
+    let band = (step / 2).max(1);
+    rows.into_iter()
+        .filter_map(|(x, y, w, h)| {
+            let b = (y as i32).div_euclid(band) as u32;
+            let jitter = (hash01(b, x as u32 / step as u32) * step as f32) as i32;
+            let x0 = (x as i32 + jitter / 2).div_euclid(step) * step;
+            let x1 = (x as i32 + w as i32 + jitter / 2).div_euclid(step) * step;
+            (x1 > x0).then_some((x0 as i16, y, (x1 - x0) as u16, h))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -516,13 +570,19 @@ mod tests {
     }
 
     #[test]
-    fn glitch_vanish_empties() {
+    fn glitch_vanish_thins_to_red() {
         let t = Instant::now();
         let g = Glitch::new(GlitchKind::Vanish, t, 7);
+        let mut plan = BodyPlan::plain();
+        plan.glitch(g.strength(t), g.coverage(t), g.step_seed(t), g.seed(), 300, 400, (0, 0, 300, 400));
+        let full: i32 = plan.slices.unwrap().iter().map(|b| b.1 - b.0).sum();
         let late = t + Duration::from_millis(290);
         let mut plan = BodyPlan::plain();
         plan.glitch(g.strength(late), g.coverage(late), g.step_seed(late), g.seed(), 300, 400, (0, 0, 300, 400));
-        assert!(plan.slices.unwrap().is_empty());
+        let thin: i32 = plan.slices.unwrap().iter().map(|b| b.1 - b.0).sum();
+        assert!(thin * 2 < full, "{thin} vs {full}");
+        assert_eq!(g.tint(late), Some(BOLT_RED));
+        assert_eq!(g.tint(t), None);
     }
 
     #[test]

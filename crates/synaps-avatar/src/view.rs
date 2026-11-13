@@ -33,6 +33,8 @@ pub struct Layout {
     pub ground_y: i32,
     /// Seat point of the perch frames inside the window (sitting on an edge).
     pub seat_y: Option<i32>,
+    /// How far the lowest frame pixel reaches below the ground point.
+    pub foot_pad: i32,
 }
 
 // Logical px. The HUD follows Capri's CSS (cyberpunk.css, avatar-detach.css).
@@ -83,9 +85,22 @@ impl Layout {
             let (dx, dy) = pack.offset(f);
             avatar_y + geo.to_device(f.anchor.x + dx, f.anchor.y + dy).1.round() as i32
         });
+        // Standing frames only (seat-anchored ones hang over an edge, not the floor).
+        let foot_pad = pack
+            .frames
+            .iter()
+            .filter(|f| f.anchor.name == "ground")
+            .map(|f| {
+                let (_, dy) = pack.offset(f);
+                (geo.to_device(0, f.bounds.y + f.bounds.height + dy).1 - gy).ceil() as i32
+            })
+            .max()
+            .unwrap_or(0)
+            .max(0);
         Layout {
             sf,
             geo,
+            foot_pad,
             win_w,
             win_h: avatar_y + geo.height as i32,
             avatar_x,
@@ -701,7 +716,8 @@ impl Avatar {
         let Leg::Bolt(t0) = tp.leg else { return false };
         let u = now.duration_since(t0).as_secs_f32() * 1000.0 / fx::BOLT_MS;
         let (to, place, moved) = (tp.to, tp.place, tp.moved);
-        if u >= 1.0 {
+        // The tail has all but caught the head: hand over to the arrival glitch.
+        if u >= 0.7 {
             self.x11.fx_hide();
             tp.leg = Leg::Appear;
             self.hidden = false;
@@ -715,8 +731,9 @@ impl Avatar {
             let (main, branches) = b.frame(u);
             let (bx, by, bw, bh) = b.bbox();
             let o = (bx, by);
-            self.x11.fx_show(0, fx::BOLT_DARK, o, (bw, bh), &fx::polys_to_rects(&branches, o)).ok();
-            self.x11.fx_show(1, fx::BOLT_RED, o, (bw, bh), &fx::polys_to_rects(&main, o)).ok();
+            let step = (6.0 * self.layout.sf).round() as i32;
+            self.x11.fx_show(0, fx::BOLT_DARK, o, (bw, bh), &fx::polys_to_rects(&branches, o, 2)).ok();
+            self.x11.fx_show(1, fx::BOLT_RED, o, (bw, bh), &fx::polys_to_rects(&main, o, step)).ok();
         }
         if u >= 0.5 && !moved {
             if let Some(tp) = &mut self.teleport {
@@ -938,7 +955,7 @@ impl Avatar {
         let (cx, cy) = (x + l.avatar_x + aw / 2, y + l.avatar_y + ah / 2);
         let m = x11.monitor_at(cx, cy);
         let ax = (x + l.avatar_x).clamp(m.x, (m.x + m.w - aw).max(m.x));
-        let gy = (y + l.ground_y).min(m.y + m.h);
+        let gy = (y + l.ground_y).min(m.y + m.h - l.foot_pad);
         let top = gy - l.ground_y + l.avatar_y;
         let gy = if top < m.y { gy + (m.y - top) } else { gy };
         (ax - l.avatar_x, gy - l.ground_y)
@@ -947,7 +964,7 @@ impl Avatar {
     pub fn default_origin(x11: &X11, l: &Layout) -> (i32, i32) {
         let m = x11.primary();
         let x = m.x + m.w - (l.avatar_x + l.geo.width as i32) - (24.0 * l.sf) as i32;
-        let y = m.y + m.h - l.ground_y;
+        let y = m.y + m.h - l.foot_pad - l.ground_y;
         (x, y)
     }
 
@@ -1385,10 +1402,10 @@ impl PanelGeom {
 
 const HEARTS: [(f32, f32, f32, u32); 4] = [
     // dx, size, delay ms, colour
-    (-12.0, 30.0, 0.0, 0xff3e83),
-    (28.0, 23.0, 90.0, 0xff79b8),
-    (-42.0, 19.0, 170.0, 0xff1f63),
-    (10.0, 15.0, 250.0, 0xffb3d9),
+    (-14.0, 36.0, 0.0, 0xff3e83),
+    (32.0, 28.0, 90.0, 0xff79b8),
+    (-48.0, 23.0, 170.0, 0xff1f63),
+    (12.0, 18.0, 250.0, 0xffb3d9),
 ];
 
 impl Render for Avatar {
@@ -1416,7 +1433,8 @@ impl Render for Avatar {
         let frame = self.frame_or_default(self.anim.frame());
         // HUD placement follows the mood's resting frame, so loops don't make it jitter.
         let base = self.frame_or_default(self.anim.base()).or(frame);
-        let (base_top, head_x) = base.map_or((0, l.geo.width as i32 / 2), |f| (f.top, f.head_x));
+        // …but a taller one-shot (an entry clip) pushes it up so it never sits on the hair.
+        let (base_top, head_x) = base.map_or((0, l.geo.width as i32 / 2), |f| (f.top.min(frame.map_or(f.top, |c| c.top)), f.head_x));
         let top_l = (l.avatar_y + base_top) as f32 / sf;
         let head_l = (l.avatar_x + head_x) as f32 / sf;
         let image = frame.map(|f| f.image.clone());
@@ -1437,6 +1455,7 @@ impl Render for Avatar {
         if let Some(g) = self.glitch {
             let top = frame.map_or(0, |f| f.top);
             plan.glitch(g.strength(now), g.coverage(now), g.step_seed(now), g.seed(), aw, ah, (0, top, aw, ah - top));
+            plan.tint = g.tint(now);
         }
         let plan = Rc::new(plan);
         let body_shape: Vec<ShapeRect> = if hidden {
@@ -1446,7 +1465,8 @@ impl Render for Avatar {
         } else {
             plan.shape(&rects)
         };
-        let ghost_rects = if plan.ghosts.is_empty() || hidden { Vec::new() } else { plan.scaled(&rects) };
+        let ghost_rects = if plan.ghosts.is_empty() || hidden { Vec::new() } else { plan.ghost_rects(&rects) };
+        let tint_rects = if plan.tint.is_some() && !hidden { plan.body_rects(&rects) } else { Vec::new() };
         let life_ms = self.pack.behaviour.life.sparkle_ms;
         let glints: Vec<(f32, f32, f32, f32)> = if hidden || self.glitch.is_some() {
             Vec::new()
@@ -1493,14 +1513,18 @@ impl Render for Avatar {
                     let lp = |v: f32| v / sf;
                     let rect = |x: f32, y: f32, w: f32, h: f32| Bounds::new(point(px(ax + lp(x)), px(ay + lp(y))), size(px(lp(w)), px(lp(h))));
                     if let (Some(img), false) = (image, hidden) {
-                        for &(dx, dy, c) in &plan2.ghosts {
-                            for r in &ghost_rects {
-                                window.paint_quad(fill(rect((r.0 as i32 + dx) as f32, (r.1 as i32 + dy) as f32, r.2 as f32, r.3 as f32), rgb(c)));
-                            }
+                        for &(r, c) in &ghost_rects {
+                            window.paint_quad(fill(rect(r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32), rgb(c)));
                         }
                         let (ix, iy, iw, ih) = plan2.image_rect(aw, ah);
                         let ib = rect(ix, iy, iw, ih);
                         match &plan2.slices {
+                            _ if plan2.tint.is_some() => {
+                                let c = rgb(plan2.tint.unwrap_or(fx::BOLT_RED));
+                                for r in &tint_rects {
+                                    window.paint_quad(fill(rect(r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32), c));
+                                }
+                            }
                             None => {
                                 window.paint_image(ib, ib, Corners::default(), img, 0, false).ok();
                             }
