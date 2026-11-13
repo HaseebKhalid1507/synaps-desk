@@ -278,6 +278,18 @@ impl X11 {
 
     /// `fx_show` without the flush, to batch several layers into one write.
     pub fn fx_set(&self, layer: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: &[ShapeRect]) -> Result<()> {
+        self.fx_place(layer, rgb, origin, size, Some(rects), false)
+    }
+
+    /// An effect layer stacked directly below the avatar window (e.g. a contact shadow).
+    /// `rects: None` keeps the current shape and only moves the window.
+    pub fn fx_under(&self, layer: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: Option<&[ShapeRect]>) -> Result<()> {
+        self.fx_place(layer, rgb, origin, size, rects, true)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn fx_place(&self, layer: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: Option<&[ShapeRect]>, under: bool) -> Result<()> {
         let mut fx = self.fx.lock().map_err(|_| anyhow::anyhow!("fx lock"))?;
         while fx.len() <= layer {
             let id = self.conn.generate_id()?;
@@ -305,24 +317,20 @@ impl X11 {
             fx.push((id, false));
         }
         let (id, mapped) = fx[layer];
-        if rects.is_empty() {
+        if rects.is_some_and(|r| r.is_empty()) {
             if mapped {
                 self.conn.unmap_window(id)?;
                 fx[layer].1 = false;
             }
             return Ok(());
         }
-        let r: Vec<xproto::Rectangle> = rects.iter().map(|&(x, y, width, height)| xproto::Rectangle { x, y, width, height }).collect();
-        self.conn.shape_rectangles(shape::SO::SET, shape::SK::BOUNDING, xproto::ClipOrdering::UNSORTED, id, 0, 0, &r)?;
-        self.conn.configure_window(
-            id,
-            &xproto::ConfigureWindowAux::new()
-                .x(origin.0)
-                .y(origin.1)
-                .width(size.0.max(1) as u32)
-                .height(size.1.max(1) as u32)
-                .stack_mode(xproto::StackMode::ABOVE),
-        )?;
+        if let Some(rects) = rects {
+            let r: Vec<xproto::Rectangle> = rects.iter().map(|&(x, y, width, height)| xproto::Rectangle { x, y, width, height }).collect();
+            self.conn.shape_rectangles(shape::SO::SET, shape::SK::BOUNDING, xproto::ClipOrdering::UNSORTED, id, 0, 0, &r)?;
+        }
+        let aux = xproto::ConfigureWindowAux::new().x(origin.0).y(origin.1).width(size.0.max(1) as u32).height(size.1.max(1) as u32);
+        let aux = if under { aux.sibling(self.win).stack_mode(xproto::StackMode::BELOW) } else { aux.stack_mode(xproto::StackMode::ABOVE) };
+        self.conn.configure_window(id, &aux)?;
         if !mapped {
             self.conn.map_window(id)?;
             fx[layer].1 = true;

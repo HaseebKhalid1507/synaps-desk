@@ -82,6 +82,71 @@ pub struct Frame {
     pub head_x: i32,
     /// Points well inside the upper part of the figure (hair), for glints.
     pub glints: Vec<(i16, i16)>,
+    /// Topmost opaque row per column (i16::MAX where the column is empty).
+    pub profile: Arc<Vec<i16>>,
+    /// Device-px rows of the face (brows to mouth): glitches keep it readable.
+    pub face: (i32, i32),
+}
+
+/// Topmost opaque row per column.
+fn top_profile(mask: &Mask) -> Vec<i16> {
+    (0..mask.w as i32)
+        .map(|x| (0..mask.h as i32).find(|&y| mask.get(x, y)).map_or(i16::MAX, |y| y as i16))
+        .collect()
+}
+
+/// Rows of the face. Capri-style eyes are saturated blue-teal disks; their rows give the
+/// band (brows a little above, the mouth below). Without them: a fixed slice under the top.
+fn face_band(px: &[u8], w: u32, top: i32, height: i32) -> (i32, i32) {
+    let mut rows = Vec::new();
+    let lim = (top + (height as f32 * 0.65) as i32).min((px.len() / 4 / w as usize) as i32);
+    for y in top.max(0)..lim {
+        for x in 0..w as i32 {
+            let i = (y as usize * w as usize + x as usize) * 4;
+            let (r, g, b, a) = (px[i], px[i + 1], px[i + 2], px[i + 3]);
+            if a > 200 && b > 190 && r < 100 && g > 50 && g < 200 {
+                rows.push(y);
+            }
+        }
+    }
+    if rows.len() >= 6 {
+        rows.sort_unstable();
+        let (y0, y1) = (rows[rows.len() / 10], rows[rows.len() * 9 / 10]);
+        let eye = (y1 - y0).max(6);
+        return (y0 - eye, y1 + eye * 2);
+    }
+    (top + (height as f32 * 0.17) as i32, top + (height as f32 * 0.37) as i32)
+}
+
+/// A 1 px rim of `rgb` around dark opaque pixels, drawn into transparent neighbours (so
+/// behind the art, never over it). RGBA straight alpha.
+fn add_rim(px: &mut [u8], w: u32, h: u32, rgb: u32) {
+    let (w, h) = (w as i32, h as i32);
+    let dark = |px: &[u8], x: i32, y: i32| {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return false;
+        }
+        let i = (y * w + x) as usize * 4;
+        px[i + 3] >= 160 && (px[i] as u32 * 3 + px[i + 1] as u32 * 6 + px[i + 2] as u32) < 10 * 70
+    };
+    let mut set = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize * 4;
+            if px[i + 3] >= HIT_ALPHA {
+                continue;
+            }
+            if dark(px, x - 1, y) || dark(px, x + 1, y) || dark(px, x, y - 1) || dark(px, x, y + 1) {
+                set.push(i);
+            }
+        }
+    }
+    for i in set {
+        px[i] = (rgb >> 16) as u8;
+        px[i + 1] = (rgb >> 8) as u8;
+        px[i + 2] = rgb as u8;
+        px[i + 3] = 255;
+    }
 }
 
 /// Head x and glint candidates from the hit mask (pack-agnostic: no colour rules).
@@ -206,6 +271,14 @@ fn decode_one(pack: &Pack, f: &FrameSource, geo: &Geometry, verify: bool, resize
     // Lanczos3 on premultiplied alpha (fast_image_resize premultiplies for U8x4).
     resizer.resize(&src, &mut dst, &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3)))?;
     let mut px = dst.into_vec();
+    if f.anchor.name == "seat"
+        && let Some(rim) = pack.behaviour.perch.as_ref().and_then(|p| u32::from_str_radix(p.rim.trim_start_matches('#'), 16).ok())
+    {
+        add_rim(&mut px, geo.width, geo.height, rim);
+    }
+    let vb = f.bounds.offset(dx, dy);
+    let (_, top) = geo.to_device(0, vb.y);
+    let face = face_band(&px, geo.width, top.round() as i32, (vb.height as f32 * geo.scale) as i32);
 
     let mut mask = Mask::new(geo.width, geo.height);
     for (i, p) in px.chunks_exact_mut(4).enumerate() {
@@ -215,13 +288,14 @@ fn decode_one(pack: &Pack, f: &FrameSource, geo: &Geometry, verify: bool, resize
         p.swap(0, 2); // RGBA → BGRA (GPUI's sprite atlas format), straight alpha.
     }
     let rects = Arc::new(mask.rects());
-    let vb = f.bounds.offset(dx, dy);
     let head_fraction = pack.behaviour.click.head_fraction;
-    let (_, top) = geo.to_device(0, vb.y);
     let head_line = (top + vb.height as f32 * geo.scale * head_fraction).round() as i32;
     let rgba = image::RgbaImage::from_raw(geo.width, geo.height, px).expect("buffer size");
     let (head_x, glints) = head_and_glints(&mask, top.round() as i32, (vb.height as f32 * geo.scale) as i32);
+    let profile = Arc::new(top_profile(&mask));
     Ok(Frame {
+        profile,
+        face,
         id: f.id.clone(),
         image: Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])),
         mask,
@@ -273,4 +347,87 @@ pub fn verify_poses(pack: &Pack) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One note sprite pre-rotated at `NOTE_ANGLES` (GPUI images don't rotate).
+pub struct NoteSprite {
+    pub size: u32,
+    pub variants: Vec<(Arc<RenderImage>, Mask)>,
+}
+
+pub const NOTE_ANGLES: [f32; 7] = [-18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0];
+
+/// Rotate a square RGBA image about its centre (bilinear, premultiplied while sampling).
+fn rotate_rgba(src: &[u8], n: u32, deg: f32) -> Vec<u8> {
+    let (s, c) = deg.to_radians().sin_cos();
+    let n_i = n as i32;
+    let mid = (n as f32 - 1.0) / 2.0;
+    let mut out = vec![0u8; src.len()];
+    let at = |x: i32, y: i32| -> [f32; 4] {
+        if x < 0 || y < 0 || x >= n_i || y >= n_i {
+            return [0.0; 4];
+        }
+        let i = (y as usize * n as usize + x as usize) * 4;
+        let a = src[i + 3] as f32 / 255.0;
+        [src[i] as f32 * a, src[i + 1] as f32 * a, src[i + 2] as f32 * a, src[i + 3] as f32]
+    };
+    for y in 0..n_i {
+        for x in 0..n_i {
+            let (dx, dy) = (x as f32 - mid, y as f32 - mid);
+            let sx = c * dx + s * dy + mid;
+            let sy = -s * dx + c * dy + mid;
+            let (x0, y0) = (sx.floor() as i32, sy.floor() as i32);
+            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+            let (p00, p10, p01, p11) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+            let mut v = [0.0f32; 4];
+            for k in 0..4 {
+                v[k] = (p00[k] * (1.0 - fx) + p10[k] * fx) * (1.0 - fy) + (p01[k] * (1.0 - fx) + p11[k] * fx) * fy;
+            }
+            let i = (y as usize * n as usize + x as usize) * 4;
+            if v[3] > 0.5 {
+                let a = v[3] / 255.0;
+                out[i] = (v[0] / a).round().min(255.0) as u8;
+                out[i + 1] = (v[1] / a).round().min(255.0) as u8;
+                out[i + 2] = (v[2] / a).round().min(255.0) as u8;
+                out[i + 3] = v[3].round().min(255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Decode note images to `size` device px squares, rotated at every `NOTE_ANGLES` step.
+pub fn decode_notes(pack: &Pack, files: &[String], size: u32) -> Result<Vec<NoteSprite>> {
+    let mut resizer = Resizer::new();
+    let mut out = Vec::new();
+    for rel in files {
+        let path = pack.dir.join(rel);
+        let bytes = std::fs::read(&path).with_context(|| format!("note {}: cannot read", path.display()))?;
+        let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+            .with_context(|| format!("note {}: not a PNG", path.display()))?
+            .into_rgba8();
+        let (w, h) = img.dimensions();
+        if w != h {
+            bail!("note {}: {w}x{h} is not square", path.display());
+        }
+        let mut variants = Vec::new();
+        for &deg in &NOTE_ANGLES {
+            let rot = if deg == 0.0 { img.as_raw().clone() } else { rotate_rgba(img.as_raw(), w, deg) };
+            let src = Image::from_vec_u8(w, w, rot, PixelType::U8x4)?;
+            let mut dst = Image::new(size, size, PixelType::U8x4);
+            resizer.resize(&src, &mut dst, &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3)))?;
+            let mut px = dst.into_vec();
+            let mut mask = Mask::new(size, size);
+            for (i, p) in px.chunks_exact_mut(4).enumerate() {
+                if p[3] >= HIT_ALPHA {
+                    mask.set(i as u32 % size, i as u32 / size);
+                }
+                p.swap(0, 2);
+            }
+            let rgba = image::RgbaImage::from_raw(size, size, px).expect("buffer size");
+            variants.push((Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])), mask));
+        }
+        out.push(NoteSprite { size, variants });
+    }
+    Ok(out)
 }

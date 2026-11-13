@@ -58,12 +58,16 @@ const CUT: f32 = 12.0;
 const TAIL_W: f32 = 26.0;
 const TAIL_H: f32 = 16.0;
 const TIP_GAP: f32 = 2.0;
-const TAG_FONT: f32 = 10.0;
-/// Clear air between the status tag and the top of the hair.
-const TAG_GAP: f32 = 10.0;
+const TAG_FONT: f32 = 13.0;
+/// Clear air between the status tag and the hair right under it (logical px).
+const TAG_GAP: f32 = 13.0;
 const MIN_WIDTH: f32 = 500.0;
-/// Seat/feet keep this far from a perch window's corners (device px).
-const EDGE_MARGIN: i32 = 48;
+/// Everything that touches a perch edge keeps this far from the window's corners (logical px).
+const EDGE_MARGIN: f32 = 60.0;
+/// Where a perch sits by default, as a fraction of the window's width.
+const PERCH_AT: f32 = 0.75;
+/// Feet stay this far above the monitor's bottom edge (device px).
+const GROUND_ROOM: i32 = 6;
 
 impl Layout {
     pub fn new(pack: &Pack, sf: f32, body_height: f32) -> Layout {
@@ -163,7 +167,12 @@ impl Bubble {
 const TYPE_TICK: Duration = Duration::from_millis(35);
 const HEARTS_MS: u64 = 1_150;
 /// First effect layer of the hearts (the bolt uses 0 and 1): a rim and a fill per heart.
-const HEART_LAYER: usize = 2;
+const HEART_LAYER: usize = 6;
+/// Effect layers 0..BOLT_LAYERS are the teleport bolt.
+const BOLT_LAYERS: usize = 6;
+/// The contact shadow under a perch, stacked right below the avatar window.
+const SHADOW_LAYER: usize = 14;
+const SHADOW_RGB: u32 = 0x06070d;
 const FRAME_FAST: Duration = Duration::from_millis(16);
 const FRAME_FX: Duration = Duration::from_millis(33);
 const FRAME_GLINT: Duration = Duration::from_millis(90);
@@ -248,6 +257,13 @@ pub struct Avatar {
     placement: Placement,
     /// Ground point to fall back to when a perch ends.
     home: (i32, i32),
+    /// What touches a perch edge, x relative to the seat (sitting) / feet (standing).
+    contact: [Option<(i32, i32)>; 2],
+    /// Contact shadow: rects for the frame it was built from, and where it is shown.
+    shadow: Option<(usize, Vec<ShapeRect>)>,
+    shadow_at: Option<(i32, i32)>,
+    /// Last laid-out width of the status tag (logical px), to place the next one.
+    tag_w: Rc<Cell<f32>>,
 }
 
 pub struct Init {
@@ -326,6 +342,10 @@ impl Avatar {
             quitting: false,
             placement: Placement::Ground,
             home,
+            contact: [None, None],
+            shadow: None,
+            shadow_at: None,
+            tag_w: Rc::new(Cell::new(150.0)),
         }
     }
 
@@ -342,6 +362,7 @@ impl Avatar {
         }
         if complete && !self.loaded {
             self.loaded = true;
+            self.contact = [self.measure_contact(true), self.measure_contact(false)];
             self.set_mood(Mood::Idle, now);
             self.next_glint = Some(now + Duration::from_millis(700));
             self.bob_t0 = now;
@@ -429,7 +450,7 @@ impl Avatar {
         // A change of signal colour glitches, like Capri's state bursts.
         // Speaking comes and goes with every reply; that alone is not worth a burst.
         let chatter = m == Mood::Talking || prev == Mood::Talking;
-        if m != prev && !chatter && self.loaded && self.teleport.is_none() && self.status_of(m).1 != self.status_of(prev).1 {
+        if m != prev && !chatter && self.loaded && self.teleport.is_none() && self.status_of(m).tone != self.status_of(prev).tone {
             self.glitch = Some(Glitch::new(GlitchKind::Burst, now, self.rng.next()));
         }
         self.mood = m;
@@ -458,14 +479,131 @@ impl Avatar {
         self.next_activity = next;
     }
 
-    fn status_of(&self, m: Mood) -> (String, u32, bool) {
+    fn status_of(&self, m: Mood) -> Status {
         let spec = self.spec(m);
-        let label = spec.and_then(|s| s.status.clone()).unwrap_or_else(|| m.default_status().into());
-        (label, self.pack.tone(spec.and_then(|s| s.tone.as_deref())), spec.is_some_and(|s| s.invert))
+        Status {
+            label: spec.and_then(|s| s.status.clone()).unwrap_or_else(|| m.default_status().into()),
+            tone: self.pack.tone(spec.and_then(|s| s.tone.as_deref())),
+            invert: spec.is_some_and(|s| s.invert),
+            glyph: spec.and_then(|s| s.glyph.clone()).unwrap_or_else(|| "dot".into()),
+        }
     }
 
-    fn status(&self) -> (String, u32, bool) {
+    fn status(&self) -> Status {
         self.status_of(self.mood)
+    }
+
+    // ---- perch shadow ---------------------------------------------------------------
+
+    /// Contact shadow for a perch: the hanging legs' silhouette pushed down-right and
+    /// softened, plus a band right under the edge where seat and hands rest. No alpha
+    /// without a compositor, so it's an ordered dither of a dark colour on its own shaped
+    /// layer. Avatar-local device px.
+    fn shadow_rects(&self, frame: usize) -> Vec<ShapeRect> {
+        let l = &self.layout;
+        let (Some(f), Some(seat)) = (self.frames.get(frame).and_then(|f| f.as_ref()), l.seat_y) else { return Vec::new() };
+        let line = seat - l.avatar_y;
+        let (w, h) = (f.mask.w as i32, f.mask.h as i32);
+        let (ox, oy) = ((6.0 * l.sf) as i32, (5.0 * l.sf) as i32);
+        let idx = |x: i32, y: i32| (y * w + x) as usize;
+        let mut a = vec![0f32; (w * h) as usize];
+        for y in (line + 1)..h {
+            for x in 0..w {
+                if y - oy > line + 1 && f.mask.get(x - ox, y - oy) {
+                    a[idx(x, y)] = 1.0;
+                }
+            }
+        }
+        // Soften: two passes of a separable box blur.
+        let r = (3.0 * l.sf) as i32;
+        let mut tmp = vec![0f32; a.len()];
+        for _ in 0..2 {
+            for y in 0..h {
+                for x in 0..w {
+                    let (x0, x1) = ((x - r).max(0), (x + r).min(w - 1));
+                    tmp[idx(x, y)] = (x0..=x1).map(|xx| a[idx(xx, y)]).sum::<f32>() / (2 * r + 1) as f32;
+                }
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    let (y0, y1) = ((y - r).max(0), (y + r).min(h - 1));
+                    a[idx(x, y)] = (y0..=y1).map(|yy| tmp[idx(x, yy)]).sum::<f32>() / (2 * r + 1) as f32;
+                }
+            }
+        }
+        for v in &mut a {
+            *v *= 0.6;
+        }
+        // The contact band under the edge.
+        if let Some((cl, ch)) = self.contact[1] {
+            let cx = l.ground_x - l.avatar_x;
+            let depth = (6.0 * l.sf) as i32;
+            for y in (line + 1)..=(line + depth).min(h - 1) {
+                let fade = 1.0 - (y - line - 1) as f32 / depth as f32;
+                for x in (cx + cl).max(0)..=(cx + ch).min(w - 1) {
+                    let i = idx(x, y);
+                    a[i] = a[i].max(0.8 * fade);
+                }
+            }
+        }
+        const BAYER: [[f32; 4]; 4] = [[0.0, 8.0, 2.0, 10.0], [12.0, 4.0, 14.0, 6.0], [3.0, 11.0, 1.0, 9.0], [15.0, 7.0, 13.0, 5.0]];
+        let mut out = Vec::new();
+        for y in (line + 1)..h {
+            let mut x = 0;
+            while x < w {
+                let on = |x: i32| a[idx(x, y)] > (BAYER[(y & 3) as usize][(x & 3) as usize] + 0.5) / 16.0 && !f.mask.get(x, y);
+                if on(x) {
+                    let s = x;
+                    while x < w && on(x) {
+                        x += 1;
+                    }
+                    out.push((s as i16, y as i16, (x - s) as u16, 1));
+                } else {
+                    x += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Show, move or hide the contact shadow to match the placement.
+    fn sync_shadow(&mut self) {
+        let want = self.sitting() && self.loaded && !self.hidden && self.teleport.is_none() && !self.quitting && self.press.is_none();
+        let base = self.perch_spec().and_then(|p| self.pack.index.get(&p.base).copied());
+        let (Some(base), true) = (base, want) else {
+            if self.shadow_at.take().is_some() {
+                self.x11.fx_unmap(SHADOW_LAYER);
+                self.x11.flush();
+            }
+            return;
+        };
+        if self.shadow.as_ref().map(|s| s.0) != Some(base) {
+            self.shadow = Some((base, self.shadow_rects(base)));
+            self.shadow_at = None;
+        }
+        let l = self.layout;
+        let at = (self.applied.0 + l.avatar_x, self.applied.1 + l.avatar_y);
+        if self.shadow_at != Some(at) {
+            let rects = self.shadow.as_ref().map(|s| s.1.clone()).unwrap_or_default();
+            let reshape = self.shadow_at.is_none();
+            self.x11
+                .fx_under(SHADOW_LAYER, SHADOW_RGB, at, (l.geo.width as i32, l.geo.height as i32), reshape.then_some(&rects[..]))
+                .ok();
+            self.shadow_at = Some(at);
+        }
+    }
+
+    /// Unmap every effect layer (the shadow too).
+    fn fx_hide_all(&mut self) {
+        self.x11.fx_hide();
+        self.shadow_at = None;
+    }
+
+    fn fx_hide_bolt(&self) {
+        for i in 0..BOLT_LAYERS {
+            self.x11.fx_unmap(i);
+        }
+        self.x11.flush();
     }
 
     // ---- timing -------------------------------------------------------------------
@@ -532,6 +670,7 @@ impl Avatar {
     }
 
     fn schedule(&mut self, _cx: &mut Context<Self>) {
+        self.sync_shadow();
         self.ticker.set(self.next_deadline());
     }
 
@@ -728,7 +867,10 @@ impl Avatar {
         let (to, place, moved) = (tp.to, tp.place, tp.moved);
         // The tail has all but caught the head: hand over to the arrival glitch.
         if u >= 0.7 {
-            self.x11.fx_hide();
+            for i in 0..BOLT_LAYERS {
+                self.x11.fx_unmap(i);
+            }
+            self.x11.flush();
             tp.leg = Leg::Appear;
             self.hidden = false;
             self.glitch = Some(Glitch::new(GlitchKind::Appear, now, self.rng.next()));
@@ -809,7 +951,7 @@ impl Avatar {
                 if instant || !self.loaded || dx * dx + dy * dy < 48 * 48 {
                     self.teleport = None;
                     self.hidden = false;
-                    self.x11.fx_hide();
+                    self.fx_hide_bolt();
                     self.arrive(o, Placement::Ground, now);
                     state::save(self.ground());
                 } else {
@@ -912,7 +1054,7 @@ impl Avatar {
         if self.placement == Placement::Ground && self.teleport.is_none() {
             state::save(self.ground());
         }
-        self.x11.fx_hide();
+        self.fx_hide_all();
         std::fs::remove_file(crate::control::socket_path()).ok();
         cx.quit();
     }
@@ -933,7 +1075,7 @@ impl Avatar {
             "mood": self.mood.key(),
             "monitor": { "x": m.x, "y": m.y, "w": m.w, "h": m.h },
             "frame": frame,
-            "status": self.status().0,
+            "status": self.status().label,
             "window": { "x": self.origin.0, "y": self.origin.1, "w": self.layout.win_w, "h": self.layout.win_h },
             "ground": [gx, gy],
             "avatar": { "x": self.origin.0 + self.layout.avatar_x, "y": self.origin.1 + self.layout.avatar_y,
@@ -965,7 +1107,7 @@ impl Avatar {
         let (cx, cy) = (x + l.avatar_x + aw / 2, y + l.avatar_y + ah / 2);
         let m = x11.monitor_at(cx, cy);
         let ax = (x + l.avatar_x).clamp(m.x, (m.x + m.w - aw).max(m.x));
-        let gy = (y + l.ground_y).min(m.y + m.h - l.foot_pad);
+        let gy = (y + l.ground_y).min(m.y + m.h - l.foot_pad - GROUND_ROOM);
         let top = gy - l.ground_y + l.avatar_y;
         let gy = if top < m.y { gy + (m.y - top) } else { gy };
         (ax - l.avatar_x, gy - l.ground_y)
@@ -974,7 +1116,7 @@ impl Avatar {
     pub fn default_origin(x11: &X11, l: &Layout) -> (i32, i32) {
         let m = x11.primary();
         let x = m.x + m.w - (l.avatar_x + l.geo.width as i32) - (24.0 * l.sf) as i32;
-        let y = m.y + m.h - l.foot_pad - l.ground_y;
+        let y = m.y + m.h - l.foot_pad - GROUND_ROOM - l.ground_y;
         (x, y)
     }
 
@@ -1031,12 +1173,41 @@ impl Avatar {
         }
     }
 
-    /// Where the seat/feet go along a window's top edge: near `x`, away from the corners.
-    fn perch_dx(r: &WinRect, x: i32) -> i32 {
-        if r.w <= 2 * EDGE_MARGIN {
-            return r.w / 2;
+    /// What touches the edge line in the perch frame (seat, thighs, planted hands) and
+    /// the legs hanging below it: x extent relative to the seat (or feet), device px.
+    fn measure_contact(&self, sit: bool) -> Option<(i32, i32)> {
+        let l = &self.layout;
+        let id = if sit { self.perch_spec()?.base.clone() } else { self.pack.catalog.default_sprite.clone() };
+        let f = self.frames.get(*self.pack.index.get(&id)?)?.as_ref()?;
+        let line = if sit { l.seat_y? } else { l.ground_y } - l.avatar_y;
+        let cx = l.ground_x - l.avatar_x;
+        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        let from = if sit { line - (8.0 * l.sf) as i32 } else { line - (30.0 * l.sf) as i32 };
+        for y in from..f.mask.h as i32 {
+            for x in 0..f.mask.w as i32 {
+                if f.mask.get(x, y) {
+                    lo = lo.min(x);
+                    hi = hi.max(x);
+                }
+            }
         }
-        (x - r.x).clamp(EDGE_MARGIN, r.w - EDGE_MARGIN)
+        (lo <= hi).then_some((lo - cx, hi - cx))
+    }
+
+    /// Where the seat/feet may go along `r`'s top edge so that everything touching it is
+    /// on the window, EDGE_MARGIN from both corners. None: the window is too narrow.
+    fn perch_range(&self, r: &WinRect, sit: bool) -> Option<(i32, i32)> {
+        let m = (EDGE_MARGIN * self.layout.sf).round() as i32;
+        let (l, h) = self.contact[sit as usize].unwrap_or((-m, m));
+        let (lo, hi) = (m - l, r.w - m - h);
+        (lo <= hi).then_some((lo, hi))
+    }
+
+    /// The seat/feet x on `r` (relative to its left edge): `want`, or PERCH_AT across by
+    /// default, clamped into the safe range.
+    fn perch_dx(&self, r: &WinRect, sit: bool, want: Option<i32>) -> Option<i32> {
+        let (lo, hi) = self.perch_range(r, sit)?;
+        Some(want.unwrap_or((r.w as f32 * PERCH_AT) as i32).clamp(lo, hi))
     }
 
     /// Whether a perch on `r` keeps the figure on `r`'s monitor and below its top.
@@ -1061,7 +1232,7 @@ impl Avatar {
             anyhow::bail!("that's me");
         }
         let r = self.x11.toplevel_rect(top).ok_or_else(|| anyhow::anyhow!("window 0x{top:x} is not visible"))?;
-        let dx = Self::perch_dx(&r, self.ground().0);
+        let dx = self.perch_dx(&r, sit, None).ok_or_else(|| anyhow::anyhow!("window 0x{top:x} is too narrow to sit on"))?;
         let o = self.perch_origin(&r, sit, dx);
         if !self.perch_fits(&r, o, sit) {
             anyhow::bail!("no room above window 0x{top:x} (or it is fullscreen)");
@@ -1091,7 +1262,10 @@ impl Avatar {
                 if win != r.id || self.teleport.is_some() {
                     return;
                 }
-                let dx = dx.clamp(EDGE_MARGIN.min(r.w / 2), (r.w - EDGE_MARGIN).max(r.w / 2));
+                let Some(dx) = self.perch_dx(&r, sit, Some(dx)) else {
+                    self.fall(now);
+                    return;
+                };
                 let o = self.perch_origin(&r, sit, dx);
                 if self.perch_fits(&r, o, sit) {
                     self.placement = Placement::Perch { win, sit, dx };
@@ -1117,7 +1291,7 @@ impl Avatar {
         self.x11.toplevels().into_iter().rev().find_map(|r| {
             let inside = gx > r.x + 20 && gx < r.x + r.w - 20;
             let near = (sy - r.y).abs() < tol || (gy - r.y).abs() < tol;
-            let dx = Self::perch_dx(&r, gx);
+            let dx = self.perch_dx(&r, true, Some(gx - r.x))?;
             (inside && near && self.perch_fits(&r, self.perch_origin(&r, true, dx), true)).then_some((r, dx))
         })
     }
@@ -1369,6 +1543,92 @@ fn chevron(dir: Chevron, colour: Rgba) -> impl IntoElement {
     .h(px(10.0))
 }
 
+struct Status {
+    label: String,
+    tone: u32,
+    invert: bool,
+    glyph: String,
+}
+
+/// A small status glyph drawn as shapes (crisp at any size, no font fallback). 11 px box;
+/// `bg` paints cut-outs.
+fn glyph(kind: &str, fg: u32, bg: u32) -> impl IntoElement {
+    let kind = kind.to_string();
+    canvas(
+        |_, _, _| (),
+        move |b, _, window, _| {
+            let (ox, oy) = (f32::from(b.origin.x), f32::from(b.origin.y));
+            let p = |x: f32, y: f32| point(px(ox + x), px(oy + y));
+            let fill_poly = |window: &mut Window, pts: &[(f32, f32)], c: u32| {
+                let mut pb = PathBuilder::fill();
+                pb.add_polygon(&pts.iter().map(|&(x, y)| p(x, y)).collect::<Vec<_>>(), true);
+                if let Ok(path) = pb.build() {
+                    window.paint_path(path, rgb(c));
+                }
+            };
+            let circle = |cx: f32, cy: f32, r: f32| (0..20).map(|i| {
+                let a = i as f32 / 20.0 * std::f32::consts::TAU;
+                (cx + r * a.cos(), cy + r * a.sin())
+            }).collect::<Vec<_>>();
+            let stroke = |window: &mut Window, pts: &[(f32, f32)], w: f32, c: u32| {
+                let mut pb = PathBuilder::stroke(px(w));
+                pb.move_to(p(pts[0].0, pts[0].1));
+                for &(x, y) in &pts[1..] {
+                    pb.line_to(p(x, y));
+                }
+                if let Ok(path) = pb.build() {
+                    window.paint_path(path, rgb(c));
+                }
+            };
+            match kind.as_str() {
+                "ring" => {
+                    fill_poly(window, &circle(5.5, 5.5, 4.6), fg);
+                    fill_poly(window, &circle(5.5, 5.5, 2.6), bg);
+                }
+                "gear" => {
+                    let pts: Vec<(f32, f32)> = (0..32)
+                        .map(|i| {
+                            let a = (i as f32 + 0.5) / 32.0 * std::f32::consts::TAU;
+                            let r = if (i / 2) % 2 == 0 { 5.6 } else { 4.1 };
+                            (5.5 + r * a.cos(), 5.5 + r * a.sin())
+                        })
+                        .collect();
+                    fill_poly(window, &pts, fg);
+                    fill_poly(window, &circle(5.5, 5.5, 1.9), bg);
+                }
+                "play" => fill_poly(window, &[(2.0, 1.0), (10.0, 5.5), (2.0, 10.0)], fg),
+                "check" => stroke(window, &[(1.2, 5.8), (4.3, 8.9), (10.0, 2.0)], 2.2, fg),
+                "bang" => {
+                    fill_poly(window, &[(4.4, 0.5), (6.6, 0.5), (6.2, 7.0), (4.8, 7.0)], fg);
+                    fill_poly(window, &[(4.5, 8.4), (6.5, 8.4), (6.5, 10.5), (4.5, 10.5)], fg);
+                }
+                "cross" => {
+                    stroke(window, &[(1.5, 1.5), (9.5, 9.5)], 2.2, fg);
+                    stroke(window, &[(9.5, 1.5), (1.5, 9.5)], 2.2, fg);
+                }
+                "moon" => {
+                    fill_poly(window, &circle(5.2, 5.5, 4.8), fg);
+                    fill_poly(window, &circle(7.6, 3.9, 3.9), bg);
+                }
+                "dots" => {
+                    for x in [0.8, 4.3, 7.8] {
+                        fill_poly(window, &[(x, 6.5), (x + 2.4, 6.5), (x + 2.4, 8.9), (x, 8.9)], fg);
+                    }
+                }
+                "note" => {
+                    fill_poly(window, &circle(3.2, 8.3, 2.4), fg);
+                    fill_poly(window, &[(4.4, 1.0), (5.8, 1.0), (5.8, 8.3), (4.4, 8.3)], fg);
+                    fill_poly(window, &[(5.8, 1.0), (9.8, 3.2), (9.8, 5.0), (5.8, 2.9)], fg);
+                }
+                _ => fill_poly(window, &circle(5.5, 5.5, 4.0), fg),
+            }
+        },
+    )
+    .flex_none()
+    .w(px(11.0))
+    .h(px(11.0))
+}
+
 struct Palette {
     frame: u32,
     accent: u32,
@@ -1428,7 +1688,7 @@ impl Render for Avatar {
             accent: self.pack.tone_or("accent", 0xc6fcf0),
             surface: self.pack.tone_or("surface", 0x0b131a),
             text: self.pack.tone_or("text", 0xf1f7f9),
-            dim: self.pack.tone_or("dim", 0x93adba),
+            dim: self.pack.tone_or("dim", 0xc4d6df),
             name: self.pack.tone_or("name", 0xf4ed75),
             slash: self.pack.tone_or("slash", 0xff3c68),
         };
@@ -1447,6 +1707,16 @@ impl Render for Avatar {
         let (base_top, head_x) = base.map_or((0, l.geo.width as i32 / 2), |f| (f.top.min(frame.map_or(f.top, |c| c.top)), f.head_x));
         let top_l = (l.avatar_y + base_top) as f32 / sf;
         let head_l = (l.avatar_x + head_x) as f32 / sf;
+        // The status tag sits just clear of the hair under the tag itself (this frame and
+        // the resting one), not of the whole silhouette.
+        let tag_hair = {
+            let tw = self.tag_w.get();
+            let (c0, c1) = (((head_l - tw / 2.0) * sf) as i32 - l.avatar_x - 4, ((head_l + tw / 2.0) * sf) as i32 - l.avatar_x + 4);
+            let under = |f: Option<&Frame>| {
+                f.and_then(|f| (c0.max(0)..c1.min(f.profile.len() as i32)).map(|x| f.profile[x as usize]).min()).filter(|&v| v != i16::MAX).map(i32::from)
+            };
+            under(base).into_iter().chain(under(frame)).min().unwrap_or(base_top)
+        };
         let image = frame.map(|f| f.image.clone());
         let rects = frame.map(|f| f.rects.clone()).unwrap_or_default();
         let hidden = self.hidden || frame.is_none();
@@ -1606,7 +1876,7 @@ impl Render for Avatar {
         );
 
         let hud = !hidden && self.teleport.is_none() && !self.quitting;
-        let (label, tone, invert) = self.status();
+        let Status { label, tone, invert, glyph: glyph_kind } = self.status();
         let bubble_open = self.focus_probe.is_some() || self.bubble.as_ref().is_some_and(|b| !b.collapsed);
         let collapsed = self.bubble.as_ref().is_some_and(|b| b.collapsed);
 
@@ -1618,16 +1888,19 @@ impl Render for Avatar {
             let plate = div()
                 .flex()
                 .items_center()
-                .px(px(9.0))
-                .py(px(4.0))
+                .gap(px(7.0))
+                .pl(px(8.0))
+                .pr(px(10.0))
+                .py(px(5.0))
                 .border_1()
                 .border_color(rgb(border))
                 .bg(rgb(bg))
                 .text_color(rgb(fg))
                 .text_size(px(TAG_FONT))
                 .line_height(px(TAG_FONT + 1.0))
-                .font_weight(if invert { FontWeight::BOLD } else { FontWeight::SEMIBOLD })
-                .child(tracked(&format!("{} // {}", self.name, label), 1.6));
+                .font_weight(FontWeight::BOLD)
+                .child(glyph(&glyph_kind, fg, bg))
+                .child(tracked(&format!("{} // {}", self.name, label), 1.5));
             // A dark ring keeps the plate legible on busy backgrounds.
             let ring = div().p(px(1.0)).bg(rgb(0x02060a)).child(plate);
             let mut row = div().id("tag").flex().items_end().gap(px(3.0));
@@ -1656,12 +1929,13 @@ impl Render for Avatar {
             }
             row = row.child(ring);
             let centre = head_l;
+            let tag_bottom = (l.avatar_y + tag_hair) as f32 / sf - TAG_GAP;
             root = root.child(
                 div()
                     .absolute()
                     .left_0()
                     .w(l.lp(l.win_w))
-                    .bottom(px(l.win_h as f32 / sf - (top_l - TAG_GAP)))
+                    .bottom(px(l.win_h as f32 / sf - tag_bottom))
                     .flex()
                     .justify_center()
                     .pl(px((2.0 * centre - l.win_w as f32 / sf).max(0.0)))
@@ -1686,8 +1960,10 @@ impl Render for Avatar {
             let text_w = self.bubble.as_ref().and_then(|b| b.wrap.as_ref()).map_or(260.0, |w| w.width);
             let w = (text_w + PAD_L + PAD_R + 2.0).clamp(PANEL_MIN_W.min(max_w), max_w);
             let total_lines = self.bubble.as_ref().and_then(|b| b.wrap.as_ref()).map_or(1, |w| w.lines.len());
+            // Fit the page: the lines it will hold once typed out (so it doesn't grow while
+            // streaming), never an empty band above the footer.
             let rows = match pages {
-                Some((_, n)) if n > 1 => LINES_PER_PAGE,
+                Some((cur, n)) if n > 1 => total_lines.saturating_sub(cur * LINES_PER_PAGE).clamp(1, LINES_PER_PAGE),
                 _ if probe => 1,
                 _ => total_lines.clamp(1, LINES_PER_PAGE),
             };
@@ -1750,14 +2026,14 @@ impl Render for Avatar {
                         .child(tracked(&self.name, 1.8).text_color(rgb(pal.name)))
                         .child(div().ml(px(4.0)).text_color(rgb(pal.slash)).child("/")),
                 )
-                .child(tracked(header_label, 1.5).text_size(px(9.0)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.dim)))
+                .child(tracked(header_label, 1.5).text_size(px(9.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.dim)))
                 .child(div().flex_1())
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(5.0))
-                        .child(div().w(px(6.0)).h(px(6.0)).bg(rgb(tone)))
+                        .child(glyph(&glyph_kind, tone, pal.surface))
                         .child(tracked(&label, 1.5).text_size(px(9.5)).font_weight(FontWeight::BOLD).text_color(rgb(tone))),
                 );
             let body = div()
@@ -1926,6 +2202,7 @@ impl Render for Avatar {
         let hearts = self.hearts.filter(|_| hud).map(|(t0, at)| (now.saturating_duration_since(t0).as_secs_f32() * 1000.0, at));
         let worigin = self.origin;
         let tag_clickable = collapsed;
+        let tag_w = self.tag_w.clone();
         root.child(
             canvas(
                 |_, _, _| (),
@@ -1943,6 +2220,7 @@ impl Render for Avatar {
                         visible.push(to_device(b, sf));
                     }
                     if let Some(b) = tag_cell.get() {
+                        tag_w.set(f32::from(b.size.width));
                         visible.push(to_device(b, sf));
                         if tag_clickable {
                             input.push(to_device(b, sf));

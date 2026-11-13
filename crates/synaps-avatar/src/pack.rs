@@ -177,6 +177,13 @@ pub struct MoodSpec {
     /// attention.
     #[serde(default)]
     pub invert: bool,
+    /// Small drawn glyph in the status tag: dot, ring, gear, play, check, bang, cross, moon,
+    /// dots, note.
+    #[serde(default)]
+    pub glyph: Option<String>,
+    /// A mood change into or out of this mood is a big one (long glitch).
+    #[serde(default)]
+    pub big: bool,
 }
 
 /// A clip id, or steps written inline.
@@ -238,6 +245,14 @@ pub struct PerchSpec {
     pub activities: Vec<Vec<Step>>,
     #[serde(default)]
     pub click: Vec<Step>,
+    /// A 1 px light rim drawn around dark limbs of seat-anchored frames at decode time,
+    /// behind the art, so they stay visible over dark windows (`#rrggbb`, "" = off).
+    #[serde(default = "rim_default")]
+    pub rim: String,
+}
+
+fn rim_default() -> String {
+    "#c9c4ec".into()
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -252,8 +267,51 @@ pub struct Then {
 pub struct ExtraFrame {
     pub id: String,
     pub file: String,
-    /// Borrow anchor and visible bounds from this catalog sprite (same registration).
-    pub like: String,
+    /// Borrow anchor and visible bounds from this catalog sprite (same registration)…
+    #[serde(default)]
+    pub like: Option<String>,
+    /// …or give them here.
+    #[serde(default)]
+    pub anchor: Option<Anchor>,
+    #[serde(default)]
+    pub visible_bounds: Option<Rect>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// Music mode: a headphones pose (floor and window-edge variants), note sprites drifting up
+/// from emitters on the beat, a head-bob at a fixed tempo. No audio is read.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicSpec {
+    pub floor: String,
+    #[serde(default)]
+    pub window: Option<String>,
+    #[serde(default = "bpm_default")]
+    pub bpm: f32,
+    /// Note images (any size, square), used in turn.
+    pub notes: Vec<String>,
+    /// Note emitters per frame id, canonical canvas px of that frame.
+    #[serde(default)]
+    pub emitters: BTreeMap<String, Vec<[i32; 2]>>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub tone: Option<String>,
+    #[serde(default)]
+    pub glyph: Option<String>,
+    /// Autonomy may start a session: chance per activity pick, and how long it lasts.
+    #[serde(default)]
+    pub activity_chance: f32,
+    #[serde(default = "music_ms_default")]
+    pub activity_ms: u64,
+}
+
+fn bpm_default() -> f32 {
+    110.0
+}
+fn music_ms_default() -> u64 {
+    24_000
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -308,6 +366,8 @@ pub struct Behaviour {
     pub life: Life,
     #[serde(default)]
     pub perch: Option<PerchSpec>,
+    #[serde(default)]
+    pub music: Option<MusicSpec>,
 }
 
 /// A frame to decode: catalog sprite or sidecar extra.
@@ -328,6 +388,8 @@ pub struct Pack {
     pub frames: Vec<FrameSource>,
     pub index: HashMap<String, usize>,
     pub poses: Vec<FrameSource>,
+    /// Seat-anchored frames are registered to this seat height (the perch base's).
+    pub seat_ref: Option<i32>,
 }
 
 impl Pack {
@@ -345,7 +407,11 @@ impl Pack {
     /// (they are authored to the seat line, not the floor).
     pub fn offset(&self, f: &FrameSource) -> (i32, i32) {
         let c = self.catalog.canonical_anchor;
-        let dy = if f.anchor.name == "ground" { c.y - f.anchor.y } else { 0 };
+        let dy = match (f.anchor.name.as_str(), self.seat_ref) {
+            ("ground", _) => c.y - f.anchor.y,
+            ("seat", Some(s)) => s - f.anchor.y,
+            _ => 0,
+        };
         (c.x - f.anchor.x, dy)
     }
 
@@ -411,17 +477,31 @@ impl Pack {
             });
         }
         for x in &behaviour.extra_frames {
-            let Some(&like) = index.get(&x.like) else {
-                errors.push(format!("moods.json extraFrames `{}`: `like` frame `{}` is unknown", x.id, x.like));
-                continue;
-            };
             let path = dir.join(&x.file);
             if !path.is_file() {
+                // Optional add-ons (e.g. music/) may be absent; their users check for the id.
+                if x.like.is_none() {
+                    eprintln!("synaps-avatar: pack extra frame `{}`: {} is missing; skipped", x.id, x.file);
+                    continue;
+                }
                 errors.push(format!("moods.json extraFrames `{}`: file {} is missing", x.id, x.file));
             }
-            let base = frames[like].clone();
+            let src = match (&x.like, &x.anchor, x.visible_bounds) {
+                (Some(like), _, _) => match index.get(like) {
+                    Some(&i) => FrameSource { id: x.id.clone(), path, sha256: None, ..frames[i].clone() },
+                    None => {
+                        errors.push(format!("moods.json extraFrames `{}`: `like` frame `{like}` is unknown", x.id));
+                        continue;
+                    }
+                },
+                (None, Some(a), Some(b)) => FrameSource { id: x.id.clone(), path, anchor: a.clone(), bounds: b, sha256: x.sha256.clone() },
+                _ => {
+                    errors.push(format!("moods.json extraFrames `{}`: needs `like` or `anchor` + `visibleBounds`", x.id));
+                    continue;
+                }
+            };
             index.insert(x.id.clone(), frames.len());
-            frames.push(FrameSource { id: x.id.clone(), path, sha256: None, ..base });
+            frames.push(src);
         }
 
         let has = |id: &str| index.contains_key(id);
@@ -447,7 +527,15 @@ impl Pack {
             .or_else(|| catalog.character.clone())
             .unwrap_or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
 
-        let mut pack = Pack { dir: dir.to_owned(), name: pack_name, catalog, behaviour, frames, index, poses: Vec::new() };
+        let seat_ref = behaviour
+            .perch
+            .as_ref()
+            .and_then(|p| index.get(&p.base))
+            .map(|&i| &frames[i])
+            .or_else(|| frames.iter().find(|f| f.anchor.name == "seat"))
+            .filter(|f| f.anchor.name == "seat")
+            .map(|f| f.anchor.y);
+        let mut pack = Pack { dir: dir.to_owned(), name: pack_name, catalog, behaviour, frames, index, poses: Vec::new(), seat_ref };
 
         // Behaviour references.
         let check_steps = |what: &str, steps: &[Step], errors: &mut Vec<String>, pack: &Pack| {
