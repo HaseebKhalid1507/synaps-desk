@@ -1,0 +1,4 @@
+{"type": "error", "session_id": "20261113-073427-5fde", "message": "refused: detach: not your client id"}
+{"type": "error", "session_id": "20261113-073427-5fde", "message": "daemon reloading; retry in a moment"}
+{"type": "error", "session_id": "20261113-073427-5fde", "message": "not attached to that session"}
+{"type": "refused", "reason": {"reason": "busy"}, "message": "daemon reloading; retry in a moment"}
