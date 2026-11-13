@@ -21,7 +21,7 @@ pub fn poly_rows(pts: &[(f32, f32)], out: &mut Vec<ShapeRect>) {
             }
         }
         xs.sort_by(f32::total_cmp);
-        for pair in xs.chunks_exact(2) {
+        for pair in xs.as_chunks::<2>().0 {
             let (x0, x1) = (pair[0].round() as i32, pair[1].round() as i32);
             if x1 > x0 {
                 out.push((x0 as i16, y as i16, (x1 - x0) as u16, 1));

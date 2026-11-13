@@ -304,7 +304,7 @@ impl BodyPlan {
                 continue;
             }
             let channel = (!face && g.solid > 0.0 && hash01(k as u32 + 17, g.order as u32 ^ 0x5a5a) < g.solid)
-                .then(|| if k % 2 == 0 { SPLIT_RED } else { SPLIT_BLUE });
+                .then_some(if k % 2 == 0 { SPLIT_RED } else { SPLIT_BLUE });
             slices.push((y0, y1, dx, 0));
             split.push(d);
             solid.push(channel);

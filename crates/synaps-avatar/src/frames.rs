@@ -216,7 +216,7 @@ impl Geometry {
     }
 
     /// Device px of a canonical-canvas point inside the avatar rect.
-    pub fn to_device(&self, x: i32, y: i32) -> (f32, f32) {
+    pub fn to_device(self, x: i32, y: i32) -> (f32, f32) {
         ((x - self.crop.x) as f32 * self.scale, (y - self.crop.y) as f32 * self.scale)
     }
 }
@@ -290,7 +290,7 @@ fn decode_one(pack: &Pack, f: &FrameSource, geo: &Geometry, verify: bool, resize
     let face = face_band(&px, geo.width, top.round() as i32, (vb.height as f32 * geo.scale) as i32);
 
     let mut mask = Mask::new(geo.width, geo.height);
-    for (i, p) in px.chunks_exact_mut(4).enumerate() {
+    for (i, p) in px.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         if p[3] >= HIT_ALPHA {
             mask.set(i as u32 % geo.width, i as u32 / geo.width);
         }
@@ -427,7 +427,7 @@ pub fn decode_notes(pack: &Pack, files: &[String], size: u32) -> Result<Vec<Note
         }
         // Fill colour: the mean of the bright opaque pixels.
         let (mut sum, mut n) = ([0u64; 3], 0u64);
-        for p in img.as_raw().chunks_exact(4).filter(|p| p[3] > 200 && !is_dark(p)) {
+        for p in img.as_raw().as_chunks::<4>().0.iter().filter(|p| p[3] > 200 && !is_dark(*p)) {
             for k in 0..3 {
                 sum[k] += p[k] as u64;
             }
@@ -443,7 +443,7 @@ pub fn decode_notes(pack: &Pack, files: &[String], size: u32) -> Result<Vec<Note
             resizer.resize(&src, &mut dst, &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3)))?;
             let px = dst.into_vec();
             let (mut outline, mut fill) = (Mask::new(size, size), Mask::new(size, size));
-            for (i, p) in px.chunks_exact(4).enumerate() {
+            for (i, p) in px.as_chunks::<4>().0.iter().enumerate() {
                 let (x, y) = (i as u32 % size, i as u32 / size);
                 if p[3] >= 110 {
                     outline.set(x, y);

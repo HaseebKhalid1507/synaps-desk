@@ -1829,6 +1829,9 @@ fn probed(child: impl IntoElement, cell: &Cell2) -> Div {
         .child(canvas(move |b, _, _| cell.set(Some(b)), |_, _, _, _| {}).absolute().top_0().left_0().size_full())
 }
 
+/// Bubble lines, the current page (first, count) and whether it is the input field.
+type BubbleContent = (Vec<String>, Option<(usize, usize)>, bool);
+
 fn to_device(b: Bounds<Pixels>, sf: f32) -> ShapeRect {
     let x0 = (f32::from(b.origin.x) * sf).floor();
     let y0 = (f32::from(b.origin.y) * sf).floor();
@@ -2424,7 +2427,7 @@ impl Render for Avatar {
 
         // Speech bubble (or the focus-probe input).
         let mut panel_geom: Option<PanelGeom> = None;
-        let content: Option<(Vec<String>, Option<(usize, usize)>, bool)> = if !hud {
+        let content: Option<BubbleContent> = if !hud {
             None
         } else if let Some(text) = &self.focus_probe {
             let body = if text.is_empty() { "click here, then type".to_string() } else { text.clone() };
