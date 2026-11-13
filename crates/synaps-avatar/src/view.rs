@@ -425,7 +425,9 @@ impl Avatar {
             self.anim.stop_oneshot(now);
         }
         // A change of signal colour glitches, like Capri's state bursts.
-        if m != prev && self.loaded && self.teleport.is_none() && self.status_of(m).1 != self.status_of(prev).1 {
+        // Speaking comes and goes with every reply; that alone is not worth a burst.
+        let chatter = m == Mood::Talking || prev == Mood::Talking;
+        if m != prev && !chatter && self.loaded && self.teleport.is_none() && self.status_of(m).1 != self.status_of(prev).1 {
             self.glitch = Some(Glitch::new(GlitchKind::Burst, now, self.rng.next()));
         }
         self.mood = m;
