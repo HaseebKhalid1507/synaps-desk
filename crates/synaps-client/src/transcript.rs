@@ -531,7 +531,10 @@ impl Transcript {
             }
             SessionEvent::Ended { reason } => self.notice(ItemKind::Notice, format!("session ended ({reason})")),
             SessionEvent::Cleared { .. } => {
-                self.swapped = true;
+                // Clearing an empty conversation changes nothing: its digest
+                // matches, no replacement follows to consume the flag, and
+                // a later unrelated one would drop this conversation's notes.
+                self.swapped |= self.history_len > 0;
                 self.notice(ItemKind::Notice, "conversation cleared");
             }
             SessionEvent::Resumed { new_id, clamp_notice, .. } => {

@@ -405,3 +405,38 @@ fn debug_redacts_text_and_answers() {
     }
     assert!(shown[2].contains("prompt_id: 4"));
 }
+
+/// M5: a drifted entry in the attach snapshot's lists is skipped and
+/// counted per list, not silently dropped.
+#[test]
+fn attach_snapshot_rejects_are_counted() {
+    let mut v: serde_json::Value = serde_json::from_str(fixture("attached_history.json").trim()).unwrap();
+    v["pending_prompts"] = serde_json::json!([{"id": "p-1", "title": "drifted id"}, {"id": 7, "title": "Allow bash?"}]);
+    v["clients"] = serde_json::json!([[2, "attach"], ["three", "attach"]]);
+    let DaemonFrame::Attached(a) = decode_frame(&v.to_string()).unwrap() else { panic!() };
+    assert_eq!(a.pending_prompts.len(), 1);
+    assert_eq!(a.pending_prompts[0].id, 7);
+    assert_eq!((a.rejected.pending_prompts, a.rejected.clients, a.rejected.roster), (1, 1, 0));
+    assert_eq!(a.rejected.total(), 2);
+    assert!(a.rejected.to_string().contains("1 pending_prompts"));
+    assert_eq!(attached("attached_history.json").rejected.total(), 0);
+}
+
+/// N4: `/clear` on an empty conversation sends no replacement, so it must
+/// not leave a "swapped" mark for the next unrelated one, which would drop
+/// this conversation's notes.
+#[test]
+fn clearing_an_empty_conversation_keeps_later_notes() {
+    use serde_json::json;
+    let mut t = Transcript::new();
+    t.apply(&SessionEvent::Cleared { session_id: "n".into() });
+    let msgs = vec![json!({"role": "user", "content": "hi"})];
+    t.apply_update(&HistoryUpdate::Append { base_len: 0, messages: msgs.clone() }).unwrap();
+    t.apply(&SessionEvent::SystemNotice { text: "a note".into() });
+    // The round ends: the note is anchored in the history, not live.
+    let reply = json!({"role": "assistant", "content": "hello"});
+    t.apply_update(&HistoryUpdate::Append { base_len: 1, messages: vec![reply.clone()] }).unwrap();
+    // A resync of the same conversation.
+    t.apply_update(&HistoryUpdate::Replace { messages: vec![msgs[0].clone(), reply] }).unwrap();
+    assert!(texts(&t).iter().any(|(_, s)| s == "a note"), "{:?}", texts(&t));
+}

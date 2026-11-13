@@ -23,8 +23,7 @@
 //! `HistoryUpdate::Replace`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -37,6 +36,13 @@ use crate::protocol::*;
 
 const BACKOFF_START: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// A connection that stayed up this long resets the backoff; one that drops
+/// sooner (accepts, greets, hangs up) keeps backing off instead of spinning.
+const STABLE_AFTER: Duration = Duration::from_secs(10);
+/// The reason of a plain detach.
+const DETACHED: &str = "detached";
+/// The hint when an attempt to create a session was cut short.
+const MAY_EXIST: &str = "while the session was being created; it may exist now (see the session list)";
 const RECONNECT_BUDGET: Duration = Duration::from_secs(60);
 /// `transport::ATTACH_TIMEOUT` / `ATTACH_TIMEOUT_PARKED` (unpark ≤ 20 s).
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -256,8 +262,11 @@ impl std::error::Error for Error {}
 pub enum Event {
     Status(Status),
     Sessions(Vec<SessionMeta>),
-    /// A (re-)attach: the full mirror. Replace, never merge. `mode` is what
-    /// was asked (`Takeover` when re-taking ownership after a reload).
+    /// A (re-)attach: the full mirror. Replace, never merge. `mode` is the
+    /// mode that was asked for, also after a reload (where an owner
+    /// re-attaches with `Takeover` on the wire to keep input). If any of
+    /// `pending_prompts` / `clients` / `roster` did not decode, an
+    /// `Error::Decode` follows (see `Attached::rejected`).
     Attached { attach_seq: u64, attached: Box<Attached>, mode: AttachMode, reconnect: bool },
     /// The session connection dropped (reload, EOF) and is being re-made;
     /// an `Attached { reconnect: true }` or a `Detached` follows. Commands
@@ -315,7 +324,9 @@ struct Msg {
 #[derive(Clone)]
 pub struct Client {
     tx: mpsc::UnboundedSender<Msg>,
-    seq: Arc<AtomicU64>,
+    /// The last `attach_seq`. Held across the send, so clones on several
+    /// threads enqueue attaches in `attach_seq` order.
+    seq: Arc<Mutex<u64>>,
 }
 
 impl Client {
@@ -326,7 +337,7 @@ impl Client {
         let (tx, rx) = mpsc::unbounded_channel();
         let (etx, erx) = async_channel::unbounded();
         std::thread::Builder::new().name("synaps-conn".into()).spawn(move || rt.block_on(run(options, rx, etx)))?;
-        Ok((Client { tx, seq: Arc::new(AtomicU64::new(0)) }, erx))
+        Ok((Client { tx, seq: Arc::new(Mutex::new(0)) }, erx))
     }
 
     /// Discover the daemon for `profile` (`None`: `$SYNAPS_PROFILE`, else
@@ -336,12 +347,12 @@ impl Client {
     }
 
     fn post(&self, cmd: Command) -> Result<u64, ClientClosed> {
-        let attach_seq = match cmd {
-            Command::Attach { .. } | Command::Create(_) => self.seq.fetch_add(1, Ordering::Relaxed) + 1,
-            _ => self.seq.load(Ordering::Relaxed),
-        };
-        self.tx.send(Msg { cmd, attach_seq }).map_err(|_| ClientClosed)?;
-        Ok(attach_seq)
+        let mut seq = self.seq.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(cmd, Command::Attach { .. } | Command::Create(_)) {
+            *seq += 1;
+        }
+        self.tx.send(Msg { cmd, attach_seq: *seq }).map_err(|_| ClientClosed)?;
+        Ok(*seq)
     }
 
     /// Queue a command. `Err` only when the thread is gone; what the daemon
@@ -426,9 +437,10 @@ enum Ctl {
 struct SessionTask {
     attach_seq: u64,
     tx: mpsc::UnboundedSender<Command>,
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<Exit>,
 }
 
+#[derive(Clone)]
 struct Exit {
     session_id: Option<String>,
     reason: String,
@@ -464,7 +476,8 @@ async fn run(options: ClientOptions, mut rx: mpsc::UnboundedReceiver<Msg>, event
                         let (sh2, done) = (sh.clone(), done_tx.clone());
                         let task = tokio::spawn(async move {
                             let exit = session_loop(sh2, attach_seq, target, mode, srx).await;
-                            let _ = done.send((attach_seq, exit));
+                            let _ = done.send((attach_seq, exit.clone()));
+                            exit
                         });
                         session = Some(SessionTask { attach_seq, tx: stx, task });
                     }
@@ -501,13 +514,20 @@ async fn run(options: ClientOptions, mut rx: mpsc::UnboundedReceiver<Msg>, event
 }
 
 /// Detach a session task cleanly (it sends `Detach` + `Bye`), or abort it
-/// after [`DETACH_GRACE`], and report it `Detached`.
+/// after [`DETACH_GRACE`], and report it `Detached`, with what the task
+/// knew (its session, and a create that may have happened).
 async fn stop(mut s: SessionTask, reason: &str, events: &Events) {
     let _ = s.tx.send(Command::Detach);
-    if tokio::time::timeout(DETACH_GRACE, &mut s.task).await.is_err() {
-        s.task.abort();
-    }
-    emit(events, Event::Detached { attach_seq: s.attach_seq, session_id: None, reason: reason.into() });
+    let (session_id, reason) = match tokio::time::timeout(DETACH_GRACE, &mut s.task).await {
+        Ok(Ok(exit)) if exit.reason != DETACHED => (exit.session_id, format!("{reason}: {}", exit.reason)),
+        Ok(Ok(exit)) => (exit.session_id, reason.to_string()),
+        Ok(Err(_)) => (None, reason.to_string()),
+        Err(_) => {
+            s.task.abort();
+            (None, reason.to_string())
+        }
+    };
+    emit(events, Event::Detached { attach_seq: s.attach_seq, session_id, reason });
 }
 
 /// Run `fut` until it ends or `ctl` says shut down (`None`). A `Refresh`
@@ -551,7 +571,7 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                 continue;
             }
         };
-        backoff = BACKOFF_START;
+        let up_at = Instant::now();
         let w = &c.welcome;
         emit(
             events,
@@ -603,9 +623,13 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
         };
         drop(c);
         emit(events, Event::Status(Status::Reconnecting { why }));
-        if until_shutdown(&mut ctl, tokio::time::sleep(delay)).await.is_none() {
+        if up_at.elapsed() >= STABLE_AFTER {
+            backoff = BACKOFF_START;
+        }
+        if until_shutdown(&mut ctl, tokio::time::sleep(delay.max(backoff))).await.is_none() {
             return;
         }
+        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 
@@ -662,7 +686,7 @@ async fn attempt(sh: &Shared, target: &Target, mode: AttachMode, previous: Optio
                 None => {
                     c.bye().await;
                     return Attempt::Fatal(
-                        "the connection dropped while the session was being created; it may exist now (see the session list)".into(),
+                        format!("the connection dropped {MAY_EXIST}"),
                     );
                 }
             }
@@ -752,14 +776,19 @@ async fn session_loop(sh: Shared, attach_seq: u64, mut target: Target, mode: Att
         Target::Existing(id) => Some(id.clone()),
         Target::Create(_) => None,
     };
-    let detached = |session_id: Option<String>| Exit { session_id, reason: "detached".into() };
+    let detached = |session_id: Option<String>| Exit { session_id, reason: DETACHED.into() };
     let mut previous: Option<Previous> = None;
     let mut backoff = BACKOFF_START;
     let mut deadline = Instant::now() + RECONNECT_BUDGET;
     let mut create_sent = false;
     loop {
         let res = without_session(&mut cmds, &events, attach_seq, attempt(&sh, &target, mode, previous.as_ref(), &mut create_sent)).await;
-        let Some(res) = res else { return detached(session_id) };
+        let Some(res) = res else {
+            if create_sent {
+                return Exit { session_id, reason: format!("detached {MAY_EXIST}") };
+            }
+            return detached(session_id);
+        };
         let (mut conn, attached) = match res {
             Attempt::Attached(c, a) => (c, a),
             Attempt::Fatal(reason) => return Exit { session_id, reason },
@@ -776,8 +805,8 @@ async fn session_loop(sh: Shared, attach_seq: u64, mut target: Target, mode: Att
                 continue;
             }
         };
-        backoff = BACKOFF_START;
         create_sent = false;
+        let up_at = Instant::now();
         let sid = attached.meta.id.clone();
         session_id = Some(sid.clone());
         target = Target::Existing(sid.clone());
@@ -795,7 +824,11 @@ async fn session_loop(sh: Shared, attach_seq: u64, mut target: Target, mode: Att
             session_id: sid.to_string(),
             cmd: SessionCommand::Query { id: query_id, query: SessionQuery::Messages },
         };
+        let rejected = attached.rejected;
         emit(&events, Event::Attached { attach_seq, attached, mode, reconnect: previous.is_some() });
+        if rejected.total() > 0 {
+            emit_error(&events, Some(attach_seq), Error::Decode(DecodeError { kind: "attached".into(), error: rejected.to_string() }));
+        }
 
         // Pump until the connection ends: `(why, delay)` = reconnect after it.
         let (why, delay): (String, Duration) = 'conn: loop {
@@ -829,34 +862,40 @@ async fn session_loop(sh: Shared, attach_seq: u64, mut target: Target, mode: Att
                 frame = conn.recv() => match frame {
                     Ok(Some(DaemonFrame::Event(env))) => {
                         let Envelope { session_id: esid, seq, event: mut v, .. } = env;
-                        if let Some(m) = mirror.as_mut() {
-                            if is_message_history(&v) {
-                                let messages = match v.pointer_mut("/event/messages").map(Value::take) {
-                                    Some(Value::Array(a)) => a,
-                                    _ => Vec::new(),
-                                };
-                                drop(v);
-                                let update = m.update(messages);
-                                emit(&events, Event::History { attach_seq, session_id: esid, seq, update });
-                                continue;
-                            }
-                            let ours = v.get("ev").and_then(Value::as_str) == Some("query_result")
-                                && v.get("id").and_then(Value::as_u64) == Some(query_id);
-                            if ours {
-                                if let Some(trigger) = resync.take() {
-                                    match v.get_mut("value").map(Value::take) {
-                                        Some(Value::Array(messages)) => {
-                                            let update = m.resynced(messages, trigger.as_ref());
-                                            emit(&events, Event::History { attach_seq, session_id: esid, seq, update });
-                                        }
-                                        other => emit_error(&events, Some(attach_seq), Error::Decode(DecodeError {
-                                            kind: "query_result:messages".into(),
-                                            error: format!("expected an array, got {}", other.map(|o| o.to_string()).unwrap_or_default().chars().take(120).collect::<String>()),
-                                        })),
+                        if let Some(m) = mirror.as_mut()
+                            && is_message_history(&v)
+                        {
+                            let messages = match v.pointer_mut("/event/messages").map(Value::take) {
+                                Some(Value::Array(a)) => a,
+                                _ => Vec::new(),
+                            };
+                            drop(v);
+                            let update = m.update(messages);
+                            emit(&events, Event::History { attach_seq, session_id: esid, seq, update });
+                            continue;
+                        }
+                        if v.get("ev").and_then(Value::as_str) == Some("query_result") {
+                            // Only our own resync is ours. Another client's
+                            // result (broadcast: a co-attached TUI's resync is
+                            // the whole history) and daemon-internal reserved
+                            // ids are dropped, as `absorb` does.
+                            let ours = v.get("id").and_then(Value::as_u64) == Some(query_id);
+                            if ours
+                                && let Some(m) = mirror.as_mut()
+                                && let Some(trigger) = resync.take()
+                            {
+                                match v.get_mut("value").map(Value::take) {
+                                    Some(Value::Array(messages)) => {
+                                        let update = m.resynced(messages, trigger.as_ref());
+                                        emit(&events, Event::History { attach_seq, session_id: esid, seq, update });
                                     }
+                                    other => emit_error(&events, Some(attach_seq), Error::Decode(DecodeError {
+                                        kind: "query_result:messages".into(),
+                                        error: format!("expected an array, got {}", other.map(|o| o.to_string()).unwrap_or_default().chars().take(120).collect::<String>()),
+                                    })),
                                 }
-                                continue;
                             }
+                            continue;
                         }
                         let raw = Arc::new(v);
                         let event = match decode_event(&raw) {
@@ -877,7 +916,9 @@ async fn session_loop(sh: Shared, attach_seq: u64, mut target: Target, mode: Att
                                 emit_error(&events, Some(attach_seq), Error::Refused { command: Some(command.clone()), reason: reason.clone() });
                             }
                             SessionEvent::Conversation { digest } => {
-                                if let Some(m) = mirror.as_mut().filter(|m| !m.matches(digest)) {
+                                if let Some(m) = mirror.as_mut()
+                                    && !m.matches(digest)
+                                {
                                     if digest.messages_len == 0 {
                                         m.reset(&[]);
                                         emit(&events, Event::History { attach_seq, session_id: esid.clone(), seq, update: HistoryUpdate::Replace { messages: Vec::new() } });
@@ -933,10 +974,20 @@ async fn session_loop(sh: Shared, attach_seq: u64, mut target: Target, mode: Att
         };
         emit(&events, Event::Reattaching { attach_seq, session_id: sid.clone(), reason: why });
         previous = Some(Previous { client: me, session_id: sid, was_owner: owner == Some(me), generation });
-        deadline = Instant::now() + RECONNECT_BUDGET;
         drop(conn);
+        // A session that keeps dropping right after attaching backs off and
+        // runs out of budget instead of reconnecting in a tight loop.
+        if up_at.elapsed() >= STABLE_AFTER {
+            backoff = BACKOFF_START;
+            deadline = Instant::now() + RECONNECT_BUDGET;
+        }
+        let delay = delay.max(backoff);
+        if Instant::now() + delay > deadline {
+            return Exit { session_id, reason: "reconnect gave up: the session connection keeps dropping".into() };
+        }
         if without_session(&mut cmds, &events, attach_seq, tokio::time::sleep(delay)).await.is_none() {
             return detached(session_id);
         }
+        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
