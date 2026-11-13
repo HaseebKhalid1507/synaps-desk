@@ -180,6 +180,11 @@ const NOTES_MAX: usize = 7;
 const NOTE_SCALE: f32 = 1.15;
 /// Note animation rate (shaped X windows; no GPUI redraw).
 const NOTE_TICK: Duration = Duration::from_millis(40);
+/// Hair glints: a glow and a core layer each, at most four at once. Shaped X windows like
+/// the hearts, so a glint costs no GPUI redraw.
+const GLINT_LAYER: usize = NOTE_LAYER + 2 * NOTES_MAX;
+const GLINTS_MAX: usize = 4;
+const GLINT_TICK: Duration = Duration::from_millis(60);
 
 /// Device px of the largest note sprite for this geometry.
 pub fn note_px(geo: &Geometry) -> u32 {
@@ -193,7 +198,6 @@ struct MusicOn {
 }
 const FRAME_FAST: Duration = Duration::from_millis(16);
 const FRAME_FX: Duration = Duration::from_millis(33);
-const FRAME_GLINT: Duration = Duration::from_millis(90);
 
 struct Press {
     root: (i32, i32),
@@ -287,6 +291,7 @@ pub struct Avatar {
     music: Option<MusicOn>,
     notes: Vec<NoteMasks>,
     notes_shown: usize,
+    glints_shown: usize,
     /// Breath/sway/nod as last drawn.
     pose_last: fx::Pose,
 }
@@ -375,6 +380,7 @@ impl Avatar {
             music: None,
             notes: Vec::new(),
             notes_shown: 0,
+            glints_shown: 0,
             pose_last: fx::Pose::default(),
         }
     }
@@ -487,6 +493,48 @@ impl Avatar {
         self.notes_shown = used;
     }
 
+    /// Move the glint layers to `now`; unmap the ones not in use.
+    fn update_glints(&mut self, now: Instant) {
+        let life_ms = self.pack.behaviour.life.sparkle_ms;
+        let show = self.loaded && !self.hidden && !self.quitting && self.glitch.is_none() && self.teleport.is_none() && self.squash.is_none();
+        let l = self.layout;
+        let base = ((self.applied.0 + l.avatar_x) as f32, (self.applied.1 + l.avatar_y) as f32);
+        let mut used = 0;
+        if show {
+            for g in &self.glints {
+                if used >= GLINTS_MAX {
+                    break;
+                }
+                let Some(sc) = g.scale(now, life_ms).filter(|&v| v > 0.02) else { continue };
+                let (cx, cy, r) = (base.0 + g.x, base.1 + g.y, g.size * sc);
+                let place = |pts: Vec<(f32, f32)>| {
+                    let x0 = pts.iter().map(|p| p.0).fold(f32::MAX, f32::min).floor() as i32;
+                    let y0 = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min).floor() as i32;
+                    let x1 = pts.iter().map(|p| p.0).fold(f32::MIN, f32::max).ceil() as i32;
+                    let y1 = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max).ceil() as i32;
+                    let local: Vec<(f32, f32)> = pts.iter().map(|&(x, y)| (x - x0 as f32, y - y0 as f32)).collect();
+                    let mut rows = Vec::new();
+                    shape::poly_rows(&local, &mut rows);
+                    ((x0, y0), (x1 - x0, y1 - y0), rows)
+                };
+                let (core, glow) = (GLINT_LAYER + 2 * used + 1, GLINT_LAYER + 2 * used);
+                let (o, sz, rows) = place(fx::star(cx, cy, r, g.spin + 0.04));
+                self.x11.fx_set(core, 0xffffff, o, sz, &rows).ok();
+                let (o, sz, rows) = place(fx::star(cx, cy, r * 1.3, g.spin));
+                self.x11.fx_set_below(glow, core, 0xffc2e2, o, sz, &rows).ok();
+                used += 1;
+            }
+        }
+        for k in used..self.glints_shown {
+            self.x11.fx_unmap(GLINT_LAYER + 2 * k);
+            self.x11.fx_unmap(GLINT_LAYER + 2 * k + 1);
+        }
+        if used > 0 || self.glints_shown > 0 {
+            self.x11.flush();
+        }
+        self.glints_shown = used;
+    }
+
     // ---- idle/music body motion --------------------------------------------------------
 
     fn pose_active(&self) -> bool {
@@ -521,8 +569,11 @@ impl Avatar {
         let life = &self.pack.behaviour.life;
         let t = now.saturating_duration_since(self.bob_t0);
         let breath = fx::bob(t, life.bob_px, life.bob_period_ms);
+        // In 2 px steps once it's wide enough: every step is a redraw.
         let sway = if life.sway_px > 0 && life.sway_period_ms > 0 {
-            (life.sway_px as f32 * (t.as_secs_f32() * 1000.0 / life.sway_period_ms as f32 * std::f32::consts::TAU).sin()).round() as i32
+            let step = if life.sway_px >= 4 { 2.0 } else { 1.0 };
+            let v = life.sway_px as f32 * (t.as_secs_f32() * 1000.0 / life.sway_period_ms as f32 * std::f32::consts::TAU).sin();
+            ((v / step).round() * step) as i32
         } else {
             0
         };
@@ -530,7 +581,8 @@ impl Avatar {
     }
 
     fn pose_next_change(&self, now: Instant) -> Option<Instant> {
-        if !self.pose_active() {
+        let life = &self.pack.behaviour.life;
+        if !self.pose_active() || (self.music_frame().is_none() && life.bob_px <= 0 && life.sway_px <= 0) {
             return None;
         }
         let cur = self.pose_at(now);
@@ -882,7 +934,7 @@ impl Avatar {
             take(Some(now + FRAME_FAST));
         }
         if !self.glints.is_empty() {
-            take(Some(now + FRAME_GLINT));
+            take(Some(now + GLINT_TICK));
         }
         take(self.next_glint);
         take(self.pose_next_change(now));
@@ -1009,14 +1061,12 @@ impl Avatar {
         }
         let life_ms = self.pack.behaviour.life.sparkle_ms;
         if !self.glints.is_empty() {
-            dirty = true;
             self.glints.retain(|g| g.scale(now, life_ms).is_some());
         }
         if let Some(at) = self.next_glint
             && at <= now
         {
             self.spawn_glints(now);
-            dirty |= !self.glints.is_empty();
         }
         dirty |= self.step_teleport(now);
         if self.music.as_ref().and_then(|m| m.until).is_some_and(|u| u <= now) {
@@ -1047,6 +1097,7 @@ impl Avatar {
         }
         self.apply_offset(now);
         self.update_notes(now);
+        self.update_glints(now);
         if dirty {
             cx.notify();
         }
@@ -2059,22 +2110,6 @@ impl Render for Avatar {
         };
         let ghost_rects = if plan.ghosts.is_empty() || hidden { Vec::new() } else { plan.ghost_rects(&rects) };
         let tint_rects = if plan.tint.is_some() && !hidden { plan.body_rects(&rects) } else { Vec::new() };
-        let life_ms = self.pack.behaviour.life.sparkle_ms;
-        let glints: Vec<(f32, f32, f32, f32)> = if hidden || self.glitch.is_some() {
-            Vec::new()
-        } else {
-            self.glints
-                .iter()
-                .filter_map(|g| {
-                    let s = g.scale(now, life_ms)?;
-                    let (px0, py0) = plan.pivot;
-                    let x = px0 + (g.x - px0) * plan.sx;
-                    let y = py0 + (g.y - py0) * plan.sy;
-                    (s > 0.02).then_some((x, y, g.size * s, g.spin))
-                })
-                .collect()
-        };
-
         let entity = cx.entity();
         let warm: Vec<Arc<RenderImage>> = if self.loaded && !self.warmed {
             self.warmed = true;
@@ -2148,18 +2183,6 @@ impl Render for Avatar {
                         }
                         for &(r, c) in &plan2.cells {
                             window.paint_quad(fill(rect(r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32), rgb(c)));
-                        }
-                        for &(x, y, r, spin) in &glints {
-                            let mut glow = PathBuilder::fill();
-                            glow.add_polygon(&fx::star(ax + lp(x), ay + lp(y), lp(r) * 1.25, spin).iter().map(|&(x, y)| point(px(x), px(y))).collect::<Vec<_>>(), true);
-                            if let Ok(p) = glow.build() {
-                                window.paint_path(p, with_alpha(0xffd6ea, 0.55));
-                            }
-                            let mut core = PathBuilder::fill();
-                            core.add_polygon(&fx::star(ax + lp(x), ay + lp(y), lp(r), spin + 0.04).iter().map(|&(x, y)| point(px(x), px(y))).collect::<Vec<_>>(), true);
-                            if let Ok(p) = core.build() {
-                                window.paint_path(p, rgb(0xffffff));
-                            }
                         }
                     }
                     let e = entity.clone();
