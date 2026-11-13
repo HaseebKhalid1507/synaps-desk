@@ -214,7 +214,8 @@ impl AppView {
             if self.model.is_active(&s.id)
                 && let Some(pr) = self.model.transcript.pending_prompts().first()
             {
-                prompt_gist(&pr.title, &pr.prompt).into()
+                // Built once per prompt, with the card (`sync_card` ran first).
+                self.current_card().map(|c| c.gist.clone()).unwrap_or_else(|| prompt_gist(&pr.title, &pr.prompt).into())
             } else {
                 s.title.clone().filter(|t| !t.is_empty() && s.name.is_some()).unwrap_or_default().into()
             }
@@ -285,14 +286,19 @@ impl AppView {
                             .child(div().size(px(10.)).bg(p.accent))
                             .child(display(label::ACCENT, 10.5, if self.picker_open { p.ink } else { p.ink4 }))
                             .hover(|d| d.text_color(p.ink))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                // The click that closed it from outside does not reopen it.
-                                if this.picker_dismissed.take().is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(400)) {
+                            .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
+                                // The click whose mouse-down closed it from outside does not reopen it.
+                                let dismissed = this.picker_dismissed.take();
+                                if let ClickEvent::Mouse(m) = ev
+                                    && dismissed == Some(m.down.position)
+                                {
                                     return;
                                 }
-                                this.picker_open = !this.picker_open;
-                                this.picker_note = None;
-                                cx.notify();
+                                if this.picker_open {
+                                    this.close_picker(window, cx);
+                                } else {
+                                    this.open_picker(window, cx);
+                                }
                             })),
                     )
                     // As in the mock: the attached session's running subagents.
@@ -724,10 +730,9 @@ impl AppView {
             .border_1()
             .border_color(p.line3)
             .occlude()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.picker_open = false;
-                this.picker_dismissed = Some(std::time::Instant::now());
-                cx.notify();
+            .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                this.picker_dismissed = Some(ev.position);
+                this.close_picker(window, cx);
             }))
             .child(
                 h_flex()
@@ -736,9 +741,8 @@ impl AppView {
                     .child(display(label::ACCENT, 11.5, p.ink))
                     .child(mono(theme::to_hex(current), 10.5, p.ink3))
                     .child(div().flex_1())
-                    .child(tbtn("picker-close", label::CLOSE, p.ink3, p.ink).on_click(cx.listener(|this, _, _, cx| {
-                        this.picker_open = false;
-                        cx.notify();
+                    .child(tbtn("picker-close", label::CLOSE, p.ink3, p.ink).on_click(cx.listener(|this, _, window, cx| {
+                        this.close_picker(window, cx);
                     }))),
             )
             .child(presets)
