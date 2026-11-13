@@ -3,10 +3,13 @@
 //! snapshot (a mood only when it changes, the reply into the bubble, the pending prompt)
 //! and runs the actions on the `Client`.
 //!
-//! Rules from lynx's client notes: attach with `Mirror` (Observe refuses input), drop
-//! every event whose `attach_seq` is not the current one, treat `Attached` as a full
-//! replace (also after a reload), rebuild on a history `Replace` and `resync` when the
-//! transcript refuses an update, and hand refused input back to the user.
+//! Rules from lynx's client notes: watch in `Observe` (a Mirror attach keeps the session
+//! from parking and makes it eligible for keep-warm pings, which cost tokens) and switch
+//! to `Mirror` only to submit, answer or abort, back to Observe once the turn is done;
+//! drop every event whose `attach_seq` is not the current one, treat `Attached` as a full
+//! replace (also after a reload or a mode switch), rebuild on a history `Replace` and
+//! `resync` when the transcript refuses an update, and hand refused input back to the user.
+//! Never attach to `subconscious` (pinned; the memory keeper).
 
 use crate::anim::Mood;
 use std::path::PathBuf;
@@ -15,8 +18,10 @@ use synaps_client::protocol::{LlmEvent, PromptRequest, SessionStreamEvent, Strea
 use synaps_client::transcript::ItemKind;
 use synaps_client::{AttachMode, CreateOptions, Cwd, Error, Event, SessionEvent, SessionMeta, Status, Transcript};
 
-/// The session the default target attaches to, or creates.
-pub const DEFAULT_NAME: &str = "avatar";
+/// The session the avatar never attaches to, by name or by id (pinned; the memory keeper).
+pub const GUARDED: &str = "subconscious";
+/// After the turn is done and nothing is pending, stay in Mirror this long, then Observe.
+const MIRROR_LINGER: Duration = Duration::from_secs(3);
 /// Done shows this long after a turn, then Idle.
 const DONE_FOR: Duration = Duration::from_secs(3);
 /// Annoyed (abort, error) shows this long.
@@ -31,7 +36,8 @@ const TOOL_MAX: usize = 18;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
-    /// Attach to the live session named [`DEFAULT_NAME`], else create it.
+    /// Her own session: attach to the one named [`Options::name`] (or the id remembered from
+    /// last time), else resume it, else create it.
     Default,
     /// Attach to this session (id, journal id or name). Never creates one.
     Session(String),
@@ -42,19 +48,55 @@ pub enum Target {
 #[derive(Clone, Debug)]
 pub struct Options {
     pub target: Target,
+    /// Her own session's name: the pack's character, lowercased (`capri`).
+    pub name: String,
+    /// Her own session's id from last time (resumed if it is not live).
+    pub remembered: Option<String>,
     pub cwd: Option<PathBuf>,
     pub model: Option<String>,
     pub sleepy_after: Duration,
 }
 
+/// `name` (or a name given for an id) is the guarded session.
+pub fn guarded(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(GUARDED)
+}
+
+/// A prompt's answer: never printed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// What the view should do on the client.
 #[derive(Debug, Clone)]
 pub enum Act {
-    Attach(String),
+    Attach(String, AttachMode),
     Create(CreateOptions),
     Resume(String, CreateOptions),
     List,
     Resync,
+    Submit(String),
+    Steer(String),
+    Answer(u64, Option<Secret>),
+    Abort,
+    Detach,
+    /// Her own session's id: remember it for next time.
+    Remember(String),
+    /// A guard tripped: say why and stop.
+    Fatal(String),
+}
+
+/// Input that needs the Mirror attach.
+#[derive(Debug, Clone)]
+enum Input {
+    Text(String),
+    Answer(u64, Option<Secret>),
+    Abort,
 }
 
 /// One-off effects.
@@ -119,8 +161,20 @@ pub struct Link {
     lost: bool,
     /// The session we follow once attached (or the one `--session` named).
     follow: Option<String>,
-    /// The pending attach is a create (named or not) or a resume of the default name.
+    /// Where the default target's attach is: resume the remembered id, create by name, ...
     creating: Option<Creating>,
+    /// Mode of the current (or pending) attachment.
+    mode: AttachMode,
+    /// The pending attach only switches the mode on the session we follow: the body stays.
+    switching: bool,
+    /// Input waiting for the switch to Mirror.
+    queued: Vec<Input>,
+    /// The text field is open: go to (and stay in) Mirror.
+    typing: bool,
+    /// Last user input or turn end: Mirror lingers this long after it.
+    touched: Instant,
+    /// Not connected since (the view re-creates the client after a long outage).
+    down_since: Option<Instant>,
     busy: bool,
     phase: Phase,
     compacting: bool,
@@ -143,8 +197,9 @@ pub struct Link {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Creating {
+    ResumeId,
     Named,
-    Resume,
+    ResumeName,
     Unnamed,
 }
 
@@ -163,6 +218,12 @@ impl Link {
             lost: false,
             follow,
             creating: None,
+            mode: AttachMode::Observe,
+            switching: false,
+            queued: Vec::new(),
+            typing: false,
+            touched: now,
+            down_since: Some(now),
             busy: false,
             phase: Phase::Thinking,
             compacting: false,
@@ -188,8 +249,110 @@ impl Link {
         }
     }
 
+    /// Attached (or only switching modes on the session): input can be taken.
     pub fn live(&self) -> bool {
-        self.connected && matches!(self.attach, Attach::Live(_))
+        self.connected && (matches!(self.attach, Attach::Live(_)) || (self.switching && matches!(self.attach, Attach::Pending(_))))
+    }
+
+    /// The mode the link is in (or switching to).
+    pub fn mode(&self) -> AttachMode {
+        self.mode
+    }
+
+    /// Not connected to the daemon for this long.
+    pub fn offline_for(&self, now: Instant) -> Option<Duration> {
+        self.down_since.map(|t| now.saturating_duration_since(t))
+    }
+
+    /// A new client replaces the old one: everything attached is gone.
+    pub fn reconnect(&mut self, now: Instant) {
+        if matches!(self.attach, Attach::Live(_) | Attach::Reattaching(_)) {
+            self.lost = true;
+        }
+        self.attach = Attach::None;
+        self.connected = false;
+        self.down_since = Some(now);
+        self.switching = false;
+        self.mode = AttachMode::Observe;
+        self.restore_queued();
+        self.busy = false;
+        self.prompts.clear();
+        self.retry_at = None;
+    }
+
+    /// The user's text (Enter): it goes out in Mirror, now or once the switch is done.
+    pub fn submit(&mut self, text: String, now: Instant) -> Result<Vec<Act>, String> {
+        if !self.live() {
+            return Err("not attached to a session".into());
+        }
+        Ok(self.input(Input::Text(text), now))
+    }
+
+    pub fn answer(&mut self, prompt_id: u64, value: Option<String>, now: Instant) -> Vec<Act> {
+        if !self.live() {
+            return Vec::new();
+        }
+        self.input(Input::Answer(prompt_id, value.map(Secret)), now)
+    }
+
+    pub fn abort(&mut self, now: Instant) -> Vec<Act> {
+        if !self.live() {
+            return Vec::new();
+        }
+        self.input(Input::Abort, now)
+    }
+
+    /// The text field opened (switch to Mirror ahead of Enter) or closed.
+    pub fn set_typing(&mut self, on: bool, now: Instant) -> Vec<Act> {
+        self.typing = on;
+        self.touched = now;
+        if on { self.upgrade() } else { Vec::new() }
+    }
+
+    fn input(&mut self, i: Input, now: Instant) -> Vec<Act> {
+        self.touched = now;
+        if self.mode == AttachMode::Mirror && !self.switching && matches!(self.attach, Attach::Live(_)) {
+            return self.send(i);
+        }
+        self.queued.push(i);
+        self.upgrade()
+    }
+
+    /// Switch the followed session to Mirror (unless it is there or on the way).
+    fn upgrade(&mut self) -> Vec<Act> {
+        if self.mode == AttachMode::Mirror || !self.live() {
+            return Vec::new();
+        }
+        let Some(id) = self.follow.clone() else { return Vec::new() };
+        self.mode = AttachMode::Mirror;
+        self.switching = true;
+        vec![Act::Attach(id, AttachMode::Mirror)]
+    }
+
+    fn send(&mut self, i: Input) -> Vec<Act> {
+        match i {
+            Input::Text(t) => {
+                self.pending_input = Some(t.clone());
+                vec![if self.busy { Act::Steer(t) } else { Act::Submit(t) }]
+            }
+            Input::Answer(id, v) => vec![Act::Answer(id, v)],
+            Input::Abort => vec![Act::Abort],
+        }
+    }
+
+    /// Queued text goes back to the user; answers and aborts are dropped.
+    fn restore_queued(&mut self) {
+        for i in std::mem::take(&mut self.queued) {
+            if let Input::Text(t) = i {
+                self.once.push(Once::Restore(t));
+            }
+        }
+    }
+
+    fn refuse(&mut self, what: &str) -> Vec<Act> {
+        let msg = format!("refusing to attach to `{what}`: that is the `{GUARDED}` session (pinned, the memory keeper)");
+        self.retry_at = None;
+        vec![Act::Fatal(msg)]
     }
 
     pub fn busy(&self) -> bool {
@@ -201,6 +364,7 @@ impl Link {
         self.attach = Attach::Pending(seq);
     }
 
+    #[cfg(test)]
     /// The user's text went out (submit or steer).
     pub fn submitted(&mut self, text: String) {
         self.pending_input = Some(text);
@@ -223,6 +387,11 @@ impl Link {
                 if self.connected && !up && matches!(self.attach, Attach::Live(_)) {
                     self.lost = true;
                 }
+                if up {
+                    self.down_since = None;
+                } else if self.down_since.is_none() {
+                    self.down_since = Some(now);
+                }
                 self.connected = up;
             }
             Event::Sessions(list) => {
@@ -231,12 +400,23 @@ impl Link {
                     acts.extend(self.resolve(&list, now));
                 }
             }
-            Event::Attached { attach_seq, attached, reconnect, .. } => {
+            Event::Attached { attach_seq, attached, reconnect, mode, .. } => {
+                if let Some(name) = attached.meta.name.as_deref().filter(|n| guarded(n)) {
+                    // Got here by an id: leave at once.
+                    self.attach = Attach::None;
+                    let mut acts = vec![Act::Detach];
+                    acts.extend(self.refuse(&format!("{} ({name})", attached.meta.id)));
+                    return acts;
+                }
                 if let Err(e) = self.transcript.load_attached(&attached) {
                     eprintln!("synaps-avatar: attach: {e}");
                 }
+                // A mode switch on the session we follow: same body, no new bubble.
+                let switch = self.switching && !reconnect && self.follow.as_deref() == Some(attached.meta.id.as_str());
                 let again = reconnect || self.lost;
                 self.attach = Attach::Live(attach_seq);
+                self.mode = mode;
+                self.switching = false;
                 self.follow = Some(attached.meta.id.clone());
                 self.creating = None;
                 self.ever_live = true;
@@ -246,10 +426,13 @@ impl Link {
                 self.compacting = false;
                 self.prompts = attached.pending_prompts.clone();
                 self.pending_input = None;
-                self.flash = None;
-                self.echo = None;
-                self.notice = None;
-                self.last_active = now;
+                if !switch {
+                    self.flash = None;
+                    self.echo = None;
+                    self.notice = None;
+                    self.last_active = now;
+                }
+                self.touched = now;
                 // The last reply stays reachable from the chip.
                 let items = self.transcript.items();
                 let mut parts: Vec<&str> = items
@@ -260,14 +443,27 @@ impl Link {
                     .map(|i| i.text.as_str())
                     .collect();
                 parts.reverse();
-                self.raw = parts.join("\n\n");
+                let raw = parts.join("\n\n");
+                // A switch keeps what was streamed if the snapshot says the same.
+                if !(switch && clean(&raw) == clean(&self.raw)) {
+                    self.turn += 1;
+                    self.raw = raw;
+                }
                 self.response_at = self.raw.len();
-                self.turn += 1;
                 if attached.rejected.total() > 0 {
                     eprintln!("synaps-avatar: attach snapshot: {} entries did not decode", attached.rejected);
                 }
                 if again {
                     self.once.push(Once::Appear);
+                }
+                if self.opts.target == Target::Default && self.opts.remembered.as_deref() != Some(attached.meta.id.as_str()) {
+                    self.opts.remembered = Some(attached.meta.id.clone());
+                    acts.push(Act::Remember(attached.meta.id.clone()));
+                }
+                if mode == AttachMode::Mirror {
+                    for i in std::mem::take(&mut self.queued) {
+                        acts.extend(self.send(i));
+                    }
                 }
             }
             Event::Reattaching { attach_seq, reason, .. } => {
@@ -282,17 +478,21 @@ impl Link {
                 eprintln!("synaps-avatar: detached: {reason}");
                 let was = self.attach;
                 self.attach = Attach::None;
-                if matches!(was, Attach::Live(_) | Attach::Reattaching(_)) {
+                if matches!(was, Attach::Live(_) | Attach::Reattaching(_)) || self.switching {
                     self.lost = true;
                 }
-                // A failed create of the default name: resume it, then create one unnamed.
-                if matches!(was, Attach::Pending(_)) {
+                // A failed resume or create of her own session: the next way in.
+                if matches!(was, Attach::Pending(_)) && !self.switching {
                     self.creating = match self.creating {
-                        Some(Creating::Named) => Some(Creating::Resume),
-                        Some(Creating::Resume) => Some(Creating::Unnamed),
+                        Some(Creating::ResumeId) => Some(Creating::Named),
+                        Some(Creating::Named) => Some(Creating::ResumeName),
+                        Some(Creating::ResumeName) => Some(Creating::Unnamed),
                         c => c,
                     };
                 }
+                self.switching = false;
+                self.mode = AttachMode::Observe;
+                self.restore_queued();
                 self.busy = false;
                 self.compacting = false;
                 self.prompts.clear();
@@ -380,12 +580,14 @@ impl Link {
                 self.busy = false;
                 self.echo = None;
                 self.last_active = now;
+                self.touched = now;
                 if !self.flash.is_some_and(|f| f.0 == Mood::Annoyed) {
                     self.flash = Some((Mood::Done, now + DONE_FOR));
                 }
             }
             SessionEvent::Aborted { .. } => {
                 self.busy = false;
+                self.touched = now;
                 self.echo = None;
                 self.notice = Some("‹aborted›".into());
                 self.flash = Some((Mood::Annoyed, now + ANNOYED_FOR));
@@ -416,26 +618,46 @@ impl Link {
 
     /// Pick (or make) the session to attach to, from a fresh session list.
     fn resolve(&mut self, list: &[SessionMeta], now: Instant) -> Vec<Act> {
-        let find = |key: &str| list.iter().find(|m| m.is(key) || m.name.as_deref() == Some(key)).map(|m| m.id.clone());
-        if let Some(id) = self.follow.as_deref().and_then(find) {
-            return vec![Act::Attach(id)];
+        let find = |key: &str| list.iter().find(|m| m.is(key) || m.name.as_deref() == Some(key));
+        if let Some(key) = self.follow.clone() {
+            if guarded(&key) {
+                return self.refuse(&key);
+            }
+            if let Some(m) = find(&key) {
+                if m.name.as_deref().is_some_and(guarded) {
+                    return self.refuse(&format!("{key} ({})", m.name.as_deref().unwrap_or_default()));
+                }
+                return vec![Act::Attach(m.id.clone(), AttachMode::Observe)];
+            }
         }
-        match &self.opts.target {
+        match self.opts.target.clone() {
             Target::Session(s) => {
                 eprintln!("synaps-avatar: no live session `{s}`; looking again in {} s", RETRY_SLOW.as_secs());
                 self.retry_at = Some(now + RETRY_SLOW);
                 Vec::new()
             }
             Target::Default => {
-                if let Some(id) = find(DEFAULT_NAME) {
-                    return vec![Act::Attach(id)];
+                let name = self.opts.name.clone();
+                let mine = list.iter().find(|m| m.name.as_deref() == Some(name.as_str()) || self.opts.remembered.as_deref().is_some_and(|r| m.is(r)));
+                if let Some(m) = mine {
+                    if m.name.as_deref().is_some_and(guarded) {
+                        return self.refuse(&m.id);
+                    }
+                    return vec![Act::Attach(m.id.clone(), AttachMode::Observe)];
                 }
-                let c = self.creating.unwrap_or(Creating::Named);
+                // Not live (a saved session keeps its name reserved): resume it by the id
+                // from last time, else create it by name, else resume the name, else unnamed.
+                let first = if self.opts.remembered.is_some() { Creating::ResumeId } else { Creating::Named };
+                let c = self.creating.unwrap_or(first);
                 self.creating = Some(c);
-                match c {
-                    Creating::Named => vec![Act::Create(self.create_options().name(DEFAULT_NAME))],
-                    Creating::Resume => vec![Act::Resume(DEFAULT_NAME.into(), self.create_options())],
-                    Creating::Unnamed => vec![Act::Create(self.create_options())],
+                match (c, self.opts.remembered.clone()) {
+                    (Creating::ResumeId, Some(id)) => vec![Act::Resume(id, self.create_options())],
+                    (Creating::ResumeId | Creating::Named, _) => {
+                        self.creating = Some(Creating::Named);
+                        vec![Act::Create(self.create_options().name(name))]
+                    }
+                    (Creating::ResumeName, _) => vec![Act::Resume(name, self.create_options())],
+                    (Creating::Unnamed, _) => vec![Act::Create(self.create_options())],
                 }
             }
             Target::New => {
@@ -446,7 +668,7 @@ impl Link {
     }
 
     fn create_options(&self) -> CreateOptions {
-        let mut o = CreateOptions::new().mode(AttachMode::Mirror);
+        let mut o = CreateOptions::new().mode(AttachMode::Observe);
         if let Some(c) = &self.opts.cwd {
             o = o.cwd(Cwd::Path(c.clone())).fallback_cwd(Cwd::Home);
         }
@@ -456,14 +678,36 @@ impl Link {
         o
     }
 
-    /// Timers: retry a lost session.
+    /// Timers: retry a lost session; back to Observe once nothing needs Mirror.
     pub fn tick(&mut self, now: Instant) -> Vec<Act> {
         if self.retry_at.is_some_and(|t| t <= now) && self.attach == Attach::None && self.connected {
             // The answer (`Sessions`) resolves.
             self.retry_at = None;
             return vec![Act::List];
         }
+        if let Some(t) = self.downgrade_at()
+            && t <= now
+            && let Some(id) = self.follow.clone()
+        {
+            self.mode = AttachMode::Observe;
+            self.switching = true;
+            return vec![Act::Attach(id, AttachMode::Observe)];
+        }
         Vec::new()
+    }
+
+    /// When the Mirror attach is no longer needed (turn done, nothing pending, field shut).
+    fn downgrade_at(&self) -> Option<Instant> {
+        let idle = self.mode == AttachMode::Mirror
+            && !self.switching
+            && matches!(self.attach, Attach::Live(_))
+            && self.connected
+            && !self.typing
+            && !self.busy
+            && self.prompts.is_empty()
+            && self.queued.is_empty()
+            && self.pending_input.is_none();
+        idle.then_some(self.touched + MIRROR_LINGER)
     }
 
     /// The next instant the body or the link changes by itself.
@@ -477,6 +721,9 @@ impl Link {
         }
         if !self.ever_live {
             t.push(self.started + BOOT_GRACE);
+        }
+        if let Some(d) = self.downgrade_at() {
+            t.push(d.max(now + Duration::from_millis(1)));
         }
         if let Some((_, until)) = self.flash {
             t.push(until);
@@ -625,12 +872,20 @@ mod tests {
     }
 
     fn opts() -> Options {
-        Options { target: Target::Default, cwd: None, model: None, sleepy_after: Duration::from_secs(600) }
+        Options { target: Target::Default, name: "capri".into(), remembered: None, cwd: None, model: None, sleepy_after: Duration::from_secs(600) }
     }
 
     fn attached(seq: u64, name: &str) -> Event {
+        attached_as(seq, name, AttachMode::Observe)
+    }
+
+    fn attached_as(seq: u64, name: &str, mode: AttachMode) -> Event {
         let DaemonFrame::Attached(a) = decode_frame(fixture(name).trim()).unwrap() else { panic!() };
-        Event::Attached { attach_seq: seq, attached: a, mode: AttachMode::Mirror, reconnect: false }
+        Event::Attached { attach_seq: seq, attached: a, mode, reconnect: false }
+    }
+
+    fn meta(id: &str, name: Option<&str>) -> SessionMeta {
+        serde_json::from_value(serde_json::json!({"id": id, "name": name, "model": "m", "lifecycle": "live"})).unwrap()
     }
 
     fn turn(seq: u64) -> Vec<Event> {
@@ -751,10 +1006,10 @@ mod tests {
         assert!(l.tick(t0).is_empty());
         let t1 = t0 + RETRY_SOON;
         assert!(matches!(l.tick(t1).as_slice(), [Act::List]));
-        // The list has no `avatar` and nothing to follow: create it, by name.
+        // Her session is gone from the live list: resume it by the id it had.
         let acts = l.on_event(Event::Sessions(vec![]), t1);
         match acts.as_slice() {
-            [Act::Create(o)] => assert_eq!(o.name.as_deref(), Some(DEFAULT_NAME)),
+            [Act::Resume(id, _)] => assert_eq!(id, "20261113-073427-5fde"),
             other => panic!("{other:?}"),
         }
     }
@@ -769,7 +1024,7 @@ mod tests {
         l.on_event(Event::Detached { attach_seq: 1, session_id: None, reason: "name taken".into() }, t0);
         let t1 = t0 + RETRY_SOON;
         match l.on_event(Event::Sessions(vec![]), t1).as_slice() {
-            [Act::Resume(n, _)] => assert_eq!(n, DEFAULT_NAME),
+            [Act::Resume(n, _)] => assert_eq!(n, "capri"),
             other => panic!("{other:?}"),
         }
         l.attaching(2);
@@ -842,5 +1097,138 @@ mod tests {
         assert_eq!(tool_label("mcp__github__create_pull_request"), "create_pull_request".chars().take(17).collect::<String>() + "…");
         assert_eq!(tool_label("bash"), "bash");
         assert_eq!(one_line("  a \n b  ", 10), "a b");
+    }
+
+    /// Her own session by name; a saved one (not in the live list on 0.11.1, but its name
+    /// stays taken) is resumed by the id from last time instead of a create that fails.
+    #[test]
+    fn her_own_session_is_found_by_name_or_resumed_by_id() {
+        let t0 = Instant::now();
+        let mut l = Link::new(opts(), t0);
+        l.on_event(connected(), t0);
+        let list = vec![meta("20261113-090000-aaaa", Some("work")), meta("20261113-163211-d09d", Some("capri"))];
+        match l.on_event(Event::Sessions(list), t0).as_slice() {
+            [Act::Attach(id, AttachMode::Observe)] => assert_eq!(id, "20261113-163211-d09d"),
+            other => panic!("{other:?}"),
+        }
+        // Remembered and not live: resume that id first, never a create that collides.
+        let mut l = Link::new(Options { remembered: Some("20261113-163211-d09d".into()), ..opts() }, t0);
+        l.on_event(connected(), t0);
+        match l.on_event(Event::Sessions(vec![meta("x", Some("work"))]), t0).as_slice() {
+            [Act::Resume(id, o)] => {
+                assert_eq!(id, "20261113-163211-d09d");
+                assert_eq!(o.mode, AttachMode::Observe);
+            }
+            other => panic!("{other:?}"),
+        }
+        // That resume fails (the journal is gone): create by name.
+        l.attaching(1);
+        l.on_event(Event::Detached { attach_seq: 1, session_id: None, reason: "no such session".into() }, t0);
+        match l.on_event(Event::Sessions(vec![]), t0 + RETRY_SOON).as_slice() {
+            [Act::Create(o)] => assert_eq!(o.name.as_deref(), Some("capri")),
+            other => panic!("{other:?}"),
+        }
+        // Attached: the id is remembered.
+        l.attaching(2);
+        let acts = l.on_event(attached(2, "attached_create.json"), t0);
+        assert!(acts.iter().any(|a| matches!(a, Act::Remember(id) if id == "20261113-073427-5fde")), "{acts:?}");
+    }
+
+    #[test]
+    fn the_subconscious_session_is_never_attached() {
+        let t0 = Instant::now();
+        let fatal = |acts: &[Act]| acts.iter().any(|a| matches!(a, Act::Fatal(m) if m.contains("subconscious")));
+        // By name.
+        let mut l = Link::new(Options { target: Target::Session("Subconscious".into()), ..opts() }, t0);
+        l.on_event(connected(), t0);
+        let acts = l.on_event(Event::Sessions(vec![meta("20261101-000000-5c5c", Some("subconscious"))]), t0);
+        assert!(fatal(&acts) && !acts.iter().any(|a| matches!(a, Act::Attach(..))), "{acts:?}");
+        // By id.
+        let mut l = Link::new(Options { target: Target::Session("20261101-000000-5c5c".into()), ..opts() }, t0);
+        l.on_event(connected(), t0);
+        let acts = l.on_event(Event::Sessions(vec![meta("20261101-000000-5c5c", Some("subconscious"))]), t0);
+        assert!(fatal(&acts) && !acts.iter().any(|a| matches!(a, Act::Attach(..))), "{acts:?}");
+        // Landed in it anyway (a resume by an id): detach at once.
+        let mut l = Link::new(opts(), t0);
+        l.on_event(connected(), t0);
+        l.attaching(1);
+        let Event::Attached { mut attached, .. } = attached(1, "attached_create.json") else { panic!() };
+        attached.meta.name = Some("subconscious".into());
+        let acts = l.on_event(Event::Attached { attach_seq: 1, attached, mode: AttachMode::Observe, reconnect: false }, t0);
+        assert!(matches!(acts.first(), Some(Act::Detach)) && fatal(&acts), "{acts:?}");
+        assert!(!l.live());
+        assert!(guarded(" SUBCONSCIOUS ") && !guarded("subconscious-2"));
+    }
+
+    /// Observe → Mirror (to submit) → the turn → Observe again once it is done; every switch
+    /// is a full-replace `Attached` under a new attach_seq, and the old seq's events drop.
+    #[test]
+    fn observe_mirror_observe_cycle() {
+        let t0 = Instant::now();
+        let mut l = live_link(t0);
+        assert_eq!(l.mode(), AttachMode::Observe);
+        let turn_before = l.body(t0).turn;
+        // Enter in Observe: no submit yet, a switch to Mirror.
+        let acts = l.submit("hi capri".into(), t0).unwrap();
+        match acts.as_slice() {
+            [Act::Attach(id, AttachMode::Mirror)] => assert_eq!(id, "20261113-073427-5fde"),
+            other => panic!("{other:?}"),
+        }
+        l.attaching(2);
+        assert!(l.live(), "the body stays while the mode switches");
+        assert_eq!(l.body(t0).mood, Mood::Idle);
+        // A late event of the Observe attachment: dropped.
+        assert!(l.on_event(turn(1)[1].clone(), t0).is_empty());
+        assert!(!l.body(t0).busy);
+        // Mirror attached: the queued text goes out, and the same reply is not a new bubble.
+        let acts = l.on_event(attached_as(2, "attached_create.json", AttachMode::Mirror), t0);
+        assert!(matches!(acts.as_slice(), [Act::Submit(t)] if t == "hi capri"), "{acts:?}");
+        assert_eq!(l.body(t0).turn, turn_before);
+        assert_eq!(l.take_once(), vec![]);
+        // In Mirror, more input goes straight out.
+        assert!(matches!(l.abort(t0).as_slice(), [Act::Abort]));
+        // The turn runs on seq 2; Mirror stays while it does.
+        let evs = turn(2);
+        for ev in &evs[..60] {
+            l.on_event(ev.clone(), t0);
+        }
+        assert!(l.body(t0).busy);
+        assert!(l.tick(t0 + Duration::from_secs(60)).is_empty());
+        for ev in &evs[60..] {
+            l.on_event(ev.clone(), t0);
+        }
+        assert_eq!(l.body(t0).mood, Mood::Done);
+        // Done, then idle a moment: back to Observe.
+        assert!(l.tick(t0 + MIRROR_LINGER - Duration::from_millis(1)).is_empty());
+        assert_eq!(l.deadline(t0), Some(t0 + MIRROR_LINGER));
+        let t1 = t0 + MIRROR_LINGER;
+        match l.tick(t1).as_slice() {
+            [Act::Attach(_, AttachMode::Observe)] => {}
+            other => panic!("{other:?}"),
+        }
+        l.attaching(3);
+        assert!(l.live());
+        let reply = l.body(t1).reply;
+        let turn_n = l.body(t1).turn;
+        let Event::Attached { attached: a, .. } = attached(3, "attached_history.json") else { panic!() };
+        l.on_event(Event::Attached { attach_seq: 3, attached: a, mode: AttachMode::Observe, reconnect: false }, t1);
+        assert_eq!(l.mode(), AttachMode::Observe);
+        assert_eq!(l.body(t1).reply, reply, "the same last reply after the switch");
+        assert_eq!(l.body(t1).turn, turn_n);
+        assert!(l.tick(t1 + Duration::from_secs(60)).is_empty(), "no more switching");
+    }
+
+    /// The field opening switches early; a failed switch gives the queued text back.
+    #[test]
+    fn typing_switches_early_and_a_failed_switch_restores_input() {
+        let t0 = Instant::now();
+        let mut l = live_link(t0);
+        assert!(matches!(l.set_typing(true, t0).as_slice(), [Act::Attach(_, AttachMode::Mirror)]));
+        l.attaching(2);
+        assert!(l.submit("queued".into(), t0).unwrap().is_empty(), "already switching");
+        l.on_event(Event::Detached { attach_seq: 2, session_id: None, reason: "refused".into() }, t0);
+        assert_eq!(l.take_once(), vec![Once::Restore("queued".into())]);
+        assert_eq!(l.mode(), AttachMode::Observe);
+        assert!(!l.live());
     }
 }

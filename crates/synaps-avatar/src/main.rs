@@ -139,6 +139,9 @@ fn parse_args_from(argv: impl IntoIterator<Item = String>) -> Result<Args> {
     a.target = match (session, new) {
         (Some(_), true) => bail!("--session and --new exclude each other"),
         (Some(s), false) => {
+            if session::guarded(&s) {
+                bail!("--session {s}: refusing, `{}` is the memory keeper's session (pinned); the avatar never attaches to it", session::GUARDED);
+            }
             if a.cwd.is_some() || a.model.is_some() {
                 bail!("--cwd and --model apply to a session the avatar creates, not to --session");
             }
@@ -412,7 +415,10 @@ fn run(t_start: Instant) -> Result<()> {
         .detach();
 
         if !args.no_session {
-            connect_session(&args, &view, cx);
+            if session::guarded(&who(&pack.name)) {
+                fatal(anyhow::anyhow!("this pack's character is called `{}`: that is the guarded session's name", pack.name));
+            }
+            connect_session(&args, &pack.name, &view, cx);
         }
 
         control::serve(listener, tx);
@@ -427,62 +433,51 @@ fn run(t_start: Instant) -> Result<()> {
     Ok(())
 }
 
-/// Start the session client and pump its events into the view. The pump drains the
-/// channel whether or not the window draws (lynx's H4: a hidden overlay that only
-/// applied events in render would let the queue grow without bound).
-fn connect_session(args: &Args, view: &Entity<view::Avatar>, cx: &mut App) {
-    let identity = match synaps_client::Identity::new("avatar") {
+/// Her name as a client and as her own session: the pack's character, lowercased, in
+/// the daemon's client-name alphabet (1-32 letters, digits, `-`, `_`).
+pub fn who(character: &str) -> String {
+    let mut w: String = character
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
+        .collect();
+    w = w.trim_matches('-').chars().take(32).collect();
+    if synaps_client::Identity::new(&w).is_err() { "avatar".into() } else { w }
+}
+
+/// Start the session link: the client and its pump live in the view.
+fn connect_session(args: &Args, character: &str, view: &Entity<view::Avatar>, cx: &mut App) {
+    let me = who(character);
+    let identity = match synaps_client::Identity::new(&me) {
         Ok(i) => i,
         Err(e) => fatal(anyhow::anyhow!("identity: {e}")),
     };
-    let endpoint = match &args.socket {
-        Some(p) => synaps_client::Endpoint::Socket(p.clone()),
-        None => synaps_client::Endpoint::profile(args.profile.as_deref()),
+    let (endpoint, key) = match &args.socket {
+        Some(p) => (synaps_client::Endpoint::Socket(p.clone()), format!("socket:{}", p.display())),
+        None => {
+            let profile = args.profile.clone().or_else(|| std::env::var("SYNAPS_PROFILE").ok());
+            let key = format!("profile:{}", profile.as_deref().unwrap_or("default"));
+            (synaps_client::Endpoint::profile(profile.as_deref()), key)
+        }
     };
-    let (client, rx) = match synaps_client::Client::spawn(synaps_client::ClientOptions::new(endpoint, identity)) {
-        Ok(c) => c,
-        Err(e) => fatal(anyhow::anyhow!("cannot start the session client: {e}")),
+    let remembered = state::remembered_session(&key);
+    eprintln!(
+        "synaps-avatar: session: {key}, client `{me}`, target {:?}{}",
+        args.target,
+        if args.target == session::Target::Default { format!(" (her own: `{me}`{})", remembered.as_deref().map(|r| format!(", last {r}")).unwrap_or_default()) } else { String::new() }
+    );
+    let opts = session::Options {
+        target: args.target.clone(),
+        name: me,
+        remembered,
+        cwd: args.cwd.clone(),
+        model: args.model.clone(),
+        sleepy_after: args.sleepy_after,
     };
-    let via = match &args.socket {
-        Some(p) => format!("socket {}", p.display()),
-        None => format!("profile {}", args.profile.clone().or_else(|| std::env::var("SYNAPS_PROFILE").ok()).unwrap_or_else(|| "default".into())),
-    };
-    eprintln!("synaps-avatar: session: {via}, target {:?}", args.target);
-    let opts = session::Options { target: args.target.clone(), cwd: args.cwd.clone(), model: args.model.clone(), sleepy_after: args.sleepy_after };
     let link = session::Link::new(opts, Instant::now());
-    view.update(cx, |v, cx| v.connect_session(client, link, cx));
-    let view = view.downgrade();
-    cx.spawn(async move |cx| {
-        while let Ok(first) = rx.recv().await {
-            let mut batch = Vec::with_capacity(rx.len() + 1);
-            batch.push(first);
-            while batch.len() < 1024
-                && let Ok(e) = rx.try_recv()
-            {
-                batch.push(e);
-            }
-            if view.update(cx, |v, cx| v.session_events(batch, cx)).is_err() {
-                return;
-            }
-            YieldNow(false).await;
-        }
-        view.update(cx, |v, cx| v.session_closed(cx)).ok();
-    })
-    .detach();
-}
-
-/// Pending once, so a frame can run between two event batches.
-struct YieldNow(bool);
-
-impl std::future::Future for YieldNow {
-    type Output = ();
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        if std::mem::replace(&mut self.0, true) {
-            return std::task::Poll::Ready(());
-        }
-        cx.waker().wake_by_ref();
-        std::task::Poll::Pending
-    }
+    let options = synaps_client::ClientOptions::new(endpoint, identity);
+    view.update(cx, |v, cx| v.connect_session(options, link, key, cx));
 }
 
 /// Run `f` on a plain thread and await its result. GPUI's background executor can be
@@ -524,6 +519,19 @@ mod tests {
             assert!(e.contains("exclude each other"), "{e}");
         }
         assert!(parse(&["--socket"]).err().expect("no path").to_string().contains("needs a socket path"));
+    }
+
+    #[test]
+    fn subconscious_is_refused_and_names_are_slugs() {
+        for s in ["subconscious", "Subconscious", " SUBCONSCIOUS "] {
+            let e = parse(&["--session", s]).err().expect("refused").to_string();
+            assert!(e.contains("refusing") && e.contains("subconscious"), "{e}");
+        }
+        assert!(parse(&["--session", "subconscious-notes"]).is_ok());
+        assert_eq!(super::who("Capri"), "capri");
+        assert_eq!(super::who("  Mister Byte! "), "mister-byte");
+        assert_eq!(super::who("!!!"), "avatar");
+        assert_eq!(super::who(&"x".repeat(40)).len(), 32);
     }
 }
 

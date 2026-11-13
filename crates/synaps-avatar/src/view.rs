@@ -19,7 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use synaps_client::{AttachMode, Client};
+use synaps_client::{Client, ClientOptions};
 
 /// Window layout in device pixels (X11 works in these; GPUI gets them / scale factor).
 #[derive(Clone, Copy, Debug)]
@@ -155,6 +155,9 @@ fn hold_for(chars: usize) -> Duration {
     Duration::from_millis((3_000 + 45 * chars.min(240) as u64).min(12_000))
 }
 
+/// Laid-out bubble buttons (for test clicks via `state`).
+type Buttons = Rc<RefCell<Vec<(&'static str, Bounds<Pixels>)>>>;
+
 /// The attached Synaps session.
 pub struct SessionLink {
     pub client: Client,
@@ -163,7 +166,20 @@ pub struct SessionLink {
     shown: Option<Body>,
     /// Shutting down: Detach + Bye are on their way.
     closing: bool,
+    /// How to make the client again (after its thread stopped or a long outage).
+    options: ClientOptions,
+    /// Where her session id is remembered (profile or socket).
+    key: String,
+    /// Bumped per client: a stopped pump of an old client is not news.
+    generation: u64,
+    respawn_at: Option<Instant>,
 }
+
+/// Re-create the client when it has been offline this long (its own reconnects gave up,
+/// or the tunnel is still coming back).
+const RESPAWN_AFTER: Duration = Duration::from_secs(90);
+/// After the client's thread stopped by itself, start a new one this soon.
+const RESPAWN_SOON: Duration = Duration::from_secs(5);
 
 /// The text field in the bubble.
 struct InputBox {
@@ -342,6 +358,10 @@ pub struct Avatar {
     /// Body not drawn (between dematerialise and materialise).
     hidden: bool,
     quitting: bool,
+    /// A guard tripped: quit with exit code 2.
+    fatal: bool,
+    /// Quit at the next tick (from where there is no `cx`).
+    quit_requested: bool,
     placement: Placement,
     /// Ground point to fall back to when a perch ends.
     home: (i32, i32),
@@ -373,7 +393,7 @@ pub struct Avatar {
     hint: Option<(String, Instant)>,
     _subs: Vec<Subscription>,
     /// Laid-out bubble buttons (window logical px), for the dev `state` (test clicks).
-    buttons: Rc<RefCell<Vec<(&'static str, Bounds<Pixels>)>>>,
+    buttons: Buttons,
 }
 
 pub struct Init {
@@ -461,6 +481,8 @@ impl Avatar {
             teleport: None,
             hidden: false,
             quitting: false,
+            fatal: false,
+            quit_requested: false,
             placement: Placement::Ground,
             home,
             contact: [None, None],
@@ -1015,6 +1037,11 @@ impl Avatar {
         take(self.menu.map(|m| m.1));
         if let Some(s) = &self.session {
             take(s.link.deadline(now));
+            take(s.respawn_at);
+            take(s.link.offline_for(now).map(|d| now + RESPAWN_AFTER.saturating_sub(d)));
+        }
+        if self.quit_requested {
+            take(Some(now));
         }
         take(self.hint.as_ref().map(|h| h.1));
         take(self.input.as_ref().and_then(|i| i.esc_at).map(|t| t + ESC_AGAIN));
@@ -1152,6 +1179,18 @@ impl Avatar {
             dirty = true;
         }
         if self.prompt_ui.as_ref().is_some_and(|p| p.shown_at + PROMPT_ARM <= now && p.shown_at + PROMPT_ARM + FRAME_FAST > now) {
+            dirty = true;
+        }
+        if let Some(s) = &self.session
+            && !s.closing
+            && (s.respawn_at.is_some_and(|t| t <= now) || s.link.offline_for(now).is_some_and(|d| d >= RESPAWN_AFTER))
+        {
+            self.respawn(now, cx);
+            dirty = true;
+        }
+        if self.quit_requested && !self.quitting {
+            self.quit_requested = false;
+            self.hide(now);
             dirty = true;
         }
         if let Some(acts) = self.session.as_mut().map(|s| s.link.tick(now)) {
@@ -1457,8 +1496,8 @@ impl Avatar {
                 Err(e) => format!("error: {e}"),
             },
             Command::Abort => match &self.session {
-                Some(s) => {
-                    s.client.abort().ok();
+                Some(_) => {
+                    self.abort();
                     "ok".into()
                 }
                 None => "error: no session".into(),
@@ -1548,10 +1587,17 @@ impl Avatar {
         self.finish_quit(cx);
     }
 
-    /// The session's connection thread stopped.
-    pub fn session_closed(&mut self, cx: &mut Context<Self>) {
-        if self.session.as_ref().is_some_and(|s| s.closing) {
+    /// A client's connection thread stopped: the end of a quit, or (by itself) a client to
+    /// make again.
+    pub fn session_closed(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let Some(s) = &mut self.session else { return };
+        if s.closing {
             self.finish_quit(cx);
+        } else if s.generation == generation {
+            eprintln!("synaps-avatar: the session client stopped; a new one in {} s", RESPAWN_SOON.as_secs());
+            s.respawn_at = Some(Instant::now() + RESPAWN_SOON);
+            cx.notify();
+            self.schedule(cx);
         }
     }
 
@@ -1561,6 +1607,9 @@ impl Avatar {
         }
         self.fx_hide_all();
         std::fs::remove_file(crate::control::socket_path()).ok();
+        if self.fatal {
+            std::process::exit(2);
+        }
         cx.quit();
     }
 
@@ -1600,7 +1649,8 @@ impl Avatar {
             "session": self.session.as_ref().map(|s| {
                 let b = s.link.body(Instant::now());
                 serde_json::json!({ "live": b.live, "busy": b.busy, "mood": b.mood.key(), "label": b.label, "reply": b.reply,
-                                    "echo": b.echo, "prompt": b.prompt.map(|p| p.title) })
+                                    "echo": b.echo, "prompt": b.prompt.map(|p| p.title),
+                                    "mode": format!("{:?}", s.link.mode()).to_lowercase(), "client": s.generation })
             }),
             "input": self.input.as_ref().map(|i| serde_json::json!({ "len": i.text.chars().count(), "secret": i.secret.is_some(),
                                                                        "prev": i.prev, "esc": i.esc_at.is_some() })),
@@ -1618,17 +1668,72 @@ impl Avatar {
 
     // ---- session ---------------------------------------------------------------------
 
-    pub fn connect_session(&mut self, client: Client, link: Link, cx: &mut Context<Self>) {
-        self.session = Some(SessionLink { client, link, shown: None, closing: false });
+    /// Start the session client and pump its events into the view.
+    pub fn connect_session(&mut self, options: ClientOptions, link: Link, key: String, cx: &mut Context<Self>) {
+        let (client, rx) = match Client::spawn(options.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("synaps-avatar: cannot start the session client: {e}");
+                std::process::exit(1);
+            }
+        };
+        self.session = Some(SessionLink { client, link, shown: None, closing: false, options, key, generation: 0, respawn_at: None });
+        self.pump(rx, 0, cx);
         self.sync_body(Instant::now());
         cx.notify();
         self.schedule(cx);
     }
 
+    /// Drain a client's events in batches whether or not the window draws (lynx's H4: a
+    /// hidden overlay that only applied events in render would let the queue grow).
+    fn pump(&mut self, rx: async_channel::Receiver<synaps_client::Event>, generation: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            while let Ok(first) = rx.recv().await {
+                let mut batch = Vec::with_capacity(rx.len() + 1);
+                batch.push(first);
+                while batch.len() < 1024
+                    && let Ok(e) = rx.try_recv()
+                {
+                    batch.push(e);
+                }
+                if this.update(cx, |v, cx| v.session_events(generation, batch, cx)).is_err() {
+                    return;
+                }
+                YieldNow(false).await;
+            }
+            this.update(cx, |v, cx| v.session_closed(generation, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// A new client in place of one that stopped or stayed offline too long.
+    fn respawn(&mut self, now: Instant, cx: &mut Context<Self>) {
+        let Some(s) = &mut self.session else { return };
+        s.respawn_at = None;
+        let (client, rx) = match Client::spawn(s.options.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("synaps-avatar: cannot start a new session client: {e}");
+                s.respawn_at = Some(now + RESPAWN_AFTER);
+                return;
+            }
+        };
+        let old = std::mem::replace(&mut s.client, client);
+        old.shutdown().ok();
+        s.generation += 1;
+        s.link.reconnect(now);
+        let generation = s.generation;
+        eprintln!("synaps-avatar: new session client (#{generation})");
+        self.pump(rx, generation, cx);
+    }
+
     /// A batch of daemon events (the pump drains the channel whether or not we draw).
-    pub fn session_events(&mut self, batch: Vec<synaps_client::Event>, cx: &mut Context<Self>) {
+    pub fn session_events(&mut self, generation: u64, batch: Vec<synaps_client::Event>, cx: &mut Context<Self>) {
         let now = Instant::now();
         let Some(s) = &mut self.session else { return };
+        if s.generation != generation {
+            return; // an old client's last words
+        }
         let mut acts = Vec::new();
         for ev in batch {
             acts.extend(s.link.on_event(ev, now));
@@ -1643,11 +1748,31 @@ impl Avatar {
         let Some(s) = &mut self.session else { return };
         for a in acts {
             let r = match a {
-                Act::Attach(id) => s.client.attach(id, AttachMode::Mirror).map(|seq| s.link.attaching(seq)),
+                Act::Attach(id, mode) => {
+                    if std::env::var_os("SA_DEBUG").is_some() {
+                        eprintln!("synaps-avatar: attach {id} as {mode:?}");
+                    }
+                    s.client.attach(id, mode).map(|seq| s.link.attaching(seq))
+                }
                 Act::Create(o) => s.client.create(o).map(|seq| s.link.attaching(seq)),
                 Act::Resume(name, o) => s.client.resume(name, o).map(|seq| s.link.attaching(seq)),
                 Act::List => s.client.list_sessions(),
                 Act::Resync => s.client.resync(),
+                Act::Submit(t) => s.client.submit(t),
+                Act::Steer(t) => s.client.steer(t),
+                Act::Answer(id, v) => s.client.answer(id, v.map(|v| v.0)),
+                Act::Abort => s.client.abort(),
+                Act::Detach => s.client.detach(),
+                Act::Remember(id) => {
+                    state::remember_session(&s.key, &id);
+                    Ok(())
+                }
+                Act::Fatal(msg) => {
+                    eprintln!("synaps-avatar: {msg}");
+                    self.fatal = true;
+                    self.quit_requested = true;
+                    Ok(())
+                }
             };
             if let Err(e) = r {
                 eprintln!("synaps-avatar: {e}");
@@ -1770,6 +1895,10 @@ impl Avatar {
             let prev = self.x11.active_window().or_else(|| self.x11.focused_window().ok()).filter(|&w| w > 1 && w != ours);
             let text = if secret.is_some() { String::new() } else { std::mem::take(&mut self.draft) };
             self.input = Some(InputBox { text, prev, esc_at: None, secret });
+            if let Some(s) = &mut self.session {
+                let acts = s.link.set_typing(true, Instant::now());
+                self.run_acts(acts);
+            }
         }
         if let Err(e) = self.x11.take_focus() {
             eprintln!("synaps-avatar: cannot take the keyboard: {e:#}");
@@ -1786,6 +1915,10 @@ impl Avatar {
         if i.secret.is_none() {
             self.draft = i.text;
         }
+        if let Some(s) = &mut self.session {
+            let acts = s.link.set_typing(false, Instant::now());
+            self.run_acts(acts);
+        }
         if restore && let Some(w) = i.prev {
             self.x11.give_focus(w).ok();
         }
@@ -1798,12 +1931,8 @@ impl Avatar {
             return Err("empty".into());
         }
         let Some(s) = &mut self.session else { return Err("no session (--no-session)".into()) };
-        if !s.link.live() {
-            return Err("not attached to a session".into());
-        }
-        let r = if s.link.busy() { s.client.steer(text.clone()) } else { s.client.submit(text.clone()) };
-        r.map_err(|e| e.to_string())?;
-        s.link.submitted(text);
+        let acts = s.link.submit(text, Instant::now())?;
+        self.run_acts(acts);
         if let Some(t) = &mut self.timing {
             *t = Some((Instant::now(), false));
         }
@@ -1811,17 +1940,19 @@ impl Avatar {
     }
 
     fn abort(&mut self) {
-        if let Some(s) = &self.session {
-            s.client.abort().ok();
+        if let Some(s) = &mut self.session {
+            let acts = s.link.abort(Instant::now());
+            self.run_acts(acts);
         }
     }
 
     fn answer(&mut self, value: Option<String>) {
         let Some(u) = self.prompt_ui.take() else { return };
         if !u.fake
-            && let Some(s) = &self.session
+            && let Some(s) = &mut self.session
         {
-            s.client.answer(u.view.id, value).ok();
+            let acts = s.link.answer(u.view.id, value, Instant::now());
+            self.run_acts(acts);
         } else {
             // A dev prompt: back to the session's mood (or idle).
             let m = self.session.as_ref().and_then(|s| s.shown.as_ref()).map_or(Mood::Idle, |b| b.mood);
@@ -3541,4 +3672,18 @@ fn mix_rgb(a: u32, b: u32, k: f32) -> u32 {
         ((x + (y - x) * k).round() as u32 & 0xff) << sh
     };
     ch(16) | ch(8) | ch(0)
+}
+
+/// Pending once, so a frame can run between two event batches.
+struct YieldNow(bool);
+
+impl std::future::Future for YieldNow {
+    type Output = ();
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if std::mem::replace(&mut self.0, true) {
+            return std::task::Poll::Ready(());
+        }
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
 }

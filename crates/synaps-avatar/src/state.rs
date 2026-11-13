@@ -28,3 +28,29 @@ pub fn save(ground: (i32, i32)) {
         std::fs::rename(&tmp, &p).ok();
     }
 }
+
+fn sessions_path() -> PathBuf {
+    path().with_file_name("sessions.json")
+}
+
+/// Her own session's id for this daemon (`key`: the profile or socket), from last time.
+pub fn remembered_session(key: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(sessions_path()).ok()?).ok()?;
+    v.get(key)?.as_str().map(str::to_string)
+}
+
+pub fn remember_session(key: &str, id: &str) {
+    let p = sessions_path();
+    let mut v: serde_json::Value = std::fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| serde_json::json!({}));
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    v[key] = serde_json::Value::String(id.to_string());
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let tmp = p.with_extension("json.tmp");
+    if std::fs::write(&tmp, v.to_string()).is_ok() {
+        std::fs::rename(&tmp, &p).ok();
+    }
+}
