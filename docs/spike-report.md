@@ -21,6 +21,7 @@ Screenshots (bench mode, bella, dark theme): `docs/img/streaming.png`,
 The public API of `synaps-client` is documented at the top of its `lib.rs`:
 `Client::connect(profile, Identity::desktop())` gives `(Client, Receiver<Event>)`.
 The client has `list_sessions / attach / create / submit / abort / detach`.
+*(After review, PR #2, the API changed; see `crates/synaps-client/CHANGELOG.md`.)*
 
 ## Machine
 
@@ -230,7 +231,7 @@ and the tail-following a chat needs, and the bench needs `scroll_by`.
 
 ## Protocol gaps a full client needs
 
-None of these blocked the spike. Items 1, 2, 3, 4, 7 and 8 need a Synaps change to do properly.
+None of these blocked the spike. Items 1, 2, 3, 4, 7 and 8 need a Synaps change to do properly; item 5 turned out not to be a gap.
 1. **No `desktop` client kind.** `ClientKind` is a closed enum (tui/chat/attach/rpc/server/test),
    and an older daemon rejects an unknown kind as a malformed frame. We send `kind: "attach"`
    (interactive, so keep-warm treats it like the TUI) with `name: "desktop"`. A proper kind
@@ -240,15 +241,18 @@ None of these blocked the spike. Items 1, 2, 3, 4, 7 and 8 need a Synaps change 
    `is_error`. A "name + status + exit" row needs `is_error` and `exit_code` on the wire.
    Today the row shows done or failed, and the exit code is not shown.
 3. **The session list is not pushed.** Clients poll `Sessions` on a control connection
-   (every 3 s here). A `sessions_changed` subscription would remove the polling.
+   (every 3 s in the desktop app; opt-in in `synaps-client` since PR #2). A
+   `sessions_changed` subscription would remove the polling.
 4. **History arrives all at once.** `Attached` ships the whole `api_messages` (up to 64 MiB),
    provider-shaped, and the client re-derives the display rows. `Digest` mode's
    `display_tail` only covers the tail. Long sessions need paginated, render-ready history
    ("give me items before X") for fast attach and scroll-back.
-5. **cwd per session.** The daemon always overwrites `SessionConfig.cwd` with `Hello.cwd`.
-   A desktop "new session in folder…" therefore has to open its session connection with
-   `Hello.cwd` set to that folder. It works, since there is one session per connection,
-   but it is implicit.
+5. **cwd per session.** *(Corrected after review.)* The daemon fills `SessionConfig.cwd`
+   from `Hello.cwd` only when the create leaves it `None` (`daemon/conn.rs`, `if
+   config.cwd.is_none()`), and refuses a relative or missing directory. So
+   `CreateConfig.cwd` works today: `synaps-client` now always sends one
+   (`CreateOptions::cwd`, default the user's home), so a GUI started from a launcher no
+   longer runs its sessions' tools in `/` or wherever it was launched. Not a gap.
 6. **Environment.** `Hello.env` is `None` here, so created sessions get the daemon's
    environment. The TUI sends a secret-stripped snapshot of its shell. A GUI launched from
    a desktop launcher has no useful shell environment, so we need a policy (probably keep

@@ -19,8 +19,24 @@ mod imp {
     pub type ReadHalf = tokio::io::ReadHalf<ClientStream>;
     pub type WriteHalf = tokio::io::WriteHalf<ClientStream>;
 
+    /// Connect and check that the server runs as this user, before a byte
+    /// (the `Hello` with its cwd, then prompts) is written: the analogue of
+    /// the Windows `verify_server_is_current_user`, and of the daemon's own
+    /// `peer_cred().uid() == geteuid()` check on its clients. The run dir's
+    /// 0700 alone does not hold with `SYNAPS_RUNTIME_DIR` pointed at a
+    /// shared or pre-created directory.
     pub async fn connect(path: &Path) -> io::Result<ClientStream> {
-        tokio::net::UnixStream::connect(path).await
+        let stream = tokio::net::UnixStream::connect(path).await?;
+        let server = stream.peer_cred()?.uid();
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if server != me {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("the daemon socket {} is served by uid {server}, not this user (uid {me}); refusing to connect", path.display()),
+            ));
+        }
+        Ok(stream)
     }
 }
 

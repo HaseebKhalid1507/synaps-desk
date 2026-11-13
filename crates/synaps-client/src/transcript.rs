@@ -2,20 +2,33 @@
 //! display items, then live stream events applied on top. Pure data, no GUI,
 //! so it is unit-tested here and shared by the desktop app and its benches.
 //!
+//! Feed it [`Transcript::load_attached`] on every `Event::Attached`,
+//! [`Transcript::apply_update`] on every `Event::History` and
+//! [`Transcript::apply`] on every `Event::Session`. It needs
+//! `HistoryMode::Full` and refuses a `Digest` attach.
+//!
+//! Notices and errors (turn errors, "turn aborted", subagent start/done,
+//! system notices) are not part of the history; they are kept across
+//! refolds, anchored to the history position they arrived at.
+//!
 //! Change tracking is splice-shaped for a virtual list: after a batch of
 //! updates, [`Transcript::take_splice`] reports the first changed index and
 //! the old/new lengths, so the UI remeasures only the rows that changed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::Value;
 
+use crate::history::HistoryUpdate;
 use crate::protocol::*;
 
 /// Bound on the tool input/result previews kept per tool row.
 const PREVIEW_MAX: usize = 4 * 1024;
+/// How far ahead id reuse looks for a row of the same kind.
+const REUSE_LOOKAHEAD: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ItemKind {
     User,
     Assistant,
@@ -26,12 +39,21 @@ pub enum ItemKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ToolStatus {
     Streaming,
     Queued,
     Running,
     Done,
     Failed,
+    /// The turn ended (abort, interruption) before the tool reported.
+    Cancelled,
+}
+
+impl ToolStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ToolStatus::Done | ToolStatus::Failed | ToolStatus::Cancelled)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -53,6 +75,16 @@ pub struct Item {
     pub text: String,
     pub tool: Option<ToolCall>,
     pub streaming: bool,
+    /// `Some(n)`: a client-side row (notice, error), not part of the
+    /// history, shown after the first `n` history messages.
+    anchor: Option<usize>,
+}
+
+impl Item {
+    /// A notice or error this client added (not part of the history).
+    pub fn is_note(&self) -> bool {
+        self.anchor.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,21 +94,51 @@ pub struct Splice {
     pub new_len: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TranscriptError {
+    /// The attach carries a digest, not the history (`HistoryMode::Digest`).
+    DigestHistory,
+    /// An append for a history this transcript does not have (`base_len`
+    /// differs from what was folded): call `Client::resync`.
+    OutOfSync { have: usize, base_len: usize },
+}
+
+impl std::fmt::Display for TranscriptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DigestHistory => f.write_str("the transcript needs HistoryMode::Full; this attach carries a digest"),
+            Self::OutOfSync { have, base_len } => {
+                write!(f, "history append from message {base_len}, but {have} are folded; resync")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TranscriptError {}
+
+/// Ids (and revs) of rows about to be rebuilt, for reuse by kind.
+type Reuse = VecDeque<(ItemKind, u64, u64)>;
+
 #[derive(Debug, Default)]
 pub struct Transcript {
-    pub items: Vec<Item>,
+    items: Vec<Item>,
     next_id: u64,
+    session_id: Option<String>,
     /// `api_messages` folded so far, and where their items end.
     history_len: usize,
     history_end: usize,
     /// Index of the first live item of the current response (`ResponseReset`).
     response_start: Option<usize>,
     tools: HashMap<String, usize>,
-    pub busy: bool,
-    pub title: Option<String>,
-    pub pending_prompts: Vec<PromptRequest>,
-    pub subagents: Vec<Value>,
-    pub cost_usd: f64,
+    busy: bool,
+    title: Option<String>,
+    pending_prompts: Vec<PromptRequest>,
+    subagents: Vec<Value>,
+    cost_usd: f64,
+    /// The conversation was swapped (clear, resume, compaction): the next
+    /// replacement drops the notes of the old one.
+    swapped: bool,
     dirty_from: Option<usize>,
     clean_len: usize,
 }
@@ -86,12 +148,47 @@ impl Transcript {
         Self::default()
     }
 
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// A turn is running.
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn pending_prompts(&self) -> &[PromptRequest] {
+        &self.pending_prompts
+    }
+
+    pub fn subagents(&self) -> &[Value] {
+        &self.subagents
+    }
+
+    pub fn cost_usd(&self) -> f64 {
+        self.cost_usd
+    }
+
+    /// History messages folded so far.
+    pub fn history_len(&self) -> usize {
+        self.history_len
+    }
+
+    /// The session of the last [`Transcript::load_attached`].
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     fn mark(&mut self, ix: usize) {
@@ -106,28 +203,40 @@ impl Transcript {
         Some(s)
     }
 
-    fn push(&mut self, kind: ItemKind, text: String, tool: Option<ToolCall>, streaming: bool, reuse: &mut Vec<(ItemKind, u64)>) -> usize {
-        let id = match reuse.first() {
-            Some(&(k, id)) if k == kind => {
-                reuse.remove(0);
-                id
+    fn push(&mut self, kind: ItemKind, text: String, tool: Option<ToolCall>, streaming: bool, reuse: &mut Reuse) -> usize {
+        // Reuse the next row of this kind within a short lookahead, dropping
+        // the rows skipped over (each entry is consumed at most once).
+        let found = reuse.iter().take(REUSE_LOOKAHEAD).position(|&(k, ..)| k == kind);
+        let (id, rev) = match found {
+            Some(p) => {
+                let (_, id, rev) = reuse.drain(..=p).next_back().expect("p is in range");
+                (id, rev + 1)
             }
-            _ => {
+            None => {
                 self.next_id += 1;
-                self.next_id
+                (self.next_id, 0)
             }
         };
         let ix = self.items.len();
         if let Some(t) = &tool {
             self.tools.insert(t.tool_id.clone(), ix);
         }
-        self.items.push(Item { id, rev: 0, kind, text, tool, streaming });
+        self.items.push(Item { id, rev, kind, text, tool, streaming, anchor: None });
         self.mark(ix);
         ix
     }
 
     fn push_new(&mut self, kind: ItemKind, text: String, tool: Option<ToolCall>, streaming: bool) -> usize {
-        self.push(kind, text, tool, streaming, &mut Vec::new())
+        self.push(kind, text, tool, streaming, &mut Reuse::new())
+    }
+
+    /// Re-insert a kept note (same id; rev bumped as its index may differ).
+    fn push_note(&mut self, mut item: Item, anchor: usize) {
+        let ix = self.items.len();
+        item.anchor = Some(anchor);
+        item.rev += 1;
+        self.items.push(item);
+        self.mark(ix);
     }
 
     fn touch(&mut self, ix: usize) {
@@ -135,63 +244,158 @@ impl Transcript {
         self.mark(ix);
     }
 
+    /// Take every row, split into notes (kept) and reusable ids.
+    fn take_rows(&mut self, from: usize) -> (Vec<Item>, Reuse) {
+        self.mark(from);
+        self.tools.retain(|_, ix| *ix < from);
+        let mut notes = Vec::new();
+        let mut reuse = Reuse::new();
+        for it in self.items.drain(from..) {
+            if it.anchor.is_some() {
+                notes.push(it);
+            } else {
+                reuse.push_back((it.kind, it.id, it.rev));
+            }
+        }
+        (notes, reuse)
+    }
+
     /// Replace everything with an attach snapshot (`Attached`), then replay
-    /// the in-flight turn's events.
-    pub fn load_attached(&mut self, a: &Attached) {
-        let old_len = self.clean_len;
-        *self = Transcript { next_id: self.next_id, ..Transcript::default() };
-        self.clean_len = old_len;
+    /// the in-flight turn's events. A re-attach to the same session (after a
+    /// reload) keeps row ids and notes; another session starts fresh.
+    pub fn load_attached(&mut self, a: &Attached) -> Result<(), TranscriptError> {
+        if a.conversation.api_messages.is_empty() && a.conversation.messages_len > 0 {
+            return Err(TranscriptError::DigestHistory);
+        }
+        let same = self.session_id.as_deref() == Some(a.meta.id.as_str());
+        let (notes, mut reuse) = if same { self.take_rows(0) } else { (Vec::new(), Reuse::new()) };
+        let (next_id, clean_len) = (self.next_id, self.clean_len);
+        *self = Transcript { next_id, clean_len, session_id: Some(a.meta.id.clone()), ..Transcript::default() };
         self.dirty_from = Some(0);
         self.title = a.meta.title.clone().or_else(|| a.conversation.header.get("title").and_then(Value::as_str).map(str::to_string));
         self.cost_usd = a.conversation.cost;
         self.pending_prompts = a.pending_prompts.clone();
-        self.fold_history(&a.conversation.api_messages, &mut Vec::new());
+        self.fold_with_notes(&a.conversation.api_messages, notes, &mut reuse);
         self.busy = a.streaming;
         for env in &a.replay {
-            self.apply(&env.decode());
+            if let Ok(ev) = env.decode() {
+                self.apply(&ev);
+            }
         }
         if !a.streaming {
             self.busy = false;
+            self.settle();
         }
+        Ok(())
     }
 
-    /// `MessageHistory`: the authoritative history. Live rows since the last
-    /// fold are replaced by their history form (ids reused by position).
+    /// An `Event::History` update from the client.
+    pub fn apply_update(&mut self, update: &HistoryUpdate) -> Result<(), TranscriptError> {
+        match update {
+            HistoryUpdate::Append { base_len, messages } => {
+                if *base_len != self.history_len {
+                    return Err(TranscriptError::OutOfSync { have: self.history_len, base_len: *base_len });
+                }
+                self.append_history(messages);
+            }
+            HistoryUpdate::Replace { messages } => self.replace_history(messages),
+        }
+        Ok(())
+    }
+
+    /// A full `MessageHistory` without a mirror (benches, digest-less
+    /// replays): longer or equal is taken as an append, shorter as a
+    /// replacement. Clients get [`HistoryUpdate`]s instead, which tell.
     pub fn apply_history(&mut self, messages: &[Value]) {
-        let mut reuse: Vec<(ItemKind, u64)>;
-        if messages.len() < self.history_len {
-            // Compaction / clear: start over.
-            reuse = self.items.iter().map(|i| (i.kind, i.id)).collect();
-            self.items.clear();
-            self.tools.clear();
-            self.history_len = 0;
-            self.history_end = 0;
-            self.mark(0);
-            self.fold_history(messages, &mut reuse);
-        } else {
-            reuse = self.items[self.history_end..].iter().map(|i| (i.kind, i.id)).collect();
-            self.items.truncate(self.history_end);
-            self.tools.retain(|_, ix| *ix < self.history_end);
-            self.mark(self.history_end);
+        if messages.len() >= self.history_len {
             let start = self.history_len;
-            self.fold_from(messages, start, &mut reuse);
+            self.append_history(&messages[start..]);
+        } else {
+            self.replace_history(messages);
         }
+    }
+
+    /// Fold `messages` after the history folded so far. Live rows since
+    /// the last fold are replaced by their history form (ids reused by
+    /// kind); notes among them stay, after the new rows.
+    fn append_history(&mut self, messages: &[Value]) {
+        let (notes, mut reuse) = self.take_rows(self.history_end);
+        for m in messages {
+            self.fold_message(m, &mut reuse);
+        }
+        self.history_len += messages.len();
+        for n in notes {
+            self.push_note(n, self.history_len);
+        }
+        self.history_end = self.items.len();
         self.response_start = None;
+        if !self.busy {
+            self.settle();
+        }
     }
 
-    fn fold_history(&mut self, messages: &[Value], reuse: &mut Vec<(ItemKind, u64)>) {
-        self.fold_from(messages, 0, reuse);
+    /// Rebuild from a whole history (resync, rewrite, clear, compaction).
+    fn replace_history(&mut self, messages: &[Value]) {
+        // This turn's notes (after the last fold) go at the end; after a
+        // conversation swap they are the only ones that still apply.
+        let live_from = self.history_end.min(self.items.len());
+        for it in &mut self.items[live_from..] {
+            if it.anchor.is_some() {
+                it.anchor = Some(usize::MAX);
+            }
+        }
+        let (mut notes, mut reuse) = self.take_rows(0);
+        if std::mem::take(&mut self.swapped) {
+            notes.retain(|n| n.anchor == Some(usize::MAX));
+        }
+        self.fold_with_notes(messages, notes, &mut reuse);
+        self.response_start = None;
+        if !self.busy {
+            self.settle();
+        }
     }
 
-    fn fold_from(&mut self, messages: &[Value], start: usize, reuse: &mut Vec<(ItemKind, u64)>) {
-        for m in &messages[start.min(messages.len())..] {
+    /// Fold a whole history from empty, interleaving `notes` by anchor.
+    fn fold_with_notes(&mut self, messages: &[Value], mut notes: Vec<Item>, reuse: &mut Reuse) {
+        notes.sort_by_key(|n| n.anchor);
+        let mut notes = notes.into_iter().peekable();
+        for (i, m) in messages.iter().enumerate() {
+            while let Some(n) = notes.next_if(|n| n.anchor.unwrap_or(0) <= i) {
+                self.push_note(n, i);
+            }
             self.fold_message(m, reuse);
+        }
+        for n in notes {
+            self.push_note(n, messages.len());
         }
         self.history_len = messages.len();
         self.history_end = self.items.len();
     }
 
-    fn fold_message(&mut self, m: &Value, reuse: &mut Vec<(ItemKind, u64)>) {
+    /// No turn runs: nothing streams and no tool is still pending. Tools
+    /// without a result (aborted, interrupted) end `Cancelled`.
+    fn settle(&mut self) {
+        for ix in 0..self.items.len() {
+            let it = &mut self.items[ix];
+            let open_tool = it.tool.as_ref().and_then(|t| t.status).is_some_and(|s| !s.is_terminal());
+            if !it.streaming && !open_tool {
+                continue;
+            }
+            it.streaming = false;
+            if let Some(t) = it.tool.as_mut().filter(|_| open_tool) {
+                t.status = Some(ToolStatus::Cancelled);
+            }
+            self.touch(ix);
+        }
+    }
+
+    /// The attachment ended: nothing will stream any more.
+    pub fn set_detached(&mut self) {
+        self.busy = false;
+        self.settle();
+    }
+
+    fn fold_message(&mut self, m: &Value, reuse: &mut Reuse) {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
         let content = m.get("content").unwrap_or(&Value::Null);
         match (role, content) {
@@ -204,7 +408,7 @@ impl Transcript {
             }
             (_, Value::Array(blocks)) => {
                 let mut text = String::new();
-                let flush = |this: &mut Self, text: &mut String, reuse: &mut Vec<(ItemKind, u64)>| {
+                let flush = |this: &mut Self, text: &mut String, reuse: &mut Reuse| {
                     if !text.trim().is_empty() {
                         let kind = if role == "assistant" { ItemKind::Assistant } else { ItemKind::User };
                         this.push(kind, std::mem::take(text), None, false, reuse);
@@ -289,9 +493,11 @@ impl Transcript {
         self.tools.get(tool_id).copied().filter(|&ix| ix < self.items.len())
     }
 
+    /// A client-side row: kept across history refolds.
     fn notice(&mut self, kind: ItemKind, text: impl Into<String>) {
         self.end_streaming_text();
-        self.push_new(kind, text.into(), None, false);
+        let ix = self.push_new(kind, text.into(), None, false);
+        self.items[ix].anchor = Some(self.history_len);
     }
 
     /// Apply one live session event.
@@ -305,16 +511,14 @@ impl Transcript {
             }
             SessionEvent::Stream { event } => self.apply_stream(event),
             SessionEvent::Conversation { digest } => {
-                if let Some(t) = digest.pointer("/header/title").and_then(Value::as_str) {
+                if let Some(t) = digest.header.get("title").and_then(Value::as_str) {
                     self.title = Some(t.to_string());
                 }
-                if let Some(c) = digest.get("cost").and_then(Value::as_f64) {
-                    self.cost_usd = c;
-                }
+                self.cost_usd = digest.cost;
             }
             SessionEvent::Idle => {
                 self.busy = false;
-                self.end_streaming_text();
+                self.settle();
             }
             SessionEvent::Prompt { request } => self.pending_prompts.push(request.clone()),
             SessionEvent::PromptResolved { prompt_id } => self.pending_prompts.retain(|p| p.id != *prompt_id),
@@ -322,9 +526,25 @@ impl Transcript {
             SessionEvent::SystemNotice { text } => self.notice(ItemKind::Notice, text.clone()),
             SessionEvent::Aborted { .. } => {
                 self.busy = false;
+                self.settle();
                 self.notice(ItemKind::Notice, "turn aborted");
             }
             SessionEvent::Ended { reason } => self.notice(ItemKind::Notice, format!("session ended ({reason})")),
+            SessionEvent::Cleared { .. } => {
+                self.swapped = true;
+                self.notice(ItemKind::Notice, "conversation cleared");
+            }
+            SessionEvent::Resumed { new_id, clamp_notice, .. } => {
+                self.swapped = true;
+                self.notice(ItemKind::Notice, format!("resumed {new_id}"));
+                if let Some(n) = clamp_notice {
+                    self.notice(ItemKind::Notice, n.clone());
+                }
+            }
+            SessionEvent::CompactionApplied { msg_count, .. } => {
+                self.swapped = true;
+                self.notice(ItemKind::Notice, format!("conversation compacted ({msg_count} messages)"));
+            }
             SessionEvent::CompactionFailed { message } => self.notice(ItemKind::Error, format!("compaction failed: {message}")),
             SessionEvent::SubagentRows { rows } => self.subagents = rows.clone(),
             SessionEvent::Reloading { .. } => self.notice(ItemKind::Notice, "daemon reloading, reconnecting..."),

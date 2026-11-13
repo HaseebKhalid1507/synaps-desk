@@ -8,16 +8,20 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+/// `$HOME`, else `%USERPROFILE%`: Synaps' order. On Windows a GUI started
+/// from Explorer usually has no `HOME` while a daemon auto-started from a
+/// shell (Git Bash, MSYS) may have one, so the two can look in different
+/// run dirs; pass an explicit socket or `SYNAPS_BASE_DIR` if they disagree.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
+}
+
 /// `$SYNAPS_BASE_DIR`, else `$HOME/.synaps-cli` (`%USERPROFILE%` on Windows).
 pub fn base_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("SYNAPS_BASE_DIR") {
         return PathBuf::from(p);
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".synaps-cli")
+    home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".synaps-cli")
 }
 
 /// `$SYNAPS_RUNTIME_DIR`, else `<base>/run`.
@@ -77,7 +81,9 @@ pub fn find_in(dir: &Path, profile: Option<&str>) -> Option<DaemonInfo> {
     read_info(&dir.join(format!("{}.json", stem(profile))))
 }
 
-/// The registry entry for `profile` in the default run dir.
+/// The registry entry for `profile` in the default run dir. `None` is the
+/// default daemon: pass `std::env::var("SYNAPS_PROFILE")` yourself, or use
+/// [`crate::Endpoint::from_env`], to honour `SYNAPS_PROFILE` as the TUI does.
 pub fn find(profile: Option<&str>) -> Option<DaemonInfo> {
     find_in(&run_dir(), profile)
 }
