@@ -477,8 +477,14 @@ impl Pack {
     }
 
     pub fn tone(&self, key: Option<&str>) -> u32 {
-        let fallback = 0x8ef5ed;
-        key.and_then(|k| self.behaviour.tones.get(k))
+        key.map_or(0x8ef5ed, |k| self.tone_or(k, 0x8ef5ed))
+    }
+
+    /// A `#rrggbb` colour from the sidecar's `tones`, or `fallback`.
+    pub fn tone_or(&self, key: &str, fallback: u32) -> u32 {
+        self.behaviour
+            .tones
+            .get(key)
             .and_then(|hex| u32::from_str_radix(hex.trim_start_matches('#'), 16).ok())
             .unwrap_or(fallback)
     }

@@ -6,7 +6,9 @@ use crate::anim::{Animator, Mood, Rng, Seq};
 use crate::control::Command;
 use crate::frames::{Frame, Geometry};
 use crate::pack::{MoodSpec, Pack};
-use crate::platform::x11::{ShapeRect, X11};
+use crate::platform::x11::X11;
+use crate::shape::{self, ShapeRect};
+use crate::ticker::Ticker;
 use crate::state;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -24,27 +26,48 @@ pub struct Layout {
     pub win_h: i32,
     pub avatar_x: i32,
     pub avatar_y: i32,
+    /// Horizontal centre of the character (canonical anchor x).
+    pub face_x: i32,
+    pub tag_bottom: i32,
     pub bubble_bottom: i32,
-    pub tag_y: i32,
     /// Ground point (the feet) inside the window.
     pub ground_x: i32,
     pub ground_y: i32,
 }
 
+// Logical px. The HUD numbers follow Capri's own CSS (cyberpunk.css, avatar-detach.css).
 const MARGIN: f32 = 8.0;
-const BUBBLE_AREA: f32 = 196.0;
-const TAG_ROW: f32 = 24.0;
-const MIN_WIDTH: f32 = 360.0;
+const TOP_MARGIN: f32 = 6.0;
+const BODY_FONT: f32 = 18.0;
+const BODY_LINE: f32 = 24.0;
+const BODY_MAX_H: f32 = 5.0 * BODY_LINE;
+/// Padding 12 + 14, title 12 + gap 5, body.
+const BUBBLE_MAX_H: f32 = 26.0 + 17.0 + BODY_MAX_H;
+const BUBBLE_MAX_W: f32 = 460.0;
+const BUBBLE_GAP: f32 = 9.0;
+const TAG_FONT: f32 = 10.0;
+/// Font line + padding 4 + 4 + border 1 + 1.
+const TAG_H: f32 = TAG_FONT + 1.0 + 10.0;
+const TAG_GAP: f32 = 4.0;
+const MIN_WIDTH: f32 = 500.0;
+const CUT: f32 = 12.0;
+const OUTLINE: f32 = 2.0;
+const TAIL_W: f32 = 22.0;
+const TAIL_H: f32 = 14.0;
 
 impl Layout {
     pub fn new(pack: &Pack, sf: f32, body_height: f32) -> Layout {
         let geo = Geometry::new(pack, body_height * sf);
         let d = |l: f32| (l * sf).round() as i32;
         let win_w = (geo.width as i32).max(d(MIN_WIDTH));
-        let bubble_bottom = d(BUBBLE_AREA);
-        let tag_y = bubble_bottom + d(4.0);
-        let avatar_y = tag_y + d(TAG_ROW);
         let avatar_x = (win_w - geo.width as i32) / 2;
+        // Top of the standing (default) frame inside the avatar rect.
+        let default = &pack.frames[pack.frame(&pack.catalog.default_sprite).unwrap_or(0)];
+        let (_, dy) = pack.offset(default);
+        let (_, head) = geo.to_device(0, default.bounds.y + dy);
+        let head_top = d(TOP_MARGIN + BUBBLE_MAX_H + BUBBLE_GAP + TAG_H + TAG_GAP);
+        let avatar_y = head_top - head.round() as i32;
+        let tag_bottom = head_top - d(TAG_GAP);
         let c = pack.catalog.canonical_anchor;
         let (gx, gy) = geo.to_device(c.x, c.y);
         Layout {
@@ -54,8 +77,9 @@ impl Layout {
             win_h: avatar_y + geo.height as i32,
             avatar_x,
             avatar_y,
-            bubble_bottom,
-            tag_y,
+            face_x: avatar_x + gx.round() as i32,
+            tag_bottom,
+            bubble_bottom: tag_bottom - d(TAG_H) - d(BUBBLE_GAP),
             ground_x: avatar_x + gx.round() as i32,
             ground_y: avatar_y + gy.round() as i32,
         }
@@ -107,12 +131,16 @@ pub struct Avatar {
     press: Option<Press>,
     streak: (u32, Instant),
     origin: (i32, i32),
-    timer: Option<Task<()>>,
+    ticker: Ticker,
+    _tick_loop: Task<()>,
     last_shape: Rc<RefCell<(Vec<ShapeRect>, Vec<ShapeRect>)>>,
     t_start: Instant,
     first_frame: Rc<Cell<bool>>,
     focus: FocusHandle,
     focus_probe: Option<String>,
+    warmed: bool,
+    /// Horizontal device-px range of the window that is on the avatar's monitor.
+    vis: (i32, i32),
 }
 
 pub struct Init {
@@ -130,6 +158,15 @@ impl Avatar {
         let pack = init.pack;
         let default = pack.frame(&pack.catalog.default_sprite).unwrap_or(0);
         let font = pack.behaviour.font.clone().unwrap_or_else(|| "Fira Sans".into());
+        let vis = Self::visible_range(&init.x11, &init.layout, init.origin);
+        let (ticker, wake) = Ticker::start();
+        let tick_loop = cx.spawn(async move |this, cx| {
+            while wake.recv().await.is_ok() {
+                if this.update(cx, |v, cx| v.tick(cx)).is_err() {
+                    break;
+                }
+            }
+        });
         Avatar {
             frames: (0..pack.frames.len()).map(|_| None).collect(),
             anim: Animator::new(default),
@@ -150,12 +187,15 @@ impl Avatar {
             press: None,
             streak: (0, Instant::now()),
             origin: init.origin,
-            timer: None,
+            ticker,
+            _tick_loop: tick_loop,
             last_shape: Rc::new(RefCell::new((vec![(0, 0, 1, 1)], vec![]))),
             t_start: init.t_start,
             first_frame: Rc::new(Cell::new(false)),
             focus: cx.focus_handle(),
             focus_probe: init.focus_probe.then(String::new),
+            warmed: false,
+            vis,
         }
     }
 
@@ -259,20 +299,15 @@ impl Avatar {
         t
     }
 
-    fn schedule(&mut self, cx: &mut Context<Self>) {
-        let Some(at) = self.next_deadline() else {
-            self.timer = None;
-            return;
-        };
-        let delay = at.saturating_duration_since(Instant::now());
-        self.timer = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(delay).await;
-            this.update(cx, |v, cx| v.tick(cx)).ok();
-        }));
+    fn schedule(&mut self, _cx: &mut Context<Self>) {
+        self.ticker.set(self.next_deadline());
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
+        if std::env::var_os("SA_DEBUG").is_some() {
+            eprintln!("tick at {} ms", self.t_start.elapsed().as_millis());
+        }
         self.anim.tick(now);
         if let Some((at, m)) = self.mood_then
             && at <= now
@@ -309,15 +344,17 @@ impl Avatar {
             if let Some(at) = b.hide_at
                 && at <= now
             {
-                b.fade -= 1.0 / FADE_STEPS as f32;
+                // No compositor, no alpha: skip the fade rather than dim to black.
+                b.fade = if self.x11.composited() { b.fade - 1.0 / FADE_STEPS as f32 } else { 0.0 };
                 b.hide_at = Some(now + FADE_TICK);
             }
             if b.fade <= 0.01 {
                 self.bubble = None;
             }
         }
+        // Keep SPEAKING up a beat after the last word, then settle.
         if typed_out && self.mood == Mood::Talking {
-            self.set_mood(Mood::Idle, now);
+            self.mood_then = Some((now + Duration::from_millis(1_400), Mood::Idle));
         }
         if let Some((t0, _)) = self.hearts
             && now.duration_since(t0) >= Duration::from_millis(HEARTS_MS)
@@ -395,6 +432,8 @@ impl Avatar {
         self.bubble = Some(Bubble { text, shown: 0, per_tick, next_char: Some(now), hide_at: None, fade: 1.0 });
         if self.mood != Mood::Talking {
             self.set_mood(Mood::Talking, now);
+        } else {
+            self.mood_then = None;
         }
     }
 
@@ -407,8 +446,10 @@ impl Avatar {
     fn state_json(&self) -> String {
         let frame = self.frame_or_default(self.anim.frame()).map(|f| f.id.clone()).unwrap_or_default();
         let (gx, gy) = self.ground();
+        let m = self.x11.monitor_at(gx, gy - 1);
         serde_json::json!({
             "mood": self.mood.key(),
+            "monitor": { "x": m.x, "y": m.y, "w": m.w, "h": m.h },
             "frame": frame,
             "status": self.status().0,
             "window": { "x": self.origin.0, "y": self.origin.1, "w": self.layout.win_w, "h": self.layout.win_h },
@@ -450,12 +491,19 @@ impl Avatar {
         (x, y)
     }
 
+    /// Which part of the window is on the avatar's monitor; the bubble stays inside it.
+    fn visible_range(x11: &X11, l: &Layout, o: (i32, i32)) -> (i32, i32) {
+        let m = x11.monitor_at(o.0 + l.avatar_x + l.geo.width as i32 / 2, o.1 + l.avatar_y + l.geo.height as i32 / 2);
+        ((m.x - o.0).max(0), (m.x + m.w - o.0).min(l.win_w))
+    }
+
     fn move_to(&mut self, o: (i32, i32), persist: bool) {
         let o = Self::clamp(&self.x11, &self.layout, o);
         if o != self.origin {
             self.origin = o;
             self.x11.move_to(o.0, o.1).ok();
         }
+        self.vis = Self::visible_range(&self.x11, &self.layout, o);
         if persist {
             state::save(self.ground());
         }
@@ -555,9 +603,16 @@ impl Avatar {
     }
 }
 
-/// A zero-cost child that reports its parent's laid-out bounds.
-fn bounds_probe(cell: Rc<Cell<Option<Bounds<Pixels>>>>) -> impl IntoElement {
-    canvas(move |b, _, _| cell.set(Some(b)), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
+type Cell2 = Rc<Cell<Option<Bounds<Pixels>>>>;
+
+/// Wraps `child` in a plain box whose laid-out bounds (= the child's border box) land
+/// in `cell` during prepaint, for the X shape.
+fn probed(child: impl IntoElement, cell: &Cell2) -> Div {
+    let cell = cell.clone();
+    div()
+        .relative()
+        .child(child)
+        .child(canvas(move |b, _, _| cell.set(Some(b)), |_, _, _, _| {}).absolute().top_0().left_0().size_full())
 }
 
 fn to_device(b: Bounds<Pixels>, sf: f32) -> ShapeRect {
@@ -568,40 +623,94 @@ fn to_device(b: Bounds<Pixels>, sf: f32) -> ShapeRect {
     (x0 as i16, y0 as i16, (x1 - x0).max(1.0) as u16, (y1 - y0).max(1.0) as u16)
 }
 
-const CYAN: u32 = 0x8ef5ed;
-const PANEL: u32 = 0x0a1318;
-const TEXT: u32 = 0xe5edf0;
-const DIM: u32 = 0x7d8d96;
-const NAME: u32 = 0xf4ed75;
-const SLASH: u32 = 0xff5679;
-
-fn with_alpha(rgb: u32, a: u8) -> Rgba {
-    rgba((rgb << 8) | a as u32)
+fn with_alpha(rgb: u32, a: f32) -> Rgba {
+    rgba((rgb << 8) | (a.clamp(0.0, 1.0) * 255.0).round() as u32)
 }
+
+/// HUD lettering with CSS-style letter-spacing (GPUI has none): one box per glyph.
+fn tracked(s: &str, spacing: f32) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .children(s.chars().map(|c| div().mr(px(spacing)).child(if c == ' ' { "\u{00A0}".to_string() } else { c.to_string() })))
+}
+
+struct Palette {
+    frame: u32,
+    accent: u32,
+    surface: u32,
+    text: u32,
+    dim: u32,
+    name: u32,
+    slash: u32,
+}
+
+const HEARTS: [(f32, f32, f32, f32, u32); 4] = [
+    // dx, dy, size, delay ms, colour
+    (-10.0, -46.0, 24.0, 0.0, 0xff3e83),
+    (29.0, -36.0, 17.0, 65.0, 0xffa7dc),
+    (-34.0, -25.0, 12.0, 135.0, 0xff1f63),
+    (15.0, -63.0, 9.0, 180.0, 0xffe0f0),
+];
 
 impl Render for Avatar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let l = self.layout;
+        let sf = l.sf;
         if std::env::var_os("SA_DEBUG").is_some() {
-            eprintln!("render: frame {} loaded {} at {} ms", self.anim.frame(), self.loaded, self.t_start.elapsed().as_millis());
+            eprintln!(
+                "render: frame {} loaded {} shown {:?} at {} ms",
+                self.anim.frame(),
+                self.loaded,
+                self.bubble.as_ref().map(|b| b.shown),
+                self.t_start.elapsed().as_millis()
+            );
         }
+        let composited = self.x11.composited();
+        let pal = Palette {
+            frame: self.pack.tone_or("frame", 0x8ef5ed),
+            accent: self.pack.tone_or("accent", 0xc6fcf0),
+            surface: self.pack.tone_or("surface", 0x0c131a),
+            text: self.pack.tone_or("text", 0xe5edf0),
+            dim: self.pack.tone_or("dim", 0x93adba),
+            name: self.pack.tone_or("name", 0xf4ed75),
+            slash: self.pack.tone_or("slash", 0xff3c68),
+        };
         let frame = self.frame_or_default(self.anim.frame());
         let image = frame.map(|f| f.image.clone());
         let rects = frame.map(|f| f.rects.clone()).unwrap_or_default();
+        let has_frame = frame.is_some();
+        // The tag rides just above the current frame's head (sitting poses are lower).
+        let tag_bottom = frame.map_or(l.tag_bottom, |f| (l.avatar_y + f.top - (TAG_GAP * sf).round() as i32).max(l.tag_bottom));
         let entity = cx.entity();
+        // Once every frame is decoded, upload them all to the sprite atlas in one go so the
+        // first switch to a new frame never stalls on an upload.
+        let warm: Vec<Arc<RenderImage>> = if self.loaded && !self.warmed {
+            self.warmed = true;
+            self.frames.iter().flatten().map(|f| f.image.clone()).collect()
+        } else {
+            Vec::new()
+        };
 
-        let bubble_cell: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
-        let menu_cell: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
-        let tag_cell: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
-        let hearts_cell: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+        let bubble_cell: Cell2 = Rc::new(Cell::new(None));
+        let menu_cell: Cell2 = Rc::new(Cell::new(None));
+        let tag_cell: Cell2 = Rc::new(Cell::new(None));
 
-        let mut root = div().size_full().relative().font_family(self.font.clone()).text_color(rgb(TEXT));
+        let mut root = div().size_full().relative().font_family(self.font.clone()).text_color(rgb(pal.text));
 
         // The body.
         root = root.child(
             canvas(
                 |_, _, _| (),
                 move |bounds, _, window, _| {
+                    if !warm.is_empty() {
+                        let off = ContentMask { bounds: Bounds::new(point(px(-8.0), px(-8.0)), size(px(1.0), px(1.0))) };
+                        window.with_content_mask(Some(off), |window| {
+                            for img in warm {
+                                window.paint_image(bounds, bounds, Corners::default(), img, 0, false).ok();
+                            }
+                        });
+                    }
                     if let Some(img) = image {
                         window.paint_image(bounds, bounds, Corners::default(), img, 0, false).ok();
                     }
@@ -632,104 +741,147 @@ impl Render for Avatar {
             .h(l.lp(l.geo.height as i32)),
         );
 
-        // Status tag: NAME // STATUS, with a HUD rail running off to the right.
-        if self.loaded || self.frames.iter().any(Option::is_some) {
+        // Status tag, just above the head.
+        if self.frames.iter().any(Option::is_some) {
             let (label, tone) = self.status();
+            let tag = div()
+                .flex()
+                .items_center()
+                .px(px(9.0))
+                .py(px(4.0))
+                .border_1()
+                .border_color(rgb(tone))
+                .bg(with_alpha(pal.surface, 0.97))
+                .text_color(rgb(tone))
+                .text_size(px(TAG_FONT))
+                .line_height(px(TAG_FONT + 1.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(tracked(&label, 1.6));
             root = root.child(
                 div()
                     .absolute()
-                    .left(px(MARGIN))
-                    .right(px(MARGIN))
-                    .top(l.lp(l.tag_y))
-                    .h(px(TAG_ROW - 4.0))
+                    .left_0()
+                    .w(l.lp(l.win_w))
+                    .bottom(l.lp(l.win_h - tag_bottom))
                     .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .relative()
-                            .flex_none()
-                            .px(px(8.0))
-                            .py(px(3.0))
-                            .border_1()
-                            .border_color(rgb(tone))
-                            .bg(with_alpha(0x091218, 0xf0))
-                            .text_color(rgb(tone))
-                            .text_size(px(10.0))
-                            .line_height(px(12.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .whitespace_nowrap()
-                            .child(format!("{} // {}", self.name, label))
-                            .child(bounds_probe(tag_cell.clone())),
-                    )
-                    .child(div().flex_1().h(px(1.0)).bg(with_alpha(tone, 0x70)))
-                    .child(div().flex_none().w(px(14.0)).h(px(3.0)).bg(rgb(tone))),
+                    .justify_center()
+                    // Centre on the face, not the window.
+                    .pl(l.lp(2 * l.face_x - l.win_w).max(px(0.0)))
+                    .pr(l.lp(l.win_w - 2 * l.face_x).max(px(0.0)))
+                    .child(probed(tag, &tag_cell)),
             );
         }
 
         // Speech bubble (or the focus-probe input).
+        let fade = self.bubble.as_ref().map_or(1.0, |b| if composited { b.fade.max(0.0) } else { 1.0 });
         let bubble = if let Some(text) = &self.focus_probe {
             let focused = self.focus.is_focused(window);
-            let body = if text.is_empty() { "click here, then type".to_string() } else { format!("{text}▏") };
-            Some((format!("{}", if focused { "FOCUS PROBE // KEYBOARD OK" } else { "FOCUS PROBE" }), body, 1.0, true))
+            let body = if text.is_empty() { "click here, then type".to_string() } else { text.clone() };
+            Some((if focused { "FOCUS PROBE // KEYS OK" } else { "FOCUS PROBE // CLICK ME" }.to_string(), body, true))
         } else {
-            self.bubble.as_ref().map(|b| {
-                let mut s: String = b.text[..b.shown].iter().collect();
-                if b.next_char.is_some() {
-                    s.push('▍');
-                }
-                ("INCOMING TRANSMISSION".to_string(), s, b.fade.max(0.0), false)
-            })
+            self.bubble.as_ref().map(|b| ("INCOMING TRANSMISSION".to_string(), b.text[..b.shown].iter().collect(), false))
         };
-        if let Some((header, body, fade, probe)) = bubble {
+        let show_tail = bubble.is_some();
+        if let Some((header, body, probe)) = bubble {
+            let (vis_l, vis_r) = self.vis;
+            let max_w = ((vis_r - vis_l) as f32 / sf - 2.0 * MARGIN).min(BUBBLE_MAX_W);
+            let (frame_c, accent_c, bar_c, surface_c) = (pal.frame, pal.accent, pal.slash, pal.surface);
+            let panel_bg = canvas(
+                |_, _, _| (),
+                move |b, _, window, _| {
+                    let (x, y) = (f32::from(b.origin.x), f32::from(b.origin.y));
+                    let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
+                    let poly = |inset: f32| {
+                        let c = CUT.min(w / 4.0).min(h / 3.0);
+                        let d = c + inset * (std::f32::consts::SQRT_2 - 1.0);
+                        [
+                            (x + d, y + inset),
+                            (x + w - inset, y + inset),
+                            (x + w - inset, y + h - d),
+                            (x + w - d, y + h - inset),
+                            (x + inset, y + h - inset),
+                            (x + inset, y + d),
+                        ]
+                    };
+                    let pts = |v: &[(f32, f32)]| v.iter().map(|&(x, y)| point(px(x), px(y))).collect::<Vec<_>>();
+                    let mut surface = PathBuilder::fill();
+                    surface.add_polygon(&pts(&poly(0.0)), true);
+                    if let Ok(p) = surface.build() {
+                        window.paint_path(p, with_alpha(surface_c, 0.94 * fade));
+                    }
+                    let inset = OUTLINE / 2.0 + 0.35;
+                    let mut edge = PathBuilder::stroke(px(OUTLINE));
+                    edge.add_polygon(&pts(&poly(inset)), true);
+                    if let Ok(p) = edge.build() {
+                        window.paint_path(p, with_alpha(frame_c, 0.74 * fade));
+                    }
+                    // The bright tab: a 40 px run of the outline, 27 px along the top edge.
+                    let x0 = poly(inset)[0].0 + 27.0;
+                    let mut tab = PathBuilder::stroke(px(OUTLINE));
+                    tab.move_to(point(px(x0), px(y + inset)));
+                    tab.line_to(point(px((x0 + 40.0).min(x + w - inset)), px(y + inset)));
+                    if let Ok(p) = tab.build() {
+                        window.paint_path(p, with_alpha(accent_c, 0.9 * fade));
+                    }
+                    // Signal bar down the left side.
+                    if h > 34.0 {
+                        window.paint_quad(fill(
+                            Bounds::new(point(px(x + 7.0), px(y + 16.0)), size(px(2.0), px(h - 28.0))),
+                            with_alpha(bar_c, fade),
+                        ));
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full();
             let mut panel = div()
                 .id("bubble")
                 .relative()
-                .max_w(px(l.win_w as f32 / l.sf - 2.0 * MARGIN))
-                .min_w(px(150.0))
+                .max_w(px(max_w))
+                .min_w(px(200.0))
                 .flex()
                 .flex_col()
                 .gap(px(5.0))
-                .px(px(13.0))
-                .pt(px(9.0))
-                .pb(px(11.0))
-                .bg(with_alpha(PANEL, 0xf2))
-                .border_1()
-                .border_color(with_alpha(CYAN, 0x8a))
-                .opacity(fade)
+                .pt(px(12.0))
+                .pr(px(15.0))
+                .pb(px(14.0))
+                .pl(px(19.0))
+                .child(panel_bg)
                 .child(
                     div()
                         .flex()
-                        .gap(px(5.0))
-                        .text_size(px(10.0))
+                        .items_center()
+                        .gap(px(9.0))
                         .line_height(px(12.0))
-                        .font_weight(FontWeight::BOLD)
-                        .whitespace_nowrap()
-                        .child(div().text_color(rgb(NAME)).child(self.name.clone()))
-                        .child(div().text_color(rgb(SLASH)).child("/"))
-                        .child(div().text_color(rgb(DIM)).child(header)),
-                )
-                .child(
-                    div()
-                        .max_h(px(150.0))
-                        .overflow_hidden()
-                        .flex()
-                        .flex_col()
-                        .justify_end()
                         .child(
                             div()
-                                .flex_none()
-                                .text_size(px(15.0))
-                                .line_height(px(20.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(body),
+                                .flex()
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child(tracked(&self.name, 1.8).text_color(with_alpha(pal.name, fade)))
+                                .child(div().ml(px(2.0)).text_color(with_alpha(pal.slash, fade)).child("/")),
+                        )
+                        .child(
+                            tracked(&header, 1.5)
+                                .text_size(px(9.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(with_alpha(pal.dim, fade)),
                         ),
                 )
-                // Corner tabs: brighter segments on the frame, HUD-style.
-                .child(div().absolute().top(px(-1.0)).left(px(14.0)).w(px(46.0)).h(px(2.0)).bg(rgb(CYAN)))
-                .child(div().absolute().bottom(px(-1.0)).right(px(18.0)).w(px(22.0)).h(px(2.0)).bg(rgb(CYAN)))
-                .child(div().absolute().top(px(-1.0)).right(px(-1.0)).w(px(9.0)).h(px(2.0)).bg(rgb(CYAN)))
-                .child(div().absolute().top(px(-1.0)).right(px(-1.0)).w(px(2.0)).h(px(9.0)).bg(rgb(CYAN)))
-                .child(bounds_probe(bubble_cell.clone()));
+                .child(
+                    // Long text keeps its tail in view: bottom-aligned, clipped at the top.
+                    div().max_h(px(BODY_MAX_H)).overflow_hidden().flex().flex_col().justify_end().child(
+                        div()
+                            .flex_none()
+                            .text_size(px(BODY_FONT))
+                            .line_height(px(BODY_LINE))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(with_alpha(pal.text, fade))
+                            .child(body),
+                    ),
+                );
             if probe {
                 panel = panel
                     .track_focus(&self.focus)
@@ -741,7 +893,7 @@ impl Render for Avatar {
                             window.focus(&this.focus, cx);
                             let fw = this.x11.focused_window().unwrap_or(0);
                             eprintln!(
-                                "focus-probe: SetInputFocus {:?}; X focus now 0x{fw:x} (ours 0x{:x})",
+                                "focus-probe: SetInputFocus err={:?}; X focus now 0x{fw:x} (ours 0x{:x})",
                                 r.err(),
                                 this.x11.win
                             );
@@ -769,140 +921,152 @@ impl Render for Avatar {
             root = root.child(
                 div()
                     .absolute()
-                    .left(px(MARGIN))
-                    .right(px(MARGIN))
+                    .left(l.lp(vis_l) + px(MARGIN))
+                    .right(l.lp(l.win_w - vis_r) + px(MARGIN))
                     .bottom(l.lp(l.win_h - l.bubble_bottom))
                     .flex()
                     .justify_center()
-                    .child(panel),
+                    .items_end()
+                    .child(probed(panel, &bubble_cell)),
             );
-        }
-
-        // Headpat hearts.
-        if let Some((t0, at)) = self.hearts {
-            let t = Instant::now().duration_since(t0).as_millis() as f32;
-            let specs: [(f32, f32, f32, f32, u32); 4] = [
-                (-10.0, -46.0, 24.0, 0.0, 0xff3e83),
-                (29.0, -36.0, 17.0, 65.0, 0xffa7dc),
-                (-34.0, -25.0, 12.0, 135.0, 0xff1f63),
-                (15.0, -63.0, 9.0, 180.0, 0xffe0f0),
-            ];
-            let mut hearts = div()
-                .absolute()
-                .left(at.x - px(60.0))
-                .top(at.y - px(90.0))
-                .w(px(120.0))
-                .h(px(110.0))
-                .child(bounds_probe(hearts_cell.clone()));
-            for (x, y, size, delay, color) in specs {
-                let p = ((t - delay) / 1040.0).clamp(0.0, 1.0);
-                if p <= 0.0 {
-                    continue;
-                }
-                let ease = 1.0 - (1.0 - p).powi(3);
-                let alpha = if p < 0.18 { p / 0.18 } else if p < 0.58 { 1.0 } else { 1.0 - (p - 0.58) / 0.42 };
-                let scale = if p < 0.18 { 0.22 + 0.9 * p / 0.18 } else { 1.12 - 0.4 * (p - 0.18) / 0.82 };
-                let s = size * scale;
-                hearts = hearts.child(
-                    div()
-                        .absolute()
-                        .left(px(60.0 + x * ease - s / 2.0))
-                        .top(px(90.0 + y * ease - s / 2.0))
-                        .text_size(px(s))
-                        .line_height(px(s))
-                        .text_color(rgb(color))
-                        .opacity(alpha.clamp(0.0, 1.0))
-                        .child("♥"),
-                );
-            }
-            root = root.child(hearts);
         }
 
         // Context menu.
         if let Some((at, _)) = self.menu {
+            let frame_c = pal.frame;
             let item = |label: &'static str| {
                 div()
                     .px(px(10.0))
                     .py(px(5.0))
                     .text_size(px(11.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(CYAN))
-                    .hover(|s| s.bg(with_alpha(CYAN, 0x30)))
-                    .child(label)
+                    .text_color(rgb(frame_c))
+                    .hover(|s| s.bg(with_alpha(frame_c, 0.2)))
+                    .child(tracked(label, 1.2))
             };
-            let max_x = px(l.win_w as f32 / l.sf - 150.0);
+            let max_x = l.lp(self.vis.1) - px(150.0);
+            let menu = div()
+                .w(px(140.0))
+                .flex()
+                .flex_col()
+                .py(px(4.0))
+                .bg(with_alpha(pal.surface, 0.97))
+                .border_1()
+                .border_color(with_alpha(pal.frame, 0.62))
+                .child(item("RESET POSITION").id("reset").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.reset_position(cx);
+                    }),
+                ))
+                .child(item("HIDE").id("hide").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.quit(cx);
+                    }),
+                ));
             root = root.child(
                 div()
                     .absolute()
                     .left(if at.x > max_x { max_x } else { at.x })
                     .top(at.y)
-                    .w(px(140.0))
-                    .flex()
-                    .flex_col()
-                    .py(px(4.0))
-                    .bg(with_alpha(PANEL, 0xf5))
-                    .border_1()
-                    .border_color(with_alpha(CYAN, 0x8a))
-                    .child(item("RESET POSITION").id("reset").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.reset_position(cx);
-                        }),
-                    ))
-                    .child(item("HIDE").id("hide").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.quit(cx);
-                        }),
-                    ))
-                    .child(bounds_probe(menu_cell.clone())),
+                    .child(probed(menu, &menu_cell)),
             );
         }
 
-        // Last: push the input/bounding shape for exactly what this frame draws.
+        // Last: the bubble tail and headpat hearts (they need the laid-out bubble and the
+        // click point), then the X input/bounding shape for exactly what this frame draws.
         let (ax, ay) = (l.avatar_x as i16, l.avatar_y as i16);
         let x11 = self.x11.clone();
         let last = self.last_shape.clone();
         let first = self.first_frame.clone();
         let t_start = self.t_start;
-        let has_frame = frame.is_some();
         let ground_px = (l.ground_x as i16, (l.ground_y - 1) as i16, 1u16, 1u16);
-        root.child(canvas(
-            |_, _, _| (),
-            move |_, _, window, _| {
-                let sf = window.scale_factor();
-                let mut input: Vec<ShapeRect> = rects.iter().map(|r| (r.0 + ax, r.1 + ay, r.2, r.3)).collect();
-                for c in [&bubble_cell, &menu_cell] {
-                    if let Some(b) = c.get() {
+        let face_x = l.face_x as f32 / sf;
+        let hearts = self.hearts.map(|(t0, at)| (Instant::now().duration_since(t0).as_millis() as f32, at));
+        root.child(
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    let mut input: Vec<ShapeRect> = rects.iter().map(|r| (r.0 + ax, r.1 + ay, r.2, r.3)).collect();
+                    let mut visible = input.clone();
+                    let dev = |pts: &[(f32, f32)]| pts.iter().map(|&(x, y)| (x * sf, y * sf)).collect::<Vec<_>>();
+
+                    if let Some(b) = bubble_cell.get() {
                         input.push(to_device(b, sf));
+                        let (bx, by) = (f32::from(b.origin.x), f32::from(b.origin.y));
+                        let (bw, bh) = (f32::from(b.size.width), f32::from(b.size.height));
+                        let c = CUT.min(bw / 4.0).min(bh / 3.0);
+                        let outline = [(bx + c, by), (bx + bw, by), (bx + bw, by + bh - c), (bx + bw - c, by + bh), (bx, by + bh), (bx, by + c)];
+                        shape::poly_rows(&dev(&outline), &mut visible);
+                        if show_tail {
+                            // Capri's tail: a cyan wedge hanging off the bottom edge, its point
+                            // leaning toward the head, set just left of the status tag.
+                            let bottom = by + bh;
+                            let anchor = tag_cell.get().map_or(face_x - 24.0, |t| f32::from(t.origin.x) - 4.0);
+                            let right = anchor.min(bx + bw - c - 6.0).max(bx + 30.0);
+                            let left = right - TAIL_W;
+                            let tri = [(left, bottom - 1.0), (left + TAIL_W * 0.8, bottom - 1.0), (right, bottom + TAIL_H)];
+                            let mut wedge = PathBuilder::fill();
+                            wedge.add_polygon(&tri.map(|(x, y)| point(px(x), px(y))), true);
+                            if let Ok(p) = wedge.build() {
+                                window.paint_path(p, with_alpha(pal.frame, 0.8 * fade));
+                            }
+                            shape::poly_rows(&dev(&tri), &mut visible);
+                        }
                     }
-                }
-                let mut visible = input.clone();
-                for c in [&tag_cell, &hearts_cell] {
-                    if let Some(b) = c.get() {
+                    if let Some(b) = menu_cell.get() {
+                        input.push(to_device(b, sf));
                         visible.push(to_device(b, sf));
                     }
-                }
-                // Never an empty bounding shape: X then reports the window fully obscured
-                // and GPUI stops drawing it for good.
-                if visible.is_empty() {
-                    visible.push(ground_px);
-                }
-                let mut last = last.borrow_mut();
-                if last.0 != input || last.1 != visible {
-                    x11.set_shape(&input, &visible).ok();
-                    *last = (input, visible);
-                }
-                if has_frame && !first.get() {
-                    first.set(true);
-                    eprintln!("first-frame: painted {} ms after process start", t_start.elapsed().as_millis());
-                    window.on_next_frame(move |_, _| {
-                        eprintln!("first-frame: next frame callback {} ms after process start", t_start.elapsed().as_millis());
-                    });
-                }
-            },
-        ))
+                    if let Some(b) = tag_cell.get() {
+                        visible.push(to_device(b, sf));
+                    }
+                    if let Some((t, at)) = hearts {
+                        let (ox, oy) = (f32::from(at.x), f32::from(at.y).max(70.0));
+                        for (dx, dy, size, delay, color) in HEARTS {
+                            let p = ((t - delay) / 1040.0).clamp(0.0, 1.0);
+                            if p <= 0.0 || p >= 1.0 {
+                                continue;
+                            }
+                            let ease = 1.0 - (1.0 - p).powi(3);
+                            let alpha = if p < 0.18 { p / 0.18 } else if p < 0.58 { 1.0 } else { 1.0 - (p - 0.58) / 0.42 };
+                            let scale = if p < 0.18 { 0.22 + 0.9 * p / 0.18 } else { 1.12 - 0.4 * (p - 0.18) / 0.82 };
+                            let pts = shape::heart(ox + dx * ease, oy + dy * ease, size * scale);
+                            let mut pb = PathBuilder::fill();
+                            pb.add_polygon(&pts.iter().map(|&(x, y)| point(px(x), px(y))).collect::<Vec<_>>(), true);
+                            if let Ok(path) = pb.build() {
+                                // Without a compositor alpha can't fade; hearts pop instead.
+                                let a = if composited { alpha } else { 1.0 };
+                                window.paint_path(path, with_alpha(color, a));
+                            }
+                            if !composited && alpha > 0.35 {
+                                shape::poly_rows(&dev(&pts), &mut visible);
+                            }
+                        }
+                    }
+                    // Never an empty bounding shape: X then reports the window fully obscured
+                    // and GPUI stops drawing it for good.
+                    if visible.is_empty() {
+                        visible.push(ground_px);
+                    }
+                    let mut last = last.borrow_mut();
+                    if last.0 != input || last.1 != visible {
+                        x11.set_shape(&input, &visible).ok();
+                        *last = (input, visible);
+                    }
+                    if has_frame && !first.get() {
+                        first.set(true);
+                        eprintln!("first-frame: painted {} ms after process start", t_start.elapsed().as_millis());
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
+        )
     }
 }

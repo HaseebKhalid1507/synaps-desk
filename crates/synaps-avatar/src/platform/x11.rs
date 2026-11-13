@@ -16,11 +16,10 @@ use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-pub type ShapeRect = (i16, i16, u16, u16);
+pub use crate::shape::ShapeRect;
 
 #[derive(Clone, Debug)]
 pub struct Monitor {
-    pub name: String,
     pub primary: bool,
     pub x: i32,
     pub y: i32,
@@ -158,11 +157,6 @@ impl X11 {
         Ok((r.root_x as i32, r.root_y as i32))
     }
 
-    pub fn window_origin(&self) -> Result<(i32, i32)> {
-        let g = self.conn.get_geometry(self.win)?.reply()?;
-        Ok((g.x as i32, g.y as i32))
-    }
-
     /// Ask the server for keyboard focus (override-redirect windows never get it from the WM).
     pub fn take_focus(&self) -> Result<()> {
         self.conn.set_input_focus(xproto::InputFocus::PARENT, self.win, x11rb::CURRENT_TIME)?;
@@ -178,15 +172,7 @@ impl X11 {
         let mut out = Vec::new();
         if let Ok(Ok(r)) = self.conn.randr_get_monitors(self.root, true).map(|c| c.reply()) {
             for m in r.monitors {
-                let name = self
-                    .conn
-                    .get_atom_name(m.name)
-                    .ok()
-                    .and_then(|c| c.reply().ok())
-                    .map(|r| String::from_utf8_lossy(&r.name).into_owned())
-                    .unwrap_or_default();
                 out.push(Monitor {
-                    name,
                     primary: m.primary,
                     x: m.x as i32,
                     y: m.y as i32,
@@ -197,7 +183,6 @@ impl X11 {
         }
         if out.is_empty() {
             out.push(Monitor {
-                name: "screen".into(),
                 primary: true,
                 x: 0,
                 y: 0,

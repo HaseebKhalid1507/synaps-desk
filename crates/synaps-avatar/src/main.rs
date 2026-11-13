@@ -7,6 +7,8 @@ mod control;
 mod frames;
 mod pack;
 mod platform;
+mod shape;
+mod ticker;
 mod state;
 mod view;
 
@@ -93,8 +95,38 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
+/// On a multi-GPU machine, render on the boot VGA device (the iGPU on a hybrid laptop)
+/// unless the user chose one with `ZED_DEVICE_ID`. Measured on bella (RTX 5070 Ti, driver
+/// 615.78, no compositor): every vkQueuePresent to this 32-bit override-redirect window
+/// busy-waits ~2.3 s on the NVIDIA GPU, so animation ran at 0.4 fps; on the Intel iGPU
+/// presents return at once. A desktop pet belongs on the low-power GPU anyway.
+fn prefer_boot_gpu() {
+    if std::env::var_os("ZED_DEVICE_ID").is_some() || std::env::var_os("SA_ANY_GPU").is_some() {
+        return;
+    }
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).map(|s| s.trim().to_string()).unwrap_or_default();
+    let mut cards = Vec::new();
+    for e in std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let dev = e.path().join("device");
+        cards.push((read(dev.join("device")), read(dev.join("boot_vga")) == "1"));
+    }
+    if cards.len() < 2 {
+        return;
+    }
+    if let Some((id, _)) = cards.iter().find(|c| c.1 && !c.0.is_empty()) {
+        eprintln!("synaps-avatar: {} GPUs, rendering on the boot VGA device {id} (SA_ANY_GPU=1 to let GPUI pick)", cards.len());
+        // SAFETY: first thing in main, before any thread exists.
+        unsafe { std::env::set_var("ZED_DEVICE_ID", id) };
+    }
+}
+
 fn main() {
     let t_start = Instant::now();
+    prefer_boot_gpu();
     if let Ok(level) = std::env::var("SA_LOG")
         && let Ok(level) = level.parse::<log::LevelFilter>()
     {
@@ -245,7 +277,7 @@ fn run(t_start: Instant) -> Result<()> {
         cx.spawn(async move |cx| {
             let default = p.frame(&p.catalog.default_sprite).unwrap_or(0);
             let p1 = p.clone();
-            let first = cx.background_executor().spawn(async move { frames::decode(&p1, &geo, &[default], verify, 1) }).await;
+            let first = off_thread(move || frames::decode(&p1, &geo, &[default], verify, 1)).await;
             let first = match first {
                 Ok(d) => d,
                 Err(e) => fatal(e),
@@ -254,7 +286,7 @@ fn run(t_start: Instant) -> Result<()> {
             let rest: Vec<usize> = (0..p.frames.len()).filter(|&i| i != default).collect();
             let p2 = p.clone();
             let rest2 = rest.clone();
-            let all = cx.background_executor().spawn(async move { frames::decode(&p2, &geo, &rest2, verify, threads) }).await;
+            let all = off_thread(move || frames::decode(&p2, &geo, &rest2, verify, threads)).await;
             let all = match all {
                 Ok(d) => d,
                 Err(e) => fatal(e),
@@ -279,6 +311,16 @@ fn run(t_start: Instant) -> Result<()> {
         .detach();
     });
     Ok(())
+}
+
+/// Run `f` on a plain thread and await its result. GPUI's background executor can be
+/// slow to hand a finished task back to an idle main loop (see ticker.rs).
+async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        tx.send_blocking(f()).ok();
+    });
+    rx.recv().await.map_err(|_| anyhow::anyhow!("decode thread died"))?
 }
 
 fn fatal(e: anyhow::Error) -> ! {

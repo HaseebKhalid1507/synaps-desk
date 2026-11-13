@@ -76,8 +76,8 @@ pub struct Frame {
     pub rects: Arc<Vec<(i16, i16, u16, u16)>>,
     /// Device-pixel y (inside the avatar rect) above which a click is a head click.
     pub head_line: i32,
-    /// Device-pixel horizontal centre of the frame's visible bounds.
-    pub center_x: i32,
+    /// Device-px top of the frame's visible bounds inside the avatar rect.
+    pub top: i32,
 }
 
 /// Display geometry shared by all frames.
@@ -181,7 +181,6 @@ fn decode_one(pack: &Pack, f: &FrameSource, geo: &Geometry, verify: bool, resize
     let head_fraction = pack.behaviour.click.head_fraction;
     let (_, top) = geo.to_device(0, vb.y);
     let head_line = (top + vb.height as f32 * geo.scale * head_fraction).round() as i32;
-    let (cx, _) = geo.to_device(vb.x + vb.width / 2, 0);
     let rgba = image::RgbaImage::from_raw(geo.width, geo.height, px).expect("buffer size");
     Ok(Frame {
         id: f.id.clone(),
@@ -189,7 +188,7 @@ fn decode_one(pack: &Pack, f: &FrameSource, geo: &Geometry, verify: bool, resize
         mask,
         rects,
         head_line,
-        center_x: cx.round() as i32,
+        top: top.round() as i32,
     })
 }
 
