@@ -471,8 +471,9 @@ impl Avatar {
                     out
                 };
                 let (ro, rf) = (runs(outline), runs(fill));
-                self.x11.fx_set(NOTE_LAYER + 2 * used, sprite.outline_rgb, o, (size, size), &ro).ok();
-                self.x11.fx_set(NOTE_LAYER + 2 * used + 1, sprite.fill_rgb, o, (size, size), &rf).ok();
+                let (lo, lf) = (NOTE_LAYER + 2 * used, NOTE_LAYER + 2 * used + 1);
+                self.x11.fx_set(lf, sprite.fill_rgb, o, (size, size), &rf).ok();
+                self.x11.fx_set_below(lo, lf, sprite.outline_rgb, o, (size, size), &ro).ok();
                 used += 1;
             }
         }
@@ -1133,10 +1134,16 @@ impl Avatar {
             let (bx, by, bw, bh) = b.bbox();
             let o = (bx, by);
             let step = (6.0 * self.layout.sf).round() as i32;
-            for (i, polys) in layers.iter().enumerate() {
+            // Top (core) first, each lower layer right under the one above it.
+            for (i, polys) in layers.iter().enumerate().rev() {
                 // Blocky outside like Capri's bolt, a finer core.
                 let grid = if i == 3 { 2 } else { step };
-                self.x11.fx_set(i, fx::BOLT_COLOURS[i], o, (bw, bh), &fx::polys_to_rects(polys, o, grid)).ok();
+                let rects = fx::polys_to_rects(polys, o, grid);
+                if i == 3 {
+                    self.x11.fx_set(i, fx::BOLT_COLOURS[i], o, (bw, bh), &rects).ok();
+                } else {
+                    self.x11.fx_set_below(i, i + 1, fx::BOLT_COLOURS[i], o, (bw, bh), &rects).ok();
+                }
             }
             self.x11.flush();
         }
@@ -2591,7 +2598,7 @@ impl Render for Avatar {
                     // pixmap inside the bounding shape. So wherever the shape grows, stale
                     // pixmap content shows (dark blobs on rising hearts) until the next present
                     // lands. The server paints a window's background together with its shape.
-                    let heart_win = |layer: usize, rgb: u32, pts: &[(f32, f32)]| {
+                    let heart_win = |layer: usize, over: Option<usize>, rgb: u32, pts: &[(f32, f32)]| {
                         let root: Vec<(f32, f32)> =
                             pts.iter().map(|&(x, y)| (x * sf + worigin.0 as f32, y * sf + worigin.1 as f32)).collect();
                         let x0 = root.iter().map(|p| p.0).fold(f32::MAX, f32::min).floor() as i32;
@@ -2601,7 +2608,10 @@ impl Render for Avatar {
                         let local: Vec<(f32, f32)> = root.iter().map(|&(x, y)| (x - x0 as f32, y - y0 as f32)).collect();
                         let mut r = Vec::new();
                         shape::poly_rows(&local, &mut r);
-                        x11.fx_set(layer, rgb, (x0, y0), (x1 - x0, y1 - y0), &r).ok();
+                        match over {
+                            Some(j) => x11.fx_set_below(layer, j, rgb, (x0, y0), (x1 - x0, y1 - y0), &r).ok(),
+                            None => x11.fx_set(layer, rgb, (x0, y0), (x1 - x0, y1 - y0), &r).ok(),
+                        };
                     };
                     // Rise from the click to clear air above the hair.
                     let target = (top_l - 22.0).max(16.0);
@@ -2627,8 +2637,8 @@ impl Render for Avatar {
                         });
                         match geom {
                             Some((x, y, s)) => {
-                                heart_win(rim, 0xffffff, &shape::heart(x, y, s + 5.0));
-                                heart_win(fill, *colour, &shape::heart(x, y, s));
+                                heart_win(fill, None, *colour, &shape::heart(x, y, s));
+                                heart_win(rim, Some(fill), 0xffffff, &shape::heart(x, y, s + 5.0));
                             }
                             None => {
                                 x11.fx_unmap(rim);

@@ -87,6 +87,13 @@ fn intern(conn: &RustConnection, name: &str) -> Result<u32> {
     Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
 }
 
+#[derive(Clone, Copy)]
+enum Stack {
+    Top,
+    BelowAvatar,
+    BelowLayer(usize),
+}
+
 impl X11 {
     /// Connect; `win` is set once GPUI has created the window.
     pub fn connect() -> Result<X11> {
@@ -269,20 +276,29 @@ impl X11 {
 
     // ---- effect windows -----------------------------------------------------------
 
-    /// `fx_show` without the flush, to batch several layers into one write.
+    /// Show effect layer `layer` (solid `rgb`) on top of everything at root `origin` with
+    /// the bounding shape `rects` (relative to `origin`). Input passes through. Created on
+    /// first use. Not flushed, so several layers go out in one write.
     pub fn fx_set(&self, layer: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: &[ShapeRect]) -> Result<()> {
-        self.fx_place(layer, rgb, origin, size, Some(rects), false)
+        self.fx_place(layer, rgb, origin, size, Some(rects), Stack::Top)
+    }
+
+    /// Like `fx_set`, stacked directly below layer `over`. Stacking a group top-down this
+    /// way never puts a lower layer above a higher one, even for a moment (raising each
+    /// to the top in turn does, and a screen grab catches it).
+    pub fn fx_set_below(&self, layer: usize, over: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: &[ShapeRect]) -> Result<()> {
+        self.fx_place(layer, rgb, origin, size, Some(rects), Stack::BelowLayer(over))
     }
 
     /// An effect layer stacked directly below the avatar window (e.g. a contact shadow).
     /// `rects: None` keeps the current shape and only moves the window.
     pub fn fx_under(&self, layer: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: Option<&[ShapeRect]>) -> Result<()> {
-        self.fx_place(layer, rgb, origin, size, rects, true)?;
+        self.fx_place(layer, rgb, origin, size, rects, Stack::BelowAvatar)?;
         self.conn.flush()?;
         Ok(())
     }
 
-    fn fx_place(&self, layer: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: Option<&[ShapeRect]>, under: bool) -> Result<()> {
+    fn fx_place(&self, layer: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: Option<&[ShapeRect]>, stack: Stack) -> Result<()> {
         let mut fx = self.fx.lock().map_err(|_| anyhow::anyhow!("fx lock"))?;
         while fx.len() <= layer {
             let id = self.conn.generate_id()?;
@@ -330,7 +346,14 @@ impl X11 {
             self.conn.shape_rectangles(shape::SO::SET, shape::SK::BOUNDING, xproto::ClipOrdering::UNSORTED, id, 0, 0, &r)?;
         }
         let aux = xproto::ConfigureWindowAux::new().x(origin.0).y(origin.1).width(size.0.max(1) as u32).height(size.1.max(1) as u32);
-        let aux = if under { aux.sibling(self.win).stack_mode(xproto::StackMode::BELOW) } else { aux.stack_mode(xproto::StackMode::ABOVE) };
+        let aux = match stack {
+            Stack::Top => aux.stack_mode(xproto::StackMode::ABOVE),
+            Stack::BelowAvatar => aux.sibling(self.win).stack_mode(xproto::StackMode::BELOW),
+            Stack::BelowLayer(j) => match fx.get(j) {
+                Some(&(sib, true, _)) => aux.sibling(sib).stack_mode(xproto::StackMode::BELOW),
+                _ => aux.stack_mode(xproto::StackMode::ABOVE),
+            },
+        };
         self.conn.configure_window(id, &aux)?;
         if !mapped {
             self.conn.map_window(id)?;
