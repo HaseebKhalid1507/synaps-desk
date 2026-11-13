@@ -13,6 +13,7 @@ mod bench;
 mod diag;
 mod mem;
 mod model;
+mod named;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

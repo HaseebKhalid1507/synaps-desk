@@ -68,7 +68,23 @@ struct Fake {
     /// Every accepted connection's writer, in accept order (the first is
     /// the control connection). Weak: dropping a `Conn` closes its socket.
     accepted: mpsc::UnboundedReceiver<Weak<Mutex<OwnedWriteHalf>>>,
+    /// Every frame after `Hello` that was not an `Attach`, in order.
+    control: mpsc::UnboundedReceiver<Value>,
 }
+
+/// What the fake daemon is.
+#[derive(Clone, Copy, Default)]
+struct Opts {
+    /// `Welcome.features` lists `saved_sessions` (and answers the frame).
+    saved: bool,
+    /// Predates `Rename`: answers it `Error{unknown variant}`.
+    old: bool,
+    /// Lists `saved_sessions` but cannot read the sessions dir: `Error`.
+    saved_error: bool,
+}
+
+/// A second live session, unnamed.
+const SID2: &str = "20261113-080000-aaaa";
 
 fn fixture(name: &str) -> String {
     std::fs::read_to_string(format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
@@ -81,14 +97,46 @@ fn attached_frame(client: u64) -> Value {
     a
 }
 
-fn welcome() -> Value {
+fn welcome(opts: Opts) -> Value {
+    let features: Vec<&str> = if opts.saved { vec!["owned_sessions", "saved_sessions"] } else { vec!["owned_sessions"] };
     json!({"type": "welcome", "protocol_version": 3, "daemon_version": "0.0.0-fake", "pid": 1, "profile": null,
-           "sessions": [{"id": SID, "model": "m", "lifecycle": "live", "name": "named-one"}],
-           "progressive_tool_disclosure": false, "generation": 1})
+           "sessions": [{"id": SID, "model": "m", "lifecycle": "live", "name": "named-one"},
+                        {"id": SID2, "model": "m", "lifecycle": "live", "journal_id": "20261101-000000-bbbb"}],
+           "progressive_tool_disclosure": false, "generation": 1, "features": features})
+}
+
+/// The fake's `Rename` (`daemon/rename.rs`): `None` = `Refused`, then close.
+fn rename_reply(opts: Opts, f: &Value) -> Option<Value> {
+    if opts.old {
+        return Some(json!({"type": "error", "session_id": null,
+            "message": "malformed frame: unknown variant `rename`, expected one of `hello`, `ping`, `sessions`"}));
+    }
+    let sid = f["session_id"].as_str().unwrap_or_default();
+    let current = match sid {
+        SID => Some("named-one"),
+        SID2 => None,
+        _ => return None,
+    };
+    let name = &f["name"];
+    if name == "taken-one" {
+        return Some(json!({"type": "rename_failed", "session_id": sid, "reason": "taken",
+            "message": "name 'taken-one' is taken", "taken_by": "20261028-045932-a1b2"}));
+    }
+    if let Some(expect) = f.get("expect")
+        && expect.as_str() != current
+    {
+        return Some(json!({"type": "rename_failed", "session_id": sid, "reason": "named",
+            "message": "the session is named", "current_name": current}));
+    }
+    Some(json!({"type": "renamed", "session_id": sid, "name": name}))
 }
 
 impl Fake {
     async fn start(name: &str) -> Fake {
+        Self::start_with(name, Opts::default()).await
+    }
+
+    async fn start_with(name: &str, opts: Opts) -> Fake {
         let dir = std::env::temp_dir().join(format!("synaps-fake-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -96,21 +144,46 @@ impl Fake {
         let listener = UnixListener::bind(&path).unwrap();
         let (atx, attaches) = mpsc::unbounded_channel();
         let (ctx, accepted) = mpsc::unbounded_channel();
+        let (ftx, control) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (r, w) = stream.into_split();
                 let w: Writer = Arc::new(Mutex::new(w));
                 let _ = ctx.send(Arc::downgrade(&w));
-                let atx = atx.clone();
+                let (atx, ftx) = (atx.clone(), ftx.clone());
                 tokio::spawn(async move {
                     let mut r = BufReader::new(r).lines();
                     let Ok(Some(hello)) = r.next_line().await else { return };
                     let hello: Value = serde_json::from_str(&hello).unwrap();
-                    write(&w, welcome()).await;
+                    write(&w, welcome(opts)).await;
                     while let Ok(Some(line)) = r.next_line().await {
                         let f: Value = serde_json::from_str(&line).unwrap();
+                        if f["type"] != "attach" {
+                            let _ = ftx.send(f.clone());
+                        }
                         match f["type"].as_str() {
                             Some("sessions") => write(&w, json!({"type": "session_list", "sessions": []})).await,
+                            Some("saved_sessions") if opts.saved && opts.saved_error => {
+                                write(&w, json!({"type": "error", "session_id": null,
+                                    "message": "saved sessions: Permission denied (os error 13)"})).await;
+                            }
+                            Some("saved_sessions") if opts.saved => {
+                                let mut list: Value = serde_json::from_str(fixture("saved_session_list.json").trim()).unwrap();
+                                list["truncated"] = json!(f["limit"] == 1);
+                                write(&w, list).await;
+                            }
+                            Some("saved_sessions") => {
+                                write(&w, json!({"type": "error", "session_id": null,
+                                    "message": "malformed frame: unknown variant `saved_sessions`"})).await;
+                            }
+                            Some("rename") => match rename_reply(opts, &f) {
+                                Some(reply) => write(&w, reply).await,
+                                None => {
+                                    write(&w, json!({"type": "refused", "reason": {"reason": "unknown_session"},
+                                        "message": format!("no live session {}", f["session_id"])})).await;
+                                    return;
+                                }
+                            },
                             Some("attach") => {
                                 let _ = atx.send(Conn { w, r, hello, attach: f });
                                 return;
@@ -121,7 +194,7 @@ impl Fake {
                 });
             }
         });
-        Fake { path, attaches, accepted }
+        Fake { path, attaches, accepted, control }
     }
 
     fn client(&self) -> (Client, async_channel::Receiver<Event>) {
@@ -130,6 +203,11 @@ impl Fake {
 
     async fn next_attach(&mut self) -> Conn {
         tokio::time::timeout(T, self.attaches.recv()).await.expect("no attach").unwrap()
+    }
+
+    /// The next control frame (not `Hello`, not `Attach`).
+    async fn next_control(&mut self) -> Value {
+        tokio::time::timeout(T, self.control.recv()).await.expect("no control frame").unwrap()
     }
 }
 
@@ -552,7 +630,7 @@ async fn n8_a_daemon_that_hangs_up_at_once_is_backed_off() {
             let (r, mut w) = stream.into_split();
             let mut r = BufReader::new(r).lines();
             let _ = r.next_line().await;
-            let mut line = welcome().to_string();
+            let mut line = welcome(Opts::default()).to_string();
             line.push('\n');
             let _ = w.write_all(line.as_bytes()).await;
         }
@@ -621,5 +699,278 @@ async fn n9_attach_seqs_are_enqueued_in_order() {
     }
     assert_eq!(seen, (1..=100).collect::<Vec<u64>>());
     drop(fake);
+    client.shutdown().unwrap();
+}
+
+async fn connected(events: &async_channel::Receiver<Event>) -> Vec<String> {
+    wait(events, "connected", |e| match e {
+        Event::Status(Status::Connected { features, .. }) => Some(features.clone()),
+        _ => None,
+    })
+    .await
+}
+
+/// Named sessions: a daemon that lists `saved_sessions` is asked with the
+/// contract's frame, and the reply arrives as `Event::SavedSessions`.
+#[tokio::test]
+async fn saved_sessions_are_asked_of_a_daemon_that_lists_them() {
+    let mut fake = Fake::start_with("saved", Opts { saved: true, ..Default::default() }).await;
+    let (client, events) = fake.client();
+    let features = connected(&events).await;
+    assert!(features.iter().any(|f| f == "saved_sessions"));
+    assert!(client.supports(synaps_client::FEATURE_SAVED_SESSIONS));
+    client.saved_sessions(true, 200).unwrap();
+    assert_eq!(fake.next_control().await, json!({"type": "saved_sessions", "named_only": true, "limit": 200}));
+    let (sessions, truncated, rejected) = wait(&events, "saved sessions", |e| match e {
+        Event::SavedSessions { sessions, truncated, rejected } => Some((sessions.clone(), *truncated, *rejected)),
+        _ => None,
+    })
+    .await;
+    assert_eq!((sessions.len(), truncated, rejected), (3, false, 0));
+    assert_eq!(sessions[1].name.as_deref(), Some("bebop"));
+    client.saved_sessions(false, 1).unwrap();
+    assert_eq!(fake.next_control().await["named_only"], false);
+    // The limit is clamped to what the daemon takes (`Option<u32>`, ≤ 1000).
+    client.saved_sessions(true, u32::MAX).unwrap();
+    assert_eq!(fake.next_control().await["limit"], 1000);
+    let truncated = wait(&events, "saved sessions", |e| match e {
+        Event::SavedSessions { truncated, .. } => Some(*truncated),
+        _ => None,
+    })
+    .await;
+    assert!(truncated);
+    client.shutdown().unwrap();
+}
+
+/// M4: a daemon `Error` answering `saved_sessions` (an unreadable sessions
+/// dir) is `Event::SavedSessionsFailed`, not a generic error, and the
+/// connection stays usable.
+#[tokio::test]
+async fn a_saved_sessions_error_is_its_own_event() {
+    let mut fake = Fake::start_with("savederr", Opts { saved: true, saved_error: true, ..Default::default() }).await;
+    let (client, events) = fake.client();
+    connected(&events).await;
+    client.saved_sessions(true, 200).unwrap();
+    fake.next_control().await;
+    let ev = wait(&events, "saved failure", |e| match e {
+        Event::SavedSessionsFailed { reason } => Some(Ok(reason.clone())),
+        Event::Error { error, .. } => Some(Err(error.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(ev, Ok("saved sessions: Permission denied (os error 13)".into()));
+    client.list_sessions().unwrap();
+    assert_eq!(fake.next_control().await["type"], "sessions");
+    client.shutdown().unwrap();
+}
+
+/// Feature gating: without `saved_sessions` in `Welcome.features` no
+/// `saved_sessions` frame ever goes out: `saved_sessions()` says
+/// `Unsupported`, and a raw `Command::SavedSessions` (the thread's own
+/// check) answers `Error::Unsupported`.
+#[tokio::test]
+async fn without_the_feature_no_saved_sessions_frame_is_sent() {
+    use synaps_client::{Command, RequestError};
+    let mut fake = Fake::start("nosaved").await;
+    let (client, events) = fake.client();
+    assert!(!connected(&events).await.iter().any(|f| f == "saved_sessions"));
+    assert_eq!(client.saved_sessions(true, 200), Err(RequestError::Unsupported { feature: "saved_sessions" }));
+    client.send(Command::SavedSessions { named_only: true, limit: 200 }).unwrap();
+    let err = wait(&events, "unsupported", |e| match e {
+        Event::Error { error, .. } => Some(error.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(err, Error::Unsupported { feature: "saved_sessions" });
+    // A marker: everything sent before it has been read by the fake.
+    client.list_sessions().unwrap();
+    assert_eq!(fake.next_control().await["type"], "sessions", "no saved_sessions frame may precede it");
+    client.shutdown().unwrap();
+    assert_eq!(fake.next_control().await["type"], "bye");
+}
+
+/// Before the control connection is up the features are unknown:
+/// `NotConnected`, nothing queued.
+#[tokio::test]
+async fn saved_sessions_before_connecting_is_not_connected() {
+    let dir = std::env::temp_dir().join(format!("synaps-fake-{}-nobody", std::process::id()));
+    let (client, _events) =
+        Client::spawn(ClientOptions::new(Endpoint::Socket(dir.join("none.sock")), Identity::new("tester").unwrap())).unwrap();
+    assert_eq!(client.saved_sessions(true, 200), Err(synaps_client::RequestError::NotConnected));
+    assert!(client.features().is_none());
+    client.shutdown().unwrap();
+}
+
+async fn rename_reply_event(events: &async_channel::Receiver<Event>) -> Event {
+    wait(events, "rename reply", |e| matches!(e, Event::Renamed { .. } | Event::RenameFailed(_)).then(|| e.clone())).await
+}
+
+/// `rename`: checked before sending, always compare-and-set, every reply
+/// typed: `Renamed`, `Named` (with `current_name`) then a replace that
+/// names what it replaces (`expect: "named-one"`), a stale replace refused
+/// again, `Taken` (with `taken_by`), and `Refused{UnknownSession}` →
+/// `NotLive` (the daemon closes; the control connection comes back).
+#[tokio::test]
+async fn rename_validates_and_types_every_reply() {
+    use synaps_client::{Expect, RenameRefusal, RequestError};
+    let mut fake = Fake::start("rename").await;
+    let (client, events) = fake.client();
+    connected(&events).await;
+
+    assert!(matches!(client.rename(SID2, Some("Not Valid"), Expect::Unnamed), Err(RequestError::InvalidName(_))));
+    client.rename(SID2, Some("fresh"), Expect::Unnamed).unwrap();
+    assert_eq!(fake.next_control().await, json!({"type": "rename", "session_id": SID2, "name": "fresh", "expect": null}));
+    let ev = rename_reply_event(&events).await;
+    assert!(matches!(&ev, Event::Renamed { session_id, name: Some(n), .. } if session_id == SID2 && n == "fresh"), "{ev:?}");
+
+    client.rename(SID, Some("other"), Expect::Unnamed).unwrap();
+    fake.next_control().await;
+    let Event::RenameFailed(f) = rename_reply_event(&events).await else { panic!() };
+    assert_eq!((f.reason, f.current_name.as_deref()), (RenameRefusal::Named, Some("named-one")));
+    // Replacing a name the user has not seen (renamed meanwhile) is refused.
+    client.rename(SID, Some("other"), Expect::Named("kite".into())).unwrap();
+    assert_eq!(fake.next_control().await["expect"], "kite");
+    let Event::RenameFailed(f) = rename_reply_event(&events).await else { panic!() };
+    assert_eq!((f.reason, f.current_name.as_deref()), (RenameRefusal::Named, Some("named-one")));
+    client.rename(SID, Some("other"), Expect::Named("named-one".into())).unwrap();
+    let frame = fake.next_control().await;
+    assert_eq!(frame, json!({"type": "rename", "session_id": SID, "name": "other", "expect": "named-one"}));
+    assert!(matches!(rename_reply_event(&events).await, Event::Renamed { .. }));
+
+    client.rename(SID2, Some("taken-one"), Expect::Unnamed).unwrap();
+    fake.next_control().await;
+    let Event::RenameFailed(f) = rename_reply_event(&events).await else { panic!() };
+    assert_eq!((f.reason, f.taken_by.as_deref()), (RenameRefusal::Taken, Some("20261028-045932-a1b2")));
+
+    client.rename("20261113-999999-dead", Some("ghost"), Expect::Unnamed).unwrap();
+    fake.next_control().await;
+    let Event::RenameFailed(f) = rename_reply_event(&events).await else { panic!() };
+    assert_eq!(f.reason, RenameRefusal::NotLive);
+    // Clearing a name: `name: null`, only if it is still the one seen.
+    connected(&events).await;
+    client.rename(SID, None, Expect::Named("named-one".into())).unwrap();
+    assert_eq!(fake.next_control().await, json!({"type": "rename", "session_id": SID, "name": null, "expect": "named-one"}));
+    client.shutdown().unwrap();
+}
+
+/// A daemon that predates `Rename` answers `Error{unknown variant}`: that
+/// is `RenameRefusal::Unsupported`, and the connection stays usable.
+#[tokio::test]
+async fn rename_on_an_older_daemon_is_unsupported() {
+    let mut fake = Fake::start_with("oldrename", Opts { old: true, ..Default::default() }).await;
+    let (client, events) = fake.client();
+    connected(&events).await;
+    client.rename(SID2, Some("fresh"), synaps_client::Expect::Unnamed).unwrap();
+    fake.next_control().await;
+    let Event::RenameFailed(f) = rename_reply_event(&events).await else { panic!() };
+    assert_eq!(f.reason, synaps_client::RenameRefusal::Unsupported);
+    assert!(f.message.contains("unknown variant"));
+    client.list_sessions().unwrap();
+    assert_eq!(fake.next_control().await["type"], "sessions");
+    client.shutdown().unwrap();
+}
+
+/// The daemon's real create errors (Synaps `origin/dev`):
+/// `daemon/conn.rs`: `format!("create session: {e}")`; `engine/setup.rs`:
+/// `"Failed to load session '{}': {}"` as `RuntimeError::Tool` (`"Tool
+/// execution failed: {0}"`); `core/session.rs`: `"no session matching '{}'"`.
+const NO_SUCH: &str = "create session: Tool execution failed: Failed to load session 'nope': no session matching 'nope'";
+
+/// `resume`: a create with `continue_session` (no feature needed). The
+/// daemon's "no session matching" ends it with that reason. A resume
+/// whose connection drops after the create is sent again, not looked up
+/// (the first may still be loading its journal): the daemon attaches a
+/// live target instead of making a second one.
+#[tokio::test]
+async fn resume_continues_and_is_resent_after_a_drop() {
+    let mut fake = Fake::start("resume").await;
+    let (client, events) = fake.client();
+    let seq = client.resume("nope", CreateOptions::new().cwd(Cwd::Path("/tmp".into()))).unwrap();
+    let conn = fake.next_attach().await;
+    assert_eq!(conn.attach["attach"], "create");
+    assert_eq!(conn.attach["config"]["continue_session"], "nope");
+    assert_eq!(conn.attach["config"]["cwd"], "/tmp");
+    conn.send(json!({"type": "error", "session_id": null, "message": NO_SUCH})).await;
+    let (s, reason) = wait(&events, "detached", |e| match e {
+        Event::Detached { attach_seq, reason, .. } => Some((*attach_seq, reason.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!((s, reason.as_str()), (seq, NO_SUCH));
+
+    // A compacted predecessor's id, not in `Welcome.sessions` at all: the
+    // retry sends the same create again.
+    client.resume("20261001-000000-0ld1", CreateOptions::new().cwd(Cwd::Path("/tmp".into()))).unwrap();
+    drop(fake.next_attach().await);
+    let again = fake.next_attach().await;
+    assert_eq!(again.attach["attach"], "create");
+    assert_eq!(again.attach["config"]["continue_session"], "20261001-000000-0ld1");
+    assert_eq!(again.attach["config"]["cwd"], "/tmp");
+    again.send(attached_frame(4)).await;
+    wait(&events, "attached", |e| matches!(e, Event::Attached { .. }).then_some(())).await;
+    client.shutdown().unwrap();
+}
+
+/// M5: a resume that takes longer than a plain create's 5 s (a long
+/// journal loads first) is waited for on the same connection.
+#[tokio::test]
+async fn a_slow_resume_is_not_given_up_at_five_seconds() {
+    let mut fake = Fake::start("slowresume").await;
+    let (client, events) = fake.client();
+    let seq = client.resume("20261110-202033-e5f6", CreateOptions::new()).unwrap();
+    let conn = fake.next_attach().await;
+    tokio::time::sleep(Duration::from_millis(6000)).await;
+    conn.send(attached_frame(5)).await;
+    let s = wait(&events, "attached", |e| match e {
+        Event::Attached { attach_seq, reconnect, .. } => Some((*attach_seq, *reconnect)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(s, (seq, false));
+    assert!(fake.attaches.try_recv().is_err(), "no second attach");
+    client.shutdown().unwrap();
+}
+
+/// H1: the saved folder goes to the daemon as is. If the daemon says it is
+/// gone on its machine (its real `Error`, then `Bye`), the create goes out
+/// once more in the fallback (`~`) and `CwdFallback` says so; without a
+/// fallback the refusal ends the resume.
+#[tokio::test]
+async fn a_missing_folder_falls_back_to_home_once() {
+    let mut fake = Fake::start("gonecwd").await;
+    let (client, events) = fake.client();
+    let gone = "/home/u/Projects/gone";
+    let seq = client
+        .resume("20261110-202033-e5f6", CreateOptions::new().cwd(Cwd::Path(gone.into())).fallback_cwd(Cwd::Home))
+        .unwrap();
+    let first = fake.next_attach().await;
+    assert_eq!(first.attach["config"]["cwd"], gone);
+    // daemon/conn.rs: `format!("cwd must be an absolute existing directory: {}", cwd.display())`.
+    first.send(json!({"type": "error", "session_id": null, "message": format!("cwd must be an absolute existing directory: {gone}")})).await;
+    first.send(json!({"type": "bye", "reason": null})).await;
+    let second = fake.next_attach().await;
+    assert_eq!(second.attach["attach"], "create");
+    assert_eq!(second.attach["config"]["continue_session"], "20261110-202033-e5f6");
+    let home = Cwd::Home.resolve().unwrap();
+    assert_eq!(second.attach["config"]["cwd"], json!(home));
+    let fb = wait(&events, "fallback", |e| match e {
+        Event::CwdFallback { attach_seq, missing, cwd } => Some((*attach_seq, missing.clone(), cwd.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(fb, (seq, gone.to_string(), Some(home)));
+    second.send(attached_frame(6)).await;
+    wait(&events, "attached", |e| matches!(e, Event::Attached { attach_seq, .. } if *attach_seq == seq).then_some(())).await;
+
+    // Once only: a second refusal (or no fallback) ends it.
+    let seq = client.resume("x", CreateOptions::new().cwd(Cwd::Path(gone.into()))).unwrap();
+    let c = fake.next_attach().await;
+    c.send(json!({"type": "error", "session_id": null, "message": format!("cwd must be an absolute existing directory: {gone}")})).await;
+    let reason = wait(&events, "detached", |e| match e {
+        Event::Detached { attach_seq, reason, .. } if *attach_seq == seq => Some(reason.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(reason.starts_with(synaps_client::MISSING_CWD), "{reason}");
     client.shutdown().unwrap();
 }
