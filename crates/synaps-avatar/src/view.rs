@@ -2094,6 +2094,11 @@ impl Render for Avatar {
                 body: (bx0, top, bx1 - bx0, ah - top),
                 face,
                 solid: g.solid(now),
+                // Last frame's tag rows (avatar-local device px), so a cut tears the plate.
+                tag: self.tag_box.get().map(|b| {
+                    let y = f32::from(b.origin.y) * sf - l.avatar_y as f32;
+                    (y as i32, (y + f32::from(b.size.height) * sf) as i32)
+                }),
                 sf,
             });
             plan.tint = g.tint(now);

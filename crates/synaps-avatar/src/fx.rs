@@ -175,6 +175,8 @@ pub struct GlitchStep {
     pub face: Option<(i32, i32)>,
     /// Fraction of bands drawn as a solid colour channel (see `Glitch::solid`).
     pub solid: f32,
+    /// The status tag's rows: one cut falls inside them, so the plate tears in two.
+    pub tag: Option<(i32, i32)>,
     /// Device px per logical px (band heights, split widths).
     pub sf: f32,
 }
@@ -243,8 +245,10 @@ impl BodyPlan {
         let top = by.clamp(g.y0, g.h);
         // Band edges: two over the HUD, 6–12 over the figure, the face's own edges.
         let mut cuts = vec![g.y0, top, g.h];
-        if top - g.y0 > 8 {
-            cuts.push(g.y0 + (top - g.y0) * rng.range(30.0, 70.0) as i32 / 100);
+        match g.tag {
+            Some((t0, t1)) if t1 - t0 > 6 && t0 >= g.y0 && t1 <= top => cuts.push(t0 + (t1 - t0) * rng.range(35.0, 65.0) as i32 / 100),
+            _ if top - g.y0 > 8 => cuts.push(g.y0 + (top - g.y0) * rng.range(30.0, 70.0) as i32 / 100),
+            _ => {}
         }
         let n = 6 + rng.pick(7);
         let min_h = (10.0 * g.sf) as i32;
@@ -919,6 +923,7 @@ mod tests {
             body: (0, 0, 300, 400),
             face: None,
             solid: 0.0,
+            tag: None,
             sf: 1.0,
         };
         let mut plan = BodyPlan::plain();
@@ -951,6 +956,7 @@ mod tests {
                     body: (20, 10, 300, 390),
                     face: Some((90, 140)),
                     solid: g.solid(at),
+                    tag: Some((-40, -14)),
                     sf: 1.0,
                 });
                 let bands = plan.slices.clone().unwrap();
@@ -958,6 +964,8 @@ mod tests {
                 for y in -80..400 {
                     assert_eq!(bands.iter().filter(|b| y >= b.0 && y < b.1).count(), 1, "{kind:?} {ms} row {y}");
                 }
+                // The tag (rows -40..-14) is cut inside.
+                assert!(bands.iter().any(|b| b.0 > -40 && b.0 < -14), "{kind:?} {ms}: tag not torn");
                 let face: Vec<usize> = (0..bands.len()).filter(|&i| bands[i].1 > 90 && bands[i].0 < 140).collect();
                 assert_eq!(face.iter().map(|&i| bands[i].1 - bands[i].0).sum::<i32>(), 50, "{kind:?} {ms}");
                 assert!(face.iter().all(|&i| bands[i].2.abs() <= 3 && bands[i].0 >= 90 && bands[i].1 <= 140 && plan.split[i] == 0));
