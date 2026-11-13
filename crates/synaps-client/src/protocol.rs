@@ -31,6 +31,13 @@ pub const FEATURE_OWNED_SESSIONS: &str = "owned_sessions";
 /// `Welcome.features` entry: the daemon answers `SavedSessions` (a newer
 /// daemon only; an older one would answer `Error{unknown variant}`).
 pub const FEATURE_SAVED_SESSIONS: &str = "saved_sessions";
+/// Most entries a `SavedSessions` asks for (the client clamps to it).
+pub const SAVED_SESSIONS_MAX: u32 = 1000;
+/// The daemon's `Error` for a create whose `cwd` is relative or missing on
+/// the daemon's machine (`daemon/conn.rs`: `format!("cwd must be an
+/// absolute existing directory: {}", cwd.display())`, then `Bye`). Nothing
+/// was created: the check runs before the create.
+pub const MISSING_CWD: &str = "cwd must be an absolute existing directory: ";
 /// Longest session name (`validate_name`: `[a-z0-9-]{1,40}`).
 pub const SESSION_NAME_MAX: usize = 40;
 /// Query ids at or above this are the daemon's and the TUI transport's own
@@ -53,7 +60,7 @@ pub enum ClientFrame {
     Cmd { session_id: String, cmd: SessionCommand },
     /// Control fast path: the saved sessions on disk, newest first. Only to
     /// a daemon that lists [`FEATURE_SAVED_SESSIONS`]. Reply: `SavedSessionList`.
-    SavedSessions { named_only: bool, limit: usize },
+    SavedSessions { named_only: bool, limit: u32 },
     /// Control fast path: name (`Some`) or unname (`None`) a live or parked
     /// session (`/saveas` rules). `expect`: absent = replace any name,
     /// `Some(None)` = only if unnamed, `Some(Some(x))` = only if named `x`.
@@ -550,8 +557,8 @@ pub enum RenameRefusal {
     /// A compaction chain has the name.
     ChainConflict,
     /// `expect` did not match: the session has (or no longer has) a name
-    /// (`current_name`). Rename never silently replaces a name: resend
-    /// with `force` to replace it.
+    /// (`current_name`). To replace it, resend with
+    /// `Expect::Named(current_name)` for the same session.
     Named,
     /// The journal is held by another process.
     Locked,

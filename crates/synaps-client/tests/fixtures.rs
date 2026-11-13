@@ -456,7 +456,7 @@ fn saved_session_lists_decode() {
     assert_eq!(axel.message_count, Some(800));
     assert_eq!(axel.updated_at.as_deref(), Some("2026-11-13T07:30:00Z"));
     let bebop = &sessions[1];
-    assert_eq!((bebop.cwd.as_deref(), bebop.message_count, bebop.title.as_deref()), (None, None, None));
+    assert_eq!((bebop.cwd.as_deref(), bebop.message_count, bebop.title.as_deref()), (None, None, Some("")));
 
     let odd = r#"{"type":"saved_session_list","sessions":[{"id":"a","name":null,"live":false},{"name":"no-id"},{"id":"b","live":"yes"}],"truncated":true}"#;
     let DaemonFrame::SavedSessionList { sessions, truncated, rejected } = decode_frame(odd).unwrap() else { panic!() };

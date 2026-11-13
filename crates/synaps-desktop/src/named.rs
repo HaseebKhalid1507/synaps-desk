@@ -3,7 +3,7 @@
 //! rename refusals and failed resumes. No GPUI.
 
 use synaps_client::protocol::SessionMeta;
-use synaps_client::{RenameFailure, RenameRefusal, SavedSession};
+use synaps_client::{CreateOptions, Cwd, RenameFailure, RenameRefusal, SavedSession};
 
 /// The one state marker a named row shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,7 +53,36 @@ pub enum RowAction {
     /// A live or parked session: attach.
     Attach(String),
     /// A saved session the daemon does not hold: resume it by journal id.
-    Resume { id: String, name: String },
+    Resume(ResumeRequest),
+}
+
+/// A resume to send: a saved row, Open by name, or a live row whose
+/// session ended since the last list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeRequest {
+    /// What the user knows it by (the name).
+    pub label: String,
+    /// `continue_session`: the exact journal id when a list had it, else
+    /// the name (the daemon's resolver).
+    pub target: String,
+    /// The chat's folder on the DAEMON's machine, sent as is (never checked
+    /// here: with a forwarded socket it is another machine). `None`: `~`.
+    pub cwd: Option<String>,
+    /// Resolved by the daemon from the name: its resolver also takes any id
+    /// containing the text, so the attached session must carry `label`.
+    pub by_name: bool,
+}
+
+impl ResumeRequest {
+    /// `Client::resume`'s options: the saved folder as is, and `~` if the
+    /// daemon says it is gone there (`Event::CwdFallback`); `~` when no
+    /// folder is known.
+    pub fn options(&self) -> CreateOptions {
+        match &self.cwd {
+            Some(c) => CreateOptions::new().cwd(Cwd::Path(c.into())).fallback_cwd(Cwd::Home),
+            None => CreateOptions::new().cwd(Cwd::Home),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,7 +101,7 @@ impl NamedRow {
     pub fn id(&self) -> &str {
         match &self.action {
             RowAction::Attach(id) => id,
-            RowAction::Resume { id, .. } => id,
+            RowAction::Resume(r) => &r.target,
         }
     }
 }
@@ -106,7 +135,12 @@ pub fn named_rows(sessions: &[SessionMeta], saved: &[SavedSession]) -> Vec<Named
             marker: Marker::Saved,
             model: v.model.as_deref().map(short_model).unwrap_or_default(),
             activity: v.updated_at.clone().or_else(|| v.created_at.clone()),
-            action: RowAction::Resume { id: v.id.clone(), name: name.to_string() },
+            action: RowAction::Resume(ResumeRequest {
+                label: name.to_string(),
+                target: v.id.clone(),
+                cwd: v.cwd.clone().filter(|c| !c.is_empty()),
+                by_name: false,
+            }),
         });
     }
     rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.id().cmp(b.id())));
@@ -206,16 +240,38 @@ pub fn rename_message(f: &RenameFailure, name: &str) -> String {
 }
 
 /// A resume that ended before attaching (`Detached { reason }`), for the user.
+/// The daemon's texts (Synaps `origin/dev`): `daemon/conn.rs` sends
+/// `format!("create session: {e}")`; `engine/setup.rs` wraps a failed
+/// lookup as `RuntimeError::Tool("Failed to load session '{}': {}")`
+/// (`"Tool execution failed: {0}"`) around `core/session.rs`'s `"no session
+/// matching '{}'"` / `"ambiguous: {} sessions match '{}'"`; a held journal
+/// is `RuntimeError::Session` (`"Session error: {0}"`) around
+/// `session_lock.rs`'s `"session {} is live in another process (pid {},
+/// {}) — use …"`.
 pub fn resume_error(label: &str, reason: &str) -> String {
-    let why = reason.strip_prefix("create session: ").unwrap_or(reason);
-    if why.contains("no session named") {
+    let mut why = reason;
+    for prefix in ["create session: ", "create owned session: ", "Tool execution failed: ", "Session error: "] {
+        why = why.strip_prefix(prefix).unwrap_or(why);
+    }
+    if why.contains("no session matching") || why.contains("No sessions to continue") {
         format!("No session named '{label}'.")
-    } else if why.contains("is live in another process") || why.contains("locked") {
+    } else if why.contains("ambiguous:") {
+        format!("'{label}' matches more than one saved session; open it from the list.")
+    } else if why.contains("is live in another process") {
         format!("'{label}' is locked by another process (a TUI or another daemon has it open). Close it there first.")
     } else {
+        let why = why.strip_prefix(&format!("Failed to load session '{label}': ")).unwrap_or(why);
         format!("Could not resume '{label}': {why}")
     }
 }
+
+/// The daemon's real create errors (see `resume_error`), word for word.
+#[cfg(test)]
+pub(crate) const NO_SUCH_GHOST: &str =
+    "create session: Tool execution failed: Failed to load session 'ghost': no session matching 'ghost'";
+#[cfg(test)]
+pub(crate) const LOCKED_AXEL: &str = "create session: Session error: session 20261110-202033-e5f6 is live in another process \
+    (pid 4242, tui) — use `synaps --attach 20261110-202033-e5f6`, or `synaps daemon sessions`";
 
 #[cfg(test)]
 mod tests {
@@ -314,7 +370,10 @@ mod tests {
                 ("zeta", Marker::Busy, "l1"),
             ]
         );
-        assert_eq!(rows[1].action, RowAction::Resume { id: "j-beta".into(), name: "beta".into() });
+        assert_eq!(
+            rows[1].action,
+            RowAction::Resume(ResumeRequest { label: "beta".into(), target: "j-beta".into(), cwd: None, by_name: false })
+        );
         assert_eq!(rows[1].model, "haiku-4-5");
         assert_eq!(rows[1].activity.as_deref(), Some("2026-11-12T00:00:00Z"));
         assert_eq!(rows[4].action, RowAction::Attach("l1".into()));
@@ -363,12 +422,27 @@ mod tests {
 
     #[test]
     fn resume_failures_read_clearly() {
-        assert_eq!(resume_error("ghost", "create session: no session named 'ghost'"), "No session named 'ghost'.");
-        let locked = resume_error(
-            "axel",
-            "create session: session 20261110-202033-e5f6 is live in another process (pid 7, tui) — use `synaps --attach …`",
-        );
+        assert_eq!(resume_error("ghost", NO_SUCH_GHOST), "No session named 'ghost'.");
+        let locked = resume_error("axel", LOCKED_AXEL);
         assert!(locked.contains("locked by another process"), "{locked}");
+        let amb = "create session: Tool execution failed: Failed to load session '2026': ambiguous: 3 sessions match '2026'";
+        assert!(resume_error("2026", amb).contains("more than one"));
+        let other = "create session: Tool execution failed: Failed to load session 'x': Permission denied (os error 13)";
+        assert_eq!(resume_error("x", other), "Could not resume 'x': Permission denied (os error 13)");
         assert_eq!(resume_error("x", "create session: disk full"), "Could not resume 'x': disk full");
+    }
+
+    /// H1: a saved row carries its folder into `CreateOptions` as is (no
+    /// local check), with `~` as the fallback; no folder: `~`.
+    #[test]
+    fn a_saved_rows_folder_reaches_the_create() {
+        let rows = named_rows(&[], &[saved(json!({"id": "j-axel", "name": "axel", "cwd": "/home/u/Projects/axel", "live": false}))]);
+        let RowAction::Resume(req) = &rows[0].action else { panic!() };
+        let o = req.options();
+        assert_eq!(o.cwd, Cwd::Path("/home/u/Projects/axel".into()));
+        assert_eq!(o.fallback_cwd, Some(Cwd::Home));
+        assert_eq!(o.clone().resume(&req.target).config().continue_session, Some(Some("j-axel".into())));
+        let req = ResumeRequest { label: "x".into(), target: "x".into(), cwd: None, by_name: true };
+        assert_eq!((req.options().cwd, req.options().fallback_cwd), (Cwd::Home, None));
     }
 }

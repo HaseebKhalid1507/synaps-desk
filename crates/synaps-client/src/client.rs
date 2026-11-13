@@ -114,6 +114,11 @@ pub struct CreateOptions {
     /// Resume this saved session (id or name) instead of starting a new
     /// one: `continue_session`. See [`Client::resume`].
     pub resume: Option<String>,
+    /// If the daemon refuses `cwd` because that folder is gone on its
+    /// machine ([`MISSING_CWD`]), create once more in this one and say so
+    /// (`Event::CwdFallback`). The folder is never checked locally: with a
+    /// forwarded socket it lives on another machine.
+    pub fallback_cwd: Option<Cwd>,
 }
 
 impl CreateOptions {
@@ -138,6 +143,10 @@ impl CreateOptions {
     }
     pub fn resume(mut self, id_or_name: impl Into<String>) -> Self {
         self.resume = Some(id_or_name.into());
+        self
+    }
+    pub fn fallback_cwd(mut self, cwd: Cwd) -> Self {
+        self.fallback_cwd = Some(cwd);
         self
     }
 
@@ -165,7 +174,7 @@ pub enum Command {
     /// Re-fetch the whole history (`Query{Messages}`) → `HistoryUpdate::Replace`.
     Resync,
     /// `SavedSessions` on the control connection → `Event::SavedSessions`.
-    SavedSessions { named_only: bool, limit: usize },
+    SavedSessions { named_only: bool, limit: u32 },
     /// `Rename` on the control connection → `Event::Renamed` / `RenameFailed`.
     Rename { session_id: String, name: Option<String>, expect: Option<Option<String>> },
     Detach,
@@ -311,9 +320,17 @@ pub enum Event {
     /// replaced). Session commands now fail with `Error::NotAttached`.
     Detached { attach_seq: u64, session_id: Option<String>, reason: String },
     Error { attach_seq: Option<u64>, error: Error },
-    /// Reply to [`Client::saved_sessions`]. A failure comes as `Error`
-    /// (`Unsupported`, `Refused { command: Some("saved_sessions") }`, ...).
-    SavedSessions { sessions: Vec<SavedSession>, truncated: bool },
+    /// Reply to [`Client::saved_sessions`]. `truncated`: there are more
+    /// than the limit; `rejected`: entries that did not decode (skipped).
+    SavedSessions { sessions: Vec<SavedSession>, truncated: bool, rejected: usize },
+    /// A [`Client::saved_sessions`] that got no list: the daemon's `Error`,
+    /// a dropped connection, or not connected. (A daemon without the
+    /// feature answers `Error::Unsupported` instead.)
+    SavedSessionsFailed { reason: String },
+    /// The daemon refused the create's `cwd` (gone on its machine) and the
+    /// create was sent again in [`CreateOptions::fallback_cwd`]. `missing`:
+    /// the folder as the daemon printed it; `cwd`: where it runs now.
+    CwdFallback { attach_seq: u64, missing: String, cwd: Option<PathBuf> },
     /// Reply to [`Client::rename`]: `session_id` is now called `name`.
     Renamed { session_id: String, name: Option<String>, in_memory_only: bool },
     /// Reply to [`Client::rename`]: not renamed (see [`RenameRefusal`]).
@@ -329,11 +346,13 @@ impl Event {
             | Event::Session { attach_seq, .. }
             | Event::History { attach_seq, .. }
             | Event::InputOwner { attach_seq, .. }
+            | Event::CwdFallback { attach_seq, .. }
             | Event::Detached { attach_seq, .. } => Some(*attach_seq),
             Event::Error { attach_seq, .. } => *attach_seq,
             Event::Status(_)
             | Event::Sessions(_)
             | Event::SavedSessions { .. }
+            | Event::SavedSessionsFailed { .. }
             | Event::Renamed { .. }
             | Event::RenameFailed(_) => None,
         }
@@ -351,6 +370,17 @@ impl std::fmt::Display for ClientClosed {
 }
 
 impl std::error::Error for ClientClosed {}
+
+/// The compare-and-set precondition of [`Client::rename`] (`expect`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Expect {
+    /// Only if the session has no name (`expect: null`).
+    Unnamed,
+    /// Only if it is still named this (`expect: "kite"`): replacing a name
+    /// after a `RenameRefusal::Named`, or clearing one.
+    Named(String),
+}
 
 /// Why a control request ([`Client::saved_sessions`], [`Client::rename`])
 /// was not sent.
@@ -455,9 +485,18 @@ impl Client {
 
     /// Resume a saved session by journal id or name (`Attach::Create` with
     /// `continue_session`), and attach to it; works on every v3 daemon. A
-    /// session that is live in the daemon is attached instead. Failures
-    /// ("no session named 'x'", a journal live in another process) come
-    /// back as `Event::Detached { reason }` for the returned `attach_seq`.
+    /// session that is live in the daemon is attached instead (its `cwd`
+    /// then does not apply). Pass the saved folder as `options.cwd`: the
+    /// daemon does not restore it from the journal. Failures ("no session
+    /// matching 'x'", a journal live in another process) come back as
+    /// `Event::Detached { reason }` for the returned `attach_seq`.
+    ///
+    /// The daemon resolves `id_or_name` as a chain, a name, then **any id
+    /// containing it**: to open a name exactly, resolve it to an id first
+    /// ([`Client::saved_sessions`]), or check the attached session's name.
+    /// A resume is idempotent on the daemon (a live target is attached), so
+    /// a dropped or slow one (25 s budget: a long journal loads first) is
+    /// sent again rather than given up.
     pub fn resume(&self, id_or_name: impl Into<String>, options: CreateOptions) -> Result<u64, ClientClosed> {
         self.post(Command::Create(options.resume(id_or_name)))
     }
@@ -474,12 +513,14 @@ impl Client {
     }
 
     /// Ask for the saved sessions (`named_only`: only named ones), newest
-    /// first, at most `limit` → `Event::SavedSessions`. Only a daemon that
+    /// first, at most `limit` (clamped to 1..=[`SAVED_SESSIONS_MAX`]) →
+    /// `Event::SavedSessions` or `Event::SavedSessionsFailed`. Only a daemon that
     /// lists [`FEATURE_SAVED_SESSIONS`] is asked: otherwise
     /// `Err(Unsupported)` (or `NotConnected` while its features are
     /// unknown), and nothing is sent. The connection thread checks again
     /// (a reconnect to another daemon) and answers `Error::Unsupported`.
-    pub fn saved_sessions(&self, named_only: bool, limit: usize) -> Result<(), RequestError> {
+    pub fn saved_sessions(&self, named_only: bool, limit: u32) -> Result<(), RequestError> {
+        let limit = limit.clamp(1, SAVED_SESSIONS_MAX);
         match self.features() {
             None => Err(RequestError::NotConnected),
             Some(f) if !f.iter().any(|x| x == FEATURE_SAVED_SESSIONS) => {
@@ -489,17 +530,23 @@ impl Client {
         }
     }
 
-    /// Name (`Some`) or unname (`None`) a live or parked session, over the
-    /// control connection (no attach needed) → `Event::Renamed` or
-    /// `Event::RenameFailed`. The name is checked first (`[a-z0-9-]{1,40}`).
-    /// Without `force` a session that already has a name is not renamed
-    /// (`RenameRefusal::Named`, with its `current_name`): ask the user,
-    /// then send again with `force` to replace it. Clearing always applies.
-    pub fn rename(&self, session_id: impl Into<String>, name: Option<&str>, force: bool) -> Result<(), RequestError> {
+    /// Name (`Some`) or unname (`None`) the live or parked session
+    /// `session_id`, over the control connection (no attach needed) →
+    /// `Event::Renamed` or `Event::RenameFailed`. The name is checked first
+    /// (`[a-z0-9-]{1,40}`). Always compare-and-set: the daemon renames only
+    /// if the session's name is still what `expect` says, else it answers
+    /// `RenameRefusal::Named` with the `current_name`. Start with
+    /// [`Expect::Unnamed`]; to replace a name the user has seen, send
+    /// [`Expect::Named`] with it (a name changed meanwhile is refused again,
+    /// never overwritten blindly).
+    pub fn rename(&self, session_id: impl Into<String>, name: Option<&str>, expect: Expect) -> Result<(), RequestError> {
         if let Some(n) = name {
             validate_session_name(n).map_err(RequestError::InvalidName)?;
         }
-        let expect = (!force && name.is_some()).then_some(None);
+        let expect = Some(match expect {
+            Expect::Unnamed => None,
+            Expect::Named(n) => Some(n),
+        });
         Ok(self.send(Command::Rename { session_id: session_id.into(), name: name.map(str::to_string), expect })?)
     }
 
@@ -557,13 +604,16 @@ struct Shared {
 
 enum Ctl {
     Refresh,
-    SavedSessions { named_only: bool, limit: usize },
+    SavedSessions { named_only: bool, limit: u32 },
     Rename { session_id: String, name: Option<String>, expect: Option<Option<String>> },
     Shutdown,
 }
 
-/// A control request waiting for its reply (the daemon answers control
-/// frames in order).
+/// A control request waiting for its reply. Matching replies to requests
+/// by order relies on the daemon answering control frames in order: its
+/// connection loop (`daemon/conn.rs`) awaits `rename_session` and
+/// `saved::saved_sessions` inline before it reads the next frame. If it
+/// ever spawns either, an `Error` could answer the wrong request.
 enum Pending {
     Saved,
     Rename(String),
@@ -572,10 +622,7 @@ enum Pending {
 /// A control request that cannot be sent (no connection): answer it now.
 fn not_sent(events: &Events, ctl: Ctl) {
     match ctl {
-        Ctl::SavedSessions { .. } => emit_error(events, None, Error::Refused {
-            command: Some("saved_sessions".into()),
-            reason: "not connected to the daemon".into(),
-        }),
+        Ctl::SavedSessions { .. } => emit(events, Event::SavedSessionsFailed { reason: "not connected to the daemon".into() }),
         Ctl::Rename { session_id, .. } => emit(events, Event::RenameFailed(RenameFailure::new(
             session_id,
             RenameRefusal::Offline,
@@ -588,7 +635,7 @@ fn not_sent(events: &Events, ctl: Ctl) {
 /// The connection ended with `p` unanswered.
 fn lost(events: &Events, p: Pending, why: &str) {
     match p {
-        Pending::Saved => emit_error(events, None, Error::Transport(format!("saved sessions: {why}"))),
+        Pending::Saved => emit(events, Event::SavedSessionsFailed { reason: format!("the connection dropped ({why})") }),
         Pending::Rename(sid) => emit(events, Event::RenameFailed(RenameFailure::new(
             sid,
             RenameRefusal::Unknown,
@@ -820,13 +867,7 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                     Ok(Some(DaemonFrame::Bye(_))) => break ("daemon said bye".into(), Duration::ZERO),
                     Ok(Some(DaemonFrame::SavedSessionList { sessions, truncated, rejected })) => {
                         take_pending(&mut pending, |p| matches!(p, Pending::Saved));
-                        emit(events, Event::SavedSessions { sessions, truncated });
-                        if rejected > 0 {
-                            emit_error(events, None, Error::Decode(DecodeError {
-                                kind: "saved_session".into(),
-                                error: format!("{rejected} saved session entries did not decode (skipped)"),
-                            }));
-                        }
+                        emit(events, Event::SavedSessions { sessions, truncated, rejected });
                     }
                     Ok(Some(DaemonFrame::Renamed { session_id, name, in_memory_only })) => {
                         take_pending(&mut pending, |p| matches!(p, Pending::Rename(_)));
@@ -854,7 +895,7 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                                 emit(events, Event::RenameFailed(RenameFailure::new(sid, r, message)));
                             }
                             _ if unknown => emit_error(events, None, Error::Unsupported { feature: FEATURE_SAVED_SESSIONS }),
-                            _ => emit_error(events, None, Error::Daemon { session_id: None, message }),
+                            _ => emit(events, Event::SavedSessionsFailed { reason: message }),
                         }
                     }
                     Ok(Some(DaemonFrame::Malformed { kind, error })) => {
@@ -928,14 +969,14 @@ async fn attempt(sh: &Shared, target: &Target, mode: AttachMode, previous: Optio
             let mode = if previous.is_some_and(|p| p.was_owner) && mode != AttachMode::Observe { AttachMode::Takeover } else { mode };
             Attach::Existing { session_id: id.clone(), mode }
         }
-        Target::Create(o) if *create_sent => {
-            // The create may have happened: attach to the session it made
-            // (the one of that name, or the resumed one) instead of making
-            // a second one.
-            let named = c.welcome.sessions.iter().find(|s| {
-                o.name.as_ref().is_some_and(|n| s.name.as_ref() == Some(n))
-                    || o.resume.as_ref().is_some_and(|r| s.is(r) || s.name.as_ref() == Some(r))
-            });
+        // A resume is idempotent on the daemon (`live_continue_target`: a
+        // live target, by id, journal id, name or chain, is attached, not
+        // made twice), so it is simply sent again: the first one may still
+        // be loading its journal, not yet in `Welcome.sessions`.
+        Target::Create(o) if *create_sent && o.resume.is_none() => {
+            // The create may have happened: attach to the session of that
+            // name instead of making a second one.
+            let named = c.welcome.sessions.iter().find(|s| o.name.as_ref().is_some_and(|n| s.name.as_ref() == Some(n)));
             match named {
                 Some(s) => Attach::Existing { session_id: s.id.clone(), mode },
                 None => {
@@ -949,7 +990,8 @@ async fn attempt(sh: &Shared, target: &Target, mode: AttachMode, previous: Optio
         Target::Create(o) => Attach::Create { config: o.config(), mode },
     };
     let (creating, budget) = match &attach {
-        Attach::Create { .. } => (true, ATTACH_TIMEOUT),
+        // A resume loads and folds a journal before `Attached`.
+        Attach::Create { config, .. } => (true, if config.continue_session.is_some() { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT }),
         Attach::Existing { session_id, .. } => {
             (false, if parked(session_id, &c) { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT })
         }
@@ -1046,7 +1088,21 @@ async fn session_loop(sh: Shared, attach_seq: u64, mut target: Target, mode: Att
         };
         let (mut conn, attached) = match res {
             Attempt::Attached(c, a) => (c, a),
-            Attempt::Fatal(reason) => return Exit { session_id, reason },
+            Attempt::Fatal(reason) => {
+                // The folder is gone on the daemon's machine: nothing was
+                // created (the daemon checks `cwd` first), so create once
+                // more in the fallback, and say so.
+                if let Target::Create(o) = &mut target
+                    && let Some(missing) = reason.strip_prefix(MISSING_CWD)
+                    && let Some(fallback) = o.fallback_cwd.take()
+                {
+                    o.cwd = fallback;
+                    create_sent = false;
+                    emit(&events, Event::CwdFallback { attach_seq, missing: missing.to_string(), cwd: o.cwd.resolve() });
+                    continue;
+                }
+                return Exit { session_id, reason };
+            }
             Attempt::Retry { why, after } => {
                 let delay = after.max(backoff);
                 if Instant::now() + delay > deadline {
