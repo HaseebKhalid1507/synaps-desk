@@ -319,6 +319,8 @@ pub struct Avatar {
     _tick_loop: Task<()>,
     last_shape: Rc<RefCell<(Vec<ShapeRect>, Vec<ShapeRect>)>>,
     t_start: Instant,
+    /// SA_TIMING=1: when Enter sent the last turn, and whether its first reply text came in.
+    timing: Option<Option<(Instant, bool)>>,
     first_frame: Rc<Cell<bool>>,
     focus: FocusHandle,
     focus_probe: Option<String>,
@@ -441,6 +443,7 @@ impl Avatar {
             _tick_loop: tick_loop,
             last_shape: Rc::new(RefCell::new((vec![(0, 0, 1, 1)], vec![]))),
             t_start: init.t_start,
+            timing: std::env::var_os("SA_TIMING").map(|_| None),
             first_frame: Rc::new(Cell::new(false)),
             focus: cx.focus_handle(),
             focus_probe: init.focus_probe.then(String::new),
@@ -1724,6 +1727,13 @@ impl Avatar {
                 width: 0.0,
             });
         }
+        if let Some(Some((t0, got))) = &mut self.timing
+            && !*got
+            && !b.reply.is_empty()
+        {
+            *got = true;
+            eprintln!("timing: first reply text from the daemon {} ms after Enter", t0.elapsed().as_millis());
+        }
         let annoyed = b.mood == Mood::Annoyed;
         let Some(bb) = self.bubble.as_mut().filter(|x| x.stream) else { return };
         let text: Vec<char> = b.reply.chars().collect();
@@ -1794,6 +1804,9 @@ impl Avatar {
         let r = if s.link.busy() { s.client.steer(text.clone()) } else { s.client.submit(text.clone()) };
         r.map_err(|e| e.to_string())?;
         s.link.submitted(text);
+        if let Some(t) = &mut self.timing {
+            *t = Some((Instant::now(), false));
+        }
         Ok(())
     }
 
@@ -2541,6 +2554,12 @@ impl Render for Avatar {
             name: self.pack.tone_or("name", 0xf4ed75),
             slash: self.pack.tone_or("slash", 0xff3c68),
         };
+        if let Some(Some((t0, true))) = self.timing
+            && self.bubble.as_ref().is_some_and(|b| b.stream && b.shown > 0 && !b.collapsed)
+        {
+            eprintln!("timing: first word on screen {} ms after Enter", t0.elapsed().as_millis());
+            self.timing = Some(None);
+        }
         if let Some(b) = &self.bubble
             && b.wrap.is_none()
         {

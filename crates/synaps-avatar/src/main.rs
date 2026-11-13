@@ -33,6 +33,8 @@ struct Args {
     check: bool,
     /// Daemon profile (`None`: `$SYNAPS_PROFILE`, else the default daemon).
     profile: Option<String>,
+    /// A daemon socket path instead of a profile (fake daemons in tests).
+    socket: Option<PathBuf>,
     target: session::Target,
     cwd: Option<PathBuf>,
     model: Option<String>,
@@ -51,6 +53,7 @@ Session (one Synaps daemon session drives the body):
                   --model: its model); afterwards follow it
                   with neither: attach to the session named `avatar`, or create it
   --no-session    the body alone (dev control only)
+  --socket PATH   connect to this daemon socket instead of a profile's (test daemons)
   --sleepy-after MIN   sleepy after this many minutes without a turn (default 10)
 
   --pack DIR      character pack (default $XDG_DATA_HOME/synaps-avatar/packs/capri)
@@ -69,6 +72,10 @@ Dev control: newline commands on $XDG_RUNTIME_DIR/synaps-avatar.sock
   submit <text>   abort   prompt confirm|secret [text]   (session / dev)";
 
 fn parse_args() -> Result<Args> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(argv: impl IntoIterator<Item = String>) -> Result<Args> {
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
@@ -83,6 +90,7 @@ fn parse_args() -> Result<Args> {
         threads: (cores / 2).clamp(1, 8),
         check: false,
         profile: None,
+        socket: None,
         target: session::Target::Default,
         cwd: None,
         model: None,
@@ -90,7 +98,7 @@ fn parse_args() -> Result<Args> {
         sleepy_after: std::time::Duration::from_secs(600),
     };
     let (mut session, mut new) = (None, false);
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.into_iter();
     while let Some(arg) = it.next() {
         let mut val = |what: &str| it.next().with_context(|| format!("{arg} needs {what}"));
         match arg.as_str() {
@@ -102,6 +110,7 @@ fn parse_args() -> Result<Args> {
             "--focus-probe" => a.focus_probe = true,
             "--check" => a.check = true,
             "--profile" => a.profile = Some(val("a profile name")?),
+            "--socket" => a.socket = Some(PathBuf::from(val("a socket path")?)),
             "--session" => session = Some(val("a session name or id")?),
             "--new" => new = true,
             "--cwd" => a.cwd = Some(PathBuf::from(val("a directory")?)),
@@ -123,6 +132,9 @@ fn parse_args() -> Result<Args> {
     }
     if !(120.0..=1200.0).contains(&a.height) {
         bail!("--height {} is out of range (120..1200)", a.height);
+    }
+    if a.socket.is_some() && a.profile.is_some() {
+        bail!("--socket and --profile exclude each other");
     }
     a.target = match (session, new) {
         (Some(_), true) => bail!("--session and --new exclude each other"),
@@ -423,15 +435,19 @@ fn connect_session(args: &Args, view: &Entity<view::Avatar>, cx: &mut App) {
         Ok(i) => i,
         Err(e) => fatal(anyhow::anyhow!("identity: {e}")),
     };
-    let (client, rx) = match synaps_client::Client::connect(args.profile.as_deref(), identity) {
+    let endpoint = match &args.socket {
+        Some(p) => synaps_client::Endpoint::Socket(p.clone()),
+        None => synaps_client::Endpoint::profile(args.profile.as_deref()),
+    };
+    let (client, rx) = match synaps_client::Client::spawn(synaps_client::ClientOptions::new(endpoint, identity)) {
         Ok(c) => c,
         Err(e) => fatal(anyhow::anyhow!("cannot start the session client: {e}")),
     };
-    eprintln!(
-        "synaps-avatar: session: profile {}, target {:?}",
-        args.profile.clone().or_else(|| std::env::var("SYNAPS_PROFILE").ok()).unwrap_or_else(|| "default".into()),
-        args.target
-    );
+    let via = match &args.socket {
+        Some(p) => format!("socket {}", p.display()),
+        None => format!("profile {}", args.profile.clone().or_else(|| std::env::var("SYNAPS_PROFILE").ok()).unwrap_or_else(|| "default".into())),
+    };
+    eprintln!("synaps-avatar: session: {via}, target {:?}", args.target);
     let opts = session::Options { target: args.target.clone(), cwd: args.cwd.clone(), model: args.model.clone(), sleepy_after: args.sleepy_after };
     let link = session::Link::new(opts, Instant::now());
     view.update(cx, |v, cx| v.connect_session(client, link, cx));
@@ -484,3 +500,30 @@ fn fatal(e: anyhow::Error) -> ! {
     std::fs::remove_file(control::socket_path()).ok();
     std::process::exit(1);
 }
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: gpui's glob exports a `test` attribute that would shadow `#[test]`.
+    use super::{Args, PathBuf, Result, parse_args_from, session};
+
+    fn parse(args: &[&str]) -> Result<Args> {
+        parse_args_from(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn socket_and_profile_exclude_each_other() {
+        let a = parse(&["--socket", "/run/user/1000/synaps-avante.sock", "--session", "work"]).unwrap();
+        assert_eq!(a.socket, Some(PathBuf::from("/run/user/1000/synaps-avante.sock")));
+        assert_eq!(a.profile, None);
+        assert_eq!(a.target, session::Target::Session("work".into()));
+        let a = parse(&["--profile", "desktopproto"]).unwrap();
+        assert_eq!((a.profile.as_deref(), a.socket), (Some("desktopproto"), None));
+        assert_eq!(a.target, session::Target::Default);
+        for args in [&["--socket", "/tmp/x.sock", "--profile", "p"][..], &["--profile", "p", "--socket", "/tmp/x.sock"][..]] {
+            let e = parse(args).err().expect("both given").to_string();
+            assert!(e.contains("exclude each other"), "{e}");
+        }
+        assert!(parse(&["--socket"]).err().expect("no path").to_string().contains("needs a socket path"));
+    }
+}
+
