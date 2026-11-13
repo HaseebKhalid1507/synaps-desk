@@ -53,6 +53,7 @@ struct Atoms {
     cm: u32,
     wm_class: u32,
     gtk_frame_extents: u32,
+    compton_shadow: u32,
 }
 
 fn intern(conn: &RustConnection, name: &str) -> Result<u32> {
@@ -75,6 +76,7 @@ impl X11 {
             cm: intern(&conn, &format!("_NET_WM_CM_S{screen}"))?,
             wm_class: xproto::AtomEnum::WM_CLASS.into(),
             gtk_frame_extents: intern(&conn, "_GTK_FRAME_EXTENTS")?,
+            compton_shadow: intern(&conn, "_COMPTON_SHADOW")?,
         };
         let composited = conn.get_selection_owner(atoms.cm)?.reply()?.owner != x11rb::NONE;
         Ok(X11 {
@@ -101,6 +103,14 @@ impl X11 {
             self.atoms.gtk_frame_extents,
             xproto::AtomEnum::CARDINAL,
             &[0, 0, 0, 0],
+        )?;
+        // picom/compton: no drop shadow around the transparent window.
+        self.conn.change_property32(
+            xproto::PropMode::REPLACE,
+            self.win,
+            self.atoms.compton_shadow,
+            xproto::AtomEnum::CARDINAL,
+            &[0],
         )?;
         self.conn.flush()?;
         Ok(())

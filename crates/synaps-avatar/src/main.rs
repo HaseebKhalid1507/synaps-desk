@@ -95,12 +95,29 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
-/// On a multi-GPU machine, render on the boot VGA device (the iGPU on a hybrid laptop)
-/// unless the user chose one with `ZED_DEVICE_ID`. Measured on bella (RTX 5070 Ti, driver
-/// 615.78, no compositor): every vkQueuePresent to this 32-bit override-redirect window
-/// busy-waits ~2.3 s on the NVIDIA GPU, so animation ran at 0.4 fps; on the Intel iGPU
-/// presents return at once. A desktop pet belongs on the low-power GPU anyway.
-fn prefer_boot_gpu() {
+/// Process setup that has to happen before any other thread exists. Each knob was
+/// measured on bella (release, `ps` RSS 6 s after start, see LOG.md):
+///
+/// * Render on the boot VGA device (the iGPU on a hybrid laptop) unless `ZED_DEVICE_ID` is
+///   set. On bella every vkQueuePresent to this 32-bit override-redirect window
+///   busy-waited ~2.3 s on the NVIDIA dGPU (0.4 fps); the Intel iGPU presents at once. A
+///   desktop pet belongs on the low-power GPU anyway.
+/// * Keep GPUI's GL fallback from probing EGL when a Vulkan driver is installed. The probe
+///   loads every EGL vendor (NVIDIA's, Mesa's llvmpipe with LLVM) and 50 threads that stay
+///   for the life of the process: 371 → 226 MB RSS. `SA_GL=1` keeps it.
+/// * glibc malloc: two arenas and a 1 MiB trim threshold, so the full-size PNG decode
+///   buffers go back to the OS after scaling: 226 → 84 MB.
+fn process_setup() {
+    if std::env::var_os("SA_GL").is_none() && has_vulkan_driver() {
+        // SAFETY (all set_var calls here): first thing in main, single-threaded.
+        unsafe { std::env::set_var("__EGL_VENDOR_LIBRARY_DIRS", "/nonexistent") };
+    }
+    #[cfg(target_env = "gnu")]
+    // SAFETY: plain libc calls with valid parameters.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 1 << 20);
+    }
     if std::env::var_os("ZED_DEVICE_ID").is_some() || std::env::var_os("SA_ANY_GPU").is_some() {
         return;
     }
@@ -119,14 +136,27 @@ fn prefer_boot_gpu() {
     }
     if let Some((id, _)) = cards.iter().find(|c| c.1 && !c.0.is_empty()) {
         eprintln!("synaps-avatar: {} GPUs, rendering on the boot VGA device {id} (SA_ANY_GPU=1 to let GPUI pick)", cards.len());
-        // SAFETY: first thing in main, before any thread exists.
         unsafe { std::env::set_var("ZED_DEVICE_ID", id) };
     }
 }
 
+/// Whether the Vulkan loader will find at least one driver manifest.
+fn has_vulkan_driver() -> bool {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for var in ["VK_DRIVER_FILES", "VK_ICD_FILENAMES"] {
+        if let Some(v) = std::env::var_os(var) {
+            return std::env::split_paths(&v).any(|p| p.exists());
+        }
+    }
+    let data_dirs = std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
+    dirs.extend(data_dirs.split(':').map(|d| std::path::Path::new(d).join("vulkan/icd.d")));
+    dirs.push("/etc/vulkan/icd.d".into());
+    dirs.iter().any(|d| std::fs::read_dir(d).into_iter().flatten().flatten().any(|e| e.path().extension().is_some_and(|x| x == "json")))
+}
+
 fn main() {
     let t_start = Instant::now();
-    prefer_boot_gpu();
+    process_setup();
     if let Ok(level) = std::env::var("SA_LOG")
         && let Ok(level) = level.parse::<log::LevelFilter>()
     {
@@ -234,9 +264,7 @@ fn run(t_start: Instant) -> Result<()> {
             // stops drawing a window it thinks is hidden.
             x11.set_compositor_hints().ok();
             let px1 = (layout.ground_x as i16, (layout.ground_y - 1) as i16, 1, 1);
-            if std::env::var_os("SA_NOSHAPE").is_none() {
-                x11.set_shape(&[], &[px1]).ok();
-            }
+            x11.set_shape(&[], &[px1]).ok();
             x11.move_to(origin.0, origin.1).ok();
             x11.raise().ok();
             let tx = tx2.clone();
@@ -298,6 +326,11 @@ fn run(t_start: Instant) -> Result<()> {
                 t_start.elapsed().as_millis()
             );
             decode_view.update(cx, |v, cx| v.add_frames(rest.into_iter().zip(all.frames).collect(), true, cx));
+            #[cfg(target_env = "gnu")]
+            // SAFETY: plain libc call; hands freed decode buffers back to the OS.
+            unsafe {
+                libc::malloc_trim(0);
+            }
         })
         .detach();
 

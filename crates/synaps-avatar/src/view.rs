@@ -305,9 +305,6 @@ impl Avatar {
 
     fn tick(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
-        if std::env::var_os("SA_DEBUG").is_some() {
-            eprintln!("tick at {} ms", self.t_start.elapsed().as_millis());
-        }
         self.anim.tick(now);
         if let Some((at, m)) = self.mood_then
             && at <= now
@@ -657,15 +654,6 @@ impl Render for Avatar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let l = self.layout;
         let sf = l.sf;
-        if std::env::var_os("SA_DEBUG").is_some() {
-            eprintln!(
-                "render: frame {} loaded {} shown {:?} at {} ms",
-                self.anim.frame(),
-                self.loaded,
-                self.bubble.as_ref().map(|b| b.shown),
-                self.t_start.elapsed().as_millis()
-            );
-        }
         let composited = self.x11.composited();
         let pal = Palette {
             frame: self.pack.tone_or("frame", 0x8ef5ed),
@@ -756,7 +744,7 @@ impl Render for Avatar {
                 .text_size(px(TAG_FONT))
                 .line_height(px(TAG_FONT + 1.0))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(tracked(&label, 1.6));
+                .child(tracked(&format!("{} // {}", self.name, label), 1.6));
             root = root.child(
                 div()
                     .absolute()
@@ -861,7 +849,7 @@ impl Render for Avatar {
                                 .text_size(px(10.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child(tracked(&self.name, 1.8).text_color(with_alpha(pal.name, fade)))
-                                .child(div().ml(px(2.0)).text_color(with_alpha(pal.slash, fade)).child("/")),
+                                .child(div().ml(px(4.0)).text_color(with_alpha(pal.slash, fade)).child("/")),
                         )
                         .child(
                             tracked(&header, 1.5)
