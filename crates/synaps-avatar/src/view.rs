@@ -145,6 +145,9 @@ struct Bubble {
     stream: bool,
     /// The turn still runs: more text may come.
     more: bool,
+    /// Widest the panel has been: it never narrows while open (a narrower shape would
+    /// land before the narrower present and clip the old one for a frame).
+    width: f32,
 }
 
 /// How long a typed-out bubble stays open.
@@ -367,6 +370,8 @@ pub struct Avatar {
     /// A short note in the input footer, until then.
     hint: Option<(String, Instant)>,
     _subs: Vec<Subscription>,
+    /// Laid-out bubble buttons (window logical px), for the dev `state` (test clicks).
+    buttons: Rc<RefCell<Vec<(&'static str, Bounds<Pixels>)>>>,
 }
 
 pub struct Init {
@@ -473,6 +478,7 @@ impl Avatar {
             label_override: None,
             hint: None,
             _subs: vec![activation],
+            buttons: Rc::default(),
         }
     }
 
@@ -1486,6 +1492,7 @@ impl Avatar {
             collapsed: false,
             stream: false,
             more: false,
+            width: 0.0,
         });
         if self.mood != Mood::Talking {
             self.set_mood(Mood::Talking, now);
@@ -1596,6 +1603,11 @@ impl Avatar {
                                                                        "prev": i.prev, "esc": i.esc_at.is_some() })),
             "draft": self.draft.chars().count(),
             "prompt_ui": self.prompt_ui.as_ref().map(|p| serde_json::json!({ "title": p.view.title, "dismissed": p.dismissed })),
+            "buttons": self.buttons.borrow().iter().map(|(id, b)| {
+                let sf = self.layout.sf;
+                let (x, y) = (self.origin.0 as f32 + f32::from(b.origin.x) * sf, self.origin.1 as f32 + f32::from(b.origin.y) * sf);
+                (id.to_string(), serde_json::json!([x.round() as i32, y.round() as i32, (f32::from(b.size.width) * sf) as i32, (f32::from(b.size.height) * sf) as i32]))
+            }).collect::<serde_json::Map<_, _>>(),
         })
         .to_string()
     }
@@ -1709,6 +1721,7 @@ impl Avatar {
                 collapsed: !b.busy,
                 stream: true,
                 more: b.busy,
+                width: 0.0,
             });
         }
         let annoyed = b.mood == Mood::Annoyed;
@@ -2931,6 +2944,7 @@ impl Render for Avatar {
 
         // Speech bubble: the text field, a pending prompt, the reply (or the focus probe).
         let mut panel_geom: Option<PanelGeom> = None;
+        self.buttons.borrow_mut().clear();
         let busy = self.session.as_ref().is_some_and(|sess| sess.link.busy());
         if let Some(mode) = mode {
             let line_strings = |chars: &[char], w: &Wrapped| -> Vec<String> {
@@ -3000,7 +3014,14 @@ impl Render for Avatar {
                 + 5.0
                 + 32.0;
             let min_w = PANEL_MIN_W.max(header_w).min(max_w);
-            let w = (text_w + PAD_L + PAD_R + 2.0).clamp(min_w, max_w);
+            let mut w = (text_w + PAD_L + PAD_R + 2.0).clamp(min_w, max_w);
+            if mode == PanelMode::Reply
+                && let Some(b) = &mut self.bubble
+            {
+                // A streaming reply takes the full width at once: no growth mid-stream.
+                w = if b.stream && b.more { max_w } else { w.max(b.width).min(max_w) };
+                b.width = w;
+            }
             // Fit the page: the lines it will hold once typed out (so it doesn't grow while
             // streaming), never an empty band above the footer.
             let rows = match pages {
@@ -3120,8 +3141,12 @@ impl Render for Avatar {
                     .border_color(line_c(on))
                     .child(chevron(dir, with_alpha(pal.text, if on { 0.95 } else { 0.3 })))
             };
+            let probes = self.buttons.clone();
             let tbtn = |id: &'static str, text: &str, colour: u32, on: bool| {
+                let probes = probes.clone();
                 div()
+                    .child(canvas(move |b, _, _| probes.borrow_mut().push((id, b)), |_, _, _, _| {}).absolute().top_0().left_0().size_full())
+                    .relative()
                     .id(id)
                     .h(px(19.0))
                     .px(px(8.0))
