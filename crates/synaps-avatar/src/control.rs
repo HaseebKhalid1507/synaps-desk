@@ -32,9 +32,6 @@ pub enum Command {
     Page(i32),
     /// Music mode (headphones, notes, head-bob to the pack's BPM).
     Music(bool),
-    /// Dev: the teleport line's look, and optionally a fixed seed for every following
-    /// teleport (same seed + same route = the same strike).
-    Bolt { style: crate::fx::LineStyle, seed: Option<u64> },
     /// Collapse the bubble to the status tag (true) or expand it again.
     Collapse(bool),
     /// Internal: from the X watcher thread.
@@ -93,24 +90,11 @@ impl Command {
                 "off" => Command::Music(false),
                 _ => bail!("usage: music on|off"),
             },
-            "bolt" => {
-                let mut it = rest.split_whitespace();
-                let style = it.next().and_then(crate::fx::LineStyle::parse);
-                let seed = match (it.next(), it.next(), it.next()) {
-                    (None, ..) => None,
-                    (Some("seed"), Some(n), None) => Some(n.parse::<u64>().context("bolt: bad seed")?),
-                    _ => bail!("usage: bolt plain|glow [seed <n>]"),
-                };
-                match style {
-                    Some(style) => Command::Bolt { style, seed },
-                    None => bail!("usage: bolt plain|glow [seed <n>]"),
-                }
-            }
             "state" => Command::State,
             "hide" => Command::Hide,
             "quit" => Command::Quit,
             _ => bail!(
-                "unknown command `{line}` (mood <name> | clip <id> | say <text> | pos <x> <y> [now] | perch [sit|stand] [win] | perch off | page next|prev | collapse | expand | music on|off | bolt plain|glow [seed <n>] | glitch | state | hide | quit)"
+                "unknown command `{line}` (mood <name> | clip <id> | say <text> | pos <x> <y> [now] | perch [sit|stand] [win] | perch off | page next|prev | collapse | expand | music on|off | glitch | state | hide | quit)"
             ),
         })
     }

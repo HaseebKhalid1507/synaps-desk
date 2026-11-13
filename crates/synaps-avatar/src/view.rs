@@ -292,10 +292,6 @@ pub struct Avatar {
     /// Last laid-out box of the status tag (window logical px), to tear it in a glitch.
     tag_box: Cell2,
     music: Option<MusicOn>,
-    /// The teleport line's look (pack default, `bolt` dev command).
-    bolt_style: fx::LineStyle,
-    /// Dev: every teleport uses this seed (vanish, bolt and landing).
-    bolt_seed: Option<u64>,
     notes: Vec<NoteMasks>,
     notes_shown: usize,
     glints_shown: usize,
@@ -321,7 +317,6 @@ fn jitter(rng: &mut Rng, ms: u64) -> Duration {
 impl Avatar {
     pub fn new(init: Init, cx: &mut Context<Self>) -> Avatar {
         let pack = init.pack;
-        let bolt_style = fx::LineStyle::parse(&pack.behaviour.teleport.line_style).unwrap_or(fx::LineStyle::Glow);
         let default = pack.frame(&pack.catalog.default_sprite).unwrap_or(0);
         let font = pack.behaviour.font.clone().unwrap_or_else(|| "Fira Sans".into());
         let vis = Self::visible_range(&init.x11, &init.layout, init.origin);
@@ -386,8 +381,6 @@ impl Avatar {
             tag_w: Rc::new(Cell::new(150.0)),
             tag_box: Rc::new(Cell::new(None)),
             music: None,
-            bolt_style,
-            bolt_seed: None,
             notes: Vec::new(),
             notes_shown: 0,
             glints_shown: 0,
@@ -1138,7 +1131,7 @@ impl Avatar {
                 let from = self.center_root(self.origin);
                 let to = self.center_root(to);
                 let seed = self.teleport.as_ref().map_or(0, |t| t.seed) ^ 0xb017_5eed;
-                let bolt = Bolt::new(from, to, seed, 220.0 * self.layout.sf, self.bolt_style);
+                let bolt = Bolt::new(from, to, seed, 220.0 * self.layout.sf, fx::BOLT_STYLE);
                 if let Some(tp) = &mut self.teleport {
                     tp.bolt = Some(bolt);
                     tp.leg = Leg::Bolt(now);
@@ -1159,21 +1152,39 @@ impl Avatar {
         let Some(tp) = &mut self.teleport else { return false };
         let Leg::Bolt(t0) = tp.leg else { return false };
         let u = now.duration_since(t0).as_secs_f32() * 1000.0 / fx::BOLT_MS;
-        let (to, place, moved) = (tp.to, tp.place, tp.moved);
-        // The tail has all but reached the target: hand over to the landing glitch.
+        let (to, place, mut moved, seed) = (tp.to, tp.place, tp.moved, tp.seed);
+        let mut redraw = false;
+        // The trail is short and closing in: the landing glitch starts under it.
+        if u >= fx::BOLT_LAND && self.hidden {
+            self.hidden = false;
+            self.glitch = Some(Glitch::new(GlitchKind::Land, now, seed ^ 0x1a4d));
+            if !moved {
+                moved = true;
+                if let Some(tp) = &mut self.teleport {
+                    tp.moved = true;
+                }
+                self.arrive(to, place, now);
+            }
+            redraw = true;
+        }
+        // The trail has drained into her: the landing glitch finishes the teleport.
         if u >= fx::BOLT_END {
             for i in 0..BOLT_LAYERS {
                 self.x11.fx_unmap(i);
             }
             self.x11.flush();
-            tp.leg = Leg::Appear;
-            self.hidden = false;
-            self.glitch = Some(Glitch::new(GlitchKind::Land, now, tp.seed ^ 0x1a4d));
-            if !moved {
-                self.arrive(to, place, now);
+            if self.glitch.is_none() {
+                // The landing already finished (a stalled frame): done.
+                self.teleport = None;
+                if self.placement == Placement::Ground {
+                    state::save(self.ground());
+                }
+            } else if let Some(tp) = &mut self.teleport {
+                tp.leg = Leg::Appear;
             }
             return true;
         }
+        let Some(tp) = &self.teleport else { return redraw };
         if let Some(b) = &tp.bolt {
             let (bx, by, bw, bh) = b.bbox();
             let o = (bx, by);
@@ -1198,7 +1209,7 @@ impl Avatar {
             }
             self.arrive(to, place, now);
         }
-        false
+        redraw
     }
 
     /// Land at the teleport target (window moved while the body is hidden).
@@ -1284,14 +1295,6 @@ impl Avatar {
             Command::Quit => {
                 self.quit(cx);
                 "bye".into()
-            }
-            Command::Bolt { style, seed } => {
-                self.bolt_style = style;
-                self.bolt_seed = seed;
-                match seed {
-                    Some(n) => format!("ok bolt {} seed {n}", style.key()),
-                    None => format!("ok bolt {}", style.key()),
-                }
             }
             Command::Glitch => {
                 self.glitch = Some(Glitch::new(GlitchKind::Big, now, self.rng.next()));
@@ -1415,7 +1418,6 @@ impl Avatar {
             "scale_factor": self.layout.sf,
             "focus_probe": self.focus_probe,
             "music": self.music.is_some(),
-            "bolt": self.bolt_style.key(),
         })
         .to_string()
     }
@@ -1483,7 +1485,7 @@ impl Avatar {
         if let Some(b) = &mut self.bubble {
             b.collapsed = true;
         }
-        let seed = self.bolt_seed.unwrap_or_else(|| self.rng.next());
+        let seed = self.rng.next();
         self.glitch = Some(Glitch::new(GlitchKind::Vanish, now, seed));
         self.teleport = Some(Teleport { seed, leg: Leg::Vanish, to, place, bolt: None, moved: false });
     }

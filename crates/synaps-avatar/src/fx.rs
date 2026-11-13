@@ -644,35 +644,25 @@ pub fn star(cx: f32, cy: f32, r: f32, spin: f32) -> Vec<(f32, f32)> {
 pub const BOLT_MS: f32 = 420.0;
 /// The body lands (window moves, still hidden) when the tip reaches the target…
 pub const BOLT_ARRIVE: f32 = 0.4;
-/// …and the landing glitch takes over as the trail drains into it.
-pub const BOLT_END: f32 = 0.62;
+/// …the landing glitch starts while the trail is still visible…
+pub const BOLT_LAND: f32 = 0.5;
+/// …and the trail drains into her for a few more frames (no empty frame in between).
+pub const BOLT_END: f32 = 0.66;
 /// How the travelling line looks. Both travel the same way (the tip races from the
-/// origin to the target with the trail behind it); only the drawing differs.
+/// origin to the target with the trail behind it); only the drawing differs. Two looks
+/// are kept only until Haseeb picks one (shots/r4/teleport-compare.mp4); then the other
+/// goes, with this enum.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LineStyle {
     /// One flat red ribbon (the bar's bolt red); no core, glow, split or flicker.
+    #[allow(dead_code)]
     Plain,
     /// A red bolt with a light core, two stacked glow halos and a blue/cyan split; the
     /// zig-zag, width, glow and forks re-roll every frame.
     Glow,
 }
 
-impl LineStyle {
-    pub fn parse(s: &str) -> Option<LineStyle> {
-        match s {
-            "plain" => Some(LineStyle::Plain),
-            "glow" => Some(LineStyle::Glow),
-            _ => None,
-        }
-    }
-
-    pub fn key(self) -> &'static str {
-        match self {
-            LineStyle::Plain => "plain",
-            LineStyle::Glow => "glow",
-        }
-    }
-}
+pub const BOLT_STYLE: LineStyle = LineStyle::Glow;
 
 /// Plain: the bar's bolt red.
 pub const BOLT_LINE: u32 = 0xff1738;
@@ -775,7 +765,7 @@ impl Bolt {
             let v = v.clamp(0.0, 1.0);
             1.0 - (1.0 - v) * (1.0 - v)
         };
-        (ease(0.06 + u / 0.4), ease((u - 0.13) / 0.47))
+        (ease(0.06 + u / 0.4), ease((u - 0.13) / 0.55))
     }
 
     /// The bolt at time `u`, bottom layer first (empty before/after the strike).
@@ -823,11 +813,12 @@ impl Bolt {
         // The split: the bolt again either side, across the strike, 4–8 px.
         let d = fl.range(4.0, 8.0) * (self.scale / 220.0).clamp(0.8, 1.6);
         let shift = |s: f32| pts.iter().map(|&p| along(p, self.axis, 0.0, s)).collect::<Vec<_>>();
+        // Halos at the bottom, the split fringes over them, then the bolt and its core.
         let mut out = vec![
-            BoltLayer { rgb: BOLT_SPLIT[0], grid: 2, polys: vec![ribbon(&shift(d), &widths)] },
-            BoltLayer { rgb: BOLT_SPLIT[1], grid: 2, polys: vec![ribbon(&shift(-d), &widths)] },
             BoltLayer { rgb: BOLT_GLOW[0], grid, polys: vec![ribbon(&pts, &grow(1.9 * halo, 4.0))] },
             BoltLayer { rgb: BOLT_GLOW[1], grid, polys: vec![ribbon(&pts, &grow(1.35 * halo, 1.5))] },
+            BoltLayer { rgb: BOLT_SPLIT[0], grid: 2, polys: vec![ribbon(&shift(d), &widths)] },
+            BoltLayer { rgb: BOLT_SPLIT[1], grid: 2, polys: vec![ribbon(&shift(-d), &widths)] },
             BoltLayer { rgb: BOLT_GLOW[2], grid: 2, polys: vec![ribbon(&pts, &widths)] },
             BoltLayer { rgb: BOLT_GLOW[3], grid: 2, polys: vec![ribbon(&pts, &grow(0.38, 0.0))] },
         ];
@@ -846,7 +837,7 @@ impl Bolt {
                 let stem = [o, fork(0.1, 0.25), fork(0.05, 0.45), fork(0.4, 0.62), fork(0.32, 0.85), fork(0.7, 1.05)];
                 let th = (self.scale * 0.012).clamp(1.6, 3.6);
                 let w: Vec<f32> = [1.3, 1.6, 1.25, 0.9, 0.55, 0.1].iter().map(|v| v * th).collect();
-                out[3].polys.push(ribbon(&stem, &w.iter().map(|v| v * 1.6 + 1.0).collect::<Vec<_>>()));
+                out[1].polys.push(ribbon(&stem, &w.iter().map(|v| v * 1.6 + 1.0).collect::<Vec<_>>()));
                 out[4].polys.push(ribbon(&stem, &w));
             }
         }
@@ -1052,8 +1043,10 @@ mod tests {
         let tips: Vec<f32> = (0..frames).map(|i| Bolt::span(i as f32 * 33.3 / BOLT_MS).0).collect();
         let racing = tips.iter().filter(|&&h| h < 0.98).count();
         assert!((3..=5).contains(&racing), "{tips:?}");
-        // The trail drains before the landing takes over.
+        // The landing starts with the trail still in view; the trail is gone by the end.
+        let (h, t) = Bolt::span(BOLT_LAND);
+        assert!(h > 0.99 && h - t > 0.08, "{h} {t}");
         let (h, t) = Bolt::span(BOLT_END);
-        assert!(h > 0.99 && t > 0.95);
+        assert!(h > 0.99 && t > 0.98, "{h} {t}");
     }
 }

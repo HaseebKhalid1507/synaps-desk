@@ -293,25 +293,6 @@ pub struct ExtraFrame {
     pub sha256: Option<String>,
 }
 
-/// Teleport look.
-#[derive(Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct TeleportSpec {
-    /// The travelling line: "glow" (default) or "plain".
-    #[serde(default = "line_style_default")]
-    pub line_style: String,
-}
-
-impl Default for TeleportSpec {
-    fn default() -> Self {
-        TeleportSpec { line_style: line_style_default() }
-    }
-}
-
-fn line_style_default() -> String {
-    "glow".into()
-}
-
 /// Music mode: a headphones pose (floor and window-edge variants), note sprites drifting up
 /// from emitters on the beat, a head-bob at a fixed tempo. No audio is read.
 #[derive(Deserialize, Clone, Debug)]
@@ -401,8 +382,6 @@ pub struct Behaviour {
     pub perch: Option<PerchSpec>,
     #[serde(default)]
     pub music: Option<MusicSpec>,
-    #[serde(default)]
-    pub teleport: TeleportSpec,
 }
 
 /// A frame to decode: catalog sprite or sidecar extra.
@@ -583,10 +562,6 @@ impl Pack {
         }
         let mut pack =
             Pack { dir: dir.to_owned(), name: pack_name, catalog, behaviour, frames, index, poses: Vec::new(), seat_ref, perch_frames };
-
-        if crate::fx::LineStyle::parse(&pack.behaviour.teleport.line_style).is_none() {
-            bail!("teleport.lineStyle `{}`: expected \"plain\" or \"glow\"", pack.behaviour.teleport.line_style);
-        }
 
         // Behaviour references.
         let check_steps = |what: &str, steps: &[Step], errors: &mut Vec<String>, pack: &Pack| {
