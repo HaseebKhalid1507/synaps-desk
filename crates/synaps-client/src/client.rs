@@ -22,6 +22,7 @@
 //! repair) triggers a `Query{Messages}`, whose result lands as a
 //! `HistoryUpdate::Replace`.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -110,6 +111,9 @@ pub struct CreateOptions {
     /// making a second one. Without a name such a create fails (`Detached`)
     /// rather than risk a duplicate.
     pub name: Option<String>,
+    /// Resume this saved session (id or name) instead of starting a new
+    /// one: `continue_session`. See [`Client::resume`].
+    pub resume: Option<String>,
 }
 
 impl CreateOptions {
@@ -132,12 +136,17 @@ impl CreateOptions {
         self.name = Some(name.into());
         self
     }
+    pub fn resume(mut self, id_or_name: impl Into<String>) -> Self {
+        self.resume = Some(id_or_name.into());
+        self
+    }
 
     pub fn config(&self) -> CreateConfig {
         CreateConfig {
             model_override: self.model.clone(),
             cwd: self.cwd.resolve(),
             name: self.name.clone(),
+            continue_session: self.resume.clone().map(Some),
             auto_approve_confirms: false,
         }
     }
@@ -155,6 +164,10 @@ pub enum Command {
     Answer { prompt_id: u64, value: Option<String> },
     /// Re-fetch the whole history (`Query{Messages}`) → `HistoryUpdate::Replace`.
     Resync,
+    /// `SavedSessions` on the control connection → `Event::SavedSessions`.
+    SavedSessions { named_only: bool, limit: usize },
+    /// `Rename` on the control connection → `Event::Renamed` / `RenameFailed`.
+    Rename { session_id: String, name: Option<String>, expect: Option<Option<String>> },
     Detach,
     Shutdown,
 }
@@ -171,6 +184,8 @@ impl Command {
             Command::Cancel => "cancel",
             Command::Answer { .. } => "answer",
             Command::Resync => "query",
+            Command::SavedSessions { .. } => "saved_sessions",
+            Command::Rename { .. } => "rename",
             Command::Detach => "detach",
             Command::Shutdown => "shutdown",
         }
@@ -191,6 +206,12 @@ impl std::fmt::Debug for Command {
             Command::Answer { prompt_id, .. } => {
                 f.debug_struct("Answer").field("prompt_id", prompt_id).field("value", &format_args!("<redacted>")).finish()
             }
+            Command::SavedSessions { named_only, limit } => {
+                f.debug_struct("SavedSessions").field("named_only", named_only).field("limit", limit).finish()
+            }
+            Command::Rename { session_id, name, expect } => {
+                f.debug_struct("Rename").field("session_id", session_id).field("name", name).field("expect", expect).finish()
+            }
             other => f.write_str(match other {
                 Command::RefreshSessions => "RefreshSessions",
                 Command::Cancel => "Cancel",
@@ -209,7 +230,9 @@ impl std::fmt::Debug for Command {
 #[non_exhaustive]
 pub enum Status {
     Connecting,
-    Connected { daemon_version: String, profile: Option<String>, pid: u32 },
+    /// `features`: the daemon's `Welcome.features` (e.g.
+    /// [`FEATURE_SAVED_SESSIONS`]); empty from an older daemon.
+    Connected { daemon_version: String, profile: Option<String>, pid: u32, features: Vec<String> },
     Reconnecting { why: String },
     Offline(String),
     /// The daemon speaks another protocol. Not retried by itself:
@@ -237,6 +260,9 @@ pub enum Error {
     Decode(DecodeError),
     /// A session command with no session attached.
     NotAttached { command: &'static str },
+    /// The daemon does not list this `Welcome.features` entry; nothing was
+    /// sent.
+    Unsupported { feature: &'static str },
 }
 
 impl std::fmt::Display for Error {
@@ -248,6 +274,7 @@ impl std::fmt::Display for Error {
             Error::Transport(e) => write!(f, "connection: {e}"),
             Error::Decode(e) => e.fmt(f),
             Error::NotAttached { command } => write!(f, "{command}: not attached to a session"),
+            Error::Unsupported { feature } => write!(f, "this daemon does not support {feature}"),
         }
     }
 }
@@ -284,6 +311,13 @@ pub enum Event {
     /// replaced). Session commands now fail with `Error::NotAttached`.
     Detached { attach_seq: u64, session_id: Option<String>, reason: String },
     Error { attach_seq: Option<u64>, error: Error },
+    /// Reply to [`Client::saved_sessions`]. A failure comes as `Error`
+    /// (`Unsupported`, `Refused { command: Some("saved_sessions") }`, ...).
+    SavedSessions { sessions: Vec<SavedSession>, truncated: bool },
+    /// Reply to [`Client::rename`]: `session_id` is now called `name`.
+    Renamed { session_id: String, name: Option<String>, in_memory_only: bool },
+    /// Reply to [`Client::rename`]: not renamed (see [`RenameRefusal`]).
+    RenameFailed(RenameFailure),
 }
 
 impl Event {
@@ -297,7 +331,11 @@ impl Event {
             | Event::InputOwner { attach_seq, .. }
             | Event::Detached { attach_seq, .. } => Some(*attach_seq),
             Event::Error { attach_seq, .. } => *attach_seq,
-            Event::Status(_) | Event::Sessions(_) => None,
+            Event::Status(_)
+            | Event::Sessions(_)
+            | Event::SavedSessions { .. }
+            | Event::Renamed { .. }
+            | Event::RenameFailed(_) => None,
         }
     }
 }
@@ -314,6 +352,38 @@ impl std::fmt::Display for ClientClosed {
 
 impl std::error::Error for ClientClosed {}
 
+/// Why a control request ([`Client::saved_sessions`], [`Client::rename`])
+/// was not sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RequestError {
+    Closed,
+    /// No control connection yet (or now): the daemon's features are unknown.
+    NotConnected,
+    /// The connected daemon does not list this feature.
+    Unsupported { feature: &'static str },
+    InvalidName(InvalidSessionName),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestError::Closed => ClientClosed.fmt(f),
+            RequestError::NotConnected => f.write_str("not connected to the daemon"),
+            RequestError::Unsupported { feature } => write!(f, "this daemon does not support {feature}"),
+            RequestError::InvalidName(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+impl From<ClientClosed> for RequestError {
+    fn from(_: ClientClosed) -> Self {
+        RequestError::Closed
+    }
+}
+
 struct Msg {
     cmd: Command,
     attach_seq: u64,
@@ -327,7 +397,11 @@ pub struct Client {
     /// The last `attach_seq`. Held across the send, so clones on several
     /// threads enqueue attaches in `attach_seq` order.
     seq: Arc<Mutex<u64>>,
+    /// The control connection's `Welcome.features`; `None` while it is down.
+    features: Features,
 }
+
+type Features = Arc<Mutex<Option<Vec<String>>>>;
 
 impl Client {
     /// Start the connection thread. Fails only if the thread or its runtime
@@ -336,8 +410,10 @@ impl Client {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let (tx, rx) = mpsc::unbounded_channel();
         let (etx, erx) = async_channel::unbounded();
-        std::thread::Builder::new().name("synaps-conn".into()).spawn(move || rt.block_on(run(options, rx, etx)))?;
-        Ok((Client { tx, seq: Arc::new(Mutex::new(0)) }, erx))
+        let features: Features = Arc::default();
+        let f2 = features.clone();
+        std::thread::Builder::new().name("synaps-conn".into()).spawn(move || rt.block_on(run(options, rx, etx, f2)))?;
+        Ok((Client { tx, seq: Arc::new(Mutex::new(0)), features }, erx))
     }
 
     /// Discover the daemon for `profile` (`None`: `$SYNAPS_PROFILE`, else
@@ -375,6 +451,56 @@ impl Client {
     /// Create a session and attach to it. Returns the `attach_seq`.
     pub fn create(&self, options: CreateOptions) -> Result<u64, ClientClosed> {
         self.post(Command::Create(options))
+    }
+
+    /// Resume a saved session by journal id or name (`Attach::Create` with
+    /// `continue_session`), and attach to it; works on every v3 daemon. A
+    /// session that is live in the daemon is attached instead. Failures
+    /// ("no session named 'x'", a journal live in another process) come
+    /// back as `Event::Detached { reason }` for the returned `attach_seq`.
+    pub fn resume(&self, id_or_name: impl Into<String>, options: CreateOptions) -> Result<u64, ClientClosed> {
+        self.post(Command::Create(options.resume(id_or_name)))
+    }
+
+    /// The connected daemon's `Welcome.features`; `None` while the control
+    /// connection is down.
+    pub fn features(&self) -> Option<Vec<String>> {
+        self.features.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether the connected daemon lists `feature`.
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features().is_some_and(|f| f.iter().any(|x| x == feature))
+    }
+
+    /// Ask for the saved sessions (`named_only`: only named ones), newest
+    /// first, at most `limit` → `Event::SavedSessions`. Only a daemon that
+    /// lists [`FEATURE_SAVED_SESSIONS`] is asked: otherwise
+    /// `Err(Unsupported)` (or `NotConnected` while its features are
+    /// unknown), and nothing is sent. The connection thread checks again
+    /// (a reconnect to another daemon) and answers `Error::Unsupported`.
+    pub fn saved_sessions(&self, named_only: bool, limit: usize) -> Result<(), RequestError> {
+        match self.features() {
+            None => Err(RequestError::NotConnected),
+            Some(f) if !f.iter().any(|x| x == FEATURE_SAVED_SESSIONS) => {
+                Err(RequestError::Unsupported { feature: FEATURE_SAVED_SESSIONS })
+            }
+            Some(_) => Ok(self.send(Command::SavedSessions { named_only, limit })?),
+        }
+    }
+
+    /// Name (`Some`) or unname (`None`) a live or parked session, over the
+    /// control connection (no attach needed) → `Event::Renamed` or
+    /// `Event::RenameFailed`. The name is checked first (`[a-z0-9-]{1,40}`).
+    /// Without `force` a session that already has a name is not renamed
+    /// (`RenameRefusal::Named`, with its `current_name`): ask the user,
+    /// then send again with `force` to replace it. Clearing always applies.
+    pub fn rename(&self, session_id: impl Into<String>, name: Option<&str>, force: bool) -> Result<(), RequestError> {
+        if let Some(n) = name {
+            validate_session_name(n).map_err(RequestError::InvalidName)?;
+        }
+        let expect = (!force && name.is_some()).then_some(None);
+        Ok(self.send(Command::Rename { session_id: session_id.into(), name: name.map(str::to_string), expect })?)
     }
 
     pub fn submit(&self, text: impl Into<String>) -> Result<(), ClientClosed> {
@@ -431,7 +557,50 @@ struct Shared {
 
 enum Ctl {
     Refresh,
+    SavedSessions { named_only: bool, limit: usize },
+    Rename { session_id: String, name: Option<String>, expect: Option<Option<String>> },
     Shutdown,
+}
+
+/// A control request waiting for its reply (the daemon answers control
+/// frames in order).
+enum Pending {
+    Saved,
+    Rename(String),
+}
+
+/// A control request that cannot be sent (no connection): answer it now.
+fn not_sent(events: &Events, ctl: Ctl) {
+    match ctl {
+        Ctl::SavedSessions { .. } => emit_error(events, None, Error::Refused {
+            command: Some("saved_sessions".into()),
+            reason: "not connected to the daemon".into(),
+        }),
+        Ctl::Rename { session_id, .. } => emit(events, Event::RenameFailed(RenameFailure::new(
+            session_id,
+            RenameRefusal::Offline,
+            "not connected to the daemon; nothing was renamed",
+        ))),
+        Ctl::Refresh | Ctl::Shutdown => {}
+    }
+}
+
+/// The connection ended with `p` unanswered.
+fn lost(events: &Events, p: Pending, why: &str) {
+    match p {
+        Pending::Saved => emit_error(events, None, Error::Transport(format!("saved sessions: {why}"))),
+        Pending::Rename(sid) => emit(events, Event::RenameFailed(RenameFailure::new(
+            sid,
+            RenameRefusal::Unknown,
+            format!("the connection dropped before the reply ({why}); the rename may have applied"),
+        ))),
+    }
+}
+
+/// Take the oldest pending request `want` accepts.
+fn take_pending(pending: &mut VecDeque<Pending>, want: impl Fn(&Pending) -> bool) -> Option<Pending> {
+    let i = pending.iter().position(want)?;
+    pending.remove(i)
 }
 
 struct SessionTask {
@@ -446,10 +615,10 @@ struct Exit {
     reason: String,
 }
 
-async fn run(options: ClientOptions, mut rx: mpsc::UnboundedReceiver<Msg>, events: Events) {
+async fn run(options: ClientOptions, mut rx: mpsc::UnboundedReceiver<Msg>, events: Events, features: Features) {
     let sh = Shared { endpoint: options.endpoint, identity: options.identity, events };
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-    let control = tokio::spawn(control_loop(sh.clone(), ctl_rx, options.poll_sessions));
+    let control = tokio::spawn(control_loop(sh.clone(), ctl_rx, options.poll_sessions, features));
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(u64, Exit)>();
     let mut session: Option<SessionTask> = None;
     loop {
@@ -459,6 +628,12 @@ async fn run(options: ClientOptions, mut rx: mpsc::UnboundedReceiver<Msg>, event
                 match cmd {
                     Command::RefreshSessions => {
                         let _ = ctl_tx.send(Ctl::Refresh);
+                    }
+                    Command::SavedSessions { named_only, limit } => {
+                        let _ = ctl_tx.send(Ctl::SavedSessions { named_only, limit });
+                    }
+                    Command::Rename { session_id, name, expect } => {
+                        let _ = ctl_tx.send(Ctl::Rename { session_id, name, expect });
                     }
                     Command::Attach { .. } | Command::Create(_) => {
                         if let Some(old) = session.take() {
@@ -532,7 +707,7 @@ async fn stop(mut s: SessionTask, reason: &str, events: &Events) {
 
 /// Run `fut` until it ends or `ctl` says shut down (`None`). A `Refresh`
 /// meanwhile is dropped: the next connect lists sessions anyway.
-async fn until_shutdown<F: Future>(ctl: &mut mpsc::UnboundedReceiver<Ctl>, fut: F) -> Option<F::Output> {
+async fn until_shutdown<F: Future>(ctl: &mut mpsc::UnboundedReceiver<Ctl>, events: &Events, fut: F) -> Option<F::Output> {
     tokio::pin!(fut);
     loop {
         tokio::select! {
@@ -540,31 +715,37 @@ async fn until_shutdown<F: Future>(ctl: &mut mpsc::UnboundedReceiver<Ctl>, fut: 
             m = ctl.recv() => match m {
                 Some(Ctl::Refresh) => {}
                 Some(Ctl::Shutdown) | None => return None,
+                Some(other) => not_sent(events, other),
             },
         }
     }
 }
 
-async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: Option<Duration>) {
+async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: Option<Duration>, features: Features) {
     let events = &sh.events;
+    let set_features = |f: Option<Vec<String>>| *features.lock().unwrap_or_else(|e| e.into_inner()) = f;
     let mut backoff = BACKOFF_START;
     emit(events, Event::Status(Status::Connecting));
     loop {
         let path = sh.endpoint.resolve();
-        let Some(res) = until_shutdown(&mut ctl, Conn::connect(&path, sh.identity.hello(None))).await else { return };
+        let Some(res) = until_shutdown(&mut ctl, events, Conn::connect(&path, sh.identity.hello(None))).await else { return };
         let mut c = match res {
             Ok(c) => c,
             Err(e) => {
                 if let Some(inc) = e.downcast_ref::<Incompatible>() {
                     // Terminal: retrying cannot help. A refresh tries again.
                     emit(events, Event::Status(Status::Incompatible(inc.clone())));
-                    match ctl.recv().await {
-                        Some(Ctl::Refresh) => continue,
-                        Some(Ctl::Shutdown) | None => return,
+                    loop {
+                        match ctl.recv().await {
+                            Some(Ctl::Refresh) => break,
+                            Some(Ctl::Shutdown) | None => return,
+                            Some(other) => not_sent(events, other),
+                        }
                     }
+                    continue;
                 }
                 emit(events, Event::Status(Status::Offline(format!("{e:#}"))));
-                if until_shutdown(&mut ctl, tokio::time::sleep(backoff)).await.is_none() {
+                if until_shutdown(&mut ctl, events, tokio::time::sleep(backoff)).await.is_none() {
                     return;
                 }
                 backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -573,20 +754,45 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
         };
         let up_at = Instant::now();
         let w = &c.welcome;
+        set_features(Some(w.features.clone()));
+        let saved_ok = w.features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
         emit(
             events,
-            Event::Status(Status::Connected { daemon_version: w.daemon_version.clone(), profile: w.profile.clone(), pid: w.pid }),
+            Event::Status(Status::Connected {
+                daemon_version: w.daemon_version.clone(),
+                profile: w.profile.clone(),
+                pid: w.pid,
+                features: w.features.clone(),
+            }),
         );
         emit(events, Event::Sessions(w.sessions.clone()));
         if w.rejected_sessions > 0 {
             emit_error(events, None, rejected_error(w.rejected_sessions));
         }
         let mut next_poll = poll.map(|p| Instant::now() + p);
-        let (why, delay) = loop {
+        let mut pending: VecDeque<Pending> = VecDeque::new();
+        let (why, delay): (String, Duration) = loop {
             tokio::select! {
                 m = ctl.recv() => match m {
                     Some(Ctl::Refresh) => {
                         if let Err(e) = c.send(&ClientFrame::Sessions).await {
+                            break (e.to_string(), Duration::ZERO);
+                        }
+                    }
+                    // Never to a daemon that does not list it: it would
+                    // answer `Error{unknown variant}`.
+                    Some(Ctl::SavedSessions { .. }) if !saved_ok => {
+                        emit_error(events, None, Error::Unsupported { feature: FEATURE_SAVED_SESSIONS });
+                    }
+                    Some(Ctl::SavedSessions { named_only, limit }) => {
+                        pending.push_back(Pending::Saved);
+                        if let Err(e) = c.send(&ClientFrame::SavedSessions { named_only, limit }).await {
+                            break (e.to_string(), Duration::ZERO);
+                        }
+                    }
+                    Some(Ctl::Rename { session_id, name, expect }) => {
+                        pending.push_back(Pending::Rename(session_id.clone()));
+                        if let Err(e) = c.send(&ClientFrame::Rename { session_id, name, expect }).await {
                             break (e.to_string(), Duration::ZERO);
                         }
                     }
@@ -612,6 +818,45 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                         break ("daemon reloading".into(), Duration::from_millis(retry_after_ms.min(10_000)));
                     }
                     Ok(Some(DaemonFrame::Bye(_))) => break ("daemon said bye".into(), Duration::ZERO),
+                    Ok(Some(DaemonFrame::SavedSessionList { sessions, truncated, rejected })) => {
+                        take_pending(&mut pending, |p| matches!(p, Pending::Saved));
+                        emit(events, Event::SavedSessions { sessions, truncated });
+                        if rejected > 0 {
+                            emit_error(events, None, Error::Decode(DecodeError {
+                                kind: "saved_session".into(),
+                                error: format!("{rejected} saved session entries did not decode (skipped)"),
+                            }));
+                        }
+                    }
+                    Ok(Some(DaemonFrame::Renamed { session_id, name, in_memory_only })) => {
+                        take_pending(&mut pending, |p| matches!(p, Pending::Rename(_)));
+                        emit(events, Event::Renamed { session_id, name, in_memory_only });
+                    }
+                    Ok(Some(DaemonFrame::RenameFailed(f))) => {
+                        take_pending(&mut pending, |p| matches!(p, Pending::Rename(_)));
+                        emit(events, Event::RenameFailed(f));
+                    }
+                    // `Refused{UnknownSession}` answers a rename; the daemon
+                    // closes the connection after it (and we reconnect).
+                    Ok(Some(DaemonFrame::Refused { reason, message })) => {
+                        if let Some(Pending::Rename(sid)) = take_pending(&mut pending, |p| matches!(p, Pending::Rename(_))) {
+                            let r = if refuse_kind(&reason) == "unknown_session" { RenameRefusal::NotLive } else { RenameRefusal::Failed };
+                            emit(events, Event::RenameFailed(RenameFailure::new(sid, r, message)));
+                        }
+                    }
+                    // A control `Error` answers the oldest pending request:
+                    // an older daemon's "malformed frame: unknown variant".
+                    Ok(Some(DaemonFrame::Error { session_id: None, message })) if !pending.is_empty() => {
+                        let unknown = message.contains("unknown variant");
+                        match pending.pop_front() {
+                            Some(Pending::Rename(sid)) => {
+                                let r = if unknown { RenameRefusal::Unsupported } else { RenameRefusal::Failed };
+                                emit(events, Event::RenameFailed(RenameFailure::new(sid, r, message)));
+                            }
+                            _ if unknown => emit_error(events, None, Error::Unsupported { feature: FEATURE_SAVED_SESSIONS }),
+                            _ => emit_error(events, None, Error::Daemon { session_id: None, message }),
+                        }
+                    }
                     Ok(Some(DaemonFrame::Malformed { kind, error })) => {
                         emit_error(events, None, Error::Decode(DecodeError { kind, error }));
                     }
@@ -621,12 +866,16 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                 },
             }
         };
+        set_features(None);
+        for p in pending.drain(..) {
+            lost(events, p, &why);
+        }
         drop(c);
         emit(events, Event::Status(Status::Reconnecting { why }));
         if up_at.elapsed() >= STABLE_AFTER {
             backoff = BACKOFF_START;
         }
-        if until_shutdown(&mut ctl, tokio::time::sleep(delay.max(backoff))).await.is_none() {
+        if until_shutdown(&mut ctl, events, tokio::time::sleep(delay.max(backoff))).await.is_none() {
             return;
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -680,7 +929,13 @@ async fn attempt(sh: &Shared, target: &Target, mode: AttachMode, previous: Optio
             Attach::Existing { session_id: id.clone(), mode }
         }
         Target::Create(o) if *create_sent => {
-            let named = o.name.as_ref().and_then(|n| c.welcome.sessions.iter().find(|s| s.name.as_deref() == Some(n.as_str())));
+            // The create may have happened: attach to the session it made
+            // (the one of that name, or the resumed one) instead of making
+            // a second one.
+            let named = c.welcome.sessions.iter().find(|s| {
+                o.name.as_ref().is_some_and(|n| s.name.as_ref() == Some(n))
+                    || o.resume.as_ref().is_some_and(|r| s.is(r) || s.name.as_ref() == Some(r))
+            });
             match named {
                 Some(s) => Attach::Existing { session_id: s.id.clone(), mode },
                 None => {
