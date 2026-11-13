@@ -263,7 +263,7 @@ pub struct PerchSpec {
 }
 
 fn sliver_px_default() -> f32 {
-    3.0
+    4.0
 }
 fn sliver_rgb_default() -> String {
     "#05060a".into()

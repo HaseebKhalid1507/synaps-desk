@@ -273,6 +273,8 @@ pub struct Avatar {
     hop: Option<Instant>,
     next_hop: Option<Instant>,
     glitch: Option<Glitch>,
+    /// Glitch frames drawn so far: each one gets a new pattern.
+    glitch_step: Cell<u64>,
     next_glitch: Option<Instant>,
     squash: Option<Instant>,
     glints: Vec<Glint>,
@@ -368,6 +370,7 @@ impl Avatar {
             hop: None,
             next_hop: None,
             glitch: None,
+            glitch_step: Cell::new(0),
             next_glitch: None,
             squash: None,
             glints: Vec::new(),
@@ -785,9 +788,10 @@ impl Avatar {
     // ---- perch shadow ---------------------------------------------------------------
 
     /// Contact sliver for a perch: a solid dark band a few px thick on the window face right
-    /// under the edge, as wide as the seat and thighs that rest on it (the run of the
-    /// figure at the seat line that holds the seat point), minus the legs hanging in front.
-    /// 1-bit friendly: no dither. Avatar-local device px.
+    /// under the edge, under every column where the figure touches the edge (seat, thighs,
+    /// the planted hand: opaque in the rows just above the line), widened by a pixel each
+    /// side, minus the legs hanging in front. 1-bit friendly: no dither. Avatar-local
+    /// device px.
     fn shadow_rects(&self, frame: usize) -> Vec<ShapeRect> {
         let l = &self.layout;
         let Some(p) = self.perch_spec() else { return Vec::new() };
@@ -798,29 +802,26 @@ impl Avatar {
         }
         let line = seat - l.avatar_y;
         let (w, h) = (f.mask.w as i32, f.mask.h as i32);
-        let sx = l.ground_x - l.avatar_x;
-        // The seat run: on a row just above the edge, the opaque span through the seat x.
-        let row = line - (2.0 * l.sf) as i32;
-        if !(0..h).contains(&row) || !f.mask.get(sx, row) {
-            return Vec::new();
-        }
-        let (mut x0, mut x1) = (sx, sx);
-        while x0 > 0 && f.mask.get(x0 - 1, row) {
-            x0 -= 1;
-        }
-        while x1 < w - 1 && f.mask.get(x1 + 1, row) {
-            x1 += 1;
+        let touch_rows = (line - (3.0 * l.sf).round() as i32).max(0)..line.min(h);
+        let pad = l.sf.round().max(1.0) as i32;
+        let mut under = vec![false; w as usize];
+        for x in 0..w {
+            if touch_rows.clone().any(|y| f.mask.get(x, y)) {
+                for k in (x - pad).max(0)..=(x + pad).min(w - 1) {
+                    under[k as usize] = true;
+                }
+            }
         }
         let mut out = Vec::new();
-        for y in (line + 1)..(line + 1 + thick).min(h) {
-            let mut x = x0;
-            while x <= x1 {
-                if f.mask.get(x, y) {
+        for y in line.max(0)..(line + thick).min(h) {
+            let mut x = 0;
+            while x < w {
+                if !under[x as usize] || f.mask.get(x, y) {
                     x += 1;
                     continue;
                 }
                 let s0 = x;
-                while x <= x1 && !f.mask.get(x, y) {
+                while x < w && under[x as usize] && !f.mask.get(x, y) {
                     x += 1;
                 }
                 out.push((s0 as i16, y as i16, (x - s0) as u16, 1));
@@ -910,7 +911,8 @@ impl Avatar {
         take(self.reaction_until);
         take(self.menu.map(|m| m.1));
         if self.glitch.is_some() {
-            take(Some(now + FRAME_FX));
+            // As often as GPUI presents, so every presented frame has a new pattern.
+            take(Some(now + FRAME_FAST));
         }
         if self.teleport.as_ref().is_some_and(|t| matches!(t.leg, Leg::Bolt(_))) {
             take(Some(now + FRAME_FAST));
@@ -2073,7 +2075,7 @@ impl Render for Avatar {
             plan.glitch(fx::GlitchStep {
                 strength: g.strength(now),
                 coverage: g.coverage(now),
-                seed: g.step_seed(now),
+                seed: g.step_seed(self.glitch_step.replace(self.glitch_step.get() + 1)),
                 order: g.seed(),
                 y0: -l.avatar_y,
                 h: ah,

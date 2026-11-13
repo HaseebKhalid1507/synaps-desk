@@ -153,9 +153,9 @@ impl Glitch {
         }
     }
 
-    /// The pattern re-rolls every frame (33 ms), like a bad signal.
-    pub fn step_seed(&self, now: Instant) -> u64 {
-        self.seed ^ ((ms(now.saturating_duration_since(self.t0)) / 33.0) as u64).wrapping_mul(0x9e37_79b9)
+    /// The pattern for drawn frame `step`: a new one every frame, like a bad signal.
+    pub fn step_seed(&self, step: u64) -> u64 {
+        self.seed ^ step.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
     }
 }
 
@@ -851,7 +851,7 @@ mod tests {
         let step = |at: Instant| GlitchStep {
             strength: g.strength(at),
             coverage: g.coverage(at),
-            seed: g.step_seed(at),
+            seed: g.step_seed(at.duration_since(t).as_millis() as u64 / 33),
             order: g.seed(),
             y0: 0,
             h: 400,
@@ -884,7 +884,7 @@ mod tests {
                 plan.glitch(GlitchStep {
                     strength: g.strength(at),
                     coverage: g.coverage(at),
-                    seed: g.step_seed(at),
+                    seed: g.step_seed(at.duration_since(t).as_millis() as u64 / 33),
                     order: g.seed(),
                     y0: -80,
                     h: 400,
@@ -963,7 +963,7 @@ mod tests {
             plan.glitch(GlitchStep {
                 strength: g.strength(at),
                 coverage: 1.0,
-                seed: g.step_seed(at),
+                seed: g.step_seed(at.duration_since(t).as_millis() as u64 / 33),
                 order: g.seed(),
                 y0: -40,
                 h: 300,
