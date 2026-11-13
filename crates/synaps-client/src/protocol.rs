@@ -828,6 +828,10 @@ pub struct ConversationSnapshot {
     /// as on [`ConversationDigest::tokens`]; `Null` from an older daemon.
     #[serde(default)]
     pub tokens: Value,
+    /// Prompt-cache keep-warm ping tokens, already included in `tokens`
+    /// (`ConversationTokens`); `Null` from a daemon that predates them.
+    #[serde(default)]
+    pub keepwarm_tokens: Value,
 }
 
 /// `wire::ConversationDigest`: what `Conversation` carries on the wire.

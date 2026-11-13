@@ -5,7 +5,8 @@
 //! The variants are derived in OKLCH (perceptual lightness, so a blue and a
 //! yellow accent get the same visual weight), gamut-mapped back to sRGB by
 //! lowering chroma, and floored on WCAG contrast against the window's
-//! backgrounds: accent text reaches 4.5:1, accent fills 3:1, so a navy or
+//! backgrounds: accent text reaches 4.5:1, accent fills and lines 3:1 (WCAG
+//! 1.4.11), on the window and on the accent-tinted card alike, so a navy or
 //! near-black accent is lifted instead of vanishing.
 //!
 //! The palette is a GPUI [`Global`] ([`Accent`]): derived once per change,
@@ -53,10 +54,13 @@ pub mod neutral {
 
 /// Minimum WCAG contrast of accent used as text (`hi`, `soft`).
 pub const TEXT_CONTRAST: f64 = 4.5;
-/// Minimum WCAG contrast of accent fills (dots, bars, gauge segments).
+/// Minimum WCAG contrast of accent fills (dots, bars, gauge segments), on
+/// the window and on the card fill.
 pub const FILL_CONTRAST: f64 = 3.0;
-/// Minimum WCAG contrast of accent borders (`mid`).
-pub const BORDER_CONTRAST: f64 = 2.0;
+/// Minimum WCAG contrast of accent borders (`mid`, the card's outline), on
+/// the window and on the card fill (WCAG 1.4.11: the card is told apart by
+/// its border, its fill is barely off the background).
+pub const BORDER_CONTRAST: f64 = 3.0;
 
 /// `#rrggbb` / `rrggbb` / `#rgb` / `rgb`, any case, surrounding space ignored.
 pub fn parse_hex(s: &str) -> Option<u32> {
@@ -204,7 +208,8 @@ pub struct Derived {
     pub accent: u32,
     /// Accent text (alerts, deny, needs-you): brighter, ≥ [`TEXT_CONTRAST`].
     pub hi: u32,
-    /// Borders (the authorization card): darker, ≥ [`BORDER_CONTRAST`].
+    /// Borders (the authorization card): darker than the fill where the
+    /// fill allows, ≥ [`BORDER_CONTRAST`].
     pub mid: u32,
     /// The accent-tinted near-black fill (the authorization card).
     pub bg: u32,
@@ -219,12 +224,13 @@ impl Derived {
         let base = to_oklch(accent & 0xff_ffff);
         let bg = from_oklch(Lch { l: 0.15, c: (base.c * 0.14).min(0.035), ..base });
         let text_bgs = [neutral::BG, neutral::BG2, neutral::BG3, bg];
-        let fill = floor_contrast(base, FILL_CONTRAST, &[neutral::BG]);
+        let fill_bgs = [neutral::BG, bg];
+        let fill = floor_contrast(base, FILL_CONTRAST, &fill_bgs);
         let hi_l = if base.l < 0.8 { (base.l + 0.07).min(0.97) } else { base.l };
         Derived {
             accent: fill,
             hi: floor_contrast(Lch { l: hi_l, ..base }, TEXT_CONTRAST, &text_bgs),
-            mid: floor_contrast(Lch { l: base.l * 0.72, c: base.c * 0.78, ..base }, BORDER_CONTRAST, &[neutral::BG]),
+            mid: floor_contrast(Lch { l: base.l * 0.72, c: base.c * 0.78, ..base }, BORDER_CONTRAST, &fill_bgs),
             bg,
             soft: floor_contrast(Lch { l: base.l.max(0.70), c: base.c * 0.42, ..base }, TEXT_CONTRAST, &text_bgs),
             lifted: fill != accent & 0xff_ffff,
@@ -264,6 +270,12 @@ pub struct Palette {
 
 fn hsla(c: u32) -> Hsla {
     rgb(c).into()
+}
+
+/// Text on an accent fill: ink or the background colour, whichever
+/// contrasts more with it.
+pub fn on_fill(fill: u32) -> u32 {
+    if contrast(neutral::INK, fill) >= contrast(neutral::BG, fill) { neutral::INK } else { neutral::BG }
 }
 
 impl Palette {
@@ -394,7 +406,7 @@ fn highlight_theme() -> Option<std::sync::Arc<gpui_kit::component::highlighter::
 /// accent for every chromatic slot.
 fn sync_kit(a: &Accent, cx: &mut App) {
     let p = a.p;
-    let light_accent = luminance(a.derived.accent) > 0.4;
+    let on_accent = hsla(on_fill(a.derived.accent));
     let highlight = highlight_theme();
     Theme::update(cx, move |t| {
         if let Some(h) = highlight {
@@ -428,11 +440,11 @@ fn sync_kit(a: &Accent, cx: &mut App) {
         c.primary = p.accent;
         c.primary_hover = p.hi;
         c.primary_active = p.mid;
-        c.primary_foreground = if light_accent { p.bg } else { p.ink };
+        c.primary_foreground = on_accent;
         c.danger = p.accent;
         c.danger_hover = p.hi;
         c.danger_active = p.mid;
-        c.danger_foreground = p.ink;
+        c.danger_foreground = on_accent;
         c.warning = p.hi;
         c.success = p.ink2;
         c.info = p.ink2;
@@ -480,21 +492,35 @@ pub fn load_accent(path: &Path) -> Option<String> {
     v.get("accent")?.as_str().map(str::to_string)
 }
 
-/// Save the accent, keeping the file's other keys; written to a temporary
-/// file first, then renamed over the old one.
+/// Save the accent, keeping the file's other keys. A file that is not a
+/// JSON object is kept as `settings.json.bad` (hand edits are not lost),
+/// then replaced. Written to a temporary file of this process (two windows
+/// never share one), flushed to disk, then renamed over the old one; the
+/// temporary file never outlives a failure.
 pub fn save_accent(path: &Path, hex: u32) -> std::io::Result<()> {
-    let mut v = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    v["accent"] = serde_json::Value::String(to_hex(hex));
+    use std::io::Write;
+    let text = std::fs::read_to_string(path).ok();
+    let parsed = text.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()).filter(serde_json::Value::is_object);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&v).unwrap_or_default() + "\n")?;
-    std::fs::rename(&tmp, path)
+    if parsed.is_none() && text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+        std::fs::copy(path, path.with_extension("json.bad"))?;
+    }
+    let mut v = parsed.unwrap_or_else(|| serde_json::json!({}));
+    v["accent"] = serde_json::Value::String(to_hex(hex));
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    let tmp = path.with_extension(format!("json.{}.{nanos}.tmp", std::process::id()));
+    let written = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all((serde_json::to_string_pretty(&v).unwrap_or_default() + "\n").as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -554,8 +580,14 @@ mod tests {
             assert!(contrast(d.hi, bg) >= TEXT_CONTRAST, "{c:06x}: hi {:06x} on {bg:06x}", d.hi);
             assert!(contrast(d.soft, bg) >= TEXT_CONTRAST, "{c:06x}: soft {:06x} on {bg:06x}", d.soft);
         }
-        assert!(contrast(d.accent, neutral::BG) >= FILL_CONTRAST, "{c:06x}: fill {:06x}", d.accent);
-        assert!(contrast(d.mid, neutral::BG) >= BORDER_CONTRAST, "{c:06x}: mid {:06x}", d.mid);
+        for bg in [neutral::BG, d.bg] {
+            assert!(contrast(d.accent, bg) >= FILL_CONTRAST, "{c:06x}: fill {:06x} on {bg:06x}", d.accent);
+            assert!(contrast(d.mid, bg) >= BORDER_CONTRAST, "{c:06x}: mid {:06x} on {bg:06x}", d.mid);
+        }
+        // Text on the fill is whichever of ink and background reads better.
+        let on = on_fill(d.accent);
+        let other = if on == neutral::INK { neutral::BG } else { neutral::INK };
+        assert!(contrast(on, d.accent) >= contrast(other, d.accent), "{c:06x}");
         // The card fill stays a near-black.
         assert!(luminance(d.bg) < 0.02, "{c:06x}: bg {:06x}", d.bg);
         d
@@ -602,7 +634,11 @@ mod tests {
         let near = |a: u32, b: u32, tol: f64| channels(a).iter().zip(channels(b)).all(|(x, y)| (x - y).abs() <= tol);
         assert_eq!(d.accent, 0xe8132f);
         assert!(near(d.hi, 0xff3f56, 0.12), "hi {:06x}", d.hi);
-        assert!(near(d.mid, 0x8f0c1d, 0.08), "mid {:06x}", d.mid);
+        // The mock's card border (#8f0c1d) is 2.2:1 on the background, under
+        // WCAG 1.4.11's 3:1: lifted to just over it, still darker than the fill.
+        assert!(contrast(0x8f0c1d, neutral::BG) < BORDER_CONTRAST);
+        assert!(near(d.mid, 0xb6232c, 0.04), "mid {:06x}", d.mid);
+        assert!(luminance(d.mid) < luminance(d.accent));
         assert!(near(d.bg, 0x130609, 0.04), "bg {:06x}", d.bg);
     }
 
@@ -619,11 +655,20 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["other"], 7);
         assert_eq!(v["accent"], "#f4b400");
-        // A corrupt file is replaced, and an unreadable accent is only a fallback.
+        // A corrupt file is kept aside, then replaced; an unreadable accent
+        // is only a fallback.
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_accent(&path), None);
         save_accent(&path, 0x35f2ff).unwrap();
         assert_eq!(load_accent(&path).as_deref(), Some("#35f2ff"));
+        assert_eq!(std::fs::read_to_string(path.with_extension("json.bad")).unwrap(), "{not json");
+        // No temporary file is left behind.
+        let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
         std::fs::write(&path, r#"{"accent": "garbage"}"#).unwrap();
         assert_eq!(resolve(None, None, load_accent(&path).as_deref()).0, DEFAULT_ACCENT);
         let _ = std::fs::remove_dir_all(&dir);

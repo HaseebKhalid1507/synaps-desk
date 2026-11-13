@@ -1,0 +1,24 @@
+main 20261113-161706.json {'load': 6.54, 's_fps': 142.9, 's_drop': 7, 's_p50': 1.4, 's_p99': 3.51, 'c_fps': 144.0, 'c_drop': 0, 'c_p50': 1.11, 'c_p99': 2.96, 'idle': 192.32, 'end': 243.56}
+main 20261113-161816.json {'load': 8.09, 's_fps': 142.7, 's_drop': 7, 's_p50': 1.24, 's_p99': 3.1, 'c_fps': 144.0, 'c_drop': 1, 'c_p50': 0.99, 'c_p99': 3.42, 'idle': 192.08, 'end': 243.9}
+main 20261113-161920.json {'load': 5.97, 's_fps': 130.6, 's_drop': 86, 's_p50': 1.23, 's_p99': 3.64, 'c_fps': 129.8, 'c_drop': 111, 'c_p50': 1.02, 'c_p99': 2.91, 'idle': 191.84, 'end': 245.91}
+main 20261113-162010.json {'load': 5.77, 's_fps': 143.3, 's_drop': 7, 's_p50': 1.09, 's_p99': 2.7, 'c_fps': 140.0, 'c_drop': 54, 'c_p50': 0.92, 'c_p99': 2.54, 'idle': 192.91, 'end': 244.6}
+main 20261113-162040.json {'load': 5.45, 's_fps': 143.3, 's_drop': 8, 's_p50': 1.14, 's_p99': 3.4, 'c_fps': 144.0, 'c_drop': 0, 'c_p50': 0.83, 'c_p99': 2.09, 'idle': 193.1, 'end': 243.95}
+main 20261113-162109.json {'load': 4.42, 's_fps': 143.3, 's_drop': 7, 's_p50': 1.15, 's_p99': 2.88, 'c_fps': 144.0, 'c_drop': 0, 'c_p50': 1.01, 'c_p99': 2.72, 'idle': 193.15, 'end': 243.68}
+hybrid 20261113-161741.json {'load': 8.78, 's_fps': 137.8, 's_drop': 33, 's_p50': 1.61, 's_p99': 3.31, 'c_fps': 130.5, 'c_drop': 81, 'c_p50': 1.36, 'c_p99': 3.01, 'idle': 249.59, 'end': 300.46}
+hybrid 20261113-161850.json {'load': 8.54, 's_fps': 143.5, 's_drop': 5, 's_p50': 1.45, 's_p99': 3.08, 'c_fps': 143.0, 'c_drop': 8, 'c_p50': 1.27, 'c_p99': 3.09, 'idle': 196.37, 'end': 247.27}
+hybrid 20261113-161936.json {'load': 5.58, 's_fps': 130.8, 's_drop': 89, 's_p50': 1.59, 's_p99': 3.23, 'c_fps': 141.5, 'c_drop': 20, 'c_p50': 1.18, 'c_p99': 3.98, 'idle': 195.76, 'end': 248.77}
+hybrid 20261113-162025.json {'load': 5.02, 's_fps': 142.9, 's_drop': 6, 's_p50': 1.57, 's_p99': 3.66, 'c_fps': 139.0, 'c_drop': 34, 'c_p50': 1.26, 'c_p99': 2.71, 'idle': 195.83, 'end': 246.82}
+hybrid 20261113-162054.json {'load': 4.84, 's_fps': 143.3, 's_drop': 7, 's_p50': 1.5, 's_p99': 4.06, 'c_fps': 144.0, 'c_drop': 0, 'c_p50': 1.2, 'c_p99': 2.62, 'idle': 195.75, 'end': 246.93}
+hybrid 20261113-162124.json {'load': 4.3, 's_fps': 143.1, 's_drop': 6, 's_p50': 1.6, 's_p99': 3.26, 'c_fps': 144.0, 'c_drop': 0, 'c_p50': 1.32, 'c_p99': 2.57, 'idle': 196.4, 'end': 247.2}
+n per side: 6 6
+load     main     5.87  hybrid     5.30
+s_fps    main   143.10  hybrid   143.00
+s_drop   main     7.00  hybrid     6.50
+s_p50    main     1.19  hybrid     1.58
+s_p99    main     3.25  hybrid     3.29
+c_fps    main   144.00  hybrid   142.25
+c_drop   main     0.50  hybrid    14.00
+c_p50    main     1.00  hybrid     1.27
+c_p99    main     2.82  hybrid     2.86
+idle     main   192.62  hybrid   196.10
+end      main   243.93  hybrid   247.23

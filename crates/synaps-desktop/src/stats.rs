@@ -36,6 +36,19 @@ impl Tokens {
         })
     }
 
+    /// The conversation's own tokens: `total` less the keep-warm pings the
+    /// daemon counts in it (`keepwarm_tokens`, absent from older daemons).
+    pub fn conversation(total: &Value, keepwarm: &Value) -> Option<Self> {
+        let t = Self::from_value(total)?;
+        let k = Self::from_value(keepwarm).unwrap_or_default();
+        Some(Tokens {
+            input: t.input.saturating_sub(k.input),
+            output: t.output.saturating_sub(k.output),
+            cache_read: t.cache_read.saturating_sub(k.cache_read),
+            cache_creation: t.cache_creation.saturating_sub(k.cache_creation),
+        })
+    }
+
     /// Share of prompt tokens served from the cache, if any were sent.
     pub fn cache_hit(&self) -> Option<f64> {
         let prompt = self.input + self.cache_read + self.cache_creation;
@@ -63,9 +76,24 @@ impl RuntimeInfo {
     }
 }
 
+/// The same model, with or without a `provider/` prefix.
+fn same_model(a: &str, b: &str) -> bool {
+    let bare = |m: &str| m.rsplit_once('/').map_or(m, |(_, m)| m).to_string();
+    a == b || bare(a) == bare(b)
+}
+
+/// The cost unless it is the serde default of a daemon that sent neither
+/// tokens nor a cost (an older one): then it is unknown, not "$0.00".
+fn known_cost(cost: f64, tokens: Option<Tokens>) -> Option<f64> {
+    (cost > 0.0 || tokens.is_some()).then_some(cost)
+}
+
 #[derive(Debug, Default)]
 pub struct Stats {
+    /// The session these are of (`Attached.meta.id`).
+    pub session: Option<String>,
     pub view: Option<RuntimeInfo>,
+    /// The conversation's tokens, keep-warm pings excluded.
     pub tokens: Option<Tokens>,
     /// The conversation's cost in USD as the daemon reports it.
     pub cost: Option<f64>,
@@ -75,22 +103,29 @@ pub struct Stats {
     /// The attached session's folder (`Attached.meta.cwd`).
     pub cwd: Option<String>,
     pub files: Ledger,
+    /// The attachment ended: these are the last numbers seen, not live.
+    pub detached: bool,
 }
 
 impl Stats {
     /// A (re-)attach: everything from the snapshot, then the in-flight
-    /// turn's replay.
+    /// turn's replay. A re-attach of the same session reuses the analysed
+    /// file edits.
     pub fn on_attached(&mut self, a: &Attached) {
         let cwd = a.meta.cwd.clone().filter(|c| !c.is_empty());
-        let mut files = Ledger::default();
-        files.reset(&a.conversation.api_messages, cwd.as_deref());
+        let same = self.session.as_deref() == Some(a.meta.id.as_str());
+        let mut files = std::mem::take(&mut self.files);
+        files.reset(&a.conversation.api_messages, cwd.as_deref(), same);
+        let tokens = Tokens::conversation(&a.conversation.tokens, &a.conversation.keepwarm_tokens);
         *self = Stats {
+            session: Some(a.meta.id.clone()),
             view: RuntimeInfo::from_value(&a.view),
-            tokens: Tokens::from_value(&a.conversation.tokens),
-            cost: Some(a.conversation.cost),
+            tokens,
+            cost: known_cost(a.conversation.cost, tokens),
             context: None,
             cwd,
             files,
+            detached: false,
         };
         for env in &a.replay {
             if let Ok(ev) = env.decode() {
@@ -99,12 +134,17 @@ impl Stats {
         }
     }
 
+    /// The attachment ended.
+    pub fn on_detached(&mut self) {
+        self.detached = true;
+    }
+
     pub fn on_history(&mut self, update: &HistoryUpdate) {
         match update {
             HistoryUpdate::Append { messages, .. } => self.files.append(messages),
             HistoryUpdate::Replace { messages } => {
                 let cwd = self.cwd.clone();
-                self.files.reset(messages, cwd.as_deref());
+                self.files.reset(messages, cwd.as_deref(), true);
             }
             _ => {}
         }
@@ -114,10 +154,13 @@ impl Stats {
     pub fn on_session(&mut self, ev: &SessionEvent, raw: &Value) {
         match ev {
             SessionEvent::Conversation { digest } => {
-                if let Some(t) = Tokens::from_value(&digest.tokens) {
+                // `keepwarm_tokens` is not on the decoded digest: from the wire event.
+                if let Some(t) = Tokens::conversation(&digest.tokens, &raw["digest"]["keepwarm_tokens"]) {
                     self.tokens = Some(t);
                 }
-                self.cost = Some(digest.cost);
+                if let Some(c) = known_cost(digest.cost, self.tokens) {
+                    self.cost = Some(c);
+                }
                 if digest.messages_len == 0 {
                     self.context = None;
                 }
@@ -127,7 +170,13 @@ impl Stats {
             }
             SessionEvent::Stream { event: StreamEvent::Session(_) } => {
                 let e = &raw["event"];
-                if e["session"] == "usage" {
+                // A side call on another model (a compaction model, say) is
+                // not what the session's window holds.
+                let other_model = match (e["model"].as_str(), self.view.as_ref().map(|v| v.model.as_str())) {
+                    (Some(m), Some(v)) if !m.is_empty() && !v.is_empty() => !same_model(m, v),
+                    _ => false,
+                };
+                if e["session"] == "usage" && !other_model {
                     let n = |k: &str| e.get(k).and_then(Value::as_u64).unwrap_or(0);
                     let prompt = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
                     if prompt > 0 {
@@ -211,6 +260,7 @@ mod tests {
         let mut s = Stats::default();
         s.on_attached(&a);
         assert_eq!((s.view.is_none(), s.tokens.is_none()), (true, true));
+        assert_eq!(s.cost, None, "no tokens and a default 0.0: unknown, not $0.00");
         assert_eq!(Tokens::from_value(&json!({})), None);
         assert_eq!(Tokens::from_value(&json!({"foo": 1})), None);
         assert_eq!(Tokens::from_value(&json!("x")), None);
@@ -222,6 +272,18 @@ mod tests {
         let mut s = Stats { view: Some(RuntimeInfo { context_window: 200_000, ..Default::default() }), ..Default::default() };
         let (e, raw) = ev(json!({"ev": "stream", "event": {"kind": "session", "session": "usage", "input_tokens": 1000,
             "output_tokens": 50, "cache_read_input_tokens": 90000, "cache_creation_input_tokens": 9000, "model": "m"}}));
+        s.on_session(&e, &raw);
+        assert_eq!(s.context, Some(100_000));
+        assert_eq!(s.context_ratio(), Some(0.5));
+        // A call on another model (a compaction model) does not move the gauge.
+        s.view.as_mut().unwrap().model = "anthropic/claude-opus-4-1".into();
+        let (e, raw) = ev(json!({"ev": "stream", "event": {"kind": "session", "session": "usage", "input_tokens": 5,
+            "output_tokens": 5, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "model": "anthropic/claude-haiku-4-5"}}));
+        s.on_session(&e, &raw);
+        assert_eq!(s.context, Some(100_000));
+        // The session's model, with or without the provider prefix, does.
+        let (e, raw) = ev(json!({"ev": "stream", "event": {"kind": "session", "session": "usage", "input_tokens": 1000,
+            "output_tokens": 5, "cache_read_input_tokens": 99000, "cache_creation_input_tokens": 0, "model": "claude-opus-4-1"}}));
         s.on_session(&e, &raw);
         assert_eq!(s.context, Some(100_000));
         assert_eq!(s.context_ratio(), Some(0.5));
@@ -238,6 +300,31 @@ mod tests {
         let (e, raw) = ev(json!({"ev": "cleared", "session_id": "x"}));
         s.on_session(&e, &raw);
         assert_eq!(s.context, None);
+    }
+
+    #[test]
+    fn keep_warm_pings_are_not_the_conversations_cache() {
+        let a = attached(json!({"type": "attached", "client": 2, "meta": {"id": "s"},
+            "conversation": {"api_messages": [], "cost": 0.0,
+                "tokens": {"input": 100, "output": 50, "cache_read": 900, "cache_creation": 100},
+                "keepwarm_tokens": {"input": 0, "output": 10, "cache_read": 800, "cache_creation": 0}}}));
+        let mut s = Stats::default();
+        s.on_attached(&a);
+        assert_eq!(s.tokens, Some(Tokens { input: 100, output: 40, cache_read: 100, cache_creation: 100 }));
+        assert_eq!(s.tokens.unwrap().cache_hit(), Some(1.0 / 3.0));
+        assert_eq!(s.cost, Some(0.0), "tokens known: a real zero");
+        // A digest's keep-warm share comes off too (from the wire event).
+        let (e, raw) = ev(json!({"ev": "conversation", "digest": {"messages_len": 2, "messages_hash": 1, "cost": 0.1,
+            "tokens": {"input": 100, "output": 50, "cache_read": 1900, "cache_creation": 100},
+            "keepwarm_tokens": {"input": 0, "output": 10, "cache_read": 1800, "cache_creation": 0}}}));
+        s.on_session(&e, &raw);
+        assert_eq!(s.tokens.unwrap().cache_read, 100);
+        assert!(!s.detached);
+        s.on_detached();
+        assert!(s.detached);
+        // A re-attach of the same session is live again.
+        s.on_attached(&a);
+        assert!(!s.detached);
     }
 
     #[test]

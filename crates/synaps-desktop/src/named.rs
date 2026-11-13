@@ -131,13 +131,20 @@ pub fn named_rows(sessions: &[SessionMeta], saved: &[SavedSession]) -> Vec<Named
             }),
         });
     }
-    rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.id().cmp(b.id())));
+    // One lowercase key per row, not two per comparison.
+    rows.sort_by_cached_key(|r| (r.name.to_lowercase(), r.id().to_string()));
     rows
 }
 
+/// A session for the live list below the Named section: it has no name.
+pub fn is_unnamed(s: &SessionMeta) -> bool {
+    s.name.as_deref().is_none_or(str::is_empty)
+}
+
 /// The live list below the Named section: sessions without a name.
+#[cfg(test)]
 pub fn unnamed(sessions: &[SessionMeta]) -> impl Iterator<Item = &SessionMeta> {
-    sessions.iter().filter(|s| s.name.as_deref().is_none_or(str::is_empty))
+    sessions.iter().filter(|s| is_unnamed(s))
 }
 
 /// `anthropic/claude-sonnet-4-5-20250929` → `sonnet-4-5`.
