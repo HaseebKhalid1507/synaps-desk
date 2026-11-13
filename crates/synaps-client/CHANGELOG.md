@@ -1,5 +1,11 @@
 # synaps-client changelog
 
+## API changes since deabaf1
+
+Additive only (the hybrid UI, PR for `feat/hybrid-ui`).
+
+- `ConversationSnapshot` gained `tokens: Value` (`serde(default)`): the attach snapshot's `ConversationTokens` (`{input, output, cache_read, cache_creation}`), which `ConversationDigest::tokens` already carried on every later `Conversation` event. `Null` from a daemon that omits it. A struct literal needs `..Default::default()` (nothing in this workspace builds one).
+
 ## API changes since 355242c
 
 Named and saved sessions (PR #4). Old → new, one line each. **Breaking** for struct literals and exhaustive matches: `Status::Connected`, `CreateConfig`, `SessionMeta`; and for anyone who built on this PR's first push (ebf3f73): `rename`, `saved_sessions`, `Event::SavedSessions`.

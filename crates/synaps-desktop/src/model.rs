@@ -16,6 +16,7 @@ use synaps_client::{
 };
 
 use crate::named::{Marker, NamedRow, ResumeRequest, RowAction};
+use crate::stats::Stats;
 
 /// The saved list is re-asked at most this often on its own (on startup,
 /// after a rename and after a resume it is asked at once).
@@ -60,6 +61,30 @@ impl Future for YieldNow {
         }
         cx.waker().wake_by_ref();
         Poll::Pending
+    }
+}
+
+/// The rail's filter tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Filter {
+    #[default]
+    All,
+    /// A turn (or a resume) is running.
+    Live,
+    /// Waiting on the user.
+    Needs,
+    /// Everything else: idle, pinned, parked, saved.
+    Idle,
+}
+
+impl Filter {
+    pub fn admits(self, m: Marker) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Live => matches!(m, Marker::Busy | Marker::Resuming),
+            Filter::Needs => m == Marker::Awaiting,
+            Filter::Idle => matches!(m, Marker::Idle | Marker::Pinned | Marker::Parked | Marker::Saved),
+        }
     }
 }
 
@@ -206,6 +231,8 @@ pub struct Model {
     /// given back to the user on a refusal (the oldest) or a detach (all).
     in_flight: VecDeque<String>,
     pub named: Named,
+    /// The attached session's numbers (header, right-hand panel).
+    pub stats: Stats,
 }
 
 impl Model {
@@ -220,6 +247,7 @@ impl Model {
             reattaching: false,
             in_flight: VecDeque::new(),
             named: Named { daemon: "the daemon's machine".into(), ..Named::default() },
+            stats: Stats::default(),
         }
     }
 
@@ -279,6 +307,42 @@ impl Model {
     /// The live sessions without a name (the list below Named).
     pub fn unnamed_sessions(&self) -> impl Iterator<Item = &SessionMeta> {
         crate::named::unnamed(&self.sessions)
+    }
+
+    /// A live session's state. The attached one is read from its own
+    /// transcript (answered prompts, a turn that just ended), which runs
+    /// ahead of the 3-second session poll.
+    pub fn marker(&self, s: &SessionMeta) -> Marker {
+        if !self.is_active(&s.id) {
+            return Marker::of(s);
+        }
+        if !self.transcript.pending_prompts().is_empty() {
+            Marker::Awaiting
+        } else if self.transcript.busy() {
+            Marker::Busy
+        } else if s.is_parked() {
+            Marker::Parked
+        } else if s.pinned {
+            Marker::Pinned
+        } else {
+            Marker::Idle
+        }
+    }
+
+    pub fn is_active(&self, session_id: &str) -> bool {
+        self.active.as_ref().is_some_and(|a| a.session_id == session_id)
+    }
+
+    /// Live sessions waiting on the user (a question, a secret, a tool-call
+    /// confirmation), in list order.
+    pub fn attention(&self) -> impl Iterator<Item = &SessionMeta> {
+        self.sessions.iter().filter(|s| self.marker(s) == Marker::Awaiting)
+    }
+
+    /// The active session's list entry.
+    pub fn active_meta(&self) -> Option<&SessionMeta> {
+        let a = self.active.as_ref()?;
+        self.sessions.iter().find(|s| s.id == a.session_id)
     }
 
     /// The active session's name, if it has one.
@@ -480,6 +544,7 @@ impl Model {
     pub fn set_local_session(&mut self, session_id: &str) {
         self.wanted = Some(LOCAL_SEQ);
         self.active = Some(Active { session_id: session_id.into(), attach_seq: LOCAL_SEQ, mode: AttachMode::Mirror });
+        self.stats = Stats::default();
     }
 
     /// Attached, connected and allowed to drive.
@@ -631,10 +696,12 @@ impl Model {
                 if let Err(e) = self.transcript.load_attached(&attached) {
                     self.last_error = Some(e.to_string());
                 }
+                self.stats.on_attached(&attached);
                 effects.push(Effect::ListSessions);
             }
             Event::Reattaching { attach_seq, .. } if self.current(attach_seq) => self.reattaching = true,
-            Event::Session { attach_seq, event, .. } if self.current(attach_seq) => {
+            Event::Session { attach_seq, event, raw, .. } if self.current(attach_seq) => {
+                self.stats.on_session(&event, &raw);
                 match &event {
                     SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. } => {
                         if let Some(i) = self.in_flight.iter().position(|s| s.trim() == t.trim()) {
@@ -648,6 +715,8 @@ impl Model {
             Event::History { attach_seq, update, .. } if self.current(attach_seq) => {
                 if self.transcript.apply_update(&update).is_err() {
                     effects.push(Effect::Resync);
+                } else {
+                    self.stats.on_history(&update);
                 }
             }
             Event::Detached { attach_seq, reason, .. } if self.current(attach_seq) => {
@@ -736,6 +805,32 @@ mod tests {
     fn attach(m: &mut Model, seq: u64) {
         m.want(seq);
         m.apply(Event::Attached { attach_seq: seq, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
+    }
+
+    #[test]
+    fn filters_and_the_attached_sessions_own_state() {
+        let mk = |id: &str, busy: bool, awaiting: usize, lifecycle: &str| -> SessionMeta {
+            serde_json::from_value(json!({"id": id, "busy": busy, "awaiting_input": awaiting, "lifecycle": lifecycle})).unwrap()
+        };
+        let mut m = Model::new(ConnState::Connecting);
+        m.sessions = vec![mk("s", true, 1, "live"), mk("b", true, 0, "live"), mk("w", false, 2, "live"), mk("p", false, 0, "parked")];
+        let markers: Vec<Marker> = m.sessions.iter().map(|s| m.marker(s)).collect();
+        assert_eq!(markers, [Marker::Awaiting, Marker::Busy, Marker::Awaiting, Marker::Parked]);
+        assert_eq!(m.attention().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s", "w"]);
+        // Attached to "s": its transcript says idle, nothing pending (the
+        // poll has not caught up yet).
+        attach(&mut m, 1);
+        assert!(m.is_active("s"));
+        assert_eq!(m.marker(&m.sessions[0]), Marker::Idle);
+        assert_eq!(m.attention().count(), 1);
+        assert_eq!(m.active_meta().map(|s| s.id.as_str()), Some("s"));
+        for (f, admitted) in
+            [(Filter::All, vec!["s", "b", "w", "p"]), (Filter::Live, vec!["b"]), (Filter::Needs, vec!["w"]), (Filter::Idle, vec!["s", "p"])]
+        {
+            let got: Vec<&str> = m.sessions.iter().filter(|s| f.admits(m.marker(s))).map(|s| s.id.as_str()).collect();
+            assert_eq!(got, admitted, "{f:?}");
+        }
+        assert!(Filter::Live.admits(Marker::Resuming) && Filter::Idle.admits(Marker::Saved));
     }
 
     /// H4: a window that never renders applies every event as it comes;

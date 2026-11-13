@@ -18,18 +18,6 @@ pub enum Marker {
 }
 
 impl Marker {
-    pub fn label(self) -> &'static str {
-        match self {
-            Marker::Busy => "busy",
-            Marker::Idle => "idle",
-            Marker::Parked => "parked",
-            Marker::Pinned => "pinned",
-            Marker::Awaiting => "awaiting input",
-            Marker::Saved => "saved",
-            Marker::Resuming => "resuming…",
-        }
-    }
-
     /// A live session's marker: awaiting input beats busy, busy beats
     /// parked, parked beats pinned.
     pub fn of(s: &SessionMeta) -> Marker {

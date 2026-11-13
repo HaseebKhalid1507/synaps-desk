@@ -824,6 +824,10 @@ pub struct ConversationSnapshot {
     pub messages_len: usize,
     #[serde(default)]
     pub cost: f64,
+    /// `ConversationTokens` (`{input, output, cache_read, cache_creation}`),
+    /// as on [`ConversationDigest::tokens`]; `Null` from an older daemon.
+    #[serde(default)]
+    pub tokens: Value,
 }
 
 /// `wire::ConversationDigest`: what `Conversation` carries on the wire.
