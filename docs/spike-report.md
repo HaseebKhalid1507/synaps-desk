@@ -5,7 +5,7 @@ Branch `spike/gpui`. Date 2026-11-13. Author: Spike (subagent), for Jawz / Hasee
 **Bottom line: GO.** GPUI held the display refresh rate in every scenario, with
 about 1 ms of CPU per frame. A warm launch reaches the first frame in about 0.3 s.
 The thin-client layer (`synaps-client`) talks to a real 0.11.1 daemon, follows
-`daemon reload` and builds on Windows. The weak spots are memory, binary
+`daemon reload` and builds on Windows and macOS in CI. The weak spots are memory, binary
 size and upstream churn. Details and caveats follow.
 
 ## What was built
@@ -24,8 +24,12 @@ The client has `list_sessions / attach / create / submit / abort / detach`.
 
 ## Machine
 
+Window launches on Haseeb's display: 7 (1 bench under load, 1 `--diag`, 3 official, 1 screenshot run, 1 confirmation
+after the toolchain bump). Every launch was `--bench`/`--diag`, auto-exited in 15–27 s and ran inside
+`systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0`.
+
 bella: Intel Core Ultra 9 275HX (24 threads), 30 GiB RAM, NVIDIA GeForce RTX 5070 Ti Laptop
-(open kernel module 615.78.08, selected by GPUI over Vulkan; Intel Arc iGPU and llvmpipe
+(open kernel module 615.78.08, selected by GPUI over Vulkan; Intel Arrow Lake iGPU and llvmpipe
 also enumerated), CachyOS kernel 7.3.0, **X11** (Xorg) + **i3 4.25.1** + **picom v13** compositor.
 The window opened on DP-3, 2560×1440 at **143.86 Hz**, RandR scale 1.083. The window type was
 `dialog` in bench mode, so i3 floated it and did not re-tile Haseeb's workspace. The script
@@ -36,13 +40,16 @@ X11, so the period comes from `xrandr` (`--refresh-hz 143.86`).
 Other sessions were building on bella. Before each run the bench waited for a 1-minute load
 under 4. The recorded load was 3.9 / 3.3 / 2.7 before the three runs, with no `rustc`
 running. Two earlier runs are not in the table. Launch 1 ran under load 13, while other
-builds were running, kswapd was active and the NVIDIA shader cache was cold. It got 9.8 s to
+builds were running, kswapd was active and the NVIDIA shader cache was probably cold. It got 9.8 s to
 the first frame and 36–50 fps. That is what a first launch on a busy, swapping machine can
 look like. It is not the steady state. Launch 2 was a `--diag` run used to split costs.
 
 ## Numbers (median of 3 `--bench` runs, raw values after)
 
-Release build (`lto = "thin"`, `codegen-units = 1`, `opt-level = 3`, `panic = "abort"`, `strip = true`), Rust 1.95.0.
+Release build (`lto = "thin"`, `codegen-units = 1`, `opt-level = 3`, `panic = "abort"`, `strip = true`), built with Rust 1.95.0.
+The toolchain is now pinned to 1.100.0 for macOS (see CI). One confirmation run with the 1.100.0 build matched these numbers:
+stream 143.1 fps, 5 dropped, draw p50/p99 1.04/2.89 ms; scroll 144.0 fps, 0 dropped, draw p50/p99 0.83/2.24 ms
+(`docs/bench/*-rust1.100-confirm.json`). The raw JSON for every run is in `docs/bench/`.
 Frame data comes from GPUI's own profiler (`gpui/profiler`: `FrameEvent::Draw`/`Present`).
 `draw` is the CPU time inside `Window::draw`, covering layout, prepaint and paint.
 `interval` is the time between consecutive presents. `dropped` is the sum of
@@ -103,8 +110,9 @@ loader and ICDs. That is mostly the NVIDIA user-space driver.
 | 2,000-message transcript loaded | 243 | 221 | 207 | 95 / 80 | 140 |
 | after scrolling it | **244** | **223** | **208** | 95 / 80 | 141 |
 
-Runs (RSS idle): 247 / 193 / 193. The first run after the rebuild mapped about 38 MiB more of
-the NVIDIA driver. The 2,000-message transcript adds about 2 MiB, which shows virtualization works.
+Runs (RSS idle): 247 / 193 / 193. The idle number is bimodal. The **first launch of a freshly built binary** maps
+about 38 MiB more NVIDIA driver memory (131 vs 93 MiB). Later launches do not. The 1.100.0 confirmation run, also
+a first launch, shows the same 247 MiB. This is most likely the driver's per-binary shader/pipeline cache being built. The 2,000-message transcript adds about 2 MiB, which shows virtualization works.
 The +46 MiB step comes with the first streamed markdown. It is not broken down further. The likely
 causes are the syntect syntax set (loaded lazily on the first code block), the glyph atlas and
 the line-layout caches. Without the NVIDIA driver mappings the app is about 93 MiB idle.
@@ -130,11 +138,14 @@ This happened with no user action.
 
 | | |
 |---|---|
-| `synaps-desktop` release, stripped | **34,057,704 bytes (32.5 MiB)** (a hello-world with the same gpui-kit features: 31 MiB) |
-| `synaps-probe` release, stripped | 1,099,136 bytes |
-| cold release build (all deps) | **7 m 57 s** wall in the lane (plus 4 m queued), peak 5.9 GiB, under load avg ~13 from other builds |
+| `synaps-desktop` Linux x86_64, stripped | **34,057,704 bytes (32.5 MiB)** with Rust 1.95; 34,004,488 with 1.100. A hello-world with the same gpui-kit features: 31 MiB |
+| `synaps-desktop.exe` Windows x86_64 (CI) | **17,469,440 bytes (16.7 MiB)** (no X11+Wayland+Vulkan/GL stack; uses DirectX) |
+| `synaps-probe` Linux / Windows | 1,099,136 / 908,288 bytes |
+| cold release build (all 536 crates), quiet bella, 10 jobs | **1 m 29 s** (toolchain switch to 1.100.0), peak 5.7 GiB |
+| cold release build under load (avg ~13, other sessions' builds) | 7 m 57 s in the lane, plus 4 m queued |
 | warm release rebuild, app crate edit, quiet box | **24 s** (thin LTO + 1 CGU relink); 3.5–4.5 min when other builds were saturating bella |
-| target dir | 1.9 GiB |
+| CI cold release build (GitHub runners) | ubuntu 15 m 01 s, windows 13 m 19 s |
+| target dir on bella | 3.7 GiB (includes stale 1.95 artifacts from before the toolchain bump) |
 
 Ways to cut the size, not tried: drop `syntect` for a smaller highlighter (it carries bat's
 syntax set), drop the default icon `assets`, use `opt-level = "s"`, use fat LTO. The size
@@ -146,7 +157,13 @@ does not affect frame time.
 `cargo test -p synaps-client`, a release build of both crates, and uploads the binaries as
 artifacts. `macos-latest` runs only on `workflow_dispatch` or tags. Swatinem/rust-cache is enabled.
 
-CI_RESULTS_PLACEHOLDER
+| OS | result | release build (cold) | `synaps-desktop` | notes |
+|---|---|---|---|---|
+| ubuntu-latest | **green** ([run 43391715707](https://github.com/HaseebKhalid1507/synaps-desktop/actions/runs/43391715707), Rust 1.95; rerun on 1.100: see PR checks) | 15 m 01 s | 34,057,584 B | client tests 10/10 (incl. doctest) |
+| windows-latest | **green** (same run) | 13 m 19 s | 17,469,440 B (`.exe`) | client tests 13/13 (incl. doctest), including the named-pipe name derivation and connect-without-server tests; GPUI's DirectX backend compiles |
+| macos-latest (arm64), `workflow_dispatch` | first run **red**: `gpui-pre-macos` needs Rust ≥ 1.98 (`Option::map_or_default`); after pinning 1.100.0 **green** ([run 43395134179](https://github.com/HaseebKhalid1507/synaps-desktop/actions/runs/43395134179)) | 2 m 22 s | 14,852,000 B | client tests pass; no runtime check (no Mac) |
+
+Windows and macOS are **compile + unit-test only**. Nobody has opened the window on those platforms yet.
 
 ## What gpui-component gave us vs what we wrote
 
@@ -195,7 +212,10 @@ and the tail-following a chat needs, and the bench needs `scroll_by`.
   It costs about 270 ms. `ZED_DEVICE_ID` can pin an adapter, but there is no API to skip the GL probe.
 - **Frame timing on X11**: `FrameTiming.refresh_interval` is `None`, so you have to supply the panel rate yourself.
 - `activate()` is not implemented on Linux (logged). Not a problem for a client app.
-- Warm rebuilds are fine (24 s), but a cold build is about 8 minutes and needs about 6 GiB peak memory.
+- Build cost is fine: cold 1.5 min on a quiet 24-thread box (about 6 GiB peak), warm 24 s; 13–15 min cold on GitHub runners.
+- **MSRV moves with the snapshot.** `gpui-pre-macos 0.3.12` calls `Option::map_or_default` (stable since
+  Rust 1.98). Linux and Windows built fine on 1.95.0, and only the first macOS CI run caught it. We now pin 1.100.0.
+  Every gpui-kit bump can raise the MSRV, so run macOS CI on each bump.
 
 ## Wayland / X11 / IME
 
@@ -210,7 +230,7 @@ and the tail-following a chat needs, and the bench needs `scroll_by`.
 
 ## Protocol gaps a full client needs
 
-None of these blocked the spike. Items 1, 2, 3 and 7 need a Synaps change to do properly.
+None of these blocked the spike. Items 1, 2, 3, 4, 7 and 8 need a Synaps change to do properly.
 1. **No `desktop` client kind.** `ClientKind` is a closed enum (tui/chat/attach/rpc/server/test),
    and an older daemon rejects an unknown kind as a malformed frame. We send `kind: "attach"`
    (interactive, so keep-warm treats it like the TUI) with `name: "desktop"`. A proper kind
@@ -235,7 +255,11 @@ None of these blocked the spike. Items 1, 2, 3 and 7 need a Synaps change to do 
    `None`, or use a configured env).
 7. **Permission prompts.** `Prompt` and `Answer` exist, but `PromptKind`'s values are not
    documented for third-party clients. The spike shows pending prompts read-only.
-8. **Daemon lifecycle and auth are outside the wire.** Starting a daemon, `synaps login`
+8. **No "recent sessions" over the wire.** `Sessions` lists sessions the daemon holds, live or
+   parked. Saved sessions it does not hold are only reachable with `Attach::Create{continue_session}`
+   if you already know the id. The rail can show live sessions but not recent history without a
+   journal-listing query (or reading `~/.synaps-cli/sessions` directly, which is not thin).
+9. **Daemon lifecycle and auth are outside the wire.** Starting a daemon, `synaps login`
    (OAuth) and listing models have no frames. The desktop would shell out to the `synaps`
    binary, or Synaps adds control frames. This decides packaging: bundle or require `synaps`.
 
