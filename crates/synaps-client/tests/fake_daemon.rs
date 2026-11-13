@@ -988,3 +988,36 @@ async fn a_missing_folder_falls_back_to_home_once() {
     assert!(reason.starts_with(synaps_client::MISSING_CWD), "{reason}");
     client.shutdown().unwrap();
 }
+
+/// A pending prompt reaches the consumer, and `answer` sends the daemon's
+/// `Answer { prompt_id, value }`: a confirm's "y" / "n", a cancel as `null`.
+#[tokio::test]
+async fn prompts_are_answered_on_the_wire() {
+    let mut fake = Fake::start("prompt").await;
+    let (client, events) = fake.client();
+    client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    conn.event(
+        30,
+        json!({"ev": "prompt", "request": {"id": 7, "kind": "confirm", "title": "Confirm tool call",
+        "prompt": "bash: cargo test", "raised_at": "2026-11-13T07:34:27Z"}}),
+    )
+    .await;
+    let (id, title) = wait(&events, "prompt", |e| match e {
+        Event::Session { event: synaps_client::SessionEvent::Prompt { request }, .. } => Some((request.id, request.title.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!((id, title.as_str()), (7, "Confirm tool call"));
+    client.answer(7, Some("y".into())).unwrap();
+    let cmd = conn.recv_cmd().await;
+    assert_eq!(cmd, json!({"cmd": "answer", "prompt_id": 7, "value": "y"}));
+    client.answer(8, None).unwrap();
+    assert_eq!(conn.recv_cmd().await, json!({"cmd": "answer", "prompt_id": 8, "value": null}));
+    conn.event(31, json!({"ev": "prompt_resolved", "prompt_id": 7})).await;
+    wait(&events, "resolved", |e| {
+        matches!(e, Event::Session { event: synaps_client::SessionEvent::PromptResolved { prompt_id: 7 }, .. }).then_some(())
+    })
+    .await;
+    client.shutdown().unwrap();
+}

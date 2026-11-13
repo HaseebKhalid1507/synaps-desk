@@ -19,7 +19,7 @@ use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError}
 use crate::bench::BenchState;
 use crate::files::{self, LineKind, Preview};
 use crate::fonts::{self, label};
-use crate::model::{ConnState, Effect, Filter, Model, RenameRequest, SAVED_LIMIT};
+use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, Filter, Model, RenameRequest, SAVED_LIMIT};
 use crate::named::ResumeRequest;
 use crate::theme::{self, Palette};
 
@@ -708,13 +708,13 @@ impl AppView {
                 .items_center()
                 .child(gbtn("p-yes", label::AUTHORIZE, can, p).on_click(cx.listener(move |this, _, _, cx| {
                     if this.drives() {
-                        this.answer(id, Some("y".into()));
+                        this.answer(id, Some(CONFIRM_YES.into()));
                     }
                     cx.notify();
                 })))
                 .child(tbtn("p-no", label::DENY, if can { p.hi } else { p.ink4 }, p.ink).on_click(cx.listener(move |this, _, _, cx| {
                     if this.drives() {
-                        this.answer(id, Some("n".into()));
+                        this.answer(id, Some(CONFIRM_NO.into()));
                     }
                     cx.notify();
                 })))
