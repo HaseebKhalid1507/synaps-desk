@@ -1,0 +1,10 @@
+{"type": "renamed", "session_id": "20261113-073427-5fde", "name": "axon"}
+{"type": "renamed", "session_id": "20261113-073427-5fde", "name": null, "in_memory_only": true}
+{"type": "rename_failed", "session_id": "20261113-073427-5fde", "reason": "taken", "message": "name 'axon' is taken by 20261028-045932-a1b2", "taken_by": "20261028-045932-a1b2"}
+{"type": "rename_failed", "session_id": "20261113-073427-5fde", "reason": "named", "message": "session is named 'kite'", "current_name": "kite"}
+{"type": "rename_failed", "session_id": "20261113-073427-5fde", "reason": "invalid", "message": "invalid name 'A'"}
+{"type": "rename_failed", "session_id": "20261113-073427-5fde", "reason": "chain_conflict", "message": "a chain is named 'axon'"}
+{"type": "rename_failed", "session_id": "20261113-073427-5fde", "reason": "locked", "message": "session is live in another process (pid 7, tui)"}
+{"type": "rename_failed", "session_id": "20261113-073427-5fde", "reason": "busy", "message": "daemon reloading; retry in a moment"}
+{"type": "rename_failed", "session_id": "20261113-073427-5fde", "reason": "unknown", "message": "no reply from the session in 10 s"}
+{"type": "rename_failed", "session_id": "20261113-073427-5fde", "reason": "from_the_future", "message": "m"}

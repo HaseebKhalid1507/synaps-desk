@@ -1,5 +1,20 @@
 # synaps-client changelog
 
+## API changes since 355242c
+
+Named and saved sessions (PR #4). Additive except the one `Status` field; old → new, one line each.
+
+- `Status::Connected { daemon_version, profile, pid }` → also `features: Vec<String>` (`Welcome.features`); match it with `..`.
+- New `Client::resume(id_or_name, CreateOptions) -> Result<u64, ClientClosed>`: `Attach::Create` with `continue_session: Some(Some(id_or_name))` (every v3 daemon). Failures ("no session named 'x'", a journal live in another process) arrive as `Event::Detached { reason }`. A resume whose connection drops after the create is not re-sent: the retry attaches to the session it resumed (by name, id or journal id).
+- `CreateOptions` gained `resume: Option<String>` / `.resume(..)`; `CreateConfig` gained `continue_session: Option<Option<String>>` (absent when `None`; `Some(None)` goes out as `null`, a bare `--continue`).
+- New `Client::saved_sessions(named_only, limit) -> Result<(), RequestError>` → `Event::SavedSessions { sessions: Vec<SavedSession>, truncated }`. Sent only when `Welcome.features` lists `saved_sessions` (`FEATURE_SAVED_SESSIONS`): otherwise `Err(RequestError::Unsupported)` (`NotConnected` while the features are unknown) and nothing goes out. The connection thread checks again and answers `Event::Error { error: Error::Unsupported { feature } }`.
+- New `Client::rename(session_id, Option<&str>, force) -> Result<(), RequestError>` on the control connection → `Event::Renamed { session_id, name, in_memory_only }` or `Event::RenameFailed(RenameFailure)`. The name is checked first (`RequestError::InvalidName`). Without `force` it sends `expect: null` (only an unnamed session is renamed; a named one is `RenameRefusal::Named` with `current_name`); `force` sends no `expect` (replace). Clearing (`None`) never has a precondition.
+- New `RenameRefusal` (`Invalid`, `Taken`, `ChainConflict`, `Named`, `Locked`, `Busy`, `Unknown`, `Failed` from the wire; `NotLive` for `Refused{UnknownSession}`, `Unsupported` for an older daemon's `Error{unknown variant}`, `Offline` when nothing was sent) and `RenameFailure { session_id, reason, message, taken_by, current_name }`.
+- New `Client::features()` / `Client::supports(feature)`: the connected daemon's `Welcome.features` (`None` while down).
+- New `Error::Unsupported { feature }`, `RequestError { Closed, NotConnected, Unsupported, InvalidName }`, `Command::{SavedSessions, Rename}`.
+- Protocol mirrors: `ClientFrame::{SavedSessions { named_only, limit }, Rename { session_id, name, expect }}`, `DaemonFrame::{SavedSessionList { sessions, truncated, rejected }, Renamed { .. }, RenameFailed(RenameFailure)}`, `SavedSession` (`name`, `cwd`, `message_count` nullable; bad entries skipped and counted), `FEATURE_SAVED_SESSIONS`, `SESSION_NAME_MAX`, `validate_session_name` / `InvalidSessionName` (agent-core's `validate_name`: `[a-z0-9-]{1,40}`).
+- `SessionMeta` gained `awaiting_input`, `journal_id`, `locked_by` and `is(id)` (id or journal id).
+
 ## API changes since f2529da
 
 Follow-up to the PR #2 re-review (PR #3). Old → new, one line each.

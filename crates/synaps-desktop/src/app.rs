@@ -4,16 +4,17 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use synaps_client::transcript::{ItemKind, ToolStatus};
-use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event};
+use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError};
 
 use crate::bench::BenchState;
-use crate::model::{ConnState, Effect, Model};
+use crate::model::{ConnState, Effect, Model, SAVED_LIMIT};
+use crate::named::{Marker, RowAction};
 
 /// Per-row strings derived from a transcript item, rebuilt only when the
 /// item's `rev` changes (so a frame never re-allocates unchanged rows).
@@ -33,6 +34,12 @@ pub struct AppView {
     pub list: ListState,
     expanded: HashSet<u64>,
     composer: Entity<TextareaState>,
+    /// "Open by name…" (rail) and "Name this session…" (header) inputs.
+    open_input: Entity<InputState>,
+    name_input: Entity<InputState>,
+    open_shown: bool,
+    naming: bool,
+    named_collapsed: bool,
     /// Refused input to put back in the composer (needs a `Window`: done
     /// at the next frame).
     restore: Option<String>,
@@ -55,25 +62,52 @@ impl AppView {
                 .submit_on_enter(true)
                 .placeholder("Message Synaps  (Enter to send, Shift+Enter for a newline)")
         });
-        let subs = vec![cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| {
-            if let InputEvent::PressEnter { shift: false, .. } = ev {
-                let text = input.read(cx).value().trim().to_string();
-                if !text.is_empty() && this.submit(text) {
-                    input.update(cx, |s, cx| s.set_value("", window, cx));
+        let open_input = cx.new(|cx| InputState::new(window, cx).placeholder("session name"));
+        let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
+        let subs = vec![
+            cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { shift: false, .. } = ev {
+                    let text = input.read(cx).value().trim().to_string();
+                    if !text.is_empty() && this.submit(text) {
+                        input.update(cx, |s, cx| s.set_value("", window, cx));
+                    }
                 }
-            }
-        })];
+            }),
+            cx.subscribe_in(&open_input, window, |this: &mut Self, input, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    let typed = input.read(cx).value().to_string();
+                    if this.open_by_name(&typed) {
+                        input.update(cx, |s, cx| s.set_value("", window, cx));
+                        this.open_shown = false;
+                    }
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&name_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    let typed = input.read(cx).value().to_string();
+                    this.rename(&typed, false);
+                    cx.notify();
+                }
+            }),
+        ];
+        let inputs = (composer, open_input, name_input);
         match client {
             Some((c, rx)) => {
-                let mut v = Self::blank(composer, Some(c), ConnState::Connecting, subs);
+                let mut v = Self::blank(inputs, Some(c), ConnState::Connecting, subs);
                 v.pump(rx, cx);
                 v
             }
-            None => Self::blank(composer, None, ConnState::Off("offline".into()), subs),
+            None => Self::blank(inputs, None, ConnState::Off("offline".into()), subs),
         }
     }
 
-    fn blank(composer: Entity<TextareaState>, client: Option<Client>, conn: ConnState, subs: Vec<Subscription>) -> Self {
+    fn blank(
+        (composer, open_input, name_input): (Entity<TextareaState>, Entity<InputState>, Entity<InputState>),
+        client: Option<Client>,
+        conn: ConnState,
+        subs: Vec<Subscription>,
+    ) -> Self {
         let list = ListState::new(0, ListAlignment::Top, px(600.));
         list.set_follow_mode(FollowMode::Tail);
         Self {
@@ -83,6 +117,11 @@ impl AppView {
             list,
             expanded: HashSet::new(),
             composer,
+            open_input,
+            name_input,
+            open_shown: false,
+            naming: false,
+            named_collapsed: false,
             restore: None,
             bench: None,
             plain_rows: false,
@@ -137,6 +176,50 @@ impl AppView {
                     let _ = c.resync();
                 }
             }
+            Effect::ListSaved => {
+                if self.client.as_ref().is_none_or(|c| c.saved_sessions(true, SAVED_LIMIT).is_err()) {
+                    self.model.saved_not_sent();
+                }
+            }
+        }
+        if self.model.named.renamed {
+            self.model.named.renamed = false;
+            self.naming = false;
+        }
+    }
+
+    /// Resume a saved session (by journal id, shown as `label`).
+    fn resume(&mut self, label: &str, target: &str) {
+        let Some(c) = &self.client else {
+            self.model.named.error = Some("offline".into());
+            return;
+        };
+        if let Ok(seq) = c.resume(target, CreateOptions::new().cwd(Cwd::Home)) {
+            self.model.resuming(label, target, seq);
+            self.list.set_follow_mode(FollowMode::Tail);
+        }
+    }
+
+    /// "Open by name…": `true` when it went out.
+    fn open_by_name(&mut self, typed: &str) -> bool {
+        match self.model.open_by_name(typed) {
+            Ok(name) => {
+                self.resume(&name, &name);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// "Name this session…" (`force`: replace the current name).
+    fn rename(&mut self, typed: &str, force: bool) {
+        let Ok((session_id, name)) = self.model.rename_request(typed) else { return };
+        let sent = match &self.client {
+            Some(c) => c.rename(session_id, Some(&name), force),
+            None => Err(RequestError::NotConnected),
+        };
+        if let Err(e) = sent {
+            self.model.rename_not_sent(e.to_string());
         }
     }
 
@@ -319,6 +402,107 @@ impl AppView {
             .into_any_element()
     }
 
+    fn render_named(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let rows = self.model.named_rows();
+        let open = !self.named_collapsed;
+        let header = h_flex()
+            .px_2()
+            .pt_1()
+            .pb_0p5()
+            .gap_1()
+            .justify_between()
+            .child(
+                div()
+                    .id("named-toggle")
+                    .flex_1()
+                    .cursor_pointer()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .child(format!("{} NAMED · {}", if open { "▾" } else { "▸" }, rows.len()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.named_collapsed = !this.named_collapsed;
+                        cx.notify();
+                    })),
+            )
+            .child(Button::new("open-by-name").ghost().compact().label("Open by name…").on_click(cx.listener(
+                |this, _, window, cx| {
+                    this.open_shown = !this.open_shown;
+                    this.named_collapsed = false;
+                    if this.open_shown {
+                        this.open_input.update(cx, |s, cx| s.focus(window, cx));
+                    }
+                    cx.notify();
+                },
+            )));
+        let mut section = v_flex().gap_0p5().child(header);
+        if self.open_shown {
+            section = section.child(div().px_2().pb_1().child(Input::new(&self.open_input)));
+        }
+        if let Some(e) = &self.model.named.error {
+            section = section.child(div().px_2().text_xs().text_color(theme.danger).child(e.clone()));
+        }
+        if !open {
+            return section;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        for (i, row) in rows.iter().enumerate() {
+            let active = matches!(&row.action, RowAction::Attach(id) if self.model.active.as_ref().is_some_and(|a| &a.session_id == id));
+            let color = match row.marker {
+                Marker::Busy | Marker::Resuming => theme.warning,
+                Marker::Awaiting => theme.danger,
+                Marker::Idle | Marker::Pinned => theme.success,
+                Marker::Parked | Marker::Saved => theme.muted_foreground,
+            };
+            let when = row.activity.as_deref().map(|t| crate::named::relative(t, now)).unwrap_or_default();
+            let detail: SharedString =
+                [row.marker.label(), row.model.as_str(), when.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ").into();
+            let action = row.action.clone();
+            section = section.child(
+                h_flex()
+                    .id(("named", i))
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(theme.sidebar_accent))
+                    .hover(|d| d.bg(theme.sidebar_accent))
+                    .child(div().size(px(7.)).flex_none().rounded_full().bg(color))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_sm().child(row.name.clone()))
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(detail),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        match &action {
+                            RowAction::Attach(id) => this.attach(id.clone()),
+                            RowAction::Resume { id, name } => {
+                                let (id, name) = (id.clone(), name.clone());
+                                this.resume(&name, &id);
+                            }
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        if rows.is_empty() {
+            section = section.child(div().px_2().pb_1().text_xs().text_color(theme.muted_foreground).child("No named sessions"));
+        }
+        section
+    }
+
     fn render_rail(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let mut rail = v_flex()
@@ -336,8 +520,26 @@ impl AppView {
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("Synaps"))
                     .child(Button::new("new").ghost().compact().label("+ New").on_click(cx.listener(|this, _, _, _| this.create()))),
             );
-        let mut list = v_flex().id("sessions").flex_1().overflow_y_scroll().px_2().gap_0p5();
-        for (i, s) in self.model.sessions.iter().enumerate() {
+        let mut list = v_flex()
+            .id("sessions")
+            .flex_1()
+            .overflow_y_scroll()
+            .px_2()
+            .gap_0p5()
+            .child(self.render_named(cx))
+            .child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .pb_0p5()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .child("SESSIONS"),
+            );
+        let mut unnamed = 0;
+        for (i, s) in self.model.unnamed_sessions().enumerate() {
+            unnamed += 1;
             let active = self.model.active.as_ref().is_some_and(|a| a.session_id == s.id);
             let id = s.id.clone();
             list = list.child(
@@ -369,8 +571,8 @@ impl AppView {
                     .on_click(cx.listener(move |this, _, _, _| this.attach(id.clone()))),
             );
         }
-        if self.model.sessions.is_empty() {
-            list = list.child(div().px_2().text_sm().text_color(theme.muted_foreground).child("No live sessions"));
+        if unnamed == 0 {
+            list = list.child(div().px_2().text_sm().text_color(theme.muted_foreground).child("No unnamed live sessions"));
         }
         rail = rail.child(list);
         rail
@@ -387,13 +589,43 @@ impl AppView {
             ConnState::Incompatible(e) => (format!("● {}", one_line(e, 60)).into(), theme.danger),
         };
         let title: SharedString = self.model.transcript.title().unwrap_or("No session").to_string().into();
+        let attached = self.model.active.is_some() && self.client.is_some();
         h_flex()
             .px_4()
             .py_2()
             .gap_3()
             .border_b_1()
             .border_color(theme.border)
+            .when_some(self.model.active_name(), |d, n| {
+                d.child(
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .bg(theme.secondary)
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(n.to_string()),
+                )
+            })
             .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_ellipsis().child(title))
+            .when(attached, |d| {
+                d.child(Button::new("name-session").ghost().compact().label("Name this session…").on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.naming = !this.naming;
+                        this.model.named.rename_error = None;
+                        this.model.named.replace = None;
+                        if this.naming {
+                            let current = this.model.active_name().unwrap_or_default().to_string();
+                            this.name_input.update(cx, |s, cx| {
+                                s.set_value(current, window, cx);
+                                s.focus(window, cx);
+                            });
+                        }
+                        cx.notify();
+                    },
+                )))
+            })
             .when(self.model.transcript.cost_usd() > 0.0, |d| {
                 d.child(div().text_sm().text_color(theme.muted_foreground).child(format!("${:.4}", self.model.transcript.cost_usd())))
             })
@@ -408,6 +640,48 @@ impl AppView {
                     .text_color(color)
                     .child(label),
             )
+    }
+}
+
+impl AppView {
+    /// The "Name this session…" row under the header.
+    fn render_naming(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let pending = self.model.named.rename.is_some();
+        let mut row = v_flex().px_4().py_2().gap_1().border_b_1().border_color(theme.border).child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(div().text_sm().text_color(theme.muted_foreground).child("Name"))
+                .child(div().flex_1().child(Input::new(&self.name_input)))
+                .child(Button::new("name-save").primary().compact().label(if pending { "Saving…" } else { "Save" }).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        let typed = this.name_input.read(cx).value().to_string();
+                        this.rename(&typed, false);
+                        cx.notify();
+                    }),
+                ))
+                .child(Button::new("name-cancel").ghost().compact().label("Cancel").on_click(cx.listener(|this, _, _, cx| {
+                    this.naming = false;
+                    cx.notify();
+                }))),
+        );
+        if let Some(e) = &self.model.named.rename_error {
+            row = row.child(div().text_xs().text_color(theme.danger).child(e.clone()));
+        }
+        if let Some((asked, current)) = self.model.named.replace.clone() {
+            row = row.child(
+                Button::new("name-replace")
+                    .danger()
+                    .compact()
+                    .label(format!("Replace '{current}' with '{asked}'"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.rename(&asked, true);
+                        cx.notify();
+                    })),
+            );
+        }
+        row
     }
 }
 
@@ -448,6 +722,7 @@ impl Render for AppView {
             .h_full()
             .min_w_0()
             .child(self.render_header(cx))
+            .when(self.naming && self.model.active.is_some(), |d| d.child(self.render_naming(cx)))
             .child(div().flex_1().min_h_0().child(list))
             .when(prompts > 0, |d| {
                 let p = &self.model.transcript.pending_prompts()[0];

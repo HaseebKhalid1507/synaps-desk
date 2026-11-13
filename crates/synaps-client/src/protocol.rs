@@ -28,6 +28,11 @@ pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// `Welcome.features` entry for owned sessions (newer daemons only).
 pub const FEATURE_OWNED_SESSIONS: &str = "owned_sessions";
+/// `Welcome.features` entry: the daemon answers `SavedSessions` (a newer
+/// daemon only; an older one would answer `Error{unknown variant}`).
+pub const FEATURE_SAVED_SESSIONS: &str = "saved_sessions";
+/// Longest session name (`validate_name`: `[a-z0-9-]{1,40}`).
+pub const SESSION_NAME_MAX: usize = 40;
 /// Query ids at or above this are the daemon's and the TUI transport's own
 /// (`wire::RESERVED_QUERY_ID_BASE`). A client picks its ids below it.
 pub const RESERVED_QUERY_ID_BASE: u64 = 1 << 63;
@@ -46,6 +51,21 @@ pub enum ClientFrame {
     Sessions,
     Attach(Attach),
     Cmd { session_id: String, cmd: SessionCommand },
+    /// Control fast path: the saved sessions on disk, newest first. Only to
+    /// a daemon that lists [`FEATURE_SAVED_SESSIONS`]. Reply: `SavedSessionList`.
+    SavedSessions { named_only: bool, limit: usize },
+    /// Control fast path: name (`Some`) or unname (`None`) a live or parked
+    /// session (`/saveas` rules). `expect`: absent = replace any name,
+    /// `Some(None)` = only if unnamed, `Some(Some(x))` = only if named `x`.
+    /// Reply: `Renamed`, `RenameFailed` or `Refused{UnknownSession}`. Not
+    /// accepted on an attached connection. An older daemon answers
+    /// `Error{unknown variant}`.
+    Rename {
+        session_id: String,
+        name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expect: Option<Option<String>>,
+    },
     Bye,
 }
 
@@ -59,6 +79,12 @@ impl std::fmt::Debug for ClientFrame {
             Self::Sessions => f.write_str("Sessions"),
             Self::Attach(a) => f.debug_tuple("Attach").field(a).finish(),
             Self::Cmd { session_id, cmd } => f.debug_struct("Cmd").field("session_id", session_id).field("cmd", cmd).finish(),
+            Self::SavedSessions { named_only, limit } => {
+                f.debug_struct("SavedSessions").field("named_only", named_only).field("limit", limit).finish()
+            }
+            Self::Rename { session_id, name, expect } => {
+                f.debug_struct("Rename").field("session_id", session_id).field("name", name).field("expect", expect).finish()
+            }
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -161,6 +187,12 @@ pub struct CreateConfig {
     /// `--name`: must be unique among saved sessions (`/saveas` rules).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// `--continue <id|name>`: resume a saved session (the daemon resolves
+    /// ids, names and compaction chains; a live one is attached instead).
+    /// `Some(None)` is a bare `--continue` (the most recent); it goes out as
+    /// `null`, which the daemon's `double_option` keeps apart from absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continue_session: Option<Option<String>>,
     pub auto_approve_confirms: bool,
 }
 
@@ -226,6 +258,12 @@ pub enum DaemonFrame {
     Attached(Box<Attached>),
     Event(Envelope),
     Error { session_id: Option<String>, message: String },
+    /// Reply to `SavedSessions`. `rejected`: entries that did not decode.
+    SavedSessionList { sessions: Vec<SavedSession>, truncated: bool, rejected: usize },
+    /// Reply to `Rename`: the session's name is now `name` (`None`: cleared).
+    Renamed { session_id: String, name: Option<String>, in_memory_only: bool },
+    /// Reply to `Rename`: not renamed.
+    RenameFailed(RenameFailure),
     Bye(Option<ByeReason>),
     Unknown(String),
     Malformed { kind: String, error: String },
@@ -266,6 +304,20 @@ enum RawFrame {
         #[serde(default)]
         message: String,
     },
+    SavedSessionList {
+        #[serde(default, deserialize_with = "null_vec")]
+        sessions: Vec<Value>,
+        #[serde(default)]
+        truncated: bool,
+    },
+    Renamed {
+        session_id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        in_memory_only: bool,
+    },
+    RenameFailed(RenameFailure),
     Bye {
         #[serde(default)]
         reason: Option<ByeReason>,
@@ -304,6 +356,12 @@ pub fn decode_frame(line: &str) -> Result<DaemonFrame, String> {
             RawFrame::Attached(a) => DaemonFrame::Attached(a),
             RawFrame::Event(e) => DaemonFrame::Event(e),
             RawFrame::Error { session_id, message } => DaemonFrame::Error { session_id, message },
+            RawFrame::SavedSessionList { sessions, truncated } => {
+                let (sessions, rejected) = lenient(sessions);
+                DaemonFrame::SavedSessionList { sessions, truncated, rejected }
+            }
+            RawFrame::Renamed { session_id, name, in_memory_only } => DaemonFrame::Renamed { session_id, name, in_memory_only },
+            RawFrame::RenameFailed(f) => DaemonFrame::RenameFailed(f),
             RawFrame::Bye { reason } => DaemonFrame::Bye(reason),
         }),
         Err(e) => {
@@ -313,8 +371,19 @@ pub fn decode_frame(line: &str) -> Result<DaemonFrame, String> {
                 kind: String,
             }
             let tag: Tag = serde_json::from_str(line).map_err(|e2| format!("not a JSON object: {e2}"))?;
-            const KNOWN: &[&str] =
-                &["welcome", "refused", "pong", "session_list", "attached", "event", "error", "bye"];
+            const KNOWN: &[&str] = &[
+                "welcome",
+                "refused",
+                "pong",
+                "session_list",
+                "attached",
+                "event",
+                "error",
+                "saved_session_list",
+                "renamed",
+                "rename_failed",
+                "bye",
+            ];
             if KNOWN.contains(&tag.kind.as_str()) {
                 Ok(DaemonFrame::Malformed { kind: tag.kind, error: e.to_string() })
             } else {
@@ -413,6 +482,16 @@ pub struct SessionMeta {
     pub messages: usize,
     #[serde(default)]
     pub state_since: Option<String>,
+    /// Pending prompts (questions, secrets) waiting for an answer.
+    #[serde(default)]
+    pub awaiting_input: usize,
+    /// The conversation's journal id (`conv.session.id`): differs from `id`
+    /// after a compaction into a successor. Empty from an older daemon.
+    #[serde(default)]
+    pub journal_id: String,
+    /// The journal is held by another process (`"pid N (kind)"`).
+    #[serde(default)]
+    pub locked_by: Option<String>,
 }
 
 impl SessionMeta {
@@ -426,6 +505,122 @@ impl SessionMeta {
     pub fn is_parked(&self) -> bool {
         self.lifecycle == "parked"
     }
+
+    /// Whether `id` (a session or journal id) is this session.
+    pub fn is(&self, id: &str) -> bool {
+        !id.is_empty() && (self.id == id || self.journal_id == id)
+    }
+}
+
+/// One saved session (`SavedSessionList.sessions`). `name`, `cwd` and
+/// `message_count` may be null; `live`: the daemon holds it now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct SavedSession {
+    /// The journal id (`20261110-202033-e5f6`).
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub message_count: Option<u64>,
+    #[serde(default)]
+    pub live: bool,
+}
+
+/// `wire::RenameRefusal`: why a `Rename` was not applied. `NotLive`,
+/// `Unsupported` and `Offline` are this client's own (never on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RenameRefusal {
+    /// Not `[a-z0-9-]{1,40}`.
+    Invalid,
+    /// Another saved session has the name (`taken_by`).
+    Taken,
+    /// A compaction chain has the name.
+    ChainConflict,
+    /// `expect` did not match: the session has (or no longer has) a name
+    /// (`current_name`). Rename never silently replaces a name: resend
+    /// with `force` to replace it.
+    Named,
+    /// The journal is held by another process.
+    Locked,
+    /// Retry shortly (queue full, daemon reloading).
+    Busy,
+    /// No answer in time: it may still apply. Re-list before retrying.
+    Unknown,
+    /// `Refused{UnknownSession}`: no live or parked session with that id.
+    NotLive,
+    /// The daemon predates `Rename` (`Error{unknown variant}`).
+    Unsupported,
+    /// Not connected to the daemon: nothing was sent.
+    Offline,
+    /// Anything else (a failed save, a reason this client does not know).
+    #[serde(other)]
+    Failed,
+}
+
+/// `DaemonFrame::RenameFailed`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct RenameFailure {
+    pub session_id: String,
+    pub reason: RenameRefusal,
+    #[serde(default)]
+    pub message: String,
+    /// The journal id of the saved session holding the name (`Taken`).
+    #[serde(default)]
+    pub taken_by: Option<String>,
+    /// The session's name when `expect` failed (`Named`).
+    #[serde(default)]
+    pub current_name: Option<String>,
+}
+
+impl RenameFailure {
+    pub fn new(session_id: impl Into<String>, reason: RenameRefusal, message: impl Into<String>) -> Self {
+        Self { session_id: session_id.into(), reason, message: message.into(), taken_by: None, current_name: None }
+    }
+}
+
+/// A session name the daemon would refuse (`validate_name`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSessionName {
+    pub name: String,
+    pub why: &'static str,
+}
+
+impl std::fmt::Display for InvalidSessionName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.name.is_empty() { f.write_str(self.why) } else { write!(f, "invalid name '{}': {}", self.name, self.why) }
+    }
+}
+
+impl std::error::Error for InvalidSessionName {}
+
+/// agent-core's `validate_name`: 1–40 of lowercase ASCII letters, digits
+/// and `-`. Session ids (`20261110-202033-e5f6`) pass too.
+pub fn validate_session_name(name: &str) -> Result<(), InvalidSessionName> {
+    let bad = |why| Err(InvalidSessionName { name: name.to_string(), why });
+    if name.is_empty() {
+        return bad("name cannot be empty");
+    }
+    if name.len() > SESSION_NAME_MAX {
+        return bad("must be 40 chars or less");
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return bad("allowed characters are lowercase letters, digits, and '-'");
+    }
+    Ok(())
 }
 
 /// `config::ClientInput`: who may drive a session with several clients.

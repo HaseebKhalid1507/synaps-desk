@@ -67,7 +67,7 @@ fn main() {
     let sessions = loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match recv(&events, left) {
-            Some(Event::Status(Status::Connected { daemon_version, profile, pid })) => {
+            Some(Event::Status(Status::Connected { daemon_version, profile, pid, .. })) => {
                 connected_ms.get_or_insert(t0.elapsed().as_secs_f64() * 1e3);
                 eprintln!("probe: connected to daemon {daemon_version} (profile {profile:?}, pid {pid})");
             }
