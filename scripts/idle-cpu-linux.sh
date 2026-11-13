@@ -15,6 +15,13 @@ while IFS= read -r -d '' kv; do
 done < "/proc/$wm/environ"
 SYNAPS_DESKTOP_FLOAT=1 "$bin" "$@" > /dev/null 2>&1 &
 pid=$!
+# BENCH_WORKSPACE=<name> (i3): as in bench-linux.sh.
+if [ -n "${BENCH_WORKSPACE:-}" ] && command -v i3-msg >/dev/null; then
+  for _ in $(seq 1 200); do
+    i3-msg -q "[class=\"^synaps-desktop$\"] move container to workspace $BENCH_WORKSPACE" 2>/dev/null && break
+    sleep 0.025
+  done
+fi
 trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 sleep "$settle"
 ticks() { awk '{print $14 + $15}' "/proc/$pid/stat"; }

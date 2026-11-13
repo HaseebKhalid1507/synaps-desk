@@ -64,6 +64,12 @@ impl Future for YieldNow {
     }
 }
 
+/// A tool-call confirmation's answers, as the daemon reads them
+/// (`session/actor.rs` `answer`: approved on "y" / "yes", any other text
+/// denies; `None` cancels).
+pub const CONFIRM_YES: &str = "y";
+pub const CONFIRM_NO: &str = "n";
+
 /// The rail's filter tabs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Filter {
