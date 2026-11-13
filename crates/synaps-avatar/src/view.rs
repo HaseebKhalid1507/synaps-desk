@@ -177,6 +177,8 @@ const NOTE_LAYER: usize = 15;
 const NOTES_MAX: usize = 7;
 /// Notes are drawn this much larger than Capri's canvas sizes (our figure is smaller).
 const NOTE_SCALE: f32 = 1.15;
+/// The farthest a pose step moves any row (nod, breath, sway), logical px.
+const POSE_REACH: f32 = 5.0;
 /// Notes fade toward this tint (no alpha without a compositor).
 const NOTE_TINT: u32 = 0x3a4656;
 /// Note animation rate (shaped X windows; no GPUI redraw).
@@ -2087,6 +2089,8 @@ impl Render for Avatar {
             });
             plan.tint = g.tint(now);
         }
+        // Device px the art is also painted at underneath the posed bands (see the body).
+        let mut under = 0.0f32;
         if plan.slices.is_none() && plan.sx == 1.0 && plan.sy == 1.0 && !hidden {
             let pose = self.pose_at(now);
             let fi = self.anim.frame();
@@ -2094,6 +2098,7 @@ impl Render for Avatar {
                 && let Some(f) = self.frames.get(fi).and_then(|f| f.as_ref())
             {
                 plan.slices = Some(fx::pose_bands(pose, self.pose_rows(fi, f)));
+                under = (POSE_REACH * sf).ceil();
             }
         }
         let plan = Rc::new(plan);
@@ -2161,6 +2166,21 @@ impl Render for Avatar {
                                 window.paint_image(ib, ib, Corners::default(), img, 0, false).ok();
                             }
                             Some(bands) => {
+                                // Posed: the frame at the pose's reach (and half of it) in 8 directions goes
+                                // underneath. The bounding shape is set when this frame paints
+                                // but the present lands up to a frame later, so where a nod or
+                                // sway step grows the shape, the strip it grows into shows the
+                                // previous present. Without this that was transparent (black
+                                // outline on the hair for one frame); with it, it's hair.
+                                // Outside the shape it's invisible; inside, the bands cover it.
+                                if under > 0.0 {
+                                    for k in [1.0, 0.5] {
+                                        for (ox, oy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
+                                            let r = rect(ix + ox * under * k, iy + oy * under * k, iw, ih);
+                                            window.paint_image(r, r, Corners::default(), img.clone(), 0, false).ok();
+                                        }
+                                    }
+                                }
                                 for (r, c) in &solid_rects {
                                     window.paint_quad(fill(rect(r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32), rgb(*c)));
                                 }
