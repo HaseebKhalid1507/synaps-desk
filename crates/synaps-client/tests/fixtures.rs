@@ -440,3 +440,97 @@ fn clearing_an_empty_conversation_keeps_later_notes() {
     t.apply_update(&HistoryUpdate::Replace { messages: vec![msgs[0].clone(), reply] }).unwrap();
     assert!(texts(&t).iter().any(|(_, s)| s == "a note"), "{:?}", texts(&t));
 }
+
+/// Saved sessions (`saved_session_list`, the `saved_sessions` contract):
+/// null `name` / `cwd` / `message_count`, unknown fields, a bad entry
+/// skipped and counted, `truncated`.
+#[test]
+fn saved_session_lists_decode() {
+    let DaemonFrame::SavedSessionList { sessions, truncated, rejected } = decode_frame(fixture("saved_session_list.json").trim()).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!((sessions.len(), truncated, rejected), (3, false, 0));
+    let axel = &sessions[0];
+    assert_eq!((axel.id.as_str(), axel.name.as_deref(), axel.live), ("20261110-202033-e5f6", Some("axel"), true));
+    assert_eq!(axel.message_count, Some(800));
+    assert_eq!(axel.updated_at.as_deref(), Some("2026-11-13T07:30:00Z"));
+    let bebop = &sessions[1];
+    assert_eq!((bebop.cwd.as_deref(), bebop.message_count, bebop.title.as_deref()), (None, None, Some("")));
+
+    let odd = r#"{"type":"saved_session_list","sessions":[{"id":"a","name":null,"live":false},{"name":"no-id"},{"id":"b","live":"yes"}],"truncated":true}"#;
+    let DaemonFrame::SavedSessionList { sessions, truncated, rejected } = decode_frame(odd).unwrap() else { panic!() };
+    assert_eq!((sessions.len(), truncated, rejected), (1, true, 2));
+    assert_eq!(sessions[0].name, None);
+    let DaemonFrame::SavedSessionList { sessions, .. } = decode_frame(r#"{"type":"saved_session_list","sessions":null}"#).unwrap() else { panic!() };
+    assert!(sessions.is_empty());
+    assert!(matches!(decode_frame(r#"{"type":"saved_session_list","truncated":"no"}"#).unwrap(), DaemonFrame::Malformed { .. }));
+}
+
+/// `Renamed` / `RenameFailed` (`wire.rs`): every refusal, `taken_by`,
+/// `current_name`, and a reason from a newer daemon (`Failed`).
+#[test]
+fn rename_replies_decode() {
+    let frames: Vec<DaemonFrame> = fixture("rename_replies.ndjson").lines().map(|l| decode_frame(l).unwrap()).collect();
+    assert!(matches!(&frames[0], DaemonFrame::Renamed { name: Some(n), in_memory_only: false, .. } if n == "axon"));
+    assert!(matches!(&frames[1], DaemonFrame::Renamed { name: None, in_memory_only: true, .. }));
+    let failures: Vec<&RenameFailure> = frames[2..]
+        .iter()
+        .map(|f| match f {
+            DaemonFrame::RenameFailed(r) => r,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let reasons: Vec<RenameRefusal> = failures.iter().map(|f| f.reason).collect();
+    use RenameRefusal::*;
+    assert_eq!(reasons, vec![Taken, Named, Invalid, ChainConflict, Locked, Busy, Unknown, Failed]);
+    assert_eq!(failures[0].taken_by.as_deref(), Some("20261028-045932-a1b2"));
+    assert_eq!(failures[1].current_name.as_deref(), Some("kite"));
+    assert!(matches!(decode_frame(r#"{"type":"rename_failed","session_id":"s"}"#).unwrap(), DaemonFrame::Malformed { .. }));
+}
+
+#[test]
+fn session_names_are_validated_as_the_daemon_does() {
+    for ok in ["a", "axel", "my-task-2", "20261110-202033-e5f6", &"x".repeat(SESSION_NAME_MAX)] {
+        assert_eq!(validate_session_name(ok), Ok(()), "{ok}");
+    }
+    for bad in ["", "Axel", "my task", "my_task", "naïve", "a.b", &"x".repeat(SESSION_NAME_MAX + 1)] {
+        let e = validate_session_name(bad).unwrap_err();
+        assert!(!e.to_string().is_empty(), "{bad}");
+    }
+    assert_eq!(validate_session_name("").unwrap_err().to_string(), "name cannot be empty");
+    assert!(validate_session_name("My").unwrap_err().to_string().contains("lowercase"));
+    assert!(validate_session_name(&"x".repeat(41)).unwrap_err().to_string().contains("40"));
+}
+
+/// `SavedSessions` / `Rename` / a resuming create, byte for byte as the
+/// contract and `wire.rs` read them.
+#[test]
+fn named_session_frames_encode_as_the_daemon_expects() {
+    let saved = encode_frame(&ClientFrame::SavedSessions { named_only: true, limit: 200 }).unwrap();
+    assert_eq!(saved, "{\"type\":\"saved_sessions\",\"named_only\":true,\"limit\":200}\n");
+    let rename = |name: Option<&str>, expect: Option<Option<&str>>| {
+        encode_frame(&ClientFrame::Rename {
+            session_id: "s".into(),
+            name: name.map(Into::into),
+            expect: expect.map(|e| e.map(Into::into)),
+        })
+        .unwrap()
+    };
+    assert_eq!(rename(Some("axon"), Some(None)), "{\"type\":\"rename\",\"session_id\":\"s\",\"name\":\"axon\",\"expect\":null}\n");
+    assert_eq!(rename(Some("axon"), None), "{\"type\":\"rename\",\"session_id\":\"s\",\"name\":\"axon\"}\n");
+    assert_eq!(rename(None, None), "{\"type\":\"rename\",\"session_id\":\"s\",\"name\":null}\n");
+    assert_eq!(rename(Some("b"), Some(Some("a"))), "{\"type\":\"rename\",\"session_id\":\"s\",\"name\":\"b\",\"expect\":\"a\"}\n");
+    let opts = synaps_client::CreateOptions::new().cwd(synaps_client::Cwd::Path("/work".into())).resume("axel");
+    let create = encode_frame(&ClientFrame::Attach(Attach::Create { config: opts.config(), mode: AttachMode::Mirror })).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&create).unwrap();
+    assert_eq!(v["config"]["continue_session"], "axel");
+    assert_eq!(v["config"]["cwd"], "/work");
+    // A plain create says nothing about continuing (absent, not null: null
+    // is a bare `--continue`).
+    let plain = encode_frame(&ClientFrame::Attach(Attach::Create { config: CreateConfig::default(), mode: AttachMode::Mirror })).unwrap();
+    assert!(!plain.contains("continue_session"), "{plain}");
+    let bare = CreateConfig { continue_session: Some(None), ..Default::default() };
+    let bare = encode_frame(&ClientFrame::Attach(Attach::Create { config: bare, mode: AttachMode::Mirror })).unwrap();
+    assert!(bare.contains("\"continue_session\":null"), "{bare}");
+}

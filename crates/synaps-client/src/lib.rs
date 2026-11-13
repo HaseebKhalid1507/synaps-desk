@@ -49,6 +49,34 @@
 //! [`ClientOptions`] adds session polling ([`ClientOptions::poll_sessions`])
 //! and an explicit socket ([`Endpoint::Socket`]).
 //!
+//! # Named and saved sessions
+//!
+//! ```no_run
+//! # use synaps_client::*;
+//! # fn f(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
+//! // The saved sessions on disk, only from a daemon whose `Welcome.features`
+//! // lists `saved_sessions` (`Status::Connected { features }`); otherwise
+//! // `Err(RequestError::Unsupported)` and nothing is sent.
+//! if client.supports(FEATURE_SAVED_SESSIONS) {
+//!     client.saved_sessions(true, 200)?;  // -> Event::SavedSessions / SavedSessionsFailed
+//! }
+//! // Resume one by its exact journal id (every v3 daemon: a create with
+//! // `continue_session`), in its saved folder: the daemon does not restore
+//! // it. If that folder is gone on the daemon's machine, run it in `~`
+//! // instead (-> Event::CwdFallback). Failures ("no session matching 'x'",
+//! // a journal live in another process) come back as `Event::Detached`.
+//! let seq = client.resume(
+//!     "20261110-202033-e5f6",
+//!     CreateOptions::new().cwd(Cwd::Path("/home/me/Projects/axel".into())).fallback_cwd(Cwd::Home),
+//! )?;
+//! // Name a live or parked session (checked against `[a-z0-9-]{1,40}` first),
+//! // compare-and-set: an already named one is refused (`RenameFailed` with
+//! // `RenameRefusal::Named` and its `current_name`). To replace it, ask,
+//! // then send `Expect::Named(current_name)` for that same session.
+//! client.rename("<session id>", Some("my-task"), Expect::Unnamed)?;  // -> Event::Renamed / RenameFailed
+//! # let _ = seq; Ok(()) }
+//! ```
+//!
 //! Modules:
 //! - [`discovery`]: run dir + `daemon[-profile].json`
 //! - [`ipc`]: Unix socket (same-user check) / Windows named pipe (pipe name
@@ -70,8 +98,11 @@ pub mod protocol;
 pub mod synthetic;
 pub mod transcript;
 
-pub use client::{Client, ClientClosed, ClientOptions, Command, CreateOptions, Cwd, Error, Event, Status};
+pub use client::{Client, ClientClosed, ClientOptions, Command, CreateOptions, Cwd, Error, Event, Expect, RequestError, Status};
 pub use conn::{Endpoint, Identity, Incompatible, InvalidName};
 pub use history::HistoryUpdate;
-pub use protocol::{AttachMode, Attached, ClientInput, ClientKind, HistoryMode, Rejected, SessionEvent, SessionMeta};
+pub use protocol::{
+    AttachMode, Attached, ClientInput, ClientKind, FEATURE_SAVED_SESSIONS, HistoryMode, InvalidSessionName, MISSING_CWD, Rejected,
+    RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, validate_session_name,
+};
 pub use transcript::{Transcript, TranscriptError};
