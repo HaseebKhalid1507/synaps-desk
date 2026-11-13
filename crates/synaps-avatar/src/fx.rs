@@ -13,7 +13,6 @@ pub const PINK: u32 = 0xff1769;
 pub const VIOLET: u32 = 0xa668ff;
 pub const YELLOW: u32 = 0xedff43;
 pub const BOLT_RED: u32 = 0xff003d;
-pub const BOLT_DARK: u32 = 0xb3102f;
 
 fn ms(since: Duration) -> f32 {
     since.as_secs_f32() * 1000.0
@@ -21,12 +20,43 @@ fn ms(since: Duration) -> f32 {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GlitchKind {
-    /// Mood change / periodic interference.
+    /// Minor mood change / periodic interference.
     Burst,
-    /// Materialise: bands fill in while the interference decays.
+    /// A big mood change (into or out of an attention state, waking up).
+    Big,
+    /// Coming online: bands fill in through a long stutter.
     Appear,
+    /// Teleport landing: a red silhouette reassembles, then a short settle.
+    Land,
     /// Dematerialise: bands drop out while the interference rises.
     Vanish,
+}
+
+/// Stutter envelopes: `(start, strength)` steps over 0..1; the last step fades out.
+/// On-off-on hits like a bad signal, not one block.
+const STUTTER_MINOR: [(f32, f32); 5] = [(0.0, 0.9), (0.2, 0.15), (0.34, 0.8), (0.55, 0.0), (0.66, 0.45)];
+const STUTTER_BIG: [(f32, f32); 10] =
+    [(0.0, 1.0), (0.11, 0.12), (0.19, 0.95), (0.33, 0.0), (0.41, 0.85), (0.5, 0.25), (0.58, 0.72), (0.7, 0.0), (0.78, 0.5), (0.86, 0.3)];
+const STUTTER_APPEAR: [(f32, f32); 9] =
+    [(0.0, 1.0), (0.13, 0.3), (0.21, 1.0), (0.36, 0.1), (0.45, 0.88), (0.58, 0.0), (0.66, 0.62), (0.78, 0.15), (0.85, 0.38)];
+
+fn stutter(table: &[(f32, f32)], u: f32, seed: u64) -> f32 {
+    // Steps move ±0.025 and levels ±12 % per glitch, so no two bursts match.
+    let mut rng = Rng::new(seed ^ 0x5157_7e7e);
+    let mut level = 0.0;
+    for (i, &(at, s)) in table.iter().enumerate() {
+        let at = if i == 0 { 0.0 } else { at + rng.range(-0.025, 0.025) };
+        let s = (s * rng.range(0.88, 1.12)).min(1.0);
+        if u < at {
+            break;
+        }
+        level = s;
+    }
+    let last = table[table.len() - 1].0;
+    if u >= last {
+        level *= ((1.0 - u) / (1.0 - last)).clamp(0.0, 1.0);
+    }
+    level
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,8 +70,10 @@ pub struct Glitch {
 impl Glitch {
     pub fn new(kind: GlitchKind, now: Instant, seed: u64) -> Glitch {
         let ms = match kind {
-            GlitchKind::Burst => 380.0,
-            GlitchKind::Appear => 420.0,
+            GlitchKind::Burst => 440.0,
+            GlitchKind::Big => 900.0,
+            GlitchKind::Appear => 950.0,
+            GlitchKind::Land => 330.0,
             GlitchKind::Vanish => 300.0,
         };
         Glitch { t0: now, kind, ms, seed }
@@ -55,30 +87,19 @@ impl Glitch {
         (ms(now.saturating_duration_since(self.t0)) / self.ms).clamp(0.0, 1.0)
     }
 
-    /// Interference 0..1: Capri's stutter envelope (hit, gap, hit, gap, tail), squeezed.
+    /// Interference 0..1.
     pub fn strength(&self, now: Instant) -> f32 {
         let u = self.u(now);
         match self.kind {
-            GlitchKind::Burst => {
-                if u < 0.12 {
-                    0.96
-                } else if u < 0.25 {
-                    0.28
-                } else if u < 0.45 {
-                    0.86
-                } else if u < 0.58 {
-                    0.12
-                } else {
-                    0.5 * (1.0 - (u - 0.58) / 0.42)
-                }
-            }
-            GlitchKind::Appear => {
-                if u < 0.5 {
+            GlitchKind::Burst => stutter(&STUTTER_MINOR, u, self.seed),
+            GlitchKind::Big => stutter(&STUTTER_BIG, u, self.seed),
+            GlitchKind::Appear => stutter(&STUTTER_APPEAR, u, self.seed),
+            // Reassembled by ~45 %, then a short settle.
+            GlitchKind::Land => {
+                if u < 0.45 {
                     1.0
-                } else if u < 0.62 {
-                    0.25
                 } else {
-                    0.7 * (1.0 - (u - 0.62) / 0.38)
+                    0.6 * (1.0 - (u - 0.45) / 0.55)
                 }
             }
             GlitchKind::Vanish => {
@@ -95,9 +116,10 @@ impl Glitch {
     pub fn coverage(&self, now: Instant) -> f32 {
         let u = self.u(now);
         match self.kind {
-            GlitchKind::Burst => 1.0,
+            GlitchKind::Burst | GlitchKind::Big => 1.0,
+            GlitchKind::Appear => 0.2 + 0.8 * (u / 0.5).min(1.0),
             // Starts a quarter in, so the body never blinks out between bolt and arrival.
-            GlitchKind::Appear => 0.25 + 0.75 * (u / 0.55).min(1.0),
+            GlitchKind::Land => 0.25 + 0.75 * (u / 0.4).min(1.0),
             GlitchKind::Vanish => 1.0 - 0.8 * u,
         }
     }
@@ -106,13 +128,18 @@ impl Glitch {
         self.seed
     }
 
+    /// The face stays readable in every frame, except while dematerialising.
+    pub fn keeps_face(&self) -> bool {
+        self.kind != GlitchKind::Vanish
+    }
+
     /// Teleport legs turn the figure into a red silhouette: late in the dissolve, early
     /// in the landing.
     pub fn tint(&self, now: Instant) -> Option<u32> {
         let u = self.u(now);
         match self.kind {
             GlitchKind::Vanish if u > 0.45 => Some(BOLT_RED),
-            GlitchKind::Appear if u < 0.3 => Some(BOLT_RED),
+            GlitchKind::Land if u < 0.3 => Some(BOLT_RED),
             _ => None,
         }
     }
@@ -121,6 +148,25 @@ impl Glitch {
     pub fn step_seed(&self, now: Instant) -> u64 {
         self.seed ^ ((ms(now.saturating_duration_since(self.t0)) / 50.0) as u64).wrapping_mul(0x9e37_79b9)
     }
+}
+
+/// One glitch step's inputs. Device px, avatar-local.
+#[derive(Clone, Copy, Debug)]
+pub struct GlitchStep {
+    pub strength: f32,
+    pub coverage: f32,
+    pub seed: u64,
+    /// Fixes which bands appear first (per glitch).
+    pub order: u64,
+    /// Rows to band: from `y0` (negative reaches the HUD above the avatar rect) to `h`.
+    pub y0: i32,
+    pub h: i32,
+    /// The frame's visible box (x, y, w, h).
+    pub body: (i32, i32, i32, i32),
+    /// Face rows: small offsets only, never dropped, lighter scanlines.
+    pub face: Option<(i32, i32)>,
+    /// Device px per logical px (band heights, split widths).
+    pub sf: f32,
 }
 
 /// How the body is drawn this frame. Device px, relative to the avatar rect.
@@ -134,64 +180,112 @@ pub struct BodyPlan {
     pub slices: Option<Vec<(i32, i32, i32)>>,
     /// Solid colour silhouettes under the body (RGB split), `(dx, dy, rgb)`.
     pub ghosts: Vec<(i32, i32, u32)>,
-    /// Corruption cells.
+    /// Corruption cells and chroma bars, drawn over the body.
     pub cells: Vec<(ShapeRect, u32)>,
-    /// Scanline darkness 0..1.
+    /// Scanline darkness 0..1 (half in the face rows).
     pub scan: f32,
+    pub face: Option<(i32, i32)>,
     /// Draw the body as a solid silhouette of this colour (teleport dissolve/land).
     pub tint: Option<u32>,
 }
 
+pub const SPLIT_RED: u32 = 0xff2448;
+
 impl BodyPlan {
     pub fn plain() -> BodyPlan {
-        BodyPlan { sx: 1.0, sy: 1.0, pivot: (0.0, 0.0), slices: None, ghosts: Vec::new(), cells: Vec::new(), scan: 0.0, tint: None }
+        BodyPlan {
+            sx: 1.0,
+            sy: 1.0,
+            pivot: (0.0, 0.0),
+            slices: None,
+            ghosts: Vec::new(),
+            cells: Vec::new(),
+            scan: 0.0,
+            face: None,
+            tint: None,
+        }
     }
 
     pub fn is_plain(&self) -> bool {
         self.sx == 1.0 && self.sy == 1.0 && self.slices.is_none() && self.ghosts.is_empty() && self.cells.is_empty()
     }
 
-    /// Glitch layout for one step. `w`, `h`: the avatar rect; `body`: the frame's visible
-    /// box (cells land near the figure).
-    /// `seed` re-rolls the pattern; `order` fixes which bands appear first (per glitch).
-    #[allow(clippy::too_many_arguments)]
-    pub fn glitch(&mut self, strength: f32, coverage: f32, seed: u64, order: u64, _w: i32, h: i32, body: (i32, i32, i32, i32)) {
-        let mut rng = Rng::new(seed | 1);
+    /// Glitch layout for one step: bands 8–20 px tall, displaced up to ~22 % of the
+    /// figure's width (a few px in the face rows), a 6–10 px red/cyan split, scanlines,
+    /// corruption cells and, on the strongest steps, chroma bars across the torso.
+    pub fn glitch(&mut self, g: GlitchStep) {
+        let mut rng = Rng::new(g.seed | 1);
+        let s = g.strength;
+        let (bx, by, bw, bh) = g.body;
+        let max_shift = 0.22 * bw as f32;
+        let face_shift = 3.0 * g.sf;
+        let in_face = |y: i32| g.face.is_some_and(|(f0, f1)| y >= f0 && y < f1);
         let mut slices = Vec::new();
-        let mut y = 0;
-        while y < h {
-            let bh = (4.0 + rng.range(0.0, 1.0).powi(2) * 46.0) as i32;
-            let y1 = (y + bh).min(h);
-            let shift = if rng.range(0.0, 1.0) < 0.2 + 0.5 * strength { rng.range(-1.0, 1.0) * 38.0 * strength } else { 0.0 };
+        let mut y = g.y0;
+        while y < g.h {
+            let mut y1 = (y + ((8.0 + rng.range(0.0, 1.0).powf(1.5) * 12.0) * g.sf) as i32).min(g.h);
+            // Bands never straddle the face's edges.
+            if let Some((f0, f1)) = g.face {
+                if y < f0 && y1 > f0 {
+                    y1 = f0;
+                } else if y >= f0 && y < f1 {
+                    y1 = y1.min(f1);
+                }
+            }
+            let face = in_face(y);
+            let roll = rng.range(0.0, 1.0);
+            let mag = rng.range(0.35, 1.0);
+            let sign = if rng.range(0.0, 1.0) < 0.5 { -1.0 } else { 1.0 };
+            let shift = if face {
+                if s > 0.3 && roll < 0.6 { sign * face_shift * mag } else { 0.0 }
+            } else if roll < 0.12 + 0.48 * s {
+                sign * max_shift * mag * s
+            } else {
+                0.0
+            };
             // Coverage: bands come and go in a stable order per glitch, not per step.
             // Band height re-rolls each step, so key the order on position, not index.
-            let keep = coverage >= 1.0 || hash01((y / 12) as u32, order as u32) < coverage;
+            let keep = g.coverage >= 1.0 || face || hash01(y.div_euclid(12) as u32, g.order as u32) < g.coverage;
             if keep {
                 slices.push((y, y1, shift.round() as i32));
             }
             y = y1;
         }
         self.slices = Some(slices);
-        if strength > 0.18 {
-            let d = (2.0 + 8.0 * strength).round() as i32;
-            if rng.range(0.0, 1.0) < 0.85 {
-                self.ghosts.push((-d, 0, CYAN));
-            }
-            if rng.range(0.0, 1.0) < 0.85 {
-                self.ghosts.push((d, (rng.range(-1.0, 1.0) * 2.0) as i32, PINK));
-            }
+        self.face = g.face;
+        if s > 0.15 {
+            let d = ((5.0 + 5.0 * s) * g.sf / 1.08).round() as i32;
+            self.ghosts.push((-d, 0, CYAN));
+            self.ghosts.push((d, (rng.range(-1.0, 1.0) * 2.0) as i32, SPLIT_RED));
         }
-        let n = (strength * 26.0) as usize;
-        let (bx, by, bw, bh) = body;
+        let n = (s * 22.0) as usize;
         for i in 0..n {
-            let cw = rng.range(3.0, 14.0) as u16;
+            let cw = rng.range(4.0, 18.0) as u16;
             let ch = rng.range(1.0, 4.0) as u16;
             let x = bx + (rng.range(-0.1, 1.1) * bw as f32) as i32;
             let y = by + (rng.range(0.0, 1.0) * bh as f32) as i32;
+            if in_face(y) || in_face(y + ch as i32) {
+                continue;
+            }
             let colour = [CYAN, PINK, VIOLET, YELLOW][i % 4];
             self.cells.push(((x as i16, y as i16, cw, ch), colour));
         }
-        self.scan = 0.45 * strength;
+        if s > 0.7 {
+            // Chroma bars across the torso (below the face, above the hips).
+            let t0 = g.face.map_or(by + bh / 4, |f| f.1 + (6.0 * g.sf) as i32);
+            let t1 = (by + bh * 3 / 5).max(t0 + 1);
+            for (k, colour) in [YELLOW, VIOLET].into_iter().enumerate() {
+                if k == 1 && rng.range(0.0, 1.0) < 0.4 {
+                    break;
+                }
+                let y = rng.range(t0 as f32, t1 as f32) as i32;
+                let hh = (rng.range(3.0, 6.0) * g.sf) as u16;
+                let x0 = bx + (rng.range(-0.15, 0.35) * bw as f32) as i32;
+                let w = (rng.range(0.45, 0.95) * bw as f32) as u16;
+                self.cells.push(((x0 as i16, y as i16, w, hh), colour));
+            }
+        }
+        self.scan = 0.55 * s;
     }
 
     /// Squash/stretch a rect about the pivot without opening gaps between bands.
@@ -378,7 +472,13 @@ pub fn star(cx: f32, cy: f32, r: f32, spin: f32) -> Vec<(f32, f32)> {
 
 // ---- teleport bolt ------------------------------------------------------------------
 
-pub const BOLT_MS: f32 = 340.0;
+pub const BOLT_MS: f32 = 420.0;
+/// The body lands (window moves, still hidden) at this point of the bolt…
+pub const BOLT_ARRIVE: f32 = 0.5;
+/// …and the landing glitch takes over here, as the tail reaches the target.
+pub const BOLT_END: f32 = 0.88;
+/// Bolt layer colours, bottom to top: outer halo, halo, bolt, core.
+pub const BOLT_COLOURS: [u32; 4] = [0x560a1b, 0xa3112e, BOLT_RED, 0xffeef3];
 
 #[derive(Clone, Copy, Debug)]
 struct RoutePt {
@@ -442,19 +542,28 @@ impl Bolt {
     }
 
     /// Head and tail positions along the route at time `u` (0..1 of BOLT_MS): the head
-    /// shoots out, the tail chases it in.
+    /// strikes out from the origin, the full bolt holds, then the tail retracts into the
+    /// target.
     pub fn span(u: f32) -> (f32, f32) {
         let ease = |v: f32| 1.0 - (1.0 - v.clamp(0.0, 1.0)).powi(3);
-        (ease(0.06 + u / 0.5), ease((u - 0.32) / 0.6))
+        (ease(0.04 + u / 0.28), ease((u - 0.6) / 0.3))
     }
 
-    /// Ribbon polygons `(main, branches)` between tail and head, root px.
-    pub fn frame(&self, u: f32) -> (Vec<Vec<(f32, f32)>>, Vec<Vec<(f32, f32)>>) {
+    /// Width multiplier: a flash when the head strikes, then a 35 ms flicker.
+    fn pulse(u: f32) -> f32 {
+        if (0.27..0.38).contains(&u) {
+            return 1.3;
+        }
+        if ((u * BOLT_MS / 35.0) as i32) % 2 == 1 { 0.8 } else { 1.0 }
+    }
+
+    /// Ribbon polygons per layer, root px: `[outer halo, halo, bolt, core]`. No alpha
+    /// without a compositor, so the glow is stacked, progressively wider dark-red shapes.
+    pub fn frame(&self, u: f32) -> [Vec<Vec<(f32, f32)>>; 4] {
+        let mut out: [Vec<Vec<(f32, f32)>>; 4] = Default::default();
         let (head, tail) = Bolt::span(u);
-        let mut main = Vec::new();
-        let mut branches = Vec::new();
         if head <= tail + 0.004 {
-            return (main, branches);
+            return out;
         }
         let travelled = head - tail;
         let mut seg: Vec<(f32, f32, f32)> = vec![{
@@ -464,7 +573,7 @@ impl Bolt {
         seg.extend(self.route.iter().filter(|p| p.t > tail && p.t < head).map(|p| (p.x, p.y, p.t)));
         let hp = self.at(head);
         seg.push((hp.0, hp.1, head));
-        let radius = (self.scale * 0.1).clamp(6.0, 28.0);
+        let radius = (self.scale * 0.1).clamp(6.0, 28.0) * Bolt::pulse(u);
         let n = seg.len();
         let widths: Vec<f32> = seg
             .iter()
@@ -478,15 +587,19 @@ impl Bolt {
                 }
             })
             .collect();
-        main.push(ribbon(&seg.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(), &widths));
-        // Forks off the travelled part.
+        let pts: Vec<(f32, f32)> = seg.iter().map(|p| (p.0, p.1)).collect();
+        let grow = |k: f32, add: f32| widths.iter().map(|w| w * k + add).collect::<Vec<_>>();
+        out[0].push(ribbon(&pts, &grow(2.3, 7.0)));
+        out[1].push(ribbon(&pts, &grow(1.6, 3.0)));
+        out[2].push(ribbon(&pts, &widths));
+        out[3].push(ribbon(&pts, &grow(0.34, 0.0)));
+        // Two forks off the travelled part.
         if travelled > 0.08 {
             let mut rng = Rng::new(self.seed ^ 0xf27a_64b5);
-            let count = 7;
-            for k in 0..count {
-                let t = 0.1 + (k as f32 + 0.15 + rng.range(0.0, 0.7)) / count as f32 * 0.82;
-                let side = if k % 2 == 1 { 1.0 } else { -1.0 };
-                let var = rng.range(0.75, 1.25);
+            for (k, base) in [0.36f32, 0.68].into_iter().enumerate() {
+                let t = base + rng.range(-0.06, 0.06);
+                let side = if k % 2 == 1 { 1.0 } else { -1.0 } * if self.seed & 1 == 0 { 1.0 } else { -1.0 };
+                let var = rng.range(0.85, 1.2);
                 if t <= tail || t >= head {
                     continue;
                 }
@@ -496,18 +609,19 @@ impl Bolt {
                 let al = (ax * ax + ay * ay).sqrt().max(1e-3);
                 let axis = (ax / al, ay / al);
                 let growth = ((t - tail) / 0.07).min((head - t) / 0.08).min(1.0);
-                let reach = self.scale * 0.3 * growth * var;
+                let reach = self.scale * 0.32 * growth * var;
                 if reach < 3.0 {
                     continue;
                 }
                 let fork = |f: f32, a: f32| along(o, axis, reach * f, side * reach * a);
                 let stem = [o, fork(-0.16, 0.22), fork(-0.12, 0.4), fork(-0.49, 0.48), fork(-0.39, 0.68), fork(-0.86, 0.88), fork(-1.15, 1.04)];
-                let th = growth * (self.scale * 0.012).clamp(1.6, 3.4);
+                let th = growth * (self.scale * 0.016).clamp(2.0, 4.5);
                 let w: Vec<f32> = [1.45, 2.05, 1.65, 1.2, 0.8, 0.55, 0.12].iter().map(|v| v * th).collect();
-                branches.push(ribbon(&stem, &w));
+                out[1].push(ribbon(&stem, &w.iter().map(|v| v * 1.7 + 2.0).collect::<Vec<_>>()));
+                out[2].push(ribbon(&stem, &w));
             }
         }
-        (main, branches)
+        out
     }
 }
 
@@ -575,12 +689,23 @@ mod tests {
     fn glitch_vanish_thins_to_red() {
         let t = Instant::now();
         let g = Glitch::new(GlitchKind::Vanish, t, 7);
+        let step = |at: Instant| GlitchStep {
+            strength: g.strength(at),
+            coverage: g.coverage(at),
+            seed: g.step_seed(at),
+            order: g.seed(),
+            y0: 0,
+            h: 400,
+            body: (0, 0, 300, 400),
+            face: None,
+            sf: 1.0,
+        };
         let mut plan = BodyPlan::plain();
-        plan.glitch(g.strength(t), g.coverage(t), g.step_seed(t), g.seed(), 300, 400, (0, 0, 300, 400));
+        plan.glitch(step(t));
         let full: i32 = plan.slices.unwrap().iter().map(|b| b.1 - b.0).sum();
         let late = t + Duration::from_millis(290);
         let mut plan = BodyPlan::plain();
-        plan.glitch(g.strength(late), g.coverage(late), g.step_seed(late), g.seed(), 300, 400, (0, 0, 300, 400));
+        plan.glitch(step(late));
         let thin: i32 = plan.slices.unwrap().iter().map(|b| b.1 - b.0).sum();
         assert!(thin * 2 < full, "{thin} vs {full}");
         assert_eq!(g.tint(late), Some(BOLT_RED));
@@ -588,11 +713,50 @@ mod tests {
     }
 
     #[test]
+    fn glitch_keeps_the_face() {
+        let t = Instant::now();
+        for kind in [GlitchKind::Big, GlitchKind::Appear, GlitchKind::Burst] {
+            let g = Glitch::new(kind, t, 11);
+            for ms in (0..950).step_by(25) {
+                let at = t + Duration::from_millis(ms);
+                let mut plan = BodyPlan::plain();
+                plan.glitch(GlitchStep {
+                    strength: g.strength(at),
+                    coverage: g.coverage(at),
+                    seed: g.step_seed(at),
+                    order: g.seed(),
+                    y0: -80,
+                    h: 400,
+                    body: (20, 10, 300, 390),
+                    face: Some((90, 140)),
+                    sf: 1.0,
+                });
+                let face: Vec<_> = plan.slices.unwrap().into_iter().filter(|b| b.1 > 90 && b.0 < 140).collect();
+                assert_eq!(face.iter().map(|b| b.1 - b.0).sum::<i32>(), 50, "{kind:?} {ms}");
+                assert!(face.iter().all(|b| b.2.abs() <= 3 && b.0 >= 90 && b.1 <= 140));
+            }
+        }
+    }
+
+    #[test]
+    fn big_glitch_stutters() {
+        let t = Instant::now();
+        let g = Glitch::new(GlitchKind::Big, t, 5);
+        let v: Vec<f32> = (0..90).map(|i| g.strength(t + Duration::from_millis(i * 10))).collect();
+        let flips = v.windows(2).filter(|w| (w[0] > 0.5) != (w[1] > 0.5)).count();
+        assert!(flips >= 4, "{flips}");
+        assert!(g.ms >= 800.0);
+    }
+
+    #[test]
     fn bolt_reaches_both_ends() {
         let b = Bolt::new((0.0, 0.0), (400.0, 100.0), 3, 300.0);
         assert_eq!(b.at(0.0), (0.0, 0.0));
         assert_eq!(b.at(1.0), (400.0, 100.0));
-        let (main, _) = b.frame(0.5);
-        assert_eq!(main.len(), 1);
+        let layers = b.frame(0.5);
+        assert!(layers.iter().all(|l| !l.is_empty()));
+        // Visible (the full bolt) from the strike through the hold: 3+ frames at 30 fps.
+        let full: Vec<u32> = (0..42).filter(|&i| { let (h, t) = Bolt::span(i as f32 / 42.0); h > 0.95 && t < 0.05 }).collect();
+        assert!(full.len() as f32 * BOLT_MS / 42.0 >= 100.0, "{full:?}");
     }
 }

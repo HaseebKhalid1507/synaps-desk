@@ -118,9 +118,9 @@ fn face_band(px: &[u8], w: u32, top: i32, height: i32) -> (i32, i32) {
     (top + (height as f32 * 0.17) as i32, top + (height as f32 * 0.37) as i32)
 }
 
-/// A 1 px rim of `rgb` around dark opaque pixels, drawn into transparent neighbours (so
-/// behind the art, never over it). RGBA straight alpha.
-fn add_rim(px: &mut [u8], w: u32, h: u32, rgb: u32) {
+/// A 1 px rim of `rgb` around dark opaque pixels from row `from` down, drawn into
+/// transparent neighbours (so behind the art, never over it). RGBA straight alpha.
+fn add_rim(px: &mut [u8], w: u32, h: u32, from: i32, rgb: u32) {
     let (w, h) = (w as i32, h as i32);
     let dark = |px: &[u8], x: i32, y: i32| {
         if x < 0 || y < 0 || x >= w || y >= h {
@@ -130,7 +130,7 @@ fn add_rim(px: &mut [u8], w: u32, h: u32, rgb: u32) {
         px[i + 3] >= 160 && (px[i] as u32 * 3 + px[i + 1] as u32 * 6 + px[i + 2] as u32) < 10 * 70
     };
     let mut set = Vec::new();
-    for y in 0..h {
+    for y in from.max(0)..h {
         for x in 0..w {
             let i = (y * w + x) as usize * 4;
             if px[i + 3] >= HIT_ALPHA {
@@ -274,7 +274,9 @@ fn decode_one(pack: &Pack, f: &FrameSource, geo: &Geometry, verify: bool, resize
     if f.anchor.name == "seat"
         && let Some(rim) = pack.behaviour.perch.as_ref().and_then(|p| u32::from_str_radix(p.rim.trim_start_matches('#'), 16).ok())
     {
-        add_rim(&mut px, geo.width, geo.height, rim);
+        // The limbs over the window: from just above the seat line down.
+        let (_, seat) = geo.to_device(0, f.anchor.y + dy);
+        add_rim(&mut px, geo.width, geo.height, seat.round() as i32 - 8, rim);
     }
     let vb = f.bounds.offset(dx, dy);
     let (_, top) = geo.to_device(0, vb.y);

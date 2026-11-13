@@ -264,6 +264,8 @@ pub struct Avatar {
     shadow_at: Option<(i32, i32)>,
     /// Last laid-out width of the status tag (logical px), to place the next one.
     tag_w: Rc<Cell<f32>>,
+    /// Last laid-out box of the status tag (window logical px), to tear it in a glitch.
+    tag_box: Cell2,
 }
 
 pub struct Init {
@@ -346,6 +348,7 @@ impl Avatar {
             shadow: None,
             shadow_at: None,
             tag_w: Rc::new(Cell::new(150.0)),
+            tag_box: Rc::new(Cell::new(None)),
         }
     }
 
@@ -451,7 +454,8 @@ impl Avatar {
         // Speaking comes and goes with every reply; that alone is not worth a burst.
         let chatter = m == Mood::Talking || prev == Mood::Talking;
         if m != prev && !chatter && self.loaded && self.teleport.is_none() && self.status_of(m).tone != self.status_of(prev).tone {
-            self.glitch = Some(Glitch::new(GlitchKind::Burst, now, self.rng.next()));
+            let big = self.spec(m).is_some_and(|s| s.big) || self.spec(prev).is_some_and(|s| s.big);
+            self.glitch = Some(Glitch::new(if big { GlitchKind::Big } else { GlitchKind::Burst }, now, self.rng.next()));
         }
         self.mood = m;
         let spec = self.spec(m).cloned();
@@ -586,9 +590,13 @@ impl Avatar {
         if self.shadow_at != Some(at) {
             let rects = self.shadow.as_ref().map(|s| s.1.clone()).unwrap_or_default();
             let reshape = self.shadow_at.is_none();
-            self.x11
-                .fx_under(SHADOW_LAYER, SHADOW_RGB, at, (l.geo.width as i32, l.geo.height as i32), reshape.then_some(&rects[..]))
-                .ok();
+            // Cut off at the window's bottom edge: the shadow falls on the window, not past it.
+            let win = match self.placement {
+                Placement::Perch { win, .. } => self.x11.toplevel_rect(win),
+                Placement::Ground => None,
+            };
+            let h = win.map_or(l.geo.height as i32, |r| (r.y + r.h - at.1).clamp(1, l.geo.height as i32));
+            self.x11.fx_under(SHADOW_LAYER, SHADOW_RGB, at, (l.geo.width as i32, h), reshape.then_some(&rects[..])).ok();
             self.shadow_at = Some(at);
         }
     }
@@ -865,29 +873,33 @@ impl Avatar {
         let Leg::Bolt(t0) = tp.leg else { return false };
         let u = now.duration_since(t0).as_secs_f32() * 1000.0 / fx::BOLT_MS;
         let (to, place, moved) = (tp.to, tp.place, tp.moved);
-        // The tail has all but caught the head: hand over to the arrival glitch.
-        if u >= 0.7 {
+        // The tail has all but reached the target: hand over to the landing glitch.
+        if u >= fx::BOLT_END {
             for i in 0..BOLT_LAYERS {
                 self.x11.fx_unmap(i);
             }
             self.x11.flush();
             tp.leg = Leg::Appear;
             self.hidden = false;
-            self.glitch = Some(Glitch::new(GlitchKind::Appear, now, self.rng.next()));
+            self.glitch = Some(Glitch::new(GlitchKind::Land, now, self.rng.next()));
             if !moved {
                 self.arrive(to, place, now);
             }
             return true;
         }
         if let Some(b) = &tp.bolt {
-            let (main, branches) = b.frame(u);
+            let layers = b.frame(u);
             let (bx, by, bw, bh) = b.bbox();
             let o = (bx, by);
             let step = (6.0 * self.layout.sf).round() as i32;
-            self.x11.fx_show(0, fx::BOLT_DARK, o, (bw, bh), &fx::polys_to_rects(&branches, o, 2)).ok();
-            self.x11.fx_show(1, fx::BOLT_RED, o, (bw, bh), &fx::polys_to_rects(&main, o, step)).ok();
+            for (i, polys) in layers.iter().enumerate() {
+                // Blocky outside like Capri's bolt, a finer core.
+                let grid = if i == 3 { 2 } else { step };
+                self.x11.fx_set(i, fx::BOLT_COLOURS[i], o, (bw, bh), &fx::polys_to_rects(polys, o, grid)).ok();
+            }
+            self.x11.flush();
         }
-        if u >= 0.5 && !moved {
+        if u >= fx::BOLT_ARRIVE && !moved {
             if let Some(tp) = &mut self.teleport {
                 tp.moved = true;
             }
@@ -981,7 +993,7 @@ impl Avatar {
                 "bye".into()
             }
             Command::Glitch => {
-                self.glitch = Some(Glitch::new(GlitchKind::Burst, now, self.rng.next()));
+                self.glitch = Some(Glitch::new(GlitchKind::Big, now, self.rng.next()));
                 "ok".into()
             }
             Command::Page(d) => self.page(d, now),
@@ -1733,8 +1745,21 @@ impl Render for Avatar {
             plan.sy = sy;
         }
         if let Some(g) = self.glitch {
-            let top = frame.map_or(0, |f| f.top);
-            plan.glitch(g.strength(now), g.coverage(now), g.step_seed(now), g.seed(), aw, ah, (0, top, aw, ah - top));
+            let (top, face, bx0, bx1) = frame.map_or((0, None, 0, aw), |f| {
+                let (x0, x1) = f.profile.iter().enumerate().filter(|p| *p.1 != i16::MAX).fold((aw, 0), |a, (i, _)| (a.0.min(i as i32), a.1.max(i as i32)));
+                (f.top, g.keeps_face().then_some(f.face), x0, x1.max(x0 + 1))
+            });
+            plan.glitch(fx::GlitchStep {
+                strength: g.strength(now),
+                coverage: g.coverage(now),
+                seed: g.step_seed(now),
+                order: g.seed(),
+                y0: -l.avatar_y,
+                h: ah,
+                body: (bx0, top, bx1 - bx0, ah - top),
+                face,
+                sf,
+            });
             plan.tint = g.tint(now);
         }
         let plan = Rc::new(plan);
@@ -1825,11 +1850,13 @@ impl Render for Avatar {
                             }
                         }
                         if plan2.scan > 0.02 {
-                            let dark = with_alpha(0x02040a, plan2.scan);
+                            let (dark, light) = (with_alpha(0x02040a, plan2.scan), with_alpha(0x02040a, plan2.scan * 0.4));
+                            let in_face = |y: i32| plan2.face.is_some_and(|(a, b)| y >= a && y < b);
                             let mut y = 0;
                             while y < ah {
-                                window.paint_quad(fill(rect(-60.0, y as f32, aw as f32 + 120.0, 1.0), dark));
-                                y += 3;
+                                let c = if in_face(y) { light } else { dark };
+                                window.paint_quad(fill(rect(-120.0, y as f32, aw as f32 + 240.0, (1.0 * sf).max(1.0)), c));
+                                y += (3.0 * sf).round() as i32;
                             }
                         }
                         for &(r, c) in &plan2.cells {
@@ -1883,26 +1910,56 @@ impl Render for Avatar {
         // Status tag above the hair, unless the bubble carries the status or a reaction
         // needs the space.
         let show_tag = hud && self.frames.iter().any(Option::is_some) && !bubble_open && self.reaction_until.is_none();
+        // In a glitch the tag tears with the body: strips of it, shifted by the same bands.
+        let mut tag_strips: Vec<ShapeRect> = Vec::new();
+        let torn = show_tag && !collapsed && self.glitch.is_some();
         if show_tag {
             let (bg, fg, border) = if invert { (tone, pal.surface, tone) } else { (pal.surface, tone, tone) };
-            let plate = div()
-                .flex()
-                .items_center()
-                .gap(px(7.0))
-                .pl(px(8.0))
-                .pr(px(10.0))
-                .py(px(5.0))
-                .border_1()
-                .border_color(rgb(border))
-                .bg(rgb(bg))
-                .text_color(rgb(fg))
-                .text_size(px(TAG_FONT))
-                .line_height(px(TAG_FONT + 1.0))
-                .font_weight(FontWeight::BOLD)
-                .child(glyph(&glyph_kind, fg, bg))
-                .child(tracked(&format!("{} // {}", self.name, label), 1.5));
-            // A dark ring keeps the plate legible on busy backgrounds.
-            let ring = div().p(px(1.0)).bg(rgb(0x02060a)).child(plate);
+            let text = format!("{} // {}", self.name, label);
+            let make_ring = || {
+                let plate = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .pl(px(8.0))
+                    .pr(px(10.0))
+                    .py(px(5.0))
+                    .border_1()
+                    .border_color(rgb(border))
+                    .bg(rgb(bg))
+                    .text_color(rgb(fg))
+                    .text_size(px(TAG_FONT))
+                    .line_height(px(TAG_FONT + 1.0))
+                    .font_weight(FontWeight::BOLD)
+                    .child(glyph(&glyph_kind, fg, bg))
+                    .child(tracked(&text, 1.5));
+                // A dark ring keeps the plate legible on busy backgrounds.
+                div().p(px(1.0)).bg(rgb(0x02060a)).child(plate)
+            };
+            if let (true, Some(b), Some(bands)) = (torn, self.tag_box.get(), plan.slices.as_ref()) {
+                let (bx, by) = (f32::from(b.origin.x), f32::from(b.origin.y));
+                let (bw, bh) = (f32::from(b.size.width), f32::from(b.size.height));
+                let t0 = by * sf - l.avatar_y as f32;
+                for &(y0, y1, dx) in bands {
+                    let (a, c) = ((y0 as f32).max(t0), (y1 as f32).min(t0 + bh * sf));
+                    if c <= a {
+                        continue;
+                    }
+                    let (s0, s1, dx) = ((a - t0) / sf, (c - t0) / sf, dx as f32 / sf);
+                    tag_strips.push(to_device(Bounds::new(point(px(bx + dx), px(by + s0)), size(px(bw), px(s1 - s0))), sf));
+                    root = root.child(
+                        div()
+                            .absolute()
+                            .left(px(bx + dx))
+                            .top(px(by + s0))
+                            .w(px(bw))
+                            .h(px(s1 - s0))
+                            .overflow_hidden()
+                            .child(div().absolute().left_0().top(px(-s0)).w(px(bw)).h(px(bh)).child(make_ring())),
+                    );
+                }
+            }
+            let ring = make_ring();
             let mut row = div().id("tag").flex().items_end().gap(px(3.0));
             if collapsed {
                 row = row
@@ -1930,18 +1987,20 @@ impl Render for Avatar {
             row = row.child(ring);
             let centre = head_l;
             let tag_bottom = (l.avatar_y + tag_hair) as f32 / sf - TAG_GAP;
-            root = root.child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .w(l.lp(l.win_w))
-                    .bottom(px(l.win_h as f32 / sf - tag_bottom))
-                    .flex()
-                    .justify_center()
-                    .pl(px((2.0 * centre - l.win_w as f32 / sf).max(0.0)))
-                    .pr(px((l.win_w as f32 / sf - 2.0 * centre).max(0.0)))
-                    .child(probed(row, &tag_cell)),
-            );
+            let mut holder = div()
+                .absolute()
+                .left_0()
+                .w(l.lp(l.win_w))
+                .bottom(px(l.win_h as f32 / sf - tag_bottom))
+                .flex()
+                .justify_center()
+                .pl(px((2.0 * centre - l.win_w as f32 / sf).max(0.0)))
+                .pr(px((l.win_w as f32 / sf - 2.0 * centre).max(0.0)));
+            // Torn: the whole tag still lays out (invisibly) so its box stays current.
+            if torn {
+                holder = holder.invisible();
+            }
+            root = root.child(holder.child(probed(row, &tag_cell)));
         }
 
         // Speech bubble (or the focus-probe input).
@@ -2203,6 +2262,7 @@ impl Render for Avatar {
         let worigin = self.origin;
         let tag_clickable = collapsed;
         let tag_w = self.tag_w.clone();
+        let tag_box = self.tag_box.clone();
         root.child(
             canvas(
                 |_, _, _| (),
@@ -2221,7 +2281,12 @@ impl Render for Avatar {
                     }
                     if let Some(b) = tag_cell.get() {
                         tag_w.set(f32::from(b.size.width));
-                        visible.push(to_device(b, sf));
+                        tag_box.set(Some(b));
+                        if torn {
+                            visible.extend(tag_strips.iter().copied());
+                        } else {
+                            visible.push(to_device(b, sf));
+                        }
                         if tag_clickable {
                             input.push(to_device(b, sf));
                         }
