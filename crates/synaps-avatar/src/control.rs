@@ -30,6 +30,8 @@ pub enum Command {
     Glitch,
     /// Bubble paging: +1 / -1.
     Page(i32),
+    /// Music mode (headphones, notes, head-bob to the pack's BPM).
+    Music(bool),
     /// Collapse the bubble to the status tag (true) or expand it again.
     Collapse(bool),
     /// Internal: from the X watcher thread.
@@ -83,11 +85,16 @@ impl Command {
             "collapse" => Command::Collapse(true),
             "expand" => Command::Collapse(false),
             "glitch" => Command::Glitch,
+            "music" => match rest {
+                "on" | "" => Command::Music(true),
+                "off" => Command::Music(false),
+                _ => bail!("usage: music on|off"),
+            },
             "state" => Command::State,
             "hide" => Command::Hide,
             "quit" => Command::Quit,
             _ => bail!(
-                "unknown command `{line}` (mood <name> | clip <id> | say <text> | pos <x> <y> [now] | perch [sit|stand] [win] | perch off | page next|prev | collapse | expand | glitch | state | hide | quit)"
+                "unknown command `{line}` (mood <name> | clip <id> | say <text> | pos <x> <y> [now] | perch [sit|stand] [win] | perch off | page next|prev | collapse | expand | music on|off | glitch | state | hide | quit)"
             ),
         })
     }

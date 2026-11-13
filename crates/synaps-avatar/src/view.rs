@@ -5,9 +5,9 @@
 
 use crate::anim::{Animator, Mood, Rng, Seq};
 use crate::control::Command;
-use crate::frames::{Frame, Geometry};
+use crate::frames::{Frame, Geometry, NoteMasks};
 use crate::fx::{self, BodyPlan, Bolt, Glint, Glitch, GlitchKind};
-use crate::pack::{MoodSpec, Pack, PerchSpec, Steps};
+use crate::pack::{MoodSpec, MusicSpec, Pack, PerchSpec, Steps};
 use crate::platform::x11::{WatchEvent, WinRect, X11};
 use crate::shape::{self, ShapeRect};
 use crate::state;
@@ -173,6 +173,24 @@ const BOLT_LAYERS: usize = 6;
 /// The contact shadow under a perch, stacked right below the avatar window.
 const SHADOW_LAYER: usize = 14;
 const SHADOW_RGB: u32 = 0x06070d;
+/// Music notes: an outline and a fill layer each, at most seven notes.
+const NOTE_LAYER: usize = 15;
+const NOTES_MAX: usize = 7;
+/// Notes are drawn this much larger than Capri's canvas sizes (our figure is smaller).
+const NOTE_SCALE: f32 = 1.15;
+/// Note animation rate (shaped X windows; no GPUI redraw).
+const NOTE_TICK: Duration = Duration::from_millis(40);
+
+/// Device px of the largest note sprite for this geometry.
+pub fn note_px(geo: &Geometry) -> u32 {
+    (120.0 * geo.scale * NOTE_SCALE).ceil().max(8.0) as u32
+}
+
+struct MusicOn {
+    t0: Instant,
+    /// Autonomy sessions end on their own; `music on` runs until `music off`.
+    until: Option<Instant>,
+}
 const FRAME_FAST: Duration = Duration::from_millis(16);
 const FRAME_FX: Duration = Duration::from_millis(33);
 const FRAME_GLINT: Duration = Duration::from_millis(90);
@@ -266,6 +284,11 @@ pub struct Avatar {
     tag_w: Rc<Cell<f32>>,
     /// Last laid-out box of the status tag (window logical px), to tear it in a glitch.
     tag_box: Cell2,
+    music: Option<MusicOn>,
+    notes: Vec<NoteMasks>,
+    notes_shown: usize,
+    /// Breath/sway/nod as last drawn.
+    pose_last: fx::Pose,
 }
 
 pub struct Init {
@@ -349,6 +372,187 @@ impl Avatar {
             shadow_at: None,
             tag_w: Rc::new(Cell::new(150.0)),
             tag_box: Rc::new(Cell::new(None)),
+            music: None,
+            notes: Vec::new(),
+            notes_shown: 0,
+            pose_last: fx::Pose::default(),
+        }
+    }
+
+    pub fn set_notes(&mut self, notes: Vec<NoteMasks>) {
+        self.notes = notes;
+    }
+
+    // ---- music --------------------------------------------------------------------
+
+    fn music_spec(&self) -> Option<&MusicSpec> {
+        self.pack.behaviour.music.as_ref()
+    }
+
+    /// The music pose for the current placement, if music is on and the pack has it.
+    fn music_frame(&self) -> Option<usize> {
+        self.music.as_ref()?;
+        let spec = self.music_spec()?;
+        let idx = |id: &str| self.pack.index.get(id).copied();
+        if self.sitting() {
+            spec.window.as_deref().and_then(idx).filter(|&i| self.pack.frames[i].anchor.name == "seat")
+        } else {
+            idx(&spec.floor).filter(|&i| self.pack.frames[i].anchor.name == "ground")
+        }
+    }
+
+    fn music_on(&mut self, now: Instant, until: Option<Instant>) -> anyhow::Result<()> {
+        let Some(spec) = self.music_spec() else { anyhow::bail!("this pack has no music") };
+        if !self.pack.index.contains_key(&spec.floor) {
+            anyhow::bail!("music frame `{}` is missing from the pack", spec.floor);
+        }
+        if self.mood != Mood::Idle {
+            self.set_mood(Mood::Idle, now);
+        }
+        let was = self.music.replace(MusicOn { t0: now, until });
+        self.relayer(now);
+        if was.is_none() && self.loaded && self.teleport.is_none() {
+            self.glitch = Some(Glitch::new(GlitchKind::Burst, now, self.rng.next()));
+        }
+        Ok(())
+    }
+
+    fn music_off(&mut self, now: Instant) {
+        if self.music.take().is_some() {
+            self.relayer(now);
+            self.update_notes(now);
+            if self.loaded && self.teleport.is_none() {
+                self.glitch = Some(Glitch::new(GlitchKind::Burst, now, self.rng.next()));
+            }
+        }
+    }
+
+    /// Move the note layers to `now`; unmap the ones not in use.
+    fn update_notes(&mut self, now: Instant) {
+        let mut used = 0;
+        let show = self.loaded && !self.hidden && !self.quitting && self.teleport.is_none() && !self.notes.is_empty();
+        if let (true, Some(m), Some(fi), Some(spec)) = (show, self.music.as_ref(), self.music_frame(), self.music_spec()) {
+            let src = &self.pack.frames[fi];
+            let emitters = spec.emitters.get(&src.id).map(Vec::as_slice).unwrap_or(&[]);
+            let (ox, oy) = self.pack.offset(src);
+            let l = self.layout;
+            let beat = 60.0 / spec.bpm.clamp(40.0, 240.0);
+            let parts = fx::music_notes(now.saturating_duration_since(m.t0).as_secs_f32(), beat, emitters);
+            let base = (self.applied.0 + l.avatar_x, self.applied.1 + l.avatar_y);
+            const BAYER: [[f32; 4]; 4] = [[0.0, 8.0, 2.0, 10.0], [12.0, 4.0, 14.0, 6.0], [3.0, 11.0, 1.0, 9.0], [15.0, 7.0, 13.0, 5.0]];
+            for n in parts.iter().take(NOTES_MAX) {
+                let sprite = &self.notes[n.sprite % self.notes.len()];
+                let (dx, dy) = l.geo.to_device(n.x.round() as i32 + ox, n.y.round() as i32 + oy);
+                let size = ((n.size * l.geo.scale * NOTE_SCALE).round() as i32).clamp(4, sprite.size as i32);
+                let o = (base.0 + dx.round() as i32 - size / 2, base.1 + dy.round() as i32 - size / 2);
+                let ai = frames_angle(n.deg);
+                let (outline, fill) = &sprite.variants[ai];
+                let k = sprite.size as f32 / size as f32;
+                let runs = |mask: &crate::frames::Mask| {
+                    let mut out = Vec::new();
+                    for y in 0..size {
+                        let mut x = 0;
+                        let on = |x: i32| {
+                            let t = (BAYER[((o.1 + y) & 3) as usize][((o.0 + x) & 3) as usize] + 0.5) / 16.0;
+                            n.alpha > t && mask.get((x as f32 * k) as i32, (y as f32 * k) as i32)
+                        };
+                        while x < size {
+                            if on(x) {
+                                let s0 = x;
+                                while x < size && on(x) {
+                                    x += 1;
+                                }
+                                out.push((s0 as i16, y as i16, (x - s0) as u16, 1u16));
+                            } else {
+                                x += 1;
+                            }
+                        }
+                    }
+                    out
+                };
+                let (ro, rf) = (runs(outline), runs(fill));
+                self.x11.fx_set(NOTE_LAYER + 2 * used, sprite.outline_rgb, o, (size, size), &ro).ok();
+                self.x11.fx_set(NOTE_LAYER + 2 * used + 1, sprite.fill_rgb, o, (size, size), &rf).ok();
+                used += 1;
+            }
+        }
+        for k in used..self.notes_shown {
+            self.x11.fx_unmap(NOTE_LAYER + 2 * k);
+            self.x11.fx_unmap(NOTE_LAYER + 2 * k + 1);
+        }
+        if used > 0 || self.notes_shown > 0 {
+            self.x11.flush();
+        }
+        self.notes_shown = used;
+    }
+
+    // ---- idle/music body motion --------------------------------------------------------
+
+    fn pose_active(&self) -> bool {
+        self.loaded
+            && !self.hidden
+            && !self.quitting
+            && self.teleport.is_none()
+            && self.press.is_none()
+            && self.squash.is_none()
+            && self.glitch.is_none()
+    }
+
+    fn pose_at(&self, now: Instant) -> fx::Pose {
+        if !self.pose_active() {
+            return fx::Pose::default();
+        }
+        let sf = self.layout.sf;
+        if let (Some(m), Some(spec), Some(_)) = (&self.music, self.music_spec(), self.music_frame()) {
+            // Held on twos (12 fps) like Capri's music body.
+            let hold = 1000.0 / 12.0;
+            let t = (now.saturating_duration_since(m.t0).as_secs_f32() * 1000.0 / hold).floor() * hold;
+            let beats = t / (60_000.0 / spec.bpm.clamp(40.0, 240.0));
+            let p = beats.fract();
+            let ease = |v: f32| {
+                let v = v.clamp(0.0, 1.0);
+                v * v * (3.0 - 2.0 * v)
+            };
+            let nod = (3.0 * sf * (1.0 - ease(p / 0.45))).round() as i32;
+            let sway = (2.5 * sf * (beats * std::f32::consts::PI).sin()).round() as i32;
+            return fx::Pose { breath: 0, nod, sway };
+        }
+        let life = &self.pack.behaviour.life;
+        let t = now.saturating_duration_since(self.bob_t0);
+        let breath = fx::bob(t, life.bob_px, life.bob_period_ms);
+        let sway = if life.sway_px > 0 && life.sway_period_ms > 0 {
+            (life.sway_px as f32 * (t.as_secs_f32() * 1000.0 / life.sway_period_ms as f32 * std::f32::consts::TAU).sin()).round() as i32
+        } else {
+            0
+        };
+        fx::Pose { breath, nod: 0, sway }
+    }
+
+    fn pose_next_change(&self, now: Instant) -> Option<Instant> {
+        if !self.pose_active() {
+            return None;
+        }
+        let cur = self.pose_at(now);
+        let step = Duration::from_millis(20);
+        (1..=100).map(|k| now + step * k).find(|&t| self.pose_at(t) != cur).or(Some(now + Duration::from_secs(2)))
+    }
+
+    /// The rows a pose acts on for frame `fi`.
+    fn pose_rows(&self, fi: usize, f: &Frame) -> fx::PoseRows {
+        let l = &self.layout;
+        let seat = self.pack.frames[fi].anchor.name == "seat";
+        let line = if seat { l.seat_y.unwrap_or(l.ground_y) } else { l.ground_y } - l.avatar_y;
+        let span = (line - f.top).max(1) as f32;
+        let waist = line - (span * if seat { 0.3 } else { 0.5 }) as i32;
+        let neck = f.face.1 + (span * 0.04) as i32;
+        let music = self.music.is_some() && self.music_frame() == Some(fi);
+        fx::PoseRows {
+            y0: -l.avatar_y,
+            h: l.geo.height as i32,
+            top: f.top,
+            shear_end: if music { neck } else { f.face.0 },
+            neck,
+            waist,
         }
     }
 
@@ -412,6 +616,9 @@ impl Avatar {
     /// Base frame and loop for a mood, given where the avatar is (standing or perched).
     fn layer(&self, m: Mood) -> (usize, Option<Seq>) {
         let default = self.pack.frame(&self.pack.catalog.default_sprite).unwrap_or(0);
+        if let Some(i) = self.music_frame() {
+            return (i, None);
+        }
         if self.sitting()
             && let Some(p) = self.perch_spec()
         {
@@ -431,6 +638,9 @@ impl Avatar {
     }
 
     pub fn set_mood(&mut self, m: Mood, now: Instant) {
+        if m != Mood::Idle {
+            self.music = None;
+        }
         let prev = self.mood;
         let mut seq: Seq = Vec::new();
         if !self.sitting() {
@@ -478,7 +688,8 @@ impl Avatar {
         let (base, looping) = self.layer(self.mood);
         self.anim.set_layer(base, looping, now);
         self.anim.stop_oneshot(now);
-        let autonomous = self.spec(self.mood).map_or(self.mood == Mood::Idle, |s| s.autonomy) && !self.activities().is_empty();
+        let autonomous =
+            self.music.is_none() && self.spec(self.mood).map_or(self.mood == Mood::Idle, |s| s.autonomy) && !self.activities().is_empty();
         let next = if autonomous { Some(now + self.autonomy_gap()) } else { None };
         self.next_activity = next;
     }
@@ -494,6 +705,14 @@ impl Avatar {
     }
 
     fn status(&self) -> Status {
+        if let (Some(_), Some(spec)) = (&self.music, self.music_spec()) {
+            return Status {
+                label: spec.status.clone().unwrap_or_else(|| "LISTENING".into()),
+                tone: self.pack.tone(spec.tone.as_deref()),
+                invert: false,
+                glyph: spec.glyph.clone().unwrap_or_else(|| "note".into()),
+            };
+        }
         self.status_of(self.mood)
     }
 
@@ -616,17 +835,12 @@ impl Avatar {
 
     // ---- timing -------------------------------------------------------------------
 
-    fn bob_active(&self) -> bool {
+    fn hop_allowed(&self) -> bool {
         self.loaded
-            && self.pack.behaviour.life.bob_px > 0
-            && self.placement == Placement::Ground
+            && !matches!(self.placement, Placement::Perch { sit: true, .. })
             && self.press.is_none()
             && self.teleport.is_none()
-            && !self.hidden
-    }
-
-    fn hop_allowed(&self) -> bool {
-        self.loaded && !matches!(self.placement, Placement::Perch { sit: true, .. }) && self.press.is_none() && self.teleport.is_none()
+            && self.music.is_none()
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -665,9 +879,10 @@ impl Avatar {
             take(Some(now + FRAME_GLINT));
         }
         take(self.next_glint);
-        if self.bob_active() {
-            let life = &self.pack.behaviour.life;
-            take(fx::bob_next_change(self.bob_t0, now, life.bob_px, life.bob_period_ms));
+        take(self.pose_next_change(now));
+        if self.music.is_some() {
+            take(Some(now + NOTE_TICK));
+            take(self.music.as_ref().and_then(|m| m.until));
         }
         if self.hop.is_some() {
             take(Some(now + FRAME_FAST));
@@ -696,13 +911,24 @@ impl Avatar {
             && !self.anim.busy()
             && !self.activities().is_empty()
         {
-            let n = self.activities().len();
-            let i = self.rng.pick(n);
-            let seq = self.pack.flatten(&self.activities()[i]);
-            let len: u64 = seq.iter().map(|s| s.1 as u64).sum();
-            self.anim.play(seq, now);
-            self.autonomy_started = true;
-            self.next_activity = Some(now + Duration::from_millis(len) + self.autonomy_gap());
+            let music = self
+                .music_spec()
+                .filter(|m| m.activity_chance > 0.0 && self.mood == Mood::Idle && self.music.is_none())
+                .map(|m| (m.activity_chance, m.activity_ms));
+            if let Some((chance, ms)) = music
+                && self.rng.range(0.0, 1.0) < chance
+                && self.music_on(now, Some(now + Duration::from_millis(ms))).is_ok()
+            {
+                self.autonomy_started = true;
+            } else {
+                let n = self.activities().len();
+                let i = self.rng.pick(n);
+                let seq = self.pack.flatten(&self.activities()[i]);
+                let len: u64 = seq.iter().map(|s| s.1 as u64).sum();
+                self.anim.play(seq, now);
+                self.autonomy_started = true;
+                self.next_activity = Some(now + Duration::from_millis(len) + self.autonomy_gap());
+            }
             dirty = true;
         }
         let mut typed_out = false;
@@ -787,8 +1013,17 @@ impl Avatar {
             dirty |= !self.glints.is_empty();
         }
         dirty |= self.step_teleport(now);
+        if self.music.as_ref().and_then(|m| m.until).is_some_and(|u| u <= now) {
+            self.music_off(now);
+            dirty = true;
+        }
+        let pose = self.pose_at(now);
+        if pose != self.pose_last {
+            self.pose_last = pose;
+            dirty = true;
+        }
 
-        // Window offset: breathing bob and the attention hop move the window, no redraw.
+        // Window offset: the attention hop moves the window, no redraw.
         if let Some(at) = self.next_hop
             && at <= now
             && self.hop.is_none()
@@ -805,6 +1040,7 @@ impl Avatar {
             self.hop = None;
         }
         self.apply_offset(now);
+        self.update_notes(now);
         if dirty {
             cx.notify();
         }
@@ -996,6 +1232,17 @@ impl Avatar {
                 self.glitch = Some(Glitch::new(GlitchKind::Big, now, self.rng.next()));
                 "ok".into()
             }
+            Command::Music(on) => {
+                if on {
+                    match self.music_on(now, None) {
+                        Ok(()) => "ok".into(),
+                        Err(e) => format!("error: {e}"),
+                    }
+                } else {
+                    self.music_off(now);
+                    "ok".into()
+                }
+            }
             Command::Page(d) => self.page(d, now),
             Command::Collapse(c) => match &mut self.bubble {
                 Some(b) => {
@@ -1102,6 +1349,7 @@ impl Avatar {
             "loaded": self.loaded,
             "scale_factor": self.layout.sf,
             "focus_probe": self.focus_probe,
+            "music": self.music.is_some(),
         })
         .to_string()
     }
@@ -1154,10 +1402,8 @@ impl Avatar {
     }
 
     fn apply_offset(&mut self, now: Instant) {
-        let life = &self.pack.behaviour.life;
-        let bob = if self.bob_active() { fx::bob(now.saturating_duration_since(self.bob_t0), life.bob_px, life.bob_period_ms) } else { 0 };
         let hop = self.hop.and_then(|t| fx::hop(now.saturating_duration_since(t), 16.0 * self.layout.sf)).unwrap_or(0);
-        let pos = (self.origin.0, self.origin.1 - bob - hop);
+        let pos = (self.origin.0, self.origin.1 - hop);
         if pos != self.applied {
             self.x11.move_to(pos.0, pos.1).ok();
             self.applied = pos;
@@ -1762,6 +2008,15 @@ impl Render for Avatar {
             });
             plan.tint = g.tint(now);
         }
+        if plan.slices.is_none() && plan.sx == 1.0 && plan.sy == 1.0 && !hidden {
+            let pose = self.pose_at(now);
+            let fi = self.anim.frame();
+            if pose != fx::Pose::default()
+                && let Some(f) = self.frames.get(fi).and_then(|f| f.as_ref())
+            {
+                plan.slices = Some(fx::pose_bands(pose, self.pose_rows(fi, f)));
+            }
+        }
         let plan = Rc::new(plan);
         let body_shape: Vec<ShapeRect> = if hidden {
             Vec::new()
@@ -1842,9 +2097,9 @@ impl Render for Avatar {
                                 window.paint_image(ib, ib, Corners::default(), img, 0, false).ok();
                             }
                             Some(bands) => {
-                                for &(y0, y1, dx) in bands {
-                                    let shifted = rect(ix + dx as f32, iy, iw, ih);
-                                    let clip = rect(ix + dx as f32, y0 as f32, iw, (y1 - y0) as f32);
+                                for &(y0, y1, dx, dy) in bands {
+                                    let shifted = rect(ix + dx as f32, iy + dy as f32, iw, ih);
+                                    let clip = rect(ix + dx as f32, (y0 + dy) as f32, iw, (y1 - y0) as f32);
                                     window.paint_image(clip, shifted, Corners::default(), img.clone(), 0, false).ok();
                                 }
                             }
@@ -1940,7 +2195,7 @@ impl Render for Avatar {
                 let (bx, by) = (f32::from(b.origin.x), f32::from(b.origin.y));
                 let (bw, bh) = (f32::from(b.size.width), f32::from(b.size.height));
                 let t0 = by * sf - l.avatar_y as f32;
-                for &(y0, y1, dx) in bands {
+                for &(y0, y1, dx, _) in bands {
                     let (a, c) = ((y0 as f32).max(t0), (y1 as f32).min(t0 + bh * sf));
                     if c <= a {
                         continue;
@@ -2365,4 +2620,13 @@ impl Render for Avatar {
             .size_full(),
         )
     }
+}
+
+/// Index of the pre-rotated note variant nearest `deg`.
+fn frames_angle(deg: f32) -> usize {
+    crate::frames::NOTE_ANGLES
+        .iter()
+        .enumerate()
+        .min_by(|a, b| (a.1 - deg).abs().total_cmp(&(b.1 - deg).abs()))
+        .map_or(3, |p| p.0)
 }

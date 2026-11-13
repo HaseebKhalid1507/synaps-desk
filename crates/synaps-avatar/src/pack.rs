@@ -203,14 +203,17 @@ impl Steps {
     }
 }
 
-/// Idle life tuning. Everything here is cheap: the bob moves the window (no redraw),
-/// sparkles redraw at a low rate only while one is alive.
+/// Idle life tuning. Everything here is cheap: breath and sway redraw only when their
+/// rounded px value changes, sparkles at a low rate only while one is alive.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Life {
-    /// Breathing bob, device px peak to peak (0 = off), and its period.
+    /// Breathing: everything above the waist rises this many device px (0 = off), and its period.
     pub bob_px: i32,
     pub bob_period_ms: u64,
+    /// Hair sway: the top of the figure shears this many device px each way (0 = off).
+    pub sway_px: i32,
+    pub sway_period_ms: u64,
     /// Glints on the upper part of the figure (the hair): a new one every
     /// `sparkleEveryMs[0]..[1]` ms, each alive `sparkleMs`.
     pub sparkle_every_ms: [u64; 2],
@@ -225,6 +228,8 @@ impl Default for Life {
         Life {
             bob_px: 2,
             bob_period_ms: 3_600,
+            sway_px: 3,
+            sway_period_ms: 5_200,
             sparkle_every_ms: [1_300, 3_000],
             sparkle_ms: 560,
             first_activity_ms: None,

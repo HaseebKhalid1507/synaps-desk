@@ -268,14 +268,6 @@ impl X11 {
 
     // ---- effect windows -----------------------------------------------------------
 
-    /// Show effect layer `layer` (solid `rgb`) at root `origin` with the bounding shape
-    /// `rects` (relative to `origin`). Input passes through. Created on first use.
-    pub fn fx_show(&self, layer: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: &[ShapeRect]) -> Result<()> {
-        self.fx_set(layer, rgb, origin, size, rects)?;
-        self.conn.flush()?;
-        Ok(())
-    }
-
     /// `fx_show` without the flush, to batch several layers into one write.
     pub fn fx_set(&self, layer: usize, rgb: u32, origin: (i32, i32), size: (i32, i32), rects: &[ShapeRect]) -> Result<()> {
         self.fx_place(layer, rgb, origin, size, Some(rects), false)

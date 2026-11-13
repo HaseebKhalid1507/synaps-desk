@@ -176,8 +176,9 @@ pub struct BodyPlan {
     pub sx: f32,
     pub sy: f32,
     pub pivot: (f32, f32),
-    /// Horizontal bands `(y0, y1, dx)` that are drawn; `None` = the whole body, unshifted.
-    pub slices: Option<Vec<(i32, i32, i32)>>,
+    /// Horizontal bands `(y0, y1, dx, dy)` that are drawn: source rows y0..y1, moved by
+    /// (dx, dy). `None` = the whole body, unshifted.
+    pub slices: Option<Vec<(i32, i32, i32, i32)>>,
     /// Solid colour silhouettes under the body (RGB split), `(dx, dy, rgb)`.
     pub ghosts: Vec<(i32, i32, u32)>,
     /// Corruption cells and chroma bars, drawn over the body.
@@ -247,7 +248,7 @@ impl BodyPlan {
             // Band height re-rolls each step, so key the order on position, not index.
             let keep = g.coverage >= 1.0 || face || hash01(y.div_euclid(12) as u32, g.order as u32) < g.coverage;
             if keep {
-                slices.push((y, y1, shift.round() as i32));
+                slices.push((y, y1, shift.round() as i32, 0));
             }
             y = y1;
         }
@@ -316,16 +317,16 @@ impl BodyPlan {
 
     /// `scaled` cut to the drawn bands and shifted with them (plus `dx`, `dy`).
     fn banded(&self, scaled: &[ShapeRect], dx: i32, dy: i32, out: &mut Vec<ShapeRect>) {
-        let mv = |x: i16, y: i32, w: u16, h: i32, sx: i32| ((x as i32 + sx + dx) as i16, (y + dy) as i16, w, h as u16);
+        let mv = |x: i16, y: i32, w: u16, h: i32, sx: i32, sy: i32| ((x as i32 + sx + dx) as i16, (y + sy + dy) as i16, w, h as u16);
         match &self.slices {
-            None => out.extend(scaled.iter().map(|&(x, y, w, h)| mv(x, y as i32, w, h as i32, 0))),
+            None => out.extend(scaled.iter().map(|&(x, y, w, h)| mv(x, y as i32, w, h as i32, 0, 0))),
             Some(bands) => {
                 for &(x, y, w, h) in scaled {
                     let (ry0, ry1) = (y as i32, y as i32 + h as i32);
-                    for &(b0, b1, sx) in bands {
+                    for &(b0, b1, sx, sy) in bands {
                         let (y0, y1) = (ry0.max(b0), ry1.min(b1));
                         if y1 > y0 {
-                            out.push(mv(x, y0, w, y1 - y0, sx));
+                            out.push(mv(x, y0, w, y1 - y0, sx, sy));
                         }
                     }
                 }
@@ -393,6 +394,126 @@ pub fn squash(age: Duration) -> Option<(f32, f32)> {
     Some((1.0, sy.min(1.0)))
 }
 
+/// Idle and music body motion, device px: `breath` lifts everything above the waist,
+/// `nod` drops the head, `sway` shears the top of the figure sideways (full at the top
+/// row, nothing at the shear line).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Pose {
+    pub breath: i32,
+    pub nod: i32,
+    pub sway: i32,
+}
+
+/// Rows (avatar-local) a pose acts on.
+#[derive(Clone, Copy, Debug)]
+pub struct PoseRows {
+    /// First row to band (negative reaches the HUD area; nothing to draw there).
+    pub y0: i32,
+    pub h: i32,
+    /// Topmost opaque row.
+    pub top: i32,
+    /// Rows above this shear with `sway`.
+    pub shear_end: i32,
+    /// Rows above this nod.
+    pub neck: i32,
+    /// Rows above this breathe.
+    pub waist: i32,
+}
+
+/// Bands `(y0, y1, dx, dy)` in paint order (legs, torso, head) for a pose. The waist rows
+/// repeat over the breath height, so nothing opens up between torso and legs.
+pub fn pose_bands(p: Pose, r: PoseRows) -> Vec<(i32, i32, i32, i32)> {
+    let b = p.breath.max(0);
+    let waist = r.waist.clamp(r.y0 + 1, r.h);
+    let neck = r.neck.clamp(r.y0, waist);
+    let mut out = vec![(waist - b, r.h, 0, 0), (neck, waist, 0, -b)];
+    let shear_end = r.shear_end.clamp(r.y0, neck);
+    let head_dy = p.nod - b;
+    let span = (shear_end - r.top).max(1) as f32;
+    let mut y = r.y0;
+    while y < neck {
+        let (y1, dx) = if p.sway != 0 && y < shear_end {
+            let y1 = (y + 2).min(shear_end);
+            let f = ((shear_end - y) as f32 / span).clamp(0.0, 1.0);
+            (y1, (p.sway as f32 * f.powf(1.2)).round() as i32)
+        } else {
+            (neck, 0)
+        };
+        match out.last_mut() {
+            Some(last) if last.1 == y && last.2 == dx && last.3 == head_dy && last.0 < neck => last.1 = y1,
+            _ => out.push((y, y1, dx, head_dy)),
+        }
+        y = y1;
+    }
+    out
+}
+
+/// Capri's note particle noise.
+fn noise(n: u64, seed: u32) -> f32 {
+    let v = (((n + 1) as f32) * 12.9898 + seed as f32 * 78.233).sin() * 43758.547;
+    v - v.floor()
+}
+
+fn smooth(a: f32, b: f32, v: f32) -> f32 {
+    let t = ((v - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn cubic(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+    let u = 1.0 - t;
+    u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+}
+
+/// One floating note, in the music frame's canvas px.
+#[derive(Clone, Copy, Debug)]
+pub struct Note {
+    pub sprite: usize,
+    pub x: f32,
+    pub y: f32,
+    pub size: f32,
+    pub alpha: f32,
+    pub deg: f32,
+}
+
+/// Notes alive `age_s` into a session: one born per beat from alternating emitters, each
+/// drifting out and up along a curve for 2.5–3.15 s, growing in, fading out, rocking.
+/// (Capri's music-animation behaviour; at most seven.)
+pub fn music_notes(age_s: f32, beat_s: f32, emitters: &[[i32; 2]]) -> Vec<Note> {
+    let mut out = Vec::new();
+    if emitters.is_empty() || beat_s <= 0.0 {
+        return out;
+    }
+    let last = (age_s / beat_s).floor() as i64;
+    let first = (((age_s - 3.15) / beat_s).floor() as i64).max(0);
+    for n in first..=last {
+        let n = n as u64;
+        let at = n as f32 * beat_s;
+        let life = 2.5 + noise(n, 1) * 0.65;
+        let p = (age_s - at) / life;
+        if p <= 0.0 || p >= 1.0 {
+            continue;
+        }
+        let side = (n % 2) as usize;
+        let dir = if side == 1 { 1.0 } else { -1.0 };
+        let [ex, ey] = emitters[side.min(emitters.len() - 1)];
+        let (ex, ey) = (ex as f32, ey as f32);
+        let dx = dir * (270.0 + 60.0 * noise(n, 2));
+        let dy = -(185.0 + 65.0 * noise(n, 3));
+        out.push(Note {
+            sprite: ((n / 2) as usize + side) % 4,
+            x: cubic(ex, ex + dir * 74.0, ex + dx * 0.85, ex + dx, p),
+            y: ey + cubic(0.0, -14.0, dy * 0.52, dy, p),
+            size: (92.0 + 28.0 * noise(n, 4)) * (0.62 + 0.38 * smooth(0.0, 0.22, p)),
+            alpha: smooth(0.0, 0.16, p) * (1.0 - smooth(0.68, 1.0, p)),
+            deg: dir * ((noise(n, 5) - 0.5) * 8.0 + (p * PI).sin() * 14.0),
+        });
+    }
+    if out.len() > 7 {
+        out.drain(..out.len() - 7);
+    }
+    out
+}
+
 /// Breathing bob, device px upward: 0..=px on a cosine.
 pub fn bob(elapsed: Duration, px: i32, period_ms: u64) -> i32 {
     if px <= 0 || period_ms == 0 {
@@ -400,23 +521,6 @@ pub fn bob(elapsed: Duration, px: i32, period_ms: u64) -> i32 {
     }
     let ph = ms(elapsed) / period_ms as f32 * 2.0 * PI;
     (px as f32 * (0.5 - 0.5 * ph.cos())).round() as i32
-}
-
-/// When the bob's rounded value next changes (searched in 20 ms steps).
-pub fn bob_next_change(t0: Instant, now: Instant, px: i32, period_ms: u64) -> Option<Instant> {
-    if px <= 0 || period_ms == 0 {
-        return None;
-    }
-    let cur = bob(now.saturating_duration_since(t0), px, period_ms);
-    let step = Duration::from_millis(20);
-    let mut t = now;
-    for _ in 0..(period_ms / 20 + 2) {
-        t += step;
-        if bob(t.saturating_duration_since(t0), px, period_ms) != cur {
-            return Some(t);
-        }
-    }
-    Some(now + Duration::from_millis(period_ms))
 }
 
 /// The attention hop: up and down once, device px upward.
@@ -746,6 +850,29 @@ mod tests {
         let flips = v.windows(2).filter(|w| (w[0] > 0.5) != (w[1] > 0.5)).count();
         assert!(flips >= 4, "{flips}");
         assert!(g.ms >= 800.0);
+    }
+
+    #[test]
+    fn pose_bands_cover_without_gaps() {
+        let r = PoseRows { y0: -50, h: 400, top: 10, shear_end: 80, neck: 120, waist: 220 };
+        let bands = pose_bands(Pose { breath: 2, nod: 0, sway: 3 }, r);
+        // Every destination row from the top to the bottom is painted by some band.
+        for y in 10..400 {
+            assert!(bands.iter().any(|&(a, b, _, dy)| y >= a + dy && y < b + dy), "row {y} {bands:?}");
+        }
+        assert_eq!(bands.iter().filter(|b| b.2 == 3).count(), 1);
+        assert!(bands.iter().all(|b| b.2.abs() <= 3));
+        let still = pose_bands(Pose::default(), r);
+        assert!(still.iter().all(|b| b.2 == 0 && b.3 == 0));
+    }
+
+    #[test]
+    fn notes_rise_and_fade() {
+        let em = [[500, 600], [760, 590]];
+        assert!(music_notes(0.01, 0.545, &em).len() <= 1);
+        let steady = music_notes(20.0, 0.545, &em);
+        assert!((4..=7).contains(&steady.len()), "{}", steady.len());
+        assert!(steady.iter().all(|n| n.y < 600.0 && n.alpha >= 0.0 && n.alpha <= 1.0 && n.deg.abs() <= 18.5));
     }
 
     #[test]

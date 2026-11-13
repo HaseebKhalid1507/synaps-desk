@@ -351,10 +351,15 @@ pub fn verify_poses(pack: &Pack) -> Result<()> {
     Ok(())
 }
 
-/// One note sprite pre-rotated at `NOTE_ANGLES` (GPUI images don't rotate).
-pub struct NoteSprite {
+/// A music note as two 1-bit masks (dark outline, colour fill) per rotation: shown as
+/// two shaped solid-colour X windows, like the hearts, so moving notes never expose stale
+/// pixels of the avatar window.
+pub struct NoteMasks {
     pub size: u32,
-    pub variants: Vec<(Arc<RenderImage>, Mask)>,
+    pub fill_rgb: u32,
+    pub outline_rgb: u32,
+    /// Per `NOTE_ANGLES` entry: (outline, fill).
+    pub variants: Vec<(Mask, Mask)>,
 }
 
 pub const NOTE_ANGLES: [f32; 7] = [-18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0];
@@ -399,9 +404,10 @@ fn rotate_rgba(src: &[u8], n: u32, deg: f32) -> Vec<u8> {
 }
 
 /// Decode note images to `size` device px squares, rotated at every `NOTE_ANGLES` step.
-pub fn decode_notes(pack: &Pack, files: &[String], size: u32) -> Result<Vec<NoteSprite>> {
+pub fn decode_notes(pack: &Pack, files: &[String], size: u32) -> Result<Vec<NoteMasks>> {
     let mut resizer = Resizer::new();
     let mut out = Vec::new();
+    let is_dark = |p: &[u8]| (p[0] as u32 * 3 + p[1] as u32 * 6 + p[2] as u32) < 10 * 60;
     for rel in files {
         let path = pack.dir.join(rel);
         let bytes = std::fs::read(&path).with_context(|| format!("note {}: cannot read", path.display()))?;
@@ -412,24 +418,36 @@ pub fn decode_notes(pack: &Pack, files: &[String], size: u32) -> Result<Vec<Note
         if w != h {
             bail!("note {}: {w}x{h} is not square", path.display());
         }
+        // Fill colour: the mean of the bright opaque pixels.
+        let (mut sum, mut n) = ([0u64; 3], 0u64);
+        for p in img.as_raw().chunks_exact(4).filter(|p| p[3] > 200 && !is_dark(p)) {
+            for k in 0..3 {
+                sum[k] += p[k] as u64;
+            }
+            n += 1;
+        }
+        let n = n.max(1);
+        let fill_rgb = ((sum[0] / n) << 16 | (sum[1] / n) << 8 | (sum[2] / n)) as u32;
         let mut variants = Vec::new();
         for &deg in &NOTE_ANGLES {
             let rot = if deg == 0.0 { img.as_raw().clone() } else { rotate_rgba(img.as_raw(), w, deg) };
             let src = Image::from_vec_u8(w, w, rot, PixelType::U8x4)?;
             let mut dst = Image::new(size, size, PixelType::U8x4);
             resizer.resize(&src, &mut dst, &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3)))?;
-            let mut px = dst.into_vec();
-            let mut mask = Mask::new(size, size);
-            for (i, p) in px.chunks_exact_mut(4).enumerate() {
-                if p[3] >= HIT_ALPHA {
-                    mask.set(i as u32 % size, i as u32 / size);
+            let px = dst.into_vec();
+            let (mut outline, mut fill) = (Mask::new(size, size), Mask::new(size, size));
+            for (i, p) in px.chunks_exact(4).enumerate() {
+                let (x, y) = (i as u32 % size, i as u32 / size);
+                if p[3] >= 110 {
+                    outline.set(x, y);
+                    if p[3] >= 200 && !is_dark(p) {
+                        fill.set(x, y);
+                    }
                 }
-                p.swap(0, 2);
             }
-            let rgba = image::RgbaImage::from_raw(size, size, px).expect("buffer size");
-            variants.push((Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])), mask));
+            variants.push((outline, fill));
         }
-        out.push(NoteSprite { size, variants });
+        out.push(NoteMasks { size, fill_rgb, outline_rgb: 0x0b0420, variants });
     }
     Ok(out)
 }

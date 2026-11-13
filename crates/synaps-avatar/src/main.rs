@@ -328,6 +328,14 @@ fn run(t_start: Instant) -> Result<()> {
                 t_start.elapsed().as_millis()
             );
             decode_view.update(cx, |v, cx| v.add_frames(rest.into_iter().zip(all.frames).collect(), true, cx));
+            if let Some(m) = p.behaviour.music.clone() {
+                let p3 = p.clone();
+                let size = crate::view::note_px(&geo);
+                match off_thread(move || frames::decode_notes(&p3, &m.notes, size)).await {
+                    Ok(notes) => decode_view.update(cx, |v, _| v.set_notes(notes)),
+                    Err(e) => eprintln!("synaps-avatar: music notes unavailable: {e:#}"),
+                }
+            }
             #[cfg(target_env = "gnu")]
             // SAFETY: plain libc call; hands freed decode buffers back to the OS.
             unsafe {
