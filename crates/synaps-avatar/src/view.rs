@@ -1661,7 +1661,7 @@ impl Avatar {
                                                                        "prev": i.prev, "esc": i.esc_at.is_some() })),
             "draft": self.draft.chars().count(),
             "prompt_ui": self.prompt_ui.as_ref().map(|p| serde_json::json!({ "title": p.view.title, "dismissed": p.dismissed })),
-            "buttons": self.buttons.borrow().iter().map(|(id, b)| {
+            "buttons": self.buttons.borrow().iter().copied().chain(self.tag_box.get().map(|b| ("chip", b))).map(|(id, b)| {
                 let sf = self.layout.sf;
                 let (x, y) = (self.origin.0 as f32 + f32::from(b.origin.x) * sf, self.origin.1 as f32 + f32::from(b.origin.y) * sf);
                 (id.to_string(), serde_json::json!([x.round() as i32, y.round() as i32, (f32::from(b.size.width) * sf) as i32, (f32::from(b.size.height) * sf) as i32]))
