@@ -8,6 +8,7 @@ mod frames;
 mod fx;
 mod pack;
 mod platform;
+mod session;
 mod shape;
 mod ticker;
 mod state;
