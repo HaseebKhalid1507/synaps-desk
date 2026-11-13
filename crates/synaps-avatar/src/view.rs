@@ -1568,6 +1568,7 @@ impl Avatar {
         };
         serde_json::json!({
             "mood": self.mood.key(),
+            "xid": self.x11.win,
             "monitor": { "x": m.x, "y": m.y, "w": m.w, "h": m.h },
             "frame": frame,
             "status": self.status().label,
