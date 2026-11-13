@@ -360,6 +360,10 @@ pub struct Avatar {
     quitting: bool,
     /// A guard tripped: quit with exit code 2.
     fatal: bool,
+    /// The open panel's bottom edge (logical px). While it is open it never moves down,
+    /// and a prompt or the text field doesn't move at all: buttons stay under the pointer
+    /// when her pose changes.
+    panel_bottom: Option<f32>,
     /// Quit at the next tick (from where there is no `cx`).
     quit_requested: bool,
     placement: Placement,
@@ -482,6 +486,7 @@ impl Avatar {
             hidden: false,
             quitting: false,
             fatal: false,
+            panel_bottom: None,
             quit_requested: false,
             placement: Placement::Ground,
             home,
@@ -3096,6 +3101,9 @@ impl Render for Avatar {
         let mut panel_geom: Option<PanelGeom> = None;
         self.buttons.borrow_mut().clear();
         let busy = self.session.as_ref().is_some_and(|sess| sess.link.busy());
+        if mode.is_none() {
+            self.panel_bottom = None;
+        }
         if let Some(mode) = mode {
             let line_strings = |chars: &[char], w: &Wrapped| -> Vec<String> {
                 w.lines.iter().map(|&(a, b)| chars[a..b.min(chars.len())].iter().collect::<String>().trim_end().to_string()).collect()
@@ -3181,7 +3189,13 @@ impl Render for Avatar {
             let footer = !probe;
             let h = PAD_T + HEADER_H + HEADER_GAP + rows as f32 * LINE_H + if footer { FOOTER_GAP + FOOTER_H } else { 0.0 } + PAD_B;
             let x = (head_l - w * 0.45).clamp(vis_l + MARGIN, (vis_r - MARGIN - w).max(vis_l + MARGIN));
-            let bottom = top_l - TIP_GAP - TAIL_H;
+            let want = top_l - TIP_GAP - TAIL_H;
+            let bottom = match self.panel_bottom {
+                Some(b) if matches!(mode, PanelMode::Prompt | PanelMode::Input { .. }) => b,
+                Some(b) => b.min(want),
+                None => want,
+            };
+            self.panel_bottom = Some(bottom);
             let y = (bottom - h).max(TOP_MARGIN);
             let lo = x + CUT + TAIL_W / 2.0 + 6.0;
             let hi = x + w - CUT - TAIL_W / 2.0 - 6.0;
