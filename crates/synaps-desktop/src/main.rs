@@ -12,13 +12,14 @@ mod app;
 mod bench;
 mod diag;
 mod mem;
+mod model;
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
-use synaps_client::{Client, Identity, discovery};
+use synaps_client::{Client, ClientOptions, Endpoint, Identity};
 
 fn main() {
     let t_main = Instant::now();
@@ -59,10 +60,22 @@ fn main() {
     }
     // In bench mode only an explicitly named daemon is ever contacted.
     let connect = !offline && (!bench || profile.is_some() || socket.is_some());
-    let client = connect.then(|| {
-        let path = discovery::resolve_socket(socket.as_deref(), profile.as_deref());
-        Client::spawn(path, Identity::desktop())
-    });
+    // No --profile: `$SYNAPS_PROFILE`, else the default daemon (as the TUI).
+    let client = if connect {
+        let endpoint = match socket {
+            Some(s) => Endpoint::Socket(s),
+            None => Endpoint::profile(profile.as_deref()),
+        };
+        match Client::spawn(ClientOptions::new(endpoint, Identity::desktop()).poll_sessions(Duration::from_secs(3))) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("synaps-desktop: cannot start the connection thread: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     diag::mark("before_application");
     gpui_kit::application().run(move |cx| {
