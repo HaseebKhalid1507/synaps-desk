@@ -167,6 +167,9 @@ impl AppView {
                 Event::Attached { attached, .. } => {
                     self.active = Some(attached.meta.id.clone());
                     self.transcript.load_attached(&attached);
+                    if let Some(c) = &self.client {
+                        c.list_sessions();
+                    }
                     self.list.set_follow_mode(FollowMode::Tail);
                 }
                 Event::Session { session_id, event, .. } => {
