@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use synaps_client::protocol::{LlmEvent, SessionEvent, StreamEvent};
 use synaps_client::transcript::Transcript;
-use synaps_client::{Client, Command, Event, Identity, Status, discovery};
+use synaps_client::{AttachMode, Client, ClientOptions, CreateOptions, Endpoint, Event, Identity, Status};
 
 fn main() {
     let t0 = Instant::now();
@@ -47,9 +47,19 @@ fn main() {
             }
         }
     }
-    let path = discovery::resolve_socket(socket.as_deref(), profile.as_deref());
-    eprintln!("probe: socket {}", path.display());
-    let (client, events) = Client::spawn(path, Identity::desktop());
+    let endpoint = match socket {
+        Some(s) => Endpoint::Socket(s),
+        None => Endpoint::profile(profile.as_deref()),
+    };
+    eprintln!("probe: socket {}", endpoint.resolve().display());
+    let identity = Identity::new("probe").expect("valid name").with_version(format!("synaps-probe/{}", env!("CARGO_PKG_VERSION")));
+    let (client, events) = match Client::spawn(ClientOptions::new(endpoint, identity)) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("probe: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let mut connected_ms = None;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -60,6 +70,10 @@ fn main() {
             Some(Event::Status(Status::Connected { daemon_version, profile, pid })) => {
                 connected_ms.get_or_insert(t0.elapsed().as_secs_f64() * 1e3);
                 eprintln!("probe: connected to daemon {daemon_version} (profile {profile:?}, pid {pid})");
+            }
+            Some(Event::Status(Status::Incompatible(e))) => {
+                eprintln!("probe: incompatible: {e}");
+                std::process::exit(1);
             }
             Some(Event::Status(Status::Offline(e))) => {
                 eprintln!("probe: offline: {e}");
@@ -82,15 +96,23 @@ fn main() {
     }
 
     let attach_start = Instant::now();
-    client.send(match session {
-        Some(id) => Command::Attach { session_id: id },
-        None => Command::Create { model },
-    });
+    let mut create = CreateOptions::new();
+    if let Some(m) = model {
+        create = create.model(m);
+    }
+    let seq = match session {
+        Some(id) => client.attach(id, AttachMode::Mirror),
+        None => client.create(create),
+    }
+    .expect("client thread");
     let mut transcript = Transcript::new();
     let session_id = loop {
         match recv(&events, Duration::from_secs(30)) {
-            Some(Event::Attached { attached, .. }) => {
-                transcript.load_attached(&attached);
+            Some(Event::Attached { attached, attach_seq, .. }) if attach_seq == seq => {
+                if let Err(e) = transcript.load_attached(&attached) {
+                    eprintln!("probe: {e}");
+                    std::process::exit(1);
+                }
                 eprintln!(
                     "probe: attached {} ({} history messages -> {} rows) in {:.1} ms",
                     attached.meta.id,
@@ -114,7 +136,7 @@ fn main() {
     let attach_ms = attach_start.elapsed().as_secs_f64() * 1e3;
 
     let submit = Instant::now();
-    client.send(Command::Submit { text: prompt });
+    client.submit(prompt).expect("client thread");
     let (mut first_delta, mut first_text) = (None, None);
     let mut deltas = 0usize;
     let mut started = false;
@@ -147,7 +169,13 @@ fn main() {
                     break submit.elapsed();
                 }
             }
-            Some(Event::Error(e)) => eprintln!("\nprobe: error: {e}"),
+            Some(Event::History { update, .. }) => {
+                if let Err(e) = transcript.apply_update(&update) {
+                    eprintln!("\nprobe: {e}");
+                    let _ = client.resync();
+                }
+            }
+            Some(Event::Error { error, .. }) => eprintln!("\nprobe: error: {error}"),
             Some(Event::Detached { reason, .. }) => {
                 eprintln!("\nprobe: detached: {reason}");
                 std::process::exit(1);
@@ -168,7 +196,7 @@ fn main() {
         while let Some(ev) = recv(&events, until.saturating_duration_since(Instant::now())) {
             match ev {
                 Event::Status(s) => eprintln!("probe: status {s:?}"),
-                Event::Attached { attached, reconnect } => eprintln!(
+                Event::Attached { attached, reconnect, .. } => eprintln!(
                     "probe: attached {} again (reconnect={reconnect}, {} messages)",
                     attached.meta.id,
                     attached.conversation.api_messages.len()
@@ -182,7 +210,8 @@ fn main() {
             }
         }
     }
-    client.send(Command::Shutdown);
+    let _ = client.shutdown();
+    std::thread::sleep(Duration::from_millis(300));
     let ms = |d: Option<Duration>| d.map(|d| (d.as_secs_f64() * 1e4).round() / 10.0);
     println!(
         "{}",

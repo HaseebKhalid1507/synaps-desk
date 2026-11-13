@@ -1,7 +1,7 @@
 //! `--bench`: self-driving measurements, printed as one JSON object, then
 //! exit. Synthetic load comes from `synaps_client::synthetic` and flows
-//! through the same event path as daemon traffic (channel → pending →
-//! once-per-frame apply). Frame data comes from GPUI's own profiler
+//! through the same event path as daemon traffic (channel → pump → model,
+//! then the transcript's splice once per frame). Frame data comes from GPUI's own profiler
 //! (`FrameEvent::Draw` / `Present`).
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -10,9 +10,12 @@ use gpui_kit::profiler::{FrameEvent, FrameTimingCollector};
 use gpui_kit::*;
 use serde_json::{Value, json};
 use synaps_client::protocol::{LlmEvent, SessionEvent, SessionStreamEvent, StreamEvent};
+use std::sync::Arc;
+
 use synaps_client::{Event, synthetic};
 
 use crate::app::AppView;
+use crate::model::LOCAL_SEQ;
 use crate::mem;
 
 pub struct BenchOptions {
@@ -258,8 +261,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 sleep(1.0).await;
                 out["static_empty"] = stats(cx, t0, Instant::now());
                 let _ = upd(cx, &|v, _| {
-                    v.active = Some("diag".into());
-                    v.transcript.apply_history(&synthetic::history(opts.history_messages, 11));
+                    v.model.set_local_session("diag");
+                    v.model.transcript.apply_history(&synthetic::history(opts.history_messages, 11));
                     v.sync_list();
                     v.list.set_follow_mode(FollowMode::Normal);
                     v.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
@@ -290,11 +293,11 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 for (name, plain, seed) in [("stream_plain", true, 21u64), ("stream_markdown", false, 22)] {
                     let _ = upd(cx, &move |v, _| {
                         v.plain_rows = plain;
-                        v.active = Some("diag-stream".into());
-                        v.transcript = synaps_client::Transcript::new();
+                        v.model.set_local_session("diag-stream");
+                        v.model.transcript = synaps_client::Transcript::new();
                         v.sync_list();
-                        v.transcript.apply_history(&synthetic::history(40, 3));
-                        v.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                        v.model.transcript.apply_history(&synthetic::history(40, 3));
+                        v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                         v.sync_list();
                         v.list.set_follow_mode(FollowMode::Tail);
                         v.list.scroll_to_end();
@@ -310,7 +313,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                                 std::thread::sleep(w);
                             }
                             let ev = SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { text: d }) };
-                            let _ = ftx.try_send(Event::Session { session_id: "diag-stream".into(), seq: i as u64, event: ev });
+                            let _ = ftx.try_send(local_event(i as u64, ev));
                         }
                     });
                     let t0 = Instant::now();
@@ -328,14 +331,14 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
 
             // 2. Streaming markdown at ~200 deltas/s into a short transcript.
             let _ = upd(cx, &|v, _| {
-                v.active = Some("bench-stream".into());
-                v.transcript.apply_history(&synthetic::history(40, 3));
-                v.transcript.apply(&SessionEvent::TurnStarted {
+                v.model.set_local_session("bench-stream");
+                v.model.transcript.apply_history(&synthetic::history(40, 3));
+                v.model.transcript.apply(&SessionEvent::TurnStarted {
                     turn_baseline: 40,
                     trigger: "user".into(),
                     user_text: Some("Explain the frame pipeline, with code.".into()),
                 });
-                v.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                 v.sync_list();
                 v.list.set_follow_mode(FollowMode::Tail);
                 v.list.scroll_to_end();
@@ -354,7 +357,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         std::thread::sleep(w);
                     }
                     let ev = SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { text: d }) };
-                    let _ = feeder_tx.try_send(Event::Session { session_id: "bench-stream".into(), seq: i as u64, event: ev });
+                    let _ = feeder_tx.try_send(local_event(i as u64, ev));
                 }
                 start.elapsed()
             });
@@ -365,7 +368,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 SessionEvent::Stream { event: StreamEvent::Session(SessionStreamEvent::Done) },
                 SessionEvent::Idle,
             ] {
-                let _ = tx.try_send(Event::Session { session_id: "bench-stream".into(), seq: 0, event: ev });
+                let _ = tx.try_send(local_event(0, ev));
             }
             sleep(0.4).await;
             let stream = view
@@ -377,7 +380,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     s["deltas_sent"] = json!(n);
                     s["deltas_per_s"] = json!(round(n as f64 / fed.as_secs_f64().max(1e-3), 1));
                     s["deltas_received"] = json!(b.received_deltas);
-                    s["streamed_chars"] = json!(v.transcript.items.last().map(|i| i.text.len()));
+                    s["streamed_chars"] = json!(v.model.transcript.items().last().map(|i| i.text.len()));
                     s
                 })
                 .unwrap_or(Value::Null);
@@ -386,10 +389,10 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
 
             // 3. A 2,000-message transcript with code blocks, scrolled top → down.
             let _ = upd(cx, &|v, _| {
-                v.active = Some("bench-long".into());
-                v.transcript = synaps_client::Transcript::new();
+                v.model.set_local_session("bench-long");
+                v.model.transcript = synaps_client::Transcript::new();
                 v.sync_list();
-                v.transcript.apply_history(&synthetic::history(opts.history_messages, 11));
+                v.model.transcript.apply_history(&synthetic::history(opts.history_messages, 11));
                 v.sync_list();
                 v.list.set_follow_mode(FollowMode::Normal);
                 v.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
@@ -409,7 +412,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     b.animate = false;
                     b.drain();
                     let mut s = b.stats(t0, t1, refresh_fallback);
-                    s["rows"] = json!(v.transcript.len());
+                    s["rows"] = json!(v.model.transcript.len());
                     s["messages"] = json!(opts.history_messages);
                     s["px_per_s"] = json!(speed);
                     s["reached_row"] = json!(v.list.logical_scroll_top().item_ix);
@@ -425,7 +428,10 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             if let (true, Some(prompt)) = (has_client, opts.prompt.clone()) {
                 let t_create = Instant::now();
                 let _ = upd(cx, &|v, _| {
-                    v.client.as_ref().unwrap().create(None);
+                    let seq = v.client.as_ref().unwrap().create(synaps_client::CreateOptions::new());
+                    if let Ok(seq) = seq {
+                        v.model.want(seq);
+                    }
                 });
                 let mut attached = None;
                 for _ in 0..250 {
@@ -442,7 +448,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let p = prompt.clone();
                     let _ = upd(cx, &move |v, _| {
                         v.bench.as_mut().unwrap().submit_at = Some(submit);
-                        v.client.as_ref().unwrap().submit(p.clone());
+                        let _ = v.client.as_ref().unwrap().submit(p.clone());
                     });
                     let budget = 28.0 - t_main.elapsed().as_secs_f64();
                     let until = Instant::now() + Duration::from_secs_f64(budget.max(1.0));
@@ -464,7 +470,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                                 "ttft_ms": b.first_text_at.map(|t| round(ms(t.duration_since(submit)), 1)),
                                 "ttft_painted_ms": painted.map(|t| round(ms(t.duration_since(submit)), 1)),
                                 "turn_ms": b.idle_at.map(|t| round(ms(t.duration_since(submit)), 1)),
-                                "rows": v.transcript.len(),
+                                "rows": v.model.transcript.len(),
                             })
                         })
                         .unwrap_or(Value::Null);
@@ -478,4 +484,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             let _ = cx.update(|_, cx| cx.quit());
         })
         .detach();
+}
+
+/// A synthetic event on the bench's local session (see `Model::set_local_session`).
+fn local_event(seq: u64, event: SessionEvent) -> Event {
+    Event::Session { attach_seq: LOCAL_SEQ, session_id: "bench".into(), seq, event, raw: Arc::new(Value::Null) }
 }

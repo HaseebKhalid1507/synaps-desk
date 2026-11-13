@@ -11,7 +11,7 @@ impl Rng {
     pub fn new(seed: u64) -> Self {
         Self(seed.max(1))
     }
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -20,7 +20,7 @@ impl Rng {
         x.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
     pub fn below(&mut self, n: u64) -> u64 {
-        self.next() % n.max(1)
+        self.next_u64() % n.max(1)
     }
 }
 
@@ -153,8 +153,8 @@ mod tests {
         let mut t = Transcript::new();
         t.apply_history(&h);
         assert!(t.len() >= 2000 / 2);
-        assert!(t.items.iter().any(|i| i.kind == ItemKind::Tool));
-        assert!(t.items.iter().any(|i| i.text.contains("```")));
+        assert!(t.items().iter().any(|i| i.kind == ItemKind::Tool));
+        assert!(t.items().iter().any(|i| i.text.contains("```")));
     }
 
     #[test]

@@ -5,12 +5,21 @@
 //! needs are mirrored, and every decoder is tolerant: unknown frame types,
 //! event kinds and fields decode to an `Unknown` variant (or are ignored)
 //! instead of failing the frame, so a newer daemon never breaks the client.
+//! A *known* event whose body changed shape is a [`DecodeError`], not a
+//! silent `Unknown`, so "new variant" and "shape drift" stay distinguishable.
+//!
+//! The mirror enums are `#[non_exhaustive]`: match them with a `_` arm.
+//!
+//! `Debug` on [`ClientFrame`] and [`SessionCommand`] redacts `Submit.text`,
+//! `Steer.text` and `Answer.value` (secret prompts carry API keys), the same
+//! as Synaps' own `Debug` impls.
 //!
 //! Framing: one JSON object per `\n`, at most [`MAX_FRAME_BYTES`].
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// Exact-match protocol version (`wire::PROTOCOL_VERSION`).
@@ -19,11 +28,18 @@ pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// `Welcome.features` entry for owned sessions (newer daemons only).
 pub const FEATURE_OWNED_SESSIONS: &str = "owned_sessions";
+/// Query ids at or above this are the daemon's and the TUI transport's own
+/// (`wire::RESERVED_QUERY_ID_BASE`). A client picks its ids below it.
+pub const RESERVED_QUERY_ID_BASE: u64 = 1 << 63;
+/// `session::RELOADING_REFUSAL`: the `Error` frame text for a command
+/// refused while the daemon drains for a reload.
+pub const RELOADING_REFUSAL: &str = "daemon reloading; retry in a moment";
 
 // ── client → daemon ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ClientFrame {
     Hello(Hello),
     Ping,
@@ -31,6 +47,21 @@ pub enum ClientFrame {
     Attach(Attach),
     Cmd { session_id: String, cmd: SessionCommand },
     Bye,
+}
+
+impl std::fmt::Debug for ClientFrame {
+    /// Frame types only for anything that can carry user text or a secret
+    /// (`SessionCommand`'s own `Debug` redacts the bodies).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hello(h) => f.debug_tuple("Hello").field(h).finish(),
+            Self::Ping => f.write_str("Ping"),
+            Self::Sessions => f.write_str("Sessions"),
+            Self::Attach(a) => f.debug_tuple("Attach").field(a).finish(),
+            Self::Cmd { session_id, cmd } => f.debug_struct("Cmd").field("session_id", session_id).field("cmd", cmd).finish(),
+            Self::Bye => f.write_str("Bye"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,9 +80,7 @@ pub struct Hello {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientMeta {
-    /// The daemon has no `desktop` kind: `attach` is the interactive thin
-    /// client kind (keep-warm treats it like the TUI). `name` says desktop.
-    pub kind: &'static str,
+    pub kind: ClientKind,
     pub terminal: Option<String>,
     pub instance: String,
     pub history: HistoryMode,
@@ -61,9 +90,29 @@ pub struct ClientMeta {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+/// `types::ClientKind`. The daemon's set is closed: an unknown kind is a
+/// malformed `Hello`, so there is no `Desktop`. A GUI is `Attach` (the
+/// interactive thin-client kind; keep-warm treats it like the TUI) and says
+/// what it is in `ClientMeta.name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ClientKind {
+    Tui,
+    Chat,
+    Attach,
+    Rpc,
+    Server,
+    Test,
+    /// A kind from a newer daemon (decode only; never sent).
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryMode {
+    #[default]
     Full,
     Digest,
 }
@@ -82,9 +131,12 @@ pub struct ClientReconnect {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// `Mirror` owns input iff nobody does, `Takeover` steals it, `Observe`
+/// never owns it (a watcher: it can never become the active client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachMode {
+    #[default]
     Mirror,
     Takeover,
     Observe,
@@ -97,35 +149,80 @@ pub enum Attach {
     Create { config: CreateConfig, mode: AttachMode },
 }
 
-/// The subset of `SessionConfig` a desktop client sets on create.
+/// The subset of `SessionConfig` a desktop client sets on create. The
+/// daemon fills `cwd` from `Hello.cwd` only when it is `None`
+/// (`daemon/conn.rs`), and refuses a relative or missing directory.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CreateConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    /// `--name`: must be unique among saved sessions (`/saveas` rules).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub auto_approve_confirms: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SessionCommand {
     Submit { text: String, attachments: Vec<Value> },
     Steer { text: String },
     Cancel,
     Answer { prompt_id: u64, value: Option<String> },
+    /// Reply: `QueryResult{id, value}`, broadcast to every attached client,
+    /// so pick an id below [`RESERVED_QUERY_ID_BASE`] that others won't.
+    Query { id: u64, query: SessionQuery },
+    /// A clean detach (then `Bye`); the turn keeps running.
+    Detach { client: u64 },
+}
+
+impl std::fmt::Debug for SessionCommand {
+    /// `Submit`/`Steer`/`Answer` print `<redacted>`, no lengths (as Synaps).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Submit { attachments, .. } => f
+                .debug_struct("Submit")
+                .field("text", &format_args!("<redacted>"))
+                .field("attachments", &attachments.len())
+                .finish(),
+            Self::Steer { .. } => f.debug_struct("Steer").field("text", &format_args!("<redacted>")).finish(),
+            Self::Cancel => f.write_str("Cancel"),
+            Self::Answer { prompt_id, .. } => {
+                f.debug_struct("Answer").field("prompt_id", prompt_id).field("value", &format_args!("<redacted>")).finish()
+            }
+            Self::Query { id, query } => f.debug_struct("Query").field("id", id).field("query", query).finish(),
+            Self::Detach { client } => f.debug_struct("Detach").field("client", client).finish(),
+        }
+    }
+}
+
+/// `types::SessionQuery`, the variants this client asks.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "query", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionQuery {
+    /// Reply value: the session's `api_messages` array.
+    Messages,
+    Status,
 }
 
 // ── daemon → client ───────────────────────────────────────────────────────────
 
 /// A decoded daemon frame. `Unknown` is a frame type this client does not
-/// mirror; `Malformed` is a known type whose body did not decode (kept raw).
+/// mirror; `Malformed` is a known type whose body did not decode.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum DaemonFrame {
     Welcome(Welcome),
+    /// `reason` is `RefuseReason` raw (`{"reason":"busy"}`, ...); see
+    /// [`refuse_kind`]. The daemon closes after it.
     Refused { reason: Value, message: String },
     Pong { pid: u32, uptime_s: u64, sessions: usize },
-    SessionList(Vec<SessionMeta>),
+    /// `rejected`: entries that did not decode (skipped, not fatal).
+    SessionList { sessions: Vec<SessionMeta>, rejected: usize },
     Attached(Box<Attached>),
     Event(Envelope),
     Error { session_id: Option<String>, message: String },
@@ -134,10 +231,15 @@ pub enum DaemonFrame {
     Malformed { kind: String, error: String },
 }
 
+/// `RefuseReason`'s tag (`busy`, `version`, `unknown_session`, ...), or "".
+pub fn refuse_kind(reason: &Value) -> &str {
+    reason.get("reason").and_then(Value::as_str).or_else(|| reason.as_str()).unwrap_or("")
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RawFrame {
-    Welcome(Welcome),
+    Welcome(RawWelcome),
     Refused {
         #[serde(default)]
         reason: Value,
@@ -154,7 +256,7 @@ enum RawFrame {
     },
     SessionList {
         #[serde(default)]
-        sessions: Vec<SessionMeta>,
+        sessions: Vec<Value>,
     },
     Attached(Box<Attached>),
     Event(Envelope),
@@ -170,6 +272,19 @@ enum RawFrame {
     },
 }
 
+/// Decode each element on its own; return the ones that decoded and how
+/// many did not.
+pub fn lenient<T: DeserializeOwned>(raw: Vec<Value>) -> (Vec<T>, usize) {
+    let n = raw.len();
+    let ok: Vec<T> = raw.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+    let rejected = n - ok.len();
+    (ok, rejected)
+}
+
+fn lenient_vec<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
+    Ok(lenient(Option::<Vec<Value>>::deserialize(d)?.unwrap_or_default()).0)
+}
+
 /// Decode one NDJSON line. Never fails on a well-formed JSON object: an
 /// unrecognised `type` is `Unknown`, an undecodable body `Malformed`.
 pub fn decode_frame(line: &str) -> Result<DaemonFrame, String> {
@@ -178,10 +293,13 @@ pub fn decode_frame(line: &str) -> Result<DaemonFrame, String> {
     }
     match serde_json::from_str::<RawFrame>(line) {
         Ok(f) => Ok(match f {
-            RawFrame::Welcome(w) => DaemonFrame::Welcome(w),
+            RawFrame::Welcome(w) => DaemonFrame::Welcome(w.into()),
             RawFrame::Refused { reason, message } => DaemonFrame::Refused { reason, message },
             RawFrame::Pong { pid, uptime_s, sessions } => DaemonFrame::Pong { pid, uptime_s, sessions },
-            RawFrame::SessionList { sessions } => DaemonFrame::SessionList(sessions),
+            RawFrame::SessionList { sessions } => {
+                let (sessions, rejected) = lenient(sessions);
+                DaemonFrame::SessionList { sessions, rejected }
+            }
             RawFrame::Attached(a) => DaemonFrame::Attached(a),
             RawFrame::Event(e) => DaemonFrame::Event(e),
             RawFrame::Error { session_id, message } => DaemonFrame::Error { session_id, message },
@@ -214,21 +332,51 @@ pub fn encode_frame(frame: &ClientFrame) -> Result<String, String> {
     Ok(s)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Welcome {
     pub protocol_version: u32,
-    #[serde(default)]
     pub daemon_version: String,
-    #[serde(default)]
     pub pid: u32,
-    #[serde(default)]
     pub profile: Option<String>,
-    #[serde(default)]
     pub sessions: Vec<SessionMeta>,
-    #[serde(default = "one")]
+    /// `sessions` entries that did not decode (skipped).
+    pub rejected_sessions: usize,
     pub generation: u64,
-    #[serde(default)]
     pub features: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RawWelcome {
+    protocol_version: u32,
+    #[serde(default)]
+    daemon_version: String,
+    #[serde(default)]
+    pid: u32,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    sessions: Vec<Value>,
+    #[serde(default = "one")]
+    generation: u64,
+    #[serde(default)]
+    features: Vec<String>,
+}
+
+impl From<RawWelcome> for Welcome {
+    fn from(w: RawWelcome) -> Self {
+        let (sessions, rejected_sessions) = lenient(w.sessions);
+        Welcome {
+            protocol_version: w.protocol_version,
+            daemon_version: w.daemon_version,
+            pid: w.pid,
+            profile: w.profile,
+            sessions,
+            rejected_sessions,
+            generation: w.generation,
+            features: w.features,
+        }
+    }
 }
 
 fn one() -> u64 {
@@ -251,6 +399,8 @@ pub struct SessionMeta {
     #[serde(default)]
     pub clients: usize,
     #[serde(default)]
+    pub input_owner: Option<u64>,
+    #[serde(default)]
     pub busy: bool,
     #[serde(default)]
     pub pinned: bool,
@@ -271,10 +421,57 @@ impl SessionMeta {
             .or_else(|| self.title.clone().filter(|t| !t.is_empty()))
             .unwrap_or_else(|| self.id.clone())
     }
+
+    pub fn is_parked(&self) -> bool {
+        self.lifecycle == "parked"
+    }
+}
+
+/// `config::ClientInput`: who may drive a session with several clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientInput {
+    /// Every non-observing client may send input; the last one to do so is
+    /// the active client.
+    Shared,
+    /// Only the input owner may; others are refused until they take over.
+    Exclusive,
+}
+
+impl<'de> Deserialize<'de> for ClientInput {
+    /// Absent (an older daemon) or unknown means `Exclusive`: the rule an
+    /// older daemon enforces.
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match Option::<String>::deserialize(d)?.as_deref() {
+            Some("shared") => ClientInput::Shared,
+            _ => ClientInput::Exclusive,
+        })
+    }
+}
+
+fn exclusive() -> ClientInput {
+    ClientInput::Exclusive
+}
+
+/// `types::ClientInfo`: one attached client, as the roster lists it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClientInfo {
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    /// `mirror`, `takeover` or `observe`.
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub attached_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct Attached {
+    /// This connection's client id in the session.
     pub client: u64,
     pub meta: SessionMeta,
     #[serde(default)]
@@ -285,10 +482,23 @@ pub struct Attached {
     pub streaming: bool,
     #[serde(default)]
     pub replay: Vec<Envelope>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
     pub pending_prompts: Vec<PromptRequest>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub clients: Vec<(u64, ClientKind)>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub roster: Vec<ClientInfo>,
+    #[serde(default = "exclusive")]
+    pub client_input: ClientInput,
     #[serde(default)]
     pub input_owner: Option<u64>,
+}
+
+impl Attached {
+    /// Whether this client may send input now without being refused.
+    pub fn may_drive(&self, mode: AttachMode) -> bool {
+        mode != AttachMode::Observe && (self.client_input == ClientInput::Shared || self.input_owner == Some(self.client))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -303,6 +513,24 @@ pub struct ConversationSnapshot {
     pub cost: f64,
 }
 
+/// `wire::ConversationDigest`: what `Conversation` carries on the wire.
+/// `messages_hash` is FNV-1a over each message's JSON ([`crate::history::messages_hash`]).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConversationDigest {
+    #[serde(default)]
+    pub header: Value,
+    #[serde(default)]
+    pub messages_len: usize,
+    #[serde(default)]
+    pub messages_hash: u64,
+    #[serde(default)]
+    pub tokens: Value,
+    #[serde(default)]
+    pub cost: f64,
+    #[serde(default)]
+    pub queued_message: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptRequest {
     pub id: u64,
@@ -314,8 +542,16 @@ pub struct PromptRequest {
     pub prompt: String,
 }
 
+impl PromptRequest {
+    /// `PromptKind::Secret`: the answer is a credential. Never log it.
+    pub fn is_secret(&self) -> bool {
+        self.kind.as_str() == Some("secret")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "bye", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ByeReason {
     Reloading {
         #[serde(default)]
@@ -325,6 +561,10 @@ pub enum ByeReason {
     },
     Shutdown,
     Detached,
+    OwnerLagged {
+        #[serde(default)]
+        dropped: u64,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -342,18 +582,49 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    pub fn decode(&self) -> SessionEvent {
+    /// Decode by reference (clones the event's strings; keeps `event`).
+    pub fn decode(&self) -> Result<SessionEvent, DecodeError> {
         decode_event(&self.event)
+    }
+
+    /// Decode by value: moves the event's strings instead of cloning them.
+    pub fn into_event(self) -> Result<SessionEvent, DecodeError> {
+        let kind = event_kind(&self.event);
+        SessionEvent::deserialize(self.event).map_err(|e| DecodeError { kind, error: e.to_string() })
     }
 }
 
-pub fn decode_event(v: &Value) -> SessionEvent {
-    SessionEvent::deserialize(v).unwrap_or(SessionEvent::Unknown)
+/// A known event (or frame) whose body did not decode: shape drift, not a
+/// new variant (new variants decode to `Unknown`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeError {
+    /// `event:<ev>` for an event, else the frame `type`.
+    pub kind: String,
+    pub error: String,
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not decode {}: {}", self.kind, self.error)
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+fn event_kind(v: &Value) -> String {
+    format!("event:{}", v.get("ev").and_then(Value::as_str).unwrap_or("?"))
+}
+
+/// `Ok(Unknown)` for an event kind this client does not mirror; `Err` for
+/// a known kind whose body no longer matches the mirror.
+pub fn decode_event(v: &Value) -> Result<SessionEvent, DecodeError> {
+    SessionEvent::deserialize(v).map_err(|e| DecodeError { kind: event_kind(v), error: e.to_string() })
 }
 
 /// `WireSessionEvent`, the variants a UI acts on. Everything else is `Unknown`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "ev", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SessionEvent {
     Stream {
         event: StreamEvent,
@@ -366,9 +637,12 @@ pub enum SessionEvent {
         #[serde(default)]
         user_text: Option<String>,
     },
+    /// After every change to the conversation. A mirror whose length or
+    /// hash differs from `digest` has drifted (clear, resume, compaction,
+    /// abort repair) and must re-query `Messages`.
     Conversation {
         #[serde(default)]
-        digest: Value,
+        digest: ConversationDigest,
     },
     Prompt {
         request: PromptRequest,
@@ -391,12 +665,20 @@ pub enum SessionEvent {
         #[serde(default)]
         text: String,
     },
+    /// The reply to a `Query`. Broadcast: check `id`.
+    QueryResult {
+        id: u64,
+        #[serde(default)]
+        value: Value,
+    },
     ClientJoined {
         client: u64,
         #[serde(default)]
         kind: String,
         #[serde(default)]
         name: String,
+        #[serde(default)]
+        mode: Option<String>,
     },
     ClientLeft {
         client: u64,
@@ -409,15 +691,45 @@ pub enum SessionEvent {
         #[serde(default)]
         context_saved: bool,
     },
+    /// `/clear` (`NewSession`): a new, empty conversation. No `MessageHistory`
+    /// follows, only a `Conversation` digest.
+    Cleared {
+        #[serde(default)]
+        session_id: String,
+    },
     CompactionStarted,
-    CompactionApplied,
+    /// The conversation was replaced by its compacted form. No
+    /// `MessageHistory` follows, only a `Conversation` digest.
+    CompactionApplied {
+        #[serde(default)]
+        previous_session_id: String,
+        #[serde(default)]
+        session_id: String,
+        #[serde(default)]
+        msg_count: usize,
+    },
     CompactionFailed {
         #[serde(default)]
         message: String,
     },
+    CompactionCancelled,
     SubagentRows {
         #[serde(default)]
         rows: Vec<Value>,
+    },
+    /// `/resume`: another conversation was swapped in. No `MessageHistory`
+    /// follows, only a `Conversation` digest.
+    Resumed {
+        #[serde(default)]
+        id: u64,
+        #[serde(default)]
+        old_id: String,
+        #[serde(default)]
+        new_id: String,
+        #[serde(default)]
+        via: Option<String>,
+        #[serde(default)]
+        clamp_notice: Option<String>,
     },
     Reloading {
         #[serde(default)]
@@ -434,6 +746,23 @@ pub enum SessionEvent {
         from: Option<u64>,
         #[serde(default)]
         to: Option<u64>,
+        /// `attach`, `takeover`, `owner_detached`, `reload`, `input`.
+        #[serde(default)]
+        reason: String,
+    },
+    /// An input command from `client` was refused with no side effect
+    /// (exclusive input owned by another client, an unverified context head,
+    /// a refused prompt answer, ...). Broadcast: check `client`.
+    Refused {
+        client: u64,
+        #[serde(default)]
+        command: String,
+        #[serde(default)]
+        reason: String,
+    },
+    Lifecycle {
+        #[serde(default)]
+        lifecycle: String,
     },
     #[serde(other)]
     Unknown,
@@ -441,6 +770,7 @@ pub enum SessionEvent {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StreamEvent {
     Llm(LlmEvent),
     Session(SessionStreamEvent),
@@ -451,6 +781,7 @@ pub enum StreamEvent {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "llm", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum LlmEvent {
     Thinking { text: String },
     Text { text: String },
@@ -469,6 +800,7 @@ pub enum LlmEvent {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "session", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SessionStreamEvent {
     MessageHistory {
         #[serde(default)]
@@ -499,6 +831,7 @@ pub enum SessionStreamEvent {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "agent", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AgentEvent {
     SubagentStart {
         subagent_id: u64,

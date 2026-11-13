@@ -9,11 +9,11 @@ use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
-use synaps_client::protocol::SessionMeta;
-use synaps_client::transcript::{ItemKind, ToolStatus, Transcript};
-use synaps_client::{Client, Event, Status};
+use synaps_client::transcript::{ItemKind, ToolStatus};
+use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event};
 
 use crate::bench::BenchState;
+use crate::model::{ConnState, Effect, Model};
 
 /// Per-row strings derived from a transcript item, rebuilt only when the
 /// item's `rev` changes (so a frame never re-allocates unchanged rows).
@@ -24,28 +24,18 @@ struct RowCache {
     detail: SharedString,
 }
 
-#[derive(Clone)]
-enum Conn {
-    Off(SharedString),
-    Connecting,
-    Connected(SharedString),
-    Reconnecting,
-}
-
 pub struct AppView {
     pub client: Option<Client>,
-    conn: Conn,
-    sessions: Vec<SessionMeta>,
-    pub active: Option<String>,
-    pub transcript: Transcript,
+    /// Connection, sessions, attachment and transcript. Events are applied
+    /// to it as they arrive (the pump), never queued for `render`.
+    pub model: Model,
     rows: Vec<RowCache>,
     pub list: ListState,
     expanded: HashSet<u64>,
     composer: Entity<TextareaState>,
-    /// Events received since the last frame: applied once per frame in
-    /// `render`, so a token stream costs one layout per frame, not per token.
-    pending: Vec<Event>,
-    last_error: Option<SharedString>,
+    /// Refused input to put back in the composer (needs a `Window`: done
+    /// at the next frame).
+    restore: Option<String>,
     pub bench: Option<BenchState>,
     /// Diagnostics: render rows as plain text instead of markdown.
     pub plain_rows: bool,
@@ -73,32 +63,27 @@ impl AppView {
                 }
             }
         })];
-        let (client, conn) = match client {
+        match client {
             Some((c, rx)) => {
-                let mut v = Self::blank(composer, Some(c), Conn::Connecting, subs);
+                let mut v = Self::blank(composer, Some(c), ConnState::Connecting, subs);
                 v.pump(rx, cx);
-                return v;
+                v
             }
-            None => (None, Conn::Off("offline".into())),
-        };
-        Self::blank(composer, client, conn, subs)
+            None => Self::blank(composer, None, ConnState::Off("offline".into()), subs),
+        }
     }
 
-    fn blank(composer: Entity<TextareaState>, client: Option<Client>, conn: Conn, subs: Vec<Subscription>) -> Self {
+    fn blank(composer: Entity<TextareaState>, client: Option<Client>, conn: ConnState, subs: Vec<Subscription>) -> Self {
         let list = ListState::new(0, ListAlignment::Top, px(600.));
         list.set_follow_mode(FollowMode::Tail);
         Self {
             client,
-            conn,
-            sessions: Vec::new(),
-            active: None,
-            transcript: Transcript::new(),
+            model: Model::new(conn),
             rows: Vec::new(),
             list,
             expanded: HashSet::new(),
             composer,
-            pending: Vec::new(),
-            last_error: None,
+            restore: None,
             bench: None,
             plain_rows: false,
             _tasks: Vec::new(),
@@ -106,7 +91,11 @@ impl AppView {
         }
     }
 
-    /// Drain an event channel into `pending`; notify once per frame.
+    /// Drain an event channel and apply each batch to the model at once,
+    /// whether or not the window renders (minimized, hidden, occluded): the
+    /// queue can never grow behind a window that gets no frames. Only the
+    /// row rebuild and remeasure wait for the next frame (`sync_list`), and
+    /// the transcript coalesces those into one splice.
     pub fn pump(&mut self, rx: async_channel::Receiver<Event>, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |this, cx| {
             while let Ok(first) = rx.recv().await {
@@ -119,11 +108,12 @@ impl AppView {
                     if let Some(b) = this.bench.as_mut() {
                         b.on_received(&batch, now);
                     }
-                    let was_empty = this.pending.is_empty();
-                    this.pending.extend(batch);
-                    if was_empty {
-                        cx.notify();
+                    for ev in batch {
+                        for fx in this.model.apply(ev) {
+                            this.effect(fx);
+                        }
                     }
+                    cx.notify();
                 });
                 if alive.is_err() {
                     break;
@@ -133,66 +123,71 @@ impl AppView {
         self._tasks.push(task);
     }
 
-    fn submit(&mut self, text: String) -> bool {
-        match (&self.client, &self.active) {
-            (Some(c), Some(_)) => {
-                if self.transcript.busy {
-                    c.send(synaps_client::Command::Steer { text });
-                } else {
-                    c.submit(text);
-                }
-                true
+    fn effect(&mut self, fx: Effect) {
+        match fx {
+            Effect::Restore(text) => {
+                self.restore = Some(match self.restore.take() {
+                    Some(prev) => format!("{prev}\n{text}"),
+                    None => text,
+                })
             }
-            _ => {
-                self.last_error = Some("not attached to a session".into());
-                false
+            Effect::ListSessions => {
+                if let Some(c) = &self.client {
+                    let _ = c.list_sessions();
+                }
+            }
+            Effect::Resync => {
+                if let Some(c) = &self.client {
+                    let _ = c.resync();
+                }
             }
         }
     }
 
-    fn apply_pending(&mut self) {
-        for ev in std::mem::take(&mut self.pending) {
-            match ev {
-                Event::Status(s) => {
-                    self.conn = match s {
-                        Status::Connecting => Conn::Connecting,
-                        Status::Connected { daemon_version, profile, .. } => Conn::Connected(
-                            format!("{}{}", daemon_version, profile.map(|p| format!(" · {p}")).unwrap_or_default()).into(),
-                        ),
-                        Status::Reconnecting { .. } => Conn::Reconnecting,
-                        Status::Offline(e) => Conn::Off(e.into()),
-                    }
-                }
-                Event::Sessions(s) => self.sessions = s,
-                Event::Attached { attached, .. } => {
-                    self.active = Some(attached.meta.id.clone());
-                    self.transcript.load_attached(&attached);
-                    if let Some(c) = &self.client {
-                        c.list_sessions();
-                    }
-                    self.list.set_follow_mode(FollowMode::Tail);
-                }
-                Event::Session { session_id, event, .. } => {
-                    if self.active.as_deref() == Some(session_id.as_str()) {
-                        self.transcript.apply(&event);
-                    }
-                }
-                Event::Detached { reason, .. } => {
-                    self.last_error = Some(format!("detached: {reason}").into());
-                    self.transcript.busy = false;
-                }
-                Event::Error(e) => self.last_error = Some(e.into()),
-            }
+    fn attach(&mut self, session_id: String) {
+        if let Some(seq) = self.client.as_ref().and_then(|c| c.attach(session_id, AttachMode::Mirror).ok()) {
+            self.model.want(seq);
+            self.list.set_follow_mode(FollowMode::Tail);
         }
-        self.sync_list();
+    }
+
+    fn create(&mut self) {
+        // Tools run in the user's home, not wherever the launcher started us.
+        if let Some(seq) = self.client.as_ref().and_then(|c| c.create(CreateOptions::new().cwd(Cwd::Home)).ok()) {
+            self.model.want(seq);
+            self.list.set_follow_mode(FollowMode::Tail);
+        }
+    }
+
+    /// Send the composer's text. `false` keeps it in the composer.
+    fn submit(&mut self, text: String) -> bool {
+        let Some(c) = &self.client else {
+            self.model.last_error = Some("offline".into());
+            return false;
+        };
+        if !self.model.can_send() {
+            self.model.last_error = Some(if self.model.active.is_some() {
+                "this session is read-only here (observing or reconnecting)".into()
+            } else {
+                "not attached to a session".into()
+            });
+            return false;
+        }
+        let sent = if self.model.transcript.busy() { c.steer(text.clone()) } else { c.submit(text.clone()) };
+        if sent.is_err() {
+            self.model.last_error = Some("the connection thread has stopped".into());
+            return false;
+        }
+        self.model.sent(text);
+        true
     }
 
     /// Push transcript changes into the virtual list: only the changed tail
     /// is spliced (and so re-measured).
     pub fn sync_list(&mut self) {
-        let Some(sp) = self.transcript.take_splice() else { return };
+        let Some(sp) = self.model.transcript.take_splice() else { return };
         self.rows.truncate(sp.start);
-        for item in &self.transcript.items[sp.start..] {
+        for item in &self.model.transcript.items()[sp.start..] {
             let (text, detail) = match item.kind {
                 ItemKind::Tool => {
                     let t = item.tool.as_ref();
@@ -204,12 +199,12 @@ impl AppView {
             };
             self.rows.push(RowCache { id: item.id, rev: item.rev, text: text.into(), detail: detail.into() });
         }
-        debug_assert!(self.rows.iter().zip(&self.transcript.items).all(|(r, i)| r.id == i.id && r.rev == i.rev));
+        debug_assert!(self.rows.iter().zip(self.model.transcript.items()).all(|(r, i)| r.id == i.id && r.rev == i.rev));
         self.list.splice(sp.start..sp.old_len, sp.new_len - sp.start);
     }
 
     fn render_row(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
-        let (Some(item), Some(row)) = (self.transcript.items.get(ix), self.rows.get(ix)) else {
+        let (Some(item), Some(row)) = (self.model.transcript.items().get(ix), self.rows.get(ix)) else {
             return div().into_any_element();
         };
         let theme = cx.theme();
@@ -244,7 +239,7 @@ impl AppView {
                                 if !this.expanded.remove(&id) {
                                     this.expanded.insert(id);
                                 }
-                                if let Some(ix) = this.transcript.items.iter().position(|i| i.id == id) {
+                                if let Some(ix) = this.model.transcript.items().iter().position(|i| i.id == id) {
                                     this.list.remeasure_items(ix..ix + 1);
                                 }
                                 cx.notify();
@@ -271,6 +266,7 @@ impl AppView {
                     Some(ToolStatus::Failed) => ("✗", theme.danger, "failed"),
                     Some(ToolStatus::Queued) => ("◌", theme.muted_foreground, "queued"),
                     Some(ToolStatus::Streaming) => ("…", theme.muted_foreground, "preparing"),
+                    Some(ToolStatus::Cancelled) => ("⊘", theme.muted_foreground, "cancelled"),
                     _ => ("●", theme.warning, "running"),
                 };
                 let name: SharedString = t.map(|t| t.name.clone()).unwrap_or_default().into();
@@ -315,6 +311,7 @@ impl AppView {
             }
             ItemKind::Notice => div().text_sm().text_color(theme.muted_foreground).child(row.text.clone()).into_any_element(),
             ItemKind::Error => div().text_sm().text_color(theme.danger).child(row.text.clone()).into_any_element(),
+            _ => div().text_sm().child(row.text.clone()).into_any_element(),
         };
         div()
             .w_full()
@@ -341,15 +338,11 @@ impl AppView {
                     .py_3()
                     .justify_between()
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("Synaps"))
-                    .child(Button::new("new").ghost().compact().label("+ New").on_click(cx.listener(|this, _, _, _| {
-                        if let Some(c) = &this.client {
-                            c.create(None);
-                        }
-                    }))),
+                    .child(Button::new("new").ghost().compact().label("+ New").on_click(cx.listener(|this, _, _, _| this.create()))),
             );
         let mut list = v_flex().id("sessions").flex_1().overflow_y_scroll().px_2().gap_0p5();
-        for (i, s) in self.sessions.iter().enumerate() {
-            let active = self.active.as_deref() == Some(s.id.as_str());
+        for (i, s) in self.model.sessions.iter().enumerate() {
+            let active = self.model.active.as_ref().is_some_and(|a| a.session_id == s.id);
             let id = s.id.clone();
             list = list.child(
                 h_flex()
@@ -377,14 +370,10 @@ impl AppView {
                             .text_sm()
                             .child(s.label()),
                     )
-                    .on_click(cx.listener(move |this, _, _, _| {
-                        if let Some(c) = &this.client {
-                            c.attach(id.clone());
-                        }
-                    })),
+                    .on_click(cx.listener(move |this, _, _, _| this.attach(id.clone()))),
             );
         }
-        if self.sessions.is_empty() {
+        if self.model.sessions.is_empty() {
             list = list.child(div().px_2().text_sm().text_color(theme.muted_foreground).child("No live sessions"));
         }
         rail = rail.child(list);
@@ -393,13 +382,15 @@ impl AppView {
 
     fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (label, color): (SharedString, Hsla) = match &self.conn {
-            Conn::Connected(v) => (format!("● connected · {v}").into(), theme.success),
-            Conn::Connecting => ("● connecting".into(), theme.warning),
-            Conn::Reconnecting => ("● reconnecting".into(), theme.warning),
-            Conn::Off(e) => (format!("● {}", one_line(e, 60)).into(), theme.danger),
+        let (label, color): (SharedString, Hsla) = match &self.model.conn {
+            _ if self.model.reattaching => ("● reattaching".into(), theme.warning),
+            ConnState::Connected(v) => (format!("● connected · {v}").into(), theme.success),
+            ConnState::Connecting => ("● connecting".into(), theme.warning),
+            ConnState::Reconnecting => ("● reconnecting".into(), theme.warning),
+            ConnState::Off(e) => (format!("● {}", one_line(e, 60)).into(), theme.danger),
+            ConnState::Incompatible(e) => (format!("● {}", one_line(e, 60)).into(), theme.danger),
         };
-        let title: SharedString = self.transcript.title.clone().unwrap_or_else(|| "No session".into()).into();
+        let title: SharedString = self.model.transcript.title().unwrap_or("No session").to_string().into();
         h_flex()
             .px_4()
             .py_2()
@@ -407,8 +398,8 @@ impl AppView {
             .border_b_1()
             .border_color(theme.border)
             .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_ellipsis().child(title))
-            .when(self.transcript.cost_usd > 0.0, |d| {
-                d.child(div().text_sm().text_color(theme.muted_foreground).child(format!("${:.4}", self.transcript.cost_usd)))
+            .when(self.model.transcript.cost_usd() > 0.0, |d| {
+                d.child(div().text_sm().text_color(theme.muted_foreground).child(format!("${:.4}", self.model.transcript.cost_usd())))
             })
             .child(
                 div()
@@ -437,15 +428,23 @@ fn one_line(s: &str, max: usize) -> String {
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diag::mark("first_render");
-        if !self.pending.is_empty() {
-            self.apply_pending();
+        if let Some(text) = self.restore.take() {
+            // Refused input goes back where it was typed, ahead of anything
+            // typed since.
+            self.composer.update(cx, |s, cx| {
+                let now = s.value().trim().to_string();
+                let text = if now.is_empty() { text } else { format!("{text}\n{now}") };
+                s.set_value(text, window, cx);
+            });
         }
+        self.sync_list();
         if let Some(b) = self.bench.as_mut() {
             b.on_render(&self.list, window);
         }
         let theme = cx.theme();
-        let busy = self.transcript.busy;
-        let prompts = self.transcript.pending_prompts.len();
+        let busy = self.model.transcript.busy();
+        let can_send = self.model.can_send();
+        let prompts = self.model.transcript.pending_prompts().len();
         let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_row(ix, cx)))
             .size_full();
         let main = v_flex()
@@ -455,7 +454,7 @@ impl Render for AppView {
             .child(self.render_header(cx))
             .child(div().flex_1().min_h_0().child(list))
             .when(prompts > 0, |d| {
-                let p = &self.transcript.pending_prompts[0];
+                let p = &self.model.transcript.pending_prompts()[0];
                 d.child(
                     div()
                         .mx_6()
@@ -467,7 +466,7 @@ impl Render for AppView {
                         .child(format!("{}: {}  (answer in the TUI; prompts are not wired here yet)", p.title, p.prompt)),
                 )
             })
-            .when_some(self.last_error.clone(), |d, e| {
+            .when_some(self.model.last_error.clone(), |d, e| {
                 d.child(div().px_6().text_xs().text_color(theme.danger).child(e))
             })
             .child(
@@ -476,11 +475,11 @@ impl Render for AppView {
                     .py_3()
                     .gap_2()
                     .items_end()
-                    .child(div().flex_1().child(Textarea::new(&self.composer)))
+                    .child(div().flex_1().child(Textarea::new(&self.composer).disabled(!can_send)))
                     .child(if busy {
                         Button::new("abort").danger().label("Abort").on_click(cx.listener(|this, _, _, _| {
                             if let Some(c) = &this.client {
-                                c.abort();
+                                let _ = c.abort();
                             }
                         }))
                     } else {
