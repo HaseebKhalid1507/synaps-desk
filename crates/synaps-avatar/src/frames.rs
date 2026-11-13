@@ -78,6 +78,44 @@ pub struct Frame {
     pub head_line: i32,
     /// Device-px top of the frame's visible bounds inside the avatar rect.
     pub top: i32,
+    /// Device-px x of the head: mask centroid over the top 30 % of the visible bounds.
+    pub head_x: i32,
+    /// Points well inside the upper part of the figure (hair), for glints.
+    pub glints: Vec<(i16, i16)>,
+}
+
+/// Head x and glint candidates from the hit mask (pack-agnostic: no colour rules).
+fn head_and_glints(mask: &Mask, top: i32, height: i32) -> (i32, Vec<(i16, i16)>) {
+    let band = (height as f32 * 0.3) as i32;
+    let (mut sum, mut n) = (0i64, 0i64);
+    for y in top.max(0)..(top + band).min(mask.h as i32) {
+        for x in 0..mask.w as i32 {
+            if mask.get(x, y) {
+                sum += x as i64;
+                n += 1;
+            }
+        }
+    }
+    let head_x = if n > 0 { (sum / n) as i32 } else { mask.w as i32 / 2 };
+    // Candidates: pixels in the top 40 % whose 9x9 neighbourhood is all body, on a grid.
+    let r = 4;
+    let mut cands = Vec::new();
+    let y1 = (top + (height as f32 * 0.4) as i32).min(mask.h as i32 - r);
+    for y in ((top + r).max(r)..y1).step_by(3) {
+        for x in (r..mask.w as i32 - r).step_by(3) {
+            if [(-r, -r), (r, -r), (-r, r), (r, r), (0, 0), (0, -r), (0, r), (-r, 0), (r, 0)].iter().all(|&(dx, dy)| mask.get(x + dx, y + dy)) {
+                cands.push((x as i16, y as i16));
+            }
+        }
+    }
+    // A fixed spread of 48 of them (deterministic LCG).
+    let mut seed = 0x2545_f491u32 ^ (cands.len() as u32);
+    let mut glints = Vec::new();
+    for _ in 0..cands.len().min(48) {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        glints.push(cands[(seed >> 8) as usize % cands.len()]);
+    }
+    (head_x, glints)
 }
 
 /// Display geometry shared by all frames.
@@ -182,6 +220,7 @@ fn decode_one(pack: &Pack, f: &FrameSource, geo: &Geometry, verify: bool, resize
     let (_, top) = geo.to_device(0, vb.y);
     let head_line = (top + vb.height as f32 * geo.scale * head_fraction).round() as i32;
     let rgba = image::RgbaImage::from_raw(geo.width, geo.height, px).expect("buffer size");
+    let (head_x, glints) = head_and_glints(&mask, top.round() as i32, (vb.height as f32 * geo.scale) as i32);
     Ok(Frame {
         id: f.id.clone(),
         image: Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])),
@@ -189,6 +228,8 @@ fn decode_one(pack: &Pack, f: &FrameSource, geo: &Geometry, verify: bool, resize
         rects,
         head_line,
         top: top.round() as i32,
+        head_x,
+        glints,
     })
 }
 

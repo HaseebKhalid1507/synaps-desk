@@ -146,9 +146,9 @@ pub enum Step {
 pub struct MoodSpec {
     /// Frame shown while the mood holds.
     pub base: String,
-    /// Clip looped over the base (e.g. blink, speech). Its frames should share the base pose.
+    /// Looped over the base (e.g. blink, speech): a catalog clip id or inline steps.
     #[serde(default)]
-    pub r#loop: Option<String>,
+    pub r#loop: Option<Steps>,
     /// Played once on entering the mood.
     #[serde(default)]
     pub entry: Option<Vec<Step>>,
@@ -167,6 +167,77 @@ pub struct MoodSpec {
     /// Automatically switch to another mood after `afterMs`.
     #[serde(default)]
     pub then: Option<Then>,
+    /// A small hop of the whole figure about every `hopEveryMs` (attention states).
+    #[serde(default)]
+    pub hop_every_ms: Option<u64>,
+    /// A glitch burst about every `glitchEveryMs` while the mood holds (error states).
+    #[serde(default)]
+    pub glitch_every_ms: Option<u64>,
+    /// Draw the status tag inverted (solid tone plate, dark text) for states that want
+    /// attention.
+    #[serde(default)]
+    pub invert: bool,
+}
+
+/// A clip id, or steps written inline.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum Steps {
+    Clip(String),
+    Inline(Vec<Step>),
+}
+
+impl Steps {
+    pub fn as_steps(&self) -> Vec<Step> {
+        match self {
+            Steps::Clip(id) => vec![Step::Clip(id.clone())],
+            Steps::Inline(v) => v.clone(),
+        }
+    }
+}
+
+/// Idle life tuning. Everything here is cheap: the bob moves the window (no redraw),
+/// sparkles redraw at a low rate only while one is alive.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Life {
+    /// Breathing bob, device px peak to peak (0 = off), and its period.
+    pub bob_px: i32,
+    pub bob_period_ms: u64,
+    /// Glints on the upper part of the figure (the hair): a new one every
+    /// `sparkleEveryMs[0]..[1]` ms, each alive `sparkleMs`.
+    pub sparkle_every_ms: [u64; 2],
+    pub sparkle_ms: u64,
+    /// Override the catalog's autonomy timing.
+    pub first_activity_ms: Option<u64>,
+    pub activity_gap_ms: Option<u64>,
+}
+
+impl Default for Life {
+    fn default() -> Self {
+        Life {
+            bob_px: 2,
+            bob_period_ms: 3_600,
+            sparkle_every_ms: [1_300, 3_000],
+            sparkle_ms: 560,
+            first_activity_ms: None,
+            activity_gap_ms: None,
+        }
+    }
+}
+
+/// Sitting on another window's top edge: the seat anchor of `base` goes on the edge.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PerchSpec {
+    pub base: String,
+    /// Seat frame per mood key; moods not listed use `base`.
+    #[serde(default)]
+    pub moods: BTreeMap<String, String>,
+    #[serde(default)]
+    pub activities: Vec<Vec<Step>>,
+    #[serde(default)]
+    pub click: Vec<Step>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -233,6 +304,10 @@ pub struct Behaviour {
     pub click: ClickSpec,
     #[serde(default)]
     pub tones: BTreeMap<String, String>,
+    #[serde(default)]
+    pub life: Life,
+    #[serde(default)]
+    pub perch: Option<PerchSpec>,
 }
 
 /// A frame to decode: catalog sprite or sidecar extra.
@@ -395,10 +470,8 @@ impl Pack {
             if !pack.index.contains_key(&m.base) {
                 errors.push(format!("moods.json mood `{name}`: base frame `{}` does not resolve", m.base));
             }
-            if let Some(l) = &m.r#loop
-                && pack.clip(l).is_none()
-            {
-                errors.push(format!("moods.json mood `{name}`: loop clip `{l}` does not exist"));
+            if let Some(l) = &m.r#loop {
+                check_steps(&format!("mood `{name}` loop"), &l.as_steps(), &mut errors, &pack);
             }
             check_steps(&format!("mood `{name}` entry"), m.entry.as_deref().unwrap_or(&[]), &mut errors, &pack);
             check_steps(&format!("mood `{name}` exit"), m.exit.as_deref().unwrap_or(&[]), &mut errors, &pack);
@@ -410,6 +483,21 @@ impl Pack {
         }
         for (i, a) in pack.behaviour.activities.iter().enumerate() {
             check_steps(&format!("activity #{i}"), a, &mut errors, &pack);
+        }
+        if let Some(p) = &pack.behaviour.perch {
+            for (what, id) in std::iter::once(("base".to_string(), &p.base)).chain(p.moods.iter().map(|(k, v)| (format!("moods.{k}"), v))) {
+                match pack.index.get(id.as_str()) {
+                    None => errors.push(format!("moods.json perch {what}: frame `{id}` does not resolve")),
+                    Some(&i) if pack.frames[i].anchor.name != "seat" => {
+                        errors.push(format!("moods.json perch {what}: frame `{id}` has no seat anchor"))
+                    }
+                    _ => {}
+                }
+            }
+            for (i, a) in p.activities.iter().enumerate() {
+                check_steps(&format!("perch.activities #{i}"), a, &mut errors, &pack);
+            }
+            check_steps("perch.click", &p.click, &mut errors, &pack);
         }
         check_steps("click.head", &pack.behaviour.click.head, &mut errors, &pack);
         check_steps("click.annoyed", &pack.behaviour.click.annoyed, &mut errors, &pack);

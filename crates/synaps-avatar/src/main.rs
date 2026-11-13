@@ -5,6 +5,7 @@
 mod anim;
 mod control;
 mod frames;
+mod fx;
 mod pack;
 mod platform;
 mod shape;
@@ -42,7 +43,9 @@ const USAGE: &str = "usage: synaps-avatar [--pack DIR] [--height PX] [--name NAM
 
 Dev control: newline commands on $XDG_RUNTIME_DIR/synaps-avatar.sock
   mood <idle|thinking|working|talking|needs_you|done|annoyed|sleepy|away>
-  clip <clip, action or frame id>   say <text>   pos <x> <y>   state   quit";
+  clip <clip, action or frame id>   say <text>   page next|prev   collapse   expand
+  pos <x> <y> [now]   perch [sit|stand] [window id]   perch off
+  glitch   state   hide   quit";
 
 fn parse_args() -> Result<Args> {
     let data = std::env::var_os("XDG_DATA_HOME")
@@ -268,10 +271,9 @@ fn run(t_start: Instant) -> Result<()> {
             x11.move_to(origin.0, origin.1).ok();
             x11.raise().ok();
             let tx = tx2.clone();
-            x11.spawn_watcher(move |composited| {
-                eprintln!("synaps-avatar: compositor {}", if composited { "appeared" } else { "went away" });
+            x11.spawn_watcher(move |ev| {
                 let (r, _) = std::sync::mpsc::channel();
-                tx.send_blocking((control::Command::Reshape, r)).ok();
+                tx.send_blocking((control::Command::Watch(ev), r)).ok();
             })
             .map_err(|e| eprintln!("synaps-avatar: x11 watcher: {e:#}"))
             .ok();

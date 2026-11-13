@@ -82,6 +82,9 @@ impl Rng {
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         Rng(t.as_nanos() as u64 | 1)
     }
+    pub fn new(seed: u64) -> Rng {
+        Rng(seed | 1)
+    }
     pub fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
@@ -121,6 +124,11 @@ impl Animator {
         if let Some(s) = &self.looping {
             return s[self.loop_pos].0;
         }
+        self.base
+    }
+
+    /// The mood layer's resting frame (stable while loops and one-shots play).
+    pub fn base(&self) -> usize {
         self.base
     }
 

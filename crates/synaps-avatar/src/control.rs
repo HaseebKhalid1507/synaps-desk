@@ -14,13 +14,26 @@ pub enum Command {
     Mood(Mood),
     Clip(String),
     Say(String),
-    /// Put the avatar's ground point (feet) at root pixel (x, y).
-    Pos(i32, i32),
+    /// Put the avatar's ground point (feet) at root pixel (x, y): a teleport, or an
+    /// instant move with `now`.
+    Pos(i32, i32, bool),
+    /// Sit (or stand) on a window's top edge: the focused window, or `win`.
+    Perch { sit: bool, win: Option<u32> },
+    /// Leave the perch: teleport back to the ground.
+    Unperch,
     /// One-line JSON snapshot of the avatar's state.
     State,
+    /// Glitch out, then quit.
+    Hide,
     Quit,
-    /// Internal: the compositor appeared or went away; re-apply shapes.
-    Reshape,
+    /// Dev: a glitch burst.
+    Glitch,
+    /// Bubble paging: +1 / -1.
+    Page(i32),
+    /// Collapse the bubble to the status tag (true) or expand it again.
+    Collapse(bool),
+    /// Internal: from the X watcher thread.
+    Watch(crate::platform::x11::WatchEvent),
 }
 
 impl Command {
@@ -37,15 +50,45 @@ impl Command {
             // `\n` in the line stands for a newline (the protocol is one command per line).
             "say" if !rest.is_empty() => Command::Say(rest.replace("\\n", "\n")),
             "pos" => {
-                let mut it = rest.split_whitespace().map(str::parse::<i32>);
-                match (it.next(), it.next(), it.next()) {
-                    (Some(Ok(x)), Some(Ok(y)), None) => Command::Pos(x, y),
-                    _ => bail!("usage: pos <x> <y>"),
+                let mut it = rest.split_whitespace();
+                let num = |v: Option<&str>| v.and_then(|v| v.parse::<i32>().ok());
+                match (num(it.next()), num(it.next()), it.next(), it.next()) {
+                    (Some(x), Some(y), None, None) => Command::Pos(x, y, false),
+                    (Some(x), Some(y), Some("now"), None) => Command::Pos(x, y, true),
+                    _ => bail!("usage: pos <x> <y> [now]"),
                 }
             }
+            "perch" => {
+                let mut sit = true;
+                let mut win = None;
+                for w in rest.split_whitespace() {
+                    match w {
+                        "off" => return Ok(Command::Unperch),
+                        "sit" => sit = true,
+                        "stand" => sit = false,
+                        _ => {
+                            let v = w.trim_start_matches("0x");
+                            let radix = if v.len() < w.len() { 16 } else { 10 };
+                            win = Some(u32::from_str_radix(v, radix).with_context(|| format!("perch: bad window id `{w}`"))?);
+                        }
+                    }
+                }
+                Command::Perch { sit, win }
+            }
+            "page" => match rest {
+                "next" | "+" => Command::Page(1),
+                "prev" | "-" => Command::Page(-1),
+                _ => bail!("usage: page next|prev"),
+            },
+            "collapse" => Command::Collapse(true),
+            "expand" => Command::Collapse(false),
+            "glitch" => Command::Glitch,
             "state" => Command::State,
+            "hide" => Command::Hide,
             "quit" => Command::Quit,
-            _ => bail!("unknown command `{line}` (mood <name> | clip <id> | say <text> | pos <x> <y> | state | quit)"),
+            _ => bail!(
+                "unknown command `{line}` (mood <name> | clip <id> | say <text> | pos <x> <y> [now] | perch [sit|stand] [win] | perch off | page next|prev | collapse | expand | glitch | state | hide | quit)"
+            ),
         })
     }
 }
