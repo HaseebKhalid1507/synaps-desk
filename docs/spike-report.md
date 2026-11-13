@@ -159,8 +159,8 @@ artifacts. `macos-latest` runs only on `workflow_dispatch` or tags. Swatinem/rus
 
 | OS | result | release build (cold) | `synaps-desktop` | notes |
 |---|---|---|---|---|
-| ubuntu-latest | **green** ([run 43391715707](https://github.com/HaseebKhalid1507/synaps-desktop/actions/runs/43391715707), Rust 1.95; rerun on 1.100: see PR checks) | 15 m 01 s | 34,057,584 B | client tests 10/10 (incl. doctest) |
-| windows-latest | **green** (same run) | 13 m 19 s | 17,469,440 B (`.exe`) | client tests 13/13 (incl. doctest), including the named-pipe name derivation and connect-without-server tests; GPUI's DirectX backend compiles |
+| ubuntu-latest | **green** ([run 43391715707](https://github.com/HaseebKhalid1507/synaps-desktop/actions/runs/43391715707), Rust 1.95; green again on 1.100.0 in [run 43395128132](https://github.com/HaseebKhalid1507/synaps-desktop/actions/runs/43395128132)) | 15 m 01 s | 34,057,584 B | client tests 10/10 (incl. doctest) |
+| windows-latest | **green** (both runs) | 13 m 19 s | 17,469,440 B (`.exe`) | client tests 13/13 (incl. doctest), including the named-pipe name derivation and connect-without-server tests; GPUI's DirectX backend compiles |
 | macos-latest (arm64), `workflow_dispatch` | first run **red**: `gpui-pre-macos` needs Rust ≥ 1.98 (`Option::map_or_default`); after pinning 1.100.0 **green** ([run 43395134179](https://github.com/HaseebKhalid1507/synaps-desktop/actions/runs/43395134179)) | 2 m 22 s | 14,852,000 B | client tests pass; no runtime check (no Mac) |
 
 Windows and macOS are **compile + unit-test only**. Nobody has opened the window on those platforms yet.
