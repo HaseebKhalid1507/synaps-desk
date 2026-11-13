@@ -176,8 +176,10 @@ pub struct SessionLink {
 }
 
 /// Re-create the client when it has been offline this long (its own reconnects gave up,
-/// or the tunnel is still coming back).
-const RESPAWN_AFTER: Duration = Duration::from_secs(90);
+/// or the tunnel is still coming back). `SA_RESPAWN_AFTER=<secs>` for tests.
+fn respawn_after() -> Duration {
+    std::env::var("SA_RESPAWN_AFTER").ok().and_then(|v| v.parse().ok()).map_or(Duration::from_secs(90), Duration::from_secs_f64)
+}
 /// After the client's thread stopped by itself, start a new one this soon.
 const RESPAWN_SOON: Duration = Duration::from_secs(5);
 
@@ -1043,7 +1045,7 @@ impl Avatar {
         if let Some(s) = &self.session {
             take(s.link.deadline(now));
             take(s.respawn_at);
-            take(s.link.offline_for(now).map(|d| now + RESPAWN_AFTER.saturating_sub(d)));
+            take(s.link.offline_for(now).map(|d| now + respawn_after().saturating_sub(d)));
         }
         if self.quit_requested {
             take(Some(now));
@@ -1188,7 +1190,7 @@ impl Avatar {
         }
         if let Some(s) = &self.session
             && !s.closing
-            && (s.respawn_at.is_some_and(|t| t <= now) || s.link.offline_for(now).is_some_and(|d| d >= RESPAWN_AFTER))
+            && (s.respawn_at.is_some_and(|t| t <= now) || s.link.offline_for(now).is_some_and(|d| d >= respawn_after()))
         {
             self.respawn(now, cx);
             dirty = true;
@@ -1719,7 +1721,7 @@ impl Avatar {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("synaps-avatar: cannot start a new session client: {e}");
-                s.respawn_at = Some(now + RESPAWN_AFTER);
+                s.respawn_at = Some(now + respawn_after());
                 return;
             }
         };
