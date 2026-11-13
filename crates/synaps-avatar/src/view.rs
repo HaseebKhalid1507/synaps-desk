@@ -758,7 +758,7 @@ impl Avatar {
             *v *= 0.6;
         }
         // The contact band under the edge.
-        if let Some((cl, ch)) = self.contact[1] {
+        if let Some((cl, ch)) = self.contact_of(frame, true) {
             let cx = l.ground_x - l.avatar_x;
             let depth = (6.0 * l.sf) as i32;
             for y in (line + 1)..=(line + depth).min(h - 1) {
@@ -792,7 +792,10 @@ impl Avatar {
     /// Show, move or hide the contact shadow to match the placement.
     fn sync_shadow(&mut self) {
         let want = self.sitting() && self.loaded && !self.hidden && self.teleport.is_none() && !self.quitting && self.press.is_none();
-        let base = self.perch_spec().and_then(|p| self.pack.index.get(&p.base).copied());
+        // The resting frame of the current layer (music swaps the pose), else the perch base.
+        let base = Some(self.anim.base())
+            .filter(|&i| self.pack.frames.get(i).is_some_and(|f| f.anchor.name == "seat"))
+            .or_else(|| self.perch_spec().and_then(|p| self.pack.index.get(&p.base).copied()));
         let (Some(base), true) = (base, want) else {
             if self.shadow_at.take().is_some() {
                 self.x11.fx_unmap(SHADOW_LAYER);
@@ -802,7 +805,9 @@ impl Avatar {
         };
         if self.shadow.as_ref().map(|s| s.0) != Some(base) {
             self.shadow = Some((base, self.shadow_rects(base)));
-            self.shadow_at = None;
+            if self.shadow_at.take().is_some() {
+                self.x11.fx_unmap(SHADOW_LAYER);
+            }
         }
         let l = self.layout;
         let at = (self.applied.0 + l.avatar_x, self.applied.1 + l.avatar_y);
@@ -1434,9 +1439,13 @@ impl Avatar {
     /// What touches the edge line in the perch frame (seat, thighs, planted hands) and
     /// the legs hanging below it: x extent relative to the seat (or feet), device px.
     fn measure_contact(&self, sit: bool) -> Option<(i32, i32)> {
-        let l = &self.layout;
         let id = if sit { self.perch_spec()?.base.clone() } else { self.pack.catalog.default_sprite.clone() };
-        let f = self.frames.get(*self.pack.index.get(&id)?)?.as_ref()?;
+        self.contact_of(*self.pack.index.get(&id)?, sit)
+    }
+
+    fn contact_of(&self, fi: usize, sit: bool) -> Option<(i32, i32)> {
+        let l = &self.layout;
+        let f = self.frames.get(fi)?.as_ref()?;
         let line = if sit { l.seat_y? } else { l.ground_y } - l.avatar_y;
         let cx = l.ground_x - l.avatar_x;
         let (mut lo, mut hi) = (i32::MAX, i32::MIN);
@@ -1699,6 +1708,22 @@ impl Avatar {
             _ => l.ground_y,
         };
         ((l.ground_x - l.avatar_x) as f32, (y - l.avatar_y) as f32)
+    }
+
+    /// Laid-out width of `tracked(s, spacing)` at `size`/`weight` (logical px).
+    fn tracked_width(&self, s: &str, size: f32, weight: FontWeight, spacing: f32, window: &Window) -> f32 {
+        if s.is_empty() {
+            return 0.0;
+        }
+        // `tracked` lays out one box per glyph: no kerning, each box rounded up.
+        let f = Font { weight, ..font(self.font.clone()) };
+        s.chars()
+            .map(|c| {
+                let t = if c == ' ' { "\u{00A0}".to_string() } else { c.to_string() };
+                let run = TextRun { len: t.len(), font: f.clone(), color: black(), background_color: None, underline: None, strikethrough: None };
+                f32::from(window.text_system().layout_line(&t, px(size), &[run], None).width).ceil() + spacing
+            })
+            .sum()
     }
 
     fn wrap_text(&self, text: &[char], window: &Window, cx: &App) -> Wrapped {
@@ -2272,7 +2297,21 @@ impl Render for Avatar {
             let (vis_l, vis_r) = (self.vis.0 as f32 / sf, self.vis.1 as f32 / sf);
             let max_w = (vis_r - vis_l - 2.0 * MARGIN).min(PANEL_MAX_W);
             let text_w = self.bubble.as_ref().and_then(|b| b.wrap.as_ref()).map_or(260.0, |w| w.width);
-            let w = (text_w + PAD_L + PAD_R + 2.0).clamp(PANEL_MIN_W.min(max_w), max_w);
+            // Never narrower than the header line (name / label .. glyph status).
+            let header_label = if probe { "FOCUS PROBE // CLICK ME" } else { "INCOMING TRANSMISSION" };
+            let header_w = PAD_L
+                + PAD_R
+                + self.tracked_width(&self.name, 10.5, FontWeight::BOLD, 1.8, window)
+                + 4.0
+                + self.tracked_width("/", 10.5, FontWeight::BOLD, 0.0, window)
+                + self.tracked_width(header_label, 9.5, FontWeight::SEMIBOLD, 1.5, window)
+                + self.tracked_width(&label, 9.5, FontWeight::BOLD, 1.5, window)
+                + 3.0 * 8.0
+                + 11.0
+                + 5.0
+                + 32.0;
+            let min_w = PANEL_MIN_W.max(header_w).min(max_w);
+            let w = (text_w + PAD_L + PAD_R + 2.0).clamp(min_w, max_w);
             let total_lines = self.bubble.as_ref().and_then(|b| b.wrap.as_ref()).map_or(1, |w| w.lines.len());
             // Fit the page: the lines it will hold once typed out (so it doesn't grow while
             // streaming), never an empty band above the footer.

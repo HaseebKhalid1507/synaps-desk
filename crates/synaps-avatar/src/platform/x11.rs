@@ -70,7 +70,8 @@ pub struct X11 {
     /// Top-level window the watcher follows (0 = none).
     target: Arc<AtomicU32>,
     /// Effect windows (teleport bolt layers), created on first use: (window, mapped).
-    fx: Mutex<Vec<(u32, bool)>>,
+    /// Effect layers: (window, mapped, background colour).
+    fx: Mutex<Vec<(u32, bool, u32)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -306,9 +307,17 @@ impl X11 {
                 b"synaps-avatar-fx\0synaps-avatar-fx\0",
             )?;
             self.conn.shape_rectangles(shape::SO::SET, shape::SK::INPUT, xproto::ClipOrdering::UNSORTED, id, 0, 0, &[])?;
-            fx.push((id, false));
+            fx.push((id, false, rgb));
         }
-        let (id, mapped) = fx[layer];
+        let (id, mapped, colour) = fx[layer];
+        if colour != rgb {
+            // Layers are created lazily in a batch, and some are reused: keep the colour current.
+            self.conn.change_window_attributes(id, &xproto::ChangeWindowAttributesAux::new().background_pixel(rgb))?;
+            if mapped {
+                self.conn.clear_area(false, id, 0, 0, 0, 0)?;
+            }
+            fx[layer].2 = rgb;
+        }
         if rects.is_some_and(|r| r.is_empty()) {
             if mapped {
                 self.conn.unmap_window(id)?;
