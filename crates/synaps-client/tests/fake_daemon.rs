@@ -436,3 +436,190 @@ async fn input_owner_changes_are_events() {
     assert_eq!(got, (2, Some(1), "takeover".to_string()));
     client.shutdown().unwrap();
 }
+
+fn history_frame(messages: &[Value]) -> Value {
+    json!({"ev": "stream", "event": {"kind": "session", "session": "message_history", "messages": messages}})
+}
+
+/// N1 through the client loop: a fresh `Messages` result that still
+/// disagrees with the digest by hash stops the re-querying (no storm), and
+/// from then on every history is a `Replace`, never spliced onto old rows.
+#[tokio::test]
+async fn n1_under_hash_distrust_histories_replace_and_do_not_requery() {
+    let mut fake = Fake::start("n1").await;
+    let (client, events) = fake.client();
+    client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    let a = attached_frame(2);
+    let history: Vec<Value> = a["conversation"]["api_messages"].as_array().unwrap().clone();
+    let n = history.len();
+    let off = json!({"ev": "conversation", "digest": {"messages_len": n, "messages_hash": 7}});
+    conn.event(50, off.clone()).await;
+    let q = conn.recv_cmd().await;
+    assert_eq!(q["cmd"], "query");
+    conn.event(51, json!({"ev": "query_result", "id": q["id"], "value": history})).await;
+    let up = wait(&events, "resync", |e| match e {
+        Event::History { update, .. } => Some(update.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(up, HistoryUpdate::Replace { messages: history.clone() });
+
+    // Still "off" by hash: no second query.
+    conn.event(52, off).await;
+    // A same-length rewrite and a longer rewrite: both replace.
+    let mut same_len = history.clone();
+    same_len[n - 1] = json!({"role": "assistant", "content": "repaired"});
+    conn.event(53, history_frame(&same_len)).await;
+    let longer: Vec<Value> = (0..n + 2).map(|i| json!({"role": "user", "content": format!("other {i}")})).collect();
+    conn.event(54, history_frame(&longer)).await;
+    for want in [same_len, longer] {
+        let up = wait(&events, "history", |e| match e {
+            Event::History { update, .. } => Some(update.clone()),
+            _ => None,
+        })
+        .await;
+        assert_eq!(up, HistoryUpdate::Replace { messages: want });
+    }
+    client.submit("x").unwrap();
+    assert_eq!(conn.recv_cmd().await["cmd"], "submit", "no query after the distrusted digest");
+    client.shutdown().unwrap();
+}
+
+/// N2: `QueryResult`s that are not this client's resync (another client's,
+/// which is a whole history when a co-attached TUI resyncs, and the
+/// daemon's reserved ids) never reach the consumer.
+#[tokio::test]
+async fn n2_foreign_and_reserved_query_results_are_dropped() {
+    let mut fake = Fake::start("n2").await;
+    let (client, events) = fake.client();
+    client.attach(SID, AttachMode::Mirror).unwrap();
+    let conn = attached(&mut fake, &events, 2).await;
+    let big: Vec<Value> = (0..50).map(|i| json!({"role": "user", "content": format!("m{i}")})).collect();
+    conn.event(60, json!({"ev": "query_result", "id": 12345, "value": big})).await;
+    conn.event(61, json!({"ev": "query_result", "id": (1u64 << 63) + 1, "value": big})).await;
+    conn.event(62, json!({"ev": "query_result", "id": u64::MAX, "value": null})).await;
+    conn.event(63, json!({"ev": "idle"})).await;
+    let first = wait(&events, "a session event", |e| match e {
+        Event::Session { raw, .. } => Some(raw["ev"].clone()),
+        Event::History { .. } => Some(json!("history")),
+        _ => None,
+    })
+    .await;
+    assert_eq!(first, "idle");
+    client.shutdown().unwrap();
+}
+
+/// M5: a drifted prompt in the attach snapshot is counted on `Attached`
+/// and reported as `Error::Decode`, not silently dropped.
+#[tokio::test]
+async fn m5_attach_snapshot_rejects_surface_as_decode_errors() {
+    let mut fake = Fake::start("m5").await;
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let conn = fake.next_attach().await;
+    let mut a = attached_frame(2);
+    a["pending_prompts"] = json!([{"id": "p-1", "title": "Allow bash?"}]);
+    conn.send(a).await;
+    let rejected = wait(&events, "attached", |e| match e {
+        Event::Attached { attached, .. } => Some((attached.pending_prompts.len(), attached.rejected.pending_prompts)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(rejected, (0, 1));
+    let err = wait(&events, "decode error", |e| match e {
+        Event::Error { error: Error::Decode(d), attach_seq } => Some((d.kind.clone(), d.error.clone(), *attach_seq)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(err.0, "attached");
+    assert!(err.1.contains("1 pending_prompts"), "{}", err.1);
+    assert_eq!(err.2, Some(seq));
+    client.shutdown().unwrap();
+}
+
+/// N8: a daemon that accepts, greets and hangs up at once is retried with
+/// a growing backoff, not in a tight loop.
+#[tokio::test]
+async fn n8_a_daemon_that_hangs_up_at_once_is_backed_off() {
+    let dir = std::env::temp_dir().join(format!("synaps-fake-{}-n8", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("d.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (r, mut w) = stream.into_split();
+            let mut r = BufReader::new(r).lines();
+            let _ = r.next_line().await;
+            let mut line = welcome().to_string();
+            line.push('\n');
+            let _ = w.write_all(line.as_bytes()).await;
+        }
+    });
+    let (client, events) = Client::spawn(ClientOptions::new(Endpoint::Socket(path), Identity::new("tester").unwrap())).unwrap();
+    let until = tokio::time::Instant::now() + Duration::from_millis(1500);
+    let mut connects = 0;
+    while let Ok(Ok(e)) = tokio::time::timeout_at(until, events.recv()).await {
+        if matches!(e, Event::Status(Status::Connected { .. })) {
+            connects += 1;
+        }
+    }
+    // 100 + 200 + 400 + 800 ms of backoff fit in 1.5 s: about 4 connects.
+    assert!((2..=6).contains(&connects), "{connects} connects in 1.5 s");
+    client.shutdown().unwrap();
+}
+
+/// N10: a detach while a create is in flight says the session may exist.
+#[tokio::test]
+async fn n10_a_detach_during_a_create_says_it_may_exist() {
+    let mut fake = Fake::start("n10").await;
+    let (client, events) = fake.client();
+    let seq = client.create(CreateOptions::new()).unwrap();
+    let conn = fake.next_attach().await;
+    assert_eq!(conn.attach["attach"], "create");
+    client.detach().unwrap();
+    let (s, reason) = wait(&events, "detached", |e| match e {
+        Event::Detached { attach_seq, reason, .. } => Some((*attach_seq, reason.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(s, seq);
+    assert!(reason.contains("may exist"), "{reason}");
+    client.shutdown().unwrap();
+}
+
+/// N9: attaches from several clones on several threads reach the
+/// connection thread in `attach_seq` order (each replaces the one before,
+/// so the `Detached` reports come out increasing).
+#[tokio::test]
+async fn n9_attach_seqs_are_enqueued_in_order() {
+    let fake = Fake::start("n9").await;
+    let (client, events) = fake.client();
+    let threads: Vec<_> = (0..4)
+        .map(|_| {
+            let c = client.clone();
+            std::thread::spawn(move || {
+                for _ in 0..25 {
+                    c.attach(SID, AttachMode::Observe).unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    client.detach().unwrap();
+    let mut seen = Vec::new();
+    while seen.len() < 100 {
+        let s = wait(&events, "detached", |e| match e {
+            Event::Detached { attach_seq, .. } => Some(*attach_seq),
+            _ => None,
+        })
+        .await;
+        seen.push(s);
+    }
+    assert_eq!(seen, (1..=100).collect::<Vec<u64>>());
+    drop(fake);
+    client.shutdown().unwrap();
+}
