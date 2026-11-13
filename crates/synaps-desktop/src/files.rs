@@ -1,14 +1,23 @@
 //! Files changed in a session, derived from its `edit` / `write` /
 //! `multi_edit` tool calls (the full inputs in the history), counted once
-//! their result came back without `is_error`. Also the inline diff a tool row
-//! shows, keyed by tool id, from the history or the live `ToolUse` event.
-//! No GPUI. Line counts are of the tool inputs (`old_string` → `new_string`,
-//! `content`), not of the files on disk, which this client never reads.
+//! their result came back as a success: the result's text is classified as
+//! the Synaps TUI does ([`synaps_client::transcript::tool_outcome`]), since
+//! the daemon leaves `is_error` unset on failed, denied and canceled calls.
+//! Also the inline diff a tool row shows, keyed by tool id, from the history
+//! or the live `ToolUse` event. No GPUI.
+//!
+//! Everything here is what the model asked for, not what landed on disk
+//! (this client never reads the files): line counts are of the tool inputs
+//! (`old_string` → `new_string`), a `write` is "N lines written" (`~N`, not a
+//! delta: the old file is unknown), a `multi_edit` regex or line-prefix
+//! anchor is shown as the pattern, `{{placeholders}}` are not expanded, and
+//! an input an extension rewrote shows as the model sent it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
+use synaps_client::transcript::{ToolOutcome, tool_result_outcome};
 
 /// Lines a preview keeps (the rest is counted in `more`).
 pub const PREVIEW_LINES: usize = 48;
@@ -16,8 +25,9 @@ pub const PREVIEW_LINES: usize = 48;
 const LINE_CHARS: usize = 240;
 /// Unchanged lines shown around a change.
 const CONTEXT: usize = 2;
-/// Above this many `old × new` cells the diff is one block (removed, added).
-const LCS_CELLS: usize = 250_000;
+/// Above this many `old × new` cells the diff is one block (removed, added):
+/// at most ~20 µs per edit, so folding a long history at attach stays cheap.
+const LCS_CELLS: usize = 20_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
@@ -31,7 +41,8 @@ pub enum LineKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffLine {
     pub kind: LineKind,
-    pub text: String,
+    /// Shared, so a frame hands it to the renderer without a copy.
+    pub text: Arc<str>,
 }
 
 /// What a tool row draws under its header.
@@ -68,9 +79,13 @@ impl FileKind {
 pub struct FileStat {
     /// As the tool got it, relative to the session's folder when under it.
     pub path: String,
+    /// How it was first touched.
     pub kind: FileKind,
+    /// Lines the edits added and removed (not the writes).
     pub added: u32,
     pub removed: u32,
+    /// Lines of the last `write` of it (0: never written whole).
+    pub written: u32,
 }
 
 impl FileStat {
@@ -92,13 +107,23 @@ struct Change {
     removed: u32,
 }
 
+/// One file tool call, analysed once.
+#[derive(Debug)]
+struct Analysed {
+    preview: Arc<Preview>,
+    changes: Vec<Change>,
+}
+
 #[derive(Debug, Default)]
 pub struct Ledger {
     files: Vec<FileStat>,
     index: HashMap<String, usize>,
-    /// Tool calls waiting for their result: tool id → the files they change.
-    pending: HashMap<String, Vec<Change>>,
-    previews: HashMap<String, Arc<Preview>>,
+    /// Tool calls waiting for their result.
+    pending: HashSet<String>,
+    /// Every file tool call seen, by tool id: kept across a reset of the
+    /// same session (a resync, a reconnect), so its history is not diffed
+    /// again.
+    calls: HashMap<String, Arc<Analysed>>,
     cwd: Option<String>,
     added: u32,
     removed: u32,
@@ -110,9 +135,12 @@ pub fn is_file_tool(name: &str) -> bool {
 }
 
 impl Ledger {
-    /// Start over from a whole history (attach, replacement).
-    pub fn reset(&mut self, messages: &[Value], cwd: Option<&str>) {
-        *self = Ledger { cwd: cwd.map(|c| c.trim_end_matches(['/', '\\']).to_string()).filter(|c| !c.is_empty()), ..Ledger::default() };
+    /// Start over from a whole history (attach, replacement). `same`: the
+    /// same session as before, whose analysed calls are reused.
+    pub fn reset(&mut self, messages: &[Value], cwd: Option<&str>, same: bool) {
+        let calls = if same { std::mem::take(&mut self.calls) } else { HashMap::new() };
+        *self =
+            Ledger { cwd: cwd.map(|c| c.trim_end_matches(['/', '\\']).to_string()).filter(|c| !c.is_empty()), calls, ..Ledger::default() };
         self.append(messages);
     }
 
@@ -131,11 +159,11 @@ impl Ledger {
                     }
                     Some("tool_result") => {
                         let Some(id) = b.get("tool_use_id").and_then(Value::as_str) else { continue };
-                        let failed = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-                        if let Some(changes) = self.pending.remove(id)
-                            && !failed
+                        if self.pending.remove(id)
+                            && tool_result_outcome(b) == ToolOutcome::Ok
+                            && let Some(call) = self.calls.get(id).cloned()
                         {
-                            for c in changes {
+                            for c in &call.changes {
                                 self.commit(c);
                             }
                         }
@@ -152,15 +180,17 @@ impl Ledger {
         if !is_file_tool(name) || id.is_empty() {
             return;
         }
-        let (mut preview, changes) = analyse(name, input);
-        let changes: Vec<Change> = changes.into_iter().map(|c| Change { path: self.relative(&c.path), ..c }).collect();
-        preview.title = match changes.as_slice() {
-            [] => String::new(),
-            [one] => one.path.clone(),
-            [first, rest @ ..] => format!("{} +{} files", first.path, rest.len()),
-        };
-        self.previews.insert(id.to_string(), Arc::new(preview));
-        self.pending.entry(id.to_string()).or_insert(changes);
+        if !self.calls.contains_key(id) {
+            let (mut preview, changes) = analyse(name, input);
+            let changes: Vec<Change> = changes.into_iter().map(|c| Change { path: self.relative(&c.path), ..c }).collect();
+            preview.title = match changes.as_slice() {
+                [] => String::new(),
+                [one] => one.path.clone(),
+                [first, rest @ ..] => format!("{} +{} files", first.path, rest.len()),
+            };
+            self.calls.insert(id.to_string(), Arc::new(Analysed { preview: Arc::new(preview), changes }));
+        }
+        self.pending.insert(id.to_string());
     }
 
     fn relative(&self, path: &str) -> String {
@@ -173,24 +203,29 @@ impl Ledger {
         }
     }
 
-    fn commit(&mut self, c: Change) {
-        self.added += c.added;
-        self.removed += c.removed;
-        match self.index.get(&c.path) {
-            Some(&i) => {
-                let f = &mut self.files[i];
-                f.added += c.added;
-                f.removed += c.removed;
-            }
+    fn commit(&mut self, c: &Change) {
+        let i = match self.index.get(&c.path) {
+            Some(&i) => i,
             None => {
                 self.index.insert(c.path.clone(), self.files.len());
-                self.files.push(FileStat { path: c.path, kind: c.kind, added: c.added, removed: c.removed });
+                self.files.push(FileStat { path: c.path.clone(), kind: c.kind, added: 0, removed: 0, written: 0 });
+                self.files.len() - 1
+            }
+        };
+        let f = &mut self.files[i];
+        match c.kind {
+            FileKind::Written => f.written = c.added,
+            FileKind::Modified => {
+                f.added += c.added;
+                f.removed += c.removed;
+                self.added += c.added;
+                self.removed += c.removed;
             }
         }
     }
 
     pub fn preview(&self, tool_id: &str) -> Option<Arc<Preview>> {
-        self.previews.get(tool_id).cloned()
+        self.calls.get(tool_id).map(|c| c.preview.clone())
     }
 
     /// Changed files, first touched first.
@@ -198,6 +233,7 @@ impl Ledger {
         &self.files
     }
 
+    /// Lines the edits added and removed (writes are not deltas).
     pub fn totals(&self) -> (u32, u32) {
         (self.added, self.removed)
     }
@@ -239,9 +275,14 @@ fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>) {
                     last_path = path;
                 }
                 let text = str_of(e, "text");
-                let (a, r) = match str_of(e, "op") {
-                    "replace" => diff_into(&mut p, str_of(e, "anchor"), text),
-                    "append_jsonl" => {
+                let (a, r) = match (str_of(e, "op"), str_of(e, "anchor_mode")) {
+                    ("replace", "" | "exact") => diff_into(&mut p, str_of(e, "anchor"), text),
+                    // A pattern, not the text it replaces: show it as such.
+                    ("replace", mode) => {
+                        push(&mut p, LineKind::Note, &format!("{mode}: {}", str_of(e, "anchor")));
+                        diff_into(&mut p, "", text)
+                    }
+                    ("append_jsonl", _) => {
                         push(&mut p, LineKind::Add, "{…}");
                         p.added += 1;
                         (1, 0)
@@ -271,7 +312,7 @@ fn push(p: &mut Preview, kind: LineKind, text: &str) {
     if t.len() < text.len() {
         t.push('…');
     }
-    p.lines.push(DiffLine { kind, text: t });
+    p.lines.push(DiffLine { kind, text: t.into() });
 }
 
 /// Append the line diff `old` → `new` to `p`; returns (added, removed).
@@ -282,7 +323,7 @@ fn diff_into(p: &mut Preview, old: &str, new: &str) -> (u32, u32) {
     let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
     let (am, bm) = (&a[pre..a.len() - suf], &b[pre..b.len() - suf]);
     if pre > CONTEXT {
-        push(p, LineKind::Note, "⋯");
+        push(p, LineKind::Note, "…");
     }
     for l in &a[pre.saturating_sub(CONTEXT)..pre] {
         push(p, LineKind::Context, l);
@@ -301,7 +342,7 @@ fn diff_into(p: &mut Preview, old: &str, new: &str) -> (u32, u32) {
         push(p, LineKind::Context, l);
     }
     if suf > CONTEXT {
-        push(p, LineKind::Note, "⋯");
+        push(p, LineKind::Note, "…");
     }
     p.added += added;
     p.removed += removed;
@@ -354,9 +395,15 @@ mod tests {
         json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]})
     }
 
-    fn result(id: &str, error: bool) -> Value {
-        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": "ok", "is_error": error}]})
+    /// A result as the daemon sends it: text only, never `is_error` on
+    /// these paths (agent-engine `runtime/stream.rs`).
+    fn result(id: &str, text: &str) -> Value {
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": text}]})
     }
+
+    const OK: &str = "Edited the file";
+    const DENIED: &str = "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this edit";
+    const FAILED: &str = "Tool execution failed: old_string not found in '/w/r/src/a.rs'. Make sure it matches exactly, including whitespace and indentation.";
 
     #[test]
     fn edit_diff_counts_and_context() {
@@ -367,34 +414,34 @@ mod tests {
         let kinds: Vec<LineKind> = p.lines.iter().map(|l| l.kind).collect();
         use LineKind::*;
         assert_eq!(kinds, vec![Note, Context, Context, Del, Del, Add, Context, Context, Note]);
-        assert_eq!(p.lines[1].text, "c");
-        assert_eq!(p.lines[5].text, "new1");
+        assert_eq!(&*p.lines[1].text, "c");
+        assert_eq!(&*p.lines[5].text, "new1");
         // An LCS keeps a moved-around common line as context.
         let mut p = Preview::default();
         assert_eq!(diff_into(&mut p, "x\nkeep\ny", "keep\nz"), (1, 2));
-        assert!(p.lines.iter().any(|l| l.kind == Context && l.text == "keep"));
+        assert!(p.lines.iter().any(|l| l.kind == Context && &*l.text == "keep"));
     }
 
     #[test]
     fn only_successful_calls_count_and_paths_are_relative() {
         let msgs = vec![
             tool_use("t1", "edit", json!({"path": "/w/r/src/a.rs", "old_string": "x\ny", "new_string": "x\nz\nw"})),
-            result("t1", false),
+            result("t1", OK),
             tool_use("t2", "write", json!({"path": "/w/r/new.sh", "content": "#!/bin/sh\necho hi\n"})),
-            result("t2", true),
+            result("t2", FAILED),
             tool_use("t3", "bash", json!({"command": "ls"})),
-            result("t3", false),
+            result("t3", OK),
             tool_use("t4", "edit", json!({"path": "/w/r/src/a.rs", "old_string": "q", "new_string": "r"})),
         ];
         let mut l = Ledger::default();
-        l.reset(&msgs, Some("/w/r/"));
-        assert_eq!(l.files(), &[FileStat { path: "src/a.rs".into(), kind: FileKind::Modified, added: 2, removed: 1 }]);
+        l.reset(&msgs, Some("/w/r/"), false);
+        assert_eq!(l.files(), &[FileStat { path: "src/a.rs".into(), kind: FileKind::Modified, added: 2, removed: 1, written: 0 }]);
         assert_eq!(l.totals(), (2, 1));
         assert!(l.preview("t2").is_some(), "a failed write still shows what it tried");
         assert!(l.preview("t3").is_none());
         assert_eq!(l.preview("t1").unwrap().title, "src/a.rs");
         // t4's result arrives in a later append.
-        l.append(&[result("t4", false)]);
+        l.append(&[result("t4", OK)]);
         assert_eq!(l.files()[0].added, 3);
         assert_eq!(l.files()[0].removed, 2);
         assert_eq!(l.files()[0].split(), ("src/", "a.rs"));
@@ -402,13 +449,60 @@ mod tests {
         l.tool_use("write", "t5", &json!({"path": "/elsewhere/x.txt", "content": "1\n2\n3"}));
         assert!(l.preview("t5").is_some(), "the live event shows its diff before the history has it");
         assert_eq!(l.files().len(), 1, "but counts only once it succeeded");
-        l.append(&[tool_use("t5", "write", json!({"path": "/elsewhere/x.txt", "content": "1\n2\n3"})), result("t5", false)]);
-        assert_eq!(l.files()[1], FileStat { path: "/elsewhere/x.txt".into(), kind: FileKind::Written, added: 3, removed: 0 });
-        assert_eq!(l.totals(), (6, 2));
+        l.append(&[tool_use("t5", "write", json!({"path": "/elsewhere/x.txt", "content": "1\n2\n3"})), result("t5", OK)]);
+        assert_eq!(l.files()[1], FileStat { path: "/elsewhere/x.txt".into(), kind: FileKind::Written, added: 0, removed: 0, written: 3 });
+        // A write is not a delta: not in the totals.
+        assert_eq!(l.totals(), (3, 2));
         // A replacement starts over.
-        l.reset(&[], None);
+        l.reset(&[], None, true);
         assert!(l.files().is_empty());
         assert_eq!(l.totals(), (0, 0));
+    }
+
+    /// The daemon's own failure texts (no `is_error`): a denied, failed or
+    /// canceled edit changes nothing.
+    #[test]
+    fn denied_failed_and_canceled_edits_change_nothing() {
+        let edit = |id: &str| tool_use(id, "edit", json!({"path": "/w/a.rs", "old_string": "a", "new_string": "b\nc"}));
+        let mut l = Ledger::default();
+        l.reset(
+            &[
+                edit("d"),
+                result("d", DENIED),
+                edit("f"),
+                result("f", FAILED),
+                edit("c"),
+                result("c", "Canceled by user"),
+                edit("p"),
+                result("p", "[partial]\n\n[Canceled by user before the tool finished; the output above is partial.]"),
+                edit("g"),
+                result("g", "Tool call denied: tool is not activated for this session: edit"),
+            ],
+            None,
+            false,
+        );
+        assert!(l.files().is_empty(), "{:?}", l.files());
+        assert_eq!(l.totals(), (0, 0));
+        assert!(l.preview("d").is_some(), "the row still shows what was asked");
+        // The live path: the `ToolUse` event, then the history with the denial.
+        l.tool_use("edit", "live", &json!({"path": "/w/b.rs", "old_string": "x", "new_string": "y"}));
+        l.append(&[edit("live"), result("live", DENIED)]);
+        assert!(l.files().is_empty());
+        l.append(&[edit("ok"), result("ok", OK)]);
+        assert_eq!(l.files().len(), 1);
+    }
+
+    #[test]
+    fn a_resync_of_the_same_session_reuses_the_analysis() {
+        let msgs = [tool_use("t", "edit", json!({"path": "a", "old_string": "1", "new_string": "2"})), result("t", OK)];
+        let mut l = Ledger::default();
+        l.reset(&msgs, None, false);
+        let first = l.preview("t").unwrap();
+        l.reset(&msgs, None, true);
+        assert!(Arc::ptr_eq(&first, &l.preview("t").unwrap()));
+        assert_eq!(l.totals(), (1, 1));
+        l.reset(&msgs, None, false);
+        assert!(!Arc::ptr_eq(&first, &l.preview("t").unwrap()), "another session starts afresh");
     }
 
     #[test]
@@ -417,15 +511,20 @@ mod tests {
             {"path": "a.md", "op": "replace", "anchor": "one", "text": "uno"},
             {"path": "a.md", "op": "append", "text": "tail\nmore"},
             {"path": "b.jsonl", "op": "append_jsonl", "value": {"k": 1}},
+            {"path": "c.rs", "op": "replace", "anchor_mode": "line_regex", "anchor": "^fn (old)", "text": "new"},
         ]});
         let mut l = Ledger::default();
-        l.append(&[tool_use("m", "multi_edit", input), result("m", false)]);
+        l.append(&[tool_use("m", "multi_edit", input), result("m", OK)]);
         let f = l.files();
         assert_eq!((f[0].path.as_str(), f[0].added, f[0].removed), ("a.md", 3, 1));
         assert_eq!((f[1].path.as_str(), f[1].added, f[1].removed), ("b.jsonl", 1, 0));
+        // A regex anchor is a pattern, not a removed line.
+        assert_eq!((f[2].path.as_str(), f[2].added, f[2].removed), ("c.rs", 1, 0));
         let p = l.preview("m").unwrap();
-        assert_eq!(p.lines.iter().filter(|l| l.kind == LineKind::Note).count(), 2);
-        assert_eq!(p.title, "a.md +1 files");
+        let notes: Vec<&str> = p.lines.iter().filter(|l| l.kind == LineKind::Note).map(|l| &*l.text).collect();
+        assert_eq!(notes, ["a.md", "b.jsonl", "c.rs", "line_regex: ^fn (old)"]);
+        assert!(!p.lines.iter().any(|l| l.kind == LineKind::Del && l.text.contains("fn")));
+        assert_eq!(p.title, "a.md +2 files");
     }
 
     #[test]

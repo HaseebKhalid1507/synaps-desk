@@ -5,7 +5,7 @@
 //! number from the daemon ([`crate::stats`]).
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
@@ -40,6 +40,59 @@ pub(crate) struct RowCache {
 
 /// Result lines an open tool row shows.
 const RESULT_LINES: usize = 12;
+/// The authorization card ignores clicks this long after it appears (the
+/// TUI's `CONFIRM_ARM_DELAY` is 400 ms): it pushes the list up, so a click
+/// meant for a row can land on it.
+pub(crate) const ARM: Duration = Duration::from_millis(500);
+/// The prompt well: line height and the height it scrolls past.
+const WELL_LINE: f32 = 18.;
+const WELL_MAX: f32 = 18. * 12.;
+
+/// The prompt the authorization card shows.
+pub(crate) struct PromptCard {
+    /// `(attach_seq, prompt id)`.
+    pub(crate) key: (u64, u64),
+    shown: Instant,
+    /// The body, verbatim (blank lines kept).
+    body: SharedString,
+    scroll: ScrollHandle,
+    /// The well was scrolled to its end (or never needed to be).
+    read: bool,
+    /// Repaints once the arm delay is over.
+    _arm: Task<()>,
+}
+
+impl PromptCard {
+    fn armed(&self) -> bool {
+        self.shown.elapsed() >= ARM
+    }
+
+    /// The well's overflow below the view, once it has been laid out.
+    fn below(&self) -> Option<f32> {
+        if self.scroll.bounds().size.height <= px(0.) {
+            return None;
+        }
+        Some(f32::from(self.scroll.max_offset().y + self.scroll.offset().y).max(0.))
+    }
+}
+
+/// AUTHORIZE may act: armed, and the whole body was on screen (it fits, or
+/// was scrolled to its end). `below`: the well's hidden height, `None`
+/// before its first layout.
+pub(crate) fn authorize_ready(armed: bool, below: Option<f32>, read: bool) -> bool {
+    armed && below.is_some_and(|b| b <= 1. || read)
+}
+
+/// Lines of the well still below its view.
+pub(crate) fn lines_below(below: f32) -> usize {
+    (below / WELL_LINE).ceil() as usize
+}
+
+/// What the well shows of a prompt: all of it, as sent (blank lines and
+/// indentation kept; long lines wrap, nothing is cut).
+pub(crate) fn well_body(prompt: &str) -> SharedString {
+    SharedString::from(prompt)
+}
 
 pub struct AppView {
     pub client: Option<Client>,
@@ -62,8 +115,16 @@ pub struct AppView {
     pub(crate) filter: Filter,
     pub picker_open: bool,
     pub(crate) picker_note: Option<SharedString>,
-    /// Prompts answered here, not yet resolved by the daemon.
-    answered: HashSet<u64>,
+    /// When a click outside closed the picker: that click must not reopen
+    /// it on its trigger.
+    pub(crate) picker_dismissed: Option<Instant>,
+    /// Where the launch accent came from (a flag or env wins over the picker's file).
+    pub accent_source: theme::Source,
+    /// The authorization card's prompt (see [`PromptCard`]).
+    card: Option<PromptCard>,
+    /// The running dot's step, and the 2 Hz timer while a turn runs.
+    pub(crate) rail: crate::chrome::RailCache,
+    focus: FocusHandle,
     /// Refused input to put back in the composer (needs a `Window`: done
     /// at the next frame).
     restore: Option<String>,
@@ -158,7 +219,9 @@ impl AppView {
                 }
             }),
         ];
-        let inputs = Inputs { composer, open_input, name_input, hex_input, secret_input };
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        let inputs = Inputs { composer, open_input, name_input, hex_input, secret_input, focus };
         let mut v = match (client, synthetic) {
             (Some((c, rx)), _) => {
                 let mut v = Self::blank(inputs, Some(c), ConnState::Connecting, subs);
@@ -201,7 +264,11 @@ impl AppView {
             filter: Filter::All,
             picker_open: false,
             picker_note: None,
-            answered: HashSet::new(),
+            picker_dismissed: None,
+            accent_source: theme::Source::Default,
+            card: None,
+            rail: Default::default(),
+            focus: i.focus,
             restore: None,
             bench: None,
             plain_rows: false,
@@ -231,8 +298,6 @@ impl AppView {
                             this.effect(fx);
                         }
                     }
-                    let pending = this.model.transcript.pending_prompts();
-                    this.answered.retain(|id| pending.iter().any(|p| p.id == *id));
                     if matches!(this.model.conn, ConnState::Connected(_))
                         && let Some(id) = this.start_session.take()
                     {
@@ -277,8 +342,9 @@ impl AppView {
                 }
             }
             Effect::Attach { session_id, fallback, open } => {
-                if let Some(seq) = self.client.as_ref().and_then(|c| c.attach(session_id, AttachMode::Mirror).ok()) {
+                if let Some(seq) = self.client.as_ref().and_then(|c| c.attach(session_id.clone(), AttachMode::Mirror).ok()) {
                     self.model.attaching(seq, fallback, open);
+                    self.model.asked_for(&session_id);
                     self.list.set_follow_mode(FollowMode::Tail);
                 } else if self.synthetic {
                     self.model.last_error = Some("offline: the synthetic transport holds one session".into());
@@ -321,13 +387,17 @@ impl AppView {
         }
     }
 
+    /// Attach to a live session, unless it is the one asked for last
+    /// (attached, or on its way): click B then A again before B lands, and
+    /// A is asked for again.
     pub(crate) fn attach(&mut self, session_id: String) {
-        if self.model.is_active(&session_id) {
+        if self.model.is_wanted(&session_id) {
             return;
         }
-        match self.client.as_ref().and_then(|c| c.attach(session_id, AttachMode::Mirror).ok()) {
+        match self.client.as_ref().and_then(|c| c.attach(session_id.clone(), AttachMode::Mirror).ok()) {
             Some(seq) => {
                 self.model.want(seq);
+                self.model.asked_for(&session_id);
                 self.list.set_follow_mode(FollowMode::Tail);
             }
             None if self.synthetic => self.model.last_error = Some("offline: the synthetic transport holds one session".into()),
@@ -350,7 +420,9 @@ impl AppView {
             return false;
         };
         if !self.model.can_send() {
-            self.model.last_error = Some(if self.model.active.is_some() {
+            self.model.last_error = Some(if self.model.switching() {
+                "switching sessions: not sent".into()
+            } else if self.model.active.is_some() {
                 "this session is read-only here (observing or reconnecting)".into()
             } else {
                 "not attached to a session".into()
@@ -372,35 +444,90 @@ impl AppView {
         self.client.is_some() && self.model.can_send()
     }
 
-    /// Answer a pending prompt (`Client::answer`). A confirm takes `y` / `n`
-    /// (the daemon's own spelling); a secret its text, or nothing to cancel.
-    fn answer(&mut self, prompt_id: u64, value: Option<String>) {
-        let sent = match &self.client {
-            Some(c) if self.model.can_send() => c.answer(prompt_id, value).map_err(|_| "the connection thread has stopped".to_string()),
-            Some(_) => Err("this session is read-only here (observing or reconnecting)".into()),
-            None => Err("offline: there is no daemon to answer".into()),
+    /// The prompt the card shows, if it is still the attached session's and
+    /// armed: what a click or Enter on the card answers.
+    fn card_target(&self) -> Option<u64> {
+        let c = self.card.as_ref().filter(|c| c.armed())?;
+        (self.model.active.as_ref()?.attach_seq == c.key.0).then_some(c.key.1)
+    }
+
+    /// Answer the card's prompt (`Client::answer`), if it is the one shown
+    /// (`key`) and the model allows it (attached, no switch under way, not
+    /// answered yet). A confirm takes `y` / `n` (the daemon's own spelling);
+    /// a secret its text, or nothing to cancel.
+    fn answer(&mut self, key: (u64, u64), value: Option<String>) -> bool {
+        let Some(c) = &self.client else {
+            self.model.last_error = Some("offline: there is no daemon to answer".into());
+            return false;
         };
-        match sent {
+        if self.card.as_ref().map(|c| c.key) != Some(key) || self.card_target() != Some(key.1) || !self.model.may_answer(key.1) {
+            return false;
+        }
+        match c.answer(key.1, value) {
             Ok(()) => {
-                self.answered.insert(prompt_id);
+                self.model.answer_sent(key.1);
+                true
             }
-            Err(e) => self.model.last_error = Some(e),
+            Err(_) => {
+                self.model.last_error = Some("the connection thread has stopped".into());
+                false
+            }
         }
     }
 
+    /// AUTHORIZE: only once the whole body has been on screen.
+    fn authorize(&mut self, key: (u64, u64)) {
+        let ready = self.card.as_ref().is_some_and(|c| c.key == key && authorize_ready(c.armed(), c.below(), c.read));
+        if ready {
+            self.answer(key, Some(CONFIRM_YES.into()));
+        }
+    }
+
+    /// A secret prompt's answer (`submit`) or cancel, for the prompt the
+    /// card shows; the field is cleared only when it went out.
     fn answer_secret(&mut self, submit: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.model.transcript.pending_prompts().first().map(|p| p.id) else { return };
+        let Some(key) = self.card.as_ref().map(|c| c.key) else { return };
         let value = submit.then(|| self.secret_input.read(cx).value().to_string());
-        self.answer(id, value);
-        self.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
+        if self.answer(key, value) {
+            self.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
         cx.notify();
+    }
+
+    /// Keep the card's state with the prompt it shows: a new prompt (or the
+    /// same id in another attachment) starts unarmed and unread, and clears
+    /// a half-typed secret meant for the previous one.
+    fn sync_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.model.active.as_ref().zip(self.model.transcript.pending_prompts().first()).map(|(a, p)| (a.attach_seq, p.id));
+        match (key, self.card.as_mut()) {
+            (Some(k), Some(c)) if c.key == k => {
+                if c.below().is_some_and(|b| b <= 1.) {
+                    c.read = true;
+                }
+            }
+            (Some(k), _) => {
+                let body = well_body(&self.model.transcript.pending_prompts()[0].prompt);
+                let arm = cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(ARM).await;
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                });
+                self.card = Some(PromptCard { key: k, shown: Instant::now(), body, scroll: ScrollHandle::new(), read: false, _arm: arm });
+                self.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
+            }
+            (None, _) => self.card = None,
+        }
     }
 
     pub(crate) fn set_accent(&mut self, hex: u32, cx: &mut Context<Self>) {
         theme::apply(hex, cx);
+        let overridden = match self.accent_source {
+            theme::Source::Flag => " (the next launch's --accent wins over it)".to_string(),
+            theme::Source::Env => format!(" (${} wins over it at the next launch)", theme::ENV_ACCENT),
+            _ => String::new(),
+        };
         self.picker_note = Some(match theme::settings_path() {
             Some(path) => match theme::save_accent(&path, hex) {
-                Ok(()) => format!("saved to {}", path.display()).into(),
+                Ok(()) => format!("saved to {}{overridden}", path.display()).into(),
                 Err(e) => format!("not saved: {e}").into(),
             },
             None => "not saved: no config folder".into(),
@@ -431,9 +558,16 @@ impl AppView {
         self.list.splice(sp.start..sp.old_len, sp.new_len - sp.start);
     }
 
-    /// Open by default: a file tool's diff when it is short.
+    /// Open by default: a file tool's diff when it is short, unless the
+    /// call failed, was denied or canceled (nothing changed).
     fn is_open(&self, item: &Item, row: &RowCache) -> bool {
-        let default = item.kind == ItemKind::Tool && row.preview.as_ref().is_some_and(|p| p.lines.len() <= 24 && !p.lines.is_empty());
+        let failed = item
+            .tool
+            .as_ref()
+            .and_then(|t| t.status)
+            .is_some_and(|s| matches!(s, ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Cancelled));
+        let default =
+            item.kind == ItemKind::Tool && !failed && row.preview.as_ref().is_some_and(|p| p.lines.len() <= 24 && !p.lines.is_empty());
         default ^ self.toggled.contains(&item.id)
     }
 
@@ -501,7 +635,12 @@ impl AppView {
                     .child(self.row_header(id, open && has_body, row.name.clone(), p.ink2, row.arg.clone(), Some(state), &p, cx))
                     .when(open && has_body, |d| match &row.preview {
                         Some(pv) => d.child(diff_block(pv, &p)),
-                        None => d.child(result_block(&row.result, row.result_more, status == Some(ToolStatus::Failed), &p)),
+                        None => d.child(result_block(
+                            &row.result,
+                            row.result_more,
+                            matches!(status, Some(ToolStatus::Failed | ToolStatus::Denied)),
+                            &p,
+                        )),
                     })
                     .into_any_element()
             }
@@ -517,29 +656,22 @@ impl AppView {
         div().w_full().pl(px(36.)).pr(px(40.)).py(px(1.)).child(div().w_full().max_w(px(836.)).child(body)).into_any_element()
     }
 
-    /// A tool's status cell: a check, a cross, or (only while a turn runs
-    /// and is not waiting on the user) a pulsing dot.
+    /// A tool's status cell: a check, a cross (failed, denied), or, while
+    /// it runs, a static dot. Nothing animates: a blink would repaint the
+    /// whole window per step for the length of every tool run (a 2 Hz step
+    /// measured 1.2 % CPU during a running tool against 0.56 % without).
     fn tool_state(&self, status: Option<ToolStatus>, p: &Palette) -> AnyElement {
         match status {
             Some(ToolStatus::Done) => mono("✓", 11., p.ink4).into_any_element(),
             Some(ToolStatus::Failed) => mono("× failed", 10.5, p.hi).into_any_element(),
+            Some(ToolStatus::Denied) => mono("× denied", 10.5, p.hi).into_any_element(),
             Some(ToolStatus::Cancelled) => mono("cancelled", 10.5, p.ink4).into_any_element(),
             Some(ToolStatus::Queued) => mono("queued", 10.5, p.ink4).into_any_element(),
             _ => {
                 let live = self.model.transcript.busy() && self.model.transcript.pending_prompts().is_empty();
-                let dot = div().size(px(6.)).bg(p.ink2);
                 h_flex()
                     .gap(px(6.))
-                    .child(if live {
-                        dot.with_animation(
-                            "tool-running",
-                            Animation::new(Duration::from_millis(900)).repeat().with_easing(pulsating_between(0.25, 1.0)),
-                            |d, t| d.opacity(t),
-                        )
-                        .into_any_element()
-                    } else {
-                        dot.into_any_element()
-                    })
+                    .child(div().size(px(6.)).bg(if live { p.ink2 } else { p.ink4 }))
                     .child(mono(if live { "running" } else { "waiting" }, 10.5, p.ink2))
                     .into_any_element()
             }
@@ -568,7 +700,16 @@ impl AppView {
             .cursor_pointer()
             .hover(|d| d.bg(p.bg2))
             .child(mono(if open { "−" } else { "+" }, 11., p.ink4).w(px(10.)).flex_none())
-            .child(display(name, 10.5, name_color).w(px(76.)).flex_none().overflow_hidden())
+            // Short names line up at 76 px; `search_tools` / `activate_tools` fit whole.
+            .child(
+                display(name, 10.5, name_color)
+                    .min_w(px(76.))
+                    .max_w(px(170.))
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis(),
+            )
             .child(mono(arg, 11.5, p.ink3).flex_1().min_w_0().overflow_hidden().text_ellipsis())
             .children(state)
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -577,7 +718,8 @@ impl AppView {
             }))
     }
 
-    /// The center column's header: title, model · effort, folder.
+    /// The center column's header: title, model · effort, folder, and the
+    /// actions (NAME, HALT) top-aligned on the right.
     fn render_header(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let attached = self.model.active.is_some() && (self.client.is_some() || self.synthetic);
         let title: SharedString = self.model.transcript.title().or(self.model.active_name()).unwrap_or("No session").to_string().into();
@@ -589,51 +731,67 @@ impl AppView {
             .collect();
         let cwd = self.model.stats.cwd.as_deref().or(self.model.active_meta().and_then(|s| s.cwd.as_deref())).map(home_short);
         let busy = self.model.transcript.busy() && self.drives();
-        v_flex()
+        let detached = self.model.active.is_none() && self.model.stats.detached;
+        // The display face is Latin only: other scripts read better in the text face.
+        let face = if title.chars().all(|c| (c as u32) < 0x250) { fonts::DISPLAY } else { fonts::SANS };
+        let actions = h_flex()
             .flex_none()
+            .gap(px(22.))
+            .pt(px(6.))
+            .when(attached, |d| {
+                d.child(tbtn("name-session", label::NAME, p.ink3, p.ink).on_click(cx.listener(|this, _, window, cx| {
+                    this.model.toggle_naming();
+                    if this.model.named.naming {
+                        let current = this.model.active_name().unwrap_or_default().to_string();
+                        this.name_input.update(cx, |s, cx| {
+                            s.set_value(current, window, cx);
+                            s.focus(window, cx);
+                        });
+                    }
+                    cx.notify();
+                })))
+            })
+            .when(busy, |d| {
+                d.child(tbtn("halt", label::HALT, p.ink3, p.hi).on_click(cx.listener(|this, _, _, _| {
+                    if let Some(c) = &this.client
+                        && this.model.can_send()
+                    {
+                        let _ = c.abort();
+                    }
+                })))
+            });
+        let left = v_flex()
+            .flex_1()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .items_end()
+                    .gap(px(16.))
+                    .child(display(title, 23., p.ink).font_family(face).min_w_0().overflow_hidden().text_ellipsis())
+                    .when_some(self.model.active_name(), |d, n| d.child(mono(n.to_string(), 10.5, p.ink3).flex_none().pb(px(4.)))),
+            )
+            .when(!meta.is_empty() || cwd.is_some() || detached, |d| {
+                d.child(
+                    h_flex()
+                        .mt(px(8.))
+                        .gap(px(24.))
+                        .when(detached, |d| d.child(display("D E T A C H E D", 10., p.hi)))
+                        .when(!meta.is_empty(), |d| d.child(mono(meta.join("  ·  "), 10.5, p.ink3)))
+                        .when_some(cwd, |d, c| d.child(mono(c, 10.5, p.ink4).overflow_hidden().text_ellipsis())),
+                )
+            });
+        h_flex()
+            .flex_none()
+            .items_start()
+            .gap(px(20.))
             .pt(px(22.))
             .pb(px(18.))
             .pl(px(36.))
             .pr(px(30.))
             .border_b_1()
             .border_color(p.line)
-            .child(
-                h_flex()
-                    .items_baseline()
-                    .gap(px(20.))
-                    .child(display(title, 23., p.ink).min_w_0().overflow_hidden().text_ellipsis())
-                    .when_some(self.model.active_name(), |d, n| d.child(mono(n.to_string(), 10.5, p.ink3)))
-                    .child(div().flex_1())
-                    .when(attached, |d| {
-                        d.child(tbtn("name-session", label::NAME, p.ink3, p.ink).on_click(cx.listener(|this, _, window, cx| {
-                            this.model.toggle_naming();
-                            if this.model.named.naming {
-                                let current = this.model.active_name().unwrap_or_default().to_string();
-                                this.name_input.update(cx, |s, cx| {
-                                    s.set_value(current, window, cx);
-                                    s.focus(window, cx);
-                                });
-                            }
-                            cx.notify();
-                        })))
-                    })
-                    .when(busy, |d| {
-                        d.child(tbtn("halt", label::HALT, p.ink3, p.hi).on_click(cx.listener(|this, _, _, _| {
-                            if let Some(c) = &this.client {
-                                let _ = c.abort();
-                            }
-                        })))
-                    }),
-            )
-            .when(!meta.is_empty() || cwd.is_some(), |d| {
-                d.child(
-                    h_flex()
-                        .mt(px(8.))
-                        .gap(px(24.))
-                        .when(!meta.is_empty(), |d| d.child(mono(meta.join("  ·  "), 10.5, p.ink3)))
-                        .when_some(cwd, |d, c| d.child(mono(c, 10.5, p.ink4).overflow_hidden().text_ellipsis())),
-                )
-            })
+            .child(left)
+            .child(actions)
     }
 
     /// The "Name this session…" row under the header.
@@ -678,56 +836,94 @@ impl AppView {
     }
 
     /// The authorization card: the first pending prompt, answered through
-    /// `Client::answer`.
+    /// `Client::answer`. The body is shown whole and verbatim in a scrolling
+    /// well; AUTHORIZE waits until all of it has been on screen and the
+    /// card is armed ([`ARM`]).
     fn render_prompt(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
         let prompts = self.model.transcript.pending_prompts();
         let pr = prompts.first()?;
         let secret = pr.is_secret();
-        let sent = self.answered.contains(&pr.id);
-        let can = self.drives() && !sent;
-        let id = pr.id;
+        let card = self.card.as_ref().filter(|c| c.key.1 == pr.id);
+        let key = card.map(|c| c.key);
+        let sent = self.model.prompt_answered(pr.id);
+        let armed = card.is_some_and(|c| c.armed());
+        let can = self.drives() && self.model.may_answer(pr.id) && armed;
+        let below = card.and_then(|c| c.below());
+        let ready = card.is_some_and(|c| authorize_ready(c.armed(), c.below(), c.read));
         let (head, kind) = if secret { (label::SECRET, "S E C R E T") } else { (label::AUTHORIZATION, "C O N F I R M") };
         let lead: SharedString = pr.title.clone().into();
-        let text: SharedString = pr.prompt.lines().filter(|l| !l.trim().is_empty()).take(12).collect::<Vec<_>>().join("\n").into();
-        let actions = if secret {
-            h_flex()
-                .gap(px(22.))
-                .items_center()
-                .child(div().w(px(260.)).child(Input::new(&self.secret_input).disabled(!can)))
-                .child(
-                    gbtn("p-submit", label::SUBMIT, can, p)
-                        .on_click(cx.listener(|this, _, window, cx| this.answer_secret(true, window, cx))),
-                )
-                .child(
-                    tbtn("p-cancel", label::CANCEL, if can { p.hi } else { p.ink4 }, p.ink)
-                        .on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx))),
-                )
+        let detached = self.model.active.is_none();
+        let actions = if detached {
+            None
+        } else if secret {
+            Some(
+                h_flex()
+                    .gap(px(22.))
+                    .items_center()
+                    .child(div().w(px(260.)).child(Input::new(&self.secret_input).disabled(!can)))
+                    .child(
+                        gbtn("p-submit", label::SUBMIT, can, p)
+                            .when(can, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(true, window, cx)))),
+                    )
+                    .child(
+                        tbtn("p-cancel", label::CANCEL, if can { p.hi } else { p.ink4 }, if can { p.ink } else { p.ink4 })
+                            .when(can, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx)))),
+                    ),
+            )
         } else {
-            h_flex()
-                .gap(px(22.))
-                .items_center()
-                .child(gbtn("p-yes", label::AUTHORIZE, can, p).on_click(cx.listener(move |this, _, _, cx| {
-                    if this.drives() {
-                        this.answer(id, Some(CONFIRM_YES.into()));
-                    }
-                    cx.notify();
-                })))
-                .child(tbtn("p-no", label::DENY, if can { p.hi } else { p.ink4 }, p.ink).on_click(cx.listener(move |this, _, _, cx| {
-                    if this.drives() {
-                        this.answer(id, Some(CONFIRM_NO.into()));
-                    }
-                    cx.notify();
-                })))
+            let yes = can && ready;
+            Some(
+                h_flex()
+                    .gap(px(22.))
+                    .items_center()
+                    .child(gbtn("p-yes", label::AUTHORIZE, yes, p).when_some(key.filter(|_| yes), |d, key| {
+                        d.on_click(cx.listener(move |this, _, _, cx| {
+                            this.authorize(key);
+                            cx.notify();
+                        }))
+                    }))
+                    .child(tbtn("p-no", label::DENY, if can { p.hi } else { p.ink4 }, if can { p.ink } else { p.ink4 }).when_some(
+                        key.filter(|_| can),
+                        |d, key| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                this.answer(key, Some(CONFIRM_NO.into()));
+                                cx.notify();
+                            }))
+                        },
+                    )),
+            )
         };
-        let footer: Option<SharedString> = if sent {
+        let more = below.filter(|&b| b > 1.).map(lines_below).filter(|_| !card.is_some_and(|c| c.read));
+        let footer: Option<SharedString> = if detached {
+            Some("detached: cannot answer".into())
+        } else if sent {
             Some("answer sent, waiting for the daemon".into())
+        } else if self.model.switching() {
+            Some("switching sessions…".into())
         } else if !self.drives() {
             Some(if self.client.is_none() { "offline: nothing to answer" } else { "read-only here" }.into())
+        } else if !secret && let Some(n) = more {
+            Some(format!("↓ {n} more lines: scroll to the end to authorize").into())
         } else if prompts.len() > 1 {
             Some(format!("+{} more waiting", prompts.len() - 1).into())
         } else {
             None
         };
+        let body = card.map(|c| c.body.clone()).unwrap_or_else(|| pr.prompt.clone().into());
+        let well = div()
+            .id("prompt-well")
+            .mt(px(10.))
+            .max_h(px(WELL_MAX + 22.))
+            .overflow_y_scroll()
+            .when_some(card, |d, c| d.track_scroll(&c.scroll))
+            .px(px(14.))
+            .py(px(11.))
+            .bg(p.well)
+            .font_family(fonts::MONO)
+            .text_size(px(12.5))
+            .line_height(px(WELL_LINE))
+            .text_color(p.ink)
+            .child(body);
         Some(
             div().pl(px(36.)).pr(px(30.)).pt(px(8.)).pb(px(4.)).child(
                 v_flex()
@@ -747,26 +943,14 @@ impl AppView {
                             .child(display(kind, 9.5, p.ink4)),
                     )
                     .when(!lead.is_empty(), |d| d.child(div().mt(px(10.)).text_size(px(13.)).text_color(p.ink2).child(lead)))
-                    .when(!text.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .mt(px(10.))
-                                .px(px(14.))
-                                .py(px(11.))
-                                .bg(p.well)
-                                .font_family(fonts::MONO)
-                                .text_size(px(12.5))
-                                .text_color(p.ink)
-                                .child(text),
-                        )
-                    })
+                    .when(!pr.prompt.is_empty(), |d| d.child(well))
                     .child(
                         h_flex()
                             .mt(px(16.))
                             .items_center()
-                            .child(actions)
+                            .children(actions)
                             .child(div().flex_1())
-                            .when_some(footer, |d, f| d.child(mono(f, 10., p.ink4))),
+                            .when_some(footer, |d, f| d.child(mono(f, 10., if more.is_some() && !sent { p.hi } else { p.ink4 }))),
                     ),
             ),
         )
@@ -792,6 +976,8 @@ impl AppView {
                         .child(mono(
                             if self.client.is_none() {
                                 "offline: no daemon to send to"
+                            } else if self.model.switching() {
+                                "switching sessions…"
                             } else if !can_send {
                                 "not attached"
                             } else if busy {
@@ -839,6 +1025,7 @@ pub(crate) fn gbtn(id: &'static str, text: &'static str, enabled: bool, p: &Pale
 }
 
 fn diff_block(pv: &Preview, p: &Palette) -> impl IntoElement {
+    // `SharedString` from the line's `Arc<str>`: no copy per frame.
     let mut col =
         v_flex().ml(px(24.)).mb(px(10.)).py(px(2.)).border_l_1().border_color(p.line3).font_family(fonts::MONO).text_size(px(11.5));
     for l in &pv.lines {
@@ -854,9 +1041,7 @@ fn diff_block(pv: &Preview, p: &Palette) -> impl IntoElement {
                 .h(px(18.))
                 .when_some(bg, |d, bg| d.bg(bg))
                 .child(div().w(px(14.)).flex_none().text_color(if l.kind == LineKind::Del { p.hi } else { p.ink4 }).child(sign))
-                .child(
-                    div().text_color(fg).whitespace_nowrap().overflow_hidden().text_ellipsis().child(SharedString::from(l.text.clone())),
-                ),
+                .child(div().text_color(fg).whitespace_nowrap().overflow_hidden().text_ellipsis().child(SharedString::from(&l.text))),
         );
     }
     if pv.more > 0 {
@@ -927,7 +1112,8 @@ fn tracked(name: &str) -> String {
 
 /// `/home/me/x` → `~/x` when it is this machine's home.
 pub(crate) fn home_short(path: &str) -> String {
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+    static HOME: OnceLock<String> = OnceLock::new();
+    let home = HOME.get_or_init(|| std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default());
     match path.strip_prefix(home.as_str()) {
         Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with(['/', '\\'])) => format!("~{rest}"),
         _ => path.to_string(),
@@ -950,6 +1136,7 @@ struct Inputs {
     name_input: Entity<InputState>,
     hex_input: Entity<InputState>,
     secret_input: Entity<InputState>,
+    focus: FocusHandle,
 }
 
 impl Render for AppView {
@@ -969,6 +1156,9 @@ impl Render for AppView {
             self.open_shown = false;
         }
         self.sync_list();
+        self.sync_card(window, cx);
+        let rail = std::mem::take(&mut self.rail);
+        self.rail = rail.refreshed(&self.model);
         if let Some(b) = self.bench.as_mut() {
             b.on_render(&self.list, window);
         }
@@ -990,6 +1180,16 @@ impl Render for AppView {
             })
             .child(self.render_composer(&p, cx));
         h_flex()
+            .id("root")
+            .track_focus(&self.focus)
+            // Esc closes the picker, wherever the focus is.
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if this.picker_open && ev.keystroke.key == "escape" {
+                    this.picker_open = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .relative()
             .size_full()
             .bg(p.bg)
@@ -1007,14 +1207,35 @@ impl Render for AppView {
                         .when(show_right, |d| d.child(self.render_right(&p))),
                 ),
             )
-            .when(self.picker_open, |d| d.child(deferred(self.render_picker(&p, cx)).with_priority(1)))
+            .when(self.picker_open, |d| d.child(deferred(self.render_picker(&p, show_rail, show_right, cx)).with_priority(1)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings in gpui's `test` attribute through `gpui_kit::*`.
-    use super::{one_line, tracked};
+    use super::{WELL_LINE, authorize_ready, lines_below, one_line, tracked, well_body};
+
+    /// H3: the card shows a long prompt whole, and AUTHORIZE waits until
+    /// all of it has been on screen.
+    #[test]
+    fn a_long_prompt_is_shown_whole_and_must_be_read() {
+        let mut lines: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
+        lines[13] = "  rm -rf ~/work   # line 14, indented".into();
+        lines[20] = String::new();
+        let prompt = lines.join("\n");
+        let body = well_body(&prompt);
+        assert_eq!(body.lines().count(), 30, "every line, the blank one too");
+        assert_eq!(&*body, prompt.as_str(), "verbatim");
+        // 30 lines in a 12-line well: 18 below at first.
+        let below = 18. * WELL_LINE;
+        assert_eq!(lines_below(below), 18);
+        assert!(!authorize_ready(true, Some(below), false), "not read");
+        assert!(!authorize_ready(true, None, false), "not laid out yet");
+        assert!(!authorize_ready(false, Some(0.), true), "not armed");
+        assert!(authorize_ready(true, Some(below), true), "scrolled to the end once");
+        assert!(authorize_ready(true, Some(0.), false), "fits: nothing to scroll");
+    }
 
     #[test]
     fn tracked_names_and_paths() {

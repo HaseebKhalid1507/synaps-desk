@@ -9,7 +9,7 @@
 #
 #   Hybrid Display   <- Rajdhani SemiBold        (Indian Type Foundry, OFL)   Latin
 #   Hybrid Sans      <- IBM Plex Sans Regular/SemiBold (IBM, OFL, RFN Plex)   Latin
-#   Hybrid Mono      <- IBM Plex Mono Regular    (IBM, OFL, RFN Plex)         Latin
+#   Hybrid Mono      <- IBM Plex Mono Regular    (IBM, OFL, RFN Plex)         Latin + box drawing, block elements
 #   Hybrid Labels JP <- IBM Plex Sans JP Regular (IBM, OFL, RFN Plex)         ONLY the label glyphs below
 #
 # Keep JP_LABELS in step with `fonts::JP_LABELS` (a unit test checks every one
@@ -20,6 +20,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 JP_LABELS="セッション文脈トークン変更荒坂"
 LATIN="U+0020-007E,U+00A0-017F,U+0192,U+02C6-02DC,U+2000-206F,U+20AC,U+2122,U+2190-2193,U+2212,U+2713"
+# Tool output (`tree`, tables, progress bars) keeps its columns in the mono face.
+MONO="$LATIN,U+2500-259F"
 DISPLAY="U+0020-007E,U+00A0-00FF,U+2013-2014,U+2018-201D,U+2022,U+2026,U+20AC,U+2212"
 gf=https://raw.githubusercontent.com/google/fonts/main/ofl
 plex=https://raw.githubusercontent.com/IBM/plex/master/packages/plex-sans/fonts/complete/ttf
@@ -33,7 +35,7 @@ sub() { pyftsubset "$tmp/$1" "$2" --name-IDs='*' --no-hinting --output-file="$tm
 sub Rajdhani-SemiBold.ttf --unicodes="$DISPLAY" HybridDisplay-SemiBold.ttf
 sub IBMPlexSans-Regular.ttf --unicodes="$LATIN" HybridSans-Regular.ttf
 sub IBMPlexSans-SemiBold.ttf --unicodes="$LATIN" HybridSans-SemiBold.ttf
-sub IBMPlexMono-Regular.ttf --unicodes="$LATIN" HybridMono-Regular.ttf
+sub IBMPlexMono-Regular.ttf --unicodes="$MONO" HybridMono-Regular.ttf
 sub IBMPlexSansJP-Regular.ttf --text="$JP_LABELS" HybridLabelsJP-Regular.ttf
 python3 - "$tmp" "$here" <<'PY'
 import sys

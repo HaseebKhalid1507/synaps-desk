@@ -63,6 +63,8 @@ pub mod label {
     pub const IN: &str = "I N";
     pub const OUT: &str = "O U T";
     pub const CACHE: &str = "C A C H E";
+    /// Cache writes (`cache_creation`).
+    pub const WRITE: &str = "W R I T E";
     pub const CACHE_HIT: &str = "C A C H E   H I T";
     pub const COST: &str = "C O S T";
     pub const WINDOW: &str = "W I N D O W";
@@ -160,9 +162,15 @@ mod tests {
             }
         }
         for font in &FILES[1..4] {
-            for c in ['→', '✓', '×', '−'] {
+            for c in ['→', '↓', '✓', '×', '−'] {
                 assert!(has_glyph(font, c as u32), "{c}");
             }
+        }
+        // Tool output keeps its columns: box drawing and block elements in mono.
+        let mono = FILES[3];
+        for c in ['─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '═', '║', '╭', '╰', '█', '▌', '░', '▒', '▓']
+        {
+            assert!(has_glyph(mono, c as u32), "mono: {c}");
         }
         let total: usize = FILES.iter().map(|f| f.len()).sum();
         assert!(total < 200 * 1024, "{total} bytes embedded");

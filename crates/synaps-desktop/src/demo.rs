@@ -101,7 +101,7 @@ fn messages() -> Vec<Value> {
             {"type": "tool_use", "id": "toolu_d4", "name": "write", "input": {"path": p("crates/relay/tests/refresh_race.rs"), "content": TEST}}]}),
         json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d4", "content": "Wrote crates/relay/tests/refresh_race.rs"}]}),
         json!({"role": "assistant", "content": [
-            {"type": "text", "text": "Fix is in. The retry band-aid in `Session` is gone and rotation is serialized in the store. The regression test drives 32 concurrent refreshes and asserts upstream rotates exactly once. Running it needs shell access."},
+            {"type": "text", "text": "Fix is in. The retry band-aid in `Session` is gone and rotation is serialized in the store. The regression test drives 32 concurrent refreshes and asserts upstream rotates exactly once ([RFC 6749 §10.4](https://www.rfc-editor.org/rfc/rfc6749#section-10.4)). Running it needs shell access."},
             {"type": "tool_use", "id": "toolu_d5", "name": "bash", "input": {"command": "cargo test -p relay --test refresh_race"}}]}),
     ]
 }
@@ -120,7 +120,8 @@ pub fn events() -> Vec<Event> {
             "tokens": {"input": 18_500, "output": 10_040, "cache_read": 1_410_000, "cache_creation": 96_200}},
         "streaming": true,
         "pending_prompts": [{"id": 7, "kind": "confirm", "title": "Confirm tool call",
-            "prompt": "bash wants to run a command in ~/work/relay-gateway:\n$ cargo test -p relay --test refresh_race"}],
+            // The daemon's confirm body (agent-engine `confirm_prompt_body`).
+            "prompt": "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/work/relay-gateway:\n$ cargo test -p relay --test refresh_race\n\nAllow this tool call?"}],
         "client_input": "shared", "input_owner": 2});
     if let Ok(DaemonFrame::Attached(a)) = decode_frame(&attached.to_string()) {
         out.push(Event::Attached { attach_seq: LOCAL_SEQ, attached: a, mode: AttachMode::Mirror, reconnect: false });

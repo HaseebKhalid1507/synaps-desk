@@ -8,9 +8,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use synaps_client::protocol::SessionMeta;
 
+use std::hash::{Hash, Hasher};
+
 use crate::app::{AppView, display, home_short, mono, section, tbtn};
 use crate::fonts::{self, label};
-use crate::model::{ConnState, Filter, SAVED_LIMIT};
+use crate::model::{ConnState, Filter, Model, SAVED_LIMIT};
 use crate::named::{Marker, RowAction, relative, short_model};
 use crate::stats::compact;
 use crate::theme::{self, Palette};
@@ -55,7 +57,112 @@ fn now_secs() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// One session in the rail.
+/// One rail row's strings, built when the lists change, not per frame.
+pub(crate) struct RailRow {
+    /// A hash of the session (or journal) id: the row's element id, so a
+    /// reorder by the poll does not move hover and clicks to another row.
+    key: usize,
+    title: SharedString,
+    sub: SharedString,
+    age: SharedString,
+    /// Index in [`Model::sessions`] of a live row.
+    live: Option<usize>,
+    /// The marker of a row that is not live (saved, resuming).
+    marker: Marker,
+    action: RowAction,
+}
+
+/// The rail's rows, rebuilt when [`Model::rail_gen`] moves or a minute
+/// passes (the ages); a frame only reads them.
+#[derive(Default)]
+pub(crate) struct RailCache {
+    generation: Option<u64>,
+    minute: i64,
+    named: Vec<RailRow>,
+    unnamed: Vec<RailRow>,
+}
+
+fn key_of(id: &str) -> usize {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut h);
+    h.finish() as usize
+}
+
+impl RailCache {
+    pub(crate) fn refreshed(self, m: &Model) -> Self {
+        let now = now_secs();
+        if self.generation == Some(m.rail_gen) && self.minute == now / 60 {
+            return self;
+        }
+        let index = |id: &str| m.sessions.iter().position(|s| s.id == id);
+        let named = m
+            .named_rows()
+            .into_iter()
+            .map(|row| {
+                let live = match &row.action {
+                    RowAction::Attach(id) if row.marker != Marker::Resuming => index(id),
+                    _ => None,
+                };
+                let meta = live.map(|i| &m.sessions[i]);
+                let sub = meta
+                    .and_then(|m| m.title.clone().filter(|t| !t.is_empty()))
+                    .or_else(|| meta.and_then(|m| m.cwd.as_deref()).map(home_short))
+                    .unwrap_or_else(|| row.model.clone());
+                RailRow {
+                    key: key_of(row.id()),
+                    title: row.name.clone().into(),
+                    sub: sub.into(),
+                    age: row.activity.as_deref().map(|t| relative(t, now)).unwrap_or_default().into(),
+                    live,
+                    marker: row.marker,
+                    action: row.action,
+                }
+            })
+            .collect();
+        let unnamed = m
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| crate::named::is_unnamed(s))
+            .map(|(i, s)| RailRow {
+                key: key_of(&s.id),
+                title: s.label().into(),
+                sub: s.cwd.as_deref().filter(|c| !c.is_empty()).map(home_short).unwrap_or_else(|| short_model(&s.model)).into(),
+                age: s.state_since.as_deref().or(Some(s.created_at.as_str())).map(|t| relative(t, now)).unwrap_or_default().into(),
+                live: Some(i),
+                marker: Marker::Idle,
+                action: RowAction::Attach(s.id.clone()),
+            })
+            .collect();
+        RailCache { generation: Some(m.rail_gen), minute: now / 60, named, unnamed }
+    }
+}
+
+/// What a top-bar ticker says about a prompt: the tool and the first line
+/// of what it will run or asks, from the daemon's confirm body
+/// (`Extension: …`, `Tool: …`, `Input that will run:`, `Message from …:`),
+/// else the body's first line that is not the closing question.
+pub(crate) fn prompt_gist(title: &str, body: &str) -> String {
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+    let tool = lines.iter().find_map(|l| l.strip_prefix("Tool: ")).filter(|t| !t.is_empty());
+    let after = |head: fn(&str) -> bool| lines.iter().skip_while(|l| !head(l)).skip(1).find(|l| !l.is_empty()).copied();
+    let detail =
+        after(|l| l == "Input that will run:").or_else(|| after(|l| l.starts_with("Message from ") && l.ends_with(':'))).or_else(|| {
+            lines
+                .iter()
+                .copied()
+                .find(|l| !l.is_empty() && *l != "Allow this tool call?" && !l.starts_with("Extension: ") && !l.starts_with("Tool: "))
+        });
+    let text = match (tool, detail) {
+        (Some(t), Some(d)) => format!("{t}: {d}"),
+        (Some(t), None) => t.to_string(),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => title.to_string(),
+    };
+    crate::app::one_line(&text, 90)
+}
+
+/// One session in the rail, as a frame draws it.
 struct Card {
     key: (&'static str, usize),
     title: SharedString,
@@ -107,8 +214,7 @@ impl AppView {
             if self.model.is_active(&s.id)
                 && let Some(pr) = self.model.transcript.pending_prompts().first()
             {
-                crate::app::one_line(&format!("{} {}", pr.title, pr.prompt.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("")), 90)
-                    .into()
+                prompt_gist(&pr.title, &pr.prompt).into()
             } else {
                 s.title.clone().filter(|t| !t.is_empty() && s.name.is_some()).unwrap_or_default().into()
             }
@@ -169,29 +275,39 @@ impl AppView {
                     .gap(px(18.))
                     .items_center()
                     .child(mono(conn, 10.5, conn_color).max_w(px(260.)).overflow_hidden().text_ellipsis())
+                    // The accent picker's own control: a swatch of the accent.
                     .child(
                         h_flex()
-                            .id("systems")
-                            .gap(px(10.))
+                            .id("accent-picker")
+                            .gap(px(8.))
                             .items_center()
                             .cursor_pointer()
-                            .child(display(label::SYSTEMS, 11., if self.picker_open { p.ink } else { p.ink3 }))
-                            .child(
-                                div()
-                                    .min_w(px(18.))
-                                    .h(px(18.))
-                                    .px(px(5.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(if subagents > 0 { p.ink } else { p.line2 })
-                                    .child(mono(subagents.to_string(), 10., if subagents > 0 { p.bg } else { p.ink3 })),
-                            )
+                            .child(div().size(px(10.)).bg(p.accent))
+                            .child(display(label::ACCENT, 10.5, if self.picker_open { p.ink } else { p.ink4 }))
+                            .hover(|d| d.text_color(p.ink))
                             .on_click(cx.listener(|this, _, _, cx| {
+                                // The click that closed it from outside does not reopen it.
+                                if this.picker_dismissed.take().is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(400)) {
+                                    return;
+                                }
                                 this.picker_open = !this.picker_open;
                                 this.picker_note = None;
                                 cx.notify();
                             })),
+                    )
+                    // As in the mock: the attached session's running subagents.
+                    .child(
+                        h_flex().gap(px(10.)).items_center().child(display(label::SYSTEMS, 11., p.ink3)).child(
+                            div()
+                                .min_w(px(18.))
+                                .h(px(18.))
+                                .px(px(5.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(if subagents > 0 { p.ink } else { p.line2 })
+                                .child(mono(subagents.to_string(), 10., if subagents > 0 { p.bg } else { p.ink3 })),
+                        ),
                     ),
             )
     }
@@ -281,26 +397,12 @@ impl AppView {
                     })),
             );
         }
-        let now = now_secs();
-        let mut list = v_flex().id("sessions").flex_1().min_h_0().overflow_y_scroll().child(self.render_named(p, now, cx));
+        let mut list = v_flex().id("sessions").flex_1().min_h_0().overflow_y_scroll().child(self.render_named(p, cx));
         let mut shown = 0;
-        for (i, s) in self.model.unnamed_sessions().enumerate() {
-            let marker = self.model.marker(s);
-            if !self.filter.admits(marker) {
-                continue;
-            }
+        for (i, r) in self.rail.unnamed.iter().enumerate() {
+            let Some(card) = self.rail_card("session", r) else { continue };
             shown += 1;
-            let id = s.id.clone();
-            let card = Card {
-                key: ("session", i),
-                title: s.label().into(),
-                sub: s.cwd.as_deref().filter(|c| !c.is_empty()).map(home_short).unwrap_or_else(|| short_model(&s.model)).into(),
-                age: s.state_since.as_deref().or(Some(s.created_at.as_str())).map(|t| relative(t, now)).unwrap_or_default().into(),
-                marker,
-                cost: Some(s.cost_usd),
-                active: self.model.is_active(&s.id),
-            };
-            list = list.child(self.card(card, move |this, _| this.attach(id.clone()), p, cx));
+            list = list.child(self.card(card, move |this, _| this.rail_click(false, i), p, cx));
         }
         if shown == 0 {
             let empty = if self.model.sessions.is_empty() { "No live sessions" } else { "No unnamed sessions in this filter" };
@@ -330,9 +432,40 @@ impl AppView {
             .child(list)
     }
 
+    /// A rail row as this frame draws it (`None`: filtered out): its state
+    /// is read live from the model (the attached session runs ahead of the
+    /// poll), its strings from the cache.
+    fn rail_card(&self, kind: &'static str, r: &RailRow) -> Option<Card> {
+        let meta = r.live.and_then(|i| self.model.sessions.get(i));
+        let marker = meta.map(|m| self.model.marker(m)).unwrap_or(r.marker);
+        if !self.filter.admits(marker) {
+            return None;
+        }
+        let active = meta.is_some_and(|m| self.model.is_active(&m.id));
+        // The attached session's cost as the panel shows it (its digests run
+        // ahead of the 3 s poll), else the poll's.
+        let cost = if active { self.model.stats.cost } else { meta.map(|m| m.cost_usd) };
+        Some(Card { key: (kind, r.key), title: r.title.clone(), sub: r.sub.clone(), age: r.age.clone(), marker, cost, active })
+    }
+
+    /// A rail row was clicked: by index, looked up now (no per-frame copy
+    /// of its id into the click handler).
+    fn rail_click(&mut self, named: bool, ix: usize) {
+        let rows = if named { &self.rail.named } else { &self.rail.unnamed };
+        let Some(action) = rows.get(ix).map(|r| r.action.clone()) else { return };
+        match action {
+            RowAction::Attach(id) if !named => self.attach(id),
+            action => {
+                for fx in self.model.open_row(&action) {
+                    self.effect(fx);
+                }
+            }
+        }
+    }
+
     /// The named sessions (live and saved), folded into the rail.
-    fn render_named(&self, p: &Palette, now: i64, cx: &Context<Self>) -> impl IntoElement {
-        let rows = self.model.named_rows();
+    fn render_named(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+        let rows = &self.rail.named;
         let open = !self.named_collapsed;
         let mut section = v_flex().child(
             h_flex()
@@ -386,44 +519,9 @@ impl AppView {
         }
         let mut shown = 0;
         for (i, row) in rows.iter().enumerate() {
-            let meta = match &row.action {
-                RowAction::Attach(id) => self.model.sessions.iter().find(|s| &s.id == id),
-                RowAction::Resume(_) => None,
-            };
-            // A live row's state from the model (the attached one runs ahead
-            // of the poll); "resuming" stays as the model set it.
-            let marker = match meta {
-                Some(m) if row.marker != Marker::Resuming => self.model.marker(m),
-                _ => row.marker,
-            };
-            if !self.filter.admits(marker) {
-                continue;
-            }
+            let Some(card) = self.rail_card("named", row) else { continue };
             shown += 1;
-            let sub = meta
-                .and_then(|m| m.title.clone().filter(|t| !t.is_empty()))
-                .or_else(|| meta.and_then(|m| m.cwd.as_deref()).map(home_short))
-                .unwrap_or_else(|| row.model.clone());
-            let card = Card {
-                key: ("named", i),
-                title: row.name.clone().into(),
-                sub: sub.into(),
-                age: row.activity.as_deref().map(|t| relative(t, now)).unwrap_or_default().into(),
-                marker,
-                cost: meta.map(|m| m.cost_usd),
-                active: meta.is_some_and(|m| self.model.is_active(&m.id)),
-            };
-            let action = row.action.clone();
-            section = section.child(self.card(
-                card,
-                move |this, _| {
-                    for fx in this.model.open_row(&action) {
-                        this.effect(fx);
-                    }
-                },
-                p,
-                cx,
-            ));
+            section = section.child(self.card(card, move |this, _| this.rail_click(true, i), p, cx));
         }
         if shown == 0 {
             let empty = if rows.is_empty() { "No named sessions" } else { "None in this filter" };
@@ -459,11 +557,13 @@ impl AppView {
                     .mt(px(20.))
                     .items_end()
                     .child(match ratio {
+                        // Bottom-aligned with the `%` lifted onto the
+                        // number's baseline (GPUI flex has no text baseline).
                         Some(r) => h_flex()
-                            .items_baseline()
+                            .items_end()
                             .gap(px(3.))
-                            .child(display(format!("{:.1}", r * 100.0), 46., if hot { p.hi } else { p.ink }))
-                            .child(display("%", 16., p.ink3))
+                            .child(display(format!("{:.1}", r * 100.0), 46., if hot { p.hi } else { p.ink }).line_height(px(46.)))
+                            .child(display("%", 16., p.ink3).line_height(px(16.)).pb(px(5.)))
                             .into_any_element(),
                         None => display("—", 46., p.ink4).into_any_element(),
                     })
@@ -495,7 +595,8 @@ impl AppView {
                     .mt(px(20.))
                     .child(div().flex_1().child(kv(label::IN, num(|t| t.input), false, p)))
                     .child(div().flex_1().child(kv(label::OUT, num(|t| t.output), false, p)))
-                    .child(div().flex_1().child(kv(label::CACHE, num(|t| t.cache_read), false, p))),
+                    .child(div().flex_1().child(kv(label::CACHE, num(|t| t.cache_read), false, p)))
+                    .child(div().flex_1().child(kv(label::WRITE, num(|t| t.cache_creation), false, p))),
             )
             .child(h_flex().mt(px(22.)).child(div().flex_1().child(kv(label::CACHE_HIT, hit, true, p))).child(div().flex_1().child(kv(
                 label::COST,
@@ -509,7 +610,7 @@ impl AppView {
             .px(px(24.))
             .pt(px(24.))
             .pb(px(26.))
-            .child(h_flex().items_baseline().child(section(label::FILES, fonts::JP_FILES, p)).child(div().flex_1()).when(
+            .child(h_flex().items_end().child(section(label::FILES, fonts::JP_FILES, p)).child(div().flex_1()).when(
                 added + removed > 0,
                 |d| {
                     d.child(h_flex().gap(px(8.)).child(mono(format!("+{added}"), 10.5, p.ink3)).child(mono(
@@ -519,7 +620,8 @@ impl AppView {
                     )))
                 },
             ))
-            .child(div().h(px(14.)));
+            .child(mono("as the model asked: tool inputs, not the disk", 9.5, p.ink4).mt(px(6.)))
+            .child(div().h(px(12.)));
         for f in ledger.files().iter().take(FILES_SHOWN) {
             let (dir, name) = f.split();
             files = files.child(
@@ -536,7 +638,9 @@ impl AppView {
                             .child(mono(dir.to_string(), 11., p.ink4).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
                             .child(mono(name.to_string(), 11., p.ink).flex_none()),
                     )
-                    .child(mono(format!("+{}", f.added), 10.5, p.ink2).flex_none())
+                    // A write is the lines written, not a delta (`~`).
+                    .when(f.written > 0, |d| d.child(mono(format!("~{}", f.written), 10.5, p.ink3).flex_none()))
+                    .when(f.added > 0 || f.written == 0, |d| d.child(mono(format!("+{}", f.added), 10.5, p.ink2).flex_none()))
                     .when(f.removed > 0, |d| d.child(mono(format!("−{}", f.removed), 10.5, p.hi).flex_none())),
             );
         }
@@ -547,6 +651,8 @@ impl AppView {
         if n == 0 {
             files = files.child(div().text_size(px(12.)).text_color(p.ink4).child("No file edits in this session"));
         }
+        // Detached: the last numbers seen, dimmed and labelled, not live.
+        let detached = s.detached && self.model.active.is_none();
         v_flex()
             .id("right")
             .w(px(296.))
@@ -555,12 +661,25 @@ impl AppView {
             .overflow_y_scroll()
             .border_l_1()
             .border_color(p.line)
-            .child(context)
-            .child(tokens)
-            .child(files)
+            .when(detached, |d| {
+                d.child(
+                    h_flex()
+                        .px(px(24.))
+                        .py(px(10.))
+                        .gap(px(10.))
+                        .border_b_1()
+                        .border_color(p.line)
+                        .child(display("D E T A C H E D", 10., p.hi))
+                        .child(mono("last numbers seen", 10., p.ink4)),
+                )
+            })
+            .child(v_flex().when(detached, |d| d.opacity(0.45)).child(context).child(tokens).child(files))
     }
 
-    pub(crate) fn render_picker(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+    /// The accent picker: over the right-hand column (clear of the
+    /// header's NAME and HALT), else over the rail, else above the composer.
+    /// Esc (the root's key handler) or a click outside closes it.
+    pub(crate) fn render_picker(&self, p: &Palette, show_rail: bool, show_right: bool, cx: &Context<Self>) -> impl IntoElement {
         let accent = cx.global::<theme::Accent>();
         let current = accent.hex;
         let d = accent.derived;
@@ -595,14 +714,21 @@ impl AppView {
         v_flex()
             .id("picker")
             .absolute()
-            .top(px(52.))
-            .right(px(24.))
-            .w(px(330.))
+            .map(|d| match (show_right, show_rail) {
+                (true, _) => d.top(px(52.)).right_0().w(px(296.)),
+                (false, true) => d.top(px(52.)).left(px(30.)).w(px(296.)),
+                (false, false) => d.bottom(px(140.)).right(px(24.)).w(px(296.)),
+            })
             .p(px(20.))
             .bg(p.bg1)
             .border_1()
             .border_color(p.line3)
             .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.picker_open = false;
+                this.picker_dismissed = Some(std::time::Instant::now());
+                cx.notify();
+            }))
             .child(
                 h_flex()
                     .items_baseline()
@@ -639,8 +765,23 @@ impl AppView {
                     .child(swatch(d.soft, "soft")),
             )
             .when(d.lifted, |el| {
-                el.child(mono("too dark to see: lifted to 3:1 (fills), 4.5:1 (text)", 10., p.ink3).mt(px(12.)).whitespace_normal())
+                el.child(mono("too dark to see: lifted to 3:1 (fills, lines), 4.5:1 (text)", 10., p.ink3).mt(px(12.)).whitespace_normal())
             })
             .when_some(self.picker_note.clone(), |el, n| el.child(mono(n, 10., p.ink4).mt(px(10.)).whitespace_normal()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_gist;
+
+    #[test]
+    fn the_ticker_names_the_tool_and_what_it_runs() {
+        let body = "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n$ cargo test\n\nAllow this tool call?";
+        assert_eq!(prompt_gist("Confirm tool call", body), "bash: bash wants to run a command in ~/w:");
+        let rewritten = "Extension: a, b\nTool: edit\nInput rewritten by: b\nInput that will run:\n{\"path\": \"/w/x\"}\n\nMessage from a, b:\nok?\n\nAllow this tool call?";
+        assert_eq!(prompt_gist("Confirm tool call", rewritten), "edit: {\"path\": \"/w/x\"}");
+        assert_eq!(prompt_gist("Confirm tool activation", "Activate shell_start?"), "Activate shell_start?");
+        assert_eq!(prompt_gist("API key", ""), "API key");
     }
 }

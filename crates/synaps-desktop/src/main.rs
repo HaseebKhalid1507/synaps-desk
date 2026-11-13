@@ -49,20 +49,28 @@ fn main() {
     let mut start_session: Option<String> = None;
     let mut open_picker = false;
     let mut args = std::env::args().skip(1);
+    // A flag's value; another flag in its place is a usage error, not the value.
+    let value = |args: &mut std::iter::Skip<std::env::Args>, flag: &str| match args.next() {
+        Some(v) if !v.starts_with("--") => v,
+        _ => {
+            eprintln!("{flag} needs a value");
+            std::process::exit(2);
+        }
+    };
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--profile" => profile = args.next(),
-            "--socket" => socket = args.next().map(PathBuf::from),
+            "--profile" => profile = Some(value(&mut args, "--profile")),
+            "--socket" => socket = Some(PathBuf::from(value(&mut args, "--socket"))),
             "--offline" => offline = true,
             "--bench" => bench = true,
             "--diag" => {
                 bench = true;
                 diag_mode = true;
             }
-            "--prompt" => prompt = args.next(),
-            "--refresh-hz" => refresh_hz = args.next().and_then(|s| s.parse().ok()),
-            "--accent" => accent = Some(args.next().unwrap_or_default()),
-            "--session" => start_session = args.next(),
+            "--prompt" => prompt = Some(value(&mut args, "--prompt")),
+            "--refresh-hz" => refresh_hz = value(&mut args, "--refresh-hz").parse().ok(),
+            "--accent" => accent = Some(value(&mut args, "--accent")),
+            "--session" => start_session = Some(value(&mut args, "--session")),
             "--accent-picker" => open_picker = true,
             "-h" | "--help" => {
                 println!(
@@ -85,7 +93,7 @@ fn main() {
     }
     let env_accent = std::env::var(theme::ENV_ACCENT).ok();
     let saved_accent = theme::settings_path().and_then(|p| theme::load_accent(&p));
-    let (accent, _, warnings) = theme::resolve(accent.as_deref(), env_accent.as_deref(), saved_accent.as_deref());
+    let (accent, accent_source, warnings) = theme::resolve(accent.as_deref(), env_accent.as_deref(), saved_accent.as_deref());
     for w in warnings {
         eprintln!("synaps-desktop: {w}");
     }
@@ -143,6 +151,7 @@ fn main() {
                 let mut v = app::AppView::new(client, synthetic, window, cx);
                 v.start_session = start_session;
                 v.picker_open = open_picker;
+                v.accent_source = accent_source;
                 v
             })
         })
