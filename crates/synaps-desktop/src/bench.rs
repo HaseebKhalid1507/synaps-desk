@@ -9,14 +9,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpui_kit::profiler::{FrameEvent, FrameTimingCollector};
 use gpui_kit::*;
 use serde_json::{Value, json};
-use synaps_client::protocol::{LlmEvent, SessionEvent, SessionStreamEvent, StreamEvent};
 use std::sync::Arc;
+use synaps_client::protocol::{LlmEvent, SessionEvent, SessionStreamEvent, StreamEvent};
 
 use synaps_client::{Event, synthetic};
 
 use crate::app::AppView;
-use crate::model::LOCAL_SEQ;
 use crate::mem;
+use crate::model::LOCAL_SEQ;
 
 pub struct BenchOptions {
     pub t_main: Instant,
@@ -120,7 +120,13 @@ impl BenchState {
         let mut presents: Vec<Instant> = Vec::new();
         let mut late = 0usize;
         let (mut layout, mut prepaint, mut paint, mut present) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let refresh_source = if self.refresh().is_some() { "gpui" } else if refresh_fallback.is_some() { "--refresh-hz" } else { "unknown" };
+        let refresh_source = if self.refresh().is_some() {
+            "gpui"
+        } else if refresh_fallback.is_some() {
+            "--refresh-hz"
+        } else {
+            "unknown"
+        };
         let refresh = self.refresh().or(refresh_fallback);
         for f in &self.frames {
             match f {
@@ -241,8 +247,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             if let Some(f) = first {
                 out["main_to_first_frame_ms"] = json!(round(ms(f.duration_since(t_main)), 2));
                 out["first_frame_epoch_ms"] = json!(round(epoch_ms(f), 1));
-                out["exec_to_first_frame_ms_approx"] =
-                    json!(opts.exec_to_main_ms.map(|e| round(e + ms(f.duration_since(t_main)), 1)));
+                out["exec_to_first_frame_ms_approx"] = json!(opts.exec_to_main_ms.map(|e| round(e + ms(f.duration_since(t_main)), 1)));
             }
             sleep(1.5).await;
             out["mem_idle"] = mem::sample();
@@ -364,10 +369,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             sleep(opts.stream_secs + 0.1).await;
             let t1 = Instant::now();
             let fed = feeder.join().unwrap_or_default();
-            for ev in [
-                SessionEvent::Stream { event: StreamEvent::Session(SessionStreamEvent::Done) },
-                SessionEvent::Idle,
-            ] {
+            for ev in [SessionEvent::Stream { event: StreamEvent::Session(SessionStreamEvent::Done) }, SessionEvent::Idle] {
                 let _ = tx.try_send(local_event(0, ev));
             }
             sleep(0.4).await;

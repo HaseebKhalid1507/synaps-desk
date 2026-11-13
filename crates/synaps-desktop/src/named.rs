@@ -267,8 +267,7 @@ pub fn resume_error(label: &str, reason: &str) -> String {
 
 /// The daemon's real create errors (see `resume_error`), word for word.
 #[cfg(test)]
-pub(crate) const NO_SUCH_GHOST: &str =
-    "create session: Tool execution failed: Failed to load session 'ghost': no session matching 'ghost'";
+pub(crate) const NO_SUCH_GHOST: &str = "create session: Tool execution failed: Failed to load session 'ghost': no session matching 'ghost'";
 #[cfg(test)]
 pub(crate) const LOCKED_AXEL: &str = "create session: Session error: session 20261110-202033-e5f6 is live in another process \
     (pid 4242, tui) — use `synaps --attach 20261110-202033-e5f6`, or `synaps daemon sessions`";
@@ -344,7 +343,9 @@ mod tests {
     #[test]
     fn live_and_saved_are_grouped_sorted_and_deduped() {
         let sessions = vec![
-            live(json!({"id": "l1", "name": "zeta", "model": "claude-opus-4-6", "lifecycle": "live", "busy": true, "state_since": "2026-11-13T07:00:00Z"})),
+            live(
+                json!({"id": "l1", "name": "zeta", "model": "claude-opus-4-6", "lifecycle": "live", "busy": true, "state_since": "2026-11-13T07:00:00Z"}),
+            ),
             live(json!({"id": "l2", "name": null, "lifecycle": "live"})),
             live(json!({"id": "l3", "name": "axel", "lifecycle": "parked", "journal_id": "j-axel"})),
             live(json!({"id": "l4-successor", "name": "mid", "lifecycle": "live", "journal_id": "j-mid"})),
@@ -354,7 +355,9 @@ mod tests {
             saved(json!({"id": "j-axel", "name": "axel", "live": true})),
             saved(json!({"id": "l1", "name": "zeta-old-name", "live": true})),
             saved(json!({"id": "j-mid", "name": "mid", "live": true})),
-            saved(json!({"id": "j-beta", "name": "beta", "model": "claude-haiku-4-5", "updated_at": "2026-11-12T00:00:00Z", "live": false})),
+            saved(
+                json!({"id": "j-beta", "name": "beta", "model": "claude-haiku-4-5", "updated_at": "2026-11-12T00:00:00Z", "live": false}),
+            ),
             saved(json!({"id": "j-anon", "name": null, "live": false})),
             saved(json!({"id": "j-ghost", "name": "Gamma", "live": true})),
         ];

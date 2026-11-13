@@ -165,18 +165,35 @@ impl CreateOptions {
 #[non_exhaustive]
 pub enum Command {
     RefreshSessions,
-    Attach { session_id: String, mode: AttachMode },
+    Attach {
+        session_id: String,
+        mode: AttachMode,
+    },
     Create(CreateOptions),
-    Submit { text: String },
-    Steer { text: String },
+    Submit {
+        text: String,
+    },
+    Steer {
+        text: String,
+    },
     Cancel,
-    Answer { prompt_id: u64, value: Option<String> },
+    Answer {
+        prompt_id: u64,
+        value: Option<String>,
+    },
     /// Re-fetch the whole history (`Query{Messages}`) → `HistoryUpdate::Replace`.
     Resync,
     /// `SavedSessions` on the control connection → `Event::SavedSessions`.
-    SavedSessions { named_only: bool, limit: u32 },
+    SavedSessions {
+        named_only: bool,
+        limit: u32,
+    },
     /// `Rename` on the control connection → `Event::Renamed` / `RenameFailed`.
-    Rename { session_id: String, name: Option<String>, expect: Option<Option<String>> },
+    Rename {
+        session_id: String,
+        name: Option<String>,
+        expect: Option<Option<String>>,
+    },
     Detach,
     Shutdown,
 }
@@ -206,9 +223,7 @@ impl std::fmt::Debug for Command {
     /// secret prompt's answer is a credential.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Command::Attach { session_id, mode } => {
-                f.debug_struct("Attach").field("session_id", session_id).field("mode", mode).finish()
-            }
+            Command::Attach { session_id, mode } => f.debug_struct("Attach").field("session_id", session_id).field("mode", mode).finish(),
             Command::Create(o) => f.debug_tuple("Create").field(o).finish(),
             Command::Submit { .. } => f.debug_struct("Submit").field("text", &format_args!("<redacted>")).finish(),
             Command::Steer { .. } => f.debug_struct("Steer").field("text", &format_args!("<redacted>")).finish(),
@@ -241,8 +256,15 @@ pub enum Status {
     Connecting,
     /// `features`: the daemon's `Welcome.features` (e.g.
     /// [`FEATURE_SAVED_SESSIONS`]); empty from an older daemon.
-    Connected { daemon_version: String, profile: Option<String>, pid: u32, features: Vec<String> },
-    Reconnecting { why: String },
+    Connected {
+        daemon_version: String,
+        profile: Option<String>,
+        pid: u32,
+        features: Vec<String>,
+    },
+    Reconnecting {
+        why: String,
+    },
     Offline(String),
     /// The daemon speaks another protocol. Not retried by itself:
     /// [`Client::list_sessions`] tries again (after a daemon upgrade).
@@ -303,36 +325,83 @@ pub enum Event {
     /// re-attaches with `Takeover` on the wire to keep input). If any of
     /// `pending_prompts` / `clients` / `roster` did not decode, an
     /// `Error::Decode` follows (see `Attached::rejected`).
-    Attached { attach_seq: u64, attached: Box<Attached>, mode: AttachMode, reconnect: bool },
+    Attached {
+        attach_seq: u64,
+        attached: Box<Attached>,
+        mode: AttachMode,
+        reconnect: bool,
+    },
     /// The session connection dropped (reload, EOF) and is being re-made;
     /// an `Attached { reconnect: true }` or a `Detached` follows. Commands
     /// meanwhile come back as `Error::Refused`.
-    Reattaching { attach_seq: u64, session_id: String, reason: String },
+    Reattaching {
+        attach_seq: u64,
+        session_id: String,
+        reason: String,
+    },
     /// A live event, decoded, with the raw wire event alongside (for fields
     /// and variants the mirror does not carry). `MessageHistory` never
     /// comes here in `Full` mode: see [`Event::History`].
-    Session { attach_seq: u64, session_id: String, seq: u64, event: SessionEvent, raw: Arc<Value> },
+    Session {
+        attach_seq: u64,
+        session_id: String,
+        seq: u64,
+        event: SessionEvent,
+        raw: Arc<Value>,
+    },
     /// The history changed (`Full` mode).
-    History { attach_seq: u64, session_id: String, seq: u64, update: HistoryUpdate },
+    History {
+        attach_seq: u64,
+        session_id: String,
+        seq: u64,
+        update: HistoryUpdate,
+    },
     /// Who owns input changed. `client` is this connection's id.
-    InputOwner { attach_seq: u64, session_id: String, client: u64, owner: Option<u64>, reason: String },
+    InputOwner {
+        attach_seq: u64,
+        session_id: String,
+        client: u64,
+        owner: Option<u64>,
+        reason: String,
+    },
     /// The attachment ended for good (ended, refused, gave up, detached,
     /// replaced). Session commands now fail with `Error::NotAttached`.
-    Detached { attach_seq: u64, session_id: Option<String>, reason: String },
-    Error { attach_seq: Option<u64>, error: Error },
+    Detached {
+        attach_seq: u64,
+        session_id: Option<String>,
+        reason: String,
+    },
+    Error {
+        attach_seq: Option<u64>,
+        error: Error,
+    },
     /// Reply to [`Client::saved_sessions`]. `truncated`: there are more
     /// than the limit; `rejected`: entries that did not decode (skipped).
-    SavedSessions { sessions: Vec<SavedSession>, truncated: bool, rejected: usize },
+    SavedSessions {
+        sessions: Vec<SavedSession>,
+        truncated: bool,
+        rejected: usize,
+    },
     /// A [`Client::saved_sessions`] that got no list: the daemon's `Error`,
     /// a dropped connection, or not connected. (A daemon without the
     /// feature answers `Error::Unsupported` instead.)
-    SavedSessionsFailed { reason: String },
+    SavedSessionsFailed {
+        reason: String,
+    },
     /// The daemon refused the create's `cwd` (gone on its machine) and the
     /// create was sent again in [`CreateOptions::fallback_cwd`]. `missing`:
     /// the folder as the daemon printed it; `cwd`: where it runs now.
-    CwdFallback { attach_seq: u64, missing: String, cwd: Option<PathBuf> },
+    CwdFallback {
+        attach_seq: u64,
+        missing: String,
+        cwd: Option<PathBuf>,
+    },
     /// Reply to [`Client::rename`]: `session_id` is now called `name`.
-    Renamed { session_id: String, name: Option<String>, in_memory_only: bool },
+    Renamed {
+        session_id: String,
+        name: Option<String>,
+        in_memory_only: bool,
+    },
     /// Reply to [`Client::rename`]: not renamed (see [`RenameRefusal`]).
     RenameFailed(RenameFailure),
 }
@@ -391,7 +460,9 @@ pub enum RequestError {
     /// No control connection yet (or now): the daemon's features are unknown.
     NotConnected,
     /// The connected daemon does not list this feature.
-    Unsupported { feature: &'static str },
+    Unsupported {
+        feature: &'static str,
+    },
     InvalidName(InvalidSessionName),
 }
 
@@ -523,9 +594,7 @@ impl Client {
         let limit = limit.clamp(1, SAVED_SESSIONS_MAX);
         match self.features() {
             None => Err(RequestError::NotConnected),
-            Some(f) if !f.iter().any(|x| x == FEATURE_SAVED_SESSIONS) => {
-                Err(RequestError::Unsupported { feature: FEATURE_SAVED_SESSIONS })
-            }
+            Some(f) if !f.iter().any(|x| x == FEATURE_SAVED_SESSIONS) => Err(RequestError::Unsupported { feature: FEATURE_SAVED_SESSIONS }),
             Some(_) => Ok(self.send(Command::SavedSessions { named_only, limit })?),
         }
     }
@@ -623,11 +692,10 @@ enum Pending {
 fn not_sent(events: &Events, ctl: Ctl) {
     match ctl {
         Ctl::SavedSessions { .. } => emit(events, Event::SavedSessionsFailed { reason: "not connected to the daemon".into() }),
-        Ctl::Rename { session_id, .. } => emit(events, Event::RenameFailed(RenameFailure::new(
-            session_id,
-            RenameRefusal::Offline,
-            "not connected to the daemon; nothing was renamed",
-        ))),
+        Ctl::Rename { session_id, .. } => emit(
+            events,
+            Event::RenameFailed(RenameFailure::new(session_id, RenameRefusal::Offline, "not connected to the daemon; nothing was renamed")),
+        ),
         Ctl::Refresh | Ctl::Shutdown => {}
     }
 }
@@ -636,11 +704,14 @@ fn not_sent(events: &Events, ctl: Ctl) {
 fn lost(events: &Events, p: Pending, why: &str) {
     match p {
         Pending::Saved => emit(events, Event::SavedSessionsFailed { reason: format!("the connection dropped ({why})") }),
-        Pending::Rename(sid) => emit(events, Event::RenameFailed(RenameFailure::new(
-            sid,
-            RenameRefusal::Unknown,
-            format!("the connection dropped before the reply ({why}); the rename may have applied"),
-        ))),
+        Pending::Rename(sid) => emit(
+            events,
+            Event::RenameFailed(RenameFailure::new(
+                sid,
+                RenameRefusal::Unknown,
+                format!("the connection dropped before the reply ({why}); the rename may have applied"),
+            )),
+        ),
     }
 }
 
@@ -943,7 +1014,10 @@ struct Previous {
 enum Attempt {
     Attached(Conn, Box<Attached>),
     /// Transient (reload, EOF, busy, timeout): retry within the budget.
-    Retry { why: String, after: Duration },
+    Retry {
+        why: String,
+        after: Duration,
+    },
     /// Retrying cannot help (refused, unknown session, bad cwd, undecodable
     /// `Attached`, incompatible daemon, or a create that may have happened).
     Fatal(String),
@@ -981,9 +1055,7 @@ async fn attempt(sh: &Shared, target: &Target, mode: AttachMode, previous: Optio
                 Some(s) => Attach::Existing { session_id: s.id.clone(), mode },
                 None => {
                     c.bye().await;
-                    return Attempt::Fatal(
-                        format!("the connection dropped {MAY_EXIST}"),
-                    );
+                    return Attempt::Fatal(format!("the connection dropped {MAY_EXIST}"));
                 }
             }
         }
@@ -992,9 +1064,7 @@ async fn attempt(sh: &Shared, target: &Target, mode: AttachMode, previous: Optio
     let (creating, budget) = match &attach {
         // A resume loads and folds a journal before `Attached`.
         Attach::Create { config, .. } => (true, if config.continue_session.is_some() { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT }),
-        Attach::Existing { session_id, .. } => {
-            (false, if parked(session_id, &c) { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT })
-        }
+        Attach::Existing { session_id, .. } => (false, if parked(session_id, &c) { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT }),
     };
     if creating {
         *create_sent = true;
@@ -1020,10 +1090,7 @@ async fn attempt(sh: &Shared, target: &Target, mode: AttachMode, previous: Optio
                 return Attempt::Fatal(DecodeError { kind, error }.to_string());
             }
             Ok(Some(DaemonFrame::Bye(Some(ByeReason::Reloading { retry_after_ms, .. })))) => {
-                return Attempt::Retry {
-                    why: "daemon reloading".into(),
-                    after: Duration::from_millis(retry_after_ms.min(10_000)),
-                };
+                return Attempt::Retry { why: "daemon reloading".into(), after: Duration::from_millis(retry_after_ms.min(10_000)) };
             }
             Ok(Some(DaemonFrame::Bye(_))) | Ok(None) => {
                 return Attempt::Retry { why: "daemon closed the connection before attaching".into(), after: Duration::ZERO };
@@ -1038,7 +1105,12 @@ async fn attempt(sh: &Shared, target: &Target, mode: AttachMode, previous: Optio
 /// them to, so input is refused (back to the user) instead of being
 /// delivered late to whatever turn runs after the reconnect. `None`: a
 /// detach (or the client went away).
-async fn without_session<F: Future>(cmds: &mut mpsc::UnboundedReceiver<Command>, events: &Events, attach_seq: u64, fut: F) -> Option<F::Output> {
+async fn without_session<F: Future>(
+    cmds: &mut mpsc::UnboundedReceiver<Command>,
+    events: &Events,
+    attach_seq: u64,
+    fut: F,
+) -> Option<F::Output> {
     tokio::pin!(fut);
     loop {
         tokio::select! {
@@ -1066,7 +1138,13 @@ fn is_refusal(message: &str) -> bool {
     message.starts_with("refused: ") || message == RELOADING_REFUSAL || message.starts_with("backpressure:")
 }
 
-async fn session_loop(sh: Shared, attach_seq: u64, mut target: Target, mode: AttachMode, mut cmds: mpsc::UnboundedReceiver<Command>) -> Exit {
+async fn session_loop(
+    sh: Shared,
+    attach_seq: u64,
+    mut target: Target,
+    mode: AttachMode,
+    mut cmds: mpsc::UnboundedReceiver<Command>,
+) -> Exit {
     let events = sh.events.clone();
     let full = sh.identity.history() == HistoryMode::Full;
     let mut session_id = match &target {

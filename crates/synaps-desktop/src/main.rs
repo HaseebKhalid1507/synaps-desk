@@ -119,9 +119,7 @@ fn main() {
                 history_messages: 2000,
                 diag: diag_mode,
             };
-            let _ = cx.windows().first().and_then(|w| {
-                w.update(cx, |_, window, cx| bench::start(&view, opts, window, cx)).ok()
-            });
+            let _ = cx.windows().first().and_then(|w| w.update(cx, |_, window, cx| bench::start(&view, opts, window, cx)).ok());
         }
         cx.activate(true);
     });

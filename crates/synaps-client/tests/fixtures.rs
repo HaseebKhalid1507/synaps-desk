@@ -282,10 +282,8 @@ fn notes_survive_refolds() {
         event: StreamEvent::Agent(AgentEvent::SubagentStart { subagent_id: 1, agent_name: "scout".into(), task_preview: "look".into() }),
     });
     t.apply(&SessionEvent::Stream { event: StreamEvent::Session(SessionStreamEvent::Error { message: "rate limited".into() }) });
-    let round = vec![
-        json!({"role": "user", "content": "go"}),
-        json!({"role": "assistant", "content": [{"type": "text", "text": "working"}]}),
-    ];
+    let round =
+        vec![json!({"role": "user", "content": "go"}), json!({"role": "assistant", "content": [{"type": "text", "text": "working"}]})];
     t.apply_history(&round);
     let rows = texts(&t);
     assert_eq!(rows[1], (ItemKind::Assistant, "working".into()));
@@ -336,10 +334,12 @@ fn an_out_of_sync_append_is_refused() {
 fn unknown_frames_events_and_fields_are_tolerated() {
     assert!(matches!(decode_frame(r#"{"type":"from_the_future","x":1}"#).unwrap(), DaemonFrame::Unknown(k) if k == "from_the_future"));
     assert!(matches!(decode_frame(r#"{"type":"welcome","protocol_version":"three"}"#).unwrap(), DaemonFrame::Malformed { .. }));
-    let f = decode_frame(r#"{"type":"event","session_id":"s","seq":1,"ts":"t","event":{"ev":"brand_new","payload":[1]},"extra":true}"#).unwrap();
+    let f = decode_frame(r#"{"type":"event","session_id":"s","seq":1,"ts":"t","event":{"ev":"brand_new","payload":[1]},"extra":true}"#)
+        .unwrap();
     let DaemonFrame::Event(env) = f else { panic!() };
     assert!(matches!(env.decode(), Ok(SessionEvent::Unknown)));
-    let env: Envelope = serde_json::from_str(r#"{"session_id":"s","event":{"ev":"stream","event":{"kind":"llm","llm":"hologram","x":1}}}"#).unwrap();
+    let env: Envelope =
+        serde_json::from_str(r#"{"session_id":"s","event":{"ev":"stream","event":{"kind":"llm","llm":"hologram","x":1}}}"#).unwrap();
     assert!(matches!(env.decode(), Ok(SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Unknown) })));
     let env: Envelope = serde_json::from_str(r#"{"session_id":"s","event":{"ev":"stream","event":{"kind":"telepathy"}}}"#).unwrap();
     assert!(matches!(env.decode(), Ok(SessionEvent::Stream { event: StreamEvent::Unknown })));
@@ -363,17 +363,17 @@ fn client_frames_encode_as_the_daemon_expects() {
     assert_eq!(v["client"]["name"], "desktop");
     assert_eq!(v["client"]["history"], "full");
     assert!(v.get("env").is_none());
-    let submit = encode_frame(&ClientFrame::Cmd {
-        session_id: "s".into(),
-        cmd: SessionCommand::Submit { text: "hi".into(), attachments: vec![] },
-    })
-    .unwrap();
+    let submit =
+        encode_frame(&ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Submit { text: "hi".into(), attachments: vec![] } })
+            .unwrap();
     assert_eq!(submit, "{\"type\":\"cmd\",\"session_id\":\"s\",\"cmd\":{\"cmd\":\"submit\",\"text\":\"hi\",\"attachments\":[]}}\n");
     let cancel = encode_frame(&ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Cancel }).unwrap();
     assert_eq!(cancel, "{\"type\":\"cmd\",\"session_id\":\"s\",\"cmd\":{\"cmd\":\"cancel\"}}\n");
     let attach = encode_frame(&ClientFrame::Attach(Attach::Existing { session_id: "s".into(), mode: AttachMode::Observe })).unwrap();
     assert_eq!(attach, "{\"type\":\"attach\",\"attach\":\"existing\",\"session_id\":\"s\",\"mode\":\"observe\"}\n");
-    let query = encode_frame(&ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Query { id: 5, query: SessionQuery::Messages } }).unwrap();
+    let query =
+        encode_frame(&ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Query { id: 5, query: SessionQuery::Messages } })
+            .unwrap();
     assert_eq!(query, "{\"type\":\"cmd\",\"session_id\":\"s\",\"cmd\":{\"cmd\":\"query\",\"id\":5,\"query\":{\"query\":\"messages\"}}}\n");
     let detach = encode_frame(&ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Detach { client: 3 } }).unwrap();
     assert_eq!(detach, "{\"type\":\"cmd\",\"session_id\":\"s\",\"cmd\":{\"cmd\":\"detach\",\"client\":3}}\n");
@@ -462,7 +462,9 @@ fn saved_session_lists_decode() {
     let DaemonFrame::SavedSessionList { sessions, truncated, rejected } = decode_frame(odd).unwrap() else { panic!() };
     assert_eq!((sessions.len(), truncated, rejected), (1, true, 2));
     assert_eq!(sessions[0].name, None);
-    let DaemonFrame::SavedSessionList { sessions, .. } = decode_frame(r#"{"type":"saved_session_list","sessions":null}"#).unwrap() else { panic!() };
+    let DaemonFrame::SavedSessionList { sessions, .. } = decode_frame(r#"{"type":"saved_session_list","sessions":null}"#).unwrap() else {
+        panic!()
+    };
     assert!(sessions.is_empty());
     assert!(matches!(decode_frame(r#"{"type":"saved_session_list","truncated":"no"}"#).unwrap(), DaemonFrame::Malformed { .. }));
 }
@@ -510,12 +512,8 @@ fn named_session_frames_encode_as_the_daemon_expects() {
     let saved = encode_frame(&ClientFrame::SavedSessions { named_only: true, limit: 200 }).unwrap();
     assert_eq!(saved, "{\"type\":\"saved_sessions\",\"named_only\":true,\"limit\":200}\n");
     let rename = |name: Option<&str>, expect: Option<Option<&str>>| {
-        encode_frame(&ClientFrame::Rename {
-            session_id: "s".into(),
-            name: name.map(Into::into),
-            expect: expect.map(|e| e.map(Into::into)),
-        })
-        .unwrap()
+        encode_frame(&ClientFrame::Rename { session_id: "s".into(), name: name.map(Into::into), expect: expect.map(|e| e.map(Into::into)) })
+            .unwrap()
     };
     assert_eq!(rename(Some("axon"), Some(None)), "{\"type\":\"rename\",\"session_id\":\"s\",\"name\":\"axon\",\"expect\":null}\n");
     assert_eq!(rename(Some("axon"), None), "{\"type\":\"rename\",\"session_id\":\"s\",\"name\":\"axon\"}\n");

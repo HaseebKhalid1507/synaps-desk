@@ -25,9 +25,40 @@ impl Rng {
 }
 
 const WORDS: &[&str] = &[
-    "daemon", "session", "frame", "socket", "render", "layout", "virtual", "list", "token", "stream",
-    "buffer", "thread", "channel", "markdown", "highlight", "window", "compositor", "latency", "memory",
-    "the", "a", "of", "to", "and", "is", "in", "that", "for", "with", "on", "we", "this", "it", "as",
+    "daemon",
+    "session",
+    "frame",
+    "socket",
+    "render",
+    "layout",
+    "virtual",
+    "list",
+    "token",
+    "stream",
+    "buffer",
+    "thread",
+    "channel",
+    "markdown",
+    "highlight",
+    "window",
+    "compositor",
+    "latency",
+    "memory",
+    "the",
+    "a",
+    "of",
+    "to",
+    "and",
+    "is",
+    "in",
+    "that",
+    "for",
+    "with",
+    "on",
+    "we",
+    "this",
+    "it",
+    "as",
 ];
 
 fn sentence(r: &mut Rng) -> String {
@@ -58,7 +89,8 @@ fn sentence(r: &mut Rng) -> String {
 }
 
 const RUST: &str = "fn main() {\n    let frames: Vec<u64> = (0..120).collect();\n    let p95 = frames[frames.len() * 95 / 100];\n    println!(\"p95 = {p95}\");\n}\n";
-const PY: &str = "def handler(event):\n    if event[\"ev\"] == \"stream\":\n        return event[\"event\"].get(\"text\", \"\")\n    return None\n";
+const PY: &str =
+    "def handler(event):\n    if event[\"ev\"] == \"stream\":\n        return event[\"event\"].get(\"text\", \"\")\n    return None\n";
 const SH: &str = "cargo build --release -p synaps-desktop\nls -la target/release | tail -n 3\n";
 
 fn code(r: &mut Rng) -> String {

@@ -26,16 +26,12 @@ pub fn base_dir() -> PathBuf {
 
 /// `$SYNAPS_RUNTIME_DIR`, else `<base>/run`.
 pub fn run_dir() -> PathBuf {
-    std::env::var_os("SYNAPS_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| base_dir().join("run"))
+    std::env::var_os("SYNAPS_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| base_dir().join("run"))
 }
 
 /// Same sanitising as Synaps' `sanitize_session_id`.
 fn sanitize(raw: &str) -> String {
-    raw.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect()
+    raw.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
 }
 
 /// The registry stem for a profile: `daemon` or `daemon-<profile>`.
