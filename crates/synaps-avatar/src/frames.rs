@@ -118,26 +118,33 @@ fn face_band(px: &[u8], w: u32, top: i32, height: i32) -> (i32, i32) {
     (top + (height as f32 * 0.17) as i32, top + (height as f32 * 0.37) as i32)
 }
 
-/// A 1 px rim of `rgb` around dark opaque pixels from row `from` down, drawn into
-/// transparent neighbours (so behind the art, never over it). RGBA straight alpha.
+/// A clean 1 px rim of `rgb` along the outline of the dark parts of the figure, from row
+/// `from` down. Rim pixels are the transparent pixels 4-adjacent to the 1-bit shape that
+/// have a dark figure pixel within 2 px, so the line is continuous along dark stretches
+/// (no speckle from anti-aliased edges) and stays off coloured parts. Drawn into
+/// transparent pixels only: behind the art, never over it. RGBA straight alpha.
 fn add_rim(px: &mut [u8], w: u32, h: u32, from: i32, rgb: u32) {
     let (w, h) = (w as i32, h as i32);
+    let at = |x: i32, y: i32| (y * w + x) as usize * 4;
+    let inside = |px: &[u8], x: i32, y: i32| x >= 0 && y >= 0 && x < w && y < h && px[at(x, y) + 3] >= HIT_ALPHA;
     let dark = |px: &[u8], x: i32, y: i32| {
-        if x < 0 || y < 0 || x >= w || y >= h {
+        if !inside(px, x, y) {
             return false;
         }
-        let i = (y * w + x) as usize * 4;
-        px[i + 3] >= 160 && (px[i] as u32 * 3 + px[i + 1] as u32 * 6 + px[i + 2] as u32) < 10 * 70
+        let i = at(x, y);
+        (px[i] as u32 * 3 + px[i + 1] as u32 * 6 + px[i + 2] as u32) < 10 * 80
     };
     let mut set = Vec::new();
     for y in from.max(0)..h {
         for x in 0..w {
-            let i = (y * w + x) as usize * 4;
-            if px[i + 3] >= HIT_ALPHA {
+            if inside(px, x, y) {
                 continue;
             }
-            if dark(px, x - 1, y) || dark(px, x + 1, y) || dark(px, x, y - 1) || dark(px, x, y + 1) {
-                set.push(i);
+            if !(inside(px, x - 1, y) || inside(px, x + 1, y) || inside(px, x, y - 1) || inside(px, x, y + 1)) {
+                continue;
+            }
+            if (-2..=2).any(|dy| (-2..=2).any(|dx| dark(px, x + dx, y + dy))) {
+                set.push(at(x, y));
             }
         }
     }
@@ -271,7 +278,7 @@ fn decode_one(pack: &Pack, f: &FrameSource, geo: &Geometry, verify: bool, resize
     // Lanczos3 on premultiplied alpha (fast_image_resize premultiplies for U8x4).
     resizer.resize(&src, &mut dst, &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3)))?;
     let mut px = dst.into_vec();
-    if f.anchor.name == "seat"
+    if pack.perch_frames.contains(&f.id)
         && let Some(rim) = pack.behaviour.perch.as_ref().and_then(|p| u32::from_str_radix(p.rim.trim_start_matches('#'), 16).ok())
     {
         // The limbs over the window: from just above the seat line down.

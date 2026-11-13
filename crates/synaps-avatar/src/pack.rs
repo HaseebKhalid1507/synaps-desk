@@ -250,14 +250,23 @@ pub struct PerchSpec {
     pub activities: Vec<Vec<Step>>,
     #[serde(default)]
     pub click: Vec<Step>,
-    /// A 1 px light rim drawn around dark limbs of seat-anchored frames at decode time,
-    /// behind the art, so they stay visible over dark windows (`#rrggbb`, "" = off).
-    #[serde(default = "rim_default")]
+    /// A clean 1 px rim around the dark limbs of perch frames below the seat line, drawn
+    /// at decode time behind the art, so they stay visible over dark windows
+    /// (`#rrggbb`; empty = off).
+    #[serde(default)]
     pub rim: String,
+    /// Contact sliver under the seat and thighs: thickness in logical px (0 = off), colour.
+    #[serde(default = "sliver_px_default")]
+    pub sliver_px: f32,
+    #[serde(default = "sliver_rgb_default")]
+    pub sliver: String,
 }
 
-fn rim_default() -> String {
-    "#c9c4ec".into()
+fn sliver_px_default() -> f32 {
+    3.0
+}
+fn sliver_rgb_default() -> String {
+    "#05060a".into()
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -393,8 +402,11 @@ pub struct Pack {
     pub frames: Vec<FrameSource>,
     pub index: HashMap<String, usize>,
     pub poses: Vec<FrameSource>,
-    /// Seat-anchored frames are registered to this seat height (the perch base's).
+    /// Seat-anchored frames used on a perch (base, per-mood frames, music's window pose)
+    /// are registered to this seat height (the perch base's), so they all sit on the same
+    /// edge line. Other seat frames keep their own canvas registration.
     pub seat_ref: Option<i32>,
+    pub perch_frames: std::collections::HashSet<String>,
 }
 
 impl Pack {
@@ -414,7 +426,7 @@ impl Pack {
         let c = self.catalog.canonical_anchor;
         let dy = match (f.anchor.name.as_str(), self.seat_ref) {
             ("ground", _) => c.y - f.anchor.y,
-            ("seat", Some(s)) => s - f.anchor.y,
+            ("seat", Some(s)) if self.perch_frames.contains(&f.id) => s - f.anchor.y,
             _ => 0,
         };
         (c.x - f.anchor.x, dy)
@@ -540,7 +552,16 @@ impl Pack {
             .or_else(|| frames.iter().find(|f| f.anchor.name == "seat"))
             .filter(|f| f.anchor.name == "seat")
             .map(|f| f.anchor.y);
-        let mut pack = Pack { dir: dir.to_owned(), name: pack_name, catalog, behaviour, frames, index, poses: Vec::new(), seat_ref };
+        let mut perch_frames = std::collections::HashSet::new();
+        if let Some(p) = &behaviour.perch {
+            perch_frames.insert(p.base.clone());
+            perch_frames.extend(p.moods.values().cloned());
+        }
+        if let Some(w) = behaviour.music.as_ref().and_then(|m| m.window.clone()) {
+            perch_frames.insert(w);
+        }
+        let mut pack =
+            Pack { dir: dir.to_owned(), name: pack_name, catalog, behaviour, frames, index, poses: Vec::new(), seat_ref, perch_frames };
 
         // Behaviour references.
         let check_steps = |what: &str, steps: &[Step], errors: &mut Vec<String>, pack: &Pack| {

@@ -172,12 +172,13 @@ const HEART_LAYER: usize = 6;
 const BOLT_LAYERS: usize = 6;
 /// The contact shadow under a perch, stacked right below the avatar window.
 const SHADOW_LAYER: usize = 14;
-const SHADOW_RGB: u32 = 0x06070d;
 /// Music notes: an outline and a fill layer each, at most seven notes.
 const NOTE_LAYER: usize = 15;
 const NOTES_MAX: usize = 7;
 /// Notes are drawn this much larger than Capri's canvas sizes (our figure is smaller).
 const NOTE_SCALE: f32 = 1.15;
+/// Notes fade toward this tint (no alpha without a compositor).
+const NOTE_TINT: u32 = 0x3a4656;
 /// Note animation rate (shaped X windows; no GPUI redraw).
 const NOTE_TICK: Duration = Duration::from_millis(40);
 /// Hair glints: a glow and a core layer each, at most four at once. Shaped X windows like
@@ -445,23 +446,33 @@ impl Avatar {
             let beat = 60.0 / spec.bpm.clamp(40.0, 240.0);
             let parts = fx::music_notes(now.saturating_duration_since(m.t0).as_secs_f32(), beat, emitters);
             let base = (self.applied.0 + l.avatar_x, self.applied.1 + l.avatar_y);
-            const BAYER: [[f32; 4]; 4] = [[0.0, 8.0, 2.0, 10.0], [12.0, 4.0, 14.0, 6.0], [3.0, 11.0, 1.0, 9.0], [15.0, 7.0, 13.0, 5.0]];
             for n in parts.iter().take(NOTES_MAX) {
+                // No alpha: fade by shrinking and stepping the colour toward a dim tint, then
+                // pop out. Four steps, no dither.
+                if n.alpha < 0.14 {
+                    continue;
+                }
+                let k = if n.alpha > 0.8 {
+                    1.0
+                } else if n.alpha > 0.55 {
+                    0.72
+                } else if n.alpha > 0.32 {
+                    0.48
+                } else {
+                    0.28
+                };
                 let sprite = &self.notes[n.sprite % self.notes.len()];
                 let (dx, dy) = l.geo.to_device(n.x.round() as i32 + ox, n.y.round() as i32 + oy);
-                let size = ((n.size * l.geo.scale * NOTE_SCALE).round() as i32).clamp(4, sprite.size as i32);
+                let size = ((n.size * l.geo.scale * NOTE_SCALE * (0.55 + 0.45 * k)).round() as i32).clamp(4, sprite.size as i32);
                 let o = (base.0 + dx.round() as i32 - size / 2, base.1 + dy.round() as i32 - size / 2);
                 let ai = frames_angle(n.deg);
                 let (outline, fill) = &sprite.variants[ai];
-                let k = sprite.size as f32 / size as f32;
+                let scale = sprite.size as f32 / size as f32;
                 let runs = |mask: &crate::frames::Mask| {
                     let mut out = Vec::new();
                     for y in 0..size {
                         let mut x = 0;
-                        let on = |x: i32| {
-                            let t = (BAYER[((o.1 + y) & 3) as usize][((o.0 + x) & 3) as usize] + 0.5) / 16.0;
-                            n.alpha > t && mask.get((x as f32 * k) as i32, (y as f32 * k) as i32)
-                        };
+                        let on = |x: i32| mask.get((x as f32 * scale) as i32, (y as f32 * scale) as i32);
                         while x < size {
                             if on(x) {
                                 let s0 = x;
@@ -478,8 +489,8 @@ impl Avatar {
                 };
                 let (ro, rf) = (runs(outline), runs(fill));
                 let (lo, lf) = (NOTE_LAYER + 2 * used, NOTE_LAYER + 2 * used + 1);
-                self.x11.fx_set(lf, sprite.fill_rgb, o, (size, size), &rf).ok();
-                self.x11.fx_set_below(lo, lf, sprite.outline_rgb, o, (size, size), &ro).ok();
+                self.x11.fx_set(lf, mix_rgb(NOTE_TINT, sprite.fill_rgb, k), o, (size, size), &rf).ok();
+                self.x11.fx_set_below(lo, lf, mix_rgb(NOTE_TINT, sprite.outline_rgb, k), o, (size, size), &ro).ok();
                 used += 1;
             }
         }
@@ -558,12 +569,10 @@ impl Avatar {
             let t = (now.saturating_duration_since(m.t0).as_secs_f32() * 1000.0 / hold).floor() * hold;
             let beats = t / (60_000.0 / spec.bpm.clamp(40.0, 240.0));
             let p = beats.fract();
-            let ease = |v: f32| {
-                let v = v.clamp(0.0, 1.0);
-                v * v * (3.0 - 2.0 * v)
-            };
-            let nod = (3.0 * sf * (1.0 - ease(p / 0.45))).round() as i32;
-            let sway = (2.5 * sf * (beats * std::f32::consts::PI).sin()).round() as i32;
+            // Head down on the beat and back up (4 px), the upper body tilting side to side
+            // over two beats (4 px at the top of the hair).
+            let nod = (4.0 * sf * (0.5 + 0.5 * (p * std::f32::consts::TAU).cos())).round() as i32;
+            let sway = (4.0 * sf * (beats * std::f32::consts::PI).sin()).round() as i32;
             return fx::Pose { breath: 0, nod, sway };
         }
         let life = &self.pack.behaviour.life;
@@ -603,7 +612,7 @@ impl Avatar {
             y0: -l.avatar_y,
             h: l.geo.height as i32,
             top: f.top,
-            shear_end: if music { neck } else { f.face.0 },
+            shear_end: if music { waist } else { f.face.0 },
             neck,
             waist,
         }
@@ -771,72 +780,46 @@ impl Avatar {
 
     // ---- perch shadow ---------------------------------------------------------------
 
-    /// Contact shadow for a perch: the hanging legs' silhouette pushed down-right and
-    /// softened, plus a band right under the edge where seat and hands rest. No alpha
-    /// without a compositor, so it's an ordered dither of a dark colour on its own shaped
-    /// layer. Avatar-local device px.
+    /// Contact sliver for a perch: a solid dark band a few px thick on the window face right
+    /// under the edge, as wide as the seat and thighs that rest on it (the run of the
+    /// figure at the seat line that holds the seat point), minus the legs hanging in front.
+    /// 1-bit friendly: no dither. Avatar-local device px.
     fn shadow_rects(&self, frame: usize) -> Vec<ShapeRect> {
         let l = &self.layout;
+        let Some(p) = self.perch_spec() else { return Vec::new() };
         let (Some(f), Some(seat)) = (self.frames.get(frame).and_then(|f| f.as_ref()), l.seat_y) else { return Vec::new() };
+        let thick = (p.sliver_px * l.sf).round() as i32;
+        if thick <= 0 {
+            return Vec::new();
+        }
         let line = seat - l.avatar_y;
         let (w, h) = (f.mask.w as i32, f.mask.h as i32);
-        let (ox, oy) = ((6.0 * l.sf) as i32, (5.0 * l.sf) as i32);
-        let idx = |x: i32, y: i32| (y * w + x) as usize;
-        let mut a = vec![0f32; (w * h) as usize];
-        for y in (line + 1)..h {
-            for x in 0..w {
-                if y - oy > line + 1 && f.mask.get(x - ox, y - oy) {
-                    a[idx(x, y)] = 1.0;
-                }
-            }
+        let sx = l.ground_x - l.avatar_x;
+        // The seat run: on a row just above the edge, the opaque span through the seat x.
+        let row = line - (2.0 * l.sf) as i32;
+        if !(0..h).contains(&row) || !f.mask.get(sx, row) {
+            return Vec::new();
         }
-        // Soften: two passes of a separable box blur.
-        let r = (3.0 * l.sf) as i32;
-        let mut tmp = vec![0f32; a.len()];
-        for _ in 0..2 {
-            for y in 0..h {
-                for x in 0..w {
-                    let (x0, x1) = ((x - r).max(0), (x + r).min(w - 1));
-                    tmp[idx(x, y)] = (x0..=x1).map(|xx| a[idx(xx, y)]).sum::<f32>() / (2 * r + 1) as f32;
-                }
-            }
-            for y in 0..h {
-                for x in 0..w {
-                    let (y0, y1) = ((y - r).max(0), (y + r).min(h - 1));
-                    a[idx(x, y)] = (y0..=y1).map(|yy| tmp[idx(x, yy)]).sum::<f32>() / (2 * r + 1) as f32;
-                }
-            }
+        let (mut x0, mut x1) = (sx, sx);
+        while x0 > 0 && f.mask.get(x0 - 1, row) {
+            x0 -= 1;
         }
-        for v in &mut a {
-            *v *= 0.6;
+        while x1 < w - 1 && f.mask.get(x1 + 1, row) {
+            x1 += 1;
         }
-        // The contact band under the edge.
-        if let Some((cl, ch)) = self.contact_of(frame, true) {
-            let cx = l.ground_x - l.avatar_x;
-            let depth = (6.0 * l.sf) as i32;
-            for y in (line + 1)..=(line + depth).min(h - 1) {
-                let fade = 1.0 - (y - line - 1) as f32 / depth as f32;
-                for x in (cx + cl).max(0)..=(cx + ch).min(w - 1) {
-                    let i = idx(x, y);
-                    a[i] = a[i].max(0.8 * fade);
-                }
-            }
-        }
-        const BAYER: [[f32; 4]; 4] = [[0.0, 8.0, 2.0, 10.0], [12.0, 4.0, 14.0, 6.0], [3.0, 11.0, 1.0, 9.0], [15.0, 7.0, 13.0, 5.0]];
         let mut out = Vec::new();
-        for y in (line + 1)..h {
-            let mut x = 0;
-            while x < w {
-                let on = |x: i32| a[idx(x, y)] > (BAYER[(y & 3) as usize][(x & 3) as usize] + 0.5) / 16.0 && !f.mask.get(x, y);
-                if on(x) {
-                    let s = x;
-                    while x < w && on(x) {
-                        x += 1;
-                    }
-                    out.push((s as i16, y as i16, (x - s) as u16, 1));
-                } else {
+        for y in (line + 1)..(line + 1 + thick).min(h) {
+            let mut x = x0;
+            while x <= x1 {
+                if f.mask.get(x, y) {
+                    x += 1;
+                    continue;
+                }
+                let s0 = x;
+                while x <= x1 && !f.mask.get(x, y) {
                     x += 1;
                 }
+                out.push((s0 as i16, y as i16, (x - s0) as u16, 1));
             }
         }
         out
@@ -873,7 +856,8 @@ impl Avatar {
                 Placement::Ground => None,
             };
             let h = win.map_or(l.geo.height as i32, |r| (r.y + r.h - at.1).clamp(1, l.geo.height as i32));
-            self.x11.fx_under(SHADOW_LAYER, SHADOW_RGB, at, (l.geo.width as i32, h), reshape.then_some(&rects[..])).ok();
+            let rgb = self.perch_spec().and_then(|p| u32::from_str_radix(p.sliver.trim_start_matches('#'), 16).ok()).unwrap_or(0x05060a);
+            self.x11.fx_under(SHADOW_LAYER, rgb, at, (l.geo.width as i32, h), reshape.then_some(&rects[..])).ok();
             self.shadow_at = Some(at);
         }
     }
@@ -1181,21 +1165,10 @@ impl Avatar {
             return true;
         }
         if let Some(b) = &tp.bolt {
-            let layers = b.frame(u);
             let (bx, by, bw, bh) = b.bbox();
             let o = (bx, by);
-            let step = (6.0 * self.layout.sf).round() as i32;
-            // Top (core) first, each lower layer right under the one above it.
-            for (i, polys) in layers.iter().enumerate().rev() {
-                // Blocky outside like Capri's bolt, a finer core.
-                let grid = if i == 3 { 2 } else { step };
-                let rects = fx::polys_to_rects(polys, o, grid);
-                if i == 3 {
-                    self.x11.fx_set(i, fx::BOLT_COLOURS[i], o, (bw, bh), &rects).ok();
-                } else {
-                    self.x11.fx_set_below(i, i + 1, fx::BOLT_COLOURS[i], o, (bw, bh), &rects).ok();
-                }
-            }
+            let rects = fx::polys_to_rects(&[b.frame(u)], o, 2);
+            self.x11.fx_set(0, fx::BOLT_LINE, o, (bw, bh), &rects).ok();
             self.x11.flush();
         }
         if u >= fx::BOLT_ARRIVE && !moved {
@@ -2087,6 +2060,7 @@ impl Render for Avatar {
                 h: ah,
                 body: (bx0, top, bx1 - bx0, ah - top),
                 face,
+                solid: g.solid(now),
                 sf,
             });
             plan.tint = g.tint(now);
@@ -2108,7 +2082,8 @@ impl Render for Avatar {
         } else {
             plan.shape(&rects)
         };
-        let ghost_rects = if plan.ghosts.is_empty() || hidden { Vec::new() } else { plan.ghost_rects(&rects) };
+        let ghost_rects = if !plan.has_ghosts() || hidden { Vec::new() } else { plan.ghost_rects(&rects) };
+        let solid_rects = if plan.solid.iter().all(Option::is_none) || hidden { Vec::new() } else { plan.solid_rects(&rects) };
         let tint_rects = if plan.tint.is_some() && !hidden { plan.body_rects(&rects) } else { Vec::new() };
         let entity = cx.entity();
         let warm: Vec<Arc<RenderImage>> = if self.loaded && !self.warmed {
@@ -2164,7 +2139,13 @@ impl Render for Avatar {
                                 window.paint_image(ib, ib, Corners::default(), img, 0, false).ok();
                             }
                             Some(bands) => {
-                                for &(y0, y1, dx, dy) in bands {
+                                for (r, c) in &solid_rects {
+                                    window.paint_quad(fill(rect(r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32), rgb(*c)));
+                                }
+                                for (i, &(y0, y1, dx, dy)) in bands.iter().enumerate() {
+                                    if plan2.solid.get(i).is_some_and(Option::is_some) {
+                                        continue;
+                                    }
                                     let shifted = rect(ix + dx as f32, iy + dy as f32, iw, ih);
                                     let clip = rect(ix + dx as f32, (y0 + dy) as f32, iw, (y1 - y0) as f32);
                                     window.paint_image(clip, shifted, Corners::default(), img.clone(), 0, false).ok();
@@ -2701,4 +2682,13 @@ fn frames_angle(deg: f32) -> usize {
         .enumerate()
         .min_by(|a, b| (a.1 - deg).abs().total_cmp(&(b.1 - deg).abs()))
         .map_or(3, |p| p.0)
+}
+
+/// `a` → `b` by `k` (0..1), per channel.
+fn mix_rgb(a: u32, b: u32, k: f32) -> u32 {
+    let ch = |sh: u32| {
+        let (x, y) = (((a >> sh) & 0xff) as f32, ((b >> sh) & 0xff) as f32);
+        ((x + (y - x) * k).round() as u32 & 0xff) << sh
+    };
+    ch(16) | ch(8) | ch(0)
 }
