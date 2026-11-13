@@ -1,0 +1,252 @@
+//! The numbers the session header and the right-hand panel show, all from
+//! the daemon: the runtime view (`Attached.view`, `setting_changed`), the
+//! conversation's token totals and cost (`Attached.conversation`, every
+//! `Conversation` digest), the last model call's prompt size (`Usage`, for
+//! the context gauge, as the TUI computes it) and the files changed (the
+//! history's file tools, [`crate::files`]). Nothing here is estimated: a
+//! value the daemon has not sent is `None` and its widget says so.
+
+use serde_json::Value;
+use synaps_client::protocol::{LlmEvent, SessionEvent, StreamEvent};
+use synaps_client::{Attached, HistoryUpdate};
+
+use crate::files::Ledger;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
+impl Tokens {
+    /// `ConversationTokens`: `None` unless it is an object with numbers.
+    pub fn from_value(v: &Value) -> Option<Self> {
+        let o = v.as_object()?;
+        let n = |k: &str| o.get(k).and_then(Value::as_u64);
+        if o.is_empty() || ["input", "output", "cache_read", "cache_creation"].iter().all(|k| n(k).is_none()) {
+            return None;
+        }
+        Some(Tokens {
+            input: n("input").unwrap_or(0),
+            output: n("output").unwrap_or(0),
+            cache_read: n("cache_read").unwrap_or(0),
+            cache_creation: n("cache_creation").unwrap_or(0),
+        })
+    }
+
+    /// Share of prompt tokens served from the cache, if any were sent.
+    pub fn cache_hit(&self) -> Option<f64> {
+        let prompt = self.input + self.cache_read + self.cache_creation;
+        (prompt > 0).then(|| self.cache_read as f64 / prompt as f64)
+    }
+}
+
+/// `RuntimeView`'s fields the header and gauge use.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeInfo {
+    pub model: String,
+    /// `reasoning_level` (else `thinking_level`): "high", "low", "off", ...
+    pub effort: String,
+    /// Tokens; 0 when the daemon did not say.
+    pub context_window: u64,
+}
+
+impl RuntimeInfo {
+    pub fn from_value(v: &Value) -> Option<Self> {
+        let o = v.as_object()?;
+        let s = |k: &str| o.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let effort = Some(s("reasoning_level")).filter(|e| !e.is_empty()).unwrap_or_else(|| s("thinking_level"));
+        let info = RuntimeInfo { model: s("model"), effort, context_window: o.get("context_window").and_then(Value::as_u64).unwrap_or(0) };
+        (info != RuntimeInfo::default()).then_some(info)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Stats {
+    pub view: Option<RuntimeInfo>,
+    pub tokens: Option<Tokens>,
+    /// The conversation's cost in USD as the daemon reports it.
+    pub cost: Option<f64>,
+    /// The last model call's prompt (input + cache read + cache creation):
+    /// what the context window holds now.
+    pub context: Option<u64>,
+    /// The attached session's folder (`Attached.meta.cwd`).
+    pub cwd: Option<String>,
+    pub files: Ledger,
+}
+
+impl Stats {
+    /// A (re-)attach: everything from the snapshot, then the in-flight
+    /// turn's replay.
+    pub fn on_attached(&mut self, a: &Attached) {
+        let cwd = a.meta.cwd.clone().filter(|c| !c.is_empty());
+        let mut files = Ledger::default();
+        files.reset(&a.conversation.api_messages, cwd.as_deref());
+        *self = Stats {
+            view: RuntimeInfo::from_value(&a.view),
+            tokens: Tokens::from_value(&a.conversation.tokens),
+            cost: Some(a.conversation.cost),
+            context: None,
+            cwd,
+            files,
+        };
+        for env in &a.replay {
+            if let Ok(ev) = env.decode() {
+                self.on_session(&ev, &env.event);
+            }
+        }
+    }
+
+    pub fn on_history(&mut self, update: &HistoryUpdate) {
+        match update {
+            HistoryUpdate::Append { messages, .. } => self.files.append(messages),
+            HistoryUpdate::Replace { messages } => {
+                let cwd = self.cwd.clone();
+                self.files.reset(messages, cwd.as_deref());
+            }
+            _ => {}
+        }
+    }
+
+    /// A live event; `raw` is the wire event (fields the mirror drops).
+    pub fn on_session(&mut self, ev: &SessionEvent, raw: &Value) {
+        match ev {
+            SessionEvent::Conversation { digest } => {
+                if let Some(t) = Tokens::from_value(&digest.tokens) {
+                    self.tokens = Some(t);
+                }
+                self.cost = Some(digest.cost);
+                if digest.messages_len == 0 {
+                    self.context = None;
+                }
+            }
+            SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) } => {
+                self.files.tool_use(tool_name, tool_id, input);
+            }
+            SessionEvent::Stream { event: StreamEvent::Session(_) } => {
+                let e = &raw["event"];
+                if e["session"] == "usage" {
+                    let n = |k: &str| e.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    let prompt = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+                    if prompt > 0 {
+                        self.context = Some(prompt);
+                    }
+                }
+            }
+            SessionEvent::Cleared { .. } | SessionEvent::Resumed { .. } | SessionEvent::CompactionApplied { .. } => self.context = None,
+            _ if raw["ev"] == "setting_changed" => {
+                if let Some(v) = RuntimeInfo::from_value(&raw["applied"]["view"]) {
+                    self.view = Some(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Context use, 0..=1, when both the prompt size and the window are known.
+    pub fn context_ratio(&self) -> Option<f64> {
+        let w = self.view.as_ref().map(|v| v.context_window).filter(|&w| w > 0)?;
+        Some((self.context? as f64 / w as f64).min(1.0))
+    }
+}
+
+/// `18.5k`, `1.41M`, `512`.
+pub fn compact(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..100_000 => format!("{:.1}k", n as f64 / 1e3),
+        100_000..1_000_000 => format!("{:.0}k", n as f64 / 1e3),
+        1_000_000..10_000_000 => format!("{:.2}M", n as f64 / 1e6),
+        _ => format!("{:.1}M", n as f64 / 1e6),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use synaps_client::protocol::{DaemonFrame, decode_event, decode_frame};
+
+    use super::*;
+
+    fn attached(v: Value) -> Box<Attached> {
+        match decode_frame(&v.to_string()).unwrap() {
+            DaemonFrame::Attached(a) => a,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn ev(v: Value) -> (SessionEvent, Arc<Value>) {
+        (decode_event(&v).unwrap(), Arc::new(v))
+    }
+
+    #[test]
+    fn attach_snapshot_feeds_view_tokens_cost_and_files() {
+        let a = attached(json!({"type": "attached", "client": 2, "meta": {"id": "s", "cwd": "/w/r"},
+            "view": {"model": "anthropic/claude-opus-4-1", "thinking_level": "low", "reasoning_level": "high", "context_window": 200000},
+            "conversation": {"api_messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "edit", "input": {"path": "/w/r/a.rs", "old_string": "a", "new_string": "b\nc"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}],
+                "cost": 1.25, "tokens": {"input": 10, "output": 20, "cache_read": 70, "cache_creation": 20}},
+            "input_owner": 2}));
+        let mut s = Stats::default();
+        s.on_attached(&a);
+        let v = s.view.clone().unwrap();
+        assert_eq!((v.model.as_str(), v.effort.as_str(), v.context_window), ("anthropic/claude-opus-4-1", "high", 200000));
+        assert_eq!(s.tokens, Some(Tokens { input: 10, output: 20, cache_read: 70, cache_creation: 20 }));
+        assert_eq!(s.tokens.unwrap().cache_hit(), Some(0.7));
+        assert_eq!(s.cost, Some(1.25));
+        assert_eq!(s.context, None, "no model call seen yet: the gauge has nothing");
+        assert_eq!(s.context_ratio(), None);
+        assert_eq!(s.files.files()[0].path, "a.rs");
+        assert_eq!(s.files.totals(), (2, 1));
+    }
+
+    #[test]
+    fn an_older_daemon_without_view_or_tokens_shows_nothing() {
+        let a = attached(json!({"type": "attached", "client": 2, "meta": {"id": "s"}, "conversation": {"api_messages": []}}));
+        let mut s = Stats::default();
+        s.on_attached(&a);
+        assert_eq!((s.view.is_none(), s.tokens.is_none()), (true, true));
+        assert_eq!(Tokens::from_value(&json!({})), None);
+        assert_eq!(Tokens::from_value(&json!({"foo": 1})), None);
+        assert_eq!(Tokens::from_value(&json!("x")), None);
+        assert_eq!(Tokens::default().cache_hit(), None);
+    }
+
+    #[test]
+    fn usage_drives_the_gauge_and_digests_the_totals() {
+        let mut s = Stats { view: Some(RuntimeInfo { context_window: 200_000, ..Default::default() }), ..Default::default() };
+        let (e, raw) = ev(json!({"ev": "stream", "event": {"kind": "session", "session": "usage", "input_tokens": 1000,
+            "output_tokens": 50, "cache_read_input_tokens": 90000, "cache_creation_input_tokens": 9000, "model": "m"}}));
+        s.on_session(&e, &raw);
+        assert_eq!(s.context, Some(100_000));
+        assert_eq!(s.context_ratio(), Some(0.5));
+        let (e, raw) = ev(json!({"ev": "conversation", "digest": {"messages_len": 4, "messages_hash": 1, "cost": 0.5,
+            "tokens": {"input": 1, "output": 2, "cache_read": 3, "cache_creation": 4}}}));
+        s.on_session(&e, &raw);
+        assert_eq!(s.tokens.unwrap().output, 2);
+        assert_eq!(s.cost, Some(0.5));
+        let (e, raw) = ev(json!({"ev": "setting_changed", "applied": {"setting": "model", "ok": true,
+            "view": {"model": "m2", "thinking_level": "off", "reasoning_level": "off", "context_window": 1000000}}}));
+        s.on_session(&e, &raw);
+        assert_eq!(s.view.as_ref().unwrap().model, "m2");
+        assert_eq!(s.context_ratio(), Some(0.1));
+        let (e, raw) = ev(json!({"ev": "cleared", "session_id": "x"}));
+        s.on_session(&e, &raw);
+        assert_eq!(s.context, None);
+    }
+
+    #[test]
+    fn compact_numbers() {
+        assert_eq!(compact(512), "512");
+        assert_eq!(compact(18_500), "18.5k");
+        assert_eq!(compact(250_000), "250k");
+        assert_eq!(compact(1_850), "1.9k");
+        assert_eq!(compact(1_410_000), "1.41M");
+        assert_eq!(compact(25_000_000), "25.0M");
+    }
+}

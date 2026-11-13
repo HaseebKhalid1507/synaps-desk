@@ -94,6 +94,8 @@ fn attached_with_history_renders() {
     assert_eq!(a.roster.len(), 1);
     assert_eq!(a.roster[0].mode, "observe");
     assert_eq!(a.clients, vec![(2, ClientKind::Attach)]);
+    assert_eq!(a.conversation.tokens["cache_creation"], 4748);
+    assert_eq!(a.conversation.tokens["input"], 84);
     let mut t = Transcript::new();
     t.load_attached(&a).unwrap();
     let kinds: Vec<_> = t.items().iter().map(|i| i.kind).collect();
