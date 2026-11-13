@@ -258,8 +258,9 @@ pub struct Init {
     pub focus_probe: bool,
 }
 
+/// A period with ±25 % jitter, never under 250 ms (a 0 in the pack must not spin).
 fn jitter(rng: &mut Rng, ms: u64) -> Duration {
-    Duration::from_millis((ms as f32 * rng.range(0.75, 1.3)) as u64)
+    Duration::from_millis(((ms as f32 * rng.range(0.75, 1.3)) as u64).max(250))
 }
 
 impl Avatar {
@@ -379,7 +380,7 @@ impl Avatar {
         } else {
             life.first_activity_ms.unwrap_or(a.first_activity_ms)
         };
-        Duration::from_millis((base as f32 * self.rng.range(0.75, 1.35)) as u64)
+        Duration::from_millis(((base as f32 * self.rng.range(0.75, 1.35)) as u64).max(500))
     }
 
     /// Base frame and loop for a mood, given where the avatar is (standing or perched).
@@ -439,8 +440,8 @@ impl Avatar {
         } else {
             None
         };
-        self.next_hop = spec.as_ref().and_then(|s| s.hop_every_ms).map(|p| now + jitter(&mut self.rng, p) / 2);
-        self.next_glitch = spec.as_ref().and_then(|s| s.glitch_every_ms).map(|p| now + jitter(&mut self.rng, p));
+        self.next_hop = spec.as_ref().and_then(|s| s.hop_every_ms).filter(|&p| p > 0).map(|p| now + jitter(&mut self.rng, p) / 2);
+        self.next_glitch = spec.as_ref().and_then(|s| s.glitch_every_ms).filter(|&p| p > 0).map(|p| now + jitter(&mut self.rng, p));
     }
 
     /// Re-apply the current mood's layer after the placement changed (no entry/exit).
@@ -614,7 +615,7 @@ impl Avatar {
                 self.glitch = Some(Glitch::new(GlitchKind::Burst, now, self.rng.next()));
                 dirty = true;
             }
-            let p = self.spec(self.mood).and_then(|s| s.glitch_every_ms);
+            let p = self.spec(self.mood).and_then(|s| s.glitch_every_ms).filter(|&p| p > 0);
             self.next_glitch = p.map(|p| now + jitter(&mut self.rng, p));
         }
         if let Some(t0) = self.squash {
@@ -644,7 +645,7 @@ impl Avatar {
             if self.hop_allowed() {
                 self.hop = Some(now);
             }
-            let p = self.spec(self.mood).and_then(|s| s.hop_every_ms);
+            let p = self.spec(self.mood).and_then(|s| s.hop_every_ms).filter(|&p| p > 0);
             self.next_hop = p.map(|p| now + jitter(&mut self.rng, p));
         }
         if let Some(t0) = self.hop
@@ -661,8 +662,13 @@ impl Avatar {
 
     fn spawn_glints(&mut self, now: Instant) {
         let [lo, hi] = self.pack.behaviour.life.sparkle_every_ms;
-        self.next_glint = Some(now + Duration::from_millis(self.rng.range(lo as f32, hi.max(lo) as f32) as u64));
-        if !self.loaded || self.hidden || self.teleport.is_some() || hi == 0 {
+        if hi == 0 || self.pack.behaviour.life.sparkle_ms == 0 {
+            self.next_glint = None;
+            return;
+        }
+        let gap = (self.rng.range(lo as f32, hi.max(lo) as f32) as u64).max(250);
+        self.next_glint = Some(now + Duration::from_millis(gap));
+        if !self.loaded || self.hidden || self.teleport.is_some() {
             return;
         }
         let Some(f) = self.frame_or_default(self.anim.frame()) else { return };
