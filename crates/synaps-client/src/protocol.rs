@@ -207,6 +207,10 @@ pub struct CreateConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continue_session: Option<Option<String>>,
     pub auto_approve_confirms: bool,
+    /// The session's system prompt (`SessionConfig.system`, the prompt
+    /// TEXT; `EngineOpts.system`). Absent: the daemon's default prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -235,6 +239,65 @@ pub enum SessionCommand {
     Detach {
         client: u64,
     },
+    /// Reply: `SettingChanged{applied: {id, ok, message, view}}`, broadcast
+    /// to every attached client, so pick an id below
+    /// [`RESERVED_QUERY_ID_BASE`] that others won't. Input-owner only: from
+    /// an `Observe` attach the session answers `Refused{command: "set"}`.
+    Set {
+        id: u64,
+        setting: Setting,
+    },
+}
+
+/// `types::SessionSetting`, the variants this client sets ([`crate::Client::set`]).
+/// The daemon records each in `settings_replay` (it survives a daemon
+/// reload) and in the session journal (a resume restores it).
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "setting", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Setting {
+    /// `set_system_prompt`: the prompt TEXT.
+    SystemPrompt { text: String },
+    /// `try_set_model`.
+    Model { model: String },
+    /// `set_reasoning_level_checked`: `low`, `medium`, `high`, `xhigh`, ...
+    /// (the daemon parses it; an unknown level is refused when the frame
+    /// decodes, as a daemon `Error`).
+    ReasoningLevel { level: String },
+}
+
+impl Setting {
+    pub fn system_prompt(text: impl Into<String>) -> Self {
+        Setting::SystemPrompt { text: text.into() }
+    }
+    pub fn model(model: impl Into<String>) -> Self {
+        Setting::Model { model: model.into() }
+    }
+    pub fn reasoning_level(level: impl Into<String>) -> Self {
+        Setting::ReasoningLevel { level: level.into() }
+    }
+
+    /// The wire name (`SettingApplied.setting`).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Setting::SystemPrompt { .. } => "system_prompt",
+            Setting::Model { .. } => "model",
+            Setting::ReasoningLevel { .. } => "reasoning_level",
+        }
+    }
+}
+
+impl std::fmt::Debug for Setting {
+    /// A system prompt prints its length, not its text.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Setting::SystemPrompt { text } => {
+                f.debug_struct("SystemPrompt").field("text", &format_args!("<{} bytes>", text.len())).finish()
+            }
+            Setting::Model { model } => f.debug_struct("Model").field("model", model).finish(),
+            Setting::ReasoningLevel { level } => f.debug_struct("ReasoningLevel").field("level", level).finish(),
+        }
+    }
 }
 
 impl std::fmt::Debug for SessionCommand {
@@ -251,6 +314,7 @@ impl std::fmt::Debug for SessionCommand {
             }
             Self::Query { id, query } => f.debug_struct("Query").field("id", id).field("query", query).finish(),
             Self::Detach { client } => f.debug_struct("Detach").field("client", client).finish(),
+            Self::Set { id, setting } => f.debug_struct("Set").field("id", id).field("setting", setting).finish(),
         }
     }
 }

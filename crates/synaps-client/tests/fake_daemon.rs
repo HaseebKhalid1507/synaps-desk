@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use synaps_client::history::{HistoryUpdate, messages_hash};
-use synaps_client::{AttachMode, Client, ClientOptions, CreateOptions, Cwd, Endpoint, Error, Event, Identity, Status};
+use synaps_client::{AttachMode, Client, ClientOptions, CreateOptions, Cwd, Endpoint, Error, Event, Identity, Setting, Status};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -1068,4 +1068,89 @@ async fn answers_for_an_earlier_connection_are_never_sent() {
     assert_eq!(again.recv_cmd().await, json!({"cmd": "answer", "prompt_id": 1, "value": "n"}));
     client.shutdown().unwrap();
     assert_eq!(again.recv_cmd().await, json!({"cmd": "detach", "client": 3}));
+}
+
+/// A create carries the system prompt as `config.system`; without one the
+/// key is absent (the daemon's default prompt).
+#[tokio::test]
+async fn a_create_carries_the_system_prompt() {
+    let mut fake = Fake::start("system").await;
+    let (client, _events) = fake.client();
+    client.create(CreateOptions::new().name("capri").system("You are Capri.")).unwrap();
+    let first = fake.next_attach().await;
+    assert_eq!(first.attach["config"]["system"], "You are Capri.");
+    client.create(CreateOptions::new().name("other")).unwrap();
+    let second = fake.next_attach().await;
+    assert!(second.attach["config"].get("system").is_none(), "{}", second.attach);
+    client.shutdown().unwrap();
+}
+
+fn applied(id: u64, setting: &str, ok: bool, message: Option<&str>, view: Value) -> Value {
+    json!({"ev": "setting_changed", "applied": {"id": id, "setting": setting, "ok": ok, "message": message, "view": view, "clamp": null}})
+}
+
+/// `set` goes out as `Set{id}`; only the `SettingChanged` with that id
+/// answers it (another client's, broadcast, does not): `ok` is
+/// `SettingApplied` with the new view, `ok: false` and a refusal (an
+/// observer is not the input owner) are `SettingRefused` with the id.
+#[tokio::test]
+async fn set_is_answered_by_its_own_id() {
+    let mut fake = Fake::start("set").await;
+    let (client, events) = fake.client();
+    client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+
+    let id = client.set(Setting::system_prompt("You are Capri.")).unwrap();
+    assert_eq!(conn.recv_cmd().await, json!({"cmd": "set", "id": id, "setting": {"setting": "system_prompt", "text": "You are Capri."}}));
+    // Someone else's reply first: not ours.
+    conn.event(40, applied(id + 1000, "model", true, None, json!({"model": "other"}))).await;
+    conn.event(41, applied(id, "system_prompt", true, None, json!({"model": "m", "system_prompt": "You are Capri."}))).await;
+    let (got, view) = wait(&events, "applied", |e| match e {
+        Event::SettingApplied { id, setting, view, .. } => Some((*id, (setting.clone(), view.clone()))),
+        _ => None,
+    })
+    .await;
+    assert_eq!(got, id);
+    assert_eq!(view.0, "system_prompt");
+    assert_eq!(view.1["system_prompt"], "You are Capri.");
+
+    let id2 = client.set(Setting::reasoning_level("low")).unwrap();
+    assert_ne!(id2, id);
+    assert_eq!(conn.recv_cmd().await["setting"], json!({"setting": "reasoning_level", "level": "low"}));
+    conn.event(42, applied(id2, "reasoning_level", false, Some("model does not support reasoning"), json!({}))).await;
+    let refused = |e: &Event| match e {
+        Event::Error { error: Error::SettingRefused { id, setting, reason }, .. } => Some((*id, setting.clone(), reason.clone())),
+        _ => None,
+    };
+    let r = wait(&events, "ok false", refused).await;
+    assert_eq!(r, (id2, "reasoning_level".to_string(), "model does not support reasoning".to_string()));
+
+    // Not the input owner: the session refuses it (no id on the wire).
+    let id3 = client.set(Setting::model("m2")).unwrap();
+    assert_eq!(conn.recv_cmd().await["setting"], json!({"setting": "model", "model": "m2"}));
+    conn.event(43, json!({"ev": "refused", "client": 2, "command": "set", "reason": "input is owned by client #1"})).await;
+    let r = wait(&events, "owner refusal", refused).await;
+    assert_eq!(r, (id3, "model".to_string(), "input is owned by client #1".to_string()));
+    client.shutdown().unwrap();
+}
+
+/// A `Set` still waiting when the session connection drops is refused
+/// (it may have applied: the next `Attached` view says).
+#[tokio::test]
+async fn a_set_cut_off_by_a_drop_is_refused() {
+    let mut fake = Fake::start("set-drop").await;
+    let (client, events) = fake.client();
+    client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    let id = client.set(Setting::model("m2")).unwrap();
+    conn.recv_cmd().await;
+    drop(conn);
+    let (got, reason) = wait(&events, "refused", |e| match e {
+        Event::Error { error: Error::SettingRefused { id, reason, .. }, .. } => Some((*id, reason.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(got, id);
+    assert!(reason.contains("may have applied"), "{reason}");
+    client.shutdown().unwrap();
 }

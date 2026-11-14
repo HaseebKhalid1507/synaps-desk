@@ -120,6 +120,11 @@ pub struct CreateOptions {
     /// (`Event::CwdFallback`). The folder is never checked locally: with a
     /// forwarded socket it lives on another machine.
     pub fallback_cwd: Option<Cwd>,
+    /// The new session's system prompt (text), `SessionConfig.system`.
+    /// Ignored by the daemon when the create attaches to a live session
+    /// (a named retry, a live resume): set it there with
+    /// [`Client::set`] ([`Setting::SystemPrompt`]).
+    pub system: Option<String>,
 }
 
 impl CreateOptions {
@@ -150,6 +155,10 @@ impl CreateOptions {
         self.fallback_cwd = Some(cwd);
         self
     }
+    pub fn system(mut self, text: impl Into<String>) -> Self {
+        self.system = Some(text.into());
+        self
+    }
 
     pub fn config(&self) -> CreateConfig {
         CreateConfig {
@@ -158,6 +167,7 @@ impl CreateOptions {
             name: self.name.clone(),
             continue_session: self.resume.clone().map(Some),
             auto_approve_confirms: false,
+            system: self.system.clone(),
         }
     }
 }
@@ -204,6 +214,12 @@ pub enum Command {
         name: Option<String>,
         expect: Option<Option<String>>,
     },
+    /// `Set` on the session → `Event::SettingApplied` or
+    /// `Error::SettingRefused` with this `id`. See [`Client::set`].
+    Set {
+        id: u64,
+        setting: Setting,
+    },
     Detach,
     Shutdown,
 }
@@ -222,6 +238,7 @@ impl Command {
             Command::Resync => "query",
             Command::SavedSessions { .. } => "saved_sessions",
             Command::Rename { .. } => "rename",
+            Command::Set { .. } => "set",
             Command::Detach => "detach",
             Command::Shutdown => "shutdown",
         }
@@ -252,6 +269,7 @@ impl std::fmt::Debug for Command {
             Command::Rename { session_id, name, expect } => {
                 f.debug_struct("Rename").field("session_id", session_id).field("name", name).field("expect", expect).finish()
             }
+            Command::Set { id, setting } => f.debug_struct("Set").field("id", id).field("setting", setting).finish(),
             other => f.write_str(match other {
                 Command::RefreshSessions => "RefreshSessions",
                 Command::Cancel => "Cancel",
@@ -310,6 +328,12 @@ pub enum Error {
     /// The daemon does not list this `Welcome.features` entry; nothing was
     /// sent.
     Unsupported { feature: &'static str },
+    /// A [`Client::set`] that was not applied: the session said `ok: false`
+    /// (`reason` is its message), refused it (not the input owner: an
+    /// `Observe` attach), or it could not go out (not connected, or the
+    /// connection dropped before the reply: compare the next `Attached`
+    /// view, it may have applied). `setting` is the wire name.
+    SettingRefused { id: u64, setting: String, reason: String },
 }
 
 impl std::fmt::Display for Error {
@@ -322,6 +346,7 @@ impl std::fmt::Display for Error {
             Error::Decode(e) => e.fmt(f),
             Error::NotAttached { command } => write!(f, "{command}: not attached to a session"),
             Error::Unsupported { feature } => write!(f, "this daemon does not support {feature}"),
+            Error::SettingRefused { setting, reason, .. } => write!(f, "set {setting} refused: {reason}"),
         }
     }
 }
@@ -420,6 +445,18 @@ pub enum Event {
     },
     /// Reply to [`Client::rename`]: not renamed (see [`RenameRefusal`]).
     RenameFailed(RenameFailure),
+    /// Reply to [`Client::set`] `id`: applied. `view` is the session's
+    /// `RuntimeView` after it (as `Attached::view`); `message` the daemon's
+    /// note, if any. (The raw `setting_changed` event also comes as an
+    /// `Event::Session`, as every client's does.)
+    SettingApplied {
+        attach_seq: u64,
+        session_id: String,
+        id: u64,
+        setting: String,
+        message: Option<String>,
+        view: Value,
+    },
 }
 
 impl Event {
@@ -432,6 +469,7 @@ impl Event {
             | Event::History { attach_seq, .. }
             | Event::InputOwner { attach_seq, .. }
             | Event::CwdFallback { attach_seq, .. }
+            | Event::SettingApplied { attach_seq, .. }
             | Event::Detached { attach_seq, .. } => Some(*attach_seq),
             Event::Error { attach_seq, .. } => *attach_seq,
             Event::Status(_)
@@ -516,6 +554,9 @@ pub struct Client {
     seq: Arc<Mutex<u64>>,
     /// The control connection's `Welcome.features`; `None` while it is down.
     features: Features,
+    /// The next [`Client::set`] id: random below the reserved range (the
+    /// replies are broadcast), then counting.
+    set_ids: Arc<AtomicU64>,
 }
 
 type Features = Arc<Mutex<Option<Vec<String>>>>;
@@ -530,7 +571,8 @@ impl Client {
         let features: Features = Arc::default();
         let f2 = features.clone();
         std::thread::Builder::new().name("synaps-conn".into()).spawn(move || rt.block_on(run(options, rx, etx, f2)))?;
-        Ok((Client { tx, seq: Arc::new(Mutex::new(0)), features }, erx))
+        let set_ids = Arc::new(AtomicU64::new(crate::conn::random_pair().0 & ((RESERVED_QUERY_ID_BASE >> 1) - 1)));
+        Ok((Client { tx, seq: Arc::new(Mutex::new(0)), features, set_ids }, erx))
     }
 
     /// Discover the daemon for `profile` (`None`: `$SYNAPS_PROFILE`, else
@@ -586,6 +628,20 @@ impl Client {
     /// sent again rather than given up.
     pub fn resume(&self, id_or_name: impl Into<String>, options: CreateOptions) -> Result<u64, ClientClosed> {
         self.post(Command::Create(options.resume(id_or_name)))
+    }
+
+    /// Change a setting of the attached session (`Set`): its system prompt,
+    /// model or reasoning level. Returns the id the reply carries:
+    /// `Event::SettingApplied { id, view, .. }`, or
+    /// `Event::Error { error: Error::SettingRefused { id, .. } }` when the
+    /// session says `ok: false`, refuses it (only the input owner may set:
+    /// attach `Mirror` first, not `Observe`) or it cannot go out. The daemon
+    /// keeps it across a daemon reload and in the journal (a resume restores
+    /// it), so set only what differs from `Attached::view`.
+    pub fn set(&self, setting: Setting) -> Result<u64, ClientClosed> {
+        let id = self.set_ids.fetch_add(1, Ordering::Relaxed);
+        self.post(Command::Set { id, setting })?;
+        Ok(id)
     }
 
     /// The connected daemon's `Welcome.features`; `None` while the control
@@ -1145,6 +1201,11 @@ async fn without_session<F: Future>(
             cmd = cmds.recv() => match cmd {
                 None | Some(Command::Detach) | Some(Command::Shutdown) => return None,
                 Some(Command::Resync) | Some(Command::RefreshSessions) => {}
+                Some(Command::Set { id, setting }) => emit_error(events, Some(attach_seq), Error::SettingRefused {
+                    id,
+                    setting: setting.name().into(),
+                    reason: "not connected to the session (attaching or reconnecting)".into(),
+                }),
                 Some(c) => emit_error(events, Some(attach_seq), Error::Refused {
                     command: Some(c.name().into()),
                     reason: "not connected to the session (attaching or reconnecting)".into(),
@@ -1241,6 +1302,8 @@ async fn session_loop(
             cmd: SessionCommand::Query { id: query_id, query: SessionQuery::Messages },
         };
         let rejected = attached.rejected;
+        // Our `Set`s awaiting their `SettingChanged` (or a refusal), in order.
+        let mut sets: VecDeque<(u64, &'static str)> = VecDeque::new();
         let connection = sh.connections.fetch_add(1, Ordering::Relaxed) + 1;
         attached.connection = connection;
         emit(&events, Event::Attached { attach_seq, attached, mode, reconnect: previous.is_some() });
@@ -1278,6 +1341,10 @@ async fn session_loop(
                             resync = Some(None);
                             SessionCommand::Query { id: query_id, query: SessionQuery::Messages }
                         }
+                        Command::Set { id, setting } => {
+                            sets.push_back((id, setting.name()));
+                            SessionCommand::Set { id, setting }
+                        }
                         _ => continue,
                     };
                     if let Err(e) = conn.send(&ClientFrame::Cmd { session_id: sid.clone(), cmd: wire }).await {
@@ -1299,6 +1366,22 @@ async fn session_loop(
                             let update = m.update(messages);
                             emit(&events, Event::History { attach_seq, session_id: esid, seq, update });
                             continue;
+                        }
+                        if v.get("ev").and_then(Value::as_str) == Some("setting_changed")
+                            && let Some(id) = v.pointer("/applied/id").and_then(Value::as_u64)
+                            && let Some(at) = sets.iter().position(|s| s.0 == id)
+                        {
+                            let (id, name) = sets.remove(at).expect("position");
+                            let a = &v["applied"];
+                            let setting = a.get("setting").and_then(Value::as_str).unwrap_or(name).to_string();
+                            let message = a.get("message").and_then(Value::as_str).map(str::to_string);
+                            if a.get("ok").and_then(Value::as_bool) == Some(true) {
+                                let view = a.get("view").cloned().unwrap_or(Value::Null);
+                                emit(&events, Event::SettingApplied { attach_seq, session_id: esid.clone(), id, setting, message, view });
+                            } else {
+                                let reason = message.unwrap_or_else(|| "not applied".into());
+                                emit_error(&events, Some(attach_seq), Error::SettingRefused { id, setting, reason });
+                            }
                         }
                         if v.get("ev").and_then(Value::as_str) == Some("query_result") {
                             // Only our own resync is ours. Another client's
@@ -1337,6 +1420,11 @@ async fn session_loop(
                             SessionEvent::InputOwnerChanged { to, reason, .. } => {
                                 owner = *to;
                                 emit(&events, Event::InputOwner { attach_seq, session_id: esid.clone(), client: me, owner, reason: reason.clone() });
+                            }
+                            // Refusals carry no id: a refused `Set` is our oldest one.
+                            SessionEvent::Refused { client, command, reason } if *client == me && command == "set" && !sets.is_empty() => {
+                                let (id, setting) = sets.pop_front().expect("non-empty");
+                                emit_error(&events, Some(attach_seq), Error::SettingRefused { id, setting: setting.into(), reason: reason.clone() });
                             }
                             SessionEvent::Refused { client, command, reason } if *client == me => {
                                 emit_error(&events, Some(attach_seq), Error::Refused { command: Some(command.clone()), reason: reason.clone() });
@@ -1398,6 +1486,19 @@ async fn session_loop(
                 }
             }
         };
+        for (id, setting) in sets.drain(..) {
+            emit_error(
+                &events,
+                Some(attach_seq),
+                Error::SettingRefused {
+                    id,
+                    setting: setting.into(),
+                    reason: format!(
+                        "the session connection dropped before the reply ({why}); it may have applied: compare the next Attached view"
+                    ),
+                },
+            );
+        }
         emit(&events, Event::Reattaching { attach_seq, session_id: sid.clone(), reason: why });
         previous = Some(Previous { client: me, session_id: sid, was_owner: owner == Some(me), generation });
         drop(conn);

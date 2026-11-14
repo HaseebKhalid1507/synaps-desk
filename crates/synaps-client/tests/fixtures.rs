@@ -382,6 +382,26 @@ fn client_frames_encode_as_the_daemon_expects() {
     let create = CreateConfig { cwd: Some("/work".into()), ..Default::default() };
     let create = encode_frame(&ClientFrame::Attach(Attach::Create { config: create, mode: AttachMode::Mirror })).unwrap();
     assert!(create.contains("\"cwd\":\"/work\""), "{create}");
+    assert!(!create.contains("\"system\""), "no system prompt: the key is absent, {create}");
+}
+
+/// `Set` and `SessionConfig.system` exactly as agent-engine's `types.rs`
+/// (`command_json_round_trip`, `SessionSetting`) and `SessionConfig` read them.
+#[test]
+fn settings_and_the_create_system_prompt_encode_as_the_daemon_expects() {
+    let set =
+        |setting: Setting| encode_frame(&ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Set { id: 7, setting } }).unwrap();
+    assert_eq!(
+        set(Setting::reasoning_level("ultra")),
+        "{\"type\":\"cmd\",\"session_id\":\"s\",\"cmd\":{\"cmd\":\"set\",\"id\":7,\"setting\":{\"setting\":\"reasoning_level\",\"level\":\"ultra\"}}}\n"
+    );
+    assert!(set(Setting::model("claude-opus-4-6")).contains("{\"setting\":\"model\",\"model\":\"claude-opus-4-6\"}"));
+    assert!(set(Setting::system_prompt("You are Capri.")).contains("{\"setting\":\"system_prompt\",\"text\":\"You are Capri.\"}"));
+    assert_eq!(Setting::system_prompt("x").name(), "system_prompt");
+    assert_eq!(format!("{:?}", Setting::system_prompt("You are Capri.")), "SystemPrompt { text: <14 bytes> }");
+    let create = CreateConfig { system: Some("You are Capri.".into()), ..Default::default() };
+    let create = encode_frame(&ClientFrame::Attach(Attach::Create { config: create, mode: AttachMode::Observe })).unwrap();
+    assert!(create.contains("\"system\":\"You are Capri.\""), "{create}");
 }
 
 /// M9: `Debug` never prints user text or a secret answer.

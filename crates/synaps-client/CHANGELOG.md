@@ -1,5 +1,17 @@
 # synaps-client changelog
 
+## Since a982132
+
+Additive (PR `feat/client-set-system`), for synaps-avatar's persona. One struct-literal break: `CreateConfig` gained a field (a literal needs `..Default::default()`; nothing in this workspace builds one without it).
+
+- New `CreateOptions::system` / `.system(text)` and `CreateConfig::system: Option<String>`: the new session's system prompt TEXT, sent as `config.system` (agent-engine `SessionConfig.system`, `EngineOpts.system`); absent when `None`. A create that attaches to a live session instead (a named retry, a live resume) does not apply it: use `Client::set`.
+- New `Client::set(Setting) -> Result<u64, ClientClosed>` and `Command::Set { id, setting }`: the session's `Set{id, setting}` for `Setting::SystemPrompt { text }`, `Setting::Model { model }`, `Setting::ReasoningLevel { level }` (wire `{"setting":"system_prompt","text":…}`, `{"setting":"model","model":…}`, `{"setting":"reasoning_level","level":…}`). The returned id is random below `RESERVED_QUERY_ID_BASE`, then counting (the replies are broadcast to every attached client). The daemon keeps a Set in `settings_replay` (across a daemon reload) and in the journal (a resume restores it).
+- New `Event::SettingApplied { attach_seq, session_id, id, setting, message, view }`: our `SettingChanged` with `ok: true`; `view` is the session's `RuntimeView` after it (as `Attached::view`). Another client's `SettingChanged` (and the daemon's `VIEW_CHANGED_SETTING_ID`) never becomes one; the raw `setting_changed` still comes as `Event::Session`, as before.
+- New `Error::SettingRefused { id, setting, reason }` (`Error` is `#[non_exhaustive]`): a Set that was not applied: `ok: false` (the daemon's message), refused by the session (`Refused{command: "set"}`: only the input owner may set, so an `Observe` attach is refused; refusals carry no id, so it is the oldest Set still waiting), sent while attaching/reconnecting, or cut off by a dropped connection ("it may have applied": compare the next `Attached` view). A refused `set` no longer comes as `Error::Refused { command: "set" }` while a Set of ours is waiting.
+- Tests: `tests/fixtures.rs` `settings_and_the_create_system_prompt_encode_as_the_daemon_expects`; `tests/fake_daemon.rs` `a_create_carries_the_system_prompt`, `set_is_answered_by_its_own_id`, `a_set_cut_off_by_a_drop_is_refused`.
+
+For synaps-avatar (nyx): create her own session with `.system(persona)` and `.model(m)`, then `set(Setting::reasoning_level(..))` after the attach; on attaching to her existing session, set only what differs from `attached.view` (`system_prompt`, `model`, `reasoning_level`), from a `Mirror` attach.
+
 ## Since cedbdbd
 
 Additive only (PR `polish/layout-backlog`), plus two behaviour fixes. Nothing existing changes shape: code that builds `Event::Attached { .. }` or matches `Command`, `ToolOutcome` or `ToolStatus` exhaustively (all `#[non_exhaustive]`) compiles as before.
