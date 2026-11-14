@@ -12,9 +12,10 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use synaps_client::protocol::{LlmEvent, SessionEvent, SessionStreamEvent, StreamEvent};
 
-use synaps_client::{Event, synthetic};
+use synaps_client::protocol::{DaemonFrame, SessionMeta, decode_frame};
+use synaps_client::{AttachMode, Event, synthetic};
 
-use crate::app::AppView;
+use crate::app::{AppView, Open, TabKey};
 use crate::mem;
 use crate::model::LOCAL_SEQ;
 
@@ -29,6 +30,10 @@ pub struct BenchOptions {
     pub drag_secs: f64,
     pub history_messages: usize,
     pub diag: bool,
+    /// `--bench-tabs`: only the tab measurements ([`TAB_SESSIONS`] sessions
+    /// of [`DRAG_TURNS`] turns: RSS with 1, 4 and 8 tabs, switch times
+    /// cached and not).
+    pub tabs: bool,
 }
 
 pub struct BenchState {
@@ -44,6 +49,8 @@ pub struct BenchState {
     pub first_text_at: Option<Instant>,
     pub idle_at: Option<Instant>,
     pub attached_at: Option<Instant>,
+    /// When the last `Attached` reached the pump (the tab bench).
+    pub last_attached: Option<Instant>,
     pub received_deltas: usize,
 }
 
@@ -60,6 +67,7 @@ impl BenchState {
             first_text_at: None,
             idle_at: None,
             attached_at: None,
+            last_attached: None,
             received_deltas: 0,
         }
     }
@@ -69,6 +77,7 @@ impl BenchState {
             match e {
                 Event::Attached { .. } => {
                     self.attached_at.get_or_insert(now);
+                    self.last_attached = Some(now);
                 }
                 Event::Session { event, .. } => match event {
                     SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { .. }) } => {
@@ -120,6 +129,20 @@ impl BenchState {
             FrameEvent::Present(p) if p.present_end >= t => Some(p.present_end),
             _ => None,
         })
+    }
+
+    /// The first frame drawn from `t` on: its draw time and when it was
+    /// on screen.
+    fn frame_after(&self, t: Instant) -> Option<(Duration, Instant)> {
+        let (k, draw) = self.frames.iter().enumerate().find_map(|(k, f)| match f {
+            FrameEvent::Draw(d) if d.draw_start >= t => Some((k, d.draw_duration())),
+            _ => None,
+        })?;
+        let shown = self.frames[k..].iter().find_map(|f| match f {
+            FrameEvent::Present(p) => Some(p.present_end),
+            _ => None,
+        })?;
+        Some((draw, shown))
     }
 
     fn refresh(&self) -> Option<Duration> {
@@ -192,6 +215,30 @@ impl BenchState {
 const DRAG_PX_PER_S: f32 = 400.;
 /// The drag scenario's transcript, in user turns.
 const DRAG_TURNS: usize = 400;
+/// The tab bench's sessions.
+const TAB_SESSIONS: usize = 8;
+/// Its tab switches, cached and not (each half).
+const TAB_SWITCHES: usize = 8;
+
+/// A synthetic history of `n` user turns.
+fn turns(n: usize, seed: u64) -> Vec<Value> {
+    let mut h = synthetic::history(n * 3, seed);
+    let cut = h.iter().enumerate().filter(|(_, m)| m["role"] == "user" && m["content"].is_string()).nth(n).map(|(i, _)| i);
+    h.truncate(cut.unwrap_or(h.len()));
+    h
+}
+
+/// A daemon's `Attached` for `id` with history `h`, through the client's
+/// own decoder.
+fn attached_event(id: &str, attach_seq: u64, h: &[Value]) -> Option<Event> {
+    let frame = json!({"type": "attached", "client": 2, "input_owner": 2, "client_input": "shared",
+        "meta": {"id": id, "model": "m", "lifecycle": "live"},
+        "conversation": {"messages_len": h.len(), "api_messages": h}});
+    match decode_frame(&frame.to_string()) {
+        Ok(DaemonFrame::Attached(attached)) => Some(Event::Attached { attach_seq, attached, mode: AttachMode::Mirror, reconnect: false }),
+        _ => None,
+    }
+}
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
@@ -271,6 +318,151 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             }
             sleep(1.5).await;
             out["mem_idle"] = mem::sample();
+            if opts.tabs {
+                // A synthetic daemon with 8 sessions of 400 turns; it answers
+                // each attach off the UI thread (encode, decode), as the
+                // connection thread would.
+                let hist: Arc<Vec<Arc<Vec<Value>>>> =
+                    Arc::new((0..TAB_SESSIONS).map(|k| Arc::new(turns(DRAG_TURNS, 30 + k as u64))).collect());
+                let ids: Arc<Vec<String>> = Arc::new((0..TAB_SESSIONS).map(|k| format!("20261114-0900{k:02}-b{k:03}")).collect());
+                let metas: Vec<SessionMeta> = ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, id)| {
+                        serde_json::from_value(json!({"id": id, "title": format!("Bench tab {}", k + 1), "model": "m", "lifecycle": "live",
+                            "messages": hist[k].len(), "created_at": format!("2026-11-14T09:00:{k:02}Z")}))
+                        .ok()
+                    })
+                    .collect();
+                let _ = tx.try_send(Event::Sessions(metas));
+                let (tx2, ids2, hist2) = (tx.clone(), ids.clone(), hist.clone());
+                let _ = upd(cx, &move |v, _| {
+                    v.synthetic_tx = Some(tx2.clone());
+                    let (tx3, ids3, hist3) = (tx2.clone(), ids2.clone(), hist2.clone());
+                    v.attach_source = Some(Box::new(move |sid: &str, seq: u64| {
+                        if let Some(k) = ids3.iter().position(|i| i == sid) {
+                            let (tx, sid, h) = (tx3.clone(), sid.to_string(), hist3[k].clone());
+                            std::thread::spawn(move || {
+                                if let Some(ev) = attached_event(&sid, seq, &h) {
+                                    let _ = tx.try_send(ev);
+                                }
+                            });
+                        }
+                        Vec::new()
+                    }));
+                });
+                sleep(0.3).await;
+                let wait_attached = async |cx: &mut AsyncWindowContext, id: &str| {
+                    for _ in 0..400 {
+                        let done = view.update(cx, |v, _| v.model.is_active(id)).unwrap_or(true);
+                        if done {
+                            return Some(Instant::now());
+                        }
+                        sleep(0.005).await;
+                    }
+                    None
+                };
+                // The first frame drawn from `t` on, once it was on screen.
+                let wait_frame = async |cx: &mut AsyncWindowContext, t: Instant| {
+                    for _ in 0..400 {
+                        let f = view
+                            .update(cx, |v, _| {
+                                let b = v.bench.as_mut().unwrap();
+                                b.drain();
+                                b.frame_after(t)
+                            })
+                            .ok()
+                            .flatten();
+                        if f.is_some() {
+                            return f;
+                        }
+                        sleep(0.002).await;
+                    }
+                    None
+                };
+                let mut mem_tabs = json!({});
+                for (k, id) in ids.iter().enumerate() {
+                    let id2 = id.clone();
+                    let _ = upd(cx, &move |v, _| {
+                        let place = if k == 0 { crate::tabs::Place::Current } else { crate::tabs::Place::New };
+                        v.open_tab(Open::Attach { session_id: id2.clone(), fallback: None, open: false }, place);
+                    });
+                    if let Some(t) = wait_attached(cx, id).await {
+                        wait_frame(cx, t).await;
+                    }
+                    if matches!(k + 1, 1 | 4 | 8) {
+                        sleep(0.5).await;
+                        let mut m = mem::sample();
+                        m["cached_tabs"] = json!(view.update(cx, |v, _| v.tab_cache.len()).unwrap_or(0));
+                        mem_tabs[format!("tabs_{}", k + 1)] = m;
+                    }
+                }
+                out["mem_tabs"] = mem_tabs;
+                let rows = view.update(cx, |v, _| v.model.transcript.len()).unwrap_or(0);
+                // Switch between the first two tabs; the second half drops the
+                // target's cache first (a tab that fell out of it).
+                let mut runs: Vec<Value> = Vec::new();
+                for k in 0..2 * TAB_SWITCHES {
+                    let target = k % 2;
+                    let uncached = k >= TAB_SWITCHES;
+                    let id = ids[target].clone();
+                    sleep(0.25).await;
+                    let t0 = Instant::now();
+                    let id2 = id.clone();
+                    let _ = upd(cx, &move |v, cx| {
+                        if uncached {
+                            let _ = v.tab_cache.take(&id2);
+                        }
+                        v.tab_key(TabKey::Nth(target), cx);
+                    });
+                    let switched = Instant::now();
+                    // What the switch put on screen before any attach: the
+                    // cached rows, or none.
+                    let rows_at_switch = view.update(cx, |v, _| v.model.transcript.len()).unwrap_or(0);
+                    let shown = wait_frame(cx, t0).await;
+                    wait_attached(cx, &id).await;
+                    let at = view.update(cx, |v, _| v.bench.as_ref().unwrap().last_attached).ok().flatten().filter(|a| *a >= t0);
+                    let drawn = match at {
+                        Some(t) => wait_frame(cx, t).await,
+                        None => None,
+                    };
+                    let since = |t: Instant| round(ms(t.duration_since(t0)), 2);
+                    runs.push(json!({
+                        "uncached": uncached,
+                        "switch_call_ms": since(switched),
+                        "rows_at_switch": rows_at_switch,
+                        "first_frame_draw_ms": shown.map(|f| round(ms(f.0), 2)),
+                        "first_frame_shown_ms": shown.map(|f| since(f.1)),
+                        "attached_ms": at.map(since),
+                        "attached_frame_draw_ms": drawn.map(|f| round(ms(f.0), 2)),
+                        "attached_frame_shown_ms": drawn.map(|f| since(f.1)),
+                    }));
+                }
+                let keys = [
+                    "rows_at_switch",
+                    "switch_call_ms",
+                    "first_frame_draw_ms",
+                    "first_frame_shown_ms",
+                    "attached_ms",
+                    "attached_frame_draw_ms",
+                    "attached_frame_shown_ms",
+                ];
+                let summary = |uncached: bool, key: &str| {
+                    let v: Vec<f64> = runs.iter().filter(|r| r["uncached"] == uncached).filter_map(|r| r[key].as_f64()).collect();
+                    pct(&v)
+                };
+                out["tab_switch"] = json!({
+                    "turns": DRAG_TURNS, "rows": rows, "messages": hist[0].len(),
+                    "cached": keys.iter().map(|k| (k.to_string(), summary(false, k))).collect::<serde_json::Map<_, _>>(),
+                    "uncached": keys.iter().map(|k| (k.to_string(), summary(true, k))).collect::<serde_json::Map<_, _>>(),
+                    "runs": runs,
+                });
+                out["mem_end"] = mem::sample();
+                out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
+                println!("{out}");
+                let _ = cx.update(|_, cx| cx.quit());
+                return;
+            }
             if opts.diag {
                 let stats = |cx: &mut AsyncWindowContext, t0: Instant, t1: Instant| {
                     view.update(cx, |v, _| {
@@ -449,11 +641,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             let _ = upd(cx, &|v, _| {
                 v.model.set_local_session("bench-drag");
                 v.reset_transcript();
-                let mut h = synthetic::history(DRAG_TURNS * 3, 13);
-                let cut =
-                    h.iter().enumerate().filter(|(_, m)| m["role"] == "user" && m["content"].is_string()).nth(DRAG_TURNS).map(|(i, _)| i);
-                h.truncate(cut.unwrap_or(h.len()));
-                v.model.transcript.apply_history(&h);
+                v.model.transcript.apply_history(&turns(DRAG_TURNS, 13));
                 v.sync_list();
                 v.list.set_follow_mode(FollowMode::Tail);
                 v.list.scroll_to_end();
