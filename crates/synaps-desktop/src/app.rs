@@ -154,7 +154,9 @@ actions!(
         Tab6,
         Tab7,
         Tab8,
-        LastTab
+        LastTab,
+        OpenSettings,
+        OpenUsage
     ]
 );
 
@@ -174,6 +176,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(smaller, TextSmaller, None),
         KeyBinding::new(reset, TextReset, None),
     ];
+    let (settings, usage) = crate::views::view_keys(mac);
+    keys.push(KeyBinding::new(settings, OpenSettings, None));
+    keys.push(KeyBinding::new(usage, OpenUsage, None));
     for &(k, t) in tab_keys(mac) {
         keys.push(match t {
             TabKey::New => KeyBinding::new(k, NewTab, None),
@@ -818,6 +823,19 @@ pub struct AppView {
     pub(crate) tab_labels: crate::tabstrip::Labels,
     /// The synthetic daemon's attach replies.
     pub(crate) attach_source: Option<AttachSource>,
+    /// Settings and Usage ([`crate::views`]): their state, the dash channel
+    /// they read, this app's own new settings, the gear's menu (and where
+    /// the mouse-down that closed it from outside was), and the view on
+    /// screen at the last frame.
+    pub(crate) settings: crate::settings_view::SettingsUi,
+    pub(crate) usage: crate::usage_view::UsageUi,
+    pub(crate) dash: crate::views::DashUi,
+    pub(crate) app_settings: crate::settings_view::AppSettings,
+    pub(crate) settings_find: Entity<InputState>,
+    pub(crate) settings_input: Entity<InputState>,
+    pub(crate) gear_menu: bool,
+    pub(crate) gear_dismissed: Option<Point<Pixels>>,
+    shown_view: Option<crate::tabs::Kind>,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -869,6 +887,8 @@ impl AppView {
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
         let secret_input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("answer (hidden)"));
+        let settings_find = cx.new(|cx| InputState::new(window, cx).placeholder("find a setting"));
+        let settings_input = cx.new(|cx| InputState::new(window, cx));
         let mut subs = vec![
             cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { shift: false, .. } = ev {
@@ -926,6 +946,26 @@ impl AppView {
                     this.answer_secret(true, window, cx);
                 }
             }),
+            cx.subscribe_in(&settings_find, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
+                if let InputEvent::Change = ev {
+                    let text = input.read(cx).value().to_string();
+                    this.settings_find(text, cx);
+                }
+            }),
+            cx.subscribe_in(&settings_input, window, |this: &mut Self, _input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => {
+                    this.settings_commit(cx);
+                    window.focus(&this.focus, cx);
+                }
+                // Clicked away: the edit is left as it was.
+                InputEvent::Blur => {
+                    let was = this.settings.editing.take();
+                    if was.is_some() {
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            }),
         ];
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -965,7 +1005,8 @@ impl AppView {
             this.flush_tabs();
             async {}
         }));
-        let inputs = Inputs { composer, find_input, name_input, hex_input, secret_input, focus };
+        crate::views::view_fallbacks(cx.weak_entity(), cx);
+        let inputs = Inputs { composer, find_input, name_input, hex_input, secret_input, settings_find, settings_input, focus };
         match (client, synthetic) {
             (Some((c, rx)), _) => {
                 let mut v = Self::blank(inputs, Some(c), ConnState::Connecting, subs);
@@ -1072,6 +1113,15 @@ impl AppView {
             tab_room: 0,
             tab_labels: Default::default(),
             attach_source: None,
+            settings: Default::default(),
+            usage: crate::usage_view::UsageUi::new(None, Default::default()),
+            dash: Default::default(),
+            app_settings: Default::default(),
+            settings_find: i.settings_find,
+            settings_input: i.settings_input,
+            gear_menu: false,
+            gear_dismissed: None,
+            shown_view: None,
             _tasks: Vec::new(),
             _subs: subs,
         }
@@ -1181,7 +1231,9 @@ impl AppView {
         {
             o.0 = into;
         }
-        let visible = self.model.tabs.visible().map(|t| (t.id, t.session.as_deref()));
+        // A view on screen leaves the session tab behind it current: the
+        // composer stays that tab's.
+        let visible = self.model.tabs.composer_tab();
         if self.restore.is_none() && Drafts::owns(self.composer_of.as_ref(), visible) {
             return;
         }
@@ -1390,7 +1442,8 @@ impl AppView {
     pub(crate) fn reconcile(&mut self, hint: Option<(Option<ResumeRequest>, bool)>) {
         let dropped = std::mem::take(&mut self.model.tabs.dropped);
         self.restore_notice(dropped);
-        let vis = self.model.tabs.visible().map(|t| (t.id, t.session.clone()));
+        // A view on screen leaves the session tab behind it current.
+        let vis = self.model.tabs.current().map(|t| (t.id, t.session.clone()));
         if let Some((_, Some(s))) = &vis
             && self.model.wanted_session() == Some(s.as_str())
         {
@@ -1486,7 +1539,7 @@ impl AppView {
     fn attach_tab(&mut self, session: String, hint: Option<(Option<ResumeRequest>, bool)>) {
         let (fallback, open) = hint.unwrap_or_else(|| (self.model.tab_fallback(&session), false));
         self.attach_wait = None;
-        let restoring = self.model.tabs.visible().is_some_and(|t| self.model.tabs.restoring(t.id));
+        let restoring = self.model.tabs.current().is_some_and(|t| self.model.tabs.restoring(t.id));
         if restoring || (self.client.is_some() && self.gate.switch(Instant::now())) {
             self.model.showing(&session);
             // A restored tab attaches once a list has its session (`start_tabs`).
@@ -1533,7 +1586,7 @@ impl AppView {
             return self.arm_attach(cx);
         }
         if let Some((s, fallback, open)) = self.attach_wait.take()
-            && self.model.tabs.visible_session() == Some(s.as_str())
+            && self.model.tabs.current_session() == Some(s.as_str())
             && self.model.active.is_none()
         {
             self.attach_now(s, fallback, open);
@@ -1590,7 +1643,7 @@ impl AppView {
                 self.tabs_saved = self.model.tabs.generation;
                 self.tabs_written = self.tabs_saved;
             }
-            let vis = self.model.tabs.visible().map(|t| (t.id, t.session.clone()));
+            let vis = self.model.tabs.current().map(|t| (t.id, t.session.clone()));
             if vis != self.shown_tab {
                 // A tab followed its session to a new id, or closed.
                 self.model.rail_gen += 1;
@@ -1760,7 +1813,7 @@ impl AppView {
         };
         // The composer's text is the visible tab's only once the frame after
         // a switch has swapped the drafts: never sent to another session.
-        if !Drafts::owns(self.composer_of.as_ref(), self.model.tabs.visible().map(|t| (t.id, t.session.as_deref()))) {
+        if !Drafts::owns(self.composer_of.as_ref(), self.model.tabs.composer_tab()) {
             self.model.last_error = Some("switching tabs: not sent".into());
             self.model.view_dirty = true;
             return false;
@@ -1789,7 +1842,7 @@ impl AppView {
     /// nothing yet) while its attach is on its way: nothing on screen is
     /// live.
     pub(crate) fn opening(&self) -> bool {
-        self.model.active.is_none() && self.model.tabs.visible_session().is_some() && !self.model.stats.detached
+        self.model.active.is_none() && self.model.tabs.current_session().is_some() && !self.model.stats.detached
     }
 
     /// A daemon is connected and this attachment may drive it (the
@@ -1986,6 +2039,17 @@ impl AppView {
         self.end_drag(cx);
         self.drag = None;
         let Some(p) = toggled(self.width, self.panels, rail) else { return };
+        self.set_panels(p, cx);
+    }
+
+    /// Every row's height changes with the text size: re-measured now (a
+    /// cached tab's when it comes back).
+    pub(crate) fn text_metrics_changed(&mut self) {
+        self.list.remeasure();
+        self.metrics_gen += 1;
+    }
+
+    pub(crate) fn set_panels_pub(&mut self, p: theme::Panels, cx: &mut Context<Self>) {
         self.set_panels(p, cx);
     }
 
@@ -2289,7 +2353,7 @@ impl AppView {
             .transcript
             .title()
             .or(self.model.active_name())
-            .or(self.model.tabs.visible().map(|t| t.label.as_str()))
+            .or(self.model.tabs.current().map(|t| t.label.as_str()))
             .unwrap_or("No session")
             .to_string()
             .into();
@@ -2759,6 +2823,8 @@ struct Inputs {
     name_input: Entity<InputState>,
     hex_input: Entity<InputState>,
     secret_input: Entity<InputState>,
+    settings_find: Entity<InputState>,
+    settings_input: Entity<InputState>,
     focus: FocusHandle,
 }
 
@@ -2778,6 +2844,12 @@ impl Render for AppView {
         }
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
+        // Settings or Usage came on screen: what it shows is asked for if stale.
+        let view = self.model.tabs.view();
+        if view != self.shown_view {
+            self.shown_view = view;
+            self.view_shown(cx);
+        }
         // A drag released outside the window has no drop: it ends here.
         if self.drag.is_some_and(|g| g.moved) && !cx.has_active_drag() {
             self.end_drag(cx);
@@ -2799,13 +2871,16 @@ impl Render for AppView {
         // a panel drag changes only the padding, and the list keeps every
         // measured row (it re-measures when its item width changes).
         let pane = (self.width - crate::chrome::MARK - rail.width() - right.width()).max(0.);
+        // A view is not a session: no right panel (it describes one); the
+        // pane takes its width. The session's column keeps its layout.
+        let view_pane = (self.width - crate::chrome::MARK - rail.width()).max(0.);
         let lay = Layout::of(pane, &m);
         if (lay.hang, lay.tight) != (self.layout.hang, self.layout.tight) {
             self.list.remeasure();
             self.metrics_gen += 1;
         }
         self.layout = lay;
-        let tabs = self.render_tabs(pane, &p, cx);
+        let tabs = self.render_tabs(if view.is_some() { view_pane } else { pane }, &p, cx);
         self.schedule_tabs_save(cx);
         if self.attach_wait.is_some() && self.attach_due.is_none() {
             self.arm_attach(cx);
@@ -2817,18 +2892,29 @@ impl Render for AppView {
             .pr(px(pad_r))
             .pt(px((8. * m.r).round()))
             .pb(px((28. * m.r).round()));
-        let main = v_flex()
-            .flex_1()
-            .h_full()
-            .min_w_0()
-            .bg(p.canvas)
-            .child(tabs)
-            .child(self.render_header(&p, cx))
-            .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
-            .child(div().flex_1().min_h_0().child(list))
-            .children(self.render_prompt(&p, &m, cx))
-            .when_some(self.model.last_error.clone(), |d, e| d.child(column(lay, mono(e, m.meta, p.err).pt(px(6.)).whitespace_normal())))
-            .child(self.render_composer(&p, &m, cx));
+        let shown_view = match view {
+            Some(crate::tabs::Kind::Settings) => Some(self.render_settings(view_pane, &p, cx)),
+            Some(crate::tabs::Kind::Usage) => Some(self.render_usage(view_pane, &p, cx)),
+            _ => None,
+        };
+        let main = if let Some(v) = shown_view {
+            v_flex().flex_1().h_full().min_w_0().bg(p.canvas).child(tabs).child(div().flex_1().min_h_0().child(v))
+        } else {
+            v_flex()
+                .flex_1()
+                .h_full()
+                .min_w_0()
+                .bg(p.canvas)
+                .child(tabs)
+                .child(self.render_header(&p, cx))
+                .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
+                .child(div().flex_1().min_h_0().child(list))
+                .children(self.render_prompt(&p, &m, cx))
+                .when_some(self.model.last_error.clone(), |d, e| {
+                    d.child(column(lay, mono(e, m.meta, p.err).pt(px(6.)).whitespace_normal()))
+                })
+                .child(self.render_composer(&p, &m, cx))
+        };
         h_flex()
             .id("root")
             .track_focus(&self.focus)
@@ -2850,6 +2936,17 @@ impl Render for AppView {
                 if this.picker_open && ev.keystroke.key == "escape" {
                     this.close_picker(window, cx);
                     cx.stop_propagation();
+                } else if ev.keystroke.key == "escape"
+                    && (this.gear_menu || this.settings.editing.is_some() || this.settings.dropdown.is_some())
+                {
+                    // The gear's menu, a settings field (left as it was) or a dropdown.
+                    this.gear_menu = false;
+                    this.settings.dropdown = None;
+                    if this.settings.editing.take().is_some() {
+                        window.focus(&this.focus, cx);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
                 } else if ev.keystroke.key == "escape" && this.find_input.read(cx).focus_handle(cx).is_focused(window) {
                     this.find_input.update(cx, |s, cx| s.set_value("", window, cx));
                     this.find.clear();
@@ -2893,6 +2990,8 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &TextBigger, _, cx| this.step_text(Some(1), cx)))
             .on_action(cx.listener(|this, _: &TextSmaller, _, cx| this.step_text(Some(-1), cx)))
             .on_action(cx.listener(|this, _: &TextReset, _, cx| this.step_text(None, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_view(crate::tabs::Kind::Settings, cx)))
+            .on_action(cx.listener(|this, _: &OpenUsage, _, cx| this.open_view(crate::tabs::Kind::Usage, cx)))
             .map(|d| tab_actions(d, cx))
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
                 let k = &ev.keystroke.key;
@@ -2928,15 +3027,18 @@ impl Render for AppView {
                             Side::Strip => d.child(self.render_rail_strip(&p, cx)),
                         })
                         .child(main)
-                        .map(|d| match right {
+                        .when(view.is_none(), |d| match right {
                             Side::Open(w) => d.child(self.render_right(w, &p, cx)),
                             Side::Strip => d.child(self.render_right_strip(&p, cx)),
                         }),
                 ),
             )
             .children(self.render_edge(true, rail, &p, cx))
-            .children(self.render_edge(false, right, &p, cx))
-            .when(self.picker_open, |d| d.child(deferred(self.render_picker(&p, right, cx)).with_priority(1)))
+            .children(view.is_none().then(|| self.render_edge(false, right, &p, cx)).flatten())
+            .when(self.picker_open, |d| {
+                d.child(deferred(self.render_picker(&p, if view.is_some() { Side::Open(0.) } else { right }, cx)).with_priority(1))
+            })
+            .when(self.gear_menu, |d| d.child(deferred(self.render_gear_menu(rail == Side::Strip, &p, cx)).with_priority(2)))
     }
 }
 

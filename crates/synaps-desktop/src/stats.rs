@@ -57,7 +57,8 @@ impl Tokens {
     }
 }
 
-/// `RuntimeView`'s fields the header and gauge use.
+/// `RuntimeView`'s fields the header, the gauge and Settings' THIS
+/// SESSION use.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeInfo {
     pub model: String,
@@ -65,14 +66,33 @@ pub struct RuntimeInfo {
     pub effort: String,
     /// Tokens; 0 when the daemon did not say.
     pub context_window: u64,
+    pub compaction_model: String,
+    /// `None`: not in the view (an older daemon).
+    pub api_retries: Option<u64>,
+    pub subagent_timeout: Option<u64>,
+    pub max_tool_output: Option<u64>,
+    pub bash_timeout: Option<u64>,
+    /// The session's own system prompt (`None`: the daemon's default).
+    pub system_prompt: Option<std::sync::Arc<str>>,
 }
 
 impl RuntimeInfo {
     pub fn from_value(v: &Value) -> Option<Self> {
         let o = v.as_object()?;
         let s = |k: &str| o.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let n = |k: &str| o.get(k).and_then(Value::as_u64);
         let effort = Some(s("reasoning_level")).filter(|e| !e.is_empty()).unwrap_or_else(|| s("thinking_level"));
-        let info = RuntimeInfo { model: s("model"), effort, context_window: o.get("context_window").and_then(Value::as_u64).unwrap_or(0) };
+        let info = RuntimeInfo {
+            model: s("model"),
+            effort,
+            context_window: n("context_window").unwrap_or(0),
+            compaction_model: s("compaction_model"),
+            api_retries: n("api_retries"),
+            subagent_timeout: n("subagent_timeout"),
+            max_tool_output: n("max_tool_output"),
+            bash_timeout: n("bash_timeout"),
+            system_prompt: o.get("system_prompt").and_then(Value::as_str).map(std::sync::Arc::from),
+        };
         (info != RuntimeInfo::default()).then_some(info)
     }
 }

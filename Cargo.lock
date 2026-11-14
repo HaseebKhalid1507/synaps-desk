@@ -6230,6 +6230,7 @@ dependencies = [
  "async-channel",
  "gpui-kit",
  "log",
+ "serde",
  "serde_json",
  "synaps-client",
 ]

@@ -325,6 +325,16 @@ roles! {
     prose_ch, dim_ch, header, warn_ch, run_ch, unread_ch, open_ch, ready_ch, err_ch, cost_ch, ok_ch, edit_ch, write_ch, bash_ch,
     sub_name, sub_status, sub_done, sub_time,
     warn_mark_ch, run_mark_ch, unread_mark_ch, focus_ch, ready_mark_ch, err_mark_ch, rest_mark, you_bar,
+    // Usage's chart series on the canvas (3:1): hosts, roles, models by
+    // rank, and the rest.
+    s1, s2, s3, s4, s5, s_rest,
+}
+
+impl Palette {
+    /// Chart series `i`: `s1`–`s5`, then `s_rest`.
+    pub fn series(&self, i: usize) -> Hsla {
+        [self.s1, self.s2, self.s3, self.s4, self.s5].get(i).copied().unwrap_or(self.s_rest)
+    }
 }
 
 fn hsla(c: u32) -> Hsla {
@@ -504,6 +514,21 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.err_mark_ch = f.mark("err_mark_ch", t.error_color, &ch);
     r.rest_mark = f.mark("rest_mark", t.muted, &ch);
     r.you_bar = f.mark("you_bar", you, &ch);
+    // Series: five theme colours at the mark floor on the canvas; one that
+    // lands within 1.25:1 of an earlier one is mixed 40 % toward the ink.
+    // Warning and error colours are never series (they keep their meaning).
+    let mut series: Vec<u32> = Vec::with_capacity(5);
+    for (role, c) in
+        [("s1", t.claude_label), ("s2", t.list_bullet_color), ("s3", t.tool_result_color), ("s4", t.heading_color), ("s5", t.tool_param)]
+    {
+        let mut v = lift(c, ink, &[canvas], MARK);
+        if series.iter().any(|&o| contrast(o, v) < 1.25) {
+            v = mix(v, ink, 0.4);
+        }
+        series.push(f.at(role, v, ink, &[canvas], MARK));
+    }
+    [r.s1, r.s2, r.s3, r.s4, r.s5] = [series[0], series[1], series[2], series[3], series[4]];
+    r.s_rest = f.mark("s_rest", t.muted, &[canvas]);
     (r, f.log)
 }
 
@@ -858,6 +883,12 @@ pub fn load_accent(path: &Path) -> Option<String> {
 /// [`save_settings`]).
 pub fn save_accent(path: &Path, hex: Option<u32>) -> std::io::Result<()> {
     save_settings(path, &[("accent", hex.map(to_hex).into())])
+}
+
+/// A string the app saved under `key` (Settings' `daemon_label`,
+/// `dash_url`, `usage_range`, `usage_host`); missing, `null` or empty: none.
+pub fn load_str(path: &Path, key: &str) -> Option<String> {
+    load_settings(path)?.get(key)?.as_str().map(str::to_string).filter(|v| !v.is_empty())
 }
 
 /// The theme the picker saved, as written ([`resolve_theme`] checks it).
