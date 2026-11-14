@@ -29,6 +29,7 @@ mod dash;
 mod demo;
 mod diag;
 mod files;
+mod fit;
 mod fonts;
 mod mem;
 mod model;
