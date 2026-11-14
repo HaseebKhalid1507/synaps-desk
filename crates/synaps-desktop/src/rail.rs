@@ -13,10 +13,9 @@ use std::sync::Arc;
 use synaps_client::SavedSession;
 use synaps_client::protocol::SessionMeta;
 
-use crate::app::home_short;
 use crate::fonts::label;
 use crate::model::Model;
-use crate::named::{ResumeRequest, RowAction, parse_rfc3339, relative, short_model};
+use crate::named::{ResumeRequest, RowAction, home_short, parse_rfc3339, relative, short_model};
 
 /// What a row is doing. Precedence, first match wins: OPENING › NEEDS YOU ›
 /// RUNNING › LOCKED › UNREAD › IDLE › PARKED › SAVED.
@@ -276,6 +275,8 @@ enum History {
     Unsupported,
     /// Asked, nothing back yet.
     Loading,
+    /// Asked, failed, nothing listed since.
+    Failed,
     Listed,
 }
 
@@ -302,12 +303,27 @@ pub fn thousands(n: usize) -> String {
     out
 }
 
-fn found(find: &str, fields: [Option<&str>; 3]) -> bool {
-    find.is_empty() || fields.into_iter().flatten().any(|f| f.to_lowercase().contains(find))
+/// Find matches what a row shows (its title, an untitled row's id, the
+/// folder as `~/…`) and the name, title and folder as listed.
+fn found(find: &str, fields: [Option<&str>; 4]) -> bool {
+    if find.is_empty() {
+        return true;
+    }
+    let cwd = fields[2].filter(|c| !c.is_empty()).map(home_short);
+    fields.into_iter().flatten().chain(cwd.as_deref()).any(|f| f.to_lowercase().contains(find))
+}
+
+/// The id, when it is what the row shows (nothing else to call it by).
+fn shown_id<'a>(id: &'a str, name: Option<&str>, title: Option<&str>) -> Option<&'a str> {
+    (named_str(name).is_none() && title.is_none_or(str::is_empty)).then_some(id)
+}
+
+fn named_str(n: Option<&str>) -> Option<&str> {
+    n.filter(|n| !n.is_empty())
 }
 
 fn named(n: &Option<String>) -> Option<&str> {
-    n.as_deref().filter(|n| !n.is_empty())
+    named_str(n.as_deref())
 }
 
 /// A held session's row.
@@ -374,16 +390,21 @@ fn saved_row(m: &Model, r: SavedRef, v: &SavedSession, now: i64) -> Row {
 /// deduped by id, less what the daemon holds (by id, journal id or name:
 /// `live` is as of the listing, the session list is newer), newest first.
 pub fn history(m: &Model) -> Vec<(SavedRef, &SavedSession, Option<i64>)> {
+    use std::collections::HashSet;
     let n = &m.named;
-    let mut seen = std::collections::HashSet::new();
+    let held: HashSet<&str> = m.sessions.iter().flat_map(|s| [s.id.as_str(), s.journal_id.as_str()]).filter(|k| !k.is_empty()).collect();
+    let held_names: HashSet<&str> = m.sessions.iter().filter_map(|s| named(&s.name)).collect();
+    let mut seen = HashSet::new();
+    // The newest list first: it is the fresher of the two (the named list
+    // is asked again only when needed).
     let mut out: Vec<(SavedRef, &SavedSession, Option<i64>)> = n
-        .saved
+        .recent
         .iter()
         .enumerate()
-        .map(|(i, v)| (SavedRef::Named(i), v))
-        .chain(n.recent.iter().enumerate().map(|(i, v)| (SavedRef::Recent(i), v)))
+        .map(|(i, v)| (SavedRef::Recent(i), v))
+        .chain(n.saved.iter().enumerate().map(|(i, v)| (SavedRef::Named(i), v)))
         .filter(|(_, v)| !v.live && seen.insert(v.id.as_str()))
-        .filter(|(_, v)| !m.sessions.iter().any(|s| s.is(&v.id) || (named(&v.name).is_some() && s.name == v.name)))
+        .filter(|(_, v)| !held.contains(v.id.as_str()) && named(&v.name).is_none_or(|nm| !held_names.contains(nm)))
         .map(|(r, v)| (r, v, v.updated_at.as_deref().or(v.created_at.as_deref()).and_then(parse_rfc3339)))
         .collect();
     out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.id.cmp(&a.1.id)));
@@ -394,7 +415,6 @@ pub fn history(m: &Model) -> Vec<(SavedRef, &SavedSession, Option<i64>)> {
 pub fn build(m: &Model, view: &View, now: i64) -> Rail {
     let mut rail = Rail::default();
     let filtering = !view.find.is_empty() || view.chip.is_some();
-    let admits = |st: State| view.chip.is_none_or(|c| c.admits(st));
 
     // PINNED by name, OPEN by created_at (the model keeps the list in that
     // order); a session that is ending is gone.
@@ -407,7 +427,11 @@ pub fn build(m: &Model, view: &View, now: i64) -> Rail {
             .into_iter()
             .filter(|&i| {
                 let s = &m.sessions[i];
-                admits(m.state(s)) && found(&view.find, [s.name.as_deref(), s.title.as_deref(), s.cwd.as_deref()])
+                view.chip.is_none_or(|c| m.chip_shows(c, s))
+                    && found(
+                        &view.find,
+                        [s.name.as_deref(), s.title.as_deref(), s.cwd.as_deref(), shown_id(&s.id, s.name.as_deref(), s.title.as_deref())],
+                    )
             })
             .collect();
         if shown.is_empty() && (group == Group::Pinned || filtering) {
@@ -432,6 +456,7 @@ pub fn build(m: &Model, view: &View, now: i64) -> Rail {
     // The last lists stay while the connection is re-made.
     let state = match &m.conn {
         _ if n.saved_supported && n.recent_loaded => History::Listed,
+        _ if n.saved_supported && n.saved_failed => History::Failed,
         _ if n.saved_supported => History::Loading,
         crate::model::ConnState::Connected(_) => History::Unsupported,
         _ => History::Off,
@@ -446,10 +471,16 @@ pub fn build(m: &Model, view: &View, now: i64) -> Rail {
             )));
         }
         History::Unsupported => {}
-        History::Loading if !filtering => {
+        History::Loading => {
             rail.items.push(Item::Group { group: Group::History, count: arc("…") });
+            if filtering {
+                rail.items.push(Item::Note(arc("Listing saved sessions…")));
+            }
         }
-        History::Loading => {}
+        History::Failed => {
+            rail.items.push(Item::Group { group: Group::History, count: arc("—") });
+            rail.items.push(Item::Note(arc("Saved sessions could not be listed (why is above). Find asks again when it gets focus.")));
+        }
         History::Listed => history_items(m, view, now, &mut rail),
     }
     if filtering && rail.items.is_empty() {
@@ -480,12 +511,15 @@ fn history_items(m: &Model, view: &View, now: i64, rail: &mut Rail) {
         let rows: Vec<&(SavedRef, &SavedSession)> = buckets[b as usize]
             .iter()
             .filter(|(_, v)| {
-                view.chip.is_none_or(|c| c.admits(m.saved_state(v)))
-                    && found(&view.find, [v.name.as_deref(), v.title.as_deref(), v.cwd.as_deref()])
+                view.chip.is_none_or(|c| m.chip_shows_saved(c, v))
+                    && found(
+                        &view.find,
+                        [v.name.as_deref(), v.title.as_deref(), v.cwd.as_deref(), shown_id(&v.id, v.name.as_deref(), v.title.as_deref())],
+                    )
             })
             .collect();
         total += rows.len();
-        rail.history_unread += buckets[b as usize].iter().filter(|(_, v)| m.saved_state(v) == State::Unread).count();
+        rail.history_unread += buckets[b as usize].iter().filter(|(_, v)| m.saved_fact(v) == State::Unread).count();
         if rows.is_empty() && (filtering || complete(b)) {
             continue;
         }
@@ -503,14 +537,27 @@ fn history_items(m: &Model, view: &View, now: i64, rail: &mut Rail) {
         if rows.len() > cap {
             items.push(Item::More { bucket: b, text: arc(format!("+ {}   {}", thousands(rows.len() - cap), label::MORE)) });
         }
-        if b == Bucket::Older && n.recent_truncated && n.deep {
+        if b == Bucket::Older && n.recent_truncated && n.deep && !filtering {
             items.push(Item::Note(arc(format!(
                 "The newest {} are listed. Anything older needs a daemon search.",
                 thousands(synaps_client::SAVED_SESSIONS_MAX as usize)
             ))));
         }
     }
-    if filtering && items.is_empty() {
+    // A search over a list known to be cut, or still coming, says what it
+    // searched: a miss is not "nothing matches".
+    let searched = if !filtering {
+        None
+    } else if m.saved_listing() {
+        Some(format!("Listing saved sessions… searched the newest {} so far.", thousands(n.recent.len())))
+    } else if n.recent_truncated {
+        Some(format!("Searched the newest {} saved sessions. Anything older needs a daemon search.", thousands(n.recent.len())))
+    } else {
+        None
+    };
+    if let Some(t) = searched {
+        items.push(Item::Note(arc(t)));
+    } else if filtering && items.is_empty() {
         return;
     }
     let plus = if n.recent_truncated { "+" } else { "" };
@@ -549,11 +596,13 @@ pub fn splice(old: &[u64], new: &[u64]) -> Option<(std::ops::Range<usize>, usize
     Some((pre..old.len() - suf, new.len() - suf - pre))
 }
 
-/// `45s`, `2m`, `3h`, `2d` until `ts` (`now` if it has passed).
+/// `<1m`, `2m`, `3h`, `2d` until `ts` (`now` if it has passed).
 pub fn until(ts: &str, now: i64) -> Option<String> {
     let d = (parse_rfc3339(ts)? - now).max(0);
     Some(match d {
-        0..60 => format!("{d}s"),
+        // Whole minutes: the readout is drawn on pointer motion, so seconds
+        // would sit frozen while the pointer rests.
+        0..60 => "<1m".to_string(),
         60..3600 => format!("{}m", d / 60),
         3600..86_400 => format!("{}h", d / 3600),
         _ => format!("{}d", d / 86_400),
@@ -683,13 +732,20 @@ mod tests {
         })
     }
 
-    /// A model with the saved lists landed as the fetch asks for them.
+    /// A model with the saved lists landed as the fetch asks for them:
+    /// the newest, then (only if it was cut) the named list.
     fn model(sessions: Value, named: Value, recent: Value, truncated: bool) -> Model {
         let mut m = Model::new(ConnState::Connecting);
         m.apply(connected(&["saved_sessions"]));
         m.apply(Event::Sessions(metas(sessions)));
-        m.apply(Event::SavedSessions { sessions: saved(named), truncated: false, rejected: 0 });
-        m.apply(Event::SavedSessions { sessions: saved(recent), truncated, rejected: 0 });
+        if truncated {
+            m.apply(Event::SavedSessions { sessions: saved(recent), truncated: true, rejected: 0 });
+            m.apply(Event::SavedSessions { sessions: saved(named), truncated: false, rejected: 0 });
+        } else {
+            let mut all = saved(named);
+            all.extend(saved(recent));
+            m.apply(Event::SavedSessions { sessions: all, truncated: false, rejected: 0 });
+        }
         m
     }
 
@@ -836,6 +892,43 @@ mod tests {
         assert_eq!(shape(&build(&m, &v, NOW)), ["empty Nothing matches"]);
     }
 
+    /// M3: a search over a list known to be cut, or still coming, says
+    /// what it searched; "Nothing matches" only when the search was whole.
+    #[test]
+    fn a_search_says_what_it_searched() {
+        let recent = json!([{"id": "t", "title": "today", "updated_at": at(60), "live": false}]);
+        let v = View { find: "zzz".into(), ..View::default() };
+        let mut m = model(json!([]), json!([]), recent.clone(), true);
+        let notes = |m: &Model| -> Vec<String> {
+            build(m, &v, NOW).items.iter().filter_map(|i| if let Item::Note(t) = i { Some(t.to_string()) } else { None }).collect()
+        };
+        assert_eq!(shape(&build(&m, &v, NOW))[0], "[History 0+]");
+        assert_eq!(notes(&m), ["Searched the newest 1 saved sessions. Anything older needs a daemon search."]);
+        m.want_deep();
+        assert_eq!(notes(&m), ["Listing saved sessions… searched the newest 1 so far."]);
+        m.apply(Event::SavedSessions { sessions: saved(recent.clone()), truncated: false, rejected: 0 });
+        assert_eq!(shape(&build(&m, &v, NOW)), ["empty Nothing matches"], "the whole list: a miss is a miss");
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["saved_sessions"]));
+        assert_eq!(shape(&build(&m, &v, NOW)), ["[History …]", "note Listing saved sessio"]);
+    }
+
+    /// L6: find matches what a row shows: an untitled row's id, the folder
+    /// as `~/…`; not an id the row does not show.
+    #[test]
+    fn find_matches_what_rows_show() {
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap();
+        let sessions = json!([
+            {"id": "20261113-101010-abcd", "lifecycle": "live", "messages": 3, "cwd": format!("{home}/work/synaps"), "created_at": at(5)},
+            {"id": "20261113-101010-ffff", "lifecycle": "live", "title": "Titled", "created_at": at(4)},
+        ]);
+        let m = model(sessions, json!([]), json!([]), false);
+        let rows = |find: &str| shape(&build(&m, &View { find: find.into(), ..View::default() }, NOW));
+        assert_eq!(rows("abcd"), ["[Open 1]", "row 20261113-101010-abcd"]);
+        assert_eq!(rows("~/work"), ["[Open 1]", "row 20261113-101010-abcd"]);
+        assert_eq!(rows("ffff"), ["empty Nothing matches"]);
+    }
+
     /// Without `saved_sessions` HISTORY is a header and a note that says
     /// why and what still works; not connected, nothing.
     #[test]
@@ -884,9 +977,10 @@ mod tests {
         assert_eq!(Bucket::of_age(Some(NOW - 30 * 86_400), NOW), Bucket::Older);
         assert_eq!(Bucket::of_age(None, NOW), Bucket::Older);
         assert_eq!(Bucket::of_age(Some(NOW + 999), NOW), Bucket::Today, "clock skew");
-        assert_eq!(until(&at(-45), NOW).as_deref(), Some("45s"));
+        assert_eq!(until(&at(-45), NOW).as_deref(), Some("<1m"));
+        assert_eq!(until(&at(-150), NOW).as_deref(), Some("2m"));
         assert_eq!(until(&at(-3 * 3600), NOW).as_deref(), Some("3h"));
-        assert_eq!(until(&at(10), NOW).as_deref(), Some("0s"));
+        assert_eq!(until(&at(10), NOW).as_deref(), Some("<1m"));
         assert_eq!(until("x", NOW), None);
         assert_eq!(thousands(0), "0");
         assert_eq!(thousands(999), "999");
