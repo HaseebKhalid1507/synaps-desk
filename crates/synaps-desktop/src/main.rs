@@ -1,7 +1,7 @@
 //! Synaps Desktop (GPUI spike): a thin client for the Synaps daemon.
 //!
 //! ```text
-//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH]
+//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL]
 //! synaps-desktop --bench [--profile P --prompt TEXT] [--refresh-hz HZ]
 //! synaps-desktop --bench-tabs [--bench-history FILE] [--refresh-hz HZ]
 //! ```
@@ -23,7 +23,9 @@
 
 mod app;
 mod bench;
+mod chart;
 mod chrome;
+mod dash;
 mod demo;
 mod diag;
 mod files;
@@ -33,6 +35,8 @@ mod model;
 mod named;
 mod palettes;
 mod rail;
+mod settings;
+mod settings_view;
 mod shell;
 mod stats;
 mod subagents;
@@ -40,6 +44,9 @@ mod tabs;
 mod tabstrip;
 mod theme;
 mod turns;
+mod usage;
+mod usage_view;
+mod views;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -66,6 +73,7 @@ fn main() {
     let mut start_session: Option<String> = None;
     let mut open_picker = false;
     let mut window_size: Option<(f32, f32)> = None;
+    let mut dash_flag: Option<String> = None;
     let mut args = std::env::args().skip(1);
     // A flag's value; another flag in its place is a usage error, not the value.
     let value = |args: &mut std::iter::Skip<std::env::Args>, flag: &str| match args.next() {
@@ -96,6 +104,7 @@ fn main() {
             "--theme" => theme_flag = Some(value(&mut args, "--theme")),
             "--session" => start_session = Some(value(&mut args, "--session")),
             "--accent-picker" => open_picker = true,
+            "--dash" => dash_flag = Some(value(&mut args, "--dash")),
             "--size" => {
                 let v = value(&mut args, "--size");
                 let parsed = v.split_once('x').and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?)));
@@ -110,7 +119,7 @@ fn main() {
             "-h" | "--help" => {
                 let names: Vec<&str> = palettes::THEMES.iter().map(|t| t.0).collect();
                 println!(
-                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--bench [--prompt TEXT] [--refresh-hz HZ] | --bench-tabs [--bench-history FILE]]\n\
+                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL] [--bench [--prompt TEXT] [--refresh-hz HZ] | --bench-tabs [--bench-history FILE]]\n\
                      theme: --theme, else ${}, else the picker's settings file ({}), else `theme =` in the Synaps config, else {}\n\
                      themes: {}\n\
                      accent (overrides the theme's \"you\" and focus colours): --accent, else ${}, else the settings file, else none",
@@ -163,12 +172,24 @@ fn main() {
     // windows on one daemon: the last to save wins.
     let mut tabs_key = (offline && !bench).then(|| "offline".to_string());
     let mut legacy_key = None;
+    // How Settings and Usage find the daemon's synaps-dash (`views::Launch`).
+    let mut launch = views::Launch { dash_flag, ..Default::default() };
     // No --profile: `$SYNAPS_PROFILE`, else the default daemon (as the TUI).
     let client = if connect {
         let endpoint = match socket {
-            Some(s) => Endpoint::Socket(s),
-            None => Endpoint::profile(profile.as_deref()),
+            Some(s) => {
+                launch.socket = Some(s.clone());
+                Endpoint::Socket(s)
+            }
+            None => {
+                let e = Endpoint::profile(profile.as_deref());
+                if let Endpoint::Profile(p) = &e {
+                    launch.profile_endpoint = Some(p.clone());
+                }
+                e
+            }
         };
+        launch.resolved = Some(endpoint.resolve());
         if !bench {
             tabs_key = Some(format!("socket:{}", canonical_socket(&endpoint.resolve()).display()));
             // What builds before this one keyed them by (read once).
@@ -236,6 +257,12 @@ fn main() {
                 v.theme_follows_config = follows_config;
                 v.theme_profile = profile_name.clone();
                 v.config_theme = v.config_choice().0.into();
+                v.app_settings = settings_view::AppSettings::load(theme::settings_path().as_deref());
+                v.usage = usage_view::UsageUi::new(v.app_settings.usage_host.clone(), v.app_settings.usage_range);
+                v.dash.launch = launch;
+                if !bench {
+                    v.start_dash_poll(cx);
+                }
                 v
             })
         })

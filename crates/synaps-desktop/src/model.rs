@@ -70,6 +70,14 @@ impl Future for YieldNow {
 pub const CONFIRM_YES: &str = "y";
 pub const CONFIRM_NO: &str = "n";
 
+/// The daemon this window is connected to, as its `Welcome` said.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Daemon {
+    pub version: String,
+    pub profile: Option<String>,
+    pub pid: u32,
+}
+
 /// The connection pill.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnState {
@@ -307,6 +315,11 @@ pub struct Model {
     /// Set by every event but a session list equal to the last: the view
     /// draws again only then (the 3-second poll of an idle daemon is free).
     pub view_dirty: bool,
+    /// The daemon at the last `Welcome`, and how many there have been (a
+    /// reconnect may be to a restarted daemon: Settings and Usage look
+    /// for its dash again).
+    pub daemon: Option<Daemon>,
+    pub daemon_gen: u64,
 }
 
 /// An empty transcript as the window keeps it: no notices for subagent
@@ -354,6 +367,8 @@ impl Model {
             unread: HashSet::new(),
             seen: HashMap::new(),
             view_dirty: false,
+            daemon: None,
+            daemon_gen: 0,
         }
     }
 
@@ -1080,7 +1095,9 @@ impl Model {
                 // A reply in flight died with the old connection.
                 self.named.saved_in_flight = None;
                 self.named.saved_queue.clear();
-                if let Status::Connected { features, profile, .. } = &s {
+                if let Status::Connected { features, profile, daemon_version, pid, .. } = &s {
+                    self.daemon = Some(Daemon { version: daemon_version.clone(), profile: profile.clone(), pid: *pid });
+                    self.daemon_gen += 1;
                     self.named.daemon = match profile {
                         Some(p) => format!("the daemon's machine (profile {p})"),
                         None => "the daemon's machine".into(),

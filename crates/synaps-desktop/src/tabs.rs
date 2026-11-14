@@ -1,9 +1,15 @@
 //! Session tabs without GPUI: which sessions are open, in what order, which
 //! one is on screen, and the stack Ctrl+Shift+T reopens from. One tab is one
 //! session, and a session is in one tab at most: opening it again focuses
-//! its tab. Only the visible tab is attached ([`crate::app`] keeps the
-//! others' last transcript in a bounded cache); a background tab's glyph
-//! comes from the session poll.
+//! its tab. Only the current session tab is attached ([`crate::app`] keeps
+//! the others' last transcript in a bounded cache); a background tab's
+//! glyph comes from the session poll.
+//!
+//! Settings and Usage are tabs of their own kind ([`Kind`]): one of each
+//! at most, opened at the end of the strip, never saved or reopened. While
+//! one is on screen the session tab focused last stays current
+//! ([`Tabs::current`]): still attached, its draft kept, and shown again as
+//! it was when its tab is.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -28,13 +34,25 @@ pub enum Place {
     New,
 }
 
-/// What a tab holds. Only sessions for now; Settings and Usage are to open
-/// as views in the centre pane, each in a tab of its own kind (no session:
+/// What a tab holds: a session, or one of the two views (no session:
 /// nothing attached, cached, saved or listed for it).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
     #[default]
     Session,
+    Settings,
+    Usage,
+}
+
+impl Kind {
+    /// What a view's tab says.
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Session => "",
+            Kind::Settings => "Settings",
+            Kind::Usage => "Usage",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +130,9 @@ pub struct Tabs {
     /// The visible tab went into the one already holding its session
     /// ([`Tabs::attached`]): (its id, that tab's id), for the composer.
     merged: Option<(u64, u64)>,
+    /// The session tab shown last (the current one while a view is on
+    /// screen).
+    last_session: Option<u64>,
 }
 
 impl Tabs {
@@ -135,8 +156,55 @@ impl Tabs {
         self.tabs.get(self.active?)
     }
 
+    /// The visible tab's session (`None` while a view is on screen: no
+    /// rail row is the one on screen then).
     pub fn visible_session(&self) -> Option<&str> {
         self.visible()?.session.as_deref()
+    }
+
+    /// The view on screen, if one is.
+    pub fn view(&self) -> Option<Kind> {
+        self.visible().map(|t| t.kind).filter(|k| *k != Kind::Session)
+    }
+
+    /// The session tab the attachment follows: the visible tab, or while a
+    /// view is on screen the session tab shown last.
+    pub fn current(&self) -> Option<&Tab> {
+        self.tabs.get(self.current_index()?)
+    }
+
+    fn current_index(&self) -> Option<usize> {
+        let a = self.active?;
+        if self.tabs[a].kind == Kind::Session {
+            return Some(a);
+        }
+        let id = self.last_session?;
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    /// The current session tab's session.
+    pub fn current_session(&self) -> Option<&str> {
+        self.current()?.session.as_deref()
+    }
+
+    /// The tab the composer types for (its id and session): the current
+    /// session tab, so a view on screen never takes the composer's text.
+    pub fn composer_tab(&self) -> Option<(u64, Option<&str>)> {
+        self.current().map(|t| (t.id, t.session.as_deref()))
+    }
+
+    /// Open the view `kind` (focused if it is open already) at the end of
+    /// the strip. `false`: it was the visible tab already.
+    pub fn open_view(&mut self, kind: Kind) -> bool {
+        debug_assert!(kind != Kind::Session);
+        if let Some(ix) = self.tabs.iter().position(|t| t.kind == kind) {
+            return self.focus(ix);
+        }
+        self.next_id += 1;
+        let id = self.next_id;
+        self.tabs.push(Tab { id, kind, session: None, label: kind.label().to_string(), journal: None, cwd: None });
+        self.show(id);
+        true
     }
 
     /// The tab holding `session`.
@@ -204,6 +272,9 @@ impl Tabs {
             Some(a) if a > ix => Some(a - 1),
             a => a,
         };
+        if let Some(v) = self.visible().filter(|v| v.kind == Kind::Session) {
+            self.last_session = Some(v.id);
+        }
         t
     }
 
@@ -263,15 +334,29 @@ impl Tabs {
         Tab { id: self.next_id, kind: Kind::Session, label, session, journal: None, cwd: None }
     }
 
-    /// Make the tab `id` visible. A visible tab still waiting for its
-    /// session (a create or a resume) is left for good: nothing would come
-    /// back to it.
+    /// Make the tab `id` visible. Leaving the current session tab for
+    /// another session tab while it still waits for its session (a create
+    /// or a resume) leaves it for good: nothing would come back to it. A
+    /// view in between does not: the session tab stays current.
     fn show(&mut self, id: u64) {
-        if let Some(i) = self.active.filter(|&i| self.tabs[i].pending() && self.tabs[i].id != id) {
+        let session = self.tabs.iter().find(|t| t.id == id).is_some_and(|t| t.kind == Kind::Session);
+        if session && let Some(i) = self.current_index().filter(|&i| self.tabs[i].pending() && self.tabs[i].id != id) {
             self.tabs.remove(i);
         }
         self.active = self.tabs.iter().position(|t| t.id == id);
+        if session {
+            self.last_session = Some(id);
+        }
         self.changed();
+    }
+
+    /// Where a session opens as `place` says: a view on screen is never
+    /// replaced (the session opens in a new tab after it).
+    fn place(&self, place: Place) -> Option<usize> {
+        match place {
+            Place::Current => self.active.filter(|&i| self.tabs[i].kind == Kind::Session),
+            Place::New => None,
+        }
     }
 
     /// Put `tab` after the visible one (at the end if none) and show it.
@@ -301,9 +386,9 @@ impl Tabs {
             self.focus(j);
             return;
         }
-        match (place, self.active) {
-            (Place::Current, Some(i)) => self.replace(i, Some(session.to_string()), label),
-            _ => {
+        match self.place(place) {
+            Some(i) => self.replace(i, Some(session.to_string()), label),
+            None => {
                 let t = self.tab(Some(session.to_string()), label.to_string());
                 self.insert_after_visible(t);
             }
@@ -314,9 +399,9 @@ impl Tabs {
     /// A tab for a session the daemon has not named yet (a create, a
     /// resume), called `label` until it does.
     pub fn open_pending(&mut self, label: &str, place: Place) {
-        match (place, self.active) {
-            (Place::Current, Some(i)) => self.replace(i, None, label),
-            _ => {
+        match self.place(place) {
+            Some(i) => self.replace(i, None, label),
+            None => {
                 let t = self.tab(None, label.to_string());
                 self.insert_after_visible(t);
             }
@@ -393,16 +478,28 @@ impl Tabs {
     /// Never two tabs for one session: a tab that already holds it stays
     /// and is shown, the visible one goes. No tab yet: one opens.
     pub fn attached(&mut self, session: &str) {
-        match self.active {
+        match self.current_index() {
             Some(i) if self.tabs[i].session.as_deref() == Some(session) => {}
             Some(i) => {
                 if let Some(j) = self.find(session) {
                     self.merged = Some((self.tabs[i].id, self.tabs[j].id));
+                    let shown = self.visible().map(|t| t.id);
+                    let keep = self.tabs[j].id;
                     self.tabs.remove(i);
-                    self.active = Some(if j > i { j - 1 } else { j });
+                    // A view on screen stays; else the tab holding it is shown.
+                    let vis = if self.active == Some(i) { Some(keep) } else { shown };
+                    self.active = vis.and_then(|id| self.tabs.iter().position(|t| t.id == id));
+                    self.last_session = Some(keep);
                 } else {
                     self.follow(i, session);
                 }
+                self.changed();
+            }
+            // A view on screen stays there; the new tab is current behind it.
+            None if self.view().is_some() => {
+                let t = self.tab(Some(session.to_string()), session.to_string());
+                self.last_session = Some(t.id);
+                self.tabs.push(t);
                 self.changed();
             }
             None => {
@@ -439,9 +536,10 @@ impl Tabs {
         let mut journals = Vec::with_capacity(self.tabs.len());
         let mut labels = Vec::with_capacity(self.tabs.len());
         let mut active = None;
+        let current = self.current_index();
         for (i, t) in self.tabs.iter().enumerate() {
             if let Some(s) = &t.session {
-                if self.active == Some(i) {
+                if current == Some(i) {
                     active = Some(sessions.len());
                 }
                 sessions.push(s.clone());
@@ -474,6 +572,7 @@ impl Tabs {
             }
         }
         t.active = active.or((!t.tabs.is_empty()).then_some(0));
+        t.last_session = t.active.map(|a| t.tabs[a].id);
         t
     }
 
@@ -486,7 +585,7 @@ impl Tabs {
         if self.restoring.is_empty() {
             return false;
         }
-        let vis = self.visible().map(|t| t.id);
+        let vis = self.current().map(|t| t.id);
         let mut shown = false;
         for id in self.restoring.clone() {
             let Some(ix) = self.tabs.iter().position(|t| t.id == id) else { continue };
@@ -505,7 +604,7 @@ impl Tabs {
                 }
                 self.changed();
             }
-            shown |= vis == Some(id) && self.visible().is_some_and(|t| t.id == id);
+            shown |= vis == Some(id) && self.current().is_some_and(|t| t.id == id);
         }
         self.restore_lists += 1;
         if self.restore_lists >= RESTORE_LISTS {
@@ -779,7 +878,8 @@ mod tests {
         assert_eq!(dedup.len(), open.len(), "two tabs for one session: {open:?}");
         assert_eq!(t.active.is_some(), !t.is_empty(), "a visible tab iff there are tabs");
         assert!(t.active.is_none_or(|a| a < t.len()));
-        assert!(t.iter().enumerate().all(|(i, x)| !x.pending() || t.active == Some(i)), "a pending tab in the background");
+        assert!(t.iter().all(|x| !x.pending() || t.current().is_some_and(|c| c.id == x.id)), "a pending tab in the background");
+        assert!(t.iter().filter(|x| x.kind == Kind::Settings).count() <= 1 && t.iter().filter(|x| x.kind == Kind::Usage).count() <= 1);
     }
 
     #[test]
@@ -1364,5 +1464,120 @@ mod tests {
             }
             unique(&t);
         }
+    }
+
+    #[test]
+    fn views_are_singletons_at_the_end_and_keep_the_session_current() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::Current);
+        t.open("b", "b", Place::New);
+        t.focus(0);
+        assert!(t.open_view(Kind::Settings));
+        assert_eq!((t.len(), t.view()), (3, Some(Kind::Settings)));
+        assert_eq!(t.visible_session(), None, "no rail row is the one on screen");
+        assert_eq!(t.current_session(), Some("a"), "the session tab shown last stays current");
+        assert_eq!(t.iter().last().map(|x| x.kind), Some(Kind::Settings), "it opens at the end");
+        t.open_view(Kind::Usage);
+        t.focus(1);
+        assert_eq!(t.current_session(), Some("b"));
+        assert!(t.open_view(Kind::Settings), "focused, not opened again");
+        assert!(!t.open_view(Kind::Settings), "already on screen");
+        assert_eq!((t.len(), t.current_session()), (4, Some("b")));
+        unique(&t);
+    }
+
+    #[test]
+    fn a_session_opened_from_a_view_gets_its_own_tab_and_the_view_stays() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::Current);
+        t.open_view(Kind::Usage);
+        t.open("b", "b", Place::Current);
+        assert_eq!((ids(&t), vis(&t), t.current_session()), (vec!["a", "…", "b"], Some("b"), Some("b")));
+        t.open_view(Kind::Usage);
+        t.open("a", "a", Place::Current);
+        assert_eq!((vis(&t), t.len()), (Some("a"), 3), "an open session's tab is focused");
+        t.open_view(Kind::Usage);
+        t.open_pending("New session", Place::Current);
+        assert_eq!((t.len(), t.view()), (4, None), "a create from a view opens a tab too");
+        unique(&t);
+    }
+
+    /// The merge with PR #14: `submit()` and `sync_composer()` ask
+    /// [`Tabs::composer_tab`], the current session tab. A view on screen
+    /// (the visible tab) must neither take the composer's text nor make a
+    /// send refused as "switching tabs".
+    #[test]
+    fn a_view_on_screen_leaves_the_composer_with_the_session_tab() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::Current);
+        let a = t.visible().unwrap().id;
+        let mut owner = Some((a, Some("a".to_string())));
+        for kind in [Kind::Settings, Kind::Usage] {
+            t.open_view(kind);
+            assert_ne!(t.visible().map(|x| x.id), Some(a));
+            assert!(Drafts::owns(owner.as_ref(), t.composer_tab()), "{kind:?} on screen: the composer is still a's");
+            let mut d = Drafts::default();
+            let mut note = None;
+            assert_eq!(d.frame(&mut owner, t.composer_tab(), None, &mut note, ("half typed", 4), |s| t.knows(s)), None, "no swap");
+            assert!(d.map.is_empty() && owner == Some((a, Some("a".to_string()))));
+        }
+        // Back on a: still a's.
+        t.focus(0);
+        assert!(Drafts::owns(owner.as_ref(), t.composer_tab()));
+    }
+
+    #[test]
+    fn views_are_not_saved_or_reopened() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::Current);
+        t.open("b", "b", Place::New);
+        t.open_view(Kind::Settings);
+        let s = t.saved();
+        assert_eq!((s.sessions, s.active), (vec!["a".to_string(), "b".to_string()], Some(1)), "the current session is the active one");
+        let ix = t.active().unwrap();
+        assert!(t.close(ix));
+        assert_eq!(vis(&t), Some("b"), "closed like a session tab: its neighbour shows");
+        assert!(!t.reopen(), "nothing to bring back");
+        unique(&t);
+    }
+
+    #[test]
+    fn a_pending_tab_behind_a_view_is_named_there_or_dropped_when_left() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::Current);
+        t.open_pending("New session", Place::New);
+        t.open_view(Kind::Settings);
+        assert!(t.current().is_some_and(Tab::pending));
+        t.attached("c");
+        assert_eq!((ids(&t), t.view()), (vec!["a", "c", "…"], Some(Kind::Settings)), "named; the view stays on screen");
+        // An attach that lands on a session another tab holds: the pending one goes.
+        t.focus(0);
+        t.open_pending("New session", Place::New);
+        t.open_view(Kind::Settings);
+        t.attached("c");
+        assert_eq!((ids(&t), t.view(), t.current_session()), (vec!["a", "c", "…"], Some(Kind::Settings), Some("c")));
+        // Left for another session tab: a pending one is gone for good.
+        t.open_pending("New session", Place::New);
+        t.open_view(Kind::Settings);
+        t.focus(0);
+        assert_eq!(ids(&t), vec!["a", "c", "…"]);
+        unique(&t);
+    }
+
+    #[test]
+    fn closing_the_current_session_behind_a_view_leaves_none() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::Current);
+        t.open_view(Kind::Usage);
+        t.close(0);
+        assert_eq!((t.current_session(), t.view()), (None, Some(Kind::Usage)));
+        // Closing a session tab moves the current one to the tab shown.
+        t.open("x", "x", Place::Current);
+        t.open("y", "y", Place::New);
+        let y = t.active().unwrap();
+        t.close(y);
+        t.open_view(Kind::Usage);
+        assert_eq!(t.current_session(), Some("x"));
+        unique(&t);
     }
 }
