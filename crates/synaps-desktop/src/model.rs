@@ -271,8 +271,6 @@ pub struct Model {
     /// transcript, which runs ahead of the poll (taken at every poll and
     /// when the user moves away). UNREAD is the next poll against this.
     seen: HashMap<String, (usize, bool)>,
-    /// Sessions whose turn this window sent: its end is not news.
-    own_turns: HashSet<String>,
     /// Set by every event but a session list equal to the last: the view
     /// draws again only then (the 3-second poll of an idle daemon is free).
     pub view_dirty: bool,
@@ -310,7 +308,6 @@ impl Model {
             rail_gen: 0,
             unread: HashSet::new(),
             seen: HashMap::new(),
-            own_turns: HashSet::new(),
             view_dirty: false,
         }
     }
@@ -808,20 +805,15 @@ impl Model {
         }
     }
 
-    /// `text` went to the daemon: the turn it starts (or steers) is the
-    /// user's own, so its end is not UNREAD.
+    /// `text` went to the daemon. A turn the user sent and then left
+    /// running is still news when it ends off screen (the reply is what
+    /// they are waiting for); one they watched to its end is in `seen`.
     pub fn sent(&mut self, text: String) {
         self.in_flight.push_back(text);
-        if let Some(a) = &self.active
-            && !self.own_turns.contains(&a.session_id)
-        {
-            self.own_turns.insert(a.session_id.clone());
-        }
     }
 
     /// The session on screen as the user sees it (its transcript): the
-    /// baseline UNREAD compares the next poll with. Its own turn is over
-    /// once nothing sent is unconfirmed and it is idle.
+    /// baseline UNREAD compares the next poll with.
     fn saw_active(&mut self) {
         let Some(a) = &self.active else { return };
         if self.transcript.session_id() != Some(a.session_id.as_str()) {
@@ -833,9 +825,6 @@ impl Model {
             None => {
                 self.seen.insert(a.session_id.clone(), now);
             }
-        }
-        if self.in_flight.is_empty() && !now.1 {
-            self.own_turns.remove(&a.session_id);
         }
     }
 
@@ -916,19 +905,15 @@ impl Model {
             Event::Sessions(s) => {
                 self.saw_active();
                 // UNREAD: off screen, a turn ended or messages came that the
-                // user has not seen. Not news: a turn this window sent, and
-                // a session a TUI is attached to (it is on a screen there).
+                // user has not seen (their own turns too, if they left them
+                // running). Not news: a session a TUI is attached to (it is
+                // on a screen there).
                 for new in &s {
                     if self.is_active(&new.id) {
                         continue;
                     }
-                    let own = self.own_turns.contains(&new.id);
-                    if own && !new.busy {
-                        self.own_turns.remove(&new.id);
-                    }
                     let elsewhere = new.roster.iter().any(|c| c.kind == "tui");
                     if let Some(&(messages, busy)) = self.seen.get(&new.id)
-                        && !own
                         && !elsewhere
                         && ((busy && !new.busy) || new.messages > messages)
                     {
@@ -1415,8 +1400,9 @@ mod tests {
 
     /// M2: UNREAD is what the user has not seen. The session on screen is
     /// seen as its transcript has it (ahead of the poll): moving away right
-    /// after its turn ends marks nothing. A turn this window sent never
-    /// marks; nor does one in a session a TUI shows (read there).
+    /// after its turn ends marks nothing. A turn this window sent and left
+    /// running marks when it ends (PR #8 re-review N1); one in a session a
+    /// TUI shows never does (read there).
     #[test]
     fn unread_is_what_was_not_seen() {
         let mut m = Model::new(ConnState::Connecting);
@@ -1453,15 +1439,24 @@ mod tests {
         m.apply(Event::Sessions(list(false, 3, json!([]))));
         assert_eq!(st(&m), State::Unread);
 
-        // The user's own turn, left running: its end is not news.
+        // The user's own turn, left running: its end is news.
         attach(&mut m, 3);
+        m.apply(history(3, 0, 3));
         m.sent("do it".into());
         m.apply(session(3, turn(Some("do it"))));
         m.want(4);
         m.apply(attached_ev(4, attached("b")));
-        m.apply(Event::Sessions(list(true, 5, json!([]))));
+        m.apply(Event::Sessions(list(true, 3, json!([]))));
+        assert_eq!(st(&m), State::Running, "still running off screen");
         m.apply(Event::Sessions(list(false, 7, json!([]))));
-        assert_eq!(st(&m), State::Idle, "own turn");
+        assert_eq!(st(&m), State::Unread, "own turn, left running, ended off screen");
+        // Opened (read), then left again.
+        attach(&mut m, 5);
+        m.apply(history(5, 0, 7));
+        m.want(6);
+        m.apply(attached_ev(6, attached("b")));
+        m.apply(Event::Sessions(list(false, 7, json!([]))));
+        assert_eq!(st(&m), State::Idle, "opened, read, left");
         // A turn driven from a TUI ends: read there.
         let tui = json!([{"id": 9, "name": "tui", "kind": "tui", "mode": "mirror", "attached_at_ms": 0}]);
         m.apply(Event::Sessions(list(true, 7, tui.clone())));
