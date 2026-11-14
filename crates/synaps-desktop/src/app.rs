@@ -1999,7 +1999,6 @@ impl Render for AppView {
             .text_color(p.ink)
             .font_family(fonts::SANS)
             .text_size(px(13.))
-            .child(self.render_mark(&p))
             .child(
                 v_flex().flex_1().h_full().min_w_0().child(self.render_top(&p, rail, cx)).child(
                     h_flex()
@@ -2157,27 +2156,31 @@ mod tests {
     fn a_drag_clamps_its_width() {
         let open = Panels::default();
         let rail = |window: f32, w: f32| dragged(window, open, true, w);
+        // The layout's left inset (0 since the mark strip went); `centre`
+        // below assumes the old 30 px, so these sides use the real one.
+        let m = crate::chrome::MARK;
+        let centre = |window: f32, (l, r): (Side, Side)| window - m - l.width() - r.width();
         assert_eq!(rail(1920., 400.), hand(Some(400), None));
-        assert_eq!(sides(1920., rail(1920., 400.), 30.), (Side::Open(400.), Side::Open(296.)));
+        assert_eq!(sides(1920., rail(1920., 400.), m), (Side::Open(400.), Side::Open(296.)));
         assert_eq!(rail(1920., 1000.).rail_width, Some(480));
         assert_eq!(rail(1920., 200.).rail_width, Some(220));
         assert_eq!(rail(1920., 300.4).rail_width, Some(300), "whole pixels");
-        // 1280 px: the centre keeps 480 px.
-        assert_eq!(rail(1280., 480.).rail_width, Some(474));
-        assert_eq!(centre(1280., sides(1280., rail(1280., 480.), 30.)), CENTRE_MIN);
-        let right = dragged(1280., open, false, 520.);
+        // 1250 px: the centre keeps 480 px.
+        assert_eq!(rail(1250., 480.).rail_width, Some(474));
+        assert_eq!(centre(1250., sides(1250., rail(1250., 480.), m)), CENTRE_MIN);
+        let right = dragged(1250., open, false, 520.);
         assert_eq!(right, hand(None, Some(494)));
-        assert_eq!(sides(1280., right, 30.), (Side::Open(276.), Side::Open(494.)));
+        assert_eq!(sides(1250., right, m), (Side::Open(276.), Side::Open(494.)));
         assert_eq!(dragged(1920., open, false, 900.).right_width, Some(520));
-        // 800 px, rail only: as wide as the narrow layout already shows it, no wider.
-        assert_eq!(rail(800., 400.).rail_width, Some(276));
-        assert_eq!(rail(800., 240.).rail_width, Some(240));
+        // 770 px, rail only: as wide as the narrow layout already shows it, no wider.
+        assert_eq!(rail(770., 400.).rail_width, Some(276));
+        assert_eq!(rail(770., 240.).rail_width, Some(240));
         // Panels that had given way: the other one is held where it is, so
         // the dragged edge follows the pointer.
         let both = hand(Some(480), Some(520));
-        let p = dragged(1100., both, true, 250.);
+        let p = dragged(1070., both, true, 250.);
         assert_eq!(p, hand(Some(250), Some(305)));
-        assert_eq!(sides(1100., p, 30.), (Side::Open(250.), Side::Open(305.)));
+        assert_eq!(sides(1070., p, m), (Side::Open(250.), Side::Open(305.)));
     }
 
     /// Dragged well past the narrowest width a panel folds, keeping the
