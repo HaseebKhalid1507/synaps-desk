@@ -3,26 +3,25 @@
 //! hidden or minimized window holds the current transcript and nothing
 //! else; the view only turns the transcript's splice into rows per frame.
 
+use std::cmp::Reverse;
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
 
 use synaps_client::protocol::SessionMeta;
 use synaps_client::{
-    AttachMode, Error, Event, Expect, FEATURE_SAVED_SESSIONS, RenameRefusal, SavedSession, SessionEvent, Status, Transcript,
-    validate_session_name,
+    AttachMode, Error, Event, Expect, FEATURE_SAVED_SESSIONS, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, Status,
+    Transcript, validate_session_name,
 };
 
-use crate::named::{Marker, NamedRow, ResumeRequest, RowAction};
+use crate::named::{ResumeRequest, RowAction, parse_rfc3339};
+use crate::rail::{State, is_parked};
 use crate::stats::Stats;
 
-/// The saved list is re-asked at most this often on its own (on startup,
-/// after a rename and after a resume it is asked at once).
-pub const SAVED_REFRESH: Duration = Duration::from_secs(30);
-/// `saved_sessions` asks for at most this many.
-pub const SAVED_LIMIT: u32 = 200;
+/// HISTORY's newest unnamed sessions, asked for at startup; up to
+/// [`SAVED_SESSIONS_MAX`] (the wire's cap) once OLDER opens or find is used.
+pub const SAVED_RECENT: u32 = 200;
 
 /// Most events the pump applies before it yields to the UI (a frame can run
 /// between batches; a backlog never becomes one unbounded `Vec`).
@@ -70,30 +69,6 @@ impl Future for YieldNow {
 pub const CONFIRM_YES: &str = "y";
 pub const CONFIRM_NO: &str = "n";
 
-/// The rail's filter tabs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Filter {
-    #[default]
-    All,
-    /// A turn (or a resume) is running.
-    Live,
-    /// Waiting on the user.
-    Needs,
-    /// Everything else: idle, pinned, parked, saved.
-    Idle,
-}
-
-impl Filter {
-    pub fn admits(self, m: Marker) -> bool {
-        match self {
-            Filter::All => true,
-            Filter::Live => matches!(m, Marker::Busy | Marker::Resuming),
-            Filter::Needs => m == Marker::Awaiting,
-            Filter::Idle => matches!(m, Marker::Idle | Marker::Pinned | Marker::Parked | Marker::Saved),
-        }
-    }
-}
-
 /// The connection pill.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnState {
@@ -125,9 +100,12 @@ pub enum Effect {
     Restore(String),
     ListSessions,
     Resync,
-    /// Ask for the saved named sessions (`Client::saved_sessions`); if it
-    /// cannot be sent, tell [`Model::saved_failed`].
-    ListSaved,
+    /// `Client::saved_sessions(named_only, limit)`; if it cannot be sent,
+    /// tell [`Model::saved_failed`].
+    ListSaved {
+        named_only: bool,
+        limit: u32,
+    },
     /// Attach to a live session, then [`Model::attaching`]. `fallback`: a
     /// named session's journal, resumed if it ended meanwhile. `open`: an
     /// Open by name.
@@ -186,20 +164,37 @@ pub struct Opening {
     asked_saved: bool,
 }
 
-/// The Named section's state.
+/// One `saved_sessions` request: the named list, or the newest `limit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SavedAsk {
+    Named,
+    Recent(u32),
+}
+
+/// What the rail knows of saved sessions, and the names and resumes.
 #[derive(Debug, Default)]
 pub struct Named {
-    /// The daemon lists `saved_sessions` (else: live named sessions only).
+    /// The daemon lists `saved_sessions` (else: no HISTORY; a name is
+    /// resolved by the daemon).
     pub saved_supported: bool,
+    /// The named saved sessions (`named_only`, up to the wire's cap).
     pub saved: Vec<SavedSession>,
-    /// The daemon has more than [`SAVED_LIMIT`].
+    /// The daemon has more named ones than that.
     pub saved_truncated: bool,
+    /// The newest saved sessions, named or not ([`SAVED_RECENT`], or the
+    /// cap once `deep`).
+    pub recent: Vec<SavedSession>,
+    pub recent_truncated: bool,
+    /// The newest list has landed at least once (HISTORY can be drawn).
+    pub recent_loaded: bool,
+    /// The cap has been asked for (OLDER opened, or find used).
+    pub deep: bool,
     /// The saved list's own trouble (failed, entries skipped).
     pub saved_note: Option<String>,
-    saved_at: Option<Instant>,
-    saved_in_flight: bool,
-    /// A forced refresh came while one was in flight: ask again after it.
-    saved_dirty: bool,
+    /// One request at a time: replies come in order, but this way a reply
+    /// is never matched to the wrong request.
+    saved_in_flight: Option<SavedAsk>,
+    saved_queue: VecDeque<SavedAsk>,
     pub resuming: Option<Resuming>,
     /// An attach from a Named row or Open by name: if the session ended
     /// since the last list, resume its journal instead.
@@ -257,8 +252,21 @@ pub struct Model {
     /// The attached session's numbers (header, right-hand panel).
     pub stats: Stats,
     /// Bumped whenever what the rail lists may have changed (anything but
-    /// a session's own stream): the view rebuilds its rows only then.
+    /// a session's own stream, and a session list equal to the last): the
+    /// view rebuilds its rows only then.
     pub rail_gen: u64,
+    /// Sessions (and their journals) whose turn ended, or which got new
+    /// messages, while not on screen: UNREAD until opened.
+    unread: HashSet<String>,
+    /// Set by every event but a session list equal to the last: the view
+    /// draws again only then (the 3-second poll of an idle daemon is free).
+    pub view_dirty: bool,
+}
+
+/// The order OPEN shows: newest conversation first (`created_at`), then by
+/// id. The daemon sends its list in hash-map order.
+pub fn sort_sessions(s: &mut [SessionMeta]) {
+    s.sort_by_cached_key(|m| (Reverse(parse_rfc3339(&m.created_at).unwrap_or(i64::MIN)), Reverse(m.id.clone())));
 }
 
 impl Model {
@@ -278,27 +286,63 @@ impl Model {
             named: Named { daemon: "the daemon's machine".into(), ..Named::default() },
             stats: Stats::default(),
             rail_gen: 0,
+            unread: HashSet::new(),
+            view_dirty: false,
         }
     }
 
-    /// `Effect::ListSaved` if the daemon supports it and it is due (`force`:
-    /// startup, after a rename or a resume), never two at once (a forced
-    /// one during a flight is asked when that lands).
-    fn want_saved(&mut self, now: Instant, force: bool, effects: &mut Vec<Effect>) {
+    /// Ask for the saved lists again (on connect, after a rename, a resume,
+    /// a row leaving OPEN; never on a timer): the named list, then the
+    /// newest. A request already waiting is not queued twice.
+    fn refresh_saved(&mut self, effects: &mut Vec<Effect>) {
         let n = &mut self.named;
         if !n.saved_supported {
             return;
         }
-        if n.saved_in_flight {
-            n.saved_dirty |= force;
+        let recent = SavedAsk::Recent(if n.deep { SAVED_SESSIONS_MAX } else { SAVED_RECENT });
+        for ask in [SavedAsk::Named, recent] {
+            if !n.saved_queue.contains(&ask) {
+                n.saved_queue.push_back(ask);
+            }
+        }
+        self.pump_saved(effects);
+    }
+
+    /// Send the next queued request if none is in flight.
+    fn pump_saved(&mut self, effects: &mut Vec<Effect>) {
+        let n = &mut self.named;
+        if n.saved_in_flight.is_some() {
             return;
         }
-        if force || n.saved_at.is_none_or(|t| now.duration_since(t) >= SAVED_REFRESH) {
-            n.saved_in_flight = true;
-            n.saved_dirty = false;
-            n.saved_at = Some(now);
-            effects.push(Effect::ListSaved);
+        if let Some(ask) = n.saved_queue.pop_front() {
+            n.saved_in_flight = Some(ask);
+            effects.push(match ask {
+                SavedAsk::Named => Effect::ListSaved { named_only: true, limit: SAVED_SESSIONS_MAX },
+                SavedAsk::Recent(limit) => Effect::ListSaved { named_only: false, limit },
+            });
         }
+    }
+
+    /// OLDER was opened or find used: list up to the wire's cap, once.
+    pub fn want_deep(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let n = &mut self.named;
+        if !n.saved_supported || n.deep {
+            return effects;
+        }
+        n.deep = true;
+        n.saved_queue.retain(|a| *a == SavedAsk::Named);
+        n.saved_queue.push_back(SavedAsk::Recent(SAVED_SESSIONS_MAX));
+        self.pump_saved(&mut effects);
+        effects
+    }
+
+    /// `--offline`: the synthetic transport answers `saved_sessions` itself.
+    pub fn offer_saved(&mut self) -> Vec<Effect> {
+        self.named.saved_supported = true;
+        let mut effects = Vec::new();
+        self.refresh_saved(&mut effects);
+        effects
     }
 
     /// The saved list did not come (or could not be asked for).
@@ -311,8 +355,8 @@ impl Model {
 
     fn on_saved_failed(&mut self, reason: &str, effects: &mut Vec<Effect>) {
         let n = &mut self.named;
-        n.saved_in_flight = false;
-        n.saved_dirty = false;
+        n.saved_in_flight = None;
+        n.saved_queue.clear();
         n.saved_note = Some(format!("Saved sessions unavailable: {reason}"));
         // An Open by name that waited for the list: the daemon resolves it.
         if n.opening.as_ref().is_some_and(|o| o.attach_seq.is_none()) {
@@ -320,44 +364,45 @@ impl Model {
         }
     }
 
-    /// The Named rows: live named + saved named not live, alphabetical; the
-    /// one being resumed says so.
-    pub fn named_rows(&self) -> Vec<NamedRow> {
-        let saved: &[SavedSession] = if self.named.saved_supported { &self.named.saved } else { &[] };
-        let mut rows = crate::named::named_rows(&self.sessions, saved);
-        if let Some(r) = &self.named.resuming {
-            for row in &mut rows {
-                if matches!(&row.action, RowAction::Resume(q) if q.target == r.req.target) || row.name == r.req.label {
-                    row.marker = Marker::Resuming;
-                }
-            }
+    /// A held session's state, first match wins (see [`State`]). The
+    /// attached one is read from its own transcript (answered prompts, a
+    /// turn that just ended), which runs ahead of the 3-second poll.
+    pub fn state(&self, s: &SessionMeta) -> State {
+        let active = self.is_active(&s.id);
+        let resuming = self.named.resuming.as_ref().is_some_and(|r| s.is(&r.req.target) || s.name.as_deref() == Some(&r.req.label));
+        if (self.is_wanted(&s.id) && !active) || resuming {
+            return State::Opening;
         }
-        rows
-    }
-
-    /// The live sessions without a name (the list below Named).
-    #[cfg(test)]
-    pub fn unnamed_sessions(&self) -> impl Iterator<Item = &SessionMeta> {
-        crate::named::unnamed(&self.sessions)
-    }
-
-    /// A live session's state. The attached one is read from its own
-    /// transcript (answered prompts, a turn that just ended), which runs
-    /// ahead of the 3-second session poll.
-    pub fn marker(&self, s: &SessionMeta) -> Marker {
-        if !self.is_active(&s.id) {
-            return Marker::of(s);
-        }
-        if !self.transcript.pending_prompts().is_empty() {
-            Marker::Awaiting
-        } else if self.transcript.busy() {
-            Marker::Busy
-        } else if s.is_parked() {
-            Marker::Parked
-        } else if s.pinned {
-            Marker::Pinned
+        let (needs, busy) =
+            if active { (!self.transcript.pending_prompts().is_empty(), self.transcript.busy()) } else { (s.awaiting_input > 0, s.busy) };
+        if needs {
+            State::NeedsYou
+        } else if busy {
+            State::Running
+        } else if s.locked_by.is_some() {
+            State::Locked
+        } else if self.unread.contains(&s.id) {
+            State::Unread
+        } else if is_parked(s) {
+            State::Parked
         } else {
-            Marker::Idle
+            State::Idle
+        }
+    }
+
+    /// A saved (not held) session's state.
+    pub fn saved_state(&self, v: &SavedSession) -> State {
+        let resuming = self
+            .named
+            .resuming
+            .as_ref()
+            .is_some_and(|r| r.req.target == v.id || (r.req.by_name && v.name.as_deref() == Some(&r.req.label)));
+        if resuming {
+            State::Opening
+        } else if self.unread.contains(&v.id) {
+            State::Unread
+        } else {
+            State::Saved
         }
     }
 
@@ -368,7 +413,7 @@ impl Model {
     /// Live sessions waiting on the user (a question, a secret, a tool-call
     /// confirmation), in list order.
     pub fn attention(&self) -> impl Iterator<Item = &SessionMeta> {
-        self.sessions.iter().filter(|s| self.marker(s) == Marker::Awaiting)
+        self.sessions.iter().filter(|s| self.state(s) == State::NeedsYou)
     }
 
     /// The active session's list entry.
@@ -403,12 +448,6 @@ impl Model {
         }
     }
 
-    /// "Open by name…" was opened (again): a fresh start.
-    pub fn open_shown(&mut self) {
-        self.named.error = None;
-        self.named.opened = false;
-    }
-
     /// "Open by name…": the name exactly, never a partial id. A live
     /// session of that name is attached; a saved one is resumed by its
     /// journal id in its folder. Not in the lists: a daemon with the saved
@@ -416,10 +455,6 @@ impl Model {
     /// named"; a daemon without it resolves the name itself, and the
     /// attached session must carry that name.
     pub fn open_by_name(&mut self, typed: &str) -> Vec<Effect> {
-        self.open_by_name_at(typed, Instant::now())
-    }
-
-    pub fn open_by_name_at(&mut self, typed: &str, now: Instant) -> Vec<Effect> {
         let name = typed.trim();
         let n = &mut self.named;
         n.error = None;
@@ -431,12 +466,12 @@ impl Model {
         }
         n.opening = Some(Opening { name: name.to_string(), attach_seq: None, asked_saved: false });
         let mut effects = Vec::new();
-        self.resolve_open(now, &mut effects);
+        self.resolve_open(&mut effects);
         effects
     }
 
     /// Resolve a waiting Open by name against the lists (exact name).
-    fn resolve_open(&mut self, now: Instant, effects: &mut Vec<Effect>) {
+    fn resolve_open(&mut self, effects: &mut Vec<Effect>) {
         let Some((name, asked_saved)) =
             self.named.opening.as_ref().filter(|o| o.attach_seq.is_none()).map(|o| (o.name.clone(), o.asked_saved))
         else {
@@ -462,7 +497,7 @@ impl Model {
                     if let Some(o) = &mut self.named.opening {
                         o.asked_saved = true;
                     }
-                    self.want_saved(now, true, effects);
+                    self.refresh_saved(effects);
                 }
                 return;
             }
@@ -550,11 +585,6 @@ impl Model {
     pub fn rename_not_sent(&mut self, why: String) {
         self.named.rename = None;
         self.named.rename_error = Some(why);
-    }
-
-    /// Events as of now.
-    pub fn apply(&mut self, ev: Event) -> Vec<Effect> {
-        self.apply_at(ev, Instant::now())
     }
 
     /// The user asked for an attachment (`Client::attach`/`create`/`resume`
@@ -661,16 +691,29 @@ impl Model {
         }
     }
 
-    /// Apply one event; `now` paces the saved-list refresh.
-    pub fn apply_at(&mut self, ev: Event, now: Instant) -> Vec<Effect> {
+    /// Apply one event.
+    pub fn apply(&mut self, ev: Event) -> Vec<Effect> {
         let mut effects = Vec::new();
+        let ev = match ev {
+            Event::Sessions(mut s) => {
+                sort_sessions(&mut s);
+                // The poll of an idle daemon: nothing to rebuild or draw.
+                if s == self.sessions {
+                    return effects;
+                }
+                Event::Sessions(s)
+            }
+            ev => ev,
+        };
+        self.view_dirty = true;
         if !matches!(ev, Event::Session { .. } | Event::History { .. }) {
             self.rail_gen += 1;
         }
         match ev {
             Event::Status(s) => {
                 // A reply in flight died with the old connection.
-                self.named.saved_in_flight = false;
+                self.named.saved_in_flight = None;
+                self.named.saved_queue.clear();
                 if let Status::Connected { features, profile, .. } = &s {
                     self.named.daemon = match profile {
                         Some(p) => format!("the daemon's machine (profile {p})"),
@@ -678,10 +721,9 @@ impl Model {
                     };
                     self.named.saved_supported = features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
                     if self.named.saved_supported {
-                        self.want_saved(now, true, &mut effects);
+                        self.refresh_saved(&mut effects);
                     } else {
-                        self.named.saved.clear();
-                        self.named.saved_note = None;
+                        self.clear_saved();
                     }
                 }
                 self.conn = match s {
@@ -696,22 +738,49 @@ impl Model {
                 }
             }
             Event::Sessions(s) => {
+                // UNREAD: a turn that ended, or new messages, off screen.
+                for new in &s {
+                    if self.is_active(&new.id) {
+                        continue;
+                    }
+                    if let Some(old) = self.sessions.iter().find(|o| o.id == new.id)
+                        && ((old.busy && !new.busy) || new.messages > old.messages)
+                    {
+                        self.unread.insert(new.id.clone());
+                        if !new.journal_id.is_empty() {
+                            self.unread.insert(new.journal_id.clone());
+                        }
+                    }
+                }
+                // A row leaving OPEN (closed, or evicted to history).
+                let left = self.sessions.iter().any(|o| !s.iter().any(|n| n.id == o.id));
                 self.sessions = s;
-                self.want_saved(now, false, &mut effects);
+                if left {
+                    self.refresh_saved(&mut effects);
+                }
             }
             Event::SavedSessions { sessions, truncated, rejected } => {
                 let n = &mut self.named;
-                n.saved = sessions;
-                n.saved_truncated = truncated;
-                n.saved_in_flight = false;
+                let asked = n.saved_in_flight.take();
                 n.saved_note = (rejected > 0).then(|| format!("{rejected} saved sessions could not be read (skipped)."));
-                // A refresh asked meanwhile (after a rename, or for an Open
-                // by name) goes out now, and the Open by name waits for it.
-                if std::mem::take(&mut n.saved_dirty) {
-                    self.want_saved(now, true, &mut effects);
-                } else {
-                    self.resolve_open(now, &mut effects);
+                match asked {
+                    Some(SavedAsk::Named) => {
+                        n.saved = sessions;
+                        n.saved_truncated = truncated;
+                    }
+                    Some(SavedAsk::Recent(_)) => {
+                        n.recent = sessions;
+                        n.recent_truncated = truncated;
+                        n.recent_loaded = true;
+                    }
+                    // Asked on a connection since dropped.
+                    None => {}
                 }
+                // An Open by name waits for a named list asked after it.
+                if asked == Some(SavedAsk::Named) && !self.named.saved_queue.contains(&SavedAsk::Named) {
+                    self.resolve_open(&mut effects);
+                }
+                self.pump_saved(&mut effects);
             }
             Event::SavedSessionsFailed { reason } => self.on_saved_failed(&reason, &mut effects),
             Event::Renamed { session_id, name, .. } => {
@@ -722,7 +791,7 @@ impl Model {
                     self.renamed();
                 }
                 effects.push(Effect::ListSessions);
-                self.want_saved(now, true, &mut effects);
+                self.refresh_saved(&mut effects);
             }
             Event::RenameFailed(f) => {
                 let asked = match self.named.rename.take() {
@@ -772,8 +841,11 @@ impl Model {
                         self.named.notice =
                             Some(format!("Opened '{}' by name: this daemon does not list saved folders, so it runs in ~.", r.req.label));
                     }
-                    self.want_saved(now, true, &mut effects);
+                    self.refresh_saved(&mut effects);
                 }
+                // Opened: read.
+                self.unread.remove(&attached.meta.id);
+                self.unread.remove(&attached.meta.journal_id);
                 self.named.attaching.take_if(|(s, _)| *s == attach_seq);
                 if self.named.opening.take_if(|o| o.attach_seq == Some(attach_seq)).is_some() {
                     self.named.opened = true;
@@ -855,11 +927,8 @@ impl Model {
             }
             // The saved list's own failures stay in the Named section.
             Event::Error { attach_seq: None, error: Error::Unsupported { .. } } => {
+                self.clear_saved();
                 let n = &mut self.named;
-                n.saved_supported = false;
-                n.saved_in_flight = false;
-                n.saved.clear();
-                n.saved_note = None;
                 if n.opening.as_ref().is_some_and(|o| o.attach_seq.is_none()) {
                     self.open_by_resolver(&mut effects);
                 }
@@ -883,6 +952,20 @@ impl Model {
             _ => {}
         }
         effects
+    }
+
+    /// A daemon without `saved_sessions`: no lists, nothing in flight.
+    fn clear_saved(&mut self) {
+        let n = &mut self.named;
+        n.saved_supported = false;
+        n.saved_in_flight = None;
+        n.saved_queue.clear();
+        n.saved.clear();
+        n.recent.clear();
+        n.saved_truncated = false;
+        n.recent_truncated = false;
+        n.recent_loaded = false;
+        n.saved_note = None;
     }
 
     /// The pending rename landed (or was already so): close the row.
@@ -923,29 +1006,80 @@ mod tests {
     }
 
     #[test]
-    fn filters_and_the_attached_sessions_own_state() {
+    fn states_and_the_attached_sessions_own_state() {
+        use crate::rail::Chip;
         let mk = |id: &str, busy: bool, awaiting: usize, lifecycle: &str| -> SessionMeta {
             serde_json::from_value(json!({"id": id, "busy": busy, "awaiting_input": awaiting, "lifecycle": lifecycle})).unwrap()
         };
         let mut m = Model::new(ConnState::Connecting);
         m.sessions = vec![mk("s", true, 1, "live"), mk("b", true, 0, "live"), mk("w", false, 2, "live"), mk("p", false, 0, "parked")];
-        let markers: Vec<Marker> = m.sessions.iter().map(|s| m.marker(s)).collect();
-        assert_eq!(markers, [Marker::Awaiting, Marker::Busy, Marker::Awaiting, Marker::Parked]);
+        let states: Vec<State> = m.sessions.iter().map(|s| m.state(s)).collect();
+        assert_eq!(states, [State::NeedsYou, State::Running, State::NeedsYou, State::Parked]);
         assert_eq!(m.attention().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s", "w"]);
         // Attached to "s": its transcript says idle, nothing pending (the
         // poll has not caught up yet).
         attach(&mut m, 1);
         assert!(m.is_active("s"));
-        assert_eq!(m.marker(&m.sessions[0]), Marker::Idle);
+        assert_eq!(m.state(&m.sessions[0]), State::Idle);
         assert_eq!(m.attention().count(), 1);
         assert_eq!(m.active_meta().map(|s| s.id.as_str()), Some("s"));
-        for (f, admitted) in
-            [(Filter::All, vec!["s", "b", "w", "p"]), (Filter::Live, vec!["b"]), (Filter::Needs, vec!["w"]), (Filter::Idle, vec!["s", "p"])]
-        {
-            let got: Vec<&str> = m.sessions.iter().filter(|s| f.admits(m.marker(s))).map(|s| s.id.as_str()).collect();
-            assert_eq!(got, admitted, "{f:?}");
+        for (c, admitted) in [(Chip::NeedsYou, vec!["w"]), (Chip::Running, vec!["b"]), (Chip::Unread, vec![])] {
+            let got: Vec<&str> = m.sessions.iter().filter(|s| c.admits(m.state(s))).map(|s| s.id.as_str()).collect();
+            assert_eq!(got, admitted, "{c:?}");
         }
-        assert!(Filter::Live.admits(Marker::Resuming) && Filter::Idle.admits(Marker::Saved));
+    }
+
+    /// The 3-second poll of an idle daemon changes nothing: no rail
+    /// rebuild, nothing to draw. The same list in another order is the
+    /// same list (the daemon sends hash-map order; OPEN is newest first).
+    #[test]
+    fn an_unchanged_poll_is_free() {
+        let mut m = Model::new(ConnState::Connecting);
+        let list = json!([{"id": "a", "lifecycle": "live", "created_at": "2026-11-13T10:00:00Z"},
+                          {"id": "b", "lifecycle": "live", "created_at": "2026-11-13T11:00:00.5Z"}]);
+        m.apply(Event::Sessions(metas(list.clone())));
+        assert_eq!(m.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["b", "a"], "newest first");
+        let generation = m.rail_gen;
+        m.view_dirty = false;
+        let mut reversed = metas(list.clone());
+        reversed.reverse();
+        assert!(m.apply(Event::Sessions(reversed)).is_empty());
+        assert_eq!(m.rail_gen, generation, "no rebuild");
+        assert!(!m.view_dirty, "nothing to draw");
+        let mut busy = metas(list);
+        busy[0].busy = true;
+        m.apply(Event::Sessions(busy));
+        assert!(m.rail_gen > generation && m.view_dirty);
+        assert_eq!(m.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["b", "a"], "a state change moves nothing");
+    }
+
+    /// UNREAD is the client's: the poll saw a turn end, or messages rise,
+    /// while the session was not on screen. Opening it clears it; the one
+    /// on screen never is; evicted to history it stays (by journal id).
+    #[test]
+    fn unread_is_kept_by_the_client() {
+        let mut m = Model::new(ConnState::Connecting);
+        let list = |busy: bool, messages: usize| {
+            metas(json!([{"id": "s", "lifecycle": "live", "busy": busy, "messages": messages},
+                         {"id": "u", "lifecycle": "live", "busy": busy, "messages": messages, "journal_id": "j-u"}]))
+        };
+        let st = |m: &Model, id: &str| m.state(m.sessions.iter().find(|s| s.id == id).unwrap());
+        m.apply(Event::Sessions(list(true, 2)));
+        attach(&mut m, 1);
+        m.apply(Event::Sessions(list(false, 2)));
+        assert_eq!(st(&m, "u"), State::Unread, "its turn ended off screen");
+        assert_eq!(st(&m, "s"), State::Idle, "on screen");
+        let saved: SavedSession = serde_json::from_value(json!({"id": "j-u", "live": false})).unwrap();
+        assert_eq!(m.saved_state(&saved), State::Unread);
+        m.want(2);
+        let a = json!({"type": "attached", "client": 2, "meta": {"id": "u", "journal_id": "j-u"}, "conversation": {"api_messages": []}});
+        let DaemonFrame::Attached(a) = decode_frame(&a.to_string()).unwrap() else { panic!() };
+        m.apply(attached_ev(2, a));
+        assert_eq!(st(&m, "u"), State::Idle, "opened: read");
+        assert_eq!(m.saved_state(&saved), State::Saved);
+        m.apply(Event::Sessions(list(false, 3)));
+        assert_eq!(st(&m, "s"), State::Unread, "new messages while s is off screen");
+        assert_eq!(st(&m, "u"), State::Idle);
     }
 
     /// H4: a window that never renders applies every event as it comes;
@@ -1145,71 +1279,113 @@ mod tests {
     }
 
     fn list_saved(fx: &[Effect]) -> bool {
-        fx.contains(&Effect::ListSaved)
+        fx.iter().any(|f| matches!(f, Effect::ListSaved { .. }))
     }
 
-    /// Feature gating: a daemon without `saved_sessions` is never asked
-    /// (no `ListSaved`, however many session lists or renames arrive); one
-    /// with it is asked on connect, then at most every 30 s, never twice at
-    /// once, and again at once after a rename.
+    const ASK_NAMED: Effect = Effect::ListSaved { named_only: true, limit: SAVED_SESSIONS_MAX };
+    const ASK_RECENT: Effect = Effect::ListSaved { named_only: false, limit: SAVED_RECENT };
+
+    /// The named list and an empty newest list, landed in the order asked.
+    fn lists(m: &mut Model, named: Value) {
+        m.apply(saved_list(named));
+        m.apply(saved_list(json!([])));
+    }
+
+    /// The rail's rows (every bucket open) as `(title, state, action)`.
+    fn rows(m: &Model) -> Vec<(String, State, RowAction)> {
+        use crate::rail::{Item, View, build};
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let rail = build(m, &View { open: 0x1f, ..View::default() }, now);
+        rail.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Row(r) | Item::Hist(r) => {
+                    let row = &rail.rows[*r];
+                    let st = row.live.map(|i| m.state(&m.sessions[i])).unwrap_or(row.state);
+                    Some((row.title.to_string(), st, row.action.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn row_action(m: &Model, title: &str) -> RowAction {
+        rows(m).into_iter().find(|r| r.0 == title).unwrap_or_else(|| panic!("no row {title}")).2
+    }
+
+    fn state_of(m: &Model, title: &str) -> State {
+        rows(m).into_iter().find(|r| r.0 == title).unwrap_or_else(|| panic!("no row {title}")).1
+    }
+
     #[test]
-    fn the_saved_list_is_asked_only_of_a_daemon_that_has_it_and_paced() {
-        let t0 = Instant::now();
+    fn the_saved_lists_are_asked_only_of_a_daemon_that_has_them_on_events() {
+        let renamed = || Event::Renamed { session_id: "s".into(), name: Some("a".into()), in_memory_only: false };
+        let one = metas(json!([{"id": "a", "lifecycle": "live"}]));
         let mut m = Model::new(ConnState::Connecting);
-        assert!(!list_saved(&m.apply_at(connected(&["owned_sessions"]), t0)));
-        for i in 0..20 {
-            let fx = m.apply_at(Event::Sessions(Vec::new()), t0 + SAVED_REFRESH * i);
-            assert!(!list_saved(&fx));
-        }
-        let fx = m.apply_at(Event::Renamed { session_id: "s".into(), name: Some("a".into()), in_memory_only: false }, t0);
+        assert!(!list_saved(&m.apply(connected(&["owned_sessions"]))));
+        assert!(!list_saved(&m.apply(Event::Sessions(one.clone()))));
+        assert!(!list_saved(&m.apply(Event::Sessions(Vec::new()))), "a row left OPEN, but there is no saved list");
+        let fx = m.apply(renamed());
         assert!(!list_saved(&fx) && fx.contains(&Effect::ListSessions));
-        assert!(m.named_rows().is_empty());
+        assert!(rows(&m).is_empty());
 
         let mut m = Model::new(ConnState::Connecting);
-        assert!(list_saved(&m.apply_at(connected(&["saved_sessions"]), t0)), "asked on startup");
-        assert!(!list_saved(&m.apply_at(Event::Sessions(Vec::new()), t0 + SAVED_REFRESH * 2)), "one in flight");
-        m.apply_at(saved_list(json!([])), t0 + Duration::from_secs(1));
-        assert!(!list_saved(&m.apply_at(Event::Sessions(Vec::new()), t0 + Duration::from_secs(29))), "not due yet");
-        assert!(list_saved(&m.apply_at(Event::Sessions(Vec::new()), t0 + SAVED_REFRESH)), "due after 30 s");
-        m.apply_at(saved_list(json!([])), t0 + SAVED_REFRESH);
-        let t1 = t0 + SAVED_REFRESH + Duration::from_secs(2);
-        let fx = m.apply_at(Event::Renamed { session_id: "s".into(), name: Some("a".into()), in_memory_only: false }, t1);
-        assert!(list_saved(&fx), "after a rename at once");
-        // A dropped connection frees the slot; an older daemon behind the
-        // same socket (Unsupported) stops the asking and the saved rows.
-        m.apply_at(Event::Status(Status::Reconnecting { why: "x".into() }), t1);
-        m.apply_at(saved_list(json!([{"id": "j", "name": "kept", "live": false}])), t1);
-        assert_eq!(m.named_rows().len(), 1);
-        m.apply_at(Event::Error { attach_seq: None, error: Error::Unsupported { feature: "saved_sessions" } }, t1);
-        assert!(m.named_rows().is_empty());
+        assert_eq!(m.apply(connected(&["saved_sessions"])), [ASK_NAMED], "the named list first");
+        assert!(m.apply(Event::Sessions(one.clone())).is_empty(), "one request at a time");
+        assert_eq!(m.apply(saved_list(json!([]))), [ASK_RECENT], "then the newest 200");
+        assert!(m.apply(saved_list(json!([]))).is_empty());
+        for _ in 0..20 {
+            let mut changed = one.clone();
+            changed[0].messages += 1;
+            assert!(!list_saved(&m.apply(Event::Sessions(changed))), "never on the poll");
+        }
+        assert_eq!(m.apply(Event::Sessions(Vec::new())), [ASK_NAMED], "a row left OPEN");
+        lists(&mut m, json!([]));
+        assert_eq!(m.apply(renamed()), [Effect::ListSessions, ASK_NAMED], "after a rename");
+        // Another rename meanwhile: asked again after, never twice at once.
+        assert!(!list_saved(&m.apply(renamed())));
+        assert_eq!(m.apply(saved_list(json!([]))), [ASK_RECENT]);
+        assert_eq!(m.apply(saved_list(json!([]))), [ASK_NAMED], "the second rename's");
+        assert!(m.apply(saved_list(json!([]))).is_empty());
+        // A dropped connection drops what was in flight; an older daemon
+        // behind the same socket (Unsupported) stops the asking and HISTORY.
+        assert_eq!(m.apply(renamed()), [Effect::ListSessions, ASK_NAMED]);
+        m.apply(Event::Status(Status::Reconnecting { why: "x".into() }));
+        assert!(m.apply(saved_list(json!([{"id": "j", "name": "kept", "live": false}]))).is_empty());
+        assert!(m.named.saved.is_empty(), "not asked on this connection");
+        assert_eq!(m.apply(connected(&["saved_sessions"])), [ASK_NAMED]);
+        lists(&mut m, json!([{"id": "j", "name": "kept", "live": false}]));
+        assert_eq!(rows(&m).len(), 1);
+        m.apply(Event::Error { attach_seq: None, error: Error::Unsupported { feature: "saved_sessions" } });
+        assert!(rows(&m).is_empty());
         assert!(m.last_error.is_none(), "not a transcript error");
-        assert!(!list_saved(&m.apply_at(Event::Sessions(Vec::new()), t1 + SAVED_REFRESH * 3)));
+        assert!(!list_saved(&m.apply(renamed())));
     }
 
-    /// The rail through the model: live named + saved named not live,
-    /// deduped and alphabetical; unnamed live sessions below.
     #[test]
     fn the_rail_groups_live_and_saved_sessions() {
-        let t0 = Instant::now();
         let mut m = Model::new(ConnState::Connecting);
-        m.apply_at(connected(&["saved_sessions"]), t0);
-        m.apply_at(
-            Event::Sessions(metas(json!([
-                {"id": "l1", "name": "zed", "lifecycle": "live", "pinned": true},
-                {"id": "l2", "lifecycle": "live"},
-                {"id": "l3", "name": "axel", "lifecycle": "live", "journal_id": "20261110-202033-e5f6", "awaiting_input": 1},
-            ]))),
-            t0,
-        );
+        m.apply(connected(&["saved_sessions"]));
+        m.apply(Event::Sessions(metas(json!([
+            {"id": "l1", "name": "zed", "lifecycle": "live", "pinned": true},
+            {"id": "l2", "lifecycle": "live"},
+            {"id": "l3", "name": "axel", "lifecycle": "live", "journal_id": "20261110-202033-e5f6", "awaiting_input": 1},
+        ]))));
         let fixture =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../synaps-client/tests/fixtures/saved_session_list.json"))
                 .unwrap();
         let DaemonFrame::SavedSessionList { sessions, truncated, .. } = decode_frame(fixture.trim()).unwrap() else { panic!() };
-        m.apply_at(Event::SavedSessions { sessions, truncated, rejected: 0 }, t0);
-        let rows: Vec<(String, Marker)> = m.named_rows().into_iter().map(|r| (r.name, r.marker)).collect();
-        let want = [("axel", Marker::Awaiting), ("bebop", Marker::Saved), ("old-notes", Marker::Saved), ("zed", Marker::Pinned)];
-        assert_eq!(rows, want.map(|(n, k)| (n.to_string(), k)).to_vec());
-        assert_eq!(m.unnamed_sessions().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec!["l2"]);
+        m.apply(Event::SavedSessions { sessions, truncated, rejected: 0 });
+        m.apply(saved_list(json!([])));
+        let got: Vec<(String, State)> = rows(&m).into_iter().map(|(t, s, _)| (t, s)).collect();
+        let want = [
+            ("zed", State::Idle),
+            ("axel", State::NeedsYou),
+            ("New session", State::Idle),
+            ("bebop", State::Saved),
+            ("old-notes", State::Saved),
+        ];
+        assert_eq!(got, want.map(|(n, k)| (n.to_string(), k)).to_vec());
     }
 
     /// Resume (H1, L1, L4): the row's saved folder reaches the create as
@@ -1221,38 +1397,36 @@ mod tests {
     #[test]
     fn resuming_a_saved_session() {
         use synaps_client::Cwd;
-        let t0 = Instant::now();
         let mut m = Model::new(ConnState::Connecting);
-        m.apply_at(connected(&["saved_sessions"]), t0);
-        m.apply_at(saved_list(json!([{"id": "j-bebop", "name": "bebop", "cwd": "/home/u/Projects/bebop", "live": false}])), t0);
-        let row = m.named_rows().remove(0);
-        let fx = m.open_row(&row.action);
+        m.apply(connected(&["saved_sessions"]));
+        lists(&mut m, json!([{"id": "j-bebop", "name": "bebop", "cwd": "/home/u/Projects/bebop", "live": false}]));
+        let fx = m.open_row(&row_action(&m, "bebop"));
         let [Effect::Resume { req: bebop, open: false }] = fx.as_slice() else { panic!("{fx:?}") };
         assert_eq!(bebop.target, "j-bebop");
         let o = bebop.options();
         assert_eq!((o.cwd, o.fallback_cwd), (Cwd::Path("/home/u/Projects/bebop".into()), Some(Cwd::Home)));
         m.resuming(bebop.clone(), 7, false);
-        assert_eq!(m.named_rows()[0].marker, Marker::Resuming);
-        m.apply_at(Event::CwdFallback { attach_seq: 7, missing: "/home/u/Projects/bebop".into(), cwd: None }, t0);
+        assert_eq!(state_of(&m, "bebop"), State::Opening);
+        m.apply(Event::CwdFallback { attach_seq: 7, missing: "/home/u/Projects/bebop".into(), cwd: None });
         assert_eq!(m.named.notice.as_deref(), Some("Folder /home/u/Projects/bebop is gone on the daemon's machine; resumed in ~."));
-        let fx = m.apply_at(attached_ev(7, attached("live-bebop")), t0);
+        let fx = m.apply(attached_ev(7, attached("live-bebop")));
         assert!(m.named.resuming.is_none());
         assert!(list_saved(&fx), "the resumed session left the saved list");
         assert_eq!(m.active.as_ref().unwrap().session_id, "live-bebop");
 
         m.resuming(req_("ghost"), 8, false);
-        m.apply_at(detached(8, crate::named::NO_SUCH_GHOST), t0);
+        m.apply(detached(8, crate::named::NO_SUCH_GHOST));
         assert_eq!(m.named.error.as_deref(), Some("No session named 'ghost'."));
         assert!(m.named.resuming.is_none() && m.active.is_none() && m.last_error.is_none());
 
         m.resuming(req("axel", "j-axel", None), 9, false);
-        m.apply_at(detached(9, crate::named::LOCKED_AXEL), t0);
+        m.apply(detached(9, crate::named::LOCKED_AXEL));
         assert!(m.named.error.as_deref().unwrap().contains("locked by another process"));
         // A plain detach is still a transcript error; an attach clears the
         // Named section's error (L4).
         attach(&mut m, 10);
         assert!(m.named.error.is_none());
-        m.apply_at(detached(10, "session ended"), t0);
+        m.apply(detached(10, "session ended"));
         assert_eq!(m.last_error.as_deref(), Some("detached: session ended"));
     }
 
@@ -1264,16 +1438,15 @@ mod tests {
     /// (the client stops it; that `Detached` is stale and says nothing).
     #[test]
     fn switching_away_from_a_resume_clears_it() {
-        let t0 = Instant::now();
         let mut m = Model::new(ConnState::Connecting);
-        m.apply_at(connected(&["saved_sessions"]), t0);
-        m.apply_at(saved_list(json!([{"id": "j-bebop", "name": "bebop", "live": false}])), t0);
+        m.apply(connected(&["saved_sessions"]));
+        lists(&mut m, json!([{"id": "j-bebop", "name": "bebop", "live": false}]));
         m.resuming(req("bebop", "j-bebop", None), 7, false);
-        assert_eq!(m.named_rows()[0].marker, Marker::Resuming);
+        assert_eq!(state_of(&m, "bebop"), State::Opening);
         m.want(8);
-        assert_eq!(m.named_rows()[0].marker, Marker::Saved);
-        m.apply_at(detached(7, "replaced by another attach"), t0);
-        assert_eq!(m.named_rows()[0].marker, Marker::Saved);
+        assert_eq!(state_of(&m, "bebop"), State::Saved);
+        m.apply(detached(7, "replaced by another attach"));
+        assert_eq!(state_of(&m, "bebop"), State::Saved);
         assert!(m.named.error.is_none() && m.last_error.is_none());
     }
 
@@ -1284,41 +1457,39 @@ mod tests {
     /// named". The typed text stays until `Attached` (`opened`).
     #[test]
     fn open_by_name_is_exact() {
-        let t0 = Instant::now();
         let mut m = Model::new(ConnState::Connecting);
-        m.apply_at(connected(&["saved_sessions"]), t0);
-        m.apply_at(
-            Event::Sessions(metas(json!([{"id": "l1", "name": "live-one", "journal_id": "j-l1", "cwd": "/w", "lifecycle": "live"}]))),
-            t0,
-        );
+        m.apply(connected(&["saved_sessions"]));
+        m.apply(Event::Sessions(metas(json!([{"id": "l1", "name": "live-one", "journal_id": "j-l1", "cwd": "/w", "lifecycle": "live"}]))));
         let axel = json!({"id": "20261110-202033-e5f6", "name": "axel", "cwd": "/home/u/axel", "live": false});
-        m.apply_at(saved_list(json!([axel])), t0);
+        lists(&mut m, json!([axel]));
 
-        assert!(m.open_by_name_at("Axel Memory", t0).is_empty());
+        assert!(m.open_by_name("Axel Memory").is_empty());
         assert!(m.named.error.as_deref().unwrap().contains("lowercase"));
         assert_eq!(
-            m.open_by_name_at(" live-one ", t0),
+            m.open_by_name(" live-one "),
             vec![Effect::Attach { session_id: "l1".into(), fallback: Some(req("live-one", "j-l1", Some("/w"))), open: true }]
         );
         assert!(m.named.error.is_none());
         let want = Effect::Resume { req: req("axel", "20261110-202033-e5f6", Some("/home/u/axel")), open: true };
-        assert_eq!(m.open_by_name_at("axel", t0), vec![want.clone()]);
+        assert_eq!(m.open_by_name("axel"), vec![want.clone()]);
 
         // Part of an id, not a name: asked again, then refused locally.
-        assert_eq!(m.open_by_name_at("64fb", t0), vec![Effect::ListSaved]);
-        assert!(m.apply_at(saved_list(json!([axel])), t0).is_empty());
+        assert_eq!(m.open_by_name("64fb"), [ASK_NAMED]);
+        assert_eq!(m.apply(saved_list(json!([axel]))), [ASK_RECENT]);
         assert_eq!(m.named.error.as_deref(), Some("No session named '64fb'."));
         assert!(m.named.opening.is_none());
+        m.apply(saved_list(json!([])));
         // A name made since the last list is in the fresh one.
-        assert_eq!(m.open_by_name_at("new-one", t0), vec![Effect::ListSaved]);
-        let fx = m.apply_at(saved_list(json!([axel, {"id": "j-new", "name": "new-one", "live": false}])), t0);
-        assert_eq!(fx, vec![Effect::Resume { req: req("new-one", "j-new", None), open: true }]);
+        assert_eq!(m.open_by_name("new-one"), [ASK_NAMED]);
+        let fx = m.apply(saved_list(json!([axel, {"id": "j-new", "name": "new-one", "live": false}])));
+        assert_eq!(fx, [Effect::Resume { req: req("new-one", "j-new", None), open: true }, ASK_RECENT]);
+        m.apply(saved_list(json!([])));
 
         // The outcome: the input clears on `Attached`, not before.
-        m.open_by_name_at("axel", t0);
+        m.open_by_name("axel");
         m.resuming(req("axel", "20261110-202033-e5f6", Some("/home/u/axel")), 5, true);
         assert!(!m.named.opened && m.named.opening.is_some());
-        m.apply_at(attached_ev(5, attached_named("live-axel", Some("axel"))), t0);
+        m.apply(attached_ev(5, attached_named("live-axel", Some("axel"))));
         assert!(m.named.opened && m.named.opening.is_none());
     }
 
@@ -1330,31 +1501,30 @@ mod tests {
     #[test]
     fn open_by_name_without_the_saved_list_checks_the_name() {
         use synaps_client::Cwd;
-        let t0 = Instant::now();
         let mut m = Model::new(ConnState::Connecting);
-        m.apply_at(connected(&["owned_sessions"]), t0);
+        m.apply(connected(&["owned_sessions"]));
         let by_name = ResumeRequest { by_name: true, ..req_("fe") };
-        assert_eq!(m.open_by_name_at("fe", t0), vec![Effect::Resume { req: by_name.clone(), open: true }]);
+        assert_eq!(m.open_by_name("fe"), vec![Effect::Resume { req: by_name.clone(), open: true }]);
         assert_eq!((by_name.options().cwd, by_name.options().fallback_cwd), (Cwd::Home, None));
         m.resuming(by_name.clone(), 3, true);
-        let fx = m.apply_at(attached_ev(3, attached_named("20261110-202033-64fe", None)), t0);
+        let fx = m.apply(attached_ev(3, attached_named("20261110-202033-64fe", None)));
         assert_eq!(fx, vec![Effect::Detach]);
         assert_eq!(m.named.error.as_deref(), Some("No session named 'fe'."));
         assert!(m.active.is_none() && !m.named.opened);
-        m.apply_at(detached(3, "detached"), t0);
+        m.apply(detached(3, "detached"));
         assert!(m.last_error.is_none(), "the detach we asked for is quiet");
 
         let axel = ResumeRequest { by_name: true, ..req_("axel") };
-        m.open_by_name_at("axel", t0);
+        m.open_by_name("axel");
         m.resuming(axel, 4, true);
-        m.apply_at(attached_ev(4, attached_named("s-axel", Some("axel"))), t0);
+        m.apply(attached_ev(4, attached_named("s-axel", Some("axel"))));
         assert!(m.named.opened && m.named.error.is_none());
         assert!(m.named.notice.as_deref().unwrap().contains("runs in ~"));
         assert_eq!(m.active.as_ref().unwrap().session_id, "s-axel");
 
-        m.open_by_name_at("ghost", t0);
+        m.open_by_name("ghost");
         m.resuming(ResumeRequest { by_name: true, ..req_("ghost") }, 5, true);
-        m.apply_at(detached(5, crate::named::NO_SUCH_GHOST), t0);
+        m.apply(detached(5, crate::named::NO_SUCH_GHOST));
         assert_eq!(m.named.error.as_deref(), Some("No session named 'ghost'."));
         assert!(!m.named.opened, "the typed text stays");
     }
@@ -1363,27 +1533,22 @@ mod tests {
     /// (`unknown session`) is resumed from its journal, in its folder.
     #[test]
     fn a_named_live_session_that_ended_is_resumed() {
-        let t0 = Instant::now();
         let mut m = Model::new(ConnState::Connecting);
-        m.apply_at(connected(&[]), t0);
-        m.apply_at(
-            Event::Sessions(metas(
-                json!([{"id": "l3", "name": "axel", "journal_id": "j-axel", "cwd": "/home/u/axel", "lifecycle": "parked"}]),
-            )),
-            t0,
-        );
-        let row = m.named_rows().remove(0);
-        let fx = m.open_row(&row.action);
+        m.apply(connected(&[]));
+        m.apply(Event::Sessions(metas(
+            json!([{"id": "l3", "name": "axel", "journal_id": "j-axel", "cwd": "/home/u/axel", "lifecycle": "parked"}]),
+        )));
+        let fx = m.open_row(&row_action(&m, "axel"));
         let fallback = Some(req("axel", "j-axel", Some("/home/u/axel")));
         assert_eq!(fx, vec![Effect::Attach { session_id: "l3".into(), fallback: fallback.clone(), open: false }]);
         m.attaching(4, fallback.clone(), false);
         // daemon/conn.rs: `DaemonFrame::Error { message: "unknown session" }`.
-        let fx = m.apply_at(detached(4, "unknown session"), t0);
+        let fx = m.apply(detached(4, "unknown session"));
         assert_eq!(fx, vec![Effect::Resume { req: fallback.clone().unwrap(), open: false }]);
         assert!(m.last_error.is_none());
         // Any other end is reported as before.
         m.attaching(5, fallback, false);
-        m.apply_at(detached(5, "daemon closed the connection"), t0);
+        m.apply(detached(5, "daemon closed the connection"));
         assert_eq!(m.last_error.as_deref(), Some("detached: daemon closed the connection"));
     }
 
@@ -1391,43 +1556,38 @@ mod tests {
     /// attach it again (re-attaching would reload it and drop the card).
     #[test]
     fn the_attached_sessions_row_does_not_reattach() {
-        let t0 = Instant::now();
         let mut m = Model::new(ConnState::Connecting);
-        m.apply_at(connected(&[]), t0);
-        m.apply_at(Event::Sessions(metas(json!([{"id": "l3", "name": "axel", "lifecycle": "live"}]))), t0);
-        let row = m.named_rows().remove(0);
-        assert_eq!(m.open_row(&row.action).len(), 1);
+        m.apply(connected(&[]));
+        m.apply(Event::Sessions(metas(json!([{"id": "l3", "name": "axel", "lifecycle": "live"}]))));
+        let action = row_action(&m, "axel");
+        assert_eq!(m.open_row(&action).len(), 1);
         m.attaching(4, None, false);
         m.asked_for("l3");
-        assert_eq!(m.open_row(&row.action), vec![], "on its way");
-        m.apply_at(attached_ev(4, attached("l3")), t0);
-        assert_eq!(m.open_row(&row.action), vec![], "on screen");
-        m.apply_at(detached(4, "detached"), t0);
-        assert_eq!(m.open_row(&row.action).len(), 1, "after a detach it attaches again");
+        assert_eq!(m.open_row(&action), vec![], "on its way");
+        m.apply(attached_ev(4, attached("l3")));
+        assert_eq!(m.open_row(&action), vec![], "on screen");
+        m.apply(detached(4, "detached"));
+        assert_eq!(m.open_row(&action).len(), 1, "after a detach it attaches again");
     }
 
-    /// M4 / L2 / L7: a failed saved list stays in the Named section (not
-    /// the transcript), frees the slot and is asked again 30 s later; a
-    /// forced refresh during a flight goes out when it lands; skipped
-    /// entries and a truncated list are said.
     #[test]
     fn the_saved_lists_own_failures_and_refreshes() {
-        let t0 = Instant::now();
-        let s = Duration::from_secs;
         let mut m = Model::new(ConnState::Connecting);
-        assert!(list_saved(&m.apply_at(connected(&["saved_sessions"]), t0)));
-        m.apply_at(Event::SavedSessionsFailed { reason: "saved sessions: Permission denied (os error 13)".into() }, t0);
+        assert!(list_saved(&m.apply(connected(&["saved_sessions"]))));
+        let fx = m.apply(Event::SavedSessionsFailed { reason: "saved sessions: Permission denied (os error 13)".into() });
+        assert!(fx.is_empty(), "what was queued behind it goes too");
         assert!(m.named.saved_note.as_deref().unwrap().contains("Permission denied"));
         assert!(m.last_error.is_none());
-        assert!(!list_saved(&m.apply_at(Event::Sessions(Vec::new()), t0 + s(10))));
-        assert!(list_saved(&m.apply_at(Event::Sessions(Vec::new()), t0 + SAVED_REFRESH)));
-        // A rename while that one is in flight: asked again when it lands.
+        // Asked again on the next event, not on the poll.
+        assert!(!list_saved(&m.apply(Event::Sessions(metas(json!([{"id": "a", "lifecycle": "live"}]))))));
         let renamed = Event::Renamed { session_id: "s".into(), name: Some("a".into()), in_memory_only: false };
-        assert!(!list_saved(&m.apply_at(renamed, t0 + s(31))));
-        let fx = m.apply_at(Event::SavedSessions { sessions: Vec::new(), truncated: true, rejected: 2 }, t0 + s(32));
-        assert!(list_saved(&fx), "the forced refresh goes out now");
+        assert!(list_saved(&m.apply(renamed)));
+        let fx = m.apply(Event::SavedSessions { sessions: Vec::new(), truncated: true, rejected: 2 });
+        assert_eq!(fx, [ASK_RECENT]);
         assert_eq!(m.named.saved_note.as_deref(), Some("2 saved sessions could not be read (skipped)."));
         assert!(m.named.saved_truncated);
+        m.apply(Event::SavedSessions { sessions: Vec::new(), truncated: true, rejected: 0 });
+        assert!(m.named.recent_truncated && m.named.recent_loaded);
         assert!(m.last_error.is_none());
     }
 
@@ -1439,12 +1599,11 @@ mod tests {
     #[test]
     fn naming_the_current_session() {
         use synaps_client::RenameFailure;
-        let t0 = Instant::now();
         let mut m = Model::new(ConnState::Connecting);
         assert!(m.rename_request("axon").is_none());
         assert_eq!(m.named.rename_error.as_deref(), Some("Not attached to a session."));
         attach(&mut m, 1);
-        m.apply_at(Event::Sessions(metas(json!([{"id": "s", "lifecycle": "live", "name": "kite"}, {"id": "t", "lifecycle": "live"}]))), t0);
+        m.apply(Event::Sessions(metas(json!([{"id": "s", "lifecycle": "live", "name": "kite"}, {"id": "t", "lifecycle": "live"}]))));
         m.toggle_naming();
         assert!(m.rename_request("Bad Name").is_none());
         assert!(m.named.rename_error.as_deref().unwrap().contains("lowercase"));
@@ -1457,34 +1616,33 @@ mod tests {
         assert!(m.rename_request("axon").is_none(), "one at a time");
         let mut f = RenameFailure::new("s", RenameRefusal::Named, "named");
         f.current_name = Some("kite".into());
-        m.apply_at(Event::RenameFailed(f), t0);
+        m.apply(Event::RenameFailed(f));
         assert_eq!(m.named.replace, Some(Replace { session_id: "s".into(), asked: "axon".into(), current: "kite".into() }));
         assert_eq!(m.named.rename_error.as_deref(), Some("This session is already named 'kite'."));
         let r = m.replace_request().unwrap();
         assert_eq!(r, RenameRequest { session_id: "s".into(), name: "axon".into(), expect: Expect::Named("kite".into()) });
         // A reply for another session is not ours.
-        m.apply_at(Event::RenameFailed(RenameFailure::new("other", RenameRefusal::Busy, "")), t0);
+        m.apply(Event::RenameFailed(RenameFailure::new("other", RenameRefusal::Busy, "")));
         assert!(m.named.rename.is_some());
-        let fx = m.apply_at(Event::Renamed { session_id: "s".into(), name: Some("axon".into()), in_memory_only: false }, t0);
+        let fx = m.apply(Event::Renamed { session_id: "s".into(), name: Some("axon".into()), in_memory_only: false });
         assert!(fx.contains(&Effect::ListSessions));
         assert!(!m.named.naming && m.named.rename.is_none() && m.named.replace.is_none());
         assert_eq!(m.active_name(), Some("axon"));
-        assert_eq!(m.named_rows()[0].name, "axon");
-        assert_eq!(m.unnamed_sessions().count(), 1);
+        assert!(rows(&m).iter().any(|r| r.0 == "axon"), "the rail shows the name at once");
 
         // A double Save: "already named what you asked" is success.
         m.toggle_naming();
         m.rename_request("zeta").unwrap();
         let mut f = RenameFailure::new("s", RenameRefusal::Named, "named");
         f.current_name = Some("zeta".into());
-        m.apply_at(Event::RenameFailed(f), t0);
+        m.apply(Event::RenameFailed(f));
         assert!(!m.named.naming && m.named.rename.is_none() && m.named.rename_error.is_none() && m.named.replace.is_none());
 
         m.toggle_naming();
         m.rename_request("taken").unwrap();
         let mut f = RenameFailure::new("s", RenameRefusal::Taken, "taken");
         f.taken_by = Some("20261028-045932-a1b2".into());
-        m.apply_at(Event::RenameFailed(f), t0);
+        m.apply(Event::RenameFailed(f));
         assert!(m.named.rename_error.as_deref().unwrap().contains("already used"));
         assert!(m.named.replace.is_none());
     }
@@ -1496,18 +1654,17 @@ mod tests {
     #[test]
     fn a_replace_offer_stays_with_its_session() {
         use synaps_client::RenameFailure;
-        let t0 = Instant::now();
         let mut m = Model::new(ConnState::Connecting);
         attach(&mut m, 1);
-        m.apply_at(Event::Sessions(metas(json!([{"id": "s", "lifecycle": "live", "name": "kite"}, {"id": "t", "lifecycle": "live"}]))), t0);
+        m.apply(Event::Sessions(metas(json!([{"id": "s", "lifecycle": "live", "name": "kite"}, {"id": "t", "lifecycle": "live"}]))));
         m.toggle_naming();
         m.rename_request("axon").unwrap();
         let mut f = RenameFailure::new("s", RenameRefusal::Named, "named");
         f.current_name = Some("kite".into());
-        m.apply_at(Event::RenameFailed(f), t0);
+        m.apply(Event::RenameFailed(f));
         assert!(m.named.replace.is_some());
         m.want(2);
-        m.apply_at(attached_ev(2, attached("t")), t0);
+        m.apply(attached_ev(2, attached("t")));
         assert!(!m.named.naming && m.named.replace.is_none() && m.named.rename_error.is_none());
         assert!(m.replace_request().is_none(), "no offer to take to t");
 
@@ -1516,8 +1673,8 @@ mod tests {
         m.toggle_naming();
         m.rename_request("axon").unwrap();
         m.want(4);
-        m.apply_at(attached_ev(4, attached("t")), t0);
-        m.apply_at(Event::RenameFailed(RenameFailure::new("s", RenameRefusal::Busy, "")), t0);
+        m.apply(attached_ev(4, attached("t")));
+        m.apply(Event::RenameFailed(RenameFailure::new("s", RenameRefusal::Busy, "")));
         assert!(!m.named.naming);
         assert!(m.named.error.as_deref().unwrap().starts_with("Naming a session 'axon': "), "{:?}", m.named.error);
 
@@ -1526,7 +1683,7 @@ mod tests {
         m.toggle_naming();
         m.rename_request("axon").unwrap();
         m.named.naming = false;
-        m.apply_at(Event::RenameFailed(RenameFailure::new("s", RenameRefusal::Busy, "")), t0);
+        m.apply(Event::RenameFailed(RenameFailure::new("s", RenameRefusal::Busy, "")));
         assert!(m.named.naming && m.named.rename_error.as_deref().unwrap().contains("busy"));
     }
 
@@ -1667,10 +1824,29 @@ mod fake_daemon {
         }
     }
 
-    fn welcome() -> Value {
+    fn welcome(saved: bool) -> Value {
+        let features: Vec<&str> = if saved { vec!["owned_sessions", "saved_sessions"] } else { vec!["owned_sessions"] };
         json!({"type": "welcome", "protocol_version": 3, "daemon_version": "0.0.0-fake", "pid": 1, "profile": null,
                "sessions": [{"id": A, "model": "m", "lifecycle": "live"}, {"id": B, "model": "m", "lifecycle": "live"}],
-               "progressive_tool_disclosure": false, "generation": 1, "features": ["owned_sessions"]})
+               "progressive_tool_disclosure": false, "generation": 1, "features": features})
+    }
+
+    /// The fake's saved sessions (`saved::rows` on #408): the named ones for
+    /// `named_only`, else the newest `limit`; one is held (`live`).
+    fn saved_reply(f: &Value) -> Value {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let at = |ago: i64| crate::demo::rfc3339(now - ago);
+        let all = [
+            json!({"id": A, "title": "held by the daemon", "updated_at": at(5), "live": true}),
+            json!({"id": "20261113-070000-0001", "title": "Fix the relay", "updated_at": at(600), "live": false}),
+            json!({"id": "20261113-060000-0002", "title": "Bench the decoder", "updated_at": at(3600), "live": false}),
+            json!({"id": "20261111-060000-0003", "name": "kite", "title": "Kite notes", "updated_at": at(2 * 86_400), "live": false}),
+            json!({"id": "20261013-060000-0004", "title": "Old work", "updated_at": at(60 * 86_400), "live": false}),
+        ];
+        let named_only = f["named_only"].as_bool().unwrap_or(false);
+        let limit = f["limit"].as_u64().unwrap_or(200) as usize;
+        let rows: Vec<&Value> = all.iter().filter(|v| !named_only || v["name"].is_string()).collect();
+        json!({"type": "saved_session_list", "sessions": rows.iter().take(limit).collect::<Vec<_>>(), "truncated": rows.len() > limit})
     }
 
     fn attached_with_prompt(sid: &str, prompt_id: u64) -> Value {
@@ -1689,28 +1865,44 @@ mod fake_daemon {
     /// Accepts connections: `Hello` → `Welcome`, a session list for the
     /// control connection, and every `Attach` handed to the test.
     fn start(name: &str) -> (PathBuf, mpsc::Receiver<Conn>) {
+        let (path, attaches, _control) = start_with(name, false);
+        (path, attaches)
+    }
+
+    /// `saved`: `Welcome.features` lists `saved_sessions` and the fake
+    /// answers it (else: `Error{unknown variant}`, as an older daemon).
+    /// Every control frame but `Hello` and `Attach` goes to the third
+    /// receiver.
+    fn start_with(name: &str, saved: bool) -> (PathBuf, mpsc::Receiver<Conn>, mpsc::Receiver<Value>) {
         let dir = std::env::temp_dir().join(format!("synaps-desktop-fake-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("d.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx) = mpsc::channel();
+        let (ctl_tx, ctl_rx) = mpsc::channel();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let tx = tx.clone();
+                let (tx, ctl_tx) = (tx.clone(), ctl_tx.clone());
                 std::thread::spawn(move || {
                     let mut c = Conn { w: stream.try_clone().unwrap(), r: BufReader::new(stream) };
                     if c.recv(T).is_none() {
                         return;
                     }
-                    c.send(welcome());
+                    c.send(welcome(saved));
                     let _ = c.r.get_ref().set_read_timeout(None);
                     let mut line = String::new();
                     while c.r.read_line(&mut line).is_ok_and(|n| n > 0) {
                         let f: Value = serde_json::from_str(&line).unwrap_or_default();
                         line.clear();
+                        if f["type"] != "attach" {
+                            let _ = ctl_tx.send(f.clone());
+                        }
                         match f["type"].as_str() {
                             Some("sessions") => c.send(json!({"type": "session_list", "sessions": []})),
+                            Some("saved_sessions") if saved => c.send(saved_reply(&f)),
+                            Some("saved_sessions") => c.send(json!({"type": "error", "session_id": null,
+                                "message": "malformed frame: unknown variant `saved_sessions`"})),
                             Some("attach") => {
                                 let _ = tx.send(c);
                                 return;
@@ -1721,7 +1913,7 @@ mod fake_daemon {
                 });
             }
         });
-        (path, rx)
+        (path, rx, ctl_rx)
     }
 
     /// Apply the client's events to `m` until `done(m)`.
@@ -1861,5 +2053,86 @@ mod fake_daemon {
         client.shutdown().unwrap();
         let answers: Vec<Value> = a.cmds(Duration::from_millis(500)).into_iter().filter(|c| c["cmd"] == "answer").collect();
         assert_eq!(answers, vec![json!({"cmd": "answer", "prompt_id": 1, "value": "n"})], "only the new connection's answer");
+    }
+
+    /// HISTORY end to end, both ways (the rail through the client, the
+    /// model and the rail builder). A daemon that lists `saved_sessions`
+    /// is asked for the named list, then the newest 200, one at a time,
+    /// and HISTORY is drawn in its buckets, less what the daemon holds. One
+    /// that does not is never asked, and HISTORY says why and what works.
+    #[test]
+    fn history_with_and_without_saved_sessions() {
+        use crate::rail::{Bucket, Item, View, build};
+        for saved in [true, false] {
+            let (path, _attaches, control) = start_with(if saved { "history" } else { "nohistory" }, saved);
+            let (client, events) = Client::spawn(ClientOptions::new(Endpoint::Socket(path), Identity::new("tester").unwrap())).unwrap();
+            let mut m = Model::new(ConnState::Connecting);
+            let until = Instant::now() + T;
+            let done = |m: &Model| matches!(m.conn, ConnState::Connected(_)) && (!saved || m.named.recent_loaded);
+            while !done(&m) {
+                assert!(Instant::now() < until, "timed out (saved: {saved})");
+                while let Ok(ev) = events.try_recv() {
+                    for fx in m.apply(ev) {
+                        // The UI's `Effect::ListSaved` (`AppView::effect`).
+                        if let Effect::ListSaved { named_only, limit } = fx
+                            && let Err(e) = client.saved_sessions(named_only, limit)
+                        {
+                            m.saved_failed(&e.to_string());
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // A marker: every frame sent before it has reached the fake.
+            client.list_sessions().unwrap();
+            let asks: Vec<Value> = std::iter::from_fn(|| control.recv_timeout(T).ok())
+                .take_while(|f| f["type"] != "sessions")
+                .filter(|f| f["type"] == "saved_sessions")
+                .collect();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            let rail = build(&m, &View { open: Bucket::DEFAULT_OPEN, ..View::default() }, now);
+            let shape: Vec<String> = rail
+                .items
+                .iter()
+                .map(|i| match i {
+                    Item::Group { group, count } => format!("{group:?} {count}"),
+                    Item::Row(r) | Item::Hist(r) => rail.rows[*r].title.to_string(),
+                    Item::Bucket { bucket, count, .. } => format!("{bucket:?} {count}"),
+                    Item::More { text, .. } => text.to_string(),
+                    Item::Note(t) => format!("note: {t}"),
+                    Item::Empty(t) => t.to_string(),
+                })
+                .collect();
+            if saved {
+                let want = [
+                    json!({"type": "saved_sessions", "named_only": true, "limit": 1000}),
+                    json!({"type": "saved_sessions", "named_only": false, "limit": 200}),
+                ];
+                assert_eq!(asks, want);
+                assert_eq!(
+                    shape,
+                    [
+                        "Open 2",
+                        "New session",
+                        "New session",
+                        "History 4",
+                        "Named 1",
+                        "kite",
+                        "Today 2",
+                        "Fix the relay",
+                        "Bench the decoder",
+                        "Older 1"
+                    ],
+                    "{shape:#?}"
+                );
+            } else {
+                assert!(asks.is_empty(), "{asks:?}");
+                assert_eq!(&shape[..3], ["Open 2", "New session", "New session"]);
+                assert_eq!(shape[3], "History —");
+                assert!(shape[4].starts_with("note: This daemon does not list saved sessions") && shape[4].contains("exact name"));
+                assert_eq!(shape.len(), 5);
+            }
+            client.shutdown().unwrap();
+        }
     }
 }

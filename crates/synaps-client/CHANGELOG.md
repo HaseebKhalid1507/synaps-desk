@@ -1,5 +1,14 @@
 # synaps-client changelog
 
+## Since a982132
+
+Additive only (PR `feat/rail-redesign`): the daemon's `SessionMeta` fields the rail reads, mirrored.
+
+- New `SessionMeta::roster: Vec<ClientInfo>` (every attached client, named; `serde(default)`, a `null` or missing list is empty, an entry that does not decode is dropped and the session stays listed), `SessionMeta::park_due` and `SessionMeta::evict_due` (`Option<String>`, RFC 3339, as `state_since`). A struct literal needs `..Default::default()` (nothing in this workspace or in synaps-avatar builds one; both decode it).
+- `SessionMeta` now derives `PartialEq`, and `ClientInfo` `PartialEq` and `Eq`, so a consumer can tell when a polled list changed.
+
+For synaps-avatar (nyx): nothing to change.
+
 ## Since cedbdbd
 
 Additive only (PR `polish/layout-backlog`), plus two behaviour fixes. Nothing existing changes shape: code that builds `Event::Attached { .. }` or matches `Command`, `ToolOutcome` or `ToolStatus` exhaustively (all `#[non_exhaustive]`) compiles as before.

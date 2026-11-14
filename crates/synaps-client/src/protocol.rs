@@ -501,7 +501,7 @@ fn one() -> u64 {
     1
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct SessionMeta {
     pub id: String,
     #[serde(default)]
@@ -540,6 +540,21 @@ pub struct SessionMeta {
     /// The journal is held by another process (`"pid N (kind)"`).
     #[serde(default)]
     pub locked_by: Option<String>,
+    /// Every attached client, named. Empty from an older daemon; an entry
+    /// that does not decode is skipped (the session stays listed).
+    #[serde(default, deserialize_with = "lenient_roster")]
+    pub roster: Vec<ClientInfo>,
+    /// RFC 3339: when the idle park fires (live, no client, grace armed).
+    #[serde(default)]
+    pub park_due: Option<String>,
+    /// RFC 3339: when a parked session is evicted to history.
+    #[serde(default)]
+    pub evict_due: Option<String>,
+}
+
+/// `SessionMeta.roster`: missing or `null` is empty, a bad entry is dropped.
+fn lenient_roster<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<ClientInfo>, D::Error> {
+    Ok(lenient(null_vec(d)?).0)
 }
 
 impl SessionMeta {
@@ -695,7 +710,7 @@ fn exclusive() -> ClientInput {
 }
 
 /// `types::ClientInfo`: one attached client, as the roster lists it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ClientInfo {
     pub id: u64,
     #[serde(default)]

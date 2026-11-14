@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use gpui_kit::component::Theme;
 use gpui_kit::{App, Global, Hsla, px, rgb, rgba};
 
+use crate::rail::Bucket;
+
 pub const DEFAULT_ACCENT: u32 = 0xe8132f;
 pub const ENV_ACCENT: &str = "SYNAPS_DESKTOP_ACCENT";
 
@@ -505,16 +507,27 @@ pub fn save_accent(path: &Path, hex: u32) -> std::io::Result<()> {
 }
 
 /// Which side panels are folded to their strips (`rail_collapsed`,
-/// `right_collapsed` in the settings file; missing or not a boolean: open).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// `right_collapsed` in the settings file; missing or not a boolean: open),
+/// and which HISTORY buckets are open (`history_open`, a list of bucket
+/// names; missing or not a list: NAMED and TODAY).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Panels {
     pub rail_collapsed: bool,
     pub right_collapsed: bool,
+    /// [`Bucket::bit`]s.
+    pub history_open: u8,
+}
+
+impl Default for Panels {
+    fn default() -> Self {
+        Panels { rail_collapsed: false, right_collapsed: false, history_open: Bucket::DEFAULT_OPEN }
+    }
 }
 
 impl Panels {
     const RAIL: &str = "rail_collapsed";
     const RIGHT: &str = "right_collapsed";
+    const HISTORY: &str = "history_open";
 }
 
 /// Which of the panel keys a window changed (and so writes).
@@ -522,27 +535,37 @@ impl Panels {
 pub struct PanelKeys {
     pub rail: bool,
     pub right: bool,
+    pub history: bool,
 }
 
 impl PanelKeys {
     /// The keys that differ between `a` and `b`.
     pub fn changed(a: Panels, b: Panels) -> Self {
-        PanelKeys { rail: a.rail_collapsed != b.rail_collapsed, right: a.right_collapsed != b.right_collapsed }
+        PanelKeys {
+            rail: a.rail_collapsed != b.rail_collapsed,
+            right: a.right_collapsed != b.right_collapsed,
+            history: a.history_open != b.history_open,
+        }
     }
 
     pub fn is_empty(self) -> bool {
-        !self.rail && !self.right
+        !self.rail && !self.right && !self.history
     }
 
     pub fn or(self, o: Self) -> Self {
-        PanelKeys { rail: self.rail || o.rail, right: self.right || o.right }
+        PanelKeys { rail: self.rail || o.rail, right: self.right || o.right, history: self.history || o.history }
     }
 }
 
 pub fn load_panels(path: &Path) -> Panels {
     let v = load_settings(path).unwrap_or_default();
     let flag = |k: &str| v.get(k).and_then(serde_json::Value::as_bool).unwrap_or(false);
-    Panels { rail_collapsed: flag(Panels::RAIL), right_collapsed: flag(Panels::RIGHT) }
+    let history_open = v
+        .get(Panels::HISTORY)
+        .and_then(serde_json::Value::as_array)
+        .map(|open| Bucket::ALL.into_iter().filter(|b| open.iter().any(|x| x.as_str() == Some(b.key()))).fold(0, |m, b| m | b.bit()))
+        .unwrap_or(Bucket::DEFAULT_OPEN);
+    Panels { rail_collapsed: flag(Panels::RAIL), right_collapsed: flag(Panels::RIGHT), history_open }
 }
 
 /// Save the panel states in `keys` only (see [`save_settings`]): another
@@ -554,6 +577,10 @@ pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<(
     }
     if keys.right {
         kv.push((Panels::RIGHT, p.right_collapsed.into()));
+    }
+    if keys.history {
+        let open: Vec<&str> = Bucket::ALL.into_iter().filter(|b| p.history_open & b.bit() != 0).map(Bucket::key).collect();
+        kv.push((Panels::HISTORY, open.into()));
     }
     if kv.is_empty() {
         return Ok(());
@@ -768,20 +795,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(load_panels(&path), Panels::default(), "no file: both open");
         save_accent(&path, 0xf4b400).unwrap();
-        let both = PanelKeys { rail: true, right: true };
+        let both = PanelKeys { rail: true, right: true, ..PanelKeys::default() };
         for p in [
-            Panels { rail_collapsed: true, right_collapsed: false },
-            Panels { rail_collapsed: false, right_collapsed: true },
-            Panels { rail_collapsed: true, right_collapsed: true },
+            Panels { rail_collapsed: true, right_collapsed: false, ..Panels::default() },
+            Panels { rail_collapsed: false, right_collapsed: true, ..Panels::default() },
+            Panels { rail_collapsed: true, right_collapsed: true, ..Panels::default() },
             Panels::default(),
         ] {
             save_panels(&path, p, both).unwrap();
             assert_eq!(load_panels(&path), p);
             assert_eq!(load_accent(&path).as_deref(), Some("#f4b400"), "the accent is kept");
         }
-        save_panels(&path, Panels { rail_collapsed: true, right_collapsed: true }, both).unwrap();
+        save_panels(&path, Panels { rail_collapsed: true, right_collapsed: true, ..Panels::default() }, both).unwrap();
         save_accent(&path, 0x2d7bff).unwrap();
-        assert_eq!(load_panels(&path), Panels { rail_collapsed: true, right_collapsed: true }, "the accent's save keeps them");
+        assert_eq!(
+            load_panels(&path),
+            Panels { rail_collapsed: true, right_collapsed: true, ..Panels::default() },
+            "the accent's save keeps them"
+        );
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v, serde_json::json!({"accent": "#2d7bff", "rail_collapsed": true, "right_collapsed": true}));
         // Hand edits: not a boolean, or not JSON, means open.
@@ -789,6 +820,28 @@ mod tests {
         assert_eq!(load_panels(&path), Panels::default());
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_panels(&path), Panels::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The HISTORY buckets the user opened or closed are remembered by
+    /// name; unknown names are ignored, anything else is the default.
+    #[test]
+    fn history_buckets_are_remembered() {
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-history-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(load_panels(&path).history_open, Bucket::DEFAULT_OPEN);
+        let p = Panels { history_open: Bucket::Today.bit() | Bucket::Older.bit(), ..Panels::default() };
+        save_panels(&path, p, PanelKeys::changed(Panels::default(), p)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({"history_open": ["today", "older"]}), "only the key that changed");
+        assert_eq!(load_panels(&path), p);
+        std::fs::write(&path, r#"{"history_open": ["week", "from_the_future"]}"#).unwrap();
+        assert_eq!(load_panels(&path).history_open, Bucket::Week.bit());
+        std::fs::write(&path, r#"{"history_open": []}"#).unwrap();
+        assert_eq!(load_panels(&path).history_open, 0, "all closed");
+        std::fs::write(&path, r#"{"history_open": "today"}"#).unwrap();
+        assert_eq!(load_panels(&path).history_open, Bucket::DEFAULT_OPEN);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -804,9 +857,13 @@ mod tests {
         save_panels(&path, a, PanelKeys::changed(a0, a)).unwrap();
         let b = Panels { right_collapsed: true, ..b0 };
         save_panels(&path, b, PanelKeys::changed(b0, b)).unwrap();
-        assert_eq!(load_panels(&path), Panels { rail_collapsed: true, right_collapsed: true });
+        assert_eq!(load_panels(&path), Panels { rail_collapsed: true, right_collapsed: true, ..Panels::default() });
         save_panels(&path, b, PanelKeys::default()).unwrap();
-        assert_eq!(load_panels(&path), Panels { rail_collapsed: true, right_collapsed: true }, "nothing changed: nothing written");
+        assert_eq!(
+            load_panels(&path),
+            Panels { rail_collapsed: true, right_collapsed: true, ..Panels::default() },
+            "nothing changed: nothing written"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
