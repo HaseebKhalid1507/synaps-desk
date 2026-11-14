@@ -18,7 +18,7 @@ use crate::model::Model;
 use crate::named::{ResumeRequest, RowAction, home_short, parse_rfc3339, relative, short_model};
 
 /// What a row is doing. Precedence, first match wins: OPENING › NEEDS YOU ›
-/// RUNNING › LOCKED › UNREAD › IDLE › PARKED › SAVED.
+/// RUNNING › WORKERS › LOCKED › UNREAD › IDLE › PARKED › SAVED.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum State {
     /// A resume or an attach is on its way (the client's own).
@@ -27,6 +27,9 @@ pub enum State {
     NeedsYou,
     /// `busy`: a turn or a compaction.
     Running,
+    /// Not busy, background workers (subagents) still running: never
+    /// IDLE ([`crate::model::Model::workers`]).
+    Workers,
     /// `locked_by`: another process holds the journal.
     Locked,
     /// The poll saw `busy` fall or `messages` rise while it was not on
@@ -47,6 +50,7 @@ impl State {
             State::Opening => Some(label::OPENING),
             State::NeedsYou => Some(label::NEEDS_YOU),
             State::Running => Some(label::RUNNING),
+            State::Workers => Some(label::WORKERS),
             State::Locked => Some(label::LOCKED),
             State::Unread => Some(label::UNREAD),
             State::Idle | State::Parked | State::Saved => None,
@@ -59,6 +63,7 @@ impl State {
             State::Opening => "opening",
             State::NeedsYou => "needs you",
             State::Running => "running",
+            State::Workers => "workers running",
             State::Locked => "locked",
             State::Unread => "unread",
             State::Idle => "idle",
@@ -82,8 +87,12 @@ pub enum Chip {
 }
 
 impl Chip {
+    /// RUNNING admits a session whose workers run on after its turn.
     pub fn admits(self, s: State) -> bool {
-        matches!((self, s), (Chip::NeedsYou, State::NeedsYou) | (Chip::Running, State::Running) | (Chip::Unread, State::Unread))
+        matches!(
+            (self, s),
+            (Chip::NeedsYou, State::NeedsYou) | (Chip::Running, State::Running | State::Workers) | (Chip::Unread, State::Unread)
+        )
     }
 
     pub fn label(self) -> &'static str {
@@ -632,6 +641,11 @@ pub fn readout_live(m: &Model, s: &SessionMeta, now: i64) -> Readout {
             let turn = if age.is_empty() { String::new() } else { format!(" · turn began {age} ago") };
             ("needs you".into(), format!("{}{turn}", plural(n.max(1), "prompt", "prompts")))
         }
+        State::Workers => {
+            let n = m.workers(s);
+            let idle = if age.is_empty() { String::new() } else { format!(" · idle {age}") };
+            (plural(n, "worker running", "workers running"), format!("its turn ended, its subagents run on{idle}"))
+        }
         State::Unread => ("unread".into(), "its turn ended while you were elsewhere".into()),
         State::Locked => (format!("locked {age}").trim_end().to_string(), if is_parked(s) { "parked".into() } else { String::new() }),
         st => (format!("{} {age}", st.name()).trim_end().to_string(), String::new()),
@@ -768,8 +782,9 @@ mod tests {
         View { open, ..View::default() }
     }
 
-    /// Precedence: OPENING › NEEDS YOU › RUNNING › LOCKED › UNREAD › IDLE ›
-    /// PARKED; each state not at rest has its word, those at rest none.
+    /// Precedence: OPENING › NEEDS YOU › RUNNING › WORKERS › LOCKED › UNREAD
+    /// › IDLE › PARKED; each state not at rest has its word, those at rest
+    /// none.
     #[test]
     fn states_follow_their_precedence() {
         let mut m = Model::new(ConnState::Connecting);
@@ -780,17 +795,22 @@ mod tests {
             {"id": "d", "lifecycle": "live"},
             {"id": "e", "lifecycle": "parking"},
             {"id": "f", "lifecycle": "parked"},
+            {"id": "g", "lifecycle": "live", "subagents_running": 1, "locked_by": "pid 1 (tui)"},
+            {"id": "h", "lifecycle": "live", "busy": true, "subagents_running": 3},
         ]);
         m.apply(Event::Sessions(metas(all)));
         let got: Vec<State> = m.sessions.iter().map(|s| m.state(s)).collect();
         // The model keeps the list newest first by created_at (all equal here: by id, descending).
         let ids: Vec<&str> = m.sessions.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["f", "e", "d", "c", "b", "a"]);
-        assert_eq!(got, [State::Parked, State::Parked, State::Idle, State::Locked, State::Running, State::NeedsYou]);
+        assert_eq!(ids, ["h", "g", "f", "e", "d", "c", "b", "a"]);
+        assert_eq!(
+            got,
+            [State::Running, State::Workers, State::Parked, State::Parked, State::Idle, State::Locked, State::Running, State::NeedsYou]
+        );
         m.want(3);
         m.asked_for("a");
-        assert_eq!(m.state(&m.sessions[5]), State::Opening, "an attach on its way beats everything");
-        for s in [State::Opening, State::NeedsYou, State::Running, State::Locked, State::Unread] {
+        assert_eq!(m.state(&m.sessions[7]), State::Opening, "an attach on its way beats everything");
+        for s in [State::Opening, State::NeedsYou, State::Running, State::Workers, State::Locked, State::Unread] {
             assert!(s.word().is_some(), "{s:?}");
         }
         for s in [State::Idle, State::Parked, State::Saved] {
@@ -999,7 +1019,13 @@ mod tests {
              "model": "anthropic/claude-sonnet-4-5", "cwd": "/srv/x"},
             {"id": "l", "lifecycle": "live", "clients": 1, "locked_by": "pid 48213 (tui)", "messages": 1, "name": "axel", "title": "Forum",
              "roster": [{"id": 3, "name": "tui", "kind": "tui", "mode": "mirror", "attached_at_ms": 0}]},
+            {"id": "w", "lifecycle": "live", "state_since": at(4 * 60), "subagents_running": 2},
         ]))));
+        let w = m.sessions.iter().find(|s| s.id == "w").unwrap();
+        assert_eq!(
+            readout_live(&m, w, NOW).lines[0],
+            (label::R_STATE, "2 workers running".into(), "its turn ended, its subagents run on · idle 4m".into())
+        );
         let p = m.sessions.iter().find(|s| s.id == "p").unwrap();
         let r = readout_live(&m, p, NOW);
         assert_eq!(r.title, "p");

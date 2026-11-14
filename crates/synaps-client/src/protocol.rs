@@ -550,6 +550,13 @@ pub struct SessionMeta {
     /// RFC 3339: when a parked session is evicted to history.
     #[serde(default)]
     pub evict_due: Option<String>,
+    /// Background workers (subagents) running and not stopping, whatever
+    /// `busy` says: a turn that ends can leave them going. Live in
+    /// listings (`Welcome.sessions`, `SessionList`); the `Attached`
+    /// snapshot's meta is the create-time copy (0). An older daemon omits
+    /// it: 0.
+    #[serde(default)]
+    pub subagents_running: usize,
 }
 
 /// `SessionMeta.roster`: missing or `null` is empty, a bad entry is dropped.

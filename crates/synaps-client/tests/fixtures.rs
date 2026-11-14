@@ -95,6 +95,25 @@ fn session_meta_mirrors_roster_and_park_times() {
     assert_eq!(sessions[1], SessionMeta { id: "b".into(), ..SessionMeta::default() });
 }
 
+/// `SessionMeta.subagents_running` (SynapsCLI #410): read from a session
+/// list and a welcome; an older daemon omits it, and that is 0.
+#[test]
+fn session_meta_counts_running_workers() {
+    let list = r#"{"type":"session_list","sessions":[{"id":"a","busy":false,"subagents_running":2},{"id":"b","busy":true}]}"#;
+    let DaemonFrame::SessionList { sessions, rejected } = decode_frame(list).unwrap() else { panic!() };
+    assert_eq!(rejected, 0);
+    assert_eq!(
+        sessions.iter().map(|s| (s.id.as_str(), s.busy, s.subagents_running)).collect::<Vec<_>>(),
+        [("a", false, 2), ("b", true, 0)]
+    );
+    let DaemonFrame::SessionList { sessions, .. } = decode_frame(fixture("session_list.json").trim()).unwrap() else { panic!() };
+    assert!(sessions.iter().all(|s| s.subagents_running == 0), "a daemon from before the field");
+    let mut welcome: serde_json::Value = serde_json::from_str(fixture("welcome.json").trim()).unwrap();
+    welcome["sessions"][0]["subagents_running"] = serde_json::json!(1);
+    let DaemonFrame::Welcome(w) = decode_frame(&welcome.to_string()).unwrap() else { panic!() };
+    assert_eq!(w.sessions[0].subagents_running, 1);
+}
+
 /// M5: a new variant is `Ok(Unknown)`; a known one that changed shape is a
 /// `DecodeError` naming it.
 #[test]

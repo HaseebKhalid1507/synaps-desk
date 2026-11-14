@@ -11,6 +11,7 @@ use synaps_client::protocol::{LlmEvent, SessionEvent, StreamEvent};
 use synaps_client::{Attached, HistoryUpdate};
 
 use crate::files::Ledger;
+use crate::subagents::Subagents;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Tokens {
@@ -103,6 +104,8 @@ pub struct Stats {
     /// The attached session's folder (`Attached.meta.cwd`).
     pub cwd: Option<String>,
     pub files: Ledger,
+    /// Its subagents, by the call that started each.
+    pub subagents: Subagents,
     /// The attachment ended: these are the last numbers seen, not live.
     pub detached: bool,
 }
@@ -116,6 +119,12 @@ impl Stats {
         let same = self.session.as_deref() == Some(a.meta.id.as_str());
         let mut files = std::mem::take(&mut self.files);
         files.reset(&a.conversation.api_messages, cwd.as_deref(), same);
+        let mut subagents = std::mem::take(&mut self.subagents);
+        if same {
+            // What ran when this window last looked is "started" until a row says.
+            subagents.reattached();
+        }
+        subagents.reset(&a.conversation.api_messages, same);
         let tokens = Tokens::conversation(&a.conversation.tokens, &a.conversation.keepwarm_tokens);
         *self = Stats {
             session: Some(a.meta.id.clone()),
@@ -125,6 +134,7 @@ impl Stats {
             context: None,
             cwd,
             files,
+            subagents,
             detached: false,
         };
         for env in &a.replay {
@@ -141,10 +151,14 @@ impl Stats {
 
     pub fn on_history(&mut self, update: &HistoryUpdate) {
         match update {
-            HistoryUpdate::Append { messages, .. } => self.files.append(messages),
+            HistoryUpdate::Append { messages, .. } => {
+                self.files.append(messages);
+                self.subagents.append(messages);
+            }
             HistoryUpdate::Replace { messages } => {
                 let cwd = self.cwd.clone();
                 self.files.reset(messages, cwd.as_deref(), true);
+                self.subagents.reset(messages, true);
             }
             _ => {}
         }
@@ -152,6 +166,7 @@ impl Stats {
 
     /// A live event; `raw` is the wire event (fields the mirror drops).
     pub fn on_session(&mut self, ev: &SessionEvent, raw: &Value) {
+        self.subagents.on_session(ev);
         match ev {
             SessionEvent::Conversation { digest } => {
                 // `keepwarm_tokens` is not on the decoded digest: from the wire event.

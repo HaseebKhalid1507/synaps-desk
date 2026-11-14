@@ -265,6 +265,9 @@ pub struct Transcript {
     clean_len: usize,
     /// The rows a rebuild took out, until [`Transcript::keep_revs`].
     before: Vec<Item>,
+    /// No notices for subagent starts and ends (a UI that shows the
+    /// workers itself): [`Transcript::set_subagent_notices`].
+    no_subagent_notices: bool,
 }
 
 impl Transcript {
@@ -299,6 +302,13 @@ impl Transcript {
 
     pub fn subagents(&self) -> &[Value] {
         &self.subagents
+    }
+
+    /// Whether a live `SubagentStart` / `SubagentDone` adds a notice
+    /// ("subagent scout started: …"); on by default. A UI that shows the
+    /// workers under their calls turns them off. Kept across attaches.
+    pub fn set_subagent_notices(&mut self, on: bool) {
+        self.no_subagent_notices = !on;
     }
 
     pub fn cost_usd(&self) -> f64 {
@@ -418,7 +428,9 @@ impl Transcript {
         let same = self.session_id.as_deref() == Some(a.meta.id.as_str());
         let (notes, mut reuse) = if same { self.take_rows(0) } else { (Vec::new(), Reuse::new()) };
         let (next_id, clean_len, before) = (self.next_id, self.clean_len, std::mem::take(&mut self.before));
-        *self = Transcript { next_id, clean_len, before, session_id: Some(a.meta.id.clone()), ..Transcript::default() };
+        let no_subagent_notices = self.no_subagent_notices;
+        *self =
+            Transcript { next_id, clean_len, before, no_subagent_notices, session_id: Some(a.meta.id.clone()), ..Transcript::default() };
         self.dirty_from = Some(0);
         self.title = a.meta.title.clone().or_else(|| a.conversation.header.get("title").and_then(Value::as_str).map(str::to_string));
         self.cost_usd = a.conversation.cost;
@@ -798,10 +810,10 @@ impl Transcript {
                 _ => {}
             },
             StreamEvent::Agent(a) => match a {
-                AgentEvent::SubagentStart { agent_name, task_preview, .. } => {
+                AgentEvent::SubagentStart { agent_name, task_preview, .. } if !self.no_subagent_notices => {
                     self.notice(ItemKind::Notice, format!("subagent {agent_name} started: {task_preview}"))
                 }
-                AgentEvent::SubagentDone { agent_name, duration_secs, .. } => {
+                AgentEvent::SubagentDone { agent_name, duration_secs, .. } if !self.no_subagent_notices => {
                     self.notice(ItemKind::Notice, format!("subagent {agent_name} done ({duration_secs:.1}s)"))
                 }
                 _ => {}
@@ -974,5 +986,33 @@ mod outcome_tests {
             "result": "Tool call blocked by extension: Tool call confirmation denied: guard"}})));
         let last = t.items().iter().rev().find_map(|i| i.tool.as_ref()).unwrap();
         assert_eq!((last.tool_id.as_str(), last.status), ("e", Some(ToolStatus::Denied)));
+    }
+
+    /// Subagent notices are on by default; off, they stay off across an
+    /// attach, and nothing else changes.
+    #[test]
+    fn subagent_notices_can_be_turned_off() {
+        let ev = |v: Value| crate::protocol::decode_event(&v).unwrap();
+        let start = ev(
+            json!({"ev": "stream", "event": {"kind": "agent", "agent": "subagent_start", "subagent_id": 1, "agent_name": "scout", "task_preview": "look"}}),
+        );
+        let done = ev(
+            json!({"ev": "stream", "event": {"kind": "agent", "agent": "subagent_done", "subagent_id": 1, "agent_name": "scout", "result_preview": "ok", "duration_secs": 2.0}}),
+        );
+        let mut on = Transcript::new();
+        on.apply(&start);
+        on.apply(&done);
+        assert_eq!(
+            on.items().iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+            ["subagent scout started: look", "subagent scout done (2.0s)"]
+        );
+        let mut off = Transcript::new();
+        off.set_subagent_notices(false);
+        let a = json!({"type": "attached", "client": 2, "meta": {"id": "s"}, "conversation": {"api_messages": []}, "input_owner": 2});
+        let crate::protocol::DaemonFrame::Attached(a) = crate::protocol::decode_frame(&a.to_string()).unwrap() else { panic!() };
+        off.load_attached(&a).unwrap();
+        off.apply(&start);
+        off.apply(&done);
+        assert!(off.items().is_empty());
     }
 }

@@ -17,6 +17,7 @@ use synaps_client::transcript::{Item, ItemKind, ToolStatus};
 use crate::app::{AppView, RowCache, display, mono};
 use crate::files::{CallDelta, LineKind, Preview};
 use crate::fonts::{self, label};
+use crate::subagents::{self, Subagents};
 use crate::theme::{self, Metrics, Palette};
 
 /// A run folds once it has finished with this many tool calls.
@@ -87,10 +88,26 @@ pub(crate) fn turn_start(items: &[Item], k: usize) -> usize {
     items[..k].iter().rposition(|i| i.kind == ItemKind::User).unwrap_or(0)
 }
 
+/// An item's `rev` as its row shows it: a call that started a subagent
+/// also changes with its block's shape (the block grows a line, the state
+/// changes).
+fn rev(x: &Item, subs: &Subagents) -> u64 {
+    match x.tool.as_ref() {
+        Some(t) if subagents::starts_worker(&t.name) => x.rev ^ subs.shape(&t.tool_id),
+        _ => x.rev,
+    }
+}
+
+/// A call still at work: unfinished, or its subagent still running.
+fn live_call(x: &Item, subs: &Subagents) -> bool {
+    !finished(status(x)) || x.tool.as_ref().is_some_and(|t| subs.running(&t.tool_id))
+}
+
 /// The display rows of `items[from..]` (`from`: a turn's start, or 0).
 /// `busy`: a turn is running, so a run at the very end is live; `open`:
-/// the runs the user unfolded (by their first item's id).
-pub(crate) fn build(items: &[Item], from: usize, busy: bool, open: &HashSet<u64>) -> Vec<Disp> {
+/// the runs the user unfolded (by their first item's id); `subs`: a run
+/// holding a running subagent's call is live too.
+pub(crate) fn build(items: &[Item], from: usize, busy: bool, open: &HashSet<u64>, subs: &Subagents) -> Vec<Disp> {
     let mut out = Vec::new();
     let mut agent = from > 0 && items[from].kind != ItemKind::User;
     let mut i = from;
@@ -117,9 +134,9 @@ pub(crate) fn build(items: &[Item], from: usize, busy: bool, open: &HashSet<u64>
                 while let Some(x) = items.get(end).filter(|x| matches!(x.kind, ItemKind::Thinking | ItemKind::Tool)) {
                     if x.kind == ItemKind::Tool {
                         tools += 1;
-                        done &= finished(status(x));
+                        done &= !live_call(x, subs);
                     }
-                    (x.id, x.rev).hash(&mut h);
+                    (x.id, rev(x, subs)).hash(&mut h);
                     end += 1;
                 }
                 let live = !done || (end == items.len() && busy);
@@ -140,7 +157,7 @@ pub(crate) fn build(items: &[Item], from: usize, busy: bool, open: &HashSet<u64>
                         out.extend((start..end).map(|k| Disp {
                             item: k,
                             id: items[k].id,
-                            rev: items[k].rev,
+                            rev: rev(&items[k], subs),
                             kind: Kind::Work,
                             gap: Gap::None,
                             who: Who::None,
@@ -150,7 +167,7 @@ pub(crate) fn build(items: &[Item], from: usize, busy: bool, open: &HashSet<u64>
                     out.extend((start..end).map(|k| Disp {
                         item: k,
                         id: items[k].id,
-                        rev: items[k].rev,
+                        rev: rev(&items[k], subs),
                         kind: Kind::Work,
                         gap: if k == start { first } else { Gap::None },
                         who: if k == start { who } else { Who::None },
@@ -619,6 +636,8 @@ impl AppView {
                 }
             }
         });
+        let worker =
+            item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name)).and_then(|t| self.model.stats.subagents.view(&t.tool_id));
         v_flex()
             .w_full()
             .bg(p.tool)
@@ -626,8 +645,68 @@ impl AppView {
             .text_size(px(m.mono))
             .line_height(px(m.mono_line))
             .child(head)
+            .children(worker.map(|v| self.subagent_block(v, p, m, lay)))
             .children(body)
             .into_any_element()
+    }
+
+    /// The worker a call started, under it (the TUI's subagent card and
+    /// tray row): state, name, model · tools · elapsed; then its step while
+    /// it runs, its result or why it failed once it ends. Nothing moves:
+    /// it changes when an event or a row comes. Not attached (a cached tab
+    /// opening, a detached session): as last seen, dimmed.
+    fn subagent_block(&self, v: &subagents::View, p: &Palette, m: &Metrics, lay: Layout) -> Div {
+        use subagents::Tone as T;
+        let seen = self.model.active.is_none();
+        let running = v.status.is_some_and(subagents::Status::running);
+        let (word, color) = match v.tone {
+            _ if seen => (if running { "last seen running" } else { v.word }, p.dim_t),
+            T::Run => (v.word, p.run),
+            T::Ok => (v.word, p.ok),
+            T::Err => (v.word, p.err),
+            T::Warn => (v.word, p.warn),
+            T::Dim => (v.word, p.dim_t),
+        };
+        let glyph = match v.tone {
+            T::Run if !seen => Some(div().size(px(8.)).m(px(1.)).flex_none().bg(p.run_mark)),
+            T::Run | T::Dim => Some(div().size(px(8.)).m(px(1.)).flex_none().border_1().border_color(p.dim_t)),
+            _ => None,
+        };
+        let sign = match v.tone {
+            T::Ok => Some("✓"),
+            T::Err => Some("×"),
+            _ => None,
+        };
+        let word_too = !lay.tight || (sign.is_none() && glyph.is_none());
+        let (name, facts, line) = if seen { (p.dim_t, p.dim_t, p.dim_t) } else { (p.sub_name_t, p.sub_time_t, p.sub_status_t) };
+        let head = h_flex()
+            .w_full()
+            .gap(px(m.run_gap))
+            .items_center()
+            .whitespace_nowrap()
+            .children(glyph)
+            .when_some(sign, |d, s| d.child(div().flex_none().text_color(color).child(s)))
+            .when(word_too, |d| d.child(div().flex_none().text_color(color).child(word)))
+            .child(div().flex_none().max_w(px(m.mono * 0.6 * 24.)).overflow_hidden().text_ellipsis().text_color(name).child(v.name.clone()))
+            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(facts).child(v.facts.clone()));
+        let rule = if seen { p.dim_t } else { p.sub_rule };
+        div().w_full().pl(px(m.run_x + m.mono * 0.6 + m.run_gap)).pr(px(m.run_x)).pb(px((6. * m.r).round())).child(
+            v_flex().w_full().border_l_2().border_color(rule).pl(px((10. * m.r).round())).child(head).when_some(
+                v.line.clone(),
+                |d, (text, err)| {
+                    let c = if seen {
+                        line
+                    } else if err {
+                        p.err
+                    } else if running {
+                        line
+                    } else {
+                        p.dim_t
+                    };
+                    d.child(div().w_full().overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(c).child(text))
+                },
+            ),
+        )
     }
 
     /// A tool's outcome: `✓`, `× failed`, `× denied`, `cancelled`, a solid
@@ -729,6 +808,7 @@ mod tests {
 
     use super::{Counts, Disp, Gap, Hue, Kind, Layout, Metrics, RowCache, RunSummary, Summaries, Tone, Who, build, diff, turn_start};
     use crate::files::{CallDelta, Ledger};
+    use crate::subagents::Subagents;
     use synaps_client::Transcript;
 
     fn transcript(msgs: &[serde_json::Value]) -> Transcript {
@@ -773,7 +853,7 @@ mod tests {
         let mut m = turn(4, "a");
         m.extend(turn(3, "b"));
         let t = transcript(&m);
-        let rows = build(t.items(), 0, false, &HashSet::new());
+        let rows = build(t.items(), 0, false, &HashSet::new(), &Subagents::default());
         assert_eq!(kinds(&rows), ["user", "fold", "prose", "user", "work", "work", "work", "prose"]);
         assert_eq!(rows.iter().map(|d| d.gap).collect::<Vec<_>>()[..5], [Gap::First, Gap::Part, Gap::Part, Gap::Turn, Gap::Part]);
         assert_eq!(rows[5].gap, Gap::None, "a run is one block");
@@ -784,8 +864,38 @@ mod tests {
         );
         // Unfolded by the user: the summary stays, the rows follow it.
         let open: HashSet<u64> = [rows[1].id].into();
-        let rows = build(t.items(), 0, false, &open);
+        let rows = build(t.items(), 0, false, &open, &Subagents::default());
         assert_eq!(kinds(&rows)[..7], ["user", "unfold", "work", "work", "work", "work", "prose"]);
+    }
+
+    /// A run holding the call of a subagent still running never folds (its
+    /// call is answered at once, the worker runs on); it folds once the
+    /// worker ends, even after the turn. The call's row changes with its
+    /// block's shape, and only that row.
+    #[test]
+    fn a_run_with_a_running_subagent_never_folds() {
+        let mut m = turn(4, "a");
+        let n = m.len();
+        m[3] = json!({"role": "assistant", "content": [{"type": "tool_use", "id": "a1", "name": "subagent_start", "input": {"agent": "scout", "task": "look"}}]});
+        m[4] = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a1", "content": json!({"handle_id": "sa_3", "agent_name": "scout", "status": "running"}).to_string()}]});
+        assert_eq!(m.len(), n);
+        let t = transcript(&m);
+        let mut subs = Subagents::default();
+        subs.reset(&m, false);
+        let rows = |subs: &Subagents| build(t.items(), 0, false, &HashSet::new(), subs);
+        assert_eq!(kinds(&rows(&subs))[1], "fold", "started, in the history only: nothing says it runs");
+        let row = |st: serde_json::Value| {
+            let v = json!({"ev": "subagent_rows", "rows": [{"subagent_id": 3, "agent_name": "scout", "status": st, "elapsed_secs": 5.0, "step": "ls", "tools": 1}]});
+            synaps_client::protocol::decode_event(&v).unwrap()
+        };
+        subs.on_session(&row(json!("running")));
+        let live = rows(&subs);
+        assert_eq!(kinds(&live), ["user", "work", "work", "work", "work", "prose"], "running: never folded");
+        let still = live[2];
+        subs.on_session(&row(json!("running")));
+        assert_eq!(rows(&subs)[2], still, "a row with only a new elapsed: same rev");
+        subs.on_session(&row(json!("completed")));
+        assert_eq!(kinds(&rows(&subs))[1], "fold", "it ended: the run folds");
     }
 
     #[test]
@@ -793,8 +903,8 @@ mod tests {
         let mut m = turn(5, "a");
         m.pop();
         let t = transcript(&m);
-        assert_eq!(kinds(&build(t.items(), 0, true, &HashSet::new()))[1], "work", "busy: the last run is live");
-        assert_eq!(kinds(&build(t.items(), 0, false, &HashSet::new()))[1], "fold", "the turn ended");
+        assert_eq!(kinds(&build(t.items(), 0, true, &HashSet::new(), &Subagents::default()))[1], "work", "busy: the last run is live");
+        assert_eq!(kinds(&build(t.items(), 0, false, &HashSet::new(), &Subagents::default()))[1], "fold", "the turn ended");
     }
 
     #[test]
@@ -802,12 +912,12 @@ mod tests {
         let mut m = turn(4, "a");
         m.extend(turn(2, "b"));
         let t = transcript(&m);
-        let all = build(t.items(), 0, false, &HashSet::new());
+        let all = build(t.items(), 0, false, &HashSet::new(), &Subagents::default());
         let k = t.items().iter().rposition(|i| i.kind == ItemKind::User).unwrap();
         assert_eq!(turn_start(t.items(), k + 1), k);
         assert_eq!(turn_start(t.items(), k), 0, "a new turn can finish the run before it");
         let from = all.partition_point(|d| d.item < k);
-        assert_eq!(&all[from..], &build(t.items(), k, false, &HashSet::new())[..]);
+        assert_eq!(&all[from..], &build(t.items(), k, false, &HashSet::new(), &Subagents::default())[..]);
     }
 
     #[test]
@@ -815,16 +925,16 @@ mod tests {
         let mut m = turn(4, "a");
         m.extend(turn(2, "b"));
         let t = transcript(&m);
-        let a = build(t.items(), 0, false, &HashSet::new());
+        let a = build(t.items(), 0, false, &HashSet::new(), &Subagents::default());
         assert_eq!(diff(&a, &a), None);
-        let b = build(t.items(), 0, false, &[a[1].id].into());
+        let b = build(t.items(), 0, false, &[a[1].id].into(), &Subagents::default());
         assert_eq!(diff(&a, &b), Some((1..2, 5)), "unfolding: the summary (its sign) and the run's rows");
         assert_eq!(diff(&b, &a), Some((1..6, 1)));
         assert_eq!(diff(&a[..3], &a), Some((3..3, a.len() - 3)));
     }
 
     fn rows(t: &Transcript, ledger: &Ledger) -> Vec<RowCache> {
-        t.items().iter().map(|i| crate::app::row_cache(i, ledger)).collect()
+        t.items().iter().map(|i| crate::app::row_cache(i, ledger, &Subagents::default())).collect()
     }
 
     fn outcome(s: &RunSummary) -> Vec<(&str, Tone)> {
@@ -865,7 +975,7 @@ mod tests {
             m.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": format!("a{k}"), "content": "Canceled by user"}]}));
         }
         let t = transcript(&m);
-        let rows = build(t.items(), 0, false, &HashSet::new());
+        let rows = build(t.items(), 0, false, &HashSet::new(), &Subagents::default());
         assert_eq!(kinds(&rows), ["user", "fold"], "a halted run folds");
         let Kind::Summary { end, .. } = rows[1].kind else { unreachable!() };
         let s = RunSummary::of(&t.items()[1..end], &self::rows(&t, &Ledger::default())[1..end]);
@@ -940,7 +1050,7 @@ mod tests {
         all.extend(turn(5, "b"));
         let stale = rows(&transcript(&first), &Ledger::default());
         let t = transcript(&all);
-        let new = build(t.items(), 0, false, &HashSet::new());
+        let new = build(t.items(), 0, false, &HashSet::new(), &Subagents::default());
         let Some(run) = new.iter().find(|d| matches!(d.kind, Kind::Summary { end, .. } if end > stale.len())) else {
             panic!("the new turn's run folds past the cached rows")
         };

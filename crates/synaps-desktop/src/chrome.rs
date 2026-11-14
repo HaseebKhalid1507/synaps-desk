@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 
 use gpui_kit::component::tooltip::Tooltip;
 
-use crate::app::{AppView, EdgeDrag, STRIP, Side, ToggleRail, ToggleRight, display, mono, section, tbtn};
+use crate::app::{AppView, EdgeDrag, STRIP, Side, ToggleRail, ToggleRight, count, display, mono, section, tbtn};
 use crate::fonts::{self, label};
 use crate::model::{ConnState, Model};
 use crate::named::RowAction;
@@ -118,6 +118,10 @@ pub(crate) fn glyph(st: State, p: &Palette) -> Div {
     match st {
         State::NeedsYou => g.child(at(0.).border_1().border_color(p.warn_mark_ch)).child(at(3.).bg(p.warn_mark_ch)),
         State::Running => g.child(at(1.).bg(p.run_mark_ch)),
+        // Two small squares: work going on, not this session's own turn.
+        State::Workers => g
+            .child(div().absolute().top(px(1.)).left(px(1.)).size(px(4.)).bg(p.run_mark_ch))
+            .child(div().absolute().top(px(5.)).left(px(5.)).size(px(4.)).bg(p.run_mark_ch)),
         State::Unread => g.child(at(3.).bg(p.unread_mark_ch)),
         State::Idle => g.child(at(1.).border_1().border_color(rest)),
         State::Parked => g.child(div().absolute().left(px(1.)).bottom(px(1.)).w(px(8.)).h(px(2.)).bg(rest)),
@@ -132,7 +136,7 @@ pub(crate) fn glyph(st: State, p: &Palette) -> Div {
 pub(crate) fn word_color(st: State, p: &Palette) -> Hsla {
     match st {
         State::NeedsYou => p.warn_ch,
-        State::Running => p.run_ch,
+        State::Running | State::Workers => p.run_ch,
         State::Unread => p.unread_ch,
         State::Opening => p.open_ch,
         _ => p.dim_ch,
@@ -240,10 +244,9 @@ impl AppView {
                 (crate::app::one_line(e, 60).into(), if self.synthetic { p.dim_ch } else { p.err_ch })
             }
         };
-        // As in the mock: subagents running, here the attached session's
-        // (`SubagentRows`, the daemon's own list).
-        let subagents =
-            self.model.transcript.subagents().iter().filter(|r| r.get("status").and_then(|s| s.as_str()) == Some("running")).count();
+        // As in the mock: subagents running, here the attached session's,
+        // as its blocks and its rail row say (they change together).
+        let subagents = self.model.active_workers();
         h_flex()
             .h(px(52.))
             .flex_none()
@@ -315,7 +318,7 @@ impl AppView {
                                 .items_center()
                                 .justify_center()
                                 .bg(if subagents > 0 { p.ink } else { p.edge })
-                                .child(mono(subagents.to_string(), 10., if subagents > 0 { p.chrome } else { p.dim_ch })),
+                                .child(mono(count(subagents), 10., if subagents > 0 { p.chrome } else { p.dim_ch })),
                         ),
                     ),
             )
@@ -465,7 +468,7 @@ impl AppView {
         for s in self.model.sessions.iter().filter(|s| s.lifecycle != "ending") {
             match self.model.fact(s) {
                 State::NeedsYou => needs += 1,
-                State::Running => running += 1,
+                State::Running | State::Workers => running += 1,
                 State::Unread => unread += 1,
                 _ => {}
             }
@@ -644,8 +647,9 @@ impl AppView {
         // run ahead of the 3 s poll), else the poll's.
         let cost = meta.map(|s| if on { self.model.stats.cost.unwrap_or(s.cost_usd) } else { s.cost_usd }).filter(|c| *c > 0.0);
         let waiting = meta.map(|s| if on { self.model.transcript.pending_prompts().len() } else { s.awaiting_input }).unwrap_or(0);
+        let workers = if st == State::Workers { meta.map_or(0, |s| self.model.workers(s)) } else { 0 };
         let title_color = match st {
-            State::NeedsYou | State::Running | State::Unread => p.ink,
+            State::NeedsYou | State::Running | State::Workers | State::Unread => p.ink,
             _ if shown => p.ink,
             State::Parked | State::Locked => p.dim_ch,
             _ if row.fresh => p.dim_ch,
@@ -668,7 +672,8 @@ impl AppView {
                 .items_baseline()
                 .gap(px(5.))
                 .child(display(w, 9.5, word_color(st, p)))
-                .when(st == State::NeedsYou && waiting > 1, |d| d.child(mono(waiting.to_string(), 10., p.warn_ch)))
+                .when(st == State::NeedsYou && waiting > 1, |d| d.child(mono(count(waiting), 10., p.warn_ch)))
+                .when(st == State::Workers, |d| d.child(mono(count(workers), 10., p.run_ch)))
         });
         div()
             .id(("rail-row", key as usize))

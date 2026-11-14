@@ -97,6 +97,7 @@ pub mod label {
     pub const SAVE: &str = "S A V E";
     pub const REPLACE: &str = "R E P L A C E";
     pub const RUNNING: &str = "R U N N I N G";
+    pub const WORKERS: &str = "W O R K E R S";
     pub const OPENING: &str = "O P E N I N G";
     pub const LOCKED: &str = "L O C K E D";
     pub const UNREAD: &str = "U N R E A D";
