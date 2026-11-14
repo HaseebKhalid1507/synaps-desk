@@ -18,7 +18,7 @@ const CWD: &str = "/home/you/work/relay-gateway";
 const SID: &str = "20261113-041207-a1f0";
 
 /// RFC 3339 (UTC) of `secs` after the epoch.
-fn rfc3339(secs: i64) -> String {
+pub(crate) fn rfc3339(secs: i64) -> String {
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     // Howard Hinnant's civil_from_days.
     let z = days + 719_468;
@@ -33,23 +33,135 @@ fn rfc3339(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-fn sessions(now: i64) -> Vec<SessionMeta> {
+/// The daemon's session list: every rail state but OPENING (the client's
+/// own) and UNREAD (the client sees it happen: `settled` is the next poll,
+/// in which the single-flight session's turn has ended off screen).
+fn sessions(now: i64, settled: bool) -> Vec<SessionMeta> {
     let ago = |min: i64| rfc3339(now - min * 60);
+    let opus = "anthropic/claude-opus-4-1";
+    let sonnet = "anthropic/claude-sonnet-4-5";
     let rows = [
-        json!({"id": SID, "name": "relay-refresh", "title": "Refresh race in session relay", "model": "anthropic/claude-opus-4-1",
-            "cwd": CWD, "busy": true, "awaiting_input": 1, "cost_usd": 4.95, "lifecycle": "live", "clients": 1, "messages": 9, "state_since": ago(4)}),
-        json!({"id": "20261113-035512-77c2", "name": "ingest-core", "title": "Migrate ingest workers to async", "model": "anthropic/claude-sonnet-4-5",
-            "cwd": "/home/you/work/ingest", "busy": true, "awaiting_input": 1, "cost_usd": 1.45, "lifecycle": "live", "messages": 31, "state_since": ago(18)}),
-        json!({"id": "20261113-033001-c3d9", "title": "Flaky e2e: checkout latency", "model": "anthropic/claude-sonnet-4-5",
-            "cwd": "/home/you/work/shop", "busy": true, "cost_usd": 0.45, "lifecycle": "live", "messages": 12, "state_since": ago(7)}),
-        json!({"id": "20261113-021944-0b1e", "title": "Bisect allocator regression", "model": "anthropic/claude-opus-4-1",
-            "cwd": "/home/you/work/alloc", "busy": false, "cost_usd": 2.17, "lifecycle": "live", "messages": 58, "state_since": ago(41)}),
+        json!({"id": "20261101-030919-c3d4", "name": "subconscious", "title": "Day ledger, heartbeat and handoff", "model": opus,
+            "cwd": "/home/you/notes", "pinned": true, "lifecycle": "live", "messages": 388, "cost_usd": 3.12, "state_since": ago(12),
+            "created_at": ago(18_000)}),
+        json!({"id": "20261113-184102-9d0e", "model": opus, "cwd": "/home/you/work/synaps-desktop", "lifecycle": "live", "messages": 0,
+            "state_since": ago(0), "created_at": ago(0)}),
+        json!({"id": "20261113-033001-c3d9", "title": "Flaky e2e: checkout latency", "model": sonnet,
+            "cwd": "/home/you/work/shop", "busy": true, "cost_usd": 0.45, "lifecycle": "live", "messages": 12, "state_since": ago(7),
+            "created_at": ago(30)}),
+        json!({"id": SID, "name": "relay-refresh", "title": "Refresh race in session relay", "model": opus,
+            "cwd": CWD, "busy": true, "awaiting_input": 1, "cost_usd": 4.95, "lifecycle": "live", "clients": 1, "messages": 9,
+            "state_since": ago(4), "created_at": ago(90),
+            "roster": [{"id": 2, "name": "desktop", "kind": "rpc", "mode": "mirror", "attached_at_ms": 0}]}),
+        json!({"id": "20261113-161706-a1b9", "title": "Idle CPU: hybrid against main", "model": sonnet, "cwd": "/home/you/work/synaps-desktop",
+            "lifecycle": "parked", "messages": 44, "cost_usd": 0.88, "state_since": ago(38), "evict_due": rfc3339(now + 22 * 60),
+            "created_at": ago(120)}),
+        json!({"id": "20261113-035512-77c2", "name": "ingest-core", "title": "Migrate ingest workers to async", "model": sonnet,
+            "cwd": "/home/you/work/ingest", "busy": true, "awaiting_input": 2, "cost_usd": 1.45, "lifecycle": "live", "messages": 31,
+            "state_since": ago(18), "created_at": ago(200)}),
+        json!({"id": "20261113-151233-8f70", "title": "Saved-sessions query: single-flight load", "model": opus,
+            "cwd": "/home/you/work/runtime", "busy": !settled, "cost_usd": 6.12, "lifecycle": "live",
+            "messages": if settled { 243 } else { 241 }, "state_since": ago(if settled { 0 } else { 13 }),
+            "park_due": rfc3339(now + 50), "created_at": ago(300)}),
+        json!({"id": "20261113-021944-0b1e", "title": "Bisect allocator regression", "model": opus,
+            "cwd": "/home/you/work/alloc", "cost_usd": 2.17, "lifecycle": "parked", "messages": 58, "state_since": ago(51),
+            "locked_by": "pid 48213 (tui)", "created_at": ago(400)}),
         json!({"id": "20261112-224410-9f00", "name": "ledger-drift", "title": "Schema drift report: ledger", "model": "anthropic/claude-haiku-4-5",
-            "cwd": "/home/you/work/ledger", "busy": false, "cost_usd": 0.09, "lifecycle": "live", "messages": 6, "state_since": ago(130)}),
-        json!({"id": "20261112-180203-44aa", "title": "Operator handbook, chapter 4", "model": "anthropic/claude-sonnet-4-5",
-            "cwd": "/home/you/docs", "busy": false, "cost_usd": 0.27, "lifecycle": "parked", "messages": 22, "state_since": ago(190)}),
+            "cwd": "/home/you/work/ledger", "cost_usd": 0.09, "lifecycle": "live", "clients": 1, "messages": 6, "state_since": ago(130),
+            "created_at": ago(800), "roster": [{"id": 3, "name": "tui", "kind": "tui", "mode": "mirror", "attached_at_ms": 0}]}),
+        json!({"id": "20261112-180203-44aa", "title": "Operator handbook, chapter 4", "model": sonnet,
+            "cwd": "/home/you/docs", "cost_usd": 0.27, "lifecycle": "parked", "messages": 22, "state_since": ago(190),
+            "created_at": ago(1500)}),
     ];
     rows.into_iter().filter_map(|r| serde_json::from_value(r).ok()).collect()
+}
+
+/// The synthetic daemon's saved sessions (`SavedSessionList`, decoded by
+/// the client's own decoder), as `saved_sessions(named_only, limit)` would
+/// list them: newest first, `truncated` past the limit.
+pub fn saved(named_only: bool, limit: u32) -> Event {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let named = [
+        ("myx", "Mixer: per-channel gain staging", 3 * 3600),
+        ("reload-bugs", "Daemon reload: owned sessions and aliases", 11 * 3600),
+        ("syn", "Synaps CLI: release checklist", 3 * 86_400),
+        ("watchcard-test", "Watch card: worker rows at 1 Hz", 5 * 86_400),
+        ("smoke-ab-rel2", "Smoke A/B, release build, second run", 9 * 86_400),
+        ("smoke-ab-rel", "Smoke A/B, release build", 9 * 86_400 + 900),
+        ("smoke-ab-new", "Smoke A/B, new build", 9 * 86_400 + 2000),
+        ("subconscious-old", "Day ledger, heartbeat and handoff", 15 * 86_400),
+        ("handbook", "Operator handbook, chapter 3", 21 * 86_400),
+        ("kite", "Kite: offline maps", 40 * 86_400),
+        ("bebop", "Bebop: audio routing", 90 * 86_400),
+    ];
+    let titles = [
+        "Fork: relay refresh race",
+        "Review PR #5: outcomes, per-attachment answers",
+        "Accent floors in OKLCH: 4.5 and 3.0",
+        "Subset Rajdhani and Plex, rename the families",
+        "Bench: launch to first frame, loaded daemon",
+        "Do owned sessions survive a reload?",
+        "Prompt answers on the wire: fixtures",
+        "GPUI or Tauri for the desktop client",
+        "Corp demo: six looks, one accent",
+        "Tolerant decoding: unknown frames and events",
+        "Rename refusals, for the user",
+        "Sessions modal: facets and day groups",
+        "Multi-account broker: refresh locks",
+        "TTFT: cold start against llama.cpp",
+        "Forum: tombstones and exact retries",
+        "Compaction chains: resolve the head exactly",
+        "Park grace and eviction timers",
+        "Decode ceiling: streaming read",
+        "Flash attention: fallback tests",
+        "Keep-warm pings: what they cost",
+        "Retention: thirty days by default",
+        "Input ownership: shared or exclusive",
+        "Subagent rows after the turn ends",
+        "Session lock: live in another process",
+        "Journal generations and snapshots",
+        "Title from the first user message",
+        "Cost cap per session",
+    ];
+    let folders = ["/home/you/work/runtime", "/home/you/work/synaps-desktop", "/home/you/work/relay-gateway", "/home/you/notes"];
+    let mut rows: Vec<(i64, Value)> = named
+        .iter()
+        .enumerate()
+        .map(|(i, (name, title, age))| {
+            (
+                now - age,
+                json!({"id": format!("20261020-0900{i:02}-n{i:03}"), "name": name, "title": title, "model": "anthropic/claude-opus-4-1",
+                "cwd": folders[i % folders.len()], "message_count": 40 + i * 37, "updated_at": rfc3339(now - age), "live": false}),
+            )
+        })
+        .collect();
+    // 7 today, 14 this week, 30 this month, 69 older.
+    for i in 0..120i64 {
+        let age = match i {
+            0..7 => 2 * 3600 + i * 2 * 3600,
+            7..21 => 86_400 + (i - 7) * 36_000,
+            21..51 => 7 * 86_400 + (i - 21) * 70_000,
+            _ => 30 * 86_400 + (i - 51) * 400_000,
+        };
+        let t = titles[i as usize % titles.len()];
+        let title = if i < titles.len() as i64 { t.to_string() } else { format!("{t} ({})", i / titles.len() as i64 + 1) };
+        rows.push((
+            now - age,
+            json!({"id": format!("20261001-1000{i:03}-u{i:03}"), "title": title, "model": "anthropic/claude-sonnet-4-5",
+            "cwd": folders[i as usize % folders.len()], "message_count": 12 + i * 7, "updated_at": rfc3339(now - age), "live": false}),
+        ));
+    }
+    // Held by the daemon: listed `live`, never in HISTORY.
+    rows.push((now - 60, json!({"id": "20261112-224410-9f00", "name": "ledger-drift", "updated_at": rfc3339(now - 60), "live": true})));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    let listed: Vec<Value> = rows.into_iter().map(|r| r.1).filter(|v| !named_only || v["name"].is_string()).collect();
+    let truncated = listed.len() > limit as usize;
+    let sessions: Vec<Value> = listed.into_iter().take(limit as usize).collect();
+    let frame = json!({"type": "saved_session_list", "sessions": sessions, "truncated": truncated});
+    match decode_frame(&frame.to_string()) {
+        Ok(DaemonFrame::SavedSessionList { sessions, truncated, rejected }) => Event::SavedSessions { sessions, truncated, rejected },
+        other => Event::SavedSessionsFailed { reason: format!("synthetic saved list did not decode: {other:?}") },
+    }
 }
 
 const OLD: &str = "        if self.token.expires_within(REFRESH_SKEW) {
@@ -109,11 +221,11 @@ fn messages() -> Vec<Value> {
     ]
 }
 
-/// The events of a daemon connection with six sessions, attached to one
+/// The events of a daemon connection with ten sessions, attached to one
 /// that waits on a tool-call confirmation.
 pub fn events() -> Vec<Event> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    let mut out = vec![Event::Sessions(sessions(now))];
+    let mut out = vec![Event::Sessions(sessions(now, false))];
     let msgs = messages();
     let attached = json!({"type": "attached", "client": 2,
         "meta": {"id": SID, "name": "relay-refresh", "title": "Refresh race in session relay", "model": "anthropic/claude-opus-4-1", "cwd": CWD,
@@ -139,13 +251,16 @@ pub fn events() -> Vec<Event> {
             out.push(Event::Session { attach_seq: LOCAL_SEQ, session_id: SID.into(), seq, event, raw: Arc::new(raw) });
         }
     }
+    // The next poll: a turn ended off screen (UNREAD).
+    out.push(Event::Sessions(sessions(now, true)));
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ConnState, Model};
+    use crate::model::{ConnState, Effect, Model};
+    use crate::rail::State;
 
     #[test]
     fn rfc3339_formats_and_round_trips() {
@@ -165,7 +280,11 @@ mod tests {
         for ev in events() {
             m.apply(ev);
         }
-        assert_eq!(m.sessions.len(), 6);
+        assert_eq!(m.sessions.len(), 10);
+        let states: std::collections::HashSet<State> = m.sessions.iter().map(|s| m.state(s)).collect();
+        for st in [State::NeedsYou, State::Running, State::Locked, State::Unread, State::Idle, State::Parked] {
+            assert!(states.contains(&st), "{st:?} missing from the demo");
+        }
         assert_eq!(m.active.as_ref().unwrap().session_id, SID);
         assert_eq!(m.transcript.pending_prompts().len(), 1);
         assert!(m.transcript.busy());
@@ -180,5 +299,24 @@ mod tests {
         let shell: Vec<(&str, &str)> = s.files.shell().iter().map(|f| (f.path.as_str(), f.verb)).collect();
         assert_eq!(shell, [("crates/relay/src/retry.rs", "rm"), ("crates/relay/src/lib.rs", "sed -i")]);
         assert_eq!(m.transcript.subagents().len(), 1);
+    }
+
+    /// `--offline` answers `saved_sessions` through the same path as a
+    /// daemon: the model asks, the synthetic catalog replies, HISTORY fills.
+    #[test]
+    fn the_demo_answers_saved_sessions() {
+        let mut m = Model::new(ConnState::Off("offline".into()));
+        let mut asks = m.offer_saved();
+        let mut n = 0;
+        while let Some(Effect::ListSaved { named_only, limit }) = asks.pop() {
+            n += 1;
+            asks.extend(m.apply(saved(named_only, limit)));
+        }
+        assert_eq!(n, 1, "the newest 200 hold them all: no named list asked");
+        assert_eq!(m.named.recent.iter().filter(|v| v.name.is_some()).count(), 12, "eleven saved and one held");
+        assert!(m.named.recent_loaded && !m.named.recent_truncated);
+        assert_eq!(crate::rail::history(&m).len(), 131, "the held one is not history");
+        let Event::SavedSessions { sessions, truncated, .. } = saved(false, 5) else { panic!() };
+        assert_eq!((sessions.len(), truncated), (5, true));
     }
 }

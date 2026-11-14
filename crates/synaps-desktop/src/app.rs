@@ -5,7 +5,7 @@
 //! number from the daemon ([`crate::stats`]).
 
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
@@ -19,8 +19,9 @@ use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError}
 use crate::bench::BenchState;
 use crate::files::{self, LineKind, Preview};
 use crate::fonts::{self, label};
-use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, Filter, Model, RenameRequest, SAVED_LIMIT};
-use crate::named::ResumeRequest;
+use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, LOCAL_SEQ, Model, RenameRequest};
+use crate::named::{ResumeRequest, RowAction, home_short};
+use crate::rail::{Bucket, Chip};
 use crate::theme::{self, Palette};
 
 /// Per-row strings derived from a transcript item, rebuilt only when the
@@ -138,7 +139,7 @@ pub(crate) fn toggled(window: f32, panels: theme::Panels, rail: bool) -> Option<
             return None;
         }
     }
-    Some(theme::Panels { rail_collapsed: !open(p, true), right_collapsed: !open(p, false) })
+    Some(theme::Panels { rail_collapsed: !open(p, true), right_collapsed: !open(p, false), ..panels })
 }
 
 /// Tells a fold key's press from its auto-repeats. Wayland, Windows and
@@ -205,6 +206,8 @@ fn fold_fallback<A: Action>(rail: bool, view: WeakEntity<AppView>, window: AnyWi
 /// A fold is saved this long after the last one, off the UI thread: a
 /// burst of folds is one write.
 const SAVE_DELAY: Duration = Duration::from_millis(400);
+/// The pointer rests this long on a rail row before its readout opens.
+const READOUT_DELAY: Duration = Duration::from_millis(400);
 
 /// `inner` in the reading column ([`COLUMN_MAX`], centred).
 pub(crate) fn column(inner: impl IntoElement) -> Div {
@@ -295,15 +298,29 @@ pub struct AppView {
     /// Rows whose open/closed state the user flipped from its default.
     toggled: HashSet<u64>,
     composer: Entity<TextareaState>,
-    /// "Open by name…" (rail) and "Name this session…" (header) inputs.
-    pub(crate) open_input: Entity<InputState>,
+    /// The rail's find (`/`; Enter opens by exact name) and "Name this
+    /// session…" (header) inputs.
+    pub(crate) find_input: Entity<InputState>,
     name_input: Entity<InputState>,
     /// The accent picker's custom colour and a secret prompt's answer.
     pub(crate) hex_input: Entity<InputState>,
     secret_input: Entity<InputState>,
-    pub(crate) open_shown: bool,
-    pub(crate) named_collapsed: bool,
-    /// The side panels folded to strips (saved with the accent).
+    /// The find text, trimmed and lowercased.
+    pub(crate) find: String,
+    /// The count chip filtering the rail.
+    pub(crate) chip: Option<Chip>,
+    /// HISTORY buckets showing all their rows (`+ N MORE`; not saved).
+    pub(crate) expanded: u8,
+    /// The rail's virtual list (only the visible rows are built).
+    pub(crate) rail_list: ListState,
+    pub(crate) rail_width: f32,
+    /// The rail row under the pointer, the one whose readout is open, and
+    /// the 400 ms wait in between.
+    hover: Option<u64>,
+    pub(crate) readout: Option<u64>,
+    readout_wait: Option<Task<()>>,
+    /// The side panels folded to strips and the open HISTORY buckets
+    /// (saved with the accent).
     pub panels: theme::Panels,
     /// Panel keys changed since the last save began, and keys handed to a
     /// save that has not finished: both written at once on a clean quit.
@@ -314,7 +331,6 @@ pub struct AppView {
     fold_keys: FoldKeys,
     /// The window's width at the last frame (what a fold acts on).
     pub(crate) width: f32,
-    pub(crate) filter: Filter,
     pub picker_open: bool,
     pub(crate) picker_note: Option<SharedString>,
     /// Where the mouse-down that closed the picker from outside was: the
@@ -334,8 +350,11 @@ pub struct AppView {
     pub bench: Option<BenchState>,
     /// Diagnostics: render rows as plain text instead of markdown.
     pub plain_rows: bool,
-    /// The synthetic transport feeds this window (`--offline`).
+    /// The synthetic transport feeds this window (`--offline`); it answers
+    /// `saved_sessions` itself, on this channel.
     pub(crate) synthetic: bool,
+    synthetic_tx: Option<async_channel::Sender<Event>>,
+    synthetic_seq: u64,
     /// `--session ID`: attach to it once connected.
     pub start_session: Option<String>,
     _tasks: Vec<Task<()>>,
@@ -379,7 +398,7 @@ impl AppView {
                 .submit_on_enter(true)
                 .placeholder("Message, or steer a running turn  (Enter sends, Shift+Enter: new line)")
         });
-        let open_input = cx.new(|cx| InputState::new(window, cx).placeholder("session name"));
+        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("find · open by name"));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
         let secret_input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("answer (hidden)"));
@@ -392,16 +411,35 @@ impl AppView {
                     }
                 }
             }),
-            // The typed name stays until the outcome is known: cleared on
+            // Find filters as it is typed; Enter opens by exact name. The
+            // typed name stays until the outcome is known: cleared on
             // `Attached` (`named.opened`, in `render`), kept on an error.
-            cx.subscribe_in(&open_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
-                if let InputEvent::PressEnter { .. } = ev {
+            cx.subscribe_in(&find_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| match ev {
+                InputEvent::Change => {
+                    let find = input.read(cx).value().trim().to_lowercase();
+                    if find != this.find {
+                        if this.find.is_empty() {
+                            for fx in this.model.want_deep() {
+                                this.effect(fx);
+                            }
+                        }
+                        this.find = find;
+                        cx.notify();
+                    }
+                }
+                InputEvent::PressEnter { .. } => {
                     let typed = input.read(cx).value().to_string();
-                    for fx in this.model.open_by_name(&typed) {
+                    this.find_enter(typed.trim());
+                    cx.notify();
+                }
+                // The user is looking: list what find searches, fresh.
+                InputEvent::Focus => {
+                    for fx in this.model.looking() {
                         this.effect(fx);
                     }
                     cx.notify();
                 }
+                _ => {}
             }),
             cx.subscribe_in(&name_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
                 if let InputEvent::PressEnter { .. } = ev {
@@ -439,8 +477,8 @@ impl AppView {
             this.flush_panels();
             async {}
         }));
-        let inputs = Inputs { composer, open_input, name_input, hex_input, secret_input, focus };
-        let mut v = match (client, synthetic) {
+        let inputs = Inputs { composer, find_input, name_input, hex_input, secret_input, focus };
+        match (client, synthetic) {
             (Some((c, rx)), _) => {
                 let mut v = Self::blank(inputs, Some(c), ConnState::Connecting, subs);
                 v.pump(rx, cx);
@@ -454,13 +492,15 @@ impl AppView {
                 for e in events {
                     let _ = tx.try_send(e);
                 }
+                v.synthetic_tx = Some(tx);
+                for fx in v.model.offer_saved() {
+                    v.effect(fx);
+                }
                 v.pump(rx, cx);
                 v
             }
             (None, None) => Self::blank(inputs, None, ConnState::Off("offline".into()), subs),
-        };
-        v.filter = Filter::All;
-        v
+        }
     }
 
     fn blank(i: Inputs, client: Option<Client>, conn: ConnState, subs: Vec<Subscription>) -> Self {
@@ -473,19 +513,24 @@ impl AppView {
             list,
             toggled: HashSet::new(),
             composer: i.composer,
-            open_input: i.open_input,
+            find_input: i.find_input,
             name_input: i.name_input,
             hex_input: i.hex_input,
             secret_input: i.secret_input,
-            open_shown: false,
-            named_collapsed: false,
+            find: String::new(),
+            chip: None,
+            expanded: 0,
+            rail_list: ListState::new(0, ListAlignment::Top, px(300.)),
+            rail_width: 0.,
+            hover: None,
+            readout: None,
+            readout_wait: None,
             panels: theme::Panels::default(),
             panels_dirty: Default::default(),
             panels_writing: Default::default(),
             panels_save: None,
             fold_keys: FoldKeys::default(),
             width: 0.,
-            filter: Filter::All,
             picker_open: false,
             picker_note: None,
             picker_dismissed: None,
@@ -497,6 +542,8 @@ impl AppView {
             bench: None,
             plain_rows: false,
             synthetic: false,
+            synthetic_tx: None,
+            synthetic_seq: 0,
             start_session: None,
             _tasks: Vec::new(),
             _subs: subs,
@@ -517,6 +564,7 @@ impl AppView {
                     if let Some(b) = this.bench.as_mut() {
                         b.on_received(&batch, now);
                     }
+                    this.model.view_dirty = false;
                     for ev in batch {
                         for fx in this.model.apply(ev) {
                             this.effect(fx);
@@ -527,7 +575,11 @@ impl AppView {
                     {
                         this.attach(id);
                     }
-                    cx.notify();
+                    // An idle daemon's poll changes nothing: no frame, unless
+                    // the rail's ages have a new minute to show.
+                    if this.model.view_dirty || this.rail.minute() != crate::chrome::now_secs() / 60 {
+                        cx.notify();
+                    }
                 })
                 .is_ok()
             })
@@ -554,10 +606,12 @@ impl AppView {
                     let _ = c.resync();
                 }
             }
-            Effect::ListSaved => {
-                let sent = match &self.client {
-                    Some(c) => c.saved_sessions(true, SAVED_LIMIT).map_err(|e| e.to_string()),
-                    None => Err("offline".into()),
+            Effect::ListSaved { named_only, limit } => {
+                let sent = match (&self.client, &self.synthetic_tx) {
+                    (Some(c), _) => c.saved_sessions(named_only, limit).map_err(|e| e.to_string()),
+                    // The synthetic transport answers as a daemon would.
+                    (None, Some(tx)) => tx.try_send(crate::demo::saved(named_only, limit)).map_err(|e| e.to_string()),
+                    (None, None) => Err("offline".into()),
                 };
                 if let Err(e) = sent {
                     for fx in self.model.saved_failed(&e) {
@@ -571,15 +625,10 @@ impl AppView {
                     self.model.asked_for(&session_id);
                     self.list.set_follow_mode(FollowMode::Tail);
                 } else if self.synthetic {
-                    self.model.last_error = Some("offline: the synthetic transport holds one session".into());
+                    self.synthetic_attach(&session_id, fallback, open);
                 }
             }
             Effect::Resume { req, open } => self.resume(req, open),
-            Effect::Detach => {
-                if let Some(c) = &self.client {
-                    let _ = c.detach();
-                }
-            }
         }
     }
 
@@ -587,7 +636,13 @@ impl AppView {
     /// is gone there.
     fn resume(&mut self, req: ResumeRequest, open: bool) {
         let Some(c) = &self.client else {
-            self.model.named.error = Some("offline".into());
+            if self.synthetic {
+                // Never answered: the row stays OPENING.
+                self.synthetic_seq += 1;
+                self.model.resuming(req, self.synthetic_seq, open);
+            } else {
+                self.model.named.error = Some("offline".into());
+            }
             return;
         };
         match c.resume(req.target.clone(), req.options()) {
@@ -597,6 +652,105 @@ impl AppView {
             }
             Err(e) => self.model.named.error = Some(e.to_string()),
         }
+    }
+
+    /// `--offline` holds one session: back to it, or an attach that is
+    /// never answered (the row stays OPENING).
+    fn synthetic_attach(&mut self, session_id: &str, fallback: Option<ResumeRequest>, open: bool) {
+        if self.model.active.as_ref().is_some_and(|a| a.session_id == session_id) {
+            self.model.want(LOCAL_SEQ);
+        } else {
+            self.synthetic_seq += 1;
+            self.model.attaching(self.synthetic_seq, fallback, open);
+        }
+        self.model.asked_for(session_id);
+    }
+
+    /// A rail row was clicked (looked up by its key now: the rail may have
+    /// been rebuilt since the frame that drew it).
+    pub(crate) fn rail_click(&mut self, key: u64) {
+        let Some(action) = self.rail.rail.rows.iter().find(|r| r.key == key).map(|r| r.action.clone()) else { return };
+        for fx in self.model.open_row(&action) {
+            self.effect(fx);
+        }
+    }
+
+    /// The rail as the model, find, the chip and the buckets have it now.
+    fn refresh_rail(&mut self) {
+        let view = crate::rail::View {
+            find: std::mem::take(&mut self.find),
+            chip: self.chip,
+            open: self.panels.history_open,
+            expanded: self.expanded,
+        };
+        self.rail.refresh(&self.model, &view, &self.rail_list);
+        self.find = view.find;
+    }
+
+    /// Enter in find (see [`Model::find_enter`]), over the rows the rail
+    /// shows for what is typed now.
+    fn find_enter(&mut self, typed: &str) {
+        self.refresh_rail();
+        let rail = &self.rail.rail;
+        let visible: Vec<RowAction> = rail
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                crate::rail::Item::Row(r) | crate::rail::Item::Hist(r) => Some(rail.rows[*r].action.clone()),
+                _ => None,
+            })
+            .collect();
+        for fx in self.model.find_enter(typed, &visible) {
+            self.effect(fx);
+        }
+    }
+
+    /// The pointer entered or left a rail row: its readout opens after
+    /// [`READOUT_DELAY`] at rest, and closes when it leaves.
+    pub(crate) fn hover_row(&mut self, key: u64, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            if self.hover == Some(key) {
+                return;
+            }
+            self.hover = Some(key);
+            let shown = self.readout.take().is_some();
+            self.readout_wait = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(READOUT_DELAY).await;
+                let _ = this.update(cx, |v, cx| {
+                    if v.hover == Some(key) {
+                        v.readout = Some(key);
+                        cx.notify();
+                    }
+                });
+            }));
+            if shown {
+                cx.notify();
+            }
+        } else if self.hover == Some(key) {
+            self.hover = None;
+            self.readout_wait = None;
+            if self.readout.take().is_some() {
+                cx.notify();
+            }
+        }
+    }
+
+    /// A HISTORY bucket opened or closed (remembered, as the panels are);
+    /// OLDER opening lists up to the wire's cap.
+    pub(crate) fn toggle_bucket(&mut self, b: Bucket, cx: &mut Context<Self>) {
+        let mut p = self.panels;
+        p.history_open ^= b.bit();
+        let open = p.history_open & b.bit() != 0;
+        if !open {
+            self.expanded &= !b.bit();
+        }
+        self.set_panels(p, cx);
+        if open && b == Bucket::Older {
+            for fx in self.model.want_deep() {
+                self.effect(fx);
+            }
+        }
+        cx.notify();
     }
 
     /// "Name this session…": send what the model checked.
@@ -793,6 +947,11 @@ impl AppView {
     /// width by itself.
     pub(crate) fn toggle_panel(&mut self, rail: bool, cx: &mut Context<Self>) {
         let Some(p) = toggled(self.width, self.panels, rail) else { return };
+        self.set_panels(p, cx);
+    }
+
+    /// New panel states, saved [`SAVE_DELAY`] after the last change.
+    fn set_panels(&mut self, p: theme::Panels, cx: &mut Context<Self>) {
         self.panels_dirty = self.panels_dirty.or(theme::PanelKeys::changed(self.panels, p));
         self.panels = p;
         if self.bench.is_none() {
@@ -1413,16 +1572,6 @@ fn tracked(name: &str) -> String {
     out
 }
 
-/// `/home/me/x` → `~/x` when it is this machine's home.
-pub(crate) fn home_short(path: &str) -> String {
-    static HOME: OnceLock<String> = OnceLock::new();
-    let home = HOME.get_or_init(|| std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default());
-    match path.strip_prefix(home.as_str()) {
-        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with(['/', '\\'])) => format!("~{rest}"),
-        _ => path.to_string(),
-    }
-}
-
 pub(crate) fn one_line(s: &str, max: usize) -> String {
     let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     let more = s.lines().filter(|l| !l.trim().is_empty()).count() > 1;
@@ -1435,7 +1584,7 @@ pub(crate) fn one_line(s: &str, max: usize) -> String {
 
 struct Inputs {
     composer: Entity<TextareaState>,
-    open_input: Entity<InputState>,
+    find_input: Entity<InputState>,
     name_input: Entity<InputState>,
     hex_input: Entity<InputState>,
     secret_input: Entity<InputState>,
@@ -1455,13 +1604,12 @@ impl Render for AppView {
             });
         }
         if std::mem::take(&mut self.model.named.opened) {
-            self.open_input.update(cx, |s, cx| s.set_value("", window, cx));
-            self.open_shown = false;
+            self.find_input.update(cx, |s, cx| s.set_value("", window, cx));
+            self.find.clear();
         }
         self.sync_list();
         self.sync_card(window, cx);
-        let rail = std::mem::take(&mut self.rail);
-        self.rail = rail.refreshed(&self.model);
+        self.refresh_rail();
         if let Some(b) = self.bench.as_mut() {
             b.on_render(&self.list, window);
         }
@@ -1470,6 +1618,9 @@ impl Render for AppView {
         // numbers, then the open rail, to strips before the session gives.
         self.width = window.viewport_size().width.into();
         let (rail, right) = sides(self.width, self.panels, crate::chrome::MARK);
+        if let Side::Open(w) = rail {
+            self.rail_width = w;
+        }
         let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_row(ix, cx))).size_full();
         let main = v_flex()
             .flex_1()
@@ -1484,11 +1635,37 @@ impl Render for AppView {
         h_flex()
             .id("root")
             .track_focus(&self.focus)
-            // Esc closes the picker, wherever the focus is.
+            // Esc closes the picker, wherever the focus is; in find it clears
+            // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if this.picker_open && ev.keystroke.key == "escape" {
                     this.close_picker(window, cx);
                     cx.stop_propagation();
+                } else if ev.keystroke.key == "escape" && this.find_input.read(cx).focus_handle(cx).is_focused(window) {
+                    this.find_input.update(cx, |s, cx| s.set_value("", window, cx));
+                    this.find.clear();
+                    window.focus(&this.focus, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            // `/` (nothing else focused) goes to find.
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                let m = &ev.keystroke.modifiers;
+                if ev.keystroke.key == "/" && !(m.control || m.alt || m.platform) && this.focus.is_focused(window) {
+                    cx.stop_propagation();
+                    let input = this.find_input.clone();
+                    if !matches!(sides(this.width, this.panels, crate::chrome::MARK).0, Side::Open(_)) {
+                        // Folded: the input is not drawn yet, and a focus on
+                        // something not drawn is lost. Focus it once the
+                        // frame that unfolds the rail has been drawn.
+                        this.toggle_panel(true, cx);
+                        window.on_next_frame(move |window, _| {
+                            window.on_next_frame(move |window, cx| input.update(cx, |s, cx| s.focus(window, cx)));
+                        });
+                    } else {
+                        input.update(cx, |s, cx| s.focus(window, cx));
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleRail, _, cx| this.fold_key(true, cx)))
@@ -1554,10 +1731,13 @@ mod tests {
         assert_eq!(sides(2560., open, 30.), (Side::Open(340.), Side::Open(358.)));
         assert_eq!(sides(1000., open, 30.), (Side::Open(276.), Side::Strip));
         assert_eq!(sides(700., open, 30.), (Side::Strip, Side::Strip));
-        let folded = Panels { rail_collapsed: true, right_collapsed: true };
+        let folded = Panels { rail_collapsed: true, right_collapsed: true, ..Panels::default() };
         assert_eq!(sides(700., folded, 30.), (Side::Strip, Side::Strip));
         // A folded rail leaves room for the open numbers.
-        assert_eq!(sides(1000., Panels { rail_collapsed: true, right_collapsed: false }, 30.), (Side::Strip, Side::Open(296.)));
+        assert_eq!(
+            sides(1000., Panels { rail_collapsed: true, right_collapsed: false, ..Panels::default() }, 30.),
+            (Side::Strip, Side::Open(296.))
+        );
     }
 
     /// L1: a click on a strip opens its panel, folding the other one if
@@ -1566,9 +1746,9 @@ mod tests {
     #[test]
     fn a_strip_opens_its_panel_or_says_it_cannot() {
         let open = Panels::default();
-        let rail_only = Panels { rail_collapsed: false, right_collapsed: true };
-        let right_only = Panels { rail_collapsed: true, right_collapsed: false };
-        let both = Panels { rail_collapsed: true, right_collapsed: true };
+        let rail_only = Panels { rail_collapsed: false, right_collapsed: true, ..Panels::default() };
+        let right_only = Panels { rail_collapsed: true, right_collapsed: false, ..Panels::default() };
+        let both = Panels { rail_collapsed: true, right_collapsed: true, ..Panels::default() };
         // Wide: each folds and opens on its own.
         assert_eq!(toggled(1920., open, true), Some(right_only));
         assert_eq!(toggled(1920., right_only, true), Some(open));

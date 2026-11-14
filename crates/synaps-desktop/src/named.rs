@@ -1,39 +1,8 @@
-//! The rail's **Named** section: grouping, sort and dedupe of live and
-//! saved sessions, row markers and labels, and the human messages for
-//! rename refusals and failed resumes. No GPUI.
+//! Names and resumes: what a rail row's click does, model names and times
+//! for people, and the human messages for rename refusals and failed
+//! resumes. No GPUI.
 
-use synaps_client::protocol::SessionMeta;
-use synaps_client::{CreateOptions, Cwd, RenameFailure, RenameRefusal, SavedSession};
-
-/// The one state marker a named row shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Marker {
-    Busy,
-    Idle,
-    Parked,
-    Pinned,
-    Awaiting,
-    Saved,
-    Resuming,
-}
-
-impl Marker {
-    /// A live session's marker: awaiting input beats busy, busy beats
-    /// parked, parked beats pinned.
-    pub fn of(s: &SessionMeta) -> Marker {
-        if s.awaiting_input > 0 {
-            Marker::Awaiting
-        } else if s.busy {
-            Marker::Busy
-        } else if s.is_parked() {
-            Marker::Parked
-        } else if s.pinned {
-            Marker::Pinned
-        } else {
-            Marker::Idle
-        }
-    }
-}
+use synaps_client::{CreateOptions, Cwd, RenameFailure, RenameRefusal};
 
 /// What clicking a row does.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,80 +40,6 @@ impl ResumeRequest {
             None => CreateOptions::new().cwd(Cwd::Home),
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NamedRow {
-    pub name: String,
-    pub marker: Marker,
-    /// Short model label (`opus-4-6`).
-    pub model: String,
-    /// RFC 3339 time of the last activity, if known.
-    pub activity: Option<String>,
-    pub action: RowAction,
-}
-
-impl NamedRow {
-    /// The session or journal id the row stands for.
-    pub fn id(&self) -> &str {
-        match &self.action {
-            RowAction::Attach(id) => id,
-            RowAction::Resume(r) => &r.target,
-        }
-    }
-}
-
-/// The Named section: live and parked sessions with a name, then saved
-/// named sessions the daemon does not hold (deduped by id, journal id and
-/// name), alphabetical.
-pub fn named_rows(sessions: &[SessionMeta], saved: &[SavedSession]) -> Vec<NamedRow> {
-    let mut rows: Vec<NamedRow> = sessions
-        .iter()
-        .filter_map(|s| {
-            let name = s.name.as_deref().filter(|n| !n.is_empty())?;
-            Some(NamedRow {
-                name: name.to_string(),
-                marker: Marker::of(s),
-                model: short_model(&s.model),
-                activity: s.state_since.clone().or_else(|| Some(s.created_at.clone()).filter(|c| !c.is_empty())),
-                action: RowAction::Attach(s.id.clone()),
-            })
-        })
-        .collect();
-    for v in saved {
-        let Some(name) = v.name.as_deref().filter(|n| !n.is_empty()) else { continue };
-        let held = sessions.iter().any(|s| s.is(&v.id) || s.name.as_deref() == Some(name));
-        let dup = rows.iter().any(|r| r.name == name);
-        if held || dup {
-            continue;
-        }
-        rows.push(NamedRow {
-            name: name.to_string(),
-            marker: Marker::Saved,
-            model: v.model.as_deref().map(short_model).unwrap_or_default(),
-            activity: v.updated_at.clone().or_else(|| v.created_at.clone()),
-            action: RowAction::Resume(ResumeRequest {
-                label: name.to_string(),
-                target: v.id.clone(),
-                cwd: v.cwd.clone().filter(|c| !c.is_empty()),
-                by_name: false,
-            }),
-        });
-    }
-    // One lowercase key per row, not two per comparison.
-    rows.sort_by_cached_key(|r| (r.name.to_lowercase(), r.id().to_string()));
-    rows
-}
-
-/// A session for the live list below the Named section: it has no name.
-pub fn is_unnamed(s: &SessionMeta) -> bool {
-    s.name.as_deref().is_none_or(str::is_empty)
-}
-
-/// The live list below the Named section: sessions without a name.
-#[cfg(test)]
-pub fn unnamed(sessions: &[SessionMeta]) -> impl Iterator<Item = &SessionMeta> {
-    sessions.iter().filter(|s| is_unnamed(s))
 }
 
 /// `anthropic/claude-sonnet-4-5-20250929` → `sonnet-4-5`.
@@ -260,6 +155,16 @@ pub fn resume_error(label: &str, reason: &str) -> String {
     }
 }
 
+/// `/home/me/x` → `~/x` when it is this machine's home.
+pub(crate) fn home_short(path: &str) -> String {
+    static HOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let home = HOME.get_or_init(|| std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default());
+    match path.strip_prefix(home.as_str()) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with(['/', '\\'])) => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 /// The daemon's real create errors (see `resume_error`), word for word.
 #[cfg(test)]
 pub(crate) const NO_SUCH_GHOST: &str = "create session: Tool execution failed: Failed to load session 'ghost': no session matching 'ghost'";
@@ -272,33 +177,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    fn live(v: serde_json::Value) -> SessionMeta {
-        serde_json::from_value(v).unwrap()
-    }
-
-    fn saved(v: serde_json::Value) -> SavedSession {
-        serde_json::from_value(v).unwrap()
-    }
-
-    #[test]
-    fn markers_follow_the_session_state() {
-        let base = json!({"id": "s", "lifecycle": "live"});
-        let with = |k: &str, v: serde_json::Value| {
-            let mut b = base.clone();
-            b[k] = v;
-            live(b)
-        };
-        assert_eq!(Marker::of(&live(base.clone())), Marker::Idle);
-        assert_eq!(Marker::of(&with("busy", json!(true))), Marker::Busy);
-        assert_eq!(Marker::of(&with("lifecycle", json!("parked"))), Marker::Parked);
-        assert_eq!(Marker::of(&with("pinned", json!(true))), Marker::Pinned);
-        assert_eq!(Marker::of(&with("awaiting_input", json!(1))), Marker::Awaiting);
-        let mut both = base.clone();
-        both["busy"] = json!(true);
-        both["awaiting_input"] = json!(2);
-        assert_eq!(Marker::of(&live(both)), Marker::Awaiting);
-    }
 
     #[test]
     fn models_are_shortened() {
@@ -329,57 +207,6 @@ mod tests {
         assert_eq!(relative(t, now + 800 * 86_400), "2y");
         assert_eq!(relative(t, now - 60), "now", "a clock skew is not negative");
         assert_eq!(relative("garbage", now), "");
-    }
-
-    /// Grouping, sort and dedupe: named live sessions and saved named
-    /// sessions the daemon does not hold, alphabetical; a saved entry for a
-    /// live session (by id, journal id or name) is dropped; unnamed live
-    /// sessions go to the list below.
-    #[test]
-    fn live_and_saved_are_grouped_sorted_and_deduped() {
-        let sessions = vec![
-            live(
-                json!({"id": "l1", "name": "zeta", "model": "claude-opus-4-6", "lifecycle": "live", "busy": true, "state_since": "2026-11-13T07:00:00Z"}),
-            ),
-            live(json!({"id": "l2", "name": null, "lifecycle": "live"})),
-            live(json!({"id": "l3", "name": "axel", "lifecycle": "parked", "journal_id": "j-axel"})),
-            live(json!({"id": "l4-successor", "name": "mid", "lifecycle": "live", "journal_id": "j-mid"})),
-            live(json!({"id": "l5", "name": "", "lifecycle": "live"})),
-        ];
-        let saved = vec![
-            saved(json!({"id": "j-axel", "name": "axel", "live": true})),
-            saved(json!({"id": "l1", "name": "zeta-old-name", "live": true})),
-            saved(json!({"id": "j-mid", "name": "mid", "live": true})),
-            saved(
-                json!({"id": "j-beta", "name": "beta", "model": "claude-haiku-4-5", "updated_at": "2026-11-12T00:00:00Z", "live": false}),
-            ),
-            saved(json!({"id": "j-anon", "name": null, "live": false})),
-            saved(json!({"id": "j-ghost", "name": "Gamma", "live": true})),
-        ];
-        let rows = named_rows(&sessions, &saved);
-        let got: Vec<(&str, Marker, &str)> = rows.iter().map(|r| (r.name.as_str(), r.marker, r.id())).collect();
-        assert_eq!(
-            got,
-            vec![
-                ("axel", Marker::Parked, "l3"),
-                ("beta", Marker::Saved, "j-beta"),
-                ("Gamma", Marker::Saved, "j-ghost"),
-                ("mid", Marker::Idle, "l4-successor"),
-                ("zeta", Marker::Busy, "l1"),
-            ]
-        );
-        assert_eq!(
-            rows[1].action,
-            RowAction::Resume(ResumeRequest { label: "beta".into(), target: "j-beta".into(), cwd: None, by_name: false })
-        );
-        assert_eq!(rows[1].model, "haiku-4-5");
-        assert_eq!(rows[1].activity.as_deref(), Some("2026-11-12T00:00:00Z"));
-        assert_eq!(rows[4].action, RowAction::Attach("l1".into()));
-        assert_eq!(rows[4].activity.as_deref(), Some("2026-11-13T07:00:00Z"));
-        let below: Vec<&str> = unnamed(&sessions).map(|s| s.id.as_str()).collect();
-        assert_eq!(below, vec!["l2", "l5"]);
-        // Without saved sessions (an older daemon): live named only.
-        assert_eq!(named_rows(&sessions, &[]).len(), 3);
     }
 
     /// Every `RenameRefusal` reads as a sentence, never as a code.
@@ -428,19 +255,5 @@ mod tests {
         let other = "create session: Tool execution failed: Failed to load session 'x': Permission denied (os error 13)";
         assert_eq!(resume_error("x", other), "Could not resume 'x': Permission denied (os error 13)");
         assert_eq!(resume_error("x", "create session: disk full"), "Could not resume 'x': disk full");
-    }
-
-    /// H1: a saved row carries its folder into `CreateOptions` as is (no
-    /// local check), with `~` as the fallback; no folder: `~`.
-    #[test]
-    fn a_saved_rows_folder_reaches_the_create() {
-        let rows = named_rows(&[], &[saved(json!({"id": "j-axel", "name": "axel", "cwd": "/home/u/Projects/axel", "live": false}))]);
-        let RowAction::Resume(req) = &rows[0].action else { panic!() };
-        let o = req.options();
-        assert_eq!(o.cwd, Cwd::Path("/home/u/Projects/axel".into()));
-        assert_eq!(o.fallback_cwd, Some(Cwd::Home));
-        assert_eq!(o.clone().resume(&req.target).config().continue_session, Some(Some("j-axel".into())));
-        let req = ResumeRequest { label: "x".into(), target: "x".into(), cwd: None, by_name: true };
-        assert_eq!((req.options().cwd, req.options().fallback_cwd), (Cwd::Home, None));
     }
 }
