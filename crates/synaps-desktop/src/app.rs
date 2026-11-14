@@ -833,6 +833,12 @@ pub(crate) fn display(text: impl Into<SharedString>, size: f32, color: Hsla) -> 
         .child(text.into())
 }
 
+/// A count as text, drawn every frame: no allocation under 10.
+pub(crate) fn count(n: usize) -> SharedString {
+    const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    DIGITS.get(n).map_or_else(|| n.to_string().into(), |&d| d.into())
+}
+
 pub(crate) fn mono(text: impl Into<SharedString>, size: f32, color: Hsla) -> Div {
     div().font_family(fonts::MONO).text_size(px(size)).text_color(color).whitespace_nowrap().child(text.into())
 }
@@ -2361,7 +2367,7 @@ impl AppView {
                         .items_center()
                         .child(g)
                         .child(display(word, 13., color))
-                        .when(st == crate::rail::State::Workers, |d| d.child(mono(workers.to_string(), 12., color))),
+                        .when(st == crate::rail::State::Workers, |d| d.child(mono(count(workers), 12., color))),
                 )
             })
             .when_some(self.model.stats.cost.filter(|_| attached), |d, c| d.child(mono(format!("${c:.2}"), 12., p.cost)));

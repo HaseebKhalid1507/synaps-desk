@@ -152,6 +152,8 @@ impl AppView {
                 State::NeedsYou
             } else if tr.busy() {
                 State::Running
+            } else if self.model.active_workers() > 0 {
+                State::Workers
             } else {
                 State::Idle
             }
