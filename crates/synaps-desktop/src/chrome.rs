@@ -35,6 +35,9 @@ const TOP: f32 = 52.;
 const EDGE: f32 = 6.;
 /// The theme picker's narrowest width: two columns of theme names.
 const PICKER_MIN: f32 = 340.;
+/// The top bar and the session header: a picker above the composer keeps
+/// below them.
+const HEADER_CLEAR: f32 = 52. + 112.;
 
 /// The TUI's `context_bar_color`: `border_active` under 50 %,
 /// `status_streaming` under 75 %, `error_color` above.
@@ -1033,21 +1036,38 @@ impl AppView {
             .child(v_flex().when(detached, |d| d.opacity(0.45)).child(context).child(tokens).child(files))
     }
 
-    /// The theme picker: the 20 built-in themes (each with the three
-    /// colours that tell them apart: canvas, `prompt_fg`, `claude_label`),
-    /// then the accent override (THEME: none; the presets; a custom hex).
-    /// Over the open right-hand column (clear of the header's NAME and
-    /// HALT), else above the composer at the right, under its THEME button
-    /// either way. A click applies and saves; Esc (the root's key handler)
-    /// or a click outside closes it.
+    /// The theme picker: SYNAPS CONFIG (follow the TUI's `theme =`, the
+    /// default), the 20 built-in themes (each with the three colours that
+    /// tell them apart: canvas, `prompt_fg`, `claude_label`), then the
+    /// accent override (THEME: none; the presets; a custom hex). Over the
+    /// open right-hand column when it is wide enough, else above the
+    /// composer at the right: never over the header's NAME and HALT. It
+    /// scrolls when the window is too short for it. A click applies and
+    /// saves; Esc (the root's key handler) or a click outside closes it.
     pub(crate) fn render_picker(&self, p: &Palette, right: Side, cx: &Context<Self>) -> impl IntoElement {
         let scheme = cx.global::<theme::Scheme>();
         let current = scheme.choice.theme.clone();
         let accent = scheme.choice.accent;
+        let follows = self.theme_follows_config;
         let swatch = |c: u32| div().size(px(10.)).flex_none().bg(rgb(c));
-        let mut grid = h_flex().mt(px(12.)).flex_wrap().gap_y(px(2.));
+        let config = h_flex()
+            .id("theme-config")
+            .mt(px(12.))
+            .h(px(26.))
+            .px(px(6.))
+            .gap(px(8.))
+            .items_center()
+            .cursor_pointer()
+            .when(follows, |d| d.bg(p.raised))
+            .hover(|d| d.bg(p.raised))
+            .child(div().size(px(12.)).flex_none().border_1().border_color(p.dim_ch))
+            .child(display(label::SYNAPS_CONFIG, 10.5, if follows { p.ink } else { p.prose_ch }).flex_none())
+            .child(mono(format!("· {}", self.config_theme), 11., p.dim_ch).flex_1().min_w_0().overflow_hidden().text_ellipsis())
+            .child(mono(if follows { "✓" } else { " " }, 11., p.focus_ch).w(px(10.)))
+            .on_click(cx.listener(|this, _, _, cx| this.follow_config(cx)));
+        let mut grid = h_flex().mt(px(2.)).flex_wrap().gap_y(px(2.));
         for (i, &(name, raw)) in crate::palettes::THEMES.iter().enumerate() {
-            let on = name == current;
+            let on = !follows && name == current;
             grid = grid.child(
                 h_flex()
                     .id(("theme", i))
@@ -1111,23 +1131,22 @@ impl AppView {
             );
         }
         let lifted = accent.is_some_and(|a| a != scheme.roles.you_bar || a != scheme.roles.focus);
-        v_flex()
-            .id("picker")
-            .absolute()
-            .map(|d| match right {
-                // As wide as the open right panel, at least wide enough for two columns of names.
-                Side::Open(w) => d.top(px(52.)).right_0().w(px(w.max(PICKER_MIN))),
-                Side::Strip => d.bottom(px(140.)).right(px(right.width() + 24.)).w(px(PICKER_MIN)),
-            })
+        let (top, bottom) = (52., 140.);
+        // Over the open right panel, at least two columns of names wide,
+        // when that stays clear of the header's NAME and HALT (they end at
+        // the column's right edge); else above the composer, under the
+        // header.
+        let place = match right {
+            Side::Open(w) if w.max(PICKER_MIN) - w + 8. <= self.layout.right => PickerAt::Top(w.max(PICKER_MIN)),
+            _ => PickerAt::Bottom(right.width() + 24.),
+        };
+        let max_h = match place {
+            PickerAt::Top(_) => self.height - top - 16.,
+            PickerAt::Bottom(_) => self.height - bottom - HEADER_CLEAR,
+        };
+        let body = v_flex()
+            .flex_none()
             .p(px(18.))
-            .bg(p.chrome)
-            .border_1()
-            .border_color(p.edge)
-            .occlude()
-            .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                this.picker_dismissed = Some(ev.position);
-                this.close_picker(window, cx);
-            }))
             .child(
                 h_flex()
                     .items_baseline()
@@ -1139,6 +1158,7 @@ impl AppView {
                         this.close_picker(window, cx);
                     }))),
             )
+            .child(config)
             .child(grid)
             .child(h_flex().mt(px(18.)).items_baseline().gap(px(12.)).child(display(label::ACCENT, 11.5, p.header)).child(mono(
                 accent.map(theme::to_hex).unwrap_or_else(|| "the theme's".into()),
@@ -1162,8 +1182,34 @@ impl AppView {
             .when(lifted, |el| {
                 el.child(mono("lifted to stay readable: 3:1 for bars, 4.5:1 for text", 10., p.dim_ch).mt(px(10.)).whitespace_normal())
             })
-            .when_some(self.picker_note.clone(), |el, n| el.child(mono(n, 10., p.dim_ch).mt(px(10.)).whitespace_normal()))
+            .when_some(self.picker_note.clone(), |el, n| el.child(mono(n, 10., p.dim_ch).mt(px(10.)).whitespace_normal()));
+        v_flex()
+            .id("picker")
+            .absolute()
+            .map(|d| match place {
+                PickerAt::Top(w) => d.top(px(top)).right_0().w(px(w)),
+                PickerAt::Bottom(r) => d.bottom(px(bottom)).right(px(r)).w(px(PICKER_MIN)),
+            })
+            .max_h(px(max_h.max(160.)))
+            .overflow_y_scroll()
+            .bg(p.chrome)
+            .border_1()
+            .border_color(p.edge)
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                this.picker_dismissed = Some(ev.position);
+                this.close_picker(window, cx);
+            }))
+            .child(body)
     }
+}
+
+/// Where the picker opens: over the open right panel (its width), or above
+/// the composer this far from the window's right edge.
+#[derive(Clone, Copy)]
+enum PickerAt {
+    Top(f32),
+    Bottom(f32),
 }
 
 #[cfg(test)]

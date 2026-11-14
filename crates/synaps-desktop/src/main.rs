@@ -128,12 +128,16 @@ fn main() {
     // The theme: the Synaps config this profile reads, as the TUI does.
     let base = synaps_client::discovery::base_dir();
     let profile_name = profile.clone().or_else(|| std::env::var("SYNAPS_PROFILE").ok());
-    let config = std::fs::read_to_string(theme::config_path(&base, profile_name.as_deref())).ok().and_then(|c| theme::config_theme(&c));
+    let (config, config_skipped) = theme::synaps_theme(&base, profile_name.as_deref());
     let env_theme = std::env::var(theme::ENV_THEME).ok();
     let saved_theme = settings.as_deref().and_then(theme::load_theme);
     let (theme_name, raw, theme_source, theme_warnings) =
-        theme::resolve_theme(theme_flag.as_deref(), env_theme.as_deref(), saved_theme.as_deref(), config.as_deref(), Some(&base));
+        theme::resolve_theme(theme_flag.as_deref(), env_theme.as_deref(), saved_theme.as_deref(), config, Some(&base));
     warnings.extend(theme_warnings);
+    let follows_config = matches!(theme_source, theme::Source::Config | theme::Source::Default);
+    if follows_config {
+        warnings.extend(config_skipped);
+    }
     for w in warnings {
         eprintln!("synaps-desktop: {w}");
     }
@@ -199,6 +203,9 @@ fn main() {
                 v.model.named.deep = panels.history_open & rail::Bucket::Older.bit() != 0;
                 v.accent_source = accent_source;
                 v.theme_source = theme_source;
+                v.theme_follows_config = follows_config;
+                v.theme_profile = profile_name.clone();
+                v.config_theme = v.config_choice().0.into();
                 v
             })
         })

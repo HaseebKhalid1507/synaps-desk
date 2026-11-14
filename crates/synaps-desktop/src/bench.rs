@@ -319,8 +319,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let _ = upd(cx, &move |v, _| {
                         v.plain_rows = plain;
                         v.model.set_local_session("diag-stream");
-                        v.model.transcript = synaps_client::Transcript::new();
-                        v.sync_list();
+                        v.reset_transcript();
                         v.model.transcript.apply_history(&synthetic::history(40, 3));
                         v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                         v.sync_list();
@@ -412,8 +411,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             // 3. A 2,000-message transcript with code blocks, scrolled top → down.
             let _ = upd(cx, &|v, _| {
                 v.model.set_local_session("bench-long");
-                v.model.transcript = synaps_client::Transcript::new();
-                v.sync_list();
+                v.reset_transcript();
                 v.model.transcript.apply_history(&synthetic::history(opts.history_messages, 11));
                 v.sync_list();
                 v.list.set_follow_mode(FollowMode::Normal);
@@ -450,8 +448,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             //    width: the visible rows re-wrap).
             let _ = upd(cx, &|v, _| {
                 v.model.set_local_session("bench-drag");
-                v.model.transcript = synaps_client::Transcript::new();
-                v.sync_list();
+                v.reset_transcript();
                 let mut h = synthetic::history(DRAG_TURNS * 3, 13);
                 let cut =
                     h.iter().enumerate().filter(|(_, m)| m["role"] == "user" && m["content"].is_string()).nth(DRAG_TURNS).map(|(i, _)| i);

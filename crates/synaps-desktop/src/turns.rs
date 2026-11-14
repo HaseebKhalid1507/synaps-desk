@@ -15,7 +15,7 @@ use gpui_kit::*;
 use synaps_client::transcript::{Item, ItemKind, ToolStatus};
 
 use crate::app::{AppView, RowCache, display, mono};
-use crate::files::{LineKind, Preview};
+use crate::files::{CallDelta, LineKind, Preview};
 use crate::fonts::{self, label};
 use crate::theme::{self, Metrics, Palette};
 
@@ -225,39 +225,146 @@ impl Hue {
     }
 }
 
-/// What a folded run's summary says: `+ 7 tools  bash 3  read 3  grep 1 … ✓`.
+/// Line counts as a row or a summary shows them, formatted once: `+3` `−1`
+/// (`~+3` for an estimate) for edits, `~3` for lines written (not a
+/// delta), as the FILES panel shows them. From the ledger's committed
+/// counts only, so a failed, denied, canceled or stopped call has none.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Counts {
+    pub added: Option<SharedString>,
+    pub removed: Option<SharedString>,
+    pub written: Option<SharedString>,
+}
+
+impl Counts {
+    pub(crate) fn of(d: CallDelta) -> Self {
+        let edits = d.added + d.removed > 0;
+        Counts {
+            added: edits.then(|| format!("{}+{}", if d.approx { "~" } else { "" }, d.added).into()),
+            removed: edits.then(|| format!("−{}", d.removed).into()),
+            written: (d.written > 0).then(|| format!("~{}", d.written).into()),
+        }
+    }
+
+    fn element(&self, p: &Palette) -> Option<Div> {
+        (self.added.is_some() || self.written.is_some()).then(|| {
+            h_flex()
+                .flex_none()
+                .gap(px(6.))
+                .children(self.written.clone().map(|t| div().text_color(p.dim_t).child(t)))
+                .children(self.added.clone().map(|t| div().text_color(p.ok).child(t)))
+                .children(self.removed.clone().map(|t| div().text_color(p.err).child(t)))
+        })
+    }
+}
+
+/// How a summary's outcome part is coloured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tone {
+    Ok,
+    Err,
+    Warn,
+}
+
+/// One tool name in a summary's tally.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Tally {
+    pub name: SharedString,
+    pub n: usize,
+    pub n_text: SharedString,
+    pub hue: Hue,
+}
+
+/// What a folded run's summary says: `+ 7 tools  bash 3  read 3  grep 1 …
+/// ✓`, every string formatted once per change of the run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RunSummary {
     pub tools: usize,
+    pub label: SharedString,
     /// Most used first (then first used first).
-    pub tally: Vec<(SharedString, usize, Hue)>,
+    pub tally: Vec<Tally>,
+    /// Calls by how they ended: done, failed, denied, canceled, stopped at
+    /// the output limit.
+    pub ok: usize,
     pub failed: usize,
-    pub added: u32,
-    pub removed: u32,
+    pub denied: usize,
+    pub cancelled: usize,
+    pub stopped: usize,
+    /// The committed counts of its file tools (the ledger's).
+    pub delta: CallDelta,
+    pub counts: Counts,
+    /// `✓` when every call is done; else each count that is not zero
+    /// (`5 ok`, `1 cancelled`), and the same without `ok` when tight.
+    pub outcome: Vec<(SharedString, Tone)>,
+    pub outcome_tight: Vec<(SharedString, Tone)>,
 }
 
 impl RunSummary {
     pub(crate) fn of(items: &[Item], rows: &[RowCache]) -> Self {
-        let mut tally: Vec<(SharedString, usize, Hue)> = Vec::new();
-        let mut s = RunSummary { tools: 0, tally: Vec::new(), failed: 0, added: 0, removed: 0 };
+        let mut tally: Vec<Tally> = Vec::new();
+        let (mut tools, mut ok, mut failed, mut denied, mut cancelled, mut stopped) = (0, 0, 0, 0, 0, 0);
+        let mut delta = CallDelta::default();
         for (it, row) in items.iter().zip(rows).filter(|(i, _)| i.kind == ItemKind::Tool) {
-            s.tools += 1;
-            if matches!(status(it), Some(ToolStatus::Failed | ToolStatus::Denied)) {
-                s.failed += 1;
+            tools += 1;
+            match status(it) {
+                Some(ToolStatus::Done) => ok += 1,
+                Some(ToolStatus::Failed) => failed += 1,
+                Some(ToolStatus::Denied) => denied += 1,
+                Some(ToolStatus::Cancelled) => cancelled += 1,
+                Some(ToolStatus::Unknown) => stopped += 1,
+                // Never in a folded run (it is not finished).
+                _ => {}
             }
-            if let Some(pv) = &row.preview {
-                s.added += pv.added;
-                s.removed += pv.removed;
+            if let Some(d) = row.delta {
+                delta.added += d.added;
+                delta.removed += d.removed;
+                delta.written += d.written;
+                delta.approx |= d.approx;
             }
-            match tally.iter_mut().find(|t| t.0 == row.name) {
-                Some(t) => t.1 += 1,
-                None => tally.push((row.name.clone(), 1, row.hue)),
+            match tally.iter_mut().find(|t| t.name == row.name) {
+                Some(t) => t.n += 1,
+                None => tally.push(Tally { name: row.name.clone(), n: 1, n_text: SharedString::default(), hue: row.hue }),
             }
         }
         // Stable: equal counts keep their first-use order.
-        tally.sort_by_key(|a| std::cmp::Reverse(a.1));
-        s.tally = tally;
-        s
+        tally.sort_by_key(|a| std::cmp::Reverse(a.n));
+        for t in &mut tally {
+            t.n_text = t.n.to_string().into();
+        }
+        let parts = [
+            (failed, "failed", "×", Tone::Err),
+            (denied, "denied", "×", Tone::Err),
+            (cancelled, "cancelled", "", Tone::Warn),
+            (stopped, "stopped", "", Tone::Warn),
+        ];
+        let (outcome, outcome_tight): (Vec<_>, Vec<_>) = if ok == tools {
+            (vec![("✓".into(), Tone::Ok)], vec![("✓".into(), Tone::Ok)])
+        } else {
+            let mut wide: Vec<(SharedString, Tone)> = Vec::new();
+            let mut tight: Vec<(SharedString, Tone)> = Vec::new();
+            if ok > 0 {
+                wide.push((format!("{ok} ok").into(), Tone::Ok));
+            }
+            for (n, word, glyph, tone) in parts.into_iter().filter(|p| p.0 > 0) {
+                wide.push((format!("{n} {word}").into(), tone));
+                tight.push((if glyph.is_empty() { format!("{n} {word}") } else { format!("{glyph} {n}") }.into(), tone));
+            }
+            (wide, tight)
+        };
+        RunSummary {
+            tools,
+            label: format!("{tools} tools").into(),
+            tally,
+            ok,
+            failed,
+            denied,
+            cancelled,
+            stopped,
+            delta,
+            counts: Counts::of(delta),
+            outcome,
+            outcome_tight,
+        }
     }
 }
 
@@ -274,12 +381,16 @@ impl Summaries {
         self.0.clear();
     }
 
+    /// The summaries of `rows` that changed. A run whose rows `cache` does
+    /// not hold yet (the transcript ran ahead of the last sync) is left out:
+    /// the next sync builds it.
     pub(crate) fn update(&mut self, rows: &[Disp], items: &[Item], cache: &[RowCache]) {
         for d in rows {
             if let Kind::Summary { end, .. } = d.kind
                 && self.0.get(&d.id).is_none_or(|e| e.0 != d.rev)
+                && let (Some(items), Some(cache)) = (items.get(d.item..end), cache.get(d.item..end))
             {
-                let s = RunSummary::of(&items[d.item..end], &cache[d.item..end]);
+                let s = RunSummary::of(items, cache);
                 self.0.insert(d.id, (d.rev, Arc::new(s)));
             }
         }
@@ -295,6 +406,10 @@ pub(crate) struct Layout {
     pub hang: bool,
     /// Under 560 px: the gutter drops to 16, status words and hints go.
     pub tight: bool,
+    /// The list's left padding: the column centred, whole pixels.
+    pub left: f32,
+    /// And its right.
+    pub right: f32,
 }
 
 impl Layout {
@@ -302,13 +417,14 @@ impl Layout {
         let tight = pane < 560.;
         let gutter = if tight { 16. } else { 24. };
         let column = m.column.min(pane - 2. * gutter).max(200.).floor();
-        Layout { column, hang: pane >= (672. + 200.) * m.r, tight }
+        let left = ((pane - column) / 2.).floor().max(0.);
+        Layout { column, hang: pane >= (672. + 200.) * m.r, tight, left, right: (pane - column - left).max(0.) }
     }
 
-    /// The list's left and right padding: the column centred, whole pixels.
-    pub(crate) fn padding(self, pane: f32) -> (f32, f32) {
-        let left = ((pane - self.column) / 2.).floor().max(0.);
-        (left, (pane - self.column - left).max(0.))
+    /// The list's left and right padding (the header, card and composer
+    /// use the same, so their edges line up with the rows').
+    pub(crate) fn padding(self) -> (f32, f32) {
+        (self.left, self.right)
     }
 }
 
@@ -352,13 +468,20 @@ impl AppView {
                 let color = if item.kind == ItemKind::Error { p.err } else { p.dim };
                 mono(row.text.clone(), m.meta, color).w_full().whitespace_normal().into_any_element()
             }
-            Kind::Summary { end, open } => self.render_summary(d, end, open, &p, &m, cx),
+            Kind::Summary { open, .. } => self.render_summary(d, open, &p, &m, cx),
             Kind::Work => self.render_work(item, row, d.id, &p, &m, lay, cx),
         };
         let who = match d.who {
             Who::None => None,
             Who::You => Some((label::YOU, p.you, m.pad_y)),
-            Who::Agent => Some((label::AGENT, p.agent, if d.kind == Kind::Prose { 0. } else { ((m.row - m.body_line) / 2.).max(0.) })),
+            Who::Agent => {
+                let row = match d.kind {
+                    Kind::Prose => m.body_line,
+                    Kind::Summary { .. } => m.summary,
+                    _ => m.row,
+                };
+                Some((label::AGENT, p.agent, ((row - m.body_line) / 2.).max(0.)))
+            }
         };
         let mut out = v_flex().w_full().pt(px(gap)).relative();
         if let Some((text, color, top)) = who {
@@ -372,35 +495,31 @@ impl AppView {
         out.child(block).into_any_element()
     }
 
-    fn render_summary(&self, d: Disp, end: usize, open: bool, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
+    fn render_summary(&self, d: Disp, open: bool, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
         let id = d.id;
         let Some(s) = self.summaries.get(id) else { return div().into_any_element() };
-        let _ = end;
         let mut tally = h_flex().flex_1().min_w_0().gap(px((14. * m.r).round())).overflow_hidden().whitespace_nowrap();
-        for (name, n, hue) in &s.tally {
+        for t in &s.tally {
             tally = tally.child(
-                h_flex().flex_none().gap(px(m.mono * 0.6)).child(div().text_color(hue.color(p)).child(name.clone())).child(n.to_string()),
+                h_flex()
+                    .flex_none()
+                    .gap(px(m.mono * 0.6))
+                    .child(div().text_color(t.hue.color(p)).child(t.name.clone()))
+                    .child(t.n_text.clone()),
             );
         }
-        let outcome = h_flex()
-            .flex_none()
-            .gap(px(8.))
-            .text_size(px(m.meta))
-            .when(s.added + s.removed > 0, |d| {
-                d.child(div().text_color(p.ok).child(format!("+{}", s.added)))
-                    .child(div().text_color(p.err).child(format!("−{}", s.removed)))
-            })
-            .map(|d| {
-                if s.failed > 0 {
-                    d.child(div().text_color(p.err).child(if self.layout.tight {
-                        format!("× {}", s.failed)
-                    } else {
-                        format!("× {} failed", s.failed)
-                    }))
-                } else {
-                    d.child(div().text_color(p.ok).child("✓"))
-                }
-            });
+        let mut outcome = h_flex().flex_none().gap(px(8.)).text_size(px(m.meta)).children(s.counts.element(p));
+        for (i, (text, tone)) in if self.layout.tight { &s.outcome_tight } else { &s.outcome }.iter().enumerate() {
+            if i > 0 {
+                outcome = outcome.child(div().text_color(p.dim_t).child("·"));
+            }
+            let color = match tone {
+                Tone::Ok => p.ok,
+                Tone::Err => p.err,
+                Tone::Warn => p.warn,
+            };
+            outcome = outcome.child(div().text_color(color).child(text.clone()));
+        }
         h_flex()
             .id(("run", id))
             .w_full()
@@ -416,7 +535,7 @@ impl AppView {
             .cursor_pointer()
             .hover(|d| d.bg(p.tool_out))
             .child(div().w(px(m.mono * 0.6)).flex_none().text_color(p.dim_t).child(if open { "−" } else { "+" }))
-            .child(div().flex_none().child(format!("{} tools", s.tools)))
+            .child(div().flex_none().child(s.label.clone()))
             .child(tally)
             .child(outcome)
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -516,20 +635,17 @@ impl AppView {
     /// prompt waits on: the last one unfinished). Nothing moves.
     fn outcome(&self, item: &Item, row: &RowCache, st: Option<ToolStatus>, p: &Palette, m: &Metrics, lay: Layout) -> AnyElement {
         let word = |w: &'static str| (!lay.tight).then_some(w);
-        let delta = row.preview.as_ref().filter(|pv| pv.added + pv.removed > 0 && st == Some(ToolStatus::Done)).map(|pv| {
-            h_flex()
-                .gap(px(6.))
-                .child(div().text_color(p.ok).child(format!("+{}", pv.added)))
-                .child(div().text_color(p.err).child(format!("−{}", pv.removed)))
-        });
+        // The ledger's committed counts: nothing unless the call succeeded.
+        let delta = row.counts.element(p);
         let (glyph, text, color): (Option<Div>, Option<&'static str>, Hsla) = match st {
             Some(ToolStatus::Done) => (None, Some("✓"), p.ok),
             Some(ToolStatus::Failed) => (None, Some(if lay.tight { "×" } else { "× failed" }), p.err),
             Some(ToolStatus::Denied) => (None, Some(if lay.tight { "×" } else { "× denied" }), p.err),
-            Some(ToolStatus::Cancelled) => (None, word("cancelled"), p.dim_t),
+            // These have no glyph, so a tight pane keeps a short word.
+            Some(ToolStatus::Cancelled) => (None, Some("cancelled"), p.dim_t),
             // The daemon stopped it at its output limit: not ✓, not ×.
-            Some(ToolStatus::Unknown) => (None, word("stopped at limit"), p.dim_t),
-            Some(ToolStatus::Queued) => (None, word("queued"), p.dim_t),
+            Some(ToolStatus::Unknown) => (None, Some(if lay.tight { "stopped" } else { "stopped at limit" }), p.dim_t),
+            Some(ToolStatus::Queued) => (None, Some("queued"), p.dim_t),
             _ if self.waiting_on == Some(item.id) && !self.model.transcript.pending_prompts().is_empty() => {
                 let g = div()
                     .relative()
@@ -606,7 +722,8 @@ mod tests {
     use serde_json::json;
     use synaps_client::transcript::ItemKind;
 
-    use super::{Disp, Gap, Hue, Kind, Layout, Metrics, RowCache, RunSummary, Who, build, diff, turn_start};
+    use super::{Counts, Disp, Gap, Hue, Kind, Layout, Metrics, RowCache, RunSummary, Summaries, Tone, Who, build, diff, turn_start};
+    use crate::files::{CallDelta, Ledger};
     use synaps_client::Transcript;
 
     fn transcript(msgs: &[serde_json::Value]) -> Transcript {
@@ -701,17 +818,132 @@ mod tests {
         assert_eq!(diff(&a[..3], &a), Some((3..3, a.len() - 3)));
     }
 
+    fn rows(t: &Transcript, ledger: &Ledger) -> Vec<RowCache> {
+        t.items().iter().map(|i| crate::app::row_cache(i, ledger)).collect()
+    }
+
+    fn outcome(s: &RunSummary) -> Vec<(&str, Tone)> {
+        s.outcome.iter().map(|(t, tone)| (t.as_ref(), *tone)).collect()
+    }
+
     #[test]
     fn summaries_count_tools_failures_and_names() {
         let mut m = turn(5, "a");
         m[4] = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a1", "content": "boom", "is_error": true}]});
         let t = transcript(&m);
-        let rows: Vec<RowCache> = t.items().iter().map(|i| crate::app::row_cache(i, &crate::files::Ledger::default())).collect();
+        let rows = rows(&t, &Ledger::default());
         let s = RunSummary::of(&t.items()[1..6], &rows[1..6]);
-        assert_eq!(s.tools, 5);
-        assert_eq!(s.failed, 1);
-        assert_eq!(s.tally.iter().map(|t| (t.0.as_ref(), t.1)).collect::<Vec<_>>(), [("bash", 3), ("read", 2)]);
-        assert_eq!(s.tally[0].2, Hue::Bash);
+        assert_eq!((s.tools, s.ok, s.failed), (5, 4, 1));
+        assert_eq!(
+            s.tally.iter().map(|t| (t.name.as_ref(), t.n, t.n_text.as_ref())).collect::<Vec<_>>(),
+            [("bash", 3, "3"), ("read", 2, "2")]
+        );
+        assert_eq!(s.tally[0].hue, Hue::Bash);
+        assert_eq!(s.label.as_ref(), "5 tools");
+        assert_eq!(outcome(&s), [("4 ok", Tone::Ok), ("1 failed", Tone::Err)]);
+    }
+
+    /// `✓` only when every call finished normally; HALT mid-run cancels the
+    /// rest, and a denied call says denied.
+    #[test]
+    fn a_summary_ticks_only_when_every_call_is_done() {
+        let t = transcript(&turn(5, "a"));
+        let s = RunSummary::of(&t.items()[1..6], &rows(&t, &Ledger::default())[1..6]);
+        assert_eq!(outcome(&s), [("✓", Tone::Ok)]);
+
+        // HALT after two calls: the other three end canceled.
+        let mut m = turn(5, "a");
+        m.truncate(1 + 2 * 2);
+        for k in 2..5 {
+            let (call, _) = tool(&format!("a{k}"), "bash");
+            m.push(call);
+            m.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": format!("a{k}"), "content": "Canceled by user"}]}));
+        }
+        let t = transcript(&m);
+        let rows = build(t.items(), 0, false, &HashSet::new());
+        assert_eq!(kinds(&rows), ["user", "fold"], "a halted run folds");
+        let Kind::Summary { end, .. } = rows[1].kind else { unreachable!() };
+        let s = RunSummary::of(&t.items()[1..end], &self::rows(&t, &Ledger::default())[1..end]);
+        assert_eq!((s.ok, s.cancelled), (2, 3));
+        assert_eq!(outcome(&s), [("2 ok", Tone::Ok), ("3 cancelled", Tone::Warn)]);
+        assert_eq!(s.outcome_tight.iter().map(|o| o.0.as_ref()).collect::<Vec<_>>(), ["3 cancelled"]);
+
+        // A denied call, and one stopped at the output limit.
+        let mut m = turn(4, "a");
+        m[2] = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a0",
+            "content": "Tool call blocked by extension: Tool call confirmation denied: no"}]});
+        m[4] = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a1",
+            "content": "line\n[output truncated at 30000 chars]"}]});
+        let t = transcript(&m);
+        let s = RunSummary::of(&t.items()[1..5], &self::rows(&t, &Ledger::default())[1..5]);
+        assert_eq!((s.ok, s.failed, s.denied, s.stopped), (2, 0, 1, 1));
+        assert_eq!(outcome(&s), [("2 ok", Tone::Ok), ("1 denied", Tone::Err), ("1 stopped", Tone::Warn)]);
+        assert_eq!(s.outcome_tight.iter().map(|o| o.0.as_ref()).collect::<Vec<_>>(), ["× 1", "1 stopped"]);
+    }
+
+    /// The transcript's counts are the FILES panel's: in the live shot a
+    /// write showed `+3 −0` and the rows summed to +6 −1 while the panel
+    /// said +3 −1 and `~3`. Now a write is `~3`, a failed edit counts
+    /// nothing, and the summary equals the ledger.
+    #[test]
+    fn counts_come_from_the_ledger() {
+        let call = |id: &str, name: &str, input: serde_json::Value, result: serde_json::Value| {
+            [
+                json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}),
+                json!({"role": "user", "content": [result]}),
+            ]
+        };
+        let ok = |id: &str| json!({"type": "tool_result", "tool_use_id": id, "content": "ok"});
+        let mut m = vec![json!({"role": "user", "content": "go"})];
+        m.extend(call("r", "read", json!({"path": "/w/a.rs"}), ok("r")));
+        m.extend(call("e", "edit", json!({"path": "/w/a.rs", "old_string": "x", "new_string": "a\nb\nc"}), ok("e")));
+        m.extend(call("w", "write", json!({"path": "/w/summary.md", "content": "1\n2\n3"}), ok("w")));
+        m.extend(call(
+            "f",
+            "edit",
+            json!({"path": "/w/b.rs", "old_string": "p\nq", "new_string": "r\ns"}),
+            json!({"type": "tool_result", "tool_use_id": "f", "content": "old_string not found", "is_error": true}),
+        ));
+        m.extend(call("b", "bash", json!({"command": "ls"}), ok("b")));
+        m.push(json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}));
+        let t = transcript(&m);
+        let mut ledger = Ledger::default();
+        ledger.reset(&m, Some("/w"), false);
+        let rows = rows(&t, &ledger);
+        let by = |id: &str| &rows[t.items().iter().position(|i| i.tool.as_ref().is_some_and(|c| c.tool_id == id)).unwrap()];
+        assert_eq!(by("e").counts, Counts { added: Some("+3".into()), removed: Some("−1".into()), written: None });
+        assert_eq!(by("w").counts, Counts { added: None, removed: None, written: Some("~3".into()) });
+        assert_eq!(by("f").counts, Counts::default(), "a failed edit counts nothing");
+        assert_eq!(by("f").preview.as_ref().map(|p| (p.added, p.removed)), Some((2, 2)), "its diff still shows");
+        let s = RunSummary::of(&t.items()[1..6], &rows[1..6]);
+        assert_eq!(s.delta, CallDelta { added: 3, removed: 1, approx: false, written: 3 });
+        assert_eq!((s.delta.added, s.delta.removed), ledger.totals(), "the summary is the panel's");
+        assert_eq!(ledger.files().iter().map(|f| f.written).sum::<u32>(), s.delta.written);
+        assert_eq!(s.counts, Counts { added: Some("+3".into()), removed: Some("−1".into()), written: Some("~3".into()) });
+        assert_eq!(outcome(&s), [("4 ok", Tone::Ok), ("1 failed", Tone::Err)]);
+        // An estimate keeps its `~`.
+        assert_eq!(Counts::of(CallDelta { added: 2, removed: 5, approx: true, written: 0 }).added.as_deref(), Some("~+2"));
+    }
+
+    /// M1: events land between frames, so a click can rebuild against rows
+    /// cached for a shorter transcript. The summary it can't build yet is
+    /// skipped (the next sync builds it), never a panic.
+    #[test]
+    fn a_summary_ahead_of_the_cached_rows_is_skipped() {
+        let first = turn(2, "a");
+        let mut all = first.clone();
+        all.extend(turn(5, "b"));
+        let stale = rows(&transcript(&first), &Ledger::default());
+        let t = transcript(&all);
+        let new = build(t.items(), 0, false, &HashSet::new());
+        let Some(run) = new.iter().find(|d| matches!(d.kind, Kind::Summary { end, .. } if end > stale.len())) else {
+            panic!("the new turn's run folds past the cached rows")
+        };
+        let mut sums = Summaries::default();
+        sums.update(&new, t.items(), &stale);
+        assert!(sums.get(run.id).is_none());
+        sums.update(&new, t.items(), &rows(&t, &Ledger::default()));
+        assert_eq!(sums.get(run.id).map(|s| s.tools), Some(5));
     }
 
     #[test]
@@ -729,7 +961,7 @@ mod tests {
         // padding: the list's item width (what its cache is keyed on) holds.
         for pane in [900., 1100., 1318., 1988.] {
             let l = Layout::of(pane, &m);
-            let (a, b) = l.padding(pane);
+            let (a, b) = l.padding();
             assert_eq!(pane - a - b, 672., "{pane}");
             assert!((a - b).abs() <= 1.);
         }
