@@ -1270,7 +1270,7 @@ async fn session_loop(
                         Command::AnswerOn { .. } => {
                             emit_error(&events, Some(attach_seq), Error::Refused {
                                 command: Some(name.into()),
-                                reason: "the prompt was raised before the session reconnected; not sent".into(),
+                                reason: "the prompt was raised on an earlier connection; not sent".into(),
                             });
                             continue;
                         }

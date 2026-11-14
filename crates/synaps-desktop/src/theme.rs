@@ -517,15 +517,48 @@ impl Panels {
     const RIGHT: &str = "right_collapsed";
 }
 
+/// Which of the panel keys a window changed (and so writes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PanelKeys {
+    pub rail: bool,
+    pub right: bool,
+}
+
+impl PanelKeys {
+    /// The keys that differ between `a` and `b`.
+    pub fn changed(a: Panels, b: Panels) -> Self {
+        PanelKeys { rail: a.rail_collapsed != b.rail_collapsed, right: a.right_collapsed != b.right_collapsed }
+    }
+
+    pub fn is_empty(self) -> bool {
+        !self.rail && !self.right
+    }
+
+    pub fn or(self, o: Self) -> Self {
+        PanelKeys { rail: self.rail || o.rail, right: self.right || o.right }
+    }
+}
+
 pub fn load_panels(path: &Path) -> Panels {
     let v = load_settings(path).unwrap_or_default();
     let flag = |k: &str| v.get(k).and_then(serde_json::Value::as_bool).unwrap_or(false);
     Panels { rail_collapsed: flag(Panels::RAIL), right_collapsed: flag(Panels::RIGHT) }
 }
 
-/// Save both panel states (see [`save_settings`]).
-pub fn save_panels(path: &Path, p: Panels) -> std::io::Result<()> {
-    save_settings(path, &[(Panels::RAIL, p.rail_collapsed.into()), (Panels::RIGHT, p.right_collapsed.into())])
+/// Save the panel states in `keys` only (see [`save_settings`]): another
+/// window's fold of the other panel is left as it wrote it.
+pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<()> {
+    let mut kv = Vec::with_capacity(2);
+    if keys.rail {
+        kv.push((Panels::RAIL, p.rail_collapsed.into()));
+    }
+    if keys.right {
+        kv.push((Panels::RIGHT, p.right_collapsed.into()));
+    }
+    if kv.is_empty() {
+        return Ok(());
+    }
+    save_settings(path, &kv)
 }
 
 /// Set `keys` in the settings file, keeping its other keys. A file that is
@@ -735,17 +768,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(load_panels(&path), Panels::default(), "no file: both open");
         save_accent(&path, 0xf4b400).unwrap();
+        let both = PanelKeys { rail: true, right: true };
         for p in [
             Panels { rail_collapsed: true, right_collapsed: false },
             Panels { rail_collapsed: false, right_collapsed: true },
             Panels { rail_collapsed: true, right_collapsed: true },
             Panels::default(),
         ] {
-            save_panels(&path, p).unwrap();
+            save_panels(&path, p, both).unwrap();
             assert_eq!(load_panels(&path), p);
             assert_eq!(load_accent(&path).as_deref(), Some("#f4b400"), "the accent is kept");
         }
-        save_panels(&path, Panels { rail_collapsed: true, right_collapsed: true }).unwrap();
+        save_panels(&path, Panels { rail_collapsed: true, right_collapsed: true }, both).unwrap();
         save_accent(&path, 0x2d7bff).unwrap();
         assert_eq!(load_panels(&path), Panels { rail_collapsed: true, right_collapsed: true }, "the accent's save keeps them");
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -755,6 +789,24 @@ mod tests {
         assert_eq!(load_panels(&path), Panels::default());
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_panels(&path), Panels::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L4: two windows, each with its own copy of the panels. Each writes
+    /// only the key it changed, so neither undoes the other's fold.
+    #[test]
+    fn two_windows_keep_each_others_folds() {
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-panels2-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (a0, b0) = (Panels::default(), Panels::default());
+        let a = Panels { rail_collapsed: true, ..a0 };
+        save_panels(&path, a, PanelKeys::changed(a0, a)).unwrap();
+        let b = Panels { right_collapsed: true, ..b0 };
+        save_panels(&path, b, PanelKeys::changed(b0, b)).unwrap();
+        assert_eq!(load_panels(&path), Panels { rail_collapsed: true, right_collapsed: true });
+        save_panels(&path, b, PanelKeys::default()).unwrap();
+        assert_eq!(load_panels(&path), Panels { rail_collapsed: true, right_collapsed: true }, "nothing changed: nothing written");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

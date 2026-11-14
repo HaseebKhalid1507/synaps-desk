@@ -86,9 +86,9 @@ pub(crate) fn side_widths(window: f32) -> (f32, f32) {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Side {
     Open(f32),
+    /// Folded, or open but the window is too narrow for it: never hidden,
+    /// its strip is how it opens again.
     Strip,
-    /// The window is too narrow for it, open.
-    Hidden,
 }
 
 impl Side {
@@ -96,7 +96,6 @@ impl Side {
         match self {
             Side::Open(w) => w,
             Side::Strip => STRIP,
-            Side::Hidden => 0.,
         }
     }
 }
@@ -104,18 +103,99 @@ impl Side {
 /// Both side panels at a window width (`mark`: the left mark strip).
 pub(crate) fn sides(window: f32, panels: theme::Panels, mark: f32) -> (Side, Side) {
     let (rail_w, right_w) = side_widths(window);
-    let rail = match () {
-        _ if panels.rail_collapsed => Side::Strip,
-        _ if window >= 760. => Side::Open(rail_w),
-        _ => Side::Hidden,
-    };
-    let right = match () {
-        _ if panels.right_collapsed => Side::Strip,
-        _ if window - mark - rail.width() - right_w >= CENTRE_MIN => Side::Open(right_w),
-        _ => Side::Hidden,
-    };
+    let rail = if !panels.rail_collapsed && window >= 760. { Side::Open(rail_w) } else { Side::Strip };
+    let right =
+        if !panels.right_collapsed && window - mark - rail.width() - right_w >= CENTRE_MIN { Side::Open(right_w) } else { Side::Strip };
     (rail, right)
 }
+
+/// The panels after the user folds or unfolds one (`rail`, else the right
+/// panel) as it is shown at this width: an open one folds; a strip opens,
+/// folding the other if only that makes room. `None`: the window is too
+/// narrow to open it at all. What is saved is what is shown, so a panel
+/// that the window could not fit is saved folded, not "open" and unseen.
+pub(crate) fn toggled(window: f32, panels: theme::Panels, rail: bool) -> Option<theme::Panels> {
+    let open = |p: theme::Panels, rail: bool| {
+        let (r, rt) = sides(window, p, crate::chrome::MARK);
+        matches!(if rail { r } else { rt }, Side::Open(_))
+    };
+    let set = |p: &mut theme::Panels, rail: bool, folded: bool| {
+        if rail {
+            p.rail_collapsed = folded;
+        } else {
+            p.right_collapsed = folded;
+        }
+    };
+    let mut p = panels;
+    if open(p, rail) {
+        set(&mut p, rail, true);
+    } else {
+        set(&mut p, rail, false);
+        if !open(p, rail) {
+            set(&mut p, !rail, true);
+        }
+        if !open(p, rail) {
+            return None;
+        }
+    }
+    Some(theme::Panels { rail_collapsed: !open(p, true), right_collapsed: !open(p, false) })
+}
+
+/// Tells a fold key's press from its auto-repeats. Wayland, Windows and
+/// macOS repeat a held key without a key-up between; X11 (GPUI does not
+/// ask for detectable auto-repeat) sends a key-up right before each repeat,
+/// at the same instant. No hand lets go of a key and presses it again in
+/// [`FoldKeys::PAIR`].
+#[derive(Debug, Default)]
+pub(crate) struct FoldKeys {
+    pressed: Option<Instant>,
+    released: Option<Instant>,
+}
+
+impl FoldKeys {
+    const PAIR: Duration = Duration::from_millis(20);
+    /// A key-up this window never saw (the window lost focus while the key
+    /// was down) stops counting after this long without a repeat: longer
+    /// than the usual first-repeat delays (X11 660 ms, Windows up to 1 s).
+    const STALE: Duration = Duration::from_millis(1100);
+
+    /// A fold key went down at `now`: `true` for a press, `false` for a repeat.
+    pub(crate) fn press(&mut self, now: Instant) -> bool {
+        let repeat = match (self.pressed, self.released) {
+            (None, _) => false,
+            (Some(_), Some(up)) => now.saturating_duration_since(up) < Self::PAIR,
+            (Some(down), None) => now.saturating_duration_since(down) < Self::STALE,
+        };
+        self.pressed = Some(now);
+        self.released = None;
+        !repeat
+    }
+
+    /// The `B` key went up.
+    pub(crate) fn release(&mut self, now: Instant) {
+        if self.pressed.is_some() {
+            self.released = Some(now);
+        }
+    }
+}
+
+/// A fold key the view did not get (the focus is outside it): an app-wide
+/// listener, which GPUI runs when nothing on the focus path handled the
+/// action. It folds, then gives the view the focus back once the dispatch
+/// is over, so the key-up (and the keys after it) reach the view again.
+fn fold_fallback<A: Action>(rail: bool, view: WeakEntity<AppView>, window: AnyWindowHandle, focus: FocusHandle, cx: &mut App) {
+    cx.on_action(move |_: &A, cx| {
+        let _ = view.update(cx, |v, cx| v.fold_key(rail, cx));
+        let focus = focus.clone();
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |_, window, cx| window.focus(&focus, cx));
+        });
+    });
+}
+
+/// A fold is saved this long after the last one, off the UI thread: a
+/// burst of folds is one write.
+const SAVE_DELAY: Duration = Duration::from_millis(400);
 
 /// `inner` in the reading column ([`COLUMN_MAX`], centred).
 pub(crate) fn column(inner: impl IntoElement) -> Div {
@@ -216,6 +296,15 @@ pub struct AppView {
     pub(crate) named_collapsed: bool,
     /// The side panels folded to strips (saved with the accent).
     pub panels: theme::Panels,
+    /// Panel keys changed since the last save began, and keys handed to a
+    /// save that has not finished: both written at once on a clean quit.
+    panels_dirty: theme::PanelKeys,
+    panels_writing: theme::PanelKeys,
+    /// The delayed save ([`SAVE_DELAY`]); a newer fold replaces it.
+    panels_save: Option<Task<()>>,
+    fold_keys: FoldKeys,
+    /// The window's width at the last frame (what a fold acts on).
+    pub(crate) width: f32,
     pub(crate) filter: Filter,
     pub picker_open: bool,
     pub(crate) picker_note: Option<SharedString>,
@@ -285,7 +374,7 @@ impl AppView {
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
         let secret_input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("answer (hidden)"));
-        let subs = vec![
+        let mut subs = vec![
             cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { shift: false, .. } = ev {
                     let text = input.read(cx).value().trim().to_string();
@@ -326,6 +415,21 @@ impl AppView {
         ];
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        // M1: a focused input that leaves the tree (OPEN BY NAME in a folded
+        // rail, a closed name bar, an answered secret prompt) leaves keys to
+        // the window's root, above this view: the focus comes back here once
+        // a frame has drawn without it. Until then the fold keys reach an
+        // app-wide fallback, which also hands the focus back.
+        subs.push(cx.on_focus_lost(window, |this, window, cx| window.focus(&this.focus, cx)));
+        fold_fallback::<ToggleRail>(true, cx.weak_entity(), window.window_handle(), focus.clone(), cx);
+        fold_fallback::<ToggleRight>(false, cx.weak_entity(), window.window_handle(), focus.clone(), cx);
+        // M3: a fold still waiting to be saved is written when the window
+        // closes (the last one quits on Linux and Windows) or the app quits.
+        subs.push(cx.on_release(|this, _| this.flush_panels()));
+        subs.push(cx.on_app_quit(|this, _| {
+            this.flush_panels();
+            async {}
+        }));
         let inputs = Inputs { composer, open_input, name_input, hex_input, secret_input, focus };
         let mut v = match (client, synthetic) {
             (Some((c, rx)), _) => {
@@ -367,6 +471,11 @@ impl AppView {
             open_shown: false,
             named_collapsed: false,
             panels: theme::Panels::default(),
+            panels_dirty: Default::default(),
+            panels_writing: Default::default(),
+            panels_save: None,
+            fold_keys: FoldKeys::default(),
+            width: 0.,
             filter: Filter::All,
             picker_open: false,
             picker_note: None,
@@ -670,22 +779,63 @@ impl AppView {
     }
 
     /// Fold or unfold a side panel (`rail`: the sessions rail, else the
-    /// right panel), at once (nothing animates), and save the state. The
-    /// list re-measures its rows for the new width by itself.
+    /// right panel) as [`toggled`] says, at once (nothing animates); saved
+    /// [`SAVE_DELAY`] later. The list re-measures its rows for the new
+    /// width by itself.
     pub(crate) fn toggle_panel(&mut self, rail: bool, cx: &mut Context<Self>) {
-        let p = &mut self.panels;
-        if rail {
-            p.rail_collapsed = !p.rail_collapsed;
-        } else {
-            p.right_collapsed = !p.right_collapsed;
-        }
-        if self.bench.is_none()
-            && let Some(path) = theme::settings_path()
-            && let Err(e) = theme::save_panels(&path, self.panels)
-        {
-            self.model.last_error = Some(format!("panel layout not saved: {e}"));
+        let Some(p) = toggled(self.width, self.panels, rail) else { return };
+        self.panels_dirty = self.panels_dirty.or(theme::PanelKeys::changed(self.panels, p));
+        self.panels = p;
+        if self.bench.is_none() {
+            self.panels_save = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SAVE_DELAY).await;
+                let _ = this.update(cx, |v, cx| v.save_panels(cx));
+            }));
         }
         cx.notify();
+    }
+
+    /// Ctrl+B / Ctrl+Alt+B (Cmd on macOS): a press folds or unfolds, its
+    /// key repeats do nothing.
+    fn fold_key(&mut self, rail: bool, cx: &mut Context<Self>) {
+        if self.fold_keys.press(Instant::now()) {
+            self.toggle_panel(rail, cx);
+        }
+    }
+
+    /// Write the changed panel keys on the background executor (a read, a
+    /// write, two fsyncs: never on the UI thread).
+    fn save_panels(&mut self, cx: &mut Context<Self>) {
+        let keys = std::mem::take(&mut self.panels_dirty);
+        let Some(path) = theme::settings_path().filter(|_| !keys.is_empty()) else { return };
+        self.panels_writing = self.panels_writing.or(keys);
+        let p = self.panels;
+        cx.spawn(async move |this, cx| {
+            let saved = cx.background_spawn(async move { theme::save_panels(&path, p, keys) }).await;
+            let _ = this.update(cx, |v, cx| {
+                v.panels_writing = theme::PanelKeys::default();
+                if let Err(e) = saved {
+                    v.panels_dirty = v.panels_dirty.or(keys);
+                    v.model.last_error = Some(format!("panel layout not saved: {e}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A save still waiting (or still being written), written now, here:
+    /// the window is closing or the app quitting.
+    fn flush_panels(&mut self) {
+        self.panels_save = None;
+        let keys = std::mem::take(&mut self.panels_dirty).or(std::mem::take(&mut self.panels_writing));
+        if self.bench.is_none()
+            && !keys.is_empty()
+            && let Some(path) = theme::settings_path()
+            && let Err(e) = theme::save_panels(&path, self.panels, keys)
+        {
+            eprintln!("synaps-desktop: panel layout not saved: {e}");
+        }
     }
 
     /// Push transcript changes into the virtual list: only the changed tail
@@ -799,7 +949,8 @@ impl AppView {
         column(body).py(px(1.)).into_any_element()
     }
 
-    /// A tool's status cell: a check, a cross (failed, denied), or, while
+    /// A tool's status cell: a check, a cross (failed, denied), "stopped
+    /// at limit" (exit status unknown), or, while
     /// it runs, a static dot. Nothing animates: a blink would repaint the
     /// whole window per step for the length of every tool run (a 2 Hz step
     /// measured 1.2 % CPU during a running tool against 0.56 % without).
@@ -809,6 +960,8 @@ impl AppView {
             Some(ToolStatus::Failed) => mono("× failed", 10.5, p.hi).into_any_element(),
             Some(ToolStatus::Denied) => mono("× denied", 10.5, p.hi).into_any_element(),
             Some(ToolStatus::Cancelled) => mono("cancelled", 10.5, p.ink4).into_any_element(),
+            // The daemon stopped it at its output limit: not ✓, not ×.
+            Some(ToolStatus::Unknown) => mono("stopped at limit", 10.5, p.ink3).into_any_element(),
             Some(ToolStatus::Queued) => mono("queued", 10.5, p.ink4).into_any_element(),
             _ => {
                 let live = self.model.transcript.busy() && self.model.transcript.pending_prompts().is_empty();
@@ -1304,9 +1457,10 @@ impl Render for AppView {
             b.on_render(&self.list, window);
         }
         let p = theme::palette(cx);
-        // Wide windows widen the side panels; narrow ones drop the open
-        // numbers, then the open rail, before the session.
-        let (rail, right) = sides(window.viewport_size().width.into(), self.panels, crate::chrome::MARK);
+        // Wide windows widen the side panels; narrow ones fold the open
+        // numbers, then the open rail, to strips before the session gives.
+        self.width = window.viewport_size().width.into();
+        let (rail, right) = sides(self.width, self.panels, crate::chrome::MARK);
         let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_row(ix, cx))).size_full();
         let main = v_flex()
             .flex_1()
@@ -1328,8 +1482,13 @@ impl Render for AppView {
                     cx.stop_propagation();
                 }
             }))
-            .on_action(cx.listener(|this, _: &ToggleRail, _, cx| this.toggle_panel(true, cx)))
-            .on_action(cx.listener(|this, _: &ToggleRight, _, cx| this.toggle_panel(false, cx)))
+            .on_action(cx.listener(|this, _: &ToggleRail, _, cx| this.fold_key(true, cx)))
+            .on_action(cx.listener(|this, _: &ToggleRight, _, cx| this.fold_key(false, cx)))
+            .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, _| {
+                if ev.keystroke.key.eq_ignore_ascii_case("b") {
+                    this.fold_keys.release(Instant::now());
+                }
+            }))
             .relative()
             .size_full()
             .bg(p.bg)
@@ -1345,24 +1504,24 @@ impl Render for AppView {
                         .map(|d| match rail {
                             Side::Open(w) => d.child(self.render_rail(w, &p, cx)),
                             Side::Strip => d.child(self.render_rail_strip(&p, cx)),
-                            Side::Hidden => d,
                         })
                         .child(main)
                         .map(|d| match right {
                             Side::Open(w) => d.child(self.render_right(w, &p, cx)),
                             Side::Strip => d.child(self.render_right_strip(&p, cx)),
-                            Side::Hidden => d,
                         }),
                 ),
             )
-            .when(self.picker_open, |d| d.child(deferred(self.render_picker(&p, rail, right, cx)).with_priority(1)))
+            .when(self.picker_open, |d| d.child(deferred(self.render_picker(&p, right, cx)).with_priority(1)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings in gpui's `test` attribute through `gpui_kit::*`.
-    use super::{Side, WELL_LINE, authorize_ready, lines_below, one_line, panel_keys, sides, tracked, well_body};
+    use std::time::{Duration, Instant};
+
+    use super::{FoldKeys, Side, WELL_LINE, authorize_ready, lines_below, one_line, panel_keys, sides, toggled, tracked, well_body};
     use crate::theme::Panels;
 
     /// The fold keys parse on every OS (a bad one panics at start-up).
@@ -1377,19 +1536,72 @@ mod tests {
     }
 
     /// Wide windows widen the panels; folded ones are strips at any width;
-    /// an open right panel gives way before the session gets too narrow.
+    /// an open panel the window cannot fit is a strip too, never hidden.
     #[test]
     fn side_panels_follow_the_window() {
         let open = Panels::default();
         assert_eq!(sides(1280., open, 30.), (Side::Open(276.), Side::Open(296.)));
         assert_eq!(sides(1920., open, 30.), (Side::Open(276.), Side::Open(296.)));
         assert_eq!(sides(2560., open, 30.), (Side::Open(340.), Side::Open(358.)));
-        assert_eq!(sides(1000., open, 30.), (Side::Open(276.), Side::Hidden));
-        assert_eq!(sides(700., open, 30.), (Side::Hidden, Side::Hidden));
+        assert_eq!(sides(1000., open, 30.), (Side::Open(276.), Side::Strip));
+        assert_eq!(sides(700., open, 30.), (Side::Strip, Side::Strip));
         let folded = Panels { rail_collapsed: true, right_collapsed: true };
         assert_eq!(sides(700., folded, 30.), (Side::Strip, Side::Strip));
         // A folded rail leaves room for the open numbers.
         assert_eq!(sides(1000., Panels { rail_collapsed: true, right_collapsed: false }, 30.), (Side::Strip, Side::Open(296.)));
+    }
+
+    /// L1: a click on a strip opens its panel, folding the other one if
+    /// only that makes room; a window too narrow for it changes nothing.
+    /// What is saved is what is shown.
+    #[test]
+    fn a_strip_opens_its_panel_or_says_it_cannot() {
+        let open = Panels::default();
+        let rail_only = Panels { rail_collapsed: false, right_collapsed: true };
+        let right_only = Panels { rail_collapsed: true, right_collapsed: false };
+        let both = Panels { rail_collapsed: true, right_collapsed: true };
+        // Wide: each folds and opens on its own.
+        assert_eq!(toggled(1920., open, true), Some(right_only));
+        assert_eq!(toggled(1920., right_only, true), Some(open));
+        assert_eq!(toggled(1920., open, false), Some(rail_only));
+        // 1000 px, both "open": the right one shows as a strip. Its click
+        // opens it and folds the rail (was: the panel vanished).
+        assert_eq!(toggled(1000., open, false), Some(right_only));
+        assert_eq!(sides(1000., right_only, 30.), (Side::Strip, Side::Open(296.)));
+        // Opening the rail again folds the right panel that no longer fits.
+        assert_eq!(toggled(1000., right_only, true), Some(rail_only));
+        // 700 px: neither fits; a click on either strip changes nothing.
+        assert_eq!(toggled(700., both, true), None);
+        assert_eq!(toggled(700., both, false), None);
+        assert_eq!(toggled(700., open, true), None);
+        // Shown as strips anyway, so folding one is a no-op that saves it folded.
+        assert_eq!(sides(700., open, 30.), sides(700., both, 30.));
+    }
+
+    /// M3: a held fold key toggles once. Wayland/Windows/macOS repeat with
+    /// no key-up; X11 sends a key-up right before each repeat.
+    #[test]
+    fn fold_key_repeats_are_ignored() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut k = FoldKeys::default();
+        assert!(k.press(ms(0)), "a press");
+        // Held (no key-up): the repeats after the delay, then every 33 ms.
+        assert!(!k.press(ms(500)));
+        assert!(!k.press(ms(533)));
+        k.release(ms(600));
+        assert!(k.press(ms(700)), "let go, pressed again");
+        // X11: a key-up and its repeat at the same instant.
+        k.release(ms(1200));
+        assert!(!k.press(ms(1200)));
+        k.release(ms(1233));
+        assert!(!k.press(ms(1234)));
+        // A real release, then a quick second press (a double tap).
+        k.release(ms(1300));
+        assert!(k.press(ms(1380)));
+        // A key-up this window never saw: a press long after is a press.
+        assert!(!k.press(ms(2000)), "within the first-repeat delay");
+        assert!(k.press(ms(3200)));
     }
 
     /// H3: the card shows a long prompt whole, and AUTHORIZE waits until

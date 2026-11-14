@@ -427,6 +427,8 @@ impl AppView {
     pub(crate) fn render_rail_strip(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let n = self.model.attention().count();
         let on = n > 0;
+        // L1: a window too narrow for the rail keeps its strip and says so.
+        let fits = crate::app::toggled(self.width, self.panels, true).is_some();
         v_flex()
             .id("rail-strip")
             .w(px(STRIP))
@@ -449,7 +451,11 @@ impl AppView {
                     .child(display(n.to_string(), 13., if on { p.hi } else { p.ink4 })),
             )
             .tooltip(move |window, cx| {
-                let tip = if on { format!("{n} need you · show sessions") } else { "Show sessions".to_string() };
+                let tip = match (on, fits) {
+                    (_, false) => format!("{n} need you · widen the window to show sessions"),
+                    (true, true) => format!("{n} need you · show sessions"),
+                    (false, true) => "Show sessions".to_string(),
+                };
                 Tooltip::new(tip).action(&ToggleRail, None).build(window, cx)
             })
             .on_click(cx.listener(|this, _, _, cx| this.toggle_panel(true, cx)))
@@ -466,6 +472,9 @@ impl AppView {
             gauge = gauge.child(div().w_full().h(px(4.)).bg(if i < filled { if hot { p.hi } else { p.accent } } else { p.seg }));
         }
         let pct: SharedString = ratio.map(|r| format!("{:.0}", r * 100.0)).unwrap_or_else(|| "—".into()).into();
+        let fits = crate::app::toggled(self.width, self.panels, false).is_some();
+        // L2: detached, the last numbers seen are dimmed, as the open panel's are.
+        let detached = self.model.stats.detached && self.model.active.is_none();
         v_flex()
             .id("right-strip")
             .w(px(STRIP))
@@ -479,9 +488,22 @@ impl AppView {
             .cursor_pointer()
             .hover(|d| d.bg(p.bg1))
             .child(mono("‹", 12., p.ink3))
-            .child(v_flex().items_center().child(display(pct, 13., if hot { p.hi } else { p.ink2 })).child(mono("%", 9., p.ink4)))
-            .child(gauge)
-            .tooltip(|window, cx| Tooltip::new("Show context, tokens and files").action(&ToggleRight, None).build(window, cx))
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap(px(14.))
+                    .when(detached, |d| d.opacity(0.45))
+                    .child(v_flex().items_center().child(display(pct, 13., if hot { p.hi } else { p.ink2 })).child(mono("%", 9., p.ink4)))
+                    .child(gauge),
+            )
+            .tooltip(move |window, cx| {
+                let tip = match (detached, fits) {
+                    (_, false) => "Widen the window to show context, tokens and files",
+                    (true, true) => "Detached: last numbers seen · show context, tokens and files",
+                    (false, true) => "Show context, tokens and files",
+                };
+                Tooltip::new(tip).action(&ToggleRight, None).build(window, cx)
+            })
             .on_click(cx.listener(|this, _, _, cx| this.toggle_panel(false, cx)))
     }
 
@@ -742,7 +764,6 @@ impl AppView {
             .child(mono("as the model asked: tool inputs, not the disk", 9.5, p.ink4).mt(px(6.)))
             .child(div().h(px(12.)));
         for f in ledger.files().iter().take(FILES_SHOWN) {
-            let (dir, name) = f.split();
             files = files.child(
                 h_flex()
                     .h(px(27.))
@@ -754,8 +775,8 @@ impl AppView {
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
-                            .child(mono(dir.to_string(), 11., p.ink4).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
-                            .child(mono(name.to_string(), 11., p.ink).flex_none()),
+                            .child(mono(f.dir.clone(), 11., p.ink4).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
+                            .child(mono(f.name.clone(), 11., p.ink).flex_none()),
                     )
                     // A write is the lines written, not a delta (`~`).
                     .when(f.written > 0, |d| d.child(mono(format!("~{}", f.written), 10.5, p.ink3).flex_none()))
@@ -788,7 +809,6 @@ impl AppView {
                 .child(mono("bash commands that succeeded; no counts", 9.5, p.ink4).mt(px(6.)))
                 .child(div().h(px(8.)));
             for f in shell.iter().take(FILES_SHOWN) {
-                let (dir, name) = f.split();
                 files = files.child(
                     h_flex()
                         .h(px(25.))
@@ -800,8 +820,8 @@ impl AppView {
                                 .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
-                                .child(mono(dir.to_string(), 11., p.ink4).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
-                                .child(mono(name.to_string(), 11., p.ink2).flex_none()),
+                                .child(mono(f.dir.clone(), 11., p.ink4).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
+                                .child(mono(f.name.clone(), 11., p.ink2).flex_none()),
                         )
                         .child(mono(f.verb, 10., p.ink3).flex_none()),
                 );
@@ -836,10 +856,10 @@ impl AppView {
     }
 
     /// The accent picker: over the open right-hand column (clear of the
-    /// header's NAME and HALT), else over the open rail, else above the
-    /// composer.
+    /// header's NAME and HALT), else above the composer at the right, under
+    /// its ACCENT button either way.
     /// Esc (the root's key handler) or a click outside closes it.
-    pub(crate) fn render_picker(&self, p: &Palette, rail: Side, right: Side, cx: &Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_picker(&self, p: &Palette, right: Side, cx: &Context<Self>) -> impl IntoElement {
         let accent = cx.global::<theme::Accent>();
         let current = accent.hex;
         let d = accent.derived;
@@ -874,10 +894,9 @@ impl AppView {
         v_flex()
             .id("picker")
             .absolute()
-            .map(|d| match (right, rail) {
-                (Side::Open(w), _) => d.top(px(52.)).right_0().w(px(w)),
-                (_, Side::Open(w)) => d.top(px(52.)).left(px(MARK)).w(px(w)),
-                _ => d.bottom(px(140.)).right(px(right.width() + 24.)).w(px(296.)),
+            .map(|d| match right {
+                Side::Open(w) => d.top(px(52.)).right_0().w(px(w)),
+                Side::Strip => d.bottom(px(140.)).right(px(right.width() + 24.)).w(px(296.)),
             })
             .p(px(20.))
             .bg(p.bg1)

@@ -89,6 +89,10 @@ impl FileKind {
 pub struct FileStat {
     /// As the tool got it, relative to the session's folder when under it.
     pub path: String,
+    /// `path`'s folder (`crates/relay/src/`, or empty) and file name,
+    /// shared: a frame draws them without a copy.
+    pub dir: Arc<str>,
+    pub name: Arc<str>,
     /// How it was first touched.
     pub kind: FileKind,
     /// Lines the edits added and removed (not the writes).
@@ -106,28 +110,20 @@ pub struct FileStat {
 pub struct ShellFile {
     /// Relative to the session's folder when under it.
     pub path: String,
+    /// As [`FileStat::dir`] and [`FileStat::name`].
+    pub dir: Arc<str>,
+    pub name: Arc<str>,
     /// The last way a command touched it ([`Touch::verb`]).
     pub verb: &'static str,
 }
 
-impl ShellFile {
-    pub fn split(&self) -> (&str, &str) {
-        split_path(&self.path)
-    }
-}
-
-fn split_path(path: &str) -> (&str, &str) {
-    match path.rfind(['/', '\\']) {
+/// `("crates/relay/src/", "session.rs")`.
+fn split_path(path: &str) -> (Arc<str>, Arc<str>) {
+    let (dir, name) = match path.rfind(['/', '\\']) {
         Some(i) => path.split_at(i + 1),
         None => ("", path),
-    }
-}
-
-impl FileStat {
-    /// `("crates/relay/src/", "session.rs")`.
-    pub fn split(&self) -> (&str, &str) {
-        split_path(&self.path)
-    }
+    };
+    (dir.into(), name.into())
 }
 
 /// One file a tool call changes.
@@ -161,8 +157,10 @@ pub struct Ledger {
     /// same session (a resync, a reconnect), so its history is not diffed
     /// again.
     calls: HashMap<String, Arc<Analysed>>,
-    /// `bash` calls that write files, by tool id (kept as `calls` is).
-    shell_calls: HashMap<String, Arc<Vec<Touch>>>,
+    /// Every `bash` call seen, by tool id (kept as `calls` is): the files
+    /// it writes, `None` when it writes none (or cannot be read), so its
+    /// command is lexed once, not again at every reset.
+    shell_calls: HashMap<String, Option<Arc<Vec<Touch>>>>,
     shell: Vec<ShellFile>,
     shell_index: HashMap<String, usize>,
     cwd: Option<String>,
@@ -209,7 +207,7 @@ impl Ledger {
                         if !self.pending.remove(id) || tool_result_outcome(b) != ToolOutcome::Ok {
                             continue;
                         }
-                        if let Some(touches) = self.shell_calls.get(id).cloned() {
+                        if let Some(Some(touches)) = self.shell_calls.get(id).cloned() {
                             for t in touches.iter() {
                                 self.commit_shell(t);
                             }
@@ -239,14 +237,13 @@ impl Ledger {
     pub fn tool_use(&mut self, name: &str, id: &str, input: &Value) {
         if name == "bash" && !id.is_empty() {
             if !self.shell_calls.contains_key(id) {
-                let touches = shell::writes(str_of(input, "command")).unwrap_or_default();
-                if touches.is_empty() {
-                    return;
-                }
-                let touches = touches.into_iter().map(|t| Touch { path: self.relative(&t.path), ..t }).collect();
-                self.shell_calls.insert(id.to_string(), Arc::new(touches));
+                let touches = shell::writes(str_of(input, "command")).filter(|t| !t.is_empty());
+                let touches = touches.map(|t| Arc::new(t.into_iter().map(|t| Touch { path: self.relative(&t.path), ..t }).collect()));
+                self.shell_calls.insert(id.to_string(), touches);
             }
-            self.pending.insert(id.to_string());
+            if matches!(self.shell_calls.get(id), Some(Some(_))) {
+                self.pending.insert(id.to_string());
+            }
             return;
         }
         if !is_file_tool(name) || id.is_empty() {
@@ -281,7 +278,17 @@ impl Ledger {
             Some(&i) => i,
             None => {
                 self.index.insert(c.path.clone(), self.files.len());
-                self.files.push(FileStat { path: c.path.clone(), kind: c.kind, added: 0, removed: 0, written: 0, approx: false });
+                let (dir, name) = split_path(&c.path);
+                self.files.push(FileStat {
+                    path: c.path.clone(),
+                    dir,
+                    name,
+                    kind: c.kind,
+                    added: 0,
+                    removed: 0,
+                    written: 0,
+                    approx: false,
+                });
                 self.files.len() - 1
             }
         };
@@ -304,7 +311,8 @@ impl Ledger {
             Some(&i) => self.shell[i].verb = t.verb,
             None => {
                 self.shell_index.insert(t.path.clone(), self.shell.len());
-                self.shell.push(ShellFile { path: t.path.clone(), verb: t.verb });
+                let (dir, name) = split_path(&t.path);
+                self.shell.push(ShellFile { path: t.path.clone(), dir, name, verb: t.verb });
             }
         }
     }
@@ -608,7 +616,16 @@ mod tests {
         l.reset(&msgs, Some("/w/r/"), false);
         assert_eq!(
             l.files(),
-            &[FileStat { path: "src/a.rs".into(), kind: FileKind::Modified, added: 2, removed: 1, written: 0, approx: false }]
+            &[FileStat {
+                path: "src/a.rs".into(),
+                dir: "src/".into(),
+                name: "a.rs".into(),
+                kind: FileKind::Modified,
+                added: 2,
+                removed: 1,
+                written: 0,
+                approx: false
+            }]
         );
         assert_eq!(l.totals(), (2, 1));
         assert!(l.preview("t2").is_some(), "a failed write still shows what it tried");
@@ -618,7 +635,7 @@ mod tests {
         l.append(&[result("t4", OK)]);
         assert_eq!(l.files()[0].added, 3);
         assert_eq!(l.files()[0].removed, 2);
-        assert_eq!(l.files()[0].split(), ("src/", "a.rs"));
+        assert_eq!((&*l.files()[0].dir, &*l.files()[0].name), ("src/", "a.rs"));
         // The live event, then its history copy: counted once.
         l.tool_use("write", "t5", &json!({"path": "/elsewhere/x.txt", "content": "1\n2\n3"}));
         assert!(l.preview("t5").is_some(), "the live event shows its diff before the history has it");
@@ -626,7 +643,16 @@ mod tests {
         l.append(&[tool_use("t5", "write", json!({"path": "/elsewhere/x.txt", "content": "1\n2\n3"})), result("t5", OK)]);
         assert_eq!(
             l.files()[1],
-            FileStat { path: "/elsewhere/x.txt".into(), kind: FileKind::Written, added: 0, removed: 0, written: 3, approx: false }
+            FileStat {
+                path: "/elsewhere/x.txt".into(),
+                dir: "/elsewhere/".into(),
+                name: "x.txt".into(),
+                kind: FileKind::Written,
+                added: 0,
+                removed: 0,
+                written: 3,
+                approx: false
+            }
         );
         // A write is not a delta: not in the totals.
         assert_eq!(l.totals(), (3, 2));
@@ -819,11 +845,30 @@ mod tests {
             result("b4", OK),
             bash("b5", "mv src/a.rs src/b.rs"),
             result("b5", "Canceled by user"),
+            // M2: stopped at the daemon's output limit (`tools/bash.rs`
+            // `output_limit_notice`): a success result, exit status unknown.
+            bash("b7", "cargo build -vv 2>&1; sed -i 's/x/y/' Cargo.toml && rm old.rs"),
+            result(
+                "b7",
+                "Compiling…\n\n[output truncated at 30000 bytes: the command was stopped at this limit before it finished, so its exit status is unknown. Redirect large output to a file (e.g. cmd > out.log 2>&1) and read only the parts you need.]",
+            ),
+            // The same as default history carries it: virtualised (head,
+            // gap, tail, note), the notice ending the tail.
+            bash("b8", "yes | head -c 400000; touch done.flag"),
+            result(
+                "b8",
+                "y\n[... lines 2-131070 omitted ...]\ny\n\n[output truncated at 262144 bytes: the command was stopped at this limit before it finished, so its exit status is unknown. Redirect large output to a file (e.g. cmd > out.log 2>&1) and read only the parts you need.]\n\n[Output virtualised: 262356 bytes, 131074 lines; lines 2-131070 are omitted above. Full output: /s/toolu_8.txt (read it with offset=1 limit=131069, or grep it).]",
+            ),
         ];
         let mut l = Ledger::default();
         l.reset(&msgs, Some("/w/r"), false);
         let got: Vec<(&str, &str)> = l.shell().iter().map(|f| (f.path.as_str(), f.verb)).collect();
         assert_eq!(got, [("src/a.rs", "sed -i"), ("old.txt", "rm"), ("/tmp/t.log", ">")]);
+        // L5: a command that writes nothing (or cannot be read) is lexed
+        // once and remembered as such, never waited on.
+        assert!(matches!(l.shell_calls.get("b3"), Some(Some(_))));
+        assert!(matches!(l.shell_calls.get("b4"), Some(None)));
+        assert!(!l.pending.contains("b4"));
         assert!(l.files().is_empty());
         assert_eq!(l.totals(), (0, 0));
         assert!(l.preview("b2").is_none(), "no diff for a shell call");
@@ -832,7 +877,7 @@ mod tests {
         l.append(&[bash("b6", "rm src/a.rs"), result("b6", OK)]);
         assert_eq!(l.shell().len(), 3);
         assert_eq!((l.shell()[0].path.as_str(), l.shell()[0].verb), ("src/a.rs", "rm"));
-        assert_eq!(l.shell()[0].split(), ("src/", "a.rs"));
+        assert_eq!((&*l.shell()[0].dir, &*l.shell()[0].name), ("src/", "a.rs"));
     }
 
     #[test]
