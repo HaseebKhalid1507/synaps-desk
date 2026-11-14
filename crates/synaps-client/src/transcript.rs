@@ -395,7 +395,7 @@ impl Transcript {
         if self.before.is_empty() {
             return;
         }
-        let before: HashMap<u64, Item> = self.before.drain(..).map(|i| (i.id, i)).collect();
+        let before: HashMap<u64, Item> = std::mem::take(&mut self.before).into_iter().map(|i| (i.id, i)).collect();
         for it in self.items.iter_mut().filter(|i| i.anchor.is_none()) {
             if let Some(o) = before.get(&it.id)
                 && o.kind == it.kind

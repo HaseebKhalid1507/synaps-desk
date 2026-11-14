@@ -655,6 +655,11 @@ impl AppView {
                     .child(div().absolute().top(px(3.)).left(px(3.)).size(px(4.)).bg(p.warn_mark));
                 (Some(g), word("waiting"), p.warn)
             }
+            // Not attached (a cached tab opening, a detached session): what
+            // was last seen, not a live run.
+            _ if self.model.active.is_none() => {
+                (Some(div().size(px(8.)).m(px(1.)).flex_none().border_1().border_color(p.dim_t)), word("last seen running"), p.dim_t)
+            }
             _ => (Some(div().size(px(8.)).m(px(1.)).flex_none().bg(p.run_mark)), word("running"), p.run),
         };
         h_flex()

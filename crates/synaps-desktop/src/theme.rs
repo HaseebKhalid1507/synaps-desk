@@ -1019,14 +1019,18 @@ pub fn save_settings(path: &Path, keys: &[(&str, serde_json::Value)]) -> std::io
 }
 
 /// The open tabs saved under `key` (the daemon they are of): `tabs.<key>`
-/// in the settings file, `{"sessions": [ids], "active": n}`. Missing or
-/// malformed: none.
+/// in the settings file, `{"sessions": [ids], "journals": [ids], "active":
+/// n}` (`journals` may be missing). Missing or malformed: none.
 pub fn load_tabs(path: &Path, key: &str) -> Option<crate::tabs::Saved> {
     let v = load_settings(path)?;
     let t = v.get("tabs")?.get(key)?;
-    let sessions: Vec<String> = t.get("sessions")?.as_array()?.iter().filter_map(|s| s.as_str()).map(str::to_string).collect();
+    let strings =
+        |k: &str| -> Option<Vec<String>> { Some(t.get(k)?.as_array()?.iter().filter_map(|s| s.as_str()).map(str::to_string).collect()) };
+    let sessions = strings("sessions")?;
+    let journals = strings("journals").filter(|j| j.len() == sessions.len()).unwrap_or_default();
+    let labels = strings("labels").filter(|l| l.len() == sessions.len()).unwrap_or_default();
     let active = t.get("active").and_then(serde_json::Value::as_u64).map(|a| a as usize).filter(|&a| a < sessions.len());
-    Some(crate::tabs::Saved { sessions, active })
+    Some(crate::tabs::Saved { sessions, journals, labels, active })
 }
 
 /// Save the open tabs under `key`, keeping every other daemon's (see
@@ -1036,7 +1040,8 @@ pub fn save_tabs(path: &Path, key: &str, saved: &crate::tabs::Saved) -> std::io:
         if !v.get("tabs").is_some_and(serde_json::Value::is_object) {
             v["tabs"] = serde_json::json!({});
         }
-        v["tabs"][key] = serde_json::json!({"sessions": saved.sessions, "active": saved.active});
+        v["tabs"][key] =
+            serde_json::json!({"sessions": saved.sessions, "journals": saved.journals, "labels": saved.labels, "active": saved.active});
     })
 }
 
@@ -1399,8 +1404,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, r##"{"accent": "#2d7bff", "tabs": 3}"##).unwrap();
         assert_eq!(load_tabs(&path, "socket:/a"), None, "not an object: none");
-        let a = Saved { sessions: vec!["s1".into(), "s2".into()], active: Some(1) };
-        let b = Saved { sessions: vec!["t1".into()], active: Some(0) };
+        let a = Saved {
+            sessions: vec!["s1".into(), "s2".into()],
+            journals: vec!["".into(), "j2".into()],
+            labels: vec!["Fix the relay".into(), "".into()],
+            active: Some(1),
+        };
+        let b = Saved { sessions: vec!["t1".into()], active: Some(0), ..Saved::default() };
         save_tabs(&path, "socket:/a", &a).unwrap();
         save_tabs(&path, "socket:/b", &b).unwrap();
         assert_eq!(load_tabs(&path, "socket:/a"), Some(a));
@@ -1409,7 +1419,10 @@ mod tests {
         assert_eq!(load_accent(&path).as_deref(), Some("#2d7bff"), "other keys kept");
         // An active index past the list, or not a number: none visible.
         std::fs::write(&path, r#"{"tabs": {"k": {"sessions": ["x", 7], "active": 4}}}"#).unwrap();
-        assert_eq!(load_tabs(&path, "k"), Some(Saved { sessions: vec!["x".into()], active: None }));
+        assert_eq!(load_tabs(&path, "k"), Some(Saved { sessions: vec!["x".into()], ..Saved::default() }));
+        // An older file (no journals), or journals that do not line up: none.
+        std::fs::write(&path, r#"{"tabs": {"k": {"sessions": ["x", "y"], "journals": ["j"], "active": 1}}}"#).unwrap();
+        assert_eq!(load_tabs(&path, "k"), Some(Saved { sessions: vec!["x".into(), "y".into()], active: Some(1), ..Saved::default() }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

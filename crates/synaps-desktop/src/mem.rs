@@ -83,6 +83,27 @@ pub fn sample() -> Value {
     }
 }
 
+/// The process's RSS once the allocator has handed its free pages back
+/// (glibc's `malloc_trim`): what is live, without what freed memory the
+/// allocator keeps for later (bench only; `null` elsewhere).
+pub fn trimmed_rss_kb() -> Value {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: glibc's malloc_trim takes no pointers and is thread-safe.
+        unsafe {
+            malloc_trim(0);
+        }
+        sample()["rss_kb"].clone()
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        Value::Null
+    }
+}
+
 /// Seconds between the kernel starting this process and now (10 ms
 /// resolution: clock ticks), Linux only.
 pub fn process_age_ms() -> Option<f64> {
