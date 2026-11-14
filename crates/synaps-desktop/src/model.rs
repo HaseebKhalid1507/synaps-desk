@@ -309,8 +309,6 @@ pub struct Model {
     pub view_dirty: bool,
 }
 
-/// The order OPEN shows: newest conversation first (`created_at`), then by
-/// id. The daemon sends its list in hash-map order.
 /// An empty transcript as the window keeps it: no notices for subagent
 /// starts and ends (each worker shows under its call, [`crate::subagents`]).
 pub fn transcript() -> Transcript {
@@ -319,6 +317,8 @@ pub fn transcript() -> Transcript {
     t
 }
 
+/// The order OPEN shows: newest conversation first (`created_at`), then by
+/// id. The daemon sends its list in hash-map order.
 pub fn sort_sessions(s: &mut [SessionMeta]) {
     s.sort_by_cached_key(|m| (Reverse(parse_rfc3339(&m.created_at).unwrap_or(i64::MIN)), Reverse(m.id.clone())));
 }
@@ -468,6 +468,8 @@ impl Model {
             State::NeedsYou
         } else if busy {
             State::Running
+        } else if self.workers(s) > 0 {
+            State::Workers
         } else if s.locked_by.is_some() {
             State::Locked
         } else if self.is_unread(s) {
@@ -476,6 +478,26 @@ impl Model {
             State::Parked
         } else {
             State::Idle
+        }
+    }
+
+    /// A held session's background workers running. The attached one's
+    /// from its own transcript once a live source (an event, a row) has
+    /// spoken of its workers since the attach: it runs ahead of the poll
+    /// and needs no daemon support. Before that, and for the others, the
+    /// listing's `subagents_running` (0 from a daemon that does not send
+    /// it).
+    pub fn workers(&self, s: &SessionMeta) -> usize {
+        let own = &self.stats.subagents;
+        if self.is_active(&s.id) && own.heard() { own.running_count() } else { s.subagents_running }
+    }
+
+    /// The attached session's workers running ([`Model::workers`]; not
+    /// listed yet, a create: its transcript's).
+    pub fn active_workers(&self) -> usize {
+        match self.active_meta() {
+            Some(s) => self.workers(s),
+            None => self.stats.subagents.running_count(),
         }
     }
 
@@ -1448,6 +1470,56 @@ mod tests {
         m.apply(Event::Sessions(busy));
         assert!(m.rail_gen > generation && m.view_dirty);
         assert_eq!(m.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["b", "a"], "a state change moves nothing");
+    }
+
+    /// A session whose workers run on after its turn is WORKERS, never
+    /// IDLE: from the listing's `subagents_running` (SynapsCLI #410; an
+    /// older daemon omits it, so 0), and the attached one from its own
+    /// transcript once a live source has spoken of its workers (no daemon
+    /// support needed, and it runs ahead of the poll).
+    #[test]
+    fn workers_running_on_are_not_idle() {
+        use crate::rail::Chip;
+        let ev = |v: Value| session(1, synaps_client::protocol::decode_event(&v).unwrap());
+        let mut m = Model::new(ConnState::Connecting);
+        let list = |s_workers: usize| {
+            Event::Sessions(metas(json!([
+                {"id": "s", "lifecycle": "live", "busy": false, "subagents_running": s_workers},
+                {"id": "w", "lifecycle": "live", "busy": false, "subagents_running": 2},
+                {"id": "b", "lifecycle": "live", "busy": true, "subagents_running": 1},
+                {"id": "o", "lifecycle": "live", "busy": false}
+            ])))
+        };
+        let st = |m: &Model, id: &str| m.state(m.sessions.iter().find(|s| s.id == id).unwrap());
+        let all = |m: &Model| ["s", "w", "b", "o"].map(|id| st(m, id));
+        m.apply(list(0));
+        assert_eq!(all(&m), [State::Idle, State::Workers, State::Running, State::Idle], "an older daemon's \"o\": idle");
+        let meta = |m: &Model, id: &str| m.sessions.iter().find(|s| s.id == id).unwrap().clone();
+        assert_eq!(m.workers(&meta(&m, "w")), 2);
+        assert!(Chip::Running.admits(State::Workers) && !Chip::Unread.admits(State::Workers));
+        // Attached to "s", from a daemon that lists no workers: its own.
+        attach(&mut m, 1);
+        let use_ = json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start", "tool_id": "t1",
+            "input": {"agent": "scout", "task": "look"}}});
+        let res = json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": "t1",
+            "result": json!({"handle_id": "sa_1", "agent_name": "scout", "status": "running"}).to_string()}});
+        let row = |status: &str| {
+            json!({"ev": "subagent_rows", "rows": [{"subagent_id": 1, "agent_name": "scout", "status": status,
+            "cancel_requested": false, "elapsed_secs": 3.0, "finished_elapsed": null, "step": "ls", "tools": 1}]})
+        };
+        m.apply(ev(use_));
+        m.apply(ev(res));
+        m.apply(ev(row("running")));
+        assert_eq!((st(&m, "s"), m.workers(&meta(&m, "s"))), (State::Workers, 1));
+        // It ends: idle at once, whatever the last poll said.
+        m.apply(list(1));
+        m.apply(ev(row("completed")));
+        assert_eq!(st(&m, "s"), State::Idle);
+        // A re-attach, nothing live heard yet: the listing's count.
+        attach(&mut m, 2);
+        assert_eq!(st(&m, "s"), State::Workers);
+        m.apply(list(0));
+        assert_eq!(st(&m, "s"), State::Idle);
     }
 
     /// UNREAD is the client's: the poll saw a turn end, or messages rise,

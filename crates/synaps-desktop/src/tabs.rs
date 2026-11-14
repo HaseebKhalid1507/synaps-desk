@@ -109,6 +109,9 @@ pub struct Tabs {
     /// an ended session, a daemon restart), oldest first: input given back
     /// to the old id goes to that tab.
     follows: Vec<(String, String)>,
+    /// The visible tab went into the one already holding its session
+    /// ([`Tabs::attached`]): (its id, that tab's id), for the composer.
+    merged: Option<(u64, u64)>,
 }
 
 impl Tabs {
@@ -150,14 +153,27 @@ impl Tabs {
         self.is_open(session) || self.closed.iter().any(|(_, t)| t.session.as_deref() == Some(session))
     }
 
-    /// The id a tab followed `session` to, if no tab holds `session` any
-    /// more and one holds that id.
+    /// The id a tab followed `session` to (along a chain, S → S2 → S3),
+    /// if no tab holds `session` any more and one holds that id.
     pub fn followed(&self, session: &str) -> Option<&str> {
         if self.knows(session) {
             return None;
         }
-        let (_, to) = self.follows.iter().rev().find(|(from, _)| from == session)?;
-        self.knows(to).then_some(to.as_str())
+        let mut at = session;
+        // Bounded: each step is one entry of `follows`.
+        for _ in 0..self.follows.len() {
+            let (_, to) = self.follows.iter().rev().find(|(from, _)| from == at)?;
+            if self.knows(to) {
+                return Some(to.as_str());
+            }
+            at = to;
+        }
+        None
+    }
+
+    /// The last merge of the visible tab into another ([`Tabs::attached`]).
+    pub fn take_merged(&mut self) -> Option<(u64, u64)> {
+        self.merged.take()
     }
 
     /// Tab `ix` follows its session to `to` (same conversation, new id).
@@ -193,9 +209,9 @@ impl Tabs {
 
     fn push_closed(&mut self, ix: usize, t: Tab) {
         self.closed.push((ix, t));
-        if self.closed.len() > CLOSED_MAX {
-            self.closed.remove(0);
-        }
+        // Back to the bound (a settle may have gone past it).
+        let over = self.closed.len().saturating_sub(CLOSED_MAX);
+        self.closed.drain(..over);
     }
 
     /// The visible tab `i` is given another session: the one it held goes
@@ -225,14 +241,20 @@ impl Tabs {
             return;
         }
         let early = self.restore_lists < RESTORE_LISTS;
+        let mut n = 0;
         for id in std::mem::take(&mut self.restoring) {
             if let Some(ix) = self.tabs.iter().position(|t| t.id == id) {
                 let t = self.remove(ix);
-                self.push_closed(ix, t);
+                self.closed.push((ix, t));
+                n += 1;
                 self.dropped += 1;
                 self.dropped_early |= early;
             }
         }
+        // Every one of them can come back, more than the usual bound if
+        // need be (the next close trims the stack back to it).
+        let over = self.closed.len().saturating_sub(CLOSED_MAX.max(n));
+        self.closed.drain(..over);
         self.changed();
     }
 
@@ -375,6 +397,7 @@ impl Tabs {
             Some(i) if self.tabs[i].session.as_deref() == Some(session) => {}
             Some(i) => {
                 if let Some(j) = self.find(session) {
+                    self.merged = Some((self.tabs[i].id, self.tabs[j].id));
                     self.tabs.remove(i);
                     self.active = Some(if j > i { j - 1 } else { j });
                 } else {
@@ -492,6 +515,10 @@ impl Tabs {
     }
 }
 
+/// What a tab's draft says when it is shown again with input the daemon
+/// gave back (refused, or the attachment ended) in the frame it was left.
+pub const REFUSED_NOTE: &str = "not sent: given back as you left this tab; check the transcript before sending it again";
+
 /// A tab's composer draft: its text, the caret (a byte offset) and what
 /// to tell when it is shown again.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -519,9 +546,11 @@ impl Drafts {
     /// One frame's composer work, in this order. Input given back for the
     /// composer's `owner` (refused, or sent before its tab was left and it
     /// is shown again) goes in first, ahead of what it holds; then, if the
-    /// visible tab is not the owner, the composer (with `note`) becomes the
-    /// owner's draft and the visible tab's comes out ([`Drafts::switch`]).
-    /// So input given back in the frame of a switch stays with its tab.
+    /// visible tab is not the owner, the composer (with `note`, else
+    /// [`REFUSED_NOTE`] when input was given back) becomes the owner's
+    /// draft and the visible tab's comes out ([`Drafts::switch`]). So
+    /// input given back in the frame of a switch stays with its tab, and
+    /// says so there.
     /// The composer's new text and caret (`None`: at the end), if it changes.
     pub fn frame(
         &mut self,
@@ -543,11 +572,11 @@ impl Drafts {
         let mut cursor = None;
         if !owned {
             let prev = std::mem::replace(owner, visible.map(|(i, s)| (i, s.map(str::to_string))));
-            let (held, at) = match &text {
-                Some(t) => (t.as_str(), t.len()),
-                None => composer,
+            let (held, at, said) = match &text {
+                Some(t) => (t.as_str(), t.len(), note.or(Some(REFUSED_NOTE))),
+                None => (composer.0, composer.1, *note),
             };
-            if let Some(d) = self.switch(prev.as_ref(), visible, held, at, *note, &knows) {
+            if let Some(d) = self.switch(prev.as_ref(), visible, held, at, said, &knows) {
                 self.retain(&knows);
                 *note = d.note;
                 if d.text.is_empty() && composer.0.is_empty() {
@@ -565,7 +594,9 @@ impl Drafts {
     /// `None`: the composer keeps what it holds, still the same tab, its
     /// session named by its create or resume, or followed to a new id (no
     /// tab or reopen entry holds the old one, per `knows`: a replaced
-    /// session is on the reopen stack, so its draft stays with it).
+    /// session is on the reopen stack, so its draft stays with it). Input
+    /// given back to the new id before then (an unsent that came first)
+    /// goes in ahead of what the composer holds.
     pub fn switch(
         &mut self,
         prev: Option<&(u64, Option<String>)>,
@@ -575,11 +606,16 @@ impl Drafts {
         note: Option<&'static str>,
         knows: impl Fn(&str) -> bool,
     ) -> Option<Draft> {
-        if let (Some((a, s)), Some((b, _))) = (prev, now)
+        if let (Some((a, s)), Some((b, to))) = (prev, now)
             && a == &b
             && s.as_deref().is_none_or(|s| !knows(s))
         {
-            return None;
+            let back = to.and_then(|to| self.map.remove(to))?;
+            return Some(if text.trim().is_empty() {
+                back
+            } else {
+                Draft { cursor: back.text.len() + 1 + cursor, text: format!("{}\n{text}", back.text), note: back.note }
+            });
         }
         if let Some((_, Some(s))) = prev {
             if text.trim().is_empty() {
@@ -1179,6 +1215,83 @@ mod tests {
         let vis = t.visible().map(|x| (x.id, x.session.as_deref()));
         assert_eq!(d.frame(&mut owner, vis, None, &mut note, ("half a steer", 4), |s| t.knows(s)), Some((String::new(), Some(0))));
         assert_eq!(d.map.get("S2").map(|x| (x.text.as_str(), x.note)), Some(("half a steer", Some("kept"))));
+    }
+
+    /// L5: input the daemon gave back in the frame of a switch says so
+    /// when its tab is shown again, even with no note of its own.
+    #[test]
+    fn input_given_back_as_a_tab_is_left_says_so() {
+        let mut d = Drafts::default();
+        let all = |_: &str| true;
+        let mut owner = Some((1, Some("A".to_string())));
+        let mut note = None;
+        d.frame(&mut owner, Some((2, Some("B"))), Some("refused".into()), &mut note, ("", 0), all);
+        assert_eq!(d.map.get("A").map(|x| (x.text.as_str(), x.note)), Some(("refused", Some(REFUSED_NOTE))));
+        // A switch with nothing given back files no note.
+        let mut note = None;
+        d.frame(&mut owner, Some((1, Some("A"))), None, &mut note, ("typed for B", 3), all);
+        assert_eq!(d.map.get("B").map(|x| x.note), Some(None));
+    }
+
+    /// Nit 7: input given back to the id a tab just followed to (before
+    /// the frame caught up) goes in ahead of the composer, not into a
+    /// draft no one shows. A tab that goes into the one already holding
+    /// its session brings its composer text along, after that tab's draft.
+    /// Nit 8: a chain of follows.
+    #[test]
+    fn a_follow_or_a_merge_loses_no_input() {
+        let mut t = Tabs::default();
+        t.open("S", "s", Place::Current);
+        let tab = t.visible().unwrap().id;
+        let mut d = Drafts::default();
+        let mut owner = Some((tab, Some("S".to_string())));
+        t.attached("S2");
+        // An unsent for S lands before the frame: S2's (the app maps it).
+        assert_eq!(t.followed("S"), Some("S2"));
+        d.give_back("S2".into(), "steer".into(), "unsent");
+        let mut note = None;
+        let vis = t.visible().map(|x| (x.id, x.session.as_deref()));
+        let out = d.frame(&mut owner, vis, None, &mut note, ("half", 4), |s| t.knows(s));
+        assert_eq!((out, note), (Some(("steer\nhalf".into(), Some(10))), Some("unsent")));
+        assert!(d.map.is_empty());
+        // S2 → S3: an unsent for S still finds the tab.
+        t.attached("S3");
+        assert_eq!((t.followed("S"), t.followed("S2")), (Some("S3"), Some("S3")));
+        // A pending tab whose resume lands on a session another tab holds.
+        let mut m = Tabs::default();
+        m.open("a", "a", Place::New);
+        let a = m.visible().unwrap().id;
+        d.map.insert("a".into(), Draft { text: "a's draft".into(), cursor: 0, note: None });
+        m.open_pending("resume", Place::New);
+        let pending = m.visible().unwrap().id;
+        let mut owner = Some((pending, None));
+        m.attached("a");
+        assert_eq!(m.take_merged(), Some((pending, a)));
+        assert_eq!(m.take_merged(), None);
+        // What the app does with it: the composer is a's.
+        owner.as_mut().unwrap().0 = a;
+        let vis = m.visible().map(|x| (x.id, x.session.as_deref()));
+        let out = d.frame(&mut owner, vis, None, &mut None, ("typed while it opened", 5), |s| m.knows(s));
+        assert_eq!(out, Some(("a's draft\ntyped while it opened".into(), Some(15))));
+    }
+
+    /// Nit 10: an early settle puts every restored tab on the reopen
+    /// stack, more than its usual bound; the next close trims it back.
+    #[test]
+    fn every_dropped_restore_can_come_back() {
+        let n = CLOSED_MAX + 3;
+        let sessions: Vec<String> = (0..n).map(|i| format!("s{i}")).collect();
+        let mut r = Tabs::restore(&Saved { sessions: sessions.clone(), journals: vec![], labels: vec![], active: Some(0) });
+        r.open("new", "new", Place::New);
+        assert_eq!((r.dropped, r.dropped_early), (n, true));
+        assert!(sessions.iter().all(|s| r.knows(s)), "all {n} on the reopen stack");
+        r.open("other", "other", Place::New);
+        r.close(0);
+        let mut back = 0;
+        while r.reopen() {
+            back += 1;
+        }
+        assert_eq!(back, CLOSED_MAX);
     }
 
     #[test]

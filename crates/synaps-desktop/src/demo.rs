@@ -67,6 +67,8 @@ fn sessions(now: i64, settled: bool) -> Vec<SessionMeta> {
             "locked_by": "pid 48213 (tui)", "created_at": ago(400)}),
         json!({"id": "20261112-224410-9f00", "name": "ledger-drift", "title": "Schema drift report: ledger", "model": "anthropic/claude-haiku-4-5",
             "cwd": "/home/you/work/ledger", "cost_usd": 0.09, "lifecycle": "live", "clients": 1, "messages": 6, "state_since": ago(130),
+            // Its turn is over, two of its subagents still run (WORKERS, not idle).
+            "subagents_running": 2,
             "created_at": ago(800), "roster": [{"id": 3, "name": "tui", "kind": "tui", "mode": "mirror", "attached_at_ms": 0}]}),
         json!({"id": "20261112-180203-44aa", "title": "Operator handbook, chapter 4", "model": sonnet,
             "cwd": "/home/you/docs", "cost_usd": 0.27, "lifecycle": "parked", "messages": 22, "state_since": ago(190),
@@ -343,7 +345,7 @@ mod tests {
         }
         assert_eq!(m.sessions.len(), 13);
         let states: std::collections::HashSet<State> = m.sessions.iter().map(|s| m.state(s)).collect();
-        for st in [State::NeedsYou, State::Running, State::Locked, State::Unread, State::Idle, State::Parked] {
+        for st in [State::NeedsYou, State::Running, State::Workers, State::Locked, State::Unread, State::Idle, State::Parked] {
             assert!(states.contains(&st), "{st:?} missing from the demo");
         }
         assert_eq!(m.active.as_ref().unwrap().session_id, SID);

@@ -809,12 +809,11 @@ impl Transcript {
                 SessionStreamEvent::Done => self.end_streaming_text(),
                 _ => {}
             },
-            StreamEvent::Agent(_) if self.no_subagent_notices => {}
             StreamEvent::Agent(a) => match a {
-                AgentEvent::SubagentStart { agent_name, task_preview, .. } => {
+                AgentEvent::SubagentStart { agent_name, task_preview, .. } if !self.no_subagent_notices => {
                     self.notice(ItemKind::Notice, format!("subagent {agent_name} started: {task_preview}"))
                 }
-                AgentEvent::SubagentDone { agent_name, duration_secs, .. } => {
+                AgentEvent::SubagentDone { agent_name, duration_secs, .. } if !self.no_subagent_notices => {
                     self.notice(ItemKind::Notice, format!("subagent {agent_name} done ({duration_secs:.1}s)"))
                 }
                 _ => {}

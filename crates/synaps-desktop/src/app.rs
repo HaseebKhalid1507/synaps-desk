@@ -1168,6 +1168,13 @@ impl AppView {
     /// in that order, so input given back in the frame of a switch stays
     /// with its tab. Nothing is read or allocated on a frame with neither.
     fn sync_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The visible tab went into the one holding its session: the
+        // composer's text is that tab's now (the follow rule keeps it).
+        if let Some((from, into)) = self.model.tabs.take_merged()
+            && let Some(o) = self.composer_of.as_mut().filter(|o| o.0 == from)
+        {
+            o.0 = into;
+        }
         let visible = self.model.tabs.visible().map(|t| (t.id, t.session.as_deref()));
         if self.restore.is_none() && Drafts::owns(self.composer_of.as_ref(), visible) {
             return;
@@ -2149,17 +2156,25 @@ impl AppView {
 
     /// A subagent's block changed shape (a line came, its state changed)
     /// with no item changing (its events and rows are not the
-    /// transcript's): the rows from its turn on, so its height and its
+    /// transcript's): the rows from the turn of the earliest call whose
+    /// block did (any: the first worker call's), so its height and its
     /// run's fold follow. Its text alone changing needs nothing: the row
     /// reads it when drawn.
     fn sync_subagents(&mut self) {
-        let subs = &self.model.stats.subagents;
+        let subs = &mut self.model.stats.subagents;
         if subs.shape_generation() == self.subs_gen {
             return;
         }
         self.subs_gen = subs.shape_generation();
+        let changed = subs.take_reshaped().filter(|c| !c.is_empty());
         let items = self.model.transcript.items();
-        if let Some(k) = items.iter().position(|i| i.tool.as_ref().is_some_and(|t| crate::subagents::starts_worker(&t.name))) {
+        let k = items.iter().position(|i| {
+            i.tool.as_ref().is_some_and(|t| match &changed {
+                Some(c) => c.contains(&t.tool_id),
+                None => crate::subagents::starts_worker(&t.name),
+            })
+        });
+        if let Some(k) = k {
             self.rebuild_from(turns::turn_start(items, k));
         }
     }
@@ -2281,12 +2296,16 @@ impl AppView {
         // The display face stops at Latin-1 (U+00FF): Polish, Czech or Turkish
         // titles, and other scripts, are set whole in the text face.
         let face = if title.chars().all(fonts::display_covers) { fonts::DISPLAY } else { fonts::SANS };
-        // NEEDS YOU / RUNNING / READY beside the cost (glyphs as the rail's).
+        // NEEDS YOU / RUNNING / WORKERS / READY beside the cost (glyphs as
+        // the rail's): its workers running on after the turn are not READY.
+        let workers = self.model.active_workers();
         let state = attached.then(|| {
             if !self.model.transcript.pending_prompts().is_empty() {
                 (crate::rail::State::NeedsYou, label::NEEDS_YOU, p.warn)
             } else if self.model.transcript.busy() {
                 (crate::rail::State::Running, label::RUNNING, p.run)
+            } else if workers > 0 {
+                (crate::rail::State::Workers, label::WORKERS, p.run)
             } else {
                 (crate::rail::State::Idle, label::READY, p.ready)
             }
@@ -2328,9 +2347,22 @@ impl AppView {
                         .child(div().absolute().inset_0().border_1().border_color(p.warn_mark))
                         .child(div().absolute().top(px(3.)).left(px(3.)).size(px(4.)).bg(p.warn_mark)),
                     crate::rail::State::Running => div().size(px(8.)).m(px(1.)).bg(p.run_mark),
+                    crate::rail::State::Workers => div()
+                        .relative()
+                        .size(px(10.))
+                        .flex_none()
+                        .child(div().absolute().top(px(1.)).left(px(1.)).size(px(4.)).bg(p.run_mark))
+                        .child(div().absolute().top(px(5.)).left(px(5.)).size(px(4.)).bg(p.run_mark)),
                     _ => div().size(px(10.)).border_1().border_color(p.ready),
                 };
-                d.child(h_flex().gap(px(8.)).items_center().child(g).child(display(word, 13., color)))
+                d.child(
+                    h_flex()
+                        .gap(px(8.))
+                        .items_center()
+                        .child(g)
+                        .child(display(word, 13., color))
+                        .when(st == crate::rail::State::Workers, |d| d.child(mono(workers.to_string(), 12., color))),
+                )
             })
             .when_some(self.model.stats.cost.filter(|_| attached), |d, c| d.child(mono(format!("${c:.2}"), 12., p.cost)));
         let mut meta = h_flex().mt(px(6.)).gap(px(10.)).overflow_hidden().whitespace_nowrap();
