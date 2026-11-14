@@ -32,14 +32,23 @@ const HOT: f64 = 0.75;
 /// Files listed before "+N more".
 const FILES_SHOWN: usize = 40;
 /// The top bar's height: the side panels and their edges start under it.
-const TOP: f32 = 52.;
+pub(crate) const TOP: f32 = 52.;
+/// In a short window ([`crate::turns::Layout::short`]): its one line of
+/// 13-px caps and the 18-px SYSTEMS badge still have 11 px above and below.
+const TOP_SHORT: f32 = 40.;
 /// An edge handle's hit area; its line is 1 px, on the panel's border.
 const EDGE: f32 = 6.;
 /// The theme picker's narrowest width: two columns of theme names.
 const PICKER_MIN: f32 = 340.;
-/// The top bar and the session header: a picker above the composer keeps
-/// below them.
-const HEADER_CLEAR: f32 = 52. + 112.;
+/// The tab strip and the session header (full, and one row): a picker
+/// above the composer keeps below them and the top bar.
+const HEADER_CLEAR: f32 = 112.;
+const HEADER_CLEAR_SHORT: f32 = 72.;
+
+/// The top bar's height this frame.
+pub(crate) fn top_h(short: bool) -> f32 {
+    if short { TOP_SHORT } else { TOP }
+}
 
 /// The TUI's `context_bar_color`: `border_active` under 50 %,
 /// `status_streaming` under 75 %, `error_color` above.
@@ -248,7 +257,7 @@ impl AppView {
         // as its blocks and its rail row say (they change together).
         let subagents = self.model.active_workers();
         h_flex()
-            .h(px(52.))
+            .h(px(top_h(self.layout.short)))
             .flex_none()
             .pl(px(22.))
             .pr(px(24.))
@@ -342,7 +351,7 @@ impl AppView {
                 .id(id)
                 .group(group)
                 .absolute()
-                .top(px(TOP))
+                .top(px(top_h(self.layout.short)))
                 .bottom_0()
                 .left(px(left))
                 .w(px(EDGE))
@@ -1149,7 +1158,7 @@ impl AppView {
             );
         }
         let lifted = accent.is_some_and(|a| a != scheme.roles.you_bar || a != scheme.roles.focus);
-        let (top, bottom) = (52., 140.);
+        let (top, bottom) = (top_h(self.layout.short), 140.);
         // Over the open right panel, at least two columns of names wide,
         // when that stays clear of the header's NAME and HALT (they end at
         // the column's right edge); else above the composer, under the
@@ -1160,7 +1169,7 @@ impl AppView {
         };
         let max_h = match place {
             PickerAt::Top(_) => self.height - top - 16.,
-            PickerAt::Bottom(_) => self.height - bottom - HEADER_CLEAR,
+            PickerAt::Bottom(_) => self.height - bottom - top - if self.layout.compact() { HEADER_CLEAR_SHORT } else { HEADER_CLEAR },
         };
         let body = v_flex()
             .flex_none()
