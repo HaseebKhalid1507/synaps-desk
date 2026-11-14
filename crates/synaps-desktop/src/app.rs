@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -126,8 +127,15 @@ pub(crate) type AttachSource = Box<dyn Fn(&str, u64) -> Vec<Event>>;
 /// TUI's `CONFIRM_ARM_DELAY` is 400 ms): it pushes the list up, so a click
 /// meant for a row can land on it.
 pub(crate) const ARM: Duration = Duration::from_millis(500);
-/// The prompt well shows this many lines before it scrolls.
+/// The prompt well shows this many lines before it scrolls...
 const WELL_LINES: f32 = 12.;
+/// ...in a short window, this many: a confirm body (extension, tool, the
+/// guard's message, the command, the question) still fits whole, and at
+/// 600 px the composer stays on screen under the card.
+const WELL_LINES_SHORT: f32 = 8.;
+/// The one-row session header ([`HeaderParts::compact`]), its hairline not
+/// included.
+const HEADER_ROW: f32 = 36.;
 /// A folded side panel's strip.
 pub(crate) const STRIP: f32 = 32.;
 /// Narrower than this, the open right panel is not drawn (the session wins).
@@ -593,6 +601,74 @@ const READOUT_DELAY: Duration = Duration::from_millis(400);
 /// `inner` on the centre column, at the list's own (whole-pixel) padding.
 pub(crate) fn column(lay: Layout, inner: impl IntoElement) -> Div {
     h_flex().w_full().pl(px(lay.left)).child(div().flex_none().w(px(lay.column)).min_w_0().child(inner))
+}
+
+/// The session header's second line ([`AppView::header_meta`]).
+pub(crate) struct HeaderMeta {
+    pub(crate) detached: bool,
+    pub(crate) model: Option<SharedString>,
+    pub(crate) effort: Option<SharedString>,
+    pub(crate) cwd: Option<SharedString>,
+}
+
+impl HeaderMeta {
+    pub(crate) fn any(&self) -> bool {
+        self.detached || self.model.is_some() || self.effort.is_some() || self.cwd.is_some()
+    }
+
+    /// The one-row header's title tooltip: the whole title, then the line.
+    pub(crate) fn tooltip(&self, title: &str) -> String {
+        let detached = self.detached.then_some("detached");
+        let parts = [detached, self.model.as_deref(), self.effort.as_deref(), self.cwd.as_deref()];
+        std::iter::once(title).chain(parts.into_iter().flatten()).collect::<Vec<_>>().join(" · ")
+    }
+}
+
+/// What the session header shows. Full: the title with the session's name
+/// beside it, model · effort · folder under it. In a short or tight pane
+/// ([`Layout::compact`]) one row, without the name (its tab shows it) and
+/// the second line (the title's tooltip). NAME and HALT are in both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeaderParts {
+    pub(crate) compact: bool,
+    /// NAME: the session is attached.
+    pub(crate) name: bool,
+    /// HALT: its turn runs and this window drives it.
+    pub(crate) halt: bool,
+    /// The session's name beside the title.
+    pub(crate) chip: bool,
+    /// The second line.
+    pub(crate) meta: bool,
+}
+
+impl HeaderParts {
+    pub(crate) fn of(lay: Layout, attached: bool, busy: bool, named: bool, meta: bool) -> Self {
+        let compact = lay.compact();
+        HeaderParts { compact, name: attached, halt: busy, chip: named && !compact, meta: meta && !compact }
+    }
+
+    /// Its height, the hairline under it included. Fixed (every line in it
+    /// has a set height), so a switch of form can keep the transcript's
+    /// rows where they are on screen.
+    pub(crate) fn height(self) -> f32 {
+        1. + if self.compact {
+            HEADER_ROW
+        } else if self.meta || self.name {
+            // 20 + the title's 28 + 6 + the line's 20 + 17; the right
+            // column (NAME and HALT over the state) is 20 + 5 + 21 + 8 + 21.
+            91.
+        } else {
+            // 20 + the title + 16: nothing attached, nothing known.
+            64.
+        }
+    }
+}
+
+/// How far down the transcript's list starts: the top bar and the session
+/// header (the tab strip, and the naming row when it is open, are the same
+/// in every form).
+pub(crate) fn above_list(lay: Layout, attached: bool, meta: bool) -> f32 {
+    crate::chrome::top_h(lay.short) + HeaderParts::of(lay, attached, false, false, meta).height()
 }
 
 /// The prompt the authorization card shows.
@@ -1081,7 +1157,7 @@ impl AppView {
             subs_gen: 0,
             rows_session: None,
             waiting_on: None,
-            layout: Layout::of(800., &Metrics::at(theme::DEFAULT_TEXT)),
+            layout: Layout::of(800., 800., &Metrics::at(theme::DEFAULT_TEXT)),
             composer: i.composer,
             find_input: i.find_input,
             name_input: i.name_input,
@@ -2387,13 +2463,50 @@ impl AppView {
         }
     }
 
-    /// The centre column's header: title, model · effort · folder; the
-    /// actions (NAME, HALT) top right, the session's state and cost under
-    /// them. Fixed sizes (the text step scales the transcript, card and
-    /// composer), on the column.
-    fn render_header(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+    /// The header shows the session's state, cost and NAME.
+    fn header_attached(&self) -> bool {
+        self.model.active.is_some() && (self.client.is_some() || self.synthetic)
+    }
+
+    /// The header's second line as the daemon said it, each part if
+    /// known: detached, model, effort, folder.
+    fn header_src(&self) -> (bool, Option<&str>, Option<&str>, Option<&str>) {
+        let view = self.model.stats.view.as_ref();
+        let model = view.map(|v| v.model.as_str()).filter(|m| !m.is_empty()).or(self.model.active_meta().map(|s| s.model.as_str()));
+        let effort = view.map(|v| v.effort.as_str()).filter(|e| !e.is_empty());
+        let cwd = self.model.stats.cwd.as_deref().or(self.model.active_meta().and_then(|s| s.cwd.as_deref()));
+        (self.model.active.is_none() && self.model.stats.detached, model, effort, cwd)
+    }
+
+    /// The header's second line, set: detached, then model · effort ·
+    /// folder. Built only when the header is drawn.
+    pub(crate) fn header_meta(&self) -> HeaderMeta {
+        let (detached, model, effort, cwd) = self.header_src();
+        HeaderMeta {
+            detached,
+            model: model.map(|m| crate::named::short_model(m).into()),
+            effort: effort.map(|e| e.to_string().into()),
+            cwd: cwd.map(|c| home_short(c).into()),
+        }
+    }
+
+    /// [`HeaderMeta::any`] of the header's line, without building it (a
+    /// view on screen draws no header).
+    fn header_known(&self) -> bool {
+        let (detached, model, effort, cwd) = self.header_src();
+        detached || model.is_some() || effort.is_some() || cwd.is_some()
+    }
+
+    /// The centre column's header ([`HeaderParts`]). Full: title (and the
+    /// session's name), model · effort · folder under it; the actions (NAME,
+    /// HALT) top right, the session's state and cost under them. In a short
+    /// or tight pane one row: title, state, cost, NAME, HALT; model · effort
+    /// · folder are the title's tooltip. Fixed sizes (the text step scales
+    /// the transcript, card and composer), on the column, at
+    /// [`HeaderParts::height`].
+    fn render_header(&self, meta: HeaderMeta, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let lay = self.layout;
-        let attached = self.model.active.is_some() && (self.client.is_some() || self.synthetic);
+        let attached = self.header_attached();
         let title: SharedString = self
             .model
             .transcript
@@ -2403,12 +2516,8 @@ impl AppView {
             .unwrap_or("No session")
             .to_string()
             .into();
-        let view = self.model.stats.view.as_ref();
-        let model = view.map(|v| v.model.as_str()).filter(|m| !m.is_empty()).or(self.model.active_meta().map(|s| s.model.as_str()));
-        let effort = view.map(|v| v.effort.clone()).filter(|e| !e.is_empty());
-        let cwd = self.model.stats.cwd.as_deref().or(self.model.active_meta().and_then(|s| s.cwd.as_deref())).map(home_short);
         let busy = self.model.transcript.busy() && self.drives();
-        let detached = self.model.active.is_none() && self.model.stats.detached;
+        let parts = HeaderParts::of(lay, attached, busy, self.model.active_name().is_some(), meta.any());
         // The display face stops at Latin-1 (U+00FF): Polish, Czech or Turkish
         // titles, and other scripts, are set whole in the text face.
         let face = if title.chars().all(fonts::display_covers) { fonts::DISPLAY } else { fonts::SANS };
@@ -2427,8 +2536,9 @@ impl AppView {
             }
         });
         let actions = h_flex()
-            .gap(px(22.))
-            .when(attached, |d| {
+            .flex_none()
+            .gap(px(if parts.compact { 18. } else { 22. }))
+            .when(parts.name, |d| {
                 d.child(tbtn("name-session", label::NAME, p.dim, p.ink).on_click(cx.listener(|this, _, window, cx| {
                     this.model.toggle_naming();
                     if this.model.named.naming {
@@ -2441,7 +2551,7 @@ impl AppView {
                     cx.notify();
                 })))
             })
-            .when(busy, |d| {
+            .when(parts.halt, |d| {
                 d.child(tbtn("halt", label::HALT, p.dim, p.err).on_click(cx.listener(|this, _, _, _| {
                     if let Some(c) = &this.client
                         && this.model.can_send()
@@ -2451,6 +2561,7 @@ impl AppView {
                 })))
             });
         let stat = h_flex()
+            .flex_none()
             .gap(px(14.))
             .items_center()
             .when_some(state, |d, (st, word, color)| {
@@ -2480,44 +2591,71 @@ impl AppView {
                         .when(st == crate::rail::State::Workers, |d| d.child(mono(count(workers), 12., color))),
                 )
             })
+            // One row: no second line says it.
+            .when(parts.compact && meta.detached, |d| d.child(mono("detached", 12., p.warn)))
             .when_some(self.model.stats.cost.filter(|_| attached), |d, c| d.child(mono(format!("${c:.2}"), 12., p.cost)));
-        let mut meta = h_flex().mt(px(6.)).gap(px(10.)).overflow_hidden().whitespace_nowrap();
-        let mut sep = false;
-        for (text, color) in [
-            (detached.then(|| SharedString::from("detached")), p.warn),
-            (model.map(|m| crate::named::short_model(m).into()), p.agent),
-            (effort.map(SharedString::from), p.dim),
-            (cwd.filter(|_| !lay.tight).map(SharedString::from), p.dim),
-        ] {
-            if let Some(t) = text {
-                if sep {
-                    meta = meta.child(mono("·", 12., p.dim));
-                }
-                meta = meta.child(mono(t, 12., color).overflow_hidden().text_ellipsis());
-                sep = true;
-            }
-        }
-        let left = v_flex()
-            .flex_1()
-            .min_w_0()
-            .child(
-                h_flex()
-                    .items_end()
-                    .gap(px(16.))
-                    .child(display(title, 24., p.ink).font_family(face).line_height(px(28.)).min_w_0().overflow_hidden().text_ellipsis())
-                    .when_some(self.model.active_name(), |d, n| d.child(mono(n.to_string(), 12., p.dim).flex_none().pb(px(4.)))),
-            )
-            .when(sep, |d| d.child(meta));
-        div().flex_none().bg(p.canvas).border_b_1().border_color(p.hair).child(column(
-            lay,
+        let row = if parts.compact {
+            let tip = meta;
+            let shown = title.clone();
             h_flex()
+                .h(px(HEADER_ROW))
+                .items_center()
+                .gap(px(18.))
+                .child(
+                    display(title, 15., p.ink)
+                        .id("header-title")
+                        .font_family(face)
+                        .line_height(px(20.))
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        // Formatted on hover only.
+                        .tooltip(move |window, cx| Tooltip::new(tip.tooltip(&shown)).build(window, cx)),
+                )
+                .child(stat)
+                .child(actions)
+        } else {
+            let mut line = h_flex().mt(px(6.)).gap(px(10.)).line_height(px(20.)).overflow_hidden().whitespace_nowrap();
+            let mut sep = false;
+            for (text, color) in [
+                (meta.detached.then(|| SharedString::from("detached")), p.warn),
+                (meta.model, p.agent),
+                (meta.effort, p.dim),
+                (meta.cwd, p.dim),
+            ] {
+                if let Some(t) = text {
+                    if sep {
+                        line = line.child(mono("·", 12., p.dim));
+                    }
+                    line = line.child(mono(t, 12., color).overflow_hidden().text_ellipsis());
+                    sep = true;
+                }
+            }
+            let left = v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    h_flex()
+                        .items_end()
+                        .gap(px(16.))
+                        .child(
+                            display(title, 24., p.ink).font_family(face).line_height(px(28.)).min_w_0().overflow_hidden().text_ellipsis(),
+                        )
+                        .when_some(self.model.active_name().filter(|_| parts.chip), |d, n| {
+                            d.child(mono(n.to_string(), 12., p.dim).flex_none().pb(px(4.)))
+                        }),
+                )
+                .when(parts.meta, |d| d.child(line));
+            h_flex()
+                .h(px(parts.height() - 1.))
                 .items_start()
                 .gap(px(20.))
                 .pt(px(20.))
-                .pb(px(16.))
                 .child(left)
-                .child(v_flex().flex_none().items_end().gap(px(8.)).pt(px(5.)).child(actions).child(stat)),
-        ))
+                .child(v_flex().flex_none().items_end().gap(px(8.)).pt(px(5.)).child(actions).child(stat))
+        };
+        div().flex_none().bg(p.canvas).border_b_1().border_color(p.hair).child(column(lay, row))
     }
 
     /// The "Name this session…" row under the header.
@@ -2648,7 +2786,7 @@ impl AppView {
         let well = div()
             .id("prompt-well")
             .mt(px((10. * r).round()))
-            .max_h(px(m.code_line * WELL_LINES + 2. * (10. * r).round()))
+            .max_h(px(m.code_line * if lay.short { WELL_LINES_SHORT } else { WELL_LINES } + 2. * (10. * r).round()))
             .overflow_y_scroll()
             .when_some(card, |d, c| d.track_scroll(&c.scroll))
             .px(px((14. * r).round()))
@@ -2782,8 +2920,8 @@ impl AppView {
                 ),
         )
         .flex_none()
-        .pt(px((10. * r).round()))
-        .pb(px((22. * r).round()))
+        .pt(px((if lay.short { 6. } else { 10. } * r).round()))
+        .pb(px((if lay.short { 12. } else { 22. } * r).round()))
     }
 }
 
@@ -2942,10 +3080,22 @@ impl Render for AppView {
         // A view is not a session: no right panel (it describes one); the
         // pane takes its width. The session's column keeps its layout.
         let view_pane = (self.width - crate::chrome::MARK - rail.width()).max(0.);
-        let lay = Layout::of(pane, &m);
+        // Its height under the full top bar, whatever bar is drawn.
+        let lay = Layout::of(pane, self.height - crate::chrome::TOP, &m);
         if (lay.hang, lay.tight) != (self.layout.hang, self.layout.tight) {
             self.list.remeasure();
             self.metrics_gen += 1;
+        } else if !self.list.is_following_tail() {
+            // Short or not: the list's top edge moves by what the bars above
+            // it gain or lose. Scrolled back, it scrolls as much with it, so
+            // the rows stay where they are on screen (following, the tail
+            // stays at the bottom anyway). Under Settings or Usage too: the
+            // session's list is back where it was when its tab is.
+            let (attached, known) = (self.header_attached(), self.header_known());
+            let shift = above_list(lay, attached, known) - above_list(self.layout, attached, known);
+            if shift != 0. {
+                self.list.scroll_by(px(shift));
+            }
         }
         self.layout = lay;
         let tabs = self.render_tabs(if view.is_some() { view_pane } else { pane }, &p, cx);
@@ -2975,7 +3125,7 @@ impl Render for AppView {
                 .min_w_0()
                 .bg(p.canvas)
                 .child(tabs)
-                .child(self.render_header(&p, cx))
+                .child(self.render_header(self.header_meta(), &p, cx))
                 .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
                 .child(div().flex_1().min_h_0().child(list))
                 .children(self.render_prompt(&p, &m, cx))
@@ -3117,10 +3267,81 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        CENTRE_MIN, FoldKeys, Side, TabKey, authorize_ready, dragged, lines_below, one_line, panel_keys, side_widths, sides, tab_keys,
-        text_keys, toggled, well_body,
+        CENTRE_MIN, FoldKeys, HeaderMeta, HeaderParts, Side, TabKey, above_list, authorize_ready, dragged, lines_below, one_line,
+        panel_keys, side_widths, sides, tab_keys, text_keys, toggled, well_body,
     };
-    use crate::theme::Panels;
+    use crate::theme::{Metrics, Panels};
+    use crate::turns::{Layout, SHORT};
+
+    /// Short is the pane's height alone, under the full top bar: 740 px,
+    /// a 792-px window. It changes nothing the list's rows are laid out
+    /// by (the column, the hanging labels, tight), so the list never
+    /// remeasures for it. The one-row header comes with short or tight.
+    #[test]
+    fn a_short_pane_compacts_the_header_and_nothing_in_the_list() {
+        let m = Metrics::at(16);
+        let pane_h = |window: f32| window - crate::chrome::TOP;
+        for (window_h, short) in [(1080., false), (864., false), (800., false), (792., false), (791., true), (720., true), (600., true)] {
+            let l = Layout::of(1000., pane_h(window_h), &m);
+            assert_eq!((l.short, l.compact()), (short, short), "{window_h}");
+        }
+        assert_eq!(SHORT, 740.);
+        for w in [500., 900., 1600.] {
+            let (tall, short) = (Layout::of(w, 1000., &m), Layout::of(w, 500., &m));
+            assert_eq!(
+                (tall.column, tall.hang, tall.tight, tall.left, tall.right),
+                (short.column, short.hang, short.tight, short.left, short.right)
+            );
+            assert!(!tall.short && short.short);
+        }
+        // Tight compacts the header at any height; short or not is height alone.
+        let tight = Layout::of(532., 1000., &m);
+        assert!(tight.tight && !tight.short && tight.compact());
+    }
+
+    /// NAME and HALT are in both forms; the name beside the title and the
+    /// second line only in the full one. Heights are fixed per form.
+    #[test]
+    fn the_one_row_header_keeps_name_and_halt() {
+        let m = Metrics::at(16);
+        let full = Layout::of(1000., 1000., &m);
+        for lay in [Layout::of(1000., 600., &m), Layout::of(532., 1000., &m), Layout::of(532., 600., &m)] {
+            assert!(lay.compact());
+            for (attached, busy) in [(true, true), (true, false), (false, false)] {
+                let parts = HeaderParts::of(lay, attached, busy, true, true);
+                assert_eq!((parts.compact, parts.name, parts.halt, parts.chip, parts.meta), (true, attached, busy, false, false));
+                assert_eq!(parts.height(), 37.);
+            }
+        }
+        let parts = HeaderParts::of(full, true, true, true, true);
+        assert_eq!((parts.compact, parts.name, parts.halt, parts.chip, parts.meta), (false, true, true, true, true));
+        assert_eq!(parts.height(), 92.);
+        // Attached, nothing known for the second line: NAME and the state
+        // still need the height. Nothing attached and nothing known: less.
+        assert_eq!(HeaderParts::of(full, true, false, false, false).height(), 92.);
+        assert_eq!(HeaderParts::of(full, false, false, false, false).height(), 65.);
+        // Full to one row: the list's top edge rises by the header's 55 px
+        // and the top bar's 12 (what a scrolled-back list scrolls by).
+        let short = Layout::of(1000., 600., &m);
+        assert_eq!(above_list(short, true, true) - above_list(full, true, true), -67.);
+        assert_eq!(above_list(short, false, false) - above_list(full, false, false), -40.);
+        // Tight alone: the header only (the list remeasures then anyway).
+        let (tight, wide) = (Layout::of(532., 1000., &m), Layout::of(600., 1000., &m));
+        assert_eq!(above_list(tight, true, true) - above_list(wide, true, true), -55.);
+    }
+
+    /// The one-row header's title tooltip: the whole title, then what the
+    /// second line would say, each part if known.
+    #[test]
+    fn the_title_tooltip_says_the_second_line() {
+        let meta =
+            HeaderMeta { detached: false, model: Some("opus-4-1".into()), effort: Some("high".into()), cwd: Some("~/work/relay".into()) };
+        assert!(meta.any());
+        assert_eq!(meta.tooltip("Refresh race"), "Refresh race · opus-4-1 · high · ~/work/relay");
+        let bare = HeaderMeta { detached: true, model: None, effort: None, cwd: None };
+        assert_eq!(bare.tooltip("t"), "t · detached");
+        assert!(!HeaderMeta { detached: false, ..bare }.any());
+    }
 
     /// N-L1: `submit()` and `sync_composer()` guard with `composer_owned()`
     /// (tested against views on screen in `tabs.rs`), first thing, and no
