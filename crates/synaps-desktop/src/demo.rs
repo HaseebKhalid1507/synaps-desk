@@ -210,6 +210,15 @@ fn messages() -> Vec<Value> {
             {"type": "text", "text": "Looking at the refresh path first."},
             {"type": "tool_use", "id": "toolu_d1", "name": "read", "input": {"path": p("crates/relay/src/token_store.rs")}}]}),
         json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d1", "content": "pub struct TokenStore {\n    inner: Mutex<Inner>,\n}\n…"}]}),
+        // Two workers: one still running (its rows below), one done.
+        json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_s1", "name": "subagent_start", "input": {"agent": "scout",
+                "task": "Find every caller of TokenStore::rotate and say which ones can race."}},
+            {"type": "tool_use", "id": "toolu_s2", "name": "subagent_start", "input": {"agent": "reviewer",
+                "task": "Review the retry path in Session for lost tokens.", "model": "anthropic/claude-sonnet-4-5"}}]}),
+        json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_s1", "content": "{\"agent_name\":\"scout\",\"handle_id\":\"sa_1\",\"status\":\"running\"}"},
+            {"type": "tool_result", "tool_use_id": "toolu_s2", "content": "{\"agent_name\":\"reviewer\",\"handle_id\":\"sa_2\",\"status\":\"running\"}"}]}),
         json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_d2", "name": "edit", "input": {"path": p("crates/relay/src/token_store.rs"),
                 "old_string": "    pub async fn rotate(&self, id: SessionId) -> Result<Token> {\n        let mut inner = self.inner.lock().await;\n        inner.rotate(id).await\n    }",
@@ -294,7 +303,11 @@ fn attach_sid(attach_seq: u64) -> Vec<Event> {
         "cache_read_input_tokens": 86_000, "cache_creation_input_tokens": 4_100, "model": "anthropic/claude-opus-4-1"}});
     let subagents = json!({"ev": "subagent_rows", "rows": [
         {"subagent_id": 1, "agent_name": "scout", "status": "running", "cancel_requested": false, "elapsed_secs": 41.0,
-            "finished_elapsed": null, "step": "reading crates/relay/src/upstream.rs", "tools": 6}]});
+            "finished_elapsed": null, "step": "reading crates/relay/src/upstream.rs", "tools": 6, "handle_id": "sa_1",
+            "model": "anthropic/claude-sonnet-4-5"},
+        {"subagent_id": 2, "agent_name": "reviewer", "status": "completed", "cancel_requested": false, "elapsed_secs": 95.0,
+            "finished_elapsed": {"secs": 12, "nanos": 0}, "step": "", "tools": 9, "handle_id": "sa_2",
+            "model": "anthropic/claude-sonnet-4-5"}]});
     for (seq, raw) in [(1, usage), (2, subagents)] {
         if let Ok(event) = decode_event(&raw) {
             out.push(Event::Session { attach_seq, session_id: SID.into(), seq, event, raw: Arc::new(raw) });
@@ -346,7 +359,10 @@ mod tests {
         assert!(s.files.preview("toolu_d3").unwrap().removed >= 5);
         let shell: Vec<(&str, &str)> = s.files.shell().iter().map(|f| (f.path.as_str(), f.verb)).collect();
         assert_eq!(shell, [("crates/relay/src/retry.rs", "rm"), ("crates/relay/src/lib.rs", "sed -i")]);
-        assert_eq!(m.transcript.subagents().len(), 1);
+        assert_eq!(m.transcript.subagents().len(), 2);
+        let sub = |id: &str| s.subagents.view(id).map(|v| (v.word, v.facts.to_string()));
+        assert_eq!(sub("toolu_s1"), Some(("running", "claude-sonnet-4-5 · 6 tools · 41.0s".into())));
+        assert_eq!(sub("toolu_s2"), Some(("completed", "claude-sonnet-4-5 · 9 tools · 1m 23s".into())));
         assert_eq!(m.tabs.visible_session(), Some(SID), "the attach is the visible tab's");
     }
 
