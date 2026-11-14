@@ -1,22 +1,30 @@
 //! Subagents in the transcript, as the Synaps TUI shows them: each worker
-//! under the call that started it (`subagent_start`, or the blocking
-//! `subagent`) with its name, model, state, tool count, elapsed time and
-//! its latest step or result, kept current while it runs. Only from what
-//! reaches an attached client:
+//! under the call that started it (`subagent_start`, `subagent_resume`, or
+//! the blocking `subagent`) with its name, model, state, tool count,
+//! elapsed time and its latest step or result, kept current while it runs.
+//! Only from what reaches an attached client:
 //! - the calls and their results (the history, the live `ToolUse` and
 //!   `ToolResult`): the label, the task and the model asked for;
-//!   `subagent_start`'s result names its worker (`handle_id` `sa_N`, N its
-//!   id), so a worker never lands under another call;
+//!   `subagent_start`'s and `subagent_resume`'s results name the worker
+//!   (`handle_id` `sa_N`, N its id), so a worker never lands under another
+//!   call, and a call keeps the worker its result named: ids restart at 1
+//!   with a cold-started daemon, so a later call naming the same id takes
+//!   the id from then on, never the earlier call's worker;
 //! - the live `SubagentStart` / `SubagentUpdate` / `SubagentDone` events
-//!   (on the turn's own stream; a start is matched to its call, still
-//!   unanswered, by label and task, then confirmed by the result);
+//!   (on the turn's own stream; a start goes to its call, still
+//!   unanswered, matched by task (and label), then confirmed by the
+//!   result);
 //! - `SubagentRows`, 1 Hz while a turn runs and after it while a worker
 //!   still does (how a worker that outlives its turn keeps moving);
 //! - the completion event in the history (`<event … source="subagent">`)
 //!   and `subagent_collect` / `subagent_status` results: how one ended.
 //!
 //! Nothing is estimated: a worker whose start is only in the history and
-//! that no live source has spoken of since is "started", not "running".
+//! that no live source has spoken of since is "started", not "running",
+//! and so is one that was running when this window last looked (a
+//! re-attach). An end read from a `SubagentDone`'s text is a guess until
+//! the daemon's own word (a row, the completion event, a collect, the
+//! blocking call's result) says how it ended: that may correct it, once.
 //! Nothing here ticks: the elapsed time moves when a row comes.
 
 use std::collections::HashMap;
@@ -29,6 +37,10 @@ use synaps_client::protocol::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
 
 /// `SubagentStart`'s `task_preview`: the task's first this many chars.
 const PREVIEW_CHARS: usize = 80;
+/// The daemon's longest label for a worker named by the caller.
+const LABEL_CHARS: usize = 32;
+/// Reshaped calls kept for [`Subagents::take_reshaped`]; past this, "all".
+const RESHAPED_MAX: usize = 64;
 
 /// Shape generations, unique across every tab's [`Subagents`] (a tab
 /// switch never meets the number the rows were built at by chance).
@@ -36,13 +48,13 @@ static SHAPES: AtomicU64 = AtomicU64::new(1);
 
 /// The tools that start a worker.
 pub fn starts_worker(name: &str) -> bool {
-    matches!(name, "subagent_start" | "subagent")
+    matches!(name, "subagent_start" | "subagent" | "subagent_resume")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Status {
-    /// Its start is in the history only: whether it still runs, no live
-    /// source has said.
+    /// Its start is in the history only (or it was running when this
+    /// window last looked): whether it still runs, no live source has said.
     Started,
     Running,
     /// Running, its cancel asked for.
@@ -63,7 +75,7 @@ impl Status {
     }
 
     /// A weaker source never overrides a stronger one: the history's
-    /// "started" < live "running" < how it ended (final).
+    /// "started" < live "running" < how it ended.
     fn rank(self) -> u8 {
         match self {
             Status::Started => 0,
@@ -76,21 +88,49 @@ impl Status {
     /// collect's `status`) and a failure's reason.
     fn parse(v: &Value) -> Option<(Self, Option<String>)> {
         match v {
-            Value::String(s) => Some((
-                match s.as_str() {
-                    "running" => Status::Running,
-                    "completed" => Status::Done,
-                    "cancelled" => Status::Cancelled,
-                    "timed_out" => Status::TimedOut,
-                    "failed" => Status::Failed,
-                    _ => return None,
-                },
-                None,
-            )),
+            Value::String(s) => Some((Self::word(s)?, None)),
             Value::Object(o) => o.get("failed").map(|r| (Status::Failed, r.as_str().map(str::to_string))),
             _ => None,
         }
     }
+
+    fn word(s: &str) -> Option<Self> {
+        Some(match s {
+            "running" => Status::Running,
+            "completed" => Status::Done,
+            "cancelled" => Status::Cancelled,
+            "timed_out" => Status::TimedOut,
+            "failed" => Status::Failed,
+            _ => return None,
+        })
+    }
+}
+
+/// How a worker ended, from its live `SubagentDone`'s `result_preview` (a
+/// guess, see [`Worker::guessed`]): `subagent_start` and `subagent_resume`
+/// workers send `ERROR: <reason>` for every end that is not a success, the
+/// reason `worker timed out` or `worker was cancelled` for those two; the
+/// blocking `subagent` sends its result's head (`[TIMED OUT after Ns — …`
+/// when its time ran out), `ERROR: <error>` or `Task panicked or dropped`.
+fn done_status(preview: &str) -> (Status, Option<String>) {
+    match preview {
+        "ERROR: worker timed out" => (Status::TimedOut, None),
+        "ERROR: worker was cancelled" => (Status::Cancelled, None),
+        "Task panicked or dropped" => (Status::Failed, Some(preview.to_string())),
+        p if p.starts_with("[TIMED OUT") => (Status::TimedOut, None),
+        p => match p.strip_prefix("ERROR: ") {
+            Some(e) => (Status::Failed, Some(e.trim().to_string())),
+            None => (Status::Done, None),
+        },
+    }
+}
+
+/// A reason worth a line: not the one the state's word already says (the
+/// daemon's `failure_reason` for a timeout or a cancel).
+fn reason_shown(status: Option<Status>, reason: Option<&str>) -> Option<&str> {
+    reason.filter(|r| {
+        !matches!((status, *r), (Some(Status::TimedOut), "worker timed out") | (Some(Status::Cancelled), "worker was cancelled"))
+    })
 }
 
 /// What is known of one worker.
@@ -110,17 +150,50 @@ pub struct Worker {
     pub elapsed: Option<f64>,
     /// Its result's first line.
     pub result: String,
+    /// Its end was read from a `SubagentDone`'s text ([`done_status`]):
+    /// the daemon's own word may still correct it, once.
+    guessed: bool,
 }
 
 impl Worker {
-    fn set_status(&mut self, s: Status, reason: Option<String>) {
-        if self.status.is_some_and(|c| c.terminal() || c.rank() > s.rank()) {
-            return;
+    fn ended(&self) -> bool {
+        self.status.is_some_and(Status::terminal)
+    }
+
+    /// Whether a source may still write how it ended (`sure`: the daemon's
+    /// own word, not a guess from text): it has not ended, or its end was
+    /// a guess and this source is sure.
+    fn open(&self, sure: bool) -> bool {
+        !self.ended() || (sure && self.guessed)
+    }
+
+    /// A weaker source never overrides a stronger one, and an end is
+    /// final, unless it was a guess and a sure source says how it ended.
+    fn set_status(&mut self, s: Status, reason: Option<String>, sure: bool) {
+        if let Some(c) = self.status {
+            let correct = c.terminal() && s.terminal() && sure && self.guessed;
+            if !correct && (c.terminal() || c.rank() > s.rank()) {
+                return;
+            }
+            if correct {
+                self.reason = None;
+            }
         }
         self.status = Some(s);
+        self.guessed = s.terminal() && !sure;
         if reason.is_some() {
             self.reason = reason;
         }
+    }
+
+    /// Running when this window last looked: "started" until a live
+    /// source says again. Whether it was running.
+    fn demote(&mut self) -> bool {
+        let was = self.status.is_some_and(Status::running);
+        if was {
+            self.status = Some(Status::Started);
+        }
+        was
     }
 
     /// Facts from another source of the same worker: the stronger status,
@@ -128,7 +201,7 @@ impl Worker {
     fn merge(&mut self, o: Worker) {
         self.id = self.id.or(o.id);
         if let Some(s) = o.status {
-            self.set_status(s, o.reason);
+            self.set_status(s, o.reason, !o.guessed);
         }
         let fill = |a: &mut String, b: String| {
             if a.is_empty() {
@@ -163,7 +236,8 @@ pub struct View {
     pub name: SharedString,
     /// `sonnet-5-5 · 6 tools · 41.0s`, what is known of it.
     pub facts: SharedString,
-    /// Running: its step; finished: its result, or why it failed.
+    /// Running (or last seen so): its step; finished: its result, or why
+    /// it failed.
     pub line: Option<(SharedString, bool)>,
 }
 
@@ -193,13 +267,14 @@ impl View {
         if let Some(s) = w.elapsed {
             facts.push(fmt_secs(s));
         }
-        let line = match w.status {
-            Some(Status::Failed) | Some(Status::TimedOut) if w.reason.is_some() => {
-                w.reason.as_deref().map(|r| (format!("reason: {}", one_line(r, 200)).into(), true))
-            }
-            Some(s) if s.terminal() => (!w.result.is_empty()).then(|| (w.result.clone().into(), false)),
-            Some(s) if s.running() => (!w.step.is_empty()).then(|| (one_line(&w.step, 200).into(), false)),
-            _ => None,
+        let reason = reason_shown(w.status, w.reason.as_deref()).filter(|_| matches!(w.status, Some(Status::Failed | Status::TimedOut)));
+        let line = match (w.status, reason) {
+            (_, Some(r)) => Some((format!("reason: {}", one_line(r, 200)).into(), true)),
+            (Some(s), _) if s.terminal() => (!w.result.is_empty()).then(|| (w.result.clone().into(), false)),
+            // Running, or last seen running (a re-attach, until a row says):
+            // its step (none for a start the history alone holds).
+            (Some(_), _) => (!w.step.is_empty()).then(|| (one_line(&w.step, 200).into(), false)),
+            (None, _) => None,
         };
         let name = if w.name.is_empty() { c.label.clone() } else { w.name.clone() };
         Some(View { status: w.status, tone, word, name: name.into(), facts: facts.join(" · ").into(), line })
@@ -213,9 +288,10 @@ impl View {
     }
 }
 
-/// `3.4s`, `59.9s`, `2m 05s`, `1h 02m` (the TUI's `fmt_secs`).
+/// `3.4s`, `59.9s`, `2m 05s`, `1h 02m` (the TUI's `fmt_secs`), the unit
+/// chosen after rounding (59.96 is `1m 00s`, not `60.0s`).
 pub fn fmt_secs(secs: f64) -> String {
-    if secs < 60.0 {
+    if (secs * 10.0).round() < 600.0 {
         return format!("{secs:.1}s");
     }
     let s = secs.round() as u64;
@@ -237,13 +313,57 @@ fn handle_id(h: &str) -> Option<u64> {
     h.strip_prefix("sa_")?.parse().ok()
 }
 
+/// The daemon's `subagent_label`: an agent by its name (one given as a
+/// path by its file stem), else an inline worker's `name`, else "inline";
+/// a stem or a name cut to `[A-Za-z0-9_-]` (whitespace becomes `-`), at
+/// most [`LABEL_CHARS`].
+fn label(agent: Option<&str>, name: Option<&str>) -> String {
+    match agent {
+        Some(a) if a.contains('/') => {
+            std::path::Path::new(a).file_stem().and_then(|f| f.to_str()).and_then(sanitize_label).unwrap_or_else(|| "agent".into())
+        }
+        Some(a) => a.to_string(),
+        None => name.and_then(sanitize_label).unwrap_or_else(|| "inline".into()),
+    }
+}
+
+/// The daemon's `sanitize_label`.
+fn sanitize_label(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in raw.trim().chars() {
+        let c = if c.is_whitespace() { '-' } else { c };
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_') || (c == '-' && (out.is_empty() || out.ends_with('-'))) {
+            continue;
+        }
+        out.push(c);
+        if out.len() == LABEL_CHARS {
+            break;
+        }
+    }
+    let out = out.trim_end_matches('-');
+    (!out.is_empty()).then(|| out.to_string())
+}
+
+/// What a call is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// `subagent_start`: a background worker, its result names it.
+    Start,
+    /// `subagent_resume`: a new worker on an ended one's conversation, its
+    /// result names it.
+    Resume,
+    /// The blocking `subagent`: no handle; its result is how it ended.
+    Oneshot,
+}
+
 #[derive(Clone, Debug)]
 struct Call {
-    oneshot: bool,
-    /// What the daemon calls its worker (`subagent_label`): the agent (a
-    /// path's file stem), else the inline name, else "inline".
+    kind: Kind,
+    /// What the daemon calls its worker (`subagent_label`); a resume's, the
+    /// ended worker's.
     label: String,
-    /// The task's first [`PREVIEW_CHARS`] chars, as `SubagentStart` has it.
+    /// The task's (a resume's instructions') first [`PREVIEW_CHARS`]
+    /// chars, as `SubagentStart` has it.
     task: String,
     /// `label · the task's first line`, the row's argument.
     arg: SharedString,
@@ -251,31 +371,38 @@ struct Call {
     model: String,
     /// Its result came: no live start can be its any more.
     answered: bool,
+    /// Its worker is the one its own result named, not a match: no other
+    /// call ever takes it.
+    named: bool,
     w: Worker,
     view: Option<View>,
     shape: u64,
 }
 
 impl Call {
-    fn new(name: &str, input: &Value) -> Self {
-        let s = |k: &str| input.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
-        let label = match (s("agent"), s("name")) {
-            (Some(a), _) if a.contains('/') => std::path::Path::new(a).file_stem().and_then(|f| f.to_str()).unwrap_or("agent").to_string(),
-            (Some(a), _) => a.to_string(),
-            (None, Some(n)) => n.to_string(),
-            (None, None) => "inline".to_string(),
+    /// `prior`: a resume's ended worker's label, if known.
+    fn new(name: &str, input: &Value, prior: Option<String>) -> Self {
+        let s = |k: &str| input.get(k).and_then(Value::as_str);
+        // The daemon reads a blank agent (spaces, controls) as none.
+        let agent = s("agent").filter(|a| !a.chars().all(|c| c.is_whitespace() || c.is_control()));
+        let (kind, label, task_full) = match name {
+            "subagent_resume" => {
+                (Kind::Resume, prior.unwrap_or_else(|| s("handle_id").unwrap_or("resume").to_string()), s("instructions").unwrap_or(""))
+            }
+            "subagent" => (Kind::Oneshot, label(agent, s("name")), s("task").unwrap_or("")),
+            _ => (Kind::Start, label(agent, s("name")), s("task").unwrap_or("")),
         };
-        let task_full = input.get("task").and_then(Value::as_str).unwrap_or("");
         let gist = one_line(task_full, 160);
         let arg = if gist.is_empty() { label.clone() } else { format!("{label} · {gist}") };
         Call {
-            oneshot: name == "subagent",
+            kind,
             task: task_full.chars().take(PREVIEW_CHARS).collect(),
             arg: arg.into(),
-            model: s("model").unwrap_or("").to_string(),
+            model: s("model").map(str::trim).unwrap_or("").to_string(),
             w: Worker::default(),
             label,
             answered: false,
+            named: false,
             view: None,
             shape: View::shape(None),
         }
@@ -293,18 +420,74 @@ impl Call {
     }
 }
 
+/// A completion event's facts.
+struct Completion {
+    n: u64,
+    status: Status,
+    reason: Option<String>,
+    secs: Option<f64>,
+    name: Option<String>,
+    preview: String,
+}
+
+/// A subagent completion event's body (after its `<event …>` tag): from
+/// its Data, else from its text. The daemon cuts Data at 1,000 chars, so a
+/// long error leaves it unreadable; the text says `Subagent 'x' (sa_2)
+/// finished with status 'failed' after 3.5s. Reason: … Call
+/// subagent_collect with handle_id "sa_2" to retrieve the full result.
+/// Preview: …` (the preview keeps its newlines: the last Data line is the
+/// event's).
+fn completion(body: &str) -> Option<Completion> {
+    let body = body.split("</event>").next().unwrap_or(body);
+    let (prose, data) = body.rsplit_once("\nData: ").unwrap_or((body, ""));
+    let preview = prose.split_once(" to retrieve the full result. Preview: ").map(|(_, p)| first_line(p)).unwrap_or_default();
+    if let Ok(d) = serde_json::from_str::<Value>(data.trim()) {
+        let n = d.get("handle_id").and_then(Value::as_str).and_then(handle_id).or_else(|| d.get("subagent_id").and_then(Value::as_u64))?;
+        let (status, _) = d.get("status").and_then(Status::parse)?;
+        return Some(Completion {
+            n,
+            status,
+            reason: d.get("error").and_then(Value::as_str).map(str::to_string),
+            secs: d.get("duration_secs").and_then(Value::as_f64),
+            name: d.get("agent_name").and_then(Value::as_str).map(str::to_string),
+            preview,
+        });
+    }
+    let rest = prose.trim_start().strip_prefix("Subagent '")?;
+    let (name, rest) = rest.split_once("' (sa_")?;
+    let (n, rest) = rest.split_once(") finished with status '")?;
+    let (status, rest) = rest.split_once("' after ")?;
+    let (secs, rest) = rest.split_once("s.")?;
+    let reason =
+        rest.strip_prefix(" Reason: ").and_then(|r| r.split_once(" Call subagent_collect with handle_id ")).map(|(r, _)| r.to_string());
+    Some(Completion {
+        n: n.parse().ok()?,
+        status: Status::word(status)?,
+        reason,
+        secs: secs.parse().ok(),
+        name: Some(name.to_string()),
+        preview,
+    })
+}
+
 /// The workers of the attached session, by the call that started each.
 #[derive(Debug, Default)]
 pub struct Subagents {
     calls: HashMap<String, Call>,
     /// Calls in the order they came (a live start goes to the oldest that
-    /// fits).
+    /// fits; an id to the newest call that has it).
     order: Vec<String>,
     /// The call each worker is shown under.
     by_id: HashMap<u64, String>,
     /// Workers no call has claimed yet (a start's result will name them).
     orphans: HashMap<u64, Worker>,
     shapes: u64,
+    /// Calls whose block changed shape since [`Subagents::take_reshaped`].
+    reshaped: Vec<String>,
+    /// Too many to list, or all may have (a new history).
+    reshaped_all: bool,
+    /// A live source has spoken of a worker since the attach.
+    heard: bool,
 }
 
 impl Subagents {
@@ -312,6 +495,13 @@ impl Subagents {
     /// changes (the rows' heights and the runs' folds follow).
     pub fn shape_generation(&self) -> u64 {
         self.shapes
+    }
+
+    /// The calls whose block changed shape since the last take; `None`:
+    /// any may have (rebuild from the first).
+    pub fn take_reshaped(&mut self) -> Option<Vec<String>> {
+        let list = std::mem::take(&mut self.reshaped);
+        (!std::mem::take(&mut self.reshaped_all)).then_some(list)
     }
 
     /// The block under call `tool_id`, if it started a worker this knows.
@@ -329,6 +519,19 @@ impl Subagents {
         self.calls.get(tool_id).is_some_and(|c| c.w.status.is_some_and(Status::running))
     }
 
+    /// Workers running, as the blocks say (and those no call claims).
+    pub fn running_count(&self) -> usize {
+        let run = |w: &Worker| w.status.is_some_and(Status::running);
+        self.calls.values().filter(|c| run(&c.w)).count() + self.orphans.values().filter(|w| run(w)).count()
+    }
+
+    /// A live source (an event, a row) has spoken of a worker since the
+    /// attach: [`Subagents::running_count`] is the daemon's, not only what
+    /// the history says.
+    pub fn heard(&self) -> bool {
+        self.heard
+    }
+
     /// What the call's row height and its run's fold depend on.
     pub fn shape(&self, tool_id: &str) -> u64 {
         self.calls.get(tool_id).map_or(0, |c| c.shape)
@@ -339,7 +542,8 @@ impl Subagents {
         self.calls
             .values()
             .map(|c| 256 + c.label.len() + c.task.len() + c.arg.len() + c.model.len() + c.w.step.len() + c.w.result.len())
-            .sum()
+            .sum::<usize>()
+            + self.orphans.values().map(|w| 128 + w.step.len() + w.result.len()).sum::<usize>()
     }
 
     /// Start over from a whole history (an attach, a replacement). `same`:
@@ -347,9 +551,34 @@ impl Subagents {
     /// mid-run repeats the calls; the rows keep coming).
     pub fn reset(&mut self, messages: &[Value], same: bool) {
         if !same {
-            *self = Subagents { shapes: SHAPES.fetch_add(1, Ordering::Relaxed), ..Subagents::default() };
+            *self = Subagents { shapes: SHAPES.fetch_add(1, Ordering::Relaxed), reshaped_all: true, ..Subagents::default() };
         }
         self.append(messages);
+        // Each id goes to the newest call that has it: a live call the
+        // history does not hold yet keeps its worker, whatever older call
+        // the history named it for.
+        for t in &self.order {
+            let Some(c) = self.calls.get(t) else { continue };
+            if let Some(n) = c.w.id.filter(|_| c.named || !c.answered) {
+                self.by_id.insert(n, t.clone());
+                self.orphans.remove(&n);
+            }
+        }
+    }
+
+    /// A re-attach of the session these are of: a worker running when this
+    /// window last looked is "started" until a live source says again (one
+    /// cancelled meanwhile sends no wake, and the rows have stopped), and
+    /// nothing has been heard in this attachment yet. Before the history.
+    pub fn reattached(&mut self) {
+        self.heard = false;
+        for w in self.orphans.values_mut() {
+            w.demote();
+        }
+        let ids: Vec<String> = self.calls.iter_mut().filter_map(|(id, c)| c.w.demote().then(|| id.clone())).collect();
+        for id in ids {
+            self.changed(&id);
+        }
     }
 
     /// Fold history messages after the ones seen so far (the live events
@@ -393,36 +622,40 @@ impl Subagents {
                 self.tool_result(tool_id, result, true)
             }
             SessionEvent::Stream { event: StreamEvent::Agent(a) } => match a {
-                AgentEvent::SubagentStart { subagent_id, agent_name, task_preview } => self.started(*subagent_id, agent_name, task_preview),
-                AgentEvent::SubagentUpdate { subagent_id, status, .. } => self.update(*subagent_id, |w| {
-                    // "⚙ <tool> (tool #N)" marks a new tool call.
-                    if let Some((_, n)) = status.strip_prefix("\u{2699} ").and_then(|r| r.rsplit_once(" (tool #")) {
-                        w.tools = n.trim_end_matches(')').parse().ok().or(w.tools);
-                    }
-                    w.step = status.clone();
-                }),
-                AgentEvent::SubagentDone { subagent_id, result_preview, duration_secs, .. } => self.update(*subagent_id, |w| {
-                    let (s, reason) = if result_preview.starts_with("[TIMED OUT") {
-                        (Status::TimedOut, None)
-                    } else if let Some(e) = result_preview.strip_prefix("ERROR") {
-                        (Status::Failed, Some(e.trim_start_matches(':').trim().to_string()))
-                    } else if result_preview == "Task panicked or dropped" {
-                        (Status::Failed, Some(result_preview.clone()))
-                    } else {
-                        (Status::Done, None)
-                    };
-                    let was_final = w.status.is_some_and(Status::terminal);
-                    w.set_status(s, reason);
-                    if !was_final {
-                        w.elapsed = Some(*duration_secs);
-                        if s == Status::Done {
-                            w.result = first_line(result_preview);
+                AgentEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
+                    self.heard = true;
+                    self.started(*subagent_id, agent_name, task_preview)
+                }
+                AgentEvent::SubagentUpdate { subagent_id, status, .. } => {
+                    self.heard = true;
+                    self.update(*subagent_id, |w| {
+                        if w.ended() {
+                            return;
                         }
-                    }
-                }),
+                        // "⚙ <tool> (tool #N)" marks a new tool call.
+                        if let Some((_, n)) = status.strip_prefix("\u{2699} ").and_then(|r| r.rsplit_once(" (tool #")) {
+                            w.tools = n.trim_end_matches(')').parse().ok().or(w.tools);
+                        }
+                        w.step = status.clone();
+                    })
+                }
+                AgentEvent::SubagentDone { subagent_id, result_preview, duration_secs, .. } => {
+                    self.heard = true;
+                    let (s, reason) = done_status(result_preview);
+                    self.update(*subagent_id, |w| {
+                        if w.open(false) {
+                            w.set_status(s, reason, false);
+                            w.elapsed = Some(*duration_secs);
+                            if s == Status::Done {
+                                w.result = first_line(result_preview);
+                            }
+                        }
+                    })
+                }
                 _ => {}
             },
             SessionEvent::SubagentRows { rows } => {
+                self.heard = true;
                 for r in rows {
                     self.row(r);
                 }
@@ -435,68 +668,87 @@ impl Subagents {
         if !starts_worker(name) || id.is_empty() || self.calls.contains_key(id) {
             return;
         }
-        self.calls.insert(id.to_string(), Call::new(name, input));
+        // A resume runs under the ended worker's label.
+        let prior = (name == "subagent_resume")
+            .then(|| {
+                let n = input.get("handle_id").and_then(Value::as_str).and_then(handle_id)?;
+                let c = self.calls.get(self.by_id.get(&n)?)?;
+                Some(if c.w.name.is_empty() { c.label.clone() } else { c.w.name.clone() })
+            })
+            .flatten();
+        self.calls.insert(id.to_string(), Call::new(name, input, prior));
         self.order.push(id.to_string());
     }
 
     fn tool_result(&mut self, id: &str, text: &str, live: bool) {
-        if let Some(c) = self.calls.get_mut(id) {
-            c.answered = true;
-            if c.oneshot {
-                // `[subagent:<label>] <output>` / `[subagent:<label> ERROR] <error>`.
-                let Some(rest) = text.strip_prefix("[subagent:") else { return };
-                let Some((head, body)) = rest.split_once("] ") else { return };
-                if head.ends_with(" ERROR") {
-                    c.w.set_status(Status::Failed, Some(body.trim().to_string()));
+        let Some(c) = self.calls.get_mut(id) else { return self.read_end(text) };
+        c.answered = true;
+        if c.kind == Kind::Oneshot {
+            // `[subagent:<label>] <output>` / `[subagent:<label> ERROR] <error>`;
+            // out of time, `[subagent:<label>] [TIMED OUT after Ns — partial
+            // results below]…`. Its own word: how it ended, and its result
+            // (twin calls have no handle to undo a swapped match).
+            if let Some((head, body)) = text.strip_prefix("[subagent:").and_then(|r| r.split_once("] ")) {
+                let (s, reason, result) = if head.ends_with(" ERROR") {
+                    (Status::Failed, Some(body.trim().to_string()), String::new())
+                } else if body.starts_with("[TIMED OUT") {
+                    (Status::TimedOut, None, String::new())
                 } else {
-                    c.w.set_status(Status::Done, None);
-                    if c.w.result.is_empty() {
-                        c.w.result = first_line(body);
-                    }
+                    (Status::Done, None, first_line(body))
+                };
+                if c.w.open(true) {
+                    c.w.set_status(s, reason, true);
+                    c.w.result = result;
                 }
                 if c.w.name.is_empty() {
                     c.w.name = head.trim_end_matches(" ERROR").to_string();
                 }
-                self.changed(id);
-                return;
             }
-            // `{"handle_id": "sa_N", "agent_name": …, "status": "running"}`.
-            let Ok(v) = serde_json::from_str::<Value>(text.trim()) else { return self.changed(id) };
-            let Some(n) = v.get("handle_id").and_then(Value::as_str).and_then(handle_id) else { return self.changed(id) };
-            self.bind(id, n);
-            let c = self.calls.get_mut(id).expect("bound");
-            if let Some(name) = v.get("agent_name").and_then(Value::as_str) {
-                c.w.name = name.to_string();
-            }
-            c.w.set_status(if live { Status::Running } else { Status::Started }, None);
-            self.changed(id);
-            return;
+            return self.changed(id);
         }
-        // How a worker ended, from a call that reads it (`subagent_collect`,
-        // `subagent_status`): final states only (a "running" here is old).
+        // `{"handle_id": "sa_N", "agent_name": …, "status": "running"}`.
+        let v = serde_json::from_str::<Value>(text.trim()).ok();
+        let Some(n) = v.as_ref().and_then(|v| v.get("handle_id")?.as_str().and_then(handle_id)) else {
+            // No worker (denied, refused, failed): one a match gave it is
+            // unclaimed again.
+            self.unclaim(id);
+            return self.changed(id);
+        };
+        self.bind(id, n, true);
+        let c = self.calls.get_mut(id).expect("bound");
+        if let Some(name) = v.as_ref().and_then(|v| v.get("agent_name")?.as_str()) {
+            c.w.name = name.to_string();
+        }
+        c.w.set_status(if live { Status::Running } else { Status::Started }, None, true);
+        self.changed(id);
+    }
+
+    /// How a worker ended, from a call that reads it (`subagent_collect`,
+    /// `subagent_status`): final states only (a "running" here is old).
+    /// Its result from `output` only: `subagent_status`'s `partial_output`
+    /// is the output's last 500 chars, not its start.
+    fn read_end(&mut self, text: &str) {
         let Ok(v) = serde_json::from_str::<Value>(text.trim()) else { return };
         let Some(n) = v.get("handle_id").and_then(Value::as_str).and_then(handle_id) else { return };
         let Some((s, reason)) = v.get("status").and_then(Status::parse).filter(|(s, _)| s.terminal()) else { return };
         let reason = reason.or_else(|| v.get("error").and_then(Value::as_str).map(str::to_string));
-        let output = ["output", "partial_output"].iter().find_map(|k| v.get(*k).and_then(Value::as_str)).map(first_line);
+        let output = v.get("output").and_then(Value::as_str).map(first_line);
         let secs = v.get("elapsed_secs").and_then(Value::as_f64);
         let tools = v.get("tool_count").and_then(Value::as_u64).map(|t| t as u32);
         self.update(n, |w| {
-            let was_final = w.status.is_some_and(Status::terminal);
-            w.set_status(s, reason);
-            if !was_final {
+            if w.open(true) {
+                w.set_status(s, reason, true);
                 w.elapsed = secs.or(w.elapsed);
+                w.tools = tools.or(w.tools);
             }
-            w.tools = tools.or(w.tools);
+            w.tools = w.tools.or(tools);
             if let Some(o) = output.filter(|o| !o.is_empty() && w.result.is_empty()) {
                 w.result = o;
             }
         });
     }
 
-    /// Completion events in a user message of the history:
-    /// `<event … source="subagent">Subagent 'x' (sa_2) finished … Preview: …
-    /// Data: {"handle_id": …, "status": …, "duration_secs": …}</event>`.
+    /// Completion events in a user message of the history (one per event).
     fn events(&mut self, text: &str) {
         if !text.contains("source=\"subagent\"") {
             return;
@@ -506,29 +758,16 @@ impl Subagents {
             if !tag.contains("source=\"subagent\"") {
                 continue;
             }
-            let body = body.split("</event>").next().unwrap_or(body);
-            let (prose, data) = body.split_once("\nData: ").unwrap_or((body, ""));
-            let Ok(d) = serde_json::from_str::<Value>(data.trim()) else { continue };
-            let Some(n) =
-                d.get("handle_id").and_then(Value::as_str).and_then(handle_id).or_else(|| d.get("subagent_id").and_then(Value::as_u64))
-            else {
-                continue;
-            };
-            let Some((s, _)) = d.get("status").and_then(Status::parse) else { continue };
-            let reason = d.get("error").and_then(Value::as_str).map(str::to_string);
-            let preview = prose.split_once(" Preview: ").map(|(_, p)| first_line(p)).unwrap_or_default();
-            let secs = d.get("duration_secs").and_then(Value::as_f64);
-            let name = d.get("agent_name").and_then(Value::as_str).map(str::to_string);
-            self.update(n, |w| {
-                let was_final = w.status.is_some_and(Status::terminal);
-                w.set_status(s, reason);
-                if !was_final {
-                    w.elapsed = secs.or(w.elapsed);
+            let Some(c) = completion(body) else { continue };
+            self.update(c.n, |w| {
+                if w.open(true) {
+                    w.set_status(c.status, c.reason, true);
+                    w.elapsed = c.secs.or(w.elapsed);
                 }
                 if w.result.is_empty() {
-                    w.result = preview;
+                    w.result = c.preview;
                 }
-                if let Some(name) = name.filter(|_| w.name.is_empty()) {
+                if let Some(name) = c.name.filter(|_| w.name.is_empty()) {
                     w.name = name;
                 }
             });
@@ -536,39 +775,39 @@ impl Subagents {
     }
 
     /// A live start: under the call it is (its own, if one already named
-    /// it), else the oldest unanswered call with its label and task.
+    /// it), else the oldest unanswered call with its task (its label too,
+    /// if one has it). A start that fits no task is under no call: a label
+    /// alone is never a call's own start (`subagent_resume` starts its
+    /// worker under the ended one's label).
     fn started(&mut self, n: u64, name: &str, preview: &str) {
-        // An id seen before under a call that has finished (ids restart
-        // after a daemon reload): a new worker.
-        if let Some(t) = self.by_id.get(&n).cloned()
-            && self.calls.get(&t).is_none_or(|c| c.w.status.is_some_and(Status::terminal))
-        {
-            self.by_id.remove(&n);
-            if let Some(c) = self.calls.get_mut(&t) {
-                c.w.id = None;
-            }
-        }
-        if !self.by_id.contains_key(&n) {
-            let score = |c: &Call| u8::from(c.task == preview) * 2 + u8::from(c.label == name);
-            let mut best: Option<(&String, u8)> = None;
-            for t in &self.order {
-                if let Some(c) = self.calls.get(t).filter(|c| !c.answered && c.w.id.is_none()) {
-                    let s = score(c);
-                    // Strictly better: the oldest of equals.
-                    if s > 0 && best.is_none_or(|(_, b)| s > b) {
-                        best = Some((t, s));
-                    }
+        let mut best: Option<(&String, u8)> = None;
+        for t in &self.order {
+            if let Some(c) = self.calls.get(t).filter(|c| !c.answered && c.w.id.is_none() && c.task == preview) {
+                let s = 1 + u8::from(c.label == name);
+                // Strictly better: the oldest of equals.
+                if best.is_none_or(|(_, b)| s > b) {
+                    best = Some((t, s));
                 }
             }
-            if let Some(t) = best.map(|(t, _)| t.clone()) {
-                self.bind(&t, n);
+        }
+        let fit = best.map(|(t, _)| t.clone());
+        let prev_runs = self.by_id.get(&n).map(|p| self.calls.get(p).is_some_and(|c| c.w.status.is_some_and(Status::running)));
+        match (prev_runs, fit) {
+            // A new worker under an id an earlier one had (ids restart at 1
+            // with a cold-started daemon): its call is here, and the earlier
+            // worker is not running. That call keeps what it showed.
+            (Some(false), Some(t)) => {
+                self.by_id.remove(&n);
+                self.bind(&t, n, false);
             }
+            (None, Some(t)) => self.bind(&t, n, false),
+            _ => {}
         }
         self.update(n, |w| {
             if w.name.is_empty() {
                 w.name = name.to_string();
             }
-            w.set_status(Status::Running, None);
+            w.set_status(Status::Running, None, true);
         });
     }
 
@@ -580,8 +819,11 @@ impl Subagents {
             return;
         };
         let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-        let status = r.get("status").and_then(Status::parse);
         let cancel = r.get("cancel_requested").and_then(Value::as_bool).unwrap_or(false);
+        let status = r.get("status").and_then(Status::parse).map(|(st, reason)| match st {
+            Status::Running if cancel => (Status::Cancelling, reason),
+            st => (st, reason),
+        });
         let elapsed = r.get("elapsed_secs").and_then(Value::as_f64);
         // `finished_elapsed` (a serde `Duration`): how long ago it ended.
         let ago = r
@@ -590,15 +832,18 @@ impl Subagents {
         let (name, model, step) = (s("agent_name"), s("model"), s("step"));
         let tools = r.get("tools").and_then(Value::as_u64).map(|t| t as u32);
         self.update(n, |w| {
-            let was_final = w.status.is_some_and(Status::terminal);
-            if let Some((st, reason)) = status {
-                let st = if st == Status::Running && cancel { Status::Cancelling } else { st };
-                w.set_status(st, reason);
+            // Once it ended, a row sent before the end (they cross) changes
+            // nothing; one that says how it ended may correct a guess.
+            let ends = status.as_ref().is_some_and(|(s, _)| s.terminal());
+            if w.ended() && !(ends && w.open(true)) {
+                return;
             }
-            let ended = w.status.is_some_and(Status::terminal);
+            if let Some((st, reason)) = status {
+                w.set_status(st, reason, true);
+            }
             // A finished worker's run: its age less the time since it ended.
-            if !was_final && let Some(e) = elapsed {
-                w.elapsed = Some(match (ended, ago) {
+            if let Some(e) = elapsed {
+                w.elapsed = Some(match (w.ended(), ago) {
                     (true, Some(a)) => (e - a).max(0.),
                     _ => e,
                 });
@@ -616,32 +861,54 @@ impl Subagents {
         });
     }
 
-    /// Show worker `n` under call `tool_id` (its result named it): what
-    /// another call, or no call, had of it comes along; a worker that call
-    /// was given by a wrong match is unclaimed again.
-    fn bind(&mut self, tool_id: &str, n: u64) {
-        if !self.calls.contains_key(tool_id) || self.by_id.get(&n).map(String::as_str) == Some(tool_id) {
+    /// Show worker `n` under call `tool_id`; `named`: its own result named
+    /// it. What a match had given another call of it comes along (and a
+    /// worker a wrong match gave this call is unclaimed again); a worker
+    /// another call's own result named stays with that call (`n` was
+    /// reused), and `n` is this call's from now on. History order decides
+    /// which call an id's events reach.
+    fn bind(&mut self, tool_id: &str, n: u64, named: bool) {
+        let Some(c) = self.calls.get_mut(tool_id) else { return };
+        if self.by_id.get(&n).map(String::as_str) == Some(tool_id) {
+            c.named |= named;
             return;
+        }
+        if let Some(old) = c.w.id.filter(|&o| o != n) {
+            let lost = std::mem::take(&mut c.w);
+            if self.by_id.get(&old).map(String::as_str) == Some(tool_id) {
+                self.by_id.remove(&old);
+                self.orphans.insert(old, lost);
+            }
         }
         let w = match self.by_id.remove(&n) {
             Some(prev) => {
-                let w = self.calls.get_mut(&prev).map(|c| std::mem::take(&mut c.w)).unwrap_or_default();
+                let w = match self.calls.get_mut(&prev) {
+                    Some(p) if !p.named => std::mem::take(&mut p.w),
+                    _ => Worker::default(),
+                };
                 self.changed(&prev);
                 w
             }
             None => self.orphans.remove(&n).unwrap_or_default(),
         };
         let c = self.calls.get_mut(tool_id).expect("checked");
-        if let Some(old) = c.w.id.filter(|&o| o != n) {
-            let lost = std::mem::take(&mut c.w);
-            self.by_id.remove(&old);
-            self.orphans.insert(old, lost);
-        }
-        let c = self.calls.get_mut(tool_id).expect("checked");
         c.w.merge(w);
         c.w.id = Some(n);
+        c.named |= named;
         self.by_id.insert(n, tool_id.to_string());
         self.changed(tool_id);
+    }
+
+    /// Call `tool_id` started no worker after all: one a match gave it is
+    /// unclaimed again.
+    fn unclaim(&mut self, tool_id: &str) {
+        let Some(c) = self.calls.get_mut(tool_id).filter(|c| !c.named) else { return };
+        let Some(g) = c.w.id else { return };
+        let w = std::mem::take(&mut c.w);
+        if self.by_id.get(&g).map(String::as_str) == Some(tool_id) {
+            self.by_id.remove(&g);
+            self.orphans.insert(g, w);
+        }
     }
 
     /// Change worker `n`: under its call, else as an orphan.
@@ -660,6 +927,12 @@ impl Subagents {
         let shape = c.shape;
         if c.refresh() && c.shape != shape {
             self.shapes = SHAPES.fetch_add(1, Ordering::Relaxed);
+            if self.reshaped.len() >= RESHAPED_MAX {
+                self.reshaped.clear();
+                self.reshaped_all = true;
+            } else if !self.reshaped_all && !self.reshaped.iter().any(|t| t == tool_id) {
+                self.reshaped.push(tool_id.to_string());
+            }
         }
     }
 }
@@ -673,25 +946,21 @@ pub fn completion_note(text: &str) -> Option<String> {
     if !tag.contains("source=\"subagent\"") {
         return None;
     }
-    let body = body.split("</event>").next().unwrap_or(body);
-    let (prose, data) = body.split_once("\nData: ")?;
-    let d: Value = serde_json::from_str(data.trim()).ok()?;
-    let (status, _) = d.get("status").and_then(Status::parse)?;
-    let name = d.get("agent_name").and_then(Value::as_str).unwrap_or("subagent");
-    let word = match status {
+    let c = completion(body)?;
+    let word = match c.status {
         Status::Done => "completed",
         Status::Failed => "failed",
         Status::Cancelled => "cancelled",
         Status::TimedOut => "timed out",
         _ => return None,
     };
-    let mut out = format!("{name} {word}");
-    if let Some(s) = d.get("duration_secs").and_then(Value::as_f64) {
+    let mut out = format!("{} {word}", c.name.as_deref().unwrap_or("subagent"));
+    if let Some(s) = c.secs {
         out.push_str(&format!(" · {}", fmt_secs(s)));
     }
-    let tail = match d.get("error").and_then(Value::as_str) {
+    let tail = match reason_shown(Some(c.status), c.reason.as_deref()) {
         Some(e) => format!("reason: {}", one_line(e, 160)),
-        None => prose.split_once(" Preview: ").map(|(_, p)| first_line(p)).unwrap_or_default(),
+        None => c.preview,
     };
     if !tail.is_empty() {
         out.push_str(&format!(" · {tail}"));
@@ -752,6 +1021,28 @@ mod tests {
     }
     fn handle(n: u64, name: &str) -> String {
         json!({"handle_id": format!("sa_{n}"), "agent_name": name, "status": "running"}).to_string()
+    }
+    /// A completion event as the daemon writes it (`finalize.rs`,
+    /// `format_event_for_agent`).
+    fn completion_event(n: u64, name: &str, status: &str, secs: f64, error: Option<&str>, preview: &str) -> String {
+        let reason = error.map(|e| format!(" Reason: {e}")).unwrap_or_default();
+        let mut data =
+            json!({"handle_id": format!("sa_{n}"), "subagent_id": n, "agent_name": name, "status": status, "duration_secs": secs});
+        if let Some(e) = error {
+            data["error"] = json!(e);
+        }
+        format!(
+            "<event id=\"e{n}\" type=\"subagent_completion\" severity=\"high\" source=\"subagent\">Subagent '{name}' (sa_{n}) finished with status '{status}' after {secs:.1}s.{reason} Call subagent_collect with handle_id \"sa_{n}\" to retrieve the full result. Preview: {preview}\nData: {data}</event>"
+        )
+    }
+    fn user(text: &str) -> Value {
+        json!({"role": "user", "content": text})
+    }
+    fn call(id: &str, name: &str, input: Value) -> Value {
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]})
+    }
+    fn answer(id: &str, text: &str) -> Value {
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": text}]})
     }
     /// `(state word, name, facts, line)` under call `id`.
     fn shown(s: &Subagents, id: &str) -> Option<(&'static str, String, String, Option<String>)> {
@@ -817,14 +1108,18 @@ mod tests {
     }
 
     /// Cancelled and timed out; a cancel asked for shows while it runs.
+    /// Labels as the daemon makes them.
     #[test]
     fn cancelled_and_timed_out() {
         let mut s = Subagents::default();
-        tool_use(&mut s, "a", "subagent_start", json!({"name": "gif-recorder", "system_prompt": "x", "task": "record"}));
+        tool_use(&mut s, "a", "subagent_start", json!({"name": " GIF recorder! ", "system_prompt": "x", "task": "record"}));
         tool_use(&mut s, "b", "subagent_start", json!({"agent": "/home/me/agents/bench.md", "task": "bench it"}));
-        result(&mut s, "a", &handle(1, "gif-recorder"));
+        tool_use(&mut s, "c", "subagent_start", json!({"agent": "  ", "system_prompt": "x", "task": "nameless"}));
+        result(&mut s, "a", &handle(1, "GIF-recorder"));
         result(&mut s, "b", &handle(2, "bench"));
+        assert_eq!(s.arg("a").as_deref(), Some("GIF-recorder · record"), "a name cut as the daemon cuts it");
         assert_eq!(s.arg("b").as_deref(), Some("bench · bench it"), "a path's file stem");
+        assert_eq!(s.arg("c").as_deref(), Some("inline · nameless"), "a blank agent is none");
         let mut r = row(1, "gif-recorder", json!("running"), 5.0, None, "", 0);
         r["cancel_requested"] = json!(true);
         rows(&mut s, json!([r]));
@@ -832,8 +1127,46 @@ mod tests {
         assert!(s.running("a"));
         rows(&mut s, json!([row(1, "gif-recorder", json!("cancelled"), 6.0, Some(0.0), "", 0)]));
         assert_eq!((word(&s, "a"), s.view("a").unwrap().tone), (Some("cancelled"), Tone::Warn));
-        done(&mut s, 2, "[TIMED OUT after 600s — partial results below]\n\nhalf", 600.0);
-        assert_eq!(shown(&s, "b").map(|v| (v.0, v.2)), Some(("timed out", "10m 00s".into())));
+        // A `subagent_start` worker's end that is not a success: `ERROR: <failure_reason>`.
+        done(&mut s, 2, "ERROR: worker timed out", 600.0);
+        assert_eq!(shown(&s, "b").map(|v| (v.0, v.2, v.3)), Some(("timed out", "10m 00s".into(), None)));
+    }
+
+    /// A `subagent_start` worker timed out or cancelled mid-turn says so
+    /// (not "failed"); "ERRORS: none" is a success. An end read from the
+    /// done event's text gives way, once, to the daemon's own word (a row,
+    /// the completion event, a collect); that word is final.
+    #[test]
+    fn reactive_ends_and_the_daemons_word() {
+        let mut s = Subagents::default();
+        for (id, n) in [("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5)] {
+            tool_use(&mut s, id, "subagent_start", json!({"agent": "w", "task": id}));
+            result(&mut s, id, &handle(n, "w"));
+        }
+        done(&mut s, 1, "ERROR: worker timed out", 600.0);
+        done(&mut s, 2, "ERROR: worker was cancelled", 5.0);
+        done(&mut s, 3, "ERRORS: none\nall good", 2.0);
+        done(&mut s, 4, "ERROR: provider overloaded [overloaded]", 3.0);
+        done(&mut s, 5, "half way", 1.0);
+        let line = |s: &Subagents, id: &str| shown(s, id).map(|v| (v.0, v.3));
+        assert_eq!(line(&s, "a"), Some(("timed out", None)));
+        assert_eq!((line(&s, "b"), s.view("b").unwrap().tone), (Some(("cancelled", None)), Tone::Warn));
+        assert_eq!(line(&s, "c"), Some(("completed", Some("ERRORS: none".into()))));
+        assert_eq!(line(&s, "d"), Some(("failed", Some("reason: provider overloaded [overloaded]".into()))));
+        // The completion event says d timed out: corrected, and final.
+        s.append(&[user(&completion_event(4, "w", "timed_out", 3.0, Some("worker timed out"), ""))]);
+        assert_eq!(line(&s, "d"), Some(("timed out", None)), "its own reason is not repeated");
+        let collect = json!({"handle_id": "sa_4", "status": {"failed": "late"}, "output": "x"}).to_string();
+        s.append(&[call("k", "subagent_collect", json!({"handle_id": "sa_4"})), answer("k", &collect)]);
+        assert_eq!(word(&s, "d"), Some("timed out"), "the daemon's word stays");
+        // A row corrects a guess too; a stale "running" one does not.
+        rows(&mut s, json!([row(5, "w", json!("running"), 0.9, None, "late", 1)]));
+        assert_eq!(line(&s, "e"), Some(("completed", Some("half way".into()))));
+        rows(&mut s, json!([row(5, "w", json!("cancelled"), 2.0, Some(1.0), "", 1)]));
+        assert_eq!(shown(&s, "e").map(|v| (v.0, v.2)), Some(("cancelled", "claude-sonnet-5-5 · 1 tool · 1.0s".into())));
+        // And a guess never overrides the daemon's word.
+        done(&mut s, 5, "ERROR: boom", 2.0);
+        assert_eq!(word(&s, "e"), Some("cancelled"));
     }
 
     /// A completion before its start, a start before its call's result,
@@ -957,6 +1290,26 @@ mod tests {
         );
         assert_eq!(shown(&h, "f").map(|v| (v.0, v.1, v.3)), Some(("failed", "inline".into(), Some("reason: model refused".into()))));
         assert_eq!(h.view("f").unwrap().status, Some(Status::Failed));
+        // Out of time, from the history alone: timed out, not completed.
+        h.append(&[
+            call("g", "subagent", json!({"agent": "scout", "task": "slow"})),
+            answer("g", "[subagent:scout] [TIMED OUT after 600s \u{2014} partial results below]\n\n$ ls\n"),
+        ]);
+        assert_eq!(shown(&h, "g").map(|v| (v.0, v.3)), Some(("timed out", None)));
+        // Twin blocking calls whose live starts matched the wrong way round:
+        // each call's own result says how its worker ended, and with what.
+        let mut t = Subagents::default();
+        for id in ["p", "q"] {
+            tool_use(&mut t, id, "subagent", json!({"agent": "twin", "task": "same"}));
+        }
+        start(&mut t, 1, "twin", "same");
+        start(&mut t, 2, "twin", "same");
+        done(&mut t, 2, "second", 1.0);
+        done(&mut t, 1, "first", 2.0);
+        result(&mut t, "p", "[subagent:twin] second");
+        result(&mut t, "q", "[subagent:twin ERROR] boom");
+        assert_eq!(shown(&t, "p").map(|v| (v.0, v.3)), Some(("completed", Some("second".into()))));
+        assert_eq!(shown(&t, "q").map(|v| (v.0, v.3)), Some(("failed", Some("reason: boom".into()))));
     }
 
     /// Ids restart after a daemon reload: a start under an id a finished
@@ -977,6 +1330,165 @@ mod tests {
     #[test]
     fn secs_read_as_the_tui_writes_them() {
         assert_eq!((fmt_secs(3.44), fmt_secs(125.0), fmt_secs(3720.0)), ("3.4s".into(), "2m 05s".into(), "1h 02m".into()));
+        assert_eq!((fmt_secs(59.94), fmt_secs(59.96)), ("59.9s".into(), "1m 00s".into()), "rounded before the unit");
         assert_eq!(completion_note("<event id=\"x\" source=\"cli\">hi</event>"), None);
+    }
+
+    /// Ids restart at 1 with a cold-started daemon: the history holds an
+    /// earlier call whose worker was sa_1 (ended, its completion event
+    /// with it) and a later one whose worker is sa_1 again. The live rows
+    /// are the later one's; a re-attach replays it all. Neither block ever
+    /// takes the other's worker, live or from the history.
+    #[test]
+    fn a_reused_id_never_moves_a_worker() {
+        let history = vec![
+            call("h1", "subagent_start", json!({"agent": "scout", "task": "map it"})),
+            answer("h1", &handle(1, "scout")),
+            user(&completion_event(1, "scout", "completed", 4.0, None, "found it")),
+            // (the daemon restarted)
+            call("x", "subagent_start", json!({"agent": "scout", "task": "map it again"})),
+            answer("x", &handle(1, "scout")),
+        ];
+        let h1 = |s: &Subagents| shown(s, "h1").map(|v| (v.0, v.2, v.3));
+        let ended = Some(("completed", "4.0s".to_string(), Some("found it".to_string())));
+        let mut s = Subagents::default();
+        s.reset(&history, false);
+        assert_eq!((h1(&s), word(&s, "x")), (ended.clone(), Some("started")));
+        rows(&mut s, json!([row(1, "scout", json!("running"), 2.0, None, "ls", 1)]));
+        assert_eq!(shown(&s, "x").map(|v| (v.0, v.3)), Some(("running", Some("ls".into()))));
+        assert_eq!(h1(&s), ended, "h1's facts stay its own");
+        assert!(s.running("x") && !s.running("h1"));
+        // A re-attach: the same history again, then the rows.
+        s.reattached();
+        s.reset(&history, true);
+        assert_eq!((h1(&s), word(&s, "x")), (ended.clone(), Some("started")));
+        rows(&mut s, json!([row(1, "scout", json!("running"), 3.0, None, "ls", 1)]));
+        assert_eq!((h1(&s), word(&s, "x")), (ended.clone(), Some("running")));
+        rows(&mut s, json!([row(1, "scout", json!("completed"), 9.0, Some(0.0), "ls", 2)]));
+        assert_eq!(shown(&s, "x").unwrap().2, "claude-sonnet-5-5 · 2 tools · 9.0s");
+        assert_eq!(h1(&s), ended);
+        // A start replayed for the worker that ended: nothing moves, nothing runs.
+        start(&mut s, 1, "scout", "map it again");
+        assert_eq!((word(&s, "x"), s.running_count()), (Some("completed"), 0));
+
+        // Live: the later call's start comes while the history's sa_1 is h1's.
+        let mut l = Subagents::default();
+        l.reset(&history[..3], false);
+        tool_use(&mut l, "x", "subagent_start", json!({"agent": "scout", "task": "map it again"}));
+        start(&mut l, 1, "scout", "map it again");
+        update(&mut l, 1, "booting");
+        result(&mut l, "x", &handle(1, "scout"));
+        assert_eq!(shown(&l, "x").map(|v| (v.0, v.3)), Some(("running", Some("booting".into()))));
+        assert_eq!(h1(&l), ended);
+        // A replacement mid-run repeats the history (h1's result first):
+        // the live call keeps its worker and its rows.
+        l.reset(&history, true);
+        rows(&mut l, json!([row(1, "scout", json!("running"), 4.0, None, "reading", 2)]));
+        assert_eq!(shown(&l, "x").map(|v| (v.0, v.3)), Some(("running", Some("reading".into()))));
+        assert_eq!(h1(&l), ended);
+    }
+
+    /// A re-attach: a worker running when this window last looked is
+    /// "started" (its last step still shown) until a live source says
+    /// again; one cancelled meanwhile (no wake, the rows stopped) never
+    /// comes back, and nothing keeps its run open.
+    #[test]
+    fn a_reattach_forgets_running_until_a_row_says() {
+        let history = vec![
+            call("h1", "subagent_start", json!({"agent": "a", "task": "one"})),
+            answer("h1", &handle(1, "a")),
+            call("h2", "subagent_start", json!({"agent": "b", "task": "two"})),
+            answer("h2", &handle(2, "b")),
+        ];
+        let mut s = Subagents::default();
+        s.reset(&history, false);
+        assert!(!s.heard(), "the history alone");
+        rows(&mut s, json!([row(1, "a", json!("running"), 1.0, None, "ls", 1), row(2, "b", json!("running"), 1.0, None, "cat", 1)]));
+        assert_eq!((s.running_count(), s.heard()), (2, true));
+        s.reattached();
+        s.reset(&history, true);
+        assert!(!s.heard());
+        assert_eq!(shown(&s, "h1").map(|v| (v.0, v.3)), Some(("started", Some("ls".into()))));
+        assert_eq!((s.running("h1"), s.running("h2"), s.running_count()), (false, false, 0));
+        rows(&mut s, json!([row(1, "a", json!("running"), 3.0, None, "ls", 1)]));
+        assert_eq!((word(&s, "h1"), word(&s, "h2"), s.running_count()), (Some("running"), Some("started"), 1));
+    }
+
+    /// A start whose task fits no call is under none, even when its label
+    /// does (`subagent_resume` starts under the ended worker's label); a
+    /// resume's worker shows under the resume; a call answered without a
+    /// handle gives back the worker a match gave it.
+    #[test]
+    fn starts_fit_by_task_and_resumes_have_blocks() {
+        let mut s = Subagents::default();
+        tool_use(&mut s, "a", "subagent_start", json!({"agent": "scout", "task": "map it"}));
+        result(&mut s, "a", &handle(1, "scout"));
+        done(&mut s, 1, "mapped", 3.0);
+        // Waiting on its approval: a call with the same label.
+        tool_use(&mut s, "b", "subagent_start", json!({"agent": "scout", "task": "something else"}));
+        tool_use(&mut s, "r", "subagent_resume", json!({"handle_id": "sa_1", "instructions": "Now map the tests too"}));
+        assert_eq!(s.arg("r").as_deref(), Some("scout · Now map the tests too"), "under the ended worker's label");
+        start(&mut s, 2, "scout", "Now map the tests too");
+        assert_eq!((s.view("b"), word(&s, "r")), (None, Some("running")), "a label alone is not b's start");
+        let resumed = json!({"handle_id": "sa_2", "resumed_from": "sa_1", "agent_name": "scout", "status": "running", "context": "full"});
+        result(&mut s, "r", &resumed.to_string());
+        rows(&mut s, json!([row(2, "scout", json!("running"), 2.0, None, "rg tests", 1)]));
+        assert_eq!(shown(&s, "r").map(|v| (v.0, v.3)), Some(("running", Some("rg tests".into()))));
+        assert_eq!(word(&s, "a"), Some("completed"));
+        result(&mut s, "b", "Tool call blocked by extension: Tool call confirmation denied: no");
+        assert_eq!(s.view("b"), None, "denied: no worker");
+        // A match, then the call fails without a handle: the worker is unclaimed.
+        tool_use(&mut s, "c", "subagent_start", json!({"agent": "x", "task": "t"}));
+        start(&mut s, 3, "x", "t");
+        assert_eq!(word(&s, "c"), Some("running"));
+        result(&mut s, "c", "Tool execution failed: boom");
+        assert_eq!(s.view("c"), None);
+        assert_eq!(s.running_count(), 2, "r's, and the unclaimed one");
+    }
+
+    /// The calls whose block changed shape are listed for the window (it
+    /// rebuilds from the earliest one's turn); a new history is "all".
+    #[test]
+    fn reshaped_calls_are_listed() {
+        let mut s = Subagents::default();
+        s.reset(&[], false);
+        assert_eq!(s.take_reshaped(), None, "a new history: all");
+        tool_use(&mut s, "a", "subagent_start", json!({"agent": "a", "task": "one"}));
+        tool_use(&mut s, "b", "subagent_start", json!({"agent": "b", "task": "two"}));
+        result(&mut s, "b", &handle(2, "b"));
+        assert_eq!(s.take_reshaped(), Some(vec!["b".to_string()]));
+        let g = s.shape_generation();
+        rows(&mut s, json!([row(2, "b", json!("running"), 1.0, None, "ls", 1)]));
+        rows(&mut s, json!([row(2, "b", json!("running"), 2.0, None, "ls", 1)]));
+        assert_eq!(s.take_reshaped(), Some(vec!["b".to_string()]), "its line came: once");
+        assert_ne!(s.shape_generation(), g);
+        rows(&mut s, json!([row(2, "b", json!("running"), 3.0, None, "cat", 1)]));
+        assert_eq!(s.take_reshaped(), Some(vec![]), "text only");
+    }
+
+    /// The completion event: Data is cut at 1,000 chars, so a long error
+    /// leaves it unreadable: its text says the same. A preview with lines
+    /// of its own; the last Data line is the event's.
+    #[test]
+    fn completion_events_read_from_data_or_text() {
+        let long = "x".repeat(1200);
+        let full = completion_event(3, "scout", "failed", 12.5, Some(&long), "");
+        let (head, data) = full.split_once("\nData: ").unwrap();
+        let cut: String = data.chars().take(1000).collect();
+        let truncated = format!("{head}\nData: {cut}</event>");
+        let note = completion_note(&truncated).unwrap();
+        assert!(note.starts_with("scout failed · 12.5s · reason: xxx"), "{note}");
+        let mut s = Subagents::default();
+        s.append(&[call("t", "subagent_start", json!({"agent": "scout", "task": "go"})), answer("t", &handle(3, "scout"))]);
+        s.append(&[user(&truncated)]);
+        assert_eq!((word(&s, "t"), shown(&s, "t").unwrap().2), (Some("failed"), "12.5s".into()));
+        let tricky = completion_event(4, "scout", "completed", 1.0, None, "line one\nData: not this\nmore");
+        assert_eq!(completion_note(&tricky).as_deref(), Some("scout completed · 1.0s · line one"));
+        // `subagent_status`'s partial output is a tail: not a result.
+        let status = json!({"handle_id": "sa_3", "status": "completed", "partial_output": "…ail end"}).to_string();
+        let mut p = Subagents::default();
+        p.append(&[call("t", "subagent_start", json!({"agent": "scout", "task": "go"})), answer("t", &handle(3, "scout"))]);
+        p.append(&[call("k", "subagent_status", json!({"handle_id": "sa_3"})), answer("k", &status)]);
+        assert_eq!(shown(&p, "t").map(|v| (v.0, v.3)), Some(("completed", None)));
     }
 }

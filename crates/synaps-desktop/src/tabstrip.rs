@@ -267,7 +267,7 @@ impl AppView {
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
         let title_color = match st {
-            State::NeedsYou | State::Running | State::Unread => p.ink,
+            State::NeedsYou | State::Running | State::Workers | State::Unread => p.ink,
             _ if on => p.ink,
             State::Parked | State::Locked | State::Saved => p.dim_ch,
             _ => p.prose_ch,

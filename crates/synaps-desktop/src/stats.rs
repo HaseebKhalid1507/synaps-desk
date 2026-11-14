@@ -120,6 +120,10 @@ impl Stats {
         let mut files = std::mem::take(&mut self.files);
         files.reset(&a.conversation.api_messages, cwd.as_deref(), same);
         let mut subagents = std::mem::take(&mut self.subagents);
+        if same {
+            // What ran when this window last looked is "started" until a row says.
+            subagents.reattached();
+        }
         subagents.reset(&a.conversation.api_messages, same);
         let tokens = Tokens::conversation(&a.conversation.tokens, &a.conversation.keepwarm_tokens);
         *self = Stats {
