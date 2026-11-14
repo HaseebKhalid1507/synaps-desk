@@ -168,8 +168,8 @@ pub(crate) fn sides(window: f32, panels: theme::Panels, mark: f32) -> (Side, Sid
             }
             (Side::Open(l), Side::Open(r))
         }
-        (true, false) => (Side::Open(want_l.min((room - STRIP).max(floor_l))), Side::Strip),
-        (false, true) => (Side::Strip, Side::Open(want_r.min(room - STRIP))),
+        (true, false) => (Side::Open(want_l.min((room - STRIP).max(floor_l)).floor()), Side::Strip),
+        (false, true) => (Side::Strip, Side::Open(want_r.min(room - STRIP).floor())),
         (false, false) => (Side::Strip, Side::Strip),
     }
 }
@@ -193,7 +193,7 @@ pub(crate) fn dragged(window: f32, start: theme::Panels, rail: bool, width: f32)
     let Some(mut p) = (if was_open { Some(start) } else { toggled(window, start, rail) }) else { return start };
     let (_, other) = pick(sides(window, p, crate::chrome::MARK));
     let room = window - crate::chrome::MARK - CENTRE_MIN - other.width();
-    let w = width.clamp(lo, hi.min(room.max(was.width())).max(lo)).round();
+    let w = width.round().clamp(lo, hi.min(room.max(was.width())).max(lo).floor());
     // The other panel keeps what it shows: one that had given way to a
     // narrow window is held there, so this edge follows the pointer.
     let (want_l, want_r) = wanted(window, p);
@@ -1051,6 +1051,10 @@ impl AppView {
     /// [`SAVE_DELAY`] later. The list re-measures its rows for the new
     /// width by itself.
     pub(crate) fn toggle_panel(&mut self, rail: bool, cx: &mut Context<Self>) {
+        // A fold mid-drag commits the drag where it is first; the rest of
+        // GPUI's drag then moves nothing (`drag_edge` needs `self.drag`).
+        self.end_drag(cx);
+        self.drag = None;
         let Some(p) = toggled(self.width, self.panels, rail) else { return };
         self.set_panels(p, cx);
     }
@@ -1131,6 +1135,10 @@ impl AppView {
     /// Write the changed panel keys on the background executor (a read, a
     /// write, two fsyncs: never on the UI thread).
     fn save_panels(&mut self, cx: &mut Context<Self>) {
+        // Never a width in the middle of a drag: its end saves again.
+        if self.drag.as_ref().is_some_and(|g| g.moved) {
+            return;
+        }
         let keys = std::mem::take(&mut self.panels_dirty);
         let Some(path) = theme::settings_path().filter(|_| !keys.is_empty()) else { return };
         self.panels_writing = self.panels_writing.or(keys);
@@ -1832,7 +1840,16 @@ impl Render for AppView {
                     }
                 }
             }))
-            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<EdgeDrag>, _, cx| this.drag_edge(ev.event.position.x.into(), cx)))
+            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<EdgeDrag>, window, cx| {
+                if ev.event.pressed_button == Some(MouseButton::Left) {
+                    this.drag_edge(ev.event.position.x.into(), cx);
+                } else {
+                    // The release went elsewhere (a workspace switch, a broken
+                    // grab, Alt+Tab): GPUI never ends the drag, so end it here.
+                    cx.stop_active_drag(window);
+                    this.end_drag(cx);
+                }
+            }))
             .on_drop(cx.listener(|this, _: &EdgeDrag, _, cx| this.end_drag(cx)))
             .on_action(cx.listener(|this, _: &ToggleRail, _, cx| this.fold_key(true, cx)))
             .on_action(cx.listener(|this, _: &ToggleRight, _, cx| this.fold_key(false, cx)))
@@ -1961,7 +1978,10 @@ mod tests {
     #[test]
     fn the_fit_rules_hold_at_every_width() {
         let folds = [(false, false), (true, false), (false, true), (true, true)];
-        for window in (640..3400).step_by(7).map(|w| w as f32) {
+        // Every 7 px, the breakpoints, and fractional widths (125 %/150 %
+        // scaling at a tiled size): panels stay on whole pixels (L4).
+        let edges = [760., 838., 1082., 2044., 1092.8, 1366.4, 1707.2, 2044.5];
+        for window in (640..3400).step_by(7).map(|w| w as f32).chain(edges) {
             for (rc, gc) in folds {
                 let auto = Panels { rail_collapsed: rc, right_collapsed: gc, ..Panels::default() };
                 assert_eq!(sides(window, auto, 30.), pr7_sides(window, auto), "{window} {auto:?}");
