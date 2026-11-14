@@ -4,7 +4,9 @@
 //! and its numbers on the right. Every colour is a Synaps TUI theme role
 //! ([`crate::theme`]); every number comes from the daemon ([`crate::stats`]).
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -127,15 +129,9 @@ pub(crate) type AttachSource = Box<dyn Fn(&str, u64) -> Vec<Event>>;
 /// TUI's `CONFIRM_ARM_DELAY` is 400 ms): it pushes the list up, so a click
 /// meant for a row can land on it.
 pub(crate) const ARM: Duration = Duration::from_millis(500);
-/// The prompt well shows this many lines before it scrolls...
-const WELL_LINES: f32 = 12.;
-/// ...in a short window, this many: a confirm body (extension, tool, the
-/// guard's message, the command, the question) still fits whole, and at
-/// 600 px the composer stays on screen under the card.
-const WELL_LINES_SHORT: f32 = 8.;
 /// The one-row session header ([`HeaderParts::compact`]), its hairline not
 /// included.
-const HEADER_ROW: f32 = 36.;
+const HEADER_ROW: f32 = crate::fit::HEADER_SHORT - 1.;
 /// A folded side panel's strip.
 pub(crate) const STRIP: f32 = 32.;
 /// Narrower than this, the open right panel is not drawn (the session wins).
@@ -625,9 +621,12 @@ impl HeaderMeta {
 }
 
 /// What the session header shows. Full: the title with the session's name
-/// beside it, model · effort · folder under it. In a short or tight pane
-/// ([`Layout::compact`]) one row, without the name (its tab shows it) and
-/// the second line (the title's tooltip). NAME and HALT are in both.
+/// beside it, model · effort · folder under it (no folder in a tight pane).
+/// In a short window ([`Layout::short`]) one row, without the name (its tab
+/// shows it): model · effort beside the state unless the pane is tight,
+/// and the whole second line as the title's tooltip. NAME and HALT are in
+/// both. Width never changes the form: a panel dragged across the tight
+/// line moves nothing up or down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HeaderParts {
     pub(crate) compact: bool,
@@ -643,7 +642,7 @@ pub(crate) struct HeaderParts {
 
 impl HeaderParts {
     pub(crate) fn of(lay: Layout, attached: bool, busy: bool, named: bool, meta: bool) -> Self {
-        let compact = lay.compact();
+        let compact = lay.short;
         HeaderParts { compact, name: attached, halt: busy, chip: named && !compact, meta: meta && !compact }
     }
 
@@ -651,15 +650,17 @@ impl HeaderParts {
     /// has a set height), so a switch of form can keep the transcript's
     /// rows where they are on screen.
     pub(crate) fn height(self) -> f32 {
-        1. + if self.compact {
-            HEADER_ROW
+        if self.compact {
+            crate::fit::HEADER_SHORT
         } else if self.meta || self.name {
-            // 20 + the title's 28 + 6 + the line's 20 + 17; the right
-            // column (NAME and HALT over the state) is 20 + 5 + 21 + 8 + 21.
-            91.
+            // 20 + the title's 28 + 6 + the line's 20 + 17 + the hairline;
+            // the right column (NAME and HALT over the state) is 20 + 5 +
+            // 21 + 8 + 21.
+            crate::fit::HEADER_FULL
         } else {
-            // 20 + the title + 16: nothing attached, nothing known.
-            64.
+            // 20 + the title + 16 + the hairline: nothing attached, nothing
+            // known.
+            65.
         }
     }
 }
@@ -727,6 +728,31 @@ impl PromptCard {
     }
 }
 
+/// What a key does to the authorization card while the window has the
+/// focus (nothing typed in does): Enter or Ctrl/Cmd+Enter answers yes, Esc
+/// no, Page Down / Page Up / Down / Up scroll its well. None of them is an
+/// app binding, and only the window's own focus sees them: the composer,
+/// find and every field keep theirs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CardKey {
+    Yes,
+    No,
+    Scroll { down: bool, page: bool },
+}
+
+pub(crate) fn card_key(ks: &Keystroke) -> Option<CardKey> {
+    let m = &ks.modifiers;
+    let bare = !(m.shift || m.alt || m.control || m.platform || m.function);
+    match ks.key.as_str() {
+        "enter" if !(m.shift || m.alt || m.function) && !(m.control && m.platform) => Some(CardKey::Yes),
+        "escape" if bare => Some(CardKey::No),
+        k @ ("pagedown" | "pageup" | "down" | "up") if bare => {
+            Some(CardKey::Scroll { down: matches!(k, "pagedown" | "down"), page: k.starts_with("page") })
+        }
+        _ => None,
+    }
+}
+
 /// AUTHORIZE may act: armed, and the whole body was on screen (it fits, or
 /// was scrolled to its end). `below`: the well's hidden height, `None`
 /// before its first layout.
@@ -782,7 +808,17 @@ pub struct AppView {
     pub(crate) waiting_on: Option<u64>,
     /// The centre pane's column at the last frame.
     pub(crate) layout: Layout,
+    /// What a rise of the list's top edge could not scroll (the list was
+    /// nearer its start), and where the list was then ([`AppView::keep_rows`]).
+    scroll_carry: Option<(f32, ListOffset)>,
+    /// The list's view grew while it was scrolled back: after this
+    /// frame's layout it must not have started following the tail.
+    hold_back: Rc<Cell<bool>>,
     composer: Entity<TextareaState>,
+    /// The rows the composer's text grows to ([`crate::fit::composer_rows`]).
+    composer_rows: usize,
+    /// The top bar's words, measured at the first frame.
+    pub(crate) top_words: Option<crate::fit::TopWords>,
     /// The rail's find (`/`; Enter opens by exact name) and "Name this
     /// session…" (header) inputs.
     pub(crate) find_input: Entity<InputState>,
@@ -1158,7 +1194,11 @@ impl AppView {
             rows_session: None,
             waiting_on: None,
             layout: Layout::of(800., 800., &Metrics::at(theme::DEFAULT_TEXT)),
+            scroll_carry: None,
+            hold_back: Rc::new(Cell::new(false)),
             composer: i.composer,
+            composer_rows: crate::fit::COMPOSER_ROWS,
+            top_words: None,
             find_input: i.find_input,
             name_input: i.name_input,
             hex_input: i.hex_input,
@@ -1973,6 +2013,42 @@ impl AppView {
         self.client.is_some() && self.model.can_send()
     }
 
+    /// The list's top edge moved by `shift` (the bars above it changed
+    /// form), and its view `grew` at the bottom (the card and composer
+    /// gave up room) or not. Following, nothing to do: the tail stays at
+    /// the bottom. Scrolled back, the list scrolls by `shift` too, so the
+    /// rows stay where they are on screen. Near the start a rise is
+    /// followed only as far as the first row; the fall that undoes it
+    /// gives back what was left over (unless the list was scrolled
+    /// meanwhile), so a round trip ends where it began. A view grown to the
+    /// transcript's end would set the list following the tail (GPUI does
+    /// at the end): `hold_back` stops it 2 px short instead, after the
+    /// layout, still scrolled back.
+    fn keep_rows(&mut self, shift: f32, grew: bool) {
+        // Between short and cramped the bars stay: what is owed stays owed.
+        let carry = if shift != 0. { self.scroll_carry.take() } else { None };
+        if self.list.is_following_tail() {
+            return;
+        }
+        self.hold_back.set(grew);
+        let (mut by, mut left) = (shift, 0.);
+        if shift > 0.
+            && let Some((owed, at)) = carry
+            && at == self.list.logical_scroll_top()
+        {
+            by -= owed;
+        } else if shift < 0. {
+            let offset = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+            left = (-shift - offset).max(0.);
+        }
+        if by != 0. {
+            self.list.scroll_by(px(by));
+        }
+        if left > 0. {
+            self.scroll_carry = Some((left, self.list.logical_scroll_top()));
+        }
+    }
+
     /// The card, if it shows the attached session's first pending prompt.
     pub(crate) fn current_card(&self) -> Option<&PromptCard> {
         self.card.as_ref().filter(|c| self.model.card_key() == Some(c.key))
@@ -2011,6 +2087,72 @@ impl AppView {
         }
     }
 
+    /// The session tab is on screen and its card shows the first prompt.
+    fn card_up(&self) -> bool {
+        self.model.tabs.view().is_none() && self.current_card().is_some()
+    }
+
+    /// The card's keys act: nothing typed in has the focus (the window's
+    /// own), or a secret prompt's field does (`Some(true)`: Enter there
+    /// submits). The composer, find and the other fields keep Enter and Esc.
+    fn card_keys_live(&self, window: &Window, cx: &App) -> Option<bool> {
+        if !self.card_up() {
+            None
+        } else if self.secret_input.read(cx).focus_handle(cx).is_focused(window) {
+            Some(true)
+        } else {
+            self.focus.is_focused(window).then_some(false)
+        }
+    }
+
+    /// The card's prompt, if this window may answer it now (as its
+    /// buttons: driving, not yet answered, armed).
+    fn card_answerable(&self) -> Option<(&PromptCard, bool)> {
+        let c = self.current_card()?;
+        let pr = self.model.transcript.pending_prompts().first()?;
+        (self.drives() && self.model.may_answer(pr.id) && c.armed()).then_some((c, pr.is_secret()))
+    }
+
+    /// Enter with the card's keys live. A confirm: AUTHORIZE, once the
+    /// whole body has been on screen (as the button); until then nothing.
+    /// A secret: its field takes the focus (Enter there submits).
+    fn card_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((c, secret)) = self.card_answerable() else { return };
+        let key = c.key;
+        if secret {
+            self.secret_input.update(cx, |s, cx| s.focus(window, cx));
+        } else {
+            self.authorize(key);
+        }
+        cx.notify();
+    }
+
+    /// Page Down / Page Up / Down / Up with the card's keys live: the well
+    /// a page (a line) further on or back, the keyboard's way to its end.
+    fn card_scroll(&mut self, down: bool, page: bool, cx: &mut Context<Self>) {
+        let Some(c) = self.current_card() else { return };
+        let s = &c.scroll;
+        let line = theme::metrics(cx).code_line;
+        let view = f32::from(s.bounds().size.height);
+        let by = if page { (view - 2. * line).max(line) } else { line };
+        let (at, max) = (s.offset(), s.max_offset());
+        let y = (f32::from(at.y) + if down { -by } else { by }).clamp(-f32::from(max.y), 0.);
+        s.set_offset(point(at.x, px(y)));
+        cx.notify();
+    }
+
+    /// Esc with the card's keys live: DENY, or a secret's CANCEL.
+    fn card_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((c, secret)) = self.card_answerable() else { return };
+        let key = c.key;
+        if secret {
+            self.answer_secret(false, window, cx);
+        } else {
+            self.answer(key, Some(CONFIRM_NO.into()));
+            cx.notify();
+        }
+    }
+
     /// AUTHORIZE: only once the whole body has been on screen.
     fn authorize(&mut self, key: (u64, u64)) {
         let ready = self.card.as_ref().is_some_and(|c| c.key == key && authorize_ready(c.armed(), c.below(), c.read));
@@ -2031,11 +2173,16 @@ impl AppView {
     }
 
     /// Keep the card's state with the prompt it shows ([`PromptCard::sync`]);
-    /// a new card also clears a half-typed secret meant for the previous one.
+    /// a new card also clears a half-typed secret meant for the previous one,
+    /// and takes the keys if nothing has the focus (a field that held it
+    /// went away): never from the composer or another field.
     fn sync_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if PromptCard::sync(&mut self.card, &self.model, Instant::now())
             && let Some(c) = self.card.as_mut()
         {
+            if window.focused(cx).is_none() {
+                window.focus(&self.focus, cx);
+            }
             c._arm = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(ARM).await;
                 let _ = this.update(cx, |_, cx| cx.notify());
@@ -2498,11 +2645,12 @@ impl AppView {
     }
 
     /// The centre column's header ([`HeaderParts`]). Full: title (and the
-    /// session's name), model · effort · folder under it; the actions (NAME,
-    /// HALT) top right, the session's state and cost under them. In a short
-    /// or tight pane one row: title, state, cost, NAME, HALT; model · effort
-    /// · folder are the title's tooltip. Fixed sizes (the text step scales
-    /// the transcript, card and composer), on the column, at
+    /// session's name), model · effort · folder under it (no folder in a
+    /// tight pane); the actions (NAME, HALT) top right, the session's state
+    /// and cost under them. In a short window one row: title, model ·
+    /// effort (unless tight), state, cost, NAME, HALT; the title's tooltip
+    /// has the whole second line. Fixed sizes (the text step scales the
+    /// transcript, card and composer), on the column, at
     /// [`HeaderParts::height`].
     fn render_header(&self, meta: HeaderMeta, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let lay = self.layout;
@@ -2537,7 +2685,7 @@ impl AppView {
         });
         let actions = h_flex()
             .flex_none()
-            .gap(px(if parts.compact { 18. } else { 22. }))
+            .gap(px(22.))
             .when(parts.name, |d| {
                 d.child(tbtn("name-session", label::NAME, p.dim, p.ink).on_click(cx.listener(|this, _, window, cx| {
                     this.model.toggle_naming();
@@ -2595,6 +2743,21 @@ impl AppView {
             .when(parts.compact && meta.detached, |d| d.child(mono("detached", 12., p.warn)))
             .when_some(self.model.stats.cost.filter(|_| attached), |d, c| d.child(mono(format!("${c:.2}"), 12., p.cost)));
         let row = if parts.compact {
+            // Model · effort beside the state, where the column has room:
+            // they give way to the title (which keeps 120 px), not it to them.
+            let mut known = h_flex().flex_shrink_1().min_w_0().overflow_hidden().gap(px(8.)).whitespace_nowrap();
+            let mut any = false;
+            if !lay.tight {
+                for (text, color) in [(meta.model.clone(), p.agent), (meta.effort.clone(), p.dim)] {
+                    if let Some(t) = text {
+                        if any {
+                            known = known.child(mono("·", 12., p.dim));
+                        }
+                        known = known.child(mono(t, 12., color).min_w_0().overflow_hidden().text_ellipsis());
+                        any = true;
+                    }
+                }
+            }
             let tip = meta;
             let shown = title.clone();
             h_flex()
@@ -2607,12 +2770,13 @@ impl AppView {
                         .font_family(face)
                         .line_height(px(20.))
                         .flex_1()
-                        .min_w_0()
+                        .min_w(px(120.))
                         .overflow_hidden()
                         .text_ellipsis()
                         // Formatted on hover only.
                         .tooltip(move |window, cx| Tooltip::new(tip.tooltip(&shown)).build(window, cx)),
                 )
+                .when(any, |d| d.child(known))
                 .child(stat)
                 .child(actions)
         } else {
@@ -2622,7 +2786,7 @@ impl AppView {
                 (meta.detached.then(|| SharedString::from("detached")), p.warn),
                 (meta.model, p.agent),
                 (meta.effort, p.dim),
-                (meta.cwd, p.dim),
+                (meta.cwd.filter(|_| !lay.tight), p.dim),
             ] {
                 if let Some(t) = text {
                     if sep {
@@ -2703,9 +2867,16 @@ impl AppView {
     /// `Client::answer`. The body is shown whole and verbatim in a scrolling
     /// well; AUTHORIZE waits until all of it has been on screen and the
     /// card is armed ([`ARM`]). On the raised prompt surface, outlined and
-    /// titled in `warning_color`.
-    fn render_prompt(&self, p: &Palette, m: &Metrics, cx: &Context<Self>) -> Option<impl IntoElement> {
+    /// titled in `warning_color`. Sized by [`crate::fit::Card`]: the well
+    /// takes what the column has left, from 3 lines (fewer if the body has
+    /// fewer) to the form's most, so the buttons and the composer stay on
+    /// screen. With `keys` live ([`AppView::card_keys_live`]) the buttons
+    /// show theirs: Enter answers yes (a secret's: in its field), Esc no.
+    fn render_prompt(&self, p: &Palette, m: &Metrics, keys: Option<bool>, cx: &Context<Self>) -> Option<impl IntoElement> {
         let lay = self.layout;
+        let form = lay.form();
+        let dims = crate::fit::Card::of(m, form);
+        let cramped = form == crate::fit::Form::Cramped;
         let prompts = self.model.transcript.pending_prompts();
         let pr = prompts.first()?;
         let secret = pr.is_secret();
@@ -2719,6 +2890,9 @@ impl AppView {
         let (head, kind) = if secret { (label::SECRET, "secret") } else { (label::AUTHORIZATION, "confirm") };
         let lead: SharedString = pr.title.clone().into();
         let detached = self.model.active.is_none();
+        let in_field = keys == Some(true);
+        let keys = keys.is_some() && can;
+        let key_hint = |k: &'static str| mono(k, m.meta, p.dim_k).flex_none();
         let actions = if detached {
             None
         } else if secret {
@@ -2728,13 +2902,19 @@ impl AppView {
                     .items_center()
                     .child(div().w(px((260. * m.r).round())).child(Input::new(&self.secret_input).disabled(!can).text_size(px(m.mono))))
                     .child(
-                        fbtn("p-submit", label::SUBMIT, can, p.warn_fill, p, m)
+                        fbtn_key("p-submit", label::SUBMIT, (keys && in_field).then_some("ENTER"), can, p.warn_fill, p, m)
                             .when(can, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(true, window, cx)))),
                     )
                     .child(
-                        tbtn("p-cancel", label::CANCEL, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
-                            .text_size(px(m.label))
-                            .when(can, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx)))),
+                        h_flex()
+                            .gap(px(8.))
+                            .items_center()
+                            .child(
+                                tbtn("p-cancel", label::CANCEL, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
+                                    .text_size(px(m.label))
+                                    .when(can, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx)))),
+                            )
+                            .when(keys, |d| d.child(key_hint("ESC"))),
                     ),
             )
         } else {
@@ -2743,21 +2923,30 @@ impl AppView {
                 h_flex()
                     .gap(px(22.))
                     .items_center()
-                    .child(fbtn("p-yes", label::AUTHORIZE, yes, p.warn_fill, p, m).when_some(key.filter(|_| yes), |d, key| {
-                        d.on_click(cx.listener(move |this, _, _, cx| {
-                            this.authorize(key);
-                            cx.notify();
-                        }))
-                    }))
+                    .child(fbtn_key("p-yes", label::AUTHORIZE, (keys && yes).then_some("ENTER"), yes, p.warn_fill, p, m).when_some(
+                        key.filter(|_| yes),
+                        |d, key| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                this.authorize(key);
+                                cx.notify();
+                            }))
+                        },
+                    ))
                     .child(
-                        tbtn("p-no", label::DENY, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
-                            .text_size(px(m.label))
-                            .when_some(key.filter(|_| can), |d, key| {
-                                d.on_click(cx.listener(move |this, _, _, cx| {
-                                    this.answer(key, Some(CONFIRM_NO.into()));
-                                    cx.notify();
-                                }))
-                            }),
+                        h_flex()
+                            .gap(px(8.))
+                            .items_center()
+                            .child(
+                                tbtn("p-no", label::DENY, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
+                                    .text_size(px(m.label))
+                                    .when_some(key.filter(|_| can), |d, key| {
+                                        d.on_click(cx.listener(move |this, _, _, cx| {
+                                            this.answer(key, Some(CONFIRM_NO.into()));
+                                            cx.notify();
+                                        }))
+                                    }),
+                            )
+                            .when(keys, |d| d.child(key_hint("ESC"))),
                     ),
             )
         };
@@ -2773,24 +2962,41 @@ impl AppView {
         } else if !self.drives() {
             Some(if self.client.is_none() { "offline: nothing to answer" } else { "read-only here" }.into())
         } else if !secret && let Some(n) = more {
-            Some(format!("↓ {n} more lines: scroll to the end to authorize").into())
+            Some(
+                if keys {
+                    format!("↓ {n} more lines: PgDn or scroll to the end")
+                } else {
+                    format!("↓ {n} more lines: scroll to the end to authorize")
+                }
+                .into(),
+            )
         } else if prompts.len() > 1 {
             Some(format!("+{} more waiting", prompts.len() - 1).into())
-        } else if lay.tight {
+        } else if lay.tight || cramped {
             None
         } else {
             Some("the session waits until you answer".into())
         };
         let body = card.map(|c| c.body.clone()).unwrap_or_else(|| pr.prompt.clone().into());
+        // Never squeezed under 3 lines, or under the body's own lines if it
+        // has fewer (it may wrap to more: they scroll).
+        let floor = (body.lines().count() as f32).clamp(1., crate::fit::WELL_MIN);
         let r = m.r;
+        // Whole lines, as many as the window has room for; less if the
+        // layout has less (an open naming row, an error line), down to the
+        // floor.
+        let rows = (1 + self.composer.read(cx).text().chunks().map(|c| c.matches('\n').count()).sum::<usize>()).min(self.composer_rows);
+        let lines = crate::fit::well_lines(m, form, self.height, rows, floor);
         let well = div()
             .id("prompt-well")
-            .mt(px((10. * r).round()))
-            .max_h(px(m.code_line * if lay.short { WELL_LINES_SHORT } else { WELL_LINES } + 2. * (10. * r).round()))
+            .mt(px(dims.well_gap))
+            .flex_shrink_1()
+            .min_h(px(dims.well(floor)))
+            .max_h(px(dims.well(lines)))
             .overflow_y_scroll()
             .when_some(card, |d, c| d.track_scroll(&c.scroll))
             .px(px((14. * r).round()))
-            .py(px((10. * r).round()))
+            .py(px(dims.well_pad))
             .bg(p.canvas)
             .font_family(fonts::MONO)
             .text_size(px(m.mono))
@@ -2803,52 +3009,96 @@ impl AppView {
             .flex_none()
             .child(div().absolute().inset_0().border_1().border_color(p.warn_mark))
             .child(div().absolute().top(px(3.)).left(px(3.)).size(px(4.)).bg(p.warn_mark));
+        // Cramped: the lead is the title (the head when there is none).
+        let title = if cramped && !lead.is_empty() {
+            div()
+                .text_size(px(m.card_lead))
+                .text_color(p.prose_k)
+                .whitespace_nowrap()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(lead.clone())
+        } else {
+            display(head, m.card_title, p.warn_k).min_w_0().overflow_hidden().text_ellipsis()
+        };
+        let lead_row = dims.lead.filter(|_| !lead.is_empty()).map(|(gap, line)| {
+            let d = div().flex_none().mt(px(gap)).text_size(px(m.card_lead)).line_height(px(line)).text_color(p.prose_k);
+            // A short window keeps it to one line (the body says the rest).
+            if lay.short { d.h(px(line)).whitespace_nowrap().overflow_hidden().text_ellipsis() } else { d }.child(lead)
+        });
+        let has_well = !pr.prompt.is_empty();
+        let floor_box = dims.boxed(floor)
+            - if has_well { 0. } else { dims.well_gap + dims.well(floor) }
+            - if lead_row.is_some() || cramped { 0. } else { dims.lead.map_or(0., |(gap, line)| gap + line) };
         Some(
-            column(
-                lay,
-                v_flex()
-                    .px(px((20. * r).round()))
-                    .py(px((16. * r).round()))
-                    .border_1()
-                    .border_color(p.warn_mark)
-                    .bg(p.card)
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap(px(12.))
-                            .child(g)
-                            .child(display(head, m.card_title, p.warn_k).min_w_0().overflow_hidden().text_ellipsis())
-                            .child(div().flex_1())
-                            .when(!lay.tight, |d| d.child(mono(kind, m.meta, p.dim_k))),
+            v_flex()
+                .id("prompt-card")
+                .flex_shrink_1()
+                .min_h(px(floor_box))
+                .mt(px(dims.top))
+                .ml(px(lay.left))
+                .mr(px(lay.right))
+                .px(px((20. * r).round()))
+                .py(px(dims.pad_y))
+                .border_1()
+                .border_color(p.warn_mark)
+                .bg(p.card)
+                // A click on a confirm card gives it the keys (a secret's
+                // field takes them itself).
+                .when(!secret, |d| {
+                    d.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if !this.focus.is_focused(window) {
+                                window.focus(&this.focus, cx);
+                                cx.notify();
+                            }
+                        }),
                     )
-                    .when(!lead.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .mt(px((8. * r).round()))
-                                .text_size(px(m.card_lead))
-                                .line_height(px(m.card_lead_line))
-                                .text_color(p.prose_k)
-                                .child(lead),
-                        )
-                    })
-                    .when(!pr.prompt.is_empty(), |d| d.child(well))
-                    .child(h_flex().mt(px((14. * r).round())).items_center().children(actions).child(div().flex_1()).when_some(
-                        footer,
-                        |d, f| {
+                })
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .when(cramped, |d| d.h(px(dims.title)).line_height(px(dims.title)))
+                        .items_center()
+                        .gap(px(12.))
+                        .child(g)
+                        .child(title)
+                        .child(div().flex_1())
+                        .when(!lay.tight && !cramped, |d| d.child(mono(kind, m.meta, p.dim_k))),
+                )
+                .children(lead_row)
+                .when(has_well, |d| d.child(well))
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .mt(px(dims.actions_gap))
+                        .h(px(dims.button))
+                        .items_center()
+                        .children(actions)
+                        .child(div().flex_1())
+                        .when_some(footer, |d, f| {
                             d.child(
-                                mono(f, m.meta, if more.is_some() && !sent { p.warn_k } else { p.dim_k }).overflow_hidden().text_ellipsis(),
+                                mono(f, m.meta, if more.is_some() && !sent { p.warn_k } else { p.dim_k })
+                                    .ml(px(16.))
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis(),
                             )
-                        },
-                    )),
-            )
-            .pt(px((6. * r).round())),
+                        }),
+                ),
         )
     }
 
     /// The composer: on the user surface, the user's bar on its left edge,
-    /// SEND (STEER while a turn runs) filled in `prompt_fg`.
-    fn render_composer(&self, p: &Palette, m: &Metrics, cx: &Context<Self>) -> impl IntoElement {
+    /// SEND (STEER while a turn runs) filled in `prompt_fg`. Sized by
+    /// [`crate::fit::Composer`]; cramped, SEND sits beside the text (a note
+    /// about the draft keeps its row). `to_card`: it has the focus while a
+    /// card waits; its hint says how to answer from the keyboard.
+    fn render_composer(&self, p: &Palette, m: &Metrics, to_card: bool, cx: &Context<Self>) -> impl IntoElement {
         let lay = self.layout;
+        let dims = crate::fit::Composer::of(m, lay.form());
         let busy = self.model.transcript.busy();
         let can_send = self.drives();
         let r = m.r;
@@ -2862,17 +3112,58 @@ impl AppView {
             "opening…"
         } else if !can_send {
             "not attached"
+        } else if to_card {
+            "Esc, then Enter answers the card yes, Esc no"
         } else if busy {
             "steer: applied at the next turn boundary"
         } else {
             "send: starts a turn"
         };
+        let send = fbtn("send", if busy { label::STEER } else { label::SEND }, can_send, p.btn_fill, p, m).on_click(cx.listener(
+            |this, _, window, cx| {
+                let text = this.composer.read(cx).value().trim().to_string();
+                if !text.is_empty() && this.submit(text) {
+                    this.composer.update(cx, |s, cx| s.set_value("", window, cx));
+                }
+                cx.notify();
+            },
+        ));
+        let field = Textarea::new(&self.composer)
+            .appearance(false)
+            .disabled(!can_send)
+            .text_size(px(m.body))
+            .line_height(px(m.body_line))
+            .text_color(p.ink);
+        let inline = dims.row_gap.is_none() && self.draft_note.is_none();
+        let inner = if inline {
+            h_flex().gap(px(12.)).items_center().child(div().flex_1().min_w_0().child(field)).child(send)
+        } else {
+            v_flex().child(field).child(
+                h_flex()
+                    .mt(px(dims.row_gap.unwrap_or((6. * r).round())))
+                    .items_center()
+                    .gap(px(20.))
+                    .child(if lay.tight {
+                        div().flex_1()
+                    } else {
+                        match &self.draft_note {
+                            Some(n) => mono(*n, m.meta, p.warn),
+                            None => mono(hint, m.meta, p.dim_u),
+                        }
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                    })
+                    .child(send),
+            )
+        };
         column(
             lay,
             v_flex()
                 .px(px(m.pad_x))
-                .pt(px(m.pad_y))
-                .pb(px((11. * r).round()))
+                .pt(px(dims.pad_top))
+                .pb(px(dims.pad_bottom))
                 .bg(p.user)
                 .relative()
                 .border_1()
@@ -2883,45 +3174,11 @@ impl AppView {
                 .line_height(px(m.body_line))
                 .text_color(p.ink)
                 // The kit sizes its own text: the step is set on it.
-                .child(
-                    Textarea::new(&self.composer)
-                        .appearance(false)
-                        .disabled(!can_send)
-                        .text_size(px(m.body))
-                        .line_height(px(m.body_line))
-                        .text_color(p.ink),
-                )
-                .child(
-                    h_flex()
-                        .mt(px((10. * r).round()))
-                        .items_center()
-                        .gap(px(20.))
-                        .child(if lay.tight {
-                            div().flex_1()
-                        } else {
-                            match &self.draft_note {
-                                Some(n) => mono(*n, m.meta, p.warn),
-                                None => mono(hint, m.meta, p.dim_u),
-                            }
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                        })
-                        .child(fbtn("send", if busy { label::STEER } else { label::SEND }, can_send, p.btn_fill, p, m).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                let text = this.composer.read(cx).value().trim().to_string();
-                                if !text.is_empty() && this.submit(text) {
-                                    this.composer.update(cx, |s, cx| s.set_value("", window, cx));
-                                }
-                                cx.notify();
-                            }),
-                        )),
-                ),
+                .child(inner),
         )
         .flex_none()
-        .pt(px((if lay.short { 6. } else { 10. } * r).round()))
-        .pb(px((if lay.short { 12. } else { 22. } * r).round()))
+        .pt(px(dims.top))
+        .pb(px(dims.bottom))
     }
 }
 
@@ -2933,17 +3190,32 @@ pub(crate) fn tbtn(id: &'static str, text: &'static str, color: Hsla, hover: Hsl
 /// A filled button (AUTHORIZE, SEND): its label is the chrome colour on
 /// `fill` (lifted until that reads at 4.5:1), dimmed when it cannot act.
 pub(crate) fn fbtn(id: &'static str, text: &'static str, enabled: bool, fill: Hsla, p: &Palette, m: &Metrics) -> Stateful<Div> {
+    fbtn_key(id, text, None, enabled, fill, p, m)
+}
+
+/// [`fbtn`] with the key that presses it, after the label.
+pub(crate) fn fbtn_key(
+    id: &'static str,
+    text: &'static str,
+    key: Option<&'static str>,
+    enabled: bool,
+    fill: Hsla,
+    p: &Palette,
+    m: &Metrics,
+) -> Stateful<Div> {
     let (bg, fg) = if enabled { (fill, p.chrome) } else { (p.edge, p.dim) };
     div()
         .id(id)
-        .h(px((30. * m.r).round().max(28.)))
+        .h(px(crate::fit::button_h(m)))
         .px(px(16.))
         .flex()
         .flex_none()
+        .gap(px(10.))
         .items_center()
         .bg(bg)
         .when(enabled, |d| d.cursor_pointer().hover(|d| d.opacity(0.88)))
         .child(display(text, m.label, fg))
+        .when_some(key, |d, k| d.child(mono(k, m.meta, fg)))
 }
 
 pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subagents::Subagents) -> RowCache {
@@ -3081,23 +3353,31 @@ impl Render for AppView {
         // pane takes its width. The session's column keeps its layout.
         let view_pane = (self.width - crate::chrome::MARK - rail.width()).max(0.);
         // Its height under the full top bar, whatever bar is drawn.
+        if self.top_words.is_none() {
+            self.top_words = Some(crate::chrome::top_words(window));
+        }
         let lay = Layout::of(pane, self.height - crate::chrome::TOP, &m);
         if (lay.hang, lay.tight) != (self.layout.hang, self.layout.tight) {
             self.list.remeasure();
             self.metrics_gen += 1;
-        } else if !self.list.is_following_tail() {
-            // Short or not: the list's top edge moves by what the bars above
-            // it gain or lose. Scrolled back, it scrolls as much with it, so
-            // the rows stay where they are on screen (following, the tail
-            // stays at the bottom anyway). Under Settings or Usage too: the
-            // session's list is back where it was when its tab is.
+        }
+        // Short or not: the list's top edge moves by what the bars above it
+        // gain or lose, and the rows keep their place on screen; after a
+        // remeasure too (a maximize crosses the hang width and the short
+        // height at once: the two scrolls compose). Under Settings or Usage
+        // too: the session's list is back where it was when its tab is.
+        if lay.form() != self.layout.form() {
             let (attached, known) = (self.header_attached(), self.header_known());
             let shift = above_list(lay, attached, known) - above_list(self.layout, attached, known);
-            if shift != 0. {
-                self.list.scroll_by(px(shift));
-            }
+            self.keep_rows(shift, (lay.form() as u8) > (self.layout.form() as u8));
         }
         self.layout = lay;
+        // The composer grows only into room the card's smallest form leaves.
+        let rows = crate::fit::composer_rows(&m, lay.form(), self.height, self.current_card().is_some());
+        if rows != self.composer_rows {
+            self.composer_rows = rows;
+            self.composer.update(cx, |s, cx| s.set_auto_grow(1, rows, cx));
+        }
         let tabs = self.render_tabs(if view.is_some() { view_pane } else { pane }, &p, cx);
         self.schedule_tabs_save(cx);
         if self.attach_wait.is_some() && self.attach_due.is_none() {
@@ -3110,6 +3390,22 @@ impl Render for AppView {
             .pr(px(pad_r))
             .pt(px((8. * m.r).round()))
             .pb(px((28. * m.r).round()));
+        // After the list's layout ([`AppView::keep_rows`]): a view grown to
+        // the end of a scrolled-back list set it following; it stops 2 px
+        // short of the end instead, still scrolled back.
+        let (held, hold) = (self.list.clone(), self.hold_back.clone());
+        let hold_back = canvas(
+            move |_, window, _| {
+                if hold.replace(false) && held.is_following_tail() {
+                    held.pause_following_tail();
+                    held.scroll_by(px(-2.));
+                    window.request_animation_frame();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_0();
         // A view draws in its own cached pane: this frame (a session
         // streaming behind it) reuses its last paint.
         let shown_view = view.filter(|k| *k != crate::tabs::Kind::Session).map(|k| {
@@ -3127,12 +3423,12 @@ impl Render for AppView {
                 .child(tabs)
                 .child(self.render_header(self.header_meta(), &p, cx))
                 .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
-                .child(div().flex_1().min_h_0().child(list))
-                .children(self.render_prompt(&p, &m, cx))
+                .child(div().flex_1().min_h_0().child(list).child(hold_back))
+                .children(self.render_prompt(&p, &m, self.card_keys_live(window, cx), cx))
                 .when_some(self.model.last_error.clone(), |d, e| {
                     d.child(column(lay, mono(e, m.meta, p.err).pt(px(6.)).whitespace_normal()))
                 })
-                .child(self.render_composer(&p, &m, cx))
+                .child(self.render_composer(&p, &m, self.card_up() && self.composer.read(cx).focus_handle(cx).is_focused(window), cx))
         };
         h_flex()
             .id("root")
@@ -3172,12 +3468,36 @@ impl Render for AppView {
                     window.focus(&this.focus, cx);
                     cx.stop_propagation();
                     cx.notify();
+                } else if ev.keystroke.key == "escape" && this.card_up() {
+                    if this.secret_input.read(cx).focus_handle(cx).is_focused(window) {
+                        // A secret prompt's field: CANCEL.
+                        cx.stop_propagation();
+                        if !ev.is_held {
+                            this.card_escape(window, cx);
+                        }
+                    } else if this.composer.read(cx).focus_handle(cx).is_focused(window) {
+                        // Out of the composer: the card's keys act.
+                        cx.stop_propagation();
+                        window.focus(&this.focus, cx);
+                        cx.notify();
+                    }
                 }
             }))
-            // `/` (nothing else focused) goes to find.
+            // `/` (nothing else focused) goes to find. With a card up, Enter
+            // (or Ctrl/Cmd+Enter) answers yes and Esc no.
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let m = &ev.keystroke.modifiers;
-                if ev.keystroke.key == "/" && !(m.control || m.alt || m.platform) && this.focus.is_focused(window) {
+                let card = card_key(&ev.keystroke).filter(|_| this.focus.is_focused(window) && this.card_up());
+                if let Some(c) = card {
+                    cx.stop_propagation();
+                    match c {
+                        // A held key never answers the card behind this one.
+                        CardKey::Yes | CardKey::No if ev.is_held => {}
+                        CardKey::Yes => this.card_enter(window, cx),
+                        CardKey::No => this.card_escape(window, cx),
+                        CardKey::Scroll { down, page } => this.card_scroll(down, page, cx),
+                    }
+                } else if ev.keystroke.key == "/" && !(m.control || m.alt || m.platform) && this.focus.is_focused(window) {
                     cx.stop_propagation();
                     let input = this.find_input.clone();
                     if !matches!(sides(this.width, this.panels, crate::chrome::MARK).0, Side::Open(_)) {
@@ -3267,11 +3587,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        CENTRE_MIN, FoldKeys, HeaderMeta, HeaderParts, Side, TabKey, above_list, authorize_ready, dragged, lines_below, one_line,
-        panel_keys, side_widths, sides, tab_keys, text_keys, toggled, well_body,
+        CENTRE_MIN, CardKey, FoldKeys, HeaderMeta, HeaderParts, Side, TabKey, above_list, authorize_ready, card_key, dragged, lines_below,
+        one_line, panel_keys, side_widths, sides, tab_keys, text_keys, toggled, well_body,
     };
     use crate::theme::{Metrics, Panels};
-    use crate::turns::{Layout, SHORT};
+    use crate::turns::Layout;
 
     /// Short is the pane's height alone, under the full top bar: 740 px,
     /// a 792-px window. It changes nothing the list's rows are laid out
@@ -3283,9 +3603,9 @@ mod tests {
         let pane_h = |window: f32| window - crate::chrome::TOP;
         for (window_h, short) in [(1080., false), (864., false), (800., false), (792., false), (791., true), (720., true), (600., true)] {
             let l = Layout::of(1000., pane_h(window_h), &m);
-            assert_eq!((l.short, l.compact()), (short, short), "{window_h}");
+            assert_eq!((l.short, HeaderParts::of(l, true, false, true, true).compact), (short, short), "{window_h}");
         }
-        assert_eq!(SHORT, 740.);
+        assert_eq!(crate::fit::short_below(&m), 740.);
         for w in [500., 900., 1600.] {
             let (tall, short) = (Layout::of(w, 1000., &m), Layout::of(w, 500., &m));
             assert_eq!(
@@ -3294,9 +3614,11 @@ mod tests {
             );
             assert!(!tall.short && short.short);
         }
-        // Tight compacts the header at any height; short or not is height alone.
-        let tight = Layout::of(532., 1000., &m);
-        assert!(tight.tight && !tight.short && tight.compact());
+        // L1: a tight pane keeps the full header (no folder); one row is for
+        // short windows only, so a panel dragged across 560 moves nothing.
+        let (tight, wide) = (Layout::of(532., 1000., &m), Layout::of(600., 1000., &m));
+        assert!(tight.tight && !tight.short && !HeaderParts::of(tight, true, false, true, true).compact);
+        assert_eq!(above_list(tight, true, true), above_list(wide, true, true));
     }
 
     /// NAME and HALT are in both forms; the name beside the title and the
@@ -3305,8 +3627,8 @@ mod tests {
     fn the_one_row_header_keeps_name_and_halt() {
         let m = Metrics::at(16);
         let full = Layout::of(1000., 1000., &m);
-        for lay in [Layout::of(1000., 600., &m), Layout::of(532., 1000., &m), Layout::of(532., 600., &m)] {
-            assert!(lay.compact());
+        for lay in [Layout::of(1000., 600., &m), Layout::of(532., 600., &m)] {
+            assert!(lay.short);
             for (attached, busy) in [(true, true), (true, false), (false, false)] {
                 let parts = HeaderParts::of(lay, attached, busy, true, true);
                 assert_eq!((parts.compact, parts.name, parts.halt, parts.chip, parts.meta), (true, attached, busy, false, false));
@@ -3325,9 +3647,10 @@ mod tests {
         let short = Layout::of(1000., 600., &m);
         assert_eq!(above_list(short, true, true) - above_list(full, true, true), -67.);
         assert_eq!(above_list(short, false, false) - above_list(full, false, false), -40.);
-        // Tight alone: the header only (the list remeasures then anyway).
-        let (tight, wide) = (Layout::of(532., 1000., &m), Layout::of(600., 1000., &m));
-        assert_eq!(above_list(tight, true, true) - above_list(wide, true, true), -55.);
+        // Cramped: the same bars as short.
+        let cramped = Layout::of(1000., 400., &m);
+        assert!(cramped.cramped && cramped.short);
+        assert_eq!(above_list(cramped, true, true), above_list(short, true, true));
     }
 
     /// The one-row header's title tooltip: the whole title, then what the
@@ -3505,7 +3828,31 @@ mod tests {
             for want in [TabKey::New, TabKey::Close, TabKey::Reopen, TabKey::Next, TabKey::Prev, TabKey::Last] {
                 assert!(tab_keys(mac).iter().any(|(_, w)| *w == want), "{want:?}");
             }
+            // The card's keys: no app binding is one of them (they act only
+            // with the window's own focus, so the inputs keep theirs).
+            let (s, u, alt) = crate::views::view_keys(mac, !mac);
+            let views: Vec<_> = [Some(s), Some(u), alt].into_iter().flatten().map(parse).collect();
+            for (k, _) in &app {
+                assert_eq!(card_key(k), None, "{k:?}");
+            }
+            for k in &views {
+                assert_eq!(card_key(k), None, "{k:?}");
+            }
         }
+        let card = |k: &'static str| card_key(&parse_any(k));
+        assert_eq!((card("enter"), card("ctrl-enter"), card("cmd-enter")), (Some(CardKey::Yes), Some(CardKey::Yes), Some(CardKey::Yes)));
+        assert_eq!(card("escape"), Some(CardKey::No));
+        assert_eq!(card("pagedown"), Some(CardKey::Scroll { down: true, page: true }));
+        assert_eq!(card("up"), Some(CardKey::Scroll { down: false, page: false }));
+        // Shift+Enter is a new line elsewhere; Shift+Esc, Ctrl+Esc and
+        // Shift+Down are not the card's.
+        for k in ["shift-enter", "alt-enter", "shift-escape", "ctrl-escape", "shift-down", "ctrl-pagedown", "a", "space"] {
+            assert_eq!(card(k), None, "{k}");
+        }
+    }
+
+    fn parse_any(k: &'static str) -> gpui_kit::Keystroke {
+        gpui_kit::Keystroke::parse(k).unwrap_or_else(|e| panic!("{k}: {e:?}"))
     }
 
     /// Wide windows widen the panels; folded ones are strips at any width;
