@@ -26,6 +26,7 @@ pub struct BenchOptions {
     pub stream_secs: f64,
     pub scroll_secs: f64,
     pub scroll_px_per_s: f32,
+    pub drag_secs: f64,
     pub history_messages: usize,
     pub diag: bool,
 }
@@ -34,6 +35,9 @@ pub struct BenchState {
     collector: FrameTimingCollector,
     pub frames: Vec<FrameEvent>,
     pub scroll: Option<(Instant, f32)>,
+    /// A side panel's edge dragged back and forth across its limits
+    /// (`rail`, else the right panel), one new width a frame.
+    pub drag: Option<(Instant, bool)>,
     pub animate: bool,
     pub submit_at: Option<Instant>,
     turn_seen: bool,
@@ -49,6 +53,7 @@ impl BenchState {
             collector: FrameTimingCollector::new(),
             frames: Vec::new(),
             scroll: None,
+            drag: None,
             animate: false,
             submit_at: None,
             turn_seen: false,
@@ -94,6 +99,16 @@ impl BenchState {
         if self.animate || self.scroll.is_some() {
             window.request_animation_frame();
         }
+    }
+
+    /// The width the dragged edge is at now: [`DRAG_PX_PER_S`] back and
+    /// forth between the panel's limits.
+    pub fn drag_width(&self) -> Option<(bool, f32)> {
+        let (t0, rail) = self.drag?;
+        let (lo, hi) = if rail { crate::theme::RAIL_WIDTHS } else { crate::theme::RIGHT_WIDTHS };
+        let (lo, hi) = (f32::from(lo), f32::from(hi));
+        let x = (t0.elapsed().as_secs_f32() * DRAG_PX_PER_S) % (2. * (hi - lo));
+        Some((rail, if x < hi - lo { lo + x } else { hi - (x - (hi - lo)) }))
     }
 
     fn drain(&mut self) {
@@ -172,6 +187,11 @@ impl BenchState {
         })
     }
 }
+
+/// How fast the bench drags an edge.
+const DRAG_PX_PER_S: f32 = 400.;
+/// The drag scenario's transcript, in user turns.
+const DRAG_TURNS: usize = 400;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
@@ -425,7 +445,50 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             sleep(0.3).await;
             out["mem_after_scroll"] = mem::sample();
 
-            // 4. One real turn against the daemon, if connected.
+            // 4. A 400-turn transcript at its end, both side panels' edges
+            //    dragged across their limits (every frame a new centre
+            //    width: the visible rows re-wrap).
+            let _ = upd(cx, &|v, _| {
+                v.model.set_local_session("bench-drag");
+                v.model.transcript = synaps_client::Transcript::new();
+                v.sync_list();
+                let mut h = synthetic::history(DRAG_TURNS * 3, 13);
+                let cut =
+                    h.iter().enumerate().filter(|(_, m)| m["role"] == "user" && m["content"].is_string()).nth(DRAG_TURNS).map(|(i, _)| i);
+                h.truncate(cut.unwrap_or(h.len()));
+                v.model.transcript.apply_history(&h);
+                v.sync_list();
+                v.list.set_follow_mode(FollowMode::Tail);
+                v.list.scroll_to_end();
+            });
+            sleep(0.4).await;
+            for (name, rail) in [("drag_rail", true), ("drag_right", false)] {
+                let t0 = Instant::now();
+                let _ = upd(cx, &move |v, _| {
+                    let b = v.bench.as_mut().unwrap();
+                    b.drag = Some((t0, rail));
+                    b.animate = true;
+                });
+                sleep(opts.drag_secs).await;
+                let t1 = Instant::now();
+                out[name] = view
+                    .update(cx, |v, _| {
+                        let b = v.bench.as_mut().unwrap();
+                        b.drag = None;
+                        b.animate = false;
+                        b.drain();
+                        let mut s = b.stats(t0, t1, refresh_fallback);
+                        s["rows"] = json!(v.model.transcript.len());
+                        s["turns"] = json!(DRAG_TURNS);
+                        s["px_per_s"] = json!(DRAG_PX_PER_S);
+                        s["window_w"] = json!(v.width);
+                        s
+                    })
+                    .unwrap_or(Value::Null);
+                sleep(0.2).await;
+            }
+
+            // 5. One real turn against the daemon, if connected.
             let has_client = view.update(cx, |v, _| v.client.is_some()).unwrap_or(false);
             if let (true, Some(prompt)) = (has_client, opts.prompt.clone()) {
                 let t_create = Instant::now();

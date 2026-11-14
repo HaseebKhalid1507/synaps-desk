@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 
 use gpui_kit::component::tooltip::Tooltip;
 
-use crate::app::{AppView, STRIP, Side, ToggleRail, ToggleRight, display, mono, section, tbtn};
+use crate::app::{AppView, EdgeDrag, STRIP, Side, ToggleRail, ToggleRight, display, mono, section, tbtn};
 use crate::fonts::{self, label};
 use crate::model::{ConnState, Model};
 use crate::named::RowAction;
@@ -27,6 +27,10 @@ const SEGMENTS: usize = 48;
 const STRIP_SEGMENTS: usize = 24;
 /// Files listed before "+N more".
 const FILES_SHOWN: usize = 40;
+/// The top bar's height: the side panels and their edges start under it.
+const TOP: f32 = 52.;
+/// An edge handle's hit area; its line is 1 px, on the panel's border.
+const EDGE: f32 = 6.;
 
 fn kv(key: &'static str, value: impl Into<SharedString>, big: bool, p: &Palette) -> impl IntoElement {
     let value = value.into();
@@ -311,6 +315,53 @@ impl AppView {
                         ),
                     ),
             )
+    }
+
+    /// The drag handle on a side panel's inner edge (`rail`, else the right
+    /// panel's), over the rest of the window: its 1-px line is the panel's
+    /// border, `line3` under the pointer, `ink3` while dragged. A strip has
+    /// one too (dragged out, it opens), unless the window cannot open it.
+    pub(crate) fn render_edge(&self, rail: bool, side: Side, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
+        if side == Side::Strip && crate::app::toggled(self.width, self.panels, rail).is_none() {
+            return None;
+        }
+        let dragged = self.drag.is_some_and(|g| g.moved && g.rail == rail);
+        // Mostly over the panel: the border is the rail's last pixel and
+        // the right panel's first.
+        let (left, line) = if rail { (MARK + side.width() - 4., 3.) } else { (self.width - side.width() - 2., 2.) };
+        let (id, group) = if rail { ("rail-edge", "rail-edge") } else { ("right-edge", "right-edge") };
+        Some(
+            div()
+                .id(id)
+                .group(group)
+                .absolute()
+                .top(px(TOP))
+                .bottom_0()
+                .left(px(left))
+                .w(px(EDGE))
+                .cursor(CursorStyle::ResizeLeftRight)
+                // The wheel still scrolls what is under it.
+                .block_mouse_except_scroll()
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(line))
+                        .w(px(1.))
+                        .when(dragged, |d| d.bg(p.ink3))
+                        .when(!dragged, |d| d.group_hover(group, |s| s.bg(p.line3))),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        this.grab_edge(rail, ev.position.x.into());
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_drag(EdgeDrag, |d, _, _, cx| cx.new(|_| *d))
+                .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| this.click_edge(rail, ev.click_count(), cx))),
+        )
     }
 
     /// The folded rail: the connection disc and how many sessions need
@@ -984,7 +1035,8 @@ impl AppView {
             .id("picker")
             .absolute()
             .map(|d| match right {
-                Side::Open(w) => d.top(px(52.)).right_0().w(px(w)),
+                // Over a right panel dragged narrower than its default: as wide as that.
+                Side::Open(w) => d.top(px(52.)).right_0().w(px(w.max(crate::app::FLOORS.1))),
                 Side::Strip => d.bottom(px(140.)).right(px(right.width() + 24.)).w(px(296.)),
             })
             .p(px(20.))
