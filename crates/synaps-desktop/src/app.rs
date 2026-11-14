@@ -164,7 +164,11 @@ impl FoldKeys {
         let repeat = match (self.pressed, self.released) {
             (None, _) => false,
             (Some(_), Some(up)) => now.saturating_duration_since(up) < Self::PAIR,
-            (Some(down), None) => now.saturating_duration_since(down) < Self::STALE,
+            // Not on macOS: AppKit drops the key-up of B when it is let go
+            // while Cmd is still held, so a quick unfold (or tapping B with
+            // Cmd held) would read as a repeat and do nothing. The cost
+            // there: holding Cmd+B flickers the panel.
+            (Some(down), None) => !cfg!(target_os = "macos") && now.saturating_duration_since(down) < Self::STALE,
         };
         self.pressed = Some(now);
         self.released = None;
@@ -1583,9 +1587,10 @@ mod tests {
         assert_eq!(sides(700., open, 30.), sides(700., both, 30.));
     }
 
-    /// M3: a held fold key toggles once. Wayland/Windows/macOS repeat with
-    /// no key-up; X11 sends a key-up right before each repeat.
+    /// M3: a held fold key toggles once. Wayland/Windows repeat with no
+    /// key-up; X11 sends a key-up right before each repeat.
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn fold_key_repeats_are_ignored() {
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
@@ -1607,6 +1612,21 @@ mod tests {
         // A key-up this window never saw: a press long after is a press.
         assert!(!k.press(ms(2000)), "within the first-repeat delay");
         assert!(k.press(ms(3200)));
+    }
+
+    /// R1 (PR #7 re-review): AppKit drops B's key-up while Cmd is held, so on
+    /// macOS a second press without a key-up is a press: fold, then unfold
+    /// at once, must both work. X11's paired key-up still marks a repeat.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fold_key_without_a_key_up_is_a_press_on_macos() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut k = FoldKeys::default();
+        assert!(k.press(ms(0)), "fold");
+        assert!(k.press(ms(300)), "unfold, Cmd still held, no key-up seen");
+        k.release(ms(400));
+        assert!(!k.press(ms(400)), "a key-up and a press at the same instant");
     }
 
     /// H3: the card shows a long prompt whole, and AUTHORIZE waits until
