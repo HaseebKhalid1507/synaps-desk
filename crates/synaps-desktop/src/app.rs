@@ -22,7 +22,7 @@ use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, Model, RenameRequ
 use crate::named::{ResumeRequest, RowAction, home_short};
 use crate::rail::{Bucket, Chip};
 use crate::stats::Stats;
-use crate::tabs::{Lru, Place, Saved};
+use crate::tabs::{Drafts, Lru, Place, Saved};
 use crate::theme::{self, Metrics, Palette};
 use crate::turns::{self, Disp, Kind, Layout, Summaries};
 
@@ -760,11 +760,11 @@ pub struct AppView {
     /// Each tab's composer draft by session (kept when its tab is left,
     /// put back when it is shown again), and the tab whose draft the
     /// composer holds.
-    drafts: crate::tabs::Drafts,
+    drafts: Drafts,
     composer_of: Option<(u64, Option<String>)>,
     /// Said in the composer's hint until the next send or switch (a draft
     /// came back with a send the daemon did not take).
-    draft_note: Option<SharedString>,
+    draft_note: Option<&'static str>,
     /// Bumped when the text metrics change every row's height (a cached
     /// tab's list is re-measured when it comes back).
     metrics_gen: u64,
@@ -1144,9 +1144,11 @@ impl AppView {
     /// that tab's draft (said when it is shown again), or the composer if
     /// it is shown again already.
     fn unsent(&mut self, session: String, text: String) {
+        // Its tab followed the session to a new id: that tab's.
+        let session = self.model.tabs.followed(&session).map_or(session, str::to_string);
         if self.composer_of.as_ref().is_some_and(|(_, s)| s.as_deref() == Some(session.as_str())) {
             self.effect(Effect::Restore(text));
-            self.draft_note = Some(UNSENT_NOTE.into());
+            self.draft_note = Some(UNSENT_NOTE);
             self.model.view_dirty = true;
         } else if self.model.tabs.knows(&session) {
             self.drafts.give_back(session, text, UNSENT_NOTE);
@@ -1156,29 +1158,31 @@ impl AppView {
         }
     }
 
-    /// The visible tab changed: the composer's text and caret go to the
-    /// tab left, the shown tab's come back. A pending tab named by its
-    /// create or resume keeps what the composer holds.
-    fn swap_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let now = self.model.tabs.visible().map(|t| (t.id, t.session.clone()));
-        if now == self.composer_of {
+    /// Input given back for the composer's tab goes in, then, if the
+    /// visible tab changed, the composer's text and caret go to the tab
+    /// left and the shown tab's come back ([`crate::tabs::Drafts::frame`]):
+    /// in that order, so input given back in the frame of a switch stays
+    /// with its tab. Nothing is read or allocated on a frame with neither.
+    fn sync_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.model.tabs.visible().map(|t| (t.id, t.session.as_deref()));
+        if self.restore.is_none() && Drafts::owns(self.composer_of.as_ref(), visible) {
             return;
         }
-        let prev = std::mem::replace(&mut self.composer_of, now.clone());
-        let (text, cursor) = {
-            let c = self.composer.read(cx);
-            (c.value().to_string(), c.cursor())
-        };
-        let Some(d) = self.drafts.switch(prev.as_ref(), now.as_ref(), text, cursor) else { return };
-        self.composer.update(cx, |c, cx| {
-            if !(d.text.is_empty() && c.value().is_empty()) {
-                c.set_value(d.text, window, cx);
-                c.set_selected_range(d.cursor..d.cursor, cx);
-            }
-        });
+        let c = self.composer.read(cx);
+        let (text, cursor) = (c.value(), c.cursor());
         let tabs = &self.model.tabs;
-        self.drafts.retain(|s| tabs.knows(s));
-        self.draft_note = d.note.map(SharedString::from);
+        let out =
+            self.drafts.frame(&mut self.composer_of, visible, self.restore.take(), &mut self.draft_note, (text.as_ref(), cursor), |s| {
+                tabs.knows(s)
+            });
+        if let Some((text, cursor)) = out {
+            self.composer.update(cx, |c, cx| {
+                c.set_value(text, window, cx);
+                if let Some(at) = cursor {
+                    c.set_selected_range(at..at, cx);
+                }
+            });
+        }
     }
 
     /// Resume a saved session: its folder as is, `~` if the daemon says it
@@ -1597,9 +1601,12 @@ impl AppView {
         if dropped == 0 {
             return;
         }
-        self.model.named.notice = Some(match dropped {
-            1 => "1 saved tab closed: its session is no longer open.".into(),
-            n => format!("{n} saved tabs closed: their sessions are no longer open."),
+        let early = std::mem::take(&mut self.model.tabs.dropped_early);
+        self.model.named.notice = Some(match (dropped, early) {
+            (1, false) => "1 saved tab closed: its session is no longer open (Ctrl+Shift+T reopens it).".into(),
+            (n, false) => format!("{n} saved tabs closed: their sessions are no longer open (Ctrl+Shift+T reopens them)."),
+            (1, true) => "1 saved tab closed before its session came back (Ctrl+Shift+T reopens it).".into(),
+            (n, true) => format!("{n} saved tabs closed before their sessions came back (Ctrl+Shift+T reopens them)."),
         });
         self.model.rail_gen += 1;
         self.model.view_dirty = true;
@@ -1734,6 +1741,13 @@ impl AppView {
             self.model.last_error = Some("offline".into());
             return false;
         };
+        // The composer's text is the visible tab's only once the frame after
+        // a switch has swapped the drafts: never sent to another session.
+        if !Drafts::owns(self.composer_of.as_ref(), self.model.tabs.visible().map(|t| (t.id, t.session.as_deref()))) {
+            self.model.last_error = Some("switching tabs: not sent".into());
+            self.model.view_dirty = true;
+            return false;
+        }
         if !self.model.can_send() {
             self.model.last_error = Some(if self.model.switching() {
                 "switching sessions: not sent".into()
@@ -2570,7 +2584,7 @@ impl AppView {
                             div().flex_1()
                         } else {
                             match &self.draft_note {
-                                Some(n) => mono(n.clone(), m.meta, p.warn),
+                                Some(n) => mono(*n, m.meta, p.warn),
                                 None => mono(hint, m.meta, p.dim_u),
                             }
                             .flex_1()
@@ -2679,16 +2693,7 @@ struct Inputs {
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diag::mark("first_render");
-        self.swap_draft(window, cx);
-        if let Some(text) = self.restore.take() {
-            // Refused input goes back where it was typed, ahead of anything
-            // typed since.
-            self.composer.update(cx, |s, cx| {
-                let now = s.value().trim().to_string();
-                let text = if now.is_empty() { text } else { format!("{text}\n{now}") };
-                s.set_value(text, window, cx);
-            });
-        }
+        self.sync_composer(window, cx);
         if std::mem::take(&mut self.model.named.opened) {
             self.find_input.update(cx, |s, cx| s.set_value("", window, cx));
             self.find.clear();
@@ -2758,8 +2763,14 @@ impl Render for AppView {
             // Esc closes the picker, wherever the focus is; in find it clears
             // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                // The letter as the key or as what it types: a binding matches
+                // either (a "Dvorak – QWERTY ⌘" layout on macOS).
+                let k_is = |k: OnceKey| {
+                    let ks = &ev.keystroke;
+                    ks.key.eq_ignore_ascii_case(k.letter()) || ks.key_char.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(k.letter()))
+                };
                 if let Some(k) = this.once.take()
-                    && ev.keystroke.key.eq_ignore_ascii_case(k.letter())
+                    && k_is(k)
                 {
                     cx.stop_propagation();
                     return this.once_key(k, ev.is_held, cx);
