@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 
 use gpui_kit::component::tooltip::Tooltip;
 
-use crate::app::{AppView, EdgeDrag, STRIP, Side, ToggleRail, ToggleRight, display, mono, section, tbtn};
+use crate::app::{AppView, EdgeDrag, STRIP, Side, ToggleRail, ToggleRight, count, display, mono, section, tbtn};
 use crate::fonts::{self, label};
 use crate::model::{ConnState, Model};
 use crate::named::RowAction;
@@ -318,7 +318,7 @@ impl AppView {
                                 .items_center()
                                 .justify_center()
                                 .bg(if subagents > 0 { p.ink } else { p.edge })
-                                .child(mono(subagents.to_string(), 10., if subagents > 0 { p.chrome } else { p.dim_ch })),
+                                .child(mono(count(subagents), 10., if subagents > 0 { p.chrome } else { p.dim_ch })),
                         ),
                     ),
             )
@@ -672,8 +672,8 @@ impl AppView {
                 .items_baseline()
                 .gap(px(5.))
                 .child(display(w, 9.5, word_color(st, p)))
-                .when(st == State::NeedsYou && waiting > 1, |d| d.child(mono(waiting.to_string(), 10., p.warn_ch)))
-                .when(st == State::Workers, |d| d.child(mono(workers.to_string(), 10., p.run_ch)))
+                .when(st == State::NeedsYou && waiting > 1, |d| d.child(mono(count(waiting), 10., p.warn_ch)))
+                .when(st == State::Workers, |d| d.child(mono(count(workers), 10., p.run_ch)))
         });
         div()
             .id(("rail-row", key as usize))

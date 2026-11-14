@@ -519,10 +519,14 @@ impl Subagents {
         self.calls.get(tool_id).is_some_and(|c| c.w.status.is_some_and(Status::running))
     }
 
-    /// Workers running, as the blocks say (and those no call claims).
+    /// Background workers running, as the blocks say (and those no call
+    /// claims), counted as the daemon counts them (SynapsCLI #410): not
+    /// one whose cancel was asked for, and no blocking `subagent`'s (it
+    /// never outlives its turn, and the daemon's registry does not hold
+    /// it).
     pub fn running_count(&self) -> usize {
-        let run = |w: &Worker| w.status.is_some_and(Status::running);
-        self.calls.values().filter(|c| run(&c.w)).count() + self.orphans.values().filter(|w| run(w)).count()
+        let run = |w: &Worker| w.status == Some(Status::Running);
+        self.calls.values().filter(|c| c.kind != Kind::Oneshot && run(&c.w)).count() + self.orphans.values().filter(|w| run(w)).count()
     }
 
     /// A live source (an event, a row) has spoken of a worker since the
@@ -703,6 +707,17 @@ impl Subagents {
                 if c.w.name.is_empty() {
                     c.w.name = head.trim_end_matches(" ERROR").to_string();
                 }
+            } else if c.w.status.is_some() && !c.w.ended() {
+                // Any other result ends its worker too. A HALT (or a cost
+                // cap, a host stop) drops the tool: no `SubagentDone`
+                // comes, and no row ever reports a blocking worker. Its
+                // result is then `Canceled …`; else the tool's own error.
+                let (s, reason) = if text.starts_with("Canceled") || text.contains("\n\n[Canceled") {
+                    (Status::Cancelled, None)
+                } else {
+                    (Status::Failed, Some(first_line(text)))
+                };
+                c.w.set_status(s, reason, true);
             }
             return self.changed(id);
         }
@@ -871,6 +886,15 @@ impl Subagents {
         let Some(c) = self.calls.get_mut(tool_id) else { return };
         if self.by_id.get(&n).map(String::as_str) == Some(tool_id) {
             c.named |= named;
+            return;
+        }
+        // Its own result read again (a replacement repeats the history)
+        // while a later call has `n`: `n`'s history from here on is this
+        // call's, and the later call keeps its worker (the end of the
+        // reset gives `n` back to it).
+        if c.w.id == Some(n) && self.by_id.contains_key(&n) {
+            c.named |= named;
+            self.by_id.insert(n, tool_id.to_string());
             return;
         }
         if let Some(old) = c.w.id.filter(|&o| o != n) {
@@ -1310,6 +1334,86 @@ mod tests {
         result(&mut t, "q", "[subagent:twin ERROR] boom");
         assert_eq!(shown(&t, "p").map(|v| (v.0, v.3)), Some(("completed", Some("second".into()))));
         assert_eq!(shown(&t, "q").map(|v| (v.0, v.3)), Some(("failed", Some("reason: boom".into()))));
+    }
+
+    /// N-M1: a blocking `subagent` cut off by a HALT, a cost cap or a host
+    /// stop. The tool is dropped (no `SubagentDone`, and no row reports a
+    /// blocking worker); its result is `Canceled …`, partial output first
+    /// or not. Its worker is over: cancelled, and nothing counts it. Any
+    /// other result ends it too (failed, its first line the reason); a
+    /// call that never started one shows nothing, and an end already
+    /// heard stays.
+    #[test]
+    fn a_blocking_subagent_cut_off_is_over() {
+        let ids = ["o", "p", "q", "r", "e"];
+        let mut s = Subagents::default();
+        for (n, id) in ids.into_iter().enumerate() {
+            tool_use(&mut s, id, "subagent", json!({"agent": "digger", "task": id}));
+            start(&mut s, n as u64 + 1, "digger", id);
+        }
+        tool_use(&mut s, "never", "subagent", json!({"agent": "digger", "task": "never"}));
+        update(&mut s, 1, "\u{2699} bash (tool #1)");
+        assert!(s.running("o") && s.heard());
+        assert_eq!(s.running_count(), 0, "blocking workers are not background ones");
+        done(&mut s, 5, "fine", 1.0);
+        result(&mut s, "o", "Canceled by user");
+        result(&mut s, "p", "$ ls\n\n[Canceled (session cost cap reached) before the tool finished; the output above is partial.]");
+        result(&mut s, "q", "Canceled (session stopped by the host). It had already started and may have partially applied its effects.");
+        result(&mut s, "r", "worker thread initialization failed\nmore");
+        result(&mut s, "e", "Canceled by user");
+        result(&mut s, "never", "Canceled by user");
+        let words = ids.map(|id| word(&s, id));
+        assert_eq!(words, [Some("cancelled"), Some("cancelled"), Some("cancelled"), Some("failed"), Some("completed")]);
+        assert_eq!(shown(&s, "o").unwrap().3, None, "no reason line: the word says it");
+        assert_eq!(shown(&s, "r").unwrap().3.as_deref(), Some("reason: worker thread initialization failed"));
+        assert_eq!(word(&s, "never"), None, "never started: no block");
+        assert!(ids.iter().all(|id| !s.running(id)));
+    }
+
+    /// N-L2: a worker whose cancel was asked for runs until its next step,
+    /// but the daemon no longer counts it (#410), so neither does this.
+    /// Its run stays open until it ends.
+    #[test]
+    fn a_cancelling_worker_is_not_counted() {
+        let mut s = Subagents::default();
+        tool_use(&mut s, "t", "subagent_start", json!({"agent": "a", "task": "one"}));
+        result(&mut s, "t", &handle(1, "a"));
+        rows(&mut s, json!([row(1, "a", json!("running"), 2.0, None, "ls", 1)]));
+        assert_eq!(s.running_count(), 1);
+        let mut r = row(1, "a", json!("running"), 3.0, None, "ls", 1);
+        r["cancel_requested"] = json!(true);
+        rows(&mut s, json!([r]));
+        assert_eq!((word(&s, "t"), s.running("t"), s.running_count()), (Some("cancelling"), true, 0));
+    }
+
+    /// N-L1: a replacement mid-run re-reads an older call's own result
+    /// naming `sa_1` while a later blocking call's live worker is `sa_1`
+    /// (the ids restarted with the daemon). Neither block takes the
+    /// other's worker, and `sa_1`'s events reach the live call again.
+    #[test]
+    fn a_replace_never_hands_a_live_worker_to_an_older_call() {
+        let history = vec![
+            call("h1", "subagent_start", json!({"agent": "scout", "task": "map it"})),
+            answer("h1", &handle(1, "scout")),
+            user(&completion_event(1, "scout", "completed", 4.0, None, "found it")),
+            // (the daemon restarted)
+            call("o", "subagent", json!({"agent": "digger", "task": "dig"})),
+        ];
+        let o = |s: &Subagents| shown(s, "o").map(|v| (v.0, v.1, v.3));
+        let h1 = |s: &Subagents| shown(s, "h1").map(|v| (v.0, v.1, v.2, v.3));
+        let digging = Some(("running", "digger".to_string(), Some("digging".to_string())));
+        let ended = Some(("completed", "scout".to_string(), "4.0s".to_string(), Some("found it".to_string())));
+        let mut s = Subagents::default();
+        s.reset(&history[..3], false);
+        tool_use(&mut s, "o", "subagent", json!({"agent": "digger", "task": "dig"}));
+        start(&mut s, 1, "digger", "dig");
+        update(&mut s, 1, "digging");
+        assert_eq!((o(&s), h1(&s)), (digging.clone(), ended.clone()));
+        s.reset(&history, true);
+        assert_eq!((o(&s), h1(&s)), (digging, ended.clone()), "each keeps its own");
+        update(&mut s, 1, "deeper");
+        assert_eq!(shown(&s, "o").unwrap().3.as_deref(), Some("deeper"));
+        assert_eq!(h1(&s), ended);
     }
 
     /// Ids restart after a daemon reload: a start under an id a finished

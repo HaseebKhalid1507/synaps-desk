@@ -493,11 +493,13 @@ impl Model {
     }
 
     /// The attached session's workers running ([`Model::workers`]; not
-    /// listed yet, a create: its transcript's).
+    /// listed yet, a create: its transcript's). Nothing attached (a cached
+    /// tab on its way back, a detach): none, never a count last seen.
     pub fn active_workers(&self) -> usize {
         match self.active_meta() {
             Some(s) => self.workers(s),
-            None => self.stats.subagents.running_count(),
+            None if self.active.is_some() => self.stats.subagents.running_count(),
+            None => 0,
         }
     }
 
@@ -1520,6 +1522,53 @@ mod tests {
         assert_eq!(st(&m, "s"), State::Workers);
         m.apply(list(0));
         assert_eq!(st(&m, "s"), State::Idle);
+    }
+
+    /// N-M1: a blocking `subagent` cut off by HALT (its tool dropped: no
+    /// `SubagentDone`, no row) leaves no WORKERS once the turn ends; its
+    /// block says cancelled. N-L3: with nothing attached (a cached tab
+    /// shown while its attach is on its way, a detach), no count last
+    /// seen is shown.
+    #[test]
+    fn a_halted_blocking_subagent_leaves_no_workers() {
+        let ev = |v: Value| session(1, synaps_client::protocol::decode_event(&v).unwrap());
+        let ev2 = |v: Value| session(2, synaps_client::protocol::decode_event(&v).unwrap());
+        let llm = |v: Value| json!({"ev": "stream", "event": v});
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(Event::Sessions(metas(json!([{"id": "s", "lifecycle": "live", "busy": false, "subagents_running": 0}]))));
+        let st = |m: &Model| m.state(&m.sessions[0]);
+        attach(&mut m, 1);
+        m.apply(ev(json!({"ev": "turn_started", "user_text": "dig"})));
+        m.apply(ev(llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "subagent", "tool_id": "o",
+            "input": {"agent": "digger", "task": "dig"}}))));
+        m.apply(ev(llm(
+            json!({"kind": "agent", "agent": "subagent_start", "subagent_id": 1, "agent_name": "digger", "task_preview": "dig"}),
+        )));
+        assert!(m.stats.subagents.running("o"));
+        assert_eq!((st(&m), m.active_workers()), (State::Running, 0));
+        // HALT: the canceled result, the turn aborted.
+        m.apply(ev(llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "o", "result": "Canceled by user"}))));
+        m.apply(ev(json!({"ev": "aborted"})));
+        assert_eq!((st(&m), m.active_workers()), (State::Idle, 0), "not WORKERS");
+        assert_eq!(m.stats.subagents.view("o").map(|v| v.word), Some("cancelled"));
+        // A background worker running on: WORKERS 1, from its own rows.
+        let row = json!({"ev": "subagent_rows", "rows": [{"subagent_id": 2, "agent_name": "scout", "status": "running",
+            "cancel_requested": false, "elapsed_secs": 3.0, "finished_elapsed": null, "step": "ls", "tools": 1}]});
+        m.apply(ev(llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start", "tool_id": "t",
+            "input": {"agent": "scout", "task": "look"}}))));
+        m.apply(ev(llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "t",
+            "result": json!({"handle_id": "sa_2", "agent_name": "scout", "status": "running"}).to_string()}))));
+        m.apply(ev(row.clone()));
+        assert_eq!((st(&m), m.active_workers()), (State::Workers, 1));
+        // The tab left and shown again from the cache, its attach on the way.
+        let (t, s) = m.switch_out();
+        m.switch_in(t, s);
+        assert_eq!((m.stats.subagents.running_count(), m.active_workers()), (1, 0), "the cache's count is not shown");
+        attach(&mut m, 2);
+        m.apply(ev2(row));
+        assert_eq!(m.active_workers(), 1);
+        m.apply(Event::Detached { attach_seq: 2, session_id: Some("s".into()), reason: "gone".into() });
+        assert_eq!(m.active_workers(), 0);
     }
 
     /// UNREAD is the client's: the poll saw a turn end, or messages rise,
