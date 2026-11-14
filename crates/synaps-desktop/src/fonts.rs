@@ -43,8 +43,12 @@ pub fn register(cx: &mut App) {
 
 /// Every Japanese sub-label. `subset.sh` keeps exactly these glyphs.
 #[cfg(test)]
-const JP_LABELS: &[&str] = &[JP_SESSIONS, JP_CONTEXT, JP_TOKENS, JP_FILES, JP_MARK_1, JP_MARK_2];
+const JP_LABELS: &[&str] = &[JP_SESSIONS, JP_CONTEXT, JP_TOKENS, JP_FILES, JP_MARK_1, JP_MARK_2, JP_PINNED, JP_OPEN, JP_HISTORY];
 pub const JP_SESSIONS: &str = "セッション";
+/// The rail's groups: PINNED, OPEN, HISTORY.
+pub const JP_PINNED: &str = "固定";
+pub const JP_OPEN: &str = "稼働";
+pub const JP_HISTORY: &str = "履歴";
 pub const JP_CONTEXT: &str = "文脈";
 pub const JP_TOKENS: &str = "トークン";
 pub const JP_FILES: &str = "変更";
@@ -58,10 +62,7 @@ pub mod label {
     pub const WORD_2: &str = "D E S K T O P";
     pub const SESSIONS: &str = "S E S S I O N S";
     pub const NEW: &str = "+  N E W";
-    pub const ALL: &str = "A L L";
-    pub const LIVE: &str = "L I V E";
     pub const NEEDS_YOU: &str = "N E E D S   Y O U";
-    pub const IDLE: &str = "I D L E";
     pub const NEED_YOU: &str = "N E E D   Y O U";
     pub const JUMP: &str = "J U M P";
     pub const SYSTEMS: &str = "S Y S T E M S";
@@ -95,13 +96,30 @@ pub mod label {
     pub const CLOSE: &str = "C L O S E";
     pub const SAVE: &str = "S A V E";
     pub const REPLACE: &str = "R E P L A C E";
-    pub const NAMED: &str = "N A M E D";
-    pub const OPEN: &str = "O P E N   B Y   N A M E";
     pub const RUNNING: &str = "R U N N I N G";
-    pub const PARKED: &str = "P A R K E D";
+    pub const OPENING: &str = "O P E N I N G";
+    pub const LOCKED: &str = "L O C K E D";
+    pub const UNREAD: &str = "U N R E A D";
     pub const PINNED: &str = "P I N N E D";
-    pub const SAVED: &str = "S A V E D";
-    pub const RESUMING: &str = "R E S U M I N G";
+    pub const OPEN_GROUP: &str = "O P E N";
+    pub const HISTORY: &str = "H I S T O R Y";
+    pub const NAMED: &str = "N A M E D";
+    pub const TODAY: &str = "T O D A Y";
+    pub const THIS_WEEK: &str = "T H I S   W E E K";
+    pub const THIS_MONTH: &str = "T H I S   M O N T H";
+    pub const OLDER: &str = "O L D E R";
+    pub const MORE: &str = "M O R E";
+    // The hover readout's keys.
+    pub const R_STATE: &str = "S T A T E";
+    pub const R_HELD: &str = "H E L D";
+    pub const R_TITLE: &str = "T I T L E";
+    pub const R_MODEL: &str = "M O D E L";
+    pub const R_CWD: &str = "C W D";
+    pub const R_SIZE: &str = "S I Z E";
+    pub const R_CLIENTS: &str = "C L I E N T S";
+    pub const R_LOCK: &str = "L O C K";
+    pub const R_ID: &str = "I D";
+    pub const R_UPDATED: &str = "U P D A T E D";
 }
 
 #[cfg(test)]

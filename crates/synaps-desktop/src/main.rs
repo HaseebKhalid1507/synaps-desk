@@ -26,6 +26,7 @@ mod fonts;
 mod mem;
 mod model;
 mod named;
+mod rail;
 mod shell;
 mod stats;
 mod theme;
@@ -171,6 +172,8 @@ fn main() {
                 v.start_session = start_session;
                 v.picker_open = open_picker;
                 v.panels = panels;
+                // OLDER left open: list up to the wire's cap from the start.
+                v.model.named.deep = panels.history_open & rail::Bucket::Older.bit() != 0;
                 v.accent_source = accent_source;
                 v
             })

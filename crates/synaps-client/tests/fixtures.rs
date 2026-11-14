@@ -73,6 +73,28 @@ fn one_bad_session_entry_is_skipped_and_counted() {
     assert_eq!((sessions.len(), rejected), (1, 2));
 }
 
+/// `roster`, `park_due` and `evict_due` (the daemon's `SessionMeta`):
+/// decoded when sent, empty or `None` from a daemon that omits them, and a
+/// bad roster entry costs only itself.
+#[test]
+fn session_meta_mirrors_roster_and_park_times() {
+    let DaemonFrame::SessionList { sessions, .. } = decode_frame(fixture("session_list.json").trim()).unwrap() else { panic!() };
+    assert_eq!(sessions[0].park_due.as_deref(), Some("2026-11-13T07:35:22.076213017Z"));
+    assert_eq!(sessions[0].evict_due, None);
+    assert!(sessions[0].roster.is_empty());
+    let list = r#"{"type":"session_list","sessions":[{"id":"a","lifecycle":"parked","evict_due":"2026-11-13T08:35:22Z",
+        "roster":[{"id":3,"name":"tui","kind":"tui","mode":"mirror","attached_at_ms":1794555143000},{"id":"x"},
+                  {"id":4,"name":"desktop","kind":"rpc","mode":"observe","attached_at_ms":1}]},
+        {"id":"b","roster":null}]}"#;
+    let DaemonFrame::SessionList { sessions, rejected } = decode_frame(list).unwrap() else { panic!() };
+    assert_eq!(rejected, 0);
+    let names: Vec<(u64, &str, &str)> = sessions[0].roster.iter().map(|c| (c.id, c.name.as_str(), c.mode.as_str())).collect();
+    assert_eq!(names, [(3, "tui", "mirror"), (4, "desktop", "observe")]);
+    assert_eq!(sessions[0].evict_due.as_deref(), Some("2026-11-13T08:35:22Z"));
+    assert!(sessions[1].roster.is_empty());
+    assert_eq!(sessions[1], SessionMeta { id: "b".into(), ..SessionMeta::default() });
+}
+
 /// M5: a new variant is `Ok(Unknown)`; a known one that changed shape is a
 /// `DecodeError` naming it.
 #[test]

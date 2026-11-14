@@ -1,6 +1,7 @@
 //! The window's frame around the session: the mark strip, the top bar (what
-//! needs you, connection, the accent picker), the sessions rail (filters,
-//! the named sessions, the live ones) and the right-hand numbers.
+//! needs you, connection, the accent picker), the sessions rail (find, the
+//! count chips, PINNED / OPEN / HISTORY, the hover readout) and the
+//! right-hand numbers.
 
 use gpui_kit::component::input::Input;
 use gpui_kit::component::{h_flex, v_flex};
@@ -12,10 +13,11 @@ use std::hash::{Hash, Hasher};
 
 use gpui_kit::component::tooltip::Tooltip;
 
-use crate::app::{AppView, STRIP, Side, ToggleRail, ToggleRight, display, home_short, mono, section, tbtn};
+use crate::app::{AppView, STRIP, Side, ToggleRail, ToggleRight, display, mono, section, tbtn};
 use crate::fonts::{self, label};
-use crate::model::{ConnState, Filter, Model, SAVED_LIMIT};
-use crate::named::{Marker, RowAction, relative, short_model};
+use crate::model::{ConnState, Model};
+use crate::named::RowAction;
+use crate::rail::{self, Chip, Item, Rail, State};
 use crate::stats::compact;
 use crate::theme::{self, Palette};
 
@@ -27,28 +29,6 @@ const STRIP_SEGMENTS: usize = 24;
 /// Files listed before "+N more".
 const FILES_SHOWN: usize = 40;
 
-fn status(m: Marker, p: &Palette) -> (&'static str, Hsla, bool) {
-    match m {
-        Marker::Awaiting => (label::NEEDS_YOU, p.hi, true),
-        Marker::Busy => (label::RUNNING, p.ink, true),
-        Marker::Resuming => (label::RESUMING, p.ink2, true),
-        Marker::Pinned => (label::PINNED, p.ink3, false),
-        Marker::Idle => (label::IDLE, p.ink4, false),
-        Marker::Parked => (label::PARKED, p.ink4, false),
-        Marker::Saved => (label::SAVED, p.ink4, false),
-    }
-}
-
-/// `■ RUNNING` (filled) / `□ IDLE` (hollow).
-fn status_chip(m: Marker, p: &Palette) -> impl IntoElement {
-    let (text, color, filled) = status(m, p);
-    h_flex()
-        .gap(px(7.))
-        .items_center()
-        .child(div().size(px(5.)).flex_none().when(filled, |d| d.bg(color)).when(!filled, |d| d.border_1().border_color(color)))
-        .child(display(text, 9.5, color))
-}
-
 fn kv(key: &'static str, value: impl Into<SharedString>, big: bool, p: &Palette) -> impl IntoElement {
     let value = value.into();
     v_flex().gap(px(5.)).child(display(key, 9.5, p.ink4)).child(if big {
@@ -58,88 +38,79 @@ fn kv(key: &'static str, value: impl Into<SharedString>, big: bool, p: &Palette)
     })
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// One rail row's strings, built when the lists change, not per frame.
-pub(crate) struct RailRow {
-    /// A hash of the session (or journal) id: the row's element id, so a
-    /// reorder by the poll does not move hover and clicks to another row.
-    key: usize,
-    title: SharedString,
-    sub: SharedString,
-    age: SharedString,
-    /// Index in [`Model::sessions`] of a live row.
-    live: Option<usize>,
-    /// The marker of a row that is not live (saved, resuming).
-    marker: Marker,
-    action: RowAction,
-}
-
-/// The rail's rows, rebuilt when [`Model::rail_gen`] moves or a minute
-/// passes (the ages); a frame only reads them.
+/// The rail, built when the lists or the user's view of them change (or a
+/// minute passes, for the ages), never per frame. The list is spliced only
+/// where items changed, so the rest keep their place and measured height.
 #[derive(Default)]
 pub(crate) struct RailCache {
     generation: Option<u64>,
     minute: i64,
-    named: Vec<RailRow>,
-    unnamed: Vec<RailRow>,
-}
-
-fn key_of(id: &str) -> usize {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    id.hash(&mut h);
-    h.finish() as usize
+    view: rail::View,
+    states: u64,
+    pub(crate) rail: Rail,
+    keys: Vec<u64>,
 }
 
 impl RailCache {
-    pub(crate) fn refreshed(self, m: &Model) -> Self {
+    /// The minute the ages were last written in.
+    pub(crate) fn minute(&self) -> i64 {
+        self.minute
+    }
+
+    pub(crate) fn refresh(&mut self, m: &Model, view: &rail::View, list: &ListState) {
         let now = now_secs();
-        if self.generation == Some(m.rail_gen) && self.minute == now / 60 {
-            return self;
+        // With a chip on, which rows show follows their states (the attached
+        // session's run ahead of the poll): a hash, no allocation.
+        let states = if view.chip.is_some() {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for s in &m.sessions {
+                m.state(s).hash(&mut h);
+            }
+            h.finish()
+        } else {
+            0
+        };
+        if self.generation == Some(m.rail_gen) && self.minute == now / 60 && self.view == *view && self.states == states {
+            return;
         }
-        let index = |id: &str| m.sessions.iter().position(|s| s.id == id);
-        let named = m
-            .named_rows()
-            .into_iter()
-            .map(|row| {
-                let live = match &row.action {
-                    RowAction::Attach(id) if row.marker != Marker::Resuming => index(id),
-                    _ => None,
-                };
-                let meta = live.map(|i| &m.sessions[i]);
-                let sub = meta
-                    .and_then(|m| m.title.clone().filter(|t| !t.is_empty()))
-                    .or_else(|| meta.and_then(|m| m.cwd.as_deref()).map(home_short))
-                    .unwrap_or_else(|| row.model.clone());
-                RailRow {
-                    key: key_of(row.id()),
-                    title: row.name.clone().into(),
-                    sub: sub.into(),
-                    age: row.activity.as_deref().map(|t| relative(t, now)).unwrap_or_default().into(),
-                    live,
-                    marker: row.marker,
-                    action: row.action,
-                }
-            })
-            .collect();
-        let unnamed = m
-            .sessions
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| crate::named::is_unnamed(s))
-            .map(|(i, s)| RailRow {
-                key: key_of(&s.id),
-                title: s.label().into(),
-                sub: s.cwd.as_deref().filter(|c| !c.is_empty()).map(home_short).unwrap_or_else(|| short_model(&s.model)).into(),
-                age: s.state_since.as_deref().or(Some(s.created_at.as_str())).map(|t| relative(t, now)).unwrap_or_default().into(),
-                live: Some(i),
-                marker: Marker::Idle,
-                action: RowAction::Attach(s.id.clone()),
-            })
-            .collect();
-        RailCache { generation: Some(m.rail_gen), minute: now / 60, named, unnamed }
+        let rail = rail::build(m, view, now);
+        let keys: Vec<u64> = rail.items.iter().map(|i| rail::item_key(&rail, i)).collect();
+        if let Some((range, count)) = rail::splice(&self.keys, &keys) {
+            list.splice(range, count);
+        }
+        *self = RailCache { generation: Some(m.rail_gen), minute: now / 60, view: view.clone(), states, rail, keys };
+    }
+}
+
+/// A state's 10 px glyph: one or two axis-aligned rectangles, never a font
+/// glyph (the embedded fonts are subsets). The accent only for NEEDS YOU.
+fn glyph(st: State, p: &Palette) -> Div {
+    let at = |inset: f32| div().absolute().top(px(inset)).left(px(inset)).size(px(10. - 2. * inset));
+    let g = div().relative().size(px(10.)).flex_none();
+    match st {
+        State::NeedsYou => g.child(at(0.).border_1().border_color(p.accent)).child(at(3.).bg(p.accent)),
+        State::Running => g.child(at(1.).bg(p.ink)),
+        State::Unread => g.child(at(3.).bg(p.ink)),
+        State::Idle => g.child(at(1.).border_1().border_color(p.ink3)),
+        State::Parked => g.child(div().absolute().left(px(1.)).bottom(px(1.)).w(px(8.)).h(px(2.)).bg(p.ink3)),
+        State::Opening => g.child(at(1.).border_t_1().border_l_1().border_color(p.ink2)),
+        State::Locked => {
+            g.child(at(1.).border_1().border_color(p.ink3)).child(div().absolute().left(px(1.)).top(px(4.)).w(px(8.)).h(px(2.)).bg(p.ink3))
+        }
+        State::Saved => g,
+    }
+}
+
+fn word_color(st: State, p: &Palette) -> Hsla {
+    match st {
+        State::NeedsYou => p.hi,
+        State::Running => p.ink,
+        State::Locked => p.ink3,
+        _ => p.ink2,
     }
 }
 
@@ -167,18 +138,6 @@ pub(crate) fn prompt_gist(title: &str, body: &str) -> String {
     crate::app::one_line(&text, 90)
 }
 
-/// One session in the rail, as a frame draws it.
-struct Card {
-    key: (&'static str, usize),
-    title: SharedString,
-    sub: SharedString,
-    age: SharedString,
-    marker: Marker,
-    cost: Option<f64>,
-    active: bool,
-}
-
-/// The fold control of a side panel: `‹` / `›`, its key in the tooltip.
 fn fold(id: &'static str, glyph: &'static str, tip: &'static str, rail: bool, p: &Palette, cx: &Context<AppView>) -> Stateful<Div> {
     let hover = p.ink4;
     div()
@@ -357,71 +316,6 @@ impl AppView {
             )
     }
 
-    fn card(
-        &self,
-        c: Card,
-        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-        p: &Palette,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let needs = c.marker == Marker::Awaiting;
-        div()
-            .id(c.key)
-            .relative()
-            .px(px(22.))
-            .pt(px(14.))
-            .pb(px(13.))
-            .border_b_1()
-            .border_color(p.line)
-            .cursor_pointer()
-            .when(c.active, |d| d.bg(p.bg2))
-            .hover(|d| d.bg(p.bg2))
-            .when(c.active || needs, |d| {
-                d.child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(if needs { p.accent } else { p.ink }))
-            })
-            .child(
-                h_flex()
-                    .gap(px(12.))
-                    .items_baseline()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(12.5))
-                            .text_color(p.ink)
-                            .child(c.title),
-                    )
-                    .child(mono(c.age, 10., p.ink4)),
-            )
-            .when(!c.sub.is_empty(), |d| {
-                d.child(
-                    div()
-                        .mt(px(3.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_size(px(11.))
-                        .text_color(p.ink3)
-                        .child(c.sub),
-                )
-            })
-            .child(
-                h_flex()
-                    .mt(px(9.))
-                    .items_center()
-                    .child(status_chip(c.marker, p))
-                    .child(div().flex_1())
-                    .when_some(c.cost.filter(|c| *c > 0.0), |d, cost| d.child(mono(format!("${cost:.2}"), 10., p.ink3))),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                on_click(this, cx);
-                cx.notify();
-            }))
-    }
-
     /// The folded rail: the connection disc and how many sessions need
     /// you. A click (or Ctrl+B) opens it again.
     pub(crate) fn render_rail_strip(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
@@ -508,36 +402,60 @@ impl AppView {
     }
 
     pub(crate) fn render_rail(&self, width: f32, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
-        let filters =
-            [(Filter::All, label::ALL), (Filter::Live, label::LIVE), (Filter::Needs, label::NEEDS_YOU), (Filter::Idle, label::IDLE)];
-        let mut tabs = h_flex().gap(px(18.)).px(px(22.)).pt(px(18.)).pb(px(14.)).border_b_1().border_color(p.line);
-        for (i, (f, text)) in filters.into_iter().enumerate() {
-            let on = self.filter == f;
-            tabs = tabs.child(
-                display(text, 10., if on { p.ink } else { p.ink4 })
-                    .id(("filter", i))
+        let n = &self.model.named;
+        let notes: Vec<(&String, Hsla)> =
+            n.error.iter().map(|e| (e, p.hi)).chain(n.notice.iter().chain(n.saved_note.iter()).map(|t| (t, p.ink4))).collect();
+        // The chips count what is held (the attached session as it runs,
+        // ahead of the poll) and the unread history rows.
+        let (mut needs, mut running, mut unread) = (0, 0, self.rail.rail.history_unread);
+        for s in self.model.sessions.iter().filter(|s| s.lifecycle != "ending") {
+            match self.model.state(s) {
+                State::NeedsYou => needs += 1,
+                State::Running => running += 1,
+                State::Unread => unread += 1,
+                _ => {}
+            }
+        }
+        // A chip toggles its filter; none selected shows everything.
+        let mut chips = h_flex().items_center().gap(px(15.)).px(px(22.)).pt(px(13.)).pb(px(12.)).border_b_1().border_color(p.line);
+        for (c, count) in [(Chip::NeedsYou, needs), (Chip::Running, running), (Chip::Unread, unread)] {
+            let on = self.chip == Some(c);
+            let tip = match c {
+                Chip::NeedsYou => "Show only sessions that need you",
+                Chip::Running => "Show only running sessions",
+                Chip::Unread => "Show only sessions with news since you looked",
+            };
+            chips = chips.child(
+                h_flex()
+                    .id(("chip", c as usize))
+                    .items_baseline()
+                    .gap(px(5.))
                     .pb(px(3.))
                     .border_b_1()
-                    .border_color(if on { p.accent } else { gpui_kit::transparent_black() })
+                    .border_color(if on { p.ink } else { gpui_kit::transparent_black() })
                     .cursor_pointer()
-                    .hover(|d| d.text_color(p.ink2))
+                    .child(display(c.label(), 10., if on { p.ink } else { p.ink3 }))
+                    .child(mono(count.to_string(), 10., if c == Chip::NeedsYou && count > 0 { p.hi } else { p.ink2 }))
+                    .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.filter = f;
+                        this.chip = if this.chip == Some(c) { None } else { Some(c) };
                         cx.notify();
                     })),
             );
         }
-        let mut list = v_flex().id("sessions").flex_1().min_h_0().overflow_y_scroll().child(self.render_named(p, cx));
-        let mut shown = 0;
-        for (i, r) in self.rail.unnamed.iter().enumerate() {
-            let Some(card) = self.rail_card("session", r) else { continue };
-            shown += 1;
-            list = list.child(self.card(card, move |this, _| this.rail_click(false, i), p, cx));
-        }
-        if shown == 0 {
-            let empty = if self.model.sessions.is_empty() { "No live sessions" } else { "No unnamed sessions in this filter" };
-            list = list.child(div().px(px(22.)).py(px(14.)).text_size(px(12.)).text_color(p.ink4).child(empty));
-        }
+        let find = h_flex()
+            .mx(px(22.))
+            .mt(px(16.))
+            .h(px(27.))
+            .items_center()
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(p.line2)
+            .child(
+                div().flex_1().min_w_0().font_family(fonts::MONO).text_size(px(10.5)).child(Input::new(&self.find_input).appearance(false)),
+            )
+            .child(div().px(px(5.)).border_1().border_color(p.line2).child(mono("/", 9.5, p.ink4)));
+        let items = list(self.rail_list.clone(), cx.processor(|this, ix, _window, cx| this.render_rail_item(ix, cx))).size_full();
         v_flex()
             .w(px(width))
             .h_full()
@@ -559,106 +477,280 @@ impl AppView {
                     })
                     .child(fold("rail-fold", "‹", "Hide sessions", true, p, cx).ml(px(16.))),
             )
-            .child(tabs)
-            .child(list)
-    }
-
-    /// A rail row as this frame draws it (`None`: filtered out): its state
-    /// is read live from the model (the attached session runs ahead of the
-    /// poll), its strings from the cache.
-    fn rail_card(&self, kind: &'static str, r: &RailRow) -> Option<Card> {
-        let meta = r.live.and_then(|i| self.model.sessions.get(i));
-        let marker = meta.map(|m| self.model.marker(m)).unwrap_or(r.marker);
-        if !self.filter.admits(marker) {
-            return None;
-        }
-        let active = meta.is_some_and(|m| self.model.is_active(&m.id));
-        // The attached session's cost as the panel shows it (its digests run
-        // ahead of the 3 s poll), else the poll's.
-        let cost = if active { self.model.stats.cost } else { meta.map(|m| m.cost_usd) };
-        Some(Card { key: (kind, r.key), title: r.title.clone(), sub: r.sub.clone(), age: r.age.clone(), marker, cost, active })
-    }
-
-    /// A rail row was clicked: by index, looked up now (no per-frame copy
-    /// of its id into the click handler).
-    fn rail_click(&mut self, named: bool, ix: usize) {
-        let rows = if named { &self.rail.named } else { &self.rail.unnamed };
-        let Some(action) = rows.get(ix).map(|r| r.action.clone()) else { return };
-        match action {
-            RowAction::Attach(id) if !named => self.attach(id),
-            action => {
-                for fx in self.model.open_row(&action) {
-                    self.effect(fx);
-                }
-            }
-        }
-    }
-
-    /// The named sessions (live and saved), folded into the rail.
-    fn render_named(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
-        let rows = &self.rail.named;
-        let open = !self.named_collapsed;
-        let mut section = v_flex().child(
-            h_flex()
-                .px(px(22.))
-                .pt(px(14.))
-                .pb(px(8.))
-                .items_center()
-                .child(
-                    h_flex()
-                        .id("named-toggle")
-                        .flex_1()
-                        .gap(px(10.))
-                        .cursor_pointer()
-                        .child(mono(if open { "−" } else { "+" }, 11., p.ink4))
-                        .child(display(label::NAMED, 10., p.ink3))
-                        .child(mono(rows.len().to_string(), 10., p.ink4))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.named_collapsed = !this.named_collapsed;
-                            cx.notify();
-                        })),
+            .child(find)
+            .when(!notes.is_empty(), |d| {
+                d.child(
+                    v_flex()
+                        .px(px(22.))
+                        .pt(px(8.))
+                        .gap(px(4.))
+                        .children(notes.into_iter().map(|(t, c)| div().text_size(px(11.)).text_color(c).child(t.clone()))),
                 )
-                .child(tbtn("open-by-name", label::OPEN, if self.open_shown { p.ink } else { p.ink4 }, p.ink).on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.open_shown = !this.open_shown;
-                        this.named_collapsed = false;
-                        if this.open_shown {
-                            this.model.open_shown();
-                            this.open_input.update(cx, |s, cx| s.focus(window, cx));
-                        }
+            })
+            .child(chips)
+            .child(div().flex_1().min_h_0().child(items))
+    }
+
+    /// One item of the rail's list (only the visible ones are built).
+    pub(crate) fn render_rail_item(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
+        let p = theme::palette(cx);
+        let rail = &self.rail.rail;
+        let Some(item) = rail.items.get(ix) else { return div().into_any_element() };
+        match item {
+            Item::Group { group, count } => h_flex()
+                .w_full()
+                .px(px(22.))
+                .pt(px(17.))
+                .pb(px(7.))
+                .items_baseline()
+                .gap(px(9.))
+                .when(ix > 0, |d| d.border_t_1().border_color(p.line))
+                .child(display(group.label(), 10., p.ink3))
+                .child(div().font_family(fonts::JP).text_size(px(9.5)).text_color(p.ink4).child(group.jp()))
+                .child(div().flex_1())
+                .child(mono(count, 10., p.ink4))
+                .into_any_element(),
+            Item::Row(r) => self.render_row2(*r, &p, cx),
+            Item::Hist(r) => self.render_hist(*r, &p, cx),
+            Item::Bucket { bucket, open, count } => {
+                let b = *bucket;
+                let color = if *open { p.ink3 } else { p.ink4 };
+                h_flex()
+                    .id(("bucket", b as usize))
+                    .w_full()
+                    .px(px(22.))
+                    .pt(px(7.))
+                    .pb(px(6.))
+                    .gap(px(10.))
+                    .items_baseline()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(p.bg1))
+                    .child(div().w(px(10.)).flex_none().child(mono(if *open { "−" } else { "+" }, 11., color)))
+                    .child(display(b.label(), 9.5, color))
+                    .child(div().flex_1())
+                    .child(mono(count, 10., p.ink4))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_bucket(b, cx)))
+                    .into_any_element()
+            }
+            Item::More { bucket, text } => {
+                let b = *bucket;
+                div()
+                    .id(("more", b as usize))
+                    .w_full()
+                    .pl(px(42.))
+                    .pr(px(22.))
+                    .pt(px(5.))
+                    .pb(px(8.))
+                    .cursor_pointer()
+                    .child(display(text, 9.5, p.ink4))
+                    .hover(|d| d.bg(p.bg1))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.expanded |= b.bit();
                         cx.notify();
-                    },
-                ))),
-        );
-        if self.open_shown {
-            section = section.child(div().px(px(22.)).pb(px(8.)).child(Input::new(&self.open_input)));
+                    }))
+                    .into_any_element()
+            }
+            Item::Note(t) => div()
+                .px(px(22.))
+                .pt(px(2.))
+                .pb(px(10.))
+                .font_family(fonts::MONO)
+                .text_size(px(10.))
+                .line_height(px(15.))
+                .text_color(p.ink4)
+                .child(SharedString::from(t))
+                .into_any_element(),
+            Item::Empty(t) => div().px(px(22.)).py(px(10.)).text_size(px(12.)).text_color(p.ink4).child(*t).into_any_element(),
         }
-        let n = &self.model.named;
-        if let Some(e) = &n.error {
-            section = section.child(div().px(px(22.)).pb(px(6.)).text_size(px(11.5)).text_color(p.hi).child(e.clone()));
+    }
+
+    /// A PINNED or OPEN row: bar, glyph, title, age; then the state word
+    /// (if not at rest), the folder or a named session's title, the cost.
+    /// Its state is read per frame (the attached session runs ahead of the
+    /// poll), its strings come from the cache; it never changes shape.
+    fn render_row2(&self, r: usize, p: &Palette, cx: &Context<Self>) -> AnyElement {
+        let row = &self.rail.rail.rows[r];
+        let meta = row.live.and_then(|i| self.model.sessions.get(i));
+        let st = meta.map(|s| self.model.state(s)).unwrap_or(row.state);
+        let on = meta.is_some_and(|s| self.model.is_active(&s.id));
+        // The attached session's cost as the panel shows it (its digests
+        // run ahead of the 3 s poll), else the poll's.
+        let cost = meta.map(|s| if on { self.model.stats.cost.unwrap_or(s.cost_usd) } else { s.cost_usd }).filter(|c| *c > 0.0);
+        let waiting = meta.map(|s| if on { self.model.transcript.pending_prompts().len() } else { s.awaiting_input }).unwrap_or(0);
+        let title_color = match st {
+            State::NeedsYou | State::Running | State::Unread => p.ink,
+            _ if on => p.ink,
+            State::Parked | State::Locked => p.ink3,
+            _ if row.fresh => p.ink3,
+            _ => p.ink2,
+        };
+        let sub_color = if matches!(st, State::Parked | State::Locked) { p.ink4 } else { p.ink3 };
+        let bar = if st == State::NeedsYou {
+            Some(p.accent)
+        } else if on {
+            Some(p.ink)
+        } else {
+            None
+        };
+        let key = row.key;
+        let word = st.word().map(|w| {
+            h_flex()
+                .flex_none()
+                .items_baseline()
+                .gap(px(5.))
+                .child(display(w, 9.5, word_color(st, p)))
+                .when(st == State::NeedsYou && waiting > 1, |d| d.child(mono(waiting.to_string(), 10., p.hi)))
+        });
+        div()
+            .id(("rail-row", key as usize))
+            .relative()
+            .w_full()
+            .px(px(22.))
+            .pt(px(8.))
+            .pb(px(9.))
+            .cursor_pointer()
+            .when(on, |d| d.bg(p.bg2))
+            .hover(|d| d.bg(p.bg2))
+            .when_some(bar, |d, c| d.child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(c)))
+            .child(
+                h_flex().gap(px(10.)).items_start().child(glyph(st, p).mt(px(5.))).child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(1.))
+                        .child(
+                            h_flex()
+                                .h(px(18.))
+                                .gap(px(10.))
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .when(row.named, |d| d.font_family(fonts::MONO).text_size(px(12.)))
+                                        .when(!row.named, |d| d.text_size(px(12.5)))
+                                        .text_color(title_color)
+                                        .child(SharedString::from(&row.title)),
+                                )
+                                .child(mono(&row.age, 10., p.ink4)),
+                        )
+                        .child(
+                            h_flex()
+                                .h(px(17.))
+                                .gap(px(8.))
+                                .items_center()
+                                .min_w_0()
+                                .children(word)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .when(row.sub_mono, |d| d.font_family(fonts::MONO).text_size(px(10.5)))
+                                        .when(!row.sub_mono, |d| d.text_size(px(11.)))
+                                        .text_color(sub_color)
+                                        .child(SharedString::from(&row.sub)),
+                                )
+                                .when_some(cost, |d, c| d.child(mono(format!("${c:.2}"), 10., p.ink3).flex_none())),
+                        ),
+                ),
+            )
+            .when(self.readout == Some(key), |d| d.child(self.render_readout(row, p)))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.rail_click(key);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// A HISTORY row: one fixed-height line, title and age, a mark only if
+    /// it is unread (or being opened).
+    fn render_hist(&self, r: usize, p: &Palette, cx: &Context<Self>) -> AnyElement {
+        let row = &self.rail.rail.rows[r];
+        let key = row.key;
+        let title_color = match row.state {
+            State::Unread => p.ink,
+            State::Opening => p.ink2,
+            _ if row.named => p.ink2,
+            _ => p.ink3,
+        };
+        h_flex()
+            .id(("rail-hist", key as usize))
+            .relative()
+            .w_full()
+            .h(px(25.))
+            .px(px(22.))
+            .gap(px(10.))
+            .items_center()
+            .cursor_pointer()
+            .hover(|d| d.bg(p.bg2))
+            .child(glyph(row.state, p))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .when(row.named, |d| d.font_family(fonts::MONO).text_size(px(11.5)))
+                    .when(!row.named, |d| d.text_size(px(12.)))
+                    .text_color(title_color)
+                    .child(SharedString::from(&row.title)),
+            )
+            .child(mono(&row.age, 10., p.ink4))
+            .when(self.readout == Some(key), |d| d.child(self.render_readout(row, p)))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.rail_click(key);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// The hover readout, beside the row over the session pane: drawn on
+    /// top of everything (not clipped by the rail's scroll), only after the
+    /// pointer has rested 400 ms.
+    fn render_readout(&self, row: &rail::Row, p: &Palette) -> AnyElement {
+        let now = now_secs();
+        let r = match (row.live.and_then(|i| self.model.sessions.get(i)), row.saved.and_then(|s| rail::saved_entry(&self.model, s))) {
+            (Some(s), _) => rail::readout_live(&self.model, s, now),
+            (None, Some(v)) => rail::readout_saved(&self.model, v, now),
+            _ => return div().into_any_element(),
+        };
+        let mut body = v_flex()
+            .w(px(296.))
+            .px(px(16.))
+            .py(px(13.))
+            .gap(px(4.))
+            .bg(p.bg1)
+            .border_1()
+            .border_color(p.line3)
+            .child(div().text_size(px(12.5)).text_color(p.ink).pb(px(5.)).child(r.title));
+        for (k, value, aside) in r.lines {
+            body = body.child(
+                h_flex().items_start().child(div().w(px(62.)).flex_none().pt(px(2.)).child(display(k, 9., p.ink4))).child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family(fonts::MONO)
+                        .text_size(px(10.5))
+                        .child(div().text_color(p.ink2).child(value))
+                        .when(!aside.is_empty(), |d| d.child(div().text_color(p.ink4).child(aside))),
+                ),
+            );
         }
-        let notes = [
-            n.notice.clone(),
-            n.saved_note.clone(),
-            n.saved_truncated.then(|| format!("Showing the newest {SAVED_LIMIT} saved sessions.")),
-        ];
-        for note in notes.into_iter().flatten() {
-            section = section.child(div().px(px(22.)).pb(px(6.)).text_size(px(11.)).text_color(p.ink4).child(note));
-        }
-        if !open {
-            return section.child(div().border_b_1().border_color(p.line));
-        }
-        let mut shown = 0;
-        for (i, row) in rows.iter().enumerate() {
-            let Some(card) = self.rail_card("named", row) else { continue };
-            shown += 1;
-            section = section.child(self.card(card, move |this, _| this.rail_click(true, i), p, cx));
-        }
-        if shown == 0 {
-            let empty = if rows.is_empty() { "No named sessions" } else { "None in this filter" };
-            section = section.child(div().px(px(22.)).pb(px(12.)).text_size(px(12.)).text_color(p.ink4).child(empty));
-        }
-        section.child(div().h(px(10.)).border_b_1().border_color(p.line))
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .child(deferred(anchored().offset(point(px(self.rail_width + 12.), px(2.))).child(body)).with_priority(2))
+            .into_any_element()
     }
 
     pub(crate) fn render_right(&self, width: f32, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
