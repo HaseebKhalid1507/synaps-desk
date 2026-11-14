@@ -414,15 +414,6 @@ impl Summaries {
     }
 }
 
-/// The centre pane's height (under the full top bar) below which the
-/// window is short: the session header is one row and the chrome around the
-/// transcript gives up its spare padding ([`Layout::short`]). 740 px is a
-/// 792-px window: every 800-px-class laptop screen and a 1080p one at 150 %
-/// are short; 1080p at 125 % (864) and a 900-px MacBook screen keep the full
-/// header. At 740 the full chrome and an authorization card leave the
-/// transcript ~140 px, about five lines.
-pub(crate) const SHORT: f32 = 740.;
-
 /// How the centre pane is laid out this frame (from its size).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Layout {
@@ -432,10 +423,14 @@ pub(crate) struct Layout {
     pub hang: bool,
     /// Under 560 px: the gutter drops to 16, status words and hints go.
     pub tight: bool,
-    /// Under [`SHORT`] tall: a 40-px top bar, a one-row header, an 8-line
+    /// Under [`crate::fit::short_below`] tall (a 792-px window at 16 px,
+    /// more with larger text): a 40-px top bar, a one-row header, an 8-line
     /// card well, less padding round the composer. Nothing in the list
     /// changes, so it never remeasures for this.
     pub short: bool,
+    /// Under [`crate::fit::cramped_below`] (short too): the card folds its
+    /// lead into its title row, the composer puts SEND beside the text.
+    pub cramped: bool,
     /// The list's left padding: the column centred, whole pixels.
     pub left: f32,
     /// And its right.
@@ -444,18 +439,31 @@ pub(crate) struct Layout {
 
 impl Layout {
     /// `pane` wide; `height` is the pane's height under the full (52-px)
-    /// top bar, so the short bar cannot flip it back.
+    /// top bar, so the short bar cannot flip it back. Short and cramped
+    /// read the height and the text step only: nothing they change feeds
+    /// back.
     pub(crate) fn of(pane: f32, height: f32, m: &Metrics) -> Self {
         let tight = pane < 560.;
         let gutter = if tight { 16. } else { 24. };
         let column = m.column.min(pane - 2. * gutter).max(200.).floor();
         let left = ((pane - column) / 2.).floor().max(0.);
-        Layout { column, hang: pane >= (672. + 200.) * m.r, tight, short: height < SHORT, left, right: (pane - column - left).max(0.) }
+        Layout {
+            column,
+            hang: pane >= (672. + 200.) * m.r,
+            tight,
+            short: height < crate::fit::short_below(m),
+            cramped: height < crate::fit::cramped_below(m),
+            left,
+            right: (pane - column - left).max(0.),
+        }
     }
 
-    /// The session header is one row: a short pane, or a tight one.
-    pub(crate) fn compact(self) -> bool {
-        self.short || self.tight
+    pub(crate) fn form(self) -> crate::fit::Form {
+        match (self.short, self.cramped) {
+            (_, true) => crate::fit::Form::Cramped,
+            (true, false) => crate::fit::Form::Short,
+            (false, false) => crate::fit::Form::Full,
+        }
     }
 
     /// The list's left and right padding (the header, card and composer

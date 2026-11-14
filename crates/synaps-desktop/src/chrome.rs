@@ -35,15 +35,47 @@ const FILES_SHOWN: usize = 40;
 pub(crate) const TOP: f32 = 52.;
 /// In a short window ([`crate::turns::Layout::short`]): its one line of
 /// 13-px caps and the 18-px SYSTEMS badge still have 11 px above and below.
-const TOP_SHORT: f32 = 40.;
+pub(crate) const TOP_SHORT: f32 = 40.;
 /// An edge handle's hit area; its line is 1 px, on the panel's border.
 const EDGE: f32 = 6.;
 /// The theme picker's narrowest width: two columns of theme names.
 const PICKER_MIN: f32 = 340.;
 /// The tab strip and the session header (full, and one row): a picker
-/// above the composer keeps below them and the top bar.
-const HEADER_CLEAR: f32 = 112.;
-const HEADER_CLEAR_SHORT: f32 = 72.;
+/// above the composer keeps below them and the top bar. The full one's
+/// clearance leaves out the header's 14-px bottom padding (the picker may
+/// cover that, not the title row or the state).
+const HEADER_CLEAR: f32 = crate::tabstrip::TAB_H + crate::fit::HEADER_FULL - 14.;
+const HEADER_CLEAR_SHORT: f32 = crate::tabstrip::TAB_H + crate::fit::HEADER_SHORT + 1.;
+
+/// The top bar's fixed words, measured in the faces they are drawn in.
+pub(crate) fn top_words(window: &Window) -> crate::fit::TopWords {
+    let width = |text: &str, family: &'static str, weight: FontWeight, size: f32| {
+        let text = SharedString::from(text.to_string());
+        let run = TextRun {
+            len: text.len(),
+            font: Font { weight, ..font(family) },
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        f32::from(window.text_system().shape_line(text, px(size), &[run], None).width).ceil()
+    };
+    let display = |text, size| width(text, fonts::DISPLAY, FontWeight::SEMIBOLD, size);
+    let cell = |size| width("0000000000", fonts::MONO, FontWeight::NORMAL, size) / 10.;
+    crate::fit::TopWords {
+        word: display(label::WORD, 13.),
+        word2: display(label::WORD_2, 13.),
+        need: display(&format!("   {}", label::NEED_YOU), 11.),
+        digit: display("0", 11.),
+        jump: display(label::JUMP, 10.5),
+        theme: display(label::THEME, 10.5),
+        systems: display(label::SYSTEMS, 11.),
+        cell: cell(11.),
+        cell_conn: cell(10.5),
+        cell_badge: cell(10.),
+    }
+}
 
 /// The top bar's height this frame.
 pub(crate) fn top_h(short: bool) -> f32 {
@@ -222,28 +254,6 @@ impl AppView {
                 s.title.clone().filter(|t| !t.is_empty() && s.name.is_some()).unwrap_or_default().into()
             }
         });
-        let on = n > 0;
-        let ticker = h_flex()
-            .id("attention")
-            .gap(px(12.))
-            .items_center()
-            .child(div().size(px(6.)).flex_none().when(on, |d| d.bg(p.warn_mark_ch)).when(!on, |d| d.border_1().border_color(p.rest_mark)))
-            .child(display(format!("{n}   {}", label::NEED_YOU), 11., if on { p.warn_ch } else { p.dim_ch }))
-            .when_some(first, |d, s| d.child(mono(s.label(), 11., p.ink)))
-            .when_some(what.filter(|w| !w.is_empty()), |d, w| {
-                d.child(mono(w, 11., p.dim_ch).max_w(px(330.)).overflow_hidden().text_ellipsis())
-            })
-            .when(n > 1, |d| d.child(mono(format!("+{}", n - 1), 11., p.dim_ch)))
-            .when_some(jump_to, |d, id| {
-                d.cursor_pointer()
-                    .child(h_flex().ml(px(8.)).gap(px(6.)).child(display(label::JUMP, 10.5, p.prose_ch)).child(mono("→", 11., p.prose_ch)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        for fx in this.model.open_row(&RowAction::Attach(id.clone())) {
-                            this.effect(fx);
-                        }
-                        cx.notify();
-                    }))
-            });
         let (conn, conn_color): (SharedString, Hsla) = match &self.model.conn {
             _ if self.model.reattaching => ("reattaching".into(), p.dim_ch),
             ConnState::Connected(v) => (format!("connected · {v}").into(), p.dim_ch),
@@ -256,6 +266,61 @@ impl AppView {
         // As in the mock: subagents running, here the attached session's,
         // as its blocks and its rail row say (they change together).
         let subagents = self.model.active_workers();
+        let what = what.filter(|w| !w.is_empty());
+        let input = crate::fit::TopIn {
+            width: self.width,
+            brand: match rail {
+                Side::Open(w) => w - 22.,
+                _ => 254.,
+            },
+            need: n,
+            label: first.map_or(0, |s| s.label().chars().count()),
+            gist: what.as_ref().map_or(0, |w| w.chars().count()),
+            more: if n > 1 { (n - 1).ilog10() as usize + 1 } else { 0 },
+            jump: jump_to.is_some(),
+            conn: conn.chars().count(),
+            badge: if subagents > 9 { subagents.ilog10() as usize + 1 } else { 1 },
+        };
+        let fit = self.top_words.map(|w| crate::fit::fit_top(&w, &input)).unwrap_or(crate::fit::TopFit {
+            brand: input.brand,
+            word: true,
+            word2: true,
+            label: 0.,
+            gist: 0.,
+            conn: 0.,
+            theme: true,
+            systems: true,
+        });
+        // Fitted: every part flex_none at its width, nothing overlaps.
+        let cut = |d: Div, w: f32| d.flex_none().max_w(px(w)).overflow_hidden().text_ellipsis();
+        let on = n > 0;
+        let ticker = h_flex()
+            .id("attention")
+            .flex_none()
+            .gap(px(12.))
+            .items_center()
+            .child(div().size(px(6.)).flex_none().when(on, |d| d.bg(p.warn_mark_ch)).when(!on, |d| d.border_1().border_color(p.rest_mark)))
+            .child(display(format!("{n}   {}", label::NEED_YOU), 11., if on { p.warn_ch } else { p.dim_ch }).flex_none())
+            .when_some(first.filter(|_| fit.label > 0.), |d, s| d.child(cut(mono(s.label(), 11., p.ink), fit.label)))
+            .when_some(what.filter(|_| fit.gist > 0.), |d, w| d.child(cut(mono(w, 11., p.dim_ch), fit.gist)))
+            .when(n > 1, |d| d.child(mono(format!("+{}", n - 1), 11., p.dim_ch).flex_none()))
+            .when_some(jump_to, |d, id| {
+                d.cursor_pointer()
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .ml(px(8.))
+                            .gap(px(6.))
+                            .child(display(label::JUMP, 10.5, p.prose_ch))
+                            .child(mono("→", 11., p.prose_ch)),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        for fx in this.model.open_row(&RowAction::Attach(id.clone())) {
+                            this.effect(fx);
+                        }
+                        cx.notify();
+                    }))
+            });
         h_flex()
             .h(px(top_h(self.layout.short)))
             .flex_none()
@@ -264,13 +329,10 @@ impl AppView {
             .items_center()
             .border_b_1()
             .border_color(p.hair)
-            // Over the open rail: as wide as it.
+            // Over the open rail: as wide as it (while the bar has room).
             .child(
                 h_flex()
-                    .w(px(match rail {
-                        Side::Open(w) => w - 22.,
-                        _ => 254.,
-                    }))
+                    .w(px(fit.brand))
                     .flex_none()
                     .items_center()
                     .gap(px(14.))
@@ -279,18 +341,19 @@ impl AppView {
                             .items_center()
                             .gap(px(10.))
                             .child(div().size(px(8.)).flex_none().rounded_full().bg(self.conn_disc(p)))
-                            .child(display(label::WORD, 13., p.header)),
+                            .when(fit.word, |d| d.child(display(label::WORD, 13., p.header))),
                     )
-                    .child(display(label::WORD_2, 13., p.dim_ch)),
+                    .when(fit.word2, |d| d.child(display(label::WORD_2, 13., p.dim_ch))),
             )
-            .child(div().flex_1())
+            .child(div().flex_1().min_w(px(16.)))
             .child(ticker)
-            .child(div().flex_1())
+            .child(div().flex_1().min_w(px(16.)))
             .child(
                 h_flex()
+                    .flex_none()
                     .gap(px(18.))
                     .items_center()
-                    .child(mono(conn, 10.5, conn_color).max_w(px(260.)).overflow_hidden().text_ellipsis())
+                    .when(fit.conn > 0., |d| d.child(cut(mono(conn, 10.5, conn_color), fit.conn)))
                     // The theme picker's own control: a swatch of the "you" colour.
                     .child(
                         h_flex()
@@ -299,7 +362,7 @@ impl AppView {
                             .items_center()
                             .cursor_pointer()
                             .child(div().size(px(10.)).bg(p.you_bar))
-                            .child(display(label::THEME, 10.5, if self.picker_open { p.ink } else { p.dim_ch }))
+                            .when(fit.theme, |d| d.child(display(label::THEME, 10.5, if self.picker_open { p.ink } else { p.dim_ch })))
                             .hover(|d| d.text_color(p.ink))
                             .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
                                 // The click whose mouse-down closed it from outside does not reopen it.
@@ -318,7 +381,7 @@ impl AppView {
                     )
                     // As in the mock: the attached session's running subagents.
                     .child(
-                        h_flex().gap(px(10.)).items_center().child(display(label::SYSTEMS, 11., p.dim_ch)).child(
+                        h_flex().gap(px(10.)).items_center().when(fit.systems, |d| d.child(display(label::SYSTEMS, 11., p.dim_ch))).child(
                             div()
                                 .min_w(px(18.))
                                 .h(px(18.))
@@ -1169,7 +1232,7 @@ impl AppView {
         };
         let max_h = match place {
             PickerAt::Top(_) => self.height - top - 16.,
-            PickerAt::Bottom(_) => self.height - bottom - top - if self.layout.compact() { HEADER_CLEAR_SHORT } else { HEADER_CLEAR },
+            PickerAt::Bottom(_) => self.height - bottom - top - if self.layout.short { HEADER_CLEAR_SHORT } else { HEADER_CLEAR },
         };
         let body = v_flex()
             .flex_none()
