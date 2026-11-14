@@ -1374,6 +1374,26 @@ mod tests {
         m.apply(Event::Attached { attach_seq: seq, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
     }
 
+    /// L2: leaving a tab drops the resume, the fallback attach and the
+    /// Open by name that were that attachment's (closing the last tab
+    /// mid-resume would otherwise leave its row OPENING and unclickable);
+    /// an Open by name not sent yet stays.
+    #[test]
+    fn leaving_a_tab_drops_what_its_attachment_had_in_flight() {
+        let req = |t: &str| ResumeRequest { label: t.into(), target: t.into(), cwd: None, by_name: false };
+        let opening = |attach_seq| Opening { name: "n".into(), attach_seq, asked_saved: false, place: Place::Current };
+        let mut m = Model::new(ConnState::Connecting);
+        attach(&mut m, 1);
+        m.named.resuming = Some(Resuming { req: req("j"), attach_seq: 2 });
+        m.named.attaching = Some((2, req("k")));
+        m.named.opening = Some(opening(Some(2)));
+        let _ = m.switch_out();
+        assert!(m.named.resuming.is_none() && m.named.attaching.is_none() && m.named.opening.is_none());
+        m.named.opening = Some(opening(None));
+        let _ = m.switch_out();
+        assert!(m.named.opening.is_some(), "not sent yet: still to open");
+    }
+
     #[test]
     fn states_and_the_attached_sessions_own_state() {
         use crate::rail::Chip;
