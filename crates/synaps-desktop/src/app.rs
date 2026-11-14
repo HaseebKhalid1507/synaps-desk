@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -127,8 +127,10 @@ pub(crate) enum Open {
 pub(crate) type AttachSource = Box<dyn Fn(&str, u64) -> Vec<Event>>;
 /// The authorization card ignores clicks this long after it appears (the
 /// TUI's `CONFIRM_ARM_DELAY` is 400 ms): it pushes the list up, so a click
-/// meant for a row can land on it.
+/// meant for a row can land on it. Its keys wait longer ([`Arm`]).
 pub(crate) const ARM: Duration = Duration::from_millis(500);
+/// The chord that answers a card yes ([`card_key`]), as its button shows it.
+pub(crate) const YES_KEY: &str = if cfg!(target_os = "macos") { "⌘ENTER" } else { "CTRL+ENTER" };
 /// The one-row session header ([`HeaderParts::compact`]), its hairline not
 /// included.
 const HEADER_ROW: f32 = crate::fit::HEADER_SHORT - 1.;
@@ -665,24 +667,72 @@ impl HeaderParts {
     }
 }
 
-/// How far down the transcript's list starts: the top bar and the session
-/// header (the tab strip, and the naming row when it is open, are the same
-/// in every form).
-pub(crate) fn above_list(lay: Layout, attached: bool, meta: bool) -> f32 {
-    crate::chrome::top_h(lay.short) + HeaderParts::of(lay, attached, false, false, meta).height()
+/// How far down the transcript's list starts: the top bar, the session
+/// header and the naming row when it is open (the tab strip is the same in
+/// every form).
+pub(crate) fn above_list(lay: Layout, attached: bool, meta: bool, naming: bool) -> f32 {
+    let naming = if naming { crate::fit::naming_h(lay.form()) } else { 0. };
+    crate::chrome::top_h(lay.short) + HeaderParts::of(lay, attached, false, false, meta).height() + naming
+}
+
+/// When the card's keys may act ([`ARM`] after each of these): its buttons
+/// from when it was shown; its keys also from when they last went live
+/// (the card came into view, the window or the keys came to it) and from
+/// the last Ctrl+Enter or Esc that came too early. That is the TUI's rule:
+/// every key that reaches an unarmed card starts the wait again. A held key
+/// repeats far inside [`ARM`] (25-30 times a second), so it never answers a
+/// card that came up under it, whether or not the platform says the key is
+/// held (X11 never does).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Arm {
+    shown: Instant,
+    keys: Instant,
+}
+
+impl Arm {
+    pub(crate) fn new(now: Instant) -> Self {
+        Arm { shown: now, keys: now }
+    }
+
+    /// The buttons may act.
+    pub(crate) fn armed(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.shown) >= ARM
+    }
+
+    /// The keys may act.
+    pub(crate) fn keys_armed(&self, now: Instant) -> bool {
+        self.armed(now) && now.saturating_duration_since(self.keys) >= ARM
+    }
+
+    /// The keys went live: they wait from `now`.
+    pub(crate) fn restart(&mut self, now: Instant) {
+        self.keys = now;
+    }
+
+    /// A Ctrl+Enter or Esc at `now` (`held`: the platform says it is a
+    /// repeat): true if it may answer; if not, the keys wait from `now`.
+    pub(crate) fn key(&mut self, now: Instant, held: bool) -> bool {
+        let ok = !held && self.keys_armed(now);
+        if !ok {
+            self.keys = now;
+        }
+        ok
+    }
 }
 
 /// The prompt the authorization card shows.
 pub(crate) struct PromptCard {
     /// [`Model::card_key`]: `(epoch, prompt id)`.
     pub(crate) key: (u64, u64),
-    shown: Instant,
+    arm: Arm,
     /// The body, verbatim (blank lines kept).
     pub(crate) body: SharedString,
     /// What the top bar says about it ([`crate::chrome::prompt_gist`]).
     pub(crate) gist: SharedString,
     scroll: ScrollHandle,
-    /// The well was scrolled to its end (or never needed to be).
+    /// The buttons' row: where it was laid out ([`PromptCard::buttons_shown`]).
+    actions: ScrollHandle,
+    /// The well was scrolled to its end (or never needed to be), on screen.
     read: bool,
     /// Repaints once the arm delay is over.
     _arm: Option<Task<()>>,
@@ -693,11 +743,11 @@ impl PromptCard {
     /// same key keeps its arm and read state; a new prompt, the same id in
     /// another attachment or after a reconnect (a restarted daemon numbers
     /// its prompts from 1 again) starts over, unarmed and unread, at `now`.
-    /// True when the card is new.
-    pub(crate) fn sync(card: &mut Option<PromptCard>, m: &Model, now: Instant) -> bool {
+    /// True when the card is new. `view`: the window's height.
+    pub(crate) fn sync(card: &mut Option<PromptCard>, m: &Model, now: Instant, view: f32) -> bool {
         match (m.card_key(), card.as_mut()) {
             (Some(k), Some(c)) if c.key == k => {
-                if c.below().is_some_and(|b| b <= 1.) {
+                if c.below(view).is_some_and(|b| b <= 1.) {
                     c.read = true;
                 }
                 false
@@ -705,7 +755,16 @@ impl PromptCard {
             (Some(k), _) => {
                 let pr = &m.transcript.pending_prompts()[0];
                 let (body, gist) = (well_body(&pr.prompt), crate::chrome::prompt_gist(&pr.title, &pr.prompt).into());
-                *card = Some(PromptCard { key: k, shown: now, body, gist, scroll: ScrollHandle::new(), read: false, _arm: None });
+                *card = Some(PromptCard {
+                    key: k,
+                    arm: Arm::new(now),
+                    body,
+                    gist,
+                    scroll: ScrollHandle::new(),
+                    actions: ScrollHandle::new(),
+                    read: false,
+                    _arm: None,
+                });
                 true
             }
             (None, _) => {
@@ -716,23 +775,45 @@ impl PromptCard {
     }
 
     pub(crate) fn armed(&self) -> bool {
-        self.shown.elapsed() >= ARM
+        self.arm.armed(Instant::now())
     }
 
-    /// The well's overflow below the view, once it has been laid out.
-    fn below(&self) -> Option<f32> {
-        if self.scroll.bounds().size.height <= px(0.) {
+    pub(crate) fn keys_armed(&self) -> bool {
+        self.arm.keys_armed(Instant::now())
+    }
+
+    /// What of the well is out of sight in a window `view` tall, once it
+    /// has been laid out: below its view, or under the window's bottom (a
+    /// tiled window can be shorter than its minimum).
+    fn below(&self, view: f32) -> Option<f32> {
+        let b = self.scroll.bounds();
+        if b.size.height <= px(0.) {
             return None;
         }
-        Some(f32::from(self.scroll.max_offset().y + self.scroll.offset().y).max(0.))
+        Some(hidden(f32::from(self.scroll.max_offset().y + self.scroll.offset().y), f32::from(b.bottom()), view))
+    }
+
+    /// Its buttons were laid out whole inside a window `view` tall (or not
+    /// laid out yet: the frame that draws a new card).
+    fn buttons_shown(&self, view: f32) -> bool {
+        let b = self.actions.bounds();
+        b.size.height <= px(0.) || f32::from(b.bottom()) <= view + 0.5
     }
 }
 
+/// A well's hidden height: what is still below its view (`overflow`) and
+/// what of it is under the window's bottom.
+pub(crate) fn hidden(overflow: f32, bottom: f32, view: f32) -> f32 {
+    overflow.max(0.) + (bottom - view).max(0.)
+}
+
 /// What a key does to the authorization card while the window has the
-/// focus (nothing typed in does): Enter or Ctrl/Cmd+Enter answers yes, Esc
-/// no, Page Down / Page Up / Down / Up scroll its well. None of them is an
-/// app binding, and only the window's own focus sees them: the composer,
-/// find and every field keep theirs.
+/// focus (nothing typed in does): Ctrl+Enter (Cmd+Enter on macOS) answers
+/// yes, Esc no, Page Down / Page Up / Down / Up scroll its well. A bare
+/// Enter does nothing: the window has the focus after a launch, a click
+/// outside a field or Settings, and an Enter meant for the composer must
+/// not run a tool. None of them is an app binding, and only the window's
+/// own focus sees them: the composer, find and every field keep theirs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CardKey {
     Yes,
@@ -741,10 +822,17 @@ pub(crate) enum CardKey {
 }
 
 pub(crate) fn card_key(ks: &Keystroke) -> Option<CardKey> {
+    card_key_on(ks, cfg!(target_os = "macos"))
+}
+
+/// [`card_key`] on macOS (`mac`) or not: Cmd there, Ctrl elsewhere (Super
+/// is the desktop's on Linux).
+pub(crate) fn card_key_on(ks: &Keystroke, mac: bool) -> Option<CardKey> {
     let m = &ks.modifiers;
     let bare = !(m.shift || m.alt || m.control || m.platform || m.function);
+    let primary = if mac { m.platform && !m.control } else { m.control && !m.platform };
     match ks.key.as_str() {
-        "enter" if !(m.shift || m.alt || m.function) && !(m.control && m.platform) => Some(CardKey::Yes),
+        "enter" if primary && !(m.shift || m.alt || m.function) => Some(CardKey::Yes),
         "escape" if bare => Some(CardKey::No),
         k @ ("pagedown" | "pageup" | "down" | "up") if bare => {
             Some(CardKey::Scroll { down: matches!(k, "pagedown" | "down"), page: k.starts_with("page") })
@@ -758,6 +846,19 @@ pub(crate) fn card_key(ks: &Keystroke) -> Option<CardKey> {
 /// before its first layout.
 pub(crate) fn authorize_ready(armed: bool, below: Option<f32>, read: bool) -> bool {
     armed && below.is_some_and(|b| b <= 1. || read)
+}
+
+/// What a secret card sends: the typed answer to `submit` (never an empty
+/// one: Enter in an empty field, a second Enter after the first moved the
+/// focus there, a held Enter after the answer went out, SUBMIT with
+/// nothing typed: none of them sends), or nothing, to cancel. `None`: send
+/// nothing at all.
+pub(crate) fn secret_answer(submit: bool, typed: &str) -> Option<Option<String>> {
+    match submit {
+        true if typed.is_empty() => None,
+        true => Some(Some(typed.to_string())),
+        false => Some(None),
+    }
 }
 
 /// Lines of the well (`line` px each) still below its view.
@@ -874,6 +975,9 @@ pub struct AppView {
     pub(crate) config_theme: SharedString,
     /// The authorization card's prompt (see [`PromptCard`]).
     card: Option<PromptCard>,
+    /// Its keys were live at the last frame ([`AppView::card_keys_live`]):
+    /// when they come back, they wait again ([`Arm`]).
+    keys_live: bool,
     /// The running dot's step, and the 2 Hz timer while a turn runs.
     pub(crate) rail: crate::chrome::RailCache,
     focus: FocusHandle,
@@ -1066,10 +1170,12 @@ impl AppView {
                     this.apply_custom_accent(cx);
                 }
             }),
-            cx.subscribe_in(&secret_input, window, |this: &mut Self, _input, ev: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { .. } = ev {
-                    this.answer_secret(true, window, cx);
-                }
+            // Enter (or Ctrl/Cmd+Enter) submits what was typed, never
+            // nothing; typing lights SUBMIT.
+            cx.subscribe_in(&secret_input, window, |this: &mut Self, _input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => this.answer_secret(true, window, cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
             }),
             cx.subscribe_in(&settings_find, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
                 if let InputEvent::Change = ev {
@@ -1100,6 +1206,8 @@ impl AppView {
         // a frame has drawn without it. Until then the fold keys reach an
         // app-wide fallback, which also hands the focus back.
         subs.push(cx.on_focus_lost(window, |this, window, cx| window.focus(&this.focus, cx)));
+        // The window came back (or went): a card's keys wait again ([`Arm`]).
+        subs.push(cx.observe_window_activation(window, |_, _, cx| cx.notify()));
         fold_fallback::<ToggleRail>(true, cx.weak_entity(), window.window_handle(), focus.clone(), cx);
         fold_fallback::<ToggleRight>(false, cx.weak_entity(), window.window_handle(), focus.clone(), cx);
         {
@@ -1193,7 +1301,7 @@ impl AppView {
             subs_gen: 0,
             rows_session: None,
             waiting_on: None,
-            layout: Layout::of(800., 800., &Metrics::at(theme::DEFAULT_TEXT)),
+            layout: Layout::of(800., 800., &Metrics::at(theme::DEFAULT_TEXT), Default::default()),
             scroll_carry: None,
             hold_back: Rc::new(Cell::new(false)),
             composer: i.composer,
@@ -1228,6 +1336,7 @@ impl AppView {
             theme_profile: None,
             config_theme: SharedString::default(),
             card: None,
+            keys_live: false,
             rail: Default::default(),
             focus: i.focus,
             restore: None,
@@ -1641,6 +1750,8 @@ impl AppView {
         self.attach_due = None;
         let fresh = ListState::new(0, ListAlignment::Top, px(600.));
         fresh.set_follow_mode(FollowMode::Tail);
+        // What a rise left owed is the old list's.
+        self.scroll_carry = None;
         let cache = TabCache {
             transcript,
             stats,
@@ -1673,6 +1784,7 @@ impl AppView {
                 self.disp = c.disp;
                 self.summaries = c.summaries;
                 self.list = c.list;
+                self.scroll_carry = None;
                 self.toggled = c.toggled;
                 self.open_runs = c.open_runs;
                 self.synced_busy = c.synced_busy;
@@ -2087,22 +2199,72 @@ impl AppView {
         }
     }
 
+    /// What the centre column draws besides the bars, the card and the
+    /// composer ([`crate::fit::Extras`]).
+    fn extras(&self) -> crate::fit::Extras {
+        crate::fit::Extras {
+            naming: self.model.named.naming && self.model.active.is_some(),
+            error: self.model.last_error.is_some(),
+            note: self.draft_note.is_some(),
+        }
+    }
+
     /// The session tab is on screen and its card shows the first prompt.
     fn card_up(&self) -> bool {
         self.model.tabs.view().is_none() && self.current_card().is_some()
     }
 
-    /// The card's keys act: nothing typed in has the focus (the window's
-    /// own), or a secret prompt's field does (`Some(true)`: Enter there
-    /// submits). The composer, find and the other fields keep Enter and Esc.
+    /// The card's keys act: it is on screen in the active window with its
+    /// buttons whole (a tiled window can be shorter than its minimum), no
+    /// overlay is open (the theme picker, the gear's menu), and nothing
+    /// typed in has the focus (the window's own), or a secret prompt's
+    /// field does (`Some(true)`: Enter there submits). The composer, find
+    /// and the other fields keep Enter and Esc.
     fn card_keys_live(&self, window: &Window, cx: &App) -> Option<bool> {
-        if !self.card_up() {
+        let view = f32::from(window.viewport_size().height);
+        let shown = self.current_card().is_some_and(|c| c.buttons_shown(view));
+        if !self.card_up() || !shown || self.picker_open || self.gear_menu || !window.is_window_active() {
             None
         } else if self.secret_input.read(cx).focus_handle(cx).is_focused(window) {
             Some(true)
         } else {
             self.focus.is_focused(window).then_some(false)
         }
+    }
+
+    /// Repaint the card when its arm runs out (its buttons, and the keys
+    /// they show, light up).
+    fn arm_repaint(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ARM).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+    }
+
+    /// The card's keys went live: they wait [`ARM`] from now.
+    fn restart_card_keys(&mut self, cx: &mut Context<Self>) {
+        if let Some(c) = self.card.as_mut() {
+            c.arm.restart(Instant::now());
+            c._arm = Some(Self::arm_repaint(cx));
+        }
+    }
+
+    /// A Ctrl+Enter or Esc reached the card (its keys are live): true if
+    /// it may answer ([`Arm::key`]). Keys that were not live at the last
+    /// frame went live with it, so it waits too.
+    fn card_key_armed(&mut self, held: bool, cx: &mut Context<Self>) -> bool {
+        let fresh = !std::mem::replace(&mut self.keys_live, true);
+        let Some(c) = self.card.as_mut() else { return false };
+        let now = Instant::now();
+        if fresh {
+            c.arm.restart(now);
+        }
+        let ok = c.arm.key(now, held);
+        if !ok {
+            c._arm = Some(Self::arm_repaint(cx));
+            cx.notify();
+        }
+        ok
     }
 
     /// The card's prompt, if this window may answer it now (as its
@@ -2113,9 +2275,10 @@ impl AppView {
         (self.drives() && self.model.may_answer(pr.id) && c.armed()).then_some((c, pr.is_secret()))
     }
 
-    /// Enter with the card's keys live. A confirm: AUTHORIZE, once the
-    /// whole body has been on screen (as the button); until then nothing.
-    /// A secret: its field takes the focus (Enter there submits).
+    /// Ctrl/Cmd+Enter with the card's keys live and armed. A confirm:
+    /// AUTHORIZE, once the whole body has been on screen (as the button);
+    /// until then nothing. A secret: its field takes the focus (Enter there
+    /// submits what was typed).
     fn card_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((c, secret)) = self.card_answerable() else { return };
         let key = c.key;
@@ -2155,17 +2318,18 @@ impl AppView {
 
     /// AUTHORIZE: only once the whole body has been on screen.
     fn authorize(&mut self, key: (u64, u64)) {
-        let ready = self.card.as_ref().is_some_and(|c| c.key == key && authorize_ready(c.armed(), c.below(), c.read));
+        let ready = self.card.as_ref().is_some_and(|c| c.key == key && authorize_ready(c.armed(), c.below(self.height), c.read));
         if ready {
             self.answer(key, Some(CONFIRM_YES.into()));
         }
     }
 
     /// A secret prompt's answer (`submit`) or cancel, for the prompt the
-    /// card shows; the field is cleared only when it went out.
+    /// card shows ([`secret_answer`]: never an empty one); the field is
+    /// cleared only when it went out.
     fn answer_secret(&mut self, submit: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(key) = self.card.as_ref().map(|c| c.key) else { return };
-        let value = submit.then(|| self.secret_input.read(cx).value().to_string());
+        let Some(value) = secret_answer(submit, &self.secret_input.read(cx).value()) else { return };
         if self.answer(key, value) {
             self.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
         }
@@ -2173,22 +2337,30 @@ impl AppView {
     }
 
     /// Keep the card's state with the prompt it shows ([`PromptCard::sync`]);
-    /// a new card also clears a half-typed secret meant for the previous one,
-    /// and takes the keys if nothing has the focus (a field that held it
-    /// went away): never from the composer or another field.
+    /// a new card also clears a half-typed secret meant for the previous
+    /// one, and takes the keys if the secret field has them (L5: what is
+    /// typed next is not for this prompt) or nothing does (rare: the
+    /// focus-lost fallback has usually given them to the window already,
+    /// which is why a bare Enter must not answer): never from the composer
+    /// or another field. Then keys that came back (the card came into view,
+    /// an overlay closed, the focus or the window came to it) wait again.
     fn sync_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if PromptCard::sync(&mut self.card, &self.model, Instant::now())
-            && let Some(c) = self.card.as_mut()
-        {
-            if window.focused(cx).is_none() {
+        let view = f32::from(window.viewport_size().height);
+        if PromptCard::sync(&mut self.card, &self.model, Instant::now(), view) && self.card.is_some() {
+            if window.focused(cx).is_none() || self.secret_input.read(cx).focus_handle(cx).is_focused(window) {
                 window.focus(&self.focus, cx);
             }
-            c._arm = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(ARM).await;
-                let _ = this.update(cx, |_, cx| cx.notify());
-            }));
+            let task = Self::arm_repaint(cx);
+            if let Some(c) = self.card.as_mut() {
+                c._arm = Some(task);
+            }
             self.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
         }
+        let live = self.card_keys_live(window, cx).is_some();
+        if live && !self.keys_live {
+            self.restart_card_keys(cx);
+        }
+        self.keys_live = live;
     }
 
     /// Open the picker with the focus on this view, so Esc reaches the
@@ -2825,7 +2997,7 @@ impl AppView {
     /// The "Name this session…" row under the header.
     fn render_naming(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let pending = self.model.named.rename.is_some();
-        let mut row = v_flex().py(px(10.)).gap(px(6.)).child(
+        let mut row = v_flex().py(px(crate::fit::naming_pad(self.layout.form()))).gap(px(6.)).child(
             h_flex()
                 .gap(px(14.))
                 .items_center()
@@ -2870,8 +3042,9 @@ impl AppView {
     /// titled in `warning_color`. Sized by [`crate::fit::Card`]: the well
     /// takes what the column has left, from 3 lines (fewer if the body has
     /// fewer) to the form's most, so the buttons and the composer stay on
-    /// screen. With `keys` live ([`AppView::card_keys_live`]) the buttons
-    /// show theirs: Enter answers yes (a secret's: in its field), Esc no.
+    /// screen. With `keys` live ([`AppView::card_keys_live`]) and armed
+    /// the buttons show theirs: Ctrl/Cmd+Enter answers yes (a secret's:
+    /// Enter in its field, once something is typed), Esc no.
     fn render_prompt(&self, p: &Palette, m: &Metrics, keys: Option<bool>, cx: &Context<Self>) -> Option<impl IntoElement> {
         let lay = self.layout;
         let form = lay.form();
@@ -2885,14 +3058,15 @@ impl AppView {
         let sent = self.model.prompt_answered(pr.id);
         let armed = card.is_some_and(|c| c.armed());
         let can = self.drives() && self.model.may_answer(pr.id) && armed;
-        let below = card.and_then(|c| c.below());
-        let ready = card.is_some_and(|c| authorize_ready(c.armed(), c.below(), c.read));
+        let below = card.and_then(|c| c.below(self.height));
+        let ready = card.is_some_and(|c| authorize_ready(c.armed(), below, c.read));
         let (head, kind) = if secret { (label::SECRET, "secret") } else { (label::AUTHORIZATION, "confirm") };
         let lead: SharedString = pr.title.clone().into();
         let detached = self.model.active.is_none();
         let in_field = keys == Some(true);
-        let keys = keys.is_some() && can;
+        let keys = keys.is_some() && can && card.is_some_and(|c| c.keys_armed());
         let key_hint = |k: &'static str| mono(k, m.meta, p.dim_k).flex_none();
+        let typed = secret && !self.secret_input.read(cx).value().is_empty();
         let actions = if detached {
             None
         } else if secret {
@@ -2902,8 +3076,16 @@ impl AppView {
                     .items_center()
                     .child(div().w(px((260. * m.r).round())).child(Input::new(&self.secret_input).disabled(!can).text_size(px(m.mono))))
                     .child(
-                        fbtn_key("p-submit", label::SUBMIT, (keys && in_field).then_some("ENTER"), can, p.warn_fill, p, m)
-                            .when(can, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(true, window, cx)))),
+                        fbtn_key(
+                            "p-submit",
+                            label::SUBMIT,
+                            (in_field && can && typed).then_some(if cfg!(target_os = "macos") { "RETURN" } else { "ENTER" }),
+                            can && typed,
+                            p.warn_fill,
+                            p,
+                            m,
+                        )
+                        .when(can && typed, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(true, window, cx)))),
                     )
                     .child(
                         h_flex()
@@ -2923,7 +3105,7 @@ impl AppView {
                 h_flex()
                     .gap(px(22.))
                     .items_center()
-                    .child(fbtn_key("p-yes", label::AUTHORIZE, (keys && yes).then_some("ENTER"), yes, p.warn_fill, p, m).when_some(
+                    .child(fbtn_key("p-yes", label::AUTHORIZE, (keys && yes).then_some(YES_KEY), yes, p.warn_fill, p, m).when_some(
                         key.filter(|_| yes),
                         |d, key| {
                             d.on_click(cx.listener(move |this, _, _, cx| {
@@ -2980,13 +3162,16 @@ impl AppView {
         let body = card.map(|c| c.body.clone()).unwrap_or_else(|| pr.prompt.clone().into());
         // Never squeezed under 3 lines, or under the body's own lines if it
         // has fewer (it may wrap to more: they scroll).
-        let floor = (body.lines().count() as f32).clamp(1., crate::fit::WELL_MIN);
+        // Fewer in a cramped window with the naming row or the notice line.
+        let ex = self.extras();
+        let floor = crate::fit::well_floor(m, form, (body.lines().count() as f32).clamp(1., crate::fit::WELL_MIN), ex);
         let r = m.r;
         // Whole lines, as many as the window has room for; less if the
-        // layout has less (an open naming row, an error line), down to the
-        // floor.
-        let rows = (1 + self.composer.read(cx).text().chunks().map(|c| c.matches('\n').count()).sum::<usize>()).min(self.composer_rows);
-        let lines = crate::fit::well_lines(m, form, self.height, rows, floor);
+        // layout has less (the naming row's own error line), down to the
+        // floor. The composer's rows: its hard lines (the rope's count; a
+        // soft wrap is taken from the well by its flex shrink).
+        let rows = self.composer.read(cx).text().lines_len().clamp(1, self.composer_rows.max(1));
+        let lines = crate::fit::well_lines(m, form, self.height, rows, floor, ex);
         let well = div()
             .id("prompt-well")
             .mt(px(dims.well_gap))
@@ -3066,16 +3251,19 @@ impl AppView {
                         .child(g)
                         .child(title)
                         .child(div().flex_1())
-                        .when(!lay.tight && !cramped, |d| d.child(mono(kind, m.meta, p.dim_k))),
+                        // Cramped, the lead replaces the head: a secret still says so.
+                        .when((!lay.tight && !cramped) || (cramped && secret), |d| d.child(mono(kind, m.meta, p.dim_k).flex_none())),
                 )
                 .children(lead_row)
                 .when(has_well, |d| d.child(well))
                 .child(
                     h_flex()
+                        .id("prompt-actions")
                         .flex_none()
                         .mt(px(dims.actions_gap))
                         .h(px(dims.button))
                         .items_center()
+                        .when_some(card, |d, c| d.track_scroll(&c.actions))
                         .children(actions)
                         .child(div().flex_1())
                         .when_some(footer, |d, f| {
@@ -3089,6 +3277,32 @@ impl AppView {
                         }),
                 ),
         )
+    }
+
+    /// The notice line under the card: the last error and, cramped, the
+    /// draft's note. With a card up it is one line, the rest in its tooltip
+    /// ([`crate::fit::Extras`] counts it so).
+    fn render_notice(&self, p: &Palette, m: &Metrics) -> Option<impl IntoElement> {
+        let lay = self.layout;
+        let note = self.draft_note.filter(|_| lay.form() == crate::fit::Form::Cramped);
+        let (text, color): (SharedString, Hsla) = match (self.model.last_error.clone(), note) {
+            (Some(e), Some(n)) => (format!("{e} · {n}").into(), p.err),
+            (Some(e), None) => (e.into(), p.err),
+            (None, Some(n)) => (n.into(), p.warn),
+            (None, None) => return None,
+        };
+        let line = mono(text.clone(), m.meta, color).pt(px(crate::fit::NOTICE_TOP)).line_height(px(crate::fit::notice_line(m)));
+        let line = if self.current_card().is_some() {
+            line.id("notice")
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
+                .into_any_element()
+        } else {
+            line.whitespace_normal().into_any_element()
+        };
+        Some(column(lay, line))
     }
 
     /// The composer: on the user surface, the user's bar on its left edge,
@@ -3113,7 +3327,11 @@ impl AppView {
         } else if !can_send {
             "not attached"
         } else if to_card {
-            "Esc, then Enter answers the card yes, Esc no"
+            if cfg!(target_os = "macos") {
+                "Esc, then ⌘Enter answers the card yes, Esc no"
+            } else {
+                "Esc, then Ctrl+Enter answers the card yes, Esc no"
+            }
         } else if busy {
             "steer: applied at the next turn boundary"
         } else {
@@ -3134,7 +3352,8 @@ impl AppView {
             .text_size(px(m.body))
             .line_height(px(m.body_line))
             .text_color(p.ink);
-        let inline = dims.row_gap.is_none() && self.draft_note.is_none();
+        // Cramped, the draft's note is on the notice line.
+        let inline = dims.row_gap.is_none();
         let inner = if inline {
             h_flex().gap(px(12.)).items_center().child(div().flex_1().min_w_0().child(field)).child(send)
         } else {
@@ -3356,7 +3575,8 @@ impl Render for AppView {
         if self.top_words.is_none() {
             self.top_words = Some(crate::chrome::top_words(window));
         }
-        let lay = Layout::of(pane, self.height - crate::chrome::TOP, &m);
+        let ex = self.extras();
+        let lay = Layout::of(pane, self.height - crate::chrome::TOP, &m, ex);
         if (lay.hang, lay.tight) != (self.layout.hang, self.layout.tight) {
             self.list.remeasure();
             self.metrics_gen += 1;
@@ -3368,12 +3588,12 @@ impl Render for AppView {
         // too: the session's list is back where it was when its tab is.
         if lay.form() != self.layout.form() {
             let (attached, known) = (self.header_attached(), self.header_known());
-            let shift = above_list(lay, attached, known) - above_list(self.layout, attached, known);
+            let shift = above_list(lay, attached, known, ex.naming) - above_list(self.layout, attached, known, ex.naming);
             self.keep_rows(shift, (lay.form() as u8) > (self.layout.form() as u8));
         }
         self.layout = lay;
         // The composer grows only into room the card's smallest form leaves.
-        let rows = crate::fit::composer_rows(&m, lay.form(), self.height, self.current_card().is_some());
+        let rows = crate::fit::composer_rows(&m, lay.form(), self.height, self.current_card().is_some(), ex);
         if rows != self.composer_rows {
             self.composer_rows = rows;
             self.composer.update(cx, |s, cx| s.set_auto_grow(1, rows, cx));
@@ -3392,20 +3612,23 @@ impl Render for AppView {
             .pb(px((28. * m.r).round()));
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
         // the end of a scrolled-back list set it following; it stops 2 px
-        // short of the end instead, still scrolled back.
-        let (held, hold) = (self.list.clone(), self.hold_back.clone());
-        let hold_back = canvas(
-            move |_, window, _| {
-                if hold.replace(false) && held.is_following_tail() {
-                    held.pause_following_tail();
-                    held.scroll_by(px(-2.));
-                    window.request_animation_frame();
-                }
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .size_0();
+        // short of the end instead, still scrolled back. Built only on the
+        // frame that needs it.
+        let hold_back = self.hold_back.get().then(|| {
+            let (held, hold) = (self.list.clone(), self.hold_back.clone());
+            canvas(
+                move |_, window, _| {
+                    if hold.replace(false) && held.is_following_tail() {
+                        held.pause_following_tail();
+                        held.scroll_by(px(-2.));
+                        window.request_animation_frame();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0()
+        });
         // A view draws in its own cached pane: this frame (a session
         // streaming behind it) reuses its last paint.
         let shown_view = view.filter(|k| *k != crate::tabs::Kind::Session).map(|k| {
@@ -3423,11 +3646,9 @@ impl Render for AppView {
                 .child(tabs)
                 .child(self.render_header(self.header_meta(), &p, cx))
                 .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
-                .child(div().flex_1().min_h_0().child(list).child(hold_back))
+                .child(div().flex_1().min_h_0().child(list).children(hold_back))
                 .children(self.render_prompt(&p, &m, self.card_keys_live(window, cx), cx))
-                .when_some(self.model.last_error.clone(), |d, e| {
-                    d.child(column(lay, mono(e, m.meta, p.err).pt(px(6.)).whitespace_normal()))
-                })
+                .children(self.render_notice(&p, &m))
                 .child(self.render_composer(&p, &m, self.card_up() && self.composer.read(cx).focus_handle(cx).is_focused(window), cx))
         };
         h_flex()
@@ -3469,33 +3690,35 @@ impl Render for AppView {
                     cx.stop_propagation();
                     cx.notify();
                 } else if ev.keystroke.key == "escape" && this.card_up() {
-                    if this.secret_input.read(cx).focus_handle(cx).is_focused(window) {
-                        // A secret prompt's field: CANCEL.
+                    if this.card_keys_live(window, cx) == Some(true) {
+                        // A secret prompt's field: CANCEL, once armed.
                         cx.stop_propagation();
-                        if !ev.is_held {
+                        if this.card_key_armed(ev.is_held, cx) {
                             this.card_escape(window, cx);
                         }
                     } else if this.composer.read(cx).focus_handle(cx).is_focused(window) {
-                        // Out of the composer: the card's keys act.
+                        // Out of the composer: the card's keys act, after
+                        // their wait (a second Esc right after is not a DENY).
                         cx.stop_propagation();
                         window.focus(&this.focus, cx);
+                        this.restart_card_keys(cx);
                         cx.notify();
                     }
                 }
             }))
-            // `/` (nothing else focused) goes to find. With a card up, Enter
-            // (or Ctrl/Cmd+Enter) answers yes and Esc no.
+            // `/` (nothing else focused) goes to find. With a card's keys
+            // live, Ctrl/Cmd+Enter answers yes and Esc no, once armed.
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let m = &ev.keystroke.modifiers;
-                let card = card_key(&ev.keystroke).filter(|_| this.focus.is_focused(window) && this.card_up());
+                let card = card_key(&ev.keystroke).filter(|_| this.card_keys_live(window, cx) == Some(false));
                 if let Some(c) = card {
                     cx.stop_propagation();
                     match c {
-                        // A held key never answers the card behind this one.
-                        CardKey::Yes | CardKey::No if ev.is_held => {}
+                        CardKey::Scroll { down, page } => this.card_scroll(down, page, cx),
+                        // Too early, or held: it waits again ([`Arm`]).
+                        _ if !this.card_key_armed(ev.is_held, cx) => {}
                         CardKey::Yes => this.card_enter(window, cx),
                         CardKey::No => this.card_escape(window, cx),
-                        CardKey::Scroll { down, page } => this.card_scroll(down, page, cx),
                     }
                 } else if ev.keystroke.key == "/" && !(m.control || m.alt || m.platform) && this.focus.is_focused(window) {
                     cx.stop_propagation();
@@ -3587,8 +3810,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        CENTRE_MIN, CardKey, FoldKeys, HeaderMeta, HeaderParts, Side, TabKey, above_list, authorize_ready, card_key, dragged, lines_below,
-        one_line, panel_keys, side_widths, sides, tab_keys, text_keys, toggled, well_body,
+        ARM, Arm, CENTRE_MIN, CardKey, FoldKeys, HeaderMeta, HeaderParts, Side, TabKey, YES_KEY, above_list, authorize_ready, card_key,
+        card_key_on, dragged, hidden, lines_below, one_line, panel_keys, secret_answer, side_widths, sides, tab_keys, text_keys, toggled,
+        well_body,
     };
     use crate::theme::{Metrics, Panels};
     use crate::turns::Layout;
@@ -3602,12 +3826,12 @@ mod tests {
         let m = Metrics::at(16);
         let pane_h = |window: f32| window - crate::chrome::TOP;
         for (window_h, short) in [(1080., false), (864., false), (800., false), (792., false), (791., true), (720., true), (600., true)] {
-            let l = Layout::of(1000., pane_h(window_h), &m);
+            let l = Layout::of(1000., pane_h(window_h), &m, Default::default());
             assert_eq!((l.short, HeaderParts::of(l, true, false, true, true).compact), (short, short), "{window_h}");
         }
         assert_eq!(crate::fit::short_below(&m), 740.);
         for w in [500., 900., 1600.] {
-            let (tall, short) = (Layout::of(w, 1000., &m), Layout::of(w, 500., &m));
+            let (tall, short) = (Layout::of(w, 1000., &m, Default::default()), Layout::of(w, 500., &m, Default::default()));
             assert_eq!(
                 (tall.column, tall.hang, tall.tight, tall.left, tall.right),
                 (short.column, short.hang, short.tight, short.left, short.right)
@@ -3616,9 +3840,9 @@ mod tests {
         }
         // L1: a tight pane keeps the full header (no folder); one row is for
         // short windows only, so a panel dragged across 560 moves nothing.
-        let (tight, wide) = (Layout::of(532., 1000., &m), Layout::of(600., 1000., &m));
+        let (tight, wide) = (Layout::of(532., 1000., &m, Default::default()), Layout::of(600., 1000., &m, Default::default()));
         assert!(tight.tight && !tight.short && !HeaderParts::of(tight, true, false, true, true).compact);
-        assert_eq!(above_list(tight, true, true), above_list(wide, true, true));
+        assert_eq!(above_list(tight, true, true, false), above_list(wide, true, true, false));
     }
 
     /// NAME and HALT are in both forms; the name beside the title and the
@@ -3626,8 +3850,8 @@ mod tests {
     #[test]
     fn the_one_row_header_keeps_name_and_halt() {
         let m = Metrics::at(16);
-        let full = Layout::of(1000., 1000., &m);
-        for lay in [Layout::of(1000., 600., &m), Layout::of(532., 600., &m)] {
+        let full = Layout::of(1000., 1000., &m, Default::default());
+        for lay in [Layout::of(1000., 600., &m, Default::default()), Layout::of(532., 600., &m, Default::default())] {
             assert!(lay.short);
             for (attached, busy) in [(true, true), (true, false), (false, false)] {
                 let parts = HeaderParts::of(lay, attached, busy, true, true);
@@ -3644,13 +3868,13 @@ mod tests {
         assert_eq!(HeaderParts::of(full, false, false, false, false).height(), 65.);
         // Full to one row: the list's top edge rises by the header's 55 px
         // and the top bar's 12 (what a scrolled-back list scrolls by).
-        let short = Layout::of(1000., 600., &m);
-        assert_eq!(above_list(short, true, true) - above_list(full, true, true), -67.);
-        assert_eq!(above_list(short, false, false) - above_list(full, false, false), -40.);
+        let short = Layout::of(1000., 600., &m, Default::default());
+        assert_eq!(above_list(short, true, true, false) - above_list(full, true, true, false), -67.);
+        assert_eq!(above_list(short, false, false, false) - above_list(full, false, false, false), -40.);
         // Cramped: the same bars as short.
-        let cramped = Layout::of(1000., 400., &m);
+        let cramped = Layout::of(1000., 400., &m, Default::default());
         assert!(cramped.cramped && cramped.short);
-        assert_eq!(above_list(cramped, true, true), above_list(short, true, true));
+        assert_eq!(above_list(cramped, true, true, false), above_list(short, true, true, false));
     }
 
     /// The one-row header's title tooltip: the whole title, then what the
@@ -3833,22 +4057,46 @@ mod tests {
             let (s, u, alt) = crate::views::view_keys(mac, !mac);
             let views: Vec<_> = [Some(s), Some(u), alt].into_iter().flatten().map(parse).collect();
             for (k, _) in &app {
-                assert_eq!(card_key(k), None, "{k:?}");
+                assert_eq!(card_key_on(k, mac), None, "{k:?}");
             }
             for k in &views {
-                assert_eq!(card_key(k), None, "{k:?}");
+                assert_eq!(card_key_on(k, mac), None, "{k:?}");
             }
         }
-        let card = |k: &'static str| card_key(&parse_any(k));
-        assert_eq!((card("enter"), card("ctrl-enter"), card("cmd-enter")), (Some(CardKey::Yes), Some(CardKey::Yes), Some(CardKey::Yes)));
-        assert_eq!(card("escape"), Some(CardKey::No));
-        assert_eq!(card("pagedown"), Some(CardKey::Scroll { down: true, page: true }));
-        assert_eq!(card("up"), Some(CardKey::Scroll { down: false, page: false }));
-        // Shift+Enter is a new line elsewhere; Shift+Esc, Ctrl+Esc and
-        // Shift+Down are not the card's.
-        for k in ["shift-enter", "alt-enter", "shift-escape", "ctrl-escape", "shift-down", "ctrl-pagedown", "a", "space"] {
-            assert_eq!(card(k), None, "{k}");
+        for mac in [false, true] {
+            let card = |k: &'static str| card_key_on(&parse_any(k), mac);
+            // H3: a bare Enter never answers (the window holds the focus
+            // after a launch, a click, Settings); Ctrl+Enter does, Cmd+Enter
+            // on macOS. L4: Super+Enter is the desktop's on Linux.
+            let (yes, other) = if mac { ("cmd-enter", "ctrl-enter") } else { ("ctrl-enter", "cmd-enter") };
+            assert_eq!(card(yes), Some(CardKey::Yes), "{mac}");
+            assert_eq!((card("enter"), card(other), card("super-enter")), (None, None, if mac { Some(CardKey::Yes) } else { None }));
+            assert_eq!(card("escape"), Some(CardKey::No));
+            assert_eq!(card("pagedown"), Some(CardKey::Scroll { down: true, page: true }));
+            assert_eq!(card("up"), Some(CardKey::Scroll { down: false, page: false }));
+            // Shift+Enter is a new line elsewhere; Shift+Esc, Ctrl+Esc and
+            // Shift+Down are not the card's; no letter is (no y / n).
+            for k in [
+                "shift-enter",
+                "alt-enter",
+                "ctrl-cmd-enter",
+                "shift-ctrl-enter",
+                "shift-cmd-enter",
+                "alt-ctrl-enter",
+                "shift-escape",
+                "ctrl-escape",
+                "shift-down",
+                "ctrl-pagedown",
+                "y",
+                "n",
+                "a",
+                "space",
+            ] {
+                assert_eq!(card(k), None, "{k} {mac}");
+            }
         }
+        assert_eq!(card_key(&parse_any(if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" })), Some(CardKey::Yes));
+        assert_eq!(YES_KEY, if cfg!(target_os = "macos") { "⌘ENTER" } else { "CTRL+ENTER" });
     }
 
     fn parse_any(k: &'static str) -> gpui_kit::Keystroke {
@@ -4113,6 +4361,127 @@ mod tests {
         assert!(!authorize_ready(false, Some(0.), true), "not armed");
         assert!(authorize_ready(true, Some(below), true), "scrolled to the end once");
         assert!(authorize_ready(true, Some(0.), false), "fits: nothing to scroll");
+    }
+
+    /// L2: the read gate counts what is under the window's bottom.
+    #[test]
+    fn a_well_under_the_window_bottom_is_not_read() {
+        assert_eq!(hidden(0., 380., 420.), 0.);
+        assert_eq!(hidden(0., 440., 420.), 20.);
+        assert_eq!(hidden(42., 440., 420.), 62.);
+        assert_eq!(hidden(-0.4, 300., 420.), 0.);
+        assert!(!authorize_ready(true, Some(hidden(0., 440., 420.)), false));
+    }
+
+    /// The card's keys, as the window sees them: `(ms, key-down, held)`,
+    /// a card shown at `card` ms (its keys live from then). Returns the
+    /// times a key answered.
+    fn answers(card: u64, live_at: &[u64], downs: &[(u64, bool)]) -> Vec<u64> {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut arm: Option<Arm> = None;
+        let mut out = Vec::new();
+        let mut live = live_at.iter().peekable();
+        let mut downs = downs.iter().peekable();
+        for ms in 0..6000 {
+            if ms == card {
+                arm = Some(Arm::new(at(ms)));
+            }
+            if live.next_if_eq(&&ms).is_some()
+                && let Some(a) = arm.as_mut()
+            {
+                a.restart(at(ms));
+            }
+            while let Some(&&(t, held)) = downs.peek() {
+                if t != ms {
+                    break;
+                }
+                downs.next();
+                if let Some(a) = arm.as_mut()
+                    && a.key(at(ms), held)
+                {
+                    out.push(ms);
+                    // Answered: the next card comes 40 ms later.
+                    arm = None;
+                }
+            }
+        }
+        out
+    }
+
+    /// H2 + M1: a held Ctrl+Enter or Esc never answers a card that came up
+    /// under it, on X11 (repeats as up/down pairs, never "held") or Wayland
+    /// (repeats marked held); a press after the release, once the wait is
+    /// over, does. The wait starts again when the keys go live.
+    #[test]
+    fn a_held_key_never_answers_the_card() {
+        let arm = ARM.as_millis() as u64;
+        // A key held from 0 to 2000 ms, repeating every 33 ms after 600; the
+        // card comes at 900.
+        let repeats: Vec<u64> = (0..43).map(|k| 600 + k * 33).collect();
+        let x11: Vec<(u64, bool)> = std::iter::once((0, false)).chain(repeats.iter().map(|&t| (t, false))).collect();
+        let wayland: Vec<(u64, bool)> = std::iter::once((0, false)).chain(repeats.iter().map(|&t| (t, true))).collect();
+        let last = *repeats.last().unwrap();
+        assert!(last < 2000);
+        for (name, keys) in [("x11", &x11), ("wayland", &wayland)] {
+            assert_eq!(answers(900, &[], keys), Vec::<u64>::new(), "{name}: held through the card");
+            // A press right after the release: the last repeat started the wait.
+            let mut k = keys.clone();
+            k.push((last + 200, false));
+            assert_eq!(answers(900, &[], &k), Vec::<u64>::new(), "{name}: too soon after the last repeat");
+            let mut k = keys.clone();
+            k.push((last + arm + 1, false));
+            assert_eq!(answers(900, &[], &k), vec![last + arm + 1], "{name}: a fresh press after the wait");
+        }
+        // A tap before the card is armed restarts the wait.
+        assert_eq!(answers(100, &[], &[(300, false), (700, false), (1300, false)]), vec![1300], "300 restarts: 700 is early too");
+        assert_eq!(answers(100, &[], &[(650, false)]), vec![650]);
+        // Keys that come live (the card came into view, Esc out of the
+        // composer, the picker closed, the window came back) wait again.
+        assert_eq!(answers(100, &[3000], &[(3200, false), (3800, false)]), vec![3800]);
+        // A double Esc: the first moved the keys to the card (live at 3000),
+        // the second (3100) is not a DENY, nor the next one too soon after it.
+        assert_eq!(answers(100, &[3000], &[(3100, false), (3300, false), (3900, false)]), vec![3900]);
+        // A press the platform marks held never answers, armed or not.
+        assert_eq!(answers(100, &[], &[(2000, true)]), Vec::<u64>::new());
+    }
+
+    /// The buttons count from when the card was shown, not from when its
+    /// keys came: a click moves the keys to the card and still lands.
+    #[test]
+    fn the_buttons_keep_their_own_arm() {
+        let t0 = Instant::now();
+        let mut a = Arm::new(t0);
+        let later = t0 + ARM + Duration::from_millis(1000);
+        a.restart(later);
+        assert!(a.armed(later) && !a.keys_armed(later));
+        assert!(a.keys_armed(later + ARM));
+        assert!(!Arm::new(t0).armed(t0 + ARM - Duration::from_millis(1)));
+    }
+
+    /// H1: a secret card never sends an empty answer: Enter in the empty
+    /// field (twice: the first Ctrl+Enter only moved the focus there), a
+    /// held Enter after the answer went out (the field is cleared), SUBMIT
+    /// with nothing typed. CANCEL sends nothing, to cancel.
+    #[test]
+    fn a_secret_card_never_sends_an_empty_answer() {
+        assert_eq!(secret_answer(true, ""), None);
+        assert_eq!(secret_answer(true, "hunter2"), Some(Some("hunter2".into())));
+        assert_eq!(secret_answer(false, ""), Some(None));
+        assert_eq!(secret_answer(false, "half"), Some(None));
+        // A held Enter in the field: the first press sends, the field is
+        // cleared, every repeat after it finds it empty.
+        let mut field = String::from("s3cret");
+        let mut sent = Vec::new();
+        for _ in 0..30 {
+            if let Some(v) = secret_answer(true, &field) {
+                sent.push(v);
+                field.clear();
+            }
+        }
+        assert_eq!(sent, vec![Some("s3cret".to_string())]);
+        // Two Enters in an empty field: nothing.
+        assert_eq!([secret_answer(true, ""), secret_answer(true, "")], [None, None]);
     }
 
     #[test]

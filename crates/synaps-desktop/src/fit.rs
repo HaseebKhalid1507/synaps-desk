@@ -14,7 +14,11 @@
 //!   (the smallest) at every text step.
 //!
 //! In every form the well takes what is left, between [`WELL_MIN`] lines
-//! and the form's most; the transcript's list gives way first.
+//! and the form's most; the transcript's list gives way first. What else
+//! the column may draw ([`Extras`]: the naming row, the notice line)
+//! counts too: it moves the cramped line up, and in a cramped window the
+//! well gives way to it down to one line, so SEND stays on screen in a
+//! 420-px window at every text step with all of it open.
 
 use crate::chrome::{TOP, TOP_SHORT};
 use crate::tabstrip::TAB_H;
@@ -42,6 +46,55 @@ const FIELD_PAD: f32 = 8.;
 /// GPUI's default line height, in ems: a row of text left at its natural
 /// height (the card's title) is this tall.
 const PHI: f32 = std::f32::consts::GOLDEN_RATIO;
+/// The naming row's field (a Medium input, 2 rem).
+const NAME_FIELD: f32 = 32.;
+/// The notice line's gap above its text.
+pub(crate) const NOTICE_TOP: f32 = 6.;
+
+/// The naming row's padding above and below (less when cramped).
+pub(crate) fn naming_pad(form: Form) -> f32 {
+    if form == Form::Cramped { 4. } else { 10. }
+}
+
+/// The naming row, its hairline included.
+pub(crate) fn naming_h(form: Form) -> f32 {
+    NAME_FIELD + 2. * naming_pad(form) + 1.
+}
+
+/// The notice line's line (one line while a card is up: the rest is in
+/// its tooltip).
+pub(crate) fn notice_line(m: &Metrics) -> f32 {
+    (18. * m.r).round()
+}
+
+/// What else the centre column draws round the card and the composer:
+/// the naming row ("Name this session…", its own error or REPLACE line
+/// not counted) and the notice line under the card: the last error and,
+/// cramped, the draft's note (the composer keeps SEND beside its text).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Extras {
+    pub(crate) naming: bool,
+    pub(crate) error: bool,
+    pub(crate) note: bool,
+}
+
+impl Extras {
+    /// The notice line is drawn in `form`.
+    pub(crate) fn notice(&self, form: Form) -> bool {
+        self.error || (self.note && form == Form::Cramped)
+    }
+
+    pub(crate) fn height(&self, m: &Metrics, form: Form) -> f32 {
+        let naming = if self.naming { naming_h(form) } else { 0. };
+        naming + if self.notice(form) { NOTICE_TOP + notice_line(m) } else { 0. }
+    }
+
+    /// The fewest lines the well keeps in `form`: one when they take room
+    /// in a cramped window, else [`WELL_MIN`].
+    pub(crate) fn well_min(&self, m: &Metrics, form: Form) -> f32 {
+        if form == Form::Cramped && self.height(m, form) > 0. { 1. } else { WELL_MIN }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Form {
@@ -174,10 +227,11 @@ pub(crate) fn above(form: Form) -> f32 {
     }
 }
 
-/// The window height `form` needs at `m`: the bars, the header, a card
-/// with a [`WELL_MIN`]-line well and a one-line composer (no transcript).
-pub(crate) fn need(m: &Metrics, form: Form) -> f32 {
-    above(form) + Card::of(m, form).height(WELL_MIN) + Composer::of(m, form).height(1)
+/// The window height `form` needs at `m`: the bars, the header, `ex`, a
+/// card with its least well ([`Extras::well_min`]) and a one-line
+/// composer (no transcript).
+pub(crate) fn need(m: &Metrics, form: Form, ex: Extras) -> f32 {
+    above(form) + ex.height(m, form) + Card::of(m, form).height(ex.well_min(m, form)) + Composer::of(m, form).height(1)
 }
 
 /// The centre pane's height (under the full top bar) below which the
@@ -192,28 +246,34 @@ pub(crate) fn short_below(m: &Metrics) -> f32 {
 }
 
 /// ...below which it is cramped: the short form would not fit a 3-line
-/// well and a one-line composer.
-pub(crate) fn cramped_below(m: &Metrics) -> f32 {
-    need(m, Form::Short) - TOP
+/// well, `ex` and a one-line composer.
+pub(crate) fn cramped_below(m: &Metrics, ex: Extras) -> f32 {
+    need(m, Form::Short, ex) - TOP
+}
+
+/// The fewest lines the well shows: `floor` (the body's own lines, up to
+/// [`WELL_MIN`]), or fewer if `ex` needs the room ([`Extras::well_min`]).
+pub(crate) fn well_floor(m: &Metrics, form: Form, floor: f32, ex: Extras) -> f32 {
+    floor.min(ex.well_min(m, form))
 }
 
 /// The lines the card's well shows in a `window` this tall: whole lines,
-/// as many as the bars, the card's other boxes and a composer of `rows`
-/// leave room for, between `floor` and the form's most. (What the budget
-/// does not count, an open naming row or an error line, the layout takes
-/// from the well, down to `floor`.)
-pub(crate) fn well_lines(m: &Metrics, form: Form, window: f32, rows: usize, floor: f32) -> f32 {
+/// as many as the bars, `ex`, the card's other boxes and a composer of
+/// `rows` leave room for, between [`well_floor`] and the form's most.
+/// (What the budget does not count, the naming row's own error line, the
+/// layout takes from the well, down to that floor.)
+pub(crate) fn well_lines(m: &Metrics, form: Form, window: f32, rows: usize, floor: f32, ex: Extras) -> f32 {
     let card = Card::of(m, form);
-    let room = window - above(form) - Composer::of(m, form).height(rows) - card.height(0.);
-    (room / card.line).floor().clamp(floor, card.lines)
+    let room = window - above(form) - ex.height(m, form) - Composer::of(m, form).height(rows) - card.height(0.);
+    (room / card.line).floor().clamp(well_floor(m, form, floor, ex), card.lines)
 }
 
 /// How many rows the composer's text may grow to: as many as fit under
-/// the card's smallest form (`card`: one is up), at least one.
-pub(crate) fn composer_rows(m: &Metrics, form: Form, window: f32, card: bool) -> usize {
+/// a card with a 3-line well (`card`: one is up) and `ex`, at least one.
+pub(crate) fn composer_rows(m: &Metrics, form: Form, window: f32, card: bool, ex: Extras) -> usize {
     let c = Composer::of(m, form);
     let card = if card { Card::of(m, form).height(WELL_MIN) } else { 0. };
-    let spare = window - above(form) - card - c.height(1);
+    let spare = window - above(form) - ex.height(m, form) - card - c.height(1);
     (1 + (spare / c.line).floor().max(0.) as usize).min(COMPOSER_ROWS)
 }
 
@@ -316,6 +376,8 @@ impl TopFit {
 /// THEME and SYSTEMS words go (the swatch and the count stay); the
 /// connection text goes (the disc keeps its colour); SYNAPS; the label.
 /// The count, NEED YOU, "+N", JUMP, the swatch and the badge always show.
+/// Then what a later step freed is given back, back up the order: a word
+/// that fits again comes back, a shortened text grows into what is left.
 pub(crate) fn fit_top(w: &TopWords, i: &TopIn) -> TopFit {
     let room = i.width - TOP_PAD;
     let mut f = TopFit {
@@ -354,12 +416,51 @@ pub(crate) fn fit_top(w: &TopWords, i: &TopIn) -> TopFit {
         },
         |f, _, _| f.label = 0.,
     ];
-    for step in steps {
+    // Each step taken: what it changed from.
+    let mut taken: [Option<TopFit>; 11] = [None; 11];
+    for (k, step) in steps.iter().enumerate() {
         let over = f.width(w, i) - room;
         if over <= 0. {
             break;
         }
+        let before = f;
         step(&mut f, w, over);
+        if f != before {
+            taken[k] = Some(before);
+        }
+    }
+    for (k, before) in taken.iter().enumerate().rev().filter_map(|(k, b)| Some((k, (*b)?))) {
+        let mut g = f;
+        match k {
+            0 => g.brand = before.brand.max(g.brand_content(w)),
+            1 => {
+                g.word2 = true;
+                g.brand = g.brand.max(g.brand_content(w));
+            }
+            9 => {
+                g.word = true;
+                g.brand = g.brand.max(g.brand_content(w));
+            }
+            6 => g.theme = true,
+            7 => g.systems = true,
+            _ => {
+                let (slot, min): (fn(&mut TopFit) -> &mut f32, f32) = match k {
+                    2 | 4 => (|t| &mut t.gist, GIST_MIN),
+                    3 | 8 => (|t| &mut t.conn, CONN_MIN),
+                    _ => (|t| &mut t.label, LABEL_MIN),
+                };
+                // As it was before the step, or shortened to what fits:
+                // longer than now, and (back from gone) not under its floor.
+                let mut b = before;
+                let (was, now) = (*slot(&mut b), *slot(&mut g));
+                *slot(&mut g) = was;
+                let v = was - (g.width(w, i) - room).max(0.);
+                *slot(&mut g) = if v > now && (now > 0. || v >= min.min(was)) { v } else { now };
+            }
+        }
+        if g.width(w, i) <= room + 0.01 {
+            f = g;
+        }
     }
     f
 }
@@ -383,9 +484,9 @@ mod tests {
         assert_eq!(Card::of(&m, Form::Full).boxed(8.).floor(), 330.);
         assert_eq!(Composer::of(&m, Form::Full).height(1), 139.);
         assert_eq!(Composer::of(&m, Form::Short).height(1), 125.);
-        assert_eq!(cramped_below(&m).floor(), 415.);
+        assert_eq!(cramped_below(&m, Extras::default()).floor(), 415.);
         // Cramped at 22 px: 406 of the smallest window's 420.
-        assert_eq!(need(&Metrics::at(22), Form::Cramped), 406.);
+        assert_eq!(need(&Metrics::at(22), Form::Cramped, Extras::default()), 406.);
         // Smaller text never makes a window less short than at 16 px.
         assert_eq!(short_below(&Metrics::at(14)), 740.);
     }
@@ -398,27 +499,31 @@ mod tests {
         let mut last = (0., 0.);
         for step in TEXT_STEPS {
             let m = Metrics::at(step);
-            let (short, cramped) = (short_below(&m), cramped_below(&m));
+            let (short, cramped) = (short_below(&m), cramped_below(&m, Extras::default()));
             assert!(cramped < short, "{step}");
             assert!(short >= last.0 && cramped >= last.1, "{step}");
             last = (short, cramped);
             for window in 420..1600 {
                 let window = window as f32;
-                let f = form(Layout::of(1000., window - TOP, &m));
-                assert!(need(&m, f) <= window, "step {step} window {window}: {f:?} needs {}", need(&m, f));
+                let f = form(Layout::of(1000., window - TOP, &m, Extras::default()));
+                assert!(
+                    need(&m, f, Extras::default()) <= window,
+                    "step {step} window {window}: {f:?} needs {}",
+                    need(&m, f, Extras::default())
+                );
                 // Full only with room for 12 lines and some transcript.
                 if f == Form::Full {
                     assert!(above(f) + Card::of(&m, f).height(WELL_MAX) + Composer::of(&m, f).height(1) < window);
                 }
-                assert!(composer_rows(&m, f, window, true) >= 1);
+                assert!(composer_rows(&m, f, window, true, Extras::default()) >= 1);
             }
         }
         // Step 22: full from 1018 px (792 at 16).
         let m = Metrics::at(22);
         assert_eq!(short_below(&m) + TOP, 1018.);
-        assert_eq!(form(Layout::of(1000., 1018. - TOP, &m)), Form::Full);
-        assert_eq!(form(Layout::of(1000., 1017. - TOP, &m)), Form::Short);
-        assert_eq!(form(Layout::of(1000., 420. - TOP, &m)), Form::Cramped);
+        assert_eq!(form(Layout::of(1000., 1018. - TOP, &m, Extras::default())), Form::Full);
+        assert_eq!(form(Layout::of(1000., 1017. - TOP, &m, Extras::default())), Form::Short);
+        assert_eq!(form(Layout::of(1000., 420. - TOP, &m, Extras::default())), Form::Cramped);
     }
 
     /// The well shows whole lines: 7 at 16 px in the smallest window, 3 at
@@ -426,26 +531,72 @@ mod tests {
     #[test]
     fn the_well_shows_whole_lines() {
         let m = Metrics::at(16);
-        assert_eq!(well_lines(&m, Form::Cramped, 420., 1, 3.), 7.);
-        assert_eq!(well_lines(&m, Form::Short, 600., 1, 3.), 8.);
-        assert_eq!(well_lines(&m, Form::Full, 800., 1, 3.), 12.);
+        assert_eq!(well_lines(&m, Form::Cramped, 420., 1, 3., Extras::default()), 7.);
+        assert_eq!(well_lines(&m, Form::Short, 600., 1, 3., Extras::default()), 8.);
+        assert_eq!(well_lines(&m, Form::Full, 800., 1, 3., Extras::default()), 12.);
         // A taller draft takes its rows from the well.
-        assert_eq!(well_lines(&m, Form::Cramped, 420., 3, 3.), 4.);
+        assert_eq!(well_lines(&m, Form::Cramped, 420., 3, 3., Extras::default()), 4.);
         let m = Metrics::at(22);
-        assert_eq!(well_lines(&m, Form::Cramped, 420., 1, 3.), 3.);
+        assert_eq!(well_lines(&m, Form::Cramped, 420., 1, 3., Extras::default()), 3.);
         // Never under the floor (the layout clips, the well scrolls).
-        assert_eq!(well_lines(&m, Form::Cramped, 300., 1, 3.), 3.);
-        assert_eq!(well_lines(&m, Form::Cramped, 300., 1, 2.), 2.);
+        assert_eq!(well_lines(&m, Form::Cramped, 300., 1, 3., Extras::default()), 3.);
+        assert_eq!(well_lines(&m, Form::Cramped, 300., 1, 2., Extras::default()), 2.);
+    }
+
+    /// Every mix of the naming row, an error and a draft note.
+    fn all_extras() -> impl Iterator<Item = Extras> {
+        (0..8u8).map(|b| Extras { naming: b & 1 != 0, error: b & 2 != 0, note: b & 4 != 0 })
+    }
+
+    /// L1: with the naming row, the notice line (an error, cramped the
+    /// draft note) or all of them open, at every text step and every
+    /// window height from the smallest up, the form chosen fits its well's
+    /// floor, AUTHORIZE and a one-line composer: SEND is on screen. The
+    /// well keeps whole lines and gives way to them only when cramped.
+    #[test]
+    fn the_naming_row_and_the_notice_line_are_counted() {
+        for step in TEXT_STEPS {
+            let m = Metrics::at(step);
+            for ex in all_extras() {
+                for window in 420..1600 {
+                    let window = window as f32;
+                    let f = form(Layout::of(1000., window - TOP, &m, ex));
+                    let need = need(&m, f, ex);
+                    assert!(need <= window, "step {step} window {window} {ex:?}: {f:?} needs {need}");
+                    let lines = well_lines(&m, f, window, 1, WELL_MIN, ex);
+                    assert_eq!(lines, lines.floor());
+                    assert!(lines >= ex.well_min(&m, f));
+                    let drawn = above(f) + ex.height(&m, f) + Card::of(&m, f).height(lines) + Composer::of(&m, f).height(1);
+                    assert!(drawn <= window + 0.01, "step {step} window {window} {ex:?}: {drawn}");
+                    if f != Form::Cramped {
+                        assert_eq!(ex.well_min(&m, f), WELL_MIN);
+                    }
+                }
+                // The thresholds only move up with more open.
+                assert!(cramped_below(&m, ex) >= cramped_below(&m, Extras::default()));
+            }
+        }
+        // Step 22, the smallest window, everything open: 420 of 420.
+        let (m, ex) = (Metrics::at(22), Extras { naming: true, error: true, note: true });
+        assert_eq!(need(&m, Form::Cramped, ex), 420.);
+        assert_eq!(well_lines(&m, Form::Cramped, 420., 1, WELL_MIN, ex), 1.);
+        // The note is on the notice line only when cramped (else in the
+        // composer's own row); the error always.
+        let note = Extras { note: true, ..Extras::default() };
+        assert_eq!((note.notice(Form::Cramped), note.notice(Form::Short)), (true, false));
+        assert_eq!(note.height(&m, Form::Short), 0.);
+        assert_eq!(naming_h(Form::Cramped), 41.);
+        assert_eq!(naming_h(Form::Short), 53.);
     }
 
     /// The composer grows only into room the card's 3-line form leaves.
     #[test]
     fn the_composer_grows_into_spare_room_only() {
         let m = Metrics::at(22);
-        assert_eq!(composer_rows(&m, Form::Cramped, 420., true), 1);
-        assert_eq!(composer_rows(&m, Form::Full, 1400., true), COMPOSER_ROWS);
+        assert_eq!(composer_rows(&m, Form::Cramped, 420., true, Extras::default()), 1);
+        assert_eq!(composer_rows(&m, Form::Full, 1400., true, Extras::default()), COMPOSER_ROWS);
         let m = Metrics::at(16);
-        let rows = composer_rows(&m, Form::Cramped, 420., true);
+        let rows = composer_rows(&m, Form::Cramped, 420., true, Extras::default());
         assert!(rows > 1);
         let c = Composer::of(&m, Form::Cramped);
         assert!(above(Form::Cramped) + Card::of(&m, Form::Cramped).height(WELL_MIN) + c.height(rows) <= 420.);
@@ -466,8 +617,8 @@ mod tests {
         cell_badge: 6.,
     };
 
-    /// The top bar never overflows, from the smallest window up, and what
-    /// it drops goes in its order: a narrower window never shows more.
+    /// The top bar never overflows, from the smallest window up; what it
+    /// drops goes in its order, and what a later drop frees is given back.
     #[test]
     fn the_top_bar_degrades_in_order() {
         let busy = TopIn { brand: 260., need: 12, label: 24, gist: 60, more: 2, jump: true, conn: 60, badge: 2, ..TopIn::default() };
@@ -478,9 +629,24 @@ mod tests {
                 let i = TopIn { width: width as f32, ..i };
                 let f = fit_top(&WORDS, &i);
                 assert!(f.width(&WORDS, &i) <= i.width - TOP_PAD + 0.01, "{width}: {f:?}");
+                // A text may grow a pixel narrower (the drop of another freed
+                // room, L3); SYNAPS never comes back.
                 if let Some(o) = wider {
-                    assert!(f.brand <= o.brand && f.label <= o.label && f.gist <= o.gist && f.conn <= o.conn, "{width}");
-                    assert!((!f.word || o.word) && (!f.word2 || o.word2) && (!f.theme || o.theme) && (!f.systems || o.systems));
+                    assert!(!f.word || o.word, "{width}");
+                }
+                // L3: nothing taken would fit again: a shortened text has
+                // grown into what was left, a word gone does not fit.
+                let left = i.width - TOP_PAD - f.width(&WORDS, &i);
+                let whole = fit_top(&WORDS, &TopIn { width: 1e5, ..i });
+                for (v, all) in [(f.gist, whole.gist), (f.conn, whole.conn), (f.label, whole.label)] {
+                    assert!(!(v > 0. && v < all) || left < 0.02, "{width}: {left} px left with a text shortened: {f:?}");
+                }
+                for (on, all, cost) in [
+                    (f.theme, whole.theme, 8. + WORDS.theme),
+                    (f.systems, whole.systems, WORDS.systems + 10.),
+                    (f.word2, whole.word2, 14. + WORDS.word2),
+                ] {
+                    assert!(on || !all || left < cost, "{width}: {left} px left, a word of {cost} gone: {f:?}");
                 }
                 // Shortened never under its floor: whole, at least the
                 // floor, or not drawn.
@@ -501,5 +667,14 @@ mod tests {
         // The smallest window keeps the count, JUMP, the swatch and the badge (in `width`).
         let f = fit_top(&WORDS, &TopIn { width: 640., ..busy });
         assert!(f.width(&WORDS, &TopIn { width: 640., ..busy }) <= 640. - TOP_PAD);
+        // L3, the review's cases: at 888 the connection text is not cut to
+        // its floor with 107 px to spare; at 640 with 123 waiting and a
+        // 3-digit badge, dropping SYSTEMS left 59 px, and THEME (46) is back.
+        let i = TopIn { width: 888., ..busy };
+        let f = fit_top(&WORDS, &i);
+        assert!(f.conn > CONN_MIN && i.width - TOP_PAD - f.width(&WORDS, &i) < 0.02, "{f:?}");
+        let i = TopIn { width: 640., need: 123, badge: 3, ..busy };
+        let f = fit_top(&WORDS, &i);
+        assert!(f.theme && !f.systems, "{f:?}");
     }
 }
