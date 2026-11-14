@@ -101,8 +101,14 @@ pub struct Tabs {
     restoring: Vec<u64>,
     restore_lists: u32,
     /// Restored tabs closed so, since the app last took the count (its
-    /// notice).
+    /// notice), and whether a tab change closed them before their wait was
+    /// over (their sessions may yet come back).
     pub dropped: usize,
+    pub dropped_early: bool,
+    /// Sessions a tab followed to a new id in place (a fallback resume of
+    /// an ended session, a daemon restart), oldest first: input given back
+    /// to the old id goes to that tab.
+    follows: Vec<(String, String)>,
 }
 
 impl Tabs {
@@ -142,6 +148,26 @@ impl Tabs {
     /// A tab open or on the reopen stack holds `session`.
     pub fn knows(&self, session: &str) -> bool {
         self.is_open(session) || self.closed.iter().any(|(_, t)| t.session.as_deref() == Some(session))
+    }
+
+    /// The id a tab followed `session` to, if no tab holds `session` any
+    /// more and one holds that id.
+    pub fn followed(&self, session: &str) -> Option<&str> {
+        if self.knows(session) {
+            return None;
+        }
+        let (_, to) = self.follows.iter().rev().find(|(from, _)| from == session)?;
+        self.knows(to).then_some(to.as_str())
+    }
+
+    /// Tab `ix` follows its session to `to` (same conversation, new id).
+    fn follow(&mut self, ix: usize, to: &str) {
+        if let Some(from) = self.tabs[ix].session.replace(to.to_string()) {
+            if self.follows.len() == CLOSED_MAX {
+                self.follows.remove(0);
+            }
+            self.follows.push((from, to.to_string()));
+        }
     }
 
     /// Tab `id` was restored and its session has not been listed yet.
@@ -192,15 +218,19 @@ impl Tabs {
     }
 
     /// The restored tabs still waiting for their session close (counted
-    /// in [`Tabs::dropped`]).
+    /// in [`Tabs::dropped`]), onto the reopen stack: Ctrl+Shift+T brings
+    /// one back, its journal with it.
     fn settle_restore(&mut self) {
         if self.restoring.is_empty() {
             return;
         }
+        let early = self.restore_lists < RESTORE_LISTS;
         for id in std::mem::take(&mut self.restoring) {
             if let Some(ix) = self.tabs.iter().position(|t| t.id == id) {
-                self.remove(ix);
+                let t = self.remove(ix);
+                self.push_closed(ix, t);
                 self.dropped += 1;
+                self.dropped_early |= early;
             }
         }
         self.changed();
@@ -348,7 +378,7 @@ impl Tabs {
                     self.tabs.remove(i);
                     self.active = Some(if j > i { j - 1 } else { j });
                 } else {
-                    self.tabs[i].session = Some(session.to_string());
+                    self.follow(i, session);
                 }
                 self.changed();
             }
@@ -448,7 +478,7 @@ impl Tabs {
                     // Another tab holds it already: one tab per session.
                     self.remove(ix);
                 } else {
-                    self.tabs[ix].session = Some(sid);
+                    self.follow(ix, &sid);
                 }
                 self.changed();
             }
@@ -480,20 +510,74 @@ pub struct Drafts {
 }
 
 impl Drafts {
+    /// The composer holds what was typed for the visible tab (`visible`:
+    /// its id and session): `owner` is that tab, with that session.
+    pub fn owns(owner: Option<&(u64, Option<String>)>, visible: Option<(u64, Option<&str>)>) -> bool {
+        owner.map(|(i, s)| (*i, s.as_deref())) == visible
+    }
+
+    /// One frame's composer work, in this order. Input given back for the
+    /// composer's `owner` (refused, or sent before its tab was left and it
+    /// is shown again) goes in first, ahead of what it holds; then, if the
+    /// visible tab is not the owner, the composer (with `note`) becomes the
+    /// owner's draft and the visible tab's comes out ([`Drafts::switch`]).
+    /// So input given back in the frame of a switch stays with its tab.
+    /// The composer's new text and caret (`None`: at the end), if it changes.
+    pub fn frame(
+        &mut self,
+        owner: &mut Option<(u64, Option<String>)>,
+        visible: Option<(u64, Option<&str>)>,
+        given_back: Option<String>,
+        note: &mut Option<&'static str>,
+        composer: (&str, usize),
+        knows: impl Fn(&str) -> bool,
+    ) -> Option<(String, Option<usize>)> {
+        let owned = Self::owns(owner.as_ref(), visible);
+        if owned && given_back.is_none() {
+            return None;
+        }
+        let mut text = given_back.map(|t| match composer.0.trim() {
+            "" => t,
+            now => format!("{t}\n{now}"),
+        });
+        let mut cursor = None;
+        if !owned {
+            let prev = std::mem::replace(owner, visible.map(|(i, s)| (i, s.map(str::to_string))));
+            let (held, at) = match &text {
+                Some(t) => (t.as_str(), t.len()),
+                None => composer,
+            };
+            if let Some(d) = self.switch(prev.as_ref(), visible, held, at, *note, &knows) {
+                self.retain(&knows);
+                *note = d.note;
+                if d.text.is_empty() && composer.0.is_empty() {
+                    return None;
+                }
+                (text, cursor) = (Some(d.text), Some(d.cursor));
+            }
+        }
+        text.map(|t| (t, cursor))
+    }
+
     /// The visible tab went from `prev` to `now` (tab id, session) while
-    /// the composer held `text` (caret at `cursor`): that is `prev`'s
-    /// session's draft now, and `now`'s comes out to be shown. `None`: the
-    /// composer keeps what it holds (a pending tab named by its create or
-    /// resume, still the same tab).
+    /// the composer held `text` (caret at `cursor`, saying `note`): that is
+    /// `prev`'s session's draft now, and `now`'s comes out to be shown.
+    /// `None`: the composer keeps what it holds, still the same tab, its
+    /// session named by its create or resume, or followed to a new id (no
+    /// tab or reopen entry holds the old one, per `knows`: a replaced
+    /// session is on the reopen stack, so its draft stays with it).
     pub fn switch(
         &mut self,
         prev: Option<&(u64, Option<String>)>,
-        now: Option<&(u64, Option<String>)>,
-        text: String,
+        now: Option<(u64, Option<&str>)>,
+        text: &str,
         cursor: usize,
+        note: Option<&'static str>,
+        knows: impl Fn(&str) -> bool,
     ) -> Option<Draft> {
-        if let (Some((a, None)), Some((b, _))) = (prev, now)
-            && a == b
+        if let (Some((a, s)), Some((b, _))) = (prev, now)
+            && a == &b
+            && s.as_deref().is_none_or(|s| !knows(s))
         {
             return None;
         }
@@ -501,10 +585,10 @@ impl Drafts {
             if text.trim().is_empty() {
                 self.map.remove(s);
             } else {
-                self.map.insert(s.clone(), Draft { text, cursor, note: None });
+                self.map.insert(s.clone(), Draft { text: text.to_string(), cursor, note });
             }
         }
-        Some(now.and_then(|(_, s)| s.as_ref()).and_then(|s| self.map.remove(s)).unwrap_or_default())
+        Some(now.and_then(|(_, s)| s).and_then(|s| self.map.remove(s)).unwrap_or_default())
     }
 
     /// Input sent to `session` and given back after its tab was left:
@@ -522,7 +606,7 @@ impl Drafts {
     }
 
     /// Drafts of sessions no tab (open, or on the reopen stack) holds go.
-    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+    pub fn retain(&mut self, keep: &impl Fn(&str) -> bool) {
         self.map.retain(|s, _| keep(s));
     }
 }
@@ -896,7 +980,8 @@ mod tests {
             assert_eq!(r.dropped, 0);
         }
         r.confirm(&[meta("s-a", ""), meta("j-b", "j-b")]);
-        assert_eq!((ids(&r), vis(&r), r.dropped), (vec!["s-a", "j-b"], Some("j-b"), 1));
+        assert_eq!((ids(&r), vis(&r), r.dropped, r.dropped_early), (vec!["s-a", "j-b"], Some("j-b"), 1, false));
+        assert!(r.knows("s-gone"), "on the reopen stack");
         // A restored session that comes back as one another tab holds: one tab.
         let both =
             Saved { sessions: vec!["old".into(), "new".into()], journals: vec!["new".into(), "".into()], labels: vec![], active: Some(0) };
@@ -914,7 +999,16 @@ mod tests {
         assert!(r.focus(1), "looking at one is no change");
         assert_eq!((r.len(), r.dropped), (3, 0));
         r.open("x", "x", Place::New);
-        assert_eq!((ids(&r), vis(&r), r.dropped), (vec!["a", "x"], Some("x"), 2));
+        assert_eq!((ids(&r), vis(&r), r.dropped, r.dropped_early), (vec!["a", "x"], Some("x"), 2, true));
+        unique(&r);
+        // R-L2: they may be a moment away: Ctrl+Shift+T brings each back,
+        // waiting for its session no more (an attach, resumed from its journal if it ended).
+        assert!(r.knows("b") && r.knows("c"));
+        assert!(r.reopen());
+        assert_eq!((ids(&r), vis(&r)), (vec!["a", "x", "c"], Some("c")));
+        assert!(!r.restoring(r.visible().unwrap().id));
+        assert!(r.reopen());
+        assert_eq!(ids(&r), vec!["a", "b", "x", "c"]);
         unique(&r);
     }
 
@@ -999,28 +1093,92 @@ mod tests {
     #[test]
     fn each_tab_keeps_its_draft() {
         let mut d = Drafts::default();
+        let all = |_: &str| true;
         let (a, b) = ((1, Some("A".to_string())), (2, Some("B".to_string())));
-        assert_eq!(d.switch(None, Some(&a), String::new(), 0), Some(Draft::default()));
+        fn v(t: &(u64, Option<String>)) -> Option<(u64, Option<&str>)> {
+            Some((t.0, t.1.as_deref()))
+        }
+        assert_eq!(d.switch(None, v(&a), "", 0, None, all), Some(Draft::default()));
         // A steer typed for A, caret mid-text; Ctrl+Tab to B: B's composer is empty.
-        assert_eq!(d.switch(Some(&a), Some(&b), "steer A this way".into(), 5), Some(Draft::default()));
+        assert_eq!(d.switch(Some(&a), v(&b), "steer A this way", 5, None, all), Some(Draft::default()));
         // Something for B, then back to A: A's text and caret come back.
-        let back = d.switch(Some(&b), Some(&a), "for B".into(), 5).unwrap();
+        let back = d.switch(Some(&b), v(&a), "for B", 5, None, all).unwrap();
         assert_eq!((back.text.as_str(), back.cursor, back.note), ("steer A this way", 5, None));
         // A's send refused after its tab was left (B shown): into A's draft.
-        let shown_b = d.switch(Some(&a), Some(&b), "more for A".into(), 10).unwrap();
+        let shown_b = d.switch(Some(&a), v(&b), "more for A", 10, None, all).unwrap();
         assert_eq!(shown_b.text, "for B", "B's own, untouched");
         d.give_back("A".into(), "the refused one".into(), "not sent");
-        let a_again = d.switch(Some(&b), Some(&a), String::new(), 0).unwrap();
+        let a_again = d.switch(Some(&b), v(&a), "", 0, None, all).unwrap();
         assert_eq!(a_again.text, "the refused one\nmore for A");
         assert_eq!((a_again.cursor, a_again.note), ("the refused one\n".len() + 10, Some("not sent")));
         // A pending tab named by its create keeps the composer as it is.
         let p = (3, None);
-        d.switch(Some(&a), Some(&p), String::new(), 0);
-        assert_eq!(d.switch(Some(&p), Some(&(3, Some("C".into()))), "typed".into(), 5), None);
+        d.switch(Some(&a), v(&p), "", 0, None, all);
+        assert_eq!(d.switch(Some(&p), Some((3, Some("C"))), "typed", 5, None, all), None);
         // Closed and gone from the reopen stack: dropped.
         d.give_back("B".into(), "x".into(), "not sent");
-        d.retain(|s| s != "B");
-        assert_eq!(d.switch(None, Some(&b), String::new(), 0), Some(Draft::default()));
+        d.retain(&|s| s != "B");
+        assert_eq!(d.switch(None, v(&b), "", 0, None, all), Some(Draft::default()));
+    }
+
+    /// R-L1: input given back in the frame of a tab switch (A's refusal
+    /// lands, then Ctrl+Tab to B, then the frame) goes into A's draft with
+    /// its note, never into B's composer; and the composer does not own B
+    /// until that frame, so Enter before it sends nothing.
+    #[test]
+    fn input_given_back_in_the_frame_of_a_switch_stays_with_its_tab() {
+        let mut d = Drafts::default();
+        let all = |_: &str| true;
+        d.switch(None, Some((2, Some("B"))), "", 0, None, all);
+        let mut owner = Some((1, Some("A".to_string())));
+        d.map.insert("B".into(), Draft { text: "for B".into(), cursor: 2, note: None });
+        // Before the frame: the composer still holds A's text, B is visible.
+        assert!(!Drafts::owns(owner.as_ref(), Some((2, Some("B")))), "Enter now: refused, nothing sent");
+        assert!(Drafts::owns(owner.as_ref(), Some((1, Some("A")))));
+        let mut note = Some("not sent");
+        let out = d.frame(&mut owner, Some((2, Some("B"))), Some("steer A".into()), &mut note, ("typed for A", 3), all);
+        assert_eq!(out, Some(("for B".into(), Some(2))), "B's own draft, untouched");
+        assert_eq!((owner.clone(), note), (Some((2, Some("B".to_string()))), None));
+        assert!(Drafts::owns(owner.as_ref(), Some((2, Some("B")))));
+        let back = d.switch(owner.as_ref(), Some((1, Some("A"))), "", 0, None, all).unwrap();
+        assert_eq!((back.text.as_str(), back.cursor, back.note), ("steer A\ntyped for A", "steer A\ntyped for A".len(), Some("not sent")));
+        // Given back with no switch: into the composer, ahead of what it holds.
+        let mut owner = Some((1, Some("A".to_string())));
+        let mut note = None;
+        assert_eq!(
+            d.frame(&mut owner, Some((1, Some("A"))), Some("refused".into()), &mut note, ("  now ", 6), all),
+            Some(("refused\nnow".into(), None))
+        );
+        assert_eq!(d.frame(&mut owner, Some((1, Some("A"))), None, &mut note, ("x", 1), all), None, "nothing to do: nothing allocated");
+    }
+
+    /// R-L3: a tab whose session comes back under a new id (a fallback
+    /// resume, a daemon restart) keeps its draft, and input given back to
+    /// the old id goes to it; a replaced session's draft stays with it on
+    /// the reopen stack.
+    #[test]
+    fn a_tab_followed_to_a_new_id_keeps_its_draft() {
+        let mut t = Tabs::default();
+        t.open("S", "s", Place::Current);
+        let tab = t.visible().unwrap().id;
+        let mut d = Drafts::default();
+        let mut owner = Some((tab, Some("S".to_string())));
+        t.attached("S2");
+        assert_eq!((t.visible_session(), t.followed("S"), t.followed("S2")), (Some("S2"), Some("S2"), None));
+        let mut note = Some("kept");
+        let vis = t.visible().map(|x| (x.id, x.session.as_deref()));
+        assert_eq!(d.frame(&mut owner, vis, None, &mut note, ("half a steer", 4), |s| t.knows(s)), None, "the composer keeps it");
+        assert_eq!((owner.clone(), note), (Some((tab, Some("S2".to_string()))), Some("kept")));
+        // A list after a daemon restart: the restored tab follows its journal.
+        let mut r = Tabs::restore(&Saved { sessions: vec!["old".into()], journals: vec!["j-old".into()], labels: vec![], active: Some(0) });
+        assert!(r.confirm(&[meta("j-old", "j-old")]));
+        assert_eq!((r.visible_session(), r.followed("old")), (Some("j-old"), Some("j-old")));
+        // Replaced by a click on another session: S2 goes to the reopen stack, its draft with it.
+        t.open("T", "t", Place::Current);
+        assert!(t.knows("S2") && t.followed("S2").is_none());
+        let vis = t.visible().map(|x| (x.id, x.session.as_deref()));
+        assert_eq!(d.frame(&mut owner, vis, None, &mut note, ("half a steer", 4), |s| t.knows(s)), Some((String::new(), Some(0))));
+        assert_eq!(d.map.get("S2").map(|x| (x.text.as_str(), x.note)), Some(("half a steer", Some("kept"))));
     }
 
     #[test]
