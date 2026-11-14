@@ -9,7 +9,12 @@
 //! target it cannot pin down (an expansion, a glob, a folder after an
 //! unknown `cd`) is left out, never guessed. What remains is still an
 //! approximation: a branch of an `if` or `||` that did not run is counted,
-//! and `mv`/`cp` to an existing folder name the folder.
+//! a function body is counted whether or not it is called, `mv`/`cp` to an
+//! existing folder name the folder, and a `cd` that fails before a `;` (not
+//! `&&`) still moves the paths after it (`cd missing; rm x` lists
+//! `missing/x`, where bash removed `./x`).
+//!
+//! A command longer than [`MAX_COMMAND`] is not read at all.
 
 /// One file (or folder) a command wrote, moved, removed or created.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,8 +27,16 @@ pub struct Touch {
     pub verb: &'static str,
 }
 
+/// Longer commands are not read: the daemon's own output buffer (256 KiB)
+/// is a natural bound, and a model-written heredoc of megabytes would cost
+/// four times its size in `char`s on the UI thread.
+pub const MAX_COMMAND: usize = 256 * 1024;
+
 /// The files `command` writes, in order; `None` when it cannot be read.
 pub fn writes(command: &str) -> Option<Vec<Touch>> {
+    if command.len() > MAX_COMMAND {
+        return None;
+    }
     let (toks, bodies) = lex(command)?;
     let mut out = Vec::new();
     let mut bodies = bodies.into_iter();
@@ -797,89 +810,90 @@ mod tests {
     type Expect = Option<&'static [(&'static str, &'static str)]>;
 
     /// Commands as agents write them, and what they write. `None`: not read.
+    const CASES: &[(&str, Expect)] = &[
+        // Redirects, on any command.
+        ("echo hi > notes.txt", Some(&[("notes.txt", ">")])),
+        ("printf '%s\\n' a b >> log/run.log 2>&1", Some(&[("log/run.log", ">>")])),
+        ("cargo test 2>/dev/null >out.txt", Some(&[("out.txt", ">")])),
+        ("python3 gen.py &> build.log", Some(&[("build.log", ">")])),
+        ("ls -la", Some(&[])),
+        ("grep -n foo src/*.rs | head -20", Some(&[])),
+        ("cat > src/config.toml <<'EOF'\n[server]\nport = 8080 # > not a redirect\nEOF\necho done", Some(&[("src/config.toml", ">")])),
+        ("cat <<-EOF > ./docs//a.md\n\t# title\n\tEOF", Some(&[("docs/a.md", ">")])),
+        ("echo \"$HOME\" > \"$OUT\"", Some(&[])),
+        ("echo x > out-$(date +%s).log", Some(&[])),
+        ("[[ $a > $b ]] && echo yes", Some(&[])),
+        // tee, sed -i.
+        ("echo 'k=v' | sudo tee -a /etc/app.conf > /dev/null", Some(&[("/etc/app.conf", "tee -a")])),
+        ("npm run build | tee build.log", Some(&[("build.log", "tee")])),
+        ("sed -i 's/foo/bar/g' src/a.rs src/b.rs", Some(&[("src/a.rs", "sed -i"), ("src/b.rs", "sed -i")])),
+        ("sed -i.bak -e 's/x/y/' -e '/^$/d' README.md", Some(&[("README.md", "sed -i")])),
+        ("sed -Ei 's/(a)+/b/' 'my file.txt'", Some(&[("my file.txt", "sed -i")])),
+        ("sed -i '' 's/a/b/' mac.txt", Some(&[("mac.txt", "sed -i")])),
+        ("sed -n '1,20p' src/main.rs", Some(&[])),
+        ("sed 's/a/b/' in.txt > out.txt", Some(&[("out.txt", ">")])),
+        ("sed -i \"s/$OLD/$NEW/\" conf.ini", Some(&[("conf.ini", "sed -i")])),
+        ("sed -i $SCRIPT conf.ini", None),
+        // mv, cp, rm, touch, mkdir.
+        ("mv old.rs new.rs", Some(&[("old.rs", "mv from"), ("new.rs", "mv to")])),
+        (
+            "mv a.txt b.txt archive/",
+            Some(&[("a.txt", "mv from"), ("archive/a.txt", "mv to"), ("b.txt", "mv from"), ("archive/b.txt", "mv to")]),
+        ),
+        ("cp -r templates/base site/", Some(&[("site/base", "cp to")])),
+        ("cp -t dist/ a.js b.js", Some(&[("dist/a.js", "cp to"), ("dist/b.js", "cp to")])),
+        ("cp --parents a/b.txt out/", None),
+        ("cp src/*.rs backup/", None),
+        ("rm -rf target/ node_modules", Some(&[("target", "rm"), ("node_modules", "rm")])),
+        ("rm -f -- -weird-name", Some(&[("-weird-name", "rm")])),
+        ("rm *.o", Some(&[])),
+        ("touch -d '2 days ago' stamp", Some(&[("stamp", "touch")])),
+        (
+            "mkdir -p crates/new/src && touch crates/new/src/lib.rs",
+            Some(&[("crates/new/src", "mkdir"), ("crates/new/src/lib.rs", "touch")]),
+        ),
+        ("mkdir -m 700 secret", Some(&[("secret", "mkdir")])),
+        // cd: relative targets follow a literal one, not an unknown one.
+        ("cd /tmp/work && echo x > a.txt", Some(&[("/tmp/work/a.txt", ">")])),
+        ("cd sub; rm b.txt", Some(&[("sub/b.txt", "rm")])),
+        ("cd \"$(git rev-parse --show-toplevel)\" && rm b.txt /abs/c", Some(&[("/abs/c", "rm")])),
+        ("(cd docs && touch x.md) && touch y.md", Some(&[("docs/x.md", "touch"), ("y.md", "touch")])),
+        ("cd ~/proj && mkdir out", Some(&[("~/proj/out", "mkdir")])),
+        // git.
+        ("git checkout -- src/a.rs src/b.rs", Some(&[("src/a.rs", "checkout"), ("src/b.rs", "checkout")])),
+        ("git checkout main -- Cargo.lock", Some(&[("Cargo.lock", "checkout")])),
+        ("git checkout -b feature", Some(&[])),
+        ("git checkout main", Some(&[])),
+        ("git restore src/x.rs", Some(&[("src/x.rs", "restore")])),
+        ("git restore --staged src/x.rs", Some(&[])),
+        ("git restore --staged --worktree src/x.rs", Some(&[("src/x.rs", "restore")])),
+        (
+            "git apply <<'PATCH'\ndiff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/old.txt b/old.txt\n--- a/old.txt\n+++ /dev/null\nPATCH",
+            Some(&[("src/a.rs", "apply"), ("old.txt", "apply")]),
+        ),
+        ("git apply fix.patch", Some(&[])),
+        ("git apply --check <<'P'\n+++ b/x\nP", Some(&[])),
+        ("git -C repo checkout -- a", Some(&[])),
+        ("git status && git diff --stat", Some(&[])),
+        // Loops and conditions: literal targets only.
+        ("for f in *.md; do sed -i 's/a/b/' \"$f\"; done", Some(&[])),
+        ("if [ -f x.lock ]; then rm x.lock; fi", Some(&[("x.lock", "rm")])),
+        ("FOO=1 BAR=2 make > make.log", Some(&[("make.log", ">")])),
+        // Not read at all.
+        ("(( n > 3 )) && rm a", None),
+        ("case $x in a) rm a;; esac", None),
+        ("diff <(sort a) <(sort b) > d.txt", None),
+        ("echo 'unterminated > x", None),
+        ("cat > f <<EOF\nno end", None),
+        ("echo $(echo ')' > x.txt", None),
+        // Command substitution that closes is skipped over, not read.
+        ("mkdir -p \"$(dirname out/a/b.txt)\" && echo hi > out/a/b.txt", Some(&[("out/a/b.txt", ">")])),
+        ("echo `date` >> stamps.log", Some(&[("stamps.log", ">>")])),
+    ];
+
     #[test]
     fn real_commands() {
-        let cases: &[(&str, Expect)] = &[
-            // Redirects, on any command.
-            ("echo hi > notes.txt", Some(&[("notes.txt", ">")])),
-            ("printf '%s\\n' a b >> log/run.log 2>&1", Some(&[("log/run.log", ">>")])),
-            ("cargo test 2>/dev/null >out.txt", Some(&[("out.txt", ">")])),
-            ("python3 gen.py &> build.log", Some(&[("build.log", ">")])),
-            ("ls -la", Some(&[])),
-            ("grep -n foo src/*.rs | head -20", Some(&[])),
-            ("cat > src/config.toml <<'EOF'\n[server]\nport = 8080 # > not a redirect\nEOF\necho done", Some(&[("src/config.toml", ">")])),
-            ("cat <<-EOF > ./docs//a.md\n\t# title\n\tEOF", Some(&[("docs/a.md", ">")])),
-            ("echo \"$HOME\" > \"$OUT\"", Some(&[])),
-            ("echo x > out-$(date +%s).log", Some(&[])),
-            ("[[ $a > $b ]] && echo yes", Some(&[])),
-            // tee, sed -i.
-            ("echo 'k=v' | sudo tee -a /etc/app.conf > /dev/null", Some(&[("/etc/app.conf", "tee -a")])),
-            ("npm run build | tee build.log", Some(&[("build.log", "tee")])),
-            ("sed -i 's/foo/bar/g' src/a.rs src/b.rs", Some(&[("src/a.rs", "sed -i"), ("src/b.rs", "sed -i")])),
-            ("sed -i.bak -e 's/x/y/' -e '/^$/d' README.md", Some(&[("README.md", "sed -i")])),
-            ("sed -Ei 's/(a)+/b/' 'my file.txt'", Some(&[("my file.txt", "sed -i")])),
-            ("sed -i '' 's/a/b/' mac.txt", Some(&[("mac.txt", "sed -i")])),
-            ("sed -n '1,20p' src/main.rs", Some(&[])),
-            ("sed 's/a/b/' in.txt > out.txt", Some(&[("out.txt", ">")])),
-            ("sed -i \"s/$OLD/$NEW/\" conf.ini", Some(&[("conf.ini", "sed -i")])),
-            ("sed -i $SCRIPT conf.ini", None),
-            // mv, cp, rm, touch, mkdir.
-            ("mv old.rs new.rs", Some(&[("old.rs", "mv from"), ("new.rs", "mv to")])),
-            (
-                "mv a.txt b.txt archive/",
-                Some(&[("a.txt", "mv from"), ("archive/a.txt", "mv to"), ("b.txt", "mv from"), ("archive/b.txt", "mv to")]),
-            ),
-            ("cp -r templates/base site/", Some(&[("site/base", "cp to")])),
-            ("cp -t dist/ a.js b.js", Some(&[("dist/a.js", "cp to"), ("dist/b.js", "cp to")])),
-            ("cp --parents a/b.txt out/", None),
-            ("cp src/*.rs backup/", None),
-            ("rm -rf target/ node_modules", Some(&[("target", "rm"), ("node_modules", "rm")])),
-            ("rm -f -- -weird-name", Some(&[("-weird-name", "rm")])),
-            ("rm *.o", Some(&[])),
-            ("touch -d '2 days ago' stamp", Some(&[("stamp", "touch")])),
-            (
-                "mkdir -p crates/new/src && touch crates/new/src/lib.rs",
-                Some(&[("crates/new/src", "mkdir"), ("crates/new/src/lib.rs", "touch")]),
-            ),
-            ("mkdir -m 700 secret", Some(&[("secret", "mkdir")])),
-            // cd: relative targets follow a literal one, not an unknown one.
-            ("cd /tmp/work && echo x > a.txt", Some(&[("/tmp/work/a.txt", ">")])),
-            ("cd sub; rm b.txt", Some(&[("sub/b.txt", "rm")])),
-            ("cd \"$(git rev-parse --show-toplevel)\" && rm b.txt /abs/c", Some(&[("/abs/c", "rm")])),
-            ("(cd docs && touch x.md) && touch y.md", Some(&[("docs/x.md", "touch"), ("y.md", "touch")])),
-            ("cd ~/proj && mkdir out", Some(&[("~/proj/out", "mkdir")])),
-            // git.
-            ("git checkout -- src/a.rs src/b.rs", Some(&[("src/a.rs", "checkout"), ("src/b.rs", "checkout")])),
-            ("git checkout main -- Cargo.lock", Some(&[("Cargo.lock", "checkout")])),
-            ("git checkout -b feature", Some(&[])),
-            ("git checkout main", Some(&[])),
-            ("git restore src/x.rs", Some(&[("src/x.rs", "restore")])),
-            ("git restore --staged src/x.rs", Some(&[])),
-            ("git restore --staged --worktree src/x.rs", Some(&[("src/x.rs", "restore")])),
-            (
-                "git apply <<'PATCH'\ndiff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/old.txt b/old.txt\n--- a/old.txt\n+++ /dev/null\nPATCH",
-                Some(&[("src/a.rs", "apply"), ("old.txt", "apply")]),
-            ),
-            ("git apply fix.patch", Some(&[])),
-            ("git apply --check <<'P'\n+++ b/x\nP", Some(&[])),
-            ("git -C repo checkout -- a", Some(&[])),
-            ("git status && git diff --stat", Some(&[])),
-            // Loops and conditions: literal targets only.
-            ("for f in *.md; do sed -i 's/a/b/' \"$f\"; done", Some(&[])),
-            ("if [ -f x.lock ]; then rm x.lock; fi", Some(&[("x.lock", "rm")])),
-            ("FOO=1 BAR=2 make > make.log", Some(&[("make.log", ">")])),
-            // Not read at all.
-            ("(( n > 3 )) && rm a", None),
-            ("case $x in a) rm a;; esac", None),
-            ("diff <(sort a) <(sort b) > d.txt", None),
-            ("echo 'unterminated > x", None),
-            ("cat > f <<EOF\nno end", None),
-            ("echo $(echo ')' > x.txt", None),
-            // Command substitution that closes is skipped over, not read.
-            ("mkdir -p \"$(dirname out/a/b.txt)\" && echo hi > out/a/b.txt", Some(&[("out/a/b.txt", ">")])),
-            ("echo `date` >> stamps.log", Some(&[("stamps.log", ">>")])),
-        ];
-        for (cmd, want) in cases {
+        for &(cmd, want) in CASES {
             let want: Option<Vec<(String, &str)>> = want.map(|w| w.iter().map(|(p, v)| (p.to_string(), *v)).collect());
             assert_eq!(paths(cmd), want, "{cmd:?}");
         }
@@ -917,5 +931,45 @@ mod tests {
         ] {
             let _ = writes(s);
         }
+    }
+
+    /// L7: never panics, on every prefix and suffix of every real command
+    /// (cut mid-quote, mid-heredoc, mid-substitution) and on a few thousand
+    /// random strings of the characters the reader cares about.
+    #[test]
+    fn cut_and_random_commands_do_not_panic() {
+        for &(cmd, _) in CASES {
+            for (i, _) in cmd.char_indices().chain([(cmd.len(), ' ')]) {
+                let _ = writes(&cmd[..i]);
+                let _ = writes(&cmd[i..]);
+            }
+        }
+        const ALPHABET: &[char] = &[
+            '$', '(', ')', '{', '}', '\'', '"', '`', '\\', '<', '>', '|', '&', ';', '#', '~', '-', '*', '\n', ' ', '=', '/', 'a', 'x', '1',
+            '2', 'E', 'O', 'F', 'é',
+        ];
+        let words = ["cd ", "mv ", "cp ", "rm ", "sed -i ", "tee ", "git apply ", "<<EOF", "EOF", "<<-'X'", "X", "pushd ", "popd"];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..4000 {
+            let len = (next() % 48) as usize;
+            let mut s = String::new();
+            for _ in 0..len {
+                let r = next();
+                if r % 5 == 0 {
+                    s.push_str(words[(r / 5) as usize % words.len()]);
+                } else {
+                    s.push(ALPHABET[(r / 5) as usize % ALPHABET.len()]);
+                }
+            }
+            let _ = writes(&s);
+        }
+        // Too long to read: not read, and quickly.
+        assert_eq!(writes(&format!("echo {} > big.txt", "x".repeat(MAX_COMMAND))), None);
     }
 }

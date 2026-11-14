@@ -52,11 +52,15 @@ pub enum ToolStatus {
     /// Not run: an extension blocked it (a denied confirmation included) or
     /// the session's tool gate refused it.
     Denied,
+    /// Ran, but did not finish on its own and the daemon does not know
+    /// whether it succeeded: a `bash` command it stopped at its output limit
+    /// (the result is still a success result).
+    Unknown,
 }
 
 impl ToolStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, ToolStatus::Done | ToolStatus::Failed | ToolStatus::Cancelled | ToolStatus::Denied)
+        matches!(self, ToolStatus::Done | ToolStatus::Failed | ToolStatus::Cancelled | ToolStatus::Denied | ToolStatus::Unknown)
     }
 }
 
@@ -76,6 +80,9 @@ pub enum ToolOutcome {
     Failed,
     Denied,
     Cancelled,
+    /// Neither a success nor a failure: the daemon stopped the command at
+    /// its output limit and says its exit status is unknown.
+    Unknown,
 }
 
 impl ToolOutcome {
@@ -85,6 +92,7 @@ impl ToolOutcome {
             ToolOutcome::Failed => ToolStatus::Failed,
             ToolOutcome::Denied => ToolStatus::Denied,
             ToolOutcome::Cancelled => ToolStatus::Cancelled,
+            ToolOutcome::Unknown => ToolStatus::Unknown,
         }
     }
 }
@@ -106,6 +114,18 @@ const ACTIVATION_DENIED: &str = "Tool execution failed: tool activation denied:"
 /// (`tools/activation.rs`): the user denied the prompt, the policy is
 /// `deny`, or nothing could show a prompt.
 const ACTIVATION_REFUSED: &str = "tool activation requires host confirmation authority";
+
+/// The last line of a `bash` result whose output passed the daemon's limit
+/// (agent-engine `tools/bash.rs`): `[output truncated at 262144]` (v0.11)
+/// or, since `output_limit_notice`, `[output truncated at N bytes: the
+/// command was stopped at this limit before it finished, so its exit status
+/// is unknown. …]`. Either way the daemon killed the command there (the
+/// process group, `kill_now`) and returned the result as a success.
+const OUTPUT_LIMIT: &str = "[output truncated at ";
+/// The note that ends a virtualised history result (agent-engine
+/// `runtime/tool_spill.rs`, on by default above 12 KiB): the result's head,
+/// a gap, its tail (the notice above ends it), a blank line, then this.
+const VIRTUALISED: &str = "[Output virtualised: ";
 
 /// Classify a tool result's text (`is_error` as the block carries it).
 pub fn tool_outcome(result: &str, is_error: bool) -> ToolOutcome {
@@ -135,10 +155,17 @@ pub fn tool_outcome(result: &str, is_error: bool) -> ToolOutcome {
         || result.trim_end().rsplit('\n').next().is_some_and(|l| {
             l.starts_with('[') && CANCEL_PHRASES.iter().any(|p| l[1..].starts_with(p)) && l.contains("before the tool finished")
         });
+    let stopped = || {
+        let mut lines = result.trim_end().rsplit('\n').filter(|l| !l.trim().is_empty());
+        let last = lines.next().filter(|l| !l.starts_with(VIRTUALISED)).or_else(|| lines.next());
+        last.is_some_and(|l| l.starts_with(OUTPUT_LIMIT) && l.trim_end().ends_with(']'))
+    };
     if canceled {
         ToolOutcome::Cancelled
     } else if is_error {
         ToolOutcome::Failed
+    } else if stopped() {
+        ToolOutcome::Unknown
     } else {
         ToolOutcome::Ok
     }
@@ -847,6 +874,33 @@ mod outcome_tests {
             ("Canceled by user. It had already started and may have partially applied its effects.", Cancelled),
             ("line 1\nline 2\n\n[Canceled by user before the tool finished; the output above is partial.]", Cancelled),
             ("Operation canceled", Cancelled),
+            // `tools/bash.rs` `output_limit_notice` (its own test's text): the
+            // command was killed at the limit, yet the result is a success.
+            (
+                "xxxx\n\n[output truncated at 256 bytes: the command was stopped at this limit before it finished, so its exit status is unknown. Redirect large output to a file (e.g. cmd > out.log 2>&1) and read only the parts you need.]",
+                Unknown,
+            ),
+            // The same in a virtualised history result (the default above
+            // 12 KiB: `runtime/tool_spill.rs` `assemble`), as the desktop
+            // and the files ledger read it.
+            (
+                "y\ny\n[... lines 3-37445 omitted ...]\ny\ny\n\n[output truncated at 262144 bytes: the command was stopped at this limit before it finished, so its exit status is unknown. Redirect large output to a file (e.g. cmd > out.log 2>&1) and read only the parts you need.]\n\n[Output virtualised: 262356 bytes, 37449 lines; lines 3-37445 are omitted above. Full output: /home/u/.synaps-cli/spill/s1/toolu_1.txt (read it with offset=2 limit=37443, or grep it).]",
+                Unknown,
+            ),
+            (
+                "y\n[... lines 2-9000 omitted ...]\ny\n\n[Output virtualised: 18000 bytes, 9001 lines; lines 2-9000 are omitted above. Full output: /s/t.txt (read it with offset=1 limit=8999, or grep it).]",
+                Ok,
+            ),
+            // v0.11.1's notice (the daemon desktopproto runs): killed too.
+            ("overflow\no\n\n[output truncated at 262144]", Unknown),
+            (
+                "overflow\n[... lines 456-28790 omitted ...]\no\n\n[output truncated at 262144]\n\n[Output virtualised: 262174 bytes, 29130 lines; lines 456-28790 are omitted above. Full output: /home/u/.synaps-cli/spill/s/toolu_01.txt (read it with offset=455 limit=28335, or grep it).]",
+                Unknown,
+            ),
+            // The notice quoted mid-output is not it, nor is the history
+            // cut (`max_tool_output`), which says nothing about the command.
+            ("[output truncated at 256]\nthen it went on", Ok),
+            ("xxxx\n\n[truncated — 262174 total bytes, showing first 30000]", Ok),
             // Successes, including ones that mention the phrases.
             ("Edited /w/a.rs", Ok),
             ("Successfully wrote 3 lines", Ok),

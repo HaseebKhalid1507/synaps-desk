@@ -1061,7 +1061,7 @@ async fn answers_for_an_earlier_connection_are_never_sent() {
     // the old card the UI had not replaced yet): dropped, refused.
     client.answer_on(first, 1, Some("y".into())).unwrap();
     let why = wait(&events, "refused after the reconnect", refused).await;
-    assert!(why.contains("reconnected"), "{why}");
+    assert!(why.contains("earlier connection"), "{why}");
     // The new connection's own answer goes out, and is the first command
     // the daemon sees: the stale "y" never reached it.
     client.answer_on(second, 1, Some("n".into())).unwrap();

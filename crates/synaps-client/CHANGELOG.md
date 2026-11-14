@@ -2,11 +2,14 @@
 
 ## Since cedbdbd
 
-Additive only (PR `polish/layout-backlog`), plus one behaviour fix. Nothing existing changes shape: code that builds `Event::Attached { .. }` or matches `Command` exhaustively (it is `#[non_exhaustive]`) compiles as before.
+Additive only (PR `polish/layout-backlog`), plus two behaviour fixes. Nothing existing changes shape: code that builds `Event::Attached { .. }` or matches `Command`, `ToolOutcome` or `ToolStatus` exhaustively (all `#[non_exhaustive]`) compiles as before.
 
 - New `Attached::connection: u64` (not on the wire; `0` from serde, set by the client): this `Client`'s number for the connection the snapshot came on, new on every attach and every reconnect, never reused. `Attached` is `#[non_exhaustive]`, so no literal elsewhere builds it.
 - New `Command::AnswerOn { connection, prompt_id, value }` and `Client::answer_on(connection, prompt_id, value)`: an `Answer` that is sent only on that connection. Once the session has reconnected (a reload, a restarted daemon that numbers its prompts from 1 again), it is dropped, never sent, and comes back as `Error::Refused { command: Some("answer"), .. }`; while reconnecting it is refused as every command is. `Client::answer` is unchanged (whatever connection is up when the thread gets to it). Its `Debug` redacts the value, as `Answer`'s does. Test: `tests/fake_daemon.rs` `answers_for_an_earlier_connection_are_never_sent`.
 - Behaviour: `tool_outcome` calls an `activate_tools` error `Denied` only for the daemon's refusal, `tool activation requires host confirmation authority` (`HostActivationError::ConfirmationRequired`: the user denied the prompt, the policy is `deny`, or nothing could show one). Every other `tool activation denied: …` (a duplicate id, an already active tool, a digest or provenance error, a guessed id: failures after AUTHORIZE) is `Failed`.
+
+- New `ToolOutcome::Unknown` and `ToolStatus::Unknown` (`is_terminal()` includes it). **Behaviour:** a result whose last line is the bash tool's output-limit notice is `Unknown`, not `Ok`: the daemon killed the command there and returns the result as a success anyway. Both forms: v0.11's `[output truncated at 262144]` and agent-engine `origin/dev`'s `output_limit_notice` (`[output truncated at N bytes: the command was stopped at this limit before it finished, so its exit status is unknown. …]`). Also when the notice ends the tail of a virtualised history result (`runtime/tool_spill.rs`: the tail, a blank line, then `[Output virtualised: …]`; the daemon's default above 12 KiB). Not detectable, so still `Ok`: the live `ToolResult` (cut to `max_tool_output`, 30 000 bytes by default, before the notice; the history that follows replaces it) and a history without virtualisation (also cut before the notice).
+- The refusal of an `AnswerOn` for an earlier connection now says "the prompt was raised on an earlier connection; not sent" (true after another attach as well as after a reconnect).
 
 For synaps-avatar (nyx): nothing to change. To make answers airtight, keep `attached.connection` from the last `Event::Attached` and answer with `client.answer_on(connection, id, value)`.
 
