@@ -399,6 +399,8 @@ impl AppView {
                     .child(div().size(px(6.)).when(on, |d| d.bg(p.warn_mark_ch)).when(!on, |d| d.border_1().border_color(p.rest_mark)))
                     .child(display(n.to_string(), 13., if on { p.warn_ch } else { p.dim_ch })),
             )
+            .child(div().flex_1())
+            .child(self.render_strip_foot(p, cx))
             .tooltip(move |window, cx| {
                 let tip = match (on, fits) {
                     (_, false) => format!("{n} need you · widen the window to show sessions"),
@@ -555,6 +557,7 @@ impl AppView {
             })
             .child(chips)
             .child(div().flex_1().min_h_0().child(items))
+            .child(self.render_foot(p, cx))
     }
 
     /// One item of the rail's list (only the visible ones are built).

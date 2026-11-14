@@ -135,7 +135,7 @@ pub fn step(ground: u32, toward: u32, target: f64) -> u32 {
 // ── which theme ───────────────────────────────────────────────────────────
 
 /// Where the theme or the accent came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Source {
     Flag,
     Env,
@@ -325,6 +325,16 @@ roles! {
     prose_ch, dim_ch, header, warn_ch, run_ch, unread_ch, open_ch, ready_ch, err_ch, cost_ch, ok_ch, edit_ch, write_ch, bash_ch,
     sub_name, sub_status, sub_done, sub_time,
     warn_mark_ch, run_mark_ch, unread_mark_ch, focus_ch, ready_mark_ch, err_mark_ch, rest_mark, you_bar,
+    // Usage's chart series on the canvas (3:1): hosts, roles, models by
+    // rank, and the rest.
+    s1, s2, s3, s4, s5, s_rest,
+}
+
+impl Palette {
+    /// Chart series `i`: `s1`–`s5`, then `s_rest`.
+    pub fn series(&self, i: usize) -> Hsla {
+        [self.s1, self.s2, self.s3, self.s4, self.s5].get(i).copied().unwrap_or(self.s_rest)
+    }
 }
 
 fn hsla(c: u32) -> Hsla {
@@ -504,6 +514,21 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.err_mark_ch = f.mark("err_mark_ch", t.error_color, &ch);
     r.rest_mark = f.mark("rest_mark", t.muted, &ch);
     r.you_bar = f.mark("you_bar", you, &ch);
+    // Series: five theme colours at the mark floor on the canvas; one that
+    // lands within 1.25:1 of an earlier one is mixed 40 % toward the ink.
+    // Warning and error colours are never series (they keep their meaning).
+    let mut series: Vec<u32> = Vec::with_capacity(5);
+    for (role, c) in
+        [("s1", t.claude_label), ("s2", t.list_bullet_color), ("s3", t.tool_result_color), ("s4", t.heading_color), ("s5", t.tool_param)]
+    {
+        let mut v = lift(c, ink, &[canvas], MARK);
+        if series.iter().any(|&o| contrast(o, v) < 1.25) {
+            v = mix(v, ink, 0.4);
+        }
+        series.push(f.at(role, v, ink, &[canvas], MARK));
+    }
+    [r.s1, r.s2, r.s3, r.s4, r.s5] = [series[0], series[1], series[2], series[3], series[4]];
+    r.s_rest = f.mark("s_rest", t.muted, &[canvas]);
     (r, f.log)
 }
 
@@ -860,6 +885,12 @@ pub fn save_accent(path: &Path, hex: Option<u32>) -> std::io::Result<()> {
     save_settings(path, &[("accent", hex.map(to_hex).into())])
 }
 
+/// A string the app saved under `key` (Settings' `daemon_label`,
+/// `dash_url`, `usage_range`, `usage_host`); missing, `null` or empty: none.
+pub fn load_str(path: &Path, key: &str) -> Option<String> {
+    load_settings(path)?.get(key)?.as_str().map(str::to_string).filter(|v| !v.is_empty())
+}
+
 /// The theme the picker saved, as written ([`resolve_theme`] checks it).
 pub fn load_theme(path: &Path) -> Option<String> {
     load_settings(path)?.get("theme")?.as_str().map(str::to_string)
@@ -878,7 +909,7 @@ pub fn save_theme(path: &Path, name: Option<&str>) -> std::io::Result<()> {
 /// (`history_open`, a list of bucket names; missing or not a list: NAMED
 /// and TODAY) and the centre pane's text size (`text_size`, one of
 /// [`TEXT_STEPS`]; anything else: [`DEFAULT_TEXT`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Panels {
     pub rail_collapsed: bool,
     pub right_collapsed: bool,
@@ -1018,7 +1049,16 @@ pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<(
 /// one (and, on Unix, the directory synced so the rename survives a
 /// crash); the temporary file never outlives a failure.
 pub fn save_settings(path: &Path, keys: &[(&str, serde_json::Value)]) -> std::io::Result<()> {
+    save_settings_unless(path, keys, || false)
+}
+
+/// [`save_settings`], unless `stale()` (asked under the writer's lock)
+/// says a later write already holds these keys: then nothing changes.
+pub fn save_settings_unless(path: &Path, keys: &[(&str, serde_json::Value)], stale: impl FnOnce() -> bool) -> std::io::Result<()> {
     update_settings(path, |v| {
+        if stale() {
+            return;
+        }
         for (k, val) in keys {
             v[*k] = val.clone();
         }
@@ -1481,6 +1521,23 @@ mod tests {
         assert!(left.is_empty(), "{left:?}");
         std::fs::write(&path, r#"{"accent": "garbage"}"#).unwrap();
         assert_eq!(resolve_accent(None, None, load_accent(&path).as_deref()).0, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nit 5: a THIS APP batch a quit's flush wrote again changes nothing
+    /// when its own write lands late.
+    #[test]
+    fn a_stale_settings_write_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-stale-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        save_settings(&path, &[("text_size", 15.into()), ("dash_url", "new".into())]).unwrap();
+        save_settings_unless(&path, &[("dash_url", "old".into())], || true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((v["dash_url"].as_str(), v["text_size"].as_u64()), (Some("new"), Some(15)));
+        save_settings_unless(&path, &[("dash_url", "later".into())], || false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["dash_url"], "later");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

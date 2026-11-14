@@ -13,7 +13,7 @@ use crate::app::{AppView, display, mono};
 use crate::chrome::{glyph, word_color};
 use crate::fonts;
 use crate::rail::State;
-use crate::tabs::{Place, Tab};
+use crate::tabs::{Kind, Place, Tab};
 use crate::theme::Palette;
 
 pub(crate) const TAB_H: f32 = 34.;
@@ -121,6 +121,9 @@ impl AppView {
     /// session" or its id (the rail's rules); not listed: what the tab last
     /// knew.
     fn tab_label(&self, t: &Tab) -> (SharedString, bool) {
+        if t.kind != Kind::Session {
+            return (t.kind.label().into(), false);
+        }
         let meta = t.session.as_deref().and_then(|s| self.model.sessions.iter().find(|m| m.id == s));
         match meta {
             Some(m) => match (m.name.as_deref().filter(|n| !n.is_empty()), m.title.as_deref().filter(|t| !t.is_empty())) {
@@ -138,6 +141,9 @@ impl AppView {
     /// listed: OPENING on its way, else from the transcript if attached
     /// (a create the poll has not caught up with), else gone (no glyph).
     pub(crate) fn tab_state(&self, t: &Tab) -> State {
+        if t.kind != Kind::Session {
+            return State::Idle;
+        }
         let Some(s) = t.session.as_deref() else { return State::Opening };
         // Restored, its session not listed yet (a daemon still starting).
         if self.model.tabs.restoring(t.id) {
@@ -190,7 +196,7 @@ impl AppView {
         for (ix, t) in tabs.iter().enumerate().skip(lay.first).take(lay.shown) {
             let st = self.tab_state(t);
             let (label, named) = self.tab_labels.labels.get(ix).cloned().unwrap_or_default();
-            row = row.child(self.render_tab(t.id, ix, active == Some(ix), st, label, named, lay.width, p, cx));
+            row = row.child(self.render_tab(t.id, ix, active == Some(ix), t.kind, st, label, named, lay.width, p, cx));
         }
         let (before, after) = (lay.first, n - lay.first - lay.shown);
         if lay.overflow && self.tab_labels.arrows.0 != (before, after) {
@@ -261,6 +267,7 @@ impl AppView {
         id: u64,
         ix: usize,
         on: bool,
+        kind: Kind,
         st: State,
         label: SharedString,
         named: bool,
@@ -268,7 +275,15 @@ impl AppView {
         p: &Palette,
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
+        let view = kind != Kind::Session;
         let title_color = match st {
+            _ if view => {
+                if on {
+                    p.ink
+                } else {
+                    p.prose_ch
+                }
+            }
             State::NeedsYou | State::Running | State::Workers | State::Unread => p.ink,
             _ if on => p.ink,
             State::Parked | State::Locked | State::Saved => p.dim_ch,
@@ -281,10 +296,10 @@ impl AppView {
         } else {
             None
         };
-        let word = st.word().filter(|_| width >= WORD_MIN);
+        let word = st.word().filter(|_| width >= WORD_MIN && !view);
         let drag = TabDrag { id, ix, label: label.clone(), bg: p.raised, fg: p.ink, edge: p.edge };
         let mark = p.focus_ch;
-        let (tip, name) = (label.clone(), st.name());
+        let (tip, name) = (label.clone(), if view { "view" } else { st.name() });
         let close = mono("×", 13., if on { p.dim_ch } else { gpui_kit::transparent_black() })
             .id(("tab-x", id as usize))
             .w(px(18.))
@@ -318,7 +333,11 @@ impl AppView {
             .when(on, |d| d.bg(p.raised))
             .when(!on, |d| d.hover(|d| d.bg(p.raised)))
             .when_some(bar, |d, c| d.child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(c)))
-            .child(glyph(st, p))
+            .child(match kind {
+                Kind::Settings => crate::views::gear(if on { p.you_bar } else { p.dim_ch }, None),
+                Kind::Usage => crate::views::bars_glyph(if on { p.you_bar } else { p.dim_ch }),
+                Kind::Session => glyph(st, p),
+            })
             .child(
                 div()
                     .flex_1()
