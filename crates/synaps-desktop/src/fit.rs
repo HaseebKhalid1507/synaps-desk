@@ -61,6 +61,12 @@ pub(crate) fn naming_h(form: Form) -> f32 {
     NAME_FIELD + 2. * naming_pad(form) + 1.
 }
 
+/// One of the naming row's own lines under its field (its error, the
+/// REPLACE offer), and the gap above it. Cramped, they are in the field's
+/// row instead.
+pub(crate) const NAMING_NOTE: f32 = 22.;
+pub(crate) const NAMING_GAP: f32 = 6.;
+
 /// The notice line's line (one line while a card is up: the rest is in
 /// its tooltip).
 pub(crate) fn notice_line(m: &Metrics) -> f32 {
@@ -68,12 +74,14 @@ pub(crate) fn notice_line(m: &Metrics) -> f32 {
 }
 
 /// What else the centre column draws round the card and the composer:
-/// the naming row ("Name this session…", its own error or REPLACE line
-/// not counted) and the notice line under the card: the last error and,
-/// cramped, the draft's note (the composer keeps SEND beside its text).
+/// the naming row ("Name this session…") with its own lines (its error,
+/// the REPLACE offer: up to two, cramped in the field's row) and the
+/// notice line under the card: the last error and, cramped, the draft's
+/// note (the composer keeps SEND beside its text).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Extras {
     pub(crate) naming: bool,
+    pub(crate) naming_notes: u8,
     pub(crate) error: bool,
     pub(crate) note: bool,
 }
@@ -85,7 +93,8 @@ impl Extras {
     }
 
     pub(crate) fn height(&self, m: &Metrics, form: Form) -> f32 {
-        let naming = if self.naming { naming_h(form) } else { 0. };
+        let notes = if form == Form::Cramped { 0. } else { f32::from(self.naming_notes) * (NAMING_GAP + NAMING_NOTE) };
+        let naming = if self.naming { naming_h(form) + notes } else { 0. };
         naming + if self.notice(form) { NOTICE_TOP + notice_line(m) } else { 0. }
     }
 
@@ -260,8 +269,6 @@ pub(crate) fn well_floor(m: &Metrics, form: Form, floor: f32, ex: Extras) -> f32
 /// The lines the card's well shows in a `window` this tall: whole lines,
 /// as many as the bars, `ex`, the card's other boxes and a composer of
 /// `rows` leave room for, between [`well_floor`] and the form's most.
-/// (What the budget does not count, the naming row's own error line, the
-/// layout takes from the well, down to that floor.)
 pub(crate) fn well_lines(m: &Metrics, form: Form, window: f32, rows: usize, floor: f32, ex: Extras) -> f32 {
     let card = Card::of(m, form);
     let room = window - above(form) - ex.height(m, form) - Composer::of(m, form).height(rows) - card.height(0.);
@@ -372,12 +379,14 @@ impl TopFit {
 /// The top bar fitted to the window: as it narrows, these give way in
 /// this order, each only as far as needed: the brand block stops lining up
 /// with the rail; DESKTOP; the prompt's gist and the connection text
-/// shorten (ellipsized); the gist goes; the session label shortens; the
-/// THEME and SYSTEMS words go (the swatch and the count stay); the
-/// connection text goes (the disc keeps its colour); SYNAPS; the label.
-/// The count, NEED YOU, "+N", JUMP, the swatch and the badge always show.
-/// Then what a later step freed is given back, back up the order: a word
-/// that fits again comes back, a shortened text grows into what is left.
+/// shorten (ellipsized); the gist goes; the session label shortens; THEME
+/// goes; SYSTEMS goes, THEME back in its place if it fits there, then
+/// THEME again (the swatch and the count stay); the connection text goes
+/// (the disc keeps its colour); SYNAPS; the label. The count, NEED YOU,
+/// "+N", JUMP, the swatch and the badge always show. Then a shortened
+/// text grows into what a later step freed. Nothing else comes back: a
+/// narrower window never shows a word or a text a wider one did not
+/// (THEME in place of SYSTEMS is one word for another).
 pub(crate) fn fit_top(w: &TopWords, i: &TopIn) -> TopFit {
     let room = i.width - TOP_PAD;
     let mut f = TopFit {
@@ -397,7 +406,7 @@ pub(crate) fn fit_top(w: &TopWords, i: &TopIn) -> TopFit {
             *v = (*v - over).max(min);
         }
     }
-    let steps: [Step; 11] = [
+    let steps: [Step; 12] = [
         |f, w, _| f.brand = f.brand_content(w),
         |f, w, _| {
             f.word2 = false;
@@ -408,7 +417,11 @@ pub(crate) fn fit_top(w: &TopWords, i: &TopIn) -> TopFit {
         |f, _, _| f.gist = 0.,
         |f, _, over| shrink(&mut f.label, LABEL_MIN, over),
         |f, _, _| f.theme = false,
-        |f, _, _| f.systems = false,
+        |f, w, over| {
+            f.systems = false;
+            f.theme = over - (w.systems + 10.) + 8. + w.theme <= 0.;
+        },
+        |f, _, _| f.theme = false,
         |f, _, _| f.conn = 0.,
         |f, w, _| {
             f.word = false;
@@ -417,7 +430,7 @@ pub(crate) fn fit_top(w: &TopWords, i: &TopIn) -> TopFit {
         |f, _, _| f.label = 0.,
     ];
     // Each step taken: what it changed from.
-    let mut taken: [Option<TopFit>; 11] = [None; 11];
+    let mut taken: [Option<TopFit>; 12] = [None; 12];
     for (k, step) in steps.iter().enumerate() {
         let over = f.width(w, i) - room;
         if over <= 0. {
@@ -430,34 +443,22 @@ pub(crate) fn fit_top(w: &TopWords, i: &TopIn) -> TopFit {
         }
     }
     for (k, before) in taken.iter().enumerate().rev().filter_map(|(k, b)| Some((k, (*b)?))) {
-        let mut g = f;
-        match k {
-            0 => g.brand = before.brand.max(g.brand_content(w)),
-            1 => {
-                g.word2 = true;
-                g.brand = g.brand.max(g.brand_content(w));
-            }
-            9 => {
-                g.word = true;
-                g.brand = g.brand.max(g.brand_content(w));
-            }
-            6 => g.theme = true,
-            7 => g.systems = true,
-            _ => {
-                let (slot, min): (fn(&mut TopFit) -> &mut f32, f32) = match k {
-                    2 | 4 => (|t| &mut t.gist, GIST_MIN),
-                    3 | 8 => (|t| &mut t.conn, CONN_MIN),
-                    _ => (|t| &mut t.label, LABEL_MIN),
-                };
-                // As it was before the step, or shortened to what fits:
-                // longer than now, and (back from gone) not under its floor.
-                let mut b = before;
-                let (was, now) = (*slot(&mut b), *slot(&mut g));
-                *slot(&mut g) = was;
-                let v = was - (g.width(w, i) - room).max(0.);
-                *slot(&mut g) = if v > now && (now > 0. || v >= min.min(was)) { v } else { now };
-            }
+        let slot: fn(&mut TopFit) -> &mut f32 = match k {
+            2 => |t| &mut t.gist,
+            3 => |t| &mut t.conn,
+            5 => |t| &mut t.label,
+            _ => continue,
+        };
+        // As it was before the step, or shortened to what fits; one gone
+        // since stays gone.
+        let (mut g, mut b) = (f, before);
+        let (was, now) = (*slot(&mut b), *slot(&mut g));
+        if now <= 0. {
+            continue;
         }
+        *slot(&mut g) = was;
+        let v = was - (g.width(w, i) - room).max(0.);
+        *slot(&mut g) = v.max(now);
         if g.width(w, i) <= room + 0.01 {
             f = g;
         }
@@ -543,9 +544,10 @@ mod tests {
         assert_eq!(well_lines(&m, Form::Cramped, 300., 1, 2., Extras::default()), 2.);
     }
 
-    /// Every mix of the naming row, an error and a draft note.
+    /// Every mix of the naming row (with none, one or both of its own
+    /// lines), an error and a draft note.
     fn all_extras() -> impl Iterator<Item = Extras> {
-        (0..8u8).map(|b| Extras { naming: b & 1 != 0, error: b & 2 != 0, note: b & 4 != 0 })
+        (0..24u8).map(|b| Extras { naming: b & 1 != 0, error: b & 2 != 0, note: b & 4 != 0, naming_notes: b >> 3 })
     }
 
     /// L1: with the naming row, the notice line (an error, cramped the
@@ -577,7 +579,7 @@ mod tests {
             }
         }
         // Step 22, the smallest window, everything open: 420 of 420.
-        let (m, ex) = (Metrics::at(22), Extras { naming: true, error: true, note: true });
+        let (m, ex) = (Metrics::at(22), Extras { naming: true, error: true, note: true, naming_notes: 2 });
         assert_eq!(need(&m, Form::Cramped, ex), 420.);
         assert_eq!(well_lines(&m, Form::Cramped, 420., 1, WELL_MIN, ex), 1.);
         // The note is on the notice line only when cramped (else in the
@@ -587,6 +589,14 @@ mod tests {
         assert_eq!(note.height(&m, Form::Short), 0.);
         assert_eq!(naming_h(Form::Cramped), 41.);
         assert_eq!(naming_h(Form::Short), 53.);
+        // Nit 4: the naming row's own lines (its error, REPLACE) count,
+        // 28 px each; cramped they are in the field's row.
+        let notes = Extras { naming: true, naming_notes: 2, ..Extras::default() };
+        assert_eq!(notes.height(&m, Form::Short), 53. + 56.);
+        assert_eq!(notes.height(&m, Form::Full), 53. + 56.);
+        assert_eq!(notes.height(&m, Form::Cramped), 41.);
+        assert_eq!(Extras { naming_notes: 2, ..Extras::default() }.height(&m, Form::Short), 0., "no row, no lines");
+        assert!(cramped_below(&m, notes) > cramped_below(&m, Extras { naming: true, ..Extras::default() }));
     }
 
     /// The composer grows only into room the card's 3-line form leaves.
@@ -618,39 +628,54 @@ mod tests {
     };
 
     /// The top bar never overflows, from the smallest window up; what it
-    /// drops goes in its order, and what a later drop frees is given back.
+    /// drops goes in its order and never comes back as the window narrows
+    /// (only THEME, in place of SYSTEMS); a shortened text grows into what
+    /// a later drop frees. Every mix of counts and text lengths.
     #[test]
     fn the_top_bar_degrades_in_order() {
         let busy = TopIn { brand: 260., need: 12, label: 24, gist: 60, more: 2, jump: true, conn: 60, badge: 2, ..TopIn::default() };
-        let calm = TopIn { brand: 254., need: 0, label: 0, gist: 0, more: 0, jump: false, conn: 18, badge: 1, ..TopIn::default() };
-        for i in [busy, calm] {
+        let mut mixes = Vec::new();
+        for b in 0..128u32 {
+            let bit = |n: u32| b >> n & 1 != 0;
+            let need = [0, 1, 12, 123][(b & 3) as usize];
+            mixes.push(TopIn {
+                brand: 254.,
+                need,
+                label: if bit(2) { 24 } else { 0 },
+                gist: if bit(3) { 60 } else { 0 },
+                more: if bit(4) { 2 } else { 0 },
+                jump: need > 0,
+                conn: if bit(5) { 60 } else { 12 },
+                badge: if bit(6) { 3 } else { 1 },
+                ..TopIn::default()
+            });
+        }
+        for i in mixes {
+            let whole = fit_top(&WORDS, &TopIn { width: 1e5, ..i });
             let mut wider: Option<TopFit> = None;
-            for width in (640..2600).rev() {
+            for width in (560..2000).rev() {
                 let i = TopIn { width: width as f32, ..i };
                 let f = fit_top(&WORDS, &i);
                 assert!(f.width(&WORDS, &i) <= i.width - TOP_PAD + 0.01, "{width}: {f:?}");
-                // A text may grow a pixel narrower (the drop of another freed
-                // room, L3); SYNAPS never comes back.
+                // L2 (re-review): narrower never shows more: the brand
+                // block, SYNAPS, DESKTOP, a text that went; THEME and
+                // SYSTEMS no more words between them.
                 if let Some(o) = wider {
-                    assert!(!f.word || o.word, "{width}");
+                    let words = |t: &TopFit| u8::from(t.theme) + u8::from(t.systems);
+                    assert!(f.brand <= o.brand && (!f.word || o.word) && (!f.word2 || o.word2), "{width} {i:?}: {f:?} after {o:?}");
+                    assert!(
+                        (f.gist == 0. || o.gist > 0.) && (f.conn == 0. || o.conn > 0.) && (f.label == 0. || o.label > 0.),
+                        "{width} {i:?}: {f:?} after {o:?}"
+                    );
+                    assert!(words(&f) <= words(&o), "{width} {i:?}: {f:?} after {o:?}");
                 }
-                // L3: nothing taken would fit again: a shortened text has
-                // grown into what was left, a word gone does not fit.
+                // L3: a shortened text has grown into what was left.
                 let left = i.width - TOP_PAD - f.width(&WORDS, &i);
-                let whole = fit_top(&WORDS, &TopIn { width: 1e5, ..i });
                 for (v, all) in [(f.gist, whole.gist), (f.conn, whole.conn), (f.label, whole.label)] {
                     assert!(!(v > 0. && v < all) || left < 0.02, "{width}: {left} px left with a text shortened: {f:?}");
                 }
-                for (on, all, cost) in [
-                    (f.theme, whole.theme, 8. + WORDS.theme),
-                    (f.systems, whole.systems, WORDS.systems + 10.),
-                    (f.word2, whole.word2, 14. + WORDS.word2),
-                ] {
-                    assert!(on || !all || left < cost, "{width}: {left} px left, a word of {cost} gone: {f:?}");
-                }
                 // Shortened never under its floor: whole, at least the
                 // floor, or not drawn.
-                let whole = fit_top(&WORDS, &TopIn { width: 1e5, ..i });
                 for (v, all, min) in [(f.gist, whole.gist, GIST_MIN), (f.conn, whole.conn, CONN_MIN), (f.label, whole.label, LABEL_MIN)] {
                     assert!(v == 0. || v == all || v >= min, "{width}: {f:?}");
                 }
@@ -669,12 +694,17 @@ mod tests {
         assert!(f.width(&WORDS, &TopIn { width: 640., ..busy }) <= 640. - TOP_PAD);
         // L3, the review's cases: at 888 the connection text is not cut to
         // its floor with 107 px to spare; at 640 with 123 waiting and a
-        // 3-digit badge, dropping SYSTEMS left 59 px, and THEME (46) is back.
+        // 3-digit badge, dropping SYSTEMS left 59 px, and THEME (46) takes
+        // its place. The re-review's (L2): DESKTOP, gone, does not come
+        // back where the gist goes.
         let i = TopIn { width: 888., ..busy };
         let f = fit_top(&WORDS, &i);
         assert!(f.conn > CONN_MIN && i.width - TOP_PAD - f.width(&WORDS, &i) < 0.02, "{f:?}");
         let i = TopIn { width: 640., need: 123, badge: 3, ..busy };
         let f = fit_top(&WORDS, &i);
         assert!(f.theme && !f.systems, "{f:?}");
+        let one = TopIn { need: 1, more: 0, conn: 12, ..busy };
+        assert!(!fit_top(&WORDS, &TopIn { width: 1099., ..one }).word2);
+        assert!((757..1099).all(|w| !fit_top(&WORDS, &TopIn { width: w as f32, ..one }).word2));
     }
 }
