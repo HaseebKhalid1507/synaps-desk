@@ -35,6 +35,7 @@ mod palettes;
 mod rail;
 mod shell;
 mod stats;
+mod subagents;
 mod tabs;
 mod tabstrip;
 mod theme;

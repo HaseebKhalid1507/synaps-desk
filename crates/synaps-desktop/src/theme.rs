@@ -311,6 +311,9 @@ roles! {
     code_fg, code_in, kw, string, num, com,
     // On a tool run (and its hover, the result surface).
     prose_t, dim_t, think, arg, ok, t_bash, t_read, t_write, t_edit, t_grep, t_find, t_ls, t_sub, t_ext, t_gen,
+    // A subagent's block in a run: its name, step and facts, and its rule
+    // (the TUI's `subagent_*` roles).
+    sub_name_t, sub_status_t, sub_time_t, sub_rule,
     // On an opened result and its diff lines.
     res, dim_o, think_o, ok_o, err_o,
     // On the permission card.
@@ -447,6 +450,10 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.t_sub = f.text("t_sub", or(t.tool_subagent, t.subagent_name), &run_grounds);
     r.t_ext = f.text("t_ext", or(t.tool_ext, or(t.event_icon, t.border_active)), &run_grounds);
     r.t_gen = f.text("t_gen", or(t.tool_generic, t.tool_label), &run_grounds);
+    r.sub_name_t = f.text("sub_name_t", t.subagent_name, &run_grounds);
+    r.sub_status_t = f.text("sub_status_t", t.subagent_status, &run_grounds);
+    r.sub_time_t = f.text("sub_time_t", t.subagent_time, &run_grounds);
+    r.sub_rule = f.mark("sub_rule", t.subagent_border, &run_grounds);
     r.res = f.text("res", t.tool_result_color, &[tool_out]);
     r.dim_o = f.text("dim_o", t.muted, &[tool_out]);
     r.think_o = think(&mut f, "think_o", &[tool_out]);

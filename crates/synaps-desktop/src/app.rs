@@ -22,7 +22,7 @@ use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, Model, RenameRequ
 use crate::named::{ResumeRequest, RowAction, home_short};
 use crate::rail::{Bucket, Chip};
 use crate::stats::Stats;
-use crate::tabs::{Lru, Place, Saved};
+use crate::tabs::{Drafts, Lru, Place, Saved};
 use crate::theme::{self, Metrics, Palette};
 use crate::turns::{self, Disp, Kind, Layout, Summaries};
 
@@ -101,6 +101,7 @@ impl TabCache {
             + self.rows.iter().map(row).sum::<usize>()
             + self.disp.len() * (std::mem::size_of::<Disp>() + 32)
             + self.stats.files.bytes()
+            + self.stats.subagents.bytes()
     }
 }
 
@@ -689,6 +690,8 @@ pub struct AppView {
     synced_busy: bool,
     /// The files ledger's generation the rows' counts are from.
     files_gen: u64,
+    /// The subagents' shape generation the rows were built at.
+    subs_gen: u64,
     /// The session the rows are of.
     rows_session: Option<String>,
     /// The last call still unfinished: the one a prompt waits on.
@@ -760,11 +763,11 @@ pub struct AppView {
     /// Each tab's composer draft by session (kept when its tab is left,
     /// put back when it is shown again), and the tab whose draft the
     /// composer holds.
-    drafts: crate::tabs::Drafts,
+    drafts: Drafts,
     composer_of: Option<(u64, Option<String>)>,
     /// Said in the composer's hint until the next send or switch (a draft
     /// came back with a send the daemon did not take).
-    draft_note: Option<SharedString>,
+    draft_note: Option<&'static str>,
     /// Bumped when the text metrics change every row's height (a cached
     /// tab's list is re-measured when it comes back).
     metrics_gen: u64,
@@ -828,6 +831,12 @@ pub(crate) fn display(text: impl Into<SharedString>, size: f32, color: Hsla) -> 
         .text_color(color)
         .whitespace_nowrap()
         .child(text.into())
+}
+
+/// A count as text, drawn every frame: no allocation under 10.
+pub(crate) fn count(n: usize) -> SharedString {
+    const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    DIGITS.get(n).map_or_else(|| n.to_string().into(), |&d| d.into())
 }
 
 pub(crate) fn mono(text: impl Into<SharedString>, size: f32, color: Hsla) -> Div {
@@ -997,6 +1006,7 @@ impl AppView {
             open_runs: HashSet::new(),
             synced_busy: false,
             files_gen: 0,
+            subs_gen: 0,
             rows_session: None,
             waiting_on: None,
             layout: Layout::of(800., &Metrics::at(theme::DEFAULT_TEXT)),
@@ -1144,9 +1154,11 @@ impl AppView {
     /// that tab's draft (said when it is shown again), or the composer if
     /// it is shown again already.
     fn unsent(&mut self, session: String, text: String) {
+        // Its tab followed the session to a new id: that tab's.
+        let session = self.model.tabs.followed(&session).map_or(session, str::to_string);
         if self.composer_of.as_ref().is_some_and(|(_, s)| s.as_deref() == Some(session.as_str())) {
             self.effect(Effect::Restore(text));
-            self.draft_note = Some(UNSENT_NOTE.into());
+            self.draft_note = Some(UNSENT_NOTE);
             self.model.view_dirty = true;
         } else if self.model.tabs.knows(&session) {
             self.drafts.give_back(session, text, UNSENT_NOTE);
@@ -1156,29 +1168,38 @@ impl AppView {
         }
     }
 
-    /// The visible tab changed: the composer's text and caret go to the
-    /// tab left, the shown tab's come back. A pending tab named by its
-    /// create or resume keeps what the composer holds.
-    fn swap_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let now = self.model.tabs.visible().map(|t| (t.id, t.session.clone()));
-        if now == self.composer_of {
+    /// Input given back for the composer's tab goes in, then, if the
+    /// visible tab changed, the composer's text and caret go to the tab
+    /// left and the shown tab's come back ([`crate::tabs::Drafts::frame`]):
+    /// in that order, so input given back in the frame of a switch stays
+    /// with its tab. Nothing is read or allocated on a frame with neither.
+    fn sync_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The visible tab went into the one holding its session: the
+        // composer's text is that tab's now (the follow rule keeps it).
+        if let Some((from, into)) = self.model.tabs.take_merged()
+            && let Some(o) = self.composer_of.as_mut().filter(|o| o.0 == from)
+        {
+            o.0 = into;
+        }
+        let visible = self.model.tabs.visible().map(|t| (t.id, t.session.as_deref()));
+        if self.restore.is_none() && Drafts::owns(self.composer_of.as_ref(), visible) {
             return;
         }
-        let prev = std::mem::replace(&mut self.composer_of, now.clone());
-        let (text, cursor) = {
-            let c = self.composer.read(cx);
-            (c.value().to_string(), c.cursor())
-        };
-        let Some(d) = self.drafts.switch(prev.as_ref(), now.as_ref(), text, cursor) else { return };
-        self.composer.update(cx, |c, cx| {
-            if !(d.text.is_empty() && c.value().is_empty()) {
-                c.set_value(d.text, window, cx);
-                c.set_selected_range(d.cursor..d.cursor, cx);
-            }
-        });
+        let c = self.composer.read(cx);
+        let (text, cursor) = (c.value(), c.cursor());
         let tabs = &self.model.tabs;
-        self.drafts.retain(|s| tabs.knows(s));
-        self.draft_note = d.note.map(SharedString::from);
+        let out =
+            self.drafts.frame(&mut self.composer_of, visible, self.restore.take(), &mut self.draft_note, (text.as_ref(), cursor), |s| {
+                tabs.knows(s)
+            });
+        if let Some((text, cursor)) = out {
+            self.composer.update(cx, |c, cx| {
+                c.set_value(text, window, cx);
+                if let Some(at) = cursor {
+                    c.set_selected_range(at..at, cx);
+                }
+            });
+        }
     }
 
     /// Resume a saved session: its folder as is, `~` if the daemon says it
@@ -1454,7 +1475,7 @@ impl AppView {
                     self.list.remeasure();
                 }
             }
-            None => self.model.switch_in(Transcript::new(), Stats::default()),
+            None => self.model.switch_in(crate::model::transcript(), Stats::default()),
         }
         self.rows_session = session;
     }
@@ -1597,9 +1618,12 @@ impl AppView {
         if dropped == 0 {
             return;
         }
-        self.model.named.notice = Some(match dropped {
-            1 => "1 saved tab closed: its session is no longer open.".into(),
-            n => format!("{n} saved tabs closed: their sessions are no longer open."),
+        let early = std::mem::take(&mut self.model.tabs.dropped_early);
+        self.model.named.notice = Some(match (dropped, early) {
+            (1, false) => "1 saved tab closed: its session is no longer open (Ctrl+Shift+T reopens it).".into(),
+            (n, false) => format!("{n} saved tabs closed: their sessions are no longer open (Ctrl+Shift+T reopens them)."),
+            (1, true) => "1 saved tab closed before its session came back (Ctrl+Shift+T reopens it).".into(),
+            (n, true) => format!("{n} saved tabs closed before their sessions came back (Ctrl+Shift+T reopens them)."),
         });
         self.model.rail_gen += 1;
         self.model.view_dirty = true;
@@ -1734,6 +1758,13 @@ impl AppView {
             self.model.last_error = Some("offline".into());
             return false;
         };
+        // The composer's text is the visible tab's only once the frame after
+        // a switch has swapped the drafts: never sent to another session.
+        if !Drafts::owns(self.composer_of.as_ref(), self.model.tabs.visible().map(|t| (t.id, t.session.as_deref()))) {
+            self.model.last_error = Some("switching tabs: not sent".into());
+            self.model.view_dirty = true;
+            return false;
+        }
         if !self.model.can_send() {
             self.model.last_error = Some(if self.model.switching() {
                 "switching sessions: not sent".into()
@@ -2086,13 +2117,15 @@ impl AppView {
                     let mut old: HashMap<(u64, u64), RowCache> =
                         self.rows.drain(sp.start.min(self.rows.len())..).map(|r| ((r.id, r.rev), r)).collect();
                     for item in &items[sp.start..] {
-                        let r = old.remove(&(item.id, item.rev)).unwrap_or_else(|| row_cache(item, &self.model.stats.files));
+                        let r = old
+                            .remove(&(item.id, item.rev))
+                            .unwrap_or_else(|| row_cache(item, &self.model.stats.files, &self.model.stats.subagents));
                         self.rows.push(r);
                     }
                 } else {
                     self.rows.truncate(sp.start);
                     for item in &items[sp.start..] {
-                        self.rows.push(row_cache(item, &self.model.stats.files));
+                        self.rows.push(row_cache(item, &self.model.stats.files, &self.model.stats.subagents));
                     }
                 }
                 debug_assert!(self.rows.iter().zip(items).all(|(r, i)| r.id == i.id && r.rev == i.rev));
@@ -2109,7 +2142,10 @@ impl AppView {
                 sp.start
             }
             None if busy != self.synced_busy => items.len(),
-            None => return self.sync_counts(),
+            None => {
+                self.sync_counts();
+                return self.sync_subagents();
+            }
         };
         self.waiting_on = items
             .iter()
@@ -2121,6 +2157,32 @@ impl AppView {
         self.synced_busy = busy;
         self.rebuild_from(start);
         self.sync_counts();
+        self.sync_subagents();
+    }
+
+    /// A subagent's block changed shape (a line came, its state changed)
+    /// with no item changing (its events and rows are not the
+    /// transcript's): the rows from the turn of the earliest call whose
+    /// block did (any: the first worker call's), so its height and its
+    /// run's fold follow. Its text alone changing needs nothing: the row
+    /// reads it when drawn.
+    fn sync_subagents(&mut self) {
+        let subs = &mut self.model.stats.subagents;
+        if subs.shape_generation() == self.subs_gen {
+            return;
+        }
+        self.subs_gen = subs.shape_generation();
+        let changed = subs.take_reshaped().filter(|c| !c.is_empty());
+        let items = self.model.transcript.items();
+        let k = items.iter().position(|i| {
+            i.tool.as_ref().is_some_and(|t| match &changed {
+                Some(c) => c.contains(&t.tool_id),
+                None => crate::subagents::starts_worker(&t.name),
+            })
+        });
+        if let Some(k) = k {
+            self.rebuild_from(turns::turn_start(items, k));
+        }
     }
 
     /// The files ledger committed a call since the rows were built (its
@@ -2152,7 +2214,7 @@ impl AppView {
     /// Start the list over on a new transcript (the bench's scenarios): no
     /// row, height or fold of the old one survives.
     pub(crate) fn reset_transcript(&mut self) {
-        self.model.transcript = synaps_client::Transcript::new();
+        self.model.transcript = crate::model::transcript();
         self.rows.clear();
         self.disp.clear();
         self.summaries.clear();
@@ -2164,7 +2226,7 @@ impl AppView {
     /// Display rows from item `start` (a turn's start) on.
     fn rebuild_from(&mut self, start: usize) {
         let items = self.model.transcript.items();
-        let new = turns::build(items, start, self.model.transcript.busy(), &self.open_runs);
+        let new = turns::build(items, start, self.model.transcript.busy(), &self.open_runs, &self.model.stats.subagents);
         self.summaries.update(&new, items, &self.rows);
         let at = self.disp.partition_point(|d| d.item < start);
         if let Some((range, count)) = turns::diff(&self.disp[at..], &new) {
@@ -2172,7 +2234,10 @@ impl AppView {
             self.disp.splice(at + range.start..at + range.end, new[range.start..range.start + count].iter().copied());
         }
         // A full build per sync: bounded, so long sessions stay usable in dev builds.
-        debug_assert!(items.len() > 2_000 || self.disp == turns::build(items, 0, self.model.transcript.busy(), &self.open_runs));
+        debug_assert!(
+            items.len() > 2_000
+                || self.disp == turns::build(items, 0, self.model.transcript.busy(), &self.open_runs, &self.model.stats.subagents)
+        );
     }
 
     /// Open by default: a file tool's diff when it is short (unless the
@@ -2237,12 +2302,16 @@ impl AppView {
         // The display face stops at Latin-1 (U+00FF): Polish, Czech or Turkish
         // titles, and other scripts, are set whole in the text face.
         let face = if title.chars().all(fonts::display_covers) { fonts::DISPLAY } else { fonts::SANS };
-        // NEEDS YOU / RUNNING / READY beside the cost (glyphs as the rail's).
+        // NEEDS YOU / RUNNING / WORKERS / READY beside the cost (glyphs as
+        // the rail's): its workers running on after the turn are not READY.
+        let workers = self.model.active_workers();
         let state = attached.then(|| {
             if !self.model.transcript.pending_prompts().is_empty() {
                 (crate::rail::State::NeedsYou, label::NEEDS_YOU, p.warn)
             } else if self.model.transcript.busy() {
                 (crate::rail::State::Running, label::RUNNING, p.run)
+            } else if workers > 0 {
+                (crate::rail::State::Workers, label::WORKERS, p.run)
             } else {
                 (crate::rail::State::Idle, label::READY, p.ready)
             }
@@ -2284,9 +2353,22 @@ impl AppView {
                         .child(div().absolute().inset_0().border_1().border_color(p.warn_mark))
                         .child(div().absolute().top(px(3.)).left(px(3.)).size(px(4.)).bg(p.warn_mark)),
                     crate::rail::State::Running => div().size(px(8.)).m(px(1.)).bg(p.run_mark),
+                    crate::rail::State::Workers => div()
+                        .relative()
+                        .size(px(10.))
+                        .flex_none()
+                        .child(div().absolute().top(px(1.)).left(px(1.)).size(px(4.)).bg(p.run_mark))
+                        .child(div().absolute().top(px(5.)).left(px(5.)).size(px(4.)).bg(p.run_mark)),
                     _ => div().size(px(10.)).border_1().border_color(p.ready),
                 };
-                d.child(h_flex().gap(px(8.)).items_center().child(g).child(display(word, 13., color)))
+                d.child(
+                    h_flex()
+                        .gap(px(8.))
+                        .items_center()
+                        .child(g)
+                        .child(display(word, 13., color))
+                        .when(st == crate::rail::State::Workers, |d| d.child(mono(count(workers), 12., color))),
+                )
             })
             .when_some(self.model.stats.cost.filter(|_| attached), |d, c| d.child(mono(format!("${c:.2}"), 12., p.cost)));
         let mut meta = h_flex().mt(px(6.)).gap(px(10.)).overflow_hidden().whitespace_nowrap();
@@ -2570,7 +2652,7 @@ impl AppView {
                             div().flex_1()
                         } else {
                             match &self.draft_note {
-                                Some(n) => mono(n.clone(), m.meta, p.warn),
+                                Some(n) => mono(*n, m.meta, p.warn),
                                 None => mono(hint, m.meta, p.dim_u),
                             }
                             .flex_1()
@@ -2616,7 +2698,7 @@ pub(crate) fn fbtn(id: &'static str, text: &'static str, enabled: bool, fill: Hs
         .child(display(text, m.label, fg))
 }
 
-pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger) -> RowCache {
+pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subagents::Subagents) -> RowCache {
     let mut r = RowCache {
         id: item.id,
         rev: item.rev,
@@ -2640,8 +2722,10 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger) -> RowCache {
                 r.delta = ledger.delta(&t.tool_id);
                 r.counts = turns::Counts::of(r.delta.unwrap_or_default());
             }
-            r.arg = match &r.preview {
-                Some(pv) if !pv.title.is_empty() => pv.title.clone().into(),
+            r.arg = match (&r.preview, subs.arg(&t.tool_id)) {
+                (Some(pv), _) if !pv.title.is_empty() => pv.title.clone().into(),
+                // A subagent's call: its label and its task's first line.
+                (_, Some(arg)) => arg,
                 _ => one_line(&t.input, 200).into(),
             };
             let lines: Vec<&str> = t.result.lines().collect();
@@ -2652,6 +2736,8 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger) -> RowCache {
             r.text = item.text.clone().into();
             r.arg = one_line(&item.text, 200).into();
         }
+        // A subagent's completion event: as the TUI says it.
+        ItemKind::Notice => r.text = crate::subagents::completion_note(&item.text).unwrap_or_else(|| item.text.clone()).into(),
         _ => r.text = item.text.clone().into(),
     }
     r
@@ -2679,16 +2765,7 @@ struct Inputs {
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diag::mark("first_render");
-        self.swap_draft(window, cx);
-        if let Some(text) = self.restore.take() {
-            // Refused input goes back where it was typed, ahead of anything
-            // typed since.
-            self.composer.update(cx, |s, cx| {
-                let now = s.value().trim().to_string();
-                let text = if now.is_empty() { text } else { format!("{text}\n{now}") };
-                s.set_value(text, window, cx);
-            });
-        }
+        self.sync_composer(window, cx);
         if std::mem::take(&mut self.model.named.opened) {
             self.find_input.update(cx, |s, cx| s.set_value("", window, cx));
             self.find.clear();
@@ -2758,8 +2835,14 @@ impl Render for AppView {
             // Esc closes the picker, wherever the focus is; in find it clears
             // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                // The letter as the key or as what it types: a binding matches
+                // either (a "Dvorak – QWERTY ⌘" layout on macOS).
+                let k_is = |k: OnceKey| {
+                    let ks = &ev.keystroke;
+                    ks.key.eq_ignore_ascii_case(k.letter()) || ks.key_char.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(k.letter()))
+                };
                 if let Some(k) = this.once.take()
-                    && ev.keystroke.key.eq_ignore_ascii_case(k.letter())
+                    && k_is(k)
                 {
                     cx.stop_propagation();
                     return this.once_key(k, ev.is_held, cx);
