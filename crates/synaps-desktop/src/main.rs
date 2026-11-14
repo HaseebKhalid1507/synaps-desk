@@ -189,6 +189,7 @@ fn main() {
                 stream_secs: 5.0,
                 scroll_secs: 6.0,
                 scroll_px_per_s: 4000.0,
+                drag_secs: 2.5,
                 history_messages: 2000,
                 diag: diag_mode,
             };

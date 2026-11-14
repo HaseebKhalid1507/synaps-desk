@@ -508,25 +508,37 @@ pub fn save_accent(path: &Path, hex: u32) -> std::io::Result<()> {
 
 /// Which side panels are folded to their strips (`rail_collapsed`,
 /// `right_collapsed` in the settings file; missing or not a boolean: open),
-/// and which HISTORY buckets are open (`history_open`, a list of bucket
-/// names; missing or not a list: NAMED and TODAY).
+/// the widths they were dragged to (`rail_width`, `right_width`: whole
+/// pixels, clamped to [`RAIL_WIDTHS`] / [`RIGHT_WIDTHS`]; missing, `null`
+/// or not a number: the auto width), and which HISTORY buckets are open
+/// (`history_open`, a list of bucket names; missing or not a list: NAMED
+/// and TODAY).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Panels {
     pub rail_collapsed: bool,
     pub right_collapsed: bool,
+    /// Set by a drag of the panel's edge; `None`: the auto width.
+    pub rail_width: Option<u16>,
+    pub right_width: Option<u16>,
     /// [`Bucket::bit`]s.
     pub history_open: u8,
 }
 
+/// The widths a drag can give the sessions rail and the right panel (px).
+pub const RAIL_WIDTHS: (u16, u16) = (220, 480);
+pub const RIGHT_WIDTHS: (u16, u16) = (240, 520);
+
 impl Default for Panels {
     fn default() -> Self {
-        Panels { rail_collapsed: false, right_collapsed: false, history_open: Bucket::DEFAULT_OPEN }
+        Panels { rail_collapsed: false, right_collapsed: false, rail_width: None, right_width: None, history_open: Bucket::DEFAULT_OPEN }
     }
 }
 
 impl Panels {
     const RAIL: &str = "rail_collapsed";
     const RIGHT: &str = "right_collapsed";
+    const RAIL_WIDTH: &str = "rail_width";
+    const RIGHT_WIDTH: &str = "right_width";
     const HISTORY: &str = "history_open";
 }
 
@@ -535,6 +547,8 @@ impl Panels {
 pub struct PanelKeys {
     pub rail: bool,
     pub right: bool,
+    pub rail_width: bool,
+    pub right_width: bool,
     pub history: bool,
 }
 
@@ -544,16 +558,24 @@ impl PanelKeys {
         PanelKeys {
             rail: a.rail_collapsed != b.rail_collapsed,
             right: a.right_collapsed != b.right_collapsed,
+            rail_width: a.rail_width != b.rail_width,
+            right_width: a.right_width != b.right_width,
             history: a.history_open != b.history_open,
         }
     }
 
     pub fn is_empty(self) -> bool {
-        !self.rail && !self.right && !self.history
+        self == Self::default()
     }
 
     pub fn or(self, o: Self) -> Self {
-        PanelKeys { rail: self.rail || o.rail, right: self.right || o.right, history: self.history || o.history }
+        PanelKeys {
+            rail: self.rail || o.rail,
+            right: self.right || o.right,
+            rail_width: self.rail_width || o.rail_width,
+            right_width: self.right_width || o.right_width,
+            history: self.history || o.history,
+        }
     }
 }
 
@@ -565,7 +587,16 @@ pub fn load_panels(path: &Path) -> Panels {
         .and_then(serde_json::Value::as_array)
         .map(|open| Bucket::ALL.into_iter().filter(|b| open.iter().any(|x| x.as_str() == Some(b.key()))).fold(0, |m, b| m | b.bit()))
         .unwrap_or(Bucket::DEFAULT_OPEN);
-    Panels { rail_collapsed: flag(Panels::RAIL), right_collapsed: flag(Panels::RIGHT), history_open }
+    let width = |k: &str, (lo, hi): (u16, u16)| {
+        v.get(k).and_then(serde_json::Value::as_f64).filter(|w| w.is_finite()).map(|w| w.round().clamp(lo.into(), hi.into()) as u16)
+    };
+    Panels {
+        rail_collapsed: flag(Panels::RAIL),
+        right_collapsed: flag(Panels::RIGHT),
+        rail_width: width(Panels::RAIL_WIDTH, RAIL_WIDTHS),
+        right_width: width(Panels::RIGHT_WIDTH, RIGHT_WIDTHS),
+        history_open,
+    }
 }
 
 /// Save the panel states in `keys` only (see [`save_settings`]): another
@@ -577,6 +608,12 @@ pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<(
     }
     if keys.right {
         kv.push((Panels::RIGHT, p.right_collapsed.into()));
+    }
+    if keys.rail_width {
+        kv.push((Panels::RAIL_WIDTH, p.rail_width.into()));
+    }
+    if keys.right_width {
+        kv.push((Panels::RIGHT_WIDTH, p.right_width.into()));
     }
     if keys.history {
         let open: Vec<&str> = Bucket::ALL.into_iter().filter(|b| p.history_open & b.bit() != 0).map(Bucket::key).collect();
@@ -864,6 +901,36 @@ mod tests {
             Panels { rail_collapsed: true, right_collapsed: true, ..Panels::default() },
             "nothing changed: nothing written"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dragged widths: saved as whole pixels, only the one that changed;
+    /// a reset saves `null`; anything unreadable is the auto width and a
+    /// width out of range is clamped.
+    #[test]
+    fn panel_widths_round_trip() {
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-widths-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let p0 = Panels::default();
+        let a = Panels { rail_width: Some(400), ..p0 };
+        save_panels(&path, a, PanelKeys::changed(p0, a)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({"rail_width": 400}), "only the key that changed");
+        // Another window drags the right panel: the rail's width stays.
+        let b = Panels { right_width: Some(300), ..p0 };
+        save_panels(&path, b, PanelKeys::changed(p0, b)).unwrap();
+        assert_eq!(load_panels(&path), Panels { rail_width: Some(400), right_width: Some(300), ..p0 });
+        // A double-click reset.
+        let c = Panels { rail_width: None, ..a };
+        save_panels(&path, c, PanelKeys::changed(a, c)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["rail_width"], serde_json::Value::Null);
+        assert_eq!(load_panels(&path), Panels { right_width: Some(300), ..p0 });
+        std::fs::write(&path, r#"{"rail_width": 9000, "right_width": 10.4}"#).unwrap();
+        assert_eq!((load_panels(&path).rail_width, load_panels(&path).right_width), (Some(480), Some(240)));
+        std::fs::write(&path, r#"{"rail_width": 300.6, "right_width": "wide"}"#).unwrap();
+        assert_eq!((load_panels(&path).rail_width, load_panels(&path).right_width), (Some(301), None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
