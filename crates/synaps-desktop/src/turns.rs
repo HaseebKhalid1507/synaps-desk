@@ -440,9 +440,9 @@ pub(crate) struct Layout {
 impl Layout {
     /// `pane` wide; `height` is the pane's height under the full (52-px)
     /// top bar, so the short bar cannot flip it back. Short and cramped
-    /// read the height and the text step only: nothing they change feeds
-    /// back.
-    pub(crate) fn of(pane: f32, height: f32, m: &Metrics) -> Self {
+    /// read the height, the text step and `ex` (the model's state) only:
+    /// nothing they change feeds back.
+    pub(crate) fn of(pane: f32, height: f32, m: &Metrics, ex: crate::fit::Extras) -> Self {
         let tight = pane < 560.;
         let gutter = if tight { 16. } else { 24. };
         let column = m.column.min(pane - 2. * gutter).max(200.).floor();
@@ -452,7 +452,7 @@ impl Layout {
             hang: pane >= (672. + 200.) * m.r,
             tight,
             short: height < crate::fit::short_below(m),
-            cramped: height < crate::fit::cramped_below(m),
+            cramped: height < crate::fit::cramped_below(m, ex),
             left,
             right: (pane - column - left).max(0.),
         }
@@ -1092,18 +1092,21 @@ mod tests {
     #[test]
     fn the_column_is_capped_and_labels_hang_when_there_is_room() {
         let m = Metrics::at(16);
-        let wide = Layout::of(1988., 900., &m);
+        let wide = Layout::of(1988., 900., &m, Default::default());
         assert_eq!((wide.column, wide.hang, wide.tight), (672., true, false));
-        assert_eq!(Layout::of(942., 900., &m).column, 672.);
-        assert!(Layout::of(942., 900., &m).hang);
-        assert_eq!((Layout::of(678., 900., &m).column, Layout::of(678., 900., &m).hang), (630., false));
-        assert_eq!((Layout::of(1988., 900., &Metrics::at(18)).column), 756.);
-        let tight = Layout::of(500., 900., &m);
+        assert_eq!(Layout::of(942., 900., &m, Default::default()).column, 672.);
+        assert!(Layout::of(942., 900., &m, Default::default()).hang);
+        assert_eq!(
+            (Layout::of(678., 900., &m, Default::default()).column, Layout::of(678., 900., &m, Default::default()).hang),
+            (630., false)
+        );
+        assert_eq!((Layout::of(1988., 900., &Metrics::at(18), Default::default()).column), 756.);
+        let tight = Layout::of(500., 900., &m, Default::default());
         assert_eq!((tight.column, tight.tight, tight.short), (468., true, false));
         // Dragging a side panel while the column is capped changes only the
         // padding: the list's item width (what its cache is keyed on) holds.
         for pane in [900., 1100., 1318., 1988.] {
-            let l = Layout::of(pane, 900., &m);
+            let l = Layout::of(pane, 900., &m, Default::default());
             let (a, b) = l.padding();
             assert_eq!(pane - a - b, 672., "{pane}");
             assert!((a - b).abs() <= 1.);
