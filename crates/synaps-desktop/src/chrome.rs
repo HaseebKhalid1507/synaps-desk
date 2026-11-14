@@ -10,15 +10,20 @@ use synaps_client::protocol::SessionMeta;
 
 use std::hash::{Hash, Hasher};
 
-use crate::app::{AppView, display, home_short, mono, section, tbtn};
+use gpui_kit::component::tooltip::Tooltip;
+
+use crate::app::{AppView, STRIP, Side, ToggleRail, ToggleRight, display, home_short, mono, section, tbtn};
 use crate::fonts::{self, label};
 use crate::model::{ConnState, Filter, Model, SAVED_LIMIT};
 use crate::named::{Marker, RowAction, relative, short_model};
 use crate::stats::compact;
 use crate::theme::{self, Palette};
 
-/// Context-gauge segments.
+/// The mark strip at the window's left edge.
+pub(crate) const MARK: f32 = 30.;
+/// Context-gauge segments (the folded panel's upright gauge: `STRIP_SEGMENTS`).
 const SEGMENTS: usize = 48;
+const STRIP_SEGMENTS: usize = 24;
 /// Files listed before "+N more".
 const FILES_SHOWN: usize = 40;
 
@@ -173,16 +178,43 @@ struct Card {
     active: bool,
 }
 
+/// The fold control of a side panel: `‹` / `›`, its key in the tooltip.
+fn fold(id: &'static str, glyph: &'static str, tip: &'static str, rail: bool, p: &Palette, cx: &Context<AppView>) -> Stateful<Div> {
+    let hover = p.ink4;
+    div()
+        .id(id)
+        .size(px(20.))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .border_1()
+        .border_color(p.line2)
+        .hover(move |d| d.border_color(hover))
+        .child(mono(glyph, 12., p.ink3))
+        .tooltip(move |window, cx| {
+            let t = Tooltip::new(tip);
+            if rail { t.action(&ToggleRail, None) } else { t.action(&ToggleRight, None) }.build(window, cx)
+        })
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_panel(rail, cx)))
+}
+
 impl AppView {
-    pub(crate) fn render_mark(&self, p: &Palette) -> impl IntoElement {
-        let disc = match &self.model.conn {
+    /// The connection disc's colour (the mark strip and the folded rail).
+    fn conn_disc(&self, p: &Palette) -> Hsla {
+        match &self.model.conn {
             ConnState::Connected(_) => p.accent,
             _ if self.synthetic => p.accent,
             ConnState::Connecting | ConnState::Reconnecting => p.ink4,
             _ => p.line3,
-        };
+        }
+    }
+
+    pub(crate) fn render_mark(&self, p: &Palette) -> impl IntoElement {
+        let disc = self.conn_disc(p);
         v_flex()
-            .w(px(30.))
+            .w(px(MARK))
             .h_full()
             .flex_none()
             .items_center()
@@ -204,7 +236,7 @@ impl AppView {
             )
     }
 
-    pub(crate) fn render_top(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_top(&self, p: &Palette, rail: Side, cx: &Context<Self>) -> impl IntoElement {
         let waiting: Vec<&SessionMeta> = self.model.attention().collect();
         let n = waiting.len();
         // The one to jump to: a waiting session other than this one, else this one.
@@ -263,11 +295,18 @@ impl AppView {
             .items_center()
             .border_b_1()
             .border_color(p.line)
-            .child(h_flex().w(px(254.)).flex_none().gap(px(14.)).child(display(label::WORD, 13., p.ink)).child(display(
-                label::WORD_2,
-                13.,
-                p.ink4,
-            )))
+            // Over the open rail: as wide as it.
+            .child(
+                h_flex()
+                    .w(px(match rail {
+                        Side::Open(w) => w - 22.,
+                        _ => 254.,
+                    }))
+                    .flex_none()
+                    .gap(px(14.))
+                    .child(display(label::WORD, 13., p.ink))
+                    .child(display(label::WORD_2, 13., p.ink4)),
+            )
             .child(div().flex_1())
             .child(ticker)
             .child(div().flex_1())
@@ -383,7 +422,92 @@ impl AppView {
             }))
     }
 
-    pub(crate) fn render_rail(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+    /// The folded rail: the connection disc and how many sessions need
+    /// you. A click (or Ctrl+B) opens it again.
+    pub(crate) fn render_rail_strip(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+        let n = self.model.attention().count();
+        let on = n > 0;
+        // L1: a window too narrow for the rail keeps its strip and says so.
+        let fits = crate::app::toggled(self.width, self.panels, true).is_some();
+        v_flex()
+            .id("rail-strip")
+            .w(px(STRIP))
+            .h_full()
+            .flex_none()
+            .items_center()
+            .pt(px(22.))
+            .gap(px(18.))
+            .border_r_1()
+            .border_color(p.line)
+            .cursor_pointer()
+            .hover(|d| d.bg(p.bg1))
+            .child(mono("›", 12., p.ink3))
+            .child(div().size(px(8.)).rounded_full().bg(self.conn_disc(p)))
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().size(px(6.)).when(on, |d| d.bg(p.accent)).when(!on, |d| d.border_1().border_color(p.ink4)))
+                    .child(display(n.to_string(), 13., if on { p.hi } else { p.ink4 })),
+            )
+            .tooltip(move |window, cx| {
+                let tip = match (on, fits) {
+                    (_, false) => format!("{n} need you · widen the window to show sessions"),
+                    (true, true) => format!("{n} need you · show sessions"),
+                    (false, true) => "Show sessions".to_string(),
+                };
+                Tooltip::new(tip).action(&ToggleRail, None).build(window, cx)
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_panel(true, cx)))
+    }
+
+    /// The folded right panel: the context gauge, upright, and its
+    /// percentage. A click (or Ctrl+Alt+B) opens it again.
+    pub(crate) fn render_right_strip(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+        let ratio = self.model.stats.context_ratio();
+        let hot = ratio.is_some_and(|r| r >= 0.85);
+        let filled = ratio.map(|r| ((r * STRIP_SEGMENTS as f64).round() as usize).min(STRIP_SEGMENTS)).unwrap_or(0);
+        let mut gauge = v_flex().w(px(6.)).gap(px(2.));
+        for i in (0..STRIP_SEGMENTS).rev() {
+            gauge = gauge.child(div().w_full().h(px(4.)).bg(if i < filled { if hot { p.hi } else { p.accent } } else { p.seg }));
+        }
+        let pct: SharedString = ratio.map(|r| format!("{:.0}", r * 100.0)).unwrap_or_else(|| "—".into()).into();
+        let fits = crate::app::toggled(self.width, self.panels, false).is_some();
+        // L2: detached, the last numbers seen are dimmed, as the open panel's are.
+        let detached = self.model.stats.detached && self.model.active.is_none();
+        v_flex()
+            .id("right-strip")
+            .w(px(STRIP))
+            .h_full()
+            .flex_none()
+            .items_center()
+            .pt(px(22.))
+            .gap(px(14.))
+            .border_l_1()
+            .border_color(p.line)
+            .cursor_pointer()
+            .hover(|d| d.bg(p.bg1))
+            .child(mono("‹", 12., p.ink3))
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap(px(14.))
+                    .when(detached, |d| d.opacity(0.45))
+                    .child(v_flex().items_center().child(display(pct, 13., if hot { p.hi } else { p.ink2 })).child(mono("%", 9., p.ink4)))
+                    .child(gauge),
+            )
+            .tooltip(move |window, cx| {
+                let tip = match (detached, fits) {
+                    (_, false) => "Widen the window to show context, tokens and files",
+                    (true, true) => "Detached: last numbers seen · show context, tokens and files",
+                    (false, true) => "Show context, tokens and files",
+                };
+                Tooltip::new(tip).action(&ToggleRight, None).build(window, cx)
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_panel(false, cx)))
+    }
+
+    pub(crate) fn render_rail(&self, width: f32, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let filters =
             [(Filter::All, label::ALL), (Filter::Live, label::LIVE), (Filter::Needs, label::NEEDS_YOU), (Filter::Idle, label::IDLE)];
         let mut tabs = h_flex().gap(px(18.)).px(px(22.)).pt(px(18.)).pb(px(14.)).border_b_1().border_color(p.line);
@@ -415,7 +539,7 @@ impl AppView {
             list = list.child(div().px(px(22.)).py(px(14.)).text_size(px(12.)).text_color(p.ink4).child(empty));
         }
         v_flex()
-            .w(px(276.))
+            .w(px(width))
             .h_full()
             .flex_none()
             .border_r_1()
@@ -432,7 +556,8 @@ impl AppView {
                             this.create();
                             cx.notify();
                         })))
-                    }),
+                    })
+                    .child(fold("rail-fold", "‹", "Hide sessions", true, p, cx).ml(px(16.))),
             )
             .child(tabs)
             .child(list)
@@ -536,7 +661,7 @@ impl AppView {
         section.child(div().h(px(10.)).border_b_1().border_color(p.line))
     }
 
-    pub(crate) fn render_right(&self, p: &Palette) -> impl IntoElement {
+    pub(crate) fn render_right(&self, width: f32, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let s = &self.model.stats;
         let window = s.view.as_ref().map(|v| v.context_window).filter(|&w| w > 0);
         let ratio = s.context_ratio();
@@ -557,7 +682,14 @@ impl AppView {
             .pb(px(26.))
             .border_b_1()
             .border_color(p.line)
-            .child(section(label::CONTEXT, fonts::JP_CONTEXT, p))
+            .child(h_flex().items_center().child(section(label::CONTEXT, fonts::JP_CONTEXT, p)).child(div().flex_1()).child(fold(
+                "right-fold",
+                "›",
+                "Hide context, tokens and files",
+                false,
+                p,
+                cx,
+            )))
             .child(
                 h_flex()
                     .mt(px(20.))
@@ -612,6 +744,9 @@ impl AppView {
             ))));
         let ledger = &s.files;
         let (added, removed) = ledger.totals();
+        // An estimate is never shown as an exact count (`files::changed_lines`).
+        let tilde = |approx: bool| if approx { "~" } else { "" };
+        let approx = tilde(ledger.approx());
         let mut files = v_flex()
             .px(px(24.))
             .pt(px(24.))
@@ -619,7 +754,7 @@ impl AppView {
             .child(h_flex().items_end().child(section(label::FILES, fonts::JP_FILES, p)).child(div().flex_1()).when(
                 added + removed > 0,
                 |d| {
-                    d.child(h_flex().gap(px(8.)).child(mono(format!("+{added}"), 10.5, p.ink3)).child(mono(
+                    d.child(h_flex().gap(px(8.)).child(mono(format!("{approx}+{added}"), 10.5, p.ink3)).child(mono(
                         format!("−{removed}"),
                         10.5,
                         p.hi,
@@ -629,7 +764,6 @@ impl AppView {
             .child(mono("as the model asked: tool inputs, not the disk", 9.5, p.ink4).mt(px(6.)))
             .child(div().h(px(12.)));
         for f in ledger.files().iter().take(FILES_SHOWN) {
-            let (dir, name) = f.split();
             files = files.child(
                 h_flex()
                     .h(px(27.))
@@ -641,12 +775,14 @@ impl AppView {
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
-                            .child(mono(dir.to_string(), 11., p.ink4).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
-                            .child(mono(name.to_string(), 11., p.ink).flex_none()),
+                            .child(mono(f.dir.clone(), 11., p.ink4).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
+                            .child(mono(f.name.clone(), 11., p.ink).flex_none()),
                     )
                     // A write is the lines written, not a delta (`~`).
                     .when(f.written > 0, |d| d.child(mono(format!("~{}", f.written), 10.5, p.ink3).flex_none()))
-                    .when(f.added > 0 || f.written == 0, |d| d.child(mono(format!("+{}", f.added), 10.5, p.ink2).flex_none()))
+                    .when(f.added > 0 || f.written == 0, |d| {
+                        d.child(mono(format!("{}+{}", tilde(f.approx), f.added), 10.5, p.ink2).flex_none())
+                    })
                     .when(f.removed > 0, |d| d.child(mono(format!("−{}", f.removed), 10.5, p.hi).flex_none())),
             );
         }
@@ -654,14 +790,51 @@ impl AppView {
         if n > FILES_SHOWN {
             files = files.child(mono(format!("+{} more files", n - FILES_SHOWN), 10.5, p.ink4).mt(px(6.)));
         }
-        if n == 0 {
+        let shell = ledger.shell();
+        if n == 0 && shell.is_empty() {
             files = files.child(div().text_size(px(12.)).text_color(p.ink4).child("No file edits in this session"));
+        }
+        if !shell.is_empty() {
+            // Read from `bash` command lines: approximate, no line counts,
+            // not in the totals above.
+            files = files
+                .child(
+                    h_flex()
+                        .mt(px(if n == 0 { 0. } else { 18. }))
+                        .gap(px(10.))
+                        .items_baseline()
+                        .child(display(label::VIA_SHELL, 10., p.ink2))
+                        .child(mono("~", 11., p.ink3)),
+                )
+                .child(mono("bash commands that succeeded; no counts", 9.5, p.ink4).mt(px(6.)))
+                .child(div().h(px(8.)));
+            for f in shell.iter().take(FILES_SHOWN) {
+                files = files.child(
+                    h_flex()
+                        .h(px(25.))
+                        .gap(px(10.))
+                        .items_center()
+                        .child(mono("$", 10.5, p.ink4).w(px(10.)).flex_none())
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(mono(f.dir.clone(), 11., p.ink4).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
+                                .child(mono(f.name.clone(), 11., p.ink2).flex_none()),
+                        )
+                        .child(mono(f.verb, 10., p.ink3).flex_none()),
+                );
+            }
+            if shell.len() > FILES_SHOWN {
+                files = files.child(mono(format!("+{} more", shell.len() - FILES_SHOWN), 10.5, p.ink4).mt(px(6.)));
+            }
         }
         // Detached: the last numbers seen, dimmed and labelled, not live.
         let detached = s.detached && self.model.active.is_none();
         v_flex()
             .id("right")
-            .w(px(296.))
+            .w(px(width))
             .h_full()
             .flex_none()
             .overflow_y_scroll()
@@ -682,10 +855,11 @@ impl AppView {
             .child(v_flex().when(detached, |d| d.opacity(0.45)).child(context).child(tokens).child(files))
     }
 
-    /// The accent picker: over the right-hand column (clear of the
-    /// header's NAME and HALT), else over the rail, else above the composer.
+    /// The accent picker: over the open right-hand column (clear of the
+    /// header's NAME and HALT), else above the composer at the right, under
+    /// its ACCENT button either way.
     /// Esc (the root's key handler) or a click outside closes it.
-    pub(crate) fn render_picker(&self, p: &Palette, show_rail: bool, show_right: bool, cx: &Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_picker(&self, p: &Palette, right: Side, cx: &Context<Self>) -> impl IntoElement {
         let accent = cx.global::<theme::Accent>();
         let current = accent.hex;
         let d = accent.derived;
@@ -720,10 +894,9 @@ impl AppView {
         v_flex()
             .id("picker")
             .absolute()
-            .map(|d| match (show_right, show_rail) {
-                (true, _) => d.top(px(52.)).right_0().w(px(296.)),
-                (false, true) => d.top(px(52.)).left(px(30.)).w(px(296.)),
-                (false, false) => d.bottom(px(140.)).right(px(24.)).w(px(296.)),
+            .map(|d| match right {
+                Side::Open(w) => d.top(px(52.)).right_0().w(px(w)),
+                Side::Strip => d.bottom(px(140.)).right(px(right.width() + 24.)).w(px(296.)),
             })
             .p(px(20.))
             .bg(p.bg1)

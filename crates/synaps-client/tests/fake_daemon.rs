@@ -1021,3 +1021,51 @@ async fn prompts_are_answered_on_the_wire() {
     .await;
     client.shutdown().unwrap();
 }
+
+/// An answer is tied to the connection its prompt came on: once the
+/// session has reconnected (a restarted daemon numbers its prompts from 1
+/// again), `answer_on` with the old connection is dropped and refused,
+/// never sent, whether it was queued during the reconnect or after it.
+#[tokio::test]
+async fn answers_for_an_earlier_connection_are_never_sent() {
+    let mut fake = Fake::start("answer-on").await;
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let conn = fake.next_attach().await;
+    conn.send(attached_frame(2)).await;
+    let first = wait(&events, "attached", |e| match e {
+        Event::Attached { attached, .. } => Some(attached.connection),
+        _ => None,
+    })
+    .await;
+    assert_ne!(first, 0);
+    // The daemon goes away with prompt #1 pending.
+    drop(conn);
+    wait(&events, "reattaching", |e| matches!(e, Event::Reattaching { attach_seq, .. } if *attach_seq == seq).then_some(())).await;
+    let refused = |e: &Event| match e {
+        Event::Error { error: Error::Refused { command: Some(c), reason }, .. } if c == "answer" => Some(reason.clone()),
+        _ => None,
+    };
+    // Queued while reconnecting: refused.
+    client.answer_on(first, 1, Some("y".into())).unwrap();
+    wait(&events, "refused while reconnecting", refused).await;
+    let mut again = fake.next_attach().await;
+    again.send(attached_frame(3)).await;
+    let second = wait(&events, "re-attached", |e| match e {
+        Event::Attached { attached, reconnect: true, .. } => Some(attached.connection),
+        _ => None,
+    })
+    .await;
+    assert!(second > first, "{first} then {second}");
+    // Queued after the reconnect, aimed at the old connection (a click on
+    // the old card the UI had not replaced yet): dropped, refused.
+    client.answer_on(first, 1, Some("y".into())).unwrap();
+    let why = wait(&events, "refused after the reconnect", refused).await;
+    assert!(why.contains("earlier connection"), "{why}");
+    // The new connection's own answer goes out, and is the first command
+    // the daemon sees: the stale "y" never reached it.
+    client.answer_on(second, 1, Some("n".into())).unwrap();
+    assert_eq!(again.recv_cmd().await, json!({"cmd": "answer", "prompt_id": 1, "value": "n"}));
+    client.shutdown().unwrap();
+    assert_eq!(again.recv_cmd().await, json!({"cmd": "detach", "client": 3}));
+}
