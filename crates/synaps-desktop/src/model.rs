@@ -112,6 +112,9 @@ pub struct Active {
     /// the `attach_seq`, and a restarted daemon numbers its prompts from 1
     /// again, so `(attach_seq, prompt id)` could name a different prompt.
     pub epoch: u64,
+    /// `Attached::connection`: answers go out on it only
+    /// (`Client::answer_on`), never on a later one.
+    pub connection: u64,
     pub mode: AttachMode,
 }
 
@@ -589,7 +592,13 @@ impl Model {
         self.wanted = Some(LOCAL_SEQ);
         self.wanted_session = Some(session_id.into());
         self.epoch += 1;
-        self.active = Some(Active { session_id: session_id.into(), attach_seq: LOCAL_SEQ, epoch: self.epoch, mode: AttachMode::Mirror });
+        self.active = Some(Active {
+            session_id: session_id.into(),
+            attach_seq: LOCAL_SEQ,
+            epoch: self.epoch,
+            connection: 0,
+            mode: AttachMode::Mirror,
+        });
         self.stats = Stats::default();
     }
 
@@ -772,7 +781,13 @@ impl Model {
                 self.named.error = None;
                 // A new epoch even on a reconnect (see `Active::epoch`).
                 self.epoch += 1;
-                self.active = Some(Active { session_id: attached.meta.id.clone(), attach_seq, epoch: self.epoch, mode });
+                self.active = Some(Active {
+                    session_id: attached.meta.id.clone(),
+                    attach_seq,
+                    epoch: self.epoch,
+                    connection: attached.connection,
+                    mode,
+                });
                 self.wanted_session = Some(attached.meta.id.clone());
                 // Whatever was answered belongs to the attachment before.
                 self.answered.clear();
@@ -1828,14 +1843,23 @@ mod fake_daemon {
         pump(&mut m, &events, "reattaching", |m| m.reattaching);
         assert!(!m.may_answer(1), "nothing answers while reconnecting");
         let mut a = attaches.recv_timeout(T).unwrap();
+        let stale = m.active.as_ref().unwrap().connection;
         a.send(attached_with(A, 1, "rm -rf ~/work"));
+        // AUTHORIZE on the old card as the client thread re-attaches, before
+        // the UI has seen it (`AppView::answer` sends on the card's
+        // connection): refused, during the reconnect or after it, never sent.
+        client.answer_on(stale, 1, Some(CONFIRM_YES.into())).unwrap();
         pump(&mut m, &events, "A reattached", |m| !m.reattaching && m.may_answer(1));
         assert_eq!(m.active.as_ref().unwrap().attach_seq, seq, "a reconnect keeps the attach_seq");
+        assert_ne!(m.active.as_ref().unwrap().connection, stale, "a new connection");
         assert!(PromptCard::sync(&mut card, &m, Instant::now()), "the restarted daemon's #1 is a new card");
         let c = card.as_ref().unwrap();
         assert!(c.body.contains("rm -rf ~/work") && !c.body.contains("README"), "the new text: {}", c.body);
         assert!(!c.armed(), "unarmed");
+        // The new card's own answer goes out.
+        client.answer_on(m.active.as_ref().unwrap().connection, 1, Some("n".into())).unwrap();
         client.shutdown().unwrap();
-        let _ = a.cmds(Duration::from_millis(100));
+        let answers: Vec<Value> = a.cmds(Duration::from_millis(500)).into_iter().filter(|c| c["cmd"] == "answer").collect();
+        assert_eq!(answers, vec![json!({"cmd": "answer", "prompt_id": 1, "value": "n"})], "only the new connection's answer");
     }
 }
