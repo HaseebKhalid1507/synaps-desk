@@ -82,6 +82,7 @@ pub mod label {
     pub const YOU: &str = "Y O U";
     pub const READY: &str = "R E A D Y";
     pub const THEME: &str = "T H E M E";
+    pub const SYNAPS_CONFIG: &str = "S Y N A P S   C O N F I G";
     pub const HALT: &str = "H A L T";
     pub const NAME: &str = "N A M E";
     pub const SEND: &str = "S E N D";

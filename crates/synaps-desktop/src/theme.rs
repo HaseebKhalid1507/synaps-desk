@@ -154,10 +154,10 @@ pub fn plain_name(s: &str) -> Option<&str> {
     ok.then_some(s)
 }
 
-/// A built-in by name; `night_city` finds `night-city`.
+/// A built-in by its exact name (`Theme::builtin`: `night-city`, never
+/// `night_city`).
 pub fn builtin(name: &str) -> Option<(&'static str, Raw)> {
-    let want = name.replace('_', "-");
-    palettes::THEMES.iter().find(|(n, _)| *n == want).copied()
+    palettes::THEMES.iter().find(|(n, _)| *n == name).copied()
 }
 
 /// A TUI theme file: `key = #hex` lines over the default palette; unknown
@@ -183,53 +183,81 @@ pub fn lookup(name: &str, base: Option<&Path>) -> Option<Raw> {
     builtin(name).map(|(_, raw)| raw)
 }
 
-/// `theme = <name>` from a Synaps config (the last one wins, as the TUI's
-/// loader reads them in order); quotes and a trailing `# comment` dropped.
-pub fn config_theme(config: &str) -> Option<String> {
-    config
-        .lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            let (k, v) = l.split_once('=').filter(|_| !l.starts_with('#'))?;
-            (k.trim() == "theme").then(|| v.split(" #").next().unwrap_or(v).trim().trim_matches('"').trim_matches('\'').to_string())
-        })
-        .rfind(|v| !v.is_empty())
+/// What [`synaps_theme`] calls the palette of a `theme` file.
+pub const THEME_FILE: &str = "theme file";
+
+/// The theme a Synaps config names, read as the TUI reads it
+/// (`load_theme_from_config`): the first `theme = <name>` line (trimmed,
+/// `#` lines skipped) whose value, only trimmed, `resolve` finds; no quote
+/// or comment stripping, so `theme = "nord"` names no theme there either.
+/// Also the values it skipped, to report.
+pub fn config_theme(config: &str, resolve: impl Fn(&str) -> Option<Raw>) -> (Option<(String, Raw)>, Vec<String>) {
+    let mut skipped = Vec::new();
+    for line in config.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let Some((_, val)) = line.split_once('=').filter(|(k, _)| k.trim() == "theme") else { continue };
+        let name = val.trim();
+        match resolve(name) {
+            Some(raw) => return (Some((name.to_string(), raw)), skipped),
+            None if !name.is_empty() => {
+                skipped.push(format!("config theme: '{}' is not a theme; skipped", name.chars().take(40).collect::<String>()));
+            }
+            None => {}
+        }
+    }
+    (None, skipped)
 }
 
-/// The Synaps config this desktop's profile reads: `<base>/<profile>/config`
-/// when there is one, else `<base>/config` (agent-core `resolve_read_path`).
-pub fn config_path(base: &Path, profile: Option<&str>) -> PathBuf {
-    profile
-        .filter(|p| plain_name(p).is_some())
-        .map(|p| base.join(p).join("config"))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| base.join("config"))
+/// The file `name` this desktop's profile reads: `<base>/<profile>/<name>`
+/// when there is one, else `<base>/<name>` (agent-core `resolve_read_path`).
+pub fn read_path(base: &Path, profile: Option<&str>, name: &str) -> PathBuf {
+    profile.filter(|p| plain_name(p).is_some()).map(|p| base.join(p).join(name)).filter(|p| p.exists()).unwrap_or_else(|| base.join(name))
 }
 
-/// The first of `flag`, `env`, `settings`, `config` that names a theme;
-/// else nord. Each one that names none is reported.
+/// The theme the Synaps TUI shows for this profile after `$SYNAPS_THEME`,
+/// found as it finds it: a `theme` file (`<base>[/<profile>]/theme`, a
+/// palette over everything else), else [`config_theme`] of the config
+/// (names: `<base>/themes/<name>`, else a built-in). Read when called.
+pub fn synaps_theme(base: &Path, profile: Option<&str>) -> (Option<(String, Raw)>, Vec<String>) {
+    let file = read_path(base, profile, "theme");
+    if file.exists() {
+        return (Some((THEME_FILE.to_string(), parse_theme_file(&std::fs::read_to_string(&file).unwrap_or_default()))), Vec::new());
+    }
+    let config = std::fs::read_to_string(read_path(base, profile, "config")).unwrap_or_default();
+    config_theme(&config, |name| lookup(name, Some(base)))
+}
+
+/// The first of `flag`, `env`, `settings` that names a theme, else the
+/// Synaps config's ([`synaps_theme`]), else nord. Each one that names none
+/// is reported.
 pub fn resolve_theme(
     flag: Option<&str>,
     env: Option<&str>,
     settings: Option<&str>,
-    config: Option<&str>,
+    config: Option<(String, Raw)>,
     base: Option<&Path>,
 ) -> (String, Raw, Source, Vec<String>) {
     let mut warnings = Vec::new();
-    for (v, src, what) in [
-        (flag, Source::Flag, "--theme"),
-        (env, Source::Env, ENV_THEME),
-        (settings, Source::Settings, "settings theme"),
-        (config, Source::Config, "config theme"),
-    ] {
+    for (v, src, what) in [(flag, Source::Flag, "--theme"), (env, Source::Env, ENV_THEME), (settings, Source::Settings, "settings theme")] {
         let Some(v) = v else { continue };
         match lookup(v, base) {
-            Some(raw) => return (v.trim().replace('_', "-"), raw, src, warnings),
+            Some(raw) => return (v.trim().to_string(), raw, src, warnings),
             None => warnings.push(format!("{what}: '{}' is not a theme; ignored", v.chars().take(40).collect::<String>())),
         }
     }
+    if let Some((name, raw)) = config {
+        return (name, raw, Source::Config, warnings);
+    }
     let (name, raw) = builtin(DEFAULT_THEME).expect("nord is built in");
     (name.to_string(), raw, Source::Default, warnings)
+}
+
+/// The theme when the desktop follows the Synaps config (no `--theme`, no
+/// saved choice): `$SYNAPS_THEME`, else [`synaps_theme`], else nord.
+pub fn follow_config(env: Option<&str>, base: &Path, profile: Option<&str>) -> (String, Raw, Source, Vec<String>) {
+    let (config, mut skipped) = synaps_theme(base, profile);
+    let (name, raw, src, warnings) = resolve_theme(None, env, None, config, Some(base));
+    skipped.extend(warnings);
+    (name, raw, src, skipped)
 }
 
 /// The first valid of `flag`, `env`, `settings`; else no accent (the
@@ -277,8 +305,8 @@ roles! {
     chrome, canvas, user, code, tool, tool_out, card, raised, hair, edge, add_bg, del_bg,
     // Text on the canvas.
     ink, prose, dim, you, agent, head, th, td, warn, run, ready, cost, err, well_fg,
-    // On the user surface.
-    dim_u,
+    // On the user surface (a user message's markdown, the composer).
+    dim_u, agent_u, head_u, hint,
     // On the code surface.
     code_fg, code_in, kw, string, num, com,
     // On a tool run (and its hover, the result surface).
@@ -391,6 +419,11 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.err = f.text("err", t.error_color, &[canvas, tool, tool_out]);
     r.well_fg = f.text("well_fg", t.code_fg, &[canvas]);
     r.dim_u = f.text("dim_u", t.muted, &[user]);
+    r.agent_u = f.text("agent_u", t.claude_label, &[user]);
+    r.head_u = f.text("head_u", t.heading_color, &[user]);
+    // The kit's placeholder colour, in every input: the composer (user),
+    // find and hex (chrome), NAME (canvas), the secret field (card).
+    r.hint = f.text("hint", t.muted, &[chrome, raised, canvas, user, card]);
     // Code: lifted toward the code text (a dark island on `paper`).
     r.code_fg = f.text("code_fg", t.code_fg, &[code]);
     r.code_in = f.text("code_in", t.code_fg, &[code]);
@@ -434,6 +467,10 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.btn_fill = f.at("btn_fill", btn, ink, &[chrome], TEXT);
     let warn = f.mark("warn_fill", t.warning_color, &[user, card]);
     r.warn_fill = f.at("warn_fill", warn, ink, &[chrome], TEXT);
+    // The final fills still stand off the surfaces they sit on.
+    for (role, c) in [("btn_fill", r.btn_fill), ("warn_fill", r.warn_fill)] {
+        f.log.push(Check { role, from: c, color: c, grounds: vec![user, card], floor: MARK });
+    }
     r.prose_ch = f.text("prose_ch", t.claude_text, &ch);
     r.dim_ch = f.text("dim_ch", t.muted, &ch);
     r.header = f.text("header", t.header_fg, &ch);
@@ -575,7 +612,10 @@ impl Scheme {
         let (roles, _) = resolve(&choice.raw, choice.accent);
         let p = Palette::of(&roles);
         let m = Metrics::at(choice.text);
-        let user_text = text_style(&p, &m, luminance(roles.canvas) < 0.5).with_foreground(p.ink);
+        // A user message's markdown sits on the user surface: its muted,
+        // quoted, link and heading colours are the ones floored there.
+        let on_user = Palette { prose: p.ink, dim: p.dim_u, agent: p.agent_u, head: p.head_u, ..p };
+        let user_text = text_style(&on_user, &m, luminance(roles.canvas) < 0.5);
         Scheme { choice, roles, p, m, user_text }
     }
 }
@@ -739,7 +779,7 @@ fn sync_kit(p: &Palette, r: &Roles, cx: &mut App) {
         c.caret = p.ink;
         c.selection = p.sel;
         c.muted = p.raised;
-        c.muted_foreground = p.dim_ch;
+        c.muted_foreground = p.hint;
         c.secondary = p.raised;
         c.secondary_hover = p.raised;
         c.secondary_active = p.raised;
@@ -818,7 +858,8 @@ pub fn load_theme(path: &Path) -> Option<String> {
     load_settings(path)?.get("theme")?.as_str().map(str::to_string)
 }
 
-pub fn save_theme(path: &Path, name: &str) -> std::io::Result<()> {
+/// Save the picked theme, or `null` to follow the Synaps config again.
+pub fn save_theme(path: &Path, name: Option<&str>) -> std::io::Result<()> {
     save_settings(path, &[("theme", name.into())])
 }
 
@@ -971,6 +1012,10 @@ pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<(
 /// crash); the temporary file never outlives a failure.
 pub fn save_settings(path: &Path, keys: &[(&str, serde_json::Value)]) -> std::io::Result<()> {
     use std::io::Write;
+    // One writer at a time in this process: the theme (UI thread) and the
+    // panels (background) each re-read and merge, so neither write is lost.
+    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = WRITER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let text = std::fs::read_to_string(path).ok();
     let parsed = text.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()).filter(serde_json::Value::is_object);
     if let Some(dir) = path.parent() {
@@ -1059,7 +1104,8 @@ mod tests {
         let nord = builtin("nord").unwrap().1;
         assert_eq!((nord.bg, nord.message_bg, nord.user_bg, nord.code_bg), (0x101216, 0x07080a, 0x16191e, 0x121419));
         assert_eq!((nord.prompt_fg, nord.claude_label, nord.warning_color, nord.tool_input_bg), (0x81a1c1, 0x88c0d0, 0xebcb8b, None));
-        let nc = builtin("night_city").unwrap();
+        assert!(builtin("night_city").is_none(), "exact names, as the TUI");
+        let nc = builtin("night-city").unwrap();
         assert_eq!((nc.0, nc.1.tool_bash, nc.1.prompt_fg), ("night-city", Some(0x6cf07a), 0xff2e88));
         // The default palette sets its tool panels explicitly.
         assert_eq!(palettes::THEMES[0].1.tool_input_bg, Some(0x171c28));
@@ -1142,25 +1188,35 @@ mod tests {
     fn themes_resolve_in_order_and_garbage_falls_through() {
         let (n, _, src, w) = resolve_theme(None, None, None, None, None);
         assert_eq!((n.as_str(), src, w.len()), ("nord", Source::Default, 0));
-        let (n, raw, src, _) = resolve_theme(Some("tokyo_night"), Some("paper"), Some("ocean"), Some("amber"), None);
+        let amber = || Some(("amber".to_string(), builtin("amber").unwrap().1));
+        let (n, raw, src, _) = resolve_theme(Some(" tokyo-night"), Some("paper"), Some("ocean"), amber(), None);
         assert_eq!((n.as_str(), src, raw), ("tokyo-night", Source::Flag, builtin("tokyo-night").unwrap().1));
-        let (n, _, src, w) = resolve_theme(Some("../etc/passwd"), Some("nope"), None, Some("rose-pine"), None);
-        assert_eq!((n.as_str(), src, w.len()), ("rose-pine", Source::Config, 2));
-        assert_eq!(resolve_theme(None, None, Some("catppuccin"), Some("amber"), None).2, Source::Settings);
+        let (n, _, src, w) = resolve_theme(Some("tokyo_night"), Some("paper"), None, None, None);
+        assert_eq!((n.as_str(), src, w.len()), ("paper", Source::Env, 1));
+        let (n, _, src, w) = resolve_theme(Some("../etc/passwd"), Some("nope"), None, amber(), None);
+        assert_eq!((n.as_str(), src, w.len()), ("amber", Source::Config, 2));
+        assert_eq!(resolve_theme(None, None, Some("catppuccin"), amber(), None).2, Source::Settings);
         assert_eq!(resolve_theme(None, Some("dracula"), Some("catppuccin"), None, None).2, Source::Env);
         for bad in ["", ".hidden", "a/b", "x".repeat(65).as_str(), "myx"] {
             assert!(lookup(bad, None).is_none(), "{bad:?}");
         }
     }
 
+    /// Read as the TUI's `load_theme_from_config` reads it: the first
+    /// `theme =` line that names a theme, its value only trimmed.
     #[test]
     fn the_config_names_the_theme() {
-        assert_eq!(config_theme("model = x\ntheme = nord\ntheme_transition = on\n").as_deref(), Some("nord"));
-        assert_eq!(config_theme("theme = \"rose-pine\" # mine\n").as_deref(), Some("rose-pine"));
-        assert_eq!(config_theme("# theme = paper\ntheme=ocean\n").as_deref(), Some("ocean"));
-        assert_eq!(config_theme("theme = a\ntheme = b").as_deref(), Some("b"));
-        assert_eq!(config_theme("theme =\n"), None);
-        assert_eq!(config_theme(""), None);
+        let name = |c: &str| config_theme(c, |n| lookup(n, None)).0.map(|t| t.0);
+        assert_eq!(name("model = x\ntheme = nord\ntheme_transition = on\n").as_deref(), Some("nord"));
+        assert_eq!(name("# theme = paper\ntheme=ocean\n").as_deref(), Some("ocean"));
+        assert_eq!(name("  theme =   rose-pine  \n").as_deref(), Some("rose-pine"));
+        assert_eq!(name("theme = ocean\ntheme = paper").as_deref(), Some("ocean"), "the first that resolves");
+        assert_eq!(name("theme = nope\ntheme = paper").as_deref(), Some("paper"), "a bad one is skipped");
+        assert_eq!(config_theme("theme = nope\ntheme = paper", |n| lookup(n, None)).1.len(), 1, "and reported");
+        // The TUI shows `default` for these, so the desktop finds none here.
+        for c in ["theme = \"nord\"", "theme = 'nord'", "theme = nord # mine", "theme=night_city", "theme =", "", "themes = nord"] {
+            assert_eq!(name(c), None, "{c:?}");
+        }
     }
 
     /// `<base>/themes/<name>` wins over the built-in; a profile's config
@@ -1180,13 +1236,25 @@ mod tests {
         assert_eq!((raw.bg, raw.prompt_fg, raw.muted, raw.message_bg), (0x000000, 0xff0000, default.muted, default.message_bg));
         assert_eq!(lookup("tokyo-night", Some(&dir)), builtin("tokyo-night").map(|t| t.1));
         std::fs::write(dir.join("themes").join("custom"), "bg = #010203\n").unwrap();
-        assert_eq!(resolve_theme(None, None, None, Some("custom"), Some(&dir)).1.bg, 0x010203);
-        assert_eq!(config_path(&dir, Some("work")), dir.join("config"));
+        std::fs::write(dir.join("config"), "theme = custom\n").unwrap();
+        assert_eq!(synaps_theme(&dir, None).0.map(|t| (t.0, t.1.bg)), Some(("custom".into(), 0x010203)));
+        let config = |p: Option<&str>| read_path(&dir, p, "config");
+        assert_eq!(config(Some("work")), dir.join("config"));
         std::fs::create_dir_all(dir.join("work")).unwrap();
         std::fs::write(dir.join("work").join("config"), "theme = paper\n").unwrap();
-        assert_eq!(config_path(&dir, Some("work")), dir.join("work").join("config"));
-        assert_eq!(config_path(&dir, Some("../x")), dir.join("config"));
-        assert_eq!(config_path(&dir, None), dir.join("config"));
+        assert_eq!(config(Some("work")), dir.join("work").join("config"));
+        assert_eq!(config(Some("../x")), dir.join("config"));
+        assert_eq!(config(None), dir.join("config"));
+        assert_eq!(synaps_theme(&dir, Some("work")).0.map(|t| t.0), Some("paper".into()));
+        // `$SYNAPS_THEME` first, as in the TUI; then the config.
+        assert_eq!(follow_config(Some("dracula"), &dir, Some("work")).0, "dracula");
+        assert_eq!(follow_config(None, &dir, Some("work")).2, Source::Config);
+        // A `theme` file is a palette over everything in the config.
+        std::fs::write(dir.join("theme"), "bg = #0a0b0c\n").unwrap();
+        let (n, raw, src, _) = follow_config(None, &dir, Some("work"));
+        assert_eq!((n.as_str(), raw.bg, src), (THEME_FILE, 0x0a0b0c, Source::Config));
+        std::fs::write(dir.join("work").join("theme"), "bg = #0d0e0f\n").unwrap();
+        assert_eq!(follow_config(None, &dir, Some("work")).1.bg, 0x0d0e0f, "the profile's own theme file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1240,8 +1308,54 @@ mod tests {
         save_accent(&path, None).unwrap();
         assert_eq!(resolve_accent(None, None, load_accent(&path).as_deref()).0, None);
         assert!(load_panels(&path).rail_collapsed, "other keys kept");
-        save_theme(&path, "catppuccin").unwrap();
+        save_theme(&path, Some("catppuccin")).unwrap();
         assert_eq!(load_theme(&path).as_deref(), Some("catppuccin"));
+        // SYNAPS CONFIG: `null`, which is no saved theme (the config's wins).
+        save_theme(&path, None).unwrap();
+        assert_eq!(load_theme(&path), None);
+        assert_eq!(load_settings(&path).unwrap()["theme"], serde_json::Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The theme (UI thread) and the panels (background) save at the same
+    /// time: each merges its keys into what the other wrote, none is lost.
+    #[test]
+    fn concurrent_saves_lose_no_key() {
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-race-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let writers: Vec<_> = (0..8)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20 {
+                        save_settings(
+                            &path,
+                            &[(
+                                [
+                                    "theme",
+                                    "accent",
+                                    "rail_collapsed",
+                                    "right_collapsed",
+                                    "rail_width",
+                                    "right_width",
+                                    "history_open",
+                                    "text_size",
+                                ][w],
+                                i.into(),
+                            )],
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let v = load_settings(&path).unwrap();
+        assert_eq!(v.as_object().map(|o| o.len()), Some(8), "{v}");
+        assert!(v.as_object().unwrap().values().all(|x| x == 19), "{v}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

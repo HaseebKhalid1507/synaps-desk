@@ -39,6 +39,10 @@ pub(crate) struct RowCache {
     pub(crate) result: SharedString,
     pub(crate) result_more: usize,
     pub(crate) preview: Option<Arc<Preview>>,
+    /// A file tool's committed counts (the ledger's: `None` until it
+    /// succeeded), and as shown.
+    pub(crate) delta: Option<files::CallDelta>,
+    pub(crate) counts: turns::Counts,
 }
 
 /// Result lines an open tool row shows.
@@ -62,20 +66,22 @@ actions!(synaps_desktop, [ToggleRail, ToggleRight, TextBigger, TextSmaller, Text
 pub fn bind_keys(cx: &mut App) {
     let mac = cfg!(target_os = "macos");
     let (rail, right) = panel_keys(mac);
-    let [bigger, plus, smaller, reset] = text_keys(mac);
+    let [bigger, plus, shift_eq, smaller, reset] = text_keys(mac);
     cx.bind_keys([
         KeyBinding::new(rail, ToggleRail, None),
         KeyBinding::new(right, ToggleRight, None),
         KeyBinding::new(bigger, TextBigger, None),
         KeyBinding::new(plus, TextBigger, None),
+        KeyBinding::new(shift_eq, TextBigger, None),
         KeyBinding::new(smaller, TextSmaller, None),
         KeyBinding::new(reset, TextReset, None),
     ]);
 }
 
-/// The text size keys (`=` and `+`, the same key on most layouts).
-const fn text_keys(mac: bool) -> [&'static str; 4] {
-    if mac { ["cmd-=", "cmd-+", "cmd--", "cmd-0"] } else { ["ctrl-=", "ctrl-+", "ctrl--", "ctrl-0"] }
+/// The text size keys: `=`, `+` (its own key on DE and Nordic layouts)
+/// and Shift+`=` (US `+`, as some backends report it).
+const fn text_keys(mac: bool) -> [&'static str; 5] {
+    if mac { ["cmd-=", "cmd-+", "cmd-shift-=", "cmd--", "cmd-0"] } else { ["ctrl-=", "ctrl-+", "ctrl-shift-=", "ctrl--", "ctrl-0"] }
 }
 
 /// The fold keys (`KeyBinding::new` does not resolve `secondary-`, and
@@ -318,8 +324,9 @@ const SAVE_DELAY: Duration = Duration::from_millis(400);
 const READOUT_DELAY: Duration = Duration::from_millis(400);
 
 /// `inner` in the centre pane's column ([`Layout::column`], centred).
+/// `inner` on the centre column, at the list's own (whole-pixel) padding.
 pub(crate) fn column(lay: Layout, inner: impl IntoElement) -> Div {
-    h_flex().w_full().justify_center().child(div().flex_none().w(px(lay.column)).min_w_0().child(inner))
+    h_flex().w_full().pl(px(lay.left)).child(div().flex_none().w(px(lay.column)).min_w_0().child(inner))
 }
 
 /// The prompt the authorization card shows.
@@ -423,6 +430,10 @@ pub struct AppView {
     /// The transcript's `busy` at the last [`Self::sync_list`]: when it
     /// falls, the last run may fold.
     synced_busy: bool,
+    /// The files ledger's generation the rows' counts are from.
+    files_gen: u64,
+    /// The session the rows are of.
+    rows_session: Option<String>,
     /// The last call still unfinished: the one a prompt waits on.
     pub(crate) waiting_on: Option<u64>,
     /// The centre pane's column at the last frame.
@@ -463,6 +474,8 @@ pub struct AppView {
     fold_keys: FoldKeys,
     /// The window's width at the last frame (what a fold acts on).
     pub(crate) width: f32,
+    /// Its height (the picker fits under it).
+    pub(crate) height: f32,
     pub picker_open: bool,
     pub(crate) picker_note: Option<SharedString>,
     /// Where the mouse-down that closed the picker from outside was: the
@@ -473,6 +486,12 @@ pub struct AppView {
     /// over the picker's file).
     pub accent_source: theme::Source,
     pub theme_source: theme::Source,
+    /// No theme is picked: the Synaps config's is shown (the picker's
+    /// SYNAPS CONFIG entry), read again from the profile's config.
+    pub theme_follows_config: bool,
+    pub theme_profile: Option<String>,
+    /// What following the config shows now (read when the picker opens).
+    pub(crate) config_theme: SharedString,
     /// The authorization card's prompt (see [`PromptCard`]).
     card: Option<PromptCard>,
     /// The running dot's step, and the 2 Hz timer while a turn runs.
@@ -650,6 +669,8 @@ impl AppView {
             toggled: HashSet::new(),
             open_runs: HashSet::new(),
             synced_busy: false,
+            files_gen: 0,
+            rows_session: None,
             waiting_on: None,
             layout: Layout::of(800., &Metrics::at(theme::DEFAULT_TEXT)),
             composer: i.composer,
@@ -672,11 +693,15 @@ impl AppView {
             drag: None,
             fold_keys: FoldKeys::default(),
             width: 0.,
+            height: 0.,
             picker_open: false,
             picker_note: None,
             picker_dismissed: None,
             accent_source: theme::Source::Default,
             theme_source: theme::Source::Default,
+            theme_follows_config: true,
+            theme_profile: None,
+            config_theme: SharedString::default(),
             card: None,
             rail: Default::default(),
             focus: i.focus,
@@ -1043,6 +1068,7 @@ impl AppView {
     pub(crate) fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.picker_open = true;
         self.picker_note = None;
+        self.config_theme = self.config_choice().0.into();
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -1074,16 +1100,40 @@ impl AppView {
     pub(crate) fn set_theme(&mut self, name: &'static str, cx: &mut Context<Self>) {
         let base = synaps_client::discovery::base_dir();
         let Some(raw) = theme::lookup(name, Some(&base)) else { return };
+        self.show_theme(name.to_string(), raw, Some(name), cx);
+    }
+
+    /// SYNAPS CONFIG: no picked theme any more (`"theme": null`); the
+    /// theme the TUI's config names, read now, as at launch.
+    pub(crate) fn follow_config(&mut self, cx: &mut Context<Self>) {
+        let (name, raw) = self.config_choice();
+        self.config_theme = name.clone().into();
+        self.show_theme(name, raw, None, cx);
+    }
+
+    /// What following the Synaps config shows: `$SYNAPS_THEME`, else the
+    /// profile's `theme` file or `theme =` line, else nord.
+    pub(crate) fn config_choice(&self) -> (String, crate::palettes::Raw) {
+        let env = std::env::var(theme::ENV_THEME).ok();
+        let base = synaps_client::discovery::base_dir();
+        let (name, raw, _, _) = theme::follow_config(env.as_deref(), &base, self.theme_profile.as_deref());
+        (name, raw)
+    }
+
+    /// Repaint with a theme and save the choice (`saved`: `None` follows
+    /// the config).
+    fn show_theme(&mut self, name: String, raw: crate::palettes::Raw, saved: Option<&str>, cx: &mut Context<Self>) {
         theme::update(cx, |c| {
-            c.theme = name.to_string();
+            c.theme = name;
             c.raw = raw;
         });
+        self.theme_follows_config = saved.is_none();
         let overridden = match self.theme_source {
             theme::Source::Flag => " (the next launch's --theme wins over it)".to_string(),
-            theme::Source::Env => format!(" (${} wins over it at the next launch)", theme::ENV_THEME),
+            theme::Source::Env if saved.is_some() => format!(" (${} wins over it at the next launch)", theme::ENV_THEME),
             _ => String::new(),
         };
-        self.picker_note = Some(saved_note(theme::settings_path().map(|path| (theme::save_theme(&path, name), path)), &overridden));
+        self.picker_note = Some(saved_note(theme::settings_path().map(|path| (theme::save_theme(&path, saved), path)), &overridden));
         cx.notify();
     }
 
@@ -1259,11 +1309,18 @@ impl AppView {
                 debug_assert!(self.rows.iter().zip(items).all(|(r, i)| r.id == i.id && r.rev == i.rev));
                 if sp.start == 0 {
                     self.summaries.clear();
+                    // Another session: what was unfolded there means nothing here.
+                    let session = self.model.active.as_ref().map(|a| a.session_id.clone());
+                    if session != self.rows_session {
+                        self.rows_session = session;
+                        self.toggled.clear();
+                        self.open_runs.clear();
+                    }
                 }
                 sp.start
             }
             None if busy != self.synced_busy => items.len(),
-            None => return,
+            None => return self.sync_counts(),
         };
         self.waiting_on = items
             .iter()
@@ -1274,6 +1331,45 @@ impl AppView {
         let start = turns::turn_start(items, from);
         self.synced_busy = busy;
         self.rebuild_from(start);
+        self.sync_counts();
+    }
+
+    /// The files ledger committed a call since the rows were built (its
+    /// result comes with the history, not with the item's status): the
+    /// file tools' counts, and the summaries that sum them, follow it.
+    fn sync_counts(&mut self) {
+        let ledger = &self.model.stats.files;
+        if ledger.generation() == self.files_gen {
+            return;
+        }
+        self.files_gen = ledger.generation();
+        let items = self.model.transcript.items();
+        let mut changed = false;
+        for (row, item) in self.rows.iter_mut().zip(items) {
+            let Some(t) = item.tool.as_ref().filter(|t| files::is_file_tool(&t.name)) else { continue };
+            let d = ledger.delta(&t.tool_id);
+            if d != row.delta {
+                row.delta = d;
+                row.counts = turns::Counts::of(d.unwrap_or_default());
+                changed = true;
+            }
+        }
+        if changed {
+            self.summaries.clear();
+            self.summaries.update(&self.disp, items, &self.rows);
+        }
+    }
+
+    /// Start the list over on a new transcript (the bench's scenarios): no
+    /// row, height or fold of the old one survives.
+    pub(crate) fn reset_transcript(&mut self) {
+        self.model.transcript = synaps_client::Transcript::new();
+        self.rows.clear();
+        self.disp.clear();
+        self.summaries.clear();
+        self.toggled.clear();
+        self.open_runs.clear();
+        self.list.reset(0);
     }
 
     /// Display rows from item `start` (a turn's start) on.
@@ -1286,7 +1382,8 @@ impl AppView {
             self.list.splice(at + range.start..at + range.end, count);
             self.disp.splice(at + range.start..at + range.end, new[range.start..range.start + count].iter().copied());
         }
-        debug_assert_eq!(self.disp, turns::build(items, 0, self.model.transcript.busy(), &self.open_runs));
+        // A full build per sync: bounded, so long sessions stay usable in dev builds.
+        debug_assert!(items.len() > 2_000 || self.disp == turns::build(items, 0, self.model.transcript.busy(), &self.open_runs));
     }
 
     /// Open by default: a file tool's diff when it is short (unless the
@@ -1314,6 +1411,9 @@ impl AppView {
     /// Fold or unfold a finished run (by its first item's id); the user's
     /// choice sticks.
     pub(crate) fn toggle_run(&mut self, id: u64) {
+        // Events may have landed since the last frame: the rows catch up
+        // first, so the rebuild below never runs ahead of them.
+        self.sync_list();
         if !self.open_runs.remove(&id) {
             self.open_runs.insert(id);
         }
@@ -1379,7 +1479,11 @@ impl AppView {
             .items_center()
             .when_some(state, |d, (st, word, color)| {
                 let g = match st {
-                    crate::rail::State::NeedsYou => crate::chrome::glyph(st, p)
+                    // The rail's glyph, in the canvas's colour.
+                    crate::rail::State::NeedsYou => div()
+                        .relative()
+                        .size(px(10.))
+                        .flex_none()
                         .child(div().absolute().inset_0().border_1().border_color(p.warn_mark))
                         .child(div().absolute().top(px(3.)).left(px(3.)).size(px(4.)).bg(p.warn_mark)),
                     crate::rail::State::Running => div().size(px(8.)).m(px(1.)).bg(p.run_mark),
@@ -1715,13 +1819,19 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger) -> RowCache {
         result: SharedString::default(),
         result_more: 0,
         preview: None,
+        delta: None,
+        counts: turns::Counts::default(),
     };
     match item.kind {
         ItemKind::Tool => {
             let Some(t) = item.tool.as_ref() else { return r };
             r.name = t.name.clone().into();
             r.hue = turns::Hue::of(&t.name);
-            r.preview = files::is_file_tool(&t.name).then(|| ledger.preview(&t.tool_id)).flatten();
+            if files::is_file_tool(&t.name) {
+                r.preview = ledger.preview(&t.tool_id);
+                r.delta = ledger.delta(&t.tool_id);
+                r.counts = turns::Counts::of(r.delta.unwrap_or_default());
+            }
             r.arg = match &r.preview {
                 Some(pv) if !pv.title.is_empty() => pv.title.clone().into(),
                 _ => one_line(&t.input, 200).into(),
@@ -1792,6 +1902,7 @@ impl Render for AppView {
         // Wide windows widen the side panels; narrow ones fold the open
         // numbers, then the open rail, to strips before the session gives.
         self.width = window.viewport_size().width.into();
+        self.height = window.viewport_size().height.into();
         let (rail, right) = sides(self.width, self.panels, crate::chrome::MARK);
         if let Side::Open(w) = rail {
             self.rail_width = w;
@@ -1807,7 +1918,7 @@ impl Render for AppView {
             self.list.remeasure();
         }
         self.layout = lay;
-        let (pad_l, pad_r) = lay.padding(pane);
+        let (pad_l, pad_r) = lay.padding();
         let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_disp(ix, cx)))
             .size_full()
             .pl(px(pad_l))
