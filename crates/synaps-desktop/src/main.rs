@@ -1,7 +1,7 @@
 //! Synaps Desktop (GPUI spike): a thin client for the Synaps daemon.
 //!
 //! ```text
-//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL]
+//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL|FILE]
 //! synaps-desktop --bench [--profile P --prompt TEXT] [--refresh-hz HZ]
 //! synaps-desktop --bench-tabs [--bench-history FILE] [--refresh-hz HZ]
 //! ```
@@ -104,7 +104,15 @@ fn main() {
             "--theme" => theme_flag = Some(value(&mut args, "--theme")),
             "--session" => start_session = Some(value(&mut args, "--session")),
             "--accent-picker" => open_picker = true,
-            "--dash" => dash_flag = Some(value(&mut args, "--dash")),
+            "--dash" => {
+                let v = value(&mut args, "--dash");
+                // A token on a command line is readable by every local user.
+                if dash::flag_has_token(&v) {
+                    eprintln!("{}", dash::FLAG_TOKEN);
+                    std::process::exit(2);
+                }
+                dash_flag = Some(v);
+            }
             "--size" => {
                 let v = value(&mut args, "--size");
                 let parsed = v.split_once('x').and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?)));
@@ -119,7 +127,7 @@ fn main() {
             "-h" | "--help" => {
                 let names: Vec<&str> = palettes::THEMES.iter().map(|t| t.0).collect();
                 println!(
-                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL] [--bench [--prompt TEXT] [--refresh-hz HZ] | --bench-tabs [--bench-history FILE]]\n\
+                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL|FILE] [--bench [--prompt TEXT] [--refresh-hz HZ] | --bench-tabs [--bench-history FILE]]\n\
                      theme: --theme, else ${}, else the picker's settings file ({}), else `theme =` in the Synaps config, else {}\n\
                      themes: {}\n\
                      accent (overrides the theme's \"you\" and focus colours): --accent, else ${}, else the settings file, else none",
@@ -177,19 +185,10 @@ fn main() {
     // No --profile: `$SYNAPS_PROFILE`, else the default daemon (as the TUI).
     let client = if connect {
         let endpoint = match socket {
-            Some(s) => {
-                launch.socket = Some(s.clone());
-                Endpoint::Socket(s)
-            }
-            None => {
-                let e = Endpoint::profile(profile.as_deref());
-                if let Endpoint::Profile(p) = &e {
-                    launch.profile_endpoint = Some(p.clone());
-                }
-                e
-            }
+            Some(s) => Endpoint::Socket(s),
+            None => Endpoint::profile(profile.as_deref()),
         };
-        launch.resolved = Some(endpoint.resolve());
+        launch.endpoint = Some(endpoint.clone());
         if !bench {
             tabs_key = Some(format!("socket:{}", canonical_socket(&endpoint.resolve()).display()));
             // What builds before this one keyed them by (read once).
@@ -259,6 +258,7 @@ fn main() {
                 v.config_theme = v.config_choice().0.into();
                 v.app_settings = settings_view::AppSettings::load(theme::settings_path().as_deref());
                 v.usage = usage_view::UsageUi::new(v.app_settings.usage_host.clone(), v.app_settings.usage_range);
+                v.dash.socket = launch.endpoint.as_ref().map(|e| e.resolve());
                 v.dash.launch = launch;
                 if !bench {
                     v.start_dash_poll(cx);

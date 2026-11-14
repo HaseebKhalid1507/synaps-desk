@@ -2,7 +2,9 @@
 //! by host (`usage-design/spec.md` sections 3–5). A sticky header (host
 //! and range chips, the refresh age, one line per source), then the
 //! sections on a 12-column grid. Everything shown is laid out once per
-//! load ([`crate::usage::Board`]); the pointer only moves a readout.
+//! load ([`crate::usage::Board`]); the pointer only moves a readout. It
+//! draws in a cached pane ([`crate::views::ViewPane`]), never because the
+//! session behind it streams.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -12,10 +14,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{AppView, Open, display, mono};
-use crate::chart::{self, Ink, Scale, Spot};
+use crate::chart::{self, Ink, Paths, Spot};
 use crate::tabs::Place;
 use crate::theme::Palette;
-use crate::usage::{self, Board, NONE, Range, SpendBy, Stack};
+use crate::usage::{self, Axes, Board, NONE, Range, SpendBy, Stack};
+use crate::views::ViewCx;
 
 const WIDE: f32 = 1180.;
 const GUTTER: f32 = 24.;
@@ -49,7 +52,10 @@ pub(crate) struct UsageUi {
     pub fetched: Option<Instant>,
     pub hover: Option<(Chart, usize)>,
     pub scroll: ScrollHandle,
+    /// A selection made while a load ran: loaded after it.
+    pub queued: bool,
     spots: [Spot; 5],
+    paths: [Paths; 5],
 }
 
 impl UsageUi {
@@ -66,12 +72,25 @@ impl UsageUi {
             fetched: None,
             hover: None,
             scroll: ScrollHandle::new(),
+            queued: false,
             spots: Default::default(),
+            paths: Default::default(),
         }
     }
 
     fn spot(&self, c: Chart) -> Spot {
         self.spots[c as usize].clone()
+    }
+
+    fn paths(&self, c: Chart) -> Paths {
+        self.paths[c as usize].clone()
+    }
+
+    /// A new board: the line paths are built again at its first paint.
+    pub fn clear_paths(&mut self) {
+        for p in &self.paths {
+            p.borrow_mut().take();
+        }
     }
 }
 
@@ -95,16 +114,12 @@ fn ink(p: &Palette) -> Ink {
     Ink { series: [p.s1, p.s2, p.s3, p.s4, p.s5, p.s_rest], grid: p.hair, rule: p.dim, hover: p.hair.opacity(0.6) }
 }
 
-/// Grid lines at the y ticks, as 0..1 of the plot.
-fn tick_fracs(ticks: &[(f64, String)], scale: Scale) -> Vec<f32> {
-    ticks.iter().map(|(v, _)| scale.at(*v)).collect()
-}
-
 impl AppView {
     fn usage_chip(&mut self, host: Option<String>, cx: &mut Context<Self>) {
         if self.usage.host != host {
             self.usage.host = host;
             self.usage_load(cx);
+            self.views_changed(cx);
         }
     }
 
@@ -112,6 +127,7 @@ impl AppView {
         if self.usage.range != r {
             self.usage.range = r;
             self.usage_load(cx);
+            self.views_changed(cx);
         }
     }
 
@@ -119,40 +135,24 @@ impl AppView {
         let h = ix.map(|i| (c, i));
         if self.usage.hover != h && (h.is_some() || self.usage.hover.is_some_and(|x| x.0 == c)) {
             self.usage.hover = h;
-            cx.notify();
+            self.views_changed(cx);
         }
     }
 
-    /// A plot with its y labels, x labels and the pointer's day.
+    /// A plot with its y labels, x labels (both from the load's [`Axes`])
+    /// and the pointer's day.
     #[allow(clippy::too_many_arguments)]
-    fn plot(
-        &self,
-        c: Chart,
-        s: &Arc<Stack>,
-        height: f32,
-        scale: Scale,
-        yfmt: fn(f64) -> String,
-        body: AnyElement,
-        p: &Palette,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let ticks = match scale {
-            Scale::Linear(lo, hi) if lo > 0. => {
-                let step = (hi - lo) / 2.;
-                vec![(lo, yfmt(lo)), (lo + step, yfmt(lo + step)), (hi, yfmt(hi))]
-            }
-            Scale::Linear(_, hi) => usage::y_ticks(hi, yfmt),
-            Scale::Log(lo, hi) => usage::log_ticks(lo, hi, yfmt),
-        };
+    fn plot(&self, c: Chart, s: &Arc<Stack>, height: f32, axes: &Axes, body: AnyElement, p: &Palette, cx: &ViewCx) -> AnyElement {
+        let scale = axes.scale;
         let mut ylab = div().relative().w(px(Y_AXIS)).h(px(height)).flex_none();
-        for (v, l) in &ticks {
+        for (v, l) in &axes.y {
             let top = height * (1. - scale.at(*v)) - 10.;
             ylab = ylab.child(mono(l.clone(), 12., p.dim).absolute().right(px(8.)).top(px(top.max(-4.))));
         }
         let n = s.days.len().max(1);
         let mut xlab = div().relative().h(px(20.)).ml(px(Y_AXIS)).flex_1();
-        for (i, l) in usage::x_ticks(&s.days) {
-            xlab = xlab.child(mono(l, 12., p.dim).absolute().top(px(4.)).left(relative(i as f32 / n as f32)));
+        for (i, l) in &axes.x {
+            xlab = xlab.child(mono(l.clone(), 12., p.dim).absolute().top(px(4.)).left(relative(*i as f32 / n as f32)));
         }
         let (stack, spot) = (s.clone(), self.usage.spot(c));
         let area = div()
@@ -175,17 +175,17 @@ impl AppView {
     }
 
     /// The row above a plot: the hovered day and each series' value, or with
-    /// no hover the range totals (`latest`: each series' last known day,
-    /// for values that do not add up). It is also the legend.
-    fn readout(&self, c: Chart, s: &Stack, fmt: fn(f64) -> String, total_label: &str, latest: bool, p: &Palette) -> AnyElement {
+    /// no hover each line's label (the range total, or for values that do
+    /// not add up its last known day: formatted once per load). It is also
+    /// the legend; `extra`: what the hovered day adds (a release).
+    fn readout(&self, c: Chart, s: &Stack, fmt: fn(f64) -> String, total_label: &str, extra: Option<&str>, p: &Palette) -> AnyElement {
         let day = self.usage.hover.filter(|h| h.0 == c).map(|h| h.1).filter(|&i| i < s.days.len());
         let mut row = h_flex().flex_wrap().gap_x(px(18.)).gap_y(px(4.)).items_center().min_h(px(20.));
         row = row.child(mono(day.map(|i| usage::day_label(&s.days[i])).unwrap_or_else(|| total_label.to_string()), 12.5, p.ink));
         for l in &s.series {
             let v = match day {
                 Some(i) => l.values[i].map(fmt).unwrap_or_else(|| NONE.into()),
-                None if latest => l.values.iter().rev().flatten().next().copied().map(fmt).unwrap_or_else(|| NONE.into()),
-                None => fmt(l.total),
+                None => l.label.clone(),
             };
             row = row.child(
                 h_flex()
@@ -196,11 +196,14 @@ impl AppView {
                     .child(mono(v, 12.5, p.prose)),
             );
         }
+        if let Some(e) = extra.filter(|_| day.is_some()) {
+            row = row.child(mono(e.to_string(), 12.5, p.dim));
+        }
         row.into_any_element()
     }
 
     /// The Usage view, `pane` px wide.
-    pub(crate) fn render_usage(&self, pane: f32, p: &Palette, cx: &Context<Self>) -> AnyElement {
+    pub(crate) fn render_usage(&self, pane: f32, p: &Palette, cx: &ViewCx) -> AnyElement {
         let w = (pane - 48.).clamp(320., WIDE);
         let left = ((pane - w) / 2.).max(24.);
         let narrow = pane < NARROW;
@@ -224,7 +227,7 @@ impl AppView {
         v_flex().size_full().bg(p.canvas).child(header).child(scroll).into_any_element()
     }
 
-    fn usage_header(&self, left: f32, w: f32, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+    fn usage_header(&self, left: f32, w: f32, p: &Palette, cx: &ViewCx) -> impl IntoElement {
         let chip = |id: (&'static str, usize), label: SharedString, on: bool| {
             div()
                 .id(id)
@@ -304,7 +307,7 @@ impl AppView {
         )
     }
 
-    fn usage_body(&self, b: &Board, w: f32, span: &dyn Fn(f32) -> f32, narrow: bool, p: &Palette, cx: &Context<Self>) -> AnyElement {
+    fn usage_body(&self, b: &Board, w: f32, span: &dyn Fn(f32) -> f32, narrow: bool, p: &Palette, cx: &ViewCx) -> AnyElement {
         let ink = ink(p);
         let money = |v: f64| usage::money(v);
         let mut out = v_flex().w(px(w));
@@ -322,11 +325,12 @@ impl AppView {
         }
         out = out.child(cells).child(note(b.notes.headline.clone(), p));
         // 4.2 Spend over time.
-        let s = &b.spend[match self.usage.by {
+        let by = match self.usage.by {
             SpendBy::Host => 0,
             SpendBy::Model => 1,
             SpendBy::Role => 2,
-        }];
+        };
+        let (s, axes) = (&b.spend[by], &b.spend_axes[by]);
         let mut switch = h_flex().gap(px(14.)).items_baseline();
         for (i, by) in SpendBy::ALL.into_iter().enumerate() {
             let on = self.usage.by == by;
@@ -341,39 +345,35 @@ impl AppView {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.usage.by = by;
                         this.usage.hover = None;
-                        cx.notify();
+                        this.views_changed(cx);
                     })),
             );
         }
-        let scale = Scale::Linear(0., s.max);
-        let yt = usage::y_ticks(s.max, money);
         let hover = self.usage.hover.filter(|h| h.0 == Chart::Spend).map(|h| h.1);
-        let bars = chart::bars(s.clone(), ink, tick_fracs(&yt, scale), hover, b.request_ix, self.usage.spot(Chart::Spend));
+        let bars = chart::bars(s.clone(), ink, axes.fracs(), hover, b.request_ix[by], self.usage.spot(Chart::Spend));
         let range_label = format!("{} total", b.range.label());
         out = out.child(
             v_flex()
                 .pt(px(SECTION))
                 .gap(px(10.))
                 .child(h_flex().gap(px(24.)).items_baseline().child(title("S P E N D   O V E R   T I M E", p)).child(switch))
-                .child(self.readout(Chart::Spend, s, money, &range_label, false, p))
-                .child(self.plot(Chart::Spend, s, 220., scale, money, bars.into_any_element(), p, cx))
-                .when(b.request_ix.is_some(), |d| d.child(mono("┊ request-level from here (dotted rule)", 12., p.dim)))
+                .child(self.readout(Chart::Spend, s, money, &range_label, None, p))
+                .child(self.plot(Chart::Spend, s, 220., axes, bars.into_any_element(), p, cx))
+                .when(b.request_ix[by].is_some(), |d| d.child(mono("┊ request-level from here (dotted rule)", 12., p.dim)))
                 .child(note(b.notes.spend.clone(), p)),
         );
         // 4.3 Prompt tokens per day (12 columns until the store has output per day).
         let pt = &b.prompt;
-        let scale = Scale::Linear(0., pt.max);
         let tok = |v: f64| usage::tokens(v as u64);
-        let yt = usage::y_ticks(pt.max, tok);
         let hover = self.usage.hover.filter(|h| h.0 == Chart::Prompt).map(|h| h.1);
-        let bars = chart::bars(pt.clone(), ink, tick_fracs(&yt, scale), hover, None, self.usage.spot(Chart::Prompt));
+        let bars = chart::bars(pt.clone(), ink, b.prompt_axes.fracs(), hover, None, self.usage.spot(Chart::Prompt));
         out = out.child(
             v_flex()
                 .pt(px(SECTION))
                 .gap(px(10.))
                 .child(title("P R O M P T   T O K E N S   /   D A Y", p))
-                .child(self.readout(Chart::Prompt, pt, tok, &range_label, false, p))
-                .child(self.plot(Chart::Prompt, pt, 140., scale, tok, bars.into_any_element(), p, cx))
+                .child(self.readout(Chart::Prompt, pt, tok, &range_label, None, p))
+                .child(self.plot(Chart::Prompt, pt, 140., &b.prompt_axes, bars.into_any_element(), p, cx))
                 .child(note(b.notes.tokens.clone(), p)),
         );
         // 4.4 Models and roles.
@@ -439,20 +439,21 @@ impl AppView {
         );
         // 4.5 Cache.
         let hit = &b.hit;
-        let hscale = Scale::Linear(50., 100.);
-        let pctf = |v: f64| format!("{v:.0} %");
         let hover = self.usage.hover.filter(|h| h.0 == Chart::Hit).map(|h| h.1);
         let lines = chart::lines(
             hit.clone(),
-            hscale,
+            b.hit_axes.scale,
             ink,
-            vec![0., 0.5, 1.],
+            b.hit_axes.fracs(),
             vec![false],
             b.legacy_until,
             b.releases.iter().map(|r| r.0).collect(),
             hover,
             self.usage.spot(Chart::Hit),
+            self.usage.paths(Chart::Hit),
         );
+        // The hovered day's release, if it has one (its tick's tag).
+        let release = hover.and_then(|h| b.releases.iter().find(|r| r.0 == h)).map(|r| format!("release {}", r.1));
         let hit_total = b.cells.get(4).map(|c| c.number.clone()).unwrap_or_default();
         let kv = |k: &'static str, v: String| {
             h_flex().h(px(22.)).gap(px(12.)).child(mono(k, 12., p.dim).w(px(110.))).child(mono(v, 12.5, p.prose))
@@ -492,8 +493,27 @@ impl AppView {
         let hit_plot = v_flex()
             .w(px(span(8.)))
             .gap(px(10.))
-            .child(self.readout(Chart::Hit, hit, |v| format!("{v:.1} %"), &format!("{} · {hit_total}", b.range.label()), false, p))
-            .child(self.plot(Chart::Hit, hit, 140., hscale, pctf, lines.into_any_element(), p, cx))
+            .child(self.readout(
+                Chart::Hit,
+                hit,
+                |v| format!("{v:.1} %"),
+                &format!("{} · {hit_total}", b.range.label()),
+                release.as_deref(),
+                p,
+            ))
+            .child(self.plot(Chart::Hit, hit, 140., &b.hit_axes, lines.into_any_element(), p, cx))
+            .when(b.hit_below > 0, |d| {
+                d.child(mono(
+                    format!(
+                        "{} {} under {:.0} %: drawn at the floor",
+                        b.hit_below,
+                        if b.hit_below == 1 { "day" } else { "days" },
+                        usage::HIT_FLOOR
+                    ),
+                    12.,
+                    p.dim,
+                ))
+            })
             .when(!b.releases.is_empty(), |d| {
                 d.child(
                     mono(format!("ticks: releases {}", b.releases.iter().map(|r| r.1.as_str()).collect::<Vec<_>>().join(", ")), 12., p.dim)
@@ -511,33 +531,36 @@ impl AppView {
                 .child(note(b.notes.cache.clone(), p)),
         );
         // 4.6 Latency.
-        let lat = |c: Chart, s: &Arc<Stack>, label: &'static str| {
-            let sc = Scale::log_of(s);
+        let lat = |c: Chart, s: &Arc<Stack>, axes: &Axes, label: &'static str| {
             let hover = self.usage.hover.filter(|h| h.0 == c).map(|h| h.1);
-            let (lo, hi) = match sc {
-                Scale::Log(lo, hi) => (lo, hi),
-                Scale::Linear(lo, hi) => (lo, hi),
-            };
-            let yt = usage::log_ticks(lo, hi, usage::secs);
-            let body =
-                chart::lines(s.clone(), sc, ink, tick_fracs(&yt, sc), vec![false, true], None, Vec::new(), hover, self.usage.spot(c));
+            let body = chart::lines(
+                s.clone(),
+                axes.scale,
+                ink,
+                axes.fracs(),
+                vec![false, true],
+                None,
+                Vec::new(),
+                hover,
+                self.usage.spot(c),
+                self.usage.paths(c),
+            );
             v_flex()
                 .w(px(span(6.)))
                 .gap(px(10.))
                 .child(display(label, 12., p.dim))
-                .child(self.readout(c, s, usage::secs, "latest day · p95 thin", true, p))
-                .child(self.plot(c, s, 140., sc, usage::secs, body.into_any_element(), p, cx))
+                .child(self.readout(c, s, usage::secs, "latest day · p95 thin", None, p))
+                .child(self.plot(c, s, 140., axes, body.into_any_element(), p, cx))
         };
-        let (xr, yr) = b.scatter_range;
-        let yt = usage::log_ticks(yr.0, yr.1, usage::secs);
-        let scatter = chart::scatter(b.scatter.clone(), p.s2, p.hair, tick_fracs(&yt, Scale::Log(yr.0, yr.1)));
+        let (xa, ya) = &b.scatter_axes;
+        let scatter = chart::scatter(b.scatter.clone(), p.s2, p.hair, ya.fracs());
         let mut xs = div().relative().h(px(20.)).ml(px(Y_AXIS)).flex_1();
-        for (v, l) in usage::log_ticks(xr.0, xr.1, |v| usage::tokens(v as u64)) {
-            xs = xs.child(mono(l, 12., p.dim).absolute().top(px(4.)).left(relative(Scale::Log(xr.0, xr.1).at(v))));
+        for (v, l) in &xa.y {
+            xs = xs.child(mono(l.clone(), 12., p.dim).absolute().top(px(4.)).left(relative(xa.scale.at(*v))));
         }
         let mut ys = div().relative().w(px(Y_AXIS)).h(px(180.)).flex_none();
-        for (v, l) in &yt {
-            ys = ys.child(mono(l.clone(), 12., p.dim).absolute().right(px(8.)).top(px(180. * (1. - Scale::Log(yr.0, yr.1).at(*v)) - 10.)));
+        for (v, l) in &ya.y {
+            ys = ys.child(mono(l.clone(), 12., p.dim).absolute().right(px(8.)).top(px(180. * (1. - ya.scale.at(*v)) - 10.)));
         }
         out = out.child(
             v_flex()
@@ -549,8 +572,8 @@ impl AppView {
                         .flex_wrap()
                         .gap(px(GUTTER))
                         .items_start()
-                        .child(lat(Chart::Ttft, &b.ttft, "T I M E   T O   F I R S T   T O K E N"))
-                        .child(lat(Chart::Total, &b.total, "T O T A L")),
+                        .child(lat(Chart::Ttft, &b.ttft, &b.ttft_axes, "T I M E   T O   F I R S T   T O K E N"))
+                        .child(lat(Chart::Total, &b.total, &b.total_axes, "T O T A L")),
                 )
                 .child(mono(b.split.clone(), 12.5, p.prose).mt(px(6.)).whitespace_normal())
                 .child(display("T O T A L   T I M E   B Y   C O N T E X T   S I Z E", 12., p.dim).mt(px(16.)))

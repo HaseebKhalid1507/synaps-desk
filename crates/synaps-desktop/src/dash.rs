@@ -3,31 +3,39 @@
 //! change (`usage-design/spec.md` section 6).
 //!
 //! Where it is: a local daemon's dash writes `<run_dir>/synaps-dash[-<profile>].url`
-//! (0600, same user); a remote one is named by `--dash URL`, else
-//! `$SYNAPS_DASH_URL`, else the settings file's `dash_url`. The URL carries
-//! the token (`?token=…`), which is new at every daemon start; it is sent
-//! as the `synaps_dash` cookie, never written, logged or shown.
+//! (0600, same user); a remote one is named by `--dash URL|FILE`, else
+//! `$SYNAPS_DASH_URL`, else the settings file's `dash_url`.
 //!
-//! Requests are plain HTTP/1.1 to loopback (`Connection: close`), blocking:
-//! callers run them on a background thread. A `POST` also sends
-//! `Origin: http://<Host>`, which the dash checks. No TLS and no client
-//! crate: the dash only listens on 127.0.0.1, and a forwarded port is
-//! loopback too.
+//! The token (`?token=…`, new at every daemon start) gates the dash's config
+//! writes and its `/ws` bridge (running agents, answering their prompts), so
+//! it is taken only from places other local users cannot read: a URL file,
+//! `$SYNAPS_DASH_URL`, or a URL pasted into `dash_url` (kept for this run,
+//! saved without it). Never from the command line (`/proc/<pid>/cmdline` is
+//! world-readable): `--dash` takes a URL without one, or a URL file. It is
+//! sent as the `synaps_dash` cookie, never written, logged or shown.
+//!
+//! Requests are plain HTTP/1.1 to loopback only (`Connection: close`),
+//! blocking, each with a deadline: callers run them on a background thread.
+//! A `POST` also sends `Origin: http://<Host>`, which the dash checks. No TLS
+//! and no client crate: the dash only listens on 127.0.0.1, a remote one is
+//! reached through a forwarded port, and any other host is refused (the
+//! cookie would cross the network in the clear).
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 /// The URL variable a launcher sets for a remote daemon's dash.
 pub const ENV_DASH: &str = "SYNAPS_DASH_URL";
 const CONNECT: Duration = Duration::from_secs(2);
-const IO: Duration = Duration::from_secs(20);
+/// One request's whole time: connect, send, read to the end.
+pub const REQUEST: Duration = Duration::from_secs(10);
 /// A reply larger than this is refused (the largest, `latency` over all
 /// time, is about 60 KB).
-const MAX_REPLY: usize = 16 << 20;
+const MAX_REPLY: usize = 2 << 20;
 
 /// A dash: host, port and token. `Debug` never prints the token.
 #[derive(Clone, PartialEq, Eq)]
@@ -61,6 +69,11 @@ impl Target {
         if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':')) {
             return Err(format!("bad host in {}", strip_token(url)));
         }
+        if !loopback(host) {
+            return Err(format!(
+                "{host} is not loopback: synaps-dash is reached on 127.0.0.1 only (forward its port: ssh -L 7717:127.0.0.1:7717)"
+            ));
+        }
         let token = tail
             .split_once('?')
             .map(|(_, q)| q)
@@ -87,6 +100,34 @@ impl Target {
     pub fn has_token(&self) -> bool {
         !self.token.is_empty()
     }
+}
+
+/// `localhost`, 127.0.0.0/8 or `::1`.
+pub fn loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// `--dash`'s value: a URL without a token, or a file holding the dash's
+/// URL (as its own URL file does). A token on the command line is refused.
+pub fn flag_target(v: &str) -> Result<Target, String> {
+    let path = Path::new(v.trim());
+    if path.is_file() {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("--dash {}: {e}", path.display()))?;
+        return Target::parse(text.lines().next().unwrap_or(""));
+    }
+    if flag_has_token(v) {
+        return Err(FLAG_TOKEN.into());
+    }
+    Target::parse(v)
+}
+
+/// Why `--dash` takes no token (said at startup and in Settings).
+pub const FLAG_TOKEN: &str =
+    "--dash takes no token (any local user can read a command line): pass the dash's URL file (--dash FILE) or set $SYNAPS_DASH_URL";
+
+/// A `--dash` value carries `token=` (refused before anything starts).
+pub fn flag_has_token(v: &str) -> bool {
+    !Path::new(v.trim()).is_file() && v.contains("token=")
 }
 
 /// A URL as it may be shown or saved: its query (the token) dropped.
@@ -125,7 +166,8 @@ pub fn url_file(run_dir: &Path, profile: Option<&str>) -> PathBuf {
 
 /// Where to find the dash. Local daemon: `--dash`, else its URL file.
 /// Remote: `--dash`, else `$SYNAPS_DASH_URL`, else `dash_url`. `Err`: a URL
-/// was given and is not one (said in Settings).
+/// was given and is not one (said in Settings). Only a [`Source::UrlFile`]
+/// dash can ever write config: `--dash` and the rest are read-only.
 pub fn discover(
     local: bool,
     run_dir: &Path,
@@ -138,7 +180,7 @@ pub fn discover(
         v.map(str::trim).filter(|v| !v.is_empty())
     }
     if let Some(u) = given(flag) {
-        return Some(Target::parse(u).map(|t| (t, Source::Flag)));
+        return Some(flag_target(u).map(|t| (t, Source::Flag)));
     }
     if local {
         let path = url_file(run_dir, profile);
@@ -158,6 +200,8 @@ pub enum Fail {
     Unreachable(String),
     /// 401: the daemon restarted and the token with it.
     Token,
+    /// 401 to a URL that carries no token.
+    NoToken,
     /// 503: the telemetry store is still starting (or off).
     Starting(String),
     /// Any other refusal, with the dash's own message.
@@ -171,6 +215,7 @@ impl std::fmt::Display for Fail {
         match self {
             Fail::Unreachable(e) => write!(f, "synaps-dash is not reachable: {e}"),
             Fail::Token => f.write_str("synaps-dash token changed: reconnect"),
+            Fail::NoToken => f.write_str("synaps-dash wants its token and this URL has none"),
             Fail::Starting(m) if m.is_empty() => f.write_str("telemetry is starting"),
             Fail::Starting(m) => f.write_str(m),
             Fail::Http(_, m) => f.write_str(m),
@@ -179,22 +224,33 @@ impl std::fmt::Display for Fail {
     }
 }
 
-/// `GET path` → the body (status 200).
-pub fn get(t: &Target, path: &str) -> Result<String, Fail> {
-    answer(request(t, "GET", path, None).map_err(Fail::Unreachable)?)
+/// `GET path` → the body (status 200), within [`REQUEST`] and by `by`.
+pub fn get(t: &Target, path: &str, by: Option<Instant>) -> Result<String, Fail> {
+    answer(t, request(t, "GET", path, None, deadline(by)).map_err(Fail::Unreachable)?)
 }
 
 /// `POST path` with a JSON body → the body (status 200).
 pub fn post_json(t: &Target, path: &str, body: &str) -> Result<String, Fail> {
-    answer(request(t, "POST", path, Some(body)).map_err(Fail::Unreachable)?)
+    answer(t, request(t, "POST", path, Some(body), deadline(None)).map_err(Fail::Unreachable)?)
 }
 
 /// `get` and decode.
 pub fn get_json<T: serde::de::DeserializeOwned>(t: &Target, path: &str) -> Result<T, Fail> {
-    serde_json::from_str(&get(t, path)?).map_err(|e| Fail::Bad(format!("{path}: {e}")))
+    get_json_by(t, path, None)
 }
 
-fn answer((status, body): (u16, String)) -> Result<String, Fail> {
+/// `get_json` that also ends by `by` (a whole load's deadline).
+pub fn get_json_by<T: serde::de::DeserializeOwned>(t: &Target, path: &str, by: Option<Instant>) -> Result<T, Fail> {
+    serde_json::from_str(&get(t, path, by)?).map_err(|e| Fail::Bad(format!("{path}: {e}")))
+}
+
+/// A request's deadline: [`REQUEST`] from now, or `by` if sooner.
+fn deadline(by: Option<Instant>) -> Instant {
+    let own = Instant::now() + REQUEST;
+    by.map_or(own, |b| b.min(own))
+}
+
+fn answer(t: &Target, (status, body): (u16, String)) -> Result<String, Fail> {
     let said = || {
         serde_json::from_str::<serde_json::Value>(&body)
             .ok()
@@ -203,6 +259,7 @@ fn answer((status, body): (u16, String)) -> Result<String, Fail> {
     };
     match status {
         200 => Ok(body),
+        401 if !t.has_token() => Err(Fail::NoToken),
         401 => Err(Fail::Token),
         503 => Err(Fail::Starting(said())),
         s => {
@@ -212,13 +269,19 @@ fn answer((status, body): (u16, String)) -> Result<String, Fail> {
     }
 }
 
-/// One request on its own connection: `(status, body)`.
-fn request(t: &Target, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String), String> {
-    let addrs: Vec<_> = (t.host.as_str(), t.port).to_socket_addrs().map_err(|e| e.to_string())?.collect();
-    let mut last = format!("{} does not resolve", t.shown());
+/// The time left before `by`, or the error that it is over.
+fn left(by: Instant) -> Result<Duration, String> {
+    by.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or_else(|| "timed out".to_string())
+}
+
+/// One request on its own connection, done by `by`: `(status, body)`.
+/// Only loopback addresses are dialled, whatever the host resolves to.
+fn request(t: &Target, method: &str, path: &str, body: Option<&str>, by: Instant) -> Result<(u16, String), String> {
+    let addrs: Vec<_> = (t.host.as_str(), t.port).to_socket_addrs().map_err(|e| e.to_string())?.filter(|a| a.ip().is_loopback()).collect();
+    let mut last = format!("{} does not resolve to a loopback address", t.shown());
     let mut stream = None;
     for a in addrs {
-        match TcpStream::connect_timeout(&a, CONNECT) {
+        match TcpStream::connect_timeout(&a, CONNECT.min(left(by)?)) {
             Ok(s) => {
                 stream = Some(s);
                 break;
@@ -227,7 +290,7 @@ fn request(t: &Target, method: &str, path: &str, body: Option<&str>) -> Result<(
         }
     }
     let mut s = stream.ok_or(last)?;
-    s.set_read_timeout(Some(IO)).and_then(|_| s.set_write_timeout(Some(IO))).map_err(|e| e.to_string())?;
+    s.set_write_timeout(Some(left(by)?)).map_err(|e| e.to_string())?;
     let authority = if t.host.contains(':') { format!("[{}]:{}", t.host, t.port) } else { format!("{}:{}", t.host, t.port) };
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nUser-Agent: synaps-desktop\r\nConnection: close\r\n"
@@ -244,16 +307,46 @@ fn request(t: &Target, method: &str, path: &str, body: Option<&str>) -> Result<(
         s.write_all(b.as_bytes()).map_err(|e| e.to_string())?;
     }
     let mut raw = Vec::new();
-    s.take(MAX_REPLY as u64 + 1).read_to_end(&mut raw).map_err(|e| e.to_string())?;
-    if raw.len() > MAX_REPLY {
-        return Err("the reply is too large".into());
+    let mut buf = [0u8; 16 << 10];
+    loop {
+        s.set_read_timeout(Some(left(by)?)).map_err(|e| e.to_string())?;
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > MAX_REPLY {
+                    return Err("the reply is too large".into());
+                }
+                if complete(&raw) {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Err("timed out".into()),
+            Err(e) => return Err(e.to_string()),
+        }
     }
-    parse_response(&raw)
+    parse_response(raw)
+}
+
+/// The reply is all here: its `Content-Length` body, or a chunked body's
+/// last chunk (else it ends when the dash closes).
+fn complete(raw: &[u8]) -> bool {
+    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { return false };
+    let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+    if head.contains("transfer-encoding: chunked") {
+        return raw.ends_with(b"\r\n0\r\n\r\n") || raw[end + 4..].starts_with(b"0\r\n\r\n");
+    }
+    head.lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .is_some_and(|n| raw.len() >= end + 4 + n)
 }
 
 /// An HTTP/1.1 response read to its end: `(status, body)`. Chunked or
-/// `Content-Length` bodies; else everything after the head.
-pub(crate) fn parse_response(raw: &[u8]) -> Result<(u16, String), String> {
+/// `Content-Length` bodies; else everything after the head. The body is
+/// cut out of `raw` in place (no copy, but a chunked one's).
+pub(crate) fn parse_response(mut raw: Vec<u8>) -> Result<(u16, String), String> {
     let end = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or("no HTTP head in the reply")?;
     let head = std::str::from_utf8(&raw[..end]).map_err(|_| "the reply's head is not text")?;
     let mut lines = head.split("\r\n");
@@ -273,13 +366,17 @@ pub(crate) fn parse_response(raw: &[u8]) -> Result<(u16, String), String> {
             length = v.parse::<usize>().ok();
         }
     }
-    let rest = &raw[end + 4..];
     let body = if chunked {
-        dechunk(rest)?
-    } else if let Some(n) = length {
-        rest.get(..n).ok_or("the reply ended early")?.to_vec()
+        dechunk(&raw[end + 4..])?
     } else {
-        rest.to_vec()
+        if let Some(n) = length {
+            if raw.len() < end + 4 + n {
+                return Err("the reply ended early".into());
+            }
+            raw.truncate(end + 4 + n);
+        }
+        raw.drain(..end + 4);
+        raw
     };
     Ok((status, String::from_utf8(body).map_err(|_| "the reply is not UTF-8")?))
 }
@@ -296,6 +393,25 @@ fn dechunk(mut b: &[u8]) -> Result<Vec<u8>, String> {
         }
         out.extend_from_slice(b.get(..size).ok_or("the reply ended inside a chunk")?);
         b = b.get(size + 2..).ok_or("the reply ended after a chunk")?;
+    }
+}
+
+// ── /api/info ─────────────────────────────────────────────────────────────
+
+/// `GET /api/info`: the daemon this dash serves, from its own registry
+/// entry (the dash only runs as a daemon's child).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Info {
+    pub pid: u32,
+    pub profile: Option<String>,
+}
+
+impl Info {
+    /// It serves the daemon whose `Welcome` said `pid` and `profile`.
+    pub fn serves(&self, pid: u32, profile: Option<&str>) -> bool {
+        let norm = |p: Option<&str>| p.filter(|p| !p.is_empty()).map(str::to_string);
+        pid != 0 && self.pid == pid && norm(self.profile.as_deref()) == norm(profile)
     }
 }
 
@@ -380,18 +496,46 @@ mod tests {
         assert_eq!(strip_token("http://127.0.0.1:7717/?token=abc"), "http://127.0.0.1:7717");
     }
 
+    /// M6: the token never crosses the network and never sits on a command line.
+    #[test]
+    fn only_loopback_and_no_token_on_the_command_line() {
+        for ok in ["http://127.0.0.1:1", "http://127.4.5.6:1", "http://localhost:1", "http://[::1]:1", "LOCALHOST:2"] {
+            assert!(Target::parse(ok).is_ok(), "{ok}");
+        }
+        for bad in ["http://avante.tailnet:7717/?token=ab", "http://10.0.0.2:7717", "http://[::2]:1", "http://0.0.0.0:1", "example.com:80"]
+        {
+            let e = Target::parse(bad).unwrap_err();
+            assert!(e.contains("not loopback") && !e.contains("token=ab"), "{bad}: {e}");
+        }
+        assert!(flag_has_token("http://127.0.0.1:7717/?token=ab"));
+        assert_eq!(flag_target("http://127.0.0.1:7717/?token=ab").unwrap_err(), FLAG_TOKEN);
+        assert!(!flag_target("http://127.0.0.1:7717").unwrap().has_token());
+        // A URL file: its token is read from the file.
+        let f = std::env::temp_dir().join(format!("sd-flag-{}.url", std::process::id()));
+        std::fs::write(&f, "http://127.0.0.1:7801/?token=ab\n").unwrap();
+        let p = f.display().to_string();
+        assert!(!flag_has_token(&p));
+        let t = flag_target(&p).unwrap();
+        assert_eq!((t.port, t.has_token()), (7801, true));
+        std::fs::remove_file(&f).ok();
+    }
+
     #[test]
     fn local_reads_the_url_file_remote_takes_flag_env_then_setting() {
         let dir = std::env::temp_dir().join(format!("sd-dash-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("synaps-dash-p.url"), "http://127.0.0.1:7801/?token=ab\n").unwrap();
-        let (t, src) = discover(true, &dir, Some("p"), None, Some("http://x:1"), None).unwrap().unwrap();
+        let (t, src) = discover(true, &dir, Some("p"), None, Some("http://localhost:1"), None).unwrap().unwrap();
         assert_eq!((t.port, src), (7801, Source::UrlFile(dir.join("synaps-dash-p.url"))));
         // Local with no file: no dash (the environment is a remote's).
-        assert!(discover(true, &dir, None, None, Some("http://x:1"), None).is_none());
-        assert_eq!(discover(true, &dir, Some("p"), Some("http://h:2"), None, None).unwrap().unwrap().1, Source::Flag);
-        assert_eq!(discover(false, &dir, Some("p"), None, Some("http://h:3"), Some("http://h:4")).unwrap().unwrap().0.port, 3);
-        assert_eq!(discover(false, &dir, None, None, Some("  "), Some("http://h:4")).unwrap().unwrap().1, Source::Setting);
+        assert!(discover(true, &dir, None, None, Some("http://localhost:1"), None).is_none());
+        // `--dash` is Usage's for a local daemon too (and never writes config: views::config_gate).
+        assert_eq!(discover(true, &dir, Some("p"), Some("http://localhost:2"), None, None).unwrap().unwrap().1, Source::Flag);
+        assert_eq!(
+            discover(false, &dir, Some("p"), None, Some("http://localhost:3"), Some("http://localhost:4")).unwrap().unwrap().0.port,
+            3
+        );
+        assert_eq!(discover(false, &dir, None, None, Some("  "), Some("http://localhost:4")).unwrap().unwrap().1, Source::Setting);
         assert!(discover(false, &dir, None, None, None, None).is_none());
         assert!(discover(false, &dir, None, Some("ftp://x"), None, None).unwrap().is_err());
         std::fs::remove_dir_all(&dir).ok();
@@ -400,20 +544,25 @@ mod tests {
     #[test]
     fn responses_parse_by_length_chunks_or_close() {
         let r = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}trailing";
-        assert_eq!(parse_response(r).unwrap(), (200, "{}".into()));
+        assert_eq!(parse_response(r.to_vec()).unwrap(), (200, "{}".into()));
+        assert!(complete(r) && !complete(&r[..r.len() - 9]));
         let c = b"HTTP/1.1 503 Service Unavailable\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3;x=1\r\n:1}\r\n0\r\n\r\n";
-        assert_eq!(parse_response(c).unwrap(), (503, "{\"a\":1}".into()));
-        assert_eq!(parse_response(b"HTTP/1.0 401 x\r\n\r\nno").unwrap(), (401, "no".into()));
-        assert!(parse_response(b"garbage").is_err());
-        assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort").is_err());
+        assert_eq!(parse_response(c.to_vec()).unwrap(), (503, "{\"a\":1}".into()));
+        assert!(complete(c) && !complete(&c[..c.len() - 5]));
+        assert_eq!(parse_response(b"HTTP/1.0 401 x\r\n\r\nno".to_vec()).unwrap(), (401, "no".into()));
+        assert!(parse_response(b"garbage".to_vec()).is_err());
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort".to_vec()).is_err());
     }
 
     #[test]
     fn statuses_map_to_what_the_views_say() {
-        assert_eq!(answer((401, String::new())), Err(Fail::Token));
-        assert_eq!(answer((503, r#"{"error":"telemetry is starting"}"#.into())), Err(Fail::Starting("telemetry is starting".into())));
+        let t = Target::parse("http://127.0.0.1:1/?token=ab").unwrap();
+        assert_eq!(answer(&t, (401, String::new())), Err(Fail::Token));
+        let bare = Target::parse("http://127.0.0.1:1").unwrap();
+        assert_eq!(answer(&bare, (401, String::new())), Err(Fail::NoToken), "L4: a URL with no token never says the token changed");
+        assert_eq!(answer(&t, (503, r#"{"error":"telemetry is starting"}"#.into())), Err(Fail::Starting("telemetry is starting".into())));
         assert_eq!(
-            answer((400, r#"{"ok":false,"error":"invalid value for api_retries"}"#.into())).unwrap_err().to_string(),
+            answer(&t, (400, r#"{"ok":false,"error":"invalid value for api_retries"}"#.into())).unwrap_err().to_string(),
             "invalid value for api_retries"
         );
         assert_eq!(Fail::Token.to_string(), "synaps-dash token changed: reconnect");
@@ -458,8 +607,9 @@ mod tests {
         let snap: ConfigSnapshot = get_json(&t, "/api/config").unwrap();
         let (line, headers, _) = h.join().unwrap();
         assert_eq!(line, "GET /api/config HTTP/1.1");
-        assert!(headers.contains(&"Cookie: synaps_dash=c0ffee".to_string()));
-        assert!(!headers.iter().any(|h| h.starts_with("Origin")));
+        assert!(!line.contains("token="), "the token is never in the request line");
+        assert_eq!(headers.iter().filter(|h| h.starts_with("Cookie:")).collect::<Vec<_>>(), ["Cookie: synaps_dash=c0ffee"]);
+        assert!(!headers.iter().any(|h| h.starts_with("Origin") || h.contains("token=")));
         assert!(snap.pending.is_empty());
     }
 
@@ -498,6 +648,25 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         drop(l);
         let t = Target::parse(&format!("http://127.0.0.1:{port}")).unwrap();
-        assert!(matches!(get(&t, "/api/config"), Err(Fail::Unreachable(_))));
+        assert!(matches!(get(&t, "/api/config", None), Err(Fail::Unreachable(_))));
+    }
+
+    /// M4: a dash that accepts and then stalls costs one deadline, not 20 s
+    /// a read.
+    #[test]
+    fn a_stalled_dash_times_out_by_the_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(900));
+            drop(s);
+        });
+        let t = Target::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+        let t0 = Instant::now();
+        let r = get(&t, "/api/config", Some(Instant::now() + Duration::from_millis(300)));
+        assert_eq!(r, Err(Fail::Unreachable("timed out".into())));
+        assert!(t0.elapsed() < Duration::from_millis(800), "{:?}", t0.elapsed());
+        h.join().unwrap();
     }
 }
