@@ -18,6 +18,7 @@ use crate::model::{ConnState, Model};
 use crate::named::RowAction;
 use crate::rail::{self, Chip, Item, Rail, State};
 use crate::stats::compact;
+use crate::tabs::Place;
 use crate::theme::{self, Palette};
 
 /// Left inset of the layout before the rail. The mark strip that used to
@@ -128,7 +129,7 @@ pub(crate) fn glyph(st: State, p: &Palette) -> Div {
     }
 }
 
-fn word_color(st: State, p: &Palette) -> Hsla {
+pub(crate) fn word_color(st: State, p: &Palette) -> Hsla {
     match st {
         State::NeedsYou => p.warn_ch,
         State::Running => p.run_ch,
@@ -418,8 +419,10 @@ impl AppView {
         }
         let pct: SharedString = ratio.map(|r| format!("{:.0}", r * 100.0)).unwrap_or_else(|| "—".into()).into();
         let fits = crate::app::toggled(self.width, self.panels, false).is_some();
-        // L2: detached, the last numbers seen are dimmed, as the open panel's are.
+        // L2: detached, the last numbers seen are dimmed, as the open panel's
+        // are; so are a cached tab's while its attach is on its way.
         let detached = self.model.stats.detached && self.model.active.is_none();
+        let dim = detached || self.opening();
         v_flex()
             .id("right-strip")
             .w(px(STRIP))
@@ -437,7 +440,7 @@ impl AppView {
                 v_flex()
                     .items_center()
                     .gap(px(14.))
-                    .when(detached, |d| d.opacity(0.45))
+                    .when(dim, |d| d.opacity(0.45))
                     .child(v_flex().items_center().child(display(pct, 13., p.prose_ch)).child(mono("%", 9., p.dim_ch)))
                     .child(gauge),
             )
@@ -633,13 +636,17 @@ impl AppView {
         let meta = row.live.and_then(|i| self.model.sessions.get(i));
         let st = meta.map(|s| self.model.state(s)).unwrap_or(row.state);
         let on = meta.is_some_and(|s| self.model.is_active(&s.id));
+        // The marker follows the visible tab (also while its attach is on
+        // its way); a session open in a background tab has a faint one.
+        let shown = meta.is_some_and(|s| self.model.is_shown(&s.id));
+        let in_tab = !shown && meta.is_some_and(|s| self.model.tabs.is_open(&s.id));
         // The attached session's cost as the panel shows it (its digests
         // run ahead of the 3 s poll), else the poll's.
         let cost = meta.map(|s| if on { self.model.stats.cost.unwrap_or(s.cost_usd) } else { s.cost_usd }).filter(|c| *c > 0.0);
         let waiting = meta.map(|s| if on { self.model.transcript.pending_prompts().len() } else { s.awaiting_input }).unwrap_or(0);
         let title_color = match st {
             State::NeedsYou | State::Running | State::Unread => p.ink,
-            _ if on => p.ink,
+            _ if shown => p.ink,
             State::Parked | State::Locked => p.dim_ch,
             _ if row.fresh => p.dim_ch,
             _ => p.prose_ch,
@@ -647,8 +654,10 @@ impl AppView {
         let sub_color = p.dim_ch;
         let bar = if st == State::NeedsYou {
             Some(p.warn_mark_ch)
-        } else if on {
+        } else if shown {
             Some(p.you_bar)
+        } else if in_tab {
+            Some(p.rest_mark)
         } else {
             None
         };
@@ -669,9 +678,9 @@ impl AppView {
             .pt(px(8.))
             .pb(px(9.))
             .cursor_pointer()
-            .when(on, |d| d.bg(p.raised))
+            .when(shown, |d| d.bg(p.raised))
             .hover(|d| d.bg(p.raised))
-            .when_some(bar, |d, c| d.child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(c)))
+            .when_some(bar, |d, c| d.child(div().absolute().left_0().top_0().bottom_0().w(px(if in_tab { 1. } else { 2. })).bg(c)))
             .child(
                 h_flex().gap(px(10.)).items_start().child(glyph(st, p).mt(px(5.))).child(
                     v_flex()
@@ -722,9 +731,15 @@ impl AppView {
             )
             .when(self.readout == Some(key), |d| d.child(self.render_readout(row, p)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.rail_click(key);
+            .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                this.rail_click(key, crate::tabstrip::click_place(ev, cx));
                 cx.notify();
+            }))
+            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                if ev.is_middle_click() {
+                    this.rail_click(key, Place::New);
+                    cx.notify();
+                }
             }))
             .into_any_element()
     }
@@ -766,9 +781,15 @@ impl AppView {
             .child(mono(&row.age, 10., p.dim_ch))
             .when(self.readout == Some(key), |d| d.child(self.render_readout(row, p)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.rail_click(key);
+            .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                this.rail_click(key, crate::tabstrip::click_place(ev, cx));
                 cx.notify();
+            }))
+            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                if ev.is_middle_click() {
+                    this.rail_click(key, Place::New);
+                    cx.notify();
+                }
             }))
             .into_any_element()
     }
@@ -994,8 +1015,10 @@ impl AppView {
                 files = files.child(mono(format!("+{} more", shell.len() - FILES_SHOWN), 10.5, p.dim_ch).mt(px(6.)));
             }
         }
-        // Detached: the last numbers seen, dimmed and labelled, not live.
+        // Detached: the last numbers seen, dimmed and labelled, not live. A
+        // cached tab whose attach is on its way: the same, as last seen.
         let detached = s.detached && self.model.active.is_none();
+        let cached = !detached && self.opening();
         v_flex()
             .id("right")
             .w(px(width))
@@ -1004,7 +1027,7 @@ impl AppView {
             .overflow_y_scroll()
             .border_l_1()
             .border_color(p.hair)
-            .when(detached, |d| {
+            .when(detached || cached, |d| {
                 d.child(
                     h_flex()
                         .px(px(24.))
@@ -1012,11 +1035,15 @@ impl AppView {
                         .gap(px(10.))
                         .border_b_1()
                         .border_color(p.hair)
-                        .child(display("D E T A C H E D", 10., p.warn_ch))
-                        .child(mono("last numbers seen", 10., p.dim_ch)),
+                        .child(display(
+                            if cached { "C A C H E D" } else { "D E T A C H E D" },
+                            10.,
+                            if cached { p.dim_ch } else { p.warn_ch },
+                        ))
+                        .child(mono(if cached { "as last seen · opening…" } else { "last numbers seen" }, 10., p.dim_ch)),
                 )
             })
-            .child(v_flex().when(detached, |d| d.opacity(0.45)).child(context).child(tokens).child(files))
+            .child(v_flex().when(detached || cached, |d| d.opacity(0.45)).child(context).child(tokens).child(files))
     }
 
     /// The theme picker: SYNAPS CONFIG (follow the TUI's `theme =`, the

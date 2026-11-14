@@ -3,6 +3,7 @@
 //! ```text
 //! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH]
 //! synaps-desktop --bench [--profile P --prompt TEXT] [--refresh-hz HZ]
+//! synaps-desktop --bench-tabs [--bench-history FILE] [--refresh-hz HZ]
 //! ```
 //! `--bench` connects to a daemon only when `--profile` or `--socket` is
 //! given (never the default daemon), runs the synthetic scenarios, prints
@@ -12,8 +13,9 @@
 //! writes ([`theme::settings_path`]), else `theme =` in the Synaps config,
 //! else nord. The accent override: `--accent`, else
 //! `$SYNAPS_DESKTOP_ACCENT`, else the settings file, else none. The same
-//! file keeps which side panels are folded (Ctrl+B, Ctrl+Alt+B) and the
-//! text size (Ctrl+= / Ctrl+- / Ctrl+0); `--bench` reads neither.
+//! file keeps which side panels are folded (Ctrl+B, Ctrl+Alt+B), the
+//! text size (Ctrl+= / Ctrl+- / Ctrl+0) and the open tabs (per daemon);
+//! `--bench` reads none of them.
 //! `--size`: the window's size in logical pixels (screenshots).
 
 // serde_json's `json!` in the synthetic transport and its tests nests deep.
@@ -33,6 +35,8 @@ mod palettes;
 mod rail;
 mod shell;
 mod stats;
+mod tabs;
+mod tabstrip;
 mod theme;
 mod turns;
 
@@ -52,6 +56,8 @@ fn main() {
     let mut offline = false;
     let mut bench = false;
     let mut diag_mode = false;
+    let mut bench_tabs = false;
+    let mut history_file: Option<PathBuf> = None;
     let mut prompt: Option<String> = None;
     let mut refresh_hz: Option<f64> = None;
     let mut accent: Option<String> = None;
@@ -78,6 +84,11 @@ fn main() {
                 bench = true;
                 diag_mode = true;
             }
+            "--bench-tabs" => {
+                bench = true;
+                bench_tabs = true;
+            }
+            "--bench-history" => history_file = Some(PathBuf::from(value(&mut args, "--bench-history"))),
             "--prompt" => prompt = Some(value(&mut args, "--prompt")),
             "--refresh-hz" => refresh_hz = value(&mut args, "--refresh-hz").parse().ok(),
             "--accent" => accent = Some(value(&mut args, "--accent")),
@@ -98,7 +109,7 @@ fn main() {
             "-h" | "--help" => {
                 let names: Vec<&str> = palettes::THEMES.iter().map(|t| t.0).collect();
                 println!(
-                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--bench [--prompt TEXT] [--refresh-hz HZ]]\n\
+                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--bench [--prompt TEXT] [--refresh-hz HZ] | --bench-tabs [--bench-history FILE]]\n\
                      theme: --theme, else ${}, else the picker's settings file ({}), else `theme =` in the Synaps config, else {}\n\
                      themes: {}\n\
                      accent (overrides the theme's \"you\" and focus colours): --accent, else ${}, else the settings file, else none",
@@ -146,12 +157,25 @@ fn main() {
     let synthetic = (offline && !bench).then(demo::events);
     // In bench mode only an explicitly named daemon is ever contacted.
     let connect = !offline && (!bench || profile.is_some() || socket.is_some());
+    // The open tabs are saved per daemon (the socket it resolves to), and
+    // `--offline`'s apart; a bench neither reads nor writes them. Two
+    // windows on one daemon: the last to save wins.
+    let mut tabs_key = (offline && !bench).then(|| "offline".to_string());
+    let mut legacy_key = None;
     // No --profile: `$SYNAPS_PROFILE`, else the default daemon (as the TUI).
     let client = if connect {
         let endpoint = match socket {
             Some(s) => Endpoint::Socket(s),
             None => Endpoint::profile(profile.as_deref()),
         };
+        if !bench {
+            tabs_key = Some(format!("socket:{}", canonical_socket(&endpoint.resolve()).display()));
+            // What builds before this one keyed them by (read once).
+            legacy_key = Some(match &endpoint {
+                Endpoint::Socket(s) => format!("socket:{}", s.display()),
+                Endpoint::Profile(p) => format!("profile:{}", p.as_deref().unwrap_or("default")),
+            });
+        }
         match Client::spawn(ClientOptions::new(endpoint, Identity::desktop()).poll_sessions(Duration::from_secs(3))) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -162,6 +186,9 @@ fn main() {
     } else {
         None
     };
+
+    let load = |k: Option<&str>| k.and_then(|k| settings.as_deref().and_then(|p| theme::load_tabs(p, k)));
+    let restore_tabs = load(tabs_key.as_deref()).or_else(|| load(legacy_key.as_deref()));
 
     diag::mark("before_application");
     gpui_kit::application().run(move |cx| {
@@ -197,6 +224,8 @@ fn main() {
             cx.new(|cx| {
                 let mut v = app::AppView::new(client, synthetic, window, cx);
                 v.start_session = start_session;
+                v.tabs_key = tabs_key;
+                v.restore_tabs = restore_tabs;
                 v.picker_open = open_picker;
                 v.panels = panels;
                 // OLDER left open: list up to the wire's cap from the start.
@@ -223,9 +252,22 @@ fn main() {
                 drag_secs: 2.5,
                 history_messages: 2000,
                 diag: diag_mode,
+                tabs: bench_tabs,
+                history_file,
             };
             let _ = cx.windows().first().and_then(|w| w.update(cx, |_, window, cx| bench::start(&view, opts, window, cx)).ok());
         }
         cx.activate(true);
     });
+}
+
+/// A daemon's socket path as one key, however it was reached: absolute,
+/// its folder's symlinks resolved (the socket itself may not exist yet).
+fn canonical_socket(p: &std::path::Path) -> PathBuf {
+    let abs =
+        if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().map(|d| d.join(p)).unwrap_or_else(|_| p.to_path_buf()) };
+    match (abs.parent().and_then(|d| d.canonicalize().ok()), abs.file_name()) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => abs,
+    }
 }
