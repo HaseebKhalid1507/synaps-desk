@@ -7,7 +7,6 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use synaps_client::protocol::SessionMeta;
 
 use std::hash::{Hash, Hasher};
 
@@ -65,10 +64,10 @@ impl RailCache {
         let now = now_secs();
         // With a chip on, which rows show follows their states (the attached
         // session's run ahead of the poll): a hash, no allocation.
-        let states = if view.chip.is_some() {
+        let states = if let Some(chip) = view.chip {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             for s in &m.sessions {
-                m.state(s).hash(&mut h);
+                m.chip_shows(chip, s).hash(&mut h);
             }
             h.finish()
         } else {
@@ -196,11 +195,9 @@ impl AppView {
     }
 
     pub(crate) fn render_top(&self, p: &Palette, rail: Side, cx: &Context<Self>) -> impl IntoElement {
-        let waiting: Vec<&SessionMeta> = self.model.attention().collect();
-        let n = waiting.len();
-        // The one to jump to: a waiting session other than this one, else this one.
-        let first = waiting.iter().find(|s| !self.model.is_active(&s.id)).or(waiting.first()).copied();
-        let jump_to = first.filter(|s| !self.model.is_active(&s.id)).map(|s| s.id.clone());
+        let n = self.model.attention().count();
+        let first = self.model.ticker();
+        let jump_to = self.model.jump_target().map(str::to_string);
         let what: Option<SharedString> = first.map(|s| {
             if self.model.is_active(&s.id)
                 && let Some(pr) = self.model.transcript.pending_prompts().first()
@@ -409,7 +406,7 @@ impl AppView {
         // ahead of the poll) and the unread history rows.
         let (mut needs, mut running, mut unread) = (0, 0, self.rail.rail.history_unread);
         for s in self.model.sessions.iter().filter(|s| s.lifecycle != "ending") {
-            match self.model.state(s) {
+            match self.model.fact(s) {
                 State::NeedsYou => needs += 1,
                 State::Running => running += 1,
                 State::Unread => unread += 1,

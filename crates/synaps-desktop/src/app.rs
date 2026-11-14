@@ -5,7 +5,7 @@
 //! number from the daemon ([`crate::stats`]).
 
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
@@ -14,13 +14,13 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use synaps_client::transcript::{Item, ItemKind, ToolStatus};
-use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError, validate_session_name};
+use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError};
 
 use crate::bench::BenchState;
 use crate::files::{self, LineKind, Preview};
 use crate::fonts::{self, label};
 use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, LOCAL_SEQ, Model, RenameRequest};
-use crate::named::ResumeRequest;
+use crate::named::{ResumeRequest, RowAction, home_short};
 use crate::rail::{Bucket, Chip};
 use crate::theme::{self, Palette};
 
@@ -432,6 +432,13 @@ impl AppView {
                     this.find_enter(typed.trim());
                     cx.notify();
                 }
+                // The user is looking: list what find searches, fresh.
+                InputEvent::Focus => {
+                    for fx in this.model.looking() {
+                        this.effect(fx);
+                    }
+                    cx.notify();
+                }
                 _ => {}
             }),
             cx.subscribe_in(&name_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
@@ -622,11 +629,6 @@ impl AppView {
                 }
             }
             Effect::Resume { req, open } => self.resume(req, open),
-            Effect::Detach => {
-                if let Some(c) = &self.client {
-                    let _ = c.detach();
-                }
-            }
         }
     }
 
@@ -673,31 +675,33 @@ impl AppView {
         }
     }
 
-    /// Enter in find: an exact session name opens (attached if held, else
-    /// resumed by name); otherwise the one row find left, if only one.
+    /// The rail as the model, find, the chip and the buckets have it now.
+    fn refresh_rail(&mut self) {
+        let view = crate::rail::View {
+            find: std::mem::take(&mut self.find),
+            chip: self.chip,
+            open: self.panels.history_open,
+            expanded: self.expanded,
+        };
+        self.rail.refresh(&self.model, &view, &self.rail_list);
+        self.find = view.find;
+    }
+
+    /// Enter in find (see [`Model::find_enter`]), over the rows the rail
+    /// shows for what is typed now.
     fn find_enter(&mut self, typed: &str) {
-        if typed.is_empty() {
-            return;
-        }
-        if validate_session_name(typed).is_ok() {
-            for fx in self.model.open_by_name(typed) {
-                self.effect(fx);
-            }
-            return;
-        }
-        let rows: Vec<u64> = self
-            .rail
-            .rail
+        self.refresh_rail();
+        let rail = &self.rail.rail;
+        let visible: Vec<RowAction> = rail
             .items
             .iter()
             .filter_map(|i| match i {
-                crate::rail::Item::Row(r) | crate::rail::Item::Hist(r) => Some(self.rail.rail.rows[*r].key),
+                crate::rail::Item::Row(r) | crate::rail::Item::Hist(r) => Some(rail.rows[*r].action.clone()),
                 _ => None,
             })
             .collect();
-        match rows.as_slice() {
-            [key] => self.rail_click(*key),
-            _ => self.model.named.error = Some(format!("No session named '{typed}'. Enter opens an exact name, or the only match.")),
+        for fx in self.model.find_enter(typed, &visible) {
+            self.effect(fx);
         }
     }
 
@@ -1568,16 +1572,6 @@ fn tracked(name: &str) -> String {
     out
 }
 
-/// `/home/me/x` → `~/x` when it is this machine's home.
-pub(crate) fn home_short(path: &str) -> String {
-    static HOME: OnceLock<String> = OnceLock::new();
-    let home = HOME.get_or_init(|| std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default());
-    match path.strip_prefix(home.as_str()) {
-        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with(['/', '\\'])) => format!("~{rest}"),
-        _ => path.to_string(),
-    }
-}
-
 pub(crate) fn one_line(s: &str, max: usize) -> String {
     let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     let more = s.lines().filter(|l| !l.trim().is_empty()).count() > 1;
@@ -1615,14 +1609,7 @@ impl Render for AppView {
         }
         self.sync_list();
         self.sync_card(window, cx);
-        let view = crate::rail::View {
-            find: std::mem::take(&mut self.find),
-            chip: self.chip,
-            open: self.panels.history_open,
-            expanded: self.expanded,
-        };
-        self.rail.refresh(&self.model, &view, &self.rail_list);
-        self.find = view.find;
+        self.refresh_rail();
         if let Some(b) = self.bench.as_mut() {
             b.on_render(&self.list, window);
         }

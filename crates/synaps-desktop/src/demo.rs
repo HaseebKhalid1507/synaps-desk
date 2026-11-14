@@ -312,8 +312,8 @@ mod tests {
             n += 1;
             asks.extend(m.apply(saved(named_only, limit)));
         }
-        assert_eq!(n, 2, "the named list, then the newest");
-        assert_eq!(m.named.saved.len(), 12, "eleven saved and one held");
+        assert_eq!(n, 1, "the newest 200 hold them all: no named list asked");
+        assert_eq!(m.named.recent.iter().filter(|v| v.name.is_some()).count(), 12, "eleven saved and one held");
         assert!(m.named.recent_loaded && !m.named.recent_truncated);
         assert_eq!(crate::rail::history(&m).len(), 131, "the held one is not history");
         let Event::SavedSessions { sessions, truncated, .. } = saved(false, 5) else { panic!() };

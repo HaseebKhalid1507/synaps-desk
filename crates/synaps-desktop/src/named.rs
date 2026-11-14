@@ -155,6 +155,16 @@ pub fn resume_error(label: &str, reason: &str) -> String {
     }
 }
 
+/// `/home/me/x` → `~/x` when it is this machine's home.
+pub(crate) fn home_short(path: &str) -> String {
+    static HOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let home = HOME.get_or_init(|| std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default());
+    match path.strip_prefix(home.as_str()) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with(['/', '\\'])) => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 /// The daemon's real create errors (see `resume_error`), word for word.
 #[cfg(test)]
 pub(crate) const NO_SUCH_GHOST: &str = "create session: Tool execution failed: Failed to load session 'ghost': no session matching 'ghost'";

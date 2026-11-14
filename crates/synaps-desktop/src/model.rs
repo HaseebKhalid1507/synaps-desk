@@ -4,7 +4,7 @@
 //! else; the view only turns the transcript's splice into rows per frame.
 
 use std::cmp::Reverse;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -16,7 +16,7 @@ use synaps_client::{
 };
 
 use crate::named::{ResumeRequest, RowAction, parse_rfc3339};
-use crate::rail::{State, is_parked};
+use crate::rail::{Chip, State, is_parked};
 use crate::stats::Stats;
 
 /// HISTORY's newest unnamed sessions, asked for at startup; up to
@@ -119,8 +119,6 @@ pub enum Effect {
         req: ResumeRequest,
         open: bool,
     },
-    /// Leave the current attachment (`Client::detach`).
-    Detach,
 }
 
 /// A resume in flight (`Client::resume`).
@@ -189,8 +187,14 @@ pub struct Named {
     pub recent_loaded: bool,
     /// The cap has been asked for (OLDER opened, or find used).
     pub deep: bool,
+    /// The named list must be asked for too if the newest list is cut:
+    /// not listed on this connection yet, a rename, an Open by name.
+    named_stale: bool,
     /// The saved list's own trouble (failed, entries skipped).
     pub saved_note: Option<String>,
+    /// The last ask failed and nothing has landed since: HISTORY says "—",
+    /// not "…" (find gaining focus asks again).
+    pub saved_failed: bool,
     /// One request at a time: replies come in order, but this way a reply
     /// is never matched to the wrong request.
     saved_in_flight: Option<SavedAsk>,
@@ -206,8 +210,9 @@ pub struct Named {
     pub error: Option<String>,
     /// Something to know that is not an error (a folder fell back to `~`).
     pub notice: Option<String>,
-    /// An `Attached` that was not the session asked for, being detached.
-    discard: Option<u64>,
+    /// Text the user was told the daemon may read as part of a session id
+    /// (find → Enter, no saved list): Enter again with it sends it.
+    confirm: Option<String>,
     /// How the notices name the daemon's machine.
     daemon: String,
     /// The "Name this session…" row is open.
@@ -234,6 +239,9 @@ pub struct Model {
     /// The session it asked for (`None`: a create or a resume, whose id
     /// comes with `Attached`).
     wanted_session: Option<String>,
+    /// Its state when it was asked for: under a chip that admitted it, its
+    /// row stays until the attach lands.
+    wanted_fact: Option<State>,
     /// Prompts answered from here that the daemon has not resolved yet, as
     /// `(epoch, prompt id)` ([`Active::epoch`]): prompt ids are per session
     /// and start at 1 (again after a daemon restart), so an id alone would
@@ -258,6 +266,13 @@ pub struct Model {
     /// Sessions (and their journals) whose turn ended, or which got new
     /// messages, while not on screen: UNREAD until opened.
     unread: HashSet<String>,
+    /// What the user has seen of each held session, `(messages, busy)`:
+    /// the last poll for one off screen; for the one on screen its
+    /// transcript, which runs ahead of the poll (taken at every poll and
+    /// when the user moves away). UNREAD is the next poll against this.
+    seen: HashMap<String, (usize, bool)>,
+    /// Sessions whose turn this window sent: its end is not news.
+    own_turns: HashSet<String>,
     /// Set by every event but a session list equal to the last: the view
     /// draws again only then (the 3-second poll of an idle daemon is free).
     pub view_dirty: bool,
@@ -269,6 +284,12 @@ pub fn sort_sessions(s: &mut [SessionMeta]) {
     s.sort_by_cached_key(|m| (Reverse(parse_rfc3339(&m.created_at).unwrap_or(i64::MIN)), Reverse(m.id.clone())));
 }
 
+/// Text the daemon's resolver could match inside a session id
+/// (`YYYYMMDD-HHMMSS-xxxx`, lowercase hex).
+fn could_be_id(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c) || c == '-')
+}
+
 impl Model {
     pub fn new(conn: ConnState) -> Self {
         Self {
@@ -277,6 +298,7 @@ impl Model {
             active: None,
             wanted: None,
             wanted_session: None,
+            wanted_fact: None,
             answered: HashSet::new(),
             epoch: 0,
             transcript: Transcript::new(),
@@ -287,25 +309,43 @@ impl Model {
             stats: Stats::default(),
             rail_gen: 0,
             unread: HashSet::new(),
+            seen: HashMap::new(),
+            own_turns: HashSet::new(),
             view_dirty: false,
         }
     }
 
     /// Ask for the saved lists again (on connect, after a rename, a resume,
-    /// a row leaving OPEN; never on a timer): the named list, then the
-    /// newest. A request already waiting is not queued twice.
+    /// a row leaving OPEN, find gaining focus; never on a timer): the
+    /// newest, and the named list only if the newest was cut (every
+    /// request costs the daemon a read of every saved header). A request
+    /// already waiting is not queued twice.
     fn refresh_saved(&mut self, effects: &mut Vec<Effect>) {
         let n = &mut self.named;
         if !n.saved_supported {
             return;
         }
         let recent = SavedAsk::Recent(if n.deep { SAVED_SESSIONS_MAX } else { SAVED_RECENT });
-        for ask in [SavedAsk::Named, recent] {
-            if !n.saved_queue.contains(&ask) {
-                n.saved_queue.push_back(ask);
-            }
+        if !n.saved_queue.contains(&recent) {
+            n.saved_queue.push_back(recent);
         }
         self.pump_saved(effects);
+    }
+
+    /// A refresh is asked for or on its way.
+    pub fn saved_listing(&self) -> bool {
+        self.named.saved_in_flight.is_some() || !self.named.saved_queue.is_empty()
+    }
+
+    /// Find gained focus: the user is looking, so list what find searches
+    /// (up to the cap), fresh.
+    pub fn looking(&mut self) -> Vec<Effect> {
+        if !self.named.deep {
+            return self.want_deep();
+        }
+        let mut effects = Vec::new();
+        self.refresh_saved(&mut effects);
+        effects
     }
 
     /// Send the next queued request if none is in flight.
@@ -332,7 +372,7 @@ impl Model {
         }
         n.deep = true;
         n.saved_queue.retain(|a| *a == SavedAsk::Named);
-        n.saved_queue.push_back(SavedAsk::Recent(SAVED_SESSIONS_MAX));
+        n.saved_queue.push_front(SavedAsk::Recent(SAVED_SESSIONS_MAX));
         self.pump_saved(&mut effects);
         effects
     }
@@ -340,6 +380,7 @@ impl Model {
     /// `--offline`: the synthetic transport answers `saved_sessions` itself.
     pub fn offer_saved(&mut self) -> Vec<Effect> {
         self.named.saved_supported = true;
+        self.named.named_stale = true;
         let mut effects = Vec::new();
         self.refresh_saved(&mut effects);
         effects
@@ -358,30 +399,36 @@ impl Model {
         n.saved_in_flight = None;
         n.saved_queue.clear();
         n.saved_note = Some(format!("Saved sessions unavailable: {reason}"));
+        n.saved_failed = true;
         // An Open by name that waited for the list: the daemon resolves it.
         if n.opening.as_ref().is_some_and(|o| o.attach_seq.is_none()) {
             self.open_by_resolver(effects);
         }
     }
 
-    /// A held session's state, first match wins (see [`State`]). The
+    /// A held session's glyph, first match wins (see [`State`]).
+    pub fn state(&self, s: &SessionMeta) -> State {
+        if self.opening(s) { State::Opening } else { self.fact(s) }
+    }
+
+    /// What a held session is doing, without OPENING (which is only this
+    /// window's click): what the counts, the chips, the ticker and JUMP go
+    /// by, so none of them changes while an attach is on its way. The
     /// attached one is read from its own transcript (answered prompts, a
     /// turn that just ended), which runs ahead of the 3-second poll.
-    pub fn state(&self, s: &SessionMeta) -> State {
-        let active = self.is_active(&s.id);
-        let resuming = self.named.resuming.as_ref().is_some_and(|r| s.is(&r.req.target) || s.name.as_deref() == Some(&r.req.label));
-        if (self.is_wanted(&s.id) && !active) || resuming {
-            return State::Opening;
-        }
-        let (needs, busy) =
-            if active { (!self.transcript.pending_prompts().is_empty(), self.transcript.busy()) } else { (s.awaiting_input > 0, s.busy) };
+    pub fn fact(&self, s: &SessionMeta) -> State {
+        let (needs, busy) = if self.is_active(&s.id) {
+            (!self.transcript.pending_prompts().is_empty(), self.transcript.busy())
+        } else {
+            (s.awaiting_input > 0, s.busy)
+        };
         if needs {
             State::NeedsYou
         } else if busy {
             State::Running
         } else if s.locked_by.is_some() {
             State::Locked
-        } else if self.unread.contains(&s.id) {
+        } else if self.is_unread(s) {
             State::Unread
         } else if is_parked(s) {
             State::Parked
@@ -390,20 +437,44 @@ impl Model {
         }
     }
 
-    /// A saved (not held) session's state.
+    /// An attach or a resume of this held session is on its way.
+    pub fn opening(&self, s: &SessionMeta) -> bool {
+        (self.is_wanted(&s.id) && !self.is_active(&s.id))
+            || self
+                .named
+                .resuming
+                .as_ref()
+                .is_some_and(|r| s.is(&r.req.target) || (r.req.by_name && s.name.as_deref() == Some(&r.req.label)))
+    }
+
+    /// Under a chip: its state; a row clicked under the chip stays where
+    /// it was until its attach lands, whatever its state does meanwhile.
+    pub fn chip_shows(&self, chip: Chip, s: &SessionMeta) -> bool {
+        chip.admits(self.fact(s)) || (self.opening(s) && self.is_wanted(&s.id) && self.wanted_fact.is_some_and(|f| chip.admits(f)))
+    }
+
+    fn is_unread(&self, s: &SessionMeta) -> bool {
+        self.unread.contains(&s.id) || (!s.journal_id.is_empty() && self.unread.contains(&s.journal_id))
+    }
+
+    /// A saved (not held) session's glyph.
     pub fn saved_state(&self, v: &SavedSession) -> State {
-        let resuming = self
-            .named
-            .resuming
-            .as_ref()
-            .is_some_and(|r| r.req.target == v.id || (r.req.by_name && v.name.as_deref() == Some(&r.req.label)));
-        if resuming {
-            State::Opening
-        } else if self.unread.contains(&v.id) {
-            State::Unread
-        } else {
-            State::Saved
-        }
+        if self.saved_opening(v) { State::Opening } else { self.saved_fact(v) }
+    }
+
+    /// A saved session's state without OPENING (see [`Model::fact`]).
+    pub fn saved_fact(&self, v: &SavedSession) -> State {
+        if self.unread.contains(&v.id) { State::Unread } else { State::Saved }
+    }
+
+    fn saved_opening(&self, v: &SavedSession) -> bool {
+        self.named.resuming.as_ref().is_some_and(|r| r.req.target == v.id || (r.req.by_name && v.name.as_deref() == Some(&r.req.label)))
+    }
+
+    /// [`Model::chip_shows`] for a saved session (its UNREAD mark holds
+    /// until the resume lands).
+    pub fn chip_shows_saved(&self, chip: Chip, v: &SavedSession) -> bool {
+        chip.admits(self.saved_fact(v))
     }
 
     pub fn is_active(&self, session_id: &str) -> bool {
@@ -411,9 +482,22 @@ impl Model {
     }
 
     /// Live sessions waiting on the user (a question, a secret, a tool-call
-    /// confirmation), in list order.
+    /// confirmation), in list order. One being attached still counts.
     pub fn attention(&self) -> impl Iterator<Item = &SessionMeta> {
-        self.sessions.iter().filter(|s| self.state(s) == State::NeedsYou)
+        self.sessions.iter().filter(|s| s.lifecycle != "ending" && self.fact(s) == State::NeedsYou)
+    }
+
+    /// The ticker's session: a waiting one other than the attached, else
+    /// the attached one.
+    pub fn ticker(&self) -> Option<&SessionMeta> {
+        self.attention().find(|s| !self.is_active(&s.id)).or_else(|| self.attention().next())
+    }
+
+    /// JUMP's target: the ticker's session, unless it is on screen. It
+    /// stays the same while its attach is on its way, so a second click
+    /// is a no-op ([`Model::open_row`]).
+    pub fn jump_target(&self) -> Option<&str> {
+        self.ticker().map(|s| s.id.as_str()).filter(|id| !self.is_active(id))
     }
 
     /// The active session's list entry.
@@ -444,8 +528,46 @@ impl Model {
             // Already the one on screen (or on its way): nothing to do.
             RowAction::Attach(id) if self.is_wanted(id) => Vec::new(),
             RowAction::Attach(id) => vec![Effect::Attach { session_id: id.clone(), fallback: self.journal_of(id), open: false }],
+            RowAction::Resume(req) if self.named.resuming.as_ref().is_some_and(|r| r.req.target == req.target) => Vec::new(),
             RowAction::Resume(req) => vec![Effect::Resume { req: req.clone(), open: false }],
         }
+    }
+
+    /// Enter in find, in this order: a session of exactly that name in the
+    /// loaded lists; else the one row find left (`visible`: the rows the
+    /// rail shows); else, with no row showing, the daemon (see
+    /// [`Model::open_by_name`]). Several rows and no exact name: nothing
+    /// opens, the user picks.
+    pub fn find_enter(&mut self, typed: &str, visible: &[RowAction]) -> Vec<Effect> {
+        let typed = typed.trim();
+        if self.named.confirm.as_deref() != Some(typed) {
+            self.named.confirm = None;
+        }
+        if typed.is_empty() {
+            return Vec::new();
+        }
+        if self.has_name(typed) {
+            return self.open_by_name(typed);
+        }
+        match visible {
+            [one] => self.open_row(one),
+            [] if validate_session_name(typed).is_ok() => self.open_by_name(typed),
+            rows => {
+                self.named.notice = None;
+                self.named.error = Some(match rows.len() {
+                    0 => format!("Nothing matches '{typed}'."),
+                    k => format!("{k} sessions match '{typed}': click one, or type its exact name."),
+                });
+                Vec::new()
+            }
+        }
+    }
+
+    /// A session of exactly this name is listed (held or saved).
+    fn has_name(&self, name: &str) -> bool {
+        let n = &self.named;
+        self.sessions.iter().any(|s| s.name.as_deref() == Some(name))
+            || n.saved.iter().chain(&n.recent).any(|v| v.name.as_deref() == Some(name))
     }
 
     /// "Open by name…": the name exactly, never a partial id. A live
@@ -484,7 +606,7 @@ impl Model {
         }
         let n = &self.named;
         if n.saved_supported {
-            if let Some(v) = n.saved.iter().find(|v| v.name.as_deref() == Some(name.as_str())) {
+            if let Some(v) = n.saved.iter().chain(&n.recent).find(|v| v.name.as_deref() == Some(name.as_str())) {
                 let req = ResumeRequest { label: name, target: v.id.clone(), cwd: v.cwd.clone().filter(|c| !c.is_empty()), by_name: false };
                 effects.push(Effect::Resume { req, open: true });
                 return;
@@ -497,6 +619,7 @@ impl Model {
                     if let Some(o) = &mut self.named.opening {
                         o.asked_saved = true;
                     }
+                    self.named.named_stale = true;
                     self.refresh_saved(effects);
                 }
                 return;
@@ -506,9 +629,25 @@ impl Model {
     }
 
     /// No list can resolve the name: let the daemon, and check on attach.
+    /// Its resolver (v0.11.1 `resolve_session`: chain, name, then the one
+    /// id containing the text) can open a session nobody picked. Ids are
+    /// `YYYYMMDD-HHMMSS-xxxx`, so only text of digits, `a`-`f` and `-` can
+    /// be part of one: such text goes only on a second Enter, after the
+    /// user was told.
     fn open_by_resolver(&mut self, effects: &mut Vec<Effect>) {
-        let Some(o) = &self.named.opening else { return };
-        let req = ResumeRequest { label: o.name.clone(), target: o.name.clone(), cwd: None, by_name: true };
+        let Some(name) = self.named.opening.as_ref().map(|o| o.name.clone()) else { return };
+        let n = &mut self.named;
+        if could_be_id(&name) && n.confirm.as_deref() != Some(name.as_str()) {
+            n.opening = None;
+            n.error = Some(format!(
+                "'{name}' could be part of a session id: if no session has this name, the daemon opens the one whose id contains it. \
+                 Press Enter again to ask it."
+            ));
+            n.confirm = Some(name);
+            return;
+        }
+        n.confirm = None;
+        let req = ResumeRequest { label: name.clone(), target: name, cwd: None, by_name: true };
         effects.push(Effect::Resume { req, open: true });
     }
 
@@ -595,12 +734,12 @@ impl Model {
     pub fn want(&mut self, attach_seq: u64) {
         self.wanted = Some(attach_seq);
         self.wanted_session = None;
+        self.wanted_fact = None;
         self.rail_gen += 1;
         let n = &mut self.named;
         n.resuming.take_if(|r| r.attach_seq != attach_seq);
         n.attaching.take_if(|(s, _)| *s != attach_seq);
         n.opening.take_if(|o| o.attach_seq != Some(attach_seq));
-        n.discard = None;
         n.naming = false;
         n.replace = None;
         n.rename_error = None;
@@ -609,6 +748,7 @@ impl Model {
     /// The attach just asked for (after [`Model::want`]) is of this session.
     pub fn asked_for(&mut self, session_id: &str) {
         self.wanted_session = Some(session_id.to_string());
+        self.wanted_fact = self.sessions.iter().find(|s| s.id == session_id).map(|s| self.fact(s));
     }
 
     /// The last attach asked for this session (attached or on its way): a
@@ -668,9 +808,44 @@ impl Model {
         }
     }
 
-    /// `text` went to the daemon.
+    /// `text` went to the daemon: the turn it starts (or steers) is the
+    /// user's own, so its end is not UNREAD.
     pub fn sent(&mut self, text: String) {
         self.in_flight.push_back(text);
+        if let Some(a) = &self.active
+            && !self.own_turns.contains(&a.session_id)
+        {
+            self.own_turns.insert(a.session_id.clone());
+        }
+    }
+
+    /// The session on screen as the user sees it (its transcript): the
+    /// baseline UNREAD compares the next poll with. Its own turn is over
+    /// once nothing sent is unconfirmed and it is idle.
+    fn saw_active(&mut self) {
+        let Some(a) = &self.active else { return };
+        if self.transcript.session_id() != Some(a.session_id.as_str()) {
+            return;
+        }
+        let now = (self.transcript.history_len(), self.transcript.busy());
+        match self.seen.get_mut(&a.session_id) {
+            Some(e) => *e = now,
+            None => {
+                self.seen.insert(a.session_id.clone(), now);
+            }
+        }
+        if self.in_flight.is_empty() && !now.1 {
+            self.own_turns.remove(&a.session_id);
+        }
+    }
+
+    /// UNREAD marks of sessions in no list (closed, or past what is listed).
+    fn prune_unread(&mut self) {
+        if self.unread.is_empty() {
+            return;
+        }
+        let (sessions, n) = (&self.sessions, &self.named);
+        self.unread.retain(|k| sessions.iter().any(|s| s.is(k)) || n.saved.iter().chain(&n.recent).any(|v| v.id == *k));
     }
 
     fn current(&self, attach_seq: u64) -> bool {
@@ -720,6 +895,7 @@ impl Model {
                         None => "the daemon's machine".into(),
                     };
                     self.named.saved_supported = features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
+                    self.named.named_stale = true;
                     if self.named.saved_supported {
                         self.refresh_saved(&mut effects);
                     } else {
@@ -738,49 +914,83 @@ impl Model {
                 }
             }
             Event::Sessions(s) => {
-                // UNREAD: a turn that ended, or new messages, off screen.
+                self.saw_active();
+                // UNREAD: off screen, a turn ended or messages came that the
+                // user has not seen. Not news: a turn this window sent, and
+                // a session a TUI is attached to (it is on a screen there).
                 for new in &s {
                     if self.is_active(&new.id) {
                         continue;
                     }
-                    if let Some(old) = self.sessions.iter().find(|o| o.id == new.id)
-                        && ((old.busy && !new.busy) || new.messages > old.messages)
+                    let own = self.own_turns.contains(&new.id);
+                    if own && !new.busy {
+                        self.own_turns.remove(&new.id);
+                    }
+                    let elsewhere = new.roster.iter().any(|c| c.kind == "tui");
+                    if let Some(&(messages, busy)) = self.seen.get(&new.id)
+                        && !own
+                        && !elsewhere
+                        && ((busy && !new.busy) || new.messages > messages)
                     {
                         self.unread.insert(new.id.clone());
                         if !new.journal_id.is_empty() {
                             self.unread.insert(new.journal_id.clone());
                         }
                     }
+                    match self.seen.get_mut(&new.id) {
+                        Some(e) => *e = (new.messages, new.busy),
+                        None => {
+                            self.seen.insert(new.id.clone(), (new.messages, new.busy));
+                        }
+                    }
                 }
+                self.seen.retain(|id, _| s.iter().any(|n| n.id == *id));
                 // A row leaving OPEN (closed, or evicted to history).
                 let left = self.sessions.iter().any(|o| !s.iter().any(|n| n.id == o.id));
                 self.sessions = s;
                 if left {
                     self.refresh_saved(&mut effects);
                 }
+                if !self.named.saved_supported {
+                    self.prune_unread();
+                }
             }
             Event::SavedSessions { sessions, truncated, rejected } => {
                 let n = &mut self.named;
                 let asked = n.saved_in_flight.take();
                 n.saved_note = (rejected > 0).then(|| format!("{rejected} saved sessions could not be read (skipped)."));
+                if asked.is_some() {
+                    n.saved_failed = false;
+                }
                 match asked {
                     Some(SavedAsk::Named) => {
                         n.saved = sessions;
                         n.saved_truncated = truncated;
+                        n.named_stale = false;
                     }
                     Some(SavedAsk::Recent(_)) => {
                         n.recent = sessions;
                         n.recent_truncated = truncated;
                         n.recent_loaded = true;
+                        if !truncated {
+                            // Every saved session, the named ones too.
+                            n.saved.clear();
+                            n.saved_truncated = false;
+                            n.named_stale = false;
+                        } else if n.named_stale && !n.saved_queue.contains(&SavedAsk::Named) {
+                            n.saved_queue.push_back(SavedAsk::Named);
+                        }
                     }
                     // Asked on a connection since dropped.
                     None => {}
                 }
-                // An Open by name waits for a named list asked after it.
-                if asked == Some(SavedAsk::Named) && !self.named.saved_queue.contains(&SavedAsk::Named) {
-                    self.resolve_open(&mut effects);
-                }
                 self.pump_saved(&mut effects);
+                // The refresh is done: an Open by name waiting for it, and
+                // UNREAD marks of sessions in no list.
+                if !self.saved_listing() {
+                    self.resolve_open(&mut effects);
+                    self.prune_unread();
+                }
             }
             Event::SavedSessionsFailed { reason } => self.on_saved_failed(&reason, &mut effects),
             Event::Renamed { session_id, name, .. } => {
@@ -791,6 +1001,7 @@ impl Model {
                     self.renamed();
                 }
                 effects.push(Effect::ListSessions);
+                self.named.named_stale = true;
                 self.refresh_saved(&mut effects);
             }
             Event::RenameFailed(f) => {
@@ -828,21 +1039,24 @@ impl Model {
             }
             Event::Attached { attach_seq, attached, mode, .. } if self.current(attach_seq) => {
                 if let Some(r) = self.named.resuming.take_if(|r| r.attach_seq == attach_seq) {
-                    // The daemon's resolver takes any id containing the
-                    // text when no name matches: not the session asked for.
+                    // The daemon's resolver took a chain of that name, or
+                    // the id containing it (after the user was told): it
+                    // stays on screen, said so, never detached and left
+                    // loaded behind the user's back.
                     if r.req.by_name && attached.meta.name.as_deref() != Some(r.req.label.as_str()) {
-                        self.named.error = Some(format!("No session named '{}'.", r.req.label));
-                        self.named.opening = None;
-                        self.named.discard = Some(attach_seq);
-                        effects.push(Effect::Detach);
-                        return effects;
-                    }
-                    if r.req.by_name {
+                        self.named.notice = Some(format!(
+                            "No session is named '{}': the daemon opened {} (a chain of that name, or the id containing it).",
+                            r.req.label,
+                            attached.meta.label()
+                        ));
+                    } else if r.req.by_name {
                         self.named.notice =
                             Some(format!("Opened '{}' by name: this daemon does not list saved folders, so it runs in ~.", r.req.label));
                     }
                     self.refresh_saved(&mut effects);
                 }
+                // The one on screen until now, as the user saw it.
+                self.saw_active();
                 // Opened: read.
                 self.unread.remove(&attached.meta.id);
                 self.unread.remove(&attached.meta.journal_id);
@@ -896,6 +1110,7 @@ impl Model {
                 }
             }
             Event::Detached { attach_seq, reason, .. } if self.current(attach_seq) => {
+                self.saw_active();
                 self.active = None;
                 self.wanted_session = None;
                 self.answered.clear();
@@ -904,9 +1119,6 @@ impl Model {
                 self.stats.on_detached();
                 self.give_back_all(&mut effects);
                 let n = &mut self.named;
-                if n.discard.take_if(|s| *s == attach_seq).is_some() {
-                    return effects;
-                }
                 // A named live session that ended since the last list:
                 // resume its journal (an Open by name keeps waiting).
                 if let Some((_, req)) = n.attaching.take_if(|(s, _)| *s == attach_seq)
@@ -1024,7 +1236,7 @@ mod tests {
         assert_eq!(m.attention().count(), 1);
         assert_eq!(m.active_meta().map(|s| s.id.as_str()), Some("s"));
         for (c, admitted) in [(Chip::NeedsYou, vec!["w"]), (Chip::Running, vec!["b"]), (Chip::Unread, vec![])] {
-            let got: Vec<&str> = m.sessions.iter().filter(|s| c.admits(m.state(s))).map(|s| s.id.as_str()).collect();
+            let got: Vec<&str> = m.sessions.iter().filter(|s| m.chip_shows(c, s)).map(|s| s.id.as_str()).collect();
             assert_eq!(got, admitted, "{c:?}");
         }
     }
@@ -1080,6 +1292,214 @@ mod tests {
         m.apply(Event::Sessions(list(false, 3)));
         assert_eq!(st(&m, "s"), State::Unread, "new messages while s is off screen");
         assert_eq!(st(&m, "u"), State::Idle);
+    }
+
+    /// The ids of the held rows a chip shows, in order.
+    fn under(m: &Model, chip: Chip) -> Vec<String> {
+        use crate::rail::{Item, View, build};
+        let rail = build(m, &View { chip: Some(chip), ..View::default() }, 0);
+        rail.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Row(r) => match &rail.rows[*r].action {
+                    RowAction::Attach(id) => Some(id.clone()),
+                    RowAction::Resume(_) => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn three(x_busy: bool, r_busy: bool) -> Vec<SessionMeta> {
+        metas(json!([
+            {"id": "x", "lifecycle": "live", "awaiting_input": 1, "busy": x_busy, "created_at": "2026-11-13T12:00:00Z"},
+            {"id": "y", "lifecycle": "live", "awaiting_input": 1, "busy": true, "created_at": "2026-11-13T11:00:00Z"},
+            {"id": "r", "lifecycle": "live", "busy": r_busy, "created_at": "2026-11-13T10:00:00Z"},
+        ]))
+    }
+
+    /// H1: OPENING is the glyph only. Under a chip a clicked row stays
+    /// where it was until its attach lands, so the second click of a
+    /// double-click hits it again (a no-op), and no count dips meanwhile.
+    #[test]
+    fn a_clicked_row_stays_put_under_its_chip() {
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[]));
+        m.apply(Event::Sessions(three(true, true)));
+        assert_eq!(under(&m, Chip::NeedsYou), ["x", "y"]);
+        assert_eq!(m.open_row(&RowAction::Attach("x".into())).len(), 1);
+        m.attaching(4, None, false);
+        m.asked_for("x");
+        assert_eq!(m.state(&m.sessions[0]), State::Opening, "the glyph says so");
+        assert_eq!(under(&m, Chip::NeedsYou), ["x", "y"], "x keeps its place");
+        assert_eq!(m.attention().count(), 2, "the counts do not dip");
+        let second = under(&m, Chip::NeedsYou)[0].clone();
+        assert!(m.open_row(&RowAction::Attach(second)).is_empty(), "the second click: x again, nothing to do");
+        // Under RUNNING: r's turn ends while its attach is on its way; it
+        // stays until the attach lands, then goes.
+        assert_eq!(under(&m, Chip::Running), ["r"]);
+        assert_eq!(m.open_row(&RowAction::Attach("r".into())).len(), 1);
+        m.attaching(5, None, false);
+        m.asked_for("r");
+        m.apply(Event::Sessions(three(true, false)));
+        assert_eq!(under(&m, Chip::Running), ["r"], "on its way: stays");
+        m.apply(attached_ev(5, attached("r")));
+        assert!(under(&m, Chip::Running).is_empty(), "landed, idle: it goes");
+    }
+
+    /// H1: JUMP clicked twice sends one attach, to the same session; once
+    /// it lands, JUMP moves on to the next one waiting.
+    #[test]
+    fn jump_twice_attaches_once() {
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[]));
+        m.apply(Event::Sessions(three(true, true)));
+        let mut sent = Vec::new();
+        for _ in 0..2 {
+            let target = m.jump_target().unwrap().to_string();
+            for fx in m.open_row(&RowAction::Attach(target)) {
+                if let Effect::Attach { session_id, .. } = &fx {
+                    m.attaching(4, None, false);
+                    m.asked_for(session_id);
+                }
+                sent.push(fx);
+            }
+        }
+        assert!(matches!(sent.as_slice(), [Effect::Attach { session_id, .. }] if session_id == "x"), "{sent:?}");
+        assert_eq!(m.jump_target(), Some("x"), "the same target while on its way");
+        assert_eq!(m.ticker().map(|s| s.id.as_str()), Some("x"));
+        m.apply(attached_ev(4, attached("x")));
+        assert_eq!(m.jump_target(), Some("y"));
+    }
+
+    /// M1: Enter in find. An exact name in the lists first; else the one
+    /// row showing; several rows: the user picks; no row: the daemon. With
+    /// the saved list it is asked once more, then "no session named".
+    /// Without it, the daemon's resolver gets at once only text no id can
+    /// contain; other text goes on a second Enter, after the user was told.
+    #[test]
+    fn enter_in_find() {
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["saved_sessions"]));
+        m.apply(Event::Sessions(metas(json!([
+            {"id": "l1", "name": "kite", "lifecycle": "live"},
+            {"id": "l2", "name": "kite-notes", "lifecycle": "live"},
+        ]))));
+        let all = json!([{"id": "j-axel", "name": "axel", "live": false}, {"id": "j-t", "title": "Smoke tests", "live": false}]);
+        lists(&mut m, all.clone());
+        let at = |id: &str| RowAction::Attach(id.into());
+        let fx = m.find_enter("kite", &[at("l1"), at("l2")]);
+        assert!(matches!(fx.as_slice(), [Effect::Attach { session_id, open: true, .. }] if session_id == "l1"), "exact: {fx:?}");
+        let fx = m.find_enter("axel", &[]);
+        assert!(matches!(fx.as_slice(), [Effect::Resume { req, open: true }] if req.target == "j-axel"), "exact, saved: {fx:?}");
+        let smoke = req("Smoke tests", "j-t", None);
+        assert_eq!(m.find_enter("smoke", &[RowAction::Resume(smoke.clone())]), [Effect::Resume { req: smoke, open: false }], "single");
+        assert!(m.find_enter("kit", &[at("l1"), at("l2")]).is_empty(), "ambiguous");
+        assert_eq!(m.named.error.as_deref(), Some("2 sessions match 'kit': click one, or type its exact name."));
+        assert_eq!(m.find_enter("ghost", &[]), [ASK_RECENT], "none: asked once more");
+        assert!(m.apply(saved_list(all)).is_empty());
+        assert_eq!(m.named.error.as_deref(), Some("No session named 'ghost'."));
+        assert!(m.find_enter("Axel Memory", &[]).is_empty());
+        assert_eq!(m.named.error.as_deref(), Some("Nothing matches 'Axel Memory'."));
+
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["owned_sessions"]));
+        let by_name = |n: &str| Effect::Resume { req: ResumeRequest { by_name: true, ..req_(n) }, open: true };
+        assert_eq!(m.find_enter("ghost", &[]), [by_name("ghost")], "no id can contain it");
+        assert!(m.find_enter("cafe", &[]).is_empty(), "could be part of an id");
+        assert!(m.named.error.as_deref().unwrap().contains("Press Enter again"));
+        assert_eq!(m.find_enter("cafe", &[]), [by_name("cafe")], "told, and Enter again");
+        assert!(m.find_enter("add", &[]).is_empty());
+        assert!(m.find_enter("cafe", &[]).is_empty(), "another text in between: told again");
+    }
+
+    /// M2: UNREAD is what the user has not seen. The session on screen is
+    /// seen as its transcript has it (ahead of the poll): moving away right
+    /// after its turn ends marks nothing. A turn this window sent never
+    /// marks; nor does one in a session a TUI shows (read there).
+    #[test]
+    fn unread_is_what_was_not_seen() {
+        let mut m = Model::new(ConnState::Connecting);
+        let list = |busy: bool, messages: usize, roster: Value| {
+            metas(json!([{"id": "s", "lifecycle": "live", "busy": busy, "messages": messages, "roster": roster},
+                         {"id": "b", "lifecycle": "live"}]))
+        };
+        let st = |m: &Model| m.state(m.sessions.iter().find(|s| s.id == "s").unwrap());
+        let history = |seq: u64, base_len: usize, n: usize| Event::History {
+            attach_seq: seq,
+            session_id: "s".into(),
+            seq: 0,
+            update: HistoryUpdate::Append {
+                base_len,
+                messages: (0..n).map(|i| json!({"role": "assistant", "content": format!("m{i}")})).collect(),
+            },
+        };
+        let turn = |text: Option<&str>| SessionEvent::TurnStarted {
+            turn_baseline: 0,
+            trigger: "user".into(),
+            user_text: text.map(str::to_string),
+        };
+        m.apply(Event::Sessions(list(true, 0, json!([]))));
+        attach(&mut m, 1);
+        // Another client's turn on s, watched to its end; the poll lags.
+        m.apply(session(1, turn(None)));
+        m.apply(history(1, 0, 2));
+        m.apply(session(1, SessionEvent::Idle));
+        m.want(2);
+        m.apply(attached_ev(2, attached("b")));
+        m.apply(Event::Sessions(list(false, 2, json!([]))));
+        assert_eq!(st(&m), State::Idle, "seen on screen, left within the poll");
+        // Off screen, another client adds a message: news.
+        m.apply(Event::Sessions(list(false, 3, json!([]))));
+        assert_eq!(st(&m), State::Unread);
+
+        // The user's own turn, left running: its end is not news.
+        attach(&mut m, 3);
+        m.sent("do it".into());
+        m.apply(session(3, turn(Some("do it"))));
+        m.want(4);
+        m.apply(attached_ev(4, attached("b")));
+        m.apply(Event::Sessions(list(true, 5, json!([]))));
+        m.apply(Event::Sessions(list(false, 7, json!([]))));
+        assert_eq!(st(&m), State::Idle, "own turn");
+        // A turn driven from a TUI ends: read there.
+        let tui = json!([{"id": 9, "name": "tui", "kind": "tui", "mode": "mirror", "attached_at_ms": 0}]);
+        m.apply(Event::Sessions(list(true, 7, tui.clone())));
+        m.apply(Event::Sessions(list(false, 9, tui)));
+        assert_eq!(st(&m), State::Idle, "a TUI shows it");
+        // The next one, no TUI, not ours: news again.
+        m.apply(Event::Sessions(list(true, 9, json!([]))));
+        m.apply(Event::Sessions(list(false, 11, json!([]))));
+        assert_eq!(st(&m), State::Unread);
+    }
+
+    /// L10: a resume is a held session's OPENING by id or journal, and by
+    /// name only when it was asked by name.
+    #[test]
+    fn a_resume_by_id_is_not_a_held_namesake() {
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[]));
+        m.apply(Event::Sessions(metas(json!([{"id": "l1", "name": "notes", "lifecycle": "live"}]))));
+        m.resuming(req("notes", "j-other", None), 3, false);
+        assert_eq!(m.state(&m.sessions[0]), State::Idle);
+        m.resuming(ResumeRequest { by_name: true, ..req_("notes") }, 4, true);
+        assert_eq!(m.state(&m.sessions[0]), State::Opening);
+    }
+
+    /// L8: an UNREAD mark follows the journal (resumed elsewhere under a new
+    /// id, still unread) and goes when the session is in no list.
+    #[test]
+    fn unread_follows_the_journal() {
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[]));
+        let one = |id: &str, busy: bool| metas(json!([{"id": id, "journal_id": "j-u", "lifecycle": "live", "busy": busy}]));
+        m.apply(Event::Sessions(one("u", true)));
+        m.apply(Event::Sessions(one("u", false)));
+        assert_eq!(m.state(&m.sessions[0]), State::Unread);
+        m.apply(Event::Sessions(one("u2", false)));
+        assert_eq!(m.state(&m.sessions[0]), State::Unread, "a new id, the same journal");
+        m.apply(Event::Sessions(Vec::new()));
+        assert!(m.unread.is_empty(), "in no list: pruned");
     }
 
     /// H4: a window that never renders applies every event as it comes;
@@ -1285,10 +1705,14 @@ mod tests {
     const ASK_NAMED: Effect = Effect::ListSaved { named_only: true, limit: SAVED_SESSIONS_MAX };
     const ASK_RECENT: Effect = Effect::ListSaved { named_only: false, limit: SAVED_RECENT };
 
-    /// The named list and an empty newest list, landed in the order asked.
-    fn lists(m: &mut Model, named: Value) {
-        m.apply(saved_list(named));
-        m.apply(saved_list(json!([])));
+    /// The newest list, whole (not cut): every saved session, named too.
+    fn lists(m: &mut Model, all: Value) {
+        m.apply(saved_list(all));
+    }
+
+    /// A newest list the daemon cut at the limit.
+    fn cut_list(v: Value) -> Event {
+        Event::SavedSessions { sessions: serde_json::from_value(v).unwrap(), truncated: true, rejected: 0 }
     }
 
     /// The rail's rows (every bucket open) as `(title, state, action)`.
@@ -1330,30 +1754,34 @@ mod tests {
         assert!(rows(&m).is_empty());
 
         let mut m = Model::new(ConnState::Connecting);
-        assert_eq!(m.apply(connected(&["saved_sessions"])), [ASK_NAMED], "the named list first");
+        assert_eq!(m.apply(connected(&["saved_sessions"])), [ASK_RECENT], "the newest 200 first");
         assert!(m.apply(Event::Sessions(one.clone())).is_empty(), "one request at a time");
-        assert_eq!(m.apply(saved_list(json!([]))), [ASK_RECENT], "then the newest 200");
+        assert_eq!(m.apply(cut_list(json!([]))), [ASK_NAMED], "cut: the named list too, once per connection");
         assert!(m.apply(saved_list(json!([]))).is_empty());
         for _ in 0..20 {
             let mut changed = one.clone();
             changed[0].messages += 1;
             assert!(!list_saved(&m.apply(Event::Sessions(changed))), "never on the poll");
         }
-        assert_eq!(m.apply(Event::Sessions(Vec::new())), [ASK_NAMED], "a row left OPEN");
-        lists(&mut m, json!([]));
-        assert_eq!(m.apply(renamed()), [Effect::ListSessions, ASK_NAMED], "after a rename");
+        assert_eq!(m.apply(Event::Sessions(Vec::new())), [ASK_RECENT], "a row left OPEN");
+        assert!(m.apply(cut_list(json!([]))).is_empty(), "cut, but the named list is fresh: one daemon read");
+        assert_eq!(m.apply(renamed()), [Effect::ListSessions, ASK_RECENT], "after a rename");
         // Another rename meanwhile: asked again after, never twice at once.
         assert!(!list_saved(&m.apply(renamed())));
-        assert_eq!(m.apply(saved_list(json!([]))), [ASK_RECENT]);
-        assert_eq!(m.apply(saved_list(json!([]))), [ASK_NAMED], "the second rename's");
+        assert_eq!(m.apply(cut_list(json!([]))), [ASK_RECENT], "the second rename's");
+        assert_eq!(m.apply(cut_list(json!([]))), [ASK_NAMED], "a rename makes the named list stale");
         assert!(m.apply(saved_list(json!([]))).is_empty());
+        // Not cut: it holds every saved session, named too; one request.
+        assert_eq!(m.apply(renamed()), [Effect::ListSessions, ASK_RECENT]);
+        assert!(m.apply(saved_list(json!([{"id": "j", "name": "kept", "live": false}]))).is_empty());
+        assert_eq!(rows(&m).len(), 1);
         // A dropped connection drops what was in flight; an older daemon
         // behind the same socket (Unsupported) stops the asking and HISTORY.
-        assert_eq!(m.apply(renamed()), [Effect::ListSessions, ASK_NAMED]);
+        assert_eq!(m.apply(renamed()), [Effect::ListSessions, ASK_RECENT]);
         m.apply(Event::Status(Status::Reconnecting { why: "x".into() }));
-        assert!(m.apply(saved_list(json!([{"id": "j", "name": "kept", "live": false}]))).is_empty());
-        assert!(m.named.saved.is_empty(), "not asked on this connection");
-        assert_eq!(m.apply(connected(&["saved_sessions"])), [ASK_NAMED]);
+        assert!(m.apply(saved_list(json!([{"id": "j2", "name": "late", "live": false}]))).is_empty());
+        assert!(!m.named.recent.iter().any(|v| v.id == "j2"), "not asked on this connection");
+        assert_eq!(m.apply(connected(&["saved_sessions"])), [ASK_RECENT]);
         lists(&mut m, json!([{"id": "j", "name": "kept", "live": false}]));
         assert_eq!(rows(&m).len(), 1);
         m.apply(Event::Error { attach_seq: None, error: Error::Unsupported { feature: "saved_sessions" } });
@@ -1407,6 +1835,7 @@ mod tests {
         assert_eq!((o.cwd, o.fallback_cwd), (Cwd::Path("/home/u/Projects/bebop".into()), Some(Cwd::Home)));
         m.resuming(bebop.clone(), 7, false);
         assert_eq!(state_of(&m, "bebop"), State::Opening);
+        assert!(m.open_row(&row_action(&m, "bebop")).is_empty(), "L4: a double-click resumes once");
         m.apply(Event::CwdFallback { attach_seq: 7, missing: "/home/u/Projects/bebop".into(), cwd: None });
         assert_eq!(m.named.notice.as_deref(), Some("Folder /home/u/Projects/bebop is gone on the daemon's machine; resumed in ~."));
         let fx = m.apply(attached_ev(7, attached("live-bebop")));
@@ -1474,16 +1903,14 @@ mod tests {
         assert_eq!(m.open_by_name("axel"), vec![want.clone()]);
 
         // Part of an id, not a name: asked again, then refused locally.
-        assert_eq!(m.open_by_name("64fb"), [ASK_NAMED]);
-        assert_eq!(m.apply(saved_list(json!([axel]))), [ASK_RECENT]);
+        assert_eq!(m.open_by_name("64fb"), [ASK_RECENT]);
+        assert!(m.apply(saved_list(json!([axel]))).is_empty());
         assert_eq!(m.named.error.as_deref(), Some("No session named '64fb'."));
         assert!(m.named.opening.is_none());
-        m.apply(saved_list(json!([])));
         // A name made since the last list is in the fresh one.
-        assert_eq!(m.open_by_name("new-one"), [ASK_NAMED]);
+        assert_eq!(m.open_by_name("new-one"), [ASK_RECENT]);
         let fx = m.apply(saved_list(json!([axel, {"id": "j-new", "name": "new-one", "live": false}])));
-        assert_eq!(fx, [Effect::Resume { req: req("new-one", "j-new", None), open: true }, ASK_RECENT]);
-        m.apply(saved_list(json!([])));
+        assert_eq!(fx, [Effect::Resume { req: req("new-one", "j-new", None), open: true }]);
 
         // The outcome: the input clears on `Attached`, not before.
         m.open_by_name("axel");
@@ -1494,25 +1921,27 @@ mod tests {
     }
 
     /// M3 on a daemon without the saved list: it resolves the name, in `~`
-    /// (no folder known, and said so), and the attached session must carry
-    /// that name: the daemon's resolver also takes any id containing it,
-    /// and such a session is detached at once, quietly. A failure keeps
-    /// the typed text.
+    /// (no folder known, and said so). Its resolver also takes the one id
+    /// containing the text: text that could be part of an id goes only on
+    /// a second Enter, after the user was told, and whatever the daemon
+    /// opened then stays on screen, said so (never detached and left
+    /// loaded). A failure keeps the typed text.
     #[test]
     fn open_by_name_without_the_saved_list_checks_the_name() {
         use synaps_client::Cwd;
         let mut m = Model::new(ConnState::Connecting);
         m.apply(connected(&["owned_sessions"]));
+        assert!(m.open_by_name("fe").is_empty(), "could be part of an id: told first");
+        assert!(m.named.error.as_deref().unwrap().contains("Press Enter again"));
         let by_name = ResumeRequest { by_name: true, ..req_("fe") };
         assert_eq!(m.open_by_name("fe"), vec![Effect::Resume { req: by_name.clone(), open: true }]);
         assert_eq!((by_name.options().cwd, by_name.options().fallback_cwd), (Cwd::Home, None));
         m.resuming(by_name.clone(), 3, true);
         let fx = m.apply(attached_ev(3, attached_named("20261110-202033-64fe", None)));
-        assert_eq!(fx, vec![Effect::Detach]);
-        assert_eq!(m.named.error.as_deref(), Some("No session named 'fe'."));
-        assert!(m.active.is_none() && !m.named.opened);
-        m.apply(detached(3, "detached"));
-        assert!(m.last_error.is_none(), "the detach we asked for is quiet");
+        assert_eq!(fx, [Effect::ListSessions], "stays attached");
+        let notice = m.named.notice.as_deref().unwrap();
+        assert!(notice.contains("No session is named 'fe'") && notice.contains("20261110-202033-64fe"), "{notice}");
+        assert_eq!(m.active.as_ref().unwrap().session_id, "20261110-202033-64fe");
 
         let axel = ResumeRequest { by_name: true, ..req_("axel") };
         m.open_by_name("axel");
@@ -1578,17 +2007,24 @@ mod tests {
         assert!(fx.is_empty(), "what was queued behind it goes too");
         assert!(m.named.saved_note.as_deref().unwrap().contains("Permission denied"));
         assert!(m.last_error.is_none());
-        // Asked again on the next event, not on the poll.
+        // L2: HISTORY says it failed ("—"), not "…" forever.
+        let shape = |m: &Model| {
+            let rail = crate::rail::build(m, &crate::rail::View::default(), 0);
+            rail.items.iter().map(|i| format!("{i:?}")).collect::<Vec<_>>().join(" | ")
+        };
+        assert!(shape(&m).contains("History, count: \"—\"") && shape(&m).contains("could not be listed"), "{}", shape(&m));
+        // Asked again on the next event (or find gaining focus), not on the poll.
         assert!(!list_saved(&m.apply(Event::Sessions(metas(json!([{"id": "a", "lifecycle": "live"}]))))));
         let renamed = Event::Renamed { session_id: "s".into(), name: Some("a".into()), in_memory_only: false };
         assert!(list_saved(&m.apply(renamed)));
         let fx = m.apply(Event::SavedSessions { sessions: Vec::new(), truncated: true, rejected: 2 });
-        assert_eq!(fx, [ASK_RECENT]);
+        assert_eq!(fx, [ASK_NAMED]);
         assert_eq!(m.named.saved_note.as_deref(), Some("2 saved sessions could not be read (skipped)."));
-        assert!(m.named.saved_truncated);
+        assert!(m.named.recent_truncated && m.named.recent_loaded && !m.named.saved_failed);
         m.apply(Event::SavedSessions { sessions: Vec::new(), truncated: true, rejected: 0 });
-        assert!(m.named.recent_truncated && m.named.recent_loaded);
+        assert!(m.named.saved_truncated);
         assert!(m.last_error.is_none());
+        assert_eq!(m.looking(), [Effect::ListSaved { named_only: false, limit: SAVED_SESSIONS_MAX }], "find focused: the cap");
     }
 
     /// "Name this session…" (M2, L3): validated first, one at a time, the
@@ -2057,8 +2493,8 @@ mod fake_daemon {
 
     /// HISTORY end to end, both ways (the rail through the client, the
     /// model and the rail builder). A daemon that lists `saved_sessions`
-    /// is asked for the named list, then the newest 200, one at a time,
-    /// and HISTORY is drawn in its buckets, less what the daemon holds. One
+    /// is asked for the newest 200 (the named list too only if that was
+    /// cut), and HISTORY is drawn in its buckets, less what the daemon holds. One
     /// that does not is never asked, and HISTORY says why and what works.
     #[test]
     fn history_with_and_without_saved_sessions() {
@@ -2104,11 +2540,8 @@ mod fake_daemon {
                 })
                 .collect();
             if saved {
-                let want = [
-                    json!({"type": "saved_sessions", "named_only": true, "limit": 1000}),
-                    json!({"type": "saved_sessions", "named_only": false, "limit": 200}),
-                ];
-                assert_eq!(asks, want);
+                // The newest 200 hold everything (not cut): one request.
+                assert_eq!(asks, [json!({"type": "saved_sessions", "named_only": false, "limit": 200})]);
                 assert_eq!(
                     shape,
                     [
