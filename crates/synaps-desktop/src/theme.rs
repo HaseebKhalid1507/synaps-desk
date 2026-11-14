@@ -1049,7 +1049,16 @@ pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<(
 /// one (and, on Unix, the directory synced so the rename survives a
 /// crash); the temporary file never outlives a failure.
 pub fn save_settings(path: &Path, keys: &[(&str, serde_json::Value)]) -> std::io::Result<()> {
+    save_settings_unless(path, keys, || false)
+}
+
+/// [`save_settings`], unless `stale()` (asked under the writer's lock)
+/// says a later write already holds these keys: then nothing changes.
+pub fn save_settings_unless(path: &Path, keys: &[(&str, serde_json::Value)], stale: impl FnOnce() -> bool) -> std::io::Result<()> {
     update_settings(path, |v| {
+        if stale() {
+            return;
+        }
         for (k, val) in keys {
             v[*k] = val.clone();
         }
@@ -1512,6 +1521,23 @@ mod tests {
         assert!(left.is_empty(), "{left:?}");
         std::fs::write(&path, r#"{"accent": "garbage"}"#).unwrap();
         assert_eq!(resolve_accent(None, None, load_accent(&path).as_deref()).0, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nit 5: a THIS APP batch a quit's flush wrote again changes nothing
+    /// when its own write lands late.
+    #[test]
+    fn a_stale_settings_write_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-stale-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        save_settings(&path, &[("text_size", 15.into()), ("dash_url", "new".into())]).unwrap();
+        save_settings_unless(&path, &[("dash_url", "old".into())], || true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((v["dash_url"].as_str(), v["text_size"].as_u64()), (Some("new"), Some(15)));
+        save_settings_unless(&path, &[("dash_url", "later".into())], || false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["dash_url"], "later");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

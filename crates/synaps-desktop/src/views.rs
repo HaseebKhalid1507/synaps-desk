@@ -27,6 +27,7 @@ use synaps_client::discovery::DaemonInfo;
 
 use crate::app::{AppView, OpenSettings, OpenUsage, display, mono};
 use crate::dash::{self, ConfigSnapshot, Fail, Info, Source, Target};
+use crate::model::{ConnState, Daemon};
 use crate::settings_view::Write;
 use crate::tabs::Kind;
 use crate::theme::Palette;
@@ -54,22 +55,45 @@ pub struct Launch {
 }
 
 /// Is the daemon on this machine? One rule for every launch (`--profile`,
-/// `$SYNAPS_PROFILE`, the default daemon, `--socket`): a registry entry in
-/// this machine's run dir has the `Welcome`'s pid and names the socket this
-/// window resolves to, and that pid is a daemon process here
-/// (`daemon_here`). A forward at the conventional path, an empty or stale
-/// registry, an unknown pid: not proven. `Err`: why, in one line.
-pub fn locality(resolved: Option<&Path>, registry: &[DaemonInfo], pid: u32, daemon_here: impl Fn(u32) -> bool) -> Result<(), String> {
+/// `$SYNAPS_PROFILE`, the default daemon, `--socket`): exactly one registry
+/// entry in this machine's run dir has the `Welcome`'s pid, and it names
+/// the socket this window resolves to and the `Welcome`'s profile and
+/// version; and that pid is a daemon process here (`daemon_here`). A
+/// forward at the conventional path, an empty or stale registry, an
+/// unknown pid, two entries for one pid (one is stale): not proven. `Err`:
+/// why, in one line.
+pub fn locality(
+    resolved: Option<&Path>,
+    registry: &[DaemonInfo],
+    daemon: &Daemon,
+    daemon_here: impl Fn(u32) -> bool,
+) -> Result<(), String> {
+    let pid = daemon.pid;
     if pid == 0 {
         return Err("the daemon did not say its pid".into());
     }
     let Some(socket) = resolved else { return Err("no socket to check".into()) };
-    let entries: Vec<&DaemonInfo> = registry.iter().filter(|d| d.pid == pid).collect();
-    if entries.is_empty() {
-        return Err(format!("no registry entry on this machine has its pid {pid}"));
-    }
-    if !entries.iter().any(|d| same_path(&d.socket_path(), socket)) {
+    let entry = match registry.iter().filter(|d| d.pid == pid).collect::<Vec<_>>()[..] {
+        [] => return Err(format!("no registry entry on this machine has its pid {pid}")),
+        [e] => e,
+        ref many => return Err(format!("{} registry entries on this machine claim pid {pid} (one is stale)", many.len())),
+    };
+    if !same_path(&entry.socket_path(), socket) {
         return Err(format!("this machine's registry entry for pid {pid} names another socket"));
+    }
+    if !dash::same_profile(entry.profile.as_deref(), daemon.profile.as_deref()) {
+        return Err(format!(
+            "this machine's registry entry for pid {pid} is profile {}, the daemon says {}",
+            dash::profile_name(entry.profile.as_deref()),
+            dash::profile_name(daemon.profile.as_deref())
+        ));
+    }
+    if entry.daemon_version != daemon.version {
+        return Err(format!(
+            "this machine's registry entry for pid {pid} is version {}, the daemon says {}",
+            if entry.daemon_version.is_empty() { "unknown" } else { &entry.daemon_version },
+            daemon.version
+        ));
     }
     if !daemon_here(pid) {
         return Err(format!("pid {pid} is not a daemon process on this machine"));
@@ -201,6 +225,8 @@ pub(crate) struct DashUi {
     finding: bool,
     /// Asked for while a find ran (it runs again after this one).
     refind: bool,
+    /// A 401 started a find for the new token; cleared by an answer.
+    token_refound: bool,
     /// Asked for while a find, a read or a write ran: done after it.
     want_config: bool,
     want_usage: bool,
@@ -255,8 +281,8 @@ impl DashUi {
                 return Err(format!(
                     "the dash serves pid {} ({}), not this daemon's pid {pid} ({})",
                     i.pid,
-                    i.profile.as_deref().filter(|p| !p.is_empty()).unwrap_or("default"),
-                    profile.filter(|p| !p.is_empty()).unwrap_or("default"),
+                    dash::profile_name(i.profile.as_deref()),
+                    dash::profile_name(profile),
                 ));
             }
             Some(Ok(_)) => {}
@@ -272,6 +298,34 @@ impl DashUi {
     }
 }
 
+impl DashUi {
+    /// The dash's config as this daemon's: only when `/api/info` names its
+    /// pid and profile (`daemon`, from its `Welcome`). Another daemon's
+    /// values (avante's dash read for a forwarded jade) are never shown as
+    /// this one's.
+    pub fn config_of(&self, daemon: Option<(u32, Option<&str>)>) -> Option<&ConfigSnapshot> {
+        let (pid, profile) = daemon?;
+        match &self.serves {
+            Some(Ok(i)) if i.serves(pid, profile) => self.config.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// A config was read but is not this daemon's ([`DashUi::config_of`]):
+    /// whose it is, in one line.
+    pub fn config_foreign(&self, daemon: Option<(u32, Option<&str>)>) -> Option<String> {
+        daemon?;
+        if self.config.is_none() || self.config_of(daemon).is_some() {
+            return None;
+        }
+        Some(match &self.serves {
+            Some(Ok(i)) => format!("the dash serves pid {} ({}), not this daemon", i.pid, dash::profile_name(i.profile.as_deref())),
+            Some(Err(e)) => format!("the dash did not say which daemon it serves: {e}"),
+            None => "the dash did not say which daemon it serves".into(),
+        })
+    }
+}
+
 /// One look at this machine, off the UI thread: where the daemon runs,
 /// where its dash is, and (local) its config's REFERENCE values.
 pub(crate) struct Probe {
@@ -281,8 +335,8 @@ pub(crate) struct Probe {
     reference: Option<crate::settings::Reference>,
 }
 
-/// [`Probe`] for the daemon `daemon` (its `Welcome`'s pid and profile).
-pub(crate) fn probe(launch: &Launch, daemon: Option<(u32, Option<String>)>, env: Option<&str>, setting: Option<&str>) -> Probe {
+/// [`Probe`] for the daemon `daemon` (its `Welcome`).
+pub(crate) fn probe(launch: &Launch, daemon: Option<Daemon>, env: Option<&str>, setting: Option<&str>) -> Probe {
     let (run, base) = (synaps_client::discovery::run_dir(), synaps_client::discovery::base_dir());
     let socket = launch.endpoint.as_ref().map(Endpoint::resolve);
     probe_in(&run, &base, socket, launch.dash_flag.as_deref(), daemon, env, setting)
@@ -295,13 +349,13 @@ fn probe_in(
     base: &Path,
     socket: Option<PathBuf>,
     flag: Option<&str>,
-    daemon: Option<(u32, Option<String>)>,
+    daemon: Option<Daemon>,
     env: Option<&str>,
     setting: Option<&str>,
 ) -> Probe {
-    let local = daemon.as_ref().map(|(pid, _)| locality(socket.as_deref(), &synaps_client::discovery::list_in(run), *pid, daemon_process));
+    let local = daemon.as_ref().map(|d| locality(socket.as_deref(), &synaps_client::discovery::list_in(run), d, daemon_process));
     let here = matches!(local, Some(Ok(())));
-    let profile = daemon.and_then(|d| d.1);
+    let profile = daemon.and_then(|d| d.profile);
     let found = dash::discover(here, run, profile.as_deref(), flag, env, setting);
     let reference = here.then(|| crate::settings::read_reference(base, profile.as_deref()));
     Probe { socket, local, found, reference }
@@ -455,15 +509,26 @@ pub(crate) fn bars_glyph(color: Hsla) -> Div {
 }
 
 /// The view keys: Ctrl+, Settings, Ctrl+Shift+U Usage (Cmd on macOS), and
-/// Ctrl+Alt+U for Usage off macOS: IBus takes Ctrl+Shift+U for Unicode
-/// entry while a text field has the focus.
-pub(crate) const fn view_keys(mac: bool) -> (&'static str, &'static str, Option<&'static str>) {
-    if mac { ("cmd-,", "cmd-shift-u", None) } else { ("ctrl-,", "ctrl-shift-u", Some("ctrl-alt-u")) }
+/// Ctrl+Alt+U for Usage on Linux: IBus takes Ctrl+Shift+U for Unicode
+/// entry while a text field has the focus. Never on Windows, where
+/// Ctrl+Alt is AltGr and types a character on some layouts.
+pub(crate) const fn view_keys(mac: bool, linux: bool) -> (&'static str, &'static str, Option<&'static str>) {
+    match (mac, linux) {
+        (true, _) => ("cmd-,", "cmd-shift-u", None),
+        (false, true) => ("ctrl-,", "ctrl-shift-u", Some("ctrl-alt-u")),
+        (false, false) => ("ctrl-,", "ctrl-shift-u", None),
+    }
 }
 
-/// How the menu writes them.
+/// How the menu writes them (both of Usage's on Linux).
 fn key_names() -> (&'static str, &'static str) {
-    if cfg!(target_os = "macos") { ("Cmd+,", "Cmd+Shift+U") } else { ("Ctrl+,", "Ctrl+Shift+U") }
+    if cfg!(target_os = "macos") {
+        ("Cmd+,", "Cmd+Shift+U")
+    } else if cfg!(target_os = "linux") {
+        ("Ctrl+,", "Ctrl+Shift+U · Ctrl+Alt+U")
+    } else {
+        ("Ctrl+,", "Ctrl+Shift+U")
+    }
 }
 
 impl AppView {
@@ -503,9 +568,28 @@ impl AppView {
         self.model.daemon.as_ref().map(|d| (&d.version, &d.profile, d.pid)).hash(&mut h);
         match kind {
             Kind::Settings => {
+                std::mem::discriminant(&self.model.conn).hash(&mut h);
                 self.model.active.as_ref().map(|a| &a.session_id).hash(&mut h);
                 self.model.tabs.current().map(|t| (t.id, &t.label)).hash(&mut h);
-                (self.model.transcript.title(), self.model.active_name(), &self.model.stats.view).hash(&mut h);
+                (self.model.transcript.title(), self.model.active_name()).hash(&mut h);
+                // The system prompt by its allocation, not its text (nit 7:
+                // never hashed whole each frame); a new view is a new one.
+                self.model
+                    .stats
+                    .view
+                    .as_ref()
+                    .map(|v| {
+                        let prompt = v.system_prompt.as_ref().map(|p| (Arc::as_ptr(p).cast::<u8>() as usize, p.len()));
+                        (
+                            &v.model,
+                            &v.effort,
+                            v.context_window,
+                            &v.compaction_model,
+                            (v.api_retries, v.subagent_timeout, v.max_tool_output, v.bash_timeout),
+                            prompt,
+                        )
+                    })
+                    .hash(&mut h);
                 (self.panels, self.theme_source, self.accent_source, self.theme_follows_config).hash(&mut h);
             }
             Kind::Usage => self.model.sessions.iter().for_each(|s| s.id.hash(&mut h)),
@@ -549,13 +633,25 @@ impl AppView {
 
     // ── the channel ────────────────────────────────────────────────────
 
+    /// The daemon's pid and profile, while connected to it (its last
+    /// `Welcome` says nothing about a daemon being reconnected to).
     fn daemon_id(&self) -> Option<(u32, Option<&str>)> {
-        self.model.daemon.as_ref().map(|d| (d.pid, d.profile.as_deref()))
+        self.model.daemon.as_ref().filter(|_| matches!(self.model.conn, ConnState::Connected(_))).map(|d| (d.pid, d.profile.as_deref()))
     }
 
     /// May CONFIG be written ([`DashUi::config_gate`])? `Err`: why not.
     pub(crate) fn config_gate(&self) -> Result<(), String> {
         self.dash.config_gate(self.daemon_id())
+    }
+
+    /// The dash's config, when it is this daemon's ([`DashUi::config_of`]).
+    pub(crate) fn shown_config(&self) -> Option<&ConfigSnapshot> {
+        self.dash.config_of(self.daemon_id())
+    }
+
+    /// Whose config the dash has, when not this daemon's.
+    pub(crate) fn config_foreign(&self) -> Option<String> {
+        self.dash.config_foreign(self.daemon_id())
     }
 
     /// The channel must be found (again) first: never yet for this daemon,
@@ -579,7 +675,7 @@ impl AppView {
         self.dash.finding = true;
         let g = self.model.daemon_gen;
         let launch = self.dash.launch.clone();
-        let daemon = self.model.daemon.as_ref().map(|d| (d.pid, d.profile.clone()));
+        let daemon = self.model.daemon.clone();
         let setting = self.app_settings.dash_url.clone();
         cx.spawn(async move |this, cx| {
             let p = cx
@@ -658,18 +754,26 @@ impl AppView {
 
     /// The channel answered (`Ok`) or not: what Settings and the rail say.
     /// A refusal (telemetry off, a 4xx) is an answer: the dash is up.
-    fn dash_said(&mut self, r: Result<(), &Fail>) {
+    fn dash_said(&mut self, r: Result<(), &Fail>, cx: &mut Context<Self>) {
         let down = matches!(r, Err(Fail::Token | Fail::NoToken | Fail::Unreachable(_)));
         self.dash.answer = match r {
             Err(e) if down => Answer::Down(e.clone()),
             _ => Answer::Up,
         };
-        if down {
-            // Settings falls back to its no-dash state; the token is new
-            // at each daemon start, so look for it again next time.
-            self.dash.config = None;
-            self.dash.serves = None;
-            self.dash.found_gen = None;
+        if !down {
+            self.dash.token_refound = false;
+            return;
+        }
+        // Settings falls back to its no-dash state; the token is new at
+        // each daemon start, so look for it again next time.
+        self.dash.config = None;
+        self.dash.serves = None;
+        self.dash.found_gen = None;
+        // N-L4: a dash restarted under the same daemon (an extension
+        // reload) wrote its new token already: read it now, once (a URL
+        // file still stale waits for the poll).
+        if matches!(r, Err(Fail::Token)) && !std::mem::replace(&mut self.dash.token_refound, true) {
+            self.dash_find(cx);
         }
     }
 
@@ -721,10 +825,10 @@ impl AppView {
                     v.dash.serves = Some(info.map_err(|e| v.fail_text(&e)));
                     match got {
                         Ok(c) => {
-                            v.dash_said(Ok(()));
+                            v.dash_said(Ok(()), cx);
                             v.dash.config = Some(c);
                         }
-                        Err(e) => v.dash_said(Err(&e)),
+                        Err(e) => v.dash_said(Err(&e), cx),
                     }
                 }
                 if std::mem::take(&mut v.dash.want_config) {
@@ -766,7 +870,7 @@ impl AppView {
                 if v.dash.order.fresh(seq) {
                     match got {
                         Ok(c) => {
-                            v.dash_said(Ok(()));
+                            v.dash_said(Ok(()), cx);
                             v.dash.config = Some(c);
                             if !newer {
                                 v.settings.writes.remove(key);
@@ -774,7 +878,7 @@ impl AppView {
                         }
                         Err(e) => {
                             if matches!(e, Fail::Token | Fail::NoToken | Fail::Unreachable(_)) {
-                                v.dash_said(Err(&e));
+                                v.dash_said(Err(&e), cx);
                             }
                             if !newer {
                                 v.settings.writes.insert(key, Write::Refused(v.fail_text(&e)));
@@ -785,8 +889,12 @@ impl AppView {
                 match next {
                     Some(n) if v.config_gate().is_ok() => v.send_write(n, cx),
                     Some(_) => {
+                        // The gate closed meanwhile: what waited is not sent, and says why.
+                        let why = format!("not sent: {}", v.config_gate().err().unwrap_or_default());
                         v.dash.order.abandon();
-                        v.settings.writes.retain(|_, w| !matches!(w, Write::Sending(_)));
+                        for w in v.settings.writes.values_mut().filter(|w| matches!(w, Write::Sending(_))) {
+                            *w = Write::Refused(why.clone());
+                        }
                     }
                     None if std::mem::take(&mut v.dash.want_config) => v.ask_config(cx),
                     None => {}
@@ -834,7 +942,7 @@ impl AppView {
                     v.usage.fetched = Some(Instant::now());
                     match got {
                         Ok((board, today)) => {
-                            v.dash_said(Ok(()));
+                            v.dash_said(Ok(()), cx);
                             if !board.hosts.is_empty() {
                                 v.usage.chips = board.hosts.clone();
                                 // A saved host the store no longer has: ALL.
@@ -850,7 +958,7 @@ impl AppView {
                             v.dash.today = today;
                         }
                         Err(e) => {
-                            v.dash_said(Err(&e));
+                            v.dash_said(Err(&e), cx);
                             v.usage.error = Some(v.fail_text(&e));
                         }
                     }
@@ -886,8 +994,8 @@ impl AppView {
                 let today = got.as_ref().ok().copied().flatten();
                 let before = v.dash.answer.clone();
                 match &got {
-                    Ok(_) => v.dash_said(Ok(())),
-                    Err(e) => v.dash_said(Err(e)),
+                    Ok(_) => v.dash_said(Ok(()), cx),
+                    Err(e) => v.dash_said(Err(e), cx),
                 }
                 if v.dash.answer != before {
                     v.views_changed(cx);
@@ -1035,7 +1143,7 @@ impl AppView {
             .absolute()
             .left(px(if folded { 6. } else { 14. }))
             .bottom(px(FOOT + 4.))
-            .w(px(240.))
+            .w(px(300.))
             .py(px(4.))
             .bg(p.card)
             .border_1()
@@ -1067,11 +1175,24 @@ mod tests {
     // Not `super::*`: gpui_kit's `test` attribute would shadow the built-in.
     use super::{Answer, ConfigOrder, DashUi, locality, probe_in, view_keys};
     use crate::dash::{ConfigSnapshot, Fail, Info, Source, Target};
+    use crate::model::Daemon;
     use std::path::{Path, PathBuf};
     use synaps_client::discovery::DaemonInfo;
 
     fn info(pid: u32, socket: &str) -> DaemonInfo {
-        serde_json::from_value(serde_json::json!({"pid": pid, "protocol_version": 3, "socket": socket})).unwrap()
+        entry(pid, socket, None, "0.11.1")
+    }
+
+    fn entry(pid: u32, socket: &str, profile: Option<&str>, version: &str) -> DaemonInfo {
+        serde_json::from_value(
+            serde_json::json!({"pid": pid, "protocol_version": 3, "daemon_version": version, "profile": profile, "socket": socket}),
+        )
+        .unwrap()
+    }
+
+    /// A `Welcome` from the default daemon, version 0.11.1.
+    fn daemon(pid: u32) -> Daemon {
+        Daemon { version: "0.11.1".into(), profile: None, pid }
     }
 
     const YES: fn(u32) -> bool = |_| true;
@@ -1082,20 +1203,49 @@ mod tests {
     fn local_is_a_registry_entry_with_this_pid_and_socket() {
         let sock = Path::new("/run/x/daemon.sock");
         let reg = [info(7, "/run/x/daemon.sock")];
-        assert_eq!(locality(Some(sock), &reg, 7, YES), Ok(()));
+        assert_eq!(locality(Some(sock), &reg, &daemon(7), YES), Ok(()));
         // An empty registry is never local, whatever the launch was.
-        assert!(locality(Some(sock), &[], 7, YES).unwrap_err().contains("no registry entry"));
+        assert!(locality(Some(sock), &[], &daemon(7), YES).unwrap_err().contains("no registry entry"));
         // The ssh-forward recipe: a forward at the conventional path. The
         // remote's pid is in no entry here (or a stale entry has another pid).
-        assert!(locality(Some(sock), &[info(4242, "/run/x/daemon.sock")], 7, YES).unwrap_err().contains("pid 7"));
+        assert!(locality(Some(sock), &[info(4242, "/run/x/daemon.sock")], &daemon(7), YES).unwrap_err().contains("pid 7"));
         // The pid is a registry's, but for another socket (a forward placed elsewhere).
         let fwd = Path::new("/tmp/avante.sock");
-        assert!(locality(Some(fwd), &reg, 7, YES).unwrap_err().contains("another socket"));
+        assert!(locality(Some(fwd), &reg, &daemon(7), YES).unwrap_err().contains("another socket"));
         // A stale entry whose pid happens to match: not a daemon process here.
-        assert!(locality(Some(sock), &reg, 7, |_| false).unwrap_err().contains("not a daemon process"));
+        assert!(locality(Some(sock), &reg, &daemon(7), |_| false).unwrap_err().contains("not a daemon process"));
         // An older daemon that says no pid.
-        assert!(locality(Some(sock), &[info(0, "/run/x/daemon.sock")], 0, YES).is_err());
-        assert!(locality(None, &reg, 7, YES).is_err());
+        assert!(locality(Some(sock), &[info(0, "/run/x/daemon.sock")], &daemon(0), YES).is_err());
+        assert!(locality(None, &reg, &daemon(7), YES).is_err());
+    }
+
+    /// N-L3: the pid alone does not bind. A crashed default daemon's stale
+    /// `daemon.json` (pid Q, `run/daemon.sock`), Q reused by a local
+    /// `--profile work` daemon (its own `daemon-work.json`, pid Q), and a
+    /// forward at `run/daemon.sock` to a remote whose pid is also Q: two
+    /// entries claim Q, so not proven. With one entry, its profile and
+    /// version must be the `Welcome`'s.
+    #[test]
+    fn local_needs_one_entry_with_the_welcomes_profile_and_version() {
+        let sock = Path::new("/run/x/daemon.sock");
+        let stale = entry(9, "/run/x/daemon.sock", None, "0.11.1");
+        let work = entry(9, "/run/x/daemon-work.sock", Some("work"), "0.11.1");
+        let why = locality(Some(sock), &[stale.clone(), work.clone()], &daemon(9), YES).unwrap_err();
+        assert_eq!(why, "2 registry entries on this machine claim pid 9 (one is stale)");
+        // One entry: the profile must be the Welcome's (none and "" are the default).
+        let named = Daemon { profile: Some("work".into()), ..daemon(9) };
+        let w = Path::new("/run/x/daemon-work.sock");
+        assert_eq!(locality(Some(w), std::slice::from_ref(&work), &named, YES), Ok(()));
+        let why = locality(Some(sock), &[entry(9, "/run/x/daemon.sock", Some("work"), "0.11.1")], &daemon(9), YES).unwrap_err();
+        assert_eq!(why, "this machine's registry entry for pid 9 is profile work, the daemon says default");
+        assert_eq!(locality(Some(sock), &[entry(9, "/run/x/daemon.sock", Some(""), "0.11.1")], &daemon(9), YES), Ok(()));
+        // And its version (an entry with none, from an older daemon: not proven).
+        let why = locality(Some(sock), &[entry(9, "/run/x/daemon.sock", None, "0.10.0")], &daemon(9), YES).unwrap_err();
+        assert_eq!(why, "this machine's registry entry for pid 9 is version 0.10.0, the daemon says 0.11.1");
+        let old: DaemonInfo =
+            serde_json::from_value(serde_json::json!({"pid": 9, "protocol_version": 3, "socket": "/run/x/daemon.sock"})).unwrap();
+        assert!(locality(Some(sock), &[old], &daemon(9), YES).unwrap_err().contains("version unknown"));
+        assert_eq!(locality(Some(sock), &[stale], &daemon(9), YES), Ok(()));
     }
 
     /// The probe on a real run dir: a forward put at the conventional
@@ -1110,7 +1260,8 @@ mod tests {
         std::fs::write(dir.join("synaps-dash-p.url"), "http://127.0.0.1:7801/?token=ab\n").unwrap();
         let sock = dir.join("daemon-p.sock");
         let me = std::process::id();
-        let probe = |flag: Option<&str>| probe_in(&dir, &dir, Some(sock.clone()), flag, Some((me, Some("p".into()))), None, None);
+        let welcome = Daemon { version: "0.11.1".into(), profile: Some("p".into()), pid: me };
+        let probe = |flag: Option<&str>| probe_in(&dir, &dir, Some(sock.clone()), flag, Some(welcome.clone()), None, None);
         let p = probe(None);
         assert!(p.local.as_ref().unwrap().as_ref().unwrap_err().contains("no registry entry"), "{:?}", p.local);
         assert!(p.found.is_none() && p.reference.is_none(), "a remote daemon's URL file and config are never read");
@@ -1120,7 +1271,7 @@ mod tests {
         std::fs::write(dir.join("daemon-q.json"), "not json").unwrap();
         assert!(probe(None).local.unwrap().is_err());
         // This process's own entry for that socket.
-        let entry = serde_json::json!({"pid": me, "protocol_version": 3, "profile": "p", "socket": sock});
+        let entry = serde_json::json!({"pid": me, "protocol_version": 3, "daemon_version": "0.11.1", "profile": "p", "socket": sock});
         std::fs::write(dir.join("daemon-p.json"), entry.to_string()).unwrap();
         let p = probe(None);
         if cfg!(target_os = "linux") {
@@ -1196,6 +1347,38 @@ mod tests {
         assert!(zero.config_gate(Some((0, None))).is_err());
     }
 
+    /// N-M1: a dash's config shows as this daemon's only when `/api/info`
+    /// names its pid and profile. Avante's dash read for a forwarded jade
+    /// (or any dash serving another daemon) shows `—`, and says whose it is.
+    #[test]
+    fn config_shows_only_for_the_daemon_the_dash_serves() {
+        let me = Some((7, Some("p")));
+        // The daemon's own dash (local, or a remote's own forwarded): shown.
+        assert!(proven().config_of(me).is_some() && proven().config_foreign(me).is_none());
+        let remote = DashUi {
+            local: Some(Err("no registry entry on this machine has its pid 7".into())),
+            found: Some(Ok((target("http://127.0.0.1:7717/?token=ab"), Source::Flag))),
+            ..proven()
+        };
+        assert!(remote.config_of(me).is_some(), "a remote's own dash: read-only, but its values are this daemon's");
+        // Another daemon's dash: never shown, and the line says whose.
+        let avante = DashUi { serves: Some(Ok(Info { pid: 4242, profile: None })), ..remote };
+        assert!(avante.config_of(me).is_none());
+        assert_eq!(avante.config_foreign(me).as_deref(), Some("the dash serves pid 4242 (default), not this daemon"));
+        let other_profile = DashUi { serves: Some(Ok(Info { pid: 7, profile: Some("work".into()) })), ..proven() };
+        assert!(other_profile.config_of(me).is_none());
+        assert_eq!(other_profile.config_foreign(me).as_deref(), Some("the dash serves pid 7 (work), not this daemon"));
+        // A dash that does not say (an older one, a refusal): not shown either.
+        for serves in [None, Some(Err("404".to_string()))] {
+            let d = DashUi { serves, ..proven() };
+            assert!(d.config_of(me).is_none());
+            assert!(d.config_foreign(me).unwrap().starts_with("the dash did not say which daemon it serves"));
+        }
+        // Nothing read: nothing to say. Not connected: nothing is this daemon's.
+        assert_eq!(DashUi { config: None, ..proven() }.config_foreign(me), None);
+        assert!(proven().config_of(None).is_none());
+    }
+
     /// M2: one write in flight, the latest value per key queued, replies
     /// applied in request order, no read while a write is out.
     #[test]
@@ -1232,8 +1415,9 @@ mod tests {
 
     #[test]
     fn view_keys_parse() {
-        for mac in [false, true] {
-            let (a, b, c) = view_keys(mac);
+        for (mac, linux) in [(false, true), (false, false), (true, false)] {
+            let (a, b, c) = view_keys(mac, linux);
+            assert_eq!(c.is_some(), linux, "Ctrl+Alt+U on Linux only (AltGr on Windows)");
             for k in [Some(a), Some(b), c].into_iter().flatten() {
                 gpui_kit::Keystroke::parse(k).unwrap_or_else(|e| panic!("{k}: {e:?}"));
             }
