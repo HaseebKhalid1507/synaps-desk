@@ -1,16 +1,19 @@
 //! Synaps Desktop (GPUI spike): a thin client for the Synaps daemon.
 //!
 //! ```text
-//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--accent #RRGGBB] [--accent-picker] [--size WxH]
+//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH]
 //! synaps-desktop --bench [--profile P --prompt TEXT] [--refresh-hz HZ]
 //! ```
 //! `--bench` connects to a daemon only when `--profile` or `--socket` is
 //! given (never the default daemon), runs the synthetic scenarios, prints
 //! JSON and exits (watchdog: 30 s). `--offline` shows the synthetic
-//! transport's sessions ([`demo`]). The accent: `--accent`, else
-//! `$SYNAPS_DESKTOP_ACCENT`, else the settings file the in-app picker writes
-//! ([`theme::settings_path`]), else Arasaka red. The same file keeps which
-//! side panels are folded (Ctrl+B, Ctrl+Alt+B; not read by `--bench`).
+//! transport's sessions ([`demo`]). The theme (one of the Synaps TUI's):
+//! `--theme`, else `$SYNAPS_THEME`, else the settings file the in-app picker
+//! writes ([`theme::settings_path`]), else `theme =` in the Synaps config,
+//! else nord. The accent override: `--accent`, else
+//! `$SYNAPS_DESKTOP_ACCENT`, else the settings file, else none. The same
+//! file keeps which side panels are folded (Ctrl+B, Ctrl+Alt+B) and the
+//! text size (Ctrl+= / Ctrl+- / Ctrl+0); `--bench` reads neither.
 //! `--size`: the window's size in logical pixels (screenshots).
 
 // serde_json's `json!` in the synthetic transport and its tests nests deep.
@@ -26,10 +29,12 @@ mod fonts;
 mod mem;
 mod model;
 mod named;
+mod palettes;
 mod rail;
 mod shell;
 mod stats;
 mod theme;
+mod turns;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -50,6 +55,7 @@ fn main() {
     let mut prompt: Option<String> = None;
     let mut refresh_hz: Option<f64> = None;
     let mut accent: Option<String> = None;
+    let mut theme_flag: Option<String> = None;
     let mut start_session: Option<String> = None;
     let mut open_picker = false;
     let mut window_size: Option<(f32, f32)> = None;
@@ -75,6 +81,7 @@ fn main() {
             "--prompt" => prompt = Some(value(&mut args, "--prompt")),
             "--refresh-hz" => refresh_hz = value(&mut args, "--refresh-hz").parse().ok(),
             "--accent" => accent = Some(value(&mut args, "--accent")),
+            "--theme" => theme_flag = Some(value(&mut args, "--theme")),
             "--session" => start_session = Some(value(&mut args, "--session")),
             "--accent-picker" => open_picker = true,
             "--size" => {
@@ -89,12 +96,17 @@ fn main() {
                 }
             }
             "-h" | "--help" => {
+                let names: Vec<&str> = palettes::THEMES.iter().map(|t| t.0).collect();
                 println!(
-                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--bench [--prompt TEXT] [--refresh-hz HZ]]\n\
-                     accent: --accent, else ${}, else the picker's settings file ({}), else {}",
-                    theme::ENV_ACCENT,
+                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--bench [--prompt TEXT] [--refresh-hz HZ]]\n\
+                     theme: --theme, else ${}, else the picker's settings file ({}), else `theme =` in the Synaps config, else {}\n\
+                     themes: {}\n\
+                     accent (overrides the theme's \"you\" and focus colours): --accent, else ${}, else the settings file, else none",
+                    theme::ENV_THEME,
                     theme::settings_path().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()),
-                    theme::to_hex(theme::DEFAULT_ACCENT)
+                    theme::DEFAULT_THEME,
+                    names.join(" "),
+                    theme::ENV_ACCENT,
                 );
                 return;
             }
@@ -107,14 +119,29 @@ fn main() {
     if bench {
         gpui_kit::profiler::set_trace_enabled(true);
     }
+    let settings = theme::settings_path();
     let env_accent = std::env::var(theme::ENV_ACCENT).ok();
-    let saved_accent = theme::settings_path().and_then(|p| theme::load_accent(&p));
+    let saved_accent = settings.as_deref().and_then(theme::load_accent);
     // A bench measures the default layout, whatever was folded last.
-    let panels = if bench { theme::Panels::default() } else { theme::settings_path().map(|p| theme::load_panels(&p)).unwrap_or_default() };
-    let (accent, accent_source, warnings) = theme::resolve(accent.as_deref(), env_accent.as_deref(), saved_accent.as_deref());
+    let panels = if bench { theme::Panels::default() } else { settings.as_deref().map(theme::load_panels).unwrap_or_default() };
+    let (accent, accent_source, mut warnings) = theme::resolve_accent(accent.as_deref(), env_accent.as_deref(), saved_accent.as_deref());
+    // The theme: the Synaps config this profile reads, as the TUI does.
+    let base = synaps_client::discovery::base_dir();
+    let profile_name = profile.clone().or_else(|| std::env::var("SYNAPS_PROFILE").ok());
+    let (config, config_skipped) = theme::synaps_theme(&base, profile_name.as_deref());
+    let env_theme = std::env::var(theme::ENV_THEME).ok();
+    let saved_theme = settings.as_deref().and_then(theme::load_theme);
+    let (theme_name, raw, theme_source, theme_warnings) =
+        theme::resolve_theme(theme_flag.as_deref(), env_theme.as_deref(), saved_theme.as_deref(), config, Some(&base));
+    warnings.extend(theme_warnings);
+    let follows_config = matches!(theme_source, theme::Source::Config | theme::Source::Default);
+    if follows_config {
+        warnings.extend(config_skipped);
+    }
     for w in warnings {
         eprintln!("synaps-desktop: {w}");
     }
+    let choice = theme::Choice { theme: theme_name, raw, accent, text: panels.text_size };
     // The synthetic transport, only for an interactive `--offline` window.
     let synthetic = (offline && !bench).then(demo::events);
     // In bench mode only an explicitly named daemon is ever contacted.
@@ -143,7 +170,7 @@ fn main() {
         diag::mark("kit_init_done");
         Theme::change(ThemeMode::Dark, None, cx);
         fonts::register(cx);
-        theme::apply(accent, cx);
+        theme::apply(choice, cx);
         app::bind_keys(cx);
         let (w, h) = window_size.unwrap_or((1360., 860.));
         let size = size(px(w), px(h));
@@ -175,6 +202,10 @@ fn main() {
                 // OLDER left open: list up to the wire's cap from the start.
                 v.model.named.deep = panels.history_open & rail::Bucket::Older.bit() != 0;
                 v.accent_source = accent_source;
+                v.theme_source = theme_source;
+                v.theme_follows_config = follows_config;
+                v.theme_profile = profile_name.clone();
+                v.config_theme = v.config_choice().0.into();
                 v
             })
         })

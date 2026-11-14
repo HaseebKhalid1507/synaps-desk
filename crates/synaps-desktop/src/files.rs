@@ -147,6 +147,19 @@ struct Analysed {
     ops: Vec<(usize, Change)>,
 }
 
+/// What one file tool call counted for once it succeeded: exactly what it
+/// added to [`Ledger::files`] and [`Ledger::totals`], so a transcript row
+/// and the FILES panel never disagree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallDelta {
+    /// Edits: lines added and removed (`approx`: an estimate).
+    pub added: u32,
+    pub removed: u32,
+    pub approx: bool,
+    /// Writes: lines written (not a delta).
+    pub written: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct Ledger {
     files: Vec<FileStat>,
@@ -163,6 +176,10 @@ pub struct Ledger {
     shell_calls: HashMap<String, Option<Arc<Vec<Touch>>>>,
     shell: Vec<ShellFile>,
     shell_index: HashMap<String, usize>,
+    /// Each file tool call that succeeded: what it counted for.
+    committed: HashMap<String, CallDelta>,
+    /// Bumped whenever `committed` changes (a reset included).
+    generation: u64,
     cwd: Option<String>,
     added: u32,
     removed: u32,
@@ -184,6 +201,7 @@ impl Ledger {
             cwd: cwd.map(|c| c.trim_end_matches(['/', '\\']).to_string()).filter(|c| !c.is_empty()),
             calls,
             shell_calls,
+            generation: self.generation + 1,
             ..Ledger::default()
         };
         self.append(messages);
@@ -215,15 +233,18 @@ impl Ledger {
                         if let Some(call) = self.calls.get(id).cloned() {
                             let skipped =
                                 if call.ops.is_empty() { Vec::new() } else { skipped_ops(b.get("content").unwrap_or(&Value::Null)) };
+                            let mut delta = CallDelta::default();
                             if skipped.is_empty() {
                                 for c in &call.changes {
-                                    self.commit(c);
+                                    self.commit(c, &mut delta);
                                 }
                             } else {
                                 for (_, c) in call.ops.iter().filter(|(i, _)| !skipped.contains(i)) {
-                                    self.commit(c);
+                                    self.commit(c, &mut delta);
                                 }
                             }
+                            self.committed.insert(id.to_string(), delta);
+                            self.generation += 1;
                         }
                     }
                     _ => {}
@@ -273,7 +294,7 @@ impl Ledger {
         }
     }
 
-    fn commit(&mut self, c: &Change) {
+    fn commit(&mut self, c: &Change, delta: &mut CallDelta) {
         let i = match self.index.get(&c.path) {
             Some(&i) => i,
             None => {
@@ -294,8 +315,14 @@ impl Ledger {
         };
         let f = &mut self.files[i];
         match c.kind {
-            FileKind::Written => f.written = c.added,
+            FileKind::Written => {
+                f.written = c.added;
+                delta.written += c.added;
+            }
             FileKind::Modified => {
+                delta.added += c.added;
+                delta.removed += c.removed;
+                delta.approx |= c.approx;
                 f.added += c.added;
                 f.removed += c.removed;
                 f.approx |= c.approx;
@@ -326,6 +353,17 @@ impl Ledger {
     /// The totals include an estimate ([`FileStat::approx`]).
     pub fn approx(&self) -> bool {
         self.approx
+    }
+
+    /// What a file tool call counted for; `None` until it succeeded (and
+    /// never for a failed, denied, canceled or stopped one).
+    pub fn delta(&self, tool_id: &str) -> Option<CallDelta> {
+        self.committed.get(tool_id).copied()
+    }
+
+    /// Changes whenever a [`Ledger::delta`] may have.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn preview(&self, tool_id: &str) -> Option<Arc<Preview>> {
