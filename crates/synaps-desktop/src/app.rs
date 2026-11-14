@@ -77,10 +77,52 @@ const fn panel_keys(mac: bool) -> (&'static str, &'static str) {
     if mac { ("cmd-b", "cmd-alt-b") } else { ("ctrl-b", "ctrl-alt-b") }
 }
 
-/// The rail's and the right panel's widths at a window width: wider on
-/// wide screens, never under the 1280-px layout's.
+/// The rail's and the right panel's widths in the 1280-px layout: the auto
+/// widths never go under them, and a dragged width wider than them gives
+/// way down to them, not further, when the window narrows.
+pub(crate) const FLOORS: (f32, f32) = (276., 296.);
+/// A drag past this share of a panel's narrowest width folds it.
+const SNAP: f32 = 0.6;
+
+/// The rail's and the right panel's auto widths at a window width: wider
+/// on wide screens, never under [`FLOORS`].
 pub(crate) fn side_widths(window: f32) -> (f32, f32) {
-    ((window * 0.135).round().clamp(276., 340.), (window * 0.14).round().clamp(296., 360.))
+    ((window * 0.135).round().clamp(FLOORS.0, 340.), (window * 0.14).round().clamp(FLOORS.1, 360.))
+}
+
+/// A panel's drag limits (px).
+fn limits(rail: bool) -> (f32, f32) {
+    let (lo, hi) = if rail { theme::RAIL_WIDTHS } else { theme::RIGHT_WIDTHS };
+    (lo.into(), hi.into())
+}
+
+/// The widths the panels ask for: the dragged one, else the auto one.
+fn wanted(window: f32, panels: theme::Panels) -> (f32, f32) {
+    let (rail, right) = side_widths(window);
+    let hand = |w: Option<u16>, rail: bool| w.map(|w| f32::from(w).clamp(limits(rail).0, limits(rail).1));
+    (hand(panels.rail_width, true).unwrap_or(rail), hand(panels.right_width, false).unwrap_or(right))
+}
+
+/// A drag of a panel's edge: where the pointer went down (`x`), the panels
+/// then and the panel's width then (a strip's, if folded).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EdgeGrab {
+    pub(crate) rail: bool,
+    x: f32,
+    start: theme::Panels,
+    width: f32,
+    pub(crate) moved: bool,
+}
+
+/// GPUI's drag value for an edge handle, and the (empty) view it draws at
+/// the pointer.
+#[derive(Clone, Copy)]
+pub(crate) struct EdgeDrag;
+
+impl Render for EdgeDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
 }
 
 /// How a side panel is drawn this frame.
@@ -101,13 +143,72 @@ impl Side {
     }
 }
 
-/// Both side panels at a window width (`mark`: the left mark strip).
+/// Both side panels at a window width (`mark`: the left mark strip). The
+/// rail opens from 760 px; the right panel only if the centre keeps
+/// [`CENTRE_MIN`] with both at their floors (a panel dragged narrower than
+/// its floor: that width). Panels that ask for more than the room left
+/// give way in proportion, down to their floors; a strip comes before the
+/// centre is squeezed. With auto widths this is the PR #7 layout exactly.
 pub(crate) fn sides(window: f32, panels: theme::Panels, mark: f32) -> (Side, Side) {
-    let (rail_w, right_w) = side_widths(window);
-    let rail = if !panels.rail_collapsed && window >= 760. { Side::Open(rail_w) } else { Side::Strip };
-    let right =
-        if !panels.right_collapsed && window - mark - rail.width() - right_w >= CENTRE_MIN { Side::Open(right_w) } else { Side::Strip };
-    (rail, right)
+    let (want_l, want_r) = wanted(window, panels);
+    let (floor_l, floor_r) = (want_l.min(FLOORS.0), want_r.min(FLOORS.1));
+    // What the two side panels may take without squeezing the centre.
+    let room = window - mark - CENTRE_MIN;
+    let rail_open = !panels.rail_collapsed && window >= 760.;
+    let right_open = !panels.right_collapsed && room - if rail_open { floor_l } else { STRIP } >= floor_r;
+    match (rail_open, right_open) {
+        (true, true) => {
+            let (mut l, mut r) = (want_l, want_r);
+            let over = l + r - room;
+            if over > 0. {
+                // `right_open` leaves the floors room: the slack covers it.
+                let (sl, sr) = (l - floor_l, r - floor_r);
+                let k = over / (sl + sr);
+                (l, r) = ((l - sl * k).floor(), (r - sr * k).floor());
+            }
+            (Side::Open(l), Side::Open(r))
+        }
+        (true, false) => (Side::Open(want_l.min((room - STRIP).max(floor_l))), Side::Strip),
+        (false, true) => (Side::Strip, Side::Open(want_r.min(room - STRIP))),
+        (false, false) => (Side::Strip, Side::Strip),
+    }
+}
+
+/// The panels while a panel's edge is dragged (`rail`, else the right
+/// panel's) to where the panel would be `width` px wide; `start`: the
+/// panels when the drag began (every move is worked out from them, so a
+/// drag can fold and unfold as it goes). Under [`SNAP`] of the narrowest
+/// width the panel folds, keeping the width it had; dragged out of a strip
+/// it opens as [`toggled`] would. The width is clamped to the panel's
+/// limits and to the room the other panel leaves the centre, never less
+/// than the panel already had.
+pub(crate) fn dragged(window: f32, start: theme::Panels, rail: bool, width: f32) -> theme::Panels {
+    let (lo, hi) = limits(rail);
+    let pick = |(l, r): (Side, Side)| if rail { (l, r) } else { (r, l) };
+    let (was, _) = pick(sides(window, start, crate::chrome::MARK));
+    let was_open = matches!(was, Side::Open(_));
+    if width < lo * SNAP {
+        return if was_open { toggled(window, start, rail).unwrap_or(start) } else { start };
+    }
+    let Some(mut p) = (if was_open { Some(start) } else { toggled(window, start, rail) }) else { return start };
+    let (_, other) = pick(sides(window, p, crate::chrome::MARK));
+    let room = window - crate::chrome::MARK - CENTRE_MIN - other.width();
+    let w = width.clamp(lo, hi.min(room.max(was.width())).max(lo)).round();
+    // The other panel keeps what it shows: one that had given way to a
+    // narrow window is held there, so this edge follows the pointer.
+    let (want_l, want_r) = wanted(window, p);
+    let pin = |o: Side, want: f32| match o {
+        Side::Open(ow) if ow < want => Some(ow as u16),
+        _ => None,
+    };
+    if rail {
+        p.rail_width = Some(w as u16);
+        p.right_width = pin(other, want_r).or(p.right_width);
+    } else {
+        p.right_width = Some(w as u16);
+        p.rail_width = pin(other, want_l).or(p.rail_width);
+    }
+    p
 }
 
 /// The panels after the user folds or unfolds one (`rail`, else the right
@@ -328,6 +429,8 @@ pub struct AppView {
     panels_writing: theme::PanelKeys,
     /// The delayed save ([`SAVE_DELAY`]); a newer fold replaces it.
     panels_save: Option<Task<()>>,
+    /// A drag of a panel's edge, from the mouse-down on its handle.
+    pub(crate) drag: Option<EdgeGrab>,
     fold_keys: FoldKeys,
     /// The window's width at the last frame (what a fold acts on).
     pub(crate) width: f32,
@@ -529,6 +632,7 @@ impl AppView {
             panels_dirty: Default::default(),
             panels_writing: Default::default(),
             panels_save: None,
+            drag: None,
             fold_keys: FoldKeys::default(),
             width: 0.,
             picker_open: false,
@@ -709,7 +813,8 @@ impl AppView {
     /// [`READOUT_DELAY`] at rest, and closes when it leaves.
     pub(crate) fn hover_row(&mut self, key: u64, hovered: bool, cx: &mut Context<Self>) {
         if hovered {
-            if self.hover == Some(key) {
+            // A drag of the rail's edge passing over it is not a rest.
+            if self.hover == Some(key) || self.drag.is_some_and(|g| g.moved) {
                 return;
             }
             self.hover = Some(key);
@@ -952,15 +1057,67 @@ impl AppView {
 
     /// New panel states, saved [`SAVE_DELAY`] after the last change.
     fn set_panels(&mut self, p: theme::Panels, cx: &mut Context<Self>) {
-        self.panels_dirty = self.panels_dirty.or(theme::PanelKeys::changed(self.panels, p));
-        self.panels = p;
+        let before = std::mem::replace(&mut self.panels, p);
+        self.panels_changed(before, cx);
+        cx.notify();
+    }
+
+    /// The panels changed from `before`: the keys that differ are saved
+    /// [`SAVE_DELAY`] later.
+    fn panels_changed(&mut self, before: theme::Panels, cx: &mut Context<Self>) {
+        self.panels_dirty = self.panels_dirty.or(theme::PanelKeys::changed(before, self.panels));
         if self.bench.is_none() {
             self.panels_save = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(SAVE_DELAY).await;
                 let _ = this.update(cx, |v, cx| v.save_panels(cx));
             }));
         }
-        cx.notify();
+    }
+
+    /// The mouse went down on a panel's edge handle (`rail`, else the right
+    /// panel's) at `x`.
+    pub(crate) fn grab_edge(&mut self, rail: bool, x: f32) {
+        let (l, r) = sides(self.width, self.panels, crate::chrome::MARK);
+        let width = if rail { l.width() } else { r.width() };
+        self.drag = Some(EdgeGrab { rail, x, start: self.panels, width, moved: false });
+    }
+
+    /// The pointer is at `x` during a drag of an edge (anywhere: GPUI
+    /// reports the moves of its drag outside the handle too).
+    fn drag_edge(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some(g) = self.drag.as_mut() else { return };
+        g.moved = true;
+        let width = if g.rail { g.width + (x - g.x) } else { g.width - (x - g.x) };
+        let p = dragged(self.width, g.start, g.rail, width);
+        if p != self.panels {
+            self.panels = p;
+            cx.notify();
+        }
+    }
+
+    /// The drag let go: what it left is saved, once.
+    fn end_drag(&mut self, cx: &mut Context<Self>) {
+        if let Some(g) = self.drag.take_if(|g| g.moved) {
+            self.panels_changed(g.start, cx);
+        }
+    }
+
+    /// A click on an edge handle: a double-click resets the panel to its
+    /// auto width; a click on a strip's edge opens it, as the strip does.
+    pub(crate) fn click_edge(&mut self, rail: bool, count: usize, cx: &mut Context<Self>) {
+        self.drag = None;
+        let (l, r) = sides(self.width, self.panels, crate::chrome::MARK);
+        if count >= 2 {
+            let mut p = self.panels;
+            if rail {
+                p.rail_width = None;
+            } else {
+                p.right_width = None;
+            }
+            self.set_panels(p, cx);
+        } else if (if rail { l } else { r }) == Side::Strip {
+            self.toggle_panel(rail, cx);
+        }
     }
 
     /// Ctrl+B / Ctrl+Alt+B (Cmd on macOS): a press folds or unfolds, its
@@ -1614,6 +1771,13 @@ impl Render for AppView {
             b.on_render(&self.list, window);
         }
         let p = theme::palette(cx);
+        // A drag released outside the window has no drop: it ends here.
+        if self.drag.is_some_and(|g| g.moved) && !cx.has_active_drag() {
+            self.end_drag(cx);
+        }
+        if let Some((rail, w)) = self.bench.as_ref().and_then(BenchState::drag_width) {
+            self.panels = dragged(self.width, self.panels, rail, w);
+        }
         // Wide windows widen the side panels; narrow ones fold the open
         // numbers, then the open rail, to strips before the session gives.
         self.width = window.viewport_size().width.into();
@@ -1668,6 +1832,8 @@ impl Render for AppView {
                     }
                 }
             }))
+            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<EdgeDrag>, _, cx| this.drag_edge(ev.event.position.x.into(), cx)))
+            .on_drop(cx.listener(|this, _: &EdgeDrag, _, cx| this.end_drag(cx)))
             .on_action(cx.listener(|this, _: &ToggleRail, _, cx| this.fold_key(true, cx)))
             .on_action(cx.listener(|this, _: &ToggleRight, _, cx| this.fold_key(false, cx)))
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, _| {
@@ -1698,6 +1864,8 @@ impl Render for AppView {
                         }),
                 ),
             )
+            .children(self.render_edge(true, rail, &p, cx))
+            .children(self.render_edge(false, right, &p, cx))
             .when(self.picker_open, |d| d.child(deferred(self.render_picker(&p, right, cx)).with_priority(1)))
     }
 }
@@ -1707,7 +1875,10 @@ mod tests {
     // Not `super::*`: that brings in gpui's `test` attribute through `gpui_kit::*`.
     use std::time::{Duration, Instant};
 
-    use super::{FoldKeys, Side, WELL_LINE, authorize_ready, lines_below, one_line, panel_keys, sides, toggled, tracked, well_body};
+    use super::{
+        CENTRE_MIN, FoldKeys, Side, WELL_LINE, authorize_ready, dragged, lines_below, one_line, panel_keys, side_widths, sides, toggled,
+        tracked, well_body,
+    };
     use crate::theme::Panels;
 
     /// The fold keys parse on every OS (a bad one panics at start-up).
@@ -1765,6 +1936,130 @@ mod tests {
         assert_eq!(toggled(700., open, true), None);
         // Shown as strips anyway, so folding one is a no-op that saves it folded.
         assert_eq!(sides(700., open, 30.), sides(700., both, 30.));
+    }
+
+    /// The PR #7 rule, before panels could be dragged.
+    fn pr7_sides(window: f32, panels: Panels) -> (Side, Side) {
+        let (rail_w, right_w) = side_widths(window);
+        let rail = if !panels.rail_collapsed && window >= 760. { Side::Open(rail_w) } else { Side::Strip };
+        let right =
+            if !panels.right_collapsed && window - 30. - rail.width() - right_w >= CENTRE_MIN { Side::Open(right_w) } else { Side::Strip };
+        (rail, right)
+    }
+
+    fn centre(window: f32, (l, r): (Side, Side)) -> f32 {
+        window - 30. - l.width() - r.width()
+    }
+
+    fn hand(rail: Option<u16>, right: Option<u16>) -> Panels {
+        Panels { rail_width: rail, right_width: right, ..Panels::default() }
+    }
+
+    /// Auto widths lay out as before at every width; dragged widths stay in
+    /// their limits, and never squeeze the centre under its minimum except
+    /// where the auto rail already does (a narrow window, rail at 276).
+    #[test]
+    fn the_fit_rules_hold_at_every_width() {
+        let folds = [(false, false), (true, false), (false, true), (true, true)];
+        for window in (640..3400).step_by(7).map(|w| w as f32) {
+            for (rc, gc) in folds {
+                let auto = Panels { rail_collapsed: rc, right_collapsed: gc, ..Panels::default() };
+                assert_eq!(sides(window, auto, 30.), pr7_sides(window, auto), "{window} {auto:?}");
+                for (l, r) in [(Some(220), Some(240)), (Some(480), Some(520)), (Some(400), None), (None, Some(500)), (Some(300), Some(260))]
+                {
+                    let p = Panels { rail_collapsed: rc, right_collapsed: gc, ..hand(l, r) };
+                    let shown = sides(window, p, 30.);
+                    let c = centre(window, shown);
+                    if let Side::Open(w) = shown.0 {
+                        assert!((220. ..=480.).contains(&w), "{window} {p:?} {shown:?}");
+                        assert!(c >= CENTRE_MIN || w <= 276., "{window} {p:?} {shown:?}");
+                        assert_eq!(w, w.round());
+                    }
+                    if let Side::Open(w) = shown.1 {
+                        assert!((240. ..=520.).contains(&w), "{window} {p:?} {shown:?}");
+                        assert!(c >= CENTRE_MIN, "{window} {p:?} {shown:?}");
+                        assert_eq!(w, w.round());
+                    }
+                    assert!(!rc || shown.0 == Side::Strip, "folded stays folded");
+                    assert!(!gc || shown.1 == Side::Strip, "folded stays folded");
+                }
+            }
+        }
+        // A width set by hand beats the wide window's auto-widening.
+        assert_eq!(sides(2560., hand(Some(250), Some(260)), 30.), (Side::Open(250.), Side::Open(260.)));
+        // Too narrow for both as dragged: they give way in proportion...
+        assert_eq!(sides(1100., hand(Some(480), Some(520)), 30.), (Side::Open(284.), Side::Open(305.)));
+        // ...then the right one is a strip and the rail stops at the centre's minimum...
+        assert_eq!(sides(1000., hand(Some(480), Some(520)), 30.), (Side::Open(458.), Side::Strip));
+        // ...then the PR #7 narrow layout.
+        assert_eq!(sides(800., hand(Some(480), Some(520)), 30.), (Side::Open(276.), Side::Strip));
+        assert_eq!(sides(700., hand(Some(480), Some(520)), 30.), (Side::Strip, Side::Strip));
+    }
+
+    /// A drag sets the width within the limits and the centre's minimum,
+    /// and leaves the folds alone.
+    #[test]
+    fn a_drag_clamps_its_width() {
+        let open = Panels::default();
+        let rail = |window: f32, w: f32| dragged(window, open, true, w);
+        assert_eq!(rail(1920., 400.), hand(Some(400), None));
+        assert_eq!(sides(1920., rail(1920., 400.), 30.), (Side::Open(400.), Side::Open(296.)));
+        assert_eq!(rail(1920., 1000.).rail_width, Some(480));
+        assert_eq!(rail(1920., 200.).rail_width, Some(220));
+        assert_eq!(rail(1920., 300.4).rail_width, Some(300), "whole pixels");
+        // 1280 px: the centre keeps 480 px.
+        assert_eq!(rail(1280., 480.).rail_width, Some(474));
+        assert_eq!(centre(1280., sides(1280., rail(1280., 480.), 30.)), CENTRE_MIN);
+        let right = dragged(1280., open, false, 520.);
+        assert_eq!(right, hand(None, Some(494)));
+        assert_eq!(sides(1280., right, 30.), (Side::Open(276.), Side::Open(494.)));
+        assert_eq!(dragged(1920., open, false, 900.).right_width, Some(520));
+        // 800 px, rail only: as wide as the narrow layout already shows it, no wider.
+        assert_eq!(rail(800., 400.).rail_width, Some(276));
+        assert_eq!(rail(800., 240.).rail_width, Some(240));
+        // Panels that had given way: the other one is held where it is, so
+        // the dragged edge follows the pointer.
+        let both = hand(Some(480), Some(520));
+        let p = dragged(1100., both, true, 250.);
+        assert_eq!(p, hand(Some(250), Some(305)));
+        assert_eq!(sides(1100., p, 30.), (Side::Open(250.), Side::Open(305.)));
+    }
+
+    /// Dragged well past the narrowest width a panel folds, keeping the
+    /// width it had for when it opens again; dragged back out (the same
+    /// drag, or a new one from the strip) it opens and follows the pointer.
+    #[test]
+    fn a_drag_snaps_to_the_strip_and_back() {
+        let set = hand(Some(400), None);
+        let folded = dragged(1920., set, true, 131.);
+        assert_eq!(folded, Panels { rail_collapsed: true, ..set });
+        assert_eq!(sides(1920., folded, 30.).0, Side::Strip);
+        assert_eq!(dragged(1920., set, true, 133.).rail_width, Some(220), "under the limit, over the snap: the limit");
+        // Unfolding (a click, Ctrl+B) restores the dragged width.
+        assert_eq!(sides(1920., toggled(1920., folded, true).unwrap(), 30.).0, Side::Open(400.));
+        // From the strip: nothing until the snap distance, then open.
+        assert_eq!(dragged(1920., folded, true, 60.), folded);
+        assert_eq!(dragged(1920., folded, true, 300.), hand(Some(300), None));
+        let right = dragged(1920., Panels::default(), false, 143.);
+        assert!(right.right_collapsed && right.right_width.is_none());
+        assert_eq!(dragged(1920., right, false, 144.), hand(None, Some(240)));
+        // A window too narrow to open it: the strip stays.
+        let both = Panels { rail_collapsed: true, right_collapsed: true, ..Panels::default() };
+        assert_eq!(dragged(700., both, true, 300.), both);
+        // 1000 px: the right one opens out of its strip by folding the rail, as a click does.
+        let rail_only = Panels { right_collapsed: true, ..Panels::default() };
+        assert_eq!(dragged(1000., rail_only, false, 300.), Panels { rail_collapsed: true, right_width: Some(300), ..Panels::default() });
+    }
+
+    /// A double-click on an edge forgets its width: the auto width again,
+    /// wide windows widening it.
+    #[test]
+    fn a_reset_is_the_auto_width() {
+        let p = dragged(2560., Panels::default(), true, 250.);
+        assert_eq!(sides(2560., p, 30.).0, Side::Open(250.));
+        let reset = Panels { rail_width: None, ..p };
+        assert_eq!(reset, Panels::default());
+        assert_eq!(sides(2560., reset, 30.).0, Side::Open(340.));
     }
 
     /// M3: a held fold key toggles once. Wayland/Windows repeat with no
