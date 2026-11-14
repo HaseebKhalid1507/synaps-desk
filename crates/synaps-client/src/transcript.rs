@@ -99,8 +99,13 @@ const CANCEL_PHRASES: [&str; 5] = [
     "Canceled (session driver revoked)",
 ];
 
-/// `activation_denied` (agent-engine `tools/discovery.rs`) as a tool error.
+/// `activation_denied` (agent-engine `tools/discovery.rs`) as a tool error:
+/// every `HostActivationError`, refusals and batch failures alike.
 const ACTIVATION_DENIED: &str = "Tool execution failed: tool activation denied:";
+/// The one `HostActivationError` that is a refusal, `ConfirmationRequired`
+/// (`tools/activation.rs`): the user denied the prompt, the policy is
+/// `deny`, or nothing could show a prompt.
+const ACTIVATION_REFUSED: &str = "tool activation requires host confirmation authority";
 
 /// Classify a tool result's text (`is_error` as the block carries it).
 pub fn tool_outcome(result: &str, is_error: bool) -> ToolOutcome {
@@ -111,10 +116,12 @@ pub fn tool_outcome(result: &str, is_error: bool) -> ToolOutcome {
     // An extension's `Block` (`Tool call blocked by extension: Tool call
     // confirmation denied: …` after a denied prompt), `GateDenial`, and an
     // `activate_tools` the user did not confirm (`tools/discovery.rs`
-    // `activation_denied`, a `RuntimeError::Tool`) but not its guessed id.
+    // `activation_denied`, a `RuntimeError::Tool`). Its other errors (a
+    // guessed id, a duplicate, an already active tool: after AUTHORIZE)
+    // are failures.
     const DENIED: [&str; 2] = ["Tool call blocked by extension", "Tool call denied:"];
     if let Some(why) = result.strip_prefix(ACTIVATION_DENIED) {
-        return if why.starts_with(" unknown tool id") { ToolOutcome::Failed } else { ToolOutcome::Denied };
+        return if why.trim_start().starts_with(ACTIVATION_REFUSED) { ToolOutcome::Denied } else { ToolOutcome::Failed };
     }
     if DENIED.iter().any(|p| result.starts_with(p)) {
         return ToolOutcome::Denied;
@@ -805,6 +812,25 @@ mod outcome_tests {
             ),
             (
                 "Tool execution failed: tool activation denied: unknown tool id 'x:y'; nothing was activated. activate_tools needs exact ids (namespace:name) as search_tools returns them: search for the tool instead of guessing its id.",
+                Failed,
+            ),
+            // `activate_model_initiated` errors after AUTHORIZE
+            // (`BulkActivationError`, `GrantIssuanceError`): not refusals.
+            ("Tool execution failed: tool activation denied: duplicate tool id in one activation batch: builtin:shell_start", Failed),
+            (
+                "Tool execution failed: tool activation denied: activation batch rejected: tool is already activated for this session: builtin:shell_start",
+                Failed,
+            ),
+            (
+                "Tool execution failed: tool activation denied: activation batch rejected: tool is already in this session's configured core set: builtin:bash",
+                Failed,
+            ),
+            (
+                "Tool execution failed: tool activation denied: activation batch rejected: activation grant schema digest does not match the catalog record for builtin:shell_start",
+                Failed,
+            ),
+            (
+                "Tool execution failed: tool activation denied: cannot issue activation grant: source provenance is unverified: ext:x",
                 Failed,
             ),
             // `RuntimeError::Tool` from `tools/edit.rs`.

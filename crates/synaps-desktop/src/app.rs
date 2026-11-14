@@ -48,6 +48,80 @@ pub(crate) const ARM: Duration = Duration::from_millis(500);
 const WELL_LINE: f32 = 18.;
 const WELL_MAX: f32 = 18. * 12.;
 
+/// The reading column: the header, rows, card and composer share it,
+/// centred in the pane, at most this wide (tool rows and diffs use all of it).
+pub(crate) const COLUMN_MAX: f32 = 1080.;
+/// Prose (user and agent text) within it: about 108 characters of the
+/// text face at 14 px.
+const PROSE_MAX: f32 = 680.;
+/// The column's margin either side of it in a narrower pane.
+const GUTTER: f32 = 36.;
+/// A folded side panel's strip.
+pub(crate) const STRIP: f32 = 32.;
+/// Narrower than this, the open right panel is not drawn (the session wins).
+const CENTRE_MIN: f32 = 480.;
+
+actions!(synaps_desktop, [ToggleRail, ToggleRight]);
+
+/// Ctrl+B folds the sessions rail, Ctrl+Alt+B the right panel (Cmd on
+/// macOS); the composer and inputs bind neither.
+pub fn bind_keys(cx: &mut App) {
+    let (rail, right) = panel_keys(cfg!(target_os = "macos"));
+    cx.bind_keys([KeyBinding::new(rail, ToggleRail, None), KeyBinding::new(right, ToggleRight, None)]);
+}
+
+/// The fold keys (`KeyBinding::new` does not resolve `secondary-`, and
+/// panics on a keystroke it cannot parse: spelled per OS).
+const fn panel_keys(mac: bool) -> (&'static str, &'static str) {
+    if mac { ("cmd-b", "cmd-alt-b") } else { ("ctrl-b", "ctrl-alt-b") }
+}
+
+/// The rail's and the right panel's widths at a window width: wider on
+/// wide screens, never under the 1280-px layout's.
+pub(crate) fn side_widths(window: f32) -> (f32, f32) {
+    ((window * 0.135).round().clamp(276., 340.), (window * 0.14).round().clamp(296., 360.))
+}
+
+/// How a side panel is drawn this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Side {
+    Open(f32),
+    Strip,
+    /// The window is too narrow for it, open.
+    Hidden,
+}
+
+impl Side {
+    pub(crate) fn width(self) -> f32 {
+        match self {
+            Side::Open(w) => w,
+            Side::Strip => STRIP,
+            Side::Hidden => 0.,
+        }
+    }
+}
+
+/// Both side panels at a window width (`mark`: the left mark strip).
+pub(crate) fn sides(window: f32, panels: theme::Panels, mark: f32) -> (Side, Side) {
+    let (rail_w, right_w) = side_widths(window);
+    let rail = match () {
+        _ if panels.rail_collapsed => Side::Strip,
+        _ if window >= 760. => Side::Open(rail_w),
+        _ => Side::Hidden,
+    };
+    let right = match () {
+        _ if panels.right_collapsed => Side::Strip,
+        _ if window - mark - rail.width() - right_w >= CENTRE_MIN => Side::Open(right_w),
+        _ => Side::Hidden,
+    };
+    (rail, right)
+}
+
+/// `inner` in the reading column ([`COLUMN_MAX`], centred).
+pub(crate) fn column(inner: impl IntoElement) -> Div {
+    h_flex().w_full().justify_center().px(px(GUTTER)).child(div().flex_1().min_w_0().max_w(px(COLUMN_MAX)).child(inner))
+}
+
 /// The prompt the authorization card shows.
 pub(crate) struct PromptCard {
     /// [`Model::card_key`]: `(epoch, prompt id)`.
@@ -140,6 +214,8 @@ pub struct AppView {
     secret_input: Entity<InputState>,
     pub(crate) open_shown: bool,
     pub(crate) named_collapsed: bool,
+    /// The side panels folded to strips (saved with the accent).
+    pub panels: theme::Panels,
     pub(crate) filter: Filter,
     pub picker_open: bool,
     pub(crate) picker_note: Option<SharedString>,
@@ -290,6 +366,7 @@ impl AppView {
             secret_input: i.secret_input,
             open_shown: false,
             named_collapsed: false,
+            panels: theme::Panels::default(),
             filter: Filter::All,
             picker_open: false,
             picker_note: None,
@@ -485,7 +562,8 @@ impl AppView {
         (self.model.card_key() == Some(c.key)).then_some(c.key.1)
     }
 
-    /// Answer the card's prompt (`Client::answer`), if it is the one shown
+    /// Answer the card's prompt (`Client::answer_on` the connection it came
+    /// on: dropped if the session reconnected meanwhile), if it is the one shown
     /// (`key`) and the model allows it (attached, no switch under way, not
     /// answered yet). A confirm takes `y` / `n` (the daemon's own spelling);
     /// a secret its text, or nothing to cancel.
@@ -497,7 +575,8 @@ impl AppView {
         if self.card.as_ref().map(|c| c.key) != Some(key) || self.card_target() != Some(key.1) || !self.model.may_answer(key.1) {
             return false;
         }
-        match c.answer(key.1, value) {
+        let connection = self.model.active.as_ref().map_or(0, |a| a.connection);
+        match c.answer_on(connection, key.1, value) {
             Ok(()) => {
                 self.model.answer_sent(key.1);
                 true
@@ -590,6 +669,25 @@ impl AppView {
         }
     }
 
+    /// Fold or unfold a side panel (`rail`: the sessions rail, else the
+    /// right panel), at once (nothing animates), and save the state. The
+    /// list re-measures its rows for the new width by itself.
+    pub(crate) fn toggle_panel(&mut self, rail: bool, cx: &mut Context<Self>) {
+        let p = &mut self.panels;
+        if rail {
+            p.rail_collapsed = !p.rail_collapsed;
+        } else {
+            p.right_collapsed = !p.right_collapsed;
+        }
+        if self.bench.is_none()
+            && let Some(path) = theme::settings_path()
+            && let Err(e) = theme::save_panels(&path, self.panels)
+        {
+            self.model.last_error = Some(format!("panel layout not saved: {e}"));
+        }
+        cx.notify();
+    }
+
     /// Push transcript changes into the virtual list: only the changed tail
     /// is spliced (and so re-measured).
     pub fn sync_list(&mut self) {
@@ -632,6 +730,7 @@ impl AppView {
         let id = item.id;
         let body: AnyElement = match item.kind {
             ItemKind::User => div()
+                .max_w(px(PROSE_MAX))
                 .mt(px(14.))
                 .pl(px(16.))
                 .py(px(1.))
@@ -646,9 +745,9 @@ impl AppView {
                 .gap(px(6.))
                 .child(display(label::AGENT, 10., p.ink3))
                 .child(if self.plain_rows {
-                    div().text_size(px(14.)).child(row.text.clone()).into_any_element()
+                    div().max_w(px(PROSE_MAX)).text_size(px(14.)).child(row.text.clone()).into_any_element()
                 } else {
-                    div().text_size(px(14.)).child(TextView::markdown(("md", id), row.text.clone())).into_any_element()
+                    div().max_w(px(PROSE_MAX)).text_size(px(14.)).child(TextView::markdown(("md", id), row.text.clone())).into_any_element()
                 })
                 .into_any_element(),
             ItemKind::Thinking => {
@@ -697,7 +796,7 @@ impl AppView {
             ItemKind::Error => mono(row.text.clone(), 11.5, p.hi).my(px(6.)).whitespace_normal().into_any_element(),
             _ => div().text_size(px(13.)).child(row.text.clone()).into_any_element(),
         };
-        div().w_full().pl(px(36.)).pr(px(40.)).py(px(1.)).child(div().w_full().max_w(px(836.)).child(body)).into_any_element()
+        column(body).py(px(1.)).into_any_element()
     }
 
     /// A tool's status cell: a check, a cross (failed, denied), or, while
@@ -825,24 +924,17 @@ impl AppView {
                         .when_some(cwd, |d, c| d.child(mono(c, 10.5, p.ink4).overflow_hidden().text_ellipsis())),
                 )
             });
-        h_flex()
+        div()
             .flex_none()
-            .items_start()
-            .gap(px(20.))
-            .pt(px(22.))
-            .pb(px(18.))
-            .pl(px(36.))
-            .pr(px(30.))
             .border_b_1()
             .border_color(p.line)
-            .child(left)
-            .child(actions)
+            .child(column(h_flex().items_start().gap(px(20.)).pt(px(22.)).pb(px(18.)).child(left).child(actions)))
     }
 
     /// The "Name this session…" row under the header.
     fn render_naming(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let pending = self.model.named.rename.is_some();
-        let mut row = v_flex().pl(px(36.)).pr(px(30.)).py(px(10.)).gap(px(6.)).border_b_1().border_color(p.line).child(
+        let mut row = v_flex().py(px(10.)).gap(px(6.)).child(
             h_flex()
                 .gap(px(14.))
                 .items_center()
@@ -877,7 +969,7 @@ impl AppView {
                     }))),
             );
         }
-        row
+        div().border_b_1().border_color(p.line).child(column(row))
     }
 
     /// The authorization card: the first pending prompt, answered through
@@ -970,9 +1062,8 @@ impl AppView {
             .text_color(p.ink)
             .child(body);
         Some(
-            div().pl(px(36.)).pr(px(30.)).pt(px(8.)).pb(px(4.)).child(
+            column(
                 v_flex()
-                    .max_w(px(720.))
                     .px(px(22.))
                     .py(px(18.))
                     .border_1()
@@ -997,14 +1088,16 @@ impl AppView {
                             .child(div().flex_1())
                             .when_some(footer, |d, f| d.child(mono(f, 10., if more.is_some() && !sent { p.hi } else { p.ink4 }))),
                     ),
-            ),
+            )
+            .pt(px(8.))
+            .pb(px(4.)),
         )
     }
 
     fn render_composer(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let busy = self.model.transcript.busy();
         let can_send = self.drives();
-        div().flex_none().pl(px(36.)).pr(px(30.)).pt(px(6.)).pb(px(22.)).child(
+        column(
             v_flex()
                 .px(px(16.))
                 .pt(px(12.))
@@ -1045,6 +1138,9 @@ impl AppView {
                         ))),
                 ),
         )
+        .flex_none()
+        .pt(px(6.))
+        .pb(px(22.))
     }
 }
 
@@ -1208,9 +1304,9 @@ impl Render for AppView {
             b.on_render(&self.list, window);
         }
         let p = theme::palette(cx);
-        // Narrow windows drop the numbers, then the rail, before the session.
-        let width = window.viewport_size().width;
-        let (show_rail, show_right) = (width >= px(760.), width >= px(1100.));
+        // Wide windows widen the side panels; narrow ones drop the open
+        // numbers, then the open rail, before the session.
+        let (rail, right) = sides(window.viewport_size().width.into(), self.panels, crate::chrome::MARK);
         let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_row(ix, cx))).size_full();
         let main = v_flex()
             .flex_1()
@@ -1220,9 +1316,7 @@ impl Render for AppView {
             .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
             .child(div().flex_1().min_h_0().pt(px(14.)).child(list))
             .children(self.render_prompt(&p, cx))
-            .when_some(self.model.last_error.clone(), |d, e| {
-                d.child(mono(e, 11., p.hi).pl(px(36.)).pr(px(30.)).pt(px(6.)).whitespace_normal())
-            })
+            .when_some(self.model.last_error.clone(), |d, e| d.child(column(mono(e, 11., p.hi).pt(px(6.)).whitespace_normal())))
             .child(self.render_composer(&p, cx));
         h_flex()
             .id("root")
@@ -1234,6 +1328,8 @@ impl Render for AppView {
                     cx.stop_propagation();
                 }
             }))
+            .on_action(cx.listener(|this, _: &ToggleRail, _, cx| this.toggle_panel(true, cx)))
+            .on_action(cx.listener(|this, _: &ToggleRight, _, cx| this.toggle_panel(false, cx)))
             .relative()
             .size_full()
             .bg(p.bg)
@@ -1242,23 +1338,59 @@ impl Render for AppView {
             .text_size(px(13.))
             .child(self.render_mark(&p))
             .child(
-                v_flex().flex_1().h_full().min_w_0().child(self.render_top(&p, cx)).child(
+                v_flex().flex_1().h_full().min_w_0().child(self.render_top(&p, rail, cx)).child(
                     h_flex()
                         .flex_1()
                         .min_h_0()
-                        .when(show_rail, |d| d.child(self.render_rail(&p, cx)))
+                        .map(|d| match rail {
+                            Side::Open(w) => d.child(self.render_rail(w, &p, cx)),
+                            Side::Strip => d.child(self.render_rail_strip(&p, cx)),
+                            Side::Hidden => d,
+                        })
                         .child(main)
-                        .when(show_right, |d| d.child(self.render_right(&p))),
+                        .map(|d| match right {
+                            Side::Open(w) => d.child(self.render_right(w, &p, cx)),
+                            Side::Strip => d.child(self.render_right_strip(&p, cx)),
+                            Side::Hidden => d,
+                        }),
                 ),
             )
-            .when(self.picker_open, |d| d.child(deferred(self.render_picker(&p, show_rail, show_right, cx)).with_priority(1)))
+            .when(self.picker_open, |d| d.child(deferred(self.render_picker(&p, rail, right, cx)).with_priority(1)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings in gpui's `test` attribute through `gpui_kit::*`.
-    use super::{WELL_LINE, authorize_ready, lines_below, one_line, tracked, well_body};
+    use super::{Side, WELL_LINE, authorize_ready, lines_below, one_line, panel_keys, sides, tracked, well_body};
+    use crate::theme::Panels;
+
+    /// The fold keys parse on every OS (a bad one panics at start-up).
+    #[test]
+    fn panel_keys_parse() {
+        for mac in [false, true] {
+            let (a, b) = panel_keys(mac);
+            for k in [a, b] {
+                assert!(gpui_kit::Keystroke::parse(k).is_ok(), "{k}");
+            }
+        }
+    }
+
+    /// Wide windows widen the panels; folded ones are strips at any width;
+    /// an open right panel gives way before the session gets too narrow.
+    #[test]
+    fn side_panels_follow_the_window() {
+        let open = Panels::default();
+        assert_eq!(sides(1280., open, 30.), (Side::Open(276.), Side::Open(296.)));
+        assert_eq!(sides(1920., open, 30.), (Side::Open(276.), Side::Open(296.)));
+        assert_eq!(sides(2560., open, 30.), (Side::Open(340.), Side::Open(358.)));
+        assert_eq!(sides(1000., open, 30.), (Side::Open(276.), Side::Hidden));
+        assert_eq!(sides(700., open, 30.), (Side::Hidden, Side::Hidden));
+        let folded = Panels { rail_collapsed: true, right_collapsed: true };
+        assert_eq!(sides(700., folded, 30.), (Side::Strip, Side::Strip));
+        // A folded rail leaves room for the open numbers.
+        assert_eq!(sides(1000., Panels { rail_collapsed: true, right_collapsed: false }, 30.), (Side::Strip, Side::Open(296.)));
+    }
 
     /// H3: the card shows a long prompt whole, and AUTHORIZE waits until
     /// all of it has been on screen.

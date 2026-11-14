@@ -68,6 +68,7 @@ pub mod label {
     pub const CONTEXT: &str = "C O N T E X T";
     pub const TOKENS: &str = "T O K E N S";
     pub const FILES: &str = "F I L E S";
+    pub const VIA_SHELL: &str = "V I A   S H E L L";
     pub const IN: &str = "I N";
     pub const OUT: &str = "O U T";
     pub const CACHE: &str = "C A C H E";

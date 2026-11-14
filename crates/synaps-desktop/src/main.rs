@@ -1,7 +1,7 @@
 //! Synaps Desktop (GPUI spike): a thin client for the Synaps daemon.
 //!
 //! ```text
-//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--accent #RRGGBB] [--accent-picker]
+//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--accent #RRGGBB] [--accent-picker] [--size WxH]
 //! synaps-desktop --bench [--profile P --prompt TEXT] [--refresh-hz HZ]
 //! ```
 //! `--bench` connects to a daemon only when `--profile` or `--socket` is
@@ -9,7 +9,9 @@
 //! JSON and exits (watchdog: 30 s). `--offline` shows the synthetic
 //! transport's sessions ([`demo`]). The accent: `--accent`, else
 //! `$SYNAPS_DESKTOP_ACCENT`, else the settings file the in-app picker writes
-//! ([`theme::settings_path`]), else Arasaka red.
+//! ([`theme::settings_path`]), else Arasaka red. The same file keeps which
+//! side panels are folded (Ctrl+B, Ctrl+Alt+B; not read by `--bench`).
+//! `--size`: the window's size in logical pixels (screenshots).
 
 // serde_json's `json!` in the synthetic transport and its tests nests deep.
 #![recursion_limit = "256"]
@@ -24,6 +26,7 @@ mod fonts;
 mod mem;
 mod model;
 mod named;
+mod shell;
 mod stats;
 mod theme;
 
@@ -48,6 +51,7 @@ fn main() {
     let mut accent: Option<String> = None;
     let mut start_session: Option<String> = None;
     let mut open_picker = false;
+    let mut window_size: Option<(f32, f32)> = None;
     let mut args = std::env::args().skip(1);
     // A flag's value; another flag in its place is a usage error, not the value.
     let value = |args: &mut std::iter::Skip<std::env::Args>, flag: &str| match args.next() {
@@ -72,9 +76,20 @@ fn main() {
             "--accent" => accent = Some(value(&mut args, "--accent")),
             "--session" => start_session = Some(value(&mut args, "--session")),
             "--accent-picker" => open_picker = true,
+            "--size" => {
+                let v = value(&mut args, "--size");
+                let parsed = v.split_once('x').and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?)));
+                match parsed.filter(|&(w, h)| (640.0..=8192.0).contains(&w) && (420.0..=8192.0).contains(&h)) {
+                    Some(s) => window_size = Some(s),
+                    None => {
+                        eprintln!("--size takes WxH, at least 640x420: {v}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "-h" | "--help" => {
                 println!(
-                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--accent #RRGGBB] [--accent-picker] [--bench [--prompt TEXT] [--refresh-hz HZ]]\n\
+                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--bench [--prompt TEXT] [--refresh-hz HZ]]\n\
                      accent: --accent, else ${}, else the picker's settings file ({}), else {}",
                     theme::ENV_ACCENT,
                     theme::settings_path().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()),
@@ -93,6 +108,8 @@ fn main() {
     }
     let env_accent = std::env::var(theme::ENV_ACCENT).ok();
     let saved_accent = theme::settings_path().and_then(|p| theme::load_accent(&p));
+    // A bench measures the default layout, whatever was folded last.
+    let panels = if bench { theme::Panels::default() } else { theme::settings_path().map(|p| theme::load_panels(&p)).unwrap_or_default() };
     let (accent, accent_source, warnings) = theme::resolve(accent.as_deref(), env_accent.as_deref(), saved_accent.as_deref());
     for w in warnings {
         eprintln!("synaps-desktop: {w}");
@@ -126,7 +143,9 @@ fn main() {
         Theme::change(ThemeMode::Dark, None, cx);
         fonts::register(cx);
         theme::apply(accent, cx);
-        let size = size(px(1360.), px(860.));
+        app::bind_keys(cx);
+        let (w, h) = window_size.unwrap_or((1360., 860.));
+        let size = size(px(w), px(h));
         let mut options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size, cx))),
             titlebar: Some(TitlebarOptions { title: Some("Synaps".into()), ..Default::default() }),
@@ -151,6 +170,7 @@ fn main() {
                 let mut v = app::AppView::new(client, synthetic, window, cx);
                 v.start_session = start_session;
                 v.picker_open = open_picker;
+                v.panels = panels;
                 v.accent_source = accent_source;
                 v
             })
