@@ -43,7 +43,7 @@ pub fn register(cx: &mut App) {
 
 /// Every Japanese sub-label. `subset.sh` keeps exactly these glyphs.
 #[cfg(test)]
-const JP_LABELS: &[&str] = &[JP_SESSIONS, JP_CONTEXT, JP_TOKENS, JP_FILES, JP_MARK_1, JP_MARK_2, JP_PINNED, JP_OPEN, JP_HISTORY];
+const JP_LABELS: &[&str] = &[JP_SESSIONS, JP_CONTEXT, JP_TOKENS, JP_FILES, JP_PINNED, JP_OPEN, JP_HISTORY];
 pub const JP_SESSIONS: &str = "セッション";
 /// The rail's groups: PINNED, OPEN, HISTORY.
 pub const JP_PINNED: &str = "固定";
@@ -52,9 +52,6 @@ pub const JP_HISTORY: &str = "履歴";
 pub const JP_CONTEXT: &str = "文脈";
 pub const JP_TOKENS: &str = "トークン";
 pub const JP_FILES: &str = "変更";
-/// 荒坂, the rail's mark, one glyph per line.
-pub const JP_MARK_1: &str = "荒";
-pub const JP_MARK_2: &str = "坂";
 
 /// Tracked display labels.
 pub mod label {
