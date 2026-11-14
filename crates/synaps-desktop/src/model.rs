@@ -99,6 +99,12 @@ pub struct Active {
 pub enum Effect {
     /// Input the daemon refused (or never got): put it back in the composer.
     Restore(String),
+    /// Input sent to `session` before its tab was left, refused (or never
+    /// confirmed) since: back into that tab's draft, which says so.
+    Unsent {
+        session: String,
+        text: String,
+    },
     ListSessions,
     Resync,
     /// `Client::saved_sessions(named_only, limit)`; if it cannot be sent,
@@ -234,6 +240,19 @@ pub const LOCAL_SEQ: u64 = u64::MAX;
 /// The daemon's answer to attaching a session it does not hold
 /// (`daemon/conn.rs`: `DaemonFrame::Error { message: "unknown session" }`).
 const UNKNOWN_SESSION: &str = "unknown session";
+/// Left attachments whose unconfirmed input is still followed.
+const LEFT_MAX: usize = 4;
+
+/// The daemon refused a submit or a steer, or a refusal that names no
+/// command (it could be one): the oldest input in flight comes back.
+fn refused_input(e: &Error) -> bool {
+    match e {
+        Error::Refused { command: None, .. } => true,
+        Error::Refused { command: Some(c), .. } => c == "submit" || c == "steer",
+        Error::NotAttached { command } => *command != "answer",
+        _ => false,
+    }
+}
 
 pub struct Model {
     pub conn: ConnState,
@@ -261,11 +280,16 @@ pub struct Model {
     /// Sent, not yet confirmed by `TurnStarted` / `Steered`, oldest first:
     /// given back to the user on a refusal (the oldest) or a detach (all).
     in_flight: VecDeque<String>,
+    /// The same for attachments a tab switch left (their last events still
+    /// come, until their `Detached`): `(attach_seq, session, texts)`.
+    left: Vec<(u64, String, VecDeque<String>)>,
     pub named: Named,
     /// The open tabs; the visible one's session is the one attached.
     pub tabs: Tabs,
-    /// A session list has landed (saved tabs can be checked against it).
+    /// A session list has landed (saved tabs can be checked against it),
+    /// and how many have (the polls of an idle daemon included).
     pub sessions_listed: bool,
+    pub lists: u64,
     /// The attached session's numbers (header, right-hand panel).
     pub stats: Stats,
     /// Bumped whenever what the rail lists may have changed (anything but
@@ -312,9 +336,11 @@ impl Model {
             last_error: None,
             reattaching: false,
             in_flight: VecDeque::new(),
+            left: Vec::new(),
             named: Named { daemon: "the daemon's machine".into(), ..Named::default() },
             tabs: Tabs::default(),
             sessions_listed: false,
+            lists: 0,
             stats: Stats::default(),
             rail_gen: 0,
             unread: HashSet::new(),
@@ -801,12 +827,20 @@ impl Model {
     /// card, no HALT can reach the session left or the one to come.
     pub fn switch_out(&mut self) -> (Transcript, Stats) {
         self.saw_active();
-        self.active = None;
         self.wanted = None;
         self.wanted_session = None;
         self.wanted_fact = None;
         self.answered.clear();
-        // Sent to the session left: its echo will never come here.
+        // Sent to the session left: its echo or refusal still comes, under
+        // that attachment's seq; a refusal goes back to that tab's draft.
+        if let Some(a) = self.active.take()
+            && !self.in_flight.is_empty()
+        {
+            if self.left.len() == LEFT_MAX {
+                self.left.remove(0);
+            }
+            self.left.push((a.attach_seq, a.session_id, std::mem::take(&mut self.in_flight)));
+        }
         self.in_flight.clear();
         self.reattaching = false;
         self.last_error = None;
@@ -814,6 +848,10 @@ impl Model {
         n.naming = false;
         n.replace = None;
         n.rename_error = None;
+        // A resume or an attach in flight was the attachment left's.
+        n.resuming = None;
+        n.attaching = None;
+        n.opening.take_if(|o| o.attach_seq.is_some());
         self.rail_gen += 1;
         self.view_dirty = true;
         (std::mem::take(&mut self.transcript), std::mem::take(&mut self.stats))
@@ -950,11 +988,47 @@ impl Model {
         }
     }
 
+    /// An event of an attachment a tab switch left, while it still has
+    /// input unconfirmed: an echo confirms it, a refusal gives the oldest
+    /// back, the end gives back the rest (to that tab's draft). `None`:
+    /// not one of those.
+    fn left_event(&mut self, ev: &Event) -> Option<Vec<Effect>> {
+        let seq = ev.attach_seq().filter(|&s| !self.current(s))?;
+        let i = self.left.iter().position(|l| l.0 == seq)?;
+        let mut effects = Vec::new();
+        let (_, session, texts) = &mut self.left[i];
+        let mut give = |t: String| effects.push(Effect::Unsent { session: session.clone(), text: t });
+        match ev {
+            Event::Session {
+                event: SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. }, ..
+            } => {
+                if let Some(k) = texts.iter().position(|s| s.trim() == t.trim()) {
+                    texts.remove(k);
+                }
+            }
+            Event::Error { error, .. } if refused_input(error) => {
+                if let Some(t) = texts.pop_front() {
+                    give(t);
+                }
+            }
+            Event::Detached { .. } if !texts.is_empty() => give(Vec::from(std::mem::take(texts)).join("\n")),
+            _ => {}
+        }
+        if self.left[i].2.is_empty() || matches!(ev, Event::Detached { .. }) {
+            self.left.remove(i);
+        }
+        Some(effects)
+    }
+
     /// Apply one event.
     pub fn apply(&mut self, ev: Event) -> Vec<Effect> {
+        if let Some(effects) = self.left_event(&ev) {
+            return effects;
+        }
         let mut effects = Vec::new();
         let ev = match ev {
             Event::Sessions(mut s) => {
+                self.lists += 1;
                 self.sessions_listed = true;
                 sort_sessions(&mut s);
                 // The poll of an idle daemon: nothing to rebuild or draw.
@@ -1239,9 +1313,7 @@ impl Model {
                 if answer || matches!(&error, Error::Refused { command: None, .. }) {
                     self.answered.clear();
                 }
-                let input = !answer && matches!(&error, Error::Refused { command: None, .. } | Error::NotAttached { .. })
-                    || matches!(&error, Error::Refused { command: Some(c), .. } if c == "submit" || c == "steer");
-                if input {
+                if refused_input(&error) {
                     self.give_back_oldest(&mut effects);
                 }
                 self.last_error = Some(error.to_string());
@@ -2332,6 +2404,7 @@ mod fake_daemon {
 
     const A: &str = "20261113-080000-aaaa";
     const B: &str = "20261113-080000-bbbb";
+    const C: &str = "20261113-080000-cccc";
     const T: Duration = Duration::from_secs(10);
 
     struct Conn {
@@ -2536,6 +2609,117 @@ mod fake_daemon {
         m.switch_in(t, s);
         ui_attach(m, client, sid);
         left
+    }
+
+    /// Apply the client's events to `m` until `n` effects match `want`;
+    /// every effect seen is returned.
+    fn effects(m: &mut Model, events: &async_channel::Receiver<Event>, n: usize, want: impl Fn(&Effect) -> bool) -> Vec<Effect> {
+        let until = Instant::now() + T;
+        let mut seen = Vec::new();
+        while seen.iter().filter(|e| want(e)).count() < n {
+            while let Ok(ev) = events.try_recv() {
+                seen.extend(m.apply(ev));
+            }
+            assert!(Instant::now() < until, "timed out; effects so far: {seen:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        seen
+    }
+
+    /// M3: Ctrl+Tab held over three tabs (the press, then 30 Hz repeats for
+    /// 1.5 s) shows each tab at once and sends one attach, for the tab it
+    /// stops on, once it is let go. The app's gate, counted at the daemon.
+    #[test]
+    fn a_held_tab_key_attaches_once_when_let_go() {
+        let (client, events, attaches, mut m) = connect("storm");
+        for s in [A, B, C] {
+            m.tabs.open(s, s, Place::New);
+        }
+        m.tabs.focus(0);
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A));
+        let mut gate = crate::tabs::AttachGate::default();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut waiting = None;
+        for t in std::iter::once(0).chain((0..45).map(|k| 600 + k * 33)) {
+            gate.key_down(at(t));
+            assert!(m.tabs.step(1));
+            let s = m.tabs.visible_session().unwrap().to_string();
+            let _ = m.switch_out();
+            m.switch_in(Transcript::new(), Stats::default());
+            if gate.switch(at(t)) {
+                m.showing(&s);
+                waiting = Some(s);
+            } else {
+                ui_attach(&mut m, &client, &s);
+            }
+            assert!(!gate.ready(at(t + 30)), "nothing is due while the key is held");
+            assert!(!m.can_send(), "nothing drives a tab still opening");
+        }
+        assert!(attaches.recv_timeout(Duration::from_millis(200)).is_err(), "no attach while held");
+        gate.key_up(at(2100));
+        assert!(!gate.ready(at(2200)) && gate.ready(at(2220)));
+        let s = waiting.take().expect("the last switch waited");
+        ui_attach(&mut m, &client, &s);
+        let mut last = attaches.recv_timeout(T).unwrap();
+        assert!(attaches.recv_timeout(Duration::from_millis(300)).is_err(), "one attach for the whole storm");
+        last.send(attached_with_prompt(&s, 1));
+        pump(&mut m, &events, "the last tab attached", |m| m.is_active(&s));
+        assert_eq!(m.tabs.visible_session(), Some(s.as_str()));
+    }
+
+    /// M4: a steer to A, then a switch to B before the daemon answers it; A
+    /// refuses it on the attachment the switch left. It comes back as A's
+    /// (into A's draft), never into the composer B shows.
+    #[test]
+    fn a_send_refused_after_its_tab_was_left_goes_back_to_that_tab() {
+        let (client, events, attaches, mut m) = connect("unsent");
+        m.tabs.open(A, "a", Place::Current);
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
+        client.submit("steer A this way").unwrap();
+        m.sent("steer A this way".into());
+        m.tabs.open(B, "b", Place::New);
+        let _ = ui_switch(&mut m, &client, B, None);
+        a.event(A, 5, json!({"ev": "refused", "client": 2, "command": "submit", "reason": "input is owned by client #1"}));
+        let seen = effects(&mut m, &events, 1, |e| matches!(e, Effect::Unsent { .. }));
+        assert!(seen.contains(&Effect::Unsent { session: A.into(), text: "steer A this way".into() }), "{seen:?}");
+        assert!(!seen.iter().any(|e| matches!(e, Effect::Restore(_))), "nothing for B's composer: {seen:?}");
+        let _b = attaches.recv_timeout(T).unwrap();
+    }
+
+    /// M4: the same send, never echoed nor refused before the attachment
+    /// left ends: given back to A too (the daemon may not have it).
+    #[test]
+    fn a_send_unconfirmed_when_its_attachment_ends_goes_back_to_that_tab() {
+        let (client, events, attaches, mut m) = connect("unsent2");
+        m.tabs.open(A, "a", Place::Current);
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
+        for t in ["one", "two"] {
+            client.submit(t).unwrap();
+            m.sent(t.into());
+        }
+        // "one" is echoed (taken), "two" is not.
+        a.event(A, 5, json!({"ev": "turn_started", "user_text": "one"}));
+        pump(&mut m, &events, "the echo", |m| m.in_flight.len() == 1);
+        m.tabs.open(B, "b", Place::New);
+        let _ = ui_switch(&mut m, &client, B, None);
+        drop(a);
+        let seen = effects(&mut m, &events, 1, |e| matches!(e, Effect::Unsent { .. }));
+        assert_eq!(
+            seen.iter().filter(|e| matches!(e, Effect::Unsent { .. })).collect::<Vec<_>>(),
+            vec![&Effect::Unsent { session: A.into(), text: "two".into() }]
+        );
+        assert!(m.left.is_empty(), "nothing left to follow");
+        let _b = attaches.recv_timeout(T).unwrap();
     }
 
     /// Tabs: A (its prompt #1 on screen) in one tab, B (its own prompt #1,

@@ -15,7 +15,7 @@ use synaps_client::protocol::{LlmEvent, SessionEvent, SessionStreamEvent, Stream
 use synaps_client::protocol::{DaemonFrame, SessionMeta, decode_frame};
 use synaps_client::{AttachMode, Event, synthetic};
 
-use crate::app::{AppView, Open, TabKey};
+use crate::app::{AppView, Open};
 use crate::mem;
 use crate::model::LOCAL_SEQ;
 
@@ -34,6 +34,10 @@ pub struct BenchOptions {
     /// of [`DRAG_TURNS`] turns: RSS with 1, 4 and 8 tabs, switch times
     /// cached and not).
     pub tabs: bool,
+    /// `--bench-history FILE`: the tab bench's sessions all have this
+    /// history (a saved session's `api_messages`: a real one, with its
+    /// tool results and edits), not the synthetic one.
+    pub history_file: Option<std::path::PathBuf>,
 }
 
 pub struct BenchState {
@@ -319,11 +323,24 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             sleep(1.5).await;
             out["mem_idle"] = mem::sample();
             if opts.tabs {
+                out["mem_idle"]["trimmed_rss_kb"] = mem::trimmed_rss_kb();
                 // A synthetic daemon with 8 sessions of 400 turns; it answers
                 // each attach off the UI thread (encode, decode), as the
                 // connection thread would.
-                let hist: Arc<Vec<Arc<Vec<Value>>>> =
-                    Arc::new((0..TAB_SESSIONS).map(|k| Arc::new(turns(DRAG_TURNS, 30 + k as u64))).collect());
+                let real = opts.history_file.as_ref().map(|p| {
+                    let v: Value = std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+                    let h = v.get("api_messages").or(Some(&v)).and_then(Value::as_array).cloned().unwrap_or_default();
+                    (p.metadata().map(|m| m.len()).unwrap_or(0), Arc::new(h))
+                });
+                out["history_file"] = json!(real.as_ref().map(|(bytes, h)| json!({"bytes": bytes, "messages": h.len()})));
+                let hist: Arc<Vec<Arc<Vec<Value>>>> = Arc::new(
+                    (0..TAB_SESSIONS)
+                        .map(|k| match &real {
+                            Some((_, h)) => h.clone(),
+                            None => Arc::new(turns(DRAG_TURNS, 30 + k as u64)),
+                        })
+                        .collect(),
+                );
                 let ids: Arc<Vec<String>> = Arc::new((0..TAB_SESSIONS).map(|k| format!("20261114-0900{k:02}-b{k:03}")).collect());
                 let metas: Vec<SessionMeta> = ids
                     .iter()
@@ -335,19 +352,26 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     })
                     .collect();
                 let _ = tx.try_send(Event::Sessions(metas));
-                let (tx2, ids2, hist2) = (tx.clone(), ids.clone(), hist.clone());
+                // One thread answers every attach, as the client's one
+                // connection thread decodes them (a thread each would give
+                // the allocator an arena each, and the RSS with it).
+                let (req_tx, req_rx) = std::sync::mpsc::channel::<(String, u64)>();
+                let (tx_conn, ids_conn, hist_conn) = (tx.clone(), ids.clone(), hist.clone());
+                std::thread::spawn(move || {
+                    for (sid, seq) in req_rx {
+                        if let Some(k) = ids_conn.iter().position(|i| *i == sid)
+                            && let Some(ev) = attached_event(&sid, seq, &hist_conn[k])
+                        {
+                            let _ = tx_conn.try_send(ev);
+                        }
+                    }
+                });
+                let tx2 = tx.clone();
                 let _ = upd(cx, &move |v, _| {
                     v.synthetic_tx = Some(tx2.clone());
-                    let (tx3, ids3, hist3) = (tx2.clone(), ids2.clone(), hist2.clone());
+                    let req = req_tx.clone();
                     v.attach_source = Some(Box::new(move |sid: &str, seq: u64| {
-                        if let Some(k) = ids3.iter().position(|i| i == sid) {
-                            let (tx, sid, h) = (tx3.clone(), sid.to_string(), hist3[k].clone());
-                            std::thread::spawn(move || {
-                                if let Some(ev) = attached_event(&sid, seq, &h) {
-                                    let _ = tx.try_send(ev);
-                                }
-                            });
-                        }
+                        let _ = req.send((sid.to_string(), seq));
                         Vec::new()
                     }));
                 });
@@ -393,7 +417,10 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     if matches!(k + 1, 1 | 4 | 8) {
                         sleep(0.5).await;
                         let mut m = mem::sample();
-                        m["cached_tabs"] = json!(view.update(cx, |v, _| v.tab_cache.len()).unwrap_or(0));
+                        m["trimmed_rss_kb"] = mem::trimmed_rss_kb();
+                        let (n, bytes) = view.update(cx, |v, _| (v.tab_cache.len(), v.tab_cache.bytes())).unwrap_or((0, 0));
+                        m["cached_tabs"] = json!(n);
+                        m["cache_estimate_mib"] = json!(round(bytes as f64 / 1048576.0, 2));
                         mem_tabs[format!("tabs_{}", k + 1)] = m;
                     }
                 }
@@ -413,7 +440,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         if uncached {
                             let _ = v.tab_cache.take(&id2);
                         }
-                        v.tab_key(TabKey::Nth(target), cx);
+                        // A click (a key would wait for its key-up).
+                        v.focus_tab(target);
+                        cx.notify();
                     });
                     let switched = Instant::now();
                     // What the switch put on screen before any attach: the

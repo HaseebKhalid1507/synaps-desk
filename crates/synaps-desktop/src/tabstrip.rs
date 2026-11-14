@@ -112,6 +112,8 @@ impl Render for TabDrag {
 pub(crate) struct Labels {
     key: (u64, u64),
     labels: Vec<(SharedString, bool)>,
+    /// The overflow arrows' texts, for the counts they show.
+    arrows: ((usize, usize), (SharedString, SharedString)),
 }
 
 impl AppView {
@@ -137,6 +139,10 @@ impl AppView {
     /// (a create the poll has not caught up with), else gone (no glyph).
     pub(crate) fn tab_state(&self, t: &Tab) -> State {
         let Some(s) = t.session.as_deref() else { return State::Opening };
+        // Restored, its session not listed yet (a daemon still starting).
+        if self.model.tabs.restoring(t.id) {
+            return State::Opening;
+        }
         if let Some(m) = self.model.sessions.iter().find(|m| m.id == s) {
             return self.model.state(m);
         }
@@ -162,7 +168,7 @@ impl AppView {
         let key = (self.model.rail_gen, self.model.tabs.generation);
         if self.tab_labels.key != key || self.tab_labels.labels.len() != self.model.tabs.len() {
             let labels = self.model.tabs.iter().map(|t| self.tab_label(t)).collect();
-            self.tab_labels = Labels { key, labels };
+            self.tab_labels = Labels { key, labels, arrows: std::mem::take(&mut self.tab_labels.arrows) };
         }
         let tabs = &self.model.tabs;
         let n = tabs.len();
@@ -184,7 +190,12 @@ impl AppView {
             let (label, named) = self.tab_labels.labels.get(ix).cloned().unwrap_or_default();
             row = row.child(self.render_tab(t.id, ix, active == Some(ix), st, label, named, lay.width, p, cx));
         }
-        let arrow = |id: &'static str, text: String, on: bool| {
+        let (before, after) = (lay.first, n - lay.first - lay.shown);
+        if lay.overflow && self.tab_labels.arrows.0 != (before, after) {
+            self.tab_labels.arrows = ((before, after), (format!("‹ {before}").into(), format!("{after} ›").into()));
+        }
+        let (left, right) = self.tab_labels.arrows.1.clone();
+        let arrow = |id: &'static str, text: SharedString, on: bool| {
             h_flex()
                 .id(id)
                 .w(px(ARROW_W))
@@ -195,7 +206,6 @@ impl AppView {
                 .child(mono(text, 11., if on { p.prose_ch } else { p.dim_ch }))
                 .when(on, |d| d.cursor_pointer().hover(|d| d.bg(p.raised)))
         };
-        let (before, after) = (lay.first, n - lay.first - lay.shown);
         h_flex()
             .id("tab-strip")
             .h(px(TAB_H))
@@ -206,16 +216,14 @@ impl AppView {
             .border_b_1()
             .border_color(p.hair)
             .when(lay.overflow, |d| {
-                d.child(arrow("tabs-left", format!("‹ {before}"), before > 0).border_r_1().border_color(p.hair).on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.tab_first = this.tab_first.saturating_sub(1);
-                        cx.notify();
-                    },
-                )))
+                d.child(arrow("tabs-left", left, before > 0).border_r_1().border_color(p.hair).on_click(cx.listener(|this, _, _, cx| {
+                    this.tab_first = this.tab_first.saturating_sub(1);
+                    cx.notify();
+                })))
             })
             .child(row)
             .when(lay.overflow, |d| {
-                d.child(arrow("tabs-right", format!("{after} ›"), after > 0).on_click(cx.listener(|this, _, _, cx| {
+                d.child(arrow("tabs-right", right, after > 0).on_click(cx.listener(|this, _, _, cx| {
                     this.tab_first += 1;
                     cx.notify();
                 })))
@@ -274,7 +282,7 @@ impl AppView {
         let word = st.word().filter(|_| width >= WORD_MIN);
         let drag = TabDrag { id, ix, label: label.clone(), bg: p.raised, fg: p.ink, edge: p.edge };
         let mark = p.focus_ch;
-        let tip: SharedString = format!("{label} · {}", st.name()).into();
+        let (tip, name) = (label.clone(), st.name());
         let close = mono("×", 13., if on { p.dim_ch } else { gpui_kit::transparent_black() })
             .id(("tab-x", id as usize))
             .w(px(18.))
@@ -323,7 +331,8 @@ impl AppView {
             )
             .when_some(word, |d, w| d.child(display(w, 9., word_color(st, p)).flex_none()))
             .child(close)
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            // Formatted on hover only.
+            .tooltip(move |window, cx| Tooltip::new(format!("{tip} · {name}")).build(window, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
                 let ix = this.model.tabs.iter().position(|t| t.id == id);
                 if let Some(ix) = ix {

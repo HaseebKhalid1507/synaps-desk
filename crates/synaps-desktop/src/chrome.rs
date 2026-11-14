@@ -419,8 +419,10 @@ impl AppView {
         }
         let pct: SharedString = ratio.map(|r| format!("{:.0}", r * 100.0)).unwrap_or_else(|| "—".into()).into();
         let fits = crate::app::toggled(self.width, self.panels, false).is_some();
-        // L2: detached, the last numbers seen are dimmed, as the open panel's are.
+        // L2: detached, the last numbers seen are dimmed, as the open panel's
+        // are; so are a cached tab's while its attach is on its way.
         let detached = self.model.stats.detached && self.model.active.is_none();
+        let dim = detached || self.opening();
         v_flex()
             .id("right-strip")
             .w(px(STRIP))
@@ -438,7 +440,7 @@ impl AppView {
                 v_flex()
                     .items_center()
                     .gap(px(14.))
-                    .when(detached, |d| d.opacity(0.45))
+                    .when(dim, |d| d.opacity(0.45))
                     .child(v_flex().items_center().child(display(pct, 13., p.prose_ch)).child(mono("%", 9., p.dim_ch)))
                     .child(gauge),
             )
@@ -1013,8 +1015,10 @@ impl AppView {
                 files = files.child(mono(format!("+{} more", shell.len() - FILES_SHOWN), 10.5, p.dim_ch).mt(px(6.)));
             }
         }
-        // Detached: the last numbers seen, dimmed and labelled, not live.
+        // Detached: the last numbers seen, dimmed and labelled, not live. A
+        // cached tab whose attach is on its way: the same, as last seen.
         let detached = s.detached && self.model.active.is_none();
+        let cached = !detached && self.opening();
         v_flex()
             .id("right")
             .w(px(width))
@@ -1023,7 +1027,7 @@ impl AppView {
             .overflow_y_scroll()
             .border_l_1()
             .border_color(p.hair)
-            .when(detached, |d| {
+            .when(detached || cached, |d| {
                 d.child(
                     h_flex()
                         .px(px(24.))
@@ -1031,11 +1035,15 @@ impl AppView {
                         .gap(px(10.))
                         .border_b_1()
                         .border_color(p.hair)
-                        .child(display("D E T A C H E D", 10., p.warn_ch))
-                        .child(mono("last numbers seen", 10., p.dim_ch)),
+                        .child(display(
+                            if cached { "C A C H E D" } else { "D E T A C H E D" },
+                            10.,
+                            if cached { p.dim_ch } else { p.warn_ch },
+                        ))
+                        .child(mono(if cached { "as last seen · opening…" } else { "last numbers seen" }, 10., p.dim_ch)),
                 )
             })
-            .child(v_flex().when(detached, |d| d.opacity(0.45)).child(context).child(tokens).child(files))
+            .child(v_flex().when(detached || cached, |d| d.opacity(0.45)).child(context).child(tokens).child(files))
     }
 
     /// The theme picker: SYNAPS CONFIG (follow the TUI's `theme =`, the

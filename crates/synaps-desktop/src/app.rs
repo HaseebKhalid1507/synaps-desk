@@ -50,11 +50,15 @@ pub(crate) struct RowCache {
 /// Result lines an open tool row shows.
 const RESULT_LINES: usize = 12;
 /// Background tabs whose transcript and rows are kept (switching back to
-/// one shows it at once, then its attach brings it up to date).
+/// one shows it at once, then its attach brings it up to date), at most
+/// this many and this many bytes (estimated, [`TabCache::bytes`]).
 pub(crate) const TAB_CACHE: usize = 8;
-/// Tab switches closer together than this attach once, after the last (a
-/// held Ctrl+Tab is not an attach, and a full history, per repeat).
-const ATTACH_GAP: Duration = Duration::from_millis(120);
+pub(crate) const TAB_CACHE_BYTES: usize = 64 << 20;
+/// A cached tab's bytes per transcript item beyond its strings: the
+/// `--bench-tabs` live (trimmed) RSS per cached tab, on the synthetic
+/// fixture and on real saved sessions of 0.75, 3.2 and 24 MB, less the
+/// strings counted, came to 1.1–2.1 KiB per item.
+const ITEM_OVERHEAD: usize = 1536;
 /// A splice longer than this reuses the rows of unchanged items.
 const REUSE_ROWS: usize = 32;
 /// What a tab opened by a create is called until the daemon names it.
@@ -75,7 +79,33 @@ pub(crate) struct TabCache {
     synced_busy: bool,
     files_gen: u64,
     waiting_on: Option<u64>,
+    /// The text metrics its heights were measured with ([`AppView::metrics_gen`]).
+    metrics_gen: u64,
 }
+
+impl TabCache {
+    /// What it keeps, roughly (bytes): the transcript's items (texts, tool
+    /// inputs and results), the rows' strings, the display rows, the files
+    /// ledger, and per item what the strings do not show (the list's
+    /// heights, maps, allocator slack: [`ITEM_OVERHEAD`]). Measured once,
+    /// when the tab is left.
+    fn bytes(&self) -> usize {
+        let item = |i: &Item| {
+            std::mem::size_of::<Item>()
+                + i.text.capacity()
+                + i.tool.as_ref().map_or(0, |t| t.tool_id.capacity() + t.name.capacity() + t.input.capacity() + t.result.capacity())
+        };
+        let row = |r: &RowCache| std::mem::size_of::<RowCache>() + r.text.len() + r.arg.len() + r.result.len();
+        self.transcript.items().iter().map(item).sum::<usize>()
+            + self.transcript.len() * ITEM_OVERHEAD
+            + self.rows.iter().map(row).sum::<usize>()
+            + self.disp.len() * (std::mem::size_of::<Disp>() + 32)
+            + self.stats.files.bytes()
+    }
+}
+
+/// What a tab says when it is shown again with a send given back.
+const UNSENT_NOTE: &str = "not confirmed before you left this tab: back here; check the transcript before sending it again";
 
 /// How a tab's session is opened.
 pub(crate) enum Open {
@@ -229,6 +259,11 @@ pub(crate) fn tab_keys(mac: bool) -> &'static [(&'static str, TabKey)] {
         ("cmd-9", Last),
     ];
     if mac { &MAC } else { &LINUX }
+}
+
+/// `key` (a keystroke's key, as GPUI names it) is one a tab key is made of.
+fn is_tab_key(key: &str) -> bool {
+    tab_keys(cfg!(target_os = "macos")).iter().any(|(k, _)| k.rsplit('-').next().is_some_and(|last| last.eq_ignore_ascii_case(key)))
 }
 
 /// The text size keys: `=`, `+` (its own key on DE and Nordic layouts)
@@ -427,17 +462,21 @@ impl FoldKeys {
     /// than the usual first-repeat delays (X11 660 ms, Windows up to 1 s).
     const STALE: Duration = Duration::from_millis(1100);
 
-    /// A fold key went down at `now`: `true` for a press, `false` for a repeat.
-    pub(crate) fn press(&mut self, now: Instant) -> bool {
-        let repeat = match (self.pressed, self.released) {
-            (None, _) => false,
-            (Some(_), Some(up)) => now.saturating_duration_since(up) < Self::PAIR,
-            // Not on macOS: AppKit drops the key-up of B when it is let go
-            // while Cmd is still held, so a quick unfold (or tapping B with
-            // Cmd held) would read as a repeat and do nothing. The cost
-            // there: holding Cmd+B flickers the panel.
-            (Some(down), None) => !cfg!(target_os = "macos") && now.saturating_duration_since(down) < Self::STALE,
-        };
+    /// A fold key went down at `now`: `true` for a press, `false` for a
+    /// repeat. `held`: the key-down says it is one (`KeyDownEvent::is_held`:
+    /// AppKit's `isARepeat`, Windows' repeat bit, Wayland's repeats; X11
+    /// never says, and the key-up rule tells there).
+    pub(crate) fn press(&mut self, now: Instant, held: bool) -> bool {
+        let repeat = held
+            || match (self.pressed, self.released) {
+                (None, _) => false,
+                (Some(_), Some(up)) => now.saturating_duration_since(up) < Self::PAIR,
+                // Not on macOS: AppKit drops the key-up of B when it is let
+                // go while Cmd is still held, so a quick unfold (or tapping B
+                // with Cmd held) would read as a repeat and do nothing. Its
+                // repeats say `held` instead.
+                (Some(down), None) => !cfg!(target_os = "macos") && now.saturating_duration_since(down) < Self::STALE,
+            };
         self.pressed = Some(now);
         self.released = None;
         !repeat
@@ -451,6 +490,30 @@ impl FoldKeys {
     }
 }
 
+/// A key whose auto-repeats must not act: a held Ctrl+T (Cmd+T) is one new
+/// tab, not a burst of daemon sessions; a held Ctrl+W closes one tab. GPUI
+/// says whether a key-down is a repeat (`is_held`) only to key listeners,
+/// which run after the actions, so the action leaves the decision to the
+/// key-down that carries it ([`AppView::once_key`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OnceKey {
+    /// Ctrl+B (`true`, the rail) / Ctrl+Alt+B.
+    Fold(bool),
+    /// New, Close, Reopen.
+    Tab(TabKey),
+}
+
+impl OnceKey {
+    /// Its key's letter: the key-down that follows the action is its own.
+    fn letter(self) -> &'static str {
+        match self {
+            OnceKey::Fold(_) => "b",
+            OnceKey::Tab(TabKey::Close) => "w",
+            OnceKey::Tab(_) => "t",
+        }
+    }
+}
+
 /// A fold key the view did not get (the focus is outside it): an app-wide
 /// listener, which GPUI runs when nothing on the focus path handled the
 /// action. It folds, then gives the view the focus back once the dispatch
@@ -459,9 +522,14 @@ impl FoldKeys {
 /// where the focus was, not to the view.
 fn fold_fallback<A: Action>(rail: bool, view: WeakEntity<AppView>, window: AnyWindowHandle, focus: FocusHandle, cx: &mut App) {
     cx.on_action(move |_: &A, cx| {
+        // The view had it: its key-down decides ([`OnceKey`]).
+        if view.read_with(cx, |v, _| v.once.is_some()).unwrap_or(false) {
+            cx.propagate();
+            return;
+        }
         let _ = view.update(cx, |v, cx| {
             v.fold_keys = FoldKeys::default();
-            v.fold_key(rail, cx);
+            v.toggle_panel(rail, cx);
         });
         let focus = focus.clone();
         cx.defer(move |cx| {
@@ -491,9 +559,13 @@ fn tab_actions(d: Stateful<Div>, cx: &mut Context<AppView>) -> Stateful<Div> {
 /// input): as [`fold_fallback`], it acts and hands the view its focus back.
 fn tab_fallback<A: Action>(key: TabKey, view: WeakEntity<AppView>, window: AnyWindowHandle, focus: FocusHandle, cx: &mut App) {
     cx.on_action(move |_: &A, cx| {
+        if view.read_with(cx, |v, _| v.once.is_some()).unwrap_or(false) {
+            cx.propagate();
+            return;
+        }
         let _ = view.update(cx, |v, cx| {
             v.tab_keys = FoldKeys::default();
-            v.tab_key(key, cx);
+            v.tab_act(key, cx);
         });
         let focus = focus.clone();
         cx.defer(move |cx| {
@@ -685,6 +757,17 @@ pub struct AppView {
     /// Refused input to put back in the composer (needs a `Window`: done
     /// at the next frame).
     restore: Option<String>,
+    /// Each tab's composer draft by session (kept when its tab is left,
+    /// put back when it is shown again), and the tab whose draft the
+    /// composer holds.
+    drafts: crate::tabs::Drafts,
+    composer_of: Option<(u64, Option<String>)>,
+    /// Said in the composer's hint until the next send or switch (a draft
+    /// came back with a send the daemon did not take).
+    draft_note: Option<SharedString>,
+    /// Bumped when the text metrics change every row's height (a cached
+    /// tab's list is re-measured when it comes back).
+    metrics_gen: u64,
     pub bench: Option<BenchState>,
     /// Diagnostics: render rows as plain text instead of markdown.
     pub plain_rows: bool,
@@ -703,20 +786,26 @@ pub struct AppView {
     /// Where the tabs are saved in the settings file (per daemon); `None`:
     /// not saved (bench).
     pub tabs_key: Option<String>,
-    /// The tabs generation saved (or being saved), and the delayed save.
+    /// The tabs generation handed to a save, the one written (or meant to
+    /// stay unwritten), and the delayed save.
     tabs_saved: u64,
+    tabs_written: u64,
     tabs_save: Option<Task<()>>,
+    /// The session lists the restored tabs have been checked against.
+    lists_seen: u64,
     /// The background tabs' sessions as last seen ([`TAB_CACHE`]).
     pub(crate) tab_cache: Lru<String, TabCache>,
     /// The tab (and its session) the model and the list hold now.
     shown_tab: Option<(u64, Option<String>)>,
-    /// A switch's attach waiting out [`ATTACH_GAP`], and when the last
-    /// attach went out.
+    /// A switch's attach waiting for the gate, and its timer.
     attach_wait: Option<(String, Option<ResumeRequest>, bool)>,
     attach_due: Option<Task<()>>,
-    last_attach: Option<Instant>,
+    gate: crate::tabs::AttachGate,
     /// Tells Ctrl+T / Ctrl+W / Ctrl+Shift+T presses from their repeats.
     tab_keys: FoldKeys,
+    /// A once-per-press key whose action came and whose key-down has not
+    /// yet ([`OnceKey`]).
+    once: Option<OnceKey>,
     /// The tab strip's first shown tab when they overflow, and the tab it
     /// last kept in view.
     pub(crate) tab_first: usize,
@@ -944,6 +1033,10 @@ impl AppView {
             rail: Default::default(),
             focus: i.focus,
             restore: None,
+            drafts: Default::default(),
+            composer_of: None,
+            draft_note: None,
+            metrics_gen: 0,
             bench: None,
             plain_rows: false,
             synthetic: false,
@@ -954,13 +1047,16 @@ impl AppView {
             restore_tabs: None,
             tabs_key: None,
             tabs_saved: 0,
+            tabs_written: 0,
             tabs_save: None,
-            tab_cache: Lru::new(TAB_CACHE),
+            lists_seen: 0,
+            tab_cache: Lru::new(TAB_CACHE, TAB_CACHE_BYTES),
             shown_tab: None,
             attach_wait: None,
             attach_due: None,
-            last_attach: None,
+            gate: Default::default(),
             tab_keys: FoldKeys::default(),
+            once: None,
             tab_first: 0,
             tab_follow: None,
             tab_room: 0,
@@ -1015,6 +1111,7 @@ impl AppView {
                     None => text,
                 })
             }
+            Effect::Unsent { session, text } => self.unsent(session, text),
             Effect::ListSessions => {
                 if let Some(c) = &self.client {
                     let _ = c.list_sessions();
@@ -1043,6 +1140,47 @@ impl AppView {
         }
     }
 
+    /// Input sent to `session` before its tab was left, given back: into
+    /// that tab's draft (said when it is shown again), or the composer if
+    /// it is shown again already.
+    fn unsent(&mut self, session: String, text: String) {
+        if self.composer_of.as_ref().is_some_and(|(_, s)| s.as_deref() == Some(session.as_str())) {
+            self.effect(Effect::Restore(text));
+            self.draft_note = Some(UNSENT_NOTE.into());
+            self.model.view_dirty = true;
+        } else if self.model.tabs.knows(&session) {
+            self.drafts.give_back(session, text, UNSENT_NOTE);
+        } else {
+            self.model.named.notice = Some(format!("Not sent (its tab is closed): {}", one_line(&text, 120)));
+            self.model.view_dirty = true;
+        }
+    }
+
+    /// The visible tab changed: the composer's text and caret go to the
+    /// tab left, the shown tab's come back. A pending tab named by its
+    /// create or resume keeps what the composer holds.
+    fn swap_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = self.model.tabs.visible().map(|t| (t.id, t.session.clone()));
+        if now == self.composer_of {
+            return;
+        }
+        let prev = std::mem::replace(&mut self.composer_of, now.clone());
+        let (text, cursor) = {
+            let c = self.composer.read(cx);
+            (c.value().to_string(), c.cursor())
+        };
+        let Some(d) = self.drafts.switch(prev.as_ref(), now.as_ref(), text, cursor) else { return };
+        self.composer.update(cx, |c, cx| {
+            if !(d.text.is_empty() && c.value().is_empty()) {
+                c.set_value(d.text, window, cx);
+                c.set_selected_range(d.cursor..d.cursor, cx);
+            }
+        });
+        let tabs = &self.model.tabs;
+        self.drafts.retain(|s| tabs.knows(s));
+        self.draft_note = d.note.map(SharedString::from);
+    }
+
     /// Resume a saved session: its folder as is, `~` if the daemon says it
     /// is gone there.
     fn resume(&mut self, req: ResumeRequest, open: bool) {
@@ -1058,7 +1196,6 @@ impl AppView {
         };
         match c.resume(req.target.clone(), req.options()) {
             Ok(seq) => {
-                self.last_attach = Some(Instant::now());
                 self.model.resuming(req, seq, open);
             }
             Err(e) => self.model.named.error = Some(e.to_string()),
@@ -1188,7 +1325,6 @@ impl AppView {
     fn create_now(&mut self) {
         // Tools run in the user's home, not wherever the launcher started us.
         if let Some(seq) = self.client.as_ref().and_then(|c| c.create(CreateOptions::new().cwd(Cwd::Home)).ok()) {
-            self.last_attach = Some(Instant::now());
             self.model.want(seq);
         }
     }
@@ -1231,6 +1367,8 @@ impl AppView {
     /// attach goes out. `hint`: the open asked for an attach (with its
     /// fallback) even if nothing changed (a session that detached).
     pub(crate) fn reconcile(&mut self, hint: Option<(Option<ResumeRequest>, bool)>) {
+        let dropped = std::mem::take(&mut self.model.tabs.dropped);
+        self.restore_notice(dropped);
         let vis = self.model.tabs.visible().map(|t| (t.id, t.session.clone()));
         if let Some((_, Some(s))) = &vis
             && self.model.wanted_session() == Some(s.as_str())
@@ -1238,6 +1376,11 @@ impl AppView {
             // What a cache held of it is older than what attached.
             let _ = self.tab_cache.take(s);
             self.shown_tab = vis;
+            if hint.as_ref().is_some_and(|h| h.1) {
+                // An Open by name of the session on screen: done.
+                self.model.named.opened = true;
+                self.model.named.opening = None;
+            }
             return;
         }
         if vis == self.shown_tab && hint.is_none() {
@@ -1281,11 +1424,13 @@ impl AppView {
             synced_busy: std::mem::take(&mut self.synced_busy),
             files_gen: std::mem::take(&mut self.files_gen),
             waiting_on: self.waiting_on.take(),
+            metrics_gen: self.metrics_gen,
         };
         self.rows_session = None;
         if let Some(k) = key {
             let tabs = &self.model.tabs;
-            self.tab_cache.put(k, cache, |k| tabs.is_open(k));
+            let bytes = cache.bytes();
+            self.tab_cache.put(k, cache, bytes, |k| tabs.is_open(k));
         }
     }
 
@@ -1304,21 +1449,29 @@ impl AppView {
                 self.synced_busy = c.synced_busy;
                 self.files_gen = c.files_gen;
                 self.waiting_on = c.waiting_on;
+                if c.metrics_gen != self.metrics_gen {
+                    // The text size changed while it was in the background.
+                    self.list.remeasure();
+                }
             }
             None => self.model.switch_in(Transcript::new(), Stats::default()),
         }
         self.rows_session = session;
     }
 
-    /// Attach the visible tab's session; within [`ATTACH_GAP`] of the
-    /// last attach it waits (shown OPENING), so a burst of switches
-    /// attaches once.
+    /// Attach the visible tab's session, or wait (shown OPENING) as the
+    /// gate says: a burst of switches, or a held tab key, attaches once,
+    /// after the last ([`crate::tabs::AttachGate`]).
     fn attach_tab(&mut self, session: String, hint: Option<(Option<ResumeRequest>, bool)>) {
         let (fallback, open) = hint.unwrap_or_else(|| (self.model.tab_fallback(&session), false));
         self.attach_wait = None;
-        if self.client.is_some() && self.last_attach.is_some_and(|t| t.elapsed() < ATTACH_GAP) {
+        let restoring = self.model.tabs.visible().is_some_and(|t| self.model.tabs.restoring(t.id));
+        if restoring || (self.client.is_some() && self.gate.switch(Instant::now())) {
             self.model.showing(&session);
-            self.attach_wait = Some((session, fallback, open));
+            // A restored tab attaches once a list has its session (`start_tabs`).
+            if !restoring {
+                self.attach_wait = Some((session, fallback, open));
+            }
             return;
         }
         self.attach_now(session, fallback, open);
@@ -1326,7 +1479,6 @@ impl AppView {
 
     fn attach_now(&mut self, session: String, fallback: Option<ResumeRequest>, open: bool) {
         if let Some(seq) = self.client.as_ref().and_then(|c| c.attach(session.clone(), AttachMode::Mirror).ok()) {
-            self.last_attach = Some(Instant::now());
             self.model.attaching(seq, fallback, open);
             self.model.asked_for(&session);
         } else if self.synthetic_tx.is_some() {
@@ -1337,14 +1489,43 @@ impl AppView {
         }
     }
 
-    /// The deferred attach, if its tab is still the visible one.
-    fn attach_waited(&mut self) {
+    /// The waiting attach's timer, (re)set for when the gate is due.
+    fn arm_attach(&mut self, cx: &mut Context<Self>) {
+        if self.attach_wait.is_none() {
+            self.attach_due = None;
+            return;
+        }
+        let at = self.gate.due();
+        self.attach_due = Some(cx.spawn(async move |this, cx| {
+            if let Some(left) = at.map(|t| t.saturating_duration_since(Instant::now())).filter(|d| !d.is_zero()) {
+                cx.background_executor().timer(left).await;
+            }
+            let _ = this.update(cx, |v, cx| v.attach_waited(cx));
+        }));
+    }
+
+    /// The deferred attach, if the gate is ready (else its timer again) and
+    /// its tab is still the visible one.
+    fn attach_waited(&mut self, cx: &mut Context<Self>) {
         self.attach_due = None;
+        if !self.gate.ready(Instant::now()) {
+            return self.arm_attach(cx);
+        }
         if let Some((s, fallback, open)) = self.attach_wait.take()
             && self.model.tabs.visible_session() == Some(s.as_str())
             && self.model.active.is_none()
         {
             self.attach_now(s, fallback, open);
+            cx.notify();
+        }
+    }
+
+    /// A tab key, or Ctrl / Cmd, went up: a waiting attach is due
+    /// [`crate::tabs::AttachGate::GAP`] from now.
+    fn tab_key_up(&mut self, cx: &mut Context<Self>) {
+        self.gate.key_up(Instant::now());
+        if self.attach_wait.is_some() {
+            self.arm_attach(cx);
         }
     }
 
@@ -1356,9 +1537,11 @@ impl AppView {
         }
     }
 
-    /// Restore the saved tabs, then open `--session` (or `--offline`'s
-    /// session when nothing was restored), once the first session list
-    /// has landed: a saved tab whose session is gone drops, said once.
+    /// Restore the saved tabs once the first session list has landed, then
+    /// open `--session` (or `--offline`'s session when nothing was
+    /// restored). A restored tab waits, OPENING, for a list that has its
+    /// session ([`crate::tabs::Tabs::confirm`]); one that never comes closes,
+    /// said once, and the file keeps it until the user changes the tabs.
     fn start_tabs(&mut self) {
         if !self.model.sessions_listed {
             return;
@@ -1366,22 +1549,38 @@ impl AppView {
         if let Some(saved) = self.restore_tabs.take()
             && self.model.tabs.is_empty()
         {
-            let sessions = &self.model.sessions;
-            let (tabs, dropped) = crate::tabs::Tabs::restore(&saved, |id| sessions.iter().any(|s| s.id == id && s.lifecycle != "ending"));
-            self.model.tabs = tabs;
-            if dropped > 0 {
-                self.model.named.notice = Some(match dropped {
-                    1 => "1 saved tab closed: its session is no longer open.".into(),
-                    n => format!("{n} saved tabs closed: their sessions are no longer open."),
-                });
-                // Saved again without them.
-                self.model.tabs.generation += 1;
-            }
-            self.tabs_saved = if dropped > 0 { 0 } else { self.model.tabs.generation };
-            let sessions = self.model.sessions.clone();
-            self.model.tabs.listed(&sessions);
+            self.model.tabs = crate::tabs::Tabs::restore(&saved);
+            self.tabs_saved = self.model.tabs.generation;
+            self.tabs_written = self.tabs_saved;
             self.model.rail_gen += 1;
+            self.model.view_dirty = true;
             self.reconcile(None);
+        }
+        if self.model.lists != self.lists_seen {
+            self.lists_seen = self.model.lists;
+            let quiet = self.model.tabs.generation == self.tabs_saved;
+            let sessions = std::mem::take(&mut self.model.sessions);
+            let shown = self.model.tabs.confirm(&sessions);
+            self.model.sessions = sessions;
+            let dropped = std::mem::take(&mut self.model.tabs.dropped);
+            if quiet && dropped > 0 {
+                // Not saved without them: the file changes when the user
+                // changes the tabs (a daemon slower than the lists keeps them).
+                self.tabs_saved = self.model.tabs.generation;
+                self.tabs_written = self.tabs_saved;
+            }
+            let vis = self.model.tabs.visible().map(|t| (t.id, t.session.clone()));
+            if vis != self.shown_tab {
+                // A tab followed its session to a new id, or closed.
+                self.model.rail_gen += 1;
+                self.model.view_dirty = true;
+                self.reconcile(None);
+            } else if shown && let Some((_, Some(s))) = vis {
+                self.model.rail_gen += 1;
+                self.model.view_dirty = true;
+                self.attach_tab(s, None);
+            }
+            self.restore_notice(dropped);
         }
         let start = self.start_session.take().or_else(|| self.default_session.take().filter(|_| self.model.tabs.is_empty()));
         self.default_session = None;
@@ -1390,6 +1589,20 @@ impl AppView {
             let fallback = self.model.tab_fallback(&id);
             self.open_tab(Open::Attach { session_id: id, fallback, open: false }, place);
         }
+    }
+
+    /// Restored tabs closed (their sessions never came back): said once,
+    /// and drawn.
+    fn restore_notice(&mut self, dropped: usize) {
+        if dropped == 0 {
+            return;
+        }
+        self.model.named.notice = Some(match dropped {
+            1 => "1 saved tab closed: its session is no longer open.".into(),
+            n => format!("{n} saved tabs closed: their sessions are no longer open."),
+        });
+        self.model.rail_gen += 1;
+        self.model.view_dirty = true;
     }
 
     /// Show tab `ix` (a click on it).
@@ -1419,12 +1632,39 @@ impl AppView {
         }
     }
 
-    /// A tab key. Ctrl+T, Ctrl+W and Ctrl+Shift+T act on a press, never on
-    /// its auto-repeats (a held Ctrl+T is not a burst of new sessions).
+    /// A tab key's action. Ctrl+T, Ctrl+W and Ctrl+Shift+T act on a press,
+    /// never on its auto-repeats (a held Ctrl+T is not a burst of new
+    /// sessions): their key-down decides ([`OnceKey`]).
     pub(crate) fn tab_key(&mut self, key: TabKey, cx: &mut Context<Self>) {
-        if matches!(key, TabKey::New | TabKey::Close | TabKey::Reopen) && !self.tab_keys.press(Instant::now()) {
+        self.gate.key_down(Instant::now());
+        if matches!(key, TabKey::New | TabKey::Close | TabKey::Reopen) {
+            self.once = Some(OnceKey::Tab(key));
+            cx.propagate();
             return;
         }
+        self.tab_act(key, cx);
+    }
+
+    /// A once-per-press key's key-down, after its action: a press acts, a
+    /// repeat does not.
+    fn once_key(&mut self, k: OnceKey, held: bool, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        match k {
+            OnceKey::Fold(rail) => {
+                if self.fold_keys.press(now, held) {
+                    self.toggle_panel(rail, cx);
+                }
+            }
+            OnceKey::Tab(key) => {
+                if self.tab_keys.press(now, held) {
+                    self.tab_act(key, cx);
+                }
+            }
+        }
+    }
+
+    /// What a tab key does.
+    pub(crate) fn tab_act(&mut self, key: TabKey, cx: &mut Context<Self>) {
         let tabs = &mut self.model.tabs;
         let changed = match key {
             TabKey::New => {
@@ -1458,25 +1698,33 @@ impl AppView {
         self.tabs_saved = self.model.tabs.generation;
         self.tabs_save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_DELAY).await;
-            let job = this.update(cx, |v, _| (theme::settings_path(), v.tabs_key.clone(), v.model.tabs.saved())).ok();
-            let Some((Some(path), Some(key), saved)) = job else { return };
+            let job =
+                this.update(cx, |v, _| (theme::settings_path(), v.tabs_key.clone(), v.model.tabs.saved(), v.model.tabs.generation)).ok();
+            let Some((Some(path), Some(key), saved, generation)) = job else { return };
             let done = cx.background_spawn(async move { theme::save_tabs(&path, &key, &saved) }).await;
-            if let Err(e) = done {
-                let _ = this.update(cx, |v, cx| {
-                    v.model.last_error = Some(format!("tabs not saved: {e}"));
+            let _ = this.update(cx, |v, cx| match done {
+                Ok(()) => v.tabs_written = v.tabs_written.max(generation),
+                Err(e) => {
+                    // Its own line: a switch or an attach does not wipe it.
+                    v.model.named.notice = Some(format!("Tabs not saved: {e}"));
                     cx.notify();
-                });
-            }
+                }
+            });
         }));
     }
 
-    /// A tab save still waiting, written now (the window closes, the app quits).
+    /// Tabs changed since the last write, written now (the window closes,
+    /// the app quits), whether or not a frame scheduled the save.
     fn flush_tabs(&mut self) {
-        if self.tabs_save.take().is_some()
-            && let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref())
-            && let Err(e) = theme::save_tabs(&path, key, &self.model.tabs.saved())
-        {
-            eprintln!("synaps-desktop: tabs not saved: {e}");
+        self.tabs_save = None;
+        if self.tabs_key.is_none() || self.bench.is_some() || self.model.tabs.generation == self.tabs_written {
+            return;
+        }
+        if let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref()) {
+            match theme::save_tabs(&path, key, &self.model.tabs.saved()) {
+                Ok(()) => self.tabs_written = self.model.tabs.generation,
+                Err(e) => eprintln!("synaps-desktop: tabs not saved: {e}"),
+            }
         }
     }
 
@@ -1502,7 +1750,15 @@ impl AppView {
             return false;
         }
         self.model.sent(text);
+        self.draft_note = None;
         true
+    }
+
+    /// The visible tab shows its session as last seen (the tab cache, or
+    /// nothing yet) while its attach is on its way: nothing on screen is
+    /// live.
+    pub(crate) fn opening(&self) -> bool {
+        self.model.active.is_none() && self.model.tabs.visible_session().is_some() && !self.model.stats.detached
     }
 
     /// A daemon is connected and this attachment may drive it (the
@@ -1672,6 +1928,7 @@ impl AppView {
         };
         theme::update(cx, |c| c.text = next);
         self.list.remeasure();
+        self.metrics_gen += 1;
         let mut p = self.panels;
         p.text_size = next;
         self.set_panels(p, cx);
@@ -1767,11 +2024,10 @@ impl AppView {
     }
 
     /// Ctrl+B / Ctrl+Alt+B (Cmd on macOS): a press folds or unfolds, its
-    /// key repeats do nothing.
+    /// key repeats do nothing; its key-down decides ([`OnceKey`]).
     fn fold_key(&mut self, rail: bool, cx: &mut Context<Self>) {
-        if self.fold_keys.press(Instant::now()) {
-            self.toggle_panel(rail, cx);
-        }
+        self.once = Some(OnceKey::Fold(rail));
+        cx.propagate();
     }
 
     /// Write the changed panel keys on the background executor (a read, a
@@ -2176,7 +2432,9 @@ impl AppView {
             )
         };
         let more = below.filter(|&b| b > 1.).map(|b| lines_below(b, m.code_line)).filter(|_| !card.is_some_and(|c| c.read));
-        let footer: Option<SharedString> = if detached {
+        let footer: Option<SharedString> = if detached && self.opening() {
+            Some("opening…".into())
+        } else if detached {
             Some("detached: cannot answer".into())
         } else if sent {
             Some("answer sent, waiting for the daemon".into())
@@ -2270,6 +2528,8 @@ impl AppView {
             "offline: synthetic transport, nothing is sent"
         } else if self.model.switching() {
             "switching sessions…"
+        } else if !can_send && self.opening() {
+            "opening…"
         } else if !can_send {
             "not attached"
         } else if busy {
@@ -2309,7 +2569,14 @@ impl AppView {
                         .child(if lay.tight {
                             div().flex_1()
                         } else {
-                            mono(hint, m.meta, p.dim_u).flex_1().min_w_0().overflow_hidden().text_ellipsis()
+                            match &self.draft_note {
+                                Some(n) => mono(n.clone(), m.meta, p.warn),
+                                None => mono(hint, m.meta, p.dim_u),
+                            }
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
                         })
                         .child(fbtn("send", if busy { label::STEER } else { label::SEND }, can_send, p.btn_fill, p, m).on_click(
                             cx.listener(|this, _, window, cx| {
@@ -2412,6 +2679,7 @@ struct Inputs {
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diag::mark("first_render");
+        self.swap_draft(window, cx);
         if let Some(text) = self.restore.take() {
             // Refused input goes back where it was typed, ahead of anything
             // typed since.
@@ -2457,19 +2725,13 @@ impl Render for AppView {
         let lay = Layout::of(pane, &m);
         if (lay.hang, lay.tight) != (self.layout.hang, self.layout.tight) {
             self.list.remeasure();
+            self.metrics_gen += 1;
         }
         self.layout = lay;
         let tabs = self.render_tabs(pane, &p, cx);
         self.schedule_tabs_save(cx);
         if self.attach_wait.is_some() && self.attach_due.is_none() {
-            let left = ATTACH_GAP.saturating_sub(self.last_attach.map_or(ATTACH_GAP, |t| t.elapsed()));
-            self.attach_due = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(left).await;
-                let _ = this.update(cx, |v, cx| {
-                    v.attach_waited();
-                    cx.notify();
-                });
-            }));
+            self.arm_attach(cx);
         }
         let (pad_l, pad_r) = lay.padding();
         let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_disp(ix, cx)))
@@ -2496,6 +2758,12 @@ impl Render for AppView {
             // Esc closes the picker, wherever the focus is; in find it clears
             // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if let Some(k) = this.once.take()
+                    && ev.keystroke.key.eq_ignore_ascii_case(k.letter())
+                {
+                    cx.stop_propagation();
+                    return this.once_key(k, ev.is_held, cx);
+                }
                 if this.picker_open && ev.keystroke.key == "escape" {
                     this.close_picker(window, cx);
                     cx.stop_propagation();
@@ -2543,12 +2811,22 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &TextSmaller, _, cx| this.step_text(Some(-1), cx)))
             .on_action(cx.listener(|this, _: &TextReset, _, cx| this.step_text(None, cx)))
             .map(|d| tab_actions(d, cx))
-            .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, _| {
+            .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
                 let k = &ev.keystroke.key;
                 if k.eq_ignore_ascii_case("b") {
                     this.fold_keys.release(Instant::now());
                 } else if k.eq_ignore_ascii_case("t") || k.eq_ignore_ascii_case("w") {
                     this.tab_keys.release(Instant::now());
+                }
+                if is_tab_key(k) {
+                    this.tab_key_up(cx);
+                }
+            }))
+            // Ctrl / Cmd let go ends a held tab key too (macOS drops the
+            // key-up of a key let go while Cmd is down).
+            .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, _, cx| {
+                if !(ev.modifiers.control || ev.modifiers.platform) {
+                    this.tab_key_up(cx);
                 }
             }))
             .relative()
@@ -2601,9 +2879,22 @@ mod tests {
         }
     }
 
+    /// A held tab key ends with its own key-up (or Ctrl / Cmd let go),
+    /// not another key's.
+    #[test]
+    fn tab_key_ups_are_known() {
+        for k in ["tab", "pagedown", "pageup", "1", "9", "t", "w"] {
+            assert!(super::is_tab_key(k), "{k}");
+        }
+        for k in ["b", "a", "enter", "escape", "shift", "control"] {
+            assert!(!super::is_tab_key(k), "{k}");
+        }
+    }
+
     /// The tab keys parse on every OS, each keystroke means one thing, and
     /// none is a key the inputs (composer, find, names) or an IME use: the
-    /// list is gpui-base 0.9.1's input bindings (`input/base/state.rs`).
+    /// list is gpui-base 0.9.1's input bindings (`input/base/state.rs`), a
+    /// hand copy: refresh it when the kit's pin moves.
     #[test]
     fn tab_keys_parse_and_clash_with_nothing() {
         const INPUT: &[&str] = &[
@@ -2904,23 +3195,23 @@ mod tests {
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
         let mut k = FoldKeys::default();
-        assert!(k.press(ms(0)), "a press");
+        assert!(k.press(ms(0), false), "a press");
         // Held (no key-up): the repeats after the delay, then every 33 ms.
-        assert!(!k.press(ms(500)));
-        assert!(!k.press(ms(533)));
+        assert!(!k.press(ms(500), false));
+        assert!(!k.press(ms(533), false));
         k.release(ms(600));
-        assert!(k.press(ms(700)), "let go, pressed again");
+        assert!(k.press(ms(700), false), "let go, pressed again");
         // X11: a key-up and its repeat at the same instant.
         k.release(ms(1200));
-        assert!(!k.press(ms(1200)));
+        assert!(!k.press(ms(1200), false));
         k.release(ms(1233));
-        assert!(!k.press(ms(1234)));
+        assert!(!k.press(ms(1234), false));
         // A real release, then a quick second press (a double tap).
         k.release(ms(1300));
-        assert!(k.press(ms(1380)));
+        assert!(k.press(ms(1380), false));
         // A key-up this window never saw: a press long after is a press.
-        assert!(!k.press(ms(2000)), "within the first-repeat delay");
-        assert!(k.press(ms(3200)));
+        assert!(!k.press(ms(2000), false), "within the first-repeat delay");
+        assert!(k.press(ms(3200), false));
     }
 
     /// R1 (PR #7 re-review): AppKit drops B's key-up while Cmd is held, so on
@@ -2932,10 +3223,30 @@ mod tests {
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
         let mut k = FoldKeys::default();
-        assert!(k.press(ms(0)), "fold");
-        assert!(k.press(ms(300)), "unfold, Cmd still held, no key-up seen");
+        assert!(k.press(ms(0), false), "fold");
+        assert!(k.press(ms(300), false), "unfold, Cmd still held, no key-up seen");
         k.release(ms(400));
-        assert!(!k.press(ms(400)), "a key-up and a press at the same instant");
+        assert!(!k.press(ms(400), false), "a key-up and a press at the same instant");
+    }
+
+    /// M1: a key-down that says it is a repeat (`is_held`: AppKit's
+    /// `isARepeat`, Windows' repeat bit, Wayland) never acts, with no
+    /// key-up ever seen (macOS drops it while Cmd is held): a held Cmd+T
+    /// is one tab, a held Cmd+W closes one. A press after it acts again.
+    #[test]
+    fn a_held_key_down_never_acts() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut k = FoldKeys::default();
+        assert!(k.press(ms(0), false), "the press");
+        for n in 0..60 {
+            assert!(!k.press(ms(250 + n * 30), true), "repeat {n}");
+        }
+        // Let go (the key-up lost), pressed again: a press, at once.
+        assert!(k.press(ms(2100), false) || cfg!(not(target_os = "macos")), "macOS: a press without a key-up");
+        k.release(ms(2200));
+        assert!(k.press(ms(2400), false), "after a key-up, everywhere");
+        assert!(!k.press(ms(2430), true));
     }
 
     /// H3: the card shows a long prompt whole, and AUTHORIZE waits until
