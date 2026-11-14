@@ -151,6 +151,38 @@ fn reattach_keeps_row_ids() {
     assert_eq!(ids, t.items().iter().map(|i| i.id).collect::<Vec<_>>());
 }
 
+/// A re-attach that brings the same history back keeps every row's `rev`
+/// too (a UI's cached rows stay valid); a row that changed gets a `rev`
+/// past every one it had.
+#[test]
+fn reattach_keeps_revs_of_unchanged_rows() {
+    let a = attached("attached_history.json");
+    let mut t = Transcript::new();
+    t.load_attached(&a).unwrap();
+    let before: Vec<(u64, u64)> = t.items().iter().map(|i| (i.id, i.rev)).collect();
+    t.load_attached(&a).unwrap();
+    assert_eq!(before, t.items().iter().map(|i| (i.id, i.rev)).collect::<Vec<_>>());
+    let mut b = a.clone();
+    let text = b
+        .conversation
+        .api_messages
+        .iter_mut()
+        .rev()
+        .filter(|m| m["role"] == "assistant")
+        .find_map(|m| m["content"].as_array_mut()?.iter_mut().find(|blk| blk["type"] == "text"))
+        .expect("a reply with text");
+    text["text"] = serde_json::json!("a different reply");
+    t.load_attached(&b).unwrap();
+    let after: Vec<(u64, u64)> = t.items().iter().map(|i| (i.id, i.rev)).collect();
+    assert_eq!(after.len(), before.len());
+    let changed: Vec<usize> = (0..after.len()).filter(|&k| after[k] != before[k]).collect();
+    assert!(!changed.is_empty(), "the edited reply changed");
+    for k in changed {
+        assert_eq!(after[k].0, before[k].0, "same id");
+        assert!(after[k].1 > before[k].1, "a newer rev");
+    }
+}
+
 #[test]
 fn a_real_turn_streams_into_the_same_transcript_as_its_history() {
     let mut t = Transcript::new();

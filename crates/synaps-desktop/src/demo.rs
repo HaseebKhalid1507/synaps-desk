@@ -10,12 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use synaps_client::protocol::{DaemonFrame, SessionMeta, decode_event, decode_frame};
-use synaps_client::{AttachMode, Event};
-
-use crate::model::LOCAL_SEQ;
+use synaps_client::{AttachMode, Event, synthetic};
 
 const CWD: &str = "/home/you/work/relay-gateway";
-const SID: &str = "20261113-041207-a1f0";
+/// The session `--offline` opens: it waits on a tool-call confirmation.
+pub(crate) const SID: &str = "20261113-041207-a1f0";
 
 /// RFC 3339 (UTC) of `secs` after the epoch.
 pub(crate) fn rfc3339(secs: i64) -> String {
@@ -72,6 +71,16 @@ fn sessions(now: i64, settled: bool) -> Vec<SessionMeta> {
         json!({"id": "20261112-180203-44aa", "title": "Operator handbook, chapter 4", "model": sonnet,
             "cwd": "/home/you/docs", "cost_usd": 0.27, "lifecycle": "parked", "messages": 22, "state_since": ago(190),
             "created_at": ago(1500)}),
+        // Enough sessions for a tab strip that overflows on a wide window.
+        json!({"id": "20261112-151010-5c21", "name": "docs-sync", "title": "Sync API docs with the wire spec", "model": sonnet,
+            "cwd": "/home/you/work/docs", "cost_usd": 0.31, "lifecycle": "live", "messages": 14, "state_since": ago(240),
+            "created_at": ago(1700)}),
+        json!({"id": "20261112-120455-e7d3", "title": "CI cache misses on the arm runners", "model": opus,
+            "cwd": "/home/you/work/ci", "cost_usd": 1.02, "lifecycle": "live", "messages": 27, "state_since": ago(300),
+            "created_at": ago(1900)}),
+        json!({"id": "20261111-201530-0a6e", "name": "release-notes", "title": "Release notes for 0.12", "model": sonnet,
+            "cwd": "/home/you/work/runtime", "cost_usd": 0.58, "lifecycle": "parked", "messages": 19, "state_since": ago(900),
+            "created_at": ago(2600)}),
     ];
     rows.into_iter().filter_map(|r| serde_json::from_value(r).ok()).collect()
 }
@@ -221,11 +230,51 @@ fn messages() -> Vec<Value> {
     ]
 }
 
-/// The events of a daemon connection with ten sessions, attached to one
-/// that waits on a tool-call confirmation.
+/// The events of a daemon connection with ten sessions: two polls (in the
+/// second a turn has ended off screen: UNREAD). The window opens [`SID`]
+/// (an attach, answered by [`attach`]).
 pub fn events() -> Vec<Event> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    let mut out = vec![Event::Sessions(sessions(now, false))];
+    vec![Event::Sessions(sessions(now, false)), Event::Sessions(sessions(now, true))]
+}
+
+/// The synthetic daemon's reply to attaching `id` as `attach_seq`: [`SID`]
+/// in full (its history, a pending confirmation, usage, a subagent); any
+/// other listed session with a short history of its own size, its busy
+/// state and as many confirmations as it awaits. An unlisted id: nothing
+/// (never answered, as a daemon that is gone).
+pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
+    if id == SID {
+        return attach_sid(attach_seq);
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let Some(m) = sessions(now, true).into_iter().find(|s| s.id == id) else { return Vec::new() };
+    let seed = id.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
+    let mut msgs = vec![json!({"role": "user", "content": m.title.clone().unwrap_or_else(|| "Start here.".into())})];
+    msgs.extend(synthetic::history(m.messages.min(60), seed));
+    if m.messages == 0 {
+        msgs.clear();
+    }
+    let prompts: Vec<Value> = (1..=m.awaiting_input as u64)
+        .map(|i| {
+            json!({"id": i, "kind": "confirm", "title": "Confirm tool call",
+                "prompt": format!("Tool: bash\n\nInput that will run:\n$ cargo test --workspace -- --test-threads {}\n\nAllow this tool call?", i * 4)})
+        })
+        .collect();
+    let frame = json!({"type": "attached", "client": 2,
+        "meta": {"id": m.id, "name": m.name, "title": m.title, "model": m.model, "cwd": m.cwd, "lifecycle": m.lifecycle,
+            "busy": m.busy, "awaiting_input": m.awaiting_input},
+        "view": {"model": m.model, "thinking_level": "medium", "reasoning_level": "medium", "context_window": 200000},
+        "conversation": {"header": {"title": m.title}, "messages_len": msgs.len(), "api_messages": msgs, "cost": m.cost_usd},
+        "streaming": m.busy, "pending_prompts": prompts, "client_input": "shared", "input_owner": 2});
+    match decode_frame(&frame.to_string()) {
+        Ok(DaemonFrame::Attached(a)) => vec![Event::Attached { attach_seq, attached: a, mode: AttachMode::Mirror, reconnect: false }],
+        _ => Vec::new(),
+    }
+}
+
+fn attach_sid(attach_seq: u64) -> Vec<Event> {
+    let mut out = Vec::new();
     let msgs = messages();
     let attached = json!({"type": "attached", "client": 2,
         "meta": {"id": SID, "name": "relay-refresh", "title": "Refresh race in session relay", "model": "anthropic/claude-opus-4-1", "cwd": CWD,
@@ -239,7 +288,7 @@ pub fn events() -> Vec<Event> {
             "prompt": "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/work/relay-gateway:\n$ cargo test -p relay --test refresh_race\n\nAllow this tool call?"}],
         "client_input": "shared", "input_owner": 2});
     if let Ok(DaemonFrame::Attached(a)) = decode_frame(&attached.to_string()) {
-        out.push(Event::Attached { attach_seq: LOCAL_SEQ, attached: a, mode: AttachMode::Mirror, reconnect: false });
+        out.push(Event::Attached { attach_seq, attached: a, mode: AttachMode::Mirror, reconnect: false });
     }
     let usage = json!({"ev": "stream", "event": {"kind": "session", "session": "usage", "input_tokens": 2_100, "output_tokens": 640,
         "cache_read_input_tokens": 86_000, "cache_creation_input_tokens": 4_100, "model": "anthropic/claude-opus-4-1"}});
@@ -248,11 +297,9 @@ pub fn events() -> Vec<Event> {
             "finished_elapsed": null, "step": "reading crates/relay/src/upstream.rs", "tools": 6}]});
     for (seq, raw) in [(1, usage), (2, subagents)] {
         if let Ok(event) = decode_event(&raw) {
-            out.push(Event::Session { attach_seq: LOCAL_SEQ, session_id: SID.into(), seq, event, raw: Arc::new(raw) });
+            out.push(Event::Session { attach_seq, session_id: SID.into(), seq, event, raw: Arc::new(raw) });
         }
     }
-    // The next poll: a turn ended off screen (UNREAD).
-    out.push(Event::Sessions(sessions(now, true)));
     out
 }
 
@@ -276,11 +323,12 @@ mod tests {
     #[test]
     fn the_demo_goes_through_the_model() {
         let mut m = Model::new(ConnState::Off("offline".into()));
-        m.set_local_session("demo");
-        for ev in events() {
+        m.attaching(1, None, false);
+        m.asked_for(SID);
+        for ev in events().into_iter().chain(attach(SID, 1)) {
             m.apply(ev);
         }
-        assert_eq!(m.sessions.len(), 10);
+        assert_eq!(m.sessions.len(), 13);
         let states: std::collections::HashSet<State> = m.sessions.iter().map(|s| m.state(s)).collect();
         for st in [State::NeedsYou, State::Running, State::Locked, State::Unread, State::Idle, State::Parked] {
             assert!(states.contains(&st), "{st:?} missing from the demo");
@@ -299,6 +347,30 @@ mod tests {
         let shell: Vec<(&str, &str)> = s.files.shell().iter().map(|f| (f.path.as_str(), f.verb)).collect();
         assert_eq!(shell, [("crates/relay/src/retry.rs", "rm"), ("crates/relay/src/lib.rs", "sed -i")]);
         assert_eq!(m.transcript.subagents().len(), 1);
+        assert_eq!(m.tabs.visible_session(), Some(SID), "the attach is the visible tab's");
+    }
+
+    /// Every listed session attaches (the tabs switch between them); its
+    /// waiting prompts and busy state are the list's. An unlisted one is
+    /// never answered.
+    #[test]
+    fn every_demo_session_attaches() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        for (k, s) in sessions(now, true).iter().enumerate() {
+            let mut m = Model::new(ConnState::Off("offline".into()));
+            let seq = k as u64 + 1;
+            m.attaching(seq, None, false);
+            m.asked_for(&s.id);
+            let evs = attach(&s.id, seq);
+            assert!(!evs.is_empty(), "{} not answered", s.id);
+            for ev in evs {
+                m.apply(ev);
+            }
+            assert_eq!(m.active.as_ref().map(|a| a.session_id.as_str()), Some(s.id.as_str()));
+            assert_eq!(m.transcript.pending_prompts().len(), s.awaiting_input, "{}", s.id);
+            assert_eq!(m.transcript.busy(), s.busy, "{}", s.id);
+        }
+        assert!(attach("20990101-000000-ffff", 1).is_empty());
     }
 
     /// `--offline` answers `saved_sessions` through the same path as a

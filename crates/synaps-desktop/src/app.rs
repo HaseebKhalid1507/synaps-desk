@@ -4,7 +4,7 @@
 //! and its numbers on the right. Every colour is a Synaps TUI theme role
 //! ([`crate::theme`]); every number comes from the daemon ([`crate::stats`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,14 +13,16 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use synaps_client::transcript::{Item, ItemKind, ToolStatus};
-use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError};
+use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError, Transcript};
 
 use crate::bench::BenchState;
 use crate::files::{self, Preview};
 use crate::fonts::{self, label};
-use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, LOCAL_SEQ, Model, RenameRequest};
+use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, Model, RenameRequest};
 use crate::named::{ResumeRequest, RowAction, home_short};
 use crate::rail::{Bucket, Chip};
+use crate::stats::Stats;
+use crate::tabs::{Lru, Place, Saved};
 use crate::theme::{self, Metrics, Palette};
 use crate::turns::{self, Disp, Kind, Layout, Summaries};
 
@@ -47,6 +49,48 @@ pub(crate) struct RowCache {
 
 /// Result lines an open tool row shows.
 const RESULT_LINES: usize = 12;
+/// Background tabs whose transcript and rows are kept (switching back to
+/// one shows it at once, then its attach brings it up to date).
+pub(crate) const TAB_CACHE: usize = 8;
+/// Tab switches closer together than this attach once, after the last (a
+/// held Ctrl+Tab is not an attach, and a full history, per repeat).
+const ATTACH_GAP: Duration = Duration::from_millis(120);
+/// A splice longer than this reuses the rows of unchanged items.
+const REUSE_ROWS: usize = 32;
+/// What a tab opened by a create is called until the daemon names it.
+pub(crate) const NEW_SESSION: &str = "New session";
+
+/// A background tab's session as it was last on screen: its transcript and
+/// numbers, and everything the list built from them (rows, folds, measured
+/// heights and scroll position).
+pub(crate) struct TabCache {
+    transcript: Transcript,
+    stats: Stats,
+    rows: Vec<RowCache>,
+    disp: Vec<Disp>,
+    summaries: Summaries,
+    list: ListState,
+    toggled: HashSet<u64>,
+    open_runs: HashSet<u64>,
+    synced_busy: bool,
+    files_gen: u64,
+    waiting_on: Option<u64>,
+}
+
+/// How a tab's session is opened.
+pub(crate) enum Open {
+    /// A live session (`fallback`: its journal, if it ended meanwhile;
+    /// `open`: an Open by name).
+    Attach { session_id: String, fallback: Option<ResumeRequest>, open: bool },
+    /// A saved one.
+    Resume { req: ResumeRequest, open: bool },
+    /// A new one.
+    Create,
+}
+
+/// The events a synthetic daemon sends for an attach (`--offline`, the
+/// tab bench): `(session id, attach_seq)`; none: never answered.
+pub(crate) type AttachSource = Box<dyn Fn(&str, u64) -> Vec<Event>>;
 /// The authorization card ignores clicks this long after it appears (the
 /// TUI's `CONFIRM_ARM_DELAY` is 400 ms): it pushes the list up, so a click
 /// meant for a row can land on it.
@@ -58,16 +102,39 @@ pub(crate) const STRIP: f32 = 32.;
 /// Narrower than this, the open right panel is not drawn (the session wins).
 const CENTRE_MIN: f32 = 480.;
 
-actions!(synaps_desktop, [ToggleRail, ToggleRight, TextBigger, TextSmaller, TextReset]);
+actions!(
+    synaps_desktop,
+    [
+        ToggleRail,
+        ToggleRight,
+        TextBigger,
+        TextSmaller,
+        TextReset,
+        NewTab,
+        CloseTab,
+        ReopenTab,
+        NextTab,
+        PrevTab,
+        Tab1,
+        Tab2,
+        Tab3,
+        Tab4,
+        Tab5,
+        Tab6,
+        Tab7,
+        Tab8,
+        LastTab
+    ]
+);
 
 /// Ctrl+B folds the sessions rail, Ctrl+Alt+B the right panel; Ctrl+= /
-/// Ctrl+- / Ctrl+0 step the centre pane's text size (Cmd on macOS). The
-/// composer and inputs bind none of them.
+/// Ctrl+- / Ctrl+0 step the centre pane's text size; the tab keys
+/// ([`tab_keys`]). Cmd on macOS. The composer and inputs bind none of them.
 pub fn bind_keys(cx: &mut App) {
     let mac = cfg!(target_os = "macos");
     let (rail, right) = panel_keys(mac);
     let [bigger, plus, shift_eq, smaller, reset] = text_keys(mac);
-    cx.bind_keys([
+    let mut keys = vec![
         KeyBinding::new(rail, ToggleRail, None),
         KeyBinding::new(right, ToggleRight, None),
         KeyBinding::new(bigger, TextBigger, None),
@@ -75,7 +142,93 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(shift_eq, TextBigger, None),
         KeyBinding::new(smaller, TextSmaller, None),
         KeyBinding::new(reset, TextReset, None),
-    ]);
+    ];
+    for &(k, t) in tab_keys(mac) {
+        keys.push(match t {
+            TabKey::New => KeyBinding::new(k, NewTab, None),
+            TabKey::Close => KeyBinding::new(k, CloseTab, None),
+            TabKey::Reopen => KeyBinding::new(k, ReopenTab, None),
+            TabKey::Next => KeyBinding::new(k, NextTab, None),
+            TabKey::Prev => KeyBinding::new(k, PrevTab, None),
+            TabKey::Nth(0) => KeyBinding::new(k, Tab1, None),
+            TabKey::Nth(1) => KeyBinding::new(k, Tab2, None),
+            TabKey::Nth(2) => KeyBinding::new(k, Tab3, None),
+            TabKey::Nth(3) => KeyBinding::new(k, Tab4, None),
+            TabKey::Nth(4) => KeyBinding::new(k, Tab5, None),
+            TabKey::Nth(5) => KeyBinding::new(k, Tab6, None),
+            TabKey::Nth(6) => KeyBinding::new(k, Tab7, None),
+            TabKey::Nth(_) => KeyBinding::new(k, Tab8, None),
+            TabKey::Last => KeyBinding::new(k, LastTab, None),
+        });
+    }
+    cx.bind_keys(keys);
+}
+
+/// What a tab key does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabKey {
+    /// A new session in a new tab.
+    New,
+    /// Close the visible tab (detach; the session keeps running).
+    Close,
+    /// The last closed tab.
+    Reopen,
+    Next,
+    Prev,
+    /// Tab 1–8 (0-based).
+    Nth(usize),
+    Last,
+}
+
+/// The tab keys, as browsers and VS Code have them: Ctrl+T / Ctrl+W /
+/// Ctrl+Shift+T, Ctrl+Tab and Ctrl+Shift+Tab, Ctrl+PageDown / PageUp,
+/// Ctrl+1–8 and Ctrl+9 for the last. On macOS Cmd for each but Ctrl+Tab
+/// (Cmd+Tab is the app switcher), plus Cmd+Shift+] / [ (spelled both ways:
+/// AppKit may report the shifted key as `}` / `{`). None is bound by the
+/// inputs (they take Tab, PageUp/PageDown and Ctrl/Cmd+[ / ] unshifted).
+pub(crate) fn tab_keys(mac: bool) -> &'static [(&'static str, TabKey)] {
+    use TabKey::*;
+    const LINUX: [(&str, TabKey); 16] = [
+        ("ctrl-t", New),
+        ("ctrl-w", Close),
+        ("ctrl-shift-t", Reopen),
+        ("ctrl-tab", Next),
+        ("ctrl-shift-tab", Prev),
+        ("ctrl-pagedown", Next),
+        ("ctrl-pageup", Prev),
+        ("ctrl-1", Nth(0)),
+        ("ctrl-2", Nth(1)),
+        ("ctrl-3", Nth(2)),
+        ("ctrl-4", Nth(3)),
+        ("ctrl-5", Nth(4)),
+        ("ctrl-6", Nth(5)),
+        ("ctrl-7", Nth(6)),
+        ("ctrl-8", Nth(7)),
+        ("ctrl-9", Last),
+    ];
+    const MAC: [(&str, TabKey); 20] = [
+        ("cmd-t", New),
+        ("cmd-w", Close),
+        ("cmd-shift-t", Reopen),
+        ("ctrl-tab", Next),
+        ("ctrl-shift-tab", Prev),
+        ("cmd-shift-]", Next),
+        ("cmd-shift-[", Prev),
+        ("cmd-}", Next),
+        ("cmd-{", Prev),
+        ("cmd-pagedown", Next),
+        ("cmd-pageup", Prev),
+        ("cmd-1", Nth(0)),
+        ("cmd-2", Nth(1)),
+        ("cmd-3", Nth(2)),
+        ("cmd-4", Nth(3)),
+        ("cmd-5", Nth(4)),
+        ("cmd-6", Nth(5)),
+        ("cmd-7", Nth(6)),
+        ("cmd-8", Nth(7)),
+        ("cmd-9", Last),
+    ];
+    if mac { &MAC } else { &LINUX }
 }
 
 /// The text size keys: `=`, `+` (its own key on DE and Nordic layouts)
@@ -317,6 +470,38 @@ fn fold_fallback<A: Action>(rail: bool, view: WeakEntity<AppView>, window: AnyWi
     });
 }
 
+/// The tab keys' actions on the window's root (the composer, find and
+/// the other inputs bind none of them, so they act wherever the focus is).
+fn tab_actions(d: Stateful<Div>, cx: &mut Context<AppView>) -> Stateful<Div> {
+    macro_rules! on {
+        ($d:expr, $($a:ident => $k:expr),* $(,)?) => {
+            $d$(.on_action(cx.listener(|this, _: &$a, _, cx| this.tab_key($k, cx))))*
+        };
+    }
+    on!(d,
+        NewTab => TabKey::New, CloseTab => TabKey::Close, ReopenTab => TabKey::Reopen,
+        NextTab => TabKey::Next, PrevTab => TabKey::Prev,
+        Tab1 => TabKey::Nth(0), Tab2 => TabKey::Nth(1), Tab3 => TabKey::Nth(2), Tab4 => TabKey::Nth(3),
+        Tab5 => TabKey::Nth(4), Tab6 => TabKey::Nth(5), Tab7 => TabKey::Nth(6), Tab8 => TabKey::Nth(7),
+        LastTab => TabKey::Last,
+    )
+}
+
+/// A tab key the view did not get (the focus left the tree with an
+/// input): as [`fold_fallback`], it acts and hands the view its focus back.
+fn tab_fallback<A: Action>(key: TabKey, view: WeakEntity<AppView>, window: AnyWindowHandle, focus: FocusHandle, cx: &mut App) {
+    cx.on_action(move |_: &A, cx| {
+        let _ = view.update(cx, |v, cx| {
+            v.tab_keys = FoldKeys::default();
+            v.tab_key(key, cx);
+        });
+        let focus = focus.clone();
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |_, window, cx| window.focus(&focus, cx));
+        });
+    });
+}
+
 /// A fold is saved this long after the last one, off the UI thread: a
 /// burst of folds is one write.
 const SAVE_DELAY: Duration = Duration::from_millis(400);
@@ -506,10 +691,41 @@ pub struct AppView {
     /// The synthetic transport feeds this window (`--offline`); it answers
     /// `saved_sessions` itself, on this channel.
     pub(crate) synthetic: bool,
-    synthetic_tx: Option<async_channel::Sender<Event>>,
+    pub(crate) synthetic_tx: Option<async_channel::Sender<Event>>,
     synthetic_seq: u64,
-    /// `--session ID`: attach to it once connected.
+    /// `--session ID`: open it once the first session list lands.
     pub start_session: Option<String>,
+    /// `--offline`: the session opened at start when no tab is restored.
+    default_session: Option<String>,
+    /// The tabs to reopen once the first session list lands (gone
+    /// sessions drop, with a notice).
+    pub restore_tabs: Option<Saved>,
+    /// Where the tabs are saved in the settings file (per daemon); `None`:
+    /// not saved (bench).
+    pub tabs_key: Option<String>,
+    /// The tabs generation saved (or being saved), and the delayed save.
+    tabs_saved: u64,
+    tabs_save: Option<Task<()>>,
+    /// The background tabs' sessions as last seen ([`TAB_CACHE`]).
+    pub(crate) tab_cache: Lru<String, TabCache>,
+    /// The tab (and its session) the model and the list hold now.
+    shown_tab: Option<(u64, Option<String>)>,
+    /// A switch's attach waiting out [`ATTACH_GAP`], and when the last
+    /// attach went out.
+    attach_wait: Option<(String, Option<ResumeRequest>, bool)>,
+    attach_due: Option<Task<()>>,
+    last_attach: Option<Instant>,
+    /// Tells Ctrl+T / Ctrl+W / Ctrl+Shift+T presses from their repeats.
+    tab_keys: FoldKeys,
+    /// The tab strip's first shown tab when they overflow, and the tab it
+    /// last kept in view.
+    pub(crate) tab_first: usize,
+    pub(crate) tab_follow: Option<u64>,
+    /// How many tabs the strip had room for at the last frame.
+    pub(crate) tab_room: usize,
+    pub(crate) tab_labels: crate::tabstrip::Labels,
+    /// The synthetic daemon's attach replies.
+    pub(crate) attach_source: Option<AttachSource>,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -580,9 +796,9 @@ impl AppView {
                         cx.notify();
                     }
                 }
-                InputEvent::PressEnter { .. } => {
+                InputEvent::PressEnter { secondary, .. } => {
                     let typed = input.read(cx).value().to_string();
-                    this.find_enter(typed.trim());
+                    this.find_enter(typed.trim(), if *secondary { Place::New } else { Place::Current });
                     cx.notify();
                 }
                 // The user is looking: list what find searches, fresh.
@@ -623,11 +839,32 @@ impl AppView {
         subs.push(cx.on_focus_lost(window, |this, window, cx| window.focus(&this.focus, cx)));
         fold_fallback::<ToggleRail>(true, cx.weak_entity(), window.window_handle(), focus.clone(), cx);
         fold_fallback::<ToggleRight>(false, cx.weak_entity(), window.window_handle(), focus.clone(), cx);
+        {
+            let (v, w) = (cx.weak_entity(), window.window_handle());
+            tab_fallback::<NewTab>(TabKey::New, v.clone(), w, focus.clone(), cx);
+            tab_fallback::<CloseTab>(TabKey::Close, v.clone(), w, focus.clone(), cx);
+            tab_fallback::<ReopenTab>(TabKey::Reopen, v.clone(), w, focus.clone(), cx);
+            tab_fallback::<NextTab>(TabKey::Next, v.clone(), w, focus.clone(), cx);
+            tab_fallback::<PrevTab>(TabKey::Prev, v.clone(), w, focus.clone(), cx);
+            tab_fallback::<Tab1>(TabKey::Nth(0), v.clone(), w, focus.clone(), cx);
+            tab_fallback::<Tab2>(TabKey::Nth(1), v.clone(), w, focus.clone(), cx);
+            tab_fallback::<Tab3>(TabKey::Nth(2), v.clone(), w, focus.clone(), cx);
+            tab_fallback::<Tab4>(TabKey::Nth(3), v.clone(), w, focus.clone(), cx);
+            tab_fallback::<Tab5>(TabKey::Nth(4), v.clone(), w, focus.clone(), cx);
+            tab_fallback::<Tab6>(TabKey::Nth(5), v.clone(), w, focus.clone(), cx);
+            tab_fallback::<Tab7>(TabKey::Nth(6), v.clone(), w, focus.clone(), cx);
+            tab_fallback::<Tab8>(TabKey::Nth(7), v.clone(), w, focus.clone(), cx);
+            tab_fallback::<LastTab>(TabKey::Last, v, w, focus.clone(), cx);
+        }
         // M3: a fold still waiting to be saved is written when the window
         // closes (the last one quits on Linux and Windows) or the app quits.
-        subs.push(cx.on_release(|this, _| this.flush_panels()));
+        subs.push(cx.on_release(|this, _| {
+            this.flush_panels();
+            this.flush_tabs();
+        }));
         subs.push(cx.on_app_quit(|this, _| {
             this.flush_panels();
+            this.flush_tabs();
             async {}
         }));
         let inputs = Inputs { composer, find_input, name_input, hex_input, secret_input, focus };
@@ -640,7 +877,8 @@ impl AppView {
             (None, Some(events)) => {
                 let mut v = Self::blank(inputs, None, ConnState::Off("offline · synthetic transport".into()), subs);
                 v.synthetic = true;
-                v.model.set_local_session("synthetic");
+                v.attach_source = Some(Box::new(crate::demo::attach));
+                v.default_session = Some(crate::demo::SID.to_string());
                 let (tx, rx) = async_channel::unbounded();
                 for e in events {
                     let _ = tx.try_send(e);
@@ -712,6 +950,22 @@ impl AppView {
             synthetic_tx: None,
             synthetic_seq: 0,
             start_session: None,
+            default_session: None,
+            restore_tabs: None,
+            tabs_key: None,
+            tabs_saved: 0,
+            tabs_save: None,
+            tab_cache: Lru::new(TAB_CACHE),
+            shown_tab: None,
+            attach_wait: None,
+            attach_due: None,
+            last_attach: None,
+            tab_keys: FoldKeys::default(),
+            tab_first: 0,
+            tab_follow: None,
+            tab_room: 0,
+            tab_labels: Default::default(),
+            attach_source: None,
             _tasks: Vec::new(),
             _subs: subs,
         }
@@ -737,11 +991,9 @@ impl AppView {
                             this.effect(fx);
                         }
                     }
-                    if matches!(this.model.conn, ConnState::Connected(_))
-                        && let Some(id) = this.start_session.take()
-                    {
-                        this.attach(id);
-                    }
+                    this.start_tabs();
+                    // An attach may have named or merged the visible tab.
+                    this.reconcile(None);
                     // An idle daemon's poll changes nothing: no frame, unless
                     // the rail's ages have a new minute to show.
                     if this.model.view_dirty || this.rail.minute() != crate::chrome::now_secs() / 60 {
@@ -786,16 +1038,8 @@ impl AppView {
                     }
                 }
             }
-            Effect::Attach { session_id, fallback, open } => {
-                if let Some(seq) = self.client.as_ref().and_then(|c| c.attach(session_id.clone(), AttachMode::Mirror).ok()) {
-                    self.model.attaching(seq, fallback, open);
-                    self.model.asked_for(&session_id);
-                    self.list.set_follow_mode(FollowMode::Tail);
-                } else if self.synthetic {
-                    self.synthetic_attach(&session_id, fallback, open);
-                }
-            }
-            Effect::Resume { req, open } => self.resume(req, open),
+            Effect::Attach { session_id, fallback, open, place } => self.open_tab(Open::Attach { session_id, fallback, open }, place),
+            Effect::Resume { req, open, place } => self.open_tab(Open::Resume { req, open }, place),
         }
     }
 
@@ -814,30 +1058,33 @@ impl AppView {
         };
         match c.resume(req.target.clone(), req.options()) {
             Ok(seq) => {
+                self.last_attach = Some(Instant::now());
                 self.model.resuming(req, seq, open);
-                self.list.set_follow_mode(FollowMode::Tail);
             }
             Err(e) => self.model.named.error = Some(e.to_string()),
         }
     }
 
-    /// `--offline` holds one session: back to it, or an attach that is
-    /// never answered (the row stays OPENING).
+    /// The synthetic daemon (`--offline`, the tab bench): an attach it
+    /// answers as a daemon would, on the channel, or never (OPENING).
     fn synthetic_attach(&mut self, session_id: &str, fallback: Option<ResumeRequest>, open: bool) {
-        if self.model.active.as_ref().is_some_and(|a| a.session_id == session_id) {
-            self.model.want(LOCAL_SEQ);
-        } else {
-            self.synthetic_seq += 1;
-            self.model.attaching(self.synthetic_seq, fallback, open);
-        }
+        self.synthetic_seq += 1;
+        let seq = self.synthetic_seq;
+        self.model.attaching(seq, fallback, open);
         self.model.asked_for(session_id);
+        if let (Some(src), Some(tx)) = (&self.attach_source, &self.synthetic_tx) {
+            for e in src(session_id, seq) {
+                let _ = tx.try_send(e);
+            }
+        }
     }
 
     /// A rail row was clicked (looked up by its key now: the rail may have
-    /// been rebuilt since the frame that drew it).
-    pub(crate) fn rail_click(&mut self, key: u64) {
+    /// been rebuilt since the frame that drew it): in the visible tab, or
+    /// (Ctrl / Cmd, the middle button) a new one.
+    pub(crate) fn rail_click(&mut self, key: u64, place: Place) {
         let Some(action) = self.rail.rail.rows.iter().find(|r| r.key == key).map(|r| r.action.clone()) else { return };
-        for fx in self.model.open_row(&action) {
+        for fx in self.model.open_row_in(&action, place) {
             self.effect(fx);
         }
     }
@@ -855,8 +1102,8 @@ impl AppView {
     }
 
     /// Enter in find (see [`Model::find_enter`]), over the rows the rail
-    /// shows for what is typed now.
-    fn find_enter(&mut self, typed: &str) {
+    /// shows for what is typed now; Ctrl+Enter opens in a new tab.
+    fn find_enter(&mut self, typed: &str, place: Place) {
         self.refresh_rail();
         let rail = &self.rail.rail;
         let visible: Vec<RowAction> = rail
@@ -867,7 +1114,7 @@ impl AppView {
                 _ => None,
             })
             .collect();
-        for fx in self.model.find_enter(typed, &visible) {
+        for fx in self.model.find_enter_in(typed, &visible, place) {
             self.effect(fx);
         }
     }
@@ -933,29 +1180,303 @@ impl AppView {
         }
     }
 
-    /// Attach to a live session, unless it is the one asked for last
-    /// (attached, or on its way): click B then A again before B lands, and
-    /// A is asked for again.
-    pub(crate) fn attach(&mut self, session_id: String) {
-        if self.model.is_wanted(&session_id) {
-            return;
-        }
-        match self.client.as_ref().and_then(|c| c.attach(session_id.clone(), AttachMode::Mirror).ok()) {
-            Some(seq) => {
-                self.model.want(seq);
-                self.model.asked_for(&session_id);
-                self.list.set_follow_mode(FollowMode::Tail);
-            }
-            None if self.synthetic => self.model.last_error = Some("offline: the synthetic transport holds one session".into()),
-            None => {}
+    /// A new session, in a new tab (`+`, NEW, Ctrl+T).
+    pub(crate) fn create(&mut self) {
+        self.open_tab(Open::Create, Place::New);
+    }
+
+    fn create_now(&mut self) {
+        // Tools run in the user's home, not wherever the launcher started us.
+        if let Some(seq) = self.client.as_ref().and_then(|c| c.create(CreateOptions::new().cwd(Cwd::Home)).ok()) {
+            self.last_attach = Some(Instant::now());
+            self.model.want(seq);
         }
     }
 
-    pub(crate) fn create(&mut self) {
-        // Tools run in the user's home, not wherever the launcher started us.
-        if let Some(seq) = self.client.as_ref().and_then(|c| c.create(CreateOptions::new().cwd(Cwd::Home)).ok()) {
-            self.model.want(seq);
-            self.list.set_follow_mode(FollowMode::Tail);
+    // ── tabs ───────────────────────────────────────────────────────────
+
+    /// Open a session in a tab: its own if it has one (focused), else the
+    /// visible one or a new one after it (`place`).
+    pub(crate) fn open_tab(&mut self, how: Open, place: Place) {
+        match how {
+            Open::Attach { session_id, fallback, open } => {
+                let label = self.model.sessions.iter().find(|s| s.id == session_id).map_or_else(|| session_id.clone(), |s| s.label());
+                self.model.tabs.open(&session_id, &label, place);
+                self.model.rail_gen += 1;
+                self.reconcile(Some((fallback, open)));
+            }
+            Open::Resume { req, open } => {
+                self.model.tabs.open_pending(&req.label, place);
+                self.model.rail_gen += 1;
+                self.reconcile(None);
+                self.resume(req, open);
+            }
+            Open::Create => {
+                if self.client.is_none() {
+                    return;
+                }
+                self.model.tabs.open_pending(NEW_SESSION, place);
+                self.model.rail_gen += 1;
+                self.reconcile(None);
+                self.create_now();
+            }
+        }
+    }
+
+    /// Bring the model and the list to the visible tab. The model already
+    /// holding its session (attached or on its way: a create or a resume
+    /// named the tab, an attach merged it into the tab that had it) is
+    /// left as is. Another session: the one shown goes to the tab cache,
+    /// the visible one's cached state (or nothing) comes in, and its
+    /// attach goes out. `hint`: the open asked for an attach (with its
+    /// fallback) even if nothing changed (a session that detached).
+    pub(crate) fn reconcile(&mut self, hint: Option<(Option<ResumeRequest>, bool)>) {
+        let vis = self.model.tabs.visible().map(|t| (t.id, t.session.clone()));
+        if let Some((_, Some(s))) = &vis
+            && self.model.wanted_session() == Some(s.as_str())
+        {
+            // What a cache held of it is older than what attached.
+            let _ = self.tab_cache.take(s);
+            self.shown_tab = vis;
+            return;
+        }
+        if vis == self.shown_tab && hint.is_none() {
+            return;
+        }
+        if vis != self.shown_tab {
+            self.stash();
+            self.load(vis.as_ref().and_then(|v| v.1.clone()));
+        }
+        self.shown_tab = vis.clone();
+        match vis {
+            Some((_, Some(s))) => self.attach_tab(s, hint),
+            // A create or a resume: the caller sends it.
+            Some((_, None)) => {}
+            None => self.detach_all(),
+        }
+    }
+
+    /// The session on screen goes to the tab cache (if it is one): the
+    /// model's transcript and numbers, the rows, folds and the list with
+    /// its heights and scroll position. A fresh list takes its place.
+    fn stash(&mut self) {
+        // The rows first: the transcript may have run ahead of the last frame.
+        self.sync_list();
+        let key = self.model.transcript.session_id().map(str::to_string);
+        let (transcript, stats) = self.model.switch_out();
+        self.card = None;
+        self.attach_wait = None;
+        self.attach_due = None;
+        let fresh = ListState::new(0, ListAlignment::Top, px(600.));
+        fresh.set_follow_mode(FollowMode::Tail);
+        let cache = TabCache {
+            transcript,
+            stats,
+            rows: std::mem::take(&mut self.rows),
+            disp: std::mem::take(&mut self.disp),
+            summaries: std::mem::take(&mut self.summaries),
+            list: std::mem::replace(&mut self.list, fresh),
+            toggled: std::mem::take(&mut self.toggled),
+            open_runs: std::mem::take(&mut self.open_runs),
+            synced_busy: std::mem::take(&mut self.synced_busy),
+            files_gen: std::mem::take(&mut self.files_gen),
+            waiting_on: self.waiting_on.take(),
+        };
+        self.rows_session = None;
+        if let Some(k) = key {
+            let tabs = &self.model.tabs;
+            self.tab_cache.put(k, cache, |k| tabs.is_open(k));
+        }
+    }
+
+    /// The visible tab's session as last seen, from the cache, or nothing
+    /// until its attach lands.
+    fn load(&mut self, session: Option<String>) {
+        match session.as_ref().and_then(|s| self.tab_cache.take(s)) {
+            Some(c) => {
+                self.model.switch_in(c.transcript, c.stats);
+                self.rows = c.rows;
+                self.disp = c.disp;
+                self.summaries = c.summaries;
+                self.list = c.list;
+                self.toggled = c.toggled;
+                self.open_runs = c.open_runs;
+                self.synced_busy = c.synced_busy;
+                self.files_gen = c.files_gen;
+                self.waiting_on = c.waiting_on;
+            }
+            None => self.model.switch_in(Transcript::new(), Stats::default()),
+        }
+        self.rows_session = session;
+    }
+
+    /// Attach the visible tab's session; within [`ATTACH_GAP`] of the
+    /// last attach it waits (shown OPENING), so a burst of switches
+    /// attaches once.
+    fn attach_tab(&mut self, session: String, hint: Option<(Option<ResumeRequest>, bool)>) {
+        let (fallback, open) = hint.unwrap_or_else(|| (self.model.tab_fallback(&session), false));
+        self.attach_wait = None;
+        if self.client.is_some() && self.last_attach.is_some_and(|t| t.elapsed() < ATTACH_GAP) {
+            self.model.showing(&session);
+            self.attach_wait = Some((session, fallback, open));
+            return;
+        }
+        self.attach_now(session, fallback, open);
+    }
+
+    fn attach_now(&mut self, session: String, fallback: Option<ResumeRequest>, open: bool) {
+        if let Some(seq) = self.client.as_ref().and_then(|c| c.attach(session.clone(), AttachMode::Mirror).ok()) {
+            self.last_attach = Some(Instant::now());
+            self.model.attaching(seq, fallback, open);
+            self.model.asked_for(&session);
+        } else if self.synthetic_tx.is_some() {
+            self.synthetic_attach(&session, fallback, open);
+        } else {
+            // No daemon: shown, never attached.
+            self.model.showing(&session);
+        }
+    }
+
+    /// The deferred attach, if its tab is still the visible one.
+    fn attach_waited(&mut self) {
+        self.attach_due = None;
+        if let Some((s, fallback, open)) = self.attach_wait.take()
+            && self.model.tabs.visible_session() == Some(s.as_str())
+            && self.model.active.is_none()
+        {
+            self.attach_now(s, fallback, open);
+        }
+    }
+
+    /// The last tab closed: nothing attached (the session keeps running).
+    fn detach_all(&mut self) {
+        self.attach_wait = None;
+        if let Some(c) = &self.client {
+            let _ = c.detach();
+        }
+    }
+
+    /// Restore the saved tabs, then open `--session` (or `--offline`'s
+    /// session when nothing was restored), once the first session list
+    /// has landed: a saved tab whose session is gone drops, said once.
+    fn start_tabs(&mut self) {
+        if !self.model.sessions_listed {
+            return;
+        }
+        if let Some(saved) = self.restore_tabs.take()
+            && self.model.tabs.is_empty()
+        {
+            let sessions = &self.model.sessions;
+            let (tabs, dropped) = crate::tabs::Tabs::restore(&saved, |id| sessions.iter().any(|s| s.id == id && s.lifecycle != "ending"));
+            self.model.tabs = tabs;
+            if dropped > 0 {
+                self.model.named.notice = Some(match dropped {
+                    1 => "1 saved tab closed: its session is no longer open.".into(),
+                    n => format!("{n} saved tabs closed: their sessions are no longer open."),
+                });
+                // Saved again without them.
+                self.model.tabs.generation += 1;
+            }
+            self.tabs_saved = if dropped > 0 { 0 } else { self.model.tabs.generation };
+            let sessions = self.model.sessions.clone();
+            self.model.tabs.listed(&sessions);
+            self.model.rail_gen += 1;
+            self.reconcile(None);
+        }
+        let start = self.start_session.take().or_else(|| self.default_session.take().filter(|_| self.model.tabs.is_empty()));
+        self.default_session = None;
+        if let Some(id) = start {
+            let place = if self.model.tabs.is_empty() { Place::Current } else { Place::New };
+            let fallback = self.model.tab_fallback(&id);
+            self.open_tab(Open::Attach { session_id: id, fallback, open: false }, place);
+        }
+    }
+
+    /// Show tab `ix` (a click on it).
+    pub(crate) fn focus_tab(&mut self, ix: usize) {
+        if self.model.tabs.focus(ix) {
+            self.model.rail_gen += 1;
+            self.reconcile(None);
+        }
+    }
+
+    /// Close tab `ix` (×, the middle button, Ctrl+W): only a detach; the
+    /// session keeps running. Its state stays in the cache for Ctrl+Shift+T.
+    pub(crate) fn close_tab(&mut self, ix: usize) {
+        if self.model.tabs.close(ix) {
+            self.model.rail_gen += 1;
+            self.reconcile(None);
+        }
+    }
+
+    /// Drop tab `from` where tab `to` is.
+    pub(crate) fn move_tab(&mut self, from: u64, to: u64) {
+        let ix = |id| self.model.tabs.iter().position(|t| t.id == id);
+        if let (Some(a), Some(b)) = (ix(from), ix(to))
+            && self.model.tabs.move_tab(a, b)
+        {
+            self.model.rail_gen += 1;
+        }
+    }
+
+    /// A tab key. Ctrl+T, Ctrl+W and Ctrl+Shift+T act on a press, never on
+    /// its auto-repeats (a held Ctrl+T is not a burst of new sessions).
+    pub(crate) fn tab_key(&mut self, key: TabKey, cx: &mut Context<Self>) {
+        if matches!(key, TabKey::New | TabKey::Close | TabKey::Reopen) && !self.tab_keys.press(Instant::now()) {
+            return;
+        }
+        let tabs = &mut self.model.tabs;
+        let changed = match key {
+            TabKey::New => {
+                self.create();
+                cx.notify();
+                return;
+            }
+            TabKey::Close => match tabs.active() {
+                Some(ix) => tabs.close(ix),
+                None => false,
+            },
+            TabKey::Reopen => tabs.reopen(),
+            TabKey::Next => tabs.step(1),
+            TabKey::Prev => tabs.step(-1),
+            TabKey::Nth(n) => tabs.focus(n),
+            TabKey::Last => tabs.focus_last(),
+        };
+        if changed {
+            self.model.rail_gen += 1;
+            self.reconcile(None);
+            cx.notify();
+        }
+    }
+
+    /// The tabs changed since the last save: saved [`SAVE_DELAY`] later, off
+    /// the UI thread (a burst of changes is one write).
+    fn schedule_tabs_save(&mut self, cx: &mut Context<Self>) {
+        if self.tabs_key.is_none() || self.bench.is_some() || self.model.tabs.generation == self.tabs_saved {
+            return;
+        }
+        self.tabs_saved = self.model.tabs.generation;
+        self.tabs_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVE_DELAY).await;
+            let job = this.update(cx, |v, _| (theme::settings_path(), v.tabs_key.clone(), v.model.tabs.saved())).ok();
+            let Some((Some(path), Some(key), saved)) = job else { return };
+            let done = cx.background_spawn(async move { theme::save_tabs(&path, &key, &saved) }).await;
+            if let Err(e) = done {
+                let _ = this.update(cx, |v, cx| {
+                    v.model.last_error = Some(format!("tabs not saved: {e}"));
+                    cx.notify();
+                });
+            }
+        }));
+    }
+
+    /// A tab save still waiting, written now (the window closes, the app quits).
+    fn flush_tabs(&mut self) {
+        if self.tabs_save.take().is_some()
+            && let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref())
+            && let Err(e) = theme::save_tabs(&path, key, &self.model.tabs.saved())
+        {
+            eprintln!("synaps-desktop: tabs not saved: {e}");
         }
     }
 
@@ -1302,17 +1823,29 @@ impl AppView {
         let items = self.model.transcript.items();
         let from = match &splice {
             Some(sp) => {
-                self.rows.truncate(sp.start);
-                for item in &items[sp.start..] {
-                    self.rows.push(row_cache(item, &self.model.stats.files));
+                if items.len() - sp.start > REUSE_ROWS {
+                    // A long tail rebuilt (an attach, a history replace):
+                    // rows whose item kept its id and rev keep their strings,
+                    // so a cached tab's re-attach rebuilds only what changed.
+                    let mut old: HashMap<(u64, u64), RowCache> =
+                        self.rows.drain(sp.start.min(self.rows.len())..).map(|r| ((r.id, r.rev), r)).collect();
+                    for item in &items[sp.start..] {
+                        let r = old.remove(&(item.id, item.rev)).unwrap_or_else(|| row_cache(item, &self.model.stats.files));
+                        self.rows.push(r);
+                    }
+                } else {
+                    self.rows.truncate(sp.start);
+                    for item in &items[sp.start..] {
+                        self.rows.push(row_cache(item, &self.model.stats.files));
+                    }
                 }
                 debug_assert!(self.rows.iter().zip(items).all(|(r, i)| r.id == i.id && r.rev == i.rev));
                 if sp.start == 0 {
-                    self.summaries.clear();
                     // Another session: what was unfolded there means nothing here.
                     let session = self.model.active.as_ref().map(|a| a.session_id.clone());
                     if session != self.rows_session {
                         self.rows_session = session;
+                        self.summaries.clear();
                         self.toggled.clear();
                         self.open_runs.clear();
                     }
@@ -1430,7 +1963,15 @@ impl AppView {
     fn render_header(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let lay = self.layout;
         let attached = self.model.active.is_some() && (self.client.is_some() || self.synthetic);
-        let title: SharedString = self.model.transcript.title().or(self.model.active_name()).unwrap_or("No session").to_string().into();
+        let title: SharedString = self
+            .model
+            .transcript
+            .title()
+            .or(self.model.active_name())
+            .or(self.model.tabs.visible().map(|t| t.label.as_str()))
+            .unwrap_or("No session")
+            .to_string()
+            .into();
         let view = self.model.stats.view.as_ref();
         let model = view.map(|v| v.model.as_str()).filter(|m| !m.is_empty()).or(self.model.active_meta().map(|s| s.model.as_str()));
         let effort = view.map(|v| v.effort.clone()).filter(|e| !e.is_empty());
@@ -1918,6 +2459,18 @@ impl Render for AppView {
             self.list.remeasure();
         }
         self.layout = lay;
+        let tabs = self.render_tabs(pane, &p, cx);
+        self.schedule_tabs_save(cx);
+        if self.attach_wait.is_some() && self.attach_due.is_none() {
+            let left = ATTACH_GAP.saturating_sub(self.last_attach.map_or(ATTACH_GAP, |t| t.elapsed()));
+            self.attach_due = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(left).await;
+                let _ = this.update(cx, |v, cx| {
+                    v.attach_waited();
+                    cx.notify();
+                });
+            }));
+        }
         let (pad_l, pad_r) = lay.padding();
         let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_disp(ix, cx)))
             .size_full()
@@ -1930,6 +2483,7 @@ impl Render for AppView {
             .h_full()
             .min_w_0()
             .bg(p.canvas)
+            .child(tabs)
             .child(self.render_header(&p, cx))
             .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
             .child(div().flex_1().min_h_0().child(list))
@@ -1988,9 +2542,13 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &TextBigger, _, cx| this.step_text(Some(1), cx)))
             .on_action(cx.listener(|this, _: &TextSmaller, _, cx| this.step_text(Some(-1), cx)))
             .on_action(cx.listener(|this, _: &TextReset, _, cx| this.step_text(None, cx)))
+            .map(|d| tab_actions(d, cx))
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, _| {
-                if ev.keystroke.key.eq_ignore_ascii_case("b") {
+                let k = &ev.keystroke.key;
+                if k.eq_ignore_ascii_case("b") {
                     this.fold_keys.release(Instant::now());
+                } else if k.eq_ignore_ascii_case("t") || k.eq_ignore_ascii_case("w") {
+                    this.tab_keys.release(Instant::now());
                 }
             }))
             .relative()
@@ -2027,8 +2585,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        CENTRE_MIN, FoldKeys, Side, authorize_ready, dragged, lines_below, one_line, panel_keys, side_widths, sides, text_keys, toggled,
-        well_body,
+        CENTRE_MIN, FoldKeys, Side, TabKey, authorize_ready, dragged, lines_below, one_line, panel_keys, side_widths, sides, tab_keys,
+        text_keys, toggled, well_body,
     };
     use crate::theme::Panels;
 
@@ -2039,6 +2597,124 @@ mod tests {
             let (a, b) = panel_keys(mac);
             for k in [a, b].into_iter().chain(text_keys(mac)) {
                 assert!(gpui_kit::Keystroke::parse(k).is_ok(), "{k}");
+            }
+        }
+    }
+
+    /// The tab keys parse on every OS, each keystroke means one thing, and
+    /// none is a key the inputs (composer, find, names) or an IME use: the
+    /// list is gpui-base 0.9.1's input bindings (`input/base/state.rs`).
+    #[test]
+    fn tab_keys_parse_and_clash_with_nothing() {
+        const INPUT: &[&str] = &[
+            "alt-backspace",
+            "alt-delete",
+            "alt-left",
+            "alt-right",
+            "alt-shift-left",
+            "alt-shift-right",
+            "backspace",
+            "cmd-.",
+            "cmd-[",
+            "cmd-]",
+            "cmd-a",
+            "cmd-alt-down",
+            "cmd-alt-up",
+            "cmd-backspace",
+            "cmd-c",
+            "cmd-delete",
+            "cmd-down",
+            "cmd-f",
+            "cmd-left",
+            "cmd-right",
+            "cmd-shift-down",
+            "cmd-shift-f",
+            "cmd-shift-up",
+            "cmd-shift-z",
+            "cmd-up",
+            "cmd-v",
+            "cmd-x",
+            "cmd-z",
+            "ctrl-.",
+            "ctrl-[",
+            "ctrl-]",
+            "ctrl-a",
+            "ctrl-alt-down",
+            "ctrl-alt-up",
+            "ctrl-backspace",
+            "ctrl-c",
+            "ctrl-cmd-space",
+            "ctrl-delete",
+            "ctrl-e",
+            "ctrl-end",
+            "ctrl-f",
+            "ctrl-h",
+            "ctrl-home",
+            "ctrl-left",
+            "ctrl-right",
+            "ctrl-shift-a",
+            "ctrl-shift-e",
+            "ctrl-shift-end",
+            "ctrl-shift-home",
+            "ctrl-shift-left",
+            "ctrl-shift-right",
+            "ctrl-v",
+            "ctrl-x",
+            "ctrl-y",
+            "ctrl-z",
+            "delete",
+            "down",
+            "end",
+            "escape",
+            "home",
+            "left",
+            "pagedown",
+            "pageup",
+            "right",
+            "shift-alt-down",
+            "shift-alt-left",
+            "shift-alt-right",
+            "shift-alt-up",
+            "shift-backspace",
+            "shift-cmd-left",
+            "shift-cmd-right",
+            "shift-delete",
+            "shift-down",
+            "shift-end",
+            "shift-home",
+            "shift-left",
+            "shift-right",
+            "shift-tab",
+            "shift-up",
+            "tab",
+            "up",
+            // The find box and composer: Enter opens / sends, Ctrl+Enter a new tab.
+            "enter",
+            "ctrl-enter",
+            "cmd-enter",
+            "shift-enter",
+        ];
+        let parse = |k: &'static str| gpui_kit::Keystroke::parse(k).unwrap_or_else(|e| panic!("{k}: {e:?}"));
+        let input: Vec<_> = INPUT.iter().map(|k| parse(k)).collect();
+        for mac in [false, true] {
+            let (a, b) = panel_keys(mac);
+            let mut app: Vec<_> = [a, b].into_iter().chain(text_keys(mac)).map(|k| (parse(k), None)).collect();
+            app.extend(tab_keys(mac).iter().map(|(k, what)| (parse(k), Some(*what))));
+            for (i, (k, what)) in app.iter().enumerate() {
+                assert!(!input.contains(k), "{k:?} is an input key");
+                assert!(!app[..i].iter().any(|(o, _)| o == k), "{k:?} bound twice");
+                // Never a bare key or Shift+key: those are typing.
+                assert!(k.modifiers.control || k.modifiers.platform, "{k:?} has no Ctrl/Cmd");
+                // Cmd+Tab is macOS's app switcher.
+                assert!(!(mac && k.modifiers.platform && k.key == "tab"), "{k:?}");
+                if what.is_some() && mac {
+                    assert!(k.key == "tab" || k.modifiers.platform, "{k:?}: Cmd on macOS");
+                }
+            }
+            let nth: Vec<usize> = tab_keys(mac).iter().filter_map(|(_, w)| if let TabKey::Nth(n) = w { Some(*n) } else { None }).collect();
+            assert_eq!(nth, (0..8).collect::<Vec<_>>());
+            for want in [TabKey::New, TabKey::Close, TabKey::Reopen, TabKey::Next, TabKey::Prev, TabKey::Last] {
+                assert!(tab_keys(mac).iter().any(|(_, w)| *w == want), "{want:?}");
             }
         }
     }

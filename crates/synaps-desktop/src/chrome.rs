@@ -18,6 +18,7 @@ use crate::model::{ConnState, Model};
 use crate::named::RowAction;
 use crate::rail::{self, Chip, Item, Rail, State};
 use crate::stats::compact;
+use crate::tabs::Place;
 use crate::theme::{self, Palette};
 
 /// Left inset of the layout before the rail. The mark strip that used to
@@ -128,7 +129,7 @@ pub(crate) fn glyph(st: State, p: &Palette) -> Div {
     }
 }
 
-fn word_color(st: State, p: &Palette) -> Hsla {
+pub(crate) fn word_color(st: State, p: &Palette) -> Hsla {
     match st {
         State::NeedsYou => p.warn_ch,
         State::Running => p.run_ch,
@@ -633,13 +634,17 @@ impl AppView {
         let meta = row.live.and_then(|i| self.model.sessions.get(i));
         let st = meta.map(|s| self.model.state(s)).unwrap_or(row.state);
         let on = meta.is_some_and(|s| self.model.is_active(&s.id));
+        // The marker follows the visible tab (also while its attach is on
+        // its way); a session open in a background tab has a faint one.
+        let shown = meta.is_some_and(|s| self.model.is_shown(&s.id));
+        let in_tab = !shown && meta.is_some_and(|s| self.model.tabs.is_open(&s.id));
         // The attached session's cost as the panel shows it (its digests
         // run ahead of the 3 s poll), else the poll's.
         let cost = meta.map(|s| if on { self.model.stats.cost.unwrap_or(s.cost_usd) } else { s.cost_usd }).filter(|c| *c > 0.0);
         let waiting = meta.map(|s| if on { self.model.transcript.pending_prompts().len() } else { s.awaiting_input }).unwrap_or(0);
         let title_color = match st {
             State::NeedsYou | State::Running | State::Unread => p.ink,
-            _ if on => p.ink,
+            _ if shown => p.ink,
             State::Parked | State::Locked => p.dim_ch,
             _ if row.fresh => p.dim_ch,
             _ => p.prose_ch,
@@ -647,8 +652,10 @@ impl AppView {
         let sub_color = p.dim_ch;
         let bar = if st == State::NeedsYou {
             Some(p.warn_mark_ch)
-        } else if on {
+        } else if shown {
             Some(p.you_bar)
+        } else if in_tab {
+            Some(p.rest_mark)
         } else {
             None
         };
@@ -669,9 +676,9 @@ impl AppView {
             .pt(px(8.))
             .pb(px(9.))
             .cursor_pointer()
-            .when(on, |d| d.bg(p.raised))
+            .when(shown, |d| d.bg(p.raised))
             .hover(|d| d.bg(p.raised))
-            .when_some(bar, |d, c| d.child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(c)))
+            .when_some(bar, |d, c| d.child(div().absolute().left_0().top_0().bottom_0().w(px(if in_tab { 1. } else { 2. })).bg(c)))
             .child(
                 h_flex().gap(px(10.)).items_start().child(glyph(st, p).mt(px(5.))).child(
                     v_flex()
@@ -722,9 +729,15 @@ impl AppView {
             )
             .when(self.readout == Some(key), |d| d.child(self.render_readout(row, p)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.rail_click(key);
+            .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                this.rail_click(key, crate::tabstrip::click_place(ev, cx));
                 cx.notify();
+            }))
+            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                if ev.is_middle_click() {
+                    this.rail_click(key, Place::New);
+                    cx.notify();
+                }
             }))
             .into_any_element()
     }
@@ -766,9 +779,15 @@ impl AppView {
             .child(mono(&row.age, 10., p.dim_ch))
             .when(self.readout == Some(key), |d| d.child(self.render_readout(row, p)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.rail_click(key);
+            .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                this.rail_click(key, crate::tabstrip::click_place(ev, cx));
                 cx.notify();
+            }))
+            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                if ev.is_middle_click() {
+                    this.rail_click(key, Place::New);
+                    cx.notify();
+                }
             }))
             .into_any_element()
     }
