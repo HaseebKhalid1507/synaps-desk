@@ -366,6 +366,27 @@ impl Ledger {
         self.generation
     }
 
+    /// What it keeps, roughly (bytes): the analysed calls' diff previews
+    /// (the rows share them) and paths, the files and the call ids.
+    pub fn bytes(&self) -> usize {
+        let preview = |p: &Preview| {
+            std::mem::size_of::<Preview>()
+                + p.title.capacity()
+                + p.lines.iter().map(|l| std::mem::size_of::<DiffLine>() + l.text.len() + 16).sum::<usize>()
+        };
+        let call = |(k, a): (&String, &Arc<Analysed>)| {
+            k.capacity()
+                + 64
+                + preview(&a.preview)
+                + a.changes.iter().chain(a.ops.iter().map(|(_, c)| c)).map(|c| c.path.capacity() + 48).sum::<usize>()
+        };
+        let file = |path: &String, dir: &Arc<str>, name: &Arc<str>| path.capacity() + dir.len() + name.len() + 96;
+        self.calls.iter().map(call).sum::<usize>()
+            + self.files.iter().map(|f| file(&f.path, &f.dir, &f.name)).sum::<usize>()
+            + self.shell.iter().map(|f| file(&f.path, &f.dir, &f.name)).sum::<usize>()
+            + (self.shell_calls.len() + self.committed.len() + self.pending.len()) * 64
+    }
+
     pub fn preview(&self, tool_id: &str) -> Option<Arc<Preview>> {
         self.calls.get(tool_id).map(|c| c.preview.clone())
     }

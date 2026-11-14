@@ -18,6 +18,7 @@ use synaps_client::{
 use crate::named::{ResumeRequest, RowAction, parse_rfc3339};
 use crate::rail::{Chip, State, is_parked};
 use crate::stats::Stats;
+use crate::tabs::{Place, Tabs};
 
 /// HISTORY's newest unnamed sessions, asked for at startup; up to
 /// [`SAVED_SESSIONS_MAX`] (the wire's cap) once OLDER opens or find is used.
@@ -98,6 +99,12 @@ pub struct Active {
 pub enum Effect {
     /// Input the daemon refused (or never got): put it back in the composer.
     Restore(String),
+    /// Input sent to `session` before its tab was left, refused (or never
+    /// confirmed) since: back into that tab's draft, which says so.
+    Unsent {
+        session: String,
+        text: String,
+    },
     ListSessions,
     Resync,
     /// `Client::saved_sessions(named_only, limit)`; if it cannot be sent,
@@ -108,16 +115,18 @@ pub enum Effect {
     },
     /// Attach to a live session, then [`Model::attaching`]. `fallback`: a
     /// named session's journal, resumed if it ended meanwhile. `open`: an
-    /// Open by name.
+    /// Open by name. `place`: the tab it opens in (its own if it has one).
     Attach {
         session_id: String,
         fallback: Option<ResumeRequest>,
         open: bool,
+        place: Place,
     },
     /// `Client::resume(req.target, req.options())`, then [`Model::resuming`].
     Resume {
         req: ResumeRequest,
         open: bool,
+        place: Place,
     },
 }
 
@@ -160,6 +169,8 @@ pub struct Opening {
     attach_seq: Option<u64>,
     /// A fresh saved list was asked for it.
     asked_saved: bool,
+    /// The tab it opens in (Ctrl+Enter: a new one).
+    place: Place,
 }
 
 /// One `saved_sessions` request: the named list, or the newest `limit`.
@@ -229,6 +240,19 @@ pub const LOCAL_SEQ: u64 = u64::MAX;
 /// The daemon's answer to attaching a session it does not hold
 /// (`daemon/conn.rs`: `DaemonFrame::Error { message: "unknown session" }`).
 const UNKNOWN_SESSION: &str = "unknown session";
+/// Left attachments whose unconfirmed input is still followed.
+const LEFT_MAX: usize = 4;
+
+/// The daemon refused a submit or a steer, or a refusal that names no
+/// command (it could be one): the oldest input in flight comes back.
+fn refused_input(e: &Error) -> bool {
+    match e {
+        Error::Refused { command: None, .. } => true,
+        Error::Refused { command: Some(c), .. } => c == "submit" || c == "steer",
+        Error::NotAttached { command } => *command != "answer",
+        _ => false,
+    }
+}
 
 pub struct Model {
     pub conn: ConnState,
@@ -256,7 +280,16 @@ pub struct Model {
     /// Sent, not yet confirmed by `TurnStarted` / `Steered`, oldest first:
     /// given back to the user on a refusal (the oldest) or a detach (all).
     in_flight: VecDeque<String>,
+    /// The same for attachments a tab switch left (their last events still
+    /// come, until their `Detached`): `(attach_seq, session, texts)`.
+    left: Vec<(u64, String, VecDeque<String>)>,
     pub named: Named,
+    /// The open tabs; the visible one's session is the one attached.
+    pub tabs: Tabs,
+    /// A session list has landed (saved tabs can be checked against it),
+    /// and how many have (the polls of an idle daemon included).
+    pub sessions_listed: bool,
+    pub lists: u64,
     /// The attached session's numbers (header, right-hand panel).
     pub stats: Stats,
     /// Bumped whenever what the rail lists may have changed (anything but
@@ -303,7 +336,11 @@ impl Model {
             last_error: None,
             reattaching: false,
             in_flight: VecDeque::new(),
+            left: Vec::new(),
             named: Named { daemon: "the daemon's machine".into(), ..Named::default() },
+            tabs: Tabs::default(),
+            sessions_listed: false,
+            lists: 0,
             stats: Stats::default(),
             rail_gen: 0,
             unread: HashSet::new(),
@@ -517,16 +554,22 @@ impl Model {
         Some(ResumeRequest { label: name, target, cwd: s.cwd.clone().filter(|c| !c.is_empty()), by_name: false })
     }
 
-    /// A Named row was clicked.
+    /// A row was clicked: in the visible tab.
     pub fn open_row(&mut self, action: &RowAction) -> Vec<Effect> {
+        self.open_row_in(action, Place::Current)
+    }
+
+    /// A row was clicked (Ctrl or middle: `Place::New`). A session open in
+    /// a tab is focused there.
+    pub fn open_row_in(&mut self, action: &RowAction, place: Place) -> Vec<Effect> {
         self.named.error = None;
         self.named.notice = None;
         match action {
             // Already the one on screen (or on its way): nothing to do.
             RowAction::Attach(id) if self.is_wanted(id) => Vec::new(),
-            RowAction::Attach(id) => vec![Effect::Attach { session_id: id.clone(), fallback: self.journal_of(id), open: false }],
+            RowAction::Attach(id) => vec![Effect::Attach { session_id: id.clone(), fallback: self.journal_of(id), open: false, place }],
             RowAction::Resume(req) if self.named.resuming.as_ref().is_some_and(|r| r.req.target == req.target) => Vec::new(),
-            RowAction::Resume(req) => vec![Effect::Resume { req: req.clone(), open: false }],
+            RowAction::Resume(req) => vec![Effect::Resume { req: req.clone(), open: false, place }],
         }
     }
 
@@ -535,7 +578,13 @@ impl Model {
     /// rail shows); else, with no row showing, the daemon (see
     /// [`Model::open_by_name`]). Several rows and no exact name: nothing
     /// opens, the user picks.
+    #[cfg(test)]
     pub fn find_enter(&mut self, typed: &str, visible: &[RowAction]) -> Vec<Effect> {
+        self.find_enter_in(typed, visible, Place::Current)
+    }
+
+    /// [`Model::find_enter`], opening in `place` (Ctrl+Enter: a new tab).
+    pub fn find_enter_in(&mut self, typed: &str, visible: &[RowAction], place: Place) -> Vec<Effect> {
         let typed = typed.trim();
         if self.named.confirm.as_deref() != Some(typed) {
             self.named.confirm = None;
@@ -544,11 +593,11 @@ impl Model {
             return Vec::new();
         }
         if self.has_name(typed) {
-            return self.open_by_name(typed);
+            return self.open_by_name_in(typed, place);
         }
         match visible {
-            [one] => self.open_row(one),
-            [] if validate_session_name(typed).is_ok() => self.open_by_name(typed),
+            [one] => self.open_row_in(one, place),
+            [] if validate_session_name(typed).is_ok() => self.open_by_name_in(typed, place),
             rows => {
                 self.named.notice = None;
                 self.named.error = Some(match rows.len() {
@@ -573,7 +622,13 @@ impl Model {
     /// list is asked once more (it may be new), then it is "no session
     /// named"; a daemon without it resolves the name itself, and the
     /// attached session must carry that name.
+    #[cfg(test)]
     pub fn open_by_name(&mut self, typed: &str) -> Vec<Effect> {
+        self.open_by_name_in(typed, Place::Current)
+    }
+
+    /// [`Model::open_by_name`], opening in `place`.
+    pub fn open_by_name_in(&mut self, typed: &str, place: Place) -> Vec<Effect> {
         let name = typed.trim();
         let n = &mut self.named;
         n.error = None;
@@ -583,7 +638,7 @@ impl Model {
             n.error = Some(e.to_string());
             return Vec::new();
         }
-        n.opening = Some(Opening { name: name.to_string(), attach_seq: None, asked_saved: false });
+        n.opening = Some(Opening { name: name.to_string(), attach_seq: None, asked_saved: false, place });
         let mut effects = Vec::new();
         self.resolve_open(&mut effects);
         effects
@@ -591,21 +646,21 @@ impl Model {
 
     /// Resolve a waiting Open by name against the lists (exact name).
     fn resolve_open(&mut self, effects: &mut Vec<Effect>) {
-        let Some((name, asked_saved)) =
-            self.named.opening.as_ref().filter(|o| o.attach_seq.is_none()).map(|o| (o.name.clone(), o.asked_saved))
+        let Some((name, asked_saved, place)) =
+            self.named.opening.as_ref().filter(|o| o.attach_seq.is_none()).map(|o| (o.name.clone(), o.asked_saved, o.place))
         else {
             return;
         };
         if let Some(s) = self.sessions.iter().find(|s| s.name.as_deref() == Some(name.as_str())) {
             let id = s.id.clone();
-            effects.push(Effect::Attach { fallback: self.journal_of(&id), session_id: id, open: true });
+            effects.push(Effect::Attach { fallback: self.journal_of(&id), session_id: id, open: true, place });
             return;
         }
         let n = &self.named;
         if n.saved_supported {
             if let Some(v) = n.saved.iter().chain(&n.recent).find(|v| v.name.as_deref() == Some(name.as_str())) {
                 let req = ResumeRequest { label: name, target: v.id.clone(), cwd: v.cwd.clone().filter(|c| !c.is_empty()), by_name: false };
-                effects.push(Effect::Resume { req, open: true });
+                effects.push(Effect::Resume { req, open: true, place });
                 return;
             }
             if !n.saved_truncated {
@@ -632,7 +687,7 @@ impl Model {
     /// be part of one: such text goes only on a second Enter, after the
     /// user was told.
     fn open_by_resolver(&mut self, effects: &mut Vec<Effect>) {
-        let Some(name) = self.named.opening.as_ref().map(|o| o.name.clone()) else { return };
+        let Some((name, place)) = self.named.opening.as_ref().map(|o| (o.name.clone(), o.place)) else { return };
         let n = &mut self.named;
         if could_be_id(&name) && n.confirm.as_deref() != Some(name.as_str()) {
             n.opening = None;
@@ -645,7 +700,7 @@ impl Model {
         }
         n.confirm = None;
         let req = ResumeRequest { label: name.clone(), target: name, cwd: None, by_name: true };
-        effects.push(Effect::Resume { req, open: true });
+        effects.push(Effect::Resume { req, open: true, place });
     }
 
     /// `Effect::Attach` went out as `attach_seq`.
@@ -754,10 +809,88 @@ impl Model {
         self.wanted_session.as_deref() == Some(session_id)
     }
 
+    /// The session asked for last (attached, or on its way).
+    pub fn wanted_session(&self) -> Option<&str> {
+        self.wanted_session.as_deref()
+    }
+
+    /// The visible tab shows this session (the rail's marker).
+    pub fn is_shown(&self, session_id: &str) -> bool {
+        self.tabs.visible_session() == Some(session_id)
+    }
+
+    /// The visible tab is leaving its session: what the user saw of it is
+    /// the baseline UNREAD compares the next poll with; its transcript and
+    /// numbers are handed over (to the tab cache); nothing of its
+    /// attachment carries over. Until the next session attaches nothing
+    /// can be sent, answered or halted (`active` is `None`): no input, no
+    /// card, no HALT can reach the session left or the one to come.
+    pub fn switch_out(&mut self) -> (Transcript, Stats) {
+        self.saw_active();
+        self.wanted = None;
+        self.wanted_session = None;
+        self.wanted_fact = None;
+        self.answered.clear();
+        // Sent to the session left: its echo or refusal still comes, under
+        // that attachment's seq; a refusal goes back to that tab's draft.
+        if let Some(a) = self.active.take()
+            && !self.in_flight.is_empty()
+        {
+            if self.left.len() == LEFT_MAX {
+                self.left.remove(0);
+            }
+            self.left.push((a.attach_seq, a.session_id, std::mem::take(&mut self.in_flight)));
+        }
+        self.in_flight.clear();
+        self.reattaching = false;
+        self.last_error = None;
+        let n = &mut self.named;
+        n.naming = false;
+        n.replace = None;
+        n.rename_error = None;
+        // A resume or an attach in flight was the attachment left's.
+        n.resuming = None;
+        n.attaching = None;
+        n.opening.take_if(|o| o.attach_seq.is_some());
+        self.rail_gen += 1;
+        self.view_dirty = true;
+        (std::mem::take(&mut self.transcript), std::mem::take(&mut self.stats))
+    }
+
+    /// The visible tab's session, as last seen (a cached tab) or nothing
+    /// yet; its attach follows.
+    pub fn switch_in(&mut self, transcript: Transcript, stats: Stats) {
+        self.transcript = transcript;
+        self.stats = stats;
+        self.view_dirty = true;
+    }
+
+    /// The visible tab shows `session_id`, whose attach is deferred (a burst
+    /// of tab switches attaches once): OPENING meanwhile, a click on it is
+    /// a no-op.
+    pub fn showing(&mut self, session_id: &str) {
+        self.wanted = None;
+        self.wanted_session = Some(session_id.to_string());
+        self.wanted_fact = self.sessions.iter().find(|s| s.id == session_id).map(|s| self.fact(s));
+        self.rail_gen += 1;
+    }
+
+    /// If a tab's session ended since the last list: its journal, resumed
+    /// in the tab instead (a named one's as its row would; else what the
+    /// tab last saw listed).
+    pub fn tab_fallback(&self, session_id: &str) -> Option<ResumeRequest> {
+        self.journal_of(session_id).or_else(|| {
+            let t = self.tabs.iter().find(|t| t.session.as_deref() == Some(session_id))?;
+            let target = t.journal.clone()?;
+            Some(ResumeRequest { label: t.label.clone(), target, cwd: t.cwd.clone(), by_name: false })
+        })
+    }
+
     /// A local session (benches): its events carry [`LOCAL_SEQ`].
     pub fn set_local_session(&mut self, session_id: &str) {
         self.wanted = Some(LOCAL_SEQ);
         self.wanted_session = Some(session_id.into());
+        self.tabs.attached(session_id);
         self.epoch += 1;
         self.active = Some(Active {
             session_id: session_id.into(),
@@ -855,11 +988,48 @@ impl Model {
         }
     }
 
+    /// An event of an attachment a tab switch left, while it still has
+    /// input unconfirmed: an echo confirms it, a refusal gives the oldest
+    /// back, the end gives back the rest (to that tab's draft). `None`:
+    /// not one of those.
+    fn left_event(&mut self, ev: &Event) -> Option<Vec<Effect>> {
+        let seq = ev.attach_seq().filter(|&s| !self.current(s))?;
+        let i = self.left.iter().position(|l| l.0 == seq)?;
+        let mut effects = Vec::new();
+        let (_, session, texts) = &mut self.left[i];
+        let mut give = |t: String| effects.push(Effect::Unsent { session: session.clone(), text: t });
+        match ev {
+            Event::Session {
+                event: SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. }, ..
+            } => {
+                if let Some(k) = texts.iter().position(|s| s.trim() == t.trim()) {
+                    texts.remove(k);
+                }
+            }
+            Event::Error { error, .. } if refused_input(error) => {
+                if let Some(t) = texts.pop_front() {
+                    give(t);
+                }
+            }
+            Event::Detached { .. } if !texts.is_empty() => give(Vec::from(std::mem::take(texts)).join("\n")),
+            _ => {}
+        }
+        if self.left[i].2.is_empty() || matches!(ev, Event::Detached { .. }) {
+            self.left.remove(i);
+        }
+        Some(effects)
+    }
+
     /// Apply one event.
     pub fn apply(&mut self, ev: Event) -> Vec<Effect> {
+        if let Some(effects) = self.left_event(&ev) {
+            return effects;
+        }
         let mut effects = Vec::new();
         let ev = match ev {
             Event::Sessions(mut s) => {
+                self.lists += 1;
+                self.sessions_listed = true;
                 sort_sessions(&mut s);
                 // The poll of an idle daemon: nothing to rebuild or draw.
                 if s == self.sessions {
@@ -930,6 +1100,7 @@ impl Model {
                     }
                 }
                 self.seen.retain(|id, _| s.iter().any(|n| n.id == *id));
+                self.tabs.listed(&s);
                 // A row leaving OPEN (closed, or evicted to history).
                 let left = self.sessions.iter().any(|o| !s.iter().any(|n| n.id == o.id));
                 self.sessions = s;
@@ -1060,6 +1231,9 @@ impl Model {
                     mode,
                 });
                 self.wanted_session = Some(attached.meta.id.clone());
+                // The visible tab holds what attached (a create or a resume
+                // names it here).
+                self.tabs.attached(&attached.meta.id);
                 // Whatever was answered belongs to the attachment before.
                 self.answered.clear();
                 self.reattaching = false;
@@ -1110,7 +1284,7 @@ impl Model {
                     && reason == UNKNOWN_SESSION
                 {
                     let open = n.opening.as_mut().filter(|o| o.attach_seq == Some(attach_seq)).map(|o| o.attach_seq = None).is_some();
-                    effects.push(Effect::Resume { req, open });
+                    effects.push(Effect::Resume { req, open, place: Place::Current });
                     return effects;
                 }
                 let opening = n.opening.take_if(|o| o.attach_seq == Some(attach_seq));
@@ -1139,9 +1313,7 @@ impl Model {
                 if answer || matches!(&error, Error::Refused { command: None, .. }) {
                     self.answered.clear();
                 }
-                let input = !answer && matches!(&error, Error::Refused { command: None, .. } | Error::NotAttached { .. })
-                    || matches!(&error, Error::Refused { command: Some(c), .. } if c == "submit" || c == "steer");
-                if input {
+                if refused_input(&error) {
                     self.give_back_oldest(&mut effects);
                 }
                 self.last_error = Some(error.to_string());
@@ -1200,6 +1372,26 @@ mod tests {
     fn attach(m: &mut Model, seq: u64) {
         m.want(seq);
         m.apply(Event::Attached { attach_seq: seq, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
+    }
+
+    /// L2: leaving a tab drops the resume, the fallback attach and the
+    /// Open by name that were that attachment's (closing the last tab
+    /// mid-resume would otherwise leave its row OPENING and unclickable);
+    /// an Open by name not sent yet stays.
+    #[test]
+    fn leaving_a_tab_drops_what_its_attachment_had_in_flight() {
+        let req = |t: &str| ResumeRequest { label: t.into(), target: t.into(), cwd: None, by_name: false };
+        let opening = |attach_seq| Opening { name: "n".into(), attach_seq, asked_saved: false, place: Place::Current };
+        let mut m = Model::new(ConnState::Connecting);
+        attach(&mut m, 1);
+        m.named.resuming = Some(Resuming { req: req("j"), attach_seq: 2 });
+        m.named.attaching = Some((2, req("k")));
+        m.named.opening = Some(opening(Some(2)));
+        let _ = m.switch_out();
+        assert!(m.named.resuming.is_none() && m.named.attaching.is_none() && m.named.opening.is_none());
+        m.named.opening = Some(opening(None));
+        let _ = m.switch_out();
+        assert!(m.named.opening.is_some(), "not sent yet: still to open");
     }
 
     #[test]
@@ -1376,9 +1568,13 @@ mod tests {
         let fx = m.find_enter("kite", &[at("l1"), at("l2")]);
         assert!(matches!(fx.as_slice(), [Effect::Attach { session_id, open: true, .. }] if session_id == "l1"), "exact: {fx:?}");
         let fx = m.find_enter("axel", &[]);
-        assert!(matches!(fx.as_slice(), [Effect::Resume { req, open: true }] if req.target == "j-axel"), "exact, saved: {fx:?}");
+        assert!(matches!(fx.as_slice(), [Effect::Resume { req, open: true, .. }] if req.target == "j-axel"), "exact, saved: {fx:?}");
         let smoke = req("Smoke tests", "j-t", None);
-        assert_eq!(m.find_enter("smoke", &[RowAction::Resume(smoke.clone())]), [Effect::Resume { req: smoke, open: false }], "single");
+        assert_eq!(
+            m.find_enter("smoke", &[RowAction::Resume(smoke.clone())]),
+            [Effect::Resume { req: smoke, open: false, place: Place::Current }],
+            "single"
+        );
         assert!(m.find_enter("kit", &[at("l1"), at("l2")]).is_empty(), "ambiguous");
         assert_eq!(m.named.error.as_deref(), Some("2 sessions match 'kit': click one, or type its exact name."));
         assert_eq!(m.find_enter("ghost", &[]), [ASK_RECENT], "none: asked once more");
@@ -1389,7 +1585,7 @@ mod tests {
 
         let mut m = Model::new(ConnState::Connecting);
         m.apply(connected(&["owned_sessions"]));
-        let by_name = |n: &str| Effect::Resume { req: ResumeRequest { by_name: true, ..req_(n) }, open: true };
+        let by_name = |n: &str| Effect::Resume { req: ResumeRequest { by_name: true, ..req_(n) }, open: true, place: Place::Current };
         assert_eq!(m.find_enter("ghost", &[]), [by_name("ghost")], "no id can contain it");
         assert!(m.find_enter("cafe", &[]).is_empty(), "could be part of an id");
         assert!(m.named.error.as_deref().unwrap().contains("Press Enter again"));
@@ -1824,7 +2020,7 @@ mod tests {
         m.apply(connected(&["saved_sessions"]));
         lists(&mut m, json!([{"id": "j-bebop", "name": "bebop", "cwd": "/home/u/Projects/bebop", "live": false}]));
         let fx = m.open_row(&row_action(&m, "bebop"));
-        let [Effect::Resume { req: bebop, open: false }] = fx.as_slice() else { panic!("{fx:?}") };
+        let [Effect::Resume { req: bebop, open: false, .. }] = fx.as_slice() else { panic!("{fx:?}") };
         assert_eq!(bebop.target, "j-bebop");
         let o = bebop.options();
         assert_eq!((o.cwd, o.fallback_cwd), (Cwd::Path("/home/u/Projects/bebop".into()), Some(Cwd::Home)));
@@ -1891,10 +2087,15 @@ mod tests {
         assert!(m.named.error.as_deref().unwrap().contains("lowercase"));
         assert_eq!(
             m.open_by_name(" live-one "),
-            vec![Effect::Attach { session_id: "l1".into(), fallback: Some(req("live-one", "j-l1", Some("/w"))), open: true }]
+            vec![Effect::Attach {
+                session_id: "l1".into(),
+                fallback: Some(req("live-one", "j-l1", Some("/w"))),
+                open: true,
+                place: Place::Current
+            }]
         );
         assert!(m.named.error.is_none());
-        let want = Effect::Resume { req: req("axel", "20261110-202033-e5f6", Some("/home/u/axel")), open: true };
+        let want = Effect::Resume { req: req("axel", "20261110-202033-e5f6", Some("/home/u/axel")), open: true, place: Place::Current };
         assert_eq!(m.open_by_name("axel"), vec![want.clone()]);
 
         // Part of an id, not a name: asked again, then refused locally.
@@ -1905,7 +2106,7 @@ mod tests {
         // A name made since the last list is in the fresh one.
         assert_eq!(m.open_by_name("new-one"), [ASK_RECENT]);
         let fx = m.apply(saved_list(json!([axel, {"id": "j-new", "name": "new-one", "live": false}])));
-        assert_eq!(fx, [Effect::Resume { req: req("new-one", "j-new", None), open: true }]);
+        assert_eq!(fx, [Effect::Resume { req: req("new-one", "j-new", None), open: true, place: Place::Current }]);
 
         // The outcome: the input clears on `Attached`, not before.
         m.open_by_name("axel");
@@ -1929,7 +2130,7 @@ mod tests {
         assert!(m.open_by_name("fe").is_empty(), "could be part of an id: told first");
         assert!(m.named.error.as_deref().unwrap().contains("Press Enter again"));
         let by_name = ResumeRequest { by_name: true, ..req_("fe") };
-        assert_eq!(m.open_by_name("fe"), vec![Effect::Resume { req: by_name.clone(), open: true }]);
+        assert_eq!(m.open_by_name("fe"), vec![Effect::Resume { req: by_name.clone(), open: true, place: Place::Current }]);
         assert_eq!((by_name.options().cwd, by_name.options().fallback_cwd), (Cwd::Home, None));
         m.resuming(by_name.clone(), 3, true);
         let fx = m.apply(attached_ev(3, attached_named("20261110-202033-64fe", None)));
@@ -1964,11 +2165,11 @@ mod tests {
         )));
         let fx = m.open_row(&row_action(&m, "axel"));
         let fallback = Some(req("axel", "j-axel", Some("/home/u/axel")));
-        assert_eq!(fx, vec![Effect::Attach { session_id: "l3".into(), fallback: fallback.clone(), open: false }]);
+        assert_eq!(fx, vec![Effect::Attach { session_id: "l3".into(), fallback: fallback.clone(), open: false, place: Place::Current }]);
         m.attaching(4, fallback.clone(), false);
         // daemon/conn.rs: `DaemonFrame::Error { message: "unknown session" }`.
         let fx = m.apply(detached(4, "unknown session"));
-        assert_eq!(fx, vec![Effect::Resume { req: fallback.clone().unwrap(), open: false }]);
+        assert_eq!(fx, vec![Effect::Resume { req: fallback.clone().unwrap(), open: false, place: Place::Current }]);
         assert!(m.last_error.is_none());
         // Any other end is reported as before.
         m.attaching(5, fallback, false);
@@ -2223,6 +2424,7 @@ mod fake_daemon {
 
     const A: &str = "20261113-080000-aaaa";
     const B: &str = "20261113-080000-bbbb";
+    const C: &str = "20261113-080000-cccc";
     const T: Duration = Duration::from_secs(10);
 
     struct Conn {
@@ -2416,6 +2618,207 @@ mod fake_daemon {
         client.shutdown().unwrap();
         let on_a = a.cmds(Duration::from_millis(300));
         assert!(!on_a.iter().any(|c| c["cmd"] == "answer"), "{on_a:?}");
+    }
+
+    /// The visible tab's switch, as `AppView::reconcile` does it: the
+    /// session shown goes to the cache, the next one's cached state (or
+    /// nothing) comes in, its attach goes out.
+    fn ui_switch(m: &mut Model, client: &Client, sid: &str, cached: Option<(Transcript, Stats)>) -> (Transcript, Stats) {
+        let left = m.switch_out();
+        let (t, s) = cached.unwrap_or_default();
+        m.switch_in(t, s);
+        ui_attach(m, client, sid);
+        left
+    }
+
+    /// Apply the client's events to `m` until `n` effects match `want`;
+    /// every effect seen is returned.
+    fn effects(m: &mut Model, events: &async_channel::Receiver<Event>, n: usize, want: impl Fn(&Effect) -> bool) -> Vec<Effect> {
+        let until = Instant::now() + T;
+        let mut seen = Vec::new();
+        while seen.iter().filter(|e| want(e)).count() < n {
+            while let Ok(ev) = events.try_recv() {
+                seen.extend(m.apply(ev));
+            }
+            assert!(Instant::now() < until, "timed out; effects so far: {seen:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        seen
+    }
+
+    /// M3: Ctrl+Tab held over three tabs (the press, then 30 Hz repeats for
+    /// 1.5 s) shows each tab at once and sends one attach, for the tab it
+    /// stops on, once it is let go. The app's gate, counted at the daemon.
+    #[test]
+    fn a_held_tab_key_attaches_once_when_let_go() {
+        let (client, events, attaches, mut m) = connect("storm");
+        for s in [A, B, C] {
+            m.tabs.open(s, s, Place::New);
+        }
+        m.tabs.focus(0);
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A));
+        let mut gate = crate::tabs::AttachGate::default();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut waiting = None;
+        for t in std::iter::once(0).chain((0..45).map(|k| 600 + k * 33)) {
+            gate.key_down(at(t));
+            assert!(m.tabs.step(1));
+            let s = m.tabs.visible_session().unwrap().to_string();
+            let _ = m.switch_out();
+            m.switch_in(Transcript::new(), Stats::default());
+            if gate.switch(at(t)) {
+                m.showing(&s);
+                waiting = Some(s);
+            } else {
+                ui_attach(&mut m, &client, &s);
+            }
+            assert!(!gate.ready(at(t + 30)), "nothing is due while the key is held");
+            assert!(!m.can_send(), "nothing drives a tab still opening");
+        }
+        assert!(attaches.recv_timeout(Duration::from_millis(200)).is_err(), "no attach while held");
+        gate.key_up(at(2100));
+        assert!(!gate.ready(at(2200)) && gate.ready(at(2220)));
+        let s = waiting.take().expect("the last switch waited");
+        ui_attach(&mut m, &client, &s);
+        let mut last = attaches.recv_timeout(T).unwrap();
+        assert!(attaches.recv_timeout(Duration::from_millis(300)).is_err(), "one attach for the whole storm");
+        last.send(attached_with_prompt(&s, 1));
+        pump(&mut m, &events, "the last tab attached", |m| m.is_active(&s));
+        assert_eq!(m.tabs.visible_session(), Some(s.as_str()));
+    }
+
+    /// M4: a steer to A, then a switch to B before the daemon answers it; A
+    /// refuses it on the attachment the switch left. It comes back as A's
+    /// (into A's draft), never into the composer B shows.
+    #[test]
+    fn a_send_refused_after_its_tab_was_left_goes_back_to_that_tab() {
+        let (client, events, attaches, mut m) = connect("unsent");
+        m.tabs.open(A, "a", Place::Current);
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
+        client.submit("steer A this way").unwrap();
+        m.sent("steer A this way".into());
+        m.tabs.open(B, "b", Place::New);
+        let _ = ui_switch(&mut m, &client, B, None);
+        a.event(A, 5, json!({"ev": "refused", "client": 2, "command": "submit", "reason": "input is owned by client #1"}));
+        let seen = effects(&mut m, &events, 1, |e| matches!(e, Effect::Unsent { .. }));
+        assert!(seen.contains(&Effect::Unsent { session: A.into(), text: "steer A this way".into() }), "{seen:?}");
+        assert!(!seen.iter().any(|e| matches!(e, Effect::Restore(_))), "nothing for B's composer: {seen:?}");
+        let _b = attaches.recv_timeout(T).unwrap();
+    }
+
+    /// M4: the same send, never echoed nor refused before the attachment
+    /// left ends: given back to A too (the daemon may not have it).
+    #[test]
+    fn a_send_unconfirmed_when_its_attachment_ends_goes_back_to_that_tab() {
+        let (client, events, attaches, mut m) = connect("unsent2");
+        m.tabs.open(A, "a", Place::Current);
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
+        for t in ["one", "two"] {
+            client.submit(t).unwrap();
+            m.sent(t.into());
+        }
+        // "one" is echoed (taken), "two" is not.
+        a.event(A, 5, json!({"ev": "turn_started", "user_text": "one"}));
+        pump(&mut m, &events, "the echo", |m| m.in_flight.len() == 1);
+        m.tabs.open(B, "b", Place::New);
+        let _ = ui_switch(&mut m, &client, B, None);
+        drop(a);
+        let seen = effects(&mut m, &events, 1, |e| matches!(e, Effect::Unsent { .. }));
+        assert_eq!(
+            seen.iter().filter(|e| matches!(e, Effect::Unsent { .. })).collect::<Vec<_>>(),
+            vec![&Effect::Unsent { session: A.into(), text: "two".into() }]
+        );
+        assert!(m.left.is_empty(), "nothing left to follow");
+        let _b = attaches.recv_timeout(T).unwrap();
+    }
+
+    /// Tabs: A (its prompt #1 on screen) in one tab, B (its own prompt #1,
+    /// streaming) in another. However the tabs switch, an answer, a steer
+    /// or a HALT can only reach the visible tab's session once it has
+    /// attached: never the tab left, never the one coming (whose cached
+    /// transcript shows A's old prompt), never a stale card.
+    #[test]
+    fn tabs_never_let_input_reach_a_background_session() {
+        let (client, events, attaches, mut m) = connect("tabs");
+        m.tabs.open(A, "a", Place::Current);
+        ui_attach(&mut m, &client, A);
+        let mut a1 = attaches.recv_timeout(T).unwrap();
+        a1.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.may_answer(1));
+        let a_card = m.card_key().unwrap();
+        // Ctrl+click B: a new tab; A's state goes to the cache.
+        m.tabs.open(B, "b", Place::New);
+        let cached_a = ui_switch(&mut m, &client, B, None);
+        assert_eq!(m.tabs.visible_session(), Some(B));
+        assert!(!m.can_send() && m.card_key().is_none() && !ui_authorize(&mut m, &client, 1), "nothing drives while B attaches");
+        let mut b = attaches.recv_timeout(T).unwrap();
+        let mut b_frame = attached_with_prompt(B, 1);
+        b_frame["streaming"] = json!(true);
+        b.send(b_frame);
+        pump(&mut m, &events, "B attached", |m| m.is_active(B));
+        assert_ne!(m.card_key(), Some(a_card), "B's prompt #1 is another card");
+        assert!(m.can_send(), "B drives (a steer goes to B)");
+        assert!(ui_authorize(&mut m, &client, 1), "B's own prompt");
+        // Back to A's tab: its cached transcript still shows prompt #1.
+        let cached_b = ui_switch(&mut m, &client, A, Some(cached_a));
+        assert_eq!(m.transcript.pending_prompts().len(), 1, "the cache shows at once");
+        assert!(!m.can_send() && m.card_key().is_none() && !ui_authorize(&mut m, &client, 1), "a cached card is not answerable");
+        let mut a2 = attaches.recv_timeout(T).unwrap();
+        a2.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached again", |m| m.is_active(A));
+        assert!(m.card_key().is_some_and(|k| k != a_card), "a new epoch: the old card's key never matches");
+        assert!(!m.prompt_answered(1), "B's answer is not A's");
+        assert!(ui_authorize(&mut m, &client, 1));
+        drop(cached_b);
+        client.shutdown().unwrap();
+        let answers = |c: &mut Conn| c.cmds(Duration::from_millis(300)).into_iter().filter(|c| c["cmd"] == "answer").count();
+        assert_eq!(answers(&mut a1), 0, "A's first connection: nothing (its card was never answered)");
+        assert_eq!(answers(&mut b), 1, "B: its own answer, once");
+        assert_eq!(answers(&mut a2), 1, "A: answered on the connection it attached on now");
+    }
+
+    /// Click landing across tabs: the card a switch brings up (a cached
+    /// one, then the attached one) is new and unarmed, so the second click
+    /// of a double-click that switched tabs cannot authorize it, even when
+    /// the other session's prompt has the same id.
+    #[test]
+    fn a_tab_switch_shows_an_unarmed_card() {
+        use crate::app::PromptCard;
+        let (client, events, attaches, mut m) = connect("tab-arm");
+        m.tabs.open(A, "a", Place::Current);
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.may_answer(1));
+        let mut card = None;
+        let long_ago = Instant::now() - Duration::from_secs(5);
+        assert!(PromptCard::sync(&mut card, &m, long_ago));
+        assert!(card.as_ref().unwrap().armed(), "A's card has been up for 5 s");
+        // A click switches to B's tab (the view drops its card on a switch);
+        // B's prompt #1 attaches.
+        m.tabs.open(B, "b", Place::New);
+        let _cached_a = ui_switch(&mut m, &client, B, None);
+        card = None;
+        assert!(!PromptCard::sync(&mut card, &m, Instant::now()) && card.is_none(), "no card while B attaches");
+        let mut b = attaches.recv_timeout(T).unwrap();
+        b.send(attached_with_prompt(B, 1));
+        pump(&mut m, &events, "B attached", |m| m.is_active(B) && m.may_answer(1));
+        assert!(PromptCard::sync(&mut card, &m, Instant::now()), "B's prompt #1 is a new card");
+        let c = card.as_ref().unwrap();
+        assert!(!c.armed(), "unarmed: the double-click's second click lands on nothing");
+        assert!(!crate::app::authorize_ready(c.armed(), Some(0.), true));
+        client.shutdown().unwrap();
+        drop((a, b));
     }
 
     /// H2: an answer the daemon refused does not leave the card stuck at

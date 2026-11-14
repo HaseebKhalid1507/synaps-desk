@@ -178,7 +178,7 @@ pub fn tool_result_outcome(block: &Value) -> ToolOutcome {
     tool_outcome(&result_text(block.get("content").unwrap_or(&Value::Null)), is_error)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolCall {
     pub tool_id: String,
     pub name: String,
@@ -263,6 +263,8 @@ pub struct Transcript {
     swapped: bool,
     dirty_from: Option<usize>,
     clean_len: usize,
+    /// The rows a rebuild took out, until [`Transcript::keep_revs`].
+    before: Vec<Item>,
 }
 
 impl Transcript {
@@ -366,7 +368,8 @@ impl Transcript {
         self.mark(ix);
     }
 
-    /// Take every row, split into notes (kept) and reusable ids.
+    /// Take every row, split into notes (kept) and reusable ids; the rows
+    /// themselves are kept in `self.before` for [`Transcript::keep_revs`].
     fn take_rows(&mut self, from: usize) -> (Vec<Item>, Reuse) {
         self.mark(from);
         self.tools.retain(|_, ix| *ix < from);
@@ -377,9 +380,32 @@ impl Transcript {
                 notes.push(it);
             } else {
                 reuse.push_back((it.kind, it.id, it.rev));
+                self.before.push(it);
             }
         }
         (notes, reuse)
+    }
+
+    /// Rows rebuilt from history (an attach, a history append or replace)
+    /// that came out exactly as they were keep their old `rev`: a UI's
+    /// strings and measured heights for `(id, rev)` stay valid, so a
+    /// re-attach redraws only what changed. A row that differs keeps the
+    /// newer `rev`, which is past every one it had.
+    fn keep_revs(&mut self) {
+        if self.before.is_empty() {
+            return;
+        }
+        let before: HashMap<u64, Item> = std::mem::take(&mut self.before).into_iter().map(|i| (i.id, i)).collect();
+        for it in self.items.iter_mut().filter(|i| i.anchor.is_none()) {
+            if let Some(o) = before.get(&it.id)
+                && o.kind == it.kind
+                && o.streaming == it.streaming
+                && o.text == it.text
+                && o.tool == it.tool
+            {
+                it.rev = o.rev;
+            }
+        }
     }
 
     /// Replace everything with an attach snapshot (`Attached`), then replay
@@ -391,8 +417,8 @@ impl Transcript {
         }
         let same = self.session_id.as_deref() == Some(a.meta.id.as_str());
         let (notes, mut reuse) = if same { self.take_rows(0) } else { (Vec::new(), Reuse::new()) };
-        let (next_id, clean_len) = (self.next_id, self.clean_len);
-        *self = Transcript { next_id, clean_len, session_id: Some(a.meta.id.clone()), ..Transcript::default() };
+        let (next_id, clean_len, before) = (self.next_id, self.clean_len, std::mem::take(&mut self.before));
+        *self = Transcript { next_id, clean_len, before, session_id: Some(a.meta.id.clone()), ..Transcript::default() };
         self.dirty_from = Some(0);
         self.title = a.meta.title.clone().or_else(|| a.conversation.header.get("title").and_then(Value::as_str).map(str::to_string));
         self.cost_usd = a.conversation.cost;
@@ -408,6 +434,7 @@ impl Transcript {
             self.busy = false;
             self.settle();
         }
+        self.keep_revs();
         Ok(())
     }
 
@@ -454,6 +481,7 @@ impl Transcript {
         if !self.busy {
             self.settle();
         }
+        self.keep_revs();
     }
 
     /// Rebuild from a whole history (resync, rewrite, clear, compaction).
@@ -475,6 +503,7 @@ impl Transcript {
         if !self.busy {
             self.settle();
         }
+        self.keep_revs();
     }
 
     /// Fold a whole history from empty, interleaving `notes` by anchor.
