@@ -414,7 +414,16 @@ impl Summaries {
     }
 }
 
-/// How the centre pane is laid out this frame (from its width).
+/// The centre pane's height (under the full top bar) below which the
+/// window is short: the session header is one row and the chrome around the
+/// transcript gives up its spare padding ([`Layout::short`]). 740 px is a
+/// 792-px window: every 800-px-class laptop screen and a 1080p one at 150 %
+/// are short; 1080p at 125 % (864) and a 900-px MacBook screen keep the full
+/// header. At 740 the full chrome and an authorization card leave the
+/// transcript ~140 px, about five lines.
+pub(crate) const SHORT: f32 = 740.;
+
+/// How the centre pane is laid out this frame (from its size).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Layout {
     /// The column (`min(42 rem, pane − 2 gutters)`).
@@ -423,6 +432,10 @@ pub(crate) struct Layout {
     pub hang: bool,
     /// Under 560 px: the gutter drops to 16, status words and hints go.
     pub tight: bool,
+    /// Under [`SHORT`] tall: a 40-px top bar, a one-row header, an 8-line
+    /// card well, less padding round the composer. Nothing in the list
+    /// changes, so it never remeasures for this.
+    pub short: bool,
     /// The list's left padding: the column centred, whole pixels.
     pub left: f32,
     /// And its right.
@@ -430,12 +443,19 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    pub(crate) fn of(pane: f32, m: &Metrics) -> Self {
+    /// `pane` wide; `height` is the pane's height under the full (52-px)
+    /// top bar, so the short bar cannot flip it back.
+    pub(crate) fn of(pane: f32, height: f32, m: &Metrics) -> Self {
         let tight = pane < 560.;
         let gutter = if tight { 16. } else { 24. };
         let column = m.column.min(pane - 2. * gutter).max(200.).floor();
         let left = ((pane - column) / 2.).floor().max(0.);
-        Layout { column, hang: pane >= (672. + 200.) * m.r, tight, left, right: (pane - column - left).max(0.) }
+        Layout { column, hang: pane >= (672. + 200.) * m.r, tight, short: height < SHORT, left, right: (pane - column - left).max(0.) }
+    }
+
+    /// The session header is one row: a short pane, or a tight one.
+    pub(crate) fn compact(self) -> bool {
+        self.short || self.tight
     }
 
     /// The list's left and right padding (the header, card and composer
@@ -1064,18 +1084,18 @@ mod tests {
     #[test]
     fn the_column_is_capped_and_labels_hang_when_there_is_room() {
         let m = Metrics::at(16);
-        let wide = Layout::of(1988., &m);
+        let wide = Layout::of(1988., 900., &m);
         assert_eq!((wide.column, wide.hang, wide.tight), (672., true, false));
-        assert_eq!(Layout::of(942., &m).column, 672.);
-        assert!(Layout::of(942., &m).hang);
-        assert_eq!((Layout::of(678., &m).column, Layout::of(678., &m).hang), (630., false));
-        assert_eq!((Layout::of(1988., &Metrics::at(18)).column), 756.);
-        let tight = Layout::of(500., &m);
-        assert_eq!((tight.column, tight.tight), (468., true));
+        assert_eq!(Layout::of(942., 900., &m).column, 672.);
+        assert!(Layout::of(942., 900., &m).hang);
+        assert_eq!((Layout::of(678., 900., &m).column, Layout::of(678., 900., &m).hang), (630., false));
+        assert_eq!((Layout::of(1988., 900., &Metrics::at(18)).column), 756.);
+        let tight = Layout::of(500., 900., &m);
+        assert_eq!((tight.column, tight.tight, tight.short), (468., true, false));
         // Dragging a side panel while the column is capped changes only the
         // padding: the list's item width (what its cache is keyed on) holds.
         for pane in [900., 1100., 1318., 1988.] {
-            let l = Layout::of(pane, &m);
+            let l = Layout::of(pane, 900., &m);
             let (a, b) = l.padding();
             assert_eq!(pane - a - b, 672., "{pane}");
             assert!((a - b).abs() <= 1.);
