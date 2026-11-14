@@ -24,6 +24,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -181,6 +182,15 @@ pub enum Command {
         prompt_id: u64,
         value: Option<String>,
     },
+    /// `Answer`, only on connection `connection` (`Attached::connection`):
+    /// after a reconnect it is dropped, never sent, and refused back
+    /// (`Error::Refused { command: "answer" }`). A restarted daemon numbers
+    /// its prompts from 1 again, so the same id may be another prompt.
+    AnswerOn {
+        connection: u64,
+        prompt_id: u64,
+        value: Option<String>,
+    },
     /// Re-fetch the whole history (`Query{Messages}`) → `HistoryUpdate::Replace`.
     Resync,
     /// `SavedSessions` on the control connection → `Event::SavedSessions`.
@@ -208,7 +218,7 @@ impl Command {
             Command::Submit { .. } => "submit",
             Command::Steer { .. } => "steer",
             Command::Cancel => "cancel",
-            Command::Answer { .. } => "answer",
+            Command::Answer { .. } | Command::AnswerOn { .. } => "answer",
             Command::Resync => "query",
             Command::SavedSessions { .. } => "saved_sessions",
             Command::Rename { .. } => "rename",
@@ -230,6 +240,12 @@ impl std::fmt::Debug for Command {
             Command::Answer { prompt_id, .. } => {
                 f.debug_struct("Answer").field("prompt_id", prompt_id).field("value", &format_args!("<redacted>")).finish()
             }
+            Command::AnswerOn { connection, prompt_id, .. } => f
+                .debug_struct("AnswerOn")
+                .field("connection", connection)
+                .field("prompt_id", prompt_id)
+                .field("value", &format_args!("<redacted>"))
+                .finish(),
             Command::SavedSessions { named_only, limit } => {
                 f.debug_struct("SavedSessions").field("named_only", named_only).field("limit", limit).finish()
             }
@@ -633,9 +649,18 @@ impl Client {
         self.send(Command::Cancel)
     }
 
-    /// Answer a prompt (`None` cancels it).
+    /// Answer a prompt (`None` cancels it), on whatever connection is up
+    /// when the connection thread gets to it. Prefer [`Client::answer_on`].
     pub fn answer(&self, prompt_id: u64, value: Option<String>) -> Result<(), ClientClosed> {
         self.send(Command::Answer { prompt_id, value })
+    }
+
+    /// Answer a prompt of the snapshot or events that came on `connection`
+    /// (`Attached::connection`). If the session has reconnected since (a
+    /// reload, a restarted daemon), the answer is dropped, never sent, and
+    /// comes back as `Error::Refused { command: "answer" }`.
+    pub fn answer_on(&self, connection: u64, prompt_id: u64, value: Option<String>) -> Result<(), ClientClosed> {
+        self.send(Command::AnswerOn { connection, prompt_id, value })
     }
 
     /// Re-fetch the whole history: an `Event::History` with a `Replace`.
@@ -669,6 +694,8 @@ struct Shared {
     endpoint: Endpoint,
     identity: Identity,
     events: Events,
+    /// The last `Attached::connection` handed out.
+    connections: Arc<AtomicU64>,
 }
 
 enum Ctl {
@@ -734,7 +761,7 @@ struct Exit {
 }
 
 async fn run(options: ClientOptions, mut rx: mpsc::UnboundedReceiver<Msg>, events: Events, features: Features) {
-    let sh = Shared { endpoint: options.endpoint, identity: options.identity, events };
+    let sh = Shared { endpoint: options.endpoint, identity: options.identity, events, connections: Arc::default() };
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let control = tokio::spawn(control_loop(sh.clone(), ctl_rx, options.poll_sessions, features));
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(u64, Exit)>();
@@ -1164,7 +1191,7 @@ async fn session_loop(
             }
             return detached(session_id);
         };
-        let (mut conn, attached) = match res {
+        let (mut conn, mut attached) = match res {
             Attempt::Attached(c, a) => (c, a),
             Attempt::Fatal(reason) => {
                 // The folder is gone on the daemon's machine: nothing was
@@ -1214,6 +1241,8 @@ async fn session_loop(
             cmd: SessionCommand::Query { id: query_id, query: SessionQuery::Messages },
         };
         let rejected = attached.rejected;
+        let connection = sh.connections.fetch_add(1, Ordering::Relaxed) + 1;
+        attached.connection = connection;
         emit(&events, Event::Attached { attach_seq, attached, mode, reconnect: previous.is_some() });
         if rejected.total() > 0 {
             emit_error(&events, Some(attach_seq), Error::Decode(DecodeError { kind: "attached".into(), error: rejected.to_string() }));
@@ -1237,6 +1266,14 @@ async fn session_loop(
                         Command::Steer { text } => SessionCommand::Steer { text },
                         Command::Cancel => SessionCommand::Cancel,
                         Command::Answer { prompt_id, value } => SessionCommand::Answer { prompt_id, value },
+                        Command::AnswerOn { connection: c, prompt_id, value } if c == connection => SessionCommand::Answer { prompt_id, value },
+                        Command::AnswerOn { .. } => {
+                            emit_error(&events, Some(attach_seq), Error::Refused {
+                                command: Some(name.into()),
+                                reason: "the prompt was raised before the session reconnected; not sent".into(),
+                            });
+                            continue;
+                        }
                         Command::Resync if mirror.is_some() && resync.is_none() => {
                             resync = Some(None);
                             SessionCommand::Query { id: query_id, query: SessionQuery::Messages }

@@ -729,6 +729,12 @@ pub struct Attached {
     /// also reports them as an `Error::Decode`: a skipped prompt is one the
     /// user would otherwise never see.
     pub rejected: Rejected,
+    /// Not on the wire: this client's number for the connection the
+    /// snapshot came on, new on every (re-)attach and never reused by a
+    /// `Client`. Pass it to [`crate::Client::answer_on`] so an answer meant
+    /// for these prompts is never sent on a later connection. 0 when the
+    /// snapshot did not come from a `Client` (decoded by hand).
+    pub connection: u64,
 }
 
 /// Per list, how many entries of an `Attached` snapshot did not decode.
@@ -799,6 +805,7 @@ impl From<RawAttached> for Attached {
             client_input: a.client_input,
             input_owner: a.input_owner,
             rejected: Rejected { pending_prompts: p, clients: c, roster: r },
+            connection: 0,
         }
     }
 }

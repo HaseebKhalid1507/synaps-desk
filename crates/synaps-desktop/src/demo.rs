@@ -101,6 +101,9 @@ fn messages() -> Vec<Value> {
             {"type": "tool_use", "id": "toolu_d4", "name": "write", "input": {"path": p("crates/relay/tests/refresh_race.rs"), "content": TEST}}]}),
         json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d4", "content": "Wrote crates/relay/tests/refresh_race.rs"}]}),
         json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_d4b", "name": "bash", "input": {"command": "rm crates/relay/src/retry.rs && sed -i '/^mod retry;$/d' crates/relay/src/lib.rs"}}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d4b", "content": ""}]}),
+        json!({"role": "assistant", "content": [
             {"type": "text", "text": "Fix is in. The retry band-aid in `Session` is gone and rotation is serialized in the store. The regression test drives 32 concurrent refreshes and asserts upstream rotates exactly once ([RFC 6749 §10.4](https://www.rfc-editor.org/rfc/rfc6749#section-10.4)). Running it needs shell access."},
             {"type": "tool_use", "id": "toolu_d5", "name": "bash", "input": {"command": "cargo test -p relay --test refresh_race"}}]}),
     ]
@@ -174,6 +177,8 @@ mod tests {
         let files: Vec<&str> = s.files.files().iter().map(|f| f.path.as_str()).collect();
         assert_eq!(files, ["crates/relay/src/token_store.rs", "crates/relay/src/session.rs", "crates/relay/tests/refresh_race.rs"]);
         assert!(s.files.preview("toolu_d3").unwrap().removed >= 5);
+        let shell: Vec<(&str, &str)> = s.files.shell().iter().map(|f| (f.path.as_str(), f.verb)).collect();
+        assert_eq!(shell, [("crates/relay/src/retry.rs", "rm"), ("crates/relay/src/lib.rs", "sed -i")]);
         assert_eq!(m.transcript.subagents().len(), 1);
     }
 }

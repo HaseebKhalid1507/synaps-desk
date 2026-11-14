@@ -12,12 +12,18 @@
 //! delta: the old file is unknown), a `multi_edit` regex or line-prefix
 //! anchor is shown as the pattern, `{{placeholders}}` are not expanded, and
 //! an input an extension rewrote shows as the model sent it.
+//!
+//! Apart from those, and never added to their counts: the files successful
+//! `bash` calls wrote, as far as their command text says ([`crate::shell`]),
+//! without line counts.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
 use synaps_client::transcript::{ToolOutcome, tool_result_outcome};
+
+use crate::shell::{self, Touch};
 
 /// Lines a preview keeps (the rest is counted in `more`).
 pub const PREVIEW_LINES: usize = 48;
@@ -90,15 +96,37 @@ pub struct FileStat {
     pub removed: u32,
     /// Lines of the last `write` of it (0: never written whole).
     pub written: u32,
+    /// `added` / `removed` include an estimate (an edit too large to
+    /// count exactly, see [`changed_lines`]): shown with `~`.
+    pub approx: bool,
+}
+
+/// A file a successful `bash` call wrote, by its command text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellFile {
+    /// Relative to the session's folder when under it.
+    pub path: String,
+    /// The last way a command touched it ([`Touch::verb`]).
+    pub verb: &'static str,
+}
+
+impl ShellFile {
+    pub fn split(&self) -> (&str, &str) {
+        split_path(&self.path)
+    }
+}
+
+fn split_path(path: &str) -> (&str, &str) {
+    match path.rfind(['/', '\\']) {
+        Some(i) => path.split_at(i + 1),
+        None => ("", path),
+    }
 }
 
 impl FileStat {
     /// `("crates/relay/src/", "session.rs")`.
     pub fn split(&self) -> (&str, &str) {
-        match self.path.rfind(['/', '\\']) {
-            Some(i) => self.path.split_at(i + 1),
-            None => ("", &self.path),
-        }
+        split_path(&self.path)
     }
 }
 
@@ -109,6 +137,7 @@ struct Change {
     kind: FileKind,
     added: u32,
     removed: u32,
+    approx: bool,
 }
 
 /// One file tool call, analysed once.
@@ -132,9 +161,14 @@ pub struct Ledger {
     /// same session (a resync, a reconnect), so its history is not diffed
     /// again.
     calls: HashMap<String, Arc<Analysed>>,
+    /// `bash` calls that write files, by tool id (kept as `calls` is).
+    shell_calls: HashMap<String, Arc<Vec<Touch>>>,
+    shell: Vec<ShellFile>,
+    shell_index: HashMap<String, usize>,
     cwd: Option<String>,
     added: u32,
     removed: u32,
+    approx: bool,
 }
 
 /// Whether a tool changes files (its row gets a diff).
@@ -146,9 +180,14 @@ impl Ledger {
     /// Start over from a whole history (attach, replacement). `same`: the
     /// same session as before, whose analysed calls are reused.
     pub fn reset(&mut self, messages: &[Value], cwd: Option<&str>, same: bool) {
-        let calls = if same { std::mem::take(&mut self.calls) } else { HashMap::new() };
-        *self =
-            Ledger { cwd: cwd.map(|c| c.trim_end_matches(['/', '\\']).to_string()).filter(|c| !c.is_empty()), calls, ..Ledger::default() };
+        let (calls, shell_calls) =
+            if same { (std::mem::take(&mut self.calls), std::mem::take(&mut self.shell_calls)) } else { Default::default() };
+        *self = Ledger {
+            cwd: cwd.map(|c| c.trim_end_matches(['/', '\\']).to_string()).filter(|c| !c.is_empty()),
+            calls,
+            shell_calls,
+            ..Ledger::default()
+        };
         self.append(messages);
     }
 
@@ -167,10 +206,15 @@ impl Ledger {
                     }
                     Some("tool_result") => {
                         let Some(id) = b.get("tool_use_id").and_then(Value::as_str) else { continue };
-                        if self.pending.remove(id)
-                            && tool_result_outcome(b) == ToolOutcome::Ok
-                            && let Some(call) = self.calls.get(id).cloned()
-                        {
+                        if !self.pending.remove(id) || tool_result_outcome(b) != ToolOutcome::Ok {
+                            continue;
+                        }
+                        if let Some(touches) = self.shell_calls.get(id).cloned() {
+                            for t in touches.iter() {
+                                self.commit_shell(t);
+                            }
+                        }
+                        if let Some(call) = self.calls.get(id).cloned() {
                             let skipped =
                                 if call.ops.is_empty() { Vec::new() } else { skipped_ops(b.get("content").unwrap_or(&Value::Null)) };
                             if skipped.is_empty() {
@@ -193,6 +237,18 @@ impl Ledger {
     /// A tool call: its preview now, its counts once it succeeds. Also for
     /// the live `ToolUse` event (the history repeats it; same id, no double count).
     pub fn tool_use(&mut self, name: &str, id: &str, input: &Value) {
+        if name == "bash" && !id.is_empty() {
+            if !self.shell_calls.contains_key(id) {
+                let touches = shell::writes(str_of(input, "command")).unwrap_or_default();
+                if touches.is_empty() {
+                    return;
+                }
+                let touches = touches.into_iter().map(|t| Touch { path: self.relative(&t.path), ..t }).collect();
+                self.shell_calls.insert(id.to_string(), Arc::new(touches));
+            }
+            self.pending.insert(id.to_string());
+            return;
+        }
         if !is_file_tool(name) || id.is_empty() {
             return;
         }
@@ -225,7 +281,7 @@ impl Ledger {
             Some(&i) => i,
             None => {
                 self.index.insert(c.path.clone(), self.files.len());
-                self.files.push(FileStat { path: c.path.clone(), kind: c.kind, added: 0, removed: 0, written: 0 });
+                self.files.push(FileStat { path: c.path.clone(), kind: c.kind, added: 0, removed: 0, written: 0, approx: false });
                 self.files.len() - 1
             }
         };
@@ -235,10 +291,33 @@ impl Ledger {
             FileKind::Modified => {
                 f.added += c.added;
                 f.removed += c.removed;
+                f.approx |= c.approx;
                 self.added += c.added;
                 self.removed += c.removed;
+                self.approx |= c.approx;
             }
         }
+    }
+
+    fn commit_shell(&mut self, t: &Touch) {
+        match self.shell_index.get(&t.path) {
+            Some(&i) => self.shell[i].verb = t.verb,
+            None => {
+                self.shell_index.insert(t.path.clone(), self.shell.len());
+                self.shell.push(ShellFile { path: t.path.clone(), verb: t.verb });
+            }
+        }
+    }
+
+    /// Files successful `bash` calls wrote, first touched first: apart
+    /// from [`Ledger::files`], and never in [`Ledger::totals`].
+    pub fn shell(&self) -> &[ShellFile] {
+        &self.shell
+    }
+
+    /// The totals include an estimate ([`FileStat::approx`]).
+    pub fn approx(&self) -> bool {
+        self.approx
     }
 
     pub fn preview(&self, tool_id: &str) -> Option<Arc<Preview>> {
@@ -290,8 +369,8 @@ fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>, Vec<(usize, Chan
     match name {
         "edit" => {
             let path = str_of(input, "path");
-            let (a, r) = diff_into(&mut p, str_of(input, "old_string"), str_of(input, "new_string"));
-            changes.push(Change { path: path.into(), kind: FileKind::Modified, added: a, removed: r });
+            let (a, r, approx) = diff_into(&mut p, str_of(input, "old_string"), str_of(input, "new_string"));
+            changes.push(Change { path: path.into(), kind: FileKind::Modified, added: a, removed: r, approx });
         }
         "write" => {
             let content = str_of(input, "content");
@@ -300,7 +379,7 @@ fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>, Vec<(usize, Chan
                 push(&mut p, LineKind::Add, l);
             }
             p.added += n;
-            changes.push(Change { path: str_of(input, "path").into(), kind: FileKind::Written, added: n, removed: 0 });
+            changes.push(Change { path: str_of(input, "path").into(), kind: FileKind::Written, added: n, removed: 0, approx: false });
         }
         "multi_edit" => {
             let mut last_path = "";
@@ -311,7 +390,7 @@ fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>, Vec<(usize, Chan
                     last_path = path;
                 }
                 let text = str_of(e, "text");
-                let (a, r) = match (str_of(e, "op"), str_of(e, "anchor_mode")) {
+                let (a, r, approx) = match (str_of(e, "op"), str_of(e, "anchor_mode")) {
                     ("replace", "" | "exact") => diff_into(&mut p, str_of(e, "anchor"), text),
                     // A pattern, not the text it replaces: show it as such.
                     ("replace", mode) => {
@@ -321,7 +400,7 @@ fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>, Vec<(usize, Chan
                     ("append_jsonl", _) => {
                         push(&mut p, LineKind::Add, "{…}");
                         p.added += 1;
-                        (1, 0)
+                        (1, 0, false)
                     }
                     _ => diff_into(&mut p, "", text),
                 };
@@ -329,10 +408,11 @@ fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>, Vec<(usize, Chan
                     Some(c) => {
                         c.added += a;
                         c.removed += r;
+                        c.approx |= approx;
                     }
-                    None => changes.push(Change { path: path.into(), kind: FileKind::Modified, added: a, removed: r }),
+                    None => changes.push(Change { path: path.into(), kind: FileKind::Modified, added: a, removed: r, approx }),
                 }
-                ops.push((i, Change { path: path.into(), kind: FileKind::Modified, added: a, removed: r }));
+                ops.push((i, Change { path: path.into(), kind: FileKind::Modified, added: a, removed: r, approx }));
             }
         }
         _ => {}
@@ -352,8 +432,9 @@ fn push(p: &mut Preview, kind: LineKind, text: &str) {
     p.lines.push(DiffLine { kind, text: t.into() });
 }
 
-/// Append the line diff `old` → `new` to `p`; returns (added, removed).
-fn diff_into(p: &mut Preview, old: &str, new: &str) -> (u32, u32) {
+/// Append the line diff `old` → `new` to `p`; returns (added, removed,
+/// whether those are an estimate).
+fn diff_into(p: &mut Preview, old: &str, new: &str) -> (u32, u32, bool) {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
     let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
@@ -370,7 +451,7 @@ fn diff_into(p: &mut Preview, old: &str, new: &str) -> (u32, u32) {
         push(p, LineKind::Note, "too long to align: the old lines, then the new");
     }
     let ops = middle(am, bm);
-    let (mut added, mut removed) = (0, 0);
+    let (mut added, mut removed, mut approx) = (0, 0, false);
     for (kind, l) in ops {
         match kind {
             LineKind::Add => added += 1,
@@ -380,7 +461,7 @@ fn diff_into(p: &mut Preview, old: &str, new: &str) -> (u32, u32) {
         push(p, kind, l);
     }
     if !aligned {
-        (added, removed) = changed_lines(am, bm);
+        (added, removed, approx) = changed_lines(am, bm);
     }
     for l in &a[a.len() - suf..][..suf.min(CONTEXT)] {
         push(p, LineKind::Context, l);
@@ -390,14 +471,15 @@ fn diff_into(p: &mut Preview, old: &str, new: &str) -> (u32, u32) {
     }
     p.added += added;
     p.removed += removed;
-    (added, removed)
+    (added, removed, approx)
 }
 
 /// Lines added and removed by the shortest edit `a` → `b`: Myers'
 /// O((N+M)·D) greedy search, within [`COUNT_WORK`]; past it, the lines of
-/// each that the other lacks, counted as multisets (exact for pure inserts
-/// and deletes, a lower bound when lines also move).
-fn changed_lines(a: &[&str], b: &[&str]) -> (u32, u32) {
+/// each that the other lacks, counted as multisets: a lower bound when
+/// lines also move, so flagged as an estimate (the last value) unless the
+/// two share no line at all (then every line was replaced: exact).
+fn changed_lines(a: &[&str], b: &[&str]) -> (u32, u32, bool) {
     let (n, m) = (a.len(), b.len());
     let max_d = (COUNT_WORK / (n + m).max(1)).min(n + m);
     // `v[off + k]`: the furthest `x` on diagonal `k = x - y`.
@@ -416,7 +498,7 @@ fn changed_lines(a: &[&str], b: &[&str]) -> (u32, u32) {
             if x as usize >= n && y as usize >= m {
                 // added - removed = m - n, added + removed = d.
                 let d = d as usize;
-                return (((d + m - n) / 2) as u32, ((d + n - m) / 2) as u32);
+                return (((d + m - n) / 2) as u32, ((d + n - m) / 2) as u32, false);
             }
         }
     }
@@ -435,7 +517,7 @@ fn changed_lines(a: &[&str], b: &[&str]) -> (u32, u32) {
             added += (-c) as u32;
         }
     }
-    (added, removed)
+    (added, removed, removed as usize != n)
 }
 
 /// The changed middle as an LCS line diff (one removed-then-added block
@@ -499,7 +581,7 @@ mod tests {
         let old = "a\nb\nc\nd\nold1\nold2\ne\nf\ng\nh";
         let new = "a\nb\nc\nd\nnew1\ne\nf\ng\nh";
         let mut p = Preview::default();
-        assert_eq!(diff_into(&mut p, old, new), (1, 2));
+        assert_eq!(diff_into(&mut p, old, new), (1, 2, false));
         let kinds: Vec<LineKind> = p.lines.iter().map(|l| l.kind).collect();
         use LineKind::*;
         assert_eq!(kinds, vec![Note, Context, Context, Del, Del, Add, Context, Context, Note]);
@@ -507,7 +589,7 @@ mod tests {
         assert_eq!(&*p.lines[5].text, "new1");
         // An LCS keeps a moved-around common line as context.
         let mut p = Preview::default();
-        assert_eq!(diff_into(&mut p, "x\nkeep\ny", "keep\nz"), (1, 2));
+        assert_eq!(diff_into(&mut p, "x\nkeep\ny", "keep\nz"), (1, 2, false));
         assert!(p.lines.iter().any(|l| l.kind == Context && &*l.text == "keep"));
     }
 
@@ -524,7 +606,10 @@ mod tests {
         ];
         let mut l = Ledger::default();
         l.reset(&msgs, Some("/w/r/"), false);
-        assert_eq!(l.files(), &[FileStat { path: "src/a.rs".into(), kind: FileKind::Modified, added: 2, removed: 1, written: 0 }]);
+        assert_eq!(
+            l.files(),
+            &[FileStat { path: "src/a.rs".into(), kind: FileKind::Modified, added: 2, removed: 1, written: 0, approx: false }]
+        );
         assert_eq!(l.totals(), (2, 1));
         assert!(l.preview("t2").is_some(), "a failed write still shows what it tried");
         assert!(l.preview("t3").is_none());
@@ -539,7 +624,10 @@ mod tests {
         assert!(l.preview("t5").is_some(), "the live event shows its diff before the history has it");
         assert_eq!(l.files().len(), 1, "but counts only once it succeeded");
         l.append(&[tool_use("t5", "write", json!({"path": "/elsewhere/x.txt", "content": "1\n2\n3"})), result("t5", OK)]);
-        assert_eq!(l.files()[1], FileStat { path: "/elsewhere/x.txt".into(), kind: FileKind::Written, added: 0, removed: 0, written: 3 });
+        assert_eq!(
+            l.files()[1],
+            FileStat { path: "/elsewhere/x.txt".into(), kind: FileKind::Written, added: 0, removed: 0, written: 3, approx: false }
+        );
         // A write is not a delta: not in the totals.
         assert_eq!(l.totals(), (3, 2));
         // A replacement starts over.
@@ -648,7 +736,8 @@ mod tests {
         let old = (0..3000).map(|i| format!("o{i}")).collect::<Vec<_>>().join("\n");
         let new = (0..3000).map(|i| format!("n{i}")).collect::<Vec<_>>().join("\n");
         let mut p = Preview::default();
-        assert_eq!(diff_into(&mut p, &old, &new), (3000, 3000));
+        // No line in common: the multiset count is exact.
+        assert_eq!(diff_into(&mut p, &old, &new), (3000, 3000, false));
     }
 
     /// N1: an edit past the preview's alignment cap still counts what changed,
@@ -662,7 +751,7 @@ mod tests {
         new.insert(80, "one more in the middle".into());
         let (old, new) = (old.join("\n"), new.join("\n"));
         let mut p = Preview::default();
-        assert_eq!(diff_into(&mut p, &old, &new), (3, 2));
+        assert_eq!(diff_into(&mut p, &old, &new), (3, 2, false));
         assert_eq!((p.added, p.removed), (3, 2));
         assert!(p.lines.iter().any(|l| l.kind == LineKind::Note && l.text.starts_with("too long to align")));
         let mut l = Ledger::default();
@@ -684,15 +773,73 @@ mod tests {
             let ops = middle(&a, &b);
             let lcs =
                 (ops.iter().filter(|o| o.0 == LineKind::Add).count() as u32, ops.iter().filter(|o| o.0 == LineKind::Del).count() as u32);
-            assert_eq!(changed_lines(&a, &b), lcs, "{a:?} -> {b:?}");
+            assert_eq!(changed_lines(&a, &b), (lcs.0, lcs.1, false), "{a:?} -> {b:?}");
         }
+    }
+
+    /// P6-2: past the work budget the multiset count is a lower bound (a
+    /// reordered block counts as almost nothing): flagged, never exact.
+    #[test]
+    fn an_estimated_count_is_flagged() {
+        let old: Vec<String> = (0..1500).map(|i| format!("row {i}")).collect();
+        let new: Vec<String> = old.iter().rev().cloned().collect();
+        let (old, new) = (old.join("\n"), new.join("\n"));
+        let mut p = Preview::default();
+        let (a, r, approx) = diff_into(&mut p, &old, &new);
+        assert!(approx, "+{a} -{r} is an estimate");
+        let mut l = Ledger::default();
+        l.append(&[
+            tool_use("big", "edit", json!({"path": "t.md", "old_string": old, "new_string": new})),
+            result("big", OK),
+            tool_use("small", "edit", json!({"path": "u.md", "old_string": "a", "new_string": "b"})),
+            result("small", OK),
+        ]);
+        assert!(l.files()[0].approx && !l.files()[1].approx);
+        assert!(l.approx(), "the totals include it");
+        // The same rows, reordered inside the budget, are exact.
+        let old: Vec<String> = (0..60).map(|i| format!("row {i}")).collect();
+        let new: Vec<String> = old.iter().rev().cloned().collect();
+        let mut p = Preview::default();
+        assert!(!diff_into(&mut p, &old.join("\n"), &new.join("\n")).2);
+    }
+
+    /// `bash` writes: their own list, only after a successful run, never in
+    /// the edit counts.
+    #[test]
+    fn shell_writes_are_listed_apart() {
+        let bash = |id: &str, cmd: &str| tool_use(id, "bash", json!({"command": cmd}));
+        let msgs = vec![
+            bash("b1", "sed -i 's/a/b/' src/a.rs && rm -f /w/r/old.txt"),
+            result("b1", "Tool execution failed: Command failed (exit 1):\nsed: can't read src/a.rs"),
+            bash("b2", "sed -i 's/a/b/' src/a.rs && rm -f /w/r/old.txt"),
+            result("b2", ""),
+            bash("b3", "cargo test > /tmp/t.log 2>&1"),
+            result("b3", OK),
+            bash("b4", "echo $(ls) > \"$OUT\"; ls"),
+            result("b4", OK),
+            bash("b5", "mv src/a.rs src/b.rs"),
+            result("b5", "Canceled by user"),
+        ];
+        let mut l = Ledger::default();
+        l.reset(&msgs, Some("/w/r"), false);
+        let got: Vec<(&str, &str)> = l.shell().iter().map(|f| (f.path.as_str(), f.verb)).collect();
+        assert_eq!(got, [("src/a.rs", "sed -i"), ("old.txt", "rm"), ("/tmp/t.log", ">")]);
+        assert!(l.files().is_empty());
+        assert_eq!(l.totals(), (0, 0));
+        assert!(l.preview("b2").is_none(), "no diff for a shell call");
+        // The live event, then its history copy: listed once, by its last verb.
+        l.tool_use("bash", "b6", &json!({"command": "rm src/a.rs"}));
+        l.append(&[bash("b6", "rm src/a.rs"), result("b6", OK)]);
+        assert_eq!(l.shell().len(), 3);
+        assert_eq!((l.shell()[0].path.as_str(), l.shell()[0].verb), ("src/a.rs", "rm"));
+        assert_eq!(l.shell()[0].split(), ("src/", "a.rs"));
     }
 
     #[test]
     fn junk_inputs_do_not_panic() {
         let mut l = Ledger::default();
         for input in [Value::Null, json!("str"), json!({"path": 3}), json!({"edits": "no"}), json!({"edits": [1, null]})] {
-            for name in ["edit", "write", "multi_edit"] {
+            for name in ["edit", "write", "multi_edit", "bash"] {
                 l.tool_use(name, "j", &input);
             }
         }

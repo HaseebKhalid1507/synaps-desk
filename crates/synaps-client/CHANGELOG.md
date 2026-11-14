@@ -1,5 +1,15 @@
 # synaps-client changelog
 
+## Since cedbdbd
+
+Additive only (PR `polish/layout-backlog`), plus one behaviour fix. Nothing existing changes shape: code that builds `Event::Attached { .. }` or matches `Command` exhaustively (it is `#[non_exhaustive]`) compiles as before.
+
+- New `Attached::connection: u64` (not on the wire; `0` from serde, set by the client): this `Client`'s number for the connection the snapshot came on, new on every attach and every reconnect, never reused. `Attached` is `#[non_exhaustive]`, so no literal elsewhere builds it.
+- New `Command::AnswerOn { connection, prompt_id, value }` and `Client::answer_on(connection, prompt_id, value)`: an `Answer` that is sent only on that connection. Once the session has reconnected (a reload, a restarted daemon that numbers its prompts from 1 again), it is dropped, never sent, and comes back as `Error::Refused { command: Some("answer"), .. }`; while reconnecting it is refused as every command is. `Client::answer` is unchanged (whatever connection is up when the thread gets to it). Its `Debug` redacts the value, as `Answer`'s does. Test: `tests/fake_daemon.rs` `answers_for_an_earlier_connection_are_never_sent`.
+- Behaviour: `tool_outcome` calls an `activate_tools` error `Denied` only for the daemon's refusal, `tool activation requires host confirmation authority` (`HostActivationError::ConfirmationRequired`: the user denied the prompt, the policy is `deny`, or nothing could show one). Every other `tool activation denied: …` (a duplicate id, an already active tool, a digest or provenance error, a guessed id: failures after AUTHORIZE) is `Failed`.
+
+For synaps-avatar (nyx): nothing to change. To make answers airtight, keep `attached.connection` from the last `Event::Attached` and answer with `client.answer_on(connection, id, value)`.
+
 ## Since 2ae846d
 
 No API change. Two behaviour fixes in `transcript::tool_outcome` (PR `fix/review-pr5`):

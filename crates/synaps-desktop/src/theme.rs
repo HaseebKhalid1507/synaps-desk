@@ -490,20 +490,51 @@ pub fn settings_path() -> Option<PathBuf> {
     Some(dir.join("synaps-desktop").join("settings.json"))
 }
 
-/// The saved accent as written (unparsed: [`resolve`] checks it).
-pub fn load_accent(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v.get("accent")?.as_str().map(str::to_string)
+fn load_settings(path: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-/// Save the accent, keeping the file's other keys. A file that is not a
-/// JSON object is kept as `settings.json.bad` (hand edits are not lost),
-/// then replaced. Written to a temporary file of this process (two windows
-/// never share one), flushed to disk, then renamed over the old one (and,
-/// on Unix, the directory synced so the rename survives a crash); the
-/// temporary file never outlives a failure.
+/// The saved accent as written (unparsed: [`resolve`] checks it).
+pub fn load_accent(path: &Path) -> Option<String> {
+    load_settings(path)?.get("accent")?.as_str().map(str::to_string)
+}
+
+/// Save the accent (see [`save_settings`]).
 pub fn save_accent(path: &Path, hex: u32) -> std::io::Result<()> {
+    save_settings(path, &[("accent", serde_json::Value::String(to_hex(hex)))])
+}
+
+/// Which side panels are folded to their strips (`rail_collapsed`,
+/// `right_collapsed` in the settings file; missing or not a boolean: open).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Panels {
+    pub rail_collapsed: bool,
+    pub right_collapsed: bool,
+}
+
+impl Panels {
+    const RAIL: &str = "rail_collapsed";
+    const RIGHT: &str = "right_collapsed";
+}
+
+pub fn load_panels(path: &Path) -> Panels {
+    let v = load_settings(path).unwrap_or_default();
+    let flag = |k: &str| v.get(k).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    Panels { rail_collapsed: flag(Panels::RAIL), right_collapsed: flag(Panels::RIGHT) }
+}
+
+/// Save both panel states (see [`save_settings`]).
+pub fn save_panels(path: &Path, p: Panels) -> std::io::Result<()> {
+    save_settings(path, &[(Panels::RAIL, p.rail_collapsed.into()), (Panels::RIGHT, p.right_collapsed.into())])
+}
+
+/// Set `keys` in the settings file, keeping its other keys. A file that is
+/// not a JSON object is kept as `settings.json.bad` (hand edits are not
+/// lost), then replaced. Written to a temporary file of this process (two
+/// windows never share one), flushed to disk, then renamed over the old
+/// one (and, on Unix, the directory synced so the rename survives a
+/// crash); the temporary file never outlives a failure.
+pub fn save_settings(path: &Path, keys: &[(&str, serde_json::Value)]) -> std::io::Result<()> {
     use std::io::Write;
     let text = std::fs::read_to_string(path).ok();
     let parsed = text.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()).filter(serde_json::Value::is_object);
@@ -514,7 +545,9 @@ pub fn save_accent(path: &Path, hex: u32) -> std::io::Result<()> {
         std::fs::copy(path, path.with_extension("json.bad"))?;
     }
     let mut v = parsed.unwrap_or_else(|| serde_json::json!({}));
-    v["accent"] = serde_json::Value::String(to_hex(hex));
+    for (k, val) in keys {
+        v[*k] = val.clone();
+    }
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     let tmp = path.with_extension(format!("json.{}.{nanos}.tmp", std::process::id()));
     let written = (|| {
@@ -690,6 +723,38 @@ mod tests {
         assert!(left.is_empty(), "{left:?}");
         std::fs::write(&path, r#"{"accent": "garbage"}"#).unwrap();
         assert_eq!(resolve(None, None, load_accent(&path).as_deref()).0, DEFAULT_ACCENT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The panel states share the accent's file: each save keeps the other's
+    /// keys, and anything unreadable means open.
+    #[test]
+    fn panel_states_round_trip_beside_the_accent() {
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-panels-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(load_panels(&path), Panels::default(), "no file: both open");
+        save_accent(&path, 0xf4b400).unwrap();
+        for p in [
+            Panels { rail_collapsed: true, right_collapsed: false },
+            Panels { rail_collapsed: false, right_collapsed: true },
+            Panels { rail_collapsed: true, right_collapsed: true },
+            Panels::default(),
+        ] {
+            save_panels(&path, p).unwrap();
+            assert_eq!(load_panels(&path), p);
+            assert_eq!(load_accent(&path).as_deref(), Some("#f4b400"), "the accent is kept");
+        }
+        save_panels(&path, Panels { rail_collapsed: true, right_collapsed: true }).unwrap();
+        save_accent(&path, 0x2d7bff).unwrap();
+        assert_eq!(load_panels(&path), Panels { rail_collapsed: true, right_collapsed: true }, "the accent's save keeps them");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({"accent": "#2d7bff", "rail_collapsed": true, "right_collapsed": true}));
+        // Hand edits: not a boolean, or not JSON, means open.
+        std::fs::write(&path, r#"{"rail_collapsed": "yes", "right_collapsed": 1}"#).unwrap();
+        assert_eq!(load_panels(&path), Panels::default());
+        std::fs::write(&path, "{not json").unwrap();
+        assert_eq!(load_panels(&path), Panels::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
