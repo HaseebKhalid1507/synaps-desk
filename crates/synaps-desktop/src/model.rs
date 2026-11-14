@@ -311,6 +311,14 @@ pub struct Model {
 
 /// The order OPEN shows: newest conversation first (`created_at`), then by
 /// id. The daemon sends its list in hash-map order.
+/// An empty transcript as the window keeps it: no notices for subagent
+/// starts and ends (each worker shows under its call, [`crate::subagents`]).
+pub fn transcript() -> Transcript {
+    let mut t = Transcript::new();
+    t.set_subagent_notices(false);
+    t
+}
+
 pub fn sort_sessions(s: &mut [SessionMeta]) {
     s.sort_by_cached_key(|m| (Reverse(parse_rfc3339(&m.created_at).unwrap_or(i64::MIN)), Reverse(m.id.clone())));
 }
@@ -332,7 +340,7 @@ impl Model {
             wanted_fact: None,
             answered: HashSet::new(),
             epoch: 0,
-            transcript: Transcript::new(),
+            transcript: transcript(),
             last_error: None,
             reattaching: false,
             in_flight: VecDeque::new(),
