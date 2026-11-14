@@ -79,7 +79,9 @@ pub mod label {
     pub const COST: &str = "C O S T";
     pub const WINDOW: &str = "W I N D O W";
     pub const AGENT: &str = "A G E N T";
-    pub const THINK: &str = "T H I N K";
+    pub const YOU: &str = "Y O U";
+    pub const READY: &str = "R E A D Y";
+    pub const THEME: &str = "T H E M E";
     pub const HALT: &str = "H A L T";
     pub const NAME: &str = "N A M E";
     pub const SEND: &str = "S E N D";

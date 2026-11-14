@@ -25,19 +25,33 @@ pub(crate) const MARK: f32 = 30.;
 /// Context-gauge segments (the folded panel's upright gauge: `STRIP_SEGMENTS`).
 const SEGMENTS: usize = 48;
 const STRIP_SEGMENTS: usize = 24;
+/// The gauge turns `error_color` from here (the TUI's `context_bar_color`).
+const HOT: f64 = 0.75;
 /// Files listed before "+N more".
 const FILES_SHOWN: usize = 40;
 /// The top bar's height: the side panels and their edges start under it.
 const TOP: f32 = 52.;
 /// An edge handle's hit area; its line is 1 px, on the panel's border.
 const EDGE: f32 = 6.;
+/// The theme picker's narrowest width: two columns of theme names.
+const PICKER_MIN: f32 = 340.;
 
-fn kv(key: &'static str, value: impl Into<SharedString>, big: bool, p: &Palette) -> impl IntoElement {
+/// The TUI's `context_bar_color`: `border_active` under 50 %,
+/// `status_streaming` under 75 %, `error_color` above.
+fn gauge_color(ratio: Option<f64>, p: &Palette) -> Hsla {
+    match ratio.unwrap_or(0.) {
+        r if r < 0.5 => p.focus_ch,
+        r if r < HOT => p.run_mark_ch,
+        _ => p.err_mark_ch,
+    }
+}
+
+fn kv(key: &'static str, value: impl Into<SharedString>, big: bool, color: Hsla, p: &Palette) -> impl IntoElement {
     let value = value.into();
-    v_flex().gap(px(5.)).child(display(key, 9.5, p.ink4)).child(if big {
-        display(value, 17., p.ink).into_any_element()
+    v_flex().gap(px(5.)).child(display(key, 9.5, p.dim_ch)).child(if big {
+        display(value, 17., color).into_any_element()
     } else {
-        mono(value, 12.5, p.ink).into_any_element()
+        mono(value, 12.5, color).into_any_element()
     })
 }
 
@@ -90,19 +104,21 @@ impl RailCache {
 }
 
 /// A state's 10 px glyph: one or two axis-aligned rectangles, never a font
-/// glyph (the embedded fonts are subsets). The accent only for NEEDS YOU.
-fn glyph(st: State, p: &Palette) -> Div {
+/// glyph (the embedded fonts are subsets), in the state's theme role
+/// (rail recommendation, section 3): at rest, `muted`, lifted.
+pub(crate) fn glyph(st: State, p: &Palette) -> Div {
     let at = |inset: f32| div().absolute().top(px(inset)).left(px(inset)).size(px(10. - 2. * inset));
     let g = div().relative().size(px(10.)).flex_none();
+    let rest = p.rest_mark;
     match st {
-        State::NeedsYou => g.child(at(0.).border_1().border_color(p.accent)).child(at(3.).bg(p.accent)),
-        State::Running => g.child(at(1.).bg(p.ink)),
-        State::Unread => g.child(at(3.).bg(p.ink)),
-        State::Idle => g.child(at(1.).border_1().border_color(p.ink3)),
-        State::Parked => g.child(div().absolute().left(px(1.)).bottom(px(1.)).w(px(8.)).h(px(2.)).bg(p.ink3)),
-        State::Opening => g.child(at(1.).border_t_1().border_l_1().border_color(p.ink2)),
+        State::NeedsYou => g.child(at(0.).border_1().border_color(p.warn_mark_ch)).child(at(3.).bg(p.warn_mark_ch)),
+        State::Running => g.child(at(1.).bg(p.run_mark_ch)),
+        State::Unread => g.child(at(3.).bg(p.unread_mark_ch)),
+        State::Idle => g.child(at(1.).border_1().border_color(rest)),
+        State::Parked => g.child(div().absolute().left(px(1.)).bottom(px(1.)).w(px(8.)).h(px(2.)).bg(rest)),
+        State::Opening => g.child(at(1.).border_t_1().border_l_1().border_color(p.focus_ch)),
         State::Locked => {
-            g.child(at(1.).border_1().border_color(p.ink3)).child(div().absolute().left(px(1.)).top(px(4.)).w(px(8.)).h(px(2.)).bg(p.ink3))
+            g.child(at(1.).border_1().border_color(rest)).child(div().absolute().left(px(1.)).top(px(4.)).w(px(8.)).h(px(2.)).bg(rest))
         }
         State::Saved => g,
     }
@@ -110,10 +126,11 @@ fn glyph(st: State, p: &Palette) -> Div {
 
 fn word_color(st: State, p: &Palette) -> Hsla {
     match st {
-        State::NeedsYou => p.hi,
-        State::Running => p.ink,
-        State::Locked => p.ink3,
-        _ => p.ink2,
+        State::NeedsYou => p.warn_ch,
+        State::Running => p.run_ch,
+        State::Unread => p.unread_ch,
+        State::Opening => p.open_ch,
+        _ => p.dim_ch,
     }
 }
 
@@ -142,7 +159,7 @@ pub(crate) fn prompt_gist(title: &str, body: &str) -> String {
 }
 
 fn fold(id: &'static str, glyph: &'static str, tip: &'static str, rail: bool, p: &Palette, cx: &Context<AppView>) -> Stateful<Div> {
-    let hover = p.ink4;
+    let hover = p.dim_ch;
     div()
         .id(id)
         .size(px(20.))
@@ -152,9 +169,9 @@ fn fold(id: &'static str, glyph: &'static str, tip: &'static str, rail: bool, p:
         .justify_center()
         .cursor_pointer()
         .border_1()
-        .border_color(p.line2)
+        .border_color(p.edge)
         .hover(move |d| d.border_color(hover))
-        .child(mono(glyph, 12., p.ink3))
+        .child(mono(glyph, 12., p.dim_ch))
         .tooltip(move |window, cx| {
             let t = Tooltip::new(tip);
             if rail { t.action(&ToggleRail, None) } else { t.action(&ToggleRight, None) }.build(window, cx)
@@ -166,10 +183,10 @@ impl AppView {
     /// The connection disc's colour (the mark strip and the folded rail).
     fn conn_disc(&self, p: &Palette) -> Hsla {
         match &self.model.conn {
-            ConnState::Connected(_) => p.accent,
-            _ if self.synthetic => p.accent,
-            ConnState::Connecting | ConnState::Reconnecting => p.ink4,
-            _ => p.line3,
+            ConnState::Connected(_) => p.ready_mark_ch,
+            _ if self.synthetic => p.ready_mark_ch,
+            ConnState::Connecting | ConnState::Reconnecting => p.rest_mark,
+            _ => p.err_mark_ch,
         }
     }
 
@@ -183,7 +200,7 @@ impl AppView {
             .pt(px(20.))
             .pb(px(24.))
             .border_r_1()
-            .border_color(p.line)
+            .border_color(p.hair)
             .child(div().size(px(12.)).rounded_full().bg(disc))
             .child(div().flex_1())
             .child(
@@ -192,7 +209,7 @@ impl AppView {
                     .gap(px(8.))
                     .font_family(fonts::JP)
                     .text_size(px(15.))
-                    .text_color(p.ink3)
+                    .text_color(p.dim_ch)
                     .child(fonts::JP_MARK_1)
                     .child(fonts::JP_MARK_2),
             )
@@ -217,16 +234,16 @@ impl AppView {
             .id("attention")
             .gap(px(12.))
             .items_center()
-            .child(div().size(px(6.)).flex_none().when(on, |d| d.bg(p.accent)).when(!on, |d| d.border_1().border_color(p.ink4)))
-            .child(display(format!("{n}   {}", label::NEED_YOU), 11., if on { p.hi } else { p.ink4 }))
+            .child(div().size(px(6.)).flex_none().when(on, |d| d.bg(p.warn_mark_ch)).when(!on, |d| d.border_1().border_color(p.rest_mark)))
+            .child(display(format!("{n}   {}", label::NEED_YOU), 11., if on { p.warn_ch } else { p.dim_ch }))
             .when_some(first, |d, s| d.child(mono(s.label(), 11., p.ink)))
             .when_some(what.filter(|w| !w.is_empty()), |d, w| {
-                d.child(mono(w, 11., p.ink3).max_w(px(330.)).overflow_hidden().text_ellipsis())
+                d.child(mono(w, 11., p.dim_ch).max_w(px(330.)).overflow_hidden().text_ellipsis())
             })
-            .when(n > 1, |d| d.child(mono(format!("+{}", n - 1), 11., p.ink3)))
+            .when(n > 1, |d| d.child(mono(format!("+{}", n - 1), 11., p.dim_ch)))
             .when_some(jump_to, |d, id| {
                 d.cursor_pointer()
-                    .child(h_flex().ml(px(8.)).gap(px(6.)).child(display(label::JUMP, 10.5, p.ink2)).child(mono("→", 11., p.ink2)))
+                    .child(h_flex().ml(px(8.)).gap(px(6.)).child(display(label::JUMP, 10.5, p.prose_ch)).child(mono("→", 11., p.prose_ch)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         for fx in this.model.open_row(&RowAction::Attach(id.clone())) {
                             this.effect(fx);
@@ -235,12 +252,12 @@ impl AppView {
                     }))
             });
         let (conn, conn_color): (SharedString, Hsla) = match &self.model.conn {
-            _ if self.model.reattaching => ("reattaching".into(), p.ink3),
-            ConnState::Connected(v) => (format!("connected · {v}").into(), p.ink4),
-            ConnState::Connecting => ("connecting".into(), p.ink3),
-            ConnState::Reconnecting => ("reconnecting".into(), p.ink3),
+            _ if self.model.reattaching => ("reattaching".into(), p.dim_ch),
+            ConnState::Connected(v) => (format!("connected · {v}").into(), p.dim_ch),
+            ConnState::Connecting => ("connecting".into(), p.dim_ch),
+            ConnState::Reconnecting => ("reconnecting".into(), p.dim_ch),
             ConnState::Off(e) | ConnState::Incompatible(e) => {
-                (crate::app::one_line(e, 60).into(), if self.synthetic { p.ink4 } else { p.hi })
+                (crate::app::one_line(e, 60).into(), if self.synthetic { p.dim_ch } else { p.err_ch })
             }
         };
         // As in the mock: subagents running, here the attached session's
@@ -254,7 +271,7 @@ impl AppView {
             .pr(px(24.))
             .items_center()
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.hair)
             // Over the open rail: as wide as it.
             .child(
                 h_flex()
@@ -264,8 +281,8 @@ impl AppView {
                     }))
                     .flex_none()
                     .gap(px(14.))
-                    .child(display(label::WORD, 13., p.ink))
-                    .child(display(label::WORD_2, 13., p.ink4)),
+                    .child(display(label::WORD, 13., p.header))
+                    .child(display(label::WORD_2, 13., p.dim_ch)),
             )
             .child(div().flex_1())
             .child(ticker)
@@ -275,15 +292,15 @@ impl AppView {
                     .gap(px(18.))
                     .items_center()
                     .child(mono(conn, 10.5, conn_color).max_w(px(260.)).overflow_hidden().text_ellipsis())
-                    // The accent picker's own control: a swatch of the accent.
+                    // The theme picker's own control: a swatch of the "you" colour.
                     .child(
                         h_flex()
                             .id("accent-picker")
                             .gap(px(8.))
                             .items_center()
                             .cursor_pointer()
-                            .child(div().size(px(10.)).bg(p.accent))
-                            .child(display(label::ACCENT, 10.5, if self.picker_open { p.ink } else { p.ink4 }))
+                            .child(div().size(px(10.)).bg(p.you_bar))
+                            .child(display(label::THEME, 10.5, if self.picker_open { p.ink } else { p.dim_ch }))
                             .hover(|d| d.text_color(p.ink))
                             .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
                                 // The click whose mouse-down closed it from outside does not reopen it.
@@ -302,7 +319,7 @@ impl AppView {
                     )
                     // As in the mock: the attached session's running subagents.
                     .child(
-                        h_flex().gap(px(10.)).items_center().child(display(label::SYSTEMS, 11., p.ink3)).child(
+                        h_flex().gap(px(10.)).items_center().child(display(label::SYSTEMS, 11., p.dim_ch)).child(
                             div()
                                 .min_w(px(18.))
                                 .h(px(18.))
@@ -310,8 +327,8 @@ impl AppView {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .bg(if subagents > 0 { p.ink } else { p.line2 })
-                                .child(mono(subagents.to_string(), 10., if subagents > 0 { p.bg } else { p.ink3 })),
+                                .bg(if subagents > 0 { p.ink } else { p.edge })
+                                .child(mono(subagents.to_string(), 10., if subagents > 0 { p.chrome } else { p.dim_ch })),
                         ),
                     ),
             )
@@ -349,8 +366,8 @@ impl AppView {
                         .bottom_0()
                         .left(px(line))
                         .w(px(1.))
-                        .when(dragged, |d| d.bg(p.ink3))
-                        .when(!dragged, |d| d.group_hover(group, |s| s.bg(p.line3))),
+                        .when(dragged, |d| d.bg(p.dim_ch))
+                        .when(!dragged, |d| d.group_hover(group, |s| s.bg(p.edge))),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
@@ -380,17 +397,17 @@ impl AppView {
             .pt(px(22.))
             .gap(px(18.))
             .border_r_1()
-            .border_color(p.line)
+            .border_color(p.hair)
             .cursor_pointer()
-            .hover(|d| d.bg(p.bg1))
-            .child(mono("›", 12., p.ink3))
+            .hover(|d| d.bg(p.raised))
+            .child(mono("›", 12., p.dim_ch))
             .child(div().size(px(8.)).rounded_full().bg(self.conn_disc(p)))
             .child(
                 v_flex()
                     .items_center()
                     .gap(px(6.))
-                    .child(div().size(px(6.)).when(on, |d| d.bg(p.accent)).when(!on, |d| d.border_1().border_color(p.ink4)))
-                    .child(display(n.to_string(), 13., if on { p.hi } else { p.ink4 })),
+                    .child(div().size(px(6.)).when(on, |d| d.bg(p.warn_mark_ch)).when(!on, |d| d.border_1().border_color(p.rest_mark)))
+                    .child(display(n.to_string(), 13., if on { p.warn_ch } else { p.dim_ch })),
             )
             .tooltip(move |window, cx| {
                 let tip = match (on, fits) {
@@ -407,11 +424,11 @@ impl AppView {
     /// percentage. A click (or Ctrl+Alt+B) opens it again.
     pub(crate) fn render_right_strip(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let ratio = self.model.stats.context_ratio();
-        let hot = ratio.is_some_and(|r| r >= 0.85);
+        let bar = gauge_color(ratio, p);
         let filled = ratio.map(|r| ((r * STRIP_SEGMENTS as f64).round() as usize).min(STRIP_SEGMENTS)).unwrap_or(0);
         let mut gauge = v_flex().w(px(6.)).gap(px(2.));
         for i in (0..STRIP_SEGMENTS).rev() {
-            gauge = gauge.child(div().w_full().h(px(4.)).bg(if i < filled { if hot { p.hi } else { p.accent } } else { p.seg }));
+            gauge = gauge.child(div().w_full().h(px(4.)).bg(if i < filled { bar } else { p.edge }));
         }
         let pct: SharedString = ratio.map(|r| format!("{:.0}", r * 100.0)).unwrap_or_else(|| "—".into()).into();
         let fits = crate::app::toggled(self.width, self.panels, false).is_some();
@@ -426,16 +443,16 @@ impl AppView {
             .pt(px(22.))
             .gap(px(14.))
             .border_l_1()
-            .border_color(p.line)
+            .border_color(p.hair)
             .cursor_pointer()
-            .hover(|d| d.bg(p.bg1))
-            .child(mono("‹", 12., p.ink3))
+            .hover(|d| d.bg(p.raised))
+            .child(mono("‹", 12., p.dim_ch))
             .child(
                 v_flex()
                     .items_center()
                     .gap(px(14.))
                     .when(detached, |d| d.opacity(0.45))
-                    .child(v_flex().items_center().child(display(pct, 13., if hot { p.hi } else { p.ink2 })).child(mono("%", 9., p.ink4)))
+                    .child(v_flex().items_center().child(display(pct, 13., p.prose_ch)).child(mono("%", 9., p.dim_ch)))
                     .child(gauge),
             )
             .tooltip(move |window, cx| {
@@ -452,7 +469,7 @@ impl AppView {
     pub(crate) fn render_rail(&self, width: f32, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let n = &self.model.named;
         let notes: Vec<(&String, Hsla)> =
-            n.error.iter().map(|e| (e, p.hi)).chain(n.notice.iter().chain(n.saved_note.iter()).map(|t| (t, p.ink4))).collect();
+            n.error.iter().map(|e| (e, p.err_ch)).chain(n.notice.iter().chain(n.saved_note.iter()).map(|t| (t, p.dim_ch))).collect();
         // The chips count what is held (the attached session as it runs,
         // ahead of the poll) and the unread history rows.
         let (mut needs, mut running, mut unread) = (0, 0, self.rail.rail.history_unread);
@@ -465,7 +482,7 @@ impl AppView {
             }
         }
         // A chip toggles its filter; none selected shows everything.
-        let mut chips = h_flex().items_center().gap(px(15.)).px(px(22.)).pt(px(13.)).pb(px(12.)).border_b_1().border_color(p.line);
+        let mut chips = h_flex().items_center().gap(px(15.)).px(px(22.)).pt(px(13.)).pb(px(12.)).border_b_1().border_color(p.hair);
         for (c, count) in [(Chip::NeedsYou, needs), (Chip::Running, running), (Chip::Unread, unread)] {
             let on = self.chip == Some(c);
             let tip = match c {
@@ -480,10 +497,19 @@ impl AppView {
                     .gap(px(5.))
                     .pb(px(3.))
                     .border_b_1()
-                    .border_color(if on { p.ink } else { gpui_kit::transparent_black() })
+                    .border_color(if on { p.focus_ch } else { gpui_kit::transparent_black() })
                     .cursor_pointer()
-                    .child(display(c.label(), 10., if on { p.ink } else { p.ink3 }))
-                    .child(mono(count.to_string(), 10., if c == Chip::NeedsYou && count > 0 { p.hi } else { p.ink2 }))
+                    .child(display(c.label(), 10., if on { p.ink } else { p.dim_ch }))
+                    .child(mono(
+                        count.to_string(),
+                        10.,
+                        match c {
+                            _ if count == 0 => p.dim_ch,
+                            Chip::NeedsYou => p.warn_ch,
+                            Chip::Running => p.run_ch,
+                            Chip::Unread => p.unread_ch,
+                        },
+                    ))
                     .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.chip = if this.chip == Some(c) { None } else { Some(c) };
@@ -498,18 +524,18 @@ impl AppView {
             .items_center()
             .gap(px(8.))
             .border_b_1()
-            .border_color(p.line2)
+            .border_color(p.edge)
             .child(
                 div().flex_1().min_w_0().font_family(fonts::MONO).text_size(px(10.5)).child(Input::new(&self.find_input).appearance(false)),
             )
-            .child(div().px(px(5.)).border_1().border_color(p.line2).child(mono("/", 9.5, p.ink4)));
+            .child(div().px(px(5.)).border_1().border_color(p.edge).child(mono("/", 9.5, p.dim_ch)));
         let items = list(self.rail_list.clone(), cx.processor(|this, ix, _window, cx| this.render_rail_item(ix, cx))).size_full();
         v_flex()
             .w(px(width))
             .h_full()
             .flex_none()
             .border_r_1()
-            .border_color(p.line)
+            .border_color(p.hair)
             .child(
                 h_flex()
                     .px(px(22.))
@@ -518,7 +544,7 @@ impl AppView {
                     .child(section(label::SESSIONS, fonts::JP_SESSIONS, p))
                     .child(div().flex_1())
                     .when(self.client.is_some(), |d| {
-                        d.child(tbtn("new", label::NEW, p.ink3, p.ink).on_click(cx.listener(|this, _, _, cx| {
+                        d.child(tbtn("new", label::NEW, p.dim_ch, p.ink).on_click(cx.listener(|this, _, _, cx| {
                             this.create();
                             cx.notify();
                         })))
@@ -552,17 +578,17 @@ impl AppView {
                 .pb(px(7.))
                 .items_baseline()
                 .gap(px(9.))
-                .when(ix > 0, |d| d.border_t_1().border_color(p.line))
-                .child(display(group.label(), 10., p.ink3))
-                .child(div().font_family(fonts::JP).text_size(px(9.5)).text_color(p.ink4).child(group.jp()))
+                .when(ix > 0, |d| d.border_t_1().border_color(p.hair))
+                .child(display(group.label(), 10., p.dim_ch))
+                .child(div().font_family(fonts::JP).text_size(px(9.5)).text_color(p.dim_ch).child(group.jp()))
                 .child(div().flex_1())
-                .child(mono(count, 10., p.ink4))
+                .child(mono(count, 10., p.dim_ch))
                 .into_any_element(),
             Item::Row(r) => self.render_row2(*r, &p, cx),
             Item::Hist(r) => self.render_hist(*r, &p, cx),
             Item::Bucket { bucket, open, count } => {
                 let b = *bucket;
-                let color = if *open { p.ink3 } else { p.ink4 };
+                let color = if *open { p.prose_ch } else { p.dim_ch };
                 h_flex()
                     .id(("bucket", b as usize))
                     .w_full()
@@ -572,11 +598,11 @@ impl AppView {
                     .gap(px(10.))
                     .items_baseline()
                     .cursor_pointer()
-                    .hover(|d| d.bg(p.bg1))
+                    .hover(|d| d.bg(p.raised))
                     .child(div().w(px(10.)).flex_none().child(mono(if *open { "−" } else { "+" }, 11., color)))
                     .child(display(b.label(), 9.5, color))
                     .child(div().flex_1())
-                    .child(mono(count, 10., p.ink4))
+                    .child(mono(count, 10., p.dim_ch))
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_bucket(b, cx)))
                     .into_any_element()
             }
@@ -590,8 +616,8 @@ impl AppView {
                     .pt(px(5.))
                     .pb(px(8.))
                     .cursor_pointer()
-                    .child(display(text, 9.5, p.ink4))
-                    .hover(|d| d.bg(p.bg1))
+                    .child(display(text, 9.5, p.dim_ch))
+                    .hover(|d| d.bg(p.raised))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.expanded |= b.bit();
                         cx.notify();
@@ -605,10 +631,10 @@ impl AppView {
                 .font_family(fonts::MONO)
                 .text_size(px(10.))
                 .line_height(px(15.))
-                .text_color(p.ink4)
+                .text_color(p.dim_ch)
                 .child(SharedString::from(t))
                 .into_any_element(),
-            Item::Empty(t) => div().px(px(22.)).py(px(10.)).text_size(px(12.)).text_color(p.ink4).child(*t).into_any_element(),
+            Item::Empty(t) => div().px(px(22.)).py(px(10.)).text_size(px(12.)).text_color(p.dim_ch).child(*t).into_any_element(),
         }
     }
 
@@ -628,15 +654,15 @@ impl AppView {
         let title_color = match st {
             State::NeedsYou | State::Running | State::Unread => p.ink,
             _ if on => p.ink,
-            State::Parked | State::Locked => p.ink3,
-            _ if row.fresh => p.ink3,
-            _ => p.ink2,
+            State::Parked | State::Locked => p.dim_ch,
+            _ if row.fresh => p.dim_ch,
+            _ => p.prose_ch,
         };
-        let sub_color = if matches!(st, State::Parked | State::Locked) { p.ink4 } else { p.ink3 };
+        let sub_color = p.dim_ch;
         let bar = if st == State::NeedsYou {
-            Some(p.accent)
+            Some(p.warn_mark_ch)
         } else if on {
-            Some(p.ink)
+            Some(p.you_bar)
         } else {
             None
         };
@@ -647,7 +673,7 @@ impl AppView {
                 .items_baseline()
                 .gap(px(5.))
                 .child(display(w, 9.5, word_color(st, p)))
-                .when(st == State::NeedsYou && waiting > 1, |d| d.child(mono(waiting.to_string(), 10., p.hi)))
+                .when(st == State::NeedsYou && waiting > 1, |d| d.child(mono(waiting.to_string(), 10., p.warn_ch)))
         });
         div()
             .id(("rail-row", key as usize))
@@ -657,8 +683,8 @@ impl AppView {
             .pt(px(8.))
             .pb(px(9.))
             .cursor_pointer()
-            .when(on, |d| d.bg(p.bg2))
-            .hover(|d| d.bg(p.bg2))
+            .when(on, |d| d.bg(p.raised))
+            .hover(|d| d.bg(p.raised))
             .when_some(bar, |d, c| d.child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(c)))
             .child(
                 h_flex().gap(px(10.)).items_start().child(glyph(st, p).mt(px(5.))).child(
@@ -683,7 +709,7 @@ impl AppView {
                                         .text_color(title_color)
                                         .child(SharedString::from(&row.title)),
                                 )
-                                .child(mono(&row.age, 10., p.ink4)),
+                                .child(mono(&row.age, 10., p.dim_ch)),
                         )
                         .child(
                             h_flex()
@@ -704,7 +730,7 @@ impl AppView {
                                         .text_color(sub_color)
                                         .child(SharedString::from(&row.sub)),
                                 )
-                                .when_some(cost, |d, c| d.child(mono(format!("${c:.2}"), 10., p.ink3).flex_none())),
+                                .when_some(cost, |d, c| d.child(mono(format!("${c:.2}"), 10., p.cost_ch).flex_none())),
                         ),
                 ),
             )
@@ -724,9 +750,9 @@ impl AppView {
         let key = row.key;
         let title_color = match row.state {
             State::Unread => p.ink,
-            State::Opening => p.ink2,
-            _ if row.named => p.ink2,
-            _ => p.ink3,
+            State::Opening => p.prose_ch,
+            _ if row.named => p.prose_ch,
+            _ => p.dim_ch,
         };
         h_flex()
             .id(("rail-hist", key as usize))
@@ -737,7 +763,7 @@ impl AppView {
             .gap(px(10.))
             .items_center()
             .cursor_pointer()
-            .hover(|d| d.bg(p.bg2))
+            .hover(|d| d.bg(p.raised))
             .child(glyph(row.state, p))
             .child(
                 div()
@@ -751,7 +777,7 @@ impl AppView {
                     .text_color(title_color)
                     .child(SharedString::from(&row.title)),
             )
-            .child(mono(&row.age, 10., p.ink4))
+            .child(mono(&row.age, 10., p.dim_ch))
             .when(self.readout == Some(key), |d| d.child(self.render_readout(row, p)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -776,20 +802,20 @@ impl AppView {
             .px(px(16.))
             .py(px(13.))
             .gap(px(4.))
-            .bg(p.bg1)
+            .bg(p.raised)
             .border_1()
-            .border_color(p.line3)
+            .border_color(p.edge)
             .child(div().text_size(px(12.5)).text_color(p.ink).pb(px(5.)).child(r.title));
         for (k, value, aside) in r.lines {
             body = body.child(
-                h_flex().items_start().child(div().w(px(62.)).flex_none().pt(px(2.)).child(display(k, 9., p.ink4))).child(
+                h_flex().items_start().child(div().w(px(62.)).flex_none().pt(px(2.)).child(display(k, 9., p.dim_ch))).child(
                     v_flex()
                         .flex_1()
                         .min_w_0()
                         .font_family(fonts::MONO)
                         .text_size(px(10.5))
-                        .child(div().text_color(p.ink2).child(value))
-                        .when(!aside.is_empty(), |d| d.child(div().text_color(p.ink4).child(aside))),
+                        .child(div().text_color(p.prose_ch).child(value))
+                        .when(!aside.is_empty(), |d| d.child(div().text_color(p.dim_ch).child(aside))),
                 ),
             );
         }
@@ -806,10 +832,11 @@ impl AppView {
         let window = s.view.as_ref().map(|v| v.context_window).filter(|&w| w > 0);
         let ratio = s.context_ratio();
         let filled = ratio.map(|r| ((r * SEGMENTS as f64).round() as usize).min(SEGMENTS)).unwrap_or(0);
-        let hot = ratio.is_some_and(|r| r >= 0.85);
+        let hot = ratio.is_some_and(|r| r >= HOT);
+        let bar = gauge_color(ratio, p);
         let mut segs = h_flex().gap(px(2.)).h(px(8.)).mt(px(20.));
         for i in 0..SEGMENTS {
-            segs = segs.child(div().flex_1().h_full().bg(if i < filled { if hot { p.hi } else { p.accent } } else { p.seg }));
+            segs = segs.child(div().flex_1().h_full().bg(if i < filled { bar } else { p.edge }));
         }
         let scale: SharedString = match (s.context, window) {
             (Some(c), Some(w)) => format!("{} of {} tokens", compact(c), compact(w)).into(),
@@ -821,7 +848,7 @@ impl AppView {
             .pt(px(24.))
             .pb(px(26.))
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.hair)
             .child(h_flex().items_center().child(section(label::CONTEXT, fonts::JP_CONTEXT, p)).child(div().flex_1()).child(fold(
                 "right-fold",
                 "›",
@@ -840,22 +867,22 @@ impl AppView {
                         Some(r) => h_flex()
                             .items_end()
                             .gap(px(3.))
-                            .child(display(format!("{:.1}", r * 100.0), 46., if hot { p.hi } else { p.ink }).line_height(px(46.)))
-                            .child(display("%", 16., p.ink3).line_height(px(16.)).pb(px(5.)))
+                            .child(display(format!("{:.1}", r * 100.0), 46., if hot { p.err_ch } else { p.ink }).line_height(px(46.)))
+                            .child(display("%", 16., p.dim_ch).line_height(px(16.)).pb(px(5.)))
                             .into_any_element(),
-                        None => display("—", 46., p.ink4).into_any_element(),
+                        None => display("—", 46., p.dim_ch).into_any_element(),
                     })
                     .child(div().flex_1())
                     .when_some(window, |d, w| {
-                        d.child(v_flex().items_end().gap(px(5.)).child(display(label::WINDOW, 9.5, p.ink4)).child(mono(
+                        d.child(v_flex().items_end().gap(px(5.)).child(display(label::WINDOW, 9.5, p.dim_ch)).child(mono(
                             compact(w),
                             12.5,
-                            p.ink2,
+                            p.prose_ch,
                         )))
                     }),
             )
             .child(segs)
-            .child(mono(scale, 9.5, if hot { p.hi } else { p.ink4 }).mt(px(9.)));
+            .child(mono(scale, 9.5, if hot { p.err_ch } else { p.dim_ch }).mt(px(9.)));
         let t = s.tokens;
         let dash = || SharedString::from("—");
         let num = |f: fn(&crate::stats::Tokens) -> u64| t.as_ref().map(|t| SharedString::from(compact(f(t)))).unwrap_or_else(dash);
@@ -866,22 +893,22 @@ impl AppView {
             .pt(px(24.))
             .pb(px(26.))
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.hair)
             .child(section(label::TOKENS, fonts::JP_TOKENS, p))
             .child(
                 h_flex()
                     .mt(px(20.))
-                    .child(div().flex_1().child(kv(label::IN, num(|t| t.input), false, p)))
-                    .child(div().flex_1().child(kv(label::OUT, num(|t| t.output), false, p)))
-                    .child(div().flex_1().child(kv(label::CACHE, num(|t| t.cache_read), false, p)))
-                    .child(div().flex_1().child(kv(label::WRITE, num(|t| t.cache_creation), false, p))),
+                    .child(div().flex_1().child(kv(label::IN, num(|t| t.input), false, p.ink, p)))
+                    .child(div().flex_1().child(kv(label::OUT, num(|t| t.output), false, p.ink, p)))
+                    .child(div().flex_1().child(kv(label::CACHE, num(|t| t.cache_read), false, p.ink, p)))
+                    .child(div().flex_1().child(kv(label::WRITE, num(|t| t.cache_creation), false, p.ink, p))),
             )
-            .child(h_flex().mt(px(22.)).child(div().flex_1().child(kv(label::CACHE_HIT, hit, true, p))).child(div().flex_1().child(kv(
-                label::COST,
-                cost,
-                true,
-                p,
-            ))));
+            .child(
+                h_flex()
+                    .mt(px(22.))
+                    .child(div().flex_1().child(kv(label::CACHE_HIT, hit, true, p.ink, p)))
+                    .child(div().flex_1().child(kv(label::COST, cost, true, p.cost_ch, p))),
+            );
         let ledger = &s.files;
         let (added, removed) = ledger.totals();
         // An estimate is never shown as an exact count (`files::changed_lines`).
@@ -894,14 +921,14 @@ impl AppView {
             .child(h_flex().items_end().child(section(label::FILES, fonts::JP_FILES, p)).child(div().flex_1()).when(
                 added + removed > 0,
                 |d| {
-                    d.child(h_flex().gap(px(8.)).child(mono(format!("{approx}+{added}"), 10.5, p.ink3)).child(mono(
+                    d.child(h_flex().gap(px(8.)).child(mono(format!("{approx}+{added}"), 10.5, p.ok_ch)).child(mono(
                         format!("−{removed}"),
                         10.5,
-                        p.hi,
+                        p.err_ch,
                     )))
                 },
             ))
-            .child(mono("as the model asked: tool inputs, not the disk", 9.5, p.ink4).mt(px(6.)))
+            .child(mono("as the model asked: tool inputs, not the disk", 9.5, p.dim_ch).mt(px(6.)))
             .child(div().h(px(12.)));
         for f in ledger.files().iter().take(FILES_SHOWN) {
             files = files.child(
@@ -909,30 +936,41 @@ impl AppView {
                     .h(px(27.))
                     .gap(px(10.))
                     .items_center()
-                    .child(mono(f.kind.letter(), 10.5, p.ink4).w(px(10.)).flex_none())
+                    .child(
+                        mono(
+                            f.kind.letter(),
+                            10.5,
+                            match f.kind {
+                                crate::files::FileKind::Modified => p.edit_ch,
+                                crate::files::FileKind::Written => p.write_ch,
+                            },
+                        )
+                        .w(px(10.))
+                        .flex_none(),
+                    )
                     .child(
                         h_flex()
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
-                            .child(mono(f.dir.clone(), 11., p.ink4).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
+                            .child(mono(f.dir.clone(), 11., p.dim_ch).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
                             .child(mono(f.name.clone(), 11., p.ink).flex_none()),
                     )
                     // A write is the lines written, not a delta (`~`).
-                    .when(f.written > 0, |d| d.child(mono(format!("~{}", f.written), 10.5, p.ink3).flex_none()))
+                    .when(f.written > 0, |d| d.child(mono(format!("~{}", f.written), 10.5, p.dim_ch).flex_none()))
                     .when(f.added > 0 || f.written == 0, |d| {
-                        d.child(mono(format!("{}+{}", tilde(f.approx), f.added), 10.5, p.ink2).flex_none())
+                        d.child(mono(format!("{}+{}", tilde(f.approx), f.added), 10.5, p.ok_ch).flex_none())
                     })
-                    .when(f.removed > 0, |d| d.child(mono(format!("−{}", f.removed), 10.5, p.hi).flex_none())),
+                    .when(f.removed > 0, |d| d.child(mono(format!("−{}", f.removed), 10.5, p.err_ch).flex_none())),
             );
         }
         let n = ledger.files().len();
         if n > FILES_SHOWN {
-            files = files.child(mono(format!("+{} more files", n - FILES_SHOWN), 10.5, p.ink4).mt(px(6.)));
+            files = files.child(mono(format!("+{} more files", n - FILES_SHOWN), 10.5, p.dim_ch).mt(px(6.)));
         }
         let shell = ledger.shell();
         if n == 0 && shell.is_empty() {
-            files = files.child(div().text_size(px(12.)).text_color(p.ink4).child("No file edits in this session"));
+            files = files.child(div().text_size(px(12.)).text_color(p.dim_ch).child("No file edits in this session"));
         }
         if !shell.is_empty() {
             // Read from `bash` command lines: approximate, no line counts,
@@ -943,10 +981,10 @@ impl AppView {
                         .mt(px(if n == 0 { 0. } else { 18. }))
                         .gap(px(10.))
                         .items_baseline()
-                        .child(display(label::VIA_SHELL, 10., p.ink2))
-                        .child(mono("~", 11., p.ink3)),
+                        .child(display(label::VIA_SHELL, 10., p.prose_ch))
+                        .child(mono("~", 11., p.dim_ch)),
                 )
-                .child(mono("bash commands that succeeded; no counts", 9.5, p.ink4).mt(px(6.)))
+                .child(mono("bash commands that succeeded; no counts", 9.5, p.dim_ch).mt(px(6.)))
                 .child(div().h(px(8.)));
             for f in shell.iter().take(FILES_SHOWN) {
                 files = files.child(
@@ -954,20 +992,20 @@ impl AppView {
                         .h(px(25.))
                         .gap(px(10.))
                         .items_center()
-                        .child(mono("$", 10.5, p.ink4).w(px(10.)).flex_none())
+                        .child(mono("$", 10.5, p.dim_ch).w(px(10.)).flex_none())
                         .child(
                             h_flex()
                                 .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
-                                .child(mono(f.dir.clone(), 11., p.ink4).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
-                                .child(mono(f.name.clone(), 11., p.ink2).flex_none()),
+                                .child(mono(f.dir.clone(), 11., p.dim_ch).flex_shrink(1.).min_w(px(14.)).overflow_hidden().text_ellipsis())
+                                .child(mono(f.name.clone(), 11., p.prose_ch).flex_none()),
                         )
-                        .child(mono(f.verb, 10., p.ink3).flex_none()),
+                        .child(mono(f.verb, 10., p.dim_ch).flex_none()),
                 );
             }
             if shell.len() > FILES_SHOWN {
-                files = files.child(mono(format!("+{} more", shell.len() - FILES_SHOWN), 10.5, p.ink4).mt(px(6.)));
+                files = files.child(mono(format!("+{} more", shell.len() - FILES_SHOWN), 10.5, p.dim_ch).mt(px(6.)));
             }
         }
         // Detached: the last numbers seen, dimmed and labelled, not live.
@@ -979,7 +1017,7 @@ impl AppView {
             .flex_none()
             .overflow_y_scroll()
             .border_l_1()
-            .border_color(p.line)
+            .border_color(p.hair)
             .when(detached, |d| {
                 d.child(
                     h_flex()
@@ -987,62 +1025,104 @@ impl AppView {
                         .py(px(10.))
                         .gap(px(10.))
                         .border_b_1()
-                        .border_color(p.line)
-                        .child(display("D E T A C H E D", 10., p.hi))
-                        .child(mono("last numbers seen", 10., p.ink4)),
+                        .border_color(p.hair)
+                        .child(display("D E T A C H E D", 10., p.warn_ch))
+                        .child(mono("last numbers seen", 10., p.dim_ch)),
                 )
             })
             .child(v_flex().when(detached, |d| d.opacity(0.45)).child(context).child(tokens).child(files))
     }
 
-    /// The accent picker: over the open right-hand column (clear of the
-    /// header's NAME and HALT), else above the composer at the right, under
-    /// its ACCENT button either way.
-    /// Esc (the root's key handler) or a click outside closes it.
+    /// The theme picker: the 20 built-in themes (each with the three
+    /// colours that tell them apart: canvas, `prompt_fg`, `claude_label`),
+    /// then the accent override (THEME: none; the presets; a custom hex).
+    /// Over the open right-hand column (clear of the header's NAME and
+    /// HALT), else above the composer at the right, under its THEME button
+    /// either way. A click applies and saves; Esc (the root's key handler)
+    /// or a click outside closes it.
     pub(crate) fn render_picker(&self, p: &Palette, right: Side, cx: &Context<Self>) -> impl IntoElement {
-        let accent = cx.global::<theme::Accent>();
-        let current = accent.hex;
-        let d = accent.derived;
-        let mut presets = v_flex().mt(px(16.));
+        let scheme = cx.global::<theme::Scheme>();
+        let current = scheme.choice.theme.clone();
+        let accent = scheme.choice.accent;
+        let swatch = |c: u32| div().size(px(10.)).flex_none().bg(rgb(c));
+        let mut grid = h_flex().mt(px(12.)).flex_wrap().gap_y(px(2.));
+        for (i, &(name, raw)) in crate::palettes::THEMES.iter().enumerate() {
+            let on = name == current;
+            grid = grid.child(
+                h_flex()
+                    .id(("theme", i))
+                    .w(relative(0.5))
+                    .h(px(26.))
+                    .px(px(6.))
+                    .gap(px(8.))
+                    .items_center()
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(p.raised))
+                    .hover(|d| d.bg(p.raised))
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .border_1()
+                            .border_color(p.edge)
+                            .child(swatch(raw.message_bg))
+                            .child(swatch(raw.prompt_fg))
+                            .child(swatch(raw.claude_label)),
+                    )
+                    .child(mono(name, 11., if on { p.ink } else { p.prose_ch }).flex_1().min_w_0().overflow_hidden().text_ellipsis())
+                    .child(mono(if on { "✓" } else { " " }, 11., p.focus_ch).w(px(10.)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_theme(name, cx))),
+            );
+        }
+        let mut presets = h_flex().mt(px(10.)).flex_wrap().gap_y(px(2.));
+        let off = accent.is_none();
+        presets = presets.child(
+            h_flex()
+                .id("accent-off")
+                .w(relative(0.5))
+                .h(px(26.))
+                .px(px(6.))
+                .gap(px(8.))
+                .items_center()
+                .cursor_pointer()
+                .when(off, |d| d.bg(p.raised))
+                .hover(|d| d.bg(p.raised))
+                .child(div().size(px(12.)).flex_none().border_1().border_color(p.dim_ch))
+                .child(display(label::THEME, 10.5, if off { p.ink } else { p.prose_ch }).flex_1())
+                .child(mono(if off { "✓" } else { " " }, 11., p.focus_ch).w(px(10.)))
+                .on_click(cx.listener(|this, _, _, cx| this.set_accent(None, cx))),
+        );
         for (i, &(name, hex)) in theme::PRESETS.iter().enumerate() {
-            let on = hex == current;
+            let on = accent == Some(hex);
             presets = presets.child(
                 h_flex()
                     .id(("preset", i))
-                    .h(px(30.))
+                    .w(relative(0.5))
+                    .h(px(26.))
                     .px(px(6.))
-                    .gap(px(12.))
+                    .gap(px(8.))
                     .items_center()
                     .cursor_pointer()
-                    .when(on, |d| d.bg(p.bg3))
-                    .hover(|d| d.bg(p.bg2))
-                    .child(div().size(px(14.)).flex_none().bg(rgb(hex)))
-                    .child(display(name, 10.5, if on { p.ink } else { p.ink2 }))
-                    .child(div().flex_1())
-                    .child(mono(theme::to_hex(hex), 10.5, p.ink4))
-                    .child(mono(if on { "✓" } else { " " }, 11., p.hi).w(px(10.)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_accent(hex, cx))),
+                    .when(on, |d| d.bg(p.raised))
+                    .hover(|d| d.bg(p.raised))
+                    .child(div().size(px(12.)).flex_none().bg(rgb(hex)))
+                    .child(display(name, 10.5, if on { p.ink } else { p.prose_ch }).flex_1().min_w_0().overflow_hidden())
+                    .child(mono(if on { "✓" } else { " " }, 11., p.focus_ch).w(px(10.)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_accent(Some(hex), cx))),
             );
         }
-        let swatch = |c: u32, name: &'static str| {
-            v_flex()
-                .gap(px(4.))
-                .items_center()
-                .child(div().size(px(22.)).bg(rgb(c)).border_1().border_color(p.line3))
-                .child(mono(name, 9., p.ink4))
-        };
+        let lifted = accent.is_some_and(|a| a != scheme.roles.you_bar || a != scheme.roles.focus);
         v_flex()
             .id("picker")
             .absolute()
             .map(|d| match right {
-                // Over a right panel dragged narrower than its default: as wide as that.
-                Side::Open(w) => d.top(px(52.)).right_0().w(px(w.max(crate::app::FLOORS.1))),
-                Side::Strip => d.bottom(px(140.)).right(px(right.width() + 24.)).w(px(296.)),
+                // As wide as the open right panel, at least wide enough for two columns of names.
+                Side::Open(w) => d.top(px(52.)).right_0().w(px(w.max(PICKER_MIN))),
+                Side::Strip => d.bottom(px(140.)).right(px(right.width() + 24.)).w(px(PICKER_MIN)),
             })
-            .p(px(20.))
-            .bg(p.bg1)
+            .p(px(18.))
+            .bg(p.chrome)
             .border_1()
-            .border_color(p.line3)
+            .border_color(p.edge)
             .occlude()
             .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                 this.picker_dismissed = Some(ev.position);
@@ -1052,40 +1132,37 @@ impl AppView {
                 h_flex()
                     .items_baseline()
                     .gap(px(12.))
-                    .child(display(label::ACCENT, 11.5, p.ink))
-                    .child(mono(theme::to_hex(current), 10.5, p.ink3))
+                    .child(display(label::THEME, 11.5, p.header))
+                    .child(mono(current.clone(), 10.5, p.dim_ch))
                     .child(div().flex_1())
-                    .child(tbtn("picker-close", label::CLOSE, p.ink3, p.ink).on_click(cx.listener(|this, _, window, cx| {
+                    .child(tbtn("picker-close", label::CLOSE, p.dim_ch, p.ink).on_click(cx.listener(|this, _, window, cx| {
                         this.close_picker(window, cx);
                     }))),
             )
+            .child(grid)
+            .child(h_flex().mt(px(18.)).items_baseline().gap(px(12.)).child(display(label::ACCENT, 11.5, p.header)).child(mono(
+                accent.map(theme::to_hex).unwrap_or_else(|| "the theme's".into()),
+                10.5,
+                p.dim_ch,
+            )))
+            .child(mono("replaces the theme's “you” and focus colours; never a state", 10., p.dim_ch).mt(px(6.)).whitespace_normal())
             .child(presets)
             .child(
                 h_flex()
-                    .mt(px(16.))
+                    .mt(px(12.))
                     .gap(px(12.))
                     .items_center()
-                    .child(display(label::CUSTOM, 10., p.ink4).w(px(62.)))
+                    .child(display(label::CUSTOM, 10., p.dim_ch).w(px(62.)))
                     .child(div().flex_1().child(Input::new(&self.hex_input)))
                     .child(
-                        tbtn("picker-apply", label::APPLY, p.ink2, p.ink)
+                        tbtn("picker-apply", label::APPLY, p.prose_ch, p.ink)
                             .on_click(cx.listener(|this, _, _, cx| this.apply_custom_accent(cx))),
                     ),
             )
-            .child(
-                h_flex()
-                    .mt(px(18.))
-                    .gap(px(12.))
-                    .child(swatch(d.accent, "fill"))
-                    .child(swatch(d.hi, "text"))
-                    .child(swatch(d.mid, "line"))
-                    .child(swatch(d.bg, "card"))
-                    .child(swatch(d.soft, "soft")),
-            )
-            .when(d.lifted, |el| {
-                el.child(mono("too dark to see: lifted to 3:1 (fills, lines), 4.5:1 (text)", 10., p.ink3).mt(px(12.)).whitespace_normal())
+            .when(lifted, |el| {
+                el.child(mono("lifted to stay readable: 3:1 for bars, 4.5:1 for text", 10., p.dim_ch).mt(px(10.)).whitespace_normal())
             })
-            .when_some(self.picker_note.clone(), |el, n| el.child(mono(n, 10., p.ink4).mt(px(10.)).whitespace_normal()))
+            .when_some(self.picker_note.clone(), |el, n| el.child(mono(n, 10., p.dim_ch).mt(px(10.)).whitespace_normal()))
     }
 }
 

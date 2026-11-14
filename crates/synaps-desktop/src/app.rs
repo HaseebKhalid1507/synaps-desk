@@ -1,15 +1,14 @@
 //! The main window (the approved "hybrid" layout): a top bar with what
-//! needs you, the sessions rail, the session in the middle (header, tool-call
-//! timeline, authorization card, composer) and its numbers on the right.
-//! Every colour comes from the accent palette ([`crate::theme`]); every
-//! number from the daemon ([`crate::stats`]).
+//! needs you, the sessions rail, the session in the middle (header, the
+//! transcript as turns ([`crate::turns`]), authorization card, composer)
+//! and its numbers on the right. Every colour is a Synaps TUI theme role
+//! ([`crate::theme`]); every number comes from the daemon ([`crate::stats`]).
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_kit::component::text::TextView;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -17,26 +16,29 @@ use synaps_client::transcript::{Item, ItemKind, ToolStatus};
 use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError};
 
 use crate::bench::BenchState;
-use crate::files::{self, LineKind, Preview};
+use crate::files::{self, Preview};
 use crate::fonts::{self, label};
 use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, LOCAL_SEQ, Model, RenameRequest};
 use crate::named::{ResumeRequest, RowAction, home_short};
 use crate::rail::{Bucket, Chip};
-use crate::theme::{self, Palette};
+use crate::theme::{self, Metrics, Palette};
+use crate::turns::{self, Disp, Kind, Layout, Summaries};
 
 /// Per-row strings derived from a transcript item, rebuilt only when the
 /// item's `rev` changes (so a frame never re-allocates unchanged rows).
 pub(crate) struct RowCache {
     id: u64,
     rev: u64,
-    text: SharedString,
-    /// Tool rows: the tracked tool name, the one-line argument, the result's
-    /// first lines and the diff of a file tool.
-    name: SharedString,
-    arg: SharedString,
-    result: SharedString,
-    result_more: usize,
-    preview: Option<Arc<Preview>>,
+    pub(crate) text: SharedString,
+    /// Tool rows: the tool's name (lower case, as sent) and its colour
+    /// role, the one-line argument, the result's first lines and the diff
+    /// of a file tool.
+    pub(crate) name: SharedString,
+    pub(crate) hue: turns::Hue,
+    pub(crate) arg: SharedString,
+    pub(crate) result: SharedString,
+    pub(crate) result_more: usize,
+    pub(crate) preview: Option<Arc<Preview>>,
 }
 
 /// Result lines an open tool row shows.
@@ -45,30 +47,35 @@ const RESULT_LINES: usize = 12;
 /// TUI's `CONFIRM_ARM_DELAY` is 400 ms): it pushes the list up, so a click
 /// meant for a row can land on it.
 pub(crate) const ARM: Duration = Duration::from_millis(500);
-/// The prompt well: line height and the height it scrolls past.
-const WELL_LINE: f32 = 18.;
-const WELL_MAX: f32 = 18. * 12.;
-
-/// The reading column: the header, rows, card and composer share it,
-/// centred in the pane, at most this wide (tool rows and diffs use all of it).
-pub(crate) const COLUMN_MAX: f32 = 1080.;
-/// Prose (user and agent text) within it: about 108 characters of the
-/// text face at 14 px.
-const PROSE_MAX: f32 = 680.;
-/// The column's margin either side of it in a narrower pane.
-const GUTTER: f32 = 36.;
+/// The prompt well shows this many lines before it scrolls.
+const WELL_LINES: f32 = 12.;
 /// A folded side panel's strip.
 pub(crate) const STRIP: f32 = 32.;
 /// Narrower than this, the open right panel is not drawn (the session wins).
 const CENTRE_MIN: f32 = 480.;
 
-actions!(synaps_desktop, [ToggleRail, ToggleRight]);
+actions!(synaps_desktop, [ToggleRail, ToggleRight, TextBigger, TextSmaller, TextReset]);
 
-/// Ctrl+B folds the sessions rail, Ctrl+Alt+B the right panel (Cmd on
-/// macOS); the composer and inputs bind neither.
+/// Ctrl+B folds the sessions rail, Ctrl+Alt+B the right panel; Ctrl+= /
+/// Ctrl+- / Ctrl+0 step the centre pane's text size (Cmd on macOS). The
+/// composer and inputs bind none of them.
 pub fn bind_keys(cx: &mut App) {
-    let (rail, right) = panel_keys(cfg!(target_os = "macos"));
-    cx.bind_keys([KeyBinding::new(rail, ToggleRail, None), KeyBinding::new(right, ToggleRight, None)]);
+    let mac = cfg!(target_os = "macos");
+    let (rail, right) = panel_keys(mac);
+    let [bigger, plus, smaller, reset] = text_keys(mac);
+    cx.bind_keys([
+        KeyBinding::new(rail, ToggleRail, None),
+        KeyBinding::new(right, ToggleRight, None),
+        KeyBinding::new(bigger, TextBigger, None),
+        KeyBinding::new(plus, TextBigger, None),
+        KeyBinding::new(smaller, TextSmaller, None),
+        KeyBinding::new(reset, TextReset, None),
+    ]);
+}
+
+/// The text size keys (`=` and `+`, the same key on most layouts).
+const fn text_keys(mac: bool) -> [&'static str; 4] {
+    if mac { ["cmd-=", "cmd-+", "cmd--", "cmd-0"] } else { ["ctrl-=", "ctrl-+", "ctrl--", "ctrl-0"] }
 }
 
 /// The fold keys (`KeyBinding::new` does not resolve `secondary-`, and
@@ -310,9 +317,9 @@ const SAVE_DELAY: Duration = Duration::from_millis(400);
 /// The pointer rests this long on a rail row before its readout opens.
 const READOUT_DELAY: Duration = Duration::from_millis(400);
 
-/// `inner` in the reading column ([`COLUMN_MAX`], centred).
-pub(crate) fn column(inner: impl IntoElement) -> Div {
-    h_flex().w_full().justify_center().px(px(GUTTER)).child(div().flex_1().min_w_0().max_w(px(COLUMN_MAX)).child(inner))
+/// `inner` in the centre pane's column ([`Layout::column`], centred).
+pub(crate) fn column(lay: Layout, inner: impl IntoElement) -> Div {
+    h_flex().w_full().justify_center().child(div().flex_none().w(px(lay.column)).min_w_0().child(inner))
 }
 
 /// The prompt the authorization card shows.
@@ -378,9 +385,18 @@ pub(crate) fn authorize_ready(armed: bool, below: Option<f32>, read: bool) -> bo
     armed && below.is_some_and(|b| b <= 1. || read)
 }
 
-/// Lines of the well still below its view.
-pub(crate) fn lines_below(below: f32) -> usize {
-    (below / WELL_LINE).ceil() as usize
+/// Lines of the well (`line` px each) still below its view.
+pub(crate) fn lines_below(below: f32, line: f32) -> usize {
+    (below / line).ceil() as usize
+}
+
+/// What the picker says after a save.
+fn saved_note(saved: Option<(std::io::Result<()>, std::path::PathBuf)>, overridden: &str) -> SharedString {
+    match saved {
+        Some((Ok(()), path)) => format!("saved to {}{overridden}", path.display()).into(),
+        Some((Err(e), _)) => format!("not saved: {e}").into(),
+        None => "not saved: no config folder".into(),
+    }
 }
 
 /// What the well shows of a prompt: all of it, as sent (blank lines and
@@ -394,10 +410,23 @@ pub struct AppView {
     /// Connection, sessions, attachment and transcript. Events are applied
     /// to it as they arrive (the pump), never queued for `render`.
     pub model: Model,
+    /// Per transcript item: its strings ([`RowCache`]).
     pub(crate) rows: Vec<RowCache>,
+    /// The virtual list's rows ([`turns::build`]): turns, runs, folds.
+    pub(crate) disp: Vec<Disp>,
+    pub(crate) summaries: Summaries,
     pub list: ListState,
     /// Rows whose open/closed state the user flipped from its default.
     toggled: HashSet<u64>,
+    /// Runs the user unfolded (by their first item's id).
+    open_runs: HashSet<u64>,
+    /// The transcript's `busy` at the last [`Self::sync_list`]: when it
+    /// falls, the last run may fold.
+    synced_busy: bool,
+    /// The last call still unfinished: the one a prompt waits on.
+    pub(crate) waiting_on: Option<u64>,
+    /// The centre pane's column at the last frame.
+    pub(crate) layout: Layout,
     composer: Entity<TextareaState>,
     /// The rail's find (`/`; Enter opens by exact name) and "Name this
     /// session…" (header) inputs.
@@ -440,8 +469,10 @@ pub struct AppView {
     /// click it starts must not reopen it on its trigger, however long it
     /// is held.
     pub(crate) picker_dismissed: Option<Point<Pixels>>,
-    /// Where the launch accent came from (a flag or env wins over the picker's file).
+    /// Where the launch accent and theme came from (a flag or env wins
+    /// over the picker's file).
     pub accent_source: theme::Source,
+    pub theme_source: theme::Source,
     /// The authorization card's prompt (see [`PromptCard`]).
     card: Option<PromptCard>,
     /// The running dot's step, and the 2 Hz timer while a turn runs.
@@ -484,8 +515,8 @@ pub(crate) fn section(title: &'static str, jp: &'static str, p: &Palette) -> Div
     h_flex()
         .items_baseline()
         .gap(px(10.))
-        .child(display(title, 11.5, p.ink))
-        .child(div().font_family(fonts::JP).text_size(px(10.)).text_color(p.ink4).child(jp))
+        .child(display(title, 11.5, p.header))
+        .child(div().font_family(fonts::JP).text_size(px(10.)).text_color(p.dim_ch).child(jp))
 }
 
 impl AppView {
@@ -613,8 +644,14 @@ impl AppView {
             client,
             model: Model::new(conn),
             rows: Vec::new(),
+            disp: Vec::new(),
+            summaries: Summaries::default(),
             list,
             toggled: HashSet::new(),
+            open_runs: HashSet::new(),
+            synced_busy: false,
+            waiting_on: None,
+            layout: Layout::of(800., &Metrics::at(theme::DEFAULT_TEXT)),
             composer: i.composer,
             find_input: i.find_input,
             name_input: i.name_input,
@@ -639,6 +676,7 @@ impl AppView {
             picker_note: None,
             picker_dismissed: None,
             accent_source: theme::Source::Default,
+            theme_source: theme::Source::Default,
             card: None,
             rail: Default::default(),
             focus: i.focus,
@@ -1018,27 +1056,60 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn set_accent(&mut self, hex: u32, cx: &mut Context<Self>) {
-        theme::apply(hex, cx);
+    /// The accent override (`None`: the theme's own `prompt_fg` and
+    /// `border_active`), repainted at once and saved.
+    pub(crate) fn set_accent(&mut self, hex: Option<u32>, cx: &mut Context<Self>) {
+        theme::update(cx, |c| c.accent = hex);
         let overridden = match self.accent_source {
             theme::Source::Flag => " (the next launch's --accent wins over it)".to_string(),
             theme::Source::Env => format!(" (${} wins over it at the next launch)", theme::ENV_ACCENT),
             _ => String::new(),
         };
-        self.picker_note = Some(match theme::settings_path() {
-            Some(path) => match theme::save_accent(&path, hex) {
-                Ok(()) => format!("saved to {}{overridden}", path.display()).into(),
-                Err(e) => format!("not saved: {e}").into(),
-            },
-            None => "not saved: no config folder".into(),
-        });
+        self.picker_note = Some(saved_note(theme::settings_path().map(|path| (theme::save_accent(&path, hex), path)), &overridden));
         cx.notify();
+    }
+
+    /// A built-in theme (or the `<base>/themes/<name>` file over it),
+    /// repainted at once and saved.
+    pub(crate) fn set_theme(&mut self, name: &'static str, cx: &mut Context<Self>) {
+        let base = synaps_client::discovery::base_dir();
+        let Some(raw) = theme::lookup(name, Some(&base)) else { return };
+        theme::update(cx, |c| {
+            c.theme = name.to_string();
+            c.raw = raw;
+        });
+        let overridden = match self.theme_source {
+            theme::Source::Flag => " (the next launch's --theme wins over it)".to_string(),
+            theme::Source::Env => format!(" (${} wins over it at the next launch)", theme::ENV_THEME),
+            _ => String::new(),
+        };
+        self.picker_note = Some(saved_note(theme::settings_path().map(|path| (theme::save_theme(&path, name), path)), &overridden));
+        cx.notify();
+    }
+
+    /// Ctrl+= / Ctrl+- (`Some(±1)`), Ctrl+0 (`None`): the centre pane's
+    /// text size. One repaint, one re-measure of the list; saved with the
+    /// panel states, [`SAVE_DELAY`] later.
+    fn step_text(&mut self, dir: Option<i8>, cx: &mut Context<Self>) {
+        let now = self.panels.text_size;
+        let Some(next) = (match dir {
+            Some(d) => Metrics::bump(now, d),
+            None => Some(theme::DEFAULT_TEXT),
+        })
+        .filter(|&n| n != now) else {
+            return;
+        };
+        theme::update(cx, |c| c.text = next);
+        self.list.remeasure();
+        let mut p = self.panels;
+        p.text_size = next;
+        self.set_panels(p, cx);
     }
 
     pub(crate) fn apply_custom_accent(&mut self, cx: &mut Context<Self>) {
         let typed = self.hex_input.read(cx).value().to_string();
         match theme::parse_hex(&typed) {
-            Some(hex) => self.set_accent(hex, cx),
+            Some(hex) => self.set_accent(Some(hex), cx),
             None => {
                 self.picker_note = Some("not a colour: use #RRGGBB".into());
                 cx.notify();
@@ -1171,205 +1242,118 @@ impl AppView {
         }
     }
 
-    /// Push transcript changes into the virtual list: only the changed tail
-    /// is spliced (and so re-measured).
+    /// Push transcript changes into the virtual list: the item strings of
+    /// the changed tail are rebuilt, then the display rows from the turn
+    /// holding it ([`turns::build`]); only rows that differ are spliced
+    /// (and so re-measured). A turn that ends can fold its last run.
     pub fn sync_list(&mut self) {
-        let Some(sp) = self.model.transcript.take_splice() else { return };
-        self.rows.truncate(sp.start);
-        for item in &self.model.transcript.items()[sp.start..] {
-            self.rows.push(row_cache(item, &self.model.stats.files));
-        }
-        debug_assert!(self.rows.iter().zip(self.model.transcript.items()).all(|(r, i)| r.id == i.id && r.rev == i.rev));
-        self.list.splice(sp.start..sp.old_len, sp.new_len - sp.start);
+        let busy = self.model.transcript.busy();
+        let splice = self.model.transcript.take_splice();
+        let items = self.model.transcript.items();
+        let from = match &splice {
+            Some(sp) => {
+                self.rows.truncate(sp.start);
+                for item in &items[sp.start..] {
+                    self.rows.push(row_cache(item, &self.model.stats.files));
+                }
+                debug_assert!(self.rows.iter().zip(items).all(|(r, i)| r.id == i.id && r.rev == i.rev));
+                if sp.start == 0 {
+                    self.summaries.clear();
+                }
+                sp.start
+            }
+            None if busy != self.synced_busy => items.len(),
+            None => return,
+        };
+        self.waiting_on = items
+            .iter()
+            .rev()
+            .take_while(|i| i.kind != ItemKind::User)
+            .find(|i| i.kind == ItemKind::Tool && !turns::finished(i.tool.as_ref().and_then(|t| t.status)))
+            .map(|i| i.id);
+        let start = turns::turn_start(items, from);
+        self.synced_busy = busy;
+        self.rebuild_from(start);
     }
 
-    /// Open by default: a file tool's diff when it is short, unless the
-    /// call failed, was denied or canceled (nothing changed).
-    fn is_open(&self, item: &Item, row: &RowCache) -> bool {
-        let failed = item
-            .tool
-            .as_ref()
-            .and_then(|t| t.status)
-            .is_some_and(|s| matches!(s, ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Cancelled));
-        let default =
-            item.kind == ItemKind::Tool && !failed && row.preview.as_ref().is_some_and(|p| p.lines.len() <= 24 && !p.lines.is_empty());
+    /// Display rows from item `start` (a turn's start) on.
+    fn rebuild_from(&mut self, start: usize) {
+        let items = self.model.transcript.items();
+        let new = turns::build(items, start, self.model.transcript.busy(), &self.open_runs);
+        self.summaries.update(&new, items, &self.rows);
+        let at = self.disp.partition_point(|d| d.item < start);
+        if let Some((range, count)) = turns::diff(&self.disp[at..], &new) {
+            self.list.splice(at + range.start..at + range.end, count);
+            self.disp.splice(at + range.start..at + range.end, new[range.start..range.start + count].iter().copied());
+        }
+        debug_assert_eq!(self.disp, turns::build(items, 0, self.model.transcript.busy(), &self.open_runs));
+    }
+
+    /// Open by default: a file tool's diff when it is short (unless the
+    /// call failed, was denied or canceled: nothing changed), and a failed
+    /// call's result.
+    pub(crate) fn is_open(&self, item: &Item, row: &RowCache) -> bool {
+        let status = item.tool.as_ref().and_then(|t| t.status);
+        let failed = matches!(status, Some(ToolStatus::Failed | ToolStatus::Denied));
+        let default = item.kind == ItemKind::Tool
+            && (failed
+                || (!matches!(status, Some(ToolStatus::Cancelled))
+                    && row.preview.as_ref().is_some_and(|p| p.lines.len() <= 24 && !p.lines.is_empty())));
         default ^ self.toggled.contains(&item.id)
     }
 
-    fn toggle(&mut self, id: u64) {
+    pub(crate) fn toggle(&mut self, id: u64) {
         if !self.toggled.remove(&id) {
             self.toggled.insert(id);
         }
-        if let Some(ix) = self.model.transcript.items().iter().position(|i| i.id == id) {
+        if let Some(ix) = self.disp.iter().position(|d| d.id == id && d.kind == Kind::Work) {
             self.list.remeasure_items(ix..ix + 1);
         }
     }
 
-    fn render_row(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
-        let (Some(item), Some(row)) = (self.model.transcript.items().get(ix), self.rows.get(ix)) else {
-            return div().into_any_element();
-        };
-        let p = theme::palette(cx);
-        let id = item.id;
-        let body: AnyElement = match item.kind {
-            ItemKind::User => div()
-                .max_w(px(PROSE_MAX))
-                .mt(px(14.))
-                .pl(px(16.))
-                .py(px(1.))
-                .border_l_2()
-                .border_color(p.ink)
-                .text_size(px(14.))
-                .text_color(p.ink)
-                .child(TextView::markdown(("md", id), row.text.clone()))
-                .into_any_element(),
-            ItemKind::Assistant => v_flex()
-                .mt(px(10.))
-                .gap(px(6.))
-                .child(display(label::AGENT, 10., p.ink3))
-                .child(if self.plain_rows {
-                    div().max_w(px(PROSE_MAX)).text_size(px(14.)).child(row.text.clone()).into_any_element()
-                } else {
-                    div().max_w(px(PROSE_MAX)).text_size(px(14.)).child(TextView::markdown(("md", id), row.text.clone())).into_any_element()
-                })
-                .into_any_element(),
-            ItemKind::Thinking => {
-                let open = self.toggled.contains(&id);
-                v_flex()
-                    .child(self.row_header(id, open, label::THINK, p.ink3, row.arg.clone(), None, &p, cx))
-                    .when(open, |d| {
-                        d.child(
-                            div()
-                                .ml(px(24.))
-                                .mb(px(8.))
-                                .pl(px(16.))
-                                .border_l_1()
-                                .border_color(p.line3)
-                                .text_size(px(13.))
-                                .text_color(p.ink3)
-                                .child(row.text.clone()),
-                        )
-                    })
-                    .into_any_element()
-            }
-            ItemKind::Tool => {
-                let status = item.tool.as_ref().and_then(|t| t.status);
-                let open = self.is_open(item, row);
-                let has_body = row.preview.is_some() || !row.result.is_empty();
-                let state = self.tool_state(status, &p);
-                v_flex()
-                    .child(self.row_header(id, open && has_body, row.name.clone(), p.ink2, row.arg.clone(), Some(state), &p, cx))
-                    .when(open && has_body, |d| match &row.preview {
-                        Some(pv) => d.child(diff_block(pv, &p)),
-                        None => d.child(result_block(
-                            &row.result,
-                            row.result_more,
-                            matches!(status, Some(ToolStatus::Failed | ToolStatus::Denied)),
-                            &p,
-                        )),
-                    })
-                    .into_any_element()
-            }
-            ItemKind::Notice => h_flex()
-                .my(px(6.))
-                .gap(px(12.))
-                .child(div().w(px(18.)).h(px(1.)).bg(p.line2))
-                .child(mono(row.text.clone(), 10.5, p.ink4).overflow_hidden().text_ellipsis())
-                .into_any_element(),
-            ItemKind::Error => mono(row.text.clone(), 11.5, p.hi).my(px(6.)).whitespace_normal().into_any_element(),
-            _ => div().text_size(px(13.)).child(row.text.clone()).into_any_element(),
-        };
-        column(body).py(px(1.)).into_any_element()
-    }
-
-    /// A tool's status cell: a check, a cross (failed, denied), "stopped
-    /// at limit" (exit status unknown), or, while
-    /// it runs, a static dot. Nothing animates: a blink would repaint the
-    /// whole window per step for the length of every tool run (a 2 Hz step
-    /// measured 1.2 % CPU during a running tool against 0.56 % without).
-    fn tool_state(&self, status: Option<ToolStatus>, p: &Palette) -> AnyElement {
-        match status {
-            Some(ToolStatus::Done) => mono("✓", 11., p.ink4).into_any_element(),
-            Some(ToolStatus::Failed) => mono("× failed", 10.5, p.hi).into_any_element(),
-            Some(ToolStatus::Denied) => mono("× denied", 10.5, p.hi).into_any_element(),
-            Some(ToolStatus::Cancelled) => mono("cancelled", 10.5, p.ink4).into_any_element(),
-            // The daemon stopped it at its output limit: not ✓, not ×.
-            Some(ToolStatus::Unknown) => mono("stopped at limit", 10.5, p.ink3).into_any_element(),
-            Some(ToolStatus::Queued) => mono("queued", 10.5, p.ink4).into_any_element(),
-            _ => {
-                let live = self.model.transcript.busy() && self.model.transcript.pending_prompts().is_empty();
-                h_flex()
-                    .gap(px(6.))
-                    .child(div().size(px(6.)).bg(if live { p.ink2 } else { p.ink4 }))
-                    .child(mono(if live { "running" } else { "waiting" }, 10.5, p.ink2))
-                    .into_any_element()
-            }
+    /// Fold or unfold a finished run (by its first item's id); the user's
+    /// choice sticks.
+    pub(crate) fn toggle_run(&mut self, id: u64) {
+        if !self.open_runs.remove(&id) {
+            self.open_runs.insert(id);
+        }
+        let items = self.model.transcript.items();
+        if let Some(start) = items.iter().position(|i| i.id == id).map(|ix| turns::turn_start(items, ix + 1)) {
+            self.rebuild_from(start);
         }
     }
 
-    /// A collapsible row's header: sign, name, argument, state.
-    #[allow(clippy::too_many_arguments)]
-    fn row_header(
-        &self,
-        id: u64,
-        open: bool,
-        name: impl Into<SharedString>,
-        name_color: Hsla,
-        arg: SharedString,
-        state: Option<AnyElement>,
-        p: &Palette,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
-        h_flex()
-            .id(("row", id))
-            .h(px(30.))
-            .px(px(4.))
-            .gap(px(12.))
-            .items_center()
-            .cursor_pointer()
-            .hover(|d| d.bg(p.bg2))
-            .child(mono(if open { "−" } else { "+" }, 11., p.ink4).w(px(10.)).flex_none())
-            // Short names line up at 76 px; `search_tools` / `activate_tools` fit whole.
-            .child(
-                display(name, 10.5, name_color)
-                    .min_w(px(76.))
-                    .max_w(px(170.))
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .text_ellipsis(),
-            )
-            .child(mono(arg, 11.5, p.ink3).flex_1().min_w_0().overflow_hidden().text_ellipsis())
-            .children(state)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle(id);
-                cx.notify();
-            }))
-    }
-
-    /// The center column's header: title, model · effort, folder, and the
-    /// actions (NAME, HALT) top-aligned on the right.
+    /// The centre column's header: title, model · effort · folder; the
+    /// actions (NAME, HALT) top right, the session's state and cost under
+    /// them. Fixed sizes (the text step scales the transcript, card and
+    /// composer), on the column.
     fn render_header(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+        let lay = self.layout;
         let attached = self.model.active.is_some() && (self.client.is_some() || self.synthetic);
         let title: SharedString = self.model.transcript.title().or(self.model.active_name()).unwrap_or("No session").to_string().into();
         let view = self.model.stats.view.as_ref();
         let model = view.map(|v| v.model.as_str()).filter(|m| !m.is_empty()).or(self.model.active_meta().map(|s| s.model.as_str()));
-        let meta: Vec<String> = [model.map(crate::named::short_model), view.map(|v| v.effort.clone()).filter(|e| !e.is_empty())]
-            .into_iter()
-            .flatten()
-            .collect();
+        let effort = view.map(|v| v.effort.clone()).filter(|e| !e.is_empty());
         let cwd = self.model.stats.cwd.as_deref().or(self.model.active_meta().and_then(|s| s.cwd.as_deref())).map(home_short);
         let busy = self.model.transcript.busy() && self.drives();
         let detached = self.model.active.is_none() && self.model.stats.detached;
         // The display face stops at Latin-1 (U+00FF): Polish, Czech or Turkish
         // titles, and other scripts, are set whole in the text face.
         let face = if title.chars().all(fonts::display_covers) { fonts::DISPLAY } else { fonts::SANS };
+        // NEEDS YOU / RUNNING / READY beside the cost (glyphs as the rail's).
+        let state = attached.then(|| {
+            if !self.model.transcript.pending_prompts().is_empty() {
+                (crate::rail::State::NeedsYou, label::NEEDS_YOU, p.warn)
+            } else if self.model.transcript.busy() {
+                (crate::rail::State::Running, label::RUNNING, p.run)
+            } else {
+                (crate::rail::State::Idle, label::READY, p.ready)
+            }
+        });
         let actions = h_flex()
-            .flex_none()
             .gap(px(22.))
-            .pt(px(6.))
             .when(attached, |d| {
-                d.child(tbtn("name-session", label::NAME, p.ink3, p.ink).on_click(cx.listener(|this, _, window, cx| {
+                d.child(tbtn("name-session", label::NAME, p.dim, p.ink).on_click(cx.listener(|this, _, window, cx| {
                     this.model.toggle_naming();
                     if this.model.named.naming {
                         let current = this.model.active_name().unwrap_or_default().to_string();
@@ -1382,7 +1366,7 @@ impl AppView {
                 })))
             })
             .when(busy, |d| {
-                d.child(tbtn("halt", label::HALT, p.ink3, p.hi).on_click(cx.listener(|this, _, _, _| {
+                d.child(tbtn("halt", label::HALT, p.dim, p.err).on_click(cx.listener(|this, _, _, _| {
                     if let Some(c) = &this.client
                         && this.model.can_send()
                     {
@@ -1390,6 +1374,36 @@ impl AppView {
                     }
                 })))
             });
+        let stat = h_flex()
+            .gap(px(14.))
+            .items_center()
+            .when_some(state, |d, (st, word, color)| {
+                let g = match st {
+                    crate::rail::State::NeedsYou => crate::chrome::glyph(st, p)
+                        .child(div().absolute().inset_0().border_1().border_color(p.warn_mark))
+                        .child(div().absolute().top(px(3.)).left(px(3.)).size(px(4.)).bg(p.warn_mark)),
+                    crate::rail::State::Running => div().size(px(8.)).m(px(1.)).bg(p.run_mark),
+                    _ => div().size(px(10.)).border_1().border_color(p.ready),
+                };
+                d.child(h_flex().gap(px(8.)).items_center().child(g).child(display(word, 13., color)))
+            })
+            .when_some(self.model.stats.cost.filter(|_| attached), |d, c| d.child(mono(format!("${c:.2}"), 12., p.cost)));
+        let mut meta = h_flex().mt(px(6.)).gap(px(10.)).overflow_hidden().whitespace_nowrap();
+        let mut sep = false;
+        for (text, color) in [
+            (detached.then(|| SharedString::from("detached")), p.warn),
+            (model.map(|m| crate::named::short_model(m).into()), p.agent),
+            (effort.map(SharedString::from), p.dim),
+            (cwd.filter(|_| !lay.tight).map(SharedString::from), p.dim),
+        ] {
+            if let Some(t) = text {
+                if sep {
+                    meta = meta.child(mono("·", 12., p.dim));
+                }
+                meta = meta.child(mono(t, 12., color).overflow_hidden().text_ellipsis());
+                sep = true;
+            }
+        }
         let left = v_flex()
             .flex_1()
             .min_w_0()
@@ -1397,24 +1411,20 @@ impl AppView {
                 h_flex()
                     .items_end()
                     .gap(px(16.))
-                    .child(display(title, 23., p.ink).font_family(face).min_w_0().overflow_hidden().text_ellipsis())
-                    .when_some(self.model.active_name(), |d, n| d.child(mono(n.to_string(), 10.5, p.ink3).flex_none().pb(px(4.)))),
+                    .child(display(title, 24., p.ink).font_family(face).line_height(px(28.)).min_w_0().overflow_hidden().text_ellipsis())
+                    .when_some(self.model.active_name(), |d, n| d.child(mono(n.to_string(), 12., p.dim).flex_none().pb(px(4.)))),
             )
-            .when(!meta.is_empty() || cwd.is_some() || detached, |d| {
-                d.child(
-                    h_flex()
-                        .mt(px(8.))
-                        .gap(px(24.))
-                        .when(detached, |d| d.child(display("D E T A C H E D", 10., p.hi)))
-                        .when(!meta.is_empty(), |d| d.child(mono(meta.join("  ·  "), 10.5, p.ink3)))
-                        .when_some(cwd, |d, c| d.child(mono(c, 10.5, p.ink4).overflow_hidden().text_ellipsis())),
-                )
-            });
-        div()
-            .flex_none()
-            .border_b_1()
-            .border_color(p.line)
-            .child(column(h_flex().items_start().gap(px(20.)).pt(px(22.)).pb(px(18.)).child(left).child(actions)))
+            .when(sep, |d| d.child(meta));
+        div().flex_none().bg(p.canvas).border_b_1().border_color(p.hair).child(column(
+            lay,
+            h_flex()
+                .items_start()
+                .gap(px(20.))
+                .pt(px(20.))
+                .pb(px(16.))
+                .child(left)
+                .child(v_flex().flex_none().items_end().gap(px(8.)).pt(px(5.)).child(actions).child(stat)),
+        ))
     }
 
     /// The "Name this session…" row under the header.
@@ -1424,9 +1434,9 @@ impl AppView {
             h_flex()
                 .gap(px(14.))
                 .items_center()
-                .child(display(label::NAME, 10., p.ink4))
+                .child(display(label::NAME, 13., p.dim))
                 .child(div().flex_1().max_w(px(320.)).child(Input::new(&self.name_input)))
-                .child(tbtn("name-save", if pending { "S A V I N G" } else { label::SAVE }, p.ink2, p.ink).on_click(cx.listener(
+                .child(tbtn("name-save", if pending { "S A V I N G" } else { label::SAVE }, p.prose, p.ink).on_click(cx.listener(
                     |this, _, _, cx| {
                         let typed = this.name_input.read(cx).value().to_string();
                         let req = this.model.rename_request(&typed);
@@ -1434,35 +1444,37 @@ impl AppView {
                         cx.notify();
                     },
                 )))
-                .child(tbtn("name-cancel", label::CANCEL, p.ink4, p.ink2).on_click(cx.listener(|this, _, _, cx| {
+                .child(tbtn("name-cancel", label::CANCEL, p.dim, p.ink).on_click(cx.listener(|this, _, _, cx| {
                     this.model.named.naming = false;
                     cx.notify();
                 }))),
         );
         if let Some(e) = &self.model.named.rename_error {
-            row = row.child(div().text_size(px(12.)).text_color(p.hi).child(e.clone()));
+            row = row.child(mono(e.clone(), 12., p.err).whitespace_normal());
         }
         // Only for the session it was made for (a switch drops it).
         if let Some(r) = self.model.named.replace.as_ref().filter(|r| self.model.is_active(&r.session_id)) {
             row = row.child(
                 h_flex()
                     .gap(px(12.))
-                    .child(div().text_size(px(12.)).text_color(p.ink2).child(format!("Replace '{}' with '{}'?", r.current, r.asked)))
-                    .child(tbtn("name-replace", label::REPLACE, p.hi, p.ink).on_click(cx.listener(|this, _, _, cx| {
+                    .child(div().text_size(px(13.)).text_color(p.prose).child(format!("Replace '{}' with '{}'?", r.current, r.asked)))
+                    .child(tbtn("name-replace", label::REPLACE, p.warn, p.ink).on_click(cx.listener(|this, _, _, cx| {
                         let req = this.model.replace_request();
                         this.rename(req);
                         cx.notify();
                     }))),
             );
         }
-        div().border_b_1().border_color(p.line).child(column(row))
+        div().bg(p.canvas).border_b_1().border_color(p.hair).child(column(self.layout, row))
     }
 
     /// The authorization card: the first pending prompt, answered through
     /// `Client::answer`. The body is shown whole and verbatim in a scrolling
     /// well; AUTHORIZE waits until all of it has been on screen and the
-    /// card is armed ([`ARM`]).
-    fn render_prompt(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
+    /// card is armed ([`ARM`]). On the raised prompt surface, outlined and
+    /// titled in `warning_color`.
+    fn render_prompt(&self, p: &Palette, m: &Metrics, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let lay = self.layout;
         let prompts = self.model.transcript.pending_prompts();
         let pr = prompts.first()?;
         let secret = pr.is_secret();
@@ -1473,7 +1485,7 @@ impl AppView {
         let can = self.drives() && self.model.may_answer(pr.id) && armed;
         let below = card.and_then(|c| c.below());
         let ready = card.is_some_and(|c| authorize_ready(c.armed(), c.below(), c.read));
-        let (head, kind) = if secret { (label::SECRET, "S E C R E T") } else { (label::AUTHORIZATION, "C O N F I R M") };
+        let (head, kind) = if secret { (label::SECRET, "secret") } else { (label::AUTHORIZATION, "confirm") };
         let lead: SharedString = pr.title.clone().into();
         let detached = self.model.active.is_none();
         let actions = if detached {
@@ -1483,13 +1495,14 @@ impl AppView {
                 h_flex()
                     .gap(px(22.))
                     .items_center()
-                    .child(div().w(px(260.)).child(Input::new(&self.secret_input).disabled(!can)))
+                    .child(div().w(px((260. * m.r).round())).child(Input::new(&self.secret_input).disabled(!can).text_size(px(m.mono))))
                     .child(
-                        gbtn("p-submit", label::SUBMIT, can, p)
+                        fbtn("p-submit", label::SUBMIT, can, p.warn_fill, p, m)
                             .when(can, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(true, window, cx)))),
                     )
                     .child(
-                        tbtn("p-cancel", label::CANCEL, if can { p.hi } else { p.ink4 }, if can { p.ink } else { p.ink4 })
+                        tbtn("p-cancel", label::CANCEL, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
+                            .text_size(px(m.label))
                             .when(can, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx)))),
                     ),
             )
@@ -1499,24 +1512,25 @@ impl AppView {
                 h_flex()
                     .gap(px(22.))
                     .items_center()
-                    .child(gbtn("p-yes", label::AUTHORIZE, yes, p).when_some(key.filter(|_| yes), |d, key| {
+                    .child(fbtn("p-yes", label::AUTHORIZE, yes, p.warn_fill, p, m).when_some(key.filter(|_| yes), |d, key| {
                         d.on_click(cx.listener(move |this, _, _, cx| {
                             this.authorize(key);
                             cx.notify();
                         }))
                     }))
-                    .child(tbtn("p-no", label::DENY, if can { p.hi } else { p.ink4 }, if can { p.ink } else { p.ink4 }).when_some(
-                        key.filter(|_| can),
-                        |d, key| {
-                            d.on_click(cx.listener(move |this, _, _, cx| {
-                                this.answer(key, Some(CONFIRM_NO.into()));
-                                cx.notify();
-                            }))
-                        },
-                    )),
+                    .child(
+                        tbtn("p-no", label::DENY, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
+                            .text_size(px(m.label))
+                            .when_some(key.filter(|_| can), |d, key| {
+                                d.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.answer(key, Some(CONFIRM_NO.into()));
+                                    cx.notify();
+                                }))
+                            }),
+                    ),
             )
         };
-        let more = below.filter(|&b| b > 1.).map(lines_below).filter(|_| !card.is_some_and(|c| c.read));
+        let more = below.filter(|&b| b > 1.).map(|b| lines_below(b, m.code_line)).filter(|_| !card.is_some_and(|c| c.read));
         let footer: Option<SharedString> = if detached {
             Some("detached: cannot answer".into())
         } else if sent {
@@ -1529,175 +1543,174 @@ impl AppView {
             Some(format!("↓ {n} more lines: scroll to the end to authorize").into())
         } else if prompts.len() > 1 {
             Some(format!("+{} more waiting", prompts.len() - 1).into())
-        } else {
+        } else if lay.tight {
             None
+        } else {
+            Some("the session waits until you answer".into())
         };
         let body = card.map(|c| c.body.clone()).unwrap_or_else(|| pr.prompt.clone().into());
+        let r = m.r;
         let well = div()
             .id("prompt-well")
-            .mt(px(10.))
-            .max_h(px(WELL_MAX + 22.))
+            .mt(px((10. * r).round()))
+            .max_h(px(m.code_line * WELL_LINES + 2. * (10. * r).round()))
             .overflow_y_scroll()
             .when_some(card, |d, c| d.track_scroll(&c.scroll))
-            .px(px(14.))
-            .py(px(11.))
-            .bg(p.well)
+            .px(px((14. * r).round()))
+            .py(px((10. * r).round()))
+            .bg(p.canvas)
             .font_family(fonts::MONO)
-            .text_size(px(12.5))
-            .line_height(px(WELL_LINE))
-            .text_color(p.ink)
+            .text_size(px(m.mono))
+            .line_height(px(m.code_line))
+            .text_color(p.well_fg)
             .child(body);
+        let g = div()
+            .relative()
+            .size(px(10.))
+            .flex_none()
+            .child(div().absolute().inset_0().border_1().border_color(p.warn_mark))
+            .child(div().absolute().top(px(3.)).left(px(3.)).size(px(4.)).bg(p.warn_mark));
         Some(
             column(
+                lay,
                 v_flex()
-                    .px(px(22.))
-                    .py(px(18.))
+                    .px(px((20. * r).round()))
+                    .py(px((16. * r).round()))
                     .border_1()
-                    .border_color(p.mid)
-                    .bg(p.accent_bg)
+                    .border_color(p.warn_mark)
+                    .bg(p.card)
                     .child(
                         h_flex()
                             .items_center()
                             .gap(px(12.))
-                            .child(div().size(px(7.)).bg(p.accent))
-                            .child(display(head, 12., p.hi))
+                            .child(g)
+                            .child(display(head, m.card_title, p.warn_k).min_w_0().overflow_hidden().text_ellipsis())
                             .child(div().flex_1())
-                            .child(display(kind, 9.5, p.ink4)),
+                            .when(!lay.tight, |d| d.child(mono(kind, m.meta, p.dim_k))),
                     )
-                    .when(!lead.is_empty(), |d| d.child(div().mt(px(10.)).text_size(px(13.)).text_color(p.ink2).child(lead)))
+                    .when(!lead.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .mt(px((8. * r).round()))
+                                .text_size(px(m.card_lead))
+                                .line_height(px(m.card_lead_line))
+                                .text_color(p.prose_k)
+                                .child(lead),
+                        )
+                    })
                     .when(!pr.prompt.is_empty(), |d| d.child(well))
-                    .child(
-                        h_flex()
-                            .mt(px(16.))
-                            .items_center()
-                            .children(actions)
-                            .child(div().flex_1())
-                            .when_some(footer, |d, f| d.child(mono(f, 10., if more.is_some() && !sent { p.hi } else { p.ink4 }))),
-                    ),
+                    .child(h_flex().mt(px((14. * r).round())).items_center().children(actions).child(div().flex_1()).when_some(
+                        footer,
+                        |d, f| {
+                            d.child(
+                                mono(f, m.meta, if more.is_some() && !sent { p.warn_k } else { p.dim_k }).overflow_hidden().text_ellipsis(),
+                            )
+                        },
+                    )),
             )
-            .pt(px(8.))
-            .pb(px(4.)),
+            .pt(px((6. * r).round())),
         )
     }
 
-    fn render_composer(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+    /// The composer: on the user surface, the user's bar on its left edge,
+    /// SEND (STEER while a turn runs) filled in `prompt_fg`.
+    fn render_composer(&self, p: &Palette, m: &Metrics, cx: &Context<Self>) -> impl IntoElement {
+        let lay = self.layout;
         let busy = self.model.transcript.busy();
         let can_send = self.drives();
+        let r = m.r;
+        let hint = if self.client.is_none() && !self.synthetic {
+            "offline: no daemon to send to"
+        } else if self.client.is_none() {
+            "offline: synthetic transport, nothing is sent"
+        } else if self.model.switching() {
+            "switching sessions…"
+        } else if !can_send {
+            "not attached"
+        } else if busy {
+            "steer: applied at the next turn boundary"
+        } else {
+            "send: starts a turn"
+        };
         column(
+            lay,
             v_flex()
-                .px(px(16.))
-                .pt(px(12.))
-                .pb(px(11.))
+                .px(px(m.pad_x))
+                .pt(px(m.pad_y))
+                .pb(px((11. * r).round()))
+                .bg(p.user)
+                .relative()
                 .border_1()
-                .border_color(p.line3)
-                .bg(p.bg1)
-                .child(Textarea::new(&self.composer).appearance(false).disabled(!can_send))
+                .border_color(p.edge)
+                // The user's bar over the left border.
+                .child(div().absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(2.)).bg(p.you_mark))
+                .text_size(px(m.body))
+                .line_height(px(m.body_line))
+                .text_color(p.ink)
+                // The kit sizes its own text: the step is set on it.
+                .child(
+                    Textarea::new(&self.composer)
+                        .appearance(false)
+                        .disabled(!can_send)
+                        .text_size(px(m.body))
+                        .line_height(px(m.body_line))
+                        .text_color(p.ink),
+                )
                 .child(
                     h_flex()
-                        .mt(px(10.))
+                        .mt(px((10. * r).round()))
                         .items_center()
                         .gap(px(20.))
-                        .child(mono(
-                            if self.client.is_none() {
-                                "offline: no daemon to send to"
-                            } else if self.model.switching() {
-                                "switching sessions…"
-                            } else if !can_send {
-                                "not attached"
-                            } else if busy {
-                                "steer: applied at the next turn boundary"
-                            } else {
-                                "send: starts a turn"
-                            },
-                            10.5,
-                            p.ink4,
-                        ))
-                        .child(div().flex_1())
-                        .child(gbtn("send", if busy { label::STEER } else { label::SEND }, can_send, p).on_click(cx.listener(
-                            |this, _, window, cx| {
+                        .child(if lay.tight {
+                            div().flex_1()
+                        } else {
+                            mono(hint, m.meta, p.dim_u).flex_1().min_w_0().overflow_hidden().text_ellipsis()
+                        })
+                        .child(fbtn("send", if busy { label::STEER } else { label::SEND }, can_send, p.btn_fill, p, m).on_click(
+                            cx.listener(|this, _, window, cx| {
                                 let text = this.composer.read(cx).value().trim().to_string();
                                 if !text.is_empty() && this.submit(text) {
                                     this.composer.update(cx, |s, cx| s.set_value("", window, cx));
                                 }
                                 cx.notify();
-                            },
-                        ))),
+                            }),
+                        )),
                 ),
         )
         .flex_none()
-        .pt(px(6.))
-        .pb(px(22.))
+        .pt(px((10. * r).round()))
+        .pb(px((22. * r).round()))
     }
 }
 
 /// A text button: tracked caps, `color`, `hover` on hover.
 pub(crate) fn tbtn(id: &'static str, text: &'static str, color: Hsla, hover: Hsla) -> Stateful<Div> {
-    display(text, 10.5, color).id(id).cursor_pointer().hover(move |d| d.text_color(hover))
+    display(text, 13., color).id(id).cursor_pointer().hover(move |d| d.text_color(hover))
 }
 
-/// The filled button (ink on the background), dimmed when it cannot act.
-pub(crate) fn gbtn(id: &'static str, text: &'static str, enabled: bool, p: &Palette) -> Stateful<Div> {
-    let (bg, fg) = if enabled { (p.ink, p.bg) } else { (p.line3, p.ink4) };
-    let hover = if enabled { p.hi } else { bg };
+/// A filled button (AUTHORIZE, SEND): its label is the chrome colour on
+/// `fill` (lifted until that reads at 4.5:1), dimmed when it cannot act.
+pub(crate) fn fbtn(id: &'static str, text: &'static str, enabled: bool, fill: Hsla, p: &Palette, m: &Metrics) -> Stateful<Div> {
+    let (bg, fg) = if enabled { (fill, p.chrome) } else { (p.edge, p.dim) };
     div()
         .id(id)
-        .h(px(28.))
-        .px(px(14.))
+        .h(px((30. * m.r).round().max(28.)))
+        .px(px(16.))
         .flex()
+        .flex_none()
         .items_center()
         .bg(bg)
-        .when(enabled, |d| d.cursor_pointer())
-        .hover(move |d| d.bg(hover))
-        .child(display(text, 11., fg))
+        .when(enabled, |d| d.cursor_pointer().hover(|d| d.opacity(0.88)))
+        .child(display(text, m.label, fg))
 }
 
-fn diff_block(pv: &Preview, p: &Palette) -> impl IntoElement {
-    // `SharedString` from the line's `Arc<str>`: no copy per frame.
-    let mut col =
-        v_flex().ml(px(24.)).mb(px(10.)).py(px(2.)).border_l_1().border_color(p.line3).font_family(fonts::MONO).text_size(px(11.5));
-    for l in &pv.lines {
-        let (sign, fg, bg) = match l.kind {
-            LineKind::Add => ("+", p.ink, Some(p.add)),
-            LineKind::Del => ("−", p.soft, Some(p.tint)),
-            LineKind::Context => (" ", p.ink2, None),
-            LineKind::Note => (" ", p.ink4, None),
-        };
-        col = col.child(
-            h_flex()
-                .px(px(14.))
-                .h(px(18.))
-                .when_some(bg, |d, bg| d.bg(bg))
-                .child(div().w(px(14.)).flex_none().text_color(if l.kind == LineKind::Del { p.hi } else { p.ink4 }).child(sign))
-                .child(div().text_color(fg).whitespace_nowrap().overflow_hidden().text_ellipsis().child(SharedString::from(&l.text))),
-        );
-    }
-    if pv.more > 0 {
-        col = col.child(div().px(px(14.)).text_color(p.ink4).child(format!("… {} more lines", pv.more)));
-    }
-    col
-}
-
-fn result_block(result: &SharedString, more: usize, failed: bool, p: &Palette) -> impl IntoElement {
-    v_flex()
-        .ml(px(24.))
-        .mb(px(10.))
-        .px(px(14.))
-        .py(px(2.))
-        .border_l_1()
-        .border_color(p.line3)
-        .font_family(fonts::MONO)
-        .text_size(px(11.5))
-        .text_color(if failed { p.hi } else { p.ink2 })
-        .child(result.clone())
-        .when(more > 0, |d| d.child(div().text_color(p.ink4).child(format!("… {more} more lines"))))
-}
-
-fn row_cache(item: &Item, ledger: &files::Ledger) -> RowCache {
+pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger) -> RowCache {
     let mut r = RowCache {
         id: item.id,
         rev: item.rev,
         text: SharedString::default(),
         name: SharedString::default(),
+        hue: turns::Hue::Gen,
         arg: SharedString::default(),
         result: SharedString::default(),
         result_more: 0,
@@ -1706,7 +1719,8 @@ fn row_cache(item: &Item, ledger: &files::Ledger) -> RowCache {
     match item.kind {
         ItemKind::Tool => {
             let Some(t) = item.tool.as_ref() else { return r };
-            r.name = tracked(&t.name).into();
+            r.name = t.name.clone().into();
+            r.hue = turns::Hue::of(&t.name);
             r.preview = files::is_file_tool(&t.name).then(|| ledger.preview(&t.tool_id)).flatten();
             r.arg = match &r.preview {
                 Some(pv) if !pv.title.is_empty() => pv.title.clone().into(),
@@ -1723,18 +1737,6 @@ fn row_cache(item: &Item, ledger: &files::Ledger) -> RowCache {
         _ => r.text = item.text.clone().into(),
     }
     r
-}
-
-/// `multi_edit` → `M U L T I _ E D I T`.
-fn tracked(name: &str) -> String {
-    let mut out = String::with_capacity(name.len() * 2);
-    for (i, c) in name.chars().flat_map(char::to_uppercase).enumerate() {
-        if i > 0 {
-            out.push(' ');
-        }
-        out.push(c);
-    }
-    out
 }
 
 pub(crate) fn one_line(s: &str, max: usize) -> String {
@@ -1779,6 +1781,7 @@ impl Render for AppView {
             b.on_render(&self.list, window);
         }
         let p = theme::palette(cx);
+        let m = theme::metrics(cx);
         // A drag released outside the window has no drop: it ends here.
         if self.drag.is_some_and(|g| g.moved) && !cx.has_active_drag() {
             self.end_drag(cx);
@@ -1793,17 +1796,35 @@ impl Render for AppView {
         if let Side::Open(w) = rail {
             self.rail_width = w;
         }
-        let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_row(ix, cx))).size_full();
+        // The centre pane's column. The list spans the pane (the wheel
+        // scrolls it anywhere, the labels hang in its padding) with the
+        // column as its item width: while the column is capped, a resize or
+        // a panel drag changes only the padding, and the list keeps every
+        // measured row (it re-measures when its item width changes).
+        let pane = (self.width - crate::chrome::MARK - rail.width() - right.width()).max(0.);
+        let lay = Layout::of(pane, &m);
+        if (lay.hang, lay.tight) != (self.layout.hang, self.layout.tight) {
+            self.list.remeasure();
+        }
+        self.layout = lay;
+        let (pad_l, pad_r) = lay.padding(pane);
+        let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_disp(ix, cx)))
+            .size_full()
+            .pl(px(pad_l))
+            .pr(px(pad_r))
+            .pt(px((8. * m.r).round()))
+            .pb(px((28. * m.r).round()));
         let main = v_flex()
             .flex_1()
             .h_full()
             .min_w_0()
+            .bg(p.canvas)
             .child(self.render_header(&p, cx))
             .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
-            .child(div().flex_1().min_h_0().pt(px(14.)).child(list))
-            .children(self.render_prompt(&p, cx))
-            .when_some(self.model.last_error.clone(), |d, e| d.child(column(mono(e, 11., p.hi).pt(px(6.)).whitespace_normal())))
-            .child(self.render_composer(&p, cx));
+            .child(div().flex_1().min_h_0().child(list))
+            .children(self.render_prompt(&p, &m, cx))
+            .when_some(self.model.last_error.clone(), |d, e| d.child(column(lay, mono(e, m.meta, p.err).pt(px(6.)).whitespace_normal())))
+            .child(self.render_composer(&p, &m, cx));
         h_flex()
             .id("root")
             .track_focus(&self.focus)
@@ -1853,6 +1874,9 @@ impl Render for AppView {
             .on_drop(cx.listener(|this, _: &EdgeDrag, _, cx| this.end_drag(cx)))
             .on_action(cx.listener(|this, _: &ToggleRail, _, cx| this.fold_key(true, cx)))
             .on_action(cx.listener(|this, _: &ToggleRight, _, cx| this.fold_key(false, cx)))
+            .on_action(cx.listener(|this, _: &TextBigger, _, cx| this.step_text(Some(1), cx)))
+            .on_action(cx.listener(|this, _: &TextSmaller, _, cx| this.step_text(Some(-1), cx)))
+            .on_action(cx.listener(|this, _: &TextReset, _, cx| this.step_text(None, cx)))
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, _| {
                 if ev.keystroke.key.eq_ignore_ascii_case("b") {
                     this.fold_keys.release(Instant::now());
@@ -1860,7 +1884,7 @@ impl Render for AppView {
             }))
             .relative()
             .size_full()
-            .bg(p.bg)
+            .bg(p.chrome)
             .text_color(p.ink)
             .font_family(fonts::SANS)
             .text_size(px(13.))
@@ -1893,8 +1917,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        CENTRE_MIN, FoldKeys, Side, WELL_LINE, authorize_ready, dragged, lines_below, one_line, panel_keys, side_widths, sides, toggled,
-        tracked, well_body,
+        CENTRE_MIN, FoldKeys, Side, authorize_ready, dragged, lines_below, one_line, panel_keys, side_widths, sides, text_keys, toggled,
+        well_body,
     };
     use crate::theme::Panels;
 
@@ -1903,7 +1927,7 @@ mod tests {
     fn panel_keys_parse() {
         for mac in [false, true] {
             let (a, b) = panel_keys(mac);
-            for k in [a, b] {
+            for k in [a, b].into_iter().chain(text_keys(mac)) {
                 assert!(gpui_kit::Keystroke::parse(k).is_ok(), "{k}");
             }
         }
@@ -2136,8 +2160,8 @@ mod tests {
         assert_eq!(body.lines().count(), 30, "every line, the blank one too");
         assert_eq!(&*body, prompt.as_str(), "verbatim");
         // 30 lines in a 12-line well: 18 below at first.
-        let below = 18. * WELL_LINE;
-        assert_eq!(lines_below(below), 18);
+        let below = 18. * 21.;
+        assert_eq!(lines_below(below, 21.), 18);
         assert!(!authorize_ready(true, Some(below), false), "not read");
         assert!(!authorize_ready(true, None, false), "not laid out yet");
         assert!(!authorize_ready(false, Some(0.), true), "not armed");
@@ -2146,10 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn tracked_names_and_paths() {
-        assert_eq!(tracked("multi_edit"), "M U L T I _ E D I T");
-        assert_eq!(tracked("bash"), "B A S H");
-        assert_eq!(tracked(""), "");
+    fn one_line_arguments() {
         assert_eq!(one_line("  \nfirst\nsecond", 80), "first …");
         assert_eq!(one_line("abcdef", 3), "abc …");
     }
