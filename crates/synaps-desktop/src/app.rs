@@ -183,9 +183,14 @@ impl FoldKeys {
 /// listener, which GPUI runs when nothing on the focus path handled the
 /// action. It folds, then gives the view the focus back once the dispatch
 /// is over, so the key-up (and the keys after it) reach the view again.
+/// A press here is always a press: the key-up of the one before it went
+/// where the focus was, not to the view.
 fn fold_fallback<A: Action>(rail: bool, view: WeakEntity<AppView>, window: AnyWindowHandle, focus: FocusHandle, cx: &mut App) {
     cx.on_action(move |_: &A, cx| {
-        let _ = view.update(cx, |v, cx| v.fold_key(rail, cx));
+        let _ = view.update(cx, |v, cx| {
+            v.fold_keys = FoldKeys::default();
+            v.fold_key(rail, cx);
+        });
         let focus = focus.clone();
         cx.defer(move |cx| {
             let _ = window.update(cx, |_, window, cx| window.focus(&focus, cx));
