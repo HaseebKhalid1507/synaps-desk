@@ -1,12 +1,13 @@
 //! The Settings view: one scrolling column of groups, each saying where it
 //! writes (`usage-design/spec.md` section 2). APP rows save to this
 //! machine's `settings.json`; CONFIG rows go through synaps-dash's `POST
-//! /api/config` when the daemon is local; everything else is shown
+//! /api/config` only when [`crate::views::DashUi::config_gate`] proves the
+//! daemon and its dash are this machine's; everything else is shown
 //! read-only with its value and the reason, never as a disabled control.
+//! It draws in a cached pane ([`crate::views::ViewPane`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Arc;
 
 use gpui_kit::component::input::Input;
 use gpui_kit::component::{h_flex, v_flex};
@@ -20,7 +21,7 @@ use crate::rail::State;
 use crate::settings::{self, Cat};
 use crate::theme::{self, Palette};
 use crate::usage::Range;
-use crate::views::Answer;
+use crate::views::{Answer, ViewCx};
 
 /// The column's widest, the index's width, and the pane from which the
 /// index shows.
@@ -42,8 +43,8 @@ pub(crate) enum Write {
 pub(crate) struct AppSettings {
     /// Names a remote daemon in headers (`Welcome` carries no host name).
     pub daemon_label: Option<String>,
-    /// A remote daemon's dash; kept here with its token for this run, saved
-    /// without it.
+    /// A remote daemon's dash (a loopback forward). A token pasted with it
+    /// is kept for this run only; it is saved without one.
     pub dash_url: Option<String>,
     pub usage_range: Range,
     pub usage_host: Option<String>,
@@ -105,10 +106,16 @@ pub(crate) struct SettingsUi {
     pub more_open: bool,
     pub writes: HashMap<&'static str, Write>,
     /// A local daemon's config as `key = value` (REFERENCE values), read
-    /// when Settings opens.
-    pub reference: Option<Arc<HashMap<String, String>>>,
+    /// off the UI thread when Settings opens (`Err`: it could not be read;
+    /// its rows show `—`).
+    pub reference: Option<settings::Reference>,
     /// The outcome of a THIS APP change, under its row (by key).
     pub app_note: Option<(&'static str, String)>,
+    /// THIS APP keys waiting for their save ([`crate::app::SAVE_DELAY`]
+    /// after the last change, all in one write, in order), and that save.
+    app_dirty: BTreeMap<&'static str, Option<String>>,
+    app_save: Option<Task<()>>,
+    app_writing: bool,
 }
 
 /// One row's parts.
@@ -157,30 +164,74 @@ impl AppView {
             Pick::Range => {
                 if let Some(r) = Range::parse(value) {
                     self.app_settings.usage_range = r;
-                    self.save_app("usage_range", Some(r.key().to_string()));
+                    self.save_app("usage_range", Some(r.key().to_string()), cx);
                 }
             }
             Pick::Host => {
                 let h = (value != "all").then(|| value.to_string());
                 self.app_settings.usage_host = h.clone();
-                self.save_app("usage_host", h);
+                self.save_app("usage_host", h, cx);
             }
         }
-        cx.notify();
+        self.views_changed(cx);
     }
 
-    /// A THIS APP key, written off the UI thread.
-    fn save_app(&mut self, key: &'static str, value: Option<String>) {
-        let Some(path) = theme::settings_path() else {
+    /// A THIS APP key, saved [`crate::app::SAVE_DELAY`] after the last
+    /// change with the others waiting, in one write off the UI thread (two
+    /// quick changes of a key cannot land out of order).
+    fn save_app(&mut self, key: &'static str, value: Option<String>, cx: &mut Context<Self>) {
+        if theme::settings_path().is_none() {
             self.settings.app_note = Some((key, "not saved: no config folder".into()));
             return;
-        };
+        }
         self.settings.app_note = None;
-        std::thread::spawn(move || {
-            if let Err(e) = theme::save_settings(&path, &[(key, value.into())]) {
-                eprintln!("synaps-desktop: {key} not saved: {e}");
+        self.settings.app_dirty.insert(key, value);
+        self.arm_app_save(cx);
+    }
+
+    fn arm_app_save(&mut self, cx: &mut Context<Self>) {
+        self.settings.app_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(crate::app::SAVE_DELAY).await;
+            let _ = this.update(cx, |v, cx| v.write_app(cx));
+        }));
+    }
+
+    fn write_app(&mut self, cx: &mut Context<Self>) {
+        if self.settings.app_writing {
+            // The last write is still out: this one goes after it.
+            return self.arm_app_save(cx);
+        }
+        let keys = std::mem::take(&mut self.settings.app_dirty);
+        let Some(path) = theme::settings_path().filter(|_| !keys.is_empty()) else { return };
+        self.settings.app_writing = true;
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_spawn(async move {
+                    let pairs: Vec<(&str, serde_json::Value)> = keys.iter().map(|(k, v)| (*k, v.clone().into())).collect();
+                    theme::save_settings(&path, &pairs).map_err(|e| (keys.keys().next().copied().unwrap_or(""), e.to_string()))
+                })
+                .await;
+            let _ = this.update(cx, |v, cx| {
+                v.settings.app_writing = false;
+                if let Err((key, e)) = saved {
+                    v.settings.app_note = Some((key, format!("not saved: {e}")));
+                    v.views_changed(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A save still waiting, written now: the window is closing.
+    pub(crate) fn flush_app(&mut self) {
+        self.settings.app_save = None;
+        let keys = std::mem::take(&mut self.settings.app_dirty);
+        if let Some(path) = theme::settings_path().filter(|_| !keys.is_empty()) {
+            let pairs: Vec<(&str, serde_json::Value)> = keys.iter().map(|(k, v)| (*k, v.clone().into())).collect();
+            if let Err(e) = theme::save_settings(&path, &pairs) {
+                eprintln!("synaps-desktop: settings not saved: {e}");
             }
-        });
+        }
     }
 
     /// Start editing a field: the shared input takes its value and focus.
@@ -195,7 +246,7 @@ impl AppView {
             s.set_value(value, window, cx);
             s.focus(window, cx);
         });
-        cx.notify();
+        self.views_changed(cx);
     }
 
     /// Enter in the edit field.
@@ -212,17 +263,16 @@ impl AppView {
             Edit::DaemonLabel => {
                 let v = (!typed.is_empty()).then_some(typed);
                 self.app_settings.daemon_label = v.clone();
-                self.save_app("daemon_label", v);
+                self.save_app("daemon_label", v, cx);
             }
             Edit::DashUrl => {
                 let saved = (!typed.is_empty()).then(|| crate::dash::strip_token(&typed));
                 self.app_settings.dash_url = (!typed.is_empty()).then_some(typed);
-                self.save_app("dash_url", saved);
-                self.dash_refind();
-                self.ask_config(cx);
+                self.save_app("dash_url", saved, cx);
+                self.dash_refind(cx);
             }
         }
-        cx.notify();
+        self.views_changed(cx);
     }
 
     fn set_text_size(&mut self, n: u8, cx: &mut Context<Self>) {
@@ -241,20 +291,17 @@ impl AppView {
         let f = text.trim().to_lowercase();
         if f != self.settings.find {
             self.settings.find = f;
-            cx.notify();
+            self.views_changed(cx);
         }
     }
 
-    /// A local daemon's config as `key = value`, read once per opening.
-    fn reference_values(&mut self) {
-        if self.dash.local != Some(true) || self.settings.reference.is_some() {
-            return;
+    /// A REFERENCE value as shown: the local config's (`default` unset),
+    /// `—` for a remote daemon or a config that could not be read.
+    fn reference_shown(&self, key: &str) -> String {
+        match self.settings.reference.as_ref() {
+            Some(settings::Reference { values: Ok(r), .. }) => settings::shown(key, r.get(key).map(String::as_str)),
+            _ => crate::usage::NONE.into(),
         }
-        let base = synaps_client::discovery::base_dir();
-        let profile = self.model.daemon.as_ref().and_then(|d| d.profile.clone());
-        let path = theme::read_path(&base, profile.as_deref(), "config");
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        self.settings.reference = Some(Arc::new(settings::read_config(&text)));
     }
 
     // ── controls ───────────────────────────────────────────────────────
@@ -269,7 +316,7 @@ impl AppView {
         selected: Option<&str>,
         sending: Option<&str>,
         p: &Palette,
-        cx: &Context<Self>,
+        cx: &ViewCx,
     ) -> AnyElement {
         let current = sending.or(selected);
         if opts.len() <= 4 {
@@ -336,7 +383,7 @@ impl AppView {
                     .child(mono(if open { "↑" } else { "↓" }, 12., p.dim))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings.dropdown = if this.settings.dropdown == Some(id) { None } else { Some(id) };
-                        cx.notify();
+                        this.views_changed(cx);
                     })),
             )
             .when(open, |d| d.child(list))
@@ -345,7 +392,7 @@ impl AppView {
 
     /// A number or text field: its value in a box; click to edit (Enter
     /// saves, Esc leaves it).
-    fn field(&self, e: Edit, value: SharedString, unit: &'static str, sending: bool, p: &Palette, cx: &Context<Self>) -> AnyElement {
+    fn field(&self, e: Edit, value: SharedString, unit: &'static str, sending: bool, p: &Palette, cx: &ViewCx) -> AnyElement {
         let editing = self.settings.editing == Some(e);
         let id: SharedString = match e {
             Edit::Config(k) => format!("field-{k}").into(),
@@ -397,7 +444,7 @@ impl AppView {
 
     /// The control for a CONFIG key: editable through the dash, else its
     /// value read-only (`—` when it cannot be read).
-    fn config_control(&self, key: &'static str, p: &Palette, cx: &Context<Self>) -> AnyElement {
+    fn config_control(&self, key: &'static str, writable: bool, p: &Palette, cx: &ViewCx) -> AnyElement {
         let snap = self.dash.config.as_ref().filter(|c| c.exposes(key));
         let raw = snap.and_then(|c| c.value(key));
         let sending = match self.settings.writes.get(key) {
@@ -405,14 +452,10 @@ impl AppView {
             _ => None,
         };
         if snap.is_none() {
-            let value = match self.settings.reference.as_ref() {
-                Some(r) => settings::shown(key, r.get(key).map(String::as_str)),
-                None => crate::usage::NONE.into(),
-            };
-            return Self::locked(value, p);
+            return Self::locked(self.reference_shown(key), p);
         }
         let shown = settings::shown(key, raw);
-        if !self.dash.config_writable() {
+        if !writable {
             return Self::locked(shown, p);
         }
         let id: &'static str = settings::def(key).map_or("config", |d| d.key);
@@ -444,7 +487,7 @@ impl AppView {
 
     // ── layout ─────────────────────────────────────────────────────────
 
-    fn render_row(&self, r: Row, first: bool, p: &Palette, cx: &Context<Self>) -> AnyElement {
+    fn render_row(&self, r: Row, first: bool, p: &Palette, cx: &ViewCx) -> AnyElement {
         let open = self.settings.open_help == Some(r.key);
         let help: SharedString = if open { r.help.into() } else { settings::first_sentence(r.help).into() };
         let key = r.key;
@@ -462,7 +505,7 @@ impl AppView {
                     .when(more, |d| d.cursor_pointer())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings.open_help = if this.settings.open_help == Some(key) { None } else { Some(key) };
-                        cx.notify();
+                        this.views_changed(cx);
                     }))
                     .child(
                         h_flex()
@@ -488,7 +531,7 @@ impl AppView {
             .into_any_element()
     }
 
-    fn group_head(&self, ix: usize, title: SharedString, line: SharedString, p: &Palette, cx: &Context<Self>) -> Div {
+    fn group_head(&self, ix: usize, title: SharedString, line: SharedString, p: &Palette, cx: &ViewCx) -> Div {
         let more = ix == 4;
         let open = self.settings.more_open || !self.settings.find.is_empty();
         v_flex()
@@ -503,7 +546,7 @@ impl AppView {
                     .when(more, |d| {
                         d.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
                             this.settings.more_open = !this.settings.more_open;
-                            cx.notify();
+                            this.views_changed(cx);
                         }))
                     })
                     .when(more, |d| d.child(mono(if open { "−" } else { "+" }, 13., p.dim)))
@@ -516,9 +559,8 @@ impl AppView {
         div().pt(px(16.)).pb(px(4.)).child(display(title, 12., p.dim)).into_any_element()
     }
 
-    /// The Settings view, `pane` px wide.
-    pub(crate) fn render_settings(&mut self, pane: f32, p: &Palette, cx: &Context<Self>) -> AnyElement {
-        self.reference_values();
+    /// The Settings view, `pane` px wide. Reads, never changes, the app.
+    pub(crate) fn render_settings(&self, pane: f32, p: &Palette, cx: &ViewCx) -> AnyElement {
         let col = (pane - 48.).clamp(320., COLUMN);
         let index = pane >= INDEX_FROM;
         let left = if index { ((pane - col) / 2.).max(INDEX + 48.) } else { ((pane - col) / 2.).max(24.) };
@@ -544,11 +586,12 @@ impl AppView {
                 )
                 .into_any_element(),
         ));
+        let gate = self.config_gate();
         let groups = [
             self.group_connection(p, &find),
             self.group_app(p, cx, &find),
-            self.group_session(p, cx, &find),
-            self.group_config(p, cx, &find),
+            self.group_session(p, cx, gate.is_ok(), &find),
+            self.group_config(p, cx, &gate, &find),
             self.group_more(p, &find),
             self.group_providers(p, &find),
             self.group_plugins(p, &find),
@@ -570,16 +613,11 @@ impl AppView {
             blocks.push(wrap(sans(format!("Nothing matches “{find}”."), 13., 20., p.dim).pt(px(40.)).into_any_element()));
         }
         blocks.push(div().h(px(64.)).into_any_element());
-        // The group at the top of the view (child 0 is the title).
+        // The group at the top of the view (child 0 is the title). A scroll
+        // draws the pane again by itself (GPUI notifies the scrolled view).
         let top = self.settings.scroll.top_item().saturating_sub(1);
         let in_view = shown_groups.get(top.min(shown_groups.len().saturating_sub(1))).copied();
-        let column = v_flex()
-            .id("settings-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.settings.scroll)
-            .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
-            .children(blocks);
+        let column = v_flex().id("settings-scroll").size_full().overflow_y_scroll().track_scroll(&self.settings.scroll).children(blocks);
         let mut root = div().relative().size_full().bg(p.canvas).child(column);
         if index {
             let mut list = v_flex().absolute().top(px(84.)).left(px(left - INDEX - 24.)).w(px(INDEX)).gap(px(2.));
@@ -594,7 +632,7 @@ impl AppView {
                         .hover(|d| d.text_color(p.ink))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.settings.scroll.scroll_to_top_of_item(pos + 1);
-                            cx.notify();
+                            this.views_changed(cx);
                         })),
                 );
             }
@@ -620,15 +658,21 @@ impl AppView {
 
     fn group_connection(&self, p: &Palette, find: &str) -> (SharedString, Vec<AnyElement>) {
         let d = self.model.daemon.as_ref();
-        let socket = self.dash.launch.resolved.as_ref().map(|s| s.display().to_string()).unwrap_or_else(|| crate::usage::NONE.into());
-        let kind = match (self.dash.local, d) {
+        let socket = self.dash.socket.as_ref().map(|s| s.display().to_string()).unwrap_or_else(|| crate::usage::NONE.into());
+        let kind = match (&self.dash.local, d) {
             (_, None) if self.synthetic => "offline (synthetic sessions)".to_string(),
             (_, None) => "not connected".to_string(),
-            (Some(true), _) => "local daemon".to_string(),
-            _ => match &self.app_settings.daemon_label {
+            (Some(Ok(())), _) => "local daemon".to_string(),
+            (None, _) => "checking where it runs".to_string(),
+            (Some(Err(_)), _) => match &self.app_settings.daemon_label {
                 Some(l) => format!("{l} · remote daemon"),
                 None => "remote daemon".to_string(),
             },
+        };
+        let place = match &self.dash.local {
+            Some(Ok(())) => "this machine's registry has its pid and socket".to_string(),
+            Some(Err(why)) => why.clone(),
+            None => crate::usage::NONE.into(),
         };
         let line = match d {
             Some(d) => format!("{kind} · v{} · pid {} · {}", d.version, d.pid, crate::named::home_short(&socket)),
@@ -641,9 +685,13 @@ impl AppView {
                 let state = match &self.dash.answer {
                     Answer::Up => "answers".to_string(),
                     Answer::Unknown => "not asked yet".to_string(),
-                    Answer::Down(e) => e.to_string(),
+                    Answer::Down(e) => self.fail_text(e),
                 };
-                format!("{} · {state} · from {}", t.shown(), src.describe())
+                let serves = match &self.dash.serves {
+                    Some(Ok(i)) => format!(" · serves pid {}", i.pid),
+                    _ => String::new(),
+                };
+                format!("{} · {state}{serves} · from {}", t.shown(), src.describe())
             }
         };
         let sources = self
@@ -655,6 +703,7 @@ impl AppView {
             .unwrap_or_else(|| "open Usage to read them".into());
         let rows: Vec<(&'static str, String)> = vec![
             ("Daemon", kind),
+            ("Where", place),
             ("Version", d.map(|d| d.version.clone()).unwrap_or_else(|| crate::usage::NONE.into())),
             ("Process", d.map(|d| d.pid.to_string()).unwrap_or_else(|| crate::usage::NONE.into())),
             ("Profile", d.map(|d| d.profile.clone().unwrap_or_else(|| "default".into())).unwrap_or_else(|| crate::usage::NONE.into())),
@@ -672,7 +721,7 @@ impl AppView {
         (line.into(), rows)
     }
 
-    fn group_app(&self, p: &Palette, cx: &Context<Self>, find: &str) -> (SharedString, Vec<AnyElement>) {
+    fn group_app(&self, p: &Palette, cx: &ViewCx, find: &str) -> (SharedString, Vec<AnyElement>) {
         let path =
             theme::settings_path().map(|p| crate::named::home_short(&p.display().to_string())).unwrap_or_else(|| "no config folder".into());
         let scheme = cx.global::<theme::Scheme>();
@@ -822,7 +871,7 @@ impl AppView {
             id: "app-dash".into(),
             label: "Dash URL".into(),
             key: "dash_url",
-            help: "A remote daemon's synaps-dash (a forwarded port). Empty: a local daemon's own URL file, --dash, or $SYNAPS_DASH_URL. Its token is kept for this run only, never saved.",
+            help: "A remote daemon's synaps-dash, through a forwarded port on 127.0.0.1 (other hosts are refused). Empty: a local daemon's own URL file, --dash, or $SYNAPS_DASH_URL. A token pasted with it is kept for this run only, never saved. Never writes config.",
             control: self.field(
                 Edit::DashUrl,
                 self.app_settings.dash_url.as_deref().map(crate::dash::strip_token).unwrap_or_else(|| "discover".into()).into(),
@@ -893,7 +942,7 @@ impl AppView {
         }
     }
 
-    fn group_session(&self, p: &Palette, cx: &Context<Self>, find: &str) -> (SharedString, Vec<AnyElement>) {
+    fn group_session(&self, p: &Palette, cx: &ViewCx, writable: bool, find: &str) -> (SharedString, Vec<AnyElement>) {
         let target = self.model.tabs.current().filter(|_| self.model.active.is_some());
         let Some(tab) = target else {
             let rows = if settings::matches(find, "open a session to change these", "", "") {
@@ -910,7 +959,7 @@ impl AppView {
             .unwrap_or("New session")
             .to_string();
         let line =
-            format!("“{}” · live values · read-only here until synaps-client can send Set (PR #9)", crate::app::one_line(&title, 60));
+            format!("“{}” · live values · read-only here until this client can change a running session", crate::app::one_line(&title, 60));
         let mut rows = Vec::new();
         for key in settings::SESSION_KEYS {
             let Some(d) = settings::def(key) else { continue };
@@ -926,7 +975,7 @@ impl AppView {
                         .items_center()
                         .child(mono("default for new sessions", 12., p.dim))
                         .child(div().flex_1())
-                        .child(self.config_control(key, p, cx))
+                        .child(self.config_control(key, writable, p, cx))
                         .into_any_element(),
                 );
                 if let Some(t) = self.applies(key) {
@@ -959,7 +1008,7 @@ impl AppView {
                     .line_height(px(20.))
                     .text_color(p.code_fg)
                     .whitespace_normal()
-                    .child(SharedString::from(text.to_string()))
+                    .child(SharedString::from(text))
                     .into_any_element(),
                 None => mono("the daemon's default prompt", 12.5, p.dim).mt(px(4.)).into_any_element(),
             };
@@ -991,25 +1040,37 @@ impl AppView {
         (line.into(), rows)
     }
 
-    fn group_config(&self, p: &Palette, cx: &Context<Self>, find: &str) -> (SharedString, Vec<AnyElement>) {
-        let path =
-            self.dash.config.as_ref().map(|c| c.path.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "~/.synaps-cli/config".into());
-        let local = self.dash.local == Some(true);
-        let line = match (&self.dash.answer, self.dash.config.as_ref(), local) {
-            (Answer::Up, Some(c), true) if c.writable && self.dash.config_writable() => format!("{path} · saved through synaps-dash"),
-            (Answer::Up, Some(_), true) => format!("{path} · synaps-dash cannot write it (no lock): read-only"),
-            (Answer::Up, Some(_), false) => format!("{path} on the daemon's machine · read-only from here"),
-            (Answer::Down(Fail::Token), _, _) => "synaps-dash token changed: reconnect · read-only".into(),
-            (_, _, true) => format!("read from {path} · read-only without synaps-dash"),
-            _ => "synaps-dash is not reachable: values unknown".into(),
+    /// DAEMON CONFIG; its header says where the values come from and, when
+    /// they cannot be written, why (the gate's first unproven link).
+    fn group_config(&self, p: &Palette, cx: &ViewCx, gate: &Result<(), String>, find: &str) -> (SharedString, Vec<AnyElement>) {
+        // The file the dash wrote, else the one read here.
+        let path = self
+            .dash
+            .config
+            .as_ref()
+            .map(|c| c.path.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.settings.reference.as_ref().map(|r| r.path.clone()))
+            .unwrap_or_else(|| "the local config".into());
+        let local = self.dash.is_local();
+        let line = match (gate, &self.dash.answer, self.dash.config.as_ref()) {
+            (Ok(()), _, _) => format!("{path} · saved through synaps-dash"),
+            (Err(why), Answer::Up, Some(_)) => format!("{path} · CONFIG read-only: {why}"),
+            (_, Answer::Down(Fail::Token), _) => "synaps-dash token changed: reconnect · CONFIG read-only".into(),
+            (_, Answer::Down(e), _) if !local => format!("{} · values unknown", self.fail_text(e)),
+            (Err(why), _, _) if local => format!("read from {path} · CONFIG read-only: {why}"),
+            (Err(why), _, _) => format!("values unknown · CONFIG read-only: {why}"),
         };
-        // The session rows' defaults show under them while a session is open.
+        // The session rows' defaults show under them while a session is
+        // open and the dash has them; else here.
         let session_open = self.model.tabs.current().is_some() && self.model.active.is_some();
+        let under_session = |key: &str| session_open && self.dash.config.as_ref().is_some_and(|c| c.exposes(key));
+        let writable = gate.is_ok();
         let mut out = Vec::new();
         for (cat, keys) in settings::CONFIG_GROUPS {
             let mut rows = Vec::new();
             for &key in keys {
-                if session_open && settings::SESSION_KEYS.contains(&key) {
+                if settings::SESSION_KEYS.contains(&key) && under_session(key) {
                     continue;
                 }
                 let Some(d) = settings::def(key) else { continue };
@@ -1021,7 +1082,7 @@ impl AppView {
                     label: d.label.into(),
                     key,
                     help: d.help,
-                    control: self.config_control(key, p, cx),
+                    control: self.config_control(key, writable, p, cx),
                     tag: self.applies(key),
                     under: self.config_under(key, p),
                 });
@@ -1042,10 +1103,7 @@ impl AppView {
                 if !settings::matches(find, d.label, d.key, d.help) {
                     continue;
                 }
-                let value = match self.settings.reference.as_ref() {
-                    Some(r) => settings::shown(d.key, r.get(d.key).map(String::as_str)),
-                    None => crate::usage::NONE.into(),
-                };
+                let value = self.reference_shown(d.key);
                 let first = lines.is_empty();
                 lines.push(
                     h_flex()
@@ -1067,7 +1125,12 @@ impl AppView {
             }
         }
         let n: usize = Cat::ORDER.iter().map(|&c| settings::reference(c).count()).sum();
-        let source = if self.dash.local == Some(true) { "values from the local config" } else { "a remote daemon's values: —" };
+        let source = match &self.settings.reference {
+            Some(settings::Reference { path, values: Ok(_) }) => format!("values from {path}"),
+            Some(settings::Reference { path, values: Err(e) }) => format!("{path} could not be read ({e}): —"),
+            None if self.dash.is_local() => "reading the local config".to_string(),
+            None => "a remote daemon's values: —".to_string(),
+        };
         (format!("{n} keys · edit with /settings in the TUI on the daemon's machine · {source}").into(), out)
     }
 

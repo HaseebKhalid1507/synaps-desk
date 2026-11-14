@@ -352,7 +352,7 @@ pub fn paths(host: Option<&str>, from: Option<i64>) -> Vec<(&'static str, String
             p.push(extra.to_string());
         }
         if let (true, Some(h)) = (with_host, host) {
-            p.push(format!("host={h}"));
+            p.push(format!("host={}", query_value(h)));
         }
         if let Some(f) = from {
             p.push(format!("from={f}"));
@@ -376,10 +376,24 @@ pub fn paths(host: Option<&str>, from: Option<i64>) -> Vec<(&'static str, String
 
 /// The per-host `summary` for the source line.
 pub fn source_path(host: &str, from: Option<i64>) -> String {
+    let host = query_value(host);
     match from {
         Some(f) => format!("/api/telemetry/summary?host={host}&from={f}"),
         None => format!("/api/telemetry/summary?host={host}"),
     }
+}
+
+/// A query value, percent-encoded (all but `A-Z a-z 0-9 - . _ ~`).
+pub fn query_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for b in v.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// The spend chart's switch.
@@ -574,6 +588,83 @@ pub fn age(ms: i64, now_ms: i64) -> String {
 
 // ── what the view draws ───────────────────────────────────────────────────
 
+/// A y axis: linear between `lo` and `hi`, or logarithmic (natural logs of
+/// the bounds).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Scale {
+    Linear(f64, f64),
+    Log(f64, f64),
+}
+
+impl Scale {
+    /// `v` as 0 (bottom) to 1 (top), clamped.
+    pub fn at(self, v: f64) -> f32 {
+        let (x, lo, hi) = match self {
+            Scale::Linear(lo, hi) => (v, lo, hi),
+            Scale::Log(lo, hi) => (v.max(1e-9).ln(), lo, hi),
+        };
+        if hi <= lo { 0. } else { ((x - lo) / (hi - lo)).clamp(0., 1.) as f32 }
+    }
+
+    /// The scale for these lines: from their lowest point to their highest,
+    /// logarithmic.
+    pub fn log_of(s: &Stack) -> Scale {
+        let (lo, hi) = s
+            .series
+            .iter()
+            .flat_map(|l| l.values.iter().flatten())
+            .filter(|v| **v > 0.)
+            .fold((f64::MAX, 0f64), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        if hi <= 0. { Scale::Log(0., 1.) } else { Scale::Log((lo * 0.8).ln(), (hi * 1.1).ln()) }
+    }
+
+    fn bounds(self) -> (f64, f64) {
+        match self {
+            Scale::Linear(lo, hi) | Scale::Log(lo, hi) => (lo, hi),
+        }
+    }
+}
+
+/// A plot's axes, laid out once per load: its scale, the y ticks (value
+/// and label) and the x ticks (day index and label).
+#[derive(Clone, Debug)]
+pub struct Axes {
+    pub scale: Scale,
+    pub y: Vec<(f64, String)>,
+    pub x: Vec<(usize, String)>,
+}
+
+impl Default for Axes {
+    fn default() -> Self {
+        Axes { scale: Scale::Linear(0., 1.), y: Vec::new(), x: Vec::new() }
+    }
+}
+
+impl Axes {
+    /// From 0 to the stack's max, round ticks.
+    fn linear(s: &Stack, fmt: fn(f64) -> String) -> Axes {
+        Axes { scale: Scale::Linear(0., s.max), y: y_ticks(s.max, fmt), x: x_ticks(&s.days) }
+    }
+
+    /// A fixed floor and ceiling: three ticks.
+    fn between(s: &Stack, lo: f64, hi: f64, fmt: fn(f64) -> String) -> Axes {
+        let mid = (lo + hi) / 2.;
+        Axes { scale: Scale::Linear(lo, hi), y: vec![(lo, fmt(lo)), (mid, fmt(mid)), (hi, fmt(hi))], x: x_ticks(&s.days) }
+    }
+
+    /// Logarithmic over the lines' points.
+    fn log(s: &Stack, fmt: fn(f64) -> String) -> Axes {
+        let scale = Scale::log_of(s);
+        let (lo, hi) = scale.bounds();
+        Axes { scale, y: log_ticks(lo, hi, fmt), x: x_ticks(&s.days) }
+    }
+
+    /// The y ticks as 0..1 of the plot (its grid lines).
+    pub fn fracs(&self) -> Vec<f32> {
+        self.y.iter().map(|(v, _)| self.scale.at(*v)).collect()
+    }
+}
+
 /// A stacked daily chart: one value per day per series, `None` a gap.
 #[derive(Clone, Debug, Default)]
 pub struct Stack {
@@ -590,9 +681,21 @@ pub struct Line {
     pub color: usize,
     pub values: Vec<Option<f64>>,
     pub total: f64,
+    /// Its readout with no day under the pointer: the range total (or the
+    /// last known day, for values that do not add up), formatted once.
+    pub label: String,
 }
 
 impl Stack {
+    /// Each line's readout label: its total, or (`latest`) its last day.
+    fn labeled(mut self, fmt: fn(f64) -> String, latest: bool) -> Self {
+        for l in &mut self.series {
+            l.label =
+                if latest { l.values.iter().rev().flatten().next().map_or_else(|| NONE.to_string(), |v| fmt(*v)) } else { fmt(l.total) };
+        }
+        self
+    }
+
     fn finish_bars(mut self) -> Self {
         self.max = (0..self.days.len()).map(|i| self.series.iter().map(|s| s.values[i].unwrap_or(0.)).sum::<f64>()).fold(0., f64::max);
         self
@@ -642,14 +745,20 @@ pub struct Board {
     pub hosts: Vec<String>,
     pub sources: Vec<SourceLine>,
     pub cells: Vec<Cell>,
-    /// Host, model, main / worker.
+    /// Host, model, main / worker, and their axes.
     pub spend: [Arc<Stack>; 3],
-    /// The day request-level data starts, as an index into the days.
-    pub request_ix: Option<usize>,
+    pub spend_axes: [Axes; 3],
+    /// The day request-level data starts (from the host-filtered series),
+    /// as an index into each spend stack's own days.
+    pub request_ix: [Option<usize>; 3],
     pub prompt: Arc<Stack>,
+    pub prompt_axes: Axes,
     pub models: Vec<(String, f64, f64)>,
     pub roles: Vec<(String, f64)>,
     pub hit: Arc<Stack>,
+    pub hit_axes: Axes,
+    /// Days whose hit rate is under the plot's 50 % floor (drawn at it).
+    pub hit_below: usize,
     pub legacy_until: Option<usize>,
     pub releases: Vec<(usize, String)>,
     pub saved: (Option<f64>, Option<f64>),
@@ -658,9 +767,12 @@ pub struct Board {
     pub misses: Vec<(String, u64)>,
     pub ttft: Arc<Stack>,
     pub total: Arc<Stack>,
+    pub ttft_axes: Axes,
+    pub total_axes: Axes,
     pub split: String,
     pub scatter: Arc<[(f32, f32)]>,
-    pub scatter_range: ((f64, f64), (f64, f64)),
+    /// Tokens across (x), total time up (y), both logarithmic.
+    pub scatter_axes: (Axes, Axes),
     pub heat: Vec<[u64; 24]>,
     pub heat_max: u64,
     pub agents: Vec<Agent>,
@@ -696,7 +808,8 @@ fn days_of<'a>(lists: impl Iterator<Item = &'a str>) -> Vec<String> {
 /// Series on a shared day axis; the five largest kept, the rest summed
 /// as `other` (when `top` is set).
 fn stack_of(spend: &Spend, keep: impl Fn(&str) -> bool, top: Option<usize>, color: impl Fn(&str, usize) -> usize) -> Stack {
-    let days = days_of(spend.series.iter().flat_map(|s| s.points.iter().map(|p| p.0.as_str())));
+    // The axis is the kept series' own: a host chip's chart starts at that host's first day.
+    let days = days_of(spend.series.iter().filter(|s| keep(&s.key)).flat_map(|s| s.points.iter().map(|p| p.0.as_str())));
     let ix: BTreeMap<&str, usize> = days.iter().enumerate().map(|(i, d)| (d.as_str(), i)).collect();
     let mut lines: Vec<Line> = spend
         .series
@@ -708,7 +821,7 @@ fn stack_of(spend: &Spend, keep: impl Fn(&str) -> bool, top: Option<usize>, colo
                 values[ix[d.as_str()]] = Some(v.unwrap_or(0.));
             }
             let total = values.iter().map(|v| v.unwrap_or(0.)).sum();
-            Line { key: s.key.clone(), color: 0, values, total }
+            Line { key: s.key.clone(), color: 0, values, total, label: String::new() }
         })
         .collect();
     lines.sort_by(|a, b| b.total.total_cmp(&a.total));
@@ -722,7 +835,7 @@ fn stack_of(spend: &Spend, keep: impl Fn(&str) -> bool, top: Option<usize>, colo
                 }
             }
         }
-        lines.push(Line { key: "other".into(), color: 5, values, total: rest.iter().map(|l| l.total).sum() });
+        lines.push(Line { key: "other".into(), color: 5, values, total: rest.iter().map(|l| l.total).sum(), label: String::new() });
     }
     for (rank, l) in lines.iter_mut().enumerate() {
         if l.key != "other" {
@@ -750,11 +863,15 @@ impl Board {
         };
         let rank = |k: &str| hosts.iter().position(|h| h == k).unwrap_or(0);
         // The spend charts.
-        let by_host = stack_of(&raw.spend_host, |k| host.is_none_or(|h| h == k), None, |k, _| host_color(k, rank(k).saturating_sub(3)));
-        let by_model = stack_of(&raw.spend_model, |_| true, Some(5), |_, r| r.min(4));
-        let by_role = stack_of(&raw.spend_role, |_| true, None, |k, _| if k == "main" { 0 } else { 1 });
-        let request_day = raw.spend_model.request_day().or(raw.spend_host.request_day());
-        let request_ix = request_day.and_then(|d| by_model.days.iter().position(|x| x.as_str() >= d)).filter(|&i| i > 0);
+        let by_host = stack_of(&raw.spend_host, |k| host.is_none_or(|h| h == k), None, |k, _| host_color(k, rank(k).saturating_sub(3)))
+            .labeled(money, false);
+        let by_model = stack_of(&raw.spend_model, |_| true, Some(5), |_, r| r.min(4)).labeled(money, false);
+        let by_role = stack_of(&raw.spend_role, |_| true, None, |k, _| if k == "main" { 0 } else { 1 }).labeled(money, false);
+        // The host-filtered series say where request-level data starts
+        // (`spend_host` is unfiltered: the chips come from it).
+        let request_day = raw.spend_model.request_day().or(raw.spend_role.request_day());
+        let request_at = |s: &Stack| request_day.and_then(|d| s.days.iter().position(|x| x.as_str() >= d)).filter(|&i| i > 0);
+        let request_ix = [request_at(&by_host), request_at(&by_model), request_at(&by_role)];
         let role_total = |k: &str| by_role.series.iter().find(|l| l.key == k).map(|l| l.total);
         // Cache.
         let cd = &raw.cache.daily;
@@ -764,15 +881,23 @@ impl Board {
         let cache_days: Vec<String> = cd.iter().map(|d| d.day.clone()).collect();
         let col = |key: &str, color: usize, f: fn(&CacheDay) -> Option<u64>| {
             let values: Vec<Option<f64>> = cd.iter().map(|d| Some(f(d).unwrap_or(0) as f64)).collect();
-            Line { key: key.into(), color, total: values.iter().flatten().sum(), values }
+            Line { key: key.into(), color, total: values.iter().flatten().sum(), values, label: String::new() }
         };
         let prompt = Stack {
             days: cache_days.clone().into(),
             series: vec![col("cache read", 0, |d| d.read), col("cache write", 1, |d| d.write), col("fresh input", 2, |d| d.fresh_input)],
             max: 0.,
         }
-        .finish_bars();
-        let hit_line = Line { key: "hit rate".into(), color: 0, values: cd.iter().map(|d| d.hit_pct).collect(), total: hit.unwrap_or(0.) };
+        .finish_bars()
+        .labeled(token_axis, false);
+        let hit_line = Line {
+            key: "hit rate".into(),
+            color: 0,
+            values: cd.iter().map(|d| d.hit_pct).collect(),
+            total: hit.unwrap_or(0.),
+            label: String::new(),
+        };
+        let hit_below = cd.iter().filter(|d| d.hit_pct.is_some_and(|v| v < HIT_FLOOR)).count();
         let legacy_until = cd.iter().rposition(|d| d.grain == "legacy").map(|i| i + 1);
         let releases = raw
             .cache
@@ -789,10 +914,10 @@ impl Board {
         let lat_days: Vec<String> = ld.iter().map(|d| d.day.clone()).collect();
         let lat = |key: &str, color: usize, f: fn(&LatencyDay) -> Option<f64>| {
             let values: Vec<Option<f64>> = ld.iter().map(|d| f(d).filter(|v| *v > 0.)).collect();
-            Line { key: key.into(), color, total: 0., values }
+            Line { key: key.into(), color, total: 0., values, label: String::new() }
         };
-        let ttft = lines_of(lat_days.clone(), vec![lat("p50", 0, |d| d.ttft_p50), lat("p95", 0, |d| d.ttft_p95)]);
-        let total = lines_of(lat_days, vec![lat("p50", 1, |d| d.total_p50), lat("p95", 1, |d| d.total_p95)]);
+        let ttft = lines_of(lat_days.clone(), vec![lat("p50", 0, |d| d.ttft_p50), lat("p95", 0, |d| d.ttft_p95)]).labeled(secs, true);
+        let total = lines_of(lat_days, vec![lat("p50", 1, |d| d.total_p50), lat("p95", 1, |d| d.total_p95)]).labeled(secs, true);
         let sp = &raw.latency.split;
         let split = format!(
             "headers p50 {}  ·  first event p50 {}  ·  stream p50 {}  ·  retries {}",
@@ -921,29 +1046,40 @@ impl Board {
         let mut ingest: Vec<Source> = h.ingest.sources.iter().filter(|x| host.is_none_or(|hh| hh == x.host)).cloned().collect();
         ingest.sort_by(|a, b| (a.host.as_str(), a.kind.as_str()).cmp(&(b.host.as_str(), b.kind.as_str())));
         let notes = notes(host, raw, request_day);
+        let hit_stack = lines_of(cache_days, vec![hit_line]).labeled(pct, false);
+        let scatter_axes = (
+            Axes { scale: Scale::Log(xr.0, xr.1), y: log_ticks(xr.0, xr.1, token_axis), x: Vec::new() },
+            Axes { scale: Scale::Log(yr.0, yr.1), y: log_ticks(yr.0, yr.1, secs), x: Vec::new() },
+        );
         Board {
             range,
             generated_at: raw.summary.generated_at,
             hosts,
             sources,
             cells,
+            spend_axes: [Axes::linear(&by_host, money), Axes::linear(&by_model, money), Axes::linear(&by_role, money)],
             spend: [Arc::new(by_host), Arc::new(by_model), Arc::new(by_role)],
             request_ix,
+            prompt_axes: Axes::linear(&prompt, token_axis),
             prompt: Arc::new(prompt),
             models,
             roles,
-            hit: Arc::new(lines_of(cache_days, vec![hit_line])),
+            hit_axes: Axes::between(&hit_stack, HIT_FLOOR, 100., |v| format!("{v:.0} %")),
+            hit: Arc::new(hit_stack),
+            hit_below,
             legacy_until,
             releases,
             saved: (s.saved_by_cache, s.saved_by_cache_net),
             writes: (sum(|d| d.write_5m), sum(|d| d.write_1h), sum(|d| d.write_unknown)),
             keepwarm: raw.cache.keepwarm.clone(),
             misses: raw.cache.miss_reasons.iter().map(|m| (m.reason.clone().unwrap_or_else(|| "unknown".into()), m.count)).collect(),
+            ttft_axes: Axes::log(&ttft, secs),
+            total_axes: Axes::log(&total, secs),
             ttft: Arc::new(ttft),
             total: Arc::new(total),
             split,
             scatter,
-            scatter_range: (xr, yr),
+            scatter_axes,
             heat,
             heat_max,
             agents: raw.agents.agents.clone(),
@@ -957,6 +1093,14 @@ impl Board {
             notes,
         }
     }
+}
+
+/// The hit-rate plot's floor (%): days under it are drawn at it, and counted.
+pub const HIT_FLOOR: f64 = 50.;
+
+/// Tokens on an axis.
+fn token_axis(v: f64) -> String {
+    tokens(v as u64)
 }
 
 /// What each section cannot show (spec section 5), from what v1 says:
@@ -973,7 +1117,9 @@ fn notes(host: Option<&str>, raw: &Raw, request_day: Option<&str>) -> Notes {
     let no_ttft = raw.latency.daily.iter().all(|d| d.ttft_p50.is_none());
     let unknown = host == Some("unknown");
     Notes {
-        headline: "API-equivalent at list price. Compaction calls are not in the api-log, so request-level spend undercounts a session's own total."
+        headline: "API-equivalent at list price. Compaction calls are not in the api-log, so request-level spend undercounts a session's own total. \
+                   TOKENS is session totals, where sessions from before cache totals were kept count no cache reads; the prompt chart below is \
+                   request-level, so the two differ."
             .into(),
         spend: grain,
         tokens: "Output tokens per day need the store's daily totals (not in API v1): prompt tokens only.".into(),
@@ -993,7 +1139,8 @@ fn notes(host: Option<&str>, raw: &Raw, request_day: Option<&str>) -> Notes {
             "TTFT is sampled: older api-log rows carry no first-event time, so its days have fewer samples than requests.".into()
         },
         activity: "Requests and sessions per day need the store's daily totals (not in API v1): the hour grid only.".into(),
-        agents: "Runs count worker archives as stored: avante's copies of bella's archives count twice (329 runs).".into(),
+        agents: "Runs count worker archives as stored: avante's copies of bella's archives count twice (329 runs when measured on 2026-11-14)."
+            .into(),
         sessions: "MAIN CONVERSATION is session_cost alone; a session's workers are not in it. Sessions belong to the host that began them."
             .into(),
     }
@@ -1106,12 +1253,35 @@ mod tests {
         assert_eq!((day.as_str(), money(v)), ("2026-11-11", "$225.02".to_string()));
         assert!((v - 225.02).abs() < 0.01);
         assert_eq!(b.ttft.days.iter().position(|d| d == "2026-11-11").map(|i| fixture("all").latency.daily[i].n), Some(Some(633)));
-        // Request-level from 2026-06-12, as the dotted rule.
-        assert_eq!(b.request_ix.map(|i| b.spend[1].days[i].as_str()), Some("2026-06-12"));
+        // Request-level from 2026-06-12, as the dotted rule, on each stack's own axis.
+        for i in 0..3 {
+            assert_eq!(b.request_ix[i].map(|ix| b.spend[i].days[ix].as_str()), Some("2026-06-12"), "stack {i}");
+        }
+        // Formatted once per load: the readout totals and the axes.
+        assert_eq!(b.spend[0].series.iter().map(|l| l.total).sum::<f64>().round(), 4_689.);
+        assert!(b.spend[0].series.iter().all(|l| l.label == money(l.total)));
+        assert!(!b.spend_axes[0].y.is_empty() && b.hit_axes.y.len() == 3);
         // Model view: five and `other`.
         assert_eq!(b.spend[1].series.len(), 6);
         assert_eq!(b.spend[1].series[5].key, "other");
         assert_eq!(b.spend[1].series[0].key, "claude-opus-4-6");
+    }
+
+    /// M5: a host chip's HOST chart starts at that host's first day, and
+    /// the dotted rule sits on that host's first request-level day there.
+    #[test]
+    fn a_host_chips_charts_share_its_own_days() {
+        let raw = fixture("bella");
+        let b = Board::build(&raw, Some("bella"), Range::All, 1_794_654_869_189);
+        assert_eq!(b.spend[0].series.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(), ["bella"]);
+        assert_eq!(b.spend[0].days.first(), b.spend[1].days.first(), "the HOST axis is bella's, not every host's");
+        let day = raw.spend_model.request_day().unwrap();
+        for i in 0..3 {
+            let ix = b.request_ix[i].unwrap_or_else(|| panic!("stack {i}"));
+            assert!(b.spend[i].days[ix].as_str() >= day && b.spend[i].days[ix - 1].as_str() < day, "stack {i}");
+        }
+        // L10: days under the floor are counted.
+        assert_eq!(b.hit_below, raw.cache.daily.iter().filter(|d| d.hit_pct.is_some_and(|v| v < HIT_FLOOR)).count());
     }
 
     #[test]
@@ -1159,6 +1329,9 @@ mod tests {
         assert!(p.iter().any(|(k, u)| *k == "sessions" && u == "/api/telemetry/sessions?sort=cost&limit=25&host=bella&from=5"));
         assert_eq!(paths(None, None)[0].1, "/api/telemetry/summary");
         assert_eq!(source_path("jade", None), "/api/telemetry/summary?host=jade");
+        // A host name is a query value, encoded.
+        assert_eq!(source_path("a b&c=d", Some(1)), "/api/telemetry/summary?host=a%20b%26c%3Dd&from=1");
+        assert!(paths(Some("x/y"), None).iter().any(|(_, u)| u == "/api/telemetry/summary?host=x%2Fy"));
     }
 
     #[test]

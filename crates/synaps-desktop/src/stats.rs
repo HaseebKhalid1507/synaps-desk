@@ -59,7 +59,7 @@ impl Tokens {
 
 /// `RuntimeView`'s fields the header, the gauge and Settings' THIS
 /// SESSION use.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RuntimeInfo {
     pub model: String,
     /// `reasoning_level` (else `thinking_level`): "high", "low", "off", ...

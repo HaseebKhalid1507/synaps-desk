@@ -176,9 +176,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(smaller, TextSmaller, None),
         KeyBinding::new(reset, TextReset, None),
     ];
-    let (settings, usage) = crate::views::view_keys(mac);
+    let (settings, usage, usage_alt) = crate::views::view_keys(mac);
     keys.push(KeyBinding::new(settings, OpenSettings, None));
     keys.push(KeyBinding::new(usage, OpenUsage, None));
+    if let Some(k) = usage_alt {
+        keys.push(KeyBinding::new(k, OpenUsage, None));
+    }
     for &(k, t) in tab_keys(mac) {
         keys.push(match t {
             TabKey::New => KeyBinding::new(k, NewTab, None),
@@ -582,7 +585,7 @@ fn tab_fallback<A: Action>(key: TabKey, view: WeakEntity<AppView>, window: AnyWi
 
 /// A fold is saved this long after the last one, off the UI thread: a
 /// burst of folds is one write.
-const SAVE_DELAY: Duration = Duration::from_millis(400);
+pub(crate) const SAVE_DELAY: Duration = Duration::from_millis(400);
 /// The pointer rests this long on a rail row before its readout opens.
 const READOUT_DELAY: Duration = Duration::from_millis(400);
 
@@ -836,6 +839,16 @@ pub struct AppView {
     pub(crate) gear_menu: bool,
     pub(crate) gear_dismissed: Option<Point<Pixels>>,
     shown_view: Option<crate::tabs::Kind>,
+    shown_views: usize,
+    /// The panes Settings and Usage draw in (cached: [`crate::views::ViewPane`]),
+    /// their width, what they read of the rest of the app at the last frame
+    /// ([`AppView::view_inputs`] and the theme), and whether the window is
+    /// in front (the dash poll waits while it is not).
+    pub(crate) settings_pane: Entity<crate::views::ViewPane>,
+    pub(crate) usage_pane: Entity<crate::views::ViewPane>,
+    pub(crate) view_width: f32,
+    view_seen: Option<(u64, theme::Choice)>,
+    pub(crate) window_active: bool,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -961,7 +974,7 @@ impl AppView {
                 InputEvent::Blur => {
                     let was = this.settings.editing.take();
                     if was.is_some() {
-                        cx.notify();
+                        this.views_changed(cx);
                     }
                 }
                 _ => {}
@@ -999,14 +1012,32 @@ impl AppView {
         subs.push(cx.on_release(|this, _| {
             this.flush_panels();
             this.flush_tabs();
+            this.flush_app();
         }));
         subs.push(cx.on_app_quit(|this, _| {
             this.flush_panels();
             this.flush_tabs();
+            this.flush_app();
             async {}
         }));
+        // The dash poll waits while the window is in the background.
+        subs.push(cx.observe_window_activation(window, |this, window, cx| this.window_activated(window.is_window_active(), cx)));
         crate::views::view_fallbacks(cx.weak_entity(), cx);
-        let inputs = Inputs { composer, find_input, name_input, hex_input, secret_input, settings_find, settings_input, focus };
+        let me = cx.weak_entity();
+        let settings_pane = cx.new(|_| crate::views::ViewPane::new(me.clone(), crate::tabs::Kind::Settings));
+        let usage_pane = cx.new(|_| crate::views::ViewPane::new(me, crate::tabs::Kind::Usage));
+        let inputs = Inputs {
+            composer,
+            find_input,
+            name_input,
+            hex_input,
+            secret_input,
+            settings_find,
+            settings_input,
+            settings_pane,
+            usage_pane,
+            focus,
+        };
         match (client, synthetic) {
             (Some((c, rx)), _) => {
                 let mut v = Self::blank(inputs, Some(c), ConnState::Connecting, subs);
@@ -1122,6 +1153,12 @@ impl AppView {
             gear_menu: false,
             gear_dismissed: None,
             shown_view: None,
+            shown_views: 0,
+            settings_pane: i.settings_pane,
+            usage_pane: i.usage_pane,
+            view_width: 0.,
+            view_seen: None,
+            window_active: true,
             _tasks: Vec::new(),
             _subs: subs,
         }
@@ -1150,6 +1187,8 @@ impl AppView {
                     this.start_tabs();
                     // An attach may have named or merged the visible tab.
                     this.reconcile(None);
+                    // A Welcome: the daemon's place and dash are looked for.
+                    this.dash_on_welcome(cx);
                     // An idle daemon's poll changes nothing: no frame, unless
                     // the rail's ages have a new minute to show.
                     if this.model.view_dirty || this.rail.minute() != crate::chrome::now_secs() / 60 {
@@ -2825,6 +2864,8 @@ struct Inputs {
     secret_input: Entity<InputState>,
     settings_find: Entity<InputState>,
     settings_input: Entity<InputState>,
+    settings_pane: Entity<crate::views::ViewPane>,
+    usage_pane: Entity<crate::views::ViewPane>,
     focus: FocusHandle,
 }
 
@@ -2844,11 +2885,31 @@ impl Render for AppView {
         }
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
-        // Settings or Usage came on screen: what it shows is asked for if stale.
+        // Settings or Usage came on screen (or one closed): after this
+        // frame, never inside it, what it shows is asked for if stale.
         let view = self.model.tabs.view();
-        if view != self.shown_view {
-            self.shown_view = view;
-            self.view_shown(cx);
+        let open_views = self.model.tabs.iter().filter(|t| t.kind != crate::tabs::Kind::Session).count();
+        if (view, open_views) != (self.shown_view, self.shown_views) {
+            (self.shown_view, self.shown_views) = (view, open_views);
+            let me = cx.weak_entity();
+            cx.defer(move |cx| {
+                let _ = me.update(cx, |v, cx| v.view_shown(cx));
+            });
+        }
+        // What the view on screen reads of the rest of the app changed (the
+        // daemon, the session, the panels, the theme): its cached pane draws
+        // again, next frame.
+        if let Some(k) = view {
+            let key = self.view_inputs(k);
+            let scheme = &cx.global::<theme::Scheme>().choice;
+            if self.view_seen.as_ref().is_none_or(|(seen, c)| *seen != key || c != scheme) {
+                let first = self.view_seen.is_none();
+                self.view_seen = Some((key, scheme.clone()));
+                if !first {
+                    let pane = self.pane(k).clone();
+                    cx.defer(move |cx| pane.update(cx, |_, cx| cx.notify()));
+                }
+            }
         }
         // A drag released outside the window has no drop: it ends here.
         if self.drag.is_some_and(|g| g.moved) && !cx.has_active_drag() {
@@ -2892,11 +2953,12 @@ impl Render for AppView {
             .pr(px(pad_r))
             .pt(px((8. * m.r).round()))
             .pb(px((28. * m.r).round()));
-        let shown_view = match view {
-            Some(crate::tabs::Kind::Settings) => Some(self.render_settings(view_pane, &p, cx)),
-            Some(crate::tabs::Kind::Usage) => Some(self.render_usage(view_pane, &p, cx)),
-            _ => None,
-        };
+        // A view draws in its own cached pane: this frame (a session
+        // streaming behind it) reuses its last paint.
+        let shown_view = view.filter(|k| *k != crate::tabs::Kind::Session).map(|k| {
+            self.view_width = view_pane;
+            AnyView::from(self.pane(k).clone()).cached(StyleRefinement::default().size_full())
+        });
         let main = if let Some(v) = shown_view {
             v_flex().flex_1().h_full().min_w_0().bg(p.canvas).child(tabs).child(div().flex_1().min_h_0().child(v))
         } else {
@@ -2946,7 +3008,7 @@ impl Render for AppView {
                         window.focus(&this.focus, cx);
                     }
                     cx.stop_propagation();
-                    cx.notify();
+                    this.views_changed(cx);
                 } else if ev.keystroke.key == "escape" && this.find_input.read(cx).focus_handle(cx).is_focused(window) {
                     this.find_input.update(cx, |s, cx| s.set_value("", window, cx));
                     this.find.clear();

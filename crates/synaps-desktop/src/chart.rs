@@ -1,49 +1,33 @@
 //! Usage's charts on GPUI's `canvas()`: bars are quads, lines one stroked
 //! path per run, grid lines `hair`. No chart library, no animation: a
-//! chart paints when its view repaints (data, a filter, the pointer).
-//! The data is laid out once per load ([`crate::usage::Board`]); a paint
-//! only scales it to the plot's bounds.
+//! chart paints when its pane draws (data, a filter, the pointer, a
+//! scroll). The data and axes are laid out once per load
+//! ([`crate::usage::Board`]); a line chart's paths are tessellated once per
+//! plot size ([`Paths`]) and only moved to where the plot is painted.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::*;
 
+pub use crate::usage::Scale;
 use crate::usage::Stack;
 
 /// Where a plot was painted last (the pointer's day is read from it).
 pub type Spot = Rc<Cell<Option<Bounds<Pixels>>>>;
 
-/// A y axis: linear between `lo` and `hi`, or logarithmic (natural logs of
-/// the bounds).
+/// A line chart's paths at the origin, for the plot size they were built
+/// for, with how each is inked: a hover or a scroll paints them again
+/// without tessellating. Emptied with each load.
+pub type Paths = Rc<RefCell<Option<(Size<Pixels>, Vec<(Path<Pixels>, Stroke)>)>>>;
+
+/// How a cached path is inked: a series (its colour, thin) or the grid
+/// colour (legacy days).
 #[derive(Clone, Copy, Debug)]
-pub enum Scale {
-    Linear(f64, f64),
-    Log(f64, f64),
-}
-
-impl Scale {
-    /// `v` as 0 (bottom) to 1 (top), clamped.
-    pub fn at(self, v: f64) -> f32 {
-        let (x, lo, hi) = match self {
-            Scale::Linear(lo, hi) => (v, lo, hi),
-            Scale::Log(lo, hi) => (v.max(1e-9).ln(), lo, hi),
-        };
-        if hi <= lo { 0. } else { ((x - lo) / (hi - lo)).clamp(0., 1.) as f32 }
-    }
-
-    /// The scale for these lines: from 0 (linear) or their lowest point
-    /// (log) to their highest.
-    pub fn log_of(s: &Stack) -> Scale {
-        let (lo, hi) = s
-            .series
-            .iter()
-            .flat_map(|l| l.values.iter().flatten())
-            .filter(|v| **v > 0.)
-            .fold((f64::MAX, 0f64), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-        if hi <= 0. { Scale::Log(0., 1.) } else { Scale::Log((lo * 0.8).ln(), (hi * 1.1).ln()) }
-    }
+pub enum Stroke {
+    Series(usize, bool),
+    Grid,
 }
 
 /// The colours a chart paints with.
@@ -143,6 +127,7 @@ pub fn lines(
     marks: Vec<usize>,
     hover: Option<usize>,
     spot: Spot,
+    paths: Paths,
 ) -> impl IntoElement {
     canvas(
         |_, _, _| (),
@@ -163,50 +148,91 @@ pub fn lines(
                 let x = x_of(m).floor();
                 window.paint_quad(fill(Bounds::new(point(x, b.origin.y + b.size.height - px(6.)), size(px(1.), px(6.))), ink.rule));
             }
+            // A lone day is a dot (a quad, cheap): painted here each time.
             for (si, l) in s.series.iter().enumerate() {
                 let thin = thin.get(si).copied().unwrap_or(false);
-                let base = ink.series[l.color.min(5)];
-                let color = if thin { base.opacity(0.5) } else { base };
-                // One path per run of known days; a lone day is a dot.
-                let mut i = 0;
-                while i < n {
-                    if l.values[i].is_none() {
-                        i += 1;
-                        continue;
-                    }
-                    let start = i;
-                    while i < n && l.values[i].is_some() {
-                        i += 1;
-                    }
-                    let run = start..i;
-                    let paint = |from: usize, to: usize, c: Hsla, window: &mut Window| {
-                        if to - from == 1 {
-                            let (x, y) = (x_of(from), y_of(l.values[from].unwrap_or(0.)));
-                            window.paint_quad(fill(Bounds::new(point(x - px(1.5), y - px(1.5)), size(px(3.), px(3.))), c));
-                            return;
-                        }
-                        let mut p = PathBuilder::stroke(px(if thin { 1. } else { 1.5 }));
-                        p.move_to(point(x_of(from), y_of(l.values[from].unwrap_or(0.))));
-                        for (j, v) in l.values.iter().enumerate().take(to).skip(from + 1) {
-                            p.line_to(point(x_of(j), y_of(v.unwrap_or(0.))));
-                        }
-                        if let Ok(path) = p.build() {
-                            window.paint_path(path, c);
-                        }
-                    };
-                    match dim_until.filter(|&d| d > run.start) {
-                        Some(d) if d < run.end => {
-                            paint(run.start, d + 1, ink.grid, window);
-                            paint(d, run.end, color, window);
-                        }
-                        Some(_) => paint(run.start, run.end, ink.grid, window),
-                        None => paint(run.start, run.end, color, window),
+                for i in 0..n {
+                    let alone = l.values[i].is_some() && (i == 0 || l.values[i - 1].is_none()) && (i + 1 == n || l.values[i + 1].is_none());
+                    if alone {
+                        let c = if dim_until.is_some_and(|d| i < d) { ink.grid } else { color_of(Stroke::Series(l.color, thin), &ink) };
+                        let (x, y) = (x_of(i), y_of(l.values[i].unwrap_or(0.)));
+                        window.paint_quad(fill(Bounds::new(point(x - px(1.5), y - px(1.5)), size(px(3.), px(3.))), c));
                     }
                 }
+            }
+            let cached = paths.borrow().as_ref().filter(|(at, _)| *at == b.size).map(|(_, v)| v.clone());
+            let built = cached.unwrap_or_else(|| {
+                let v = build_lines(&s, scale, &thin, dim_until, b.size);
+                *paths.borrow_mut() = Some((b.size, v.clone()));
+                v
+            });
+            for (mut path, stroke) in built {
+                for v in &mut path.vertices {
+                    v.xy_position += b.origin;
+                }
+                path.bounds.origin += b.origin;
+                window.paint_path(path, color_of(stroke, &ink));
             }
         },
     )
     .size_full()
+}
+
+fn color_of(stroke: Stroke, ink: &Ink) -> Hsla {
+    match stroke {
+        Stroke::Series(c, thin) => {
+            let base = ink.series[c.min(5)];
+            if thin { base.opacity(0.5) } else { base }
+        }
+        Stroke::Grid => ink.grid,
+    }
+}
+
+/// The paths of a line chart `size` large at the origin: one per run of
+/// known days (two or more), split where legacy days end.
+fn build_lines(s: &Stack, scale: Scale, thin: &[bool], dim_until: Option<usize>, size: Size<Pixels>) -> Vec<(Path<Pixels>, Stroke)> {
+    let n = s.days.len();
+    let step = size.width / n as f32;
+    let x_of = |i: usize| step * (i as f32 + 0.5);
+    let y_of = |v: f64| size.height * (1. - scale.at(v));
+    let mut out = Vec::new();
+    for (si, l) in s.series.iter().enumerate() {
+        let thin = thin.get(si).copied().unwrap_or(false);
+        let own = Stroke::Series(l.color, thin);
+        let mut i = 0;
+        while i < n {
+            if l.values[i].is_none() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < n && l.values[i].is_some() {
+                i += 1;
+            }
+            let mut push = |from: usize, to: usize, stroke: Stroke| {
+                if to - from < 2 {
+                    return;
+                }
+                let mut p = PathBuilder::stroke(px(if thin { 1. } else { 1.5 }));
+                p.move_to(point(x_of(from), y_of(l.values[from].unwrap_or(0.))));
+                for (j, v) in l.values.iter().enumerate().take(to).skip(from + 1) {
+                    p.line_to(point(x_of(j), y_of(v.unwrap_or(0.))));
+                }
+                if let Ok(path) = p.build() {
+                    out.push((path, stroke));
+                }
+            };
+            match dim_until.filter(|&d| d > start) {
+                Some(d) if d < i => {
+                    push(start, d + 1, Stroke::Grid);
+                    push(d, i, own);
+                }
+                Some(_) => push(start, i, Stroke::Grid),
+                None => push(start, i, own),
+            }
+        }
+    }
+    out
 }
 
 /// 2-px squares at half strength; points already on 0..1 both ways.

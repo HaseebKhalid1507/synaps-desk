@@ -3,19 +3,22 @@
 //!
 //! - APP: `settings.json` on this machine ([`crate::theme`]), always.
 //! - SESSION: the running session. Shown from its `RuntimeView`; read-only
-//!   here until `synaps-client` can send `Set` (PR #9).
+//!   here until this client can change a running session.
 //! - CONFIG: `<base>/config` on the daemon's machine, through synaps-dash's
 //!   `POST /api/config` ([`crate::dash`]): only when the daemon is local and
 //!   the dash says the file is writable. The desktop never writes or
 //!   parses that file itself; the dash validates, locks and writes it.
 //! - REFERENCE: the keys the dash does not expose, shown with the value a
-//!   local daemon's config holds (`key = value`, last wins), never written.
+//!   local daemon's config holds (`key = value`, last wins, only the TUI's
+//!   own rows kept), never written.
 //!
 //! [`ALL`] is the TUI's `ALL_SETTINGS` (agent-runtime `dev` 0932c7c1,
 //! `crates/agent-tui/src/tui/settings/defs.rs`): its 88 rows, labels and
 //! help, in its order.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 
 /// The TUI's categories (REFERENCE rows are sub-headed by them).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,21 +294,70 @@ pub fn first_sentence(help: &str) -> &str {
 }
 
 /// A row matches the find text (lowercase) by its label, key or help.
+/// Allocates nothing (it runs for every row on every frame of a find).
 pub fn matches(find: &str, label: &str, key: &str, help: &str) -> bool {
-    find.is_empty() || [label, key, help].iter().any(|s| s.to_lowercase().contains(find))
+    find.is_empty() || [label, key, help].iter().any(|s| contains_lower(s, find))
+}
+
+/// `hay` contains `needle` (lowercase), ignoring case.
+fn contains_lower(hay: &str, needle: &str) -> bool {
+    if hay.is_ascii() && needle.is_ascii() {
+        let (h, n) = (hay.as_bytes(), needle.as_bytes());
+        return n.len() <= h.len() && h.windows(n.len()).any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b));
+    }
+    hay.to_lowercase().contains(needle)
 }
 
 /// `key = value` lines, the last of a key winning, as Synaps' parser and
-/// the dash read them; comments and other lines skipped. Only for the
-/// REFERENCE values of a local daemon (never written back).
+/// the dash read them; comments and other lines skipped. Only the TUI's
+/// own rows are kept (an allowlist: no `bridge.*`, `shell.*`, extension
+/// keys or secrets are held), for the REFERENCE values of a local daemon
+/// (never written back).
 pub fn read_config(text: &str) -> HashMap<String, String> {
     let mut m = HashMap::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
-        if let Some((k, v)) = line.split_once('=').filter(|(k, _)| !secret(k.trim())) {
-            m.insert(k.trim().to_string(), v.trim().to_string());
+        if let Some((k, v)) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim())).filter(|(k, _)| def(k).is_some() && !secret(k)) {
+            m.insert(k.to_string(), v.to_string());
         }
     }
     m
+}
+
+/// A local daemon's config for REFERENCE: no file is all defaults; a file
+/// that cannot be read is `Err` (its rows show `—`).
+pub fn read_reference(base: &Path, profile: Option<&str>) -> Reference {
+    let path = crate::theme::read_path(base, profile, "config");
+    let values = match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Arc::new(read_config(&text))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Arc::default()),
+        Err(e) => Err(e.to_string()),
+    };
+    Reference { path: crate::named::home_short(&path.display().to_string()), values }
+}
+
+/// A local daemon's config as read: the file (the profile's, else the
+/// base one, as Synaps finds it; `~`-shortened) and its values.
+#[derive(Clone, Debug)]
+pub struct Reference {
+    pub path: String,
+    pub values: Result<Arc<HashMap<String, String>>, String>,
+}
+
+/// A CONFIG number's range, as synaps-dash's `CONFIG_KEYS` takes it
+/// (`intIn(lo, hi)`: 1 to 9 digits, inclusive).
+pub fn range(key: &str) -> Option<(u64, u64)> {
+    Some(match key {
+        "api_retries" => (0, 20),
+        "refusal_retries" => (0, 10),
+        "subagent_timeout" => (10, 86_400),
+        "max_tool_output" => (1024, 4 << 20),
+        "bash_timeout" => (1, 3600),
+        "bash_max_timeout" => (1, 86_400),
+        "events.auto_turn_cap" => (0, 1000),
+        "daemon.idle_exit_secs" | "daemon.prompt_abandon_secs" | "daemon.parked_evict_secs" => (0, 604_800),
+        "startup.extensions_ready_timeout_secs" => (1, 600),
+        _ => return None,
+    })
 }
 
 /// Secrets never shown, even in REFERENCE (none of its rows is one; the
@@ -317,16 +369,22 @@ pub fn secret(key: &str) -> bool {
         || key.contains("token") && !key.ends_with("_tokens")
 }
 
-/// A typed value checked before it is sent, as the dash would (its
-/// refusal is the same words): `None` is fine.
+/// A typed value checked before it is sent, by the dash's own rules (its
+/// own refusal, worded its way, still comes back for anything else):
+/// `None` is fine.
 pub fn check(key: &str, typed: &str) -> Option<String> {
     let v = typed.trim();
     if v.is_empty() {
         return None;
     }
+    let whole = (1..=9).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_digit());
     match def(key).map(|d| d.ctl) {
         Some(Ctl::Model) if !model_ok(v) => Some(format!("{key}: expected provider/model, got {v:?}")),
-        Some(Ctl::Number) if v.parse::<f64>().is_err() => Some(format!("{key}: expected a number, got {v:?}")),
+        Some(Ctl::Number) if !whole => Some(format!("{key}: expected a whole number, got {v:?}")),
+        Some(Ctl::Number) => match (range(key), v.parse::<u64>()) {
+            (Some((lo, hi)), Ok(n)) if n < lo || n > hi => Some(format!("{key}: expected {lo} to {hi}, got {n}")),
+            _ => None,
+        },
         Some(Ctl::Choice(opts)) if !opts.contains(&v) && config_choices(key).is_none_or(|c| !c.contains(&v)) => {
             Some(format!("{key}: expected one of {}", opts.join(", ")))
         }
@@ -410,6 +468,9 @@ mod tests {
         assert_eq!(m.get("model").map(String::as_str), Some("c/d"));
         assert_eq!(m.get("turn_budget.worker.max_cost_usd").map(String::as_str), Some("2.50"));
         assert_eq!(m.len(), 2);
+        // L1: an allowlist of the TUI's rows; nothing else is held.
+        let other = read_config("bridge.url = x\nshell.rc = y\nextension.foo.api_key = k\nextension.foo.secret = s\nmax_fps = 30\n");
+        assert_eq!(other.into_iter().collect::<Vec<_>>(), [("max_fps".to_string(), "30".to_string())]);
         assert!(model_ok("anthropic/claude-opus-4-1") && model_ok("openai/gpt-5:latest"));
         assert!(!model_ok("claude") && !model_ok("a/") && !model_ok("a b/c"));
         assert!(read_config("auth.token = x\nprovider.openai.key = y\nmodel = a/b\n").len() == 1, "secrets never read");
@@ -424,5 +485,47 @@ mod tests {
         assert_eq!(check("thinking_display", "omitted"), None);
         assert!(check("thinking_display", "loud").is_some());
         assert_eq!(check("model", "  "), None, "empty unsets");
+        // L5: the dash's `^\d{1,9}$` within its range.
+        for bad in ["2.5", "-1", "1e3", "NaN", "inf", "+3", "1234567890"] {
+            assert!(check("api_retries", bad).is_some_and(|m| m.contains("whole number")), "{bad}");
+        }
+        assert_eq!(check("api_retries", "20"), None);
+        assert_eq!(check("api_retries", "21").as_deref(), Some("api_retries: expected 0 to 20, got 21"));
+        assert!(check("subagent_timeout", "9").is_some() && check("subagent_timeout", "86400").is_none());
+        for (_, keys) in CONFIG_GROUPS {
+            for k in keys.iter().filter(|k| def(k).is_some_and(|d| d.ctl == Ctl::Number)) {
+                assert!(range(k).is_some(), "{k}: every CONFIG number has the dash's range");
+            }
+        }
+    }
+
+    #[test]
+    fn find_matches_any_case_without_allocating() {
+        assert!(matches("", "x", "", ""));
+        assert!(matches("api", "API retries", "api_retries", ""));
+        assert!(matches("retr", "x", "API_RETRIES", ""));
+        assert!(!matches("zzz", "API retries", "api_retries", "help"));
+        assert!(matches("ü", "Grüße", "", ""));
+    }
+
+    #[test]
+    fn an_unreadable_config_is_an_error_a_missing_one_defaults() {
+        let base = std::env::temp_dir().join(format!("sd-ref-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(read_reference(&base, None).values.unwrap().is_empty(), "no file: every row default");
+        std::fs::write(base.join("config"), "max_fps = 30\nauth.token = t\n").unwrap();
+        assert_eq!(read_reference(&base, None).values.unwrap().len(), 1);
+        // A profile's own file when it has one; the path read is the one shown.
+        std::fs::create_dir_all(base.join("p")).unwrap();
+        std::fs::write(base.join("p/config"), "api_retries = 4\n").unwrap();
+        let r = read_reference(&base, Some("p"));
+        assert!(r.path.ends_with("/p/config"), "{}", r.path);
+        assert_eq!(r.values.unwrap().get("api_retries").map(String::as_str), Some("4"));
+        assert!(read_reference(&base, Some("q")).path.ends_with(&format!("sd-ref-{}/config", std::process::id())));
+        // A directory where the file should be: unreadable, not "default".
+        std::fs::remove_file(base.join("config")).unwrap();
+        std::fs::create_dir_all(base.join("config")).unwrap();
+        assert!(read_reference(&base, None).values.is_err());
+        std::fs::remove_dir_all(&base).ok();
     }
 }

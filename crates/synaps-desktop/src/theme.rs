@@ -135,7 +135,7 @@ pub fn step(ground: u32, toward: u32, target: f64) -> u32 {
 // ── which theme ───────────────────────────────────────────────────────────
 
 /// Where the theme or the accent came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Source {
     Flag,
     Env,
@@ -909,7 +909,7 @@ pub fn save_theme(path: &Path, name: Option<&str>) -> std::io::Result<()> {
 /// (`history_open`, a list of bucket names; missing or not a list: NAMED
 /// and TODAY) and the centre pane's text size (`text_size`, one of
 /// [`TEXT_STEPS`]; anything else: [`DEFAULT_TEXT`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Panels {
     pub rail_collapsed: bool,
     pub right_collapsed: bool,
