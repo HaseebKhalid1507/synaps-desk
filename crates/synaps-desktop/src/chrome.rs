@@ -20,8 +20,9 @@ use crate::rail::{self, Chip, Item, Rail, State};
 use crate::stats::compact;
 use crate::theme::{self, Palette};
 
-/// The mark strip at the window's left edge.
-pub(crate) const MARK: f32 = 30.;
+/// Left inset of the layout before the rail. The mark strip that used to
+/// sit here (connection disc over 荒坂) is gone; the disc is in the top bar.
+pub(crate) const MARK: f32 = 0.;
 /// Context-gauge segments (the folded panel's upright gauge: `STRIP_SEGMENTS`).
 const SEGMENTS: usize = 48;
 const STRIP_SEGMENTS: usize = 24;
@@ -183,7 +184,7 @@ fn fold(id: &'static str, glyph: &'static str, tip: &'static str, rail: bool, p:
 }
 
 impl AppView {
-    /// The connection disc's colour (the mark strip and the folded rail).
+    /// The connection disc's colour (the top bar and the folded rail).
     fn conn_disc(&self, p: &Palette) -> Hsla {
         match &self.model.conn {
             ConnState::Connected(_) => p.ready_mark_ch,
@@ -191,31 +192,6 @@ impl AppView {
             ConnState::Connecting | ConnState::Reconnecting => p.rest_mark,
             _ => p.err_mark_ch,
         }
-    }
-
-    pub(crate) fn render_mark(&self, p: &Palette) -> impl IntoElement {
-        let disc = self.conn_disc(p);
-        v_flex()
-            .w(px(MARK))
-            .h_full()
-            .flex_none()
-            .items_center()
-            .pt(px(20.))
-            .pb(px(24.))
-            .border_r_1()
-            .border_color(p.hair)
-            .child(div().size(px(12.)).rounded_full().bg(disc))
-            .child(div().flex_1())
-            .child(
-                v_flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .font_family(fonts::JP)
-                    .text_size(px(15.))
-                    .text_color(p.dim_ch)
-                    .child(fonts::JP_MARK_1)
-                    .child(fonts::JP_MARK_2),
-            )
     }
 
     pub(crate) fn render_top(&self, p: &Palette, rail: Side, cx: &Context<Self>) -> impl IntoElement {
@@ -283,8 +259,15 @@ impl AppView {
                         _ => 254.,
                     }))
                     .flex_none()
+                    .items_center()
                     .gap(px(14.))
-                    .child(display(label::WORD, 13., p.header))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(div().size(px(8.)).flex_none().rounded_full().bg(self.conn_disc(p)))
+                            .child(display(label::WORD, 13., p.header)),
+                    )
                     .child(display(label::WORD_2, 13., p.dim_ch)),
             )
             .child(div().flex_1())
