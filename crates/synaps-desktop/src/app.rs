@@ -176,7 +176,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(smaller, TextSmaller, None),
         KeyBinding::new(reset, TextReset, None),
     ];
-    let (settings, usage, usage_alt) = crate::views::view_keys(mac);
+    let (settings, usage, usage_alt) = crate::views::view_keys(mac, cfg!(target_os = "linux"));
     keys.push(KeyBinding::new(settings, OpenSettings, None));
     keys.push(KeyBinding::new(usage, OpenUsage, None));
     if let Some(k) = usage_alt {
@@ -1272,10 +1272,10 @@ impl AppView {
         }
         // A view on screen leaves the session tab behind it current: the
         // composer stays that tab's.
-        let visible = self.model.tabs.composer_tab();
-        if self.restore.is_none() && Drafts::owns(self.composer_of.as_ref(), visible) {
+        if self.restore.is_none() && self.composer_owned() {
             return;
         }
+        let visible = self.model.tabs.composer_tab();
         let c = self.composer.read(cx);
         let (text, cursor) = (c.value(), c.cursor());
         let tabs = &self.model.tabs;
@@ -1844,6 +1844,13 @@ impl AppView {
         }
     }
 
+    /// The composer holds the text of the tab it types for (the current
+    /// session tab, never a view on screen): the one guard of `submit()`
+    /// and `sync_composer()`.
+    fn composer_owned(&self) -> bool {
+        Drafts::composer_owned(self.composer_of.as_ref(), &self.model.tabs)
+    }
+
     /// Send the composer's text. `false` keeps it in the composer.
     fn submit(&mut self, text: String) -> bool {
         let Some(c) = &self.client else {
@@ -1852,7 +1859,7 @@ impl AppView {
         };
         // The composer's text is the visible tab's only once the frame after
         // a switch has swapped the drafts: never sent to another session.
-        if !Drafts::owns(self.composer_of.as_ref(), self.model.tabs.composer_tab()) {
+        if !self.composer_owned() {
             self.model.last_error = Some("switching tabs: not sent".into());
             self.model.view_dirty = true;
             return false;
@@ -3114,6 +3121,29 @@ mod tests {
         text_keys, toggled, well_body,
     };
     use crate::theme::Panels;
+
+    /// N-L1: `submit()` and `sync_composer()` guard with `composer_owned()`
+    /// (tested against views on screen in `tabs.rs`), first thing, and no
+    /// other composer check is left in this file. It reads this file: a
+    /// call site that drifts back to the visible tab fails here without a
+    /// GPUI window.
+    #[test]
+    fn composer_guard_is_the_one_helper() {
+        let src = include_str!("app.rs");
+        let body = |name: &str| {
+            let at = src.find(&format!("\n    fn {name}(")).unwrap_or_else(|| panic!("fn {name}"));
+            let rest = &src[at + 1..];
+            &rest[..rest.find("\n    }\n").unwrap_or_else(|| panic!("end of fn {name}"))]
+        };
+        let submit = body("submit");
+        let guard = submit.find("if !self.composer_owned() {").expect("submit() guards with composer_owned()");
+        let send = submit.find(".submit(text").expect("submit() sends");
+        assert!(guard < send, "the guard comes before the send");
+        assert!(body("sync_composer").contains("&& self.composer_owned() {"), "the draft swap uses the same guard");
+        assert_eq!(body("composer_owned").matches("Drafts::composer_owned(").count(), 1);
+        // Nothing else asks for the composer's tab on its own.
+        assert_eq!(src.matches(["Drafts", "::owns("].concat().as_str()).count(), 0);
+    }
 
     /// The fold keys parse on every OS (a bad one panics at start-up).
     #[test]

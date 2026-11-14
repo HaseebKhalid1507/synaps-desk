@@ -410,9 +410,18 @@ pub struct Info {
 impl Info {
     /// It serves the daemon whose `Welcome` said `pid` and `profile`.
     pub fn serves(&self, pid: u32, profile: Option<&str>) -> bool {
-        let norm = |p: Option<&str>| p.filter(|p| !p.is_empty()).map(str::to_string);
-        pid != 0 && self.pid == pid && norm(self.profile.as_deref()) == norm(profile)
+        pid != 0 && self.pid == pid && same_profile(self.profile.as_deref(), profile)
     }
+}
+
+/// One profile, however it is written (none and `""` are the default).
+pub fn same_profile(a: Option<&str>, b: Option<&str>) -> bool {
+    a.filter(|p| !p.is_empty()) == b.filter(|p| !p.is_empty())
+}
+
+/// A profile as the views write it.
+pub fn profile_name(p: Option<&str>) -> &str {
+    p.filter(|p| !p.is_empty()).unwrap_or("default")
 }
 
 // ── /api/config ───────────────────────────────────────────────────────────

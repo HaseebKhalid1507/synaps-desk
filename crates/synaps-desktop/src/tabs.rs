@@ -500,14 +500,17 @@ impl Tabs {
                 self.changed();
             }
             // No current tab behind a view on screen (it was closed): a tab
-            // holding the session becomes current, else a new one does.
+            // holding the session becomes current, else a new one does,
+            // before the views (they stay at the end of the strip).
             None if self.view().is_some() => {
                 let id = match self.find(session) {
                     Some(j) => self.tabs[j].id,
                     None => {
                         let t = self.tab(Some(session.to_string()), session.to_string());
                         let id = t.id;
-                        self.tabs.push(t);
+                        let at = self.tabs.iter().position(|t| t.kind != Kind::Session).unwrap_or(self.tabs.len());
+                        self.tabs.insert(at, t);
+                        self.active = self.active.map(|a| if a >= at { a + 1 } else { a });
                         id
                     }
                 };
@@ -652,6 +655,13 @@ impl Drafts {
     /// its id and session): `owner` is that tab, with that session.
     pub fn owns(owner: Option<&(u64, Option<String>)>, visible: Option<(u64, Option<&str>)>) -> bool {
         owner.map(|(i, s)| (*i, s.as_deref())) == visible
+    }
+
+    /// The composer's text is `owner`'s and that is the tab it types for
+    /// ([`Tabs::composer_tab`]: the current session tab, never a view on
+    /// screen). The one guard `submit()` and the draft swap use.
+    pub fn composer_owned(owner: Option<&(u64, Option<String>)>, tabs: &Tabs) -> bool {
+        Drafts::owns(owner, tabs.composer_tab())
     }
 
     /// One frame's composer work, in this order. Input given back for the
@@ -1528,10 +1538,11 @@ mod tests {
         unique(&t);
     }
 
-    /// The merge with PR #14: `submit()` and `sync_composer()` ask
-    /// [`Tabs::composer_tab`], the current session tab. A view on screen
-    /// (the visible tab) must neither take the composer's text nor make a
-    /// send refused as "switching tabs".
+    /// The merge with PR #14: `submit()` and `sync_composer()` guard with
+    /// [`Drafts::composer_owned`] (the current session tab; `app.rs`'s
+    /// `composer_guard_is_the_one_helper` pins the call sites). A view on
+    /// screen (the visible tab) must neither take the composer's text nor
+    /// make a send refused as "switching tabs".
     #[test]
     fn a_view_on_screen_leaves_the_composer_with_the_session_tab() {
         let mut t = Tabs::default();
@@ -1541,7 +1552,8 @@ mod tests {
         for kind in [Kind::Settings, Kind::Usage] {
             t.open_view(kind);
             assert_ne!(t.visible().map(|x| x.id), Some(a));
-            assert!(Drafts::owns(owner.as_ref(), t.composer_tab()), "{kind:?} on screen: the composer is still a's");
+            assert!(!Drafts::owns(owner.as_ref(), t.visible().map(|x| (x.id, x.session.as_deref()))), "the visible tab is the view");
+            assert!(Drafts::composer_owned(owner.as_ref(), &t), "{kind:?} on screen: the composer is still a's");
             let mut d = Drafts::default();
             let mut note = None;
             assert_eq!(d.frame(&mut owner, t.composer_tab(), None, &mut note, ("half typed", 4), |s| t.knows(s)), None, "no swap");
@@ -1549,7 +1561,27 @@ mod tests {
         }
         // Back on a: still a's.
         t.focus(0);
-        assert!(Drafts::owns(owner.as_ref(), t.composer_tab()));
+        assert!(Drafts::composer_owned(owner.as_ref(), &t));
+    }
+
+    /// Nit 1: the tab an attach opens behind a view, with no current tab,
+    /// goes before the views (they stay at the end of the strip) and the
+    /// view on screen stays.
+    #[test]
+    fn an_attach_behind_a_view_opens_its_tab_before_the_views() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::Current);
+        t.open_view(Kind::Settings);
+        t.open_view(Kind::Usage);
+        t.focus(0);
+        t.close(0);
+        let on = t.visible().map(|v| v.id);
+        assert_eq!((t.view(), t.current().map(|c| c.id)), (Some(Kind::Settings), None));
+        t.attached("b");
+        let kinds: Vec<Kind> = t.iter().map(|x| x.kind).collect();
+        assert_eq!(kinds, [Kind::Session, Kind::Settings, Kind::Usage]);
+        assert_eq!((t.visible().map(|v| v.id), t.current_session()), (on, Some("b")));
+        unique(&t);
     }
 
     /// Found by the property test once views joined it: the current tab
