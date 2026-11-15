@@ -591,11 +591,14 @@ impl Subagents {
             let name = if w.name.is_empty() { label.to_string() } else { w.name.clone() };
             Some(Live { id, name, status, line, tools: w.tools, elapsed: w.elapsed, watchable })
         };
+        // Each id is the newest call's that has it (`by_id`): ids restart
+        // at 1 with a cold-started daemon, and an earlier call's worker
+        // under the same id is not this one.
         let mut out: Vec<Live> = self
-            .calls
+            .by_id
             .values()
-            .filter_map(|c| of(&c.w, &c.label, c.kind != Kind::Oneshot))
-            .chain(self.orphans.values().filter_map(|w| of(w, "subagent", true)))
+            .filter_map(|t| self.calls.get(t).and_then(|c| of(&c.w, &c.label, c.kind != Kind::Oneshot)))
+            .chain(self.orphans.iter().filter(|(n, _)| !self.by_id.contains_key(n)).filter_map(|(_, w)| of(w, "subagent", true)))
             .collect();
         out.sort_by_key(|l| l.id);
         out.dedup_by_key(|l| l.id);
@@ -1561,6 +1564,16 @@ mod tests {
         assert_eq!((h1(&s), word(&s, "x")), (ended.clone(), Some("started")));
         rows(&mut s, json!([row(1, "scout", json!("running"), 3.0, None, "ls", 1)]));
         assert_eq!((h1(&s), word(&s, "x")), (ended.clone(), Some("running")));
+        // The tray's id 1 is x's (running), never h1's (ended), whatever
+        // order the calls sit in (a hash map's: many maps, many orders).
+        for _ in 0..16 {
+            let mut t = Subagents::default();
+            t.reset(&history, false);
+            rows(&mut t, json!([row(1, "scout", json!("running"), 3.0, None, "ls", 1)]));
+            let live = t.live();
+            assert_eq!(live.len(), 1, "one worker per id");
+            assert_eq!((live[0].id, live[0].status, live[0].line.as_str()), (1, Status::Running, "ls"));
+        }
         rows(&mut s, json!([row(1, "scout", json!("completed"), 9.0, Some(0.0), "ls", 2)]));
         assert_eq!(shown(&s, "x").unwrap().2, "claude-sonnet-5-5 · 2 tools · 9.0s");
         assert_eq!(h1(&s), ended);

@@ -72,6 +72,17 @@ pub(crate) struct Disp {
     pub who: Who,
 }
 
+impl Disp {
+    /// Its item `n` places earlier: the transcript dropped its `n` oldest
+    /// (a worker's bound), and this row shows one after them.
+    pub(crate) fn shift(&mut self, n: usize) {
+        self.item -= n;
+        if let Kind::Summary { end, .. } = &mut self.kind {
+            *end -= n;
+        }
+    }
+}
+
 /// A call that has reported (or never will): not live.
 pub(crate) fn finished(s: Option<ToolStatus>) -> bool {
     matches!(s, Some(ToolStatus::Done | ToolStatus::Failed | ToolStatus::Cancelled | ToolStatus::Denied | ToolStatus::Unknown))
@@ -946,6 +957,38 @@ mod tests {
         assert_eq!(turn_start(t.items(), k), 0, "a new turn can finish the run before it");
         let from = all.partition_point(|d| d.item < k);
         assert_eq!(&all[from..], &build(t.items(), k, false, &HashSet::new(), &Subagents::default())[..]);
+    }
+
+    /// The transcript dropped its oldest rows (a worker's bound): the rows
+    /// after the cut, shifted, are the new build's but for the run the cut
+    /// went through, so the list keeps every other row, its measured
+    /// height and the scroll on it; nothing is replaced wholesale.
+    #[test]
+    fn a_front_trim_keeps_the_rows_after_the_cut() {
+        let ev = |v: serde_json::Value| serde_json::from_value::<synaps_client::protocol::WatchEvent>(v).unwrap();
+        let mut t = crate::model::transcript();
+        t.set_busy(true);
+        for k in 0..6 {
+            t.apply_watch(&ev(json!({"kind": "steered", "text": format!("step {k}")})));
+            for j in 0..4 {
+                let id = format!("t{k}{j}");
+                t.apply_watch(&ev(json!({"kind": "tool_use", "tool_id": id, "tool_name": "bash", "input": {"command": "ls"}})));
+                t.apply_watch(&ev(json!({"kind": "tool_result", "tool_id": id, "result": "ok"})));
+            }
+            t.apply_watch(&ev(json!({"kind": "text", "text": format!("done {k}")})));
+        }
+        t.set_busy(false);
+        let open = HashSet::new();
+        let old = build(t.items(), 0, false, &open, &Subagents::default());
+        assert_eq!(t.trim_live_front(t.len() - 8, usize::MAX), 8, "the first turn and two rows of the second");
+        let k = old.partition_point(|d| d.item < 8);
+        let mut kept = old[k..].to_vec();
+        kept.iter_mut().for_each(|d| d.shift(8));
+        let new = build(t.items(), 0, false, &open, &Subagents::default());
+        let (range, count) = diff(&kept, &new).expect("the cut run changed");
+        // The cut run's three calls left come in; nothing kept is spliced.
+        assert_eq!((range, count), (0..0, 3), "{kept:?} -> {new:?}");
+        assert_eq!(kept[..], new[3..]);
     }
 
     #[test]
