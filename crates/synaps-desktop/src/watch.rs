@@ -156,9 +156,9 @@ pub struct Worker {
     /// What the right panel's FILES says over this view (they are the
     /// session's thread's, not this worker's).
     pub files_note: SharedString,
-    /// A refused steer's text, for the composer once this view is on
-    /// screen again.
-    unsent: Option<String>,
+    /// A refused steer's text and the daemon's reason, for the composer
+    /// once this view is on screen again.
+    unsent: Option<(String, String)>,
 }
 
 impl Worker {
@@ -215,6 +215,8 @@ impl Worker {
             format!("{} {}: read-only · Esc returns to the session", self.name, self.state()).into()
         } else if self.status.is_empty() {
             format!("{} is connecting…", self.name).into()
+        } else if !self.steerable {
+            format!("{} can't be steered right now · Esc returns to the session", self.name).into()
         } else {
             format!("steer {}: it takes it in at its next step · Esc returns to the session", self.name).into()
         };
@@ -278,6 +280,7 @@ impl Worker {
             self.transcript.apply_watch(ev);
         }
         self.next_seq = page.next_seq;
+        said |= self.steerable != page.steerable;
         self.steerable = page.steerable;
         let finished = page.status != "running";
         if finished && (self.status.is_empty() || self.status == "running") {
@@ -328,11 +331,30 @@ fn live_bytes(t: &Transcript) -> usize {
         .sum()
 }
 
-/// The handle a refusal's reason names (`… sa_3 …`), if any.
+/// The handle a refusal's reason names (`… sa_3 …`, `nasa_scout (sa_3)
+/// is not running`), if any: a whole word, never inside a worker's name.
 fn named_handle(reason: &str) -> Option<String> {
-    let at = reason.find("sa_")? + 3;
-    let n: String = reason[at..].chars().take_while(char::is_ascii_digit).collect();
-    (!n.is_empty()).then(|| format!("sa_{n}"))
+    reason.match_indices("sa_").find_map(|(at, _)| {
+        if reason[..at].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let n: String = reason[at + 3..].chars().take_while(char::is_ascii_digit).collect();
+        (!n.is_empty()).then(|| format!("sa_{n}"))
+    })
+}
+
+/// A steer sent: to `handle_id` (the worker `name`), `text`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Steer {
+    handle_id: String,
+    name: String,
+    text: String,
+}
+
+/// What the session's composer says of a refused steer's text given back
+/// to it (its view has gone).
+fn refused_note(name: &str, handle_id: &str, reason: &str) -> String {
+    format!("your steer to {name} ({handle_id}) was refused ({reason}): Enter now sends it to the session")
 }
 
 /// The poll in flight.
@@ -353,11 +375,11 @@ pub struct Watch {
     next_poll: Option<Instant>,
     /// An Esc before this does not act on the session's thread ([`ESC_GUARD`]).
     esc_guard: Option<Instant>,
-    /// Steers sent, `(handle id, text)`, oldest first, until the engine
-    /// notes each or the daemon refuses it ([`STEERS_MAX`]).
-    steers: Vec<(String, String)>,
-    /// A refused steer whose view has gone: `(its worker's name, text)`,
-    /// for the session's composer once its thread is on screen.
+    /// Steers sent, oldest first, until the engine notes each or the
+    /// daemon refuses it ([`STEERS_MAX`]).
+    steers: Vec<Steer>,
+    /// A refused steer whose view has gone: `(what the composer says of
+    /// it, text)`, for the session's composer once its thread is on screen.
     unsent: Option<(String, String)>,
     /// The daemon cannot decode the query (before v0.11.0). Cleared on a
     /// reconnect.
@@ -596,21 +618,41 @@ impl Watch {
     /// one takes no steer until a page says it may; it starts over from 0
     /// if the daemon is another process, else it reads on from its cursor.
     pub fn on_reconnect(&mut self, now: Instant, daemon: Option<u32>) {
-        let restarted = self.daemon.is_some() && daemon.is_some() && daemon != self.daemon;
-        if daemon.is_some() {
-            self.daemon = daemon;
-        }
         self.unsupported = false;
+        self.reset(now);
+        if let Some(pid) = daemon {
+            self.daemon_changed(pid, now);
+        }
+    }
+
+    /// The daemon is process `pid` (its control connection says so, or an
+    /// attach): another one than the views were read from (a restart,
+    /// which numbers its workers from 1 again) starts the focused view
+    /// over from 0, whichever of the two connections comes back first.
+    pub fn daemon_changed(&mut self, pid: u32, now: Instant) {
+        let restarted = self.daemon.is_some_and(|d| d != pid);
+        self.daemon = Some(pid);
+        if !restarted {
+            return;
+        }
+        self.reset(now);
+        if let Some(w) = self.focused_mut() {
+            let why = format!("the daemon restarted: {}'s thread from the start", w.handle_id);
+            w.restart(why);
+        }
+    }
+
+    /// The connection the views were read on went: nothing in flight, no
+    /// steer waits for word, the views nobody looks at go and the focused
+    /// one takes no steer until a page says it may.
+    fn reset(&mut self, now: Instant) {
         self.pending = None;
         self.steers.clear();
         let focus = self.focus.clone();
         self.retain(|id, _| focus.as_deref() == Some(id));
         if let Some(w) = self.focused_mut() {
             w.steerable = false;
-            if restarted {
-                let why = format!("the daemon restarted: {}'s thread from the start", w.handle_id);
-                w.restart(why);
-            }
+            w.strings();
         }
         self.next_poll = self.focus.is_some().then_some(now);
     }
@@ -641,10 +683,10 @@ impl Watch {
         let mut lost: Option<(String, String)> = self.unsent.take();
         self.workers.retain(|id, w| {
             let kept = keep(id, w);
-            if !kept && let Some(text) = w.unsent.take() {
+            if !kept && let Some((reason, text)) = w.unsent.take() {
                 lost = Some(match lost.take() {
-                    Some((why, prev)) => (why, format!("{prev}\n{text}")),
-                    None => (format!("{id}'s view closed"), text),
+                    Some((note, prev)) => (note, format!("{prev}\n{text}")),
+                    None => (refused_note(&w.name, id, &reason), text),
                 });
             }
             kept
@@ -679,9 +721,9 @@ impl Watch {
         if self.steers.len() == STEERS_MAX {
             self.steers.remove(0);
         }
-        self.steers.push((handle_id.to_string(), text.to_string()));
+        let name = self.workers.get(handle_id).map_or_else(|| handle_id.to_string(), |w| w.name.clone());
+        self.steers.push(Steer { handle_id: handle_id.to_string(), name: name.clone(), text: text.to_string() });
         if let Some(w) = self.workers.get_mut(handle_id) {
-            let name = w.name.clone();
             // Its text shows once the worker takes it in (a YOU row).
             w.notice(format!("→ steer sent: {name} takes it in at its next step"));
         }
@@ -689,7 +731,7 @@ impl Watch {
 
     /// The engine noted the steer of `handle_id` in the main conversation.
     pub fn steer_accepted(&mut self, handle_id: &str) {
-        if let Some(i) = self.steers.iter().position(|(h, _)| h == handle_id) {
+        if let Some(i) = self.steers.iter().position(|s| s.handle_id == handle_id) {
             self.steers.remove(i);
         }
     }
@@ -700,23 +742,23 @@ impl Watch {
     /// thread gets it. Whether one was pending.
     pub fn steer_refused(&mut self, reason: &str) -> bool {
         let named = named_handle(reason);
-        let i = named.and_then(|h| self.steers.iter().position(|(s, _)| *s == h)).unwrap_or(0);
+        let i = named.and_then(|h| self.steers.iter().position(|s| s.handle_id == h)).unwrap_or(0);
         if i >= self.steers.len() {
             return false;
         }
-        let (handle_id, text) = self.steers.remove(i);
+        let Steer { handle_id, name, text } = self.steers.remove(i);
         match self.workers.get_mut(&handle_id) {
             Some(w) => {
                 w.notice(format!("steer refused: {reason}"));
                 w.unsent = Some(match w.unsent.take() {
-                    Some(prev) => format!("{prev}\n{text}"),
-                    None => text,
+                    Some((why, prev)) => (why, format!("{prev}\n{text}")),
+                    None => (reason.to_string(), text),
                 });
             }
             None => {
                 self.unsent = Some(match self.unsent.take() {
-                    Some((why, prev)) => (why, format!("{prev}\n{text}")),
-                    None => (format!("{handle_id}: {reason}"), text),
+                    Some((note, prev)) => (note, format!("{prev}\n{text}")),
+                    None => (refused_note(&name, &handle_id, reason), text),
                 })
             }
         }
@@ -730,12 +772,12 @@ impl Watch {
         match self.focus.as_deref() {
             Some(id) => {
                 let w = self.workers.get_mut(id)?;
-                let text = w.unsent.take()?;
+                let (_, text) = w.unsent.take()?;
                 Some((text, format!("your refused steer is back: Enter sends it to {} again", w.name)))
             }
             None => {
-                let (why, text) = self.unsent.take()?;
-                Some((text, format!("a steer was refused ({why}): Enter now sends it to the session")))
+                let (note, text) = self.unsent.take()?;
+                Some((text, note))
             }
         }
     }
@@ -1207,13 +1249,66 @@ mod tests {
         w.on_reconnect(t0, Some(100));
         assert!(w.worker("sa_5").is_none());
         assert_eq!(w.steer_target(), Some(Err("sleeper can't be steered right now: try again in a moment".into())));
+        assert_eq!(w.focused().unwrap().hint, "sleeper can't be steered right now · Esc returns to the session", "nor says it can");
         assert_eq!((w.focus_key().unwrap().1, w.take_poll(t0)), (generation, Some(("sa_2".into(), 4))), "from its cursor");
-        w.on_reply("sa_2", 4, running(4, false, json!([])), t0);
+        assert!(w.on_reply("sa_2", 4, running(4, false, json!([])), t0), "steerable again: drawn");
         assert_eq!(w.steer_target(), Some(Ok("sa_2".into())));
+        assert!(w.focused().unwrap().hint.starts_with("steer sleeper: "));
         // Another daemon process: from 0.
         w.on_reconnect(t0, Some(200));
         assert!(w.focus_key().unwrap().1 != generation);
         assert_eq!(w.take_poll(t0), Some(("sa_2".into(), 0)));
         assert!(matches!(w.steer_target(), Some(Err(_))));
+    }
+
+    /// N-L1: a cold start is seen whichever connection comes back first:
+    /// the session's attach (still under the old pid), then the control
+    /// connection's new pid; or the other way round. Either way the
+    /// focused view starts over once, from 0, and takes no steer.
+    #[test]
+    fn a_restart_is_seen_whichever_connection_comes_back_first() {
+        let t0 = Instant::now();
+        let at_cursor = |pid: u32| {
+            let mut w = Watch::default();
+            w.daemon_changed(pid, t0);
+            w.open(&Candidate::of(2, "sleeper"), None, t0);
+            let _ = w.take_poll(t0);
+            w.on_reply("sa_2", 0, running(40, false, json!([{"kind": "text", "text": "old worker"}])), t0);
+            assert_eq!(w.steer_target(), Some(Ok("sa_2".into())));
+            w
+        };
+        // The attach first: the model still holds the old pid.
+        let mut w = at_cursor(100);
+        let generation = w.focus_key().unwrap().1;
+        w.on_reconnect(t0, Some(100));
+        assert_eq!(w.focus_key().unwrap().1, generation, "the same daemon, as far as it knows");
+        let _ = w.take_poll(t0);
+        w.daemon_changed(200, t0);
+        assert!(w.focus_key().unwrap().1 != generation, "started over");
+        assert!(texts(w.focused().unwrap()).iter().all(|(_, t)| t != "old worker"));
+        assert_eq!(w.take_poll(t0), Some(("sa_2".into(), 0)), "from 0, the old query dropped");
+        assert!(matches!(w.steer_target(), Some(Err(_))));
+        // The control connection first: the attach after it starts nothing over again.
+        let mut w = at_cursor(100);
+        let generation = w.focus_key().unwrap().1;
+        w.daemon_changed(200, t0);
+        let restarted = w.focus_key().unwrap().1;
+        assert!(restarted != generation);
+        w.on_reconnect(t0, Some(200));
+        assert_eq!(w.focus_key().unwrap().1, restarted, "once");
+        assert_eq!(w.take_poll(t0), Some(("sa_2".into(), 0)));
+        // The same daemon again: nothing starts over.
+        w.daemon_changed(200, t0);
+        assert_eq!(w.focus_key().unwrap().1, restarted);
+    }
+
+    /// N-L3: a refusal names its worker's handle, not a `sa_` inside a name.
+    #[test]
+    fn a_refusal_names_the_handle_not_a_name() {
+        assert_eq!(named_handle("nasa_scout (sa_3) is not running").as_deref(), Some("sa_3"));
+        assert_eq!(named_handle("visa_7 (sa_12) is not running").as_deref(), Some("sa_12"));
+        assert_eq!(named_handle("no subagent sa_4").as_deref(), Some("sa_4"));
+        assert_eq!(named_handle("input is owned by client #1"), None);
+        assert_eq!(named_handle("nasa_scout is not running"), None);
     }
 }

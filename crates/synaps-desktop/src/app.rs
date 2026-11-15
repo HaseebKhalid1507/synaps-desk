@@ -961,6 +961,25 @@ pub(crate) fn secret_answer(submit: bool, typed: &str) -> Option<Option<String>>
     }
 }
 
+/// One frame's composer work ([`Drafts::frame`]) and the notes with it
+/// (the draft's, a worker key's or a refused steer's): a worker note goes
+/// only when the composer becomes another tab's. Input given back into
+/// the composer's own tab (a refused steer, its view gone) keeps the note
+/// that says where Enter now sends it.
+fn frame_composer(
+    drafts: &mut Drafts,
+    owner: &mut Option<(u64, Option<String>)>,
+    tabs: &crate::tabs::Tabs,
+    given_back: Option<String>,
+    (draft_note, watch_note): (&mut Option<&'static str>, &mut Option<SharedString>),
+    composer: (&str, usize),
+) -> Option<(String, Option<usize>)> {
+    if !Drafts::composer_owned(owner.as_ref(), tabs) {
+        *watch_note = None;
+    }
+    drafts.frame(owner, tabs.composer_tab(), given_back, draft_note, composer, |s| tabs.knows(s))
+}
+
 /// A call's input with more than one field (a `bash` with its `timeout`)
 /// as its row says it: its `command`, not its JSON (one field is shown
 /// bare already).
@@ -1714,17 +1733,17 @@ impl AppView {
         if self.restore.is_none() && self.composer_owned() {
             return;
         }
-        let visible = self.model.tabs.composer_tab();
         let c = self.composer.read(cx);
         let (text, cursor) = (c.value(), c.cursor());
-        let tabs = &self.model.tabs;
-        let out =
-            self.drafts.frame(&mut self.composer_of, visible, self.restore.take(), &mut self.draft_note, (text.as_ref(), cursor), |s| {
-                tabs.knows(s)
-            });
+        let out = frame_composer(
+            &mut self.drafts,
+            &mut self.composer_of,
+            &self.model.tabs,
+            self.restore.take(),
+            (&mut self.draft_note, &mut self.watch_note),
+            (text.as_ref(), cursor),
+        );
         if let Some((text, cursor)) = out {
-            // Another tab's composer: what a worker key said is not its.
-            self.watch_note = None;
             self.composer.update(cx, |c, cx| {
                 c.set_value(text, window, cx);
                 if let Some(at) = cursor {
@@ -2540,6 +2559,12 @@ impl AppView {
         }
     }
 
+    /// What the composer says of its text instead of its hint: a worker
+    /// key's or a refused steer's note, else the draft's.
+    fn composer_note(&self) -> Option<SharedString> {
+        self.watch_note.clone().or_else(|| self.draft_note.map(SharedString::from))
+    }
+
     /// What the centre column draws besides the bars, the card and the
     /// composer ([`crate::fit::Extras`]).
     fn extras(&self) -> crate::fit::Extras {
@@ -2548,7 +2573,7 @@ impl AppView {
             naming: n.naming && self.model.active.is_some(),
             naming_notes: u8::from(n.rename_error.is_some()) + u8::from(self.replace_offer().is_some()),
             error: self.model.last_error.is_some(),
-            note: self.draft_note.is_some(),
+            note: self.watch_note.is_some() || self.draft_note.is_some(),
             crumb: self.model.watch.focus().is_some(),
             tray: self.tray_rows as u8,
         }
@@ -3026,6 +3051,12 @@ impl AppView {
                     self.disp.drain(..k);
                     self.disp.iter_mut().for_each(|d| d.shift(trimmed));
                     self.rows.drain(..trimmed);
+                    // The cut runs' summaries and folds go with them.
+                    if let Some(first) = items.first().map(|i| i.id) {
+                        self.summaries.retain_from(first);
+                        self.toggled.retain(|id| *id >= first);
+                        self.open_runs.retain(|id| *id >= first);
+                    }
                 }
                 if trimmed > 0 || items.len() - sp.start > REUSE_ROWS {
                     // A long tail rebuilt (an attach, a history replace):
@@ -3826,15 +3857,16 @@ impl AppView {
     }
 
     /// The notice line under the card: the last error and, cramped, the
-    /// draft's note. With a card up it is one line, the rest in its tooltip
-    /// ([`crate::fit::Extras`] counts it so).
+    /// composer's note (a worker's, else the draft's). With a card up it is
+    /// one line, the rest in its tooltip ([`crate::fit::Extras`] counts it
+    /// so).
     fn render_notice(&self, p: &Palette, m: &Metrics) -> Option<impl IntoElement> {
         let lay = self.layout;
-        let note = self.draft_note.filter(|_| lay.form() == crate::fit::Form::Cramped);
+        let note = self.composer_note().filter(|_| lay.form() == crate::fit::Form::Cramped);
         let (text, color): (SharedString, Hsla) = match (self.model.last_error.clone(), note) {
             (Some(e), Some(n)) => (format!("{e} · {n}").into(), p.err),
             (Some(e), None) => (e.into(), p.err),
-            (None, Some(n)) => (n.into(), p.warn),
+            (None, Some(n)) => (n, p.warn),
             (None, None) => return None,
         };
         let line = mono(text.clone(), m.meta, color).pt(px(crate::fit::NOTICE_TOP)).line_height(px(crate::fit::notice_line(m)));
@@ -3864,7 +3896,7 @@ impl AppView {
         // once it has finished.
         let worker = self.model.watch.focused();
         let drives = self.drives();
-        let can_send = drives && worker.is_none_or(|w| !w.read_only());
+        let can_send = drives && worker.is_none_or(|w| !w.read_only() && w.steerable);
         let r = m.r;
         let hint: SharedString = if self.client.is_none() && !self.synthetic {
             "offline: no daemon to send to".into()
@@ -3922,18 +3954,12 @@ impl AppView {
                     .mt(px(dims.row_gap.unwrap_or((6. * r).round())))
                     .items_center()
                     .gap(px(20.))
-                    .child(if lay.tight {
-                        div().flex_1()
-                    } else {
-                        match (&self.watch_note, &self.draft_note) {
-                            (Some(n), _) => mono(n.clone(), m.meta, p.warn),
-                            (None, Some(n)) => mono(*n, m.meta, p.warn),
-                            (None, None) => mono(hint, m.meta, p.dim_u),
-                        }
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
+                    .child(match (self.composer_note(), lay.tight) {
+                        // A tight pane has no room for the hint, but a note
+                        // says where Enter sends the text.
+                        (Some(n), _) => mono(n, m.meta, p.warn).flex_1().min_w_0().overflow_hidden().text_ellipsis(),
+                        (None, true) => div().flex_1(),
+                        (None, false) => mono(hint, m.meta, p.dim_u).flex_1().min_w_0().overflow_hidden().text_ellipsis(),
                     })
                     .child(send),
             )
@@ -5215,5 +5241,54 @@ mod tests {
         assert_eq!(command_of(r#"{"path":"a.rs","limit":3}"#), None);
         assert_eq!(command_of(r#"{"command":"cut off at the prev"#), None, "a cut preview stays as it is");
         assert_eq!(command_of("ls"), None);
+    }
+
+    /// N-M1: a steer to scout, Esc out, scout finishes and its view goes,
+    /// then the daemon refuses the steer. Its text comes back into the
+    /// session's composer (the same tab) with the note that says it was a
+    /// steer to scout, refused, and that Enter now sends it to the session.
+    /// Only a switch to another tab's composer takes a worker note away.
+    #[test]
+    fn a_refused_steer_back_in_the_session_composer_says_so() {
+        use gpui_kit::SharedString;
+        use serde_json::json;
+        use synaps_client::WatchReply;
+
+        use super::frame_composer;
+        use crate::subagents::{Live, Status};
+        use crate::tabs::{Drafts, Place, Tabs};
+        use crate::watch::{Candidate, Watch};
+
+        let t0 = Instant::now();
+        let mut w = Watch::default();
+        w.open(&Candidate::of(3, "scout"), None, t0);
+        let _ = w.take_poll(t0);
+        let page = json!({"handle_id": "sa_3", "agent_name": "scout", "status": "running", "steerable": true, "next_seq": 1, "events": []});
+        w.on_reply("sa_3", 0, WatchReply::Page(Box::new(serde_json::from_value(page).unwrap())), t0);
+        assert_eq!(w.steer_target(), Some(Ok("sa_3".into())));
+        w.steer_sent("sa_3", "look in crates/relay too");
+        w.leave_on_esc(t0);
+        let done =
+            Live { id: 3, name: "scout".into(), status: Status::Done, line: String::new(), tools: None, elapsed: None, watchable: true };
+        w.prune(t0, &[done]);
+        assert!(w.worker("sa_3").is_none(), "its view has gone");
+        assert!(w.steer_refused("scout (sa_3) is not running"));
+        let (text, note) = w.take_unsent().expect("the session's thread is on screen");
+        // `sync_composer`: the text goes back into the composer it came from.
+        let mut tabs = Tabs::default();
+        tabs.open("s", "s", Place::Current);
+        let (mut drafts, mut owner) = (Drafts::default(), tabs.composer_tab().map(|(id, s)| (id, s.map(str::to_string))));
+        let (mut draft_note, mut watch_note) = (None, Some(SharedString::from(note)));
+        let out = frame_composer(&mut drafts, &mut owner, &tabs, Some(text), (&mut draft_note, &mut watch_note), ("", 0));
+        assert_eq!(out, Some(("look in crates/relay too".to_string(), None)));
+        assert_eq!(
+            watch_note.as_deref(),
+            Some("your steer to scout (sa_3) was refused (scout (sa_3) is not running): Enter now sends it to the session"),
+            "the note shows with it"
+        );
+        // Another tab's composer: the note is not its.
+        tabs.open("t", "t", Place::New);
+        let _ = frame_composer(&mut drafts, &mut owner, &tabs, None, (&mut draft_note, &mut watch_note), ("x", 1));
+        assert_eq!(watch_note, None);
     }
 }

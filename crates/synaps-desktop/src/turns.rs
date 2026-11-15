@@ -409,6 +409,12 @@ impl Summaries {
         self.0.clear();
     }
 
+    /// The oldest items went (a worker's bound): their runs' summaries
+    /// too. `first`: the oldest item's id kept.
+    pub(crate) fn retain_from(&mut self, first: u64) {
+        self.0.retain(|id, _| *id >= first);
+    }
+
     /// The summaries of `rows` that changed. A run whose rows `cache` does
     /// not hold yet (the transcript ran ahead of the last sync) is left out:
     /// the next sync builds it.
@@ -980,7 +986,15 @@ mod tests {
         t.set_busy(false);
         let open = HashSet::new();
         let old = build(t.items(), 0, false, &open, &Subagents::default());
+        let mut sums = Summaries::default();
+        sums.update(&old, t.items(), &rows(&t, &Ledger::default()));
+        let runs: Vec<u64> = old.iter().filter(|d| matches!(d.kind, Kind::Summary { .. })).map(|d| d.id).collect();
         assert_eq!(t.trim_live_front(t.len() - 8, usize::MAX), 8, "the first turn and two rows of the second");
+        // The runs cut go with their summaries (N-L4).
+        let first = t.items()[0].id;
+        sums.retain_from(first);
+        assert!(runs.iter().any(|id| *id < first) && runs.iter().any(|id| *id >= first), "{runs:?} at {first}");
+        assert!(runs.iter().all(|id| sums.get(*id).is_some() == (*id >= first)));
         let k = old.partition_point(|d| d.item < 8);
         let mut kept = old[k..].to_vec();
         kept.iter_mut().for_each(|d| d.shift(8));
