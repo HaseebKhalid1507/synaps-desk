@@ -72,6 +72,17 @@ pub(crate) struct Disp {
     pub who: Who,
 }
 
+impl Disp {
+    /// Its item `n` places earlier: the transcript dropped its `n` oldest
+    /// (a worker's bound), and this row shows one after them.
+    pub(crate) fn shift(&mut self, n: usize) {
+        self.item -= n;
+        if let Kind::Summary { end, .. } = &mut self.kind {
+            *end -= n;
+        }
+    }
+}
+
 /// A call that has reported (or never will): not live.
 pub(crate) fn finished(s: Option<ToolStatus>) -> bool {
     matches!(s, Some(ToolStatus::Done | ToolStatus::Failed | ToolStatus::Cancelled | ToolStatus::Denied | ToolStatus::Unknown))
@@ -398,6 +409,12 @@ impl Summaries {
         self.0.clear();
     }
 
+    /// The oldest items went (a worker's bound): their runs' summaries
+    /// too. `first`: the oldest item's id kept.
+    pub(crate) fn retain_from(&mut self, first: u64) {
+        self.0.retain(|id, _| *id >= first);
+    }
+
     /// The summaries of `rows` that changed. A run whose rows `cache` does
     /// not hold yet (the transcript ran ahead of the last sync) is left out:
     /// the next sync builds it.
@@ -477,7 +494,7 @@ impl AppView {
     /// One display row: its gap, its label and the block.
     pub(crate) fn render_disp(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
         let Some(&d) = self.disp.get(ix) else { return div().into_any_element() };
-        let items = self.model.transcript.items();
+        let items = self.model.shown().items();
         let (Some(item), Some(row)) = (items.get(d.item), self.rows.get(d.item)) else { return div().into_any_element() };
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
@@ -665,7 +682,7 @@ impl AppView {
             }
         });
         let worker =
-            item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name)).and_then(|t| self.model.stats.subagents.view(&t.tool_id));
+            item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name)).and_then(|t| self.model.shown_subagents().view(&t.tool_id));
         v_flex()
             .w_full()
             .bg(p.tool)
@@ -753,7 +770,7 @@ impl AppView {
             // The daemon stopped it at its output limit: not ✓, not ×.
             Some(ToolStatus::Unknown) => (None, Some(if lay.tight { "stopped" } else { "stopped at limit" }), p.dim_t),
             Some(ToolStatus::Queued) => (None, Some("queued"), p.dim_t),
-            _ if self.waiting_on == Some(item.id) && !self.model.transcript.pending_prompts().is_empty() => {
+            _ if self.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty() => {
                 let g = div()
                     .relative()
                     .size(px(10.))
@@ -946,6 +963,46 @@ mod tests {
         assert_eq!(turn_start(t.items(), k), 0, "a new turn can finish the run before it");
         let from = all.partition_point(|d| d.item < k);
         assert_eq!(&all[from..], &build(t.items(), k, false, &HashSet::new(), &Subagents::default())[..]);
+    }
+
+    /// The transcript dropped its oldest rows (a worker's bound): the rows
+    /// after the cut, shifted, are the new build's but for the run the cut
+    /// went through, so the list keeps every other row, its measured
+    /// height and the scroll on it; nothing is replaced wholesale.
+    #[test]
+    fn a_front_trim_keeps_the_rows_after_the_cut() {
+        let ev = |v: serde_json::Value| serde_json::from_value::<synaps_client::protocol::WatchEvent>(v).unwrap();
+        let mut t = crate::model::transcript();
+        t.set_busy(true);
+        for k in 0..6 {
+            t.apply_watch(&ev(json!({"kind": "steered", "text": format!("step {k}")})));
+            for j in 0..4 {
+                let id = format!("t{k}{j}");
+                t.apply_watch(&ev(json!({"kind": "tool_use", "tool_id": id, "tool_name": "bash", "input": {"command": "ls"}})));
+                t.apply_watch(&ev(json!({"kind": "tool_result", "tool_id": id, "result": "ok"})));
+            }
+            t.apply_watch(&ev(json!({"kind": "text", "text": format!("done {k}")})));
+        }
+        t.set_busy(false);
+        let open = HashSet::new();
+        let old = build(t.items(), 0, false, &open, &Subagents::default());
+        let mut sums = Summaries::default();
+        sums.update(&old, t.items(), &rows(&t, &Ledger::default()));
+        let runs: Vec<u64> = old.iter().filter(|d| matches!(d.kind, Kind::Summary { .. })).map(|d| d.id).collect();
+        assert_eq!(t.trim_live_front(t.len() - 8, usize::MAX), 8, "the first turn and two rows of the second");
+        // The runs cut go with their summaries (N-L4).
+        let first = t.items()[0].id;
+        sums.retain_from(first);
+        assert!(runs.iter().any(|id| *id < first) && runs.iter().any(|id| *id >= first), "{runs:?} at {first}");
+        assert!(runs.iter().all(|id| sums.get(*id).is_some() == (*id >= first)));
+        let k = old.partition_point(|d| d.item < 8);
+        let mut kept = old[k..].to_vec();
+        kept.iter_mut().for_each(|d| d.shift(8));
+        let new = build(t.items(), 0, false, &open, &Subagents::default());
+        let (range, count) = diff(&kept, &new).expect("the cut run changed");
+        // The cut run's three calls left come in; nothing kept is spliced.
+        assert_eq!((range, count), (0..0, 3), "{kept:?} -> {new:?}");
+        assert_eq!(kept[..], new[3..]);
     }
 
     #[test]

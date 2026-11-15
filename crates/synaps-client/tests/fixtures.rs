@@ -607,3 +607,106 @@ fn named_session_frames_encode_as_the_daemon_expects() {
     let bare = encode_frame(&ClientFrame::Attach(Attach::Create { config: bare, mode: AttachMode::Mirror })).unwrap();
     assert!(bare.contains("\"continue_session\":null"), "{bare}");
 }
+
+/// A worker's watch page as v0.11.1 serializes it (`subagent_watch.rs`):
+/// it decodes, a kind this client does not know is `Unknown` (never a
+/// failed page), and the entries replay into a transcript of their own
+/// exactly as the main conversation's stream events would.
+#[test]
+fn a_watch_page_decodes_and_replays_like_the_main_stream() {
+    let page: WatchPage = serde_json::from_value(serde_json::json!({
+        "handle_id": "sa_3", "subagent_id": 3, "agent_name": "sleeper", "model": "claude-sonnet-5-5",
+        "status": "running", "steerable": true, "next_seq": 9, "truncated": false, "more": false,
+        "events": [
+            {"kind": "response_start"},
+            {"kind": "thinking", "text": "slow steps"},
+            {"kind": "text", "text": "Step 1."},
+            {"kind": "tool_use_start", "tool_id": "t1", "tool_name": "bash"},
+            {"kind": "tool_use", "tool_id": "t1", "tool_name": "bash", "input": {"command": "sleep 5"}},
+            {"kind": "tool_queued", "tool_id": "t1"},
+            {"kind": "tool_started", "tool_id": "t1"},
+            {"kind": "tool_result_delta", "tool_id": "t1", "delta": "ok"},
+            {"kind": "tool_result", "tool_id": "t1", "result": "ok\n"},
+            {"kind": "steered", "text": "stop after the next step"},
+            {"kind": "steered", "text": "<event id=\"e\" source=\"subagent\">x</event>"},
+            {"kind": "from_the_future", "x": 1},
+            {"kind": "failed", "category": "rate_limit"},
+            {"kind": "done"}
+        ],
+        "at_ms": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        "now_ms": 20
+    }))
+    .unwrap();
+    assert_eq!((page.handle_id.as_str(), page.next_seq, page.running(), page.steerable), ("sa_3", 9, true, true));
+    assert_eq!(page.events[11], WatchEvent::Unknown);
+    let mut t = Transcript::new();
+    for ev in &page.events {
+        t.apply_watch(ev);
+    }
+    assert_eq!(
+        texts(&t),
+        vec![
+            (ItemKind::Thinking, "slow steps".into()),
+            (ItemKind::Assistant, "Step 1.".into()),
+            (ItemKind::Tool, String::new()),
+            (ItemKind::User, "stop after the next step".into()),
+            (ItemKind::Error, "subagent failed [rate_limit]".into()),
+        ]
+    );
+    let tool = t.items()[2].tool.as_ref().unwrap();
+    assert_eq!(
+        (tool.name.as_str(), tool.input.as_str(), tool.result.as_str(), tool.status),
+        ("bash", "sleep 5", "ok\n", Some(ToolStatus::Done))
+    );
+    // An older daemon's page: no model, no timing.
+    let old: WatchPage = serde_json::from_str(r#"{"handle_id":"sa_1","subagent_id":1,"agent_name":"a","status":"completed","steerable":false,"next_seq":0,"truncated":true,"more":false,"events":[]}"#).unwrap();
+    assert_eq!((old.model.as_str(), old.at_ms.len(), old.now_ms, old.running(), old.truncated), ("", 0, None, false, true));
+}
+
+/// The watch query and the worker steer go out in the daemon's shapes
+/// (`types.rs` v0.11.1: `{"query":"subagent_watch",…}`, `tool_queue`
+/// left out when off), and a steer's text never prints.
+#[test]
+fn the_watch_query_and_the_worker_steer_encode_as_the_daemon_reads_them() {
+    let q =
+        |tool_queue| SessionCommand::Query { id: 7, query: SessionQuery::SubagentWatch { handle_id: "sa_2".into(), since: 4, tool_queue } };
+    assert_eq!(
+        serde_json::to_value(q(true)).unwrap(),
+        serde_json::json!({"cmd": "query", "id": 7, "query": {"query": "subagent_watch", "handle_id": "sa_2", "since": 4, "tool_queue": true}})
+    );
+    assert!(!serde_json::to_string(&q(false)).unwrap().contains("tool_queue"));
+    let steer = SessionCommand::SubagentSteer { handle_id: "sa_2".into(), text: "focus on X".into() };
+    assert_eq!(
+        serde_json::to_value(&steer).unwrap(),
+        serde_json::json!({"cmd": "subagent_steer", "handle_id": "sa_2", "text": "focus on X"})
+    );
+    assert!(!format!("{steer:?}").contains("focus"));
+}
+
+/// A worker's transcript keeps its newest rows: the oldest go past the
+/// caps (the newest always stays), its tools keep working, and a
+/// transcript with history is never trimmed.
+#[test]
+fn a_live_only_transcript_trims_its_oldest_rows() {
+    let mut t = Transcript::new();
+    for i in 0..10 {
+        t.apply_watch(&WatchEvent::ToolUse {
+            tool_id: format!("t{i}"),
+            tool_name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+        });
+    }
+    let _ = t.take_splice();
+    assert_eq!(t.trim_live_front(4, usize::MAX), 6);
+    assert_eq!(t.len(), 4);
+    assert_eq!(t.take_splice().map(|s| s.start), Some(0));
+    t.apply_watch(&WatchEvent::ToolResult { tool_id: "t9".into(), result: "done".into() });
+    assert_eq!(t.items()[3].tool.as_ref().unwrap().result, "done");
+    // A dropped tool's result goes nowhere.
+    t.apply_watch(&WatchEvent::ToolResult { tool_id: "t0".into(), result: "late".into() });
+    assert!(t.items().iter().all(|i| i.tool.as_ref().unwrap().result != "late"));
+    assert_eq!(t.trim_live_front(0, 0), 3, "the newest row stays");
+    let mut h = Transcript::new();
+    h.apply_history(&[serde_json::json!({"role": "user", "content": "hi"}), serde_json::json!({"role": "assistant", "content": "yo"})]);
+    assert_eq!(h.trim_live_front(1, 0), 0);
+}

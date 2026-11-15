@@ -19,6 +19,7 @@ use crate::named::{ResumeRequest, RowAction, parse_rfc3339};
 use crate::rail::{Chip, State, is_parked};
 use crate::stats::Stats;
 use crate::tabs::{Place, Tabs};
+use crate::watch::{Candidate, Watch};
 
 /// HISTORY's newest unnamed sessions, asked for at startup; up to
 /// [`SAVED_SESSIONS_MAX`] (the wire's cap) once OLDER opens or find is used.
@@ -320,6 +321,9 @@ pub struct Model {
     /// for its dash again).
     pub daemon: Option<Daemon>,
     pub daemon_gen: u64,
+    /// The attached session's worker views ([`crate::watch`]): with the
+    /// transcript, they go to the tab cache when its tab is left.
+    pub watch: Watch,
 }
 
 /// An empty transcript as the window keeps it: no notices for subagent
@@ -369,7 +373,57 @@ impl Model {
             view_dirty: false,
             daemon: None,
             daemon_gen: 0,
+            watch: Watch::default(),
         }
+    }
+
+    /// The transcript the list shows: the focused worker's, else the
+    /// session's own.
+    pub fn shown(&self) -> &Transcript {
+        self.watch.focused().map_or(&self.transcript, |w| &w.transcript)
+    }
+
+    pub fn shown_mut(&mut self) -> &mut Transcript {
+        match self.watch.focused_mut() {
+            Some(w) => &mut w.transcript,
+            None => &mut self.transcript,
+        }
+    }
+
+    /// What the shown transcript's rows read: its file tools' diffs and the
+    /// workers under its calls.
+    pub fn shown_files(&self) -> &crate::files::Ledger {
+        self.watch.focused().map_or(&self.stats.files, |w| &w.files)
+    }
+
+    pub fn shown_subagents(&self) -> &crate::subagents::Subagents {
+        self.watch.focused().map_or(&self.stats.subagents, |w| &w.subagents)
+    }
+
+    pub fn shown_subagents_mut(&mut self) -> &mut crate::subagents::Subagents {
+        match self.watch.focused_mut() {
+            Some(w) => &mut w.subagents,
+            None => &mut self.stats.subagents,
+        }
+    }
+
+    /// The tray's running background workers, as [`Watch::step`] takes
+    /// them.
+    pub fn watchable(&self) -> Vec<Candidate> {
+        self.stats
+            .subagents
+            .live()
+            .into_iter()
+            // A worker only started (no live word yet) too: its view says
+            // if it is gone.
+            .filter(|l| l.watchable && !l.status.terminal())
+            .map(|l| Candidate::of(l.id, &l.name))
+            .collect()
+    }
+
+    /// The session's folder (a worker's diffs are shown relative to it).
+    pub fn cwd(&self) -> Option<&str> {
+        self.stats.cwd.as_deref()
     }
 
     /// Ask for the saved lists again (on connect, after a rename, a resume,
@@ -901,6 +955,8 @@ impl Model {
         n.opening.take_if(|o| o.attach_seq.is_some());
         self.rail_gen += 1;
         self.view_dirty = true;
+        // Its worker views go with it (the view takes them); nothing polls.
+        self.watch.suspend();
         (std::mem::take(&mut self.transcript), std::mem::take(&mut self.stats))
     }
 
@@ -1084,6 +1140,37 @@ impl Model {
                 }
                 Event::Sessions(s)
             }
+            // A worker's page: a frame only if it changed what the view
+            // shows (an idle worker's empty pages, 4 a second, draw
+            // nothing), and nothing of the rail's.
+            Event::SubagentWatch { attach_seq, handle_id, since, reply, .. } => {
+                if self.current(attach_seq) && self.watch.on_reply(&handle_id, since, reply, std::time::Instant::now()) {
+                    self.view_dirty = true;
+                }
+                return effects;
+            }
+            // A poll that could not go: again later (nothing shows it).
+            Event::Error { error: Error::Refused { command: Some(c), .. }, .. } if c == "subagent_watch" => {
+                self.watch.poll_failed(std::time::Instant::now());
+                return effects;
+            }
+            Event::Error { error: Error::NotAttached { command: "subagent_watch" }, .. } => {
+                self.watch.poll_failed(std::time::Instant::now());
+                return effects;
+            }
+            Event::Error { error: Error::Decode(d), .. } if d.kind == "query_result:subagent_watch" => return effects,
+            // A worker steer refused: its view says why and keeps the text
+            // for the composer ([`Watch::take_unsent`]).
+            Event::Error { attach_seq, error: Error::Refused { command: Some(c), reason } }
+                if c == "subagent_steer" && attach_seq.is_none_or(|s| self.current(s)) =>
+            {
+                self.view_dirty |= self.watch.steer_refused(&reason);
+                return effects;
+            }
+            Event::Error { error: Error::NotAttached { command: "subagent_steer" }, .. } => {
+                self.view_dirty |= self.watch.steer_refused("not attached to the session");
+                return effects;
+            }
             ev => ev,
         };
         self.view_dirty = true;
@@ -1098,6 +1185,9 @@ impl Model {
                 if let Status::Connected { features, profile, daemon_version, pid, .. } = &s {
                     self.daemon = Some(Daemon { version: daemon_version.clone(), profile: profile.clone(), pid: *pid });
                     self.daemon_gen += 1;
+                    // Another daemon process: the worker on screen is read
+                    // from 0, even before its session's attach comes back.
+                    self.watch.daemon_changed(*pid, std::time::Instant::now());
                     self.named.daemon = match profile {
                         Some(p) => format!("the daemon's machine (profile {p})"),
                         None => "the daemon's machine".into(),
@@ -1287,6 +1377,12 @@ impl Model {
                 self.answered.clear();
                 self.reattaching = false;
                 self.last_error = None;
+                // Another session's worker views mean nothing here; the
+                // same session's (a reconnect, its tab back) watch again.
+                if self.transcript.session_id() != Some(attached.meta.id.as_str()) {
+                    self.watch = Watch::default();
+                }
+                self.watch.on_reconnect(std::time::Instant::now(), self.daemon.as_ref().map(|d| d.pid));
                 if let Err(e) = self.transcript.load_attached(&attached) {
                     self.last_error = Some(e.to_string());
                 }
@@ -1295,6 +1391,10 @@ impl Model {
             }
             Event::Reattaching { attach_seq, .. } if self.current(attach_seq) => self.reattaching = true,
             Event::Session { attach_seq, event, raw, .. } if self.current(attach_seq) => {
+                // The engine's note of a worker steer in the main conversation.
+                if raw["ev"] == "external" && raw["event"]["content"]["content_type"] == "subagent_steer" {
+                    self.watch.steer_accepted(raw["event"]["content"]["data"]["handle_id"].as_str().unwrap_or(""));
+                }
                 self.stats.on_session(&event, &raw);
                 match &event {
                     SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. } => {
@@ -1325,6 +1425,7 @@ impl Model {
                 self.reattaching = false;
                 self.transcript.set_detached();
                 self.stats.on_detached();
+                self.watch.suspend();
                 self.give_back_all(&mut effects);
                 let n = &mut self.named;
                 // A named live session that ended since the last list:
@@ -1528,17 +1629,101 @@ mod tests {
         };
         m.apply(ev(use_));
         m.apply(ev(res));
+        // Watchable from its start (before a live row says it runs).
+        assert_eq!(m.watchable(), vec![crate::watch::Candidate::of(1, "scout")]);
         m.apply(ev(row("running")));
         assert_eq!((st(&m, "s"), m.workers(&meta(&m, "s"))), (State::Workers, 1));
-        // It ends: idle at once, whatever the last poll said.
+        assert_eq!(m.watchable().len(), 1);
+        // It ends: idle at once, whatever the last poll said; no longer on offer.
         m.apply(list(1));
         m.apply(ev(row("completed")));
         assert_eq!(st(&m, "s"), State::Idle);
+        assert!(m.watchable().is_empty());
         // A re-attach, nothing live heard yet: the listing's count.
         attach(&mut m, 2);
         assert_eq!(st(&m, "s"), State::Workers);
         m.apply(list(0));
         assert_eq!(st(&m, "s"), State::Idle);
+    }
+
+    /// Worker views are their session's: an attach of another session drops
+    /// them, a re-attach of the same one (a reconnect, its tab back) asks
+    /// again at once; a detach or a tab left asks nothing more; a reply to an
+    /// attachment before is dropped; the engine's note of a steer settles it
+    /// and a refusal keeps the text for the composer. A page never rebuilds
+    /// the rail, and an idle worker's empty page draws nothing.
+    #[test]
+    fn worker_views_are_their_sessions() {
+        use std::time::Instant;
+        use synaps_client::WatchReply;
+
+        use crate::watch::Candidate;
+        let page = |v: Value| WatchReply::Page(Box::new(serde_json::from_value(v).unwrap()));
+        let reply_at = |seq: u64, since: u64, events: Value| Event::SubagentWatch {
+            attach_seq: seq,
+            session_id: "s".into(),
+            handle_id: "sa_2".into(),
+            since,
+            reply: page(json!({"handle_id": "sa_2", "subagent_id": 2, "agent_name": "sleeper", "status": "running",
+                "steerable": true, "next_seq": 1, "more": false, "events": events})),
+        };
+        let reply = |seq: u64| reply_at(seq, 0, json!([{"kind": "text", "text": "Step 1."}]));
+        let mut m = Model::new(ConnState::Connecting);
+        attach(&mut m, 1);
+        let t0 = Instant::now();
+        m.watch.open(&Candidate::of(2, "sleeper"), None, t0);
+        assert_eq!(m.watch.take_poll(t0), Some(("sa_2".into(), 0)));
+        // A reply to the attachment before is not this one's.
+        let before = m.shown().len();
+        m.apply(reply(9));
+        assert_eq!(m.shown().len(), before, "dropped");
+        let generation = m.rail_gen;
+        m.apply(reply(1));
+        assert_eq!(m.shown().items().last().map(|i| i.text.as_str()), Some("Step 1."));
+        assert_eq!(m.transcript.len(), 0, "the session's own transcript is untouched");
+        assert!(m.view_dirty && m.rail_gen == generation, "drawn, the rail not rebuilt");
+        // Idle: an empty page draws nothing.
+        m.view_dirty = false;
+        assert_eq!(m.watch.take_poll(Instant::now() + crate::watch::POLL_INTERVAL), Some(("sa_2".into(), 1)));
+        m.apply(reply_at(1, 1, json!([])));
+        assert!(!m.view_dirty && m.rail_gen == generation, "nothing to draw");
+        assert!(m.watch.poll_due().is_some(), "and the next poll is due");
+        // Steer: the engine's note settles it; a refusal of a later one gives
+        // its text back (its view is on screen).
+        let steer = |h: &str| {
+            let raw = json!({"ev": "external", "event": {"content": {"content_type": "subagent_steer", "data": {"handle_id": h}}}});
+            Event::Session { attach_seq: 1, session_id: "s".into(), seq: 0, event: SessionEvent::Idle, raw: Arc::new(raw) }
+        };
+        m.watch.steer_sent("sa_2", "stop after the next step");
+        m.apply(steer("sa_2"));
+        let refused = |c: &str| Event::Error {
+            attach_seq: Some(1),
+            error: Error::Refused { command: Some(c.into()), reason: "not the input owner".into() },
+        };
+        assert!(m.apply(refused("subagent_steer")).is_empty());
+        assert_eq!(m.watch.take_unsent(), None, "settled: nothing to give back");
+        m.watch.steer_sent("sa_2", "reply STEERED");
+        m.view_dirty = false;
+        assert!(m.apply(refused("subagent_steer")).is_empty());
+        assert!(m.view_dirty && m.rail_gen == generation);
+        assert_eq!(m.watch.take_unsent().map(|u| u.0).as_deref(), Some("reply STEERED"));
+        // The same session again: asked again at once, from where it was.
+        attach(&mut m, 2);
+        let t1 = Instant::now();
+        assert_eq!(m.watch.focus(), Some("sa_2"));
+        assert_eq!(m.watch.take_poll(t1), Some(("sa_2".into(), 1)), "at once, from its cursor");
+        // Detached: nothing polls.
+        m.apply(Event::Detached { attach_seq: 2, session_id: Some("s".into()), reason: "gone".into() });
+        assert_eq!(m.watch.poll_due(), None);
+        // Another session: its views are gone.
+        m.want(3);
+        m.apply(Event::Attached { attach_seq: 3, attached: attached("other"), mode: AttachMode::Mirror, reconnect: false });
+        assert_eq!((m.watch.focus(), m.watch.bytes()), (None, 0));
+        // A tab left: what it hands out polls nothing.
+        attach(&mut m, 4);
+        m.watch.open(&Candidate::of(2, "sleeper"), None, t1);
+        let _ = m.switch_out();
+        assert_eq!(m.watch.poll_due(), None, "a background tab polls nothing");
     }
 
     /// N-M1: a blocking `subagent` cut off by HALT (its tool dropped: no
@@ -1996,6 +2181,27 @@ mod tests {
         assert!(m.can_send());
         m.apply(Event::Reattaching { attach_seq: 4, session_id: "s".into(), reason: "reload".into() });
         assert!(!m.can_send());
+    }
+
+    /// N-L1: the control connection's new pid starts the worker on screen
+    /// over, before its session's attach comes back; the same pid does not.
+    #[test]
+    fn a_new_daemon_pid_starts_the_worker_view_over() {
+        use std::time::Instant;
+
+        use crate::watch::Candidate;
+        let at = |pid: u32| Event::Status(Status::Connected { daemon_version: "0.0.0".into(), profile: None, pid, features: vec![] });
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(at(100));
+        attach(&mut m, 1);
+        let t0 = Instant::now();
+        m.watch.open(&Candidate::of(2, "sleeper"), None, t0);
+        let generation = m.watch.focus_key().unwrap().1;
+        m.apply(at(100));
+        assert_eq!(m.watch.focus_key().unwrap().1, generation, "the same daemon");
+        m.apply(at(200));
+        assert!(m.watch.focus_key().unwrap().1 != generation, "another daemon: from 0");
+        assert_eq!(m.watch.take_poll(Instant::now()), Some(("sa_2".into(), 0)));
     }
 
     fn connected(features: &[&str]) -> Event {
