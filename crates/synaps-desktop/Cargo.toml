@@ -1,6 +1,7 @@
 [package]
 name = "synaps-desktop"
 description = "Native desktop client for the Synaps daemon (GPUI spike)."
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

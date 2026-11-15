@@ -1,6 +1,7 @@
 [package]
 name = "synaps-client"
 description = "Thin wire client for the Synaps daemon: discovery, connection, protocol mirrors. No GUI."
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
