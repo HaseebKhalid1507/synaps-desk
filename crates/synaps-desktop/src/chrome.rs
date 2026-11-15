@@ -1015,7 +1015,15 @@ impl AppView {
                     )))
                 },
             ))
-            .child(mono("as the model asked: tool inputs, not the disk", 9.5, p.dim_ch).mt(px(6.)))
+            // Over a worker's view: still the session's thread's, not the
+            // worker's on screen.
+            .child(
+                match self.model.watch.focused() {
+                    Some(w) => mono(w.files_note.clone(), 9.5, p.dim_ch),
+                    None => mono("as the model asked: tool inputs, not the disk", 9.5, p.dim_ch),
+                }
+                .mt(px(6.)),
+            )
             .child(div().h(px(12.)));
         for f in ledger.files().iter().take(FILES_SHOWN) {
             files = files.child(

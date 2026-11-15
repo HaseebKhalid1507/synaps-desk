@@ -28,6 +28,7 @@ use crate::stats::Stats;
 use crate::tabs::{Drafts, Lru, Place, Saved};
 use crate::theme::{self, Metrics, Palette};
 use crate::turns::{self, Disp, Kind, Layout, Summaries};
+use crate::watch::{Moved, Step, Watch};
 
 /// Per-row strings derived from a transcript item, rebuilt only when the
 /// item's `rev` changes (so a frame never re-allocates unchanged rows).
@@ -84,6 +85,27 @@ pub(crate) struct TabCache {
     waiting_on: Option<u64>,
     /// The text metrics its heights were measured with ([`AppView::metrics_gen`]).
     metrics_gen: u64,
+    /// Its worker views (the one focused comes back focused).
+    watch: Watch,
+}
+
+/// The list's state over one transcript: its rows, folds, measured heights
+/// and scroll position. The session's waits here while a worker's view is
+/// shown ([`AppView::sync_pane`]), so neither ever moves the other.
+pub(crate) struct Pane {
+    rows: Vec<RowCache>,
+    disp: Vec<Disp>,
+    summaries: Summaries,
+    list: ListState,
+    toggled: HashSet<u64>,
+    open_runs: HashSet<u64>,
+    synced_busy: bool,
+    files_gen: u64,
+    subs_gen: u64,
+    waiting_on: Option<u64>,
+    rows_session: Option<String>,
+    scroll_carry: Option<(f32, ListOffset)>,
+    metrics_gen: u64,
 }
 
 impl TabCache {
@@ -105,6 +127,7 @@ impl TabCache {
             + self.disp.len() * (std::mem::size_of::<Disp>() + 32)
             + self.stats.files.bytes()
             + self.stats.subagents.bytes()
+            + self.watch.bytes()
     }
 }
 
@@ -162,7 +185,9 @@ actions!(
         Tab8,
         LastTab,
         OpenSettings,
-        OpenUsage
+        OpenUsage,
+        WorkerUp,
+        WorkerDown
     ]
 );
 
@@ -206,8 +231,31 @@ pub fn bind_keys(cx: &mut App) {
             TabKey::Last => KeyBinding::new(k, LastTab, None),
         });
     }
+    for &(k, step) in &worker_keys(mac) {
+        keys.push(match step {
+            Step::Up => KeyBinding::new(k, WorkerUp, None),
+            Step::Down => KeyBinding::new(k, WorkerDown, None),
+        });
+    }
     cx.bind_keys(keys);
 }
+
+/// The worker keys ([`crate::watch`]): Ctrl+↑/↓ and Alt+↑/↓ as in the TUI
+/// (Option+↑/↓ first on macOS, where Ctrl+↑/↓ are Mission Control's). No
+/// input binds them: in the composer they switch the view, the caret
+/// stays where it was.
+pub(crate) const fn worker_keys(mac: bool) -> [(&'static str, Step); 4] {
+    if mac {
+        [("alt-up", Step::Up), ("alt-down", Step::Down), ("ctrl-up", Step::Up), ("ctrl-down", Step::Down)]
+    } else {
+        [("ctrl-up", Step::Up), ("ctrl-down", Step::Down), ("alt-up", Step::Up), ("alt-down", Step::Down)]
+    }
+}
+
+const COMPOSER_PLACEHOLDER: &str = "Message, or steer a running turn  (Enter sends, Shift+Enter: new line)";
+
+/// The worker key as the composer's hint and the breadcrumb spell it.
+pub(crate) const WORKER_KEY: &str = if cfg!(target_os = "macos") { "⌥↑/↓" } else { "Ctrl+↑/↓" };
 
 /// What a tab key does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -913,6 +961,45 @@ pub(crate) fn secret_answer(submit: bool, typed: &str) -> Option<Option<String>>
     }
 }
 
+/// One frame's composer work ([`Drafts::frame`]) and the notes with it
+/// (the draft's, a worker key's or a refused steer's): a worker note goes
+/// only when the composer becomes another tab's. Input given back into
+/// the composer's own tab (a refused steer, its view gone) keeps the note
+/// that says where Enter now sends it.
+fn frame_composer(
+    drafts: &mut Drafts,
+    owner: &mut Option<(u64, Option<String>)>,
+    tabs: &crate::tabs::Tabs,
+    given_back: Option<String>,
+    (draft_note, watch_note): (&mut Option<&'static str>, &mut Option<SharedString>),
+    composer: (&str, usize),
+) -> Option<(String, Option<usize>)> {
+    if !Drafts::composer_owned(owner.as_ref(), tabs) {
+        *watch_note = None;
+    }
+    drafts.frame(owner, tabs.composer_tab(), given_back, draft_note, composer, |s| tabs.knows(s))
+}
+
+/// A call's input with more than one field (a `bash` with its `timeout`)
+/// as its row says it: its `command`, not its JSON (one field is shown
+/// bare already).
+fn command_of(input: &str) -> Option<String> {
+    if !input.starts_with('{') {
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(input).ok()?.get("command")? {
+        serde_json::Value::String(c) => Some(c.clone()),
+        _ => None,
+    }
+}
+
+/// How many of the oldest rows a change from the start dropped: where the
+/// first item left sits among the rows built (0: none dropped, or another
+/// transcript).
+pub(crate) fn front_trimmed(rows: &[RowCache], items: &[Item]) -> usize {
+    items.first().and_then(|first| rows.iter().position(|r| r.id == first.id)).unwrap_or(0)
+}
+
 /// A key reached the window at `now`, the last secret card having gone
 /// (or the last key come) at `left`: the typing meant for it goes on if
 /// that was less than [`ARM`] ago (then from `now`).
@@ -1136,6 +1223,34 @@ pub struct AppView {
     pub(crate) view_width: f32,
     view_seen: Option<(u64, theme::Choice)>,
     pub(crate) window_active: bool,
+    /// The session's list while a worker's view is shown, and the worker
+    /// whose rows the list holds (`None`: the session's).
+    main_pane: Option<Pane>,
+    /// The worker's view the list holds and its generation
+    /// ([`crate::watch::Watch::focus_key`]).
+    pane_of: Option<(String, u64)>,
+    /// The next sync builds every row again (a worker's view came on).
+    full_rebuild: bool,
+    /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
+    watch_poll: Option<(Instant, Task<()>)>,
+    /// Frames drawn for the window are shown (GPUI's visibility: mapped and
+    /// not wholly covered, not minimized). Nothing polls while it is not.
+    visible: bool,
+    /// The card was on screen last frame (not behind a worker's view,
+    /// Settings or Usage): one coming back waits again ([`Arm`]).
+    card_was_up: bool,
+    /// The tray's rows as last built, and the timer that drops a finished
+    /// worker's ([`crate::watch::FLASH`]).
+    pub(crate) tray: crate::tray::TrayCache,
+    pub(crate) tray_due: Option<(Instant, Task<()>)>,
+    /// Rows the tray draws this frame ([`crate::fit::tray_rows`]).
+    pub(crate) tray_rows: usize,
+    /// Said in the composer's hint until the next key that moves or sends:
+    /// why a worker key went nowhere, or why a steer was not sent.
+    pub(crate) watch_note: Option<SharedString>,
+    /// The worker whose name and state the composer's placeholder has
+    /// (`None`: the session's placeholder).
+    placeholder_of: Option<(String, String)>,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -1177,12 +1292,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(1, 6)
-                .submit_on_enter(true)
-                .placeholder("Message, or steer a running turn  (Enter sends, Shift+Enter: new line)")
-        });
+        let composer = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder(COMPOSER_PLACEHOLDER));
         let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("find · open by name"));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
@@ -1190,13 +1300,19 @@ impl AppView {
         let settings_find = cx.new(|cx| InputState::new(window, cx).placeholder("find a setting"));
         let settings_input = cx.new(|cx| InputState::new(window, cx));
         let mut subs = vec![
-            cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { shift: false, .. } = ev {
+            cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { shift: false, .. } => {
                     let text = input.read(cx).value().trim().to_string();
                     if !text.is_empty() && this.submit(text) {
                         input.update(cx, |s, cx| s.set_value("", window, cx));
                     }
                 }
+                // Typing: what a worker key or a refused steer said is old.
+                InputEvent::Change if this.watch_note.is_some() => {
+                    this.watch_note = None;
+                    cx.notify();
+                }
+                _ => {}
             }),
             // Find filters as it is typed; Enter opens by exact name. The
             // typed name stays until the outcome is known: cleared on
@@ -1322,6 +1438,8 @@ impl AppView {
         }));
         // The dash poll waits while the window is in the background.
         subs.push(cx.observe_window_activation(window, |this, window, cx| this.window_activated(window.is_window_active(), cx)));
+        // A worker's view polls only while the window shows.
+        subs.push(cx.observe_window_visibility(window, |this, v, _, cx| this.visibility_changed(v.is_visible(), cx)));
         crate::views::view_fallbacks(cx.weak_entity(), cx);
         let me = cx.weak_entity();
         let settings_pane = cx.new(|_| crate::views::ViewPane::new(me.clone(), crate::tabs::Kind::Settings));
@@ -1337,6 +1455,7 @@ impl AppView {
             settings_pane,
             usage_pane,
             focus,
+            visible: window.is_visible(),
         };
         match (client, synthetic) {
             (Some((c, rx)), _) => {
@@ -1468,6 +1587,17 @@ impl AppView {
             view_width: 0.,
             view_seen: None,
             window_active: true,
+            main_pane: None,
+            pane_of: None,
+            full_rebuild: false,
+            watch_poll: None,
+            visible: i.visible,
+            card_was_up: false,
+            tray: crate::tray::TrayCache::default(),
+            tray_due: None,
+            tray_rows: 0,
+            watch_note: None,
+            placeholder_of: None,
             _tasks: Vec::new(),
             _subs: subs,
         }
@@ -1498,6 +1628,8 @@ impl AppView {
                     this.reconcile(None);
                     // A Welcome: the daemon's place and dash are looked for.
                     this.dash_on_welcome(cx);
+                    // A worker's page came: its next poll, drawn or not.
+                    this.arm_watch_poll(cx);
                     // An idle daemon's poll changes nothing: no frame, unless
                     // the rail's ages have a new minute to show.
                     if this.model.view_dirty || this.rail.minute() != crate::chrome::now_secs() / 60 {
@@ -1572,6 +1704,23 @@ impl AppView {
     /// in that order, so input given back in the frame of a switch stays
     /// with its tab. Nothing is read or allocated on a frame with neither.
     fn sync_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Over a worker's view the composer steers it (compared, not
+        // allocated, each frame).
+        let worker = self.model.watch.focused().map(|w| (w.handle_id.as_str(), w.state()));
+        if worker != self.placeholder_of.as_ref().map(|(h, s)| (h.as_str(), s.as_str())) {
+            let text: SharedString = match self.model.watch.focused() {
+                Some(w) if w.read_only() => format!("{} is {}: nothing to steer  (Esc: back to the session)", w.name, w.state()).into(),
+                Some(w) => format!("Steer {}: it reads this at its next step  (Enter sends)", w.name).into(),
+                None => COMPOSER_PLACEHOLDER.into(),
+            };
+            self.placeholder_of = worker.map(|(h, s)| (h.to_string(), s.to_string()));
+            self.composer.update(cx, |c, cx| c.set_placeholder(text, window, cx));
+        }
+        // A refused steer's text, once the thread it is for is on screen.
+        if let Some((text, note)) = self.model.watch.take_unsent() {
+            self.effect(Effect::Restore(text));
+            self.watch_note = Some(note.into());
+        }
         // The visible tab went into the one holding its session: the
         // composer's text is that tab's now (the follow rule keeps it).
         if let Some((from, into)) = self.model.tabs.take_merged()
@@ -1584,14 +1733,16 @@ impl AppView {
         if self.restore.is_none() && self.composer_owned() {
             return;
         }
-        let visible = self.model.tabs.composer_tab();
         let c = self.composer.read(cx);
         let (text, cursor) = (c.value(), c.cursor());
-        let tabs = &self.model.tabs;
-        let out =
-            self.drafts.frame(&mut self.composer_of, visible, self.restore.take(), &mut self.draft_note, (text.as_ref(), cursor), |s| {
-                tabs.knows(s)
-            });
+        let out = frame_composer(
+            &mut self.drafts,
+            &mut self.composer_of,
+            &self.model.tabs,
+            self.restore.take(),
+            (&mut self.draft_note, &mut self.watch_note),
+            (text.as_ref(), cursor),
+        );
         if let Some((text, cursor)) = out {
             self.composer.update(cx, |c, cx| {
                 c.set_value(text, window, cx);
@@ -1825,6 +1976,10 @@ impl AppView {
     /// model's transcript and numbers, the rows, folds and the list with
     /// its heights and scroll position. A fresh list takes its place.
     fn stash(&mut self) {
+        // Its worker views go with it; the session's own list comes back
+        // first (a worker's view is built again when the tab is shown).
+        let mut watch = std::mem::take(&mut self.model.watch);
+        watch.suspend();
         // The rows first: the transcript may have run ahead of the last frame.
         self.sync_list();
         let key = self.model.transcript.session_id().map(str::to_string);
@@ -1849,6 +2004,7 @@ impl AppView {
             files_gen: std::mem::take(&mut self.files_gen),
             waiting_on: self.waiting_on.take(),
             metrics_gen: self.metrics_gen,
+            watch,
         };
         self.rows_session = None;
         if let Some(k) = key {
@@ -1878,8 +2034,13 @@ impl AppView {
                     // The text size changed while it was in the background.
                     self.list.remeasure();
                 }
+                // Polled again once its attach lands (`Watch::on_reconnect`).
+                self.model.watch = c.watch;
             }
-            None => self.model.switch_in(crate::model::transcript(), Stats::default()),
+            None => {
+                self.model.switch_in(crate::model::transcript(), Stats::default());
+                self.model.watch = Watch::default();
+            }
         }
         self.rows_session = session;
     }
@@ -2186,6 +2347,24 @@ impl AppView {
             });
             return false;
         }
+        // In a worker's view, Enter steers that worker (never the session).
+        if let Some(target) = self.model.watch.steer_target() {
+            let handle = match target {
+                Ok(h) => h,
+                Err(why) => {
+                    self.watch_note = Some(why.into());
+                    self.model.view_dirty = true;
+                    return false;
+                }
+            };
+            if c.steer_subagent(handle.clone(), text.clone()).is_err() {
+                self.model.last_error = Some("the connection thread has stopped".into());
+                return false;
+            }
+            self.model.watch.steer_sent(&handle, &text);
+            self.watch_note = None;
+            return true;
+        }
         let sent = if self.model.transcript.busy() { c.steer(text.clone()) } else { c.submit(text.clone()) };
         if sent.is_err() {
             self.model.last_error = Some("the connection thread has stopped".into());
@@ -2193,7 +2372,96 @@ impl AppView {
         }
         self.model.sent(text);
         self.draft_note = None;
+        self.watch_note = None;
         true
+    }
+
+    /// Ctrl/Alt+↑ / ↓: walk the workers' views ([`crate::watch`]). Not
+    /// under Settings or Usage. At either end the composer's hint says so.
+    fn worker_key(&mut self, step: Step, cx: &mut Context<Self>) {
+        if self.model.tabs.view().is_some() {
+            return;
+        }
+        let running = if self.model.active.is_some() { self.model.watchable() } else { Vec::new() };
+        let cwd = self.model.cwd().map(str::to_string);
+        let moved = self.model.watch.step(step, &running, cwd.as_deref(), Instant::now());
+        log::debug!(target: "synaps_desktop::watch", "key {step:?}: {moved:?}");
+        self.watch_note = match moved {
+            Moved::Worker(_) => {
+                self.watch_opened();
+                None
+            }
+            Moved::Main => None,
+            Moved::Oldest => Some(format!("the oldest worker: {WORKER_KEY} or Esc goes back").into()),
+            Moved::No if self.model.watch.candidates(&running).is_empty() => Some("no workers to watch".into()),
+            Moved::No => Some(format!("on the session's thread: {WORKER_KEY} watches its workers").into()),
+        };
+        cx.notify();
+    }
+
+    /// A worker's view came on: without a daemon it says nothing comes.
+    pub(crate) fn watch_opened(&mut self) {
+        self.watch_note = None;
+        if self.client.is_none() {
+            self.model.watch.no_daemon("offline: there is no daemon to read this worker's thread from");
+        }
+    }
+
+    /// Back to the session's thread (`esc`: by Esc, which guards the next).
+    pub(crate) fn leave_worker(&mut self, esc: bool, cx: &mut Context<Self>) {
+        if esc {
+            self.model.watch.leave_on_esc(Instant::now());
+        } else {
+            self.model.watch.focus_main();
+        }
+        self.watch_note = None;
+        cx.notify();
+    }
+
+    /// The watch poll's timer, (re)set for when the next page is due: by a
+    /// frame, a reply or the poll itself, without drawing one. Only while
+    /// the window is visible and no Settings or Usage is on screen: a
+    /// window that shows nothing (minimized, covered) asks for nothing
+    /// after the poll on its way.
+    fn arm_watch_poll(&mut self, cx: &mut Context<Self>) {
+        let due = self.model.watch.poll_due().filter(|_| self.visible && self.model.tabs.view().is_none());
+        let Some(due) = due else {
+            self.watch_poll = None;
+            return;
+        };
+        if self.watch_poll.as_ref().is_some_and(|(at, _)| *at == due) {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let left = due.saturating_duration_since(Instant::now());
+            if !left.is_zero() {
+                cx.background_executor().timer(left).await;
+            }
+            let _ = this.update(cx, |v, cx| v.watch_poll_now(cx));
+        });
+        self.watch_poll = Some((due, task));
+    }
+
+    fn watch_poll_now(&mut self, cx: &mut Context<Self>) {
+        self.watch_poll = None;
+        let now = Instant::now();
+        if self.client.is_none() {
+            self.model.watch.no_daemon("offline: there is no daemon to read this worker's thread from");
+            cx.notify();
+        } else if let Some((handle, since)) = self.model.watch.take_poll(now) {
+            log::debug!(target: "synaps_desktop::watch", "watch {handle} since {since}");
+            if !self.client.as_ref().is_some_and(|c| c.watch_subagent(handle, since).is_ok()) {
+                self.model.watch.poll_failed(now);
+            }
+        }
+        // The timeout's (or the retry's) timer; the reply arms the next.
+        self.arm_watch_poll(cx);
+    }
+
+    /// The window was shown or hidden: polls stop while it shows nothing.
+    fn visibility_changed(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.visible = visible;
+        self.arm_watch_poll(cx);
     }
 
     /// The visible tab shows its session as last seen (the tab cache, or
@@ -2291,6 +2559,12 @@ impl AppView {
         }
     }
 
+    /// What the composer says of its text instead of its hint: a worker
+    /// key's or a refused steer's note, else the draft's.
+    fn composer_note(&self) -> Option<SharedString> {
+        self.watch_note.clone().or_else(|| self.draft_note.map(SharedString::from))
+    }
+
     /// What the centre column draws besides the bars, the card and the
     /// composer ([`crate::fit::Extras`]).
     fn extras(&self) -> crate::fit::Extras {
@@ -2299,13 +2573,22 @@ impl AppView {
             naming: n.naming && self.model.active.is_some(),
             naming_notes: u8::from(n.rename_error.is_some()) + u8::from(self.replace_offer().is_some()),
             error: self.model.last_error.is_some(),
-            note: self.draft_note.is_some(),
+            note: self.watch_note.is_some() || self.draft_note.is_some(),
+            crumb: self.model.watch.focus().is_some(),
+            tray: self.tray_rows as u8,
         }
     }
 
+    /// The card on screen: the session's, not over a worker's view.
+    fn card_shown(&self) -> bool {
+        self.model.watch.focus().is_none() && self.current_card().is_some()
+    }
+
     /// The session tab is on screen and its card shows the first prompt.
+    /// Not over a worker's view: the card is the session's, and Esc there
+    /// goes back to it.
     fn card_up(&self) -> bool {
-        self.model.tabs.view().is_none() && self.current_card().is_some()
+        self.model.tabs.view().is_none() && self.model.watch.focus().is_none() && self.current_card().is_some()
     }
 
     /// The card's keys act: it is on screen in the active window with its
@@ -2415,6 +2698,10 @@ impl AppView {
 
     /// Esc with the card's keys live: DENY, or a secret's CANCEL.
     fn card_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The second of two quick Escs that left a worker's view.
+        if self.model.watch.esc_guarded(Instant::now()) {
+            return;
+        }
         let Some((c, secret)) = self.card_answerable() else { return };
         let key = c.key;
         if secret {
@@ -2477,6 +2764,19 @@ impl AppView {
                 c._arm = Some(task);
             }
         }
+        // Back on screen from behind a worker's view (or Settings, Usage):
+        // its buttons and keys wait again, as a new card's do. Nothing
+        // that was not drawn counts as seen.
+        let up = self.card_up();
+        if up && !self.card_was_up && !new {
+            if let Some(c) = self.card.as_mut() {
+                log::info!(target: "synaps_desktop::card", "card {:?}: back on screen, waiting", c.key);
+                c.arm = Arm::new(now);
+                c._arm = Some(Self::arm_repaint(cx));
+            }
+            self.keys_live = false;
+        }
+        self.card_was_up = up;
         let live = self.card_keys_live(window, cx).is_some();
         if live && !self.keys_live {
             self.restart_card_keys(cx);
@@ -2731,12 +3031,34 @@ impl AppView {
     /// holding it ([`turns::build`]); only rows that differ are spliced
     /// (and so re-measured). A turn that ends can fold its last run.
     pub fn sync_list(&mut self) {
-        let busy = self.model.transcript.busy();
-        let splice = self.model.transcript.take_splice();
-        let items = self.model.transcript.items();
+        self.sync_pane();
+        let busy = self.model.shown().busy();
+        let mut splice = self.model.shown_mut().take_splice();
+        if std::mem::take(&mut self.full_rebuild) {
+            let n = self.model.shown().len();
+            splice = Some(synaps_client::transcript::Splice { start: 0, old_len: self.rows.len(), new_len: n });
+        }
+        let items = self.model.shown().items();
         let from = match &splice {
             Some(sp) => {
-                if items.len() - sp.start > REUSE_ROWS {
+                // The oldest rows dropped (a worker's bound): the list drops
+                // theirs and keeps every other row, its height and the
+                // scroll on it; the rest syncs as any change does.
+                let trimmed = if sp.start == 0 { front_trimmed(&self.rows, items) } else { 0 };
+                if trimmed > 0 {
+                    let k = self.disp.partition_point(|d| d.item < trimmed);
+                    self.list.splice(0..k, 0);
+                    self.disp.drain(..k);
+                    self.disp.iter_mut().for_each(|d| d.shift(trimmed));
+                    self.rows.drain(..trimmed);
+                    // The cut runs' summaries and folds go with them.
+                    if let Some(first) = items.first().map(|i| i.id) {
+                        self.summaries.retain_from(first);
+                        self.toggled.retain(|id| *id >= first);
+                        self.open_runs.retain(|id| *id >= first);
+                    }
+                }
+                if trimmed > 0 || items.len() - sp.start > REUSE_ROWS {
                     // A long tail rebuilt (an attach, a history replace):
                     // rows whose item kept its id and rev keep their strings,
                     // so a cached tab's re-attach rebuilds only what changed.
@@ -2745,13 +3067,13 @@ impl AppView {
                     for item in &items[sp.start..] {
                         let r = old
                             .remove(&(item.id, item.rev))
-                            .unwrap_or_else(|| row_cache(item, &self.model.stats.files, &self.model.stats.subagents));
+                            .unwrap_or_else(|| row_cache(item, self.model.shown_files(), self.model.shown_subagents()));
                         self.rows.push(r);
                     }
                 } else {
                     self.rows.truncate(sp.start);
                     for item in &items[sp.start..] {
-                        self.rows.push(row_cache(item, &self.model.stats.files, &self.model.stats.subagents));
+                        self.rows.push(row_cache(item, self.model.shown_files(), self.model.shown_subagents()));
                     }
                 }
                 debug_assert!(self.rows.iter().zip(items).all(|(r, i)| r.id == i.id && r.rev == i.rev));
@@ -2786,6 +3108,76 @@ impl AppView {
         self.sync_subagents();
     }
 
+    /// The list holds the rows of the transcript on screen: when a worker's
+    /// view comes on, the session's list (rows, folds, heights, scroll)
+    /// waits in [`AppView::main_pane`] and a fresh one is built for the
+    /// worker; when it goes, the worker's is dropped and the session's
+    /// comes back exactly as it was left.
+    fn sync_pane(&mut self) {
+        let want = self.model.watch.focus_key();
+        if want == self.pane_of.as_ref().map(|(h, g)| (h.as_str(), *g)) {
+            return;
+        }
+        let want = want.map(|(h, g)| (h.to_string(), g));
+        let left = self.take_pane();
+        if self.pane_of.is_none() {
+            self.main_pane = Some(left);
+        }
+        match (&want, self.main_pane.take()) {
+            (None, Some(main)) => {
+                let stale = main.metrics_gen != self.metrics_gen;
+                self.put_pane(main);
+                if stale {
+                    self.list.remeasure();
+                }
+            }
+            // Never: the session's list is always kept. Built again.
+            (None, None) => self.full_rebuild = true,
+            (Some(_), main) => {
+                self.main_pane = main;
+                self.rows_session = self.model.active.as_ref().map(|a| a.session_id.clone());
+                self.full_rebuild = true;
+            }
+        }
+        self.pane_of = want;
+    }
+
+    /// The list's state, handed out; a fresh, empty list in its place.
+    fn take_pane(&mut self) -> Pane {
+        let fresh = ListState::new(0, ListAlignment::Top, px(600.));
+        fresh.set_follow_mode(FollowMode::Tail);
+        Pane {
+            rows: std::mem::take(&mut self.rows),
+            disp: std::mem::take(&mut self.disp),
+            summaries: std::mem::take(&mut self.summaries),
+            list: std::mem::replace(&mut self.list, fresh),
+            toggled: std::mem::take(&mut self.toggled),
+            open_runs: std::mem::take(&mut self.open_runs),
+            synced_busy: std::mem::take(&mut self.synced_busy),
+            files_gen: std::mem::take(&mut self.files_gen),
+            subs_gen: std::mem::take(&mut self.subs_gen),
+            waiting_on: self.waiting_on.take(),
+            rows_session: self.rows_session.take(),
+            scroll_carry: self.scroll_carry.take(),
+            metrics_gen: self.metrics_gen,
+        }
+    }
+
+    fn put_pane(&mut self, p: Pane) {
+        self.rows = p.rows;
+        self.disp = p.disp;
+        self.summaries = p.summaries;
+        self.list = p.list;
+        self.toggled = p.toggled;
+        self.open_runs = p.open_runs;
+        self.synced_busy = p.synced_busy;
+        self.files_gen = p.files_gen;
+        self.subs_gen = p.subs_gen;
+        self.waiting_on = p.waiting_on;
+        self.rows_session = p.rows_session;
+        self.scroll_carry = p.scroll_carry;
+    }
+
     /// A subagent's block changed shape (a line came, its state changed)
     /// with no item changing (its events and rows are not the
     /// transcript's): the rows from the turn of the earliest call whose
@@ -2793,13 +3185,13 @@ impl AppView {
     /// run's fold follow. Its text alone changing needs nothing: the row
     /// reads it when drawn.
     fn sync_subagents(&mut self) {
-        let subs = &mut self.model.stats.subagents;
+        let subs = self.model.shown_subagents_mut();
         if subs.shape_generation() == self.subs_gen {
             return;
         }
         self.subs_gen = subs.shape_generation();
         let changed = subs.take_reshaped().filter(|c| !c.is_empty());
-        let items = self.model.transcript.items();
+        let items = self.model.shown().items();
         let k = items.iter().position(|i| {
             i.tool.as_ref().is_some_and(|t| match &changed {
                 Some(c) => c.contains(&t.tool_id),
@@ -2815,12 +3207,12 @@ impl AppView {
     /// result comes with the history, not with the item's status): the
     /// file tools' counts, and the summaries that sum them, follow it.
     fn sync_counts(&mut self) {
-        let ledger = &self.model.stats.files;
+        let ledger = self.model.shown_files();
         if ledger.generation() == self.files_gen {
             return;
         }
         self.files_gen = ledger.generation();
-        let items = self.model.transcript.items();
+        let items = self.model.shown().items();
         let mut changed = false;
         for (row, item) in self.rows.iter_mut().zip(items) {
             let Some(t) = item.tool.as_ref().filter(|t| files::is_file_tool(&t.name)) else { continue };
@@ -2851,8 +3243,9 @@ impl AppView {
 
     /// Display rows from item `start` (a turn's start) on.
     fn rebuild_from(&mut self, start: usize) {
-        let items = self.model.transcript.items();
-        let new = turns::build(items, start, self.model.transcript.busy(), &self.open_runs, &self.model.stats.subagents);
+        let shown = self.model.shown();
+        let items = shown.items();
+        let new = turns::build(items, start, shown.busy(), &self.open_runs, self.model.shown_subagents());
         self.summaries.update(&new, items, &self.rows);
         let at = self.disp.partition_point(|d| d.item < start);
         if let Some((range, count)) = turns::diff(&self.disp[at..], &new) {
@@ -2861,8 +3254,7 @@ impl AppView {
         }
         // A full build per sync: bounded, so long sessions stay usable in dev builds.
         debug_assert!(
-            items.len() > 2_000
-                || self.disp == turns::build(items, 0, self.model.transcript.busy(), &self.open_runs, &self.model.stats.subagents)
+            items.len() > 2_000 || self.disp == turns::build(items, 0, shown.busy(), &self.open_runs, self.model.shown_subagents())
         );
     }
 
@@ -2897,7 +3289,7 @@ impl AppView {
         if !self.open_runs.remove(&id) {
             self.open_runs.insert(id);
         }
-        let items = self.model.transcript.items();
+        let items = self.model.shown().items();
         if let Some(start) = items.iter().position(|i| i.id == id).map(|ix| turns::turn_start(items, ix + 1)) {
             self.rebuild_from(start);
         }
@@ -3465,15 +3857,16 @@ impl AppView {
     }
 
     /// The notice line under the card: the last error and, cramped, the
-    /// draft's note. With a card up it is one line, the rest in its tooltip
-    /// ([`crate::fit::Extras`] counts it so).
+    /// composer's note (a worker's, else the draft's). With a card up it is
+    /// one line, the rest in its tooltip ([`crate::fit::Extras`] counts it
+    /// so).
     fn render_notice(&self, p: &Palette, m: &Metrics) -> Option<impl IntoElement> {
         let lay = self.layout;
-        let note = self.draft_note.filter(|_| lay.form() == crate::fit::Form::Cramped);
+        let note = self.composer_note().filter(|_| lay.form() == crate::fit::Form::Cramped);
         let (text, color): (SharedString, Hsla) = match (self.model.last_error.clone(), note) {
             (Some(e), Some(n)) => (format!("{e} · {n}").into(), p.err),
             (Some(e), None) => (e.into(), p.err),
-            (None, Some(n)) => (n.into(), p.warn),
+            (None, Some(n)) => (n, p.warn),
             (None, None) => return None,
         };
         let line = mono(text.clone(), m.meta, color).pt(px(crate::fit::NOTICE_TOP)).line_height(px(crate::fit::notice_line(m)));
@@ -3499,43 +3892,55 @@ impl AppView {
         let lay = self.layout;
         let dims = crate::fit::Composer::of(m, lay.form());
         let busy = self.model.transcript.busy();
-        let can_send = self.drives();
+        // Over a worker's view the composer steers it, or takes nothing
+        // once it has finished.
+        let worker = self.model.watch.focused();
+        let drives = self.drives();
+        let can_send = drives && worker.is_none_or(|w| !w.read_only() && w.steerable);
         let r = m.r;
-        let hint = if self.client.is_none() && !self.synthetic {
-            "offline: no daemon to send to"
+        let hint: SharedString = if self.client.is_none() && !self.synthetic {
+            "offline: no daemon to send to".into()
         } else if self.client.is_none() {
-            "offline: synthetic transport, nothing is sent"
+            "offline: synthetic transport, nothing is sent".into()
         } else if self.model.switching() {
-            "switching sessions…"
-        } else if !can_send && self.opening() {
-            "opening…"
-        } else if !can_send {
-            "not attached"
+            "switching sessions…".into()
+        } else if !drives && self.opening() {
+            "opening…".into()
+        } else if !drives {
+            "not attached".into()
+        } else if let Some(w) = worker {
+            w.hint.clone()
         } else if to_card {
             // The composer keeps its keys (Ctrl/Cmd+Enter sends from here);
             // the card's buttons show none until it has them.
             if cfg!(target_os = "macos") {
-                "⌘Enter sends this · Esc, then ⌘Enter answers the card"
+                "⌘Enter sends this · Esc, then ⌘Enter answers the card".into()
             } else {
-                "Ctrl+Enter sends this · Esc, then Ctrl+Enter answers the card"
+                "Ctrl+Enter sends this · Esc, then Ctrl+Enter answers the card".into()
             }
         } else if busy {
-            "steer: applied at the next turn boundary"
+            "steer: applied at the next turn boundary".into()
         } else {
-            "send: starts a turn"
+            "send: starts a turn".into()
         };
-        let send = fbtn("send", if busy { label::STEER } else { label::SEND }, can_send, p.btn_fill, p, m).on_click(cx.listener(
-            |this, _, window, cx| {
-                let text = this.composer.read(cx).value().trim().to_string();
-                if !text.is_empty() && this.submit(text) {
-                    this.composer.update(cx, |s, cx| s.set_value("", window, cx));
-                }
-                cx.notify();
-            },
-        ));
+        let word = match worker {
+            Some(w) if w.read_only() => label::READ_ONLY,
+            Some(_) => label::STEER_WORKER,
+            None if busy => label::STEER,
+            None => label::SEND,
+        };
+        let send = fbtn("send", word, can_send, p.btn_fill, p, m).on_click(cx.listener(|this, _, window, cx| {
+            let text = this.composer.read(cx).value().trim().to_string();
+            if !text.is_empty() && this.submit(text) {
+                this.composer.update(cx, |s, cx| s.set_value("", window, cx));
+            }
+            cx.notify();
+        }));
+        // A worker that finished keeps the composer (and what is typed in
+        // it, the focus too): Enter says why nothing goes, SEND is off.
         let field = Textarea::new(&self.composer)
             .appearance(false)
-            .disabled(!can_send)
+            .disabled(!drives)
             .text_size(px(m.body))
             .line_height(px(m.body_line))
             .text_color(p.ink);
@@ -3549,17 +3954,12 @@ impl AppView {
                     .mt(px(dims.row_gap.unwrap_or((6. * r).round())))
                     .items_center()
                     .gap(px(20.))
-                    .child(if lay.tight {
-                        div().flex_1()
-                    } else {
-                        match &self.draft_note {
-                            Some(n) => mono(*n, m.meta, p.warn),
-                            None => mono(hint, m.meta, p.dim_u),
-                        }
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
+                    .child(match (self.composer_note(), lay.tight) {
+                        // A tight pane has no room for the hint, but a note
+                        // says where Enter sends the text.
+                        (Some(n), _) => mono(n, m.meta, p.warn).flex_1().min_w_0().overflow_hidden().text_ellipsis(),
+                        (None, true) => div().flex_1(),
+                        (None, false) => mono(hint, m.meta, p.dim_u).flex_1().min_w_0().overflow_hidden().text_ellipsis(),
                     })
                     .child(send),
             )
@@ -3652,7 +4052,10 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
                 (Some(pv), _) if !pv.title.is_empty() => pv.title.clone().into(),
                 // A subagent's call: its label and its task's first line.
                 (_, Some(arg)) => arg,
-                _ => one_line(&t.input, 200).into(),
+                _ => match command_of(&t.input) {
+                    Some(c) => one_line(&c, 200).into(),
+                    None => one_line(&t.input, 200).into(),
+                },
             };
             let lines: Vec<&str> = t.result.lines().collect();
             r.result_more = lines.len().saturating_sub(RESULT_LINES);
@@ -3690,11 +4093,15 @@ struct Inputs {
     settings_pane: Entity<crate::views::ViewPane>,
     usage_pane: Entity<crate::views::ViewPane>,
     focus: FocusHandle,
+    visible: bool,
 }
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diag::mark("first_render");
+        // Every frame drawn (`SYNAPS_DESKTOP_LOG=debug`): what an idle
+        // window costs is countable.
+        log::debug!(target: "synaps_desktop::frame", "frame");
         self.sync_composer(window, cx);
         if std::mem::take(&mut self.model.named.opened) {
             self.find_input.update(cx, |s, cx| s.set_value("", window, cx));
@@ -3702,6 +4109,7 @@ impl Render for AppView {
         }
         self.sync_list();
         self.sync_card(window, cx);
+        self.sync_tray(cx);
         self.refresh_rail();
         if let Some(b) = self.bench.as_mut() {
             b.on_render(&self.list, window);
@@ -3769,7 +4177,8 @@ impl Render for AppView {
         if self.top_words.is_none() {
             self.top_words = Some(crate::chrome::top_words(window));
         }
-        let ex = self.extras();
+        // The form from what decides it (not the breadcrumb or the tray).
+        let ex = crate::fit::Extras { crumb: false, tray: 0, ..self.extras() };
         let lay = Layout::of(pane, self.height - crate::chrome::TOP, &m, ex);
         if (lay.hang, lay.tight) != (self.layout.hang, self.layout.tight) {
             self.list.remeasure();
@@ -3789,14 +4198,28 @@ impl Render for AppView {
         }
         self.layout = lay;
         self.layout_naming = ex.naming;
-        // The composer grows only into room the card's smallest form leaves.
-        let rows = crate::fit::composer_rows(&m, lay.form(), self.height, self.current_card().is_some(), ex);
+        // The tray takes what is left over the card's least well and a
+        // one-line composer; the composer grows only into room the card's
+        // smallest form and the tray leave.
+        let card_shown = self.card_shown();
+        let ex = crate::fit::Extras { crumb: self.model.watch.focus().is_some(), ..ex };
+        let tray_n = if view.is_none() { self.tray.rows.len() } else { 0 };
+        self.tray_rows = crate::fit::tray_rows(&m, lay.form(), self.height, card_shown, ex, tray_n);
+        let ex = crate::fit::Extras { tray: self.tray_rows as u8, ..ex };
+        let rows = crate::fit::composer_rows(&m, lay.form(), self.height, card_shown, ex);
         if rows != self.composer_rows {
             self.composer_rows = rows;
             self.composer.update(cx, |s, cx| s.set_auto_grow(1, rows, cx));
         }
         let tabs = self.render_tabs(if view.is_some() { view_pane } else { pane }, &p, cx);
         self.schedule_tabs_save(cx);
+        // A worker's view on screen asks for its next page; under Settings
+        // or Usage, nothing. Whether its list is scrolled back (its oldest
+        // rows stay while they may be read).
+        if self.model.watch.focus().is_some() {
+            self.model.watch.scrolled_back = !self.list.is_following_tail();
+        }
+        self.arm_watch_poll(cx);
         if self.attach_wait.is_some() && self.attach_due.is_none() {
             self.arm_attach(cx);
         }
@@ -3843,9 +4266,11 @@ impl Render for AppView {
                 .child(tabs)
                 .child(self.render_header(self.header_meta(), &p, cx))
                 .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
+                .children(self.render_crumb(&p, cx))
                 .child(div().flex_1().min_h_0().child(list).children(hold_back))
-                .children(self.render_prompt(&p, &m, self.card_keys_live(window, cx), cx))
+                .when(card_shown, |d| d.children(self.render_prompt(&p, &m, self.card_keys_live(window, cx), cx)))
                 .children(self.render_notice(&p, &m))
+                .children(self.render_tray(&p, &m, cx))
                 .child(self.render_composer(&p, &m, self.card_up() && self.composer.read(cx).focus_handle(cx).is_focused(window), cx))
         };
         h_flex()
@@ -3888,6 +4313,13 @@ impl Render for AppView {
                     window.focus(&this.focus, cx);
                     cx.stop_propagation();
                     cx.notify();
+                } else if ev.keystroke.key == "escape" && this.model.watch.focus().is_some() && this.model.tabs.view().is_none() {
+                    // A worker's view: back to the session (a held Esc once).
+                    cx.stop_propagation();
+                    log::debug!(target: "synaps_desktop::watch", "esc (new press: {})", this.chord_press);
+                    if this.chord_press {
+                        this.leave_worker(true, cx);
+                    }
                 } else if ev.keystroke.key == "escape" && this.card_up() {
                     if this.card_keys_live(window, cx) == Some(true) {
                         // A secret prompt's field: CANCEL, once armed.
@@ -3955,6 +4387,8 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &TextReset, _, cx| this.step_text(None, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_view(crate::tabs::Kind::Settings, cx)))
             .on_action(cx.listener(|this, _: &OpenUsage, _, cx| this.open_view(crate::tabs::Kind::Usage, cx)))
+            .on_action(cx.listener(|this, _: &WorkerUp, _, cx| this.worker_key(Step::Up, cx)))
+            .on_action(cx.listener(|this, _: &WorkerDown, _, cx| this.worker_key(Step::Down, cx)))
             .map(|d| tab_actions(d, cx))
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
                 let k = &ev.keystroke.key;
@@ -4013,11 +4447,12 @@ mod tests {
 
     use super::{
         ARM, Arm, CENTRE_MIN, CardChord, CardKey, FoldKeys, HeaderMeta, HeaderParts, Side, TabKey, YES_KEY, above_list, authorize_ready,
-        card_key, card_key_on, dragged, hidden, lines_below, one_line, panel_keys, secret_answer, side_widths, sides, still_typing,
-        tab_keys, text_keys, toggled, well_body,
+        card_key, card_key_on, command_of, dragged, hidden, lines_below, one_line, panel_keys, secret_answer, side_widths, sides,
+        still_typing, tab_keys, text_keys, toggled, well_body, worker_keys,
     };
     use crate::theme::{Metrics, Panels};
     use crate::turns::Layout;
+    use crate::watch::Step;
 
     /// Short is the pane's height alone, under the full top bar: 740 px,
     /// a 792-px window. It changes nothing the list's rows are laid out
@@ -4234,6 +4669,27 @@ mod tests {
         ];
         let parse = |k: &'static str| gpui_kit::Keystroke::parse(k).unwrap_or_else(|e| panic!("{k}: {e:?}"));
         let input: Vec<_> = INPUT.iter().map(|k| parse(k)).collect();
+        // The worker keys: Ctrl/Alt+↑/↓ (Option first on macOS), none an
+        // input's (the composer keeps ↑/↓, Shift+↑/↓, Ctrl+Alt+↑/↓ and
+        // Cmd+↑/↓), an app key, a view key or a card key.
+        for mac in [false, true] {
+            let (a, b) = panel_keys(mac);
+            let (s, u, alt) = crate::views::view_keys(mac, !mac);
+            let mut taken: Vec<_> =
+                [a, b].into_iter().chain(text_keys(mac)).chain(tab_keys(mac).iter().map(|(k, _)| *k)).map(parse).collect();
+            taken.extend([Some(s), Some(u), alt].into_iter().flatten().map(parse));
+            let keys = worker_keys(mac);
+            assert_eq!(keys[0], (if mac { "alt-up" } else { "ctrl-up" }, Step::Up));
+            for (i, (k, _)) in keys.iter().enumerate() {
+                let k = parse(k);
+                assert!(!input.contains(&k) && !taken.contains(&k), "{k:?}");
+                assert!(!keys[..i].iter().any(|(o, _)| parse(o) == k), "{k:?} bound twice");
+                assert_eq!(card_key_on(&k, mac), None, "{k:?}");
+                assert!(k.modifiers.control != k.modifiers.alt && !k.modifiers.shift && !k.modifiers.platform, "{k:?}");
+                assert!(k.key == "up" || k.key == "down");
+            }
+            assert_eq!(keys.iter().filter(|(_, s)| *s == Step::Up).count(), 2);
+        }
         for mac in [false, true] {
             let (a, b) = panel_keys(mac);
             let mut app: Vec<_> = [a, b].into_iter().chain(text_keys(mac)).map(|k| (parse(k), None)).collect();
@@ -4781,5 +5237,58 @@ mod tests {
     fn one_line_arguments() {
         assert_eq!(one_line("  \nfirst\nsecond", 80), "first …");
         assert_eq!(one_line("abcdef", 3), "abc …");
+        assert_eq!(command_of(r#"{"command":"sleep 16 && echo step 1","timeout":30}"#).as_deref(), Some("sleep 16 && echo step 1"));
+        assert_eq!(command_of(r#"{"path":"a.rs","limit":3}"#), None);
+        assert_eq!(command_of(r#"{"command":"cut off at the prev"#), None, "a cut preview stays as it is");
+        assert_eq!(command_of("ls"), None);
+    }
+
+    /// N-M1: a steer to scout, Esc out, scout finishes and its view goes,
+    /// then the daemon refuses the steer. Its text comes back into the
+    /// session's composer (the same tab) with the note that says it was a
+    /// steer to scout, refused, and that Enter now sends it to the session.
+    /// Only a switch to another tab's composer takes a worker note away.
+    #[test]
+    fn a_refused_steer_back_in_the_session_composer_says_so() {
+        use gpui_kit::SharedString;
+        use serde_json::json;
+        use synaps_client::WatchReply;
+
+        use super::frame_composer;
+        use crate::subagents::{Live, Status};
+        use crate::tabs::{Drafts, Place, Tabs};
+        use crate::watch::{Candidate, Watch};
+
+        let t0 = Instant::now();
+        let mut w = Watch::default();
+        w.open(&Candidate::of(3, "scout"), None, t0);
+        let _ = w.take_poll(t0);
+        let page = json!({"handle_id": "sa_3", "agent_name": "scout", "status": "running", "steerable": true, "next_seq": 1, "events": []});
+        w.on_reply("sa_3", 0, WatchReply::Page(Box::new(serde_json::from_value(page).unwrap())), t0);
+        assert_eq!(w.steer_target(), Some(Ok("sa_3".into())));
+        w.steer_sent("sa_3", "look in crates/relay too");
+        w.leave_on_esc(t0);
+        let done =
+            Live { id: 3, name: "scout".into(), status: Status::Done, line: String::new(), tools: None, elapsed: None, watchable: true };
+        w.prune(t0, &[done]);
+        assert!(w.worker("sa_3").is_none(), "its view has gone");
+        assert!(w.steer_refused("scout (sa_3) is not running"));
+        let (text, note) = w.take_unsent().expect("the session's thread is on screen");
+        // `sync_composer`: the text goes back into the composer it came from.
+        let mut tabs = Tabs::default();
+        tabs.open("s", "s", Place::Current);
+        let (mut drafts, mut owner) = (Drafts::default(), tabs.composer_tab().map(|(id, s)| (id, s.map(str::to_string))));
+        let (mut draft_note, mut watch_note) = (None, Some(SharedString::from(note)));
+        let out = frame_composer(&mut drafts, &mut owner, &tabs, Some(text), (&mut draft_note, &mut watch_note), ("", 0));
+        assert_eq!(out, Some(("look in crates/relay too".to_string(), None)));
+        assert_eq!(
+            watch_note.as_deref(),
+            Some("your steer to scout (sa_3) was refused (scout (sa_3) is not running): Enter now sends it to the session"),
+            "the note shows with it"
+        );
+        // Another tab's composer: the note is not its.
+        tabs.open("t", "t", Place::New);
+        let _ = frame_composer(&mut drafts, &mut owner, &tabs, None, (&mut draft_note, &mut watch_note), ("x", 1));
+        assert_eq!(watch_note, None);
     }
 }

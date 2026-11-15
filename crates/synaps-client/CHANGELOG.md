@@ -1,6 +1,21 @@
 # synaps-client changelog
 
-## Since a982132
+Commit hashes are this repository's (`synaps-desk`). PR numbers other than synaps-desk#N are those of the archived `synaps-desktop` repository this history was rewritten from.
+
+## Since dc5a246
+
+Additive only (synaps-desk#1 `feat/worker-tray`): watching and steering a session's workers (subagents), as the Synaps TUI does. Nothing existing changes shape: `Command`, `Event`, `Error`, `SessionCommand` and `SessionQuery` were already `#[non_exhaustive]`.
+
+- New `Command::SubagentWatch { handle_id, since }` and `Client::watch_subagent(handle_id, since)`: one page of a worker's watch journal (`{"cmd":"query","query":{"query":"subagent_watch","handle_id":…,"since":…,"tool_queue":true}}`, Synaps v0.11.0+). The reply comes as the new `Event::SubagentWatch { attach_seq, session_id, handle_id, since, reply }`, `reply` a new `WatchReply` (`#[non_exhaustive]`): `Page(Box<WatchPage>)`, `Gone(String)` (the daemon's `{"error": …}`: an unknown worker, or one that finished longer ago than the daemon keeps a journal), `Unsupported` (a daemon before v0.11.0 could not decode the query), `Undecodable(String)` (with an `Error::Decode`).
+- New `protocol::WatchPage` and `protocol::WatchEvent` (both `#[non_exhaustive]`), mirroring v0.11.1's `runtime/subagent_watch.rs`; every field `serde(default)`, and a kind this client does not know is `WatchEvent::Unknown`, never a failed page. `WatchEvent::to_stream()` gives the main transcript's shape.
+- New `Command::SubagentSteer { handle_id, text }` and `Client::steer_subagent(handle_id, text)`: steer a running worker (`{"cmd":"subagent_steer",…}`, an input command: refused unless this client owns the session's input). Its `Debug` redacts the text, as `Submit`'s does. A refusal is `Error::Refused { command: Some("subagent_steer"), reason }`; from a daemon before v0.11.0 the reason is the new `STEER_UNSUPPORTED`.
+- Behaviour, only for the two new commands: a daemon before v0.11.0 answers a frame it cannot decode with `malformed frame: unknown variant …` and keeps the connection; for `subagent_watch` / `subagent_steer` that now becomes `WatchReply::Unsupported` / the `STEER_UNSUPPORTED` refusal instead of an `Error::Protocol`.
+- New `Transcript` methods for a transcript fed by hand (a worker's): `apply_watch(&WatchEvent)`, `set_busy(bool)` and `trim_live_front(max_items, max_bytes)` (drops the oldest rows of a transcript with no history; returns how many; the next splice starts at 0).
+- Tests: `tests/fixtures.rs` (a v0.11.1 page decodes and replays like the main stream; the query and the steer encode as the daemon reads them, the text never printed; a live-only transcript trims its oldest rows) and `tests/fake_daemon.rs` (pages, `Gone`, an old daemon's `unknown variant`).
+
+For synaps-avatar (nyx): nothing to change.
+
+## Since 3efcca2
 
 Additive only (PR `feat/rail-redesign`): the daemon's `SessionMeta` fields the rail reads, mirrored.
 
@@ -9,7 +24,7 @@ Additive only (PR `feat/rail-redesign`): the daemon's `SessionMeta` fields the r
 
 For synaps-avatar (nyx): nothing to change.
 
-## Since cedbdbd
+## Since 0451a7a
 
 Additive only (PR `polish/layout-backlog`), plus two behaviour fixes. Nothing existing changes shape: code that builds `Event::Attached { .. }` or matches `Command`, `ToolOutcome` or `ToolStatus` exhaustively (all `#[non_exhaustive]`) compiles as before.
 
@@ -22,14 +37,14 @@ Additive only (PR `polish/layout-backlog`), plus two behaviour fixes. Nothing ex
 
 For synaps-avatar (nyx): nothing to change. To make answers airtight, keep `attached.connection` from the last `Event::Attached` and answer with `client.answer_on(connection, id, value)`.
 
-## Since 2ae846d
+## Since 12d89d9
 
 No API change. Two behaviour fixes in `transcript::tool_outcome` (PR `fix/review-pr5`):
 
 - An `activate_tools` call whose confirmation was denied (`Tool execution failed: tool activation denied: …`, agent-engine `tools/discovery.rs` `activation_denied`) is `Denied`, not `Failed`. A guessed id (`… tool activation denied: unknown tool id …`) stays `Failed`.
 - `Unknown tool` matches only the daemon's `Unknown tool: ` (with the colon), so a result that merely starts with the words is not a failure.
 
-## API changes since deabaf1
+## API changes since 66ffc7a
 
 Additive only (the hybrid UI, PR #5 `feat/hybrid-ui`), plus one behaviour fix (tool status from the result text).
 
@@ -38,7 +53,7 @@ Additive only (the hybrid UI, PR #5 `feat/hybrid-ui`), plus one behaviour fix (t
 - New `transcript::ToolOutcome { Ok, Failed, Denied, Cancelled }` (`#[non_exhaustive]`), `transcript::tool_outcome(text, is_error)` and `transcript::tool_result_outcome(&block)`: a finished tool call classified by its result text, as the Synaps TUI does. The engine leaves `is_error` unset on a failed tool (`Tool execution failed: …`), an extension block (a denied confirmation: `Tool call blocked by extension: …`), a gate denial (`Tool call denied: …`, `Unknown tool: …`) and a canceled call (`Canceled by user`, …), so `is_error` alone called all of them successes.
 - New `ToolStatus::Denied` (`ToolStatus` is `#[non_exhaustive]`; `is_terminal()` includes it). **Behaviour:** `Transcript` now sets a tool row's status from `tool_outcome` (history and live `ToolResult`): those results were `Done`, now `Failed` / `Denied` / `Cancelled`.
 
-## API changes since 355242c
+## API changes since 526f307
 
 Named and saved sessions (PR #4). Old → new, one line each. **Breaking** for struct literals and exhaustive matches: `Status::Connected`, `CreateConfig`, `SessionMeta`; and for anyone who built on this PR's first push (ebf3f73): `rename`, `saved_sessions`, `Event::SavedSessions`.
 
@@ -57,7 +72,7 @@ Named and saved sessions (PR #4). Old → new, one line each. **Breaking** for s
 - Protocol mirrors: `ClientFrame::{SavedSessions { named_only, limit }, Rename { session_id, name, expect }}`, `DaemonFrame::{SavedSessionList { sessions, truncated, rejected }, Renamed { .. }, RenameFailed(RenameFailure)}`, `SavedSession` (`name`, `cwd`, `message_count` nullable; bad entries skipped and counted), `FEATURE_SAVED_SESSIONS`, `SAVED_SESSIONS_MAX`, `MISSING_CWD`, `SESSION_NAME_MAX`, `validate_session_name` / `InvalidSessionName` (agent-core's `validate_name`: `[a-z0-9-]{1,40}`).
 - Control replies are matched to requests in order; this relies on the daemon awaiting `rename` and `saved_sessions` inline on the control connection (as `daemon/conn.rs` does today).
 
-## API changes since f2529da
+## API changes since 73a38f6
 
 Follow-up to the PR #2 re-review (PR #3). Old → new, one line each.
 
@@ -72,7 +87,7 @@ Follow-up to the PR #2 re-review (PR #3). Old → new, one line each.
 - Reconnect backoff reset on every successful connect → only after the connection stayed up 10 s (control and session connections); a session connection that keeps dropping gives up after the reconnect budget.
 - `attach()` / `create()` from several threads could enqueue `attach_seq`s out of order → enqueued in `attach_seq` order.
 
-## API changes since 10ebfe7
+## API changes since a4d1937
 
 For the synaps-avatar author: everything that changed shape, old → new, one line each.
 Behaviour fixes with no API change are listed in PR #2.

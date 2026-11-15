@@ -206,6 +206,19 @@ pub enum Command {
     },
     Detach,
     Shutdown,
+    /// One page of worker `handle_id`'s watch journal from `since`
+    /// (`SessionQuery::SubagentWatch`, with the queue entries) →
+    /// `Event::SubagentWatch`. See [`Client::watch_subagent`].
+    SubagentWatch {
+        handle_id: String,
+        since: u64,
+    },
+    /// Steer a running worker (`SessionCommand::SubagentSteer`). See
+    /// [`Client::steer_subagent`].
+    SubagentSteer {
+        handle_id: String,
+        text: String,
+    },
 }
 
 impl Command {
@@ -224,6 +237,8 @@ impl Command {
             Command::Rename { .. } => "rename",
             Command::Detach => "detach",
             Command::Shutdown => "shutdown",
+            Command::SubagentWatch { .. } => "subagent_watch",
+            Command::SubagentSteer { .. } => "subagent_steer",
         }
     }
 }
@@ -251,6 +266,12 @@ impl std::fmt::Debug for Command {
             }
             Command::Rename { session_id, name, expect } => {
                 f.debug_struct("Rename").field("session_id", session_id).field("name", name).field("expect", expect).finish()
+            }
+            Command::SubagentWatch { handle_id, since } => {
+                f.debug_struct("SubagentWatch").field("handle_id", handle_id).field("since", since).finish()
+            }
+            Command::SubagentSteer { handle_id, .. } => {
+                f.debug_struct("SubagentSteer").field("handle_id", handle_id).field("text", &format_args!("<redacted>")).finish()
             }
             other => f.write_str(match other {
                 Command::RefreshSessions => "RefreshSessions",
@@ -420,6 +441,30 @@ pub enum Event {
     },
     /// Reply to [`Client::rename`]: not renamed (see [`RenameRefusal`]).
     RenameFailed(RenameFailure),
+    /// Reply to [`Client::watch_subagent`] for worker `handle_id` from
+    /// `since` (as asked: a late reply to an earlier ask can be told apart).
+    SubagentWatch {
+        attach_seq: u64,
+        session_id: String,
+        handle_id: String,
+        since: u64,
+        reply: WatchReply,
+    },
+}
+
+/// What a [`Client::watch_subagent`] got back.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum WatchReply {
+    Page(Box<WatchPage>),
+    /// The session has no such worker: unknown, or finished longer ago than
+    /// the daemon keeps a journal (15 minutes). The daemon's text.
+    Gone(String),
+    /// The daemon predates worker watch (before v0.11.0): it could not
+    /// decode the query. Asking again is pointless until it is replaced.
+    Unsupported,
+    /// The reply did not decode (shape drift); an `Error::Decode` came too.
+    Undecodable(String),
 }
 
 impl Event {
@@ -432,6 +477,7 @@ impl Event {
             | Event::History { attach_seq, .. }
             | Event::InputOwner { attach_seq, .. }
             | Event::CwdFallback { attach_seq, .. }
+            | Event::SubagentWatch { attach_seq, .. }
             | Event::Detached { attach_seq, .. } => Some(*attach_seq),
             Event::Error { attach_seq, .. } => *attach_seq,
             Event::Status(_)
@@ -666,6 +712,24 @@ impl Client {
     /// Re-fetch the whole history: an `Event::History` with a `Replace`.
     pub fn resync(&self) -> Result<(), ClientClosed> {
         self.send(Command::Resync)
+    }
+
+    /// Ask for one page of worker `handle_id`'s (`sa_N`) watch journal from
+    /// `since` (0: everything it has shown so far; then the last page's
+    /// `next_seq`) → `Event::SubagentWatch` with a [`WatchReply`]. Pages
+    /// include the tool-queue entries. Replies are matched to their query
+    /// (another client's never comes here); keep one in flight. Not
+    /// attached: `Error::NotAttached`; reconnecting: `Error::Refused`.
+    pub fn watch_subagent(&self, handle_id: impl Into<String>, since: u64) -> Result<(), ClientClosed> {
+        self.send(Command::SubagentWatch { handle_id: handle_id.into(), since })
+    }
+
+    /// Steer the running worker `handle_id` (owner-only, like `steer`). A
+    /// refusal (not running, not the owner, an older daemon) comes back as
+    /// `Error::Refused { command: Some("subagent_steer") }`; an accepted
+    /// steer is noted in the main conversation (an `External` event).
+    pub fn steer_subagent(&self, handle_id: impl Into<String>, text: impl Into<String>) -> Result<(), ClientClosed> {
+        self.send(Command::SubagentSteer { handle_id: handle_id.into(), text: text.into() })
     }
 
     /// Leave the session cleanly (`Detach` + `Bye`); its turn keeps running.
@@ -1160,6 +1224,32 @@ fn is_message_history(v: &Value) -> bool {
         && v.pointer("/event/session").and_then(Value::as_str) == Some("message_history")
 }
 
+/// Watch queries one connection keeps waiting for (the app keeps one).
+const WATCHES_MAX: usize = 8;
+
+/// Why a worker steer was refused by a daemon before v0.11.0.
+pub const STEER_UNSUPPORTED: &str = "this daemon predates steering workers (Synaps v0.11.0)";
+
+/// The tag in an older daemon's `malformed frame: unknown variant `x`,
+/// expected one of …` (serde names it in backticks).
+fn unknown_variant(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("malformed frame")?;
+    let (_, rest) = rest.split_once("unknown variant `")?;
+    Some(rest.split_once('`')?.0)
+}
+
+/// A `SubagentWatch` query's `value`: a page, or the session's "no subagent".
+fn watch_reply(value: Value, handle_id: &str) -> WatchReply {
+    if let Some(e) = value.get("error").and_then(Value::as_str) {
+        return WatchReply::Gone(e.to_string());
+    }
+    match serde_json::from_value::<WatchPage>(value) {
+        Ok(p) if p.handle_id.is_empty() || p.handle_id == handle_id => WatchReply::Page(Box::new(p)),
+        Ok(p) => WatchReply::Undecodable(format!("a page of {} for {handle_id}", p.handle_id)),
+        Err(e) => WatchReply::Undecodable(e.to_string()),
+    }
+}
+
 /// Daemon `Error` frames that mean "this command was not carried out".
 fn is_refusal(message: &str) -> bool {
     message.starts_with("refused: ") || message == RELOADING_REFUSAL || message.starts_with("backpressure:")
@@ -1236,6 +1326,8 @@ async fn session_loop(
         // `Some(trigger)`: a `Messages` query is in flight; `trigger` is the
         // newest digest that disagreed with the mirror, if any.
         let mut resync: Option<Option<ConversationDigest>> = None;
+        // Watch queries in flight on this connection: `(query id, handle id, since)`.
+        let mut watches: VecDeque<(u64, String, u64)> = VecDeque::new();
         let query = |sid: &str| ClientFrame::Cmd {
             session_id: sid.to_string(),
             cmd: SessionCommand::Query { id: query_id, query: SessionQuery::Messages },
@@ -1278,6 +1370,20 @@ async fn session_loop(
                             resync = Some(None);
                             SessionCommand::Query { id: query_id, query: SessionQuery::Messages }
                         }
+                        Command::SubagentWatch { handle_id, since } => {
+                            let id = loop {
+                                let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
+                                if id != query_id && !watches.iter().any(|w| w.0 == id) {
+                                    break id;
+                                }
+                            };
+                            if watches.len() == WATCHES_MAX {
+                                watches.pop_front();
+                            }
+                            watches.push_back((id, handle_id.clone(), since));
+                            SessionCommand::Query { id, query: SessionQuery::SubagentWatch { handle_id, since, tool_queue: true } }
+                        }
+                        Command::SubagentSteer { handle_id, text } => SessionCommand::SubagentSteer { handle_id, text },
                         _ => continue,
                     };
                     if let Err(e) = conn.send(&ClientFrame::Cmd { session_id: sid.clone(), cmd: wire }).await {
@@ -1298,6 +1404,17 @@ async fn session_loop(
                             drop(v);
                             let update = m.update(messages);
                             emit(&events, Event::History { attach_seq, session_id: esid, seq, update });
+                            continue;
+                        }
+                        if v.get("ev").and_then(Value::as_str) == Some("query_result")
+                            && let Some(k) = v.get("id").and_then(Value::as_u64).and_then(|q| watches.iter().position(|w| w.0 == q))
+                        {
+                            let (_, handle_id, since) = watches.remove(k).expect("present");
+                            let reply = watch_reply(v.get_mut("value").map(Value::take).unwrap_or_default(), &handle_id);
+                            if let WatchReply::Undecodable(e) = &reply {
+                                emit_error(&events, Some(attach_seq), Error::Decode(DecodeError { kind: "query_result:subagent_watch".into(), error: e.clone() }));
+                            }
+                            emit(&events, Event::SubagentWatch { attach_seq, session_id: esid, handle_id, since, reply });
                             continue;
                         }
                         if v.get("ev").and_then(Value::as_str) == Some("query_result") {
@@ -1379,6 +1496,24 @@ async fn session_loop(
                         return Exit { session_id, reason: format!("daemon said bye ({reason:?})") };
                     }
                     Ok(Some(DaemonFrame::Error { session_id: esid, message })) => {
+                        // A daemon before v0.11.0 cannot decode a watch query
+                        // or a worker steer (the connection survives).
+                        match unknown_variant(&message) {
+                            Some("subagent_watch") => {
+                                for (_, handle_id, since) in watches.drain(..) {
+                                    emit(&events, Event::SubagentWatch { attach_seq, session_id: sid.clone(), handle_id, since, reply: WatchReply::Unsupported });
+                                }
+                                continue;
+                            }
+                            Some("subagent_steer") => {
+                                emit_error(&events, Some(attach_seq), Error::Refused {
+                                    command: Some("subagent_steer".into()),
+                                    reason: STEER_UNSUPPORTED.into(),
+                                });
+                                continue;
+                            }
+                            _ => {}
+                        }
                         let error = if is_refusal(&message) {
                             Error::Refused { command: None, reason: message.strip_prefix("refused: ").unwrap_or(&message).to_string() }
                         } else {
