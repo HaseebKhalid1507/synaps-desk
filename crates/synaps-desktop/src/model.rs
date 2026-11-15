@@ -1185,6 +1185,9 @@ impl Model {
                 if let Status::Connected { features, profile, daemon_version, pid, .. } = &s {
                     self.daemon = Some(Daemon { version: daemon_version.clone(), profile: profile.clone(), pid: *pid });
                     self.daemon_gen += 1;
+                    // Another daemon process: the worker on screen is read
+                    // from 0, even before its session's attach comes back.
+                    self.watch.daemon_changed(*pid, std::time::Instant::now());
                     self.named.daemon = match profile {
                         Some(p) => format!("the daemon's machine (profile {p})"),
                         None => "the daemon's machine".into(),
@@ -2178,6 +2181,27 @@ mod tests {
         assert!(m.can_send());
         m.apply(Event::Reattaching { attach_seq: 4, session_id: "s".into(), reason: "reload".into() });
         assert!(!m.can_send());
+    }
+
+    /// N-L1: the control connection's new pid starts the worker on screen
+    /// over, before its session's attach comes back; the same pid does not.
+    #[test]
+    fn a_new_daemon_pid_starts_the_worker_view_over() {
+        use std::time::Instant;
+
+        use crate::watch::Candidate;
+        let at = |pid: u32| Event::Status(Status::Connected { daemon_version: "0.0.0".into(), profile: None, pid, features: vec![] });
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(at(100));
+        attach(&mut m, 1);
+        let t0 = Instant::now();
+        m.watch.open(&Candidate::of(2, "sleeper"), None, t0);
+        let generation = m.watch.focus_key().unwrap().1;
+        m.apply(at(100));
+        assert_eq!(m.watch.focus_key().unwrap().1, generation, "the same daemon");
+        m.apply(at(200));
+        assert!(m.watch.focus_key().unwrap().1 != generation, "another daemon: from 0");
+        assert_eq!(m.watch.take_poll(Instant::now()), Some(("sa_2".into(), 0)));
     }
 
     fn connected(features: &[&str]) -> Event {
