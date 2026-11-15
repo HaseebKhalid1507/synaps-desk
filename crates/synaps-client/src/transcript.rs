@@ -663,6 +663,68 @@ impl Transcript {
         self.items[ix].anchor = Some(self.history_len);
     }
 
+    /// One entry of a worker's watch journal (`Client::watch_subagent`), on
+    /// a transcript of the worker's own: it replays through the same path
+    /// as [`Transcript::apply`]'s stream events, so a worker's rows are the
+    /// main conversation's rows. A steer it took in is a user row (unless
+    /// it is a drained event's payload, `<event …>`: its parent's
+    /// business); a failure is an error row with its category.
+    pub fn apply_watch(&mut self, ev: &WatchEvent) {
+        match ev {
+            WatchEvent::Steered { text } if !text.trim_start().starts_with("<event") => {
+                self.end_streaming_text();
+                self.push_new(ItemKind::User, text.clone(), None, false);
+            }
+            WatchEvent::Failed { category } => self.notice(ItemKind::Error, format!("subagent failed [{category}]")),
+            other => {
+                if let Some(s) = other.to_stream() {
+                    self.apply_stream(&s);
+                }
+            }
+        }
+    }
+
+    /// A transcript fed by hand (a worker's): whether its run is still
+    /// going. Settled when it stops (no row streams, an open tool ends
+    /// `Cancelled`), as at a turn's end.
+    pub fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+        if !busy {
+            self.settle();
+        }
+    }
+
+    /// Drop the oldest rows of a transcript that has no history folded (a
+    /// worker's, fed by [`Transcript::apply_watch`]) until at most
+    /// `max_items` rows and about `max_bytes` of text, tool inputs and
+    /// results are left (the newest row always stays). Returns how many
+    /// went; the next splice starts at 0. A transcript with history is
+    /// never trimmed (0).
+    pub fn trim_live_front(&mut self, max_items: usize, max_bytes: usize) -> usize {
+        if self.history_len != 0 || self.history_end != 0 {
+            return 0;
+        }
+        let size =
+            |i: &Item| 64 + i.text.len() + i.tool.as_ref().map_or(0, |t| t.tool_id.len() + t.name.len() + t.input.len() + t.result.len());
+        let mut bytes: usize = self.items.iter().map(size).sum();
+        let mut n = 0;
+        while n + 1 < self.items.len() && (self.items.len() - n > max_items || bytes > max_bytes) {
+            bytes -= size(&self.items[n]);
+            n += 1;
+        }
+        if n == 0 {
+            return 0;
+        }
+        self.items.drain(..n);
+        self.tools.retain(|_, ix| *ix >= n);
+        for ix in self.tools.values_mut() {
+            *ix -= n;
+        }
+        self.response_start = self.response_start.map(|s| s.saturating_sub(n));
+        self.mark(0);
+        n
+    }
+
     /// Apply one live session event.
     pub fn apply(&mut self, ev: &SessionEvent) {
         match ev {

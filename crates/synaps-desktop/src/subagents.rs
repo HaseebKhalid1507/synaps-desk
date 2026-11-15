@@ -488,6 +488,41 @@ pub struct Subagents {
     reshaped_all: bool,
     /// A live source has spoken of a worker since the attach.
     heard: bool,
+    /// Bumped on every change to any worker ([`Subagents::revision`]).
+    revision: u64,
+}
+
+/// A worker as the tray over the composer lists it ([`Subagents::live`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Live {
+    pub id: u64,
+    pub name: String,
+    pub status: Status,
+    /// Running: what it is doing (its step, without the daemon's
+    /// prefixes); ended: its result's first line, or why it failed.
+    pub line: String,
+    pub tools: Option<u32>,
+    pub elapsed: Option<f64>,
+    /// A background worker (`sa_N`, `subagent_start` / `subagent_resume`):
+    /// its journal can be watched and it can be steered. The blocking
+    /// `subagent`'s cannot: the daemon's registry does not hold it.
+    pub watchable: bool,
+}
+
+/// A running worker's step as the tray says it (the TUI's `step()`):
+/// `⚙ bash (tool #3)` is `bash`, a start or a bare `running` is
+/// `starting…`, any thinking is `thinking…`.
+pub fn tray_step(step: &str) -> String {
+    let st = step.trim();
+    if st.is_empty() || st.starts_with("starting") || st == "running" {
+        "starting…".into()
+    } else if let Some(rest) = st.strip_prefix("\u{2699} ") {
+        rest.rsplit_once(" (tool #").map_or(rest, |(tool, _)| tool).to_string()
+    } else if st.contains("thinking") {
+        "thinking…".into()
+    } else {
+        one_line(st, 200)
+    }
 }
 
 impl Subagents {
@@ -536,6 +571,37 @@ impl Subagents {
         self.heard
     }
 
+    /// Bumped on every change to any worker (state, step, tools, elapsed,
+    /// result), a new history included.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Every worker with an id this window has heard of, oldest first.
+    pub fn live(&self) -> Vec<Live> {
+        let of = |w: &Worker, label: &str, watchable: bool| {
+            let id = w.id?;
+            let status = w.status?;
+            let reason = reason_shown(w.status, w.reason.as_deref()).filter(|_| matches!(status, Status::Failed | Status::TimedOut));
+            let line = match reason {
+                Some(r) => format!("reason: {}", one_line(r, 200)),
+                None if status.terminal() => w.result.clone(),
+                None => tray_step(&w.step),
+            };
+            let name = if w.name.is_empty() { label.to_string() } else { w.name.clone() };
+            Some(Live { id, name, status, line, tools: w.tools, elapsed: w.elapsed, watchable })
+        };
+        let mut out: Vec<Live> = self
+            .calls
+            .values()
+            .filter_map(|c| of(&c.w, &c.label, c.kind != Kind::Oneshot))
+            .chain(self.orphans.values().filter_map(|w| of(w, "subagent", true)))
+            .collect();
+        out.sort_by_key(|l| l.id);
+        out.dedup_by_key(|l| l.id);
+        out
+    }
+
     /// What the call's row height and its run's fold depend on.
     pub fn shape(&self, tool_id: &str) -> u64 {
         self.calls.get(tool_id).map_or(0, |c| c.shape)
@@ -555,8 +621,14 @@ impl Subagents {
     /// mid-run repeats the calls; the rows keep coming).
     pub fn reset(&mut self, messages: &[Value], same: bool) {
         if !same {
-            *self = Subagents { shapes: SHAPES.fetch_add(1, Ordering::Relaxed), reshaped_all: true, ..Subagents::default() };
+            *self = Subagents {
+                shapes: SHAPES.fetch_add(1, Ordering::Relaxed),
+                reshaped_all: true,
+                revision: self.revision + 1,
+                ..Subagents::default()
+            };
         }
+        self.revision += 1;
         self.append(messages);
         // Each id goes to the newest call that has it: a live call the
         // history does not hold yet keeps its worker, whatever older call
@@ -937,6 +1009,7 @@ impl Subagents {
 
     /// Change worker `n`: under its call, else as an orphan.
     fn update(&mut self, n: u64, f: impl FnOnce(&mut Worker)) {
+        self.revision += 1;
         match self.by_id.get(&n).cloned() {
             Some(t) if self.calls.contains_key(&t) => {
                 f(&mut self.calls.get_mut(&t).expect("present").w);
@@ -947,6 +1020,7 @@ impl Subagents {
     }
 
     fn changed(&mut self, tool_id: &str) {
+        self.revision += 1;
         let Some(c) = self.calls.get_mut(tool_id) else { return };
         let shape = c.shape;
         if c.refresh() && c.shape != shape {
@@ -967,6 +1041,9 @@ impl Subagents {
 pub fn completion_note(text: &str) -> Option<String> {
     let ev = text.strip_prefix("<event ")?;
     let (tag, body) = ev.split_once('>')?;
+    if tag.contains("type=\"subagent_steer\"") {
+        return steer_note(body);
+    }
     if !tag.contains("source=\"subagent\"") {
         return None;
     }
@@ -990,6 +1067,18 @@ pub fn completion_note(text: &str) -> Option<String> {
         out.push_str(&format!(" · {tail}"));
     }
     Some(out)
+}
+
+/// The engine's note of a worker steered from its view (`User steered
+/// subagent 'sleeper' (sa_1) directly: TEXT`, then its data) as `you
+/// steered sleeper (sa_1): TEXT`.
+fn steer_note(body: &str) -> Option<String> {
+    let body = body.strip_suffix("</event>").unwrap_or(body);
+    let body = body.rsplit_once("\nData: ").map_or(body, |(b, _)| b);
+    let rest = body.strip_prefix("User steered subagent '")?;
+    let (name, rest) = rest.split_once("' (")?;
+    let (handle, text) = rest.split_once(") directly: ")?;
+    Some(format!("you steered {name} ({handle}): {}", one_line(text, 400)))
 }
 
 /// A tool result's text (a string, or text blocks).
@@ -1436,6 +1525,10 @@ mod tests {
         assert_eq!((fmt_secs(3.44), fmt_secs(125.0), fmt_secs(3720.0)), ("3.4s".into(), "2m 05s".into(), "1h 02m".into()));
         assert_eq!((fmt_secs(59.94), fmt_secs(59.96)), ("59.9s".into(), "1m 00s".into()), "rounded before the unit");
         assert_eq!(completion_note("<event id=\"x\" source=\"cli\">hi</event>"), None);
+        // A steer from a worker's view, as the engine notes it in the main conversation.
+        let steer = "<event id=\"d5\" type=\"subagent_steer\" severity=\"low\" source=\"user\">User steered subagent 'sleeper' (sa_1) directly: Stop after your next step: (a) then STEERED.\nData: {\"agent_name\":\"sleeper\",\"handle_id\":\"sa_1\"}</event>";
+        assert_eq!(completion_note(steer).as_deref(), Some("you steered sleeper (sa_1): Stop after your next step: (a) then STEERED."));
+        assert_eq!(completion_note("<event id=\"d5\" type=\"subagent_steer\" source=\"user\">something else</event>"), None);
     }
 
     /// Ids restart at 1 with a cold-started daemon: the history holds an
