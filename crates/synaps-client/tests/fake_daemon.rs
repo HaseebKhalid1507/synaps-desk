@@ -1069,3 +1069,80 @@ async fn answers_for_an_earlier_connection_are_never_sent() {
     client.shutdown().unwrap();
     assert_eq!(again.recv_cmd().await, json!({"cmd": "detach", "client": 3}));
 }
+
+/// Worker watch: a page comes back as `Event::SubagentWatch` for the
+/// worker it was asked for (another client's query result never does),
+/// the session's "no subagent" is `Gone`, a worker steer goes out in the
+/// daemon's shape, and a daemon from before v0.11.0 (`malformed frame:
+/// unknown variant`) answers `Unsupported` for the watch and a refusal for
+/// the steer, on a connection that stays up.
+#[tokio::test]
+async fn worker_watch_pages_gone_steer_and_an_older_daemon() {
+    use synaps_client::{WatchEvent, WatchReply};
+    let mut fake = Fake::start("watch").await;
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    let reply = |events| async move {
+        wait(events, "watch reply", |e| match e {
+            Event::SubagentWatch { attach_seq, handle_id, since, reply, .. } => {
+                Some((*attach_seq, format!("{handle_id}@{since}"), reply.clone()))
+            }
+            _ => None,
+        })
+        .await
+    };
+
+    client.watch_subagent("sa_3", 0).unwrap();
+    let cmd = conn.recv_cmd().await;
+    assert_eq!(
+        (cmd["cmd"].as_str(), &cmd["query"]),
+        (Some("query"), &json!({"query": "subagent_watch", "handle_id": "sa_3", "since": 0, "tool_queue": true}))
+    );
+    let id = cmd["id"].as_u64().unwrap();
+    assert!(id < synaps_client::protocol::RESERVED_QUERY_ID_BASE);
+    // Another client's result first (ids are per client): not ours.
+    conn.event(30, json!({"ev": "query_result", "id": id ^ 1, "value": {"handle_id": "sa_9", "events": []}})).await;
+    conn.event(
+        31,
+        json!({"ev": "query_result", "id": id, "value": {"handle_id": "sa_3", "subagent_id": 3, "agent_name": "sleeper",
+        "status": "running", "steerable": true, "next_seq": 2, "truncated": false, "more": true,
+        "events": [{"kind": "text", "text": "hi"}, {"kind": "tool_queued", "tool_id": "t"}], "at_ms": [1, 2], "now_ms": 5}}),
+    )
+    .await;
+    let (s, h, r) = reply(&events).await;
+    let WatchReply::Page(page) = r else { panic!("{r:?}") };
+    assert_eq!((s, h.as_str(), page.next_seq, page.more, page.events.len()), (seq, "sa_3@0", 2, true, 2));
+    assert_eq!(page.events[1], WatchEvent::ToolQueued { tool_id: "t".into() });
+
+    client.watch_subagent("sa_9", 4).unwrap();
+    let id = conn.recv_cmd().await["id"].as_u64().unwrap();
+    conn.event(32, json!({"ev": "query_result", "id": id, "value": {"error": "no subagent sa_9 in this session"}})).await;
+    assert_eq!(reply(&events).await.2, WatchReply::Gone("no subagent sa_9 in this session".into()));
+
+    client.steer_subagent("sa_3", "stop after the next step").unwrap();
+    let cmd = conn.recv_cmd().await;
+    assert_eq!(cmd, json!({"cmd": "subagent_steer", "handle_id": "sa_3", "text": "stop after the next step"}));
+
+    // An older daemon: neither decodes; the session connection survives.
+    client.watch_subagent("sa_3", 2).unwrap();
+    let _ = conn.recv_cmd().await;
+    conn.send(json!({"type": "error", "session_id": SID,
+        "message": "malformed frame: unknown variant `subagent_watch`, expected one of `messages`, `status`"}))
+        .await;
+    assert_eq!(reply(&events).await, (seq, "sa_3@2".to_string(), WatchReply::Unsupported));
+    client.steer_subagent("sa_3", "x").unwrap();
+    let _ = conn.recv_cmd().await;
+    conn.send(json!({"type": "error", "session_id": SID,
+        "message": "malformed frame: unknown variant `subagent_steer`, expected one of `submit`, `steer`"}))
+        .await;
+    let err = wait(&events, "steer refusal", |e| match e {
+        Event::Error { error, .. } => Some(error.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(err, Error::Refused { command: Some("subagent_steer".into()), reason: synaps_client::STEER_UNSUPPORTED.into() });
+    client.submit("still here").unwrap();
+    assert_eq!(conn.recv_cmd().await["text"], "still here");
+    client.shutdown().unwrap();
+}

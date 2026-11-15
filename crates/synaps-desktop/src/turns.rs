@@ -477,7 +477,7 @@ impl AppView {
     /// One display row: its gap, its label and the block.
     pub(crate) fn render_disp(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
         let Some(&d) = self.disp.get(ix) else { return div().into_any_element() };
-        let items = self.model.transcript.items();
+        let items = self.model.shown().items();
         let (Some(item), Some(row)) = (items.get(d.item), self.rows.get(d.item)) else { return div().into_any_element() };
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
@@ -665,7 +665,7 @@ impl AppView {
             }
         });
         let worker =
-            item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name)).and_then(|t| self.model.stats.subagents.view(&t.tool_id));
+            item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name)).and_then(|t| self.model.shown_subagents().view(&t.tool_id));
         v_flex()
             .w_full()
             .bg(p.tool)
@@ -753,7 +753,7 @@ impl AppView {
             // The daemon stopped it at its output limit: not ✓, not ×.
             Some(ToolStatus::Unknown) => (None, Some(if lay.tight { "stopped" } else { "stopped at limit" }), p.dim_t),
             Some(ToolStatus::Queued) => (None, Some("queued"), p.dim_t),
-            _ if self.waiting_on == Some(item.id) && !self.model.transcript.pending_prompts().is_empty() => {
+            _ if self.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty() => {
                 let g = div()
                     .relative()
                     .size(px(10.))

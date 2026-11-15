@@ -44,10 +44,12 @@ mod subagents;
 mod tabs;
 mod tabstrip;
 mod theme;
+mod tray;
 mod turns;
 mod usage;
 mod usage_view;
 mod views;
+mod watch;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

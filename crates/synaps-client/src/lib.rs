@@ -98,11 +98,15 @@ pub mod protocol;
 pub mod synthetic;
 pub mod transcript;
 
-pub use client::{Client, ClientClosed, ClientOptions, Command, CreateOptions, Cwd, Error, Event, Expect, RequestError, Status};
+pub use client::{
+    Client, ClientClosed, ClientOptions, Command, CreateOptions, Cwd, Error, Event, Expect, RequestError, STEER_UNSUPPORTED, Status,
+    WatchReply,
+};
 pub use conn::{Endpoint, Identity, Incompatible, InvalidName};
 pub use history::HistoryUpdate;
 pub use protocol::{
     AttachMode, Attached, ClientInput, ClientKind, FEATURE_SAVED_SESSIONS, HistoryMode, InvalidSessionName, MISSING_CWD, Rejected,
-    RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, validate_session_name,
+    RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, WatchEvent, WatchPage,
+    validate_session_name,
 };
 pub use transcript::{Transcript, TranscriptError};

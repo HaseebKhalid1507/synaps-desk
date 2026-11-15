@@ -235,6 +235,14 @@ pub enum SessionCommand {
     Detach {
         client: u64,
     },
+    /// Steer one of this session's running workers (`sa_N`) from its watch
+    /// view (owner-only like `Steer`). The engine also notes it in the main
+    /// conversation (`External`, content type `subagent_steer`); a failure
+    /// is `Refused { command: "subagent_steer" }`. Daemons from v0.11.0.
+    SubagentSteer {
+        handle_id: String,
+        text: String,
+    },
 }
 
 impl std::fmt::Debug for SessionCommand {
@@ -251,6 +259,9 @@ impl std::fmt::Debug for SessionCommand {
             }
             Self::Query { id, query } => f.debug_struct("Query").field("id", id).field("query", query).finish(),
             Self::Detach { client } => f.debug_struct("Detach").field("client", client).finish(),
+            Self::SubagentSteer { handle_id, .. } => {
+                f.debug_struct("SubagentSteer").field("handle_id", handle_id).field("text", &format_args!("<redacted>")).finish()
+            }
         }
     }
 }
@@ -263,6 +274,144 @@ pub enum SessionQuery {
     /// Reply value: the session's `api_messages` array.
     Messages,
     Status,
+    /// Reply value: a [`WatchPage`] of worker `handle_id`'s journal from
+    /// `since` (the previous page's `next_seq`; 0 = all), or `{"error":
+    /// "no subagent <id> in this session"}`. `tool_queue`: include the
+    /// queue entries (an off flag is not sent: an older daemon sees the old
+    /// bytes). Daemons from v0.11.0; an older one answers
+    /// `Error{"malformed frame: unknown variant `subagent_watch`..."}`.
+    SubagentWatch {
+        handle_id: String,
+        since: u64,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        tool_queue: bool,
+    },
+}
+
+/// One page of a worker's watch journal (`runtime::subagent_watch::WatchPage`,
+/// the `SessionQuery::SubagentWatch` reply). Every field defaults, so an
+/// older or newer daemon's page still decodes.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct WatchPage {
+    pub handle_id: String,
+    pub subagent_id: u64,
+    pub agent_name: String,
+    /// The worker's model; empty from older daemons.
+    pub model: String,
+    /// `running`, `completed`, `cancelled`, `timed_out` or `failed`.
+    pub status: String,
+    /// It takes steering now (running, with a steer channel).
+    pub steerable: bool,
+    /// Ask for `since = next_seq` next time.
+    pub next_seq: u64,
+    /// Entries before the asked `since` were dropped (the journal keeps 2 MiB).
+    pub truncated: bool,
+    /// More entries are ready now (this page hit its 1 MiB budget).
+    pub more: bool,
+    pub events: Vec<WatchEvent>,
+    /// When each of `events` was recorded, ms on the journal's clock (same
+    /// length, or empty from an older daemon).
+    pub at_ms: Vec<u64>,
+    /// The journal's clock when the page was read.
+    pub now_ms: Option<u64>,
+}
+
+impl WatchPage {
+    /// The worker is still running (no later page can change that it ended).
+    pub fn running(&self) -> bool {
+        self.status == "running"
+    }
+}
+
+/// One entry of a worker's journal (`runtime::subagent_watch::WatchEvent`),
+/// in the shape the main transcript applies ([`WatchEvent::to_stream`]).
+/// A kind this client does not know is `Unknown`, never a failed page.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WatchEvent {
+    ResponseStart,
+    ResponseReset,
+    Thinking {
+        #[serde(default)]
+        text: String,
+    },
+    Text {
+        #[serde(default)]
+        text: String,
+    },
+    ToolUseStart {
+        tool_id: String,
+        #[serde(default)]
+        tool_name: String,
+    },
+    ToolUse {
+        tool_id: String,
+        #[serde(default)]
+        tool_name: String,
+        #[serde(default)]
+        input: Value,
+    },
+    ToolResultDelta {
+        tool_id: String,
+        #[serde(default)]
+        delta: String,
+    },
+    ToolResult {
+        tool_id: String,
+        #[serde(default)]
+        result: String,
+    },
+    /// Only in pages asked for with `tool_queue: true`.
+    ToolQueued {
+        tool_id: String,
+    },
+    ToolStarted {
+        tool_id: String,
+    },
+    /// A steering message the worker took in (from the user or its parent).
+    Steered {
+        #[serde(default)]
+        text: String,
+    },
+    Done,
+    /// It failed: the error's category label only, never its text.
+    Failed {
+        #[serde(default)]
+        category: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+impl WatchEvent {
+    /// The stream event it was recorded from, to replay through the same
+    /// transcript path as the main conversation. `None` for `Steered`,
+    /// `Failed` and `Unknown`: [`crate::Transcript::apply_watch`] shows the
+    /// first two itself.
+    pub fn to_stream(&self) -> Option<StreamEvent> {
+        let llm = |l| Some(StreamEvent::Llm(l));
+        match self {
+            Self::ResponseStart => llm(LlmEvent::ResponseStart),
+            Self::ResponseReset => llm(LlmEvent::ResponseReset),
+            Self::Thinking { text } => llm(LlmEvent::Thinking { text: text.clone() }),
+            Self::Text { text } => llm(LlmEvent::Text { text: text.clone() }),
+            Self::ToolUseStart { tool_id, tool_name } => {
+                llm(LlmEvent::ToolUseStart { tool_name: tool_name.clone(), tool_id: tool_id.clone() })
+            }
+            Self::ToolUse { tool_id, tool_name, input } => {
+                llm(LlmEvent::ToolUse { tool_name: tool_name.clone(), tool_id: tool_id.clone(), input: input.clone() })
+            }
+            Self::ToolResultDelta { tool_id, delta } => llm(LlmEvent::ToolResultDelta { tool_id: tool_id.clone(), delta: delta.clone() }),
+            Self::ToolResult { tool_id, result } => llm(LlmEvent::ToolResult { tool_id: tool_id.clone(), result: result.clone() }),
+            Self::ToolQueued { tool_id } => llm(LlmEvent::ToolQueued { tool_id: tool_id.clone() }),
+            Self::ToolStarted { tool_id } => llm(LlmEvent::ToolStarted { tool_id: tool_id.clone() }),
+            Self::Done => Some(StreamEvent::Session(SessionStreamEvent::Done)),
+            Self::Steered { .. } | Self::Failed { .. } | Self::Unknown => None,
+        }
+    }
 }
 
 // ── daemon → client ───────────────────────────────────────────────────────────

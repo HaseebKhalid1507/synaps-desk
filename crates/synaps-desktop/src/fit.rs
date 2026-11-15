@@ -78,12 +78,20 @@ pub(crate) fn notice_line(m: &Metrics) -> f32 {
 /// the REPLACE offer: up to two, cramped in the field's row) and the
 /// notice line under the card: the last error and, cramped, the draft's
 /// note (the composer keeps SEND beside its text).
+///
+///
+/// Drawn, not deciding the form: the breadcrumb over a worker's view
+/// (`crumb`; that view draws no card, whose least height the form keeps
+/// and the crumb is under) and the tray's rows over the composer (`tray`,
+/// [`tray_rows`]: what the room leaves).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Extras {
     pub(crate) naming: bool,
     pub(crate) naming_notes: u8,
     pub(crate) error: bool,
     pub(crate) note: bool,
+    pub(crate) crumb: bool,
+    pub(crate) tray: u8,
 }
 
 impl Extras {
@@ -95,7 +103,9 @@ impl Extras {
     pub(crate) fn height(&self, m: &Metrics, form: Form) -> f32 {
         let notes = if form == Form::Cramped { 0. } else { f32::from(self.naming_notes) * (NAMING_GAP + NAMING_NOTE) };
         let naming = if self.naming { naming_h(form) + notes } else { 0. };
-        naming + if self.notice(form) { NOTICE_TOP + notice_line(m) } else { 0. }
+        let crumb = if self.crumb { crumb_h(form) } else { 0. };
+        let tray = if self.tray > 0 { tray_box(form) + f32::from(self.tray) * tray_row(m) } else { 0. };
+        naming + crumb + tray + if self.notice(form) { NOTICE_TOP + notice_line(m) } else { 0. }
     }
 
     /// The fewest lines the well keeps in `form`: one when they take room
@@ -110,6 +120,51 @@ pub(crate) enum Form {
     Full,
     Short,
     Cramped,
+}
+
+/// The breadcrumb bar over a worker's view, its hairline included.
+pub(crate) fn crumb_h(form: Form) -> f32 {
+    if form == Form::Cramped { 29. } else { 35. }
+}
+
+/// One tray row (a worker).
+pub(crate) fn tray_row(m: &Metrics) -> f32 {
+    (22. * m.r).round()
+}
+
+/// The tray round its rows: its gap above, its padding and top rule.
+pub(crate) fn tray_box(form: Form) -> f32 {
+    if form == Form::Cramped { 4. + 2. * 2. + 1. } else { 8. + 2. * 4. + 1. }
+}
+
+/// Most rows the tray shows (its "+N more" row included): the TUI's six
+/// and a "+N more" in a tall window, three in a short one, one cramped
+/// (the count of the rest beside it).
+pub(crate) fn tray_max(form: Form) -> usize {
+    match form {
+        Form::Full => 7,
+        Form::Short => 3,
+        Form::Cramped => 1,
+    }
+}
+
+/// What the transcript keeps under the tray (scaled with the text).
+const TRAY_LIST: f32 = 60.;
+
+/// The rows the tray draws for `n` workers in a `window` this tall: as
+/// many as [`tray_max`] and the room leave after the bars, `ex` (without
+/// the tray), a card at its least well (`card`: one is up), a one-line
+/// composer and [`TRAY_LIST`] of transcript. Fewer rows than workers: the
+/// last one says how many more.
+pub(crate) fn tray_rows(m: &Metrics, form: Form, window: f32, card: bool, ex: Extras, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let card = if card { Card::of(m, form).height(ex.well_min(m, form)) } else { 0. };
+    let spare =
+        window - above(form) - ex.height(m, form) - card - Composer::of(m, form).height(1) - (TRAY_LIST * m.r).round() - tray_box(form);
+    let fit = (spare / tray_row(m)).floor().max(0.) as usize;
+    n.min(tray_max(form)).min(fit)
 }
 
 /// A filled button's height (AUTHORIZE, SEND).
@@ -547,7 +602,7 @@ mod tests {
     /// Every mix of the naming row (with none, one or both of its own
     /// lines), an error and a draft note.
     fn all_extras() -> impl Iterator<Item = Extras> {
-        (0..24u8).map(|b| Extras { naming: b & 1 != 0, error: b & 2 != 0, note: b & 4 != 0, naming_notes: b >> 3 })
+        (0..24u8).map(|b| Extras { naming: b & 1 != 0, error: b & 2 != 0, note: b & 4 != 0, naming_notes: b >> 3, ..Extras::default() })
     }
 
     /// L1: with the naming row, the notice line (an error, cramped the
@@ -579,7 +634,7 @@ mod tests {
             }
         }
         // Step 22, the smallest window, everything open: 420 of 420.
-        let (m, ex) = (Metrics::at(22), Extras { naming: true, error: true, note: true, naming_notes: 2 });
+        let (m, ex) = (Metrics::at(22), Extras { naming: true, error: true, note: true, naming_notes: 2, ..Extras::default() });
         assert_eq!(need(&m, Form::Cramped, ex), 420.);
         assert_eq!(well_lines(&m, Form::Cramped, 420., 1, WELL_MIN, ex), 1.);
         // The note is on the notice line only when cramped (else in the
@@ -597,6 +652,53 @@ mod tests {
         assert_eq!(notes.height(&m, Form::Cramped), 41.);
         assert_eq!(Extras { naming_notes: 2, ..Extras::default() }.height(&m, Form::Short), 0., "no row, no lines");
         assert!(cramped_below(&m, notes) > cramped_below(&m, Extras { naming: true, ..Extras::default() }));
+    }
+
+    /// The tray and a worker's breadcrumb only take what the room leaves:
+    /// at every text step, window height and mix of the rest, with a card
+    /// up or a worker's view (no card, its breadcrumb), SEND stays on
+    /// screen with the tray's rows and the composer's, and the transcript
+    /// keeps its share under the tray.
+    #[test]
+    fn the_tray_and_the_breadcrumb_fit_what_is_left() {
+        for step in TEXT_STEPS {
+            let m = Metrics::at(step);
+            for f in [Form::Full, Form::Short, Form::Cramped] {
+                assert!(Card::of(&m, f).height(1.) >= crumb_h(f), "step {step} {f:?}: the crumb is under the card it replaces");
+            }
+            for ex in all_extras() {
+                for window in 420..1600 {
+                    let window = window as f32;
+                    let f = form(Layout::of(1000., window - TOP, &m, ex));
+                    for (card, crumb) in [(true, false), (false, true), (false, false)] {
+                        let base = Extras { crumb, ..ex };
+                        let n = tray_rows(&m, f, window, card, base, 9);
+                        assert!(n <= tray_max(f));
+                        let drawn = Extras { tray: n as u8, ..base };
+                        let rows = composer_rows(&m, f, window, card, drawn);
+                        let card_h = if card { Card::of(&m, f).height(well_lines(&m, f, window, rows, WELL_MIN, drawn)) } else { 0. };
+                        let h = above(f) + drawn.height(&m, f) + card_h + Composer::of(&m, f).height(rows);
+                        let slack = if n > 0 { (TRAY_LIST * m.r).round() } else { 0. };
+                        // A composer of one row and a card at its floor always fit; the tray never eats into them.
+                        let floor = above(f)
+                            + drawn.height(&m, f)
+                            + if card { Card::of(&m, f).height(drawn.well_min(&m, f)) } else { 0. }
+                            + Composer::of(&m, f).height(1);
+                        assert!(
+                            n == 0 || floor + slack <= window + 0.01,
+                            "step {step} window {window} {ex:?} card {card}: {n} rows, {floor}"
+                        );
+                        assert!(rows == 1 || h <= window + 0.01, "step {step} window {window} {ex:?} card {card}: {h}");
+                    }
+                }
+            }
+        }
+        // A tall window: six workers and a "+N more" row; short: three; cramped: one.
+        let m = Metrics::at(16);
+        assert_eq!(tray_rows(&m, Form::Full, 1200., false, Extras::default(), 9), 7);
+        assert_eq!(tray_rows(&m, Form::Short, 800., false, Extras::default(), 9), 3);
+        assert_eq!(tray_rows(&m, Form::Cramped, 600., false, Extras::default(), 2), 1);
+        assert_eq!(tray_rows(&m, Form::Full, 1200., true, Extras::default(), 0), 0);
     }
 
     /// The composer grows only into room the card's 3-line form leaves.

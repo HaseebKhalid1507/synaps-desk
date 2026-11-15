@@ -84,6 +84,9 @@ pub mod label {
     pub const NAME: &str = "N A M E";
     pub const SEND: &str = "S E N D";
     pub const STEER: &str = "S T E E R";
+    pub const STEER_WORKER: &str = "S T E E R   W O R K E R";
+    pub const READ_ONLY: &str = "R E A D   O N L Y";
+    pub const MAIN: &str = "M A I N";
     pub const AUTHORIZATION: &str = "A U T H O R I Z A T I O N   R E Q U I R E D";
     pub const SECRET: &str = "S E C R E T   R E Q U E S T E D";
     pub const AUTHORIZE: &str = "A U T H O R I Z E";
