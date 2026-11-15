@@ -79,7 +79,6 @@ pub(crate) fn notice_line(m: &Metrics) -> f32 {
 /// notice line under the card: the last error and, cramped, the draft's
 /// note (the composer keeps SEND beside its text).
 ///
-///
 /// Drawn, not deciding the form: the breadcrumb over a worker's view
 /// (`crumb`; that view draws no card, whose least height the form keeps
 /// and the crumb is under) and the tray's rows over the composer (`tray`,

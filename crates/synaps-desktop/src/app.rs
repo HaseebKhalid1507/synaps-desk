@@ -961,6 +961,26 @@ pub(crate) fn secret_answer(submit: bool, typed: &str) -> Option<Option<String>>
     }
 }
 
+/// A call's input with more than one field (a `bash` with its `timeout`)
+/// as its row says it: its `command`, not its JSON (one field is shown
+/// bare already).
+fn command_of(input: &str) -> Option<String> {
+    if !input.starts_with('{') {
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(input).ok()?.get("command")? {
+        serde_json::Value::String(c) => Some(c.clone()),
+        _ => None,
+    }
+}
+
+/// How many of the oldest rows a change from the start dropped: where the
+/// first item left sits among the rows built (0: none dropped, or another
+/// transcript).
+pub(crate) fn front_trimmed(rows: &[RowCache], items: &[Item]) -> usize {
+    items.first().and_then(|first| rows.iter().position(|r| r.id == first.id)).unwrap_or(0)
+}
+
 /// A key reached the window at `now`, the last secret card having gone
 /// (or the last key come) at `left`: the typing meant for it goes on if
 /// that was less than [`ARM`] ago (then from `now`).
@@ -1187,11 +1207,19 @@ pub struct AppView {
     /// The session's list while a worker's view is shown, and the worker
     /// whose rows the list holds (`None`: the session's).
     main_pane: Option<Pane>,
-    pane_of: Option<String>,
+    /// The worker's view the list holds and its generation
+    /// ([`crate::watch::Watch::focus_key`]).
+    pane_of: Option<(String, u64)>,
     /// The next sync builds every row again (a worker's view came on).
     full_rebuild: bool,
     /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
     watch_poll: Option<(Instant, Task<()>)>,
+    /// Frames drawn for the window are shown (GPUI's visibility: mapped and
+    /// not wholly covered, not minimized). Nothing polls while it is not.
+    visible: bool,
+    /// The card was on screen last frame (not behind a worker's view,
+    /// Settings or Usage): one coming back waits again ([`Arm`]).
+    card_was_up: bool,
     /// The tray's rows as last built, and the timer that drops a finished
     /// worker's ([`crate::watch::FLASH`]).
     pub(crate) tray: crate::tray::TrayCache,
@@ -1201,9 +1229,9 @@ pub struct AppView {
     /// Said in the composer's hint until the next key that moves or sends:
     /// why a worker key went nowhere, or why a steer was not sent.
     pub(crate) watch_note: Option<SharedString>,
-    /// The worker whose name the composer's placeholder has (`None`: the
-    /// session's placeholder).
-    placeholder_of: Option<(String, bool)>,
+    /// The worker whose name and state the composer's placeholder has
+    /// (`None`: the session's placeholder).
+    placeholder_of: Option<(String, String)>,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -1253,13 +1281,19 @@ impl AppView {
         let settings_find = cx.new(|cx| InputState::new(window, cx).placeholder("find a setting"));
         let settings_input = cx.new(|cx| InputState::new(window, cx));
         let mut subs = vec![
-            cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { shift: false, .. } = ev {
+            cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { shift: false, .. } => {
                     let text = input.read(cx).value().trim().to_string();
                     if !text.is_empty() && this.submit(text) {
                         input.update(cx, |s, cx| s.set_value("", window, cx));
                     }
                 }
+                // Typing: what a worker key or a refused steer said is old.
+                InputEvent::Change if this.watch_note.is_some() => {
+                    this.watch_note = None;
+                    cx.notify();
+                }
+                _ => {}
             }),
             // Find filters as it is typed; Enter opens by exact name. The
             // typed name stays until the outcome is known: cleared on
@@ -1385,6 +1419,8 @@ impl AppView {
         }));
         // The dash poll waits while the window is in the background.
         subs.push(cx.observe_window_activation(window, |this, window, cx| this.window_activated(window.is_window_active(), cx)));
+        // A worker's view polls only while the window shows.
+        subs.push(cx.observe_window_visibility(window, |this, v, _, cx| this.visibility_changed(v.is_visible(), cx)));
         crate::views::view_fallbacks(cx.weak_entity(), cx);
         let me = cx.weak_entity();
         let settings_pane = cx.new(|_| crate::views::ViewPane::new(me.clone(), crate::tabs::Kind::Settings));
@@ -1400,6 +1436,7 @@ impl AppView {
             settings_pane,
             usage_pane,
             focus,
+            visible: window.is_visible(),
         };
         match (client, synthetic) {
             (Some((c, rx)), _) => {
@@ -1535,6 +1572,8 @@ impl AppView {
             pane_of: None,
             full_rebuild: false,
             watch_poll: None,
+            visible: i.visible,
+            card_was_up: false,
             tray: crate::tray::TrayCache::default(),
             tray_due: None,
             tray_rows: 0,
@@ -1570,6 +1609,8 @@ impl AppView {
                     this.reconcile(None);
                     // A Welcome: the daemon's place and dash are looked for.
                     this.dash_on_welcome(cx);
+                    // A worker's page came: its next poll, drawn or not.
+                    this.arm_watch_poll(cx);
                     // An idle daemon's poll changes nothing: no frame, unless
                     // the rail's ages have a new minute to show.
                     if this.model.view_dirty || this.rail.minute() != crate::chrome::now_secs() / 60 {
@@ -1644,16 +1685,22 @@ impl AppView {
     /// in that order, so input given back in the frame of a switch stays
     /// with its tab. Nothing is read or allocated on a frame with neither.
     fn sync_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Over a worker's view the composer steers it.
-        let worker = self.model.watch.focused().map(|w| (w.handle_id.clone(), w.read_only()));
-        if worker != self.placeholder_of {
+        // Over a worker's view the composer steers it (compared, not
+        // allocated, each frame).
+        let worker = self.model.watch.focused().map(|w| (w.handle_id.as_str(), w.state()));
+        if worker != self.placeholder_of.as_ref().map(|(h, s)| (h.as_str(), s.as_str())) {
             let text: SharedString = match self.model.watch.focused() {
                 Some(w) if w.read_only() => format!("{} is {}: nothing to steer  (Esc: back to the session)", w.name, w.state()).into(),
                 Some(w) => format!("Steer {}: it reads this at its next step  (Enter sends)", w.name).into(),
                 None => COMPOSER_PLACEHOLDER.into(),
             };
+            self.placeholder_of = worker.map(|(h, s)| (h.to_string(), s.to_string()));
             self.composer.update(cx, |c, cx| c.set_placeholder(text, window, cx));
-            self.placeholder_of = worker;
+        }
+        // A refused steer's text, once the thread it is for is on screen.
+        if let Some((text, note)) = self.model.watch.take_unsent() {
+            self.effect(Effect::Restore(text));
+            self.watch_note = Some(note.into());
         }
         // The visible tab went into the one holding its session: the
         // composer's text is that tab's now (the follow rule keeps it).
@@ -1676,6 +1723,8 @@ impl AppView {
                 tabs.knows(s)
             });
         if let Some((text, cursor)) = out {
+            // Another tab's composer: what a worker key said is not its.
+            self.watch_note = None;
             self.composer.update(cx, |c, cx| {
                 c.set_value(text, window, cx);
                 if let Some(at) = cursor {
@@ -2304,6 +2353,7 @@ impl AppView {
         }
         self.model.sent(text);
         self.draft_note = None;
+        self.watch_note = None;
         true
     }
 
@@ -2349,11 +2399,14 @@ impl AppView {
         cx.notify();
     }
 
-    /// The watch poll's timer, (re)set for when the next page is due.
-    /// Armed by a drawn frame only: a window that draws nothing (minimized,
-    /// hidden) asks for nothing after the poll on its way.
+    /// The watch poll's timer, (re)set for when the next page is due: by a
+    /// frame, a reply or the poll itself, without drawing one. Only while
+    /// the window is visible and no Settings or Usage is on screen: a
+    /// window that shows nothing (minimized, covered) asks for nothing
+    /// after the poll on its way.
     fn arm_watch_poll(&mut self, cx: &mut Context<Self>) {
-        let Some(due) = self.model.watch.poll_due() else {
+        let due = self.model.watch.poll_due().filter(|_| self.visible && self.model.tabs.view().is_none());
+        let Some(due) = due else {
             self.watch_poll = None;
             return;
         };
@@ -2375,14 +2428,21 @@ impl AppView {
         let now = Instant::now();
         if self.client.is_none() {
             self.model.watch.no_daemon("offline: there is no daemon to read this worker's thread from");
+            cx.notify();
         } else if let Some((handle, since)) = self.model.watch.take_poll(now) {
             log::debug!(target: "synaps_desktop::watch", "watch {handle} since {since}");
             if !self.client.as_ref().is_some_and(|c| c.watch_subagent(handle, since).is_ok()) {
                 self.model.watch.poll_failed(now);
             }
         }
-        // The next frame arms the next timer (the reply's, or the timeout's).
-        cx.notify();
+        // The timeout's (or the retry's) timer; the reply arms the next.
+        self.arm_watch_poll(cx);
+    }
+
+    /// The window was shown or hidden: polls stop while it shows nothing.
+    fn visibility_changed(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.visible = visible;
+        self.arm_watch_poll(cx);
     }
 
     /// The visible tab shows its session as last seen (the tab cache, or
@@ -2679,6 +2739,19 @@ impl AppView {
                 c._arm = Some(task);
             }
         }
+        // Back on screen from behind a worker's view (or Settings, Usage):
+        // its buttons and keys wait again, as a new card's do. Nothing
+        // that was not drawn counts as seen.
+        let up = self.card_up();
+        if up && !self.card_was_up && !new {
+            if let Some(c) = self.card.as_mut() {
+                log::info!(target: "synaps_desktop::card", "card {:?}: back on screen, waiting", c.key);
+                c.arm = Arm::new(now);
+                c._arm = Some(Self::arm_repaint(cx));
+            }
+            self.keys_live = false;
+        }
+        self.card_was_up = up;
         let live = self.card_keys_live(window, cx).is_some();
         if live && !self.keys_live {
             self.restart_card_keys(cx);
@@ -2943,7 +3016,18 @@ impl AppView {
         let items = self.model.shown().items();
         let from = match &splice {
             Some(sp) => {
-                if items.len() - sp.start > REUSE_ROWS {
+                // The oldest rows dropped (a worker's bound): the list drops
+                // theirs and keeps every other row, its height and the
+                // scroll on it; the rest syncs as any change does.
+                let trimmed = if sp.start == 0 { front_trimmed(&self.rows, items) } else { 0 };
+                if trimmed > 0 {
+                    let k = self.disp.partition_point(|d| d.item < trimmed);
+                    self.list.splice(0..k, 0);
+                    self.disp.drain(..k);
+                    self.disp.iter_mut().for_each(|d| d.shift(trimmed));
+                    self.rows.drain(..trimmed);
+                }
+                if trimmed > 0 || items.len() - sp.start > REUSE_ROWS {
                     // A long tail rebuilt (an attach, a history replace):
                     // rows whose item kept its id and rev keep their strings,
                     // so a cached tab's re-attach rebuilds only what changed.
@@ -2999,11 +3083,11 @@ impl AppView {
     /// worker; when it goes, the worker's is dropped and the session's
     /// comes back exactly as it was left.
     fn sync_pane(&mut self) {
-        let want = self.model.watch.focus();
-        if want == self.pane_of.as_deref() {
+        let want = self.model.watch.focus_key();
+        if want == self.pane_of.as_ref().map(|(h, g)| (h.as_str(), *g)) {
             return;
         }
-        let want = want.map(str::to_string);
+        let want = want.map(|(h, g)| (h.to_string(), g));
         let left = self.take_pane();
         if self.pane_of.is_none() {
             self.main_pane = Some(left);
@@ -3820,9 +3904,11 @@ impl AppView {
             }
             cx.notify();
         }));
+        // A worker that finished keeps the composer (and what is typed in
+        // it, the focus too): Enter says why nothing goes, SEND is off.
         let field = Textarea::new(&self.composer)
             .appearance(false)
-            .disabled(!can_send)
+            .disabled(!drives)
             .text_size(px(m.body))
             .line_height(px(m.body_line))
             .text_color(p.ink);
@@ -3940,7 +4026,10 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
                 (Some(pv), _) if !pv.title.is_empty() => pv.title.clone().into(),
                 // A subagent's call: its label and its task's first line.
                 (_, Some(arg)) => arg,
-                _ => one_line(&t.input, 200).into(),
+                _ => match command_of(&t.input) {
+                    Some(c) => one_line(&c, 200).into(),
+                    None => one_line(&t.input, 200).into(),
+                },
             };
             let lines: Vec<&str> = t.result.lines().collect();
             r.result_more = lines.len().saturating_sub(RESULT_LINES);
@@ -3978,11 +4067,15 @@ struct Inputs {
     settings_pane: Entity<crate::views::ViewPane>,
     usage_pane: Entity<crate::views::ViewPane>,
     focus: FocusHandle,
+    visible: bool,
 }
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diag::mark("first_render");
+        // Every frame drawn (`SYNAPS_DESKTOP_LOG=debug`): what an idle
+        // window costs is countable.
+        log::debug!(target: "synaps_desktop::frame", "frame");
         self.sync_composer(window, cx);
         if std::mem::take(&mut self.model.named.opened) {
             self.find_input.update(cx, |s, cx| s.set_value("", window, cx));
@@ -4037,12 +4130,6 @@ impl Render for AppView {
         // L5: the card's read gate and AUTHORIZE are drawn from the last
         // frame's bounds: after a resize, one more frame draws them from
         // this one's.
-        // A worker's view gone read-only disables the composer: a disabled
-        // input that keeps the focus is not drawn as focusable, and the keys
-        // (Esc back, the worker keys) would reach nothing of this view.
-        if self.model.watch.focused().is_some_and(|w| w.read_only()) && self.composer.read(cx).focus_handle(cx).is_focused(window) {
-            window.focus(&self.focus, cx);
-        }
         if height != self.height && self.card.is_some() {
             window.request_animation_frame();
         }
@@ -4101,12 +4188,12 @@ impl Render for AppView {
         let tabs = self.render_tabs(if view.is_some() { view_pane } else { pane }, &p, cx);
         self.schedule_tabs_save(cx);
         // A worker's view on screen asks for its next page; under Settings
-        // or Usage, nothing.
-        if view.is_none() {
-            self.arm_watch_poll(cx);
-        } else {
-            self.watch_poll = None;
+        // or Usage, nothing. Whether its list is scrolled back (its oldest
+        // rows stay while they may be read).
+        if self.model.watch.focus().is_some() {
+            self.model.watch.scrolled_back = !self.list.is_following_tail();
         }
+        self.arm_watch_poll(cx);
         if self.attach_wait.is_some() && self.attach_due.is_none() {
             self.arm_attach(cx);
         }
@@ -4334,8 +4421,8 @@ mod tests {
 
     use super::{
         ARM, Arm, CENTRE_MIN, CardChord, CardKey, FoldKeys, HeaderMeta, HeaderParts, Side, TabKey, YES_KEY, above_list, authorize_ready,
-        card_key, card_key_on, dragged, hidden, lines_below, one_line, panel_keys, secret_answer, side_widths, sides, still_typing,
-        tab_keys, text_keys, toggled, well_body, worker_keys,
+        card_key, card_key_on, command_of, dragged, hidden, lines_below, one_line, panel_keys, secret_answer, side_widths, sides,
+        still_typing, tab_keys, text_keys, toggled, well_body, worker_keys,
     };
     use crate::theme::{Metrics, Panels};
     use crate::turns::Layout;
@@ -5124,5 +5211,9 @@ mod tests {
     fn one_line_arguments() {
         assert_eq!(one_line("  \nfirst\nsecond", 80), "first …");
         assert_eq!(one_line("abcdef", 3), "abc …");
+        assert_eq!(command_of(r#"{"command":"sleep 16 && echo step 1","timeout":30}"#).as_deref(), Some("sleep 16 && echo step 1"));
+        assert_eq!(command_of(r#"{"path":"a.rs","limit":3}"#), None);
+        assert_eq!(command_of(r#"{"command":"cut off at the prev"#), None, "a cut preview stays as it is");
+        assert_eq!(command_of("ls"), None);
     }
 }

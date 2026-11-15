@@ -1,5 +1,18 @@
 # synaps-client changelog
 
+## Since 9fa77fb
+
+Additive only (PR #18 `feat/worker-tray`): watching and steering a session's workers (subagents), as the Synaps TUI does. Nothing existing changes shape: `Command`, `Event`, `Error`, `SessionCommand` and `SessionQuery` were already `#[non_exhaustive]`.
+
+- New `Command::SubagentWatch { handle_id, since }` and `Client::watch_subagent(handle_id, since)`: one page of a worker's watch journal (`{"cmd":"query","query":{"query":"subagent_watch","handle_id":…,"since":…,"tool_queue":true}}`, Synaps v0.11.0+). The reply comes as the new `Event::SubagentWatch { attach_seq, session_id, handle_id, since, reply }`, `reply` a new `WatchReply` (`#[non_exhaustive]`): `Page(Box<WatchPage>)`, `Gone(String)` (the daemon's `{"error": …}`: an unknown worker, or one that finished longer ago than the daemon keeps a journal), `Unsupported` (a daemon before v0.11.0 could not decode the query), `Undecodable(String)` (with an `Error::Decode`).
+- New `protocol::WatchPage` and `protocol::WatchEvent` (both `#[non_exhaustive]`), mirroring v0.11.1's `runtime/subagent_watch.rs`; every field `serde(default)`, and a kind this client does not know is `WatchEvent::Unknown`, never a failed page. `WatchEvent::to_stream()` gives the main transcript's shape.
+- New `Command::SubagentSteer { handle_id, text }` and `Client::steer_subagent(handle_id, text)`: steer a running worker (`{"cmd":"subagent_steer",…}`, an input command: refused unless this client owns the session's input). Its `Debug` redacts the text, as `Submit`'s does. A refusal is `Error::Refused { command: Some("subagent_steer"), reason }`; from a daemon before v0.11.0 the reason is the new `STEER_UNSUPPORTED`.
+- Behaviour, only for the two new commands: a daemon before v0.11.0 answers a frame it cannot decode with `malformed frame: unknown variant …` and keeps the connection; for `subagent_watch` / `subagent_steer` that now becomes `WatchReply::Unsupported` / the `STEER_UNSUPPORTED` refusal instead of an `Error::Protocol`.
+- New `Transcript` methods for a transcript fed by hand (a worker's): `apply_watch(&WatchEvent)`, `set_busy(bool)` and `trim_live_front(max_items, max_bytes)` (drops the oldest rows of a transcript with no history; returns how many; the next splice starts at 0).
+- Tests: `tests/fixtures.rs` (a v0.11.1 page decodes and replays like the main stream; the query and the steer encode as the daemon reads them, the text never printed; a live-only transcript trims its oldest rows) and `tests/fake_daemon.rs` (pages, `Gone`, an old daemon's `unknown variant`).
+
+For synaps-avatar (nyx): nothing to change.
+
 ## Since a982132
 
 Additive only (PR `feat/rail-redesign`): the daemon's `SessionMeta` fields the rail reads, mirrored.

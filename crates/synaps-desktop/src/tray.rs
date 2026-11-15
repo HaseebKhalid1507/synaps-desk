@@ -105,8 +105,9 @@ impl AppView {
             return;
         }
         let live = if attached { self.model.stats.subagents.live() } else { Vec::new() };
+        // A view nobody looks at whose worker ended goes (and leaves the walk).
+        self.model.watch.prune(now, &live);
         let (rows, until) = self.model.watch.tray(live, now);
-        self.model.watch.prune(now);
         self.tray = TrayCache { key: Some(key), rows: rows.into_iter().map(TrayRow::of).collect(), until };
         match until {
             Some(u) if self.tray_due.as_ref().map(|d| d.0) != Some(u) => {

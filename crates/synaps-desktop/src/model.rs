@@ -1140,6 +1140,37 @@ impl Model {
                 }
                 Event::Sessions(s)
             }
+            // A worker's page: a frame only if it changed what the view
+            // shows (an idle worker's empty pages, 4 a second, draw
+            // nothing), and nothing of the rail's.
+            Event::SubagentWatch { attach_seq, handle_id, since, reply, .. } => {
+                if self.current(attach_seq) && self.watch.on_reply(&handle_id, since, reply, std::time::Instant::now()) {
+                    self.view_dirty = true;
+                }
+                return effects;
+            }
+            // A poll that could not go: again later (nothing shows it).
+            Event::Error { error: Error::Refused { command: Some(c), .. }, .. } if c == "subagent_watch" => {
+                self.watch.poll_failed(std::time::Instant::now());
+                return effects;
+            }
+            Event::Error { error: Error::NotAttached { command: "subagent_watch" }, .. } => {
+                self.watch.poll_failed(std::time::Instant::now());
+                return effects;
+            }
+            Event::Error { error: Error::Decode(d), .. } if d.kind == "query_result:subagent_watch" => return effects,
+            // A worker steer refused: its view says why and keeps the text
+            // for the composer ([`Watch::take_unsent`]).
+            Event::Error { attach_seq, error: Error::Refused { command: Some(c), reason } }
+                if c == "subagent_steer" && attach_seq.is_none_or(|s| self.current(s)) =>
+            {
+                self.view_dirty |= self.watch.steer_refused(&reason);
+                return effects;
+            }
+            Event::Error { error: Error::NotAttached { command: "subagent_steer" }, .. } => {
+                self.view_dirty |= self.watch.steer_refused("not attached to the session");
+                return effects;
+            }
             ev => ev,
         };
         self.view_dirty = true;
@@ -1345,11 +1376,10 @@ impl Model {
                 self.last_error = None;
                 // Another session's worker views mean nothing here; the
                 // same session's (a reconnect, its tab back) watch again.
-                if self.transcript.session_id() == Some(attached.meta.id.as_str()) {
-                    self.watch.on_reconnect(std::time::Instant::now());
-                } else {
+                if self.transcript.session_id() != Some(attached.meta.id.as_str()) {
                     self.watch = Watch::default();
                 }
+                self.watch.on_reconnect(std::time::Instant::now(), self.daemon.as_ref().map(|d| d.pid));
                 if let Err(e) = self.transcript.load_attached(&attached) {
                     self.last_error = Some(e.to_string());
                 }
@@ -1357,9 +1387,6 @@ impl Model {
                 effects.push(Effect::ListSessions);
             }
             Event::Reattaching { attach_seq, .. } if self.current(attach_seq) => self.reattaching = true,
-            Event::SubagentWatch { attach_seq, handle_id, since, reply, .. } if self.current(attach_seq) => {
-                self.watch.on_reply(&handle_id, since, reply, std::time::Instant::now());
-            }
             Event::Session { attach_seq, event, raw, .. } if self.current(attach_seq) => {
                 // The engine's note of a worker steer in the main conversation.
                 if raw["ev"] == "external" && raw["event"]["content"]["content_type"] == "subagent_steer" {
@@ -1424,28 +1451,6 @@ impl Model {
                     self.open_by_resolver(&mut effects);
                 }
             }
-            // A worker steer refused: said in its view, the text back if
-            // that view is the one on screen. A poll that could not go:
-            // later. A page that did not decode: its view says so.
-            Event::Error { attach_seq, error: Error::Refused { command: Some(c), reason } }
-                if c == "subagent_steer" && attach_seq.is_none_or(|s| self.current(s)) =>
-            {
-                if let Some(t) = self.watch.steer_refused(&reason) {
-                    effects.push(Effect::Restore(t));
-                }
-            }
-            Event::Error { error: Error::Refused { command: Some(c), .. }, .. } if c == "subagent_watch" => {
-                self.watch.poll_failed(std::time::Instant::now());
-            }
-            Event::Error { error: Error::NotAttached { command: "subagent_watch" }, .. } => {
-                self.watch.poll_failed(std::time::Instant::now());
-            }
-            Event::Error { error: Error::NotAttached { command: "subagent_steer" }, .. } => {
-                if let Some(t) = self.watch.steer_refused("not attached to the session") {
-                    effects.push(Effect::Restore(t));
-                }
-            }
-            Event::Error { error: Error::Decode(d), .. } if d.kind == "query_result:subagent_watch" => {}
             Event::Error { attach_seq, error } if attach_seq.is_none_or(|s| self.current(s)) => {
                 // An answer the daemon may not have got (a refusal that names
                 // no command could be one): the card asks again. A repeat is
@@ -1642,7 +1647,8 @@ mod tests {
     /// them, a re-attach of the same one (a reconnect, its tab back) asks
     /// again at once; a detach or a tab left asks nothing more; a reply to an
     /// attachment before is dropped; the engine's note of a steer settles it
-    /// and a refusal gives the text back to the composer.
+    /// and a refusal keeps the text for the composer. A page never rebuilds
+    /// the rail, and an idle worker's empty page draws nothing.
     #[test]
     fn worker_views_are_their_sessions() {
         use std::time::Instant;
@@ -1650,14 +1656,15 @@ mod tests {
 
         use crate::watch::Candidate;
         let page = |v: Value| WatchReply::Page(Box::new(serde_json::from_value(v).unwrap()));
-        let reply = |seq: u64| Event::SubagentWatch {
+        let reply_at = |seq: u64, since: u64, events: Value| Event::SubagentWatch {
             attach_seq: seq,
             session_id: "s".into(),
             handle_id: "sa_2".into(),
-            since: 0,
+            since,
             reply: page(json!({"handle_id": "sa_2", "subagent_id": 2, "agent_name": "sleeper", "status": "running",
-                "steerable": true, "next_seq": 1, "more": false, "events": [{"kind": "text", "text": "Step 1."}]})),
+                "steerable": true, "next_seq": 1, "more": false, "events": events})),
         };
+        let reply = |seq: u64| reply_at(seq, 0, json!([{"kind": "text", "text": "Step 1."}]));
         let mut m = Model::new(ConnState::Connecting);
         attach(&mut m, 1);
         let t0 = Instant::now();
@@ -1667,9 +1674,17 @@ mod tests {
         let before = m.shown().len();
         m.apply(reply(9));
         assert_eq!(m.shown().len(), before, "dropped");
+        let generation = m.rail_gen;
         m.apply(reply(1));
         assert_eq!(m.shown().items().last().map(|i| i.text.as_str()), Some("Step 1."));
         assert_eq!(m.transcript.len(), 0, "the session's own transcript is untouched");
+        assert!(m.view_dirty && m.rail_gen == generation, "drawn, the rail not rebuilt");
+        // Idle: an empty page draws nothing.
+        m.view_dirty = false;
+        assert_eq!(m.watch.take_poll(Instant::now() + crate::watch::POLL_INTERVAL), Some(("sa_2".into(), 1)));
+        m.apply(reply_at(1, 1, json!([])));
+        assert!(!m.view_dirty && m.rail_gen == generation, "nothing to draw");
+        assert!(m.watch.poll_due().is_some(), "and the next poll is due");
         // Steer: the engine's note settles it; a refusal of a later one gives
         // its text back (its view is on screen).
         let steer = |h: &str| {
@@ -1682,9 +1697,13 @@ mod tests {
             attach_seq: Some(1),
             error: Error::Refused { command: Some(c.into()), reason: "not the input owner".into() },
         };
-        assert!(m.apply(refused("subagent_steer")).is_empty(), "settled: nothing to give back");
+        assert!(m.apply(refused("subagent_steer")).is_empty());
+        assert_eq!(m.watch.take_unsent(), None, "settled: nothing to give back");
         m.watch.steer_sent("sa_2", "reply STEERED");
-        assert_eq!(m.apply(refused("subagent_steer")), vec![Effect::Restore("reply STEERED".into())]);
+        m.view_dirty = false;
+        assert!(m.apply(refused("subagent_steer")).is_empty());
+        assert!(m.view_dirty && m.rail_gen == generation);
+        assert_eq!(m.watch.take_unsent().map(|u| u.0).as_deref(), Some("reply STEERED"));
         // The same session again: asked again at once, from where it was.
         attach(&mut m, 2);
         let t1 = Instant::now();
