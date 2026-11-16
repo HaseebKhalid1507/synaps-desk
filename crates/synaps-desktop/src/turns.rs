@@ -4,10 +4,14 @@
 //! the tool surface; a finished run of 4 or more tool calls folds to one
 //! summary row. `YOU` and `AGENT` hang in the margin, once per turn.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use gpui_kit::base::TextViewState;
 use gpui_kit::base::text::TextView;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -22,6 +26,232 @@ use crate::theme::{self, Metrics, Palette};
 
 /// A run folds once it has finished with this many tool calls.
 pub(crate) const FOLD_AT: usize = 4;
+
+/// The markdown rows' text views, kept by the app rather than in the
+/// element's keyed state (which lives only while the row is drawn), so a
+/// row that comes back into view keeps its parse. The kit parses text over
+/// 4 KB in the background, and a view made for it lays out empty
+/// until that parse lands. That layout is not the row's height: until the
+/// view's own parse has landed ([`TextViewState::rendered_text`]) the row is
+/// as tall as its text comes to ([`text_lines`]), and the list is told
+/// ([`ListState::set_item_measurement_readiness`]), so it keeps its anchor
+/// and follow. The parse's commit draws again. Without this, a drag or a
+/// scroll into a long reply measured it a few px tall, and the list,
+/// believing it had reached its end, followed the tail again.
+///
+/// Views are kept by item id and checked against their text: ids restart
+/// at 1 in every transcript (a tab, a worker), so a kept view whose text is
+/// not this row's (nor a prefix of it, streamed on) is replaced, never
+/// reused. Every list swap clears them as well ([`TextRows::clear`]).
+pub(crate) struct TextRows<V> {
+    kept: HashMap<u64, Kept<V>>,
+    /// The kept views' text, in bytes ([`KEEP_BYTES`]).
+    bytes: usize,
+    /// The rows laid out this frame whose parse is pending (indices): no
+    /// allocation once warm.
+    waiting: Vec<usize>,
+    frame: u64,
+    /// The characters a line of the column holds this frame ([`cpl`]).
+    cpl: f32,
+}
+
+/// The transcript's: a view, and its redraw when it changes (a parse lands).
+pub(crate) type Views = TextRows<(Entity<TextViewState>, Subscription)>;
+
+struct Kept<V> {
+    text: SharedString,
+    view: V,
+    /// The frame it was last drawn in (the least recent goes first).
+    drawn: u64,
+    born: Instant,
+    /// Its parse has landed (it stays landed: appended text parses on top).
+    parsed: bool,
+}
+
+/// Views kept, at most: past it the one drawn longest ago goes (it parses
+/// again if it comes back). Above the render window's rows: at the smallest
+/// text size a markdown row is at least ~37 px (a line and a part gap), so
+/// with 600 px of overdraw each side a 2160 px view draws ~86 of them and a
+/// 3384 px one ~122. Nothing drawn this frame or last ever goes, whatever
+/// the count, so a lower cap thrashes nothing; it only parses more.
+const KEEP: usize = 160;
+
+/// The kept views' text, at most, in bytes: past it the ones drawn longest
+/// ago go, as past [`KEEP`]. A kept view holds far more than its text: its
+/// document, its blocks' layout and the shaped glyphs of every paragraph it
+/// last painted (the kit keeps those until the view drops). Measured on a
+/// code-heavy transcript, ~190 bytes of memory a character kept (256 KiB
+/// kept: +48 MB over keeping none). 32 KiB is ~6 MB: about ten screens of
+/// dense text behind the window (rows go whole), for a scroll back and
+/// forth that parses nothing again. The window itself may hold more (a
+/// 300 KB reply on screen): what it draws stays, as before views were kept;
+/// the budget only drops what it no longer draws.
+const KEEP_BYTES: usize = 32 * 1024;
+
+/// A parse that never lands (a failed one) stops holding its row after this.
+pub(crate) const MAX_WAIT: Duration = Duration::from_secs(2);
+
+/// What a kept view does for its row's text this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Keep {
+    /// The text it has.
+    Same,
+    /// Its text and more (streamed on): it takes the rest.
+    Append,
+    /// None is kept, or the kept one is another row's (an id reused by
+    /// another transcript): a new view.
+    Fresh,
+}
+
+fn keep(kept: &SharedString, text: &SharedString) -> Keep {
+    if kept.as_ptr() == text.as_ptr() && kept.len() == text.len() {
+        Keep::Same
+    } else if text.starts_with(kept.as_str()) {
+        if text.len() == kept.len() { Keep::Same } else { Keep::Append }
+    } else {
+        Keep::Fresh
+    }
+}
+
+/// A row waits (holds its estimated height, its layout not taken for its
+/// height) while its view's parse has not landed, unless it has no text or
+/// has waited [`MAX_WAIT`].
+pub(crate) fn waits(parsed: bool, empty: bool, age: Duration) -> bool {
+    !parsed && !empty && age < MAX_WAIT
+}
+
+impl<V> Default for TextRows<V> {
+    fn default() -> Self {
+        TextRows { kept: HashMap::new(), bytes: 0, waiting: Vec::new(), frame: 0, cpl: 16. }
+    }
+}
+
+impl<V> TextRows<V> {
+    /// A frame begins, its column `column` px wide (the list's item width).
+    pub(crate) fn frame(&mut self, column: f32, m: &Metrics) {
+        self.frame += 1;
+        self.waiting.clear();
+        self.cpl = cpl(column, m);
+    }
+
+    /// Another list is shown (a tab, a worker's view, a new transcript):
+    /// nothing of this one carries over.
+    pub(crate) fn clear(&mut self) {
+        self.kept.clear();
+        self.bytes = 0;
+        self.waiting.clear();
+    }
+
+    /// Row `id` is drawn with `text`: what its kept view does with it.
+    fn take(&mut self, id: u64, text: &SharedString) -> Keep {
+        let frame = self.frame;
+        match self.kept.get_mut(&id) {
+            Some(k) => {
+                let keep = keep(&k.text, text);
+                if keep != Keep::Fresh {
+                    self.bytes += text.len() - k.text.len();
+                    (k.text, k.drawn) = (text.clone(), frame);
+                }
+                keep
+            }
+            None => Keep::Fresh,
+        }
+    }
+
+    fn view(&self, id: u64) -> Option<&V> {
+        self.kept.get(&id).map(|k| &k.view)
+    }
+
+    /// Keep `view` for row `id` (its `text`), made `now`. Past [`KEEP`] views
+    /// or [`KEEP_BYTES`], the views drawn longest ago go, never one drawn
+    /// this frame or the last: rows below this one in the window are not
+    /// drawn yet this frame, and one dropped would be made again (and over
+    /// 4 KB parsed again, pending) every frame.
+    fn put(&mut self, id: u64, text: SharedString, view: V, now: Instant) {
+        self.bytes += text.len();
+        if let Some(old) = self.kept.insert(id, Kept { text, view, drawn: self.frame, born: now, parsed: false }) {
+            self.bytes -= old.text.len();
+        }
+        while self.kept.len() > KEEP || self.bytes > KEEP_BYTES {
+            let frame = self.frame;
+            let old = self.kept.iter().filter(|(_, k)| k.drawn + 1 < frame).min_by_key(|(_, k)| k.drawn).map(|(&id, _)| id);
+            let Some(k) = old.and_then(|id| self.kept.remove(&id)) else { break };
+            self.bytes -= k.text.len();
+        }
+    }
+
+    /// Whether row `id` (drawn at `ix`) waits for its parse, `parsed` telling
+    /// whether it has landed (read only until it has).
+    fn wait(&mut self, ix: usize, id: u64, now: Instant, parsed: impl FnOnce(&V) -> bool) -> bool {
+        let Some(k) = self.kept.get_mut(&id) else { return false };
+        if !k.parsed {
+            k.parsed = parsed(&k.view);
+        }
+        let wait = waits(k.parsed, k.text.is_empty(), now.saturating_duration_since(k.born));
+        if wait && !self.waiting.contains(&ix) {
+            self.waiting.push(ix);
+        }
+        wait
+    }
+
+    /// A row's layout this frame is its height: it is not markdown, or its
+    /// parse has landed.
+    pub(crate) fn ready(&self, ix: usize) -> bool {
+        !self.waiting.contains(&ix)
+    }
+
+    /// A row laid out this frame waits for its parse: the layout is
+    /// provisional (GPUI neither fills up to the end nor re-arms following).
+    pub(crate) fn pending(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
+    /// The kept views' rows: item id and text.
+    #[cfg(test)]
+    pub(crate) fn kept(&self) -> impl Iterator<Item = (u64, &SharedString)> {
+        self.kept.iter().map(|(&id, k)| (id, &k.text))
+    }
+}
+
+/// A transcript list asks `rows` whether a row's layout is its height.
+pub(crate) fn readiness(list: &ListState, rows: &Rc<RefCell<Views>>) {
+    let rows = rows.clone();
+    list.set_item_measurement_readiness(move |ix, _| rows.borrow().ready(ix));
+}
+
+/// The lines `text` comes to, wrapped at `cpl` characters a line.
+fn text_lines(text: &str, cpl: f32) -> f32 {
+    let cpl = cpl.max(1.);
+    text.split('\n').map(|l| (l.len() as f32 / cpl).ceil().max(1.)).sum()
+}
+
+/// The mean height display rows come to from their text, wrapped at `cpl`
+/// characters a line: a hint for rows not drawn yet.
+pub(crate) fn mean_height(disp: &[Disp], rows: &[RowCache], m: &Metrics, cpl: f32) -> f32 {
+    if disp.is_empty() {
+        return 0.;
+    }
+    let total: f32 = disp
+        .iter()
+        .map(|d| {
+            let lines = match d.kind {
+                Kind::User | Kind::Prose | Kind::Note => rows.get(d.item).map_or(1., |r| text_lines(&r.text, cpl)),
+                _ => 1.,
+            };
+            gap_of(d.gap, m) + lines * m.body_line + 2. * m.pad_y
+        })
+        .sum();
+    total / disp.len() as f32
+}
+
+fn gap_of(gap: Gap, m: &Metrics) -> f32 {
+    match gap {
+        Gap::None => 0.,
+        Gap::First => m.first_gap,
+        Gap::Part => m.part_gap,
+        Gap::Turn => m.turn_gap,
+    }
+}
 
 /// The space above a row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -490,20 +720,56 @@ impl Layout {
     }
 }
 
+/// About the characters a line of a `column` px column holds (a row's own
+/// side padding off): prose wraps at about two an em. An estimate: it counts
+/// bytes, so text that is not ASCII (CJK about one an em) comes out longer.
+pub(crate) fn cpl(column: f32, m: &Metrics) -> f32 {
+    ((column - 2. * m.pad_x) / (0.5 * m.body)).max(16.)
+}
+
 impl AppView {
+    /// Row `ix`'s markdown (item `id`) in its kept view ([`TextRows`]), and
+    /// the height it holds while the view's parse is pending (0 once landed).
+    fn markdown(&self, ix: usize, id: u64, text: &SharedString, m: &Metrics, cx: &mut Context<Self>) -> (TextView, Pixels) {
+        let now = Instant::now();
+        let keep = self.texts.borrow_mut().take(id, text);
+        let kept = self.texts.borrow().view(id).map(|(v, _)| v.clone());
+        let view = match (keep, kept) {
+            (Keep::Same, Some(v)) => v,
+            (Keep::Append, Some(v)) => {
+                v.update(cx, |s, cx| s.set_text(text, cx));
+                v
+            }
+            _ => {
+                let v = cx.new(|cx| TextViewState::markdown(text, cx));
+                let redraw = cx.observe(&v, |_, _, cx| cx.notify());
+                self.texts.borrow_mut().put(id, text.clone(), (v.clone(), redraw), now);
+                v
+            }
+        };
+        let mut rows = self.texts.borrow_mut();
+        let wait = rows.wait(ix, id, now, |(v, _)| !v.read(cx).rendered_text().source().is_empty());
+        let h = if wait { text_lines(text, rows.cpl) * m.body_line } else { 0. };
+        (TextView::new(&view), px(h))
+    }
+
     /// One display row: its gap, its label and the block.
-    pub(crate) fn render_disp(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
+    pub(crate) fn render_disp(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(&d) = self.disp.get(ix) else { return div().into_any_element() };
         let items = self.model.shown().items();
         let (Some(item), Some(row)) = (items.get(d.item), self.rows.get(d.item)) else { return div().into_any_element() };
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
         let lay = self.layout;
-        let gap = match d.gap {
-            Gap::None => 0.,
-            Gap::First => m.first_gap,
-            Gap::Part => m.part_gap,
-            Gap::Turn => m.turn_gap,
+        let gap = gap_of(d.gap, &m);
+        // Its markdown in its kept view, as tall as its text while the
+        // view's parse is pending ([`TextRows`]).
+        let (md, min_h) = match d.kind {
+            Kind::User | Kind::Prose if d.kind == Kind::User || !self.plain_rows => {
+                let (v, h) = self.markdown(ix, d.id, &row.text, &m, cx);
+                (Some(v), h)
+            }
+            _ => (None, px(0.)),
         };
         let block: AnyElement = match d.kind {
             Kind::User => div()
@@ -516,14 +782,14 @@ impl AppView {
                 .text_size(px(m.body))
                 .line_height(px(m.body_line))
                 .text_color(p.ink)
-                .child(TextView::markdown(("md", d.id), row.text.clone()).style(cx.global::<theme::Scheme>().user_text.clone()))
+                .min_h(min_h)
+                .children(md.map(|v| v.style(cx.global::<theme::Scheme>().user_text.clone())))
                 .into_any_element(),
             Kind::Prose => {
-                let body = div().w_full().text_size(px(m.body)).line_height(px(m.body_line)).text_color(p.prose);
-                if self.plain_rows {
-                    body.child(row.text.clone()).into_any_element()
-                } else {
-                    body.child(TextView::markdown(("md", d.id), row.text.clone())).into_any_element()
+                let body = div().w_full().min_h(min_h).text_size(px(m.body)).line_height(px(m.body_line)).text_color(p.prose);
+                match md {
+                    Some(v) => body.child(v).into_any_element(),
+                    None => body.child(row.text.clone()).into_any_element(),
                 }
             }
             Kind::Note => {
@@ -901,11 +1167,16 @@ fn result_body(result: &SharedString, more: usize, failed: bool, p: &Palette, m:
 mod tests {
     // Not `super::*`: that brings in gpui's `test` attribute through `gpui_kit::*`.
     use std::collections::HashSet;
+    use std::time::{Duration, Instant};
 
+    use gpui_kit::SharedString;
     use serde_json::json;
     use synaps_client::transcript::ItemKind;
 
-    use super::{Counts, Disp, Gap, Hue, Kind, Layout, Metrics, RowCache, RunSummary, Summaries, Tone, Who, build, diff, turn_start};
+    use super::{
+        Counts, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, TextRows, Tone,
+        Who, build, diff, text_lines, turn_start,
+    };
     use crate::files::{CallDelta, Ledger};
     use crate::subagents::Subagents;
     use synaps_client::Transcript;
@@ -1222,5 +1493,170 @@ mod tests {
             assert_eq!(pane - a - b, 672., "{pane}");
             assert!((a - b).abs() <= 1.);
         }
+    }
+
+    /// A row's layout is its height once its view's own parse has landed,
+    /// however many frames that takes (a drag or a stream draws many
+    /// meanwhile); landed, it stays landed. A parse that never lands stops
+    /// holding the row after [`MAX_WAIT`]; a row without text never waits.
+    #[test]
+    fn a_rows_layout_waits_for_its_parse_to_land() {
+        let m = Metrics::at(16);
+        let t0 = Instant::now();
+        let mut rows = TextRows::<u32>::default();
+        let text = SharedString::from("x".repeat(9000));
+        rows.frame(672., &m);
+        assert_eq!(rows.take(42, &text), Keep::Fresh);
+        rows.put(42, text.clone(), 1, t0);
+        assert!(rows.wait(3, 42, t0, |_| false), "made this frame, parse pending");
+        assert!(!rows.ready(3) && rows.ready(4) && rows.pending());
+        for f in 1..6 {
+            // Frames the drag draws while the parse is still running.
+            rows.frame(672., &m);
+            assert_eq!(rows.take(42, &text), Keep::Same);
+            assert!(rows.wait(3, 42, t0 + Duration::from_millis(f), |_| false), "frame {f}");
+            assert!(!rows.ready(3));
+        }
+        rows.frame(672., &m);
+        assert!(!rows.wait(5, 42, t0, |_| true), "landed (a splice moved it: the same row)");
+        assert!(rows.ready(5) && !rows.pending());
+        rows.frame(672., &m);
+        assert!(!rows.wait(5, 42, t0, |_| panic!("read once landed")));
+        // A parse that never lands, and an empty row.
+        rows.put(7, "y".repeat(9000).into(), 2, t0);
+        assert!(rows.wait(1, 7, t0 + MAX_WAIT - Duration::from_millis(1), |_| false));
+        rows.frame(672., &m);
+        assert!(!rows.wait(1, 7, t0 + MAX_WAIT, |_| false));
+        rows.put(8, SharedString::default(), 3, t0);
+        assert!(!rows.wait(2, 8, t0, |_| false));
+    }
+
+    /// Item ids restart at 1 in every transcript: a tab's row 7 and a
+    /// worker's row 7 are different rows. A kept view is reused only for
+    /// its own text (or its text streamed on), and a list swap clears them.
+    #[test]
+    fn rows_of_two_lists_with_the_same_ids_never_share_a_view() {
+        let m = Metrics::at(16);
+        let t0 = Instant::now();
+        let mut rows = TextRows::<&str>::default();
+        let (a, b) = (SharedString::from("the tab's reply"), SharedString::from("the worker's reply"));
+        rows.frame(672., &m);
+        assert_eq!(rows.take(7, &a), Keep::Fresh);
+        rows.put(7, a.clone(), "tab", t0);
+        assert!(!rows.wait(0, 7, t0, |_| true));
+        // The worker's list, same id, without a clear: not the tab's view.
+        rows.frame(672., &m);
+        assert_eq!(rows.take(7, &b), Keep::Fresh);
+        rows.put(7, b.clone(), "worker", t0);
+        assert_eq!(rows.view(7), Some(&"worker"));
+        assert!(rows.wait(0, 7, t0, |_| false), "its own parse, not the tab's");
+        // Its own text again (another allocation), and streamed on.
+        rows.frame(672., &m);
+        assert_eq!(rows.take(7, &SharedString::from(b.to_string())), Keep::Same);
+        assert_eq!(rows.take(7, &SharedString::from(format!("{b}, and more"))), Keep::Append);
+        // A swap: nothing carries over, nothing pending.
+        rows.wait(0, 7, t0, |_| false);
+        rows.clear();
+        assert!(!rows.pending() && rows.view(7).is_none());
+        assert_eq!(rows.take(7, &b), Keep::Fresh);
+    }
+
+    /// Past [`KEEP`] views, the one drawn longest ago goes, never one drawn
+    /// this frame.
+    #[test]
+    fn the_view_drawn_longest_ago_goes_first() {
+        let m = Metrics::at(16);
+        let t0 = Instant::now();
+        let mut rows = TextRows::<u64>::default();
+        for id in 0..KEEP as u64 {
+            rows.frame(672., &m);
+            rows.put(id, SharedString::from(id.to_string()), id, t0);
+        }
+        rows.frame(672., &m);
+        assert_eq!(rows.take(0, &SharedString::from("0")), Keep::Same, "0 drawn again: 1 is the oldest now");
+        rows.put(1000, "new".into(), 1000, t0);
+        assert!(rows.view(0).is_some() && rows.view(1).is_none() && rows.view(1000).is_some());
+        assert_eq!(rows.kept.len(), KEEP);
+    }
+
+    fn kept_bytes<V>(rows: &TextRows<V>) -> usize {
+        rows.kept.values().map(|k| k.text.len()).sum()
+    }
+
+    /// Past [`KEEP_BYTES`] of text, the views drawn longest ago go, however
+    /// few they are; the count follows streamed text and replaced views.
+    #[test]
+    fn the_byte_budget_drops_the_views_drawn_longest_ago() {
+        let m = Metrics::at(16);
+        let t0 = Instant::now();
+        let quarter = |c: char| SharedString::from(c.to_string().repeat(KEEP_BYTES / 4));
+        let mut rows = TextRows::<char>::default();
+        // Scrolled through six long replies, one a frame.
+        for (id, c) in (0..).zip("abcdef".chars()) {
+            rows.frame(672., &m);
+            assert_eq!(rows.take(id, &quarter(c)), Keep::Fresh);
+            rows.put(id, quarter(c), c, t0);
+            assert_eq!(rows.bytes, kept_bytes(&rows));
+        }
+        assert!(rows.view(0).is_none() && rows.view(1).is_none(), "a and b went");
+        assert!((2..6).all(|id| rows.view(id).is_some()));
+        assert_eq!(rows.bytes, KEEP_BYTES);
+        // Streamed on, replaced by another row's text, cleared.
+        rows.frame(672., &m);
+        assert_eq!(rows.take(5, &SharedString::from(format!("{}, and more", quarter('f')))), Keep::Append);
+        assert_eq!(rows.bytes, kept_bytes(&rows));
+        assert_eq!(rows.take(4, &"another".into()), Keep::Fresh);
+        rows.put(4, "another".into(), 'g', t0);
+        assert_eq!(rows.bytes, kept_bytes(&rows));
+        rows.clear();
+        assert_eq!(rows.bytes, 0);
+    }
+
+    /// A window that draws more text than [`KEEP_BYTES`] keeps every view it
+    /// draws. A row made this frame above the others (drawn before them)
+    /// spares the ones drawn last frame and not yet this one: with only this
+    /// frame's spared, they would go and be made again (a parse each) every
+    /// frame. Rows off the window go.
+    #[test]
+    fn a_window_over_the_byte_budget_never_drops_its_own_views() {
+        let m = Metrics::at(16);
+        let t0 = Instant::now();
+        let half = |c: char| SharedString::from(c.to_string().repeat(KEEP_BYTES / 2));
+        let mut rows = TextRows::<char>::default();
+        rows.frame(672., &m);
+        for (id, c) in (1..).zip("xyz".chars()) {
+            assert_eq!(rows.take(id, &half(c)), Keep::Fresh);
+            rows.put(id, half(c), c, t0);
+        }
+        assert_eq!(rows.kept.len(), 3, "1.5 budgets, all on screen");
+        // Each frame a new row above them, made before they are drawn.
+        for new in 10..14 {
+            rows.frame(672., &m);
+            let text = SharedString::from(new.to_string());
+            assert_eq!(rows.take(new, &text), Keep::Fresh);
+            rows.put(new, text, 'n', t0);
+            for (id, c) in (1..).zip("xyz".chars()) {
+                assert_eq!(rows.take(id, &half(c)), Keep::Same, "{c} kept, frame after frame");
+            }
+        }
+        assert!(rows.view(10).is_none() && rows.view(11).is_none(), "off the window, over the budget: gone");
+        // Scrolled on: x leaves the window, and goes after a frame's grace.
+        rows.frame(672., &m);
+        for (id, c) in (2..).zip("yz".chars()) {
+            assert_eq!(rows.take(id, &half(c)), Keep::Same);
+        }
+        rows.frame(672., &m);
+        rows.put(20, "v".into(), 'v', t0);
+        assert!(rows.view(1).is_none(), "x went");
+        assert!(rows.view(2).is_some() && rows.view(3).is_some(), "drawn last frame: kept");
+        assert_eq!(rows.bytes, kept_bytes(&rows));
+    }
+
+    #[test]
+    fn text_lines_wrap_each_line_and_count_blank_ones() {
+        assert_eq!(text_lines("", 80.), 1.);
+        assert_eq!(text_lines(&"x".repeat(80), 80.), 1.);
+        assert_eq!(text_lines(&"x".repeat(81), 80.), 2.);
+        assert_eq!(text_lines("a\n\nb", 80.), 3.);
     }
 }

@@ -143,7 +143,11 @@ impl RailCache {
         let rail = rail::build(m, view, now);
         let keys: Vec<u64> = rail.items.iter().map(|i| rail::item_key(&rail, i)).collect();
         if let Some((range, count)) = rail::splice(&self.keys, &keys) {
+            let start = range.start;
             list.splice(range, count);
+            // The rail measures every row, so its bar reaches its end; GPUI
+            // measures new ones up front only once told they need it.
+            list.remeasure_items(start..start + count);
         }
         *self = RailCache { generation: Some(m.rail_gen), minute: now / 60, view: view.clone(), states, rail, keys };
     }
@@ -628,7 +632,13 @@ impl AppView {
                 )
             })
             .child(chips)
-            .child(div().flex_1().min_h_0().child(items))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(items)
+                    .child(crate::scrollbar::rows(&self.rail_list, 0., &self.bars.rail).ground(crate::scrollbar::Ground::Chrome)),
+            )
             .child(self.render_foot(p, cx))
     }
 
@@ -1113,6 +1123,7 @@ impl AppView {
             .h_full()
             .flex_none()
             .overflow_y_scroll()
+            .track_scroll(&self.bars.right.scroll)
             .border_l_1()
             .border_color(p.hair)
             .when(detached || cached, |d| {
@@ -1290,6 +1301,7 @@ impl AppView {
             })
             .max_h(px(max_h.max(160.)))
             .overflow_y_scroll()
+            .track_scroll(&self.bars.picker.scroll)
             .bg(p.chrome)
             .border_1()
             .border_color(p.edge)

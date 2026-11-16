@@ -161,3 +161,53 @@ fn a_held_ctrl_enter_after_a_keyboard_pick_never_sends(cx: &mut TestAppContext) 
     down(cx, w, "enter", false);
     assert_eq!(view.read_with(cx, |v, _| v.submits.clone()), vec![(DRAFT.to_string(), false)]);
 }
+
+/// Every list swap a worker brings goes through `list_out`: its view shown
+/// in place, opened in a tab, its tab closed. The text views kept for one
+/// list's rows never serve the next one's (item ids restart at 1 in each),
+/// and a drag on the transcript's bar ends with the list it began on.
+#[gpui_kit::test]
+fn a_worker_swap_carries_no_text_view_or_drag_over(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    let views = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.text_views());
+    let (kept, stale) = views(cx);
+    assert!(kept > 0 && stale == 0, "the session's rows drawn, their views kept: {kept}, {stale}");
+    // A drag on the session's bar under way, then scout shown in place.
+    let session = view.update(cx, |v, _| {
+        v.list.scrollbar_drag_started();
+        v.list.clone()
+    });
+    menu_on(cx, w, &view, Act::Open);
+    down(cx, w, "enter", false);
+    up(cx, w, "enter");
+    assert!(view.read_with(cx, |v, _| v.model.watch.focus() == Some("sa_1")), "scout in place");
+    assert!(!session.is_scrollbar_dragging(), "the drag ended with the session's list");
+    assert_eq!(views(cx).1, 0, "scout's list: none of the session's views");
+    // Back on the session's thread, then scout in a tab of its own.
+    let scout = view.update(cx, |v, cx| {
+        v.list.scrollbar_drag_started();
+        let l = v.list.clone();
+        v.model.watch.focus_main();
+        cx.notify();
+        l
+    });
+    cx.run_until_parked();
+    assert!(!scout.is_scrollbar_dragging(), "the drag ended with scout's list");
+    assert_eq!(views(cx).1, 0, "the session's list again: none of scout's views");
+    menu_on(cx, w, &view, Act::OpenTab);
+    down(cx, w, "enter", false);
+    up(cx, w, "enter");
+    assert!(view.read_with(cx, |v, _| v.model.tabs.current_worker().is_some()), "scout's tab on screen");
+    assert_eq!(views(cx).1, 0, "scout's tab: none of the session's views");
+    // Its tab closed: the session's list, and none of the tab's views.
+    let tab = view.update(cx, |v, _| {
+        v.list.scrollbar_drag_started();
+        v.list.clone()
+    });
+    down(cx, w, "ctrl-w", false);
+    up(cx, w, "ctrl-w");
+    assert!(view.read_with(cx, |v, _| v.model.tabs.current_worker().is_none()), "the tab closed");
+    assert!(!tab.is_scrollbar_dragging(), "the drag ended with the tab's list");
+    let (kept, stale) = views(cx);
+    assert!(kept > 0 && stale == 0, "the session's rows drawn again, nothing of the tab's: {kept}, {stale}");
+}
