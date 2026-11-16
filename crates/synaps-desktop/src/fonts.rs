@@ -26,14 +26,6 @@ const FILES: [&[u8]; 5] = [
     include_bytes!("../assets/fonts/HybridLabelsJP-Regular.ttf"),
 ];
 
-/// The display face has `c`: `subset.sh`'s `DISPLAY` ranges, less what
-/// Rajdhani never drew. A title with anything else is set in the text face,
-/// not patched per glyph.
-pub fn display_covers(c: char) -> bool {
-    matches!(c as u32, 0x20..=0x7e | 0xa0..=0xff | 0x2013..=0x2014 | 0x2018..=0x201d | 0x2022 | 0x2026 | 0x20ac | 0x2212)
-        && !matches!(c, '¤' | 'ª' | '¬' | '\u{ad}' | '²' | '³' | 'µ' | '¹' | 'º' | '¼' | '½' | '¾' | '‛')
-}
-
 /// Register the embedded faces (borrowed: the bytes stay in the binary).
 pub fn register(cx: &mut App) {
     if let Err(e) = cx.text_system().add_fonts(FILES.iter().map(|b| Cow::Borrowed(*b)).collect()) {
@@ -214,17 +206,6 @@ mod tests {
         }
         let total: usize = FILES.iter().map(|f| f.len()).sum();
         assert!(total < 200 * 1024, "{total} bytes embedded");
-    }
-
-    /// N4: `display_covers` is exactly what the embedded display face has
-    /// (Latin-1 less a few signs; Latin Extended-A, U+0100 on, is not in it).
-    #[test]
-    fn display_covers_what_the_display_face_has() {
-        for cp in 0x20..0x3000u32 {
-            let Some(c) = char::from_u32(cp) else { continue };
-            assert_eq!(display_covers(c), has_glyph(FILES[0], cp), "U+{cp:04X}");
-        }
-        assert!(display_covers('é') && !display_covers('ł') && !display_covers('ő') && !display_covers('ş'));
     }
 
     #[test]

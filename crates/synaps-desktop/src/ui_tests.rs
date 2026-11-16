@@ -9,8 +9,9 @@
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, Entity, Focusable as _, KeyDownEvent, KeyUpEvent, Keystroke, PlatformInput, TestAppContext,
-    WindowBounds, WindowOptions, px, size,
+    VisualTestContext, WindowBounds, WindowOptions, px, size,
 };
+use synaps_client::protocol::SessionEvent;
 
 use crate::app::AppView;
 use crate::wtabs::Act;
@@ -19,15 +20,23 @@ const DRAFT: &str = "half-typed, not for sending";
 
 /// The window, and the events of its client (kept: its thread lives on).
 fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<AppView>, async_channel::Receiver<synaps_client::Event>) {
+    open_at(cx, (1440., 900.), crate::theme::Panels::default().text_size)
+}
+
+/// [`open`], `size` px at text step `text`.
+fn open_at(
+    cx: &mut TestAppContext,
+    (w, h): (f32, f32),
+    text: u8,
+) -> (AnyWindowHandle, Entity<AppView>, async_channel::Receiver<synaps_client::Event>) {
     let (window, view) = cx.update(|cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         crate::fonts::register(cx);
         let (theme, raw, _, _) = crate::theme::resolve_theme(None, None, None, None, None);
-        let text = crate::theme::Panels::default().text_size;
         crate::theme::apply(crate::theme::Choice { theme, raw, accent: None, text }, cx);
         crate::app::bind_keys(cx);
-        let bounds = Bounds { origin: Default::default(), size: size(px(1440.), px(900.)) };
+        let bounds = Bounds { origin: Default::default(), size: size(px(w), px(h)) };
         let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
         gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(None, Some(crate::demo::events()), window, cx)))
             .expect("a test window")
@@ -218,6 +227,18 @@ fn poll(cx: &mut TestAppContext, view: &Entity<AppView>) {
     view.update(cx, |v, cx| {
         let same = v.model.sessions.clone();
         v.apply_batch(vec![synaps_client::Event::Sessions(same)], cx);
+    });
+    cx.run_until_parked();
+}
+
+/// The session's one prompt answered elsewhere: no card up.
+fn resolve_prompt(cx: &mut TestAppContext, view: &Entity<AppView>) {
+    view.update(cx, |v, cx| {
+        let ids: Vec<u64> = v.model.transcript.pending_prompts().iter().map(|p| p.id).collect();
+        for prompt_id in ids {
+            v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id });
+        }
+        cx.notify();
     });
     cx.run_until_parked();
 }
@@ -423,4 +444,169 @@ fn a_tally_never_clips_what_it_names(cx: &mut TestAppContext) {
     }
     eprintln!("tallies drawn {drawn}: the 17-tool one cut {cut} times, a tally whole {whole} times");
     assert!(cut > 0 && whole > 0, "the sweep cuts the 17-tool tally, and shows tallies whole: {cut}, {whole}");
+}
+
+/// A new press of `key` (down and up, then past a repeat's 30 ms).
+fn tap(cx: &mut TestAppContext, w: AnyWindowHandle, key: &str) {
+    down(cx, w, key, false);
+    up(cx, w, key);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+}
+
+fn focus_composer(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.composer.update(cx, |s, cx| s.focus(window, cx)))).expect("the window");
+    cx.run_until_parked();
+}
+
+/// design.md §8.14: the session's state and HALT stay reachable at every
+/// window size and text step: the foot's glyph and HALT (the demo's turn
+/// runs, and this window drives it) are drawn inside the window at
+/// 1920×1080, 1280×720, 860×600 and the smallest window, 640×420
+/// (the narrowest; cramped from step 16: the inline row). The word drops only in a tight
+/// pane or cramped (no foot row).
+#[gpui_kit::test]
+fn the_foot_keeps_its_glyph_and_halt_at_every_size(cx: &mut TestAppContext) {
+    for (w, h) in [(1920., 1080.), (1280., 720.), (860., 600.), (640., 420.)] {
+        for step in crate::theme::TEXT_STEPS {
+            let (win, view, _events) = open_at(cx, (w, h), step);
+            let lay = view.read_with(cx, |v, _| v.layout);
+            let mut vcx = VisualTestContext::from_window(win, cx);
+            let inside = |b: Option<gpui_kit::Bounds<gpui_kit::Pixels>>, what: &str| {
+                let b = b.unwrap_or_else(|| panic!("{w}x{h} step {step}: no {what}"));
+                assert!(
+                    f32::from(b.origin.x) >= 0. && f32::from(b.bottom()) <= h && f32::from(b.right()) <= w && f32::from(b.size.width) > 0.,
+                    "{w}x{h} step {step}: {what} at {b:?}"
+                );
+            };
+            inside(vcx.debug_bounds("foot-glyph"), "foot glyph");
+            inside(vcx.debug_bounds("halt"), "HALT");
+            let word = vcx.debug_bounds("foot-word").is_some();
+            assert_eq!(word, !lay.tight && !lay.cramped, "{w}x{h} step {step}: the word ({lay:?})");
+            if (w, h) == (1280., 720.) && step == 16 {
+                assert!(!lay.short, "1280×720 is full now");
+            }
+            if (w, h) == (640., 420.) {
+                // Cramped below a 430-px window at 16 px (design.md §8.14).
+                assert!(lay.short && (step < 16 || lay.cramped), "the smallest window at step {step}: {lay:?}");
+            }
+        }
+    }
+}
+
+/// HALT goes away when this window does not drive the turn (no client).
+#[gpui_kit::test]
+fn halt_is_not_drawn_without_a_turn_this_window_drives(cx: &mut TestAppContext) {
+    let (win, view, _events) = open(cx);
+    view.update(cx, |v, cx| {
+        v.client = None;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let mut vcx = VisualTestContext::from_window(win, cx);
+    assert!(vcx.debug_bounds("halt").is_none());
+    assert!(vcx.debug_bounds("foot-glyph").is_some(), "the glyph stays");
+}
+
+/// Esc, Esc in the composer halts the turn, once; a held Esc never does;
+/// with the card up the first Esc goes to the card (no HALT); from a
+/// worker's view Esc goes back and the Esc right after is not HALT's.
+#[gpui_kit::test]
+fn esc_esc_halts_once(cx: &mut TestAppContext) {
+    // The card up: Esc leaves the composer for the card's keys.
+    let (w, view, _events) = open(cx);
+    focus_composer(cx, w, &view);
+    tap(cx, w, "escape");
+    tap(cx, w, "escape");
+    assert_eq!(view.read_with(cx, |v, _| v.halts), 0, "the card's Esc, not HALT's");
+    // No card: the first arms, the second halts.
+    resolve_prompt(cx, &view);
+    focus_composer(cx, w, &view);
+    tap(cx, w, "escape");
+    assert!(view.read_with(cx, |v, _| v.halts == 0 && v.halt_armed.is_some()), "armed");
+    tap(cx, w, "escape");
+    assert_eq!(view.read_with(cx, |v, _| (v.halts, v.halt_armed)), (1, None), "halted once");
+    // Held: its repeats are not presses.
+    down(cx, w, "escape", false);
+    for _ in 0..4 {
+        down(cx, w, "escape", true);
+    }
+    up(cx, w, "escape");
+    assert_eq!(view.read_with(cx, |v, _| v.halts), 1, "a held Esc halts nothing");
+    std::thread::sleep(crate::app::ARM);
+    // From a worker's view: back to the session; the Esc right after
+    // (inside its guard) arms nothing.
+    view.update(cx, |v, _| v.halt_armed = None);
+    menu_on(cx, w, &view, Act::Open);
+    down(cx, w, "enter", false);
+    up(cx, w, "enter");
+    assert!(view.read_with(cx, |v, _| v.model.watch.focus() == Some("sa_1")));
+    focus_composer(cx, w, &view);
+    tap(cx, w, "escape");
+    assert!(view.read_with(cx, |v, _| v.model.watch.focus().is_none()), "Esc went back");
+    tap(cx, w, "escape");
+    assert!(view.read_with(cx, |v, _| v.halts == 1 && v.halt_armed.is_none()), "the worker view's Esc and its guard arm nothing");
+}
+
+/// F2 opens (and closes) the naming row of the session on screen, from
+/// the window or from the composer.
+#[gpui_kit::test]
+fn f2_opens_the_naming_row(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    let naming = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.model.named.naming);
+    assert!(!naming(cx));
+    tap(cx, w, "f2");
+    assert!(naming(cx), "F2 opens it");
+    tap(cx, w, "f2");
+    assert!(!naming(cx), "and closes it");
+    focus_composer(cx, w, &view);
+    tap(cx, w, "f2");
+    assert!(naming(cx), "from the composer too");
+}
+
+/// The NEEDS YOU stub (design.md §8.17) is drawn only over a worker's view
+/// while its session waits on a prompt; the card is not; a click on it
+/// goes back to the session with the card up.
+#[gpui_kit::test]
+fn the_stub_is_only_over_a_worker_view_with_a_waiting_prompt(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    let stub = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("needs-stub");
+    assert!(stub(cx).is_none(), "the session's thread: the card itself");
+    menu_on(cx, w, &view, Act::Open);
+    down(cx, w, "enter", false);
+    up(cx, w, "enter");
+    assert!(view.read_with(cx, |v, _| v.model.watch.focus() == Some("sa_1")));
+    let at = stub(cx).expect("the stub over scout's view");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("foot-main").is_some(), "MAIN › in the foot");
+    // A click on it: the session's thread, its card up.
+    let centre = at.center();
+    event(
+        cx,
+        w,
+        PlatformInput::MouseDown(gpui_kit::MouseDownEvent {
+            button: gpui_kit::MouseButton::Left,
+            position: centre,
+            modifiers: Default::default(),
+            click_count: 1,
+            first_mouse: false,
+        }),
+    );
+    event(
+        cx,
+        w,
+        PlatformInput::MouseUp(gpui_kit::MouseUpEvent {
+            button: gpui_kit::MouseButton::Left,
+            position: centre,
+            modifiers: Default::default(),
+            click_count: 1,
+        }),
+    );
+    assert!(view.read_with(cx, |v, _| v.model.watch.focus().is_none()), "back on the session's thread");
+    assert!(stub(cx).is_none());
+    // No prompt waiting: no stub over the worker either.
+    resolve_prompt(cx, &view);
+    menu_on(cx, w, &view, Act::Open);
+    down(cx, w, "enter", false);
+    up(cx, w, "enter");
+    assert!(view.read_with(cx, |v, _| v.model.watch.focus() == Some("sa_1")));
+    assert!(stub(cx).is_none(), "nothing waits");
 }

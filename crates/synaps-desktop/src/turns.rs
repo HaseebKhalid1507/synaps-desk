@@ -1129,7 +1129,9 @@ impl AppView {
     /// numbers from 1 again); one that has is another worker's handle now,
     /// and the block does nothing.
     fn subagent_block(&self, v: &subagents::View, current: bool, p: &Palette, m: &Metrics, lay: Layout, cx: &Context<Self>) -> AnyElement {
-        let live = subagents::Liveness::of(v.status, self.model.active.is_some());
+        let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
+        let pending = session.zip(v.id).is_some_and(|(s, id)| self.model.cancels.pending_id(s, id));
+        let live = subagents::Liveness::of(v.status, session.is_some(), true).cancelling(pending);
         let (g, _, word, family) = glyph::worker(live);
         let (word_color, mark) = glyph::ink(family, Ground::Run, p);
         let ended = v.status.is_some_and(subagents::Status::terminal);

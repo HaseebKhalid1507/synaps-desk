@@ -1,5 +1,5 @@
 //! The main window (the approved "hybrid" layout): a top bar with what
-//! needs you, the sessions rail, the session in the middle (header, the
+//! needs you, the sessions rail, the session in the middle (its tabs, the
 //! transcript as turns ([`crate::turns`]), authorization card, composer)
 //! and its numbers on the right. Every colour is a Synaps TUI theme role
 //! ([`crate::theme`]); every number comes from the daemon ([`crate::stats`]).
@@ -21,10 +21,12 @@ use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError,
 use crate::bench::BenchState;
 use crate::files::{self, Preview};
 use crate::fonts::{self, label};
+use crate::glyph::{self, Ground};
 use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, Model, RenameRequest};
 use crate::named::{ResumeRequest, RowAction, home_short};
 use crate::rail::{Bucket, Chip};
 use crate::stats::Stats;
+use crate::subagents::Liveness;
 use crate::tabs::{Drafts, Lru, Place, Saved};
 use crate::theme::{self, Metrics, Palette};
 use crate::turns::{self, Disp, Kind, Layout, Summaries};
@@ -154,9 +156,6 @@ pub(crate) type AttachSource = Box<dyn Fn(&str, u64) -> Vec<Event>>;
 pub(crate) const ARM: Duration = Duration::from_millis(500);
 /// The chord that answers a card yes ([`card_key`]), as its button shows it.
 pub(crate) const YES_KEY: &str = if cfg!(target_os = "macos") { "⌘ENTER" } else { "CTRL+ENTER" };
-/// The one-row session header ([`HeaderParts::compact`]), its hairline not
-/// included.
-const HEADER_ROW: f32 = crate::fit::HEADER_SHORT - 1.;
 /// A folded side panel's strip.
 pub(crate) const STRIP: f32 = 32.;
 /// Narrower than this, the open right panel is not drawn (the session wins).
@@ -188,7 +187,8 @@ actions!(
         OpenUsage,
         WorkerUp,
         WorkerDown,
-        WorkerTab
+        WorkerTab,
+        RenameSession
     ]
 );
 
@@ -241,8 +241,13 @@ pub fn bind_keys(cx: &mut App) {
     for &k in crate::wtabs::tab_keys(mac) {
         keys.push(KeyBinding::new(k, WorkerTab, None));
     }
+    keys.push(KeyBinding::new(RENAME_KEY, RenameSession, None));
     cx.bind_keys(keys);
 }
+
+/// Names the session on screen (opens or closes its naming row), as the
+/// session menu's Rename… and a double-click on its tab's title.
+pub(crate) const RENAME_KEY: &str = "f2";
 
 /// The worker keys ([`crate::watch`]): Ctrl+↑/↓ and Alt+↑/↓ as in the TUI
 /// (Option+↑/↓ first on macOS, where Ctrl+↑/↓ are Mission Control's). No
@@ -258,7 +263,7 @@ pub(crate) const fn worker_keys(mac: bool) -> [(&'static str, Step); 4] {
 
 const COMPOSER_PLACEHOLDER: &str = "Message, or steer a running turn  (Enter sends, Shift+Enter: new line)";
 
-/// The worker key as the composer's hint and the breadcrumb spell it.
+/// The worker key as the hints spell it.
 pub(crate) const WORKER_KEY: &str = if cfg!(target_os = "macos") { "⌥↑/↓" } else { "Ctrl+↑/↓" };
 
 /// What a tab key does.
@@ -701,70 +706,141 @@ pub(crate) fn column(lay: Layout, inner: impl IntoElement) -> Div {
     h_flex().w_full().pl(px(lay.left)).child(div().flex_none().w(px(lay.column)).min_w_0().child(inner))
 }
 
-/// The session header's second line ([`AppView::header_meta`]).
-pub(crate) struct HeaderMeta {
-    pub(crate) detached: bool,
+/// What is known of a session, in the order the session header once said
+/// it ([`AppView::session_meta`]): its tab's tooltip; model · effort in the
+/// composer foot, `detached` its hint, the folder the right pane's FILES.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionMeta {
+    pub(crate) title: Option<SharedString>,
+    pub(crate) name: Option<SharedString>,
     pub(crate) model: Option<SharedString>,
     pub(crate) effort: Option<SharedString>,
     pub(crate) cwd: Option<SharedString>,
+    pub(crate) detached: bool,
 }
 
-impl HeaderMeta {
-    pub(crate) fn any(&self) -> bool {
-        self.detached || self.model.is_some() || self.effort.is_some() || self.cwd.is_some()
-    }
-
-    /// The one-row header's title tooltip: the whole title, then the line.
-    pub(crate) fn tooltip(&self, title: &str) -> String {
+impl SessionMeta {
+    /// The whole line (design.md §8.5): title, name, model, effort, folder
+    /// and `detached`, each if known, joined with `·`; `label` (the tab's)
+    /// leads when the title is not known.
+    pub(crate) fn tooltip(&self, label: &str) -> String {
         let detached = self.detached.then_some("detached");
-        let parts = [detached, self.model.as_deref(), self.effort.as_deref(), self.cwd.as_deref()];
+        let title = self.title.as_deref().unwrap_or(label);
+        let name = self.name.as_deref().filter(|n| *n != title);
+        let parts = [name, self.model.as_deref(), self.effort.as_deref(), self.cwd.as_deref(), detached];
         std::iter::once(title).chain(parts.into_iter().flatten()).collect::<Vec<_>>().join(" · ")
     }
 }
 
-/// What the session header shows. Full: the title with the session's name
-/// beside it, model · effort · folder under it (no folder in a tight pane).
-/// In a short window ([`Layout::short`]) one row, without the name (its tab
-/// shows it): model · effort beside the state unless the pane is tight,
-/// and the whole second line as the title's tooltip. NAME and HALT are in
-/// both. Width never changes the form: a panel dragged across the tight
-/// line moves nothing up or down.
+/// What a session's menu does (a right-click on its tab or rail row).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HeaderParts {
-    pub(crate) compact: bool,
-    /// NAME: the session is attached.
-    pub(crate) name: bool,
-    /// HALT: its turn runs and this window drives it.
-    pub(crate) halt: bool,
-    /// The session's name beside the title.
-    pub(crate) chip: bool,
-    /// The second line.
-    pub(crate) meta: bool,
+pub(crate) enum SessionAct {
+    Rename,
+    Close,
 }
 
-impl HeaderParts {
-    pub(crate) fn of(lay: Layout, attached: bool, busy: bool, named: bool, meta: bool) -> Self {
-        let compact = lay.short;
-        HeaderParts { compact, name: attached, halt: busy, chip: named && !compact, meta: meta && !compact }
-    }
+/// Where a session's menu was opened: its tab, or its rail row (its key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionAt {
+    Tab(u64),
+    Row(u64),
+}
 
-    /// Its height, the hairline under it included. Fixed (every line in it
-    /// has a set height), so a switch of form can keep the transcript's
-    /// rows where they are on screen.
-    pub(crate) fn height(self) -> f32 {
-        if self.compact {
-            crate::fit::HEADER_SHORT
-        } else if self.meta || self.name {
-            // 20 + the title's 28 + 6 + the line's 20 + 17 + the hairline;
-            // the right column (NAME and HALT over the state) is 20 + 5 +
-            // 21 + 8 + 21.
-            crate::fit::HEADER_FULL
-        } else {
-            // 20 + the title + 16 + the hairline: nothing attached, nothing
-            // known.
-            65.
+/// The session a menu is for, and its tab if it has one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionTarget {
+    pub(crate) session: String,
+    pub(crate) tab: Option<u64>,
+    pub(crate) row: Option<u64>,
+}
+
+/// The session menu's items: Rename… (F2) and Close tab (the tab key).
+pub(crate) fn session_items(tab: bool) -> Vec<crate::menu::Item<SessionAct>> {
+    use crate::menu::Item;
+    let close = Item::new(SessionAct::Close, "Close tab").key(CLOSE_KEY);
+    vec![Item::new(SessionAct::Rename, "Rename…").key("F2"), if tab { close } else { close.off("it is not open in a tab") }]
+}
+
+/// The close-tab key as the session menu shows it.
+const CLOSE_KEY: &str = if cfg!(target_os = "macos") { "⌘W" } else { "Ctrl+W" };
+
+/// The composer foot's parts (design.md §8.11), as the room allows: what
+/// drops first when the row is short of width. The glyph, MAIN, HALT and
+/// the primary button never drop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Foot {
+    pub(crate) hint: bool,
+    pub(crate) effort: bool,
+    /// Model (main view) or facts (worker view).
+    pub(crate) model: bool,
+    /// The state word and its count (also gone in a tight pane).
+    pub(crate) word: bool,
+    /// The worker's name and handle (worker view).
+    pub(crate) name: bool,
+}
+
+/// The widths a [`Foot`] is fitted from (px), each part's own; 0: none.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct FootIn {
+    /// The row's inner width (the composer's padding off).
+    pub(crate) room: f32,
+    /// The lead: the glyph column (main), or MAIN › and the glyph (worker).
+    pub(crate) lead: f32,
+    pub(crate) word: f32,
+    pub(crate) name: f32,
+    pub(crate) model: f32,
+    pub(crate) effort: f32,
+    pub(crate) hint: f32,
+    /// HALT (0: not shown) and the primary button.
+    pub(crate) halt: f32,
+    pub(crate) primary: f32,
+    pub(crate) tight: bool,
+}
+
+/// Gaps (design.md §8.11): 8 inside a part, 12 between name and word, 16
+/// between parts, 24 before each button.
+const FOOT_PART: f32 = 16.;
+const FOOT_BUTTON: f32 = 24.;
+/// The least the hint keeps before it goes (it ellipsizes down to this).
+const FOOT_HINT_MIN: f32 = 60.;
+
+/// The foot fitted to its row (design.md §8.11), measured like
+/// [`crate::fit::fit_top`]: while the parts are wider than the row they
+/// drop in this order: the hint (counted at its least), the effort, the
+/// model or facts, the state word and its count (also gone in a tight
+/// pane), the name and handle. The glyph, MAIN, HALT and the primary never
+/// drop.
+pub(crate) fn fit_foot(i: &FootIn) -> Foot {
+    let mut f = Foot { hint: i.hint > 0., effort: i.effort > 0., model: i.model > 0., word: i.word > 0. && !i.tight, name: i.name > 0. };
+    let width = |f: &Foot| {
+        let mut w = i.lead + FOOT_BUTTON + i.primary;
+        if i.halt > 0. {
+            w += i.halt + FOOT_BUTTON;
         }
+        if f.name {
+            w += i.name;
+        }
+        if f.word {
+            w += i.word + if f.name { 12. } else { 0. };
+        }
+        if f.model {
+            w += FOOT_PART + i.model + if f.effort { i.effort } else { 0. };
+        }
+        if f.hint {
+            w += FOOT_PART + i.hint.min(FOOT_HINT_MIN);
+        }
+        w
+    };
+    type Drop = fn(&mut Foot);
+    let order: [Drop; 5] = [|f| f.hint = false, |f| f.effort = false, |f| f.model = false, |f| f.word = false, |f| f.name = false];
+    for drop in order {
+        if width(&f) <= i.room {
+            break;
+        }
+        drop(&mut f);
     }
+    f.effort &= f.model;
+    f
 }
 
 /// The hold-back after a layout ([`AppView::keep_rows`]): whether the list,
@@ -793,12 +869,12 @@ fn wants_hint(l: &ListState, n: usize) -> bool {
         && l.bounds_for_item(n - 1).is_some()
 }
 
-/// How far down the transcript's list starts: the top bar, the session
-/// header and the naming row when it is open (the tab strip is the same in
-/// every form).
-pub(crate) fn above_list(lay: Layout, attached: bool, meta: bool, naming: bool) -> f32 {
+/// How far down the transcript's list starts: the top bar and the naming
+/// row when it is open (the tab strip is the same in every form; nothing
+/// else sits over the list: design.md §8.14).
+pub(crate) fn above_list(lay: Layout, naming: bool) -> f32 {
     let naming = if naming { crate::fit::naming_h(lay.form()) } else { 0. };
-    crate::chrome::top_h(lay.short) + HeaderParts::of(lay, attached, false, false, meta).height() + naming
+    crate::chrome::top_h(lay.short) + naming
 }
 
 /// When the card's keys may act ([`ARM`] after each of these): its buttons
@@ -1108,7 +1184,7 @@ pub struct AppView {
     /// The top bar's words, measured at the first frame.
     pub(crate) top_words: Option<crate::fit::TopWords>,
     /// The rail's find (`/`; Enter opens by exact name) and "Name this
-    /// session…" (header) inputs.
+    /// session…" (the naming row's) inputs.
     pub(crate) find_input: Entity<InputState>,
     name_input: Entity<InputState>,
     /// The accent picker's custom colour and a secret prompt's answer.
@@ -1303,6 +1379,16 @@ pub struct AppView {
     /// open): given back once it closes, if nothing else took it.
     pub(crate) menu_focus_back: Option<FocusHandle>,
     pub(crate) cancel_tick: Option<Task<()>>,
+    /// A session's menu (a right-click on its tab or rail row): Rename…,
+    /// Close tab.
+    pub(crate) smenu: Option<(crate::menu::Menu<SessionAct>, SessionTarget)>,
+    /// A rename asked for a session not on screen yet: its naming row opens
+    /// once it is attached.
+    rename_pending: Option<String>,
+    /// HALT armed by a first Esc in the composer ([`ARM`]): a second
+    /// halts. Its label is `err` while armed; the timer ends the arm.
+    pub(crate) halt_armed: Option<Instant>,
+    halt_tick: Option<Task<()>>,
     /// An item was picked from the keyboard: that key's repeats, once the
     /// menu is gone, are not the next thing's ([`AppView::menu_keydown`]).
     /// The root's capture listener stops them, but GPUI runs a focused
@@ -1317,8 +1403,13 @@ pub struct AppView {
     pub(crate) swallow_clicks: Option<Instant>,
     /// What reached [`AppView::submit`], and whether a worker's view was
     /// on screen (a steer): the UI tests' record of what would have gone.
+    /// Display caps' widths ([`AppView::display_w`]), measured once.
+    widths: RefCell<std::collections::HashMap<(&'static str, u32), f32>>,
     #[cfg(test)]
     pub(crate) submits: Vec<(String, bool)>,
+    /// HALTs sent ([`AppView::halt`]): the UI tests' record.
+    #[cfg(test)]
+    pub(crate) halts: usize,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -1688,10 +1779,17 @@ impl AppView {
             menu: None,
             menu_focus_back: None,
             cancel_tick: None,
+            smenu: None,
+            rename_pending: None,
+            halt_armed: None,
+            halt_tick: None,
             menu_picked: false,
             swallow_clicks: None,
+            widths: RefCell::default(),
             #[cfg(test)]
             submits: Vec::new(),
+            #[cfg(test)]
+            halts: 0,
             _tasks: Vec::new(),
             _subs: subs,
         }
@@ -2821,7 +2919,7 @@ impl AppView {
             naming_notes: u8::from(n.rename_error.is_some()) + u8::from(self.replace_offer().is_some()),
             error: self.model.last_error.is_some(),
             note: self.watch_note.is_some() || self.draft_note.is_some(),
-            crumb: self.model.watch.focus().is_some(),
+            stub: self.stub_shown(),
             tray: self.tray_rows as u8,
         }
     }
@@ -3601,14 +3699,9 @@ impl AppView {
         }
     }
 
-    /// The header shows the session's state, cost and NAME.
-    fn header_attached(&self) -> bool {
-        self.model.active.is_some() && (self.client.is_some() || self.synthetic)
-    }
-
-    /// The header's second line as the daemon said it, each part if
-    /// known: detached, model, effort, folder.
-    fn header_src(&self) -> (bool, Option<&str>, Option<&str>, Option<&str>) {
+    /// What the daemon said of the session on screen, each part if known:
+    /// detached, model, effort, folder.
+    fn session_src(&self) -> (bool, Option<&str>, Option<&str>, Option<&str>) {
         let view = self.model.stats.view.as_ref();
         let model = view.map(|v| v.model.as_str()).filter(|m| !m.is_empty()).or(self.model.active_meta().map(|s| s.model.as_str()));
         let effort = view.map(|v| v.effort.as_str()).filter(|e| !e.is_empty());
@@ -3616,211 +3709,247 @@ impl AppView {
         (self.model.active.is_none() && self.model.stats.detached, model, effort, cwd)
     }
 
-    /// The header's second line, set: detached, then model · effort ·
-    /// folder. Built only when the header is drawn.
-    pub(crate) fn header_meta(&self) -> HeaderMeta {
-        let (detached, model, effort, cwd) = self.header_src();
-        HeaderMeta {
-            detached,
+    /// The session on screen's line ([`SessionMeta`]), set. Built when it
+    /// is shown (a tooltip on hover).
+    pub(crate) fn session_meta(&self) -> SessionMeta {
+        let (detached, model, effort, cwd) = self.session_src();
+        SessionMeta {
+            title: self.model.transcript.title().map(|t| t.to_string().into()),
+            name: self.model.active_name().map(|n| n.to_string().into()),
             model: model.map(|m| crate::named::short_model(m).into()),
             effort: effort.map(|e| e.to_string().into()),
             cwd: cwd.map(|c| home_short(c).into()),
+            detached,
         }
     }
 
-    /// [`HeaderMeta::any`] of the header's line, without building it (a
-    /// view on screen draws no header).
-    fn header_known(&self) -> bool {
-        let (detached, model, effort, cwd) = self.header_src();
-        detached || model.is_some() || effort.is_some() || cwd.is_some()
+    /// Tab `id`'s session line, for its tooltip: the session on screen's
+    /// in full, another's as its list entry says it (no effort: only an
+    /// attached session's view says it).
+    pub(crate) fn tab_meta(&self, id: u64) -> Option<SessionMeta> {
+        let t = self.model.tabs.iter().find(|t| t.id == id)?;
+        let session = t.session.as_deref()?;
+        if self.model.is_active(session) {
+            return Some(self.session_meta());
+        }
+        let m = self.model.sessions.iter().find(|m| m.id == session)?;
+        Some(SessionMeta {
+            title: m.title.clone().filter(|t| !t.is_empty()).map(Into::into),
+            name: m.name.clone().filter(|n| !n.is_empty()).map(Into::into),
+            model: (!m.model.is_empty()).then(|| crate::named::short_model(&m.model).into()),
+            effort: None,
+            cwd: m.cwd.as_deref().filter(|c| !c.is_empty()).map(|c| home_short(c).into()),
+            detached: false,
+        })
     }
 
-    /// The centre column's header ([`HeaderParts`]). Full: title (and the
-    /// session's name), model · effort · folder under it (no folder in a
-    /// tight pane); the actions (NAME, HALT) top right, the session's state
-    /// and cost under them. In a short window one row: title, model ·
-    /// effort (unless tight), state, cost, NAME, HALT; the title's tooltip
-    /// has the whole second line. Fixed sizes (the text step scales the
-    /// transcript, card and composer), on the column, at
-    /// [`HeaderParts::height`].
-    fn render_header(&self, meta: HeaderMeta, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
-        let lay = self.layout;
-        let attached = self.header_attached();
-        let title: SharedString = self
-            .model
-            .transcript
-            .title()
-            .or(self.model.active_name())
-            .or(self.model.tabs.current().map(|t| t.label.as_str()))
-            .unwrap_or("No session")
-            .to_string()
-            .into();
-        let busy = self.model.transcript.busy() && self.drives();
-        let parts = HeaderParts::of(lay, attached, busy, self.model.active_name().is_some(), meta.any());
-        // The display face stops at Latin-1 (U+00FF): Polish, Czech or Turkish
-        // titles, and other scripts, are set whole in the text face.
-        let face = if title.chars().all(fonts::display_covers) { fonts::DISPLAY } else { fonts::SANS };
-        // NEEDS YOU / RUNNING / WORKERS / READY beside the cost (glyphs as
-        // the rail's): its workers running on after the turn are not READY.
-        let workers = self.model.active_workers();
-        let state = attached.then(|| {
-            if !self.model.transcript.pending_prompts().is_empty() {
-                (crate::rail::State::NeedsYou, label::NEEDS_YOU, p.warn)
-            } else if self.model.transcript.busy() {
-                (crate::rail::State::Running, label::RUNNING, p.run)
-            } else if workers > 0 {
-                (crate::rail::State::Workers, label::WORKERS, p.run)
-            } else {
-                (crate::rail::State::Idle, label::READY, p.ready)
-            }
-        });
-        let actions = h_flex()
-            .flex_none()
-            .gap(px(22.))
-            .when(parts.name, |d| {
-                d.child(tbtn("name-session", label::NAME, p.dim, p.ink).on_click(cx.listener(|this, _, window, cx| {
-                    this.model.toggle_naming();
-                    if this.model.named.naming {
-                        let current = this.model.active_name().unwrap_or_default().to_string();
-                        this.name_input.update(cx, |s, cx| {
-                            s.set_value(current, window, cx);
-                            s.focus(window, cx);
-                        });
-                    }
-                    cx.notify();
-                })))
-            })
-            .when(parts.halt, |d| {
-                d.child(tbtn("halt", label::HALT, p.dim, p.err).on_click(cx.listener(|this, _, _, _| {
-                    if let Some(c) = &this.client
-                        && this.model.can_send()
-                    {
-                        let _ = c.abort();
-                    }
-                })))
+    /// The session's folder for the right pane's FILES head (design.md
+    /// §8.18): shortened from the left to `chars`, so its leaf stays
+    /// (`…/work/relay-gateway`), and the whole of it for the tooltip.
+    pub(crate) fn session_cwd(&self, chars: usize) -> Option<(SharedString, SharedString)> {
+        let (_, _, _, cwd) = self.session_src();
+        let whole = home_short(cwd?);
+        Some((left_cut(&whole, chars).into(), whole.into()))
+    }
+
+    /// F2, the session menu's Rename…, a double-click on its tab's title:
+    /// the naming row of the session on screen opens (or closes).
+    pub(crate) fn rename_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let on_screen = self.model.tabs.view().is_none()
+            && self.model.tabs.current().and_then(|t| t.session.as_deref()).is_some_and(|s| self.model.is_active(s));
+        if !on_screen {
+            return;
+        }
+        self.model.toggle_naming();
+        if self.model.named.naming {
+            let current = self.model.active_name().unwrap_or_default().to_string();
+            self.name_input.update(cx, |s, cx| {
+                s.set_value(current, window, cx);
+                s.focus(window, cx);
             });
-        let stat = h_flex()
-            .flex_none()
-            .gap(px(14.))
-            .items_center()
-            .when_some(state, |d, (st, word, color)| {
-                let g = match st {
-                    // The rail's glyph, in the canvas's colour.
-                    crate::rail::State::NeedsYou => div()
-                        .relative()
-                        .size(px(10.))
-                        .flex_none()
-                        .child(div().absolute().inset_0().border_1().border_color(p.warn_mark))
-                        .child(div().absolute().top(px(3.)).left(px(3.)).size(px(4.)).bg(p.warn_mark)),
-                    crate::rail::State::Running => div().size(px(8.)).m(px(1.)).bg(p.run_mark),
-                    crate::rail::State::Workers => div()
-                        .relative()
-                        .size(px(10.))
-                        .flex_none()
-                        .child(div().absolute().top(px(1.)).left(px(1.)).size(px(4.)).bg(p.run_mark))
-                        .child(div().absolute().top(px(5.)).left(px(5.)).size(px(4.)).bg(p.run_mark)),
-                    _ => div().size(px(10.)).border_1().border_color(p.ready),
-                };
-                d.child(
-                    h_flex()
-                        .gap(px(8.))
-                        .items_center()
-                        .child(g)
-                        .child(display(word, 13., color))
-                        .when(st == crate::rail::State::Workers, |d| d.child(mono(count(workers), 12., color))),
-                )
-            })
-            // One row: no second line says it.
-            .when(parts.compact && meta.detached, |d| d.child(mono("detached", 12., p.warn)))
-            .when_some(self.model.stats.cost.filter(|_| attached), |d, c| d.child(mono(format!("${c:.2}"), 12., p.cost)));
-        let row = if parts.compact {
-            // Model · effort beside the state, where the column has room:
-            // they give way to the title (which keeps 120 px), not it to them.
-            let mut known = h_flex().flex_shrink_1().min_w_0().overflow_hidden().gap(px(8.)).whitespace_nowrap();
-            let mut any = false;
-            if !lay.tight {
-                for (text, color) in [(meta.model.clone(), p.agent), (meta.effort.clone(), p.dim)] {
-                    if let Some(t) = text {
-                        if any {
-                            known = known.child(mono("·", 12., p.dim));
-                        }
-                        known = known.child(mono(t, 12., color).min_w_0().overflow_hidden().text_ellipsis());
-                        any = true;
-                    }
-                }
-            }
-            let tip = meta;
-            let shown = title.clone();
-            h_flex()
-                .h(px(HEADER_ROW))
-                .items_center()
-                .gap(px(18.))
-                .child(
-                    display(title, 15., p.ink)
-                        .id("header-title")
-                        .font_family(face)
-                        .line_height(px(20.))
-                        .flex_1()
-                        .min_w(px(120.))
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        // Formatted on hover only.
-                        .tooltip(move |window, cx| Tooltip::new(tip.tooltip(&shown)).build(window, cx)),
-                )
-                .when(any, |d| d.child(known))
-                .child(stat)
-                .child(actions)
-        } else {
-            let mut line = h_flex().mt(px(6.)).gap(px(10.)).line_height(px(20.)).overflow_hidden().whitespace_nowrap();
-            let mut sep = false;
-            for (text, color) in [
-                (meta.detached.then(|| SharedString::from("detached")), p.warn),
-                (meta.model, p.agent),
-                (meta.effort, p.dim),
-                (meta.cwd.filter(|_| !lay.tight), p.dim),
-            ] {
-                if let Some(t) = text {
-                    if sep {
-                        line = line.child(mono("·", 12., p.dim));
-                    }
-                    line = line.child(mono(t, 12., color).overflow_hidden().text_ellipsis());
-                    sep = true;
-                }
-            }
-            let left = v_flex()
-                .flex_1()
-                .min_w_0()
-                .child(
-                    h_flex()
-                        .items_end()
-                        .gap(px(16.))
-                        .child(
-                            display(title, 24., p.ink).font_family(face).line_height(px(28.)).min_w_0().overflow_hidden().text_ellipsis(),
-                        )
-                        .when_some(self.model.active_name().filter(|_| parts.chip), |d, n| {
-                            d.child(mono(n.to_string(), 12., p.dim).flex_none().pb(px(4.)))
-                        }),
-                )
-                .when(parts.meta, |d| d.child(line));
-            h_flex()
-                .h(px(parts.height() - 1.))
-                .items_start()
-                .gap(px(20.))
-                .pt(px(20.))
-                .child(left)
-                .child(v_flex().flex_none().items_end().gap(px(8.)).pt(px(5.)).child(actions).child(stat))
-        };
-        div().flex_none().bg(p.canvas).border_b_1().border_color(p.hair).child(column(lay, row))
+        }
+        cx.notify();
     }
 
-    /// The "Name this session…" row under the header.
+    /// A rename asked for from another session's tab or row: once it is on
+    /// screen and attached, its naming row opens.
+    fn rename_when_shown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(s) = self.rename_pending.as_deref() else { return };
+        if !self.model.is_active(s) || self.model.tabs.current().and_then(|t| t.session.as_deref()) != Some(s) {
+            return;
+        }
+        self.rename_pending = None;
+        if !self.model.named.naming {
+            self.rename_session(window, cx);
+        }
+    }
+
+    /// The live session rail row `key` holds.
+    fn rail_session(&self, key: u64) -> Option<String> {
+        let row = self.rail.rail.rows.iter().find(|r| r.key == key)?;
+        self.model.sessions.get(row.live?).map(|m| m.id.clone())
+    }
+
+    /// A session's menu at `pt` (a right-click on its tab or rail row).
+    pub(crate) fn open_session_menu(&mut self, at: SessionAt, pt: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let (session, tab, row) = match at {
+            SessionAt::Tab(id) => {
+                let Some(t) = self.model.tabs.iter().find(|t| t.id == id && t.kind == crate::tabs::Kind::Session) else { return };
+                let Some(s) = t.session.clone() else { return };
+                (s, Some(id), None)
+            }
+            SessionAt::Row(key) => {
+                let Some(s) = self.rail_session(key) else { return };
+                let tab = self.model.tabs.find(&s).and_then(|ix| self.model.tabs.iter().nth(ix)).map(|t| t.id);
+                (s, tab, Some(key))
+            }
+        };
+        self.close_menu();
+        if let Some(prev) = window.focused(cx).filter(|f| *f != self.focus)
+            && self.menu_focus_back.is_none()
+        {
+            self.menu_focus_back = Some(prev);
+        }
+        window.focus(&self.focus, cx);
+        self.gear_menu = false;
+        let menu = crate::menu::Menu::new(session_items(tab.is_some()), crate::menu::At::Point(pt), false);
+        self.smenu = Some((menu, SessionTarget { session, tab, row }));
+        cx.notify();
+    }
+
+    /// An item of the session menu picked, `how`.
+    pub(crate) fn session_menu_pick(&mut self, act: SessionAct, how: crate::menu::How, window: &mut Window, cx: &mut Context<Self>) {
+        if !how.is_press() {
+            return;
+        }
+        let Some((_, t)) = self.smenu.take() else { return };
+        self.close_menu();
+        match act {
+            SessionAct::Rename => {
+                let ix = t.tab.and_then(|id| self.model.tabs.iter().position(|x| x.id == id));
+                match (ix, t.row) {
+                    (Some(ix), _) => self.focus_tab(ix),
+                    (None, Some(key)) => self.rail_click(key, crate::tabs::Place::Current),
+                    (None, None) => {}
+                }
+                self.rename_pending = Some(t.session);
+                self.rename_when_shown(window, cx);
+            }
+            SessionAct::Close => {
+                if let Some(ix) = t.tab.and_then(|id| self.model.tabs.iter().position(|x| x.id == id)) {
+                    self.close_tab(ix);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// A key while the session menu is open: `true` if it took it.
+    fn session_menu_keydown(&mut self, ks: &Keystroke, press: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some((m, _)) = self.smenu.as_mut() else { return false };
+        match m.key(&ks.key, ks.modifiers.shift, press) {
+            crate::menu::Key::Moved => {}
+            crate::menu::Key::Pick(a) => {
+                self.menu_picked = true;
+                self.session_menu_pick(a, crate::menu::How::Key { press }, window, cx);
+            }
+            crate::menu::Key::Close => self.close_menu(),
+            crate::menu::Key::Other => {
+                self.close_menu();
+                cx.notify();
+                return false;
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// The session menu, if open: at the root, over everything.
+    fn render_session_menu(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let (m, _) = self.smenu.as_ref()?;
+        let crate::menu::At::Point(pt) = m.at else { return None };
+        let body = crate::menu::render("session-menu", m, p, AppView::session_menu_pick, cx);
+        Some(deferred(anchored().position(pt).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
+    }
+
+    /// HALT is drawn: this window drives the session's running turn (in a
+    /// worker's view too).
+    pub(crate) fn halt_shown(&self) -> bool {
+        self.model.transcript.busy() && self.drives()
+    }
+
+    /// HALT: the session's turn stops (the app's one abort).
+    pub(crate) fn halt(&mut self) {
+        self.halt_armed = None;
+        self.halt_tick = None;
+        if let Some(c) = &self.client
+            && self.model.can_send()
+        {
+            let _ = c.abort();
+            #[cfg(test)]
+            {
+                self.halts += 1;
+            }
+        }
+    }
+
+    /// An Esc the composer did not use (no card up, the session's thread
+    /// on screen, a new press): the first arms HALT for [`ARM`], its label
+    /// `err`; a second within it halts. Whether the Esc was HALT's.
+    fn halt_escape(&mut self, now: Instant, cx: &mut Context<Self>) -> bool {
+        // The second of two quick Escs that left a worker's view is not the
+        // session's.
+        if !self.halt_shown() || self.model.watch.esc_guarded(now) {
+            self.halt_armed = None;
+            return false;
+        }
+        if self.halt_armed.is_some_and(|at| now.saturating_duration_since(at) < ARM) {
+            self.halt();
+        } else {
+            self.halt_armed = Some(now);
+            self.halt_tick = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(ARM).await;
+                let _ = this.update(cx, |v, cx| {
+                    v.halt_tick = None;
+                    if v.halt_armed.take().is_some() {
+                        cx.notify();
+                    }
+                });
+            }));
+        }
+        cx.notify();
+        true
+    }
+
+    /// Display caps `text` at `size`, as wide as it is drawn: measured once
+    /// per size in the embedded face.
+    fn display_w(&self, text: &'static str, size: f32, window: &Window) -> f32 {
+        let key = (text, size.to_bits());
+        if let Some(w) = self.widths.borrow().get(&key) {
+            return *w;
+        }
+        let run = TextRun {
+            len: text.len(),
+            font: Font { weight: FontWeight::SEMIBOLD, ..font(fonts::DISPLAY) },
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let w = f32::from(window.text_system().shape_line(text.into(), px(size), &[run], None).width).ceil();
+        self.widths.borrow_mut().insert(key, w);
+        w
+    }
+
     /// The naming row's REPLACE offer: only for the session it was made
     /// for (a switch drops it).
     fn replace_offer(&self) -> Option<&crate::model::Replace> {
         self.model.named.replace.as_ref().filter(|r| self.model.is_active(&r.session_id))
     }
 
-    /// The naming row: NAME, its field, SAVE and CANCEL, then its own lines,
+    /// The naming row, under the tab strip (F2, the session menu's Rename…,
+    /// a double-click on the session's tab): NAME, its field, SAVE and
+    /// CANCEL, then its own lines,
     /// one each (the error, the REPLACE offer; the rest in a tooltip), as
     /// [`crate::fit::Extras`] counts them. Cramped, they are in the field's
     /// row: the error shortened, REPLACE.
@@ -4193,12 +4322,17 @@ impl AppView {
         Some(column(lay, line))
     }
 
-    /// The composer: on the user surface, the user's bar on its left edge,
-    /// SEND (STEER while a turn runs) filled in `prompt_fg`. Sized by
-    /// [`crate::fit::Composer`]; cramped, SEND sits beside the text (a note
+    /// The composer (design.md §8.11): on the user surface, the user's bar
+    /// on its left edge. Its last row is the foot: the state of what is on
+    /// screen (the session's glyph and word, or over a worker's view MAIN ›
+    /// the worker's), model · effort (or the worker's facts), an exceptional
+    /// hint, HALT while this window drives a running turn, then SEND (STEER
+    /// while a turn runs) filled in `prompt_fg`; what does not fit drops in
+    /// [`fit_foot`]'s order. Sized by [`crate::fit::Composer`]; cramped, no
+    /// foot: the glyph, HALT and the primary sit beside the text (a note
     /// about the draft keeps its row). `to_card`: it has the focus while a
     /// card waits; its hint says how to answer from the keyboard.
-    fn render_composer(&self, p: &Palette, m: &Metrics, to_card: bool, cx: &Context<Self>) -> impl IntoElement {
+    fn render_composer(&self, p: &Palette, m: &Metrics, to_card: bool, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let lay = self.layout;
         let dims = crate::fit::Composer::of(m, lay.form());
         let busy = self.model.transcript.busy();
@@ -4207,47 +4341,144 @@ impl AppView {
         let worker = self.model.watch.focused();
         let drives = self.drives();
         let can_send = drives && worker.is_none_or(|w| !w.read_only() && w.steerable);
-        let r = m.r;
-        let hint: SharedString = if self.client.is_none() && !self.synthetic {
-            "offline: no daemon to send to".into()
+        let (detached, model, effort, _) = self.session_src();
+        // Only what is out of the ordinary: the routine two are SEND's and
+        // STEER's tooltips.
+        let hint: Option<(SharedString, Hsla)> = if let Some(n) = self.composer_note() {
+            Some((n, p.warn))
+        } else if self.client.is_none() && !self.synthetic {
+            Some(("offline: no daemon to send to".into(), p.dim_u))
         } else if self.client.is_none() {
-            "offline: synthetic transport, nothing is sent".into()
+            Some(("offline: synthetic transport, nothing is sent".into(), p.dim_u))
         } else if self.model.switching() {
-            "switching sessions…".into()
+            Some(("switching sessions…".into(), p.dim_u))
         } else if !drives && self.opening() {
-            "opening…".into()
+            Some(("opening…".into(), p.dim_u))
+        } else if detached {
+            Some(("detached".into(), p.warn))
         } else if !drives {
-            "not attached".into()
+            Some(("not attached".into(), p.dim_u))
         } else if let Some(w) = worker {
-            w.hint.clone()
+            Some((w.hint.clone(), p.dim_u))
         } else if to_card {
             // The composer keeps its keys (Ctrl/Cmd+Enter sends from here);
             // the card's buttons show none until it has them.
-            if cfg!(target_os = "macos") {
-                "⌘Enter sends this · Esc, then ⌘Enter answers the card".into()
-            } else {
-                "Ctrl+Enter sends this · Esc, then Ctrl+Enter answers the card".into()
-            }
-        } else if busy {
-            "steer: applied at the next turn boundary".into()
+            Some((
+                if cfg!(target_os = "macos") {
+                    "⌘Enter sends this · Esc, then ⌘Enter answers the card".into()
+                } else {
+                    "Ctrl+Enter sends this · Esc, then Ctrl+Enter answers the card".into()
+                },
+                p.dim_u,
+            ))
         } else {
-            "send: starts a turn".into()
+            None
         };
-        let word = match worker {
+        let primary = match worker {
             Some(w) if w.read_only() => label::READ_ONLY,
             Some(_) => label::STEER_WORKER,
             None if busy => label::STEER,
             None => label::SEND,
         };
-        let send = fbtn("send", word, can_send, p.btn_fill, p, m).on_click(cx.listener(|this, _, window, cx| {
-            let text = this.composer.read(cx).value().trim().to_string();
-            if !text.is_empty() && this.submit(text) {
-                this.composer.update(cx, |s, cx| s.set_value("", window, cx));
+        let halt = self.halt_shown();
+        let cell = 0.6 * m.meta;
+        let display_w = |t: &'static str, size: f32| self.display_w(t, size, window);
+        // The state part: the session's (main view), or the watched worker's.
+        let (g, word, family, tally, read_only) = match worker {
+            None => {
+                let st = self.model.tabs.current().map_or(crate::rail::State::Saved, |t| self.tab_state(t));
+                let (g, word, family) = glyph::foot(st);
+                let tally = match st {
+                    crate::rail::State::Workers => Some(self.model.active_workers()),
+                    crate::rail::State::NeedsYou => Some(self.model.transcript.pending_prompts().len()).filter(|n| *n > 1),
+                    _ => None,
+                };
+                (g, word, family, tally, false)
             }
-            cx.notify();
-        }));
-        // A worker that finished keeps the composer (and what is typed in
-        // it, the focus too): Enter says why nothing goes, SEND is off.
+            Some(w) => {
+                let session = self.model.active.as_ref().map(|a| a.session_id.as_str()).or(self.model.tabs.current_session());
+                let live = session.map_or(Liveness::Started, |s| self.worker_state(s, &w.handle_id, None));
+                let (g, word, _, family) = glyph::worker(live);
+                (Some(g), Some(word), family, None, w.read_only())
+            }
+        };
+        let (word_color, mark) = glyph::ink(family, Ground::User, p);
+        // Model · effort, or the worker's facts (its tray row's: tools ·
+        // elapsed; else its model).
+        let facts = worker.map(|w| {
+            self.tray
+                .rows
+                .iter()
+                .find(|r| r.id == w.subagent_id && !r.facts.is_empty())
+                .map_or_else(|| w.facts.clone(), |r| r.facts.clone())
+        });
+        let (model, effort): (Option<SharedString>, Option<SharedString>) = match &facts {
+            Some(f) => ((!f.is_empty()).then(|| f.clone()), None),
+            None => (model.map(|m| crate::named::short_model(m).into()), effort.map(|e| SharedString::from(e.to_string()))),
+        };
+        let mono_w = |t: &str| t.chars().count() as f32 * cell;
+        let main_w = display_w(label::MAIN, m.label);
+        let primary_w = 32. + display_w(primary, m.label);
+        let halt_w = if halt { display_w(label::HALT, m.label) } else { 0. };
+        let word_w = word.map_or(0., |w| {
+            display_w(w, 12.)
+                + tally.map_or(0., |n| 8. + (n.max(1).ilog10() + 1) as f32 * cell)
+                + if read_only { 8. + cell + 8. + display_w(label::READ_ONLY, 12.) } else { 0. }
+        });
+        let name_w = worker.map_or(0., |w| (mono_w(&w.name).min(24. * cell)) + 8. + mono_w(&w.handle_id));
+        let lead_w = if worker.is_some() { main_w + 8. + cell + 8. + m.lead } else { m.lead };
+        let fit = fit_foot(&FootIn {
+            room: lay.column - 2. * m.pad_x - 2.,
+            lead: lead_w,
+            word: word_w,
+            name: name_w,
+            model: if lay.tight { 0. } else { model.as_deref().map_or(0., mono_w) },
+            effort: if lay.tight { 0. } else { effort.as_deref().map_or(0., |e| 8. + cell + 8. + mono_w(e)) },
+            hint: hint.as_ref().map_or(0., |(h, _)| mono_w(h)),
+            halt: halt_w,
+            primary: primary_w,
+            tight: lay.tight,
+        });
+        let send = fbtn("send", primary, can_send, p.btn_fill, p, m)
+            .when(worker.is_none(), |d| {
+                d.tooltip(move |window, cx| {
+                    Tooltip::new(if busy { "steer: applied at the next turn boundary" } else { "send: starts a turn" }).build(window, cx)
+                })
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                let text = this.composer.read(cx).value().trim().to_string();
+                if !text.is_empty() && this.submit(text) {
+                    this.composer.update(cx, |s, cx| s.set_value("", window, cx));
+                }
+                cx.notify();
+            }));
+        let halt_el = halt.then(|| {
+            let armed = self.halt_armed.is_some();
+            let tip = if worker.is_some() { "Halt the session's turn" } else { "Halt this turn (Esc, Esc)" };
+            display(label::HALT, m.label, if armed { p.err } else { p.dim_u })
+                .id("halt")
+                .debug_selector(|| "halt".into())
+                .flex_none()
+                .cursor_pointer()
+                .hover(|d| d.text_color(p.err))
+                .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.halt();
+                    cx.notify();
+                }))
+        });
+        let main_btn = || {
+            display(label::MAIN, m.label, p.dim_u)
+                .id("foot-main")
+                .debug_selector(|| "foot-main".into())
+                .flex_none()
+                .cursor_pointer()
+                .hover(|d| d.text_color(p.ink))
+                .tooltip(|window, cx| Tooltip::new("back to the session · Esc").build(window, cx))
+                .on_click(cx.listener(|this, _, _, cx| this.leave_worker(false, cx)))
+        };
+        let glyph_el = || g.map(|g| div().flex().debug_selector(|| "foot-glyph".into()).child(glyph::draw(g, mark)).into_any_element());
+        // A worker tab's glyph says whose; the primary may shorten.
         let field = Textarea::new(&self.composer)
             .appearance(false)
             .disabled(!drives)
@@ -4257,21 +4488,97 @@ impl AppView {
         // Cramped, the draft's note is on the notice line.
         let inline = dims.row_gap.is_none();
         let inner = if inline {
-            h_flex().gap(px(12.)).items_center().child(div().flex_1().min_w_0().child(field)).child(send)
+            // Under a 120 px field the row sheds MAIN, then STEER WORKER
+            // says STEER (the glyph still names whose).
+            let room = lay.column - 2. * m.pad_x - 2.;
+            let rest = |main: bool, primary: f32| {
+                12. + if main { main_w + 8. } else { 0. } + 10. + if halt { 24. + halt_w } else { 0. } + 24. + primary
+            };
+            let main = worker.is_some() && room - rest(true, primary_w) >= 120.;
+            let short = primary == label::STEER_WORKER && room - rest(main, primary_w) < 120.;
+            let send = if short {
+                fbtn("send", label::STEER, can_send, p.btn_fill, p, m).on_click(cx.listener(|this, _, window, cx| {
+                    let text = this.composer.read(cx).value().trim().to_string();
+                    if !text.is_empty() && this.submit(text) {
+                        this.composer.update(cx, |s, cx| s.set_value("", window, cx));
+                    }
+                    cx.notify();
+                }))
+            } else {
+                send
+            };
+            h_flex()
+                .items_center()
+                .child(div().flex_1().min_w_0().child(field))
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .ml(px(12.))
+                        .gap(px(8.))
+                        .items_center()
+                        .when(main, |d| d.child(main_btn()))
+                        .child(div().flex().flex_none().size(px(10.)).children(glyph_el())),
+                )
+                .children(halt_el.map(|h| h.ml(px(24.))))
+                .child(send.ml(px(24.)))
         } else {
+            let lead = match worker {
+                None => glyph::lead(glyph_el(), m).into_any_element(),
+                Some(_) => h_flex()
+                    .flex_none()
+                    .items_center()
+                    .child(main_btn())
+                    .child(mono("›", m.meta, p.dim_u).mx(px(8.)).flex_none())
+                    .child(glyph::lead(glyph_el(), m))
+                    .into_any_element(),
+            };
+            let name = worker.filter(|_| fit.name).map(|w| {
+                h_flex()
+                    .flex_none()
+                    .gap(px(8.))
+                    .child(mono(w.name.clone(), m.meta, p.ink).max_w(px(24. * cell)).overflow_hidden().text_ellipsis())
+                    .child(mono(w.handle_id.clone(), m.meta, p.dim_u))
+            });
+            let word = word.filter(|_| fit.word).map(|w| {
+                h_flex()
+                    .flex_none()
+                    .gap(px(8.))
+                    .items_center()
+                    .debug_selector(|| "foot-word".into())
+                    .when(name.is_some(), |d| d.ml(px(12.)))
+                    .child(display(w, 12., word_color))
+                    .when_some(tally, |d, n| d.child(mono(count(n), m.meta, word_color)))
+                    .when(read_only, |d| d.child(mono("·", m.meta, p.dim_u)).child(display(label::READ_ONLY, 12., p.dim_u)))
+            });
+            let meta = model.filter(|_| fit.model).map(|t| {
+                h_flex()
+                    .flex_shrink(1.)
+                    .min_w_0()
+                    .ml(px(16.))
+                    .gap(px(8.))
+                    .overflow_hidden()
+                    .child(mono(t, m.meta, p.dim_u).min_w_0().overflow_hidden().text_ellipsis())
+                    .when_some(effort.filter(|_| fit.effort), |d, e| {
+                        d.child(mono("·", m.meta, p.dim_u).flex_none()).child(mono(e, m.meta, p.dim_u).flex_none())
+                    })
+            });
+            let hint =
+                hint.filter(|_| fit.hint).map(|(h, c)| mono(h, m.meta, c).ml(px(16.)).flex_1().min_w_0().overflow_hidden().text_ellipsis());
+            let filler = hint.is_none().then(|| div().flex_1());
             v_flex().child(field).child(
                 h_flex()
-                    .mt(px(dims.row_gap.unwrap_or((6. * r).round())))
+                    .mt(px(dims.row_gap.unwrap_or_default()))
+                    .h(px(dims.button))
                     .items_center()
-                    .gap(px(20.))
-                    .child(match (self.composer_note(), lay.tight) {
-                        // A tight pane has no room for the hint, but a note
-                        // says where Enter sends the text.
-                        (Some(n), _) => mono(n, m.meta, p.warn).flex_1().min_w_0().overflow_hidden().text_ellipsis(),
-                        (None, true) => div().flex_1(),
-                        (None, false) => mono(hint, m.meta, p.dim_u).flex_1().min_w_0().overflow_hidden().text_ellipsis(),
-                    })
-                    .child(send),
+                    .whitespace_nowrap()
+                    .child(lead)
+                    .children(name)
+                    .children(word)
+                    .children(meta)
+                    .children(hint)
+                    .children(filler)
+                    .children(halt_el.map(|h| h.ml(px(24.))))
+                    .child(send.ml(px(24.))),
             )
         };
         column(
@@ -4382,6 +4689,21 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
     r
 }
 
+/// `s` in at most `max` characters, cut from the left (`…` first) at a
+/// `/` if one is in reach: a path keeps its leaf.
+pub(crate) fn left_cut(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max.max(2) {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(n - (max.max(2) - 1)).collect();
+    let tail = match tail.find('/') {
+        Some(at) if at > 0 && tail[at..].len() > 1 => tail[at..].to_string(),
+        _ => tail,
+    };
+    format!("…{tail}")
+}
+
 pub(crate) fn one_line(s: &str, max: usize) -> String {
     let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     let more = s.lines().filter(|l| !l.trim().is_empty()).count() > 1;
@@ -4413,6 +4735,7 @@ impl Render for AppView {
         // window costs is countable.
         log::debug!(target: "synaps_desktop::frame", "frame");
         if self.menu.is_none()
+            && self.smenu.is_none()
             && let Some(h) = self.menu_focus_back.take()
             && self.focus.is_focused(window)
         {
@@ -4426,6 +4749,7 @@ impl Render for AppView {
         self.sync_list();
         self.sync_card(window, cx);
         self.sync_tray(cx);
+        self.rename_when_shown(window, cx);
         self.refresh_rail();
         if let Some(b) = self.bench.as_mut() {
             b.on_render(&self.list, window);
@@ -4493,8 +4817,8 @@ impl Render for AppView {
         if self.top_words.is_none() {
             self.top_words = Some(crate::chrome::top_words(window));
         }
-        // The form from what decides it (not the breadcrumb or the tray).
-        let ex = crate::fit::Extras { crumb: false, tray: 0, ..self.extras() };
+        // The form from what decides it (not the stub or the tray).
+        let ex = crate::fit::Extras { stub: false, tray: 0, ..self.extras() };
         let lay = Layout::of(pane, self.height - crate::chrome::TOP, &m, ex);
         if (lay.hang, lay.tight) != (self.layout.hang, self.layout.tight) {
             self.list.remeasure();
@@ -4508,8 +4832,7 @@ impl Render for AppView {
         // flips the form. Under Settings or Usage too: the session's list
         // is back where it was when its tab is.
         if lay.form() != self.layout.form() {
-            let (attached, known) = (self.header_attached(), self.header_known());
-            let shift = above_list(lay, attached, known, ex.naming) - above_list(self.layout, attached, known, self.layout_naming);
+            let shift = above_list(lay, ex.naming) - above_list(self.layout, self.layout_naming);
             self.keep_rows(shift, (lay.form() as u8) > (self.layout.form() as u8));
         }
         self.layout = lay;
@@ -4518,7 +4841,7 @@ impl Render for AppView {
         // one-line composer; the composer grows only into room the card's
         // smallest form and the tray leave.
         let card_shown = self.card_shown();
-        let ex = crate::fit::Extras { crumb: self.model.watch.focus().is_some(), ..ex };
+        let ex = crate::fit::Extras { stub: self.stub_shown(), ..ex };
         let tray_n = if view.is_none() { self.tray.rows.len() } else { 0 };
         self.tray_rows = crate::fit::tray_rows(&m, lay.form(), self.height, card_shown, ex, tray_n);
         // A keyboard menu over a row no longer drawn closes.
@@ -4542,7 +4865,9 @@ impl Render for AppView {
             self.arm_attach(cx);
         }
         let (pad_l, pad_r) = lay.padding();
-        let (pad_t, pad_b) = ((8. * m.r).round(), (28. * m.r).round());
+        // Nothing over the list but the tab strip: the first row's own gap
+        // (20·r) is the transcript's top edge (design.md §8.14).
+        let (pad_t, pad_b) = (0., (28. * m.r).round());
         let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_disp(ix, cx)))
             .size_full()
             .pl(px(pad_l))
@@ -4607,14 +4932,20 @@ impl Render for AppView {
                 .min_w_0()
                 .bg(p.canvas)
                 .child(tabs)
-                .child(self.render_header(self.header_meta(), &p, cx))
                 .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
-                .children(self.render_crumb(&p, cx))
                 .child(div().flex_1().min_h_0().child(list).children(hint_frame).children(hold_back).child(transcript_bar))
                 .when(card_shown, |d| d.children(self.render_prompt(&p, &m, self.card_keys_live(window, cx), cx)))
+                // The card's slot over a worker's view: NEEDS YOU, folded.
+                .children(self.render_stub(&p, &m, cx))
                 .children(self.render_notice(&p, &m))
                 .children(self.render_tray(&p, &m, cx))
-                .child(self.render_composer(&p, &m, self.card_up() && self.composer.read(cx).focus_handle(cx).is_focused(window), cx))
+                .child(self.render_composer(
+                    &p,
+                    &m,
+                    self.card_up() && self.composer.read(cx).focus_handle(cx).is_focused(window),
+                    window,
+                    cx,
+                ))
         };
         h_flex()
             .id("root")
@@ -4654,6 +4985,10 @@ impl Render for AppView {
                 }
                 // A worker's context menu takes the keys while it is open.
                 if this.menu.is_some() && this.menu_keydown(&ev.keystroke, this.chord_press, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.smenu.is_some() && this.session_menu_keydown(&ev.keystroke, this.chord_press, window, cx) {
                     cx.stop_propagation();
                     return;
                 }
@@ -4715,6 +5050,22 @@ impl Render for AppView {
                         this.restart_card_keys(cx);
                         cx.notify();
                     }
+                } else if ev.keystroke.key == "escape"
+                    && this.chord_press
+                    && !{
+                        let m = &ev.keystroke.modifiers;
+                        m.control || m.alt || m.shift || m.platform
+                    }
+                    && this.model.watch.focus().is_none()
+                    && this.model.tabs.view().is_none()
+                    && this.composer.read(cx).focus_handle(cx).is_focused(window)
+                    // An IME composition's Esc is the IME's.
+                    && this.composer.update(cx, |s, cx| gpui_kit::EntityInputHandler::marked_text_range(s, window, cx)).is_none()
+                    && this.halt_escape(Instant::now(), cx)
+                {
+                    // Esc, Esc in the composer (no card up, the session's
+                    // thread, no IME composition): HALT.
+                    cx.stop_propagation();
                 }
             }))
             // `/` (nothing else focused) goes to find, but not under a
@@ -4770,6 +5121,7 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &WorkerUp, _, cx| this.worker_key(Step::Up, cx)))
             .on_action(cx.listener(|this, _: &WorkerDown, _, cx| this.worker_key(Step::Down, cx)))
             .on_action(cx.listener(|this, _: &WorkerTab, _, cx| this.worker_tab_key(cx)))
+            .on_action(cx.listener(|this, _: &RenameSession, window, cx| this.rename_session(window, cx)))
             .map(|d| tab_actions(d, cx))
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
                 let k = &ev.keystroke.key;
@@ -4822,6 +5174,7 @@ impl Render for AppView {
             })
             .when(self.gear_menu, |d| d.child(deferred(self.render_gear_menu(rail == Side::Strip, &p, cx)).with_priority(2)))
             .children(self.render_menu_at_point(&p, cx))
+            .children(self.render_session_menu(&p, cx))
     }
 }
 
@@ -4831,27 +5184,28 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ARM, Arm, CENTRE_MIN, CardChord, CardKey, FoldKeys, HeaderMeta, HeaderParts, Side, TabKey, YES_KEY, above_list, authorize_ready,
-        card_key, card_key_on, command_of, dragged, held_back, hidden, lines_below, one_line, panel_keys, secret_answer, side_widths,
-        sides, still_typing, tab_keys, text_keys, toggled, well_body, worker_keys,
+        ARM, Arm, CENTRE_MIN, CardChord, CardKey, FoldKeys, Foot, FootIn, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY, above_list,
+        authorize_ready, card_key, card_key_on, command_of, dragged, fit_foot, held_back, hidden, left_cut, lines_below, one_line,
+        panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled, well_body, worker_keys,
     };
     use crate::theme::{Metrics, Panels};
     use crate::turns::Layout;
     use crate::watch::Step;
 
-    /// Short is the pane's height alone, under the full top bar: 740 px,
-    /// a 792-px window. It changes nothing the list's rows are laid out
-    /// by (the column, the hanging labels, tight), so the list never
-    /// remeasures for it. The one-row header comes with short or tight.
+    /// Short is the pane's height alone, under the full top bar: 648 px,
+    /// a 700-px window (1280×720 is full). It changes nothing the list's
+    /// rows are laid out by (the column, the hanging labels, tight), so the
+    /// list never remeasures for it. Nothing sits between the tab strip and
+    /// the list (design.md §8.14): the list's top edge moves only with the
+    /// top bar and the naming row.
     #[test]
-    fn a_short_pane_compacts_the_header_and_nothing_in_the_list() {
+    fn a_short_pane_changes_nothing_in_the_list() {
         let m = Metrics::at(16);
         let pane_h = |window: f32| window - crate::chrome::TOP;
-        for (window_h, short) in [(1080., false), (864., false), (800., false), (792., false), (791., true), (720., true), (600., true)] {
-            let l = Layout::of(1000., pane_h(window_h), &m, Default::default());
-            assert_eq!((l.short, HeaderParts::of(l, true, false, true, true).compact), (short, short), "{window_h}");
+        for (window_h, short) in [(1080., false), (864., false), (720., false), (700., false), (699., true), (600., true)] {
+            assert_eq!(Layout::of(1000., pane_h(window_h), &m, Default::default()).short, short, "{window_h}");
         }
-        assert_eq!(crate::fit::short_below(&m), 740.);
+        assert_eq!(crate::fit::short_below(&m), 648.);
         for w in [500., 900., 1600.] {
             let (tall, short) = (Layout::of(w, 1000., &m, Default::default()), Layout::of(w, 500., &m, Default::default()));
             assert_eq!(
@@ -4860,56 +5214,87 @@ mod tests {
             );
             assert!(!tall.short && short.short);
         }
-        // L1: a tight pane keeps the full header (no folder); one row is for
-        // short windows only, so a panel dragged across 560 moves nothing.
+        // A panel dragged across 560 moves nothing up or down.
         let (tight, wide) = (Layout::of(532., 1000., &m, Default::default()), Layout::of(600., 1000., &m, Default::default()));
-        assert!(tight.tight && !tight.short && !HeaderParts::of(tight, true, false, true, true).compact);
-        assert_eq!(above_list(tight, true, true, false), above_list(wide, true, true, false));
-    }
-
-    /// NAME and HALT are in both forms; the name beside the title and the
-    /// second line only in the full one. Heights are fixed per form.
-    #[test]
-    fn the_one_row_header_keeps_name_and_halt() {
-        let m = Metrics::at(16);
-        let full = Layout::of(1000., 1000., &m, Default::default());
-        for lay in [Layout::of(1000., 600., &m, Default::default()), Layout::of(532., 600., &m, Default::default())] {
-            assert!(lay.short);
-            for (attached, busy) in [(true, true), (true, false), (false, false)] {
-                let parts = HeaderParts::of(lay, attached, busy, true, true);
-                assert_eq!((parts.compact, parts.name, parts.halt, parts.chip, parts.meta), (true, attached, busy, false, false));
-                assert_eq!(parts.height(), 37.);
-            }
-        }
-        let parts = HeaderParts::of(full, true, true, true, true);
-        assert_eq!((parts.compact, parts.name, parts.halt, parts.chip, parts.meta), (false, true, true, true, true));
-        assert_eq!(parts.height(), 92.);
-        // Attached, nothing known for the second line: NAME and the state
-        // still need the height. Nothing attached and nothing known: less.
-        assert_eq!(HeaderParts::of(full, true, false, false, false).height(), 92.);
-        assert_eq!(HeaderParts::of(full, false, false, false, false).height(), 65.);
-        // Full to one row: the list's top edge rises by the header's 55 px
-        // and the top bar's 12 (what a scrolled-back list scrolls by).
-        let short = Layout::of(1000., 600., &m, Default::default());
-        assert_eq!(above_list(short, true, true, false) - above_list(full, true, true, false), -67.);
-        assert_eq!(above_list(short, false, false, false) - above_list(full, false, false, false), -40.);
-        // Cramped: the same bars as short.
-        let cramped = Layout::of(1000., 400., &m, Default::default());
+        assert!(tight.tight && !tight.short);
+        assert_eq!(above_list(tight, false), above_list(wide, false));
+        // Full to short: the list's top edge rises by the top bar's 12 px
+        // (what a scrolled-back list scrolls by); the naming row adds its own.
+        let (full, short) = (Layout::of(1000., 1000., &m, Default::default()), Layout::of(1000., 600., &m, Default::default()));
+        assert_eq!(above_list(short, false) - above_list(full, false), -12.);
+        assert_eq!(above_list(full, true) - above_list(full, false), crate::fit::naming_h(full.form()));
+        let cramped = Layout::of(1000., 340., &m, Default::default());
         assert!(cramped.cramped && cramped.short);
-        assert_eq!(above_list(cramped, true, true, false), above_list(short, true, true, false));
+        assert_eq!(above_list(cramped, false), above_list(short, false));
     }
 
-    /// The one-row header's title tooltip: the whole title, then what the
-    /// second line would say, each part if known.
+    /// The tab's tooltip is the line the session header had: title, name,
+    /// model, effort, folder and `detached`, each if known.
     #[test]
-    fn the_title_tooltip_says_the_second_line() {
-        let meta =
-            HeaderMeta { detached: false, model: Some("opus-4-1".into()), effort: Some("high".into()), cwd: Some("~/work/relay".into()) };
-        assert!(meta.any());
-        assert_eq!(meta.tooltip("Refresh race"), "Refresh race · opus-4-1 · high · ~/work/relay");
-        let bare = HeaderMeta { detached: true, model: None, effort: None, cwd: None };
+    fn the_tab_tooltip_says_the_session_line() {
+        let meta = SessionMeta {
+            title: Some("Refresh race".into()),
+            name: Some("relay-refresh".into()),
+            model: Some("opus-4-1".into()),
+            effort: Some("high".into()),
+            cwd: Some("~/work/relay".into()),
+            detached: false,
+        };
+        assert_eq!(meta.tooltip("relay-refresh"), "Refresh race · relay-refresh · opus-4-1 · high · ~/work/relay");
+        let bare = SessionMeta { detached: true, ..SessionMeta::default() };
         assert_eq!(bare.tooltip("t"), "t · detached");
-        assert!(!HeaderMeta { detached: false, ..bare }.any());
+        // A name the tab already shows as its title is not said twice.
+        let named = SessionMeta { name: Some("t".into()), ..SessionMeta::default() };
+        assert_eq!(named.tooltip("t"), "t");
+    }
+
+    /// The folder keeps its leaf: cut from the left at a `/`.
+    #[test]
+    fn the_folder_is_cut_from_the_left() {
+        assert_eq!(left_cut("~/work/relay-gateway", 40), "~/work/relay-gateway");
+        assert_eq!(left_cut("/home/you/work/relay-gateway", 22), "…/work/relay-gateway");
+        assert_eq!(left_cut("/home/you/work/relay-gateway", 14), "…relay-gateway");
+        assert!(left_cut("/a/very/long/path/to/somewhere", 10).chars().count() <= 10);
+    }
+
+    /// The foot's parts at full width: every part that has something to
+    /// say; then, as the row narrows, they drop in order (hint, effort,
+    /// model, word, name), never the lead, HALT or the primary; a tight
+    /// pane has no word.
+    #[test]
+    fn the_foot_drops_its_parts_in_order() {
+        let all = FootIn {
+            room: 2000.,
+            lead: 20.,
+            word: 60.,
+            name: 80.,
+            model: 72.,
+            effort: 50.,
+            hint: 200.,
+            halt: 40.,
+            primary: 80.,
+            tight: false,
+        };
+        let every = Foot { hint: true, effort: true, model: true, word: true, name: true };
+        assert_eq!(fit_foot(&all), every);
+        let mut last = every;
+        let parts = |f: &Foot| [f.hint, f.effort, f.model, f.word, f.name];
+        for room in (100..2000).rev() {
+            let f = fit_foot(&FootIn { room: room as f32, ..all });
+            // Narrower never shows a part a wider row did not; the first
+            // part still shown means every later one is too.
+            for (a, b) in parts(&f).into_iter().zip(parts(&last)) {
+                assert!(!a || b, "{room}: {f:?} after {last:?}");
+            }
+            let first = parts(&f).iter().position(|&p| p).unwrap_or(5);
+            assert!(parts(&f)[first..].iter().all(|&p| p) || !f.model && f.word, "{room}: {f:?}");
+            last = f;
+        }
+        assert_eq!(fit_foot(&FootIn { room: 100., ..all }), Foot::default(), "the lead, HALT and the primary stay");
+        assert!(!fit_foot(&FootIn { tight: true, ..all }).word, "a tight pane drops the word");
+        // Nothing to say: nothing shown.
+        let quiet = FootIn { hint: 0., effort: 0., name: 0., ..all };
+        assert_eq!(fit_foot(&quiet), Foot { model: true, word: true, ..Foot::default() });
     }
 
     /// N-L1: `submit()` and `sync_composer()` guard with `composer_owned()`
@@ -5062,7 +5447,7 @@ mod tests {
             let (a, b) = panel_keys(mac);
             let (s, u, alt) = crate::views::view_keys(mac, !mac);
             let mut taken: Vec<_> =
-                [a, b].into_iter().chain(text_keys(mac)).chain(tab_keys(mac).iter().map(|(k, _)| *k)).map(parse).collect();
+                [a, b, RENAME_KEY].into_iter().chain(text_keys(mac)).chain(tab_keys(mac).iter().map(|(k, _)| *k)).map(parse).collect();
             taken.extend([Some(s), Some(u), alt].into_iter().flatten().map(parse));
             let keys = worker_keys(mac);
             assert_eq!(keys[0], (if mac { "alt-up" } else { "ctrl-up" }, Step::Up));
@@ -5091,6 +5476,12 @@ mod tests {
                     assert!(k.key == "tab" || k.modifiers.platform, "{k:?}: Cmd on macOS");
                 }
             }
+            // F2 names the session (design.md §8.14): a function key, so
+            // not typing; no input, app, view or card key is it.
+            let f2 = parse(RENAME_KEY);
+            assert_eq!((f2.key.as_str(), f2.modifiers), ("f2", Default::default()));
+            assert!(!input.contains(&f2) && !app.iter().any(|(k, _)| *k == f2), "F2 is taken");
+            assert_eq!(card_key_on(&f2, mac), None);
             let nth: Vec<usize> = tab_keys(mac).iter().filter_map(|(_, w)| if let TabKey::Nth(n) = w { Some(*n) } else { None }).collect();
             assert_eq!(nth, (0..8).collect::<Vec<_>>());
             for want in [TabKey::New, TabKey::Close, TabKey::Reopen, TabKey::Next, TabKey::Prev, TabKey::Last] {
