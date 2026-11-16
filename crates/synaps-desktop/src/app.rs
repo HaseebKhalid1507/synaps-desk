@@ -4,7 +4,7 @@
 //! and its numbers on the right. Every colour is a Synaps TUI theme role
 //! ([`crate::theme`]); every number comes from the daemon ([`crate::stats`]).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -767,6 +767,32 @@ impl HeaderParts {
     }
 }
 
+/// The hold-back after a layout ([`AppView::keep_rows`]): whether the list,
+/// grown to its end while scrolled back, is paused short of it now. It was
+/// not following when the hold was armed, so following now is GPUI's
+/// re-arm: paused, whatever is pending. Otherwise the hold is spent on the
+/// first layout with no row's parse pending: a provisional one (`pending`)
+/// neither fills up to the end nor re-arms, and spent there, the next
+/// would follow. `pending` also counts rows GPUI did not wait for (above
+/// the view), so it can re-arm with a row pending.
+pub(crate) fn held_back(hold: &Cell<bool>, pending: bool, following: bool) -> bool {
+    let pause = hold.get() && following;
+    if pause || !pending {
+        hold.set(false);
+    }
+    pause
+}
+
+/// Whether list `l` (of `n` rows) has rows to hint ([`AppView::hint_rows`]):
+/// more rows than fit, one with no height, the last one drawn.
+fn wants_hint(l: &ListState, n: usize) -> bool {
+    n > 0
+        && l.item_count() == n
+        && l.max_offset_for_scrollbar().y > px(0.)
+        && l.is_scrolled_to_end().is_none()
+        && l.bounds_for_item(n - 1).is_some()
+}
+
 /// How far down the transcript's list starts: the top bar, the session
 /// header and the naming row when it is open (the tab strip is the same in
 /// every form).
@@ -836,6 +862,9 @@ pub(crate) struct PromptCard {
     /// What the top bar says about it ([`crate::chrome::prompt_gist`]).
     pub(crate) gist: SharedString,
     scroll: ScrollHandle,
+    /// The well's bar: each card its own, so a drag on one never carries
+    /// into the next.
+    bar: crate::scrollbar::BarState,
     /// The buttons' row: where it was laid out ([`PromptCard::buttons_shown`]).
     actions: ScrollHandle,
     /// The well was scrolled to its end (or never needed to be), on screen.
@@ -868,6 +897,7 @@ impl PromptCard {
                     body,
                     gist,
                     scroll: ScrollHandle::new(),
+                    bar: Default::default(),
                     actions: ScrollHandle::new(),
                     read: false,
                     _arm: None,
@@ -1068,6 +1098,10 @@ pub struct AppView {
     /// The list's view grew while it was scrolled back: after this
     /// frame's layout it must not have started following the tail.
     hold_back: Rc<Cell<bool>>,
+    /// The markdown rows' text views, and whose parse is pending ([`turns::TextRows`]).
+    pub(crate) texts: Rc<RefCell<turns::Views>>,
+    /// Every pane's scrollbar ([`crate::scrollbar`]).
+    pub(crate) bars: crate::scrollbar::Bars,
     pub(crate) composer: Entity<TextareaState>,
     /// The rows the composer's text grows to ([`crate::fit::composer_rows`]).
     composer_rows: usize,
@@ -1326,7 +1360,11 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder(COMPOSER_PLACEHOLDER));
+        let composer = cx.new(|cx| {
+            let mut s = TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder(COMPOSER_PLACEHOLDER);
+            s.set_scrollbar_renderer(Some(crate::scrollbar::editor()));
+            s
+        });
         let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("find · open by name"));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
@@ -1527,6 +1565,8 @@ impl AppView {
     fn blank(i: Inputs, client: Option<Client>, conn: ConnState, subs: Vec<Subscription>) -> Self {
         let list = ListState::new(0, ListAlignment::Top, px(600.));
         list.set_follow_mode(FollowMode::Tail);
+        let texts = Rc::default();
+        turns::readiness(&list, &texts);
         Self {
             client,
             model: Model::new(conn),
@@ -1544,6 +1584,8 @@ impl AppView {
             layout: Layout::of(800., 800., &Metrics::at(theme::DEFAULT_TEXT), Default::default()),
             scroll_carry: None,
             hold_back: Rc::new(Cell::new(false)),
+            texts,
+            bars: Default::default(),
             composer: i.composer,
             composer_rows: crate::fit::COMPOSER_ROWS,
             top_words: None,
@@ -1554,7 +1596,10 @@ impl AppView {
             find: String::new(),
             chip: None,
             expanded: 0,
-            rail_list: ListState::new(0, ListAlignment::Top, px(300.)),
+            // Every row measured (they are cheap, and new ones only come by a
+            // splice, [`crate::chrome::RailCache`]): the bar's thumb reaches
+            // the rail's end.
+            rail_list: ListState::new(0, ListAlignment::Top, px(300.)).measure_all(),
             rail_width: 0.,
             hover: None,
             readout: None,
@@ -2111,6 +2156,7 @@ impl AppView {
         watch.suspend();
         // The rows first: the transcript may have run ahead of the last frame.
         self.sync_list();
+        self.list_out();
         let key = self.model.transcript.session_id().map(str::to_string);
         let (transcript, stats) = self.model.switch_out();
         self.card = None;
@@ -2118,6 +2164,7 @@ impl AppView {
         self.attach_due = None;
         let fresh = ListState::new(0, ListAlignment::Top, px(600.));
         fresh.set_follow_mode(FollowMode::Tail);
+        turns::readiness(&fresh, &self.texts);
         // What a rise left owed is the old list's.
         self.scroll_carry = None;
         let cache = TabCache {
@@ -2146,6 +2193,7 @@ impl AppView {
     /// The visible tab's session as last seen, from the cache, or nothing
     /// until its attach lands.
     fn load(&mut self, session: Option<String>) {
+        self.list_out();
         match session.as_ref().and_then(|s| self.tab_cache.take(s)) {
             Some(c) => {
                 self.model.switch_in(c.transcript, c.stats);
@@ -2666,6 +2714,32 @@ impl AppView {
         }
     }
 
+    /// Rows the list has no height for (a load, a switch, a new width: not
+    /// drawn yet) count 0 px to GPUI, so the thumb would fill most of the
+    /// track and shrink as history is read. They get a hint, the mean height
+    /// their text comes to ([`turns::mean_height`]; GPUI hints all alike);
+    /// each row's height replaces it once drawn. The last row must have its height: rows
+    /// streaming in below a scrolled-back view keep 0 px until drawn (a
+    /// guess there could put the end where it is not, and a drag to it
+    /// would follow). Once hinted every row has a height, and this is a few
+    /// lookups a frame.
+    fn hint_rows(&self, m: &Metrics) {
+        let (l, n) = (&self.list, self.disp.len());
+        if !wants_hint(l, n) {
+            return;
+        }
+        // The rows not drawn are above the view (rows below it are drawn
+        // or keep 0 px): their mean, not the drawn tail's.
+        let top = l.logical_scroll_top().item_ix.min(n);
+        let above = if top > 0 { &self.disp[..top] } else { &self.disp[..] };
+        let h = turns::mean_height(above, &self.rows, m, turns::cpl(self.layout.column, m));
+        if h > 0. {
+            // A builder, on a clone: `ListState` is shared, so the hint lands
+            // on the list itself.
+            let _ = l.clone().with_uniform_item_height(px(h));
+        }
+    }
+
     /// The card, if it shows the attached session's first pending prompt.
     pub(crate) fn current_card(&self) -> Option<&PromptCard> {
         self.card.as_ref().filter(|c| self.model.card_key() == Some(c.key))
@@ -2945,6 +3019,8 @@ impl AppView {
         self.picker_open = true;
         self.picker_note = None;
         self.config_theme = self.config_choice().0.into();
+        // It opens at its top, as it did before it kept a scroll handle.
+        self.bars.picker.scroll.set_offset(point(px(0.), px(0.)));
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -3321,10 +3397,33 @@ impl AppView {
         panes.retain(|((h, g), _)| model.holds_view(h) && model.watch.generation_of(h) == Some(*g));
     }
 
+    /// The kept text views ([`turns::TextRows`]), and how many of them are
+    /// for no row of the list on screen (an item id whose text is not
+    /// theirs, nor theirs streamed on).
+    #[cfg(test)]
+    pub(crate) fn text_views(&self) -> (usize, usize) {
+        let texts = self.texts.borrow();
+        let stale = texts.kept().filter(|&(id, t)| !self.rows.iter().any(|r| r.id == id && r.text.starts_with(t.as_str()))).count();
+        (texts.kept().count(), stale)
+    }
+
+    /// The list on screen gives way to another (a tab, a worker's view, a
+    /// new transcript): a drag on its bar ends on it, its hold-back is
+    /// dropped (it was this list's), and the text views kept for its rows
+    /// go (the next list numbers its items from 1 too).
+    fn list_out(&mut self) {
+        self.bars.transcript.release();
+        self.list.scrollbar_drag_ended();
+        self.hold_back.set(false);
+        self.texts.borrow_mut().clear();
+    }
+
     /// The list's state, handed out; a fresh, empty list in its place.
     fn take_pane(&mut self) -> Pane {
+        self.list_out();
         let fresh = ListState::new(0, ListAlignment::Top, px(600.));
         fresh.set_follow_mode(FollowMode::Tail);
+        turns::readiness(&fresh, &self.texts);
         Pane {
             rows: std::mem::take(&mut self.rows),
             disp: std::mem::take(&mut self.disp),
@@ -3343,6 +3442,7 @@ impl AppView {
     }
 
     fn put_pane(&mut self, p: Pane) {
+        self.list_out();
         self.rows = p.rows;
         self.disp = p.disp;
         self.summaries = p.summaries;
@@ -3417,6 +3517,7 @@ impl AppView {
         self.summaries.clear();
         self.toggled.clear();
         self.open_runs.clear();
+        self.list_out();
         self.list.reset(0);
     }
 
@@ -4011,7 +4112,11 @@ impl AppView {
                         .when((!lay.tight && !cramped) || (cramped && secret), |d| d.child(mono(kind, m.meta, p.dim_k).flex_none())),
                 )
                 .children(lead_row)
-                .when(has_well, |d| d.child(well))
+                .when(has_well, |d| {
+                    // A press on the bar gives a confirm card the keys, as one on the card does.
+                    let bar = card.map(|c| crate::scrollbar::Bar::new(c.scroll.clone(), &c.bar));
+                    d.child(well).children(bar.map(|b| if secret { b } else { b.focus(self.focus.clone()) }))
+                })
                 .child(
                     h_flex()
                         .id("prompt-actions")
@@ -4411,21 +4516,46 @@ impl Render for AppView {
             self.arm_attach(cx);
         }
         let (pad_l, pad_r) = lay.padding();
+        let (pad_t, pad_b) = ((8. * m.r).round(), (28. * m.r).round());
         let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_disp(ix, cx)))
             .size_full()
             .pl(px(pad_l))
             .pr(px(pad_r))
-            .pt(px((8. * m.r).round()))
-            .pb(px((28. * m.r).round()));
+            .pt(px(pad_t))
+            .pb(px(pad_b));
+        self.texts.borrow_mut().frame(lay.column, &m);
+        self.hint_rows(&m);
+        // After the list's layout: rows it has no height for get their hint
+        // in the next frame's [`AppView::hint_rows`], so one is drawn (once:
+        // hinted, every row has a height). Else, a load's last frame left the
+        // thumb its unhinted length until something else drew.
+        let hint_frame = self.list.is_scrolled_to_end().is_none().then(|| {
+            let (l, n) = (self.list.clone(), self.disp.len());
+            canvas(
+                move |_, window, _| {
+                    if wants_hint(&l, n) {
+                        window.request_animation_frame();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0()
+        });
+        // Over the list's right padding, after its layout (and the hold-back's).
+        let transcript_bar = crate::scrollbar::rows(&self.list, pad_t + pad_b, &self.bars.transcript).always();
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
         // the end of a scrolled-back list set it following; it stops 2 px
         // short of the end instead, still scrolled back. Built only on the
-        // frame that needs it.
+        // frames that need it; a layout with a reply's parse pending may be
+        // provisional (GPUI re-arms following only on a real one), so the
+        // hold lasts until GPUI re-arms or a layout has nothing pending
+        // ([`held_back`]).
         let hold_back = self.hold_back.get().then(|| {
-            let (held, hold) = (self.list.clone(), self.hold_back.clone());
+            let (held, hold, texts) = (self.list.clone(), self.hold_back.clone(), self.texts.clone());
             canvas(
                 move |_, window, _| {
-                    if hold.replace(false) && held.is_following_tail() {
+                    if held_back(&hold, texts.borrow().pending(), held.is_following_tail()) {
                         held.pause_following_tail();
                         held.scroll_by(px(-2.));
                         window.request_animation_frame();
@@ -4454,7 +4584,7 @@ impl Render for AppView {
                 .child(self.render_header(self.header_meta(), &p, cx))
                 .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
                 .children(self.render_crumb(&p, cx))
-                .child(div().flex_1().min_h_0().child(list).children(hold_back))
+                .child(div().flex_1().min_h_0().child(list).children(hint_frame).children(hold_back).child(transcript_bar))
                 .when(card_shown, |d| d.children(self.render_prompt(&p, &m, self.card_keys_live(window, cx), cx)))
                 .children(self.render_notice(&p, &m))
                 .children(self.render_tray(&p, &m, cx))
@@ -4651,7 +4781,9 @@ impl Render for AppView {
                         })
                         .child(main)
                         .when(view.is_none(), |d| match right {
-                            Side::Open(w) => d.child(self.render_right(w, &p, cx)),
+                            Side::Open(w) => {
+                                d.child(self.render_right(w, &p, cx)).child(self.bars.right.bar(crate::scrollbar::Ground::Chrome))
+                            }
                             Side::Strip => d.child(self.render_right_strip(&p, cx)),
                         }),
                 ),
@@ -4660,6 +4792,7 @@ impl Render for AppView {
             .children(view.is_none().then(|| self.render_edge(false, right, &p, cx)).flatten())
             .when(self.picker_open, |d| {
                 d.child(deferred(self.render_picker(&p, if view.is_some() { Side::Open(0.) } else { right }, cx)).with_priority(1))
+                    .child(deferred(self.bars.picker.bar(crate::scrollbar::Ground::Chrome)).with_priority(1))
             })
             .when(self.gear_menu, |d| d.child(deferred(self.render_gear_menu(rail == Side::Strip, &p, cx)).with_priority(2)))
             .children(self.render_menu_at_point(&p, cx))
@@ -4673,8 +4806,8 @@ mod tests {
 
     use super::{
         ARM, Arm, CENTRE_MIN, CardChord, CardKey, FoldKeys, HeaderMeta, HeaderParts, Side, TabKey, YES_KEY, above_list, authorize_ready,
-        card_key, card_key_on, command_of, dragged, hidden, lines_below, one_line, panel_keys, secret_answer, side_widths, sides,
-        still_typing, tab_keys, text_keys, toggled, well_body, worker_keys,
+        card_key, card_key_on, command_of, dragged, held_back, hidden, lines_below, one_line, panel_keys, secret_answer, side_widths,
+        sides, still_typing, tab_keys, text_keys, toggled, well_body, worker_keys,
     };
     use crate::theme::{Metrics, Panels};
     use crate::turns::Layout;
@@ -5524,5 +5657,46 @@ mod tests {
         tabs.open("t", "t", Place::New);
         let _ = frame_composer(&mut drafts, &mut owner, &tabs, None, (&mut draft_note, &mut watch_note), ("x", 1));
         assert_eq!(watch_note, None);
+    }
+
+    /// The window crosses into a more compact form (full to short, short to
+    /// cramped) while the list is scrolled back near its end: the card and
+    /// composer give up room and the list's view grows at the bottom, where
+    /// a long reply not drawn since the list was shown comes into view. Its
+    /// parse is pending, so that layout is provisional and GPUI does not
+    /// re-arm following on it. The hold waits; the next layout (the parse
+    /// landed) reaches the end, GPUI re-arms, and the hold pauses it short
+    /// of the end: still scrolled back. Spent on the provisional layout (as
+    /// before), the next would have followed.
+    #[test]
+    fn a_grown_view_holds_back_past_a_reply_still_parsing() {
+        use std::cell::Cell;
+        let hold = Cell::new(true);
+        // Frame F: provisional (the reply's parse pending), not following.
+        assert!(!held_back(&hold, true, false));
+        assert!(hold.get(), "not spent on a provisional layout");
+        // Frame F+1: the parse landed; at the end, GPUI re-armed following.
+        assert!(held_back(&hold, false, true), "paused short of the end");
+        assert!(!hold.get());
+        // Spent: later layouts leave following alone (a wheel to the end follows).
+        assert!(!held_back(&hold, false, true));
+        // The old rule (spent on the first layout, whatever it was) let F+1 follow.
+        let old = |hold: &Cell<bool>, following: bool| hold.replace(false) && following;
+        let hold = Cell::new(true);
+        assert!(!old(&hold, false));
+        assert!(!old(&hold, true), "F+1 followed");
+        // No reply pending: spent at once, as before.
+        let hold = Cell::new(true);
+        assert!(held_back(&hold, false, true));
+        let hold = Cell::new(true);
+        assert!(!held_back(&hold, false, false) && !hold.get(), "not at the end: nothing to hold");
+        // A row pending above the view (GPUI waits only for those it fills
+        // the view with): GPUI re-armed all the same. Paused, and spent.
+        let hold = Cell::new(true);
+        assert!(held_back(&hold, true, true), "paused, a row pending or not");
+        assert!(!hold.get() && !held_back(&hold, true, true));
+        // The rule before held only once nothing was pending: it followed.
+        let before = |hold: &Cell<bool>, pending: bool, following: bool| !pending && hold.replace(false) && following;
+        assert!(!before(&Cell::new(true), true, true), "followed");
     }
 }
