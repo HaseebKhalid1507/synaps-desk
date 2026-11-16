@@ -295,19 +295,30 @@ pub(crate) fn worker(l: Liveness) -> (Glyph, &'static str, &'static str, Family)
 /// first (`n` of each: its calls), in a bar `h` px tall. The first
 /// `K = min(tools, h/4)` are drawn (the proportional part keeps at least
 /// half the bar); each gets 2 px and its share of the rest,
-/// `2 + floor((h − 2K)·nᵢ / Σ_K n)`; what flooring leaves goes to the
-/// first. So heights never grow down the tally, and the tools not drawn
-/// take no one's colour. Yields (index, top, height), top to bottom;
-/// nothing allocated.
+/// `(h − 2K)·nᵢ / Σ_K n`, floored. The pixels flooring leaves go one each
+/// to the largest fractional parts, ties in tally order (Hamilton's
+/// method): every segment is within 1 px of its exact share, equal counts
+/// within 1 px of each other, heights never grow down the tally, and the
+/// tools not drawn take no one's colour. Yields (index, top, height), top
+/// to bottom; nothing allocated (K ≤ h/4: a rank is K steps).
 pub(crate) fn tally_bar<'a, T>(tally: &'a [T], n: impl Fn(&T) -> usize + 'a, h: u32) -> impl Iterator<Item = (usize, u32, u32)> + 'a {
     let k = tally.len().min(h as usize / 4);
-    let sum = tally[..k].iter().map(&n).sum::<usize>().max(1);
+    let drawn = &tally[..k];
+    // A tool in a tally was called at least once.
+    let n = move |t: &T| n(t).max(1);
+    let sum = drawn.iter().map(&n).sum::<usize>().max(1);
     let free = h as usize - 2 * k;
-    let share = move |t: &T| 2 + (free * n(t) / sum) as u32;
-    let rest = h - tally[..k].iter().map(&share).sum::<u32>();
+    // Its whole pixels and what flooring cut off (in 1/sum px).
+    let share = move |t: &T| (free * n(t) / sum, free * n(t) % sum);
+    let left = free - drawn.iter().map(|t| share(t).0).sum::<usize>();
     let mut top = 0;
-    tally[..k].iter().enumerate().map(move |(i, t)| {
-        let s = share(t) + if i == 0 { rest } else { 0 };
+    drawn.iter().enumerate().map(move |(i, t)| {
+        let (whole, cut) = share(t);
+        let ahead = drawn.iter().enumerate().filter(|&(j, u)| {
+            let c = share(u).1;
+            c > cut || (c == cut && j < i)
+        });
+        let s = 2 + (whole + usize::from(ahead.count() < left)) as u32;
         let seg = (i, top, s);
         top += s;
         seg
@@ -449,26 +460,33 @@ mod tests {
     }
 
     /// The stacked bar: 2 px each and a share of the rest ∝ the tally, the
-    /// remainder on the first; segments touch and fill the bar exactly.
+    /// pixels flooring leaves to the largest fractional parts; segments
+    /// touch and fill the bar exactly.
     #[test]
     fn the_tally_bar_stacks_its_counts() {
-        // 7 tools, 36 px: 2 + floor(30·3/7) = 14, 14, 2 + floor(30/7) = 6; +2 to the first.
-        assert_eq!(bar(&[3, 3, 1], 36), [(0, 0, 16), (1, 16, 14), (2, 30, 6)]);
+        // 7 tools, 36 px: 30·3/7 = 12 r 6/7 twice, 30/7 = 4 r 2/7; the 2 px
+        // left go to the two 6/7s: 2 + 13, 2 + 13, 2 + 4.
+        assert_eq!(bar(&[3, 3, 1], 36), [(0, 0, 15), (1, 15, 15), (2, 30, 6)]);
         assert_eq!(bar(&[4], 36), [(0, 0, 36)]);
-        assert_eq!(bar(&[39, 1], 36), [(0, 0, 34), (1, 34, 2)]);
-        // The open summary's bar ends over the 1 px cut.
+        // 32·39/40 = 31.2, 32/40 = 0.8: the pixel left to the 0.8.
+        assert_eq!(bar(&[39, 1], 36), [(0, 0, 33), (1, 33, 3)]);
+        // The open summary's bar ends over the 1 px cut: 29·3/7 = 12 r 3/7
+        // twice, 29/7 = 4 r 1/7, one pixel left: the first 3/7 (tally order).
         assert_eq!(heights(&[3, 3, 1], 35), [15, 14, 6]);
         // The finish gate's cases: a dominant tool and many singletons, and
         // 13 names (MCP tools): 9 drawn, the dominant one the tallest.
         let mut one_and_17 = vec![10];
         one_and_17.extend([1; 17]);
         assert_eq!(heights(&one_and_17, 36), [12, 3, 3, 3, 3, 3, 3, 3, 3]);
-        assert_eq!(heights(&[20, 12, 8, 5, 4, 3, 2, 1, 1, 1, 1, 1, 1], 36), [13, 5, 4, 3, 3, 2, 2, 2, 2]);
-        // Shady's: the most used is never drawn under a tool used as often.
+        // 18·nᵢ/56 = 6.43 3.86 2.57 1.61 1.29 0.96 0.64 0.32 0.32: 5 px left,
+        // to .96 .86 .64 .61 .57.
+        assert_eq!(heights(&[20, 12, 8, 5, 4, 3, 2, 1, 1, 1, 1, 1, 1], 36), [8, 6, 5, 4, 3, 3, 3, 2, 2]);
+        // Shady's: equal counts drawn alike, never under a tool used less.
         let mut two_and_13 = vec![4, 4];
         two_and_13.extend([1; 13]);
-        let segs = heights(&two_and_13, 36);
-        assert!(segs[0] >= segs[1] && segs[1] > segs[2], "{segs:?}");
+        assert_eq!(heights(&two_and_13, 36), [7, 7, 4, 3, 3, 3, 3, 3, 3]);
+        // The top tool has 2 of 10 calls: 5 px of 36, not a third of the bar.
+        assert_eq!(heights(&[2, 1, 1, 1, 1, 1, 1, 1, 1], 36), [5, 4, 4, 4, 4, 4, 4, 4, 3]);
         // More tools than slots: the first h/4 drawn, the rest take no one's colour.
         let many = bar(&[1; 30], 36);
         assert_eq!(many.len(), 9);
@@ -478,7 +496,8 @@ mod tests {
 
     /// Over random tallies (sorted, as a summary's are) at every summary
     /// height the steps give: tally order, heights never growing down it,
-    /// at least 2 px each, at most h/4 drawn, touching, filling the bar.
+    /// at least 2 px each, at most h/4 drawn, touching, filling the bar;
+    /// each within 1 px of its exact share, equal counts within 1 px.
     #[test]
     fn the_tally_bar_keeps_the_tally_order() {
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
@@ -504,6 +523,17 @@ mod tests {
                 }
                 for w in segs.windows(2) {
                     assert!(w[0].2 >= w[1].2, "{n:?} in {h}: {segs:?} inverts");
+                }
+                let k = segs.len();
+                let (free, sum) = ((h as usize - 2 * k) as f64, n[..k].iter().sum::<usize>() as f64);
+                for (&(i, _, s), &c) in segs.iter().zip(&n) {
+                    let exact = 2. + free * c as f64 / sum;
+                    assert!((s as f64 - exact).abs() < 1., "{n:?} in {h}: segment {i} is {s}, its share {exact:.2}");
+                }
+                for (a, sa) in segs.iter().enumerate() {
+                    for sb in segs[a + 1..].iter().filter(|sb| n[sb.0] == n[a]) {
+                        assert!(sa.2 - sb.2 <= 1, "{n:?} in {h}: equal counts {segs:?}");
+                    }
                 }
             }
         }

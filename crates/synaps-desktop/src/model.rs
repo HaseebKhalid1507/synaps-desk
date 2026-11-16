@@ -1192,8 +1192,10 @@ impl Model {
                 sort_sessions(&mut s);
                 // The poll of an idle daemon: nothing to rebuild or draw.
                 if s == self.sessions {
+                    log::debug!(target: "synaps_desktop::sessions", "list {}: unchanged", self.lists);
                     return effects;
                 }
+                log::debug!(target: "synaps_desktop::sessions", "list {}: {} sessions", self.lists, s.len());
                 Event::Sessions(s)
             }
             // A worker's page: a frame only if it changed what the view

@@ -211,3 +211,72 @@ fn a_worker_swap_carries_no_text_view_or_drag_over(cx: &mut TestAppContext) {
     let (kept, stale) = views(cx);
     assert!(kept > 0 && stale == 0, "the session's rows drawn again, nothing of the tab's: {kept}, {stale}");
 }
+
+/// The daemon's session poll (every 3 s, an event each time even when
+/// nothing changed): the batch it comes in, as the pump applies it.
+fn poll(cx: &mut TestAppContext, view: &Entity<AppView>) {
+    view.update(cx, |v, cx| {
+        let same = v.model.sessions.clone();
+        v.apply_batch(vec![synaps_client::Event::Sessions(same)], cx);
+    });
+    cx.run_until_parked();
+}
+
+fn in_place(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<String> {
+    view.read_with(cx, |v, _| v.model.watch.focus().filter(|_| !v.model.watch.in_tab()).map(str::to_string))
+}
+
+/// A worker shown in place stays on screen across the session polls: the
+/// session tab's hand-off (`Tab::watching`, written when it is left) is no
+/// order to go back to the thread while it stays on screen.
+#[gpui_kit::test]
+fn a_worker_in_place_outlives_the_session_poll(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    menu_on(cx, w, &view, Act::Open);
+    down(cx, w, "enter", false);
+    up(cx, w, "enter");
+    assert_eq!(in_place(cx, &view).as_deref(), Some("sa_1"), "scout in place");
+    for _ in 0..3 {
+        poll(cx, &view);
+        assert_eq!(in_place(cx, &view).as_deref(), Some("sa_1"), "a poll that changed nothing left scout on screen");
+    }
+}
+
+/// A session tab shows the worker it showed in place when it was left,
+/// once: Esc'd back to the thread, the next poll does not bring it back.
+#[gpui_kit::test]
+fn an_escaped_worker_stays_gone_across_the_poll(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    menu_on(cx, w, &view, Act::Open);
+    down(cx, w, "enter", false);
+    up(cx, w, "enter");
+    assert_eq!(in_place(cx, &view).as_deref(), Some("sa_1"), "scout in place");
+    // The session tab left for another worker's tab, then shown again.
+    let tab = view.update(cx, |v, cx| {
+        let tab = v.model.tabs.current().map(|t| t.id).expect("the session's tab");
+        let session = v.model.tabs.current().and_then(|t| t.session.clone()).expect("its session");
+        assert!(v.model.tabs.open_worker_as(&session, "sa_9", "ghost", None, &session));
+        v.reconcile(None);
+        cx.notify();
+        tab
+    });
+    cx.run_until_parked();
+    let watching =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.model.tabs.iter().find(|t| t.id == tab).and_then(|t| t.watching.clone()));
+    assert_eq!(watching(cx), Some(("sa_1".into(), "scout".into())), "left showing scout");
+    down(cx, w, "ctrl-w", false);
+    up(cx, w, "ctrl-w");
+    assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current().map(|t| t.id)), Some(tab), "the session's tab again");
+    assert_eq!(in_place(cx, &view).as_deref(), Some("sa_1"), "scout shown again, in place");
+    assert_eq!(watching(cx), None, "the hand-off taken");
+    poll(cx, &view);
+    assert_eq!(in_place(cx, &view).as_deref(), Some("sa_1"), "and kept across a poll");
+    // Esc: the thread, and it stays the thread.
+    down(cx, w, "escape", false);
+    up(cx, w, "escape");
+    assert_eq!(view.read_with(cx, |v, _| v.model.watch.focus().map(str::to_string)), None, "Esc: the session's thread");
+    for _ in 0..3 {
+        poll(cx, &view);
+        assert_eq!(view.read_with(cx, |v, _| v.model.watch.focus().map(str::to_string)), None, "scout did not come back");
+    }
+}
