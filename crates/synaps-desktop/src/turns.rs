@@ -526,17 +526,25 @@ pub(crate) struct Tally {
     pub n: usize,
     pub n_text: SharedString,
     pub hue: Hue,
-    /// The characters of its name and count (mono: its width, without layout).
-    pub chars: usize,
+    /// The characters of its name (mono: its width, without layout).
+    pub name_chars: usize,
+}
+
+/// A text box of `chars` mono characters (`cw` px each) as GPUI lays it
+/// out: its advances, rounded up to a whole pixel (`TextLayout` rounds
+/// every text element's width up, and nothing gives the pixel back).
+pub(crate) fn text_w(chars: usize, cw: f32) -> f32 {
+    (chars as f32 * cw).ceil()
 }
 
 /// How many of `tally`'s tools a folded run's summary names in `avail` px
-/// of mono text (`cw` px a character): each `name n` (a character's gap
-/// between), `gap` apart. All of them, or as many as fit with the `+N`
-/// that ends the row (N: the calls of the tools not named, so the counts
-/// shown add up to the summary's `n tools`); none if not even one does.
+/// of mono text (`cw` px a character): each `name n` (two text boxes, a
+/// character apart), `gap` apart. All of them, or as many as fit with the
+/// `+N` that ends the row (N: the calls of the tools not named, so the
+/// counts shown add up to the summary's `n tools`); none if not even one
+/// does.
 pub(crate) fn tally_fit(tally: &[Tally], avail: f32, cw: f32, gap: f32) -> usize {
-    let w = |t: &Tally| (t.chars + 1) as f32 * cw;
+    let w = |t: &Tally| text_w(t.name_chars, cw) + cw + text_w(t.n_text.len(), cw);
     let all = tally.iter().map(w).sum::<f32>() + gap * tally.len().saturating_sub(1) as f32;
     if all <= avail {
         return tally.len();
@@ -546,7 +554,7 @@ pub(crate) fn tally_fit(tally: &[Tally], avail: f32, cw: f32, gap: f32) -> usize
     for t in tally {
         rest -= t.n;
         let item = w(t) + if k > 0 { gap } else { 0. };
-        let tail = gap + (1 + digits(rest)) as f32 * cw;
+        let tail = gap + text_w(1 + digits(rest), cw);
         if used + item + tail > avail {
             break;
         }
@@ -624,14 +632,14 @@ impl RunSummary {
             }
             match tally.iter_mut().find(|t| t.name == row.name) {
                 Some(t) => t.n += 1,
-                None => tally.push(Tally { name: row.name.clone(), n: 1, n_text: SharedString::default(), hue: row.hue, chars: 0 }),
+                None => tally.push(Tally { name: row.name.clone(), n: 1, n_text: SharedString::default(), hue: row.hue, name_chars: 0 }),
             }
         }
         // Stable: equal counts keep their first-use order.
         tally.sort_by_key(|a| std::cmp::Reverse(a.n));
         for t in &mut tally {
             t.n_text = t.n.to_string().into();
-            t.chars = t.name.chars().count() + t.n_text.len();
+            t.name_chars = t.name.chars().count();
         }
         let tip = tally.iter().map(|t| format!("{} {}", t.name, t.n)).collect::<Vec<_>>().join("\n").into();
         let parts = [
@@ -666,22 +674,22 @@ impl RunSummary {
 
     /// Its trail's width at `meta` px (mono), as [`AppView::render_summary`]
     /// lays it out: counts · glyph, then (not `tight`) the words, `·`
-    /// between, every part 8 px apart.
+    /// between, every part 8 px apart, each text a whole pixel wide.
     pub(crate) fn trail_w(&self, meta: f32, tight: bool) -> f32 {
         let cw = 0.6 * meta;
-        let chars = |t: &SharedString| t.chars().count() as f32 * cw;
+        let chars = |t: &SharedString| text_w(t.chars().count(), cw);
         let (mut w, mut parts) = (self.worst.0.size(), 1);
         let counts = [&self.counts.written, &self.counts.added, &self.counts.removed];
         let shown = counts.iter().filter(|c| c.is_some()).count();
         if shown > 0 {
             // The counts (8 apart), and a `·`.
-            w += counts.iter().filter_map(|c| c.as_ref()).map(chars).sum::<f32>() + 8. * (shown - 1) as f32 + cw;
+            w += counts.iter().filter_map(|c| c.as_ref()).map(chars).sum::<f32>() + 8. * (shown - 1) as f32 + text_w(1, cw);
             parts += 2;
         }
         if !tight {
             for (i, (text, _)) in self.outcome.iter().enumerate() {
                 if i > 0 {
-                    w += cw;
+                    w += text_w(1, cw);
                     parts += 1;
                 }
                 w += chars(text);
@@ -703,6 +711,12 @@ impl Summaries {
 
     pub(crate) fn clear(&mut self) {
         self.0.clear();
+    }
+
+    /// Every run summarised: its id and summary.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, &RunSummary)> {
+        self.0.iter().map(|(&id, e)| (id, &*e.1))
     }
 
     /// The oldest items went (a worker's bound): their runs' summaries
@@ -898,31 +912,44 @@ impl AppView {
     fn render_summary(&self, d: Disp, open: bool, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
         let id = d.id;
         let Some(s) = self.summaries.get(id) else { return div().into_any_element() };
-        // The tally names what fits (mono: measured without layout), then
-        // `+N`; the whole of it in the tooltip.
+        // The tally names what fits (mono: measured without layout, every
+        // text box a whole pixel), then `+N`; the whole of it in the tooltip.
         let tight = self.layout.tight;
         let (cw, gap) = (m.mono * 0.6, (14. * m.r).round());
         let avail =
-            self.layout.column - 2. * m.pad_x - m.lead - 2. * m.run_gap - s.label.chars().count() as f32 * cw - s.trail_w(m.meta, tight);
-        // A pixel's slack for the shaper's rounding.
+            self.layout.column - 2. * m.pad_x - m.lead - 2. * m.run_gap - text_w(s.label.chars().count(), cw) - s.trail_w(m.meta, tight);
+        // A pixel's slack for the shaper's sums.
         let named = tally_fit(&s.tally, avail - 1., cw, gap);
-        let mut tally = h_flex().id(("tally", id)).flex_1().min_w_0().gap(px(gap)).overflow_hidden().whitespace_nowrap();
-        for t in &s.tally[..named] {
+        let mut tally = h_flex()
+            .id(("tally", id))
+            .debug_selector(|| format!("tally {id}"))
+            .flex_1()
+            .min_w_0()
+            .gap(px(gap))
+            .overflow_hidden()
+            .whitespace_nowrap();
+        for (i, t) in s.tally[..named].iter().enumerate() {
             tally = tally.child(
                 h_flex()
+                    .when(i + 1 == named, |d| d.debug_selector(|| format!("tally {id} last")))
                     .flex_none()
                     .gap(px(cw))
                     .child(div().text_color(t.hue.color(p)).child(t.name.clone()))
                     .child(div().text_color(p.dim_t).child(t.n_text.clone())),
             );
         }
-        if named < s.tally.len() {
-            if named > 0 {
-                let rest = s.tally[named..].iter().map(|t| t.n).sum();
-                tally = tally.child(div().flex_none().text_color(p.dim_t).child(plus(rest)));
-            }
+        // Cut short: the whole tally in a tooltip, on the tally, or on the
+        // row when not one name fits (the tally is an empty strip then).
+        let tip = (named < s.tally.len()).then(|| {
             let tip = s.tip.clone();
-            tally = tally.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx));
+            move |window: &mut Window, cx: &mut App| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+        });
+        let (tally_tip, row_tip) = if named > 0 { (tip, None) } else { (None, tip) };
+        if let Some(tip) = tally_tip {
+            let rest = s.tally[named..].iter().map(|t| t.n).sum();
+            tally = tally
+                .child(div().debug_selector(|| format!("tally {id} more")).flex_none().text_color(p.dim_t).child(plus(rest)))
+                .tooltip(tip);
         }
         let (worst, family) = s.worst;
         let dot = || div().text_color(p.dim_t).child("·");
@@ -971,6 +998,7 @@ impl AppView {
                     .child(trail),
             )
             .children(segments)
+            .when_some(row_tip, |d, tip| d.tooltip(tip))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_run(id);
                 cx.notify();
@@ -1285,7 +1313,7 @@ mod tests {
 
     use super::{
         Counts, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, Tally, TextRows,
-        Who, build, diff, digits, plus, tally_fit, text_lines, turn_start,
+        Who, build, diff, digits, plus, tally_fit, text_lines, text_w, turn_start,
     };
     use crate::files::{CallDelta, Ledger};
     use crate::subagents::Subagents;
@@ -1483,7 +1511,7 @@ mod tests {
         assert_eq!(outcome(&s), [("1 failed", Family::Err), ("4 ok", Family::Ok)], "worst first: by its glyph");
         assert_eq!(s.worst, (Glyph::Failed, Family::Err));
         assert_eq!(s.tip.as_ref(), "bash 3\nread 2");
-        assert_eq!(s.tally.iter().map(|t| t.chars).collect::<Vec<_>>(), [5, 5]);
+        assert_eq!(s.tally.iter().map(|t| t.name_chars).collect::<Vec<_>>(), [4, 4]);
         // The trail at 10 px (6 a character): ✕ 10, `1 failed` 48, `·` 6,
         // `4 ok` 24, 8 apart; tight, the glyph alone.
         assert_eq!(s.trail_w(10., false), 10. + 48. + 6. + 24. + 3. * 8.);
@@ -1500,7 +1528,7 @@ mod tests {
             n,
             n_text: n.to_string().into(),
             hue: Hue::of(name),
-            chars: name.len() + digits(n),
+            name_chars: name.len(),
         };
         let t = [tal("bash", 4), tal("read", 3), tal("grep", 2), tal("edit", 2), tal("find", 1), tal("ls", 1), tal("glob", 1)];
         // `name n` is (chars + 1)·6: 36 each, `ls 1` 24; 14 apart.
@@ -1520,6 +1548,14 @@ mod tests {
         assert_eq!((shown, rest, shown + rest), (13, 1, 14));
         assert_eq!((plus(1).as_ref(), plus(10).as_ref(), plus(30).as_ref()), ("+1", "+10", "+30"));
         assert_eq!((digits(0), digits(9), digits(10), digits(123)), (1, 1, 2, 3));
+        // At 7.2 px a character (mono at 12 px) every text box is a whole
+        // pixel wide, as GPUI lays it out: `bash` 28.8 → 29, `4` 7.2 → 8.
+        assert_eq!((text_w(4, 7.2), text_w(1, 7.2), text_w(5, 7.2), text_w(0, 7.2)), (29., 8., 36., 0.));
+        // `bash 4`, `read 3`: 2 · (29 + 7.2 + 8) + 14 = 102.4 (the advances
+        // alone, 2 · 43.2 + 14 = 100.4, would name both in 101 px).
+        let two = &t[..2];
+        assert_eq!(tally_fit(two, 102.5, 7.2, 14.), 2);
+        assert_eq!(tally_fit(two, 101., 7.2, 14.), 1, "both do not fit: `bash 4` and `+3`");
     }
 
     /// The `Ok` glyph alone only when every call finished normally; else

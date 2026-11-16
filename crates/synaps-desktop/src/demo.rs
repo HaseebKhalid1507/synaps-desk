@@ -17,7 +17,7 @@ const CWD: &str = "/home/you/work/relay-gateway";
 pub(crate) const SID: &str = "20261113-041207-a1f0";
 /// A parked session whose turns are over: runs that fold (one with a
 /// failed call, one all ok), an edit's diff in each.
-const IDLE_CPU: &str = "20261113-161706-a1b9";
+pub(crate) const IDLE_CPU: &str = "20261113-161706-a1b9";
 
 /// RFC 3339 (UTC) of `secs` after the epoch.
 pub(crate) fn rfc3339(secs: i64) -> String {

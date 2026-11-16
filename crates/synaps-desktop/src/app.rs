@@ -3121,12 +3121,18 @@ impl AppView {
         .filter(|&n| n != now) else {
             return;
         };
-        theme::update(cx, |c| c.text = next);
-        self.list.remeasure();
-        self.metrics_gen += 1;
+        self.show_text_size(next, cx);
         let mut p = self.panels;
         p.text_size = next;
         self.set_panels(p, cx);
+    }
+
+    /// The centre pane's text at step `next` (one of [`theme::TEXT_STEPS`]):
+    /// the metrics, and one re-measure of the list.
+    pub(crate) fn show_text_size(&mut self, next: u8, cx: &mut App) {
+        theme::update(cx, |c| c.text = next);
+        self.list.remeasure();
+        self.metrics_gen += 1;
     }
 
     pub(crate) fn apply_custom_accent(&mut self, cx: &mut Context<Self>) {

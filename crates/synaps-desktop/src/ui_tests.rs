@@ -288,3 +288,139 @@ fn an_escaped_worker_stays_gone_across_the_poll(cx: &mut TestAppContext) {
         assert_eq!(view.read_with(cx, |v, _| v.model.watch.focus().map(str::to_string)), None, "scout did not come back");
     }
 }
+
+/// The session's tab left showing scout in place, for a tab of another
+/// session (the synthetic transport answers its attach): `session`, and
+/// the tab left.
+fn leave_for_another_session(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> (String, u64) {
+    menu_on(cx, w, view, Act::Open);
+    down(cx, w, "enter", false);
+    up(cx, w, "enter");
+    assert_eq!(in_place(cx, view).as_deref(), Some("sa_1"), "scout in place");
+    let left = view.update(cx, |v, cx| {
+        v.client = None;
+        let tab = v.model.tabs.current().map(|t| t.id).expect("the session's tab");
+        let session = v.model.tabs.current().and_then(|t| t.session.clone()).expect("its session");
+        let other = crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false };
+        v.open_tab(other, crate::tabs::Place::New);
+        cx.notify();
+        (session, tab)
+    });
+    cx.run_until_parked();
+    assert_eq!(attached(cx, view).as_deref(), Some(crate::demo::IDLE_CPU), "the other session attached");
+    left
+}
+
+fn attached(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<String> {
+    view.read_with(cx, |v, _| v.model.active.as_ref().map(|a| a.session_id.clone()))
+}
+
+/// M1: a session tab whose cache missed (8 sessions or 64 MiB; a larger
+/// one always misses) shows the worker it showed in place when it was
+/// left, and keeps it once its attach lands: its transcript is new (no
+/// session yet), its view the tab's hand-off, for the session asked for.
+#[gpui_kit::test]
+fn a_worker_in_place_survives_a_tab_cache_miss(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    let (session, tab) = leave_for_another_session(cx, w, &view);
+    view.update(cx, |v, cx| {
+        assert!(v.tab_cache.take(&session).is_some(), "the session's tab was cached: now it is not");
+        let ix = v.model.tabs.iter().position(|t| t.id == tab).expect("its tab");
+        v.focus_tab(ix);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(attached(cx, &view), Some(session), "its attach landed");
+    assert_eq!(in_place(cx, &view).as_deref(), Some("sa_1"), "scout in place, after the attach too");
+}
+
+/// The same with the cache kept: the tab comes back as it was left.
+#[gpui_kit::test]
+fn a_worker_in_place_comes_back_with_its_cached_tab(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    let (session, tab) = leave_for_another_session(cx, w, &view);
+    view.update(cx, |v, cx| {
+        let ix = v.model.tabs.iter().position(|t| t.id == tab).expect("its tab");
+        v.focus_tab(ix);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(attached(cx, &view), Some(session), "its attach landed");
+    assert_eq!(in_place(cx, &view).as_deref(), Some("sa_1"), "scout in place");
+}
+
+/// L1: GPUI lays every text box out a whole pixel wide (its advances,
+/// rounded up), and a folded run's tally counts it that way. At every
+/// text step, over the column widths up to the cap (3 px apart), the
+/// last tool a tally names and its `+N` end inside it: nothing is clipped.
+/// The test window's text system advances every character 0.6 em, as
+/// Hybrid Mono advances every glyph it maps. Bounds are recorded in debug
+/// builds only (`debug_selector`).
+#[cfg(debug_assertions)]
+#[gpui_kit::test]
+fn a_tally_never_clips_what_it_names(cx: &mut TestAppContext) {
+    use gpui_kit::VisualTestContext;
+    let (w, view, _events) = open(cx);
+    // The demo's session whose turns end in folded runs (2, 4 and 17
+    // tools); both side panels folded: the pane is the window less them.
+    view.update(cx, |v, cx| {
+        v.client = None;
+        v.panels.rail_collapsed = true;
+        v.panels.right_collapsed = true;
+        let open = crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false };
+        v.open_tab(open, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let runs: Vec<(usize, [&'static str; 3])> = view
+        .read_with(cx, |v, _| {
+            v.summaries
+                .iter()
+                .map(|(id, s)| (s.tools, [format!("tally {id}"), format!("tally {id} last"), format!("tally {id} more")]))
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .map(|(n, [a, b, c])| (n, [leak(a), leak(b), leak(c)]))
+        .collect();
+    assert!(runs.iter().any(|r| r.0 == 17), "the 17-tool run is summarised: {:?}", runs.iter().map(|r| r.0).collect::<Vec<_>>());
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    let (mut drawn, mut cut, mut whole) = (0, 0, 0);
+    for step in crate::theme::TEXT_STEPS {
+        view.update(&mut vcx, |v, cx| {
+            v.show_text_size(step, cx);
+            cx.notify();
+        });
+        let cap = crate::theme::Metrics::at(step).column.floor();
+        for width in (420..2000).step_by(3) {
+            vcx.simulate_resize(size(px(width as f32), px(900.)));
+            vcx.run_until_parked();
+            let (seen, column) = view.read_with(&vcx, |v, _| (v.width, v.layout.column));
+            assert_eq!(seen, width as f32, "drawn at {width} px");
+            for (tools, [tally, last, more]) in &runs {
+                let Some(t) = vcx.debug_bounds(tally) else { continue };
+                drawn += 1;
+                for (part, b) in [("last name", vcx.debug_bounds(last)), ("+N", vcx.debug_bounds(more))] {
+                    if let Some(b) = b {
+                        assert!(
+                            b.right() <= t.right(),
+                            "step {step}, column {column}: the {tools}-tool tally's {part} ends at {:?}, past its edge {:?}",
+                            b.right(),
+                            t.right()
+                        );
+                    }
+                }
+                if vcx.debug_bounds(more).is_some() {
+                    cut += usize::from(*tools == 17);
+                } else if vcx.debug_bounds(last).is_some() {
+                    whole += 1;
+                }
+            }
+            if column >= cap {
+                break;
+            }
+        }
+    }
+    eprintln!("tallies drawn {drawn}: the 17-tool one cut {cut} times, a tally whole {whole} times");
+    assert!(cut > 0 && whole > 0, "the sweep cuts the 17-tool tally, and shows tallies whole: {cut}, {whole}");
+}
