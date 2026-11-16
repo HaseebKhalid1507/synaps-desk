@@ -37,6 +37,18 @@ jobs:
             libxcb1-dev libvulkan1 libzstd-dev libssl-dev libasound2-dev
       - name: Test synaps-client (fixtures, named-pipe derivation on Windows)
         run: cargo test -p synaps-client --locked
+      # The desktop's logic tests and its UI tests (GPUI's headless test
+      # window: no display, no GPU, no daemon). The counts are printed so
+      # the log shows they ran.
+      - name: Test synaps-desktop (logic + headless UI tests)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p synaps-desktop --locked 2>&1 | tee desktop-tests.log
+          passed=$(grep -E '^test result: ok' desktop-tests.log | awk '{s += $4} END {print s + 0}')
+          ui=$(grep -cE '^test ui_tests::.* \.\.\. ok' desktop-tests.log || true)
+          echo "synaps-desktop: $passed tests passed, $ui of them UI tests"
+          test "$passed" -gt 0 && test "$ui" -gt 0
       - name: Build release
         run: cargo build --release --locked -p synaps-desktop -p synaps-client
       - name: Binary size

@@ -532,7 +532,7 @@ mod tests {
                 }
                 for (a, sa) in segs.iter().enumerate() {
                     for sb in segs[a + 1..].iter().filter(|sb| n[sb.0] == n[a]) {
-                        assert!(sa.2 - sb.2 <= 1, "{n:?} in {h}: equal counts {segs:?}");
+                        assert!(sa.2.abs_diff(sb.2) <= 1, "{n:?} in {h}: equal counts {segs:?}");
                     }
                 }
             }

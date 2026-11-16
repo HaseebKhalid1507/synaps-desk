@@ -1433,6 +1433,9 @@ impl Model {
                 self.named.error = None;
                 // A new epoch even on a reconnect (see `Active::epoch`).
                 self.epoch += 1;
+                // The session this attach was asked for (`asked_for`,
+                // `showing`), before it becomes the one that attached.
+                let asked = self.wanted_session.take();
                 self.active = Some(Active {
                     session_id: attached.meta.id.clone(),
                     attach_seq,
@@ -1453,7 +1456,11 @@ impl Model {
                 self.last_error = None;
                 // Another session's worker views mean nothing here; the
                 // same session's (a reconnect, its tab back) watch again.
-                if self.transcript.session_id() != Some(attached.meta.id.as_str()) {
+                // So does the view of a tab whose cache missed: its
+                // transcript is new (no session yet), its view what the tab
+                // showed when it was left, for the session asked for. A
+                // follow to a new id (a resume's fallback) still resets.
+                if self.transcript.session_id().or(asked.as_deref()) != Some(attached.meta.id.as_str()) {
                     self.watch = Watch::default();
                 }
                 let held = self.held_views();
