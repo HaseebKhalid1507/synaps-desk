@@ -987,16 +987,15 @@ impl AppView {
                 .child(div().text_color(p.err).child(format!("Cancel {}?", who.name)))
                 .child(display("CONFIRM", 10., p.err))
         } else {
+            // A reveal button (design.md §5): drawn while its row is hovered.
             h_flex()
                 .id(("tray-x", who.id as usize))
+                .group("tray-x")
                 .flex_none()
                 .w(px(16.))
                 .justify_center()
                 .cursor_pointer()
-                .text_color(gpui_kit::transparent_black())
-                .group_hover("tray-row", |s| s.text_color(p.dim_t))
-                .hover(|s| s.text_color(p.err))
-                .child("×")
+                .child(crate::glyph::reveal(crate::glyph::Glyph::Close, "tray-row", "tray-x", p.dim_t, p.ink))
         };
         let tip = if armed { "click again to cancel it (it stops at its next step)" } else { "cancel this worker…" };
         let who = who.clone();

@@ -454,6 +454,7 @@ mod tests {
     use super::*;
     use crate::model::{ConnState, Effect, Model};
     use crate::rail::State;
+    use crate::subagents::Status;
 
     #[test]
     fn rfc3339_formats_and_round_trips() {
@@ -493,9 +494,9 @@ mod tests {
         let shell: Vec<(&str, &str)> = s.files.shell().iter().map(|f| (f.path.as_str(), f.verb)).collect();
         assert_eq!(shell, [("crates/relay/src/retry.rs", "rm"), ("crates/relay/src/lib.rs", "sed -i")]);
         assert_eq!(m.transcript.subagents().len(), 2);
-        let sub = |id: &str| s.subagents.view(id).map(|v| (v.word, v.facts.to_string()));
-        assert_eq!(sub("toolu_s1"), Some(("running", "claude-sonnet-4-5 · 6 tools · 41.0s".into())));
-        assert_eq!(sub("toolu_s2"), Some(("completed", "claude-sonnet-4-5 · 9 tools · 1m 23s".into())));
+        let sub = |id: &str| s.subagents.view(id).map(|v| (v.status, v.facts.to_string()));
+        assert_eq!(sub("toolu_s1"), Some((Some(Status::Running), "claude-sonnet-4-5 · 6 tools · 41.0s".into())));
+        assert_eq!(sub("toolu_s2"), Some((Some(Status::Done), "claude-sonnet-4-5 · 9 tools · 1m 23s".into())));
         assert_eq!(m.tabs.visible_session(), Some(SID), "the attach is the visible tab's");
     }
 

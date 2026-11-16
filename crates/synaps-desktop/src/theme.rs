@@ -318,9 +318,10 @@ roles! {
     res, dim_o, think_o, ok_o, err_o,
     // On the permission card.
     prose_k, dim_k, warn_k, err_k,
-    // Marks (3:1): the user's bar, bullets, state glyphs and borders, focus,
-    // the table rule, the two filled buttons.
-    you_mark, bullet, warn_mark, run_mark, focus, tb2, btn_fill, warn_fill,
+    // Marks (3:1): the user's bar (on the canvas and user, and on a run:
+    // the watched tray row), bullets, state glyphs and borders, focus, the
+    // table rule, the two filled buttons.
+    you_mark, you_mark_t, bullet, warn_mark, run_mark, focus, tb2, btn_fill, warn_fill,
     // The chrome, on `bg` and the raised row: text, then marks.
     prose_ch, dim_ch, header, warn_ch, run_ch, unread_ch, open_ch, ready_ch, err_ch, cost_ch, ok_ch, edit_ch, write_ch, bash_ch,
     sub_name, sub_status, sub_done, sub_time,
@@ -390,8 +391,10 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     let tool_out = t.tool_output_bg.unwrap_or_else(|| step(canvas, t.claude_text, 1.31));
     let card = step(chrome, ink, 1.32);
     let raised = step(chrome, ink, 1.14);
-    let add_bg = mix(tool_out, t.tool_result_ok, 0.16);
-    let del_bg = mix(tool_out, t.error_color, 0.18);
+    // Diff washes stand `SURFACE` off the result surface, as `user` and
+    // `code` do off the canvas: never louder than the card (design.md §1.6).
+    let add_bg = step(tool_out, t.tool_result_ok, SURFACE);
+    let del_bg = step(tool_out, t.error_color, SURFACE);
     let you = accent.unwrap_or(t.prompt_fg);
     let focus = accent.unwrap_or(t.border_active);
     let or = |raw: Option<u32>, d: u32| raw.unwrap_or(d);
@@ -417,6 +420,9 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
         del_bg,
         ..Roles::default()
     };
+    for (role, from, c) in [("add_bg", tool_out, add_bg), ("del_bg", tool_out, del_bg)] {
+        f.log.push(Check { role, from, color: c, grounds: vec![tool_out], floor: SURFACE });
+    }
     r.ink = f.text("ink", ink, &[canvas, user, tool_out, chrome, raised]);
     r.prose = f.text("prose", t.claude_text, &[canvas]);
     r.dim = f.text("dim", t.muted, &[canvas]);
@@ -474,6 +480,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.warn_k = f.text("warn_k", t.warning_color, &[card]);
     r.err_k = f.text("err_k", t.error_color, &[card]);
     r.you_mark = f.mark("you_mark", you, &[canvas, user]);
+    r.you_mark_t = f.mark("you_mark_t", you, &run_grounds);
     r.bullet = f.mark("bullet", t.list_bullet_color, &[canvas]);
     r.warn_mark = f.mark("warn_mark", t.warning_color, &[canvas, tool, card]);
     r.run_mark = f.mark("run_mark", t.status_streaming, &[canvas, tool, tool_out]);
@@ -557,14 +564,20 @@ pub struct Metrics {
     pub table: f32,
     pub table_line: f32,
     pub row: f32,
+    /// A compact list row (the tray's).
+    pub row_compact: f32,
     pub summary: f32,
     pub first_gap: f32,
     pub turn_gap: f32,
     pub part_gap: f32,
     pub pad_y: f32,
+    /// `inset`: the content inset of every surface in the column (design.md
+    /// §1.1), a run's rows and the tray's included.
     pub pad_x: f32,
-    /// A tool row's inner padding and gaps.
-    pub run_x: f32,
+    /// `lead`: a row's glyph column (12) and its gap (8); a row's name and
+    /// its open body start at `pad_x + lead`.
+    pub lead: f32,
+    /// The gap between a row's name, argument and trail.
     pub run_gap: f32,
     /// A label hangs this far left of the column.
     pub hang: f32,
@@ -595,13 +608,14 @@ impl Metrics {
             table: font(14.),
             table_line: px(22.),
             row: px(32.),
+            row_compact: px(24.),
             summary: px(36.),
             first_gap: px(20.),
             turn_gap: px(40.),
             part_gap: px(16.),
             pad_y: px(12.),
             pad_x: px(16.),
-            run_x: px(14.),
+            lead: px(20.),
             run_gap: px(12.),
             hang: px(20.),
             r,
@@ -1205,6 +1219,29 @@ mod tests {
         assert_eq!((r.ink, r.prose, r.you, r.agent), (0xeceff4, 0xd8dee9, 0x81a1c1, 0x88c0d0));
         assert_eq!((r.think, r.dim), (0x868e9e, 0x707889));
         assert_eq!((r.warn, r.run, r.cost), (0xebcb8b, 0xa3be8c, 0xa3be8c));
+        // design.md §1.6, as `roles_check.py` computes them.
+        assert_eq!((r.add_bg, r.del_bg, r.you_mark_t), (0x292e31, 0x332c2f, 0x81a1c1));
+    }
+
+    /// The diff washes stand 1.10:1 off the result surface and never louder
+    /// than the card by more than 0.15 (audit E2: they were up to 2.02:1 off
+    /// the canvas against the card's 1.24–1.48); text on them still reads.
+    #[test]
+    fn diff_washes_sit_at_card_level() {
+        let mut accents: Vec<Option<u32>> = vec![None];
+        accents.extend(PRESETS.iter().map(|p| Some(p.1)));
+        for (name, raw) in palettes::THEMES {
+            for &accent in &accents {
+                let (r, _) = resolve(&raw, accent);
+                for wash in [r.add_bg, r.del_bg] {
+                    let off = contrast(wash, r.canvas);
+                    assert!(contrast(wash, r.tool_out) >= SURFACE - 1e-9, "{name}");
+                    assert!((1.44..=1.47).contains(&((off * 100.).round() / 100.)), "{name}: {off:.3} off the canvas");
+                    assert!(contrast(r.ink, wash) >= 6.1, "{name}");
+                }
+                assert!(contrast(r.ok_o, r.add_bg) >= TEXT && contrast(r.err_o, r.del_bg) >= TEXT, "{name}");
+            }
+        }
     }
 
     /// Every role meets its floor in all 20 themes, without an accent and
@@ -1252,7 +1289,7 @@ mod tests {
     /// colour moves with it.
     #[test]
     fn the_accent_colours_you_and_focus_only() {
-        let allowed = ["you", "you_mark", "btn_fill", "focus", "focus_ch", "open_ch", "you_bar"];
+        let allowed = ["you", "you_mark", "you_mark_t", "btn_fill", "focus", "focus_ch", "open_ch", "you_bar"];
         for (name, raw) in palettes::THEMES {
             let (a, base) = resolve(&raw, None);
             for &(_, accent) in PRESETS {
@@ -1344,6 +1381,8 @@ mod tests {
     fn text_steps_scale_the_centre_pane() {
         let m = Metrics::at(16);
         assert_eq!((m.body, m.body_line, m.column, m.mono, m.row), (16., 26., 672., 13., 32.));
+        // The edges in a run: 16 and 36 (design.md §1.1); a tray row 24.
+        assert_eq!((m.pad_x, m.pad_x + m.lead, m.row_compact, m.summary), (16., 36., 24., 36.));
         assert_eq!(Metrics::at(18).column, 756., "the column grows with the text");
         assert_eq!(Metrics::at(99), m, "an unknown step is the default");
         for s in TEXT_STEPS {
