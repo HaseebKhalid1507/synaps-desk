@@ -187,12 +187,19 @@ struct Sent {
     at: Instant,
 }
 
-/// The worker whose cancel was pressed once, and when.
+/// The worker whose cancel was pressed once, and when: who it is, not
+/// only its handle (a cold-started daemon gives `sa_N` to another).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Arm {
     session: String,
-    handle: String,
+    who: Who,
     at: Instant,
+}
+
+impl Arm {
+    fn is(&self, session: &str, id: u64, key: (Option<&str>, &str), now: Instant) -> bool {
+        self.session == session && self.who.id == id && same_worker(self.who.key(), key) && now < self.at + CONFIRM
+    }
 }
 
 /// The two-step cancel and the cancels on their way. No GPUI.
@@ -205,29 +212,39 @@ pub(crate) struct Cancels {
 }
 
 impl Cancels {
-    /// Cancel pressed for worker `handle` of `session`, `how`: the first
+    /// Cancel pressed for worker `who` of `session`, `how`: the first
     /// press arms it for [`CONFIRM`]; a second one from [`SETTLE`] after
-    /// it fires. A double-click's second click and a held key's repeats
-    /// are not presses.
-    pub fn press(&mut self, session: &str, handle: &str, how: How, now: Instant) -> Press {
-        if !how.is_press() {
+    /// it fires. A held key's repeats are not presses; nor is a
+    /// multi-click's later click before [`SETTLE`] (a double-click). From
+    /// then on it is: a system whose double-click time is longer (macOS
+    /// and Windows let it be seconds) counts a deliberate second click
+    /// as one.
+    pub fn press(&mut self, session: &str, who: &Who, how: How, now: Instant) -> Press {
+        let multi = matches!(how, How::Click(n) if n > 1);
+        if !how.is_press() && !multi {
             return Press::Ignored;
         }
-        if let Some(a) = self.armed.as_ref().filter(|a| a.session == session && a.handle == handle && now < a.at + CONFIRM) {
+        if let Some(a) = self.armed.as_ref().filter(|a| a.is(session, who.id, who.key(), now)) {
             if now.saturating_duration_since(a.at) < SETTLE {
-                return Press::Early;
+                return if multi { Press::Ignored } else { Press::Early };
             }
             self.armed = None;
             self.generation += 1;
             return Press::Fire;
         }
-        self.armed = Some(Arm { session: session.to_string(), handle: handle.to_string(), at: now });
+        // A multi-click never arms: its first click did, or nothing.
+        if multi {
+            return Press::Ignored;
+        }
+        self.armed = Some(Arm { session: session.to_string(), who: who.clone(), at: now });
         self.generation += 1;
         Press::Armed
     }
 
-    pub fn armed(&self, session: &str, handle: &str, now: Instant) -> bool {
-        self.armed.as_ref().is_some_and(|a| a.session == session && a.handle == handle && now < a.at + CONFIRM)
+    /// Worker `id` (`key`: [`Who::key`]) of `session` is armed. Per frame
+    /// (the tray's rows): nothing allocated.
+    pub fn armed(&self, session: &str, id: u64, key: (Option<&str>, &str), now: Instant) -> bool {
+        self.armed.as_ref().is_some_and(|a| a.is(session, id, key, now))
     }
 
     /// When the armed press runs out.
@@ -480,6 +497,9 @@ enum Blocked {
     Unknown,
     /// The handle names another worker now.
     Other,
+    /// The same call, under another name now than the menu or the row
+    /// had (it was opened before the call's result named the worker).
+    Renamed,
     Ended(WState),
 }
 
@@ -489,6 +509,7 @@ impl Blocked {
             Blocked::Drive(why) => format!("{} not cancelled: {why}", who.handle()),
             Blocked::Unknown => format!("{} not cancelled: this window knows no worker by that handle", who.handle()),
             Blocked::Other => format!("{}: nothing sent", other_why(&who.handle(), &who.name)),
+            Blocked::Renamed => format!("{} not cancelled: {} goes by another name now; open its menu again", who.handle(), who.name),
             Blocked::Ended(s) => format!("{} is {}: nothing to cancel", who.name, s.word()),
         }
     }
@@ -621,9 +642,13 @@ impl AppView {
         }
         // The session is attached (`may_drive`): its workers are the model's.
         let Some(now) = self.model.stats.subagents.ident(who.id) else { return Some(Blocked::Unknown) };
-        // Its name too, whatever the call says.
-        if !same_worker(who.key(), now) || now.1 != who.name.as_ref() {
+        if !same_worker(who.key(), now) {
             return Some(Blocked::Other);
+        }
+        // Its name too, whatever the call says (N1: the menu's `other` goes
+        // by the call, so a renamed worker is said as one).
+        if now.1 != who.name.as_ref() {
+            return Some(Blocked::Renamed);
         }
         match self.worker_state(session, handle, Some(who.key())) {
             WState::Running | WState::Unknown => None,
@@ -730,7 +755,7 @@ impl AppView {
             state: if other { WState::Gone } else { self.worker_state(&t.session, &handle, Some(t.who.key())) },
             read_only: self.may_drive(&t.session).err(),
             other,
-            armed: self.model.cancels.armed(&t.session, &handle, now),
+            armed: self.model.cancels.armed(&t.session, t.who.id, t.who.key(), now),
             pending: self.model.cancels.pending(&t.session, &handle),
             result: info.as_ref().filter(|i| !i.result.is_empty()).map(|i| (i.whole, i.result.chars().count())),
             has_task: info.as_ref().is_some_and(|i| !i.task_full.is_empty()),
@@ -805,6 +830,14 @@ impl AppView {
         true
     }
 
+    /// The Enter an input just emitted (`PressEnter`) is a held repeat of
+    /// the key that picked a menu item: it does nothing. The input's Enter
+    /// binding ran before the root's key listener could stop it; the event
+    /// arrives after that listener ([`AppView::menu_picked`]).
+    pub(crate) fn enter_is_the_picks(&self) -> bool {
+        self.menu_picked
+    }
+
     /// An item picked, `how`.
     pub(crate) fn menu_pick(&mut self, act: Act, how: How, window: &mut Window, cx: &mut Context<Self>) {
         let Some((_, t)) = self.menu.clone() else { return };
@@ -870,7 +903,7 @@ impl AppView {
             }
             return;
         }
-        let pressed = self.model.cancels.press(session, &handle, how, now);
+        let pressed = self.model.cancels.press(session, who, how, now);
         log::debug!(target: "synaps_desktop::watch", "cancel press {handle}: {how:?} -> {pressed:?}");
         match pressed {
             Press::Fire => {
@@ -1113,6 +1146,16 @@ mod tests {
     }
 
     const CLICK: How = How::Click(1);
+    const W2: (Option<&str>, &str) = (Some("t_2"), "sleeper");
+    const W3: (Option<&str>, &str) = (Some("t_3"), "scout");
+
+    fn w2() -> Who {
+        Who::new(2, W2.1, W2.0.map(Into::into))
+    }
+
+    fn w3() -> Who {
+        Who::new(3, W3.1, W3.0.map(Into::into))
+    }
     const KEY: How = How::Key { press: true };
 
     #[test]
@@ -1120,28 +1163,48 @@ mod tests {
         let t0 = Instant::now();
         let ms = |n| t0 + Duration::from_millis(n);
         let mut c = Cancels::default();
-        assert_eq!(c.press("s", "sa_2", CLICK, t0), Press::Armed, "the first press arms");
-        assert!(c.armed("s", "sa_2", ms(100)));
-        assert!(!c.armed("s", "sa_3", t0) && !c.armed("t", "sa_2", t0), "only that worker of that session");
-        assert_eq!(c.press("s", "sa_2", CLICK, t0 + CONFIRM - Duration::from_millis(1)), Press::Fire, "the second within the window fires");
-        assert!(!c.armed("s", "sa_2", t0), "and disarms");
+        assert_eq!(c.press("s", &w2(), CLICK, t0), Press::Armed, "the first press arms");
+        assert!(c.armed("s", 2, W2, ms(100)));
+        assert!(!c.armed("s", 3, W3, t0) && !c.armed("t", 2, W2, t0), "only that worker of that session");
+        assert_eq!(c.press("s", &w2(), CLICK, t0 + CONFIRM - Duration::from_millis(1)), Press::Fire, "the second within the window fires");
+        assert!(!c.armed("s", 2, W2, t0), "and disarms");
         // Too late: the second press arms again instead.
-        assert_eq!(c.press("s", "sa_2", CLICK, t0), Press::Armed);
-        assert_eq!(c.press("s", "sa_2", CLICK, t0 + CONFIRM), Press::Armed, "out of time: armed again, not fired");
-        assert_eq!(c.press("s", "sa_2", KEY, t0 + CONFIRM + Duration::from_secs(1)), Press::Fire);
+        assert_eq!(c.press("s", &w2(), CLICK, t0), Press::Armed);
+        assert_eq!(c.press("s", &w2(), CLICK, t0 + CONFIRM), Press::Armed, "out of time: armed again, not fired");
+        assert_eq!(c.press("s", &w2(), KEY, t0 + CONFIRM + Duration::from_secs(1)), Press::Fire);
         // Another worker's press re-arms for that one.
-        assert_eq!(c.press("s", "sa_2", CLICK, t0), Press::Armed);
-        assert_eq!(c.press("s", "sa_3", CLICK, ms(10)), Press::Armed);
-        assert_eq!(c.press("s", "sa_2", CLICK, ms(20)), Press::Armed, "sa_2's arm went to sa_3");
+        assert_eq!(c.press("s", &w2(), CLICK, t0), Press::Armed);
+        assert_eq!(c.press("s", &w3(), CLICK, ms(10)), Press::Armed);
+        assert_eq!(c.press("s", &w2(), CLICK, ms(20)), Press::Armed, "sa_2's arm went to sa_3");
         // It runs out.
         assert_eq!(c.armed_until(), Some(ms(20) + CONFIRM));
         assert!(!c.expire(ms(30)));
         assert!(c.expire(ms(20) + CONFIRM));
         assert_eq!(c.armed_until(), None);
         // Anything else done disarms it.
-        assert_eq!(c.press("s", "sa_2", CLICK, t0), Press::Armed);
+        assert_eq!(c.press("s", &w2(), CLICK, t0), Press::Armed);
         assert!(c.disarm() && !c.disarm());
-        assert_eq!(c.press("s", "sa_2", CLICK, ms(500)), Press::Armed, "armed again, not fired");
+        assert_eq!(c.press("s", &w2(), CLICK, ms(500)), Press::Armed, "armed again, not fired");
+    }
+
+    /// R2-L2: an arm is the worker's, not its handle's. After a cold
+    /// restart, `builder` under `sleeper`'s sa_2 is not armed, and its
+    /// first press arms it; a call learned since the press is still the
+    /// same worker (by name).
+    #[test]
+    fn an_arm_is_the_workers_not_its_handles() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let builder = Who::new(2, "builder", Some("t_9".into()));
+        let mut c = Cancels::default();
+        assert_eq!(c.press("s", &w2(), CLICK, t0), Press::Armed);
+        assert!(!c.armed("s", 2, builder.key(), ms(10)), "not builder's row");
+        assert!(!c.armed("s", 2, (None, "builder"), ms(10)));
+        assert_eq!(c.press("s", &builder, CLICK, ms(500)), Press::Armed, "builder's first press");
+        assert!(!c.armed("s", 2, W2, ms(510)));
+        let unnamed = Who::new(2, "builder", None);
+        assert!(c.armed("s", 2, unnamed.key(), ms(520)));
+        assert_eq!(c.press("s", &unnamed, CLICK, ms(1000)), Press::Fire);
     }
 
     /// H1: a double-click, a held key or a second press right after the
@@ -1152,27 +1215,33 @@ mod tests {
         let ms = |n| t0 + Duration::from_millis(n);
         // Two presses 50 ms apart: armed, then too early (still armed).
         let mut c = Cancels::default();
-        assert_eq!(c.press("s", "sa_2", CLICK, t0), Press::Armed);
-        assert_eq!(c.press("s", "sa_2", CLICK, ms(50)), Press::Early);
-        assert!(c.armed("s", "sa_2", ms(60)), "still armed, from the first press");
-        assert_eq!(c.press("s", "sa_2", CLICK, ms(500)), Press::Fire);
-        // A double-click: its second click (click count 2) is no press, at
-        // any time; the third neither.
+        assert_eq!(c.press("s", &w2(), CLICK, t0), Press::Armed);
+        assert_eq!(c.press("s", &w2(), CLICK, ms(50)), Press::Early);
+        assert!(c.armed("s", 2, W2, ms(60)), "still armed, from the first press");
+        assert_eq!(c.press("s", &w2(), CLICK, ms(500)), Press::Fire);
+        // A double-click: its second click (click count 2) is no press
+        // before SETTLE; the third neither.
         let mut c = Cancels::default();
-        assert_eq!(c.press("s", "sa_2", How::Click(1), t0), Press::Armed);
-        assert_eq!(c.press("s", "sa_2", How::Click(2), ms(450)), Press::Ignored);
-        assert_eq!(c.press("s", "sa_2", How::Click(3), ms(600)), Press::Ignored);
-        assert!(c.armed("s", "sa_2", ms(700)));
+        assert_eq!(c.press("s", &w2(), How::Click(1), t0), Press::Armed);
+        assert_eq!(c.press("s", &w2(), How::Click(2), ms(80)), Press::Ignored);
+        assert_eq!(c.press("s", &w2(), How::Click(3), ms(390)), Press::Ignored);
+        assert!(c.armed("s", 2, W2, ms(700)));
+        // R2-L3: a long system double-click time (macOS, Windows) makes a
+        // deliberate second click a count of 2: from SETTLE on, it counts.
+        assert_eq!(c.press("s", &w2(), How::Click(2), ms(400)), Press::Fire);
+        // A multi-click never arms.
+        assert_eq!(c.press("s", &w2(), How::Click(2), ms(500)), Press::Ignored);
+        assert!(!c.armed("s", 2, W2, ms(510)));
         // A held Enter (or Space): the press arms, the repeats (from 250 ms
         // on every ~30 ms, for seconds) never fire.
         let mut c = Cancels::default();
-        assert_eq!(c.press("s", "sa_2", KEY, t0), Press::Armed);
+        assert_eq!(c.press("s", &w2(), KEY, t0), Press::Armed);
         for n in (250..2900).step_by(33) {
-            assert_eq!(c.press("s", "sa_2", How::Key { press: false }, ms(n)), Press::Ignored, "repeat at {n} ms");
+            assert_eq!(c.press("s", &w2(), How::Key { press: false }, ms(n)), Press::Ignored, "repeat at {n} ms");
         }
-        assert!(c.armed("s", "sa_2", ms(2900)));
+        assert!(c.armed("s", 2, W2, ms(2900)));
         // Let go and pressed again: that one confirms.
-        assert_eq!(c.press("s", "sa_2", KEY, ms(2950)), Press::Fire);
+        assert_eq!(c.press("s", &w2(), KEY, ms(2950)), Press::Fire);
         assert!(SETTLE >= Duration::from_millis(250) && SETTLE < CONFIRM);
     }
 

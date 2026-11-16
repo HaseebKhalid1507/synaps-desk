@@ -1271,10 +1271,20 @@ pub struct AppView {
     pub(crate) cancel_tick: Option<Task<()>>,
     /// An item was picked from the keyboard: that key's repeats, once the
     /// menu is gone, are not the next thing's ([`AppView::menu_keydown`]).
+    /// The root's capture listener stops them, but GPUI runs a focused
+    /// input's key bindings before any key listener: its Enter has already
+    /// emitted `PressEnter` by then. That event is a deferred effect, so it
+    /// reaches the subscriptions after the listener has set this flag for
+    /// a repeat (cleared it for a new press): each one checks it
+    /// ([`AppView::enter_is_the_picks`]).
     pub(crate) menu_picked: bool,
     /// A click opened a worker's tab: until then, a mouse-down that is the
     /// rest of its double-click goes nowhere ([`crate::wtabs::MULTI_CLICK`]).
     pub(crate) swallow_clicks: Option<Instant>,
+    /// What reached [`AppView::submit`], and whether a worker's view was
+    /// on screen (a steer): the UI tests' record of what would have gone.
+    #[cfg(test)]
+    pub(crate) submits: Vec<(String, bool)>,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -1325,11 +1335,14 @@ impl AppView {
         let settings_input = cx.new(|cx| InputState::new(window, cx));
         let mut subs = vec![
             cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { shift: false, .. } => {
+                InputEvent::PressEnter { shift: false, .. } if !this.enter_is_the_picks() => {
                     let text = input.read(cx).value().trim().to_string();
                     if !text.is_empty() && this.submit(text) {
                         input.update(cx, |s, cx| s.set_value("", window, cx));
                     }
+                }
+                InputEvent::PressEnter { shift: false, .. } => {
+                    log::debug!(target: "synaps_desktop::send", "enter: a held repeat of a menu pick's key, nothing sent");
                 }
                 // Typing: what a worker key or a refused steer said is old.
                 InputEvent::Change if this.watch_note.is_some() => {
@@ -1354,7 +1367,7 @@ impl AppView {
                         cx.notify();
                     }
                 }
-                InputEvent::PressEnter { secondary, .. } => {
+                InputEvent::PressEnter { secondary, .. } if !this.enter_is_the_picks() => {
                     let typed = input.read(cx).value().to_string();
                     this.find_enter(typed.trim(), if *secondary { Place::New } else { Place::Current });
                     cx.notify();
@@ -1369,7 +1382,9 @@ impl AppView {
                 _ => {}
             }),
             cx.subscribe_in(&name_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
-                if let InputEvent::PressEnter { .. } = ev {
+                if let InputEvent::PressEnter { .. } = ev
+                    && !this.enter_is_the_picks()
+                {
                     let typed = input.read(cx).value().to_string();
                     let req = this.model.rename_request(&typed);
                     this.rename(req);
@@ -1377,14 +1392,16 @@ impl AppView {
                 }
             }),
             cx.subscribe_in(&hex_input, window, |this: &mut Self, _input, ev: &InputEvent, _window, cx| {
-                if let InputEvent::PressEnter { .. } = ev {
+                if let InputEvent::PressEnter { .. } = ev
+                    && !this.enter_is_the_picks()
+                {
                     this.apply_custom_accent(cx);
                 }
             }),
             // Enter (or Ctrl/Cmd+Enter) submits what was typed, never
             // nothing; typing lights SUBMIT.
             cx.subscribe_in(&secret_input, window, |this: &mut Self, _input, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { .. } => this.answer_secret(true, window, cx),
+                InputEvent::PressEnter { .. } if !this.enter_is_the_picks() => this.answer_secret(true, window, cx),
                 InputEvent::Change => cx.notify(),
                 _ => {}
             }),
@@ -1395,7 +1412,7 @@ impl AppView {
                 }
             }),
             cx.subscribe_in(&settings_input, window, |this: &mut Self, _input, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { .. } => {
+                InputEvent::PressEnter { .. } if !this.enter_is_the_picks() => {
                     this.settings_commit(cx);
                     window.focus(&this.focus, cx);
                 }
@@ -1628,6 +1645,8 @@ impl AppView {
             cancel_tick: None,
             menu_picked: false,
             swallow_clicks: None,
+            #[cfg(test)]
+            submits: Vec::new(),
             _tasks: Vec::new(),
             _subs: subs,
         }
@@ -1649,11 +1668,17 @@ impl AppView {
                     }
                     this.model.view_dirty = false;
                     for ev in batch {
-                        // A worker's menu means nothing across a reconnect
-                        // (a restarted daemon numbers its workers anew).
-                        if matches!(ev, Event::Attached { .. } | Event::Reattaching { .. }) && this.menu.is_some() {
-                            this.close_menu();
-                            this.model.view_dirty = true;
+                        // A worker's menu, or a cancel armed from the tray,
+                        // means nothing across a reconnect (a restarted
+                        // daemon numbers its workers anew).
+                        if matches!(ev, Event::Attached { .. } | Event::Reattaching { .. }) {
+                            if this.menu.is_some() {
+                                this.close_menu();
+                                this.model.view_dirty = true;
+                            } else if this.model.cancels.disarm() {
+                                this.cancel_tick = None;
+                                this.model.view_dirty = true;
+                            }
                         }
                         for fx in this.model.apply(ev) {
                             this.effect(fx);
@@ -2430,6 +2455,8 @@ impl AppView {
 
     /// Send the composer's text. `false` keeps it in the composer.
     fn submit(&mut self, text: String) -> bool {
+        #[cfg(test)]
+        self.submits.push((text.clone(), self.model.watch.focus().is_some()));
         let Some(c) = &self.client else {
             self.model.last_error = Some("offline".into());
             return false;
@@ -2465,15 +2492,18 @@ impl AppView {
                 self.model.last_error = Some("the connection thread has stopped".into());
                 return false;
             }
+            log::debug!(target: "synaps_desktop::send", "steer {handle} ({} chars)", text.chars().count());
             self.model.watch.steer_sent(&handle, &text);
             self.watch_note = None;
             return true;
         }
-        let sent = if self.model.transcript.busy() { c.steer(text.clone()) } else { c.submit(text.clone()) };
+        let busy = self.model.transcript.busy();
+        let sent = if busy { c.steer(text.clone()) } else { c.submit(text.clone()) };
         if sent.is_err() {
             self.model.last_error = Some("the connection thread has stopped".into());
             return false;
         }
+        log::debug!(target: "synaps_desktop::send", "{} ({} chars)", if busy { "steer" } else { "submit" }, text.chars().count());
         self.model.sent(text);
         self.draft_note = None;
         self.watch_note = None;
@@ -3252,9 +3282,7 @@ impl AppView {
             }
             Some(_) => {}
         }
-        // Only while its tab is open and its view is the same one.
-        let (model, panes) = (&self.model, &mut self.worker_panes);
-        panes.retain(|((h, g), _)| model.holds_view(h) && model.watch.generation_of(h) == Some(*g));
+        self.drop_released_panes();
         match (&want, self.main_pane.take()) {
             (None, Some(main)) => {
                 let stale = main.metrics_gen != self.metrics_gen;
@@ -3284,6 +3312,13 @@ impl AppView {
             }
         }
         self.pane_of = want;
+    }
+
+    /// Worker tabs' lists stay only while their tab is open and their view
+    /// is the same one ([`crate::watch::Watch::hold`]).
+    pub(crate) fn drop_released_panes(&mut self) {
+        let (model, panes) = (&self.model, &mut self.worker_panes);
+        panes.retain(|((h, g), _)| model.holds_view(h) && model.watch.generation_of(h) == Some(*g));
     }
 
     /// The list's state, handed out; a fresh, empty list in its place.
@@ -4442,6 +4477,8 @@ impl Render for AppView {
                 this.chord_press = this.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
                 // A menu item picked from the keyboard: that key's repeats
                 // go nowhere (a held Enter on Steer… would send the draft).
+                // A focused input's Enter binding has run already: its
+                // `PressEnter` checks the flag ([`AppView::enter_is_the_picks`]).
                 if std::mem::take(&mut this.menu_picked) && matches!(ev.keystroke.key.as_str(), "enter" | "space") && !this.chord_press {
                     this.menu_picked = true;
                     cx.stop_propagation();

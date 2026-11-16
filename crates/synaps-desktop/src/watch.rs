@@ -72,6 +72,10 @@ pub const FINISHED_TTL: Duration = Duration::from_secs(900);
 /// at its top once a batch, not one a page).
 pub const WORKER_ITEMS: usize = 400;
 pub const WORKER_BYTES: usize = 2 << 20;
+/// Worker tabs' views kept while another thread is on screen, the most
+/// recently shown first ([`Watch::hold`]): another tab's is read again
+/// when it is shown (its journal is local, re-paging is cheap).
+pub const HELD_VIEWS: usize = 8;
 /// Scrolled back, a worker's transcript is trimmed only past this many
 /// times the bounds (the rows being read stay put).
 pub const SCROLLED_BACK: usize = 2;
@@ -179,6 +183,8 @@ pub struct Worker {
     /// Shown in a worker tab (not in place over the session's thread):
     /// what its hints say.
     pub tabbed: bool,
+    /// When it was last put on screen ([`Watch::shown`]'s count).
+    shown: u64,
 }
 
 impl Worker {
@@ -213,6 +219,7 @@ impl Worker {
             files_note: SharedString::default(),
             unsent: None,
             tabbed: false,
+            shown: 0,
         };
         w.strings();
         w
@@ -449,6 +456,8 @@ pub struct Watch {
     /// The handles the session's open worker tabs show ([`Watch::hold`]):
     /// their views stay while the tab does, finished or not.
     held: Vec<String>,
+    /// Views put on screen so far (each view's [`Worker::shown`]).
+    shown: u64,
 }
 
 impl Watch {
@@ -555,6 +564,8 @@ impl Watch {
         if self.unsupported && w.status.is_empty() {
             w.notice(UNSUPPORTED.into());
         }
+        self.shown += 1;
+        w.shown = self.shown;
         self.focus = Some(c.handle_id.clone());
         self.next_poll = (!self.unsupported).then_some(now);
         self.pending = None;
@@ -610,9 +621,18 @@ impl Watch {
 
     /// The session's open worker tabs show `handles`: their views stay
     /// (no page read twice, the scroll kept, a refused steer's text with
-    /// its tab) until the tab closes.
-    pub fn hold(&mut self, handles: Vec<String>) {
+    /// its tab) until the tab closes; the [`HELD_VIEWS`] most recently
+    /// shown, that is. The others' views go now, running or not (one with
+    /// a refused steer's text stays: the text is its tab's), and are read
+    /// again when shown.
+    pub fn hold(&mut self, mut handles: Vec<String>) {
+        handles.sort_by_key(|h| std::cmp::Reverse(self.workers.get(h).map_or(0, |w| w.shown)));
+        let released = handles.split_off(handles.len().min(HELD_VIEWS));
         self.held = handles;
+        if released.iter().any(|h| self.workers.contains_key(h)) {
+            let focus = self.focus.clone();
+            self.retain(|id, w| focus.as_deref() == Some(id) || w.unsent.is_some() || !released.iter().any(|h| h == id));
+        }
     }
 
     fn kept(&self, id: &str) -> bool {
@@ -1232,6 +1252,58 @@ mod tests {
         w.hold(Vec::new());
         w.prune(t0, std::slice::from_ref(&done));
         assert!(w.worker("sa_2").is_none());
+    }
+
+    /// R2-L1: the worker tabs keep the views of the [`HELD_VIEWS`] most
+    /// recently shown, running or not; the others go (read again when
+    /// shown), never the one on screen or one holding a refused steer's
+    /// text (its tab's). A closed tab's view is let go at the next hold:
+    /// as any view, it stays while its worker runs.
+    #[test]
+    fn worker_tabs_keep_the_most_recently_shown_views() {
+        let t0 = Instant::now();
+        let mut w = Watch::default();
+        let n = HELD_VIEWS as u64 + 3;
+        let kept = |w: &Watch| (1..=n).filter(|id| w.worker(&format!("sa_{id}")).is_some()).collect::<Vec<u64>>();
+        for id in 1..=n {
+            w.open_tab(&Candidate::of(id, "worker"), None, t0);
+            let _ = w.take_poll(t0);
+            let page = page(json!({"handle_id": format!("sa_{id}"), "subagent_id": id, "agent_name": "worker", "status": "running",
+                "steerable": true, "next_seq": 4, "more": false, "events": []}));
+            assert!(w.on_reply(&format!("sa_{id}"), 0, page, t0));
+            if id == 1 {
+                w.steer_sent("sa_1", "stop after the next step");
+            }
+        }
+        // sa_1's steer is refused: the text waits in its view.
+        assert!(w.steer_refused("subagent sa_1 is not running"));
+        let all: Vec<String> = (1..=n).map(|id| format!("sa_{id}")).collect();
+        w.hold(all.clone());
+        // sa_11 (on screen) to sa_4 shown last stay; sa_2 and sa_3 go though
+        // they run; sa_1 keeps its text.
+        assert_eq!(kept(&w), [1, 4, 5, 6, 7, 8, 9, 10, 11]);
+        // Shown again: read from the start; sa_4 is let go.
+        w.open_tab(&Candidate::of(2, "worker"), None, t0);
+        assert_eq!(w.worker("sa_2").map(|v| v.next_seq), Some(0));
+        w.hold(all);
+        assert_eq!(kept(&w), [1, 2, 5, 6, 7, 8, 9, 10, 11]);
+        // Only sa_1, sa_2 and sa_6's tabs stay open: the closed tabs' views
+        // are as any other view, kept while their worker runs; sa_5's has
+        // finished: it goes. sa_6's tab keeps its, finished.
+        w.focus_main();
+        w.hold(["sa_1", "sa_2", "sa_6"].map(String::from).to_vec());
+        let ended = |id| Live {
+            id,
+            call: None,
+            name: "worker".into(),
+            status: crate::subagents::Status::Done,
+            line: String::new(),
+            tools: None,
+            elapsed: None,
+            watchable: true,
+        };
+        w.prune(t0, &[ended(5), ended(6)]);
+        assert_eq!(kept(&w), [1, 2, 6, 7, 8, 9, 10, 11]);
     }
 
     /// H2: a worker tab's view is of one worker. A page that names another
