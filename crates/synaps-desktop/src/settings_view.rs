@@ -640,7 +640,8 @@ impl AppView {
         let top = self.settings.scroll.top_item().saturating_sub(1);
         let in_view = shown_groups.get(top.min(shown_groups.len().saturating_sub(1))).copied();
         let column = v_flex().id("settings-scroll").size_full().overflow_y_scroll().track_scroll(&self.settings.scroll).children(blocks);
-        let mut root = div().relative().size_full().bg(p.canvas).child(column);
+        let bar = crate::scrollbar::Bar::new(self.settings.scroll.clone(), &self.bars.settings);
+        let mut root = div().relative().size_full().bg(p.canvas).child(column).child(bar);
         if index {
             let mut list = v_flex().absolute().top(px(84.)).left(px(left - INDEX - 24.)).w(px(INDEX)).gap(px(2.));
             for (pos, &ix) in shown_groups.iter().enumerate() {
@@ -1026,19 +1027,24 @@ impl AppView {
         if settings::matches(find, "System prompt", "system_prompt", "system prompt") {
             let prompt = self.model.stats.view.as_ref().and_then(|v| v.system_prompt.clone());
             let well = match prompt {
-                Some(text) => div()
-                    .id("system-prompt")
-                    .mt(px(8.))
-                    .max_h(px(12. * 20.))
-                    .overflow_y_scroll()
-                    .p(px(10.))
-                    .bg(p.code)
-                    .font_family(crate::fonts::MONO)
-                    .text_size(px(12.5))
-                    .line_height(px(20.))
-                    .text_color(p.code_fg)
-                    .whitespace_normal()
-                    .child(SharedString::from(text))
+                Some(text) => v_flex()
+                    .child(
+                        div()
+                            .id("system-prompt")
+                            .mt(px(8.))
+                            .max_h(px(12. * 20.))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.bars.prompt.scroll)
+                            .p(px(10.))
+                            .bg(p.code)
+                            .font_family(crate::fonts::MONO)
+                            .text_size(px(12.5))
+                            .line_height(px(20.))
+                            .text_color(p.code_fg)
+                            .whitespace_normal()
+                            .child(SharedString::from(text)),
+                    )
+                    .child(self.bars.prompt.bar(crate::scrollbar::Ground::Canvas))
                     .into_any_element(),
                 None => mono("the daemon's default prompt", 12.5, p.dim).mt(px(4.)).into_any_element(),
             };

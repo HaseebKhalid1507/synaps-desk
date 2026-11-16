@@ -224,7 +224,8 @@ impl AppView {
             .overflow_y_scroll()
             .track_scroll(&self.usage.scroll)
             .child(h_flex().w_full().pl(px(left)).child(div().w(px(w)).flex_none().pb(px(64.)).child(body)));
-        v_flex().size_full().bg(p.canvas).child(header).child(scroll).into_any_element()
+        let bar = crate::scrollbar::Bar::new(self.usage.scroll.clone(), &self.bars.usage);
+        v_flex().size_full().bg(p.canvas).child(header).child(scroll).child(bar).into_any_element()
     }
 
     fn usage_header(&self, left: f32, w: f32, p: &Palette, cx: &ViewCx) -> impl IntoElement {

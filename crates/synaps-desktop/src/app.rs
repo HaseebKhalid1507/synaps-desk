@@ -4,7 +4,7 @@
 //! and its numbers on the right. Every colour is a Synaps TUI theme role
 //! ([`crate::theme`]); every number comes from the daemon ([`crate::stats`]).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1068,6 +1068,10 @@ pub struct AppView {
     /// The list's view grew while it was scrolled back: after this
     /// frame's layout it must not have started following the tail.
     hold_back: Rc<Cell<bool>>,
+    /// Long markdown rows drawn, for the list's measurements ([`turns::LateRows`]).
+    pub(crate) late: Rc<RefCell<turns::LateRows>>,
+    /// Every pane's scrollbar ([`crate::scrollbar`]).
+    pub(crate) bars: crate::scrollbar::Bars,
     pub(crate) composer: Entity<TextareaState>,
     /// The rows the composer's text grows to ([`crate::fit::composer_rows`]).
     composer_rows: usize,
@@ -1326,7 +1330,11 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder(COMPOSER_PLACEHOLDER));
+        let composer = cx.new(|cx| {
+            let mut s = TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder(COMPOSER_PLACEHOLDER);
+            s.set_scrollbar_renderer(Some(crate::scrollbar::editor()));
+            s
+        });
         let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("find · open by name"));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
@@ -1527,6 +1535,8 @@ impl AppView {
     fn blank(i: Inputs, client: Option<Client>, conn: ConnState, subs: Vec<Subscription>) -> Self {
         let list = ListState::new(0, ListAlignment::Top, px(600.));
         list.set_follow_mode(FollowMode::Tail);
+        let late = Rc::default();
+        turns::readiness(&list, &late);
         Self {
             client,
             model: Model::new(conn),
@@ -1544,6 +1554,8 @@ impl AppView {
             layout: Layout::of(800., 800., &Metrics::at(theme::DEFAULT_TEXT), Default::default()),
             scroll_carry: None,
             hold_back: Rc::new(Cell::new(false)),
+            late,
+            bars: Default::default(),
             composer: i.composer,
             composer_rows: crate::fit::COMPOSER_ROWS,
             top_words: None,
@@ -2118,6 +2130,7 @@ impl AppView {
         self.attach_due = None;
         let fresh = ListState::new(0, ListAlignment::Top, px(600.));
         fresh.set_follow_mode(FollowMode::Tail);
+        turns::readiness(&fresh, &self.late);
         // What a rise left owed is the old list's.
         self.scroll_carry = None;
         let cache = TabCache {
@@ -2641,6 +2654,35 @@ impl AppView {
     /// transcript's end would set the list following the tail (GPUI does
     /// at the end): `hold_back` stops it 2 px short instead, after the
     /// layout, still scrolled back.
+    /// Rows the list has no height for (a load, a switch, a new width: not
+    /// drawn yet) count 0 px to GPUI, so the thumb would fill most of the
+    /// track and shrink as history is read. They get a hint, the mean height
+    /// their text comes to ([`turns::mean_height`]; GPUI hints all alike);
+    /// each row's height replaces it once drawn. The last row must have its height: rows
+    /// streaming in below a scrolled-back view keep 0 px until drawn (a
+    /// guess there could put the end where it is not, and a drag to it
+    /// would follow). Once hinted every row has a height, and this is a few
+    /// lookups a frame.
+    fn hint_rows(&self, pad: f32, m: &Metrics) {
+        let (l, n) = (&self.list, self.disp.len());
+        if n == 0
+            || l.item_count() != n
+            || l.max_offset_for_scrollbar().y <= px(0.)
+            || l.is_scrolled_to_end().is_some()
+            || l.bounds_for_item(n - 1).is_none()
+        {
+            return;
+        }
+        // The rows not drawn are above the view (rows below it are drawn
+        // or keep 0 px): their mean, not the drawn tail's.
+        let top = l.logical_scroll_top().item_ix.min(n);
+        let above = if top > 0 { &self.disp[..top] } else { &self.disp[..] };
+        let h = turns::mean_height(above, &self.rows, m, turns::cpl(l, pad, m));
+        if h > 0. {
+            let _ = l.clone().with_uniform_item_height(px(h));
+        }
+    }
+
     fn keep_rows(&mut self, shift: f32, grew: bool) {
         // Between short and cramped the bars stay: what is owed stays owed.
         let carry = if shift != 0. { self.scroll_carry.take() } else { None };
@@ -3325,6 +3367,7 @@ impl AppView {
     fn take_pane(&mut self) -> Pane {
         let fresh = ListState::new(0, ListAlignment::Top, px(600.));
         fresh.set_follow_mode(FollowMode::Tail);
+        turns::readiness(&fresh, &self.late);
         Pane {
             rows: std::mem::take(&mut self.rows),
             disp: std::mem::take(&mut self.disp),
@@ -4011,7 +4054,7 @@ impl AppView {
                         .when((!lay.tight && !cramped) || (cramped && secret), |d| d.child(mono(kind, m.meta, p.dim_k).flex_none())),
                 )
                 .children(lead_row)
-                .when(has_well, |d| d.child(well))
+                .when(has_well, |d| d.child(well).children(card.map(|c| crate::scrollbar::Bar::new(c.scroll.clone(), &self.bars.card))))
                 .child(
                     h_flex()
                         .id("prompt-actions")
@@ -4411,12 +4454,17 @@ impl Render for AppView {
             self.arm_attach(cx);
         }
         let (pad_l, pad_r) = lay.padding();
+        let (pad_t, pad_b) = ((8. * m.r).round(), (28. * m.r).round());
         let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_disp(ix, cx)))
             .size_full()
             .pl(px(pad_l))
             .pr(px(pad_r))
-            .pt(px((8. * m.r).round()))
-            .pb(px((28. * m.r).round()));
+            .pt(px(pad_t))
+            .pb(px(pad_b));
+        self.late.borrow_mut().frame(&self.list, pad_l + pad_r, &m);
+        self.hint_rows(pad_l + pad_r, &m);
+        // Over the list's right padding, after its layout (and the hold-back's).
+        let transcript_bar = crate::scrollbar::rows(&self.list, pad_t + pad_b, &self.bars.transcript).always();
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
         // the end of a scrolled-back list set it following; it stops 2 px
         // short of the end instead, still scrolled back. Built only on the
@@ -4454,7 +4502,7 @@ impl Render for AppView {
                 .child(self.render_header(self.header_meta(), &p, cx))
                 .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
                 .children(self.render_crumb(&p, cx))
-                .child(div().flex_1().min_h_0().child(list).children(hold_back))
+                .child(div().flex_1().min_h_0().child(list).children(hold_back).child(transcript_bar))
                 .when(card_shown, |d| d.children(self.render_prompt(&p, &m, self.card_keys_live(window, cx), cx)))
                 .children(self.render_notice(&p, &m))
                 .children(self.render_tray(&p, &m, cx))
@@ -4651,7 +4699,9 @@ impl Render for AppView {
                         })
                         .child(main)
                         .when(view.is_none(), |d| match right {
-                            Side::Open(w) => d.child(self.render_right(w, &p, cx)),
+                            Side::Open(w) => {
+                                d.child(self.render_right(w, &p, cx)).child(self.bars.right.bar(crate::scrollbar::Ground::Chrome))
+                            }
                             Side::Strip => d.child(self.render_right_strip(&p, cx)),
                         }),
                 ),
@@ -4660,6 +4710,7 @@ impl Render for AppView {
             .children(view.is_none().then(|| self.render_edge(false, right, &p, cx)).flatten())
             .when(self.picker_open, |d| {
                 d.child(deferred(self.render_picker(&p, if view.is_some() { Side::Open(0.) } else { right }, cx)).with_priority(1))
+                    .child(deferred(self.bars.picker.bar(crate::scrollbar::Ground::Chrome)).with_priority(1))
             })
             .when(self.gear_menu, |d| d.child(deferred(self.render_gear_menu(rail == Side::Strip, &p, cx)).with_priority(2)))
             .children(self.render_menu_at_point(&p, cx))
