@@ -143,7 +143,11 @@ impl RailCache {
         let rail = rail::build(m, view, now);
         let keys: Vec<u64> = rail.items.iter().map(|i| rail::item_key(&rail, i)).collect();
         if let Some((range, count)) = rail::splice(&self.keys, &keys) {
+            let start = range.start;
             list.splice(range, count);
+            // The rail measures every row, so its bar reaches its end; GPUI
+            // measures new ones up front only once told they need it.
+            list.remeasure_items(start..start + count);
         }
         *self = RailCache { generation: Some(m.rail_gen), minute: now / 60, view: view.clone(), states, rail, keys };
     }
