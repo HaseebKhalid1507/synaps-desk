@@ -70,6 +70,44 @@ pub enum Status {
     TimedOut,
 }
 
+/// A worker's life as every surface shows it (design.md §4.3): its status
+/// and whether this window is attached to its session. Read by the
+/// transcript's worker block and the tray ([`crate::glyph::worker`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum Liveness {
+    /// Its start is all that is known.
+    Started,
+    Running,
+    Cancelling,
+    Done,
+    Failed,
+    Cancelled,
+    TimedOut,
+    /// Running when this window last looked (not attached now).
+    LastSeen,
+    /// Its session has no word of it any more.
+    Gone,
+}
+
+impl Liveness {
+    /// `None`: nothing but its handle is known yet (started). Not
+    /// attached, a worker that was running is as last seen; how one ended
+    /// stays so.
+    pub fn of(status: Option<Status>, attached: bool) -> Self {
+        match status {
+            None | Some(Status::Started) => Liveness::Started,
+            Some(Status::Running | Status::Cancelling) if !attached => Liveness::LastSeen,
+            Some(Status::Running) => Liveness::Running,
+            Some(Status::Cancelling) => Liveness::Cancelling,
+            Some(Status::Done) => Liveness::Done,
+            Some(Status::Failed) => Liveness::Failed,
+            Some(Status::Cancelled) => Liveness::Cancelled,
+            Some(Status::TimedOut) => Liveness::TimedOut,
+        }
+    }
+}
+
 impl Status {
     pub fn terminal(self) -> bool {
         matches!(self, Status::Done | Status::Failed | Status::Cancelled | Status::TimedOut)
@@ -247,16 +285,6 @@ impl Worker {
     }
 }
 
-/// How a block's state word is coloured.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tone {
-    Run,
-    Ok,
-    Err,
-    Warn,
-    Dim,
-}
-
 /// A worker as its block shows it, formatted once per change.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
@@ -267,9 +295,8 @@ pub struct View {
     /// (who it is: [`Subagents::ident`]).
     pub call: Option<SharedString>,
     pub watchable: bool,
+    /// How it is going: its glyph and word are [`Liveness`]'s.
     pub status: Option<Status>,
-    pub tone: Tone,
-    pub word: &'static str,
     pub name: SharedString,
     /// `sonnet-5-5 · 6 tools · 41.0s`, what is known of it.
     pub facts: SharedString,
@@ -284,15 +311,6 @@ impl View {
         if w.id.is_none() && w.status.is_none() {
             return None;
         }
-        let (tone, word) = match w.status {
-            None | Some(Status::Started) => (Tone::Dim, "started"),
-            Some(Status::Running) => (Tone::Run, "running"),
-            Some(Status::Cancelling) => (Tone::Warn, "cancelling"),
-            Some(Status::Done) => (Tone::Ok, "completed"),
-            Some(Status::Failed) => (Tone::Err, "failed"),
-            Some(Status::Cancelled) => (Tone::Warn, "cancelled"),
-            Some(Status::TimedOut) => (Tone::Warn, "timed out"),
-        };
         let mut facts: Vec<String> = Vec::new();
         let model = if w.model.is_empty() { &c.model } else { &w.model };
         if !model.is_empty() {
@@ -319,8 +337,6 @@ impl View {
             call: c.named.then(|| c.tool_id.clone()),
             watchable: c.kind != Kind::Oneshot,
             status: w.status,
-            tone,
-            word,
             name: name.into(),
             facts: facts.join(" · ").into(),
             line,
@@ -1330,7 +1346,8 @@ mod tests {
     use serde_json::{Value, json};
     use synaps_client::protocol::decode_event;
 
-    use super::{CARD_LINES, Status, Subagents, Tone, completion_note, fmt_secs};
+    use super::{CARD_LINES, Liveness, Status, Subagents, View, completion_note, fmt_secs};
+    use crate::glyph::{self, Family};
 
     fn ev(s: &mut Subagents, v: Value) {
         s.on_session(&decode_event(&v).unwrap());
@@ -1392,12 +1409,17 @@ mod tests {
     fn answer(id: &str, text: &str) -> Value {
         json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": text}]})
     }
+    /// Its block's state word and family (attached).
+    fn state(v: &View) -> (&'static str, Family) {
+        let (_, _, word, family) = glyph::worker(Liveness::of(v.status, true));
+        (word, family)
+    }
     /// `(state word, name, facts, line)` under call `id`.
     fn shown(s: &Subagents, id: &str) -> Option<(&'static str, String, String, Option<String>)> {
-        s.view(id).map(|v| (v.word, v.name.to_string(), v.facts.to_string(), v.line.as_ref().map(|l| l.0.to_string())))
+        s.view(id).map(|v| (state(v).0, v.name.to_string(), v.facts.to_string(), v.line.as_ref().map(|l| l.0.to_string())))
     }
     fn word(s: &Subagents, id: &str) -> Option<&'static str> {
-        s.view(id).map(|v| v.word)
+        s.view(id).map(|v| state(v).0)
     }
 
     /// What the hover card and the menu read: the task's first lines (the
@@ -1547,7 +1569,7 @@ mod tests {
         assert_eq!(shown(&s, "t1").unwrap().2, "claude-sonnet-5-5 · 3 tools · 43.2s");
         rows(&mut s, json!([row(8, "reviewer", json!({"failed": "provider overloaded"}), 70.0, Some(10.0), "", 5)]));
         let v = s.view("t2").unwrap();
-        assert_eq!((v.word, v.tone, v.facts.as_ref()), ("failed", Tone::Err, "claude-sonnet-5-5 · 5 tools · 1m 00s"));
+        assert_eq!((state(v), v.facts.as_ref()), (("failed", Family::Err), "claude-sonnet-5-5 · 5 tools · 1m 00s"));
         assert_eq!(v.line, Some(("reason: provider overloaded".into(), true)));
     }
 
@@ -1570,7 +1592,7 @@ mod tests {
         assert_eq!(word(&s, "a"), Some("cancelling"));
         assert!(s.running("a"));
         rows(&mut s, json!([row(1, "gif-recorder", json!("cancelled"), 6.0, Some(0.0), "", 0)]));
-        assert_eq!((word(&s, "a"), s.view("a").unwrap().tone), (Some("cancelled"), Tone::Warn));
+        assert_eq!(s.view("a").map(state), Some(("cancelled", Family::Warn)));
         // A `subagent_start` worker's end that is not a success: `ERROR: <failure_reason>`.
         done(&mut s, 2, "ERROR: worker timed out", 600.0);
         assert_eq!(shown(&s, "b").map(|v| (v.0, v.2, v.3)), Some(("timed out", "10m 00s".into(), None)));
@@ -1594,7 +1616,7 @@ mod tests {
         done(&mut s, 5, "half way", 1.0);
         let line = |s: &Subagents, id: &str| shown(s, id).map(|v| (v.0, v.3));
         assert_eq!(line(&s, "a"), Some(("timed out", None)));
-        assert_eq!((line(&s, "b"), s.view("b").unwrap().tone), (Some(("cancelled", None)), Tone::Warn));
+        assert_eq!((line(&s, "b"), s.view("b").map(state).map(|w| w.1)), (Some(("cancelled", None)), Some(Family::Warn)));
         assert_eq!(line(&s, "c"), Some(("completed", Some("ERRORS: none".into()))));
         assert_eq!(line(&s, "d"), Some(("failed", Some("reason: provider overloaded [overloaded]".into()))));
         // The completion event says d timed out: corrected, and final.
