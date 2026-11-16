@@ -10,6 +10,15 @@
 //! one is on screen the session tab focused last stays current
 //! ([`Tabs::current`]): still attached, its draft kept, and shown again as
 //! it was when its tab is.
+//!
+//! A worker tab ([`Kind::Worker`]) shows one worker (`sa_N`) of a session:
+//! it attaches that session, as its session tab would, and its view pages
+//! the worker's journal. One tab per worker; it opens right after its
+//! session's tab (after the worker tabs already there), follows the session
+//! to a new id with it, outlives its session tab, and is never saved (a
+//! handle does not survive a park or a daemon restart). The rail lists
+//! sessions only. A session tab keeps the worker its view showed in place
+//! ([`Tab::watching`]) while another tab is on screen.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -34,24 +43,62 @@ pub enum Place {
     New,
 }
 
-/// What a tab holds: a session, or one of the two views (no session:
-/// nothing attached, cached, saved or listed for it).
+/// What a tab holds: a session, one of its workers, or one of the two
+/// views (no session: nothing attached, cached, saved or listed for it).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
     #[default]
     Session,
     Settings,
     Usage,
+    /// A worker of `session` ([`Tab::worker`]).
+    Worker,
 }
 
 impl Kind {
     /// What a view's tab says.
     pub fn label(self) -> &'static str {
         match self {
-            Kind::Session => "",
+            Kind::Session | Kind::Worker => "",
             Kind::Settings => "Settings",
             Kind::Usage => "Usage",
         }
+    }
+
+    /// It attaches its session: a session tab, or a worker tab (its
+    /// worker's session). The views attach nothing.
+    pub fn attaches(self) -> bool {
+        matches!(self, Kind::Session | Kind::Worker)
+    }
+}
+
+/// A worker tab's worker: its handle (`sa_N`), its name, and the key its
+/// composer draft is kept under (`session#sa_N`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerRef {
+    pub handle: String,
+    pub name: String,
+    /// The tool id of the call that started it, if that call's own result
+    /// had named it when the tab opened: with the name, who it is (a
+    /// cold-started daemon numbers its workers from 1 again).
+    pub call: Option<String>,
+    key: String,
+}
+
+impl WorkerRef {
+    pub fn new(session: &str, handle: &str, name: &str) -> Self {
+        WorkerRef { handle: handle.to_string(), name: name.to_string(), call: None, key: format!("{session}#{handle}") }
+    }
+
+    /// Who it is: its call (if known) and name, as
+    /// [`crate::wtabs::same_worker`] compares them.
+    pub fn who(&self) -> (Option<&str>, &str) {
+        (self.call.as_deref(), &self.name)
+    }
+
+    /// Its number (`sa_7` → 7).
+    pub fn id(&self) -> Option<u64> {
+        self.handle.strip_prefix("sa_")?.parse().ok()
     }
 }
 
@@ -70,12 +117,47 @@ pub struct Tab {
     /// resumes from them.
     pub journal: Option<String>,
     pub cwd: Option<String>,
+    /// A worker tab's worker.
+    pub worker: Option<WorkerRef>,
+    /// A session tab left while its view showed a worker in place: that
+    /// worker's handle and name, shown again when the tab is.
+    pub watching: Option<(String, String)>,
 }
 
 impl Tab {
+    fn new(id: u64, kind: Kind, session: Option<String>, label: String) -> Self {
+        Tab { id, kind, session, label, journal: None, cwd: None, worker: None, watching: None }
+    }
+
     /// A session tab whose create or resume has not attached yet.
     pub fn pending(&self) -> bool {
         self.kind == Kind::Session && self.session.is_none()
+    }
+
+    /// What its composer draft is kept under: its session, or a worker
+    /// tab's `session#sa_N`.
+    pub fn draft_key(&self) -> Option<&str> {
+        match &self.worker {
+            Some(w) => Some(&w.key),
+            None => self.session.as_deref(),
+        }
+    }
+
+    /// The tab holds this worker of this session.
+    pub fn is_worker(&self, session: &str, handle: &str) -> bool {
+        self.session.as_deref() == Some(session) && self.worker.as_ref().is_some_and(|w| w.handle == handle)
+    }
+
+    /// Its session is now `to` (a worker tab's draft key with it): the
+    /// draft keys that changed.
+    fn set_session(&mut self, to: &str) -> Option<(String, String)> {
+        let moved = self.worker.as_mut().map(|w| {
+            let from = std::mem::take(&mut w.key);
+            *w = WorkerRef { call: w.call.take(), ..WorkerRef::new(to, &w.handle, &w.name) };
+            (from, w.key.clone())
+        });
+        self.session = Some(to.to_string());
+        moved.filter(|(a, b)| a != b)
     }
 }
 
@@ -133,9 +215,23 @@ pub struct Tabs {
     /// The session tab shown last (the current one while a view is on
     /// screen).
     last_session: Option<u64>,
+    /// Worker tabs' draft keys that changed with their session (a follow,
+    /// a merge): (from, to), for [`Drafts::rekey`].
+    rekeys: Vec<(String, String)>,
 }
 
 impl Tabs {
+    /// The worker tabs' draft keys changed since the last call ([`Tabs::rekeys`]).
+    pub fn take_rekeys(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.rekeys)
+    }
+
+    fn set_session(&mut self, ix: usize, to: &str) {
+        if let Some(k) = self.tabs[ix].set_session(to) {
+            self.rekeys.push(k);
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Tab> {
         self.tabs.iter()
     }
@@ -164,7 +260,12 @@ impl Tabs {
 
     /// The view on screen, if one is.
     pub fn view(&self) -> Option<Kind> {
-        self.visible().map(|t| t.kind).filter(|k| *k != Kind::Session)
+        self.visible().map(|t| t.kind).filter(|k| !k.attaches())
+    }
+
+    /// The current tab is a worker tab: its worker.
+    pub fn current_worker(&self) -> Option<&WorkerRef> {
+        self.current().filter(|t| t.kind == Kind::Worker)?.worker.as_ref()
     }
 
     /// The session tab the attachment follows: the visible tab, or while a
@@ -175,7 +276,7 @@ impl Tabs {
 
     fn current_index(&self) -> Option<usize> {
         let a = self.active?;
-        if self.tabs[a].kind == Kind::Session {
+        if self.tabs[a].kind.attaches() {
             return Some(a);
         }
         let id = self.last_session?;
@@ -190,7 +291,7 @@ impl Tabs {
     /// The tab the composer types for (its id and session): the current
     /// session tab, so a view on screen never takes the composer's text.
     pub fn composer_tab(&self) -> Option<(u64, Option<&str>)> {
-        self.current().map(|t| (t.id, t.session.as_deref()))
+        self.current().map(|t| (t.id, t.draft_key()))
     }
 
     /// Open the view `kind` (focused if it is open already) at the end of
@@ -202,23 +303,47 @@ impl Tabs {
         }
         self.next_id += 1;
         let id = self.next_id;
-        self.tabs.push(Tab { id, kind, session: None, label: kind.label().to_string(), journal: None, cwd: None });
+        self.tabs.push(Tab::new(id, kind, None, kind.label().to_string()));
         self.show(id);
         true
     }
 
-    /// The tab holding `session`.
+    /// The session tab holding `session`.
     pub fn find(&self, session: &str) -> Option<usize> {
-        self.tabs.iter().position(|t| t.session.as_deref() == Some(session))
+        self.tabs.iter().position(|t| t.kind == Kind::Session && t.session.as_deref() == Some(session))
+    }
+
+    /// The worker tab holding worker `handle` of `session`.
+    pub fn find_worker(&self, session: &str, handle: &str) -> Option<usize> {
+        self.tabs.iter().position(|t| t.kind == Kind::Worker && t.is_worker(session, handle))
     }
 
     pub fn is_open(&self, session: &str) -> bool {
         self.find(session).is_some()
     }
 
-    /// A tab open or on the reopen stack holds `session`.
-    pub fn knows(&self, session: &str) -> bool {
-        self.is_open(session) || self.closed.iter().any(|(_, t)| t.session.as_deref() == Some(session))
+    /// A tab attaches `session`: its session tab or a worker tab (what
+    /// the tab cache keeps).
+    pub fn holds(&self, session: &str) -> bool {
+        self.tabs.iter().any(|t| t.kind.attaches() && t.session.as_deref() == Some(session))
+    }
+
+    /// A tab open or on the reopen stack has `key`: a session tab's
+    /// session, or a worker tab's draft key.
+    pub fn knows(&self, key: &str) -> bool {
+        let has = |t: &Tab| match t.kind {
+            Kind::Worker => t.draft_key() == Some(key),
+            _ => t.session.as_deref() == Some(key),
+        };
+        self.tabs.iter().any(has) || self.closed.iter().any(|(_, t)| has(t))
+    }
+
+    /// Session tab `id`'s view shows `worker` (handle, name) in place, or
+    /// its session's thread: kept for when it is shown again.
+    pub fn set_watching(&mut self, id: u64, worker: Option<(String, String)>) {
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id && t.kind == Kind::Session) {
+            t.watching = worker;
+        }
     }
 
     /// The id a tab followed `session` to (along a chain, S → S2 → S3),
@@ -244,13 +369,49 @@ impl Tabs {
         self.merged.take()
     }
 
-    /// Tab `ix` follows its session to `to` (same conversation, new id).
+    /// Tab `ix` follows its session to `to` (same conversation, new id),
+    /// and so do the session's worker tabs, and (from a worker tab) its
+    /// session tab, unless another session tab holds `to` already.
     fn follow(&mut self, ix: usize, to: &str) {
-        if let Some(from) = self.tabs[ix].session.replace(to.to_string()) {
-            if self.follows.len() == CLOSED_MAX {
-                self.follows.remove(0);
+        let free = self.find(to).is_none();
+        let from = self.tabs[ix].session.clone();
+        self.set_session(ix, to);
+        // A pending tab named (a create, a resume): nothing else follows.
+        let Some(from) = from else { return };
+        if free && let Some(s) = self.find(&from) {
+            self.set_session(s, to);
+        }
+        self.repoint_workers(&from, to);
+        if self.follows.len() == CLOSED_MAX {
+            self.follows.remove(0);
+        }
+        self.follows.push((from, to.to_string()));
+    }
+
+    /// `from`'s worker tabs go to `to` with its tab (a follow, a merge);
+    /// one whose worker has a tab under `to` already goes into that one.
+    fn repoint_workers(&mut self, from: &str, to: &str) {
+        let ids: Vec<u64> =
+            self.tabs.iter().filter(|t| t.kind == Kind::Worker && t.session.as_deref() == Some(from)).map(|t| t.id).collect();
+        for id in ids {
+            let Some(ix) = self.tabs.iter().position(|t| t.id == id) else { continue };
+            let handle = self.tabs[ix].worker.as_ref().map(|w| w.handle.clone()).unwrap_or_default();
+            match self.find_worker(to, &handle) {
+                Some(j) => {
+                    let (shown, keep) = (self.active == Some(ix), self.tabs[j].id);
+                    if self.last_session == Some(id) {
+                        self.last_session = Some(keep);
+                    }
+                    if let (Some(a), Some(b)) = (self.tabs[ix].draft_key(), self.tabs[j].draft_key()) {
+                        self.rekeys.push((a.to_string(), b.to_string()));
+                    }
+                    self.remove(ix);
+                    if shown {
+                        self.active = self.tabs.iter().position(|t| t.id == keep);
+                    }
+                }
+                None => self.set_session(ix, to),
             }
-            self.follows.push((from, to.to_string()));
         }
     }
 
@@ -267,7 +428,7 @@ impl Tabs {
     /// else its left. A view on screen gives way to the session tab behind
     /// it (spec section 1: back as it was), if that is still open.
     fn remove(&mut self, ix: usize) -> Tab {
-        let behind = (self.active == Some(ix) && self.tabs[ix].kind != Kind::Session).then_some(self.last_session).flatten();
+        let behind = (self.active == Some(ix) && !self.tabs[ix].kind.attaches()).then_some(self.last_session).flatten();
         let t = self.tabs.remove(ix);
         let back = behind.and_then(|id| self.tabs.iter().position(|t| t.id == id));
         self.active = match self.active {
@@ -276,7 +437,7 @@ impl Tabs {
             Some(a) if a > ix => Some(a - 1),
             a => a,
         };
-        if let Some(v) = self.visible().filter(|v| v.kind == Kind::Session) {
+        if let Some(v) = self.visible().filter(|v| v.kind.attaches()) {
             self.last_session = Some(v.id);
         }
         t
@@ -305,6 +466,7 @@ impl Tabs {
         t.label = label.to_string();
         t.journal = None;
         t.cwd = None;
+        t.watching = None;
         self.changed();
     }
 
@@ -335,7 +497,7 @@ impl Tabs {
 
     fn tab(&mut self, session: Option<String>, label: String) -> Tab {
         self.next_id += 1;
-        Tab { id: self.next_id, kind: Kind::Session, label, session, journal: None, cwd: None }
+        Tab::new(self.next_id, Kind::Session, session, label)
     }
 
     /// Make the tab `id` visible. Leaving the current session tab for
@@ -343,7 +505,7 @@ impl Tabs {
     /// or a resume) leaves it for good: nothing would come back to it. A
     /// view in between does not: the session tab stays current.
     fn show(&mut self, id: u64) {
-        let session = self.tabs.iter().find(|t| t.id == id).is_some_and(|t| t.kind == Kind::Session);
+        let session = self.tabs.iter().find(|t| t.id == id).is_some_and(|t| t.kind.attaches());
         if session && let Some(i) = self.current_index().filter(|&i| self.tabs[i].pending() && self.tabs[i].id != id) {
             self.tabs.remove(i);
         }
@@ -400,6 +562,56 @@ impl Tabs {
         self.settle_restore();
     }
 
+    /// Open worker `handle` (called `name`) of `session` (listed as
+    /// `label`) in its own tab, focused if it has one, else a new one right
+    /// after the session's tab and the worker tabs after it (after the
+    /// visible tab if the session has none). `false`: it was the visible
+    /// tab already.
+    #[cfg(test)]
+    pub fn open_worker(&mut self, session: &str, handle: &str, name: &str, label: &str) -> bool {
+        self.open_worker_as(session, handle, name, None, label)
+    }
+
+    /// [`Tabs::open_worker`], its worker's call known (`call`). A tab that
+    /// holds an earlier worker under the handle (a cold-started daemon
+    /// reuses `sa_N`) is this one's now.
+    pub fn open_worker_as(&mut self, session: &str, handle: &str, name: &str, call: Option<&str>, label: &str) -> bool {
+        if let Some(j) = self.find_worker(session, handle) {
+            let w = self.tabs[j].worker.as_mut().expect("a worker tab");
+            if !crate::wtabs::same_worker(w.who(), (call, name)) {
+                *w = WorkerRef { call: call.map(str::to_string), ..WorkerRef::new(session, handle, name) };
+                self.changed();
+                self.focus(j);
+                return true;
+            }
+            if w.call.is_none() && call.is_some() {
+                w.call = call.map(str::to_string);
+            }
+            return self.focus(j);
+        }
+        let at = match self.find(session) {
+            Some(s) => {
+                let mut at = s + 1;
+                while self.tabs.get(at).is_some_and(|t| t.kind == Kind::Worker && t.session.as_deref() == Some(session)) {
+                    at += 1;
+                }
+                at
+            }
+            None => self.active.map_or(self.tabs.len(), |a| a + 1),
+        };
+        self.next_id += 1;
+        let mut t = Tab::new(self.next_id, Kind::Worker, Some(session.to_string()), label.to_string());
+        t.worker = Some(WorkerRef { call: call.map(str::to_string), ..WorkerRef::new(session, handle, name) });
+        let id = t.id;
+        self.tabs.insert(at, t);
+        if let Some(a) = self.active.as_mut().filter(|a| **a >= at) {
+            *a += 1;
+        }
+        self.show(id);
+        self.settle_restore();
+        true
+    }
+
     /// A tab for a session the daemon has not named yet (a create, a
     /// resume), called `label` until it does.
     pub fn open_pending(&mut self, label: &str, place: Place) {
@@ -433,7 +645,12 @@ impl Tabs {
     /// again since is focused instead).
     pub fn reopen(&mut self) -> bool {
         let Some((ix, t)) = self.closed.pop() else { return false };
-        if let Some(j) = t.session.as_deref().and_then(|s| self.find(s)) {
+        let open = match (&t.worker, t.session.as_deref()) {
+            (Some(w), Some(s)) => self.find_worker(s, &w.handle),
+            (None, Some(s)) => self.find(s),
+            _ => None,
+        };
+        if let Some(j) = open {
             self.focus(j);
             return true;
         }
@@ -484,16 +701,42 @@ impl Tabs {
     pub fn attached(&mut self, session: &str) {
         match self.current_index() {
             Some(i) if self.tabs[i].session.as_deref() == Some(session) => {}
+            // A worker tab's session went to a new id: its tab and the
+            // session's other tabs follow it (no tab ever merges into a
+            // worker tab, or a worker tab into a session tab).
+            Some(i) if self.tabs[i].kind == Kind::Worker => {
+                let handle = self.tabs[i].worker.as_ref().map(|w| w.handle.clone()).unwrap_or_default();
+                if let Some(j) = self.find_worker(session, &handle) {
+                    // That worker has its tab under the new id already: that one.
+                    self.merged = Some((self.tabs[i].id, self.tabs[j].id));
+                    let keep = self.tabs[j].id;
+                    let shown = if self.active == Some(i) { Some(keep) } else { self.visible().map(|t| t.id) };
+                    let from = self.tabs[i].session.clone();
+                    self.tabs.remove(i);
+                    self.active = shown.and_then(|id| self.tabs.iter().position(|t| t.id == id));
+                    self.last_session = Some(keep);
+                    if let Some(from) = from {
+                        self.repoint_workers(&from, session);
+                    }
+                } else {
+                    self.follow(i, session);
+                }
+                self.changed();
+            }
             Some(i) => {
                 if let Some(j) = self.find(session) {
                     self.merged = Some((self.tabs[i].id, self.tabs[j].id));
                     let shown = self.visible().map(|t| t.id);
                     let keep = self.tabs[j].id;
-                    self.tabs.remove(i);
+                    let from = self.tabs.remove(i).session;
                     // A view on screen stays; else the tab holding it is shown.
                     let vis = if self.active == Some(i) { Some(keep) } else { shown };
                     self.active = vis.and_then(|id| self.tabs.iter().position(|t| t.id == id));
                     self.last_session = Some(keep);
+                    // Its worker tabs go along (after: they may merge too).
+                    if let Some(from) = from {
+                        self.repoint_workers(&from, session);
+                    }
                 } else {
                     self.follow(i, session);
                 }
@@ -508,7 +751,7 @@ impl Tabs {
                     None => {
                         let t = self.tab(Some(session.to_string()), session.to_string());
                         let id = t.id;
-                        let at = self.tabs.iter().position(|t| t.kind != Kind::Session).unwrap_or(self.tabs.len());
+                        let at = self.tabs.iter().position(|t| !t.kind.attaches()).unwrap_or(self.tabs.len());
                         self.tabs.insert(at, t);
                         self.active = self.active.map(|a| if a >= at { a + 1 } else { a });
                         id
@@ -551,9 +794,13 @@ impl Tabs {
         let mut journals = Vec::with_capacity(self.tabs.len());
         let mut labels = Vec::with_capacity(self.tabs.len());
         let mut active = None;
-        let current = self.current_index();
+        // A worker tab current: its session's tab is the one shown next time.
+        let current = self.current_index().and_then(|i| match self.tabs[i].kind {
+            Kind::Worker => self.find(self.tabs[i].session.as_deref()?),
+            _ => Some(i),
+        });
         for (i, t) in self.tabs.iter().enumerate() {
-            if let Some(s) = &t.session {
+            if let Some(s) = t.session.as_ref().filter(|_| t.kind == Kind::Session) {
                 if current == Some(i) {
                     active = Some(sessions.len());
                 }
@@ -613,6 +860,9 @@ impl Tabs {
             if !same {
                 if self.is_open(&sid) {
                     // Another tab holds it already: one tab per session.
+                    if let Some(from) = self.tabs[ix].session.clone() {
+                        self.repoint_workers(&from, &sid);
+                    }
                     self.remove(ix);
                 } else {
                     self.follow(ix, &sid);
@@ -762,6 +1012,21 @@ impl Drafts {
         d.note = Some(note);
     }
 
+    /// A worker tab's draft key changed with its session ([`Tabs::take_rekeys`]):
+    /// its draft goes with it (after one already there).
+    pub fn rekey(&mut self, from: &str, to: &str) {
+        let Some(d) = self.map.remove(from) else { return };
+        match self.map.remove(to) {
+            Some(had) if !had.text.trim().is_empty() => {
+                let cursor = had.text.len() + 1 + d.cursor;
+                self.map.insert(to.to_string(), Draft { text: format!("{}\n{}", had.text, d.text), cursor, note: had.note.or(d.note) });
+            }
+            _ => {
+                self.map.insert(to.to_string(), d);
+            }
+        }
+    }
+
     /// Drafts of sessions no tab (open, or on the reopen stack) holds go.
     pub fn retain(&mut self, keep: &impl Fn(&str) -> bool) {
         self.map.retain(|s, _| keep(s));
@@ -853,6 +1118,14 @@ impl<K: Clone + Eq + Hash, V> Lru<K, V> {
         self.map.contains_key(k)
     }
 
+    /// `k`'s entry, left where it is.
+    pub fn peek<Q: ?Sized + Hash + Eq>(&self, k: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        self.map.get(k).map(|(v, _)| v)
+    }
+
     /// Take `k` out (it is on screen now).
     pub fn take(&mut self, k: &K) -> Option<V> {
         let (v, n) = self.map.remove(k)?;
@@ -891,13 +1164,20 @@ mod tests {
         t.visible().map(|t| t.session.as_deref().unwrap_or("…"))
     }
 
-    /// No two tabs ever hold one session, whatever the operations.
+    /// No two session tabs ever hold one session, nor two worker tabs one
+    /// worker, whatever the operations.
     fn unique(t: &Tabs) {
-        let open: Vec<&str> = t.iter().filter_map(|t| t.session.as_deref()).collect();
+        let open: Vec<&str> = t.iter().filter(|t| t.kind == Kind::Session).filter_map(|t| t.session.as_deref()).collect();
         let mut dedup = open.clone();
         dedup.sort_unstable();
         dedup.dedup();
         assert_eq!(dedup.len(), open.len(), "two tabs for one session: {open:?}");
+        let workers: Vec<&str> = t.iter().filter_map(|t| t.draft_key().filter(|_| t.kind == Kind::Worker)).collect();
+        let mut dedup = workers.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(dedup.len(), workers.len(), "two tabs for one worker: {workers:?}");
+        assert!(t.iter().all(|x| x.kind != Kind::Worker || (x.session.is_some() && x.worker.is_some())));
         assert_eq!(t.active.is_some(), !t.is_empty(), "a visible tab iff there are tabs");
         assert!(t.active.is_none_or(|a| a < t.len()));
         assert!(t.iter().all(|x| !x.pending() || t.current().is_some_and(|c| c.id == x.id)), "a pending tab in the background");
@@ -1068,6 +1348,193 @@ mod tests {
         assert_eq!((ids(&t), vis(&t)), (vec!["b", "c", "d", "a"], Some("b")));
         assert!(!t.move_tab(1, 1) && !t.move_tab(0, 9));
         unique(&t);
+    }
+
+    /// What the strip shows: a session tab its session, a worker tab
+    /// `session/sa_N`.
+    fn strip(t: &Tabs) -> Vec<String> {
+        t.iter()
+            .map(|t| match (&t.worker, t.session.as_deref()) {
+                (Some(w), Some(s)) => format!("{s}/{}", w.handle),
+                (_, s) => s.unwrap_or("…").to_string(),
+            })
+            .collect()
+    }
+
+    fn shown(t: &Tabs) -> Option<String> {
+        let ix = t.active()?;
+        strip(t).get(ix).cloned()
+    }
+
+    #[test]
+    fn a_worker_tab_opens_after_its_session_and_is_focused_if_open() {
+        let mut t = Tabs::default();
+        for s in ["a", "b", "c"] {
+            t.open(s, s, Place::New);
+        }
+        t.focus(1);
+        assert!(t.open_worker("b", "sa_2", "sleeper", "b"));
+        assert_eq!((strip(&t), shown(&t).as_deref()), (vec!["a".into(), "b".into(), "b/sa_2".into(), "c".into()], Some("b/sa_2")));
+        // It attaches its session: it is the current tab, its draft its own.
+        assert_eq!(t.current_session(), Some("b"));
+        assert_eq!(t.composer_tab().map(|c| c.1), Some(Some("b#sa_2")));
+        assert_eq!(t.view(), None, "not a view");
+        assert_eq!(t.current_worker().map(|w| (w.handle.as_str(), w.name.as_str(), w.id())), Some(("sa_2", "sleeper", Some(2))));
+        // The next one of the same session after it; from the session's tab.
+        t.focus(1);
+        assert!(t.open_worker("b", "sa_3", "scout", "b"));
+        assert_eq!(strip(&t)[1..4], ["b".to_string(), "b/sa_2".into(), "b/sa_3".into()]);
+        // Open already: focused, not a second tab; the visible one: nothing.
+        let g = t.generation;
+        assert!(t.open_worker("b", "sa_2", "sleeper", "b"));
+        assert_eq!((t.len(), shown(&t).as_deref()), (5, Some("b/sa_2")));
+        assert!(!t.open_worker("b", "sa_2", "sleeper", "b"));
+        assert!(t.generation > g);
+        // The rail's session lookups see session tabs only.
+        assert_eq!((t.find("b"), t.is_open("b"), t.holds("b")), (Some(1), true, true));
+        assert_eq!(t.find_worker("b", "sa_3"), Some(3));
+        // A session with no tab: after the visible one.
+        t.focus(0);
+        t.open_worker("z", "sa_1", "w", "z");
+        assert_eq!(strip(&t)[..2], ["a".to_string(), "z/sa_1".into()]);
+        assert!(!t.is_open("z") && t.holds("z"));
+        unique(&t);
+    }
+
+    #[test]
+    fn a_worker_tab_closes_reopens_and_outlives_its_session_tab() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::New);
+        t.open("b", "b", Place::New);
+        t.open_worker("a", "sa_1", "sleeper", "a");
+        assert_eq!(strip(&t), ["a", "a/sa_1", "b"]);
+        // Closing the session's tab leaves its worker's tab, still able to
+        // attach it (the cache keeps the session for it).
+        t.close(0);
+        assert_eq!((strip(&t), shown(&t).as_deref()), (vec!["a/sa_1".to_string(), "b".into()], Some("a/sa_1")));
+        assert_eq!((t.current_session(), t.holds("a"), t.is_open("a")), (Some("a"), true, false));
+        // Its breadcrumb (or a rail click) opens the session again: a tab
+        // of its own, never the worker's.
+        t.open("a", "a", Place::Current);
+        assert_eq!((strip(&t), shown(&t).as_deref()), (vec!["a/sa_1".to_string(), "a".into(), "b".into()], Some("a")));
+        // Closed: never the worker (a detach of nothing); Ctrl+Shift+T brings it back.
+        t.close(0);
+        assert_eq!(strip(&t), ["a", "b"]);
+        assert!(t.knows("a#sa_1"), "its draft is kept while it can come back");
+        assert!(t.reopen());
+        assert_eq!((strip(&t), shown(&t).as_deref()), (vec!["a/sa_1".to_string(), "a".into(), "b".into()], Some("a/sa_1")));
+        // Reopened while open again: focused, not doubled.
+        t.close(0);
+        t.focus(0);
+        t.open_worker("a", "sa_1", "sleeper", "a");
+        t.focus(0);
+        assert!(t.reopen());
+        assert_eq!((t.len(), shown(&t).as_deref()), (3, Some("a/sa_1")));
+        unique(&t);
+    }
+
+    #[test]
+    fn worker_tabs_follow_their_session_and_are_never_saved() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::New);
+        t.open_worker("a", "sa_1", "sleeper", "a");
+        t.open("b", "b", Place::New);
+        // A view on screen: the worker tab behind it stays current.
+        t.focus(1);
+        t.open_view(Kind::Settings);
+        assert_eq!((t.current_session(), t.current_worker().map(|w| w.handle.as_str())), (Some("a"), Some("sa_1")));
+        t.focus(1);
+        // Its session comes back under a new id (a fallback resume, a
+        // daemon restart): the worker tab, the session's tab and its draft key follow.
+        t.attached("a2");
+        assert_eq!(strip(&t), ["a2", "a2/sa_1", "b", "…"]);
+        assert_eq!(t.composer_tab().map(|c| c.1), Some(Some("a2#sa_1")));
+        assert_eq!(t.followed("a"), Some("a2"));
+        // From the session's tab too.
+        t.focus(0);
+        t.attached("a3");
+        assert_eq!(strip(&t)[..2], ["a3".to_string(), "a3/sa_1".into()]);
+        // A session tab merging into one that holds the new id takes its
+        // worker tabs along.
+        t.focus(2);
+        t.open_worker("b", "sa_4", "w", "b");
+        t.focus(2);
+        t.attached("a3");
+        assert_eq!(strip(&t), ["a3", "a3/sa_1", "a3/sa_4", "…"]);
+        unique(&t);
+        // Saved: session tabs only; a worker tab current saves its session's.
+        t.focus(1);
+        let s = t.saved();
+        assert_eq!((s.sessions, s.active), (vec!["a3".to_string()], Some(0)));
+        // A worker tab whose session has no tab: nothing is active.
+        t.close(0);
+        assert_eq!(t.saved(), Saved::default());
+        assert!(Tabs::restore(&t.saved()).is_empty(), "not restored on launch");
+    }
+
+    /// L9: a background worker tab whose session follows a new id keeps
+    /// its draft (its key changes with it); one that merges into the tab
+    /// already holding its worker under the new id brings its text along.
+    #[test]
+    fn a_background_worker_tabs_draft_follows_its_session() {
+        let mut t = Tabs::default();
+        let mut d = Drafts::default();
+        t.open("a", "a", Place::New);
+        t.open_worker("a", "sa_1", "sleeper", "a");
+        t.open_worker("a", "sa_2", "scout", "a");
+        d.give_back("a#sa_2".into(), "to scout".into(), "n");
+        // sa_1's tab is shown; sa_2's is in the background with a draft.
+        t.focus(1);
+        t.attached("a2");
+        assert_eq!(strip(&t), ["a2", "a2/sa_1", "a2/sa_2"]);
+        for (from, to) in t.take_rekeys() {
+            d.rekey(&from, &to);
+        }
+        assert!(t.take_rekeys().is_empty(), "once");
+        d.retain(&|k| t.knows(k));
+        assert_eq!(d.switch(None, Some((9, Some("a2#sa_2"))), "", 0, None, |_| true).map(|d| d.text).as_deref(), Some("to scout"));
+        // Into a tab that holds the worker already: the text goes along, after its own.
+        let mut d = Drafts::default();
+        d.give_back("b#sa_4".into(), "mine".into(), "n");
+        d.give_back("a2#sa_4".into(), "theirs".into(), "n");
+        d.rekey("b#sa_4", "a2#sa_4");
+        assert_eq!(d.switch(None, Some((9, Some("a2#sa_4"))), "", 0, None, |_| true).map(|d| d.text).as_deref(), Some("theirs\nmine"));
+    }
+
+    /// H2: a tab that holds an earlier worker under a handle (a
+    /// cold-started daemon reuses `sa_N`) is the new one's once that one
+    /// opens: never two tabs for one handle, and the new worker's call
+    /// says who it is.
+    #[test]
+    fn a_reused_handle_takes_its_tab_over() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::New);
+        assert!(t.open_worker_as("a", "sa_2", "scout", Some("t_old"), "a"));
+        t.focus(0);
+        assert!(t.open_worker_as("a", "sa_2", "scout", Some("t_old"), "a"), "the same worker: focused");
+        assert!(!t.open_worker_as("a", "sa_2", "scout", None, "a"), "already shown");
+        t.focus(0);
+        assert!(t.open_worker_as("a", "sa_2", "builder", Some("t_new"), "a"));
+        assert_eq!(strip(&t), ["a", "a/sa_2"]);
+        assert_eq!(t.current_worker().map(|w| w.who()), Some((Some("t_new"), "builder")));
+        unique(&t);
+    }
+
+    #[test]
+    fn a_session_tab_keeps_the_worker_it_showed_in_place() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::New);
+        let id = t.current().unwrap().id;
+        t.set_watching(id, Some(("sa_2".into(), "sleeper".into())));
+        t.open_worker("a", "sa_3", "scout", "a");
+        let w = t.current().unwrap().id;
+        t.set_watching(w, Some(("sa_9".into(), "x".into())));
+        assert_eq!(t.current().unwrap().watching, None, "a worker tab shows its own worker only");
+        t.focus(0);
+        assert_eq!(t.current().unwrap().watching, Some(("sa_2".into(), "sleeper".into())));
+        // Replaced by another session: its thread.
+        t.open("b", "b", Place::Current);
+        assert_eq!(t.current().unwrap().watching, None);
     }
 
     fn meta(id: &str, journal: &str) -> SessionMeta {
@@ -1460,7 +1927,14 @@ mod tests {
             let s = ((x >> 8) % 6).to_string();
             let i = ((x >> 16) % 7) as usize;
             let place = if x & 1 == 0 { Place::Current } else { Place::New };
-            match (x >> 24) % 11 {
+            let before = format!(
+                "{:?} active {:?} last {:?}",
+                t.iter().map(|x| (x.id, x.kind, x.session.clone())).collect::<Vec<_>>(),
+                t.active,
+                t.last_session
+            );
+            let op = (x >> 24) % 12;
+            match (x >> 24) % 12 {
                 0 | 1 => t.open(&s, &s, place),
                 2 => t.open_pending("p", place),
                 3 => {
@@ -1483,12 +1957,23 @@ mod tests {
                 9 => {
                     t.open_view(if x & 4 == 0 { Kind::Settings } else { Kind::Usage });
                 }
+                8 => {
+                    let h = format!("sa_{}", (x >> 40) % 3);
+                    t.open_worker(&s, &h, "w", &s);
+                    assert!(t.current_worker().is_some_and(|w| w.handle == h));
+                }
                 10 => {
                     if let Some(a) = t.active() {
                         let behind = t.view().and(t.current().map(|c| c.id));
+                        let before = format!(
+                            "{:?} active {:?} last {:?}",
+                            t.iter().map(|x| (x.id, x.kind)).collect::<Vec<_>>(),
+                            t.active,
+                            t.last_session
+                        );
                         t.close(a);
                         if let Some(id) = behind {
-                            assert_eq!(t.visible().map(|v| v.id), Some(id), "a closed view gives way to the session behind it");
+                            assert_eq!(t.visible().map(|v| v.id), Some(id), "a closed view gives way to the session behind it: {before}");
                         }
                     }
                 }
@@ -1498,6 +1983,14 @@ mod tests {
                     }
                 }
             }
+            let ok = t.last_session.is_none_or(|id| t.iter().find(|x| x.id == id).is_none_or(|x| x.kind.attaches()));
+            assert!(
+                ok,
+                "op {op} s {s} i {i}: {before} -> {:?} active {:?} last {:?}",
+                t.iter().map(|x| (x.id, x.kind, x.session.clone())).collect::<Vec<_>>(),
+                t.active,
+                t.last_session
+            );
             unique(&t);
         }
     }

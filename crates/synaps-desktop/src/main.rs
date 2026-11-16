@@ -32,6 +32,7 @@ mod files;
 mod fit;
 mod fonts;
 mod mem;
+mod menu;
 mod model;
 mod named;
 mod palettes;
@@ -46,10 +47,13 @@ mod tabstrip;
 mod theme;
 mod tray;
 mod turns;
+#[cfg(test)]
+mod ui_tests;
 mod usage;
 mod usage_view;
 mod views;
 mod watch;
+mod wtabs;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

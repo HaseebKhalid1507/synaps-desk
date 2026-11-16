@@ -219,6 +219,11 @@ pub enum Command {
         handle_id: String,
         text: String,
     },
+    /// Cancel a running worker (`/workers cancel sa_N`, an engine
+    /// command). See [`Client::cancel_worker`].
+    CancelWorker {
+        handle_id: String,
+    },
 }
 
 impl Command {
@@ -239,6 +244,7 @@ impl Command {
             Command::Shutdown => "shutdown",
             Command::SubagentWatch { .. } => "subagent_watch",
             Command::SubagentSteer { .. } => "subagent_steer",
+            Command::CancelWorker { .. } => "engine_command",
         }
     }
 }
@@ -273,6 +279,7 @@ impl std::fmt::Debug for Command {
             Command::SubagentSteer { handle_id, .. } => {
                 f.debug_struct("SubagentSteer").field("handle_id", handle_id).field("text", &format_args!("<redacted>")).finish()
             }
+            Command::CancelWorker { handle_id } => f.debug_struct("CancelWorker").field("handle_id", handle_id).finish(),
             other => f.write_str(match other {
                 Command::RefreshSessions => "RefreshSessions",
                 Command::Cancel => "Cancel",
@@ -450,6 +457,17 @@ pub enum Event {
         since: u64,
         reply: WatchReply,
     },
+    /// Reply to [`Client::cancel_worker`] for worker `handle_id`: `Ok` with
+    /// the daemon's text (`Cancelled sa_3 (they stop at their next step;
+    /// …)`: its rows say `cancel_requested`, then `cancelled`), or `Err`
+    /// with why not: the daemon's (`sa_3 is already completed — nothing to
+    /// cancel`, a refusal: not this client's input), or this client's (not
+    /// connected, the connection dropped before the daemon answered).
+    WorkerCancel {
+        attach_seq: u64,
+        handle_id: String,
+        result: Result<String, String>,
+    },
 }
 
 /// What a [`Client::watch_subagent`] got back.
@@ -478,6 +496,7 @@ impl Event {
             | Event::InputOwner { attach_seq, .. }
             | Event::CwdFallback { attach_seq, .. }
             | Event::SubagentWatch { attach_seq, .. }
+            | Event::WorkerCancel { attach_seq, .. }
             | Event::Detached { attach_seq, .. } => Some(*attach_seq),
             Event::Error { attach_seq, .. } => *attach_seq,
             Event::Status(_)
@@ -730,6 +749,19 @@ impl Client {
     /// steer is noted in the main conversation (an `External` event).
     pub fn steer_subagent(&self, handle_id: impl Into<String>, text: impl Into<String>) -> Result<(), ClientClosed> {
         self.send(Command::SubagentSteer { handle_id: handle_id.into(), text: text.into() })
+    }
+
+    /// Cancel the running worker `handle_id` (`sa_N`) as `/workers cancel
+    /// sa_N` does: `SessionCommand::EngineCommand { name: "workers", arg:
+    /// "cancel sa_N" }`, owner-only like `steer`. It stops at its next step
+    /// and sends no completion wake; the engine notes the cancel in the
+    /// main conversation. The answer is `Event::WorkerCancel`, also for a
+    /// cancel that never reached the daemon (the connection dropped, the
+    /// session was detached or ended first). One worker only: a handle
+    /// that is not `sa_` and digits (`all` would cancel every worker) is
+    /// never sent, and answered `Err`. Daemons from v0.11.0.
+    pub fn cancel_worker(&self, handle_id: impl Into<String>) -> Result<(), ClientClosed> {
+        self.send(Command::CancelWorker { handle_id: handle_id.into() })
     }
 
     /// Leave the session cleanly (`Detach` + `Bye`); its turn keeps running.
@@ -1209,6 +1241,11 @@ async fn without_session<F: Future>(
             cmd = cmds.recv() => match cmd {
                 None | Some(Command::Detach) | Some(Command::Shutdown) => return None,
                 Some(Command::Resync) | Some(Command::RefreshSessions) => {}
+                Some(Command::CancelWorker { handle_id }) => emit(events, Event::WorkerCancel {
+                    attach_seq,
+                    handle_id,
+                    result: Err("not connected to the session (attaching or reconnecting): not cancelled".into()),
+                }),
                 Some(c) => emit_error(events, Some(attach_seq), Error::Refused {
                     command: Some(c.name().into()),
                     reason: "not connected to the session (attaching or reconnecting)".into(),
@@ -1226,6 +1263,35 @@ fn is_message_history(v: &Value) -> bool {
 
 /// Watch queries one connection keeps waiting for (the app keeps one).
 const WATCHES_MAX: usize = 8;
+/// Worker cancels one connection keeps waiting for.
+const CANCELS_MAX: usize = 16;
+
+/// `sa_` and digits: one worker's handle. `workers cancel all` (or
+/// anything else the engine command reads) is never sent.
+fn is_worker_handle(h: &str) -> bool {
+    h.strip_prefix("sa_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The cancels still in flight as the connection or the attachment ends:
+/// each answered `Err(why)`, never left without an answer.
+fn unanswered(events: &Events, attach_seq: u64, cancels: &mut VecDeque<(u64, String)>, why: &str) {
+    for (_, handle_id) in cancels.drain(..) {
+        emit(events, Event::WorkerCancel { attach_seq, handle_id, result: Err(why.into()) });
+    }
+}
+
+/// A `workers cancel` engine command's `value`: `{"kind": "output", "text":
+/// "Cancelled sa_3 (…)"}`, or `{"kind": "error", "text": "sa_3 is already
+/// completed — nothing to cancel"}`.
+fn cancel_reply(value: &Value) -> Result<String, String> {
+    let text = value.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+    match value.get("kind").and_then(Value::as_str) {
+        Some("output") => Ok(text),
+        Some("error") if !text.is_empty() => Err(text),
+        Some(k) => Err(format!("the daemon did not cancel it (it answered `{k}`)")),
+        None => Err("the daemon's answer did not say whether it cancelled".into()),
+    }
+}
 
 /// Why a worker steer was refused by a daemon before v0.11.0.
 pub const STEER_UNSUPPORTED: &str = "this daemon predates steering workers (Synaps v0.11.0)";
@@ -1328,6 +1394,8 @@ async fn session_loop(
         let mut resync: Option<Option<ConversationDigest>> = None;
         // Watch queries in flight on this connection: `(query id, handle id, since)`.
         let mut watches: VecDeque<(u64, String, u64)> = VecDeque::new();
+        // Worker cancels in flight: `(query id, handle id)`, oldest first.
+        let mut cancels: VecDeque<(u64, String)> = VecDeque::new();
         let query = |sid: &str| ClientFrame::Cmd {
             session_id: sid.to_string(),
             cmd: SessionCommand::Query { id: query_id, query: SessionQuery::Messages },
@@ -1348,6 +1416,7 @@ async fn session_loop(
                         None | Some(Command::Detach) | Some(Command::Shutdown) => {
                             let _ = conn.send(&ClientFrame::Cmd { session_id: sid.clone(), cmd: SessionCommand::Detach { client: me } }).await;
                             conn.bye().await;
+                            unanswered(&events, attach_seq, &mut cancels, "detached before the daemon answered: look at the worker's row");
                             return detached(session_id);
                         }
                         Some(c) => c,
@@ -1373,7 +1442,7 @@ async fn session_loop(
                         Command::SubagentWatch { handle_id, since } => {
                             let id = loop {
                                 let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
-                                if id != query_id && !watches.iter().any(|w| w.0 == id) {
+                                if id != query_id && !watches.iter().any(|w| w.0 == id) && !cancels.iter().any(|c| c.0 == id) {
                                     break id;
                                 }
                             };
@@ -1384,6 +1453,30 @@ async fn session_loop(
                             SessionCommand::Query { id, query: SessionQuery::SubagentWatch { handle_id, since, tool_queue: true } }
                         }
                         Command::SubagentSteer { handle_id, text } => SessionCommand::SubagentSteer { handle_id, text },
+                        Command::CancelWorker { handle_id } if !is_worker_handle(&handle_id) => {
+                            emit(&events, Event::WorkerCancel {
+                                attach_seq,
+                                result: Err(format!("not a worker's handle ({handle_id:?}): one worker is cancelled by its sa_N")),
+                                handle_id,
+                            });
+                            continue;
+                        }
+                        Command::CancelWorker { handle_id } => {
+                            let id = loop {
+                                let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
+                                if id != query_id && !watches.iter().any(|w| w.0 == id) && !cancels.iter().any(|c| c.0 == id) {
+                                    break id;
+                                }
+                            };
+                            if cancels.len() == CANCELS_MAX
+                                && let Some((_, h)) = cancels.pop_front()
+                            {
+                                emit(&events, Event::WorkerCancel { attach_seq, handle_id: h, result: Err("no answer from the daemon".into()) });
+                            }
+                            let arg = format!("cancel {handle_id}");
+                            cancels.push_back((id, handle_id));
+                            SessionCommand::EngineCommand { id, name: "workers".into(), arg }
+                        }
                         _ => continue,
                     };
                     if let Err(e) = conn.send(&ClientFrame::Cmd { session_id: sid.clone(), cmd: wire }).await {
@@ -1415,6 +1508,14 @@ async fn session_loop(
                                 emit_error(&events, Some(attach_seq), Error::Decode(DecodeError { kind: "query_result:subagent_watch".into(), error: e.clone() }));
                             }
                             emit(&events, Event::SubagentWatch { attach_seq, session_id: esid, handle_id, since, reply });
+                            continue;
+                        }
+                        if v.get("ev").and_then(Value::as_str) == Some("query_result")
+                            && let Some(k) = v.get("id").and_then(Value::as_u64).and_then(|q| cancels.iter().position(|c| c.0 == q))
+                        {
+                            let (_, handle_id) = cancels.remove(k).expect("present");
+                            let result = cancel_reply(v.get("value").unwrap_or(&Value::Null));
+                            emit(&events, Event::WorkerCancel { attach_seq, handle_id, result });
                             continue;
                         }
                         if v.get("ev").and_then(Value::as_str) == Some("query_result") {
@@ -1455,6 +1556,12 @@ async fn session_loop(
                                 owner = *to;
                                 emit(&events, Event::InputOwner { attach_seq, session_id: esid.clone(), client: me, owner, reason: reason.clone() });
                             }
+                            // A cancel refused (this client does not own the
+                            // session's input): the oldest one in flight.
+                            SessionEvent::Refused { client, command, reason } if *client == me && command == "engine_command" && !cancels.is_empty() => {
+                                let (_, handle_id) = cancels.pop_front().expect("not empty");
+                                emit(&events, Event::WorkerCancel { attach_seq, handle_id, result: Err(format!("refused: {reason}")) });
+                            }
                             SessionEvent::Refused { client, command, reason } if *client == me => {
                                 emit_error(&events, Some(attach_seq), Error::Refused { command: Some(command.clone()), reason: reason.clone() });
                             }
@@ -1482,6 +1589,7 @@ async fn session_loop(
                         let ended = matches!(event, SessionEvent::Ended { .. });
                         emit(&events, Event::Session { attach_seq, session_id: esid, seq, event, raw });
                         if ended {
+                            unanswered(&events, attach_seq, &mut cancels, "the session ended before the daemon answered: look at the worker's row");
                             return Exit { session_id, reason: "session ended".into() };
                         }
                         if send_query && let Err(e) = conn.send(&query(&sid)).await {
@@ -1493,6 +1601,7 @@ async fn session_loop(
                         break 'conn ("daemon reloading".into(), Duration::from_millis(retry_after_ms.min(10_000)));
                     }
                     Ok(Some(DaemonFrame::Bye(reason))) => {
+                        unanswered(&events, attach_seq, &mut cancels, "the daemon said bye before it answered: look at the worker's row");
                         return Exit { session_id, reason: format!("daemon said bye ({reason:?})") };
                     }
                     Ok(Some(DaemonFrame::Error { session_id: esid, message })) => {
@@ -1533,6 +1642,12 @@ async fn session_loop(
                 }
             }
         };
+        unanswered(
+            &events,
+            attach_seq,
+            &mut cancels,
+            "the session connection dropped before the daemon answered: look at the worker's row",
+        );
         emit(&events, Event::Reattaching { attach_seq, session_id: sid.clone(), reason: why });
         previous = Some(Previous { client: me, session_id: sid, was_owner: owner == Some(me), generation });
         drop(conn);

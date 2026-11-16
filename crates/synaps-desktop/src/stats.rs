@@ -157,11 +157,13 @@ impl Stats {
             subagents,
             detached: false,
         };
+        self.subagents.replaying(true);
         for env in &a.replay {
             if let Ok(ev) = env.decode() {
                 self.on_session(&ev, &env.event);
             }
         }
+        self.subagents.replaying(false);
     }
 
     /// The attachment ended.
