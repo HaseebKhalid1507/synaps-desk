@@ -11,8 +11,8 @@ use std::task::{Context, Poll};
 
 use synaps_client::protocol::SessionMeta;
 use synaps_client::{
-    AttachMode, Error, Event, Expect, FEATURE_SAVED_SESSIONS, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, Status,
-    Transcript, validate_session_name,
+    AttachMode, ClientInput, Error, Event, Expect, FEATURE_SAVED_SESSIONS, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent,
+    Status, Transcript, validate_session_name,
 };
 
 use crate::named::{ResumeRequest, RowAction, parse_rfc3339};
@@ -101,6 +101,11 @@ pub struct Active {
     /// (`Client::answer_on`), never on a later one.
     pub connection: u64,
     pub mode: AttachMode,
+    /// This connection's client id in the session, who owns its input,
+    /// and the session's input rule (who may send it).
+    pub client: u64,
+    pub owner: Option<u64>,
+    pub input: ClientInput,
 }
 
 /// What the view must do after an event (it owns the client and composer).
@@ -137,6 +142,8 @@ pub enum Effect {
         open: bool,
         place: Place,
     },
+    /// What the composer's note line says of a worker (a cancel refused).
+    WorkerNote(String),
 }
 
 /// A resume in flight (`Client::resume`).
@@ -324,6 +331,8 @@ pub struct Model {
     /// The attached session's worker views ([`crate::watch`]): with the
     /// transcript, they go to the tab cache when its tab is left.
     pub watch: Watch,
+    /// Worker cancels armed and on their way ([`crate::wtabs`]).
+    pub cancels: crate::wtabs::Cancels,
 }
 
 /// An empty transcript as the window keeps it: no notices for subagent
@@ -374,6 +383,7 @@ impl Model {
             daemon: None,
             daemon_gen: 0,
             watch: Watch::default(),
+            cancels: Default::default(),
         }
     }
 
@@ -1001,6 +1011,9 @@ impl Model {
             epoch: self.epoch,
             connection: 0,
             mode: AttachMode::Mirror,
+            client: 0,
+            owner: None,
+            input: ClientInput::Shared,
         });
         self.stats = Stats::default();
     }
@@ -1011,6 +1024,49 @@ impl Model {
     /// on screen (the connection thread routes them to its latest attach).
     pub fn can_send(&self) -> bool {
         self.active.as_ref().is_some_and(|a| a.mode != AttachMode::Observe && self.wanted == Some(a.attach_seq)) && !self.reattaching
+    }
+
+    /// Whether this window may send the session on screen input (steer or
+    /// cancel its workers), else the reason that applies: the daemon's
+    /// rule (`exclusive`: the input owner only; `shared`: every client but
+    /// an observer), and no reconnect or switch under way.
+    pub fn input_gate(&self) -> Result<(), &'static str> {
+        let Some(a) = self.active.as_ref() else { return Err("not attached") };
+        if self.reattaching {
+            return Err("reconnecting to the session: try again in a moment");
+        }
+        if self.switching() {
+            return Err("switching sessions: try again in a moment");
+        }
+        if a.mode == AttachMode::Observe {
+            return Err("read-only: this window observes the session");
+        }
+        if !self.can_send() {
+            return Err("not connected to the session: try again in a moment");
+        }
+        if a.input == ClientInput::Exclusive && a.owner != Some(a.client) {
+            return Err("read-only here: another client owns this session's input");
+        }
+        Ok(())
+    }
+
+    /// A worker tab of the session on screen shows `handle`.
+    pub fn holds_view(&self, handle: &str) -> bool {
+        let Some(s) = self.active.as_ref().map(|a| a.session_id.as_str()) else { return false };
+        self.tabs.iter().any(|t| {
+            t.kind == crate::tabs::Kind::Worker && t.session.as_deref() == Some(s) && t.worker.as_ref().is_some_and(|w| w.handle == handle)
+        })
+    }
+
+    /// The handles the session on screen's open worker tabs show: their
+    /// views stay while the tabs do ([`Watch::hold`]).
+    pub fn held_views(&self) -> Vec<String> {
+        let Some(s) = self.active.as_ref().map(|a| a.session_id.as_str()) else { return Vec::new() };
+        self.tabs
+            .iter()
+            .filter(|t| t.kind == crate::tabs::Kind::Worker && t.session.as_deref() == Some(s))
+            .filter_map(|t| t.worker.as_ref().map(|w| w.handle.clone()))
+            .collect()
     }
 
     /// A switch to another attachment is under way.
@@ -1171,12 +1227,23 @@ impl Model {
                 self.view_dirty |= self.watch.steer_refused("not attached to the session");
                 return effects;
             }
+            // A worker cancel answered: done, its rows will say so (it is
+            // `cancelling…` until then); not done, the composer's note says why.
+            Event::WorkerCancel { attach_seq, handle_id, result } => {
+                log::debug!(target: "synaps_desktop::watch", "cancel {handle_id}: {result:?}");
+                if let Some(note) = self.cancels.answered(attach_seq, &handle_id, &result) {
+                    effects.push(Effect::WorkerNote(note));
+                    self.view_dirty = true;
+                }
+                return effects;
+            }
             ev => ev,
         };
         self.view_dirty = true;
         if !matches!(ev, Event::Session { .. } | Event::History { .. }) {
             self.rail_gen += 1;
         }
+
         match ev {
             Event::Status(s) => {
                 // A reply in flight died with the old connection.
@@ -1187,6 +1254,8 @@ impl Model {
                     self.daemon_gen += 1;
                     // Another daemon process: the worker on screen is read
                     // from 0, even before its session's attach comes back.
+                    let held = self.held_views();
+                    self.watch.hold(held);
                     self.watch.daemon_changed(*pid, std::time::Instant::now());
                     self.named.daemon = match profile {
                         Some(p) => format!("the daemon's machine (profile {p})"),
@@ -1368,6 +1437,9 @@ impl Model {
                     epoch: self.epoch,
                     connection: attached.connection,
                     mode,
+                    client: attached.client,
+                    owner: attached.input_owner,
+                    input: attached.client_input,
                 });
                 self.wanted_session = Some(attached.meta.id.clone());
                 // The visible tab holds what attached (a create or a resume
@@ -1382,6 +1454,8 @@ impl Model {
                 if self.transcript.session_id() != Some(attached.meta.id.as_str()) {
                     self.watch = Watch::default();
                 }
+                let held = self.held_views();
+                self.watch.hold(held);
                 self.watch.on_reconnect(std::time::Instant::now(), self.daemon.as_ref().map(|d| d.pid));
                 if let Err(e) = self.transcript.load_attached(&attached) {
                     self.last_error = Some(e.to_string());
@@ -1390,6 +1464,12 @@ impl Model {
                 effects.push(Effect::ListSessions);
             }
             Event::Reattaching { attach_seq, .. } if self.current(attach_seq) => self.reattaching = true,
+            Event::InputOwner { attach_seq, client, owner, .. } if self.current(attach_seq) => {
+                if let Some(a) = self.active.as_mut() {
+                    (a.client, a.owner) = (client, owner);
+                    self.view_dirty = true;
+                }
+            }
             Event::Session { attach_seq, event, raw, .. } if self.current(attach_seq) => {
                 // The engine's note of a worker steer in the main conversation.
                 if raw["ev"] == "external" && raw["event"]["content"]["content_type"] == "subagent_steer" {
@@ -1522,6 +1602,57 @@ mod tests {
     fn attach(m: &mut Model, seq: u64) {
         m.want(seq);
         m.apply(Event::Attached { attach_seq: seq, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
+    }
+
+    /// A worker cancel's answer: refused or not done, the composer's note
+    /// says why and the worker is not `cancelling…` any more; done, it
+    /// stays so until its rows say it.
+    #[test]
+    fn a_worker_cancel_answer_says_why_it_was_not_done() {
+        let mut m = Model::new(ConnState::Connecting);
+        attach(&mut m, 1);
+        let t0 = std::time::Instant::now();
+        m.cancels.sent("s", "sa_2", 1, t0);
+        m.cancels.sent("s", "sa_3", 1, t0);
+        let answer = |h: &str, result: Result<String, String>| Event::WorkerCancel { attach_seq: 1, handle_id: h.into(), result };
+        assert!(
+            m.apply(answer("sa_2", Ok("Cancelled sa_2 (they stop at their next step; no completion wake is sent).".into()))).is_empty()
+        );
+        assert!(m.cancels.pending("s", "sa_2"));
+        let fx = m.apply(answer("sa_3", Err("refused: input is owned by client #1".into())));
+        assert_eq!(fx, vec![Effect::WorkerNote("sa_3 not cancelled: refused: input is owned by client #1".into())]);
+        assert!(!m.cancels.pending("s", "sa_3"));
+        assert_eq!(m.last_error, None, "a cancel's answer is not a session error");
+    }
+
+    /// L5: who may steer or cancel a worker is who may send the session
+    /// input, as the daemon rules it, and the reason given is the one that
+    /// applies: an exclusive session's owner only (it follows the owner as
+    /// it changes), a shared one's every client but an observer.
+    #[test]
+    fn the_input_gate_says_why_not() {
+        let mut m = Model::new(ConnState::Connecting);
+        assert_eq!(m.input_gate(), Err("not attached"));
+        attach(&mut m, 1);
+        assert_eq!(m.input_gate(), Ok(()), "client 2 owns its input");
+        let owner = |to| Event::InputOwner { attach_seq: 1, session_id: "s".into(), client: 2, owner: to, reason: "takeover".into() };
+        m.apply(owner(Some(1)));
+        assert_eq!(m.input_gate(), Err("read-only here: another client owns this session's input"));
+        m.apply(owner(Some(2)));
+        assert_eq!(m.input_gate(), Ok(()));
+        m.apply(Event::Reattaching { attach_seq: 1, session_id: "s".into(), reason: "x".into() });
+        assert_eq!(m.input_gate(), Err("reconnecting to the session: try again in a moment"));
+        // Shared: any client that drives, whoever owns it.
+        let v = json!({"type": "attached", "client": 3, "meta": {"id": "s"}, "conversation": {"api_messages": []}, "input_owner": 1, "client_input": "shared"});
+        let a = match synaps_client::protocol::decode_frame(&v.to_string()).unwrap() {
+            synaps_client::protocol::DaemonFrame::Attached(a) => a,
+            other => panic!("{other:?}"),
+        };
+        m.apply(Event::Attached { attach_seq: 1, attached: a.clone(), mode: AttachMode::Mirror, reconnect: true });
+        assert_eq!(m.input_gate(), Ok(()));
+        m.want(2);
+        m.apply(Event::Attached { attach_seq: 2, attached: a, mode: AttachMode::Observe, reconnect: false });
+        assert_eq!(m.input_gate(), Err("read-only: this window observes the session"));
     }
 
     /// L2: leaving a tab drops the resume, the fallback attach and the

@@ -1,6 +1,9 @@
 //! The tab strip over the centre pane: one tab per open session, its state
 //! as the rail draws it (glyph, word, the needs-you bar), the visible one
-//! raised with the "you" bar. Nothing moves on its own: no animation, a
+//! raised with the "you" bar. A worker's tab ([`Kind::Worker`]) says
+//! `sleeper · <its session>` with the worker's state mark, its session in
+//! its tooltip; right-click opens the worker's menu ([`crate::wtabs`]).
+//! Nothing moves on its own: no animation, a
 //! drag drops where it is let go, and tabs that do not fit scroll by the
 //! arrows at the ends (never a second row).
 
@@ -15,6 +18,7 @@ use crate::fonts;
 use crate::rail::State;
 use crate::tabs::{Kind, Place, Tab};
 use crate::theme::Palette;
+use crate::wtabs::WState;
 
 pub(crate) const TAB_H: f32 = 34.;
 /// A tab is never narrower or wider than this; under the minimum they
@@ -121,9 +125,18 @@ impl AppView {
     /// session" or its id (the rail's rules); not listed: what the tab last
     /// knew.
     fn tab_label(&self, t: &Tab) -> (SharedString, bool) {
+        if let (Kind::Worker, Some(w)) = (t.kind, &t.worker) {
+            let (session, _) = self.session_tab_label(t);
+            return (format!("{} · {session}", w.name).into(), false);
+        }
         if t.kind != Kind::Session {
             return (t.kind.label().into(), false);
         }
+        self.session_tab_label(t)
+    }
+
+    /// What a session tab (or a worker tab, of its session) calls it.
+    fn session_tab_label(&self, t: &Tab) -> (SharedString, bool) {
         let meta = t.session.as_deref().and_then(|s| self.model.sessions.iter().find(|m| m.id == s));
         match meta {
             Some(m) => match (m.name.as_deref().filter(|n| !n.is_empty()), m.title.as_deref().filter(|t| !t.is_empty())) {
@@ -140,13 +153,21 @@ impl AppView {
     /// the rail's state (the attached one from its own transcript). Not
     /// listed: OPENING on its way, else from the transcript if attached
     /// (a create the poll has not caught up with), else gone (no glyph).
+    /// A worker tab: NEEDS YOU while its session waits on a prompt (its
+    /// card is never shown over the worker), else nothing of the session's.
     pub(crate) fn tab_state(&self, t: &Tab) -> State {
-        if t.kind != Kind::Session {
-            return State::Idle;
+        match (t.kind, t.session.as_deref()) {
+            (Kind::Session, _) => self.session_state(t.id, t.session.as_deref()),
+            (Kind::Worker, Some(s)) if self.session_state(t.id, Some(s)) == State::NeedsYou => State::NeedsYou,
+            _ => State::Idle,
         }
-        let Some(s) = t.session.as_deref() else { return State::Opening };
+    }
+
+    /// The state of session `s` as tab `id` shows it ([`AppView::tab_state`]).
+    fn session_state(&self, id: u64, s: Option<&str>) -> State {
+        let Some(s) = s else { return State::Opening };
         // Restored, its session not listed yet (a daemon still starting).
-        if self.model.tabs.restoring(t.id) {
+        if self.model.tabs.restoring(id) {
             return State::Opening;
         }
         if let Some(m) = self.model.sessions.iter().find(|m| m.id == s) {
@@ -196,7 +217,15 @@ impl AppView {
         for (ix, t) in tabs.iter().enumerate().skip(lay.first).take(lay.shown) {
             let st = self.tab_state(t);
             let (label, named) = self.tab_labels.labels.get(ix).cloned().unwrap_or_default();
-            row = row.child(self.render_tab(t.id, ix, active == Some(ix), t.kind, st, label, named, lay.width, p, cx));
+            // A worker of a session not attached here: as last seen (dimmed).
+            let worker = match (&t.worker, t.session.as_deref()) {
+                (Some(w), Some(s)) if t.kind == Kind::Worker => {
+                    let live = self.model.is_active(s) || self.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(s);
+                    Some((self.worker_state(s, &w.handle, Some(w.who())), live))
+                }
+                _ => None,
+            };
+            row = row.child(self.render_tab(t.id, ix, active == Some(ix), t.kind, (st, worker), label, named, lay.width, p, cx));
         }
         let (before, after) = (lay.first, n - lay.first - lay.shown);
         if lay.overflow && self.tab_labels.arrows.0 != (before, after) {
@@ -268,16 +297,16 @@ impl AppView {
         ix: usize,
         on: bool,
         kind: Kind,
-        st: State,
+        (st, worker): (State, Option<(WState, bool)>),
         label: SharedString,
         named: bool,
         width: f32,
         p: &Palette,
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
-        let view = kind != Kind::Session;
+        let view = !kind.attaches();
         let title_color = match st {
-            _ if view => {
+            _ if view || worker.is_some() => {
                 if on {
                     p.ink
                 } else {
@@ -289,17 +318,30 @@ impl AppView {
             State::Parked | State::Locked | State::Saved => p.dim_ch,
             _ => p.prose_ch,
         };
-        let bar = if st == State::NeedsYou {
+        // NEEDS YOU first: a worker tab's session's prompt too.
+        let needs = st == State::NeedsYou;
+        let bar = if needs {
             Some(p.warn_mark_ch)
         } else if on {
             Some(p.you_bar)
         } else {
             None
         };
-        let word = st.word().filter(|_| width >= WORD_MIN && !view);
+        let word = match worker {
+            Some((w, _)) if !needs => w.mark(),
+            _ => st.word(),
+        }
+        .filter(|_| width >= WORD_MIN && !view);
+        let word_color = match worker {
+            Some((w, true)) if !needs => worker_color(w, p),
+            Some((_, false)) if !needs => p.dim_ch,
+            _ => word_color(st, p),
+        };
         let drag = TabDrag { id, ix, label: label.clone(), bg: p.raised, fg: p.ink, edge: p.edge };
         let mark = p.focus_ch;
-        let (tip, name) = (label.clone(), if view { "view" } else { st.name() });
+        let (tip, name) = (label.clone(), if view { "view" } else { worker.map_or_else(|| st.name(), |(w, _)| w.word()) });
+        let seen = if worker.is_some_and(|(_, live)| !live) { " (as last seen)" } else { "" };
+        let waits = if needs && worker.is_some() { " · its session needs you" } else { "" };
         let close = mono("×", 13., if on { p.dim_ch } else { gpui_kit::transparent_black() })
             .id(("tab-x", id as usize))
             .w(px(18.))
@@ -337,6 +379,7 @@ impl AppView {
                 Kind::Settings => crate::views::gear(if on { p.you_bar } else { p.dim_ch }, None),
                 Kind::Usage => crate::views::bars_glyph(if on { p.you_bar } else { p.dim_ch }),
                 Kind::Session => glyph(st, p),
+                Kind::Worker => worker_glyph(worker.map_or(WState::Unknown, |(w, _)| w), p),
             })
             .child(
                 div()
@@ -350,10 +393,22 @@ impl AppView {
                     .text_color(title_color)
                     .child(label),
             )
-            .when_some(word, |d, w| d.child(display(w, 9., word_color(st, p)).flex_none()))
+            .when_some(word, |d, w| d.child(display(w, 9., word_color).flex_none()))
             .child(close)
             // Formatted on hover only.
-            .tooltip(move |window, cx| Tooltip::new(format!("{tip} · {name}")).build(window, cx))
+            .tooltip(move |window, cx| {
+                let text = if kind == Kind::Worker {
+                    match tip.split_once(" · ") {
+                        Some((w, s)) => {
+                            format!("worker {w} · {name}{seen} · of the session {s}{waits} · closing this tab leaves it running")
+                        }
+                        None => format!("{tip} · {name}"),
+                    }
+                } else {
+                    format!("{tip} · {name}")
+                };
+                Tooltip::new(text).build(window, cx)
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 let ix = this.model.tabs.iter().position(|t| t.id == id);
                 if let Some(ix) = ix {
@@ -361,13 +416,15 @@ impl AppView {
                 }
                 cx.notify();
             }))
-            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 let ix = this.model.tabs.iter().position(|t| t.id == id);
                 if ev.is_middle_click()
                     && let Some(ix) = ix
                 {
                     this.close_tab(ix);
                     cx.notify();
+                } else if ev.is_right_click() && kind == Kind::Worker {
+                    this.worker_tab_menu(id, ev.position(), window, cx);
                 }
             }))
             .on_drag(drag, |d, _, _, cx| cx.new(|_| d.clone()))
@@ -380,6 +437,30 @@ impl AppView {
                 this.move_tab(d.id, id);
                 cx.notify();
             }))
+    }
+}
+
+/// A worker tab's mark: a solid square while it runs, how it ended after.
+fn worker_glyph(w: WState, p: &Palette) -> Div {
+    let sign = |s: &'static str, c: Hsla| div().w(px(10.)).flex_none().text_size(px(12.)).text_color(c).child(s);
+    match w {
+        WState::Running => div().size(px(8.)).m(px(1.)).flex_none().bg(p.run_mark_ch),
+        WState::Cancelling => sign("◌", p.warn_ch),
+        WState::Done => sign("✓", p.ok_ch),
+        WState::Failed => sign("×", p.err_ch),
+        WState::Cancelled => sign("–", p.dim_ch),
+        WState::TimedOut => sign("!", p.warn_ch),
+        WState::Unknown | WState::Gone => div().size(px(8.)).m(px(1.)).flex_none().border_1().border_color(p.dim_ch),
+    }
+}
+
+fn worker_color(w: WState, p: &Palette) -> Hsla {
+    match w {
+        WState::Running => p.run_ch,
+        WState::Done => p.ok_ch,
+        WState::Failed => p.err_ch,
+        WState::Cancelling | WState::TimedOut => p.warn_ch,
+        WState::Cancelled | WState::Unknown | WState::Gone => p.dim_ch,
     }
 }
 

@@ -243,6 +243,15 @@ pub enum SessionCommand {
         handle_id: String,
         text: String,
     },
+    /// A runtime-backed slash command (`/workers cancel sa_N`, ...), owner-
+    /// only. Reply: `QueryResult{id, value: {"kind": "output"|"error"|...,
+    /// "text": ...}}`, broadcast like a query's; a non-owner's is
+    /// `Refused { command: "engine_command" }`.
+    EngineCommand {
+        id: u64,
+        name: String,
+        arg: String,
+    },
 }
 
 impl std::fmt::Debug for SessionCommand {
@@ -261,6 +270,9 @@ impl std::fmt::Debug for SessionCommand {
             Self::Detach { client } => f.debug_struct("Detach").field("client", client).finish(),
             Self::SubagentSteer { handle_id, .. } => {
                 f.debug_struct("SubagentSteer").field("handle_id", handle_id).field("text", &format_args!("<redacted>")).finish()
+            }
+            Self::EngineCommand { id, name, arg } => {
+                f.debug_struct("EngineCommand").field("id", id).field("name", name).field("arg", arg).finish()
             }
         }
     }
