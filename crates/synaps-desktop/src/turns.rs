@@ -487,7 +487,8 @@ impl Hue {
 }
 
 /// Line counts as a row or a summary shows them, formatted once: `+3` `−1`
-/// (`~+3` for an estimate) for edits, each only when not 0 (no `−0`), `~3`
+/// for edits, each only when not 0 (no `−0`), an estimate's `~` on the
+/// first shown (`~+3 −1`, `~−6`), `~3`
 /// for lines written (not a delta). From the ledger's committed counts
 /// only, so a failed, denied, canceled or stopped call has none.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -501,7 +502,7 @@ impl Counts {
     pub(crate) fn of(d: CallDelta) -> Self {
         Counts {
             added: (d.added > 0).then(|| format!("{}+{}", if d.approx { "~" } else { "" }, d.added).into()),
-            removed: (d.removed > 0).then(|| format!("−{}", d.removed).into()),
+            removed: (d.removed > 0).then(|| format!("{}−{}", if d.approx && d.added == 0 { "~" } else { "" }, d.removed).into()),
             written: (d.written > 0).then(|| format!("~{}", d.written).into()),
         }
     }
@@ -536,8 +537,6 @@ pub(crate) struct RunSummary {
     pub label: SharedString,
     /// Most used first (then first used first).
     pub tally: Vec<Tally>,
-    /// Each tool's count, in the tally's order (its stacked bar).
-    pub ns: Vec<usize>,
     /// Calls by how they ended: done, failed, denied, canceled, stopped at
     /// the output limit.
     pub ok: usize,
@@ -551,7 +550,8 @@ pub(crate) struct RunSummary {
     /// Its worst outcome's glyph ([`glyph::worst`]).
     pub worst: (Glyph, Family),
     /// Nothing when every call is done (the glyph alone); else each count
-    /// that is not zero (`5 ok`, `1 cancelled`).
+    /// that is not zero, worst first as [`glyph::worst`] ranks them, so the
+    /// glyph sits by its own word: `1 failed`, `1 stopped`, `5 ok`.
     pub outcome: Vec<(SharedString, Family)>,
 }
 
@@ -590,14 +590,12 @@ impl RunSummary {
         let parts = [
             (failed, "failed", Family::Err),
             (denied, "denied", Family::Err),
-            (cancelled, "cancelled", Family::Warn),
             (stopped, "stopped", Family::Warn),
+            (cancelled, "cancelled", Family::Warn),
+            (ok, "ok", Family::Ok),
         ];
         let mut outcome: Vec<(SharedString, Family)> = Vec::new();
         if ok < tools {
-            if ok > 0 {
-                outcome.push((format!("{ok} ok").into(), Family::Ok));
-            }
             for (n, word, family) in parts.into_iter().filter(|p| p.0 > 0) {
                 outcome.push((format!("{n} {word}").into(), family));
             }
@@ -605,7 +603,6 @@ impl RunSummary {
         RunSummary {
             tools,
             label: format!("{tools} tools").into(),
-            ns: tally.iter().map(|t| t.n).collect(),
             tally,
             ok,
             failed,
@@ -818,9 +815,11 @@ impl AppView {
     }
 
     /// A run's summary row (design.md §8.2): the fold, `7 tools`, the tally
-    /// (names in their hues), then counts · its worst outcome's glyph · the
-    /// counts by outcome. On its lead edge the tally stacked into one bar:
-    /// the run's rows' bars, folded.
+    /// (names in their hues), then the trail: counts · its worst outcome's
+    /// glyph by the counts by outcome, worst first (`+3 −4 · ✕ 1 failed ·
+    /// 7 ok`; tight, the glyph alone: `+3 −4 · ✕`), so no glyph sits
+    /// between two numbers. On its lead edge the tally stacked into one
+    /// bar: the run's rows' bars, folded.
     fn render_summary(&self, d: Disp, open: bool, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
         let id = d.id;
         let Some(s) = self.summaries.get(id) else { return div().into_any_element() };
@@ -835,24 +834,25 @@ impl AppView {
             );
         }
         let (worst, family) = s.worst;
+        let dot = || div().text_color(p.dim_t).child("·");
         let mut trail = h_flex()
             .flex_none()
             .gap(px(8.))
             .items_center()
             .text_size(px(m.meta))
-            .children(s.counts.element(p))
+            .when_some(s.counts.element(p), |d, c| d.child(c).child(dot()))
             .child(glyph::draw(worst, glyph::ink(family, Ground::Run, p).1));
         if !self.layout.tight {
             for (i, (text, family)) in s.outcome.iter().enumerate() {
                 if i > 0 {
-                    trail = trail.child(div().text_color(p.dim_t).child("·"));
+                    trail = trail.child(dot());
                 }
                 trail = trail.child(div().text_color(glyph::ink(*family, Ground::Run, p).0).child(text.clone()));
             }
         }
         // Open, the bar ends over the 1 px cut under it.
         let h = m.summary as u32 - u32::from(open);
-        let segments = glyph::tally_bar(&s.ns, h)
+        let segments = glyph::tally_bar(&s.tally, |t| t.n, h)
             .map(|(i, top, h)| div().absolute().left_0().top(px(top as f32)).w(px(2.)).h(px(h as f32)).bg(s.tally[i].hue.color(p)));
         h_flex()
             .id(("run", id))
@@ -1026,7 +1026,7 @@ impl AppView {
                 .group("wblock-go")
                 .flex_none()
                 .items_center()
-                .child(glyph::reveal(glyph::GO, "wblock", "wblock-go", p.dim_t, p.ink))
+                .child(glyph::reveal(glyph::GO, "wblock", "wblock-go", false, p.dim_t, p.ink))
                 .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                     cx.stop_propagation();
                     if ev.click_count() > 1 {
@@ -1389,9 +1389,8 @@ mod tests {
         assert_eq!([Hue::of("subagent_start"), Hue::of("subagent_resume"), Hue::of("subagent")], [Hue::Sub; 3]);
         assert_eq!(Hue::of("subagent_collect"), Hue::Gen);
         assert_eq!(s.label.as_ref(), "5 tools");
-        assert_eq!(outcome(&s), [("4 ok", Family::Ok), ("1 failed", Family::Err)]);
+        assert_eq!(outcome(&s), [("1 failed", Family::Err), ("4 ok", Family::Ok)], "worst first: by its glyph");
         assert_eq!(s.worst, (Glyph::Failed, Family::Err));
-        assert_eq!(s.ns, [3, 2], "the stacked bar's counts, in the tally's order");
     }
 
     /// The `Ok` glyph alone only when every call finished normally; else
@@ -1417,7 +1416,7 @@ mod tests {
         let Kind::Summary { end, .. } = rows[1].kind else { unreachable!() };
         let s = RunSummary::of(&t.items()[1..end], &self::rows(&t, &Ledger::default())[1..end]);
         assert_eq!((s.ok, s.cancelled), (2, 3));
-        assert_eq!(outcome(&s), [("2 ok", Family::Ok), ("3 cancelled", Family::Warn)]);
+        assert_eq!(outcome(&s), [("3 cancelled", Family::Warn), ("2 ok", Family::Ok)]);
         assert_eq!(s.worst, (Glyph::Cancelled, Family::Warn));
 
         // A denied call, and one stopped at the output limit.
@@ -1429,7 +1428,7 @@ mod tests {
         let t = transcript(&m);
         let s = RunSummary::of(&t.items()[1..5], &self::rows(&t, &Ledger::default())[1..5]);
         assert_eq!((s.ok, s.failed, s.denied, s.stopped), (2, 0, 1, 1));
-        assert_eq!(outcome(&s), [("2 ok", Family::Ok), ("1 denied", Family::Err), ("1 stopped", Family::Warn)]);
+        assert_eq!(outcome(&s), [("1 denied", Family::Err), ("1 stopped", Family::Warn), ("2 ok", Family::Ok)]);
         assert_eq!(s.worst, (Glyph::Failed, Family::Err), "denied is the worst: failed > limit > cancelled");
     }
 
@@ -1472,9 +1471,17 @@ mod tests {
         assert_eq!((s.delta.added, s.delta.removed), ledger.totals(), "the summary is the panel's");
         assert_eq!(ledger.files().iter().map(|f| f.written).sum::<u32>(), s.delta.written);
         assert_eq!(s.counts, Counts { added: Some("+3".into()), removed: Some("−1".into()), written: Some("~3".into()) });
-        assert_eq!(outcome(&s), [("4 ok", Family::Ok), ("1 failed", Family::Err)]);
-        // An estimate keeps its `~`.
-        assert_eq!(Counts::of(CallDelta { added: 2, removed: 5, approx: true, written: 0 }).added.as_deref(), Some("~+2"));
+        assert_eq!(outcome(&s), [("1 failed", Family::Err), ("4 ok", Family::Ok)]);
+        // An estimate keeps its `~`, on the first count shown.
+        assert_eq!(
+            Counts::of(CallDelta { added: 2, removed: 5, approx: true, written: 0 }),
+            Counts { added: Some("~+2".into()), removed: Some("−5".into()), written: None }
+        );
+        assert_eq!(
+            Counts::of(CallDelta { added: 0, removed: 6, approx: true, written: 0 }),
+            Counts { added: None, removed: Some("~−6".into()), written: None },
+            "a lower bound with nothing added is still an estimate"
+        );
         // No `−0` (audit E3) and no `+0`: a count shows only when it is not 0.
         assert_eq!(
             Counts::of(CallDelta { added: 4, removed: 0, approx: false, written: 0 }),

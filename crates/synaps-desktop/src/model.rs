@@ -1228,7 +1228,7 @@ impl Model {
                 return effects;
             }
             // A worker cancel answered: done, its rows will say so (it is
-            // `cancelling…` until then); not done, the composer's note says why.
+            // `cancelling` until then); not done, the composer's note says why.
             Event::WorkerCancel { attach_seq, handle_id, result } => {
                 log::debug!(target: "synaps_desktop::watch", "cancel {handle_id}: {result:?}");
                 if let Some(note) = self.cancels.answered(attach_seq, &handle_id, &result) {
@@ -1605,7 +1605,7 @@ mod tests {
     }
 
     /// A worker cancel's answer: refused or not done, the composer's note
-    /// says why and the worker is not `cancelling…` any more; done, it
+    /// says why and the worker is not `cancelling` any more; done, it
     /// stays so until its rows say it.
     #[test]
     fn a_worker_cancel_answer_says_why_it_was_not_done() {

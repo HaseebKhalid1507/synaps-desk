@@ -302,7 +302,7 @@ impl AppView {
             .when(!r.facts.is_empty() && !armed, |d| d.child(div().text_color(p.sub_time_t).child(r.facts.clone())))
             .when(!self.layout.tight, |d| d.child(div().text_color(word_color).child(word)))
             .children(more)
-            .children(r.watchable.then(|| self.cancel_x(&who, &r.handle, armed, p, cx)).flatten());
+            .children(r.watchable.then(|| self.cancel_x(&who, &r.handle, armed, watched, h, p, cx)).flatten());
         let row = h_flex()
             .id(("tray-row", r.id as usize))
             .group("tray-row")

@@ -1,16 +1,21 @@
 //! The one drawn glyph set and the state table (design.md §4). Every state
 //! and every affordance is drawn here, in one 10×10 box: quads (absolute
-//! divs) for the silhouettes, stroked paths for the diagonals (the tick,
-//! the cross, the chevrons). Never a font character: the embedded fonts
-//! are subsets, and Plex Mono's `✓` reads as `√` at 13 px. A glyph takes
-//! its family's mark role on its ground, its word the family's text role
+//! divs) for the silhouettes, and for the diagonals (the tick, the cross,
+//! the chevrons) a stroked SVG sprite, rasterized into GPUI's sprite atlas
+//! once per size and scale and then drawn as a tinted monochrome sprite,
+//! batched with the text (a GPUI path would cost a full-window MSAA pass on
+//! every frame it is on). Never a font character: the embedded fonts are
+//! subsets, and Plex Mono's `✓` reads as `√` at 13 px. A glyph takes its
+//! family's mark role on its ground, its word the family's text role
 //! ([`ink`]).
 //!
 //! The rail and the tabs still draw through `chrome::glyph` (the same
 //! drawings); they come here with the rest of the state language.
 
-use std::cell::RefCell;
+use std::borrow::Cow;
+use std::fmt::Write;
 
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use synaps_client::transcript::ToolStatus;
 
@@ -60,7 +65,6 @@ pub(crate) enum Part {
 }
 
 impl Glyph {
-    #[cfg(test)]
     pub(crate) const ALL: [Glyph; 17] = [
         Glyph::Run,
         Glyph::Workers,
@@ -90,6 +94,18 @@ impl Glyph {
         if self == Glyph::Close { 1. } else { 1.5 }
     }
 
+    /// A stroked glyph's sprite: its SVG's asset path ([`Sprites`]).
+    pub(crate) fn sprite(self) -> Option<&'static str> {
+        Some(match self {
+            Glyph::Ok => "glyph/ok.svg",
+            Glyph::Failed => "glyph/failed.svg",
+            Glyph::Fold => "glyph/fold.svg",
+            Glyph::FoldOpen => "glyph/fold-open.svg",
+            Glyph::Close => "glyph/close.svg",
+            _ => return None,
+        })
+    }
+
     pub(crate) fn parts(self) -> &'static [Part] {
         use Part::{Fill, Frame, Line};
         match self {
@@ -114,64 +130,56 @@ impl Glyph {
     }
 }
 
-/// `g` in `color`: its quads, and its strokes painted from a path
-/// tessellated once ([`PATHS`]).
+/// `g` in `color`: its quads, or its sprite tinted.
 pub(crate) fn draw(g: Glyph, color: Hsla) -> AnyElement {
-    let s = g.size();
-    let mut el = div().relative().flex_none().size(px(s));
-    let mut lines = false;
+    let s = px(g.size());
+    if let Some(path) = g.sprite() {
+        return svg().path(path).flex_none().size(s).text_color(color).into_any_element();
+    }
+    let mut el = div().relative().flex_none().size(s);
     for &part in g.parts() {
         el = match part {
             Part::Fill(x, y, w, h) => el.child(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).bg(color)),
             Part::Frame(x, y, w, h) => el.child(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).border_1().border_color(color)),
-            Part::Line(_) => {
-                lines = true;
-                el
-            }
+            // A stroked glyph is a sprite.
+            Part::Line(_) => el,
         };
-    }
-    if lines {
-        el = el
-            .child(canvas(|_, _, _| (), move |b, _, window, _| paint(g, b.origin, color, window)).absolute().top_0().left_0().size(px(s)));
     }
     el.into_any_element()
 }
 
-thread_local! {
-    /// Each stroked glyph's path at the origin: tessellated once, then only
-    /// moved to where it is painted.
-    static PATHS: RefCell<Vec<(Glyph, Path<Pixels>)>> = const { RefCell::new(Vec::new()) };
-}
-
-fn paint(g: Glyph, at: Point<Pixels>, color: Hsla, window: &mut Window) {
-    let path = PATHS.with_borrow_mut(|paths| {
-        if let Some((_, p)) = paths.iter().find(|(k, _)| *k == g) {
-            return Some(p.clone());
-        }
-        let p = build(g)?;
-        paths.push((g, p.clone()));
-        Some(p)
-    });
-    let Some(mut path) = path else { return };
-    for v in &mut path.vertices {
-        v.xy_position += at;
-    }
-    path.bounds.origin += at;
-    window.paint_path(path, color);
-}
-
-fn build(g: Glyph) -> Option<Path<Pixels>> {
-    let mut b = PathBuilder::stroke(px(g.stroke()));
+/// A stroked glyph's SVG, written from its drawing: the box as the view
+/// box, its lines as one path. Butt caps and miter joins, as a stroke's
+/// defaults.
+pub(crate) fn svg_of(g: Glyph) -> String {
+    let s = g.size();
+    let mut d = String::new();
     for part in g.parts() {
         if let Part::Line(pts) = part {
-            let (&(x, y), rest) = pts.split_first()?;
-            b.move_to(point(px(x), px(y)));
-            for &(x, y) in rest {
-                b.line_to(point(px(x), px(y)));
+            for (i, (x, y)) in pts.iter().enumerate() {
+                let _ = write!(d, "{}{x} {y}", if i == 0 { "M" } else { "L" });
             }
         }
     }
-    b.build().ok()
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}" viewBox="0 0 {s} {s}"><path d="{d}" fill="none" stroke="#000" stroke-width="{}"/></svg>"##,
+        g.stroke()
+    )
+}
+
+/// The app's assets: the stroked glyphs' SVGs, embedded (written from the
+/// drawing table, so the two never disagree). Loaded only when the atlas
+/// has no sprite of that size and scale yet.
+pub(crate) struct Sprites;
+
+impl AssetSource for Sprites {
+    fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
+        Ok(Glyph::ALL.into_iter().find(|g| g.sprite() == Some(path)).map(|g| Cow::Owned(svg_of(g).into_bytes())))
+    }
+
+    fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
+        Ok(Glyph::ALL.into_iter().filter_map(Glyph::sprite).filter(|p| p.starts_with(path)).map(SharedString::from).collect())
+    }
 }
 
 /// A row's lead column (design.md §3): `m.lead` wide (12·r and the gap of
@@ -190,13 +198,18 @@ pub(crate) fn bar(color: Hsla) -> Div {
 }
 
 /// A reveal button's glyph (design.md §5): its slot always kept, drawn
-/// only while `group` (its row) is hovered, in `rest`; in `on` while the
-/// pointer is on the button itself (`own`, the button's group).
-pub(crate) fn reveal(g: Glyph, group: &'static str, own: &'static str, rest: Hsla, on: Hsla) -> Div {
-    let layer = |color: Hsla, group: &'static str| {
-        div().absolute().top_0().left_0().invisible().group_hover(group, |d| d.visible()).child(draw(g, color))
+/// while `group` (its row) is hovered or `shown` (the row is selected), in
+/// `rest`; in `on` while the pointer is on the button itself (`own`, the
+/// button's group). A stroked glyph (a sprite): one element.
+pub(crate) fn reveal(g: Glyph, group: &'static str, own: &'static str, shown: bool, rest: Hsla, on: Hsla) -> Div {
+    let s = px(g.size());
+    let mark = match g.sprite() {
+        Some(path) => {
+            svg().path(path).flex_none().size(s).text_color(rest).group_hover(own, move |st| st.text_color(on)).into_any_element()
+        }
+        None => draw(g, rest),
     };
-    div().relative().flex_none().size(px(g.size())).child(layer(rest, group)).child(layer(on, own))
+    div().flex_none().size(s).when(!shown, |d| d.invisible().group_hover(group, |d| d.visible())).child(mark)
 }
 
 /// What a glyph and its word are painted in (design.md §4.4).
@@ -278,26 +291,23 @@ pub(crate) fn worker(l: Liveness) -> (Glyph, &'static str, &'static str, Family)
     }
 }
 
-/// A folded run's stacked tally bar (design.md §8.2): `n` calls per tool,
-/// most used first, in a bar `h` px tall. Each segment is `floor(h·nᵢ/N)`
-/// px, at least 2; the first takes what is left. A tool that would leave
-/// the first under 2 px is not drawn (the first takes its share). Yields
-/// (index, top, height), top to bottom; nothing allocated.
-pub(crate) fn tally_bar(n: &[usize], h: u32) -> impl Iterator<Item = (usize, u32, u32)> + '_ {
-    let total = n.iter().sum::<usize>().max(1);
-    let share = move |i: usize| ((h as usize * n[i]) / total).max(2) as u32;
-    let (mut rest, mut k) = (0u32, n.len().min(1));
-    for i in 1..n.len() {
-        let s = share(i);
-        if rest + s + 2 > h {
-            break;
-        }
-        rest += s;
-        k = i + 1;
-    }
+/// A folded run's stacked tally bar (design.md §8.2): its tools, most used
+/// first (`n` of each: its calls), in a bar `h` px tall. The first
+/// `K = min(tools, h/4)` are drawn (the proportional part keeps at least
+/// half the bar); each gets 2 px and its share of the rest,
+/// `2 + floor((h − 2K)·nᵢ / Σ_K n)`; what flooring leaves goes to the
+/// first. So heights never grow down the tally, and the tools not drawn
+/// take no one's colour. Yields (index, top, height), top to bottom;
+/// nothing allocated.
+pub(crate) fn tally_bar<'a, T>(tally: &'a [T], n: impl Fn(&T) -> usize + 'a, h: u32) -> impl Iterator<Item = (usize, u32, u32)> + 'a {
+    let k = tally.len().min(h as usize / 4);
+    let sum = tally[..k].iter().map(&n).sum::<usize>().max(1);
+    let free = h as usize - 2 * k;
+    let share = move |t: &T| 2 + (free * n(t) / sum) as u32;
+    let rest = h - tally[..k].iter().map(&share).sum::<u32>();
     let mut top = 0;
-    (0..k).map(move |i| {
-        let s = if i == 0 { h.saturating_sub(rest) } else { share(i) };
+    tally[..k].iter().enumerate().map(move |(i, t)| {
+        let s = share(t) + if i == 0 { rest } else { 0 };
         let seg = (i, top, s);
         top += s;
         seg
@@ -306,8 +316,9 @@ pub(crate) fn tally_bar(n: &[usize], h: u32) -> impl Iterator<Item = (usize, u32
 
 #[cfg(test)]
 mod tests {
-    use super::{Family, GO, Glyph, Part, build, call, tally_bar, worker, worst};
+    use super::{Family, GO, Glyph, Part, Sprites, call, svg_of, tally_bar, worker, worst};
     use crate::subagents::Liveness;
+    use gpui_kit::AssetSource;
     use synaps_client::transcript::ToolStatus;
 
     /// The drawing table is injective (`GO` is `Fold` by design: one
@@ -338,13 +349,35 @@ mod tests {
         assert_eq!(GO, Glyph::Fold);
     }
 
-    /// Every stroked glyph tessellates.
+    /// A glyph is quads or strokes, never both; every stroked glyph (and
+    /// only those) is a sprite the app's assets serve, its SVG written from
+    /// its drawing.
     #[test]
-    fn every_stroke_builds() {
-        for g in Glyph::ALL.into_iter().filter(|g| g.parts().iter().any(|p| matches!(p, Part::Line(_)))) {
-            let p = build(g).unwrap_or_else(|| panic!("{g:?}"));
-            assert!(!p.vertices.is_empty(), "{g:?}");
+    fn every_stroked_glyph_is_a_sprite() {
+        let mut paths = Vec::new();
+        for g in Glyph::ALL {
+            let lines = g.parts().iter().filter(|p| matches!(p, Part::Line(_))).count();
+            assert!(lines == 0 || lines == g.parts().len(), "{g:?} mixes quads and strokes");
+            assert_eq!(g.sprite().is_some(), lines > 0, "{g:?}");
+            let Some(path) = g.sprite() else { continue };
+            assert!(!paths.contains(&path), "{path}");
+            paths.push(path);
+            let svg = Sprites.load(path).unwrap().unwrap_or_else(|| panic!("{path} not served"));
+            assert_eq!(&*svg, svg_of(g).as_bytes());
+            assert_eq!(svg_of(g).matches('M').count(), lines, "{g:?}: one subpath per line");
         }
+        assert_eq!(paths.len(), 5);
+        assert_eq!(
+            svg_of(Glyph::Ok),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10"><path d="M1.5 5.5L4 8L8.5 2" fill="none" stroke="#000" stroke-width="1.5"/></svg>"##
+        );
+        assert_eq!(
+            svg_of(Glyph::Close),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8" viewBox="0 0 8 8"><path d="M1.6 1.6L6.4 6.4M6.4 1.6L1.6 6.4" fill="none" stroke="#000" stroke-width="1"/></svg>"##
+        );
+        assert!(Sprites.load("glyph/nope.svg").unwrap().is_none());
+        assert!(Sprites.load("").unwrap().is_none());
+        assert_eq!(Sprites.list("glyph/").unwrap().len(), 5);
     }
 
     /// A call's state: the glyph never drops, ok has no word, and the
@@ -408,32 +441,71 @@ mod tests {
     }
 
     fn bar(n: &[usize], h: u32) -> Vec<(usize, u32, u32)> {
-        tally_bar(n, h).collect()
+        tally_bar(n, |&n| n, h).collect()
     }
 
-    /// The stacked bar: heights ∝ the tally, floored, at least 2 px, the
+    fn heights(n: &[usize], h: u32) -> Vec<u32> {
+        bar(n, h).iter().map(|s| s.2).collect()
+    }
+
+    /// The stacked bar: 2 px each and a share of the rest ∝ the tally, the
     /// remainder on the first; segments touch and fill the bar exactly.
     #[test]
     fn the_tally_bar_stacks_its_counts() {
-        // 7 tools, 36 px: bash 3 → 15, read 3 → 15, grep 1 → 5; +1 to the first.
-        assert_eq!(bar(&[3, 3, 1], 36), [(0, 0, 16), (1, 16, 15), (2, 31, 5)]);
+        // 7 tools, 36 px: 2 + floor(30·3/7) = 14, 14, 2 + floor(30/7) = 6; +2 to the first.
+        assert_eq!(bar(&[3, 3, 1], 36), [(0, 0, 16), (1, 16, 14), (2, 30, 6)]);
         assert_eq!(bar(&[4], 36), [(0, 0, 36)]);
-        // A tool used once in 40: floor(0.9) = 0, lifted to 2.
         assert_eq!(bar(&[39, 1], 36), [(0, 0, 34), (1, 34, 2)]);
         // The open summary's bar ends over the 1 px cut.
-        assert_eq!(bar(&[3, 3, 1], 35), [(0, 0, 15), (1, 15, 15), (2, 30, 5)]);
-        // More tools than 2 px slots: the last ones are not drawn; the first keeps 2 px.
+        assert_eq!(heights(&[3, 3, 1], 35), [15, 14, 6]);
+        // The finish gate's cases: a dominant tool and many singletons, and
+        // 13 names (MCP tools): 9 drawn, the dominant one the tallest.
+        let mut one_and_17 = vec![10];
+        one_and_17.extend([1; 17]);
+        assert_eq!(heights(&one_and_17, 36), [12, 3, 3, 3, 3, 3, 3, 3, 3]);
+        assert_eq!(heights(&[20, 12, 8, 5, 4, 3, 2, 1, 1, 1, 1, 1, 1], 36), [13, 5, 4, 3, 3, 2, 2, 2, 2]);
+        // Shady's: the most used is never drawn under a tool used as often.
+        let mut two_and_13 = vec![4, 4];
+        two_and_13.extend([1; 13]);
+        let segs = heights(&two_and_13, 36);
+        assert!(segs[0] >= segs[1] && segs[1] > segs[2], "{segs:?}");
+        // More tools than slots: the first h/4 drawn, the rest take no one's colour.
         let many = bar(&[1; 30], 36);
-        assert_eq!(many.len(), 18);
-        assert!(many.iter().all(|s| s.2 >= 2));
-        for (h, n) in [(36, vec![5, 4, 3, 2, 1, 1, 1]), (49, vec![12, 1]), (36, vec![1, 1, 1, 1]), (27, vec![30, 9, 2, 1, 1])] {
-            let segs = bar(&n, h);
-            assert_eq!(segs.iter().map(|s| s.2).sum::<u32>(), h, "{n:?} in {h}");
-            assert!(segs.iter().all(|s| s.2 >= 2), "{n:?} in {h}: {segs:?}");
-            for w in segs.windows(2) {
-                assert_eq!(w[0].1 + w[0].2, w[1].1, "{n:?}: they touch");
+        assert_eq!(many.len(), 9);
+        assert!(many.iter().all(|s| s.2 == 4));
+        assert!(bar(&[], 36).is_empty());
+    }
+
+    /// Over random tallies (sorted, as a summary's are) at every summary
+    /// height the steps give: tally order, heights never growing down it,
+    /// at least 2 px each, at most h/4 drawn, touching, filling the bar.
+    #[test]
+    fn the_tally_bar_keeps_the_tally_order() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move |below: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % below
+        };
+        for _ in 0..20_000 {
+            let tools = 1 + rnd(24) as usize;
+            let mut n: Vec<usize> = (0..tools).map(|_| 1 + (rnd(40) * rnd(40) / 40) as usize).collect();
+            n.sort_by_key(|&c| std::cmp::Reverse(c));
+            for h in [27, 35, 36, 49] {
+                let segs = bar(&n, h);
+                assert_eq!(segs.len(), n.len().min(h as usize / 4), "{n:?} in {h}");
+                assert_eq!(segs.iter().map(|s| s.2).sum::<u32>(), h, "{n:?} in {h}");
+                let mut top = 0;
+                for (k, &(i, t, s)) in segs.iter().enumerate() {
+                    assert_eq!((i, t), (k, top), "{n:?} in {h}: in order, touching");
+                    assert!(s >= 2, "{n:?} in {h}: {segs:?}");
+                    top += s;
+                }
+                for w in segs.windows(2) {
+                    assert!(w[0].2 >= w[1].2, "{n:?} in {h}: {segs:?} inverts");
+                }
             }
         }
-        assert!(bar(&[], 36).is_empty());
     }
 }

@@ -122,8 +122,13 @@ pub fn lift(from: u32, toward: u32, grounds: &[u32], target: f64) -> u32 {
 /// The TUI's `tool_panel` / `raised_surface`: `ground` stepped toward `toward`
 /// (0.5 % steps, at most 40 %) until it stands `target` off itself.
 pub fn step(ground: u32, toward: u32, target: f64) -> u32 {
+    step_upto(ground, toward, target, 80)
+}
+
+/// [`step`], at most `steps` half-percent steps toward `toward`.
+fn step_upto(ground: u32, toward: u32, target: f64, steps: u8) -> u32 {
     let mut out = ground;
-    for i in 1..=80u8 {
+    for i in 1..=steps {
         out = mix(ground, toward, f64::from(i) * 0.005);
         if contrast(out, ground) >= target {
             break;
@@ -392,9 +397,12 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     let card = step(chrome, ink, 1.32);
     let raised = step(chrome, ink, 1.14);
     // Diff washes stand `SURFACE` off the result surface, as `user` and
-    // `code` do off the canvas: never louder than the card (design.md §1.6).
-    let add_bg = step(tool_out, t.tool_result_ok, SURFACE);
-    let del_bg = step(tool_out, t.error_color, SURFACE);
+    // `code` do off the canvas (design.md §1.6), mixed at most 30 % (the
+    // most a built-in theme needs: solarized-dark's red), so a user theme
+    // whose ok or error colour sits near its result surface gets no loud
+    // wash; `ink` is floored on them.
+    let add_bg = step_upto(tool_out, t.tool_result_ok, SURFACE, 60);
+    let del_bg = step_upto(tool_out, t.error_color, SURFACE, 60);
     let you = accent.unwrap_or(t.prompt_fg);
     let focus = accent.unwrap_or(t.border_active);
     let or = |raw: Option<u32>, d: u32| raw.unwrap_or(d);
@@ -423,7 +431,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     for (role, from, c) in [("add_bg", tool_out, add_bg), ("del_bg", tool_out, del_bg)] {
         f.log.push(Check { role, from, color: c, grounds: vec![tool_out], floor: SURFACE });
     }
-    r.ink = f.text("ink", ink, &[canvas, user, tool_out, chrome, raised]);
+    r.ink = f.text("ink", ink, &[canvas, user, tool_out, chrome, raised, add_bg, del_bg]);
     r.prose = f.text("prose", t.claude_text, &[canvas]);
     r.dim = f.text("dim", t.muted, &[canvas]);
     r.you = f.text("you", you, &[canvas]);
@@ -482,7 +490,8 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.you_mark = f.mark("you_mark", you, &[canvas, user]);
     r.you_mark_t = f.mark("you_mark_t", you, &run_grounds);
     r.bullet = f.mark("bullet", t.list_bullet_color, &[canvas]);
-    r.warn_mark = f.mark("warn_mark", t.warning_color, &[canvas, tool, card]);
+    // `tool_out` too: a run's open body and hovered rows (`glyph::ink`).
+    r.warn_mark = f.mark("warn_mark", t.warning_color, &[canvas, tool, tool_out, card]);
     r.run_mark = f.mark("run_mark", t.status_streaming, &[canvas, tool, tool_out]);
     r.focus = f.mark("focus", focus, &[canvas, chrome]);
     r.tb2 = f.mark("tb2", t.table_border_color, &[canvas]);
@@ -1223,9 +1232,11 @@ mod tests {
         assert_eq!((r.add_bg, r.del_bg, r.you_mark_t), (0x292e31, 0x332c2f, 0x81a1c1));
     }
 
-    /// The diff washes stand 1.10:1 off the result surface and never louder
-    /// than the card by more than 0.15 (audit E2: they were up to 2.02:1 off
-    /// the canvas against the card's 1.24–1.48); text on them still reads.
+    /// The diff washes stand 1.10:1 off the result surface (audit E2: they
+    /// were up to 2.02:1 off the canvas against the card's 1.24–1.48), and
+    /// off the canvas at most 0.15 louder than the card, but in
+    /// solarized-dark (+0.21: its card is the quietest); text on them still
+    /// reads.
     #[test]
     fn diff_washes_sit_at_card_level() {
         let mut accents: Vec<Option<u32>> = vec![None];
@@ -1238,6 +1249,9 @@ mod tests {
                     assert!(contrast(wash, r.tool_out) >= SURFACE - 1e-9, "{name}");
                     assert!((1.44..=1.47).contains(&((off * 100.).round() / 100.)), "{name}: {off:.3} off the canvas");
                     assert!(contrast(r.ink, wash) >= 6.1, "{name}");
+                    let over = off - contrast(r.card, r.canvas);
+                    let most = if name == "solarized-dark" { 0.22 } else { 0.15 };
+                    assert!(over <= most, "{name}: {over:.3} louder than the card");
                 }
                 assert!(contrast(r.ok_o, r.add_bg) >= TEXT && contrast(r.err_o, r.del_bg) >= TEXT, "{name}");
             }
