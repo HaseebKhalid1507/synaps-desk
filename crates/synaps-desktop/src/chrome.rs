@@ -628,7 +628,13 @@ impl AppView {
                 )
             })
             .child(chips)
-            .child(div().flex_1().min_h_0().child(items))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(items)
+                    .child(crate::scrollbar::rows(&self.rail_list, 0., &self.bars.rail).ground(crate::scrollbar::Ground::Chrome)),
+            )
             .child(self.render_foot(p, cx))
     }
 
@@ -1113,6 +1119,7 @@ impl AppView {
             .h_full()
             .flex_none()
             .overflow_y_scroll()
+            .track_scroll(&self.bars.right.scroll)
             .border_l_1()
             .border_color(p.hair)
             .when(detached || cached, |d| {
@@ -1290,6 +1297,7 @@ impl AppView {
             })
             .max_h(px(max_h.max(160.)))
             .overflow_y_scroll()
+            .track_scroll(&self.bars.picker.scroll)
             .bg(p.chrome)
             .border_1()
             .border_color(p.edge)

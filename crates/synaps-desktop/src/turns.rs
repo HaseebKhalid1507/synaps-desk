@@ -4,8 +4,10 @@
 //! the tool surface; a finished run of 4 or more tool calls folds to one
 //! summary row. `YOU` and `AGENT` hang in the margin, once per turn.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::base::text::TextView;
@@ -22,6 +24,97 @@ use crate::theme::{self, Metrics, Palette};
 
 /// A run folds once it has finished with this many tool calls.
 pub(crate) const FOLD_AT: usize = 4;
+
+/// The kit parses markdown longer than this in the background (its
+/// `MAX_SYNC_FULL_REPLACE_BYTES`).
+const SYNC_PARSE: usize = 4 * 1024;
+
+/// A long markdown row's text view lays out empty on the frame it is made
+/// (its parse runs in the background), and it is made again whenever the
+/// row was not drawn the frame before (keyed state lives only while drawn).
+/// That layout is not the row's height: the row is as tall as its text
+/// comes to meanwhile ([`text_lines`]), and the list is told
+/// ([`ListState::set_item_measurement_readiness`]), so it keeps its anchor
+/// and follow until the next frame, which the parse brings. Without it a
+/// drag or a scroll into a long reply measured it a few px tall, and the
+/// list, believing it had reached its end, followed the tail again.
+#[derive(Default)]
+pub(crate) struct LateRows {
+    /// Long rows drawn the last frame (ids) and this one (index, id): no
+    /// allocation once warm.
+    prev: Vec<u64>,
+    cur: Vec<(usize, u64)>,
+    /// The characters a line of the list holds, as of the frame's start
+    /// (the list is borrowed while it lays rows out).
+    cpl: f32,
+}
+
+impl LateRows {
+    /// A frame begins on `list`.
+    pub(crate) fn frame(&mut self, list: &ListState, pad: f32, m: &Metrics) {
+        self.next();
+        self.cpl = cpl(list, pad, m);
+    }
+
+    fn next(&mut self) {
+        self.prev.clear();
+        self.prev.extend(self.cur.drain(..).map(|(_, id)| id));
+    }
+
+    /// Row `ix` is drawn this frame; whether its parse is pending (it was
+    /// not drawn the frame before).
+    fn drawn(&mut self, ix: usize, id: u64) -> bool {
+        if !self.cur.iter().any(|&(i, _)| i == ix) {
+            self.cur.push((ix, id));
+        }
+        !self.prev.contains(&id)
+    }
+
+    /// A row's layout this frame is its height: it is not long markdown,
+    /// or it was drawn the frame before too.
+    pub(crate) fn ready(&self, ix: usize) -> bool {
+        self.cur.iter().find(|&&(i, _)| i == ix).is_none_or(|&(_, id)| self.prev.contains(&id))
+    }
+}
+
+/// A transcript list asks `late` whether a row's layout is its height.
+pub(crate) fn readiness(list: &ListState, late: &Rc<RefCell<LateRows>>) {
+    let late = late.clone();
+    list.set_item_measurement_readiness(move |ix, _| late.borrow().ready(ix));
+}
+
+/// The lines `text` comes to, wrapped at `cpl` characters a line.
+fn text_lines(text: &str, cpl: f32) -> f32 {
+    text.split('\n').map(|l| (l.len() as f32 / cpl).ceil().max(1.)).sum()
+}
+
+/// The mean height display rows come to from their text, wrapped at `cpl`
+/// characters a line: a hint for rows not drawn yet.
+pub(crate) fn mean_height(disp: &[Disp], rows: &[RowCache], m: &Metrics, cpl: f32) -> f32 {
+    if disp.is_empty() {
+        return 0.;
+    }
+    let total: f32 = disp
+        .iter()
+        .map(|d| {
+            let lines = match d.kind {
+                Kind::User | Kind::Prose | Kind::Note => rows.get(d.item).map_or(1., |r| text_lines(&r.text, cpl)),
+                _ => 1.,
+            };
+            gap_of(d.gap, m) + lines * m.body_line + 2. * m.pad_y
+        })
+        .sum();
+    total / disp.len() as f32
+}
+
+fn gap_of(gap: Gap, m: &Metrics) -> f32 {
+    match gap {
+        Gap::None => 0.,
+        Gap::First => m.first_gap,
+        Gap::Part => m.part_gap,
+        Gap::Turn => m.turn_gap,
+    }
+}
 
 /// The space above a row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -490,6 +583,12 @@ impl Layout {
     }
 }
 
+/// About the characters a line of `list` holds (its side padding `pad`):
+/// prose wraps at about two an em.
+pub(crate) fn cpl(list: &ListState, pad: f32, m: &Metrics) -> f32 {
+    ((f32::from(list.viewport_bounds().size.width) - pad - 2. * m.pad_x) / (0.5 * m.body)).max(16.)
+}
+
 impl AppView {
     /// One display row: its gap, its label and the block.
     pub(crate) fn render_disp(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
@@ -499,11 +598,14 @@ impl AppView {
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
         let lay = self.layout;
-        let gap = match d.gap {
-            Gap::None => 0.,
-            Gap::First => m.first_gap,
-            Gap::Part => m.part_gap,
-            Gap::Turn => m.turn_gap,
+        let gap = gap_of(d.gap, &m);
+        // A long reply's parse pending ([`LateRows`]): as tall as its text.
+        let min_h = if matches!(d.kind, Kind::User | Kind::Prose) && !self.plain_rows && row.text.len() > SYNC_PARSE {
+            let mut late = self.late.borrow_mut();
+            let wait = late.drawn(ix, d.id);
+            px(if wait { text_lines(&row.text, late.cpl) * m.body_line } else { 0. })
+        } else {
+            px(0.)
         };
         let block: AnyElement = match d.kind {
             Kind::User => div()
@@ -516,10 +618,11 @@ impl AppView {
                 .text_size(px(m.body))
                 .line_height(px(m.body_line))
                 .text_color(p.ink)
+                .min_h(min_h)
                 .child(TextView::markdown(("md", d.id), row.text.clone()).style(cx.global::<theme::Scheme>().user_text.clone()))
                 .into_any_element(),
             Kind::Prose => {
-                let body = div().w_full().text_size(px(m.body)).line_height(px(m.body_line)).text_color(p.prose);
+                let body = div().w_full().min_h(min_h).text_size(px(m.body)).line_height(px(m.body_line)).text_color(p.prose);
                 if self.plain_rows {
                     body.child(row.text.clone()).into_any_element()
                 } else {
@@ -905,7 +1008,10 @@ mod tests {
     use serde_json::json;
     use synaps_client::transcript::ItemKind;
 
-    use super::{Counts, Disp, Gap, Hue, Kind, Layout, Metrics, RowCache, RunSummary, Summaries, Tone, Who, build, diff, turn_start};
+    use super::{
+        Counts, Disp, Gap, Hue, Kind, LateRows, Layout, Metrics, RowCache, RunSummary, Summaries, Tone, Who, build, diff, text_lines,
+        turn_start,
+    };
     use crate::files::{CallDelta, Ledger};
     use crate::subagents::Subagents;
     use synaps_client::Transcript;
@@ -1222,5 +1328,34 @@ mod tests {
             assert_eq!(pane - a - b, 672., "{pane}");
             assert!((a - b).abs() <= 1.);
         }
+    }
+
+    /// A long reply's layout is its height only once it was drawn the
+    /// frame before too (its parse landed); off screen a frame, it waits
+    /// again. Rows are told apart by id, not index (a splice moves them).
+    #[test]
+    fn a_long_rows_first_layout_is_not_its_height() {
+        let mut late = LateRows::default();
+        assert!(late.drawn(3, 42), "made this frame: its parse is pending");
+        assert!(!late.ready(3));
+        assert!(late.ready(4), "not long markdown: ready");
+        late.next();
+        assert!(!late.drawn(3, 42));
+        assert!(late.ready(3));
+        late.next();
+        assert!(!late.drawn(5, 42), "moved by a splice: the same row");
+        assert!(late.ready(5));
+        late.next();
+        late.next();
+        assert!(late.drawn(5, 42), "not drawn a frame: made again");
+        assert!(!late.ready(5));
+    }
+
+    #[test]
+    fn text_lines_wrap_each_line_and_count_blank_ones() {
+        assert_eq!(text_lines("", 80.), 1.);
+        assert_eq!(text_lines(&"x".repeat(80), 80.), 1.);
+        assert_eq!(text_lines(&"x".repeat(81), 80.), 2.);
+        assert_eq!(text_lines("a\n\nb", 80.), 3.);
     }
 }

@@ -37,6 +37,7 @@ mod model;
 mod named;
 mod palettes;
 mod rail;
+mod scrollbar;
 mod settings;
 mod settings_view;
 mod shell;
