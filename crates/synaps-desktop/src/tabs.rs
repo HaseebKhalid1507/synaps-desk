@@ -78,12 +78,22 @@ impl Kind {
 pub struct WorkerRef {
     pub handle: String,
     pub name: String,
+    /// The tool id of the call that started it, if that call's own result
+    /// had named it when the tab opened: with the name, who it is (a
+    /// cold-started daemon numbers its workers from 1 again).
+    pub call: Option<String>,
     key: String,
 }
 
 impl WorkerRef {
     pub fn new(session: &str, handle: &str, name: &str) -> Self {
-        WorkerRef { handle: handle.to_string(), name: name.to_string(), key: format!("{session}#{handle}") }
+        WorkerRef { handle: handle.to_string(), name: name.to_string(), call: None, key: format!("{session}#{handle}") }
+    }
+
+    /// Who it is: its call (if known) and name, as
+    /// [`crate::wtabs::same_worker`] compares them.
+    pub fn who(&self) -> (Option<&str>, &str) {
+        (self.call.as_deref(), &self.name)
     }
 
     /// Its number (`sa_7` → 7).
@@ -138,12 +148,16 @@ impl Tab {
         self.session.as_deref() == Some(session) && self.worker.as_ref().is_some_and(|w| w.handle == handle)
     }
 
-    /// Its session is now `to` (a worker tab's draft key with it).
-    fn set_session(&mut self, to: &str) {
-        if let Some(w) = &mut self.worker {
-            *w = WorkerRef::new(to, &w.handle, &w.name);
-        }
+    /// Its session is now `to` (a worker tab's draft key with it): the
+    /// draft keys that changed.
+    fn set_session(&mut self, to: &str) -> Option<(String, String)> {
+        let moved = self.worker.as_mut().map(|w| {
+            let from = std::mem::take(&mut w.key);
+            *w = WorkerRef { call: w.call.take(), ..WorkerRef::new(to, &w.handle, &w.name) };
+            (from, w.key.clone())
+        });
         self.session = Some(to.to_string());
+        moved.filter(|(a, b)| a != b)
     }
 }
 
@@ -201,9 +215,23 @@ pub struct Tabs {
     /// The session tab shown last (the current one while a view is on
     /// screen).
     last_session: Option<u64>,
+    /// Worker tabs' draft keys that changed with their session (a follow,
+    /// a merge): (from, to), for [`Drafts::rekey`].
+    rekeys: Vec<(String, String)>,
 }
 
 impl Tabs {
+    /// The worker tabs' draft keys changed since the last call ([`Tabs::rekeys`]).
+    pub fn take_rekeys(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.rekeys)
+    }
+
+    fn set_session(&mut self, ix: usize, to: &str) {
+        if let Some(k) = self.tabs[ix].set_session(to) {
+            self.rekeys.push(k);
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Tab> {
         self.tabs.iter()
     }
@@ -347,11 +375,11 @@ impl Tabs {
     fn follow(&mut self, ix: usize, to: &str) {
         let free = self.find(to).is_none();
         let from = self.tabs[ix].session.clone();
-        self.tabs[ix].set_session(to);
+        self.set_session(ix, to);
         // A pending tab named (a create, a resume): nothing else follows.
         let Some(from) = from else { return };
         if free && let Some(s) = self.find(&from) {
-            self.tabs[s].set_session(to);
+            self.set_session(s, to);
         }
         self.repoint_workers(&from, to);
         if self.follows.len() == CLOSED_MAX {
@@ -374,12 +402,15 @@ impl Tabs {
                     if self.last_session == Some(id) {
                         self.last_session = Some(keep);
                     }
+                    if let (Some(a), Some(b)) = (self.tabs[ix].draft_key(), self.tabs[j].draft_key()) {
+                        self.rekeys.push((a.to_string(), b.to_string()));
+                    }
                     self.remove(ix);
                     if shown {
                         self.active = self.tabs.iter().position(|t| t.id == keep);
                     }
                 }
-                None => self.tabs[ix].set_session(to),
+                None => self.set_session(ix, to),
             }
         }
     }
@@ -536,8 +567,26 @@ impl Tabs {
     /// after the session's tab and the worker tabs after it (after the
     /// visible tab if the session has none). `false`: it was the visible
     /// tab already.
+    #[cfg(test)]
     pub fn open_worker(&mut self, session: &str, handle: &str, name: &str, label: &str) -> bool {
+        self.open_worker_as(session, handle, name, None, label)
+    }
+
+    /// [`Tabs::open_worker`], its worker's call known (`call`). A tab that
+    /// holds an earlier worker under the handle (a cold-started daemon
+    /// reuses `sa_N`) is this one's now.
+    pub fn open_worker_as(&mut self, session: &str, handle: &str, name: &str, call: Option<&str>, label: &str) -> bool {
         if let Some(j) = self.find_worker(session, handle) {
+            let w = self.tabs[j].worker.as_mut().expect("a worker tab");
+            if !crate::wtabs::same_worker(w.who(), (call, name)) {
+                *w = WorkerRef { call: call.map(str::to_string), ..WorkerRef::new(session, handle, name) };
+                self.changed();
+                self.focus(j);
+                return true;
+            }
+            if w.call.is_none() && call.is_some() {
+                w.call = call.map(str::to_string);
+            }
             return self.focus(j);
         }
         let at = match self.find(session) {
@@ -552,7 +601,7 @@ impl Tabs {
         };
         self.next_id += 1;
         let mut t = Tab::new(self.next_id, Kind::Worker, Some(session.to_string()), label.to_string());
-        t.worker = Some(WorkerRef::new(session, handle, name));
+        t.worker = Some(WorkerRef { call: call.map(str::to_string), ..WorkerRef::new(session, handle, name) });
         let id = t.id;
         self.tabs.insert(at, t);
         if let Some(a) = self.active.as_mut().filter(|a| **a >= at) {
@@ -961,6 +1010,21 @@ impl Drafts {
             d.text = format!("{text}\n{}", d.text);
         }
         d.note = Some(note);
+    }
+
+    /// A worker tab's draft key changed with its session ([`Tabs::take_rekeys`]):
+    /// its draft goes with it (after one already there).
+    pub fn rekey(&mut self, from: &str, to: &str) {
+        let Some(d) = self.map.remove(from) else { return };
+        match self.map.remove(to) {
+            Some(had) if !had.text.trim().is_empty() => {
+                let cursor = had.text.len() + 1 + d.cursor;
+                self.map.insert(to.to_string(), Draft { text: format!("{}\n{}", had.text, d.text), cursor, note: had.note.or(d.note) });
+            }
+            _ => {
+                self.map.insert(to.to_string(), d);
+            }
+        }
     }
 
     /// Drafts of sessions no tab (open, or on the reopen stack) holds go.
@@ -1406,6 +1470,54 @@ mod tests {
         t.close(0);
         assert_eq!(t.saved(), Saved::default());
         assert!(Tabs::restore(&t.saved()).is_empty(), "not restored on launch");
+    }
+
+    /// L9: a background worker tab whose session follows a new id keeps
+    /// its draft (its key changes with it); one that merges into the tab
+    /// already holding its worker under the new id brings its text along.
+    #[test]
+    fn a_background_worker_tabs_draft_follows_its_session() {
+        let mut t = Tabs::default();
+        let mut d = Drafts::default();
+        t.open("a", "a", Place::New);
+        t.open_worker("a", "sa_1", "sleeper", "a");
+        t.open_worker("a", "sa_2", "scout", "a");
+        d.give_back("a#sa_2".into(), "to scout".into(), "n");
+        // sa_1's tab is shown; sa_2's is in the background with a draft.
+        t.focus(1);
+        t.attached("a2");
+        assert_eq!(strip(&t), ["a2", "a2/sa_1", "a2/sa_2"]);
+        for (from, to) in t.take_rekeys() {
+            d.rekey(&from, &to);
+        }
+        assert!(t.take_rekeys().is_empty(), "once");
+        d.retain(&|k| t.knows(k));
+        assert_eq!(d.switch(None, Some((9, Some("a2#sa_2"))), "", 0, None, |_| true).map(|d| d.text).as_deref(), Some("to scout"));
+        // Into a tab that holds the worker already: the text goes along, after its own.
+        let mut d = Drafts::default();
+        d.give_back("b#sa_4".into(), "mine".into(), "n");
+        d.give_back("a2#sa_4".into(), "theirs".into(), "n");
+        d.rekey("b#sa_4", "a2#sa_4");
+        assert_eq!(d.switch(None, Some((9, Some("a2#sa_4"))), "", 0, None, |_| true).map(|d| d.text).as_deref(), Some("theirs\nmine"));
+    }
+
+    /// H2: a tab that holds an earlier worker under a handle (a
+    /// cold-started daemon reuses `sa_N`) is the new one's once that one
+    /// opens: never two tabs for one handle, and the new worker's call
+    /// says who it is.
+    #[test]
+    fn a_reused_handle_takes_its_tab_over() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::New);
+        assert!(t.open_worker_as("a", "sa_2", "scout", Some("t_old"), "a"));
+        t.focus(0);
+        assert!(t.open_worker_as("a", "sa_2", "scout", Some("t_old"), "a"), "the same worker: focused");
+        assert!(!t.open_worker_as("a", "sa_2", "scout", None, "a"), "already shown");
+        t.focus(0);
+        assert!(t.open_worker_as("a", "sa_2", "builder", Some("t_new"), "a"));
+        assert_eq!(strip(&t), ["a", "a/sa_2"]);
+        assert_eq!(t.current_worker().map(|w| w.who()), Some((Some("t_new"), "builder")));
+        unique(&t);
     }
 
     #[test]

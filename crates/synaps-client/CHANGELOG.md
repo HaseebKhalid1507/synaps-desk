@@ -6,10 +6,10 @@ Commit hashes are this repository's (`synaps-desk`). PR numbers other than synap
 
 Additive only (synaps-desk `feat/worker-tabs`): cancelling a worker, as the TUI's `/workers cancel sa_N`. Nothing existing changes shape (`Command`, `Event` and `SessionCommand` are `#[non_exhaustive]`); no default changes.
 
-- New `Client::cancel_worker(handle_id)` and `Command::CancelWorker { handle_id }`: the engine command `{"cmd":"engine_command","id":…,"name":"workers","arg":"cancel sa_N"}` (v0.11.1 `actor_cmds.rs`), owner-only like a steer. The worker stops at its next step and sends no completion wake; the engine notes the cancel in the main conversation (an `external` event, `content_type` `subagent_cancelled`).
+- New `Client::cancel_worker(handle_id)` and `Command::CancelWorker { handle_id }`: the engine command `{"cmd":"engine_command","id":…,"name":"workers","arg":"cancel sa_N"}` (v0.11.1 `actor_cmds.rs`), owner-only like a steer. The worker stops at its next step and sends no completion wake; the engine notes the cancel in the main conversation (an `external` event, `content_type` `subagent_cancelled`). One worker only: a handle that is not `sa_` and digits (`all`, which v0.11.1 reads as every running worker) is never sent and is answered `Err`.
 - New `SessionCommand::EngineCommand { id, name, arg }` (the wire command it goes as).
-- New `Event::WorkerCancel { attach_seq, handle_id, result }`: the reply, matched by its query id (another client's broadcast `query_result` never counts). `Ok(text)`: the daemon's `{"kind":"output"}` (`Cancelled sa_3 (they stop at their next step; …)`). `Err(why)`: its `{"kind":"error"}` (`sa_3 is already completed — nothing to cancel`), a non-owner's `refused` (`refused: input is owned by client #1`), a cancel in flight when the connection dropped, or one asked for while not connected. Every cancel gets exactly one answer.
-- Tests: `tests/fake_daemon.rs` `cancel_worker_wire_shape_and_replies`.
+- New `Event::WorkerCancel { attach_seq, handle_id, result }`: the reply, matched by its query id (another client's broadcast `query_result` never counts). `Ok(text)`: the daemon's `{"kind":"output"}` (`Cancelled sa_3 (they stop at their next step; …)`). `Err(why)`: its `{"kind":"error"}` (`sa_3 is already completed — nothing to cancel`), a non-owner's `refused` (`refused: input is owned by client #1`), a cancel in flight when the connection dropped, the session ended, the daemon said bye or the session was detached, one asked for while not connected, or a handle that is not one worker's. Every cancel gets exactly one answer.
+- Tests: `tests/fake_daemon.rs` `cancel_worker_wire_shape_and_replies`, `cancel_worker_sends_one_handle_and_always_answers`.
 
 For synaps-avatar (nyx): nothing to change.
 

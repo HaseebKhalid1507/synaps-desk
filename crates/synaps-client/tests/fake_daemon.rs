@@ -1205,3 +1205,43 @@ async fn cancel_worker_wire_shape_and_replies() {
     assert!(r.is_err_and(|e| e.contains("not connected")));
     client.shutdown().unwrap();
 }
+
+/// One worker only: a handle that is not `sa_N` (`all` would cancel every
+/// running worker) is answered `Err` and never sent. A cancel in flight as
+/// the session ends, or as it is detached, is answered too.
+#[tokio::test]
+async fn cancel_worker_sends_one_handle_and_always_answers() {
+    let mut fake = Fake::start("cancel-end").await;
+    let (client, events) = fake.client();
+    let reply = |events| async move {
+        wait(events, "cancel reply", |e| match e {
+            Event::WorkerCancel { attach_seq, handle_id, result } => Some((*attach_seq, handle_id.clone(), result.clone())),
+            _ => None,
+        })
+        .await
+    };
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    for bad in ["all", "sa_", "sa_3 sa_4", "3", "sa_x", " sa_3"] {
+        client.cancel_worker(bad).unwrap();
+        let (s, h, r) = reply(&events).await;
+        assert_eq!((s, h.as_str()), (seq, bad));
+        assert!(r.is_err_and(|e| e.contains("not a worker's handle")), "{bad}");
+    }
+    client.cancel_worker("sa_7").unwrap();
+    assert_eq!(conn.recv_cmd().await["arg"], "cancel sa_7", "nothing before it went out");
+    conn.event(30, json!({"ev": "ended", "reason": "client_quit"})).await;
+    let (s, h, r) = reply(&events).await;
+    assert_eq!((s, h.as_str()), (seq, "sa_7"));
+    assert!(r.is_err_and(|e| e.contains("session ended")));
+
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    client.cancel_worker("sa_8").unwrap();
+    assert_eq!(conn.recv_cmd().await["arg"], "cancel sa_8");
+    client.detach().unwrap();
+    let (s, h, r) = reply(&events).await;
+    assert_eq!((s, h.as_str()), (seq, "sa_8"));
+    assert!(r.is_err_and(|e| e.contains("detached")));
+    client.shutdown().unwrap();
+}

@@ -93,11 +93,19 @@ pub struct Candidate {
     pub handle_id: String,
     pub subagent_id: u64,
     pub name: String,
+    /// The tool id of the call that started it, once that call's own
+    /// result named it (who it is: [`crate::subagents::Subagents::ident`]).
+    pub call: Option<String>,
 }
 
 impl Candidate {
     pub fn of(id: u64, name: &str) -> Self {
-        Candidate { handle_id: format!("sa_{id}"), subagent_id: id, name: name.to_string() }
+        Candidate { handle_id: format!("sa_{id}"), subagent_id: id, name: name.to_string(), call: None }
+    }
+
+    pub fn with_call(mut self, call: Option<&str>) -> Self {
+        self.call = call.map(str::to_string);
+        self
     }
 }
 
@@ -132,6 +140,8 @@ pub struct Worker {
     /// The session's folder (its diffs' paths).
     cwd: Option<String>,
     pub name: String,
+    /// Its call's tool id, if known when it opened ([`Candidate::call`]).
+    call: Option<String>,
     pub model: String,
     pub transcript: Transcript,
     /// What its rows read (the session's are another's): its file tools'
@@ -158,6 +168,8 @@ pub struct Worker {
     pub crumb: SharedString,
     pub facts: SharedString,
     pub hint: SharedString,
+    /// What its breadcrumb says while its session waits on a prompt.
+    pub needs: SharedString,
     /// What the right panel's FILES says over this view (they are the
     /// session's thread's, not this worker's).
     pub files_note: SharedString,
@@ -181,6 +193,7 @@ impl Worker {
             generation: GENERATION.fetch_add(1, Ordering::Relaxed),
             cwd: cwd.map(str::to_string),
             name: c.name.clone(),
+            call: c.call.clone(),
             model: String::new(),
             transcript,
             files,
@@ -196,6 +209,7 @@ impl Worker {
             crumb: SharedString::default(),
             facts: SharedString::default(),
             hint: SharedString::default(),
+            needs: SharedString::default(),
             files_note: SharedString::default(),
             unsent: None,
             tabbed: false,
@@ -206,7 +220,12 @@ impl Worker {
 
     /// This view started over: the same handle, from 0, saying why.
     fn restart(&mut self, why: String) {
-        let c = Candidate { handle_id: self.handle_id.clone(), subagent_id: self.subagent_id, name: self.name.clone() };
+        let c = Candidate {
+            handle_id: self.handle_id.clone(),
+            subagent_id: self.subagent_id,
+            name: self.name.clone(),
+            call: self.call.clone(),
+        };
         let (unsent, tabbed) = (self.unsent.take(), self.tabbed);
         *self = Worker::new(&c, self.cwd.as_deref());
         self.unsent = unsent;
@@ -217,11 +236,13 @@ impl Worker {
     /// The breadcrumb's and the composer's strings, again.
     fn strings(&mut self) {
         self.crumb = format!("{} ({})", self.name, self.handle_id).into();
+        self.needs = format!("{}'s session needs you → open", self.name).into();
         self.files_note = format!("the session's thread, not {}'s: tool inputs, not the disk", self.name).into();
         let model = self.model.rsplit_once('/').map_or(self.model.as_str(), |(_, m)| m);
         let dropped = (self.dropped > 0).then(|| format!("{} earlier rows dropped", self.dropped));
         self.facts = [(!model.is_empty()).then(|| model.to_string()), dropped].into_iter().flatten().collect::<Vec<_>>().join(" · ").into();
-        let back = if self.tabbed { " · closing this tab leaves it as it is" } else { " · Esc returns to the session" };
+        // A worker tab's notice says what closing it does: not the hint.
+        let back = if self.tabbed { "" } else { " · Esc returns to the session" };
         self.hint = if self.read_only() {
             format!("{} {}: read-only{back}", self.name, self.state()).into()
         } else if self.status.is_empty() {
@@ -256,9 +277,30 @@ impl Worker {
     /// The page is another worker's (the handle was reused: a cold-started
     /// daemon numbers its workers from 1 again): its cursor went back (the
     /// daemon clamps a cursor past a journal's end to that end), or it
-    /// names another worker.
+    /// names another worker. A worker tab's view is of one worker: even
+    /// its first page must name it ([`Worker::other`]).
     fn reused(&self, page: &WatchPage) -> bool {
-        !self.status.is_empty() && (page.next_seq < self.next_seq || (!page.agent_name.is_empty() && page.agent_name != self.name))
+        let named = !page.agent_name.is_empty() && page.agent_name != self.name;
+        (self.tabbed && named) || (!self.status.is_empty() && (page.next_seq < self.next_seq || named))
+    }
+
+    /// The handle names another worker now: this view is gone (read-only,
+    /// no polls, no steer), saying why; whatever it showed stays.
+    fn other(&mut self, why: String) {
+        self.steerable = false;
+        self.notice(why.clone());
+        self.gone = Some(why);
+        self.transcript.set_busy(false);
+        self.strings();
+    }
+
+    /// Whether this view is of worker `c` (its call if both know it, else
+    /// its name), not an earlier one under the same handle.
+    fn is(&self, c: &Candidate) -> bool {
+        match (self.call.as_deref(), c.call.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.name == c.name,
+        }
     }
 
     /// One page into its transcript. `scrolled_back`: its list does not
@@ -404,6 +446,9 @@ pub struct Watch {
     /// The daemon's process the views were read from: another (a restart)
     /// starts the focused view over at the next attach.
     daemon: Option<u32>,
+    /// The handles the session's open worker tabs show ([`Watch::hold`]):
+    /// their views stay while the tab does, finished or not.
+    held: Vec<String>,
 }
 
 impl Watch {
@@ -449,7 +494,7 @@ impl Watch {
         if let Some(w) = self.focused()
             && !out.iter().any(|c| c.handle_id == w.handle_id)
         {
-            out.push(Candidate { handle_id: w.handle_id.clone(), subagent_id: w.subagent_id, name: w.name.clone() });
+            out.push(Candidate { handle_id: w.handle_id.clone(), subagent_id: w.subagent_id, name: w.name.clone(), call: w.call.clone() });
         }
         out.sort_by_key(|c| c.subagent_id);
         out
@@ -467,12 +512,27 @@ impl Watch {
         self.open_as(c, cwd, now, true);
     }
 
+    /// Worker `handle_id`'s view's generation, if it has one.
+    pub fn generation_of(&self, handle_id: &str) -> Option<u64> {
+        self.workers.get(handle_id).map(|w| w.generation)
+    }
+
+    /// The focused view is of worker `c` ([`Worker::is`]).
+    pub fn focused_is(&self, c: &Candidate) -> bool {
+        self.focused().is_some_and(|w| w.is(c))
+    }
+
     /// The focused view is a worker tab's.
     pub fn in_tab(&self) -> bool {
         self.focused().is_some_and(|w| w.tabbed)
     }
 
     fn open_as(&mut self, c: &Candidate, cwd: Option<&str>, now: Instant, tab: bool) {
+        // A view under this handle of an earlier worker (a cold-started
+        // daemon reuses `sa_N`) is not this one's: it goes.
+        if self.workers.get(&c.handle_id).is_some_and(|w| !w.is(c)) {
+            self.workers.remove(&c.handle_id);
+        }
         let w = self.workers.entry(c.handle_id.clone()).or_insert_with(|| {
             let mut w = Worker::new(c, cwd);
             w.notice(if tab {
@@ -548,6 +608,30 @@ impl Watch {
         }
     }
 
+    /// The session's open worker tabs show `handles`: their views stay
+    /// (no page read twice, the scroll kept, a refused steer's text with
+    /// its tab) until the tab closes.
+    pub fn hold(&mut self, handles: Vec<String>) {
+        self.held = handles;
+    }
+
+    fn kept(&self, id: &str) -> bool {
+        self.focus.as_deref() == Some(id) || self.held.iter().any(|h| h == id)
+    }
+
+    /// Worker `handle_id`'s handle names another worker now (its tab's
+    /// worker is not the one the session's workers say): its view is
+    /// gone, saying why. Whether that changed it.
+    pub fn disown(&mut self, handle_id: &str, why: impl FnOnce() -> String) -> bool {
+        let Some(w) = self.workers.get_mut(handle_id).filter(|w| w.gone.is_none()) else { return false };
+        w.other(why());
+        if self.focus.as_deref() == Some(handle_id) {
+            self.next_poll = None;
+            self.pending = None;
+        }
+        true
+    }
+
     /// Nothing to ask (no daemon: `--offline`): the focused view says so
     /// once, and nothing polls.
     pub fn no_daemon(&mut self, why: &str) {
@@ -616,6 +700,11 @@ impl Watch {
         let scrolled_back = self.scrolled_back;
         let Some(w) = self.workers.get_mut(handle_id) else { return false };
         let (next, changed) = match reply {
+            WatchReply::Page(page) if w.reused(&page) && w.tabbed => {
+                let who = if page.agent_name.is_empty() { String::new() } else { format!(" ({})", page.agent_name) };
+                w.other(format!("{handle_id} is another worker now{who} (the daemon restarted): {} is gone", w.name));
+                (None, true)
+            }
             WatchReply::Page(page) if w.reused(&page) => {
                 w.restart(format!("{handle_id} is another worker now (the daemon restarted): its thread from the start"));
                 (Some(now), true)
@@ -681,10 +770,16 @@ impl Watch {
             return;
         }
         self.reset(now);
-        if let Some(w) = self.focused_mut() {
-            let why = format!("the daemon restarted: {}'s thread from the start", w.handle_id);
-            w.restart(why);
+        // The views kept read from 0 again (a worker tab's goes if its
+        // handle names another worker now).
+        let held = std::mem::take(&mut self.held);
+        for (id, w) in self.workers.iter_mut() {
+            if self.focus.as_deref() == Some(id.as_str()) || held.contains(id) {
+                let why = format!("the daemon restarted: {}'s thread from the start", w.handle_id);
+                w.restart(why);
+            }
         }
+        self.held = held;
     }
 
     /// The connection the views were read on went: nothing in flight, no
@@ -693,9 +788,10 @@ impl Watch {
     fn reset(&mut self, now: Instant) {
         self.pending = None;
         self.steers.clear();
-        let focus = self.focus.clone();
-        self.retain(|id, _| focus.as_deref() == Some(id));
-        if let Some(w) = self.focused_mut() {
+        let (focus, held) = (self.focus.clone(), std::mem::take(&mut self.held));
+        self.retain(|id, _| focus.as_deref() == Some(id) || held.iter().any(|h| h == id));
+        self.held = held;
+        for w in self.workers.values_mut() {
             w.steerable = false;
             w.strings();
         }
@@ -709,15 +805,16 @@ impl Watch {
         self.steers.clear();
     }
 
-    /// Drop the views nobody is looking at whose worker no longer runs:
-    /// gone, finished by its own pages, or (a view that was not on screen
-    /// when it ended) by the tray's word, `live`. Forget the tray's ended
-    /// workers after [`FINISHED_TTL`].
+    /// Drop the views nobody is looking at (on screen, or held by a
+    /// worker tab: [`Watch::hold`]) whose worker no longer runs: gone,
+    /// finished by its own pages, or (a view that was not on screen when it
+    /// ended) by the tray's word, `live`. Forget the tray's ended workers
+    /// after [`FINISHED_TTL`].
     pub fn prune(&mut self, now: Instant, live: &[Live]) {
-        let focus = self.focus.clone();
+        let keep: Vec<String> = self.workers.keys().filter(|id| self.kept(id)).cloned().collect();
         self.retain(|id, w| {
             let ended = w.read_only() || w.finished_at.is_some() || live.iter().any(|l| l.id == w.subagent_id && l.status.terminal());
-            focus.as_deref() == Some(id) || !ended
+            keep.iter().any(|k| k == id) || !ended
         });
         self.seen.retain(|_, ended| ended.is_none_or(|t| now.saturating_duration_since(t) < FINISHED_TTL));
     }
@@ -808,6 +905,14 @@ impl Watch {
             }
         }
         true
+    }
+
+    /// A refused steer's text waits for the thread on screen ([`Watch::take_unsent`]).
+    pub fn has_unsent(&self) -> bool {
+        match self.focus.as_deref() {
+            Some(id) => self.workers.get(id).is_some_and(|w| w.unsent.is_some()),
+            None => self.unsent.is_some(),
+        }
     }
 
     /// A refused steer's text for the composer, once the thread it is for
@@ -1086,6 +1191,77 @@ mod tests {
         assert_eq!(w.steer_target(), Some(Err("sleeper can't be steered right now: try again in a moment".into())));
     }
 
+    /// M2: a worker tab's view stays while its tab does ([`Watch::hold`]),
+    /// finished or not: nothing is paged twice, and a steer refused after
+    /// its tab was left comes back into that tab's composer, never the
+    /// session's. Its tab closed, it goes as any other view.
+    #[test]
+    fn a_worker_tabs_view_stays_with_its_tab() {
+        let t0 = Instant::now();
+        let mut w = Watch::default();
+        w.hold(vec!["sa_2".into()]);
+        w.open_tab(&Candidate::of(2, "sleeper"), None, t0);
+        let _ = w.take_poll(t0);
+        w.on_reply("sa_2", 0, running(4, false, json!([])), t0);
+        w.steer_sent("sa_2", "stop after the next step");
+        // Its session's tab is shown: the steer is refused there.
+        w.focus_main();
+        assert!(w.steer_refused("subagent sa_2 is not running"));
+        let done = Live {
+            id: 2,
+            call: None,
+            name: "sleeper".into(),
+            status: crate::subagents::Status::Done,
+            line: String::new(),
+            tools: None,
+            elapsed: None,
+            watchable: true,
+        };
+        w.prune(t0, std::slice::from_ref(&done));
+        assert_eq!(w.worker("sa_2").map(|v| v.next_seq), Some(4), "kept: its cursor too");
+        assert!(!w.has_unsent() && w.take_unsent().is_none(), "never the session's composer");
+        // A reconnect keeps it as well.
+        w.on_reconnect(t0, None);
+        assert!(w.worker("sa_2").is_some());
+        // Back on its tab: its text, for its composer.
+        w.open_tab(&Candidate::of(2, "sleeper"), None, t0);
+        assert!(w.has_unsent());
+        assert_eq!(w.take_unsent().map(|u| u.0).as_deref(), Some("stop after the next step"));
+        // Its tab closed: it goes once nobody looks at it.
+        w.focus_main();
+        w.hold(Vec::new());
+        w.prune(t0, std::slice::from_ref(&done));
+        assert!(w.worker("sa_2").is_none());
+    }
+
+    /// H2: a worker tab's view is of one worker. A page that names another
+    /// (a cold-started daemon gave the handle to it), even the first, makes
+    /// it gone: nothing of the other worker is read into it, nothing
+    /// steers it. In place, the view starts over as before. Opening the
+    /// handle's new worker replaces the old one's view.
+    #[test]
+    fn a_worker_tab_never_shows_another_worker() {
+        let t0 = Instant::now();
+        let mut w = Watch::default();
+        w.open_tab(&Candidate::of(2, "scout").with_call(Some("t_old")), None, t0);
+        let _ = w.take_poll(t0);
+        let builder = page(json!({"handle_id": "sa_2", "subagent_id": 2, "agent_name": "builder", "status": "running", "steerable": true,
+            "next_seq": 3, "events": [{"kind": "text", "text": "builder's secret"}]}));
+        assert!(w.on_reply("sa_2", 0, builder, t0));
+        let v = w.focused().unwrap();
+        assert_eq!(v.state(), "gone");
+        assert!(texts(v).iter().all(|(_, t)| !t.contains("builder's secret")), "nothing of builder's");
+        assert!(texts(v).last().unwrap().1.contains("sa_2 is another worker now (builder)"));
+        assert_eq!(w.poll_due(), None, "nothing polls");
+        assert!(w.steer_target().is_some_and(|t| t.is_err()), "nothing steers");
+        // The handle's new worker opened (its own call): a view of its own.
+        w.open_tab(&Candidate::of(2, "builder").with_call(Some("t_new")), None, t0);
+        assert_eq!(w.focused().unwrap().state(), "connecting");
+        // Disowned from outside (the session's workers say so): gone, once.
+        assert!(w.disown("sa_2", || "sa_2 is another worker now".into()));
+        assert!(!w.disown("sa_2", || unreachable!()));
+    }
+
     /// A refusal goes to the steer its reason names (two in flight), and
     /// its text waits for its view: back in the composer once that view is
     /// on screen again, never while another thread is; a view that has
@@ -1119,6 +1295,7 @@ mod tests {
             t0,
             &[Live {
                 id: 3,
+                call: None,
                 name: "scout".into(),
                 status: crate::subagents::Status::Done,
                 line: String::new(),
@@ -1188,7 +1365,16 @@ mod tests {
     #[test]
     fn a_finished_view_goes_once_nobody_looks_at_it() {
         use crate::subagents::Status;
-        let l = |id, status| Live { id, name: format!("w{id}"), status, line: String::new(), tools: None, elapsed: None, watchable: true };
+        let l = |id, status| Live {
+            id,
+            call: None,
+            name: format!("w{id}"),
+            status,
+            line: String::new(),
+            tools: None,
+            elapsed: None,
+            watchable: true,
+        };
         let t0 = Instant::now();
         let mut w = Watch::default();
         for id in [1, 3] {
@@ -1222,7 +1408,16 @@ mod tests {
     #[test]
     fn the_tray_flashes_a_finished_worker_then_drops_it() {
         use crate::subagents::Status;
-        let l = |id, status| Live { id, name: format!("w{id}"), status, line: String::new(), tools: None, elapsed: None, watchable: true };
+        let l = |id, status| Live {
+            id,
+            call: None,
+            name: format!("w{id}"),
+            status,
+            line: String::new(),
+            tools: None,
+            elapsed: None,
+            watchable: true,
+        };
         let t0 = Instant::now();
         let mut w = Watch::default();
         let ids = |v: &(Vec<Live>, Option<Instant>)| v.0.iter().map(|l| l.id).collect::<Vec<_>>();

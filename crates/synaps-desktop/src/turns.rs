@@ -681,8 +681,10 @@ impl AppView {
                 }
             }
         });
-        let worker =
-            item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name)).and_then(|t| self.model.shown_subagents().view(&t.tool_id));
+        let worker = item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name)).and_then(|t| {
+            let subs = self.model.shown_subagents();
+            subs.view(&t.tool_id).map(|v| (v, subs.current(&t.tool_id)))
+        });
         v_flex()
             .w_full()
             .bg(p.tool)
@@ -690,7 +692,7 @@ impl AppView {
             .text_size(px(m.mono))
             .line_height(px(m.mono_line))
             .child(head)
-            .children(worker.map(|v| self.subagent_block(v, p, m, lay, cx)))
+            .children(worker.map(|(v, current)| self.subagent_block(v, current, p, m, lay, cx)))
             .children(body)
             .into_any_element()
     }
@@ -700,9 +702,12 @@ impl AppView {
     /// it runs, its result or why it failed once it ends. Nothing moves:
     /// it changes when an event or a row comes. Not attached (a cached tab
     /// opening, a detached session): as last seen, dimmed. On the
-    /// session's thread a background worker's block opens it as its tray
-    /// row does ([`crate::wtabs`]), with OPEN ↗ (in a tab) on hover.
-    fn subagent_block(&self, v: &subagents::View, p: &Palette, m: &Metrics, lay: Layout, cx: &Context<Self>) -> AnyElement {
+    /// session's thread a background worker's block opens it in a tab
+    /// (history: [`crate::wtabs`]), with OPEN ↗ on hover. `current`: no
+    /// later call has its `sa_N` (a cold-started daemon numbers from 1
+    /// again); one that has is another worker's handle now, and the block
+    /// does nothing.
+    fn subagent_block(&self, v: &subagents::View, current: bool, p: &Palette, m: &Metrics, lay: Layout, cx: &Context<Self>) -> AnyElement {
         use subagents::Tone as T;
         let seen = self.model.active.is_none();
         let running = v.status.is_some_and(subagents::Status::running);
@@ -737,9 +742,10 @@ impl AppView {
             .child(div().flex_none().max_w(px(m.mono * 0.6 * 24.)).overflow_hidden().text_ellipsis().text_color(name).child(v.name.clone()))
             .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(facts).child(v.facts.clone()));
         // A background worker of the session on screen: it opens.
-        let open = v.id.filter(|_| v.watchable && self.model.watch.focus().is_none());
-        let head = head.when_some(open, |d, id| {
-            let name = v.name.clone();
+        let open = v.id.filter(|_| v.watchable && current && self.model.watch.focus().is_none());
+        let who = open.map(|id| crate::wtabs::Who::new(id, v.name.clone(), v.call.clone()));
+        let head = head.when_some(who.clone(), |d, who| {
+            let id = who.id;
             d.child(
                 div()
                     .id(("wblock-open", id as usize))
@@ -749,9 +755,13 @@ impl AppView {
                     .group_hover("wblock", |s| s.text_color(p.dim_t))
                     .hover(|s| s.text_color(p.prose_t))
                     .child("OPEN ↗")
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                         cx.stop_propagation();
-                        this.open_worker_tab(id, &name, cx);
+                        if ev.click_count() > 1 {
+                            return;
+                        }
+                        this.swallow_clicks = Some(std::time::Instant::now() + crate::wtabs::MULTI_CLICK);
+                        this.open_worker_tab(&who, cx);
                     })),
             )
         });
@@ -773,17 +783,28 @@ impl AppView {
                 },
             ),
         );
-        let Some(id) = open else { return block.into_any_element() };
-        let (n1, n2) = (v.name.clone(), v.name.clone());
-        let tip = SharedString::new_static("click: watch this worker · middle-click: in a tab · right-click: more");
+        let Some(who) = who else {
+            // Its handle names a later worker now: nothing of that one's here.
+            if let Some(id) = v.id.filter(|_| v.watchable && !current && self.model.watch.focus().is_none()) {
+                let tip = SharedString::new_static("an earlier worker: a restarted daemon has given its handle to another one since");
+                return block
+                    .id(("wblock-old", id as usize))
+                    .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+                    .into_any_element();
+            }
+            return block.into_any_element();
+        };
+        let id = who.id;
+        let who2 = who.clone();
+        let tip = SharedString::new_static("click: open it in a tab · right-click: more");
         block
             .id(("wblock", id as usize))
             .group("wblock")
             .cursor_pointer()
             .hover(|d| d.bg(p.tool_out))
-            .when(self.menu.is_none(), |d| d.tooltip(crate::wtabs::card_tip(cx.weak_entity(), id, tip)))
-            .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(id, &n1, ev, window, cx)))
-            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(id, &n2, ev, window, cx)))
+            .when(self.menu.is_none(), |d| d.tooltip(crate::wtabs::card_tip(cx.weak_entity(), who.clone(), tip)))
+            .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who, true, ev, window, cx)))
+            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who2, true, ev, window, cx)))
             .into_any_element()
     }
 

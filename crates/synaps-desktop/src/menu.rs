@@ -1,6 +1,7 @@
 //! A context menu: a column of items in the gear menu's style, at the
-//! pointer (a right-click) or over a row (the Menu key, Shift+F10). ↑/↓
-//! (Home/End) move the selection over the items that can act, Enter picks,
+//! pointer (a right-click) or over a row (the Menu key, Shift+F10). ↑/↓,
+//! Tab/Shift+Tab (Home/End) move the selection over the items that can
+//! act, Enter or Space picks (a new press: a held key's repeats never do),
 //! Esc or a click elsewhere closes it. Nothing moves. No GPUI in the logic
 //! ([`Menu`]); [`render`] draws it.
 
@@ -51,6 +52,22 @@ pub(crate) enum At {
     Row(u64),
 }
 
+/// How an item was picked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum How {
+    /// A click, its count (2: the second click of a double-click).
+    Click(usize),
+    /// Enter or Space; `press`: a new press, not a held key's repeat.
+    Key { press: bool },
+}
+
+impl How {
+    /// A new press: a single click, or a key's first key-down.
+    pub fn is_press(self) -> bool {
+        matches!(self, How::Click(0 | 1) | How::Key { press: true })
+    }
+}
+
 /// What a key did to an open menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Key<A> {
@@ -94,10 +111,13 @@ impl<A: Copy> Menu<A> {
         }
     }
 
-    /// A key (as GPUI names it) while the menu is open.
-    pub fn key(&mut self, key: &str) -> Key<A> {
+    /// A key (as GPUI names it; `shift` held; `press`: a new press, not a
+    /// held key's repeat) while the menu is open. A repeat of Enter or
+    /// Space picks nothing.
+    pub fn key(&mut self, key: &str, shift: bool, press: bool) -> Key<A> {
         match key {
-            "down" | "tab" => self.step(true),
+            "tab" => self.step(!shift),
+            "down" => self.step(true),
             "up" => self.step(false),
             "home" => {
                 self.sel = None;
@@ -108,7 +128,7 @@ impl<A: Copy> Menu<A> {
                 self.step(false);
             }
             "enter" | "space" => {
-                return match self.sel.and_then(|i| self.items.get(i)).filter(|it| it.enabled()) {
+                return match self.sel.and_then(|i| self.items.get(i)).filter(|it| it.enabled() && press) {
                     Some(it) => Key::Pick(it.act),
                     None => Key::Moved,
                 };
@@ -122,12 +142,13 @@ impl<A: Copy> Menu<A> {
 }
 
 /// The menu's box, in the gear menu's style; `pick` acts on an item
-/// (a click, or Enter through [`Menu::key`]), a mouse-down outside closes it.
+/// (a click, with its count: [`How`]; or Enter through [`Menu::key`]), a
+/// mouse-down outside closes it.
 pub(crate) fn render<A: Copy + 'static>(
     id: &'static str,
     menu: &Menu<A>,
     p: &Palette,
-    pick: fn(&mut AppView, A, &mut Window, &mut Context<AppView>),
+    pick: fn(&mut AppView, A, How, &mut Window, &mut Context<AppView>),
     cx: &Context<AppView>,
 ) -> Stateful<Div> {
     let mut col = v_flex()
@@ -167,9 +188,9 @@ pub(crate) fn render<A: Copy + 'static>(
             )
             .when_some(it.key, |d, k| d.child(mono(k, 12., p.dim_k)));
         if on {
-            row = row.cursor_pointer().hover(|d| d.bg(p.raised)).on_click(cx.listener(move |this, _, window, cx| {
+            row = row.cursor_pointer().hover(|d| d.bg(p.raised)).on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                pick(this, act, window, cx);
+                pick(this, act, How::Click(ev.click_count()), window, cx);
             }));
         } else if let Some(why) = it.why_not.clone() {
             row = row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(why.clone()).build(window, cx));
@@ -181,7 +202,7 @@ pub(crate) fn render<A: Copy + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::{At, Item, Key, Menu};
+    use super::{At, How, Item, Key, Menu};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum A {
@@ -198,30 +219,52 @@ mod tests {
     #[test]
     fn the_keys_walk_the_items_that_can_act() {
         // From the keyboard the first one that can act is selected.
+        let k = |m: &mut Menu<A>, key: &str| m.key(key, false, true);
         let mut m = menu(true);
         assert_eq!(m.sel, Some(1));
-        assert_eq!(m.key("down"), Key::Moved);
+        assert_eq!(k(&mut m, "down"), Key::Moved);
         assert_eq!(m.sel, Some(2));
         // Wrapping, past the one that cannot act.
-        assert_eq!(m.key("down"), Key::Moved);
+        assert_eq!(k(&mut m, "down"), Key::Moved);
         assert_eq!(m.sel, Some(1));
-        assert_eq!(m.key("up"), Key::Moved);
+        assert_eq!(k(&mut m, "up"), Key::Moved);
         assert_eq!(m.sel, Some(2));
-        assert_eq!(m.key("home"), Key::Moved);
+        assert_eq!(k(&mut m, "home"), Key::Moved);
         assert_eq!(m.sel, Some(1));
-        assert_eq!(m.key("end"), Key::Moved);
+        assert_eq!(k(&mut m, "end"), Key::Moved);
         assert_eq!(m.sel, Some(2));
-        assert_eq!(m.key("enter"), Key::Pick(A::Three));
-        assert_eq!(m.key("shift"), Key::Moved, "a modifier alone changes nothing");
-        assert_eq!(m.key("escape"), Key::Close);
-        assert_eq!(m.key("x"), Key::Other);
+        // Tab goes down, Shift+Tab up.
+        assert_eq!((k(&mut m, "tab"), m.sel), (Key::Moved, Some(1)));
+        assert_eq!((m.key("tab", true, true), m.sel), (Key::Moved, Some(2)));
+        assert_eq!(k(&mut m, "enter"), Key::Pick(A::Three));
+        assert_eq!(k(&mut m, "space"), Key::Pick(A::Three));
+        assert_eq!(k(&mut m, "shift"), Key::Moved, "a modifier alone changes nothing");
+        assert_eq!(k(&mut m, "escape"), Key::Close);
+        assert_eq!(k(&mut m, "x"), Key::Other);
         // From the pointer nothing is selected: Enter picks nothing.
         let mut m = menu(false);
-        assert_eq!((m.sel, m.key("enter")), (None, Key::Moved));
-        assert_eq!(m.key("up"), Key::Moved);
+        assert_eq!((m.sel, k(&mut m, "enter")), (None, Key::Moved));
+        assert_eq!(k(&mut m, "up"), Key::Moved);
         assert_eq!(m.sel, Some(2));
         // Nothing can act: the selection stays.
         let mut m = Menu::new(vec![Item::new(A::One, "one").off("no")], At::Row(1), true);
-        assert_eq!((m.sel, m.key("down"), m.sel), (None, Key::Moved, None));
+        assert_eq!((m.sel, k(&mut m, "down"), m.sel), (None, Key::Moved, None));
+    }
+
+    /// A held Enter or Space picks once, on its press: its repeats pick
+    /// nothing (they still move nothing and close nothing). A click picks
+    /// on its first click only.
+    #[test]
+    fn a_held_key_picks_once() {
+        let mut m = menu(true);
+        assert_eq!(m.key("enter", false, true), Key::Pick(A::Two));
+        for _ in 0..5 {
+            assert_eq!(m.key("enter", false, false), Key::Moved, "a repeat");
+            assert_eq!(m.key("space", false, false), Key::Moved, "a repeat");
+        }
+        assert_eq!(m.sel, Some(1), "where it was");
+        assert_eq!(m.key("enter", false, true), Key::Pick(A::Two), "pressed again");
+        assert!(How::Click(1).is_press() && How::Key { press: true }.is_press());
+        assert!(!How::Click(2).is_press() && !How::Click(3).is_press() && !How::Key { press: false }.is_press());
     }
 }
