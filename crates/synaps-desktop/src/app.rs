@@ -4919,7 +4919,8 @@ mod tests {
     /// GPUI window.
     #[test]
     fn composer_guard_is_the_one_helper() {
-        let src = include_str!("app.rs");
+        // A Windows checkout's CRLF read as the LF it is in the repository.
+        let src = include_str!("app.rs").replace("\r\n", "\n");
         let body = |name: &str| {
             let at = src.find(&format!("\n    fn {name}(")).unwrap_or_else(|| panic!("fn {name}"));
             let rest = &src[at + 1..];
