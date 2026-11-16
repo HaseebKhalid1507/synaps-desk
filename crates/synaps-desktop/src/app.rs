@@ -1711,45 +1711,51 @@ impl AppView {
                     if let Some(b) = this.bench.as_mut() {
                         b.on_received(&batch, now);
                     }
-                    this.model.view_dirty = false;
-                    for ev in batch {
-                        // A worker's menu, or a cancel armed from the tray,
-                        // means nothing across a reconnect (a restarted
-                        // daemon numbers its workers anew).
-                        if matches!(ev, Event::Attached { .. } | Event::Reattaching { .. }) {
-                            if this.menu.is_some() {
-                                this.close_menu();
-                                this.model.view_dirty = true;
-                            } else if this.model.cancels.disarm() {
-                                this.cancel_tick = None;
-                                this.model.view_dirty = true;
-                            }
-                        }
-                        for fx in this.model.apply(ev) {
-                            this.effect(fx);
-                        }
-                    }
-                    this.start_tabs();
-                    // An attach may have named or merged the visible tab.
-                    this.reconcile(None);
-                    // The worker tab on screen: its handle may name another
-                    // worker now.
-                    this.disown_reused();
-                    // A Welcome: the daemon's place and dash are looked for.
-                    this.dash_on_welcome(cx);
-                    // A worker's page came: its next poll, drawn or not.
-                    this.arm_watch_poll(cx);
-                    // An idle daemon's poll changes nothing: no frame, unless
-                    // the rail's ages have a new minute to show.
-                    if this.model.view_dirty || this.rail.minute() != crate::chrome::now_secs() / 60 {
-                        cx.notify();
-                    }
+                    this.apply_batch(batch, cx);
                 })
                 .is_ok()
             })
             .await;
         });
         self._tasks.push(task);
+    }
+
+    /// One batch of events, as the pump hands it over: into the model, then
+    /// the tabs, the visible tab's view and the polls brought to it.
+    pub(crate) fn apply_batch(&mut self, batch: Vec<Event>, cx: &mut Context<Self>) {
+        self.model.view_dirty = false;
+        for ev in batch {
+            // A worker's menu, or a cancel armed from the tray,
+            // means nothing across a reconnect (a restarted
+            // daemon numbers its workers anew).
+            if matches!(ev, Event::Attached { .. } | Event::Reattaching { .. }) {
+                if self.menu.is_some() {
+                    self.close_menu();
+                    self.model.view_dirty = true;
+                } else if self.model.cancels.disarm() {
+                    self.cancel_tick = None;
+                    self.model.view_dirty = true;
+                }
+            }
+            for fx in self.model.apply(ev) {
+                self.effect(fx);
+            }
+        }
+        self.start_tabs();
+        // An attach may have named or merged the visible tab.
+        self.reconcile(None);
+        // The worker tab on screen: its handle may name another
+        // worker now.
+        self.disown_reused();
+        // A Welcome: the daemon's place and dash are looked for.
+        self.dash_on_welcome(cx);
+        // A worker's page came: its next poll, drawn or not.
+        self.arm_watch_poll(cx);
+        // An idle daemon's poll changes nothing: no frame, unless
+        // the rail's ages have a new minute to show.
+        if self.model.view_dirty || self.rail.minute() != crate::chrome::now_secs() / 60 {
+            cx.notify();
+        }
     }
 
     pub(crate) fn effect(&mut self, fx: Effect) {
@@ -2064,6 +2070,10 @@ impl AppView {
         self.restore_notice(dropped);
         // A view on screen leaves the session tab behind it current.
         let vis = self.model.tabs.current().map(|t| (t.id, t.session.clone()));
+        // Another tab on screen (not the same one named or re-attached),
+        // or the one on screen opened again (a rail row, an open by name):
+        // its view starts from its hand-off, never from an event batch.
+        let shown = hint.is_some() || self.shown_tab.as_ref().map(|v| v.0) != vis.as_ref().map(|v| v.0);
         // A session tab left keeps the worker its view showed in place.
         if let Some((id, _)) = self.shown_tab
             && vis.as_ref().map(|v| v.0) != Some(id)
@@ -2080,7 +2090,7 @@ impl AppView {
             self.shown_tab = vis;
             // Another tab of the same session (its worker's, or back to
             // it): the same attachment, another view.
-            self.tab_watch();
+            self.tab_watch(shown);
             if hint.as_ref().is_some_and(|h| h.1) {
                 // An Open by name of the session on screen: done.
                 self.model.named.opened = true;
@@ -2096,7 +2106,7 @@ impl AppView {
             self.load(vis.as_ref().and_then(|v| v.1.clone()));
         }
         self.shown_tab = vis.clone();
-        self.tab_watch();
+        self.tab_watch(shown);
         match vis {
             Some((_, Some(s))) => self.attach_tab(s, hint),
             // A create or a resume: the caller sends it.
@@ -2105,14 +2115,24 @@ impl AppView {
         }
     }
 
-    /// The current tab's worker view: a worker tab's worker, or the one
-    /// its session tab showed in place when it was left (else the
-    /// session's thread).
-    fn tab_watch(&mut self) {
+    /// The current tab's worker view. A worker tab: its worker, checked
+    /// on every reconcile (an attach elsewhere resets the view, a handle
+    /// may name another worker now). A session tab, only when it is
+    /// `shown` (come on screen, or opened again): the worker it showed in
+    /// place when it was left, else its thread. Between, its view is the
+    /// user's: a session poll (one every 3 s, changed or not) neither
+    /// drops a worker shown in place nor brings back one Esc'd away.
+    fn tab_watch(&mut self, shown: bool) {
         let Some(t) = self.model.tabs.current() else { return };
         let want = match (&t.worker, t.kind) {
             (Some(w), crate::tabs::Kind::Worker) => Some((w.handle.clone(), w.name.clone(), w.call.clone(), true)),
-            _ => t.watching.clone().map(|(h, n)| (h, n, None, false)),
+            _ if !shown => return,
+            _ => {
+                let id = t.id;
+                let handoff = self.model.tabs.take_watching(id);
+                log::debug!(target: "synaps_desktop::watch", "tab {id} shown: {}", handoff.as_ref().map_or("its thread", |w| w.0.as_str()));
+                handoff.map(|(h, n)| (h, n, None, false))
+            }
         };
         match want {
             Some((handle, name, call, tab)) => {
@@ -3101,12 +3121,18 @@ impl AppView {
         .filter(|&n| n != now) else {
             return;
         };
-        theme::update(cx, |c| c.text = next);
-        self.list.remeasure();
-        self.metrics_gen += 1;
+        self.show_text_size(next, cx);
         let mut p = self.panels;
         p.text_size = next;
         self.set_panels(p, cx);
+    }
+
+    /// The centre pane's text at step `next` (one of [`theme::TEXT_STEPS`]):
+    /// the metrics, and one re-measure of the list.
+    pub(crate) fn show_text_size(&mut self, next: u8, cx: &mut App) {
+        theme::update(cx, |c| c.text = next);
+        self.list.remeasure();
+        self.metrics_gen += 1;
     }
 
     pub(crate) fn apply_custom_accent(&mut self, cx: &mut Context<Self>) {
@@ -4893,7 +4919,8 @@ mod tests {
     /// GPUI window.
     #[test]
     fn composer_guard_is_the_one_helper() {
-        let src = include_str!("app.rs");
+        // A Windows checkout's CRLF read as the LF it is in the repository.
+        let src = include_str!("app.rs").replace("\r\n", "\n");
         let body = |name: &str| {
             let at = src.find(&format!("\n    fn {name}(")).unwrap_or_else(|| panic!("fn {name}"));
             let rest = &src[at + 1..];
