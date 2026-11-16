@@ -1010,6 +1010,8 @@ impl AppView {
                     Some(w) => mono(w.files_note.clone(), 12., p.dim_ch),
                     None => mono("as the model asked: tool inputs, not the disk", 12., p.dim_ch),
                 }
+                // At 12 px it is wider than a narrow pane: it wraps.
+                .whitespace_normal()
                 .mt(px(6.)),
             )
             .child(div().h(px(12.)));

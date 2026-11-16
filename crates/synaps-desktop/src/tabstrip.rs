@@ -344,6 +344,7 @@ impl AppView {
         let name = if view { "view" } else { worker.map_or_else(|| st.name(), |w| glyph::worker(w).2) };
         let waits = if needs && worker.is_some() { " · its session needs you" } else { "" };
         let (tip, me) = (label.clone(), cx.weak_entity());
+        let menu_open = self.menu.is_some() || self.smenu.is_some();
         let close = h_flex()
             .id(("tab-x", id as usize))
             .group("tab-x")
@@ -398,18 +399,22 @@ impl AppView {
             .when_some(word, |d, w| d.child(display(w, 12., word_color).flex_none()))
             .child(close)
             // Formatted on hover only.
-            .tooltip(move |window, cx| {
-                // A session's: the line the session header had (design.md §8.5).
-                let meta = me.upgrade().filter(|_| kind == Kind::Session).and_then(|v| v.read(cx).tab_meta(id));
-                let text = match (kind, meta) {
-                    (Kind::Worker, _) => match tip.split_once(" · ") {
-                        Some((w, s)) => format!("worker {w} · {name} · of the session {s}{waits} · closing this tab leaves it running"),
-                        None => format!("{tip} · {name}"),
-                    },
-                    (_, Some(meta)) => format!("{} · {name}", meta.tooltip(&tip)),
-                    _ => format!("{tip} · {name}"),
-                };
-                Tooltip::new(text).build(window, cx)
+            // Not under an open menu (a right-click's pointer rests on the
+            // tab it opened from).
+            .when(!menu_open, |d| {
+                d.tooltip(move |window, cx| {
+                    // A session's: the line the session header had (design.md §8.5).
+                    let meta = me.upgrade().filter(|_| kind == Kind::Session).and_then(|v| v.read(cx).tab_meta(id));
+                    let text = match (kind, meta) {
+                        (Kind::Worker, _) => match tip.split_once(" · ") {
+                            Some((w, s)) => format!("worker {w} · {name} · of the session {s}{waits} · closing this tab leaves it running"),
+                            None => format!("{tip} · {name}"),
+                        },
+                        (_, Some(meta)) => format!("{} · {name}", meta.tooltip(&tip)),
+                        _ => format!("{tip} · {name}"),
+                    };
+                    Tooltip::new(text).build(window, cx)
+                })
             })
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 let ix = this.model.tabs.iter().position(|t| t.id == id);
