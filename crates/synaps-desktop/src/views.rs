@@ -442,7 +442,7 @@ impl Render for ViewPane {
         match self.kind {
             Kind::Settings => a.render_settings(a.view_width, &p, &vc),
             Kind::Usage => a.render_usage(a.view_width, &p, &vc),
-            Kind::Session => div().into_any_element(),
+            Kind::Session | Kind::Worker => div().into_any_element(),
         }
     }
 }
@@ -593,7 +593,7 @@ impl AppView {
                 (self.panels, self.theme_source, self.accent_source, self.theme_follows_config).hash(&mut h);
             }
             Kind::Usage => self.model.sessions.iter().for_each(|s| s.id.hash(&mut h)),
-            Kind::Session => {}
+            Kind::Session | Kind::Worker => {}
         }
         h.finish()
     }

@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use gpui_kit::SharedString;
 use serde_json::Value;
@@ -41,6 +42,10 @@ const PREVIEW_CHARS: usize = 80;
 const LABEL_CHARS: usize = 32;
 /// Reshaped calls kept for [`Subagents::take_reshaped`]; past this, "all".
 const RESHAPED_MAX: usize = 64;
+/// A task or a result kept for copying is cut at this many bytes.
+const KEEP_MAX: usize = 64 << 10;
+/// The hover card shows a task's first this many lines.
+const CARD_LINES: usize = 6;
 
 /// Shape generations, unique across every tab's [`Subagents`] (a tab
 /// switch never meets the number the rows were built at by chance).
@@ -150,6 +155,12 @@ pub struct Worker {
     pub elapsed: Option<f64>,
     /// Its result's first line.
     pub result: String,
+    /// Its result as far as this window has it, for copying: a collect's
+    /// output, else the completion's or `SubagentDone`'s preview.
+    pub full: String,
+    /// When it started: its live start, else its first running row less
+    /// its age then (the daemon's clock, not estimated).
+    pub started: Option<Instant>,
     /// Its end was read from a `SubagentDone`'s text ([`done_status`]):
     /// the daemon's own word may still correct it, once.
     guessed: bool,
@@ -212,6 +223,8 @@ impl Worker {
         fill(&mut self.model, o.model);
         fill(&mut self.step, o.step);
         fill(&mut self.result, o.result);
+        fill(&mut self.full, o.full);
+        self.started = self.started.or(o.started);
         self.tools = self.tools.or(o.tools);
         self.elapsed = self.elapsed.or(o.elapsed);
     }
@@ -230,6 +243,10 @@ pub enum Tone {
 /// A worker as its block shows it, formatted once per change.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
+    /// Its id (`sa_N`'s N), once known, and whether its thread can be
+    /// watched (a background worker; not the blocking `subagent`).
+    pub id: Option<u64>,
+    pub watchable: bool,
     pub status: Option<Status>,
     pub tone: Tone,
     pub word: &'static str,
@@ -277,7 +294,16 @@ impl View {
             (None, _) => None,
         };
         let name = if w.name.is_empty() { c.label.clone() } else { w.name.clone() };
-        Some(View { status: w.status, tone, word, name: name.into(), facts: facts.join(" · ").into(), line })
+        Some(View {
+            id: w.id,
+            watchable: c.kind != Kind::Oneshot,
+            status: w.status,
+            tone,
+            word,
+            name: name.into(),
+            facts: facts.join(" · ").into(),
+            line,
+        })
     }
 
     /// What its row's height and the run's fold depend on.
@@ -365,6 +391,8 @@ struct Call {
     /// The task's (a resume's instructions') first [`PREVIEW_CHARS`]
     /// chars, as `SubagentStart` has it.
     task: String,
+    /// The whole task, up to [`KEEP_MAX`] (the hover card, Copy task).
+    task_full: String,
     /// `label · the task's first line`, the row's argument.
     arg: SharedString,
     /// The model it asked for (the worker's own, once a row says, wins).
@@ -397,6 +425,7 @@ impl Call {
         Call {
             kind,
             task: task_full.chars().take(PREVIEW_CHARS).collect(),
+            task_full: cut(task_full, KEEP_MAX),
             arg: arg.into(),
             model: s("model").map(str::trim).unwrap_or("").to_string(),
             w: Worker::default(),
@@ -420,6 +449,15 @@ impl Call {
     }
 }
 
+/// `s`, at most `max` bytes (on a char boundary).
+fn cut(s: &str, max: usize) -> String {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 /// A completion event's facts.
 struct Completion {
     n: u64,
@@ -428,6 +466,8 @@ struct Completion {
     secs: Option<f64>,
     name: Option<String>,
     preview: String,
+    /// The whole preview (for copying).
+    preview_full: String,
 }
 
 /// A subagent completion event's body (after its `<event …>` tag): from
@@ -440,7 +480,9 @@ struct Completion {
 fn completion(body: &str) -> Option<Completion> {
     let body = body.split("</event>").next().unwrap_or(body);
     let (prose, data) = body.rsplit_once("\nData: ").unwrap_or((body, ""));
-    let preview = prose.split_once(" to retrieve the full result. Preview: ").map(|(_, p)| first_line(p)).unwrap_or_default();
+    let preview_full =
+        prose.split_once(" to retrieve the full result. Preview: ").map(|(_, p)| cut(p.trim(), KEEP_MAX)).unwrap_or_default();
+    let preview = first_line(&preview_full);
     if let Ok(d) = serde_json::from_str::<Value>(data.trim()) {
         let n = d.get("handle_id").and_then(Value::as_str).and_then(handle_id).or_else(|| d.get("subagent_id").and_then(Value::as_u64))?;
         let (status, _) = d.get("status").and_then(Status::parse)?;
@@ -451,6 +493,7 @@ fn completion(body: &str) -> Option<Completion> {
             secs: d.get("duration_secs").and_then(Value::as_f64),
             name: d.get("agent_name").and_then(Value::as_str).map(str::to_string),
             preview,
+            preview_full,
         });
     }
     let rest = prose.trim_start().strip_prefix("Subagent '")?;
@@ -467,6 +510,7 @@ fn completion(body: &str) -> Option<Completion> {
         secs: secs.parse().ok(),
         name: Some(name.to_string()),
         preview,
+        preview_full,
     })
 }
 
@@ -490,6 +534,70 @@ pub struct Subagents {
     heard: bool,
     /// Bumped on every change to any worker ([`Subagents::revision`]).
     revision: u64,
+}
+
+/// What the hover card and the context menu say of a worker: what this
+/// window has heard of it, nothing more.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Info {
+    pub id: u64,
+    pub name: String,
+    /// Its task's first [`CARD_LINES`] lines (`…` if there is more), and
+    /// the whole task (up to [`KEEP_MAX`]).
+    pub task: String,
+    pub task_full: String,
+    pub model: String,
+    pub status: Option<Status>,
+    pub tools: Option<u32>,
+    pub elapsed: Option<f64>,
+    pub started: Option<Instant>,
+    /// Running: its step; ended: its result's first line, or why it failed.
+    pub line: String,
+    /// Its result for copying (empty: none heard).
+    pub result: String,
+    pub watchable: bool,
+}
+
+impl Info {
+    fn of(w: &Worker, c: Option<&Call>) -> Option<Self> {
+        let id = w.id?;
+        let status = w.status;
+        let reason = reason_shown(status, w.reason.as_deref()).filter(|_| matches!(status, Some(Status::Failed | Status::TimedOut)));
+        let line = match reason {
+            Some(r) => format!("reason: {}", one_line(r, 200)),
+            None if status.is_some_and(Status::terminal) => w.result.clone(),
+            None if w.step.is_empty() => String::new(),
+            None => tray_step(&w.step),
+        };
+        let task_full = c.map_or("", |c| c.task_full.as_str());
+        let mut task: Vec<&str> = task_full.lines().map(str::trim_end).skip_while(|l| l.is_empty()).take(CARD_LINES + 1).collect();
+        let more = task.len() > CARD_LINES;
+        task.truncate(CARD_LINES);
+        let mut task: String = task.iter().map(|l| one_line(l, 160)).collect::<Vec<_>>().join("\n");
+        if more {
+            task.push_str("\n…");
+        }
+        let model = if w.model.is_empty() { c.map_or("", |c| c.model.as_str()) } else { w.model.as_str() };
+        let name = match (&w.name, c) {
+            (n, _) if !n.is_empty() => n.clone(),
+            (_, Some(c)) => c.label.clone(),
+            _ => "subagent".into(),
+        };
+        Some(Info {
+            id,
+            name,
+            task,
+            task_full: task_full.to_string(),
+            model: model.rsplit_once('/').map_or(model, |(_, m)| m).to_string(),
+            status,
+            tools: w.tools,
+            elapsed: w.elapsed,
+            started: w.started,
+            line,
+            result: if w.full.is_empty() { w.result.clone() } else { w.full.clone() },
+            watchable: c.is_none_or(|c| c.kind != Kind::Oneshot),
+        })
+    }
 }
 
 /// A worker as the tray over the composer lists it ([`Subagents::live`]).
@@ -605,6 +713,22 @@ impl Subagents {
         out
     }
 
+    /// Worker `id`'s state, if known (the newest call's that has it).
+    pub fn status(&self, id: u64) -> Option<Status> {
+        match self.by_id.get(&id).and_then(|t| self.calls.get(t)) {
+            Some(c) => c.w.status,
+            None => self.orphans.get(&id)?.status,
+        }
+    }
+
+    /// What is known of worker `id` (the newest call's that has it).
+    pub fn info(&self, id: u64) -> Option<Info> {
+        match self.by_id.get(&id).and_then(|t| self.calls.get(t)) {
+            Some(c) => Info::of(&c.w, Some(c)),
+            None => Info::of(self.orphans.get(&id)?, None),
+        }
+    }
+
     /// What the call's row height and its run's fold depend on.
     pub fn shape(&self, tool_id: &str) -> u64 {
         self.calls.get(tool_id).map_or(0, |c| c.shape)
@@ -614,9 +738,18 @@ impl Subagents {
     pub fn bytes(&self) -> usize {
         self.calls
             .values()
-            .map(|c| 256 + c.label.len() + c.task.len() + c.arg.len() + c.model.len() + c.w.step.len() + c.w.result.len())
+            .map(|c| {
+                256 + c.label.len()
+                    + c.task.len()
+                    + c.task_full.len()
+                    + c.arg.len()
+                    + c.model.len()
+                    + c.w.step.len()
+                    + c.w.result.len()
+                    + c.w.full.len()
+            })
             .sum::<usize>()
-            + self.orphans.values().map(|w| 128 + w.step.len() + w.result.len()).sum::<usize>()
+            + self.orphans.values().map(|w| 128 + w.step.len() + w.result.len() + w.full.len()).sum::<usize>()
     }
 
     /// Start over from a whole history (an attach, a replacement). `same`:
@@ -727,6 +860,9 @@ impl Subagents {
                             w.elapsed = Some(*duration_secs);
                             if s == Status::Done {
                                 w.result = first_line(result_preview);
+                                if w.full.is_empty() {
+                                    w.full = cut(result_preview, KEEP_MAX);
+                                }
                             }
                         }
                     })
@@ -778,6 +914,7 @@ impl Subagents {
                 if c.w.open(true) {
                     c.w.set_status(s, reason, true);
                     c.w.result = result;
+                    c.w.full = cut(body, KEEP_MAX);
                 }
                 if c.w.name.is_empty() {
                     c.w.name = head.trim_end_matches(" ERROR").to_string();
@@ -822,6 +959,7 @@ impl Subagents {
         let Some(n) = v.get("handle_id").and_then(Value::as_str).and_then(handle_id) else { return };
         let Some((s, reason)) = v.get("status").and_then(Status::parse).filter(|(s, _)| s.terminal()) else { return };
         let reason = reason.or_else(|| v.get("error").and_then(Value::as_str).map(str::to_string));
+        let whole = v.get("output").and_then(Value::as_str).filter(|o| !o.trim().is_empty()).map(|o| cut(o, KEEP_MAX));
         let output = v.get("output").and_then(Value::as_str).map(first_line);
         let secs = v.get("elapsed_secs").and_then(Value::as_f64);
         let tools = v.get("tool_count").and_then(Value::as_u64).map(|t| t as u32);
@@ -834,6 +972,10 @@ impl Subagents {
             w.tools = w.tools.or(tools);
             if let Some(o) = output.filter(|o| !o.is_empty() && w.result.is_empty()) {
                 w.result = o;
+            }
+            // The collect's output is the whole result: it wins.
+            if let Some(o) = whole {
+                w.full = o;
             }
         });
     }
@@ -856,6 +998,9 @@ impl Subagents {
                 }
                 if w.result.is_empty() {
                     w.result = c.preview;
+                }
+                if w.full.is_empty() {
+                    w.full = c.preview_full;
                 }
                 if let Some(name) = c.name.filter(|_| w.name.is_empty()) {
                     w.name = name;
@@ -893,9 +1038,14 @@ impl Subagents {
             (None, Some(t)) => self.bind(&t, n, false),
             _ => {}
         }
+        // Its live start: when it started.
+        let now = Instant::now();
         self.update(n, |w| {
             if w.name.is_empty() {
                 w.name = name.to_string();
+            }
+            if !w.ended() {
+                w.started.get_or_insert(now);
             }
             w.set_status(Status::Running, None, true);
         });
@@ -930,6 +1080,10 @@ impl Subagents {
             }
             if let Some((st, reason)) = status {
                 w.set_status(st, reason, true);
+            }
+            // Running: it started its age ago (as the daemon counts it).
+            if let Some(e) = elapsed.filter(|_| !w.ended() && w.started.is_none()) {
+                w.started = Instant::now().checked_sub(Duration::from_secs_f64(e.max(0.)));
             }
             // A finished worker's run: its age less the time since it ended.
             if let Some(e) = elapsed {
@@ -1047,6 +1201,9 @@ pub fn completion_note(text: &str) -> Option<String> {
     if tag.contains("type=\"subagent_steer\"") {
         return steer_note(body);
     }
+    if tag.contains("type=\"subagent_cancelled\"") {
+        return cancel_note(body);
+    }
     if !tag.contains("source=\"subagent\"") {
         return None;
     }
@@ -1070,6 +1227,17 @@ pub fn completion_note(text: &str) -> Option<String> {
         out.push_str(&format!(" · {tail}"));
     }
     Some(out)
+}
+
+/// The engine's note of a worker cancelled (`User cancelled subagent
+/// 'quick' (sa_3) with /workers cancel. It stops at its next step ...`,
+/// v0.11.1 `subagent_user_cancel_event`) as `you cancelled quick (sa_3):
+/// it stops at its next step`.
+fn cancel_note(body: &str) -> Option<String> {
+    let rest = body.strip_prefix("User cancelled subagent '")?;
+    let (name, rest) = rest.split_once("' (")?;
+    let (handle, _) = rest.split_once(") with /workers cancel")?;
+    Some(format!("you cancelled {name} ({handle}): it stops at its next step"))
 }
 
 /// The engine's note of a worker steered from its view (`User steered
@@ -1098,7 +1266,7 @@ mod tests {
     use serde_json::{Value, json};
     use synaps_client::protocol::decode_event;
 
-    use super::{Status, Subagents, Tone, completion_note, fmt_secs};
+    use super::{CARD_LINES, Status, Subagents, Tone, completion_note, fmt_secs};
 
     fn ev(s: &mut Subagents, v: Value) {
         s.on_session(&decode_event(&v).unwrap());
@@ -1166,6 +1334,51 @@ mod tests {
     }
     fn word(s: &Subagents, id: &str) -> Option<&'static str> {
         s.view(id).map(|v| v.word)
+    }
+
+    /// What the hover card and the menu read: the task's first lines (the
+    /// whole task for copying), model, when it started (its live start, or
+    /// its first running row less its age), its step, then its result:
+    /// the done event's preview, replaced by a collect's whole output.
+    #[test]
+    fn a_workers_info_is_what_was_heard_of_it() {
+        let mut s = Subagents::default();
+        let task = (1..=9).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        tool_use(&mut s, "t1", "subagent_start", json!({"agent": "scout", "task": task, "model": "anthropic/claude-haiku-4-5"}));
+        assert_eq!(s.info(1), None, "no id yet");
+        result(&mut s, "t1", &handle(1, "scout"));
+        let i = s.info(1).unwrap();
+        assert_eq!((i.name.as_str(), i.model.as_str(), i.watchable, i.status), ("scout", "claude-haiku-4-5", true, Some(Status::Running)));
+        assert_eq!(i.task.lines().count(), CARD_LINES + 1, "{}", i.task);
+        assert!(i.task.starts_with("line 1\nline 2") && i.task.ends_with("line 6\n…"));
+        assert_eq!(i.task_full, task);
+        assert_eq!((i.started, i.result.as_str()), (None, ""), "the history alone: not when it started");
+        // Its first running row: it started its age ago.
+        let before = std::time::Instant::now();
+        rows(&mut s, json!([row(1, "scout", json!("running"), 30.0, None, "⚙ bash (tool #2)", 2)]));
+        let i = s.info(1).unwrap();
+        let started = i.started.unwrap();
+        assert!(before.saturating_duration_since(started).as_secs_f64() >= 29.9, "{:?}", before.saturating_duration_since(started));
+        assert_eq!((i.line.as_str(), i.tools, i.elapsed), ("bash", Some(2), Some(30.0)));
+        // A later row does not move it.
+        rows(&mut s, json!([row(1, "scout", json!("running"), 31.5, None, "⚙ read (tool #3)", 3)]));
+        assert_eq!(s.info(1).unwrap().started, Some(started));
+        assert_eq!(s.status(1), Some(Status::Running));
+        // Done: the preview, then a collect's whole output.
+        done(&mut s, 1, "# Found\nThe relay refreshes in auth.rs", 40.0);
+        let i = s.info(1).unwrap();
+        assert_eq!((i.line.as_str(), i.result.as_str()), ("The relay refreshes in auth.rs", "# Found\nThe relay refreshes in auth.rs"));
+        tool_use(&mut s, "c1", "subagent_collect", json!({"handle_id": "sa_1"}));
+        let out = json!({"handle_id": "sa_1", "status": "completed", "output": "# Found\nThe relay refreshes in auth.rs\n\nAll of it."});
+        result(&mut s, "c1", &out.to_string());
+        assert_eq!(s.info(1).unwrap().result, "# Found\nThe relay refreshes in auth.rs\n\nAll of it.");
+        // A live start of a worker no call has: when it started is now.
+        start(&mut s, 7, "orphan", "something");
+        let i = s.info(7).unwrap();
+        assert!(i.started.is_some() && i.task_full.is_empty());
+        // The blocks carry the worker's id, and whether it can be watched.
+        let v = s.view("t1").unwrap();
+        assert_eq!((v.id, v.watchable), (Some(1), true));
     }
 
     /// Two workers started side by side, their starts out of order, each
@@ -1532,6 +1745,10 @@ mod tests {
         let steer = "<event id=\"d5\" type=\"subagent_steer\" severity=\"low\" source=\"user\">User steered subagent 'sleeper' (sa_1) directly: Stop after your next step: (a) then STEERED.\nData: {\"agent_name\":\"sleeper\",\"handle_id\":\"sa_1\"}</event>";
         assert_eq!(completion_note(steer).as_deref(), Some("you steered sleeper (sa_1): Stop after your next step: (a) then STEERED."));
         assert_eq!(completion_note("<event id=\"d5\" type=\"subagent_steer\" source=\"user\">something else</event>"), None);
+        // A cancel (`/workers cancel`, the menu's Cancel worker), as v0.11.1 notes it.
+        let cancel = "<event id=\"e7\" type=\"subagent_cancelled\" severity=\"low\" source=\"user\">User cancelled subagent 'quick' (sa_3) with /workers cancel. It stops at its next step and sends no completion wake; do not wait for it. Its partial output is readable with subagent_collect (handle_id \"sa_3\") only while this session stays loaded: the handle does not survive the session being parked.\nData: {\"agent_name\":\"quick\",\"handle_id\":\"sa_3\"}</event>";
+        assert_eq!(completion_note(cancel).as_deref(), Some("you cancelled quick (sa_3): it stops at its next step"));
+        assert_eq!(completion_note("<event id=\"e7\" type=\"subagent_cancelled\" source=\"user\">other</event>"), None);
     }
 
     /// Ids restart at 1 with a cold-started daemon: the history holds an

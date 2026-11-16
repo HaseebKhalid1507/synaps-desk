@@ -1,0 +1,227 @@
+//! A context menu: a column of items in the gear menu's style, at the
+//! pointer (a right-click) or over a row (the Menu key, Shift+F10). ↑/↓
+//! (Home/End) move the selection over the items that can act, Enter picks,
+//! Esc or a click elsewhere closes it. Nothing moves. No GPUI in the logic
+//! ([`Menu`]); [`render`] draws it.
+
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use crate::app::{AppView, mono};
+use crate::theme::Palette;
+
+/// One item: what it does, what it says (and an emphasised word after,
+/// e.g. CONFIRM), its key, and whether it can act now (else why not).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Item<A> {
+    pub act: A,
+    pub label: SharedString,
+    pub confirm: Option<SharedString>,
+    pub key: Option<&'static str>,
+    pub why_not: Option<SharedString>,
+}
+
+impl<A> Item<A> {
+    pub fn new(act: A, label: impl Into<SharedString>) -> Self {
+        Item { act, label: label.into(), confirm: None, key: None, why_not: None }
+    }
+
+    pub fn key(mut self, key: &'static str) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    /// It cannot act now: `why` (its tooltip).
+    pub fn off(mut self, why: impl Into<SharedString>) -> Self {
+        self.why_not = Some(why.into());
+        self
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.why_not.is_none()
+    }
+}
+
+/// Where the menu is: at a point in the window (a right-click), or over
+/// the row it is for (opened from the keyboard; the row draws it).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum At {
+    Point(Point<Pixels>),
+    Row(u64),
+}
+
+/// What a key did to an open menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Key<A> {
+    /// The selection moved (or stayed: nothing else can act).
+    Moved,
+    Pick(A),
+    Close,
+    /// Not a menu key: the menu closes, the key goes on.
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Menu<A> {
+    pub items: Vec<Item<A>>,
+    /// The selected item (keyboard); a pointer-opened menu starts with none.
+    pub sel: Option<usize>,
+    pub at: At,
+}
+
+impl<A: Copy> Menu<A> {
+    /// From the keyboard the first item that can act is selected.
+    pub fn new(items: Vec<Item<A>>, at: At, keyboard: bool) -> Self {
+        let sel = if keyboard { items.iter().position(Item::enabled) } else { None };
+        Menu { items, sel, at }
+    }
+
+    /// The next item that can act from the selection, `down` or up,
+    /// wrapping; none can: the selection stays.
+    fn step(&mut self, down: bool) {
+        let n = self.items.len();
+        if n == 0 {
+            return;
+        }
+        let start = self.sel.unwrap_or(if down { n - 1 } else { 0 });
+        for k in 1..=n {
+            let i = if down { (start + k) % n } else { (start + n - k) % n };
+            if self.items[i].enabled() {
+                self.sel = Some(i);
+                return;
+            }
+        }
+    }
+
+    /// A key (as GPUI names it) while the menu is open.
+    pub fn key(&mut self, key: &str) -> Key<A> {
+        match key {
+            "down" | "tab" => self.step(true),
+            "up" => self.step(false),
+            "home" => {
+                self.sel = None;
+                self.step(true);
+            }
+            "end" => {
+                self.sel = None;
+                self.step(false);
+            }
+            "enter" | "space" => {
+                return match self.sel.and_then(|i| self.items.get(i)).filter(|it| it.enabled()) {
+                    Some(it) => Key::Pick(it.act),
+                    None => Key::Moved,
+                };
+            }
+            "escape" => return Key::Close,
+            "shift" | "control" | "alt" | "platform" | "function" => {}
+            _ => return Key::Other,
+        }
+        Key::Moved
+    }
+}
+
+/// The menu's box, in the gear menu's style; `pick` acts on an item
+/// (a click, or Enter through [`Menu::key`]), a mouse-down outside closes it.
+pub(crate) fn render<A: Copy + 'static>(
+    id: &'static str,
+    menu: &Menu<A>,
+    p: &Palette,
+    pick: fn(&mut AppView, A, &mut Window, &mut Context<AppView>),
+    cx: &Context<AppView>,
+) -> Stateful<Div> {
+    let mut col = v_flex()
+        .id(id)
+        .font_family(crate::fonts::SANS)
+        .min_w(px(236.))
+        .max_w(px(360.))
+        .py(px(4.))
+        .bg(p.card)
+        .border_1()
+        .border_color(p.edge)
+        .occlude()
+        .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            this.close_menu();
+            cx.notify();
+        }));
+    for (i, it) in menu.items.iter().enumerate() {
+        let on = it.enabled();
+        let selected = menu.sel == Some(i);
+        let act = it.act;
+        let mut row = h_flex()
+            .id(("menu-item", i))
+            .h(px(32.))
+            .px(px(14.))
+            .gap(px(24.))
+            .items_center()
+            .whitespace_nowrap()
+            .when(selected, |d| d.bg(p.raised))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .gap(px(8.))
+                    .text_size(px(14.))
+                    .text_color(if on { p.ink } else { p.dim_k })
+                    .child(it.label.clone())
+                    .when_some(it.confirm.clone(), |d, c| d.child(crate::app::display(c, 12., p.err_k))),
+            )
+            .when_some(it.key, |d, k| d.child(mono(k, 12., p.dim_k)));
+        if on {
+            row = row.cursor_pointer().hover(|d| d.bg(p.raised)).on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                pick(this, act, window, cx);
+            }));
+        } else if let Some(why) = it.why_not.clone() {
+            row = row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(why.clone()).build(window, cx));
+        }
+        col = col.child(row);
+    }
+    col
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{At, Item, Key, Menu};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum A {
+        One,
+        Two,
+        Three,
+    }
+
+    fn menu(keyboard: bool) -> Menu<A> {
+        let items = vec![Item::new(A::One, "one").off("no"), Item::new(A::Two, "two"), Item::new(A::Three, "three")];
+        Menu::new(items, At::Row(1), keyboard)
+    }
+
+    #[test]
+    fn the_keys_walk_the_items_that_can_act() {
+        // From the keyboard the first one that can act is selected.
+        let mut m = menu(true);
+        assert_eq!(m.sel, Some(1));
+        assert_eq!(m.key("down"), Key::Moved);
+        assert_eq!(m.sel, Some(2));
+        // Wrapping, past the one that cannot act.
+        assert_eq!(m.key("down"), Key::Moved);
+        assert_eq!(m.sel, Some(1));
+        assert_eq!(m.key("up"), Key::Moved);
+        assert_eq!(m.sel, Some(2));
+        assert_eq!(m.key("home"), Key::Moved);
+        assert_eq!(m.sel, Some(1));
+        assert_eq!(m.key("end"), Key::Moved);
+        assert_eq!(m.sel, Some(2));
+        assert_eq!(m.key("enter"), Key::Pick(A::Three));
+        assert_eq!(m.key("shift"), Key::Moved, "a modifier alone changes nothing");
+        assert_eq!(m.key("escape"), Key::Close);
+        assert_eq!(m.key("x"), Key::Other);
+        // From the pointer nothing is selected: Enter picks nothing.
+        let mut m = menu(false);
+        assert_eq!((m.sel, m.key("enter")), (None, Key::Moved));
+        assert_eq!(m.key("up"), Key::Moved);
+        assert_eq!(m.sel, Some(2));
+        // Nothing can act: the selection stays.
+        let mut m = Menu::new(vec![Item::new(A::One, "one").off("no")], At::Row(1), true);
+        assert_eq!((m.sel, m.key("down"), m.sel), (None, Key::Moved, None));
+    }
+}

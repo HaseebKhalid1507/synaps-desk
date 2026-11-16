@@ -717,7 +717,7 @@ impl AppView {
         // The marker follows the visible tab (also while its attach is on
         // its way); a session open in a background tab has a faint one.
         let shown = meta.is_some_and(|s| self.model.is_shown(&s.id));
-        let in_tab = !shown && meta.is_some_and(|s| self.model.tabs.is_open(&s.id));
+        let in_tab = !shown && meta.is_some_and(|s| self.model.tabs.holds(&s.id));
         // The attached session's cost as the panel shows it (its digests
         // run ahead of the 3 s poll), else the poll's.
         let cost = meta.map(|s| if on { self.model.stats.cost.unwrap_or(s.cost_usd) } else { s.cost_usd }).filter(|c| *c > 0.0);

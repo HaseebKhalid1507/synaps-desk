@@ -4,7 +4,10 @@
 //! [`crate::fit::tray_rows`] leaves room for, then "+N more". A finished
 //! worker shows how it ended for [`crate::watch::FLASH`], then drops.
 //! Nothing moves: no spinner; the elapsed time moves when a row comes (1 Hz
-//! while a worker runs). A click on a row opens that worker's view.
+//! while a worker runs). A click on a row opens that worker's view; the
+//! middle button, Ctrl/Cmd+click or a double-click open it in a tab, the
+//! right button its menu, and a hovered row shows its card and a × that
+//! cancels it ([`crate::wtabs`]). A cancel on its way says `cancelling…`.
 //!
 //! Built from the attached session's workers ([`crate::subagents`]) only
 //! when they change: no row is formatted per frame.
@@ -50,6 +53,8 @@ impl Mark {
 #[derive(Clone, Debug)]
 pub(crate) struct TrayRow {
     pub(crate) id: u64,
+    /// `sa_N`.
+    pub(crate) handle: SharedString,
     pub(crate) name: SharedString,
     pub(crate) mark: Mark,
     pub(crate) line: SharedString,
@@ -59,7 +64,18 @@ pub(crate) struct TrayRow {
 }
 
 impl TrayRow {
-    fn of(l: Live) -> Self {
+    /// `cancelling`: a cancel of it is on its way (its rows have not said so).
+    /// Cancelling says so until it has stopped; cancelled, so does a row
+    /// with no line of its own.
+    fn of(mut l: Live, cancelling: bool) -> Self {
+        if cancelling && l.status == Status::Running {
+            l.status = Status::Cancelling;
+        }
+        if l.status == Status::Cancelling {
+            l.line = "cancelling…".into();
+        } else if l.status == Status::Cancelled && l.line.is_empty() {
+            l.line = "cancelled".into();
+        }
         let mut facts = Vec::new();
         if let Some(n) = l.tools.filter(|&n| n > 0) {
             facts.push(format!("{n} tool{}", if n == 1 { "" } else { "s" }));
@@ -68,12 +84,13 @@ impl TrayRow {
             facts.push(fmt_secs(s));
         }
         let tip = if l.watchable {
-            format!("watch {} (sa_{}) · {WORKER_KEY} walks the workers", l.name, l.id)
+            format!("watch {} (sa_{}) · middle-click: in a tab · {WORKER_KEY} walks the workers", l.name, l.id)
         } else {
             format!("{}: the blocking subagent has no thread to watch", l.name)
         };
         TrayRow {
             id: l.id,
+            handle: format!("sa_{}", l.id).into(),
             name: l.name.into(),
             mark: Mark::of(l.status),
             line: l.line.into(),
@@ -88,7 +105,7 @@ impl TrayRow {
 /// focused view changes, or a finished worker's flash ends.
 #[derive(Default)]
 pub(crate) struct TrayCache {
-    key: Option<(u64, Option<u64>, bool)>,
+    key: Option<(u64, Option<u64>, bool, u64)>,
     pub(crate) rows: Vec<TrayRow>,
     /// When the next finished worker drops.
     until: Option<Instant>,
@@ -99,8 +116,23 @@ impl AppView {
     /// a finished worker's row at the end of its flash.
     pub(crate) fn sync_tray(&mut self, cx: &mut Context<Self>) {
         let attached = self.model.active.is_some();
-        let key = (self.model.stats.subagents.revision(), self.model.watch.focused().map(|w| w.subagent_id), attached);
         let now = Instant::now();
+        // Cancels the rows now say are cancelling (or ended) are done.
+        let session = self.model.active.as_ref().map(|a| a.session_id.clone());
+        if let Some(s) = session.as_deref() {
+            let subs = &self.model.stats.subagents;
+            let said = |h: &str| {
+                let id = h.strip_prefix("sa_").and_then(|n| n.parse().ok());
+                id.and_then(|id| subs.status(id)).is_some_and(|st| st == Status::Cancelling || st.terminal())
+            };
+            self.model.cancels.settle(s, said, now);
+        }
+        let key = (
+            self.model.stats.subagents.revision(),
+            self.model.watch.focused().map(|w| w.subagent_id),
+            attached,
+            self.model.cancels.generation,
+        );
         if self.tray.key == Some(key) && self.tray.until.is_none_or(|u| now < u) {
             return;
         }
@@ -108,7 +140,16 @@ impl AppView {
         // A view nobody looks at whose worker ended goes (and leaves the walk).
         self.model.watch.prune(now, &live);
         let (rows, until) = self.model.watch.tray(live, now);
-        self.tray = TrayCache { key: Some(key), rows: rows.into_iter().map(TrayRow::of).collect(), until };
+        let cancels = &self.model.cancels;
+        let pending = |id: u64| session.as_deref().is_some_and(|s| cancels.pending(s, &format!("sa_{id}")));
+        let rows = rows
+            .into_iter()
+            .map(|l| {
+                let p = pending(l.id);
+                TrayRow::of(l, p)
+            })
+            .collect();
+        self.tray = TrayCache { key: Some(key), rows, until };
         match until {
             Some(u) if self.tray_due.as_ref().map(|d| d.0) != Some(u) => {
                 let task = cx.spawn(async move |this, cx| {
@@ -152,9 +193,12 @@ impl AppView {
         let watched = self.model.watch.focused().map(|w| w.subagent_id);
         let row_h = crate::fit::tray_row(m);
         let mut list = v_flex();
+        let now = Instant::now();
+        let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
         for (i, r) in self.tray.rows.iter().take(workers).enumerate() {
             let inline_more = (cramped && more > 0 && i == 0).then(|| mono(format!("+{more}"), m.meta, p.dim_t).flex_none());
-            list = list.child(self.tray_row(r, watched == Some(r.id), row_h, inline_more, p, m, cx));
+            let armed = session.is_some_and(|s| self.model.cancels.armed(s, &r.handle, now));
+            list = list.child(self.tray_row(r, watched == Some(r.id), armed, row_h, inline_more, p, m, cx));
         }
         if more > 0 && !cramped {
             list = list.child(h_flex().h(px(row_h)).pl(px(m.run_x + 18.)).items_center().child(mono(
@@ -171,7 +215,17 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn tray_row(&self, r: &TrayRow, watched: bool, h: f32, more: Option<Div>, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
+    fn tray_row(
+        &self,
+        r: &TrayRow,
+        watched: bool,
+        armed: bool,
+        h: f32,
+        more: Option<Div>,
+        p: &Palette,
+        m: &Metrics,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let (sign, color) = match r.mark {
             Mark::Run => (None, p.run),
             Mark::Cancelling => (Some("◌"), p.warn),
@@ -192,6 +246,7 @@ impl AppView {
         };
         let row = h_flex()
             .id(("tray-row", r.id as usize))
+            .group("tray-row")
             .h(px(h))
             .w_full()
             .relative()
@@ -213,17 +268,22 @@ impl AppView {
                     .child(r.name.clone()),
             )
             .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(line_color).child(r.line.clone()))
-            .when(!r.facts.is_empty(), |d| d.child(div().flex_none().text_color(p.sub_time_t).child(r.facts.clone())))
-            .children(more);
-        let tip = r.tip.clone();
-        let row = row.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
-        if !r.watchable || watched {
-            return row.into_any_element();
+            .when(!r.facts.is_empty() && !armed, |d| d.child(div().flex_none().text_color(p.sub_time_t).child(r.facts.clone())))
+            .children(more)
+            .children(r.watchable.then(|| self.cancel_x(r.id, &r.handle, &r.name, armed, p, cx)).flatten())
+            .children(self.render_menu_at_row(r.id, p, cx));
+        if !r.watchable {
+            let tip = r.tip.clone();
+            return row.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)).into_any_element();
         }
         let (id, name) = (r.id, r.name.clone());
-        row.cursor_pointer()
-            .hover(|d| d.bg(p.tool_out))
-            .on_click(cx.listener(move |this, _, _, cx| this.watch_worker(id, &name, cx)))
+        let name2 = name.clone();
+        // No card over an open menu.
+        row.when(self.menu.is_none(), |d| d.tooltip(crate::wtabs::card_tip(cx.weak_entity(), id, r.tip.clone())))
+            .cursor_pointer()
+            .when(!watched, |d| d.hover(|d| d.bg(p.tool_out)))
+            .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(id, &name, ev, window, cx)))
+            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(id, &name2, ev, window, cx)))
             .into_any_element()
     }
 
@@ -269,5 +329,30 @@ impl AppView {
             .when(waits, |d| d.child(display(label::NEEDS_YOU, 10.5, p.warn).flex_none()))
             .when(!lay.tight, |d| d.child(mono(WORKER_KEY, 11., p.dim).flex_none()));
         Some(div().flex_none().bg(p.canvas).border_b_1().border_color(p.hair).child(column(lay, row)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Mark, TrayRow};
+    use crate::subagents::{Live, Status};
+
+    fn live(status: Status, line: &str) -> Live {
+        Live { id: 3, name: "quick".into(), status, line: line.into(), tools: Some(1), elapsed: Some(40.0), watchable: true }
+    }
+
+    /// A cancel on its way, then the rows' cancelling: `cancelling…` until
+    /// it has stopped; then `cancelled`.
+    #[test]
+    fn a_cancel_says_cancelling_until_the_rows_say_cancelled() {
+        let r = TrayRow::of(live(Status::Running, "bash"), true);
+        assert_eq!((r.mark, r.line.as_ref()), (Mark::Cancelling, "cancelling…"));
+        let r = TrayRow::of(live(Status::Cancelling, "bash"), false);
+        assert_eq!((r.mark, r.line.as_ref()), (Mark::Cancelling, "cancelling…"));
+        let r = TrayRow::of(live(Status::Cancelled, ""), true);
+        assert_eq!((r.mark, r.line.as_ref()), (Mark::Cancelled, "cancelled"));
+        let r = TrayRow::of(live(Status::Done, "ok"), true);
+        assert_eq!((r.mark, r.line.as_ref()), (Mark::Ok, "ok"), "ended: a cancel too late changes nothing");
+        assert_eq!(TrayRow::of(live(Status::Running, "bash"), false).line.as_ref(), "bash");
     }
 }
