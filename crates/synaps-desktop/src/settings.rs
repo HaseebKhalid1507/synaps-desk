@@ -519,9 +519,9 @@ mod tests {
         std::fs::create_dir_all(base.join("p")).unwrap();
         std::fs::write(base.join("p/config"), "api_retries = 4\n").unwrap();
         let r = read_reference(&base, Some("p"));
-        assert!(r.path.ends_with("/p/config"), "{}", r.path);
+        assert!(Path::new(&r.path).ends_with("p/config"), "{}", r.path);
         assert_eq!(r.values.unwrap().get("api_retries").map(String::as_str), Some("4"));
-        assert!(read_reference(&base, Some("q")).path.ends_with(&format!("sd-ref-{}/config", std::process::id())));
+        assert!(Path::new(&read_reference(&base, Some("q")).path).ends_with(format!("sd-ref-{}/config", std::process::id())));
         // A directory where the file should be: unreadable, not "default".
         std::fs::remove_file(base.join("config")).unwrap();
         std::fs::create_dir_all(base.join("config")).unwrap();
