@@ -29,7 +29,7 @@
 //!   window that may send the session input (as a steer); a first press
 //!   arms it (`Cancel sleeper? CONFIRM`) for [`CONFIRM`], a second one from
 //!   [`SETTLE`] on sends it (a double-click's second click and a held
-//!   key's repeats are not presses). The worker says `cancelling…` until
+//!   key's repeats are not presses). The worker says `cancelling` until
 //!   its rows say how it ended. Also from the × a hovered tray row shows.
 //! - **The hover card** on a tray row or a worker block, after the pointer
 //!   rests as for any tooltip: its task's first lines, model, elapsed
@@ -53,7 +53,7 @@ use crate::theme::{self, Palette};
 
 /// A cancel's first press waits this long for the second.
 pub(crate) const CONFIRM: Duration = Duration::from_secs(3);
-/// A cancel sent is shown `cancelling…` until the rows say so, or this long.
+/// A cancel sent is shown `cancelling` until the rows say so, or this long.
 pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(20);
 /// After a click opens a worker's tab, a click this soon with a click
 /// count over 1 is the rest of a double-click, not the tab's.
@@ -282,7 +282,7 @@ impl Cancels {
     }
 
     /// The daemon's answer to the cancel of `handle` sent on attachment
-    /// `attach_seq`: done, the rows will say it (it stays `cancelling…`
+    /// `attach_seq`: done, the rows will say it (it stays `cancelling`
     /// until they do); not done, the note to show.
     pub fn answered(&mut self, attach_seq: u64, handle: &str, result: &Result<String, String>) -> Option<String> {
         let i = self.sent.iter().position(|s| s.attach_seq == attach_seq && s.handle == handle)?;
@@ -363,12 +363,12 @@ impl WState {
         Some(match self {
             WState::Unknown => return None,
             WState::Running => fonts::label::RUNNING,
-            WState::Cancelling => "C A N C E L L I N G",
-            WState::Done => "C O M P L E T E D",
-            WState::Failed => "F A I L E D",
-            WState::Cancelled => "C A N C E L L E D",
-            WState::TimedOut => "T I M E D   O U T",
-            WState::Gone => "G O N E",
+            WState::Cancelling => fonts::label::CANCELLING,
+            WState::Done => fonts::label::COMPLETED,
+            WState::Failed => fonts::label::FAILED,
+            WState::Cancelled => fonts::label::CANCELLED,
+            WState::TimedOut => fonts::label::TIMED_OUT,
+            WState::Gone => fonts::label::GONE,
         })
     }
 
@@ -376,7 +376,7 @@ impl WState {
         match self {
             WState::Unknown => "started",
             WState::Running => "running",
-            WState::Cancelling => "cancelling…",
+            WState::Cancelling => "cancelling",
             WState::Done => "completed",
             WState::Failed => "failed",
             WState::Cancelled => "cancelled",
@@ -452,7 +452,7 @@ pub(crate) fn items(f: &Facts) -> Vec<Item<Act>> {
     }
     out.push(off(steer));
     let cancel = match (f.pending || f.state == WState::Cancelling, f.armed) {
-        (true, _) => Item::new(Act::Cancel, "cancelling…").off(format!("{} stops at its next step", f.name)),
+        (true, _) => Item::new(Act::Cancel, "cancelling").off(format!("{} stops at its next step", f.name)),
         (false, true) => {
             let mut i = Item::new(Act::Cancel, format!("Cancel {}?", f.name));
             i.confirm = Some("CONFIRM".into());
@@ -969,34 +969,52 @@ impl AppView {
         )
     }
 
-    /// A tray row's × (on hover; armed: `Cancel sleeper? CONFIRM`), if
-    /// this window may cancel it. A double-click's second click is not a
-    /// second press ([`Cancels::press`]).
-    pub(crate) fn cancel_x(&self, who: &Who, handle: &str, armed: bool, p: &Palette, cx: &Context<Self>) -> Option<AnyElement> {
+    /// A tray row's × (on hover, or while its row is the watched one;
+    /// armed: `Cancel sleeper? CONFIRM`), if this window may cancel it: the
+    /// row's full height `h`, so a near miss is not a click on the row. A
+    /// double-click's second click is not a second press
+    /// ([`Cancels::press`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cancel_x(
+        &self,
+        who: &Who,
+        handle: &str,
+        armed: bool,
+        watched: bool,
+        h: f32,
+        p: &Palette,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
         let session = self.model.active.as_ref()?.session_id.as_str();
         if self.cancel_blocked(session, who, handle).is_some() {
             return None;
         }
         let el = if armed {
+            // The name as the row's name column cuts it (18 characters).
+            let name = match who.name.char_indices().nth(18) {
+                Some((at, _)) => format!("{}…", &who.name[..at]),
+                None => who.name.to_string(),
+            };
             h_flex()
                 .id(("tray-x", who.id as usize))
                 .flex_none()
+                .h(px(h))
                 .gap(px(6.))
                 .items_center()
                 .cursor_pointer()
-                .child(div().text_color(p.err).child(format!("Cancel {}?", who.name)))
+                .child(div().text_color(p.err).child(format!("Cancel {name}?")))
                 .child(display("CONFIRM", 10., p.err))
         } else {
+            // A reveal button (design.md §5): drawn while its row is hovered.
             h_flex()
                 .id(("tray-x", who.id as usize))
+                .group("tray-x")
                 .flex_none()
                 .w(px(16.))
+                .h(px(h))
                 .justify_center()
                 .cursor_pointer()
-                .text_color(gpui_kit::transparent_black())
-                .group_hover("tray-row", |s| s.text_color(p.dim_t))
-                .hover(|s| s.text_color(p.err))
-                .child("×")
+                .child(crate::glyph::reveal(crate::glyph::Glyph::Close, "tray-row", "tray-x", watched, p.dim_t, p.ink))
         };
         let tip = if armed { "click again to cancel it (it stops at its next step)" } else { "cancel this worker…" };
         let who = who.clone();
@@ -1293,9 +1311,9 @@ mod tests {
         // Armed: the second press is asked for.
         let armed = items(&Facts { armed: true, ..facts() });
         assert_eq!((armed[3].label.as_ref(), armed[3].confirm.as_deref()), ("Cancel sleeper?", Some("CONFIRM")));
-        // Sent: cancelling…, nothing to press.
+        // Sent: cancelling, nothing to press.
         let sent = items(&Facts { pending: true, ..facts() });
-        assert_eq!((sent[3].label.as_ref(), sent[3].enabled()), ("cancelling…", false));
+        assert_eq!((sent[3].label.as_ref(), sent[3].enabled()), ("cancelling", false));
         // Finished with its whole result: copy it; no steer, no cancel.
         let done = Facts { state: WState::Done, result: Some((true, 900)), ..facts() };
         assert_eq!(acts(&done)[2..6], [(Steer, false), (Cancel, false), (CopyHandle, true), (CopyResult, true)]);

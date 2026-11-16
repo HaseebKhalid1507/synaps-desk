@@ -1,13 +1,15 @@
 //! The tray of workers over the composer (the TUI's subagent tray), and a
-//! worker's view's breadcrumb. One row per worker: its state, name, what
-//! it is doing (or ended with), tools and elapsed time; at most what
+//! worker's view's breadcrumb. One row per worker, in the grammar of the
+//! transcript's worker block (design.md §8.4): its state glyph, name, what
+//! it is doing (or ended with), tools and elapsed time, its state word; at
+//! most what
 //! [`crate::fit::tray_rows`] leaves room for, then "+N more". A finished
 //! worker shows how it ended for [`crate::watch::FLASH`], then drops.
 //! Nothing moves: no spinner; the elapsed time moves when a row comes (1 Hz
 //! while a worker runs). A click on a row opens that worker's view; the
 //! middle button, Ctrl/Cmd+click or a double-click open it in a tab, the
 //! right button its menu, and a hovered row shows its card and a × that
-//! cancels it ([`crate::wtabs`]). A cancel on its way says `cancelling…`.
+//! cancels it ([`crate::wtabs`]). A cancel on its way says `cancelling`.
 //!
 //! Built from the attached session's workers ([`crate::subagents`]) only
 //! when they change: no row is formatted per frame (each frame's rows hold
@@ -22,15 +24,18 @@ use gpui_kit::*;
 
 use crate::app::{AppView, WORKER_KEY, column, display, mono, tbtn};
 use crate::fonts::{self, label};
+use crate::glyph::{self, Ground};
 use crate::menu::At;
-use crate::subagents::{Live, Status, fmt_secs};
+use crate::subagents::{Live, Liveness, Status, fmt_secs};
 use crate::theme::{Metrics, Palette};
 use crate::watch::Candidate;
 use crate::wtabs::Who;
 
-/// A row's state mark.
+/// A row's state mark (the tray lists the attached session's workers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mark {
+    /// Its start is all that is known: not running.
+    Started,
     Run,
     Cancelling,
     Ok,
@@ -47,7 +52,20 @@ impl Mark {
             Status::Failed => Mark::Failed,
             Status::TimedOut => Mark::TimedOut,
             Status::Cancelled => Mark::Cancelled,
-            Status::Running | Status::Started => Mark::Run,
+            Status::Running => Mark::Run,
+            Status::Started => Mark::Started,
+        }
+    }
+
+    pub(crate) fn liveness(self) -> Liveness {
+        match self {
+            Mark::Started => Liveness::Started,
+            Mark::Run => Liveness::Running,
+            Mark::Cancelling => Liveness::Cancelling,
+            Mark::Ok => Liveness::Done,
+            Mark::Failed => Liveness::Failed,
+            Mark::TimedOut => Liveness::TimedOut,
+            Mark::Cancelled => Liveness::Cancelled,
         }
     }
 }
@@ -69,17 +87,11 @@ pub(crate) struct TrayRow {
 }
 
 impl TrayRow {
-    /// `cancelling`: a cancel of it is on its way (its rows have not said so).
-    /// Cancelling says so until it has stopped; cancelled, so does a row
-    /// with no line of its own.
+    /// `cancelling`: a cancel of it is on its way (its rows have not said
+    /// so): its word says cancelling until it has stopped.
     fn of(mut l: Live, cancelling: bool) -> Self {
         if cancelling && l.status == Status::Running {
             l.status = Status::Cancelling;
-        }
-        if l.status == Status::Cancelling {
-            l.line = "cancelling…".into();
-        } else if l.status == Status::Cancelled && l.line.is_empty() {
-            l.line = "cancelled".into();
         }
         let mut facts = Vec::new();
         if let Some(n) = l.tools.filter(|&n| n > 0) {
@@ -237,16 +249,28 @@ impl AppView {
             list = list.child(self.tray_row(r, watched == Some(r.id), armed, row_h, inline_more, p, m, cx));
         }
         if more > 0 && !cramped {
-            list = list.child(h_flex().h(px(row_h)).pl(px(m.run_x + 18.)).items_center().child(mono(
+            list = list.child(h_flex().h(px(row_h)).pl(px(m.pad_x + m.lead)).items_center().child(mono(
                 format!("+{more} more"),
                 m.meta,
                 p.dim_t,
             )));
         }
         let (gap, pad) = if cramped { (4., 2.) } else { (8., 4.) };
+        // The workers' bar down its lead edge; the watched row's is yours.
+        let you = watched.and_then(|w| self.tray.rows.iter().take(workers).position(|r| r.id == w));
         Some(column(
             lay,
-            div().mt(px(gap)).py(px(pad)).bg(p.tool).border_t_1().border_color(p.sub_rule).font_family(fonts::MONO).child(list),
+            div()
+                .mt(px(gap))
+                .py(px(pad))
+                .relative()
+                .bg(p.tool)
+                .font_family(fonts::MONO)
+                .child(list)
+                .child(glyph::bar(p.sub_rule))
+                .when_some(you, |d, i| {
+                    d.child(div().absolute().left_0().top(px(pad + i as f32 * row_h)).w(px(2.)).h(px(row_h)).bg(p.you_mark_t))
+                }),
         ))
     }
 
@@ -262,53 +286,55 @@ impl AppView {
         m: &Metrics,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let (sign, color) = match r.mark {
-            Mark::Run => (None, p.run),
-            Mark::Cancelling => (Some("◌"), p.warn),
-            Mark::Ok => (Some("✓"), p.ok),
-            Mark::Failed => (Some("×"), p.err),
-            Mark::TimedOut => (Some("!"), p.warn),
-            Mark::Cancelled => (Some("–"), p.dim_t),
-        };
-        let ended = !matches!(r.mark, Mark::Run | Mark::Cancelling);
-        let glyph = match sign {
-            None => div().size(px(8.)).m(px(1.)).flex_none().bg(p.run_mark),
-            Some(s) => div().w(px(10.)).flex_none().text_color(color).child(s),
-        };
+        let (g, _, word, family) = glyph::worker(r.mark.liveness());
+        let (word_color, mark) = glyph::ink(family, Ground::Run, p);
         let line_color = match r.mark {
             Mark::Failed => p.err,
-            _ if ended => p.dim_t,
-            _ => p.sub_status_t,
+            Mark::Run | Mark::Cancelling => p.sub_status_t,
+            _ => p.dim_t,
         };
+        let who = Who::new(r.id, r.name.clone(), r.call.clone());
+        // Facts · word · cancel ×: an armed cancel takes the facts' room.
+        let trail = h_flex()
+            .flex_none()
+            .gap(px(8.))
+            .items_center()
+            .when(!r.facts.is_empty() && !armed, |d| d.child(div().text_color(p.sub_time_t).child(r.facts.clone())))
+            .when(!self.layout.tight, |d| d.child(div().text_color(word_color).child(word)))
+            .children(more)
+            .children(r.watchable.then(|| self.cancel_x(&who, &r.handle, armed, watched, h, p, cx)).flatten());
         let row = h_flex()
             .id(("tray-row", r.id as usize))
             .group("tray-row")
             .h(px(h))
             .w_full()
             .relative()
-            .px(px(m.run_x))
-            .gap(px(m.run_gap))
+            .px(px(m.pad_x))
             .items_center()
             .whitespace_nowrap()
             .text_size(px(m.meta))
-            // The watched worker: the composer steers it.
-            .when(watched, |d| d.bg(p.tool_out).child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(p.focus)))
-            .child(glyph)
+            // The watched worker (the composer steers it): its bar is the
+            // tray's ([`AppView::render_tray`]).
+            .when(watched, |d| d.bg(p.tool_out))
+            .child(glyph::lead(Some(glyph::draw(g, mark)), m))
             .child(
-                div()
-                    .flex_none()
-                    .max_w(px(m.meta * 0.6 * 18.))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_color(if ended { p.dim_t } else { p.sub_name_t })
-                    .child(r.name.clone()),
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(m.run_gap))
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(m.meta * 0.6 * 18.))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_color(p.sub_name_t)
+                            .child(r.name.clone()),
+                    )
+                    .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(line_color).child(r.line.clone()))
+                    .child(trail),
             )
-            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(line_color).child(r.line.clone()))
-            .when(!r.facts.is_empty() && !armed, |d| d.child(div().flex_none().text_color(p.sub_time_t).child(r.facts.clone())))
-            .children(more);
-        let who = Who::new(r.id, r.name.clone(), r.call.clone());
-        let row = row
-            .children(r.watchable.then(|| self.cancel_x(&who, &r.handle, armed, p, cx)).flatten())
             .children(self.render_menu_at_row(r.id, p, cx));
         if !r.watchable {
             let tip = r.tip.clone();
@@ -393,24 +419,41 @@ impl AppView {
 #[cfg(test)]
 mod tests {
     use super::{Mark, TrayRow};
+    use crate::glyph::{self, Glyph};
     use crate::subagents::{Live, Status};
 
     fn live(status: Status, line: &str) -> Live {
         Live { id: 3, call: None, name: "quick".into(), status, line: line.into(), tools: Some(1), elapsed: Some(40.0), watchable: true }
     }
 
-    /// A cancel on its way, then the rows' cancelling: `cancelling…` until
-    /// it has stopped; then `cancelled`.
+    /// A row's glyph, word and step.
+    fn shown(r: &TrayRow) -> (Glyph, &'static str, &str) {
+        let (g, _, word, _) = glyph::worker(r.mark.liveness());
+        (g, word, r.line.as_ref())
+    }
+
+    /// A cancel on its way, then the rows' cancelling: `cancelling` until it
+    /// has stopped; then `cancelled`. The step stays the worker's.
     #[test]
     fn a_cancel_says_cancelling_until_the_rows_say_cancelled() {
         let r = TrayRow::of(live(Status::Running, "bash"), true);
-        assert_eq!((r.mark, r.line.as_ref()), (Mark::Cancelling, "cancelling…"));
+        assert_eq!((r.mark, shown(&r)), (Mark::Cancelling, (Glyph::Cancelling, "cancelling", "bash")));
         let r = TrayRow::of(live(Status::Cancelling, "bash"), false);
-        assert_eq!((r.mark, r.line.as_ref()), (Mark::Cancelling, "cancelling…"));
+        assert_eq!(shown(&r), (Glyph::Cancelling, "cancelling", "bash"));
         let r = TrayRow::of(live(Status::Cancelled, ""), true);
-        assert_eq!((r.mark, r.line.as_ref()), (Mark::Cancelled, "cancelled"));
+        assert_eq!(shown(&r), (Glyph::Cancelled, "cancelled", ""));
         let r = TrayRow::of(live(Status::Done, "ok"), true);
-        assert_eq!((r.mark, r.line.as_ref()), (Mark::Ok, "ok"), "ended: a cancel too late changes nothing");
-        assert_eq!(TrayRow::of(live(Status::Running, "bash"), false).line.as_ref(), "bash");
+        assert_eq!(shown(&r), (Glyph::Ok, "completed", "ok"), "ended: a cancel too late changes nothing");
+        assert_eq!(shown(&TrayRow::of(live(Status::Running, "bash"), false)), (Glyph::Run, "running", "bash"));
+    }
+
+    /// A start the history alone holds is not running (design.md §8.4): the
+    /// rest glyph and `started`, as the worker block says.
+    #[test]
+    fn a_started_worker_is_not_drawn_running() {
+        let r = TrayRow::of(live(Status::Started, ""), false);
+        assert_eq!((r.mark, shown(&r)), (Mark::Started, (Glyph::Idle, "started", "")));
+        let block = glyph::worker(crate::subagents::Liveness::of(Some(Status::Started), true));
+        assert_eq!(glyph::worker(r.mark.liveness()), block, "the tray row and the block agree");
     }
 }

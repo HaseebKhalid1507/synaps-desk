@@ -126,14 +126,15 @@ pub(crate) fn crumb_h(form: Form) -> f32 {
     if form == Form::Cramped { 29. } else { 35. }
 }
 
-/// One tray row (a worker).
+/// One tray row (a worker): a compact row.
 pub(crate) fn tray_row(m: &Metrics) -> f32 {
-    (22. * m.r).round()
+    m.row_compact
 }
 
-/// The tray round its rows: its gap above, its padding and top rule.
+/// The tray round its rows: its gap above and its padding (its bar is
+/// inside: design.md §8.4).
 pub(crate) fn tray_box(form: Form) -> f32 {
-    if form == Form::Cramped { 4. + 2. * 2. + 1. } else { 8. + 2. * 4. + 1. }
+    if form == Form::Cramped { 4. + 2. * 2. } else { 8. + 2. * 4. }
 }
 
 /// Most rows the tray shows (its "+N more" row included): the TUI's six
