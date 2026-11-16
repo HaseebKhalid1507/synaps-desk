@@ -115,11 +115,12 @@ impl Geo {
     }
 
     /// The offset that puts the thumb's start at `start`: the drag's
-    /// mapping. The thumb at the track's end is the scroll's end exactly.
-    pub(crate) fn offset_at(self, start: f32) -> f32 {
+    /// mapping. The thumb at the track's end is the scroll's end exactly. A
+    /// thumb that fills its track has nowhere to go: the offset stays `now`.
+    pub(crate) fn offset_at(self, start: f32, now: f32) -> f32 {
         let travel = self.track - self.len();
         if travel <= 0. {
-            return 0.;
+            return now;
         }
         unwarp((start / travel).clamp(0., 1.), self.warp) * self.max()
     }
@@ -129,9 +130,9 @@ impl Geo {
         (if toward_end { offset + self.view } else { offset - self.view }).clamp(0., self.max())
     }
 
-    /// The offset that centres the thumb on `at` (a Shift+click).
-    pub(crate) fn jump(self, at: f32) -> f32 {
-        self.offset_at(at - self.len() / 2.)
+    /// The offset that centres the thumb on `at` (a Shift+click), from `now`.
+    pub(crate) fn jump(self, at: f32, now: f32) -> f32 {
+        self.offset_at(at - self.len() / 2., now)
     }
 }
 
@@ -158,10 +159,13 @@ pub(crate) fn unwarp(d: f32, anchor: Option<(f32, f32)>) -> f32 {
 }
 
 /// The warp through `live` (where the content is) and `shown` (where the
-/// thumb was let go); none at the ends or where they agree.
+/// thumb was let go); none where they agree, nor at the ends: let go at an
+/// end, or come to one, the thumb tells where the content is (a list whose
+/// end was not measured yet when the thumb got there is not at its end).
 pub(crate) fn anchor(live: f32, shown: f32) -> Option<(f32, f32)> {
     const E: f32 = 1e-3;
-    (live > E && live < 1. - E && (live - shown).abs() > 1e-4).then(|| (live, shown.clamp(E, 1. - E)))
+    let inside = |f: f32| f > E && f < 1. - E;
+    (inside(live) && inside(shown) && (live - shown).abs() > 1e-4).then_some((live, shown))
 }
 
 /// Whether a bar shows: always (the transcript), under the pointer, while
@@ -230,6 +234,11 @@ pub(crate) trait Scrolled: Clone + 'static {
     fn offset(&self) -> Point<Pixels>;
     fn scroll_to(&self, at: Point<Pixels>);
     fn drag(&self, _on: bool) {}
+    /// A drag begun on this bar is still this target's: false once another
+    /// list took its place (a tab, a worker's view).
+    fn held(&self) -> bool {
+        true
+    }
 }
 
 fn neg(p: Point<Pixels>) -> Point<Pixels> {
@@ -298,11 +307,26 @@ impl Scrolled for Rows {
             self.list.scrollbar_drag_ended();
         }
     }
+    fn held(&self) -> bool {
+        self.list.is_scrollbar_dragging()
+    }
 }
 
 /// A bar's state across frames.
 #[derive(Clone, Default)]
 pub(crate) struct BarState(Rc<RefCell<Inner>>);
+
+impl BarState {
+    /// Its target goes (another list takes its place): a drag ends on it,
+    /// and nothing of where its thumb was carries over.
+    pub(crate) fn release(&self) {
+        let mut s = self.0.borrow_mut();
+        let end = s.end();
+        (s.warp, s.dropped, s.last) = (None, None, None);
+        drop(s);
+        end.into_iter().for_each(|f| f());
+    }
+}
 
 #[derive(Default)]
 struct Inner {
@@ -325,9 +349,18 @@ struct Inner {
     dropped: Option<f32>,
     /// The bar moved the content since the last frame.
     ours: bool,
+    /// Ends the drag on the target it began on (whatever is shown now).
+    release: Option<Box<dyn FnOnce()>>,
 }
 
 impl Inner {
+    /// The drag is over: what ends it on its target, run once the state is
+    /// let go of.
+    fn end(&mut self) -> Option<Box<dyn FnOnce()>> {
+        self.grab = None;
+        self.release.take()
+    }
+
     /// What is drawn: shown, and wide.
     fn look(&self, always: bool, now: Instant) -> (bool, bool) {
         let dragging = self.grab.is_some();
@@ -363,7 +396,6 @@ pub(crate) struct Bars {
     /// The session's system prompt in Settings.
     pub prompt: Pane,
     pub usage: BarState,
-    pub card: BarState,
 }
 
 /// A bar over `scroll`.
@@ -373,11 +405,12 @@ pub(crate) struct Bar<S: Scrolled> {
     axis: Axis,
     ground: Ground,
     always: bool,
+    focus: Option<FocusHandle>,
 }
 
 impl<S: Scrolled> Bar<S> {
     pub(crate) fn new(scroll: S, state: &BarState) -> Self {
-        Bar { scroll, state: state.clone(), axis: Axis::Vertical, ground: Ground::Canvas, always: false }
+        Bar { scroll, state: state.clone(), axis: Axis::Vertical, ground: Ground::Canvas, always: false, focus: None }
     }
 
     pub(crate) fn ground(mut self, ground: Ground) -> Self {
@@ -388,6 +421,13 @@ impl<S: Scrolled> Bar<S> {
     /// Shown whenever there is something to scroll.
     pub(crate) fn always(mut self) -> Self {
         self.always = true;
+        self
+    }
+
+    /// A press on the bar gives `focus` the keys (the pane's own press
+    /// would, and the bar takes it).
+    pub(crate) fn focus(mut self, focus: FocusHandle) -> Self {
+        self.focus = Some(focus);
         self
     }
 }
@@ -446,13 +486,21 @@ impl<S: Scrolled> Bar<S> {
             Geo { track: length(axis, lane0.size), view: length(axis, vp.size), content: length(axis, self.scroll.content()), warp: None };
         let offset = self.scroll.offset();
         let at = along(axis, offset);
-        if !geo.overflows() {
-            // Nothing to scroll (any more): no hitbox, no listener.
-            if st.grab.take().is_some() {
-                self.scroll.drag(false);
+        if !geo.overflows() || (st.grab.is_some() && !self.scroll.held()) {
+            // Nothing to scroll (any more), or another list in place of the
+            // one dragged: the drag ends where it began.
+            let end = st.end();
+            (st.warp, st.dropped) = (None, None);
+            if !geo.overflows() {
+                // No hitbox, no listener.
+                (st.over, st.on_bar, st.last) = (false, false, Some(at));
+                drop(st);
+                end.into_iter().for_each(|f| f());
+                return None;
             }
-            (st.over, st.on_bar, st.last, st.warp, st.dropped) = (false, false, Some(at), None, None);
-            return None;
+            drop(st);
+            end.into_iter().for_each(|f| f());
+            st = self.state.0.borrow_mut();
         }
         // The warp: anchored where the thumb was let go; gone at the ends
         // and after a jump the bar did not make (another list, a key).
@@ -500,7 +548,7 @@ impl<S: Scrolled> Bar<S> {
 impl<S: Scrolled> Frame<S> {
     fn paint(self, window: &mut Window, cx: &mut App) {
         let Frame { bar, geo, offset, thumb, lane, vp, pane, strip, thumb_hit, look, view } = self;
-        let Bar { scroll, state, axis, ground, always } = bar;
+        let Bar { scroll, state, axis, ground, always, focus } = bar;
         let dragging = state.0.borrow().grab.is_some();
         if look.0 {
             let p = &cx.global::<crate::theme::Scheme>().p;
@@ -544,14 +592,14 @@ impl<S: Scrolled> Frame<S> {
                     cx.stop_propagation();
                     if e.pressed_button != Some(MouseButton::Left) {
                         // Let go outside the window.
-                        s.grab = None;
+                        let end = s.end();
                         s.dropped = Some(geo.frac_at(s.held));
                         drop(s);
-                        scroll.drag(false);
+                        end.into_iter().for_each(|f| f());
                     } else {
                         s.held = geo.start_at(along(axis, e.position) - origin - grab);
                         s.ours = true;
-                        let to = geo.offset_at(s.held);
+                        let to = geo.offset_at(s.held, along(axis, offset));
                         drop(s);
                         scroll.scroll_to(place(axis, to, scroll.offset()));
                     }
@@ -588,24 +636,25 @@ impl<S: Scrolled> Frame<S> {
                 }
             });
         }
-        if dragging {
-            window.on_mouse_event({
-                let (scroll, state) = (scroll.clone(), state.clone());
-                move |e: &MouseUpEvent, phase, _, cx| {
-                    let mut s = state.0.borrow_mut();
-                    if phase.capture()
-                        && e.button == MouseButton::Left
-                        && let Some(grab) = s.grab.take()
-                    {
-                        // Where the thumb is let go (the pointer may be ahead of the last move).
-                        s.dropped = Some(geo.frac_at(geo.start_at(along(axis, e.position) - origin - grab)));
-                        drop(s);
-                        scroll.drag(false);
-                        cx.notify(view);
-                    }
+        // Whether or not a drag is on now: a press and its release can
+        // both come before the next paint.
+        window.on_mouse_event({
+            let state = state.clone();
+            move |e: &MouseUpEvent, phase, _, cx| {
+                let mut s = state.0.borrow_mut();
+                if phase.capture()
+                    && e.button == MouseButton::Left
+                    && let Some(grab) = s.grab
+                {
+                    // Where the thumb is let go (the pointer may be ahead of the last move).
+                    let end = s.end();
+                    s.dropped = Some(geo.frac_at(geo.start_at(along(axis, e.position) - origin - grab)));
+                    drop(s);
+                    end.into_iter().for_each(|f| f());
+                    cx.notify(view);
                 }
-            });
-        }
+            }
+        });
         // The track: the thumb to drag, a page toward a click, Shift+click
         // straight there (and on dragging from there).
         if let Some(strip) = strip.filter(|_| look.0) {
@@ -615,23 +664,32 @@ impl<S: Scrolled> Frame<S> {
                 }
                 cx.stop_propagation();
                 window.prevent_default();
+                if let Some(f) = focus.as_ref().filter(|f| !f.is_focused(window)) {
+                    window.focus(f, cx);
+                }
                 let at = along(axis, e.position) - origin;
                 let now = along(axis, offset);
                 state.0.borrow_mut().ours = true;
                 let grab = if (thumb.start..=thumb.start + thumb.len).contains(&at) {
                     Some(at - thumb.start)
                 } else if e.modifiers.shift {
-                    scroll.scroll_to(place(axis, geo.jump(at), offset));
+                    scroll.scroll_to(place(axis, geo.jump(at, now), offset));
                     Some(geo.len() / 2.)
                 } else {
                     scroll.scroll_to(place(axis, geo.page(now, at > thumb.start), offset));
                     None
                 };
                 if let Some(g) = grab {
+                    // A drag already on (its release missed) ends first.
+                    let end = state.0.borrow_mut().end();
+                    end.into_iter().for_each(|f| f());
+                    scroll.drag(true);
                     let mut s = state.0.borrow_mut();
                     (s.grab, s.held) = (Some(g), geo.start_at(at - g));
-                    drop(s);
-                    scroll.drag(true);
+                    s.release = Some(Box::new({
+                        let scroll = scroll.clone();
+                        move || scroll.drag(false)
+                    }));
                 }
                 cx.notify(view);
             });
@@ -663,7 +721,9 @@ fn linger(state: BarState, view: EntityId, window: &mut Window, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui_kit's `test` attribute would shadow the built-in.
-    use super::{EDGE, END, Geo, LINGER, MIN_THUMB, THIN, Thumb, WIDE, anchor, lane, list_content, shown, strip, thumb_rect, unwarp, warp};
+    use super::{
+        BarState, EDGE, END, Geo, LINGER, MIN_THUMB, THIN, Thumb, WIDE, anchor, lane, list_content, shown, strip, thumb_rect, unwarp, warp,
+    };
     use gpui_kit::{Axis, Bounds, point, px, size};
     use std::time::{Duration, Instant};
 
@@ -709,19 +769,22 @@ mod tests {
     fn a_drag_maps_the_thumb_back_to_its_offset_and_shift_click_centres_it() {
         for o in [0., 1., 333., 750., 1499., 1500.] {
             let t = G.thumb(o);
-            assert!((G.offset_at(t.start) - o).abs() < 1e-3, "{o}");
+            assert!((G.offset_at(t.start, 0.) - o).abs() < 1e-3, "{o}");
         }
         // Past either end of the track: the ends of the scroll.
-        assert_eq!(G.offset_at(-40.), 0.);
-        assert_eq!(G.offset_at(10_000.), 1500.);
+        assert_eq!(G.offset_at(-40., 700.), 0.);
+        assert_eq!(G.offset_at(10_000., 700.), 1500.);
         // Shift+click at 250 (the middle): the thumb centred there.
-        let o = G.jump(250.);
+        let o = G.jump(250., 0.);
         let t = G.thumb(o);
         assert!((t.start + t.len / 2. - 250.).abs() < 1e-3);
-        assert_eq!(G.jump(5.), 0.);
-        assert_eq!(G.jump(495.), 1500.);
-        // A drag on a track the thumb fills moves nothing.
-        assert_eq!(Geo { track: 20., view: 20., content: 1000., warp: None }.offset_at(10.), 0.);
+        assert_eq!(G.jump(5., 700.), 0.);
+        assert_eq!(G.jump(495., 0.), 1500.);
+        // A drag or Shift+click on a track the thumb fills moves nothing:
+        // the offset stays where it is (not the top).
+        let full = Geo { track: 20., view: 20., content: 1000., warp: None };
+        assert_eq!(full.offset_at(10., 640.), 640.);
+        assert_eq!(full.jump(3., 640.), 640.);
     }
 
     /// GPUI's `ListState::set_offset_from_scrollbar` (gpui-pre 0.3.12,
@@ -737,13 +800,13 @@ mod tests {
         let g = Geo { track: view - 2. * END, view, content: list_content(view, rows - view, pad), warp: None };
         assert_eq!(g.max(), scroll_max);
         let end = g.track - g.len();
-        assert!(follows(g.offset_at(end)), "the thumb at its end is the end");
-        assert!(follows(g.offset_at(end + 30.)), "past it too");
-        assert!(!follows(g.offset_at(end - 1.)), "a pixel up stops following");
-        assert!(!follows(g.offset_at(0.)));
+        assert!(follows(g.offset_at(end, 0.)), "the thumb at its end is the end");
+        assert!(follows(g.offset_at(end + 30., 0.)), "past it too");
+        assert!(!follows(g.offset_at(end - 1., scroll_max)), "a pixel up stops following");
+        assert!(!follows(g.offset_at(0., scroll_max)));
         // Without the padding the thumb's end is 36 px short: never re-armed.
         let bare = Geo { content: view + (rows - view), ..g };
-        assert!(!follows(bare.offset_at(end + 30.)));
+        assert!(!follows(bare.offset_at(end + 30., 0.)));
         // A list that fits draws no bar.
         assert!(!Geo { content: list_content(view, 0., pad), ..g }.overflows());
     }
@@ -805,7 +868,7 @@ mod tests {
         assert_eq!(G.start_at(100.), 100.);
         assert_eq!(G.frac_at(travel / 4.), 0.25);
         assert_eq!(G.frac_at(G.start_at(1e6)), 1.);
-        assert_eq!(G.offset_at(G.start_at(1e6)), G.max(), "held past the end is the end: it follows");
+        assert_eq!(G.offset_at(G.start_at(1e6), 0.), G.max(), "held past the end is the end: it follows");
         let fits = Geo { content: 400., ..G };
         assert_eq!((fits.start_at(50.), fits.frac_at(50.)), (0., 0.));
     }
@@ -831,13 +894,48 @@ mod tests {
         // 40 % of the travel is the content at 52 %.
         let g = Geo { warp: a, ..G };
         let travel = g.track - g.len();
-        assert!((g.offset_at(0.40 * travel) - 0.52 * g.max()).abs() < 1e-2);
+        assert!((g.offset_at(0.40 * travel, 0.) - 0.52 * g.max()).abs() < 1e-2);
         assert!((g.thumb(0.52 * g.max()).start - 0.40 * travel).abs() < 1e-2);
         assert_eq!(g.thumb(g.max()).start, travel);
-        assert_eq!(g.offset_at(travel), g.max(), "the end still follows");
+        assert_eq!(g.offset_at(travel, 0.), g.max(), "the end still follows");
         // No warp at the ends, nor where the two agree.
         assert_eq!(anchor(0., 0.3), None);
         assert_eq!(anchor(1., 0.7), None);
         assert_eq!(anchor(0.5, 0.5), None);
+    }
+
+    /// The rail's thumb dropped at the bottom of a list whose last rows were
+    /// not measured yet: once they are, the content is short of its end and
+    /// the thumb says so (no warp pins it to the bottom). The same at the top.
+    #[test]
+    fn a_thumb_dropped_at_an_end_tells_where_the_content_is() {
+        assert_eq!(anchor(0.8, 1.), None);
+        assert_eq!(anchor(0.2, 0.), None);
+        let g = Geo { warp: anchor(0.8, 1.), ..G };
+        let travel = g.track - g.len();
+        assert!((g.thumb(0.8 * g.max()).start - 0.8 * travel).abs() < 1e-3, "short of the bottom");
+    }
+
+    /// A drag ends on the target it began on, once: on a release, or when
+    /// another list takes its place (then nothing of the old thumb stays).
+    #[test]
+    fn a_drag_ends_on_the_list_it_began_on() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let ended = Rc::new(Cell::new(0));
+        let bar = BarState::default();
+        {
+            let mut s = bar.0.borrow_mut();
+            let e = ended.clone();
+            (s.grab, s.held, s.warp, s.last) = (Some(4.), 100., Some((0.5, 0.4)), Some(900.));
+            s.release = Some(Box::new(move || e.set(e.get() + 1)));
+        }
+        bar.release();
+        assert_eq!(ended.get(), 1);
+        let s = bar.0.borrow();
+        assert_eq!((s.grab, s.warp, s.last), (None, None, None));
+        drop(s);
+        bar.release();
+        assert_eq!(ended.get(), 1, "once");
     }
 }
