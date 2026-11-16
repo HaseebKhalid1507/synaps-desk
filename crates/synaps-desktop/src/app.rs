@@ -768,12 +768,19 @@ impl HeaderParts {
 }
 
 /// The hold-back after a layout ([`AppView::keep_rows`]): whether the list,
-/// grown to its end while scrolled back, is paused short of it now. The hold
-/// is spent on the first layout that is not provisional (`pending`: a row's
-/// parse not landed, so GPUI neither fills up to the end nor re-arms
-/// following on it); spent on a provisional one, the next would follow.
+/// grown to its end while scrolled back, is paused short of it now. It was
+/// not following when the hold was armed, so following now is GPUI's
+/// re-arm: paused, whatever is pending. Otherwise the hold is spent on the
+/// first layout with no row's parse pending: a provisional one (`pending`)
+/// neither fills up to the end nor re-arms, and spent there, the next
+/// would follow. `pending` also counts rows GPUI did not wait for (above
+/// the view), so it can re-arm with a row pending.
 pub(crate) fn held_back(hold: &Cell<bool>, pending: bool, following: bool) -> bool {
-    !pending && hold.replace(false) && following
+    let pause = hold.get() && following;
+    if pause || !pending {
+        hold.set(false);
+    }
+    pause
 }
 
 /// How far down the transcript's list starts: the top bar, the session
@@ -4508,9 +4515,10 @@ impl Render for AppView {
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
         // the end of a scrolled-back list set it following; it stops 2 px
         // short of the end instead, still scrolled back. Built only on the
-        // frames that need it: a layout with a reply's parse pending is
-        // provisional (GPUI re-arms following only on the next one), so the
-        // hold waits for a real one.
+        // frames that need it; a layout with a reply's parse pending may be
+        // provisional (GPUI re-arms following only on a real one), so the
+        // hold lasts until GPUI re-arms or a layout has nothing pending
+        // ([`held_back`]).
         let hold_back = self.hold_back.get().then(|| {
             let (held, hold, texts) = (self.list.clone(), self.hold_back.clone(), self.texts.clone());
             canvas(
@@ -5650,5 +5658,13 @@ mod tests {
         assert!(held_back(&hold, false, true));
         let hold = Cell::new(true);
         assert!(!held_back(&hold, false, false) && !hold.get(), "not at the end: nothing to hold");
+        // A row pending above the view (GPUI waits only for those it fills
+        // the view with): GPUI re-armed all the same. Paused, and spent.
+        let hold = Cell::new(true);
+        assert!(held_back(&hold, true, true), "paused, a row pending or not");
+        assert!(!hold.get() && !held_back(&hold, true, true));
+        // The rule before held only once nothing was pending: it followed.
+        let before = |hold: &Cell<bool>, pending: bool, following: bool| !pending && hold.replace(false) && following;
+        assert!(!before(&Cell::new(true), true, true), "followed");
     }
 }

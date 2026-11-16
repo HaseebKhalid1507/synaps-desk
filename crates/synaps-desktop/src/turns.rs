@@ -45,6 +45,8 @@ pub(crate) const FOLD_AT: usize = 4;
 /// reused. Every list swap clears them as well ([`TextRows::clear`]).
 pub(crate) struct TextRows<V> {
     kept: HashMap<u64, Kept<V>>,
+    /// The kept views' text, in bytes ([`KEEP_BYTES`]).
+    bytes: usize,
     /// The rows laid out this frame whose parse is pending (indices): no
     /// allocation once warm.
     waiting: Vec<usize>,
@@ -66,9 +68,25 @@ struct Kept<V> {
     parsed: bool,
 }
 
-/// Views kept: a few screens of rows at the smallest text size. Past it the
-/// one drawn longest ago goes (it parses again if it comes back).
+/// Views kept, at most: past it the one drawn longest ago goes (it parses
+/// again if it comes back). Above the render window's rows: at the smallest
+/// text size a markdown row is at least ~37 px (a line and a part gap), so
+/// with 600 px of overdraw each side a 2160 px view draws ~86 of them and a
+/// 3384 px one ~122. Nothing drawn this frame or last ever goes, whatever
+/// the count, so a lower cap thrashes nothing; it only parses more.
 const KEEP: usize = 160;
+
+/// The kept views' text, at most, in bytes: past it the ones drawn longest
+/// ago go, as past [`KEEP`]. A kept view holds far more than its text: its
+/// document, its blocks' layout and the shaped glyphs of every paragraph it
+/// last painted (the kit keeps those until the view drops). Measured on a
+/// code-heavy transcript, ~190 bytes of memory a character kept (256 KiB
+/// kept: +48 MB over keeping none). 32 KiB is ~6 MB: about ten screens of
+/// dense text behind the window (rows go whole), for a scroll back and
+/// forth that parses nothing again. The window itself may hold more (a
+/// 300 KB reply on screen): what it draws stays, as before views were kept;
+/// the budget only drops what it no longer draws.
+const KEEP_BYTES: usize = 32 * 1024;
 
 /// A parse that never lands (a failed one) stops holding its row after this.
 pub(crate) const MAX_WAIT: Duration = Duration::from_secs(2);
@@ -104,7 +122,7 @@ pub(crate) fn waits(parsed: bool, empty: bool, age: Duration) -> bool {
 
 impl<V> Default for TextRows<V> {
     fn default() -> Self {
-        TextRows { kept: HashMap::new(), waiting: Vec::new(), frame: 0, cpl: 16. }
+        TextRows { kept: HashMap::new(), bytes: 0, waiting: Vec::new(), frame: 0, cpl: 16. }
     }
 }
 
@@ -120,6 +138,7 @@ impl<V> TextRows<V> {
     /// nothing of this one carries over.
     pub(crate) fn clear(&mut self) {
         self.kept.clear();
+        self.bytes = 0;
         self.waiting.clear();
     }
 
@@ -130,6 +149,7 @@ impl<V> TextRows<V> {
             Some(k) => {
                 let keep = keep(&k.text, text);
                 if keep != Keep::Fresh {
+                    self.bytes += text.len() - k.text.len();
                     (k.text, k.drawn) = (text.clone(), frame);
                 }
                 keep
@@ -142,16 +162,22 @@ impl<V> TextRows<V> {
         self.kept.get(&id).map(|k| &k.view)
     }
 
-    /// Keep `view` for row `id` (its `text`), made `now`; past [`KEEP`], the
-    /// view drawn longest ago (not this frame) goes.
+    /// Keep `view` for row `id` (its `text`), made `now`. Past [`KEEP`] views
+    /// or [`KEEP_BYTES`], the views drawn longest ago go, never one drawn
+    /// this frame or the last: rows below this one in the window are not
+    /// drawn yet this frame, and one dropped would be made again (and over
+    /// 4 KB parsed again, pending) every frame.
     fn put(&mut self, id: u64, text: SharedString, view: V, now: Instant) {
-        if self.kept.len() >= KEEP && !self.kept.contains_key(&id) {
-            let old = self.kept.iter().filter(|(_, k)| k.drawn < self.frame).min_by_key(|(_, k)| k.drawn).map(|(&id, _)| id);
-            if let Some(old) = old {
-                self.kept.remove(&old);
-            }
+        self.bytes += text.len();
+        if let Some(old) = self.kept.insert(id, Kept { text, view, drawn: self.frame, born: now, parsed: false }) {
+            self.bytes -= old.text.len();
         }
-        self.kept.insert(id, Kept { text, view, drawn: self.frame, born: now, parsed: false });
+        while self.kept.len() > KEEP || self.bytes > KEEP_BYTES {
+            let frame = self.frame;
+            let old = self.kept.iter().filter(|(_, k)| k.drawn + 1 < frame).min_by_key(|(_, k)| k.drawn).map(|(&id, _)| id);
+            let Some(k) = old.and_then(|id| self.kept.remove(&id)) else { break };
+            self.bytes -= k.text.len();
+        }
     }
 
     /// Whether row `id` (drawn at `ix`) waits for its parse, `parsed` telling
@@ -1142,8 +1168,8 @@ mod tests {
     use synaps_client::transcript::ItemKind;
 
     use super::{
-        Counts, Disp, Gap, Hue, KEEP, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, TextRows, Tone, Who, build,
-        diff, text_lines, turn_start,
+        Counts, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, TextRows, Tone,
+        Who, build, diff, text_lines, turn_start,
     };
     use crate::files::{CallDelta, Ledger};
     use crate::subagents::Subagents;
@@ -1545,6 +1571,79 @@ mod tests {
         rows.put(1000, "new".into(), 1000, t0);
         assert!(rows.view(0).is_some() && rows.view(1).is_none() && rows.view(1000).is_some());
         assert_eq!(rows.kept.len(), KEEP);
+    }
+
+    fn kept_bytes<V>(rows: &TextRows<V>) -> usize {
+        rows.kept.values().map(|k| k.text.len()).sum()
+    }
+
+    /// Past [`KEEP_BYTES`] of text, the views drawn longest ago go, however
+    /// few they are; the count follows streamed text and replaced views.
+    #[test]
+    fn the_byte_budget_drops_the_views_drawn_longest_ago() {
+        let m = Metrics::at(16);
+        let t0 = Instant::now();
+        let quarter = |c: char| SharedString::from(c.to_string().repeat(KEEP_BYTES / 4));
+        let mut rows = TextRows::<char>::default();
+        // Scrolled through six long replies, one a frame.
+        for (id, c) in (0..).zip("abcdef".chars()) {
+            rows.frame(672., &m);
+            assert_eq!(rows.take(id, &quarter(c)), Keep::Fresh);
+            rows.put(id, quarter(c), c, t0);
+            assert_eq!(rows.bytes, kept_bytes(&rows));
+        }
+        assert!(rows.view(0).is_none() && rows.view(1).is_none(), "a and b went");
+        assert!((2..6).all(|id| rows.view(id).is_some()));
+        assert_eq!(rows.bytes, KEEP_BYTES);
+        // Streamed on, replaced by another row's text, cleared.
+        rows.frame(672., &m);
+        assert_eq!(rows.take(5, &SharedString::from(format!("{}, and more", quarter('f')))), Keep::Append);
+        assert_eq!(rows.bytes, kept_bytes(&rows));
+        assert_eq!(rows.take(4, &"another".into()), Keep::Fresh);
+        rows.put(4, "another".into(), 'g', t0);
+        assert_eq!(rows.bytes, kept_bytes(&rows));
+        rows.clear();
+        assert_eq!(rows.bytes, 0);
+    }
+
+    /// A window that draws more text than [`KEEP_BYTES`] keeps every view it
+    /// draws. A row made this frame above the others (drawn before them)
+    /// spares the ones drawn last frame and not yet this one: with only this
+    /// frame's spared, they would go and be made again (a parse each) every
+    /// frame. Rows off the window go.
+    #[test]
+    fn a_window_over_the_byte_budget_never_drops_its_own_views() {
+        let m = Metrics::at(16);
+        let t0 = Instant::now();
+        let half = |c: char| SharedString::from(c.to_string().repeat(KEEP_BYTES / 2));
+        let mut rows = TextRows::<char>::default();
+        rows.frame(672., &m);
+        for (id, c) in (1..).zip("xyz".chars()) {
+            assert_eq!(rows.take(id, &half(c)), Keep::Fresh);
+            rows.put(id, half(c), c, t0);
+        }
+        assert_eq!(rows.kept.len(), 3, "1.5 budgets, all on screen");
+        // Each frame a new row above them, made before they are drawn.
+        for new in 10..14 {
+            rows.frame(672., &m);
+            let text = SharedString::from(new.to_string());
+            assert_eq!(rows.take(new, &text), Keep::Fresh);
+            rows.put(new, text, 'n', t0);
+            for (id, c) in (1..).zip("xyz".chars()) {
+                assert_eq!(rows.take(id, &half(c)), Keep::Same, "{c} kept, frame after frame");
+            }
+        }
+        assert!(rows.view(10).is_none() && rows.view(11).is_none(), "off the window, over the budget: gone");
+        // Scrolled on: x leaves the window, and goes after a frame's grace.
+        rows.frame(672., &m);
+        for (id, c) in (2..).zip("yz".chars()) {
+            assert_eq!(rows.take(id, &half(c)), Keep::Same);
+        }
+        rows.frame(672., &m);
+        rows.put(20, "v".into(), 'v', t0);
+        assert!(rows.view(1).is_none(), "x went");
+        assert!(rows.view(2).is_some() && rows.view(3).is_some(), "drawn last frame: kept");
+        assert_eq!(rows.bytes, kept_bytes(&rows));
     }
 
     #[test]
