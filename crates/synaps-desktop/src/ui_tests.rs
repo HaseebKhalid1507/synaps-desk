@@ -240,6 +240,14 @@ fn a_worker_in_place_outlives_the_session_poll(cx: &mut TestAppContext) {
         poll(cx, &view);
         assert_eq!(in_place(cx, &view).as_deref(), Some("sa_1"), "a poll that changed nothing left scout on screen");
     }
+    // The session opened again (its rail row): its thread, as before.
+    view.update(cx, |v, cx| {
+        let session = v.model.tabs.current().and_then(|t| t.session.clone()).expect("its session");
+        v.open_tab(crate::app::Open::Attach { session_id: session, fallback: None, open: false }, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.model.watch.focus().map(str::to_string)), None, "an open of the session: its thread");
 }
 
 /// A session tab shows the worker it showed in place when it was left,

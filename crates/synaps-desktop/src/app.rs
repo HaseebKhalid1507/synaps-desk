@@ -2070,8 +2070,10 @@ impl AppView {
         self.restore_notice(dropped);
         // A view on screen leaves the session tab behind it current.
         let vis = self.model.tabs.current().map(|t| (t.id, t.session.clone()));
-        // Another tab on screen (not the same one named or re-attached).
-        let moved = self.shown_tab.as_ref().map(|v| v.0) != vis.as_ref().map(|v| v.0);
+        // Another tab on screen (not the same one named or re-attached),
+        // or the one on screen opened again (a rail row, an open by name):
+        // its view starts from its hand-off, never from an event batch.
+        let shown = hint.is_some() || self.shown_tab.as_ref().map(|v| v.0) != vis.as_ref().map(|v| v.0);
         // A session tab left keeps the worker its view showed in place.
         if let Some((id, _)) = self.shown_tab
             && vis.as_ref().map(|v| v.0) != Some(id)
@@ -2088,7 +2090,7 @@ impl AppView {
             self.shown_tab = vis;
             // Another tab of the same session (its worker's, or back to
             // it): the same attachment, another view.
-            self.tab_watch(moved);
+            self.tab_watch(shown);
             if hint.as_ref().is_some_and(|h| h.1) {
                 // An Open by name of the session on screen: done.
                 self.model.named.opened = true;
@@ -2104,7 +2106,7 @@ impl AppView {
             self.load(vis.as_ref().and_then(|v| v.1.clone()));
         }
         self.shown_tab = vis.clone();
-        self.tab_watch(moved);
+        self.tab_watch(shown);
         match vis {
             Some((_, Some(s))) => self.attach_tab(s, hint),
             // A create or a resume: the caller sends it.
@@ -2115,16 +2117,16 @@ impl AppView {
 
     /// The current tab's worker view. A worker tab: its worker, checked
     /// on every reconcile (an attach elsewhere resets the view, a handle
-    /// may name another worker now). A session tab, only when it came on
-    /// screen (`moved`): the worker it showed in place when it was left,
-    /// else its thread. Between, its view is the user's: a session poll
-    /// (one every 3 s, changed or not) neither drops a worker shown in
-    /// place nor brings back one Esc'd away.
-    fn tab_watch(&mut self, moved: bool) {
+    /// may name another worker now). A session tab, only when it is
+    /// `shown` (come on screen, or opened again): the worker it showed in
+    /// place when it was left, else its thread. Between, its view is the
+    /// user's: a session poll (one every 3 s, changed or not) neither
+    /// drops a worker shown in place nor brings back one Esc'd away.
+    fn tab_watch(&mut self, shown: bool) {
         let Some(t) = self.model.tabs.current() else { return };
         let want = match (&t.worker, t.kind) {
             (Some(w), crate::tabs::Kind::Worker) => Some((w.handle.clone(), w.name.clone(), w.call.clone(), true)),
-            _ if !moved => return,
+            _ if !shown => return,
             _ => {
                 let id = t.id;
                 let handoff = self.model.tabs.take_watching(id);
