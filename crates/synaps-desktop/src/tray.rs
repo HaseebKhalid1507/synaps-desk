@@ -111,7 +111,7 @@ impl TrayRow {
 /// focused view changes, or a finished worker's flash ends.
 #[derive(Default)]
 pub(crate) struct TrayCache {
-    key: Option<(u64, Option<u64>, bool, u64)>,
+    key: Option<(u64, Option<u64>, bool, u64, u64)>,
     pub(crate) rows: Vec<TrayRow>,
     /// When the next finished worker drops.
     until: Option<Instant>,
@@ -137,16 +137,20 @@ impl AppView {
             self.model.watch.focused().map(|w| w.subagent_id),
             attached,
             self.model.cancels.generation,
+            // A worker tab closed: its view and list go now.
+            self.model.tabs.generation,
         );
         if self.tray.key == Some(key) && self.tray.until.is_none_or(|u| now < u) {
             return;
         }
         let live = if attached { self.model.stats.subagents.live() } else { Vec::new() };
         // A view nobody looks at (on screen, or held by a worker tab) whose
-        // worker ended goes (and leaves the walk).
+        // worker ended goes (and leaves the walk), as do the views of the
+        // worker tabs past the most recently shown few, and their lists.
         let held = self.model.held_views();
         self.model.watch.hold(held);
         self.model.watch.prune(now, &live);
+        self.drop_released_panes();
         let (rows, until) = self.model.watch.tray(live, now);
         let cancels = &self.model.cancels;
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
@@ -229,7 +233,7 @@ impl AppView {
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
         for (i, r) in self.tray.rows.iter().take(workers).enumerate() {
             let inline_more = (cramped && more > 0 && i == 0).then(|| mono(format!("+{more}"), m.meta, p.dim_t).flex_none());
-            let armed = session.is_some_and(|s| self.model.cancels.armed(s, &r.handle, now));
+            let armed = session.is_some_and(|s| self.model.cancels.armed(s, r.id, (r.call.as_deref(), &r.name), now));
             list = list.child(self.tray_row(r, watched == Some(r.id), armed, row_h, inline_more, p, m, cx));
         }
         if more > 0 && !cramped {

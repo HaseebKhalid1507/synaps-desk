@@ -47,6 +47,8 @@ mod tabstrip;
 mod theme;
 mod tray;
 mod turns;
+#[cfg(test)]
+mod ui_tests;
 mod usage;
 mod usage_view;
 mod views;
