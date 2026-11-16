@@ -15,6 +15,9 @@ use synaps_client::{AttachMode, Event, synthetic};
 const CWD: &str = "/home/you/work/relay-gateway";
 /// The session `--offline` opens: it waits on a tool-call confirmation.
 pub(crate) const SID: &str = "20261113-041207-a1f0";
+/// A parked session whose turns are over: runs that fold (one with a
+/// failed call, one all ok), an edit's diff in each.
+const IDLE_CPU: &str = "20261113-161706-a1b9";
 
 /// RFC 3339 (UTC) of `secs` after the epoch.
 pub(crate) fn rfc3339(secs: i64) -> String {
@@ -241,6 +244,131 @@ fn messages() -> Vec<Value> {
     ]
 }
 
+/// [`IDLE_CPU`]'s history: two finished turns whose runs fold.
+fn idle_cpu() -> Vec<Value> {
+    let p = |f: &str| format!("/home/you/work/synaps-desktop/crates/synaps-desktop/src/{f}");
+    let mut out =
+        vec![json!({"role": "user", "content": "The hybrid build idles at 3 % CPU where main sits at 0. Find out why and fix it."})];
+    fn call(out: &mut Vec<Value>, id: &str, name: &str, input: Value, result: &str, error: bool, text: Option<&str>) {
+        let mut blocks = Vec::new();
+        if let Some(t) = text {
+            blocks.push(json!({"type": "text", "text": t}));
+        }
+        blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
+        out.push(json!({"role": "assistant", "content": blocks}));
+        out.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": result, "is_error": error}]}));
+    }
+    let idle = "scripts/idle-cpu-linux.sh target/release/synaps-desktop";
+    call(
+        &mut out,
+        "toolu_i1",
+        "bash",
+        json!({"command": idle}),
+        "synaps-desktop: frames/15s=212 cpu_ticks=46 rss_kb=184212",
+        false,
+        Some("Measuring it first: frames and CPU over 15 s with nothing happening."),
+    );
+    call(
+        &mut out,
+        "toolu_i2",
+        "grep",
+        json!({"pattern": "request_animation_frame|on_next_frame", "path": p("")}),
+        "app.rs:2210:        window.request_animation_frame();",
+        false,
+        None,
+    );
+    call(
+        &mut out,
+        "toolu_i3",
+        "read",
+        json!({"path": p("app.rs")}),
+        "    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) {\n…",
+        false,
+        None,
+    );
+    call(
+        &mut out,
+        "toolu_i4",
+        "read",
+        json!({"path": p("tray.rs")}),
+        "    pub(crate) fn sync_tray(&mut self, cx: &mut Context<Self>) {\n…",
+        false,
+        None,
+    );
+    call(
+        &mut out,
+        "toolu_i5",
+        "edit",
+        json!({"path": p("app.rs"),
+        "old_string": "        if self.tray.until.is_some() {\n            window.request_animation_frame();\n        }",
+        "new_string": "        // The tray's flash ends on its own timer (`tray_due`): no frame\n        // is asked for while nothing changes.\n        let _ = due;"}),
+        "Edited app.rs",
+        false,
+        None,
+    );
+    call(
+        &mut out,
+        "toolu_i6",
+        "bash",
+        json!({"command": "cargo build --release -p synaps-desktop"}),
+        "error[E0425]: cannot find value `due` in this scope\n --> crates/synaps-desktop/src/app.rs:2212:17",
+        true,
+        None,
+    );
+    call(
+        &mut out,
+        "toolu_i7",
+        "edit",
+        json!({"path": p("app.rs"), "old_string": "        let _ = due;", "new_string": ""}),
+        "Edited app.rs",
+        false,
+        None,
+    );
+    call(&mut out, "toolu_i8", "bash", json!({"command": idle}), "synaps-desktop: frames/15s=0 cpu_ticks=1 rss_kb=183960", false, None);
+    out.push(json!({"role": "assistant", "content": [{"type": "text",
+        "text": "Idle is back to 0 frames in 15 s. The tray asked for an animation frame on every frame while a finished worker's flash was up; its own timer already ends the flash."}]}));
+    out.push(json!({"role": "user", "content": "Bench it once more against main, then commit."}));
+    call(
+        &mut out,
+        "toolu_j1",
+        "bash",
+        json!({"command": "scripts/bench-linux.sh target/release/synaps-desktop"}),
+        "bench-results/20261113-1702.json",
+        false,
+        Some("Running the bench."),
+    );
+    call(
+        &mut out,
+        "toolu_j2",
+        "read",
+        json!({"path": "/home/you/work/synaps-desktop/bench-results/20261113-1702.json"}),
+        "{\"stream\": {\"fps\": 143.1, \"dropped_frames\": 2}, …}",
+        false,
+        None,
+    );
+    call(
+        &mut out,
+        "toolu_j3",
+        "edit",
+        json!({"path": "/home/you/work/synaps-desktop/docs/bench/README.md",
+        "old_string": "| idle | 212 frames / 15 s |", "new_string": "| idle | 0 frames / 15 s |"}),
+        "Edited README.md",
+        false,
+        None,
+    );
+    call(
+        &mut out,
+        "toolu_j4",
+        "bash",
+        json!({"command": "git commit -am 'Tray: no frame per frame while a flash is up'"}),
+        "[fix/idle 4c1d2e7] Tray: no frame per frame while a flash is up",
+        false,
+        None,
+    );
+    out.push(json!({"role": "assistant", "content": [{"type": "text", "text": "Committed. The bench matches main: 143 fps streaming, 2 dropped."}]}));
+    out
+}
+
 /// The events of a daemon connection with ten sessions: two polls (in the
 /// second a turn has ended off screen: UNREAD). The window opens [`SID`]
 /// (an attach, answered by [`attach`]).
@@ -265,6 +393,9 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
     msgs.extend(synthetic::history(m.messages.min(60), seed));
     if m.messages == 0 {
         msgs.clear();
+    }
+    if id == IDLE_CPU {
+        msgs = idle_cpu();
     }
     let prompts: Vec<Value> = (1..=m.awaiting_input as u64)
         .map(|i| {
@@ -389,6 +520,23 @@ mod tests {
             assert_eq!(m.transcript.busy(), s.busy, "{}", s.id);
         }
         assert!(attach("20990101-000000-ffff", 1).is_empty());
+        // The parked one's turns are over: both runs fold, one with a
+        // failed call, each with an edit.
+        let mut m = Model::new(ConnState::Off("offline".into()));
+        m.attaching(1, None, false);
+        m.asked_for(IDLE_CPU);
+        for ev in attach(IDLE_CPU, 1) {
+            m.apply(ev);
+        }
+        let rows = crate::turns::build(m.transcript.items(), 0, false, &Default::default(), &Default::default());
+        let runs: Vec<usize> = rows
+            .iter()
+            .filter_map(|d| match d.kind {
+                crate::turns::Kind::Summary { end, .. } => Some(end - d.item),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs, [8, 4]);
     }
 
     /// `--offline` answers `saved_sessions` through the same path as a
