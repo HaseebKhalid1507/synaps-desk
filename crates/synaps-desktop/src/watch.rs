@@ -33,6 +33,11 @@
 //!   one takes no steer until a page says so (from 0 if the daemon is
 //!   another process); a page whose cursor goes back, or that names
 //!   another worker, starts the view over from 0.
+//! - **Worker tabs.** A worker can have a tab of its own
+//!   ([`crate::tabs::Kind::Worker`]): the same view, opened with
+//!   [`Watch::open_tab`]. Esc does not leave it and the worker keys do not
+//!   walk from it (it is that worker's tab); closing it never touches the
+//!   worker. In the background it polls nothing, as any tab left.
 //! - **Older daemons.** One before v0.11.0 cannot decode the query: the
 //!   view says so once ([`UNSUPPORTED`]) and nothing polls until the next
 //!   reconnect.
@@ -159,6 +164,9 @@ pub struct Worker {
     /// A refused steer's text and the daemon's reason, for the composer
     /// once this view is on screen again.
     unsent: Option<(String, String)>,
+    /// Shown in a worker tab (not in place over the session's thread):
+    /// what its hints say.
+    pub tabbed: bool,
 }
 
 impl Worker {
@@ -190,6 +198,7 @@ impl Worker {
             hint: SharedString::default(),
             files_note: SharedString::default(),
             unsent: None,
+            tabbed: false,
         };
         w.strings();
         w
@@ -198,9 +207,10 @@ impl Worker {
     /// This view started over: the same handle, from 0, saying why.
     fn restart(&mut self, why: String) {
         let c = Candidate { handle_id: self.handle_id.clone(), subagent_id: self.subagent_id, name: self.name.clone() };
-        let unsent = self.unsent.take();
+        let (unsent, tabbed) = (self.unsent.take(), self.tabbed);
         *self = Worker::new(&c, self.cwd.as_deref());
         self.unsent = unsent;
+        self.tabbed = tabbed;
         self.notice(why);
     }
 
@@ -211,14 +221,15 @@ impl Worker {
         let model = self.model.rsplit_once('/').map_or(self.model.as_str(), |(_, m)| m);
         let dropped = (self.dropped > 0).then(|| format!("{} earlier rows dropped", self.dropped));
         self.facts = [(!model.is_empty()).then(|| model.to_string()), dropped].into_iter().flatten().collect::<Vec<_>>().join(" · ").into();
+        let back = if self.tabbed { " · closing this tab leaves it as it is" } else { " · Esc returns to the session" };
         self.hint = if self.read_only() {
-            format!("{} {}: read-only · Esc returns to the session", self.name, self.state()).into()
+            format!("{} {}: read-only{back}", self.name, self.state()).into()
         } else if self.status.is_empty() {
             format!("{} is connecting…", self.name).into()
         } else if !self.steerable {
-            format!("{} can't be steered right now · Esc returns to the session", self.name).into()
+            format!("{} can't be steered right now{back}", self.name).into()
         } else {
-            format!("steer {}: it takes it in at its next step · Esc returns to the session", self.name).into()
+            format!("steer {}: it takes it in at its next step{back}", self.name).into()
         };
     }
 
@@ -425,6 +436,11 @@ impl Watch {
         self.workers.values().map(Worker::bytes).sum()
     }
 
+    /// Worker `handle_id`'s view's word ([`Worker::state`]), if it has one.
+    pub fn view_state(&self, handle_id: &str) -> Option<&str> {
+        self.workers.get(handle_id).map(Worker::state)
+    }
+
     /// The workers on offer, oldest first: `running` (the tray's running
     /// background workers) and the focused view's, whatever its state (a
     /// walk from it goes to its neighbours).
@@ -439,14 +455,43 @@ impl Watch {
         out
     }
 
-    /// Open (if need be) and focus a worker's view; its journal is asked
-    /// for at once. `cwd`: the session's folder (its diffs' paths).
+    /// Open (if need be) and focus a worker's view in place, over the
+    /// session's thread; its journal is asked for at once. `cwd`: the
+    /// session's folder (its diffs' paths).
     pub fn open(&mut self, c: &Candidate, cwd: Option<&str>, now: Instant) {
+        self.open_as(c, cwd, now, false);
+    }
+
+    /// The same, as a worker tab's view.
+    pub fn open_tab(&mut self, c: &Candidate, cwd: Option<&str>, now: Instant) {
+        self.open_as(c, cwd, now, true);
+    }
+
+    /// The focused view is a worker tab's.
+    pub fn in_tab(&self) -> bool {
+        self.focused().is_some_and(|w| w.tabbed)
+    }
+
+    fn open_as(&mut self, c: &Candidate, cwd: Option<&str>, now: Instant, tab: bool) {
         let w = self.workers.entry(c.handle_id.clone()).or_insert_with(|| {
             let mut w = Worker::new(c, cwd);
-            w.notice(format!("{} ({}): Esc returns to the session · {} switches workers", c.name, c.handle_id, crate::app::WORKER_KEY));
+            w.notice(if tab {
+                format!("{} ({}) in its own tab: closing the tab leaves the worker running", c.name, c.handle_id)
+            } else {
+                format!(
+                    "{} ({}): Esc returns to the session · {} switches workers · {} opens it in a tab",
+                    c.name,
+                    c.handle_id,
+                    crate::app::WORKER_KEY,
+                    crate::wtabs::TAB_KEY
+                )
+            });
             w
         });
+        if w.tabbed != tab {
+            w.tabbed = tab;
+            w.strings();
+        }
         if self.unsupported && w.status.is_empty() {
             w.notice(UNSUPPORTED.into());
         }
@@ -903,6 +948,50 @@ mod tests {
         // Reconnecting: the poll could not go; again a second later.
         w.poll_failed(t0);
         assert_eq!(w.poll_due(), Some(t0 + RETRY));
+    }
+
+    /// A worker tab's view: the same view, steered from its tab, its hints
+    /// its tab's; left for another tab (its session's thread, or another
+    /// session: suspended) it asks for nothing.
+    #[test]
+    fn a_worker_tab_steers_its_worker_and_polls_nothing_in_the_background() {
+        let t0 = Instant::now();
+        let mut w = Watch::default();
+        w.open_tab(&Candidate::of(2, "sleeper"), None, t0);
+        assert!(w.in_tab());
+        let v = w.focused().unwrap();
+        assert!(texts(v)[0].1.contains("in its own tab"), "{:?}", texts(v));
+        assert_eq!(w.take_poll(t0), Some(("sa_2".into(), 0)));
+        w.on_reply("sa_2", 0, running(1, false, json!([])), t0);
+        // Steered from its tab: Enter goes to the worker, never the session.
+        assert_eq!(w.steer_target(), Some(Ok("sa_2".into())));
+        let hint = w.focused().unwrap().hint.to_string();
+        assert!(hint.starts_with("steer sleeper") && !hint.contains("Esc"), "{hint}");
+        w.steer_sent("sa_2", "stop after the next step");
+        w.steer_accepted("sa_2");
+        // Its session's tab shown (same attachment): the session's thread,
+        // and no poll.
+        w.focus_main();
+        assert!(!w.in_tab());
+        assert_eq!((w.poll_due(), w.take_poll(t0 + POLL_TIMEOUT), w.steer_target()), (None, None, None));
+        // Back to the tab, then another session's tab (its watch stashed).
+        w.open_tab(&Candidate::of(2, "sleeper"), None, t0);
+        w.suspend();
+        assert_eq!((w.poll_due(), w.take_poll(t0 + POLL_TIMEOUT)), (None, None));
+        // The same worker shown in place over the session's thread: the
+        // session's hints again.
+        w.open(&Candidate::of(2, "sleeper"), None, t0);
+        assert!(!w.in_tab());
+        assert!(w.focused().unwrap().hint.contains("Esc returns to the session"));
+        // Gone on attach (a handle does not survive a park or a restart):
+        // its tab says so and is read-only.
+        w.open_tab(&Candidate::of(2, "sleeper"), None, t0);
+        let (_, since) = w.take_poll(t0).unwrap();
+        w.on_reply("sa_2", since, WatchReply::Gone("no subagent sa_2 in this session".into()), t0);
+        let v = w.focused().unwrap();
+        assert!(v.read_only() && v.state() == "gone");
+        assert_eq!(w.view_state("sa_2"), Some("gone"));
+        assert!(matches!(w.steer_target(), Some(Err(_))));
     }
 
     /// A worker's entries go to its own transcript only: the session's,

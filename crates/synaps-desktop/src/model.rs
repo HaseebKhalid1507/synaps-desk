@@ -137,6 +137,8 @@ pub enum Effect {
         open: bool,
         place: Place,
     },
+    /// What the composer's note line says of a worker (a cancel refused).
+    WorkerNote(String),
 }
 
 /// A resume in flight (`Client::resume`).
@@ -324,6 +326,8 @@ pub struct Model {
     /// The attached session's worker views ([`crate::watch`]): with the
     /// transcript, they go to the tab cache when its tab is left.
     pub watch: Watch,
+    /// Worker cancels armed and on their way ([`crate::wtabs`]).
+    pub cancels: crate::wtabs::Cancels,
 }
 
 /// An empty transcript as the window keeps it: no notices for subagent
@@ -374,6 +378,7 @@ impl Model {
             daemon: None,
             daemon_gen: 0,
             watch: Watch::default(),
+            cancels: Default::default(),
         }
     }
 
@@ -1171,12 +1176,23 @@ impl Model {
                 self.view_dirty |= self.watch.steer_refused("not attached to the session");
                 return effects;
             }
+            // A worker cancel answered: done, its rows will say so (it is
+            // `cancelling…` until then); not done, the composer's note says why.
+            Event::WorkerCancel { attach_seq, handle_id, result } => {
+                log::debug!(target: "synaps_desktop::watch", "cancel {handle_id}: {result:?}");
+                if let Some(note) = self.cancels.answered(attach_seq, &handle_id, &result) {
+                    effects.push(Effect::WorkerNote(note));
+                    self.view_dirty = true;
+                }
+                return effects;
+            }
             ev => ev,
         };
         self.view_dirty = true;
         if !matches!(ev, Event::Session { .. } | Event::History { .. }) {
             self.rail_gen += 1;
         }
+
         match ev {
             Event::Status(s) => {
                 // A reply in flight died with the old connection.
@@ -1522,6 +1538,27 @@ mod tests {
     fn attach(m: &mut Model, seq: u64) {
         m.want(seq);
         m.apply(Event::Attached { attach_seq: seq, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
+    }
+
+    /// A worker cancel's answer: refused or not done, the composer's note
+    /// says why and the worker is not `cancelling…` any more; done, it
+    /// stays so until its rows say it.
+    #[test]
+    fn a_worker_cancel_answer_says_why_it_was_not_done() {
+        let mut m = Model::new(ConnState::Connecting);
+        attach(&mut m, 1);
+        let t0 = std::time::Instant::now();
+        m.cancels.sent("s", "sa_2", 1, t0);
+        m.cancels.sent("s", "sa_3", 1, t0);
+        let answer = |h: &str, result: Result<String, String>| Event::WorkerCancel { attach_seq: 1, handle_id: h.into(), result };
+        assert!(
+            m.apply(answer("sa_2", Ok("Cancelled sa_2 (they stop at their next step; no completion wake is sent).".into()))).is_empty()
+        );
+        assert!(m.cancels.pending("s", "sa_2"));
+        let fx = m.apply(answer("sa_3", Err("refused: input is owned by client #1".into())));
+        assert_eq!(fx, vec![Effect::WorkerNote("sa_3 not cancelled: refused: input is owned by client #1".into())]);
+        assert!(!m.cancels.pending("s", "sa_3"));
+        assert_eq!(m.last_error, None, "a cancel's answer is not a session error");
     }
 
     /// L2: leaving a tab drops the resume, the fallback attach and the

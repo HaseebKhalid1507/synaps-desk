@@ -1,0 +1,925 @@
+//! Workers as app objects, beyond the TUI's tray: a worker in a tab of its
+//! own ([`crate::tabs::Kind::Worker`]), a context menu, cancelling one, and
+//! a hover card. Only what avante's v0.11.1 daemon already has: the watch
+//! journal, `SubagentSteer`, and `/workers cancel sa_N` (an engine command).
+//!
+//! - **Clicks.** On a tray row or a worker's block in the transcript a left
+//!   click opens the worker in place, over the session's thread (in a
+//!   worker tab, which shows one worker, in its own tab instead). The
+//!   middle button, Ctrl/Cmd+click and a double-click open it in a tab of
+//!   its own, right after its session's tab (focused if it has one). The
+//!   middle button never does anything destructive: on a tab it closes the
+//!   tab, and closing a worker's tab never touches the worker.
+//! - **Keys.** Ctrl+Shift+↑ (Cmd/Option+Shift+↑ on macOS) opens the worker
+//!   on screen, else the newest running one, in a tab. The Menu key and
+//!   Shift+F10 open the menu of the worker on screen (its tray row), else
+//!   of the newest row.
+//! - **The menu** (right-click on a tray row, a worker block or a worker
+//!   tab): Open, Open in new tab, Steer…, Cancel worker…, Copy handle,
+//!   Copy result (once it ended), Copy task. An item that cannot act says
+//!   why in its tooltip.
+//! - **Cancel.** `Client::cancel_worker`: the engine stops it at its next
+//!   step and notes the cancel in the main conversation. Only from the
+//!   window that drives the session (as a steer); a first press arms it
+//!   (`Cancel sleeper? CONFIRM`) for [`CONFIRM`], a second one sends it. The
+//!   worker says `cancelling…` until its rows say how it ended. Also from
+//!   the × a hovered tray row shows.
+//! - **The hover card** on a tray row or a worker block, after the pointer
+//!   rests as for any tooltip: its task's first lines, model, when it
+//!   started, elapsed, tools, its step or result. Built when shown, from
+//!   what this window has heard; nothing in it moves.
+
+use std::time::{Duration, Instant};
+
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use crate::app::{AppView, display, mono};
+use crate::fonts;
+use crate::menu::{At, Item, Key, Menu};
+use crate::subagents::{Info, Status, fmt_secs};
+use crate::tabs::{Kind, Place};
+use crate::theme::{self, Palette};
+
+/// A cancel's first press waits this long for the second.
+pub(crate) const CONFIRM: Duration = Duration::from_secs(3);
+/// A cancel sent is shown `cancelling…` until the rows say so, or this long.
+pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(20);
+
+/// The worker key that opens a worker in a tab, as hints spell it.
+pub(crate) const TAB_KEY: &str = if cfg!(target_os = "macos") { "⌥⇧↑" } else { "Ctrl+Shift+↑" };
+
+/// Ctrl+Shift+↑ (macOS: Cmd+Shift+↑ outside an input, where it selects to
+/// the start, and Option+Shift+↑). Not Alt+Shift+↑ elsewhere: the inputs
+/// add a caret above with it.
+pub(crate) const fn tab_keys(mac: bool) -> &'static [&'static str] {
+    if mac { &["alt-shift-up", "cmd-shift-up"] } else { &["ctrl-shift-up"] }
+}
+
+/// A keystroke that opens a context menu from the keyboard.
+pub(crate) fn is_menu_key(ks: &Keystroke) -> bool {
+    let m = &ks.modifiers;
+    match ks.key.as_str() {
+        "menu" | "contextmenu" | "apps" => !(m.control || m.alt || m.platform),
+        "f10" => m.shift && !(m.control || m.alt || m.platform),
+        _ => false,
+    }
+}
+
+/// Where a click on a worker (its tray row, its block) takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// Over the session's thread, in the session's tab.
+    InPlace,
+    /// In a tab of its own.
+    Tab,
+    /// Its menu.
+    Menu,
+}
+
+/// A click with `button`, Ctrl/Cmd held (`secondary`), its `clicks`
+/// (2: a double-click), `in_tab`: a worker tab is on screen (it shows its
+/// one worker: another opens in a tab of its own).
+pub(crate) fn route(button: MouseButton, secondary: bool, clicks: usize, in_tab: bool) -> Option<Route> {
+    match button {
+        MouseButton::Left if secondary || clicks >= 2 || in_tab => Some(Route::Tab),
+        MouseButton::Left => Some(Route::InPlace),
+        MouseButton::Middle => Some(Route::Tab),
+        MouseButton::Right => Some(Route::Menu),
+        _ => None,
+    }
+}
+
+fn button(ev: &ClickEvent) -> MouseButton {
+    if ev.is_right_click() {
+        MouseButton::Right
+    } else if ev.is_middle_click() {
+        MouseButton::Middle
+    } else {
+        MouseButton::Left
+    }
+}
+
+// ── cancel ────────────────────────────────────────────────────────────
+
+/// A cancel sent, waiting for the daemon's answer and the rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Sent {
+    session: String,
+    handle: String,
+    attach_seq: u64,
+    at: Instant,
+}
+
+/// The two-step cancel and the cancels on their way. No GPUI.
+#[derive(Debug, Default)]
+pub(crate) struct Cancels {
+    /// The worker whose cancel was pressed once, until when.
+    armed: Option<(String, String, Instant)>,
+    sent: Vec<Sent>,
+    /// Bumped on every change (what the tray says).
+    pub generation: u64,
+}
+
+impl Cancels {
+    /// Cancel pressed for worker `handle` of `session`: the first press
+    /// arms it for [`CONFIRM`], a second one within that fires (`true`).
+    pub fn press(&mut self, session: &str, handle: &str, now: Instant) -> bool {
+        self.generation += 1;
+        if self.armed(session, handle, now) {
+            self.armed = None;
+            return true;
+        }
+        self.armed = Some((session.to_string(), handle.to_string(), now + CONFIRM));
+        false
+    }
+
+    pub fn armed(&self, session: &str, handle: &str, now: Instant) -> bool {
+        matches!(&self.armed, Some((s, h, until)) if s == session && h == handle && now < *until)
+    }
+
+    /// When the armed press runs out.
+    pub fn armed_until(&self) -> Option<Instant> {
+        self.armed.as_ref().map(|a| a.2)
+    }
+
+    /// The armed press ran out (or anything else was done): disarmed.
+    /// Whether that changed anything.
+    pub fn expire(&mut self, now: Instant, all: bool) -> bool {
+        if self.armed.as_ref().is_some_and(|a| all || now >= a.2) {
+            self.armed = None;
+            self.generation += 1;
+            return true;
+        }
+        false
+    }
+
+    pub fn sent(&mut self, session: &str, handle: &str, attach_seq: u64, now: Instant) {
+        self.sent.retain(|s| !(s.session == session && s.handle == handle));
+        self.sent.push(Sent { session: session.to_string(), handle: handle.to_string(), attach_seq, at: now });
+        self.generation += 1;
+    }
+
+    /// A cancel of worker `handle` of `session` is on its way.
+    pub fn pending(&self, session: &str, handle: &str) -> bool {
+        self.sent.iter().any(|s| s.session == session && s.handle == handle)
+    }
+
+    /// The daemon's answer to the cancel of `handle` sent on attachment
+    /// `attach_seq`: done, the rows will say it (it stays `cancelling…`
+    /// until they do); not done, the note to show.
+    pub fn answered(&mut self, attach_seq: u64, handle: &str, result: &Result<String, String>) -> Option<String> {
+        let i = self.sent.iter().position(|s| s.attach_seq == attach_seq && s.handle == handle)?;
+        match result {
+            Ok(_) => None,
+            Err(why) => {
+                self.sent.remove(i);
+                self.generation += 1;
+                Some(format!("{handle} not cancelled: {why}"))
+            }
+        }
+    }
+
+    /// The cancels of `session`'s workers its rows now say ended or
+    /// cancelling (`said`), or that waited [`CANCEL_WAIT`], are done.
+    /// Whether any was.
+    pub fn settle(&mut self, session: &str, said: impl Fn(&str) -> bool, now: Instant) -> bool {
+        let n = self.sent.len();
+        self.sent.retain(|s| !(s.session == session && said(&s.handle)) && now.saturating_duration_since(s.at) < CANCEL_WAIT);
+        let changed = self.sent.len() != n;
+        if changed {
+            self.generation += 1;
+        }
+        changed
+    }
+}
+
+// ── what a worker is doing ────────────────────────────────────────────
+
+/// A worker's state as the menu and its tab's mark need it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WState {
+    /// Nothing heard yet (or only that it started).
+    Unknown,
+    Running,
+    Cancelling,
+    Done,
+    Failed,
+    Cancelled,
+    TimedOut,
+    /// The daemon no longer knows it (or there is no daemon).
+    Gone,
+}
+
+impl WState {
+    fn of_status(s: Option<Status>) -> Self {
+        match s {
+            None | Some(Status::Started) => WState::Unknown,
+            Some(Status::Running) => WState::Running,
+            Some(Status::Cancelling) => WState::Cancelling,
+            Some(Status::Done) => WState::Done,
+            Some(Status::Failed) => WState::Failed,
+            Some(Status::Cancelled) => WState::Cancelled,
+            Some(Status::TimedOut) => WState::TimedOut,
+        }
+    }
+
+    /// From its view's word ([`crate::watch::Worker::state`]).
+    fn of_view(s: &str) -> Self {
+        match s {
+            "running" => WState::Running,
+            "completed" => WState::Done,
+            "failed" => WState::Failed,
+            "cancelled" => WState::Cancelled,
+            "timed out" => WState::TimedOut,
+            "gone" | "offline" => WState::Gone,
+            _ => WState::Unknown,
+        }
+    }
+
+    pub fn ended(self) -> bool {
+        matches!(self, WState::Done | WState::Failed | WState::Cancelled | WState::TimedOut | WState::Gone)
+    }
+
+    /// Its tab's mark, in the strip's spaced caps (as NEEDS YOU).
+    pub fn mark(self) -> Option<&'static str> {
+        Some(match self {
+            WState::Unknown => return None,
+            WState::Running => fonts::label::RUNNING,
+            WState::Cancelling => "C A N C E L L I N G",
+            WState::Done => "C O M P L E T E D",
+            WState::Failed => "F A I L E D",
+            WState::Cancelled => "C A N C E L L E D",
+            WState::TimedOut => "T I M E D   O U T",
+            WState::Gone => "G O N E",
+        })
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            WState::Unknown => "started",
+            WState::Running => "running",
+            WState::Cancelling => "cancelling…",
+            WState::Done => "completed",
+            WState::Failed => "failed",
+            WState::Cancelled => "cancelled",
+            WState::TimedOut => "timed out",
+            WState::Gone => "gone",
+        }
+    }
+}
+
+/// The worker a menu is for: `id` (`sa_N`'s N) of `session`, called
+/// `name`; `tab`: the worker tab it was opened on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Target {
+    pub session: String,
+    pub id: u64,
+    pub name: String,
+    pub tab: Option<u64>,
+}
+
+impl Target {
+    pub fn handle(&self) -> String {
+        format!("sa_{}", self.id)
+    }
+}
+
+/// What a worker's menu does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Act {
+    Open,
+    OpenTab,
+    Steer,
+    Cancel,
+    CopyHandle,
+    CopyResult,
+    CopyTask,
+}
+
+/// What the menu's items depend on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Facts {
+    pub name: String,
+    pub handle: String,
+    pub state: WState,
+    /// This window drives the session (it may steer and cancel).
+    pub drives: bool,
+    /// Its cancel was pressed once ([`Cancels::armed`]) / was sent.
+    pub armed: bool,
+    pub pending: bool,
+    pub has_result: bool,
+    pub has_task: bool,
+    /// The menu is its worker tab's (no "Open in new tab").
+    pub tab: bool,
+}
+
+const READ_ONLY: &str = "read-only here: another window owns this session's input";
+
+/// The menu of a worker.
+pub(crate) fn items(f: &Facts) -> Vec<Item<Act>> {
+    let mut out = vec![if f.tab { Item::new(Act::Open, "Show") } else { Item::new(Act::Open, "Open").key("Click") }];
+    if !f.tab {
+        out.push(Item::new(Act::OpenTab, "Open in new tab").key("Middle-click"));
+    }
+    let mut steer = Item::new(Act::Steer, "Steer…");
+    if f.state.ended() {
+        steer = steer.off(format!("{} is {}: nothing to steer", f.name, f.state.word()));
+    } else if !f.drives {
+        steer = steer.off(READ_ONLY);
+    }
+    out.push(steer);
+    let cancel = match (f.pending || f.state == WState::Cancelling, f.armed) {
+        (true, _) => Item::new(Act::Cancel, "cancelling…").off(format!("{} stops at its next step", f.name)),
+        (false, true) => {
+            let mut i = Item::new(Act::Cancel, format!("Cancel {}?", f.name));
+            i.confirm = Some("CONFIRM".into());
+            i
+        }
+        (false, false) => Item::new(Act::Cancel, "Cancel worker…"),
+    };
+    out.push(if f.state.ended() && !f.pending {
+        cancel.off(format!("{} is {}: nothing to cancel", f.name, f.state.word()))
+    } else if !f.drives {
+        cancel.off(READ_ONLY)
+    } else {
+        cancel
+    });
+    out.push(Item::new(Act::CopyHandle, format!("Copy handle ({})", f.handle)));
+    let mut result = Item::new(Act::CopyResult, "Copy result");
+    if !f.state.ended() || f.state == WState::Gone {
+        result = result.off("once it has finished");
+    } else if !f.has_result {
+        result = result.off("no result heard: collect it (subagent_collect) or open its thread");
+    }
+    out.push(result);
+    let mut task = Item::new(Act::CopyTask, "Copy task");
+    if !f.has_task {
+        task = task.off("its task is not in this transcript");
+    }
+    out.push(task);
+    out
+}
+
+impl AppView {
+    /// The session whose workers the tray and the blocks show.
+    pub(crate) fn worker_session(&self) -> Option<String> {
+        self.model.active.as_ref().map(|a| a.session_id.clone()).or_else(|| self.model.tabs.current_session().map(str::to_string))
+    }
+
+    /// What the session calls itself (a worker tab's title, its parent).
+    pub(crate) fn session_label(&self, session: &str) -> String {
+        match self.model.sessions.iter().find(|m| m.id == session) {
+            Some(m) => m.label(),
+            None => self
+                .model
+                .tabs
+                .iter()
+                .find(|t| t.session.as_deref() == Some(session))
+                .map_or_else(|| session.to_string(), |t| t.label.clone()),
+        }
+    }
+
+    /// What this window knows of worker `id` of `session` (attached, or in
+    /// the tab cache).
+    pub(crate) fn worker_info(&self, session: &str, id: u64) -> Option<Info> {
+        if self.model.is_active(session) {
+            return self.model.stats.subagents.info(id);
+        }
+        self.tab_cache.peek(session).and_then(|c| c.stats.subagents.info(id))
+    }
+
+    /// Worker `handle` (`sa_N`) of `session`: its view's word if it has
+    /// one, else the session's; a cancel on its way is `Cancelling`. Read
+    /// per frame for a worker tab's mark: nothing allocated.
+    pub(crate) fn worker_state(&self, session: &str, handle: &str) -> WState {
+        let shown = self.model.is_active(session) || self.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(session);
+        let (watch, subs) = match (shown, self.tab_cache.peek(session)) {
+            (true, _) => (&self.model.watch, &self.model.stats.subagents),
+            (false, Some(c)) => (&c.watch, &c.stats.subagents),
+            (false, None) => return WState::Unknown,
+        };
+        let id = handle.strip_prefix("sa_").and_then(|n| n.parse().ok());
+        let from_view = watch.view_state(handle).map(WState::of_view).filter(|s| *s != WState::Unknown);
+        let s = from_view.unwrap_or_else(|| WState::of_status(id.and_then(|id| subs.status(id))));
+        if !s.ended() && self.model.cancels.pending(session, handle) { WState::Cancelling } else { s }
+    }
+
+    /// Cancel may go for worker `handle` of `session` from this window.
+    fn may_cancel(&self, session: &str, handle: &str) -> bool {
+        self.drives() && self.model.is_active(session) && matches!(self.worker_state(session, handle), WState::Running | WState::Unknown)
+    }
+
+    /// A click on a worker (its tray row, its block), as [`route`] says.
+    pub(crate) fn worker_click(&mut self, id: u64, name: &str, ev: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let secondary = crate::tabstrip::click_place(ev, cx) == Place::New;
+        match route(button(ev), secondary, ev.click_count(), self.model.tabs.current_worker().is_some()) {
+            Some(Route::InPlace) => {
+                self.close_menu();
+                self.watch_worker(id, name, cx);
+            }
+            Some(Route::Tab) => {
+                self.close_menu();
+                self.open_worker_tab(id, name, cx);
+            }
+            Some(Route::Menu) => {
+                let Some(session) = self.worker_session() else { return };
+                let t = Target { session, id, name: name.to_string(), tab: None };
+                self.open_menu(t, At::Point(ev.position()), false, window, cx);
+            }
+            None => {}
+        }
+    }
+
+    /// Open worker `id` (`name`) of the session on screen in its own tab
+    /// (focused if it has one). Its view over the session's thread, if it
+    /// was there, gives the thread back.
+    pub(crate) fn open_worker_tab(&mut self, id: u64, name: &str, cx: &mut Context<Self>) {
+        let Some(session) = self.worker_session() else { return };
+        let handle = format!("sa_{id}");
+        if self.model.watch.focus() == Some(handle.as_str()) && !self.model.watch.in_tab() {
+            self.model.watch.focus_main();
+        }
+        let label = self.session_label(&session);
+        if self.model.tabs.open_worker(&session, &handle, name, &label) {
+            self.model.rail_gen += 1;
+            self.reconcile(None);
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+Shift+↑: the worker on screen, else the newest running one, in
+    /// a tab.
+    pub(crate) fn worker_tab_key(&mut self, cx: &mut Context<Self>) {
+        if self.model.tabs.view().is_some() || self.model.tabs.current_worker().is_some() {
+            return;
+        }
+        let pick = match self.model.watch.focused() {
+            Some(w) => Some((w.subagent_id, w.name.clone())),
+            None if self.model.active.is_some() => self.model.watchable().last().map(|c| (c.subagent_id, c.name.clone())),
+            None => None,
+        };
+        match pick {
+            Some((id, name)) => self.open_worker_tab(id, &name, cx),
+            None => {
+                self.watch_note = Some("no running workers to open in a tab".into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// The tab strip's right-click on worker tab `tab_id`.
+    pub(crate) fn worker_tab_menu(&mut self, tab_id: u64, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = self.model.tabs.iter().find(|t| t.id == tab_id && t.kind == Kind::Worker) else { return };
+        let (Some(session), Some(w)) = (t.session.clone(), t.worker.as_ref()) else { return };
+        let Some(id) = w.id() else { return };
+        let target = Target { session, id, name: w.name.clone(), tab: Some(tab_id) };
+        self.open_menu(target, At::Point(at), false, window, cx);
+    }
+
+    /// The Menu key / Shift+F10: the menu of the worker on screen (its
+    /// tray row), else of the newest row.
+    pub(crate) fn menu_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = self.tray_rows.min(self.tray.rows.len());
+        let rows = &self.tray.rows[..shown];
+        let watched = self.model.watch.focused().map(|w| w.subagent_id);
+        let row = watched.and_then(|id| rows.iter().find(|r| r.id == id)).or_else(|| rows.iter().rev().find(|r| r.watchable));
+        let (Some(r), Some(session)) = (row.filter(|r| r.watchable), self.worker_session()) else {
+            self.watch_note = Some("no worker here: the tray over the composer lists the session's workers".into());
+            cx.notify();
+            return;
+        };
+        let tab = self.model.tabs.current().filter(|t| t.worker.as_ref().and_then(|w| w.id()) == Some(r.id)).map(|t| t.id);
+        let t = Target { session, id: r.id, name: r.name.to_string(), tab };
+        self.open_menu(t, At::Row(r.id), true, window, cx);
+    }
+
+    fn facts(&self, t: &Target, now: Instant) -> Facts {
+        let handle = t.handle();
+        let info = self.worker_info(&t.session, t.id);
+        Facts {
+            name: t.name.clone(),
+            state: self.worker_state(&t.session, &handle),
+            drives: self.drives() && self.model.is_active(&t.session),
+            armed: self.model.cancels.armed(&t.session, &handle, now),
+            pending: self.model.cancels.pending(&t.session, &handle),
+            has_result: info.as_ref().is_some_and(|i| !i.result.is_empty()),
+            has_task: info.as_ref().is_some_and(|i| !i.task_full.is_empty()),
+            tab: t.tab.is_some(),
+            handle,
+        }
+    }
+
+    /// Open the menu of `t`. The view takes the focus while it is open,
+    /// so Esc and the arrows reach the menu, not an input's own bindings
+    /// (the composer's); what had it gets it back once the menu closes.
+    pub(crate) fn open_menu(&mut self, t: Target, at: At, keyboard: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(prev) = window.focused(cx).filter(|f| *f != self.focus)
+            && self.menu_focus_back.is_none()
+        {
+            self.menu_focus_back = Some(prev);
+        }
+        window.focus(&self.focus, cx);
+        self.gear_menu = false;
+        let items = items(&self.facts(&t, Instant::now()));
+        self.menu = Some((Menu::new(items, at, keyboard), t));
+        cx.notify();
+    }
+
+    pub(crate) fn close_menu(&mut self) {
+        self.menu = None;
+    }
+
+    /// The open menu's items again (a cancel armed or run out), the
+    /// selection kept.
+    fn refresh_menu(&mut self) {
+        let Some((m, t)) = self.menu.as_ref() else { return };
+        let items = items(&self.facts(t, Instant::now()));
+        let (at, sel) = (m.at, m.sel);
+        if let Some((m, _)) = self.menu.as_mut() {
+            *m = Menu { items, sel, at };
+        }
+    }
+
+    /// A key while the menu is open: `true` if the menu took it.
+    pub(crate) fn menu_keydown(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some((m, _)) = self.menu.as_mut() else { return false };
+        match m.key(key) {
+            Key::Moved => {}
+            Key::Pick(a) => self.menu_pick(a, window, cx),
+            Key::Close => self.close_menu(),
+            Key::Other => {
+                self.close_menu();
+                cx.notify();
+                return false;
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// An item picked.
+    pub(crate) fn menu_pick(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, t)) = self.menu.clone() else { return };
+        if act == Act::Cancel {
+            self.press_cancel(&t.session, t.id, cx);
+            return;
+        }
+        self.close_menu();
+        let copy = |text: String, cx: &mut Context<Self>| cx.write_to_clipboard(ClipboardItem::new_string(text));
+        match act {
+            Act::Open | Act::Steer => {
+                match t.tab {
+                    Some(tab) => {
+                        let ix = self.model.tabs.iter().position(|x| x.id == tab);
+                        if let Some(ix) = ix {
+                            self.focus_tab(ix);
+                        }
+                    }
+                    None if self.model.tabs.current_worker().is_some() => self.open_worker_tab(t.id, &t.name, cx),
+                    None => self.watch_worker(t.id, &t.name, cx),
+                }
+                if act == Act::Steer {
+                    self.composer.update(cx, |s, cx| s.focus(window, cx));
+                }
+            }
+            Act::OpenTab => self.open_worker_tab(t.id, &t.name, cx),
+            Act::CopyHandle => copy(t.handle(), cx),
+            Act::CopyResult => {
+                if let Some(i) = self.worker_info(&t.session, t.id) {
+                    copy(i.result, cx);
+                }
+            }
+            Act::CopyTask => {
+                if let Some(i) = self.worker_info(&t.session, t.id) {
+                    copy(i.task_full, cx);
+                }
+            }
+            Act::Cancel => {}
+        }
+        cx.notify();
+    }
+
+    /// Cancel pressed (the menu's item, a tray row's ×) for worker `id` of
+    /// `session`: armed, or (the second press) sent.
+    pub(crate) fn press_cancel(&mut self, session: &str, id: u64, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let handle = format!("sa_{id}");
+        if !self.may_cancel(session, &handle) {
+            return;
+        }
+        if self.model.cancels.press(session, &handle, now) {
+            let seq = self.model.active.as_ref().map(|a| a.attach_seq);
+            match (&self.client, seq) {
+                (Some(c), Some(seq)) if c.cancel_worker(handle.clone()).is_ok() => {
+                    log::debug!(target: "synaps_desktop::watch", "cancel {handle}");
+                    self.model.cancels.sent(session, &handle, seq, now);
+                }
+                _ => self.watch_note = Some(format!("{handle} not cancelled: the connection thread has stopped").into()),
+            }
+            self.close_menu();
+            self.cancel_tick = None;
+        } else {
+            self.arm_cancel_tick(cx);
+            self.refresh_menu();
+        }
+        cx.notify();
+    }
+
+    /// The armed cancel's end draws (once, when it runs out).
+    fn arm_cancel_tick(&mut self, cx: &mut Context<Self>) {
+        let Some(until) = self.model.cancels.armed_until() else { return };
+        self.cancel_tick = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(until.saturating_duration_since(Instant::now())).await;
+            let _ = this.update(cx, |v, cx| {
+                v.cancel_tick = None;
+                if v.model.cancels.expire(Instant::now(), false) {
+                    v.refresh_menu();
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// The menu, if open at a point (a right-click): at the root, over
+    /// everything.
+    pub(crate) fn render_menu_at_point(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let (m, _) = self.menu.as_ref()?;
+        let At::Point(pt) = m.at else { return None };
+        let body = crate::menu::render("worker-menu", m, p, AppView::menu_pick, cx);
+        Some(deferred(anchored().position(pt).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
+    }
+
+    /// The menu, if opened from the keyboard over tray row `id`: drawn by
+    /// that row, above it.
+    pub(crate) fn render_menu_at_row(&self, id: u64, p: &Palette, cx: &Context<Self>) -> Option<AnyElement> {
+        let (m, _) = self.menu.as_ref()?;
+        if m.at != At::Row(id) {
+            return None;
+        }
+        let body = crate::menu::render("worker-menu", m, p, AppView::menu_pick, cx);
+        Some(
+            div()
+                .absolute()
+                .left(px(24.))
+                .top_0()
+                .child(deferred(anchored().anchor(Anchor::BottomLeft).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
+                .into_any_element(),
+        )
+    }
+
+    /// A tray row's × (on hover; armed: `Cancel sleeper? CONFIRM`), if
+    /// this window may cancel it.
+    pub(crate) fn cancel_x(
+        &self,
+        id: u64,
+        handle: &str,
+        name: &SharedString,
+        armed: bool,
+        p: &Palette,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let session = &self.model.active.as_ref()?.session_id;
+        if !self.may_cancel(session, handle) {
+            return None;
+        }
+        let session = session.clone();
+        let el = if armed {
+            h_flex()
+                .id(("tray-x", id as usize))
+                .flex_none()
+                .gap(px(6.))
+                .items_center()
+                .cursor_pointer()
+                .child(div().text_color(p.err).child(format!("Cancel {name}?")))
+                .child(display("CONFIRM", 10., p.err))
+        } else {
+            h_flex()
+                .id(("tray-x", id as usize))
+                .flex_none()
+                .w(px(16.))
+                .justify_center()
+                .cursor_pointer()
+                .text_color(gpui_kit::transparent_black())
+                .group_hover("tray-row", |s| s.text_color(p.dim_t))
+                .hover(|s| s.text_color(p.err))
+                .child("×")
+        };
+        let tip = if armed { "click again to cancel it (it stops at its next step)" } else { "cancel this worker…" };
+        Some(
+            el.tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.press_cancel(&session, id, cx);
+                }))
+                .on_aux_click(|_, _, cx| cx.stop_propagation())
+                .into_any_element(),
+        )
+    }
+}
+
+/// The hover card of worker `id` of the session on screen (a tray row, a
+/// worker block): built when it shows, from what this window has heard;
+/// `fallback` if it has heard nothing.
+pub(crate) fn card_tip(me: WeakEntity<AppView>, id: u64, fallback: SharedString) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    move |window, cx| {
+        let info = me.upgrade().and_then(|v| {
+            let v = v.read(cx);
+            let session = v.worker_session()?;
+            Some((v.worker_info(&session, id)?, v.worker_state(&session, &format!("sa_{id}"))))
+        });
+        let Some((info, state)) = info else { return Tooltip::new(fallback.clone()).build(window, cx) };
+        let p = theme::palette(cx);
+        let started = info.started.map(|t| format!("{} ago", fmt_secs(Instant::now().saturating_duration_since(t).as_secs_f64())));
+        Tooltip::element(move |_, _| card(&info, state, started.as_deref(), &p)).build(window, cx)
+    }
+}
+
+/// The card's body.
+fn card(i: &Info, state: WState, started: Option<&str>, p: &Palette) -> Div {
+    let color = match state {
+        WState::Running => p.run_ch,
+        WState::Done => p.ok_ch,
+        WState::Failed => p.err_ch,
+        WState::Cancelling | WState::Cancelled | WState::TimedOut => p.warn_ch,
+        WState::Unknown | WState::Gone => p.dim_ch,
+    };
+    let fact = |k: &'static str, v: String| {
+        h_flex()
+            .items_start()
+            .child(div().w(px(62.)).flex_none().pt(px(2.)).child(display(k, 9., p.dim_ch)))
+            .child(div().flex_1().min_w_0().font_family(fonts::MONO).text_size(px(10.5)).text_color(p.prose_ch).child(v))
+    };
+    let mut facts = v_flex().gap(px(2.));
+    if !i.model.is_empty() {
+        facts = facts.child(fact("MODEL", i.model.clone()));
+    }
+    if let Some(s) = started {
+        facts = facts.child(fact("STARTED", s.to_string()));
+    }
+    if let Some(e) = i.elapsed {
+        facts = facts.child(fact(if state.ended() { "RAN" } else { "ELAPSED" }, fmt_secs(e)));
+    }
+    if let Some(n) = i.tools {
+        facts = facts.child(fact("TOOLS", n.to_string()));
+    }
+    v_flex()
+        .w(px(340.))
+        .py(px(6.))
+        .gap(px(6.))
+        .child(
+            h_flex()
+                .gap(px(8.))
+                .items_center()
+                .child(div().text_size(px(12.5)).text_color(p.ink).child(i.name.clone()))
+                .child(mono(format!("sa_{}", i.id), 11., p.dim_ch))
+                .child(div().flex_1())
+                .child(display(state.word(), 9.5, color)),
+        )
+        .when(!i.task.is_empty(), |d| {
+            d.child(div().font_family(fonts::MONO).text_size(px(11.)).line_height(px(16.)).text_color(p.prose_ch).child(i.task.clone()))
+        })
+        .child(facts)
+        .when(!i.line.is_empty(), |d| {
+            d.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(if state == WState::Failed { p.err_ch } else { p.dim_ch })
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(i.line.clone()),
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use gpui_kit::{Keystroke, MouseButton};
+
+    use super::{Act, CANCEL_WAIT, CONFIRM, Cancels, Facts, Route, WState, is_menu_key, items, route};
+
+    #[test]
+    fn clicks_on_a_worker_go_where_the_button_says() {
+        use MouseButton::*;
+        // A left click: in place; with Ctrl/Cmd or twice, or in a worker
+        // tab: a tab of its own.
+        assert_eq!(route(Left, false, 1, false), Some(Route::InPlace));
+        assert_eq!(route(Left, true, 1, false), Some(Route::Tab));
+        assert_eq!(route(Left, false, 2, false), Some(Route::Tab));
+        assert_eq!(route(Left, false, 1, true), Some(Route::Tab));
+        // The middle button: a tab, never anything destructive; the right one: the menu.
+        assert_eq!(route(Middle, false, 1, false), Some(Route::Tab));
+        assert_eq!(route(Middle, true, 1, true), Some(Route::Tab));
+        assert_eq!(route(Right, false, 1, false), Some(Route::Menu));
+        assert_eq!(route(Navigate(gpui_kit::NavigationDirection::Back), false, 1, false), None);
+    }
+
+    #[test]
+    fn the_menu_key_and_shift_f10_open_the_menu() {
+        fn k(s: &'static str) -> Keystroke {
+            Keystroke::parse(s).unwrap()
+        }
+        assert!(is_menu_key(&k("menu")) && is_menu_key(&k("shift-f10")));
+        assert!(!is_menu_key(&k("f10")) && !is_menu_key(&k("ctrl-shift-f10")) && !is_menu_key(&k("ctrl-menu")));
+    }
+
+    fn facts() -> Facts {
+        Facts {
+            name: "sleeper".into(),
+            handle: "sa_2".into(),
+            state: WState::Running,
+            drives: true,
+            armed: false,
+            pending: false,
+            has_result: false,
+            has_task: true,
+            tab: false,
+        }
+    }
+
+    #[test]
+    fn cancel_needs_a_second_press_within_the_window() {
+        let t0 = Instant::now();
+        let mut c = Cancels::default();
+        assert!(!c.press("s", "sa_2", t0), "the first press arms");
+        assert!(c.armed("s", "sa_2", t0 + Duration::from_millis(100)));
+        assert!(!c.armed("s", "sa_3", t0) && !c.armed("t", "sa_2", t0), "only that worker of that session");
+        assert!(c.press("s", "sa_2", t0 + CONFIRM - Duration::from_millis(1)), "the second within the window fires");
+        assert!(!c.armed("s", "sa_2", t0), "and disarms");
+        // Too late: the second press arms again instead.
+        assert!(!c.press("s", "sa_2", t0));
+        assert!(!c.press("s", "sa_2", t0 + CONFIRM), "out of time: armed again, not fired");
+        assert!(c.press("s", "sa_2", t0 + CONFIRM + Duration::from_secs(1)));
+        // Another worker's press re-arms for that one.
+        assert!(!c.press("s", "sa_2", t0));
+        assert!(!c.press("s", "sa_3", t0 + Duration::from_millis(10)));
+        assert!(!c.press("s", "sa_2", t0 + Duration::from_millis(20)), "sa_2's arm went to sa_3");
+        // It runs out.
+        assert_eq!(c.armed_until(), Some(t0 + Duration::from_millis(20) + CONFIRM));
+        assert!(!c.expire(t0 + Duration::from_millis(30), false));
+        assert!(c.expire(t0 + Duration::from_millis(20) + CONFIRM, false));
+        assert_eq!(c.armed_until(), None);
+    }
+
+    #[test]
+    fn a_cancel_sent_is_cancelling_until_the_rows_or_an_error_say_otherwise() {
+        let t0 = Instant::now();
+        let mut c = Cancels::default();
+        c.sent("s", "sa_2", 7, t0);
+        c.sent("s", "sa_3", 7, t0);
+        assert!(c.pending("s", "sa_2") && !c.pending("t", "sa_2"));
+        // The daemon took it: still cancelling until the rows say so.
+        assert_eq!(c.answered(7, "sa_2", &Ok("Cancelled sa_2".into())), None);
+        assert!(c.pending("s", "sa_2"));
+        // An answer of another attachment is not this one's.
+        assert_eq!(c.answered(8, "sa_3", &Err("x".into())), None);
+        assert!(c.pending("s", "sa_3"));
+        let note = c.answered(7, "sa_3", &Err("sa_3 is already completed — nothing to cancel".into()));
+        assert_eq!(note.as_deref(), Some("sa_3 not cancelled: sa_3 is already completed — nothing to cancel"));
+        assert!(!c.pending("s", "sa_3"));
+        // The rows say it is cancelling: done here.
+        assert!(!c.settle("s", |_| false, t0 + Duration::from_secs(1)));
+        assert!(c.settle("s", |h| h == "sa_2", t0 + Duration::from_secs(1)));
+        assert!(!c.pending("s", "sa_2"));
+        // Never forever.
+        c.sent("s", "sa_4", 7, t0);
+        assert!(c.settle("x", |_| false, t0 + CANCEL_WAIT));
+        assert!(!c.pending("s", "sa_4"));
+    }
+
+    fn acts(f: &Facts) -> Vec<(Act, bool)> {
+        items(f).iter().map(|i| (i.act, i.enabled())).collect()
+    }
+
+    #[test]
+    fn the_menu_says_what_can_be_done() {
+        use Act::*;
+        let f = facts();
+        assert_eq!(
+            acts(&f),
+            vec![(Open, true), (OpenTab, true), (Steer, true), (Cancel, true), (CopyHandle, true), (CopyResult, false), (CopyTask, true)]
+        );
+        assert_eq!(items(&f)[4].label.as_ref(), "Copy handle (sa_2)");
+        // Not this window's input: no steer, no cancel (as a steer).
+        let ro = Facts { drives: false, ..facts() };
+        let a = acts(&ro);
+        assert_eq!((a[2], a[3]), ((Steer, false), (Cancel, false)));
+        assert!(items(&ro)[3].why_not.as_ref().is_some_and(|w| w.contains("read-only")));
+        // Armed: the second press is asked for.
+        let armed = items(&Facts { armed: true, ..facts() });
+        assert_eq!((armed[3].label.as_ref(), armed[3].confirm.as_deref()), ("Cancel sleeper?", Some("CONFIRM")));
+        // Sent: cancelling…, nothing to press.
+        let sent = items(&Facts { pending: true, ..facts() });
+        assert_eq!((sent[3].label.as_ref(), sent[3].enabled()), ("cancelling…", false));
+        // Finished with a result: copy it; no steer, no cancel.
+        let done = Facts { state: WState::Done, has_result: true, ..facts() };
+        assert_eq!(acts(&done)[2..6], [(Steer, false), (Cancel, false), (CopyHandle, true), (CopyResult, true)]);
+        // A worker tab's menu: Show, no "in new tab".
+        let tab = items(&Facts { tab: true, ..facts() });
+        assert_eq!((tab[0].label.as_ref(), tab[1].act), ("Show", Steer));
+    }
+}

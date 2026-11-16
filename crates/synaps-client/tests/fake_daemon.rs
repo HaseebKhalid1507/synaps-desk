@@ -1146,3 +1146,62 @@ async fn worker_watch_pages_gone_steer_and_an_older_daemon() {
     assert_eq!(conn.recv_cmd().await["text"], "still here");
     client.shutdown().unwrap();
 }
+
+/// Cancelling a worker: `/workers cancel sa_N` as the engine command the
+/// daemon (v0.11.1 `actor_cmds.rs`) reads, its `QueryResult` (by id: another
+/// client's never counts) as `Event::WorkerCancel`, the daemon's error and a
+/// non-owner's refusal as `Err`, and a cancel in flight when the
+/// connection drops as `Err` too, never lost.
+#[tokio::test]
+async fn cancel_worker_wire_shape_and_replies() {
+    let mut fake = Fake::start("cancel").await;
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    let reply = |events| async move {
+        wait(events, "cancel reply", |e| match e {
+            Event::WorkerCancel { attach_seq, handle_id, result } => Some((*attach_seq, handle_id.clone(), result.clone())),
+            _ => None,
+        })
+        .await
+    };
+
+    client.cancel_worker("sa_3").unwrap();
+    let cmd = conn.recv_cmd().await;
+    let id = cmd["id"].as_u64().unwrap();
+    assert!(id < synaps_client::protocol::RESERVED_QUERY_ID_BASE);
+    assert_eq!(cmd, json!({"cmd": "engine_command", "id": id, "name": "workers", "arg": "cancel sa_3"}));
+    // Another client's result (broadcast) first: not ours.
+    conn.event(40, json!({"ev": "query_result", "id": id ^ 1, "value": {"kind": "output", "text": "Cancelled sa_9"}})).await;
+    let text = "Cancelled sa_3 (they stop at their next step; no completion wake is sent).";
+    conn.event(41, json!({"ev": "query_result", "id": id, "value": {"kind": "output", "text": text}})).await;
+    assert_eq!(reply(&events).await, (seq, "sa_3".into(), Ok(text.into())));
+
+    // The daemon's own error: a worker that has finished.
+    client.cancel_worker("sa_1").unwrap();
+    let id = conn.recv_cmd().await["id"].as_u64().unwrap();
+    let why = "sa_1 is already completed — nothing to cancel";
+    conn.event(42, json!({"ev": "query_result", "id": id, "value": {"kind": "error", "text": why}})).await;
+    assert_eq!(reply(&events).await, (seq, "sa_1".into(), Err(why.into())));
+
+    // Not the input owner: the session refuses the engine command.
+    client.cancel_worker("sa_4").unwrap();
+    let _ = conn.recv_cmd().await;
+    conn.event(43, json!({"ev": "refused", "client": 9, "command": "engine_command", "reason": "not you"})).await;
+    conn.event(44, json!({"ev": "refused", "client": 2, "command": "engine_command", "reason": "input is owned by client #1"})).await;
+    assert_eq!(reply(&events).await, (seq, "sa_4".into(), Err("refused: input is owned by client #1".into())));
+
+    // In flight when the connection drops: answered, as not known.
+    client.cancel_worker("sa_5").unwrap();
+    let _ = conn.recv_cmd().await;
+    drop(conn);
+    let (s, h, r) = reply(&events).await;
+    assert_eq!((s, h.as_str()), (seq, "sa_5"));
+    assert!(r.is_err_and(|e| e.contains("dropped")));
+    // Reconnecting: not sent, said so.
+    client.cancel_worker("sa_6").unwrap();
+    let (_, h, r) = reply(&events).await;
+    assert_eq!(h, "sa_6");
+    assert!(r.is_err_and(|e| e.contains("not connected")));
+    client.shutdown().unwrap();
+}

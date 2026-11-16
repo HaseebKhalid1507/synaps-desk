@@ -73,7 +73,7 @@ pub(crate) const NEW_SESSION: &str = "New session";
 /// heights and scroll position).
 pub(crate) struct TabCache {
     transcript: Transcript,
-    stats: Stats,
+    pub(crate) stats: Stats,
     rows: Vec<RowCache>,
     disp: Vec<Disp>,
     summaries: Summaries,
@@ -86,7 +86,7 @@ pub(crate) struct TabCache {
     /// The text metrics its heights were measured with ([`AppView::metrics_gen`]).
     metrics_gen: u64,
     /// Its worker views (the one focused comes back focused).
-    watch: Watch,
+    pub(crate) watch: Watch,
 }
 
 /// The list's state over one transcript: its rows, folds, measured heights
@@ -187,7 +187,8 @@ actions!(
         OpenSettings,
         OpenUsage,
         WorkerUp,
-        WorkerDown
+        WorkerDown,
+        WorkerTab
     ]
 );
 
@@ -236,6 +237,9 @@ pub fn bind_keys(cx: &mut App) {
             Step::Up => KeyBinding::new(k, WorkerUp, None),
             Step::Down => KeyBinding::new(k, WorkerDown, None),
         });
+    }
+    for &k in crate::wtabs::tab_keys(mac) {
+        keys.push(KeyBinding::new(k, WorkerTab, None));
     }
     cx.bind_keys(keys);
 }
@@ -1061,7 +1065,7 @@ pub struct AppView {
     /// The list's view grew while it was scrolled back: after this
     /// frame's layout it must not have started following the tail.
     hold_back: Rc<Cell<bool>>,
-    composer: Entity<TextareaState>,
+    pub(crate) composer: Entity<TextareaState>,
     /// The rows the composer's text grows to ([`crate::fit::composer_rows`]).
     composer_rows: usize,
     /// The top bar's words, measured at the first frame.
@@ -1138,7 +1142,7 @@ pub struct AppView {
     layout_naming: bool,
     /// The running dot's step, and the 2 Hz timer while a turn runs.
     pub(crate) rail: crate::chrome::RailCache,
-    focus: FocusHandle,
+    pub(crate) focus: FocusHandle,
     /// Refused input to put back in the composer (needs a `Window`: done
     /// at the next frame).
     restore: Option<String>,
@@ -1181,7 +1185,7 @@ pub struct AppView {
     /// The background tabs' sessions as last seen ([`TAB_CACHE`]).
     pub(crate) tab_cache: Lru<String, TabCache>,
     /// The tab (and its session) the model and the list hold now.
-    shown_tab: Option<(u64, Option<String>)>,
+    pub(crate) shown_tab: Option<(u64, Option<String>)>,
     /// A switch's attach waiting for the gate, and its timer.
     attach_wait: Option<(String, Option<ResumeRequest>, bool)>,
     attach_due: Option<Task<()>>,
@@ -1250,7 +1254,14 @@ pub struct AppView {
     pub(crate) watch_note: Option<SharedString>,
     /// The worker whose name and state the composer's placeholder has
     /// (`None`: the session's placeholder).
-    placeholder_of: Option<(String, String)>,
+    placeholder_of: Option<(String, String, bool)>,
+    /// A worker's context menu and the worker it is for ([`crate::wtabs`]),
+    /// and the timer that ends an armed cancel's wait.
+    pub(crate) menu: Option<(crate::menu::Menu<crate::wtabs::Act>, crate::wtabs::Target)>,
+    /// What had the focus when the menu opened (it takes the keys while
+    /// open): given back once it closes, if nothing else took it.
+    pub(crate) menu_focus_back: Option<FocusHandle>,
+    pub(crate) cancel_tick: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -1598,6 +1609,9 @@ impl AppView {
             tray_rows: 0,
             watch_note: None,
             placeholder_of: None,
+            menu: None,
+            menu_focus_back: None,
+            cancel_tick: None,
             _tasks: Vec::new(),
             _subs: subs,
         }
@@ -1677,6 +1691,7 @@ impl AppView {
             }
             Effect::Attach { session_id, fallback, open, place } => self.open_tab(Open::Attach { session_id, fallback, open }, place),
             Effect::Resume { req, open, place } => self.open_tab(Open::Resume { req, open }, place),
+            Effect::WorkerNote(note) => self.watch_note = Some(note.into()),
         }
     }
 
@@ -1706,14 +1721,15 @@ impl AppView {
     fn sync_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Over a worker's view the composer steers it (compared, not
         // allocated, each frame).
-        let worker = self.model.watch.focused().map(|w| (w.handle_id.as_str(), w.state()));
-        if worker != self.placeholder_of.as_ref().map(|(h, s)| (h.as_str(), s.as_str())) {
+        let worker = self.model.watch.focused().map(|w| (w.handle_id.as_str(), w.state(), w.tabbed));
+        if worker != self.placeholder_of.as_ref().map(|(h, s, t)| (h.as_str(), s.as_str(), *t)) {
             let text: SharedString = match self.model.watch.focused() {
+                Some(w) if w.read_only() && w.tabbed => format!("{} is {}: nothing to steer", w.name, w.state()).into(),
                 Some(w) if w.read_only() => format!("{} is {}: nothing to steer  (Esc: back to the session)", w.name, w.state()).into(),
                 Some(w) => format!("Steer {}: it reads this at its next step  (Enter sends)", w.name).into(),
                 None => COMPOSER_PLACEHOLDER.into(),
             };
-            self.placeholder_of = worker.map(|(h, s)| (h.to_string(), s.to_string()));
+            self.placeholder_of = worker.map(|(h, s, t)| (h.to_string(), s.to_string(), t));
             self.composer.update(cx, |c, cx| c.set_placeholder(text, window, cx));
         }
         // A refused steer's text, once the thread it is for is on screen.
@@ -1943,12 +1959,23 @@ impl AppView {
         self.restore_notice(dropped);
         // A view on screen leaves the session tab behind it current.
         let vis = self.model.tabs.current().map(|t| (t.id, t.session.clone()));
+        // A session tab left keeps the worker its view showed in place.
+        if let Some((id, _)) = self.shown_tab
+            && vis.as_ref().map(|v| v.0) != Some(id)
+        {
+            let inplace = self.model.watch.focused().filter(|w| !w.tabbed).map(|w| (w.handle_id.clone(), w.name.clone()));
+            self.model.tabs.set_watching(id, inplace);
+            self.close_menu();
+        }
         if let Some((_, Some(s))) = &vis
             && self.model.wanted_session() == Some(s.as_str())
         {
             // What a cache held of it is older than what attached.
             let _ = self.tab_cache.take(s);
             self.shown_tab = vis;
+            // Another tab of the same session (its worker's, or back to
+            // it): the same attachment, another view.
+            self.tab_watch();
             if hint.as_ref().is_some_and(|h| h.1) {
                 // An Open by name of the session on screen: done.
                 self.model.named.opened = true;
@@ -1964,11 +1991,41 @@ impl AppView {
             self.load(vis.as_ref().and_then(|v| v.1.clone()));
         }
         self.shown_tab = vis.clone();
+        self.tab_watch();
         match vis {
             Some((_, Some(s))) => self.attach_tab(s, hint),
             // A create or a resume: the caller sends it.
             Some((_, None)) => {}
             None => self.detach_all(),
+        }
+    }
+
+    /// The current tab's worker view: a worker tab's worker, or the one
+    /// its session tab showed in place when it was left (else the
+    /// session's thread).
+    fn tab_watch(&mut self) {
+        let Some(t) = self.model.tabs.current() else { return };
+        let want = match (&t.worker, t.kind) {
+            (Some(w), crate::tabs::Kind::Worker) => Some((w.handle.clone(), w.name.clone(), true)),
+            _ => t.watching.clone().map(|(h, n)| (h, n, false)),
+        };
+        match want {
+            Some((handle, name, tab)) => {
+                if self.model.watch.focus() == Some(handle.as_str()) && self.model.watch.in_tab() == tab {
+                    return;
+                }
+                let Some(id) = handle.strip_prefix("sa_").and_then(|n| n.parse().ok()) else { return };
+                let c = crate::watch::Candidate::of(id, &name);
+                let cwd = self.model.cwd().map(str::to_string);
+                if tab {
+                    self.model.watch.open_tab(&c, cwd.as_deref(), Instant::now());
+                } else {
+                    self.model.watch.open(&c, cwd.as_deref(), Instant::now());
+                }
+                self.watch_opened();
+            }
+            None if self.model.watch.focus().is_some() => self.model.watch.focus_main(),
+            None => {}
         }
     }
 
@@ -2010,7 +2067,7 @@ impl AppView {
         if let Some(k) = key {
             let tabs = &self.model.tabs;
             let bytes = cache.bytes();
-            self.tab_cache.put(k, cache, bytes, |k| tabs.is_open(k));
+            self.tab_cache.put(k, cache, bytes, |k| tabs.holds(k));
         }
     }
 
@@ -2382,6 +2439,12 @@ impl AppView {
         if self.model.tabs.view().is_some() {
             return;
         }
+        // A worker tab shows its one worker: its session's tab walks them.
+        if self.model.tabs.current_worker().is_some() {
+            self.watch_note = Some(format!("this tab shows one worker: its session's tab walks them ({WORKER_KEY})").into());
+            cx.notify();
+            return;
+        }
         let running = if self.model.active.is_some() { self.model.watchable() } else { Vec::new() };
         let cwd = self.model.cwd().map(str::to_string);
         let moved = self.model.watch.step(step, &running, cwd.as_deref(), Instant::now());
@@ -2409,6 +2472,19 @@ impl AppView {
 
     /// Back to the session's thread (`esc`: by Esc, which guards the next).
     pub(crate) fn leave_worker(&mut self, esc: bool, cx: &mut Context<Self>) {
+        // A worker tab's breadcrumb: its session's tab (opened if closed).
+        if let Some(t) = self.model.tabs.current().filter(|t| t.kind == crate::tabs::Kind::Worker) {
+            let Some(session) = t.session.clone() else { return };
+            match self.model.tabs.find(&session) {
+                Some(ix) => self.focus_tab(ix),
+                None => {
+                    let fallback = self.model.tab_fallback(&session);
+                    self.open_tab(Open::Attach { session_id: session, fallback, open: false }, Place::New);
+                }
+            }
+            cx.notify();
+            return;
+        }
         if esc {
             self.model.watch.leave_on_esc(Instant::now());
         } else {
@@ -2473,7 +2549,7 @@ impl AppView {
 
     /// A daemon is connected and this attachment may drive it (the
     /// synthetic transport never can).
-    fn drives(&self) -> bool {
+    pub(crate) fn drives(&self) -> bool {
         self.client.is_some() && self.model.can_send()
     }
 
@@ -4102,6 +4178,12 @@ impl Render for AppView {
         // Every frame drawn (`SYNAPS_DESKTOP_LOG=debug`): what an idle
         // window costs is countable.
         log::debug!(target: "synaps_desktop::frame", "frame");
+        if self.menu.is_none()
+            && let Some(h) = self.menu_focus_back.take()
+            && self.focus.is_focused(window)
+        {
+            window.focus(&h, cx);
+        }
         self.sync_composer(window, cx);
         if std::mem::take(&mut self.model.named.opened) {
             self.find_input.update(cx, |s, cx| s.set_value("", window, cx));
@@ -4293,6 +4375,16 @@ impl Render for AppView {
                     cx.stop_propagation();
                     return this.once_key(k, ev.is_held, cx);
                 }
+                // A worker's context menu takes the keys while it is open.
+                if this.menu.is_some() && this.menu_keydown(&ev.keystroke.key, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if crate::wtabs::is_menu_key(&ev.keystroke) && this.model.tabs.view().is_none() {
+                    cx.stop_propagation();
+                    this.menu_key(window, cx);
+                    return;
+                }
                 if this.picker_open && ev.keystroke.key == "escape" {
                     this.close_picker(window, cx);
                     cx.stop_propagation();
@@ -4313,7 +4405,11 @@ impl Render for AppView {
                     window.focus(&this.focus, cx);
                     cx.stop_propagation();
                     cx.notify();
-                } else if ev.keystroke.key == "escape" && this.model.watch.focus().is_some() && this.model.tabs.view().is_none() {
+                } else if ev.keystroke.key == "escape"
+                    && this.model.watch.focus().is_some()
+                    && !this.model.watch.in_tab()
+                    && this.model.tabs.view().is_none()
+                {
                     // A worker's view: back to the session (a held Esc once).
                     cx.stop_propagation();
                     log::debug!(target: "synaps_desktop::watch", "esc (new press: {})", this.chord_press);
@@ -4389,6 +4485,7 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &OpenUsage, _, cx| this.open_view(crate::tabs::Kind::Usage, cx)))
             .on_action(cx.listener(|this, _: &WorkerUp, _, cx| this.worker_key(Step::Up, cx)))
             .on_action(cx.listener(|this, _: &WorkerDown, _, cx| this.worker_key(Step::Down, cx)))
+            .on_action(cx.listener(|this, _: &WorkerTab, _, cx| this.worker_tab_key(cx)))
             .map(|d| tab_actions(d, cx))
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
                 let k = &ev.keystroke.key;
@@ -4437,6 +4534,7 @@ impl Render for AppView {
                 d.child(deferred(self.render_picker(&p, if view.is_some() { Side::Open(0.) } else { right }, cx)).with_priority(1))
             })
             .when(self.gear_menu, |d| d.child(deferred(self.render_gear_menu(rail == Side::Strip, &p, cx)).with_priority(2)))
+            .children(self.render_menu_at_point(&p, cx))
     }
 }
 
