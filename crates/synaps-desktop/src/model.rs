@@ -1883,7 +1883,7 @@ mod tests {
         m.apply(ev(llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "o", "result": "Canceled by user"}))));
         m.apply(ev(json!({"ev": "aborted"})));
         assert_eq!((st(&m), m.active_workers()), (State::Idle, 0), "not WORKERS");
-        assert_eq!(m.stats.subagents.view("o").map(|v| v.word), Some("cancelled"));
+        assert_eq!(m.stats.subagents.view("o").and_then(|v| v.status), Some(crate::subagents::Status::Cancelled));
         // A background worker running on: WORKERS 1, from its own rows.
         let row = json!({"ev": "subagent_rows", "rows": [{"subagent_id": 2, "agent_name": "scout", "status": "running",
             "cancel_requested": false, "elapsed_secs": 3.0, "finished_elapsed": null, "step": "ls", "tools": 1}]});

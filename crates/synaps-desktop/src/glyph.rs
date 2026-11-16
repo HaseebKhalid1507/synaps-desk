@@ -1,0 +1,439 @@
+//! The one drawn glyph set and the state table (design.md §4). Every state
+//! and every affordance is drawn here, in one 10×10 box: quads (absolute
+//! divs) for the silhouettes, stroked paths for the diagonals (the tick,
+//! the cross, the chevrons). Never a font character: the embedded fonts
+//! are subsets, and Plex Mono's `✓` reads as `√` at 13 px. A glyph takes
+//! its family's mark role on its ground, its word the family's text role
+//! ([`ink`]).
+//!
+//! The rail and the tabs still draw through `chrome::glyph` (the same
+//! drawings); they come here with the rest of the state language.
+
+use std::cell::RefCell;
+
+use gpui_kit::*;
+use synaps_client::transcript::ToolStatus;
+
+use crate::fonts::label;
+use crate::subagents::Liveness;
+use crate::theme::{Metrics, Palette};
+
+/// Every drawing (design.md §4.1). Each one is unique, so a state reads by
+/// its shape where two families share a colour (`run` and `warn` are one
+/// colour in 7 themes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Glyph {
+    Run,
+    Workers,
+    Needs,
+    Unread,
+    Idle,
+    Parked,
+    Opening,
+    Locked,
+    Gone,
+    Cancelling,
+    Cancelled,
+    Limit,
+    Ok,
+    Failed,
+    /// A closed fold; also [`GO`].
+    Fold,
+    FoldOpen,
+    /// Close or cancel: `Failed` in an 8 px box.
+    Close,
+}
+
+/// Open it (in a tab): the closed fold's chevron.
+pub(crate) const GO: Glyph = Glyph::Fold;
+
+/// One part of a drawing, in px from its box's top-left.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Part {
+    /// A filled rectangle: x, y, w, h.
+    Fill(f32, f32, f32, f32),
+    /// A 1 px frame, its outer rectangle: x, y, w, h.
+    Frame(f32, f32, f32, f32),
+    /// A stroked polyline.
+    Line(&'static [(f32, f32)]),
+}
+
+impl Glyph {
+    #[cfg(test)]
+    pub(crate) const ALL: [Glyph; 17] = [
+        Glyph::Run,
+        Glyph::Workers,
+        Glyph::Needs,
+        Glyph::Unread,
+        Glyph::Idle,
+        Glyph::Parked,
+        Glyph::Opening,
+        Glyph::Locked,
+        Glyph::Gone,
+        Glyph::Cancelling,
+        Glyph::Cancelled,
+        Glyph::Limit,
+        Glyph::Ok,
+        Glyph::Failed,
+        Glyph::Fold,
+        Glyph::FoldOpen,
+        Glyph::Close,
+    ];
+
+    /// Its box: 10 px; `Close` 8.
+    pub(crate) fn size(self) -> f32 {
+        if self == Glyph::Close { 8. } else { 10. }
+    }
+
+    fn stroke(self) -> f32 {
+        if self == Glyph::Close { 1. } else { 1.5 }
+    }
+
+    pub(crate) fn parts(self) -> &'static [Part] {
+        use Part::{Fill, Frame, Line};
+        match self {
+            Glyph::Run => &[Fill(1., 1., 8., 8.)],
+            Glyph::Workers => &[Fill(1., 1., 4., 4.), Fill(5., 5., 4., 4.)],
+            Glyph::Needs => &[Frame(0., 0., 10., 10.), Fill(3., 3., 4., 4.)],
+            Glyph::Unread => &[Fill(3., 3., 4., 4.)],
+            Glyph::Idle => &[Frame(1., 1., 8., 8.)],
+            Glyph::Parked => &[Fill(1., 7., 8., 2.)],
+            Glyph::Opening => &[Fill(1., 1., 8., 1.), Fill(1., 1., 1., 8.)],
+            Glyph::Locked => &[Frame(1., 1., 8., 8.), Fill(1., 4., 8., 2.)],
+            Glyph::Gone => &[Fill(0., 0., 2., 2.), Fill(8., 0., 2., 2.), Fill(0., 8., 2., 2.), Fill(8., 8., 2., 2.)],
+            Glyph::Cancelling => &[Fill(2., 1., 2., 8.), Fill(6., 1., 2., 8.)],
+            Glyph::Cancelled => &[Fill(1., 4., 8., 2.)],
+            Glyph::Limit => &[Fill(4., 1., 2., 5.), Fill(4., 8., 2., 2.)],
+            Glyph::Ok => &[Line(&[(1.5, 5.5), (4., 8.), (8.5, 2.)])],
+            Glyph::Failed => &[Line(&[(2., 2.), (8., 8.)]), Line(&[(8., 2.), (2., 8.)])],
+            Glyph::Fold => &[Line(&[(3.5, 1.5), (7., 5.), (3.5, 8.5)])],
+            Glyph::FoldOpen => &[Line(&[(1.5, 3.5), (5., 7.), (8.5, 3.5)])],
+            Glyph::Close => &[Line(&[(1.6, 1.6), (6.4, 6.4)]), Line(&[(6.4, 1.6), (1.6, 6.4)])],
+        }
+    }
+}
+
+/// `g` in `color`: its quads, and its strokes painted from a path
+/// tessellated once ([`PATHS`]).
+pub(crate) fn draw(g: Glyph, color: Hsla) -> AnyElement {
+    let s = g.size();
+    let mut el = div().relative().flex_none().size(px(s));
+    let mut lines = false;
+    for &part in g.parts() {
+        el = match part {
+            Part::Fill(x, y, w, h) => el.child(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).bg(color)),
+            Part::Frame(x, y, w, h) => el.child(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).border_1().border_color(color)),
+            Part::Line(_) => {
+                lines = true;
+                el
+            }
+        };
+    }
+    if lines {
+        el = el
+            .child(canvas(|_, _, _| (), move |b, _, window, _| paint(g, b.origin, color, window)).absolute().top_0().left_0().size(px(s)));
+    }
+    el.into_any_element()
+}
+
+thread_local! {
+    /// Each stroked glyph's path at the origin: tessellated once, then only
+    /// moved to where it is painted.
+    static PATHS: RefCell<Vec<(Glyph, Path<Pixels>)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn paint(g: Glyph, at: Point<Pixels>, color: Hsla, window: &mut Window) {
+    let path = PATHS.with_borrow_mut(|paths| {
+        if let Some((_, p)) = paths.iter().find(|(k, _)| *k == g) {
+            return Some(p.clone());
+        }
+        let p = build(g)?;
+        paths.push((g, p.clone()));
+        Some(p)
+    });
+    let Some(mut path) = path else { return };
+    for v in &mut path.vertices {
+        v.xy_position += at;
+    }
+    path.bounds.origin += at;
+    window.paint_path(path, color);
+}
+
+fn build(g: Glyph) -> Option<Path<Pixels>> {
+    let mut b = PathBuilder::stroke(px(g.stroke()));
+    for part in g.parts() {
+        if let Part::Line(pts) = part {
+            let (&(x, y), rest) = pts.split_first()?;
+            b.move_to(point(px(x), px(y)));
+            for &(x, y) in rest {
+                b.line_to(point(px(x), px(y)));
+            }
+        }
+    }
+    b.build().ok()
+}
+
+/// A row's lead column (design.md §3): `m.lead` wide (12·r and the gap of
+/// 8·r), its glyph centred in the first part, or nothing: the column stays,
+/// so nothing shifts.
+pub(crate) fn lead(g: Option<AnyElement>, m: &Metrics) -> Div {
+    let col = m.lead - (8. * m.r).round();
+    div().flex_none().w(px(m.lead)).flex().items_center().child(div().flex().flex_none().w(px(col)).justify_center().children(g))
+}
+
+/// The house mark (design.md §2): 2 px on its container's left edge, its
+/// full height. An absolute child (the container is `relative`): it never
+/// moves content.
+pub(crate) fn bar(color: Hsla) -> Div {
+    div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(color)
+}
+
+/// A reveal button's glyph (design.md §5): its slot always kept, drawn
+/// only while `group` (its row) is hovered, in `rest`; in `on` while the
+/// pointer is on the button itself (`own`, the button's group).
+pub(crate) fn reveal(g: Glyph, group: &'static str, own: &'static str, rest: Hsla, on: Hsla) -> Div {
+    let layer = |color: Hsla, group: &'static str| {
+        div().absolute().top_0().left_0().invisible().group_hover(group, |d| d.visible()).child(draw(g, color))
+    };
+    div().relative().flex_none().size(px(g.size())).child(layer(rest, group)).child(layer(on, own))
+}
+
+/// What a glyph and its word are painted in (design.md §4.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Family {
+    Run,
+    Warn,
+    Err,
+    Ok,
+    Rest,
+}
+
+/// Where a glyph sits. A run's surfaces (`tool`, `tool_out`): its rows,
+/// worker blocks and the tray. The canvas, the chrome and the card come
+/// with the rest of the state language.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ground {
+    Run,
+}
+
+/// A family's (text, mark) roles on a ground: the only place a state
+/// becomes a colour.
+pub(crate) fn ink(f: Family, g: Ground, p: &Palette) -> (Hsla, Hsla) {
+    match (g, f) {
+        (Ground::Run, Family::Run) => (p.run, p.run_mark),
+        (Ground::Run, Family::Warn) => (p.warn, p.warn_mark),
+        (Ground::Run, Family::Err) => (p.err, p.err),
+        (Ground::Run, Family::Ok) => (p.ok, p.ok),
+        (Ground::Run, Family::Rest) => (p.dim_t, p.dim_t),
+    }
+}
+
+/// A call's outcome (design.md §8.1): its glyph, its word (none when it
+/// ended ok: the commonest outcome stays silent) and its family. `waiting`:
+/// a prompt waits on it; `seen`: not attached, so a call that has not
+/// ended is as last seen.
+pub(crate) fn call(st: Option<ToolStatus>, waiting: bool, seen: bool) -> (Glyph, Option<&'static str>, Family) {
+    match st {
+        Some(ToolStatus::Done) => (Glyph::Ok, None, Family::Ok),
+        Some(ToolStatus::Failed) => (Glyph::Failed, Some("failed"), Family::Err),
+        Some(ToolStatus::Denied) => (Glyph::Failed, Some("denied"), Family::Err),
+        Some(ToolStatus::Cancelled) => (Glyph::Cancelled, Some("cancelled"), Family::Warn),
+        // The daemon stopped it at its output limit: neither ok nor failed.
+        Some(ToolStatus::Unknown) => (Glyph::Limit, Some("stopped at limit"), Family::Warn),
+        Some(ToolStatus::Queued) => (Glyph::Idle, Some("queued"), Family::Rest),
+        _ if waiting => (Glyph::Needs, Some("waiting"), Family::Warn),
+        _ if seen => (Glyph::Idle, Some("last seen running"), Family::Rest),
+        _ => (Glyph::Run, Some("running"), Family::Run),
+    }
+}
+
+/// A folded run's trail glyph: its worst outcome, failed (or denied) >
+/// stopped at the limit > cancelled > ok.
+pub(crate) fn worst(failed: usize, stopped: usize, cancelled: usize) -> (Glyph, Family) {
+    if failed > 0 {
+        (Glyph::Failed, Family::Err)
+    } else if stopped > 0 {
+        (Glyph::Limit, Family::Warn)
+    } else if cancelled > 0 {
+        (Glyph::Cancelled, Family::Warn)
+    } else {
+        (Glyph::Ok, Family::Ok)
+    }
+}
+
+/// A worker's glyph, its word outside run surfaces (Display caps) and
+/// inside them (Mono), and its family (design.md §4.2).
+pub(crate) fn worker(l: Liveness) -> (Glyph, &'static str, &'static str, Family) {
+    match l {
+        Liveness::Started => (Glyph::Idle, label::STARTED, "started", Family::Rest),
+        Liveness::Running => (Glyph::Run, label::RUNNING, "running", Family::Run),
+        Liveness::Cancelling => (Glyph::Cancelling, label::CANCELLING, "cancelling", Family::Warn),
+        Liveness::Done => (Glyph::Ok, label::COMPLETED, "completed", Family::Ok),
+        Liveness::Failed => (Glyph::Failed, label::FAILED, "failed", Family::Err),
+        Liveness::Cancelled => (Glyph::Cancelled, label::CANCELLED, "cancelled", Family::Warn),
+        Liveness::TimedOut => (Glyph::Limit, label::TIMED_OUT, "timed out", Family::Warn),
+        Liveness::LastSeen => (Glyph::Idle, label::LAST_SEEN, "last seen running", Family::Rest),
+        Liveness::Gone => (Glyph::Gone, label::GONE, "gone", Family::Rest),
+    }
+}
+
+/// A folded run's stacked tally bar (design.md §8.2): `n` calls per tool,
+/// most used first, in a bar `h` px tall. Each segment is `floor(h·nᵢ/N)`
+/// px, at least 2; the first takes what is left. A tool that would leave
+/// the first under 2 px is not drawn (the first takes its share). Yields
+/// (index, top, height), top to bottom; nothing allocated.
+pub(crate) fn tally_bar(n: &[usize], h: u32) -> impl Iterator<Item = (usize, u32, u32)> + '_ {
+    let total = n.iter().sum::<usize>().max(1);
+    let share = move |i: usize| ((h as usize * n[i]) / total).max(2) as u32;
+    let (mut rest, mut k) = (0u32, n.len().min(1));
+    for i in 1..n.len() {
+        let s = share(i);
+        if rest + s + 2 > h {
+            break;
+        }
+        rest += s;
+        k = i + 1;
+    }
+    let mut top = 0;
+    (0..k).map(move |i| {
+        let s = if i == 0 { h.saturating_sub(rest) } else { share(i) };
+        let seg = (i, top, s);
+        top += s;
+        seg
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Family, GO, Glyph, Part, build, call, tally_bar, worker, worst};
+    use crate::subagents::Liveness;
+    use synaps_client::transcript::ToolStatus;
+
+    /// The drawing table is injective (`GO` is `Fold` by design: one
+    /// chevron) and every part stays inside its box, strokes
+    /// with their half width.
+    #[test]
+    fn every_glyph_is_unique_and_inside_its_box() {
+        for (i, a) in Glyph::ALL.iter().enumerate() {
+            for b in &Glyph::ALL[i + 1..] {
+                assert_ne!(a.parts(), b.parts(), "{a:?} and {b:?} are drawn alike");
+            }
+            let (s, half) = (a.size(), a.stroke() / 2.);
+            for part in a.parts() {
+                match *part {
+                    Part::Fill(x, y, w, h) | Part::Frame(x, y, w, h) => {
+                        assert!(x >= 0. && y >= 0. && x + w <= s && y + h <= s && w > 0. && h > 0., "{a:?}: {part:?}");
+                    }
+                    Part::Line(pts) => {
+                        assert!(pts.len() >= 2, "{a:?}");
+                        for &(x, y) in pts {
+                            assert!(x - half >= 0. && y - half >= 0. && x + half <= s && y + half <= s, "{a:?}: ({x}, {y})");
+                        }
+                    }
+                }
+            }
+            assert!(!a.parts().is_empty(), "{a:?}");
+        }
+        assert_eq!(GO, Glyph::Fold);
+    }
+
+    /// Every stroked glyph tessellates.
+    #[test]
+    fn every_stroke_builds() {
+        for g in Glyph::ALL.into_iter().filter(|g| g.parts().iter().any(|p| matches!(p, Part::Line(_)))) {
+            let p = build(g).unwrap_or_else(|| panic!("{g:?}"));
+            assert!(!p.vertices.is_empty(), "{g:?}");
+        }
+    }
+
+    /// A call's state: the glyph never drops, ok has no word, and the
+    /// families are the TUI's (cancelled is warn, as its subagent card).
+    #[test]
+    fn calls_map_to_one_glyph_word_and_family() {
+        use ToolStatus as S;
+        let c = |st, waiting, seen| call(st, waiting, seen);
+        assert_eq!(c(Some(S::Done), false, false), (Glyph::Ok, None, Family::Ok));
+        assert_eq!(c(Some(S::Failed), false, false), (Glyph::Failed, Some("failed"), Family::Err));
+        assert_eq!(c(Some(S::Denied), true, false), (Glyph::Failed, Some("denied"), Family::Err), "ended: a prompt no longer waits on it");
+        assert_eq!(c(Some(S::Cancelled), false, false), (Glyph::Cancelled, Some("cancelled"), Family::Warn));
+        assert_eq!(c(Some(S::Unknown), false, false), (Glyph::Limit, Some("stopped at limit"), Family::Warn));
+        assert_eq!(c(Some(S::Queued), false, false), (Glyph::Idle, Some("queued"), Family::Rest));
+        assert_eq!(c(Some(S::Running), true, false), (Glyph::Needs, Some("waiting"), Family::Warn));
+        assert_eq!(c(None, true, true), (Glyph::Needs, Some("waiting"), Family::Warn));
+        assert_eq!(c(Some(S::Running), false, true), (Glyph::Idle, Some("last seen running"), Family::Rest));
+        assert_eq!(c(Some(S::Streaming), false, false), (Glyph::Run, Some("running"), Family::Run));
+        assert_eq!(worst(1, 1, 1), (Glyph::Failed, Family::Err));
+        assert_eq!(worst(0, 1, 1), (Glyph::Limit, Family::Warn));
+        assert_eq!(worst(0, 0, 1), (Glyph::Cancelled, Family::Warn));
+        assert_eq!(worst(0, 0, 0), (Glyph::Ok, Family::Ok));
+    }
+
+    /// A worker's states: one glyph each (started and last seen share the
+    /// rest glyph, as the table says), one word in each register.
+    #[test]
+    fn workers_map_to_one_glyph_and_word() {
+        use crate::subagents::Status as S;
+        let all = [
+            Liveness::Started,
+            Liveness::Running,
+            Liveness::Cancelling,
+            Liveness::Done,
+            Liveness::Failed,
+            Liveness::Cancelled,
+            Liveness::TimedOut,
+            Liveness::LastSeen,
+            Liveness::Gone,
+        ];
+        let glyphs: Vec<Glyph> = all.iter().map(|&l| worker(l).0).collect();
+        for (i, g) in glyphs.iter().enumerate() {
+            let same: Vec<Liveness> = all.iter().zip(&glyphs).filter(|(_, h)| *h == g).map(|(l, _)| *l).collect();
+            assert!(same.len() == 1 || same == [Liveness::Started, Liveness::LastSeen], "{:?} shares {g:?} with {same:?}", all[i]);
+        }
+        for l in all {
+            let (_, display, mono, _) = worker(l);
+            assert_eq!(
+                display.replace("   ", "\u{0}").replace(' ', "").replace('\u{0}', " ").to_lowercase(),
+                mono.replace(" running", ""),
+                "{l:?}"
+            );
+        }
+        assert_eq!(worker(Liveness::Done), (Glyph::Ok, "C O M P L E T E D", "completed", Family::Ok));
+        assert_eq!(worker(Liveness::Cancelled).3, Family::Warn);
+        assert_eq!(Liveness::of(Some(S::Running), false), Liveness::LastSeen);
+        assert_eq!(Liveness::of(Some(S::Cancelling), true), Liveness::Cancelling);
+        assert_eq!(Liveness::of(Some(S::Done), false), Liveness::Done, "how it ended stays so");
+        assert_eq!(Liveness::of(None, true), Liveness::Started);
+        assert_eq!(Liveness::of(Some(S::Started), true), Liveness::Started, "a start only in the history is not running");
+    }
+
+    fn bar(n: &[usize], h: u32) -> Vec<(usize, u32, u32)> {
+        tally_bar(n, h).collect()
+    }
+
+    /// The stacked bar: heights ∝ the tally, floored, at least 2 px, the
+    /// remainder on the first; segments touch and fill the bar exactly.
+    #[test]
+    fn the_tally_bar_stacks_its_counts() {
+        // 7 tools, 36 px: bash 3 → 15, read 3 → 15, grep 1 → 5; +1 to the first.
+        assert_eq!(bar(&[3, 3, 1], 36), [(0, 0, 16), (1, 16, 15), (2, 31, 5)]);
+        assert_eq!(bar(&[4], 36), [(0, 0, 36)]);
+        // A tool used once in 40: floor(0.9) = 0, lifted to 2.
+        assert_eq!(bar(&[39, 1], 36), [(0, 0, 34), (1, 34, 2)]);
+        // The open summary's bar ends over the 1 px cut.
+        assert_eq!(bar(&[3, 3, 1], 35), [(0, 0, 15), (1, 15, 15), (2, 30, 5)]);
+        // More tools than 2 px slots: the last ones are not drawn; the first keeps 2 px.
+        let many = bar(&[1; 30], 36);
+        assert_eq!(many.len(), 18);
+        assert!(many.iter().all(|s| s.2 >= 2));
+        for (h, n) in [(36, vec![5, 4, 3, 2, 1, 1, 1]), (49, vec![12, 1]), (36, vec![1, 1, 1, 1]), (27, vec![30, 9, 2, 1, 1])] {
+            let segs = bar(&n, h);
+            assert_eq!(segs.iter().map(|s| s.2).sum::<u32>(), h, "{n:?} in {h}");
+            assert!(segs.iter().all(|s| s.2 >= 2), "{n:?} in {h}: {segs:?}");
+            for w in segs.windows(2) {
+                assert_eq!(w[0].1 + w[0].2, w[1].1, "{n:?}: they touch");
+            }
+        }
+        assert!(bar(&[], 36).is_empty());
+    }
+}

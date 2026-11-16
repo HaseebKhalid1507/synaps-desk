@@ -100,6 +100,15 @@ pub mod label {
     pub const SAVE: &str = "S A V E";
     pub const REPLACE: &str = "R E P L A C E";
     pub const RUNNING: &str = "R U N N I N G";
+    // A worker's states (design.md §4.2): the words outside run surfaces.
+    pub const STARTED: &str = "S T A R T E D";
+    pub const CANCELLING: &str = "C A N C E L L I N G";
+    pub const COMPLETED: &str = "C O M P L E T E D";
+    pub const FAILED: &str = "F A I L E D";
+    pub const CANCELLED: &str = "C A N C E L L E D";
+    pub const TIMED_OUT: &str = "T I M E D   O U T";
+    pub const LAST_SEEN: &str = "L A S T   S E E N";
+    pub const GONE: &str = "G O N E";
     pub const WORKERS: &str = "W O R K E R S";
     pub const OPENING: &str = "O P E N I N G";
     pub const LOCKED: &str = "L O C K E D";

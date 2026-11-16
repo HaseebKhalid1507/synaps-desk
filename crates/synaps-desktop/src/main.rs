@@ -31,6 +31,7 @@ mod diag;
 mod files;
 mod fit;
 mod fonts;
+mod glyph;
 mod mem;
 mod menu;
 mod model;

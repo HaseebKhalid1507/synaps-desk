@@ -21,6 +21,7 @@ use synaps_client::transcript::{Item, ItemKind, ToolStatus};
 use crate::app::{AppView, RowCache, display, mono};
 use crate::files::{CallDelta, LineKind, Preview};
 use crate::fonts::{self, label};
+use crate::glyph::{self, Family, Glyph, Ground};
 use crate::subagents::{self, Subagents};
 use crate::theme::{self, Metrics, Palette};
 
@@ -461,7 +462,9 @@ impl Hue {
             "grep" => Hue::Grep,
             "find" => Hue::Find,
             "ls" => Hue::Ls,
-            "subagent" => Hue::Sub,
+            // Every call that starts a worker wears the worker's hue
+            // (design.md §8.3), not only the blocking `subagent`.
+            n if subagents::starts_worker(n) => Hue::Sub,
             n if n.starts_with("ext__") => Hue::Ext,
             _ => Hue::Gen,
         }
@@ -484,9 +487,9 @@ impl Hue {
 }
 
 /// Line counts as a row or a summary shows them, formatted once: `+3` `−1`
-/// (`~+3` for an estimate) for edits, `~3` for lines written (not a
-/// delta), as the FILES panel shows them. From the ledger's committed
-/// counts only, so a failed, denied, canceled or stopped call has none.
+/// (`~+3` for an estimate) for edits, each only when not 0 (no `−0`), `~3`
+/// for lines written (not a delta). From the ledger's committed counts
+/// only, so a failed, denied, canceled or stopped call has none.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Counts {
     pub added: Option<SharedString>,
@@ -496,32 +499,23 @@ pub(crate) struct Counts {
 
 impl Counts {
     pub(crate) fn of(d: CallDelta) -> Self {
-        let edits = d.added + d.removed > 0;
         Counts {
-            added: edits.then(|| format!("{}+{}", if d.approx { "~" } else { "" }, d.added).into()),
-            removed: edits.then(|| format!("−{}", d.removed).into()),
+            added: (d.added > 0).then(|| format!("{}+{}", if d.approx { "~" } else { "" }, d.added).into()),
+            removed: (d.removed > 0).then(|| format!("−{}", d.removed).into()),
             written: (d.written > 0).then(|| format!("~{}", d.written).into()),
         }
     }
 
     fn element(&self, p: &Palette) -> Option<Div> {
-        (self.added.is_some() || self.written.is_some()).then(|| {
+        (self.added.is_some() || self.removed.is_some() || self.written.is_some()).then(|| {
             h_flex()
                 .flex_none()
-                .gap(px(6.))
+                .gap(px(8.))
                 .children(self.written.clone().map(|t| div().text_color(p.dim_t).child(t)))
                 .children(self.added.clone().map(|t| div().text_color(p.ok).child(t)))
                 .children(self.removed.clone().map(|t| div().text_color(p.err).child(t)))
         })
     }
-}
-
-/// How a summary's outcome part is coloured.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Tone {
-    Ok,
-    Err,
-    Warn,
 }
 
 /// One tool name in a summary's tally.
@@ -533,14 +527,17 @@ pub(crate) struct Tally {
     pub hue: Hue,
 }
 
-/// What a folded run's summary says: `+ 7 tools  bash 3  read 3  grep 1 …
-/// ✓`, every string formatted once per change of the run.
+/// What a folded run's summary says: `› 7 tools  bash 3  read 3  grep 1 …`
+/// and its worst outcome's glyph, every string formatted once per change
+/// of the run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RunSummary {
     pub tools: usize,
     pub label: SharedString,
     /// Most used first (then first used first).
     pub tally: Vec<Tally>,
+    /// Each tool's count, in the tally's order (its stacked bar).
+    pub ns: Vec<usize>,
     /// Calls by how they ended: done, failed, denied, canceled, stopped at
     /// the output limit.
     pub ok: usize,
@@ -551,10 +548,11 @@ pub(crate) struct RunSummary {
     /// The committed counts of its file tools (the ledger's).
     pub delta: CallDelta,
     pub counts: Counts,
-    /// `✓` when every call is done; else each count that is not zero
-    /// (`5 ok`, `1 cancelled`), and the same without `ok` when tight.
-    pub outcome: Vec<(SharedString, Tone)>,
-    pub outcome_tight: Vec<(SharedString, Tone)>,
+    /// Its worst outcome's glyph ([`glyph::worst`]).
+    pub worst: (Glyph, Family),
+    /// Nothing when every call is done (the glyph alone); else each count
+    /// that is not zero (`5 ok`, `1 cancelled`).
+    pub outcome: Vec<(SharedString, Family)>,
 }
 
 impl RunSummary {
@@ -590,28 +588,24 @@ impl RunSummary {
             t.n_text = t.n.to_string().into();
         }
         let parts = [
-            (failed, "failed", "×", Tone::Err),
-            (denied, "denied", "×", Tone::Err),
-            (cancelled, "cancelled", "", Tone::Warn),
-            (stopped, "stopped", "", Tone::Warn),
+            (failed, "failed", Family::Err),
+            (denied, "denied", Family::Err),
+            (cancelled, "cancelled", Family::Warn),
+            (stopped, "stopped", Family::Warn),
         ];
-        let (outcome, outcome_tight): (Vec<_>, Vec<_>) = if ok == tools {
-            (vec![("✓".into(), Tone::Ok)], vec![("✓".into(), Tone::Ok)])
-        } else {
-            let mut wide: Vec<(SharedString, Tone)> = Vec::new();
-            let mut tight: Vec<(SharedString, Tone)> = Vec::new();
+        let mut outcome: Vec<(SharedString, Family)> = Vec::new();
+        if ok < tools {
             if ok > 0 {
-                wide.push((format!("{ok} ok").into(), Tone::Ok));
+                outcome.push((format!("{ok} ok").into(), Family::Ok));
             }
-            for (n, word, glyph, tone) in parts.into_iter().filter(|p| p.0 > 0) {
-                wide.push((format!("{n} {word}").into(), tone));
-                tight.push((if glyph.is_empty() { format!("{n} {word}") } else { format!("{glyph} {n}") }.into(), tone));
+            for (n, word, family) in parts.into_iter().filter(|p| p.0 > 0) {
+                outcome.push((format!("{n} {word}").into(), family));
             }
-            (wide, tight)
-        };
+        }
         RunSummary {
             tools,
             label: format!("{tools} tools").into(),
+            ns: tally.iter().map(|t| t.n).collect(),
             tally,
             ok,
             failed,
@@ -620,8 +614,8 @@ impl RunSummary {
             stopped,
             delta,
             counts: Counts::of(delta),
+            worst: glyph::worst(failed + denied, stopped, cancelled),
             outcome,
-            outcome_tight,
         }
     }
 }
@@ -823,6 +817,10 @@ impl AppView {
         out.child(block).into_any_element()
     }
 
+    /// A run's summary row (design.md §8.2): the fold, `7 tools`, the tally
+    /// (names in their hues), then counts · its worst outcome's glyph · the
+    /// counts by outcome. On its lead edge the tally stacked into one bar:
+    /// the run's rows' bars, folded.
     fn render_summary(&self, d: Disp, open: bool, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
         let id = d.id;
         let Some(s) = self.summaries.get(id) else { return div().into_any_element() };
@@ -833,27 +831,35 @@ impl AppView {
                     .flex_none()
                     .gap(px(m.mono * 0.6))
                     .child(div().text_color(t.hue.color(p)).child(t.name.clone()))
-                    .child(t.n_text.clone()),
+                    .child(div().text_color(p.dim_t).child(t.n_text.clone())),
             );
         }
-        let mut outcome = h_flex().flex_none().gap(px(8.)).text_size(px(m.meta)).children(s.counts.element(p));
-        for (i, (text, tone)) in if self.layout.tight { &s.outcome_tight } else { &s.outcome }.iter().enumerate() {
-            if i > 0 {
-                outcome = outcome.child(div().text_color(p.dim_t).child("·"));
+        let (worst, family) = s.worst;
+        let mut trail = h_flex()
+            .flex_none()
+            .gap(px(8.))
+            .items_center()
+            .text_size(px(m.meta))
+            .children(s.counts.element(p))
+            .child(glyph::draw(worst, glyph::ink(family, Ground::Run, p).1));
+        if !self.layout.tight {
+            for (i, (text, family)) in s.outcome.iter().enumerate() {
+                if i > 0 {
+                    trail = trail.child(div().text_color(p.dim_t).child("·"));
+                }
+                trail = trail.child(div().text_color(glyph::ink(*family, Ground::Run, p).0).child(text.clone()));
             }
-            let color = match tone {
-                Tone::Ok => p.ok,
-                Tone::Err => p.err,
-                Tone::Warn => p.warn,
-            };
-            outcome = outcome.child(div().text_color(color).child(text.clone()));
         }
+        // Open, the bar ends over the 1 px cut under it.
+        let h = m.summary as u32 - u32::from(open);
+        let segments = glyph::tally_bar(&s.ns, h)
+            .map(|(i, top, h)| div().absolute().left_0().top(px(top as f32)).w(px(2.)).h(px(h as f32)).bg(s.tally[i].hue.color(p)));
         h_flex()
             .id(("run", id))
+            .relative()
             .w_full()
             .h(px(m.summary))
-            .px(px(m.run_x))
-            .gap(px(m.run_gap))
+            .px(px(m.pad_x))
             .items_center()
             .bg(p.tool)
             .when(open, |d| d.border_b_1().border_color(p.canvas))
@@ -862,10 +868,18 @@ impl AppView {
             .text_color(p.prose_t)
             .cursor_pointer()
             .hover(|d| d.bg(p.tool_out))
-            .child(div().w(px(m.mono * 0.6)).flex_none().text_color(p.dim_t).child(if open { "−" } else { "+" }))
-            .child(div().flex_none().child(s.label.clone()))
-            .child(tally)
-            .child(outcome)
+            .child(glyph::lead(Some(glyph::draw(if open { Glyph::FoldOpen } else { Glyph::Fold }, p.dim_t)), m))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(m.run_gap))
+                    .items_center()
+                    .child(div().flex_none().child(s.label.clone()))
+                    .child(tally)
+                    .child(trail),
+            )
+            .children(segments)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_run(id);
                 cx.notify();
@@ -873,8 +887,10 @@ impl AppView {
             .into_any_element()
     }
 
-    /// A thinking or tool row in a run: sign, name, argument, outcome; and
-    /// its body when open.
+    /// A thinking or tool row in a run (design.md §8.1): the fold (blank
+    /// without a body), name, argument, outcome; its body when open; the
+    /// worker it started. On its lead edge a bar in its tool's hue, through
+    /// its body (`warn_mark` while a prompt waits on it).
     #[allow(clippy::too_many_arguments)]
     fn render_work(&self, item: &Item, row: &RowCache, id: u64, p: &Palette, m: &Metrics, lay: Layout, cx: &Context<Self>) -> AnyElement {
         let think = item.kind == ItemKind::Thinking;
@@ -896,28 +912,45 @@ impl AppView {
         } else {
             div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(p.arg).child(row.arg.clone())
         };
+        // The call a prompt waits on (the last one unfinished).
+        let waiting = !think && self.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty();
+        let state = glyph::call(st, waiting, self.model.active.is_none());
+        let bar = if think {
+            p.think
+        } else if state.0 == Glyph::Needs {
+            p.warn_mark
+        } else {
+            name_color
+        };
+        let fold = has_body.then(|| glyph::draw(if open { Glyph::FoldOpen } else { Glyph::Fold }, p.dim_t));
         let head = h_flex()
             .id(("row", id))
             .w_full()
             .min_h(px(m.row))
-            .px(px(m.run_x))
-            .gap(px(m.run_gap))
+            .px(px(m.pad_x))
             .items_center()
             .when(has_body, |d| d.cursor_pointer().hover(|d| d.bg(p.tool_out)))
-            .child(div().w(px(m.mono * 0.6)).flex_none().text_color(p.dim_t).child(if open { "−" } else { "+" }))
+            .child(glyph::lead(fold, m))
             .child(
-                div()
-                    .flex_none()
-                    .min_w(px(m.mono * 0.6 * 5.))
-                    .max_w(px(m.mono * 0.6 * 16.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_color(name_color)
-                    .child(name),
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(m.run_gap))
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_none()
+                            .min_w(px(m.mono * 0.6 * 5.))
+                            .max_w(px(m.mono * 0.6 * 16.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(name_color)
+                            .child(name),
+                    )
+                    .child(arg)
+                    .when(!think, |d| d.child(outcome(row, state, p, m, lay))),
             )
-            .child(arg)
-            .when(!think, |d| d.child(self.outcome(item, row, st, p, m, lay)))
             .when(has_body, |d| {
                 d.on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle(id);
@@ -929,10 +962,10 @@ impl AppView {
                 div()
                     .w_full()
                     .bg(p.tool_out)
-                    .pl(px(m.run_x + m.mono * 0.6 + m.run_gap))
-                    .pr(px(m.run_x))
+                    .pl(px(m.pad_x + m.lead))
+                    .pr(px(m.pad_x))
                     .pt(px((8. * m.r).round()))
-                    .pb(px((10. * m.r).round()))
+                    .pb(px((12. * m.r).round()))
                     .font_family(fonts::SANS)
                     .text_size(px(m.think))
                     .line_height(px(m.think_line))
@@ -952,6 +985,7 @@ impl AppView {
             subs.view(&t.tool_id).map(|v| (v, subs.current(&t.tool_id)))
         });
         v_flex()
+            .relative()
             .w_full()
             .bg(p.tool)
             .font_family(fonts::MONO)
@@ -960,95 +994,105 @@ impl AppView {
             .child(head)
             .children(worker.map(|(v, current)| self.subagent_block(v, current, p, m, lay, cx)))
             .children(body)
+            .child(glyph::bar(bar))
             .into_any_element()
     }
 
-    /// The worker a call started, under it (the TUI's subagent card and
-    /// tray row): state, name, model · tools · elapsed; then its step while
-    /// it runs, its result or why it failed once it ends. Nothing moves:
-    /// it changes when an event or a row comes. Not attached (a cached tab
-    /// opening, a detached session): as last seen, dimmed. On the
-    /// session's thread a background worker's block opens it in a tab
-    /// (history: [`crate::wtabs`]), with OPEN ↗ on hover. `current`: no
-    /// later call has its `sa_N` (a cold-started daemon numbers from 1
-    /// again); one that has is another worker's handle now, and the block
-    /// does nothing.
+    /// The worker a call started, under it (design.md §8.3; the tray row's
+    /// grammar): state glyph, name, its step while it runs, its facts
+    /// (model · tools · elapsed), its state word and `Go`; once it ended,
+    /// its result or why it failed under the row. Its `sub_rule` bar under
+    /// the call's name. Nothing moves: it changes when an event or a row
+    /// comes. Not attached (a cached tab opening, a detached session): as
+    /// last seen. On the session's thread a background worker's block opens
+    /// it in a tab (history: [`crate::wtabs`]), `Go` drawn on hover.
+    /// `current`: no later call has its `sa_N` (a cold-started daemon
+    /// numbers from 1 again); one that has is another worker's handle now,
+    /// and the block does nothing.
     fn subagent_block(&self, v: &subagents::View, current: bool, p: &Palette, m: &Metrics, lay: Layout, cx: &Context<Self>) -> AnyElement {
-        use subagents::Tone as T;
-        let seen = self.model.active.is_none();
-        let running = v.status.is_some_and(subagents::Status::running);
-        let (word, color) = match v.tone {
-            _ if seen => (if running { "last seen running" } else { v.word }, p.dim_t),
-            T::Run => (v.word, p.run),
-            T::Ok => (v.word, p.ok),
-            T::Err => (v.word, p.err),
-            T::Warn => (v.word, p.warn),
-            T::Dim => (v.word, p.dim_t),
-        };
-        let glyph = match v.tone {
-            T::Run if !seen => Some(div().size(px(8.)).m(px(1.)).flex_none().bg(p.run_mark)),
-            T::Run | T::Dim => Some(div().size(px(8.)).m(px(1.)).flex_none().border_1().border_color(p.dim_t)),
-            _ => None,
-        };
-        let sign = match v.tone {
-            T::Ok => Some("✓"),
-            T::Err => Some("×"),
-            _ => None,
-        };
-        let word_too = !lay.tight || (sign.is_none() && glyph.is_none());
-        let (name, facts, line) = if seen { (p.dim_t, p.dim_t, p.dim_t) } else { (p.sub_name_t, p.sub_time_t, p.sub_status_t) };
-        let head = h_flex()
-            .w_full()
-            .gap(px(m.run_gap))
-            .items_center()
-            .whitespace_nowrap()
-            .children(glyph)
-            .when_some(sign, |d, s| d.child(div().flex_none().text_color(color).child(s)))
-            .when(word_too, |d| d.child(div().flex_none().text_color(color).child(word)))
-            .child(div().flex_none().max_w(px(m.mono * 0.6 * 24.)).overflow_hidden().text_ellipsis().text_color(name).child(v.name.clone()))
-            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(facts).child(v.facts.clone()));
+        let live = subagents::Liveness::of(v.status, self.model.active.is_some());
+        let (g, _, word, family) = glyph::worker(live);
+        let (word_color, mark) = glyph::ink(family, Ground::Run, p);
+        let ended = v.status.is_some_and(subagents::Status::terminal);
+        let (step, result) = if ended { (None, v.line.clone()) } else { (v.line.clone(), None) };
+        let step_color =
+            if matches!(live, subagents::Liveness::Running | subagents::Liveness::Cancelling) { p.sub_status_t } else { p.dim_t };
         // A background worker of the session on screen: it opens.
         let open = v.id.filter(|_| v.watchable && current && self.model.watch.focus().is_none());
         let who = open.map(|id| crate::wtabs::Who::new(id, v.name.clone(), v.call.clone()));
-        let head = head.when_some(who.clone(), |d, who| {
-            let id = who.id;
-            d.child(
-                div()
-                    .id(("wblock-open", id as usize))
-                    .flex_none()
-                    .text_size(px(m.meta))
-                    .text_color(gpui_kit::transparent_black())
-                    .group_hover("wblock", |s| s.text_color(p.dim_t))
-                    .hover(|s| s.text_color(p.prose_t))
-                    .child("OPEN ↗")
-                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        if ev.click_count() > 1 {
-                            return;
-                        }
-                        this.swallow_clicks = Some(std::time::Instant::now() + crate::wtabs::MULTI_CLICK);
-                        this.open_worker_tab(&who, cx);
-                    })),
-            )
+        let go = who.clone().map(|who| {
+            h_flex()
+                .id(("wblock-open", who.id as usize))
+                .group("wblock-go")
+                .flex_none()
+                .items_center()
+                .child(glyph::reveal(glyph::GO, "wblock", "wblock-go", p.dim_t, p.ink))
+                .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    if ev.click_count() > 1 {
+                        return;
+                    }
+                    this.swallow_clicks = Some(std::time::Instant::now() + crate::wtabs::MULTI_CLICK);
+                    this.open_worker_tab(&who, cx);
+                }))
         });
-        let rule = if seen { p.dim_t } else { p.sub_rule };
-        let block = div().w_full().pl(px(m.run_x + m.mono * 0.6 + m.run_gap)).pr(px(m.run_x)).pb(px((6. * m.r).round())).child(
-            v_flex().w_full().border_l_2().border_color(rule).pl(px((10. * m.r).round())).child(head).when_some(
-                v.line.clone(),
-                |d, (text, err)| {
-                    let c = if seen {
-                        line
-                    } else if err {
-                        p.err
-                    } else if running {
-                        line
-                    } else {
-                        p.dim_t
-                    };
-                    d.child(div().w_full().overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(c).child(text))
-                },
-            ),
-        );
+        let trail = h_flex()
+            .flex_none()
+            .gap(px(8.))
+            .items_center()
+            .text_size(px(m.meta))
+            .when(!v.facts.is_empty(), |d| d.child(div().text_color(p.sub_time_t).child(v.facts.clone())))
+            .when(!lay.tight, |d| d.child(div().text_color(word_color).child(word)))
+            .children(go);
+        let head = h_flex()
+            .w_full()
+            .min_h(px(m.row))
+            .px(px(m.pad_x))
+            .items_center()
+            .whitespace_nowrap()
+            .child(glyph::lead(Some(glyph::draw(g, mark)), m))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(m.run_gap))
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(m.mono * 0.6 * 24.))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_color(p.sub_name_t)
+                            .child(v.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .when_some(step, |d, (text, _)| d.text_color(step_color).child(text)),
+                    )
+                    .child(trail),
+            );
+        let result = result.map(|(text, err)| {
+            div()
+                .w_full()
+                .pl(px(m.pad_x + m.lead))
+                .pr(px(m.pad_x))
+                .pb(px((8. * m.r).round()))
+                .text_size(px(m.meta))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_color(if err { p.err } else { p.dim_t })
+                .child(text)
+        });
+        let block = div()
+            .w_full()
+            .pl(px(m.pad_x + m.lead))
+            .child(v_flex().relative().w_full().child(head).children(result).child(glyph::bar(p.sub_rule)));
         let Some(who) = who else {
             // Its handle names a later worker now: nothing of that one's here.
             if let Some(id) = v.id.filter(|_| v.watchable && !current && self.model.watch.focus().is_none()) {
@@ -1073,57 +1117,32 @@ impl AppView {
             .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who2, true, ev, window, cx)))
             .into_any_element()
     }
-
-    /// A tool's outcome: `✓`, `× failed`, `× denied`, `cancelled`, a solid
-    /// square and `running`, a framed square and `waiting` (the call a
-    /// prompt waits on: the last one unfinished). Nothing moves.
-    fn outcome(&self, item: &Item, row: &RowCache, st: Option<ToolStatus>, p: &Palette, m: &Metrics, lay: Layout) -> AnyElement {
-        let word = |w: &'static str| (!lay.tight).then_some(w);
-        // The ledger's committed counts: nothing unless the call succeeded.
-        let delta = row.counts.element(p);
-        let (glyph, text, color): (Option<Div>, Option<&'static str>, Hsla) = match st {
-            Some(ToolStatus::Done) => (None, Some("✓"), p.ok),
-            Some(ToolStatus::Failed) => (None, Some(if lay.tight { "×" } else { "× failed" }), p.err),
-            Some(ToolStatus::Denied) => (None, Some(if lay.tight { "×" } else { "× denied" }), p.err),
-            // These have no glyph, so a tight pane keeps a short word.
-            Some(ToolStatus::Cancelled) => (None, Some("cancelled"), p.dim_t),
-            // The daemon stopped it at its output limit: not ✓, not ×.
-            Some(ToolStatus::Unknown) => (None, Some(if lay.tight { "stopped" } else { "stopped at limit" }), p.dim_t),
-            Some(ToolStatus::Queued) => (None, Some("queued"), p.dim_t),
-            _ if self.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty() => {
-                let g = div()
-                    .relative()
-                    .size(px(10.))
-                    .flex_none()
-                    .child(div().absolute().inset_0().border_1().border_color(p.warn_mark))
-                    .child(div().absolute().top(px(3.)).left(px(3.)).size(px(4.)).bg(p.warn_mark));
-                (Some(g), word("waiting"), p.warn)
-            }
-            // Not attached (a cached tab opening, a detached session): what
-            // was last seen, not a live run.
-            _ if self.model.active.is_none() => {
-                (Some(div().size(px(8.)).m(px(1.)).flex_none().border_1().border_color(p.dim_t)), word("last seen running"), p.dim_t)
-            }
-            _ => (Some(div().size(px(8.)).m(px(1.)).flex_none().bg(p.run_mark)), word("running"), p.run),
-        };
-        h_flex()
-            .flex_none()
-            .gap(px(8.))
-            .items_center()
-            .text_size(px(m.meta))
-            .whitespace_nowrap()
-            .children(delta)
-            .children(glyph)
-            .when_some(text, |d, t| d.child(div().text_color(color).child(t)))
-            .into_any_element()
-    }
 }
 
-/// An edit's diff on the result surface: added and removed lines washed
-/// toward `tool_result_ok` / `error_color` (16 % / 18 %).
+/// A call's trail (design.md §8.1): its counts, its outcome's glyph and
+/// its word (none for ok, none in a tight pane; the glyph never drops).
+/// Nothing moves.
+fn outcome(row: &RowCache, (g, word, family): (Glyph, Option<&'static str>, Family), p: &Palette, m: &Metrics, lay: Layout) -> AnyElement {
+    let (text, mark) = glyph::ink(family, Ground::Run, p);
+    h_flex()
+        .flex_none()
+        .gap(px(8.))
+        .items_center()
+        .text_size(px(m.meta))
+        .whitespace_nowrap()
+        // The ledger's committed counts: nothing unless the call succeeded.
+        .children(row.counts.element(p))
+        .child(glyph::draw(g, mark))
+        .when_some(word.filter(|_| !lay.tight), |d, w| d.child(div().text_color(text).child(w)))
+        .into_any_element()
+}
+
+/// An edit's diff on the result surface: its signs at the row's name (36),
+/// its text one inset in (52); added and removed lines washed 1.10:1 off it
+/// toward `tool_result_ok` / `error_color`.
 fn diff_body(pv: &Preview, p: &Palette, m: &Metrics) -> impl IntoElement {
-    let indent = m.run_x + m.mono * 0.6 + m.run_gap;
-    let mut col = v_flex().w_full().bg(p.tool_out).py(px((8. * m.r).round()));
+    let indent = m.pad_x + m.lead;
+    let mut col = v_flex().w_full().bg(p.tool_out).pt(px((8. * m.r).round())).pb(px((12. * m.r).round()));
     for l in &pv.lines {
         let (sign, fg, sign_fg, bg) = match l.kind {
             LineKind::Add => ("+", p.ink, p.ok_o, Some(p.add_bg)),
@@ -1135,10 +1154,10 @@ fn diff_body(pv: &Preview, p: &Palette, m: &Metrics) -> impl IntoElement {
             h_flex()
                 .w_full()
                 .pl(px(indent))
-                .pr(px(m.run_x))
+                .pr(px(m.pad_x))
                 .items_start()
                 .when_some(bg, |d, bg| d.bg(bg))
-                .child(div().w(px(m.mono * 1.2)).flex_none().text_color(sign_fg).child(sign))
+                .child(div().w(px(m.pad_x)).flex_none().text_color(sign_fg).child(sign))
                 // `SharedString` from the line's `Arc<str>`: no copy per frame.
                 .child(div().flex_1().min_w_0().text_color(fg).whitespace_normal().child(SharedString::from(&l.text))),
         );
@@ -1150,13 +1169,13 @@ fn diff_body(pv: &Preview, p: &Palette, m: &Metrics) -> impl IntoElement {
 }
 
 fn result_body(result: &SharedString, more: usize, failed: bool, p: &Palette, m: &Metrics) -> impl IntoElement {
-    let indent = m.run_x + m.mono * 0.6 + m.run_gap;
     v_flex()
         .w_full()
         .bg(p.tool_out)
-        .pl(px(indent))
-        .pr(px(m.run_x))
-        .py(px((8. * m.r).round()))
+        .pl(px(m.pad_x + m.lead))
+        .pr(px(m.pad_x))
+        .pt(px((8. * m.r).round()))
+        .pb(px((12. * m.r).round()))
         .text_color(if failed { p.err_o } else { p.res })
         .whitespace_normal()
         .child(result.clone())
@@ -1174,8 +1193,8 @@ mod tests {
     use synaps_client::transcript::ItemKind;
 
     use super::{
-        Counts, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, TextRows, Tone,
-        Who, build, diff, text_lines, turn_start,
+        Counts, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, TextRows, Who,
+        build, diff, text_lines, turn_start,
     };
     use crate::files::{CallDelta, Ledger};
     use crate::subagents::Subagents;
@@ -1347,7 +1366,9 @@ mod tests {
         t.items().iter().map(|i| crate::app::row_cache(i, ledger, &Subagents::default())).collect()
     }
 
-    fn outcome(s: &RunSummary) -> Vec<(&str, Tone)> {
+    use crate::glyph::{Family, Glyph};
+
+    fn outcome(s: &RunSummary) -> Vec<(&str, Family)> {
         s.outcome.iter().map(|(t, tone)| (t.as_ref(), *tone)).collect()
     }
 
@@ -1364,17 +1385,23 @@ mod tests {
             [("bash", 3, "3"), ("read", 2, "2")]
         );
         assert_eq!(s.tally[0].hue, Hue::Bash);
+        // A call that starts a worker wears the worker's hue.
+        assert_eq!([Hue::of("subagent_start"), Hue::of("subagent_resume"), Hue::of("subagent")], [Hue::Sub; 3]);
+        assert_eq!(Hue::of("subagent_collect"), Hue::Gen);
         assert_eq!(s.label.as_ref(), "5 tools");
-        assert_eq!(outcome(&s), [("4 ok", Tone::Ok), ("1 failed", Tone::Err)]);
+        assert_eq!(outcome(&s), [("4 ok", Family::Ok), ("1 failed", Family::Err)]);
+        assert_eq!(s.worst, (Glyph::Failed, Family::Err));
+        assert_eq!(s.ns, [3, 2], "the stacked bar's counts, in the tally's order");
     }
 
-    /// `✓` only when every call finished normally; HALT mid-run cancels the
+    /// The `Ok` glyph alone only when every call finished normally; else
+    /// its worst outcome's glyph and the counts. HALT mid-run cancels the
     /// rest, and a denied call says denied.
     #[test]
     fn a_summary_ticks_only_when_every_call_is_done() {
         let t = transcript(&turn(5, "a"));
         let s = RunSummary::of(&t.items()[1..6], &rows(&t, &Ledger::default())[1..6]);
-        assert_eq!(outcome(&s), [("✓", Tone::Ok)]);
+        assert_eq!((outcome(&s), s.worst), (vec![], (Glyph::Ok, Family::Ok)));
 
         // HALT after two calls: the other three end canceled.
         let mut m = turn(5, "a");
@@ -1390,8 +1417,8 @@ mod tests {
         let Kind::Summary { end, .. } = rows[1].kind else { unreachable!() };
         let s = RunSummary::of(&t.items()[1..end], &self::rows(&t, &Ledger::default())[1..end]);
         assert_eq!((s.ok, s.cancelled), (2, 3));
-        assert_eq!(outcome(&s), [("2 ok", Tone::Ok), ("3 cancelled", Tone::Warn)]);
-        assert_eq!(s.outcome_tight.iter().map(|o| o.0.as_ref()).collect::<Vec<_>>(), ["3 cancelled"]);
+        assert_eq!(outcome(&s), [("2 ok", Family::Ok), ("3 cancelled", Family::Warn)]);
+        assert_eq!(s.worst, (Glyph::Cancelled, Family::Warn));
 
         // A denied call, and one stopped at the output limit.
         let mut m = turn(4, "a");
@@ -1402,8 +1429,8 @@ mod tests {
         let t = transcript(&m);
         let s = RunSummary::of(&t.items()[1..5], &self::rows(&t, &Ledger::default())[1..5]);
         assert_eq!((s.ok, s.failed, s.denied, s.stopped), (2, 0, 1, 1));
-        assert_eq!(outcome(&s), [("2 ok", Tone::Ok), ("1 denied", Tone::Err), ("1 stopped", Tone::Warn)]);
-        assert_eq!(s.outcome_tight.iter().map(|o| o.0.as_ref()).collect::<Vec<_>>(), ["× 1", "1 stopped"]);
+        assert_eq!(outcome(&s), [("2 ok", Family::Ok), ("1 denied", Family::Err), ("1 stopped", Family::Warn)]);
+        assert_eq!(s.worst, (Glyph::Failed, Family::Err), "denied is the worst: failed > limit > cancelled");
     }
 
     /// The transcript's counts are the FILES panel's: in the live shot a
@@ -1445,9 +1472,18 @@ mod tests {
         assert_eq!((s.delta.added, s.delta.removed), ledger.totals(), "the summary is the panel's");
         assert_eq!(ledger.files().iter().map(|f| f.written).sum::<u32>(), s.delta.written);
         assert_eq!(s.counts, Counts { added: Some("+3".into()), removed: Some("−1".into()), written: Some("~3".into()) });
-        assert_eq!(outcome(&s), [("4 ok", Tone::Ok), ("1 failed", Tone::Err)]);
+        assert_eq!(outcome(&s), [("4 ok", Family::Ok), ("1 failed", Family::Err)]);
         // An estimate keeps its `~`.
         assert_eq!(Counts::of(CallDelta { added: 2, removed: 5, approx: true, written: 0 }).added.as_deref(), Some("~+2"));
+        // No `−0` (audit E3) and no `+0`: a count shows only when it is not 0.
+        assert_eq!(
+            Counts::of(CallDelta { added: 4, removed: 0, approx: false, written: 0 }),
+            Counts { added: Some("+4".into()), removed: None, written: None }
+        );
+        assert_eq!(
+            Counts::of(CallDelta { added: 0, removed: 6, approx: false, written: 0 }),
+            Counts { added: None, removed: Some("−6".into()), written: None }
+        );
     }
 
     /// M1: events land between frames, so a click can rebuild against rows
