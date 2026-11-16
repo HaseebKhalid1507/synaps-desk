@@ -783,6 +783,16 @@ pub(crate) fn held_back(hold: &Cell<bool>, pending: bool, following: bool) -> bo
     pause
 }
 
+/// Whether list `l` (of `n` rows) has rows to hint ([`AppView::hint_rows`]):
+/// more rows than fit, one with no height, the last one drawn.
+fn wants_hint(l: &ListState, n: usize) -> bool {
+    n > 0
+        && l.item_count() == n
+        && l.max_offset_for_scrollbar().y > px(0.)
+        && l.is_scrolled_to_end().is_none()
+        && l.bounds_for_item(n - 1).is_some()
+}
+
 /// How far down the transcript's list starts: the top bar, the session
 /// header and the naming row when it is open (the tab strip is the same in
 /// every form).
@@ -2715,12 +2725,7 @@ impl AppView {
     /// lookups a frame.
     fn hint_rows(&self, m: &Metrics) {
         let (l, n) = (&self.list, self.disp.len());
-        if n == 0
-            || l.item_count() != n
-            || l.max_offset_for_scrollbar().y <= px(0.)
-            || l.is_scrolled_to_end().is_some()
-            || l.bounds_for_item(n - 1).is_none()
-        {
+        if !wants_hint(l, n) {
             return;
         }
         // The rows not drawn are above the view (rows below it are drawn
@@ -4520,6 +4525,23 @@ impl Render for AppView {
             .pb(px(pad_b));
         self.texts.borrow_mut().frame(lay.column, &m);
         self.hint_rows(&m);
+        // After the list's layout: rows it has no height for get their hint
+        // in the next frame's [`AppView::hint_rows`], so one is drawn (once:
+        // hinted, every row has a height). Else, a load's last frame left the
+        // thumb its unhinted length until something else drew.
+        let hint_frame = self.list.is_scrolled_to_end().is_none().then(|| {
+            let (l, n) = (self.list.clone(), self.disp.len());
+            canvas(
+                move |_, window, _| {
+                    if wants_hint(&l, n) {
+                        window.request_animation_frame();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0()
+        });
         // Over the list's right padding, after its layout (and the hold-back's).
         let transcript_bar = crate::scrollbar::rows(&self.list, pad_t + pad_b, &self.bars.transcript).always();
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
@@ -4562,7 +4584,7 @@ impl Render for AppView {
                 .child(self.render_header(self.header_meta(), &p, cx))
                 .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
                 .children(self.render_crumb(&p, cx))
-                .child(div().flex_1().min_h_0().child(list).children(hold_back).child(transcript_bar))
+                .child(div().flex_1().min_h_0().child(list).children(hint_frame).children(hold_back).child(transcript_bar))
                 .when(card_shown, |d| d.children(self.render_prompt(&p, &m, self.card_keys_live(window, cx), cx)))
                 .children(self.render_notice(&p, &m))
                 .children(self.render_tray(&p, &m, cx))
