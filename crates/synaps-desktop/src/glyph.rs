@@ -9,8 +9,9 @@
 //! family's mark role on its ground, its word the family's text role
 //! ([`ink`]).
 //!
-//! The rail and the tabs still draw through `chrome::glyph` (the same
-//! drawings); they come here with the rest of the state language.
+//! Every surface that shows a state reads this table (design.md §4.3): the
+//! rail, the tabs, the composer foot, the tray, the worker blocks, the
+//! hover card and the NEEDS YOU stub.
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -20,6 +21,7 @@ use gpui_kit::*;
 use synaps_client::transcript::ToolStatus;
 
 use crate::fonts::label;
+use crate::rail::State;
 use crate::subagents::Liveness;
 use crate::theme::{Metrics, Palette};
 
@@ -27,7 +29,6 @@ use crate::theme::{Metrics, Palette};
 /// its shape where two families share a colour (`run` and `warn` are one
 /// colour in 7 themes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Glyph {
     Run,
     Workers,
@@ -220,25 +221,109 @@ pub(crate) enum Family {
     Err,
     Ok,
     Rest,
+    Unread,
+    /// Opening: the one state that is yours (the accent).
+    Open,
+    /// The composer foot's READY.
+    Ready,
 }
 
-/// Where a glyph sits. A run's surfaces (`tool`, `tool_out`): its rows,
-/// worker blocks and the tray. The canvas, the chrome and the card come
-/// with the rest of the state language.
+/// Where a glyph sits (design.md §4.4). `Run`: a run's surfaces (`tool`,
+/// `tool_out`): its rows, worker blocks and the tray. `User`: the composer
+/// foot. `Chrome`: the rail, the tabs, the top bar, and the kit's popover
+/// (the hover card, until overlays move to the card). `Card`: the NEEDS YOU
+/// stub and the authorization card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Ground {
+    Canvas,
     Run,
+    User,
+    Chrome,
+    Card,
 }
 
 /// A family's (text, mark) roles on a ground: the only place a state
-/// becomes a colour.
+/// becomes a colour. A family the table has no column for on a ground
+/// (unread off the chrome; opening and ready off theirs) takes rest's.
 pub(crate) fn ink(f: Family, g: Ground, p: &Palette) -> (Hsla, Hsla) {
+    use Family as F;
+    use Ground as G;
     match (g, f) {
-        (Ground::Run, Family::Run) => (p.run, p.run_mark),
-        (Ground::Run, Family::Warn) => (p.warn, p.warn_mark),
-        (Ground::Run, Family::Err) => (p.err, p.err),
-        (Ground::Run, Family::Ok) => (p.ok, p.ok),
-        (Ground::Run, Family::Rest) => (p.dim_t, p.dim_t),
+        (G::Canvas, F::Run) => (p.run, p.run_mark),
+        (G::Canvas, F::Warn) => (p.warn, p.warn_mark),
+        (G::Canvas, F::Err) => (p.err, p.err),
+        (G::Canvas, F::Ok) => (p.ok, p.ok),
+        (G::Canvas, F::Ready) => (p.ready, p.ready),
+        (G::Canvas, _) => (p.dim, p.dim),
+        (G::Run, F::Run) => (p.run, p.run_mark),
+        (G::Run, F::Warn) => (p.warn, p.warn_mark),
+        (G::Run, F::Err) => (p.err, p.err),
+        (G::Run, F::Ok) => (p.ok, p.ok),
+        (G::Run, _) => (p.dim_t, p.dim_t),
+        (G::User, F::Run) => (p.run, p.run_mark),
+        (G::User, F::Warn) => (p.warn, p.warn_mark),
+        (G::User, F::Err) => (p.err, p.err),
+        (G::User, F::Ok) => (p.ok, p.ok),
+        (G::User, F::Ready) => (p.ready, p.ready),
+        // The word is the hint's ("opening…"); `you` is not floored on `user`.
+        (G::User, F::Open) => (p.dim_u, p.you_mark),
+        (G::User, _) => (p.dim_u, p.dim_u),
+        (G::Chrome, F::Run) => (p.run_ch, p.run_mark_ch),
+        (G::Chrome, F::Warn) => (p.warn_ch, p.warn_mark_ch),
+        (G::Chrome, F::Err) => (p.err_ch, p.err_mark_ch),
+        (G::Chrome, F::Ok) => (p.ok_ch, p.ok_ch),
+        (G::Chrome, F::Rest) => (p.dim_ch, p.rest_mark),
+        (G::Chrome, F::Unread) => (p.unread_ch, p.unread_mark_ch),
+        (G::Chrome, F::Open) => (p.open_ch, p.focus_ch),
+        (G::Chrome, F::Ready) => (p.ready_ch, p.ready_mark_ch),
+        (G::Card, F::Run) => (p.run_k, p.run_mark_k),
+        (G::Card, F::Warn) => (p.warn_k, p.warn_mark),
+        (G::Card, F::Err) => (p.err_k, p.err_mark_k),
+        (G::Card, F::Ok) => (p.ok_k, p.ok_k),
+        (G::Card, _) => (p.dim_k, p.rest_mark_k),
+    }
+}
+
+/// A session's state (the rail's [`State`]): its glyph (none when saved)
+/// and its family (design.md §4.2). Its word is [`State::word`]; the
+/// composer foot says READY for idle ([`foot`]).
+pub(crate) fn session(st: State) -> (Option<Glyph>, Family) {
+    match st {
+        State::NeedsYou => (Some(Glyph::Needs), Family::Warn),
+        State::Running => (Some(Glyph::Run), Family::Run),
+        State::Workers => (Some(Glyph::Workers), Family::Run),
+        State::Unread => (Some(Glyph::Unread), Family::Unread),
+        State::Idle => (Some(Glyph::Idle), Family::Rest),
+        State::Parked => (Some(Glyph::Parked), Family::Rest),
+        State::Opening => (Some(Glyph::Opening), Family::Open),
+        State::Locked => (Some(Glyph::Locked), Family::Rest),
+        State::Saved => (None, Family::Rest),
+    }
+}
+
+/// A session's glyph on `ground`, in a 10 px box (empty when it has none).
+pub(crate) fn session_mark(st: State, ground: Ground, p: &Palette) -> Div {
+    let (g, f) = session(st);
+    let (_, mark) = ink(f, ground, p);
+    div().flex().flex_none().size(px(10.)).children(g.map(|g| draw(g, mark)))
+}
+
+/// A session's word colour on `ground` (its state word and counts).
+pub(crate) fn session_word(st: State, ground: Ground, p: &Palette) -> Hsla {
+    ink(session(st).1, ground, p).0
+}
+
+/// The composer foot's state (design.md §8.11): the session's glyph, its
+/// word (READY when idle; none while opening: the hint says it) and its
+/// family, on the user ground.
+pub(crate) fn foot(st: State) -> (Option<Glyph>, Option<&'static str>, Family) {
+    match st {
+        State::Idle => (Some(Glyph::Idle), Some(label::READY), Family::Ready),
+        State::Opening => (Some(Glyph::Opening), None, Family::Open),
+        _ => {
+            let (g, f) = session(st);
+            (g, st.word(), f)
+        }
     }
 }
 
@@ -444,11 +529,17 @@ mod tests {
         }
         assert_eq!(worker(Liveness::Done), (Glyph::Ok, "C O M P L E T E D", "completed", Family::Ok));
         assert_eq!(worker(Liveness::Cancelled).3, Family::Warn);
-        assert_eq!(Liveness::of(Some(S::Running), false), Liveness::LastSeen);
-        assert_eq!(Liveness::of(Some(S::Cancelling), true), Liveness::Cancelling);
-        assert_eq!(Liveness::of(Some(S::Done), false), Liveness::Done, "how it ended stays so");
-        assert_eq!(Liveness::of(None, true), Liveness::Started);
-        assert_eq!(Liveness::of(Some(S::Started), true), Liveness::Started, "a start only in the history is not running");
+        assert_eq!(Liveness::of(Some(S::Running), false, true), Liveness::LastSeen);
+        assert_eq!(Liveness::of(Some(S::Cancelling), true, true), Liveness::Cancelling);
+        assert_eq!(Liveness::of(Some(S::Done), false, true), Liveness::Done, "how it ended stays so");
+        assert_eq!(Liveness::of(None, true, true), Liveness::Started);
+        assert_eq!(Liveness::of(Some(S::Started), true, true), Liveness::Started, "a start only in the history is not running");
+        assert_eq!(Liveness::of(Some(S::Running), true, false), Liveness::Gone, "its session knows it no more");
+        assert_eq!(Liveness::of(Some(S::Running), true, true).cancelling(true), Liveness::Cancelling);
+        assert_eq!(Liveness::of(Some(S::Done), true, true).cancelling(true), Liveness::Done, "ended: a cancel too late changes nothing");
+        assert_eq!(Liveness::of_view("timed out"), Some(Liveness::TimedOut));
+        assert_eq!((Liveness::of_view("offline"), Liveness::of_view("connecting")), (Some(Liveness::Gone), None));
+        assert!(Liveness::Gone.ended() && !Liveness::LastSeen.ended() && !Liveness::Started.ended());
     }
 
     fn bar(n: &[usize], h: u32) -> Vec<(usize, u32, u32)> {

@@ -1,5 +1,5 @@
-//! The tray of workers over the composer (the TUI's subagent tray), and a
-//! worker's view's breadcrumb. One row per worker, in the grammar of the
+//! The tray of workers over the composer (the TUI's subagent tray), and
+//! the NEEDS YOU stub over a worker's view. One row per worker, in the grammar of the
 //! transcript's worker block (design.md §8.4): its state glyph, name, what
 //! it is doing (or ended with), tools and elapsed time, its state word; at
 //! most what
@@ -22,53 +22,14 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::{AppView, WORKER_KEY, column, display, mono, tbtn};
+use crate::app::{AppView, WORKER_KEY, column, display, mono};
 use crate::fonts::{self, label};
-use crate::glyph::{self, Ground};
+use crate::glyph::{self, Glyph, Ground};
 use crate::menu::At;
 use crate::subagents::{Live, Liveness, Status, fmt_secs};
 use crate::theme::{Metrics, Palette};
 use crate::watch::Candidate;
 use crate::wtabs::Who;
-
-/// A row's state mark (the tray lists the attached session's workers).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Mark {
-    /// Its start is all that is known: not running.
-    Started,
-    Run,
-    Cancelling,
-    Ok,
-    Failed,
-    TimedOut,
-    Cancelled,
-}
-
-impl Mark {
-    fn of(s: Status) -> Self {
-        match s {
-            Status::Cancelling => Mark::Cancelling,
-            Status::Done => Mark::Ok,
-            Status::Failed => Mark::Failed,
-            Status::TimedOut => Mark::TimedOut,
-            Status::Cancelled => Mark::Cancelled,
-            Status::Running => Mark::Run,
-            Status::Started => Mark::Started,
-        }
-    }
-
-    pub(crate) fn liveness(self) -> Liveness {
-        match self {
-            Mark::Started => Liveness::Started,
-            Mark::Run => Liveness::Running,
-            Mark::Cancelling => Liveness::Cancelling,
-            Mark::Ok => Liveness::Done,
-            Mark::Failed => Liveness::Failed,
-            Mark::TimedOut => Liveness::TimedOut,
-            Mark::Cancelled => Liveness::Cancelled,
-        }
-    }
-}
 
 /// One tray row, formatted once per change.
 #[derive(Clone, Debug)]
@@ -79,7 +40,8 @@ pub(crate) struct TrayRow {
     pub(crate) name: SharedString,
     /// Its call, if that call's own result named it ([`Who`]).
     pub(crate) call: Option<SharedString>,
-    pub(crate) mark: Mark,
+    /// The tray lists the attached session's workers: never as last seen.
+    pub(crate) live: Liveness,
     pub(crate) line: SharedString,
     pub(crate) facts: SharedString,
     pub(crate) watchable: bool,
@@ -89,10 +51,7 @@ pub(crate) struct TrayRow {
 impl TrayRow {
     /// `cancelling`: a cancel of it is on its way (its rows have not said
     /// so): its word says cancelling until it has stopped.
-    fn of(mut l: Live, cancelling: bool) -> Self {
-        if cancelling && l.status == Status::Running {
-            l.status = Status::Cancelling;
-        }
+    fn of(l: Live, cancelling: bool) -> Self {
         let mut facts = Vec::new();
         if let Some(n) = l.tools.filter(|&n| n > 0) {
             facts.push(format!("{n} tool{}", if n == 1 { "" } else { "s" }));
@@ -110,7 +69,7 @@ impl TrayRow {
             handle: format!("sa_{}", l.id).into(),
             name: l.name.into(),
             call: l.call,
-            mark: Mark::of(l.status),
+            live: Liveness::of(Some(l.status), true, true).cancelling(cancelling),
             line: l.line.into(),
             facts: facts.join(" · ").into(),
             watchable: l.watchable,
@@ -286,11 +245,11 @@ impl AppView {
         m: &Metrics,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let (g, _, word, family) = glyph::worker(r.mark.liveness());
+        let (g, _, word, family) = glyph::worker(r.live);
         let (word_color, mark) = glyph::ink(family, Ground::Run, p);
-        let line_color = match r.mark {
-            Mark::Failed => p.err,
-            Mark::Run | Mark::Cancelling => p.sub_status_t,
+        let line_color = match r.live {
+            Liveness::Failed => p.err,
+            Liveness::Running | Liveness::Cancelling => p.sub_status_t,
             _ => p.dim_t,
         };
         let who = Who::new(r.id, r.name.clone(), r.call.clone());
@@ -350,77 +309,67 @@ impl AppView {
             .into_any_element()
     }
 
-    /// A worker's view's breadcrumb: MAIN (back to the session) › its name
-    /// and handle · its state · its model, and how to get back. Formatted
-    /// when the worker changes ([`crate::watch::Worker`]'s strings).
-    pub(crate) fn render_crumb(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
-        let w = self.model.watch.focused()?;
+    /// The NEEDS YOU stub (design.md §8.17): the authorization card folded
+    /// to its header line, where the card docks, while a worker's view is
+    /// on screen (in place or in its tab) and its session waits on a prompt
+    /// (the card is never shown, nor answered, over a worker's view). One
+    /// target: it goes back to the session with the card up.
+    pub(crate) fn render_stub(&self, p: &Palette, m: &Metrics, cx: &Context<Self>) -> Option<impl IntoElement> {
+        if !self.stub_shown() {
+            return None;
+        }
         let lay = self.layout;
-        let form = lay.form();
-        let (word, color) = match w.state() {
-            "running" => ("running", p.run),
-            "completed" => ("completed · read-only", p.ok),
-            "connecting" => ("connecting", p.dim),
-            "failed" => ("failed · read-only", p.err),
-            "gone" => ("gone · read-only", p.dim),
-            "offline" => ("offline · read-only", p.dim),
-            "cancelled" => ("cancelled · read-only", p.warn),
-            "timed out" => ("timed out · read-only", p.warn),
-            _ => ("read-only", p.dim),
-        };
-        // The session waits on a prompt: its card is never shown (nor
-        // answered) over a worker's view; this says so and takes you there.
-        let waits = !self.model.transcript.pending_prompts().is_empty();
-        let needs = waits.then(|| {
-            h_flex()
-                .id("crumb-needs")
-                .h_full()
-                .flex_none()
-                .gap(px(8.))
-                .px(px(10.))
-                .items_center()
-                .border_l_2()
-                .border_color(p.warn_mark)
-                .cursor_pointer()
-                .hover(|d| d.bg(p.raised))
-                .child(display(label::NEEDS_YOU, 10.5, p.warn).flex_none())
-                .when(!lay.tight, |d| d.child(mono(w.needs.clone(), 12., p.warn).flex_none()))
-                .tooltip(|window, cx| {
-                    Tooltip::new("a prompt waits in this worker's session: answer it on the session's tab").build(window, cx)
-                })
-                .on_click(cx.listener(|this, _, _, cx| this.open_parent_card(cx)))
-        });
+        let gist = self.model.transcript.pending_prompts().first().map(|q| crate::chrome::prompt_gist(&q.title, &q.prompt));
+        let (word, mark) = glyph::ink(glyph::Family::Warn, Ground::Card, p);
         let row = h_flex()
-            .h(px(crate::fit::crumb_h(form) - 1.))
+            .id("needs-stub")
+            .group("needs-stub")
+            .debug_selector(|| "needs-stub".into())
+            .h(px(m.row))
+            .relative()
+            .pl(px(m.pad_x - 1.))
+            .pr(px(m.pad_x - 1.))
             .items_center()
-            .gap(px(10.))
             .whitespace_nowrap()
+            .bg(p.card)
+            .border_1()
+            .border_color(p.warn_mark)
+            .cursor_pointer()
+            .hover(|d| d.bg(p.card_hi))
+            .child(glyph::lead(Some(glyph::draw(Glyph::Needs, mark)), m))
+            .child(display(label::NEEDS_YOU, 12., word).flex_none())
             .child(
-                tbtn("crumb-main", label::MAIN, p.dim, p.ink)
-                    .on_click(cx.listener(|this, _, _, cx| this.leave_worker(false, cx)))
-                    .tooltip(|window, cx| Tooltip::new("back to the session · Esc").build(window, cx)),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .ml(px(12.))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .font_family(fonts::MONO)
+                    .text_size(px(m.meta))
+                    .text_color(p.prose_k)
+                    .when_some(gist.filter(|_| !lay.tight), |d, g| d.child(g)),
             )
-            .child(mono("›", 12., p.dim).flex_none())
-            .child(mono(w.crumb.clone(), 12., p.agent).flex_none().max_w(px(260.)).overflow_hidden().text_ellipsis())
-            .child(mono("·", 12., p.dim).flex_none())
-            .child(mono(word, 12., color).flex_none())
-            .when(!w.facts.is_empty() && !lay.tight, |d| {
-                d.child(mono("·", 12., p.dim).flex_none())
-                    .child(mono(w.facts.clone(), 12., p.dim).min_w_0().overflow_hidden().text_ellipsis())
-            })
-            .child(div().flex_1())
-            .children(needs)
-            // A worker tab shows its one worker: no walk.
-            .when(!lay.tight && !w.tabbed && !waits, |d| d.child(mono(WORKER_KEY, 11., p.dim).flex_none()));
-        Some(div().flex_none().bg(p.canvas).border_b_1().border_color(p.hair).child(column(lay, row)))
+            .child(div().flex_none().ml(px(12.)).child(glyph::reveal(glyph::GO, "needs-stub", "needs-stub", true, p.dim_k, p.ink)))
+            .tooltip(|window, cx| Tooltip::new("A prompt waits in this session: answer it there.").build(window, cx))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.open_parent_card(cx);
+                cx.notify();
+            }));
+        Some(column(lay, row).flex_none().pt(px(crate::fit::STUB_GAP)))
+    }
+
+    /// A worker's view is on screen and its session waits on a prompt.
+    pub(crate) fn stub_shown(&self) -> bool {
+        self.model.tabs.view().is_none() && self.model.watch.focus().is_some() && !self.model.transcript.pending_prompts().is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Mark, TrayRow};
+    use super::TrayRow;
     use crate::glyph::{self, Glyph};
-    use crate::subagents::{Live, Status};
+    use crate::subagents::{Live, Liveness, Status};
 
     fn live(status: Status, line: &str) -> Live {
         Live { id: 3, call: None, name: "quick".into(), status, line: line.into(), tools: Some(1), elapsed: Some(40.0), watchable: true }
@@ -428,7 +377,7 @@ mod tests {
 
     /// A row's glyph, word and step.
     fn shown(r: &TrayRow) -> (Glyph, &'static str, &str) {
-        let (g, _, word, _) = glyph::worker(r.mark.liveness());
+        let (g, _, word, _) = glyph::worker(r.live);
         (g, word, r.line.as_ref())
     }
 
@@ -437,7 +386,7 @@ mod tests {
     #[test]
     fn a_cancel_says_cancelling_until_the_rows_say_cancelled() {
         let r = TrayRow::of(live(Status::Running, "bash"), true);
-        assert_eq!((r.mark, shown(&r)), (Mark::Cancelling, (Glyph::Cancelling, "cancelling", "bash")));
+        assert_eq!((r.live, shown(&r)), (Liveness::Cancelling, (Glyph::Cancelling, "cancelling", "bash")));
         let r = TrayRow::of(live(Status::Cancelling, "bash"), false);
         assert_eq!(shown(&r), (Glyph::Cancelling, "cancelling", "bash"));
         let r = TrayRow::of(live(Status::Cancelled, ""), true);
@@ -452,8 +401,8 @@ mod tests {
     #[test]
     fn a_started_worker_is_not_drawn_running() {
         let r = TrayRow::of(live(Status::Started, ""), false);
-        assert_eq!((r.mark, shown(&r)), (Mark::Started, (Glyph::Idle, "started", "")));
-        let block = glyph::worker(crate::subagents::Liveness::of(Some(Status::Started), true));
-        assert_eq!(glyph::worker(r.mark.liveness()), block, "the tray row and the block agree");
+        assert_eq!((r.live, shown(&r)), (Liveness::Started, (Glyph::Idle, "started", "")));
+        let block = glyph::worker(Liveness::of(Some(Status::Started), true, true));
+        assert_eq!(glyph::worker(r.live), block, "the tray row and the block agree");
     }
 }

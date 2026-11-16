@@ -57,6 +57,10 @@ pub const TEXT: f64 = 4.5;
 pub const MARK: f64 = 3.0;
 /// The user and code surfaces stand at least this far off the canvas.
 pub const SURFACE: f64 = 1.10;
+/// A step up a surface (`raised` off the chrome, `card_hi` off the card).
+pub const STEP: f64 = 1.14;
+/// An overlay's outline and a control's on a card (`hybrid.html` `--line3`).
+pub const FRAME: f64 = 1.56;
 
 /// `#rrggbb` / `rrggbb` / `#rgb` / `rgb`, any case, surrounding space ignored.
 pub fn parse_hex(s: &str) -> Option<u32> {
@@ -307,7 +311,7 @@ roles! {
     // canvas, the user message and composer, code, a tool run and an opened
     // result, the permission card, a raised (selected) row on the chrome,
     // hairlines and input borders, diff line washes.
-    chrome, canvas, user, code, tool, tool_out, card, raised, hair, edge, add_bg, del_bg,
+    chrome, canvas, user, code, tool, tool_out, card, card_hi, raised, hair, edge, frame, add_bg, del_bg,
     // Text on the canvas.
     ink, prose, dim, you, agent, head, th, td, warn, run, ready, cost, err, well_fg,
     // On the user surface (a user message's markdown, the composer).
@@ -321,8 +325,9 @@ roles! {
     sub_name_t, sub_status_t, sub_time_t, sub_rule,
     // On an opened result and its diff lines.
     res, dim_o, think_o, ok_o, err_o,
-    // On the permission card.
-    prose_k, dim_k, warn_k, err_k,
+    // On the card (the permission card, the NEEDS YOU stub, overlays) and
+    // its hovered step: text, then marks.
+    prose_k, dim_k, warn_k, err_k, run_k, ok_k, run_mark_k, err_mark_k, rest_mark_k, focus_k,
     // Marks (3:1): the user's bar (on the canvas and user, and on a run:
     // the watched tray row), bullets, state glyphs and borders, focus, the
     // table rule, the two filled buttons.
@@ -395,7 +400,8 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     let tool = t.tool_input_bg.unwrap_or_else(|| step(canvas, t.claude_text, 1.14));
     let tool_out = t.tool_output_bg.unwrap_or_else(|| step(canvas, t.claude_text, 1.31));
     let card = step(chrome, ink, 1.32);
-    let raised = step(chrome, ink, 1.14);
+    let card_hi = step(card, ink, STEP);
+    let raised = step(chrome, ink, STEP);
     // Diff washes stand `SURFACE` off the result surface, as `user` and
     // `code` do off the canvas (design.md §1.6), mixed at most 30 % (the
     // most a built-in theme needs: solarized-dark's red), so a user theme
@@ -421,6 +427,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
         tool,
         tool_out,
         card,
+        card_hi,
         raised,
         hair: t.separator,
         edge: t.border,
@@ -431,7 +438,12 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     for (role, from, c) in [("add_bg", tool_out, add_bg), ("del_bg", tool_out, del_bg)] {
         f.log.push(Check { role, from, color: c, grounds: vec![tool_out], floor: SURFACE });
     }
-    r.ink = f.text("ink", ink, &[canvas, user, tool_out, chrome, raised, add_bg, del_bg]);
+    f.log.push(Check { role: "card_hi", from: card, color: card_hi, grounds: vec![card], floor: STEP });
+    // The composer foot's state is on `user` (design.md §4.4); the card's
+    // hovered rows on `card_hi`.
+    let k = [card, card_hi];
+    r.frame = f.at("frame", t.border, ink, &[card, card_hi, canvas, chrome, tool_out], FRAME);
+    r.ink = f.text("ink", ink, &[canvas, user, tool_out, chrome, raised, add_bg, del_bg, card, card_hi]);
     r.prose = f.text("prose", t.claude_text, &[canvas]);
     r.dim = f.text("dim", t.muted, &[canvas]);
     r.you = f.text("you", you, &[canvas]);
@@ -439,11 +451,11 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.head = f.text("head", t.heading_color, &[canvas]);
     r.th = f.text("th", t.table_header_color, &[canvas]);
     r.td = f.text("td", t.table_cell_color, &[canvas]);
-    r.warn = f.text("warn", t.warning_color, &[canvas, tool, tool_out]);
-    r.run = f.text("run", t.status_streaming, &[canvas, tool, tool_out]);
-    r.ready = f.text("ready", t.status_ready, &[canvas]);
+    r.warn = f.text("warn", t.warning_color, &[canvas, tool, tool_out, user]);
+    r.run = f.text("run", t.status_streaming, &[canvas, tool, tool_out, user]);
+    r.ready = f.text("ready", t.status_ready, &[canvas, user]);
     r.cost = f.text("cost", t.cost_color, &[canvas]);
-    r.err = f.text("err", t.error_color, &[canvas, tool, tool_out]);
+    r.err = f.text("err", t.error_color, &[canvas, tool, tool_out, user]);
     r.well_fg = f.text("well_fg", t.code_fg, &[canvas]);
     r.dim_u = f.text("dim_u", t.muted, &[user]);
     r.agent_u = f.text("agent_u", t.claude_label, &[user]);
@@ -462,7 +474,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.dim_t = f.text("dim_t", t.muted, &run_grounds);
     r.think = think(&mut f, "think", &run_grounds);
     r.arg = f.text("arg", t.tool_param, &run_grounds);
-    r.ok = f.text("ok", t.tool_result_ok, &run_grounds);
+    r.ok = f.text("ok", t.tool_result_ok, &[canvas, tool, tool_out]);
     // `draw.rs` `tool_accent()`: an unset `tool_*` derives from the palette.
     r.t_bash = f.text("t_bash", or(t.tool_bash, t.tool_result_ok), &run_grounds);
     r.t_read = f.text("t_read", or(t.tool_read, t.claude_label), &run_grounds);
@@ -483,16 +495,22 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.think_o = think(&mut f, "think_o", &[tool_out]);
     r.ok_o = f.text("ok_o", t.tool_result_ok, &[add_bg]);
     r.err_o = f.text("err_o", t.error_color, &[del_bg, tool_out]);
-    r.prose_k = f.text("prose_k", t.claude_text, &[card]);
-    r.dim_k = f.text("dim_k", t.muted, &[card]);
-    r.warn_k = f.text("warn_k", t.warning_color, &[card]);
-    r.err_k = f.text("err_k", t.error_color, &[card]);
+    r.prose_k = f.text("prose_k", t.claude_text, &k);
+    r.dim_k = f.text("dim_k", t.muted, &k);
+    r.warn_k = f.text("warn_k", t.warning_color, &k);
+    r.err_k = f.text("err_k", t.error_color, &k);
+    r.run_k = f.text("run_k", t.status_streaming, &k);
+    r.ok_k = f.text("ok_k", t.tool_result_ok, &k);
+    r.run_mark_k = f.mark("run_mark_k", t.status_streaming, &k);
+    r.err_mark_k = f.mark("err_mark_k", t.error_color, &k);
+    r.rest_mark_k = f.mark("rest_mark_k", t.muted, &k);
+    r.focus_k = f.mark("focus_k", focus, &k);
     r.you_mark = f.mark("you_mark", you, &[canvas, user]);
     r.you_mark_t = f.mark("you_mark_t", you, &run_grounds);
     r.bullet = f.mark("bullet", t.list_bullet_color, &[canvas]);
     // `tool_out` too: a run's open body and hovered rows (`glyph::ink`).
-    r.warn_mark = f.mark("warn_mark", t.warning_color, &[canvas, tool, tool_out, card]);
-    r.run_mark = f.mark("run_mark", t.status_streaming, &[canvas, tool, tool_out]);
+    r.warn_mark = f.mark("warn_mark", t.warning_color, &[canvas, tool, tool_out, user, card, card_hi]);
+    r.run_mark = f.mark("run_mark", t.status_streaming, &[canvas, tool, tool_out, user]);
     r.focus = f.mark("focus", focus, &[canvas, chrome]);
     r.tb2 = f.mark("tb2", t.table_border_color, &[canvas]);
     // A filled button's label is `bg`: the fill is lifted until it reads.
@@ -1303,7 +1321,7 @@ mod tests {
     /// colour moves with it.
     #[test]
     fn the_accent_colours_you_and_focus_only() {
-        let allowed = ["you", "you_mark", "you_mark_t", "btn_fill", "focus", "focus_ch", "open_ch", "you_bar"];
+        let allowed = ["you", "you_mark", "you_mark_t", "btn_fill", "focus", "focus_ch", "focus_k", "open_ch", "you_bar"];
         for (name, raw) in palettes::THEMES {
             let (a, base) = resolve(&raw, None);
             for &(_, accent) in PRESETS {
