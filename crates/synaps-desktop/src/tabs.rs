@@ -120,7 +120,9 @@ pub struct Tab {
     /// A worker tab's worker.
     pub worker: Option<WorkerRef>,
     /// A session tab left while its view showed a worker in place: that
-    /// worker's handle and name, shown again when the tab is.
+    /// worker's handle and name, shown again when the tab is. A hand-off,
+    /// taken when the tab comes back on screen ([`Tabs::take_watching`]),
+    /// never the view's live state.
     pub watching: Option<(String, String)>,
 }
 
@@ -149,8 +151,12 @@ impl Tab {
     }
 
     /// Its session is now `to` (a worker tab's draft key with it): the
-    /// draft keys that changed.
+    /// draft keys that changed. A hand-off of the session left goes: its
+    /// `sa_N` in `to` can be another worker.
     fn set_session(&mut self, to: &str) -> Option<(String, String)> {
+        if self.session.as_deref() != Some(to) {
+            self.watching = None;
+        }
         let moved = self.worker.as_mut().map(|w| {
             let from = std::mem::take(&mut w.key);
             *w = WorkerRef { call: w.call.take(), ..WorkerRef::new(to, &w.handle, &w.name) };
@@ -344,6 +350,12 @@ impl Tabs {
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id && t.kind == Kind::Session) {
             t.watching = worker;
         }
+    }
+
+    /// Session tab `id` is on screen again: what its view showed when it
+    /// was left, once (the view is the user's from here).
+    pub fn take_watching(&mut self, id: u64) -> Option<(String, String)> {
+        self.tabs.iter_mut().find(|t| t.id == id && t.kind == Kind::Session).and_then(|t| t.watching.take())
     }
 
     /// The id a tab followed `session` to (along a chain, S → S2 → S3),
@@ -1532,9 +1544,35 @@ mod tests {
         assert_eq!(t.current().unwrap().watching, None, "a worker tab shows its own worker only");
         t.focus(0);
         assert_eq!(t.current().unwrap().watching, Some(("sa_2".into(), "sleeper".into())));
+        // Taken once, when shown: the view is the user's from there.
+        assert_eq!(t.take_watching(id), Some(("sa_2".into(), "sleeper".into())));
+        assert_eq!(t.take_watching(id), None);
+        assert_eq!(t.take_watching(w), None, "a worker tab hands nothing off");
+        t.set_watching(id, Some(("sa_2".into(), "sleeper".into())));
         // Replaced by another session: its thread.
         t.open("b", "b", Place::Current);
         assert_eq!(t.current().unwrap().watching, None);
+    }
+
+    /// A session tab behind its worker's tab follows the session to a new
+    /// id (the worker tab's attach landed on `a2`): the worker it showed
+    /// in place was `a`'s, so it hands nothing off in `a2`.
+    #[test]
+    fn a_session_tab_that_follows_drops_its_hand_off() {
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::New);
+        let id = t.current().unwrap().id;
+        let scout = Some(("sa_1".to_string(), "scout".to_string()));
+        t.set_watching(id, scout.clone());
+        t.open_worker("a", "sa_3", "w", "a");
+        // The same session attached again: the hand-off stays.
+        t.attached("a");
+        assert_eq!(t.iter().find(|x| x.id == id).unwrap().watching, scout);
+        t.attached("a2");
+        let tab = t.iter().find(|x| x.id == id).unwrap();
+        assert_eq!(tab.session.as_deref(), Some("a2"), "it followed");
+        assert_eq!(tab.watching, None, "and handed nothing of `a` off");
+        assert_eq!(t.take_watching(id), None);
     }
 
     fn meta(id: &str, journal: &str) -> SessionMeta {
