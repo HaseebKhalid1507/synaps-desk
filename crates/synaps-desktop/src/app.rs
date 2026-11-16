@@ -3392,6 +3392,16 @@ impl AppView {
         panes.retain(|((h, g), _)| model.holds_view(h) && model.watch.generation_of(h) == Some(*g));
     }
 
+    /// The kept text views ([`turns::TextRows`]), and how many of them are
+    /// for no row of the list on screen (an item id whose text is not
+    /// theirs, nor theirs streamed on).
+    #[cfg(test)]
+    pub(crate) fn text_views(&self) -> (usize, usize) {
+        let texts = self.texts.borrow();
+        let stale = texts.kept().filter(|&(id, t)| !self.rows.iter().any(|r| r.id == id && r.text.starts_with(t.as_str()))).count();
+        (texts.kept().count(), stale)
+    }
+
     /// The list on screen gives way to another (a tab, a worker's view, a
     /// new transcript): a drag on its bar ends on it, its hold-back is
     /// dropped (it was this list's), and the text views kept for its rows
