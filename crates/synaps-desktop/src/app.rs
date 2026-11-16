@@ -565,10 +565,11 @@ impl FoldKeys {
     }
 }
 
-/// The card's answer keys, Enter and Esc, as every key-down and key-up in
-/// the window passes (the root's capture), whoever takes it: whether a
-/// key-down is a new press ([`FoldKeys`]). Only a new press answers a card
-/// ([`Arm::key`]): a key still down from before the card came, or from
+/// The card's answer keys, Enter and Esc, and Space (a worker menu's pick
+/// key, with Enter), as every key-down and key-up in the window passes
+/// (the root's capture), whoever takes it: whether a key-down is a new
+/// press ([`FoldKeys`]). Only a new press picks a menu item, or answers a
+/// card ([`Arm::key`]): a key still down from before the card came, or from
 /// before its keys armed, never does, until it has been let go and
 /// pressed again. The modifiers do not count: an Enter held, then Ctrl,
 /// is still the Enter held. On X11 a held key's first repeat comes after
@@ -578,6 +579,7 @@ impl FoldKeys {
 pub(crate) struct CardChord {
     enter: FoldKeys,
     escape: FoldKeys,
+    space: FoldKeys,
 }
 
 impl CardChord {
@@ -585,12 +587,13 @@ impl CardChord {
         match key {
             "enter" => Some(&mut self.enter),
             "escape" => Some(&mut self.escape),
+            "space" => Some(&mut self.space),
             _ => None,
         }
     }
 
     /// `key` went down at `now` (`held`: the platform says it is a repeat):
-    /// true for a new press of Enter or Esc.
+    /// true for a new press of Enter, Esc or Space.
     pub(crate) fn down(&mut self, key: &str, now: Instant, held: bool) -> bool {
         self.of(key).is_some_and(|k| k.press(now, held))
     }
@@ -1233,6 +1236,10 @@ pub struct AppView {
     /// The worker's view the list holds and its generation
     /// ([`crate::watch::Watch::focus_key`]).
     pane_of: Option<(String, u64)>,
+    /// Worker tabs' lists (rows, folds, heights, scroll) while another
+    /// thread of their session is on screen, by view and generation: back
+    /// as they were left, while the tab is open.
+    worker_panes: Vec<((String, u64), Pane)>,
     /// The next sync builds every row again (a worker's view came on).
     full_rebuild: bool,
     /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
@@ -1262,6 +1269,12 @@ pub struct AppView {
     /// open): given back once it closes, if nothing else took it.
     pub(crate) menu_focus_back: Option<FocusHandle>,
     pub(crate) cancel_tick: Option<Task<()>>,
+    /// An item was picked from the keyboard: that key's repeats, once the
+    /// menu is gone, are not the next thing's ([`AppView::menu_keydown`]).
+    pub(crate) menu_picked: bool,
+    /// A click opened a worker's tab: until then, a mouse-down that is the
+    /// rest of its double-click goes nowhere ([`crate::wtabs::MULTI_CLICK`]).
+    pub(crate) swallow_clicks: Option<Instant>,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -1600,6 +1613,7 @@ impl AppView {
             window_active: true,
             main_pane: None,
             pane_of: None,
+            worker_panes: Vec::new(),
             full_rebuild: false,
             watch_poll: None,
             visible: i.visible,
@@ -1612,6 +1626,8 @@ impl AppView {
             menu: None,
             menu_focus_back: None,
             cancel_tick: None,
+            menu_picked: false,
+            swallow_clicks: None,
             _tasks: Vec::new(),
             _subs: subs,
         }
@@ -1633,6 +1649,12 @@ impl AppView {
                     }
                     this.model.view_dirty = false;
                     for ev in batch {
+                        // A worker's menu means nothing across a reconnect
+                        // (a restarted daemon numbers its workers anew).
+                        if matches!(ev, Event::Attached { .. } | Event::Reattaching { .. }) && this.menu.is_some() {
+                            this.close_menu();
+                            this.model.view_dirty = true;
+                        }
                         for fx in this.model.apply(ev) {
                             this.effect(fx);
                         }
@@ -1640,6 +1662,9 @@ impl AppView {
                     this.start_tabs();
                     // An attach may have named or merged the visible tab.
                     this.reconcile(None);
+                    // The worker tab on screen: its handle may name another
+                    // worker now.
+                    this.disown_reused();
                     // A Welcome: the daemon's place and dash are looked for.
                     this.dash_on_welcome(cx);
                     // A worker's page came: its next poll, drawn or not.
@@ -1732,10 +1757,20 @@ impl AppView {
             self.placeholder_of = worker.map(|(h, s, t)| (h.to_string(), s.to_string(), t));
             self.composer.update(cx, |c, cx| c.set_placeholder(text, window, cx));
         }
-        // A refused steer's text, once the thread it is for is on screen.
-        if let Some((text, note)) = self.model.watch.take_unsent() {
-            self.effect(Effect::Restore(text));
-            self.watch_note = Some(note.into());
+        // Worker tabs that followed their session: their drafts with them.
+        for (from, to) in self.model.tabs.take_rekeys() {
+            self.drafts.rekey(&from, &to);
+        }
+        // A refused steer's text, once the thread it is for is on screen
+        // and the composer is that tab's (never in the frame of a switch:
+        // it would go to the tab left).
+        if self.composer_owned() {
+            if let Some((text, note)) = self.model.watch.take_unsent() {
+                self.effect(Effect::Restore(text));
+                self.watch_note = Some(note.into());
+            }
+        } else if self.model.watch.has_unsent() {
+            cx.notify();
         }
         // The visible tab went into the one holding its session: the
         // composer's text is that tab's now (the follow rule keeps it).
@@ -2006,16 +2041,25 @@ impl AppView {
     fn tab_watch(&mut self) {
         let Some(t) = self.model.tabs.current() else { return };
         let want = match (&t.worker, t.kind) {
-            (Some(w), crate::tabs::Kind::Worker) => Some((w.handle.clone(), w.name.clone(), true)),
-            _ => t.watching.clone().map(|(h, n)| (h, n, false)),
+            (Some(w), crate::tabs::Kind::Worker) => Some((w.handle.clone(), w.name.clone(), w.call.clone(), true)),
+            _ => t.watching.clone().map(|(h, n)| (h, n, None, false)),
         };
         match want {
-            Some((handle, name, tab)) => {
-                if self.model.watch.focus() == Some(handle.as_str()) && self.model.watch.in_tab() == tab {
+            Some((handle, name, call, tab)) => {
+                let Some(id) = handle.strip_prefix("sa_").and_then(|n| n.parse().ok()) else { return };
+                let c = crate::watch::Candidate::of(id, &name).with_call(call.as_deref());
+                // A worker tab whose handle names another worker now: its
+                // view is gone, never that worker's.
+                let reused = tab && self.tab_worker_reused();
+                if self.model.watch.focus() == Some(handle.as_str())
+                    && self.model.watch.in_tab() == tab
+                    && (reused || self.model.watch.focused_is(&c))
+                {
+                    if reused {
+                        self.disown_reused();
+                    }
                     return;
                 }
-                let Some(id) = handle.strip_prefix("sa_").and_then(|n| n.parse().ok()) else { return };
-                let c = crate::watch::Candidate::of(id, &name);
                 let cwd = self.model.cwd().map(str::to_string);
                 if tab {
                     self.model.watch.open_tab(&c, cwd.as_deref(), Instant::now());
@@ -2023,6 +2067,9 @@ impl AppView {
                     self.model.watch.open(&c, cwd.as_deref(), Instant::now());
                 }
                 self.watch_opened();
+                if reused {
+                    self.disown_reused();
+                }
             }
             None if self.model.watch.focus().is_some() => self.model.watch.focus_main(),
             None => {}
@@ -3196,9 +3243,18 @@ impl AppView {
         }
         let want = want.map(|(h, g)| (h.to_string(), g));
         let left = self.take_pane();
-        if self.pane_of.is_none() {
-            self.main_pane = Some(left);
+        match self.pane_of.take() {
+            None => self.main_pane = Some(left),
+            // A worker tab's: kept for when it is shown again.
+            Some(k) if self.model.holds_view(&k.0) => {
+                self.worker_panes.retain(|(w, _)| *w != k);
+                self.worker_panes.push((k, left));
+            }
+            Some(_) => {}
         }
+        // Only while its tab is open and its view is the same one.
+        let (model, panes) = (&self.model, &mut self.worker_panes);
+        panes.retain(|((h, g), _)| model.holds_view(h) && model.watch.generation_of(h) == Some(*g));
         match (&want, self.main_pane.take()) {
             (None, Some(main)) => {
                 let stale = main.metrics_gen != self.metrics_gen;
@@ -3209,10 +3265,22 @@ impl AppView {
             }
             // Never: the session's list is always kept. Built again.
             (None, None) => self.full_rebuild = true,
-            (Some(_), main) => {
+            (Some(k), main) => {
                 self.main_pane = main;
-                self.rows_session = self.model.active.as_ref().map(|a| a.session_id.clone());
-                self.full_rebuild = true;
+                match self.worker_panes.iter().position(|(w, _)| w == k) {
+                    Some(i) => {
+                        let (_, pane) = self.worker_panes.swap_remove(i);
+                        let stale = pane.metrics_gen != self.metrics_gen;
+                        self.put_pane(pane);
+                        if stale {
+                            self.list.remeasure();
+                        }
+                    }
+                    None => {
+                        self.rows_session = self.model.active.as_ref().map(|a| a.session_id.clone());
+                        self.full_rebuild = true;
+                    }
+                }
             }
         }
         self.pane_of = want;
@@ -4287,6 +4355,8 @@ impl Render for AppView {
         let ex = crate::fit::Extras { crumb: self.model.watch.focus().is_some(), ..ex };
         let tray_n = if view.is_none() { self.tray.rows.len() } else { 0 };
         self.tray_rows = crate::fit::tray_rows(&m, lay.form(), self.height, card_shown, ex, tray_n);
+        // A keyboard menu over a row no longer drawn closes.
+        self.close_orphan_menu();
         let ex = crate::fit::Extras { tray: self.tray_rows as u8, ..ex };
         let rows = crate::fit::composer_rows(&m, lay.form(), self.height, card_shown, ex);
         if rows != self.composer_rows {
@@ -4358,11 +4428,25 @@ impl Render for AppView {
         h_flex()
             .id("root")
             .track_focus(&self.focus)
+            // A click opened a worker's tab: the rest of its double-click
+            // is not the tab's (it would fold a row there, say).
+            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| match this.swallow_clicks {
+                Some(until) if ev.click_count > 1 && Instant::now() < until => cx.stop_propagation(),
+                Some(_) => this.swallow_clicks = None,
+                None => {}
+            }))
             // Esc closes the picker, wherever the focus is; in find it clears
             // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                // Every Enter and Esc, whoever takes it ([`CardChord`]).
+                // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
                 this.chord_press = this.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
+                // A menu item picked from the keyboard: that key's repeats
+                // go nowhere (a held Enter on Steer… would send the draft).
+                if std::mem::take(&mut this.menu_picked) && matches!(ev.keystroke.key.as_str(), "enter" | "space") && !this.chord_press {
+                    this.menu_picked = true;
+                    cx.stop_propagation();
+                    return;
+                }
                 // The letter as the key or as what it types: a binding matches
                 // either (a "Dvorak – QWERTY ⌘" layout on macOS).
                 let k_is = |k: OnceKey| {
@@ -4376,11 +4460,18 @@ impl Render for AppView {
                     return this.once_key(k, ev.is_held, cx);
                 }
                 // A worker's context menu takes the keys while it is open.
-                if this.menu.is_some() && this.menu_keydown(&ev.keystroke.key, window, cx) {
+                if this.menu.is_some() && this.menu_keydown(&ev.keystroke, this.chord_press, window, cx) {
                     cx.stop_propagation();
                     return;
                 }
-                if crate::wtabs::is_menu_key(&ev.keystroke) && this.model.tabs.view().is_none() {
+                // The worker menu from the keyboard: from the session's
+                // thread or a worker's (the composer, the view), never over
+                // the accent picker or the find field.
+                if crate::wtabs::is_menu_key(&ev.keystroke)
+                    && this.model.tabs.view().is_none()
+                    && !this.picker_open
+                    && (this.focus.is_focused(window) || this.composer.read(cx).focus_handle(cx).is_focused(window))
+                {
                     cx.stop_propagation();
                     this.menu_key(window, cx);
                     return;
@@ -5366,8 +5457,16 @@ mod tests {
         assert_eq!(w.steer_target(), Some(Ok("sa_3".into())));
         w.steer_sent("sa_3", "look in crates/relay too");
         w.leave_on_esc(t0);
-        let done =
-            Live { id: 3, name: "scout".into(), status: Status::Done, line: String::new(), tools: None, elapsed: None, watchable: true };
+        let done = Live {
+            id: 3,
+            call: None,
+            name: "scout".into(),
+            status: Status::Done,
+            line: String::new(),
+            tools: None,
+            elapsed: None,
+            watchable: true,
+        };
         w.prune(t0, &[done]);
         assert!(w.worker("sa_3").is_none(), "its view has gone");
         assert!(w.steer_refused("scout (sa_3) is not running"));
