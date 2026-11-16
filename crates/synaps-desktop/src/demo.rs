@@ -56,7 +56,7 @@ fn sessions(now: i64, settled: bool) -> Vec<SessionMeta> {
             "state_since": ago(4), "created_at": ago(90),
             "roster": [{"id": 2, "name": "desktop", "kind": "rpc", "mode": "mirror", "attached_at_ms": 0}]}),
         json!({"id": "20261113-161706-a1b9", "title": "Idle CPU: hybrid against main", "model": sonnet, "cwd": "/home/you/work/synaps-desktop",
-            "lifecycle": "parked", "messages": 44, "cost_usd": 0.88, "state_since": ago(38), "evict_due": rfc3339(now + 22 * 60),
+            "lifecycle": "parked", "messages": 64, "cost_usd": 0.88, "state_since": ago(38), "evict_due": rfc3339(now + 22 * 60),
             "created_at": ago(120)}),
         json!({"id": "20261113-035512-77c2", "name": "ingest-core", "title": "Migrate ingest workers to async", "model": sonnet,
             "cwd": "/home/you/work/ingest", "busy": true, "awaiting_input": 2, "cost_usd": 1.45, "lifecycle": "live", "messages": 31,
@@ -244,7 +244,8 @@ fn messages() -> Vec<Value> {
     ]
 }
 
-/// [`IDLE_CPU`]'s history: two finished turns whose runs fold.
+/// [`IDLE_CPU`]'s history: three finished turns whose runs fold, the last
+/// one with ten tools (more than its tally bar draws).
 fn idle_cpu() -> Vec<Value> {
     let p = |f: &str| format!("/home/you/work/synaps-desktop/crates/synaps-desktop/src/{f}");
     let mut out =
@@ -366,6 +367,101 @@ fn idle_cpu() -> Vec<Value> {
         None,
     );
     out.push(json!({"role": "assistant", "content": [{"type": "text", "text": "Committed. The bench matches main: 143 fps streaming, 2 dropped."}]}));
+    out.push(
+        json!({"role": "user", "content": "One more pass: anything else that asks for frames while idle? Note what you find in the docs."}),
+    );
+    let ok = |out: &mut Vec<Value>, id: &str, name: &str, input: Value, result: &str| call(out, id, name, input, result, false, None);
+    call(
+        &mut out,
+        "toolu_k01",
+        "grep",
+        json!({"pattern": "request_animation_frame", "path": p("")}),
+        "chart.rs:88:            window.request_animation_frame();",
+        false,
+        Some("Every other frame request first."),
+    );
+    ok(
+        &mut out,
+        "toolu_k02",
+        "read",
+        json!({"path": p("chart.rs")}),
+        "    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window) {\n…",
+    );
+    ok(&mut out, "toolu_k03", "find", json!({"pattern": "*.rs", "path": p("")}), "app.rs\nbench.rs\nchart.rs\ntray.rs\n…");
+    ok(&mut out, "toolu_k04", "ls", json!({"path": p("")}), "app.rs  bench.rs  chart.rs  demo.rs  tray.rs  …");
+    ok(
+        &mut out,
+        "toolu_k05",
+        "bash",
+        json!({"command": "cargo test -p synaps-desktop chart -- --nocapture"}),
+        "running 14 tests\n…\n[output truncated at 30000 chars]",
+    );
+    ok(
+        &mut out,
+        "toolu_k06",
+        "ext__github__search_code",
+        json!({"q": "request_animation_frame language:rust repo:zed-industries/zed"}),
+        "3 results: gpui/src/window.rs, …",
+    );
+    ok(
+        &mut out,
+        "toolu_k07",
+        "ext__web_tools__fetch",
+        json!({"url": "https://docs.rs/gpui/latest/gpui/struct.Window.html"}),
+        "request_animation_frame: schedules a frame for the window, once.",
+    );
+    ok(&mut out, "toolu_k08", "read", json!({"path": p("app.rs")}), "    fn on_usage(&mut self, cx: &mut Context<Self>) {\n…");
+    ok(
+        &mut out,
+        "toolu_k09",
+        "edit",
+        json!({"path": p("chart.rs"),
+        "old_string": "            window.request_animation_frame();\n",
+        "new_string": "            // Drawn once per change of its data: no frame asked for.\n"}),
+        "Edited chart.rs",
+    );
+    ok(
+        &mut out,
+        "toolu_k10",
+        "bash",
+        json!({"command": "cargo build --release -p synaps-desktop"}),
+        "Finished `release` profile [optimized] target(s)",
+    );
+    ok(&mut out, "toolu_k11", "grep", json!({"pattern": "request_animation_frame", "path": p("")}), "(no matches)");
+    ok(
+        &mut out,
+        "toolu_k12",
+        "edit",
+        json!({"path": "/home/you/work/synaps-desktop/docs/bench/README.md",
+        "old_string": "## Idle\n", "new_string": "## Idle\n\nNo view asks for a frame while nothing changes.\n"}),
+        "Edited README.md",
+    );
+    ok(
+        &mut out,
+        "toolu_k13",
+        "write",
+        json!({"path": "/home/you/work/synaps-desktop/docs/idle.md",
+        "content": "# Idle\n\nFrames are drawn on a change only.\nTimers: the tray's flash, the session poll.\n"}),
+        "Wrote docs/idle.md",
+    );
+    ok(
+        &mut out,
+        "toolu_k14",
+        "todo_write",
+        json!({"todos": [{"content": "chart: no frame request", "status": "done"}, {"content": "docs: idle", "status": "done"}]}),
+        "Updated 2 todos",
+    );
+    ok(&mut out, "toolu_k15", "read", json!({"path": "/home/you/work/synaps-desktop/docs/idle.md"}), "# Idle\n…");
+    ok(&mut out, "toolu_k16", "bash", json!({"command": idle}), "synaps-desktop: frames/15s=0 cpu_ticks=1 rss_kb=183812");
+    ok(
+        &mut out,
+        "toolu_k17",
+        "bash",
+        json!({"command": "git commit -am 'Chart: no frame request; docs: idle'"}),
+        "[fix/idle 9b3e1a0] Chart: no frame request; docs: idle",
+    );
+    out.push(json!({"role": "assistant", "content": [{"type": "text",
+        "text": "The usage chart asked for a frame on every paint; now it draws once per change. Idle stays at 0 frames. The chart test run hit the output limit, so I left its log alone."}]}));
     out
 }
 
@@ -521,8 +617,9 @@ mod tests {
             assert_eq!(m.transcript.busy(), s.busy, "{}", s.id);
         }
         assert!(attach("20990101-000000-ffff", 1).is_empty());
-        // The parked one's turns are over: both runs fold, one with a
-        // failed call, each with an edit.
+        // The parked one's turns are over: its runs fold, one with a
+        // failed call, each with an edit, the last with ten tools; the
+        // rail's count is its history's.
         let mut m = Model::new(ConnState::Off("offline".into()));
         m.attaching(1, None, false);
         m.asked_for(IDLE_CPU);
@@ -537,7 +634,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(runs, [8, 4]);
+        assert_eq!(runs, [8, 4, 17]);
+        let listed = sessions(now, true).into_iter().find(|s| s.id == IDLE_CPU).map(|s| s.messages);
+        assert_eq!(listed, Some(idle_cpu().len()));
     }
 
     /// `--offline` answers `saved_sessions` through the same path as a

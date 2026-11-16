@@ -221,7 +221,8 @@ fn main() {
     let restore_tabs = load(tabs_key.as_deref()).or_else(|| load(legacy_key.as_deref()));
 
     diag::mark("before_application");
-    gpui_kit::application().run(move |cx| {
+    // The assets: the stroked glyphs' sprites (`glyph::Sprites`).
+    gpui_kit::application().with_assets(glyph::Sprites).run(move |cx| {
         diag::mark("app_run_callback");
         gpui_kit::init(cx);
         diag::mark("kit_init_done");
