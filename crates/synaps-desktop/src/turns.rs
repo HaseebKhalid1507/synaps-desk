@@ -205,6 +205,12 @@ impl<V> TextRows<V> {
     pub(crate) fn pending(&self) -> bool {
         !self.waiting.is_empty()
     }
+
+    /// The kept views' rows: item id and text.
+    #[cfg(test)]
+    pub(crate) fn kept(&self) -> impl Iterator<Item = (u64, &SharedString)> {
+        self.kept.iter().map(|(&id, k)| (id, &k.text))
+    }
 }
 
 /// A transcript list asks `rows` whether a row's layout is its height.
