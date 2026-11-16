@@ -120,7 +120,9 @@ pub struct Tab {
     /// A worker tab's worker.
     pub worker: Option<WorkerRef>,
     /// A session tab left while its view showed a worker in place: that
-    /// worker's handle and name, shown again when the tab is.
+    /// worker's handle and name, shown again when the tab is. A hand-off,
+    /// taken when the tab comes back on screen ([`Tabs::take_watching`]),
+    /// never the view's live state.
     pub watching: Option<(String, String)>,
 }
 
@@ -344,6 +346,12 @@ impl Tabs {
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id && t.kind == Kind::Session) {
             t.watching = worker;
         }
+    }
+
+    /// Session tab `id` is on screen again: what its view showed when it
+    /// was left, once (the view is the user's from here).
+    pub fn take_watching(&mut self, id: u64) -> Option<(String, String)> {
+        self.tabs.iter_mut().find(|t| t.id == id && t.kind == Kind::Session).and_then(|t| t.watching.take())
     }
 
     /// The id a tab followed `session` to (along a chain, S → S2 → S3),
@@ -1532,6 +1540,11 @@ mod tests {
         assert_eq!(t.current().unwrap().watching, None, "a worker tab shows its own worker only");
         t.focus(0);
         assert_eq!(t.current().unwrap().watching, Some(("sa_2".into(), "sleeper".into())));
+        // Taken once, when shown: the view is the user's from there.
+        assert_eq!(t.take_watching(id), Some(("sa_2".into(), "sleeper".into())));
+        assert_eq!(t.take_watching(id), None);
+        assert_eq!(t.take_watching(w), None, "a worker tab hands nothing off");
+        t.set_watching(id, Some(("sa_2".into(), "sleeper".into())));
         // Replaced by another session: its thread.
         t.open("b", "b", Place::Current);
         assert_eq!(t.current().unwrap().watching, None);

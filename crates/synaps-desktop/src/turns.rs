@@ -526,6 +526,48 @@ pub(crate) struct Tally {
     pub n: usize,
     pub n_text: SharedString,
     pub hue: Hue,
+    /// The characters of its name and count (mono: its width, without layout).
+    pub chars: usize,
+}
+
+/// How many of `tally`'s tools a folded run's summary names in `avail` px
+/// of mono text (`cw` px a character): each `name n` (a character's gap
+/// between), `gap` apart. All of them, or as many as fit with the `+N`
+/// that ends the row (N: the calls of the tools not named, so the counts
+/// shown add up to the summary's `n tools`); none if not even one does.
+pub(crate) fn tally_fit(tally: &[Tally], avail: f32, cw: f32, gap: f32) -> usize {
+    let w = |t: &Tally| (t.chars + 1) as f32 * cw;
+    let all = tally.iter().map(w).sum::<f32>() + gap * tally.len().saturating_sub(1) as f32;
+    if all <= avail {
+        return tally.len();
+    }
+    let mut rest = tally.iter().map(|t| t.n).sum::<usize>();
+    let (mut used, mut k) = (0., 0);
+    for t in tally {
+        rest -= t.n;
+        let item = w(t) + if k > 0 { gap } else { 0. };
+        let tail = gap + (1 + digits(rest)) as f32 * cw;
+        if used + item + tail > avail {
+            break;
+        }
+        used += item;
+        k += 1;
+    }
+    k
+}
+
+fn digits(n: usize) -> usize {
+    n.checked_ilog10().map_or(1, |l| l as usize + 1)
+}
+
+/// `+N`, the end of a tally cut short: static for the counts a fold
+/// usually hides (no string a frame), formatted past them.
+fn plus(n: usize) -> SharedString {
+    const PLUS: [&str; 25] = [
+        "+0", "+1", "+2", "+3", "+4", "+5", "+6", "+7", "+8", "+9", "+10", "+11", "+12", "+13", "+14", "+15", "+16", "+17", "+18", "+19",
+        "+20", "+21", "+22", "+23", "+24",
+    ];
+    PLUS.get(n).map_or_else(|| format!("+{n}").into(), |&p| p.into())
 }
 
 /// What a folded run's summary says: `› 7 tools  bash 3  read 3  grep 1 …`
@@ -549,6 +591,9 @@ pub(crate) struct RunSummary {
     pub counts: Counts,
     /// Its worst outcome's glyph ([`glyph::worst`]).
     pub worst: (Glyph, Family),
+    /// The whole tally, a tool a line (`bash 4`, `read 3`, …): the tooltip
+    /// of one cut short, as narrow as its longest name.
+    pub tip: SharedString,
     /// Nothing when every call is done (the glyph alone); else each count
     /// that is not zero, worst first as [`glyph::worst`] ranks them, so the
     /// glyph sits by its own word: `1 failed`, `1 stopped`, `5 ok`.
@@ -579,14 +624,16 @@ impl RunSummary {
             }
             match tally.iter_mut().find(|t| t.name == row.name) {
                 Some(t) => t.n += 1,
-                None => tally.push(Tally { name: row.name.clone(), n: 1, n_text: SharedString::default(), hue: row.hue }),
+                None => tally.push(Tally { name: row.name.clone(), n: 1, n_text: SharedString::default(), hue: row.hue, chars: 0 }),
             }
         }
         // Stable: equal counts keep their first-use order.
         tally.sort_by_key(|a| std::cmp::Reverse(a.n));
         for t in &mut tally {
             t.n_text = t.n.to_string().into();
+            t.chars = t.name.chars().count() + t.n_text.len();
         }
+        let tip = tally.iter().map(|t| format!("{} {}", t.name, t.n)).collect::<Vec<_>>().join("\n").into();
         let parts = [
             (failed, "failed", Family::Err),
             (denied, "denied", Family::Err),
@@ -612,8 +659,36 @@ impl RunSummary {
             delta,
             counts: Counts::of(delta),
             worst: glyph::worst(failed + denied, stopped, cancelled),
+            tip,
             outcome,
         }
+    }
+
+    /// Its trail's width at `meta` px (mono), as [`AppView::render_summary`]
+    /// lays it out: counts · glyph, then (not `tight`) the words, `·`
+    /// between, every part 8 px apart.
+    pub(crate) fn trail_w(&self, meta: f32, tight: bool) -> f32 {
+        let cw = 0.6 * meta;
+        let chars = |t: &SharedString| t.chars().count() as f32 * cw;
+        let (mut w, mut parts) = (self.worst.0.size(), 1);
+        let counts = [&self.counts.written, &self.counts.added, &self.counts.removed];
+        let shown = counts.iter().filter(|c| c.is_some()).count();
+        if shown > 0 {
+            // The counts (8 apart), and a `·`.
+            w += counts.iter().filter_map(|c| c.as_ref()).map(chars).sum::<f32>() + 8. * (shown - 1) as f32 + cw;
+            parts += 2;
+        }
+        if !tight {
+            for (i, (text, _)) in self.outcome.iter().enumerate() {
+                if i > 0 {
+                    w += cw;
+                    parts += 1;
+                }
+                w += chars(text);
+                parts += 1;
+            }
+        }
+        w + 8. * (parts - 1) as f32
     }
 }
 
@@ -823,15 +898,31 @@ impl AppView {
     fn render_summary(&self, d: Disp, open: bool, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
         let id = d.id;
         let Some(s) = self.summaries.get(id) else { return div().into_any_element() };
-        let mut tally = h_flex().flex_1().min_w_0().gap(px((14. * m.r).round())).overflow_hidden().whitespace_nowrap();
-        for t in &s.tally {
+        // The tally names what fits (mono: measured without layout), then
+        // `+N`; the whole of it in the tooltip.
+        let tight = self.layout.tight;
+        let (cw, gap) = (m.mono * 0.6, (14. * m.r).round());
+        let avail =
+            self.layout.column - 2. * m.pad_x - m.lead - 2. * m.run_gap - s.label.chars().count() as f32 * cw - s.trail_w(m.meta, tight);
+        // A pixel's slack for the shaper's rounding.
+        let named = tally_fit(&s.tally, avail - 1., cw, gap);
+        let mut tally = h_flex().id(("tally", id)).flex_1().min_w_0().gap(px(gap)).overflow_hidden().whitespace_nowrap();
+        for t in &s.tally[..named] {
             tally = tally.child(
                 h_flex()
                     .flex_none()
-                    .gap(px(m.mono * 0.6))
+                    .gap(px(cw))
                     .child(div().text_color(t.hue.color(p)).child(t.name.clone()))
                     .child(div().text_color(p.dim_t).child(t.n_text.clone())),
             );
+        }
+        if named < s.tally.len() {
+            if named > 0 {
+                let rest = s.tally[named..].iter().map(|t| t.n).sum();
+                tally = tally.child(div().flex_none().text_color(p.dim_t).child(plus(rest)));
+            }
+            let tip = s.tip.clone();
+            tally = tally.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx));
         }
         let (worst, family) = s.worst;
         let dot = || div().text_color(p.dim_t).child("·");
@@ -842,7 +933,7 @@ impl AppView {
             .text_size(px(m.meta))
             .when_some(s.counts.element(p), |d, c| d.child(c).child(dot()))
             .child(glyph::draw(worst, glyph::ink(family, Ground::Run, p).1));
-        if !self.layout.tight {
+        if !tight {
             for (i, (text, family)) in s.outcome.iter().enumerate() {
                 if i > 0 {
                     trail = trail.child(dot());
@@ -1193,8 +1284,8 @@ mod tests {
     use synaps_client::transcript::ItemKind;
 
     use super::{
-        Counts, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, TextRows, Who,
-        build, diff, text_lines, turn_start,
+        Counts, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, Tally, TextRows,
+        Who, build, diff, digits, plus, tally_fit, text_lines, turn_start,
     };
     use crate::files::{CallDelta, Ledger};
     use crate::subagents::Subagents;
@@ -1391,6 +1482,44 @@ mod tests {
         assert_eq!(s.label.as_ref(), "5 tools");
         assert_eq!(outcome(&s), [("1 failed", Family::Err), ("4 ok", Family::Ok)], "worst first: by its glyph");
         assert_eq!(s.worst, (Glyph::Failed, Family::Err));
+        assert_eq!(s.tip.as_ref(), "bash 3\nread 2");
+        assert_eq!(s.tally.iter().map(|t| t.chars).collect::<Vec<_>>(), [5, 5]);
+        // The trail at 10 px (6 a character): ✕ 10, `1 failed` 48, `·` 6,
+        // `4 ok` 24, 8 apart; tight, the glyph alone.
+        assert_eq!(s.trail_w(10., false), 10. + 48. + 6. + 24. + 3. * 8.);
+        assert_eq!(s.trail_w(10., true), 10.);
+    }
+
+    /// A tally names what fits and ends with `+N`, N the calls of the
+    /// tools it does not name: the counts on the row add up to its
+    /// `n tools`. Mono, so the widths are arithmetic: 6 px a character.
+    #[test]
+    fn a_tally_cut_short_names_what_fits_and_counts_the_rest() {
+        let tal = |name: &str, n: usize| Tally {
+            name: name.to_string().into(),
+            n,
+            n_text: n.to_string().into(),
+            hue: Hue::of(name),
+            chars: name.len() + digits(n),
+        };
+        let t = [tal("bash", 4), tal("read", 3), tal("grep", 2), tal("edit", 2), tal("find", 1), tal("ls", 1), tal("glob", 1)];
+        // `name n` is (chars + 1)·6: 36 each, `ls 1` 24; 14 apart.
+        let all = 6. * 36. + 24. + 6. * 14.;
+        assert_eq!(tally_fit(&t, all, 6., 14.), 7, "it all fits: no +N");
+        // A pixel short: `glob 1` gives way to `+1` (14 + 2·6 = 26 px).
+        assert_eq!(tally_fit(&t, all - 1., 6., 14.), 6);
+        // `bash 4` and `+10` (14 + 3·6) need 68 px; with `read 3` (50)
+        // the tail is `+7` (26): 112.
+        assert_eq!(tally_fit(&t, 111., 6., 14.), 1);
+        assert_eq!(tally_fit(&t, 112., 6., 14.), 2);
+        assert_eq!(tally_fit(&t, 67., 6., 14.), 0, "not even one: the label alone, the tally in the tooltip");
+        assert_eq!(tally_fit(&[], 0., 6., 14.), 0);
+        let named = tally_fit(&t, all - 1., 6., 14.);
+        let shown = t[..named].iter().map(|t| t.n).sum::<usize>();
+        let rest = t[named..].iter().map(|t| t.n).sum::<usize>();
+        assert_eq!((shown, rest, shown + rest), (13, 1, 14));
+        assert_eq!((plus(1).as_ref(), plus(10).as_ref(), plus(30).as_ref()), ("+1", "+10", "+30"));
+        assert_eq!((digits(0), digits(9), digits(10), digits(123)), (1, 1, 2, 3));
     }
 
     /// The `Ok` glyph alone only when every call finished normally; else
