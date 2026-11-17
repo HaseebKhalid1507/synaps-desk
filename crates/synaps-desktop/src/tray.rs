@@ -114,6 +114,9 @@ impl TrayRow {
     }
 }
 
+/// A worker's step in the workers menu, at most (the menu is 360 px at most).
+const MENU_STEP: usize = 24;
+
 /// Which chips go first, so `+N more` never folds away a worker that
 /// needs a look while a quiet one is drawn (finish gate r2): failed (or
 /// timed out), then the watched one, then running (cancelling, started)
@@ -498,7 +501,8 @@ impl AppView {
         let items: Vec<crate::menu::Item<u64>> = self.tray.rows[self.tray_drawn().min(self.tray.rows.len())..]
             .iter()
             .map(|r| {
-                let item = crate::menu::Item::new(r.id, format!("{}  {} · {}", r.name, glyph::worker(r.live).2, chip_step(r)));
+                let item =
+                    crate::menu::Item::new(r.id, format!("{}  {} · {}", r.name, glyph::worker(r.live).2, cut(chip_step(r), MENU_STEP)));
                 if r.watchable { item } else { item.off(r.tip.clone()) }
             })
             .collect();
@@ -639,7 +643,8 @@ impl AppView {
                 .cursor_pointer()
                 .hover(|d| d.bg(p.tool_out))
                 .child(mono(format!("+{} more", chips.more), m.meta, p.dim_t))
-                .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
+                // Its menu open: the menu says it (no tooltip over it).
+                .when(self.wmenu.is_none(), |d| d.tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)))
                 .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| this.open_workers_menu(ev.position(), window, cx)));
             if let Some(at) = lines.get_mut(chips.more_line.min(chips.lines - 1)) {
                 at.push(more.into_any_element());
