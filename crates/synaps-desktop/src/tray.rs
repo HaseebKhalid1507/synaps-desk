@@ -65,6 +65,8 @@ pub(crate) struct TrayRow {
     pub(crate) tick: Option<(SharedString, crate::subagents::Tick)>,
     pub(crate) watchable: bool,
     pub(crate) tip: SharedString,
+    /// A re-attach's demoted start ([`glyph::steady`]).
+    pub(crate) demoted: bool,
 }
 
 impl TrayRow {
@@ -95,6 +97,7 @@ impl TrayRow {
             tick,
             watchable: l.watchable,
             tip: tip.into(),
+            demoted: l.demoted,
         }
     }
 }
@@ -374,7 +377,7 @@ impl AppView {
                     g,
                     mark,
                     p.tool,
-                    self.fx.change(Tag::TrayGlyph, r.id, crate::turns::glyph_code(g), None),
+                    self.fx.change(Tag::TrayGlyph, r.id, crate::turns::glyph_code(glyph::worker(glyph::steady(r.live, r.demoted)).0), None),
                     None,
                     false,
                 )),
@@ -429,7 +432,7 @@ impl AppView {
             .px(px(m.pad_x))
             .items_center()
             .whitespace_nowrap()
-            .text_size(px(m.meta))
+            .text_px(m.meta)
             .child(glyph::lead(Some(glyph::draw(g, mark)), m))
             .child(
                 h_flex()
@@ -523,6 +526,7 @@ mod tests {
             elapsed: Some(40.0),
             tick: None,
             watchable: true,
+            demoted: false,
         }
     }
 
