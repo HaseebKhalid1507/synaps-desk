@@ -444,6 +444,22 @@ pub(crate) struct Link {
     pub restore: Option<Instant>,
 }
 
+/// A worker tab opened from a row by the pointer (§6.2): the tracer, a
+/// 2 × 24 px line in `you_bar` from where it was opened to the new tab's
+/// top edge over `base` `out`; then the tab's bar draws left to right over
+/// `quick`. Full only.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Tracer {
+    pub tab: u64,
+    pub from: gpui_kit::Point<gpui_kit::Pixels>,
+    pub at: Instant,
+    /// The tab's top-left corner in the window, once the strip laid it out.
+    pub to: Option<gpui_kit::Point<gpui_kit::Pixels>>,
+}
+
+/// The tracer's line: its length.
+pub(crate) const TRACER_LEN: f32 = 24.;
+
 /// The tear's two frames (§5.3): 60 ms, then 40.
 pub(crate) const TEAR: [Duration; 2] = [Duration::from_millis(60), Duration::from_millis(40)];
 

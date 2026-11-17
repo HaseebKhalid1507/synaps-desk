@@ -1523,6 +1523,11 @@ pub struct AppView {
     /// connection cell's tear offset this frame.
     pub(crate) link: crate::motion::Link,
     pub(crate) conn_dy: f32,
+    /// A worker tab opened this frame (its id), the tracer to it, and where
+    /// the tab strip was painted last.
+    pub(crate) tracer_open: Option<u64>,
+    pub(crate) tracer: Option<crate::motion::Tracer>,
+    pub(crate) strip_at: std::rc::Rc<std::cell::Cell<Point<Pixels>>>,
     view_seen: Option<(u64, theme::Choice)>,
     pub(crate) window_active: bool,
     /// The session's list while a worker's view is shown, and the worker
@@ -2073,6 +2078,9 @@ impl AppView {
             seg_places: Default::default(),
             link: Default::default(),
             conn_dy: 0.,
+            tracer_open: None,
+            tracer: None,
+            strip_at: Default::default(),
             view_seen: None,
             window_active: true,
             main_pane: None,
@@ -5846,6 +5854,13 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.rescope(self.motion_session(), self.motion_column());
+        // A worker tab opened by the pointer: the tracer from it (§6.2).
+        if let Some(tab) = self.tracer_open.take()
+            && self.fx.level() == crate::motion::Level::Full
+            && !window.last_input_was_keyboard()
+        {
+            self.tracer = Some(crate::motion::Tracer { tab, from: window.mouse_position(), at: self.fx.now(), to: None });
+        }
         if self.menu.is_none()
             && self.smenu.is_none()
             && self.wmenu.is_none()
@@ -6441,6 +6456,7 @@ impl Render for AppView {
             .children(self.render_session_menu(&p, cx))
             .children(self.render_workers_menu(&p, cx))
             .children(self.render_link(tear, &p))
+            .children(self.render_tracer(&p))
             // Painted last, after every row was rendered: what the frame's
             // motion asked for (a frame, the one timer, or nothing; with a
             // beat layer, it arms the timer after painting the beat).

@@ -639,6 +639,7 @@ impl AppView {
         if self.model.tabs.open_worker_as(&session, &handle, &who.name, who.call.as_deref(), &label) {
             self.model.rail_gen += 1;
             self.reconcile(None);
+            self.tracer_open = self.model.tabs.current().map(|t| t.id);
         }
         cx.notify();
     }
