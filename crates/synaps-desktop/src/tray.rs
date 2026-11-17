@@ -126,11 +126,14 @@ impl AppView {
     pub(crate) fn sync_tray(&mut self, cx: &mut Context<Self>) {
         let attached = self.model.active.is_some();
         let now = Instant::now();
+        // Arrivals and fades on the motion clock, as every motion reads it
+        // (tests: the test's own).
+        let fx_now = self.fx.clock();
         // A left row's fade is over (or motion went off): the dock
         // shrinks, in one frame.
         let gone = motion::exit(motion::QUICK);
         let on = self.fx.on();
-        self.tray.ghosts.retain(|g| on && now.saturating_duration_since(g.2) < gone);
+        self.tray.ghosts.retain(|g| on && fx_now.saturating_duration_since(g.2) < gone);
         // Cancels the rows now say are cancelling (or ended) are done.
         if let Some(s) = self.model.active.as_ref().map(|a| a.session_id.as_str()) {
             let subs = &self.model.stats.subagents;
@@ -176,11 +179,11 @@ impl AppView {
         if self.fx.on() && session.is_some() && session == self.tray.session {
             let fresh = rows.iter().filter(|r| !self.tray.rows.iter().any(|o| o.id == r.id));
             for (k, r) in fresh.enumerate() {
-                self.fx.born(TRAY | r.id, now + motion::stagger(k));
+                self.fx.born(TRAY | r.id, fx_now + motion::stagger(k));
             }
             for (slot, r) in self.tray.rows.iter().enumerate() {
                 if !rows.iter().any(|n| n.id == r.id) {
-                    ghosts.push((slot, r.clone(), now));
+                    ghosts.push((slot, r.clone(), fx_now));
                 }
             }
         } else {
