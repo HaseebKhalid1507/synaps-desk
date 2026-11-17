@@ -912,7 +912,8 @@ mod tests {
     #[test]
     fn the_bar_paints_from_the_palette() {
         let src = include_str!("scrollbar.rs");
-        let code = &src[..src.find("#[cfg(test)]\nmod tests").expect("the tests")];
+        // (A Windows checkout has CRLF line ends.)
+        let code = &src[..src.find("mod tests {").expect("the tests")];
         let reads = code.matches("crate::theme::palette(cx)").count();
         assert!(reads >= 2, "the hide and the show read the palette ({reads})");
         for raw in ["Scheme", ".roles", "colors.", "cx.theme()"] {
