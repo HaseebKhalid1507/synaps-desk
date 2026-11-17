@@ -141,6 +141,23 @@ fn no_opacity_outside_charts() {
     assert_eq!(lifts, 1, "motion::lift sets opacity once");
 }
 
+/// No gradients anywhere (polish.md: "No gradients anywhere, on any card
+/// or control"; finish gate 6): flat fills only, and no shadow on a card.
+#[test]
+fn no_gradients_anywhere() {
+    let bad: Vec<String> = sources()
+        .into_iter()
+        .filter(|(name, _)| name != "style_tests.rs")
+        .flat_map(|(name, code)| {
+            ["linear_gradient", "LinearColorStop", "radial_gradient", ".shadow(", "box_shadow("]
+                .into_iter()
+                .flat_map(|g| code.match_indices(g).map(|(at, _)| format!("{name}:{} {g}", line_of(&code, at))).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(bad.is_empty(), "a gradient or a shadow:\n{}", bad.join("\n"));
+}
+
 /// One overlay box (design.md §8.9): every tooltip is built by
 /// `overlay.rs`, on `card` with its `frame`.
 #[test]
