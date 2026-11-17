@@ -385,9 +385,10 @@ pub(crate) struct Motion {
     /// Whose state is remembered: the session's (id and attach) and the
     /// column's (the session's thread or a worker's view) ([`Motion::rescope`]).
     scope: Cell<(u64, u64)>,
-    /// Tests move the clock with the executor's ([`Motion::clock`]).
+    /// Tests move the clock with the executor's ([`Motion::clock`]): the
+    /// clock's offset from the wall clock, in signed nanoseconds.
     #[cfg(test)]
-    skew: Cell<Duration>,
+    skew: Cell<i128>,
     /// Tests: the OS in low power ([`Motion::low_power`]).
     #[cfg(test)]
     pub(crate) force_low_power: Cell<bool>,
@@ -428,7 +429,7 @@ impl Motion {
             fold: Cell::new(None),
             scope: Cell::new((0, 0)),
             #[cfg(test)]
-            skew: Cell::new(Duration::ZERO),
+            skew: Cell::new(0),
             #[cfg(test)]
             force_low_power: Cell::new(false),
         }
@@ -501,16 +502,24 @@ impl Motion {
 
     /// The time (tests: moved on with the test executor's clock).
     pub(crate) fn clock(&self) -> Instant {
+        let now = Instant::now();
         #[cfg(test)]
-        return Instant::now() + self.skew.get();
-        #[cfg(not(test))]
-        Instant::now()
+        let now = {
+            let (s, d) = (self.skew.get(), Duration::from_nanos(self.skew.get().unsigned_abs() as u64));
+            if s >= 0 { now + d } else { now - d }
+        };
+        now
     }
 
-    /// Tests: the clock moves on `d` (as the executor's does).
+    /// Tests: the clock reads `at` now (then runs on with the wall clock).
+    /// A test's beat sets it a millisecond at a time with the executor's,
+    /// so a slow runner's wall time doesn't run the beat ahead of the
+    /// executor's timers.
     #[cfg(test)]
-    pub(crate) fn skew(&self, d: Duration) {
-        self.skew.set(self.skew.get() + d);
+    pub(crate) fn set_clock(&self, at: Instant) {
+        let now = Instant::now();
+        let s = if at >= now { at.duration_since(now).as_nanos() as i128 } else { -(now.duration_since(at).as_nanos() as i128) };
+        self.skew.set(s);
     }
 
     /// A frame starts (the root's render): the clock, the level, and what

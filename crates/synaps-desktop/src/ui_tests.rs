@@ -1570,11 +1570,13 @@ fn a_running_bar_blooms_until_it_settles(cx: &mut TestAppContext) {
 
 /// One beat goes by: the motion clock and the executor's move on together,
 /// a millisecond at a time (the one timer fires when it is due, as it
-/// would), and what it drew settles.
+/// would), and what it drew settles. The motion clock is set at each step,
+/// not moved on: the wall time a slow runner spends in a step never adds up.
 fn beat(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     let ms = std::time::Duration::from_millis(1);
-    for _ in 0..crate::motion::BEAT.as_millis() {
-        view.read_with(cx, |v, _| v.fx.skew(ms));
+    let t0 = view.read_with(cx, |v, _| v.fx.clock());
+    for k in 1..=crate::motion::BEAT.as_millis() as u32 {
+        view.read_with(cx, |v, _| v.fx.set_clock(t0 + ms * k));
         cx.executor().advance_clock(ms);
         cx.run_until_parked();
     }
