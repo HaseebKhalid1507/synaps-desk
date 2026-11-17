@@ -2143,9 +2143,10 @@ impl Motion {
         }
         if sweeps {
             // 30 Hz while a sweep is on screen (polish.md P2), on the
-            // shared grid; the beat's own frames are on it too.
-            let next = self.epoch + Duration::from_nanos((DECAY_TICK.as_nanos() * (tick as u128 + 1)) as u64);
-            self.beat_next.set(Some(self.beat_next.get().map_or(next, |b| b.min(next))));
+            // shared grid. The spinners ride its ticks (each samples the
+            // beat it is in, at most a tick late): 30 paints a second, not
+            // 30 and the beats between them.
+            self.beat_next.set(Some(self.epoch + Duration::from_nanos((DECAY_TICK.as_nanos() * (tick as u128 + 1)) as u64)));
         }
         if !self.display.get() {
             self.arm(cx, app, layer);
@@ -2156,6 +2157,10 @@ impl Motion {
     /// frame, the layer with it) or the beat's (only the layer).
     fn arm(&self, cx: &mut App, app: EntityId, layer: EntityId) {
         let target = match (self.next.get(), self.beat_next.get()) {
+            // The app's change and the layer's within a hair (a clock's
+            // second and the 30 Hz grid's 30th tick, 10 ns apart): one wake,
+            // the app's (its frame paints the layer too).
+            (Some(a), Some(b)) if a.max(b).saturating_duration_since(a.min(b)) < Duration::from_millis(2) => Some((a.max(b), Wake::App)),
             (Some(a), Some(b)) if b < a => Some((b, Wake::Beat)),
             (Some(a), _) => Some((a, Wake::App)),
             (None, Some(b)) => Some((b, Wake::Beat)),
