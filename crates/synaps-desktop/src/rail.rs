@@ -1,11 +1,13 @@
-//! The sessions rail without GPUI: each row's state, the three groups
-//! (PINNED, OPEN, HISTORY), the history buckets, find and the count chips,
-//! and the hover readout's lines. Built when the lists change, never per
-//! frame; a frame reads the result (`chrome.rs`).
+//! The sessions rail without GPUI: each row's state, the groups
+//! (FAVOURITES, PINNED, OPEN, HISTORY), the history buckets, find and the
+//! count chips, and the hover readout's lines. Built when the lists change,
+//! never per frame; a frame reads the result (`chrome.rs`).
 //!
-//! Where the daemon holds a session decides its group; what it is doing
-//! decides its glyph, first match wins (see [`State`]). A row never moves
-//! because its state changed: OPEN is ordered by `created_at`.
+//! A favourite (the desktop's own bookmark, [`crate::favourites`]) shows in
+//! FAVOURITES only, in the order it was favourited; otherwise where the
+//! daemon holds a session decides its group. What it is doing decides its
+//! glyph, first match wins (see [`State`]). A row never moves because its
+//! state changed: OPEN is ordered by `created_at`.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -13,6 +15,7 @@ use std::sync::Arc;
 use synaps_client::SavedSession;
 use synaps_client::protocol::SessionMeta;
 
+use crate::favourites::{Favourite, Source};
 use crate::fonts::label;
 use crate::model::Model;
 use crate::named::{ResumeRequest, RowAction, home_short, parse_rfc3339, relative, short_model};
@@ -229,11 +232,23 @@ pub struct Row {
     /// A saved row's state (a held row's is read per frame).
     pub state: State,
     pub action: RowAction,
+    /// A favourite's row: its index in [`Model::favs`].
+    pub fav: Option<usize>,
+    /// A favourite whose journal a resume did not find: GONE, with Remove.
+    pub gone: bool,
+    /// The daemon pins it (a favourite's row shows the pin mark: it is not
+    /// in PINNED).
+    pub pinned: bool,
 }
 
 /// One line of the rail's list.
 #[derive(Clone, Debug)]
 pub enum Item {
+    /// FAVOURITES' head: it folds, as a bucket does.
+    Favs {
+        open: bool,
+        count: Arc<str>,
+    },
     Group {
         group: Group,
         count: Arc<str>,
@@ -265,6 +280,8 @@ pub struct View {
     pub open: u8,
     /// Buckets showing all their rows (`+ N MORE` was clicked).
     pub expanded: u8,
+    /// FAVOURITES folded to its head.
+    pub favs_closed: bool,
 }
 
 /// The rail, built.
@@ -289,8 +306,20 @@ enum History {
     Listed,
 }
 
+/// A held session's row key (by its live id).
 pub fn key_of(id: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut h);
+    h.finish()
+}
+
+/// A journal's row key (a saved session, a favourite nothing holds): never
+/// a held row's, though a live id may be a journal id too (a session
+/// created as `J` keeps its live id `J` after `/clear` or a compaction gives
+/// it another journal, and `J` is listed, or a favourite, apart).
+fn saved_key(id: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "journal".hash(&mut h);
     id.hash(&mut h);
     h.finish()
 }
@@ -356,6 +385,7 @@ fn live_row(m: &Model, i: usize, now: i64) -> Row {
         },
     };
     let since = s.state_since.as_deref().or(Some(s.created_at.as_str()).filter(|c| !c.is_empty()));
+    let fav = m.fav_of(s);
     Row {
         key: key_of(&s.id),
         live: Some(i),
@@ -368,6 +398,42 @@ fn live_row(m: &Model, i: usize, now: i64) -> Row {
         fresh: s.messages == 0 && name.is_none() && title_text.is_none(),
         state: State::Idle,
         action: RowAction::Attach(s.id.clone()),
+        fav,
+        gone: false,
+        // Only a favourite's row says so: PINNED itself does.
+        pinned: s.pinned && fav.is_some(),
+    }
+}
+
+/// A favourite nothing holds: its listing's entry if the lists have it,
+/// else its snapshot (an old one the newest-first listing no longer
+/// reaches still shows, and resumes by its journal id in its folder).
+fn fav_row(m: &Model, ix: usize, f: &Favourite, entry: Option<SavedRef>, now: i64) -> Row {
+    let cwd = f.cwd.as_deref().filter(|c| !c.is_empty());
+    let (sub, sub_mono) = match cwd {
+        Some(c) => (home_short(c), true),
+        None => (f.model.as_deref().map(short_model).unwrap_or_default(), true),
+    };
+    Row {
+        key: saved_key(&f.id),
+        live: None,
+        saved: entry,
+        title: arc(f.label.as_str()),
+        named: f.named,
+        sub: arc(sub),
+        sub_mono,
+        age: arc(f.updated_at.as_deref().map(|t| relative(t, now)).unwrap_or_default()),
+        fresh: false,
+        state: m.fav_state(f),
+        action: RowAction::Resume(ResumeRequest {
+            label: f.label.clone(),
+            target: f.id.clone(),
+            cwd: cwd.map(str::to_string),
+            by_name: false,
+        }),
+        fav: Some(ix),
+        gone: f.is_gone(),
+        pinned: false,
     }
 }
 
@@ -376,7 +442,7 @@ fn saved_row(m: &Model, r: SavedRef, v: &SavedSession, now: i64) -> Row {
     let name = named(&v.name);
     let title = name.or(v.title.as_deref().filter(|t| !t.is_empty())).unwrap_or(&v.id);
     Row {
-        key: key_of(&v.id),
+        key: saved_key(&v.id),
         live: None,
         saved: Some(r),
         title: arc(title),
@@ -392,6 +458,9 @@ fn saved_row(m: &Model, r: SavedRef, v: &SavedSession, now: i64) -> Row {
             cwd: v.cwd.clone().filter(|c| !c.is_empty()),
             by_name: false,
         }),
+        fav: None,
+        gone: false,
+        pinned: false,
     }
 }
 
@@ -425,12 +494,17 @@ pub fn build(m: &Model, view: &View, now: i64) -> Rail {
     let mut rail = Rail::default();
     let filtering = !view.find.is_empty() || view.chip.is_some();
 
-    // PINNED by name, OPEN by created_at (the model keeps the list in that
-    // order); a session that is ending is gone.
+    // FAVOURITES in the order they were favourited, each where the daemon
+    // has it now: held (its live row), else listed or remembered.
     let held = |s: &SessionMeta| s.lifecycle != "ending";
-    let mut pinned: Vec<usize> = (0..m.sessions.len()).filter(|&i| m.sessions[i].pinned && held(&m.sessions[i])).collect();
+    let favs = fav_items(m, view, now, &mut rail);
+    // PINNED by name, OPEN by created_at (the model keeps the list in that
+    // order); a session that is ending is gone; a favourite is in
+    // FAVOURITES only.
+    let other = |i: &usize| held(&m.sessions[*i]) && !favs.contains(i);
+    let mut pinned: Vec<usize> = (0..m.sessions.len()).filter(|&i| m.sessions[i].pinned).filter(other).collect();
     pinned.sort_by_cached_key(|&i| (m.sessions[i].label().to_lowercase(), m.sessions[i].id.clone()));
-    let open: Vec<usize> = (0..m.sessions.len()).filter(|&i| !m.sessions[i].pinned && held(&m.sessions[i])).collect();
+    let open: Vec<usize> = (0..m.sessions.len()).filter(|&i| !m.sessions[i].pinned).filter(other).collect();
     for (group, ids) in [(Group::Pinned, pinned), (Group::Open, open)] {
         let shown: Vec<usize> = ids
             .into_iter()
@@ -498,10 +572,76 @@ pub fn build(m: &Model, view: &View, now: i64) -> Rail {
     rail
 }
 
+/// FAVOURITES: hidden when there are none (or, filtering, none match);
+/// folded to its head when closed (not while filtering, as a bucket), but
+/// a favourite that needs you or is running stays under it: it is in no
+/// other group, and the rail is where those are seen. Returns the held
+/// sessions it has (shown or not): no other group lists them.
+fn fav_items(m: &Model, view: &View, now: i64, rail: &mut Rail) -> Vec<usize> {
+    let mut held = Vec::new();
+    if m.favs.is_empty() {
+        return held;
+    }
+    let filtering = !view.find.is_empty() || view.chip.is_some();
+    let n = &m.named;
+    // Each shown row, and whether it stays when folded.
+    let mut rows = Vec::new();
+    for (ix, f) in m.favs.list.iter().enumerate() {
+        let live = m.sessions.iter().position(|s| s.lifecycle != "ending" && f.is(Source::Live(s)));
+        let row = match live {
+            Some(i) => {
+                held.push(i);
+                let s = &m.sessions[i];
+                let shows = view.chip.is_none_or(|c| m.chip_shows(c, s))
+                    && found(
+                        &view.find,
+                        [s.name.as_deref(), s.title.as_deref(), s.cwd.as_deref(), shown_id(&s.id, s.name.as_deref(), s.title.as_deref())],
+                    );
+                shows.then(|| (live_row(m, i, now), busy(m, s)))
+            }
+            None => {
+                let entry = n
+                    .recent
+                    .iter()
+                    .position(|v| f.is(Source::Saved(v)))
+                    .map(SavedRef::Recent)
+                    .or_else(|| n.saved.iter().position(|v| f.is(Source::Saved(v))).map(SavedRef::Named));
+                let st = m.fav_state(f);
+                if st == State::Unread {
+                    rail.history_unread += 1;
+                }
+                let name = f.named.then_some(f.label.as_str());
+                let shows = view.chip.is_none_or(|c| c.admits(st))
+                    && found(&view.find, [name, Some(f.label.as_str()), f.cwd.as_deref(), (f.label == f.id).then_some(f.id.as_str())]);
+                shows.then(|| (fav_row(m, ix, f, entry, now), false))
+            }
+        };
+        rows.extend(row);
+    }
+    if rows.is_empty() && filtering {
+        return held;
+    }
+    let open = filtering || !view.favs_closed;
+    rail.items.push(Item::Favs { open, count: arc(rows.len().to_string()) });
+    for (row, busy) in rows {
+        if open || busy {
+            rail.rows.push(row);
+            rail.items.push(Item::Row(rail.rows.len() - 1));
+        }
+    }
+    held
+}
+
+/// A held session needs you or runs (a folded FAVOURITES still shows it).
+pub fn busy(m: &Model, s: &SessionMeta) -> bool {
+    [Chip::NeedsYou, Chip::Running].into_iter().any(|c| m.chip_shows(c, s))
+}
+
 fn history_items(m: &Model, view: &View, now: i64, rail: &mut Rail) {
     let n = &m.named;
     let filtering = !view.find.is_empty() || view.chip.is_some();
-    let all = history(m);
+    // A favourite is in FAVOURITES only.
+    let all: Vec<_> = history(m).into_iter().filter(|(_, v, _)| !m.favs.contains(Source::Saved(v))).collect();
     // The oldest time listed: buckets wholly newer than it are complete.
     let horizon = n.recent_truncated.then(|| all.iter().filter(|e| named(&e.1.name).is_none()).filter_map(|e| e.2).min()).flatten();
     let mut buckets: [Vec<(SavedRef, &SavedSession)>; 5] = Default::default();
@@ -583,6 +723,7 @@ pub fn item_key(rail: &Rail, item: &Item) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     std::mem::discriminant(item).hash(&mut h);
     match item {
+        Item::Favs { open, count } => (open, count).hash(&mut h),
         Item::Group { group, count } => (group, count).hash(&mut h),
         Item::Row(i) | Item::Hist(i) => rail.rows[*i].key.hash(&mut h),
         Item::Bucket { bucket, open, count } => (bucket, open, count).hash(&mut h),
@@ -685,6 +826,30 @@ pub fn readout_live(m: &Model, s: &SessionMeta, now: i64) -> Readout {
     Readout { title: named(&s.name).or(s.title.as_deref().filter(|t| !t.is_empty())).unwrap_or(&s.id).to_string(), lines }
 }
 
+/// A favourite nothing holds, as remembered (the listing does not reach
+/// it, or it is gone).
+pub fn readout_fav(m: &Model, f: &Favourite, now: i64) -> Readout {
+    let mut lines = Vec::new();
+    let (value, aside) = match m.fav_state(f) {
+        _ if f.is_gone() => ("gone", "a resume found no journal for it; Remove takes it off this list"),
+        State::Opening => ("opening", "resume sent, waiting for the daemon"),
+        State::Unread => ("unread", "saved · its last turn ended while you were elsewhere"),
+        _ => ("saved", "a click resumes it in its folder"),
+    };
+    lines.push((label::R_STATE, value.to_string(), aside.to_string()));
+    if let Some(u) = f.updated_at.as_deref() {
+        lines.push((label::R_UPDATED, format!("{} ago", relative(u, now)).replace("now ago", "now"), "as last listed".into()));
+    }
+    if let Some(model) = f.model.as_deref().filter(|m| !m.is_empty()) {
+        lines.push((label::R_MODEL, short_model(model), String::new()));
+    }
+    if let Some(c) = f.cwd.as_deref().filter(|c| !c.is_empty()) {
+        lines.push((label::R_CWD, home_short(c), String::new()));
+    }
+    lines.push((label::R_ID, f.id.clone(), String::new()));
+    Readout { title: f.label.clone(), lines }
+}
+
 /// A saved session's readout.
 pub fn readout_saved(m: &Model, v: &SavedSession, now: i64) -> Readout {
     let mut lines = Vec::new();
@@ -767,6 +932,7 @@ mod tests {
         rail.items
             .iter()
             .map(|i| match i {
+                Item::Favs { open, count } => format!("[Favs{} {count}]", if *open { "" } else { "+" }),
                 Item::Group { group, count } => format!("[{group:?} {count}]"),
                 Item::Row(r) => format!("row {}", rail.rows[*r].title),
                 Item::Bucket { bucket, open, count } => format!("{} {bucket:?} {count}", if *open { "-" } else { "+" }),
@@ -780,6 +946,533 @@ mod tests {
 
     fn view(open: u8) -> View {
         View { open, ..View::default() }
+    }
+
+    /// The favourites' scene: held (one pinned, one with no journal id
+    /// yet), one listed in TODAY, one too old for the capped listing (its
+    /// snapshot only), favourited in that order: p2, t3, deep, o1.
+    fn fav_scene() -> Model {
+        use crate::favourites::{Favourite, Source};
+        let sessions = json!([
+            {"id": "o1", "lifecycle": "live", "created_at": at(600), "title": "Older open", "cwd": "/home/u/o1"},
+            {"id": "o2", "lifecycle": "live", "created_at": at(60), "title": "Newest open"},
+            {"id": "p2", "lifecycle": "live", "created_at": at(5), "name": "zulu", "pinned": true, "journal_id": "j-p2"},
+            {"id": "p1", "lifecycle": "parked", "created_at": at(9000), "name": "alpha", "pinned": true},
+        ]);
+        let mut recent = Vec::new();
+        for i in 0..10 {
+            recent.push(json!({"id": format!("t{i}"), "title": format!("today {i}"), "cwd": "/home/u/t", "updated_at": at(3600 + i), "live": false}));
+        }
+        // The daemon cut the newest list: j-deep is older than its last.
+        let mut m = model(sessions, json!([]), Value::Array(recent), true);
+        let now = 1;
+        m.favs.toggle(Source::Live(&m.sessions.iter().find(|s| s.id == "p2").unwrap().clone()), now);
+        let t3 = m.named.recent.iter().find(|v| v.id == "t3").unwrap().clone();
+        m.favs.toggle(Source::Saved(&t3), now);
+        let deep: SavedSession = serde_json::from_value(
+            json!({"id": "j-deep", "title": "Deep history", "cwd": "/home/u/deep", "model": "anthropic/claude-opus-4-1", "updated_at": at(400 * 86_400)}),
+        )
+        .unwrap();
+        m.favs.list.push(Favourite::of(Source::Saved(&deep), now));
+        m.favs.toggle(Source::Live(&m.sessions.iter().find(|s| s.id == "o1").unwrap().clone()), now);
+        assert!(m.favs.list[3].provisional, "o1 has no journal id yet");
+        m.sync_favs();
+        m
+    }
+
+    fn keys_once(rail: &Rail) {
+        let mut seen = std::collections::HashSet::new();
+        for i in &rail.items {
+            if let Item::Row(r) | Item::Hist(r) = i {
+                assert!(seen.insert(rail.rows[*r].key), "{} is listed twice", rail.rows[*r].title);
+            }
+        }
+    }
+
+    /// Brief 4: FAVOURITES leads the rail in the order the user favourited,
+    /// each favourite there only (not in PINNED, OPEN or HISTORY), with its
+    /// real state; the pinned one keeps the pin mark; the one the capped
+    /// listing no longer reaches renders from its snapshot and resumes by
+    /// its journal id in its folder.
+    #[test]
+    fn favourites_lead_the_rail_and_show_only_there() {
+        let m = fav_scene();
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+        let s = shape(&rail);
+        assert_eq!(
+            s[..9],
+            [
+                "[Favs 4]",
+                "row zulu",
+                "row today 3",
+                "row Deep history",
+                "row Older open",
+                "[Pinned 1]",
+                "row alpha",
+                "[Open 1]",
+                "row Newest open"
+            ]
+        );
+        assert_eq!(s[9], "[History 9+]");
+        assert!(!s.iter().any(|r| r == "  today 3"), "{s:?}");
+        keys_once(&rail);
+        let row = |t: &str| rail.rows.iter().find(|r| &*r.title == t).unwrap();
+        assert!(row("zulu").pinned && row("zulu").live.is_some(), "held: the live row, with the pin mark");
+        assert_eq!(row("zulu").fav, Some(0));
+        assert!(!row("alpha").pinned, "PINNED needs no mark");
+        let deep = row("Deep history");
+        assert_eq!((deep.live, deep.saved, deep.fav, deep.gone), (None, None, Some(2), false));
+        assert_eq!((&*deep.sub, deep.state), ("/home/u/deep", State::Saved));
+        assert_eq!(deep.age.as_ref(), relative(&at(400 * 86_400), NOW));
+        let RowAction::Resume(req) = &deep.action else { panic!("{:?}", deep.action) };
+        assert_eq!((req.target.as_str(), req.cwd.as_deref(), req.by_name), ("j-deep", Some("/home/u/deep"), false));
+        assert!(matches!(row("today 3").saved, Some(SavedRef::Recent(_))), "listed: its entry (the readout)");
+        // No favourites: no group.
+        let mut m = m;
+        m.favs = Default::default();
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+        assert_eq!(shape(&rail)[..3], ["[Pinned 2]", "row alpha", "row zulu"]);
+        assert!(shape(&rail).contains(&"  today 3".to_string()));
+    }
+
+    /// Brief 8: a favourite's row never moves for a state change: running,
+    /// needs you, unread, parked, or resumed from history under a new live
+    /// id; the live id is upgraded to the journal id once it comes.
+    #[test]
+    fn favourites_keep_their_order_across_state_changes() {
+        let mut m = fav_scene();
+        let order = |m: &Model| -> Vec<String> {
+            let rail = build(m, &view(Bucket::DEFAULT_OPEN), NOW);
+            keys_once(&rail);
+            let end = rail.items.iter().position(|i| matches!(i, Item::Group { .. })).unwrap();
+            rail.items[1..end].iter().map(|i| if let Item::Row(r) = i { rail.rows[*r].title.to_string() } else { panic!() }).collect()
+        };
+        let want = ["zulu", "today 3", "Deep history", "Older open"];
+        assert_eq!(order(&m), want);
+        let base = json!([
+            {"id": "o1", "lifecycle": "live", "created_at": at(600), "title": "Older open", "busy": true, "journal_id": "j-o1"},
+            {"id": "o2", "lifecycle": "live", "created_at": at(60), "title": "Newest open"},
+            {"id": "p2", "lifecycle": "parked", "created_at": at(5), "name": "zulu", "pinned": true, "journal_id": "j-p2", "awaiting_input": 1},
+            {"id": "p1", "lifecycle": "parked", "created_at": at(9000), "name": "alpha", "pinned": true},
+            {"id": "r3", "lifecycle": "live", "created_at": at(1), "title": "today 3", "journal_id": "t3", "busy": true},
+        ]);
+        m.apply(Event::Sessions(metas(base)));
+        assert!(m.sync_favs(), "o1's journal id came; t3 is held");
+        assert_eq!((m.favs.list[3].id.as_str(), m.favs.list[3].provisional), ("j-o1", false));
+        assert_eq!(order(&m), want, "running, needs you, resumed: in place");
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+        let t3 = rail.rows.iter().find(|r| &*r.title == "today 3").unwrap();
+        assert_eq!((t3.live.map(|i| m.sessions[i].id.as_str()), t3.fav), (Some("r3"), Some(1)), "held now: its live row");
+        // Back to saved (ended, listed again): the same place.
+        m.apply(Event::Sessions(metas(json!([{"id": "o2", "lifecycle": "live", "created_at": at(60), "title": "Newest open"}]))));
+        m.sync_favs();
+        assert_eq!(order(&m), want);
+    }
+
+    /// Brief 4: find and the chips filter FAVOURITES as any group (it hides
+    /// when nothing in it matches), it folds to its head (not while
+    /// filtering), and an unread favourite nothing holds counts in UNREAD.
+    #[test]
+    fn favourites_find_fold_and_chips() {
+        let mut m = fav_scene();
+        let v = |find: &str, chip: Option<Chip>, closed: bool| View {
+            find: find.into(),
+            chip,
+            open: Bucket::DEFAULT_OPEN,
+            expanded: 0,
+            favs_closed: closed,
+        };
+        let s = shape(&build(&m, &v("deep", None, false), NOW));
+        assert_eq!(s[..2], ["[Favs 1]", "row Deep history"], "{s:?}");
+        let s = shape(&build(&m, &v("/home/u/o1", None, true), NOW));
+        assert_eq!(s[..2], ["[Favs 1]", "row Older open"], "find opens a folded group: {s:?}");
+        let s = shape(&build(&m, &v("newest", None, false), NOW));
+        assert!(!s.iter().any(|r| r.starts_with("[Favs")), "nothing matches: hidden: {s:?}");
+        let s = shape(&build(&m, &v("", None, true), NOW));
+        assert_eq!(s[..2], ["[Favs+ 4]", "[Pinned 1]"], "folded: its head and count");
+        // The chips: UNREAD admits the favourite nothing holds; RUNNING the held one.
+        m.mark_unread_for_test("t3");
+        let rail = build(&m, &v("", Some(Chip::Unread), false), NOW);
+        assert_eq!(shape(&rail)[..2], ["[Favs 1]", "row today 3"]);
+        assert_eq!(rail.history_unread, 1, "counted in the chip");
+        m.apply(Event::Sessions(metas(json!([
+            {"id": "o1", "lifecycle": "live", "created_at": at(600), "title": "Older open", "busy": true, "cwd": "/home/u/o1"},
+        ]))));
+        let s = shape(&build(&m, &v("", Some(Chip::Running), false), NOW));
+        assert_eq!(s[..2], ["[Favs 1]", "row Older open"], "{s:?}");
+        // M4: folded, a favourite that needs you or is running stays under
+        // the head (it is in no other group).
+        m.apply(Event::Sessions(metas(json!([
+            {"id": "o1", "lifecycle": "live", "created_at": at(600), "title": "Older open", "busy": true, "cwd": "/home/u/o1"},
+            {"id": "o2", "lifecycle": "live", "created_at": at(60), "title": "Newest open"},
+            {"id": "p2", "lifecycle": "live", "created_at": at(5), "name": "zulu", "pinned": true, "journal_id": "j-p2", "awaiting_input": 1},
+        ]))));
+        let s = shape(&build(&m, &v("", None, true), NOW));
+        assert_eq!(s[..4], ["[Favs+ 4]", "row zulu", "row Older open", "[Open 1]"], "{s:?}");
+    }
+
+    /// Brief 6: a favourite whose resume finds no journal shows GONE (with
+    /// Remove); it is never dropped by itself, and a refusal for another
+    /// reason (a lock) is not gone. Seen again, it is not gone.
+    #[test]
+    fn a_favourite_whose_journal_is_missing_is_gone_not_pruned() {
+        let mut m = fav_scene();
+        let deep =
+            || ResumeRequest { label: "Deep history".into(), target: "j-deep".into(), cwd: Some("/home/u/deep".into()), by_name: false };
+        m.resuming(deep(), 40, false);
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+        assert_eq!(rail.rows.iter().find(|r| &*r.title == "Deep history").unwrap().state, State::Opening);
+        m.apply(Event::Detached { attach_seq: 40, session_id: None, reason: crate::named::LOCKED_AXEL.into() });
+        assert!(!m.favs.list[2].is_gone(), "locked is not gone");
+        // H1: the daemon down (its socket gone, a tunnel down): the client's
+        // own ENOENT is not gone, and the real reason is what is said.
+        m.resuming(deep(), 39, false);
+        let down = "attach gave up: connect /home/u/.synaps-cli/run/daemon.sock: No such file or directory (os error 2)";
+        m.apply(Event::Detached { attach_seq: 39, session_id: None, reason: down.into() });
+        assert!(!m.favs.list[2].is_gone(), "a stopped daemon is not gone");
+        assert!(m.named.error.as_deref().unwrap().contains("No such file or directory"), "{:?}", m.named.error);
+        m.resuming(deep(), 41, false);
+        let missing = "create session: Tool execution failed: Failed to load session 'j-deep': no session matching 'j-deep'";
+        m.apply(Event::Detached { attach_seq: 41, session_id: None, reason: missing.into() });
+        assert!(m.favs.list[2].is_gone());
+        assert_eq!(
+            m.named.error.as_deref(),
+            Some("'Deep history' is gone: the daemon has no journal for it. It stays in FAVOURITES until you remove it.")
+        );
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+        let row = rail.rows.iter().find(|r| &*r.title == "Deep history").expect("never pruned");
+        assert!(row.gone);
+        assert_eq!(readout_fav(&m, &m.favs.list[2], NOW).lines[0].1, "gone");
+        assert_eq!(m.favs.list.len(), 4);
+        // Removed by the user: gone from the list.
+        assert!(m.favs.remove("j-deep"));
+        assert_eq!(shape(&build(&m, &view(Bucket::DEFAULT_OPEN), NOW))[0], "[Favs 3]");
+    }
+
+    /// M2: a favourite the cached listing still has (asked for before the
+    /// verdict) stays GONE through the app's refresh step (`sync_favs`, then
+    /// the rail, as `AppView::refresh_rail` runs them); the verdict asks for
+    /// a fresh listing, and only that one can say it is there.
+    #[test]
+    fn gone_survives_the_cached_listing() {
+        let mut m = fav_scene();
+        let t3 = ResumeRequest { label: "today 3".into(), target: "t3".into(), cwd: Some("/home/u/t".into()), by_name: false };
+        m.resuming(t3, 50, false);
+        let missing = "create session: Tool execution failed: Failed to load session 't3': no session matching 't3'";
+        let fx = m.apply(Event::Detached { attach_seq: 50, session_id: None, reason: missing.into() });
+        assert!(
+            fx.iter().any(|f| matches!(f, crate::model::Effect::ListSaved { named_only: false, .. })),
+            "a fresh listing asked for: {fx:?}"
+        );
+        let gone = |m: &mut Model| {
+            m.sync_favs();
+            let rail = build(m, &view(Bucket::DEFAULT_OPEN), NOW);
+            keys_once(&rail);
+            rail.rows.iter().find(|r| &*r.title == "today 3").expect("never pruned").gone
+        };
+        assert!(gone(&mut m), "the cached listing has it: still gone");
+        assert!(gone(&mut m), "and on the next rebuild");
+        // The fresh listing lands without it: gone. With it (the journal is
+        // there after all): not.
+        let rest: Vec<Value> = m
+            .named
+            .recent
+            .iter()
+            .filter(|v| v.id != "t3")
+            .map(|v| json!({"id": v.id, "title": v.title, "updated_at": v.updated_at, "live": false}))
+            .collect();
+        m.apply(Event::SavedSessions { sessions: saved(Value::Array(rest)), truncated: true, rejected: 0 });
+        assert!(gone(&mut m));
+        m.refresh_saved_for_test();
+        m.apply(Event::SavedSessions {
+            sessions: saved(json!([{"id": "t3", "title": "today 3", "updated_at": at(3603), "live": false}])),
+            truncated: true,
+            rejected: 0,
+        });
+        assert!(!gone(&mut m), "a listing asked for after the verdict has it");
+    }
+
+    /// An attach of `meta`, its conversation's header naming `parent`.
+    fn attached_frame(meta: Value, parent: Option<&str>) -> Box<synaps_client::Attached> {
+        let header = json!({"id": meta["journal_id"], "title": meta["title"], "parent_session": parent});
+        let frame = json!({"type": "attached", "client": 2, "meta": meta, "conversation": {"header": header, "api_messages": []}, "input_owner": 2});
+        let synaps_client::protocol::DaemonFrame::Attached(a) = synaps_client::protocol::decode_frame(&frame.to_string()).unwrap() else {
+            panic!()
+        };
+        a
+    }
+
+    /// The attached session's `Conversation` after a swap: its header.
+    fn swapped(seq: u64, id: &str, parent: Option<&str>) -> Event {
+        let digest = synaps_client::protocol::ConversationDigest {
+            header: json!({"id": id, "title": "Long talk", "parent_session": parent}),
+            ..Default::default()
+        };
+        Event::session(seq, "c1", 0, synaps_client::protocol::SessionEvent::Conversation { digest }, std::sync::Arc::new(Value::Null))
+    }
+
+    fn count(m: &mut Model, title: &str) -> (Vec<String>, usize) {
+        m.sync_favs();
+        let rail = build(m, &view(Bucket::DEFAULT_OPEN), NOW);
+        keys_once(&rail);
+        let s = shape(&rail);
+        let n = s.iter().filter(|r| r.ends_with(title)).count();
+        (s, n)
+    }
+
+    /// R1 (H2 as built): one conversation is one row through the
+    /// compactions seen here (the attached session's conversation header
+    /// names its parent), once and twice, open and parked; evicted to
+    /// history under its chain head. `/clear` there leaves the favourite on
+    /// its conversation, and `/resume` of another favourite merges nothing.
+    #[test]
+    fn a_compacted_favourite_is_one_row() {
+        fn once(m: &mut Model, why: &str) {
+            let (s, n) = count(m, "Long talk");
+            assert_eq!(n, 1, "{why}: {s:?}");
+            assert_eq!(s[..2], ["[Favs 1]", "row Long talk"], "{why}");
+        }
+        let s = |journal: &str, life: &str| json!({"id": "c1", "lifecycle": life, "created_at": at(50), "title": "Long talk", "journal_id": journal});
+        let mut m = model(json!([s("c1", "live")]), json!([]), json!([]), false);
+        m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
+        once(&mut m, "favourited");
+        m.want(5);
+        m.apply(Event::Attached {
+            attach_seq: 5,
+            attached: attached_frame(s("c1", "live"), None),
+            mode: synaps_client::AttachMode::Mirror,
+            reconnect: false,
+        });
+        for (journal, parent, life, why) in
+            [("c2", "c1", "live", "one compaction, open"), ("c3", "c2", "live", "two, open"), ("c3", "c2", "parked", "two, parked")]
+        {
+            m.apply(swapped(5, journal, Some(parent)));
+            m.apply(Event::Sessions(metas(json!([s(journal, life)]))));
+            once(&mut m, why);
+        }
+        assert_eq!((m.favs.list[0].id.as_str(), &m.favs.list[0].aliases[..]), ("c3", &["c1".to_string(), "c2".to_string()][..]));
+        // `/clear` in it: a new conversation under the same live id. The
+        // favourite stays on c3 (not held now: its row resumes c3), and the
+        // cleared one is in OPEN.
+        m.apply(swapped(5, "y", None));
+        m.apply(Event::Sessions(metas(json!([{"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "", "journal_id": "y"}]))));
+        let (rows, n) = count(&mut m, "Long talk");
+        assert_eq!((n, &rows[..2]), (1, &["[Favs 1]".to_string(), "row Long talk".to_string()][..]), "{rows:?}");
+        assert!(rows.contains(&"[Open 1]".to_string()), "{rows:?}");
+        assert_eq!(m.favs.list[0].id, "c3");
+        assert_eq!(m.fav_of(&m.sessions[0]), None, "the cleared conversation is not the favourite");
+        // Evicted: listed under its chain head (c1 and c2 fold into it).
+        m.apply(Event::Sessions(vec![]));
+        m.refresh_saved_for_test();
+        m.apply(Event::SavedSessions {
+            sessions: saved(json!([{"id": "c3", "title": "Long talk", "updated_at": at(10), "live": false}])),
+            truncated: false,
+            rejected: 0,
+        });
+        once(&mut m, "evicted");
+    }
+
+    /// R1: `/resume` of another favourite in the live session holding one:
+    /// both stay, each matched by its own journal; the swapped-in one shows
+    /// held, the other its saved row.
+    #[test]
+    fn a_resume_onto_another_favourite_keeps_both() {
+        let a = json!({"id": "la", "lifecycle": "live", "created_at": at(50), "title": "Alpha", "journal_id": "ja"});
+        let mut m = model(json!([a]), json!([]), json!([{"id": "jb", "title": "Bravo", "updated_at": at(900), "live": false}]), false);
+        m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
+        let jb = m.named.recent[0].clone();
+        m.favs.toggle(Source::Saved(&jb), 2);
+        m.want(6);
+        m.apply(Event::Attached {
+            attach_seq: 6,
+            attached: attached_frame(a.clone(), None),
+            mode: synaps_client::AttachMode::Mirror,
+            reconnect: false,
+        });
+        m.apply(swapped(6, "jb", None));
+        m.apply(Event::Sessions(metas(
+            json!([{"id": "la", "lifecycle": "live", "created_at": at(50), "title": "Bravo", "journal_id": "jb"}]),
+        )));
+        m.sync_favs();
+        assert_eq!(m.favs.list.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["ja", "jb"]);
+        assert_eq!(m.fav_of(&m.sessions[0]), Some(1), "held: Bravo's favourite");
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+        keys_once(&rail);
+        assert_eq!(shape(&rail)[..3], ["[Favs 2]", "row Alpha", "row Bravo"]);
+    }
+
+    /// R1: an unseen compaction (the TUI's, nothing attached here) is two
+    /// rows: the favourite on its old id, and its new journal in OPEN; once
+    /// it is attached the header says so, and it is one. A resume of an id
+    /// whose live session holds an unrelated journal (cleared elsewhere)
+    /// moves nothing, and says so.
+    #[test]
+    fn an_unseen_compaction_is_two_rows_until_attached() {
+        let c = |journal: &str| json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "Long talk", "journal_id": journal});
+        let mut m = model(json!([c("c1")]), json!([]), json!([]), false);
+        m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
+        m.apply(Event::Sessions(metas(json!([c("c2")]))));
+        let (rows, n) = count(&mut m, "Long talk");
+        assert_eq!(n, 2, "the favourite (c1) and c2 in OPEN: {rows:?}");
+        // Attached from its OPEN row: the header names c1.
+        m.want(7);
+        m.apply(Event::Attached {
+            attach_seq: 7,
+            attached: attached_frame(c("c2"), Some("c1")),
+            mode: synaps_client::AttachMode::Mirror,
+            reconnect: false,
+        });
+        let (rows, n) = count(&mut m, "Long talk");
+        assert_eq!((n, &rows[..2]), (1, &["[Favs 1]".to_string(), "row Long talk".to_string()][..]), "{rows:?}");
+        // Cleared elsewhere, then the favourite's resume: the daemon hands
+        // back the live session (it matches by live id), holding y.
+        m.apply(Event::Sessions(metas(json!([{"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "", "journal_id": "y"}]))));
+        m.resuming(ResumeRequest { label: "Long talk".into(), target: "c2".into(), cwd: None, by_name: false }, 8, false);
+        // The attach's meta names the journal the session started with (as
+        // 0.11.1 sends it after a swap); its header, the one it holds.
+        let mut a = attached_frame(json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "", "journal_id": "c2"}), None);
+        a.conversation.header = json!({"id": "y", "title": "", "parent_session": null});
+        m.apply(Event::Attached { attach_seq: 8, attached: a, mode: synaps_client::AttachMode::Mirror, reconnect: false });
+        assert_eq!(m.favs.list[0].id, "c2");
+        let notice = m.named.notice.clone().unwrap_or_default();
+        assert!(notice.contains("does not say it is the same conversation"), "{notice}");
+    }
+
+    /// N2: two compactions not seen here (the TUI's), the session closed
+    /// since; the favourite's resume of its old journal, which the daemon
+    /// follows down the chain (F24) and says so (`continue_info`): one row,
+    /// and no notice. The same resume answered with a session that holds
+    /// another journal (cleared since) moves nothing, and says so; one
+    /// onto another favourite's journal says that.
+    #[test]
+    fn two_unseen_compactions_are_one_row_once_the_favourite_is_resumed() {
+        let resume = |m: &mut Model, seq: u64, holds: &str| {
+            m.resuming(ResumeRequest { label: "Long talk".into(), target: "c1".into(), cwd: None, by_name: false }, seq, false);
+            let mut meta = json!({"id": "c3", "lifecycle": "live", "created_at": at(5), "title": "Long talk", "journal_id": "c3"});
+            meta["continue_info"] = json!({"session_id": "c3", "resolved_via": "compacted", "query": "c1",
+                "compaction_notice": "followed 2 compactions"});
+            let mut a = attached_frame(meta, Some("c2"));
+            a.conversation.header["id"] = json!(holds);
+            m.apply(Event::Attached { attach_seq: seq, attached: a, mode: synaps_client::AttachMode::Mirror, reconnect: false });
+        };
+        let listing = json!([{"id": "c3", "title": "Long talk", "updated_at": at(10), "live": false}]);
+        let mut m = model(json!([]), json!([]), listing.clone(), false);
+        let c1 = saved(json!([{"id": "c1", "title": "Long talk", "updated_at": at(900), "live": false}]));
+        m.favs.toggle(Source::Saved(&c1[0]), 1);
+        let (rows, n) = count(&mut m, "Long talk");
+        assert_eq!(n, 2, "the favourite (c1) and c3 in HISTORY: {rows:?}");
+        resume(&mut m, 4, "c3");
+        assert_eq!((m.favs.list[0].id.as_str(), &m.favs.list[0].aliases[..]), ("c3", &["c1".to_string()][..]));
+        assert_eq!(m.named.notice, None);
+        m.apply(Event::Sessions(metas(
+            json!([{"id": "c3", "lifecycle": "live", "created_at": at(5), "title": "Long talk", "journal_id": "c3"}]),
+        )));
+        let (rows, n) = count(&mut m, "Long talk");
+        assert_eq!((n, &rows[..2]), (1, &["[Favs 1]".to_string(), "row Long talk".to_string()][..]), "{rows:?}");
+        // Cleared since the daemon resolved it: the session holds y.
+        let mut m = model(json!([]), json!([]), listing.clone(), false);
+        m.favs.toggle(Source::Saved(&c1[0]), 1);
+        resume(&mut m, 4, "y");
+        assert_eq!(m.favs.list[0].id, "c1");
+        assert!(m.named.notice.as_deref().unwrap_or("").contains("does not say it is the same conversation"), "{:?}", m.named.notice);
+        // c3 is another favourite already: both stay, and the notice says so.
+        let mut m = model(json!([]), json!([]), listing, false);
+        m.favs.toggle(Source::Saved(&c1[0]), 1);
+        let c3 = m.named.recent[0].clone();
+        m.favs.toggle(Source::Saved(&c3), 2);
+        resume(&mut m, 4, "c3");
+        assert_eq!(m.favs.list.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["c1", "c3"]);
+        assert!(m.named.notice.as_deref().unwrap_or("").contains("another favourite has that conversation"), "{:?}", m.named.notice);
+    }
+
+    /// N1: a favourite's own row, its old live session still running under
+    /// its journal id (as a live id) and holding another journal (after an
+    /// unseen compaction, `/clear`, `/resume`): its star unfavourites it,
+    /// and favourites nothing else; the held row's star toggles the journal
+    /// the session holds.
+    #[test]
+    fn a_favourites_star_unfavourites_it_whatever_its_old_session_holds() {
+        let c = |journal: &str| json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "Long talk", "journal_id": journal});
+        for (why, holds) in [("an unseen compaction", "c2"), ("/clear", "y"), ("/resume", "jb")] {
+            let listing = json!([{"id": "jb", "title": "Bravo", "updated_at": at(900), "live": false}]);
+            let mut m = model(json!([c("c1")]), json!([]), listing, false);
+            m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
+            m.apply(Event::Sessions(metas(json!([c(holds)]))));
+            m.sync_favs();
+            let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+            keys_once(&rail);
+            let row = rail.rows.iter().find(|r| r.key == saved_key("c1")).expect("the favourite's own row");
+            assert!(row.fav.is_some() && row.live.is_none(), "{why}");
+            assert!(m.toggle_fav_row(&row.action.clone(), true, 2), "{why}");
+            assert!(m.favs.is_empty(), "{why}: unfavourited, {holds} not added: {:?}", m.favs.list);
+            let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+            let held = rail.rows.iter().find(|r| r.key == key_of("c1")).expect("the held row");
+            assert!(m.toggle_fav_row(&held.action.clone(), held.fav.is_some(), 3), "{why}");
+            assert_eq!(m.favs.list.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), [holds], "{why}");
+        }
+    }
+
+    /// N3: the attached session's journal is the daemon's word at once (its
+    /// attach's header, each swap's), not the last poll's: after a `/clear`
+    /// there, its row is not the favourite, and its star favourites the
+    /// cleared conversation, never removing the favourite.
+    #[test]
+    fn the_attached_sessions_journal_is_its_header_at_once() {
+        let c = |journal: &str| json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "Long talk", "journal_id": journal});
+        let mut m = model(json!([c("c1")]), json!([]), json!([]), false);
+        m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
+        m.want(5);
+        m.apply(Event::Attached {
+            attach_seq: 5,
+            attached: attached_frame(c("c1"), None),
+            mode: synaps_client::AttachMode::Mirror,
+            reconnect: false,
+        });
+        m.apply(swapped(5, "y", None));
+        assert_eq!(m.sessions[0].journal_id, "y", "before the next poll");
+        m.sync_favs();
+        assert_eq!(m.fav_of(&m.sessions[0]), None);
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+        let held = rail.rows.iter().find(|r| r.key == key_of("c1")).expect("the held row");
+        m.toggle_fav_row(&held.action.clone(), held.fav.is_some(), 2);
+        assert_eq!(m.favs.list.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["c1", "y"]);
+        // Attached again: its meta names the journal it started with, its
+        // header the one it holds.
+        m.want(6);
+        let mut a = attached_frame(c("c1"), None);
+        a.conversation.header["id"] = json!("y2");
+        m.apply(Event::Attached { attach_seq: 6, attached: a, mode: synaps_client::AttachMode::Mirror, reconnect: false });
+        assert_eq!(m.sessions[0].journal_id, "y2");
+    }
+
+    /// R3: a named favourite whose resume found no journal stays GONE
+    /// against the named list asked for before the verdict, however new
+    /// the newest list is (it is cut, so it never says the named one is
+    /// there); a named list asked for after it says it is there.
+    #[test]
+    fn gone_holds_against_a_stale_named_list() {
+        let named = json!([{"id": "jn", "title": "Notes", "name": "notes", "updated_at": at(900_000), "live": false}]);
+        let recent = json!([{"id": "t0", "title": "today", "updated_at": at(100), "live": false}]);
+        let mut m = model(json!([]), named.clone(), recent.clone(), true);
+        let jn = m.named.saved[0].clone();
+        m.favs.toggle(Source::Saved(&jn), 1);
+        m.resuming(ResumeRequest { label: "notes".into(), target: "jn".into(), cwd: None, by_name: false }, 9, false);
+        let missing = "create session: Tool execution failed: Failed to load session 'jn': no session matching 'jn'";
+        m.apply(Event::Detached { attach_seq: 9, session_id: None, reason: missing.into() });
+        assert!(m.favs.list[0].is_gone());
+        // The verdict's fresh newest list lands (cut: not the named one).
+        m.apply(Event::SavedSessions { sessions: saved(recent), truncated: true, rejected: 0 });
+        m.sync_favs();
+        assert!(m.favs.list[0].is_gone(), "the named list it is in is from before the verdict");
+        // R7: clicked again, the same refusal says gone again.
+        m.resuming(ResumeRequest { label: "notes".into(), target: "jn".into(), cwd: None, by_name: false }, 10, false);
+        m.apply(Event::Detached { attach_seq: 10, session_id: None, reason: missing.into() });
+        assert!(m.named.error.as_deref().unwrap_or("").starts_with("'notes' is gone"), "{:?}", m.named.error);
+        // A named list asked for after the verdict has it: there.
+        m.want_named_for_test();
+        m.apply(Event::SavedSessions { sessions: saved(named), truncated: false, rejected: 0 });
+        m.sync_favs();
+        assert!(!m.favs.list[0].is_gone());
     }
 
     /// Precedence: OPENING › NEEDS YOU › RUNNING › WORKERS › LOCKED › UNREAD

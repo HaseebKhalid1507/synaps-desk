@@ -226,6 +226,15 @@ pub struct Named {
     /// is never matched to the wrong request.
     saved_in_flight: Option<SavedAsk>,
     saved_queue: VecDeque<SavedAsk>,
+    /// Listings asked for so far, on any connection (never reset): a
+    /// favourite's gone verdict holds against those (it was there before).
+    pub asks: u64,
+    /// The number (of [`Named::asks`]) of the one on its way; of the
+    /// newest list of each kind landed (each says only what it knew when it
+    /// was asked: a favourite's gone holds against an older one).
+    asked: u64,
+    pub recent_listed: u64,
+    pub named_listed: u64,
     pub resuming: Option<Resuming>,
     /// An attach from a Named row or Open by name: if the session ended
     /// since the last list, resume its journal instead.
@@ -300,6 +309,9 @@ pub struct Model {
     /// come, until their `Detached`): `(attach_seq, session, texts)`.
     left: Vec<(u64, String, VecDeque<String>)>,
     pub named: Named,
+    /// The favourite sessions (desktop only, per daemon): the rail's
+    /// FAVOURITES. Never sent to the daemon.
+    pub favs: crate::favourites::Favourites,
     /// The open tabs; the visible one's session is the one attached.
     pub tabs: Tabs,
     /// A session list has landed (saved tabs can be checked against it),
@@ -373,6 +385,7 @@ impl Model {
             in_flight: VecDeque::new(),
             left: Vec::new(),
             named: Named { daemon: "the daemon's machine".into(), ..Named::default() },
+            favs: Default::default(),
             tabs: Tabs::default(),
             sessions_listed: false,
             lists: 0,
@@ -478,6 +491,8 @@ impl Model {
         }
         if let Some(ask) = n.saved_queue.pop_front() {
             n.saved_in_flight = Some(ask);
+            n.asks += 1;
+            n.asked = n.asks;
             effects.push(match ask {
                 SavedAsk::Named => Effect::ListSaved { named_only: true, limit: SAVED_SESSIONS_MAX },
                 SavedAsk::Recent(limit) => Effect::ListSaved { named_only: false, limit },
@@ -621,6 +636,102 @@ impl Model {
     /// until the resume lands).
     pub fn chip_shows_saved(&self, chip: Chip, v: &SavedSession) -> bool {
         chip.admits(self.saved_fact(v))
+    }
+
+    /// The attached session `session_id` holds `journal`, the daemon says
+    /// (its conversation's header): the session list has it at once, so its
+    /// row, its favourite star and the favourite key act on that journal,
+    /// not on the one the last poll saw.
+    fn holds(&mut self, session_id: &str, journal: &str) {
+        if journal.is_empty() {
+            return;
+        }
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id && s.journal_id != journal) {
+            s.journal_id = journal.to_string();
+            self.rail_gen += 1;
+        }
+    }
+
+    /// A rail row's star (or its menu's Favourite), by what the row is,
+    /// never by a bare id (a favourite's journal id is a live id too when
+    /// the session it started as still runs, holding another journal): a
+    /// held session's row toggles the journal it holds; a favourite's own
+    /// row unfavourites it; a HISTORY row toggles that saved session. `true`
+    /// if the favourites changed.
+    pub fn toggle_fav_row(&mut self, action: &RowAction, fav: bool, now: i64) -> bool {
+        use crate::favourites::Source;
+        match action {
+            RowAction::Attach(id) => match self.sessions.iter().find(|s| &s.id == id) {
+                Some(s) => {
+                    self.favs.toggle(Source::Live(s), now);
+                    true
+                }
+                None => false,
+            },
+            RowAction::Resume(r) if r.by_name => false,
+            RowAction::Resume(r) if fav => self.favs.remove(&r.target),
+            RowAction::Resume(r) => match self.named.recent.iter().chain(self.named.saved.iter()).find(|v| v.id == r.target) {
+                Some(v) => {
+                    self.favs.toggle(Source::Saved(v), now);
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// The favourites' snapshots brought up to what the lists say now (a
+    /// held session, else its listing): run when the lists change, before
+    /// the rail is built. `true` if any changed (and so is saved).
+    pub fn sync_favs(&mut self) -> bool {
+        if self.favs.is_empty() {
+            return false;
+        }
+        let n = &self.named;
+        let changed = self.favs.refresh(&self.sessions, &[(&n.recent, n.recent_listed), (&n.saved, n.named_listed)]);
+        if changed {
+            self.rail_gen += 1;
+        }
+        changed
+    }
+
+    /// A listing asked for (as a resume or a session leaving asks).
+    #[cfg(test)]
+    pub fn refresh_saved_for_test(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.refresh_saved(&mut effects);
+        effects
+    }
+
+    /// The named list asked for (as a rename or an Open by name asks).
+    #[cfg(test)]
+    pub fn want_named_for_test(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.named.saved_queue.push_back(SavedAsk::Named);
+        self.pump_saved(&mut effects);
+        effects
+    }
+
+    #[cfg(test)]
+    pub fn mark_unread_for_test(&mut self, id: &str) {
+        self.unread.insert(id.to_string());
+    }
+
+    /// The favourite a held session is, if any.
+    pub fn fav_of(&self, s: &SessionMeta) -> Option<usize> {
+        self.favs.find(crate::favourites::Source::Live(s))
+    }
+
+    /// A favourite's state as its row shows it when nothing holds it:
+    /// OPENING while its resume is on its way, UNREAD, else SAVED.
+    pub fn fav_state(&self, f: &crate::favourites::Favourite) -> State {
+        if self.named.resuming.as_ref().is_some_and(|r| f.knows(&r.req.target)) {
+            State::Opening
+        } else if f.ids().any(|id| self.unread.contains(id)) {
+            State::Unread
+        } else {
+            State::Saved
+        }
     }
 
     pub fn is_active(&self, session_id: &str) -> bool {
@@ -1363,11 +1474,13 @@ impl Model {
                 }
                 match asked {
                     Some(SavedAsk::Named) => {
+                        n.named_listed = n.asked;
                         n.saved = sessions;
                         n.saved_truncated = truncated;
                         n.named_stale = false;
                     }
                     Some(SavedAsk::Recent(_)) => {
+                        n.recent_listed = n.asked;
                         n.recent = sessions;
                         n.recent_truncated = truncated;
                         n.recent_loaded = true;
@@ -1437,7 +1550,8 @@ impl Model {
                 self.named.notice = Some(format!("Folder {missing} is gone on {}; resumed in ~.", self.named.daemon));
             }
             Event::Attached { attach_seq, attached, mode, .. } if self.current(attach_seq) => {
-                if let Some(r) = self.named.resuming.take_if(|r| r.attach_seq == attach_seq) {
+                let resumed = self.named.resuming.take_if(|r| r.attach_seq == attach_seq);
+                if let Some(r) = &resumed {
                     // The daemon's resolver took a chain of that name, or
                     // the id containing it (after the user was told): it
                     // stays on screen, said so, never detached and left
@@ -1453,6 +1567,45 @@ impl Model {
                             Some(format!("Opened '{}' by name: this daemon does not list saved folders, so it runs in ~.", r.req.label));
                     }
                     self.refresh_saved(&mut effects);
+                }
+                // The journal it holds is the header's: the attach's
+                // `meta.journal_id` is the one the session started with
+                // (0.11.1, after a swap). The daemon's word beats the
+                // listing's (polled, up to seconds old): its row and the
+                // favourite key act on what it holds.
+                let journal =
+                    attached.conversation.header.get("id").and_then(serde_json::Value::as_str).unwrap_or(&attached.meta.journal_id);
+                self.holds(&attached.meta.id, journal);
+                // A compaction of a favourite's conversation, said by the
+                // daemon: the header names its parent (one not seen while
+                // it ran), or this session is a resume the daemon followed
+                // down the chain to the journal it still holds (any number
+                // of compactions not seen here): the favourite follows.
+                if self.favs.continued(&attached.conversation.header)
+                    | attached.meta.continue_info.as_ref().is_some_and(|i| self.favs.resolved(i, journal))
+                {
+                    self.rail_gen += 1;
+                }
+                // A favourite's resume the daemon answered with a session
+                // that holds another journal it does not say continues this
+                // one (its live session `/clear`ed or `/resume`d elsewhere,
+                // or compacted more than once while live: a live session is
+                // handed back by its live id): the favourite stays on its
+                // own conversation, and the user is told.
+                if let Some(r) = resumed.filter(|r| !r.req.by_name)
+                    && !journal.is_empty()
+                    && self.favs.position(&r.req.target).is_some_and(|i| !self.favs.list[i].knows(journal))
+                {
+                    let (label, wanted) = (attached.meta.label(), &r.req.label);
+                    self.named.notice = Some(if self.favs.position(journal).is_some() {
+                        format!(
+                            "The daemon opened {label} ({journal}) for '{wanted}': another favourite has that conversation, so both stay as they were."
+                        )
+                    } else {
+                        format!(
+                            "The daemon opened {label} ({journal}) for '{wanted}', and does not say it is the same conversation: the favourite stays as it was."
+                        )
+                    });
                 }
                 // The one on screen until now, as the user saw it.
                 self.saw_active();
@@ -1518,6 +1671,19 @@ impl Model {
                     self.watch.steer_accepted(raw["event"]["content"]["data"]["handle_id"].as_str().unwrap_or(""));
                 }
                 self.stats.on_session(&event, &raw);
+                // After a swap (a compaction, `/clear`, `/resume`): only a
+                // compaction's successor names its parent. The journal it
+                // holds now, at once (the listing is polled).
+                if let SessionEvent::Conversation { digest } = &event {
+                    if let Some(id) = digest.header.get("id").and_then(serde_json::Value::as_str)
+                        && let Some(a) = self.active.as_ref().map(|a| a.session_id.clone())
+                    {
+                        self.holds(&a, id);
+                    }
+                    if self.favs.continued(&digest.header) {
+                        self.rail_gen += 1;
+                    }
+                }
                 match &event {
                     SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. } => {
                         if let Some(i) = self.in_flight.iter().position(|s| s.trim() == t.trim()) {
@@ -1561,7 +1727,28 @@ impl Model {
                 }
                 let opening = n.opening.take_if(|o| o.attach_seq == Some(attach_seq));
                 match n.resuming.take_if(|r| r.attach_seq == attach_seq) {
-                    Some(r) => n.error = Some(crate::named::resume_error(&r.req.label, &reason)),
+                    Some(r) => {
+                        n.error = Some(crate::named::resume_error(&r.req.label, &reason));
+                        // A favourite whose journal is not there (the
+                        // daemon's own refusal for that id, nothing else):
+                        // its row says so (and offers Remove); never dropped
+                        // here. A fresh listing is asked for: only one asked
+                        // after this says it is there after all.
+                        // Said again on a second click of a gone row.
+                        if !r.req.by_name
+                            && crate::favourites::journal_missing(&reason, &r.req.target)
+                            && self.favs.position(&r.req.target).is_some()
+                        {
+                            n.error = Some(format!(
+                                "'{}' is gone: the daemon has no journal for it. It stays in FAVOURITES until you remove it.",
+                                r.req.label
+                            ));
+                            if self.favs.set_gone(&r.req.target, n.asks) {
+                                self.rail_gen += 1;
+                                self.refresh_saved(&mut effects);
+                            }
+                        }
+                    }
                     None => match opening {
                         Some(o) => n.error = Some(format!("Could not open '{}': {reason}", o.name)),
                         None => self.last_error = Some(format!("detached: {reason}")),
@@ -3534,6 +3721,7 @@ mod fake_daemon {
                 .items
                 .iter()
                 .map(|i| match i {
+                    Item::Favs { count, .. } => format!("Favs {count}"),
                     Item::Group { group, count } => format!("{group:?} {count}"),
                     Item::Row(r) | Item::Hist(r) => rail.rows[*r].title.to_string(),
                     Item::Bucket { bucket, count, .. } => format!("{bucket:?} {count}"),
