@@ -6,9 +6,9 @@ Commit hashes are this repository's (`synaps-desk`). PR numbers other than synap
 
 Additive only (synaps-desk#11 `feat/favourites`): the daemon's word on a resume that followed a compaction chain. Nothing existing changes shape.
 
-- New `SessionMeta::continue_info: Option<ContinueInfo>` (`serde(default)`; `null` or missing is `None`) and `protocol::ContinueInfo` (`#[non_exhaustive]`, every field `serde(default)`), mirroring v0.11.1's `ContinueInfoWire`: `session_id` (the journal opened), `resolved_via` (`"compacted"`, `"chain"`, `"name"` or none), `query` (what was asked for), `compaction_notice`. Set at create, so the `Attached` snapshot's meta (the create-time copy) carries it. `ContinueInfo::compacted()`: the daemon followed `query`'s compactions to `session_id` (F24). A `SessionMeta` struct literal needs `..Default::default()` as before.
+- New `SessionMeta::continue_info: Option<ContinueInfo>`, decoded leniently as `roster` is: `null`, missing or a shape this client doesn't read (not an object, a field of another type) is `None`, and never fails the attach; and `protocol::ContinueInfo` (`#[non_exhaustive]`, every field `serde(default)`), mirroring v0.11.1's `ContinueInfoWire`: `session_id` (the journal opened), `resolved_via` (`"compacted"`, `"chain"`, `"name"` or none), `query` (what was asked for), `compaction_notice`. Set at create, so the `Attached` snapshot's meta (the create-time copy) carries it. `ContinueInfo::compacted()`: the daemon followed `query`'s compactions to `session_id` (F24). A `SessionMeta` struct literal needs `..Default::default()` as before.
 - Fixture fix: `tests/fixtures/session_swaps.ndjson`'s conversation after `compaction_applied` now names its parent (`parent_session`: the previous journal), as the engine's `Session::from_compaction_record` sets it; it had `null`.
-- Test: `tests/fixtures.rs` `session_meta_carries_continue_info`.
+- Test: `tests/fixtures.rs` `session_meta_carries_continue_info` (with malformed values: `None`, the meta still read).
 
 For synaps-avatar (nyx): nothing to change.
 

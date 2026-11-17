@@ -1339,27 +1339,25 @@ pub fn save_favourites(
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The advisory lock on `lock` (the settings' own lock file), tried until
-/// `wait` has passed; `None` (said on stderr): written unlocked. Never a
-/// blocking lock.
-fn lock_settings(lock: &Path, wait: std::time::Duration) -> Option<std::fs::File> {
-    let f = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("synaps-desktop: {} not opened ({e}): settings written unlocked", lock.display());
-            return None;
-        }
-    };
+/// `wait` has passed while another holds it (std's `WouldBlock`: `EWOULDBLOCK`,
+/// Windows' `ERROR_LOCK_VIOLATION` only). `Err`: why it isn't held, at once
+/// for a lock file that can't be opened or locked at all (the caller writes
+/// unlocked and says so on stderr). Never a blocking lock.
+fn lock_settings(lock: &Path, wait: std::time::Duration) -> Result<std::fs::File, String> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock)
+        .map_err(|e| format!("{} not opened ({e})", lock.display()))?;
     let deadline = std::time::Instant::now() + wait;
     loop {
         match f.try_lock() {
-            Ok(()) => return Some(f),
+            Ok(()) => return Ok(f),
             Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            Err(e) => {
-                eprintln!("synaps-desktop: {} not locked ({e}): settings written unlocked", lock.display());
-                return None;
-            }
+            Err(e) => return Err(format!("{} not locked ({e})", lock.display())),
         }
     }
 }
@@ -1404,7 +1402,9 @@ fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value) ->
     // And one at a time across processes (two windows, two builds): the
     // read, the merge and the rename under an advisory lock of a file of
     // its own, so no window writes over what another wrote after its read.
-    let _lock = lock_settings(&path.with_extension("json.lock"), LOCK_WAIT);
+    let _lock = lock_settings(&path.with_extension("json.lock"), LOCK_WAIT)
+        .inspect_err(|why| eprintln!("synaps-desktop: {why}: settings written unlocked"))
+        .ok();
     // Lossy: a stray invalid byte is a file that does not parse (set aside
     // below), never one read as missing (which would wipe every key).
     let text = match std::fs::read(path) {
@@ -1917,42 +1917,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// R4: a write waits for another process's (the lock is advisory, on a
-    /// file of its own: two opens conflict as two processes do). N4: never
-    /// for longer than [`LOCK_WAIT`]: a holder that never lets go (stopped
-    /// mid-write) does not freeze it; it writes unlocked, as it does when
-    /// the lock file can't be opened.
+    /// R4: a write waits for another process's lock (advisory, on a file of
+    /// its own: two opens conflict as two processes do). N4: never for
+    /// longer than its wait: a holder that never lets go (stopped mid-write)
+    /// does not freeze it, and a lock file that can't be opened isn't waited
+    /// for at all; either way it writes, unlocked. No bound here depends on
+    /// how fast the machine is: a wait that was waited out took at least its
+    /// length, one not waited for took less than a minute of it.
     #[test]
     fn a_write_waits_for_the_lock() {
+        use std::time::{Duration, Instant};
         let dir = std::env::temp_dir().join(format!("synaps-desktop-lock-{}", std::process::id()));
         let path = dir.join("settings.json");
+        let lock = path.with_extension("json.lock");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, r#"{"theme": "nord"}"#).unwrap();
-        let other = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("json.lock")).unwrap();
+        let other = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock).unwrap();
         other.lock().unwrap();
-        let p = path.clone();
-        let writer = std::thread::spawn(move || save_settings(&p, &[("accent", "#2d7bff".into())]));
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"theme": "nord"}"#, "held: not written yet");
+        // Held: waited for (a minute's wait: still waiting while it is held)
+        // and taken once let go.
+        let l = lock.clone();
+        let waiter = std::thread::spawn(move || lock_settings(&l, Duration::from_secs(60)));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "held: still waiting");
         other.unlock().unwrap();
-        writer.join().unwrap().unwrap();
-        assert_eq!(load_accent(&path).as_deref(), Some("#2d7bff"));
-        // Held for good: written after the wait, unlocked.
+        assert!(waiter.join().unwrap().is_ok(), "taken once let go");
+        // Held for good: not taken, after the whole wait; the write goes
+        // ahead, unlocked.
         other.lock().unwrap();
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
+        let why = lock_settings(&lock, LOCK_WAIT).unwrap_err();
+        assert!(t0.elapsed() >= LOCK_WAIT, "{:?}", t0.elapsed());
+        assert!(why.contains("not locked"), "{why}");
         save_settings(&path, &[("accent", "#35f2ff".into())]).unwrap();
-        let waited = t0.elapsed();
-        assert!(waited >= LOCK_WAIT && waited < LOCK_WAIT * 8, "{waited:?}");
         assert_eq!(load_accent(&path).as_deref(), Some("#35f2ff"));
-        // A lock file that can't be opened (a directory there): written
-        // unlocked at once, said on stderr.
+        assert_eq!(load_theme(&path).as_deref(), Some("nord"), "merged");
+        // A lock file that can't be opened (a directory there: EISDIR,
+        // Windows' ERROR_ACCESS_DENIED): not waited for, whatever the wait;
+        // the write goes ahead, unlocked.
         drop(other);
-        std::fs::remove_file(path.with_extension("json.lock")).unwrap();
-        std::fs::create_dir(path.with_extension("json.lock")).unwrap();
-        let t0 = std::time::Instant::now();
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        let t0 = Instant::now();
+        let why = lock_settings(&lock, Duration::from_secs(60)).unwrap_err();
+        assert!(t0.elapsed() < Duration::from_secs(60), "not waited for: {:?}", t0.elapsed());
+        assert!(why.contains("not opened"), "{why}");
         save_settings(&path, &[("accent", "#ff2d7b".into())]).unwrap();
-        assert!(t0.elapsed() < LOCK_WAIT, "{:?}", t0.elapsed());
         assert_eq!(load_accent(&path).as_deref(), Some("#ff2d7b"));
         let _ = std::fs::remove_dir_all(&dir);
     }
