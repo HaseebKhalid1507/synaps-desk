@@ -145,11 +145,19 @@ impl RailCache {
     pub(crate) fn refresh(&mut self, m: &Model, view: &rail::View, list: &ListState) {
         let now = now_secs();
         // With a chip on, which rows show follows their states (the attached
-        // session's run ahead of the poll): a hash, no allocation.
-        let states = if let Some(chip) = view.chip {
+        // session's run ahead of the poll), and so does which favourites a
+        // folded FAVOURITES shows (those that need you or run): a hash, no
+        // allocation.
+        let folded = view.favs_closed && !m.favs.is_empty();
+        let states = if view.chip.is_some() || folded {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             for s in &m.sessions {
-                m.chip_shows(chip, s).hash(&mut h);
+                if let Some(chip) = view.chip {
+                    m.chip_shows(chip, s).hash(&mut h);
+                }
+                if folded {
+                    (m.fav_of(s).is_some() && rail::busy(m, s)).hash(&mut h);
+                }
             }
             h.finish()
         } else {

@@ -585,8 +585,7 @@ fn fav_items(m: &Model, view: &View, now: i64, rail: &mut Rail) -> Vec<usize> {
                         &view.find,
                         [s.name.as_deref(), s.title.as_deref(), s.cwd.as_deref(), shown_id(&s.id, s.name.as_deref(), s.title.as_deref())],
                     );
-                let busy = [Chip::NeedsYou, Chip::Running].into_iter().any(|c| m.chip_shows(c, s));
-                shows.then(|| (live_row(m, i, now), busy))
+                shows.then(|| (live_row(m, i, now), busy(m, s)))
             }
             None => {
                 let entry = n
@@ -619,6 +618,11 @@ fn fav_items(m: &Model, view: &View, now: i64, rail: &mut Rail) -> Vec<usize> {
         }
     }
     held
+}
+
+/// A held session needs you or runs (a folded FAVOURITES still shows it).
+pub fn busy(m: &Model, s: &SessionMeta) -> bool {
+    [Chip::NeedsYou, Chip::Running].into_iter().any(|c| m.chip_shows(c, s))
 }
 
 fn history_items(m: &Model, view: &View, now: i64, rail: &mut Rail) {
