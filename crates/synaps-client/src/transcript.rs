@@ -267,6 +267,11 @@ pub struct Transcript {
     items: Vec<Item>,
     next_id: u64,
     session_id: Option<String>,
+    /// The conversation's journal id ([`SessionMeta::journal_id`]), kept
+    /// current by clear, resume and compaction. The session's id stays the
+    /// same through those; a re-attach to another journal is another
+    /// conversation, and carries no time of this one's.
+    journal_id: String,
     /// `api_messages` folded so far, and where their items end.
     history_len: usize,
     history_end: usize,
@@ -468,11 +473,21 @@ impl Transcript {
             return Err(TranscriptError::DigestHistory);
         }
         let same = self.session_id.as_deref() == Some(a.meta.id.as_str());
+        // A clear, resume or compaction made while detached (in the TUI,
+        // another window) keeps the session's id and changes its journal's.
+        let carry = same && self.journal_id == a.meta.journal_id;
         let (notes, mut reuse) = if same { self.take_rows(0) } else { (Vec::new(), Reuse::new()) };
         let (next_id, clean_len, before) = (self.next_id, self.clean_len, std::mem::take(&mut self.before));
         let no_subagent_notices = self.no_subagent_notices;
-        *self =
-            Transcript { next_id, clean_len, before, no_subagent_notices, session_id: Some(a.meta.id.clone()), ..Transcript::default() };
+        *self = Transcript {
+            next_id,
+            clean_len,
+            before,
+            no_subagent_notices,
+            session_id: Some(a.meta.id.clone()),
+            journal_id: a.meta.journal_id.clone(),
+            ..Transcript::default()
+        };
         self.dirty_from = Some(0);
         self.title = a.meta.title.clone().or_else(|| a.conversation.header.get("title").and_then(Value::as_str).map(str::to_string));
         self.cost_usd = a.conversation.cost;
@@ -488,7 +503,7 @@ impl Transcript {
             self.busy = false;
             self.settle();
         }
-        self.keep_revs(true);
+        self.keep_revs(carry);
         Ok(())
     }
 
@@ -535,7 +550,10 @@ impl Transcript {
         if !self.busy {
             self.settle();
         }
-        self.keep_revs(!self.swapped);
+        // An append matched this conversation's prefix: the rows it took
+        // are its own live ones, whatever swap came before it (a resume of
+        // the same journal has no replacement to consume the flag).
+        self.keep_revs(true);
     }
 
     /// Rebuild from a whole history (resync, rewrite, clear, compaction).
@@ -831,7 +849,8 @@ impl Transcript {
                 self.notice(ItemKind::Notice, "turn aborted");
             }
             SessionEvent::Ended { reason } => self.notice(ItemKind::Notice, format!("session ended ({reason})")),
-            SessionEvent::Cleared { .. } => {
+            SessionEvent::Cleared { session_id } => {
+                self.journal_id.clone_from(session_id);
                 // Clearing an empty conversation changes nothing: its digest
                 // matches, no replacement follows to consume the flag, and
                 // a later unrelated one would drop this conversation's notes.
@@ -840,13 +859,15 @@ impl Transcript {
             }
             SessionEvent::Resumed { new_id, clamp_notice, .. } => {
                 self.swapped = true;
+                self.journal_id.clone_from(new_id);
                 self.notice(ItemKind::Notice, format!("resumed {new_id}"));
                 if let Some(n) = clamp_notice {
                     self.notice(ItemKind::Notice, n.clone());
                 }
             }
-            SessionEvent::CompactionApplied { msg_count, .. } => {
+            SessionEvent::CompactionApplied { session_id, msg_count, .. } => {
                 self.swapped = true;
+                self.journal_id.clone_from(session_id);
                 self.notice(ItemKind::Notice, format!("conversation compacted ({msg_count} messages)"));
             }
             SessionEvent::CompactionFailed { message } => self.notice(ItemKind::Error, format!("compaction failed: {message}")),

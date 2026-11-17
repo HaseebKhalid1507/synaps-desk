@@ -286,6 +286,71 @@ fn rows_carry_their_message_times() {
     assert!(old.items().iter().filter(|i| !i.is_note()).all(|i| i.at.is_none()), "{:?}", at(&old));
 }
 
+/// A swap the client sees no replacement for (a resume of the journal it
+/// shows: the digest matches) leaves first times on: the turn after it
+/// keeps its live times when its history lands, as any other.
+#[test]
+fn a_swap_with_no_replacement_keeps_live_times() {
+    let mut t = Transcript::new();
+    let a = attached("attached_create.json");
+    t.load_attached(&a).unwrap();
+    let id = a.meta.journal_id.clone();
+    let resumed = SessionEvent::Resumed { id: 1, old_id: id.clone(), new_id: id, via: None, clamp_notice: None };
+    t.apply_at(&resumed, "2026-11-13T07:34:20Z");
+    let mut appends = 0;
+    for (env, ev) in events("turn_events.ndjson") {
+        appends += usize::from(history_of(&ev).is_some());
+        t.apply_at(&ev, &env.ts);
+    }
+    assert_eq!(appends, 3, "every round's history is an append");
+    let thinking = t.items().iter().find(|i| i.kind == ItemKind::Thinking).unwrap();
+    assert_eq!(thinking.at.as_deref(), Some("2026-11-13T07:34:28.569949873Z"), "not the history's 07:34:30");
+}
+
+/// A re-attach after a clear made while the tab was detached (in the TUI,
+/// another window): the daemon session is the same, its journal is new,
+/// and the same question asked again is another message. Its row reuses
+/// the id and has the snapshot's time, not the old one's. A reload of the
+/// same journal keeps the first times, and a clear seen live moves the
+/// journal the next re-attach is compared with.
+#[test]
+fn a_reattach_after_a_clear_elsewhere_carries_no_time() {
+    let mut t = Transcript::new();
+    t.load_attached(&attached("attached_history.json")).unwrap();
+    let asked = t.items()[0].clone();
+    assert_eq!((asked.kind, asked.at.as_deref()), (ItemKind::User, Some("2026-11-13T07:34:27Z")));
+    let again = |journal: &str, at: &str| {
+        let mut b = attached("attached_history.json");
+        b.meta.journal_id = journal.into();
+        let first = b.conversation.api_messages[0].clone();
+        b.conversation.api_messages =
+            vec![first, serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "Another answer."}]})];
+        for m in &mut b.conversation.api_messages {
+            m["_synaps_at"] = serde_json::json!(at);
+        }
+        b.conversation.messages_len = 2;
+        b
+    };
+    let at = |t: &Transcript| t.items().iter().filter(|i| !i.is_note()).map(|i| i.at.as_deref().map(str::to_string)).collect::<Vec<_>>();
+    let s = |v: &str| Some(v.to_string());
+
+    t.load_attached(&again("20261113-090000-c1ea", "2026-11-13T09:00:00Z")).unwrap();
+    assert_eq!((t.items()[0].id, t.items()[0].text.as_str()), (asked.id, asked.text.as_str()), "the same session: the id is reused");
+    assert_eq!(at(&t), [s("2026-11-13T09:00:00Z"), s("2026-11-13T09:00:00Z")], "the new conversation's times");
+
+    // A reload of that journal: the first times stay.
+    t.load_attached(&again("20261113-090000-c1ea", "2026-11-13T09:05:00Z")).unwrap();
+    assert_eq!(at(&t), [s("2026-11-13T09:00:00Z"), s("2026-11-13T09:00:00Z")]);
+
+    // A clear seen live: the next re-attach to its journal is a reload.
+    t.apply_at(&SessionEvent::Cleared { session_id: "20261113-091000-d2fb".into() }, "2026-11-13T09:10:00Z");
+    let cleared = again("20261113-091000-d2fb", "2026-11-13T09:11:00Z");
+    t.apply_update(&HistoryUpdate::Replace { messages: cleared.conversation.api_messages.clone() }).unwrap();
+    assert_eq!(at(&t), [s("2026-11-13T09:11:00Z"), s("2026-11-13T09:11:00Z")], "swapped: no carry");
+    t.load_attached(&again("20261113-091000-d2fb", "2026-11-13T09:15:00Z")).unwrap();
+    assert_eq!(at(&t), [s("2026-11-13T09:11:00Z"), s("2026-11-13T09:11:00Z")], "the same journal: kept");
+}
+
 /// H1/M6: the client's path. Every `MessageHistory` of a real turn is an
 /// append carrying only the new messages, every digest matches the mirror
 /// (no resync), and the result equals a fresh attach.

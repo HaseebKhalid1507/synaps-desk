@@ -1730,6 +1730,12 @@ mod tests {
         assert_eq!(kinds(&build(t.items(), 0, false, &HashSet::new(), &Subagents::default()))[1], "fold", "the turn ended");
     }
 
+    /// A compaction summary as the daemon writes it into the history
+    /// (SynapsCLI `compaction_context_messages`).
+    const SUMMARY: &str = "The conversation history before this point was compacted into the following summary:\n\n\
+        <context-summary>\nwhat came before\n</context-summary>\n\n\
+        Continue from where we left off. The summary and the system prompt contain all the context you need.";
+
     fn dated(m: serde_json::Value, at: String) -> serde_json::Value {
         let mut m = m;
         m["_synaps_at"] = json!(at);
@@ -1759,7 +1765,10 @@ mod tests {
                 dated(text("late"), d1(23, 30)),
                 dated(json!({"role": "user", "content": "resumed the next morning"}), d2(0, 30)),
                 dated(text("morning"), d2(0, 31)),
-                dated(json!({"role": "user", "content": "<context-summary>what came before</context-summary>"}), d3(8, 0)),
+                // The daemon's compaction (`compaction_context_messages`):
+                // the summary in a user message, and an acknowledgement.
+                dated(json!({"role": "user", "content": SUMMARY}), d3(8, 0)),
+                dated(json!({"role": "assistant", "content": "I've loaded the conversation summary. Ready to continue."}), d3(8, 0)),
                 dated(json!({"role": "user", "content": "after the compaction"}), d3(8, 1)),
                 dated(text("same day"), d3(8, 2)),
             ];
@@ -1769,12 +1778,18 @@ mod tests {
             let t = transcript(&m);
             assert!(t.items()[..2].iter().all(|i| i.at.is_none()), "legacy rows have no time");
             let rows = build_in(&tz, t.items(), 0, false, &HashSet::new(), &Subagents::default());
-            assert_eq!(kinds(&rows), ["user", "prose", "user", "prose", "day", "user", "prose", "day", "note", "user", "prose"], "{tz}");
+            // The summary is drawn as YOU and AGENT rows today (the client
+            // finds a summary only at the start of a message: issue #14).
+            assert_eq!(
+                kinds(&rows),
+                ["user", "prose", "user", "prose", "day", "user", "prose", "day", "user", "prose", "user", "prose"],
+                "{tz}"
+            );
             let (day, under) = (rows[4], rows[5]);
             assert_eq!((day.item, day.id, day.who), (under.item, under.id | DAY_ID, Who::None));
             assert_eq!((day.gap, under.gap), (Gap::Turn, Gap::Part), "the line takes the turn's gap");
             assert_eq!(day.rev, day_number(chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap()), "{tz}");
-            assert_eq!((rows[7].gap, rows[8].gap), (Gap::Part, Gap::Part), "a note's part gap, then a part");
+            assert_eq!((rows[7].item, rows[7].gap, rows[8].gap), (rows[8].item, Gap::Turn, Gap::Part), "over the summary, its turn's gap");
             for k in 0..t.len() {
                 let from = rows.partition_point(|d| d.item < turn_start(t.items(), k));
                 let part = build_in(&tz, t.items(), turn_start(t.items(), k), false, &HashSet::new(), &Subagents::default());
