@@ -17,6 +17,20 @@ use crate::usage::Stack;
 /// Where a plot was painted last (the pointer's day is read from it).
 pub type Spot = Rc<Cell<Option<Bounds<Pixels>>>>;
 
+/// A data colour at `alpha` (a series' thin line, a scatter's dots, the
+/// heatmap's steps): opacity is for data only, so it lives here, and only
+/// here (design.md §5; clippy's `disallowed-methods` holds the rest).
+#[allow(clippy::disallowed_methods)]
+fn fade(c: Hsla, alpha: f32) -> Hsla {
+    c.opacity(alpha)
+}
+
+/// A heatmap cell's colour: its step of 5 in `full` (data), an empty one
+/// `empty` at half.
+pub fn heat(empty: Hsla, full: Hsla, step: usize) -> Hsla {
+    if step == 0 { fade(empty, 0.5) } else { fade(full, step as f32 / 5.) }
+}
+
 /// A line chart's paths at the origin, for the plot size they were built
 /// for, with how each is inked: a hover or a scroll paints them again
 /// without tessellating. Emptied with each load.
@@ -182,7 +196,7 @@ fn color_of(stroke: Stroke, ink: &Ink) -> Hsla {
     match stroke {
         Stroke::Series(c, thin) => {
             let base = ink.series[c.min(5)];
-            if thin { base.opacity(0.5) } else { base }
+            if thin { fade(base, 0.5) } else { base }
         }
         Stroke::Grid => ink.grid,
     }
@@ -242,7 +256,7 @@ pub fn scatter(points: Arc<[(f32, f32)]>, color: Hsla, grid: Hsla, ticks: Vec<f3
         move |b, _, window, _| {
             let ink = Ink { series: [color; 6], grid, rule: grid, hover: grid };
             grid_lines(b, &ticks, &ink, window);
-            let c = color.opacity(0.5);
+            let c = fade(color, 0.5);
             let (w, h) = (b.size.width - px(2.), b.size.height - px(2.));
             for &(x, y) in points.iter() {
                 window.paint_quad(fill(Bounds::new(point(b.origin.x + w * x, b.origin.y + h * (1. - y)), size(px(2.), px(2.))), c));

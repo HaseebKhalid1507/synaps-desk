@@ -18,6 +18,8 @@ use gpui_kit::*;
 
 use crate::app::{AppView, display, mono};
 use crate::dash::Fail;
+use crate::fonts;
+use crate::fonts::TextPx as _;
 use crate::model::ConnState;
 use crate::rail::State;
 use crate::settings::{self, Cat};
@@ -143,7 +145,7 @@ struct Row {
 }
 
 fn sans(text: impl Into<SharedString>, size: f32, line: f32, color: Hsla) -> Div {
-    div().text_size(px(size)).line_height(px(line)).text_color(color).child(text.into())
+    div().text_px(size).line_height(px(line)).text_color(color).child(text.into())
 }
 
 /// The value a session row shows.
@@ -353,15 +355,17 @@ impl AppView {
                 seg = seg.child(
                     div()
                         .id((id, i))
+                        .relative()
                         .h_full()
                         .px(px(12.))
                         .flex()
                         .items_center()
                         .when(i > 0, |d| d.border_l_1().border_color(p.edge))
-                        .when(on, |d| d.bg(p.raised).border_b_2().border_color(p.focus))
+                        // Selected (design.md §5): `raised` and a 2 px you bar on top.
+                        .when(on, |d| d.bg(p.raised).child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(p.you_bar)))
                         .cursor_pointer()
                         .hover(|d| d.bg(p.raised))
-                        .child(mono(o, 12.5, color))
+                        .child(mono(o, 13., color))
                         .on_click(cx.listener(move |this, _, _, cx| this.settings_pick(what, &v, cx))),
                 );
             }
@@ -383,7 +387,7 @@ impl AppView {
                         .cursor_pointer()
                         .when(on, |d| d.bg(p.raised))
                         .hover(|d| d.bg(p.raised))
-                        .child(mono(o, 12.5, if on { p.ink } else { p.prose }))
+                        .child(mono(o, 13., if on { p.ink } else { p.prose }))
                         .on_click(cx.listener(move |this, _, _, cx| this.settings_pick(what, &v, cx))),
                 );
             }
@@ -400,7 +404,7 @@ impl AppView {
                     .border_1()
                     .border_color(if open { p.focus } else { p.edge })
                     .cursor_pointer()
-                    .child(mono(shown, 12.5, if sending.is_some() { p.dim } else { p.prose }).flex_1())
+                    .child(mono(shown, 13., if sending.is_some() { p.dim } else { p.prose }).flex_1())
                     .child(mono(if open { "↑" } else { "↓" }, 12., p.dim))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings.dropdown = if this.settings.dropdown == Some(id) { None } else { Some(id) };
@@ -425,11 +429,11 @@ impl AppView {
                 .flex_1()
                 .min_w_0()
                 .font_family(crate::fonts::MONO)
-                .text_size(px(12.5))
+                .text_px(13.)
                 .child(Input::new(&self.settings_input).appearance(false))
                 .into_any_element()
         } else {
-            mono(value, 12.5, if sending { p.dim } else { p.prose }).flex_1().min_w_0().overflow_hidden().text_ellipsis().into_any_element()
+            mono(value, 13., if sending { p.dim } else { p.prose }).flex_1().min_w_0().overflow_hidden().text_ellipsis().into_any_element()
         };
         h_flex()
             .id(id)
@@ -458,7 +462,7 @@ impl AppView {
             .items_center()
             .justify_end()
             .max_w(px(CONTROL + 120.))
-            .child(mono(value, 12.5, p.dim).overflow_hidden().text_ellipsis())
+            .child(mono(value, 13., p.dim).overflow_hidden().text_ellipsis())
             .child(crate::glyph::session_mark(State::Locked, crate::glyph::Ground::Canvas, p))
             .into_any_element()
     }
@@ -571,7 +575,7 @@ impl AppView {
                         }))
                     })
                     .when(more, |d| d.child(mono(if open { "−" } else { "+" }, 13., p.dim)))
-                    .child(display(title, 13., p.header)),
+                    .child(display(title, fonts::size::D_M, p.header)),
             )
             .child(mono(line, 12., p.dim).whitespace_normal())
     }
@@ -594,17 +598,11 @@ impl AppView {
                 .pt(px(28.))
                 .gap(px(24.))
                 .items_center()
-                .child(display("S E T T I N G S", 16., p.header))
+                .child(display("S E T T I N G S", fonts::size::D_L, p.header))
                 .child(div().flex_1())
-                .child(
-                    h_flex().w(px(CONTROL)).h(px(28.)).px(px(10.)).items_center().border_1().border_color(p.edge).child(
-                        div()
-                            .flex_1()
-                            .font_family(crate::fonts::MONO)
-                            .text_size(px(12.5))
-                            .child(Input::new(&self.settings_find).appearance(false)),
-                    ),
-                )
+                .child(h_flex().w(px(CONTROL)).h(px(28.)).px(px(10.)).items_center().border_1().border_color(p.edge).child(
+                    div().flex_1().font_family(crate::fonts::MONO).text_px(13.).child(Input::new(&self.settings_find).appearance(false)),
+                ))
                 .into_any_element(),
         ));
         let gate = self.config_gate();
@@ -646,10 +644,14 @@ impl AppView {
             for (pos, &ix) in shown_groups.iter().enumerate() {
                 let on = in_view == Some(ix);
                 list = list.child(
+                    // The group in view: a you bar on its left (design.md §5).
                     div()
                         .id(("settings-index", ix))
+                        .relative()
                         .py(px(5.))
+                        .pl(px(10.))
                         .cursor_pointer()
+                        .when(on, |d| d.child(crate::glyph::bar(p.you_mark)))
                         .child(display(GROUPS[ix], 12., if on { p.ink } else { p.dim }))
                         .hover(|d| d.text_color(p.ink))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -674,7 +676,7 @@ impl AppView {
             .items_center()
             .when(!first, |d| d.border_t_1().border_color(p.hair))
             .child(sans(label, 14., 22., p.ink).w(px(180.)).flex_none())
-            .child(mono(value, 12.5, p.prose).flex_1().min_w_0().whitespace_normal())
+            .child(mono(value, 13., p.prose).flex_1().min_w_0().whitespace_normal())
             .into_any_element()
     }
 
@@ -762,17 +764,18 @@ impl AppView {
             _ => None,
         };
         let open_picker = |id: &'static str| {
+            // The outlined button (design.md §8.12).
             div()
                 .id(id)
                 .h(px(28.))
-                .px(px(12.))
+                .px(px(16.))
                 .flex()
                 .items_center()
                 .border_1()
                 .border_color(p.edge)
                 .cursor_pointer()
                 .hover(|d| d.bg(p.raised))
-                .child(display("C H O O S E", 12., p.prose))
+                .child(display("C H O O S E", fonts::size::D_S, p.prose))
                 .on_click(cx.listener(|this, _, window, cx| this.open_picker(window, cx)))
         };
         let theme_value = if self.theme_follows_config {
@@ -790,7 +793,7 @@ impl AppView {
                 None => h_flex()
                     .gap(px(12.))
                     .items_center()
-                    .child(mono(theme_value, 12.5, p.prose))
+                    .child(mono(theme_value, 13., p.prose))
                     .child(open_picker("app-theme-pick"))
                     .into_any_element(),
             },
@@ -808,7 +811,7 @@ impl AppView {
                 None => h_flex()
                     .gap(px(12.))
                     .items_center()
-                    .child(mono(accent, 12.5, p.prose))
+                    .child(mono(accent, 13., p.prose))
                     .child(open_picker("app-accent-pick"))
                     .into_any_element(),
             },
@@ -1037,7 +1040,7 @@ impl AppView {
                             .p(px(10.))
                             .bg(p.code)
                             .font_family(crate::fonts::MONO)
-                            .text_size(px(12.5))
+                            .text_px(13.)
                             .line_height(px(20.))
                             .text_color(p.code_fg)
                             .whitespace_normal()
@@ -1045,7 +1048,7 @@ impl AppView {
                     )
                     .child(self.bars.prompt.bar(crate::scrollbar::Ground::Canvas))
                     .into_any_element(),
-                None => mono("the daemon's default prompt", 12.5, p.dim).mt(px(4.)).into_any_element(),
+                None => mono("the daemon's default prompt", 13., p.dim).mt(px(4.)).into_any_element(),
             };
             rows.push(Row {
                 id: "session-system".into(),
@@ -1151,7 +1154,7 @@ impl AppView {
                         .when(!first, |d| d.border_t_1().border_color(p.hair))
                         .child(sans(d.label, 14., 22., p.ink).flex_none())
                         .child(mono(d.key, 12., p.dim).flex_1().min_w_0().overflow_hidden().text_ellipsis())
-                        .child(mono(value, 12.5, p.dim).flex_none().max_w(px(220.)).overflow_hidden().text_ellipsis())
+                        .child(mono(value, 13., p.dim).flex_none().max_w(px(220.)).overflow_hidden().text_ellipsis())
                         .child(crate::glyph::session_mark(State::Locked, crate::glyph::Ground::Canvas, p))
                         .into_any_element(),
                 );
@@ -1226,7 +1229,7 @@ impl AppView {
             .items_center()
             .when(!first, |d| d.border_t_1().border_color(p.hair))
             .child(sans(label, 14., 22., p.ink).w(px(180.)).flex_none().overflow_hidden().text_ellipsis())
-            .child(mono(value, 12.5, p.dim).flex_1().min_w_0().whitespace_normal())
+            .child(mono(value, 13., p.dim).flex_1().min_w_0().whitespace_normal())
             .into_any_element()
     }
 }

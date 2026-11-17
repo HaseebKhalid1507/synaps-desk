@@ -2,8 +2,11 @@
 //! (`/dev/dri`, `/dev/nvidia*`, the driver and Vulkan/GL libraries) are
 //! summed separately so their share of RSS/PSS is visible.
 
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(target_os = "linux")]
+use serde_json::json;
 
+#[cfg(target_os = "linux")]
 #[derive(Default, Clone, Copy)]
 struct Acc {
     rss: u64,
@@ -12,6 +15,7 @@ struct Acc {
     anon: u64,
 }
 
+#[cfg(target_os = "linux")]
 fn is_gpu(path: &str) -> bool {
     const PATTERNS: &[&str] = &[
         "/dev/dri",

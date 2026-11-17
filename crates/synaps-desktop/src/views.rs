@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -1075,9 +1074,7 @@ impl AppView {
                         .cursor_pointer()
                         .child(mono(usage::money(t), 12., p.cost_ch))
                         .child(display("T O D A Y", 12., p.dim_ch))
-                        .tooltip(|window, cx| {
-                            Tooltip::new("Spend today, all hosts · open Usage").action(&OpenUsage, None).build(window, cx)
-                        })
+                        .tooltip(|window, cx| crate::overlay::tip_key("Spend today, all hosts · open Usage", &OpenUsage, window, cx))
                         .on_click(cx.listener(|this, _, _, cx| this.open_view(Kind::Usage, cx))),
                 )
             })
@@ -1108,7 +1105,7 @@ impl AppView {
             .justify_center()
             .cursor_pointer()
             .child(gear(rest, Some(hover)))
-            .tooltip(|window, cx| Tooltip::new("Settings and Usage").build(window, cx))
+            .tooltip(|window, cx| crate::overlay::tip("Settings and Usage", window, cx))
             .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
                 cx.stop_propagation();
                 let dismissed = this.gear_dismissed.take();
@@ -1122,40 +1119,23 @@ impl AppView {
             }))
     }
 
-    /// The gear's menu, above it on `card`: two rows with their keys.
+    /// The gear's menu, above it: a [`crate::menu::Menu`] of two items with
+    /// their keys, drawn as every menu is.
     pub(crate) fn render_gear_menu(&self, folded: bool, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+        use crate::menu::{At, Item, Menu};
         let (ks, ku) = key_names();
-        let row = |id: &'static str, label: &'static str, key: &'static str, kind: Kind| {
-            h_flex()
-                .id(id)
-                .h(px(32.))
-                .px(px(14.))
-                .gap(px(24.))
-                .items_center()
-                .cursor_pointer()
-                .hover(|d| d.bg(p.raised))
-                .child(div().flex_1().text_size(px(14.)).text_color(p.ink).child(label))
-                .child(mono(key, 12., p.dim_k))
-                .on_click(cx.listener(move |this, _, _, cx| this.open_view(kind, cx)))
+        let items = vec![Item::new(Kind::Settings, "Settings").key(ks), Item::new(Kind::Usage, "Usage").key(ku)];
+        let menu = Menu::new(items, At::Point(Point::default()), false);
+        let pick = |this: &mut AppView, kind, _, _: &mut Window, cx: &mut Context<AppView>| this.open_view(kind, cx);
+        let close = |this: &mut AppView, ev: &MouseDownEvent| {
+            this.gear_dismissed = Some(ev.position);
+            this.gear_menu = false;
         };
-        v_flex()
-            .id("gear-menu")
+        div()
             .absolute()
             .left(px(if folded { 6. } else { 14. }))
             .bottom(px(FOOT + 4.))
-            .w(px(300.))
-            .py(px(4.))
-            .bg(p.card)
-            .border_1()
-            .border_color(p.edge)
-            .occlude()
-            .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                this.gear_dismissed = Some(ev.position);
-                this.gear_menu = false;
-                cx.notify();
-            }))
-            .child(row("menu-settings", "Settings", ks, Kind::Settings))
-            .child(row("menu-usage", "Usage", ku, Kind::Usage))
+            .child(crate::menu::render("gear-menu", &menu, p, pick, close, cx).w(px(300.)))
     }
 }
 

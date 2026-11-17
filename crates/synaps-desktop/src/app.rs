@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, RopeExt as _, Textarea, TextareaState};
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -20,6 +19,7 @@ use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError,
 
 use crate::bench::BenchState;
 use crate::files::{self, Preview};
+use crate::fonts::TextPx as _;
 use crate::fonts::{self, label};
 use crate::glyph::{self, Ground};
 use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, Model, RenameRequest};
@@ -354,8 +354,15 @@ const fn panel_keys(mac: bool) -> (&'static str, &'static str) {
 
 /// The rail's and the right panel's widths in the 1280-px layout: the auto
 /// widths never go under them, and a dragged width wider than them gives
-/// way down to them, not further, when the window narrows.
-pub(crate) const FLOORS: (f32, f32) = (276., 296.);
+/// way down to them, not further, when the window narrows. The rail's: its
+/// three chips on one line at 12 px (measured: 255 px of 268 with one-digit
+/// counts; a two-digit count adds a 7.2-px cell), line 2 room for its sub.
+pub(crate) const FLOORS: (f32, f32) = (312., 296.);
+/// The auto rail's narrowest (PR #7's floor): beside a strip, on a window
+/// too narrow for its floor and the centre's [`CENTRE_MIN`], a rail the
+/// user never dragged gives way down to this (its chips wrap). A dragged
+/// one stops at its floor.
+const RAIL_YIELD: f32 = 276.;
 /// A drag past this share of a panel's narrowest width folds it.
 const SNAP: f32 = 0.6;
 
@@ -443,7 +450,10 @@ pub(crate) fn sides(window: f32, panels: theme::Panels, mark: f32) -> (Side, Sid
             }
             (Side::Open(l), Side::Open(r))
         }
-        (true, false) => (Side::Open(want_l.min((room - STRIP).max(floor_l)).floor()), Side::Strip),
+        (true, false) => {
+            let floor = if panels.rail_width.is_none() { RAIL_YIELD } else { floor_l };
+            (Side::Open(want_l.min((room - STRIP).max(floor)).floor()), Side::Strip)
+        }
         (false, true) => (Side::Strip, Side::Open(want_r.min(room - STRIP).floor())),
         (false, false) => (Side::Strip, Side::Strip),
     }
@@ -1186,6 +1196,9 @@ pub struct AppView {
     composer_rows: usize,
     /// The top bar's words, measured at the first frame.
     pub(crate) top_words: Option<crate::fit::TopWords>,
+    /// The find field shows its placeholder's first word only (a rail too
+    /// narrow for all of it: [`crate::chrome::find_fits`]).
+    find_short: bool,
     /// The rail's find (`/`; Enter opens by exact name) and "Name this
     /// session…" (the naming row's) inputs.
     pub(crate) find_input: Entity<InputState>,
@@ -1416,7 +1429,7 @@ pub struct AppView {
     /// rest of its double-click goes nowhere ([`crate::wtabs::MULTI_CLICK`]).
     pub(crate) swallow_clicks: Option<Instant>,
     /// Display caps' widths ([`AppView::display_w`]), measured once.
-    widths: RefCell<std::collections::HashMap<(&'static str, u32), f32>>,
+    pub(crate) widths: RefCell<std::collections::HashMap<(&'static str, u32), f32>>,
     /// What reached [`AppView::submit`], and whether a worker's view was
     /// on screen (a steer): the UI tests' record of what would have gone.
     #[cfg(test)]
@@ -1433,7 +1446,7 @@ pub(crate) fn display(text: impl Into<SharedString>, size: f32, color: Hsla) -> 
     div()
         .font_family(fonts::DISPLAY)
         .font_weight(FontWeight::SEMIBOLD)
-        .text_size(px(size))
+        .text_px(size)
         .text_color(color)
         .whitespace_nowrap()
         .child(text.into())
@@ -1446,7 +1459,7 @@ pub(crate) fn count(n: usize) -> SharedString {
 }
 
 pub(crate) fn mono(text: impl Into<SharedString>, size: f32, color: Hsla) -> Div {
-    div().font_family(fonts::MONO).text_size(px(size)).text_color(color).whitespace_nowrap().child(text.into())
+    div().font_family(fonts::MONO).text_px(size).text_color(color).whitespace_nowrap().child(text.into())
 }
 
 /// A section header: display caps plus the Japanese sub-label.
@@ -1454,8 +1467,8 @@ pub(crate) fn section(title: &'static str, jp: &'static str, p: &Palette) -> Div
     h_flex()
         .items_baseline()
         .gap(px(10.))
-        .child(display(title, 11.5, p.header))
-        .child(div().font_family(fonts::JP).text_size(px(10.)).text_color(p.dim_ch).child(jp))
+        .child(display(title, fonts::size::D_S, p.header))
+        .child(div().font_family(fonts::JP).text_px(fonts::size::JP).text_color(p.dim_ch).child(jp))
 }
 
 impl AppView {
@@ -1470,7 +1483,7 @@ impl AppView {
             s.set_scrollbar_renderer(Some(crate::scrollbar::editor()));
             s
         });
-        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("find · open by name"));
+        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::chrome::FIND.0));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
         let secret_input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("answer (hidden)"));
@@ -1694,6 +1707,7 @@ impl AppView {
             composer: i.composer,
             composer_rows: crate::fit::COMPOSER_ROWS,
             top_words: None,
+            find_short: false,
             find_input: i.find_input,
             name_input: i.name_input,
             hex_input: i.hex_input,
@@ -3902,7 +3916,7 @@ impl AppView {
     fn render_session_menu(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
         let (m, _) = self.smenu.as_ref()?;
         let crate::menu::At::Point(pt) = m.at else { return None };
-        let body = crate::menu::render("session-menu", m, p, AppView::session_menu_pick, cx);
+        let body = crate::menu::render("session-menu", m, p, AppView::session_menu_pick, |this, _| this.close_menu(), cx);
         Some(deferred(anchored().position(pt).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
     }
 
@@ -3916,8 +3930,8 @@ impl AppView {
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str()).or(self.model.tabs.current_session());
         let live = session
             .and_then(|s| self.worker_state(s, &w.handle_id, Some(w.key())))
-            .or_else(|| Liveness::of_view(w.state()))
-            .unwrap_or(Liveness::Started);
+            // Its session in no list here: what its own pages said.
+            .unwrap_or_else(|| Liveness::of(crate::subagents::Status::word(&w.status), true, w.gone.is_none()));
         let row = self.tray.rows.iter().find(|r| {
             r.id == w.subagent_id && !r.facts.is_empty() && crate::wtabs::same_worker((r.call.as_deref(), r.name.as_ref()), w.key())
         });
@@ -4002,7 +4016,7 @@ impl AppView {
 
     /// Display caps `text` at `size`, as wide as it is drawn: measured once
     /// per size in the embedded face.
-    fn display_w(&self, text: &'static str, size: f32, window: &Window) -> f32 {
+    pub(crate) fn display_w(&self, text: &'static str, size: f32, window: &Window) -> f32 {
         let key = (text, size.to_bits());
         if let Some(w) = self.widths.borrow().get(&key) {
             return *w;
@@ -4052,7 +4066,7 @@ impl AppView {
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
-                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
         };
         let error = self.model.named.rename_error.clone();
         let mut row = v_flex().py(px(crate::fit::naming_pad(form))).gap(px(crate::fit::NAMING_GAP)).child(
@@ -4091,12 +4105,7 @@ impl AppView {
             }
             if let Some(o) = offer {
                 row = row.child(
-                    h_flex()
-                        .h(line)
-                        .gap(px(12.))
-                        .items_center()
-                        .child(note("name-offer", o.into(), p.prose).text_size(px(13.)))
-                        .child(replace()),
+                    h_flex().h(line).gap(px(12.)).items_center().child(note("name-offer", o.into(), p.prose).text_px(13.)).child(replace()),
                 );
             }
         }
@@ -4140,7 +4149,7 @@ impl AppView {
         } else if secret {
             Some(
                 h_flex()
-                    .gap(px(22.))
+                    .gap(px(24.))
                     .items_center()
                     .child(
                         h_flex()
@@ -4149,7 +4158,7 @@ impl AppView {
                             .child(
                                 div()
                                     .w(px((260. * m.r).round()))
-                                    .child(Input::new(&self.secret_input).disabled(!can).text_size(px(m.mono))),
+                                    .child(Input::new(&self.secret_input).disabled(!can).text_px(m.mono).border_color(p.frame)),
                             )
                             // Ctrl/Cmd+Enter takes the keys into the field.
                             .when(keys && !in_field, |d| d.child(key_hint(YES_KEY))),
@@ -4160,7 +4169,7 @@ impl AppView {
                             label::SUBMIT,
                             (in_field && can && typed).then_some(if cfg!(target_os = "macos") { "RETURN" } else { "ENTER" }),
                             can && typed,
-                            p.warn_fill,
+                            Fill::Warn,
                             p,
                             m,
                         )
@@ -4172,7 +4181,7 @@ impl AppView {
                             .items_center()
                             .child(
                                 tbtn("p-cancel", label::CANCEL, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
-                                    .text_size(px(m.label))
+                                    .text_px(m.label)
                                     .when(can, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx)))),
                             )
                             .when(keys, |d| d.child(key_hint("ESC"))),
@@ -4182,12 +4191,12 @@ impl AppView {
             let yes = can && ready;
             Some(
                 h_flex()
-                    .gap(px(22.))
+                    .gap(px(24.))
                     .items_center()
                     // Clickable whenever the card may be answered: the read
                     // gate is checked at the click (as the keys do), not by
                     // this frame, laid out with the last one's bounds.
-                    .child(fbtn_key("p-yes", label::AUTHORIZE, (keys && yes).then_some(YES_KEY), yes, p.warn_fill, p, m).when_some(
+                    .child(fbtn_key("p-yes", label::AUTHORIZE, (keys && yes).then_some(YES_KEY), yes, Fill::Warn, p, m).when_some(
                         key.filter(|_| can),
                         |d, key| {
                             d.on_click(cx.listener(move |this, _, _, cx| {
@@ -4202,7 +4211,7 @@ impl AppView {
                             .items_center()
                             .child(
                                 tbtn("p-no", label::DENY, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
-                                    .text_size(px(m.label))
+                                    .text_px(m.label)
                                     .when_some(key.filter(|_| can), |d, key| {
                                         d.on_click(cx.listener(move |this, _, _, cx| {
                                             this.answer(key, Some(CONFIRM_NO.into()));
@@ -4275,7 +4284,7 @@ impl AppView {
             .border_color(p.canvas)
             .bg(p.canvas)
             .font_family(fonts::MONO)
-            .text_size(px(m.mono))
+            .text_px(m.mono)
             .line_height(px(m.code_line))
             .text_color(p.well_fg)
             .child(body);
@@ -4288,7 +4297,7 @@ impl AppView {
         // Cramped: the lead is the title (the head when there is none).
         let title = if cramped && !lead.is_empty() {
             div()
-                .text_size(px(m.card_lead))
+                .text_px(m.card_lead)
                 .text_color(p.prose_k)
                 .whitespace_nowrap()
                 .min_w_0()
@@ -4296,10 +4305,10 @@ impl AppView {
                 .text_ellipsis()
                 .child(lead.clone())
         } else {
-            display(head, m.card_title, p.warn_k).min_w_0().overflow_hidden().text_ellipsis()
+            display(head, m.label, p.warn_k).min_w_0().overflow_hidden().text_ellipsis()
         };
         let lead_row = dims.lead.filter(|_| !lead.is_empty()).map(|(gap, line)| {
-            let d = div().flex_none().mt(px(gap)).text_size(px(m.card_lead)).line_height(px(line)).text_color(p.prose_k);
+            let d = div().flex_none().mt(px(gap)).text_px(m.card_lead).line_height(px(line)).text_color(p.prose_k);
             // A short window keeps it to one line (the body says the rest).
             if lay.short { d.h(px(line)).whitespace_nowrap().overflow_hidden().text_ellipsis() } else { d }.child(lead)
         });
@@ -4315,7 +4324,7 @@ impl AppView {
                 .mt(px(dims.top))
                 .ml(px(lay.left))
                 .mr(px(lay.right))
-                .px(px((20. * r).round()))
+                .px(px(m.pad_x))
                 .py(px(dims.pad_y))
                 .border_1()
                 .border_color(p.warn_mark)
@@ -4393,7 +4402,7 @@ impl AppView {
                 .min_w_0()
                 .overflow_hidden()
                 .text_ellipsis()
-                .tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
+                .tooltip(move |window, cx| crate::overlay::tip(text.clone(), window, cx))
                 .into_any_element()
         } else {
             line.whitespace_normal().into_any_element()
@@ -4511,7 +4520,7 @@ impl AppView {
         let name_w = worker.map_or(0., |w| (mono_w(&w.name).min(24. * cell)) + 8. + mono_w(&w.handle_id));
         let lead_w = if worker.is_some() { main_w + 8. + cell + 8. + m.lead } else { m.lead };
         let fit = fit_foot(&FootIn {
-            room: lay.column - 2. * m.pad_x - 2.,
+            room: lay.column - 2. * m.pad_x,
             lead: lead_w,
             word: word_w,
             name: name_w,
@@ -4522,10 +4531,10 @@ impl AppView {
             primary: primary_w,
             tight: lay.tight,
         });
-        let send = fbtn("send", primary, can_send, p.btn_fill, p, m)
+        let send = fbtn("send", primary, can_send, Fill::Btn, p, m)
             .when(worker.is_none(), |d| {
                 d.tooltip(move |window, cx| {
-                    Tooltip::new(if busy { "steer: applied at the next turn boundary" } else { "send: starts a turn" }).build(window, cx)
+                    crate::overlay::tip(if busy { "steer: applied at the next turn boundary" } else { "send: starts a turn" }, window, cx)
                 })
             })
             .on_click(cx.listener(|this, _, window, cx| {
@@ -4544,7 +4553,7 @@ impl AppView {
                 .flex_none()
                 .cursor_pointer()
                 .hover(|d| d.text_color(p.err))
-                .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+                .tooltip(move |window, cx| crate::overlay::tip(tip, window, cx))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.halt();
                     cx.notify();
@@ -4557,30 +4566,35 @@ impl AppView {
                 .flex_none()
                 .cursor_pointer()
                 .hover(|d| d.text_color(p.ink))
-                .tooltip(|window, cx| Tooltip::new("back to the session · Esc").build(window, cx))
+                .tooltip(|window, cx| crate::overlay::tip("back to the session · Esc", window, cx))
                 .on_click(cx.listener(|this, _, _, cx| this.leave_worker(false, cx)))
         };
         let glyph_el = || g.map(|g| div().flex().debug_selector(|| "foot-glyph".into()).child(glyph::draw(g, mark)).into_any_element());
         // A worker tab's glyph says whose; the primary may shorten.
-        let field = Textarea::new(&self.composer)
-            .appearance(false)
-            .disabled(!drives)
-            .text_size(px(m.body))
-            .line_height(px(m.body_line))
-            .text_color(p.ink);
+        // Its text at `inset` (design.md §8.11): the kit pads a multi-line
+        // field's text by its own `input_px` whatever its appearance, so the
+        // field reaches that far past the composer's padding on each side.
+        let field = div().mx(px(-kit_input_px())).child(
+            Textarea::new(&self.composer)
+                .appearance(false)
+                .disabled(!drives)
+                .text_px(m.body)
+                .line_height(px(m.body_line))
+                .text_color(p.ink),
+        );
         // Cramped, the draft's note is on the notice line.
         let inline = dims.row_gap.is_none();
         let inner = if inline {
             // Under a 120 px field the row sheds MAIN, then STEER WORKER
             // says STEER (the glyph still names whose).
-            let room = lay.column - 2. * m.pad_x - 2.;
+            let room = lay.column - 2. * m.pad_x;
             let rest = |main: bool, primary: f32| {
                 16. + if main { main_w + 8. } else { 0. } + 10. + if halt { 24. + halt_w } else { 0. } + 24. + primary
             };
             let main = worker.is_some() && room - rest(true, primary_w) >= 120.;
             let short = primary == label::STEER_WORKER && room - rest(main, primary_w) < 120.;
             let send = if short {
-                fbtn("send", label::STEER, can_send, p.btn_fill, p, m).on_click(cx.listener(|this, _, window, cx| {
+                fbtn("send", label::STEER, can_send, Fill::Btn, p, m).on_click(cx.listener(|this, _, window, cx| {
                     let text = this.composer.read(cx).value().trim().to_string();
                     if !text.is_empty() && this.submit(text) {
                         this.composer.update(cx, |s, cx| s.set_value("", window, cx));
@@ -4668,7 +4682,8 @@ impl AppView {
         column(
             lay,
             v_flex()
-                .px(px(m.pad_x))
+                // The frame sits inside the inset (design.md §1.1).
+                .px(px(m.pad_x - 1.))
                 .pt(px(dims.pad_top))
                 .pb(px(dims.pad_bottom))
                 .bg(p.user)
@@ -4677,7 +4692,7 @@ impl AppView {
                 .border_color(p.edge)
                 // The user's bar over the left border.
                 .child(div().absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(2.)).bg(p.you_mark))
-                .text_size(px(m.body))
+                .text_px(m.body)
                 .line_height(px(m.body_line))
                 .text_color(p.ink)
                 // The kit sizes its own text: the step is set on it.
@@ -4689,14 +4704,40 @@ impl AppView {
     }
 }
 
-/// A text button: tracked caps, `color`, `hover` on hover.
-pub(crate) fn tbtn(id: &'static str, text: &'static str, color: Hsla, hover: Hsla) -> Stateful<Div> {
-    display(text, 13., color).id(id).cursor_pointer().hover(move |d| d.text_color(hover))
+/// The kit's horizontal padding of a medium input's text, drawn whatever
+/// the input's appearance (read from the kit: it follows an upgrade).
+pub(crate) fn kit_input_px() -> f32 {
+    gpui_kit::component::Size::Medium.input_px().into()
 }
 
-/// A filled button (AUTHORIZE, SEND): its label is the chrome colour on
-/// `fill` (lifted until that reads at 4.5:1), dimmed when it cannot act.
-pub(crate) fn fbtn(id: &'static str, text: &'static str, enabled: bool, fill: Hsla, p: &Palette, m: &Metrics) -> Stateful<Div> {
+/// A text button: tracked caps, `color`, `hover` on hover.
+pub(crate) fn tbtn(id: &'static str, text: &'static str, color: Hsla, hover: Hsla) -> Stateful<Div> {
+    display(text, fonts::size::D_M, color).id(id).cursor_pointer().hover(move |d| d.text_color(hover))
+}
+
+/// A filled button's fill: SEND and STEER's, or the warning's
+/// (AUTHORIZE, SUBMIT).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fill {
+    Btn,
+    Warn,
+}
+
+impl Fill {
+    /// At rest and hovered (a step toward the ink).
+    fn roles(self, p: &Palette) -> (Hsla, Hsla) {
+        match self {
+            Fill::Btn => (p.btn_fill, p.btn_hi),
+            Fill::Warn => (p.warn_fill, p.warn_hi),
+        }
+    }
+}
+
+/// A filled button (AUTHORIZE, SEND, design.md §8.12): its label is the
+/// chrome colour on its fill (lifted until that reads at 4.5:1), the fill
+/// a step up while hovered. One that cannot act has no fill: a 1 px
+/// `edge` outline (inside its box: nothing moves) and a `dim` label.
+pub(crate) fn fbtn(id: &'static str, text: &'static str, enabled: bool, fill: Fill, p: &Palette, m: &Metrics) -> Stateful<Div> {
     fbtn_key(id, text, None, enabled, fill, p, m)
 }
 
@@ -4706,21 +4747,23 @@ pub(crate) fn fbtn_key(
     text: &'static str,
     key: Option<&'static str>,
     enabled: bool,
-    fill: Hsla,
+    fill: Fill,
     p: &Palette,
     m: &Metrics,
 ) -> Stateful<Div> {
-    let (bg, fg) = if enabled { (fill, p.chrome) } else { (p.edge, p.dim) };
+    let (bg, hi) = fill.roles(p);
+    let fg = if enabled { p.chrome } else { p.dim };
     div()
         .id(id)
+        .relative()
         .h(px(crate::fit::button_h(m)))
         .px(px(16.))
         .flex()
         .flex_none()
         .gap(px(10.))
         .items_center()
-        .bg(bg)
-        .when(enabled, |d| d.cursor_pointer().hover(|d| d.opacity(0.88)))
+        .when(enabled, |d| d.bg(bg).cursor_pointer().hover(move |d| d.bg(hi)))
+        .when(!enabled, |d| d.child(div().absolute().inset_0().border_1().border_color(p.edge)))
         .child(display(text, m.label, fg))
         .when_some(key, |d, k| d.child(mono(k, m.meta, fg)))
 }
@@ -4902,7 +4945,25 @@ impl Render for AppView {
         let view_pane = (self.width - crate::chrome::MARK - rail.width()).max(0.);
         // Its height under the full top bar, whatever bar is drawn.
         if self.top_words.is_none() {
-            self.top_words = Some(crate::chrome::top_words(window));
+            let words = crate::chrome::top_words(window);
+            log::debug!(target: "synaps_desktop::words", "top bar {words:?}");
+            self.top_words = Some(words);
+            // The rail rows' state words (line 2's room for the rest).
+            for st in crate::chrome::WORDED {
+                if let Some(w) = st.word() {
+                    self.display_w(w, fonts::size::D_S, window);
+                }
+            }
+        }
+        // The find field's placeholder whole where it fits, else its first
+        // word: never cut mid-word.
+        if let (Side::Open(w), Some(t)) = (rail, self.top_words.as_ref()) {
+            let short = !crate::chrome::find_fits(w, t.cell);
+            if short != self.find_short {
+                self.find_short = short;
+                let text = if short { crate::chrome::FIND.1 } else { crate::chrome::FIND.0 };
+                self.find_input.update(cx, |s, cx| s.set_placeholder(text, window, cx));
+            }
         }
         // The form from what decides it (not the stub or the tray).
         let ex = crate::fit::Extras { stub: false, tray: 0, ..self.extras() };
@@ -5242,7 +5303,7 @@ impl Render for AppView {
             .bg(p.chrome)
             .text_color(p.ink)
             .font_family(fonts::SANS)
-            .text_size(px(13.))
+            .text_px(13.)
             .child(
                 v_flex().flex_1().h_full().min_w_0().child(self.render_top(&p, rail, cx)).child(
                     h_flex()
@@ -5642,10 +5703,10 @@ mod tests {
     #[test]
     fn side_panels_follow_the_window() {
         let open = Panels::default();
-        assert_eq!(sides(1280., open, 30.), (Side::Open(276.), Side::Open(296.)));
-        assert_eq!(sides(1920., open, 30.), (Side::Open(276.), Side::Open(296.)));
+        assert_eq!(sides(1280., open, 30.), (Side::Open(312.), Side::Open(296.)));
+        assert_eq!(sides(1920., open, 30.), (Side::Open(312.), Side::Open(296.)));
         assert_eq!(sides(2560., open, 30.), (Side::Open(340.), Side::Open(358.)));
-        assert_eq!(sides(1000., open, 30.), (Side::Open(276.), Side::Strip));
+        assert_eq!(sides(1000., open, 30.), (Side::Open(312.), Side::Strip));
         assert_eq!(sides(700., open, 30.), (Side::Strip, Side::Strip));
         let folded = Panels { rail_collapsed: true, right_collapsed: true, ..Panels::default() };
         assert_eq!(sides(700., folded, 30.), (Side::Strip, Side::Strip));
@@ -5683,13 +5744,39 @@ mod tests {
         assert_eq!(sides(700., open, 30.), sides(700., both, 30.));
     }
 
-    /// The PR #7 rule, before panels could be dragged.
+    /// The PR #7 rule, before panels could be dragged, with the rail's
+    /// 312 floor: beside a strip it gives way to the centre's minimum, down
+    /// to PR #7's 276.
     fn pr7_sides(window: f32, panels: Panels) -> (Side, Side) {
         let (rail_w, right_w) = side_widths(window);
         let rail = if !panels.rail_collapsed && window >= 760. { Side::Open(rail_w) } else { Side::Strip };
         let right =
             if !panels.right_collapsed && window - 30. - rail.width() - right_w >= CENTRE_MIN { Side::Open(right_w) } else { Side::Strip };
+        let rail = match (rail, right) {
+            (Side::Open(w), Side::Strip) => Side::Open(w.min((window - 30. - CENTRE_MIN - super::STRIP).max(276.)).floor()),
+            (r, _) => r,
+        };
         (rail, right)
+    }
+
+    /// The auto rail on a narrow window: it gives way so the centre keeps
+    /// [`CENTRE_MIN`], down to 276 (then the centre gives); one the user
+    /// dragged keeps its floor.
+    #[test]
+    fn the_auto_rail_gives_way_to_the_centre() {
+        let m = crate::chrome::MARK;
+        let centre = |window: f32, (l, r): (Side, Side)| window - m - l.width() - r.width();
+        let open = Panels::default();
+        assert_eq!(sides(1280., open, m), (Side::Open(312.), Side::Open(296.)));
+        assert_eq!(centre(1280., sides(1280., open, m)), 672.);
+        assert_eq!(sides(1000., open, m), (Side::Open(312.), Side::Strip));
+        assert_eq!(centre(1000., sides(1000., open, m)), 656.);
+        assert_eq!(sides(800., open, m), (Side::Open(288.), Side::Strip));
+        assert_eq!(centre(800., sides(800., open, m)), CENTRE_MIN);
+        assert_eq!(sides(770., open, m), (Side::Open(276.), Side::Strip), "no narrower than 276");
+        // A width the user saved: its floor, as before.
+        assert_eq!(sides(800., hand(Some(312), None), m), (Side::Open(312.), Side::Strip));
+        assert_eq!(sides(800., hand(Some(400), None), m), (Side::Open(312.), Side::Strip));
     }
 
     fn centre(window: f32, (l, r): (Side, Side)) -> f32 {
@@ -5702,7 +5789,8 @@ mod tests {
 
     /// Auto widths lay out as before at every width; dragged widths stay in
     /// their limits, and never squeeze the centre under its minimum except
-    /// where the auto rail already does (a narrow window, rail at 276).
+    /// where the auto rail already does (a narrow window, the rail at its
+    /// floor).
     #[test]
     fn the_fit_rules_hold_at_every_width() {
         let folds = [(false, false), (true, false), (false, true), (true, true)];
@@ -5720,7 +5808,7 @@ mod tests {
                     let c = centre(window, shown);
                     if let Side::Open(w) = shown.0 {
                         assert!((220. ..=480.).contains(&w), "{window} {p:?} {shown:?}");
-                        assert!(c >= CENTRE_MIN || w <= 276., "{window} {p:?} {shown:?}");
+                        assert!(c >= CENTRE_MIN || w <= super::FLOORS.0, "{window} {p:?} {shown:?}");
                         assert_eq!(w, w.round());
                     }
                     if let Side::Open(w) = shown.1 {
@@ -5736,11 +5824,11 @@ mod tests {
         // A width set by hand beats the wide window's auto-widening.
         assert_eq!(sides(2560., hand(Some(250), Some(260)), 30.), (Side::Open(250.), Side::Open(260.)));
         // Too narrow for both as dragged: they give way in proportion...
-        assert_eq!(sides(1100., hand(Some(480), Some(520)), 30.), (Side::Open(284.), Side::Open(305.)));
+        assert_eq!(sides(1130., hand(Some(480), Some(520)), 30.), (Side::Open(317.), Side::Open(302.)));
         // ...then the right one is a strip and the rail stops at the centre's minimum...
         assert_eq!(sides(1000., hand(Some(480), Some(520)), 30.), (Side::Open(458.), Side::Strip));
         // ...then the PR #7 narrow layout.
-        assert_eq!(sides(800., hand(Some(480), Some(520)), 30.), (Side::Open(276.), Side::Strip));
+        assert_eq!(sides(800., hand(Some(480), Some(520)), 30.), (Side::Open(312.), Side::Strip));
         assert_eq!(sides(700., hand(Some(480), Some(520)), 30.), (Side::Strip, Side::Strip));
     }
 
@@ -5763,18 +5851,19 @@ mod tests {
         assert_eq!(rail(1250., 480.).rail_width, Some(474));
         assert_eq!(centre(1250., sides(1250., rail(1250., 480.), m)), CENTRE_MIN);
         let right = dragged(1250., open, false, 520.);
-        assert_eq!(right, hand(None, Some(494)));
-        assert_eq!(sides(1250., right, m), (Side::Open(276.), Side::Open(494.)));
+        assert_eq!(right, hand(None, Some(458)));
+        assert_eq!(sides(1250., right, m), (Side::Open(312.), Side::Open(458.)));
         assert_eq!(dragged(1920., open, false, 900.).right_width, Some(520));
-        // 770 px, rail only: as wide as the narrow layout already shows it, no wider.
+        // 770 px, rail only: as wide as the narrow layout already shows it
+        // (the auto rail gave way to 276), no wider.
         assert_eq!(rail(770., 400.).rail_width, Some(276));
         assert_eq!(rail(770., 240.).rail_width, Some(240));
         // Panels that had given way: the other one is held where it is, so
         // the dragged edge follows the pointer.
         let both = hand(Some(480), Some(520));
-        let p = dragged(1070., both, true, 250.);
-        assert_eq!(p, hand(Some(250), Some(305)));
-        assert_eq!(sides(1070., p, m), (Side::Open(250.), Side::Open(305.)));
+        let p = dragged(1150., both, true, 250.);
+        assert_eq!(p, hand(Some(250), Some(331)));
+        assert_eq!(sides(1150., p, m), (Side::Open(250.), Side::Open(331.)));
     }
 
     /// Dragged well past the narrowest width a panel folds, keeping the

@@ -11,12 +11,50 @@
 
 use std::borrow::Cow;
 
-use gpui_kit::App;
+use gpui_kit::{App, Styled, px};
 
 pub const DISPLAY: &str = "Hybrid Display";
 pub const SANS: &str = "Hybrid Sans";
 pub const MONO: &str = "Hybrid Mono";
 pub const JP: &str = "Hybrid Labels JP";
+
+/// The chrome's type scale (design.md §1.2), in px: nothing under 12. The
+/// column's sizes scale with the text step ([`crate::theme::Metrics`]);
+/// these are fixed. Usage's and the right panel's big figures (`fig.*`)
+/// keep their own sizes.
+/// A text size, the only way one is set (clippy's `disallowed-methods`
+/// holds every other): never under [`size::FLOOR`] (design.md §1.2). A
+/// size under it is a mistake the tests' debug build reports; a release
+/// build draws it at the floor.
+pub(crate) trait TextPx: Styled + Sized {
+    fn text_px(self, size: f32) -> Self {
+        debug_assert!(size >= size::FLOOR, "text under {} px: {size}", size::FLOOR);
+        #[allow(clippy::disallowed_methods)]
+        self.text_size(px(size.max(size::FLOOR)))
+    }
+}
+
+impl<E: Styled> TextPx for E {}
+
+pub mod size {
+    /// No text is smaller.
+    pub const FLOOR: f32 = 12.;
+    /// Display, small: state words outside runs, chips, field keys,
+    /// section heads, confirm words.
+    pub const D_S: f32 = 12.;
+    /// Display, medium: buttons, card titles, the wordmark.
+    pub const D_M: f32 = 13.;
+    /// Display, large: view titles.
+    pub const D_L: f32 = 16.;
+    /// Sans: menu items.
+    pub const UI: f32 = 14.;
+    /// Sans: rail and tab titles, overlay titles, tooltips, help.
+    pub const TITLE: f32 = 13.;
+    /// Mono: counts, handles, ages, costs, key hints, notes.
+    pub const META: f32 = 12.;
+    /// The Japanese sub-labels.
+    pub const JP: f32 = 12.;
+}
 
 const FILES: [&[u8]; 5] = [
     include_bytes!("../assets/fonts/HybridDisplay-SemiBold.ttf"),
@@ -125,6 +163,12 @@ pub mod label {
     pub const R_LOCK: &str = "L O C K";
     pub const R_ID: &str = "I D";
     pub const R_UPDATED: &str = "U P D A T E D";
+    // A worker's hover card's keys (its MODEL is the readout's).
+    pub const ELAPSED: &str = "E L A P S E D";
+    pub const RAN: &str = "R A N";
+    pub const TOOLS: &str = "T O O L S";
+    /// A cancel armed (the worker menu's item, a tray row's ×).
+    pub const CONFIRM: &str = "C O N F I R M ?";
 }
 
 #[cfg(test)]

@@ -230,9 +230,8 @@ pub(crate) enum Family {
 
 /// Where a glyph sits (design.md §4.4). `Run`: a run's surfaces (`tool`,
 /// `tool_out`): its rows, worker blocks and the tray. `User`: the composer
-/// foot. `Chrome`: the rail, the tabs, the top bar, and the kit's popover
-/// (the hover card, until overlays move to the card). `Card`: the NEEDS YOU
-/// stub and the authorization card.
+/// foot. `Chrome`: the rail, the tabs, the top bar. `Card`: the NEEDS YOU
+/// stub, the authorization card and the overlays (the hover card).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Ground {
     Canvas,
@@ -538,29 +537,6 @@ mod tests {
         assert_eq!(Liveness::of(Some(S::Running), true, true).cancelling(true), Liveness::Cancelling);
         assert_eq!(Liveness::of(Some(S::Done), true, true).cancelling(true), Liveness::Done, "ended: a cancel too late changes nothing");
         assert_eq!(Liveness::of(Some(S::Started), true, true).cancelling(true), Liveness::Cancelling, "a re-attach's start, cancelled");
-        // Two sources: the list's word; the view's over a start, and how it
-        // ended first.
-        let both = Liveness::of_sources;
-        assert_eq!(both(Some(S::Started), Some(Liveness::Running), true, true), Liveness::Running, "a re-attach's start, its view running");
-        assert_eq!(both(None, Some(Liveness::Running), true, true), Liveness::Running);
-        assert_eq!(both(Some(S::Started), Some(Liveness::Running), false, true), Liveness::LastSeen, "not attached: as last seen");
-        assert_eq!(both(Some(S::Started), None, true, true), Liveness::Started);
-        assert_eq!(
-            both(Some(S::Started), Some(Liveness::Gone), true, true),
-            Liveness::Started,
-            "a re-attach's start, its view offline before its first page"
-        );
-        assert_eq!(both(None, Some(Liveness::Gone), true, true), Liveness::Gone, "only its view knows it: gone");
-        assert_eq!(both(Some(S::Running), Some(Liveness::Done), true, true), Liveness::Done, "its pages said it ended first");
-        assert_eq!(
-            both(Some(S::Running), Some(Liveness::Gone), true, true),
-            Liveness::Running,
-            "a view gone (offline) is not how it ended"
-        );
-        assert_eq!(both(Some(S::Done), Some(Liveness::Running), true, true), Liveness::Done, "ended stays ended");
-        assert_eq!(both(Some(S::Running), None, false, true), Liveness::LastSeen);
-        assert_eq!(Liveness::of_view("timed out"), Some(Liveness::TimedOut));
-        assert_eq!((Liveness::of_view("offline"), Liveness::of_view("connecting")), (Some(Liveness::Gone), None));
         assert!(Liveness::Gone.ended() && !Liveness::LastSeen.ended() && !Liveness::Started.ended());
     }
 

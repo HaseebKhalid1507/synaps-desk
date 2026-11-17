@@ -1121,6 +1121,23 @@ impl Model {
         }
     }
 
+    /// Worker `handle_id`'s view, just polled, tells the attached
+    /// session's list what its pages say: one state per worker, whichever
+    /// source heard it first ([`crate::subagents::Subagents::heard_page`]).
+    /// Only a view of the worker the handle names now (a cold-started
+    /// daemon numbers from 1 again: a stale view says nothing of the new
+    /// one), and not one gone (offline is not how it ended). Whether the
+    /// list changed.
+    pub fn heard_view(&mut self, handle_id: &str, word: &str) -> bool {
+        let Some(id) = handle_id.strip_prefix("sa_").and_then(|n| n.parse::<u64>().ok()) else { return false };
+        let Some(w) = self.watch.worker(handle_id).filter(|w| w.gone.is_none()) else { return false };
+        if self.stats.subagents.ident(id).is_some_and(|now| !crate::wtabs::same_worker(w.key(), now)) {
+            return false;
+        }
+        let Some(status) = crate::subagents::Status::word(word) else { return false };
+        self.stats.subagents.heard_page(id, status)
+    }
+
     /// UNREAD marks of sessions in no list (closed, or past what is listed).
     fn prune_unread(&mut self) {
         if self.unread.is_empty() {
@@ -1203,8 +1220,23 @@ impl Model {
             // shows (an idle worker's empty pages, 4 a second, draw
             // nothing), and nothing of the rail's.
             Event::SubagentWatch { attach_seq, handle_id, since, reply, .. } => {
-                if self.current(attach_seq) && self.watch.on_reply(&handle_id, since, reply, std::time::Instant::now()) {
-                    self.view_dirty = true;
+                if self.current(attach_seq) {
+                    let heard = self.watch.on_reply(&handle_id, since, reply, std::time::Instant::now());
+                    // The page it took is a live source of the session's
+                    // list too (a reply it dropped says nothing).
+                    let fed = heard.page.as_deref().is_some_and(|word| self.heard_view(&handle_id, word));
+                    match heard.page.as_deref() {
+                        Some(word) if fed => {
+                            log::debug!(target: "synaps_desktop::workers", "{handle_id}@{since}: its page says {word}: the list takes it")
+                        }
+                        None if !heard.shown => {
+                            log::debug!(target: "synaps_desktop::workers", "{handle_id}@{since}: reply dropped (not the poll in flight)")
+                        }
+                        _ => {}
+                    }
+                    if fed || heard.shown {
+                        self.view_dirty = true;
+                    }
                 }
                 return effects;
             }
@@ -1865,6 +1897,86 @@ mod tests {
         m.watch.open(&Candidate::of(2, "sleeper"), None, t1);
         let _ = m.switch_out();
         assert_eq!(m.watch.poll_due(), None, "a background tab polls nothing");
+    }
+
+    /// Shady M1/M2: a worker's pages reach the session's list through the
+    /// pump, and only a page its view took: a reply it dropped (asked
+    /// before its focus moved) says nothing, so a re-attach's demotion
+    /// stands until a fresh page lifts it. A page's end, then the
+    /// stream's: why and how long (H1).
+    #[test]
+    fn the_list_hears_only_the_pages_its_view_took() {
+        use std::time::Instant;
+        use synaps_client::WatchReply;
+
+        use crate::subagents::Status;
+        use crate::watch::{Candidate, POLL_INTERVAL};
+        let ev = |seq: u64, v: Value| session(seq, synaps_client::protocol::decode_event(&v).unwrap());
+        let page = |n: u64, name: &str, status: &str| {
+            let v = json!({"handle_id": format!("sa_{n}"), "subagent_id": n, "agent_name": name, "status": status,
+                "steerable": status == "running", "next_seq": 1, "more": false, "events": []});
+            WatchReply::Page(Box::new(serde_json::from_value(v).unwrap()))
+        };
+        let watch = |seq: u64, n: u64, since: u64, reply: WatchReply| Event::SubagentWatch {
+            attach_seq: seq,
+            session_id: "s".into(),
+            handle_id: format!("sa_{n}"),
+            since,
+            reply,
+        };
+        let status = |m: &Model, n: u64| m.stats.subagents.status(n);
+        let mut m = Model::new(ConnState::Connecting);
+        attach(&mut m, 1);
+        for (n, name) in [(2, "sleeper"), (3, "scout")] {
+            let t = format!("t{n}");
+            m.apply(ev(
+                1,
+                json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start", "tool_id": t,
+                "input": {"agent": name, "task": "go"}}}),
+            ));
+            let res = json!({"handle_id": format!("sa_{n}"), "agent_name": name, "status": "running"}).to_string();
+            m.apply(ev(1, json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": t, "result": res}})));
+            m.apply(ev(
+                1,
+                json!({"ev": "subagent_rows", "rows": [{"subagent_id": n, "agent_name": name, "status": "running",
+                "cancel_requested": false, "elapsed_secs": 3.0, "finished_elapsed": null, "step": "ls", "tools": 1}]}),
+            ));
+        }
+        assert_eq!((status(&m, 2), status(&m, 3)), (Some(Status::Running), Some(Status::Running)));
+        // sa_2's view reads its first page: running.
+        let t0 = Instant::now();
+        m.watch.open(&Candidate::of(2, "sleeper"), None, t0);
+        assert_eq!(m.watch.take_poll(t0), Some(("sa_2".into(), 0)));
+        m.apply(watch(1, 2, 0, page(2, "sleeper", "running")));
+        // A reconnect: both "started" until a live source says again.
+        attach(&mut m, 2);
+        assert_eq!((status(&m, 2), status(&m, 3)), (Some(Status::Started), Some(Status::Started)), "demoted");
+        assert_eq!(m.watch.take_poll(Instant::now()), Some(("sa_2".into(), 1)), "asked again at once");
+        // Its focus moves to sa_3 before the answer comes: the answer is
+        // dropped, and the view's last page (the attachment before's) is
+        // not heard again.
+        m.watch.open(&Candidate::of(3, "scout"), None, Instant::now());
+        m.view_dirty = false;
+        m.apply(watch(2, 2, 1, page(2, "sleeper", "running")));
+        assert_eq!(status(&m, 2), Some(Status::Started), "the demotion stands");
+        assert!(!m.view_dirty, "nothing to draw");
+        // sa_3's own page, fresh: lifted.
+        assert_eq!(m.watch.take_poll(Instant::now()), Some(("sa_3".into(), 0)));
+        m.apply(watch(2, 3, 0, page(3, "scout", "running")));
+        assert_eq!(status(&m, 3), Some(Status::Running), "a page it took lifts it");
+        assert!(m.view_dirty);
+        // Its page says how it ended first; then the stream's end says why
+        // and how long.
+        assert_eq!(m.watch.take_poll(Instant::now() + 2 * POLL_INTERVAL), Some(("sa_3".into(), 1)));
+        m.apply(watch(2, 3, 1, page(3, "scout", "failed")));
+        assert_eq!(status(&m, 3), Some(Status::Failed));
+        m.apply(ev(
+            2,
+            json!({"ev": "stream", "event": {"kind": "agent", "agent": "subagent_done", "subagent_id": 3, "agent_name": "",
+            "result_preview": "ERROR: boom", "duration_secs": 12.5}}),
+        ));
+        let info = m.stats.subagents.info(3).expect("sa_3 known");
+        assert_eq!((info.status, info.line.as_str(), info.elapsed), (Some(Status::Failed), "reason: boom", Some(12.5)));
     }
 
     /// N-M1: a blocking `subagent` cut off by HALT (its tool dropped: no
