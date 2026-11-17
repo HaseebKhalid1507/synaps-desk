@@ -79,6 +79,7 @@ pub(crate) enum Edit {
 pub(crate) enum Pick {
     Config(&'static str),
     TextSize,
+    Motion,
     Rail,
     Right,
     Range,
@@ -167,6 +168,17 @@ impl AppView {
             Pick::TextSize => {
                 if let Ok(n) = value.parse::<u8>() {
                     self.set_text_size(n, cx);
+                }
+            }
+            Pick::Motion => {
+                // Choosing pins it (unset follows the OS).
+                if let Some(l) = crate::motion::Level::parse(value) {
+                    let mut st = cx.try_global::<crate::motion::Setting>().copied().unwrap_or_default();
+                    st.level = Some(l);
+                    cx.set_global(st);
+                    crate::motion::Level::apply(cx);
+                    self.save_app("motion", Some(l.key().to_string()), cx);
+                    cx.notify();
                 }
             }
             Pick::Rail | Pick::Right => {
@@ -833,6 +845,29 @@ impl AppView {
                 p,
                 cx,
             ),
+            tag: None,
+            under: Vec::new(),
+        });
+        let motion = cx.try_global::<crate::motion::Setting>().copied().unwrap_or_default();
+        let level = crate::motion::Level::current(cx);
+        rows.push(Row {
+            id: "app-motion".into(),
+            label: "Motion".into(),
+            key: "motion",
+            help: "Full, reduced (no movement, short fades) or off (nothing animates). Follows the system until you choose.",
+            control: match motion.lock {
+                Some(crate::motion::Lock::Flag) => Self::locked(format!("{} · set by --motion for this run", level.key()), p),
+                Some(crate::motion::Lock::NoBootFx) => Self::locked(format!("off · set by ${}", crate::motion::ENV_NO_BOOT_FX), p),
+                None => self.choice(
+                    "motion",
+                    Pick::Motion,
+                    crate::motion::Level::ALL.iter().map(|l| SharedString::from(l.key())).collect(),
+                    Some(level.key()),
+                    None,
+                    p,
+                    cx,
+                ),
+            },
             tag: None,
             under: Vec::new(),
         });

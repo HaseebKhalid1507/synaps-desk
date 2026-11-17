@@ -26,6 +26,7 @@ use crate::fonts::TextPx as _;
 use crate::fonts::{self, label};
 use crate::glyph::{self, Glyph, Ground};
 use crate::menu::At;
+use crate::motion::{self, Tag};
 use crate::subagents::{Live, Liveness, Status, fmt_secs};
 use crate::theme::{Metrics, Palette};
 use crate::watch::Candidate;
@@ -86,7 +87,15 @@ pub(crate) struct TrayCache {
     pub(crate) rows: Vec<TrayRow>,
     /// When the next finished worker drops.
     until: Option<Instant>,
+    /// Whose workers the rows are (a switch is not an arrival).
+    session: Option<String>,
+    /// Rows that left while watched, fading in their slot (no clicks):
+    /// their slot, the row, when it left (motion.md §6.2).
+    pub(crate) ghosts: Vec<(usize, TrayRow, Instant)>,
 }
+
+/// Tray rows' keys in [`motion::Motion`], apart from item ids.
+const TRAY: u64 = 1 << 61;
 
 impl AppView {
     /// The tray's rows, rebuilt if a worker changed; the timer that drops
@@ -94,6 +103,9 @@ impl AppView {
     pub(crate) fn sync_tray(&mut self, cx: &mut Context<Self>) {
         let attached = self.model.active.is_some();
         let now = Instant::now();
+        // A left row's fade is over: the dock shrinks, in one frame.
+        let gone = motion::exit(motion::QUICK);
+        self.tray.ghosts.retain(|g| now.saturating_duration_since(g.2) < gone);
         // Cancels the rows now say are cancelling (or ended) are done.
         if let Some(s) = self.model.active.as_ref().map(|a| a.session_id.as_str()) {
             let subs = &self.model.stats.subagents;
@@ -126,14 +138,30 @@ impl AppView {
         let cancels = &self.model.cancels;
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
         let pending = |id: u64| session.is_some_and(|s| cancels.pending(s, &format!("sa_{id}")));
-        let rows = rows
+        let rows: Vec<TrayRow> = rows
             .into_iter()
             .map(|l| {
                 let p = pending(l.id);
                 TrayRow::of(l, p)
             })
             .collect();
-        self.tray = TrayCache { key: Some(key), rows, until };
+        // Rows that came while watched draw in (staggered); rows that left fade out.
+        let session = self.model.active.as_ref().map(|a| a.session_id.clone());
+        let mut ghosts = std::mem::take(&mut self.tray.ghosts);
+        if self.fx.on() && session.is_some() && session == self.tray.session {
+            let fresh = rows.iter().filter(|r| !self.tray.rows.iter().any(|o| o.id == r.id));
+            for (k, r) in fresh.enumerate() {
+                self.fx.born(TRAY | r.id, now + motion::stagger(k));
+            }
+            for (slot, r) in self.tray.rows.iter().enumerate() {
+                if !rows.iter().any(|n| n.id == r.id) {
+                    ghosts.push((slot, r.clone(), now));
+                }
+            }
+        } else {
+            ghosts.clear();
+        }
+        self.tray = TrayCache { key: Some(key), rows, until, session, ghosts };
         // An open menu says what its worker can do now (it may have ended
         // under it); a keyboard one whose row has gone closes.
         self.refresh_menu();
@@ -186,7 +214,7 @@ impl AppView {
 
     /// The tray over the composer: [`AppView::tray_rows`] rows.
     pub(crate) fn render_tray(&self, p: &Palette, m: &Metrics, cx: &Context<Self>) -> Option<impl IntoElement> {
-        let shown = self.tray_rows.min(self.tray.rows.len());
+        let shown = self.tray_rows.min(self.tray.rows.len() + self.tray.ghosts.len());
         if shown == 0 {
             return None;
         }
@@ -202,10 +230,37 @@ impl AppView {
         let mut list = v_flex();
         let now = Instant::now();
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
-        for (i, r) in self.tray.rows.iter().take(workers).enumerate() {
-            let inline_more = (cramped && more > 0 && i == 0).then(|| mono(format!("+{more}"), m.meta, p.dim_t).flex_none());
-            let armed = session.is_some_and(|s| self.model.cancels.armed(s, r.id, (r.call.as_deref(), &r.name), now));
-            list = list.child(self.tray_row(r, watched == Some(r.id), armed, row_h, inline_more, p, m, cx));
+        let fx = &self.fx;
+        // Each row in its slot; a left row's ghost keeps its slot while it
+        // fades. A row that changed slot slides from its last place (`Flip`:
+        // a paint offset, the dock's rows are plain divs).
+        let ghosts = &self.tray.ghosts;
+        let (mut slot, mut drawn, mut real) = (0usize, Vec::new(), self.tray.rows.iter().take(workers).enumerate().peekable());
+        while slot < (workers + ghosts.len()).min(self.tray_rows.max(workers)) {
+            if let Some(g) = ghosts.iter().find(|g| g.0 == slot) {
+                let fade =
+                    1. - fx.shot(Some(g.2), std::time::Duration::ZERO, motion::exit(motion::QUICK), &motion::ease::IN, motion::Kind::Fade);
+                list = list.child(self.tray_ghost(&g.1, fade, row_h, p, m));
+                fx.want_frame();
+            } else if let Some((i, r)) = real.next() {
+                let inline_more = (cramped && more > 0 && i == 0).then(|| mono(format!("+{more}"), m.meta, p.dim_t).flex_none());
+                let armed = session.is_some_and(|s| self.model.cancels.armed(s, r.id, (r.call.as_deref(), &r.name), now));
+                let off = fx.slide(TRAY | r.id, slot as f32 * row_h);
+                list = list.child(div().relative().top(px(off)).child(self.tray_row(
+                    r,
+                    watched == Some(r.id),
+                    armed,
+                    row_h,
+                    inline_more,
+                    p,
+                    m,
+                    cx,
+                )));
+                drawn.push((slot, r.id));
+            } else {
+                break;
+            }
+            slot += 1;
         }
         if more > 0 && !cramped {
             list = list.child(h_flex().h(px(row_h)).pl(px(m.pad_x + m.lead)).items_center().child(mono(
@@ -216,7 +271,20 @@ impl AppView {
         }
         let (gap, pad) = if cramped { (4., 2.) } else { (8., 4.) };
         // The workers' bar down its lead edge; the watched row's is yours.
-        let you = watched.and_then(|w| self.tray.rows.iter().take(workers).position(|r| r.id == w));
+        let you = watched.and_then(|w| drawn.iter().find(|d| d.1 == w).map(|d| d.0));
+        // A row that came draws its segment of the bar (the rest of the
+        // segment is the tray's ground until it has).
+        let undrawn: Vec<(usize, f32)> = drawn
+            .iter()
+            .map(|&(slot, id)| (slot, fx.draw(fx.birth(TRAY | id), std::time::Duration::ZERO, motion::QUICK)))
+            .filter(|d| d.1 < 1.)
+            .collect();
+        // The watched row's bar draws when its view opens here, and lights
+        // after the composer's when you steer it (Handoff out).
+        let watch_at = fx.change(Tag::Watched, 0, watched.unwrap_or(0), None).filter(|_| watched.is_some()).map(|c| c.0);
+        let you_drawn = fx.draw(watch_at, std::time::Duration::ZERO, motion::QUICK);
+        let steer = fx.flash(fx.sent.get().filter(|s| s.1 && watched.is_some()).map(|s| s.0 + 2 * motion::STAGGER));
+        let you_color = motion::mix(p.you_mark_t, motion::mix(p.you, p.ink, 0.35), steer);
         Some(column(
             lay,
             div()
@@ -227,8 +295,11 @@ impl AppView {
                 .font_family(fonts::MONO)
                 .child(list)
                 .child(glyph::bar(p.sub_rule))
+                .children(undrawn.into_iter().map(|(i, k)| {
+                    div().absolute().left_0().top(px(pad + (i as f32 + k) * row_h)).w(px(2.)).h(px((1. - k) * row_h)).bg(p.tool)
+                }))
                 .when_some(you, |d, i| {
-                    d.child(div().absolute().left_0().top(px(pad + i as f32 * row_h)).w(px(2.)).h(px(row_h)).bg(p.you_mark_t))
+                    d.child(div().absolute().left_0().top(px(pad + i as f32 * row_h)).w(px(2.)).h(px(row_h * you_drawn)).bg(you_color))
                 }),
         ))
     }
@@ -275,7 +346,18 @@ impl AppView {
             // The watched worker (the composer steers it): its bar is the
             // tray's ([`AppView::render_tray`]).
             .when(watched, |d| d.bg(p.tool_out))
-            .child(glyph::lead(Some(glyph::draw(g, mark)), m))
+            .child(glyph::lead(
+                Some(crate::turns::live_glyph(
+                    &self.fx,
+                    g,
+                    mark,
+                    p.tool,
+                    self.fx.change(Tag::TrayGlyph, r.id, crate::turns::glyph_code(g), None),
+                    None,
+                    false,
+                )),
+                m,
+            ))
             .child(
                 h_flex()
                     .flex_1()
@@ -306,6 +388,34 @@ impl AppView {
             .when(!watched, |d| d.hover(|d| d.bg(p.tool_out)))
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who, false, ev, window, cx)))
             .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who2, false, ev, window, cx)))
+            .into_any_element()
+    }
+
+    /// A row that left, fading (`fade` 1 → 0) in its slot: what it said,
+    /// with no id, listener or hitbox (motion.md §8: an exit takes no click).
+    fn tray_ghost(&self, r: &TrayRow, fade: f32, h: f32, p: &Palette, m: &Metrics) -> AnyElement {
+        let (g, _, word, family) = glyph::worker(r.live);
+        let (word_color, mark) = glyph::ink(family, Ground::Run, p);
+        h_flex()
+            .debug_selector(|| "tray-ghost".into())
+            .h(px(h))
+            .w_full()
+            .px(px(m.pad_x))
+            .items_center()
+            .whitespace_nowrap()
+            .text_size(px(m.meta))
+            .opacity(fade)
+            .child(glyph::lead(Some(glyph::draw(g, mark)), m))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(m.run_gap))
+                    .items_center()
+                    .child(div().flex_none().max_w(px(m.meta * 0.6 * 18.)).overflow_hidden().text_color(p.sub_name_t).child(r.name.clone()))
+                    .child(div().flex_1().min_w_0().overflow_hidden().text_color(p.dim_t).child(r.line.clone()))
+                    .when(!self.layout.tight, |d| d.child(div().flex_none().text_color(word_color).child(word))),
+            )
             .into_any_element()
     }
 

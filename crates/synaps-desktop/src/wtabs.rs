@@ -925,6 +925,26 @@ impl AppView {
     /// row's full height `h`, so a near miss is not a click on the row. A
     /// double-click's second click is not a second press
     /// ([`Cancels::press`]).
+    /// The fuse after an armed cancel's CONFIRM (motion.md §6.2): three
+    /// 4 px `err_mark` cells, one going dark per second of [`CONFIRM`] on
+    /// the clock; Reduced, all three until it runs out; Off, none.
+    fn fuse(&self, p: &Palette) -> Option<Div> {
+        let until = self.model.cancels.armed_until()?;
+        let lit = match self.fx.level() {
+            crate::motion::Level::Off => return None,
+            crate::motion::Level::Reduced => 3,
+            crate::motion::Level::Full => {
+                let left = until.saturating_duration_since(self.fx.now());
+                let n = left.as_millis().div_ceil(1000).min(3) as u32;
+                if n > 0 {
+                    self.fx.tick_at(until - Duration::from_secs(u64::from(n - 1)));
+                }
+                n
+            }
+        };
+        Some(h_flex().flex_none().gap(px(4.)).children((0..3).map(|i| div().size(px(4.)).when(i < lit, |d| d.bg(p.err)))))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn cancel_x(
         &self,
@@ -955,6 +975,7 @@ impl AppView {
                 .cursor_pointer()
                 .child(div().text_color(p.err).child(format!("Cancel {name}?")))
                 .child(display(fonts::label::CONFIRM, crate::fonts::size::D_S, p.err))
+                .children(self.fuse(p))
         } else {
             // A reveal button (design.md §5): drawn while its row is hovered.
             h_flex()
