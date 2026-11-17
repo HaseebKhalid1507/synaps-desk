@@ -1590,7 +1590,11 @@ fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
     // A turn of its own: its first row, the call, carries AGENT.
     view.update(cx, |v, _| {
         let n = v.model.transcript.items().len();
-        v.model.transcript.apply(&SessionEvent::TurnStarted { turn_baseline: n as _, trigger: "user".into(), user_text: Some("Run it.".into()) });
+        v.model.transcript.apply(&SessionEvent::TurnStarted {
+            turn_baseline: n as _,
+            trigger: "user".into(),
+            user_text: Some("Run it.".into()),
+        });
     });
     running_tools(cx, &view, 1);
     for _ in 0..4 {
@@ -1613,7 +1617,10 @@ fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
     assert_eq!(row.size.height, gpui_kit::px(m.row), "one row");
     let column = f32::from(row.left()) + geo.out;
     let status = bounds(cx, leak(format!("tool-status {id}"))).expect("the status glyph's column");
-    assert!(f32::from(status.left()) >= f32::from(row.left()) && f32::from(status.right()) <= column, "{status:?}: in the gutter, inside the row's box");
+    assert!(
+        f32::from(status.left()) >= f32::from(row.left()) && f32::from(status.right()) <= column,
+        "{status:?}: in the gutter, inside the row's box"
+    );
     // Its AGENT label ends where the row's box starts.
     let label = bounds(cx, leak(format!("hang-label-{id}"))).expect("the call's AGENT label");
     assert!(label.right() <= row.left(), "the hover fill stops at the label: {label:?} {row:?}");

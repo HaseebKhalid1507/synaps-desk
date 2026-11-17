@@ -91,7 +91,7 @@ impl TrayRow {
         if let Some(s) = l.elapsed {
             facts.push(fmt_secs(s));
         }
-        let step = cut(&l.line, STEP_CHARS).into();
+        let step = cut(&crate::turns::tilde(&l.line, true), STEP_CHARS).into();
         let tip = if l.watchable {
             format!("watch {} (sa_{}) · middle-click: in a tab · {WORKER_KEY} walks the workers", l.name, l.id)
         } else {

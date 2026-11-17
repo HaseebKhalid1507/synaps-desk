@@ -584,6 +584,8 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     // `code`, the result's on `tool_out`.
     r.res = f.text("res", if well == code { t.code_fg } else { t.tool_result_color }, &[well]);
     r.dim_o = f.text("dim_o", t.muted, &[well]);
+    // Unpainted since Q1 cards (an opened thought is `think` on the
+    // canvas); kept for the roles that list it.
     r.think_o = think(&mut f, "think_o", &[tool_out]);
     r.ok_o = f.text("ok_o", t.tool_result_ok, &[add_bg]);
     r.err_o = f.text("err_o", t.error_color, &[del_bg, well]);
@@ -1576,7 +1578,8 @@ mod tests {
                 for wash in [r.add_bg, r.del_bg] {
                     let off = contrast(wash, r.canvas);
                     assert!(contrast(wash, r.well) >= SURFACE - 1e-9, "{name}");
-                    assert!(contrast(r.ink, wash) >= TEXT, "{name}");
+                    // Q1 measured 7.32 at the least (`roles_check.py`).
+                    assert!(contrast(r.ink, wash) >= 7., "{name}: ink on a wash {:.2}", contrast(r.ink, wash));
                     let over = off - contrast(r.card, r.canvas);
                     let most = if name == "solarized-dark" { 0.22 } else { 0.15 };
                     assert!(over <= most, "{name}: {over:.3} louder than the card");

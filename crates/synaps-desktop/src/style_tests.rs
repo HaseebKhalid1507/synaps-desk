@@ -142,16 +142,22 @@ fn no_opacity_outside_charts() {
 }
 
 /// No gradients anywhere (polish.md: "No gradients anywhere, on any card
-/// or control"; finish gate 6): flat fills only, and no shadow on a card.
+/// or control"; finish gate 6): flat fills only, and no shadow on a card
+/// (GPUI's `shadow_sm()` and kin too; `shadow_none()` takes one away).
 #[test]
 fn no_gradients_anywhere() {
     let bad: Vec<String> = sources()
         .into_iter()
         .filter(|(name, _)| name != "style_tests.rs")
         .flat_map(|(name, code)| {
-            ["linear_gradient", "LinearColorStop", "radial_gradient", ".shadow(", "box_shadow("]
+            ["linear_gradient", "LinearColorStop", "radial_gradient", ".shadow(", "shadow_", "box_shadow(", "BoxShadow"]
                 .into_iter()
-                .flat_map(|g| code.match_indices(g).map(|(at, _)| format!("{name}:{} {g}", line_of(&code, at))).collect::<Vec<_>>())
+                .flat_map(|g| {
+                    code.match_indices(g)
+                        .filter(|(at, _)| !code[*at..].starts_with("shadow_none("))
+                        .map(|(at, _)| format!("{name}:{} {g}", line_of(&code, at)))
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>()
         })
         .collect();
