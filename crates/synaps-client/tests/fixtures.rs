@@ -225,9 +225,10 @@ fn a_real_turn_streams_into_the_same_transcript_as_its_history() {
 }
 
 /// Message times: a history row carries its message's `_synaps_at`; a live
-/// row the `ts` of the event that started it, until its history form
-/// brings the message time (same row id, same `rev`: nothing to redraw but
-/// the time). A legacy message has none.
+/// row the `ts` of the event that started it, and keeps it when its
+/// history form lands (the daemon dates a message when its round ends:
+/// here the thinking streamed from 07:34:28, the history says 07:34:30).
+/// A legacy message has none.
 #[test]
 fn rows_carry_their_message_times() {
     let at = |t: &Transcript| t.items().iter().map(|i| (i.kind, i.at.as_deref().map(str::to_string))).collect::<Vec<_>>();
@@ -239,38 +240,50 @@ fn rows_carry_their_message_times() {
     assert!(want[1..want.len() - 1].iter().all(|(_, t)| *t == s("2026-11-13T07:34:30Z")), "{want:?}");
     assert_eq!(want.last().unwrap(), &(ItemKind::Assistant, s("2026-11-13T07:34:32Z")));
 
-    // Live: the first delta's row has its event's `ts`, then the history's time.
+    // Live: a row has the `ts` of the event that started it, from then on.
     let mut t = Transcript::new();
     t.load_attached(&attached("attached_create.json")).unwrap();
-    let mut live = None;
+    let mut first: Vec<(u64, String)> = Vec::new();
     for (env, ev) in events("turn_events.ndjson") {
         t.apply_at(&ev, &env.ts);
-        if live.is_none()
-            && let Some(row) = t.items().iter().find(|i| i.kind == ItemKind::Thinking && i.streaming)
-        {
-            assert_eq!(row.at.as_deref(), Some(env.ts.as_str()), "stamped by the event that started it");
-            live = Some(row.id);
+        for i in t.items() {
+            let at = i.at.as_deref().unwrap_or_else(|| panic!("row {} has a time", i.id));
+            match first.iter().find(|(id, _)| *id == i.id) {
+                Some((_, ts)) => assert_eq!(at, ts, "row {} keeps its first time", i.id),
+                None => first.push((i.id, at.to_string())),
+            }
         }
     }
-    let live = live.expect("thinking streamed");
-    assert_eq!(at(&t), want, "the history's times replace the live ones");
-    assert!(t.items().iter().any(|i| i.id == live && i.at.as_deref() == Some("2026-11-13T07:34:30Z")), "the same row");
+    let thinking = t.items().iter().find(|i| i.kind == ItemKind::Thinking).unwrap();
+    assert_eq!(thinking.at.as_deref(), Some("2026-11-13T07:34:28.569949873Z"), "not the history's 07:34:30");
+    assert_eq!(at(&t).iter().map(|r| r.0).collect::<Vec<_>>(), want.iter().map(|r| r.0).collect::<Vec<_>>());
+    // A re-attach (a reload) keeps them; a fresh one has the history's.
+    let seen = at(&t);
+    t.load_attached(&attached("attached_history.json")).unwrap();
+    assert_eq!(at(&t), seen);
 
     // Legacy history: no time, never one made up.
     let mut old = Transcript::new();
     old.apply_history(&[serde_json::json!({"role": "user", "content": "hi"})]);
     assert_eq!(old.items()[0].at, None);
-    // A live row keeps its time when its history form has none; a swapped
-    // conversation's rows never take a time from rows they replace.
+    // A live row keeps its time when its history form has none; another
+    // message at its id never takes it.
     old.apply_at(
         &SessionEvent::TurnStarted { turn_baseline: 1, trigger: "user".into(), user_text: Some("again".into()) },
         "2026-11-13T07:40:00.5Z",
     );
     let row = old.items()[1].id;
-    old.apply_history(&[serde_json::json!({"role": "user", "content": "hi"}), serde_json::json!({"role": "user", "content": "again"})]);
+    let both = [serde_json::json!({"role": "user", "content": "hi"}), serde_json::json!({"role": "user", "content": "again"})];
+    old.apply_history(&both);
     assert_eq!((old.items()[1].id, old.items()[1].at.as_deref()), (row, Some("2026-11-13T07:40:00.5Z")));
+    // A swapped conversation (cleared, resumed, compacted) reuses the ids,
+    // even for the same text: its legacy rows get no time of the old one's.
+    old.apply_at(&SessionEvent::Cleared { session_id: String::new() }, "2026-11-13T07:41:00Z");
+    old.apply_update(&HistoryUpdate::Replace { messages: both.to_vec() }).unwrap();
+    assert_eq!(old.items()[1].id, row, "the id is reused");
+    assert!(old.items().iter().filter(|i| !i.is_note()).all(|i| i.at.is_none()), "{:?}", at(&old));
     old.apply_update(&HistoryUpdate::Replace { messages: vec![serde_json::json!({"role": "user", "content": "other"}); 2] }).unwrap();
-    assert!(old.items().iter().all(|i| i.at.is_none()), "{:?}", at(&old));
+    assert!(old.items().iter().filter(|i| !i.is_note()).all(|i| i.at.is_none()), "{:?}", at(&old));
 }
 
 /// H1/M6: the client's path. Every `MessageHistory` of a real turn is an

@@ -1883,13 +1883,14 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| {
             let a = v.model.active.as_ref().expect("attached");
             let (attach_seq, session_id) = (a.attach_seq, a.session_id.clone());
-            let ev = |seq: u64, event: StreamEvent| synaps_client::Event::Session {
-                attach_seq,
-                session_id: session_id.clone(),
-                seq,
-                ts: String::new(),
-                event: SessionEvent::Stream { event },
-                raw: std::sync::Arc::new(serde_json::Value::Null),
+            let ev = |seq: u64, event: StreamEvent| {
+                synaps_client::Event::session(
+                    attach_seq,
+                    session_id.clone(),
+                    seq,
+                    SessionEvent::Stream { event },
+                    std::sync::Arc::new(serde_json::Value::Null),
+                )
             };
             let id = "ui-batch-0".to_string();
             let start = LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id.clone() };
@@ -2416,9 +2417,8 @@ fn labels_show_their_message_times(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let labelled = |cx: &mut VisualTestContext| {
         view.read_with(cx, |v, _| {
-            let items = v.model.shown().items();
             let rows = v.disp.iter().filter(|d| d.who != crate::turns::Who::None);
-            rows.map(|d| (d.id, crate::times::of(&items[d.item]).map(crate::times::hhmm))).collect::<Vec<_>>()
+            rows.map(|d| (d.id, v.rows[d.item].time.as_ref().map(|t| t.hhmm.to_string()))).collect::<Vec<_>>()
         })
     };
     let mut vcx = VisualTestContext::from_window(w, cx);
