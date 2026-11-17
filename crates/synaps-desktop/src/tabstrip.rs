@@ -44,7 +44,7 @@ const WORD_MIN: f32 = 220.;
 /// Spring keys (the strip's own, [`crate::motion::Motion::spring`]).
 pub(crate) const IND_X: u64 = 0x7AB0 << 48;
 const IND_W: u64 = 0x7AB1 << 48;
-const OPEN_W: u64 = 0x7AB2 << 48;
+pub(crate) const OPEN_W: u64 = 0x7AB2 << 48;
 const LABEL: u64 = 0x7AB3 << 48;
 pub(crate) const TOUCH: u64 = 0x7AB4 << 48;
 const CLOSE_W: u64 = 0x7AB5 << 48;
@@ -564,6 +564,10 @@ impl AppView {
         // over `hover_out`; held, `press_ch` and the content 1 px down.
         let touch = crate::motion::key(TOUCH, id);
         let (fill, dy) = fx.fill(touch, p.chrome, (on && lit).then_some(p.raised), p.raised, p.press_ch);
+        // The selected tab while the indicator's quads are up (it slides in
+        // under them on a close, re-gate 2): no fill of its own, so it never
+        // paints over them.
+        let fill = fill.filter(|_| lit || !on);
         // A worker tab: its worker's glyph and word (§4.2), whatever its
         // session waits on (the bar says that; the stub over its view too).
         // One this window holds nothing of: the rest glyph and no word.

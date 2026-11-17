@@ -435,8 +435,10 @@ pub(crate) enum Kind {
 /// The link's signatures (§5.1 Scan, §5.3 Glitch), never offline. Only a
 /// real loss plays them: a daemon reload is a planned handover (its
 /// sessions come back), so a link that goes down for one is given
-/// [`RELOAD_GRACE`]; any other drop [`LINK_GRACE`]. Back within it, nothing
-/// happened. Past it, the link is lost: the tear (at most once per
+/// [`RELOAD_GRACE`], restarted by each new reload's goodbye (a storm); any
+/// other drop [`LINK_GRACE`]. Back within it, nothing happened. The first
+/// hello after launch scans, however long the link took to come up (the
+/// window starts at `Connecting`). Past it, the link is lost: the tear (at most once per
 /// [`FLASH_BUDGET`]), then the palette drains, held while down. Back after
 /// a loss, it restores and scans (the Scan also at most once per budget).
 /// The drain is a [`Tween`]: a drop mid-restore or a return mid-drain
@@ -445,9 +447,11 @@ pub(crate) enum Kind {
 pub(crate) struct Link {
     /// Up last frame (none: not seen yet).
     pub up: Option<bool>,
-    /// Since when it is down, and whether for a reload (the reason it went
-    /// down with, kept until it is up again).
-    pub down: Option<(Instant, bool)>,
+    /// Since when it is down, and for which reload (the model's count of
+    /// reload goodbyes; none: not a reload). A new goodbye restarts it.
+    pub down: Option<(Instant, Option<u64>)>,
+    /// It has been up since launch (so the next up isn't the first hello).
+    pub ever_up: bool,
     /// The loss was seen (past the grace).
     pub lost: bool,
     pub scan: Option<Instant>,
@@ -462,9 +466,11 @@ pub(crate) struct Link {
 
 /// How long a non-reload drop may last before it is a loss.
 pub(crate) const LINK_GRACE: Duration = Duration::from_millis(1000);
-/// How long a reload may take before it is a loss (the client waits up to
-/// 10 s on the daemon's `retry_after`).
-pub(crate) const RELOAD_GRACE: Duration = Duration::from_millis(6000);
+/// How long a reload may take before it is a loss, from its last goodbye:
+/// longer than the client's longest honest wait in one (it retries every
+/// `synaps_client::RELOAD_RETRY` for `RELOAD_WINDOW`, but first waits out
+/// the daemon's `retry_after`, capped at 10 s), plus a boot.
+pub(crate) const RELOAD_GRACE: Duration = Duration::from_secs(15);
 /// At most one tear, and one Scan, per this.
 pub(crate) const FLASH_BUDGET: Duration = Duration::from_secs(5);
 
@@ -488,19 +494,27 @@ pub(crate) const TRACER_LEN: f32 = 24.;
 pub(crate) const TEAR: [Duration; 2] = [Duration::from_millis(60), Duration::from_millis(40)];
 
 impl Link {
-    /// The connection is `up` this frame (`reload`: it went down for a
-    /// daemon reload), at `now`, under `fx`'s level.
-    pub(crate) fn see(&mut self, up: bool, reload: bool, fx: &Motion) {
+    /// The connection is `up` this frame (`reload`: it went down for the
+    /// daemon reload with this count), at `now`, under `fx`'s level.
+    ///
+    /// Off plays nothing (no tear, drain or Scan) but still keeps the
+    /// state: the grace and the loss (what the words and the rail say),
+    /// and the first hello spent. A switch to Full mid-loss drains, no
+    /// tear.
+    pub(crate) fn see(&mut self, up: bool, reload: Option<u64>, fx: &Motion) {
         let (now, level) = (fx.now(), fx.level());
-        if level == Level::Off {
-            *self = Link { up: Some(up), down: (!up).then_some((now, reload)), ..Link::default() };
-            return;
+        let off = level == Level::Off;
+        if off {
+            (self.scan, self.glitch, self.drain) = (None, None, None);
         }
         let budget = |at: Option<Instant>| at.is_none_or(|t| now.saturating_duration_since(t) >= FLASH_BUDGET);
         match (self.up.replace(up), up) {
-            // The first hello scans (outside the budget: a return after a
-            // loss soon after launch scans too).
-            (None, true) => {
+            // The first hello scans, from `Connecting` or before the first
+            // frame (outside the budget: a return after a loss soon after
+            // launch scans too).
+            (_, true) if !self.ever_up => {
+                self.ever_up = true;
+                self.down = None;
                 if level == Level::Full {
                     self.scan = Some(now);
                 }
@@ -509,7 +523,9 @@ impl Link {
                 self.down = None;
                 if std::mem::take(&mut self.lost) {
                     self.glitch = None;
-                    self.retarget(0., fx);
+                    if !off {
+                        self.retarget(0., fx);
+                    }
                     if level == Level::Full && budget(self.scanned) {
                         (self.scan, self.scanned) = (Some(now), Some(now));
                     }
@@ -519,15 +535,27 @@ impl Link {
                 self.down = Some((now, reload));
                 self.scan = None;
             }
+            // Down still, and a new reload's goodbye came (the client was
+            // back for a moment between two frames): its grace starts now.
+            (_, false) if reload.is_some() && self.down.is_some_and(|(_, r)| r != reload) => {
+                self.down = Some((now, reload));
+            }
             _ => {}
         }
+        if self.lost && !off && self.drain.is_none() {
+            // Lost under Off, now on: drained, held (no tear).
+            self.retarget(1., fx);
+        }
         let Some((since, reload)) = self.down.filter(|_| !self.lost && self.up == Some(false)) else { return };
-        let grace = if reload { RELOAD_GRACE } else { LINK_GRACE };
+        let grace = if reload.is_some() { RELOAD_GRACE } else { LINK_GRACE };
         if now.saturating_duration_since(since) < grace {
             fx.want_at(since + grace);
             return;
         }
         self.lost = true;
+        if off {
+            return;
+        }
         let tear = level == Level::Full && budget(self.tore);
         if tear {
             (self.glitch, self.tore) = (Some(now), Some(now));
@@ -1898,7 +1926,6 @@ impl Motion {
     }
 
     /// What the last frame asked for: a frame, a timer at, nothing (tests).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pending(&self) -> (bool, Option<Instant>) {
         (self.display.get(), self.armed.get().map(|(t, _)| t))
     }
@@ -1973,42 +2000,75 @@ mod tests {
 
     /// The link (§5.3): a drop is nothing for its grace; past it the tear's
     /// two frames (60 ms, 40 ms), then the drain over `slow`; a reload's
-    /// grace is longer; back after a loss, it restores and scans; a second
-    /// loss within the budget doesn't tear again.
+    /// grace is longer, and each new goodbye restarts it; back after a
+    /// loss, it restores and scans; a second loss within the budget doesn't
+    /// tear again.
     #[test]
     fn the_link_tears_after_its_grace() {
         let t0 = Instant::now();
         let m = Motion::new(t0);
         let mut l = Link::default();
-        let at = |m: &Motion, l: &mut Link, t: u64, up: bool, reload: bool| {
+        let at = |m: &Motion, l: &mut Link, t: u64, up: bool, reload: Option<u64>| {
             m.begin_frame(Level::Full, false, t0 + ms(t));
             l.see(up, reload, m);
             (l.tear(m), l.drain(m))
         };
-        at(&m, &mut l, 0, true, false);
+        let (no, yes) = (None, Some(1));
+        at(&m, &mut l, 0, true, no);
         assert!(l.scan.is_some(), "the first hello scans");
-        assert_eq!(at(&m, &mut l, 1000, false, false), (None, 0.), "dropped: the grace");
+        assert_eq!(at(&m, &mut l, 1000, false, no), (None, 0.), "dropped: the grace");
         assert_eq!(m.demand(), (false, Some(t0 + ms(1000) + LINK_GRACE)), "one timer, at the grace's end");
-        assert_eq!(at(&m, &mut l, 1999, false, false), (None, 0.));
-        assert_eq!(at(&m, &mut l, 2000, false, false), (Some(0), 0.), "lost: the tear's first frame");
-        assert_eq!(at(&m, &mut l, 2061, false, false), (Some(1), 0.), "its second; the drain waits");
-        assert_eq!(at(&m, &mut l, 2101, false, false).0, None);
-        assert_eq!(at(&m, &mut l, 2100 + 360, false, false), (None, 1.), "drained");
-        assert_eq!(at(&m, &mut l, 2600, true, false).1, 1., "back: from where it is");
+        assert_eq!(at(&m, &mut l, 1999, false, no), (None, 0.));
+        assert_eq!(at(&m, &mut l, 2000, false, no), (Some(0), 0.), "lost: the tear's first frame");
+        assert_eq!(at(&m, &mut l, 2061, false, no), (Some(1), 0.), "its second; the drain waits");
+        assert_eq!(at(&m, &mut l, 2101, false, no).0, None);
+        assert_eq!(at(&m, &mut l, 2100 + 360, false, no), (None, 1.), "drained");
+        assert_eq!(at(&m, &mut l, 2600, true, no).1, 1., "back: from where it is");
         assert!(l.scan.is_some(), "back after a loss: it scans");
-        assert_eq!(at(&m, &mut l, 2600 + 360, true, false).1, 0., "restored");
-        // A reload: nothing for RELOAD_GRACE, then a loss (7 s after the
-        // last tear: it tears).
+        assert_eq!(at(&m, &mut l, 2600 + 360, true, no).1, 0., "restored");
+        // A reload: nothing for RELOAD_GRACE; a second goodbye 10 s in (the
+        // client back for a moment between two frames) restarts it; then
+        // a loss (past the last tear's budget: it tears).
         let rg = RELOAD_GRACE.as_millis() as u64;
-        assert_eq!(at(&m, &mut l, 3000, false, true), (None, 0.));
-        assert_eq!(at(&m, &mut l, 3000 + rg - 1, false, true), (None, 0.), "reloading");
-        assert_eq!(at(&m, &mut l, 3000 + rg, false, true).0, Some(0), "a reload that never came back: lost");
+        assert_eq!(at(&m, &mut l, 3000, false, yes), (None, 0.));
+        let mut l2 = l;
+        assert_eq!(at(&m, &mut l, 13_000, false, Some(2)), (None, 0.), "a second goodbye");
+        assert_eq!(at(&m, &mut l2, 3000 + rg - 1, false, yes), (None, 0.), "reloading");
+        assert_eq!(at(&m, &mut l2, 3000 + rg, false, yes).0, Some(0), "a reload that never came back: lost");
+        assert_eq!(at(&m, &mut l, 3000 + rg, false, Some(2)), (None, 0.), "the second goodbye's own grace");
+        assert_eq!(at(&m, &mut l, 13_000 + rg - 1, false, Some(2)), (None, 0.));
+        assert_eq!(at(&m, &mut l, 13_000 + rg, false, Some(2)).0, Some(0), "lost, from the last goodbye");
         // Back, and lost again within FLASH_BUDGET: it drains, no tear.
-        at(&m, &mut l, 9200, true, false);
-        at(&m, &mut l, 9300, false, false);
-        assert_eq!(at(&m, &mut l, 10_300, false, false).0, None, "within the budget: no second tear");
+        let t = 13_000 + rg;
+        at(&m, &mut l, t + 200, true, no);
+        at(&m, &mut l, t + 300, false, no);
+        assert_eq!(at(&m, &mut l, t + 1300, false, no).0, None, "within the budget: no second tear");
         assert!(l.lost);
-        assert!(at(&m, &mut l, 11_000, false, false).1 > 0.99, "it drains all the same");
+        assert!(at(&m, &mut l, t + 2000, false, no).1 > 0.99, "it drains all the same");
+    }
+
+    /// The first hello scans when the window started at `Connecting` (its
+    /// first frames down), however long the daemon took; never before; and
+    /// a launch that never connected has nothing to lose.
+    #[test]
+    fn the_first_hello_scans_from_connecting() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        let mut l = Link::default();
+        for t in [0, 16, 5000, 20_000] {
+            m.begin_frame(Level::Full, false, t0 + ms(t));
+            l.see(false, None, &m);
+            assert_eq!((l.scan, l.tear(&m), l.lost), (None, None, false), "connecting at {t} ms: nothing");
+        }
+        m.begin_frame(Level::Full, false, t0 + ms(20_100));
+        l.see(true, None, &m);
+        assert_eq!(l.scan, Some(t0 + ms(20_100)), "the first hello scans");
+        // Off: no Scan, and the first hello is spent all the same.
+        let mut l = Link::default();
+        m.begin_frame(Level::Off, false, t0 + ms(30_000));
+        l.see(false, None, &m);
+        l.see(true, None, &m);
+        assert!(l.ever_up && l.scan.is_none());
     }
 
     /// After every one-shot is over, a frame asks for nothing.

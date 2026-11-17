@@ -145,39 +145,51 @@ pub fn step(ground: u32, toward: u32, target: f64) -> u32 {
     step_upto(ground, toward, target, 80)
 }
 
-/// How far a pressed fill stands off its hover fill, at least: a press is
-/// always seen (fluid.md §3.9).
+/// How far a pressed fill stands off both its hover fill and its rest
+/// fill, at least (a contrast ratio): a press is a state of its own, never
+/// "the hover went off" (fluid.md §3.9). 1.05 is about a third of a
+/// [`STEP`], the least two flat fills side by side are told apart at.
 pub const PRESS_MIN: f64 = 1.05;
 
-/// A pressed fill (fluid.md §3.9): `hover` stepped toward `toward` (the
-/// ink) until it stands [`STEP`] off it, no further than every one of
-/// `texts` still reads on it at [`TEXT`] and every one of `marks` at
-/// [`MARK`]. Where that way is blocked short of [`PRESS_MIN`] (texts
-/// floored onto the hover fill itself), it steps away from the ink: that
-/// only raises what is drawn on it. Never `hover` itself.
-pub fn pressed(hover: u32, toward: u32, texts: &[u32], marks: &[u32]) -> u32 {
+/// A pressed fill (fluid.md §3.9): `hover` (which is `rest` one [`STEP`]
+/// toward the ink) stepped on, to the ink's side of it (toward white or
+/// black: a fill as light as the ink still has room), until it stands
+/// [`STEP`] off it, no further than every one of `texts` still reads on it
+/// at [`TEXT`] and every one of `marks` at [`MARK`]. Where that way is
+/// blocked short of [`PRESS_MIN`] (texts floored onto the hover fill
+/// itself), it steps back toward the rest fill and stops halfway, where it
+/// stands farthest off both. Either way at least [`PRESS_MIN`] off each
+/// (`press_is_visible_in_every_theme`): never the hover, never the rest.
+pub fn pressed(rest: u32, hover: u32, toward: u32, texts: &[u32], marks: &[u32]) -> u32 {
     let ok = |c: u32| texts.iter().all(|&t| contrast(t, c) >= TEXT) && marks.iter().all(|&m| contrast(m, c) >= MARK);
-    let walk = |to: u32| {
-        let mut out = hover;
-        for i in 1..=80u8 {
-            let c = mix(hover, to, f64::from(i) * 0.005);
-            if !ok(c) {
-                break;
-            }
-            out = c;
-            if contrast(c, hover) >= STEP {
-                break;
-            }
+    // How far `c` stands off the nearer of the two.
+    let apart = |c: u32| contrast(c, hover).min(contrast(c, rest));
+    let side = if luminance(toward) > luminance(hover) { 0xffffff } else { 0x000000 };
+    let mut near = hover;
+    for i in 1..=200u8 {
+        let c = mix(hover, side, f64::from(i) * 0.005);
+        if !ok(c) {
+            break;
         }
-        out
-    };
-    let near = walk(toward);
-    if contrast(near, hover) >= PRESS_MIN {
+        near = c;
+        if contrast(c, hover) >= STEP {
+            break;
+        }
+    }
+    if apart(near) >= PRESS_MIN {
         return near;
     }
-    let away = if luminance(toward) > luminance(hover) { 0x000000 } else { 0xffffff };
-    let far = walk(away);
-    if contrast(far, hover) > contrast(near, hover) { far } else { near }
+    // Back toward rest (away from the ink): the farthest from both.
+    let away = side ^ 0xffffff;
+    let mut far = hover;
+    for i in 1..=80u8 {
+        let c = mix(hover, away, f64::from(i) * 0.005);
+        if !ok(c) || apart(c) < apart(far) {
+            break;
+        }
+        far = c;
+    }
+    if apart(far) > apart(near) { far } else { near }
 }
 
 /// [`step`], at most `steps` half-percent steps toward `toward`.
@@ -752,15 +764,17 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
             [r.run_mark_k, r.err_mark_k, r.rest_mark_k, r.focus_k, r.warn_mark],
         );
         let label = [chrome];
-        let sets: [(&'static str, u32, &[u32], &[u32]); 4] = [
-            ("press_ch", raised, &texts_ch, &marks_ch),
-            ("press_k", card_hi, &texts_k, &marks_k),
-            ("btn_press", r.btn_hi, &label, &[]),
-            ("warn_press", r.warn_hi, &label, &[]),
+        // (role, rest, hover, what is drawn on it: texts, marks)
+        type Set<'a> = (&'static str, u32, u32, &'a [u32], &'a [u32]);
+        let sets: [Set; 4] = [
+            ("press_ch", chrome, raised, &texts_ch, &marks_ch),
+            ("press_k", card, card_hi, &texts_k, &marks_k),
+            ("btn_press", r.btn_fill, r.btn_hi, &label, &[]),
+            ("warn_press", r.warn_fill, r.warn_hi, &label, &[]),
         ];
         let mut out = [0u32; 4];
-        for (i, (role, hover, texts, marks)) in sets.into_iter().enumerate() {
-            let c = pressed(hover, ink, texts, marks);
+        for (i, (role, rest, hover, texts, marks)) in sets.into_iter().enumerate() {
+            let c = pressed(rest, hover, ink, texts, marks);
             out[i] = c;
             for &t in texts {
                 f.log.push(Check { role, from: t, color: t, grounds: vec![c], floor: TEXT });
@@ -912,6 +926,9 @@ pub struct Scheme {
     /// A cross-fade's kit theme and text views' style wait for its last
     /// frame (motion.md §6.8).
     sync_due: std::cell::Cell<bool>,
+    /// How far through the cross-fade the text views' style was last
+    /// installed (1: at the end, or no fade).
+    pub text_t: std::cell::Cell<f32>,
 }
 
 impl Scheme {
@@ -959,6 +976,7 @@ impl Scheme {
             drain: Default::default(),
             cache: Default::default(),
             sync_due: Default::default(),
+            text_t: std::cell::Cell::new(1.),
         }
     }
 }
@@ -1000,6 +1018,10 @@ pub fn luminance_hsla(c: Hsla) -> f32 {
 const UNDRAINED: &[&str] = &[
     "chrome", "canvas", "user", "code", "tool", "tool_out", "card", "card_hi", "raised", "hair", "edge", "frame", "add_bg", "del_bg",
     "thumb", "thumb_ch", "thumb_u", "press_ch", "press_k", "ink", "prose",
+    // Q1's (PR #16) ground and rules, kept for when it lands (a well greys
+    // while the code beside it doesn't): `grounds_and_rules_never_drain`
+    // fails on any new one missing here.
+    "well", "hair_w", "hair_t", "edge_t",
 ];
 
 /// `c` mixed `t` toward the grey of its own relative luminance, in linear
@@ -1060,7 +1082,18 @@ pub fn settle_fade(cx: &mut App) {
     let s = cx.global::<Scheme>();
     let (p, m, roles) = (s.p, s.m, s.roles);
     sync_kit(&p, &roles, cx);
+    cx.global::<Scheme>().text_t.set(1.);
     let dark = luminance(roles.canvas) < 0.5;
+    TextViewDefaults::global(cx).with_style(text_style(&p, &m, dark)).with_inherit_text_color(false).install(cx);
+}
+
+/// The text views' style from this frame's cross-fade blend (re-gate 5):
+/// their colours (prose, links, code spans, headings) move with the
+/// grounds, not after them. [`settle_fade`] installs the end.
+pub fn blend_text(cx: &mut App) {
+    let s = cx.global::<Scheme>();
+    let (p, m, dark, t) = (s.blended(), s.m, luminance(s.roles.canvas) < 0.5, s.from.get().map_or(1., |f| f.2));
+    s.text_t.set(t);
     TextViewDefaults::global(cx).with_style(text_style(&p, &m, dark)).with_inherit_text_color(false).install(cx);
 }
 
@@ -1773,8 +1806,26 @@ mod tests {
         assert!(worst < 0.06, "the drain moved a contrast by {worst:.3}");
     }
 
-    /// A press is always seen (fluid.md §3.9): every pressed fill stands
-    /// [`PRESS_MIN`] off its hover fill, in every theme and accent, and
+    /// The drain (motion.md §5.3) keeps every ground and rule: any role
+    /// named as one (a `hair*`, `edge*`, `well`, `*_bg`, the grounds) is
+    /// in `UNDRAINED`. A branch that adds one (Q1: `well`, `hair_w`,
+    /// `hair_t`, `edge_t`) fails here until it is kept.
+    #[test]
+    fn grounds_and_rules_never_drain() {
+        let mut p = Palette::of(&resolve(&crate::palettes::THEMES[0].1, None).0);
+        let mut missing = Vec::new();
+        p.each_mut(|n, _| {
+            let rule = n.starts_with("hair") || n.starts_with("edge") || n.starts_with("well") && !n.contains("_fg") || n.ends_with("_bg");
+            if rule && !UNDRAINED.contains(&n) {
+                missing.push(n);
+            }
+        });
+        assert!(missing.is_empty(), "grounds and rules that would drain: {missing:?}");
+    }
+
+    /// A press is a state of its own (fluid.md §3.9): every pressed fill
+    /// stands [`PRESS_MIN`] off both its hover fill and its rest fill, in
+    /// every theme (20) and accent (7), for all four press roles, and
     /// everything drawn on it still reads (its checks are in the log).
     #[test]
     fn press_is_visible_in_every_theme() {
@@ -1783,16 +1834,18 @@ mod tests {
             for accent in [None, Some(0xe8132f), Some(0xf4b400), Some(0xcfa85a), Some(0x2d7bff), Some(0x35f2ff), Some(0x2bd47d)] {
                 let (r, log) = resolve(&raw, accent);
                 let raised = step(r.chrome, r.ink, STEP);
-                for (role, press, hover) in [
-                    ("press_ch", r.press_ch, raised),
-                    ("press_k", r.press_k, r.card_hi),
-                    ("btn_press", r.btn_press, r.btn_hi),
-                    ("warn_press", r.warn_press, r.warn_hi),
+                for (role, press, rest, hover) in [
+                    ("press_ch", r.press_ch, r.chrome, raised),
+                    ("press_k", r.press_k, r.card, r.card_hi),
+                    ("btn_press", r.btn_press, r.btn_fill, r.btn_hi),
+                    ("warn_press", r.warn_press, r.warn_fill, r.warn_hi),
                 ] {
-                    let c = contrast(press, hover);
                     assert_ne!(press, hover, "{name} {accent:?} {role}: the hover fill");
-                    if c < worst.0 {
-                        worst = (c, format!("{name} {accent:?} {role}"));
+                    assert_ne!(press, rest, "{name} {accent:?} {role}: the rest fill");
+                    for (what, c) in [("hover", contrast(press, hover)), ("rest", contrast(press, rest))] {
+                        if c < worst.0 {
+                            worst = (c, format!("{name} {accent:?} {role} vs {what}"));
+                        }
                     }
                 }
                 for c in log.iter().filter(|c| c.role.contains("press")) {
@@ -1802,7 +1855,7 @@ mod tests {
                 }
             }
         }
-        assert!(worst.0 >= PRESS_MIN, "a press too close to its hover: {:.3} ({})", worst.0, worst.1);
+        assert!(worst.0 >= PRESS_MIN, "a press too close to its hover or rest: {:.3} ({})", worst.0, worst.1);
     }
 
     /// The drain keeps every floor the theme was lifted to: each check of

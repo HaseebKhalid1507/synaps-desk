@@ -136,7 +136,7 @@ pub(crate) struct SettingsUi {
     pub app_note: Option<(Vec<&'static str>, String)>,
     /// THIS APP keys waiting for their save ([`crate::app::SAVE_DELAY`]
     /// after the last change, all in one write, in order), and that save.
-    app_dirty: BTreeMap<&'static str, Option<String>>,
+    pub(crate) app_dirty: BTreeMap<&'static str, Option<String>>,
     app_save: Option<Task<()>>,
     /// The batch being written off the UI thread, and its stop: a quit's
     /// flush writes it again with what came after, and the late write
@@ -519,6 +519,14 @@ impl AppView {
     /// it finished (none if it failed), a daemon one when its write is
     /// answered. Never on first sight: what changed while Settings was not
     /// shown is history (the map is cleared when it hides). Its `k`.
+    /// The THIS APP key of control `id` ("usage-range", "field-dash-url")
+    /// is waiting to be written, or being written.
+    fn app_pending(&self, id: &SharedString) -> bool {
+        let key = id.strip_prefix("field-").unwrap_or(id).replace('-', "_");
+        let key = key.as_str();
+        self.settings.app_dirty.contains_key(key) || self.settings.app_writing.as_ref().is_some_and(|(keys, _)| keys.contains_key(key))
+    }
+
     pub(crate) fn saved_glow(&self, id: &SharedString, value: &str, sending: bool) -> f32 {
         let hash = {
             use std::hash::{Hash, Hasher};
@@ -534,7 +542,11 @@ impl AppView {
                 let (since, wait) = match (sending, was_sending) {
                     (true, _) => (None, None),
                     (false, true) => (Some(now), None),
-                    (false, false) => (None, Some(self.settings.app_gen)),
+                    // Changed, not by a send: this app's own key waits for
+                    // its write; anything else (another client, the
+                    // daemon) glows as it lands.
+                    (false, false) if self.app_pending(id) => (None, Some(self.settings.app_gen)),
+                    (false, false) => (Some(now), None),
                 };
                 saved.insert(id.clone(), (hash, sending, since, wait));
                 since

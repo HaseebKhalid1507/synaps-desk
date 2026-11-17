@@ -406,9 +406,19 @@ fn hiding(view: EntityId, window: &mut Window, cx: &mut App) {
     if !arm {
         return;
     }
+    /// Disarms when the timer is done, or dropped unfired (its window
+    /// gone): a bar can always arm the next.
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            HIDING.with(|h| h.borrow_mut().0 = false);
+        }
+    }
     let at = crate::motion::next_tick(Instant::now());
+    let disarm = Disarm;
     window
         .spawn(cx, async move |cx| {
+            let _disarm = disarm;
             cx.background_executor().timer(at.saturating_duration_since(Instant::now())).await;
             let views = HIDING.with(|h| {
                 let mut h = h.borrow_mut();
@@ -851,6 +861,64 @@ mod tests {
     };
     use gpui_kit::{Axis, Bounds, point, px, size};
     use std::time::{Duration, Instant};
+
+    /// M7: any number of bars hiding share one timer, due on the motion's
+    /// decay grid (`next_tick`, within one 30 Hz tick); it wakes each view
+    /// once and disarms, so the next hide arms again.
+    #[gpui_kit::test]
+    fn hiding_bars_share_one_timer(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, Context, Entity, IntoElement, Render, Window, div};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct V;
+        impl Render for V {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        let w = cx.add_window(|_, _| V);
+        let views: Vec<Entity<V>> = (0..3).map(|_| cx.new(|_| V)).collect();
+        let woken = Rc::new(Cell::new(0));
+        let _subs: Vec<_> = cx.update(|cx| {
+            views
+                .iter()
+                .map(|v| {
+                    let woken = woken.clone();
+                    cx.observe(v, move |_, _| woken.set(woken.get() + 1))
+                })
+                .collect()
+        });
+        let hide = |cx: &mut gpui_kit::TestAppContext, v: &Entity<V>| {
+            let id = v.entity_id();
+            w.update(cx, |_, window, cx| super::hiding(id, window, cx)).unwrap();
+        };
+        let state = || super::HIDING.with(|h| (h.borrow().0, h.borrow().1.len()));
+        for v in views.iter().chain(views.iter()) {
+            hide(cx, v);
+        }
+        assert_eq!(state(), (true, 3), "one timer armed, each view once");
+        cx.executor().advance_clock(crate::motion::DECAY_TICK + Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!((woken.get(), state()), (3, (false, 0)), "each view woken once, disarmed");
+        hide(cx, &views[0]);
+        assert_eq!(state(), (true, 1), "the next hide arms again");
+        cx.executor().advance_clock(crate::motion::DECAY_TICK + Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!((woken.get(), state()), (4, (false, 0)));
+    }
+
+    /// M7: the bar's colours are the palette's (`theme::palette`, drained
+    /// and cross-faded), never a raw role or the kit's.
+    #[test]
+    fn the_bar_paints_from_the_palette() {
+        let src = include_str!("scrollbar.rs");
+        let code = &src[..src.find("#[cfg(test)]\nmod tests").expect("the tests")];
+        let reads = code.matches("crate::theme::palette(cx)").count();
+        assert!(reads >= 2, "the hide and the show read the palette ({reads})");
+        for raw in ["Scheme", ".roles", "colors.", "cx.theme()"] {
+            assert!(!code.contains(raw), "a raw colour source: {raw}");
+        }
+    }
 
     /// The colour fade (motion.md §6.4): shown, the thumb comes up from its
     /// ground over 90 ms `out`; hidden, it goes back over 270 ms `in`; then
