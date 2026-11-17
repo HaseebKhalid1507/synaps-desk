@@ -1328,6 +1328,61 @@ fn transcript_heights_stable_across_frames(cx: &mut TestAppContext) {
     assert_eq!(heights(cx), full, "Off and Full lay the column out alike");
 }
 
+/// The clicked header is the anchor (fluid.md §3.3): a run unfolded under
+/// Full at the end of the list (tail-follow on) reveals its rows below its
+/// header, which is drawn on every frame, at its height and its y, until
+/// they have. Its id is its first row's: that row's reveal is not its.
+#[gpui_kit::test]
+fn an_unfold_under_full_keeps_its_header_put(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    // The column's glide in (a session opened) ends first.
+    let mut n = 0;
+    while motion_pending(cx, &view).0 && n < 400 {
+        fluid_frame(cx, w, &view);
+        n += 1;
+    }
+    settle(cx, w, 8);
+    assert!(view.read_with(cx, |v, _| v.list.is_following_tail()), "at the end, following");
+    let header = |cx: &mut TestAppContext, run: u64| {
+        view.read_with(cx, |v, _| {
+            let ix = v.disp.iter().position(|d| d.id == run && matches!(d.kind, crate::turns::Kind::Summary { .. }))?;
+            v.list.bounds_for_item(ix).map(|b| (f32::from(b.origin.y), f32::from(b.size.height)))
+        })
+    };
+    // The last folded run on screen: the one the clip clicks.
+    let run = view.read_with(cx, |v, _| {
+        v.disp
+            .iter()
+            .enumerate()
+            .filter(|(ix, d)| matches!(d.kind, crate::turns::Kind::Summary { open: false, .. }) && v.list.bounds_for_item(*ix).is_some())
+            .map(|(_, d)| d.id)
+            .last()
+            .expect("a folded run on screen")
+    });
+    let at = header(cx, run).expect("drawn");
+    assert!(at.1 > 0., "{at:?}");
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(motion_pending(cx, &view).0, "the cascade is running");
+    let mut frames = 0;
+    while motion_pending(cx, &view).0 && frames < 120 {
+        fluid_frame(cx, w, &view);
+        frames += 1;
+        assert_eq!(header(cx, run), Some(at), "the header on frame {frames}");
+    }
+    assert!(frames > 2, "the cascade ran over frames ({frames})");
+    let opened = view.read_with(cx, |v, _| v.disp.iter().filter(|d| d.kind == crate::turns::Kind::Work).count());
+    assert!(opened >= 5, "its rows are in the list ({opened})");
+    settle(cx, w, 8);
+    assert_eq!(header(cx, run), Some(at), "at rest");
+}
+
 /// Words arrive readable (fluid.md law 3, §3.4): the one stream fade in
 /// the app is `motion::text_motion` (its words start at 70 %), given only
 /// to text streamed into a row (`turns.rs`); no view gets the kit's own
