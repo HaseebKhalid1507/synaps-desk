@@ -518,12 +518,11 @@ impl AppView {
             .child(if on { glyph::draw(glyph::Glyph::Needs, p.warn_mark_ch) } else { glyph::draw(glyph::Glyph::Idle, p.rest_mark) })
             // The count rolls (polish.md P5) and afterglows (motion.md
             // §6.6) when it changes; the words stay.
+            // One text at rest, as before; rolling, only its changed cells.
             .child({
                 let c = self.fx.glow(GLOW | 0xFFFF, n as u64, if on { p.warn_ch } else { p.dim_ch });
-                h_flex()
-                    .flex_none()
-                    .child(crate::motion::roll_count(&self.fx, crate::motion::ROLL_NEEDS, n, count(n), |t| display(t, size::D_S, c)))
-                    .child(display(format!("   {}", label::NEED_YOU), size::D_S, c))
+                let text = format!("{n}   {}", label::NEED_YOU).into();
+                crate::motion::roll_count(&self.fx, crate::motion::ROLL_NEEDS, n, text, |t| display(t, size::D_S, c).flex_none())
             })
             .when_some(first.filter(|_| fit.label > 0.), |d, s| d.child(cut(mono(s.label(), size::META, p.ink), fit.label)))
             .when_some(what.filter(|_| fit.gist > 0.), |d, w| d.child(cut(mono(w, size::META, p.dim_ch), fit.gist)))
