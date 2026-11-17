@@ -155,13 +155,51 @@ pub fn resume_error(label: &str, reason: &str) -> String {
     }
 }
 
+/// This machine's home folder, read once: `$HOME` (on Windows
+/// `%USERPROFILE%` first: the daemon's paths are native there), without its
+/// trailing separator. `None` when unset or a root (`/`, `C:\\`).
+pub(crate) fn home() -> Option<&'static str> {
+    static HOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let vars = if cfg!(windows) { ["USERPROFILE", "HOME"] } else { ["HOME", "USERPROFILE"] };
+        let h = vars.iter().filter_map(|v| std::env::var(v).ok()).find(|h| !h.is_empty())?;
+        let h = h.trim_end_matches(['/', '\\']);
+        (h.len() > 1 && !h.ends_with(':')).then(|| h.to_string())
+    })
+    .as_deref()
+}
+
+/// How many bytes `home` takes at the start of `s`, if it is there whole
+/// (the end, a separator, a space or a quote follows). A drive path's
+/// (`C:\\Users\\me`) case is ignored and its separators go either way,
+/// JSON's escaped `\\\\` too, as a model writes them.
+pub(crate) fn home_len(s: &str, home: &str) -> Option<usize> {
+    let (s, h) = (s.as_bytes(), home.as_bytes());
+    let drive = h.len() > 2 && h[0].is_ascii_alphabetic() && h[1] == b':';
+    let mut i = 0;
+    for &c in h {
+        let d = *s.get(i)?;
+        if drive && matches!(c, b'/' | b'\\') {
+            i += match (d, s.get(i + 1)) {
+                (b'/', _) => 1,
+                (b'\\', Some(b'\\')) => 2,
+                (b'\\', _) => 1,
+                _ => return None,
+            };
+        } else if d == c || (drive && d.eq_ignore_ascii_case(&c)) {
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    s.get(i).is_none_or(|c| matches!(c, b'/' | b'\\' | b' ' | b'"' | b'\'' | b'\n')).then_some(i)
+}
+
 /// `/home/me/x` → `~/x` when it is this machine's home.
 pub(crate) fn home_short(path: &str) -> String {
-    static HOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let home = HOME.get_or_init(|| std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default());
-    match path.strip_prefix(home.as_str()) {
-        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with(['/', '\\'])) => format!("~{rest}"),
-        _ => path.to_string(),
+    match home().and_then(|h| home_len(path, h)) {
+        Some(n) => format!("~{}", &path[n..]),
+        None => path.to_string(),
     }
 }
 
@@ -177,6 +215,23 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The home at a path's start, whole: on Windows whatever the case and
+    /// the separators (escaped in JSON too); elsewhere exactly.
+    #[test]
+    fn the_home_is_found_however_a_windows_path_spells_it() {
+        let win = "C:\\Users\\me";
+        for s in ["C:\\Users\\me\\x", "c:\\users\\ME\\x", "C:/Users/me/x", "C:\\\\Users\\\\me\\\\x", "C:\\Users\\me"] {
+            let n = home_len(s, win).unwrap_or_else(|| panic!("{s}"));
+            assert!(!s[n..].contains("me") && !s[n..].contains("ME"), "{s}: {}", &s[n..]);
+        }
+        assert_eq!(home_len("C:\\Users\\meg\\x", win), None, "another user");
+        assert_eq!(home_len("D:\\Users\\me\\x", win), None, "another drive");
+        assert_eq!(home_len("/home/me/x", "/home/me"), Some(8));
+        assert_eq!(home_len("/HOME/me/x", "/home/me"), None, "case counts off Windows");
+        assert_eq!(home_len("\\home\\me", "/home/me"), None);
+        assert_eq!(home_len("/home/me\"", "/home/me"), Some(8));
+    }
 
     #[test]
     fn models_are_shortened() {
