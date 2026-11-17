@@ -137,7 +137,7 @@ fn need(r: &TrayRow, watched: Option<u64>) -> (u8, std::cmp::Reverse<u64>) {
 /// focused view changes, or a finished worker's flash ends.
 #[derive(Default)]
 pub(crate) struct TrayCache {
-    key: Option<(u64, Option<u64>, bool, u64, u64)>,
+    pub(crate) key: Option<(u64, Option<u64>, bool, u64, u64)>,
     pub(crate) rows: Vec<TrayRow>,
     /// When the next finished worker drops.
     until: Option<Instant>,
@@ -536,7 +536,13 @@ impl AppView {
             return;
         }
         if items.is_empty() {
-            self.wmenu = None;
+            // Closed here, in the render after `overlay_exits` (Shady #15
+            // L1): its exit starts now, at its place, so this frame draws
+            // the first of it (`fx.leave` asks for the rest).
+            if let Some(m) = self.wmenu.take().filter(|m| m.born.is_some()) {
+                self.wmenu_leaving = Some((m, self.fx.now()));
+            }
+            self.wmenu_was = None;
             return;
         }
         let sel = m.sel.and_then(|i| m.items.get(i)).and_then(|was| items.iter().position(|n| n.act == was.act));
@@ -595,7 +601,9 @@ impl AppView {
     /// A menu opened from the keyboard over a tray row whose row is not
     /// drawn any more (its worker dropped, the window got short): it
     /// closes, never left taking keys unseen.
-    /// The workers menu follows what `+N more` stands for.
+    /// The workers menu follows what `+N more` stands for. `sync_tray`'s
+    /// call reads last frame's chips (a guess); the render's, after
+    /// `fit_chips`, this frame's (the word).
     pub(crate) fn close_orphan_menu(&mut self) {
         self.refresh_workers_menu();
         let Some(At::Row(id)) = self.menu.as_ref().map(|(m, _)| m.at) else { return };

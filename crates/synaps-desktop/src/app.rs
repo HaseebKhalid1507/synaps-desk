@@ -1506,7 +1506,7 @@ pub struct AppView {
     pub(crate) menu_leaving: Option<(crate::menu::Menu<crate::wtabs::Act>, Instant)>,
     smenu_was: Option<crate::menu::Menu<SessionAct>>,
     smenu_leaving: Option<(crate::menu::Menu<SessionAct>, Instant)>,
-    wmenu_was: Option<crate::menu::Menu<u64>>,
+    pub(crate) wmenu_was: Option<crate::menu::Menu<u64>>,
     pub(crate) wmenu_leaving: Option<(crate::menu::Menu<u64>, Instant)>,
     pub(crate) gear_at: Option<Instant>,
     pub(crate) gear_leaving: Option<Instant>,
@@ -6172,8 +6172,13 @@ impl Render for AppView {
             self.pack_chips(Vec::new(), &[], lay.column, 0, &m);
             0
         };
-        // A keyboard menu over a row no longer drawn closes.
+        // A keyboard menu over a row no longer drawn closes; a workers menu
+        // left empty leaves. Either way the next frame gives focus back.
+        let menus = (self.menu.is_some(), self.wmenu.is_some());
         self.close_orphan_menu();
+        if menus != (self.menu.is_some(), self.wmenu.is_some()) {
+            window.request_animation_frame();
+        }
         let ex = crate::fit::Extras { tray: self.tray_rows as u8, ..ex };
         let rows = crate::fit::composer_rows(&m, lay.form(), self.height, card_shown, ex);
         if rows != self.composer_rows {

@@ -449,26 +449,33 @@ impl AppView {
             format!("{word} {:<3}", "·".repeat(n)).into()
         };
         let (conn, conn_color): (SharedString, Hsla) = match &self.model.conn {
+            // A daemon reload within its grace (re-gate 3): a planned
+            // handover, not a disconnect. The words say so, a session
+            // attached or not.
+            _ if self.model.reload => (dots("reloading"), p.dim_ch),
             _ if self.model.reattaching => (dots("reattaching"), p.dim_ch),
             ConnState::Connected(v) => {
                 let words: SharedString = format!("connected · {v}").into();
                 self.conn_held.set(words.chars().count());
                 (words, p.dim_ch)
             }
-            // A daemon reload within its grace (re-gate 3): a planned
-            // handover, not a disconnect. The words say so.
-            _ if self.model.reload => (dots("reloading"), p.dim_ch),
             ConnState::Connecting => (dots("connecting"), p.dim_ch),
             ConnState::Reconnecting => (dots("reconnecting"), p.dim_ch),
             ConnState::Off(e) | ConnState::Incompatible(e) => {
                 (crate::app::one_line(e, 60).into(), if self.synthetic { p.dim_ch } else { p.err_ch })
             }
         };
-        // Down after it was up (a loss, a reload): the words keep the
-        // connected words' width (mono), padded or cut with an ellipsis, so
-        // NEEDS YOU, centred between, never moves (re-gate r3).
+        // Down after it was up (a loss, a reload), or up again with the
+        // session still re-attaching: the words keep the connected words'
+        // width (mono), padded or cut with an ellipsis, so NEEDS YOU,
+        // centred between, never moves (re-gate r3, Shady #15 M1). Cut, the
+        // whole of them is the cell's tooltip.
         let held = self.conn_held.get();
-        let hold = held > 0 && !matches!(self.model.conn, ConnState::Connected(_));
+        let hold = held > 0 && (self.model.reattaching || !matches!(self.model.conn, ConnState::Connected(_)));
+        let whole: Option<SharedString> = (hold && conn.chars().count() > held).then(|| match &self.model.conn {
+            ConnState::Off(e) | ConnState::Incompatible(e) => e.clone().into(),
+            _ => conn.clone(),
+        });
         let conn: SharedString = if hold { hold_width(&conn, held).into() } else { conn };
         // As in the mock: subagents running, here the attached session's,
         // as its blocks and its rail row say (they change together).
@@ -571,7 +578,11 @@ impl AppView {
                         // Down after it was up the cell keeps the connected
                         // words' width: NEEDS YOU, centred between, never moves.
                         let cell = cut(mono(conn, size::META, conn_color), fit.conn).relative().top(px(self.conn_dy));
-                        d.child(if hold { cell.w(px(fit.conn)) } else { cell })
+                        let cell = if hold { cell.w(px(fit.conn)) } else { cell };
+                        d.child(
+                            cell.id("conn-words")
+                                .when_some(whole, |c, t| c.tooltip(move |window, cx| crate::overlay::tip(t.clone(), window, cx))),
+                        )
                     })
                     // The theme picker's own control: a swatch of the "you" colour.
                     .child(
@@ -1935,9 +1946,6 @@ enum PickerAt {
     Bottom(f32),
 }
 
-/// A chip's count: two mono cells whatever it is (a no-break space after
-/// one digit), so a count crossing 10 moves nothing; 100 and more is
-/// `99+`, the one count a cell wider.
 /// `words` at exactly `w` chars (mono): padded, or cut with an ellipsis.
 fn hold_width(words: &str, w: usize) -> String {
     if words.chars().count() <= w {
@@ -1948,6 +1956,9 @@ fn hold_width(words: &str, w: usize) -> String {
     }
 }
 
+/// A chip's count: two mono cells whatever it is (a no-break space after
+/// one digit), so a count crossing 10 moves nothing; 100 and more is
+/// `99+`, the one count a cell wider.
 fn chip_count(n: usize) -> String {
     if n > 99 { "99+".into() } else { format!("{n:\u{a0}<2}") }
 }
