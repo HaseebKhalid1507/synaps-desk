@@ -212,6 +212,22 @@ impl<V> TextRows<V> {
     pub(crate) fn kept(&self) -> impl Iterator<Item = (u64, &SharedString)> {
         self.kept.iter().map(|(&id, k)| (id, &k.text))
     }
+
+    /// The frames begun so far ([`TextRows::frame`]).
+    #[cfg(test)]
+    pub(crate) fn frames(&self) -> u64 {
+        self.frame
+    }
+}
+
+impl Views {
+    /// The kept views: item id and the view's entity, sorted by id.
+    #[cfg(test)]
+    pub(crate) fn entities(&self) -> Vec<(u64, gpui_kit::EntityId)> {
+        let mut out: Vec<_> = self.kept.iter().map(|(&id, k)| (id, k.view.0.entity_id())).collect();
+        out.sort_unstable();
+        out
+    }
 }
 
 /// A transcript list asks `rows` whether a row's layout is its height.
