@@ -300,6 +300,9 @@ pub struct Model {
     /// come, until their `Detached`): `(attach_seq, session, texts)`.
     left: Vec<(u64, String, VecDeque<String>)>,
     pub named: Named,
+    /// The favourite sessions (desktop only, per daemon): the rail's
+    /// FAVOURITES. Never sent to the daemon.
+    pub favs: crate::favourites::Favourites,
     /// The open tabs; the visible one's session is the one attached.
     pub tabs: Tabs,
     /// A session list has landed (saved tabs can be checked against it),
@@ -373,6 +376,7 @@ impl Model {
             in_flight: VecDeque::new(),
             left: Vec::new(),
             named: Named { daemon: "the daemon's machine".into(), ..Named::default() },
+            favs: Default::default(),
             tabs: Tabs::default(),
             sessions_listed: false,
             lists: 0,
@@ -621,6 +625,43 @@ impl Model {
     /// until the resume lands).
     pub fn chip_shows_saved(&self, chip: Chip, v: &SavedSession) -> bool {
         chip.admits(self.saved_fact(v))
+    }
+
+    /// The favourites' snapshots brought up to what the lists say now (a
+    /// held session, else its listing): run when the lists change, before
+    /// the rail is built. `true` if any changed (and so is saved).
+    pub fn sync_favs(&mut self) -> bool {
+        if self.favs.is_empty() {
+            return false;
+        }
+        let n = &self.named;
+        let changed = self.favs.refresh(&self.sessions, n.recent.iter().chain(n.saved.iter()));
+        if changed {
+            self.rail_gen += 1;
+        }
+        changed
+    }
+
+    #[cfg(test)]
+    pub fn mark_unread_for_test(&mut self, id: &str) {
+        self.unread.insert(id.to_string());
+    }
+
+    /// The favourite a held session is, if any.
+    pub fn fav_of(&self, s: &SessionMeta) -> Option<usize> {
+        self.favs.find(crate::favourites::Source::Live(s))
+    }
+
+    /// A favourite's state as its row shows it when nothing holds it:
+    /// OPENING while its resume is on its way, UNREAD, else SAVED.
+    pub fn fav_state(&self, f: &crate::favourites::Favourite) -> State {
+        if self.named.resuming.as_ref().is_some_and(|r| r.req.target == f.id) {
+            State::Opening
+        } else if self.unread.contains(&f.id) {
+            State::Unread
+        } else {
+            State::Saved
+        }
     }
 
     pub fn is_active(&self, session_id: &str) -> bool {
@@ -1561,7 +1602,14 @@ impl Model {
                 }
                 let opening = n.opening.take_if(|o| o.attach_seq == Some(attach_seq));
                 match n.resuming.take_if(|r| r.attach_seq == attach_seq) {
-                    Some(r) => n.error = Some(crate::named::resume_error(&r.req.label, &reason)),
+                    Some(r) => {
+                        n.error = Some(crate::named::resume_error(&r.req.label, &reason));
+                        // A favourite whose journal is not there: its row
+                        // says so (and offers Remove); never dropped here.
+                        if !r.req.by_name && crate::favourites::journal_missing(&reason) && self.favs.set_gone(&r.req.target) {
+                            self.rail_gen += 1;
+                        }
+                    }
                     None => match opening {
                         Some(o) => n.error = Some(format!("Could not open '{}': {reason}", o.name)),
                         None => self.last_error = Some(format!("detached: {reason}")),
@@ -3534,6 +3582,7 @@ mod fake_daemon {
                 .items
                 .iter()
                 .map(|i| match i {
+                    Item::Favs { count, .. } => format!("Favs {count}"),
                     Item::Group { group, count } => format!("{group:?} {count}"),
                     Item::Row(r) | Item::Hist(r) => rail.rows[*r].title.to_string(),
                     Item::Bucket { bucket, count, .. } => format!("{bucket:?} {count}"),

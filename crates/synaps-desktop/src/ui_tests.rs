@@ -2460,3 +2460,79 @@ fn labels_show_their_message_times(cx: &mut TestAppContext) {
 fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
+
+/// Favourites (desktop only): a HISTORY row's star is laid out before it
+/// is drawn (the row's text never moves when it shows), a click on it
+/// favourites the row without opening it (no resume, nothing sent), and
+/// the row moves to FAVOURITES, out of HISTORY; the favourite key
+/// (Ctrl+D) favourites the session on screen; its row's star unfavourites
+/// it. A favourite's row draws its filled star always.
+#[gpui_kit::test]
+fn a_star_favourites_a_row_without_opening_it(cx: &mut TestAppContext) {
+    use crate::rail::Item;
+    let (w, view, _events) = open(cx);
+    settle(cx, w, 8);
+    // The first HISTORY row the rail shows (it lists the demo's history).
+    let (key, id) = view.update(cx, |v, cx| {
+        let rail = &v.rail.rail;
+        let (ix, r) = rail
+            .items
+            .iter()
+            .enumerate()
+            .find_map(|(ix, i)| if let Item::Hist(r) = i { Some((ix, *r)) } else { None })
+            .expect("a history row");
+        let entry = crate::rail::saved_entry(&v.model, rail.rows[r].saved.expect("saved")).expect("listed");
+        let out = (rail.rows[r].key, entry.id.clone());
+        v.rail_list.scroll_to_reveal_item(ix);
+        cx.notify();
+        out
+    });
+    settle(cx, w, 4);
+    let star: &'static str = Box::leak(format!("star {key}").into_boxed_str());
+    let bounds = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel);
+    let before = bounds(cx, star).expect("the star's slot is laid out at rest");
+    event(
+        cx,
+        w,
+        PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
+            position: before.center(),
+            pressed_button: None,
+            modifiers: Default::default(),
+        }),
+    );
+    settle(cx, w, 4);
+    assert_eq!(bounds(cx, star), Some(before), "hovered: drawn in its slot, nothing moved");
+    click_at(cx, w, before.center());
+    settle(cx, w, 4);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.model.favs.list.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), [id.as_str()]);
+        assert!(v.model.named.resuming.is_none(), "the star's click is its own: the row did not open");
+        let rail = &v.rail.rail;
+        assert!(matches!(rail.items[0], Item::Favs { open: true, .. }), "FAVOURITES leads the rail");
+        let rows: Vec<u64> =
+            rail.items.iter().filter_map(|i| if let Item::Row(r) | Item::Hist(r) = i { Some(rail.rows[*r].key) } else { None }).collect();
+        assert_eq!(rows.iter().filter(|k| **k == key).count(), 1, "in FAVOURITES only");
+        assert!(matches!(rail.items[1], Item::Row(r) if rail.rows[r].key == key && rail.rows[r].fav == Some(0)));
+    });
+    // The key: the session on screen.
+    let shown = view.read_with(cx, |v, _| v.model.tabs.current().and_then(|t| t.session.clone()).expect("the demo's session"));
+    down(cx, w, if cfg!(target_os = "macos") { "cmd-d" } else { "ctrl-d" }, false);
+    up(cx, w, "d");
+    settle(cx, w, 4);
+    let live_key = view.read_with(cx, |v, _| {
+        assert_eq!(v.model.favs.list.len(), 2);
+        let s = v.model.sessions.iter().find(|s| s.id == shown).unwrap();
+        assert!(v.model.fav_of(s).is_some(), "Ctrl+D favourited the session on screen");
+        assert!(!s.pinned, "a favourite is not the daemon's pin");
+        crate::rail::key_of(&shown)
+    });
+    // Its filled star, drawn at rest; a click unfavourites it.
+    let star: &'static str = Box::leak(format!("star {live_key}").into_boxed_str());
+    let b = bounds(cx, star).expect("the favourite's star");
+    click_at(cx, w, b.center());
+    settle(cx, w, 4);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.model.favs.list.len(), 1);
+        assert!(v.model.is_shown(&shown), "still the session on screen: nothing opened or closed");
+    });
+}

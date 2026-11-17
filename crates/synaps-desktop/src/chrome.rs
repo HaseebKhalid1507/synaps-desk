@@ -651,6 +651,31 @@ impl AppView {
         let rail = &self.rail.rail;
         let Some(item) = rail.items.get(ix) else { return div().into_any_element() };
         match item {
+            // A group's head (the first: no rule above it) that folds, as a
+            // bucket does: its chevron in the left inset, so the label
+            // lines up with the other groups'.
+            Item::Favs { open, count } => {
+                let chevron = if *open { glyph::Glyph::FoldOpen } else { glyph::Glyph::Fold };
+                h_flex()
+                    .id("favs-head")
+                    .debug_selector(|| "favs-head".into())
+                    .relative()
+                    .w_full()
+                    .px(px(22.))
+                    .pt(px(17.))
+                    .pb(px(7.))
+                    .items_baseline()
+                    .gap(px(9.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(p.raised))
+                    .child(div().absolute().left(px(7.)).top(px(19.)).child(glyph::draw(chevron, p.rest_mark)))
+                    .child(display(label::FAVOURITES, size::D_S, p.dim_ch))
+                    .child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_ch).child(fonts::JP_FAVOURITES))
+                    .child(div().flex_1())
+                    .child(mono(count, size::META, p.dim_ch))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_favs_group(cx)))
+                    .into_any_element()
+            }
             Item::Group { group, count } => h_flex()
                 .w_full()
                 .px(px(22.))
@@ -739,7 +764,9 @@ impl AppView {
         let cost = meta.map(|s| if on { self.model.stats.cost.unwrap_or(s.cost_usd) } else { s.cost_usd }).filter(|c| *c > 0.0);
         let waiting = meta.map(|s| if on { self.model.transcript.pending_prompts().len() } else { s.awaiting_input }).unwrap_or(0);
         let workers = if st == State::Workers { meta.map_or(0, |s| self.model.workers(s)) } else { 0 };
+        let gone = row.gone && meta.is_none();
         let title_color = match st {
+            _ if gone => p.dim_ch,
             State::NeedsYou | State::Running | State::Workers | State::Unread => p.ink,
             _ if shown => p.ink,
             State::Parked | State::Locked => p.dim_ch,
@@ -766,22 +793,45 @@ impl AppView {
             State::Workers => 5. + cells(&count(workers)),
             _ => 0.,
         };
-        let word_w = st.word().map_or(0., |w| self.widths.borrow().get(&(w, size::D_S.to_bits())).copied().unwrap_or(0.) + count_w + 8.);
-        let cost_w = cost.map_or(0., |c| 8. + cells(&format!("${c:.2}")));
+        // A favourite whose journal is gone: GONE (rest), and Remove.
+        let st_word = if gone { Some(label::GONE) } else { st.word() };
+        let word_w = st_word.map_or(0., |w| self.widths.borrow().get(&(w, size::D_S.to_bits())).copied().unwrap_or(0.) + count_w + 8.);
+        let cost_w = cost.map_or(0., |c| 8. + cells(&format!("${c:.2}"))) + if gone { 8. + 11. * cell } else { 0. };
         // The row's insets, its glyph and gap.
         let room = self.rail_width - 2. * 22. - 10. - 10. - word_w - cost_w;
         let sub = room >= SUB_MIN_CELLS * cell;
-        let word = st.word().map(|w| {
+        let word_color = if gone { p.dim_ch } else { glyph::session_word(st, Ground::Chrome, p) };
+        let word = st_word.map(|w| {
             h_flex()
                 .flex_none()
                 .items_baseline()
                 .gap(px(5.))
-                .child(display(w, size::D_S, glyph::session_word(st, Ground::Chrome, p)))
+                .child(display(w, size::D_S, word_color))
                 .when(st == State::NeedsYou && waiting > 1, |d| d.child(mono(count(waiting), size::META, p.warn_ch)))
                 .when(st == State::Workers, |d| d.child(mono(count(workers), size::META, p.run_ch)))
         });
+        let lead = if gone {
+            div().flex().flex_none().size(px(10.)).child(glyph::draw(glyph::Glyph::Gone, p.rest_mark))
+        } else {
+            glyph::session_mark(st, Ground::Chrome, p)
+        };
+        let remove = gone.then(|| {
+            let id = row.fav.and_then(|i| self.model.favs.list.get(i)).map(|f| f.id.clone()).unwrap_or_default();
+            display(label::REMOVE, size::D_S, p.dim_ch)
+                .id(("rail-remove", key as usize))
+                .debug_selector(|| "fav-remove".into())
+                .flex_none()
+                .cursor_pointer()
+                .hover(|d| d.text_color(p.ink))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.remove_fav(&id);
+                    cx.notify();
+                }))
+        });
         div()
             .id(("rail-row", key as usize))
+            .group("rail-row")
             .relative()
             .w_full()
             .px(px(22.))
@@ -791,7 +841,7 @@ impl AppView {
             .hover(|d| d.bg(p.raised))
             .when_some(bar, |d, c| d.child(div().absolute().left_0().top_0().bottom_0().w(px(if in_tab { 1. } else { 2. })).bg(c)))
             .child(
-                h_flex().gap(px(10.)).items_start().child(glyph::session_mark(st, Ground::Chrome, p).mt(px(5.))).child(
+                h_flex().gap(px(10.)).items_start().child(lead.mt(px(5.))).child(
                     v_flex()
                         .flex_1()
                         .min_w_0()
@@ -813,7 +863,18 @@ impl AppView {
                                         .text_color(title_color)
                                         .child(SharedString::from(&row.title)),
                                 )
-                                .child(mono(&row.age, size::META, p.dim_ch)),
+                                // The daemon pins it too (it is not in PINNED).
+                                .when(row.pinned, |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .flex_none()
+                                            .debug_selector(|| "pin-mark".into())
+                                            .child(glyph::draw(glyph::Glyph::Pinned, p.rest_mark)),
+                                    )
+                                })
+                                .child(mono(&row.age, size::META, p.dim_ch))
+                                .child(self.star(key, row.fav.is_some(), 18., p, cx)),
                         )
                         .child(
                             h_flex()
@@ -834,7 +895,8 @@ impl AppView {
                                         .text_color(sub_color)
                                         .when(sub, |d| d.child(SharedString::from(&row.sub))),
                                 )
-                                .when_some(cost, |d, c| d.child(mono(format!("${c:.2}"), size::META, p.cost_ch).flex_none())),
+                                .when_some(cost, |d, c| d.child(mono(format!("${c:.2}"), size::META, p.cost_ch).flex_none()))
+                                .children(remove),
                         ),
                 ),
             )
@@ -871,6 +933,7 @@ impl AppView {
         };
         h_flex()
             .id(("rail-hist", key as usize))
+            .group("rail-row")
             .relative()
             .w_full()
             .h(px(25.))
@@ -893,19 +956,55 @@ impl AppView {
                     .child(SharedString::from(&row.title)),
             )
             .child(mono(&row.age, size::META, p.dim_ch))
+            .child(self.star(key, false, 25., p, cx))
             .when(self.readout == Some(key) && !menu_open, |d| d.child(self.render_readout(row, p)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                 this.rail_click(key, crate::tabstrip::click_place(ev, cx));
                 cx.notify();
             }))
-            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 if ev.is_middle_click() {
                     this.rail_click(key, Place::New);
                     cx.notify();
+                } else if ev.is_right_click() {
+                    this.open_session_menu(crate::app::SessionAt::Row(key), ev.position(), window, cx);
                 }
             }))
             .into_any_element()
+    }
+
+    /// A row's favourite star, at its line 1's end (design.md §5: a
+    /// reveal action keeps its slot always, so nothing moves): a favourite's
+    /// filled, always drawn (accent through `focus_ch`: it is yours); any
+    /// other row's outline, drawn while the row is hovered. A click
+    /// (favourite or not) is the star's only: the row does not open.
+    fn star(&self, key: u64, fav: bool, h: f32, p: &Palette, cx: &Context<Self>) -> Stateful<Div> {
+        let mark = if fav {
+            div().flex().flex_none().size(px(10.)).child(glyph::draw(glyph::Glyph::Starred, p.focus_ch))
+        } else {
+            glyph::reveal(glyph::Glyph::Star, "rail-row", "rail-star", false, p.dim_ch, p.ink)
+        };
+        let tip = if fav { "Unfavourite" } else { "Favourite (this desktop only: the daemon is not told)" };
+        h_flex()
+            .id(("rail-star", key as usize))
+            .debug_selector(move || format!("star {key}"))
+            .group("rail-star")
+            .flex_none()
+            // A wider target than the glyph, laid out as 10 px.
+            .w(px(18.))
+            .mx(px(-4.))
+            .h(px(h))
+            .justify_center()
+            .items_center()
+            .cursor_pointer()
+            .child(mark)
+            .tooltip(move |window, cx| crate::overlay::tip(tip, window, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_fav_row(key);
+                cx.notify();
+            }))
     }
 
     /// The hover readout, beside the row over the session pane: drawn on
@@ -913,10 +1012,14 @@ impl AppView {
     /// pointer has rested 400 ms.
     fn render_readout(&self, row: &rail::Row, p: &Palette) -> AnyElement {
         let now = now_secs();
+        let fav = row.fav.and_then(|i| self.model.favs.list.get(i));
         let r = match (row.live.and_then(|i| self.model.sessions.get(i)), row.saved.and_then(|s| rail::saved_entry(&self.model, s))) {
             (Some(s), _) => rail::readout_live(&self.model, s, now),
-            (None, Some(v)) => rail::readout_saved(&self.model, v, now),
-            _ => return div().into_any_element(),
+            (None, Some(v)) if !row.gone => rail::readout_saved(&self.model, v, now),
+            _ => match fav {
+                Some(f) => rail::readout_fav(&self.model, f, now),
+                None => return div().into_any_element(),
+            },
         };
         // The overlay anatomy (design.md §8.13): the title, then the facts.
         let facts = r.lines.into_iter().map(|(k, value, aside)| crate::overlay::Fact::new(k, value).aside(aside));

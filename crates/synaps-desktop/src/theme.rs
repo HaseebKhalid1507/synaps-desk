@@ -1035,7 +1035,8 @@ pub fn save_theme(path: &Path, name: Option<&str>) -> std::io::Result<()> {
 /// pixels, clamped to [`RAIL_WIDTHS`] / [`RIGHT_WIDTHS`]; missing, `null`
 /// or not a number: the auto width), which HISTORY buckets are open
 /// (`history_open`, a list of bucket names; missing or not a list: NAMED
-/// and TODAY) and the centre pane's text size (`text_size`, one of
+/// and TODAY), whether FAVOURITES is folded (`favourites_closed`; missing:
+/// open) and the centre pane's text size (`text_size`, one of
 /// [`TEXT_STEPS`]; anything else: [`DEFAULT_TEXT`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Panels {
@@ -1046,6 +1047,7 @@ pub struct Panels {
     pub right_width: Option<u16>,
     /// [`Bucket::bit`]s.
     pub history_open: u8,
+    pub favs_closed: bool,
     pub text_size: u8,
 }
 
@@ -1061,6 +1063,7 @@ impl Default for Panels {
             rail_width: None,
             right_width: None,
             history_open: Bucket::DEFAULT_OPEN,
+            favs_closed: false,
             text_size: DEFAULT_TEXT,
         }
     }
@@ -1072,6 +1075,7 @@ impl Panels {
     const RAIL_WIDTH: &str = "rail_width";
     const RIGHT_WIDTH: &str = "right_width";
     const HISTORY: &str = "history_open";
+    const FAVS: &str = "favourites_closed";
     const TEXT_SIZE: &str = "text_size";
 }
 
@@ -1083,6 +1087,7 @@ pub struct PanelKeys {
     pub rail_width: bool,
     pub right_width: bool,
     pub history: bool,
+    pub favs: bool,
     pub text_size: bool,
 }
 
@@ -1095,6 +1100,7 @@ impl PanelKeys {
             rail_width: a.rail_width != b.rail_width,
             right_width: a.right_width != b.right_width,
             history: a.history_open != b.history_open,
+            favs: a.favs_closed != b.favs_closed,
             text_size: a.text_size != b.text_size,
         }
     }
@@ -1110,6 +1116,7 @@ impl PanelKeys {
             rail_width: self.rail_width || o.rail_width,
             right_width: self.right_width || o.right_width,
             history: self.history || o.history,
+            favs: self.favs || o.favs,
             text_size: self.text_size || o.text_size,
         }
     }
@@ -1132,6 +1139,7 @@ pub fn load_panels(path: &Path) -> Panels {
         rail_width: width(Panels::RAIL_WIDTH, RAIL_WIDTHS),
         right_width: width(Panels::RIGHT_WIDTH, RIGHT_WIDTHS),
         history_open,
+        favs_closed: flag(Panels::FAVS),
         text_size: v
             .get(Panels::TEXT_SIZE)
             .and_then(serde_json::Value::as_u64)
@@ -1160,6 +1168,9 @@ pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<(
     if keys.history {
         let open: Vec<&str> = Bucket::ALL.into_iter().filter(|b| p.history_open & b.bit() != 0).map(Bucket::key).collect();
         kv.push((Panels::HISTORY, open.into()));
+    }
+    if keys.favs {
+        kv.push((Panels::FAVS, p.favs_closed.into()));
     }
     if keys.text_size {
         kv.push((Panels::TEXT_SIZE, p.text_size.into()));
@@ -1217,6 +1228,24 @@ pub fn save_tabs(path: &Path, key: &str, saved: &crate::tabs::Saved) -> std::io:
         }
         v["tabs"][key] =
             serde_json::json!({"sessions": saved.sessions, "journals": saved.journals, "labels": saved.labels, "active": saved.active});
+    })
+}
+
+/// The favourite sessions saved under `key` (the daemon they are of, as
+/// the tabs are keyed): `favourites.<key>` in the settings file, a list
+/// ([`crate::favourites::to_json`]). Missing or malformed: none.
+pub fn load_favourites(path: &Path, key: &str) -> Vec<crate::favourites::Favourite> {
+    load_settings(path).and_then(|v| v.get("favourites")?.get(key).map(crate::favourites::from_json)).unwrap_or_default()
+}
+
+/// Save the favourites under `key`, keeping every other daemon's and every
+/// other key (see [`save_settings`]).
+pub fn save_favourites(path: &Path, key: &str, list: &[crate::favourites::Favourite]) -> std::io::Result<()> {
+    update_settings(path, |v| {
+        if !v.get("favourites").is_some_and(serde_json::Value::is_object) {
+            v["favourites"] = serde_json::json!({});
+        }
+        v["favourites"][key] = crate::favourites::to_json(list);
     })
 }
 
@@ -1625,6 +1654,58 @@ mod tests {
         let v = load_settings(&path).unwrap();
         assert_eq!(v.as_object().map(|o| o.len()), Some(8), "{v}");
         assert!(v.as_object().unwrap().values().all(|x| x == 19), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Favourites are kept per daemon (the tabs' keys): one daemon's list
+    /// never shows on another, saving one keeps the others, the tabs and
+    /// every key this build does not know; a list survives a write of
+    /// anything else.
+    #[test]
+    fn favourites_round_trip_per_daemon_keeping_unknown_keys() {
+        use crate::favourites::{Favourite, Favourites, Source};
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-favs-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r##"{"accent": "#2d7bff", "from_the_future": {"x": [1, 2]}, "tabs": {"socket:/a": {"sessions": ["s1"], "active": 0}}}"##,
+        )
+        .unwrap();
+        assert!(load_favourites(&path, "socket:/a").is_empty(), "none yet");
+        let saved = |id: &str, cwd: &str| -> synaps_client::SavedSession {
+            serde_json::from_value(
+                serde_json::json!({"id": id, "title": format!("t {id}"), "cwd": cwd, "updated_at": "2026-01-02T03:04:05Z"}),
+            )
+            .unwrap()
+        };
+        let mut a = Favourites::default();
+        a.toggle(Source::Saved(&saved("j-old", "/home/u/deep")), 10);
+        a.toggle(Source::Saved(&saved("j-new", "/home/u/new")), 20);
+        let b = vec![Favourite::of(Source::Saved(&saved("j-b", "/srv/b")), 30)];
+        save_favourites(&path, "socket:/a", &a.list).unwrap();
+        save_favourites(&path, "socket:/b", &b).unwrap();
+        assert_eq!(load_favourites(&path, "socket:/a"), a.list, "order and snapshot kept");
+        assert_eq!(load_favourites(&path, "socket:/b"), b, "another daemon's apart");
+        assert!(load_favourites(&path, "offline").is_empty());
+        // Everything else stays: unknown keys, the tabs, the accent.
+        save_settings(&path, &[("theme", "nord".into())]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["from_the_future"], serde_json::json!({"x": [1, 2]}));
+        assert_eq!(v["tabs"]["socket:/a"]["sessions"], serde_json::json!(["s1"]));
+        assert_eq!(load_accent(&path).as_deref(), Some("#2d7bff"));
+        assert_eq!(load_favourites(&path, "socket:/a"), a.list, "a write of another key keeps them");
+        assert_eq!(load_tabs(&path, "socket:/a").map(|t| t.sessions), Some(vec!["s1".to_string()]));
+        // Unfavourited: an empty list, not the daemon's key gone with the others.
+        save_favourites(&path, "socket:/a", &[]).unwrap();
+        assert!(load_favourites(&path, "socket:/a").is_empty());
+        assert_eq!(load_favourites(&path, "socket:/b"), b);
+        // Not an object: none (and the next save makes it one).
+        std::fs::write(&path, r#"{"favourites": [1, 2]}"#).unwrap();
+        assert!(load_favourites(&path, "socket:/b").is_empty());
+        save_favourites(&path, "socket:/b", &b).unwrap();
+        assert_eq!(load_favourites(&path, "socket:/b"), b);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -49,6 +49,14 @@ pub(crate) enum Glyph {
     FoldOpen,
     /// Close or cancel: `Failed` in an 8 px box.
     Close,
+    /// Favourite this session (a row's reveal): a five-point star's
+    /// outline, stroke 1, round joins.
+    Star,
+    /// A favourite (desktop only, never the daemon's pin): the star filled.
+    Starred,
+    /// The daemon pins it (kept loaded, never parked), on a favourite's
+    /// row: a tack, a 6×2 head over a 2×6 stem.
+    Pinned,
 }
 
 /// Open it (in a tab): the closed fold's chevron.
@@ -63,10 +71,17 @@ pub(crate) enum Part {
     Frame(f32, f32, f32, f32),
     /// A stroked polyline.
     Line(&'static [(f32, f32)]),
+    /// A closed polyline (its last point its first), filled and stroked.
+    Poly(&'static [(f32, f32)]),
 }
 
+/// The star's ten points (outer radius 4.4 about (5, 5.25), inner 2), top
+/// first, clockwise; closed by the drawing.
+const STAR: &[(f32, f32)] =
+    &[(5., 0.85), (6.18, 3.63), (9.18, 3.89), (6.9, 5.87), (7.59, 8.81), (5., 7.25), (2.41, 8.81), (3.1, 5.87), (0.82, 3.89), (3.82, 3.63)];
+
 impl Glyph {
-    pub(crate) const ALL: [Glyph; 17] = [
+    pub(crate) const ALL: [Glyph; 20] = [
         Glyph::Run,
         Glyph::Workers,
         Glyph::Needs,
@@ -84,6 +99,9 @@ impl Glyph {
         Glyph::Fold,
         Glyph::FoldOpen,
         Glyph::Close,
+        Glyph::Star,
+        Glyph::Starred,
+        Glyph::Pinned,
     ];
 
     /// Its box: 10 px; `Close` 8.
@@ -92,7 +110,7 @@ impl Glyph {
     }
 
     fn stroke(self) -> f32 {
-        if self == Glyph::Close { 1. } else { 1.5 }
+        if matches!(self, Glyph::Close | Glyph::Star | Glyph::Starred) { 1. } else { 1.5 }
     }
 
     /// A stroked glyph's sprite: its SVG's asset path ([`Sprites`]).
@@ -103,12 +121,14 @@ impl Glyph {
             Glyph::Fold => "glyph/fold.svg",
             Glyph::FoldOpen => "glyph/fold-open.svg",
             Glyph::Close => "glyph/close.svg",
+            Glyph::Star => "glyph/star.svg",
+            Glyph::Starred => "glyph/starred.svg",
             _ => return None,
         })
     }
 
     pub(crate) fn parts(self) -> &'static [Part] {
-        use Part::{Fill, Frame, Line};
+        use Part::{Fill, Frame, Line, Poly};
         match self {
             Glyph::Run => &[Fill(1., 1., 8., 8.)],
             Glyph::Workers => &[Fill(1., 1., 4., 4.), Fill(5., 5., 4., 4.)],
@@ -127,6 +147,9 @@ impl Glyph {
             Glyph::Fold => &[Line(&[(3.5, 1.5), (7., 5.), (3.5, 8.5)])],
             Glyph::FoldOpen => &[Line(&[(1.5, 3.5), (5., 7.), (8.5, 3.5)])],
             Glyph::Close => &[Line(&[(1.6, 1.6), (6.4, 6.4)]), Line(&[(6.4, 1.6), (1.6, 6.4)])],
+            Glyph::Star => &[Line(STAR_CLOSED)],
+            Glyph::Starred => &[Poly(STAR_CLOSED)],
+            Glyph::Pinned => &[Fill(2., 1., 6., 2.), Fill(4., 3., 2., 6.)],
         }
     }
 }
@@ -143,11 +166,23 @@ pub(crate) fn draw(g: Glyph, color: Hsla) -> AnyElement {
             Part::Fill(x, y, w, h) => el.child(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).bg(color)),
             Part::Frame(x, y, w, h) => el.child(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).border_1().border_color(color)),
             // A stroked glyph is a sprite.
-            Part::Line(_) => el,
+            Part::Line(_) | Part::Poly(_) => el,
         };
     }
     el.into_any_element()
 }
+
+/// [`STAR`] closed: the outline's polyline.
+const STAR_CLOSED: &[(f32, f32)] = &{
+    let mut out = [(0., 0.); 11];
+    let mut i = 0;
+    while i < 10 {
+        out[i] = STAR[i];
+        i += 1;
+    }
+    out[10] = STAR[0];
+    out
+};
 
 /// A stroked glyph's SVG, written from its drawing: the box as the view
 /// box, its lines as one path. Butt caps and miter joins, as a stroke's
@@ -167,7 +202,11 @@ pub(crate) const CUTS: u32 = 8;
 pub(crate) fn svg_cut(g: Glyph, k: u32) -> String {
     let s = g.size();
     let seg = |a: (f32, f32), b: (f32, f32)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
-    let lines = || g.parts().iter().filter_map(|p| if let Part::Line(pts) = p { Some(*pts) } else { None });
+    let lines = || g.parts().iter().filter_map(|p| if let Part::Line(pts) | Part::Poly(pts) = p { Some(*pts) } else { None });
+    let poly = g.parts().iter().any(|p| matches!(p, Part::Poly(_)));
+    // A closed outline (the stars) is closed once drawn whole, and joined
+    // round: no corner to miter out of its box.
+    let closed = |pts: &[(f32, f32)]| pts.len() > 2 && pts.first() == pts.last();
     let total: f32 = lines().map(|pts| pts.windows(2).map(|w| seg(w[0], w[1])).sum::<f32>()).sum();
     let mut left = total * k.min(CUTS) as f32 / CUTS as f32;
     let mut d = String::new();
@@ -176,10 +215,14 @@ pub(crate) fn svg_cut(g: Glyph, k: u32) -> String {
             break;
         }
         let _ = write!(d, "M{} {}", pts[0].0, pts[0].1);
-        for w in pts.windows(2) {
+        for (i, w) in pts.windows(2).enumerate() {
             let l = seg(w[0], w[1]);
             if left >= l - 1e-4 {
-                let _ = write!(d, "L{} {}", w[1].0, w[1].1);
+                if closed(pts) && i == pts.len() - 2 {
+                    d.push('Z');
+                } else {
+                    let _ = write!(d, "L{} {}", w[1].0, w[1].1);
+                }
                 left -= l;
             } else {
                 let t = left / l;
@@ -190,8 +233,10 @@ pub(crate) fn svg_cut(g: Glyph, k: u32) -> String {
             }
         }
     }
+    let join = if lines().any(closed) { r#" stroke-linejoin="round""# } else { "" };
+    let fill = if poly && k >= CUTS { "#000" } else { "none" };
     format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}" viewBox="0 0 {s} {s}"><path d="{d}" fill="none" stroke="#000" stroke-width="{}"/></svg>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}" viewBox="0 0 {s} {s}"><path d="{d}" fill="{fill}" stroke="#000" stroke-width="{}"{join}/></svg>"##,
         g.stroke()
     )
 }
@@ -223,6 +268,8 @@ fn cut_path(g: Glyph, k: u32) -> Option<&'static str> {
         Glyph::Fold => cuts!("glyph/fold"),
         Glyph::FoldOpen => cuts!("glyph/fold-open"),
         Glyph::Close => cuts!("glyph/close"),
+        Glyph::Star => cuts!("glyph/star"),
+        Glyph::Starred => cuts!("glyph/starred"),
         _ => return None,
     };
     table.get(k.checked_sub(1)? as usize).copied()
@@ -261,7 +308,7 @@ pub(crate) fn draw_at(g: Glyph, p: f32, color: Hsla) -> AnyElement {
             Part::Frame(x, y, w, h) => {
                 el.child(div().absolute().left(px(x)).top(px(y)).w(px(w * p)).h(px(h)).border_1().border_color(color))
             }
-            Part::Line(_) => el,
+            Part::Line(_) | Part::Poly(_) => el,
         };
     }
     el.into_any_element()
@@ -746,7 +793,7 @@ mod tests {
                     Part::Fill(x, y, w, h) | Part::Frame(x, y, w, h) => {
                         assert!(x >= 0. && y >= 0. && x + w <= s && y + h <= s && w > 0. && h > 0., "{a:?}: {part:?}");
                     }
-                    Part::Line(pts) => {
+                    Part::Line(pts) | Part::Poly(pts) => {
                         assert!(pts.len() >= 2, "{a:?}");
                         for &(x, y) in pts {
                             assert!(x - half >= 0. && y - half >= 0. && x + half <= s && y + half <= s, "{a:?}: ({x}, {y})");
@@ -766,7 +813,7 @@ mod tests {
     fn every_stroked_glyph_is_a_sprite() {
         let mut paths = Vec::new();
         for g in Glyph::ALL {
-            let lines = g.parts().iter().filter(|p| matches!(p, Part::Line(_))).count();
+            let lines = g.parts().iter().filter(|p| matches!(p, Part::Line(_) | Part::Poly(_))).count();
             assert!(lines == 0 || lines == g.parts().len(), "{g:?} mixes quads and strokes");
             assert_eq!(g.sprite().is_some(), lines > 0, "{g:?}");
             let Some(path) = g.sprite() else { continue };
@@ -776,7 +823,7 @@ mod tests {
             assert_eq!(&*svg, svg_of(g).as_bytes());
             assert_eq!(svg_of(g).matches('M').count(), lines, "{g:?}: one subpath per line");
         }
-        assert_eq!(paths.len(), 5);
+        assert_eq!(paths.len(), 7);
         assert_eq!(
             svg_of(Glyph::Ok),
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10"><path d="M1.5 5.5L4 8L8.5 2" fill="none" stroke="#000" stroke-width="1.5"/></svg>"##
@@ -787,7 +834,12 @@ mod tests {
         );
         assert!(Sprites.load("glyph/nope.svg").unwrap().is_none());
         assert!(Sprites.load("").unwrap().is_none());
-        assert_eq!(Sprites.list("glyph/").unwrap().len(), 5);
+        assert_eq!(Sprites.list("glyph/").unwrap().len(), 7);
+        // The stars: one closed outline, joined round; the favourite's filled.
+        let star = svg_of(Glyph::Star);
+        assert!(star.contains(r#"L3.82 3.63Z" fill="none""#) && star.contains(r#"stroke-linejoin="round""#), "{star}");
+        assert!(svg_of(Glyph::Starred).contains(r##"Z" fill="#000""##), "{}", svg_of(Glyph::Starred));
+        assert!(!svg_of(Glyph::Ok).contains("linejoin"));
     }
 
     /// A write-on's cuts: served for every stroked glyph, drawn to their
