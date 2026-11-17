@@ -265,6 +265,12 @@ impl Worker {
         }
     }
 
+    /// Who it is, as a tab, a menu or a tray row says it
+    /// ([`crate::wtabs::same_worker`]): its call if known, its name.
+    pub fn key(&self) -> (Option<&str>, &str) {
+        (self.call.as_deref(), &self.name)
+    }
+
     /// Its view takes no input: it finished (or is gone).
     pub fn read_only(&self) -> bool {
         self.gone.is_some() || (!self.status.is_empty() && self.status != "running")

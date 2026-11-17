@@ -513,7 +513,7 @@ impl AppView {
         }
     }
 
-    /// The breadcrumb's NEEDS YOU: the session of the worker on screen
+    /// The NEEDS YOU stub's click: the session of the worker on screen
     /// waits on a prompt. Its tab (opened if closed) with its thread on
     /// screen, and so its card: never answered from a worker's view.
     pub(crate) fn open_parent_card(&mut self, cx: &mut Context<Self>) {
@@ -536,33 +536,32 @@ impl AppView {
 
     /// Worker `handle` (`sa_N`) of `session`, as every surface shows it
     /// ([`Liveness`], design.md §4.3): from its session's workers (attached
-    /// here, or as its tab last saw them), as the tray and its block read
-    /// them; its view's own word only if they say nothing of it. A cancel
-    /// on its way is `Cancelling`; `expect` (who a tab or a menu says it
-    /// is): another worker under the handle now is `Gone`, as is one an
-    /// attached session does not know. Read per frame for a worker tab's
-    /// mark and the composer foot: nothing allocated.
-    pub(crate) fn worker_state(&self, session: &str, handle: &str, expect: Option<(Option<&str>, &str)>) -> Liveness {
+    /// here, or as its tab last saw them) and its view's own word
+    /// ([`Liveness::of_sources`]). A cancel on its way is `Cancelling`;
+    /// `expect` (who a tab, a menu or the foot says it is): another worker
+    /// under the handle now is `Gone`, as is one an attached session does
+    /// not know. `None`: this window holds nothing of its session (not
+    /// attached, not cached). Read per frame for a worker tab's mark and
+    /// the composer foot: nothing allocated.
+    pub(crate) fn worker_state(&self, session: &str, handle: &str, expect: Option<(Option<&str>, &str)>) -> Option<Liveness> {
         let attached = self.model.is_active(session);
         let shown = attached || self.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(session);
         let (watch, subs) = match (shown, self.tab_cache.peek(session)) {
             (true, _) => (&self.model.watch, &self.model.stats.subagents),
             (false, Some(c)) => (&c.watch, &c.stats.subagents),
-            (false, None) => return Liveness::Started,
+            (false, None) => return None,
         };
         let id = handle.strip_prefix("sa_").and_then(|n| n.parse().ok());
         let now = id.and_then(|id| subs.ident(id));
         if let (Some(e), Some(now)) = (expect, now)
             && !same_worker(e, now)
         {
-            return Liveness::Gone;
+            return Some(Liveness::Gone);
         }
         let status = id.and_then(|id| subs.status(id));
-        let live = match (status, watch.view_state(handle).and_then(Liveness::of_view)) {
-            (None, Some(v)) => v,
-            (status, _) => Liveness::of(status, attached, !attached || now.is_some() || status.is_some()),
-        };
-        live.cancelling(self.model.cancels.pending(session, handle))
+        let view = watch.view_state(handle).and_then(Liveness::of_view);
+        let live = Liveness::of_sources(status, view, attached, !attached || now.is_some() || status.is_some());
+        Some(live.cancelling(self.model.cancels.pending(session, handle)))
     }
 
     /// Whether this window may steer or cancel `session`'s workers, else
@@ -596,8 +595,8 @@ impl AppView {
             return Some(Blocked::Renamed);
         }
         match self.worker_state(session, handle, Some(who.key())) {
-            Liveness::Running | Liveness::Started => None,
-            s => Some(Blocked::Ended(s)),
+            None | Some(Liveness::Running | Liveness::Started) => None,
+            Some(s) => Some(Blocked::Ended(s)),
         }
     }
 
@@ -697,7 +696,12 @@ impl AppView {
         let info = if other { None } else { subs.and_then(|s| s.info(t.who.id)) };
         Facts {
             name: t.who.name.to_string(),
-            state: if other { Liveness::Gone } else { self.worker_state(&t.session, &handle, Some(t.who.key())) },
+            // Nothing held of its session: not ended, as far as this window knows.
+            state: if other {
+                Liveness::Gone
+            } else {
+                self.worker_state(&t.session, &handle, Some(t.who.key())).unwrap_or(Liveness::Started)
+            },
             read_only: self.may_drive(&t.session).err(),
             other,
             armed: self.model.cancels.armed(&t.session, t.who.id, t.who.key(), now),
@@ -988,7 +992,7 @@ pub(crate) fn card_tip(me: WeakEntity<AppView>, who: Who, fallback: SharedString
             let v = v.read(cx);
             let session = v.worker_session()?;
             let info = v.info_of(&session, &who)?;
-            Some((info, v.worker_state(&session, &who.handle(), Some(who.key()))))
+            Some((info, v.worker_state(&session, &who.handle(), Some(who.key()))?))
         });
         let Some((info, state)) = info else { return Tooltip::new(fallback.clone()).build(window, cx) };
         let p = theme::palette(cx);

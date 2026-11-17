@@ -154,6 +154,8 @@ pub(crate) type AttachSource = Box<dyn Fn(&str, u64) -> Vec<Event>>;
 /// TUI's `CONFIRM_ARM_DELAY` is 400 ms): it pushes the list up, so a click
 /// meant for a row can land on it. Its keys wait longer ([`Arm`]).
 pub(crate) const ARM: Duration = Duration::from_millis(500);
+/// How long a rename asked for another session waits for its attach.
+pub(crate) const RENAME_WAIT: Duration = Duration::from_secs(10);
 /// The chord that answers a card yes ([`card_key`]), as its button shows it.
 pub(crate) const YES_KEY: &str = if cfg!(target_os = "macos") { "⌘ENTER" } else { "CTRL+ENTER" };
 /// A folded side panel's strip.
@@ -809,7 +811,8 @@ const FOOT_HINT_MIN: f32 = 60.;
 /// drop in this order: the hint (counted at its least), the effort, the
 /// model or facts, the state word and its count (also gone in a tight
 /// pane), the name and handle. The glyph, MAIN, HALT and the primary never
-/// drop.
+/// drop. The effort is said after the model (`model · effort`): it goes
+/// with it.
 pub(crate) fn fit_foot(i: &FootIn) -> Foot {
     let mut f = Foot { hint: i.hint > 0., effort: i.effort > 0., model: i.model > 0., word: i.word > 0. && !i.tight, name: i.name > 0. };
     let width = |f: &Foot| {
@@ -1382,13 +1385,24 @@ pub struct AppView {
     /// A session's menu (a right-click on its tab or rail row): Rename…,
     /// Close tab.
     pub(crate) smenu: Option<(crate::menu::Menu<SessionAct>, SessionTarget)>,
-    /// A rename asked for a session not on screen yet: its naming row opens
-    /// once it is attached.
-    rename_pending: Option<String>,
+    /// A rename asked for a session not on screen yet (and when): its
+    /// naming row opens once it is attached, if that is soon and nothing
+    /// else was shown meanwhile ([`RENAME_WAIT`]); else it is forgotten.
+    pub(crate) rename_pending: Option<(String, Instant)>,
     /// HALT armed by a first Esc in the composer ([`ARM`]): a second
-    /// halts. Its label is `err` while armed; the timer ends the arm.
+    /// halts. Its label is `err` while armed; the timer ends the arm, as
+    /// does anything else shown (another tab, session or view).
     pub(crate) halt_armed: Option<Instant>,
     halt_tick: Option<Task<()>>,
+    /// Where HALT was armed ([`AppView::halt_place`]).
+    halt_where: Option<(Option<u64>, Option<String>, bool)>,
+    /// The Esc on its way had an IME composition to end: the composition's,
+    /// not HALT's. Read before the kit's `Escape` ends it (the root's
+    /// action capture runs first).
+    esc_composing: bool,
+    /// The composer's placeholder was set for a cramped window (its key
+    /// hints dropped: the field is short).
+    placeholder_cramped: bool,
     /// An item was picked from the keyboard: that key's repeats, once the
     /// menu is gone, are not the next thing's ([`AppView::menu_keydown`]).
     /// The root's capture listener stops them, but GPUI runs a focused
@@ -1401,10 +1415,10 @@ pub struct AppView {
     /// A click opened a worker's tab: until then, a mouse-down that is the
     /// rest of its double-click goes nowhere ([`crate::wtabs::MULTI_CLICK`]).
     pub(crate) swallow_clicks: Option<Instant>,
-    /// What reached [`AppView::submit`], and whether a worker's view was
-    /// on screen (a steer): the UI tests' record of what would have gone.
     /// Display caps' widths ([`AppView::display_w`]), measured once.
     widths: RefCell<std::collections::HashMap<(&'static str, u32), f32>>,
+    /// What reached [`AppView::submit`], and whether a worker's view was
+    /// on screen (a steer): the UI tests' record of what would have gone.
     #[cfg(test)]
     pub(crate) submits: Vec<(String, bool)>,
     /// HALTs sent ([`AppView::halt`]): the UI tests' record.
@@ -1783,6 +1797,9 @@ impl AppView {
             rename_pending: None,
             halt_armed: None,
             halt_tick: None,
+            halt_where: None,
+            esc_composing: false,
+            placeholder_cramped: false,
             menu_picked: false,
             swallow_clicks: None,
             widths: RefCell::default(),
@@ -1921,14 +1938,19 @@ impl AppView {
         // Over a worker's view the composer steers it (compared, not
         // allocated, each frame).
         let worker = self.model.watch.focused().map(|w| (w.handle_id.as_str(), w.state(), w.tabbed));
-        if worker != self.placeholder_of.as_ref().map(|(h, s, t)| (h.as_str(), s.as_str(), *t)) {
-            let text: SharedString = match self.model.watch.focused() {
-                Some(w) if w.read_only() && w.tabbed => format!("{} is {}: nothing to steer", w.name, w.state()).into(),
-                Some(w) if w.read_only() => format!("{} is {}: nothing to steer  (Esc: back to the session)", w.name, w.state()).into(),
-                Some(w) => format!("Steer {}: it reads this at its next step  (Enter sends)", w.name).into(),
-                None => COMPOSER_PLACEHOLDER.into(),
+        let cramped = self.layout.cramped;
+        if worker != self.placeholder_of.as_ref().map(|(h, s, t)| (h.as_str(), s.as_str(), *t)) || cramped != self.placeholder_cramped {
+            let text = match self.model.watch.focused() {
+                Some(w) if w.read_only() && w.tabbed => format!("{} is {}: nothing to steer", w.name, w.state()),
+                Some(w) if w.read_only() => format!("{} is {}: nothing to steer  (Esc: back to the session)", w.name, w.state()),
+                Some(w) => format!("Steer {}: it reads this at its next step  (Enter sends)", w.name),
+                None => COMPOSER_PLACEHOLDER.to_string(),
             };
+            // Cramped, the field is short: its key hints go, so it is not
+            // cut off against the glyph.
+            let text: SharedString = if cramped { text.split("  (").next().unwrap_or_default().to_string().into() } else { text.into() };
             self.placeholder_of = worker.map(|(h, s, t)| (h.to_string(), s.to_string(), t));
+            self.placeholder_cramped = cramped;
             self.composer.update(cx, |c, cx| c.set_placeholder(text, window, cx));
         }
         // Worker tabs that followed their session: their drafts with them.
@@ -2312,6 +2334,7 @@ impl AppView {
     /// until its attach lands.
     fn load(&mut self, session: Option<String>) {
         self.list_out();
+        self.disarm_halt();
         match session.as_ref().and_then(|s| self.tab_cache.take(s)) {
             Some(c) => {
                 self.model.switch_in(c.transcript, c.stats);
@@ -2715,7 +2738,7 @@ impl AppView {
 
     /// Back to the session's thread (`esc`: by Esc, which guards the next).
     pub(crate) fn leave_worker(&mut self, esc: bool, cx: &mut Context<Self>) {
-        // A worker tab's breadcrumb: its session's tab (opened if closed).
+        // A worker tab's MAIN: its session's tab (opened if closed).
         if let Some(t) = self.model.tabs.current().filter(|t| t.kind == crate::tabs::Kind::Worker) {
             let Some(session) = t.session.clone() else { return };
             match self.model.tabs.find(&session) {
@@ -3773,9 +3796,17 @@ impl AppView {
 
     /// A rename asked for from another session's tab or row: once it is on
     /// screen and attached, its naming row opens.
+    /// Anything else shown first (another tab or session, a view), or an
+    /// attach that did not land within [`RENAME_WAIT`], and the intent is
+    /// gone: a naming row never opens later, under someone's typing.
     fn rename_when_shown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(s) = self.rename_pending.as_deref() else { return };
-        if !self.model.is_active(s) || self.model.tabs.current().and_then(|t| t.session.as_deref()) != Some(s) {
+        let Some((s, at)) = self.rename_pending.as_ref() else { return };
+        let shown = self.model.tabs.view().is_none() && self.model.tabs.current().and_then(|t| t.session.as_deref()) == Some(s.as_str());
+        if !shown || at.elapsed() > RENAME_WAIT {
+            self.rename_pending = None;
+            return;
+        }
+        if !self.model.is_active(s) {
             return;
         }
         self.rename_pending = None;
@@ -3805,6 +3836,9 @@ impl AppView {
             }
         };
         self.close_menu();
+        // The row's readout is not drawn under its menu.
+        self.readout = None;
+        self.readout_wait = None;
         if let Some(prev) = window.focused(cx).filter(|f| *f != self.focus)
             && self.menu_focus_back.is_none()
         {
@@ -3832,7 +3866,7 @@ impl AppView {
                     (None, Some(key)) => self.rail_click(key, crate::tabs::Place::Current),
                     (None, None) => {}
                 }
-                self.rename_pending = Some(t.session);
+                self.rename_pending = Some((t.session, Instant::now()));
                 self.rename_when_shown(window, cx);
             }
             SessionAct::Close => {
@@ -3872,16 +3906,56 @@ impl AppView {
         Some(deferred(anchored().position(pt).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
     }
 
+    /// The worker on screen as the composer foot says it: its state as its
+    /// tab, its tray row and its menu say it of this worker (its call and
+    /// name: another worker under its handle now, after a cold-started
+    /// daemon numbered its workers from 1 again, is GONE), and its facts:
+    /// its tray row's (tools · elapsed) when that row is this worker's,
+    /// else its view's own.
+    pub(crate) fn watched_state(&self, w: &crate::watch::Worker) -> (Liveness, SharedString) {
+        let session = self.model.active.as_ref().map(|a| a.session_id.as_str()).or(self.model.tabs.current_session());
+        let live = session
+            .and_then(|s| self.worker_state(s, &w.handle_id, Some(w.key())))
+            .or_else(|| Liveness::of_view(w.state()))
+            .unwrap_or(Liveness::Started);
+        let row = self.tray.rows.iter().find(|r| {
+            r.id == w.subagent_id && !r.facts.is_empty() && crate::wtabs::same_worker((r.call.as_deref(), r.name.as_ref()), w.key())
+        });
+        (live, row.map_or_else(|| w.facts.clone(), |r| r.facts.clone()))
+    }
+
     /// HALT is drawn: this window drives the session's running turn (in a
     /// worker's view too).
     pub(crate) fn halt_shown(&self) -> bool {
         self.model.transcript.busy() && self.drives()
     }
 
-    /// HALT: the session's turn stops (the app's one abort).
-    pub(crate) fn halt(&mut self) {
+    /// What is on screen, as far as HALT's arm goes: the visible tab, the
+    /// attached session, and whether a worker's view is up.
+    fn halt_place(&self) -> (Option<u64>, Option<&str>, bool) {
+        (
+            self.model.tabs.visible().map(|t| t.id),
+            self.model.active.as_ref().map(|a| a.session_id.as_str()),
+            self.model.watch.focus().is_some(),
+        )
+    }
+
+    /// HALT is armed for what is on screen now.
+    fn halt_here(&self) -> bool {
+        self.halt_where.as_ref().map(|(t, s, w)| (*t, s.as_deref(), *w)) == Some(self.halt_place())
+    }
+
+    /// The arm ends: another tab, session or view is on screen (a second
+    /// Esc there never halts the turn the first was for), or it was used.
+    pub(crate) fn disarm_halt(&mut self) {
         self.halt_armed = None;
         self.halt_tick = None;
+        self.halt_where = None;
+    }
+
+    /// HALT: the session's turn stops (the app's one abort).
+    pub(crate) fn halt(&mut self) {
+        self.disarm_halt();
         if let Some(c) = &self.client
             && self.model.can_send()
         {
@@ -3900,17 +3974,22 @@ impl AppView {
         // The second of two quick Escs that left a worker's view is not the
         // session's.
         if !self.halt_shown() || self.model.watch.esc_guarded(now) {
-            self.halt_armed = None;
+            self.disarm_halt();
             return false;
         }
-        if self.halt_armed.is_some_and(|at| now.saturating_duration_since(at) < ARM) {
+        if self.halt_armed.is_some_and(|at| now.saturating_duration_since(at) < ARM) && self.halt_here() {
             self.halt();
         } else {
             self.halt_armed = Some(now);
+            self.halt_where = Some({
+                let (t, s, w) = self.halt_place();
+                (t, s.map(str::to_string), w)
+            });
             self.halt_tick = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(ARM).await;
                 let _ = this.update(cx, |v, cx| {
                     v.halt_tick = None;
+                    v.halt_where = None;
                     if v.halt_armed.take().is_some() {
                         cx.notify();
                     }
@@ -4339,8 +4418,14 @@ impl AppView {
         // Over a worker's view the composer steers it, or takes nothing
         // once it has finished.
         let worker = self.model.watch.focused();
+        // Its state and facts, read once (one source for the whole row).
+        let watched = worker.map(|w| self.watched_state(w));
         let drives = self.drives();
-        let can_send = drives && worker.is_none_or(|w| !w.read_only() && w.steerable);
+        // Read-only by its view (it finished, or is gone) or by its state
+        // (it ended first by the session's word; another worker under its
+        // handle now).
+        let read_only = worker.zip(watched.as_ref()).is_some_and(|(w, (live, _))| w.read_only() || live.ended());
+        let can_send = drives && worker.is_none_or(|w| !read_only && w.steerable);
         let (detached, model, effort, _) = self.session_src();
         // Only what is out of the ordinary: the routine two are SEND's and
         // STEER's tooltips.
@@ -4359,7 +4444,14 @@ impl AppView {
         } else if !drives {
             Some(("not attached".into(), p.dim_u))
         } else if let Some(w) = worker {
-            Some((w.hint.clone(), p.dim_u))
+            match watched.as_ref().map(|(live, _)| *live) {
+                // Its state says it ended before its view does.
+                Some(live) if read_only && !w.read_only() => {
+                    let back = if w.tabbed { "" } else { " · Esc returns to the session" };
+                    Some((format!("{} {}: read-only{back}", w.name, glyph::worker(live).2).into(), p.dim_u))
+                }
+                _ => Some((w.hint.clone(), p.dim_u)),
+            }
         } else if to_card {
             // The composer keeps its keys (Ctrl/Cmd+Enter sends from here);
             // the card's buttons show none until it has them.
@@ -4375,7 +4467,7 @@ impl AppView {
             None
         };
         let primary = match worker {
-            Some(w) if w.read_only() => label::READ_ONLY,
+            Some(_) if read_only => label::READ_ONLY,
             Some(_) => label::STEER_WORKER,
             None if busy => label::STEER,
             None => label::SEND,
@@ -4383,8 +4475,9 @@ impl AppView {
         let halt = self.halt_shown();
         let cell = 0.6 * m.meta;
         let display_w = |t: &'static str, size: f32| self.display_w(t, size, window);
-        // The state part: the session's (main view), or the watched worker's.
-        let (g, word, family, tally, read_only) = match worker {
+        // The state part: the session's (main view), or the watched worker's
+        // (READ ONLY is the primary's: said once).
+        let (g, word, family, tally) = match watched.as_ref() {
             None => {
                 let st = self.model.tabs.current().map_or(crate::rail::State::Saved, |t| self.tab_state(t));
                 let (g, word, family) = glyph::foot(st);
@@ -4393,38 +4486,28 @@ impl AppView {
                     crate::rail::State::NeedsYou => Some(self.model.transcript.pending_prompts().len()).filter(|n| *n > 1),
                     _ => None,
                 };
-                (g, word, family, tally, false)
+                // READY only where this window can send.
+                let word = word.filter(|_| drives || st != crate::rail::State::Idle);
+                (g, word, family, tally)
             }
-            Some(w) => {
-                let session = self.model.active.as_ref().map(|a| a.session_id.as_str()).or(self.model.tabs.current_session());
-                let live = session.map_or(Liveness::Started, |s| self.worker_state(s, &w.handle_id, None));
-                let (g, word, _, family) = glyph::worker(live);
-                (Some(g), Some(word), family, None, w.read_only())
+            Some((live, _)) => {
+                let (g, word, _, family) = glyph::worker(*live);
+                (Some(g), Some(word), family, None)
             }
         };
         let (word_color, mark) = glyph::ink(family, Ground::User, p);
-        // Model · effort, or the worker's facts (its tray row's: tools ·
-        // elapsed; else its model).
-        let facts = worker.map(|w| {
-            self.tray
-                .rows
-                .iter()
-                .find(|r| r.id == w.subagent_id && !r.facts.is_empty())
-                .map_or_else(|| w.facts.clone(), |r| r.facts.clone())
-        });
-        let (model, effort): (Option<SharedString>, Option<SharedString>) = match &facts {
-            Some(f) => ((!f.is_empty()).then(|| f.clone()), None),
+        // Model · effort, or the worker's facts.
+        let (model, effort): (Option<SharedString>, Option<SharedString>) = match watched {
+            Some((_, f)) => ((!f.is_empty()).then_some(f), None),
             None => (model.map(|m| crate::named::short_model(m).into()), effort.map(|e| SharedString::from(e.to_string()))),
         };
-        let mono_w = |t: &str| t.chars().count() as f32 * cell;
+        // GPUI lays a text box out a whole pixel wide.
+        let mono_w = |t: &str| (t.chars().count() as f32 * cell).ceil();
         let main_w = display_w(label::MAIN, m.label);
         let primary_w = 32. + display_w(primary, m.label);
         let halt_w = if halt { display_w(label::HALT, m.label) } else { 0. };
-        let word_w = word.map_or(0., |w| {
-            display_w(w, 12.)
-                + tally.map_or(0., |n| 8. + (n.max(1).ilog10() + 1) as f32 * cell)
-                + if read_only { 8. + cell + 8. + display_w(label::READ_ONLY, 12.) } else { 0. }
-        });
+        // The word is the column's size (design.md §1.2 `d.s`: 12·r).
+        let word_w = word.map_or(0., |w| display_w(w, m.meta) + tally.map_or(0., |n| 8. + mono_w(&count(n))));
         let name_w = worker.map_or(0., |w| (mono_w(&w.name).min(24. * cell)) + 8. + mono_w(&w.handle_id));
         let lead_w = if worker.is_some() { main_w + 8. + cell + 8. + m.lead } else { m.lead };
         let fit = fit_foot(&FootIn {
@@ -4492,7 +4575,7 @@ impl AppView {
             // says STEER (the glyph still names whose).
             let room = lay.column - 2. * m.pad_x - 2.;
             let rest = |main: bool, primary: f32| {
-                12. + if main { main_w + 8. } else { 0. } + 10. + if halt { 24. + halt_w } else { 0. } + 24. + primary
+                16. + if main { main_w + 8. } else { 0. } + 10. + if halt { 24. + halt_w } else { 0. } + 24. + primary
             };
             let main = worker.is_some() && room - rest(true, primary_w) >= 120.;
             let short = primary == label::STEER_WORKER && room - rest(main, primary_w) < 120.;
@@ -4511,9 +4594,11 @@ impl AppView {
                 .items_center()
                 .child(div().flex_1().min_w_0().child(field))
                 .child(
+                    // 16 clear of the field: the glyph never reads as the
+                    // end of its text.
                     h_flex()
                         .flex_none()
-                        .ml(px(12.))
+                        .ml(px(16.))
                         .gap(px(8.))
                         .items_center()
                         .when(main, |d| d.child(main_btn()))
@@ -4546,9 +4631,8 @@ impl AppView {
                     .items_center()
                     .debug_selector(|| "foot-word".into())
                     .when(name.is_some(), |d| d.ml(px(12.)))
-                    .child(display(w, 12., word_color))
+                    .child(display(w, m.meta, word_color))
                     .when_some(tally, |d, n| d.child(mono(count(n), m.meta, word_color)))
-                    .when(read_only, |d| d.child(mono("·", m.meta, p.dim_u)).child(display(label::READ_ONLY, 12., p.dim_u)))
             });
             let meta = model.filter(|_| fit.model).map(|t| {
                 h_flex()
@@ -4690,14 +4774,14 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
 }
 
 /// `s` in at most `max` characters, cut from the left (`…` first) at a
-/// `/` if one is in reach: a path keeps its leaf.
+/// `/` or `\\` if one is in reach: a path keeps its leaf (Windows' too).
 pub(crate) fn left_cut(s: &str, max: usize) -> String {
     let n = s.chars().count();
     if n <= max.max(2) {
         return s.to_string();
     }
     let tail: String = s.chars().skip(n - (max.max(2) - 1)).collect();
-    let tail = match tail.find('/') {
+    let tail = match tail.find(['/', '\\']) {
         Some(at) if at > 0 && tail[at..].len() > 1 => tail[at..].to_string(),
         _ => tail,
     };
@@ -4740,6 +4824,9 @@ impl Render for AppView {
             && self.focus.is_focused(window)
         {
             window.focus(&h, cx);
+        }
+        if self.halt_armed.is_some() && !self.halt_here() {
+            self.disarm_halt();
         }
         self.sync_composer(window, cx);
         if std::mem::take(&mut self.model.named.opened) {
@@ -4957,6 +5044,13 @@ impl Render for AppView {
                 Some(_) => this.swallow_clicks = None,
                 None => {}
             }))
+            // The kit's `Escape` (the key bindings run before any key
+            // listener) ends an IME composition: whether there was one is
+            // read here first, for HALT's Esc below.
+            .capture_action(cx.listener(|this, _: &gpui_kit::base::input::Escape, window, cx| {
+                this.esc_composing = this.composer.read(cx).focus_handle(cx).is_focused(window)
+                    && this.composer.update(cx, |s, cx| gpui_kit::EntityInputHandler::marked_text_range(s, window, cx)).is_some();
+            }))
             // Esc closes the picker, wherever the focus is; in find it clears
             // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
@@ -5059,8 +5153,9 @@ impl Render for AppView {
                     && this.model.watch.focus().is_none()
                     && this.model.tabs.view().is_none()
                     && this.composer.read(cx).focus_handle(cx).is_focused(window)
-                    // An IME composition's Esc is the IME's.
-                    && this.composer.update(cx, |s, cx| gpui_kit::EntityInputHandler::marked_text_range(s, window, cx)).is_none()
+                    // An IME composition's Esc is the IME's (seen before
+                    // the kit's `Escape` ended it).
+                    && !std::mem::take(&mut this.esc_composing)
                     && this.halt_escape(Instant::now(), cx)
                 {
                     // Esc, Esc in the composer (no card up, the session's
@@ -5255,6 +5350,9 @@ mod tests {
         assert_eq!(left_cut("/home/you/work/relay-gateway", 22), "…/work/relay-gateway");
         assert_eq!(left_cut("/home/you/work/relay-gateway", 14), "…relay-gateway");
         assert!(left_cut("/a/very/long/path/to/somewhere", 10).chars().count() <= 10);
+        // Windows' separator (`home_short` gives `~\\work\\…` there).
+        assert_eq!(left_cut("C:\\Users\\you\\work\\relay-gateway", 22), "…\\work\\relay-gateway");
+        assert_eq!(left_cut("~\\work\\relay-gateway", 15), "…\\relay-gateway");
     }
 
     /// The foot's parts at full width: every part that has something to
@@ -5277,19 +5375,20 @@ mod tests {
         };
         let every = Foot { hint: true, effort: true, model: true, word: true, name: true };
         assert_eq!(fit_foot(&all), every);
-        let mut last = every;
-        let parts = |f: &Foot| [f.hint, f.effort, f.model, f.word, f.name];
+        // Every foot a narrowing row shows, in order: exactly one part
+        // fewer each time, in the drop order.
+        let mut seen = vec![every];
         for room in (100..2000).rev() {
             let f = fit_foot(&FootIn { room: room as f32, ..all });
-            // Narrower never shows a part a wider row did not; the first
-            // part still shown means every later one is too.
-            for (a, b) in parts(&f).into_iter().zip(parts(&last)) {
-                assert!(!a || b, "{room}: {f:?} after {last:?}");
+            if seen.last() != Some(&f) {
+                seen.push(f);
             }
-            let first = parts(&f).iter().position(|&p| p).unwrap_or(5);
-            assert!(parts(&f)[first..].iter().all(|&p| p) || !f.model && f.word, "{room}: {f:?}");
-            last = f;
         }
+        let no_hint = Foot { hint: false, ..every };
+        let no_effort = Foot { effort: false, ..no_hint };
+        let no_model = Foot { model: false, ..no_effort };
+        let no_word = Foot { word: false, ..no_model };
+        assert_eq!(seen, [every, no_hint, no_effort, no_model, no_word, Foot::default()]);
         assert_eq!(fit_foot(&FootIn { room: 100., ..all }), Foot::default(), "the lead, HALT and the primary stay");
         assert!(!fit_foot(&FootIn { tight: true, ..all }).word, "a tight pane drops the word");
         // Nothing to say: nothing shown.

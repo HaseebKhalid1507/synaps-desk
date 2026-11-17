@@ -111,6 +111,22 @@ impl Liveness {
         }
     }
 
+    /// A worker from its two sources: its session's list (`status`,
+    /// `attached`, `known` as for [`Liveness::of`]) and its view's own
+    /// word, polled from the daemon ([`Liveness::of_view`]). The list's,
+    /// but the view's when the list says no more than a start (the history
+    /// alone holds it, or a re-attach demoted a running worker until it is
+    /// heard again), and when the view says how it ended before the
+    /// session's stream does. Not attached, a running view is as last seen.
+    pub fn of_sources(status: Option<Status>, view: Option<Self>, attached: bool, known: bool) -> Self {
+        let view = view.map(|v| if v == Liveness::Running && !attached { Liveness::LastSeen } else { v });
+        match (status, view) {
+            (None | Some(Status::Started), Some(v)) => v,
+            (Some(s), Some(v)) if !s.terminal() && v.ended() && v != Liveness::Gone => v,
+            _ => Liveness::of(status, attached, known),
+        }
+    }
+
     /// From a worker's view's own word ([`crate::watch::Worker::state`]),
     /// for a worker its session's list does not say (`None`: nothing yet).
     pub fn of_view(word: &str) -> Option<Self> {
@@ -130,10 +146,11 @@ impl Liveness {
         matches!(self, Liveness::Done | Liveness::Failed | Liveness::Cancelled | Liveness::TimedOut | Liveness::Gone)
     }
 
-    /// A cancel of it is on its way (`pending`): running, it is cancelling
-    /// until its rows say how it stopped.
+    /// A cancel of it is on its way (`pending`): running (or started: a
+    /// re-attach says so of a running worker until it is heard again), it
+    /// is cancelling until its rows say how it stopped.
     pub fn cancelling(self, pending: bool) -> Self {
-        if pending && matches!(self, Liveness::Running) { Liveness::Cancelling } else { self }
+        if pending && matches!(self, Liveness::Running | Liveness::Started) { Liveness::Cancelling } else { self }
     }
 }
 

@@ -152,26 +152,33 @@ impl RailCache {
     }
 }
 
-/// What a top-bar ticker says about a prompt: the tool and the first line
-/// of what it will run or asks, from the daemon's confirm body
+/// What a top-bar ticker (and the NEEDS YOU stub) says about a prompt:
+/// the tool and what it will run or asks, from the daemon's confirm body
 /// (`Extension: …`, `Tool: …`, `Input that will run:`, `Message from …:`),
-/// else the body's first line that is not the closing question.
+/// else the body's first line that is not the closing question. A message
+/// that introduces a command (`… a command in ~/w:` then `$ cargo test`)
+/// says the command; a detail that names the tool itself is not prefixed
+/// with it again; a line that only introduces drops its colon.
 pub(crate) fn prompt_gist(title: &str, body: &str) -> String {
     let lines: Vec<&str> = body.lines().map(str::trim).collect();
     let tool = lines.iter().find_map(|l| l.strip_prefix("Tool: ")).filter(|t| !t.is_empty());
-    let after = |head: fn(&str) -> bool| lines.iter().skip_while(|l| !head(l)).skip(1).find(|l| !l.is_empty()).copied();
-    let detail =
+    let first_after = |at: usize| (at + 1..lines.len()).find(|&i| !lines[i].is_empty());
+    let after = |head: fn(&str) -> bool| lines.iter().position(|l| head(l)).and_then(first_after);
+    let at =
         after(|l| l == "Input that will run:").or_else(|| after(|l| l.starts_with("Message from ") && l.ends_with(':'))).or_else(|| {
             lines
                 .iter()
-                .copied()
-                .find(|l| !l.is_empty() && *l != "Allow this tool call?" && !l.starts_with("Extension: ") && !l.starts_with("Tool: "))
+                .position(|l| !l.is_empty() && *l != "Allow this tool call?" && !l.starts_with("Extension: ") && !l.starts_with("Tool: "))
         });
-    let text = match (tool, detail) {
-        (Some(t), Some(d)) => format!("{t}: {d}"),
-        (Some(t), None) => t.to_string(),
-        (None, Some(d)) => d.to_string(),
-        (None, None) => title.to_string(),
+    let command = at.filter(|&i| lines[i].ends_with(':')).and_then(first_after).and_then(|i| lines[i].strip_prefix("$ "));
+    let text = match (tool, at.map(|i| lines[i]), command) {
+        (Some(t), _, Some(c)) => format!("{t}: {c}"),
+        (None, _, Some(c)) => format!("$ {c}"),
+        (Some(t), Some(d), None) if d.split_whitespace().next() == Some(t) => d.trim_end_matches(':').to_string(),
+        (Some(t), Some(d), None) => format!("{t}: {}", d.trim_end_matches(':')),
+        (Some(t), None, None) => t.to_string(),
+        (None, Some(d), None) => d.trim_end_matches(':').to_string(),
+        (None, None, None) => title.to_string(),
     };
     crate::app::one_line(&text, 90)
 }
@@ -684,6 +691,9 @@ impl AppView {
     /// Its state is read per frame (the attached session runs ahead of the
     /// poll), its strings come from the cache; it never changes shape.
     fn render_row2(&self, r: usize, p: &Palette, cx: &Context<Self>) -> AnyElement {
+        // No readout under an open menu (a right-click's pointer rests on
+        // the row it opened from).
+        let menu_open = self.menu.is_some() || self.smenu.is_some();
         let row = &self.rail.rail.rows[r];
         let meta = row.live.and_then(|i| self.model.sessions.get(i));
         let st = meta.map(|s| self.model.state(s)).unwrap_or(row.state);
@@ -783,7 +793,7 @@ impl AppView {
                         ),
                 ),
             )
-            .when(self.readout == Some(key), |d| d.child(self.render_readout(row, p)))
+            .when(self.readout == Some(key) && !menu_open, |d| d.child(self.render_readout(row, p)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                 this.rail_click(key, crate::tabstrip::click_place(ev, cx));
@@ -803,6 +813,9 @@ impl AppView {
     /// A HISTORY row: one fixed-height line, title and age, a mark only if
     /// it is unread (or being opened).
     fn render_hist(&self, r: usize, p: &Palette, cx: &Context<Self>) -> AnyElement {
+        // No readout under an open menu (a right-click's pointer rests on
+        // the row it opened from).
+        let menu_open = self.menu.is_some() || self.smenu.is_some();
         let row = &self.rail.rail.rows[r];
         let key = row.key;
         let title_color = match row.state {
@@ -835,7 +848,7 @@ impl AppView {
                     .child(SharedString::from(&row.title)),
             )
             .child(mono(&row.age, 10., p.dim_ch))
-            .when(self.readout == Some(key), |d| d.child(self.render_readout(row, p)))
+            .when(self.readout == Some(key) && !menu_open, |d| d.child(self.render_readout(row, p)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                 this.rail_click(key, crate::tabstrip::click_place(ev, cx));
@@ -1069,7 +1082,8 @@ impl AppView {
                         .child(display(label::VIA_SHELL, 10., p.prose_ch))
                         .child(mono("~", 11., p.dim_ch)),
                 )
-                .child(mono("bash commands that succeeded; no counts", 9.5, p.dim_ch).mt(px(6.)))
+                // The FILES note's size (design.md §8.18); it wraps.
+                .child(mono("bash commands that succeeded; no counts", 12., p.dim_ch).whitespace_normal().mt(px(6.)))
                 .child(div().h(px(8.)));
             for f in shell.iter().take(FILES_SHOWN) {
                 files = files.child(
@@ -1308,8 +1322,16 @@ mod tests {
 
     #[test]
     fn the_ticker_names_the_tool_and_what_it_runs() {
-        let body = "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n$ cargo test\n\nAllow this tool call?";
-        assert_eq!(prompt_gist("Confirm tool call", body), "bash: bash wants to run a command in ~/w:");
+        // The command the message introduces, not the introduction.
+        let body = "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n$ cargo test -p relay\n\nAllow this tool call?";
+        assert_eq!(prompt_gist("Confirm tool call", body), "bash: cargo test -p relay");
+        let crlf = body.replace('\n', "\r\n");
+        assert_eq!(prompt_gist("Confirm tool call", &crlf), "bash: cargo test -p relay", "a CRLF body reads the same");
+        // No command: the message, once named, with no dangling colon.
+        let bare = "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n\nAllow this tool call?";
+        assert_eq!(prompt_gist("Confirm tool call", bare), "bash wants to run a command in ~/w");
+        let other = "Extension: guard\nTool: edit\n\nMessage from guard:\nwrites outside the folder\n\nAllow this tool call?";
+        assert_eq!(prompt_gist("Confirm tool call", other), "edit: writes outside the folder");
         let rewritten = "Extension: a, b\nTool: edit\nInput rewritten by: b\nInput that will run:\n{\"path\": \"/w/x\"}\n\nMessage from a, b:\nok?\n\nAllow this tool call?";
         assert_eq!(prompt_gist("Confirm tool call", rewritten), "edit: {\"path\": \"/w/x\"}");
         assert_eq!(prompt_gist("Confirm tool activation", "Activate shell_start?"), "Activate shell_start?");

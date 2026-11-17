@@ -750,9 +750,9 @@ pub(crate) struct Layout {
     pub hang: bool,
     /// Under 560 px: the gutter drops to 16, status words and hints go.
     pub tight: bool,
-    /// Under [`crate::fit::short_below`] tall (a 792-px window at 16 px,
-    /// more with larger text): a 40-px top bar, a one-row header, an 8-line
-    /// card well, less padding round the composer. Nothing in the list
+    /// Under [`crate::fit::short_below`] tall (a 700-px window at 16 px,
+    /// more with larger text): a 40-px top bar, an 8-line card well, less
+    /// padding round the composer. Nothing in the list
     /// changes, so it never remeasures for this.
     pub short: bool,
     /// Under [`crate::fit::cramped_below`] (short too): the card folds its
@@ -793,8 +793,8 @@ impl Layout {
         }
     }
 
-    /// The list's left and right padding (the header, card and composer
-    /// use the same, so their edges line up with the rows').
+    /// The list's left and right padding (the card, the tray and the
+    /// composer use the same, so their edges line up with the rows').
     pub(crate) fn padding(self) -> (f32, f32) {
         (self.left, self.right)
     }

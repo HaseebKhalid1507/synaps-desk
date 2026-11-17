@@ -537,6 +537,22 @@ mod tests {
         assert_eq!(Liveness::of(Some(S::Running), true, false), Liveness::Gone, "its session knows it no more");
         assert_eq!(Liveness::of(Some(S::Running), true, true).cancelling(true), Liveness::Cancelling);
         assert_eq!(Liveness::of(Some(S::Done), true, true).cancelling(true), Liveness::Done, "ended: a cancel too late changes nothing");
+        assert_eq!(Liveness::of(Some(S::Started), true, true).cancelling(true), Liveness::Cancelling, "a re-attach's start, cancelled");
+        // Two sources: the list's word; the view's over a start, and how it
+        // ended first.
+        let both = Liveness::of_sources;
+        assert_eq!(both(Some(S::Started), Some(Liveness::Running), true, true), Liveness::Running, "a re-attach's start, its view running");
+        assert_eq!(both(None, Some(Liveness::Running), true, true), Liveness::Running);
+        assert_eq!(both(Some(S::Started), Some(Liveness::Running), false, true), Liveness::LastSeen, "not attached: as last seen");
+        assert_eq!(both(Some(S::Started), None, true, true), Liveness::Started);
+        assert_eq!(both(Some(S::Running), Some(Liveness::Done), true, true), Liveness::Done, "its pages said it ended first");
+        assert_eq!(
+            both(Some(S::Running), Some(Liveness::Gone), true, true),
+            Liveness::Running,
+            "a view gone (offline) is not how it ended"
+        );
+        assert_eq!(both(Some(S::Done), Some(Liveness::Running), true, true), Liveness::Done, "ended stays ended");
+        assert_eq!(both(Some(S::Running), None, false, true), Liveness::LastSeen);
         assert_eq!(Liveness::of_view("timed out"), Some(Liveness::TimedOut));
         assert_eq!((Liveness::of_view("offline"), Liveness::of_view("connecting")), (Some(Liveness::Gone), None));
         assert!(Liveness::Gone.ended() && !Liveness::LastSeen.ended() && !Liveness::Started.ended());

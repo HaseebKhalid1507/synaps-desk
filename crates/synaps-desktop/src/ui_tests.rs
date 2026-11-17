@@ -601,6 +601,7 @@ fn the_stub_is_only_over_a_worker_view_with_a_waiting_prompt(cx: &mut TestAppCon
         }),
     );
     assert!(view.read_with(cx, |v, _| v.model.watch.focus().is_none()), "back on the session's thread");
+    assert!(view.read_with(cx, |v, _| v.current_card().is_some()), "its card up");
     assert!(stub(cx).is_none());
     // No prompt waiting: no stub over the worker either.
     resolve_prompt(cx, &view);
@@ -609,4 +610,240 @@ fn the_stub_is_only_over_a_worker_view_with_a_waiting_prompt(cx: &mut TestAppCon
     up(cx, w, "enter");
     assert!(view.read_with(cx, |v, _| v.model.watch.focus() == Some("sa_1")));
     assert!(stub(cx).is_none(), "nothing waits");
+}
+
+/// Scout (sa_1) shown in place over the session's thread.
+fn scout_in_place(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    menu_on(cx, w, view, Act::Open);
+    down(cx, w, "enter", false);
+    up(cx, w, "enter");
+    assert_eq!(in_place(cx, view).as_deref(), Some("sa_1"), "scout in place");
+}
+
+/// What the foot says of the worker on screen: its state and facts.
+fn foot_of(cx: &mut TestAppContext, view: &Entity<AppView>) -> (crate::subagents::Liveness, String) {
+    view.read_with(cx, |v, _| {
+        let w = v.model.watch.focused().expect("a worker on screen");
+        let (live, facts) = v.watched_state(w);
+        (live, facts.to_string())
+    })
+}
+
+/// Its view polled `running` from the daemon (the offline demo's view
+/// has no daemon to poll).
+fn view_running(cx: &mut TestAppContext, view: &Entity<AppView>) {
+    view.update(cx, |v, _| {
+        let w = v.model.watch.focused_mut().expect("a worker on screen");
+        w.gone = None;
+        w.status = "running".into();
+    });
+}
+
+/// Shady M1: a cold-started daemon numbers its workers from 1 again, and
+/// sa_1 is another worker now. The foot over scout's view says GONE (as
+/// scout's tab would), and none of the new sa_1's facts.
+#[gpui_kit::test]
+fn the_foot_never_says_another_worker_under_its_handle(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    scout_in_place(cx, w, &view);
+    view_running(cx, &view);
+    let tray = view.read_with(cx, |v, _| v.tray.rows.iter().find(|r| r.id == 1).map(|r| r.facts.to_string())).expect("scout's tray row");
+    assert_eq!(foot_of(cx, &view), (crate::subagents::Liveness::Running, tray), "scout, as its tray row says it");
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.append(&[
+            serde_json::json!({"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_new", "name": "subagent_start",
+                "input": {"agent": "builder", "task": "build it"}}]}),
+            serde_json::json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_new",
+                "content": "{\"agent_name\":\"builder\",\"handle_id\":\"sa_1\",\"status\":\"running\"}"}]}),
+        ]);
+        assert_eq!(v.model.stats.subagents.ident(1).map(|(_, n)| n.to_string()).as_deref(), Some("builder"));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let own = view.read_with(cx, |v, _| v.model.watch.focused().map(|w| w.facts.to_string())).expect("scout's view");
+    assert_eq!(foot_of(cx, &view), (crate::subagents::Liveness::Gone, own), "GONE, with scout's own facts");
+    let (session, key) = view.read_with(cx, |v, _| {
+        let w = v.model.watch.focused().expect("scout's view");
+        (v.model.tabs.current_session().map(str::to_string).expect("its session"), (w.key().0.map(str::to_string), w.key().1.to_string()))
+    });
+    let tab = view.read_with(cx, |v, _| v.worker_state(&session, "sa_1", Some((key.0.as_deref(), &key.1))));
+    assert_eq!(tab, Some(crate::subagents::Liveness::Gone), "its tab says the same");
+}
+
+/// Shady M2: a re-attach during a long tool call demotes every running
+/// worker to started until it is heard again; its view, polled from the
+/// daemon, still says running. The foot and its worker tab say RUNNING.
+#[gpui_kit::test]
+fn a_reattach_leaves_a_running_worker_running(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    scout_in_place(cx, w, &view);
+    view_running(cx, &view);
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.reattached();
+        assert_eq!(v.model.stats.subagents.status(1), Some(crate::subagents::Status::Started), "demoted until heard again");
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(foot_of(cx, &view).0, crate::subagents::Liveness::Running, "the foot: running, as its view says");
+    let tab = view.read_with(cx, |v, _| {
+        let w = v.model.watch.focused().expect("scout's view");
+        let session = v.model.tabs.current_session().expect("its session");
+        v.worker_state(session, &w.handle_id, Some(w.key()))
+    });
+    assert_eq!(tab, Some(crate::subagents::Liveness::Running), "its tab: running too");
+}
+
+/// The other demo session in a tab, attached (with no client, the
+/// synthetic transport answers its attach).
+fn open_idle_cpu(cx: &mut TestAppContext, view: &Entity<AppView>, place: crate::tabs::Place) {
+    view.update(cx, |v, cx| {
+        assert!(v.client.is_none(), "the synthetic transport attaches");
+        let other = crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false };
+        v.open_tab(other, place);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(attached(cx, view).as_deref(), Some(crate::demo::IDLE_CPU), "the other session attached");
+}
+
+/// Shady L6: HALT's arm is for what was on screen. Another session's tab
+/// (its turn running too) disarms it: the Esc there arms for that turn,
+/// and never halts it.
+#[gpui_kit::test]
+fn a_halt_armed_in_one_session_never_halts_another(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    focus_composer(cx, w, &view);
+    tap(cx, w, "escape");
+    assert!(view.read_with(cx, |v, _| v.halts == 0 && v.halt_armed.is_some()), "armed");
+    let client = view.update(cx, |v, _| v.client.take());
+    open_idle_cpu(cx, &view, crate::tabs::Place::New);
+    view.update(cx, |v, cx| {
+        v.client = client;
+        v.model.transcript.set_busy(true);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| v.halt_shown()), "the other session's turn runs, and this window drives it");
+    assert!(view.read_with(cx, |v, _| v.halt_armed.is_none()), "the switch disarmed it");
+    focus_composer(cx, w, &view);
+    tap(cx, w, "escape");
+    assert!(view.read_with(cx, |v, _| v.halts == 0 && v.halt_armed.is_some()), "the Esc there arms for its turn, no more");
+    // Back to the first session's tab: disarmed again; its Esc halts nothing.
+    view.update(cx, |v, cx| {
+        v.focus_tab(0);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| v.halt_armed.is_none()), "the tab change disarmed it");
+    focus_composer(cx, w, &view);
+    tap(cx, w, "escape");
+    assert_eq!(view.read_with(cx, |v, _| v.halts), 0, "no turn halted but by two Escs in one place");
+}
+
+/// Shady L2: a rename asked for another session whose attach never came
+/// is forgotten once anything else is shown (or it waited too long): the
+/// naming row never opens later, under someone's typing. Asked from the
+/// session menu of its rail row, it opens once the attach lands.
+#[gpui_kit::test]
+fn a_rename_for_another_session_never_opens_later(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    let naming = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.model.named.naming);
+    // Asked; its attach never landed; this session stayed on screen.
+    view.update(cx, |v, cx| {
+        v.rename_pending = Some((crate::demo::IDLE_CPU.into(), std::time::Instant::now()));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| v.rename_pending.is_none()), "forgotten: another session was on screen");
+    let client = view.update(cx, |v, _| v.client.take());
+    open_idle_cpu(cx, &view, crate::tabs::Place::New);
+    assert!(!naming(cx), "that session opened later: no naming row");
+    // On screen and attached, but asked too long ago: nothing.
+    view.update(cx, |v, cx| {
+        let long_ago = std::time::Instant::now().checked_sub(crate::app::RENAME_WAIT + std::time::Duration::from_secs(1));
+        v.rename_pending = long_ago.map(|t| (crate::demo::IDLE_CPU.into(), t));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(!naming(cx) && view.read_with(cx, |v, _| v.rename_pending.is_none()), "an expired rename opens nothing");
+    // The session menu's Rename… on the first session's rail row: its
+    // tab, then its naming row once it is attached.
+    let first = view.read_with(cx, |v, _| v.model.tabs.iter().next().and_then(|t| t.session.clone())).expect("the first tab's session");
+    let key = view
+        .read_with(cx, |v, _| {
+            v.rail.rail.rows.iter().find(|r| r.live.and_then(|i| v.model.sessions.get(i)).is_some_and(|m| m.id == first)).map(|r| r.key)
+        })
+        .expect("its rail row");
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_session_menu(crate::app::SessionAt::Row(key), Default::default(), window, cx);
+            v.session_menu_pick(crate::app::SessionAct::Rename, crate::menu::How::Key { press: true }, window, cx);
+        })
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    assert_eq!(attached(cx, &view), Some(first), "its session on screen");
+    assert!(naming(cx), "its naming row opened");
+    view.update(cx, |v, _| v.client = client);
+}
+
+/// Shady L1: the Esc that ends an IME composition is the composition's:
+/// it arms nothing. The next Esc arms HALT, the one after halts.
+#[gpui_kit::test]
+fn an_esc_ending_a_composition_is_not_halts(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    focus_composer(cx, w, &view);
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.composer.update(cx, |s, cx| gpui_kit::EntityInputHandler::replace_and_mark_text_in_range(s, None, "か", None, window, cx))
+        })
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    let composing = cx
+        .update_window(w, |_, window, cx| {
+            view.update(cx, |v, cx| v.composer.update(cx, |s, cx| gpui_kit::EntityInputHandler::marked_text_range(s, window, cx)))
+        })
+        .expect("the window");
+    assert!(composing.is_some(), "a composition under way");
+    tap(cx, w, "escape");
+    assert!(view.read_with(cx, |v, _| v.halts == 0 && v.halt_armed.is_none()), "the composition's Esc arms nothing");
+    tap(cx, w, "escape");
+    assert!(view.read_with(cx, |v, _| v.halt_armed.is_some()), "the next arms");
+    tap(cx, w, "escape");
+    assert_eq!(view.read_with(cx, |v, _| v.halts), 1, "and the one after halts");
+}
+
+/// Finish gate F2: the foot's state word is the column's size (12·r):
+/// at step 22 it is drawn larger than at 16, never the smallest text in
+/// the foot.
+#[gpui_kit::test]
+fn the_foot_word_grows_with_the_text(cx: &mut TestAppContext) {
+    let mut heights = Vec::new();
+    for step in [16, 22] {
+        let (win, _view, _events) = open_at(cx, (1280., 720.), step);
+        let b = VisualTestContext::from_window(win, cx).debug_bounds("foot-word").expect("the word");
+        heights.push(f32::from(b.size.height));
+    }
+    assert!(heights[1] > heights[0], "the word at 22 is taller than at 16: {heights:?}");
+}
+
+/// Shady L3: the rail's readout is not drawn under the session menu.
+#[gpui_kit::test]
+fn the_rail_readout_goes_under_the_session_menu(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    let key = view.read_with(cx, |v, _| v.rail.rail.rows.iter().find(|r| r.live.is_some()).map(|r| r.key)).expect("a live row");
+    view.update(cx, |v, cx| {
+        v.readout = Some(key);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| v.open_session_menu(crate::app::SessionAt::Row(key), Default::default(), window, cx))
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| v.smenu.is_some() && v.readout.is_none()), "the menu, and no readout under it");
 }
