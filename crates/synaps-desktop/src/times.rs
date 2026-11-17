@@ -139,7 +139,7 @@ mod tests {
                 assert!(Stamp::in_zone(bad, &tz).is_none(), "{bad:?}");
             }
         }
-        // The zone is the reader's, not UTC's: 19:30 UTC is 00:30 the next
+        // The zone is the reader's, not UTC's: 19:30 UTC is 01:00 the next
         // day at UTC+5:30, and 14:30 the same day at UTC-5.
         let [west, half, _] = zones();
         let at = "2026-11-16T19:30:00Z";
