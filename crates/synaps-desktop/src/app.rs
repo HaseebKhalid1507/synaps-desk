@@ -1231,6 +1231,41 @@ pub(crate) fn well_body(prompt: &str) -> SharedString {
     SharedString::from(prompt)
 }
 
+/// A favourites write shared by the window and its background job: the job
+/// writes holding the lock and leaves what it wrote here, so the window
+/// takes it ([`crate::favourites::Favourites::written`]) whether or not the
+/// task that started it is still there.
+#[derive(Default)]
+struct FavsJob {
+    /// A job is between taking the list and its result being taken.
+    writing: bool,
+    /// The window closed: a job not begun yet writes nothing.
+    closed: bool,
+    /// The generation written, the list sent, the file's list after.
+    done: Option<(u64, Vec<crate::favourites::Favourite>, Vec<crate::favourites::Favourite>)>,
+}
+
+impl FavsJob {
+    /// `sent` merged into the file over `base` ([`theme::save_favourites`]),
+    /// unless the window closed first.
+    fn write(
+        slot: &std::sync::Mutex<FavsJob>,
+        path: &std::path::Path,
+        key: &str,
+        base: &[crate::favourites::Favourite],
+        sent: Vec<crate::favourites::Favourite>,
+        generation: u64,
+    ) -> std::io::Result<()> {
+        let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if job.closed {
+            return Ok(());
+        }
+        let file = theme::save_favourites(path, key, base, &sent)?;
+        job.done = Some((generation, sent, file));
+        Ok(())
+    }
+}
+
 pub struct AppView {
     pub client: Option<Client>,
     /// Connection, sessions, attachment and transcript. Events are applied
@@ -1392,6 +1427,8 @@ pub struct AppView {
     favs_saved: u64,
     favs_written: u64,
     favs_save: Option<Task<()>>,
+    /// The favourites write on its way, shared with its background job.
+    favs_job: Arc<std::sync::Mutex<FavsJob>>,
     favs_synced: Option<u64>,
     /// The session lists the restored tabs have been checked against.
     lists_seen: u64,
@@ -1877,6 +1914,7 @@ impl AppView {
             favs_saved: 0,
             favs_written: 0,
             favs_save: None,
+            favs_job: Arc::default(),
             favs_synced: None,
             tabs_written: 0,
             tabs_save: None,
@@ -2775,47 +2813,80 @@ impl AppView {
     /// later, off the UI thread, under the tabs' key (never in a bench), as
     /// a merge into what the file has now ([`crate::favourites::merge`]):
     /// another window's adds and removes are kept, and taken.
+    ///
+    /// A write once begun is never dropped: a change while it runs waits for
+    /// it (the same task writes again), and what it wrote is taken
+    /// ([`crate::favourites::Favourites::written`]) even if the window closes meanwhile
+    /// ([`FavsJob`]), so the next merge never reads a stale base (a removed
+    /// favourite coming back as another instance's).
     fn schedule_favs_save(&mut self, cx: &mut Context<Self>) {
         if self.tabs_key.is_none() || self.bench.is_some() || self.model.favs.generation == self.favs_saved {
             return;
         }
         self.favs_saved = self.model.favs.generation;
+        if self.favs_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).writing {
+            return;
+        }
         self.favs_save = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SAVE_DELAY).await;
-            let job = this
-                .update(cx, |v, _| {
-                    let f = &v.model.favs;
-                    (theme::settings_path(), v.tabs_key.clone(), f.base.clone(), f.list.clone(), f.generation)
-                })
-                .ok();
-            let Some((Some(path), Some(key), base, sent, generation)) = job else { return };
-            let done = cx
-                .background_spawn(async move {
-                    let file = theme::save_favourites(&path, &key, &base, &sent);
-                    (file, sent)
-                })
-                .await;
-            let _ = this.update(cx, |v, cx| match done {
-                (Ok(file), sent) => {
+            loop {
+                cx.background_executor().timer(SAVE_DELAY).await;
+                let job = this
+                    .update(cx, |v, _| {
+                        let f = &v.model.favs;
+                        v.favs_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).writing = true;
+                        (theme::settings_path(), v.tabs_key.clone(), f.base.clone(), f.list.clone(), f.generation, v.favs_job.clone())
+                    })
+                    .ok();
+                let Some((Some(path), Some(key), base, sent, generation, slot)) = job else { return };
+                let done = cx.background_spawn(async move { FavsJob::write(&slot, &path, &key, &base, sent, generation) }).await;
+                let again = this.update(cx, |v, cx| {
+                    let taken = v.take_favs_written();
+                    if let Err(e) = done {
+                        v.model.named.notice = Some(format!("Favourites not saved: {e}"));
+                        cx.notify();
+                        return false;
+                    }
                     v.favs_written = v.favs_written.max(generation);
                     v.model.favs.quiet = false;
-                    if v.model.favs.written(&sent, file) {
+                    if taken {
                         v.model.rail_gen += 1;
                         cx.notify();
                     }
+                    // Changed while it wrote: write again.
+                    v.model.favs.generation != generation
+                });
+                if !again.unwrap_or(false) {
+                    return;
                 }
-                (Err(e), _) => {
-                    v.model.named.notice = Some(format!("Favourites not saved: {e}"));
-                    cx.notify();
-                }
-            });
+            }
         }));
+    }
+
+    /// The write that finished, taken into the list (once). `true`: the
+    /// list changed (another instance's adds or removes).
+    fn take_favs_written(&mut self) -> bool {
+        let mut job = self.favs_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        job.writing = false;
+        match job.done.take() {
+            Some((_, sent, file)) => self.model.favs.written(&sent, file),
+            None => false,
+        }
     }
 
     /// Favourites changed since the last write (an update time too),
     /// written now, merged as [`AppView::schedule_favs_save`] does.
+    ///
+    /// A background write still running is waited for and taken first (it
+    /// holds [`FavsJob`]'s lock while it writes); one not begun never will.
     fn flush_favs(&mut self) {
         self.favs_save = None;
+        let slot = self.favs_job.clone();
+        let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        job.closed = true;
+        if let Some((generation, sent, file)) = job.done.take() {
+            self.model.favs.written(&sent, file);
+            self.favs_written = self.favs_written.max(generation);
+        }
         let f = &self.model.favs;
         if self.tabs_key.is_none() || self.bench.is_some() || (f.generation == self.favs_written && !f.quiet) {
             return;
@@ -6080,13 +6151,39 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ARM, Arm, CENTRE_MIN, CardChord, CardKey, FoldKeys, Foot, FootIn, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY, above_list,
-        authorize_ready, card_key, card_key_on, command_of, dragged, fav_key, fit_foot, held_back, hidden, left_cut, lines_below, one_line,
-        panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled, well_body, worker_keys,
+        ARM, Arm, CENTRE_MIN, CardChord, CardKey, FavsJob, FoldKeys, Foot, FootIn, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY,
+        above_list, authorize_ready, card_key, card_key_on, command_of, dragged, fav_key, fit_foot, held_back, hidden, left_cut,
+        lines_below, one_line, panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled, well_body,
+        worker_keys,
     };
     use crate::theme::{Metrics, Panels};
     use crate::turns::Layout;
     use crate::watch::Step;
+
+    /// R5: a favourites write leaves what it wrote for the window to take,
+    /// whatever became of the task that started it; once the window has
+    /// closed (its flush wrote, holding the lock), a job not begun writes
+    /// nothing over it.
+    #[test]
+    fn a_favourites_write_is_taken_or_never_begun() {
+        use crate::favourites::{Favourite, Source};
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-favsjob-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v: synaps_client::SavedSession = serde_json::from_value(serde_json::json!({"id": "x", "title": "X"})).unwrap();
+        let sent = vec![Favourite::of(Source::Saved(&v), 1)];
+        let slot = std::sync::Mutex::new(FavsJob::default());
+        FavsJob::write(&slot, &path, "k", &[], sent.clone(), 7).unwrap();
+        let (generation, s, file) = slot.lock().unwrap().done.take().expect("left to take");
+        assert_eq!((generation, &s, &file), (7, &sent, &sent));
+        std::fs::write(&path, "{}").unwrap();
+        slot.lock().unwrap().closed = true;
+        FavsJob::write(&slot, &path, "k", &[], sent, 8).unwrap();
+        assert!(slot.lock().unwrap().done.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}", "closed: not written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Short is the pane's height alone, under the full top bar: 648 px,
     /// a 700-px window (1280×720 is full). It changes nothing the list's

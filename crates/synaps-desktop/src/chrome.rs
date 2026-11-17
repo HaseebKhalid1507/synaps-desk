@@ -1483,7 +1483,48 @@ fn chip_count(n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FIND, chip_count, find_fits, prompt_gist};
+    use super::{FIND, RailCache, chip_count, find_fits, prompt_gist};
+    use crate::model::{ConnState, Model};
+    use crate::rail::{self, Item};
+    use gpui_kit::{ListAlignment, ListState, px};
+    use serde_json::{Value, json};
+    use synaps_client::Event;
+    use synaps_client::protocol::SessionEvent;
+
+    /// R6: a folded FAVOURITES shows a favourite that runs (M4). The
+    /// attached session's run starts by an event that changes no list
+    /// (`rail_gen` stays): the cache rebuilds for it all the same, and again
+    /// when it stops.
+    #[test]
+    fn a_folded_favourites_rebuilds_when_a_favourite_starts_running() {
+        let mut m = Model::new(ConnState::Connecting);
+        let meta = json!({"id": "s", "journal_id": "j", "lifecycle": "live", "title": "Relay", "created_at": "2026-11-01T00:00:00Z"});
+        m.apply(Event::Sessions(serde_json::from_value(json!([meta.clone()])).unwrap()));
+        m.favs.toggle(crate::favourites::Source::Live(&m.sessions[0].clone()), 1);
+        let frame = json!({"type": "attached", "client": 2, "meta": meta, "conversation": {"api_messages": []}, "input_owner": 2});
+        let synaps_client::protocol::DaemonFrame::Attached(attached) = synaps_client::protocol::decode_frame(&frame.to_string()).unwrap()
+        else {
+            panic!()
+        };
+        m.want(1);
+        m.apply(Event::Attached { attach_seq: 1, attached, mode: synaps_client::AttachMode::Mirror, reconnect: false });
+        m.sync_favs();
+        let view = rail::View { favs_closed: true, ..Default::default() };
+        let list = ListState::new(0, ListAlignment::Top, px(300.));
+        let shows = |c: &RailCache| c.rail.items.iter().any(|i| matches!(i, Item::Row(r) if &*c.rail.rows[*r].title == "Relay"));
+        let mut cache = RailCache::default();
+        cache.refresh(&m, &view, &list);
+        assert!(!shows(&cache), "folded, at rest: under the head's count only");
+        let event = |event: SessionEvent| Event::session(1, "s", 0, event, std::sync::Arc::new(Value::Null));
+        let before = m.rail_gen;
+        m.apply(event(SessionEvent::TurnStarted { turn_baseline: 0, trigger: "user".into(), user_text: None }));
+        assert_eq!(m.rail_gen, before, "a run starting is no list change");
+        cache.refresh(&m, &view, &list);
+        assert!(shows(&cache), "running: it shows under the folded head");
+        m.apply(event(SessionEvent::Idle));
+        cache.refresh(&m, &view, &list);
+        assert!(!shows(&cache), "done: folded again");
+    }
 
     /// Re-review N5: every count is two cells (`99+` past 99), so the chips
     /// hold one line at the default rail whatever the counts. Their labels
