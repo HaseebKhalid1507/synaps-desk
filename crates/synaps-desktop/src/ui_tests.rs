@@ -3441,6 +3441,111 @@ fn the_drain_and_the_restore_run_every_frame(cx: &mut TestAppContext) {
     assert_eq!(bar(cx), Some(lit), "the composer's bar restored");
 }
 
+/// Re-gate r3 item 1, in what is painted: the composer bar's quad in the
+/// window's rendered scene (the frame GPUI hands the renderer), read every
+/// 7 ms frame through a loss and a return, through the cached app view
+/// and its beat layer as the app opens them. It leaves the live colour on
+/// the drain's first frame, moves on every frame after, never by more
+/// than a quarter of the way, and is what render computed each frame.
+#[gpui_kit::test]
+fn the_drain_is_painted_every_frame(cx: &mut TestAppContext) {
+    let (w, view) = link_up(cx);
+    let painted = |cx: &mut TestAppContext| {
+        let b = VisualTestContext::from_window(w, cx).debug_bounds("composer-bar").expect("the composer's bar");
+        cx.update_window(w, |_, window, _| {
+            let s = window.scale_factor();
+            let near = |a: gpui_kit::ScaledPixels, b: gpui_kit::Pixels| (a.0 - f32::from(b) * s).abs() < 0.5;
+            let hits: Vec<gpui_kit::Hsla> = window
+                .painted_quads()
+                .iter()
+                .filter(|q| {
+                    near(q.bounds.origin.x, b.origin.x)
+                        && near(q.bounds.size.width, b.size.width)
+                        && near(q.bounds.size.height, b.size.height)
+                })
+                .filter_map(|q| q.background.as_solid())
+                .collect();
+            assert_eq!(hits.len(), 1, "one quad is the composer's bar: {hits:?}");
+            hits[0]
+        })
+        .expect("the window")
+    };
+    let computed = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.composer_bar.get()).expect("drawn");
+    let lit = painted(cx);
+    assert_eq!(lit, computed(cx), "live: painted as computed");
+    let run = |cx: &mut TestAppContext, what: &str| {
+        let from = painted(cx);
+        let mut seen = vec![from];
+        for _ in 0..80 {
+            wait(cx, w, &view, 7);
+            let c = painted(cx);
+            assert_eq!(c, computed(cx), "{what}: painted as render computed it, frame {}", seen.len());
+            seen.push(c);
+            if !motion_pending(cx, &view).0 && motion_pending(cx, &view).1.is_none() && c != from {
+                break;
+            }
+        }
+        let to = *seen.last().expect("frames");
+        let dist = |a: gpui_kit::Hsla, b: gpui_kit::Hsla| {
+            let (a, b) = (gpui_kit::Rgba::from(a), gpui_kit::Rgba::from(b));
+            ((a.r - b.r).powi(2) + (a.g - b.g).powi(2) + (a.b - b.b).powi(2)).sqrt()
+        };
+        let travel = dist(from, to);
+        assert!(travel > 0.05, "{what}: it moves ({from:?} → {to:?})");
+        let first = seen.iter().position(|c| *c != from).expect("it left");
+        let last = seen.iter().position(|c| *c == to).expect("it got there");
+        for (i, p) in seen.windows(2).enumerate() {
+            assert!(dist(p[0], p[1]) <= travel / 4. + 1e-4, "{what}: frame {i} → {}: a step over a quarter of the travel", i + 1);
+            if i + 1 > first && i + 1 <= last {
+                assert_ne!(p[0], p[1], "{what}: held at frame {} (moving {first}..{last})", i + 1);
+            }
+        }
+        // `slow` (360 ms) at 7 ms frames: about 51 frames moving.
+        assert!(last - first >= 360 / 7 - 4, "{what}: at frame rate ({first}..{last})");
+        (first, to)
+    };
+    status(cx, &view, synaps_client::Status::Reconnecting { why: "daemon closed the connection".into() });
+    wait_past(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64);
+    assert!(view.read_with(cx, |v, _| v.link.tore.is_some()), "lost");
+    let (first, drained) = run(cx, "the drain");
+    assert!(first <= 16, "the drain starts after the tear (100 ms): frame {first}");
+    assert_ne!(drained, lit, "drained");
+    status(cx, &view, hello());
+    let (_, back) = run(cx, "the restore");
+    assert_eq!(back, lit, "restored");
+}
+
+/// Re-gate r3: on a real loss too the words keep the connected words'
+/// width (padded, or cut with an ellipsis), so NEEDS YOU, centred beside
+/// them, never moves: "reconnecting ··", then the client's long error.
+#[gpui_kit::test]
+fn needs_you_holds_still_through_a_loss(cx: &mut TestAppContext) {
+    use synaps_client::Status;
+    let (w, view) = link_up(cx);
+    let need = |cx: &mut TestAppContext| {
+        let mut vcx = gpui_kit::VisualTestContext::from_window(w, cx);
+        vcx.debug_bounds("attention").map(|b| f32::from(b.origin.x))
+    };
+    let up = need(cx);
+    assert!(up.is_some(), "NEEDS YOU drawn");
+    let long = "connect /home/someone/.synaps-cli/run/daemon-desktopproto.sock: Connection refused (os error 111)";
+    for (s, what) in [
+        (Status::Reconnecting { why: "daemon closed the connection".into() }, "reconnecting"),
+        (Status::Offline(long.into()), "the client's error"),
+    ] {
+        status(cx, &view, s);
+        for _ in 0..3 {
+            wait(cx, w, &view, 7);
+            assert_eq!(need(cx), up, "NEEDS YOU on a loss: {what}");
+        }
+    }
+    wait_past(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64 + 600);
+    assert_eq!(need(cx), up, "NEEDS YOU, lost and drained");
+    status(cx, &view, hello());
+    wait(cx, w, &view, 7);
+    assert_eq!(need(cx), up, "NEEDS YOU, back");
+}
+
 /// R2 (motion.md §5.1, §6.7): a real window starts at `Connecting`, so its
 /// first frames see the link down; the first hello still scans, however
 /// late it comes, and a launch that never connected tears nothing.
@@ -3810,7 +3915,8 @@ fn tracer_starts_from_the_chips_bar(cx: &mut TestAppContext) {
         let r = v.tray.rows.iter().find(|r| r.id == 1).expect("scout's tray row");
         crate::wtabs::Who::new(1, r.name.clone(), r.call.clone())
     });
-    let chip = view.read_with(cx, |v, _| v.chip_bounds.borrow().iter().find(|(id, _)| *id == 1).map(|(_, b)| *b)).expect("its chip laid out");
+    let chip =
+        view.read_with(cx, |v, _| v.chip_bounds.borrow().iter().find(|(id, _)| *id == 1).map(|(_, b)| *b)).expect("its chip laid out");
     let to = |cx: &mut TestAppContext, at: gpui_kit::Point<gpui_kit::Pixels>| {
         event(cx, w, PlatformInput::MouseMove(MouseMoveEvent { position: at, pressed_button: None, modifiers: Default::default() }));
         view.update(cx, |v, cx| v.open_worker_tab(&scout, cx));

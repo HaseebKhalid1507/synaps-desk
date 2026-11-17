@@ -5680,7 +5680,9 @@ impl AppView {
                 .border_1()
                 .border_color(p.edge)
                 // The user's bar over the left border.
-                .child(div().absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(2.)).bg(bar))
+                .child(
+                    div().debug_selector(|| "composer-bar".into()).absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(2.)).bg(bar),
+                )
                 // Handoff in: a 24 px light travels down it.
                 .when(segment < 1., |d| {
                     d.child(

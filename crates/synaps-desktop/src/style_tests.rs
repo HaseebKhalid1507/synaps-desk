@@ -157,16 +157,7 @@ fn no_gradients_anywhere() {
         .into_iter()
         .filter(|(name, _)| name != "style_tests.rs")
         .flat_map(|(name, code)| {
-            [
-                "linear_gradient",
-                "LinearColorStop",
-                "radial_gradient",
-                "conic_gradient",
-                ".shadow(",
-                "shadow_",
-                "box_shadow(",
-                "BoxShadow",
-            ]
+            ["linear_gradient", "LinearColorStop", "radial_gradient", "conic_gradient", ".shadow(", "shadow_", "box_shadow(", "BoxShadow"]
                 .into_iter()
                 .flat_map(|g| {
                     code.match_indices(g)
