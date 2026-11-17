@@ -1519,6 +1519,10 @@ pub struct AppView {
     /// Where each segmented control's segments were laid out last frame
     /// (their bar springs between them).
     pub(crate) seg_places: std::rc::Rc<RefCell<HashMap<u64, (f32, f32)>>>,
+    /// The link's signatures (motion.md §5.1, §5.3), and the top bar's
+    /// connection cell's tear offset this frame.
+    pub(crate) link: crate::motion::Link,
+    pub(crate) conn_dy: f32,
     view_seen: Option<(u64, theme::Choice)>,
     pub(crate) window_active: bool,
     /// The session's list while a worker's view is shown, and the worker
@@ -2067,6 +2071,8 @@ impl AppView {
             usage_pane: i.usage_pane,
             view_width: 0.,
             seg_places: Default::default(),
+            link: Default::default(),
+            conn_dy: 0.,
             view_seen: None,
             window_active: true,
             main_pane: None,
@@ -5891,6 +5897,27 @@ impl Render for AppView {
             let pane = self.pane(k).clone();
             cx.defer(move |cx| pane.update(cx, |_, cx| cx.notify()));
         }
+        // The link (motion.md §5.1, §5.3; never offline): up, it scans;
+        // dropped, it tears and the palette drains, held while down; back,
+        // the palette restores. Settings and Usage draw with it.
+        if !self.synthetic {
+            let up = matches!(self.model.conn, ConnState::Connected(_));
+            self.link.see(up, self.fx.now(), self.fx.level());
+        }
+        let drain = self.link.drain(&self.fx);
+        let scheme = cx.global::<theme::Scheme>();
+        if scheme.drain.replace(drain) != drain
+            && let Some(k) = self.model.tabs.view()
+        {
+            let pane = self.pane(k).clone();
+            cx.defer(move |cx| pane.update(cx, |_, cx| cx.notify()));
+        }
+        let tear = self.link.tear(&self.fx);
+        self.conn_dy = match tear {
+            Some(0) => 3.,
+            Some(_) => -2.,
+            None => 0.,
+        };
         // A theme change cross-fades over `slow` `inout` (motion.md §6.8),
         // from the app's frame; Settings and Usage draw with it.
         if let Some((at, _)) = cx.global::<theme::Scheme>().fading() {
@@ -6413,6 +6440,7 @@ impl Render for AppView {
             .children(self.render_menu_at_point(&p, cx))
             .children(self.render_session_menu(&p, cx))
             .children(self.render_workers_menu(&p, cx))
+            .children(self.render_link(tear, &p))
             // Painted last, after every row was rendered: what the frame's
             // motion asked for (a frame, the one timer, or nothing; with a
             // beat layer, it arms the timer after painting the beat).

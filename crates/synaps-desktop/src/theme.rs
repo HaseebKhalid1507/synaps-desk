@@ -422,6 +422,31 @@ roles! {
 }
 
 impl Palette {
+    /// The link down (motion.md §5.3): every status, identity and accent
+    /// role `k` of the way to its drained self (70 % toward its own grey);
+    /// grounds, surfaces, lines, text and code untouched.
+    pub fn drained(&self, k: f32) -> Palette {
+        if k <= 0. {
+            return *self;
+        }
+        let t = 0.7 * k.min(1.);
+        let mut p = *self;
+        for c in [
+            &mut p.you, &mut p.warn, &mut p.run, &mut p.ready, &mut p.cost, &mut p.err, &mut p.think, &mut p.ok,
+            &mut p.t_bash, &mut p.t_read, &mut p.t_write, &mut p.t_edit, &mut p.t_grep, &mut p.t_find, &mut p.t_ls, &mut p.t_sub,
+            &mut p.t_ext, &mut p.t_gen, &mut p.sub_name_t, &mut p.sub_status_t, &mut p.ok_o, &mut p.err_o, &mut p.think_o,
+            &mut p.warn_k, &mut p.err_k, &mut p.run_k, &mut p.ok_k, &mut p.run_mark_k, &mut p.err_mark_k, &mut p.focus_k,
+            &mut p.you_mark, &mut p.you_mark_t, &mut p.warn_mark, &mut p.run_mark, &mut p.focus, &mut p.btn_fill, &mut p.warn_fill,
+            &mut p.btn_hi, &mut p.warn_hi, &mut p.btn_press, &mut p.warn_press, &mut p.warn_ch, &mut p.run_ch, &mut p.unread_ch,
+            &mut p.open_ch, &mut p.ready_ch, &mut p.err_ch, &mut p.cost_ch, &mut p.ok_ch, &mut p.edit_ch, &mut p.write_ch,
+            &mut p.bash_ch, &mut p.sub_name, &mut p.sub_status, &mut p.sub_done, &mut p.warn_mark_ch, &mut p.run_mark_ch,
+            &mut p.unread_mark_ch, &mut p.focus_ch, &mut p.ready_mark_ch, &mut p.err_mark_ch, &mut p.you_bar,
+        ] {
+            *c = drain_hsla(*c, t);
+        }
+        p
+    }
+
     /// The chrome's numbers as last seen, not live (the right panel
     /// detached, or a cached tab opening): every chrome text role in
     /// `dim_ch`, every chrome mark in `rest_mark` (it was `opacity(0.45)`).
@@ -867,6 +892,9 @@ pub struct Scheme {
     /// before it, when it began, and how far it is as of the app's frame
     /// ([`Scheme::fade`]). [`palette`] paints from that blend.
     pub from: std::cell::Cell<Option<(Palette, Option<std::time::Instant>, f32)>>,
+    /// The link is down (motion.md §5.3): how drained the palette is, as of
+    /// the app's frame (0: not at all).
+    pub drain: std::cell::Cell<f32>,
 }
 
 impl Scheme {
@@ -894,17 +922,41 @@ impl Scheme {
         // quoted, link and heading colours are the ones floored there.
         let on_user = Palette { prose: p.ink, dim: p.dim_u, agent: p.agent_u, head: p.head_u, ..p };
         let user_text = text_style(&on_user, &m, luminance(roles.canvas) < 0.5);
-        Scheme { choice, roles, p, m, user_text, from: Default::default() }
+        Scheme { choice, roles, p, m, user_text, from: Default::default(), drain: Default::default() }
     }
 }
 
 /// The palette, by value (no allocation).
 pub fn palette(cx: &App) -> Palette {
     let s = cx.global::<Scheme>();
-    match s.from.get() {
+    let p = match s.from.get() {
         Some((from, _, t)) => from.lerp(&s.p, t),
         None => s.p,
+    };
+    match s.drain.get() {
+        k if k > 0. => p.drained(k),
+        _ => p,
     }
+}
+
+/// A colour's relative luminance (WCAG).
+pub fn luminance_hsla(c: Hsla) -> f32 {
+    let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let rgb = Rgba::from(c);
+    0.2126 * lin(rgb.r) + 0.7152 * lin(rgb.g) + 0.0722 * lin(rgb.b)
+}
+
+/// `c` mixed `t` toward the grey of its own relative luminance, in linear
+/// light (motion.md §5.3's drain): its luminance, so every contrast it
+/// makes, stays.
+pub fn drain_hsla(c: Hsla, t: f32) -> Hsla {
+    let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let enc = |l: f32| if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1. / 2.4) - 0.055 };
+    let rgb = Rgba::from(c);
+    let (r, g, b) = (lin(rgb.r), lin(rgb.g), lin(rgb.b));
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let ch = |v: f32| enc(v + (y - v) * t).clamp(0., 1.);
+    Hsla::from(Rgba { r: ch(r), g: ch(g), b: ch(b), a: rgb.a })
 }
 
 pub fn metrics(cx: &App) -> Metrics {
@@ -1589,6 +1641,35 @@ fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The drain (motion.md §5.3) keeps every role's contrast on every
+    /// ground, in every theme and accent: each drained role sits at its own
+    /// luminance (to within the 8-bit rounding of its channels), and the
+    /// grounds, text and lines don't move.
+    #[test]
+    fn drain_keeps_every_floor() {
+        let lum = |c: Hsla| f64::from(luminance_hsla(c));
+        let con = |a: Hsla, b: Hsla| {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        };
+        let mut worst = 0f64;
+        for (name, raw) in crate::palettes::THEMES {
+            for accent in [None, Some(0xe8132f), Some(0xf4b400), Some(0x2d7bff), Some(0x35f2ff)] {
+                let p = Palette::of(&resolve(&raw, accent).0);
+                let d = p.drained(1.);
+                assert_eq!((d.canvas, d.chrome, d.ink, d.prose, d.hair, d.tool, d.user), (p.canvas, p.chrome, p.ink, p.prose, p.hair, p.tool, p.user), "{name}");
+                assert_ne!(d.run, p.run, "{name}: the live colour drains");
+                for (a, b) in [(p.run, d.run), (p.err_ch, d.err_ch), (p.warn_mark, d.warn_mark), (p.you_bar, d.you_bar), (p.ok, d.ok), (p.focus, d.focus)] {
+                    for ground in [p.canvas, p.chrome, p.tool, p.user] {
+                        worst = worst.max((con(a, ground) - con(b, ground)).abs());
+                    }
+                }
+                assert_eq!(p.drained(0.), p, "{name}: none at 0");
+            }
+        }
+        assert!(worst < 0.06, "the drain moved a contrast by {worst:.3}");
+    }
 
     #[test]
     fn hex_parsing() {

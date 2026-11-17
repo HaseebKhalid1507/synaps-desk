@@ -3018,3 +3018,74 @@ fn saved_value_afterglows(cx: &mut TestAppContext) {
     assert_eq!(k(cx, "d", true), 0.);
     assert_eq!(k(cx, "d", false), 0., "Off: none");
 }
+
+/// The link's signatures (motion.md §5.1, §5.3): a drop tears for two
+/// frames (the connection cell +3 px, then −2), the palette drains and
+/// holds while down; back, it scans and restores. Every drained role keeps
+/// its contrast. Reduced: no tear, no scan, a quick drain. Offline: never.
+#[gpui_kit::test]
+fn the_link_drops_drains_and_scans_back(cx: &mut TestAppContext) {
+    use crate::model::ConnState;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let conn = |cx: &mut TestAppContext, c: ConnState| {
+        view.update(cx, |v, cx| {
+            v.model.conn = c;
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let drain = |cx: &mut TestAppContext| cx.update(|cx| cx.global::<crate::theme::Scheme>().drain.get());
+    let run = |cx: &mut TestAppContext| cx.update(|cx| crate::theme::palette(cx).run);
+    let lit = run(cx);
+    // Offline (the demo's synthetic transport): nothing, whatever it says.
+    conn(cx, ConnState::Connected("x".into()));
+    conn(cx, ConnState::Reconnecting);
+    assert_eq!(view.read_with(cx, |v, _| v.link.glitch), None, "offline: never");
+    view.update(cx, |v, _| v.synthetic = false);
+    conn(cx, ConnState::Connected("x".into()));
+    assert!(view.read_with(cx, |v, _| v.link.scan.is_some()), "the first hello scans");
+    wait(cx, w, &view, 700);
+    assert!(view.read_with(cx, |v, _| v.link.scan.is_none()), "the scan is over");
+    conn(cx, ConnState::Reconnecting);
+    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), 3., "the tear's first frame");
+    wait(cx, w, &view, 61);
+    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), -2., "its second");
+    assert_eq!(drain(cx), 0., "the drain waits for the tear");
+    wait(cx, w, &view, 40);
+    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), 0.);
+    wait(cx, w, &view, 400);
+    assert_eq!(drain(cx), 1., "drained");
+    let grey = run(cx);
+    assert_ne!(grey, lit, "the live colours drain");
+    let (l0, l1) = (crate::theme::luminance_hsla(lit), crate::theme::luminance_hsla(grey));
+    assert!((l0 - l1).abs() < 0.01, "at their own luminance: {l0} {l1}");
+    wait(cx, w, &view, 2000);
+    assert_eq!(drain(cx), 1., "held while down");
+    // Holding asks for no display frame (the word's dots step on the beat).
+    assert!(!motion_pending(cx, &view).0, "holding draws nothing");
+    conn(cx, ConnState::Connected("x".into()));
+    assert!(view.read_with(cx, |v, _| v.link.scan.is_some()), "back: it scans");
+    wait(cx, w, &view, 400);
+    assert_eq!(drain(cx), 0., "restored");
+    assert_eq!(run(cx), lit);
+    wait(cx, w, &view, 400);
+    assert!(!motion_pending(cx, &view).0, "settled: no display frames");
+    // Reduced: no tear, no scan; the drain over `quick`.
+    set_motion(cx, &view, crate::motion::Level::Reduced);
+    settle(cx, w, 4);
+    conn(cx, ConnState::Reconnecting);
+    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), 0., "Reduced: no tear");
+    wait(cx, w, &view, 130);
+    assert_eq!(drain(cx), 1., "Reduced: a quick drain");
+    conn(cx, ConnState::Connected("x".into()));
+    assert!(view.read_with(cx, |v, _| v.link.scan.is_none()), "Reduced: no scan");
+    wait(cx, w, &view, 130);
+    assert_eq!(drain(cx), 0.);
+    // Off: none.
+    set_motion(cx, &view, crate::motion::Level::Off);
+    settle(cx, w, 4);
+    conn(cx, ConnState::Reconnecting);
+    assert_eq!(drain(cx), 0., "Off: none");
+    assert_eq!(motion_pending(cx, &view), (false, None), "Off: the dots hold too");
+}
