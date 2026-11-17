@@ -920,7 +920,7 @@ impl AppView {
         )
     }
 
-    /// The fuse after an armed cancel's CONFIRM (motion.md §6.2): three
+    /// The fuse before an armed cancel's CONFIRM (motion.md §6.2): three
     /// 4 px cells in the err family's mark on the tray's ground, which is
     /// `err` itself there (design.md §4.4's table: `err_mark_ch` is the
     /// chrome's, `err_mark_k` the card's), one going dark per second of [`CONFIRM`] on
@@ -939,7 +939,13 @@ impl AppView {
                 n
             }
         };
-        Some(h_flex().flex_none().gap(px(4.)).children((0..3).map(|i| div().size(px(4.)).when(i < lit, |d| d.bg(p.err)))))
+        Some(
+            h_flex()
+                .debug_selector(|| "tray-fuse".into())
+                .flex_none()
+                .gap(px(4.))
+                .children((0..3).map(|i| div().size(px(4.)).when(i < lit, |d| d.bg(p.err)))),
+        )
     }
 
     /// A tray row's × (on hover, or while its row is the watched one;
@@ -970,14 +976,17 @@ impl AppView {
             };
             h_flex()
                 .id(("tray-x", who.id as usize))
+                .debug_selector(|| "tray-armed".into())
                 .flex_none()
                 .h(px(h))
                 .gap(px(6.))
                 .items_center()
                 .cursor_pointer()
                 .child(div().text_color(p.err).child(format!("Cancel {name}?")))
-                .child(display(fonts::label::CONFIRM, crate::fonts::size::D_S, p.err))
-                .children(self.fuse(p))
+                // Before CONFIRM, 8 px from it: the pointer that armed it
+                // rests on the ×'s end, where CONFIRM is (finish gate fix 2).
+                .children(self.fuse(p).map(|f| f.mr(px(2.))))
+                .child(display(fonts::label::CONFIRM, crate::fonts::size::D_S, p.err).debug_selector(|| "tray-confirm".into()))
         } else {
             // A reveal button (design.md §5): drawn while its row is hovered.
             h_flex()

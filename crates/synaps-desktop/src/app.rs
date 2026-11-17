@@ -154,6 +154,10 @@ pub(crate) type AttachSource = Box<dyn Fn(&str, u64) -> Vec<Event>>;
 /// TUI's `CONFIRM_ARM_DELAY` is 400 ms): it pushes the list up, so a click
 /// meant for a row can land on it. Its keys wait longer ([`Arm`]).
 pub(crate) const ARM: Duration = Duration::from_millis(500);
+/// How far toward the ink Handoff in's light is: the beam's
+/// ([`crate::glyph::BEAM`]), the one "your turn" signature as bright as
+/// the column's brightest light.
+pub(crate) const HANDOFF_LIT: f32 = crate::glyph::BEAM;
 /// How long a rename asked for another session waits for its attach.
 pub(crate) const RENAME_WAIT: Duration = Duration::from_secs(10);
 /// The chord that answers a card yes ([`card_key`]), as its button shows it.
@@ -4450,8 +4454,11 @@ impl AppView {
         let g = crate::turns::live_glyph(&self.fx, glyph::Glyph::Needs, p.warn_mark, p.card, None, self.card_at.filter(|_| live), false);
         // Its frame traces from the top-left corner: one stroke along the
         // top and down the right, one down the left and along the bottom,
-        // meeting after `base` (paint only, over its 1 px border).
-        let trace = self.fx.draw(self.card_at, Duration::ZERO, crate::motion::BASE);
+        // meeting after `base` (paint only, over its 1 px border). In and
+        // out (motion.md §10 amendment 18): its start is seen, not only the
+        // corner closing.
+        let trace =
+            self.fx.shot(self.card_at, Duration::ZERO, crate::motion::BASE, &crate::motion::ease::INOUT, crate::motion::Kind::Spatial);
         let warn_mark = p.warn_mark;
         let tracer = (trace < 1.).then(|| {
             canvas(
@@ -4816,6 +4823,10 @@ impl AppView {
             _ => (out.max(fx.flash(handoff_in)), 1.),
         };
         let bar = crate::motion::mix(p.you_mark, lit, bar_flash);
+        // Handoff in's light (motion.md §10 amendment 17): lit as the beam
+        // is, on at once, decaying into the bar over the last `glow` of its
+        // travel: it lands as the bar, never switched off.
+        let segment_color = crate::motion::mix(bar, crate::motion::mix(p.you, p.ink, HANDOFF_LIT), fx.handoff_light(handoff_in));
         // A worker tab's glyph says whose; the primary may shorten.
         // Its text at `inset` (design.md §8.11): the kit pads a multi-line
         // field's text by its own `input_px` whatever its appearance, so the
@@ -4941,13 +4952,16 @@ impl AppView {
                 // Handoff in: a 24 px light travels down it.
                 .when(segment < 1., |d| {
                     d.child(
-                        div()
-                            .absolute()
-                            .left(px(-1.))
-                            .top(px(-1.))
-                            .bottom(px(23.))
-                            .w(px(2.))
-                            .child(div().absolute().left_0().top(relative(segment)).w(px(2.)).h(px(24.)).bg(lit)),
+                        div().absolute().left(px(-1.)).top(px(-1.)).bottom(px(23.)).w(px(2.)).child(
+                            div()
+                                .debug_selector(|| "handoff-in".into())
+                                .absolute()
+                                .left_0()
+                                .top(relative(segment))
+                                .w(px(2.))
+                                .h(px(24.))
+                                .bg(segment_color),
+                        ),
                     )
                 })
                 .text_px(m.body)
@@ -5161,9 +5175,9 @@ impl Render for AppView {
         // window costs is countable.
         log::debug!(target: "synaps_desktop::frame", "frame");
         // The frame's clock and level: every animated element samples them.
-        let low_power = cx.power_mode() == gpui_kit::PowerMode::LowPower;
+        let low_power = self.fx.low_power(cx);
         self.fx.set_visible(self.visible);
-        self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.clock());
+        self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.rescope(self.motion_session(), self.motion_column());
         if self.menu.is_none()
             && self.smenu.is_none()

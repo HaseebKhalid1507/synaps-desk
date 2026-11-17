@@ -562,8 +562,9 @@ mod tests {
     }
 
     /// The tray's clock ticks on the frame from the daemon's last count,
-    /// asking for its next second only; Reduced and low power tick too
-    /// (clocks are information); Off holds the row's text and asks nothing.
+    /// asking for its next second only, on the window's one second;
+    /// Reduced and low power tick too (clocks are information), on the
+    /// same second (Shady N5); Off holds the row's text and asks nothing.
     #[test]
     fn a_running_clock_ticks_on_the_frame_and_off_holds_it() {
         use crate::motion::{Level, Motion};
@@ -574,9 +575,8 @@ mod tests {
         let r = TrayRow::of(l, false);
         assert_eq!(r.facts.as_ref(), "1 tool · 40.0s", "the row's own text, as the daemon said");
         // Its next second (44) at 2.6 s: on the grid's second that crosses
-        // it while the heartbeat runs (3 s: every clock's one app frame),
-        // else at the second.
-        for (level, low_power, at) in [(Level::Full, false, 3000), (Level::Reduced, false, 2600), (Level::Full, true, 2600)] {
+        // it (3 s: every clock's one app frame), at every level.
+        for (level, low_power, at) in [(Level::Full, false, 3000), (Level::Reduced, false, 3000), (Level::Full, true, 3000)] {
             fx.begin_frame(level, low_power, t0 + Duration::from_millis(1700));
             assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 43s", "{level:?}");
             assert_eq!(fx.demand(), (false, Some(t0 + Duration::from_millis(at))), "{level:?} {low_power}: only its next second");

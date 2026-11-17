@@ -365,6 +365,8 @@ pub(crate) struct Motion {
     timer: RefCell<Option<Task<()>>>,
     /// The instant it is armed for, and whom it wakes (cleared as it fires).
     armed: Rc<Cell<Option<(Instant, Wake)>>>,
+    /// The instant the timer last fired for ([`Motion::tick`]).
+    woke: Rc<Cell<Option<Instant>>>,
     /// A beat layer paints the beat ([`crate::beat::BeatLayer`]); without
     /// one the app's frame draws it (and each beat is the app's frame).
     layer: Cell<bool>,
@@ -386,6 +388,9 @@ pub(crate) struct Motion {
     /// Tests move the clock with the executor's ([`Motion::clock`]).
     #[cfg(test)]
     skew: Cell<Duration>,
+    /// Tests: the OS in low power ([`Motion::low_power`]).
+    #[cfg(test)]
+    pub(crate) force_low_power: Cell<bool>,
 }
 
 impl Default for Motion {
@@ -413,6 +418,7 @@ impl Motion {
             turns: RefCell::default(),
             timer: RefCell::default(),
             armed: Rc::default(),
+            woke: Rc::default(),
             layer: Cell::new(false),
             sites: RefCell::default(),
             beat_next: Cell::new(None),
@@ -423,6 +429,8 @@ impl Motion {
             scope: Cell::new((0, 0)),
             #[cfg(test)]
             skew: Cell::new(Duration::ZERO),
+            #[cfg(test)]
+            force_low_power: Cell::new(false),
         }
     }
 
@@ -471,6 +479,24 @@ impl Motion {
     /// The frame's clock (every element of a frame samples the same instant).
     pub(crate) fn now(&self) -> Instant {
         if self.in_frame.get() { self.now.get() } else { self.clock() }
+    }
+
+    /// A frame's instant: the clock, or the instant the timer fired for if
+    /// it fired a hair early (a coarse OS timer): the beat it was armed for
+    /// is the one drawn, so an early wake is not a second present of the
+    /// beat before (Shady N2). Once that instant is past, the clock.
+    pub(crate) fn tick(&self) -> Instant {
+        let now = self.clock();
+        self.woke.get().map_or(now, |due| due.max(now))
+    }
+
+    /// The OS is in low power: no ambient (§7).
+    pub(crate) fn low_power(&self, cx: &App) -> bool {
+        #[cfg(test)]
+        if self.force_low_power.get() {
+            return true;
+        }
+        cx.power_mode() == gpui_kit::PowerMode::LowPower
     }
 
     /// The time (tests: moved on with the test executor's clock).
@@ -595,30 +621,30 @@ impl Motion {
         b(self.now()).saturating_sub(b(since))
     }
 
-    /// A clock (a running elapsed time, a fuse) changes at `at`: under
-    /// every level but Off (information, not motion). While the heartbeat
-    /// runs it changes on the beat that crosses `at` (§7.1: the heartbeat's
-    /// frame, no extra one); without it, at `at` itself.
+    /// A clock (a fuse's step; a running elapsed time is [`Self::tick_clock`])
+    /// changes at `at`: under every level but Off (information, not
+    /// motion). While the heartbeat runs it changes on the beat that
+    /// crosses `at` (§7.1: the heartbeat's frame, no extra one); without
+    /// it, at `at` itself.
     pub(crate) fn tick_at(&self, at: Instant) {
-        self.tick_on(at, BEAT);
+        self.want_at(if self.ambient.get() { self.on_grid(at, BEAT) } else { at });
     }
 
-    /// A running clock's next second at `at`. While the heartbeat runs,
-    /// every clock changes on the one second of the beat's grid that
-    /// crosses it (8 beats): N clocks, whatever their phase, cost one app
-    /// frame a second, the rest of the beats only the beat layer. Each
+    /// A running clock's next second at `at`: every clock changes on the
+    /// one second of the window's grid that crosses it (8 beats): N clocks,
+    /// whatever their phase, cost one app frame a second (while the
+    /// heartbeat runs, the rest of the beats only the beat layer). Each
     /// shows its own whole seconds as of that frame (at most one behind
-    /// for less than a second). Without the heartbeat, at `at` itself.
+    /// for less than a second). At every level but Off, and in low power,
+    /// where frames matter most (Shady N5).
     pub(crate) fn tick_clock(&self, at: Instant) {
-        self.tick_on(at, BEAT * 8);
+        self.want_at(self.on_grid(at, BEAT * 8));
     }
 
-    fn tick_on(&self, at: Instant, grid: Duration) {
-        if !self.ambient.get() {
-            return self.want_at(at);
-        }
+    /// The first instant of the window's `grid` at or after `at`.
+    fn on_grid(&self, at: Instant, grid: Duration) -> Instant {
         let n = at.saturating_duration_since(self.epoch).as_nanos().div_ceil(grid.as_nanos());
-        self.want_at(self.epoch + Duration::from_nanos((grid.as_nanos() * n) as u64));
+        self.epoch + Duration::from_nanos((grid.as_nanos() * n) as u64)
     }
 
     // ── one-shots ─────────────────────────────────────────────────────
@@ -676,6 +702,13 @@ impl Motion {
             return 0.;
         }
         1. - self.shot(Some(since + hold), Duration::ZERO, dur, &ease::OUT, Kind::Decay)
+    }
+
+    /// Handoff in's light as it travels (motion.md §5.2, §10 amendment 17):
+    /// 1 (lit) from `at`, decaying to 0 (the bar) over the last [`GLOW`] of
+    /// its [`SIG`]: it lands as the bar, never switched off.
+    pub(crate) fn handoff_light(&self, at: Option<Instant>) -> f32 {
+        self.decay(at, SIG - GLOW, GLOW)
     }
 
     /// Handoff's light (motion.md §5.2): dark before `at`, lit at `at`,
@@ -785,7 +818,15 @@ impl Motion {
         if !self.on() || !self.visible.get() {
             return self.disarm();
         }
-        let since = self.clock().saturating_duration_since(self.epoch);
+        // Low power: no ambient (§7). GPUI stores a power change without a
+        // refresh, so the cached frame's sites would beat on; the app draws
+        // instead, sees low power, and records none (Shady N1). Notified
+        // after this frame (a notify while painting draws nothing).
+        if !self.sites.borrow().is_empty() && self.low_power(cx) {
+            cx.defer(move |cx| cx.notify(app));
+            return self.disarm();
+        }
+        let since = self.tick().saturating_duration_since(self.epoch);
         let beat = (since.as_nanos() / BEAT.as_nanos()) as u32;
         let mut wants = false;
         for s in self.sites.borrow().iter() {
@@ -834,11 +875,12 @@ impl Motion {
         }
         self.arms.set(self.arms.get() + 1);
         self.armed.set(Some((at, wake)));
-        let (armed, who) = (self.armed.clone(), if wake == Wake::App { app } else { layer });
+        let (armed, woke, who) = (self.armed.clone(), self.woke.clone(), if wake == Wake::App { app } else { layer });
         let wait = at.saturating_duration_since(self.clock());
         let task = cx.spawn(async move |cx| {
             cx.background_executor().timer(wait).await;
             armed.set(None);
+            woke.set(Some(at));
             cx.update(|cx| cx.notify(who));
         });
         *self.timer.borrow_mut() = Some(task);
@@ -1054,15 +1096,41 @@ mod tests {
         assert_eq!(m.change(Tag::Outcome, 5, 1, m.birth(5)), Some((t0 + ms(64), u64::MAX)));
     }
 
+    /// Finish gate fix 1: Handoff in's light is on at once and decays into
+    /// the bar, each 30 fps step smaller than the last: it lands as the
+    /// bar, never switched off.
+    #[test]
+    fn handoff_in_decays_into_the_bar() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        // At 30 fps, as a capture sees it.
+        let at = |t: u64| {
+            m.begin_frame(Level::Full, false, t0 + ms(t));
+            m.handoff_light(Some(t0))
+        };
+        assert_eq!(at(0), 1., "on at once");
+        assert_eq!(at(99), 1., "lit while it starts down");
+        let k: Vec<f32> = (0..=20).map(|f| at(f * 100 / 3)).collect();
+        assert!(k.windows(2).all(|w| w[1] <= w[0]), "it only decays: {k:?}");
+        let steps: Vec<f32> = k.windows(2).map(|w| w[0] - w[1]).filter(|d| *d > 0.).collect();
+        // (The first step is a part one: the decay starts between frames.)
+        assert!(steps[1..].windows(2).all(|w| w[1] <= w[0] + 1e-6), "each step smaller than the last (no jump at the end): {steps:?}");
+        assert!(*steps.last().unwrap() < 0.02, "its last step is a whisker: {steps:?}");
+        assert_eq!(at(600), 0., "the bar at sig");
+        assert_eq!(m.handoff_light(None), 0.);
+    }
+
     /// Every running glyph samples the same beat in a frame, though the
     /// wall clock crosses a beat while the frame's rows are built (they
     /// read the frame's clock, not the time each is built at), and a row
     /// born mid-cycle joins the phase (it does not start at 0).
     #[test]
     fn fresh_glyph_rows_scan_in_lockstep() {
-        // The epoch put so that the next beat is 2 ms from now.
-        let m = Motion::new(Instant::now() - (BEAT * 3 - ms(2)));
-        m.begin_frame(Level::Full, false, Instant::now());
+        // The epoch put so that the next beat is 2 ms after the frame's
+        // instant (one instant for both: a slow runner can't cross it).
+        let t0 = Instant::now();
+        let m = Motion::new(t0 - (BEAT * 3 - ms(2)));
+        m.begin_frame(Level::Full, false, t0);
         let old = m.beat(1);
         std::thread::sleep(ms(6));
         m.born(9, Instant::now());
@@ -1071,7 +1139,7 @@ mod tests {
         assert_eq!(fresh, old, "a row built after the wall clock crossed the beat scans with the rest");
         assert_eq!(crate::glyph::scan_row(old.unwrap()), crate::glyph::scan_row(fresh.unwrap()));
         // The next frame: the next beat, for both.
-        m.begin_frame(Level::Full, false, Instant::now());
+        m.begin_frame(Level::Full, false, t0 + ms(6));
         assert_eq!((m.beat(1), m.beat(1)), (Some(3), Some(3)));
     }
 
@@ -1136,7 +1204,7 @@ mod tests {
     /// The `roles_check` step for the soul (amendments 14, 15): the scan's
     /// beam and its afterglow are a running glyph's light, so they hold
     /// the mark floor (3:1) on every ground a running glyph is drawn on;
-    /// a drawing bar's hot head holds it on the run surface, for every
+    /// a new bar, drawn hot, holds it on the run surface, for every
     /// tool's hue and thinking's; in every theme and accent. The bloom is
     /// the lit bar's glow beside it (decoration: the bar is the state).
     #[test]

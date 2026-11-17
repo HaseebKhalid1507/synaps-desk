@@ -1104,7 +1104,11 @@ impl AppView {
             _ => 0.,
         };
         let bar = motion::mix(hue, lit, k);
-        let drawn = fx.draw(fx.birth(id), Duration::ZERO, motion::QUICK);
+        let born = fx.birth(id);
+        let drawn = fx.draw(born, Duration::ZERO, motion::QUICK);
+        // It draws hot, all of it, then cools to its light over `glow` once
+        // drawn (motion.md §10 amendment 15, as tuned by the finish gate).
+        let hot = fx.decay(born, motion::QUICK, motion::GLOW);
         // Lit, it blooms: a still 1 px column of its light on its right, in
         // the row's own padding (motion.md §10 amendment 15).
         let bloom = (k > 0.).then(|| glyph::bloom_at(motion::mix(p.tool, motion::mix(lit, p.tool, BLOOM), k), drawn));
@@ -1205,7 +1209,7 @@ impl AppView {
             .children(worker.map(|(v, current)| self.subagent_block(v, current, id, block_at, p, m, lay, cx)))
             .children(body)
             .children(bloom)
-            .child(glyph::bar_lit(bar, motion::mix(bar, p.ink, HEAD), drawn))
+            .child(glyph::bar_at(motion::mix(bar, motion::mix(bar, p.ink, HEAD), hot), drawn))
             .children(warn.map(|k| glyph::bar_at(p.warn_mark, k)))
             .into_any_element()
     }
@@ -1374,7 +1378,7 @@ pub(crate) fn glyph_code(g: Glyph) -> u64 {
 /// A lit bar's bloom: how far toward the ground its light is (motion.md
 /// §10 amendment 15).
 const BLOOM: f32 = 0.62;
-/// A drawing bar's head: how far toward the ink it is.
+/// A new bar, hot: how far toward the ink it draws.
 pub(crate) const HEAD: f32 = 0.65;
 
 /// A state glyph as it is now (motion.md §6, §7): `Run` and `Workers`
