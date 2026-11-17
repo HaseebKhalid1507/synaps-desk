@@ -36,6 +36,7 @@ mod mem;
 mod menu;
 mod model;
 mod named;
+mod overlay;
 mod palettes;
 mod rail;
 mod scrollbar;
@@ -43,6 +44,8 @@ mod settings;
 mod settings_view;
 mod shell;
 mod stats;
+#[cfg(test)]
+mod style_tests;
 mod subagents;
 mod tabs;
 mod tabstrip;

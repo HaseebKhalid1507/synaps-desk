@@ -630,12 +630,14 @@ fn foot_of(cx: &mut TestAppContext, view: &Entity<AppView>) -> (crate::subagents
 }
 
 /// Its view polled `running` from the daemon (the offline demo's view
-/// has no daemon to poll).
+/// has no daemon to poll): the page, and what the pump does with it.
 fn view_running(cx: &mut TestAppContext, view: &Entity<AppView>) {
     view.update(cx, |v, _| {
         let w = v.model.watch.focused_mut().expect("a worker on screen");
         w.gone = None;
         w.status = "running".into();
+        let handle = w.handle_id.clone();
+        v.model.heard_view(&handle);
     });
 }
 
@@ -670,9 +672,11 @@ fn the_foot_never_says_another_worker_under_its_handle(cx: &mut TestAppContext) 
     assert_eq!(tab, Some(crate::subagents::Liveness::Gone), "its tab says the same");
 }
 
-/// Shady M2: a re-attach during a long tool call demotes every running
-/// worker to started until it is heard again; its view, polled from the
-/// daemon, still says running. The foot and its worker tab say RUNNING.
+/// Shady M2, the proper fix: a re-attach during a long tool call demotes
+/// every running worker to started until it is heard again; its view's
+/// next page (polled from the daemon, 4 a second) is heard by the
+/// session's list, the one source: the foot, its worker tab and its tray
+/// row say RUNNING, and READ ONLY or STEER WORKER follow from it.
 #[gpui_kit::test]
 fn a_reattach_leaves_a_running_worker_running(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
@@ -684,7 +688,15 @@ fn a_reattach_leaves_a_running_worker_running(cx: &mut TestAppContext) {
         cx.notify();
     });
     cx.run_until_parked();
-    assert_eq!(foot_of(cx, &view).0, crate::subagents::Liveness::Running, "the foot: running, as its view says");
+    assert_eq!(foot_of(cx, &view).0, crate::subagents::Liveness::Started, "one source: started until heard");
+    view_running(cx, &view);
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.model.stats.subagents.status(1)),
+        Some(crate::subagents::Status::Running),
+        "its page is heard by the list"
+    );
+    assert_eq!(foot_of(cx, &view).0, crate::subagents::Liveness::Running, "the foot: running, as its pages say");
     let tab = view.read_with(cx, |v, _| {
         let w = v.model.watch.focused().expect("scout's view");
         let session = v.model.tabs.current_session().expect("its session");
@@ -730,6 +742,9 @@ fn a_stale_view_under_a_reused_handle_says_nothing_of_its_worker(cx: &mut TestAp
             "cancel_requested": false, "elapsed_secs": 3.0, "finished_elapsed": null, "step": "cargo build", "tools": 1}]});
         v.model.stats.subagents.on_session(&synaps_client::protocol::decode_event(&row).expect("a rows event"));
         assert_eq!(v.model.stats.subagents.status(1), Some(crate::subagents::Status::Running), "the list: builder runs");
+        // Scout's stale view is not heard as builder's.
+        assert!(!v.model.heard_view("sa_1"), "a view of another worker feeds nothing");
+        assert_eq!(v.model.stats.subagents.status(1), Some(crate::subagents::Status::Running));
         cx.notify();
     });
     cx.run_until_parked();

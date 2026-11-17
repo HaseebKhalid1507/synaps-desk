@@ -552,17 +552,19 @@ impl<S: Scrolled> Frame<S> {
         let dragging = state.0.borrow().grab.is_some();
         if look.0 {
             let p = &cx.global::<crate::theme::Scheme>().p;
-            let (rest, hot) = match ground {
-                Ground::Canvas => (p.dim, p.focus),
-                Ground::Chrome => (p.dim_ch, p.focus_ch),
-                Ground::User => (p.dim_u, p.focus),
+            // At rest the `thumb*` role; hovered its ground's dim text;
+            // dragged the focus colour (design.md §8.16).
+            let (thin, rest, hot) = match ground {
+                Ground::Canvas => (p.thumb, p.dim, p.focus),
+                Ground::Chrome => (p.thumb_ch, p.dim_ch, p.focus_ch),
+                Ground::User => (p.thumb_u, p.dim_u, p.focus),
             };
             let color = if dragging {
                 hot
             } else if look.1 {
                 rest
             } else {
-                rest.opacity(0.55)
+                thin
             };
             let track = look.1.then_some(p.hair);
             let rect = thumb_rect(axis, lane, thumb);

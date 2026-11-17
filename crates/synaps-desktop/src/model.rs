@@ -1121,6 +1121,23 @@ impl Model {
         }
     }
 
+    /// Worker `handle_id`'s view, just polled, tells the attached
+    /// session's list what its pages say: one state per worker, whichever
+    /// source heard it first ([`crate::subagents::Subagents::heard_page`]).
+    /// Only a view of the worker the handle names now (a cold-started
+    /// daemon numbers from 1 again: a stale view says nothing of the new
+    /// one), and not one gone (offline is not how it ended). Whether the
+    /// list changed.
+    pub fn heard_view(&mut self, handle_id: &str) -> bool {
+        let Some(id) = handle_id.strip_prefix("sa_").and_then(|n| n.parse::<u64>().ok()) else { return false };
+        let Some(w) = self.watch.worker(handle_id).filter(|w| w.gone.is_none()) else { return false };
+        if self.stats.subagents.ident(id).is_some_and(|now| !crate::wtabs::same_worker(w.key(), now)) {
+            return false;
+        }
+        let Some(status) = crate::subagents::Status::word(&w.status) else { return false };
+        self.stats.subagents.heard_page(id, status)
+    }
+
     /// UNREAD marks of sessions in no list (closed, or past what is listed).
     fn prune_unread(&mut self) {
         if self.unread.is_empty() {
@@ -1203,8 +1220,12 @@ impl Model {
             // shows (an idle worker's empty pages, 4 a second, draw
             // nothing), and nothing of the rail's.
             Event::SubagentWatch { attach_seq, handle_id, since, reply, .. } => {
-                if self.current(attach_seq) && self.watch.on_reply(&handle_id, since, reply, std::time::Instant::now()) {
-                    self.view_dirty = true;
+                if self.current(attach_seq) {
+                    let shown = self.watch.on_reply(&handle_id, since, reply, std::time::Instant::now());
+                    // Its page is a live source of the session's list too.
+                    if self.heard_view(&handle_id) || shown {
+                        self.view_dirty = true;
+                    }
                 }
                 return effects;
             }

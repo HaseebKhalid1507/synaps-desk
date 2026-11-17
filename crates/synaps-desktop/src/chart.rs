@@ -17,6 +17,12 @@ use crate::usage::Stack;
 /// Where a plot was painted last (the pointer's day is read from it).
 pub type Spot = Rc<Cell<Option<Bounds<Pixels>>>>;
 
+/// A data colour at `alpha` (a series' thin line, the heatmap's steps):
+/// opacity is for data only, so it lives here (design.md §5).
+pub fn fade(c: Hsla, alpha: f32) -> Hsla {
+    c.opacity(alpha)
+}
+
 /// A line chart's paths at the origin, for the plot size they were built
 /// for, with how each is inked: a hover or a scroll paints them again
 /// without tessellating. Emptied with each load.

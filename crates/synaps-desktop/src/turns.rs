@@ -852,11 +852,13 @@ impl AppView {
             _ => (None, px(0.)),
         };
         let block: AnyElement = match d.kind {
+            // The you bar over its left edge (design.md §8.11): the text at
+            // `inset`, the bar inside it.
             Kind::User => div()
+                .relative()
                 .w_full()
                 .bg(p.user)
-                .border_l_2()
-                .border_color(p.you_mark)
+                .child(crate::glyph::bar(p.you_mark))
                 .px(px(m.pad_x))
                 .py(px(m.pad_y))
                 .text_size(px(m.body))
@@ -942,7 +944,7 @@ impl AppView {
         // row when not one name fits (the tally is an empty strip then).
         let tip = (named < s.tally.len()).then(|| {
             let tip = s.tip.clone();
-            move |window: &mut Window, cx: &mut App| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            move |window: &mut Window, cx: &mut App| crate::overlay::tip(tip.clone(), window, cx)
         });
         let (tally_tip, row_tip) = if named > 0 { (tip, None) } else { (None, tip) };
         if let Some(tip) = tally_tip {
@@ -1220,7 +1222,7 @@ impl AppView {
                 let tip = SharedString::new_static("an earlier worker: a restarted daemon has given its handle to another one since");
                 return block
                     .id(("wblock-old", id as usize))
-                    .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+                    .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
                     .into_any_element();
             }
             return block.into_any_element();

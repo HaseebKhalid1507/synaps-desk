@@ -111,38 +111,6 @@ impl Liveness {
         }
     }
 
-    /// A worker from its two sources: its session's list (`status`,
-    /// `attached`, `known` as for [`Liveness::of`]) and its view's own
-    /// word, polled from the daemon ([`Liveness::of_view`]). The list's,
-    /// but the view's when the list says no more than a start (the history
-    /// alone holds it, or a re-attach demoted a running worker until it is
-    /// heard again), and when the view says how it ended before the
-    /// session's stream does. A view gone (offline) says neither: the
-    /// list's start stands. Not attached, a running view is as last seen.
-    pub fn of_sources(status: Option<Status>, view: Option<Self>, attached: bool, known: bool) -> Self {
-        let view = view.map(|v| if v == Liveness::Running && !attached { Liveness::LastSeen } else { v });
-        match (status, view) {
-            (None, Some(v)) => v,
-            (Some(Status::Started), Some(v)) if v != Liveness::Gone => v,
-            (Some(s), Some(v)) if !s.terminal() && v.ended() && v != Liveness::Gone => v,
-            _ => Liveness::of(status, attached, known),
-        }
-    }
-
-    /// From a worker's view's own word ([`crate::watch::Worker::state`]),
-    /// for a worker its session's list does not say (`None`: nothing yet).
-    pub fn of_view(word: &str) -> Option<Self> {
-        Some(match word {
-            "running" => Liveness::Running,
-            "completed" => Liveness::Done,
-            "failed" => Liveness::Failed,
-            "cancelled" => Liveness::Cancelled,
-            "timed out" => Liveness::TimedOut,
-            "gone" | "offline" => Liveness::Gone,
-            _ => return None,
-        })
-    }
-
     /// It will do nothing more: nothing to steer or cancel.
     pub fn ended(self) -> bool {
         matches!(self, Liveness::Done | Liveness::Failed | Liveness::Cancelled | Liveness::TimedOut | Liveness::Gone)
@@ -185,7 +153,8 @@ impl Status {
         }
     }
 
-    fn word(s: &str) -> Option<Self> {
+    /// The daemon's status word (a row's, a watch page's).
+    pub fn word(s: &str) -> Option<Self> {
         Some(match s {
             "running" => Status::Running,
             "completed" => Status::Done,
@@ -269,17 +238,23 @@ impl Worker {
         !self.ended() || (sure && self.guessed)
     }
 
+    /// A guessed end that a sure source corrects.
+    fn corrects(&self, s: Status, sure: bool) -> bool {
+        self.status.is_some_and(|c| c.terminal() && s.terminal() && sure && self.guessed)
+    }
+
     /// A weaker source never overrides a stronger one, and an end is
     /// final, unless it was a guess and a sure source says how it ended.
+    fn may_take(&self, s: Status, sure: bool) -> bool {
+        self.corrects(s, sure) || self.status.is_none_or(|c| !c.terminal() && c.rank() <= s.rank())
+    }
+
     fn set_status(&mut self, s: Status, reason: Option<String>, sure: bool) {
-        if let Some(c) = self.status {
-            let correct = c.terminal() && s.terminal() && sure && self.guessed;
-            if !correct && (c.terminal() || c.rank() > s.rank()) {
-                return;
-            }
-            if correct {
-                self.reason = None;
-            }
+        if !self.may_take(s, sure) {
+            return;
+        }
+        if self.corrects(s, sure) {
+            self.reason = None;
         }
         self.status = Some(s);
         self.guessed = s.terminal() && !sure;
@@ -817,6 +792,26 @@ impl Subagents {
         out.sort_by_key(|l| l.id);
         out.dedup_by_key(|l| l.id);
         out
+    }
+
+    /// Worker `id`'s own pages (its view, polled from the daemon) say
+    /// `status`: a live source, as its rows are, so the list holds the one
+    /// state a worker has (a re-attach's demoted start is lifted by its
+    /// next page; how it ended may come first from its pages). The caller
+    /// has checked the view is of the worker `id` names now. A page's
+    /// "running" knows nothing of a cancel on its way: CANCELLING stays.
+    /// Whether it changed anything.
+    pub fn heard_page(&mut self, id: u64, status: Status) -> bool {
+        let held = match self.by_id.get(&id).and_then(|t| self.calls.get(t)) {
+            Some(c) => Some(&c.w),
+            None => self.orphans.get(&id),
+        };
+        let cancelling = held.is_some_and(|w| w.status == Some(Status::Cancelling));
+        if held.is_some_and(|w| w.status == Some(status) || !w.may_take(status, true)) || (cancelling && status == Status::Running) {
+            return false;
+        }
+        self.update(id, |w| w.set_status(status, None, true));
+        true
     }
 
     /// Worker `id`'s state, if known (the newest call's that has it).
@@ -1468,6 +1463,31 @@ mod tests {
     }
     fn word(s: &Subagents, id: &str) -> Option<&'static str> {
         s.view(id).map(|v| state(v).0)
+    }
+
+    /// Its view's pages are a live source of the list (Shady M2): a
+    /// re-attach's start is lifted, how it ended may come first, an end
+    /// stays, and a cancel on its way stays CANCELLING.
+    #[test]
+    fn a_workers_pages_are_heard_by_its_list() {
+        let mut s = Subagents::default();
+        tool_use(&mut s, "t1", "subagent_start", json!({"agent": "scout", "task": "look"}));
+        result(&mut s, "t1", &handle(1, "scout"));
+        rows(&mut s, json!([row(1, "scout", json!("running"), 3.0, None, "ls", 1)]));
+        s.reattached();
+        assert_eq!(s.status(1), Some(Status::Started), "demoted until heard again");
+        assert!(s.heard_page(1, Status::Running));
+        assert_eq!(s.status(1), Some(Status::Running));
+        assert!(!s.heard_page(1, Status::Running), "the same word changes nothing (4 pages a second)");
+        let mut cancel = row(1, "scout", json!("running"), 4.0, None, "ls", 1);
+        cancel["cancel_requested"] = json!(true);
+        rows(&mut s, json!([cancel]));
+        assert_eq!(s.status(1), Some(Status::Cancelling));
+        assert!(!s.heard_page(1, Status::Running), "a page's running knows nothing of the cancel");
+        assert_eq!(s.status(1), Some(Status::Cancelling));
+        assert!(s.heard_page(1, Status::Cancelled), "its pages said how it ended first");
+        assert_eq!(s.status(1), Some(Status::Cancelled));
+        assert!(!s.heard_page(1, Status::Running) && s.status(1) == Some(Status::Cancelled), "ended stays ended");
     }
 
     /// What the hover card and the menu read: the task's first lines (the

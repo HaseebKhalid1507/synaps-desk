@@ -59,6 +59,10 @@ pub const MARK: f64 = 3.0;
 pub const SURFACE: f64 = 1.10;
 /// A step up a surface (`raised` off the chrome, `card_hi` off the card).
 pub const STEP: f64 = 1.14;
+/// A region divider (`hybrid.html` `--line`).
+pub const HAIR: f64 = 1.14;
+/// A control's outline (`--line2`).
+pub const EDGE: f64 = 1.27;
 /// An overlay's outline and a control's on a card (`hybrid.html` `--line3`).
 pub const FRAME: f64 = 1.56;
 
@@ -300,9 +304,15 @@ macro_rules! roles {
 
         impl Palette {
             pub fn of(r: &Roles) -> Self {
-                Palette { $($name: hsla(r.$name),)* sel: hsla(r.focus).opacity(0.35) }
+                // The selection wash is see-through: the text under it reads.
+                Palette { $($name: hsla(r.$name),)* sel: Hsla { a: 0.35, ..hsla(r.focus) } }
             }
         }
+
+        /// Every role's name, in order (the tests find each in the
+        /// [`Check`] log).
+        #[cfg(test)]
+        pub const ROLE_NAMES: &[&str] = &[$(stringify!($name)),*];
     };
 }
 
@@ -332,6 +342,9 @@ roles! {
     // the watched tray row), bullets, state glyphs and borders, focus, the
     // table rule, the two filled buttons.
     you_mark, you_mark_t, bullet, warn_mark, run_mark, focus, tb2, btn_fill, warn_fill,
+    // The filled buttons' hover (a step toward the ink); a scrollbar's
+    // thumb at rest on the canvas, the chrome and the user surface.
+    btn_hi, warn_hi, thumb, thumb_ch, thumb_u,
     // The chrome, on `bg` and the raised row: text, then marks.
     prose_ch, dim_ch, header, warn_ch, run_ch, unread_ch, open_ch, ready_ch, err_ch, cost_ch, ok_ch, edit_ch, write_ch, bash_ch,
     sub_name, sub_status, sub_done, sub_time,
@@ -342,6 +355,41 @@ roles! {
 }
 
 impl Palette {
+    /// The chrome's numbers as last seen, not live (the right panel
+    /// detached, or a cached tab opening): every chrome text role in
+    /// `dim_ch`, every chrome mark in `rest_mark` (it was `opacity(0.45)`).
+    pub fn faded(&self) -> Palette {
+        let (t, m) = (self.dim_ch, self.rest_mark);
+        Palette {
+            ink: t,
+            prose_ch: t,
+            header: t,
+            warn_ch: t,
+            run_ch: t,
+            unread_ch: t,
+            open_ch: t,
+            ready_ch: t,
+            err_ch: t,
+            cost_ch: t,
+            ok_ch: t,
+            edit_ch: t,
+            write_ch: t,
+            bash_ch: t,
+            sub_name: t,
+            sub_status: t,
+            sub_done: t,
+            sub_time: t,
+            warn_mark_ch: m,
+            run_mark_ch: m,
+            unread_mark_ch: m,
+            focus_ch: m,
+            ready_mark_ch: m,
+            err_mark_ch: m,
+            you_bar: m,
+            ..*self
+        }
+    }
+
     /// Chart series `i`: `s1`–`s5`, then `s_rest`.
     pub fn series(&self, i: usize) -> Hsla {
         [self.s1, self.s2, self.s3, self.s4, self.s5].get(i).copied().unwrap_or(self.s_rest)
@@ -419,29 +467,28 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
         let c = lift(t.thinking_color, t.claude_text, g, TEXT);
         f.text(role, c, g)
     };
-    let mut r = Roles {
-        chrome,
-        canvas,
-        user,
-        code,
-        tool,
-        tool_out,
-        card,
-        card_hi,
-        raised,
-        hair: t.separator,
-        edge: t.border,
-        add_bg,
-        del_bg,
-        ..Roles::default()
-    };
+    let mut r = Roles { chrome, canvas, user, code, tool, tool_out, card, card_hi, raised, add_bg, del_bg, ..Roles::default() };
     for (role, from, c) in [("add_bg", tool_out, add_bg), ("del_bg", tool_out, del_bg)] {
         f.log.push(Check { role, from, color: c, grounds: vec![tool_out], floor: SURFACE });
     }
     f.log.push(Check { role: "card_hi", from: card, color: card_hi, grounds: vec![card], floor: STEP });
+    // The ladder (design.md §1.4): a run and its open body off the canvas,
+    // the card and the raised row off the chrome.
+    for (role, from, c, ground, floor) in [
+        ("tool", t.tool_input_bg.unwrap_or(canvas), tool, canvas, SURFACE),
+        ("tool_out", t.tool_output_bg.unwrap_or(canvas), tool_out, canvas, SURFACE),
+        ("card", chrome, card, chrome, 1.32),
+        ("raised", chrome, raised, chrome, STEP),
+    ] {
+        f.log.push(Check { role, from, color: c, grounds: vec![ground], floor });
+    }
     // The composer foot's state is on `user` (design.md §4.4); the card's
     // hovered rows on `card_hi`.
     let k = [card, card_hi];
+    // Lines (design.md §1.3): dividers on the chrome and the canvas;
+    // control outlines there and on the user surface.
+    r.hair = f.at("hair", t.separator, ink, &[canvas, chrome], HAIR);
+    r.edge = f.at("edge", t.border, ink, &[canvas, chrome, user], EDGE);
     r.frame = f.at("frame", t.border, ink, &[card, card_hi, canvas, chrome, tool_out], FRAME);
     r.ink = f.text("ink", ink, &[canvas, user, tool_out, chrome, raised, add_bg, del_bg, card, card_hi]);
     r.prose = f.text("prose", t.claude_text, &[canvas]);
@@ -522,6 +569,12 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     for (role, c) in [("btn_fill", r.btn_fill), ("warn_fill", r.warn_fill)] {
         f.log.push(Check { role, from: c, color: c, grounds: vec![user, card], floor: MARK });
     }
+    // Hovered, a step toward the ink: the label (`chrome`) reads on it still.
+    r.btn_hi = step(r.btn_fill, ink, STEP);
+    r.warn_hi = step(r.warn_fill, ink, STEP);
+    for (role, from, c) in [("btn_hi", r.btn_fill, r.btn_hi), ("warn_hi", r.warn_fill, r.warn_hi)] {
+        f.log.push(Check { role, from, color: c, grounds: vec![chrome], floor: TEXT });
+    }
     r.prose_ch = f.text("prose_ch", t.claude_text, &ch);
     r.dim_ch = f.text("dim_ch", t.muted, &ch);
     r.header = f.text("header", t.header_fg, &ch);
@@ -548,6 +601,15 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.err_mark_ch = f.mark("err_mark_ch", t.error_color, &ch);
     r.rest_mark = f.mark("rest_mark", t.muted, &ch);
     r.you_bar = f.mark("you_bar", you, &ch);
+    // A thumb at rest: its ground's dim text, 55 % of the way off the
+    // ground (what `opacity(0.55)` painted). It stands off the ground as a
+    // divider does.
+    [r.thumb, r.thumb_ch, r.thumb_u] = [mix(canvas, r.dim, 0.55), mix(chrome, r.dim_ch, 0.55), mix(user, r.dim_u, 0.55)];
+    for (role, ground, from, c) in
+        [("thumb", canvas, r.dim, r.thumb), ("thumb_ch", chrome, r.dim_ch, r.thumb_ch), ("thumb_u", user, r.dim_u, r.thumb_u)]
+    {
+        f.log.push(Check { role, from, color: c, grounds: vec![ground], floor: HAIR });
+    }
     // Series: five theme colours at the mark floor on the canvas; one that
     // lands within 1.25:1 of an earlier one is mixed 40 % toward the ink.
     // Warning and error colours are never series (they keep their meaning).
@@ -859,7 +921,7 @@ fn sync_kit(p: &Palette, r: &Roles, cx: &mut App) {
         c.secondary_foreground = p.ink;
         c.accent = p.raised;
         c.accent_foreground = p.ink;
-        c.popover = p.chrome;
+        c.popover = p.card;
         c.popover_foreground = p.ink;
         c.primary = p.focus;
         c.primary_hover = p.focus;
@@ -1242,7 +1304,9 @@ mod tests {
         assert_eq!((r.chrome, r.canvas, r.user), (0x101216, 0x07080a, 0x16191e));
         assert_eq!(r.code, 0x151618, "code_bg lifted off the canvas");
         assert_eq!((r.tool, r.tool_out, r.card), (0x191a1d, 0x242629, 0x292b30));
-        assert_eq!((r.hair, r.edge), (0x1c2028, 0x232832));
+        // `edge` lifted to 1.27 (design.md §1.6); `hair` already stands 1.14 off.
+        assert_eq!((r.hair, r.edge), (0x1c2028, 0x292e38));
+        assert_eq!(r.btn_hi, 0x8facc8);
         assert_eq!((r.ink, r.prose, r.you, r.agent), (0xeceff4, 0xd8dee9, 0x81a1c1, 0x88c0d0));
         assert_eq!((r.think, r.dim), (0x868e9e, 0x707889));
         assert_eq!((r.warn, r.run, r.cost), (0xebcb8b, 0xa3be8c, 0xa3be8c));
@@ -1317,11 +1381,23 @@ mod tests {
         println!("{}", report.join("\n"));
     }
 
+    /// Every role is in the `Check` log (so the floor test covers it), but
+    /// the two grounds a theme gives as they are.
+    #[test]
+    fn every_role_is_checked() {
+        for (name, raw) in palettes::THEMES {
+            let (_, checks) = resolve(&raw, None);
+            for role in super::ROLE_NAMES.iter().filter(|r| !["canvas", "chrome"].contains(r)) {
+                assert!(checks.iter().any(|c| c.role == *role), "{name}: {role} has no floor in the log");
+            }
+        }
+    }
+
     /// The accent replaces `prompt_fg` and `border_active` only: no state
     /// colour moves with it.
     #[test]
     fn the_accent_colours_you_and_focus_only() {
-        let allowed = ["you", "you_mark", "you_mark_t", "btn_fill", "focus", "focus_ch", "focus_k", "open_ch", "you_bar"];
+        let allowed = ["you", "you_mark", "you_mark_t", "btn_fill", "btn_hi", "focus", "focus_ch", "focus_k", "open_ch", "you_bar"];
         for (name, raw) in palettes::THEMES {
             let (a, base) = resolve(&raw, None);
             for &(_, accent) in PRESETS {
