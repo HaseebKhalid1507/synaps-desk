@@ -239,6 +239,8 @@ pub(crate) struct Site {
     pub(crate) mask: ContentMask<Pixels>,
     pub(crate) mark: Hsla,
     pub(crate) ground: Hsla,
+    /// The ink a scan's beam is lit toward ([`crate::glyph::beam`]).
+    pub(crate) ink: Hsla,
     pub(crate) beat: Beat,
 }
 
@@ -342,6 +344,8 @@ impl Slide {
 /// the last frame: nothing grows with history).
 pub(crate) struct Motion {
     level: Cell<Level>,
+    /// The palette's ink, as of the frame ([`crate::glyph::beam`]).
+    ink: Cell<Hsla>,
     ambient: Cell<bool>,
     visible: Cell<bool>,
     now: Cell<Instant>,
@@ -394,6 +398,7 @@ impl Motion {
     pub(crate) fn new(epoch: Instant) -> Self {
         Motion {
             level: Cell::new(Level::Full),
+            ink: Cell::new(Hsla::default()),
             ambient: Cell::new(true),
             visible: Cell::new(true),
             now: Cell::new(epoch),
@@ -447,6 +452,15 @@ impl Motion {
 
     pub(crate) fn level(&self) -> Level {
         self.level.get()
+    }
+
+    /// The palette's ink, set as a frame begins (a scan's beam).
+    pub(crate) fn set_ink(&self, ink: Hsla) {
+        self.ink.set(ink);
+    }
+
+    pub(crate) fn ink(&self) -> Hsla {
+        self.ink.get()
     }
 
     /// Motion is on at all (not [`Level::Off`]).
@@ -783,9 +797,8 @@ impl Motion {
             match s.beat {
                 Beat::Scan(g) => {
                     wants = true;
-                    let line = crate::glyph::scan_line(s.mark, s.ground);
-                    for (x, y, w) in crate::glyph::scan_rows(g, beat) {
-                        quad(x, y, w, 1., line, window);
+                    for (x, y, w, c) in crate::glyph::beam_rows(g, beat, s.mark, s.ink) {
+                        quad(x, y, w, 1., c, window);
                     }
                 }
                 Beat::Breath(at) => {
@@ -1118,6 +1131,48 @@ mod tests {
         }
         assert!(low >= 4.5, "{low}");
         assert!(worst < 0.06, "the drain moved a contrast by {worst:.3}");
+    }
+
+    /// The `roles_check` step for the soul (amendments 14, 15): the scan's
+    /// beam and its afterglow are a running glyph's light, so they hold
+    /// the mark floor (3:1) on every ground a running glyph is drawn on;
+    /// a drawing bar's hot head holds it on the run surface, for every
+    /// tool's hue and thinking's; in every theme and accent. The bloom is
+    /// the lit bar's glow beside it (decoration: the bar is the state).
+    #[test]
+    fn the_beam_and_the_head_keep_the_mark_floor() {
+        use crate::glyph::{BEAM, GLOW};
+        use crate::theme::{contrast, mix, resolve};
+        let mut low = f64::MAX;
+        for (name, raw) in crate::palettes::THEMES {
+            for accent in [None, Some(0xe8132f), Some(0xf4b400), Some(0x2d7bff), Some(0x35f2ff)] {
+                let r = resolve(&raw, accent).0;
+                let marks = [
+                    (r.run_mark, vec![r.canvas, r.tool, r.tool_out, r.user], "run_mark"),
+                    (r.run_mark_ch, vec![r.chrome], "run_mark_ch"),
+                    (r.run_mark_k, vec![r.card, r.card_hi], "run_mark_k"),
+                ];
+                for (mark, grounds, what) in marks {
+                    for k in [BEAM, GLOW] {
+                        let c = mix(mark, r.ink, f64::from(k));
+                        for g in &grounds {
+                            let x = contrast(c, *g);
+                            low = low.min(x);
+                            assert!(x >= 3., "{name} {accent:?}: {what}'s beam at {k}: {x:.2}");
+                        }
+                    }
+                }
+                for hue in [r.t_bash, r.t_read, r.t_write, r.t_edit, r.t_grep, r.t_find, r.t_ls, r.t_sub, r.t_ext, r.t_gen, r.think] {
+                    let lit = mix(hue, r.ink, 0.30);
+                    for bar in [hue, lit] {
+                        let x = contrast(mix(bar, r.ink, f64::from(crate::turns::HEAD)), r.tool);
+                        low = low.min(x);
+                        assert!(x >= 3., "{name} {accent:?}: a bar's head: {x:.2}");
+                    }
+                }
+            }
+        }
+        assert!(low >= 3., "{low}");
     }
 
     #[test]

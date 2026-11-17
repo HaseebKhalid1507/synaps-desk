@@ -1491,6 +1491,54 @@ fn running_tools(cx: &mut TestAppContext, view: &Entity<AppView>, n: usize) {
     cx.run_until_parked();
 }
 
+/// Soul B (motion.md §10 amendment 15): a running call's lit bar blooms,
+/// a 1 px column beside it in the row's padding (nothing moves: the
+/// bloom is an absolute child); Off has none; it is gone once the bar
+/// has settled after the call ends.
+#[gpui_kit::test]
+fn a_running_bar_blooms_until_it_settles(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open_at(cx, (1440., 1800.), crate::theme::Panels::default().text_size);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    // Read off a frame of the app's own (a beat may have replayed it).
+    let blooms = |cx: &mut TestAppContext| {
+        view.update(cx, |_, cx| cx.notify());
+        cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+        cx.run_until_parked();
+        VisualTestContext::from_window(w, cx).debug_bounds("bar-bloom")
+    };
+    // The demo's own calls have ended: nothing blooms.
+    for _ in 0..6 {
+        beat(cx, w, &view);
+    }
+    assert!(blooms(cx).is_none(), "no call runs: no bloom");
+    running_tools(cx, &view, 1);
+    for _ in 0..4 {
+        beat(cx, w, &view);
+    }
+    let b = blooms(cx).expect("the running call's bar blooms");
+    assert_eq!(b.size.width, gpui_kit::px(1.), "1 px");
+    set_motion(cx, &view, crate::motion::Level::Off);
+    settle(cx, w, 4);
+    assert!(blooms(cx).is_none(), "Off: the static app, no bloom");
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    assert!(blooms(cx).is_some(), "lit again");
+    view.update(cx, |v, cx| {
+        v.model.transcript.apply(&SessionEvent::Stream {
+            event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "ok".into() }),
+        });
+        v.sync_list();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    // (Its light decays over SLOW on the wall clock: not sampled mid-way.)
+    for _ in 0..5 {
+        beat(cx, w, &view);
+    }
+    assert!(blooms(cx).is_none(), "settled to its hue: the bloom is gone");
+}
+
 /// One beat goes by: the motion clock and the executor's move on together,
 /// a millisecond at a time (the one timer fires when it is due, as it
 /// would), and what it drew settles.

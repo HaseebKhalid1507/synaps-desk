@@ -5203,6 +5203,7 @@ impl Render for AppView {
         }
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
+        self.fx.set_ink(p.ink);
         // Settings or Usage came on screen (or one closed): after this
         // frame, never inside it, what it shows is asked for if stale.
         let view = self.model.tabs.view();
