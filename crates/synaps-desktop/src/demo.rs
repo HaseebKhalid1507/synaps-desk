@@ -567,7 +567,7 @@ fn attach_sid(attach_seq: u64) -> Vec<Event> {
             "model": "anthropic/claude-sonnet-4-5"}]});
     for (seq, raw) in [(1, usage), (2, subagents)] {
         if let Ok(event) = decode_event(&raw) {
-            out.push(Event::Session { attach_seq, session_id: SID.into(), seq, ts: String::new(), event, raw: Arc::new(raw) });
+            out.push(Event::session(attach_seq, SID, seq, event, Arc::new(raw)));
         }
     }
     out
@@ -654,7 +654,7 @@ mod tests {
         for ev in attach(IDLE_CPU, 1) {
             m.apply(ev);
         }
-        let rows = crate::turns::build(m.transcript.items(), 0, false, &Default::default(), &Default::default());
+        let rows = crate::turns::build(m.transcript.items(), &|_| None, 0, false, &Default::default(), &Default::default());
         let runs: Vec<usize> = rows
             .iter()
             .filter_map(|d| match d.kind {

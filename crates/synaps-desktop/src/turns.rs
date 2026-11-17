@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::NaiveDate;
 use gpui_kit::base::TextViewState;
 use gpui_kit::base::text::TextView;
 use gpui_kit::component::{h_flex, v_flex};
@@ -372,16 +373,25 @@ fn live_call(x: &Item, subs: &Subagents) -> bool {
 /// The display rows of `items[from..]` (`from`: a turn's start, or 0).
 /// `busy`: a turn is running, so a run at the very end is live; `open`:
 /// the runs the user unfolded (by their first item's id); `subs`: a run
-/// holding a running subagent's call is live too.
-pub(crate) fn build(items: &[Item], from: usize, busy: bool, open: &HashSet<u64>, subs: &Subagents) -> Vec<Disp> {
+/// holding a running subagent's call is live too; `day`: item `i`'s date
+/// (its row strings', `RowCache::time`), for the day lines.
+pub(crate) fn build(
+    items: &[Item],
+    day: &dyn Fn(usize) -> Option<NaiveDate>,
+    from: usize,
+    busy: bool,
+    open: &HashSet<u64>,
+    subs: &Subagents,
+) -> Vec<Disp> {
     let mut out = Vec::new();
     let mut agent = from > 0 && items[from].kind != ItemKind::User;
     let mut i = from;
     let gap = |i: usize| if i == 0 { Gap::First } else { Gap::Part };
-    let mut days = crate::times::Days::after(&items[..from.min(items.len())]);
+    let day = |i: usize| if items[i].is_note() { None } else { day(i) };
+    let mut days = crate::times::Days::after((0..from.min(items.len())).rev().find_map(day));
     while i < items.len() {
         let it = &items[i];
-        if let Some(day) = days.next(it) {
+        if let Some(day) = days.next(day(i)) {
             // Its gap is the row's under it, which then sits a part below.
             out.push(Disp {
                 item: i,
@@ -411,10 +421,10 @@ pub(crate) fn build(items: &[Item], from: usize, busy: bool, open: &HashSet<u64>
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 while let Some(x) = items.get(end).filter(|x| matches!(x.kind, ItemKind::Thinking | ItemKind::Tool)) {
                     // A run that crosses midnight is two: the day line between.
-                    if end > start && days.turns(x) {
+                    if end > start && days.starts_day(day(end)) {
                         break;
                     }
-                    days.next(x);
+                    days.next(day(end));
                     if x.kind == ItemKind::Tool {
                         tools += 1;
                         done &= !live_call(x, subs);
@@ -484,29 +494,29 @@ pub(crate) fn diff(old: &[Disp], new: &[Disp]) -> Option<(std::ops::Range<usize>
 }
 
 /// A labelled row's time (`crate::times`): local `HH:MM` in `m.meta` mono,
-/// `dim`; the date and seconds in its tooltip. Static text: it never
-/// animates (a history row's least of all).
-fn time_slot(t: chrono::DateTime<chrono::Local>, id: u64, p: &Palette, m: &Metrics) -> Stateful<Div> {
-    let tip: SharedString = crate::times::readout(t).into();
-    mono(crate::times::hhmm(t), m.meta, p.dim)
+/// `dim`; the date and seconds in its tooltip, made when that opens.
+/// Static text: it never animates (a history row's least of all).
+fn time_slot(t: &crate::times::Stamp, id: u64, p: &Palette, m: &Metrics) -> Stateful<Div> {
+    let at = t.clone();
+    mono(t.hhmm.clone(), m.meta, p.dim)
         .line_height(px(m.mono_line))
         .id(("time", id))
         .debug_selector(move || format!("time {id}"))
-        .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
+        .tooltip(move |window, cx| crate::overlay::tip(at.readout(), window, cx))
 }
 
 /// A day line (`crate::times::Days`): the date in `m.meta` mono, `dim`,
 /// between two `hair` rules, across the column.
-fn day_line(item: &Item, p: &Palette, m: &Metrics) -> AnyElement {
-    let Some(t) = crate::times::of(item) else { return div().into_any_element() };
-    let (id, rule) = (item.id, || div().flex_1().h(px(1.)).bg(p.hair));
+fn day_line(d: Disp, p: &Palette, m: &Metrics) -> AnyElement {
+    let Some(day) = crate::times::day_of(d.rev) else { return div().into_any_element() };
+    let (id, rule) = (d.id & !DAY_ID, || div().flex_1().h(px(1.)).bg(p.hair));
     h_flex()
         .w_full()
         .gap(px(m.run_gap))
         .items_center()
         .debug_selector(move || format!("day {id}"))
         .child(rule())
-        .child(mono(crate::times::day_label(t.date_naive()), m.meta, p.dim).line_height(px(m.mono_line)))
+        .child(mono(crate::times::day_label(day), m.meta, p.dim).line_height(px(m.mono_line)))
         .child(rule())
         .into_any_element()
 }
@@ -977,7 +987,7 @@ impl AppView {
             }
             Kind::Summary { open, .. } => self.render_summary(d, open, &p, &m, cx),
             Kind::Work => self.render_work(item, row, d.id, &p, &m, lay, cx),
-            Kind::Day => day_line(item, &p, &m),
+            Kind::Day => day_line(d, &p, &m),
         };
         let who = match d.who {
             Who::None => None,
@@ -997,7 +1007,7 @@ impl AppView {
             let id = d.id;
             let l = display(text, m.label, color).line_height(px(m.body_line)).debug_selector(move || format!("label {id}"));
             // Its time: under it in the margin, or at the line's end.
-            let time = crate::times::of(item).map(|t| time_slot(t, d.id, &p, &m));
+            let time = row.time.as_ref().map(|t| time_slot(t, d.id, &p, &m));
             if lay.hang {
                 // The label and its time hang in the gutter, outside the
                 // row's reveal clip (`RowParts::label`).
@@ -1011,7 +1021,8 @@ impl AppView {
         // The write head (motion.md §6.1): where the agent is writing, the
         // streaming row's bottom-left in the gutter; lit while deltas come,
         // decaying once they stop. Touches no text.
-        let head = (d.item + 1 == items.len() && matches!(item.kind, ItemKind::Assistant | ItemKind::Thinking))
+        // Not on a day line over it (they share the item).
+        let head = (d.kind != Kind::Day && d.item + 1 == items.len() && matches!(item.kind, ItemKind::Assistant | ItemKind::Thinking))
             .then(|| self.fx.change(Tag::Stream, item.id, item.text.len() as u64, self.fx.birth(item.id)))
             .flatten()
             .map(|(at, _)| self.fx.decay(Some(at), motion::HEAD_HOLD, motion::GLOW))
@@ -1600,11 +1611,27 @@ mod tests {
 
     use super::{
         Counts, DAY_ID, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, Tally,
-        TextRows, Who, build, diff, digits, plus, tally_fit, text_lines, text_w, turn_start,
+        TextRows, Who, diff, digits, plus, tally_fit, text_lines, text_w, turn_start,
     };
     use crate::files::{CallDelta, Ledger};
     use crate::subagents::Subagents;
+    use crate::times::{Stamp, utc_in, zones};
+    use chrono::FixedOffset;
     use synaps_client::Transcript;
+    use synaps_client::protocol::SessionEvent;
+    use synaps_client::transcript::Item;
+
+    /// [`super::build`], each row's date read in `tz` (as `RowCache::time`
+    /// reads it in the local zone).
+    fn build_in(tz: &FixedOffset, items: &[Item], from: usize, busy: bool, open: &HashSet<u64>, subs: &Subagents) -> Vec<Disp> {
+        let day = |i: usize| items[i].at.as_deref().and_then(|a| Stamp::in_zone(a, tz)).map(|t| t.day());
+        super::build(items, &day, from, busy, open, subs)
+    }
+
+    /// [`build_in`] UTC.
+    fn build(items: &[Item], from: usize, busy: bool, open: &HashSet<u64>, subs: &Subagents) -> Vec<Disp> {
+        build_in(&FixedOffset::east_opt(0).unwrap(), items, from, busy, open, subs)
+    }
 
     fn transcript(msgs: &[serde_json::Value]) -> Transcript {
         let mut t = Transcript::new();
@@ -1714,91 +1741,142 @@ mod tests {
     /// day), none for a legacy row. A session resumed the next day and a
     /// compaction summary dated later get theirs. The line takes the gap of
     /// the row under it, which sits a part below; a rebuild from any turn
-    /// agrees with a full build.
+    /// agrees with a full build. In zones west and east of UTC: a local day
+    /// spans two UTC dates (no line), and a local midnight can fall inside
+    /// one (a line).
     #[test]
     fn a_day_line_where_the_local_date_changes() {
-        use crate::times::{day_number, utc_of};
-        let d1 = |h, mi| utc_of(2026, 11, 13, h, mi, 0);
-        let d2 = |h, mi| utc_of(2026, 11, 14, h, mi, 0);
-        let d3 = |h, mi| utc_of(2026, 11, 20, h, mi, 0);
-        let text = |t: &str| json!({"role": "assistant", "content": [{"type": "text", "text": t}]});
-        let m = vec![
-            json!({"role": "user", "content": "from before message times"}),
-            text("legacy"),
-            dated(json!({"role": "user", "content": "first dated"}), d1(23, 58)),
-            dated(text("late"), d1(23, 59)),
-            dated(json!({"role": "user", "content": "resumed the next morning"}), d2(9, 12)),
-            dated(text("morning"), d2(9, 13)),
-            dated(json!({"role": "user", "content": "<context-summary>what came before</context-summary>"}), d3(8, 0)),
-            dated(json!({"role": "user", "content": "after the compaction"}), d3(8, 1)),
-            dated(text("same day"), d3(8, 2)),
-        ];
-        let t = transcript(&m);
-        assert!(t.items()[..2].iter().all(|i| crate::times::of(i).is_none()), "legacy rows have no time");
-        let rows = build(t.items(), 0, false, &HashSet::new(), &Subagents::default());
-        assert_eq!(kinds(&rows), ["user", "prose", "user", "prose", "day", "user", "prose", "day", "note", "user", "prose"]);
-        let (day, under) = (rows[4], rows[5]);
-        assert_eq!((day.item, day.id, day.who), (under.item, under.id | DAY_ID, Who::None));
-        assert_eq!((day.gap, under.gap), (Gap::Turn, Gap::Part), "the line takes the turn's gap");
-        assert_eq!(day.rev, day_number(chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap()));
-        assert_eq!((rows[7].gap, rows[8].gap), (Gap::Part, Gap::Part), "a note's part gap, then a part");
-        for k in 0..t.len() {
-            let from = rows.partition_point(|d| d.item < turn_start(t.items(), k));
-            let part = build(t.items(), turn_start(t.items(), k), false, &HashSet::new(), &Subagents::default());
-            assert_eq!(&rows[from..], &part[..], "rebuilt from item {k}'s turn");
+        use crate::times::day_number;
+        for tz in zones() {
+            let d1 = |h, mi| utc_in(&tz, 2026, 11, 13, h, mi, 0);
+            let d2 = |h, mi| utc_in(&tz, 2026, 11, 14, h, mi, 0);
+            let d3 = |h, mi| utc_in(&tz, 2026, 11, 20, h, mi, 0);
+            let text = |t: &str| json!({"role": "assistant", "content": [{"type": "text", "text": t}]});
+            let m = vec![
+                json!({"role": "user", "content": "from before message times"}),
+                text("legacy"),
+                dated(json!({"role": "user", "content": "first dated"}), d1(0, 30)),
+                dated(text("late"), d1(23, 30)),
+                dated(json!({"role": "user", "content": "resumed the next morning"}), d2(0, 30)),
+                dated(text("morning"), d2(0, 31)),
+                dated(json!({"role": "user", "content": "<context-summary>what came before</context-summary>"}), d3(8, 0)),
+                dated(json!({"role": "user", "content": "after the compaction"}), d3(8, 1)),
+                dated(text("same day"), d3(8, 2)),
+            ];
+            let utc = |at: &str| at[..10].to_string();
+            assert_ne!(utc(&d1(0, 30)), utc(&d1(23, 30)), "{tz}: one local day, two UTC dates");
+            assert_eq!(utc(&d1(23, 30)), utc(&d2(0, 30)), "{tz}: a local midnight inside one UTC date");
+            let t = transcript(&m);
+            assert!(t.items()[..2].iter().all(|i| i.at.is_none()), "legacy rows have no time");
+            let rows = build_in(&tz, t.items(), 0, false, &HashSet::new(), &Subagents::default());
+            assert_eq!(kinds(&rows), ["user", "prose", "user", "prose", "day", "user", "prose", "day", "note", "user", "prose"], "{tz}");
+            let (day, under) = (rows[4], rows[5]);
+            assert_eq!((day.item, day.id, day.who), (under.item, under.id | DAY_ID, Who::None));
+            assert_eq!((day.gap, under.gap), (Gap::Turn, Gap::Part), "the line takes the turn's gap");
+            assert_eq!(day.rev, day_number(chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap()), "{tz}");
+            assert_eq!((rows[7].gap, rows[8].gap), (Gap::Part, Gap::Part), "a note's part gap, then a part");
+            for k in 0..t.len() {
+                let from = rows.partition_point(|d| d.item < turn_start(t.items(), k));
+                let part = build_in(&tz, t.items(), turn_start(t.items(), k), false, &HashSet::new(), &Subagents::default());
+                assert_eq!(&rows[from..], &part[..], "rebuilt from item {k}'s turn");
+            }
+            // Nothing dated: no line, whatever the history.
+            let legacy: Vec<serde_json::Value> = m
+                .into_iter()
+                .map(|mut m| {
+                    m.as_object_mut().unwrap().remove("_synaps_at");
+                    m
+                })
+                .collect();
+            let t = transcript(&legacy);
+            assert!(build_in(&tz, t.items(), 0, false, &HashSet::new(), &Subagents::default()).iter().all(|d| d.kind != Kind::Day));
         }
-        // Nothing dated: no line, whatever the history.
-        let legacy: Vec<serde_json::Value> = m
-            .into_iter()
-            .map(|mut m| {
-                m.as_object_mut().unwrap().remove("_synaps_at");
-                m
-            })
-            .collect();
-        let t = transcript(&legacy);
-        assert!(build(t.items(), 0, false, &HashSet::new(), &Subagents::default()).iter().all(|d| d.kind != Kind::Day));
+    }
+
+    /// Only messages move the day: a client note (dated by the event it
+    /// came in, placed after its round's messages, which the daemon dates
+    /// at the round's end) draws no line back and forth.
+    #[test]
+    fn a_note_never_moves_the_day() {
+        for tz in zones() {
+            let (d1, d2) = (|h, mi, s| utc_in(&tz, 2026, 11, 13, h, mi, s), |h, mi, s| utc_in(&tz, 2026, 11, 14, h, mi, s));
+            let mut t = transcript(&[
+                dated(json!({"role": "user", "content": "go"}), d1(23, 50, 0)),
+                dated(json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}), d2(0, 0, 2)),
+            ]);
+            t.apply_at(&SessionEvent::SystemNotice { text: "a note from the round".into() }, &d1(23, 59, 58));
+            let next = SessionEvent::TurnStarted { turn_baseline: 2, trigger: "user".into(), user_text: Some("more".into()) };
+            t.apply_at(&next, &d2(0, 1, 0));
+            assert!(t.items()[2].is_note() && t.items()[2].at.is_some());
+            let rows = build_in(&tz, t.items(), 0, true, &HashSet::new(), &Subagents::default());
+            assert_eq!(kinds(&rows), ["user", "day", "prose", "note", "user"], "{tz}");
+        }
     }
 
     /// A run that crosses midnight is two, the day line between: its rows
     /// keep their order and the turn its one AGENT.
     #[test]
     fn a_run_across_midnight_splits_at_the_day_line() {
-        use crate::times::utc_of;
-        let mut m = vec![dated(json!({"role": "user", "content": "go"}), utc_of(2026, 11, 13, 23, 50, 0))];
-        for (id, at) in [("a", utc_of(2026, 11, 13, 23, 59, 0)), ("b", utc_of(2026, 11, 14, 0, 1, 0))] {
-            let (call, result) = tool(id, "bash");
-            m.push(dated(call, at.clone()));
-            m.push(dated(result, at));
+        for tz in zones() {
+            let at = |d, h, mi| utc_in(&tz, 2026, 11, d, h, mi, 0);
+            let mut m = vec![dated(json!({"role": "user", "content": "go"}), at(13, 23, 50))];
+            for (id, at) in [("a", at(13, 23, 59)), ("b", at(14, 0, 1))] {
+                let (call, result) = tool(id, "bash");
+                m.push(dated(call, at.clone()));
+                m.push(dated(result, at));
+            }
+            m.push(dated(json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}), at(14, 0, 2)));
+            let t = transcript(&m);
+            let rows = build_in(&tz, t.items(), 0, false, &HashSet::new(), &Subagents::default());
+            assert_eq!(kinds(&rows), ["user", "work", "day", "work", "prose"], "{tz}");
+            assert_eq!(rows.iter().map(|d| d.who).collect::<Vec<_>>(), [Who::You, Who::Agent, Who::None, Who::None, Who::None]);
+            assert_eq!(rows.iter().map(|d| d.item).collect::<Vec<_>>(), [0, 1, 2, 2, 3]);
         }
-        m.push(dated(json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}), utc_of(2026, 11, 14, 0, 2, 0)));
-        let t = transcript(&m);
-        let rows = build(t.items(), 0, false, &HashSet::new(), &Subagents::default());
-        assert_eq!(kinds(&rows), ["user", "work", "day", "work", "prose"]);
-        assert_eq!(rows.iter().map(|d| d.who).collect::<Vec<_>>(), [Who::You, Who::Agent, Who::None, Who::None, Who::None]);
-        assert_eq!(rows.iter().map(|d| d.item).collect::<Vec<_>>(), [0, 1, 2, 2, 3]);
     }
 
-    /// A live row's time (its event's `ts`) becomes its message time when
-    /// the history lands: same id, same `rev`, same `HH:MM`, the same
-    /// display rows. Nothing flickers, nothing is re-measured.
+    /// The TUI's live rows: a row keeps the time it started streaming at
+    /// when its history lands, though the daemon dates the message when its
+    /// round ends (here 20 s later): across a minute, the AGENT label keeps
+    /// its `HH:MM`; across midnight, no day line comes late. A row first
+    /// seen in history (an attach, a resume) has the history's time.
     #[test]
-    fn a_live_time_becomes_the_history_time_unchanged() {
-        use crate::times::{hhmm, of, utc_of};
-        let at = utc_of(2026, 11, 16, 14, 5, 9);
-        let mut t = Transcript::new();
-        let started =
-            synaps_client::protocol::SessionEvent::TurnStarted { turn_baseline: 0, trigger: "user".into(), user_text: Some("go".into()) };
-        t.apply_at(&started, &at.replace('Z', ".794878606Z"));
-        let live = &t.items()[0];
-        let before = (live.id, live.rev, of(live).map(hhmm), live.at.clone());
-        let rows = build(t.items(), 0, true, &HashSet::new(), &Subagents::default());
-        t.apply_history(&[dated(json!({"role": "user", "content": "go"}), at.clone())]);
-        let it = &t.items()[0];
-        assert_eq!((it.id, it.rev, of(it).map(hhmm)), (before.0, before.1, Some("14:05".into())));
-        assert_eq!(before.2.as_deref(), Some("14:05"));
-        assert_eq!(it.at.as_deref(), Some(at.as_str()), "the history's time now");
-        assert_ne!(it.at, before.3);
-        assert_eq!(build(t.items(), 0, true, &HashSet::new(), &Subagents::default()), rows);
+    fn a_live_time_stays_when_the_history_lands() {
+        let text = |t: &str| {
+            serde_json::from_value::<SessionEvent>(json!({"ev": "stream", "event": {"kind": "llm", "llm": "text", "text": t}})).unwrap()
+        };
+        // (user, the agent's first delta, the agent's message time), as (day, h, m, s); its `HH:MM`.
+        let cases =
+            [((13, 14, 5, 0), (13, 14, 5, 50), (13, 14, 6, 10), "14:05"), ((13, 23, 59, 30), (13, 23, 59, 50), (14, 0, 0, 10), "23:59")];
+        for tz in zones() {
+            let at = |(d, h, mi, s): (u32, u32, u32, u32)| utc_in(&tz, 2026, 11, d, h, mi, s);
+            let shown = |t: &Transcript| {
+                let it = &t.items()[1];
+                (it.kind, it.id, it.at.clone(), it.at.as_deref().and_then(|a| Stamp::in_zone(a, &tz)).map(|s| s.hhmm.to_string()))
+            };
+            for (user, live, history, hhmm) in cases {
+                let mut t = Transcript::new();
+                let go = SessionEvent::TurnStarted { turn_baseline: 0, trigger: "user".into(), user_text: Some("go".into()) };
+                t.apply_at(&go, &at(user).replace('Z', ".5Z"));
+                t.apply_at(&text("done"), &at(live).replace('Z', ".25Z"));
+                let before = shown(&t);
+                assert_eq!((before.0, before.3.as_deref()), (ItemKind::Assistant, Some(hhmm)), "{tz}");
+                let rows = build_in(&tz, t.items(), 0, true, &HashSet::new(), &Subagents::default());
+                let msgs = [
+                    dated(json!({"role": "user", "content": "go"}), at(user)),
+                    dated(json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}), at(history)),
+                ];
+                t.apply_history(&msgs);
+                assert_eq!(shown(&t), before, "{tz} {hhmm}: the same row, the same time");
+                let after = build_in(&tz, t.items(), 0, true, &HashSet::new(), &Subagents::default());
+                assert_eq!(kinds(&after), kinds(&rows));
+                assert!(after.iter().all(|d| d.kind != Kind::Day), "{tz} {hhmm}: no late day line");
+                // Never seen live: the history's time, and its day.
+                let fresh = transcript(&msgs);
+                assert_eq!(fresh.items()[1].at.as_deref(), Some(at(history).as_str()));
+                let lines = build_in(&tz, fresh.items(), 0, false, &HashSet::new(), &Subagents::default());
+                assert_eq!(lines.iter().any(|d| d.kind == Kind::Day), history.0 != user.0, "{tz} {hhmm}");
+            }
+        }
     }
 
     #[test]

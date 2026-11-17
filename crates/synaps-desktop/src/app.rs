@@ -51,6 +51,20 @@ pub(crate) struct RowCache {
     /// succeeded), and as shown.
     pub(crate) delta: Option<files::CallDelta>,
     pub(crate) counts: turns::Counts,
+    /// The item's time ([`Item::at`], which is not in `rev`), and read in
+    /// the local zone: parsed once here, never per frame or per sync.
+    at: Option<Arc<str>>,
+    pub(crate) time: Option<crate::times::Stamp>,
+}
+
+impl RowCache {
+    /// The item's time as read now: kept if it is the one read before.
+    fn retime(&mut self, item: &Item) {
+        if self.at != item.at {
+            self.at = item.at.clone();
+            self.time = item.at.as_deref().and_then(crate::times::Stamp::local);
+        }
+    }
 }
 
 /// Result lines an open tool row shows.
@@ -3686,9 +3700,10 @@ impl AppView {
                     let mut old: HashMap<(u64, u64), RowCache> =
                         self.rows.drain(sp.start.min(self.rows.len())..).map(|r| ((r.id, r.rev), r)).collect();
                     for item in &items[sp.start..] {
-                        let r = old
+                        let mut r = old
                             .remove(&(item.id, item.rev))
                             .unwrap_or_else(|| row_cache(item, self.model.shown_files(), self.model.shown_subagents()));
+                        r.retime(item);
                         self.rows.push(r);
                     }
                 } else {
@@ -3697,7 +3712,7 @@ impl AppView {
                         self.rows.push(row_cache(item, self.model.shown_files(), self.model.shown_subagents()));
                     }
                 }
-                debug_assert!(self.rows.iter().zip(items).all(|(r, i)| r.id == i.id && r.rev == i.rev));
+                debug_assert!(self.rows.iter().zip(items).all(|(r, i)| r.id == i.id && r.rev == i.rev && r.at == i.at));
                 if sp.start == 0 {
                     // Another session: what was unfolded there means nothing here.
                     let session = self.model.active.as_ref().map(|a| a.session_id.clone());
@@ -3934,7 +3949,9 @@ impl AppView {
     fn rebuild_from(&mut self, start: usize) {
         let shown = self.model.shown();
         let items = shown.items();
-        let new = turns::build(items, start, shown.busy(), &self.open_runs, self.model.shown_subagents());
+        let rows = &self.rows;
+        let day = |i: usize| rows.get(i).and_then(|r| r.time.as_ref()).map(crate::times::Stamp::day);
+        let new = turns::build(items, &day, start, shown.busy(), &self.open_runs, self.model.shown_subagents());
         self.summaries.update(&new, items, &self.rows);
         let at = self.disp.partition_point(|d| d.item < start);
         if let Some((range, count)) = turns::diff(&self.disp[at..], &new) {
@@ -3943,7 +3960,7 @@ impl AppView {
         }
         // A full build per sync: bounded, so long sessions stay usable in dev builds.
         debug_assert!(
-            items.len() > 2_000 || self.disp == turns::build(items, 0, shown.busy(), &self.open_runs, self.model.shown_subagents())
+            items.len() > 2_000 || self.disp == turns::build(items, &day, 0, shown.busy(), &self.open_runs, self.model.shown_subagents())
         );
     }
 
@@ -5230,7 +5247,10 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
         preview: None,
         delta: None,
         counts: turns::Counts::default(),
+        at: None,
+        time: None,
     };
+    r.retime(item);
     match item.kind {
         ItemKind::Tool => {
             let Some(t) = item.tool.as_ref() else { return r };

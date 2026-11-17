@@ -207,12 +207,15 @@ pub struct Item {
     pub text: String,
     pub tool: Option<ToolCall>,
     pub streaming: bool,
-    /// When it happened, RFC 3339: a history row's message time
-    /// ([`message_at`]); a live row's, the `ts` of the event that started it
-    /// ([`Transcript::apply_at`], an attach's replay), until its history
-    /// form brings the message time (a history form without one keeps it).
-    /// `None`: no recorded time (legacy history, a row fed without one),
-    /// never "now". Not part of `rev`: read it when drawing.
+    /// When it happened, RFC 3339, the first time the row had: a live
+    /// row's is the `ts` of the event that started it
+    /// ([`Transcript::apply_at`], an attach's replay), kept when its history
+    /// form lands; a row first seen in history has its message time
+    /// ([`message_at`]). `None`: no recorded time (legacy history, a row fed
+    /// without one), never "now". Not part of `rev`: it can change with
+    /// `rev` unchanged (a live row without one, then its history form; a
+    /// row of a swapped conversation), so key anything derived from it on
+    /// it.
     pub at: Option<Arc<str>>,
     /// `Some(n)`: a client-side row (notice, error), not part of the
     /// history, shown after the first `n` history messages.
@@ -286,8 +289,12 @@ pub struct Transcript {
     /// workers itself): [`Transcript::set_subagent_notices`].
     no_subagent_notices: bool,
     /// The time new rows get ([`Item::at`]): the message being folded's,
-    /// or the event being applied's.
+    /// or the event being applied's once a row takes it.
     stamp: Option<Arc<str>>,
+    /// The `ts` of the event being applied (empty: none), shared into
+    /// `stamp` by the first row it starts: most events start no row, so
+    /// most never allocate.
+    event_ts: String,
 }
 
 impl Transcript {
@@ -375,6 +382,9 @@ impl Transcript {
         if let Some(t) = &tool {
             self.tools.insert(t.tool_id.clone(), ix);
         }
+        if self.stamp.is_none() && !self.event_ts.is_empty() {
+            self.stamp = Some(Arc::from(self.event_ts.as_str()));
+        }
         self.items.push(Item { id, rev, kind, text, tool, streaming, at: self.stamp.clone(), anchor: None });
         self.mark(ix);
         ix
@@ -421,22 +431,27 @@ impl Transcript {
     /// strings and measured heights for `(id, rev)` stay valid, so a
     /// re-attach redraws only what changed. A row that differs keeps the
     /// newer `rev`, which is past every one it had.
-    fn keep_revs(&mut self) {
+    ///
+    /// A row's time is the first one it had ([`Item::at`]), as the TUI's
+    /// live rows: the daemon dates a message when its round ends, which can
+    /// be minutes after its row started streaming, and a time that moved
+    /// would move the row's day too. The history's time fills only a row
+    /// that had none. Unless `carry` is false (the conversation was
+    /// swapped: its ids are reused for other messages), and only from the
+    /// row's own form.
+    fn keep_revs(&mut self, carry: bool) {
         if self.before.is_empty() {
             return;
         }
         let before: HashMap<u64, Item> = std::mem::take(&mut self.before).into_iter().map(|i| (i.id, i)).collect();
         for it in self.items.iter_mut().filter(|i| i.anchor.is_none()) {
             let Some(o) = before.get(&it.id) else { continue };
-            // A live row's time stays when its history form has none (a
-            // daemon that records no message times). Only its own form's:
-            // a swapped conversation reuses ids for other messages.
             let same = match (&o.tool, &it.tool) {
                 (Some(a), Some(b)) => a.tool_id == b.tool_id,
                 (None, None) => o.text == it.text,
                 _ => false,
             };
-            if it.at.is_none() && o.kind == it.kind && same {
+            if carry && o.at.is_some() && o.kind == it.kind && same {
                 it.at = o.at.clone();
             }
             if o.kind == it.kind && o.streaming == it.streaming && o.text == it.text && o.tool == it.tool {
@@ -473,7 +488,7 @@ impl Transcript {
             self.busy = false;
             self.settle();
         }
-        self.keep_revs();
+        self.keep_revs(true);
         Ok(())
     }
 
@@ -520,7 +535,7 @@ impl Transcript {
         if !self.busy {
             self.settle();
         }
-        self.keep_revs();
+        self.keep_revs(!self.swapped);
     }
 
     /// Rebuild from a whole history (resync, rewrite, clear, compaction).
@@ -534,7 +549,8 @@ impl Transcript {
             }
         }
         let (mut notes, mut reuse) = self.take_rows(0);
-        if std::mem::take(&mut self.swapped) {
+        let swapped = std::mem::take(&mut self.swapped);
+        if swapped {
             notes.retain(|n| n.anchor == Some(usize::MAX));
         }
         self.fold_with_notes(messages, notes, &mut reuse);
@@ -542,7 +558,7 @@ impl Transcript {
         if !self.busy {
             self.settle();
         }
-        self.keep_revs();
+        self.keep_revs(!swapped);
     }
 
     /// Fold a whole history from empty, interleaving `notes` by anchor.
@@ -586,9 +602,10 @@ impl Transcript {
     }
 
     fn fold_message(&mut self, m: &Value, reuse: &mut Reuse) {
-        let outer = std::mem::replace(&mut self.stamp, message_at(m).map(Arc::from));
+        // Its rows have its time or none: never the event's it came in.
+        let outer = (std::mem::replace(&mut self.stamp, message_at(m).map(Arc::from)), std::mem::take(&mut self.event_ts));
         self.fold_blocks(m, reuse);
-        self.stamp = outer;
+        (self.stamp, self.event_ts) = outer;
     }
 
     fn fold_blocks(&mut self, m: &Value, reuse: &mut Reuse) {
@@ -709,8 +726,9 @@ impl Transcript {
     /// [`Transcript::apply_watch`] of an entry recorded at `at` (RFC 3339;
     /// empty: unknown): the rows it starts carry it ([`Item::at`]).
     pub fn apply_watch_at(&mut self, ev: &WatchEvent, at: &str) {
-        self.stamp = (!at.is_empty()).then(|| Arc::from(at));
+        self.event_ts.push_str(at);
         self.watch_event(ev);
+        self.event_ts.clear();
         self.stamp = None;
     }
 
@@ -778,8 +796,9 @@ impl Transcript {
     /// [`Transcript::apply`] of an event sent at `ts` (its envelope's, RFC
     /// 3339; empty: unknown): the rows it starts carry it ([`Item::at`]).
     pub fn apply_at(&mut self, ev: &SessionEvent, ts: &str) {
-        self.stamp = (!ts.is_empty()).then(|| Arc::from(ts));
+        self.event_ts.push_str(ts);
         self.apply_event(ev);
+        self.event_ts.clear();
         self.stamp = None;
     }
 

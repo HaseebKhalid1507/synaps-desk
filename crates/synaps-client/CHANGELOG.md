@@ -2,6 +2,23 @@
 
 Commit hashes are this repository's (`synaps-desk`). PR numbers other than synaps-desk#N are those of the archived `synaps-desktop` repository this history was rewritten from.
 
+## Since 8e69eda
+
+Message times (synaps-desk#12 `feat/message-times`). **One breaking change**, `Event::Session`'s new `ts` field; the rest is additive.
+
+- **Breaking:** `Event::Session` has a new field, `ts: String`: its envelope's `ts` (RFC 3339, when the daemon sent it; empty if it had none). A struct literal without it no longer compiles (E0063), nor does a pattern that names every field without `..` (E0027). The variant is now `#[non_exhaustive]`, so this is the last time a field breaks it: outside this crate it can only be built with the new `Event::session(attach_seq, session_id, seq, event, raw)` (sent at no known time, `ts` empty), plus `.with_ts(ts)` to give it a time, and only matched with `..`.
+- New `Item::at: Option<Arc<str>>`: when the row happened, RFC 3339. A live row has the `ts` of the event that started it, and keeps it when its history form lands, as the TUI's live rows: the daemon dates a message when its round ends, which can be minutes later. A row first seen in history (an attach, a resume, a rebuild) has its message's `_synaps_at`. A legacy message (no `_synaps_at`) and a row fed without a time have `None`, never "now". After a conversation swap (clear, resume, compaction) no row takes a time from the row it replaces. `at` is not part of `rev`: it can change with `rev` unchanged (a live row without a time, then its history form; a swapped conversation's row), so key anything derived from it on `at` itself. `Item` was already unbuildable outside this crate (a private field), so this is additive.
+- New `transcript::MESSAGE_AT_KEY` (`"_synaps_at"`, agent-core `session_journal::MESSAGE_AT_KEY`) and `transcript::message_at(&Value) -> Option<&str>`.
+- New `Transcript::apply_at(&SessionEvent, ts)` and `Transcript::apply_watch_at(&WatchEvent, at)`: `apply` / `apply_watch` whose new rows carry `ts` / `at`. `apply` and `apply_watch` are unchanged (their rows have no live time).
+- Behaviour: `Transcript::load_attached` replays the attach's in-flight events with their envelopes' `ts` (`apply_at`), so a row the replay starts has a time.
+- Tests: `tests/fixtures.rs` `rows_carry_their_message_times` (the captured v0.11.1 turn: the thinking row streamed from 07:34:28 keeps that time although its history says 07:34:30; a re-attach keeps it, a fresh attach has the history's; a legacy row has none; a swapped conversation's same-text row at a reused id takes no time).
+
+For synaps-avatar (nyx): three test literals in `crates/synaps-avatar/src/session.rs` stop compiling: a struct literal of a `#[non_exhaustive]` variant is refused outside its crate (E0639), so adding `ts` to them is not enough; build them with the constructor. Production code (`:510`, `Event::Session { event, .. }`) compiles unchanged; its rows just carry no live time (avatar draws none).
+- `:897` (the `turn()` helper, which has the envelope): `Event::session(attach_seq, session_id, seq, event, raw).with_ts(env.ts.clone())`.
+- `:1057` (`prompts_need_you_until_resolved`) and `:1074` (`abort_is_annoyed_with_a_reason`): `Event::session(attach_seq, session_id, seq, event, raw)`.
+
+To show times as the desktop does, apply events with `transcript.apply_at(&event, &ts)` (`Event::Session { event, ts, .. }`).
+
 ## Since ca644b1
 
 Additive only (synaps-desk `feat/worker-tabs`): cancelling a worker, as the TUI's `/workers cancel sa_N`. Nothing existing changes shape (`Command`, `Event` and `SessionCommand` are `#[non_exhaustive]`); no default changes.
