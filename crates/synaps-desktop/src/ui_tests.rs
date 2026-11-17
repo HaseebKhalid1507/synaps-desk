@@ -2526,6 +2526,24 @@ fn a_star_favourites_a_row_without_opening_it(cx: &mut TestAppContext) {
         assert!(!s.pinned, "a favourite is not the daemon's pin");
         crate::rail::key_of(&shown)
     });
+    // FAVOURITES folds from its head and opens again, drawn each time.
+    view.update(cx, |v, cx| {
+        v.rail_list.scroll_to_reveal_item(0);
+        cx.notify();
+    });
+    settle(cx, w, 4);
+    let head = bounds(cx, "favs-head").expect("the group's head");
+    let row_shown = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.rail.rail.items.iter().any(|i| matches!(i, Item::Row(r) if v.rail.rail.rows[*r].key == key)))
+    };
+    click_at(cx, w, head.center());
+    settle(cx, w, 4);
+    assert!(view.read_with(cx, |v, _| v.panels.favs_closed));
+    assert!(!row_shown(cx), "folded: its head only");
+    assert_eq!(bounds(cx, "favs-head"), Some(head));
+    click_at(cx, w, head.center());
+    settle(cx, w, 4);
+    assert!(view.read_with(cx, |v, _| !v.panels.favs_closed) && row_shown(cx), "open again");
     // Its filled star, drawn at rest; a click unfavourites it.
     let star: &'static str = Box::leak(format!("star {live_key}").into_boxed_str());
     let b = bounds(cx, star).expect("the favourite's star");

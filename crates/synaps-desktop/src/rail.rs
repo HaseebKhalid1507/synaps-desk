@@ -1100,6 +1100,10 @@ mod tests {
         let missing = "create session: Tool execution failed: Failed to load session 'j-deep': no session matching 'j-deep'";
         m.apply(Event::Detached { attach_seq: 41, session_id: None, reason: missing.into() });
         assert!(m.favs.list[2].gone);
+        assert_eq!(
+            m.named.error.as_deref(),
+            Some("'Deep history' is gone: the daemon has no journal for it. It stays in FAVOURITES until you remove it.")
+        );
         let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
         let row = rail.rows.iter().find(|r| &*r.title == "Deep history").expect("never pruned");
         assert!(row.gone);

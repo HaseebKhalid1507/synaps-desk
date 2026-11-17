@@ -1607,6 +1607,10 @@ impl Model {
                         // A favourite whose journal is not there: its row
                         // says so (and offers Remove); never dropped here.
                         if !r.req.by_name && crate::favourites::journal_missing(&reason) && self.favs.set_gone(&r.req.target) {
+                            n.error = Some(format!(
+                                "'{}' is gone: the daemon has no journal for it. It stays in FAVOURITES until you remove it.",
+                                r.req.label
+                            ));
                             self.rail_gen += 1;
                         }
                     }
