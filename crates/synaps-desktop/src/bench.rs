@@ -802,7 +802,11 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 for _ in 0..100 {
                     let _ = cx.update(|window, cx| {
                         window.dispatch_event(
-                            PlatformInput::MouseMove(MouseMoveEvent { position: center, pressed_button: None, modifiers: Modifiers::default() }),
+                            PlatformInput::MouseMove(MouseMoveEvent {
+                                position: center,
+                                pressed_button: None,
+                                modifiers: Modifiers::default(),
+                            }),
                             cx,
                         );
                         window.dispatch_event(

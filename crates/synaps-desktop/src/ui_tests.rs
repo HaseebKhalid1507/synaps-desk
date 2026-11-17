@@ -1923,7 +1923,11 @@ fn start_stream(cx: &mut TestAppContext, view: &Entity<AppView>) {
     view.update(cx, |v, cx| {
         let t = &mut v.model.transcript;
         let n = t.items().len();
-        t.apply(&SessionEvent::TurnStarted { turn_baseline: n as _, trigger: "user".into(), user_text: Some("Walk me through it.".into()) });
+        t.apply(&SessionEvent::TurnStarted {
+            turn_baseline: n as _,
+            trigger: "user".into(),
+            user_text: Some("Walk me through it.".into()),
+        });
         t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
         t.set_busy(true);
         cx.notify();
@@ -1939,12 +1943,20 @@ fn stream_step(cx: &mut TestAppContext, view: &Entity<AppView>, k: usize) {
         let t = &mut v.model.transcript;
         if k % 25 == 12 {
             let id = format!("fluid-{k}");
-            t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id.clone() }) });
             t.apply(&SessionEvent::Stream {
-                event: StreamEvent::Llm(LlmEvent::ToolUse { tool_name: "bash".into(), tool_id: id, input: serde_json::json!({"command": "cargo test"}) }),
+                event: StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id.clone() }),
+            });
+            t.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolUse {
+                    tool_name: "bash".into(),
+                    tool_id: id,
+                    input: serde_json::json!({"command": "cargo test"}),
+                }),
             });
         }
-        t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { text: format!("word{k} and some more text to wrap, ") }) });
+        t.apply(&SessionEvent::Stream {
+            event: StreamEvent::Llm(LlmEvent::Text { text: format!("word{k} and some more text to wrap, ") }),
+        });
         cx.notify();
     });
 }

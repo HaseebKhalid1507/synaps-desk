@@ -693,7 +693,6 @@ impl Motion {
         self.grows.borrow().get(&key).map(|g| (g.shown, g.sink.get()))
     }
 
-
     pub(crate) fn level(&self) -> Level {
         self.level.get()
     }
