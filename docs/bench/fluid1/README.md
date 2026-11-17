@@ -39,5 +39,29 @@ dispatched through the window's own input path). `spin_reduced` is GPUI's own wh
 
 **Binary size:** main 37,438,104 B, F1 37,474,712 B (+36.6 KB, +0.1 %).
 
-Not measured: a 240 Hz panel (the laptop isn't available) and a real touchpad (bella has none; the
-coast is covered by `scroll::tests` with X11-shaped packets, and by the fluid spike's synthetic runs).
+## Round 2 (review fixes, `fec9800`)
+
+Same script and binaries' roles (main = the same `synaps-desktop-hybrid.motion`), load average 2.4–3.1.
+One round on DP-3 (143.86 Hz), then two rounds with the window on **workspace 2, the laptop's own
+240 Hz panel (eDP-1-1)**, `BENCH_WORKSPACE=2 --refresh-hz 240`. Raw: `r2-*.json`.
+
+| | main 144 | F1 r2 144 | main eDP (2 runs) | F1 r2 eDP (2 runs) |
+|---|---|---|---|---|
+| streaming fps | 143.1 | 143.3 | 143.1, 143.3 | 142.7, 142.7 |
+| streaming draw p50 / p99 ms | 1.50 / 2.40 | 1.67 / 2.59 | 1.63 / 2.58, 1.85 / 2.88 | 1.71 / 2.82, 1.74 / 3.20 |
+| scroll draw p50 / p99 ms | 1.18 / 2.27 | 1.16 / 2.24 | 1.17 / 2.27, 1.41 / 3.44 | 1.14 / 2.25, 1.13 / 2.15 |
+| wheel spin (Full) fps, dropped | — | 143.9, 0 | — | 144.1, 143.6 |
+| wheel spin draw p50 / p99 ms | (Reduced: 1.31 / 2.46) | 1.13 / 2.16 | — | 1.32 / 2.41, 1.16 / 2.12 |
+| RSS idle / end (MiB) | 200 / 259 | 202 / 263 | 202 / 261, 202 / 262 | 201 / 262, 202 / 263 |
+
+**240 Hz: not reachable on bella's i3/X11 session.** The window really was on the 240 Hz eDP panel
+(workspace 2), but every run presents at 6.95 ms (143.86 Hz), main and F1 alike. Under X11 with no
+compositor, vsync follows the primary output (DP-3, 143.86 Hz), and bella's eDP is the iGPU's
+reverse-PRIME sink (`eDP-1-1`). So the "dropped" counts against 240 in the raw JSON mean nothing.
+A real 240 Hz run needs the laptop panel as primary or alone (or Wayland). I didn't change
+Haseeb's xrandr layout. F1's draw p99 everywhere (≤ 3.2 ms) fits a 240 Hz frame (4.17 ms).
+
+Not measured: a real touchpad. bella has one (`CUST0001 04F3:31FD`), but nobody can use it remotely,
+and headless gamescope can't send X11's fractional scroll valuators. The coast is covered by
+`scroll::tests` with X11-shaped packets. bella's mouse (Logitech G102, `hid-generic`, no Resolution
+Multiplier in its HID descriptor, valuator increment 120) is a plain wheel: 3.0 lines a detent.
