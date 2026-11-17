@@ -2333,3 +2333,40 @@ fn the_column_layer_starts_with_the_column(cx: &mut TestAppContext) {
     assert_eq!(layer(cx), None, "Settings: no layer");
     view.update(cx, |v, _| v.client = client);
 }
+
+/// Shady M2: every list swap goes through `list_out`, which stops the
+/// scroller: a glide in flight never carries onto the next list (a worker's
+/// view, a session not in the tab cache).
+#[gpui_kit::test]
+fn a_list_swap_stops_the_scroller(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseMoveEvent, ScrollDelta, ScrollEvent, ScrollSource, TouchPhase, point};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let over = point(px(720.), px(300.));
+    event(cx, w, PlatformInput::MouseMove(MouseMoveEvent { position: over, pressed_button: None, modifiers: Modifiers::default() }));
+    let notch = |cx: &mut TestAppContext| {
+        event(
+            cx,
+            w,
+            PlatformInput::Scroll(ScrollEvent {
+                position: over,
+                delta: ScrollDelta::Lines(point(0., 3.)),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+                source: ScrollSource::Pointer,
+            }),
+        )
+    };
+    notch(cx);
+    assert!(view.read_with(cx, |v, _| v.scroller.active()), "a glide in flight");
+    scout_in_place(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| !v.scroller.active()), "a worker's view: stopped");
+    view.update(cx, |v, cx| v.leave_worker(false, cx));
+    cx.run_until_parked();
+    notch(cx);
+    assert!(view.read_with(cx, |v, _| v.scroller.active()), "a glide in flight");
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    assert!(view.read_with(cx, |v, _| !v.scroller.active()), "another session: stopped");
+}
