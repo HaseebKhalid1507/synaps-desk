@@ -638,6 +638,48 @@ impl Model {
         chip.admits(self.saved_fact(v))
     }
 
+    /// The attached session `session_id` holds `journal`, the daemon says
+    /// (its conversation's header): the session list has it at once, so its
+    /// row, its favourite star and the favourite key act on that journal,
+    /// not on the one the last poll saw.
+    fn holds(&mut self, session_id: &str, journal: &str) {
+        if journal.is_empty() {
+            return;
+        }
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id && s.journal_id != journal) {
+            s.journal_id = journal.to_string();
+            self.rail_gen += 1;
+        }
+    }
+
+    /// A rail row's star (or its menu's Favourite), by what the row is,
+    /// never by a bare id (a favourite's journal id is a live id too when
+    /// the session it started as still runs, holding another journal): a
+    /// held session's row toggles the journal it holds; a favourite's own
+    /// row unfavourites it; a HISTORY row toggles that saved session. `true`
+    /// if the favourites changed.
+    pub fn toggle_fav_row(&mut self, action: &RowAction, fav: bool, now: i64) -> bool {
+        use crate::favourites::Source;
+        match action {
+            RowAction::Attach(id) => match self.sessions.iter().find(|s| &s.id == id) {
+                Some(s) => {
+                    self.favs.toggle(Source::Live(s), now);
+                    true
+                }
+                None => false,
+            },
+            RowAction::Resume(r) if r.by_name => false,
+            RowAction::Resume(r) if fav => self.favs.remove(&r.target),
+            RowAction::Resume(r) => match self.named.recent.iter().chain(self.named.saved.iter()).find(|v| v.id == r.target) {
+                Some(v) => {
+                    self.favs.toggle(Source::Saved(v), now);
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
     /// The favourites' snapshots brought up to what the lists say now (a
     /// held session, else its listing): run when the lists change, before
     /// the rail is built. `true` if any changed (and so is saved).
@@ -1526,30 +1568,44 @@ impl Model {
                     }
                     self.refresh_saved(&mut effects);
                 }
+                // The journal it holds is the header's: the attach's
+                // `meta.journal_id` is the one the session started with
+                // (0.11.1, after a swap). The daemon's word beats the
+                // listing's (polled, up to seconds old): its row and the
+                // favourite key act on what it holds.
+                let journal =
+                    attached.conversation.header.get("id").and_then(serde_json::Value::as_str).unwrap_or(&attached.meta.journal_id);
+                self.holds(&attached.meta.id, journal);
                 // A compaction of a favourite's conversation, said by the
-                // daemon (a resume of an old id it followed down the chain,
-                // or one not seen while it ran): the favourite follows.
-                if self.favs.continued(&attached.conversation.header) {
+                // daemon: the header names its parent (one not seen while
+                // it ran), or this session is a resume the daemon followed
+                // down the chain to the journal it still holds (any number
+                // of compactions not seen here): the favourite follows.
+                if self.favs.continued(&attached.conversation.header)
+                    | attached.meta.continue_info.as_ref().is_some_and(|i| self.favs.resolved(i, journal))
+                {
                     self.rail_gen += 1;
                 }
                 // A favourite's resume the daemon answered with a session
                 // that holds another journal it does not say continues this
                 // one (its live session `/clear`ed or `/resume`d elsewhere,
-                // or two compactions not seen here): the favourite stays on
-                // its own conversation, and the user is told. The journal
-                // is the header's: the attach's `meta.journal_id` is the one
-                // the session started with (0.11.1, after a swap).
-                let journal =
-                    attached.conversation.header.get("id").and_then(serde_json::Value::as_str).unwrap_or(&attached.meta.journal_id);
+                // or compacted more than once while live: a live session is
+                // handed back by its live id): the favourite stays on its
+                // own conversation, and the user is told.
                 if let Some(r) = resumed.filter(|r| !r.req.by_name)
                     && !journal.is_empty()
                     && self.favs.position(&r.req.target).is_some_and(|i| !self.favs.list[i].knows(journal))
                 {
-                    self.named.notice = Some(format!(
-                        "The daemon opened {} ({journal}) for '{}', and does not say it is the same conversation: the favourite stays as it was.",
-                        attached.meta.label(),
-                        r.req.label
-                    ));
+                    let (label, wanted) = (attached.meta.label(), &r.req.label);
+                    self.named.notice = Some(if self.favs.position(journal).is_some() {
+                        format!(
+                            "The daemon opened {label} ({journal}) for '{wanted}': another favourite has that conversation, so both stay as they were."
+                        )
+                    } else {
+                        format!(
+                            "The daemon opened {label} ({journal}) for '{wanted}', and does not say it is the same conversation: the favourite stays as it was."
+                        )
+                    });
                 }
                 // The one on screen until now, as the user saw it.
                 self.saw_active();
@@ -1616,11 +1672,17 @@ impl Model {
                 }
                 self.stats.on_session(&event, &raw);
                 // After a swap (a compaction, `/clear`, `/resume`): only a
-                // compaction's successor names its parent.
-                if let SessionEvent::Conversation { digest } = &event
-                    && self.favs.continued(&digest.header)
-                {
-                    self.rail_gen += 1;
+                // compaction's successor names its parent. The journal it
+                // holds now, at once (the listing is polled).
+                if let SessionEvent::Conversation { digest } = &event {
+                    if let Some(id) = digest.header.get("id").and_then(serde_json::Value::as_str)
+                        && let Some(a) = self.active.as_ref().map(|a| a.session_id.clone())
+                    {
+                        self.holds(&a, id);
+                    }
+                    if self.favs.continued(&digest.header) {
+                        self.rail_gen += 1;
+                    }
                 }
                 match &event {
                     SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. } => {

@@ -1338,6 +1338,113 @@ mod tests {
         assert!(notice.contains("does not say it is the same conversation"), "{notice}");
     }
 
+    /// N2: two compactions not seen here (the TUI's), the session closed
+    /// since; the favourite's resume of its old journal, which the daemon
+    /// follows down the chain (F24) and says so (`continue_info`): one row,
+    /// and no notice. The same resume answered with a session that holds
+    /// another journal (cleared since) moves nothing, and says so; one
+    /// onto another favourite's journal says that.
+    #[test]
+    fn two_unseen_compactions_are_one_row_once_the_favourite_is_resumed() {
+        let resume = |m: &mut Model, seq: u64, holds: &str| {
+            m.resuming(ResumeRequest { label: "Long talk".into(), target: "c1".into(), cwd: None, by_name: false }, seq, false);
+            let mut meta = json!({"id": "c3", "lifecycle": "live", "created_at": at(5), "title": "Long talk", "journal_id": "c3"});
+            meta["continue_info"] = json!({"session_id": "c3", "resolved_via": "compacted", "query": "c1",
+                "compaction_notice": "followed 2 compactions"});
+            let mut a = attached_frame(meta, Some("c2"));
+            a.conversation.header["id"] = json!(holds);
+            m.apply(Event::Attached { attach_seq: seq, attached: a, mode: synaps_client::AttachMode::Mirror, reconnect: false });
+        };
+        let listing = json!([{"id": "c3", "title": "Long talk", "updated_at": at(10), "live": false}]);
+        let mut m = model(json!([]), json!([]), listing.clone(), false);
+        let c1 = saved(json!([{"id": "c1", "title": "Long talk", "updated_at": at(900), "live": false}]));
+        m.favs.toggle(Source::Saved(&c1[0]), 1);
+        let (rows, n) = count(&mut m, "Long talk");
+        assert_eq!(n, 2, "the favourite (c1) and c3 in HISTORY: {rows:?}");
+        resume(&mut m, 4, "c3");
+        assert_eq!((m.favs.list[0].id.as_str(), &m.favs.list[0].aliases[..]), ("c3", &["c1".to_string()][..]));
+        assert_eq!(m.named.notice, None);
+        m.apply(Event::Sessions(metas(
+            json!([{"id": "c3", "lifecycle": "live", "created_at": at(5), "title": "Long talk", "journal_id": "c3"}]),
+        )));
+        let (rows, n) = count(&mut m, "Long talk");
+        assert_eq!((n, &rows[..2]), (1, &["[Favs 1]".to_string(), "row Long talk".to_string()][..]), "{rows:?}");
+        // Cleared since the daemon resolved it: the session holds y.
+        let mut m = model(json!([]), json!([]), listing.clone(), false);
+        m.favs.toggle(Source::Saved(&c1[0]), 1);
+        resume(&mut m, 4, "y");
+        assert_eq!(m.favs.list[0].id, "c1");
+        assert!(m.named.notice.as_deref().unwrap_or("").contains("does not say it is the same conversation"), "{:?}", m.named.notice);
+        // c3 is another favourite already: both stay, and the notice says so.
+        let mut m = model(json!([]), json!([]), listing, false);
+        m.favs.toggle(Source::Saved(&c1[0]), 1);
+        let c3 = m.named.recent[0].clone();
+        m.favs.toggle(Source::Saved(&c3), 2);
+        resume(&mut m, 4, "c3");
+        assert_eq!(m.favs.list.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["c1", "c3"]);
+        assert!(m.named.notice.as_deref().unwrap_or("").contains("another favourite has that conversation"), "{:?}", m.named.notice);
+    }
+
+    /// N1: a favourite's own row, its old live session still running under
+    /// its journal id (as a live id) and holding another journal (after an
+    /// unseen compaction, `/clear`, `/resume`): its star unfavourites it,
+    /// and favourites nothing else; the held row's star toggles the journal
+    /// the session holds.
+    #[test]
+    fn a_favourites_star_unfavourites_it_whatever_its_old_session_holds() {
+        let c = |journal: &str| json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "Long talk", "journal_id": journal});
+        for (why, holds) in [("an unseen compaction", "c2"), ("/clear", "y"), ("/resume", "jb")] {
+            let listing = json!([{"id": "jb", "title": "Bravo", "updated_at": at(900), "live": false}]);
+            let mut m = model(json!([c("c1")]), json!([]), listing, false);
+            m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
+            m.apply(Event::Sessions(metas(json!([c(holds)]))));
+            m.sync_favs();
+            let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+            keys_once(&rail);
+            let row = rail.rows.iter().find(|r| r.key == saved_key("c1")).expect("the favourite's own row");
+            assert!(row.fav.is_some() && row.live.is_none(), "{why}");
+            assert!(m.toggle_fav_row(&row.action.clone(), true, 2), "{why}");
+            assert!(m.favs.is_empty(), "{why}: unfavourited, {holds} not added: {:?}", m.favs.list);
+            let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+            let held = rail.rows.iter().find(|r| r.key == key_of("c1")).expect("the held row");
+            assert!(m.toggle_fav_row(&held.action.clone(), held.fav.is_some(), 3), "{why}");
+            assert_eq!(m.favs.list.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), [holds], "{why}");
+        }
+    }
+
+    /// N3: the attached session's journal is the daemon's word at once (its
+    /// attach's header, each swap's), not the last poll's: after a `/clear`
+    /// there, its row is not the favourite, and its star favourites the
+    /// cleared conversation, never removing the favourite.
+    #[test]
+    fn the_attached_sessions_journal_is_its_header_at_once() {
+        let c = |journal: &str| json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "Long talk", "journal_id": journal});
+        let mut m = model(json!([c("c1")]), json!([]), json!([]), false);
+        m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
+        m.want(5);
+        m.apply(Event::Attached {
+            attach_seq: 5,
+            attached: attached_frame(c("c1"), None),
+            mode: synaps_client::AttachMode::Mirror,
+            reconnect: false,
+        });
+        m.apply(swapped(5, "y", None));
+        assert_eq!(m.sessions[0].journal_id, "y", "before the next poll");
+        m.sync_favs();
+        assert_eq!(m.fav_of(&m.sessions[0]), None);
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+        let held = rail.rows.iter().find(|r| r.key == key_of("c1")).expect("the held row");
+        m.toggle_fav_row(&held.action.clone(), held.fav.is_some(), 2);
+        assert_eq!(m.favs.list.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["c1", "y"]);
+        // Attached again: its meta names the journal it started with, its
+        // header the one it holds.
+        m.want(6);
+        let mut a = attached_frame(c("c1"), None);
+        a.conversation.header["id"] = json!("y2");
+        m.apply(Event::Attached { attach_seq: 6, attached: a, mode: synaps_client::AttachMode::Mirror, reconnect: false });
+        assert_eq!(m.sessions[0].journal_id, "y2");
+    }
+
     /// R3: a named favourite whose resume found no journal stays GONE
     /// against the named list asked for before the verdict, however new
     /// the newest list is (it is cut, so it never says the named one is
