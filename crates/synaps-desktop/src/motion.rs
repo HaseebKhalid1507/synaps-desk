@@ -122,9 +122,6 @@ impl Setting {
 
 pub(crate) const QUICK: Duration = Duration::from_millis(120);
 pub(crate) const BASE: Duration = Duration::from_millis(200);
-// Q1 took the tool rows' lit bar (its one use) away; Q4's chrome and
-// charts use it again: drop this allow when they land (motion.md §2).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SLOW: Duration = Duration::from_millis(360);
 pub(crate) const GLOW: Duration = Duration::from_millis(480);
 pub(crate) const SIG: Duration = Duration::from_millis(600);
