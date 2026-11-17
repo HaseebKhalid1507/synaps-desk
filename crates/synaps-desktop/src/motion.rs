@@ -392,6 +392,9 @@ pub(crate) struct Motion {
     /// Tests: the OS in low power ([`Motion::low_power`]).
     #[cfg(test)]
     pub(crate) force_low_power: Cell<bool>,
+    /// Tests: the beat each layer paint with sites drew, in order.
+    #[cfg(test)]
+    pub(crate) painted: RefCell<Vec<u32>>,
 }
 
 impl Default for Motion {
@@ -432,6 +435,8 @@ impl Motion {
             skew: Cell::new(0),
             #[cfg(test)]
             force_low_power: Cell::new(false),
+            #[cfg(test)]
+            painted: RefCell::default(),
         }
     }
 
@@ -862,6 +867,8 @@ impl Motion {
             }
         }
         if wants {
+            #[cfg(test)]
+            self.painted.borrow_mut().push(beat);
             self.beat_next.set(Some(self.epoch + BEAT * (beat + 1)));
         }
         if !self.display.get() {
@@ -904,6 +911,12 @@ impl Motion {
             self.seen.borrow().iter().filter(|(k, s)| k.0 != Tag::Watched && s.since == Some(now)).map(|(k, _)| *k).collect();
         v.extend(self.births.borrow().iter().filter(|(_, at)| **at >= now).map(|(id, _)| (Tag::Stream, *id)));
         v
+    }
+
+    /// The beat the last frame drew (tests).
+    #[cfg(test)]
+    pub(crate) fn frame_beat(&self) -> u32 {
+        (self.now.get().saturating_duration_since(self.epoch).as_nanos() / BEAT.as_nanos()) as u32
     }
 
     /// Every keyed value that changed (animating) after `t` (tests).
