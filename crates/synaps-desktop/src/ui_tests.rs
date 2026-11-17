@@ -1607,6 +1607,7 @@ fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     let scans = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Scan(_))).count();
     assert!(scans >= 25, "the running glyphs on screen are the layer's: {scans}");
     let (f0, l0) = frames(cx, &view);
+    let p0 = view.read_with(cx, |v, _| v.fx.painted.borrow().len());
     let mut layer_only = 0;
     for _ in 0..16 {
         layer_only += usize::from(view.read_with(cx, |v, _| v.fx.wakes()) == Some(crate::motion::Wake::Beat));
@@ -1616,8 +1617,9 @@ fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     // 2 s: the clocks' second twice (a third at most, as the edges fall).
     assert!(layer_only >= 13, "the timer woke only the layer on {layer_only} of 16 beats");
     // Every beat paints it, once (Shady N2: a beat painted twice is the
-    // regression the layer exists to prevent).
-    assert!((15..=18).contains(&(l1 - l0)), "every beat paints the layer, once: {} in 16", l1 - l0);
+    // regression the layer exists to prevent): a beat is painted again
+    // only by an app frame inside it.
+    assert_painted_once(cx, &view, p0, l1 - l0, f1 - f0);
     assert!(f1 - f0 <= 3, "16 beats drew the app {} times: only the clocks' second may", f1 - f0);
     assert_eq!(view.read_with(cx, |v, _| v.fx.sites().len()), sites.len(), "the cached frame keeps its sites");
     // Off: the glyphs draw still in the app's frame; nothing for the layer.
@@ -1712,13 +1714,27 @@ fn beats_without_a_clock_draw_no_app_frame(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     running_without_a_clock(cx, w, &view, 3);
     let (f0, l0) = frames(cx, &view);
+    let p0 = view.read_with(cx, |v, _| v.fx.painted.borrow().len());
     for _ in 0..16 {
         assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::Beat), "the timer wakes the layer");
         beat(cx, w, &view);
     }
     let (f1, l1) = frames(cx, &view);
     assert_eq!(f1, f0, "16 beats drew the app's view {} times", f1 - f0);
-    assert!((15..=17).contains(&(l1 - l0)), "a paint of the layer a beat: {} in 16", l1 - l0);
+    assert_painted_once(cx, &view, p0, l1 - l0, 0);
+}
+
+/// The `paints` the layer made since its `p0`th: each a beat of its own
+/// (at most `again` repainted, by the app's own frames), in order, about
+/// one a test beat (a slow runner's wall time can carry the clock past a
+/// beat, and then its paints are for later beats, never the same one).
+fn assert_painted_once(cx: &mut TestAppContext, view: &Entity<AppView>, p0: usize, paints: u64, again: u64) {
+    let painted = view.read_with(cx, |v, _| v.fx.painted.borrow()[p0..].to_vec());
+    assert_eq!(painted.len() as u64, paints, "every paint had the beat's sites to paint");
+    assert!(painted.windows(2).all(|w| w[1] >= w[0]), "in order: {painted:?}");
+    let twice = painted.windows(2).filter(|w| w[1] == w[0]).count() as u64;
+    assert!(twice <= again, "{twice} beats painted twice ({again} app frames): {painted:?}");
+    assert!(painted.len() >= 12, "about a paint a beat: {painted:?}");
 }
 
 /// Shady N1: low power stops the beat (§7: no ambient). GPUI stores a
@@ -1755,14 +1771,17 @@ fn the_beat_in_the_frame_scans_without_the_layer(cx: &mut TestAppContext) {
     let (w, view, _events) = open_with(cx, (1440., 900.), crate::theme::Panels::default().text_size, false);
     running_without_a_clock_in_frame(cx, w, &view);
     let beam = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("beam-row").expect("a beam row in the frame");
-    let (f0, b0) = (frames(cx, &view).0, beam(cx));
+    let at = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.frame_beat());
+    let (f0, b0, k0) = (frames(cx, &view).0, beam(cx), at(cx));
     assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::App), "the timer wakes the app");
     beat(cx, w, &view);
-    let (f1, b1) = (frames(cx, &view).0, beam(cx));
-    assert!(f1 > f0, "the beat is the app's frame");
+    let (f1, b1, k1) = (frames(cx, &view).0, beam(cx), at(cx));
+    assert!(f1 > f0 && k1 > k0, "the beat is the app's frame");
     assert!(view.read_with(cx, |v, _| v.fx.sites().is_empty()), "nothing on the layer");
+    // The row of the frame's own beat (one down a beat, back to the top
+    // after 8; a slow runner's clock may have crossed two).
     let dy = f32::from(b1.origin.y - b0.origin.y);
-    assert!(dy == 1. || dy == -7., "one row down a beat (or back to the top): {dy}");
+    assert_eq!(dy, crate::glyph::scan_row(k1) - crate::glyph::scan_row(k0), "the beam on the frame's beat ({k0} → {k1})");
     // Off: still, no beam.
     set_motion(cx, &view, crate::motion::Level::Off);
     assert!(VisualTestContext::from_window(w, cx).debug_bounds("beam-row").is_none());
