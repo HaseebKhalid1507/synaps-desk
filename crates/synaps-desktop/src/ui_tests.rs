@@ -1579,14 +1579,19 @@ fn running_tools(cx: &mut TestAppContext, view: &Entity<AppView>, n: usize) {
 
 /// Q1 cards (polish.md §2.1, F1): a tool row is bare on the canvas. Its
 /// box reaches into the gutter for its status glyph (the hover fill takes
-/// the glyph in), its verb starts on the prose column, and nothing is drawn
-/// on its lead edge: no hue bar, no bloom, lit or settled. An opened body
-/// is a well at the target column, to the column's end.
+/// the glyph in) and stops where the AGENT label ends; its verb starts on
+/// the prose column. A failed call opens on its well, at the target column
+/// to the column's end.
 #[gpui_kit::test]
 fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
     use synaps_client::protocol::{LlmEvent, StreamEvent};
     let (w, view, _events) = open_at(cx, (2200., 1400.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
+    // A turn of its own: its first row, the call, carries AGENT.
+    view.update(cx, |v, _| {
+        let n = v.model.transcript.items().len();
+        v.model.transcript.apply(&SessionEvent::TurnStarted { turn_baseline: n as _, trigger: "user".into(), user_text: Some("Run it.".into()) });
+    });
     running_tools(cx, &view, 1);
     for _ in 0..4 {
         beat(cx, w, &view);
@@ -1604,12 +1609,17 @@ fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
         VisualTestContext::from_window(w, cx).debug_bounds(what)
     };
     let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the running call's row");
-    assert!(bounds(cx, "bar-bloom").is_none(), "no bloom: the bar is gone");
     assert_eq!(f32::from(row.size.width), lay.column + geo.out, "the column and {} of the gutter", geo.out);
     assert_eq!(row.size.height, gpui_kit::px(m.row), "one row");
+    let column = f32::from(row.left()) + geo.out;
+    let status = bounds(cx, leak(format!("tool-status {id}"))).expect("the status glyph's column");
+    assert!(f32::from(status.left()) >= f32::from(row.left()) && f32::from(status.right()) <= column, "{status:?}: in the gutter, inside the row's box");
+    // Its AGENT label ends where the row's box starts.
+    let label = bounds(cx, leak(format!("hang-label-{id}"))).expect("the call's AGENT label");
+    assert!(label.right() <= row.left(), "the hover fill stops at the label: {label:?} {row:?}");
     view.update(cx, |v, cx| {
         v.model.transcript.apply(&SessionEvent::Stream {
-            event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "error: boom".into() }),
+            event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "Tool execution failed: boom".into() }),
         });
         v.sync_list();
         v.list.scroll_to_end();
@@ -1620,13 +1630,13 @@ fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
         beat(cx, w, &view);
     }
     let failed = view.read_with(cx, |v, _| v.model.transcript.items().last().and_then(|i| i.tool.as_ref()).and_then(|t| t.status));
-    if failed == Some(synaps_client::transcript::ToolStatus::Failed) {
-        let well = bounds(cx, leak(format!("well {id}"))).expect("a failed call opens on its well");
-        let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the row");
-        assert_eq!(f32::from(well.left()), f32::from(row.left()) + geo.out + geo.target, "the well at the target column");
-        assert_eq!(well.right(), row.right(), "to the column's end");
-    }
-    assert!(bounds(cx, "bar-bloom").is_none(), "settled: nothing on the lead edge");
+    assert_eq!(failed, Some(synaps_client::transcript::ToolStatus::Failed));
+    let well = bounds(cx, leak(format!("well {id}"))).expect("a failed call opens on its well");
+    let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the row");
+    assert_eq!(f32::from(well.left()), f32::from(row.left()) + geo.out + geo.target, "the well at the target column");
+    assert_eq!(well.right(), row.right(), "to the column's end");
+    let status = bounds(cx, leak(format!("tool-status {id}"))).expect("its failed glyph");
+    assert!(f32::from(status.right()) <= f32::from(row.left()) + geo.out, "still in the gutter");
 }
 
 /// One beat goes by: the motion clock and the executor's move on together,
@@ -1708,6 +1718,9 @@ fn the_fuse_burns_clear_of_the_pointer(cx: &mut TestAppContext) {
     assert_eq!(f32::from(confirm.left() - fuse.right()), 8., "8 px before CONFIRM");
     assert!(f32::from(armed.right() - fuse.right()) >= 24., "clear of the ×'s end: {armed:?} {fuse:?}");
     assert!(confirm.right() <= armed.right() && fuse.left() >= armed.left());
+    // Its chip holds all of it: CONFIRM is not clipped.
+    let chip = b(cx, "chip 1");
+    assert!(armed.right() <= chip.right() && confirm.right() <= chip.right(), "{confirm:?} in {chip:?}");
 }
 
 /// Finish gate fix 1: a turn that ends here hands the floor back: Handoff
