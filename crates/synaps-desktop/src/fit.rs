@@ -104,7 +104,7 @@ impl Extras {
         let notes = if form == Form::Cramped { 0. } else { f32::from(self.naming_notes) * (NAMING_GAP + NAMING_NOTE) };
         let naming = if self.naming { naming_h(form) + notes } else { 0. };
         let stub = if self.stub { stub_h(m) } else { 0. };
-        let tray = if self.tray > 0 { tray_box(form) + f32::from(self.tray) * tray_row(m) } else { 0. };
+        let tray = if self.tray > 0 { tray_box(form) + chips_h(m, form, usize::from(self.tray)) } else { 0. };
         naming + stub + tray + if self.notice(form) { NOTICE_TOP + notice_line(m) } else { 0. }
     }
 
@@ -127,44 +127,50 @@ pub(crate) fn stub_h(m: &Metrics) -> f32 {
     m.row + STUB_GAP
 }
 
-/// One tray row (a worker): a compact row.
+/// One line of worker chips: a compact row.
 pub(crate) fn tray_row(m: &Metrics) -> f32 {
     m.row_compact
 }
 
-/// The tray round its rows: its gap above and its padding (its bar is
-/// inside: design.md §8.4).
-pub(crate) fn tray_box(form: Form) -> f32 {
-    if form == Form::Cramped { 4. + 2. * 2. } else { 8. + 2. * 4. }
+/// Between two lines of chips (polish.md §2.5).
+fn chip_gap(form: Form) -> f32 {
+    if form == Form::Cramped { 4. } else { 8. }
 }
 
-/// Most rows the tray shows (its "+N more" row included): the TUI's six
-/// and a "+N more" in a tall window, three in a short one, one cramped
-/// (the count of the rest beside it).
+/// `lines` lines of chips, the gaps between them.
+pub(crate) fn chips_h(m: &Metrics, form: Form, lines: usize) -> f32 {
+    lines as f32 * tray_row(m) + lines.saturating_sub(1) as f32 * chip_gap(form)
+}
+
+/// Above the chips: the gap over them (each chip is its own box).
+pub(crate) fn tray_box(form: Form) -> f32 {
+    if form == Form::Cramped { 4. } else { 8. }
+}
+
+/// Most lines of chips (the `+N more` chip ends the last): two, cramped one.
 pub(crate) fn tray_max(form: Form) -> usize {
     match form {
-        Form::Full => 7,
-        Form::Short => 3,
+        Form::Full | Form::Short => 2,
         Form::Cramped => 1,
     }
 }
 
-/// What the transcript keeps under the tray (scaled with the text).
+/// What the transcript keeps under the chips (scaled with the text).
 const TRAY_LIST: f32 = 60.;
 
-/// The rows the tray draws for `n` workers in a `window` this tall: as
-/// many as [`tray_max`] and the room leave after the bars, `ex` (without
-/// the tray), a card at its least well (`card`: one is up), a one-line
-/// composer and [`TRAY_LIST`] of transcript. Fewer rows than workers: the
-/// last one says how many more.
-pub(crate) fn tray_rows(m: &Metrics, form: Form, window: f32, card: bool, ex: Extras, n: usize) -> usize {
+/// The lines of chips drawn for chips that need `n` lines in a `window`
+/// this tall: as many as [`tray_max`] and the room leave after the bars,
+/// `ex` (without the chips), a card at its least well (`card`: one is
+/// up), a one-line composer and [`TRAY_LIST`] of transcript. Fewer lines
+/// than they need: the last ends with `+N more`.
+pub(crate) fn chip_lines(m: &Metrics, form: Form, window: f32, card: bool, ex: Extras, n: usize) -> usize {
     if n == 0 {
         return 0;
     }
     let card = if card { Card::of(m, form).height(ex.well_min(m, form)) } else { 0. };
     let spare =
         window - above(form) - ex.height(m, form) - card - Composer::of(m, form).height(1) - (TRAY_LIST * m.r).round() - tray_box(form);
-    let fit = (spare / tray_row(m)).floor().max(0.) as usize;
+    let fit = ((spare + chip_gap(form)) / (tray_row(m) + chip_gap(form))).floor().max(0.) as usize;
     n.min(tray_max(form)).min(fit)
 }
 
@@ -677,7 +683,7 @@ mod tests {
                     let f = form(Layout::of(1000., window - TOP, &m, ex));
                     for (card, stub) in [(true, false), (false, true), (false, false)] {
                         let base = Extras { stub, ..ex };
-                        let n = tray_rows(&m, f, window, card, base, 9);
+                        let n = chip_lines(&m, f, window, card, base, 9);
                         assert!(n <= tray_max(f));
                         let drawn = Extras { tray: n as u8, ..base };
                         let rows = composer_rows(&m, f, window, card, drawn);
@@ -698,12 +704,13 @@ mod tests {
                 }
             }
         }
-        // A tall window: six workers and a "+N more" row; short: three; cramped: one.
+        // Chips: two lines at most, cramped one (polish.md §2.5).
         let m = Metrics::at(16);
-        assert_eq!(tray_rows(&m, Form::Full, 1200., false, Extras::default(), 9), 7);
-        assert_eq!(tray_rows(&m, Form::Short, 800., false, Extras::default(), 9), 3);
-        assert_eq!(tray_rows(&m, Form::Cramped, 600., false, Extras::default(), 2), 1);
-        assert_eq!(tray_rows(&m, Form::Full, 1200., true, Extras::default(), 0), 0);
+        assert_eq!(chip_lines(&m, Form::Full, 1200., false, Extras::default(), 9), 2);
+        assert_eq!(chip_lines(&m, Form::Full, 1200., false, Extras::default(), 1), 1);
+        assert_eq!(chip_lines(&m, Form::Short, 800., false, Extras::default(), 9), 2);
+        assert_eq!(chip_lines(&m, Form::Cramped, 600., false, Extras::default(), 2), 1);
+        assert_eq!(chip_lines(&m, Form::Full, 1200., true, Extras::default(), 0), 0);
     }
 
     /// The composer grows only into room the card's 3-line form leaves.
