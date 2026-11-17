@@ -319,7 +319,11 @@ impl AppView {
             return None;
         }
         let lay = self.layout;
-        let gist = self.model.transcript.pending_prompts().first().map(|q| crate::chrome::prompt_gist(&q.title, &q.prompt));
+        // What waits: the card's gist (made once), as the top bar says it.
+        let gist = self
+            .current_card()
+            .map(|c| c.gist.clone())
+            .or_else(|| self.model.transcript.pending_prompts().first().map(|q| crate::chrome::prompt_gist(&q.title, &q.prompt).into()));
         let (word, mark) = glyph::ink(glyph::Family::Warn, Ground::Card, p);
         let row = h_flex()
             .id("needs-stub")
@@ -337,7 +341,7 @@ impl AppView {
             .cursor_pointer()
             .hover(|d| d.bg(p.card_hi))
             .child(glyph::lead(Some(glyph::draw(Glyph::Needs, mark)), m))
-            .child(display(label::NEEDS_YOU, 12., word).flex_none())
+            .child(display(label::NEEDS_YOU, m.meta, word).flex_none())
             .child(
                 div()
                     .flex_1()

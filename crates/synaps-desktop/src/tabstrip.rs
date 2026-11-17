@@ -1,6 +1,7 @@
 //! The tab strip over the centre pane: one tab per open session, its state
 //! as the rail draws it (glyph, word, the needs-you bar), the visible one
-//! raised with the "you" bar. A worker's tab ([`Kind::Worker`]) says
+//! raised with the "you" bar (its word is the composer foot's: it keeps
+//! the glyph and gives the title the room). A worker's tab ([`Kind::Worker`]) says
 //! `sleeper · <its session>` with the worker's state mark, its session in
 //! its tooltip; right-click opens the worker's menu ([`crate::wtabs`]).
 //! Nothing moves on its own: no animation, a
@@ -218,9 +219,10 @@ impl AppView {
         for (ix, t) in tabs.iter().enumerate().skip(lay.first).take(lay.shown) {
             let st = self.tab_state(t);
             let (label, named) = self.tab_labels.labels.get(ix).cloned().unwrap_or_default();
-            // A worker of a session not attached here: as last seen.
+            // A worker of a session not attached here: as last seen (as
+            // nothing, if this window holds nothing of its session).
             let worker = match (&t.worker, t.session.as_deref()) {
-                (Some(w), Some(s)) if t.kind == Kind::Worker => Some(self.worker_state(s, &w.handle, Some(w.who()))),
+                (Some(w), Some(s)) if t.kind == Kind::Worker => self.worker_state(s, &w.handle, Some(w.who())),
                 _ => None,
             };
             row = row.child(self.render_tab(t.id, ix, active == Some(ix), t.kind, (st, worker), label, named, lay.width, p, cx));
@@ -304,7 +306,7 @@ impl AppView {
     ) -> impl IntoElement + use<> {
         let view = !kind.attaches();
         let title_color = match st {
-            _ if view || worker.is_some() => {
+            _ if view || kind == Kind::Worker => {
                 if on {
                     p.ink
                 } else {
@@ -327,21 +329,30 @@ impl AppView {
         };
         // A worker tab: its worker's glyph and word (§4.2), whatever its
         // session waits on (the bar says that; the stub over its view too).
-        let (g, word, family) = match worker {
-            Some(w) => {
+        // One this window holds nothing of: the rest glyph and no word.
+        let (g, word, family) = match (kind, worker) {
+            (_, Some(w)) => {
                 let (g, word, _, family) = glyph::worker(w);
                 (Some(g), Some(word), family)
             }
-            None => {
+            (Kind::Worker, None) => (Some(Glyph::Idle), None, glyph::Family::Rest),
+            _ => {
                 let (g, family) = glyph::session(st);
                 (g, st.word(), family)
             }
         };
-        let word = word.filter(|_| width >= WORD_MIN && !view);
+        // The current tab's word is the composer foot's (design.md §8.14):
+        // its glyph stays, its title gets the room.
+        let word = word.filter(|_| width >= WORD_MIN && !view && !on);
         let (word_color, mark_color) = glyph::ink(family, Ground::Chrome, p);
         let drag = TabDrag { id, ix, label: label.clone(), bg: p.raised, fg: p.ink, edge: p.edge };
         let mark = p.focus_ch;
-        let name = if view { "view" } else { worker.map_or_else(|| st.name(), |w| glyph::worker(w).2) };
+        let name = match (kind, worker) {
+            _ if view => "view",
+            (_, Some(w)) => glyph::worker(w).2,
+            (Kind::Worker, None) => "not known in this window",
+            _ => st.name(),
+        };
         let waits = if needs && worker.is_some() { " · its session needs you" } else { "" };
         let (tip, me) = (label.clone(), cx.weak_entity());
         let menu_open = self.menu.is_some() || self.smenu.is_some();
