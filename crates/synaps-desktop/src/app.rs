@@ -1237,8 +1237,6 @@ pub(crate) fn well_body(prompt: &str) -> SharedString {
 /// task that started it is still there.
 #[derive(Default)]
 struct FavsJob {
-    /// A job is between taking the list and its result being taken.
-    writing: bool,
     /// The window closed: a job not begun yet writes nothing.
     closed: bool,
     /// The generation written, the list sent, the file's list after.
@@ -1429,6 +1427,9 @@ pub struct AppView {
     favs_save: Option<Task<()>>,
     /// The favourites write on its way, shared with its background job.
     favs_job: Arc<std::sync::Mutex<FavsJob>>,
+    /// A favourites job is between taking the list and its result being
+    /// taken (the window's own: never a wait on the job's lock).
+    favs_writing: bool,
     favs_synced: Option<u64>,
     /// The session lists the restored tabs have been checked against.
     lists_seen: u64,
@@ -1915,6 +1916,7 @@ impl AppView {
             favs_written: 0,
             favs_save: None,
             favs_job: Arc::default(),
+            favs_writing: false,
             favs_synced: None,
             tabs_written: 0,
             tabs_save: None,
@@ -2824,7 +2826,8 @@ impl AppView {
             return;
         }
         self.favs_saved = self.model.favs.generation;
-        if self.favs_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).writing {
+        self.carry_favs();
+        if self.favs_writing {
             return;
         }
         self.favs_save = Some(cx.spawn(async move |this, cx| {
@@ -2833,7 +2836,7 @@ impl AppView {
                 let job = this
                     .update(cx, |v, _| {
                         let f = &v.model.favs;
-                        v.favs_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).writing = true;
+                        v.favs_writing = true;
                         (theme::settings_path(), v.tabs_key.clone(), f.base.clone(), f.list.clone(), f.generation, v.favs_job.clone())
                     })
                     .ok();
@@ -2865,11 +2868,20 @@ impl AppView {
     /// The write that finished, taken into the list (once). `true`: the
     /// list changed (another instance's adds or removes).
     fn take_favs_written(&mut self) -> bool {
-        let mut job = self.favs_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        job.writing = false;
-        match job.done.take() {
-            Some((_, sent, file)) => self.model.favs.written(&sent, file),
-            None => false,
+        self.favs_writing = false;
+        let done = self.favs_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).done.take();
+        let changed = done.is_some_and(|(_, sent, file)| self.model.favs.written(&sent, file));
+        if changed {
+            self.carry_favs();
+        }
+        changed
+    }
+
+    /// The favourites in memory, for a write that sets a corrupt settings
+    /// file aside to carry ([`theme::carry_favourites`]).
+    fn carry_favs(&self) {
+        if let (Some(path), Some(key), None) = (theme::settings_path(), self.tabs_key.as_deref(), self.bench.as_ref()) {
+            theme::carry_favourites(&path, key, &self.model.favs.list);
         }
     }
 
@@ -2877,7 +2889,9 @@ impl AppView {
     /// written now, merged as [`AppView::schedule_favs_save`] does.
     ///
     /// A background write still running is waited for and taken first (it
-    /// holds [`FavsJob`]'s lock while it writes); one not begun never will.
+    /// holds [`FavsJob`]'s lock while it writes, never longer than the
+    /// settings lock's bounded wait and the write); one not begun never
+    /// will.
     fn flush_favs(&mut self) {
         self.favs_save = None;
         let slot = self.favs_job.clone();
@@ -4298,31 +4312,17 @@ impl AppView {
         self.model.sessions.get(row.live?).map(|m| m.id.clone())
     }
 
-    /// Favourite a rail row's session, or unfavourite it: held, a
-    /// favourite (its own row) or listed. Looked up by the row's id in the
-    /// lists as they are now, never by an index the rail was built with (a
-    /// poll may have replaced the lists since). Desktop only: nothing is
-    /// sent.
+    /// Favourite a rail row's session, or unfavourite it, by what the row
+    /// is: held, a favourite (its own row) or listed
+    /// ([`Model::toggle_fav_row`]). Looked up by the row's id in the lists
+    /// as they are now, never by an index the rail was built with (a poll
+    /// may have replaced the lists since). Desktop only: nothing is sent.
     pub(crate) fn toggle_fav_row(&mut self, key: u64) {
-        use crate::favourites::Source;
         let Some(row) = self.rail.rail.rows.iter().find(|r| r.key == key) else { return };
-        let id = match &row.action {
-            RowAction::Attach(id) => id.clone(),
-            RowAction::Resume(r) if !r.by_name => r.target.clone(),
-            RowAction::Resume(_) => return,
-        };
-        let now = crate::chrome::now_secs();
-        let m = &mut self.model;
-        if let Some(s) = m.sessions.iter().find(|s| s.id == id) {
-            m.favs.toggle(Source::Live(s), now);
-        } else if m.favs.position(&id).is_some() {
-            m.favs.remove(&id);
-        } else if let Some(v) = m.named.recent.iter().chain(m.named.saved.iter()).find(|v| v.id == id).cloned() {
-            m.favs.toggle(Source::Saved(&v), now);
-        } else {
-            return;
+        let (action, fav) = (row.action.clone(), row.fav.is_some());
+        if self.model.toggle_fav_row(&action, fav, crate::chrome::now_secs()) {
+            self.favs_changed();
         }
-        self.favs_changed();
     }
 
     /// Favourite a held session (its tab, the key), or unfavourite it.

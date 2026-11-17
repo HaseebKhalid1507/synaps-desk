@@ -718,6 +718,40 @@ pub struct SessionMeta {
     /// it: 0.
     #[serde(default)]
     pub subagents_running: usize,
+    /// How the daemon resolved the id this session was created from (a
+    /// resume, `--continue`): set at create, so the `Attached` snapshot's
+    /// meta carries it (the create-time copy). `None` for a new session and
+    /// from an older daemon.
+    #[serde(default)]
+    pub continue_info: Option<ContinueInfo>,
+}
+
+/// `SessionMeta.continue_info` (the daemon's `ContinueInfoWire`, v0.11.1):
+/// the query a resume asked for and the journal it opened. `resolved_via`
+/// `"compacted"`: the query's journal was compacted, and the daemon followed
+/// its chain forward to `session_id` (F24). `"chain"` / `"name"`: a chain or
+/// a name of that query; `None`: the journal itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct ContinueInfo {
+    /// The journal id opened.
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub resolved_via: Option<String>,
+    /// What was asked for.
+    #[serde(default)]
+    pub query: String,
+    /// The daemon's note when it followed a compaction chain.
+    #[serde(default)]
+    pub compaction_notice: Option<String>,
+}
+
+impl ContinueInfo {
+    /// The daemon followed `query`'s compactions to `session_id`.
+    pub fn compacted(&self) -> bool {
+        self.resolved_via.as_deref() == Some("compacted") && !self.query.is_empty() && !self.session_id.is_empty()
+    }
 }
 
 /// `SessionMeta.roster`: missing or `null` is empty, a bad entry is dropped.

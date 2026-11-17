@@ -1332,6 +1332,48 @@ pub fn save_favourites(
     Ok(written)
 }
 
+/// How long a write waits for another process's lock on the settings file
+/// (its read, merge and rename take milliseconds) before it writes
+/// unlocked: a holder stopped mid-write (a suspended or hung process) never
+/// freezes this one, on the UI thread or off it.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The advisory lock on `lock` (the settings' own lock file), tried until
+/// `wait` has passed; `None` (said on stderr): written unlocked. Never a
+/// blocking lock.
+fn lock_settings(lock: &Path, wait: std::time::Duration) -> Option<std::fs::File> {
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock).ok()?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Some(f),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => {
+                eprintln!("synaps-desktop: {} not locked ({e}): settings written unlocked", lock.display());
+                return None;
+            }
+        }
+    }
+}
+
+/// The favourites this process holds, per settings file and daemon key, as
+/// saved ([`crate::favourites::to_json`]): what a write that sets a corrupt
+/// file aside carries into the new one ([`try_update_settings`]).
+type Carried = Vec<(std::path::PathBuf, String, serde_json::Value)>;
+static CARRIED: std::sync::Mutex<Carried> = std::sync::Mutex::new(Vec::new());
+
+/// The favourites in memory under `key` now, for `path` ([`CARRIED`]).
+pub fn carry_favourites(path: &Path, key: &str, list: &[crate::favourites::Favourite]) {
+    let mut c = CARRIED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let v = crate::favourites::to_json(list);
+    match c.iter_mut().find(|(p, k, _)| p == path && k == key) {
+        Some((.., l)) => *l = v,
+        None => c.push((path.to_path_buf(), key.to_string(), v)),
+    }
+}
+
 /// Change the settings file with `edit` (on its JSON object), as
 /// [`save_settings`] says.
 fn update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> std::io::Result<()> {
@@ -1356,25 +1398,34 @@ fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value) ->
     // And one at a time across processes (two windows, two builds): the
     // read, the merge and the rename under an advisory lock of a file of
     // its own, so no window writes over what another wrote after its read.
-    // Best effort: where locks are not to be had, it writes unlocked.
-    let _lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path.with_extension("json.lock"))
-        .and_then(|f| f.lock().map(|()| f))
-        .ok();
+    let _lock = lock_settings(&path.with_extension("json.lock"), LOCK_WAIT);
+    // Lossy: a stray invalid byte is a file that does not parse (set aside
+    // below), never one read as missing (which would wipe every key).
     let text = match std::fs::read(path) {
         Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
     let parsed = text.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()).filter(serde_json::Value::is_object);
-    if parsed.is_none() && text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+    let set_aside = parsed.is_none() && text.as_deref().is_some_and(|t| !t.trim().is_empty());
+    if set_aside {
         std::fs::copy(path, path.with_extension("json.bad"))?;
     }
     let mut v = parsed.unwrap_or_else(|| serde_json::json!({}));
     edit(&mut v)?;
+    // Set aside, the file had the favourites (they are in `.bad` now): a
+    // write of other keys (the tabs, the theme) carries this process's in
+    // memory, unless the edit wrote them itself.
+    if set_aside {
+        for (_, key, list) in CARRIED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().filter(|(p, ..)| p == path) {
+            if !v.get("favourites").is_some_and(serde_json::Value::is_object) {
+                v["favourites"] = serde_json::json!({});
+            }
+            if v["favourites"].get(key).is_none() {
+                v["favourites"][key] = list.clone();
+            }
+        }
+    }
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     let tmp = path.with_extension(format!("json.{}.{nanos}.tmp", std::process::id()));
     let written = (|| {
@@ -1861,7 +1912,9 @@ mod tests {
     }
 
     /// R4: a write waits for another process's (the lock is advisory, on a
-    /// file of its own: two opens conflict as two processes do).
+    /// file of its own: two opens conflict as two processes do). N4: never
+    /// for longer than [`LOCK_WAIT`]: a holder that never lets go (stopped
+    /// mid-write) does not freeze it; it writes unlocked.
     #[test]
     fn a_write_waits_for_the_lock() {
         let dir = std::env::temp_dir().join(format!("synaps-desktop-lock-{}", std::process::id()));
@@ -1878,6 +1931,43 @@ mod tests {
         other.unlock().unwrap();
         writer.join().unwrap().unwrap();
         assert_eq!(load_accent(&path).as_deref(), Some("#2d7bff"));
+        // Held for good: written after the wait, unlocked.
+        other.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        save_settings(&path, &[("accent", "#35f2ff".into())]).unwrap();
+        let waited = t0.elapsed();
+        assert!(waited >= LOCK_WAIT && waited < LOCK_WAIT * 8, "{waited:?}");
+        assert_eq!(load_accent(&path).as_deref(), Some("#35f2ff"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// N5: a write of other keys (the tabs, the theme) that sets a corrupt
+    /// file aside carries the favourites this process holds for that file
+    /// into the new one (they were in it); the favourites' own write
+    /// merges as before. Another file's are not carried.
+    #[test]
+    fn a_set_aside_carries_the_favourites() {
+        use crate::favourites::{Favourite, Source};
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-carry-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v: synaps_client::SavedSession =
+            serde_json::from_value(serde_json::json!({"id": "j1", "title": "Relay", "cwd": "/w"})).unwrap();
+        let mine = vec![Favourite::of(Source::Saved(&v), 7)];
+        save_favourites(&path, "socket:/b", &[], &mine).unwrap();
+        carry_favourites(&path, "socket:/b", &mine);
+        carry_favourites(&dir.join("other.json"), "socket:/c", &mine);
+        std::fs::write(&path, r#"{"favourites": {"socket:/b": [{"id": "j1"},]}}"#).unwrap();
+        save_tabs(&path, "socket:/b", &crate::tabs::Saved::default()).unwrap();
+        assert_eq!(load_favourites(&path, "socket:/b"), mine, "carried over");
+        assert!(load_tabs(&path, "socket:/b").is_some());
+        let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(file["favourites"].get("socket:/c").is_none(), "only this file's");
+        // Not set aside: nothing carried (another instance's remove stays).
+        std::fs::write(&path, r#"{"theme": "nord"}"#).unwrap();
+        save_accent(&path, Some(0x2d7bff)).unwrap();
+        assert!(load_favourites(&path, "socket:/b").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

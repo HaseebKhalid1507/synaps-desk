@@ -2,6 +2,16 @@
 
 Commit hashes are this repository's (`synaps-desk`). PR numbers other than synaps-desk#N are those of the archived `synaps-desktop` repository this history was rewritten from.
 
+## Since c9dc8c7
+
+Additive only (synaps-desk#11 `feat/favourites`): the daemon's word on a resume that followed a compaction chain. Nothing existing changes shape.
+
+- New `SessionMeta::continue_info: Option<ContinueInfo>` (`serde(default)`; `null` or missing is `None`) and `protocol::ContinueInfo` (`#[non_exhaustive]`, every field `serde(default)`), mirroring v0.11.1's `ContinueInfoWire`: `session_id` (the journal opened), `resolved_via` (`"compacted"`, `"chain"`, `"name"` or none), `query` (what was asked for), `compaction_notice`. Set at create, so the `Attached` snapshot's meta (the create-time copy) carries it. `ContinueInfo::compacted()`: the daemon followed `query`'s compactions to `session_id` (F24). A `SessionMeta` struct literal needs `..Default::default()` as before.
+- Fixture fix: `tests/fixtures/session_swaps.ndjson`'s conversation after `compaction_applied` now names its parent (`parent_session`: the previous journal), as the engine's `Session::from_compaction_record` sets it; it had `null`.
+- Test: `tests/fixtures.rs` `session_meta_carries_continue_info`.
+
+For synaps-avatar (nyx): nothing to change.
+
 ## Since 8e69eda
 
 Message times (synaps-desk#12 `feat/message-times`). **One breaking change**, `Event::Session`'s new `ts` field; the rest is additive.

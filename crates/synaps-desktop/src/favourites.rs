@@ -15,12 +15,18 @@
 //! is this favourite only by its journal id (its live id says nothing), and
 //! a favourite follows a new journal only on the daemon's own word that it
 //! is the same conversation: the conversation's header, on the attached
-//! session (its attach, and every swap), names an id the favourite holds as
+//! session (its attach, and every swap), names the favourite's journal as
 //! its `parent_session` (set by compaction only; one hop per header, so a
-//! chain is followed swap by swap; [`Favourites::continued`]). A compaction
-//! of a session not attached here is not seen: its favourite and its new
-//! journal are two rows until it is attached. Never a wrong target, never
-//! two favourites the user added folded into one.
+//! chain is followed swap by swap; [`Favourites::continued`]), or the
+//! attached session was opened by a resume of the favourite's journal that
+//! the daemon followed down its compactions to the journal it still holds
+//! (`continue_info`, F24; any number of hops; [`Favourites::resolved`]).
+//! A compaction of a session not attached here is not seen: its favourite
+//! and its new journal are two rows until one of those says so (attached
+//! after one compaction; after more, once the session has left the daemon
+//! and the favourite's resume reopens it: a live session is handed back by
+//! its live id, with no word on how it got to the journal it holds). Never
+//! a wrong target, never two favourites the user added folded into one.
 //!
 //! Each keeps a snapshot (label, folder, model, last update): the saved
 //! listing is newest first and capped, so an old favourite may not be in it,
@@ -28,7 +34,7 @@
 
 use serde_json::{Map, Value};
 use synaps_client::SavedSession;
-use synaps_client::protocol::SessionMeta;
+use synaps_client::protocol::{ContinueInfo, SessionMeta};
 
 /// The ids a favourite keeps besides its own: a compaction adds one.
 const MAX_ALIASES: usize = 16;
@@ -308,20 +314,38 @@ impl Favourites {
 
     /// The attached session's conversation is `header` (its attach's
     /// snapshot, or a `Conversation` after a swap): if it names, as its
-    /// `parent_session`, an id a favourite holds, it is that favourite's
+    /// `parent_session`, a favourite's journal, it is that favourite's
     /// conversation compacted (the daemon sets it on a compaction's
     /// successor only; `/clear` leaves it empty, `/resume` names the
-    /// resumed one's own), and the favourite follows it there. Not if
-    /// another favourite already holds the new id: two the user added stay
-    /// two. `true`: a favourite moved (written).
+    /// resumed one's own), and the favourite follows it there. Its journal
+    /// now, not an older id it was known by (a chain is linear: a successor
+    /// of an older one is a branch). `true`: a favourite moved (written).
     pub fn continued(&mut self, header: &Value) -> bool {
         let id = header.get("id").and_then(Value::as_str).unwrap_or("");
         let parent = header.get("parent_session").and_then(Value::as_str).unwrap_or("");
-        if id.is_empty() || parent.is_empty() || self.position(id).is_some() {
+        self.follow(parent, id)
+    }
+
+    /// The attached session was opened by a resume of `info.query` that the
+    /// daemon followed down its compactions to `info.session_id` (its
+    /// `continue_info`, set at create), and it still holds that journal
+    /// (`holds`, its header's id: a session `/clear`ed or `/resume`d since,
+    /// or compacted again, says nothing here): the favourite whose journal
+    /// was asked for follows it there, however many compactions it was.
+    /// `true`: a favourite moved (written).
+    pub fn resolved(&mut self, info: &ContinueInfo, holds: &str) -> bool {
+        info.compacted() && info.session_id == holds && self.follow(&info.query, holds)
+    }
+
+    /// The favourite whose journal is `from` is `to` now, the daemon says.
+    /// Not if another favourite already holds `to`: two the user added
+    /// stay two.
+    fn follow(&mut self, from: &str, to: &str) -> bool {
+        if from.is_empty() || to.is_empty() || from == to || self.position(to).is_some() {
             return false;
         }
-        let Some(f) = self.list.iter_mut().find(|f| f.knows(parent)) else { return false };
-        f.rekey(id);
+        let Some(f) = self.list.iter_mut().find(|f| f.id == from) else { return false };
+        f.rekey(to);
         self.generation += 1;
         true
     }
@@ -675,12 +699,55 @@ mod tests {
         // Attached (its row, or the favourite's resume): reconciled.
         assert!(f.continued(&header("J2", Some("J1"))));
         assert!(f.contains(Source::Live(&compacted)));
-        // Two compactions unseen, then a resume of the old id: the attach
-        // names only the last hop: not proven, not moved (two rows).
+        // Two compactions unseen: the header names only the last hop: not
+        // proven, not moved (two rows).
         let mut f = Favourites::default();
         f.toggle(Source::Saved(&saved("J1", "Relay", "/")), 1);
         assert!(!f.continued(&header("J3", Some("J2"))));
         assert_eq!(ids(&f), ["J1"]);
+    }
+
+    fn info(query: &str, opened: &str, via: Option<&str>) -> ContinueInfo {
+        serde_json::from_value(serde_json::json!({"session_id": opened, "resolved_via": via, "query": query})).unwrap()
+    }
+
+    /// N2: two compactions unseen, then the favourite's resume, which the
+    /// daemon followed down the chain (`continue_info`: J1 resolved via
+    /// compaction to J3) to a session that holds J3: followed, however many
+    /// hops. Not when the session holds another journal now (cleared since),
+    /// nor for a name, a chain or the journal itself, nor from an older id
+    /// the favourite was known by, nor onto another favourite's journal.
+    #[test]
+    fn a_resume_down_the_chain_is_followed() {
+        let one = || {
+            let mut f = Favourites::default();
+            f.toggle(Source::Saved(&saved("J1", "Relay", "/")), 1);
+            f
+        };
+        let mut f = one();
+        let g = f.generation;
+        assert!(!f.resolved(&info("J1", "J3", Some("compacted")), "Y"), "the session holds another journal");
+        assert!(!f.resolved(&info("J1", "J3", Some("name")), "J3"));
+        assert!(!f.resolved(&info("J1", "J1", None), "J1"));
+        assert!(!f.resolved(&info("J0", "J3", Some("compacted")), "J3"), "not this favourite's");
+        assert_eq!((ids(&f), f.generation), (vec!["J1"], g));
+        assert!(f.resolved(&info("J1", "J3", Some("compacted")), "J3"));
+        assert_eq!((ids(&f), &f.list[0].aliases[..], f.generation), (vec!["J3"], &["J1".to_string()][..], g + 1));
+        assert!(f.contains(Source::Live(&live("J1", "J3", "Relay"))), "one row: held");
+        // From an alias (J1 after it moved to J3): the favourite's journal
+        // is J3; a resolve of J1 elsewhere moves nothing.
+        assert!(!f.resolved(&info("J1", "J5", Some("compacted")), "J5"));
+        assert_eq!(ids(&f), ["J3"]);
+        // Onto another favourite's journal: both stay.
+        let mut f = one();
+        f.toggle(Source::Saved(&saved("J3", "Relay, later", "/")), 2);
+        assert!(!f.resolved(&info("J1", "J3", Some("compacted")), "J3"));
+        assert_eq!(ids(&f), ["J1", "J3"]);
+        // The header's link is the favourite's journal only, too.
+        let mut f = one();
+        assert!(f.continued(&header("J2", Some("J1"))));
+        assert!(!f.continued(&header("J9", Some("J1"))), "a successor of an older id: a branch");
+        assert_eq!(ids(&f), ["J2"]);
     }
 
     /// M1: what a held session's every turn changes (its state's time) is
