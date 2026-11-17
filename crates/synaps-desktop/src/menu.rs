@@ -87,13 +87,17 @@ pub(crate) struct Menu<A> {
     /// The selected item (keyboard); a pointer-opened menu starts with none.
     pub sel: Option<usize>,
     pub at: At,
+    /// When the pointer opened it (it enters: fluid.md §3.10); none when
+    /// the keyboard did (it is there at once: a keyboard user is waiting
+    /// on the first item).
+    pub born: Option<std::time::Instant>,
 }
 
 impl<A: Copy> Menu<A> {
     /// From the keyboard the first item that can act is selected.
     pub fn new(items: Vec<Item<A>>, at: At, keyboard: bool) -> Self {
         let sel = if keyboard { items.iter().position(Item::enabled) } else { None };
-        Menu { items, sel, at }
+        Menu { items, sel, at, born: None }
     }
 
     /// The next item that can act from the selection, `down` or up,
@@ -116,6 +120,12 @@ impl<A: Copy> Menu<A> {
     /// A key (as GPUI names it; `shift` held; `press`: a new press, not a
     /// held key's repeat) while the menu is open. A repeat of Enter or
     /// Space picks nothing.
+    /// Opened by the pointer at `at` (it enters).
+    pub fn born(mut self, at: std::time::Instant) -> Self {
+        self.born = Some(at);
+        self
+    }
+
     pub fn key(&mut self, key: &str, shift: bool, press: bool) -> Key<A> {
         match key {
             "tab" => self.step(!shift),
@@ -146,30 +156,69 @@ impl<A: Copy> Menu<A> {
 /// The menu on the overlay box (design.md §8.8); `pick` acts on an item
 /// (a click, with its count: [`How`]; or Enter through [`Menu::key`]),
 /// `close` takes a mouse-down outside it.
+/// How a menu is drawn this frame: its strength and its offset toward or
+/// away from its anchor (fluid.md §3.10), and whether it is live (one
+/// leaving has no hitbox and takes no click).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Phase {
+    pub strength: f32,
+    pub dy: f32,
+    pub live: bool,
+}
+
+impl Phase {
+    /// An overlay below its anchor (`up` = -1: it starts nearer the anchor,
+    /// above) or above it (`up` = 1), entering since `born`.
+    pub fn enter(fx: &crate::motion::Motion, born: Option<std::time::Instant>, up: f32) -> Phase {
+        let (strength, rise) = fx.enter(born);
+        Phase { strength, dy: up * rise, live: true }
+    }
+
+    /// The same overlay leaving since `at`, sinking back toward its anchor;
+    /// none once gone.
+    pub fn leave(fx: &crate::motion::Motion, at: std::time::Instant, up: f32) -> Option<Phase> {
+        let (strength, sink) = fx.leave(at)?;
+        Some(Phase { strength, dy: up * sink, live: false })
+    }
+}
+
+/// The menu in `phase` (fluid.md §3.10): live, its items answer the
+/// pointer ([`AppView::touch`]) and a click outside closes it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render<A: Copy + 'static>(
     id: &'static str,
     menu: &Menu<A>,
     p: &Palette,
     pick: fn(&mut AppView, A, How, &mut Window, &mut Context<AppView>),
     close: fn(&mut AppView, &MouseDownEvent),
+    phase: Phase,
+    fx: &crate::motion::Motion,
     cx: &Context<AppView>,
 ) -> Stateful<Div> {
-    let mut col = crate::overlay::frame(v_flex(), p)
+    let col = crate::overlay::frame(v_flex(), p)
         .id(id)
+        .relative()
+        .top(px(phase.dy))
         .font_family(crate::fonts::SANS)
         .min_w(px(236.))
         .max_w(px(360.))
-        .py(px(4.))
-        .occlude()
-        .on_mouse_down_out(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+        .py(px(4.));
+    let mut col = if phase.live {
+        col.occlude().on_mouse_down_out(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
             close(this, ev);
             cx.notify();
-        }));
+        }))
+    } else {
+        col
+    };
     for (i, it) in menu.items.iter().enumerate() {
         let on = it.enabled();
         let selected = menu.sel == Some(i);
         let act = it.act;
         // The keyboard's row: the hover fill and a 1 px focus frame (§5).
+        let key = crate::app::tkey(id, i);
+        let (fill, dy) =
+            if on && phase.live { fx.fill(key, p.card, selected.then_some(p.card_hi), p.card_hi, p.press_k) } else { (None, 0.) };
         let mut row = h_flex()
             .id(("menu-item", i))
             .relative()
@@ -179,8 +228,11 @@ pub(crate) fn render<A: Copy + 'static>(
             .items_center()
             .whitespace_nowrap()
             .when(selected, |d| d.bg(p.card_hi).child(div().absolute().inset_0().border_1().border_color(p.focus_k)))
+            .when_some(fill, |d, c| d.bg(c))
             .child(
                 h_flex()
+                    .relative()
+                    .top(px(dy))
                     .flex_1()
                     .gap(px(8.))
                     .text_px(size::UI)
@@ -188,18 +240,18 @@ pub(crate) fn render<A: Copy + 'static>(
                     .child(it.label.clone())
                     .when_some(it.confirm.clone(), |d, c| d.child(crate::app::display(c, size::D_S, p.err_k))),
             )
-            .when_some(it.key, |d, k| d.child(mono(k, size::META, p.dim_k)));
-        if on {
-            row = row.cursor_pointer().hover(|d| d.bg(p.card_hi)).on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+            .when_some(it.key, |d, k| d.child(mono(k, size::META, p.dim_k).relative().top(px(dy))));
+        if on && phase.live {
+            row = AppView::touch(row.cursor_pointer(), key, cx).on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 cx.stop_propagation();
                 pick(this, act, How::Click(ev.click_count()), window, cx);
             }));
-        } else if let Some(why) = it.why_not.clone() {
+        } else if let Some(why) = it.why_not.clone().filter(|_| phase.live) {
             row = row.tooltip(move |window, cx| crate::overlay::tip(why.clone(), window, cx));
         }
         col = col.child(row);
     }
-    col
+    crate::motion::appear(col, phase.strength)
 }
 
 #[cfg(test)]

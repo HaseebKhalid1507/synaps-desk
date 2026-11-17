@@ -444,6 +444,39 @@ async fn m2_control_sees_a_reload_at_once() {
     client.shutdown().unwrap();
 }
 
+/// A storm of daemon reloads (the desktop's motion.md §5.3): each
+/// goodbye is a planned handover, so the control connection comes back on
+/// the client's short fixed retry every time, not on a doubling backoff
+/// (it was 100, 200, 400, 800, 1600 ms: the fifth reload took 1.6 s).
+#[tokio::test]
+async fn a_reload_storm_reconnects_on_a_fixed_schedule() {
+    let mut fake = Fake::start("storm").await;
+    let (client, events) = fake.client();
+    wait(&events, "connected", |e| matches!(e, Event::Status(Status::Connected { .. })).then_some(())).await;
+    let mut control = tokio::time::timeout(T, fake.accepted.recv()).await.unwrap().unwrap().upgrade().unwrap();
+    let mut took = Vec::new();
+    for g in 2..7 {
+        let t0 = tokio::time::Instant::now();
+        write(&control, json!({"type": "bye", "reason": {"bye": "reloading", "generation": g, "retry_after_ms": 50}})).await;
+        wait(&events, "reconnecting", |e| match e {
+            Event::Status(Status::Reconnecting { why }) => {
+                assert_eq!(why, synaps_client::RELOADING);
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        wait(&events, "connected again", |e| matches!(e, Event::Status(Status::Connected { .. })).then_some(())).await;
+        took.push(t0.elapsed());
+        control = tokio::time::timeout(T, fake.accepted.recv()).await.unwrap().unwrap().upgrade().unwrap();
+    }
+    assert!(
+        took.iter().all(|d| *d >= synaps_client::RELOAD_RETRY && *d < synaps_client::RELOAD_RETRY * 2),
+        "each reload back in about RELOAD_RETRY: {took:?}"
+    );
+    client.shutdown().unwrap();
+}
+
 /// Reload: an observer re-attaches as an observer (never `Takeover`), with
 /// `reconnect_of`, and input sent meanwhile is refused, not delivered late
 /// (L5). Shutdown then sends `Detach` + `Bye` (API 7).

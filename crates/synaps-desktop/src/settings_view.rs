@@ -6,10 +6,12 @@
 //! read-only with its value and the reason, never as a disabled control.
 //! It draws in a cached pane ([`crate::views::ViewPane`]).
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use gpui_kit::component::input::Input;
 use gpui_kit::component::{h_flex, v_flex};
@@ -98,10 +100,25 @@ const GROUPS: [&str; 7] = [
     "P L U G I N S",
 ];
 
+/// A shown value's hash, whether it was being sent, and when its save's
+/// afterglow begins.
+/// The segmented control's bar: its x and width springs, and where the
+/// control was laid out (each a key space of its own).
+const SEG_X: u64 = 0x7AE0 << 48;
+const SEG_W: u64 = 0x7AE1 << 48;
+const SEG_AT: u64 = 0x7AE2 << 48;
+
+/// A shown value: its hash, whether it was being sent, when its afterglow
+/// begins, and the THIS APP write it waits for (its generation).
+type Saved = (u64, bool, Option<Instant>, Option<u64>);
+
 #[derive(Default)]
 pub(crate) struct SettingsUi {
     /// The find text, lowercase.
     pub find: String,
+    /// Each value shown (by its control): what it was, whether it was being
+    /// sent, and when its save's afterglow begins (motion.md §6.8).
+    pub saved: RefCell<HashMap<SharedString, Saved>>,
     pub scroll: ScrollHandle,
     pub editing: Option<Edit>,
     /// The row whose whole help shows (by key).
@@ -119,12 +136,16 @@ pub(crate) struct SettingsUi {
     pub app_note: Option<(Vec<&'static str>, String)>,
     /// THIS APP keys waiting for their save ([`crate::app::SAVE_DELAY`]
     /// after the last change, all in one write, in order), and that save.
-    app_dirty: BTreeMap<&'static str, Option<String>>,
+    pub(crate) app_dirty: BTreeMap<&'static str, Option<String>>,
     app_save: Option<Task<()>>,
     /// The batch being written off the UI thread, and its stop: a quit's
     /// flush writes it again with what came after, and the late write
     /// then changes nothing (checked under the settings file's lock).
     app_writing: Option<(AppBatch, Arc<AtomicBool>)>,
+    /// THIS APP changes so far, and the last that a write saved (with when
+    /// it finished): a value's afterglow starts there, never on a guess.
+    app_gen: u64,
+    pub(crate) app_wrote: Option<(u64, Instant)>,
 }
 
 type AppBatch = BTreeMap<&'static str, Option<String>>;
@@ -212,6 +233,7 @@ impl AppView {
             return;
         }
         self.settings.app_note = None;
+        self.settings.app_gen += 1;
         self.settings.app_dirty.insert(key, value);
         self.arm_app_save(cx);
     }
@@ -231,6 +253,7 @@ impl AppView {
         let keys = std::mem::take(&mut self.settings.app_dirty);
         let Some(path) = theme::settings_path().filter(|_| !keys.is_empty()) else { return };
         let stop = Arc::new(AtomicBool::new(false));
+        let generation = self.settings.app_gen;
         self.settings.app_writing = Some((keys.clone(), stop.clone()));
         cx.spawn(async move |this, cx| {
             let saved = cx
@@ -242,10 +265,11 @@ impl AppView {
                 .await;
             let _ = this.update(cx, |v, cx| {
                 v.settings.app_writing = None;
-                if let Err((keys, e)) = saved {
-                    v.settings.app_note = Some((keys, format!("not saved: {e}")));
-                    v.views_changed(cx);
+                match saved {
+                    Err((keys, e)) => v.settings.app_note = Some((keys, format!("not saved: {e}"))),
+                    Ok(()) => v.settings.app_wrote = Some((generation, v.fx.now())),
                 }
+                v.views_changed(cx);
             });
         })
         .detach();
@@ -355,9 +379,56 @@ impl AppView {
     ) -> AnyElement {
         let current = sending.or(selected);
         if opts.len() <= 4 {
-            let mut seg = h_flex().h(px(28.)).border_1().border_color(p.edge);
+            // The selected bar springs to a newly selected segment (`snap`,
+            // motion.md §6.8) from the segments' places last frame; the
+            // `raised` fill moves at once.
+            let sel = opts.iter().position(|o| current == Some(o.as_ref()));
+            let fx = &self.fx;
+            // Each in a key space of its own (motion.md §2.2).
+            let h = crate::app::tkey(id, 900);
+            let (base, bar_x, bar_w, at) = (h, crate::motion::key(SEG_X, h), crate::motion::key(SEG_W, h), crate::motion::key(SEG_AT, h));
+            let places = self.seg_places.borrow();
+            let origin = places.get(&at).map(|p| p.0);
+            let place = |i: usize| places.get(&crate::app::tkey(id, i)).zip(origin).map(|(&(x, w), o)| (x - o, w));
+            let moved = sel.and_then(|s| fx.changed(base, s as u64)).is_some_and(|(_, at)| at == fx.now());
+            let mut bar = None;
+            if let Some((x, w)) = sel.and_then(place) {
+                if moved && let (Some(x0), Some(w0)) = (fx.spring_at(bar_x), fx.spring_at(bar_w)) {
+                    fx.spring_jump(bar_x, x0, x, crate::motion::SNAP_RESPONSE);
+                    fx.spring_jump(bar_w, w0, w, crate::motion::SNAP_RESPONSE);
+                }
+                let ((bx, mx), (bw, mw)) =
+                    (fx.spring_held(bar_x, x, crate::motion::SNAP_RESPONSE), fx.spring_held(bar_w, w, crate::motion::SNAP_RESPONSE));
+                if mx || mw {
+                    bar = Some((bx, bw));
+                }
+            }
+            drop(places);
+            let sink = self.seg_places.clone();
+            let mut seg = h_flex().relative().h(px(28.)).border_1().border_color(p.edge).child({
+                let sink = sink.clone();
+                canvas(
+                    move |b, _, _| {
+                        sink.borrow_mut().insert(at, (f32::from(b.origin.x), f32::from(b.size.width)));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0()
+            });
             for (i, o) in opts.into_iter().enumerate() {
                 let on = current == Some(o.as_ref());
+                let sink = sink.clone();
+                let key = crate::app::tkey(id, i);
+                // Where it is, for the bar's next move.
+                let place = canvas(
+                    move |b, _, _| {
+                        sink.borrow_mut().insert(key, (f32::from(b.origin.x), f32::from(b.size.width)));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0();
                 let color = match (on, sending.is_some()) {
                     (true, true) => p.dim,
                     (true, false) => p.ink,
@@ -373,15 +444,26 @@ impl AppView {
                         .flex()
                         .items_center()
                         .when(i > 0, |d| d.border_l_1().border_color(p.edge))
+                        .child(place)
                         // Selected (design.md §5): `raised` and a 2 px you bar on top.
-                        .when(on, |d| d.bg(p.raised).child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(p.you_bar)))
+                        .when(on, |d| {
+                            d.bg(p.raised)
+                                .when(bar.is_none(), |d| d.child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(p.you_bar)))
+                        })
                         .cursor_pointer()
-                        .hover(|d| d.bg(p.raised))
+                        .when(!on, |d| d.hover(|d| d.bg(p.raised)))
+                        // Pressed (fluid.md §3.9): state, in the frame the
+                        // pointer goes down.
+                        .active(|d| d.bg(p.press_ch))
                         .child(mono(o, 13., color))
                         .on_click(cx.listener(move |this, _, _, cx| this.settings_pick(what, &v, cx))),
                 );
             }
-            return seg.into_any_element();
+            // Over the segments: their fills (the new one's `raised`, a
+            // hover's) never cover it on its way.
+            return seg
+                .children(bar.map(|(x, w)| div().absolute().top_0().left(px(x)).w(px(w)).h(px(2.)).bg(p.you_bar)))
+                .into_any_element();
         }
         let open = self.settings.dropdown == Some(id);
         let shown: SharedString = current.map(|s| SharedString::from(s.to_string())).unwrap_or_else(|| "default".into());
@@ -416,7 +498,10 @@ impl AppView {
                     .border_1()
                     .border_color(if open { p.focus } else { p.edge })
                     .cursor_pointer()
-                    .child(mono(shown, 13., if sending.is_some() { p.dim } else { p.prose }).flex_1())
+                    .child({
+                        let k = self.saved_glow(&SharedString::from(id), &shown, sending.is_some());
+                        mono(shown, 13., if sending.is_some() { p.dim } else { crate::motion::mix(p.prose, p.ink, k) }).flex_1()
+                    })
                     .child(mono(if open { "↑" } else { "↓" }, 12., p.dim))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings.dropdown = if this.settings.dropdown == Some(id) { None } else { Some(id) };
@@ -429,6 +514,60 @@ impl AppView {
 
     /// A number or text field: its value in a box; click to edit (Enter
     /// saves, Esc leaves it).
+    /// A shown value's afterglow once saved (motion.md §6.8: the
+    /// confirmation, no toast): a THIS APP value when the write that saved
+    /// it finished (none if it failed), a daemon one when its write is
+    /// answered. Never on first sight: what changed while Settings was not
+    /// shown is history (the map is cleared when it hides). Its `k`.
+    /// The THIS APP key of control `id` ("usage-range", "field-dash-url")
+    /// is waiting to be written, or being written.
+    fn app_pending(&self, id: &SharedString) -> bool {
+        let key = id.strip_prefix("field-").unwrap_or(id).replace('-', "_");
+        let key = key.as_str();
+        self.settings.app_dirty.contains_key(key) || self.settings.app_writing.as_ref().is_some_and(|(keys, _)| keys.contains_key(key))
+    }
+
+    pub(crate) fn saved_glow(&self, id: &SharedString, value: &str, sending: bool) -> f32 {
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut h);
+            h.finish()
+        };
+        let now = self.fx.now();
+        let mut saved = self.settings.saved.borrow_mut();
+        let wrote = self.settings.app_wrote;
+        let since = match saved.get(id).copied() {
+            Some((was, was_sending, _, _)) if (was, was_sending) != (hash, sending) => {
+                let (since, wait) = match (sending, was_sending) {
+                    (true, _) => (None, None),
+                    (false, true) => (Some(now), None),
+                    // Changed, not by a send: this app's own key waits for
+                    // its write; anything else (another client, the
+                    // daemon) glows as it lands.
+                    (false, false) if self.app_pending(id) => (None, Some(self.settings.app_gen)),
+                    (false, false) => (Some(now), None),
+                };
+                saved.insert(id.clone(), (hash, sending, since, wait));
+                since
+            }
+            Some((h, s, None, Some(g))) => match wrote.filter(|&(w, _)| w >= g) {
+                Some((_, at)) => {
+                    saved.insert(id.clone(), (h, s, Some(at), None));
+                    Some(at)
+                }
+                None => None,
+            },
+            Some((_, _, since, _)) => since,
+            None => {
+                saved.insert(id.clone(), (hash, sending, None, None));
+                None
+            }
+        };
+        drop(saved);
+        self.fx.afterglow(since)
+    }
+
     fn field(&self, e: Edit, value: SharedString, unit: &'static str, sending: bool, p: &Palette, cx: &ViewCx) -> AnyElement {
         let editing = self.settings.editing == Some(e);
         let id: SharedString = match e {
@@ -445,7 +584,9 @@ impl AppView {
                 .child(Input::new(&self.settings_input).appearance(false))
                 .into_any_element()
         } else {
-            mono(value, 13., if sending { p.dim } else { p.prose }).flex_1().min_w_0().overflow_hidden().text_ellipsis().into_any_element()
+            let k = self.saved_glow(&id, &value, sending);
+            let color = if sending { p.dim } else { crate::motion::mix(p.prose, p.ink, k) };
+            mono(value, 13., color).flex_1().min_w_0().overflow_hidden().text_ellipsis().into_any_element()
         };
         h_flex()
             .id(id)

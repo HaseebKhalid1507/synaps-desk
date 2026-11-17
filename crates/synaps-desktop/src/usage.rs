@@ -270,7 +270,6 @@ pub struct Raw {
 impl Raw {
     /// A design fixture (`usage-design/data/<host>.json`): every endpoint's
     /// body under its key.
-    #[cfg(test)]
     pub fn from_fixture(v: &serde_json::Value) -> Result<Raw, String> {
         let get = |k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
         macro_rules! de {

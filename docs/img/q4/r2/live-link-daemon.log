@@ -1,0 +1,6 @@
+reloaded (pid 417231, generation 2, sessions 0)
+reloaded (pid 417231, generation 3, sessions 0)
+reloaded (pid 417231, generation 3, sessions 0)
+reloaded (pid 417231, generation 3, sessions 0)
+daemon stopped (pid 417231)
+daemon started (pid 418908, socket /home/haseeb/.synaps-cli/run/daemon-desktopproto.sock)

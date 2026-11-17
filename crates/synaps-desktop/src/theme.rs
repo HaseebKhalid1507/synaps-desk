@@ -145,6 +145,53 @@ pub fn step(ground: u32, toward: u32, target: f64) -> u32 {
     step_upto(ground, toward, target, 80)
 }
 
+/// How far a pressed fill stands off both its hover fill and its rest
+/// fill, at least (a contrast ratio): a press is a state of its own, never
+/// "the hover went off" (fluid.md §3.9). 1.05 is about a third of a
+/// [`STEP`], the least two flat fills side by side are told apart at.
+pub const PRESS_MIN: f64 = 1.05;
+
+/// A pressed fill (fluid.md §3.9): `hover` (which is `rest` one [`STEP`]
+/// toward the ink) stepped on, to the ink's side of it (toward white or
+/// black: a fill as light as the ink still has room), until it stands
+/// [`STEP`] off it, no further than every one of `texts` still reads on it
+/// at [`TEXT`] and every one of `marks` at [`MARK`]. Where that way is
+/// blocked short of [`PRESS_MIN`] (texts floored onto the hover fill
+/// itself), it steps back toward the rest fill and stops halfway, where it
+/// stands farthest off both. Either way at least [`PRESS_MIN`] off each
+/// (`press_is_visible_in_every_theme`): never the hover, never the rest.
+pub fn pressed(rest: u32, hover: u32, toward: u32, texts: &[u32], marks: &[u32]) -> u32 {
+    let ok = |c: u32| texts.iter().all(|&t| contrast(t, c) >= TEXT) && marks.iter().all(|&m| contrast(m, c) >= MARK);
+    // How far `c` stands off the nearer of the two.
+    let apart = |c: u32| contrast(c, hover).min(contrast(c, rest));
+    let side = if luminance(toward) > luminance(hover) { 0xffffff } else { 0x000000 };
+    let mut near = hover;
+    for i in 1..=200u8 {
+        let c = mix(hover, side, f64::from(i) * 0.005);
+        if !ok(c) {
+            break;
+        }
+        near = c;
+        if contrast(c, hover) >= STEP {
+            break;
+        }
+    }
+    if apart(near) >= PRESS_MIN {
+        return near;
+    }
+    // Back toward rest (away from the ink): the farthest from both.
+    let away = side ^ 0xffffff;
+    let mut far = hover;
+    for i in 1..=80u8 {
+        let c = mix(hover, away, f64::from(i) * 0.005);
+        if !ok(c) || apart(c) < apart(far) {
+            break;
+        }
+        far = c;
+    }
+    if apart(far) > apart(near) { far } else { near }
+}
+
 /// [`step`], at most `steps` half-percent steps toward `toward`.
 fn step_upto(ground: u32, toward: u32, target: f64, steps: u8) -> u32 {
     let mut out = ground;
@@ -322,6 +369,24 @@ macro_rules! roles {
                 Palette { $($name: hsla(r.$name),)* sel: Hsla { a: 0.35, ..hsla(r.focus) } }
             }
 
+            /// Every role `t` (0..1) of the way to `to`'s, mixed as an
+            /// opacity would paint it (motion.md §6.8's palette cross-fade);
+            /// the selection wash is `to`'s once there.
+            pub fn lerp(&self, to: &Palette, t: f32) -> Palette {
+                if t >= 1. {
+                    return *to;
+                }
+                if t <= 0. {
+                    return *self;
+                }
+                Palette { $($name: crate::motion::mix(self.$name, to.$name, t),)* sel: self.sel }
+            }
+
+            /// Every role, by name.
+            fn each_mut(&mut self, mut f: impl FnMut(&'static str, &mut Hsla)) {
+                $(f(stringify!($name), &mut self.$name);)*
+            }
+
             /// A role by its name (the tests).
             #[cfg(test)]
             pub fn role(&self, name: &str) -> Option<Hsla> {
@@ -375,6 +440,11 @@ roles! {
     // The filled buttons' hover (a step toward the ink); a scrollbar's
     // thumb at rest on the canvas, the chrome and the user surface.
     btn_hi, warn_hi, thumb, thumb_ch, thumb_u,
+    // Pressed (fluid.md §3.9): a step off each hover fill, toward the ink
+    // or else away from it, never through a floor of what is drawn on it:
+    // on the chrome (`raised`), the card (`card_hi`), and the two filled
+    // buttons. (A run row's press waits for its row roles, Q1.)
+    press_ch, press_k, btn_press, warn_press,
     // The chrome, on `bg` and the raised row: text, then marks.
     prose_ch, dim_ch, header, warn_ch, run_ch, unread_ch, open_ch, ready_ch, err_ch, cost_ch, ok_ch, edit_ch, write_ch, bash_ch,
     sub_name, sub_status, sub_done, sub_time,
@@ -385,6 +455,25 @@ roles! {
 }
 
 impl Palette {
+    /// The link is down (motion.md §5.3): every role but the grounds and
+    /// the ink `0.7 × k` of the way to the grey of its own luminance (so
+    /// every contrast stays): status, identity, accent, the chrome's heads
+    /// and wordmark, the rail's marks, tool hues, chart series. The window
+    /// is visibly stale; its words still read.
+    pub fn drained(&self, k: f32) -> Palette {
+        if k <= 0. {
+            return *self;
+        }
+        let t = 0.7 * k.min(1.);
+        let mut p = *self;
+        p.each_mut(|name, c| {
+            if !UNDRAINED.contains(&name) {
+                *c = drain_hsla(*c, t);
+            }
+        });
+        p
+    }
+
     /// The chrome's numbers as last seen, not live (the right panel
     /// detached, or a cached tab opening): every chrome text role in
     /// `dim_ch`, every chrome mark in `rest_mark` (it was `opacity(0.45)`).
@@ -664,6 +753,38 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     {
         f.log.push(Check { role, from, color: c, grounds: vec![ground], floor: HAIR });
     }
+    // Pressed ([`pressed`]): what is drawn on each is logged on it.
+    {
+        let (texts_ch, marks_ch) = (
+            [r.ink, r.prose_ch, r.dim_ch, r.header, r.warn_ch, r.run_ch, r.unread_ch, r.open_ch, r.ready_ch, r.err_ch, r.cost_ch, r.ok_ch],
+            [r.warn_mark_ch, r.run_mark_ch, r.unread_mark_ch, r.focus_ch, r.ready_mark_ch, r.err_mark_ch, r.rest_mark, r.you_bar],
+        );
+        let (texts_k, marks_k) = (
+            [r.ink, r.prose_k, r.dim_k, r.warn_k, r.err_k, r.run_k, r.ok_k],
+            [r.run_mark_k, r.err_mark_k, r.rest_mark_k, r.focus_k, r.warn_mark],
+        );
+        let label = [chrome];
+        // (role, rest, hover, what is drawn on it: texts, marks)
+        type Set<'a> = (&'static str, u32, u32, &'a [u32], &'a [u32]);
+        let sets: [Set; 4] = [
+            ("press_ch", chrome, raised, &texts_ch, &marks_ch),
+            ("press_k", card, card_hi, &texts_k, &marks_k),
+            ("btn_press", r.btn_fill, r.btn_hi, &label, &[]),
+            ("warn_press", r.warn_fill, r.warn_hi, &label, &[]),
+        ];
+        let mut out = [0u32; 4];
+        for (i, (role, rest, hover, texts, marks)) in sets.into_iter().enumerate() {
+            let c = pressed(rest, hover, ink, texts, marks);
+            out[i] = c;
+            for &t in texts {
+                f.log.push(Check { role, from: t, color: t, grounds: vec![c], floor: TEXT });
+            }
+            for &m in marks {
+                f.log.push(Check { role, from: m, color: m, grounds: vec![c], floor: MARK });
+            }
+        }
+        [r.press_ch, r.press_k, r.btn_press, r.warn_press] = out;
+    }
     // Series: five theme colours at the mark floor on the canvas; one that
     // lands within 1.25:1 of an earlier one is mixed 40 % toward the ink.
     // Warning and error colours are never series (they keep their meaning).
@@ -792,6 +913,46 @@ pub struct Scheme {
     /// Agent prose (installed as every text view's default) and the user's
     /// own text, which only differs in its foreground.
     pub user_text: TextViewStyle,
+    /// A theme or accent change cross-fading (motion.md §6.8): the palette
+    /// before it, when it began, and how far it is as of the app's frame
+    /// ([`Scheme::fade`]). [`palette`] paints from that blend.
+    pub from: std::cell::Cell<Option<(Palette, Option<std::time::Instant>, f32)>>,
+    /// The link is down (motion.md §5.3): how drained the palette is, as of
+    /// the app's frame (0: not at all).
+    pub drain: std::cell::Cell<f32>,
+    /// The blended palette for the last (fade, drain), so the many reads a
+    /// frame (one per transcript row) cost a copy, not a blend.
+    cache: std::cell::Cell<Option<(f32, f32, Palette)>>,
+    /// A cross-fade's kit theme and text views' style wait for its last
+    /// frame (motion.md §6.8).
+    sync_due: std::cell::Cell<bool>,
+    /// How far through the cross-fade the text views' style was last
+    /// installed (1: at the end, or no fade).
+    pub text_t: std::cell::Cell<f32>,
+}
+
+impl Scheme {
+    /// The cross-fade's start (none: its first frame is next) and its last
+    /// progress, if one runs.
+    pub fn fading(&self) -> Option<(Option<std::time::Instant>, f32)> {
+        self.from.get().map(|(_, at, t)| (at, t))
+    }
+
+    /// The app's frame sets when the cross-fade began (its first frame) and
+    /// how far it is (`t` 1: over). True on its last frame: the kit's theme
+    /// and the text views' style are due ([`settle_fade`]).
+    pub fn fade(&self, at: std::time::Instant, t: f32) -> bool {
+        self.from.set(self.from.get().filter(|_| t < 1.).map(|(p, _, _)| (p, Some(at), t)));
+        t >= 1. && self.sync_due.replace(false)
+    }
+
+    /// The cross-fade's blend, not drained.
+    fn blended(&self) -> Palette {
+        match self.from.get() {
+            Some((from, _, t)) => from.lerp(&self.p, t),
+            None => self.p,
+        }
+    }
 }
 
 impl Global for Scheme {}
@@ -805,13 +966,75 @@ impl Scheme {
         // quoted, link and heading colours are the ones floored there.
         let on_user = Palette { prose: p.ink, dim: p.dim_u, agent: p.agent_u, head: p.head_u, ..p };
         let user_text = text_style(&on_user, &m, luminance(roles.canvas) < 0.5);
-        Scheme { choice, roles, p, m, user_text }
+        Scheme {
+            choice,
+            roles,
+            p,
+            m,
+            user_text,
+            from: Default::default(),
+            drain: Default::default(),
+            cache: Default::default(),
+            sync_due: Default::default(),
+            text_t: std::cell::Cell::new(1.),
+        }
     }
+}
+
+/// The palette not drained (a cross-fade's blend): what the link's Scan
+/// is drawn in, live again from its first frame (motion.md §5.1).
+pub fn live_palette(cx: &App) -> Palette {
+    cx.global::<Scheme>().blended()
 }
 
 /// The palette, by value (no allocation).
 pub fn palette(cx: &App) -> Palette {
-    cx.global::<Scheme>().p
+    let s = cx.global::<Scheme>();
+    let (k, fade) = (s.drain.get(), s.from.get());
+    if k <= 0. && fade.is_none() {
+        return s.p;
+    }
+    let t = fade.map_or(1., |f| f.2);
+    if let Some((ck, ct, p)) = s.cache.get()
+        && (ck, ct) == (k, t)
+    {
+        return p;
+    }
+    let p = s.blended().drained(k);
+    s.cache.set(Some((k, t, p)));
+    p
+}
+
+/// A colour's relative luminance (WCAG).
+#[cfg(test)]
+pub fn luminance_hsla(c: Hsla) -> f32 {
+    let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let rgb = Rgba::from(c);
+    0.2126 * lin(rgb.r) + 0.7152 * lin(rgb.g) + 0.0722 * lin(rgb.b)
+}
+
+/// What a drain leaves: the grounds (and what is a ground: fills, rules,
+/// thumbs), and the ink and prose the words are in.
+const UNDRAINED: &[&str] = &[
+    "chrome", "canvas", "user", "code", "tool", "tool_out", "card", "card_hi", "raised", "hair", "edge", "frame", "add_bg", "del_bg",
+    "thumb", "thumb_ch", "thumb_u", "press_ch", "press_k", "ink", "prose",
+    // Q1's (PR #16) ground and rules (a well greys while the code beside
+    // it doesn't): `grounds_and_rules_never_drain` fails on any new one
+    // missing here.
+    "well", "hair_w", "hair_t", "edge_t",
+];
+
+/// `c` mixed `t` toward the grey of its own relative luminance, in linear
+/// light (motion.md §5.3's drain): its luminance, so every contrast it
+/// makes, stays.
+pub fn drain_hsla(c: Hsla, t: f32) -> Hsla {
+    let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let enc = |l: f32| if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1. / 2.4) - 0.055 };
+    let rgb = Rgba::from(c);
+    let (r, g, b) = (lin(rgb.r), lin(rgb.g), lin(rgb.b));
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let ch = |v: f32| enc(v + (y - v) * t).clamp(0., 1.);
+    Hsla::from(Rgba { r: ch(r), g: ch(g), b: ch(b), a: rgb.a })
 }
 
 pub fn metrics(cx: &App) -> Metrics {
@@ -827,13 +1050,51 @@ pub fn apply(choice: Choice, cx: &mut App) {
         return;
     }
     let s = Scheme::new(choice);
-    let (p, m, roles) = (s.p, s.m, s.roles);
+    // A change of colour while the window shows one (not the first)
+    // cross-fades from what was painted (motion.md §6.8), under Full: the
+    // palette blends, and the kit's theme and the text views' style follow
+    // on its last frame. Not across a polarity (dark to light): text and
+    // ground would pass through each other's colour mid-fade, so that is
+    // instant, as is a text size (no colour changes).
+    let dark = luminance(s.roles.canvas) < 0.5;
+    let fade = crate::motion::Level::current(cx) == crate::motion::Level::Full
+        && cx.try_global::<Scheme>().is_some_and(|old| old.p != s.p && (luminance(old.roles.canvas) < 0.5) == dark);
+    if fade {
+        let old = cx.global::<Scheme>();
+        s.from.set(Some((old.blended(), None, 0.)));
+        s.sync_due.set(true);
+        s.drain.set(old.drain.get());
+    } else if let Some(old) = cx.try_global::<Scheme>() {
+        s.drain.set(old.drain.get());
+    }
     cx.set_global(s);
-    sync_kit(&p, &roles, cx);
-    let dark = luminance(roles.canvas) < 0.5;
-    TextViewDefaults::global(cx).with_style(text_style(&p, &m, dark)).with_inherit_text_color(false).install(cx);
+    if !fade {
+        settle_fade(cx);
+    }
     // A global: cached views (the app's) don't see it change.
     cx.refresh_windows();
+}
+
+/// The kit's theme (inputs, scrollbars, focus ring, code colours) and
+/// every text view's default style, from the scheme: at once, or on a
+/// cross-fade's last frame.
+pub fn settle_fade(cx: &mut App) {
+    let s = cx.global::<Scheme>();
+    let (p, m, roles) = (s.p, s.m, s.roles);
+    sync_kit(&p, &roles, cx);
+    cx.global::<Scheme>().text_t.set(1.);
+    let dark = luminance(roles.canvas) < 0.5;
+    TextViewDefaults::global(cx).with_style(text_style(&p, &m, dark)).with_inherit_text_color(false).install(cx);
+}
+
+/// The text views' style from this frame's cross-fade blend (re-gate 5):
+/// their colours (prose, links, code spans, headings) move with the
+/// grounds, not after them. [`settle_fade`] installs the end.
+pub fn blend_text(cx: &mut App) {
+    let s = cx.global::<Scheme>();
+    let (p, m, dark, t) = (s.blended(), s.m, luminance(s.roles.canvas) < 0.5, s.from.get().map_or(1., |f| f.2));
+    s.text_t.set(t);
+    TextViewDefaults::global(cx).with_style(text_style(&p, &m, dark)).with_inherit_text_color(false).install(cx);
 }
 
 /// Change one part of the current [`Choice`].
@@ -1488,6 +1749,148 @@ fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value) ->
 mod tests {
     use super::*;
 
+    /// The drain (motion.md §5.3) keeps every role's contrast on every
+    /// ground, in every theme and accent: each drained role sits at its own
+    /// luminance (to within the 8-bit rounding of its channels), and the
+    /// grounds, text and lines don't move.
+    #[test]
+    fn drain_keeps_every_floor() {
+        let lum = |c: Hsla| f64::from(luminance_hsla(c));
+        let con = |a: Hsla, b: Hsla| {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        };
+        let mut worst = 0f64;
+        for (name, raw) in crate::palettes::THEMES {
+            for accent in [None, Some(0xe8132f), Some(0xf4b400), Some(0x2d7bff), Some(0x35f2ff)] {
+                let p = Palette::of(&resolve(&raw, accent).0);
+                let d = p.drained(1.);
+                assert_eq!(
+                    (d.canvas, d.chrome, d.ink, d.prose, d.hair, d.tool, d.user),
+                    (p.canvas, p.chrome, p.ink, p.prose, p.hair, p.tool, p.user),
+                    "{name}"
+                );
+                assert_ne!(d.run, p.run, "{name}: the live colour drains");
+                for (a, b) in [
+                    (p.run, d.run),
+                    (p.err_ch, d.err_ch),
+                    (p.warn_mark, d.warn_mark),
+                    (p.you_bar, d.you_bar),
+                    (p.ok, d.ok),
+                    (p.focus, d.focus),
+                ] {
+                    for ground in [p.canvas, p.chrome, p.tool, p.user] {
+                        worst = worst.max((con(a, ground) - con(b, ground)).abs());
+                    }
+                }
+                assert_eq!(p.drained(0.), p, "{name}: none at 0");
+                // Every role but the grounds and the words loses most of its
+                // hue (the wordmark and heads, rail marks, chart series too).
+                let chroma = |c: Hsla| {
+                    let c = Rgba::from(c);
+                    c.r.max(c.g).max(c.b) - c.r.min(c.g).min(c.b)
+                };
+                let (mut dp, mut pp) = (d, p);
+                let mut was = Vec::new();
+                pp.each_mut(|n, c| was.push((n, *c)));
+                let mut i = 0;
+                dp.each_mut(|n, c| {
+                    let (_, before) = was[i];
+                    i += 1;
+                    if !UNDRAINED.contains(&n) {
+                        assert!(chroma(*c) <= 0.5 * chroma(before) + 0.01, "{name}: {n} keeps its hue: {before:?} → {c:?}");
+                    }
+                });
+            }
+        }
+        assert!(worst < 0.06, "the drain moved a contrast by {worst:.3}");
+    }
+
+    /// The drain (motion.md §5.3) keeps every ground and rule: any role
+    /// named as one (a `hair*`, `edge*`, `well`, `*_bg`, the grounds) is
+    /// in `UNDRAINED`. A branch that adds one (Q1: `well`, `hair_w`,
+    /// `hair_t`, `edge_t`) fails here until it is kept.
+    #[test]
+    fn grounds_and_rules_never_drain() {
+        let mut p = Palette::of(&resolve(&crate::palettes::THEMES[0].1, None).0);
+        let mut missing = Vec::new();
+        p.each_mut(|n, _| {
+            let rule = n.starts_with("hair") || n.starts_with("edge") || n.starts_with("well") && !n.contains("_fg") || n.ends_with("_bg");
+            if rule && !UNDRAINED.contains(&n) {
+                missing.push(n);
+            }
+        });
+        assert!(missing.is_empty(), "grounds and rules that would drain: {missing:?}");
+    }
+
+    /// A press is a state of its own (fluid.md §3.9): every pressed fill
+    /// stands [`PRESS_MIN`] off both its hover fill and its rest fill, in
+    /// every theme (20) and accent (7), for all four press roles, and
+    /// everything drawn on it still reads (its checks are in the log).
+    #[test]
+    fn press_is_visible_in_every_theme() {
+        let mut worst = (f64::MAX, String::new());
+        for (name, raw) in crate::palettes::THEMES {
+            for accent in [None, Some(0xe8132f), Some(0xf4b400), Some(0xcfa85a), Some(0x2d7bff), Some(0x35f2ff), Some(0x2bd47d)] {
+                let (r, log) = resolve(&raw, accent);
+                let raised = step(r.chrome, r.ink, STEP);
+                for (role, press, rest, hover) in [
+                    ("press_ch", r.press_ch, r.chrome, raised),
+                    ("press_k", r.press_k, r.card, r.card_hi),
+                    ("btn_press", r.btn_press, r.btn_fill, r.btn_hi),
+                    ("warn_press", r.warn_press, r.warn_fill, r.warn_hi),
+                ] {
+                    assert_ne!(press, hover, "{name} {accent:?} {role}: the hover fill");
+                    assert_ne!(press, rest, "{name} {accent:?} {role}: the rest fill");
+                    for (what, c) in [("hover", contrast(press, hover)), ("rest", contrast(press, rest))] {
+                        if c < worst.0 {
+                            worst = (c, format!("{name} {accent:?} {role} vs {what}"));
+                        }
+                    }
+                }
+                for c in log.iter().filter(|c| c.role.contains("press")) {
+                    for &g in &c.grounds {
+                        assert!(contrast(c.color, g) >= c.floor - 1e-9, "{name} {accent:?} {}: {:06x} on {g:06x}", c.role, c.color);
+                    }
+                }
+            }
+        }
+        assert!(worst.0 >= PRESS_MIN, "a press too close to its hover or rest: {:.3} ({})", worst.0, worst.1);
+    }
+
+    /// The drain keeps every floor the theme was lifted to: each check of
+    /// the log, re-run on the drained palette's colours.
+    #[test]
+    fn drained_checks_hold() {
+        let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        let lum = |c: Hsla| {
+            let c = Rgba::from(c);
+            f64::from(0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b))
+        };
+        let con = |a: Hsla, b: Hsla| {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        };
+        let mut bad = Vec::new();
+        for (name, raw) in crate::palettes::THEMES {
+            for accent in [None, Some(0xe8132f), Some(0x2d7bff)] {
+                let (_, log) = resolve(&raw, accent);
+                for c in &log {
+                    let d = drain_hsla(hsla(c.color), 0.7);
+                    for &g in &c.grounds {
+                        // The grounds that drain (button fills) drain too.
+                        let dg = drain_hsla(hsla(g), 0.7);
+                        let got = con(d, hsla(g)).min(con(d, dg));
+                        if got < c.floor - 0.01 {
+                            bad.push(format!("{name} {accent:?} {}: {got:.3} < {}", c.role, c.floor));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
     #[test]
     fn hex_parsing() {
         assert_eq!(parse_hex("#e8132f"), Some(0xe8132f));
@@ -1718,7 +2121,7 @@ mod tests {
         for (name, raw) in palettes::THEMES {
             let p = Palette::of(&resolve(&raw, None).0);
             let f = p.faded();
-            for role in super::ROLE_NAMES.iter().filter(|r| r.ends_with("_ch") && !["dim_ch", "thumb_ch"].contains(r)) {
+            for role in super::ROLE_NAMES.iter().filter(|r| r.ends_with("_ch") && !["dim_ch", "thumb_ch", "press_ch"].contains(r)) {
                 assert_ne!(p.role(role), f.role(role), "{name}: {role} stays bright on a faded panel");
             }
         }
@@ -1728,7 +2131,22 @@ mod tests {
     /// colour moves with it.
     #[test]
     fn the_accent_colours_you_and_focus_only() {
-        let allowed = ["you", "you_mark", "you_mark_t", "btn_fill", "btn_hi", "focus", "focus_ch", "focus_k", "open_ch", "you_bar"];
+        // The pressed fills are held back by the accent's marks drawn on them.
+        let allowed = [
+            "you",
+            "you_mark",
+            "you_mark_t",
+            "btn_fill",
+            "btn_hi",
+            "focus",
+            "focus_ch",
+            "focus_k",
+            "open_ch",
+            "you_bar",
+            "press_ch",
+            "press_k",
+            "btn_press",
+        ];
         for (name, raw) in palettes::THEMES {
             let (a, base) = resolve(&raw, None);
             for &(_, accent) in PRESETS {

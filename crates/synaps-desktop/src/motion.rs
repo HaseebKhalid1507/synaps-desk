@@ -122,9 +122,6 @@ impl Setting {
 
 pub(crate) const QUICK: Duration = Duration::from_millis(120);
 pub(crate) const BASE: Duration = Duration::from_millis(200);
-// Q1 took the tool rows' lit bar (its one use) away; Q4's chrome and
-// charts use it again: drop this allow when they land (motion.md §2).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SLOW: Duration = Duration::from_millis(360);
 pub(crate) const GLOW: Duration = Duration::from_millis(480);
 pub(crate) const SIG: Duration = Duration::from_millis(600);
@@ -193,12 +190,36 @@ pub(crate) const LIFT: f32 = 0.7;
 pub(crate) const ARRIVE: f32 = 8.;
 /// A view (session, tab, worker) arriving travels this far, in its direction.
 pub(crate) const SHIFT: f32 = 12.;
+/// Chrome key `id` in the key space `space` (its top 16 bits): a row's
+/// hashed key never reaches into another space.
+pub(crate) const fn key(space: u64, id: u64) -> u64 {
+    space | (id & 0xFFFF_FFFF_FFFF)
+}
+
+/// A hover fill comes on over this (fluid.md §3.9)…
+pub(crate) const HOVER_IN: Duration = Duration::from_millis(60);
+/// …and goes off over this: sweeping down the rail leaves a trail.
+pub(crate) const HOVER_OUT: Duration = Duration::from_millis(160);
+/// A press holds a control's content this far down (no div scale in GPUI:
+/// a 1 px travel, fluid.md §3.9).
+pub(crate) const PRESS: f32 = 1.;
+/// An overlay rises this far from its anchor side as it enters (`rise`,
+/// fluid.md §2.3: 6, was motion.md's 4).
+pub(crate) const RISE_FLUID: f32 = 6.;
+/// An overlay leaving sinks this far back toward its anchor.
+pub(crate) const SINK: f32 = 2.;
+/// One overlay replacing another this soon doesn't re-enter (it follows).
+pub(crate) const REPLACE: Duration = Duration::from_millis(300);
+/// A switch this soon after the last is instant (fluid.md §3.6).
+pub(crate) const RAPID: Duration = Duration::from_millis(150);
 /// A streamed word reaches full strength over this.
 pub(crate) const STREAM_FADE: Duration = Duration::from_millis(180);
 /// Each further word of one update starts this much later.
 pub(crate) const STREAM_STAGGER: Duration = Duration::from_millis(12);
 /// Positions settle within this (px).
 const FLUID_EPSILON: f32 = 0.5;
+/// A press's release has settled (its fill and travel, as progress).
+const PRESS_EPSILON: f32 = 0.002;
 
 /// `stream`: a streamed word's strength, piecewise linear 0.70 at 0, 0.88
 /// at 0.35, 1.0 at 1: it starts at the floor, so no word is ever faint.
@@ -223,6 +244,14 @@ pub(crate) fn text_motion() -> gpui_kit::base::TextViewMotion {
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn lift<E: Styled>(el: E, strength: f32) -> E {
     if strength >= 1. { el } else { el.opacity(strength.max(LIFT)) }
+}
+
+/// The overlay's strength (fluid.md §3.10): transient chrome appearing
+/// under the pointer on the overlay box (opaque `card`) may start at 0.
+/// The only other sanctioned opacity; never a state.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn appear<E: Styled>(el: E, strength: f32) -> E {
+    if strength >= 1. { el } else { el.opacity(strength.max(0.)) }
 }
 
 /// A critically damped spring's state (ζ = 1): its displacement `x` from
@@ -400,6 +429,196 @@ pub(crate) enum Kind {
     Decay,
 }
 
+/// The link's signatures (§5.1 Scan, §5.3 Glitch), never offline. Only a
+/// real loss plays them: a daemon reload is a planned handover (its
+/// sessions come back), so a link that goes down for one is given
+/// [`RELOAD_GRACE`], restarted by each new reload's goodbye (a storm); any
+/// other drop [`LINK_GRACE`]. Back within it, nothing happened. The first
+/// hello after launch scans, however long the link took to come up (the
+/// window starts at `Connecting`). Past it, the link is lost: the tear (at most once per
+/// [`FLASH_BUDGET`]), then the palette drains, held while down. Back after
+/// a loss, it restores and scans (the Scan also at most once per budget).
+/// The drain is a [`Tween`]: a drop mid-restore or a return mid-drain
+/// turns from where it is, never from an end.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Link {
+    /// Up last frame (none: not seen yet).
+    pub up: Option<bool>,
+    /// Since when it is down, and for which reload (the model's count of
+    /// reload goodbyes; none: not a reload). A new goodbye restarts it.
+    pub down: Option<(Instant, Option<u64>)>,
+    /// It has been up since launch (so the next up isn't the first hello).
+    pub ever_up: bool,
+    /// The loss was seen (past the grace).
+    pub lost: bool,
+    pub scan: Option<Instant>,
+    /// The tear that is playing (the drop's time, for its seed).
+    pub glitch: Option<Instant>,
+    /// The last tear and the last Scan (the budget).
+    pub tore: Option<Instant>,
+    pub scanned: Option<Instant>,
+    /// How drained the palette is (0..1).
+    pub drain: Option<Tween>,
+}
+
+/// How long a non-reload drop may last before it is a loss.
+pub(crate) const LINK_GRACE: Duration = Duration::from_millis(1000);
+/// How long a reload may take before it is a loss, from its last goodbye:
+/// longer than the client's longest honest wait in one (it retries every
+/// `synaps_client::RELOAD_RETRY` for `RELOAD_WINDOW`, but first waits out
+/// the daemon's `retry_after`, capped at 10 s), plus a boot.
+pub(crate) const RELOAD_GRACE: Duration = Duration::from_secs(15);
+/// At most one tear, and one Scan, per this.
+pub(crate) const FLASH_BUDGET: Duration = Duration::from_secs(5);
+
+/// A worker tab opened from a row by the pointer (§6.2): the tracer, a
+/// 2 × 24 px line in `you_bar` from where it was opened to the new tab's
+/// top edge over `base` `out`; then the tab's bar draws left to right over
+/// `quick`. Full only.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Tracer {
+    pub tab: u64,
+    pub from: gpui_kit::Point<gpui_kit::Pixels>,
+    pub at: Instant,
+    /// The tab's top-left corner in the window, once the strip laid it out.
+    pub to: Option<gpui_kit::Point<gpui_kit::Pixels>>,
+}
+
+/// The tracer's line: its length.
+pub(crate) const TRACER_LEN: f32 = 24.;
+
+/// The tear's two frames (§5.3): 60 ms, then 40.
+pub(crate) const TEAR: [Duration; 2] = [Duration::from_millis(60), Duration::from_millis(40)];
+
+impl Link {
+    /// The connection is `up` this frame (`reload`: it went down for the
+    /// daemon reload with this count), at `now`, under `fx`'s level.
+    ///
+    /// Off plays nothing (no tear, drain or Scan) but still keeps the
+    /// state: the grace and the loss (what the words and the rail say),
+    /// and the first hello spent. A switch to Full mid-loss drains, no
+    /// tear.
+    pub(crate) fn see(&mut self, up: bool, reload: Option<u64>, fx: &Motion) {
+        let (now, level) = (fx.now(), fx.level());
+        let off = level == Level::Off;
+        if off {
+            (self.scan, self.glitch, self.drain) = (None, None, None);
+        }
+        let budget = |at: Option<Instant>| at.is_none_or(|t| now.saturating_duration_since(t) >= FLASH_BUDGET);
+        match (self.up.replace(up), up) {
+            // The first hello scans, from `Connecting` or before the first
+            // frame (outside the budget: a return after a loss soon after
+            // launch scans too).
+            (_, true) if !self.ever_up => {
+                self.ever_up = true;
+                self.down = None;
+                if level == Level::Full {
+                    self.scan = Some(now);
+                }
+            }
+            (Some(false), true) => {
+                self.down = None;
+                if std::mem::take(&mut self.lost) {
+                    self.glitch = None;
+                    if !off {
+                        self.retarget(0., fx);
+                    }
+                    if level == Level::Full && budget(self.scanned) {
+                        (self.scan, self.scanned) = (Some(now), Some(now));
+                    }
+                }
+            }
+            (Some(true), false) => {
+                self.down = Some((now, reload));
+                self.scan = None;
+            }
+            // Down still, and a new reload's goodbye came (the client was
+            // back for a moment between two frames): its grace starts now.
+            (_, false) if reload.is_some() && self.down.is_some_and(|(_, r)| r != reload) => {
+                self.down = Some((now, reload));
+            }
+            _ => {}
+        }
+        if self.lost && !off && self.drain.is_none() {
+            // Lost under Off, now on: drained, held (no tear).
+            self.retarget(1., fx);
+        }
+        let Some((since, reload)) = self.down.filter(|_| !self.lost && self.up == Some(false)) else { return };
+        let grace = if reload.is_some() { RELOAD_GRACE } else { LINK_GRACE };
+        if now.saturating_duration_since(since) < grace {
+            fx.want_at(since + grace);
+            return;
+        }
+        self.lost = true;
+        if off {
+            return;
+        }
+        let tear = level == Level::Full && budget(self.tore);
+        if tear {
+            (self.glitch, self.tore) = (Some(now), Some(now));
+        }
+        self.retarget(1., fx);
+        if tear && let Some(d) = self.drain.as_mut() {
+            // The drain waits for the tear.
+            d.delay(TEAR[0] + TEAR[1]);
+        }
+    }
+
+    fn retarget(&mut self, to: f32, fx: &Motion) {
+        let now = fx.now();
+        let dur = if fx.level() == Level::Full { SLOW } else { QUICK };
+        self.drain.get_or_insert(Tween::rest(0., now)).retarget(to, now, dur, &ease::INOUT);
+    }
+
+    /// The tear's frame now (0, 1), if one is on: Full only.
+    pub(crate) fn tear(&mut self, fx: &Motion) -> Option<usize> {
+        let g = self.glitch.filter(|_| fx.level() == Level::Full)?;
+        let gone = fx.now().saturating_duration_since(g);
+        if gone < TEAR[0] {
+            fx.want_at(g + TEAR[0]);
+            Some(0)
+        } else if gone < TEAR[0] + TEAR[1] {
+            fx.want_at(g + TEAR[0] + TEAR[1]);
+            Some(1)
+        } else {
+            self.glitch = None;
+            None
+        }
+    }
+
+    /// How drained the palette is (0..1): from the end of the tear over
+    /// `slow` `inout` (Reduced: no tear, `quick`), held while down; back
+    /// over the same once up again, from wherever it was.
+    pub(crate) fn drain(&mut self, fx: &Motion) -> f32 {
+        if fx.level() == Level::Off {
+            self.drain = None;
+            return 0.;
+        }
+        let now = fx.now();
+        let Some(d) = self.drain else { return 0. };
+        let k = d.sample(now, &ease::INOUT);
+        if d.running(now) {
+            match d.starts() {
+                Some(at) if at > now => fx.want_at(at),
+                _ => fx.want_frame(),
+            }
+        } else if k <= 0. {
+            self.drain = None;
+        }
+        k
+    }
+
+    /// The Scan's line, 0..1 down the window (`sig` `out`), while it runs.
+    pub(crate) fn scan(&mut self, fx: &Motion) -> Option<f32> {
+        let t = fx.shot(self.scan, Duration::ZERO, SIG, &ease::OUT, Kind::Spatial);
+        if t >= 1. {
+            self.scan = None;
+            return None;
+        }
+        Some(t)
+    }
+}
+
 /// What an element remembers of a value between frames ([`Motion::change`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Tag {
@@ -421,6 +640,10 @@ pub(crate) enum Tag {
     Watched,
     /// A streaming row's text length (the write head).
     Stream,
+    /// A tab needs you (its top bar draws).
+    TabNeeds,
+    /// A rail row needs you (its bar draws).
+    RowNeeds,
 }
 
 impl Tag {
@@ -495,7 +718,17 @@ impl Tween {
     }
 
     pub(crate) fn running(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.at) < self.dur
+        now < self.at || now.saturating_duration_since(self.at) < self.dur
+    }
+
+    /// Its travel starts `by` later (it holds its start value until then).
+    pub(crate) fn delay(&mut self, by: Duration) {
+        self.at += by;
+    }
+
+    /// When its travel starts, if it has one.
+    pub(crate) fn starts(&self) -> Option<Instant> {
+        (!self.dur.is_zero()).then_some(self.at)
     }
 
     /// Toward `to` from its value at `now`, over `full` × the distance.
@@ -549,6 +782,31 @@ impl Slide {
     }
 }
 
+/// A chrome position on a critically damped spring ([`Motion::spring`]):
+/// its displacement from `target` at `at`, and its velocity then.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Sprung {
+    target: f32,
+    x0: f32,
+    v0: f32,
+    at: Instant,
+    frame: u64,
+    response: f32,
+}
+
+impl Sprung {
+    fn state(&self, now: Instant) -> (f32, f32) {
+        let mut s = Spring { x: self.x0, v: self.v0 };
+        s.step(self.response, now.saturating_duration_since(self.at).as_secs_f32());
+        (s.x, s.v)
+    }
+
+    fn settled(&self, now: Instant) -> bool {
+        let (x, v) = self.state(now);
+        Spring { x, v }.settled(self.response)
+    }
+}
+
 /// One window's motion: the frame's clock, what the frame asked for, and
 /// what elements remember between frames (kept only for what was drawn in
 /// the last frame: nothing grows with history).
@@ -571,6 +829,20 @@ pub(crate) struct Motion {
     births: RefCell<HashMap<u64, Instant>>,
     slides: RefCell<HashMap<u64, Slide>>,
     turns: RefCell<HashMap<u64, (Tween, u64)>>,
+    /// Chrome on springs (the tab indicator, the rail's selection, a
+    /// segment's bar, the readout's y): the window's, never rescoped.
+    springs: RefCell<HashMap<u64, Sprung>>,
+    /// A view pane is drawing, and something in it asked for a frame.
+    pane: Cell<bool>,
+    pane_wants: Cell<bool>,
+    /// Hover fills on their way in or out ([`Motion::hover`]).
+    hovers: RefCell<HashMap<u64, (Tween, u64)>>,
+    /// The control held down (or pressed from the keyboard): its key, and
+    /// when it was let go ([`Motion::pressed`]).
+    press: Cell<Option<(u64, Option<Instant>)>>,
+    /// Numbers as last drawn, for their afterglow ([`Motion::glow`]):
+    /// the window's, so a switch's new values glow (fluid.md §3.6).
+    glows: RefCell<HashMap<u64, Seen>>,
     /// Rows revealing or growing ([`Motion::grow`]).
     grows: RefCell<HashMap<u64, Growing>>,
     /// Rows born that will not reveal: first drawn off screen, in the
@@ -617,8 +889,22 @@ pub(crate) struct Motion {
 
 impl Default for Motion {
     fn default() -> Self {
-        Motion::new(Instant::now())
+        // Tests: each window's clock is its own, so is its epoch.
+        if cfg!(test) { Motion::new(Instant::now()) } else { Motion::new(epoch()) }
     }
+}
+
+/// The process's motion epoch: every 30 Hz decay tick (the app's and a
+/// scrollbar's) is on its grid, so they land in the same frames.
+pub(crate) fn epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// The first 30 Hz tick on [`epoch`]'s grid after `now`.
+pub(crate) fn next_tick(now: Instant) -> Instant {
+    let ticks = now.saturating_duration_since(epoch()).as_nanos() / DECAY_TICK.as_nanos() + 1;
+    epoch() + Duration::from_nanos((DECAY_TICK.as_nanos() * ticks) as u64)
 }
 
 impl Motion {
@@ -638,6 +924,12 @@ impl Motion {
             births: RefCell::default(),
             slides: RefCell::default(),
             turns: RefCell::default(),
+            springs: RefCell::default(),
+            hovers: RefCell::default(),
+            pane: Cell::new(false),
+            pane_wants: Cell::new(false),
+            press: Cell::new(None),
+            glows: RefCell::default(),
             grows: RefCell::default(),
             quiet: RefCell::default(),
             timer: RefCell::default(),
@@ -923,6 +1215,9 @@ impl Motion {
         self.seen.borrow_mut().retain(|_, s| alive(s.frame));
         self.slides.borrow_mut().retain(|_, s| alive(s.frame));
         self.turns.borrow_mut().retain(|_, t| alive(t.1));
+        self.springs.borrow_mut().retain(|_, s| alive(s.frame));
+        self.hovers.borrow_mut().retain(|_, h| alive(h.1));
+        self.glows.borrow_mut().retain(|_, s| alive(s.frame));
         self.grows.borrow_mut().retain(|_, g| alive(g.frame));
         let cut = BASE + STAGGER_CAP + SIG;
         self.births.borrow_mut().retain(|_, at| now.saturating_duration_since(*at) < cut);
@@ -981,7 +1276,21 @@ impl Motion {
     pub(crate) fn want_frame(&self) {
         if self.on() {
             self.display.set(true);
+            if self.pane.get() {
+                self.pane_wants.set(true);
+            }
         }
+    }
+
+    /// A view pane (Settings, Usage: cached views of their own) draws: what
+    /// moves in it asks the app to draw it again ([`Motion::pane_wants`]).
+    pub(crate) fn in_pane(&self, on: bool) {
+        self.pane.set(on);
+    }
+
+    /// Something in the view pane moved last frame: draw it again.
+    pub(crate) fn pane_wants(&self) -> bool {
+        self.pane_wants.replace(false)
     }
 
     /// A change due at `at` (a timer, unless a frame comes first).
@@ -1190,6 +1499,306 @@ impl Motion {
         t.0.sample(now, &ease::INOUT)
     }
 
+    // ── chrome (fluid.md §3.5–3.10, motion.md PR 5) ───────────────────
+
+    /// Chrome position `key` this frame, sprung toward `target` (fluid.md
+    /// §2.1): when the target moves it starts where it is, with its
+    /// velocity. `from`: where it starts the first time it is drawn (a
+    /// tab's width from 0); none, at its target. Not drawn last frame, or
+    /// not [`Level::Full`]: at its target. Its value, and whether it moves.
+    pub(crate) fn spring(&self, key: u64, from: Option<f32>, target: f32, response: f32) -> (f32, bool) {
+        let (frame, now) = (self.frame.get(), self.now());
+        let full = self.level.get() == Level::Full;
+        let mut springs = self.springs.borrow_mut();
+        let start = from.filter(|_| full).unwrap_or(target);
+        let s = springs.entry(key).or_insert(Sprung { target, x0: start - target, v0: 0., at: now, frame, response });
+        if s.frame + 1 < frame || !full {
+            *s = Sprung { target, x0: 0., v0: 0., at: now, frame, response };
+        }
+        if s.target != target {
+            let (x, v) = s.state(now);
+            *s = Sprung { target, x0: x + s.target - target, v0: v, at: now, frame, response };
+        }
+        s.response = response;
+        s.frame = frame;
+        if s.settled(now) {
+            return (target, false);
+        }
+        self.want_frame();
+        (target + s.state(now).0, true)
+    }
+
+    /// [`Motion::spring`] for what only moves when told to: at rest, a new
+    /// target is taken at once (a resize, a scroll: `follow`); moving, it
+    /// retargets. [`Motion::spring_jump`] starts a move.
+    pub(crate) fn spring_held(&self, key: u64, target: f32, response: f32) -> (f32, bool) {
+        let now = self.now();
+        if let Some(s) = self.springs.borrow_mut().get_mut(&key)
+            && s.target != target
+            && s.settled(now)
+        {
+            *s = Sprung { target, x0: 0., v0: 0., at: now, ..*s };
+        }
+        self.spring(key, None, target, response)
+    }
+
+    /// Value `key` eased toward `to` (a label's colour, as 0..1): over `up`
+    /// (rising) or `down` (falling) for a whole 0 → 1, from where it is.
+    /// First drawn, not drawn last frame, or Off: at `to`. Reduced: over
+    /// at most [`QUICK`].
+    pub(crate) fn ease_to(&self, key: u64, to: f32, up: Duration, down: Duration) -> f32 {
+        let (frame, now) = (self.frame.get(), self.now());
+        let mut hovers = self.hovers.borrow_mut();
+        let h = hovers.entry(key).or_insert((Tween::rest(to, now), frame));
+        if h.1 + 1 < frame || !self.on() {
+            h.0 = Tween::rest(to, now);
+        }
+        h.1 = frame;
+        let full = match self.level.get() {
+            Level::Full => {
+                if to > h.0.sample(now, &ease::OUT) {
+                    up
+                } else {
+                    down
+                }
+            }
+            _ => QUICK.min(if to > h.0.sample(now, &ease::OUT) { up } else { down }),
+        };
+        h.0.retarget(to, now, full, &ease::OUT);
+        if h.0.running(now) {
+            self.want_frame();
+        }
+        h.0.sample(now, &ease::OUT)
+    }
+
+    /// Chrome position `key` moves to `target` from wherever it was drawn
+    /// last (`at`: there, now), as [`Motion::spring`] will draw it.
+    pub(crate) fn spring_jump(&self, key: u64, at: f32, target: f32, response: f32) {
+        if self.level.get() != Level::Full {
+            return;
+        }
+        let (frame, now) = (self.frame.get(), self.now());
+        self.springs.borrow_mut().insert(key, Sprung { target, x0: at - target, v0: 0., at: now, frame, response });
+    }
+
+    /// Where chrome position `key` was drawn last, if it is on a spring.
+    pub(crate) fn spring_at(&self, key: u64) -> Option<f32> {
+        let now = self.now();
+        self.springs.borrow().get(&key).map(|s| s.target + if s.settled(now) { 0. } else { s.state(now).0 })
+    }
+
+    /// The pointer went over (or off) control `key` (its `on_hover`): its
+    /// fill comes on over [`HOVER_IN`] and goes off over [`HOVER_OUT`]
+    /// (fluid.md §3.9: on fast, off decays). Reduced: on at once, off over
+    /// [`QUICK`]. Off: at once.
+    pub(crate) fn set_hover(&self, key: u64, on: bool) {
+        let (frame, now) = (self.frame.get(), self.now());
+        let to = if on { 1. } else { 0. };
+        let full = match (self.level.get(), on) {
+            (Level::Full, true) => HOVER_IN,
+            (Level::Full, false) => HOVER_OUT,
+            (Level::Reduced, false) => QUICK,
+            _ => Duration::ZERO,
+        };
+        let mut hovers = self.hovers.borrow_mut();
+        let h = hovers.entry(key).or_insert((Tween::rest(1. - to, now), frame));
+        if full.is_zero() {
+            h.0 = Tween::rest(to, now);
+        } else {
+            h.0.retarget(to, now, full, &ease::OUT);
+        }
+        h.1 = frame;
+    }
+
+    /// Control `key`'s hover (0 at rest … 1 hovered) this frame.
+    pub(crate) fn hover(&self, key: u64) -> f32 {
+        let (frame, now) = (self.frame.get(), self.now());
+        let mut hovers = self.hovers.borrow_mut();
+        let Some(h) = hovers.get_mut(&key) else { return 0. };
+        h.1 = frame;
+        if h.0.running(now) {
+            self.want_frame();
+        }
+        h.0.sample(now, &ease::OUT)
+    }
+
+    /// Control `key`'s fill this frame: `rest` (none: no fill of its own)
+    /// toward `hover` as it is hovered, and `press` while it is held.
+    /// Its fill and its content's offset (`PRESS` px down while held,
+    /// springing back on `flick` once let go).
+    pub(crate) fn fill(&self, key: u64, ground: Hsla, rest: Option<Hsla>, hover: Hsla, press: Hsla) -> (Option<Hsla>, f32) {
+        let h = self.hover(key);
+        let (p, dy) = self.pressed(key);
+        let base = rest.unwrap_or(ground);
+        let lit = if h > 0. { Some(mix(base, hover, h)) } else { rest };
+        if p > 0. {
+            let under = lit.unwrap_or(base);
+            return (Some(mix(under, press, p)), dy);
+        }
+        (lit, dy)
+    }
+
+    /// Control `key` is pressed (the pointer went down on it): its press
+    /// look is drawn in the next frame, whatever the level (it is state,
+    /// not motion).
+    pub(crate) fn press_down(&self, key: u64) {
+        self.press.set(Some((key, None)));
+    }
+
+    /// A control of the `space` (its keys' top 16 bits) is held down.
+    pub(crate) fn held(&self, space: u64) -> bool {
+        self.press.get().is_some_and(|(k, up)| up.is_none() && k >> 48 == space >> 48)
+    }
+
+    /// The pointer went up: the press lets go (springing back on `flick`).
+    pub(crate) fn press_up(&self) -> bool {
+        let Some((key, None)) = self.press.get() else { return false };
+        self.press.set(Some((key, Some(self.now()))));
+        true
+    }
+
+    /// Control `key`'s press this frame: its fill toward `press*` (1 held …
+    /// 0) and its content's offset down.
+    pub(crate) fn pressed(&self, key: u64) -> (f32, f32) {
+        let Some((_, up)) = self.press.get().filter(|p| p.0 == key) else { return (0., 0.) };
+        let full = self.level.get() == Level::Full;
+        let travel = if full { PRESS } else { 0. };
+        let now = self.now();
+        let Some(up) = up.filter(|u| now >= *u) else {
+            if let Some(Some(u)) = self.press.get().map(|p| p.1) {
+                self.want_at(u);
+            }
+            return (1., travel);
+        };
+        if !full {
+            self.press.set(None);
+            return (0., 0.);
+        }
+        let x = Spring::from_rest(1., FLICK_RESPONSE, now.saturating_duration_since(up).as_secs_f32());
+        if x < PRESS_EPSILON {
+            self.press.set(None);
+            return (0., 0.);
+        }
+        self.want_frame();
+        (x, x * travel)
+    }
+
+    /// An overlay that opened at `born` (none: from the keyboard, or at
+    /// rest): its strength (0 → 1 over [`QUICK`] `out`) and its rise
+    /// ([`RISE_FLUID`] → 0 on `flick`, toward its anchor), fluid.md §3.10.
+    /// Reduced: opacity only. Off: there at once.
+    pub(crate) fn enter(&self, born: Option<Instant>) -> (f32, f32) {
+        let Some(born) = born.filter(|_| self.on()) else { return (1., 0.) };
+        let a = self.shot(Some(born), Duration::ZERO, QUICK, &ease::OUT, Kind::Fade);
+        if self.level.get() != Level::Full {
+            return (a, 0.);
+        }
+        let rise = Spring::from_rest(RISE_FLUID, FLICK_RESPONSE, self.now().saturating_duration_since(born).as_secs_f32());
+        if rise >= FLUID_EPSILON {
+            self.want_frame();
+            return (a, rise);
+        }
+        (a, 0.)
+    }
+
+    /// An overlay that closed at `at`: its strength (1 → 0 over 90 ms
+    /// `in`) and how far it has sunk back toward its anchor ([`SINK`]);
+    /// none once gone (or not on: gone at once).
+    pub(crate) fn leave(&self, at: Instant) -> Option<(f32, f32)> {
+        if !self.on() {
+            return None;
+        }
+        let p = self.shot(Some(at), Duration::ZERO, exit(QUICK), &ease::IN, Kind::Fade);
+        if p >= 1. {
+            return None;
+        }
+        let sink = if self.level.get() == Level::Full { SINK * p } else { 0. };
+        Some((1. - p, sink))
+    }
+
+    /// Number `key`'s colour this frame (motion.md §6.6): `role`, and for
+    /// [`GLOW`] after `value` changed while drawn, mixed toward the ink,
+    /// stepping 1 → 0.66 → 0.33 → 0 (three frames, not 30 a second).
+    /// First drawn, or not drawn last frame: at rest. Reduced: lit for
+    /// [`QUICK`]. Off: never.
+    pub(crate) fn glow(&self, key: u64, value: u64, role: Hsla) -> Hsla {
+        let k = self.glow_k(key, value);
+        if k > 0. { mix(role, self.ink.get(), k) } else { role }
+    }
+
+    /// When `value` of `key` last changed while drawn, and what it was:
+    /// none first drawn or not drawn last frame (at rest), or under Off.
+    pub(crate) fn changed(&self, key: u64, value: u64) -> Option<(u64, Instant)> {
+        let frame = self.frame.get();
+        let mut glows = self.glows.borrow_mut();
+        let s = glows.entry(key).or_insert(Seen { value, prev: value, since: None, frame });
+        if s.value != value {
+            s.since = (s.frame + 1 >= frame && self.on()).then_some(self.now());
+            (s.prev, s.value) = (s.value, value);
+        }
+        s.frame = frame;
+        s.since.map(|t| (s.prev, t))
+    }
+
+    /// A meter's segment `i` (motion.md §6.6): `lit` now or not, of a
+    /// meter keyed `key` with `filled` lit. Newly lit ones light in order
+    /// (from the low end, `stagger` apart), each `edge` → `bar` over
+    /// [`QUICK`]; ones going out go from the high end. Its colour.
+    pub(crate) fn segment(&self, key: u64, filled: usize, i: usize, edge: Hsla, bar: Hsla) -> Hsla {
+        let lit = i < filled;
+        let Some((prev, since)) = self.changed(key, filled as u64) else { return if lit { bar } else { edge } };
+        let prev = prev as usize;
+        let k = if filled > prev && (prev..filled).contains(&i) {
+            i - prev
+        } else if filled < prev && (filled..prev).contains(&i) {
+            prev - 1 - i
+        } else {
+            return if lit { bar } else { edge };
+        };
+        let t = self.shot(Some(since), stagger(k), QUICK, &ease::OUT, Kind::Fade);
+        if lit { mix(edge, bar, t) } else { mix(bar, edge, t) }
+    }
+
+    /// The afterglow's step (1, 0.66, 0.33, 0) of `key` showing `value`.
+    pub(crate) fn glow_k(&self, key: u64, value: u64) -> f32 {
+        let (frame, now) = (self.frame.get(), self.now());
+        let mut glows = self.glows.borrow_mut();
+        let s = glows.entry(key).or_insert(Seen { value, prev: value, since: None, frame });
+        if s.value != value {
+            s.since = (s.frame + 1 >= frame && self.on()).then_some(now);
+            (s.prev, s.value) = (s.value, value);
+        }
+        s.frame = frame;
+        let k = self.afterglow(s.since);
+        if k <= 0. && s.since.is_some_and(|t| t <= now) {
+            s.since = None;
+        }
+        k
+    }
+
+    /// An afterglow's `k` (§6.6) at the frame's time, for one that began at
+    /// `since` (a time still to come: due then, 0 until it is): 1 → 0.66 →
+    /// 0.33 → 0 over `glow` at Full, one step of `quick` at Reduced, 0 at
+    /// Off. Asks for the frame its next step is due at.
+    pub(crate) fn afterglow(&self, since: Option<Instant>) -> f32 {
+        let Some(since) = since.filter(|_| self.on()) else { return 0. };
+        let now = self.now();
+        if now < since {
+            self.want_at(since);
+            return 0.;
+        }
+        let dur = if self.level.get() == Level::Full { GLOW } else { QUICK };
+        let gone = now.saturating_duration_since(since);
+        if gone >= dur {
+            return 0.;
+        }
+        let steps = if self.level.get() == Level::Full { 3 } else { 1 };
+        let step = dur / steps;
+        let n = (gone.as_nanos() / step.as_nanos()) as u32;
+        self.want_at(since + step * (n + 1));
+        1. - n as f32 / steps as f32
+    }
+
     // ── after the frame ───────────────────────────────────────────────
 
     /// The app's frame is built (painted last): ask for the next frame,
@@ -1314,7 +1923,6 @@ impl Motion {
     }
 
     /// What the last frame asked for: a frame, a timer at, nothing (tests).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pending(&self) -> (bool, Option<Instant>) {
         (self.display.get(), self.armed.get().map(|(t, _)| t))
     }
@@ -1341,8 +1949,8 @@ mod tests {
     use gpui_kit::{Bounds, point, px, size};
 
     use super::{
-        BASE, BEAT, GLOW, HEAD_HOLD, Kind, Level, Lock, Motion, QUICK, SLIDE_CAP, SLOW, STAGGER, STAGGER_CAP, Setting, Slide, Tag, Tween,
-        ease, exit, stagger,
+        BASE, BEAT, GLOW, HEAD_HOLD, Kind, LINK_GRACE, Level, Link, Lock, Motion, QUICK, RELOAD_GRACE, SLIDE_CAP, SLOW, STAGGER,
+        STAGGER_CAP, Setting, Slide, Tag, Tween, ease, exit, stagger,
     };
 
     fn ms(n: u64) -> Duration {
@@ -1385,6 +1993,79 @@ mod tests {
         // Clocks still tick.
         m.tick_at(t0 + ms(1000));
         assert_eq!(m.demand(), (false, Some(t0 + ms(1000))));
+    }
+
+    /// The link (§5.3): a drop is nothing for its grace; past it the tear's
+    /// two frames (60 ms, 40 ms), then the drain over `slow`; a reload's
+    /// grace is longer, and each new goodbye restarts it; back after a
+    /// loss, it restores and scans; a second loss within the budget doesn't
+    /// tear again.
+    #[test]
+    fn the_link_tears_after_its_grace() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        let mut l = Link::default();
+        let at = |m: &Motion, l: &mut Link, t: u64, up: bool, reload: Option<u64>| {
+            m.begin_frame(Level::Full, false, t0 + ms(t));
+            l.see(up, reload, m);
+            (l.tear(m), l.drain(m))
+        };
+        let (no, yes) = (None, Some(1));
+        at(&m, &mut l, 0, true, no);
+        assert!(l.scan.is_some(), "the first hello scans");
+        assert_eq!(at(&m, &mut l, 1000, false, no), (None, 0.), "dropped: the grace");
+        assert_eq!(m.demand(), (false, Some(t0 + ms(1000) + LINK_GRACE)), "one timer, at the grace's end");
+        assert_eq!(at(&m, &mut l, 1999, false, no), (None, 0.));
+        assert_eq!(at(&m, &mut l, 2000, false, no), (Some(0), 0.), "lost: the tear's first frame");
+        assert_eq!(at(&m, &mut l, 2061, false, no), (Some(1), 0.), "its second; the drain waits");
+        assert_eq!(at(&m, &mut l, 2101, false, no).0, None);
+        assert_eq!(at(&m, &mut l, 2100 + 360, false, no), (None, 1.), "drained");
+        assert_eq!(at(&m, &mut l, 2600, true, no).1, 1., "back: from where it is");
+        assert!(l.scan.is_some(), "back after a loss: it scans");
+        assert_eq!(at(&m, &mut l, 2600 + 360, true, no).1, 0., "restored");
+        // A reload: nothing for RELOAD_GRACE; a second goodbye 10 s in (the
+        // client back for a moment between two frames) restarts it; then
+        // a loss (past the last tear's budget: it tears).
+        let rg = RELOAD_GRACE.as_millis() as u64;
+        assert_eq!(at(&m, &mut l, 3000, false, yes), (None, 0.));
+        let mut l2 = l;
+        assert_eq!(at(&m, &mut l, 13_000, false, Some(2)), (None, 0.), "a second goodbye");
+        assert_eq!(at(&m, &mut l2, 3000 + rg - 1, false, yes), (None, 0.), "reloading");
+        assert_eq!(at(&m, &mut l2, 3000 + rg, false, yes).0, Some(0), "a reload that never came back: lost");
+        assert_eq!(at(&m, &mut l, 3000 + rg, false, Some(2)), (None, 0.), "the second goodbye's own grace");
+        assert_eq!(at(&m, &mut l, 13_000 + rg - 1, false, Some(2)), (None, 0.));
+        assert_eq!(at(&m, &mut l, 13_000 + rg, false, Some(2)).0, Some(0), "lost, from the last goodbye");
+        // Back, and lost again within FLASH_BUDGET: it drains, no tear.
+        let t = 13_000 + rg;
+        at(&m, &mut l, t + 200, true, no);
+        at(&m, &mut l, t + 300, false, no);
+        assert_eq!(at(&m, &mut l, t + 1300, false, no).0, None, "within the budget: no second tear");
+        assert!(l.lost);
+        assert!(at(&m, &mut l, t + 2000, false, no).1 > 0.99, "it drains all the same");
+    }
+
+    /// The first hello scans when the window started at `Connecting` (its
+    /// first frames down), however long the daemon took; never before; and
+    /// a launch that never connected has nothing to lose.
+    #[test]
+    fn the_first_hello_scans_from_connecting() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        let mut l = Link::default();
+        for t in [0, 16, 5000, 20_000] {
+            m.begin_frame(Level::Full, false, t0 + ms(t));
+            l.see(false, None, &m);
+            assert_eq!((l.scan, l.tear(&m), l.lost), (None, None, false), "connecting at {t} ms: nothing");
+        }
+        m.begin_frame(Level::Full, false, t0 + ms(20_100));
+        l.see(true, None, &m);
+        assert_eq!(l.scan, Some(t0 + ms(20_100)), "the first hello scans");
+        // Off: no Scan, and the first hello is spent all the same.
+        let mut l = Link::default();
+        m.begin_frame(Level::Off, false, t0 + ms(30_000));
+        l.see(false, None, &m);
+        l.see(true, None, &m);
+        assert!(l.ever_up && l.scan.is_none());
     }
 
     /// After every one-shot is over, a frame asks for nothing.
@@ -1795,5 +2476,98 @@ mod tests {
         // Done streaming and at rest: unwrapped.
         m.begin_frame(Level::Full, false, t0 + ms(907));
         assert!(m.grow(9, 0, None, false, 24.).is_none());
+    }
+
+    /// motion.md §6.4 Flip (fluid.md §2.1 `snap`): a chrome spring started
+    /// anywhere settles exactly on its target and asks for nothing more;
+    /// a retarget mid-flight keeps where it is.
+    #[test]
+    fn flip_offsets_settle_to_zero() {
+        let t0 = Instant::now();
+        let ms = |n: u64| Duration::from_millis(n);
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Full, false, t0);
+        assert_eq!(m.spring(1, None, 100., super::SNAP_RESPONSE), (100., false), "first drawn: at its target");
+        m.spring_jump(1, 260., 100., super::SNAP_RESPONSE);
+        let mut last = 260.;
+        for k in 1..=40 {
+            m.begin_frame(Level::Full, false, t0 + ms(7 * k));
+            let (v, moving) = m.spring_held(1, 100., super::SNAP_RESPONSE);
+            assert!(v <= last + 1e-3 && v >= 100., "critically damped: no overshoot ({last} → {v})");
+            last = v;
+            if k == 10 {
+                assert!(moving && v > 100.5, "mid-flight at {v}");
+                // A new target: it starts from where it is.
+                let (w, _) = m.spring_held(1, 40., super::SNAP_RESPONSE);
+                assert!((w - v).abs() < 1e-3, "a retarget keeps the position: {v} → {w}");
+                m.spring_held(1, 100., super::SNAP_RESPONSE);
+            }
+        }
+        m.begin_frame(Level::Full, false, t0 + ms(600));
+        assert_eq!(m.spring_held(1, 100., super::SNAP_RESPONSE), (100., false), "settled exactly");
+        assert!(!m.demand().0, "asks for no frame");
+        // At rest, a new target is taken at once (a resize, a scroll).
+        m.begin_frame(Level::Full, false, t0 + ms(610));
+        assert_eq!(m.spring_held(1, 140., super::SNAP_RESPONSE), (140., false));
+        // Not Full: never moves.
+        m.begin_frame(Level::Reduced, false, t0 + ms(620));
+        m.spring_jump(1, 0., 140., super::SNAP_RESPONSE);
+        assert_eq!(m.spring_held(1, 140., super::SNAP_RESPONSE), (140., false));
+    }
+
+    /// fluid.md §3.9: a hover fill comes on over 60 ms and goes off over
+    /// 160 (on fast, off decays); Reduced on at once, off over `quick`;
+    /// Off at once both ways.
+    #[test]
+    fn hover_eases_in_fast_and_out_slow() {
+        let t0 = Instant::now();
+        let ms = |n: u64| Duration::from_millis(n);
+        for (level, on, off) in [(Level::Full, 60, 160), (Level::Reduced, 0, 120), (Level::Off, 0, 0)] {
+            let m = Motion::new(t0);
+            m.begin_frame(level, false, t0);
+            m.set_hover(7, true);
+            assert_eq!(m.hover(7) == 1., on == 0, "{level:?}: on at once only if instant");
+            m.begin_frame(level, false, t0 + ms(on));
+            assert_eq!(m.hover(7), 1., "{level:?}: on after {on} ms");
+            m.set_hover(7, false);
+            if off > 0 {
+                m.begin_frame(level, false, t0 + ms(on + off / 2));
+                let h = m.hover(7);
+                assert!(h > 0. && h < 1., "{level:?}: half way off: {h}");
+            }
+            m.begin_frame(level, false, t0 + ms(on + off));
+            assert_eq!(m.hover(7), 0., "{level:?}: off after {off} ms");
+        }
+    }
+
+    /// motion.md §6.6: a changed number afterglows in three steps over
+    /// `glow` (1, 0.66, 0.33, then the role), three frames rather than 30
+    /// a second; first drawn it is at rest; Reduced lit for `quick`; Off never.
+    #[test]
+    fn a_changed_number_afterglows_in_three_steps() {
+        let t0 = Instant::now();
+        let ms = |n: u64| Duration::from_millis(n);
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Full, false, t0);
+        assert_eq!(m.glow_k(3, 10), 0., "first drawn: at rest");
+        m.begin_frame(Level::Full, false, t0 + ms(10));
+        assert_eq!(m.glow_k(3, 11), 1., "changed: lit");
+        assert_eq!(m.demand().1, Some(t0 + ms(170)), "its next step is a timer, not a frame");
+        for (at, k) in [(100, 1.), (170, 1. - 1. / 3.), (330, 1. - 2. / 3.), (490, 0.)] {
+            m.begin_frame(Level::Full, false, t0 + ms(at));
+            assert!((m.glow_k(3, 11) - k).abs() < 1e-5, "{at} ms: {k}");
+        }
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Reduced, false, t0);
+        m.glow_k(3, 10);
+        m.begin_frame(Level::Reduced, false, t0 + ms(10));
+        assert_eq!(m.glow_k(3, 11), 1.);
+        m.begin_frame(Level::Reduced, false, t0 + ms(130));
+        assert_eq!(m.glow_k(3, 11), 0., "Reduced: lit for quick");
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Off, false, t0);
+        m.glow_k(3, 10);
+        m.begin_frame(Level::Off, false, t0 + ms(10));
+        assert_eq!(m.glow_k(3, 11), 0., "Off: never");
     }
 }

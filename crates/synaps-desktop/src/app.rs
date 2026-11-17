@@ -1280,6 +1280,9 @@ impl FavsJob {
     }
 }
 
+/// Each worker chip's bounds (its worker's id) as last laid out.
+pub(crate) type ChipBounds = Vec<(u64, Bounds<Pixels>)>;
+
 pub struct AppView {
     pub client: Option<Client>,
     /// Connection, sessions, attachment and transcript. Events are applied
@@ -1350,6 +1353,15 @@ pub struct AppView {
     hover: Option<u64>,
     pub(crate) readout: Option<u64>,
     readout_wait: Option<Task<()>>,
+    /// When the readout came (its enter; none: it followed another, fluid.md
+    /// §3.10), the one leaving and since when, the row it follows from (its
+    /// top in the rail's content), and the last one left: its row, when.
+    pub(crate) readout_at: Option<Instant>,
+    pub(crate) readout_leaving: Option<(u64, Instant)>,
+    pub(crate) readout_from: Option<f32>,
+    readout_left: Option<(u64, Instant)>,
+    /// The rail's motion this frame ([`AppView::rail_motion`]).
+    pub(crate) rail_fx: crate::chrome::RailFx,
     /// The side panels folded to strips and the open HISTORY buckets
     /// (saved with the accent).
     pub panels: theme::Panels,
@@ -1472,6 +1484,8 @@ pub struct AppView {
     /// How many tabs the strip had room for at the last frame.
     pub(crate) tab_room: usize,
     pub(crate) tab_labels: crate::tabstrip::Labels,
+    /// What the strip's motion remembers ([`crate::tabstrip::TabFx`]).
+    pub(crate) tab_fx: crate::tabstrip::TabFx,
     /// The synthetic daemon's attach replies.
     pub(crate) attach_source: Option<AttachSource>,
     /// Settings and Usage ([`crate::views`]): their state, the dash channel
@@ -1485,6 +1499,18 @@ pub struct AppView {
     pub(crate) settings_find: Entity<InputState>,
     pub(crate) settings_input: Entity<InputState>,
     pub(crate) gear_menu: bool,
+    /// Overlays as they leave (fluid.md §3.10): what was open last frame,
+    /// and what closed and when, drawn without a hitbox until gone; the
+    /// gear's menu: when it opened, and when it closed.
+    menu_was: Option<crate::menu::Menu<crate::wtabs::Act>>,
+    pub(crate) menu_leaving: Option<(crate::menu::Menu<crate::wtabs::Act>, Instant)>,
+    smenu_was: Option<crate::menu::Menu<SessionAct>>,
+    smenu_leaving: Option<(crate::menu::Menu<SessionAct>, Instant)>,
+    pub(crate) wmenu_was: Option<crate::menu::Menu<u64>>,
+    pub(crate) wmenu_leaving: Option<(crate::menu::Menu<u64>, Instant)>,
+    pub(crate) gear_at: Option<Instant>,
+    pub(crate) gear_leaving: Option<Instant>,
+    gear_was: bool,
     pub(crate) gear_dismissed: Option<Point<Pixels>>,
     shown_view: Option<crate::tabs::Kind>,
     shown_views: usize,
@@ -1495,6 +1521,28 @@ pub struct AppView {
     pub(crate) settings_pane: Entity<crate::views::ViewPane>,
     pub(crate) usage_pane: Entity<crate::views::ViewPane>,
     pub(crate) view_width: f32,
+    /// Where each segmented control's segments were laid out last frame
+    /// (their bar springs between them).
+    pub(crate) seg_places: std::rc::Rc<RefCell<HashMap<u64, (f32, f32)>>>,
+    /// The link's signatures (motion.md §5.1, §5.3), and the top bar's
+    /// connection cell's tear offset this frame.
+    pub(crate) link: crate::motion::Link,
+    pub(crate) conn_dy: f32,
+    /// The connected words' width (chars, mono), held through a reload.
+    pub(crate) conn_held: std::cell::Cell<usize>,
+    /// What the composer's bar and the Scan's line were last drawn in (tests).
+    #[cfg(test)]
+    pub(crate) composer_bar: std::cell::Cell<Option<Hsla>>,
+    #[cfg(test)]
+    pub(crate) scan_line: Option<Hsla>,
+    /// A worker tab opened this frame (its id), the tracer to it, and where
+    /// the tab strip was painted last.
+    pub(crate) tracer_open: Option<u64>,
+    pub(crate) tracer: Option<crate::motion::Tracer>,
+    pub(crate) strip_at: std::rc::Rc<std::cell::Cell<Point<Pixels>>>,
+    /// Each worker chip's bounds as last laid out (the tracer starts from
+    /// the source chip's bar).
+    pub(crate) chip_bounds: Rc<RefCell<ChipBounds>>,
     view_seen: Option<(u64, theme::Choice)>,
     pub(crate) window_active: bool,
     /// The session's list while a worker's view is shown, and the worker
@@ -1613,6 +1661,79 @@ pub struct AppView {
 }
 
 /// A text run in the display face: caps, tracked, semibold.
+impl AppView {
+    /// Control `key` answers the pointer (fluid.md §3.9): its hover eases
+    /// in and out ([`crate::motion::Motion::set_hover`]) and a press shows
+    /// in the next frame ([`crate::motion::Motion::press_down`]). Draw it
+    /// with [`crate::motion::Motion::fill`]. One `on_hover` per element:
+    /// an element with its own calls `set_hover` from it instead.
+    pub(crate) fn touch<E: StatefulInteractiveElement>(el: E, key: u64, cx: &Context<Self>) -> E {
+        let el = el.on_hover(cx.listener(move |this, on: &bool, _, cx| {
+            this.fx.set_hover(key, *on);
+            cx.notify();
+        }));
+        Self::pressable(el, key, cx)
+    }
+
+    /// A control's hover fill (fluid.md §3.9): on `ground`, toward `hover`
+    /// as the pointer comes (over `hover_in`) and back as it goes (over
+    /// `hover_out`); held, `press`. Where `.hover(|d| d.bg(hover))` was.
+    pub(crate) fn lit(&self, el: Stateful<Div>, key: u64, roles: (Hsla, Hsla, Hsla), cx: &Context<Self>) -> Stateful<Div> {
+        self.lit_rest(el, key, roles, None, cx)
+    }
+
+    /// [`AppView::lit`] for a control with a fill of its own at rest (a
+    /// selected picker row's `raised`): its hover starts from that, not
+    /// from the ground.
+    pub(crate) fn lit_rest(
+        &self,
+        el: Stateful<Div>,
+        key: u64,
+        (ground, hover, press): (Hsla, Hsla, Hsla),
+        rest: Option<Hsla>,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let (fill, _) = self.fx.fill(key, ground, rest, hover, press);
+        Self::touch(el.when_some(fill, |d, c| d.bg(c)), key, cx)
+    }
+
+    /// [`AppView::touch`]'s press half alone.
+    pub(crate) fn pressable<E: InteractiveElement>(el: E, key: u64, cx: &Context<Self>) -> E {
+        el.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                this.fx.press_down(key);
+                cx.notify();
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                if this.fx.press_up() {
+                    cx.notify();
+                }
+            }),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                if this.fx.press_up() {
+                    cx.notify();
+                }
+            }),
+        )
+    }
+}
+
+/// A control's key for [`AppView::touch`]: its name and index, hashed
+/// into the hover space.
+pub(crate) fn tkey(name: &str, n: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (name, n).hash(&mut h);
+    (0x7AD0 << 48) | (h.finish() & 0xFFFF_FFFF_FFFF)
+}
+
 pub(crate) fn display(text: impl Into<SharedString>, size: f32, color: Hsla) -> Div {
     div()
         .font_family(fonts::DISPLAY)
@@ -1897,6 +2018,11 @@ impl AppView {
             hover: None,
             readout: None,
             readout_wait: None,
+            readout_at: None,
+            readout_leaving: None,
+            readout_from: None,
+            readout_left: None,
+            rail_fx: Default::default(),
             panels: theme::Panels::default(),
             panels_dirty: Default::default(),
             panels_writing: Default::default(),
@@ -1956,6 +2082,7 @@ impl AppView {
             tab_follow: None,
             tab_room: 0,
             tab_labels: Default::default(),
+            tab_fx: Default::default(),
             attach_source: None,
             settings: Default::default(),
             usage: crate::usage_view::UsageUi::new(None, Default::default()),
@@ -1964,12 +2091,33 @@ impl AppView {
             settings_find: i.settings_find,
             settings_input: i.settings_input,
             gear_menu: false,
+            menu_was: None,
+            menu_leaving: None,
+            smenu_was: None,
+            smenu_leaving: None,
+            wmenu_was: None,
+            wmenu_leaving: None,
+            gear_at: None,
+            gear_leaving: None,
+            gear_was: false,
             gear_dismissed: None,
             shown_view: None,
             shown_views: 0,
             settings_pane: i.settings_pane,
             usage_pane: i.usage_pane,
             view_width: 0.,
+            seg_places: Default::default(),
+            link: Default::default(),
+            conn_dy: 0.,
+            conn_held: Default::default(),
+            #[cfg(test)]
+            composer_bar: Default::default(),
+            #[cfg(test)]
+            scan_line: None,
+            tracer_open: None,
+            tracer: None,
+            strip_at: Default::default(),
+            chip_bounds: Default::default(),
             view_seen: None,
             window_active: true,
             main_pane: None,
@@ -2049,11 +2197,11 @@ impl AppView {
     pub(crate) fn apply_batch(&mut self, batch: Vec<Event>, cx: &mut Context<Self>) {
         self.model.view_dirty = false;
         for ev in batch {
-            // A worker's menu, or a cancel armed from the tray,
-            // means nothing across a reconnect (a restarted
-            // daemon numbers its workers anew).
+            // A worker's menu, the workers menu, or a cancel armed
+            // from the tray, means nothing across a reconnect (a
+            // restarted daemon numbers its workers anew).
             if matches!(ev, Event::Attached { .. } | Event::Reattaching { .. }) {
-                if self.menu.is_some() {
+                if self.menu.is_some() || self.wmenu.is_some() {
                     self.close_menu();
                     self.model.view_dirty = true;
                 } else if self.model.cancels.disarm() {
@@ -2254,6 +2402,72 @@ impl AppView {
         }
     }
 
+    /// Overlays that closed since the last frame leave (fluid.md §3.10):
+    /// 90 ms `in` and 2 px back toward their anchor, without a hitbox. One
+    /// the keyboard opened goes at once, as it came.
+    fn overlay_exits(&mut self) {
+        let now = self.fx.now();
+        if self.menu.is_none() {
+            // A row's menu has no exit drawn (it is anchored to the row).
+            if let Some(m) = self.menu_was.take().filter(|m| m.born.is_some() && matches!(m.at, crate::menu::At::Point(_))) {
+                self.menu_leaving = Some((m, now));
+            }
+        } else {
+            self.menu_leaving = None;
+            // Kept once per menu opened or refreshed in place (its exit shows
+            // what it showed last), not cloned every frame.
+            if self.menu_was.as_ref().map(|m| (m.born, &m.items)) != self.menu.as_ref().map(|m| (m.0.born, &m.0.items)) {
+                self.menu_was = self.menu.as_ref().map(|m| m.0.clone());
+            }
+        }
+        if self.menu_leaving.as_ref().is_some_and(|(_, at)| self.fx.leave(*at).is_none()) {
+            self.menu_leaving = None;
+        }
+        if self.smenu.is_none() {
+            if let Some(m) = self.smenu_was.take().filter(|m| m.born.is_some()) {
+                self.smenu_leaving = Some((m, now));
+            }
+        } else {
+            self.smenu_leaving = None;
+            if self.smenu_was.as_ref().map(|m| m.born) != self.smenu.as_ref().map(|m| m.0.born) {
+                self.smenu_was = self.smenu.as_ref().map(|m| m.0.clone());
+            }
+        }
+        if self.smenu_leaving.as_ref().is_some_and(|(_, at)| self.fx.leave(*at).is_none()) {
+            self.smenu_leaving = None;
+        }
+        // The workers menu's items follow the tray while it is open: its
+        // exit shows the last of them.
+        if self.wmenu.is_none() {
+            if let Some(m) = self.wmenu_was.take().filter(|m| m.born.is_some()) {
+                self.wmenu_leaving = Some((m, now));
+            }
+        } else {
+            self.wmenu_leaving = None;
+            if self.wmenu_was.as_ref().map(|m| (m.born, &m.items)) != self.wmenu.as_ref().map(|m| (m.born, &m.items)) {
+                self.wmenu_was = self.wmenu.clone();
+            }
+        }
+        if self.wmenu_leaving.as_ref().is_some_and(|(_, at)| self.fx.leave(*at).is_none()) {
+            self.wmenu_leaving = None;
+        }
+        if self.gear_menu != self.gear_was {
+            self.gear_was = self.gear_menu;
+            if self.gear_menu {
+                self.gear_at = Some(now);
+                self.gear_leaving = None;
+            } else {
+                self.gear_leaving = Some(now);
+            }
+        }
+        if self.gear_leaving.is_some_and(|at| self.fx.leave(at).is_none()) {
+            self.gear_leaving = None;
+        }
+        if self.readout_leaving.is_some_and(|(_, at)| self.fx.leave(at).is_none()) {
+            self.readout_leaving = None;
+        }
+    }
+
     /// The rail as the model, find, the chip and the buckets have it now.
     fn refresh_rail(&mut self) {
         // The favourites' snapshots follow the lists (and are saved when
@@ -2269,7 +2483,8 @@ impl AppView {
             expanded: self.expanded,
             favs_closed: self.panels.favs_closed,
         };
-        self.rail.refresh(&self.model, &view, &self.rail_list);
+        let hold = self.fx.held(crate::chrome::RAIL_TOUCH);
+        self.rail.refresh(&self.model, &view, &self.rail_list, hold);
         self.find = view.find;
     }
 
@@ -2300,23 +2515,48 @@ impl AppView {
                 return;
             }
             self.hover = Some(key);
-            let shown = self.readout.take().is_some();
+            // Another row's readout shown, or gone less than 300 ms ago: this
+            // one shows now and follows from it, without entering again
+            // (fluid.md §3.10, motion.md §6.4).
+            let now = self.fx.now();
+            let from = self
+                .readout
+                .take()
+                .or(self.readout_left.filter(|l| now.saturating_duration_since(l.1) < crate::motion::REPLACE).map(|l| l.0));
+            if let Some(old) = from.filter(|&k| k != key) {
+                let rail = &self.rail.rail;
+                let y = rail
+                    .items
+                    .iter()
+                    .position(|it| crate::chrome::row_key(rail, it) == Some(old))
+                    .and_then(|ix| crate::chrome::item_y(&self.rail_list, ix))
+                    .map(|y| y.0);
+                self.readout_from = y.or(self.fx.spring_at(crate::chrome::READOUT_Y));
+                self.readout = Some(key);
+                self.readout_at = None;
+                self.readout_leaving = None;
+                self.readout_left = None;
+                self.readout_wait = None;
+                cx.notify();
+                return;
+            }
             self.readout_wait = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(READOUT_DELAY).await;
                 let _ = this.update(cx, |v, cx| {
                     if v.hover == Some(key) {
                         v.readout = Some(key);
+                        v.readout_at = Some(v.fx.clock());
                         cx.notify();
                     }
                 });
             }));
-            if shown {
-                cx.notify();
-            }
         } else if self.hover == Some(key) {
             self.hover = None;
             self.readout_wait = None;
             if self.readout.take().is_some() {
+                let now = self.fx.now();
+                self.readout_leaving = Some((key, now));
+                self.readout_left = Some((key, now));
                 cx.notify();
             }
         }
@@ -3224,7 +3464,9 @@ impl AppView {
     ///   happens; a closed tab's, from where it was);
     /// - a worker's view: from below (out of the tray and blocks); back to
     ///   the session from it: from above;
-    /// - otherwise (launch, a session in the tab): from below.
+    /// - another session in the same tab (the rail, ↑↓): from the side its
+    ///   rail row is on, relative to the one before (fluid.md §3.6);
+    /// - otherwise (launch): from below.
     ///
     /// Keyed by what is drawn: the session whose rows are on screen (a tab's
     /// kept rows show before its attach lands; the attach changes nothing),
@@ -3245,7 +3487,16 @@ impl AppView {
             return;
         }
         let now = self.fx.now();
-        let rapid = self.column_at.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(150));
+        let rapid = self.column_at.is_some_and(|t| now.saturating_duration_since(t) < crate::motion::RAPID);
+        // A session's row in the rail (its place, top to bottom).
+        let rail = &self.rail.rail;
+        let row_of = |s: &Option<String>| {
+            let s = s.as_deref()?;
+            rail.items.iter().position(|it| match it {
+                crate::rail::Item::Row(r) => rail.rows[*r].live.and_then(|i| self.model.sessions.get(i)).is_some_and(|m| m.id == s),
+                _ => false,
+            })
+        };
         let ix = tabs.active();
         let (dx, dy) = match (self.column_key.2, key.2) {
             (Some(a), Some(b)) if a != b && !worker => {
@@ -3254,6 +3505,12 @@ impl AppView {
                 (if left { -1. } else { 1. }, 0.)
             }
             _ if self.column_worker && !worker => (0., -1.),
+            (a, b) if a == b && !worker && self.column_key.0.is_some() && self.column_key.0 != key.0 => {
+                match (row_of(&self.column_key.0), row_of(&key.0)) {
+                    (Some(o), Some(n)) if n < o => (0., -1.),
+                    _ => (0., 1.),
+                }
+            }
             _ => (0., 1.),
         };
         (self.column_key, self.column_ix, self.column_worker, self.column_at) = (key, ix, worker, Some(now));
@@ -4452,7 +4709,7 @@ impl AppView {
         }
         window.focus(&self.focus, cx);
         self.gear_menu = false;
-        let menu = crate::menu::Menu::new(session_items(for_), crate::menu::At::Point(pt), false);
+        let menu = crate::menu::Menu::new(session_items(for_), crate::menu::At::Point(pt), false).born(self.fx.clock());
         self.smenu = Some((menu, SessionTarget { session, tab, row }));
         cx.notify();
     }
@@ -4510,9 +4767,15 @@ impl AppView {
 
     /// The session menu, if open: at the root, over everything.
     fn render_session_menu(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
-        let (m, _) = self.smenu.as_ref()?;
+        let (m, phase) = match self.smenu.as_ref() {
+            Some((m, _)) => (m, crate::menu::Phase::enter(&self.fx, m.born, -1.)),
+            None => {
+                let (m, at) = self.smenu_leaving.as_ref()?;
+                (m, crate::menu::Phase::leave(&self.fx, *at, -1.)?)
+            }
+        };
         let crate::menu::At::Point(pt) = m.at else { return None };
-        let body = crate::menu::render("session-menu", m, p, AppView::session_menu_pick, |this, _| this.close_menu(), cx);
+        let body = crate::menu::render("session-menu", m, p, AppView::session_menu_pick, |this, _| this.close_menu(), phase, &self.fx, cx);
         Some(deferred(anchored().position(pt).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
     }
 
@@ -5290,6 +5553,8 @@ impl AppView {
             _ => (out.max(fx.flash(handoff_in)), 1.),
         };
         let bar = crate::motion::mix(p.you_mark, lit, bar_flash);
+        #[cfg(test)]
+        self.composer_bar.set(Some(bar));
         // Handoff in's light (motion.md §10 amendment 17): lit as the beam
         // is, on at once, decaying into the bar over the last `glow` of its
         // travel: it lands as the bar, never switched off.
@@ -5415,7 +5680,9 @@ impl AppView {
                 .border_1()
                 .border_color(p.edge)
                 // The user's bar over the left border.
-                .child(div().absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(2.)).bg(bar))
+                .child(
+                    div().debug_selector(|| "composer-bar".into()).absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(2.)).bg(bar),
+                )
                 // Handoff in: a 24 px light travels down it.
                 .when(segment < 1., |d| {
                     d.child(
@@ -5470,6 +5737,15 @@ impl Fill {
             Fill::Warn => (p.warn_fill, p.warn_hi),
         }
     }
+
+    /// Pressed (fluid.md §3.9): state, drawn in the frame the pointer goes
+    /// down, at every motion level.
+    fn press(self, p: &Palette) -> Hsla {
+        match self {
+            Fill::Btn => p.btn_press,
+            Fill::Warn => p.warn_press,
+        }
+    }
 }
 
 /// A filled button (AUTHORIZE, SEND, design.md §8.12): its label is the
@@ -5490,7 +5766,7 @@ pub(crate) fn fbtn_key(
     p: &Palette,
     m: &Metrics,
 ) -> Stateful<Div> {
-    let (bg, hi) = fill.roles(p);
+    let ((bg, hi), down) = (fill.roles(p), fill.press(p));
     let fg = if enabled { p.chrome } else { p.dim };
     div()
         .id(id)
@@ -5501,7 +5777,7 @@ pub(crate) fn fbtn_key(
         .flex_none()
         .gap(px(10.))
         .items_center()
-        .when(enabled, |d| d.bg(bg).cursor_pointer().hover(move |d| d.bg(hi)))
+        .when(enabled, |d| d.bg(bg).cursor_pointer().hover(move |d| d.bg(hi)).active(move |d| d.bg(down)))
         .when(!enabled, |d| d.child(div().absolute().inset_0().border_1().border_color(p.edge)))
         .child(display(text, m.label, fg))
         .when_some(key, |d, k| d.child(mono(k, m.meta, fg)))
@@ -5654,6 +5930,22 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.rescope(self.motion_session(), self.motion_column());
+        // A worker tab opened by the pointer: the tracer from it (§6.2),
+        // from the source chip's bar (its left edge, at its centre) when the
+        // click, or the menu picked from, was on a chip.
+        if let Some(tab) = self.tracer_open.take()
+            && self.fx.level() == crate::motion::Level::Full
+            && !window.last_input_was_keyboard()
+        {
+            let mouse = window.mouse_position();
+            let src = match self.menu_was.as_ref().map(|m| m.at) {
+                Some(crate::menu::At::Point(pt)) => pt,
+                _ => mouse,
+            };
+            let chip = self.chip_bounds.borrow().iter().find(|(_, b)| b.contains(&src)).map(|(_, b)| point(b.left(), b.center().y));
+            self.tracer = Some(crate::motion::Tracer { tab, from: chip.unwrap_or(mouse), at: self.fx.now(), to: None });
+        }
+        self.chip_bounds.borrow_mut().clear();
         if self.menu.is_none()
             && self.smenu.is_none()
             && self.wmenu.is_none()
@@ -5687,9 +5979,77 @@ impl Render for AppView {
             .map(|(at, _)| at);
         self.sync_tray(cx);
         self.rename_when_shown(window, cx);
+        // A reorder waits while a rail row is held (motion.md §6.4): a row
+        // never moves away from a click. Its release draws.
         self.refresh_rail();
+        self.rail_motion();
+        self.overlay_exits();
         if let Some(b) = self.bench.as_mut() {
             b.on_render(&self.list, window);
+        }
+        // Settings hidden: what it showed is forgotten, so a value changed
+        // meanwhile (Ctrl+=, the top bar's THEME) is history when it opens
+        // again, not a save to glow for.
+        if self.model.tabs.view() != Some(crate::tabs::Kind::Settings) {
+            self.settings.saved.get_mut().clear();
+        }
+        // What moves in Settings or Usage (a segment's bar, a chart's
+        // reveal) draws their pane again.
+        if self.fx.pane_wants()
+            && let Some(k) = self.model.tabs.view()
+        {
+            let pane = self.pane(k).clone();
+            cx.defer(move |cx| pane.update(cx, |_, cx| cx.notify()));
+        }
+        // The link (motion.md §5.1, §5.3; never offline): up, it scans;
+        // dropped, it tears and the palette drains, held while down; back,
+        // the palette restores. Settings and Usage draw with it.
+        if !self.synthetic {
+            let up = matches!(self.model.conn, ConnState::Connected(_));
+            self.link.see(up, self.model.reload.then_some(self.model.reload_seq), &self.fx);
+            // A reload past its grace is a loss: from here the rail and the
+            // words say so (re-gate 3).
+            if self.link.lost && self.model.reload {
+                self.model.reload = false;
+                self.model.rail_gen += 1;
+            }
+        }
+        let drain = self.link.drain(&self.fx);
+        if drain > 0. || self.link.lost {
+            log::debug!(target: "synaps_desktop::link", "drain {drain:.3} lost {} pending {:?}", self.link.lost, self.fx.pending());
+        }
+        let scheme = cx.global::<theme::Scheme>();
+        if scheme.drain.replace(drain) != drain
+            && let Some(k) = self.model.tabs.view()
+        {
+            let pane = self.pane(k).clone();
+            cx.defer(move |cx| pane.update(cx, |_, cx| cx.notify()));
+        }
+        let tear = self.link.tear(&self.fx);
+        self.conn_dy = match tear {
+            Some(0) => 3.,
+            Some(_) => -2.,
+            None => 0.,
+        };
+        // A theme change cross-fades over `slow` `inout` (motion.md §6.8),
+        // from the app's frame; Settings and Usage draw with it. Sampled as
+        // `Spatial` (a colour, but Reduced wants it at once: a level change
+        // mid-fade ends it); its last frame syncs the kit and text views.
+        if let Some((at, _)) = cx.global::<theme::Scheme>().fading() {
+            let at = at.unwrap_or(self.fx.now());
+            let t = self.fx.shot(Some(at), Duration::ZERO, crate::motion::SLOW, &crate::motion::ease::INOUT, crate::motion::Kind::Spatial);
+            if cx.global::<theme::Scheme>().fade(at, t) {
+                cx.defer(|cx| {
+                    theme::settle_fade(cx);
+                    cx.refresh_windows();
+                });
+            } else if t < 1. {
+                cx.defer(theme::blend_text);
+            }
+            if let Some(k) = self.model.tabs.view() {
+                let pane = self.pane(k).clone();
+                cx.defer(move |cx| pane.update(cx, |_, cx| cx.notify()));
+            }
         }
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
@@ -5812,8 +6172,13 @@ impl Render for AppView {
             self.pack_chips(Vec::new(), &[], lay.column, 0, &m);
             0
         };
-        // A keyboard menu over a row no longer drawn closes.
+        // A keyboard menu over a row no longer drawn closes; a workers menu
+        // left empty leaves. Either way the next frame gives focus back.
+        let menus = (self.menu.is_some(), self.wmenu.is_some());
         self.close_orphan_menu();
+        if menus != (self.menu.is_some(), self.wmenu.is_some()) {
+            window.request_animation_frame();
+        }
         let ex = crate::fit::Extras { tray: self.tray_rows as u8, ..ex };
         let rows = crate::fit::composer_rows(&m, lay.form(), self.height, card_shown, ex);
         if rows != self.composer_rows {
@@ -6196,10 +6561,14 @@ impl Render for AppView {
                 d.child(deferred(self.render_picker(&p, if view.is_some() { Side::Open(0.) } else { right }, cx)).with_priority(1))
                     .child(deferred(self.bars.picker.bar(crate::scrollbar::Ground::Chrome)).with_priority(1))
             })
-            .when(self.gear_menu, |d| d.child(deferred(self.render_gear_menu(rail == Side::Strip, &p, cx)).with_priority(2)))
+            .when(self.gear_menu || self.gear_leaving.is_some(), |d| {
+                d.child(deferred(self.render_gear_menu(rail == Side::Strip, &p, cx)).with_priority(2))
+            })
             .children(self.render_menu_at_point(&p, cx))
             .children(self.render_session_menu(&p, cx))
             .children(self.render_workers_menu(&p, cx))
+            .children(self.render_link(tear, &p, &theme::live_palette(cx)))
+            .children(self.render_tracer(&p))
             // Painted last, after every row was rendered: what the frame's
             // motion asked for (a frame, the one timer, or nothing; with a
             // beat layer, it arms the timer after painting the beat).

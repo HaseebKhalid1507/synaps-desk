@@ -91,6 +91,13 @@ fn wait(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ms:
     settle(cx, w, 8);
 }
 
+/// [`wait`] to just past `ms` in two steps, so a timer due at `ms` fires
+/// on its own (a single jump lets the timers armed on the way chain past it).
+fn wait_past(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ms: u64) {
+    wait(cx, w, view, ms - 1);
+    wait(cx, w, view, 1);
+}
+
 fn keystroke(cx: &TestAppContext, key: &str) -> Keystroke {
     Keystroke::parse_with_os(key, cx.update(|cx| cx.platform_info().os)).expect("a keystroke")
 }
@@ -979,6 +986,136 @@ fn a_failed_worker_is_never_folded_into_more(cx: &mut TestAppContext) {
     });
 }
 
+/// The workers menu is a pointer menu like the others (fluid.md §3.10):
+/// it enters from the click and leaves without a hitbox. While open it
+/// says what `+N more` stands for now (a worker ended: its line and
+/// place), its selection kept on the same worker. A reconnect closes it
+/// (a restarted daemon numbers its workers anew: Shady #16 L-a, L-b).
+#[gpui_kit::test]
+fn the_workers_menu_follows_the_tray_and_closes_on_a_reconnect(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    let rows = |ended: Option<u64>| {
+        let rows: Vec<serde_json::Value> = (1..=12u64)
+            .map(|n| {
+                let status = if ended == Some(n) { "completed" } else { "running" };
+                serde_json::json!({"subagent_id": n, "agent_name": format!("worker-{n}"), "status": status, "cancel_requested": false,
+                    "elapsed_secs": 10.0 + n as f64, "finished_elapsed": if ended == Some(n) { serde_json::json!(20.0) } else { serde_json::Value::Null },
+                    "step": format!("reading src/part_{n}.rs"), "tools": n, "handle_id": format!("sa_{n}")})
+            })
+            .collect();
+        synaps_client::protocol::decode_event(&serde_json::json!({"ev": "subagent_rows", "rows": rows})).expect("a rows event")
+    };
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.on_session(&rows(None));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let at = VisualTestContext::from_window(w, cx).debug_bounds("tray-more").expect("+N more drawn").center();
+    click_at(cx, w, at);
+    let (born, items) = view.read_with(cx, |v, _| {
+        let m = v.wmenu.as_ref().expect("the workers menu");
+        (m.born, m.items.iter().map(|i| i.act).collect::<Vec<_>>())
+    });
+    assert!(born.is_some(), "the pointer opened it: it enters");
+    assert!(items.len() >= 3, "workers not drawn: {items:?}");
+    // The second item selected; the first one listed ends.
+    let (gone, kept) = (items[0], items[1]);
+    view.update(cx, |v, cx| {
+        v.wmenu.as_mut().expect("open").sel = Some(1);
+        v.model.stats.subagents.on_session(&rows(Some(gone)));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    view.read_with(cx, |v, _| {
+        let m = v.wmenu.as_ref().expect("still open");
+        let now: Vec<u64> = m.items.iter().map(|i| i.act).collect();
+        let expect: Vec<u64> = v.tray.rows[v.tray_drawn()..].iter().map(|r| r.id).collect();
+        assert_eq!(now, expect, "what +N more stands for now");
+        assert_ne!(now, items, "the ended one moved (ended last)");
+        assert_eq!(m.sel.map(|i| m.items[i].act), Some(kept), "the selection on the same worker");
+        let line = &m.items[now.iter().position(|&a| a == gone).expect("the ended one listed")].label;
+        assert!(line.contains(crate::glyph::worker(crate::subagents::Liveness::Done).2), "its line says it ended: {line}");
+    });
+    // A reconnect closes it; it leaves, then is gone.
+    view.update(cx, |v, cx| {
+        let seq = v.model.active.as_ref().expect("attached").attach_seq;
+        let events = crate::demo::attach(crate::demo::SID, seq)
+            .into_iter()
+            .filter_map(|e| match e {
+                synaps_client::Event::Attached { attach_seq, attached, mode, .. } => {
+                    Some(synaps_client::Event::Attached { attach_seq, attached, mode, reconnect: true })
+                }
+                _ => None,
+            })
+            .collect();
+        v.apply_batch(events, cx);
+    });
+    wait(cx, w, &view, 7);
+    view.read_with(cx, |v, _| {
+        assert!(v.wmenu.is_none(), "closed by the reconnect");
+        assert!(v.wmenu_leaving.is_some(), "leaving");
+    });
+    for _ in 0..30 {
+        wait(cx, w, &view, 7);
+    }
+    assert!(view.read_with(cx, |v, _| v.wmenu_leaving.is_none()), "gone");
+}
+
+/// Shady #15 L1: a workers menu emptied in the render (the window grew,
+/// every worker got its chip, the tray's key unchanged) leaves from that
+/// frame, at its place, and is gone after its exit; not later, when
+/// something else draws.
+#[gpui_kit::test]
+fn a_workers_menu_emptied_by_room_leaves_at_once(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    let rows: Vec<serde_json::Value> = (1..=6u64)
+        .map(|n| {
+            serde_json::json!({"subagent_id": n, "agent_name": format!("worker-{n}"), "status": "running", "cancel_requested": false,
+                "elapsed_secs": 10.0 + n as f64, "step": format!("reading src/part_{n}.rs"), "tools": n, "handle_id": format!("sa_{n}")})
+        })
+        .collect();
+    let ev = synaps_client::protocol::decode_event(&serde_json::json!({"ev": "subagent_rows", "rows": rows})).expect("a rows event");
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.on_session(&ev);
+        cx.notify();
+    });
+    VisualTestContext::from_window(w, cx).simulate_resize(size(px(1440.), px(560.)));
+    settle(cx, w, 8);
+    let drawn = view.read_with(cx, |v, _| (v.tray_drawn(), v.tray.rows.len()));
+    let at = VisualTestContext::from_window(w, cx).debug_bounds("tray-more").unwrap_or_else(|| panic!("+N more drawn: {drawn:?}")).center();
+    click_at(cx, w, at);
+    let key = view.read_with(cx, |v, _| {
+        assert!(v.wmenu.as_ref().expect("the workers menu").born.is_some(), "the pointer opened it");
+        v.tray.key
+    });
+    for _ in 0..20 {
+        wait(cx, w, &view, 7);
+    }
+    // Frame by frame: (open, leaving) after each.
+    let state = |cx: &mut TestAppContext| view.read_with(cx, |v, _| (v.wmenu.is_some(), v.wmenu_leaving.is_some()));
+    VisualTestContext::from_window(w, cx).simulate_resize(size(px(1440.), px(900.)));
+    let mut seen = vec![state(cx)];
+    for _ in 0..8 {
+        cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+        cx.run_until_parked();
+        seen.push(state(cx));
+    }
+    let closed = seen.iter().position(|s| !s.0).unwrap_or_else(|| panic!("closed: {seen:?}"));
+    assert!(seen[closed].1, "leaving from the frame it closed in: {seen:?}");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.tray.key, key, "the tray's key unchanged: only the render sees the room");
+        assert_eq!(v.tray_drawn(), v.tray.rows.len(), "every worker has its chip");
+    });
+    for _ in 0..30 {
+        wait(cx, w, &view, 7);
+    }
+    view.read_with(cx, |v, _| assert!(v.wmenu_leaving.is_none() && v.wmenu_was.is_none(), "gone, nothing left to leave later"));
+}
+
 /// The other demo session in a tab, attached (with no client, the
 /// synthetic transport answers its attach).
 fn open_idle_cpu(cx: &mut TestAppContext, view: &Entity<AppView>, place: crate::tabs::Place) {
@@ -1282,6 +1419,9 @@ fn idle_requests_no_frames(cx: &mut TestAppContext) {
     }
     assert!(drawn > 0, "the unfold animated");
     assert!(settle(cx, w, 8) <= 2);
+    // The switch's new numbers afterglow (motion.md §6.6, fluid.md §3.6):
+    // three steps on a timer over `glow`.
+    wait(cx, w, &view, crate::motion::GLOW.as_millis() as u64);
     assert_eq!(motion_pending(cx, &view), (false, None), "settled: no frame, no timer");
 }
 
@@ -2692,4 +2832,1234 @@ fn a_star_favourites_a_row_without_opening_it(cx: &mut TestAppContext) {
         assert_eq!(v.model.favs.list.len(), 1);
         assert!(v.model.is_shown(&shown), "still the session on screen: nothing opened or closed");
     });
+}
+
+// ── chrome motion (polish.md Q4: fluid.md F2, motion.md PR 5) ─────────
+
+/// A left-button press at `at`, and its release.
+fn press_at(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>) {
+    let ev = gpui_kit::MouseDownEvent {
+        button: gpui_kit::MouseButton::Left,
+        position: at,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    };
+    event(cx, w, PlatformInput::MouseDown(ev));
+}
+
+fn release_at(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>) {
+    let ev = gpui_kit::MouseUpEvent { button: gpui_kit::MouseButton::Left, position: at, modifiers: Default::default(), click_count: 1 };
+    event(cx, w, PlatformInput::MouseUp(ev));
+}
+
+/// fluid.md §3.9: a press shows in the next frame, whatever the level: the
+/// content 1 px down (Full) and the press fill; let go, it springs back on
+/// `flick` and comes to rest where it was. Reduced: the fill, no travel.
+#[gpui_kit::test]
+fn press_feedback_is_same_frame(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    let id = view.read_with(cx, |v, _| v.model.tabs.iter().next().map(|t| t.id)).expect("a tab");
+    let title = format!("tab {id} title");
+    let leak: &'static str = Box::leak(title.into_boxed_str());
+    let y = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(leak).expect("the tab's title").origin.y;
+    for level in [crate::motion::Level::Full, crate::motion::Level::Reduced] {
+        set_motion(cx, &view, level);
+        settle(cx, w, 8);
+        let y0 = y(cx);
+        let at = VisualTestContext::from_window(w, cx).debug_bounds(leak).expect("the title").center();
+        press_at(cx, w, at);
+        frame(cx, &view);
+        let travel = if level == crate::motion::Level::Full { 1. } else { 0. };
+        assert_eq!(y(cx), y0 + px(travel), "{level:?}: the press, in the next frame");
+        let key = view.read_with(cx, |v, _| v.fx.pressed(crate::motion::key(crate::tabstrip::TOUCH, id)));
+        assert_eq!(key, (1., travel), "{level:?}: held: the press fill, {travel} px down");
+        release_at(cx, w, at);
+        for _ in 0..60 {
+            wait(cx, w, &view, 7);
+        }
+        assert_eq!(y(cx), y0, "{level:?}: let go, back where it was");
+        assert_eq!(view.read_with(cx, |v, _| v.fx.pressed(crate::motion::key(crate::tabstrip::TOUCH, id))), (0., 0.), "{level:?}: at rest");
+    }
+}
+
+/// fluid.md §3.5: the visible tab's fill and bar are one quad pair that
+/// springs to a newly visible tab; a switch mid-flight retargets from where
+/// it is (never a jump), and it lands exactly on the tab.
+#[gpui_kit::test]
+fn indicator_retargets(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, cx| {
+        v.client = None;
+        let ids: Vec<String> = v.model.sessions.iter().map(|s| s.id.clone()).take(3).collect();
+        for id in ids {
+            v.open_tab(crate::app::Open::Attach { session_id: id, fallback: None, open: false }, crate::tabs::Place::New);
+        }
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    wait(cx, w, &view, 600);
+    let n = view.read_with(cx, |v, _| v.model.tabs.len());
+    assert!(n >= 3, "three tabs: {n}");
+    let ind = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.spring_at(crate::tabstrip::IND_X));
+    let focus = |cx: &mut TestAppContext, ix: usize| {
+        view.update(cx, |v, cx| {
+            v.focus_tab(ix);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let x_of = |cx: &mut TestAppContext, ix: usize| {
+        let id = view.read_with(cx, |v, _| v.model.tabs.iter().nth(ix).map(|t| t.id)).expect("the tab");
+        let s: &'static str = Box::leak(format!("tab {id}").into_boxed_str());
+        f32::from(VisualTestContext::from_window(w, cx).debug_bounds(s).expect("the tab").origin.x)
+    };
+    focus(cx, 0);
+    wait(cx, w, &view, 600);
+    let start = ind(cx).expect("the indicator");
+    focus(cx, n - 1);
+    let mut last = start;
+    for _ in 0..8 {
+        wait(cx, w, &view, 7);
+        last = ind(cx).expect("moving");
+    }
+    let far = x_of(cx, n - 1) - x_of(cx, 0);
+    assert!(last > start + 1. && last < start + far - 1., "mid-flight: {start} → {last} of {far}");
+    // Retarget to the middle tab: the next frame starts where it was.
+    focus(cx, 1);
+    wait(cx, w, &view, 7);
+    let next = ind(cx).expect("moving");
+    // At most a frame of the spring's own travel (its top speed over the
+    // whole way is far × ω / e, ω = 2π / snap): 7 ms of it, with room.
+    let step = far * std::f32::consts::TAU / crate::motion::SNAP_RESPONSE / std::f32::consts::E * 0.007 * 1.5;
+    assert!((next - last).abs() < step, "no jump on a retarget: {last} → {next} (a frame is at most {step})");
+    for _ in 0..80 {
+        wait(cx, w, &view, 7);
+    }
+    assert_eq!(ind(cx).expect("at rest"), x_of(cx, 1) - x_of(cx, 0) + start, "lands on the tab");
+    assert!(!motion_pending(cx, &view).0, "and asks for nothing more");
+}
+
+/// fluid.md §3.5 "Close" (finish gate 1): closing the visible tab, the
+/// indicator stays in the closed slot while its neighbour slides in under
+/// it; it never runs right and back.
+#[gpui_kit::test]
+fn closing_a_tab_keeps_the_indicator_in_its_slot(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, cx| {
+        v.client = None;
+        let ids: Vec<String> = v.model.sessions.iter().map(|s| s.id.clone()).take(3).collect();
+        for id in ids {
+            v.open_tab(crate::app::Open::Attach { session_id: id, fallback: None, open: false }, crate::tabs::Place::New);
+        }
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    wait(cx, w, &view, 600);
+    let n = view.read_with(cx, |v, _| v.model.tabs.len());
+    assert!(n >= 3, "three tabs: {n}");
+    let ind = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.spring_at(crate::tabstrip::IND_X));
+    view.update(cx, |v, cx| {
+        v.focus_tab(1);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    wait(cx, w, &view, 600);
+    let slot = ind(cx).expect("the indicator");
+    view.update(cx, |v, cx| {
+        v.close_tab(1);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let mut xs = vec![];
+    for _ in 0..60 {
+        wait(cx, w, &view, 7);
+        xs.push(ind(cx).unwrap_or(slot));
+    }
+    let worst = xs.iter().copied().fold(f32::MIN, f32::max);
+    assert!(worst <= slot + 0.5, "the indicator never leaves the closed slot to the right: {slot} → max {worst} ({xs:?})");
+    let quad = view.read_with(cx, |v, _| v.model.tabs.active());
+    assert!(quad.is_some(), "a tab is shown");
+    assert!(!motion_pending(cx, &view).0, "settled");
+}
+
+/// fluid.md §3.8 (M3): a new tab's width springs open from 0; settled, a
+/// later change of width (the window widening, every tab with it) is taken
+/// at once, in the first frame, by every tab: none springs again.
+#[gpui_kit::test]
+fn a_settled_tab_takes_a_new_width_at_once(cx: &mut TestAppContext) {
+    use gpui_kit::VisualTestContext;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let ids = view.update(cx, |v, cx| {
+        v.client = None;
+        v.panels.rail_width = Some(220);
+        v.panels.right_width = Some(413);
+        let ids: Vec<String> = v.model.sessions.iter().map(|s| s.id.clone()).collect();
+        for id in ids {
+            v.open_tab(crate::app::Open::Attach { session_id: id, fallback: None, open: false }, crate::tabs::Place::New);
+        }
+        cx.notify();
+        v.model.tabs.iter().map(|t| t.id).collect::<Vec<_>>()
+    });
+    // Each tab's drawn width (its spring; the tab itself is laid out at
+    // the final width, clipped to this while it opens).
+    let widths = |vcx: &mut VisualTestContext| {
+        view.read_with(vcx, |v, _| {
+            ids.iter().filter_map(|id| v.fx.spring_at(crate::motion::key(crate::tabstrip::OPEN_W, *id))).collect::<Vec<_>>()
+        })
+    };
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    vcx.run_until_parked();
+    // Opening: springs from 0.
+    let opening = widths(&mut vcx);
+    wait(&mut vcx, w, &view, 600);
+    let settled = widths(&mut vcx);
+    assert!(!opening.is_empty() && opening.iter().zip(&settled).all(|(a, b)| a < b), "they opened on a spring: {opening:?} → {settled:?}");
+    vcx.simulate_resize(size(px(1000.), px(900.)));
+    vcx.run_until_parked();
+    let first = widths(&mut vcx);
+    wait(&mut vcx, w, &view, 600);
+    let end = widths(&mut vcx);
+    assert_ne!(settled, end, "the widening changed the tabs' width");
+    assert_eq!(first, end, "the new width in the first frame: no spring");
+}
+
+/// fluid.md §3.6: a switch within 150 ms of the last is instant (holding
+/// ↓ never stacks transitions); one after it plays.
+#[gpui_kit::test]
+fn rapid_switch_is_instant(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::New);
+    wait(cx, w, &view, 600);
+    let focus = |cx: &mut TestAppContext, ix: usize| {
+        view.update(cx, |v, cx| {
+            v.focus_tab(ix);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        frame(cx, &view);
+    };
+    focus(cx, 0);
+    assert!(view.read_with(cx, |v, _| v.layer.is_some()), "a switch on its own plays");
+    wait(cx, w, &view, 100);
+    focus(cx, 1);
+    assert!(view.read_with(cx, |v, _| v.layer.is_none()), "within 150 ms of the last: instant");
+    wait(cx, w, &view, 400);
+    focus(cx, 0);
+    assert!(view.read_with(cx, |v, _| v.layer.is_some()), "after it: plays");
+}
+
+/// fluid.md §3.10: a menu the keyboard opened is there at once (a keyboard
+/// user waits on its first item); one the pointer opened enters.
+#[gpui_kit::test]
+fn keyboard_menu_instant(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    menu_on(cx, w, &view, Act::Open);
+    let born = view.read_with(cx, |v, _| v.menu.as_ref().map(|m| m.0.born));
+    assert_eq!(born, Some(None), "opened from the keyboard: no enter");
+    view.update(cx, |v, _| v.close_menu());
+    cx.run_until_parked();
+    let key = view.read_with(cx, |v, _| v.rail.rail.rows.iter().find(|r| r.live.is_some()).map(|r| r.key)).expect("a live row");
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| v.open_session_menu(crate::app::SessionAt::Row(key), Default::default(), window, cx))
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    let (strength, rise) = view.read_with(cx, |v, _| v.fx.enter(v.smenu.as_ref().and_then(|m| m.0.born)));
+    assert!(strength < 1. && rise > 0., "the pointer's enters: {strength} {rise}");
+    wait(cx, w, &view, 400);
+    let (strength, rise) = view.read_with(cx, |v, _| v.fx.enter(v.smenu.as_ref().and_then(|m| m.0.born)));
+    assert_eq!((strength, rise), (1., 0.), "and lands");
+}
+
+/// motion.md §6.4 / fluid.md §3.10: the rail readout moving to the next row
+/// within 300 ms shows at once, at full strength, and follows from the row
+/// before (no re-enter).
+#[gpui_kit::test]
+fn overlay_replace_does_not_reenter(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let keys: Vec<u64> = view.read_with(cx, |v, _| v.rail.rail.rows.iter().filter(|r| r.live.is_some()).map(|r| r.key).take(2).collect());
+    assert_eq!(keys.len(), 2, "two live rows");
+    view.update(cx, |v, cx| v.hover_row(keys[0], true, cx));
+    wait(cx, w, &view, 500);
+    assert_eq!(view.read_with(cx, |v, _| v.readout), Some(keys[0]), "the first row's readout");
+    assert!(view.read_with(cx, |v, _| v.readout_at.is_some()), "it entered");
+    view.update(cx, |v, cx| {
+        v.hover_row(keys[0], false, cx);
+        v.hover_row(keys[1], true, cx);
+    });
+    frame(cx, &view);
+    let (now, at, from) = view.read_with(cx, |v, _| (v.readout, v.readout_at, v.rail_fx.readout_dy));
+    assert_eq!(now, Some(keys[1]), "the next row's, at once (no 400 ms wait)");
+    assert_eq!(at, None, "no enter: full strength from its first frame");
+    assert!(from != 0., "it follows from the row before: {from}");
+    for _ in 0..60 {
+        wait(cx, w, &view, 7);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.rail_fx.readout_dy), 0., "and lands on its row");
+}
+
+/// motion.md §6.4: a reorder under a held rail row waits for the release:
+/// a row never moves away from a click. Only the order waits: a row's
+/// content (here a session's new title) is today's while held.
+#[gpui_kit::test]
+fn rail_reorder_waits_for_release(cx: &mut TestAppContext) {
+    let (_w, view, _events) = open(cx);
+    let order = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.rail.rail.items.iter().map(|i| crate::rail::item_key(&v.rail.rail, i)).collect::<Vec<_>>())
+    };
+    let (key, id) = view
+        .read_with(cx, |v, _| v.rail.rail.rows.iter().find_map(|r| r.live.map(|i| (r.key, v.model.sessions[i].id.clone()))))
+        .expect("a live row");
+    let before = order(cx);
+    view.update(cx, |v, cx| {
+        v.fx.press_down(crate::motion::key(crate::chrome::RAIL_TOUCH, key));
+        // Another session is pinned (it moves up), and the held one renamed.
+        let other =
+            v.model.sessions.iter_mut().rev().find(|s| s.id != id && !s.pinned && s.lifecycle != "ending").expect("another session");
+        other.pinned = true;
+        let s = v.model.sessions.iter_mut().find(|s| s.id == id).expect("its session");
+        (s.name, s.title) = (None, Some("renamed while held".into()));
+        v.model.rail_gen += 1;
+        cx.notify();
+    });
+    frame(cx, &view);
+    assert_eq!(order(cx), before, "held: the order as it was");
+    let title = view.read_with(cx, |v, _| v.rail.rail.rows.iter().find(|r| r.key == key).map(|r| r.title.to_string()));
+    assert_eq!(title.as_deref(), Some("renamed while held"), "held: the row's content is today's");
+    view.update(cx, |v, cx| {
+        v.fx.press_up();
+        cx.notify();
+    });
+    frame(cx, &view);
+    assert_ne!(order(cx), before, "let go: the change lands");
+}
+
+/// Flip (motion.md §6.4) in a splice's own frame, before the list lays out
+/// again: a row that moved starts where it was and slides; the rows that
+/// didn't move get no offset; the next frame (laid out) agrees with where
+/// the splice frame said each row would be.
+#[gpui_kit::test]
+fn rail_reorder_flips_moved_rows_only(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    // Every live row's key and top, as laid out.
+    let tops = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let rail = &v.rail.rail;
+            rail.items
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, it)| Some((crate::chrome::row_key(rail, it)?, crate::chrome::item_y(&v.rail_list, ix)?.0)))
+                .collect::<std::collections::HashMap<u64, f32>>()
+        })
+    };
+    // Only rows on screen were seen where they were.
+    let view_h = view.read_with(cx, |v, _| f32::from(v.rail_list.viewport_bounds().size.height));
+    let before: std::collections::HashMap<u64, f32> = tops(cx).into_iter().filter(|&(_, y)| y < view_h).collect();
+    // The lowest OPEN row on screen is pinned: it moves up into PINNED.
+    let moved = view
+        .read_with(cx, |v, _| {
+            v.model
+                .sessions
+                .iter()
+                .filter(|s| !s.pinned && s.lifecycle != "ending")
+                .filter_map(|s| before.get(&crate::rail::key_of(&s.id)).map(|y| (*y, s.id.clone())))
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, id)| id)
+        })
+        .expect("an open session on screen");
+    view.update(cx, |v, cx| {
+        let s = v.model.sessions.iter_mut().find(|s| s.id == moved).expect("its session");
+        s.pinned = true;
+        v.model.rail_gen += 1;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let offsets = view.read_with(cx, |v, _| v.rail_fx.offsets.clone());
+    let after = tops(cx);
+    let key = crate::rail::key_of(&moved);
+    let mut slid = 0;
+    for (k, y) in &after {
+        let Some(was) = before.get(k) else { continue };
+        let off = offsets.get(k).copied().unwrap_or(0.);
+        if (was - y).abs() < 0.5 {
+            assert!(off.abs() < 0.5, "a row that didn't move has no offset ({off})");
+        } else {
+            let want = (was - y).clamp(-crate::chrome::FLIP_CAP, crate::chrome::FLIP_CAP);
+            assert!((off - want).abs() < 1., "a moved row starts where it was: {off} vs {want} (key {k:x})");
+            slid += 1;
+        }
+    }
+    assert!(slid >= 2 && before.get(&key) != after.get(&key), "the moved row and those it passed slide ({slid})");
+    // The row that travels farthest is drawn over the ones it passes.
+    let leads = view.read_with(cx, |v, _| v.rail_fx.leads.keys().copied().collect::<Vec<_>>());
+    assert_eq!(leads, vec![key], "the moved row leads");
+    wait(cx, w, &view, 400);
+    assert!(view.read_with(cx, |v, _| v.rail_fx.offsets.is_empty()), "settled");
+}
+
+/// motion.md §6.8: a theme change cross-fades the palette over `slow`
+/// under Full (its first frame the old colours, then between, then the
+/// new); Reduced and Off change it at once.
+#[gpui_kit::test]
+fn a_theme_change_cross_fades(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let ink = |cx: &mut TestAppContext| cx.update(|cx| crate::theme::palette(cx).canvas);
+    let kit = |cx: &mut TestAppContext| cx.update(|cx| Theme::global(cx).colors.background);
+    let to = |cx: &mut TestAppContext, name: &str| {
+        cx.update(|cx| {
+            let raw = crate::theme::builtin(name).expect("built in").1;
+            crate::theme::update(cx, |c| {
+                c.theme = name.into();
+                c.raw = raw;
+            });
+        });
+        frame(cx, &view);
+    };
+    let fading = |cx: &mut TestAppContext| cx.update(|cx| cx.global::<crate::theme::Scheme>().fading().is_some());
+    wait(cx, w, &view, 400);
+    // Dark to dark: the palette blends; the kit and the text views follow
+    // on the last frame.
+    let (old, old_kit) = (ink(cx), kit(cx));
+    to(cx, "night-city");
+    let new = cx.update(|cx| cx.global::<crate::theme::Scheme>().p.canvas);
+    assert_ne!(old, new, "night-city's canvas is another colour");
+    assert_eq!(ink(cx), old, "its first frame: the old palette");
+    assert_eq!(kit(cx), old_kit, "the kit waits for the last frame");
+    wait(cx, w, &view, 180);
+    let mid = ink(cx);
+    assert!(mid != old && mid != new, "between: {mid:?}");
+    // Re-gate 5: the text views' colours (links, code spans) move with it,
+    // a frame behind at most, never after it.
+    let text_t = |cx: &mut TestAppContext| cx.update(|cx| cx.global::<crate::theme::Scheme>().text_t.get());
+    let tt = text_t(cx);
+    assert!(tt > 0.2 && tt < 0.8, "the text views' style mid-fade: {tt}");
+    wait(cx, w, &view, 400);
+    assert_eq!(ink(cx), new, "then the new one");
+    assert_eq!(text_t(cx), 1., "the text views' style at the end");
+    assert_ne!(kit(cx), old_kit, "the kit, synced on the last frame");
+    assert!(!fading(cx));
+    // Dark to light: at once (text and ground would cross mid-fade).
+    to(cx, "paper");
+    let paper = cx.update(|cx| cx.global::<crate::theme::Scheme>().p.canvas);
+    assert_eq!(ink(cx), paper, "a polarity change: at once");
+    assert!(!fading(cx));
+    // A text size: no colour changes, no fade.
+    cx.update(|cx| crate::theme::update(cx, |c| c.text = 18));
+    frame(cx, &view);
+    assert!(!fading(cx), "a text size never fades");
+    to(cx, "nord");
+    for level in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
+        set_motion(cx, &view, level);
+        to(cx, "night-city");
+        let nc = cx.update(|cx| cx.global::<crate::theme::Scheme>().p.canvas);
+        assert_eq!(ink(cx), nc, "{level:?}: at once");
+        to(cx, "nord");
+    }
+}
+
+/// The Usage charts reveal on their first board and on another range,
+/// never on a refresh of the same (motion.md §6.8); at Full only: Reduced
+/// and Off show them whole.
+#[gpui_kit::test]
+fn chart_reveal_skipped_when_reduced(cx: &mut TestAppContext) {
+    use crate::usage::{Board, Range, Raw};
+    let (w, view, _events) = open(cx);
+    let board = |range: Range| {
+        let path = format!("{}/fixtures/usage/all.json", env!("CARGO_MANIFEST_DIR"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::sync::Arc::new(Board::build(&Raw::from_fixture(&v).unwrap(), None, range, 1_794_654_869_189))
+    };
+    let show = |cx: &mut TestAppContext, b: Option<Range>| {
+        view.update(cx, |v, _| {
+            if let Some(r) = b {
+                v.usage.board = Some(board(r));
+            }
+            v.usage_reveal()
+        })
+    };
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    let first = show(cx, Some(Range::ALL[0]));
+    assert!(first.at.is_some(), "the first board reveals");
+    assert_eq!(first.column(0, 30), 0., "from the baseline");
+    wait(cx, w, &view, 100);
+    let r = show(cx, None);
+    assert!(r.column(0, 30) > r.column(29, 30), "the left columns lead: {} {}", r.column(0, 30), r.column(29, 30));
+    assert!(r.line() > 0. && r.line() < 1., "the lines draw on: {}", r.line());
+    wait(cx, w, &view, chart_span());
+    assert_eq!(show(cx, None), crate::chart::Reveal::default(), "over: shown whole");
+    assert_eq!(show(cx, Some(Range::ALL[0])), crate::chart::Reveal::default(), "a refresh of the same range: no reveal");
+    assert!(show(cx, Some(Range::ALL[1])).at.is_some(), "another range reveals");
+    for level in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
+        set_motion(cx, &view, level);
+        settle(cx, w, 4);
+        wait(cx, w, &view, chart_span());
+        let k = if level == crate::motion::Level::Reduced { 2 } else { 0 };
+        assert_eq!(show(cx, Some(Range::ALL[k])), crate::chart::Reveal::default(), "{level:?}: shown whole");
+    }
+}
+
+fn chart_span() -> u64 {
+    crate::chart::Reveal::SPAN.as_millis() as u64 + 10
+}
+
+/// A saved setting's value afterglows (motion.md §6.8: the confirmation, no
+/// toast): a THIS APP value once its write is due, a daemon one when the
+/// write is answered; never on first sight, never under Off.
+#[gpui_kit::test]
+fn saved_value_afterglows(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    let id: gpui_kit::SharedString = "field-dash-url".into();
+    let k = |cx: &mut TestAppContext, value: &str, sending: bool| view.read_with(cx, |v, _| v.saved_glow(&id, value, sending));
+    // A THIS APP key waiting for its write (`save_app` put it there).
+    view.update(cx, |v, _| {
+        v.settings.app_dirty.insert("dash_url", None);
+    });
+    // Read outside a frame: at the motion clock, moved here alone.
+    let wait = |cx: &mut TestAppContext, _: AnyWindowHandle, view: &Entity<AppView>, ms: u64| {
+        view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + std::time::Duration::from_millis(ms)));
+    };
+    assert_eq!(k(cx, "a", false), 0., "first sight");
+    assert_eq!(k(cx, "b", false), 0., "changed: its write is still to come");
+    wait(cx, w, &view, crate::app::SAVE_DELAY.as_millis() as u64 + 50);
+    assert_eq!(k(cx, "b", false), 0., "not written yet (no guess at when)");
+    // Its write finished (the one that saved it, or a later one).
+    view.update(cx, |v, _| v.settings.app_wrote = Some((u64::MAX, v.fx.now())));
+    let lit = k(cx, "b", false);
+    assert!(lit > 0.5, "written: lit ({lit})");
+    wait(cx, w, &view, crate::motion::GLOW.as_millis() as u64);
+    assert_eq!(k(cx, "b", false), 0., "settled");
+    assert_eq!(k(cx, "c", true), 0., "sending");
+    wait(cx, w, &view, 50);
+    assert_eq!(k(cx, "c", false), 1., "answered: lit at once");
+    // Nit (cross-client): a change that isn't this app's pending write (a
+    // daemon value another client set) glows as it lands, not on this
+    // app's next unrelated write.
+    view.update(cx, |v, _| v.settings.app_dirty.clear());
+    let other: gpui_kit::SharedString = "field-model".into();
+    let k2 = |cx: &mut TestAppContext, value: &str| view.read_with(cx, |v, _| v.saved_glow(&other, value, false));
+    assert_eq!(k2(cx, "x"), 0., "first sight");
+    assert_eq!(k2(cx, "y"), 1., "another client's change: lit at once");
+    // Settings not shown (this test's window shows a session): what it
+    // showed is forgotten, so a value changed meanwhile is first sight.
+    frame(cx, &view);
+    assert!(view.read_with(cx, |v, _| v.settings.saved.borrow().is_empty()), "hidden: forgotten");
+    assert_eq!(k(cx, "e", false), 0., "reopened: first sight, not a save");
+    set_motion(cx, &view, crate::motion::Level::Off);
+    settle(cx, w, 4);
+    assert_eq!(k(cx, "d", true), 0.);
+    assert_eq!(k(cx, "d", false), 0., "Off: none");
+}
+
+/// The link's signatures (motion.md §5.1, §5.3): a drop tears for two
+/// frames (the connection cell +3 px, then −2), the palette drains and
+/// holds while down; back, it scans and restores. Every drained role keeps
+/// its contrast. Reduced: no tear, no scan, a quick drain. Offline: never.
+#[gpui_kit::test]
+fn the_link_drops_drains_and_scans_back(cx: &mut TestAppContext) {
+    use crate::model::ConnState;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let conn = |cx: &mut TestAppContext, c: ConnState| {
+        view.update(cx, |v, cx| {
+            v.model.conn = c;
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let drain = |cx: &mut TestAppContext| cx.update(|cx| cx.global::<crate::theme::Scheme>().drain.get());
+    let run = |cx: &mut TestAppContext| cx.update(|cx| crate::theme::palette(cx).run);
+    let lit = run(cx);
+    // Offline (the demo's synthetic transport): nothing, whatever it says.
+    conn(cx, ConnState::Connected("x".into()));
+    conn(cx, ConnState::Reconnecting);
+    assert_eq!(view.read_with(cx, |v, _| v.link.glitch), None, "offline: never");
+    view.update(cx, |v, _| v.synthetic = false);
+    conn(cx, ConnState::Connected("x".into()));
+    assert!(view.read_with(cx, |v, _| v.link.scan.is_some()), "the first hello scans");
+    wait(cx, w, &view, 700);
+    assert!(view.read_with(cx, |v, _| v.link.scan.is_none()), "the scan is over");
+    conn(cx, ConnState::Reconnecting);
+    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), 0., "the grace: nothing yet");
+    assert_eq!(drain(cx), 0.);
+    wait_past(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64);
+    // (The tear's two frames, to the millisecond: motion.rs
+    // `the_link_tears_after_its_grace`.)
+    assert!(view.read_with(cx, |v, _| v.link.tore.is_some()), "past the grace: the tear");
+    wait(cx, w, &view, 500);
+    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), 0., "the tear is over");
+    assert_eq!(drain(cx), 1., "drained");
+    let grey = run(cx);
+    assert_ne!(grey, lit, "the live colours drain");
+    let (l0, l1) = (crate::theme::luminance_hsla(lit), crate::theme::luminance_hsla(grey));
+    assert!((l0 - l1).abs() < 0.01, "at their own luminance: {l0} {l1}");
+    wait(cx, w, &view, 2000);
+    assert_eq!(drain(cx), 1., "held while down");
+    // Holding asks for no display frame (the word's dots step on the beat).
+    assert!(!motion_pending(cx, &view).0, "holding draws nothing");
+    conn(cx, ConnState::Connected("x".into()));
+    assert!(view.read_with(cx, |v, _| v.link.scan.is_some()), "back: it scans");
+    // FG2: the Scan's line is drawn live from its first frame, while the
+    // palette is still drained.
+    let (line, live, drained) = (
+        view.read_with(cx, |v, _| v.scan_line),
+        cx.update(|cx| crate::theme::live_palette(cx).run_mark_ch),
+        cx.update(|cx| crate::theme::palette(cx).run_mark_ch),
+    );
+    assert_eq!(line, Some(live), "the Scan in the live colour");
+    assert_ne!(live, drained, "(while the palette is drained)");
+    wait(cx, w, &view, 400);
+    assert_eq!(drain(cx), 0., "restored");
+    assert_eq!(run(cx), lit);
+    wait(cx, w, &view, 400);
+    assert!(!motion_pending(cx, &view).0, "settled: no display frames");
+    // Reduced: no tear, no scan; the drain over `quick`.
+    set_motion(cx, &view, crate::motion::Level::Reduced);
+    settle(cx, w, 4);
+    conn(cx, ConnState::Reconnecting);
+    wait(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64);
+    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), 0., "Reduced: no tear");
+    wait(cx, w, &view, 130);
+    assert_eq!(drain(cx), 1., "Reduced: a quick drain");
+    conn(cx, ConnState::Connected("x".into()));
+    assert!(view.read_with(cx, |v, _| v.link.scan.is_none()), "Reduced: no scan");
+    wait(cx, w, &view, 130);
+    assert_eq!(drain(cx), 0.);
+    // Off: none.
+    set_motion(cx, &view, crate::motion::Level::Off);
+    settle(cx, w, 4);
+    conn(cx, ConnState::Reconnecting);
+    wait(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64 + 500);
+    assert_eq!(drain(cx), 0., "Off: none");
+    assert_eq!(motion_pending(cx, &view), (false, None), "Off: the dots hold too");
+}
+
+/// Re-gate 1 (motion.md §5.3 "over `slow` 360 `inout`"): the drain and
+/// the restore run their whole tween at frame rate. From the tear's end
+/// every 7 ms frame asks for the next and moves the palette on (no step
+/// over a quarter of the way) until it is all the way, and the app's frame
+/// (the composer's bar with it) draws each step.
+#[gpui_kit::test]
+fn the_drain_and_the_restore_run_every_frame(cx: &mut TestAppContext) {
+    let (w, view) = link_up(cx);
+    let drain = |cx: &mut TestAppContext| cx.update(|cx| cx.global::<crate::theme::Scheme>().drain.get());
+    let bar = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.composer_bar.get());
+    let frames = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.frames());
+    let lit = bar(cx).expect("the composer's bar is drawn");
+    let run = |cx: &mut TestAppContext, to: f32, what: &str| {
+        let mut ks = vec![drain(cx)];
+        let mut bars = vec![bar(cx)];
+        for _ in 0..120 {
+            if ks.last() == Some(&to) {
+                break;
+            }
+            let (frame, timer) = motion_pending(cx, &view);
+            assert!(frame || timer.is_some(), "{what}: the window stopped asking for frames at {:?}", ks.last());
+            let f0 = frames(cx);
+            wait(cx, w, &view, 7);
+            ks.push(drain(cx));
+            bars.push(bar(cx));
+            assert!(frames(cx) > f0, "{what}: no frame drawn at {:?}", ks.last());
+        }
+        assert_eq!(ks.last(), Some(&to), "{what}: all the way ({ks:?})");
+        let moving: Vec<f32> = ks.iter().copied().filter(|k| *k > 0. && *k < 1.).collect();
+        assert!(moving.len() >= 360 / 7 - 4, "{what}: at frame rate, {} frames between ({ks:?})", moving.len());
+        for p in ks.windows(2) {
+            assert!((p[1] - p[0]).abs() <= 0.25, "{what}: a step over a quarter ({} → {})", p[0], p[1]);
+            assert!(if to > 0. { p[1] >= p[0] } else { p[1] <= p[0] }, "{what}: one way ({} → {})", p[0], p[1]);
+        }
+        let changes = bars.windows(2).filter(|p| p[0] != p[1]).count();
+        assert!(changes >= moving.len(), "{what}: the composer's bar moves with it ({changes} of {} frames)", moving.len());
+    };
+    status(cx, &view, synaps_client::Status::Reconnecting { why: "daemon closed the connection".into() });
+    wait_past(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64);
+    assert!(view.read_with(cx, |v, _| v.link.tore.is_some()), "lost");
+    run(cx, 1., "the drain");
+    assert_ne!(bar(cx), Some(lit), "the composer's bar drained");
+    status(cx, &view, hello());
+    run(cx, 0., "the restore");
+    assert_eq!(bar(cx), Some(lit), "the composer's bar restored");
+}
+
+/// Re-gate r3 item 1, in what is painted: the composer bar's quad in the
+/// window's rendered scene (the frame GPUI hands the renderer), read every
+/// 7 ms frame through a loss and a return, through the cached app view
+/// and its beat layer as the app opens them. It leaves the live colour on
+/// the drain's first frame, moves on every frame after, never by more
+/// than 8 % of the way, and is what render computed each frame.
+#[gpui_kit::test]
+fn the_drain_is_painted_every_frame(cx: &mut TestAppContext) {
+    let (w, view) = link_up(cx);
+    let painted = |cx: &mut TestAppContext| {
+        let b = VisualTestContext::from_window(w, cx).debug_bounds("composer-bar").expect("the composer's bar");
+        cx.update_window(w, |_, window, _| {
+            let s = window.scale_factor();
+            let near = |a: gpui_kit::ScaledPixels, b: gpui_kit::Pixels| (a.0 - f32::from(b) * s).abs() < 0.5;
+            let hits: Vec<gpui_kit::Hsla> = window
+                .painted_quads()
+                .iter()
+                .filter(|q| {
+                    near(q.bounds.origin.x, b.origin.x)
+                        && near(q.bounds.size.width, b.size.width)
+                        && near(q.bounds.size.height, b.size.height)
+                })
+                .filter_map(|q| q.background.as_solid())
+                .collect();
+            assert_eq!(hits.len(), 1, "one quad is the composer's bar: {hits:?}");
+            hits[0]
+        })
+        .expect("the window")
+    };
+    let computed = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.composer_bar.get()).expect("drawn");
+    let lit = painted(cx);
+    assert_eq!(lit, computed(cx), "live: painted as computed");
+    let run = |cx: &mut TestAppContext, what: &str| {
+        let from = painted(cx);
+        let mut seen = vec![from];
+        for _ in 0..80 {
+            wait(cx, w, &view, 7);
+            let c = painted(cx);
+            assert_eq!(c, computed(cx), "{what}: painted as render computed it, frame {}", seen.len());
+            seen.push(c);
+            if !motion_pending(cx, &view).0 && motion_pending(cx, &view).1.is_none() && c != from {
+                break;
+            }
+        }
+        let to = *seen.last().expect("frames");
+        let dist = |a: gpui_kit::Hsla, b: gpui_kit::Hsla| {
+            let (a, b) = (gpui_kit::Rgba::from(a), gpui_kit::Rgba::from(b));
+            ((a.r - b.r).powi(2) + (a.g - b.g).powi(2) + (a.b - b.b).powi(2)).sqrt()
+        };
+        let travel = dist(from, to);
+        assert!(travel > 0.05, "{what}: it moves ({from:?} → {to:?})");
+        let first = seen.iter().position(|c| *c != from).expect("it left");
+        let last = seen.iter().position(|c| *c == to).expect("it got there");
+        for (i, p) in seen.windows(2).enumerate() {
+            // `inout`'s steepest is 2.86× linear: 6 % of the way in 7 ms.
+            assert!(dist(p[0], p[1]) <= travel * 0.08 + 1e-4, "{what}: frame {i} → {}: a step over 8 % of the travel", i + 1);
+            if i >= first && i < last {
+                assert_ne!(p[0], p[1], "{what}: held at frame {} (moving {first}..{last})", i + 1);
+            }
+        }
+        // `slow` (360 ms) at 7 ms frames: about 51 frames moving.
+        assert!(last - first >= 360 / 7 - 4, "{what}: at frame rate ({first}..{last})");
+        (first, to)
+    };
+    status(cx, &view, synaps_client::Status::Reconnecting { why: "daemon closed the connection".into() });
+    wait_past(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64);
+    assert!(view.read_with(cx, |v, _| v.link.tore.is_some()), "lost");
+    let (first, drained) = run(cx, "the drain");
+    assert!(first <= 16, "the drain starts after the tear (100 ms): frame {first}");
+    assert_ne!(drained, lit, "drained");
+    status(cx, &view, hello());
+    let (_, back) = run(cx, "the restore");
+    assert_eq!(back, lit, "restored");
+}
+
+/// Re-gate r3: on a real loss too the words keep the connected words'
+/// width (padded, or cut with an ellipsis), so NEEDS YOU, centred beside
+/// them, never moves: "reconnecting ··", then the client's long error.
+/// With a session attached (Shady #15 M1) its own connection re-attaches
+/// on its own backoff, after the link's hello: "reattaching ···" holds
+/// the width too, until it is attached again.
+#[gpui_kit::test]
+fn needs_you_holds_still_through_a_loss(cx: &mut TestAppContext) {
+    use synaps_client::Status;
+    let (w, view) = link_up(cx);
+    let need = |cx: &mut TestAppContext| {
+        let mut vcx = gpui_kit::VisualTestContext::from_window(w, cx);
+        vcx.debug_bounds("attention").map(|b| f32::from(b.origin.x))
+    };
+    let up = need(cx);
+    assert!(up.is_some(), "NEEDS YOU drawn");
+    let seq = view.read_with(cx, |v, _| v.model.active.as_ref().expect("the demo session attached").attach_seq);
+    view.update(cx, |v, cx| {
+        let why = "daemon closed the connection".into();
+        let _ = v.model.apply(synaps_client::Event::Reattaching { attach_seq: seq, session_id: crate::demo::SID.into(), reason: why });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    wait(cx, w, &view, 7);
+    assert_eq!(need(cx), up, "NEEDS YOU, the session re-attaching");
+    let long = "connect /home/someone/.synaps-cli/run/daemon-desktopproto.sock: Connection refused (os error 111)";
+    for (s, what) in [
+        (Status::Reconnecting { why: "daemon closed the connection".into() }, "reconnecting"),
+        (Status::Offline(long.into()), "the client's error"),
+    ] {
+        status(cx, &view, s);
+        for _ in 0..3 {
+            wait(cx, w, &view, 7);
+            assert_eq!(need(cx), up, "NEEDS YOU on a loss: {what}");
+        }
+    }
+    wait_past(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64 + 600);
+    assert_eq!(need(cx), up, "NEEDS YOU, lost and drained");
+    status(cx, &view, hello());
+    for _ in 0..3 {
+        wait(cx, w, &view, 7);
+        assert!(view.read_with(cx, |v, _| v.model.reattaching), "the link up first, the session still re-attaching");
+        assert_eq!(need(cx), up, "NEEDS YOU, back, the session re-attaching");
+    }
+    view.update(cx, |v, cx| {
+        let events = crate::demo::attach(crate::demo::SID, seq)
+            .into_iter()
+            .filter_map(|e| match e {
+                synaps_client::Event::Attached { attach_seq, attached, mode, .. } => {
+                    Some(synaps_client::Event::Attached { attach_seq, attached, mode, reconnect: true })
+                }
+                _ => None,
+            })
+            .collect();
+        v.apply_batch(events, cx);
+    });
+    wait(cx, w, &view, 7);
+    assert!(!view.read_with(cx, |v, _| v.model.reattaching), "attached again");
+    assert_eq!(need(cx), up, "NEEDS YOU, back");
+}
+
+/// R2 (motion.md §5.1, §6.7): a real window starts at `Connecting`, so its
+/// first frames see the link down; the first hello still scans, however
+/// late it comes, and a launch that never connected tears nothing.
+#[gpui_kit::test]
+fn the_first_hello_scans_after_connecting(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, cx| {
+        v.synthetic = false;
+        v.link = Default::default();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    status(cx, &view, synaps_client::Status::Connecting);
+    wait(cx, w, &view, 3000);
+    status(cx, &view, synaps_client::Status::Offline("connection refused".into()));
+    wait(cx, w, &view, 3000);
+    let (tore, scan) = view.read_with(cx, |v, _| (v.link.tore, v.link.scan));
+    assert_eq!((tore, scan), (None, None), "never up yet: nothing to lose, nothing to scan");
+    status(cx, &view, hello());
+    assert!(view.read_with(cx, |v, _| v.link.scan.is_some()), "the first hello scans");
+    assert_eq!(view.read_with(cx, |v, _| v.scan_line), Some(cx.update(|cx| crate::theme::live_palette(cx).run_mark_ch)));
+}
+
+/// A link set up for the link tests: Full, a live (not synthetic) link,
+/// up, its first Scan over.
+fn link_up(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<AppView>) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.synthetic = false);
+    set_conn(cx, &view, crate::model::ConnState::Connected("x".into()), false);
+    wait(cx, w, &view, 700);
+    (w, view)
+}
+
+fn set_conn(cx: &mut TestAppContext, view: &Entity<AppView>, c: crate::model::ConnState, reload: bool) {
+    view.update(cx, |v, cx| {
+        v.model.conn = c;
+        v.model.reload = reload;
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+/// What the client says, as the model takes it (`Model::apply`): the
+/// link's reason (`reload`, `reload_seq`) is the model's own mapping.
+fn status(cx: &mut TestAppContext, view: &Entity<AppView>, s: synaps_client::Status) {
+    view.update(cx, |v, cx| {
+        let _ = v.model.apply(synaps_client::Event::Status(s));
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+fn goodbye() -> synaps_client::Status {
+    synaps_client::Status::Reconnecting { why: synaps_client::RELOADING.into() }
+}
+
+fn hello() -> synaps_client::Status {
+    synaps_client::Status::Connected { daemon_version: "x".into(), profile: None, pid: 1, features: vec![] }
+}
+
+/// The link shows nothing of a reload: no tear, no drain, no Scan.
+fn quiet(cx: &mut TestAppContext, view: &Entity<AppView>, what: &str) {
+    let (dy, glitch, scan, lost) = view.read_with(cx, |v, _| (v.conn_dy, v.link.glitch, v.link.scan, v.link.lost));
+    assert_eq!((dy, glitch.is_some(), scan.is_some(), lost), (0., false, false, false), "{what}");
+    assert_eq!(cx.update(|cx| cx.global::<crate::theme::Scheme>().drain.get()), 0., "{what}: no drain");
+}
+
+/// Frames every 100 ms (the reconnect failing every second meanwhile)
+/// until the link is lost: quiet before, and how long it was down (from
+/// the grace's start) when it was lost. (The harness's clock can jump a
+/// beat ahead: the grace is measured against the link's own `since`.)
+fn until_lost(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> std::time::Duration {
+    for n in 1..400 {
+        let since = view.read_with(cx, |v, _| v.link.down.map(|d| d.0)).expect("down");
+        wait(cx, w, view, 100);
+        if n % 10 == 0 {
+            status(cx, view, synaps_client::Status::Offline("connection refused".into()));
+        }
+        let (now, lost, tore) = view.read_with(cx, |v, _| (v.fx.now(), v.link.lost, v.link.tore));
+        if lost {
+            let tore = tore.expect("lost: the tear");
+            return tore.saturating_duration_since(since);
+        }
+        quiet(cx, view, &format!("{:?} down", now.saturating_duration_since(since)));
+    }
+    panic!("never lost");
+}
+
+/// A daemon reload is a planned handover (its sessions come back): no
+/// tear, no drain, no Scan, even when the new daemon takes 9 s (the
+/// reconnect failing every `RELOAD_RETRY` meanwhile, Offline). Past
+/// [`RELOAD_GRACE`] from its goodbye it is a loss.
+#[gpui_kit::test]
+fn a_reload_neither_tears_nor_scans(cx: &mut TestAppContext) {
+    use synaps_client::Status;
+    let (w, view) = link_up(cx);
+    let retry = synaps_client::RELOAD_RETRY.as_millis() as u64;
+    // An empty daemon (the sandbox's): the rail says "No open sessions".
+    view.update(cx, |v, cx| {
+        let _ = v.model.apply(synaps_client::Event::Sessions(Vec::new()));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let rail = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.rail.keys.clone());
+    let before = rail(cx);
+    status(cx, &view, goodbye());
+    quiet(cx, &view, "the goodbye");
+    // Re-gate 3: the rail keeps its last lists (no "Not connected", its
+    // HISTORY block kept) while the reload is within its grace.
+    assert_eq!(rail(cx), before, "the rail through a reload");
+    for n in 1..=9000 / retry {
+        wait(cx, w, &view, retry);
+        status(cx, &view, Status::Offline("connection refused".into()));
+        quiet(cx, &view, &format!("reloading, {} ms", retry * n));
+    }
+    assert_eq!(rail(cx), before, "the rail 9 s into a reload");
+    // The words say so, at the connected words' width (NEEDS YOU, centred
+    // beside them, never moves), and the disc stays lit.
+    let need = |cx: &mut TestAppContext| {
+        let mut vcx = gpui_kit::VisualTestContext::from_window(w, cx);
+        vcx.debug_bounds("attention").map(|b| f32::from(b.origin.x))
+    };
+    let during = need(cx);
+    status(cx, &view, hello());
+    let after = need(cx);
+    assert!(during.is_some() && during == after, "NEEDS YOU through a reload: {during:?} vs connected {after:?}");
+    status(cx, &view, goodbye());
+    status(cx, &view, hello());
+    quiet(cx, &view, "back after 9 s");
+    wait(cx, w, &view, 700);
+    quiet(cx, &view, "settled");
+    assert!(!motion_pending(cx, &view).0, "settled: no frames");
+    // A reload that never comes back is a loss, its grace after the goodbye
+    // (to the millisecond: motion.rs `the_link_tears_after_its_grace`).
+    status(cx, &view, goodbye());
+    let rg = crate::motion::RELOAD_GRACE;
+    let down = until_lost(cx, w, &view);
+    assert!(down >= rg && down < rg + std::time::Duration::from_millis(200), "lost {down:?} after the goodbye");
+    // From here the rail and the words say so (re-gate 3).
+    assert!(!view.read_with(cx, |v, _| v.model.reload), "a reload past its grace is a loss");
+    frame(cx, &view);
+    assert_ne!(rail(cx), before, "lost: the rail says it is not connected");
+}
+
+/// When the client is back for a moment between two frames and a second
+/// goodbye comes (the window never sees it up), the new goodbye restarts
+/// the grace: a slow storm is never a loss.
+#[gpui_kit::test]
+fn a_new_goodbye_restarts_the_reload_grace(cx: &mut TestAppContext) {
+    let (w, view) = link_up(cx);
+    let rg = crate::motion::RELOAD_GRACE.as_millis() as u64;
+    status(cx, &view, goodbye());
+    let first = view.read_with(cx, |v, _| v.link.down.map(|d| d.0)).expect("down");
+    wait(cx, w, &view, rg - 2000);
+    view.update(cx, |v, cx| {
+        let _ = v.model.apply(synaps_client::Event::Status(hello()));
+        let _ = v.model.apply(synaps_client::Event::Status(goodbye()));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let second = view.read_with(cx, |v, _| v.link.down.map(|d| d.0)).expect("down");
+    assert!(second.duration_since(first).as_millis() as u64 >= rg - 2000, "the second goodbye restarted the grace");
+    let down = until_lost(cx, w, &view);
+    let rg = crate::motion::RELOAD_GRACE;
+    assert!(down >= rg && down < rg + std::time::Duration::from_millis(200), "lost {down:?} after the second goodbye");
+}
+
+/// A daemon's availability for a reload storm: `n` reloads, each new daemon
+/// taking `boot` ms to answer, the next reload as soon as it does (the
+/// CLI's `daemon reload` returns once the new image answers a ping).
+/// Then what the client says and when, on the reconnect schedule `wait`
+/// (`after`, `now`, and whether this wait follows a goodbye).
+fn storm(n: u64, boot: u64, mut wait: impl FnMut(u64, u64, bool, u64) -> u64) -> Vec<(u64, synaps_client::Status)> {
+    let reloads: Vec<u64> = (0..n).map(|k| 1000 + k * (boot + 50)).collect();
+    let daemon_up = |t: u64| !reloads.iter().any(|&r| r <= t && t < r + boot);
+    let mut out = Vec::new();
+    let (mut up_since, mut next, mut k) = (Some(0u64), 0u64, 0usize);
+    loop {
+        if let Some(since) = up_since {
+            let Some(&r) = reloads.get(k) else { break };
+            k += 1;
+            out.push((r, goodbye()));
+            up_since = None;
+            // The goodbye's `retry_after_ms`: 500 here.
+            next = r + wait(500, r, true, r - since);
+            continue;
+        }
+        while reloads.get(k).is_some_and(|&r| r <= next) {
+            k += 1;
+        }
+        if daemon_up(next) {
+            out.push((next, hello()));
+            up_since = Some(next);
+        } else {
+            out.push((next, synaps_client::Status::Offline("connection refused".into())));
+            next += wait(0, next, false, 0);
+        }
+    }
+    out
+}
+
+/// The longest stretch the link is down in `events`, from its last goodbye.
+fn longest_from_goodbye(events: &[(u64, synaps_client::Status)]) -> u64 {
+    let (mut from, mut worst) = (None, 0);
+    for (t, s) in events {
+        match s {
+            synaps_client::Status::Reconnecting { .. } => from = Some(*t),
+            synaps_client::Status::Connected { .. } => worst = worst.max(from.take().map_or(0, |f| t - f)),
+            _ => {}
+        }
+    }
+    worst
+}
+
+/// A storm of four daemon reloads as the client lives it (R1): its real
+/// reconnect schedule (`synaps_client::Backoff`), each new daemon taking
+/// 1.6 s to boot (bella's sandbox, empty), the CLI reloading again as soon
+/// as the new one answers: about 7 s of the link down, nearly unbroken.
+/// No tear, no drain, no Scan at any step. (On the old schedule, doubling
+/// and never reset within 10 s, the same storm kept the link down past the
+/// old 6 s grace: the sim says so first.)
+#[gpui_kit::test]
+fn a_four_reload_storm_on_the_clients_schedule_plays_nothing(cx: &mut TestAppContext) {
+    use std::time::{Duration, Instant};
+    let base = Instant::now();
+    let mut b = synaps_client::Backoff::default();
+    let events = storm(4, 1600, |after, t, bye, up_for| {
+        let now = base + Duration::from_millis(t);
+        if bye {
+            b.dropped(Duration::from_millis(up_for), true, now);
+        }
+        b.wait(Duration::from_millis(after), now).as_millis() as u64
+    });
+    let mut old = 100u64;
+    let was = storm(4, 1600, |after, _, _, _| {
+        let w = after.max(old);
+        old = (old * 2).min(5000);
+        w
+    });
+    assert!(longest_from_goodbye(&was) > 6000, "the old schedule outlasted the old grace: {was:?}");
+    let rg = crate::motion::RELOAD_GRACE.as_millis() as u64;
+    assert!(longest_from_goodbye(&events) < rg / 2, "the client's schedule: {events:?}");
+    let (w, view) = link_up(cx);
+    let mut t = 0;
+    for (at, s) in events {
+        // Frames on the way, every 100 ms at most.
+        while t < at {
+            let d = (at - t).min(100);
+            wait(cx, w, &view, d);
+            t += d;
+            quiet(cx, &view, &format!("{t} ms"));
+        }
+        let what = format!("{s:?} at {at} ms");
+        status(cx, &view, s);
+        quiet(cx, &view, &what);
+    }
+    assert!(matches!(view.read_with(cx, |v, _| v.model.conn.clone()), crate::model::ConnState::Connected(_)), "back");
+    wait(cx, w, &view, 700);
+    quiet(cx, &view, "settled");
+    assert!(!motion_pending(cx, &view).0, "settled: no frames");
+}
+
+/// A storm of reloads (3 in 2 s), or of short drops, plays nothing; a
+/// storm of real losses tears at most once per [`FLASH_BUDGET`].
+#[gpui_kit::test]
+fn a_reload_storm_tears_at_most_once(cx: &mut TestAppContext) {
+    use crate::model::ConnState;
+    let (w, view) = link_up(cx);
+    let tears = std::rc::Rc::new(std::cell::Cell::new(0));
+    let scans = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut last = (None, None);
+    let mut count = |cx: &mut TestAppContext| {
+        let now = view.read_with(cx, |v, _| (v.link.tore, v.link.scanned));
+        if now.0 != last.0 {
+            tears.set(tears.get() + 1);
+        }
+        if now.1 != last.1 {
+            scans.set(scans.get() + 1);
+        }
+        last = now;
+    };
+    count(cx);
+    tears.set(0);
+    scans.set(0);
+    for _ in 0..3 {
+        set_conn(cx, &view, ConnState::Reconnecting, true);
+        count(cx);
+        wait(cx, w, &view, 120);
+        count(cx);
+        set_conn(cx, &view, ConnState::Connected("x".into()), false);
+        count(cx);
+        wait(cx, w, &view, 540);
+        count(cx);
+    }
+    assert_eq!((tears.get(), scans.get()), (0, 0), "a reload storm: nothing");
+    // Short drops (under the grace): nothing either.
+    for _ in 0..3 {
+        set_conn(cx, &view, ConnState::Reconnecting, false);
+        wait(cx, w, &view, 300);
+        set_conn(cx, &view, ConnState::Connected("x".into()), false);
+        wait(cx, w, &view, 300);
+        count(cx);
+    }
+    assert_eq!((tears.get(), scans.get()), (0, 0), "blips: nothing");
+    // Real losses, 3 in under 5 s: one tear, one Scan.
+    for _ in 0..3 {
+        set_conn(cx, &view, ConnState::Reconnecting, false);
+        wait(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64);
+        count(cx);
+        wait(cx, w, &view, 200);
+        set_conn(cx, &view, ConnState::Connected("x".into()), false);
+        count(cx);
+        wait(cx, w, &view, 100);
+        count(cx);
+    }
+    assert_eq!((tears.get(), scans.get()), (1, 1), "losses: at most one tear and one Scan per budget");
+}
+
+/// The drain turns from where it is (motion.md §8): back mid-tear or
+/// mid-drain, then lost again (the grace outlasts the restore, so that one
+/// drains from where the restore ended), the palette never moves by more
+/// than the curve's own step in a frame.
+#[gpui_kit::test]
+fn a_blip_never_jumps_the_palette(cx: &mut TestAppContext) {
+    use crate::model::ConnState;
+    let drain = |cx: &mut TestAppContext| cx.update(|cx| cx.global::<crate::theme::Scheme>().drain.get());
+    // `inout`'s steepest slope is 2.86× linear: a 7 ms frame's largest step.
+    let max_step = 7. / crate::motion::SLOW.as_millis() as f32 * 3.;
+    let grace = crate::motion::LINK_GRACE.as_millis() as u64;
+    for back_at in [50u64, 150, 300] {
+        let (w, view) = link_up(cx);
+        let prev = std::cell::Cell::new(drain(cx));
+        let frames = |cx: &mut TestAppContext, ms: u64, what: &str| {
+            for _ in 0..ms.div_ceil(7) {
+                wait(cx, w, &view, 7);
+                let d = drain(cx);
+                assert!((d - prev.get()).abs() <= max_step, "{what}, back at {back_at} ms: {} → {d}", prev.get());
+                prev.set(d);
+            }
+        };
+        set_conn(cx, &view, ConnState::Reconnecting, false);
+        frames(cx, grace + back_at, "down");
+        assert!(prev.get() > 0. || back_at < 100, "lost: draining ({})", prev.get());
+        set_conn(cx, &view, ConnState::Connected("x".into()), false);
+        frames(cx, 140, "back");
+        let mid = prev.get();
+        set_conn(cx, &view, ConnState::Reconnecting, false);
+        frames(cx, grace + 200, "lost again");
+        set_conn(cx, &view, ConnState::Connected("x".into()), false);
+        frames(cx, 500, "back again");
+        assert_eq!(prev.get(), 0., "restored (mid {mid})");
+    }
+}
+
+/// The tracer starts from the source chip's bar (motion.md §6.2: its left
+/// edge, at its centre) when the pointer was on the chip; elsewhere, from
+/// the pointer.
+#[gpui_kit::test]
+fn tracer_starts_from_the_chips_bar(cx: &mut TestAppContext) {
+    use gpui_kit::{MouseMoveEvent, PlatformInput, point};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    let scout = view.read_with(cx, |v, _| {
+        let r = v.tray.rows.iter().find(|r| r.id == 1).expect("scout's tray row");
+        crate::wtabs::Who::new(1, r.name.clone(), r.call.clone())
+    });
+    let chip =
+        view.read_with(cx, |v, _| v.chip_bounds.borrow().iter().find(|(id, _)| *id == 1).map(|(_, b)| *b)).expect("its chip laid out");
+    let to = |cx: &mut TestAppContext, at: gpui_kit::Point<gpui_kit::Pixels>| {
+        event(cx, w, PlatformInput::MouseMove(MouseMoveEvent { position: at, pressed_button: None, modifiers: Default::default() }));
+        view.update(cx, |v, cx| v.open_worker_tab(&scout, cx));
+        cx.run_until_parked();
+        wait(cx, w, &view, 7);
+        let from = view.read_with(cx, |v, _| v.tracer.map(|t| t.from)).expect("a tracer");
+        // Its tab closed: the next open is a new tab again.
+        view.update(cx, |v, cx| {
+            v.tracer = None;
+            let ix = v.model.tabs.iter().position(|t| t.worker.is_some()).expect("the worker's tab");
+            v.close_tab(ix);
+            cx.notify();
+        });
+        settle(cx, w, 4);
+        from
+    };
+    let on_chip = point(chip.left() + chip.size.width * 0.75, chip.center().y);
+    assert_eq!(to(cx, on_chip), point(chip.left(), chip.center().y), "from the chip's bar");
+    let off = point(chip.left(), chip.top() - gpui_kit::px(40.));
+    assert_eq!(to(cx, off), off, "elsewhere, from the pointer");
+}
+
+/// A worker tab opened by the pointer draws the tracer to it (motion.md
+/// §6.2): the line lands on the new tab's top-left corner over `base`, the
+/// tab's bar draws over `quick`, then it is gone. Reduced: none.
+#[gpui_kit::test]
+fn tracer_lands_on_new_tab(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    let scout = view.read_with(cx, |v, _| {
+        let r = v.tray.rows.iter().find(|r| r.id == 1).expect("scout's tray row");
+        crate::wtabs::Who::new(1, r.name.clone(), r.call.clone())
+    });
+    view.update(cx, |v, cx| v.open_worker_tab(&scout, cx));
+    cx.run_until_parked();
+    wait(cx, w, &view, 7);
+    let (tr, tab) = view.read_with(cx, |v, _| (v.tracer, v.model.tabs.current().map(|t| t.id)));
+    let tr = tr.expect("a tracer");
+    assert_eq!(Some(tr.tab), tab, "to the new tab");
+    let to = tr.to.expect("its target laid out");
+    let strip = view.read_with(cx, |v, _| v.strip_at.get());
+    assert!(strip.y > px(0.) && to.y == strip.y, "the tab's top edge: {to:?} {strip:?}");
+    // `base` + `quick`: 320 ms, 47 frames at 144 Hz.
+    for _ in 0..30 {
+        wait(cx, w, &view, 7);
+    }
+    assert!(view.read_with(cx, |v, _| v.tracer.is_some()), "the bar drawing");
+    for _ in 0..20 {
+        wait(cx, w, &view, 7);
+    }
+    let left = view.read_with(cx, |v, _| v.tracer.map(|t| (t, v.fx.clock().duration_since(t.at))));
+    assert!(left.is_none(), "landed, the bar drawn: gone ({left:?})");
+    // Reduced: none.
+    view.update(cx, |v, cx| v.leave_worker(false, cx));
+    set_motion(cx, &view, crate::motion::Level::Reduced);
+    settle(cx, w, 4);
+    view.update(cx, |v, cx| v.open_worker_tab(&scout, cx));
+    cx.run_until_parked();
+    settle(cx, w, 4);
+    assert!(view.read_with(cx, |v, _| v.tracer.is_none()), "Reduced: no tracer");
 }

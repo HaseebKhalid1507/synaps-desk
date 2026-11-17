@@ -105,17 +105,23 @@ fn no_text_under_12_px() {
 
 /// `motion::lift`, from its `#[allow]` to its closing brace: in motion.rs
 /// the one place opacity (and its lint's allow) may be.
-fn lift_span(code: &str) -> std::ops::Range<usize> {
-    let head = "#[allow(clippy::disallowed_methods)]\npub(crate) fn lift";
-    let start = code.find(head).expect("motion::lift, allowed directly above");
-    let end = start + code[start..].find("\n}\n").expect("lift's end") + 2;
-    start..end
+fn lift_span(code: &str) -> Vec<std::ops::Range<usize>> {
+    ["lift", "appear"]
+        .into_iter()
+        .map(|f| {
+            let head = format!("#[allow(clippy::disallowed_methods)]\npub(crate) fn {f}");
+            let start = code.find(&head).expect("motion::lift and motion::appear, allowed directly above");
+            let end = start + code[start..].find("\n}\n").expect("its end") + 2;
+            start..end
+        })
+        .collect()
 }
 
 /// No state is drawn with opacity (design.md §5), by any of its names:
-/// only a chart's data fades (`chart::fade`), and something arriving lifts
-/// from 70 % (`motion::lift`, fluid.md law 3): in motion.rs, inside `lift`
-/// only, once.
+/// only a chart's data fades (`chart::fade`), something arriving lifts
+/// from 70 % (`motion::lift`, fluid.md law 3), and an overlay enters and
+/// leaves (`motion::appear`, fluid.md §3.10): in motion.rs, inside those
+/// two only, once each.
 #[test]
 fn no_opacity_outside_charts() {
     let mut lifts = 0;
@@ -127,7 +133,7 @@ fn no_opacity_outside_charts() {
             let mut bad = Vec::new();
             for o in [".opacity(", ".alpha(", ".fade_out("] {
                 for (at, _) in code.match_indices(o) {
-                    if span.as_ref().is_some_and(|s| s.contains(&at)) {
+                    if span.as_ref().is_some_and(|s| s.iter().any(|s| s.contains(&at))) {
                         lifts += 1;
                     } else {
                         bad.push(format!("{name}:{} {o}", line_of(&code, at)));
@@ -138,19 +144,20 @@ fn no_opacity_outside_charts() {
         })
         .collect();
     assert!(bad.is_empty(), "opacity outside chart.rs and motion::lift:\n{}", bad.join("\n"));
-    assert_eq!(lifts, 1, "motion::lift sets opacity once");
+    assert_eq!(lifts, 2, "motion::lift and motion::appear set opacity once each");
 }
 
 /// No gradients anywhere (polish.md: "No gradients anywhere, on any card
-/// or control"; finish gate 6): flat fills only, and no shadow on a card
-/// (GPUI's `shadow_sm()` and kin too; `shadow_none()` takes one away).
+/// or control"; §6 finish gate 6): every fill is one opaque colour of the
+/// palette (the sweep's levels are four opaque steps), and no shadow on a
+/// card (GPUI's `shadow_sm()` and kin too; `shadow_none()` takes one away).
 #[test]
 fn no_gradients_anywhere() {
     let bad: Vec<String> = sources()
         .into_iter()
         .filter(|(name, _)| name != "style_tests.rs")
         .flat_map(|(name, code)| {
-            ["linear_gradient", "LinearColorStop", "radial_gradient", ".shadow(", "shadow_", "box_shadow(", "BoxShadow"]
+            ["linear_gradient", "LinearColorStop", "radial_gradient", "conic_gradient", ".shadow(", "shadow_", "box_shadow(", "BoxShadow"]
                 .into_iter()
                 .flat_map(|g| {
                     code.match_indices(g)
@@ -162,6 +169,21 @@ fn no_gradients_anywhere() {
         })
         .collect();
     assert!(bad.is_empty(), "a gradient or a shadow:\n{}", bad.join("\n"));
+}
+
+/// No press on a transcript row or a worker chip yet (Q4 leaves "press on
+/// tray rows, run headers and chips" for later): Q1's rows and chips
+/// (`turns.rs`, `tray.rs`) have hover fills only, so their inks (`err`,
+/// `warn`, `think`, `sub_*`) sit on no press fill. Wiring one adds those
+/// inks to a press set (`theme.rs` `pressed`) and the set to
+/// `press_is_visible_in_every_theme`, then drops its file here.
+#[test]
+fn rows_and_chips_have_no_press_yet() {
+    for (name, code) in sources().into_iter().filter(|(n, _)| ["turns.rs", "tray.rs"].contains(&n.as_str())) {
+        for g in ["press_ch", "press_k", "btn_press", "warn_press", ".active(", "fx.fill(", ".lit(", "lit_rest(", "touch("] {
+            assert!(!code.contains(g), "{name}: a press ({g}): add its inks to a press set");
+        }
+    }
 }
 
 /// One overlay box (design.md §8.9): every tooltip is built by
@@ -183,7 +205,7 @@ fn every_tooltip_is_the_overlay() {
 
 /// The lint's way in, one per rule: `clippy::disallowed_methods` is
 /// allowed only where its rule lives (fonts.rs, chart.rs, overlay.rs, and
-/// in motion.rs once, directly above `lift`);
+/// in motion.rs directly above `lift` and `appear`);
 /// the groups that hold it (`clippy::style`, `clippy::all`) nowhere.
 #[test]
 fn the_house_rules_are_allowed_only_where_they_live() {
@@ -197,7 +219,7 @@ fn the_house_rules_are_allowed_only_where_they_live() {
             }
             for (at, _) in code.match_indices(lint) {
                 // The one `#[allow]`, the line above `lift`.
-                if lint == "disallowed_methods" && lift.as_ref().is_some_and(|s| (s.start..s.start + 40).contains(&at)) {
+                if lint == "disallowed_methods" && lift.as_ref().is_some_and(|s| s.iter().any(|s| (s.start..s.start + 40).contains(&at))) {
                     continue;
                 }
                 // A whole name: not `clippy::all_…`.
