@@ -1132,6 +1132,11 @@ impl Motion {
         self.births.borrow().get(&id).copied()
     }
 
+    /// Row `key` is revealing: growing, or born too lately to have begun.
+    pub(crate) fn revealing(&self, key: u64) -> bool {
+        self.grows.borrow().contains_key(&key) || self.birth(key).is_some_and(|b| self.now().saturating_duration_since(b) < QUICK)
+    }
+
     /// `value` of `(tag, key)` this frame: when it last changed while
     /// watched, and what it was before. A value seen for the first time, or
     /// not drawn last frame (scrolled back in, a session switch), is at

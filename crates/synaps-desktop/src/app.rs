@@ -1295,6 +1295,9 @@ pub struct AppView {
     toggled: HashSet<u64>,
     /// Runs the user unfolded (by their first item's id).
     open_runs: HashSet<u64>,
+    /// The rows an unfold under Full is revealing: tail-follow is held
+    /// paused while they do ([`Self::hold_unfold`]).
+    unfold_hold: Vec<u64>,
     /// The transcript's `busy` at the last [`Self::sync_list`]: when it
     /// falls, the last run may fold.
     synced_busy: bool,
@@ -1862,6 +1865,7 @@ impl AppView {
             list,
             toggled: HashSet::new(),
             open_runs: HashSet::new(),
+            unfold_hold: Vec::new(),
             synced_busy: false,
             files_gen: 0,
             subs_gen: 0,
@@ -3275,7 +3279,8 @@ impl AppView {
     fn arrive(&self, ix: usize, row: turns::RowParts) -> AnyElement {
         let Some(d) = self.disp.get(ix) else { return row.whole() };
         let streaming = self.synced_busy && ix + 1 == self.disp.len() && d.kind == Kind::Prose;
-        match self.fx.grow(d.id, ix, self.fx.birth(d.id), streaming, self.body_line) {
+        let key = d.motion_key();
+        match self.fx.grow(key, ix, self.fx.birth(key), streaming, self.body_line) {
             // Your own message was readable a frame ago: it doesn't lift.
             Some(mut g) => {
                 if d.kind == Kind::User {
@@ -3966,7 +3971,7 @@ impl AppView {
             let now = self.fx.clock();
             let fresh = self.disp.iter().skip_while(|d| d.item < start).filter(|d| !before.contains(&d.id));
             for (k, d) in fresh.enumerate() {
-                self.fx.born(d.id, now + crate::motion::stagger(k));
+                self.fx.born(d.motion_key(), now + crate::motion::stagger(k));
             }
         }
         self.sync_counts();
@@ -4226,10 +4231,28 @@ impl AppView {
         // header down; a fold draws the tally's segments.
         let now = self.fx.clock();
         self.fx.fold.set(Some((id, now)));
-        let fresh = self.disp.iter().filter(|d| d.kind == Kind::Work && !before.contains(&d.id));
-        for (k, d) in fresh.enumerate() {
-            self.fx.born(d.id, now + crate::motion::stagger(k));
+        let fresh: Vec<u64> = self.disp.iter().filter(|d| d.kind == Kind::Work && !before.contains(&d.id)).map(|d| d.id).collect();
+        for (k, id) in fresh.iter().enumerate() {
+            self.fx.born(*id, now + crate::motion::stagger(k));
         }
+        // They reveal from 0 px (Full), so the list is still at its end the
+        // frame after: GPUI's tail-follow would resume there and carry the
+        // header up as they grow. Paused until they have (fluid.md §3.3).
+        self.unfold_hold = if self.fx.fluid() { fresh } else { Vec::new() };
+    }
+
+    /// An unfold's rows revealing ([`Self::unfold_hold`]): tail-follow
+    /// stays paused, the clicked header where it was. Before the list's
+    /// layout, each frame.
+    fn hold_unfold(&mut self) {
+        if self.unfold_hold.is_empty() {
+            return;
+        }
+        if self.list.is_following_tail() {
+            self.list.pause_following_tail();
+        }
+        let fx = &self.fx;
+        self.unfold_hold.retain(|&id| fx.revealing(id));
     }
 
     /// What the daemon said of the session on screen, each part if known:
@@ -5824,6 +5847,7 @@ impl Render for AppView {
         .pb(px(pad_b));
         self.texts.borrow_mut().frame(lay.column, &m);
         self.hint_rows(&m);
+        self.hold_unfold();
         // After the list's layout: rows it has no height for get their hint
         // in the next frame's [`AppView::hint_rows`], so one is drawn (once:
         // hinted, every row has a height). Else, a load's last frame left the

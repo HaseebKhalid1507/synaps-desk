@@ -328,7 +328,18 @@ pub(crate) struct Disp {
     pub who: Who,
 }
 
+/// A summary's key in the motion's maps (births, reveals): its id is its
+/// run's first item's, which an unfolded run also draws as a work row
+/// (`DAY_ID` marks day lines; item ids count up from 1).
+const SUMMARY_KEY: u64 = 1 << 62;
+
 impl Disp {
+    /// Its key in the motion's maps: its id, a summary's marked (else an
+    /// unfold's first row, born, would reveal the clicked header too).
+    pub(crate) fn motion_key(&self) -> u64 {
+        if matches!(self.kind, Kind::Summary { .. }) { self.id | SUMMARY_KEY } else { self.id }
+    }
+
     /// Its item `n` places earlier: the transcript dropped its `n` oldest
     /// (a worker's bound), and this row shows one after them.
     pub(crate) fn shift(&mut self, n: usize) {
