@@ -651,7 +651,10 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.hint = f.text("hint", t.muted, &[chrome, raised, canvas, user, card]);
     // Code: lifted toward the code text (a dark island on `paper`).
     r.code_fg = f.text("code_fg", t.code_fg, &[code]);
-    r.code_in = f.text("code_in", t.code_fg, &[code]);
+    // Inline code's chip is the well (paper's code is a dark island: a
+    // near-black chip in light prose; its chip is `tool_out`), its text
+    // the well's.
+    r.code_in = f.text("code_in", if well == code { t.code_fg } else { t.tool_result_color }, &[well]);
     r.kw = f.at("kw", t.heading_color, t.code_fg, &[code], TEXT);
     r.string = f.at("string", t.list_bullet_color, t.code_fg, &[code], TEXT);
     r.num = f.at("num", t.warning_color, t.code_fg, &[code], TEXT);
@@ -1136,7 +1139,7 @@ fn text_style(p: &Palette, m: &Metrics, dark: bool) -> TextViewStyle {
         .with_table(table)
         .with_table_head(table_head)
         .with_table_cell(table_cell)
-        .with_inline_code(HighlightStyle { color: Some(p.code_in), background_color: Some(p.code), ..Default::default() })
+        .with_inline_code(HighlightStyle { color: Some(p.code_in), background_color: Some(p.well), ..Default::default() })
         .with_list_style(StyleRefinement::default().text_color(p.bullet))
         .with_blockquote_style(StyleRefinement::default().text_color(p.dim).border_color(p.edge))
         .with_dark(dark)
@@ -2098,6 +2101,22 @@ mod tests {
             report.push(format!("{name:<15} {lifted:>3} of {total} roles lifted, lowest ratio / floor {worst:.3}"));
         }
         println!("{}", report.join("\n"));
+    }
+
+    /// Inline code is a chip on the well (Q3): on paper, whose code is a
+    /// dark island, a light chip off the canvas with dark text, never the
+    /// near-black chip in light prose; elsewhere the code surface, as before.
+    #[test]
+    fn inline_code_chips_are_the_well() {
+        for (name, raw) in palettes::THEMES {
+            let (r, _) = resolve(&raw, None);
+            assert!(contrast(r.code_in, r.well) >= TEXT - 1e-9, "{name}: code_in on its chip");
+            assert!(contrast(r.well, r.canvas) >= SURFACE - 1e-9, "{name}: the chip stands off the canvas");
+            if name == "paper" {
+                assert_ne!(r.well, r.code, "paper's chip is not its dark code island");
+                assert!(luminance(r.well) > 0.4 && luminance(r.code_in) < 0.2, "paper: a light chip, dark text");
+            }
+        }
     }
 
     /// Every role is in the `Check` log (so the floor test covers it), but
