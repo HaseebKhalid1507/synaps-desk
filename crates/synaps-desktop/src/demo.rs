@@ -18,6 +18,8 @@ pub(crate) const SID: &str = "20261113-041207-a1f0";
 /// A parked session whose turns are over: runs that fold (one with a
 /// failed call, one all ok), an edit's diff in each.
 pub(crate) const IDLE_CPU: &str = "20261113-161706-a1b9";
+/// A busy session whose turn is running a call.
+pub(crate) const FLAKY: &str = "20261113-033001-c3d9";
 /// A session from before message times: its history has none.
 pub(crate) const LEGACY: &str = "20261111-201530-0a6e";
 
@@ -70,7 +72,7 @@ fn sessions(now: i64, settled: bool) -> Vec<SessionMeta> {
             "created_at": ago(18_000)}),
         json!({"id": "20261113-184102-9d0e", "model": opus, "cwd": "/home/you/work/synaps-desktop", "lifecycle": "live", "messages": 0,
             "state_since": ago(0), "created_at": ago(0)}),
-        json!({"id": "20261113-033001-c3d9", "title": "Flaky e2e: checkout latency", "model": sonnet,
+        json!({"id": FLAKY, "title": "Flaky e2e: checkout latency", "model": sonnet,
             "cwd": "/home/you/work/shop", "busy": true, "cost_usd": 0.45, "lifecycle": "live", "messages": 12, "state_since": ago(7),
             "created_at": ago(30)}),
         json!({"id": SID, "name": "relay-refresh", "title": "Refresh race in session relay", "model": opus,
@@ -526,6 +528,15 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
     } else if id != LEGACY {
         stamp(&mut msgs, id, 45, None);
     }
+    // The flaky-e2e session's turn runs a call as it attaches: it started
+    // 12 s ago (its row's clock counts from there).
+    if id == FLAKY && m.busy {
+        let mut call = json!({"role": "assistant", "content": [
+            {"type": "text", "text": "Re-running the checkout suite with tracing on."},
+            {"type": "tool_use", "id": "toolu_e2e", "name": "bash", "input": {"command": "npm run e2e -- --grep checkout --trace on"}}]});
+        call["_synaps_at"] = json!(rfc3339(now - 12));
+        msgs.push(call);
+    }
     let prompts: Vec<Value> = (1..=m.awaiting_input as u64)
         .map(|i| {
             json!({"id": i, "kind": "confirm", "title": "Confirm tool call",
@@ -538,10 +549,29 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
         "view": {"model": m.model, "thinking_level": "medium", "reasoning_level": "medium", "context_window": 200000},
         "conversation": {"header": {"title": m.title}, "messages_len": msgs.len(), "api_messages": msgs, "cost": m.cost_usd},
         "streaming": m.busy, "pending_prompts": prompts, "client_input": "shared", "input_owner": 2});
-    match decode_frame(&frame.to_string()) {
+    let mut out = match decode_frame(&frame.to_string()) {
         Ok(DaemonFrame::Attached(a)) => vec![Event::Attached { attach_seq, attached: a, mode: AttachMode::Mirror, reconnect: false }],
         _ => Vec::new(),
+    };
+    // The flaky-e2e session fans out: more workers than two lines of
+    // chips hold at 1280 (the rest in `+N more`).
+    if id == FLAKY && !out.is_empty() {
+        let row = |n: u64, name: &str, step: &str, secs: f64| {
+            json!({"subagent_id": n, "agent_name": name, "status": "running", "cancel_requested": false, "elapsed_secs": secs,
+                "finished_elapsed": null, "step": step, "tools": n + 2, "handle_id": format!("sa_{n}"), "model": "anthropic/claude-sonnet-4-5"})
+        };
+        let rows = json!({"ev": "subagent_rows", "rows": [
+            row(1, "trace-cart", "reading e2e/checkout/cart.spec.ts", 52.),
+            row(2, "trace-pay", "grep -rn \"waitForResponse\" e2e/", 47.),
+            row(3, "har-diff", "comparing 14 HAR captures", 38.),
+            row(4, "bisect", "git bisect run npm run e2e:checkout", 121.),
+            row(5, "flake-stats", "reading ci/runs.json", 19.),
+            row(6, "reviewer", "reading src/checkout/latency.ts", 7.)]});
+        if let Ok(event) = decode_event(&rows) {
+            out.push(Event::session(attach_seq, FLAKY, 1, event, Arc::new(rows)));
+        }
     }
+    out
 }
 
 fn attach_sid(attach_seq: u64) -> Vec<Event> {

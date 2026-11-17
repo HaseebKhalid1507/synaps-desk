@@ -59,10 +59,13 @@ pub(crate) struct TrayRow {
     pub(crate) call: Option<SharedString>,
     /// The tray lists the attached session's workers: never as last seen.
     pub(crate) live: Liveness,
-    pub(crate) line: SharedString,
     pub(crate) facts: SharedString,
     /// Running: the facts before its clock, and the clock ([`ticked`]).
     pub(crate) tick: Option<(SharedString, crate::subagents::Tick)>,
+    /// Its chip's clock as last reported (`41.0s`; a running one ticks
+    /// from [`TrayRow::tick`]), and its step cut to [`STEP_CHARS`].
+    pub(crate) clock: Option<SharedString>,
+    pub(crate) step: SharedString,
     pub(crate) watchable: bool,
     pub(crate) tip: SharedString,
     /// A re-attach's demoted start ([`glyph::steady`]).
@@ -78,9 +81,11 @@ impl TrayRow {
             facts.push(format!("{n} tool{}", if n == 1 { "" } else { "s" }));
         }
         let tick = l.tick.map(|t| (SharedString::from(facts.join(" · ")), t));
+        let clock = l.elapsed.map(|s| SharedString::from(fmt_secs(s)));
         if let Some(s) = l.elapsed {
             facts.push(fmt_secs(s));
         }
+        let step = cut(&l.line, STEP_CHARS).into();
         let tip = if l.watchable {
             format!("watch {} (sa_{}) · middle-click: in a tab · {WORKER_KEY} walks the workers", l.name, l.id)
         } else {
@@ -92,9 +97,10 @@ impl TrayRow {
             name: l.name.into(),
             call: l.call,
             live: Liveness::of(Some(l.status), true, true).cancelling(cancelling),
-            line: l.line.into(),
             facts: facts.join(" · ").into(),
             tick,
+            clock,
+            step,
             watchable: l.watchable,
             tip: tip.into(),
             demoted: l.demoted,
@@ -119,6 +125,126 @@ pub(crate) struct TrayCache {
 
 /// Tray rows' keys in [`motion::Motion`], apart from item ids.
 const TRAY: u64 = 1 << 61;
+
+/// Between chips, and between their lines.
+pub(crate) const CHIP_GAP: f32 = 8.;
+
+/// A chip's step, at most (polish.md §2.5), and its name.
+pub(crate) const STEP_CHARS: usize = 32;
+const NAME_CHARS: usize = 18;
+/// A chip's clock slot, in characters (`1m 23s`): it ticks without the
+/// chips reflowing.
+const CLOCK_CHARS: usize = 6;
+
+/// `s` in at most `n` characters, `…` last when cut.
+fn cut(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n.saturating_sub(1)) {
+        Some((at, _)) if s.chars().count() > n => format!("{}…", &s[..at]),
+        _ => s.to_string(),
+    }
+}
+
+/// One place in the chips' flow: a worker's chip or a left one's ghost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Slot {
+    Row(usize),
+    Ghost(usize),
+}
+
+/// How the chips flow over the composer this frame ([`chip_pack`]): the
+/// slots drawn and the line each is on, the workers not drawn (`+N more`,
+/// on the last line) and how many lines.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Chips {
+    pub(crate) slots: Vec<(Slot, usize, f32)>,
+    pub(crate) more: usize,
+    pub(crate) more_line: usize,
+    pub(crate) lines: usize,
+}
+
+impl Chips {
+    /// The workers' chips drawn (not ghosts).
+    pub(crate) fn drawn(&self) -> usize {
+        self.slots.iter().filter(|s| matches!(s.0, Slot::Row(_))).count()
+    }
+}
+
+/// The parts' widths of a chip (mono at `m.meta`, every text box a whole
+/// pixel): its 1 px frame, padding 12 (the bar and 10) and 10, the
+/// glyph, its name, its step, its clock slot and the cancel × slot, 8
+/// apart. An armed cancel's `Cancel name? ··· C O N F I R M` takes the
+/// step's and the clock's room.
+pub(crate) fn chip_w(r: &TrayRow, armed: bool, m: &Metrics) -> f32 {
+    use crate::turns::text_w;
+    let cw = m.meta * 0.6;
+    let name = r.name.chars().count().min(NAME_CHARS);
+    let mut w = 2. + 12. + 10. + 8. + text_w(name, cw) + 10.;
+    if armed {
+        // `Cancel ` and `?`, the fuse (3 cells 4 apart), CONFIRM (13 caps).
+        w += 8. + text_w(name + 8, cw) + 6. + 20. + 8. + 13. * m.meta * 0.62;
+    } else {
+        w += 8. + text_w(chip_step(r).chars().count(), cw);
+        if r.clock.is_some() || r.tick.is_some() {
+            w += 8. + text_w(CLOCK_CHARS, cw);
+        }
+    }
+    if r.watchable {
+        w += 8. + 16.;
+    }
+    w.ceil()
+}
+
+/// A chip's step: what it does while it runs, else its state's word.
+fn chip_step(r: &TrayRow) -> &str {
+    match r.live {
+        Liveness::Running | Liveness::Started if !r.step.is_empty() => &r.step,
+        _ => glyph::worker(r.live).2,
+    }
+}
+
+/// `+N more`'s chip width.
+pub(crate) fn more_w(n: usize, m: &Metrics) -> f32 {
+    (2. + 10. + crate::turns::text_w(format!("+{n} more").chars().count(), m.meta * 0.6) + 10.).ceil()
+}
+
+/// The chips of `widths` flowed left to right in lines `avail` px wide,
+/// `gap` apart: the line each is on, as many as `lines` lines hold. All of
+/// them, or as many as fit with the `+N more` chip (`more(n)` wide) that
+/// ends the last line. A chip wider than a line has a line of its own.
+pub(crate) fn chip_pack(widths: &[f32], avail: f32, gap: f32, lines: usize, more: impl Fn(usize) -> f32) -> (Vec<usize>, usize) {
+    let flow = |ws: &mut dyn Iterator<Item = f32>| {
+        let (mut line, mut x, mut out) = (0, 0., Vec::new());
+        for w in ws {
+            if x > 0. && x + gap + w > avail {
+                line += 1;
+                x = 0.;
+            }
+            x += if x > 0. { gap + w } else { w };
+            out.push((line, x));
+        }
+        out
+    };
+    let all = flow(&mut widths.iter().copied());
+    if lines == 0 {
+        return (Vec::new(), 0);
+    }
+    if all.last().is_none_or(|l| l.0 < lines) {
+        return (all.into_iter().map(|l| l.0).collect(), widths.len());
+    }
+    // As many as fit with `+N more` after them.
+    for k in (0..widths.len()).rev() {
+        let placed = flow(&mut widths[..k].iter().copied().chain(std::iter::once(more(widths.len() - k))));
+        if placed.last().is_some_and(|l| l.0 < lines) {
+            return (placed[..k].iter().map(|l| l.0).collect(), k);
+        }
+    }
+    (Vec::new(), 0)
+}
+
+/// The lines `widths` flow to, all of them, in `avail` px.
+pub(crate) fn chip_lines_needed(widths: &[f32], avail: f32, gap: f32) -> usize {
+    chip_pack(widths, avail, gap, usize::MAX, |_| 0.).0.last().map_or(0, |l| l + 1)
+}
 
 impl AppView {
     /// The tray's rows, rebuilt if a worker changed; the timer that drops
@@ -219,15 +345,54 @@ impl AppView {
         cx.notify();
     }
 
-    /// How many tray rows are drawn (the rest are "+N more").
+    /// How many workers' chips are drawn (the rest are "+N more").
     pub(crate) fn tray_drawn(&self) -> usize {
-        let shown = self.tray_rows.min(self.tray.rows.len());
-        let cramped = self.layout.form() == crate::fit::Form::Cramped;
-        match (self.tray.rows.len() > shown, cramped) {
-            (false, _) => shown,
-            (true, true) => shown.min(1),
-            (true, false) => shown.saturating_sub(1),
-        }
+        self.chips.drawn()
+    }
+
+    /// The chips' flow, in order: each slot a left row's ghost (it keeps
+    /// its place while it fades) or the next worker.
+    fn tray_slots(&self) -> Vec<Slot> {
+        let n = self.tray.rows.len() + self.tray.ghosts.len();
+        let mut real = 0..self.tray.rows.len();
+        (0..n)
+            .filter_map(|slot| match self.tray.ghosts.iter().position(|g| g.0 == slot) {
+                Some(g) => Some(Slot::Ghost(g)),
+                None => real.next().map(Slot::Row),
+            })
+            .collect()
+    }
+
+    /// The chips over the composer this frame: their widths, the lines they
+    /// need in the column (`avail` px) and, once [`crate::fit::chip_lines`]
+    /// has said how many it has room for (`lines`), how they flow
+    /// ([`AppView::chips`]).
+    pub(crate) fn chip_widths(&self, m: &Metrics) -> (Vec<Slot>, Vec<f32>) {
+        let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
+        let now = Instant::now();
+        let slots = self.tray_slots();
+        let widths = slots
+            .iter()
+            .map(|s| match *s {
+                Slot::Row(i) => {
+                    let r = &self.tray.rows[i];
+                    let armed = session.is_some_and(|s| self.model.cancels.armed(s, r.id, (r.call.as_deref(), &r.name), now));
+                    chip_w(r, armed, m)
+                }
+                Slot::Ghost(g) => chip_w(&self.tray.ghosts[g].1, false, m),
+            })
+            .collect();
+        (slots, widths)
+    }
+
+    pub(crate) fn pack_chips(&mut self, slots: Vec<Slot>, widths: &[f32], avail: f32, lines: usize, m: &Metrics) {
+        let (on, k) = chip_pack(widths, avail, CHIP_GAP, lines, |n| more_w(n, m));
+        let placed: Vec<(Slot, usize, f32)> = slots.into_iter().zip(on).zip(widths).map(|((s, l), w)| (s, l, *w)).collect();
+        let drawn = placed.iter().filter(|s| matches!(s.0, Slot::Row(_))).count();
+        let more = self.tray.rows.len().saturating_sub(drawn);
+        let more_line = placed.last().map_or(0, |s| s.1);
+        let used = if k == widths.len() { placed.last().map_or(0, |s| s.1 + 1) } else { lines };
+        self.chips = Chips { slots: placed, more: if k < widths.len() { more.max(1) } else { 0 }, more_line, lines: used };
     }
 
     /// A menu opened from the keyboard over a tray row whose row is not
@@ -240,142 +405,143 @@ impl AppView {
         }
     }
 
-    /// The tray over the composer: [`AppView::tray_rows`] rows.
+    /// The worker chips over the composer (polish.md §2.5): flowing left
+    /// to right in at most [`crate::fit::chip_lines`] lines, the rest in a
+    /// `+N more` chip ending the last line (its tooltip names them).
     pub(crate) fn render_tray(&self, p: &Palette, m: &Metrics, cx: &Context<Self>) -> Option<impl IntoElement> {
-        let shown = self.tray_rows.min(self.tray.rows.len() + self.tray.ghosts.len());
-        if shown == 0 {
+        let chips = &self.chips;
+        if chips.lines == 0 {
             return None;
         }
         let lay = self.layout;
         let cramped = lay.form() == crate::fit::Form::Cramped;
-        let all = self.tray.rows.len();
-        // Fewer rows than workers: the last row says how many more (cramped:
-        // beside the one row).
-        let workers = self.tray_drawn();
-        let more = all - workers;
         let watched = self.model.watch.focused().map(|w| w.subagent_id);
         let row_h = crate::fit::tray_row(m);
-        let mut list = v_flex();
         let now = Instant::now();
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
         let fx = &self.fx;
-        // Each row in its slot; a left row's ghost keeps its slot while it
-        // fades. A row that changed slot slides from its last place (`Flip`:
-        // a paint offset, the dock's rows are plain divs).
-        let ghosts = &self.tray.ghosts;
-        let (mut slot, mut drawn, mut real) = (0usize, Vec::new(), self.tray.rows.iter().take(workers).enumerate().peekable());
-        while slot < (workers + ghosts.len()).min(self.tray_rows.max(workers)) {
-            if let Some(g) = ghosts.iter().find(|g| g.0 == slot) {
-                let fade =
-                    1. - fx.shot(Some(g.2), std::time::Duration::ZERO, motion::exit(motion::QUICK), &motion::ease::IN, motion::Kind::Fade);
-                list = list.child(self.tray_ghost(&g.1, fade, row_h, p, m));
-                fx.want_frame();
-            } else if let Some((i, r)) = real.next() {
-                let inline_more = (cramped && more > 0 && i == 0).then(|| mono(format!("+{more}"), m.meta, p.dim_t).flex_none());
-                let armed = session.is_some_and(|s| self.model.cancels.armed(s, r.id, (r.call.as_deref(), &r.name), now));
-                let off = fx.slide(TRAY | r.id, slot as f32 * row_h);
-                list = list.child(div().relative().top(px(off)).child(self.tray_row(
-                    r,
-                    watched == Some(r.id),
-                    armed,
-                    row_h,
-                    inline_more,
-                    p,
-                    m,
-                    cx,
-                )));
-                drawn.push((slot, r.id));
-            } else {
-                break;
-            }
-            slot += 1;
-        }
-        if more > 0 && !cramped {
-            list = list.child(h_flex().h(px(row_h)).pl(px(m.pad_x + m.lead)).items_center().child(mono(
-                format!("+{more} more"),
-                m.meta,
-                p.dim_t,
-            )));
-        }
-        let (gap, pad) = if cramped { (4., 2.) } else { (8., 4.) };
-        // The workers' bar down its lead edge; the watched row's is yours.
-        let you = watched.and_then(|w| drawn.iter().find(|d| d.1 == w).map(|d| d.0));
-        // A row that came draws its segment of the bar (the rest of the
-        // segment is the tray's ground until it has).
-        let undrawn: Vec<(usize, f32)> = drawn
-            .iter()
-            .map(|&(slot, id)| (slot, fx.draw(fx.birth(TRAY | id), std::time::Duration::ZERO, motion::QUICK)))
-            .filter(|d| d.1 < 1.)
-            .collect();
-        // The watched row's bar draws when its view opens here, and lights
+        // The watched chip's bar draws when its view opens here, and lights
         // after the composer's when you steer it (Handoff out).
         let watch_at = fx.change(Tag::Watched, 0, watched.unwrap_or(0), None).filter(|_| watched.is_some()).map(|c| c.0);
         let you_drawn = fx.draw(watch_at, std::time::Duration::ZERO, motion::QUICK);
         let steer = fx.flash(fx.sent.get().filter(|s| s.1 && watched.is_some()).map(|s| s.0 + 2 * motion::STAGGER));
         let you_color = motion::mix(p.you_mark_t, motion::mix(p.you, p.ink, 0.35), steer);
+        let mut lines: Vec<Vec<AnyElement>> = (0..chips.lines).map(|_| Vec::new()).collect();
+        for &(slot, line, w) in &chips.slots {
+            let Some(at) = lines.get_mut(line) else { continue };
+            match slot {
+                Slot::Ghost(g) => {
+                    let Some(g) = self.tray.ghosts.get(g) else { continue };
+                    let fade = 1.
+                        - fx.shot(Some(g.2), std::time::Duration::ZERO, motion::exit(motion::QUICK), &motion::ease::IN, motion::Kind::Fade);
+                    at.push(self.tray_ghost(&g.1, fade, w, row_h, p, m));
+                    fx.want_frame();
+                }
+                Slot::Row(i) => {
+                    let Some(r) = self.tray.rows.get(i) else { continue };
+                    let armed = session.is_some_and(|s| self.model.cancels.armed(s, r.id, (r.call.as_deref(), &r.name), now));
+                    let is_watched = watched == Some(r.id);
+                    // Its bar: yours when watched, else the workers' rule,
+                    // drawn top down when it came.
+                    let bar = if is_watched {
+                        glyph::bar_at(you_color, you_drawn)
+                    } else {
+                        glyph::bar_at(p.sub_rule, fx.draw(fx.birth(TRAY | r.id), std::time::Duration::ZERO, motion::QUICK))
+                    };
+                    // A chip that changed line slides from its last place.
+                    let off = fx.slide(TRAY | r.id, line as f32 * (row_h + CHIP_GAP));
+                    at.push(
+                        div()
+                            .relative()
+                            .top(px(off))
+                            .flex_none()
+                            .child(self.tray_row(r, is_watched, armed, w, row_h, bar, p, m, cx))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        if chips.more > 0 {
+            let rest: Vec<String> =
+                self.tray.rows.iter().skip(chips.drawn()).map(|r| format!("{}  {}", r.name, glyph::worker(r.live).2)).collect();
+            let tip = SharedString::from(rest.join("\n"));
+            let more = h_flex()
+                .id("tray-more")
+                .debug_selector(|| "tray-more".into())
+                .flex_none()
+                .h(px(row_h))
+                .px(px(10.))
+                .items_center()
+                .bg(p.tool)
+                .border_1()
+                .border_color(p.hair)
+                .child(mono(format!("+{} more", chips.more), m.meta, p.dim_t))
+                .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx));
+            if let Some(at) = lines.get_mut(chips.more_line.min(chips.lines - 1)) {
+                at.push(more.into_any_element());
+            }
+        }
+        let gap = crate::fit::tray_box(lay.form());
         Some(column(
             lay,
-            div()
+            v_flex()
                 .mt(px(gap))
-                .py(px(pad))
-                .relative()
-                .bg(p.tool)
+                .gap(px(if cramped { 4. } else { CHIP_GAP }))
                 .font_family(fonts::MONO)
-                .child(list)
-                .child(glyph::bar(p.sub_rule))
-                .children(undrawn.into_iter().map(|(i, k)| {
-                    div().absolute().left_0().top(px(pad + (i as f32 + k) * row_h)).w(px(2.)).h(px((1. - k) * row_h)).bg(p.tool)
-                }))
-                .when_some(you, |d, i| {
-                    d.child(div().absolute().left_0().top(px(pad + i as f32 * row_h)).w(px(2.)).h(px(row_h * you_drawn)).bg(you_color))
-                }),
+                .children(lines.into_iter().map(|l| h_flex().h(px(row_h)).gap(px(CHIP_GAP)).items_center().children(l))),
         ))
     }
 
+    /// A worker's chip (polish.md §2.5): on the `tool` ground in a 1 px
+    /// `hair` frame, `bar` on its left edge; its state glyph, name, step
+    /// (or its state's word once it ended; an armed cancel's `Cancel …?`
+    /// and CONFIRM), its clock (ticking while it runs) and the cancel ×.
     #[allow(clippy::too_many_arguments)]
     fn tray_row(
         &self,
         r: &TrayRow,
         watched: bool,
         armed: bool,
+        w: f32,
         h: f32,
-        more: Option<Div>,
+        bar: Div,
         p: &Palette,
         m: &Metrics,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let (g, _, word, family) = glyph::worker(r.live);
+        let (g, _, _, family) = glyph::worker(r.live);
         let (word_color, mark) = glyph::ink(family, Ground::Run, p);
-        let line_color = match r.live {
-            Liveness::Failed => p.err,
-            Liveness::Running | Liveness::Cancelling => p.sub_status_t,
-            _ => p.dim_t,
-        };
+        let running = matches!(r.live, Liveness::Running | Liveness::Started) && !r.step.is_empty();
+        let step_color = if running { p.sub_status_t } else { word_color };
         let who = Who::new(r.id, r.name.clone(), r.call.clone());
-        // Facts · word · cancel ×: an armed cancel takes the facts' room.
-        let trail = h_flex()
-            .flex_none()
-            .gap(px(8.))
-            .items_center()
-            .when(!r.facts.is_empty() && !armed, |d| d.child(div().text_color(p.sub_time_t).child(ticked(&self.fx, &r.facts, &r.tick))))
-            .when(!self.layout.tight, |d| d.child(div().text_color(word_color).child(word)))
-            .children(more)
-            .children(r.watchable.then(|| self.cancel_x(&who, &r.handle, armed, watched, h, p, cx)).flatten());
-        let row = h_flex()
-            .id(("tray-row", r.id as usize))
-            .group("tray-row")
-            .h(px(h))
-            .w_full()
-            .relative()
-            .px(px(m.pad_x))
-            .items_center()
-            .whitespace_nowrap()
-            .text_px(m.meta)
-            // The watched worker (the composer steers it): its bar is the
-            // tray's ([`AppView::render_tray`]).
-            .when(watched, |d| d.bg(p.tool_out))
-            .child(glyph::lead(
-                Some(crate::turns::live_glyph(
+        let clock = match &r.tick {
+            Some((_, t)) if self.fx.on() => {
+                let (s, next) = t.whole(self.fx.now());
+                self.fx.tick_clock(next);
+                Some(SharedString::from(crate::subagents::fmt_whole(s)))
+            }
+            _ => r.clock.clone(),
+        };
+        let x = r.watchable.then(|| self.cancel_x(&who, &r.handle, armed, watched, h, p, cx)).flatten();
+        let (x, armed_el) = if armed { (None, x) } else { (x, None) };
+        let row =
+            h_flex()
+                .id(("tray-row", r.id as usize))
+                .group("tray-row")
+                .h(px(h))
+                .w(px(w))
+                .relative()
+                .pl(px(12.))
+                .pr(px(10.))
+                .gap(px(8.))
+                .items_center()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_px(m.meta)
+                .bg(if watched { p.tool_out } else { p.tool })
+                .border_1()
+                .border_color(p.hair)
+                .child(crate::turns::live_glyph(
                     &self.fx,
                     g,
                     mark,
@@ -383,28 +549,26 @@ impl AppView {
                     self.fx.change(Tag::TrayGlyph, r.id, crate::turns::glyph_code(glyph::worker(glyph::steady(r.live, r.demoted)).0), None),
                     None,
                     false,
-                )),
-                m,
-            ))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(m.run_gap))
-                    .items_center()
-                    .child(
+                ))
+                .child(div().flex_none().text_color(p.sub_name_t).child(SharedString::from(cut(&r.name, NAME_CHARS))))
+                .when_some(armed_el, |d, a| d.child(a))
+                .when(!armed, |d| {
+                    d.child(
                         div()
-                            .flex_none()
-                            .max_w(px(m.meta * 0.6 * 18.))
+                            .flex_1()
+                            .min_w_0()
                             .overflow_hidden()
                             .text_ellipsis()
-                            .text_color(p.sub_name_t)
-                            .child(r.name.clone()),
+                            .text_color(step_color)
+                            .child(SharedString::from(chip_step(r).to_string())),
                     )
-                    .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(line_color).child(r.line.clone()))
-                    .child(trail),
-            )
-            .children(self.render_menu_at_row(r.id, p, cx));
+                    .children(clock.map(|c| {
+                        div().flex_none().w(px(crate::turns::text_w(CLOCK_CHARS, m.meta * 0.6))).text_color(p.sub_time_t).child(c)
+                    }))
+                })
+                .children(x)
+                .child(bar)
+                .children(self.render_menu_at_row(r.id, p, cx));
         if !r.watchable {
             let tip = r.tip.clone();
             return row.tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)).into_any_element();
@@ -419,36 +583,34 @@ impl AppView {
             .into_any_element()
     }
 
-    /// A row that left, fading (`fade` 1 → 0) in its slot: what it said,
+    /// A chip that left, fading (`fade` 1 → 0) in its slot: what it said,
     /// with no id, listener or hitbox (motion.md §8: an exit takes no click).
-    /// Faded as a colour mix toward the tray's opaque ground (what opacity
+    /// Faded as a colour mix toward the chip's opaque ground (what opacity
     /// would paint there; no translucent text, design.md §5).
-    fn tray_ghost(&self, r: &TrayRow, fade: f32, h: f32, p: &Palette, m: &Metrics) -> AnyElement {
-        let (g, _, word, family) = glyph::worker(r.live);
+    fn tray_ghost(&self, r: &TrayRow, fade: f32, w: f32, h: f32, p: &Palette, m: &Metrics) -> AnyElement {
+        let (g, _, _, family) = glyph::worker(r.live);
         let (word_color, mark) = glyph::ink(family, Ground::Run, p);
         let f = |c: Hsla| motion::mix(p.tool, c, fade);
-        let (word_color, mark) = (f(word_color), f(mark));
         h_flex()
             .debug_selector(|| "tray-ghost".into())
+            .flex_none()
             .h(px(h))
-            .w_full()
-            .px(px(m.pad_x))
+            .w(px(w))
+            .relative()
+            .pl(px(12.))
+            .pr(px(10.))
+            .gap(px(8.))
             .items_center()
+            .overflow_hidden()
             .whitespace_nowrap()
             .text_px(m.meta)
-            .child(glyph::lead(Some(glyph::draw(g, mark)), m))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(m.run_gap))
-                    .items_center()
-                    .child(
-                        div().flex_none().max_w(px(m.meta * 0.6 * 18.)).overflow_hidden().text_color(f(p.sub_name_t)).child(r.name.clone()),
-                    )
-                    .child(div().flex_1().min_w_0().overflow_hidden().text_color(f(p.dim_t)).child(r.line.clone()))
-                    .when(!self.layout.tight, |d| d.child(div().flex_none().text_color(word_color).child(word))),
-            )
+            .bg(p.tool)
+            .border_1()
+            .border_color(f(p.hair))
+            .child(glyph::draw(g, f(mark)))
+            .child(div().flex_none().text_color(f(p.sub_name_t)).child(SharedString::from(cut(&r.name, NAME_CHARS))))
+            .child(div().flex_1().min_w_0().overflow_hidden().text_color(f(word_color)).child(SharedString::from(chip_step(r).to_string())))
+            .child(glyph::bar(f(p.sub_rule)))
             .into_any_element()
     }
 
@@ -514,7 +676,7 @@ impl AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::TrayRow;
+    use super::{TrayRow, chip_lines_needed, chip_pack, cut};
     use crate::glyph::{self, Glyph};
     use crate::subagents::{Live, Liveness, Status};
 
@@ -533,10 +695,26 @@ mod tests {
         }
     }
 
+    /// Chips flow left to right in lines; past the lines they have, the
+    /// last line ends with `+N more` (N the chips not drawn); a chip wider
+    /// than a line has its own.
+    #[test]
+    fn chips_flow_in_lines_and_the_rest_is_more() {
+        let more = |_| 50.;
+        assert_eq!(chip_pack(&[100., 100., 100.], 320., 8., 2, more), (vec![0, 0, 0], 3), "one line holds all three");
+        assert_eq!(chip_pack(&[200., 200., 200.], 320., 8., 2, more), (vec![0, 1], 2), "two lines: the third is +1 more after the second");
+        assert_eq!(chip_pack(&[100., 100., 100., 100.], 320., 8., 1, more), (vec![0, 0], 2), "one line: two and +2 more");
+        assert_eq!(chip_pack(&[500., 100.], 320., 8., 2, more), (vec![0, 1], 2), "a wide one has its line");
+        assert_eq!(chip_lines_needed(&[200., 200., 200.], 320., 8.), 3);
+        assert_eq!(chip_lines_needed(&[], 320., 8.), 0);
+        assert_eq!(cut("reading crates/relay/src/upstream.rs", 12), "reading cra…");
+        assert_eq!(cut("short", 12), "short");
+    }
+
     /// A row's glyph, word and step.
     fn shown(r: &TrayRow) -> (Glyph, &'static str, &str) {
         let (g, _, word, _) = glyph::worker(r.live);
-        (g, word, r.line.as_ref())
+        (g, word, r.step.as_ref())
     }
 
     /// A cancel on its way, then the rows' cancelling: `cancelling` until it

@@ -1535,8 +1535,10 @@ pub struct AppView {
     /// worker's ([`crate::watch::FLASH`]).
     pub(crate) tray: crate::tray::TrayCache,
     pub(crate) tray_due: Option<(Instant, Task<()>)>,
-    /// Rows the tray draws this frame ([`crate::fit::tray_rows`]).
+    /// Lines of worker chips this frame ([`crate::fit::chip_lines`]), and
+    /// how the chips flow in them.
     pub(crate) tray_rows: usize,
+    pub(crate) chips: crate::tray::Chips,
     /// Said in the composer's hint until the next key that moves or sends:
     /// why a worker key went nowhere, or why a steer was not sent.
     pub(crate) watch_note: Option<SharedString>,
@@ -1978,6 +1980,7 @@ impl AppView {
             tray: crate::tray::TrayCache::default(),
             tray_due: None,
             tray_rows: 0,
+            chips: Default::default(),
             watch_note: None,
             placeholder_of: None,
             menu: None,
@@ -5761,9 +5764,13 @@ impl Render for AppView {
         // smallest form and the tray leave.
         let card_shown = self.card_shown();
         let ex = crate::fit::Extras { stub: self.stub_shown(), ..ex };
-        // A row fading out keeps its slot until its fade is over.
-        let tray_n = if view.is_none() { self.tray.rows.len() + self.tray.ghosts.len() } else { 0 };
-        self.tray_rows = crate::fit::tray_rows(&m, lay.form(), self.height, card_shown, ex, tray_n);
+        // The worker chips: the lines they need in the column, then how
+        // many the room leaves. A chip fading out keeps its slot until its
+        // fade is over.
+        let (slots, widths) = if view.is_none() { self.chip_widths(&m) } else { (Vec::new(), Vec::new()) };
+        let needed = crate::tray::chip_lines_needed(&widths, lay.column, crate::tray::CHIP_GAP);
+        self.tray_rows = crate::fit::chip_lines(&m, lay.form(), self.height, card_shown, ex, needed);
+        self.pack_chips(slots, &widths, lay.column, self.tray_rows, &m);
         // A keyboard menu over a row no longer drawn closes.
         self.close_orphan_menu();
         let ex = crate::fit::Extras { tray: self.tray_rows as u8, ..ex };

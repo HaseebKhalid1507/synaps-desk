@@ -1261,7 +1261,11 @@ impl Geo {
     pub(crate) fn of(lay: Layout, m: &Metrics) -> Self {
         let gap = (8. * m.r).round();
         let verb_w = text_w(VERB_CHARS, m.mono * 0.6);
-        let (out, pad, verb) = if lay.hang { (m.lead + gap, gap, 0.) } else { (0., 0., m.lead) };
+        // Hanging: the glyph's 12·r column starts where the AGENT label
+        // ends (column − 20·r, C4), centred at column − 14·r; the fill
+        // reaches 4·r past it.
+        let edge = (4. * m.r).round();
+        let (out, pad, verb) = if lay.hang { (m.lead + edge, edge, 0.) } else { (0., 0., m.lead) };
         Geo { out, pad, right: gap, verb_w, gap, verb, target: verb + verb_w + gap, fold: (12. * m.r).round() }
     }
 
@@ -1611,7 +1615,7 @@ impl AppView {
             .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.arg).child(task));
         // The state's word only when it is not going well (C10).
         let warn = matches!(family, Family::Err | Family::Warn);
-        let tick = if running { &v.tick } else { &None };
+        let tick = if running { &v.tick_bare } else { &None };
         let meta = h_flex()
             .flex_none()
             .ml(px(geo.gap))
@@ -1619,7 +1623,7 @@ impl AppView {
             .items_center()
             .text_px(m.meta)
             .whitespace_nowrap()
-            .when(!v.facts.is_empty(), |d| d.child(div().text_color(p.sub_time_t).child(crate::tray::ticked(fx, &v.facts, tick))))
+            .when(!v.facts_bare.is_empty(), |d| d.child(div().text_color(p.sub_time_t).child(crate::tray::ticked(fx, &v.facts_bare, tick))))
             .when(warn && !lay.tight, |d| d.child(div().text_color(word_color).child(word)));
         let button = who.clone().map(|who| {
             let who2 = who.clone();
