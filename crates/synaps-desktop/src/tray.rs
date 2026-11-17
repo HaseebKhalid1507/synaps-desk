@@ -198,23 +198,29 @@ impl Chips {
 /// and the cancel ×'s, 8 apart. Nothing in it changes with a tick. An
 /// armed cancel's `Cancel name? ··· C O N F I R M` (CONFIRM `confirm` px,
 /// as drawn) takes the step's, the clock's and the ×'s room. No wider than
-/// the line (`line` px): the step gives way.
-pub(crate) fn chip_w(r: &TrayRow, armed: bool, line: f32, confirm: f32, m: &Metrics) -> f32 {
+/// the line (`line` px): the step gives way. With the least it may shrink
+/// to in a line's rest: its step cut at [`STEP_LEAST`].
+pub(crate) fn chip_w(r: &TrayRow, armed: bool, line: f32, confirm: f32, m: &Metrics) -> (f32, f32) {
     use crate::turns::text_w;
     let cw = m.meta * 0.6;
     let name = r.name.chars().count().min(NAME_CHARS);
     let base = 2. + 12. + 10. + 8. + text_w(name, cw) + 10.;
-    let w = if armed {
+    if armed {
         // `Cancel ` and `?`, the fuse (3 cells 4 apart, 2 after), CONFIRM,
         // 6 apart.
-        base + 8. + text_w(name + 8, cw) + 6. + 22. + 6. + confirm
-    } else {
-        let fixed = base + if r.clocked() { 8. + text_w(CLOCK_CHARS, cw) } else { 0. } + if r.watchable { 8. + X_W } else { 0. };
-        let room = (line - fixed - 8.).max(text_w(8, cw));
-        fixed + 8. + text_w(chip_step(r).chars().count(), cw).min(room)
-    };
-    w.ceil()
+        let w = (base + 8. + text_w(name + 8, cw) + 6. + 22. + 6. + confirm).ceil();
+        return (w, w);
+    }
+    let fixed = base + if r.clocked() { 8. + text_w(CLOCK_CHARS, cw) } else { 0. } + if r.watchable { 8. + X_W } else { 0. };
+    let room = (line - fixed - 8.).max(text_w(8, cw));
+    let step = chip_step(r).chars().count();
+    let w = fixed + 8. + text_w(step, cw).min(room);
+    let least = fixed + 8. + text_w(step.min(STEP_LEAST), cw).min(room);
+    (w.ceil(), least.ceil())
 }
+
+/// The least of a step a chip keeps when it shrinks into a line's rest.
+const STEP_LEAST: usize = 14;
 
 /// A chip's step: what it does while it runs, else its state's word.
 fn chip_step(r: &TrayRow) -> &str {
@@ -229,20 +235,34 @@ pub(crate) fn more_w(n: usize, m: &Metrics) -> f32 {
     (2. + 10. + crate::turns::text_w(format!("+{n} more").chars().count(), m.meta * 0.6) + 10.).ceil()
 }
 
-/// The chips of `widths` flowed left to right in lines `avail` px wide,
-/// `gap` apart: the line each is on, as many as `lines` lines hold. All of
+/// The chips of `widths` (each whole, and the least it may shrink to: its
+/// step cut shorter) flowed left to right in lines `avail` px wide, `gap`
+/// apart: the line each is on and its width, as many as `lines` lines hold.
+/// A chip that does not fit whole in what is left of a line takes the rest
+/// of it if it can shrink that far, else starts the next line. All of
 /// them, or as many as fit with the `+N more` chip (`more(n)` wide) that
 /// ends the last line. A chip wider than a line has a line of its own.
-pub(crate) fn chip_pack(widths: &[f32], avail: f32, gap: f32, lines: usize, more: impl Fn(usize) -> f32) -> (Vec<usize>, usize) {
-    let flow = |ws: &mut dyn Iterator<Item = f32>| {
+pub(crate) fn chip_pack(
+    widths: &[(f32, f32)],
+    avail: f32,
+    gap: f32,
+    lines: usize,
+    more: impl Fn(usize) -> f32,
+) -> (Vec<(usize, f32)>, usize) {
+    let flow = |ws: &mut dyn Iterator<Item = (f32, f32)>| {
         let (mut line, mut x, mut out) = (0, 0., Vec::new());
-        for w in ws {
+        for (w, least) in ws {
+            let mut w = w;
             if x > 0. && x + gap + w > avail {
-                line += 1;
-                x = 0.;
+                if x + gap + least <= avail {
+                    w = avail - x - gap;
+                } else {
+                    line += 1;
+                    x = 0.;
+                }
             }
             x += if x > 0. { gap + w } else { w };
-            out.push((line, x));
+            out.push((line, w));
         }
         out
     };
@@ -251,21 +271,22 @@ pub(crate) fn chip_pack(widths: &[f32], avail: f32, gap: f32, lines: usize, more
         return (Vec::new(), 0);
     }
     if all.last().is_none_or(|l| l.0 < lines) {
-        return (all.into_iter().map(|l| l.0).collect(), widths.len());
+        return (all, widths.len());
     }
     // As many as fit with `+N more` after them.
     for k in (0..widths.len()).rev() {
-        let placed = flow(&mut widths[..k].iter().copied().chain(std::iter::once(more(widths.len() - k))));
+        let m = more(widths.len() - k);
+        let placed = flow(&mut widths[..k].iter().copied().chain(std::iter::once((m, m))));
         if placed.last().is_some_and(|l| l.0 < lines) {
-            return (placed[..k].iter().map(|l| l.0).collect(), k);
+            return (placed[..k].to_vec(), k);
         }
     }
     (Vec::new(), 0)
 }
 
 /// The lines `widths` flow to, all of them, in `avail` px.
-pub(crate) fn chip_lines_needed(widths: &[f32], avail: f32, gap: f32) -> usize {
-    chip_pack(widths, avail, gap, usize::MAX, |_| 0.).0.last().map_or(0, |l| l + 1)
+pub(crate) fn chip_lines_needed(widths: &[(f32, f32)], avail: f32, gap: f32) -> usize {
+    chip_pack(widths, avail, gap, usize::MAX, |_| 0.).0.last().map_or(0, |l| l.0 + 1)
 }
 
 impl AppView {
@@ -389,7 +410,7 @@ impl AppView {
     /// need in the column (`avail` px) and, once [`crate::fit::chip_lines`]
     /// has said how many it has room for (`lines`), how they flow
     /// ([`AppView::chips`]).
-    pub(crate) fn chip_widths(&self, line: f32, confirm: f32, m: &Metrics) -> (Vec<Slot>, Vec<f32>) {
+    pub(crate) fn chip_widths(&self, line: f32, confirm: f32, m: &Metrics) -> (Vec<Slot>, Vec<(f32, f32)>) {
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
         let now = Instant::now();
         let slots = self.tray_slots();
@@ -407,9 +428,9 @@ impl AppView {
         (slots, widths)
     }
 
-    pub(crate) fn pack_chips(&mut self, slots: Vec<Slot>, widths: &[f32], avail: f32, lines: usize, m: &Metrics) {
+    pub(crate) fn pack_chips(&mut self, slots: Vec<Slot>, widths: &[(f32, f32)], avail: f32, lines: usize, m: &Metrics) {
         let (on, k) = chip_pack(widths, avail, CHIP_GAP, lines, |n| more_w(n, m));
-        let placed: Vec<(Slot, usize, f32)> = slots.into_iter().zip(on).zip(widths).map(|((s, l), w)| (s, l, *w)).collect();
+        let placed: Vec<(Slot, usize, f32)> = slots.into_iter().zip(on).map(|(s, (l, w))| (s, l, w)).collect();
         let drawn = placed.iter().filter(|s| matches!(s.0, Slot::Row(_))).count();
         let more = self.tray.rows.len().saturating_sub(drawn);
         let more_line = placed.last().map_or(0, |s| s.1);
@@ -729,11 +750,21 @@ mod tests {
     #[test]
     fn chips_flow_in_lines_and_the_rest_is_more() {
         let more = |_| 50.;
-        assert_eq!(chip_pack(&[100., 100., 100.], 320., 8., 2, more), (vec![0, 0, 0], 3), "one line holds all three");
-        assert_eq!(chip_pack(&[200., 200., 200.], 320., 8., 2, more), (vec![0, 1], 2), "two lines: the third is +1 more after the second");
-        assert_eq!(chip_pack(&[100., 100., 100., 100.], 320., 8., 1, more), (vec![0, 0], 2), "one line: two and +2 more");
-        assert_eq!(chip_pack(&[500., 100.], 320., 8., 2, more), (vec![0, 1], 2), "a wide one has its line");
-        assert_eq!(chip_lines_needed(&[200., 200., 200.], 320., 8.), 3);
+        let whole = |ws: &[f32]| ws.iter().map(|&w| (w, w)).collect::<Vec<_>>();
+        let lines = |r: (Vec<(usize, f32)>, usize)| (r.0.into_iter().map(|l| l.0).collect::<Vec<_>>(), r.1);
+        assert_eq!(lines(chip_pack(&whole(&[100., 100., 100.]), 320., 8., 2, more)), (vec![0, 0, 0], 3), "one line holds all three");
+        assert_eq!(
+            lines(chip_pack(&whole(&[200., 200., 200.]), 320., 8., 2, more)),
+            (vec![0, 1], 2),
+            "two lines: the third is +1 more after the second"
+        );
+        assert_eq!(lines(chip_pack(&whole(&[100., 100., 100., 100.]), 320., 8., 1, more)), (vec![0, 0], 2), "one line: two and +2 more");
+        assert_eq!(lines(chip_pack(&whole(&[500., 100.]), 320., 8., 2, more)), (vec![0, 1], 2), "a wide one has its line");
+        // A chip that can shrink takes the line's rest; one that cannot
+        // starts the next.
+        assert_eq!(chip_pack(&[(200., 200.), (200., 100.)], 320., 8., 2, more), (vec![(0, 200.), (0, 112.)], 2));
+        assert_eq!(chip_pack(&[(200., 200.), (200., 150.)], 320., 8., 2, more), (vec![(0, 200.), (1, 200.)], 2));
+        assert_eq!(chip_lines_needed(&whole(&[200., 200., 200.]), 320., 8.), 3);
         assert_eq!(chip_lines_needed(&[], 320., 8.), 0);
         assert_eq!(cut("reading crates/relay/src/upstream.rs", 12), "reading cra…");
         assert_eq!(cut("short", 12), "short");

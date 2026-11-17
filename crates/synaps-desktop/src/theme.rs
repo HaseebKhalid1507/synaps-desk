@@ -530,7 +530,8 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.hair = f.at("hair", t.separator, ink, &[canvas, chrome], HAIR);
     r.edge = f.at("edge", t.border, ink, &[canvas, chrome, user], EDGE);
     r.frame = f.at("frame", t.border, ink, &[card, card_hi, canvas, chrome, tool_out], FRAME);
-    r.hair_w = f.at("hair_w", t.separator, ink, &[well, canvas], HAIR);
+    // Against a hovered row over its well too (paper's well is `tool_out`).
+    r.hair_w = f.at("hair_w", t.separator, ink, &[well, canvas, tool_out], HAIR);
     r.hair_t = f.at("hair_t", t.separator, ink, &[tool, tool_out, canvas], HAIR);
     r.edge_t = f.at("edge_t", t.border, ink, &[canvas, tool_out], EDGE);
     r.ink = f.text("ink", ink, &[canvas, user, tool_out, chrome, raised, add_bg, del_bg, card, card_hi]);
@@ -1609,7 +1610,7 @@ mod tests {
                 let mut pairs: Vec<(&str, u32, Vec<u32>, f64)> = vec![
                     ("hover fill", r.tool_out, vec![r.canvas], SURFACE),
                     ("well", r.well, vec![r.canvas], SURFACE),
-                    ("well frame and header rule", r.hair_w, vec![r.well, r.canvas], HAIR),
+                    ("well frame and header rule", r.hair_w, vec![r.well, r.canvas, r.tool_out], HAIR),
                     ("chip frame", r.hair_t, vec![r.tool, r.tool_out, r.canvas], HAIR),
                     ("OPEN outline", r.edge_t, row.to_vec(), EDGE),
                     ("OPEN outline hovered", r.frame, vec![r.tool_out], FRAME),
