@@ -1,0 +1,11 @@
+0.00 t0: relay-refresh, the waiting call breathes (NEEDS YOU)
+3.00 click Flaky e2e: row clock, chip clocks, scans
+7.11 hover a chip
+7.92 click the chip (the demo mirrors its sessions: no cancel x; the armed fuse is ui_tests::the_fuse_burns_clear_of_the_pointer)
+12.33 pointer away
+13.34 click Idle CPU
+15.44 unfold the run (chevron turns, rows grow)
+17.55 open the edit's well (chevron)
+19.16 close it
+20.77 fold the run
+22.87 end
