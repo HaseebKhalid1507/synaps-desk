@@ -785,6 +785,56 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             sleep(0.3).await;
             out["mem_after_scroll"] = mem::sample();
 
+            // 3b. A wheel spun over the same transcript (fluid.md §3.2): a
+            //     notch (3 lines) every 25 ms for 2.5 s, through the
+            //     window's own input path, first under Full (the scroller's
+            //     glide), then Reduced (GPUI's own wheel: the build before F1).
+            let center = view.update(cx, |v, _| v.list.viewport_bounds().center()).unwrap_or_default();
+            for (name, level) in [("spin_full", crate::motion::Level::Full), ("spin_reduced", crate::motion::Level::Reduced)] {
+                let _ = cx.update(|_, cx| {
+                    cx.set_global(crate::motion::Setting { level: Some(level), lock: None });
+                    crate::motion::Level::apply(cx);
+                });
+                let _ = upd(cx, &|v, _| v.bench.as_mut().unwrap().animate = false);
+                sleep(0.3).await;
+                let t0 = Instant::now();
+                let start = view.update(cx, |v, _| -f32::from(v.list.scroll_px_offset_for_scrollbar().y)).unwrap_or(0.);
+                for _ in 0..100 {
+                    let _ = cx.update(|window, cx| {
+                        window.dispatch_event(
+                            PlatformInput::MouseMove(MouseMoveEvent { position: center, pressed_button: None, modifiers: Modifiers::default() }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            PlatformInput::Scroll(ScrollEvent {
+                                position: center,
+                                delta: ScrollDelta::Lines(point(0., -3.)),
+                                modifiers: Modifiers::default(),
+                                touch_phase: TouchPhase::Moved,
+                                source: ScrollSource::Pointer,
+                            }),
+                            cx,
+                        );
+                    });
+                    sleep(0.025).await;
+                }
+                let t1 = Instant::now();
+                sleep(0.3).await;
+                out[name] = view
+                    .update(cx, |v, _| {
+                        let b = v.bench.as_mut().unwrap();
+                        b.drain();
+                        let mut s = b.stats(t0, t1, refresh_fallback);
+                        s["travel_px"] = json!(round((-f32::from(v.list.scroll_px_offset_for_scrollbar().y) - start) as f64, 1));
+                        s
+                    })
+                    .unwrap_or(Value::Null);
+            }
+            let _ = cx.update(|_, cx| {
+                cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Full), lock: None });
+                crate::motion::Level::apply(cx);
+            });
+
             // 4. A 400-turn transcript at its end, both side panels' edges
             //    dragged across their limits (every frame a new centre
             //    width: the visible rows re-wrap).
