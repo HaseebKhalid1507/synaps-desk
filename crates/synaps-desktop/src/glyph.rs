@@ -251,37 +251,93 @@ pub(crate) fn scan_row(beat: u32) -> f32 {
 /// inside its fill in `mix(mark, ground, 0.55)`. Any other glyph: [`draw`].
 pub(crate) fn scan(g: Glyph, beat: Option<u32>, mark: Hsla, ground: Hsla) -> AnyElement {
     let Some(beat) = beat.filter(|_| matches!(g, Glyph::Run | Glyph::Workers)) else { return draw(g, mark) };
-    let y = scan_row(beat);
-    let line = crate::motion::mix(mark, ground, 0.55);
+    let line = scan_line(mark, ground);
     let mut el = div().relative().flex_none().size(px(g.size()));
     for &part in g.parts() {
         if let Part::Fill(x, top, w, h) = part {
             el = el.child(div().absolute().left(px(x)).top(px(top)).w(px(w)).h(px(h)).bg(mark));
-            if (top..top + h).contains(&y) {
-                el = el.child(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(1.)).bg(line));
-            }
         }
     }
+    for (x, y, w) in scan_rows(g, beat) {
+        el = el.child(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(1.)).bg(line));
+    }
     el.into_any_element()
+}
+
+/// The scan's 1 px rows in `g`'s box at `beat`: x, y, width (one per fill
+/// the row crosses). [`scan`] and the beat layer draw these.
+pub(crate) fn scan_rows(g: Glyph, beat: u32) -> impl Iterator<Item = (f32, f32, f32)> {
+    let y = scan_row(beat);
+    g.parts().iter().filter_map(move |&part| match part {
+        Part::Fill(x, top, w, h) if (top..top + h).contains(&y) => Some((x, y, w)),
+        _ => None,
+    })
+}
+
+/// The scan row's colour.
+pub(crate) fn scan_line(mark: Hsla, ground: Hsla) -> Hsla {
+    crate::motion::mix(mark, ground, 0.55)
+}
+
+/// `Needs`' inner cell in its box: x, y, side.
+pub(crate) const BREATH_CELL: (f32, f32, f32) = (3., 3., 4.);
+
+/// The breathing cell's colour `step` beats in: between `mark` and
+/// `mix(mark, ground, 0.6)`, 19 beats a cycle.
+pub(crate) fn breath_cell(step: u32, mark: Hsla, ground: Hsla) -> Hsla {
+    let n = crate::motion::BREATH_BEATS;
+    let f = 1. - ((2 * (step % n)) as f32 / n as f32 - 1.).abs();
+    crate::motion::mix(mark, ground, 0.6 * f)
 }
 
 /// `Needs` breathing (motion.md §6.3): `step` beats since the prompt came,
 /// the inner cell between `mark` and `mix(mark, ground, 0.6)`, 19 beats a
 /// cycle, three cycles, then held at `mark`. `None`: still.
 pub(crate) fn breath(step: Option<u32>, mark: Hsla, ground: Hsla) -> AnyElement {
-    let n = crate::motion::BREATH_BEATS;
-    let f = match step.filter(|s| *s < n * crate::motion::BREATHS) {
-        None => return draw(Glyph::Needs, mark),
-        Some(s) => 1. - ((2 * (s % n)) as f32 / n as f32 - 1.).abs(),
+    let Some(s) = step.filter(|s| *s < crate::motion::BREATH_BEATS * crate::motion::BREATHS) else {
+        return draw(Glyph::Needs, mark);
     };
-    let cell = crate::motion::mix(mark, ground, 0.6 * f);
+    breath_box(breath_cell(s, mark, ground), mark).into_any_element()
+}
+
+fn breath_box(cell: Hsla, mark: Hsla) -> Div {
+    let (x, y, w) = BREATH_CELL;
     div()
         .relative()
         .flex_none()
         .size(px(10.))
         .child(div().absolute().inset_0().border_1().border_color(mark))
-        .child(div().absolute().left(px(3.)).top(px(3.)).size(px(4.)).bg(cell))
-        .into_any_element()
+        .child(div().absolute().left(px(x)).top(px(y)).size(px(w)).bg(cell))
+}
+
+/// A glyph whose beat the beat layer paints ([`crate::motion::Beat`]):
+/// drawn still (a scan's quads without its row; a breath's cell at
+/// `mark`, where it ends), and where it was painted recorded for the
+/// layer. Pixel for pixel what [`scan`] and [`breath`] draw, the layer's
+/// row or cell painted over it.
+pub(crate) fn on_beat(beat: crate::motion::Beat, mark: Hsla, ground: Hsla, fx: &std::rc::Rc<crate::motion::Motion>) -> AnyElement {
+    let el = match beat {
+        crate::motion::Beat::Scan(g) => {
+            let mut el = div().relative().flex_none().size(px(g.size()));
+            for &part in g.parts() {
+                if let Part::Fill(x, top, w, h) = part {
+                    el = el.child(div().absolute().left(px(x)).top(px(top)).w(px(w)).h(px(h)).bg(mark));
+                }
+            }
+            el
+        }
+        crate::motion::Beat::Breath(_) => breath_box(mark, mark),
+    };
+    let fx = fx.clone();
+    el.child(
+        canvas(
+            |_, _, _| {},
+            move |b, _, window, _| fx.site(crate::motion::Site { origin: b.origin, mask: window.content_mask(), mark, ground, beat }),
+        )
+        .absolute()
+        .inset_0(),
+    )
+    .into_any_element()
 }
 
 /// A state's glyph changing (motion.md §6.1, §6.2) at `p` (0..1): to `Ok`

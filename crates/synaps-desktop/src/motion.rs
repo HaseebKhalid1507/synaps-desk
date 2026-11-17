@@ -13,9 +13,17 @@
 //! ([`Motion::end_frame`], painted last) the window asks for one animation
 //! frame, or arms **one** timer to the earliest change, or nothing. So N
 //! animated things cost one frame, and an idle window draws none.
+//!
+//! What changes on the beat alone (a running glyph's scan row, a breath's
+//! cell) is not the app's frame: the app's view is cached
+//! ([`crate::beat::Shell`]), those glyphs are drawn still and say where
+//! they were painted ([`Site`]), and a beat repaints only the beat layer
+//! over the cached frame ([`Motion::paint_beats`]). A clock's second, a
+//! decay, a draw: the app's frame, as before.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::base::motion::Easing;
@@ -64,6 +72,8 @@ impl Level {
         if let Some(l) = cx.try_global::<Setting>().and_then(|s| s.level) {
             cx.set_reduce_motion(l != Level::Full);
         }
+        // A global: cached views don't see it change (the app's view is one).
+        cx.refresh_windows();
     }
 }
 
@@ -211,6 +221,35 @@ impl Tag {
     }
 }
 
+/// What a glyph does on the beat alone, painted by the beat layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Beat {
+    /// A running glyph's scan row ([`crate::glyph::scan`]).
+    Scan(crate::glyph::Glyph),
+    /// `Needs` breathing since the prompt came ([`crate::glyph::breath`]).
+    Breath(Instant),
+}
+
+/// A glyph drawn still in the app's frame whose beat the beat layer
+/// paints: where it was painted (its box's origin, under its clip), and
+/// in what.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Site {
+    pub(crate) origin: Point<Pixels>,
+    pub(crate) mask: ContentMask<Pixels>,
+    pub(crate) mark: Hsla,
+    pub(crate) ground: Hsla,
+    pub(crate) beat: Beat,
+}
+
+/// Who the one timer wakes: the app's view (a frame of its own) or only
+/// the beat layer (the beat, over the cached frame).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wake {
+    App,
+    Beat,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Seen {
     value: u64,
@@ -318,8 +357,19 @@ pub(crate) struct Motion {
     births: RefCell<HashMap<u64, Instant>>,
     slides: RefCell<HashMap<u64, Slide>>,
     turns: RefCell<HashMap<u64, (Tween, u64)>>,
-    /// The one timer, and the instant it is armed for.
-    timer: RefCell<Option<(Instant, Task<()>)>>,
+    /// The one timer.
+    timer: RefCell<Option<Task<()>>>,
+    /// The instant it is armed for, and whom it wakes (cleared as it fires).
+    armed: Rc<Cell<Option<(Instant, Wake)>>>,
+    /// A beat layer paints the beat ([`crate::beat::BeatLayer`]); without
+    /// one the app's frame draws it (and each beat is the app's frame).
+    layer: Cell<bool>,
+    /// Glyphs whose beat the layer paints, recorded by the app's last paint.
+    sites: RefCell<Vec<Site>>,
+    /// The next beat the layer's sites change on.
+    beat_next: Cell<Option<Instant>>,
+    /// Frames the beat layer painted (tests, the bench).
+    pub(crate) layer_paints: Cell<u64>,
     /// Timers armed so far (tests: one per change of deadline).
     pub(crate) arms: Cell<u64>,
     /// Handoff out: you sent (`false`) or steered a worker (`true`).
@@ -329,6 +379,9 @@ pub(crate) struct Motion {
     /// Whose state is remembered: the session's (id and attach) and the
     /// column's (the session's thread or a worker's view) ([`Motion::rescope`]).
     scope: Cell<(u64, u64)>,
+    /// Tests move the clock with the executor's ([`Motion::clock`]).
+    #[cfg(test)]
+    skew: Cell<Duration>,
 }
 
 impl Default for Motion {
@@ -354,10 +407,17 @@ impl Motion {
             slides: RefCell::default(),
             turns: RefCell::default(),
             timer: RefCell::default(),
+            armed: Rc::default(),
+            layer: Cell::new(false),
+            sites: RefCell::default(),
+            beat_next: Cell::new(None),
+            layer_paints: Cell::new(0),
             arms: Cell::new(0),
             sent: Cell::new(None),
             fold: Cell::new(None),
             scope: Cell::new((0, 0)),
+            #[cfg(test)]
+            skew: Cell::new(Duration::ZERO),
         }
     }
 
@@ -396,7 +456,21 @@ impl Motion {
 
     /// The frame's clock (every element of a frame samples the same instant).
     pub(crate) fn now(&self) -> Instant {
-        if self.in_frame.get() { self.now.get() } else { Instant::now() }
+        if self.in_frame.get() { self.now.get() } else { self.clock() }
+    }
+
+    /// The time (tests: moved on with the test executor's clock).
+    pub(crate) fn clock(&self) -> Instant {
+        #[cfg(test)]
+        return Instant::now() + self.skew.get();
+        #[cfg(not(test))]
+        Instant::now()
+    }
+
+    /// Tests: the clock moves on `d` (as the executor's does).
+    #[cfg(test)]
+    pub(crate) fn skew(&self, d: Duration) {
+        self.skew.set(self.skew.get() + d);
     }
 
     /// A frame starts (the root's render): the clock, the level, and what
@@ -410,6 +484,7 @@ impl Motion {
         self.in_frame.set(true);
         self.display.set(false);
         self.next.set(None);
+        self.sites.borrow_mut().clear();
         let alive = |f: u64| f + 1 >= frame;
         self.seen.borrow_mut().retain(|_, s| alive(s.frame));
         self.slides.borrow_mut().retain(|_, s| alive(s.frame));
@@ -423,8 +498,44 @@ impl Motion {
     pub(crate) fn set_visible(&self, visible: bool) {
         self.visible.set(visible);
         if !visible {
-            self.timer.borrow_mut().take();
+            self.disarm();
         }
+    }
+
+    /// A beat layer paints the beat from now on ([`crate::beat::BeatLayer`]).
+    pub(crate) fn set_layer(&self) {
+        self.layer.set(true);
+    }
+
+    /// The beat goes to the beat layer this frame: ambient runs, and a
+    /// layer is there to paint it.
+    pub(crate) fn layered(&self) -> bool {
+        self.layer.get() && self.ambient.get()
+    }
+
+    /// AppView frames so far (each one a render, layout and prepaint).
+    pub(crate) fn frames(&self) -> u64 {
+        self.frame.get()
+    }
+
+    /// A glyph drawn still was painted here: the layer paints its beat.
+    pub(crate) fn site(&self, site: Site) {
+        self.sites.borrow_mut().push(site);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sites(&self) -> Vec<Site> {
+        self.sites.borrow().clone()
+    }
+
+    /// Glyphs the beat layer paints (the bench).
+    pub(crate) fn site_count(&self) -> usize {
+        self.sites.borrow().len()
+    }
+
+    fn disarm(&self) {
+        self.timer.borrow_mut().take();
+        self.armed.set(None);
     }
 
     // ── demand ────────────────────────────────────────────────────────
@@ -475,11 +586,25 @@ impl Motion {
     /// runs it changes on the beat that crosses `at` (§7.1: the heartbeat's
     /// frame, no extra one); without it, at `at` itself.
     pub(crate) fn tick_at(&self, at: Instant) {
+        self.tick_on(at, BEAT);
+    }
+
+    /// A running clock's next second at `at`. While the heartbeat runs,
+    /// every clock changes on the one second of the beat's grid that
+    /// crosses it (8 beats): N clocks, whatever their phase, cost one app
+    /// frame a second, the rest of the beats only the beat layer. Each
+    /// shows its own whole seconds as of that frame (at most one behind
+    /// for less than a second). Without the heartbeat, at `at` itself.
+    pub(crate) fn tick_clock(&self, at: Instant) {
+        self.tick_on(at, BEAT * 8);
+    }
+
+    fn tick_on(&self, at: Instant, grid: Duration) {
         if !self.ambient.get() {
             return self.want_at(at);
         }
-        let n = at.saturating_duration_since(self.epoch).as_nanos().div_ceil(BEAT.as_nanos());
-        self.want_at(self.epoch + Duration::from_nanos((BEAT.as_nanos() * n) as u64));
+        let n = at.saturating_duration_since(self.epoch).as_nanos().div_ceil(grid.as_nanos());
+        self.want_at(self.epoch + Duration::from_nanos((grid.as_nanos() * n) as u64));
     }
 
     // ── one-shots ─────────────────────────────────────────────────────
@@ -618,32 +743,92 @@ impl Motion {
 
     // ── after the frame ───────────────────────────────────────────────
 
-    /// The frame is built (painted last): ask for the next frame, or arm
-    /// the one timer to the earliest change, or nothing.
-    pub(crate) fn end_frame<V: 'static>(&self, window: &mut Window, cx: &mut App, view: WeakEntity<V>) {
+    /// The app's frame is built (painted last): ask for the next frame,
+    /// or (no beat layer) arm the one timer to the earliest change, or
+    /// nothing. With a layer, it paints next and arms the timer.
+    pub(crate) fn end_frame(&self, window: &mut Window, cx: &mut App, app: EntityId) {
         self.in_frame.set(false);
         if !self.on() || !self.visible.get() {
-            self.timer.borrow_mut().take();
-            return;
+            return self.disarm();
         }
         if self.display.get() {
+            // The app's view (the current one) draws the next frame.
             window.request_animation_frame();
             return;
         }
-        let Some(at) = self.next.get() else {
-            self.timer.borrow_mut().take();
-            return;
+        if !self.layer.get() {
+            self.beat_next.set(None);
+            self.arm(cx, app, app);
+        }
+    }
+
+    /// The beat layer's paint, over the app's frame (cached or new): each
+    /// recorded glyph's beat now, on one beat (they scan in lockstep), then
+    /// the one timer, to the earliest of the app's change and the next beat.
+    pub(crate) fn paint_beats(&self, window: &mut Window, cx: &mut App, app: EntityId, layer: EntityId) {
+        self.layer_paints.set(self.layer_paints.get() + 1);
+        self.beat_next.set(None);
+        if !self.on() || !self.visible.get() {
+            return self.disarm();
+        }
+        let since = self.clock().saturating_duration_since(self.epoch);
+        let beat = (since.as_nanos() / BEAT.as_nanos()) as u32;
+        let mut wants = false;
+        for s in self.sites.borrow().iter() {
+            let quad = |x: f32, y: f32, w: f32, h: f32, c: Hsla, window: &mut Window| {
+                window.with_content_mask(Some(s.mask), |window| {
+                    window.paint_quad(fill(Bounds::new(s.origin + point(px(x), px(y)), size(px(w), px(h))), c));
+                });
+            };
+            match s.beat {
+                Beat::Scan(g) => {
+                    wants = true;
+                    let line = crate::glyph::scan_line(s.mark, s.ground);
+                    for (x, y, w) in crate::glyph::scan_rows(g, beat) {
+                        quad(x, y, w, 1., line, window);
+                    }
+                }
+                Beat::Breath(at) => {
+                    let step = beat.saturating_sub((at.saturating_duration_since(self.epoch).as_nanos() / BEAT.as_nanos()) as u32);
+                    if step < BREATH_BEATS * BREATHS {
+                        wants = true;
+                        let (x, y, w) = crate::glyph::BREATH_CELL;
+                        quad(x, y, w, w, crate::glyph::breath_cell(step, s.mark, s.ground), window);
+                    }
+                }
+            }
+        }
+        if wants {
+            self.beat_next.set(Some(self.epoch + BEAT * (beat + 1)));
+        }
+        if !self.display.get() {
+            self.arm(cx, app, layer);
+        }
+    }
+
+    /// Arms the one timer to the earliest change: the app's (it draws a
+    /// frame, the layer with it) or the beat's (only the layer).
+    fn arm(&self, cx: &mut App, app: EntityId, layer: EntityId) {
+        let target = match (self.next.get(), self.beat_next.get()) {
+            (Some(a), Some(b)) if b < a => Some((b, Wake::Beat)),
+            (Some(a), _) => Some((a, Wake::App)),
+            (None, Some(b)) => Some((b, Wake::Beat)),
+            (None, None) => None,
         };
-        if self.timer.borrow().as_ref().is_some_and(|(t, _)| *t == at) {
+        let Some((at, wake)) = target else { return self.disarm() };
+        if self.armed.get() == Some((at, wake)) {
             return;
         }
         self.arms.set(self.arms.get() + 1);
-        let wait = at.saturating_duration_since(Instant::now());
+        self.armed.set(Some((at, wake)));
+        let (armed, who) = (self.armed.clone(), if wake == Wake::App { app } else { layer });
+        let wait = at.saturating_duration_since(self.clock());
         let task = cx.spawn(async move |cx| {
             cx.background_executor().timer(wait).await;
-            let _ = view.update(cx, |_, cx| cx.notify());
+            armed.set(None);
+            cx.update(|cx| cx.notify(who));
         });
-        *self.timer.borrow_mut() = Some((at, task));
+        *self.timer.borrow_mut() = Some(task);
     }
 
     /// One-shots that started on this frame (tests: a switch starts none).
@@ -660,7 +845,13 @@ impl Motion {
     /// What the last frame asked for: a frame, a timer at, nothing (tests).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pending(&self) -> (bool, Option<Instant>) {
-        (self.display.get(), self.timer.borrow().as_ref().map(|(t, _)| *t))
+        (self.display.get(), self.armed.get().map(|(t, _)| t))
+    }
+
+    /// Whom the armed timer wakes (tests).
+    #[cfg(test)]
+    pub(crate) fn wakes(&self) -> Option<Wake> {
+        self.armed.get().map(|(_, w)| w)
     }
 
     /// The scheduler, as `end_frame` would leave it, without a window (tests).

@@ -4445,7 +4445,9 @@ impl AppView {
             .line_height(px(m.code_line))
             .text_color(p.well_fg)
             .child(body);
-        let g = crate::turns::live_glyph(&self.fx, glyph::Glyph::Needs, p.warn_mark, p.card, None, self.card_at, false);
+        // Leaving, it holds still: its cover fades over it, and a breath
+        // (the beat layer's, painted over the app's frame) would show through.
+        let g = crate::turns::live_glyph(&self.fx, glyph::Glyph::Needs, p.warn_mark, p.card, None, self.card_at.filter(|_| live), false);
         // Its frame traces from the top-left corner: one stroke along the
         // top and down the right, one down the left and along the bottom,
         // meeting after `base` (paint only, over its 1 px border).
@@ -5157,7 +5159,7 @@ impl Render for AppView {
         // The frame's clock and level: every animated element samples them.
         let low_power = cx.power_mode() == gpui_kit::PowerMode::LowPower;
         self.fx.set_visible(self.visible);
-        self.fx.begin_frame(crate::motion::Level::current(cx), low_power, Instant::now());
+        self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.clock());
         self.fx.rescope(self.motion_session(), self.motion_column());
         if self.menu.is_none()
             && self.smenu.is_none()
@@ -5644,9 +5646,10 @@ impl Render for AppView {
             .children(self.render_menu_at_point(&p, cx))
             .children(self.render_session_menu(&p, cx))
             // Painted last, after every row was rendered: what the frame's
-            // motion asked for (a frame, the one timer, or nothing).
+            // motion asked for (a frame, the one timer, or nothing; with a
+            // beat layer, it arms the timer after painting the beat).
             .child({
-                let (fx, me) = (self.fx.clone(), cx.weak_entity());
+                let (fx, me) = (self.fx.clone(), cx.entity_id());
                 canvas(|_, _, _| {}, move |_, _, window, cx| fx.end_frame(window, cx, me)).absolute().size_0()
             })
     }

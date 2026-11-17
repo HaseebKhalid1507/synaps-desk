@@ -801,6 +801,8 @@ pub fn apply(choice: Choice, cx: &mut App) {
     sync_kit(&p, &roles, cx);
     let dark = luminance(roles.canvas) < 0.5;
     TextViewDefaults::global(cx).with_style(text_style(&p, &m, dark)).with_inherit_text_color(false).install(cx);
+    // A global: cached views (the app's) don't see it change.
+    cx.refresh_windows();
 }
 
 /// Change one part of the current [`Choice`].
