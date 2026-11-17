@@ -306,6 +306,12 @@ pub(crate) fn guard_shape(body: &str) -> Option<Guard> {
     (!dir.is_empty() && !command.trim().is_empty()).then(|| Guard { command: command.to_string().into(), dir: dir.to_string().into() })
 }
 
+/// A call row's status word beside its receipt: none when the receipt
+/// already says it, so the meta never reads `denied denied 14:22`.
+pub(crate) fn status_beside(word: Option<&'static str>, receipt: Option<Answer>) -> Option<&'static str> {
+    word.filter(|w| !(receipt == Some(Answer::Denied) && *w == "denied"))
+}
+
 /// The header's right: `bash · guard · asked 14:21`, from the scope's tool
 /// and extensions and `raised_at` (local, 24 h); a missing part goes with
 /// its separator.
@@ -516,9 +522,14 @@ impl AppView {
         if self.model.watch.focus().is_some() {
             return None;
         }
-        let sid = self.model.active.as_ref()?.session_id.as_str();
-        let r = self.receipts.get(sid)?.iter().rev().find(|r| !r.own && r.after == item)?;
+        let r = self.row_receipt(item)?;
         Some(self.receipt_words(r, p).into_any_element())
+    }
+
+    /// The receipt a call's row carries in its meta, if any.
+    pub(crate) fn row_receipt(&self, item: u64) -> Option<&Receipt> {
+        let sid = self.model.active.as_ref()?.session_id.as_str();
+        self.receipts.get(sid)?.iter().rev().find(|r| !r.own && r.after == item)
     }
 
     fn receipt_words(&self, r: &Receipt, p: &Palette) -> Div {
@@ -1025,6 +1036,10 @@ mod tests {
         assert_eq!(words(r(Answer::Denied, None)), "denied 14:21");
         assert_eq!(words(r(Answer::Elsewhere, Some(Duration::from_secs(3)))), "answered elsewhere 14:21", "not ours: no wait");
         assert_eq!(words(r(Answer::Provided, None)), "provided 14:21");
+        assert_eq!(status_beside(Some("denied"), Some(Answer::Denied)), None, "one denied, the receipt's");
+        assert_eq!(status_beside(Some("denied"), None), Some("denied"));
+        assert_eq!(status_beside(Some("failed"), Some(Answer::Allowed)), Some("failed"));
+        assert_eq!(status_beside(Some("waiting"), Some(Answer::Allowed)), Some("waiting"), "a secret still to come");
         assert_eq!((took(Duration::from_secs(125)), took(Duration::from_secs(3780))), ("2m 05s".into(), "1h 03m".into()));
     }
 

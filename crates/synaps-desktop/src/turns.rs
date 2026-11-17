@@ -1703,7 +1703,10 @@ impl AppView {
             .children(row.counts.element(p))
             .children(row.card.facts.clone().map(|f| div().text_color(p.dim_t).child(f)))
             .children(running.then(|| clock(fx, row.started)).flatten().map(|c| div().text_color(p.dim_t).child(c)))
-            .when_some(state.1.filter(|_| !lay.tight && !think), |d, w| d.child(div().text_color(word_color).child(w)))
+            .when_some(
+                crate::authorize::status_beside(state.1, self.row_receipt(id).map(|r| r.answer)).filter(|_| !lay.tight && !think),
+                |d, w| d.child(div().text_color(word_color).child(w)),
+            )
             .children(row.card.server.clone().map(|s| div().text_color(p.dim_t).child(s)))
             // An answered prompt's receipt (polish.md §2.6).
             .children((!think).then(|| self.receipt_el(id, p)).flatten());
