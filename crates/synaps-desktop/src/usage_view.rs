@@ -15,6 +15,7 @@ use gpui_kit::*;
 
 use crate::app::{AppView, Open, display, mono};
 use crate::chart::{self, Ink, Paths, Spot};
+use crate::fonts::TextPx as _;
 use crate::tabs::Place;
 use crate::theme::Palette;
 use crate::usage::{self, Axes, Board, NONE, Range, SpendBy, Stack};
@@ -95,11 +96,11 @@ impl UsageUi {
 }
 
 fn sans(text: impl Into<SharedString>, size: f32, line: f32, color: Hsla) -> Div {
-    div().text_size(px(size)).line_height(px(line)).text_color(color).child(text.into())
+    div().text_px(size).line_height(px(line)).text_color(color).child(text.into())
 }
 
 fn title(t: &'static str, p: &Palette) -> Div {
-    display(t, 13., p.header)
+    display(t, crate::fonts::size::D_M, p.header)
 }
 
 fn note(t: impl Into<SharedString>, p: &Palette) -> Div {
@@ -111,7 +112,12 @@ fn swatch(c: Hsla) -> Div {
 }
 
 fn ink(p: &Palette) -> Ink {
-    Ink { series: [p.s1, p.s2, p.s3, p.s4, p.s5, p.s_rest], grid: p.hair, rule: p.dim, hover: p.hair.opacity(0.6) }
+    Ink {
+        series: [p.s1, p.s2, p.s3, p.s4, p.s5, p.s_rest],
+        grid: p.hair,
+        rule: p.dim,
+        hover: crate::theme::mix_hsla(p.canvas, p.hair, 0.6),
+    }
 }
 
 impl AppView {
@@ -181,7 +187,7 @@ impl AppView {
     fn readout(&self, c: Chart, s: &Stack, fmt: fn(f64) -> String, total_label: &str, extra: Option<&str>, p: &Palette) -> AnyElement {
         let day = self.usage.hover.filter(|h| h.0 == c).map(|h| h.1).filter(|&i| i < s.days.len());
         let mut row = h_flex().flex_wrap().gap_x(px(18.)).gap_y(px(4.)).items_center().min_h(px(20.));
-        row = row.child(mono(day.map(|i| usage::day_label(&s.days[i])).unwrap_or_else(|| total_label.to_string()), 12.5, p.ink));
+        row = row.child(mono(day.map(|i| usage::day_label(&s.days[i])).unwrap_or_else(|| total_label.to_string()), 13., p.ink));
         for l in &s.series {
             let v = match day {
                 Some(i) => l.values[i].map(fmt).unwrap_or_else(|| NONE.into()),
@@ -192,12 +198,12 @@ impl AppView {
                     .gap(px(6.))
                     .items_center()
                     .child(swatch(p.series(l.color)))
-                    .child(mono(l.key.clone(), 12.5, p.dim))
-                    .child(mono(v, 12.5, p.prose)),
+                    .child(mono(l.key.clone(), 13., p.dim))
+                    .child(mono(v, 13., p.prose)),
             );
         }
         if let Some(e) = extra.filter(|_| day.is_some()) {
-            row = row.child(mono(e.to_string(), 12.5, p.dim));
+            row = row.child(mono(e.to_string(), 13., p.dim));
         }
         row.into_any_element()
     }
@@ -296,7 +302,7 @@ impl AppView {
                             .h(px(52.))
                             .gap(px(28.))
                             .items_center()
-                            .child(display("U S A G E", 16., p.header))
+                            .child(display("U S A G E", crate::fonts::size::D_L, p.header))
                             .child(hosts)
                             .child(ranges)
                             .child(div().flex_1())
@@ -398,7 +404,7 @@ impl AppView {
                             .gap(px(8.))
                             .items_center()
                             .child(swatch(p.series(i.min(5))))
-                            .child(mono(name.clone(), 12.5, p.prose).overflow_hidden().text_ellipsis()),
+                            .child(mono(name.clone(), 13., p.prose).overflow_hidden().text_ellipsis()),
                     )
                     .child(
                         h_flex()
@@ -406,7 +412,7 @@ impl AppView {
                             .gap(px(8.))
                             .items_center()
                             .child(div().w(px(90.)).h(px(6.)).bg(p.hair).child(div().h_full().w(relative(frac)).bg(p.series(i.min(5)))))
-                            .child(mono(usage::money(*spend), 12.5, p.cost))
+                            .child(mono(usage::money(*spend), 13., p.cost))
                             .child(mono(format!("{:.0} %", share * 100.), 12., p.dim)),
                     ),
             );
@@ -425,8 +431,8 @@ impl AppView {
                     .border_t_1()
                     .border_color(p.hair)
                     .child(swatch(p.series(i)))
-                    .child(mono(name.clone(), 12.5, p.prose).flex_1())
-                    .child(mono(usage::money(*v), 12.5, p.cost))
+                    .child(mono(name.clone(), 13., p.prose).flex_1())
+                    .child(mono(usage::money(*v), 13., p.cost))
                     .child(mono(if role_total > 0. { format!("{:.0} %", 100. * v / role_total) } else { NONE.into() }, 12., p.dim)),
             );
         }
@@ -457,7 +463,7 @@ impl AppView {
         let release = hover.and_then(|h| b.releases.iter().find(|r| r.0 == h)).map(|r| format!("release {}", r.1));
         let hit_total = b.cells.get(4).map(|c| c.number.clone()).unwrap_or_default();
         let kv = |k: &'static str, v: String| {
-            h_flex().h(px(22.)).gap(px(12.)).child(mono(k, 12., p.dim).w(px(110.))).child(mono(v, 12.5, p.prose))
+            h_flex().h(px(22.)).gap(px(12.)).child(mono(k, 12., p.dim).w(px(110.))).child(mono(v, 13., p.prose))
         };
         let side = v_flex()
             .w(px(span(4.)))
@@ -481,15 +487,15 @@ impl AppView {
                     .h(px(20.))
                     .gap(px(12.))
                     .items_center()
-                    .child(mono(reason.clone(), 12.5, p.prose).w(px(240.)).overflow_hidden().text_ellipsis())
+                    .child(mono(reason.clone(), 13., p.prose).w(px(240.)).overflow_hidden().text_ellipsis())
                     .child(
                         div().w(px(span(6.).min(360.))).h(px(8.)).child(div().h_full().w(relative(*n as f32 / miss_max as f32)).bg(p.s1)),
                     )
-                    .child(mono(usage::thousands(*n), 12.5, p.dim)),
+                    .child(mono(usage::thousands(*n), 13., p.dim)),
             );
         }
         if b.misses.is_empty() {
-            misses = misses.child(mono(NONE, 12.5, p.dim));
+            misses = misses.child(mono(NONE, 13., p.dim));
         }
         let hit_plot = v_flex()
             .w(px(span(8.)))
@@ -576,7 +582,7 @@ impl AppView {
                         .child(lat(Chart::Ttft, &b.ttft, &b.ttft_axes, "T I M E   T O   F I R S T   T O K E N"))
                         .child(lat(Chart::Total, &b.total, &b.total_axes, "T O T A L")),
                 )
-                .child(mono(b.split.clone(), 12.5, p.prose).mt(px(6.)).whitespace_normal())
+                .child(mono(b.split.clone(), 13., p.prose).mt(px(6.)).whitespace_normal())
                 .child(display("T O T A L   T I M E   B Y   C O N T E X T   S I Z E", 12., p.dim).mt(px(16.)))
                 .child(
                     v_flex()
@@ -599,7 +605,7 @@ impl AppView {
             let mut r = h_flex().gap(px(2.)).items_center().child(mono(days[d], 12., p.dim).w(px(38.)));
             for &n in row {
                 let step = if b.heat_max == 0 || n == 0 { 0 } else { ((n as f64 / b.heat_max as f64) * 5.).ceil() as usize };
-                r = r.child(div().w(px(16.)).h(px(14.)).bg(if step == 0 { p.hair.opacity(0.5) } else { p.s1.opacity(step as f32 / 5.) }));
+                r = r.child(div().w(px(16.)).h(px(14.)).bg(crate::chart::heat(p.hair, p.s1, step)));
             }
             grid = grid.child(r);
         }
@@ -640,16 +646,16 @@ impl AppView {
                     .items_center()
                     .border_t_1()
                     .border_color(p.hair)
-                    .child(mono(a.name.clone(), 12.5, p.prose).w(px(140.)).overflow_hidden().text_ellipsis())
-                    .child(mono(usage::count_or(a.runs), 12.5, p.prose).w(px(70.)))
-                    .child(mono(usage::count_or(a.requests), 12.5, p.prose).w(px(90.)))
+                    .child(mono(a.name.clone(), 13., p.prose).w(px(140.)).overflow_hidden().text_ellipsis())
+                    .child(mono(usage::count_or(a.runs), 13., p.prose).w(px(70.)))
+                    .child(mono(usage::count_or(a.requests), 13., p.prose).w(px(90.)))
                     .child(
                         h_flex()
                             .w(px(220.))
                             .gap(px(8.))
                             .items_center()
                             .child(div().w(px(90.)).h(px(6.)).bg(p.hair).child(div().h_full().w(relative(frac)).bg(p.s2)))
-                            .child(mono(usage::money_or(a.spend), 12.5, p.cost)),
+                            .child(mono(usage::money_or(a.spend), 13., p.cost)),
                     )
                     .child(mono(a.models.join(", "), 12., p.dim).flex_1().min_w_0().overflow_hidden().text_ellipsis()),
             );
@@ -658,7 +664,7 @@ impl AppView {
             agents = agents.child(mono(format!("+ {} more agents", b.agents.len() - 20), 12., p.dim).pt(px(6.)));
         }
         if b.agents.is_empty() {
-            agents = agents.child(mono(NONE, 12.5, p.dim).pt(px(6.)));
+            agents = agents.child(mono(NONE, 13., p.dim).pt(px(6.)));
         }
         out = out.child(
             v_flex()
@@ -704,14 +710,14 @@ impl AppView {
                             .text_ellipsis(),
                     )
                     .when(!narrow, |d| {
-                        d.child(mono(s.host.clone().unwrap_or_else(|| NONE.into()), 12.5, p.dim).w(px(70.))).child(
-                            mono(s.created.map(|t| usage::day_label(&usage::ny_day(t))).unwrap_or_else(|| NONE.into()), 12.5, p.dim)
+                        d.child(mono(s.host.clone().unwrap_or_else(|| NONE.into()), 13., p.dim).w(px(70.))).child(
+                            mono(s.created.map(|t| usage::day_label(&usage::ny_day(t))).unwrap_or_else(|| NONE.into()), 13., p.dim)
                                 .w(px(70.)),
                         )
                     })
-                    .child(mono(usage::money_or(s.spend), 12.5, p.cost).w(px(150.)))
-                    .child(mono(usage::count_or(s.workers.filter(|w| *w > 0)), 12.5, p.prose).w(px(70.)))
-                    .child(mono(usage::count_or(s.requests), 12.5, p.prose).w(px(80.)))
+                    .child(mono(usage::money_or(s.spend), 13., p.cost).w(px(150.)))
+                    .child(mono(usage::count_or(s.workers.filter(|w| *w > 0)), 13., p.prose).w(px(70.)))
+                    .child(mono(usage::count_or(s.requests), 13., p.prose).w(px(80.)))
                     .when_some(live, |d, id| {
                         d.cursor_pointer().hover(|d| d.bg(p.user)).on_click(cx.listener(move |this, _, _, cx| {
                             let fallback = this.model.tab_fallback(&id);
@@ -757,10 +763,10 @@ impl AppView {
                     .items_center()
                     .border_t_1()
                     .border_color(p.hair)
-                    .child(mono(s.host.clone(), 12.5, p.prose).w(px(80.)))
-                    .child(mono(s.kind.clone(), 12.5, p.prose).w(px(120.)))
-                    .child(mono(size, 12.5, p.prose).w(px(90.)))
-                    .child(mono(read, 12.5, p.prose).w(px(90.)))
+                    .child(mono(s.host.clone(), 13., p.prose).w(px(80.)))
+                    .child(mono(s.kind.clone(), 13., p.prose).w(px(120.)))
+                    .child(mono(size, 13., p.prose).w(px(90.)))
+                    .child(mono(read, 13., p.prose).w(px(90.)))
                     .child(mono(crate::named::home_short(&s.path), 12., p.dim).flex_1().min_w_0().overflow_hidden().text_ellipsis()),
             );
         }
@@ -769,9 +775,9 @@ impl AppView {
                 .pt(px(SECTION))
                 .gap(px(8.))
                 .child(title("D A T A", p))
-                .child(mono(format!("stops: {}", b.stops), 12.5, p.prose).whitespace_normal())
-                .child(mono(b.health_line.clone(), 12.5, p.prose))
-                .child(mono(b.ingest_line.clone(), 12.5, p.prose).whitespace_normal())
+                .child(mono(format!("stops: {}", b.stops), 13., p.prose).whitespace_normal())
+                .child(mono(b.health_line.clone(), 13., p.prose))
+                .child(mono(b.ingest_line.clone(), 13., p.prose).whitespace_normal())
                 .child(sources.mt(px(8.)))
                 .child(note("Folders (spend by the folder a session began in) need the store's folders endpoint: not drawn.", p)),
         );

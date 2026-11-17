@@ -10,6 +10,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{AppView, mono};
+use crate::fonts::TextPx as _;
+use crate::fonts::size;
 use crate::theme::Palette;
 
 /// One item: what it does, what it says (and an emphasised word after,
@@ -141,59 +143,59 @@ impl<A: Copy> Menu<A> {
     }
 }
 
-/// The menu's box, in the gear menu's style; `pick` acts on an item
-/// (a click, with its count: [`How`]; or Enter through [`Menu::key`]), a
-/// mouse-down outside closes it.
+/// The menu on the overlay box (design.md §8.8); `pick` acts on an item
+/// (a click, with its count: [`How`]; or Enter through [`Menu::key`]),
+/// `close` takes a mouse-down outside it.
 pub(crate) fn render<A: Copy + 'static>(
     id: &'static str,
     menu: &Menu<A>,
     p: &Palette,
     pick: fn(&mut AppView, A, How, &mut Window, &mut Context<AppView>),
+    close: fn(&mut AppView, &MouseDownEvent),
     cx: &Context<AppView>,
 ) -> Stateful<Div> {
-    let mut col = v_flex()
+    let mut col = crate::overlay::frame(v_flex(), p)
         .id(id)
         .font_family(crate::fonts::SANS)
         .min_w(px(236.))
         .max_w(px(360.))
         .py(px(4.))
-        .bg(p.card)
-        .border_1()
-        .border_color(p.edge)
         .occlude()
-        .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-            this.close_menu();
+        .on_mouse_down_out(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+            close(this, ev);
             cx.notify();
         }));
     for (i, it) in menu.items.iter().enumerate() {
         let on = it.enabled();
         let selected = menu.sel == Some(i);
         let act = it.act;
+        // The keyboard's row: the hover fill and a 1 px focus frame (§5).
         let mut row = h_flex()
             .id(("menu-item", i))
+            .relative()
             .h(px(32.))
-            .px(px(14.))
+            .px(px(16.))
             .gap(px(24.))
             .items_center()
             .whitespace_nowrap()
-            .when(selected, |d| d.bg(p.raised))
+            .when(selected, |d| d.bg(p.card_hi).child(div().absolute().inset_0().border_1().border_color(p.focus_k)))
             .child(
                 h_flex()
                     .flex_1()
                     .gap(px(8.))
-                    .text_size(px(14.))
+                    .text_px(size::UI)
                     .text_color(if on { p.ink } else { p.dim_k })
                     .child(it.label.clone())
-                    .when_some(it.confirm.clone(), |d, c| d.child(crate::app::display(c, 12., p.err_k))),
+                    .when_some(it.confirm.clone(), |d, c| d.child(crate::app::display(c, size::D_S, p.err_k))),
             )
-            .when_some(it.key, |d, k| d.child(mono(k, 12., p.dim_k)));
+            .when_some(it.key, |d, k| d.child(mono(k, size::META, p.dim_k)));
         if on {
-            row = row.cursor_pointer().hover(|d| d.bg(p.raised)).on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+            row = row.cursor_pointer().hover(|d| d.bg(p.card_hi)).on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 cx.stop_propagation();
                 pick(this, act, How::Click(ev.click_count()), window, cx);
             }));
         } else if let Some(why) = it.why_not.clone() {
-            row = row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(why.clone()).build(window, cx));
+            row = row.tooltip(move |window, cx| crate::overlay::tip(why.clone(), window, cx));
         }
         col = col.child(row);
     }

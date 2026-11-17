@@ -111,38 +111,6 @@ impl Liveness {
         }
     }
 
-    /// A worker from its two sources: its session's list (`status`,
-    /// `attached`, `known` as for [`Liveness::of`]) and its view's own
-    /// word, polled from the daemon ([`Liveness::of_view`]). The list's,
-    /// but the view's when the list says no more than a start (the history
-    /// alone holds it, or a re-attach demoted a running worker until it is
-    /// heard again), and when the view says how it ended before the
-    /// session's stream does. A view gone (offline) says neither: the
-    /// list's start stands. Not attached, a running view is as last seen.
-    pub fn of_sources(status: Option<Status>, view: Option<Self>, attached: bool, known: bool) -> Self {
-        let view = view.map(|v| if v == Liveness::Running && !attached { Liveness::LastSeen } else { v });
-        match (status, view) {
-            (None, Some(v)) => v,
-            (Some(Status::Started), Some(v)) if v != Liveness::Gone => v,
-            (Some(s), Some(v)) if !s.terminal() && v.ended() && v != Liveness::Gone => v,
-            _ => Liveness::of(status, attached, known),
-        }
-    }
-
-    /// From a worker's view's own word ([`crate::watch::Worker::state`]),
-    /// for a worker its session's list does not say (`None`: nothing yet).
-    pub fn of_view(word: &str) -> Option<Self> {
-        Some(match word {
-            "running" => Liveness::Running,
-            "completed" => Liveness::Done,
-            "failed" => Liveness::Failed,
-            "cancelled" => Liveness::Cancelled,
-            "timed out" => Liveness::TimedOut,
-            "gone" | "offline" => Liveness::Gone,
-            _ => return None,
-        })
-    }
-
     /// It will do nothing more: nothing to steer or cancel.
     pub fn ended(self) -> bool {
         matches!(self, Liveness::Done | Liveness::Failed | Liveness::Cancelled | Liveness::TimedOut | Liveness::Gone)
@@ -185,7 +153,8 @@ impl Status {
         }
     }
 
-    fn word(s: &str) -> Option<Self> {
+    /// The daemon's status word (a row's, a watch page's).
+    pub fn word(s: &str) -> Option<Self> {
         Some(match s {
             "running" => Status::Running,
             "completed" => Status::Done,
@@ -255,6 +224,10 @@ pub struct Worker {
     /// Its end was read from a `SubagentDone`'s text ([`done_status`]):
     /// the daemon's own word may still correct it, once.
     guessed: bool,
+    /// Its end was its view's page's ([`Subagents::heard_page`]): a page
+    /// says only the word, so the daemon's own end sources (its stream,
+    /// rows, result, completion) still write how it ended, once.
+    by_page: bool,
 }
 
 impl Worker {
@@ -263,26 +236,55 @@ impl Worker {
     }
 
     /// Whether a source may still write how it ended (`sure`: the daemon's
-    /// own word, not a guess from text): it has not ended, or its end was
-    /// a guess and this source is sure.
+    /// own word, not a guess from text): it has not ended, its end was a
+    /// page's (the word alone), or its end was a guess and this source is
+    /// sure.
     fn open(&self, sure: bool) -> bool {
-        !self.ended() || (sure && self.guessed)
+        !self.ended() || self.by_page || (sure && self.guessed)
+    }
+
+    /// An end (a guess, or a page's word alone) that a sure source
+    /// corrects.
+    fn corrects(&self, s: Status, sure: bool) -> bool {
+        self.status.is_some_and(|c| c.terminal() && s.terminal() && sure && (self.guessed || self.by_page))
+    }
+
+    /// A sure source that names the end a guess held: the guess was right,
+    /// and its reason and run (`SubagentDone`'s `duration_secs`, the
+    /// daemon's own number) stand where the source says none.
+    fn confirms(&self, s: Status) -> bool {
+        self.guessed && self.status == Some(s)
     }
 
     /// A weaker source never overrides a stronger one, and an end is
     /// final, unless it was a guess and a sure source says how it ended.
+    fn may_take(&self, s: Status, sure: bool) -> bool {
+        self.corrects(s, sure) || self.status.is_none_or(|c| !c.terminal() && c.rank() <= s.rank())
+    }
+
     fn set_status(&mut self, s: Status, reason: Option<String>, sure: bool) {
-        if let Some(c) = self.status {
-            let correct = c.terminal() && s.terminal() && sure && self.guessed;
-            if !correct && (c.terminal() || c.rank() > s.rank()) {
-                return;
+        // A page's end, then a guess from text: the page's word stands (it
+        // is the daemon's state). A guess that agrees closes the end: its
+        // reason and its run (`duration_secs`) are the daemon's own, and no
+        // later source rewrites them.
+        if self.by_page && !sure && self.ended() {
+            if self.status == Some(s) {
+                self.reason = reason.or(self.reason.take());
+                self.by_page = false;
             }
-            if correct {
-                self.reason = None;
-            }
+            return;
+        }
+        if !self.may_take(s, sure) {
+            return;
+        }
+        // A sure source that names another end: the guess's reason goes
+        // with it. One that agrees keeps it if it says none.
+        if self.corrects(s, sure) && self.status != Some(s) {
+            self.reason = None;
         }
         self.status = Some(s);
         self.guessed = s.terminal() && !sure;
+        self.by_page = false;
         if reason.is_some() {
             self.reason = reason;
         }
@@ -312,7 +314,9 @@ impl Worker {
     fn merge(&mut self, o: Worker) {
         self.id = self.id.or(o.id);
         if let Some(s) = o.status {
+            let took = self.may_take(s, !o.guessed);
             self.set_status(s, o.reason, !o.guessed);
+            self.by_page |= took && o.by_page;
         }
         let fill = |a: &mut String, b: String| {
             if a.is_empty() {
@@ -819,6 +823,46 @@ impl Subagents {
         out
     }
 
+    /// Worker `id`'s own pages (its view, polled from the daemon) say
+    /// `status`: a live source, as its rows are, so the list holds the one
+    /// state a worker has (a re-attach's demoted start is lifted by its
+    /// next page; how it ended may come first from its pages). The caller
+    /// has checked the view is of the worker `id` names now. A page's
+    /// "running" knows nothing of a cancel on its way: CANCELLING stays.
+    /// A page's end is the word alone: the daemon's own end sources still
+    /// say why and how long ([`Worker::by_page`]). Only a worker the list
+    /// knows (a view polled before the history came makes no row).
+    /// Whether it changed anything.
+    pub fn heard_page(&mut self, id: u64, status: Status) -> bool {
+        let held = match self.by_id.get(&id).and_then(|t| self.calls.get(t)) {
+            Some(c) => &c.w,
+            None => match self.orphans.get(&id) {
+                Some(w) => w,
+                None => return false,
+            },
+        };
+        let cancelling = held.status == Some(Status::Cancelling);
+        let ended = held.ended() && !held.guessed;
+        if ended || held.status == Some(status) || !held.may_take(status, true) || (cancelling && status == Status::Running) {
+            return false;
+        }
+        self.update(id, |w| {
+            let was_running = w.status.is_some_and(Status::running);
+            w.set_status(status, None, true);
+            w.by_page = w.ended();
+            // Its run until the daemon says it: its age at the page's end
+            // (a running worker's start is the daemon's clock), not its
+            // last running row's.
+            if w.by_page
+                && was_running
+                && let Some(t) = w.started
+            {
+                w.elapsed = Some(t.elapsed().as_secs_f64());
+            }
+        });
+        true
+    }
+
     /// Worker `id`'s state, if known (the newest call's that has it).
     pub fn status(&self, id: u64) -> Option<Status> {
         match self.by_id.get(&id).and_then(|t| self.calls.get(t)) {
@@ -917,6 +961,10 @@ impl Subagents {
             w.demote();
         }
         let ids: Vec<String> = self.calls.iter_mut().filter_map(|(id, c)| c.w.demote().then(|| id.clone())).collect();
+        if !ids.is_empty() {
+            let n: Vec<String> = ids.iter().filter_map(|t| self.calls.get(t)?.w.id).map(|n| format!("sa_{n}")).collect();
+            log::debug!(target: "synaps_desktop::workers", "re-attached: {} started until heard again", n.join(", "));
+        }
         for id in ids {
             self.changed(&id);
         }
@@ -987,7 +1035,9 @@ impl Subagents {
                         if w.open(false) {
                             w.set_status(s, reason, false);
                             w.elapsed = Some(*duration_secs);
-                            if s == Status::Done {
+                            // The end held, not the guess: a page's other
+                            // word keeps its result line empty.
+                            if w.status == Some(Status::Done) {
                                 w.result = first_line(result_preview);
                                 w.preview(keep(result_preview));
                             }
@@ -1093,8 +1143,9 @@ impl Subagents {
         let tools = v.get("tool_count").and_then(Value::as_u64).map(|t| t as u32);
         self.update(n, |w| {
             if w.open(true) {
+                let kept = w.confirms(s);
                 w.set_status(s, reason, true);
-                w.elapsed = secs.or(w.elapsed);
+                w.elapsed = if kept { w.elapsed.or(secs) } else { secs.or(w.elapsed) };
                 w.tools = tools.or(w.tools);
             }
             w.tools = w.tools.or(tools);
@@ -1122,8 +1173,9 @@ impl Subagents {
             let Some(c) = completion(body) else { continue };
             self.update(c.n, |w| {
                 if w.open(true) {
+                    let kept = w.confirms(c.status);
                     w.set_status(c.status, c.reason, true);
-                    w.elapsed = c.secs.or(w.elapsed);
+                    w.elapsed = if kept { w.elapsed.or(c.secs) } else { c.secs.or(w.elapsed) };
                 }
                 if w.result.is_empty() {
                     w.result = c.preview;
@@ -1206,6 +1258,7 @@ impl Subagents {
             if w.ended() && !(ends && w.open(true)) {
                 return;
             }
+            let kept = status.as_ref().is_some_and(|(s, _)| w.confirms(*s)) && w.elapsed.is_some();
             if let Some((st, reason)) = status {
                 w.set_status(st, reason, true);
             }
@@ -1213,8 +1266,9 @@ impl Subagents {
             if let Some(e) = elapsed.filter(|_| !w.ended() && w.started.is_none()) {
                 w.started = Instant::now().checked_sub(Duration::from_secs_f64(e.max(0.)));
             }
-            // A finished worker's run: its age less the time since it ended.
-            if let Some(e) = elapsed {
+            // A finished worker's run: its age less the time since it ended
+            // (a guess it confirms keeps the daemon's `duration_secs`).
+            if let Some(e) = elapsed.filter(|_| !kept) {
                 w.elapsed = Some(match (w.ended(), ago) {
                     (true, Some(a)) => (e - a).max(0.),
                     _ => e,
@@ -1295,6 +1349,18 @@ impl Subagents {
     /// Change worker `n`: under its call, else as an orphan.
     fn update(&mut self, n: u64, f: impl FnOnce(&mut Worker)) {
         self.revision += 1;
+        // `SYNAPS_DESKTOP_LOG=debug`: each change of how it is or how it
+        // ended, whichever source said it.
+        let f = |w: &mut Worker| {
+            if !log::log_enabled!(target: "synaps_desktop::workers", log::Level::Debug) {
+                return f(w);
+            }
+            let before = (w.status, w.ended().then_some(w.elapsed).flatten(), w.reason.clone());
+            f(w);
+            if (w.status, w.ended().then_some(w.elapsed).flatten(), w.reason.as_ref()) != (before.0, before.1, before.2.as_ref()) {
+                log::debug!(target: "synaps_desktop::workers", "sa_{n}: {:?} -> {:?}, ran {:?}, reason {:?}", before.0, w.status, w.elapsed, w.reason);
+            }
+        };
         match self.by_id.get(&n).cloned() {
             Some(t) if self.calls.contains_key(&t) => {
                 f(&mut self.calls.get_mut(&t).expect("present").w);
@@ -1396,6 +1462,7 @@ mod tests {
 
     use super::{CARD_LINES, Liveness, Status, Subagents, View, completion_note, fmt_secs};
     use crate::glyph::{self, Family};
+    use std::time::{Duration, Instant};
 
     fn ev(s: &mut Subagents, v: Value) {
         s.on_session(&decode_event(&v).unwrap());
@@ -1468,6 +1535,117 @@ mod tests {
     }
     fn word(s: &Subagents, id: &str) -> Option<&'static str> {
         s.view(id).map(|v| state(v).0)
+    }
+
+    /// Its view's pages are a live source of the list (Shady M2): a
+    /// re-attach's start is lifted, how it ended may come first, an end
+    /// stays, and a cancel on its way stays CANCELLING.
+    #[test]
+    fn a_workers_pages_are_heard_by_its_list() {
+        let mut s = Subagents::default();
+        tool_use(&mut s, "t1", "subagent_start", json!({"agent": "scout", "task": "look"}));
+        result(&mut s, "t1", &handle(1, "scout"));
+        rows(&mut s, json!([row(1, "scout", json!("running"), 3.0, None, "ls", 1)]));
+        s.reattached();
+        assert_eq!(s.status(1), Some(Status::Started), "demoted until heard again");
+        assert!(s.heard_page(1, Status::Running));
+        assert_eq!(s.status(1), Some(Status::Running));
+        assert!(!s.heard_page(1, Status::Running), "the same word changes nothing (4 pages a second)");
+        let mut cancel = row(1, "scout", json!("running"), 4.0, None, "ls", 1);
+        cancel["cancel_requested"] = json!(true);
+        rows(&mut s, json!([cancel]));
+        assert_eq!(s.status(1), Some(Status::Cancelling));
+        assert!(!s.heard_page(1, Status::Running), "a page's running knows nothing of the cancel");
+        assert_eq!(s.status(1), Some(Status::Cancelling));
+        assert!(s.heard_page(1, Status::Cancelled), "its pages said how it ended first");
+        assert_eq!(s.status(1), Some(Status::Cancelled));
+        assert!(!s.heard_page(1, Status::Running) && s.status(1) == Some(Status::Cancelled), "ended stays ended");
+    }
+
+    /// A page's end is the word alone (Shady H1): the daemon's own end
+    /// sources still say why and how long, once each: the stream's
+    /// `SubagentDone`, its rows, a completion event, a collect. A page
+    /// never takes an end back, and a view the list has no worker for
+    /// makes none.
+    #[test]
+    fn a_pages_end_leaves_room_for_the_daemons() {
+        let fresh = |n: u64| {
+            let mut s = Subagents::default();
+            tool_use(&mut s, "t1", "subagent_start", json!({"agent": "scout", "task": "look"}));
+            result(&mut s, "t1", &handle(n, "scout"));
+            rows(&mut s, json!([row(n, "scout", json!("running"), 3.0, None, "ls", 1)]));
+            s
+        };
+        let end = |s: &Subagents| s.info(1).map(|i| (i.status, i.line, i.elapsed.map(|e| (e * 10.).round() / 10.)));
+        // The stream's end: its reason and its duration. Until then its run
+        // is its age at the page's end (its last row, at 3 s, is stale).
+        let mut s = fresh(1);
+        s.update(1, |w| w.started = Instant::now().checked_sub(Duration::from_secs(20)));
+        assert!(s.heard_page(1, Status::Failed), "its page said it first");
+        assert_eq!(end(&s), Some((Some(Status::Failed), String::new(), Some(20.0))), "the word alone: no reason, its age then");
+        done(&mut s, 1, "ERROR: boom", 12.5);
+        assert_eq!(end(&s), Some((Some(Status::Failed), "reason: boom".into(), Some(12.5))), "why and how long");
+        // The done agreed with the page: the end is the daemon's, a row
+        // after it (no reason, its age less the time since) changes nothing.
+        rows(&mut s, json!([row(1, "scout", json!("failed"), 30.0, Some(4.0), "ls", 2)]));
+        assert_eq!(end(&s), Some((Some(Status::Failed), "reason: boom".into(), Some(12.5))), "page, done, then a row");
+        assert!(!s.heard_page(1, Status::Done) && s.status(1) == Some(Status::Failed), "a page never takes an end back");
+        // A guess that disagrees with the page keeps the page's word, and
+        // writes no result under it.
+        let mut s = fresh(1);
+        s.heard_page(1, Status::Cancelled);
+        done(&mut s, 1, "partial notes", 9.0);
+        assert_eq!(end(&s).map(|e| (e.0, e.2)), Some((Some(Status::Cancelled), Some(9.0))));
+        let i = s.info(1).unwrap();
+        assert!(i.result.is_empty() && !i.line.contains("partial"), "no result under CANCELLED: {:?}", (i.result, i.line));
+        // A guess (no page) that its row confirms: the guess's reason and
+        // the daemon's duration stand; the row has neither.
+        let mut s = fresh(1);
+        done(&mut s, 1, "ERROR: boom", 12.5);
+        rows(&mut s, json!([row(1, "scout", json!("failed"), 30.0, Some(4.0), "ls", 2)]));
+        assert_eq!(end(&s), Some((Some(Status::Failed), "reason: boom".into(), Some(12.5))), "done, then a row that agrees");
+        // A worker the list held as started (a re-attach) has no run to
+        // freeze: its page's end leaves what it had.
+        let mut s = fresh(1);
+        s.update(1, |w| {
+            w.demote();
+        });
+        s.heard_page(1, Status::Done);
+        assert_eq!(end(&s).map(|e| e.2), Some(Some(3.0)));
+        // A success: its result kept.
+        let mut s = fresh(1);
+        s.heard_page(1, Status::Done);
+        done(&mut s, 1, "Found it\nall of it", 7.0);
+        assert_eq!(end(&s), Some((Some(Status::Done), "Found it".into(), Some(7.0))));
+        assert_eq!(s.info(1).map(|i| i.result), Some("Found it\nall of it".into()));
+        // Its rows: the run (age less the time since it ended), the reason.
+        let mut s = fresh(1);
+        s.heard_page(1, Status::Failed);
+        rows(&mut s, json!([row(1, "scout", json!({"failed": "disk full"}), 30.0, Some(4.0), "ls", 2)]));
+        assert_eq!(end(&s), Some((Some(Status::Failed), "reason: disk full".into(), Some(26.0))));
+        // A completion event in the history.
+        let mut s = fresh(1);
+        s.heard_page(1, Status::Failed);
+        s.append(&[user(&completion_event(1, "scout", "failed", 5.5, Some("boom"), ""))]);
+        assert_eq!(end(&s), Some((Some(Status::Failed), "reason: boom".into(), Some(5.5))));
+        // A collect's answer.
+        let mut s = fresh(1);
+        s.heard_page(1, Status::Done);
+        tool_use(&mut s, "c1", "subagent_collect", json!({"handle_id": "sa_1"}));
+        result(
+            &mut s,
+            "c1",
+            &json!({"handle_id": "sa_1", "status": "completed", "output": "Done: 3 files", "elapsed_secs": 8.0, "tool_count": 4})
+                .to_string(),
+        );
+        assert_eq!(end(&s), Some((Some(Status::Done), "Done: 3 files".into(), Some(8.0))));
+        assert_eq!(s.info(1).map(|i| (i.tools, i.whole)), Some((Some(4), true)));
+        // Once the daemon said it, the next end source changes nothing.
+        done(&mut s, 1, "ERROR: late", 1.0);
+        assert_eq!(end(&s), Some((Some(Status::Done), "Done: 3 files".into(), Some(8.0))));
+        // No worker of that id in the list: no row made.
+        let mut s = Subagents::default();
+        assert!(!s.heard_page(7, Status::Running) && s.status(7).is_none() && s.live().is_empty());
     }
 
     /// What the hover card and the menu read: the task's first lines (the

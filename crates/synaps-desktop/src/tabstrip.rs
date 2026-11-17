@@ -9,12 +9,12 @@
 //! arrows at the ends (never a second row).
 
 use gpui_kit::component::h_flex;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{AppView, display, mono};
 use crate::fonts;
+use crate::fonts::TextPx as _;
 use crate::glyph::{self, Glyph, Ground};
 use crate::rail::State;
 use crate::subagents::Liveness;
@@ -103,7 +103,7 @@ impl Render for TabDrag {
             .bg(self.bg)
             .border_1()
             .border_color(self.edge)
-            .text_size(px(12.5))
+            .text_px(crate::fonts::size::TITLE)
             .text_color(self.fg)
             .whitespace_nowrap()
             .overflow_hidden()
@@ -240,7 +240,7 @@ impl AppView {
                 .flex_none()
                 .justify_center()
                 .items_center()
-                .child(mono(text, 11., if on { p.prose_ch } else { p.dim_ch }))
+                .child(mono(text, crate::fonts::size::META, if on { p.prose_ch } else { p.dim_ch }))
                 .when(on, |d| d.cursor_pointer().hover(|d| d.bg(p.raised)))
         };
         h_flex()
@@ -280,7 +280,7 @@ impl AppView {
                         .cursor_pointer()
                         .child(mono("+", 15., p.dim_ch).hover(|d| d.text_color(p.ink)))
                         .hover(|d| d.bg(p.raised))
-                        .tooltip(|window, cx| Tooltip::new(new_tip()).build(window, cx))
+                        .tooltip(|window, cx| crate::overlay::tip(new_tip(), window, cx))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.create();
                             cx.notify();
@@ -358,6 +358,7 @@ impl AppView {
         let menu_open = self.menu.is_some() || self.smenu.is_some();
         let close = h_flex()
             .id(("tab-x", id as usize))
+            .debug_selector(|| format!("tab {id} x"))
             .group("tab-x")
             .w(px(18.))
             .h_full()
@@ -375,6 +376,7 @@ impl AppView {
             }));
         h_flex()
             .id(("tab", id as usize))
+            .debug_selector(|| format!("tab {id}"))
             .group("tab")
             .relative()
             .flex_none()
@@ -393,17 +395,23 @@ impl AppView {
             .child(match kind {
                 Kind::Settings => crate::views::gear(if on { p.you_bar } else { p.dim_ch }, None),
                 Kind::Usage => crate::views::bars_glyph(if on { p.you_bar } else { p.dim_ch }),
-                Kind::Session | Kind::Worker => div().flex().flex_none().size(px(10.)).children(g.map(|g| glyph::draw(g, mark_color))),
+                Kind::Session | Kind::Worker => div()
+                    .flex()
+                    .flex_none()
+                    .size(px(10.))
+                    .debug_selector(|| format!("tab {id} glyph"))
+                    .children(g.map(|g| glyph::draw(g, mark_color))),
             })
             .child(
                 div()
+                    .debug_selector(|| format!("tab {id} title"))
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .when(named, |d| d.font_family(fonts::MONO).text_size(px(12.)))
-                    .when(!named, |d| d.text_size(px(13.)))
+                    .when(named, |d| d.font_family(fonts::MONO).text_px(12.))
+                    .when(!named, |d| d.text_px(13.))
                     .text_color(title_color)
                     .child(label),
             )
@@ -424,7 +432,7 @@ impl AppView {
                         (_, Some(meta)) => format!("{} · {name}", meta.tooltip(&tip)),
                         _ => format!("{tip} · {name}"),
                     };
-                    Tooltip::new(text).build(window, cx)
+                    crate::overlay::tip(text, window, cx)
                 })
             })
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {

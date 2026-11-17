@@ -17,12 +17,12 @@
 
 use std::time::Instant;
 
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{AppView, WORKER_KEY, column, display, mono};
+use crate::fonts::TextPx as _;
 use crate::fonts::{self, label};
 use crate::glyph::{self, Glyph, Ground};
 use crate::menu::At;
@@ -271,7 +271,7 @@ impl AppView {
             .px(px(m.pad_x))
             .items_center()
             .whitespace_nowrap()
-            .text_size(px(m.meta))
+            .text_px(m.meta)
             // The watched worker (the composer steers it): its bar is the
             // tray's ([`AppView::render_tray`]).
             .when(watched, |d| d.bg(p.tool_out))
@@ -297,7 +297,7 @@ impl AppView {
             .children(self.render_menu_at_row(r.id, p, cx));
         if !r.watchable {
             let tip = r.tip.clone();
-            return row.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)).into_any_element();
+            return row.tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)).into_any_element();
         }
         let who2 = who.clone();
         // No card over an open menu.
@@ -350,12 +350,12 @@ impl AppView {
                     .overflow_hidden()
                     .text_ellipsis()
                     .font_family(fonts::MONO)
-                    .text_size(px(m.meta))
+                    .text_px(m.meta)
                     .text_color(p.prose_k)
                     .when_some(gist.filter(|_| !lay.tight), |d, g| d.child(g)),
             )
             .child(div().flex_none().ml(px(12.)).child(glyph::reveal(glyph::GO, "needs-stub", "needs-stub", true, p.dim_k, p.ink)))
-            .tooltip(|window, cx| Tooltip::new("A prompt waits in this session: answer it there.").build(window, cx))
+            .tooltip(|window, cx| crate::overlay::tip("A prompt waits in this session: answer it there.", window, cx))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.open_parent_card(cx);
                 cx.notify();
