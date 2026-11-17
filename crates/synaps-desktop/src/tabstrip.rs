@@ -340,11 +340,7 @@ impl AppView {
             slots.push(Slot::Tab(ix, w, opening));
             ghosts_after(Some(t.id), &mut slots);
         }
-        for k in 0..ghosts.len() {
-            if !placed[k] {
-                slots.push(Slot::Ghost(k));
-            }
-        }
+        slots.extend(placed.iter().enumerate().filter(|(_, p)| !**p).map(|(k, _)| Slot::Ghost(k)));
         // The indicator: a newly visible tab's fill and bar spring there
         // from where they were drawn (`snap`); at rest they follow the
         // layout at once (a resize, an arrow scroll).

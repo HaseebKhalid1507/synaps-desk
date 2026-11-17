@@ -199,8 +199,6 @@ pub(crate) const fn key(space: u64, id: u64) -> u64 {
     space | (id & 0xFFFF_FFFF_FFFF)
 }
 
-/// `sheet`: panels, the dock, section folds (fluid.md §2.1).
-pub(crate) const SHEET_RESPONSE: f32 = 0.36;
 /// A hover fill comes on over this (fluid.md §3.9)…
 pub(crate) const HOVER_IN: Duration = Duration::from_millis(60);
 /// …and goes off over this: sweeping down the rail leaves a trail.
@@ -208,8 +206,6 @@ pub(crate) const HOVER_OUT: Duration = Duration::from_millis(160);
 /// A press holds a control's content this far down (no div scale in GPUI:
 /// a 1 px travel, fluid.md §3.9).
 pub(crate) const PRESS: f32 = 1.;
-/// A key's activation shows the press look this long.
-pub(crate) const KEY_PRESS: Duration = Duration::from_millis(90);
 /// An overlay rises this far from its anchor side as it enters (`rise`,
 /// fluid.md §2.3: 6, was motion.md's 4).
 pub(crate) const RISE_FLUID: f32 = 6.;
@@ -1442,12 +1438,6 @@ impl Motion {
         let Some((key, None)) = self.press.get() else { return false };
         self.press.set(Some((key, Some(self.now()))));
         true
-    }
-
-    /// A key activated control `key` (Enter, Space): the press look for
-    /// [`KEY_PRESS`], then let go.
-    pub(crate) fn key_press(&self, key: u64) {
-        self.press.set(Some((key, Some(self.now() + KEY_PRESS))));
     }
 
     /// Control `key`'s press this frame: its fill toward `press*` (1 held …

@@ -184,6 +184,7 @@ impl Phase {
 
 /// The menu in `phase` (fluid.md §3.10): live, its items answer the
 /// pointer ([`AppView::touch`]) and a click outside closes it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render<A: Copy + 'static>(
     id: &'static str,
     menu: &Menu<A>,
