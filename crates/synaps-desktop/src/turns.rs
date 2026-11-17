@@ -835,14 +835,20 @@ impl AppView {
         let view = match (keep, kept) {
             (Keep::Same, Some(v)) => v,
             (Keep::Append, Some(v)) => {
-                v.update(cx, |s, cx| s.set_text(text, cx));
+                // Text streamed in: its words start at 70 % and reach full
+                // colour (fluid.md §3.4; `motion::text_motion`, the one
+                // policy). Not in low power (the agent's motion stops).
+                let motion = if self.fx.fluid() { motion::text_motion() } else { Default::default() };
+                v.update(cx, |s, cx| {
+                    s.set_motion(motion);
+                    s.set_text(text, cx)
+                });
                 v
             }
             _ => {
-                // No `TextViewMotion` (`TextView::motion`): the kit's stream
-                // fade stays at its zero default. A glyph that starts
-                // transparent is a delayed glyph (motion.md rule 1); the
-                // write head marks where the agent writes instead.
+                // A view made with its text (history, a new row) has no
+                // motion policy: what it starts with is not streamed, and
+                // history never animates.
                 let v = cx.new(|cx| TextViewState::markdown(text, cx));
                 let redraw = cx.observe(&v, |_, _, cx| cx.notify());
                 self.texts.borrow_mut().put(id, text.clone(), (v.clone(), redraw), now);
@@ -856,10 +862,10 @@ impl AppView {
     }
 
     /// One display row: its gap, its label and the block.
-    pub(crate) fn render_disp(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        let Some(&d) = self.disp.get(ix) else { return div().into_any_element() };
+    pub(crate) fn render_disp(&self, ix: usize, cx: &mut Context<Self>) -> RowParts {
+        let Some(&d) = self.disp.get(ix) else { return RowParts::empty() };
         let items = self.model.shown().items();
-        let (Some(item), Some(row)) = (items.get(d.item), self.rows.get(d.item)) else { return div().into_any_element() };
+        let (Some(item), Some(row)) = (items.get(d.item), self.rows.get(d.item)) else { return RowParts::empty() };
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
         let lay = self.layout;
@@ -929,10 +935,12 @@ impl AppView {
             }
         };
         let mut out = v_flex().w_full().pt(px(gap)).relative();
+        let mut hang = None;
         if let Some((text, color, top)) = who {
             let l = display(text, m.label, color).line_height(px(m.body_line));
             if lay.hang {
-                out = out.child(l.absolute().top(px(gap + top)).right(px(lay.column + m.hang)));
+                let id = d.id;
+                hang = Some((l.absolute().right(px(lay.column + m.hang)).debug_selector(move || format!("hang-label-{id}")), gap + top));
             } else {
                 out = out.child(l.mb(px((2. * m.r).round())));
             }
@@ -947,11 +955,42 @@ impl AppView {
             .filter(|k| *k > 0.)
             .map(|k| {
                 let mark = if item.kind == ItemKind::Thinking { p.think } else { p.run_mark };
-                div().absolute().left(px(-10.)).bottom_0().w(px(2.)).h(px((26. * m.r).round())).bg(motion::mix(p.canvas, mark, k))
+                div()
+                    .absolute()
+                    .left(px(-10.))
+                    .bottom_0()
+                    .w(px(2.))
+                    .h(px((26. * m.r).round()))
+                    .bg(motion::mix(p.canvas, mark, k))
+                    .debug_selector(|| "write-head".into())
             });
-        out.child(block).children(head).into_any_element()
+        RowParts { body: out.child(block), label: hang, head }
+    }
+}
+
+/// A transcript row as drawn ([`AppView::render_disp`]): its body, and what
+/// hangs in the gutter, left of the row's box: the `YOU`/`AGENT` label
+/// (positioned, and its top in the row) and the write head (on the row's
+/// bottom). A row that reveals or grows clips its body and not these
+/// ([`motion::grow_block`]).
+pub(crate) struct RowParts {
+    pub(crate) body: Div,
+    pub(crate) label: Option<(Div, f32)>,
+    pub(crate) head: Option<Div>,
+}
+
+impl RowParts {
+    fn empty() -> Self {
+        RowParts { body: div(), label: None, head: None }
     }
 
+    /// At rest: one element, as the row always was.
+    pub(crate) fn whole(self) -> AnyElement {
+        self.body.children(self.label.map(|(l, top)| l.top(px(top)))).children(self.head).into_any_element()
+    }
+}
+
+impl AppView {
     /// A run's summary row (design.md §8.2): the fold, `7 tools`, the tally
     /// (names in their hues), then the trail: counts · its worst outcome's
     /// glyph by the counts by outcome, worst first (`+3 −4 · ✕ 1 failed ·

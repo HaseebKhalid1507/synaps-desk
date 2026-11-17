@@ -2,7 +2,8 @@
 # one sanctioned way in, `#[allow]`ed where it is (the lint is `deny`,
 # `crates/synaps-desktop/Cargo.toml` `[lints]`; CI runs clippy):
 # - text sizes: `fonts::TextPx::text_px` (never under 12 px);
-# - opacity: a chart's data (`chart.rs`), never a state;
+# - opacity: a chart's data (`chart.rs`), and an arrival's lift from 70 %
+#   (`motion::lift`, cohesion/fluid.md law 3), never a state;
 # - tooltips: `overlay.rs` (the one overlay box).
 disallowed-methods = [
     { path = "gpui::Styled::text_size", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },

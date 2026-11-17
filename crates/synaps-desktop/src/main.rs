@@ -44,6 +44,7 @@ mod named;
 mod overlay;
 mod palettes;
 mod rail;
+mod scroll;
 mod scrollbar;
 mod settings;
 mod settings_view;
