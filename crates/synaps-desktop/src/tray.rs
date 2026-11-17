@@ -129,12 +129,24 @@ const TRAY: u64 = 1 << 61;
 /// Between chips, and between their lines.
 pub(crate) const CHIP_GAP: f32 = 8.;
 
-/// A chip's step, at most (polish.md §2.5), and its name.
-pub(crate) const STEP_CHARS: usize = 32;
+/// A chip's step, at most, and its name. polish.md §2.5 says 32: at 24 two
+/// chips share the 672 px column (a 10-character name, a cut step and a
+/// clock come to ~325 px).
+pub(crate) const STEP_CHARS: usize = 24;
 const NAME_CHARS: usize = 18;
-/// A chip's clock slot, in characters (`1m 23s`): it ticks without the
-/// chips reflowing.
-const CLOCK_CHARS: usize = 6;
+
+/// A chip's clock as this frame shows it: ticking while it runs (motion
+/// on), else as last reported.
+fn chip_clock(fx: &motion::Motion, r: &TrayRow) -> Option<SharedString> {
+    match &r.tick {
+        Some((_, t)) if fx.on() => {
+            let (s, next) = t.whole(fx.now());
+            fx.tick_clock(next);
+            Some(crate::subagents::fmt_whole(s).into())
+        }
+        _ => r.clock.clone(),
+    }
+}
 
 /// `s` in at most `n` characters, `…` last when cut.
 fn cut(s: &str, n: usize) -> String {
@@ -171,10 +183,10 @@ impl Chips {
 
 /// The parts' widths of a chip (mono at `m.meta`, every text box a whole
 /// pixel): its 1 px frame, padding 12 (the bar and 10) and 10, the
-/// glyph, its name, its step, its clock slot and the cancel × slot, 8
-/// apart. An armed cancel's `Cancel name? ··· C O N F I R M` takes the
-/// step's and the clock's room.
-pub(crate) fn chip_w(r: &TrayRow, armed: bool, m: &Metrics) -> f32 {
+/// glyph, its name, its step and its clock (`clock` chars), 8 apart; the
+/// cancel × shows over the clock on hover. An armed cancel's `Cancel
+/// name? ··· C O N F I R M` takes the step's and the clock's room.
+pub(crate) fn chip_w(r: &TrayRow, armed: bool, clock: usize, m: &Metrics) -> f32 {
     use crate::turns::text_w;
     let cw = m.meta * 0.6;
     let name = r.name.chars().count().min(NAME_CHARS);
@@ -184,12 +196,12 @@ pub(crate) fn chip_w(r: &TrayRow, armed: bool, m: &Metrics) -> f32 {
         w += 8. + text_w(name + 8, cw) + 6. + 20. + 8. + 13. * m.meta * 0.62;
     } else {
         w += 8. + text_w(chip_step(r).chars().count(), cw);
-        if r.clock.is_some() || r.tick.is_some() {
-            w += 8. + text_w(CLOCK_CHARS, cw);
+        if clock > 0 {
+            w += 8. + text_w(clock.max(2), cw);
+        } else if r.watchable {
+            // The × still has its place on hover.
+            w += 8. + 16.;
         }
-    }
-    if r.watchable {
-        w += 8. + 16.;
     }
     w.ceil()
 }
@@ -377,9 +389,12 @@ impl AppView {
                 Slot::Row(i) => {
                     let r = &self.tray.rows[i];
                     let armed = session.is_some_and(|s| self.model.cancels.armed(s, r.id, (r.call.as_deref(), &r.name), now));
-                    chip_w(r, armed, m)
+                    chip_w(r, armed, chip_clock(&self.fx, r).map_or(0, |c| c.chars().count()), m)
                 }
-                Slot::Ghost(g) => chip_w(&self.tray.ghosts[g].1, false, m),
+                Slot::Ghost(g) => {
+                    let r = &self.tray.ghosts[g].1;
+                    chip_w(r, false, r.clock.as_ref().map_or(0, |c| c.chars().count()), m)
+                }
             })
             .collect();
         (slots, widths)
@@ -514,16 +529,23 @@ impl AppView {
         let running = matches!(r.live, Liveness::Running | Liveness::Started) && !r.step.is_empty();
         let step_color = if running { p.sub_status_t } else { word_color };
         let who = Who::new(r.id, r.name.clone(), r.call.clone());
-        let clock = match &r.tick {
-            Some((_, t)) if self.fx.on() => {
-                let (s, next) = t.whole(self.fx.now());
-                self.fx.tick_clock(next);
-                Some(SharedString::from(crate::subagents::fmt_whole(s)))
-            }
-            _ => r.clock.clone(),
-        };
+        let clock = chip_clock(&self.fx, r);
         let x = r.watchable.then(|| self.cancel_x(&who, &r.handle, armed, watched, h, p, cx)).flatten();
         let (x, armed_el) = if armed { (None, x) } else { (x, None) };
+        // The × at the chip's end, over the clock: drawn on hover (a reveal,
+        // design.md §5; always on the watched chip), on the hover's ground.
+        let x = x.map(|x| {
+            div()
+                .absolute()
+                .right(px(4.))
+                .top_0()
+                .bottom_0()
+                .flex()
+                .items_center()
+                .when(watched, |d| d.bg(p.tool_out))
+                .group_hover("tray-row", |s| s.bg(p.tool_out))
+                .child(x)
+        });
         let row =
             h_flex()
                 .id(("tray-row", r.id as usize))
@@ -562,9 +584,7 @@ impl AppView {
                             .text_color(step_color)
                             .child(SharedString::from(chip_step(r).to_string())),
                     )
-                    .children(clock.map(|c| {
-                        div().flex_none().w(px(crate::turns::text_w(CLOCK_CHARS, m.meta * 0.6))).text_color(p.sub_time_t).child(c)
-                    }))
+                    .children(clock.map(|c| div().flex_none().text_color(p.sub_time_t).child(c)))
                 })
                 .children(x)
                 .child(bar)
