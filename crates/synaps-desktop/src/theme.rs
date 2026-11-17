@@ -26,8 +26,9 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::base::{TextViewDefaults, TextViewStyle};
 use gpui_kit::component::Theme;
-use gpui_kit::{App, FontWeight, Global, HighlightStyle, Hsla, Rems, StyleRefinement, Styled as _, px, rgb};
+use gpui_kit::{App, FontWeight, Global, HighlightStyle, Hsla, Rems, Rgba, StyleRefinement, Styled as _, px, rgb};
 
+use crate::fonts::TextPx as _;
 use crate::palettes::{self, Raw};
 use crate::rail::Bucket;
 
@@ -65,6 +66,9 @@ pub const HAIR: f64 = 1.14;
 pub const EDGE: f64 = 1.27;
 /// An overlay's outline and a control's on a card (`hybrid.html` `--line3`).
 pub const FRAME: f64 = 1.56;
+/// The overlay box's `card` off the chrome (design.md §1.4): two steps,
+/// so its `card_hi` row and its `frame` both still read on it.
+pub const CARD: f64 = 1.32;
 
 /// `#rrggbb` / `rrggbb` / `#rgb` / `rgb`, any case, surrounding space ignored.
 pub fn parse_hex(s: &str) -> Option<u32> {
@@ -108,6 +112,14 @@ pub fn luminance(c: u32) -> f64 {
 pub fn contrast(a: u32, b: u32) -> f64 {
     let (la, lb) = (luminance(a), luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// `b` over `a` at `t` (0: `a`, 1: `b`), opaque: a state's colour between
+/// two roles (never an opacity, design.md §5).
+pub fn mix_hsla(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    let (a, b) = (Rgba::from(a), Rgba::from(b));
+    let m = |x: f32, y: f32| x + (y - x) * t;
+    Hsla::from(Rgba { r: m(a.r, b.r), g: m(a.g, b.g), b: m(a.b, b.b), a: 1. })
 }
 
 /// `a` mixed toward `b` by `t` in sRGB (the TUI's `mix_rgb`).
@@ -305,7 +317,18 @@ macro_rules! roles {
         impl Palette {
             pub fn of(r: &Roles) -> Self {
                 // The selection wash is see-through: the text under it reads.
+                // It is not a role (not in `ROLE_NAMES`, no floor): an
+                // alpha over whatever it selects, not a colour of its own.
                 Palette { $($name: hsla(r.$name),)* sel: Hsla { a: 0.35, ..hsla(r.focus) } }
+            }
+
+            /// A role by its name (the tests).
+            #[cfg(test)]
+            pub fn role(&self, name: &str) -> Option<Hsla> {
+                match name {
+                    $(stringify!($name) => Some(self.$name),)*
+                    _ => None,
+                }
             }
         }
 
@@ -447,7 +470,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     }
     let tool = t.tool_input_bg.unwrap_or_else(|| step(canvas, t.claude_text, 1.14));
     let tool_out = t.tool_output_bg.unwrap_or_else(|| step(canvas, t.claude_text, 1.31));
-    let card = step(chrome, ink, 1.32);
+    let card = step(chrome, ink, CARD);
     let card_hi = step(card, ink, STEP);
     let raised = step(chrome, ink, STEP);
     // Diff washes stand `SURFACE` off the result surface, as `user` and
@@ -477,7 +500,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     for (role, from, c, ground, floor) in [
         ("tool", t.tool_input_bg.unwrap_or(canvas), tool, canvas, SURFACE),
         ("tool_out", t.tool_output_bg.unwrap_or(canvas), tool_out, canvas, SURFACE),
-        ("card", chrome, card, chrome, 1.32),
+        ("card", chrome, card, chrome, CARD),
         ("raised", chrome, raised, chrome, STEP),
     ] {
         f.log.push(Check { role, from, color: c, grounds: vec![ground], floor });
@@ -800,10 +823,10 @@ fn text_style(p: &Palette, m: &Metrics, dark: bool) -> TextViewStyle {
         .border_color(p.hair)
         .px(px((16. * r).round()))
         .py(px((12. * r).round()))
-        .text_size(px(m.mono))
+        .text_px(m.mono)
         .line_height(px(m.code_line))
         .text_color(code_fg);
-    let table = StyleRefinement::default().text_size(px(m.table)).line_height(px(m.table_line));
+    let table = StyleRefinement::default().text_px(m.table).line_height(px(m.table_line));
     let table_head = StyleRefinement::default().font_weight(FontWeight::SEMIBOLD).text_color(p.th).border_b_1().border_color(p.tb2);
     let table_cell = StyleRefinement::default().px(px((12. * r).round())).py(px((7. * r).round())).text_color(p.td);
     TextViewStyle::default()
@@ -814,7 +837,7 @@ fn text_style(p: &Palette, m: &Metrics, dark: bool) -> TextViewStyle {
         .with_code_background(p.code)
         .with_border(p.hair)
         .with_paragraph_gap(Rems(r))
-        .with_heading(move |level| StyleRefinement::default().text_size(px(sizes[usize::from(level.clamp(1, 3)) - 1])).text_color(head))
+        .with_heading(move |level| StyleRefinement::default().text_px(sizes[usize::from(level.clamp(1, 3)) - 1]).text_color(head))
         .with_code_block(code_block)
         .with_table(table)
         .with_table_head(table_head)
@@ -1389,6 +1412,21 @@ mod tests {
             let (_, checks) = resolve(&raw, None);
             for role in super::ROLE_NAMES.iter().filter(|r| !["canvas", "chrome"].contains(r)) {
                 assert!(checks.iter().any(|c| c.role == *role), "{name}: {role} has no floor in the log");
+            }
+        }
+    }
+
+    /// A detached panel's palette (`Palette::faded`, Shady L10) dims every
+    /// chrome role: a new `*_ch` role left out of it would stay bright. Not
+    /// `dim_ch` (the fade's own ink) nor `thumb_ch` (a scrollbar at rest,
+    /// already at the hairline).
+    #[test]
+    fn a_faded_palette_dims_every_chrome_role() {
+        for (name, raw) in palettes::THEMES {
+            let p = Palette::of(&resolve(&raw, None).0);
+            let f = p.faded();
+            for role in super::ROLE_NAMES.iter().filter(|r| r.ends_with("_ch") && !["dim_ch", "thumb_ch"].contains(r)) {
+                assert_ne!(p.role(role), f.role(role), "{name}: {role} stays bright on a faded panel");
             }
         }
     }

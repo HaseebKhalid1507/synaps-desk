@@ -20,6 +20,7 @@ use synaps_client::transcript::{Item, ItemKind, ToolStatus};
 
 use crate::app::{AppView, RowCache, display, mono};
 use crate::files::{CallDelta, LineKind, Preview};
+use crate::fonts::TextPx as _;
 use crate::fonts::{self, label};
 use crate::glyph::{self, Family, Glyph, Ground};
 use crate::subagents::{self, Subagents};
@@ -861,14 +862,14 @@ impl AppView {
                 .child(crate::glyph::bar(p.you_mark))
                 .px(px(m.pad_x))
                 .py(px(m.pad_y))
-                .text_size(px(m.body))
+                .text_px(m.body)
                 .line_height(px(m.body_line))
                 .text_color(p.ink)
                 .min_h(min_h)
                 .children(md.map(|v| v.style(cx.global::<theme::Scheme>().user_text.clone())))
                 .into_any_element(),
             Kind::Prose => {
-                let body = div().w_full().min_h(min_h).text_size(px(m.body)).line_height(px(m.body_line)).text_color(p.prose);
+                let body = div().w_full().min_h(min_h).text_px(m.body).line_height(px(m.body_line)).text_color(p.prose);
                 match md {
                     Some(v) => body.child(v).into_any_element(),
                     None => body.child(row.text.clone()).into_any_element(),
@@ -959,7 +960,7 @@ impl AppView {
             .flex_none()
             .gap(px(8.))
             .items_center()
-            .text_size(px(m.meta))
+            .text_px(m.meta)
             .when_some(s.counts.element(p), |d, c| d.child(c).child(dot()))
             .child(glyph::draw(worst, glyph::ink(family, Ground::Run, p).1));
         if !tight {
@@ -984,7 +985,7 @@ impl AppView {
             .bg(p.tool)
             .when(open, |d| d.border_b_1().border_color(p.canvas))
             .font_family(fonts::MONO)
-            .text_size(px(m.mono))
+            .text_px(m.mono)
             .text_color(p.prose_t)
             .cursor_pointer()
             .hover(|d| d.bg(p.tool_out))
@@ -1027,7 +1028,7 @@ impl AppView {
                 .whitespace_nowrap()
                 .text_ellipsis()
                 .font_family(fonts::SANS)
-                .text_size(px(m.think))
+                .text_px(m.think)
                 .text_color(p.think)
                 .child(row.arg.clone())
         } else {
@@ -1088,7 +1089,7 @@ impl AppView {
                     .pt(px((8. * m.r).round()))
                     .pb(px((12. * m.r).round()))
                     .font_family(fonts::SANS)
-                    .text_size(px(m.think))
+                    .text_px(m.think)
                     .line_height(px(m.think_line))
                     .text_color(p.think_o)
                     .child(row.text.clone())
@@ -1110,7 +1111,7 @@ impl AppView {
             .w_full()
             .bg(p.tool)
             .font_family(fonts::MONO)
-            .text_size(px(m.mono))
+            .text_px(m.mono)
             .line_height(px(m.mono_line))
             .child(head)
             .children(worker.map(|(v, current)| self.subagent_block(v, current, p, m, lay, cx)))
@@ -1163,7 +1164,7 @@ impl AppView {
             .flex_none()
             .gap(px(8.))
             .items_center()
-            .text_size(px(m.meta))
+            .text_px(m.meta)
             .when(!v.facts.is_empty(), |d| d.child(div().text_color(p.sub_time_t).child(v.facts.clone())))
             .when(!lay.tight, |d| d.child(div().text_color(word_color).child(word)))
             .children(go);
@@ -1205,7 +1206,7 @@ impl AppView {
                 .pl(px(m.pad_x + m.lead))
                 .pr(px(m.pad_x))
                 .pb(px((8. * m.r).round()))
-                .text_size(px(m.meta))
+                .text_px(m.meta)
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
@@ -1251,7 +1252,7 @@ fn outcome(row: &RowCache, (g, word, family): (Glyph, Option<&'static str>, Fami
         .flex_none()
         .gap(px(8.))
         .items_center()
-        .text_size(px(m.meta))
+        .text_px(m.meta)
         .whitespace_nowrap()
         // The ledger's committed counts: nothing unless the call succeeded.
         .children(row.counts.element(p))

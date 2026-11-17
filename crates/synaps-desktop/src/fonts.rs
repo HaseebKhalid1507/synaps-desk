@@ -11,7 +11,7 @@
 
 use std::borrow::Cow;
 
-use gpui_kit::App;
+use gpui_kit::{App, Styled, px};
 
 pub const DISPLAY: &str = "Hybrid Display";
 pub const SANS: &str = "Hybrid Sans";
@@ -22,7 +22,23 @@ pub const JP: &str = "Hybrid Labels JP";
 /// column's sizes scale with the text step ([`crate::theme::Metrics`]);
 /// these are fixed. Usage's and the right panel's big figures (`fig.*`)
 /// keep their own sizes.
+/// A text size, the only way one is set (clippy's `disallowed-methods`
+/// holds every other): never under [`size::FLOOR`] (design.md §1.2). A
+/// size under it is a mistake the tests' debug build reports; a release
+/// build draws it at the floor.
+pub(crate) trait TextPx: Styled + Sized {
+    fn text_px(self, size: f32) -> Self {
+        debug_assert!(size >= size::FLOOR, "text under {} px: {size}", size::FLOOR);
+        #[allow(clippy::disallowed_methods)]
+        self.text_size(px(size.max(size::FLOOR)))
+    }
+}
+
+impl<E: Styled> TextPx for E {}
+
 pub mod size {
+    /// No text is smaller.
+    pub const FLOOR: f32 = 12.;
     /// Display, small: state words outside runs, chips, field keys,
     /// section heads, confirm words.
     pub const D_S: f32 = 12.;

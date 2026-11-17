@@ -1,0 +1,20 @@
+# The house rules the compiler holds (design.md §1.2, §5, §8.9). Each has
+# one sanctioned way in, `#[allow]`ed where it is:
+# - text sizes: `fonts::TextPx::text_px` (never under 12 px);
+# - opacity: a chart's data (`chart.rs`), never a state;
+# - tooltips: `overlay.rs` (the one overlay box).
+disallowed-methods = [
+    { path = "gpui::Styled::text_size", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
+    { path = "gpui::Styled::text_xs", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
+    { path = "gpui::Styled::text_sm", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
+    { path = "gpui::Styled::text_base", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
+    { path = "gpui::Styled::text_lg", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
+    { path = "gpui::Styled::text_xl", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
+    { path = "gpui::Styled::text_2xl", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
+    { path = "gpui::Styled::text_3xl", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
+    { path = "gpui::Styled::opacity", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
+    { path = "gpui::Hsla::opacity", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
+    { path = "gpui::Rgba::opacity", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
+    { path = "gpui_component::tooltip::Tooltip::new", reason = "every tooltip is the one overlay box: `overlay::tip` (design.md §8.9)" },
+    { path = "gpui_component::tooltip::Tooltip::element", reason = "every tooltip is the one overlay box: `overlay::element` (design.md §8.9)" },
+]

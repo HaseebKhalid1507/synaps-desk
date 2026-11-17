@@ -446,6 +446,66 @@ fn a_tally_never_clips_what_it_names(cx: &mut TestAppContext) {
     assert!(cut > 0 && whole > 0, "the sweep cuts the 17-tool tally, and shows tallies whole: {cut}, {whole}");
 }
 
+/// Finish gate F1: ten tabs and more at 1920 (the rail at its 220 px
+/// limit, the right pane at 413) sit at the strip's narrowest,
+/// [`crate::tabstrip::TAB_MIN`]. Each
+/// keeps its glyph, a 13-px title cut to at least a character and its
+/// ellipsis, and its ×, none over another and all inside the tab, at text
+/// steps 16 and 22. The test window advances every character 0.6 em.
+#[cfg(debug_assertions)]
+#[gpui_kit::test]
+fn a_tab_at_its_narrowest_cuts_its_title_cleanly(cx: &mut TestAppContext) {
+    use gpui_kit::VisualTestContext;
+
+    use crate::tabstrip::TAB_MIN;
+    let (w, view, _events) = open(cx);
+    let tabs = view.update(cx, |v, cx| {
+        v.client = None;
+        // 1920 less the 220 rail and a 413 right pane: 8 tabs of 132 and
+        // the arrows.
+        v.panels.rail_width = Some(220);
+        v.panels.right_width = Some(413);
+        let ids: Vec<String> = v.model.sessions.iter().map(|s| s.id.clone()).collect();
+        for id in ids {
+            v.open_tab(crate::app::Open::Attach { session_id: id, fallback: None, open: false }, crate::tabs::Place::New);
+        }
+        cx.notify();
+        v.model.tabs.iter().map(|t| (t.id, t.label.to_string())).collect::<Vec<_>>()
+    });
+    assert!(tabs.len() >= 10, "ten tabs and more: {}", tabs.len());
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    for step in [16, 22] {
+        view.update(&mut vcx, |v, cx| {
+            v.show_text_size(step, cx);
+            cx.notify();
+        });
+        vcx.simulate_resize(size(px(1920.), px(1080.)));
+        vcx.run_until_parked();
+        let mut shown = 0;
+        for (id, label) in &tabs {
+            let Some(tab) = vcx.debug_bounds(leak(format!("tab {id}"))) else { continue };
+            shown += 1;
+            let width = f32::from(tab.size.width);
+            assert!((width - TAB_MIN).abs() < 0.5, "step {step}: tab {id} is {width} px");
+            let mut part =
+                |name: &str| vcx.debug_bounds(leak(format!("tab {id} {name}"))).unwrap_or_else(|| panic!("tab {id}: its {name}"));
+            let (glyph, title, x) = (part("glyph"), part("title"), part("x"));
+            let at = |v: gpui_kit::Pixels| f32::from(v);
+            assert!(at(glyph.left()) >= at(tab.left()) && at(glyph.right()) <= at(title.left()), "step {step}: tab {id}'s glyph");
+            assert!(at(title.right()) <= at(x.left()) + 0.01, "step {step}: tab {id}'s title runs under its ×");
+            assert!(at(x.right()) <= at(tab.right()) + 0.01, "step {step}: tab {id}'s × past its edge");
+            // A character and the ellipsis at the least; cut, not spilled.
+            let cell = 0.6 * crate::fonts::size::TITLE;
+            assert!(at(title.size.width) >= 2. * cell, "step {step}: tab {id}'s title has {:?}", title.size.width);
+            if label.chars().count() as f32 * cell > at(title.size.width) {
+                assert!(at(title.right()) <= at(tab.right()), "step {step}: tab {id}'s title cut inside it");
+            }
+        }
+        assert!(shown >= 8, "step {step}: {shown} tabs drawn");
+    }
+}
+
 /// A new press of `key` (down and up, then past a repeat's 30 ms).
 fn tap(cx: &mut TestAppContext, w: AnyWindowHandle, key: &str) {
     down(cx, w, key, false);
@@ -629,15 +689,16 @@ fn foot_of(cx: &mut TestAppContext, view: &Entity<AppView>) -> (crate::subagents
     })
 }
 
-/// Its view polled `running` from the daemon (the offline demo's view
-/// has no daemon to poll): the page, and what the pump does with it.
+/// Its view took a `running` page from the daemon (the offline demo's
+/// view has no daemon to poll): the page, and what the pump does with it
+/// (the pump's own path: `model::the_list_hears_only_the_pages_its_view_took`).
 fn view_running(cx: &mut TestAppContext, view: &Entity<AppView>) {
     view.update(cx, |v, _| {
         let w = v.model.watch.focused_mut().expect("a worker on screen");
         w.gone = None;
         w.status = "running".into();
         let handle = w.handle_id.clone();
-        v.model.heard_view(&handle);
+        v.model.heard_view(&handle, "running");
     });
 }
 
@@ -743,7 +804,7 @@ fn a_stale_view_under_a_reused_handle_says_nothing_of_its_worker(cx: &mut TestAp
         v.model.stats.subagents.on_session(&synaps_client::protocol::decode_event(&row).expect("a rows event"));
         assert_eq!(v.model.stats.subagents.status(1), Some(crate::subagents::Status::Running), "the list: builder runs");
         // Scout's stale view is not heard as builder's.
-        assert!(!v.model.heard_view("sa_1"), "a view of another worker feeds nothing");
+        assert!(!v.model.heard_view("sa_1", "running"), "a view of another worker feeds nothing");
         assert_eq!(v.model.stats.subagents.status(1), Some(crate::subagents::Status::Running));
         cx.notify();
     });

@@ -19,6 +19,7 @@ use gpui_kit::*;
 use crate::app::{AppView, display, mono};
 use crate::dash::Fail;
 use crate::fonts;
+use crate::fonts::TextPx as _;
 use crate::model::ConnState;
 use crate::rail::State;
 use crate::settings::{self, Cat};
@@ -144,7 +145,7 @@ struct Row {
 }
 
 fn sans(text: impl Into<SharedString>, size: f32, line: f32, color: Hsla) -> Div {
-    div().text_size(px(size)).line_height(px(line)).text_color(color).child(text.into())
+    div().text_px(size).line_height(px(line)).text_color(color).child(text.into())
 }
 
 /// The value a session row shows.
@@ -428,7 +429,7 @@ impl AppView {
                 .flex_1()
                 .min_w_0()
                 .font_family(crate::fonts::MONO)
-                .text_size(px(13.))
+                .text_px(13.)
                 .child(Input::new(&self.settings_input).appearance(false))
                 .into_any_element()
         } else {
@@ -599,15 +600,9 @@ impl AppView {
                 .items_center()
                 .child(display("S E T T I N G S", fonts::size::D_L, p.header))
                 .child(div().flex_1())
-                .child(
-                    h_flex().w(px(CONTROL)).h(px(28.)).px(px(10.)).items_center().border_1().border_color(p.edge).child(
-                        div()
-                            .flex_1()
-                            .font_family(crate::fonts::MONO)
-                            .text_size(px(13.))
-                            .child(Input::new(&self.settings_find).appearance(false)),
-                    ),
-                )
+                .child(h_flex().w(px(CONTROL)).h(px(28.)).px(px(10.)).items_center().border_1().border_color(p.edge).child(
+                    div().flex_1().font_family(crate::fonts::MONO).text_px(13.).child(Input::new(&self.settings_find).appearance(false)),
+                ))
                 .into_any_element(),
         ));
         let gate = self.config_gate();
@@ -1045,7 +1040,7 @@ impl AppView {
                             .p(px(10.))
                             .bg(p.code)
                             .font_family(crate::fonts::MONO)
-                            .text_size(px(13.))
+                            .text_px(13.)
                             .line_height(px(20.))
                             .text_color(p.code_fg)
                             .whitespace_normal()

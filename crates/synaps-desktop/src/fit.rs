@@ -721,15 +721,15 @@ mod tests {
     }
 
     /// The words as the embedded faces draw them (measured on Linux at
-    /// 11 / 10.5 / 10 px, scaled to 12).
+    /// 12 px: `SYNAPS_DESKTOP_LOG=debug`'s `synaps_desktop::words` line).
     pub(crate) const WORDS: TopWords = TopWords {
         word: 58.,
         word2: 66.,
-        need: 77.,
+        need: 76.,
         digit: 7.,
         jump: 37.,
         theme: 44.,
-        systems: 64.,
+        systems: 63.,
         cell: 7.2,
         cell_conn: 7.2,
         cell_badge: 7.2,
@@ -814,6 +814,28 @@ mod tests {
             f.theme && !f.systems
         });
         assert!(swapped.is_some(), "THEME never takes SYSTEMS' place");
+        // Its rule, at every width of every mix: where SYSTEMS went and
+        // nothing after it did (the connection text, SYNAPS, the label),
+        // THEME is in its place whenever it fits there.
+        for b in 0..128u32 {
+            let i = TopIn {
+                width: 0.,
+                need: [0, 1, 12, 123][(b & 3) as usize],
+                badge: 1 + (b >> 2 & 3) as usize,
+                more: (b >> 4 & 1) as usize,
+                ..busy
+            };
+            let whole = fit_top(&WORDS, &TopIn { width: 1e5, ..i });
+            for width in 560..2000 {
+                let i = TopIn { width: width as f32, jump: i.need > 0, ..i };
+                let f = fit_top(&WORDS, &i);
+                let later = (f.conn == 0. && whole.conn > 0.) || !f.word || (f.label == 0. && whole.label > 0.);
+                let fits = TopFit { theme: true, ..f }.width(&WORDS, &i) <= i.width - TOP_PAD + 0.01;
+                if !f.systems && !later && fits {
+                    assert!(f.theme, "{width} {i:?}: THEME fits in SYSTEMS' place: {f:?}");
+                }
+            }
+        }
         let one = TopIn { need: 1, more: 0, conn: 12, ..busy };
         assert!(!fit_top(&WORDS, &TopIn { width: 1099., ..one }).word2);
         assert!((757..1099).all(|w| !fit_top(&WORDS, &TopIn { width: w as f32, ..one }).word2));

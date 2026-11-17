@@ -45,6 +45,7 @@ use gpui_kit::*;
 
 use crate::app::{AppView, display, mono};
 use crate::fonts;
+use crate::fonts::TextPx as _;
 use crate::glyph::{self, Ground};
 use crate::menu::{At, How, Item, Key, Menu};
 use crate::subagents::{Info, Liveness, Subagents, fmt_secs};
@@ -1005,7 +1006,8 @@ pub(crate) fn card_tip(me: WeakEntity<AppView>, who: Who, fallback: SharedString
     }
 }
 
-/// The hover card's outer width (design.md §8.7), and its padding.
+/// The hover card's outer width (design.md §8.7: the overlay's 1-px frame
+/// inside it), and its padding.
 const CARD_W: f32 = 340.;
 const CARD_PAD: f32 = 16.;
 
@@ -1034,7 +1036,7 @@ fn card(i: &Info, state: Liveness, started: Option<&str>, p: &Palette) -> Div {
     // The lead column: the 10 px glyph centred in 12, then 8.
     let under = || v_flex().pl(px(20.)).min_w_0();
     v_flex()
-        .w(px(CARD_W))
+        .w(px(CARD_W - 2.))
         .p(px(CARD_PAD))
         .gap(px(8.))
         .child(
@@ -1049,7 +1051,7 @@ fn card(i: &Info, state: Liveness, started: Option<&str>, p: &Palette) -> Div {
                         .min_w_0()
                         .gap(px(8.))
                         .items_baseline()
-                        .child(div().flex_none().text_size(px(size::TITLE)).text_color(p.ink).child(i.name.clone()))
+                        .child(div().flex_none().text_px(size::TITLE).text_color(p.ink).child(i.name.clone()))
                         .child(mono(format!("sa_{}", i.id), size::META, p.dim_k).flex_none()),
                 )
                 .child(display(word, size::D_S, color).flex_none().ml(px(8.))),
@@ -1059,7 +1061,7 @@ fn card(i: &Info, state: Liveness, started: Option<&str>, p: &Palette) -> Div {
                 under().child(
                     div()
                         .font_family(fonts::MONO)
-                        .text_size(px(size::META))
+                        .text_px(size::META)
                         .line_height(px(18.))
                         .max_h(px(72.))
                         .overflow_hidden()
@@ -1073,7 +1075,7 @@ fn card(i: &Info, state: Liveness, started: Option<&str>, p: &Palette) -> Div {
             d.child(
                 under().child(
                     div()
-                        .text_size(px(size::TITLE))
+                        .text_px(size::TITLE)
                         .line_height(px(18.))
                         .text_color(if state == Liveness::Failed { p.err_k } else { p.dim_k })
                         .whitespace_nowrap()

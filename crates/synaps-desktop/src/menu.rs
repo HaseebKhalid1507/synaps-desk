@@ -10,6 +10,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{AppView, mono};
+use crate::fonts::TextPx as _;
 use crate::fonts::size;
 use crate::theme::Palette;
 
@@ -182,7 +183,7 @@ pub(crate) fn render<A: Copy + 'static>(
                 h_flex()
                     .flex_1()
                     .gap(px(8.))
-                    .text_size(px(size::UI))
+                    .text_px(size::UI)
                     .text_color(if on { p.ink } else { p.dim_k })
                     .child(it.label.clone())
                     .when_some(it.confirm.clone(), |d, c| d.child(crate::app::display(c, size::D_S, p.err_k))),

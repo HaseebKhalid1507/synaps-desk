@@ -15,6 +15,7 @@ use gpui_kit::*;
 
 use crate::app::{AppView, Open, display, mono};
 use crate::chart::{self, Ink, Paths, Spot};
+use crate::fonts::TextPx as _;
 use crate::tabs::Place;
 use crate::theme::Palette;
 use crate::usage::{self, Axes, Board, NONE, Range, SpendBy, Stack};
@@ -95,7 +96,7 @@ impl UsageUi {
 }
 
 fn sans(text: impl Into<SharedString>, size: f32, line: f32, color: Hsla) -> Div {
-    div().text_size(px(size)).line_height(px(line)).text_color(color).child(text.into())
+    div().text_px(size).line_height(px(line)).text_color(color).child(text.into())
 }
 
 fn title(t: &'static str, p: &Palette) -> Div {
@@ -111,7 +112,12 @@ fn swatch(c: Hsla) -> Div {
 }
 
 fn ink(p: &Palette) -> Ink {
-    Ink { series: [p.s1, p.s2, p.s3, p.s4, p.s5, p.s_rest], grid: p.hair, rule: p.dim, hover: crate::chart::fade(p.hair, 0.6) }
+    Ink {
+        series: [p.s1, p.s2, p.s3, p.s4, p.s5, p.s_rest],
+        grid: p.hair,
+        rule: p.dim,
+        hover: crate::theme::mix_hsla(p.canvas, p.hair, 0.6),
+    }
 }
 
 impl AppView {
@@ -599,11 +605,7 @@ impl AppView {
             let mut r = h_flex().gap(px(2.)).items_center().child(mono(days[d], 12., p.dim).w(px(38.)));
             for &n in row {
                 let step = if b.heat_max == 0 || n == 0 { 0 } else { ((n as f64 / b.heat_max as f64) * 5.).ceil() as usize };
-                r = r.child(div().w(px(16.)).h(px(14.)).bg(if step == 0 {
-                    crate::chart::fade(p.hair, 0.5)
-                } else {
-                    crate::chart::fade(p.s1, step as f32 / 5.)
-                }));
+                r = r.child(div().w(px(16.)).h(px(14.)).bg(crate::chart::heat(p.hair, p.s1, step)));
             }
             grid = grid.child(r);
         }

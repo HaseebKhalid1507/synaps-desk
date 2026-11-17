@@ -11,6 +11,7 @@ use gpui_kit::*;
 use std::hash::{Hash, Hasher};
 
 use crate::app::{AppView, EdgeDrag, STRIP, Side, ToggleRail, ToggleRight, count, display, mono, section, tbtn};
+use crate::fonts::TextPx as _;
 use crate::fonts::{self, label, size};
 use crate::glyph::{self, Ground};
 use crate::model::{ConnState, Model};
@@ -43,6 +44,26 @@ const PICKER_MIN: f32 = 340.;
 /// below it and the top bar.
 const TABS_CLEAR: f32 = crate::tabstrip::TAB_H;
 const TABS_CLEAR_SHORT: f32 = crate::tabstrip::TAB_H + 1.;
+
+/// The find field's placeholder, and its first word for a rail too narrow
+/// for all of it.
+pub(crate) const FIND: (&str, &str) = ("find · open by name", "find");
+
+/// Whether the whole find placeholder fits a rail `rail` px wide (`cell`:
+/// a 12-px mono cell): the rail's insets (22 each side), the gap (8) and
+/// the `/` key (5 each side, its border, a cell), less the kit's padding of
+/// the field's text.
+pub(crate) fn find_fits(rail: f32, cell: f32) -> bool {
+    let room = rail - 2. * 22. - 8. - (2. * 5. + 2. + cell) - 2. * crate::app::kit_input_px();
+    room >= FIND.0.chars().count() as f32 * cell
+}
+
+/// The rail states that say a word on line 2 ([`State::word`]).
+pub(crate) const WORDED: [State; 6] = [State::Opening, State::NeedsYou, State::Running, State::Workers, State::Locked, State::Unread];
+
+/// A rail row's sub is dropped when it would show fewer cells than this
+/// (six characters and the ellipsis): "Re…" is noise, not information.
+const SUB_MIN_CELLS: f32 = 7.;
 
 /// The top bar's fixed words, measured in the faces they are drawn in.
 pub(crate) fn top_words(window: &Window) -> crate::fit::TopWords {
@@ -525,7 +546,8 @@ impl AppView {
             }
         }
         // A chip toggles its filter; none selected shows everything. At
-        // 12 px the three take 250 px: a narrow rail wraps the last.
+        // 12 px the three take 255 px: the default rail holds them on one
+        // line ([`crate::app::FLOORS`]); one dragged narrower wraps the last.
         let mut chips =
             h_flex().flex_wrap().items_center().gap_x(px(12.)).gap_y(px(4.)).px(px(22.)).py(px(12.)).border_b_1().border_color(p.hair);
         for (c, count) in [(Chip::NeedsYou, needs), (Chip::Running, running), (Chip::Unread, unread)] {
@@ -538,12 +560,13 @@ impl AppView {
             chips = chips.child(
                 h_flex()
                     .id(("chip", c as usize))
+                    .relative()
                     .items_baseline()
                     .gap(px(5.))
-                    .pb(px(3.))
-                    .border_b_1()
-                    .border_color(if on { p.focus_ch } else { gpui_kit::transparent_black() })
+                    .pb(px(4.))
                     .cursor_pointer()
+                    // Selected: the 2-px `you_bar` (design.md §5), under it.
+                    .when(on, |d| d.child(div().absolute().left_0().right_0().bottom_0().h(px(2.)).bg(p.you_bar)))
                     .child(display(c.label(), size::D_S, if on { p.ink } else { p.dim_ch }))
                     .child(mono(
                         count.to_string(),
@@ -571,12 +594,7 @@ impl AppView {
             .border_b_1()
             .border_color(p.edge)
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .font_family(fonts::MONO)
-                    .text_size(px(size::META))
-                    .child(Input::new(&self.find_input).appearance(false)),
+                div().flex_1().min_w_0().font_family(fonts::MONO).text_px(size::META).child(Input::new(&self.find_input).appearance(false)),
             )
             .child(div().px(px(5.)).border_1().border_color(p.edge).child(mono("/", size::META, p.dim_ch)));
         let items = list(self.rail_list.clone(), cx.processor(|this, ix, _window, cx| this.render_rail_item(ix, cx))).size_full();
@@ -604,7 +622,7 @@ impl AppView {
             .child(find)
             .when(!notes.is_empty(), |d| {
                 d.child(v_flex().px(px(22.)).pt(px(8.)).gap(px(4.)).children(
-                    notes.into_iter().map(|(t, c)| div().font_family(fonts::MONO).text_size(px(size::META)).text_color(c).child(t.clone())),
+                    notes.into_iter().map(|(t, c)| div().font_family(fonts::MONO).text_px(size::META).text_color(c).child(t.clone())),
                 ))
             })
             .child(chips)
@@ -633,7 +651,7 @@ impl AppView {
                 .gap(px(9.))
                 .when(ix > 0, |d| d.border_t_1().border_color(p.hair))
                 .child(display(group.label(), size::D_S, p.dim_ch))
-                .child(div().font_family(fonts::JP).text_size(px(size::JP)).text_color(p.dim_ch).child(group.jp()))
+                .child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_ch).child(group.jp()))
                 .child(div().flex_1())
                 .child(mono(count, size::META, p.dim_ch))
                 .into_any_element(),
@@ -682,12 +700,12 @@ impl AppView {
                 .pt(px(2.))
                 .pb(px(10.))
                 .font_family(fonts::MONO)
-                .text_size(px(size::META))
+                .text_px(size::META)
                 .line_height(px(18.))
                 .text_color(p.dim_ch)
                 .child(SharedString::from(t))
                 .into_any_element(),
-            Item::Empty(t) => div().px(px(22.)).py(px(10.)).text_size(px(size::TITLE)).text_color(p.dim_ch).child(*t).into_any_element(),
+            Item::Empty(t) => div().px(px(22.)).py(px(10.)).text_px(size::TITLE).text_color(p.dim_ch).child(*t).into_any_element(),
         }
     }
 
@@ -730,6 +748,20 @@ impl AppView {
             None
         };
         let key = row.key;
+        // Line 2's room for the sub, past the word (and its count) and the
+        // cost: under SUB_MIN_CELLS cells it is dropped.
+        let cell = self.top_words.as_ref().map_or(7.2, |t| t.cell);
+        let cells = |t: &str| t.chars().count() as f32 * cell;
+        let count_w = match st {
+            State::NeedsYou if waiting > 1 => 5. + cells(&count(waiting)),
+            State::Workers => 5. + cells(&count(workers)),
+            _ => 0.,
+        };
+        let word_w = st.word().map_or(0., |w| self.widths.borrow().get(&(w, size::D_S.to_bits())).copied().unwrap_or(0.) + count_w + 8.);
+        let cost_w = cost.map_or(0., |c| 8. + cells(&format!("${c:.2}")));
+        // The row's insets, its glyph and gap.
+        let room = self.rail_width - 2. * 22. - 10. - 10. - word_w - cost_w;
+        let sub = room >= SUB_MIN_CELLS * cell;
         let word = st.word().map(|w| {
             h_flex()
                 .flex_none()
@@ -767,8 +799,8 @@ impl AppView {
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()
-                                        .when(row.named, |d| d.font_family(fonts::MONO).text_size(px(size::META)))
-                                        .when(!row.named, |d| d.text_size(px(size::TITLE)))
+                                        .when(row.named, |d| d.font_family(fonts::MONO).text_px(size::META))
+                                        .when(!row.named, |d| d.text_px(size::TITLE))
                                         .text_color(title_color)
                                         .child(SharedString::from(&row.title)),
                                 )
@@ -788,10 +820,10 @@ impl AppView {
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()
-                                        .when(row.sub_mono, |d| d.font_family(fonts::MONO).text_size(px(size::META)))
-                                        .when(!row.sub_mono, |d| d.text_size(px(size::TITLE)))
+                                        .when(row.sub_mono, |d| d.font_family(fonts::MONO).text_px(size::META))
+                                        .when(!row.sub_mono, |d| d.text_px(size::TITLE))
                                         .text_color(sub_color)
-                                        .child(SharedString::from(&row.sub)),
+                                        .when(sub, |d| d.child(SharedString::from(&row.sub))),
                                 )
                                 .when_some(cost, |d, c| d.child(mono(format!("${c:.2}"), size::META, p.cost_ch).flex_none())),
                         ),
@@ -846,8 +878,8 @@ impl AppView {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .when(row.named, |d| d.font_family(fonts::MONO).text_size(px(size::META)))
-                    .when(!row.named, |d| d.text_size(px(size::TITLE)))
+                    .when(row.named, |d| d.font_family(fonts::MONO).text_px(size::META))
+                    .when(!row.named, |d| d.text_px(size::TITLE))
                     .text_color(title_color)
                     .child(SharedString::from(&row.title)),
             )
@@ -883,7 +915,7 @@ impl AppView {
             .w(px(296.))
             .p(px(16.))
             .gap(px(8.))
-            .child(div().text_size(px(size::TITLE)).line_height(px(18.)).text_color(p.ink).child(r.title))
+            .child(div().text_px(size::TITLE).line_height(px(18.)).text_color(p.ink).child(r.title))
             .child(crate::overlay::facts(facts, p));
         div()
             .absolute()
@@ -1067,7 +1099,7 @@ impl AppView {
         }
         let shell = ledger.shell();
         if n == 0 && shell.is_empty() {
-            files = files.child(div().text_size(px(size::TITLE)).text_color(p.dim_ch).child("No file edits in this session"));
+            files = files.child(div().text_px(size::TITLE).text_color(p.dim_ch).child("No file edits in this session"));
         }
         if !shell.is_empty() {
             // Read from `bash` command lines: approximate, no line counts,
@@ -1324,7 +1356,19 @@ enum PickerAt {
 
 #[cfg(test)]
 mod tests {
-    use super::prompt_gist;
+    use super::{FIND, find_fits, prompt_gist};
+
+    /// Finish gate F2: the find field's placeholder is whole or its first
+    /// word, never cut mid-word: whole at the default rail, the word alone
+    /// at the 220-px limit (it read "find · open by nar").
+    #[test]
+    fn the_find_placeholder_is_never_cut() {
+        let cell = 7.2;
+        assert!(find_fits(crate::app::FLOORS.0, cell), "the default rail: all of it");
+        assert!(!find_fits(220., cell), "220 px: {}", FIND.1);
+        let edge = (220..480).find(|&w| find_fits(w as f32, cell)).expect("a width that fits it");
+        assert!((220..240).contains(&edge), "whole from {edge} px");
+    }
 
     #[test]
     fn the_ticker_names_the_tool_and_what_it_runs() {
