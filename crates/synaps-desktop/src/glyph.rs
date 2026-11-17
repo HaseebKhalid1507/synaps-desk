@@ -55,7 +55,7 @@ pub(crate) enum Glyph {
     /// A favourite (desktop only, never the daemon's pin): the star filled.
     Starred,
     /// The daemon pins it (kept loaded, never parked), on a favourite's
-    /// row: a tack, a 6×2 head over a 2×6 stem.
+    /// row: a push pin side on (its cap, neck, flange and needle).
     Pinned,
 }
 
@@ -149,7 +149,7 @@ impl Glyph {
             Glyph::Close => &[Line(&[(1.6, 1.6), (6.4, 6.4)]), Line(&[(6.4, 1.6), (1.6, 6.4)])],
             Glyph::Star => &[Line(STAR_CLOSED)],
             Glyph::Starred => &[Poly(STAR_CLOSED)],
-            Glyph::Pinned => &[Fill(2., 1., 6., 2.), Fill(4., 3., 2., 6.)],
+            Glyph::Pinned => &[Fill(3., 1., 4., 2.), Fill(4., 3., 2., 2.), Fill(2., 5., 6., 1.), Fill(4., 6., 2., 3.)],
         }
     }
 }
