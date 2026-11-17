@@ -1063,6 +1063,59 @@ fn the_workers_menu_follows_the_tray_and_closes_on_a_reconnect(cx: &mut TestAppC
     assert!(view.read_with(cx, |v, _| v.wmenu_leaving.is_none()), "gone");
 }
 
+/// Shady #15 L1: a workers menu emptied in the render (the window grew,
+/// every worker got its chip, the tray's key unchanged) leaves from that
+/// frame, at its place, and is gone after its exit; not later, when
+/// something else draws.
+#[gpui_kit::test]
+fn a_workers_menu_emptied_by_room_leaves_at_once(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    let rows: Vec<serde_json::Value> = (1..=6u64)
+        .map(|n| {
+            serde_json::json!({"subagent_id": n, "agent_name": format!("worker-{n}"), "status": "running", "cancel_requested": false,
+                "elapsed_secs": 10.0 + n as f64, "step": format!("reading src/part_{n}.rs"), "tools": n, "handle_id": format!("sa_{n}")})
+        })
+        .collect();
+    let ev = synaps_client::protocol::decode_event(&serde_json::json!({"ev": "subagent_rows", "rows": rows})).expect("a rows event");
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.on_session(&ev);
+        cx.notify();
+    });
+    VisualTestContext::from_window(w, cx).simulate_resize(size(px(1440.), px(560.)));
+    settle(cx, w, 8);
+    let drawn = view.read_with(cx, |v, _| (v.tray_drawn(), v.tray.rows.len()));
+    let at = VisualTestContext::from_window(w, cx).debug_bounds("tray-more").unwrap_or_else(|| panic!("+N more drawn: {drawn:?}")).center();
+    click_at(cx, w, at);
+    let key = view.read_with(cx, |v, _| {
+        assert!(v.wmenu.as_ref().expect("the workers menu").born.is_some(), "the pointer opened it");
+        v.tray.key
+    });
+    for _ in 0..20 {
+        wait(cx, w, &view, 7);
+    }
+    // Frame by frame: (open, leaving) after each.
+    let state = |cx: &mut TestAppContext| view.read_with(cx, |v, _| (v.wmenu.is_some(), v.wmenu_leaving.is_some()));
+    VisualTestContext::from_window(w, cx).simulate_resize(size(px(1440.), px(900.)));
+    let mut seen = vec![state(cx)];
+    for _ in 0..8 {
+        cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+        cx.run_until_parked();
+        seen.push(state(cx));
+    }
+    let closed = seen.iter().position(|s| !s.0).unwrap_or_else(|| panic!("closed: {seen:?}"));
+    assert!(seen[closed].1, "leaving from the frame it closed in: {seen:?}");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.tray.key, key, "the tray's key unchanged: only the render sees the room");
+        assert_eq!(v.tray_drawn(), v.tray.rows.len(), "every worker has its chip");
+    });
+    for _ in 0..30 {
+        wait(cx, w, &view, 7);
+    }
+    view.read_with(cx, |v, _| assert!(v.wmenu_leaving.is_none() && v.wmenu_was.is_none(), "gone, nothing left to leave later"));
+}
+
 /// The other demo session in a tab, attached (with no client, the
 /// synthetic transport answers its attach).
 fn open_idle_cpu(cx: &mut TestAppContext, view: &Entity<AppView>, place: crate::tabs::Place) {
@@ -3519,6 +3572,9 @@ fn the_drain_is_painted_every_frame(cx: &mut TestAppContext) {
 /// Re-gate r3: on a real loss too the words keep the connected words'
 /// width (padded, or cut with an ellipsis), so NEEDS YOU, centred beside
 /// them, never moves: "reconnecting ··", then the client's long error.
+/// With a session attached (Shady #15 M1) its own connection re-attaches
+/// on its own backoff, after the link's hello: "reattaching ···" holds
+/// the width too, until it is attached again.
 #[gpui_kit::test]
 fn needs_you_holds_still_through_a_loss(cx: &mut TestAppContext) {
     use synaps_client::Status;
@@ -3529,6 +3585,15 @@ fn needs_you_holds_still_through_a_loss(cx: &mut TestAppContext) {
     };
     let up = need(cx);
     assert!(up.is_some(), "NEEDS YOU drawn");
+    let seq = view.read_with(cx, |v, _| v.model.active.as_ref().expect("the demo session attached").attach_seq);
+    view.update(cx, |v, cx| {
+        let why = "daemon closed the connection".into();
+        let _ = v.model.apply(synaps_client::Event::Reattaching { attach_seq: seq, session_id: crate::demo::SID.into(), reason: why });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    wait(cx, w, &view, 7);
+    assert_eq!(need(cx), up, "NEEDS YOU, the session re-attaching");
     let long = "connect /home/someone/.synaps-cli/run/daemon-desktopproto.sock: Connection refused (os error 111)";
     for (s, what) in [
         (Status::Reconnecting { why: "daemon closed the connection".into() }, "reconnecting"),
@@ -3543,7 +3608,25 @@ fn needs_you_holds_still_through_a_loss(cx: &mut TestAppContext) {
     wait_past(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64 + 600);
     assert_eq!(need(cx), up, "NEEDS YOU, lost and drained");
     status(cx, &view, hello());
+    for _ in 0..3 {
+        wait(cx, w, &view, 7);
+        assert!(view.read_with(cx, |v, _| v.model.reattaching), "the link up first, the session still re-attaching");
+        assert_eq!(need(cx), up, "NEEDS YOU, back, the session re-attaching");
+    }
+    view.update(cx, |v, cx| {
+        let events = crate::demo::attach(crate::demo::SID, seq)
+            .into_iter()
+            .filter_map(|e| match e {
+                synaps_client::Event::Attached { attach_seq, attached, mode, .. } => {
+                    Some(synaps_client::Event::Attached { attach_seq, attached, mode, reconnect: true })
+                }
+                _ => None,
+            })
+            .collect();
+        v.apply_batch(events, cx);
+    });
     wait(cx, w, &view, 7);
+    assert!(!view.read_with(cx, |v, _| v.model.reattaching), "attached again");
     assert_eq!(need(cx), up, "NEEDS YOU, back");
 }
 

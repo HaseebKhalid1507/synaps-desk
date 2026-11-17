@@ -180,7 +180,7 @@ fn no_gradients_anywhere() {
 #[test]
 fn rows_and_chips_have_no_press_yet() {
     for (name, code) in sources().into_iter().filter(|(n, _)| ["turns.rs", "tray.rs"].contains(&n.as_str())) {
-        for g in ["press_ch", "press_k", "btn_press", "warn_press", ".active(", "fx.fill(", ".lit("] {
+        for g in ["press_ch", "press_k", "btn_press", "warn_press", ".active(", "fx.fill(", ".lit(", "lit_rest(", "touch("] {
             assert!(!code.contains(g), "{name}: a press ({g}): add its inks to a press set");
         }
     }

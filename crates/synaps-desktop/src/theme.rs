@@ -1018,9 +1018,9 @@ pub fn luminance_hsla(c: Hsla) -> f32 {
 const UNDRAINED: &[&str] = &[
     "chrome", "canvas", "user", "code", "tool", "tool_out", "card", "card_hi", "raised", "hair", "edge", "frame", "add_bg", "del_bg",
     "thumb", "thumb_ch", "thumb_u", "press_ch", "press_k", "ink", "prose",
-    // Q1's (PR #16) ground and rules, kept for when it lands (a well greys
-    // while the code beside it doesn't): `grounds_and_rules_never_drain`
-    // fails on any new one missing here.
+    // Q1's (PR #16) ground and rules (a well greys while the code beside
+    // it doesn't): `grounds_and_rules_never_drain` fails on any new one
+    // missing here.
     "well", "hair_w", "hair_t", "edge_t",
 ];
 

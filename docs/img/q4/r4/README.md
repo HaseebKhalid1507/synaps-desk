@@ -46,7 +46,9 @@ The same pixel in the raw capture moves on every frame from f718 to f726, and ba
 
 **The tear:** the connection words' cell sits 3 px low at f74–75 and 2 px high at f76, and is back at f77.
 
-**The drain:** columns are the composer bar's pixel (633,1000), then mean chroma (the re-gate's method: max−min of R, G, B over the pixels coloured at f60), then the pixels that changed since the last frame.
+**The drain:** columns are the composer bar's pixel (633,1000), then mean chroma (the re-gate's method: max−min of R, G, B over the pixels coloured at f60), then the pixels that changed since the last frame. **"Pixels changed"** counts a pixel only when its R, G and B
+differences sum to more than 6, so the drain's first sub-unit steps read 0 there: counting any difference, f78 is 891
+and f79 is 7461.
 
 | frame | bar (633,1000) | wordmark | SESSIONS | theme square | disc | bar | pixels changed |
 |---|---|---|---|---|---|---|---|
@@ -87,10 +89,13 @@ The same pixel in the raw capture moves on every frame from f718 to f726, and ba
 ¹ The Scan's line crosses the bar's box on that frame.
 
 - **It moves together on every frame.** f324–f331: 8 frames, every element together. The largest step on the bar is 11.7 of 45 (26 %).
-- **No pop afterwards.** The pixels changed per frame fall 46012, 34482, 9594, 5745, 3825, 1911 over f332–f337 (the Scan's glow fading). After that, one frame moves: f341, 1910 pixels (the beat's glyph). Nothing else moves to f379.
+- **No pop afterwards.** The pixels changed per frame fall 46012, 34482, 9594, 5745, 3825, 1911 over f332–f337 (the Scan's glow fading). After that, one frame moves: f341, 1910 pixels, a 1 px row across the whole window at y 1079 (the bottom edge). Nothing else moves to f379.
 - **The disc ends at a different colour, and that is correct.** It was the loss's red (`err`) from f51, then drained red; after the hello it is the connected colour. 88.7 → 68.1 is a change of hue, not a short restore.
 
 **NEEDS YOU** (the stub's left edge, the top bar's first lit pixel between x 640 and 1280) is at **x 839 on every frame, f0–f379**. That covers the loss's words (`reconnecting ··`, then the client's error), the tear, the drain, the Scan and the restore. The words keep the connected words' width on a loss now, padded or cut with `…` (`chrome.rs hold_width`; test `needs_you_holds_still_through_a_loss`, which fails without the fix: 387.5 vs 398.0).
+This clip's window has **no session attached** ("No open sessions", "not attached"). With one attached, the
+session's own connection re-attaches after the link's hello, and "reattaching ···" now holds the same width
+until it is attached again (r5, Shady #15 M1: the same test sends `Event::Reattaching` and `Attached { reconnect }`).
 
 ## Stills
 
