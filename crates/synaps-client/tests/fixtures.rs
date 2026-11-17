@@ -310,7 +310,9 @@ fn a_swap_with_no_replacement_keeps_live_times() {
 /// A re-attach after a clear made while the tab was detached (in the TUI,
 /// another window): the daemon session is the same, its journal is new,
 /// and the same question asked again is another message. Its row reuses
-/// the id and has the snapshot's time, not the old one's. A reload of the
+/// the id and has the snapshot's time, not the old one's. The journal is
+/// the conversation header's: the attach's `meta.journal_id` still names
+/// the one the session started with, as 0.11.1 sends it. A reload of the
 /// same journal keeps the first times, and a clear seen live moves the
 /// journal the next re-attach is compared with.
 #[test]
@@ -321,7 +323,8 @@ fn a_reattach_after_a_clear_elsewhere_carries_no_time() {
     assert_eq!((asked.kind, asked.at.as_deref()), (ItemKind::User, Some("2026-11-13T07:34:27Z")));
     let again = |journal: &str, at: &str| {
         let mut b = attached("attached_history.json");
-        b.meta.journal_id = journal.into();
+        assert_eq!(b.meta.journal_id, "20261113-073427-5fde", "the meta keeps the first journal");
+        b.conversation.header["id"] = serde_json::json!(journal);
         let first = b.conversation.api_messages[0].clone();
         b.conversation.api_messages =
             vec![first, serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "Another answer."}]})];
