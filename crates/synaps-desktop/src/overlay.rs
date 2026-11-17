@@ -9,6 +9,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::display;
+use crate::fonts::TextPx as _;
 use crate::fonts::{self, size};
 use crate::theme::{self, Palette};
 
@@ -21,17 +22,31 @@ pub(crate) fn frame<E: Styled>(el: E, p: &Palette) -> E {
 }
 
 /// A tooltip: `text` in `s.title` `prose_k`, padded 8 / 4.
+#[allow(clippy::disallowed_methods)] // the one overlay box
 pub(crate) fn tip(text: impl Into<SharedString>, window: &mut Window, cx: &mut App) -> AnyView {
     boxed(Tooltip::new(text.into()), cx).build(window, cx)
 }
 
-/// [`tip`], with the key bound to `action` after the text.
+/// [`tip`], with the key bound to `action` after the text, as key hints
+/// are drawn: `m.meta` in `dim_k` (design.md §1.2, §8.8).
+#[allow(clippy::disallowed_methods)] // the one overlay box
 pub(crate) fn tip_key(text: impl Into<SharedString>, action: &dyn Action, window: &mut Window, cx: &mut App) -> AnyView {
-    boxed(Tooltip::new(text.into()).action(action, None), cx).build(window, cx)
+    let (text, action) = (text.into(), action.boxed_clone());
+    let body = move |window: &mut Window, cx: &mut App| {
+        let key = window
+            .highest_precedence_binding_for_action(action.as_ref())
+            .and_then(|b| b.keystrokes().first().map(|k| gpui_kit::component::kbd::Kbd::format(k.as_keystroke())));
+        h_flex()
+            .gap(px(12.))
+            .child(text.clone())
+            .when_some(key, |d, k| d.child(crate::app::mono(k, size::META, theme::palette(cx).dim_k).flex_none()))
+    };
+    boxed(Tooltip::element(body), cx).build(window, cx)
 }
 
 /// A body of its own on the box (the hover card): the kit's padding off,
 /// the body pads itself.
+#[allow(clippy::disallowed_methods)] // the one overlay box
 pub(crate) fn element<E: IntoElement>(body: impl Fn(&mut Window, &mut App) -> E + 'static, window: &mut Window, cx: &mut App) -> AnyView {
     let p = theme::palette(cx);
     Tooltip::element(body).bg(p.card).border_color(p.frame).p_0().shadow_none().build(window, cx)
@@ -45,7 +60,7 @@ fn boxed(t: Tooltip, cx: &App) -> Tooltip {
         .px(px(8.))
         .py(px(4.))
         .font_family(fonts::SANS)
-        .text_size(px(size::TITLE))
+        .text_px(size::TITLE)
         .line_height(px(18.))
         .text_color(p.prose_k)
 }
@@ -78,7 +93,7 @@ pub(crate) fn facts(rows: impl IntoIterator<Item = Fact>, p: &Palette) -> Div {
                 .flex_1()
                 .min_w_0()
                 .font_family(fonts::MONO)
-                .text_size(px(size::META))
+                .text_px(size::META)
                 .line_height(px(18.))
                 .child(div().text_color(p.prose_k).child(f.value))
                 .when(!f.aside.is_empty(), |d| d.child(div().text_color(p.dim_k).child(f.aside))),

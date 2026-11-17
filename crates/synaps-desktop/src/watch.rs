@@ -229,6 +229,10 @@ impl Worker {
             call: self.call.clone(),
         };
         let (unsent, tabbed) = (self.unsent.take(), self.tabbed);
+        // An in-place view's handle may name another worker now: its call
+        // is not known to be this one's (a worker tab's view is of one
+        // worker: another's first page makes it gone).
+        let c = Candidate { call: if tabbed { c.call } else { None }, ..c };
         *self = Worker::new(&c, self.cwd.as_deref());
         self.unsent = unsent;
         self.tabbed = tabbed;
@@ -350,6 +354,7 @@ impl Worker {
         }
         self.drained = finished && !page.more;
         if page.status != self.status {
+            log::debug!(target: "synaps_desktop::watch", "{}: its page says {} (was {:?})", self.handle_id, page.status, self.status);
             self.status = page.status;
             said = true;
         }
@@ -414,6 +419,16 @@ struct Steer {
 /// to it (its view has gone).
 fn refused_note(name: &str, handle_id: &str, reason: &str) -> String {
     format!("your steer to {name} ({handle_id}) was refused ({reason}): Enter now sends it to the session")
+}
+
+/// What a poll's reply did ([`Watch::on_reply`]): whether its view shows
+/// anything new, and the state word of the page it took of the worker it
+/// watches (`None`: none: a stale reply, another worker's page, gone,
+/// unsupported).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Heard {
+    pub shown: bool,
+    pub page: Option<String>,
 }
 
 /// The poll in flight.
@@ -694,10 +709,9 @@ impl Watch {
 
     /// The daemon's reply to a poll. Only the one asked for counts (a late
     /// reply to an earlier ask is dropped: its page was asked again).
-    /// Whether anything changed.
-    pub fn on_reply(&mut self, handle_id: &str, since: u64, reply: WatchReply, now: Instant) -> bool {
+    pub fn on_reply(&mut self, handle_id: &str, since: u64, reply: WatchReply, now: Instant) -> Heard {
         if self.pending.as_ref() != Some(&Pending { handle_id: handle_id.to_string(), since }) {
-            return false;
+            return Heard::default();
         }
         self.pending = None;
         let focused = self.focus.as_deref() == Some(handle_id);
@@ -708,10 +722,11 @@ impl Watch {
             if first && let Some(w) = self.workers.get_mut(handle_id) {
                 w.notice(UNSUPPORTED.into());
             }
-            return true;
+            return Heard { shown: true, page: None };
         }
         let scrolled_back = self.scrolled_back;
-        let Some(w) = self.workers.get_mut(handle_id) else { return false };
+        let Some(w) = self.workers.get_mut(handle_id) else { return Heard::default() };
+        let mut took = None;
         let (next, changed) = match reply {
             WatchReply::Page(page) if w.reused(&page) && w.tabbed => {
                 let who = if page.agent_name.is_empty() { String::new() } else { format!(" ({})", page.agent_name) };
@@ -724,6 +739,7 @@ impl Watch {
             }
             WatchReply::Page(page) => {
                 let more = page.more;
+                took = Some(page.status.clone());
                 let changed = w.apply(*page, now, scrolled_back);
                 let next = if more {
                     Some(now)
@@ -756,7 +772,7 @@ impl Watch {
         if focused {
             self.next_poll = next;
         }
-        changed
+        Heard { shown: changed, page: took }
     }
 
     /// The session was attached again (a reconnect, a reload, a restarted
@@ -1018,10 +1034,10 @@ mod tests {
         w.open(&Candidate::of(2, "sleeper"), None, t0);
         assert_eq!(w.take_poll(t0), Some(("sa_2".into(), 0)));
         assert_eq!(w.take_poll(t0), None, "one in flight");
-        assert!(w.on_reply("sa_2", 0, running(3, true, json!([{"kind": "text", "text": "Step 1."}])), t0));
+        assert!(w.on_reply("sa_2", 0, running(3, true, json!([{"kind": "text", "text": "Step 1."}])), t0).shown);
         assert_eq!(w.poll_due(), Some(t0), "more: at once");
         assert_eq!(w.take_poll(t0), Some(("sa_2".into(), 3)));
-        assert!(w.on_reply("sa_2", 3, running(5, false, json!([{"kind": "text", "text": " Step 2."}])), t0));
+        assert!(w.on_reply("sa_2", 3, running(5, false, json!([{"kind": "text", "text": " Step 2."}])), t0).shown);
         assert_eq!(w.poll_due(), Some(t0 + POLL_INTERVAL));
         assert_eq!(w.take_poll(t0 + Duration::from_millis(100)), None, "not yet");
         let t1 = t0 + POLL_INTERVAL;
@@ -1029,8 +1045,8 @@ mod tests {
         // No reply: after the timeout the same cursor is asked again; the
         // first ask's late reply changes nothing.
         assert_eq!(w.take_poll(t1 + POLL_TIMEOUT), Some(("sa_2".into(), 5)));
-        assert!(w.on_reply("sa_2", 5, running(6, false, json!([{"kind": "text", "text": " Step 3."}])), t1));
-        assert!(!w.on_reply("sa_2", 5, running(6, false, json!([{"kind": "text", "text": " Step 3."}])), t1));
+        assert!(w.on_reply("sa_2", 5, running(6, false, json!([{"kind": "text", "text": " Step 3."}])), t1).shown);
+        assert!(!w.on_reply("sa_2", 5, running(6, false, json!([{"kind": "text", "text": " Step 3."}])), t1).shown);
         let v = w.focused().unwrap();
         assert_eq!(texts(v)[1], (ItemKind::Assistant, "Step 1. Step 2. Step 3.".into()));
         assert_eq!(v.next_seq, 6);
@@ -1038,7 +1054,7 @@ mod tests {
         let done = page(json!({"handle_id": "sa_2", "status": "completed", "next_seq": 7, "events": [{"kind": "done"}]}));
         let t2 = t1 + POLL_TIMEOUT + POLL_INTERVAL;
         assert_eq!(w.take_poll(t2), Some(("sa_2".into(), 6)));
-        assert!(w.on_reply("sa_2", 6, done, t2));
+        assert!(w.on_reply("sa_2", 6, done, t2).shown);
         let v = w.focused().unwrap();
         assert!(v.read_only() && v.drained && !v.transcript.busy());
         assert_eq!(texts(v).last().unwrap().1, "sleeper completed: this view is read-only");
@@ -1057,7 +1073,7 @@ mod tests {
         let _ = w.take_poll(t0);
         w.focus_main();
         assert_eq!((w.poll_due(), w.take_poll(t0 + POLL_TIMEOUT)), (None, None));
-        assert!(!w.on_reply("sa_2", 0, running(1, false, json!([])), t0), "asked before it left");
+        assert!(!w.on_reply("sa_2", 0, running(1, false, json!([])), t0).shown, "asked before it left");
         w.open(&Candidate::of(2, "sleeper"), None, t0);
         w.suspend();
         assert_eq!(w.poll_due(), None);
@@ -1263,7 +1279,7 @@ mod tests {
             let _ = w.take_poll(t0);
             let page = page(json!({"handle_id": format!("sa_{id}"), "subagent_id": id, "agent_name": "worker", "status": "running",
                 "steerable": true, "next_seq": 4, "more": false, "events": []}));
-            assert!(w.on_reply(&format!("sa_{id}"), 0, page, t0));
+            assert!(w.on_reply(&format!("sa_{id}"), 0, page, t0).shown);
             if id == 1 {
                 w.steer_sent("sa_1", "stop after the next step");
             }
@@ -1312,7 +1328,7 @@ mod tests {
         let _ = w.take_poll(t0);
         let builder = page(json!({"handle_id": "sa_2", "subagent_id": 2, "agent_name": "builder", "status": "running", "steerable": true,
             "next_seq": 3, "events": [{"kind": "text", "text": "builder's secret"}]}));
-        assert!(w.on_reply("sa_2", 0, builder, t0));
+        assert!(w.on_reply("sa_2", 0, builder, t0).shown);
         let v = w.focused().unwrap();
         assert_eq!(v.state(), "gone");
         assert!(texts(v).iter().all(|(_, t)| !t.contains("builder's secret")), "nothing of builder's");
@@ -1387,7 +1403,7 @@ mod tests {
         let mut w = Watch::default();
         w.open(&Candidate::of(2, "sleeper"), None, t0);
         let _ = w.take_poll(t0);
-        assert!(w.on_reply("sa_2", 0, WatchReply::Unsupported, t0));
+        assert!(w.on_reply("sa_2", 0, WatchReply::Unsupported, t0).shown);
         assert!(w.unsupported);
         assert_eq!((w.poll_due(), w.steer_target()), (None, Some(Err(UNSUPPORTED.into()))));
         w.open(&Candidate::of(3, "other"), None, t0);
@@ -1398,7 +1414,7 @@ mod tests {
         assert!(!w.unsupported);
         assert!(w.worker("sa_2").is_none(), "a view nobody looks at goes with the connection");
         assert_eq!(w.take_poll(t0), Some(("sa_3".into(), 0)));
-        assert!(w.on_reply("sa_3", 0, WatchReply::Gone("no subagent sa_3 in this session".into()), t0));
+        assert!(w.on_reply("sa_3", 0, WatchReply::Gone("no subagent sa_3 in this session".into()), t0).shown);
         assert_eq!((w.focused().unwrap().state(), w.poll_due()), ("gone", None));
         assert_eq!(w.candidates(&[]).iter().map(|c| c.handle_id.as_str()).collect::<Vec<_>>(), ["sa_3"], "the focused one");
         w.focus_main();
@@ -1543,16 +1559,16 @@ mod tests {
         let mut w = Watch::default();
         w.open(&Candidate::of(2, "sleeper"), None, t0);
         let _ = w.take_poll(t0);
-        assert!(w.on_reply("sa_2", 0, running(1, false, json!([])), t0), "the first page names it and says it runs");
+        assert!(w.on_reply("sa_2", 0, running(1, false, json!([])), t0).shown, "the first page names it and says it runs");
         let hint = w.focused().unwrap().hint.clone();
         for i in 1..5 {
             let _ = w.take_poll(t0 + POLL_INTERVAL * i);
-            assert!(!w.on_reply("sa_2", 1, running(1, false, json!([])), t0), "idle: nothing to draw");
+            assert!(!w.on_reply("sa_2", 1, running(1, false, json!([])), t0).shown, "idle: nothing to draw");
             assert_eq!(w.poll_due(), Some(t0 + POLL_INTERVAL), "and the next poll is due");
         }
         assert!(w.focused().unwrap().hint.as_ptr() == hint.as_ptr(), "its strings were not made again");
         let _ = w.take_poll(t0 + POLL_INTERVAL * 5);
-        assert!(w.on_reply("sa_2", 1, running(2, false, json!([{"kind": "text", "text": "Step 1."}])), t0));
+        assert!(w.on_reply("sa_2", 1, running(2, false, json!([{"kind": "text", "text": "Step 1."}])), t0).shown);
     }
 
     /// A cold-started daemon numbers its workers from 1 again. A page whose
@@ -1566,26 +1582,29 @@ mod tests {
         let t0 = Instant::now();
         let mut w = Watch::default();
         w.on_reconnect(t0, Some(100));
-        w.open(&Candidate::of(2, "sleeper"), None, t0);
+        w.open(&Candidate::of(2, "sleeper").with_call(Some("toolu_old")), None, t0);
         let _ = w.take_poll(t0);
-        w.on_reply("sa_2", 0, running(9, false, json!([{"kind": "text", "text": "old worker"}])), t0);
+        let heard = w.on_reply("sa_2", 0, running(9, false, json!([{"kind": "text", "text": "old worker"}])), t0);
+        assert_eq!(heard.page.as_deref(), Some("running"), "a page it took: its word");
         let generation = w.focus_key().unwrap().1;
         // A cursor that went back: another journal behind sa_2.
         let _ = w.take_poll(t0 + POLL_INTERVAL);
-        assert!(w.on_reply("sa_2", 9, running(3, false, json!([{"kind": "text", "text": "new worker"}])), t0));
+        let heard = w.on_reply("sa_2", 9, running(3, false, json!([{"kind": "text", "text": "new worker"}])), t0);
+        assert_eq!(heard, Heard { shown: true, page: None }, "another worker's page says nothing of this one");
         let v = w.focused().unwrap();
         assert!(w.focus_key().unwrap().1 != generation, "another list");
         assert_eq!((v.next_seq, v.status.as_str(), v.steerable), (0, "", false));
+        assert_eq!(v.key(), (None, "sleeper"), "whose call it is, not known (Shady L1)");
         assert!(texts(v).iter().all(|(_, t)| t != "old worker" && t != "new worker"));
         assert_eq!(texts(v).last().unwrap().1, "sa_2 is another worker now (the daemon restarted): its thread from the start");
         assert_eq!(w.take_poll(t0), Some(("sa_2".into(), 0)), "asked from 0 at once");
         // Another name at a cursor ahead: also another worker.
-        assert!(w.on_reply("sa_2", 0, running(4, false, json!([])), t0));
+        assert!(w.on_reply("sa_2", 0, running(4, false, json!([])), t0).shown);
         let generation = w.focus_key().unwrap().1;
         let _ = w.take_poll(t0 + POLL_INTERVAL);
         let other =
             json!({"handle_id": "sa_2", "agent_name": "scout", "status": "running", "steerable": true, "next_seq": 6, "events": []});
-        assert!(w.on_reply("sa_2", 4, page(other), t0));
+        assert!(w.on_reply("sa_2", 4, page(other), t0).shown);
         assert!(w.focus_key().unwrap().1 != generation && w.focused().unwrap().next_seq == 0);
         // A reconnect to the same daemon: no steer until a page says so;
         // the views nobody looks at go.
@@ -1600,7 +1619,7 @@ mod tests {
         assert_eq!(w.steer_target(), Some(Err("sleeper can't be steered right now: try again in a moment".into())));
         assert_eq!(w.focused().unwrap().hint, "sleeper can't be steered right now · Esc returns to the session", "nor says it can");
         assert_eq!((w.focus_key().unwrap().1, w.take_poll(t0)), (generation, Some(("sa_2".into(), 4))), "from its cursor");
-        assert!(w.on_reply("sa_2", 4, running(4, false, json!([])), t0), "steerable again: drawn");
+        assert!(w.on_reply("sa_2", 4, running(4, false, json!([])), t0).shown, "steerable again: drawn");
         assert_eq!(w.steer_target(), Some(Ok("sa_2".into())));
         assert!(w.focused().unwrap().hint.starts_with("steer sleeper: "));
         // Another daemon process: from 0.

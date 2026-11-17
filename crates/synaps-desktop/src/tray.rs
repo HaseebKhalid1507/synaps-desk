@@ -22,6 +22,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{AppView, WORKER_KEY, column, display, mono};
+use crate::fonts::TextPx as _;
 use crate::fonts::{self, label};
 use crate::glyph::{self, Glyph, Ground};
 use crate::menu::At;
@@ -270,7 +271,7 @@ impl AppView {
             .px(px(m.pad_x))
             .items_center()
             .whitespace_nowrap()
-            .text_size(px(m.meta))
+            .text_px(m.meta)
             // The watched worker (the composer steers it): its bar is the
             // tray's ([`AppView::render_tray`]).
             .when(watched, |d| d.bg(p.tool_out))
@@ -349,7 +350,7 @@ impl AppView {
                     .overflow_hidden()
                     .text_ellipsis()
                     .font_family(fonts::MONO)
-                    .text_size(px(m.meta))
+                    .text_px(m.meta)
                     .text_color(p.prose_k)
                     .when_some(gist.filter(|_| !lay.tight), |d, g| d.child(g)),
             )

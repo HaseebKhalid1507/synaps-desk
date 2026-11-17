@@ -1,7 +1,8 @@
-//! The house rules no compiler checks (design.md §1.2, §5, §8.9), read off
-//! the sources: no text under 12 px but Usage's and the right panel's
-//! figures; no opacity but a chart's data; every tooltip on the one
-//! overlay box. Line ends and path separators as the platform has them.
+//! The house rules (design.md §1.2, §5, §8.9), read off the sources: a
+//! backstop to clippy's `disallowed-methods` (`clippy.toml`), which holds
+//! them at compile time: no text under 12 px; no opacity but a chart's
+//! data; every tooltip on the one overlay box. Line ends and path
+//! separators as the platform has them.
 
 use std::path::Path;
 
@@ -63,26 +64,32 @@ fn line_of(code: &str, at: usize) -> usize {
 }
 
 /// No text-size literal under 12 px (design.md §1.2): not in
-/// `text_size(px(…))`, nor as the size of the text helpers (`display`,
-/// `mono`, `sans`); no kit size under 12 either.
+/// `text_px(…)`, nor as the size of the text helpers (`display`, `mono`,
+/// `sans`); no size set but by `fonts::TextPx`; no kit size under 12.
 #[test]
 fn no_text_under_12_px() {
     let mut bad = Vec::new();
     for (name, code) in sources() {
-        for call in ["display(", "mono(", "sans(", "text_size(px("] {
+        for call in ["display(", "mono(", "sans(", "text_px("] {
             for (at, _) in code.match_indices(call) {
                 // A whole name: not `foo_mono(`.
-                if call != "text_size(px(" && code[..at].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                if call != "text_px(" && code[..at].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_') {
                     continue;
                 }
                 let open = at + call.len() - 1;
                 let a = args(&code, open);
-                let size = if call == "text_size(px(" { a.first() } else { a.get(1) };
+                let size = if call == "text_px(" { a.first() } else { a.get(1) };
                 if let Some(v) = size.and_then(|s| s.parse::<f32>().ok())
                     && v < 12.
                 {
                     bad.push(format!("{name}:{} {call}… {v}", line_of(&code, at)));
                 }
+            }
+        }
+        // Sizes are set only by `fonts::TextPx`.
+        if name != "fonts.rs" {
+            for (at, _) in code.match_indices(".text_size(") {
+                bad.push(format!("{name}:{} .text_size(", line_of(&code, at)));
             }
         }
         for small in [".text_xs()", ".text_2xs()"] {
@@ -116,8 +123,25 @@ fn every_tooltip_is_the_overlay() {
         .into_iter()
         .filter(|(name, _)| name != "overlay.rs")
         .flat_map(|(name, code)| {
-            code.match_indices("Tooltip::").map(|(at, _)| format!("{name}:{}", line_of(&code, at))).collect::<Vec<_>>()
+            ["Tooltip::", "Tooltip as", "tooltip::{"]
+                .into_iter()
+                .flat_map(|t| code.match_indices(t).map(|(at, _)| format!("{name}:{}", line_of(&code, at))).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
         })
         .collect();
     assert!(bad.is_empty(), "a tooltip not built by overlay.rs:\n{}", bad.join("\n"));
+}
+
+/// The lint's way in, one per rule: `clippy::disallowed_methods` is
+/// allowed only where its rule lives (fonts.rs, chart.rs, overlay.rs).
+#[test]
+fn the_house_rules_are_allowed_only_where_they_live() {
+    let bad: Vec<String> = sources()
+        .into_iter()
+        .filter(|(name, _)| !["fonts.rs", "chart.rs", "overlay.rs"].contains(&name.as_str()))
+        .flat_map(|(name, code)| {
+            code.match_indices("disallowed_methods").map(|(at, _)| format!("{name}:{}", line_of(&code, at))).collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(bad.is_empty(), "the house rules allowed outside their home:\n{}", bad.join("\n"));
 }
