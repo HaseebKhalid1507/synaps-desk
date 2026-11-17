@@ -129,10 +129,10 @@ const TRAY: u64 = 1 << 61;
 /// Between chips, and between their lines.
 pub(crate) const CHIP_GAP: f32 = 8.;
 
-/// A chip's step, at most, and its name. polish.md §2.5 says 32: at 24 two
+/// A chip's step, at most, and its name. polish.md §2.5 says 32: at 20 two
 /// chips share the 672 px column (a 10-character name, a cut step and a
-/// clock come to ~325 px).
-pub(crate) const STEP_CHARS: usize = 24;
+/// clock come to ~310 px).
+pub(crate) const STEP_CHARS: usize = 20;
 const NAME_CHARS: usize = 18;
 
 /// A chip's clock as this frame shows it: ticking while it runs (motion
@@ -546,49 +546,48 @@ impl AppView {
                 .group_hover("tray-row", |s| s.bg(p.tool_out))
                 .child(x)
         });
-        let row =
-            h_flex()
-                .id(("tray-row", r.id as usize))
-                .group("tray-row")
-                .h(px(h))
-                .w(px(w))
-                .relative()
-                .pl(px(12.))
-                .pr(px(10.))
-                .gap(px(8.))
-                .items_center()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_px(m.meta)
-                .bg(if watched { p.tool_out } else { p.tool })
-                .border_1()
-                .border_color(p.hair)
-                .child(crate::turns::live_glyph(
-                    &self.fx,
-                    g,
-                    mark,
-                    p.tool,
-                    self.fx.change(Tag::TrayGlyph, r.id, crate::turns::glyph_code(glyph::worker(glyph::steady(r.live, r.demoted)).0), None),
-                    None,
-                    false,
-                ))
-                .child(div().flex_none().text_color(p.sub_name_t).child(SharedString::from(cut(&r.name, NAME_CHARS))))
-                .when_some(armed_el, |d, a| d.child(a))
-                .when(!armed, |d| {
-                    d.child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_color(step_color)
-                            .child(SharedString::from(chip_step(r).to_string())),
-                    )
-                    .children(clock.map(|c| div().flex_none().text_color(p.sub_time_t).child(c)))
-                })
-                .children(x)
-                .child(bar)
-                .children(self.render_menu_at_row(r.id, p, cx));
+        let row = h_flex()
+            .id(("tray-row", r.id as usize))
+            .group("tray-row")
+            .h(px(h))
+            .w(px(w))
+            .relative()
+            .pl(px(12.))
+            .pr(px(10.))
+            .gap(px(8.))
+            .items_center()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_px(m.meta)
+            .bg(if watched { p.tool_out } else { p.tool })
+            .border_1()
+            .border_color(p.hair)
+            .child(crate::turns::live_glyph(
+                &self.fx,
+                g,
+                mark,
+                p.tool,
+                self.fx.change(Tag::TrayGlyph, r.id, crate::turns::glyph_code(glyph::worker(glyph::steady(r.live, r.demoted)).0), None),
+                None,
+                false,
+            ))
+            .child(div().flex_none().text_color(p.sub_name_t).child(SharedString::from(cut(&r.name, NAME_CHARS))))
+            .when_some(armed_el, |d, a| d.child(a))
+            .when(!armed, |d| {
+                d.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(step_color)
+                        .child(SharedString::from(chip_step(r).to_string())),
+                )
+                .children(clock.map(|c| div().flex_none().text_color(p.sub_time_t).child(c)))
+            })
+            .children(x)
+            .child(bar)
+            .children(self.render_menu_at_row(r.id, p, cx));
         if !r.watchable {
             let tip = r.tip.clone();
             return row.tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)).into_any_element();
