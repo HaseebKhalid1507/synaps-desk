@@ -27,6 +27,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::base::motion::Easing;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 // ── the setting ───────────────────────────────────────────────────────
@@ -173,6 +174,214 @@ pub(crate) fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
     let t = t.clamp(0., 1.);
     let l = |p: f32, q: f32| p + (q - p) * t;
     Hsla::from(Rgba { r: l(x.r, y.r), g: l(x.g, y.g), b: l(x.b, y.b), a: l(x.a, y.a) })
+}
+
+// ── fluid (cohesion/fluid.md §2): matter on springs ─────────────────
+
+/// `wheel`: wheel-notch scrolling (91 ms to 95 %).
+pub(crate) const WHEEL_RESPONSE: f32 = 0.12;
+/// `flick`: small travel (≤ 16 px): arrival offsets, streamed line growth.
+pub(crate) const FLICK_RESPONSE: f32 = 0.16;
+/// `glide`: scroll jumps, a view arriving.
+pub(crate) const GLIDE_RESPONSE: f32 = 0.3;
+/// An arriving block's or word's first strength: never lower (law 3).
+pub(crate) const LIFT: f32 = 0.7;
+/// A block or row arriving in a list travels this far, from below.
+pub(crate) const ARRIVE: f32 = 8.;
+/// A view (session, tab, worker) arriving travels this far, in its direction.
+pub(crate) const SHIFT: f32 = 12.;
+/// A streamed word reaches full strength over this.
+pub(crate) const STREAM_FADE: Duration = Duration::from_millis(180);
+/// Each further word of one update starts this much later.
+pub(crate) const STREAM_STAGGER: Duration = Duration::from_millis(12);
+/// Positions settle within this (px).
+const FLUID_EPSILON: f32 = 0.5;
+
+/// `stream`: a streamed word's strength, piecewise linear 0.70 at 0, 0.88
+/// at 0.35, 1.0 at 1: it starts at the floor, so no word is ever faint.
+pub(crate) fn stream_curve() -> Easing {
+    use gpui_kit::base::motion::LinearStop;
+    Easing::linear_stops([LinearStop::at(LIFT, 0.), LinearStop::at(0.88, 0.35), LinearStop::at(1., 1.)]).unwrap_or(Easing::Linear)
+}
+
+/// The one way a text view gets a motion policy (fluid.md §3.4): words
+/// streamed into it start at [`LIFT`] and reach full colour over
+/// [`STREAM_FADE`]. The kit plays it only while its reduce-motion flag is
+/// clear ([`Level::apply`]): Full.
+pub(crate) fn text_motion() -> gpui_kit::base::TextViewMotion {
+    gpui_kit::base::TextViewMotion::default()
+        .with_stream_fade(STREAM_FADE)
+        .with_stream_fade_stagger(STREAM_STAGGER)
+        .with_stream_fade_easing(stream_curve())
+}
+
+/// The one sanctioned opacity (fluid.md §3.6, law 3): something arriving
+/// lifts from [`LIFT`] to full, never lower. Opaque grounds only.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn lift<E: Styled>(el: E, strength: f32) -> E {
+    if strength >= 1. { el } else { el.opacity(strength.max(LIFT)) }
+}
+
+/// A critically damped spring's state (ζ = 1): its displacement `x` from
+/// the target and its velocity `v` (per second). Stepped analytically, so
+/// any frame interval samples the same curve; a retarget shifts `x` by the
+/// move and keeps the velocity.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Spring {
+    pub(crate) x: f32,
+    pub(crate) v: f32,
+}
+
+impl Spring {
+    /// `dt` seconds on, `response` the undamped period.
+    pub(crate) fn step(&mut self, response: f32, dt: f32) {
+        let w = std::f32::consts::TAU / response;
+        let e = (-w * dt).exp();
+        let c = self.v + w * self.x;
+        (self.x, self.v) = ((self.x + c * dt) * e, (self.v - w * c * dt) * e);
+    }
+
+    pub(crate) fn settled(&self, response: f32) -> bool {
+        self.x.abs() < FLUID_EPSILON && self.v.abs() < FLUID_EPSILON * std::f32::consts::TAU / response
+    }
+
+    /// The displacement `t` seconds after a rest at `x0`.
+    pub(crate) fn from_rest(x0: f32, response: f32, t: f32) -> f32 {
+        let mut s = Spring { x: x0, v: 0. };
+        s.step(response, t.max(0.));
+        s.x
+    }
+}
+
+/// How a row is drawn this frame ([`Motion::grow`]): clipped to `shown`
+/// (none: its own height), where its measured height goes, and (arriving)
+/// its content's travel from below and strength.
+#[derive(Clone, Debug)]
+pub(crate) struct Grow {
+    /// The row's key (its display id).
+    pub(crate) key: u64,
+    pub(crate) shown: Option<f32>,
+    pub(crate) sink: Rc<Cell<f32>>,
+    pub(crate) travel: f32,
+    pub(crate) strength: f32,
+}
+
+#[derive(Clone, Debug)]
+struct Growing {
+    /// Its row in the list (this frame's).
+    ix: usize,
+    shown: f32,
+    spring: Spring,
+    arriving: bool,
+    born: Option<Instant>,
+    at: Instant,
+    frame: u64,
+    sink: Rc<Cell<f32>>,
+}
+
+/// The wrapper a growing row is drawn in: `g.shown` tall, its body laid
+/// out at its own height as the wrapper's child (one layout, not measured
+/// apart: no double layout however many rows arrive), that height sent to
+/// the sink for the next frame, and the body clipped to the wrapper's top
+/// and bottom only ([`ClipY`]). What hangs in the gutter is drawn outside
+/// the clip: the `label` (positioned, and at `top` in the row) travels and
+/// lifts with the body, whole from the first frame; the write head `head`
+/// sits on the wrapper's bottom, the row's shown bottom.
+pub(crate) fn grow_block(body: AnyElement, label: Option<(Div, f32)>, head: Option<Div>, g: Grow) -> AnyElement {
+    let (sink, key) = (g.sink.clone(), g.key);
+    let content = div().w_full().flex_shrink_0().relative().top(px(g.travel)).child(body);
+    let clip = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .debug_selector(move || format!("grow-clip-{key}"))
+        .when_some(g.shown, |d, h| d.h(px(h)))
+        .child(lift(content, g.strength))
+        .on_children_prepainted(move |b, _, _| {
+            if let Some(b) = b.first() {
+                sink.set(f32::from(b.size.height));
+            }
+        });
+    div()
+        .relative()
+        .w_full()
+        .flex()
+        .flex_col()
+        .child(ClipY(clip.into_any_element()))
+        .children(label.map(|(l, top)| lift(l.top(px(top + g.travel)), g.strength)))
+        .children(head)
+        .into_any_element()
+}
+
+/// Its child, clipped to its own top and bottom and nothing else: a
+/// revealing row's gutter (the hanging labels, the write head, left of the
+/// row's box) stays drawn. GPUI's `overflow_*` clip x as well, whichever
+/// axis they hide. The list's own mask still bounds x.
+struct ClipY(AnyElement);
+
+impl ClipY {
+    fn mask(b: Bounds<Pixels>) -> ContentMask<Pixels> {
+        let wide = px(1.0e6);
+        ContentMask { bounds: Bounds::from_corners(point(b.left() - wide, b.top()), point(b.right() + wide, b.bottom())) }
+    }
+}
+
+impl IntoElement for ClipY {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for ClipY {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.0.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.with_content_mask(Some(Self::mask(bounds)), |window| {
+            self.0.prepaint(window, cx);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.with_content_mask(Some(Self::mask(bounds)), |window| self.0.paint(window, cx));
+    }
 }
 
 // ── what a value is, and how it runs ──────────────────────────────────
@@ -361,6 +570,11 @@ pub(crate) struct Motion {
     births: RefCell<HashMap<u64, Instant>>,
     slides: RefCell<HashMap<u64, Slide>>,
     turns: RefCell<HashMap<u64, (Tween, u64)>>,
+    /// Rows revealing or growing ([`Motion::grow`]).
+    grows: RefCell<HashMap<u64, Growing>>,
+    /// Rows born that will not reveal: first drawn off screen, in the
+    /// list's overdraw ([`Motion::unpainted`]).
+    quiet: RefCell<std::collections::HashSet<u64>>,
     /// The one timer.
     timer: RefCell<Option<Task<()>>>,
     /// The instant it is armed for, and whom it wakes (cleared as it fires).
@@ -389,6 +603,9 @@ pub(crate) struct Motion {
     /// clock's offset from the wall clock, in signed nanoseconds.
     #[cfg(test)]
     skew: Cell<i128>,
+    /// Tests: the clock stands at this instant until set ([`Motion::pin_clock`]).
+    #[cfg(test)]
+    pin: Cell<Option<Instant>>,
     /// Tests: the OS in low power ([`Motion::low_power`]).
     #[cfg(test)]
     pub(crate) force_low_power: Cell<bool>,
@@ -420,6 +637,8 @@ impl Motion {
             births: RefCell::default(),
             slides: RefCell::default(),
             turns: RefCell::default(),
+            grows: RefCell::default(),
+            quiet: RefCell::default(),
             timer: RefCell::default(),
             armed: Rc::default(),
             woke: Rc::default(),
@@ -433,6 +652,8 @@ impl Motion {
             scope: Cell::new((0, 0)),
             #[cfg(test)]
             skew: Cell::new(0),
+            #[cfg(test)]
+            pin: Cell::new(None),
             #[cfg(test)]
             force_low_power: Cell::new(false),
             #[cfg(test)]
@@ -460,8 +681,145 @@ impl Motion {
             self.seen.borrow_mut().retain(|k, _| !k.0.column());
         }
         self.turns.borrow_mut().clear();
+        self.grows.borrow_mut().clear();
+        self.quiet.borrow_mut().clear();
         self.births.borrow_mut().clear();
         self.fold.set(None);
+    }
+
+    /// Fluid motion the agent causes plays (fluid.md §5): Full, and not in
+    /// low power, which stops it (the user's scroll asks [`Motion::level`]).
+    pub(crate) fn fluid(&self) -> bool {
+        self.ambient.get()
+    }
+
+    /// Row `key`'s height this frame (fluid.md §3.3, §3.4), or none: drawn
+    /// as is (Reduced, Off, low power, history, at rest).
+    /// - `born` (it arrived while watched): its height reveals 0 → its own
+    ///   on `snap`, clipped. Its first frame is 0 px tall (measured, not
+    ///   shown), so the reveal runs to its true height from the start.
+    ///   Inside, the content travels [`ARRIVE`] → 0 (`flick`) and lifts
+    ///   [`LIFT`] → 1 (`quick`, `out`).
+    /// - `streaming`: a height that grows (a wrapped line) glides there on
+    ///   `flick` (an arrival's reveal on `snap`), never more than `line`
+    ///   short of its true height once it has arrived; it shrinks at once.
+    ///   The height is the last frame's measure: a chunk of more than a
+    ///   line shows one frame (7 ms at 144 Hz) at the height before it.
+    ///
+    /// Settled, a row that no longer streams is unwrapped (none): a row is
+    /// wrapped only while it moves or streams. `ix`: its row in the list.
+    pub(crate) fn grow(&self, key: u64, ix: usize, born: Option<Instant>, streaming: bool, line: f32) -> Option<Grow> {
+        if !self.fluid() {
+            return None;
+        }
+        let (frame, now) = (self.frame.get(), self.now());
+        let mut grows = self.grows.borrow_mut();
+        let fresh = born.is_some_and(|b| now.saturating_duration_since(b) < QUICK) && !self.quiet.borrow().contains(&key);
+        let g = match grows.get_mut(&key) {
+            Some(g) if g.frame + 1 >= frame => g,
+            _ if fresh || streaming => {
+                let g = Growing {
+                    ix,
+                    shown: f32::NAN,
+                    spring: Spring::default(),
+                    arriving: fresh,
+                    born: born.filter(|_| fresh),
+                    at: now,
+                    frame,
+                    sink: Rc::new(Cell::new(f32::NAN)),
+                };
+                grows.insert(key, g);
+                grows.get_mut(&key)?
+            }
+            _ => return None,
+        };
+        let dt = now.saturating_duration_since(g.at).as_secs_f32().min(0.05);
+        (g.at, g.frame, g.ix) = (now, frame, ix);
+        let natural = g.sink.get();
+        let since = g.born.map_or(1., |b| now.checked_duration_since(b).map_or(0., |d| d.as_secs_f32()));
+        let (travel, strength) = if g.arriving {
+            let q = (since / QUICK.as_secs_f32()).clamp(0., 1.);
+            (Spring::from_rest(ARRIVE, FLICK_RESPONSE, since), LIFT + (1. - LIFT) * ease::OUT.sample(q))
+        } else {
+            (0., 1.)
+        };
+        let content_moves = g.arriving && (travel >= FLUID_EPSILON || strength < 1.);
+        if natural.is_nan() {
+            // Not measured yet: an arrival is 0 px tall; a streaming row its own height.
+            self.want_frame();
+            return Some(Grow { key, shown: g.arriving.then_some(0.), sink: g.sink.clone(), travel, strength });
+        }
+        if g.shown.is_nan() {
+            g.shown = if g.arriving { 0. } else { natural };
+        }
+        if g.born.is_none_or(|b| b <= now) {
+            if natural < g.shown {
+                (g.shown, g.spring) = (natural, Spring::default());
+            } else {
+                let response = if g.arriving { SNAP_RESPONSE } else { FLICK_RESPONSE };
+                g.spring.x = g.shown - natural;
+                g.spring.step(response, dt);
+                if streaming && !g.arriving {
+                    // The newest line is never more than a line away (an
+                    // arrival reveals all of itself on `snap` first).
+                    g.spring.x = g.spring.x.max(-line);
+                }
+                g.shown = natural + g.spring.x;
+                if g.spring.settled(response) {
+                    (g.shown, g.spring) = (natural, Spring::default());
+                }
+            }
+        }
+        // Arrived: its content at rest, and (unless it streams on) all of it
+        // shown. A streaming arrival's new lines then glide, a line short at most.
+        if g.arriving && !content_moves && (streaming || g.shown == natural) {
+            g.arriving = false;
+        }
+        if g.shown == natural && !content_moves {
+            if !streaming {
+                grows.remove(&key);
+                return None;
+            }
+        } else {
+            self.want_frame();
+        }
+        Some(Grow { key, shown: Some(g.shown), sink: g.sink.clone(), travel, strength })
+    }
+
+    /// After the list's layout: arrivals it drew this frame but did not
+    /// paint (laid out in its overdraw, off screen) have no measure, and
+    /// GPUI keeps the 0 px they were drawn at. They don't reveal: they come
+    /// back at their height, and their rows (returned) are measured again.
+    pub(crate) fn unpainted(&self) -> Vec<usize> {
+        let frame = self.frame.get();
+        let mut out = Vec::new();
+        self.grows.borrow_mut().retain(|key, g| {
+            let off = g.frame == frame && g.arriving && g.sink.get().is_nan();
+            if off {
+                self.quiet.borrow_mut().insert(*key);
+                out.push(g.ix);
+            }
+            !off
+        });
+        out
+    }
+
+    /// Rows revealing or growing now (tests).
+    #[cfg(test)]
+    pub(crate) fn growing(&self) -> usize {
+        self.grows.borrow().len()
+    }
+
+    /// Row `key` is revealing as it arrives (tests).
+    #[cfg(test)]
+    pub(crate) fn arriving(&self, key: u64) -> bool {
+        self.grows.borrow().get(&key).is_some_and(|g| g.arriving)
+    }
+
+    /// Row `key`'s drawn and measured heights (tests).
+    #[cfg(test)]
+    pub(crate) fn grow_of(&self, key: u64) -> Option<(f32, f32)> {
+        self.grows.borrow().get(&key).map(|g| (g.shown, g.sink.get()))
     }
 
     pub(crate) fn level(&self) -> Level {
@@ -507,6 +865,10 @@ impl Motion {
 
     /// The time (tests: moved on with the test executor's clock).
     pub(crate) fn clock(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(at) = self.pin.get() {
+            return at;
+        }
         let now = Instant::now();
         #[cfg(test)]
         let now = {
@@ -522,9 +884,26 @@ impl Motion {
     /// executor's timers.
     #[cfg(test)]
     pub(crate) fn set_clock(&self, at: Instant) {
+        if self.pin.get().is_some() {
+            return self.pin.set(Some(at));
+        }
         let now = Instant::now();
         let s = if at >= now { at.duration_since(now).as_nanos() as i128 } else { -(now.duration_since(at).as_nanos() as i128) };
         self.skew.set(s);
+    }
+
+    /// Tests: the clock stops where it is and moves only when set, with the
+    /// executor's ([`Motion::set_clock`]): what a test sees doesn't depend on
+    /// how long its runner took between two steps.
+    #[cfg(test)]
+    pub(crate) fn pin_clock(&self) {
+        self.pin.set(Some(self.clock()));
+    }
+
+    /// Tests: the last frame's instant (what its timer was armed from).
+    #[cfg(test)]
+    pub(crate) fn frame_now(&self) -> Instant {
+        self.now.get()
     }
 
     /// A frame starts (the root's render): the clock, the level, and what
@@ -543,8 +922,11 @@ impl Motion {
         self.seen.borrow_mut().retain(|_, s| alive(s.frame));
         self.slides.borrow_mut().retain(|_, s| alive(s.frame));
         self.turns.borrow_mut().retain(|_, t| alive(t.1));
+        self.grows.borrow_mut().retain(|_, g| alive(g.frame));
         let cut = BASE + STAGGER_CAP + SIG;
         self.births.borrow_mut().retain(|_, at| now.saturating_duration_since(*at) < cut);
+        let births = self.births.borrow();
+        self.quiet.borrow_mut().retain(|k| births.contains_key(k));
     }
 
     /// The window is shown or hidden: hidden, the timer stops (visible
@@ -950,6 +1332,8 @@ mod tests {
     // Not `super::*`: that brings in gpui's `test` attribute through `gpui_kit::*`.
     use std::time::{Duration, Instant};
 
+    use gpui_kit::{Bounds, point, px, size};
+
     use super::{
         BASE, BEAT, GLOW, HEAD_HOLD, Kind, Level, Lock, Motion, QUICK, SLIDE_CAP, SLOW, STAGGER, STAGGER_CAP, Setting, Slide, Tag, Tween,
         ease, exit, stagger,
@@ -1286,5 +1670,133 @@ mod tests {
         assert_eq!(stagger(5), STAGGER_CAP);
         assert_eq!(stagger(9), STAGGER_CAP);
         assert_eq!(BEAT * 8, Duration::from_secs(1));
+    }
+
+    /// Law 3 and §3.3: a row born now is 0 px tall on its first frame (its
+    /// text measured, not shown) at no less than [`super::LIFT`], reveals
+    /// to its measured height without overshoot, then is unwrapped.
+    #[test]
+    fn first_paint_text_at_least_lift() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Full, false, t0);
+        let g = m.grow(3, 0, Some(t0), false, 20.).expect("an arrival grows");
+        assert_eq!(g.shown, Some(0.));
+        assert!(g.strength >= super::LIFT && g.strength < 1.);
+        assert!(g.travel > 7.9);
+        g.sink.set(120.);
+        let mut last = 0.;
+        let mut unwrapped = None;
+        for k in 1..80u64 {
+            m.begin_frame(Level::Full, false, t0 + Duration::from_micros(6944 * k));
+            match m.grow(3, 0, Some(t0), false, 20.) {
+                Some(g) => {
+                    let h = g.shown.expect("clipped while revealing");
+                    assert!(h >= last && h <= 120., "frame {k}: {h} after {last}");
+                    assert!(g.strength >= super::LIFT);
+                    last = h;
+                }
+                None => {
+                    unwrapped = Some(k);
+                    break;
+                }
+            }
+        }
+        let k = unwrapped.expect("unwrapped once settled");
+        assert!(k > 20 && k < 60, "settled on snap: frame {k}");
+        assert_eq!(m.growing(), 0);
+        // Words: the stream curve starts at the floor and never goes under it.
+        let e = super::stream_curve();
+        assert!((e.sample(0.) - super::LIFT).abs() < 1e-4);
+        assert!((e.sample(0.35) - 0.88).abs() < 1e-4);
+        assert!((0..=100).all(|k| e.sample(k as f32 / 100.) >= super::LIFT - 1e-4));
+        assert_eq!(super::text_motion().stream_fade(), super::STREAM_FADE);
+    }
+
+    /// Reduced, Off and low power: nothing grows (rows as today); history
+    /// (no birth) never does.
+    #[test]
+    fn grow_is_full_and_live_only() {
+        let t0 = Instant::now();
+        for (level, low) in [(Level::Reduced, false), (Level::Off, false), (Level::Full, true)] {
+            let m = Motion::new(t0);
+            m.begin_frame(level, low, t0);
+            assert!(m.grow(1, 0, Some(t0), true, 20.).is_none(), "{level:?} low power {low}");
+        }
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Full, false, t0);
+        assert!(m.grow(1, 0, None, false, 20.).is_none(), "history");
+        m.begin_frame(Level::Full, false, t0 + ms(500));
+        assert!(m.grow(2, 0, Some(t0), false, 20.).is_none(), "born long ago, first drawn now: as is");
+    }
+
+    /// A revealing row is clipped at its top and bottom only: its gutter
+    /// (the hanging label, the write head) is not (Shady H1).
+    #[test]
+    fn a_reveal_clips_y_only() {
+        let b = Bounds::new(point(px(300.), px(100.)), size(px(600.), px(40.)));
+        let m = super::ClipY::mask(b).bounds;
+        assert_eq!((m.top(), m.bottom()), (b.top(), b.bottom()));
+        assert!(m.left() < px(0.) && m.right() > px(10_000.), "{m:?}");
+    }
+
+    /// An arrival laid out off screen (the list's overdraw: drawn, never
+    /// painted) doesn't reveal: its row is measured again, at its height
+    /// (Shady M1).
+    #[test]
+    fn an_unpainted_arrival_comes_back_at_rest() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Full, false, t0);
+        m.born(5, t0);
+        let g = m.grow(5, 7, Some(t0), false, 20.).expect("an arrival");
+        assert_eq!(g.shown, Some(0.));
+        assert_eq!(m.unpainted(), vec![7], "drawn, not painted: measured again");
+        m.begin_frame(Level::Full, false, t0 + ms(7));
+        assert!(m.grow(5, 7, Some(t0), false, 20.).is_none(), "at rest");
+        // One painted (its measure came) is not touched.
+        m.born(6, t0 + ms(7));
+        let g = m.grow(6, 8, Some(t0 + ms(7)), false, 20.).expect("an arrival");
+        g.sink.set(40.);
+        assert!(m.unpainted().is_empty());
+        assert_eq!(m.growing(), 1);
+    }
+
+    /// §3.4: a streaming row's new line glides in on `flick`, never more
+    /// than a line short; a shrink is at once.
+    #[test]
+    fn stream_line_growth_glides_within_a_line() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Full, false, t0);
+        let g = m.grow(9, 0, None, true, 24.).expect("streaming rows are tracked");
+        assert_eq!(g.shown, None, "unmeasured: its own height");
+        g.sink.set(100.);
+        m.begin_frame(Level::Full, false, t0 + ms(7));
+        assert_eq!(m.grow(9, 0, None, true, 24.).and_then(|g| g.shown), Some(100.));
+        g.sink.set(172.);
+        let mut prev = 100.;
+        for k in 2..60u64 {
+            m.begin_frame(Level::Full, false, t0 + Duration::from_micros(6944 * k));
+            let h = m.grow(9, 0, None, true, 24.).and_then(|g| g.shown).expect("still streaming");
+            assert!(h >= 172. - 24. - 1e-3, "trails by at most a line: {h}");
+            assert!(h >= prev);
+            prev = h;
+        }
+        assert_eq!(prev, 172.);
+        // A chunk of five lines at once (Shady L1): a line short at most,
+        // from the frame its measure comes.
+        g.sink.set(172. + 5. * 24.);
+        for k in 60..120u64 {
+            m.begin_frame(Level::Full, false, t0 + Duration::from_micros(6944 * k));
+            let h = m.grow(9, 0, None, true, 24.).and_then(|g| g.shown).expect("still streaming");
+            assert!(h >= 292. - 24. - 1e-3, "trails by at most a line: {h}");
+        }
+        g.sink.set(150.);
+        m.begin_frame(Level::Full, false, t0 + ms(900));
+        assert_eq!(m.grow(9, 0, None, true, 24.).and_then(|g| g.shown), Some(150.));
+        // Done streaming and at rest: unwrapped.
+        m.begin_frame(Level::Full, false, t0 + ms(907));
+        assert!(m.grow(9, 0, None, false, 24.).is_none());
     }
 }
