@@ -346,15 +346,15 @@ pub(crate) struct TopWords {
     /// SYNAPS and DESKTOP (display, 13 px).
     pub(crate) word: f32,
     pub(crate) word2: f32,
-    /// "   NEED YOU" after the count, and one digit of it (display, 11 px).
+    /// "   NEED YOU" after the count, and one digit of it (display, 12 px).
     pub(crate) need: f32,
     pub(crate) digit: f32,
-    /// JUMP and THEME (display, 10.5 px), SYSTEMS (11 px).
+    /// JUMP, THEME and SYSTEMS (display, 12 px).
     pub(crate) jump: f32,
     pub(crate) theme: f32,
     pub(crate) systems: f32,
-    /// A mono cell at 11 px (the ticker) and at 10.5 / 10 px (the
-    /// connection, the SYSTEMS badge).
+    /// A mono cell at 12 px: the ticker, the connection, the SYSTEMS
+    /// badge.
     pub(crate) cell: f32,
     pub(crate) cell_conn: f32,
     pub(crate) cell_badge: f32,
@@ -413,7 +413,7 @@ impl TopFit {
     fn width(&self, w: &TopWords, i: &TopIn) -> f32 {
         let on = |b: bool, v: f32| if b { v } else { 0. };
         let text = |v: f32, gap: f32| if v > 0. { v + gap } else { 0. };
-        let ticker = 6.
+        let ticker = 10.
             + 12.
             + w.need
             + digits(i.need) as f32 * w.digit
@@ -720,18 +720,19 @@ mod tests {
         assert!(above(Form::Cramped) + Card::of(&m, Form::Cramped).height(WELL_MIN) + c.height(rows + 1) > 420.);
     }
 
-    /// The words as the embedded faces draw them (measured on Linux).
+    /// The words as the embedded faces draw them (measured on Linux at
+    /// 11 / 10.5 / 10 px, scaled to 12).
     pub(crate) const WORDS: TopWords = TopWords {
         word: 58.,
         word2: 66.,
-        need: 70.,
-        digit: 6.,
-        jump: 32.,
-        theme: 38.,
-        systems: 58.,
-        cell: 6.6,
-        cell_conn: 6.3,
-        cell_badge: 6.,
+        need: 77.,
+        digit: 7.,
+        jump: 37.,
+        theme: 44.,
+        systems: 64.,
+        cell: 7.2,
+        cell_conn: 7.2,
+        cell_badge: 7.2,
     };
 
     /// The top bar never overflows, from the smallest window up; what it
@@ -800,16 +801,19 @@ mod tests {
         let f = fit_top(&WORDS, &TopIn { width: 640., ..busy });
         assert!(f.width(&WORDS, &TopIn { width: 640., ..busy }) <= 640. - TOP_PAD);
         // L3, the review's cases: at 888 the connection text is not cut to
-        // its floor with 107 px to spare; at 640 with 123 waiting and a
-        // 3-digit badge, dropping SYSTEMS left 59 px, and THEME (46) takes
-        // its place. The re-review's (L2): DESKTOP, gone, does not come
-        // back where the gist goes.
+        // its floor with 107 px to spare; with 123 waiting and a 3-digit
+        // badge, a width where dropping SYSTEMS leaves room for THEME has
+        // THEME in its place (640 at the old 10.5–11 px words; wider at 12).
+        // The re-review's (L2): DESKTOP, gone, does not come back where the
+        // gist goes.
         let i = TopIn { width: 888., ..busy };
         let f = fit_top(&WORDS, &i);
         assert!(f.conn > CONN_MIN && i.width - TOP_PAD - f.width(&WORDS, &i) < 0.02, "{f:?}");
-        let i = TopIn { width: 640., need: 123, badge: 3, ..busy };
-        let f = fit_top(&WORDS, &i);
-        assert!(f.theme && !f.systems, "{f:?}");
+        let swapped = (640..1000).find(|&w| {
+            let f = fit_top(&WORDS, &TopIn { width: w as f32, need: 123, badge: 3, ..busy });
+            f.theme && !f.systems
+        });
+        assert!(swapped.is_some(), "THEME never takes SYSTEMS' place");
         let one = TopIn { need: 1, more: 0, conn: 12, ..busy };
         assert!(!fit_top(&WORDS, &TopIn { width: 1099., ..one }).word2);
         assert!((757..1099).all(|w| !fit_top(&WORDS, &TopIn { width: w as f32, ..one }).word2));

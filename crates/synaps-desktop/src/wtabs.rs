@@ -39,7 +39,6 @@
 
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -392,7 +391,7 @@ pub(crate) fn items(f: &Facts) -> Vec<Item<Act>> {
         (true, _) => Item::new(Act::Cancel, "cancelling").off(format!("{} stops at its next step", f.name)),
         (false, true) => {
             let mut i = Item::new(Act::Cancel, format!("Cancel {}?", f.name));
-            i.confirm = Some("CONFIRM".into());
+            i.confirm = Some(fonts::label::CONFIRM.into());
             i
         }
         (false, false) => Item::new(Act::Cancel, "Cancel worker…"),
@@ -536,8 +535,8 @@ impl AppView {
 
     /// Worker `handle` (`sa_N`) of `session`, as every surface shows it
     /// ([`Liveness`], design.md §4.3): from its session's workers (attached
-    /// here, or as its tab last saw them) and its view's own word
-    /// ([`Liveness::of_sources`]). A cancel on its way is `Cancelling`;
+    /// here, or as its tab last saw them), which its view's pages feed.
+    /// A cancel on its way is `Cancelling`;
     /// `expect` (who a tab, a menu or the foot says it is): another worker
     /// under the handle now is `Gone`, as is one an attached session does
     /// not know. `None`: this window holds nothing of its session (not
@@ -546,9 +545,9 @@ impl AppView {
     pub(crate) fn worker_state(&self, session: &str, handle: &str, expect: Option<(Option<&str>, &str)>) -> Option<Liveness> {
         let attached = self.model.is_active(session);
         let shown = attached || self.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(session);
-        let (watch, subs) = match (shown, self.tab_cache.peek(session)) {
-            (true, _) => (&self.model.watch, &self.model.stats.subagents),
-            (false, Some(c)) => (&c.watch, &c.stats.subagents),
+        let subs = match (shown, self.tab_cache.peek(session)) {
+            (true, _) => &self.model.stats.subagents,
+            (false, Some(c)) => &c.stats.subagents,
             (false, None) => return None,
         };
         let id = handle.strip_prefix("sa_").and_then(|n| n.parse().ok());
@@ -558,11 +557,10 @@ impl AppView {
         {
             return Some(Liveness::Gone);
         }
+        // One source: the session's list (its views' pages feed it,
+        // [`crate::model::Model::heard_view`]).
         let status = id.and_then(|id| subs.status(id));
-        // Its view's word only if the view is of the worker the handle names
-        // now: a stale view of an earlier worker under it says nothing of this one.
-        let view = watch.worker(handle).filter(|w| now.is_none_or(|n| same_worker(w.key(), n))).and_then(|w| Liveness::of_view(w.state()));
-        let live = Liveness::of_sources(status, view, attached, !attached || now.is_some() || status.is_some());
+        let live = Liveness::of(status, attached, !attached || now.is_some() || status.is_some());
         Some(live.cancelling(self.model.cancels.pending(session, handle)))
     }
 
@@ -899,7 +897,7 @@ impl AppView {
     pub(crate) fn render_menu_at_point(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
         let (m, _) = self.menu.as_ref()?;
         let At::Point(pt) = m.at else { return None };
-        let body = crate::menu::render("worker-menu", m, p, AppView::menu_pick, cx);
+        let body = crate::menu::render("worker-menu", m, p, AppView::menu_pick, |this, _| this.close_menu(), cx);
         Some(deferred(anchored().position(pt).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
     }
 
@@ -910,7 +908,7 @@ impl AppView {
         if m.at != At::Row(id) {
             return None;
         }
-        let body = crate::menu::render("worker-menu", m, p, AppView::menu_pick, cx);
+        let body = crate::menu::render("worker-menu", m, p, AppView::menu_pick, |this, _| this.close_menu(), cx);
         Some(
             div()
                 .absolute()
@@ -955,7 +953,7 @@ impl AppView {
                 .items_center()
                 .cursor_pointer()
                 .child(div().text_color(p.err).child(format!("Cancel {name}?")))
-                .child(display("CONFIRM", 10., p.err))
+                .child(display(fonts::label::CONFIRM, crate::fonts::size::D_S, p.err))
         } else {
             // A reveal button (design.md §5): drawn while its row is hovered.
             h_flex()
@@ -971,7 +969,7 @@ impl AppView {
         let tip = if armed { "click again to cancel it (it stops at its next step)" } else { "cancel this worker…" };
         let who = who.clone();
         Some(
-            el.tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+            el.tooltip(move |window, cx| crate::overlay::tip(tip, window, cx))
                 .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                     cx.stop_propagation();
                     // The tray lists the attached session's workers.
@@ -996,69 +994,93 @@ pub(crate) fn card_tip(me: WeakEntity<AppView>, who: Who, fallback: SharedString
             let info = v.info_of(&session, &who)?;
             Some((info, v.worker_state(&session, &who.handle(), Some(who.key()))?))
         });
-        let Some((info, state)) = info else { return Tooltip::new(fallback.clone()).build(window, cx) };
+        let Some((info, state)) = info else { return crate::overlay::tip(fallback.clone(), window, cx) };
         let p = theme::palette(cx);
         // Running, ELAPSED says when it started.
         let started = info
             .started
             .filter(|_| state.ended())
             .map(|t| format!("{} ago", fmt_secs(Instant::now().saturating_duration_since(t).as_secs_f64())));
-        Tooltip::element(move |_, _| card(&info, state, started.as_deref(), &p)).build(window, cx)
+        crate::overlay::element(move |_, _| card(&info, state, started.as_deref(), &p), window, cx)
     }
 }
 
-/// The card's body: the worker's glyph in the lead column, its name and
-/// handle, its word (§4.2's Display column) at the trail; its task, facts
-/// and step under them. On the kit's popover (the chrome) until overlays
-/// move to the card.
+/// The hover card's outer width (design.md §8.7), and its padding.
+const CARD_W: f32 = 340.;
+const CARD_PAD: f32 = 16.;
+
+/// The card's body (design.md §8.7, on the overlay box): the worker's
+/// glyph in the lead column, its name and handle, its word (§4.2's Display
+/// column) at the trail; its task, facts and step under them, at the
+/// title's edge. 16 all round, 8 between parts.
 fn card(i: &Info, state: Liveness, started: Option<&str>, p: &Palette) -> Div {
+    use crate::fonts::size;
+    use crate::overlay::Fact;
     let (g, word, _, family) = glyph::worker(state);
-    let (color, mark) = glyph::ink(family, Ground::Chrome, p);
-    let fact = |k: &'static str, v: String| {
-        h_flex()
-            .items_start()
-            .child(div().w(px(62.)).flex_none().pt(px(2.)).child(display(k, 9., p.dim_ch)))
-            .child(div().flex_1().min_w_0().font_family(fonts::MONO).text_size(px(10.5)).text_color(p.prose_ch).child(v))
-    };
-    let mut facts = v_flex().gap(px(2.));
+    let (color, mark) = glyph::ink(family, Ground::Card, p);
+    let mut facts = Vec::with_capacity(4);
     if !i.model.is_empty() {
-        facts = facts.child(fact("MODEL", i.model.clone()));
+        facts.push(Fact::new(fonts::label::R_MODEL, i.model.clone()));
     }
     if let Some(s) = started {
-        facts = facts.child(fact("STARTED", s.to_string()));
+        facts.push(Fact::new(fonts::label::STARTED, s.to_string()));
     }
     if let Some(e) = i.elapsed {
-        facts = facts.child(fact(if state.ended() { "RAN" } else { "ELAPSED" }, fmt_secs(e)));
+        facts.push(Fact::new(if state.ended() { fonts::label::RAN } else { fonts::label::ELAPSED }, fmt_secs(e)));
     }
     if let Some(n) = i.tools {
-        facts = facts.child(fact("TOOLS", n.to_string()));
+        facts.push(Fact::new(fonts::label::TOOLS, n.to_string()));
     }
+    // The lead column: the 10 px glyph centred in 12, then 8.
+    let under = || v_flex().pl(px(20.)).min_w_0();
     v_flex()
-        .w(px(340.))
-        .py(px(6.))
-        .gap(px(6.))
+        .w(px(CARD_W))
+        .p(px(CARD_PAD))
+        .gap(px(8.))
         .child(
             h_flex()
-                .gap(px(8.))
+                .h(px(18.))
                 .items_center()
-                .child(glyph::draw(g, mark))
-                .child(div().text_size(px(12.5)).text_color(p.ink).child(i.name.clone()))
-                .child(mono(format!("sa_{}", i.id), 11., p.dim_ch))
-                .child(div().flex_1())
-                .child(display(word, 12., color)),
+                .child(div().w(px(12.)).flex_none().flex().justify_center().child(glyph::draw(g, mark)))
+                .child(
+                    h_flex()
+                        .ml(px(8.))
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(8.))
+                        .items_baseline()
+                        .child(div().flex_none().text_size(px(size::TITLE)).text_color(p.ink).child(i.name.clone()))
+                        .child(mono(format!("sa_{}", i.id), size::META, p.dim_k).flex_none()),
+                )
+                .child(display(word, size::D_S, color).flex_none().ml(px(8.))),
         )
         .when(!i.task.is_empty(), |d| {
-            d.child(div().font_family(fonts::MONO).text_size(px(11.)).line_height(px(16.)).text_color(p.prose_ch).child(i.task.clone()))
+            d.child(
+                under().child(
+                    div()
+                        .font_family(fonts::MONO)
+                        .text_size(px(size::META))
+                        .line_height(px(18.))
+                        .max_h(px(72.))
+                        .overflow_hidden()
+                        .text_color(p.prose_k)
+                        .child(i.task.clone()),
+                ),
+            )
         })
-        .child(facts)
+        .when(!facts.is_empty(), |d| d.child(under().child(crate::overlay::facts(facts, p))))
         .when(!i.line.is_empty(), |d| {
             d.child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(if state == Liveness::Failed { p.err_ch } else { p.dim_ch })
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(i.line.clone()),
+                under().child(
+                    div()
+                        .text_size(px(size::TITLE))
+                        .line_height(px(18.))
+                        .text_color(if state == Liveness::Failed { p.err_k } else { p.dim_k })
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(i.line.clone()),
+                ),
             )
         })
 }
@@ -1262,7 +1284,7 @@ mod tests {
         assert_eq!(items(&ro)[3].why_not.as_deref(), Some(why));
         // Armed: the second press is asked for.
         let armed = items(&Facts { armed: true, ..facts() });
-        assert_eq!((armed[3].label.as_ref(), armed[3].confirm.as_deref()), ("Cancel sleeper?", Some("CONFIRM")));
+        assert_eq!((armed[3].label.as_ref(), armed[3].confirm.as_deref()), ("Cancel sleeper?", Some(crate::fonts::label::CONFIRM)));
         // Sent: cancelling, nothing to press.
         let sent = items(&Facts { pending: true, ..facts() });
         assert_eq!((sent[3].label.as_ref(), sent[3].enabled()), ("cancelling", false));

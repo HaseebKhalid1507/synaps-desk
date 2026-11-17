@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, RopeExt as _, Textarea, TextareaState};
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -1454,8 +1453,8 @@ pub(crate) fn section(title: &'static str, jp: &'static str, p: &Palette) -> Div
     h_flex()
         .items_baseline()
         .gap(px(10.))
-        .child(display(title, 11.5, p.header))
-        .child(div().font_family(fonts::JP).text_size(px(10.)).text_color(p.dim_ch).child(jp))
+        .child(display(title, fonts::size::D_S, p.header))
+        .child(div().font_family(fonts::JP).text_size(px(fonts::size::JP)).text_color(p.dim_ch).child(jp))
 }
 
 impl AppView {
@@ -3902,7 +3901,7 @@ impl AppView {
     fn render_session_menu(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
         let (m, _) = self.smenu.as_ref()?;
         let crate::menu::At::Point(pt) = m.at else { return None };
-        let body = crate::menu::render("session-menu", m, p, AppView::session_menu_pick, cx);
+        let body = crate::menu::render("session-menu", m, p, AppView::session_menu_pick, |this, _| this.close_menu(), cx);
         Some(deferred(anchored().position(pt).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
     }
 
@@ -3916,8 +3915,8 @@ impl AppView {
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str()).or(self.model.tabs.current_session());
         let live = session
             .and_then(|s| self.worker_state(s, &w.handle_id, Some(w.key())))
-            .or_else(|| Liveness::of_view(w.state()))
-            .unwrap_or(Liveness::Started);
+            // Its session in no list here: what its own pages said.
+            .unwrap_or_else(|| Liveness::of(crate::subagents::Status::word(&w.status), true, w.gone.is_none()));
         let row = self.tray.rows.iter().find(|r| {
             r.id == w.subagent_id && !r.facts.is_empty() && crate::wtabs::same_worker((r.call.as_deref(), r.name.as_ref()), w.key())
         });
@@ -4052,7 +4051,7 @@ impl AppView {
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
-                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
         };
         let error = self.model.named.rename_error.clone();
         let mut row = v_flex().py(px(crate::fit::naming_pad(form))).gap(px(crate::fit::NAMING_GAP)).child(
@@ -4140,7 +4139,7 @@ impl AppView {
         } else if secret {
             Some(
                 h_flex()
-                    .gap(px(22.))
+                    .gap(px(24.))
                     .items_center()
                     .child(
                         h_flex()
@@ -4149,7 +4148,7 @@ impl AppView {
                             .child(
                                 div()
                                     .w(px((260. * m.r).round()))
-                                    .child(Input::new(&self.secret_input).disabled(!can).text_size(px(m.mono))),
+                                    .child(Input::new(&self.secret_input).disabled(!can).text_size(px(m.mono)).border_color(p.frame)),
                             )
                             // Ctrl/Cmd+Enter takes the keys into the field.
                             .when(keys && !in_field, |d| d.child(key_hint(YES_KEY))),
@@ -4160,7 +4159,7 @@ impl AppView {
                             label::SUBMIT,
                             (in_field && can && typed).then_some(if cfg!(target_os = "macos") { "RETURN" } else { "ENTER" }),
                             can && typed,
-                            p.warn_fill,
+                            Fill::Warn,
                             p,
                             m,
                         )
@@ -4182,12 +4181,12 @@ impl AppView {
             let yes = can && ready;
             Some(
                 h_flex()
-                    .gap(px(22.))
+                    .gap(px(24.))
                     .items_center()
                     // Clickable whenever the card may be answered: the read
                     // gate is checked at the click (as the keys do), not by
                     // this frame, laid out with the last one's bounds.
-                    .child(fbtn_key("p-yes", label::AUTHORIZE, (keys && yes).then_some(YES_KEY), yes, p.warn_fill, p, m).when_some(
+                    .child(fbtn_key("p-yes", label::AUTHORIZE, (keys && yes).then_some(YES_KEY), yes, Fill::Warn, p, m).when_some(
                         key.filter(|_| can),
                         |d, key| {
                             d.on_click(cx.listener(move |this, _, _, cx| {
@@ -4296,7 +4295,7 @@ impl AppView {
                 .text_ellipsis()
                 .child(lead.clone())
         } else {
-            display(head, m.card_title, p.warn_k).min_w_0().overflow_hidden().text_ellipsis()
+            display(head, m.label, p.warn_k).min_w_0().overflow_hidden().text_ellipsis()
         };
         let lead_row = dims.lead.filter(|_| !lead.is_empty()).map(|(gap, line)| {
             let d = div().flex_none().mt(px(gap)).text_size(px(m.card_lead)).line_height(px(line)).text_color(p.prose_k);
@@ -4315,7 +4314,7 @@ impl AppView {
                 .mt(px(dims.top))
                 .ml(px(lay.left))
                 .mr(px(lay.right))
-                .px(px((20. * r).round()))
+                .px(px(m.pad_x))
                 .py(px(dims.pad_y))
                 .border_1()
                 .border_color(p.warn_mark)
@@ -4393,7 +4392,7 @@ impl AppView {
                 .min_w_0()
                 .overflow_hidden()
                 .text_ellipsis()
-                .tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
+                .tooltip(move |window, cx| crate::overlay::tip(text.clone(), window, cx))
                 .into_any_element()
         } else {
             line.whitespace_normal().into_any_element()
@@ -4511,7 +4510,7 @@ impl AppView {
         let name_w = worker.map_or(0., |w| (mono_w(&w.name).min(24. * cell)) + 8. + mono_w(&w.handle_id));
         let lead_w = if worker.is_some() { main_w + 8. + cell + 8. + m.lead } else { m.lead };
         let fit = fit_foot(&FootIn {
-            room: lay.column - 2. * m.pad_x - 2.,
+            room: lay.column - 2. * m.pad_x,
             lead: lead_w,
             word: word_w,
             name: name_w,
@@ -4522,10 +4521,10 @@ impl AppView {
             primary: primary_w,
             tight: lay.tight,
         });
-        let send = fbtn("send", primary, can_send, p.btn_fill, p, m)
+        let send = fbtn("send", primary, can_send, Fill::Btn, p, m)
             .when(worker.is_none(), |d| {
                 d.tooltip(move |window, cx| {
-                    Tooltip::new(if busy { "steer: applied at the next turn boundary" } else { "send: starts a turn" }).build(window, cx)
+                    crate::overlay::tip(if busy { "steer: applied at the next turn boundary" } else { "send: starts a turn" }, window, cx)
                 })
             })
             .on_click(cx.listener(|this, _, window, cx| {
@@ -4544,7 +4543,7 @@ impl AppView {
                 .flex_none()
                 .cursor_pointer()
                 .hover(|d| d.text_color(p.err))
-                .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+                .tooltip(move |window, cx| crate::overlay::tip(tip, window, cx))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.halt();
                     cx.notify();
@@ -4557,30 +4556,35 @@ impl AppView {
                 .flex_none()
                 .cursor_pointer()
                 .hover(|d| d.text_color(p.ink))
-                .tooltip(|window, cx| Tooltip::new("back to the session · Esc").build(window, cx))
+                .tooltip(|window, cx| crate::overlay::tip("back to the session · Esc", window, cx))
                 .on_click(cx.listener(|this, _, _, cx| this.leave_worker(false, cx)))
         };
         let glyph_el = || g.map(|g| div().flex().debug_selector(|| "foot-glyph".into()).child(glyph::draw(g, mark)).into_any_element());
         // A worker tab's glyph says whose; the primary may shorten.
-        let field = Textarea::new(&self.composer)
-            .appearance(false)
-            .disabled(!drives)
-            .text_size(px(m.body))
-            .line_height(px(m.body_line))
-            .text_color(p.ink);
+        // Its text at `inset` (design.md §8.11): the kit pads a multi-line
+        // field's text by its own `input_px` whatever its appearance, so the
+        // field reaches that far past the composer's padding on each side.
+        let field = div().mx(px(-KIT_INPUT_PX)).child(
+            Textarea::new(&self.composer)
+                .appearance(false)
+                .disabled(!drives)
+                .text_size(px(m.body))
+                .line_height(px(m.body_line))
+                .text_color(p.ink),
+        );
         // Cramped, the draft's note is on the notice line.
         let inline = dims.row_gap.is_none();
         let inner = if inline {
             // Under a 120 px field the row sheds MAIN, then STEER WORKER
             // says STEER (the glyph still names whose).
-            let room = lay.column - 2. * m.pad_x - 2.;
+            let room = lay.column - 2. * m.pad_x;
             let rest = |main: bool, primary: f32| {
                 16. + if main { main_w + 8. } else { 0. } + 10. + if halt { 24. + halt_w } else { 0. } + 24. + primary
             };
             let main = worker.is_some() && room - rest(true, primary_w) >= 120.;
             let short = primary == label::STEER_WORKER && room - rest(main, primary_w) < 120.;
             let send = if short {
-                fbtn("send", label::STEER, can_send, p.btn_fill, p, m).on_click(cx.listener(|this, _, window, cx| {
+                fbtn("send", label::STEER, can_send, Fill::Btn, p, m).on_click(cx.listener(|this, _, window, cx| {
                     let text = this.composer.read(cx).value().trim().to_string();
                     if !text.is_empty() && this.submit(text) {
                         this.composer.update(cx, |s, cx| s.set_value("", window, cx));
@@ -4668,7 +4672,8 @@ impl AppView {
         column(
             lay,
             v_flex()
-                .px(px(m.pad_x))
+                // The frame sits inside the inset (design.md §1.1).
+                .px(px(m.pad_x - 1.))
                 .pt(px(dims.pad_top))
                 .pb(px(dims.pad_bottom))
                 .bg(p.user)
@@ -4689,14 +4694,38 @@ impl AppView {
     }
 }
 
+/// The kit's horizontal padding of a medium multi-line input's text
+/// (`Size::Medium.input_px()`), drawn whatever the input's appearance.
+const KIT_INPUT_PX: f32 = 10.;
+
 /// A text button: tracked caps, `color`, `hover` on hover.
 pub(crate) fn tbtn(id: &'static str, text: &'static str, color: Hsla, hover: Hsla) -> Stateful<Div> {
-    display(text, 13., color).id(id).cursor_pointer().hover(move |d| d.text_color(hover))
+    display(text, fonts::size::D_M, color).id(id).cursor_pointer().hover(move |d| d.text_color(hover))
 }
 
-/// A filled button (AUTHORIZE, SEND): its label is the chrome colour on
-/// `fill` (lifted until that reads at 4.5:1), dimmed when it cannot act.
-pub(crate) fn fbtn(id: &'static str, text: &'static str, enabled: bool, fill: Hsla, p: &Palette, m: &Metrics) -> Stateful<Div> {
+/// A filled button's fill: SEND and STEER's, or the warning's
+/// (AUTHORIZE, SUBMIT).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fill {
+    Btn,
+    Warn,
+}
+
+impl Fill {
+    /// At rest and hovered (a step toward the ink).
+    fn roles(self, p: &Palette) -> (Hsla, Hsla) {
+        match self {
+            Fill::Btn => (p.btn_fill, p.btn_hi),
+            Fill::Warn => (p.warn_fill, p.warn_hi),
+        }
+    }
+}
+
+/// A filled button (AUTHORIZE, SEND, design.md §8.12): its label is the
+/// chrome colour on its fill (lifted until that reads at 4.5:1), the fill
+/// a step up while hovered. One that cannot act has no fill: a 1 px
+/// `edge` outline (inside its box: nothing moves) and a `dim` label.
+pub(crate) fn fbtn(id: &'static str, text: &'static str, enabled: bool, fill: Fill, p: &Palette, m: &Metrics) -> Stateful<Div> {
     fbtn_key(id, text, None, enabled, fill, p, m)
 }
 
@@ -4706,21 +4735,23 @@ pub(crate) fn fbtn_key(
     text: &'static str,
     key: Option<&'static str>,
     enabled: bool,
-    fill: Hsla,
+    fill: Fill,
     p: &Palette,
     m: &Metrics,
 ) -> Stateful<Div> {
-    let (bg, fg) = if enabled { (fill, p.chrome) } else { (p.edge, p.dim) };
+    let (bg, hi) = fill.roles(p);
+    let fg = if enabled { p.chrome } else { p.dim };
     div()
         .id(id)
+        .relative()
         .h(px(crate::fit::button_h(m)))
         .px(px(16.))
         .flex()
         .flex_none()
         .gap(px(10.))
         .items_center()
-        .bg(bg)
-        .when(enabled, |d| d.cursor_pointer().hover(|d| d.opacity(0.88)))
+        .when(enabled, |d| d.bg(bg).cursor_pointer().hover(move |d| d.bg(hi)))
+        .when(!enabled, |d| d.child(div().absolute().inset_0().border_1().border_color(p.edge)))
         .child(display(text, m.label, fg))
         .when_some(key, |d, k| d.child(mono(k, m.meta, fg)))
 }

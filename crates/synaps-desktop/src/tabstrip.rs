@@ -9,7 +9,6 @@
 //! arrows at the ends (never a second row).
 
 use gpui_kit::component::h_flex;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -103,7 +102,7 @@ impl Render for TabDrag {
             .bg(self.bg)
             .border_1()
             .border_color(self.edge)
-            .text_size(px(12.5))
+            .text_size(px(crate::fonts::size::TITLE))
             .text_color(self.fg)
             .whitespace_nowrap()
             .overflow_hidden()
@@ -240,7 +239,7 @@ impl AppView {
                 .flex_none()
                 .justify_center()
                 .items_center()
-                .child(mono(text, 11., if on { p.prose_ch } else { p.dim_ch }))
+                .child(mono(text, crate::fonts::size::META, if on { p.prose_ch } else { p.dim_ch }))
                 .when(on, |d| d.cursor_pointer().hover(|d| d.bg(p.raised)))
         };
         h_flex()
@@ -280,7 +279,7 @@ impl AppView {
                         .cursor_pointer()
                         .child(mono("+", 15., p.dim_ch).hover(|d| d.text_color(p.ink)))
                         .hover(|d| d.bg(p.raised))
-                        .tooltip(|window, cx| Tooltip::new(new_tip()).build(window, cx))
+                        .tooltip(|window, cx| crate::overlay::tip(new_tip(), window, cx))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.create();
                             cx.notify();
@@ -424,7 +423,7 @@ impl AppView {
                         (_, Some(meta)) => format!("{} · {name}", meta.tooltip(&tip)),
                         _ => format!("{tip} · {name}"),
                     };
-                    Tooltip::new(text).build(window, cx)
+                    crate::overlay::tip(text, window, cx)
                 })
             })
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
