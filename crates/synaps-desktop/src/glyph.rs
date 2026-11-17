@@ -584,6 +584,14 @@ pub(crate) fn worst(failed: usize, stopped: usize, cancelled: usize) -> (Glyph, 
     }
 }
 
+/// A worker's state as motion keys it: a re-attach's demoted start
+/// (`demoted`, [`crate::subagents::View::demoted`]) is still running, so
+/// neither the reconnect's demote nor its lift on the next page plays a
+/// write-on (motion.md §8: a reconnect is history).
+pub(crate) fn steady(l: Liveness, demoted: bool) -> Liveness {
+    if demoted && l == Liveness::Started { Liveness::Running } else { l }
+}
+
 /// A worker's glyph, its word outside run surfaces (Display caps) and
 /// inside them (Mono), and its family (design.md §4.2).
 pub(crate) fn worker(l: Liveness) -> (Glyph, &'static str, &'static str, Family) {

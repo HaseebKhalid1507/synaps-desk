@@ -768,6 +768,54 @@ fn a_reattach_leaves_a_running_worker_running(cx: &mut TestAppContext) {
     assert_eq!(tab, Some(crate::subagents::Liveness::Running), "its tab: running too");
 }
 
+/// Shady #8 on the PR 4 rebase: a reconnect demotes a watched running
+/// worker to started, and its view's next page lifts it (PR 3's one
+/// source). Neither is news (motion.md §8: a reconnect is history): its
+/// tray row's glyph and the foot's play no write-on, either way.
+#[gpui_kit::test]
+fn a_reconnect_replays_no_worker_write_ons(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    scout_in_place(cx, w, &view);
+    view_running(cx, &view);
+    settle(cx, w, 8);
+    let shown = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.tray.rows.iter().find(|r| r.id == 1).map(|r| r.live)).expect("scout's tray row")
+    };
+    assert_eq!(shown(cx), crate::subagents::Liveness::Running);
+    let t0 = view.read_with(cx, |v, _| v.fx.clock());
+    // The daemon attaches the same session again: a reconnect (its
+    // attach alone: no row of scout's comes with it to lift it at once).
+    view.update(cx, |v, cx| {
+        let seq = v.model.active.as_ref().expect("attached").attach_seq;
+        let events = crate::demo::attach(crate::demo::SID, seq)
+            .into_iter()
+            .filter_map(|e| match e {
+                synaps_client::Event::Attached { attach_seq, attached, mode, .. } => {
+                    Some(synaps_client::Event::Attached { attach_seq, attached, mode, reconnect: true })
+                }
+                _ => None,
+            })
+            .collect();
+        v.apply_batch(events, cx);
+    });
+    settle(cx, w, 8);
+    assert_eq!(foot_of(cx, &view).0, crate::subagents::Liveness::Started, "demoted until heard");
+    assert_eq!(shown(cx), crate::subagents::Liveness::Started, "its row too");
+    assert_eq!(in_place(cx, &view).as_deref(), Some("sa_1"), "still watched");
+    view_running(cx, &view);
+    view.update(cx, |_, cx| cx.notify());
+    settle(cx, w, 8);
+    assert_eq!(foot_of(cx, &view).0, crate::subagents::Liveness::Running, "lifted by its page");
+    assert_eq!(shown(cx), crate::subagents::Liveness::Running);
+    let replayed: Vec<_> = view
+        .read_with(cx, |v, _| v.fx.changed_since(t0))
+        .into_iter()
+        .filter(|(t, _)| matches!(t, crate::motion::Tag::TrayGlyph | crate::motion::Tag::BlockGlyph | crate::motion::Tag::Foot))
+        .collect();
+    assert!(replayed.is_empty(), "no write-on replayed across the reconnect: {replayed:?}");
+}
+
 /// Shady N1: scout (sa_1) ended in a worker tab left in the background
 /// (not polled: its view still says completed); a cold-started daemon
 /// gave sa_1 to builder, running. Scout's stale view says nothing of

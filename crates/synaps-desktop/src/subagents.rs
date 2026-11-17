@@ -230,6 +230,10 @@ pub struct Worker {
     /// says only the word, so the daemon's own end sources (its stream,
     /// rows, result, completion) still write how it ended, once.
     by_page: bool,
+    /// Running when this window last looked, "started" since a re-attach
+    /// ([`Worker::demote`]) and not yet heard again: what motion takes as
+    /// its state (a reconnect's demote and lift are not news, motion.md §8).
+    demoted: bool,
     /// When `elapsed` arrived, if it arrived while it ran (a row).
     reported: Option<Instant>,
 }
@@ -330,6 +334,8 @@ impl Worker {
         if self.corrects(s, sure) && self.status != Some(s) {
             self.reason = None;
         }
+        // A history's start again keeps a demoted one demoted.
+        self.demoted &= self.status == Some(s);
         self.status = Some(s);
         self.guessed = s.terminal() && !sure;
         self.by_page = false;
@@ -353,6 +359,7 @@ impl Worker {
         let was = self.status.is_some_and(Status::running);
         if was {
             self.status = Some(Status::Started);
+            self.demoted = true;
         }
         was
     }
@@ -409,6 +416,8 @@ pub struct View {
     /// Running (or last seen so): its step; finished: its result, or why
     /// it failed.
     pub line: Option<(SharedString, bool)>,
+    /// A re-attach's demoted start, not yet heard again ([`Worker::demoted`]).
+    pub demoted: bool,
 }
 
 impl View {
@@ -448,6 +457,7 @@ impl View {
             facts: facts.join(" · ").into(),
             tick,
             line,
+            demoted: w.demoted,
         })
     }
 
@@ -782,6 +792,8 @@ pub struct Live {
     /// its journal can be watched and it can be steered. The blocking
     /// `subagent`'s cannot: the daemon's registry does not hold it.
     pub watchable: bool,
+    /// A re-attach's demoted start, not yet heard again ([`Worker::demoted`]).
+    pub demoted: bool,
 }
 
 /// A running worker's step as the tray says it (the TUI's `step()`):
@@ -865,7 +877,7 @@ impl Subagents {
             };
             let name = if w.name.is_empty() { label.to_string() } else { w.name.clone() };
             let call = call.filter(|c| c.named).map(|c| c.tool_id.clone());
-            Some(Live { id, call, name, status, line, tools: w.tools, elapsed: w.elapsed, tick: w.tick(), watchable })
+            Some(Live { id, call, name, status, line, tools: w.tools, elapsed: w.elapsed, tick: w.tick(), watchable, demoted: w.demoted })
         };
         // Each id is the newest call's that has it (`by_id`): ids restart
         // at 1 with a cold-started daemon, and an earlier call's worker
@@ -926,6 +938,14 @@ impl Subagents {
         match self.by_id.get(&id).and_then(|t| self.calls.get(t)) {
             Some(c) => c.w.status,
             None => self.orphans.get(&id)?.status,
+        }
+    }
+
+    /// Worker `id` is a re-attach's demoted start ([`Worker::demoted`]).
+    pub fn demoted(&self, id: u64) -> bool {
+        match self.by_id.get(&id).and_then(|t| self.calls.get(t)) {
+            Some(c) => c.w.demoted,
+            None => self.orphans.get(&id).is_some_and(|w| w.demoted),
         }
     }
 

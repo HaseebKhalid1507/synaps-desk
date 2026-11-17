@@ -842,6 +842,12 @@ impl Motion {
         v
     }
 
+    /// Every keyed value that changed (animating) after `t` (tests).
+    #[cfg(test)]
+    pub(crate) fn changed_since(&self, t: Instant) -> Vec<(Tag, u64)> {
+        self.seen.borrow().iter().filter(|(_, s)| s.since.is_some_and(|at| at > t)).map(|(k, _)| *k).collect()
+    }
+
     /// What the last frame asked for: a frame, a timer at, nothing (tests).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pending(&self) -> (bool, Option<Instant>) {

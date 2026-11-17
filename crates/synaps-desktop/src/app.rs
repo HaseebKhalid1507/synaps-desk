@@ -4699,6 +4699,8 @@ impl AppView {
         let display_w = |t: &'static str, size: f32| self.display_w(t, size, window);
         // The state part: the session's (main view), or the watched worker's
         // (READ ONLY is the primary's: said once).
+        // What motion keys the glyph by ([`glyph::steady`]).
+        let mut steady = None;
         let (g, word, family, tally) = match watched.as_ref() {
             None => {
                 let st = self.model.tabs.current().map_or(crate::rail::State::Saved, |t| self.tab_state(t));
@@ -4714,6 +4716,8 @@ impl AppView {
             }
             Some((live, _)) => {
                 let (g, word, _, family) = glyph::worker(*live);
+                let demoted = worker.is_some_and(|w| self.model.stats.subagents.demoted(w.subagent_id));
+                steady = Some(glyph::worker(glyph::steady(*live, demoted)).0);
                 (Some(g), Some(word), family, None)
             }
         };
@@ -4788,7 +4792,7 @@ impl AppView {
         let fx = &self.fx;
         // The scope is the session's ([`AppView::motion_session`]).
         let foot_key = worker.map_or(0, |w| (1 << 62) | w.subagent_id);
-        let foot_ch = g.and_then(|g| fx.change(crate::motion::Tag::Foot, foot_key, crate::turns::glyph_code(g), None));
+        let foot_ch = steady.or(g).and_then(|g| fx.change(crate::motion::Tag::Foot, foot_key, crate::turns::glyph_code(g), None));
         let busy_glyph = |c: u64| {
             [glyph::Glyph::Run, glyph::Glyph::Workers, glyph::Glyph::Needs, glyph::Glyph::Cancelling]
                 .iter()
@@ -6564,6 +6568,7 @@ mod tests {
             elapsed: None,
             tick: None,
             watchable: true,
+            demoted: false,
         };
         w.prune(t0, &[done]);
         assert!(w.worker("sa_3").is_none(), "its view has gone");

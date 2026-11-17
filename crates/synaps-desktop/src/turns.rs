@@ -1274,7 +1274,15 @@ impl AppView {
             .items_center()
             .whitespace_nowrap()
             .child(glyph::lead(
-                Some(live_glyph(&self.fx, g, mark, p.tool, self.fx.change(Tag::BlockGlyph, key, glyph_code(g), None), None, false)),
+                Some(live_glyph(
+                    &self.fx,
+                    g,
+                    mark,
+                    p.tool,
+                    self.fx.change(Tag::BlockGlyph, key, glyph_code(glyph::worker(glyph::steady(live, v.demoted)).0), None),
+                    None,
+                    false,
+                )),
                 m,
             ))
             .child(
