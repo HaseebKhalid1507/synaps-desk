@@ -122,6 +122,7 @@ pub mod label {
     pub const SECRET: &str = "S E C R E T   R E Q U E S T E D";
     pub const AUTHORIZE: &str = "A U T H O R I Z E";
     pub const DENY: &str = "D E N Y";
+    pub const OPEN: &str = "O P E N";
     pub const SUBMIT: &str = "S U B M I T";
     pub const CANCEL: &str = "C A N C E L";
     pub const ACCENT: &str = "A C C E N T";

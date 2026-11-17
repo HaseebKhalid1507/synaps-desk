@@ -928,6 +928,57 @@ fn a_stale_view_under_a_reused_handle_says_nothing_of_its_worker(cx: &mut TestAp
     });
 }
 
+/// A fan-out wider than its chips' lines (polish.md §2.5, finish gate
+/// r2): the newest worker fails, and its chip is drawn, first, while
+/// quiet running ones go into `+N more`; `+N more` opens the workers
+/// menu, the workers not drawn, newest first; picked, its view in place.
+#[gpui_kit::test]
+fn a_failed_worker_is_never_folded_into_more(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    let rows = |failed: bool| {
+        let rows: Vec<serde_json::Value> = (1..=12u64)
+            .map(|n| {
+                let status = if failed && n == 12 { "failed" } else { "running" };
+                serde_json::json!({"subagent_id": n, "agent_name": format!("worker-{n}"), "status": status, "cancel_requested": false,
+                    "elapsed_secs": 10.0 + n as f64, "finished_elapsed": null, "step": format!("reading src/part_{n}.rs"), "tools": n,
+                    "handle_id": format!("sa_{n}")})
+            })
+            .collect();
+        synaps_client::protocol::decode_event(&serde_json::json!({"ev": "subagent_rows", "rows": rows})).expect("a rows event")
+    };
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.on_session(&rows(false));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.on_session(&rows(true));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let (ids, drawn, more) =
+        view.read_with(cx, |v, _| (v.tray.rows.iter().map(|r| r.id).collect::<Vec<_>>(), v.tray_drawn(), v.chips.more));
+    assert!(ids.contains(&12), "the failed one flashes in the tray: {ids:?}");
+    assert!(more > 0 && drawn + more == ids.len(), "more workers than lines: {drawn} drawn, +{more}");
+    assert_eq!(ids[0], 12, "the failure first: {ids:?}");
+    let running: Vec<u64> = ids[1..].to_vec();
+    assert!(running.windows(2).all(|p| p[0] > p[1]), "then the running, newest first: {running:?}");
+    // `+N more` opens the workers menu: the ones not drawn.
+    let at = VisualTestContext::from_window(w, cx).debug_bounds("tray-more").expect("+N more drawn").center();
+    click_at(cx, w, at);
+    let items = view.read_with(cx, |v, _| v.wmenu.as_ref().map(|m| m.items.iter().map(|i| i.act).collect::<Vec<_>>()));
+    assert_eq!(items.as_deref(), Some(&ids[drawn..]), "the workers menu lists those not drawn");
+    let pick = ids[drawn];
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.workers_menu_pick(pick, crate::menu::How::Click(1), window, cx)))
+        .expect("the window");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(v.wmenu.is_none(), "picked: closed");
+        assert_eq!(v.model.watch.focused().map(|w| w.subagent_id), Some(pick), "its view in place");
+    });
+}
+
 /// The other demo session in a tab, attached (with no client, the
 /// synthetic transport answers its attach).
 fn open_idle_cpu(cx: &mut TestAppContext, view: &Entity<AppView>, place: crate::tabs::Place) {
@@ -1328,6 +1379,61 @@ fn transcript_heights_stable_across_frames(cx: &mut TestAppContext) {
     assert_eq!(heights(cx), full, "Off and Full lay the column out alike");
 }
 
+/// The clicked header is the anchor (fluid.md §3.3): a run unfolded under
+/// Full at the end of the list (tail-follow on) reveals its rows below its
+/// header, which is drawn on every frame, at its height and its y, until
+/// they have. Its id is its first row's: that row's reveal is not its.
+#[gpui_kit::test]
+fn an_unfold_under_full_keeps_its_header_put(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    // The column's glide in (a session opened) ends first.
+    let mut n = 0;
+    while motion_pending(cx, &view).0 && n < 400 {
+        fluid_frame(cx, w, &view);
+        n += 1;
+    }
+    settle(cx, w, 8);
+    assert!(view.read_with(cx, |v, _| v.list.is_following_tail()), "at the end, following");
+    let header = |cx: &mut TestAppContext, run: u64| {
+        view.read_with(cx, |v, _| {
+            let ix = v.disp.iter().position(|d| d.id == run && matches!(d.kind, crate::turns::Kind::Summary { .. }))?;
+            v.list.bounds_for_item(ix).map(|b| (f32::from(b.origin.y), f32::from(b.size.height)))
+        })
+    };
+    // The last folded run on screen: the one the clip clicks.
+    let run = view.read_with(cx, |v, _| {
+        v.disp
+            .iter()
+            .enumerate()
+            .filter(|(ix, d)| matches!(d.kind, crate::turns::Kind::Summary { open: false, .. }) && v.list.bounds_for_item(*ix).is_some())
+            .map(|(_, d)| d.id)
+            .last()
+            .expect("a folded run on screen")
+    });
+    let at = header(cx, run).expect("drawn");
+    assert!(at.1 > 0., "{at:?}");
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(motion_pending(cx, &view).0, "the cascade is running");
+    let mut frames = 0;
+    while motion_pending(cx, &view).0 && frames < 120 {
+        fluid_frame(cx, w, &view);
+        frames += 1;
+        assert_eq!(header(cx, run), Some(at), "the header on frame {frames}");
+    }
+    assert!(frames > 2, "the cascade ran over frames ({frames})");
+    let opened = view.read_with(cx, |v, _| v.disp.iter().filter(|d| d.kind == crate::turns::Kind::Work).count());
+    assert!(opened >= 5, "its rows are in the list ({opened})");
+    settle(cx, w, 8);
+    assert_eq!(header(cx, run), Some(at), "at rest");
+}
+
 /// Words arrive readable (fluid.md law 3, §3.4): the one stream fade in
 /// the app is `motion::text_motion` (its words start at 70 %), given only
 /// to text streamed into a row (`turns.rs`); no view gets the kit's own
@@ -1577,52 +1683,73 @@ fn running_tools(cx: &mut TestAppContext, view: &Entity<AppView>, n: usize) {
     cx.run_until_parked();
 }
 
-/// Soul B (motion.md §10 amendment 15): a running call's lit bar blooms,
-/// a 1 px column beside it in the row's padding (nothing moves: the
-/// bloom is an absolute child); Off has none; it is gone once the bar
-/// has settled after the call ends.
+/// Q1 cards (polish.md §2.1, F1): a tool row is bare on the canvas. Its
+/// box reaches into the gutter for its status glyph (the hover fill takes
+/// the glyph in) and stops where the AGENT label ends; its verb starts on
+/// the prose column. A failed call opens on its well, at the verb column
+/// to the column's end.
 #[gpui_kit::test]
-fn a_running_bar_blooms_until_it_settles(cx: &mut TestAppContext) {
+fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
     use synaps_client::protocol::{LlmEvent, StreamEvent};
-    let (w, view, _events) = open_at(cx, (1440., 1800.), crate::theme::Panels::default().text_size);
+    let (w, view, _events) = open_at(cx, (2200., 1400.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
-    // Read off a frame of the app's own (a beat may have replayed it).
-    let blooms = |cx: &mut TestAppContext| {
-        view.update(cx, |_, cx| cx.notify());
-        cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
-        cx.run_until_parked();
-        VisualTestContext::from_window(w, cx).debug_bounds("bar-bloom")
-    };
-    // The demo's own calls have ended: nothing blooms.
-    for _ in 0..6 {
-        beat(cx, w, &view);
-    }
-    assert!(blooms(cx).is_none(), "no call runs: no bloom");
+    // A turn of its own: its first row, the call, carries AGENT.
+    view.update(cx, |v, _| {
+        let n = v.model.transcript.items().len();
+        v.model.transcript.apply(&SessionEvent::TurnStarted {
+            turn_baseline: n as _,
+            trigger: "user".into(),
+            user_text: Some("Run it.".into()),
+        });
+    });
     running_tools(cx, &view, 1);
     for _ in 0..4 {
         beat(cx, w, &view);
     }
-    let b = blooms(cx).expect("the running call's bar blooms");
-    assert_eq!(b.size.width, gpui_kit::px(1.), "1 px");
-    set_motion(cx, &view, crate::motion::Level::Off);
-    settle(cx, w, 4);
-    assert!(blooms(cx).is_none(), "Off: the static app, no bloom");
-    set_motion(cx, &view, crate::motion::Level::Full);
-    settle(cx, w, 4);
-    assert!(blooms(cx).is_some(), "lit again");
+    let (id, lay, m) = view.read_with(cx, |v, cx| {
+        let id = v.model.transcript.items().last().map(|i| i.id).expect("the call");
+        (id, v.layout, crate::theme::metrics(cx))
+    });
+    assert!(lay.hang, "2200 px: the labels hang");
+    let geo = crate::turns::Geo::of(lay, &m);
+    let bounds = |cx: &mut TestAppContext, what: &'static str| {
+        view.update(cx, |_, cx| cx.notify());
+        cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+        cx.run_until_parked();
+        VisualTestContext::from_window(w, cx).debug_bounds(what)
+    };
+    let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the running call's row");
+    assert_eq!(f32::from(row.size.width), lay.column + geo.out, "the column and {} of the gutter", geo.out);
+    assert_eq!(row.size.height, gpui_kit::px(m.row), "one row");
+    let column = f32::from(row.left()) + geo.out;
+    let status = bounds(cx, leak(format!("tool-status {id}"))).expect("the status glyph's column");
+    assert!(
+        f32::from(status.left()) >= f32::from(row.left()) && f32::from(status.right()) <= column,
+        "{status:?}: in the gutter, inside the row's box"
+    );
+    // Its AGENT label ends where the row's box starts.
+    let label = bounds(cx, leak(format!("hang-label-{id}"))).expect("the call's AGENT label");
+    assert!(label.right() <= row.left(), "the hover fill stops at the label: {label:?} {row:?}");
     view.update(cx, |v, cx| {
         v.model.transcript.apply(&SessionEvent::Stream {
-            event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "ok".into() }),
+            event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "Tool execution failed: boom".into() }),
         });
         v.sync_list();
+        v.list.scroll_to_end();
         cx.notify();
     });
     cx.run_until_parked();
-    // (Its light decays over SLOW: not sampled mid-way.)
-    for _ in 0..5 {
+    for _ in 0..4 {
         beat(cx, w, &view);
     }
-    assert!(blooms(cx).is_none(), "settled to its hue: the bloom is gone");
+    let failed = view.read_with(cx, |v, _| v.model.transcript.items().last().and_then(|i| i.tool.as_ref()).and_then(|t| t.status));
+    assert_eq!(failed, Some(synaps_client::transcript::ToolStatus::Failed));
+    let well = bounds(cx, leak(format!("well {id}"))).expect("a failed call opens on its well");
+    let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the row");
+    assert_eq!(f32::from(well.left()), f32::from(row.left()) + geo.out + geo.verb, "the well at the verb column");
+    assert_eq!(well.right(), row.right(), "to the column's end");
+    let status = bounds(cx, leak(format!("tool-status {id}"))).expect("its failed glyph");
+    assert!(f32::from(status.right()) <= f32::from(row.left()) + geo.out, "still in the gutter");
 }
 
 /// One beat goes by: the motion clock and the executor's move on together,
@@ -1704,6 +1831,9 @@ fn the_fuse_burns_clear_of_the_pointer(cx: &mut TestAppContext) {
     assert_eq!(f32::from(confirm.left() - fuse.right()), 8., "8 px before CONFIRM");
     assert!(f32::from(armed.right() - fuse.right()) >= 24., "clear of the ×'s end: {armed:?} {fuse:?}");
     assert!(confirm.right() <= armed.right() && fuse.left() >= armed.left());
+    // Its chip holds all of it: CONFIRM is not clipped.
+    let chip = b(cx, "chip 1");
+    assert!(armed.right() <= chip.right() && confirm.right() <= chip.right(), "{confirm:?} in {chip:?}");
 }
 
 /// Finish gate fix 1: a turn that ends here hands the floor back: Handoff

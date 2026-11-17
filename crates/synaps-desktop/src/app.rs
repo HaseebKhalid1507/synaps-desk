@@ -51,10 +51,17 @@ pub(crate) struct RowCache {
     /// succeeded), and as shown.
     pub(crate) delta: Option<files::CallDelta>,
     pub(crate) counts: turns::Counts,
+    /// The row's card parts (polish.md §2.1): its verb, a path target split
+    /// in two, the meta facts and the well's header and numbered lines.
+    pub(crate) card: turns::Card,
     /// The item's time ([`Item::at`], which is not in `rev`), and read in
     /// the local zone: parsed once here, never per frame or per sync.
     at: Option<Arc<str>>,
     pub(crate) time: Option<crate::times::Stamp>,
+    /// The same instant on this machine's clock, read once against the
+    /// wall clock: a running call's clock counts from it on the frame's
+    /// instant ([`crate::motion::Motion::now`]).
+    pub(crate) started: Option<Instant>,
 }
 
 impl RowCache {
@@ -63,12 +70,17 @@ impl RowCache {
         if self.at != item.at {
             self.at = item.at.clone();
             self.time = item.at.as_deref().and_then(crate::times::Stamp::local);
+            self.started = item.at.as_deref().and_then(|a| chrono::DateTime::parse_from_rfc3339(a).ok()).map(|t| {
+                let ago = (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).to_std().unwrap_or_default();
+                let now = Instant::now();
+                now.checked_sub(ago).unwrap_or(now)
+            });
         }
     }
 }
 
 /// Result lines an open tool row shows.
-const RESULT_LINES: usize = 12;
+pub(crate) const RESULT_LINES: usize = 12;
 /// Background tabs whose transcript and rows are kept (switching back to
 /// one shows it at once, then its attach brings it up to date), at most
 /// this many and this many bytes (estimated, [`TabCache::bytes`]).
@@ -134,9 +146,11 @@ impl TabCache {
         let item = |i: &Item| {
             std::mem::size_of::<Item>()
                 + i.text.capacity()
-                + i.tool.as_ref().map_or(0, |t| t.tool_id.capacity() + t.name.capacity() + t.input.capacity() + t.result.capacity())
+                + i.tool
+                    .as_ref()
+                    .map_or(0, |t| t.tool_id.capacity() + t.name.capacity() + t.input.capacity() + t.result.capacity() + t.tail.capacity())
         };
-        let row = |r: &RowCache| std::mem::size_of::<RowCache>() + r.text.len() + r.arg.len() + r.result.len();
+        let row = |r: &RowCache| std::mem::size_of::<RowCache>() + r.text.len() + r.arg.len() + r.result.len() + r.card.bytes();
         self.transcript.items().iter().map(item).sum::<usize>()
             + self.transcript.len() * ITEM_OVERHEAD
             + self.rows.iter().map(row).sum::<usize>()
@@ -1187,11 +1201,13 @@ fn frame_composer(
 /// A call's input with more than one field (a `bash` with its `timeout`)
 /// as its row says it: its `command`, not its JSON (one field is shown
 /// bare already).
-fn command_of(input: &str) -> Option<String> {
-    if !input.starts_with('{') {
-        return None;
-    }
-    match serde_json::from_str::<serde_json::Value>(input).ok()?.get("command")? {
+/// A call's input as JSON, when it is an object (not a cut preview).
+pub(crate) fn input_of(input: &str) -> Option<serde_json::Value> {
+    input.starts_with('{').then(|| serde_json::from_str::<serde_json::Value>(input).ok()).flatten()
+}
+
+fn command_of(input: Option<&serde_json::Value>) -> Option<String> {
+    match input?.get("command")? {
         serde_json::Value::String(c) => Some(c.clone()),
         _ => None,
     }
@@ -1279,6 +1295,9 @@ pub struct AppView {
     toggled: HashSet<u64>,
     /// Runs the user unfolded (by their first item's id).
     open_runs: HashSet<u64>,
+    /// The rows an unfold under Full is revealing: tail-follow is held
+    /// paused while they do ([`Self::hold_unfold`]).
+    unfold_hold: Vec<u64>,
     /// The transcript's `busy` at the last [`Self::sync_list`]: when it
     /// falls, the last run may fold.
     synced_busy: bool,
@@ -1528,8 +1547,10 @@ pub struct AppView {
     /// worker's ([`crate::watch::FLASH`]).
     pub(crate) tray: crate::tray::TrayCache,
     pub(crate) tray_due: Option<(Instant, Task<()>)>,
-    /// Rows the tray draws this frame ([`crate::fit::tray_rows`]).
+    /// Lines of worker chips this frame ([`crate::fit::chip_lines`]), and
+    /// how the chips flow in them.
     pub(crate) tray_rows: usize,
+    pub(crate) chips: crate::tray::Chips,
     /// Said in the composer's hint until the next key that moves or sends:
     /// why a worker key went nowhere, or why a steer was not sent.
     pub(crate) watch_note: Option<SharedString>,
@@ -1546,6 +1567,8 @@ pub struct AppView {
     /// A session's menu (a right-click on its tab or rail row): Rename…,
     /// Close tab.
     pub(crate) smenu: Option<(crate::menu::Menu<SessionAct>, SessionTarget)>,
+    /// The workers menu (`+N more`'s): its items' acts are worker ids.
+    pub(crate) wmenu: Option<crate::menu::Menu<u64>>,
     /// A rename asked for a session not on screen yet (and when): its
     /// naming row opens once it is attached, if that is soon and nothing
     /// else was shown meanwhile ([`RENAME_WAIT`]); else it is forgotten.
@@ -1844,6 +1867,7 @@ impl AppView {
             list,
             toggled: HashSet::new(),
             open_runs: HashSet::new(),
+            unfold_hold: Vec::new(),
             synced_busy: false,
             files_gen: 0,
             subs_gen: 0,
@@ -1971,12 +1995,14 @@ impl AppView {
             tray: crate::tray::TrayCache::default(),
             tray_due: None,
             tray_rows: 0,
+            chips: Default::default(),
             watch_note: None,
             placeholder_of: None,
             menu: None,
             menu_focus_back: None,
             cancel_tick: None,
             smenu: None,
+            wmenu: None,
             rename_pending: None,
             halt_armed: None,
             halt_tick: None,
@@ -3256,7 +3282,8 @@ impl AppView {
     fn arrive(&self, ix: usize, row: turns::RowParts) -> AnyElement {
         let Some(d) = self.disp.get(ix) else { return row.whole() };
         let streaming = self.synced_busy && ix + 1 == self.disp.len() && d.kind == Kind::Prose;
-        match self.fx.grow(d.id, ix, self.fx.birth(d.id), streaming, self.body_line) {
+        let key = d.motion_key();
+        match self.fx.grow(key, ix, self.fx.birth(key), streaming, self.body_line) {
             // Your own message was readable a frame ago: it doesn't lift.
             Some(mut g) => {
                 if d.kind == Kind::User {
@@ -3947,7 +3974,7 @@ impl AppView {
             let now = self.fx.clock();
             let fresh = self.disp.iter().skip_while(|d| d.item < start).filter(|d| !before.contains(&d.id));
             for (k, d) in fresh.enumerate() {
-                self.fx.born(d.id, now + crate::motion::stagger(k));
+                self.fx.born(d.motion_key(), now + crate::motion::stagger(k));
             }
         }
         self.sync_counts();
@@ -4207,10 +4234,28 @@ impl AppView {
         // header down; a fold draws the tally's segments.
         let now = self.fx.clock();
         self.fx.fold.set(Some((id, now)));
-        let fresh = self.disp.iter().filter(|d| d.kind == Kind::Work && !before.contains(&d.id));
-        for (k, d) in fresh.enumerate() {
-            self.fx.born(d.id, now + crate::motion::stagger(k));
+        let fresh: Vec<u64> = self.disp.iter().filter(|d| d.kind == Kind::Work && !before.contains(&d.id)).map(|d| d.id).collect();
+        for (k, id) in fresh.iter().enumerate() {
+            self.fx.born(*id, now + crate::motion::stagger(k));
         }
+        // They reveal from 0 px (Full), so the list is still at its end the
+        // frame after: GPUI's tail-follow would resume there and carry the
+        // header up as they grow. Paused until they have (fluid.md §3.3).
+        self.unfold_hold = if self.fx.fluid() { fresh } else { Vec::new() };
+    }
+
+    /// An unfold's rows revealing ([`Self::unfold_hold`]): tail-follow
+    /// stays paused, the clicked header where it was. Before the list's
+    /// layout, each frame.
+    fn hold_unfold(&mut self) {
+        if self.unfold_hold.is_empty() {
+            return;
+        }
+        if self.list.is_following_tail() {
+            self.list.pause_following_tail();
+        }
+        let fx = &self.fx;
+        self.unfold_hold.retain(|&id| fx.revealing(id));
     }
 
     /// What the daemon said of the session on screen, each part if known:
@@ -5516,8 +5561,10 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
         preview: None,
         delta: None,
         counts: turns::Counts::default(),
+        card: turns::Card::default(),
         at: None,
         time: None,
+        started: None,
     };
     r.retime(item);
     match item.kind {
@@ -5530,11 +5577,12 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
                 r.delta = ledger.delta(&t.tool_id);
                 r.counts = turns::Counts::of(r.delta.unwrap_or_default());
             }
+            let input = input_of(&t.input);
             r.arg = match (&r.preview, subs.arg(&t.tool_id)) {
                 (Some(pv), _) if !pv.title.is_empty() => pv.title.clone().into(),
                 // A subagent's call: its label and its task's first line.
                 (_, Some(arg)) => arg,
-                _ => match command_of(&t.input) {
+                _ => match command_of(input.as_ref()) {
                     Some(c) => one_line(&c, 200).into(),
                     None => one_line(&t.input, 200).into(),
                 },
@@ -5542,10 +5590,12 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
             let lines: Vec<&str> = t.result.lines().collect();
             r.result_more = lines.len().saturating_sub(RESULT_LINES);
             r.result = lines.iter().take(RESULT_LINES).copied().collect::<Vec<_>>().join("\n").into();
+            r.card = turns::Card::of(t, r.preview.as_deref(), &r.arg, input.as_ref());
         }
         ItemKind::Thinking => {
             r.text = item.text.clone().into();
             r.arg = one_line(&item.text, 200).into();
+            r.card.verb = "think".into();
         }
         // A subagent's completion event: as the TUI says it.
         ItemKind::Notice => r.text = crate::subagents::completion_note(&item.text).unwrap_or_else(|| item.text.clone()).into(),
@@ -5606,6 +5656,7 @@ impl Render for AppView {
         self.fx.rescope(self.motion_session(), self.motion_column());
         if self.menu.is_none()
             && self.smenu.is_none()
+            && self.wmenu.is_none()
             && let Some(h) = self.menu_focus_back.take()
             && self.focus.is_focused(window)
         {
@@ -5750,9 +5801,17 @@ impl Render for AppView {
         // smallest form and the tray leave.
         let card_shown = self.card_shown();
         let ex = crate::fit::Extras { stub: self.stub_shown(), ..ex };
-        // A row fading out keeps its slot until its fade is over.
-        let tray_n = if view.is_none() { self.tray.rows.len() + self.tray.ghosts.len() } else { 0 };
-        self.tray_rows = crate::fit::tray_rows(&m, lay.form(), self.height, card_shown, ex, tray_n);
+        // The worker chips: the lines they need in the column, then how
+        // many the room leaves. A chip fading out keeps its slot until its
+        // fade is over.
+        let confirm = self.display_w(label::CONFIRM, fonts::size::D_S, window);
+        let (form, height, workers) = (lay.form(), self.height, self.tray.rows.len());
+        self.tray_rows = if view.is_none() {
+            self.fit_chips(lay.column, confirm, &m, |needed| crate::fit::chip_lines(&m, form, height, card_shown, ex, workers, needed))
+        } else {
+            self.pack_chips(Vec::new(), &[], lay.column, 0, &m);
+            0
+        };
         // A keyboard menu over a row no longer drawn closes.
         self.close_orphan_menu();
         let ex = crate::fit::Extras { tray: self.tray_rows as u8, ..ex };
@@ -5792,6 +5851,7 @@ impl Render for AppView {
         .pb(px(pad_b));
         self.texts.borrow_mut().frame(lay.column, &m);
         self.hint_rows(&m);
+        self.hold_unfold();
         // After the list's layout: rows it has no height for get their hint
         // in the next frame's [`AppView::hint_rows`], so one is drawn (once:
         // hinted, every row has a height). Else, a load's last frame left the
@@ -5947,6 +6007,10 @@ impl Render for AppView {
                     return;
                 }
                 if this.smenu.is_some() && this.session_menu_keydown(&ev.keystroke, this.chord_press, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.wmenu.is_some() && this.workers_menu_keydown(&ev.keystroke, this.chord_press, window, cx) {
                     cx.stop_propagation();
                     return;
                 }
@@ -6135,6 +6199,7 @@ impl Render for AppView {
             .when(self.gear_menu, |d| d.child(deferred(self.render_gear_menu(rail == Side::Strip, &p, cx)).with_priority(2)))
             .children(self.render_menu_at_point(&p, cx))
             .children(self.render_session_menu(&p, cx))
+            .children(self.render_workers_menu(&p, cx))
             // Painted last, after every row was rendered: what the frame's
             // motion asked for (a frame, the one timer, or nothing; with a
             // beat layer, it arms the timer after painting the beat).
@@ -6152,7 +6217,7 @@ mod tests {
 
     use super::{
         ARM, Arm, CENTRE_MIN, CardChord, CardKey, FavsJob, FoldKeys, Foot, FootIn, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY,
-        above_list, authorize_ready, card_key, card_key_on, command_of, dragged, fav_key, fit_foot, held_back, hidden, left_cut,
+        above_list, authorize_ready, card_key, card_key_on, command_of, dragged, fav_key, fit_foot, held_back, hidden, input_of, left_cut,
         lines_below, one_line, panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled, well_body,
         worker_keys,
     };
@@ -7061,10 +7126,11 @@ mod tests {
     fn one_line_arguments() {
         assert_eq!(one_line("  \nfirst\nsecond", 80), "first …");
         assert_eq!(one_line("abcdef", 3), "abc …");
-        assert_eq!(command_of(r#"{"command":"sleep 16 && echo step 1","timeout":30}"#).as_deref(), Some("sleep 16 && echo step 1"));
-        assert_eq!(command_of(r#"{"path":"a.rs","limit":3}"#), None);
-        assert_eq!(command_of(r#"{"command":"cut off at the prev"#), None, "a cut preview stays as it is");
-        assert_eq!(command_of("ls"), None);
+        let command = |s: &str| command_of(input_of(s).as_ref());
+        assert_eq!(command(r#"{"command":"sleep 16 && echo step 1","timeout":30}"#).as_deref(), Some("sleep 16 && echo step 1"));
+        assert_eq!(command(r#"{"path":"a.rs","limit":3}"#), None);
+        assert_eq!(command(r#"{"command":"cut off at the prev"#), None, "a cut preview stays as it is");
+        assert_eq!(command("ls"), None);
     }
 
     /// N-M1: a steer to scout, Esc out, scout finishes and its view goes,

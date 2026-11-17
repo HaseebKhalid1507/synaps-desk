@@ -345,6 +345,13 @@ roles! {
     // result, the permission card, a raised (selected) row on the chrome,
     // hairlines and input borders, diff line washes.
     chrome, canvas, user, code, tool, tool_out, card, card_hi, raised, hair, edge, frame, add_bg, del_bg,
+    // An opened call's well (polish.md §2.3): `code`, or `tool_out` where
+    // the ink does not read on `code` (paper's code is a dark island).
+    well,
+    // Rules drawn on Q1's boxes, each floored on its own ground and what is
+    // around it: a well's frame and header rule, a chip's frame, OPEN's
+    // outline (on a hovered row too).
+    hair_w, hair_t, edge_t,
     // Text on the canvas.
     ink, prose, dim, you, agent, head, th, td, warn, run, ready, cost, err, well_fg,
     // On the user surface (a user message's markdown, the composer).
@@ -478,22 +485,32 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     // most a built-in theme needs: solarized-dark's red), so a user theme
     // whose ok or error colour sits near its result surface gets no loud
     // wash; `ink` is floored on them.
-    let add_bg = step_upto(tool_out, t.tool_result_ok, SURFACE, 60);
-    let del_bg = step_upto(tool_out, t.error_color, SURFACE, 60);
+    // Since Q1 cards they wash an opened call's well (polish.md §2.3), so
+    // they stand off its ground: `code`, unless the theme's ink does not
+    // read on `code` (paper's is a dark island), then `tool_out`.
+    let washes = |g: u32| (step_upto(g, t.tool_result_ok, SURFACE, 60), step_upto(g, t.error_color, SURFACE, 60));
+    let (on_code_add, on_code_del) = washes(code);
+    let reads = [code, on_code_add, on_code_del].iter().all(|&c| contrast(ink, c) >= TEXT);
+    let well = if reads { code } else { tool_out };
+    let (add_bg, del_bg) = if reads { (on_code_add, on_code_del) } else { washes(tool_out) };
     let you = accent.unwrap_or(t.prompt_fg);
     let focus = accent.unwrap_or(t.border_active);
     let or = |raw: Option<u32>, d: u32| raw.unwrap_or(d);
     let ch = [chrome, raised];
-    let run_grounds = [tool, tool_out];
+    // A run's rows sit bare on the canvas (Q1 cards, F1), `tool_out` under
+    // the hovered one; the worker chips are on `tool`.
+    let run_grounds = [canvas, tool, tool_out];
     // `thinking_colors()`: `thinking_color` lifted toward the answer's colour.
     let think = |f: &mut Floors, role, g: &[u32]| {
         let c = lift(t.thinking_color, t.claude_text, g, TEXT);
         f.text(role, c, g)
     };
-    let mut r = Roles { chrome, canvas, user, code, tool, tool_out, card, card_hi, raised, add_bg, del_bg, ..Roles::default() };
-    for (role, from, c) in [("add_bg", tool_out, add_bg), ("del_bg", tool_out, del_bg)] {
-        f.log.push(Check { role, from, color: c, grounds: vec![tool_out], floor: SURFACE });
+    let mut r = Roles { chrome, canvas, user, code, tool, tool_out, card, card_hi, raised, add_bg, del_bg, well, ..Roles::default() };
+    for (role, from, c) in [("add_bg", well, add_bg), ("del_bg", well, del_bg)] {
+        f.log.push(Check { role, from, color: c, grounds: vec![well], floor: SURFACE });
     }
+    // Its ground stands off the canvas as `code` and `tool_out` do.
+    f.log.push(Check { role: "well", from: well, color: well, grounds: vec![canvas], floor: SURFACE });
     f.log.push(Check { role: "card_hi", from: card, color: card_hi, grounds: vec![card], floor: STEP });
     // The ladder (design.md §1.4): a run and its open body off the canvas,
     // the card and the raised row off the chrome.
@@ -513,6 +530,16 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.hair = f.at("hair", t.separator, ink, &[canvas, chrome], HAIR);
     r.edge = f.at("edge", t.border, ink, &[canvas, chrome, user], EDGE);
     r.frame = f.at("frame", t.border, ink, &[card, card_hi, canvas, chrome, tool_out], FRAME);
+    // A well's frame and header rule, floored on `tool_out` as well as the
+    // well and the canvas: a hovered row's `tool_out` fill sits 2·r over its
+    // well, and paper's well *is* `tool_out`, where a rule floored on the
+    // well alone drew nothing (finish gate r1: well and hovered row read as
+    // one grey L). So it reads heavier than `hair` in most themes (median
+    // 1.37:1 on the well; `hair` is ~1.16:1 on the canvas), on purpose: the
+    // wells are the only boxes in a run, and the design re-gate (r2) kept it.
+    r.hair_w = f.at("hair_w", t.separator, ink, &[well, canvas, tool_out], HAIR);
+    r.hair_t = f.at("hair_t", t.separator, ink, &[tool, tool_out, canvas], HAIR);
+    r.edge_t = f.at("edge_t", t.border, ink, &[canvas, tool_out], EDGE);
     r.ink = f.text("ink", ink, &[canvas, user, tool_out, chrome, raised, add_bg, del_bg, card, card_hi]);
     r.prose = f.text("prose", t.claude_text, &[canvas]);
     r.dim = f.text("dim", t.muted, &[canvas]);
@@ -560,11 +587,15 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.sub_status_t = f.text("sub_status_t", t.subagent_status, &run_grounds);
     r.sub_time_t = f.text("sub_time_t", t.subagent_time, &run_grounds);
     r.sub_rule = f.mark("sub_rule", t.subagent_border, &run_grounds);
-    r.res = f.text("res", t.tool_result_color, &[tool_out]);
-    r.dim_o = f.text("dim_o", t.muted, &[tool_out]);
+    // An opened call's well (polish.md §2.3): its text is the code's on
+    // `code`, the result's on `tool_out`.
+    r.res = f.text("res", if well == code { t.code_fg } else { t.tool_result_color }, &[well]);
+    r.dim_o = f.text("dim_o", t.muted, &[well]);
+    // Unpainted since Q1 cards (an opened thought is `think` on the
+    // canvas); kept for the roles that list it.
     r.think_o = think(&mut f, "think_o", &[tool_out]);
     r.ok_o = f.text("ok_o", t.tool_result_ok, &[add_bg]);
-    r.err_o = f.text("err_o", t.error_color, &[del_bg, tool_out]);
+    r.err_o = f.text("err_o", t.error_color, &[del_bg, well]);
     r.prose_k = f.text("prose_k", t.claude_text, &k);
     r.dim_k = f.text("dim_k", t.muted, &k);
     r.warn_k = f.text("warn_k", t.warning_color, &k);
@@ -1530,10 +1561,12 @@ mod tests {
         assert_eq!((r.think, r.dim), (0x868e9e, 0x707889));
         assert_eq!((r.warn, r.run, r.cost), (0xebcb8b, 0xa3be8c, 0xa3be8c));
         // design.md §1.6, as `roles_check.py` computes them.
-        assert_eq!((r.add_bg, r.del_bg, r.you_mark_t), (0x292e31, 0x332c2f, 0x81a1c1));
+        // Q1 cards: the washes stand off the well's ground, nord's `code`.
+        assert_eq!(r.well, r.code);
+        assert_eq!((r.add_bg, r.del_bg, r.you_mark_t), (0x1c2023, 0x261e20, 0x81a1c1));
     }
 
-    /// The diff washes stand 1.10:1 off the result surface (audit E2: they
+    /// The diff washes stand 1.10:1 off the well's ground (audit E2: they
     /// were up to 2.02:1 off the canvas against the card's 1.24–1.48), and
     /// off the canvas at most 0.15 louder than the card, but in
     /// solarized-dark (+0.21: its card is the quietest); text on them still
@@ -1545,11 +1578,15 @@ mod tests {
         for (name, raw) in palettes::THEMES {
             for &accent in &accents {
                 let (r, _) = resolve(&raw, accent);
+                // Q1 cards: the washes are a well's, off its ground (`code`,
+                // paper's `tool_out`), so quieter off the canvas than they
+                // were off the run's open body.
+                assert!(r.well == r.code || r.well == r.tool_out, "{name}");
                 for wash in [r.add_bg, r.del_bg] {
                     let off = contrast(wash, r.canvas);
-                    assert!(contrast(wash, r.tool_out) >= SURFACE - 1e-9, "{name}");
-                    assert!((1.44..=1.47).contains(&((off * 100.).round() / 100.)), "{name}: {off:.3} off the canvas");
-                    assert!(contrast(r.ink, wash) >= 6.1, "{name}");
+                    assert!(contrast(wash, r.well) >= SURFACE - 1e-9, "{name}");
+                    // Q1 measured 7.32 at the least (`roles_check.py`).
+                    assert!(contrast(r.ink, wash) >= 7., "{name}: ink on a wash {:.2}", contrast(r.ink, wash));
                     let over = off - contrast(r.card, r.canvas);
                     let most = if name == "solarized-dark" { 0.22 } else { 0.15 };
                     assert!(over <= most, "{name}: {over:.3} louder than the card");
@@ -1557,6 +1594,66 @@ mod tests {
                 assert!(contrast(r.ok_o, r.add_bg) >= TEXT && contrast(r.err_o, r.del_bg) >= TEXT, "{name}");
             }
         }
+    }
+
+    /// Q1 cards: every pair the rows, wells, spawn rows and chips draw, as
+    /// drawn (a colour on the ground it is painted over), meets its floor
+    /// in every theme and accent, whatever grounds its role was floored on
+    /// (Shady M1, M4, M5: a rule on its own box, OPEN on a hovered row).
+    #[test]
+    fn q1_draws_every_pair_above_its_floor() {
+        let mut accents: Vec<Option<u32>> = vec![None];
+        accents.extend(PRESETS.iter().map(|p| Some(p.1)));
+        let mut bad = Vec::new();
+        for (name, raw) in palettes::THEMES {
+            for &accent in &accents {
+                let (r, _) = resolve(&raw, accent);
+                // The row on the canvas, hovered on `tool_out`; a chip too
+                // (no fill since the finish gate; `tool` before it).
+                let row = [r.canvas, r.tool_out];
+                let chip = [r.tool, r.tool_out];
+                let verbs = [r.t_bash, r.t_read, r.t_write, r.t_edit, r.t_grep, r.t_find, r.t_ls, r.t_sub, r.t_ext, r.t_gen];
+                let mut pairs: Vec<(&str, u32, Vec<u32>, f64)> = vec![
+                    ("hover fill", r.tool_out, vec![r.canvas], SURFACE),
+                    ("well", r.well, vec![r.canvas], SURFACE),
+                    ("well frame and header rule", r.hair_w, vec![r.well, r.canvas, r.tool_out], HAIR),
+                    ("chip frame", r.hair_t, vec![r.tool, r.tool_out, r.canvas], HAIR),
+                    ("OPEN outline", r.edge_t, row.to_vec(), EDGE),
+                    ("OPEN outline hovered", r.frame, vec![r.tool_out], FRAME),
+                    ("OPEN word hovered", r.prose_t, vec![r.tool_out], TEXT),
+                    ("well text", r.res, vec![r.well], TEXT),
+                    ("well numbers and header", r.dim_o, vec![r.well], TEXT),
+                    ("failed output", r.err_o, vec![r.well, r.del_bg], TEXT),
+                    ("added sign", r.ok_o, vec![r.add_bg], TEXT),
+                    ("diff line", r.ink, vec![r.add_bg, r.del_bg], TEXT),
+                    ("spawn bar, chip bar", r.sub_rule, vec![r.canvas, r.tool, r.tool_out], MARK),
+                    ("spawn task", r.dim_t, row.to_vec(), TEXT),
+                    ("watched chip bar", r.you_mark_t, vec![r.tool_out], MARK),
+                    ("gutter running", r.run_mark, row.to_vec(), MARK),
+                    ("gutter waiting", r.warn_mark, row.to_vec(), MARK),
+                ];
+                for (k, c) in
+                    [("target file", r.prose_t), ("target folder", r.arg), ("meta", r.dim_t), ("count +", r.ok), ("count −", r.err)]
+                {
+                    pairs.push((k, c, row.to_vec(), TEXT));
+                }
+                for c in verbs {
+                    pairs.push(("verb", c, row.to_vec(), TEXT));
+                }
+                for (k, c) in [("worker name", r.sub_name_t), ("worker step", r.sub_status_t), ("worker clock", r.sub_time_t)] {
+                    pairs.push((k, c, [row.as_slice(), chip.as_slice()].concat(), TEXT));
+                }
+                for (what, c, grounds, floor) in pairs {
+                    for g in grounds {
+                        let k = contrast(c, g);
+                        if k < floor - 1e-9 {
+                            bad.push(format!("{name} {accent:?}: {what} #{c:06x} on #{g:06x}: {k:.3} < {floor}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     /// Every role meets its floor in all 20 themes, without an accent and
