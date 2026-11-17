@@ -1552,11 +1552,27 @@ impl Motion {
             (s.prev, s.value) = (s.value, value);
         }
         s.frame = frame;
-        let Some(since) = s.since else { return 0. };
+        let k = self.afterglow(s.since);
+        if k <= 0. && s.since.is_some_and(|t| t <= now) {
+            s.since = None;
+        }
+        k
+    }
+
+    /// An afterglow's `k` (§6.6) at the frame's time, for one that began at
+    /// `since` (a time still to come: due then, 0 until it is): 1 → 0.66 →
+    /// 0.33 → 0 over `glow` at Full, one step of `quick` at Reduced, 0 at
+    /// Off. Asks for the frame its next step is due at.
+    pub(crate) fn afterglow(&self, since: Option<Instant>) -> f32 {
+        let Some(since) = since.filter(|_| self.on()) else { return 0. };
+        let now = self.now();
+        if now < since {
+            self.want_at(since);
+            return 0.;
+        }
         let dur = if self.level.get() == Level::Full { GLOW } else { QUICK };
         let gone = now.saturating_duration_since(since);
         if gone >= dur {
-            s.since = None;
             return 0.;
         }
         let steps = if self.level.get() == Level::Full { 3 } else { 1 };

@@ -6,9 +6,11 @@
 //! read-only with its value and the reason, never as a disabled control.
 //! It draws in a cached pane ([`crate::views::ViewPane`]).
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui_kit::component::input::Input;
@@ -102,6 +104,9 @@ const GROUPS: [&str; 7] = [
 pub(crate) struct SettingsUi {
     /// The find text, lowercase.
     pub find: String,
+    /// Each value shown (by its control): what it was, whether it was being
+    /// sent, and when its save's afterglow begins (motion.md §6.8).
+    pub saved: RefCell<HashMap<SharedString, (u64, bool, Option<Instant>)>>,
     pub scroll: ScrollHandle,
     pub editing: Option<Edit>,
     /// The row whose whole help shows (by key).
@@ -468,7 +473,10 @@ impl AppView {
                     .border_1()
                     .border_color(if open { p.focus } else { p.edge })
                     .cursor_pointer()
-                    .child(mono(shown, 13., if sending.is_some() { p.dim } else { p.prose }).flex_1())
+                    .child({
+                        let k = self.saved_glow(&SharedString::from(id), &shown, sending.is_some());
+                        mono(shown, 13., if sending.is_some() { p.dim } else { crate::motion::mix(p.prose, p.ink, k) }).flex_1()
+                    })
                     .child(mono(if open { "↑" } else { "↓" }, 12., p.dim))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings.dropdown = if this.settings.dropdown == Some(id) { None } else { Some(id) };
@@ -481,6 +489,41 @@ impl AppView {
 
     /// A number or text field: its value in a box; click to edit (Enter
     /// saves, Esc leaves it).
+    /// A shown value's afterglow once saved (motion.md §6.8: the
+    /// confirmation, no toast): a THIS APP value [`crate::app::SAVE_DELAY`]
+    /// after it changed (its write), a daemon one when its write is
+    /// answered. Never on first sight. Its `k`.
+    pub(crate) fn saved_glow(&self, id: &SharedString, value: &str, sending: bool) -> f32 {
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut h);
+            h.finish()
+        };
+        let now = self.fx.now();
+        let mut saved = self.settings.saved.borrow_mut();
+        let since = match saved.get(id).copied() {
+            Some((was, was_sending, _)) if (was, was_sending) != (hash, sending) => {
+                let since = if sending {
+                    None
+                } else if was_sending {
+                    Some(now)
+                } else {
+                    Some(now + crate::app::SAVE_DELAY)
+                };
+                saved.insert(id.clone(), (hash, sending, since));
+                since
+            }
+            Some((_, _, since)) => since,
+            None => {
+                saved.insert(id.clone(), (hash, sending, None));
+                None
+            }
+        };
+        drop(saved);
+        self.fx.afterglow(since)
+    }
+
     fn field(&self, e: Edit, value: SharedString, unit: &'static str, sending: bool, p: &Palette, cx: &ViewCx) -> AnyElement {
         let editing = self.settings.editing == Some(e);
         let id: SharedString = match e {
@@ -497,7 +540,9 @@ impl AppView {
                 .child(Input::new(&self.settings_input).appearance(false))
                 .into_any_element()
         } else {
-            mono(value, 13., if sending { p.dim } else { p.prose }).flex_1().min_w_0().overflow_hidden().text_ellipsis().into_any_element()
+            let k = self.saved_glow(&id, &value, sending);
+            let color = if sending { p.dim } else { crate::motion::mix(p.prose, p.ink, k) };
+            mono(value, 13., color).flex_1().min_w_0().overflow_hidden().text_ellipsis().into_any_element()
         };
         h_flex()
             .id(id)
