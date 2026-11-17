@@ -32,6 +32,7 @@ mod chrome;
 mod dash;
 mod demo;
 mod diag;
+mod favourites;
 mod files;
 mod fit;
 mod fonts;
@@ -242,6 +243,11 @@ fn main() {
 
     let load = |k: Option<&str>| k.and_then(|k| settings.as_deref().and_then(|p| theme::load_tabs(p, k)));
     let restore_tabs = load(tabs_key.as_deref()).or_else(|| load(legacy_key.as_deref()));
+    // The favourites, under the same key (a bench has none).
+    let favs = tabs_key.as_deref().zip(settings.as_deref()).map(|(k, p)| theme::load_favourites(p, k)).unwrap_or_default();
+    if let (Some(k), Some(p)) = (tabs_key.as_deref(), settings.as_deref()) {
+        theme::carry_favourites(p, k, &favs);
+    }
 
     diag::mark("before_application");
     // The assets: the stroked glyphs' sprites (`glyph::Sprites`).
@@ -284,6 +290,7 @@ fn main() {
                 v.start_session = start_session;
                 v.tabs_key = tabs_key;
                 v.restore_tabs = restore_tabs;
+                v.model.favs = favourites::Favourites::new(favs);
                 v.picker_open = open_picker;
                 v.panels = panels;
                 // OLDER left open: list up to the wire's cap from the start.

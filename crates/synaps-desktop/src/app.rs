@@ -208,7 +208,8 @@ actions!(
         WorkerUp,
         WorkerDown,
         WorkerTab,
-        RenameSession
+        RenameSession,
+        ToggleFavourite
     ]
 );
 
@@ -262,8 +263,19 @@ pub fn bind_keys(cx: &mut App) {
         keys.push(KeyBinding::new(k, WorkerTab, None));
     }
     keys.push(KeyBinding::new(RENAME_KEY, RenameSession, None));
+    keys.push(KeyBinding::new(fav_key(mac), ToggleFavourite, None));
     cx.bind_keys(keys);
 }
+
+/// Favourites the session on screen, or unfavourites it (as a browser's
+/// bookmark key): Ctrl+D, Cmd+D on macOS. No input, app, view or card key
+/// is it (`tab_keys_parse_and_clash_with_nothing`).
+pub(crate) const fn fav_key(mac: bool) -> &'static str {
+    if mac { "cmd-d" } else { "ctrl-d" }
+}
+
+/// [`fav_key`] as the session menu shows it.
+const FAV_KEY: &str = if cfg!(target_os = "macos") { "⌘D" } else { "Ctrl+D" };
 
 /// Names the session on screen (opens or closes its naming row), as the
 /// session menu's Rename… and a double-click on its tab's title.
@@ -767,6 +779,8 @@ impl SessionMeta {
 pub(crate) enum SessionAct {
     Rename,
     Close,
+    /// Favourite or unfavourite it (desktop only: never the daemon's pin).
+    Favourite,
 }
 
 /// Where a session's menu was opened: its tab, or its rail row (its key).
@@ -784,11 +798,25 @@ pub(crate) struct SessionTarget {
     pub(crate) row: Option<u64>,
 }
 
-/// The session menu's items: Rename… (F2) and Close tab (the tab key).
-pub(crate) fn session_items(tab: bool) -> Vec<crate::menu::Item<SessionAct>> {
+/// What a session's menu is for: a held session (its live id), and
+/// whether it is a favourite (`None`: it cannot be one yet, not listed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MenuFor {
+    pub(crate) tab: bool,
+    pub(crate) live: bool,
+    pub(crate) fav: Option<bool>,
+}
+
+/// The session menu's items: Rename… (F2, a held session's), Favourite /
+/// Unfavourite (Ctrl+D) and Close tab (the tab key).
+pub(crate) fn session_items(f: MenuFor) -> Vec<crate::menu::Item<SessionAct>> {
     use crate::menu::Item;
+    let fav = Item::new(SessionAct::Favourite, if f.fav == Some(true) { "Unfavourite" } else { "Favourite" }).key(FAV_KEY);
+    let fav = if f.fav.is_some() { fav } else { fav.off("not listed by the daemon yet") };
+    let rename = Item::new(SessionAct::Rename, "Rename…").key("F2");
+    let rename = if f.live { rename } else { rename.off("open it to name it") };
     let close = Item::new(SessionAct::Close, "Close tab").key(CLOSE_KEY);
-    vec![Item::new(SessionAct::Rename, "Rename…").key("F2"), if tab { close } else { close.off("it is not open in a tab") }]
+    vec![rename, fav, if f.tab { close } else { close.off("it is not open in a tab") }]
 }
 
 /// The close-tab key as the session menu shows it.
@@ -1203,6 +1231,39 @@ pub(crate) fn well_body(prompt: &str) -> SharedString {
     SharedString::from(prompt)
 }
 
+/// A favourites write shared by the window and its background job: the job
+/// writes holding the lock and leaves what it wrote here, so the window
+/// takes it ([`crate::favourites::Favourites::written`]) whether or not the
+/// task that started it is still there.
+#[derive(Default)]
+struct FavsJob {
+    /// The window closed: a job not begun yet writes nothing.
+    closed: bool,
+    /// The generation written, the list sent, the file's list after.
+    done: Option<(u64, Vec<crate::favourites::Favourite>, Vec<crate::favourites::Favourite>)>,
+}
+
+impl FavsJob {
+    /// `sent` merged into the file over `base` ([`theme::save_favourites`]),
+    /// unless the window closed first.
+    fn write(
+        slot: &std::sync::Mutex<FavsJob>,
+        path: &std::path::Path,
+        key: &str,
+        base: &[crate::favourites::Favourite],
+        sent: Vec<crate::favourites::Favourite>,
+        generation: u64,
+    ) -> std::io::Result<()> {
+        let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if job.closed {
+            return Ok(());
+        }
+        let file = theme::save_favourites(path, key, base, &sent)?;
+        job.done = Some((generation, sent, file));
+        Ok(())
+    }
+}
+
 pub struct AppView {
     pub client: Option<Client>,
     /// Connection, sessions, attachment and transcript. Events are applied
@@ -1359,6 +1420,17 @@ pub struct AppView {
     tabs_saved: u64,
     tabs_written: u64,
     tabs_save: Option<Task<()>>,
+    /// The same for the favourites (saved under `tabs_key` too), and the
+    /// rail generation their snapshots were last brought up to.
+    favs_saved: u64,
+    favs_written: u64,
+    favs_save: Option<Task<()>>,
+    /// The favourites write on its way, shared with its background job.
+    favs_job: Arc<std::sync::Mutex<FavsJob>>,
+    /// A favourites job is between taking the list and its result being
+    /// taken (the window's own: never a wait on the job's lock).
+    favs_writing: bool,
+    favs_synced: Option<u64>,
     /// The session lists the restored tabs have been checked against.
     lists_seen: u64,
     /// The background tabs' sessions as last seen ([`TAB_CACHE`]).
@@ -1701,11 +1773,13 @@ impl AppView {
         subs.push(cx.on_release(|this, _| {
             this.flush_panels();
             this.flush_tabs();
+            this.flush_favs();
             this.flush_app();
         }));
         subs.push(cx.on_app_quit(|this, _| {
             this.flush_panels();
             this.flush_tabs();
+            this.flush_favs();
             this.flush_app();
             async {}
         }));
@@ -1838,6 +1912,12 @@ impl AppView {
             restore_tabs: None,
             tabs_key: None,
             tabs_saved: 0,
+            favs_saved: 0,
+            favs_written: 0,
+            favs_save: None,
+            favs_job: Arc::default(),
+            favs_writing: false,
+            favs_synced: None,
             tabs_written: 0,
             tabs_save: None,
             lists_seen: 0,
@@ -2150,11 +2230,18 @@ impl AppView {
 
     /// The rail as the model, find, the chip and the buckets have it now.
     fn refresh_rail(&mut self) {
+        // The favourites' snapshots follow the lists (and are saved when
+        // they change): only when the lists did.
+        if self.favs_synced != Some(self.model.rail_gen) {
+            self.model.sync_favs();
+            self.favs_synced = Some(self.model.rail_gen);
+        }
         let view = crate::rail::View {
             find: std::mem::take(&mut self.find),
             chip: self.chip,
             open: self.panels.history_open,
             expanded: self.expanded,
+            favs_closed: self.panels.favs_closed,
         };
         self.rail.refresh(&self.model, &view, &self.rail_list);
         self.find = view.find;
@@ -2721,6 +2808,114 @@ impl AppView {
                 }
             });
         }));
+    }
+
+    /// The favourites changed since the last save (the set, or what a row
+    /// shows; an update time alone waits for quit): saved [`SAVE_DELAY`]
+    /// later, off the UI thread, under the tabs' key (never in a bench), as
+    /// a merge into what the file has now ([`crate::favourites::merge`]):
+    /// another window's adds and removes are kept, and taken.
+    ///
+    /// A write once begun is never dropped: a change while it runs waits for
+    /// it (the same task writes again), and what it wrote is taken
+    /// ([`crate::favourites::Favourites::written`]) even if the window closes meanwhile
+    /// ([`FavsJob`]), so the next merge never reads a stale base (a removed
+    /// favourite coming back as another instance's).
+    fn schedule_favs_save(&mut self, cx: &mut Context<Self>) {
+        if self.tabs_key.is_none() || self.bench.is_some() || self.model.favs.generation == self.favs_saved {
+            return;
+        }
+        self.favs_saved = self.model.favs.generation;
+        self.carry_favs();
+        if self.favs_writing {
+            return;
+        }
+        self.favs_save = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SAVE_DELAY).await;
+                let job = this
+                    .update(cx, |v, _| {
+                        let f = &v.model.favs;
+                        v.favs_writing = true;
+                        (theme::settings_path(), v.tabs_key.clone(), f.base.clone(), f.list.clone(), f.generation, v.favs_job.clone())
+                    })
+                    .ok();
+                let Some((Some(path), Some(key), base, sent, generation, slot)) = job else { return };
+                let done = cx.background_spawn(async move { FavsJob::write(&slot, &path, &key, &base, sent, generation) }).await;
+                let again = this.update(cx, |v, cx| {
+                    let taken = v.take_favs_written();
+                    if let Err(e) = done {
+                        v.model.named.notice = Some(format!("Favourites not saved: {e}"));
+                        cx.notify();
+                        return false;
+                    }
+                    v.favs_written = v.favs_written.max(generation);
+                    v.model.favs.quiet = false;
+                    if taken {
+                        v.model.rail_gen += 1;
+                        cx.notify();
+                    }
+                    // Changed while it wrote: write again.
+                    v.model.favs.generation != generation
+                });
+                if !again.unwrap_or(false) {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// The write that finished, taken into the list (once). `true`: the
+    /// list changed (another instance's adds or removes).
+    fn take_favs_written(&mut self) -> bool {
+        self.favs_writing = false;
+        let done = self.favs_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).done.take();
+        let changed = done.is_some_and(|(_, sent, file)| self.model.favs.written(&sent, file));
+        if changed {
+            self.carry_favs();
+        }
+        changed
+    }
+
+    /// The favourites in memory, for a write that sets a corrupt settings
+    /// file aside to carry ([`theme::carry_favourites`]).
+    fn carry_favs(&self) {
+        if let (Some(path), Some(key), None) = (theme::settings_path(), self.tabs_key.as_deref(), self.bench.as_ref()) {
+            theme::carry_favourites(&path, key, &self.model.favs.list);
+        }
+    }
+
+    /// Favourites changed since the last write (an update time too),
+    /// written now, merged as [`AppView::schedule_favs_save`] does.
+    ///
+    /// A background write still running is waited for and taken first (it
+    /// holds [`FavsJob`]'s lock while it writes, never longer than the
+    /// settings lock's bounded wait and the write); one not begun never
+    /// will.
+    fn flush_favs(&mut self) {
+        self.favs_save = None;
+        let slot = self.favs_job.clone();
+        let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        job.closed = true;
+        if let Some((generation, sent, file)) = job.done.take() {
+            self.model.favs.written(&sent, file);
+            self.favs_written = self.favs_written.max(generation);
+        }
+        let f = &self.model.favs;
+        if self.tabs_key.is_none() || self.bench.is_some() || (f.generation == self.favs_written && !f.quiet) {
+            return;
+        }
+        if let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref()) {
+            let sent = f.list.clone();
+            match theme::save_favourites(&path, key, &f.base, &sent) {
+                Ok(file) => {
+                    self.favs_written = self.model.favs.generation;
+                    self.model.favs.quiet = false;
+                    self.model.favs.written(&sent, file);
+                }
+                Err(e) => eprintln!("synaps-desktop: favourites not saved: {e}"),
+            }
+        }
     }
 
     /// Tabs changed since the last write, written now (the window closes,
@@ -4117,6 +4312,69 @@ impl AppView {
         self.model.sessions.get(row.live?).map(|m| m.id.clone())
     }
 
+    /// Favourite a rail row's session, or unfavourite it, by what the row
+    /// is: held, a favourite (its own row) or listed
+    /// ([`Model::toggle_fav_row`]). Looked up by the row's id in the lists
+    /// as they are now, never by an index the rail was built with (a poll
+    /// may have replaced the lists since). Desktop only: nothing is sent.
+    pub(crate) fn toggle_fav_row(&mut self, key: u64) {
+        let Some(row) = self.rail.rail.rows.iter().find(|r| r.key == key) else { return };
+        let (action, fav) = (row.action.clone(), row.fav.is_some());
+        if self.model.toggle_fav_row(&action, fav, crate::chrome::now_secs()) {
+            self.favs_changed();
+        }
+    }
+
+    /// Favourite a held session (its tab, the key), or unfavourite it.
+    pub(crate) fn toggle_fav_session(&mut self, session_id: &str) {
+        let m = &mut self.model;
+        let Some(s) = m.sessions.iter().find(|s| s.id == session_id) else { return };
+        m.favs.toggle(crate::favourites::Source::Live(s), crate::chrome::now_secs());
+        self.favs_changed();
+    }
+
+    /// A gone favourite's Remove.
+    pub(crate) fn remove_fav(&mut self, id: &str) {
+        if self.model.favs.remove(id) {
+            self.favs_changed();
+        }
+    }
+
+    fn favs_changed(&mut self) {
+        self.model.rail_gen += 1;
+        self.model.view_dirty = true;
+    }
+
+    /// A text field has the keyboard (the composer, find, a name, a colour,
+    /// a secret, Settings' fields): keys are its text, not the app's.
+    fn typing(&self, window: &Window, cx: &App) -> bool {
+        self.composer.read(cx).focus_handle(cx).is_focused(window)
+            || [&self.find_input, &self.name_input, &self.hex_input, &self.secret_input, &self.settings_find, &self.settings_input]
+                .iter()
+                .any(|i| i.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    /// The favourite key: the session tab on screen. Not while typing (a
+    /// TUI hand's Ctrl+D there is no toggle of the favourites).
+    fn fav_key_pressed(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.typing(window, cx) {
+            return;
+        }
+        let Some(id) = self.model.tabs.current().filter(|t| t.kind == crate::tabs::Kind::Session).and_then(|t| t.session.clone()) else {
+            return;
+        };
+        self.toggle_fav_session(&id);
+        cx.notify();
+    }
+
+    /// FAVOURITES folded or opened (saved, as the buckets are).
+    pub(crate) fn toggle_favs_group(&mut self, cx: &mut Context<Self>) {
+        let mut p = self.panels;
+        p.favs_closed = !p.favs_closed;
+        self.set_panels(p, cx);
+        cx.notify();
+    }
+
     /// A session's menu at `pt` (a right-click on its tab or rail row).
     pub(crate) fn open_session_menu(&mut self, at: SessionAt, pt: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let (session, tab, row) = match at {
@@ -4126,11 +4384,18 @@ impl AppView {
                 (s, Some(id), None)
             }
             SessionAt::Row(key) => {
-                let Some(s) = self.rail_session(key) else { return };
-                let tab = self.model.tabs.find(&s).and_then(|ix| self.model.tabs.iter().nth(ix)).map(|t| t.id);
+                // A saved row's menu has no live session (Favourite only).
+                let s = self.rail_session(key).unwrap_or_default();
+                let tab =
+                    (!s.is_empty()).then(|| self.model.tabs.find(&s).and_then(|ix| self.model.tabs.iter().nth(ix)).map(|t| t.id)).flatten();
                 (s, tab, Some(key))
             }
         };
+        let fav = match row {
+            Some(key) => self.rail.rail.rows.iter().find(|r| r.key == key).map(|r| r.fav.is_some()),
+            None => self.model.sessions.iter().find(|m| m.id == session).map(|m| self.model.fav_of(m).is_some()),
+        };
+        let for_ = MenuFor { tab: tab.is_some(), live: !session.is_empty(), fav };
         self.close_menu();
         // The row's readout is not drawn under its menu.
         self.readout = None;
@@ -4142,7 +4407,7 @@ impl AppView {
         }
         window.focus(&self.focus, cx);
         self.gear_menu = false;
-        let menu = crate::menu::Menu::new(session_items(tab.is_some()), crate::menu::At::Point(pt), false);
+        let menu = crate::menu::Menu::new(session_items(for_), crate::menu::At::Point(pt), false);
         self.smenu = Some((menu, SessionTarget { session, tab, row }));
         cx.notify();
     }
@@ -4170,6 +4435,10 @@ impl AppView {
                     self.close_tab(ix);
                 }
             }
+            SessionAct::Favourite => match t.row {
+                Some(key) => self.toggle_fav_row(key),
+                None => self.toggle_fav_session(&t.session),
+            },
         }
         cx.notify();
     }
@@ -5494,6 +5763,7 @@ impl Render for AppView {
         }
         let tabs = self.render_tabs(if view.is_some() { view_pane } else { pane }, &p, cx);
         self.schedule_tabs_save(cx);
+        self.schedule_favs_save(cx);
         // A worker's view on screen asks for its next page; under Settings
         // or Usage, nothing. Whether its list is scrolled back (its oldest
         // rows stay while they may be read).
@@ -5811,6 +6081,7 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &WorkerDown, _, cx| this.worker_key(Step::Down, cx)))
             .on_action(cx.listener(|this, _: &WorkerTab, _, cx| this.worker_tab_key(cx)))
             .on_action(cx.listener(|this, _: &RenameSession, window, cx| this.rename_session(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleFavourite, window, cx| this.fav_key_pressed(window, cx)))
             .map(|d| tab_actions(d, cx))
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
                 let k = &ev.keystroke.key;
@@ -5880,13 +6151,39 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ARM, Arm, CENTRE_MIN, CardChord, CardKey, FoldKeys, Foot, FootIn, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY, above_list,
-        authorize_ready, card_key, card_key_on, command_of, dragged, fit_foot, held_back, hidden, left_cut, lines_below, one_line,
-        panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled, well_body, worker_keys,
+        ARM, Arm, CENTRE_MIN, CardChord, CardKey, FavsJob, FoldKeys, Foot, FootIn, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY,
+        above_list, authorize_ready, card_key, card_key_on, command_of, dragged, fav_key, fit_foot, held_back, hidden, left_cut,
+        lines_below, one_line, panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled, well_body,
+        worker_keys,
     };
     use crate::theme::{Metrics, Panels};
     use crate::turns::Layout;
     use crate::watch::Step;
+
+    /// R5: a favourites write leaves what it wrote for the window to take,
+    /// whatever became of the task that started it; once the window has
+    /// closed (its flush wrote, holding the lock), a job not begun writes
+    /// nothing over it.
+    #[test]
+    fn a_favourites_write_is_taken_or_never_begun() {
+        use crate::favourites::{Favourite, Source};
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-favsjob-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v: synaps_client::SavedSession = serde_json::from_value(serde_json::json!({"id": "x", "title": "X"})).unwrap();
+        let sent = vec![Favourite::of(Source::Saved(&v), 1)];
+        let slot = std::sync::Mutex::new(FavsJob::default());
+        FavsJob::write(&slot, &path, "k", &[], sent.clone(), 7).unwrap();
+        let (generation, s, file) = slot.lock().unwrap().done.take().expect("left to take");
+        assert_eq!((generation, &s, &file), (7, &sent, &sent));
+        std::fs::write(&path, "{}").unwrap();
+        slot.lock().unwrap().closed = true;
+        FavsJob::write(&slot, &path, "k", &[], sent, 8).unwrap();
+        assert!(slot.lock().unwrap().done.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}", "closed: not written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Short is the pane's height alone, under the full top bar: 648 px,
     /// a 700-px window (1280×720 is full). It changes nothing the list's
@@ -6048,6 +6345,23 @@ mod tests {
     /// none is a key the inputs (composer, find, names) or an IME use: the
     /// list is gpui-base 0.9.1's input bindings (`input/base/state.rs`), a
     /// hand copy: refresh it when the kit's pin moves.
+    /// The session menu: Rename… (a held session's), Favourite or
+    /// Unfavourite as it is (off while the daemon has not listed it), Close
+    /// tab (a tab's).
+    #[test]
+    fn the_session_menu_favourites() {
+        use super::{MenuFor, SessionAct, session_items};
+        let labels = |f: MenuFor| -> Vec<(String, bool)> {
+            session_items(f).into_iter().map(|i| (i.label.to_string(), i.why_not.is_none())).collect()
+        };
+        let held = labels(MenuFor { tab: true, live: true, fav: Some(false) });
+        assert_eq!(held, [("Rename…".into(), true), ("Favourite".into(), true), ("Close tab".into(), true)]);
+        let saved = labels(MenuFor { tab: false, live: false, fav: Some(true) });
+        assert_eq!(saved, [("Rename…".into(), false), ("Unfavourite".into(), true), ("Close tab".into(), false)]);
+        assert!(!labels(MenuFor { tab: true, live: true, fav: None })[1].1);
+        assert_eq!(session_items(MenuFor { tab: true, live: true, fav: Some(true) })[1].act, SessionAct::Favourite);
+    }
+
     #[test]
     fn tab_keys_parse_and_clash_with_nothing() {
         const INPUT: &[&str] = &[
@@ -6146,8 +6460,12 @@ mod tests {
         for mac in [false, true] {
             let (a, b) = panel_keys(mac);
             let (s, u, alt) = crate::views::view_keys(mac, !mac);
-            let mut taken: Vec<_> =
-                [a, b, RENAME_KEY].into_iter().chain(text_keys(mac)).chain(tab_keys(mac).iter().map(|(k, _)| *k)).map(parse).collect();
+            let mut taken: Vec<_> = [a, b, RENAME_KEY, fav_key(mac)]
+                .into_iter()
+                .chain(text_keys(mac))
+                .chain(tab_keys(mac).iter().map(|(k, _)| *k))
+                .map(parse)
+                .collect();
             taken.extend([Some(s), Some(u), alt].into_iter().flatten().map(parse));
             let keys = worker_keys(mac);
             assert_eq!(keys[0], (if mac { "alt-up" } else { "ctrl-up" }, Step::Up));
@@ -6163,7 +6481,8 @@ mod tests {
         }
         for mac in [false, true] {
             let (a, b) = panel_keys(mac);
-            let mut app: Vec<_> = [a, b].into_iter().chain(text_keys(mac)).map(|k| (parse(k), None)).collect();
+            // Ctrl+D / Cmd+D, the favourite key, with them.
+            let mut app: Vec<_> = [a, b, fav_key(mac)].into_iter().chain(text_keys(mac)).map(|k| (parse(k), None)).collect();
             app.extend(tab_keys(mac).iter().map(|(k, what)| (parse(k), Some(*what))));
             for (i, (k, what)) in app.iter().enumerate() {
                 assert!(!input.contains(k), "{k:?} is an input key");

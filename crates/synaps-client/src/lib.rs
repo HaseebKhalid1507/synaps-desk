@@ -105,8 +105,8 @@ pub use client::{
 pub use conn::{Endpoint, Identity, Incompatible, InvalidName};
 pub use history::HistoryUpdate;
 pub use protocol::{
-    AttachMode, Attached, ClientInput, ClientKind, FEATURE_SAVED_SESSIONS, HistoryMode, InvalidSessionName, MISSING_CWD, Rejected,
-    RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, WatchEvent, WatchPage,
+    AttachMode, Attached, ClientInput, ClientKind, ContinueInfo, FEATURE_SAVED_SESSIONS, HistoryMode, InvalidSessionName, MISSING_CWD,
+    Rejected, RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, WatchEvent, WatchPage,
     validate_session_name,
 };
 pub use transcript::{Transcript, TranscriptError};

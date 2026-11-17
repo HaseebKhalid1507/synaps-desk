@@ -983,9 +983,28 @@ fn sync_kit(p: &Palette, r: &Roles, cx: &mut App) {
 
 /// The settings file: `<config dir>/synaps-desktop/settings.json`.
 /// Linux/BSD: `$XDG_CONFIG_HOME` or `~/.config`; macOS: `~/Library/Application
-/// Support`; Windows: `%APPDATA%`.
+/// Support`; Windows: `%APPDATA%`. In a test, under the test process's own
+/// folder ([`test_home`]): no test reads or writes the user's.
 pub fn settings_path() -> Option<PathBuf> {
-    let env_dir = |k: &str| std::env::var_os(k).map(PathBuf::from).filter(|p| p.is_absolute());
+    let path = settings_path_in(env_var)?;
+    #[cfg(test)]
+    test_home::guard(&path);
+    Some(path)
+}
+
+#[cfg(not(test))]
+fn env_var(k: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(k)
+}
+
+#[cfg(test)]
+fn env_var(k: &str) -> Option<std::ffi::OsString> {
+    test_home::var(k)
+}
+
+/// [`settings_path`] in the environment `var` reads.
+fn settings_path_in(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let env_dir = |k: &str| var(k).map(PathBuf::from).filter(|p| p.is_absolute());
     let dir = if cfg!(windows) {
         env_dir("APPDATA")?
     } else if cfg!(target_os = "macos") {
@@ -994,6 +1013,43 @@ pub fn settings_path() -> Option<PathBuf> {
         env_dir("XDG_CONFIG_HOME").or_else(|| env_dir("HOME").map(|h| h.join(".config")))?
     };
     Some(dir.join("synaps-desktop").join("settings.json"))
+}
+
+/// Tests' config: `XDG_CONFIG_HOME`, `APPDATA` and `HOME` are a folder of
+/// the test process's own (the process environment is never changed: the
+/// tests run on threads, and C code reads it too).
+#[cfg(test)]
+pub(crate) mod test_home {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    pub fn root() -> &'static Path {
+        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| std::env::temp_dir().join(format!("synaps-desktop-test-home-{}", std::process::id())))
+    }
+
+    pub fn var(k: &str) -> Option<OsString> {
+        matches!(k, "XDG_CONFIG_HOME" | "APPDATA" | "HOME").then(|| root().join(k).into_os_string())
+    }
+
+    /// A test resolved the user's real settings file (or folder): it stops
+    /// there, before anything reads or writes it.
+    pub fn guard(path: &Path) {
+        if let Some(real) = super::settings_path_in(|k| std::env::var_os(k)) {
+            let dir = real.parent().unwrap_or(&real);
+            assert!(!path.starts_with(dir), "a test resolved the real settings file {}", path.display());
+        }
+    }
+
+    #[test]
+    fn tests_never_resolve_the_real_settings() {
+        let path = super::settings_path().unwrap();
+        assert!(path.starts_with(root()), "{}", path.display());
+        let real = super::settings_path_in(|k| std::env::var_os(k));
+        assert!(real.as_ref().is_none_or(|r| *r != path));
+        let caught = std::panic::catch_unwind(|| guard(&super::settings_path_in(|k| std::env::var_os(k)).unwrap_or_default()));
+        assert!(real.is_none() || caught.is_err(), "the guard stops the real path");
+    }
 }
 
 fn load_settings(path: &Path) -> Option<serde_json::Value> {
@@ -1035,7 +1091,8 @@ pub fn save_theme(path: &Path, name: Option<&str>) -> std::io::Result<()> {
 /// pixels, clamped to [`RAIL_WIDTHS`] / [`RIGHT_WIDTHS`]; missing, `null`
 /// or not a number: the auto width), which HISTORY buckets are open
 /// (`history_open`, a list of bucket names; missing or not a list: NAMED
-/// and TODAY) and the centre pane's text size (`text_size`, one of
+/// and TODAY), whether FAVOURITES is folded (`favourites_closed`; missing:
+/// open) and the centre pane's text size (`text_size`, one of
 /// [`TEXT_STEPS`]; anything else: [`DEFAULT_TEXT`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Panels {
@@ -1046,6 +1103,7 @@ pub struct Panels {
     pub right_width: Option<u16>,
     /// [`Bucket::bit`]s.
     pub history_open: u8,
+    pub favs_closed: bool,
     pub text_size: u8,
 }
 
@@ -1061,6 +1119,7 @@ impl Default for Panels {
             rail_width: None,
             right_width: None,
             history_open: Bucket::DEFAULT_OPEN,
+            favs_closed: false,
             text_size: DEFAULT_TEXT,
         }
     }
@@ -1072,6 +1131,7 @@ impl Panels {
     const RAIL_WIDTH: &str = "rail_width";
     const RIGHT_WIDTH: &str = "right_width";
     const HISTORY: &str = "history_open";
+    const FAVS: &str = "favourites_closed";
     const TEXT_SIZE: &str = "text_size";
 }
 
@@ -1083,6 +1143,7 @@ pub struct PanelKeys {
     pub rail_width: bool,
     pub right_width: bool,
     pub history: bool,
+    pub favs: bool,
     pub text_size: bool,
 }
 
@@ -1095,6 +1156,7 @@ impl PanelKeys {
             rail_width: a.rail_width != b.rail_width,
             right_width: a.right_width != b.right_width,
             history: a.history_open != b.history_open,
+            favs: a.favs_closed != b.favs_closed,
             text_size: a.text_size != b.text_size,
         }
     }
@@ -1110,6 +1172,7 @@ impl PanelKeys {
             rail_width: self.rail_width || o.rail_width,
             right_width: self.right_width || o.right_width,
             history: self.history || o.history,
+            favs: self.favs || o.favs,
             text_size: self.text_size || o.text_size,
         }
     }
@@ -1132,6 +1195,7 @@ pub fn load_panels(path: &Path) -> Panels {
         rail_width: width(Panels::RAIL_WIDTH, RAIL_WIDTHS),
         right_width: width(Panels::RIGHT_WIDTH, RIGHT_WIDTHS),
         history_open,
+        favs_closed: flag(Panels::FAVS),
         text_size: v
             .get(Panels::TEXT_SIZE)
             .and_then(serde_json::Value::as_u64)
@@ -1160,6 +1224,9 @@ pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<(
     if keys.history {
         let open: Vec<&str> = Bucket::ALL.into_iter().filter(|b| p.history_open & b.bit() != 0).map(Bucket::key).collect();
         kv.push((Panels::HISTORY, open.into()));
+    }
+    if keys.favs {
+        kv.push((Panels::FAVS, p.favs_closed.into()));
     }
     if keys.text_size {
         kv.push((Panels::TEXT_SIZE, p.text_size.into()));
@@ -1220,24 +1287,151 @@ pub fn save_tabs(path: &Path, key: &str, saved: &crate::tabs::Saved) -> std::io:
     })
 }
 
+/// The favourite sessions saved under `key` (the daemon they are of, as
+/// the tabs are keyed): `favourites.<key>` in the settings file, a list
+/// ([`crate::favourites::to_json`]). Missing or malformed: none.
+pub fn load_favourites(path: &Path, key: &str) -> Vec<crate::favourites::Favourite> {
+    load_settings(path).and_then(|v| v.get("favourites")?.get(key).map(crate::favourites::from_json)).unwrap_or_default()
+}
+
+/// Save the favourites under `key`, keeping every other daemon's and every
+/// other key (see [`save_settings`]): `ours` merged into the list the file
+/// has now, from `base` (the list as this instance last read or wrote it;
+/// [`crate::favourites::merge`]), so another instance's adds and removes
+/// survive. Returns the list written. A file with no `favourites.<key>`
+/// (none yet, or one that did not parse and was set aside) says nothing of
+/// removals: `ours` is written as it is (a real "none left" is `[]`). A
+/// `favourites` that is not an object, or a `favourites.<key>` that is not a
+/// list (a newer build's form, a hand edit), is not overwritten: an error
+/// says so.
+pub fn save_favourites(
+    path: &Path,
+    key: &str,
+    base: &[crate::favourites::Favourite],
+    ours: &[crate::favourites::Favourite],
+) -> std::io::Result<Vec<crate::favourites::Favourite>> {
+    let mut written = Vec::new();
+    try_update_settings(path, |v| {
+        let refuse = |what: String| Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{what}: not overwritten")));
+        match v.get("favourites") {
+            None => v["favourites"] = serde_json::json!({}),
+            Some(f) if !f.is_object() => return refuse("settings.json's favourites is not an object".into()),
+            Some(f) => {
+                if f.get(key).is_some_and(|l| !l.is_array()) {
+                    return refuse(format!("settings.json's favourites.{key} is not a list"));
+                }
+            }
+        }
+        written = match v["favourites"].get(key) {
+            Some(theirs) => crate::favourites::merge(&crate::favourites::from_json(theirs), base, ours),
+            None => ours.to_vec(),
+        };
+        v["favourites"][key] = crate::favourites::to_json(&written);
+        Ok(())
+    })?;
+    Ok(written)
+}
+
+/// How long a write waits for another process's lock on the settings file
+/// (its read, merge and rename take milliseconds) before it writes
+/// unlocked: a holder stopped mid-write (a suspended or hung process) never
+/// freezes this one, on the UI thread or off it.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The advisory lock on `lock` (the settings' own lock file), tried until
+/// `wait` has passed while another holds it (std's `WouldBlock`: `EWOULDBLOCK`,
+/// Windows' `ERROR_LOCK_VIOLATION` only). `Err`: why it isn't held, at once
+/// for a lock file that can't be opened or locked at all (the caller writes
+/// unlocked and says so on stderr). Never a blocking lock.
+fn lock_settings(lock: &Path, wait: std::time::Duration) -> Result<std::fs::File, String> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock)
+        .map_err(|e| format!("{} not opened ({e})", lock.display()))?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(format!("{} not locked ({e})", lock.display())),
+        }
+    }
+}
+
+/// The favourites this process holds, per settings file and daemon key, as
+/// saved ([`crate::favourites::to_json`]): what a write that sets a corrupt
+/// file aside carries into the new one ([`try_update_settings`]).
+type Carried = Vec<(std::path::PathBuf, String, serde_json::Value)>;
+static CARRIED: std::sync::Mutex<Carried> = std::sync::Mutex::new(Vec::new());
+
+/// The favourites in memory under `key` now, for `path` ([`CARRIED`]).
+pub fn carry_favourites(path: &Path, key: &str, list: &[crate::favourites::Favourite]) {
+    let mut c = CARRIED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let v = crate::favourites::to_json(list);
+    match c.iter_mut().find(|(p, k, _)| p == path && k == key) {
+        Some((.., l)) => *l = v,
+        None => c.push((path.to_path_buf(), key.to_string(), v)),
+    }
+}
+
 /// Change the settings file with `edit` (on its JSON object), as
 /// [`save_settings`] says.
 fn update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> std::io::Result<()> {
+    try_update_settings(path, |v| {
+        edit(v);
+        Ok(())
+    })
+}
+
+/// [`update_settings`] with an `edit` that may refuse: the file is then
+/// left as it was. A file that is there but cannot be read is left as it
+/// was too (an error says so): only a missing one starts empty.
+fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value) -> std::io::Result<()>) -> std::io::Result<()> {
     use std::io::Write;
     // One writer at a time in this process: the theme (UI thread) and the
     // panels (background) each re-read and merge, so neither write is lost.
     static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = WRITER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let text = std::fs::read_to_string(path).ok();
-    let parsed = text.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()).filter(serde_json::Value::is_object);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    if parsed.is_none() && text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+    // And one at a time across processes (two windows, two builds): the
+    // read, the merge and the rename under an advisory lock of a file of
+    // its own, so no window writes over what another wrote after its read.
+    let _lock = lock_settings(&path.with_extension("json.lock"), LOCK_WAIT)
+        .inspect_err(|why| eprintln!("synaps-desktop: {why}: settings written unlocked"))
+        .ok();
+    // Lossy: a stray invalid byte is a file that does not parse (set aside
+    // below), never one read as missing (which would wipe every key).
+    let text = match std::fs::read(path) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let parsed = text.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()).filter(serde_json::Value::is_object);
+    let set_aside = parsed.is_none() && text.as_deref().is_some_and(|t| !t.trim().is_empty());
+    if set_aside {
         std::fs::copy(path, path.with_extension("json.bad"))?;
     }
     let mut v = parsed.unwrap_or_else(|| serde_json::json!({}));
-    edit(&mut v);
+    edit(&mut v)?;
+    // Set aside, the file had the favourites (they are in `.bad` now): a
+    // write of other keys (the tabs, the theme) carries this process's in
+    // memory, unless the edit wrote them itself.
+    if set_aside {
+        for (_, key, list) in CARRIED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().filter(|(p, ..)| p == path) {
+            if !v.get("favourites").is_some_and(serde_json::Value::is_object) {
+                v["favourites"] = serde_json::json!({});
+            }
+            if v["favourites"].get(key).is_none() {
+                v["favourites"][key] = list.clone();
+            }
+        }
+    }
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     let tmp = path.with_extension(format!("json.{}.{nanos}.tmp", std::process::id()));
     let written = (|| {
@@ -1625,6 +1819,182 @@ mod tests {
         let v = load_settings(&path).unwrap();
         assert_eq!(v.as_object().map(|o| o.len()), Some(8), "{v}");
         assert!(v.as_object().unwrap().values().all(|x| x == 19), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Favourites are kept per daemon (the tabs' keys): one daemon's list
+    /// never shows on another, saving one keeps the others, the tabs and
+    /// every key this build does not know; a list survives a write of
+    /// anything else.
+    #[test]
+    fn favourites_round_trip_per_daemon_keeping_unknown_keys() {
+        use crate::favourites::{Favourite, Favourites, Source};
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-favs-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r##"{"accent": "#2d7bff", "from_the_future": {"x": [1, 2]}, "tabs": {"socket:/a": {"sessions": ["s1"], "active": 0}}}"##,
+        )
+        .unwrap();
+        assert!(load_favourites(&path, "socket:/a").is_empty(), "none yet");
+        let saved = |id: &str, cwd: &str| -> synaps_client::SavedSession {
+            serde_json::from_value(
+                serde_json::json!({"id": id, "title": format!("t {id}"), "cwd": cwd, "updated_at": "2026-01-02T03:04:05Z"}),
+            )
+            .unwrap()
+        };
+        let mut a = Favourites::default();
+        a.toggle(Source::Saved(&saved("j-old", "/home/u/deep")), 10);
+        a.toggle(Source::Saved(&saved("j-new", "/home/u/new")), 20);
+        let b = vec![Favourite::of(Source::Saved(&saved("j-b", "/srv/b")), 30)];
+        assert_eq!(save_favourites(&path, "socket:/a", &[], &a.list).unwrap(), a.list);
+        save_favourites(&path, "socket:/b", &[], &b).unwrap();
+        assert_eq!(load_favourites(&path, "socket:/a"), a.list, "order and snapshot kept");
+        assert_eq!(load_favourites(&path, "socket:/b"), b, "another daemon's apart");
+        assert!(load_favourites(&path, "offline").is_empty());
+        // Everything else stays: unknown keys, the tabs, the accent.
+        save_settings(&path, &[("theme", "nord".into())]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["from_the_future"], serde_json::json!({"x": [1, 2]}));
+        assert_eq!(v["tabs"]["socket:/a"]["sessions"], serde_json::json!(["s1"]));
+        assert_eq!(load_accent(&path).as_deref(), Some("#2d7bff"));
+        assert_eq!(load_favourites(&path, "socket:/a"), a.list, "a write of another key keeps them");
+        assert_eq!(load_tabs(&path, "socket:/a").map(|t| t.sessions), Some(vec!["s1".to_string()]));
+        // Unfavourited: an empty list, not the daemon's key gone with the others.
+        assert!(save_favourites(&path, "socket:/a", &a.list, &[]).unwrap().is_empty());
+        assert!(load_favourites(&path, "socket:/a").is_empty());
+        assert_eq!(load_favourites(&path, "socket:/b"), b);
+        // Another instance's add since this one read the file: kept.
+        let c = vec![Favourite::of(Source::Saved(&saved("j-c", "/srv/c")), 40)];
+        save_favourites(&path, "socket:/b", &b, &[b.clone(), c.clone()].concat()).unwrap();
+        let mine = vec![b[0].clone(), Favourite::of(Source::Saved(&saved("j-d", "/srv/d")), 50)];
+        let written = save_favourites(&path, "socket:/b", &b, &mine).unwrap();
+        assert_eq!(written.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["j-b", "j-c", "j-d"]);
+        assert_eq!(load_favourites(&path, "socket:/b"), written);
+        // Not an object, or a key's value not a list (a newer build's
+        // form, a hand edit): read as none, and never overwritten.
+        for odd in [r#"{"favourites": [1, 2]}"#, r#"{"favourites": {"socket:/b": {"v": 2, "list": []}}}"#] {
+            std::fs::write(&path, odd).unwrap();
+            assert!(load_favourites(&path, "socket:/b").is_empty());
+            let e = save_favourites(&path, "socket:/b", &[], &b).unwrap_err();
+            assert!(e.to_string().contains("not overwritten"), "{e}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), odd, "left as it was");
+        }
+        // R2: a file that does not parse (a hand edit's trailing comma) is
+        // set aside and says nothing of removals: every favourite this
+        // instance has is written, and stays in its list.
+        std::fs::write(&path, "{}").unwrap();
+        save_favourites(&path, "socket:/b", &[], &mine).unwrap();
+        let bad = std::fs::read_to_string(&path).unwrap().replacen('{', "{,", 1);
+        std::fs::write(&path, &bad).unwrap();
+        let written = save_favourites(&path, "socket:/b", &mine, &mine).unwrap();
+        assert_eq!(written, mine, "none dropped as another instance's remove");
+        assert_eq!(load_favourites(&path, "socket:/b"), mine);
+        assert_eq!(std::fs::read_to_string(path.with_extension("json.bad")).unwrap(), bad, "the hand edit kept");
+        let mut list = Favourites::new(mine.clone());
+        assert!(!list.written(&mine, written), "the list keeps them");
+        assert_eq!(list.list, mine);
+        // No `favourites`, or no key for this daemon: the same.
+        for none in [r#"{"theme": "nord"}"#, r#"{"favourites": {"socket:/a": []}}"#] {
+            std::fs::write(&path, none).unwrap();
+            assert_eq!(save_favourites(&path, "socket:/b", &mine, &mine).unwrap(), mine, "{none}");
+        }
+        // A file there that cannot be read is left as it was.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&path, r#"{"theme": "nord", "favourites": {"socket:/b": []}}"#).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+            // Root reads it anyway: nothing to check there.
+            if std::fs::read(&path).is_err() {
+                assert!(save_favourites(&path, "socket:/b", &[], &mine).is_err());
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"theme": "nord", "favourites": {"socket:/b": []}}"#);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4: a write waits for another process's lock (advisory, on a file of
+    /// its own: two opens conflict as two processes do). N4: never for
+    /// longer than its wait: a holder that never lets go (stopped mid-write)
+    /// does not freeze it, and a lock file that can't be opened isn't waited
+    /// for at all; either way it writes, unlocked. No bound here depends on
+    /// how fast the machine is: a wait that was waited out took at least its
+    /// length, one not waited for took less than a minute of it.
+    #[test]
+    fn a_write_waits_for_the_lock() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-lock-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let lock = path.with_extension("json.lock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"theme": "nord"}"#).unwrap();
+        let other = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock).unwrap();
+        other.lock().unwrap();
+        // Held: waited for (a minute's wait: still waiting while it is held)
+        // and taken once let go.
+        let l = lock.clone();
+        let waiter = std::thread::spawn(move || lock_settings(&l, Duration::from_secs(60)));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "held: still waiting");
+        other.unlock().unwrap();
+        assert!(waiter.join().unwrap().is_ok(), "taken once let go");
+        // Held for good: not taken, after the whole wait; the write goes
+        // ahead, unlocked.
+        other.lock().unwrap();
+        let t0 = Instant::now();
+        let why = lock_settings(&lock, LOCK_WAIT).unwrap_err();
+        assert!(t0.elapsed() >= LOCK_WAIT, "{:?}", t0.elapsed());
+        assert!(why.contains("not locked"), "{why}");
+        save_settings(&path, &[("accent", "#35f2ff".into())]).unwrap();
+        assert_eq!(load_accent(&path).as_deref(), Some("#35f2ff"));
+        assert_eq!(load_theme(&path).as_deref(), Some("nord"), "merged");
+        // A lock file that can't be opened (a directory there: EISDIR,
+        // Windows' ERROR_ACCESS_DENIED): not waited for, whatever the wait;
+        // the write goes ahead, unlocked.
+        drop(other);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        let t0 = Instant::now();
+        let why = lock_settings(&lock, Duration::from_secs(60)).unwrap_err();
+        assert!(t0.elapsed() < Duration::from_secs(60), "not waited for: {:?}", t0.elapsed());
+        assert!(why.contains("not opened"), "{why}");
+        save_settings(&path, &[("accent", "#ff2d7b".into())]).unwrap();
+        assert_eq!(load_accent(&path).as_deref(), Some("#ff2d7b"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// N5: a write of other keys (the tabs, the theme) that sets a corrupt
+    /// file aside carries the favourites this process holds for that file
+    /// into the new one (they were in it); the favourites' own write
+    /// merges as before. Another file's are not carried.
+    #[test]
+    fn a_set_aside_carries_the_favourites() {
+        use crate::favourites::{Favourite, Source};
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-carry-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v: synaps_client::SavedSession =
+            serde_json::from_value(serde_json::json!({"id": "j1", "title": "Relay", "cwd": "/w"})).unwrap();
+        let mine = vec![Favourite::of(Source::Saved(&v), 7)];
+        save_favourites(&path, "socket:/b", &[], &mine).unwrap();
+        carry_favourites(&path, "socket:/b", &mine);
+        carry_favourites(&dir.join("other.json"), "socket:/c", &mine);
+        std::fs::write(&path, r#"{"favourites": {"socket:/b": [{"id": "j1"},]}}"#).unwrap();
+        save_tabs(&path, "socket:/b", &crate::tabs::Saved::default()).unwrap();
+        assert_eq!(load_favourites(&path, "socket:/b"), mine, "carried over");
+        assert!(load_tabs(&path, "socket:/b").is_some());
+        let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(file["favourites"].get("socket:/c").is_none(), "only this file's");
+        // Not set aside: nothing carried (another instance's remove stays).
+        std::fs::write(&path, r#"{"theme": "nord"}"#).unwrap();
+        save_accent(&path, Some(0x2d7bff)).unwrap();
+        assert!(load_favourites(&path, "socket:/b").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
