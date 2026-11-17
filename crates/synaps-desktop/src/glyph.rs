@@ -152,13 +152,41 @@ pub(crate) fn draw(g: Glyph, color: Hsla) -> AnyElement {
 /// A stroked glyph's SVG, written from its drawing: the box as the view
 /// box, its lines as one path. Butt caps and miter joins, as a stroke's
 /// defaults.
+#[cfg(test)]
 pub(crate) fn svg_of(g: Glyph) -> String {
+    svg_cut(g, CUTS)
+}
+
+/// A stroked glyph's write-on is cut into this many sprites (each
+/// rasterized once per size and scale, as the whole one is): `k` of them
+/// draws its strokes, in order, to `k / CUTS` of their length.
+pub(crate) const CUTS: u32 = 8;
+
+/// [`svg_of`] drawn to `k / CUTS` of its strokes' length (motion.md §6.1:
+/// the write-on; `Failed`'s two strokes one after the other).
+pub(crate) fn svg_cut(g: Glyph, k: u32) -> String {
     let s = g.size();
+    let seg = |a: (f32, f32), b: (f32, f32)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    let lines = || g.parts().iter().filter_map(|p| if let Part::Line(pts) = p { Some(*pts) } else { None });
+    let total: f32 = lines().map(|pts| pts.windows(2).map(|w| seg(w[0], w[1])).sum::<f32>()).sum();
+    let mut left = total * k.min(CUTS) as f32 / CUTS as f32;
     let mut d = String::new();
-    for part in g.parts() {
-        if let Part::Line(pts) = part {
-            for (i, (x, y)) in pts.iter().enumerate() {
-                let _ = write!(d, "{}{x} {y}", if i == 0 { "M" } else { "L" });
+    for pts in lines() {
+        if left <= 1e-4 {
+            break;
+        }
+        let _ = write!(d, "M{} {}", pts[0].0, pts[0].1);
+        for w in pts.windows(2) {
+            let l = seg(w[0], w[1]);
+            if left >= l - 1e-4 {
+                let _ = write!(d, "L{} {}", w[1].0, w[1].1);
+                left -= l;
+            } else {
+                let t = left / l;
+                let (x, y) = (w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t);
+                let _ = write!(d, "L{} {}", (x * 100.).round() / 100., (y * 100.).round() / 100.);
+                left = 0.;
+                break;
             }
         }
     }
@@ -168,6 +196,236 @@ pub(crate) fn svg_of(g: Glyph) -> String {
     )
 }
 
+/// A cut sprite's path: `glyph/ok.svg` cut at `k` is `glyph/ok~k.svg`.
+/// A static table: a write-on frame formats nothing.
+fn cut_path(g: Glyph, k: u32) -> Option<&'static str> {
+    const _: () = assert!(CUTS == 8, "one path per cut below");
+    macro_rules! cuts {
+        ($stem:literal) => {
+            &[
+                concat!($stem, "~1.svg"),
+                concat!($stem, "~2.svg"),
+                concat!($stem, "~3.svg"),
+                concat!($stem, "~4.svg"),
+                concat!($stem, "~5.svg"),
+                concat!($stem, "~6.svg"),
+                concat!($stem, "~7.svg"),
+            ]
+        };
+    }
+    let base = g.sprite()?;
+    if k >= CUTS {
+        return Some(base);
+    }
+    let table: &[&str; 7] = match g {
+        Glyph::Ok => cuts!("glyph/ok"),
+        Glyph::Failed => cuts!("glyph/failed"),
+        Glyph::Fold => cuts!("glyph/fold"),
+        Glyph::FoldOpen => cuts!("glyph/fold-open"),
+        Glyph::Close => cuts!("glyph/close"),
+        _ => return None,
+    };
+    table.get(k.checked_sub(1)? as usize).copied()
+}
+
+/// The glyph and cut a sprite path names.
+fn parse_cut(path: &str) -> Option<(Glyph, u32)> {
+    if let Some(g) = Glyph::ALL.into_iter().find(|g| g.sprite() == Some(path)) {
+        return Some((g, CUTS));
+    }
+    let (stem, k) = path.strip_suffix(".svg")?.rsplit_once('~')?;
+    let k: u32 = k.parse().ok().filter(|k| (1..CUTS).contains(k))?;
+    let g = Glyph::ALL.into_iter().find(|g| g.sprite().is_some_and(|s| s.strip_suffix(".svg") == Some(stem)))?;
+    Some((g, k))
+}
+
+/// `g` drawn to `p` (0..1) in `color` (motion.md §2.2 `draw_at`): strokes
+/// cut at `p` of their length, quads at `p` of their width. 1: [`draw`].
+pub(crate) fn draw_at(g: Glyph, p: f32, color: Hsla) -> AnyElement {
+    if p >= 1. {
+        return draw(g, color);
+    }
+    let s = px(g.size());
+    if p <= 0. {
+        return div().flex_none().size(s).into_any_element();
+    }
+    if g.sprite().is_some() {
+        let k = ((p * CUTS as f32).ceil() as u32).clamp(1, CUTS);
+        let path = cut_path(g, k).unwrap_or_default();
+        return svg().path(SharedString::new_static(path)).flex_none().size(s).text_color(color).into_any_element();
+    }
+    let mut el = div().relative().flex_none().size(s);
+    for &part in g.parts() {
+        el = match part {
+            Part::Fill(x, y, w, h) => el.child(div().absolute().left(px(x)).top(px(y)).w(px(w * p)).h(px(h)).bg(color)),
+            Part::Frame(x, y, w, h) => {
+                el.child(div().absolute().left(px(x)).top(px(y)).w(px(w * p)).h(px(h)).border_1().border_color(color))
+            }
+            Part::Line(_) => el,
+        };
+    }
+    el.into_any_element()
+}
+
+/// The scan's row in the glyph box at `beat` (motion.md §7.1): one device
+/// pixel down per beat, a 1 s cycle.
+pub(crate) fn scan_row(beat: u32) -> f32 {
+    1. + (beat % 8) as f32
+}
+
+/// A running glyph (`Run`, `Workers`) at `beat`: its quads, and its beam
+/// ([`beam_rows`]). Any other glyph: [`draw`].
+pub(crate) fn scan(g: Glyph, beat: Option<u32>, mark: Hsla, ink: Hsla) -> AnyElement {
+    let Some(beat) = beat.filter(|_| matches!(g, Glyph::Run | Glyph::Workers)) else { return draw(g, mark) };
+    let mut el = div().relative().flex_none().size(px(g.size()));
+    for &part in g.parts() {
+        if let Part::Fill(x, top, w, h) = part {
+            el = el.child(div().absolute().left(px(x)).top(px(top)).w(px(w)).h(px(h)).bg(mark));
+        }
+    }
+    let hot = beam(mark, ink).0;
+    for (x, y, w, c) in beam_rows(g, beat, mark, ink) {
+        let row = div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(1.)).bg(c);
+        el = el.child(if c == hot { row.debug_selector(|| "beam-row".into()) } else { row });
+    }
+    el.into_any_element()
+}
+
+/// The scan's phosphor beam in `g`'s box at `beat` (motion.md §10
+/// amendment 14): the 1 px row the beat is on, lit toward the ink
+/// (`mix(mark, ink, 0.6)`), and the row it left one beat ago, its
+/// afterglow (`mix(mark, ink, 0.22)`; none as the beam wraps to the top).
+/// x, y, width, colour: one per fill a row crosses. [`scan`] and the beat
+/// layer draw these.
+pub(crate) fn beam_rows(g: Glyph, beat: u32, mark: Hsla, ink: Hsla) -> impl Iterator<Item = (f32, f32, f32, Hsla)> {
+    let (hot, glow) = beam(mark, ink);
+    let trail = (!beat.is_multiple_of(8)).then(|| scan_row(beat - 1));
+    rows_at(g, scan_row(beat), hot).chain(trail.into_iter().flat_map(move |y| rows_at(g, y, glow)))
+}
+
+fn rows_at(g: Glyph, y: f32, c: Hsla) -> impl Iterator<Item = (f32, f32, f32, Hsla)> {
+    g.parts().iter().filter_map(move |&part| match part {
+        Part::Fill(x, top, w, h) if (top..top + h).contains(&y) => Some((x, y, w, c)),
+        _ => None,
+    })
+}
+
+/// The beam's row and its afterglow's: the mark toward the ink.
+pub(crate) fn beam(mark: Hsla, ink: Hsla) -> (Hsla, Hsla) {
+    (crate::motion::mix(mark, ink, BEAM), crate::motion::mix(mark, ink, GLOW))
+}
+
+/// How far toward the ink the beam's row is lit, and its afterglow's.
+pub(crate) const BEAM: f32 = 0.6;
+pub(crate) const GLOW: f32 = 0.22;
+
+/// `Needs`' inner cell in its box: x, y, side.
+pub(crate) const BREATH_CELL: (f32, f32, f32) = (3., 3., 4.);
+
+/// The breathing cell's colour `step` beats in: between `mark` and
+/// `mix(mark, ground, 0.6)`, 19 beats a cycle.
+pub(crate) fn breath_cell(step: u32, mark: Hsla, ground: Hsla) -> Hsla {
+    let n = crate::motion::BREATH_BEATS;
+    let f = 1. - ((2 * (step % n)) as f32 / n as f32 - 1.).abs();
+    crate::motion::mix(mark, ground, 0.6 * f)
+}
+
+/// `Needs` breathing (motion.md §6.3): `step` beats since the prompt came,
+/// the inner cell between `mark` and `mix(mark, ground, 0.6)`, 19 beats a
+/// cycle, three cycles, then held at `mark`. `None`: still.
+pub(crate) fn breath(step: Option<u32>, mark: Hsla, ground: Hsla) -> AnyElement {
+    let Some(s) = step.filter(|s| *s < crate::motion::BREATH_BEATS * crate::motion::BREATHS) else {
+        return draw(Glyph::Needs, mark);
+    };
+    breath_box(breath_cell(s, mark, ground), mark).into_any_element()
+}
+
+fn breath_box(cell: Hsla, mark: Hsla) -> Div {
+    let (x, y, w) = BREATH_CELL;
+    div()
+        .relative()
+        .flex_none()
+        .size(px(10.))
+        .child(div().absolute().inset_0().border_1().border_color(mark))
+        .child(div().absolute().left(px(x)).top(px(y)).size(px(w)).bg(cell))
+}
+
+/// A glyph whose beat the beat layer paints ([`crate::motion::Beat`]):
+/// drawn still (a scan's quads without its row; a breath's cell at
+/// `mark`, where it ends), and where it was painted recorded for the
+/// layer. Pixel for pixel what [`scan`] and [`breath`] draw, the layer's
+/// row or cell painted over it.
+pub(crate) fn on_beat(beat: crate::motion::Beat, mark: Hsla, ground: Hsla, fx: &std::rc::Rc<crate::motion::Motion>) -> AnyElement {
+    let el = match beat {
+        crate::motion::Beat::Scan(g) => {
+            let mut el = div().relative().flex_none().size(px(g.size()));
+            for &part in g.parts() {
+                if let Part::Fill(x, top, w, h) = part {
+                    el = el.child(div().absolute().left(px(x)).top(px(top)).w(px(w)).h(px(h)).bg(mark));
+                }
+            }
+            el
+        }
+        crate::motion::Beat::Breath(_) => breath_box(mark, mark),
+    };
+    let (fx, ink) = (fx.clone(), fx.ink());
+    el.child(
+        canvas(
+            |_, _, _| {},
+            move |b, _, window, _| fx.site(crate::motion::Site { origin: b.origin, mask: window.content_mask(), mark, ground, ink, beat }),
+        )
+        .absolute()
+        .inset_0(),
+    )
+    .into_any_element()
+}
+
+/// A state's glyph changing (motion.md §6.1, §6.2) at `p` (0..1): to `Ok`
+/// or `Failed` its strokes write on; to `Cancelled`, `Limit` or
+/// `Cancelling` (not from `Cancelling`) its quads draw; else (or `fade`)
+/// the old glyph's colour goes to the ground as the new one's comes from
+/// it: a cross-fade by colour, as an opacity would paint it.
+pub(crate) fn change(from: Option<(Glyph, Hsla)>, to: Glyph, mark: Hsla, ground: Hsla, p: f32, fade: bool) -> AnyElement {
+    if p >= 1. {
+        return draw(to, mark);
+    }
+    let draws = match to {
+        Glyph::Ok | Glyph::Failed => true,
+        Glyph::Cancelled | Glyph::Limit | Glyph::Cancelling => from.is_none_or(|(g, _)| g != Glyph::Cancelling),
+        _ => false,
+    };
+    if draws && !fade {
+        return draw_at(to, p, mark);
+    }
+    let s = px(to.size().max(from.map_or(0., |(g, _)| g.size())));
+    div()
+        .relative()
+        .flex_none()
+        .size(s)
+        .children(from.filter(|(g, _)| *g != to).map(|(g, c)| div().absolute().inset_0().child(draw(g, crate::motion::mix(c, ground, p)))))
+        .child(div().absolute().inset_0().child(draw(to, crate::motion::mix(ground, mark, p))))
+        .into_any_element()
+}
+
+/// The fold chevron at `p` of its turn (0 `Fold` … 1 `FoldOpen`): its
+/// points rotated about the box centre (the sprite drawn turned).
+pub(crate) fn turn(p: f32, color: Hsla) -> AnyElement {
+    if p <= 0. {
+        return draw(Glyph::Fold, color);
+    }
+    if p >= 1. {
+        return draw(Glyph::FoldOpen, color);
+    }
+    let path = Glyph::Fold.sprite().unwrap_or_default();
+    svg()
+        .path(path)
+        .flex_none()
+        .size(px(10.))
+        .text_color(color)
+        .with_transformation(Transformation::rotate(radians(p * std::f32::consts::FRAC_PI_2)))
+        .into_any_element()
+}
+
 /// The app's assets: the stroked glyphs' SVGs, embedded (written from the
 /// drawing table, so the two never disagree). Loaded only when the atlas
 /// has no sprite of that size and scale yet.
@@ -175,7 +433,7 @@ pub(crate) struct Sprites;
 
 impl AssetSource for Sprites {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
-        Ok(Glyph::ALL.into_iter().find(|g| g.sprite() == Some(path)).map(|g| Cow::Owned(svg_of(g).into_bytes())))
+        Ok(parse_cut(path).map(|(g, k)| Cow::Owned(svg_cut(g, k).into_bytes())))
     }
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
@@ -196,6 +454,19 @@ pub(crate) fn lead(g: Option<AnyElement>, m: &Metrics) -> Div {
 /// moves content.
 pub(crate) fn bar(color: Hsla) -> Div {
     div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(color)
+}
+
+/// [`bar`] drawn to `p` of its length, top down (motion.md §6.1: a bar
+/// draws; an un-draw is the same bar going back up). Paint only: an
+/// absolute child's length.
+pub(crate) fn bar_at(color: Hsla, p: f32) -> Div {
+    if p >= 1. { bar(color) } else { div().absolute().left_0().top_0().w(px(2.)).h(relative(p.max(0.))).bg(color) }
+}
+
+/// A lit bar's bloom: a 1 px column of `color` on the bar's right (x 2),
+/// drawn to `p` of its length as the bar is. Paint only.
+pub(crate) fn bloom_at(color: Hsla, p: f32) -> Div {
+    div().debug_selector(|| "bar-bloom".into()).absolute().left(px(2.)).top_0().w(px(1.)).h(relative(p.clamp(0., 1.))).bg(color)
 }
 
 /// A reveal button's glyph (design.md §5): its slot always kept, drawn
@@ -359,6 +630,14 @@ pub(crate) fn worst(failed: usize, stopped: usize, cancelled: usize) -> (Glyph, 
     }
 }
 
+/// A worker's state as motion keys it: a re-attach's demoted start
+/// (`demoted`, [`crate::subagents::View::demoted`]) is still running, so
+/// neither the reconnect's demote nor its lift on the next page plays a
+/// write-on (motion.md §8: a reconnect is history).
+pub(crate) fn steady(l: Liveness, demoted: bool) -> Liveness {
+    if demoted && l == Liveness::Started { Liveness::Running } else { l }
+}
+
 /// A worker's glyph, its word outside run surfaces (Display caps) and
 /// inside them (Mono), and its family (design.md §4.2).
 pub(crate) fn worker(l: Liveness) -> (Glyph, &'static str, &'static str, Family) {
@@ -415,6 +694,42 @@ mod tests {
     use crate::subagents::Liveness;
     use gpui_kit::AssetSource;
     use synaps_client::transcript::ToolStatus;
+
+    /// The scan's beam (motion.md §10 amendment 14): on every beat a
+    /// running glyph's lit row and, one row above it, the row it left, its
+    /// afterglow: two quads a beat for `Run` (one as the beam wraps back to
+    /// the top), lit toward the ink.
+    #[test]
+    fn the_beam_lights_its_row_and_trails_one() {
+        let mark = gpui_kit::Hsla { h: 0.6, s: 0.5, l: 0.4, a: 1. };
+        let ink = gpui_kit::Hsla { h: 0., s: 0., l: 0.95, a: 1. };
+        let (hot, glow) = super::beam(mark, ink);
+        for beat in 0..24u32 {
+            let rows: Vec<_> = super::beam_rows(Glyph::Run, beat, mark, ink).collect();
+            let y = super::scan_row(beat);
+            assert_eq!(rows[0], (1., y, 8., hot), "beat {beat}");
+            if beat % 8 == 0 {
+                assert_eq!(rows.len(), 1, "beat {beat}: wrapping, no trail across the glyph");
+            } else {
+                assert_eq!(rows[1..], [(1., y - 1., 8., glow)], "beat {beat}");
+            }
+        }
+        assert!(hot.l > glow.l && glow.l > mark.l, "lit toward the ink");
+        assert_eq!(super::beam_rows(Glyph::Workers, 3, mark, ink).count() % 2, 0, "every fill the beam crosses trails too");
+    }
+
+    /// Every cut's static path names its glyph and cut (Shady N7: the
+    /// table stands in for a `format!` per write-on frame).
+    #[test]
+    fn every_cut_path_names_its_cut() {
+        for g in Glyph::ALL.into_iter().filter(|g| g.sprite().is_some()) {
+            for k in 1..=super::CUTS {
+                let path = super::cut_path(g, k).expect("a sprite glyph's cut");
+                assert_eq!(super::parse_cut(path), Some((g, k)), "{path}");
+            }
+        }
+        assert_eq!(super::cut_path(Glyph::Run, 3), None, "quads are not cut");
+    }
 
     /// The drawing table is injective (`GO` is `Fold` by design: one
     /// chevron) and every part stays inside its box, strokes
@@ -473,6 +788,31 @@ mod tests {
         assert!(Sprites.load("glyph/nope.svg").unwrap().is_none());
         assert!(Sprites.load("").unwrap().is_none());
         assert_eq!(Sprites.list("glyph/").unwrap().len(), 5);
+    }
+
+    /// A write-on's cuts: served for every stroked glyph, drawn to their
+    /// share of its strokes' length (`Failed`: the first stroke, then the
+    /// second), the last cut the whole sprite; nothing else parses.
+    #[test]
+    fn write_on_cuts_are_sprites_of_their_share() {
+        use super::{CUTS, svg_cut};
+        for g in Glyph::ALL.into_iter().filter(|g| g.sprite().is_some()) {
+            let base = g.sprite().unwrap().trim_end_matches(".svg");
+            for k in 1..CUTS {
+                let path = format!("{base}~{k}.svg");
+                let svg = Sprites.load(&path).unwrap().unwrap_or_else(|| panic!("{path}"));
+                assert_eq!(&*svg, svg_cut(g, k).as_bytes());
+            }
+            assert_eq!(svg_cut(g, CUTS), svg_of(g));
+            assert!(Sprites.load(&format!("{base}~0.svg")).unwrap().is_none());
+            assert!(Sprites.load(&format!("{base}~{CUTS}.svg")).unwrap().is_none());
+        }
+        // Half of `Failed` is its first stroke, whole; a quarter, half of it.
+        assert!(svg_cut(Glyph::Failed, CUTS / 2).contains(r#"d="M2 2L8 8""#), "{}", svg_cut(Glyph::Failed, 4));
+        assert!(svg_cut(Glyph::Failed, CUTS / 4).contains(r#"d="M2 2L5 5""#), "{}", svg_cut(Glyph::Failed, 2));
+        assert_eq!(super::scan_row(0), 1.);
+        assert_eq!(super::scan_row(7), 8.);
+        assert_eq!(super::scan_row(8), 1.);
     }
 
     /// A call's state: the glyph never drops, ok has no word, and the

@@ -1,0 +1,35 @@
+# tool clip (scripts/capture-linux.sh, MESA_VK_WSI_DEBUG=sw, lossless 30 fps), frames numbered as scripts/frame-dips.py numbers them.
+# per-region split of each frame that differs from the one before, inside the finishing row (x 600-1320, y 330-445).
+188 none
+189 none
+190 x1220-1227 y422-429 n24
+191 none
+192 none
+193 x652-656 y422-429 n22; x1220-1227 y422-429 n64; x1237-1286 y422-431 n213
+194 x632-634 y410-441 n96; x1279-1287 y422-430 n31
+195 x632-634 y410-441 n96
+196 x632-634 y410-441 n96
+197 x632-634 y410-441 n96
+198 x632-634 y410-441 n96
+199 x632-634 y410-441 n96
+200 x632-633 y410-441 n64
+201 x634-634 y410-441 n32
+202 none
+203 none
+204 none
+205 none
+
+# frame-dips.py on the whole clip and on the transcript band:
+tool/clip.mkv: 780 frames, band 0,0..1920,1080, median ink 9028
+dips: 1
+  frames 0..42 (43), ink 6175
+dips: 1
+  frames 0..56 (57), ink 1102
+
+# Reading: the call ends on frame 193. In that one frame the row's lead glyph (x 652-656) changes, the running
+# square (x 1220-1227) and the word "running" (x 1237-1286) go: the outcome's text lands in one frame (an ok
+# call has no word). Frame 194: the check (x 1279-1287, the trailing glyph where the word was) finishes its
+# write-on (QUICK; empty on 193, drawn on 194), and the bar starts settling (x 632-634, to 201). 190 is the
+# beam inside the running square (the beat). Nothing else in the row changes; its height never does.
+# The dips frame-dips.py reports are the clip's opening, before the reply arrives (less ink, not a dropout):
+# none after frame 56 in 780.
