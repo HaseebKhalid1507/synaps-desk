@@ -1589,6 +1589,65 @@ mod tests {
         }
     }
 
+    /// Q1 cards: every pair the rows, wells, spawn rows and chips draw, as
+    /// drawn (a colour on the ground it is painted over), meets its floor
+    /// in every theme and accent, whatever grounds its role was floored on
+    /// (Shady M1, M4, M5: a rule on its own box, OPEN on a hovered row).
+    #[test]
+    fn q1_draws_every_pair_above_its_floor() {
+        let mut accents: Vec<Option<u32>> = vec![None];
+        accents.extend(PRESETS.iter().map(|p| Some(p.1)));
+        let mut bad = Vec::new();
+        for (name, raw) in palettes::THEMES {
+            for &accent in &accents {
+                let (r, _) = resolve(&raw, accent);
+                // The row on the canvas, hovered on `tool_out`; a chip on
+                // `tool`, the watched one on `tool_out`.
+                let row = [r.canvas, r.tool_out];
+                let chip = [r.tool, r.tool_out];
+                let verbs = [r.t_bash, r.t_read, r.t_write, r.t_edit, r.t_grep, r.t_find, r.t_ls, r.t_sub, r.t_ext, r.t_gen];
+                let mut pairs: Vec<(&str, u32, Vec<u32>, f64)> = vec![
+                    ("hover fill", r.tool_out, vec![r.canvas], SURFACE),
+                    ("well", r.well, vec![r.canvas], SURFACE),
+                    ("well frame and header rule", r.hair_w, vec![r.well, r.canvas], HAIR),
+                    ("chip frame", r.hair_t, vec![r.tool, r.tool_out, r.canvas], HAIR),
+                    ("OPEN outline", r.edge_t, row.to_vec(), EDGE),
+                    ("OPEN outline hovered", r.frame, vec![r.tool_out], FRAME),
+                    ("OPEN word hovered", r.prose_t, vec![r.tool_out], TEXT),
+                    ("well text", r.res, vec![r.well], TEXT),
+                    ("well numbers and header", r.dim_o, vec![r.well], TEXT),
+                    ("failed output", r.err_o, vec![r.well, r.del_bg], TEXT),
+                    ("added sign", r.ok_o, vec![r.add_bg], TEXT),
+                    ("diff line", r.ink, vec![r.add_bg, r.del_bg], TEXT),
+                    ("spawn bar, chip bar", r.sub_rule, vec![r.canvas, r.tool], MARK),
+                    ("watched chip bar", r.you_mark_t, vec![r.tool_out], MARK),
+                    ("gutter running", r.run_mark, row.to_vec(), MARK),
+                    ("gutter waiting", r.warn_mark, row.to_vec(), MARK),
+                ];
+                for (k, c) in
+                    [("target file", r.prose_t), ("target folder", r.arg), ("meta", r.dim_t), ("count +", r.ok), ("count −", r.err)]
+                {
+                    pairs.push((k, c, row.to_vec(), TEXT));
+                }
+                for c in verbs {
+                    pairs.push(("verb", c, row.to_vec(), TEXT));
+                }
+                for (k, c) in [("worker name", r.sub_name_t), ("worker step", r.sub_status_t), ("worker clock", r.sub_time_t)] {
+                    pairs.push((k, c, [row.as_slice(), chip.as_slice()].concat(), TEXT));
+                }
+                for (what, c, grounds, floor) in pairs {
+                    for g in grounds {
+                        let k = contrast(c, g);
+                        if k < floor - 1e-9 {
+                            bad.push(format!("{name} {accent:?}: {what} #{c:06x} on #{g:06x}: {k:.3} < {floor}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
     /// Every role meets its floor in all 20 themes, without an accent and
     /// with every preset, a navy, a near-black, white and a mid grey.
     #[test]
