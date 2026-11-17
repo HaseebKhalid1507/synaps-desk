@@ -88,8 +88,10 @@ fn no_text_under_12_px() {
         }
         // Sizes are set only by `fonts::TextPx`.
         if name != "fonts.rs" {
-            for (at, _) in code.match_indices(".text_size(") {
-                bad.push(format!("{name}:{} .text_size(", line_of(&code, at)));
+            for set in [".text_size(", ".text_style()"] {
+                for (at, _) in code.match_indices(set) {
+                    bad.push(format!("{name}:{} {set}", line_of(&code, at)));
+                }
             }
         }
         for small in [".text_xs()", ".text_2xs()"] {
@@ -101,15 +103,18 @@ fn no_text_under_12_px() {
     assert!(bad.is_empty(), "text under 12 px:\n{}", bad.join("\n"));
 }
 
-/// No state is drawn with opacity (design.md §5): only a chart's data
-/// fades (`chart::fade`).
+/// No state is drawn with opacity (design.md §5), by any of its names:
+/// only a chart's data fades (`chart::fade`).
 #[test]
 fn no_opacity_outside_charts() {
     let bad: Vec<String> = sources()
         .into_iter()
         .filter(|(name, _)| name != "chart.rs")
         .flat_map(|(name, code)| {
-            code.match_indices(".opacity(").map(|(at, _)| format!("{name}:{}", line_of(&code, at))).collect::<Vec<_>>()
+            [".opacity(", ".alpha(", ".fade_out("]
+                .into_iter()
+                .flat_map(|o| code.match_indices(o).map(|(at, _)| format!("{name}:{} {o}", line_of(&code, at))).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
         })
         .collect();
     assert!(bad.is_empty(), "opacity outside chart.rs:\n{}", bad.join("\n"));
@@ -133,15 +138,24 @@ fn every_tooltip_is_the_overlay() {
 }
 
 /// The lint's way in, one per rule: `clippy::disallowed_methods` is
-/// allowed only where its rule lives (fonts.rs, chart.rs, overlay.rs).
+/// allowed only where its rule lives (fonts.rs, chart.rs, overlay.rs);
+/// the groups that hold it (`clippy::style`, `clippy::all`) nowhere.
 #[test]
 fn the_house_rules_are_allowed_only_where_they_live() {
-    let bad: Vec<String> = sources()
-        .into_iter()
-        .filter(|(name, _)| !["fonts.rs", "chart.rs", "overlay.rs"].contains(&name.as_str()))
-        .flat_map(|(name, code)| {
-            code.match_indices("disallowed_methods").map(|(at, _)| format!("{name}:{}", line_of(&code, at))).collect::<Vec<_>>()
-        })
-        .collect();
+    let mut bad = Vec::new();
+    for (name, code) in sources() {
+        let home = ["fonts.rs", "chart.rs", "overlay.rs"].contains(&name.as_str());
+        for lint in ["disallowed_methods", "clippy::style", "clippy::all"] {
+            if lint == "disallowed_methods" && home {
+                continue;
+            }
+            for (at, _) in code.match_indices(lint) {
+                // A whole name: not `clippy::all_…`.
+                if !code[at + lint.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+                    bad.push(format!("{name}:{} {lint}", line_of(&code, at)));
+                }
+            }
+        }
+    }
     assert!(bad.is_empty(), "the house rules allowed outside their home:\n{}", bad.join("\n"));
 }

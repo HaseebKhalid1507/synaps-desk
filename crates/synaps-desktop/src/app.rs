@@ -358,6 +358,11 @@ const fn panel_keys(mac: bool) -> (&'static str, &'static str) {
 /// three chips on one line at 12 px (measured: 255 px of 268 with one-digit
 /// counts; a two-digit count adds a 7.2-px cell), line 2 room for its sub.
 pub(crate) const FLOORS: (f32, f32) = (312., 296.);
+/// The auto rail's narrowest (PR #7's floor): beside a strip, on a window
+/// too narrow for its floor and the centre's [`CENTRE_MIN`], a rail the
+/// user never dragged gives way down to this (its chips wrap). A dragged
+/// one stops at its floor.
+const RAIL_YIELD: f32 = 276.;
 /// A drag past this share of a panel's narrowest width folds it.
 const SNAP: f32 = 0.6;
 
@@ -445,7 +450,10 @@ pub(crate) fn sides(window: f32, panels: theme::Panels, mark: f32) -> (Side, Sid
             }
             (Side::Open(l), Side::Open(r))
         }
-        (true, false) => (Side::Open(want_l.min((room - STRIP).max(floor_l)).floor()), Side::Strip),
+        (true, false) => {
+            let floor = if panels.rail_width.is_none() { RAIL_YIELD } else { floor_l };
+            (Side::Open(want_l.min((room - STRIP).max(floor)).floor()), Side::Strip)
+        }
         (false, true) => (Side::Strip, Side::Open(want_r.min(room - STRIP).floor())),
         (false, false) => (Side::Strip, Side::Strip),
     }
@@ -5736,13 +5744,39 @@ mod tests {
         assert_eq!(sides(700., open, 30.), sides(700., both, 30.));
     }
 
-    /// The PR #7 rule, before panels could be dragged.
+    /// The PR #7 rule, before panels could be dragged, with the rail's
+    /// 312 floor: beside a strip it gives way to the centre's minimum, down
+    /// to PR #7's 276.
     fn pr7_sides(window: f32, panels: Panels) -> (Side, Side) {
         let (rail_w, right_w) = side_widths(window);
         let rail = if !panels.rail_collapsed && window >= 760. { Side::Open(rail_w) } else { Side::Strip };
         let right =
             if !panels.right_collapsed && window - 30. - rail.width() - right_w >= CENTRE_MIN { Side::Open(right_w) } else { Side::Strip };
+        let rail = match (rail, right) {
+            (Side::Open(w), Side::Strip) => Side::Open(w.min((window - 30. - CENTRE_MIN - super::STRIP).max(276.)).floor()),
+            (r, _) => r,
+        };
         (rail, right)
+    }
+
+    /// The auto rail on a narrow window: it gives way so the centre keeps
+    /// [`CENTRE_MIN`], down to 276 (then the centre gives); one the user
+    /// dragged keeps its floor.
+    #[test]
+    fn the_auto_rail_gives_way_to_the_centre() {
+        let m = crate::chrome::MARK;
+        let centre = |window: f32, (l, r): (Side, Side)| window - m - l.width() - r.width();
+        let open = Panels::default();
+        assert_eq!(sides(1280., open, m), (Side::Open(312.), Side::Open(296.)));
+        assert_eq!(centre(1280., sides(1280., open, m)), 672.);
+        assert_eq!(sides(1000., open, m), (Side::Open(312.), Side::Strip));
+        assert_eq!(centre(1000., sides(1000., open, m)), 656.);
+        assert_eq!(sides(800., open, m), (Side::Open(288.), Side::Strip));
+        assert_eq!(centre(800., sides(800., open, m)), CENTRE_MIN);
+        assert_eq!(sides(770., open, m), (Side::Open(276.), Side::Strip), "no narrower than 276");
+        // A width the user saved: its floor, as before.
+        assert_eq!(sides(800., hand(Some(312), None), m), (Side::Open(312.), Side::Strip));
+        assert_eq!(sides(800., hand(Some(400), None), m), (Side::Open(312.), Side::Strip));
     }
 
     fn centre(window: f32, (l, r): (Side, Side)) -> f32 {
@@ -5820,8 +5854,9 @@ mod tests {
         assert_eq!(right, hand(None, Some(458)));
         assert_eq!(sides(1250., right, m), (Side::Open(312.), Side::Open(458.)));
         assert_eq!(dragged(1920., open, false, 900.).right_width, Some(520));
-        // 770 px, rail only: as wide as the narrow layout already shows it, no wider.
-        assert_eq!(rail(770., 400.).rail_width, Some(312));
+        // 770 px, rail only: as wide as the narrow layout already shows it
+        // (the auto rail gave way to 276), no wider.
+        assert_eq!(rail(770., 400.).rail_width, Some(276));
         assert_eq!(rail(770., 240.).rail_width, Some(240));
         // Panels that had given way: the other one is held where it is, so
         // the dragged edge follows the pointer.

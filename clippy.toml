@@ -1,5 +1,6 @@
 # The house rules the compiler holds (design.md §1.2, §5, §8.9). Each has
-# one sanctioned way in, `#[allow]`ed where it is:
+# one sanctioned way in, `#[allow]`ed where it is (the lint is `deny`,
+# `crates/synaps-desktop/Cargo.toml` `[lints]`; CI runs clippy):
 # - text sizes: `fonts::TextPx::text_px` (never under 12 px);
 # - opacity: a chart's data (`chart.rs`), never a state;
 # - tooltips: `overlay.rs` (the one overlay box).
@@ -12,9 +13,16 @@ disallowed-methods = [
     { path = "gpui::Styled::text_xl", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
     { path = "gpui::Styled::text_2xl", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
     { path = "gpui::Styled::text_3xl", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
+    { path = "gpui::Styled::text_style", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
     { path = "gpui::Styled::opacity", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
     { path = "gpui::Hsla::opacity", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
     { path = "gpui::Rgba::opacity", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
+    { path = "gpui::Hsla::alpha", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
+    { path = "gpui::Rgba::alpha", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
+    { path = "gpui::Hsla::fade_out", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
+    { path = "gpui::Background::opacity", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
+    { path = "gpui::LinearColorStop::opacity", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
+    { path = "gpui_component::Colorize::opacity", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
     { path = "gpui_component::tooltip::Tooltip::new", reason = "every tooltip is the one overlay box: `overlay::tip` (design.md §8.9)" },
     { path = "gpui_component::tooltip::Tooltip::element", reason = "every tooltip is the one overlay box: `overlay::element` (design.md §8.9)" },
 ]
