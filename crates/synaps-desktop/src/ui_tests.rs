@@ -26,8 +26,19 @@ fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<AppView>, async_cha
 /// [`open`], `size` px at text step `text`.
 fn open_at(
     cx: &mut TestAppContext,
+    size: (f32, f32),
+    text: u8,
+) -> (AnyWindowHandle, Entity<AppView>, async_channel::Receiver<synaps_client::Event>) {
+    open_with(cx, size, text, true)
+}
+
+/// [`open_at`], the beat on the layer (`layered`, the app's way) or in the
+/// app's frame (`SYNAPS_DESKTOP_BEAT_IN_FRAME=1`).
+fn open_with(
+    cx: &mut TestAppContext,
     (w, h): (f32, f32),
     text: u8,
+    layered: bool,
 ) -> (AnyWindowHandle, Entity<AppView>, async_channel::Receiver<synaps_client::Event>) {
     let (window, view) = cx.update(|cx| {
         gpui_kit::init(cx);
@@ -38,8 +49,10 @@ fn open_at(
         crate::app::bind_keys(cx);
         let bounds = Bounds { origin: Default::default(), size: size(px(w), px(h)) };
         let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
-        gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(None, Some(crate::demo::events()), window, cx)))
-            .expect("a test window")
+        crate::beat::open_window(options, cx, layered, |window, cx| {
+            cx.new(|cx| AppView::new(None, Some(crate::demo::events()), window, cx))
+        })
+        .expect("a test window")
     });
     cx.run_until_parked();
     let nowhere = std::env::temp_dir().join(format!("synaps-desktop-ui-test-{}", std::process::id())).join("no-daemon.sock");
@@ -710,7 +723,9 @@ fn the_foot_never_says_another_worker_under_its_handle(cx: &mut TestAppContext) 
     let (w, view, _events) = open(cx);
     scout_in_place(cx, w, &view);
     view_running(cx, &view);
-    let tray = view.read_with(cx, |v, _| v.tray.rows.iter().find(|r| r.id == 1).map(|r| r.facts.to_string())).expect("scout's tray row");
+    let tray = view
+        .read_with(cx, |v, _| v.tray.rows.iter().find(|r| r.id == 1).map(|r| crate::tray::ticked(&v.fx, &r.facts, &r.tick).to_string()))
+        .expect("scout's tray row");
     assert_eq!(foot_of(cx, &view), (crate::subagents::Liveness::Running, tray), "scout, as its tray row says it");
     view.update(cx, |v, cx| {
         v.model.stats.subagents.append(&[
@@ -764,6 +779,54 @@ fn a_reattach_leaves_a_running_worker_running(cx: &mut TestAppContext) {
         v.worker_state(session, &w.handle_id, Some(w.key()))
     });
     assert_eq!(tab, Some(crate::subagents::Liveness::Running), "its tab: running too");
+}
+
+/// Shady #8 on the PR 4 rebase: a reconnect demotes a watched running
+/// worker to started, and its view's next page lifts it (PR 3's one
+/// source). Neither is news (motion.md §8: a reconnect is history): its
+/// tray row's glyph and the foot's play no write-on, either way.
+#[gpui_kit::test]
+fn a_reconnect_replays_no_worker_write_ons(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    scout_in_place(cx, w, &view);
+    view_running(cx, &view);
+    settle(cx, w, 8);
+    let shown = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.tray.rows.iter().find(|r| r.id == 1).map(|r| r.live)).expect("scout's tray row")
+    };
+    assert_eq!(shown(cx), crate::subagents::Liveness::Running);
+    let t0 = view.read_with(cx, |v, _| v.fx.clock());
+    // The daemon attaches the same session again: a reconnect (its
+    // attach alone: no row of scout's comes with it to lift it at once).
+    view.update(cx, |v, cx| {
+        let seq = v.model.active.as_ref().expect("attached").attach_seq;
+        let events = crate::demo::attach(crate::demo::SID, seq)
+            .into_iter()
+            .filter_map(|e| match e {
+                synaps_client::Event::Attached { attach_seq, attached, mode, .. } => {
+                    Some(synaps_client::Event::Attached { attach_seq, attached, mode, reconnect: true })
+                }
+                _ => None,
+            })
+            .collect();
+        v.apply_batch(events, cx);
+    });
+    settle(cx, w, 8);
+    assert_eq!(foot_of(cx, &view).0, crate::subagents::Liveness::Started, "demoted until heard");
+    assert_eq!(shown(cx), crate::subagents::Liveness::Started, "its row too");
+    assert_eq!(in_place(cx, &view).as_deref(), Some("sa_1"), "still watched");
+    view_running(cx, &view);
+    view.update(cx, |_, cx| cx.notify());
+    settle(cx, w, 8);
+    assert_eq!(foot_of(cx, &view).0, crate::subagents::Liveness::Running, "lifted by its page");
+    assert_eq!(shown(cx), crate::subagents::Liveness::Running);
+    let replayed: Vec<_> = view
+        .read_with(cx, |v, _| v.fx.changed_since(t0))
+        .into_iter()
+        .filter(|(t, _)| matches!(t, crate::motion::Tag::TrayGlyph | crate::motion::Tag::BlockGlyph | crate::motion::Tag::Foot))
+        .collect();
+    assert!(replayed.is_empty(), "no write-on replayed across the reconnect: {replayed:?}");
 }
 
 /// Shady N1: scout (sa_1) ended in a worker tab left in the background
@@ -1023,4 +1086,810 @@ fn a_redraw_with_nothing_changed_keeps_every_text_view(cx: &mut TestAppContext) 
     assert!(last >= first + 40, "each notify drew a frame: {first} then {last}");
     assert_eq!(again, kept, "no text view dropped or made again across 40 frames");
     assert_eq!(view.read_with(cx, |v, _| v.text_views().1), 0, "none stale");
+}
+
+// ── motion (cohesion/motion.md §10, PR 4) ─────────────────────────────
+
+/// Delivers next frames until the window asks for none (at most `max`):
+/// how many it drew.
+fn settle(cx: &mut TestAppContext, w: AnyWindowHandle, max: usize) -> usize {
+    for n in 0..max {
+        let ran = cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+        cx.run_until_parked();
+        if ran == 0 {
+            return n;
+        }
+    }
+    max
+}
+
+fn set_motion(cx: &mut TestAppContext, view: &Entity<AppView>, level: crate::motion::Level) {
+    cx.update(|cx| {
+        cx.set_global(crate::motion::Setting { level: Some(level), lock: None });
+        crate::motion::Level::apply(cx);
+    });
+    view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+}
+
+/// What the window's motion asked for after its last frame.
+fn motion_pending(cx: &mut TestAppContext, view: &Entity<AppView>) -> (bool, Option<std::time::Instant>) {
+    view.read_with(cx, |v, _| v.fx.pending())
+}
+
+/// Draws one more frame now.
+fn frame(cx: &mut TestAppContext, view: &Entity<AppView>) {
+    view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+}
+
+/// A run of the other demo session folded, then its id (it has three).
+fn a_folded_run(cx: &mut TestAppContext, view: &Entity<AppView>) -> u64 {
+    view.read_with(cx, |v, _| {
+        v.disp.iter().find(|d| matches!(d.kind, crate::turns::Kind::Summary { open: false, .. })).map(|d| d.id).expect("a folded run")
+    })
+}
+
+/// Off is the static app: whatever happens (a worker running, a send, a
+/// worker's view in and out, the card answered, a session switch, a fold
+/// and an unfold), motion asks for no frame and arms no timer: the guard is
+/// `motion_pending() == (false, None)` after every event. The frame counts
+/// (`settle`) are the static app's own: up to 2 follow-up frames after an
+/// event (its hint canvases measure on the next frame), as on main; motion
+/// adds none (0 frames of its own per event).
+#[gpui_kit::test]
+fn off_is_static(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Off);
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "scout runs in the tray: nothing scans under Off");
+    // A worker's view in, and out.
+    scout_in_place(cx, w, &view);
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "no bar draw opening a worker's view under Off");
+    view.update(cx, |v, cx| v.leave_worker(false, cx));
+    cx.run_until_parked();
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None));
+    // A send's Handoff (what `submit` stamps).
+    view.update(cx, |v, cx| {
+        v.fx.sent.set(Some((std::time::Instant::now(), false)));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "no Handoff under Off");
+    // The card answered: it goes in the same frame.
+    resolve_prompt(cx, &view);
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "no exit fade under Off");
+    assert!(view.read_with(cx, |v, _| v.card_exit.is_none()));
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    assert!(settle(cx, w, 8) <= 2);
+    let run = a_folded_run(cx, &view);
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(settle(cx, w, 8) <= 2, "the unfold's own frame, and the static app's hint");
+    assert_eq!(motion_pending(cx, &view), (false, None), "no cascade under Off");
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "no tally draw under Off");
+    cx.update(|cx| assert!(cx.reduce_motion(), "the kit's own motion is off too"));
+}
+
+/// Nothing running on screen, nothing moving: after the last animation the
+/// window asks for no frame and arms no timer.
+#[gpui_kit::test]
+fn idle_requests_no_frames(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    let run = a_folded_run(cx, &view);
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    // The cascade runs on display frames, then stops by itself.
+    let mut drawn = 0;
+    while motion_pending(cx, &view).0 && drawn < 400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        drawn += 1 + settle(cx, w, 1);
+    }
+    assert!(drawn > 0, "the unfold animated");
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "settled: no frame, no timer");
+}
+
+/// A screen full of running things: no display frames for ambient, one
+/// timer to the next beat; every glyph samples the one beat.
+#[gpui_kit::test]
+fn heartbeat_is_one_timer(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    // A second goes by: the card's AUTHORIZE charge (its own frames) ends.
+    for _ in 0..8 {
+        beat(cx, w, &view);
+    }
+    let (display, timer) = motion_pending(cx, &view);
+    assert!(!display, "ambient asks for no display frames");
+    let at = timer.expect("scout runs: the heartbeat is armed");
+    let now = view.read_with(cx, |v, _| v.fx.clock());
+    assert!(at > now - std::time::Duration::from_millis(1));
+    assert!(at <= now + crate::motion::BEAT, "to the next beat");
+    let arms = view.read_with(cx, |v, _| v.fx.arms.get());
+    frame(cx, &view);
+    let again = view.read_with(cx, |v, _| v.fx.arms.get());
+    assert!(again - arms <= 1, "one timer per beat, however many glyphs scan");
+}
+
+/// Hidden: the heartbeat's timer goes; shown again, the next frame arms it.
+#[gpui_kit::test]
+fn heartbeat_stops_hidden(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    assert!(motion_pending(cx, &view).1.is_some());
+    cx.simulate_window_visibility_change(w, gpui_kit::WindowVisibility::Hidden);
+    cx.run_until_parked();
+    assert_eq!(motion_pending(cx, &view).1, None, "hidden: no timer");
+    frame(cx, &view);
+    assert_eq!(motion_pending(cx, &view).1, None, "a frame while hidden arms nothing");
+    cx.simulate_window_visibility_change(w, gpui_kit::WindowVisibility::Visible);
+    cx.run_until_parked();
+    assert!(motion_pending(cx, &view).1.is_some(), "shown: armed again");
+}
+
+/// An unfold's cascade (bars drawing, the chevron turning) paints only:
+/// every row on screen has one height on every frame of it.
+#[gpui_kit::test]
+fn transcript_heights_stable_across_frames(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    settle(cx, w, 8);
+    let run = a_folded_run(cx, &view);
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(motion_pending(cx, &view).0, "the cascade is running");
+    let heights = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            (0..v.disp.len())
+                .filter_map(|ix| v.list.bounds_for_item(ix).map(|b| (v.disp[ix].id, f32::from(b.size.height))))
+                .collect::<Vec<_>>()
+        })
+    };
+    let first = heights(cx);
+    assert!(first.len() > 3, "rows on screen: {first:?}");
+    let mut frames = 0;
+    while motion_pending(cx, &view).0 && frames < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(4));
+        settle(cx, w, 1);
+        frames += 1;
+        let now = heights(cx);
+        for (id, h) in &now {
+            if let Some((_, h0)) = first.iter().find(|(i, _)| i == id) {
+                assert_eq!(h, h0, "row {id} changed height on frame {frames}");
+            }
+        }
+    }
+    assert!(frames > 0, "the cascade ran over frames ({frames})");
+    // Every row, the user blocks with it (their bar is an absolute child
+    // now), is as high under Full as under Off, the static app.
+    let full = heights(cx);
+    assert!(view.read_with(cx, |v, _| v.disp.iter().any(|r| matches!(r.kind, crate::turns::Kind::User))), "user blocks on screen");
+    set_motion(cx, &view, crate::motion::Level::Off);
+    settle(cx, w, 8);
+    assert_eq!(heights(cx), full, "Off and Full lay the column out alike");
+}
+
+/// Words never wait: no text view anywhere in the app is given a motion
+/// policy or a stream fade (nor the kit a global one), so appended text is
+/// opaque on the frame it lands at the kit's zero default; the write head
+/// is a gutter bar, not a wash. (A lint over every source file: the text
+/// run's colour is not observable from a test window.)
+#[test]
+fn no_text_view_gets_a_stream_fade() {
+    assert_eq!(gpui_kit::base::TextViewMotion::default().stream_fade(), std::time::Duration::ZERO);
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut n = 0;
+    for f in std::fs::read_dir(&dir).expect("src").flatten() {
+        let path = f.path();
+        if path.extension().is_none_or(|e| e != "rs") || path.ends_with("ui_tests.rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("a source file");
+        n += 1;
+        for bad in [concat!(".mot", "ion("), concat!("with_stream", "_fade")] {
+            assert!(!src.contains(bad), "{}: {bad}", path.display());
+        }
+    }
+    assert!(n > 20, "every source file read ({n})");
+}
+
+/// A tray row leaving fades in its slot, but takes no click: the click
+/// lands on what is there after the exit (nothing opens).
+#[gpui_kit::test]
+fn exiting_takes_no_click(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    view.update(cx, |v, cx| {
+        let row = v.tray.rows.first().cloned().expect("scout's row");
+        v.tray.rows.clear();
+        // Left "later": its fade holds at full for the whole test.
+        v.tray.ghosts.push((0, row, std::time::Instant::now() + std::time::Duration::from_secs(60)));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    let b = vcx.debug_bounds("tray-ghost").expect("the leaving row is drawn");
+    let position = b.center();
+    vcx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 });
+    vcx.run_until_parked();
+    assert!(view.read_with(&vcx, |v, _| v.model.watch.focus().is_none() && v.menu.is_none()), "the click opened nothing");
+}
+
+/// The answered card fades in its own slot (the dock keeps its height),
+/// drawn as it last was and taking no click; then the dock closes in one
+/// frame. Off: it closes at once, as today.
+#[gpui_kit::test]
+fn the_answered_card_fades_in_its_slot(cx: &mut TestAppContext) {
+    use std::time::{Duration, Instant};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let bounds = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel);
+    // A new prompt arrives while watched (the one there at open is history:
+    // it doesn't breathe): its card traces and its glyph breathes.
+    resolve_prompt(cx, &view);
+    view.update(cx, |v, cx| {
+        let request = synaps_client::protocol::PromptRequest {
+            id: 8,
+            kind: serde_json::json!("confirm"),
+            title: "Confirm tool call".into(),
+            prompt: "Tool: bash\n\nAllow this tool call?".into(),
+        };
+        v.model.transcript.apply(&SessionEvent::Prompt { request });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    let live = bounds(cx, "card").expect("the new card is up");
+    let in_card = |cx: &mut TestAppContext, b: gpui_kit::Bounds<gpui_kit::Pixels>| {
+        view.read_with(cx, |v, _| {
+            v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Breath(_)) && b.contains(&s.origin)).count()
+        })
+    };
+    assert_eq!(in_card(cx, live), 1, "the live card's glyph breathes on the beat layer");
+    // The live card takes a press (the control for the leaving one below).
+    click_at(cx, w, live.center());
+    assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the live card took the press");
+    resolve_prompt(cx, &view);
+    // Held mid-fade for the test.
+    view.update(cx, |v, cx| {
+        v.card_exit.as_mut().expect("answered on screen: it fades").at = Instant::now() + Duration::from_secs(60);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(bounds(cx, "card").is_none());
+    let ghost = bounds(cx, "card-exit").expect("the answered card, fading");
+    assert_eq!(ghost, live, "in its slot: nothing above or below it moved");
+    assert_eq!(in_card(cx, ghost), 0, "leaving, its glyph holds still: no breath over its cover");
+    click_at(cx, w, ghost.center());
+    assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the leaving card took no press (the one is the live card's)");
+    // Its time is up: the dock closes in one frame.
+    view.update(cx, |v, cx| {
+        v.card_exit.as_mut().unwrap().at = Instant::now() - Duration::from_secs(1);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| v.card_exit.is_none()));
+    assert!(bounds(cx, "card-exit").is_none() && bounds(cx, "card").is_none());
+}
+
+/// Motion Off: an answered card goes in the frame its answer lands.
+#[gpui_kit::test]
+fn the_answered_card_goes_at_once_with_motion_off(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Off);
+    settle(cx, w, 8);
+    resolve_prompt(cx, &view);
+    assert!(view.read_with(cx, |v, _| v.card_exit.is_none()));
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("card-exit").is_none());
+}
+
+/// A left-button press and release at `position`.
+fn click_at(cx: &mut TestAppContext, w: AnyWindowHandle, position: gpui_kit::Point<gpui_kit::Pixels>) {
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    vcx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 });
+    vcx.run_until_parked();
+}
+
+/// Shady H1: motion's memory is the shown column's and session's. Every
+/// transcript numbers its rows from 1 (and every session its workers), so
+/// another's row 12 is not this one's: a session switch in the same tab (a
+/// rail click), a worker's view in and out, and back, all come up at rest:
+/// no write-on, settle, warn draw, chevron turn, write head or Handoff
+/// replayed from the other column, and no display frame asked for.
+#[gpui_kit::test]
+fn a_switch_replays_nothing(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    // Nothing changed after `t0` (Shady N3: a change started on the switch
+    // and on any frame after it, not only the last frame's), and no
+    // display frame asked for.
+    let mark = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.clock());
+    let check = |cx: &mut TestAppContext, what: &str, t0: std::time::Instant| {
+        let fresh = view.read_with(cx, |v, _| v.fx.fresh());
+        assert!(fresh.is_empty(), "{what}: replayed {fresh:?}");
+        // (The watched bar is this view's own: its draw is the one a view
+        // opened or left here plays, as [`crate::motion::Motion::fresh`] has it.)
+        let changed: Vec<_> =
+            view.read_with(cx, |v, _| v.fx.changed_since(t0)).into_iter().filter(|(t, _)| *t != crate::motion::Tag::Watched).collect();
+        assert!(changed.is_empty(), "{what}: replayed {changed:?}");
+        assert!(!motion_pending(cx, &view).0, "{what}: a display frame asked for");
+    };
+    // A worker's view in place (its tray bar draws: that is this view's
+    // own, not a replay), and out again.
+    let t0 = mark(cx);
+    scout_in_place(cx, w, &view);
+    let fresh = view.read_with(cx, |v, _| v.fx.fresh());
+    assert!(fresh.is_empty(), "scout's view in: replayed {fresh:?}");
+    let changed: Vec<_> =
+        view.read_with(cx, |v, _| v.fx.changed_since(t0)).into_iter().filter(|(t, _)| *t != crate::motion::Tag::Watched).collect();
+    assert!(changed.is_empty(), "scout's view in: replayed {changed:?}");
+    let t0 = mark(cx);
+    view.update(cx, |v, cx| v.leave_worker(false, cx));
+    cx.run_until_parked();
+    check(cx, "scout's view out", t0);
+    // relay-refresh → Idle CPU in the same tab (its rows share ids with
+    // relay-refresh's; its turn is over, relay-refresh's foot was busy).
+    view.update(cx, |v, _| v.client = None);
+    let t0 = mark(cx);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    check(cx, "a switch in the tab", t0);
+    assert_eq!(motion_pending(cx, &view), (false, None), "Idle CPU runs nothing: no frame, no timer");
+    // And back.
+    let t0 = mark(cx);
+    view.update(cx, |v, cx| {
+        v.open_tab(
+            crate::app::Open::Attach { session_id: crate::demo::SID.into(), fallback: None, open: false },
+            crate::tabs::Place::Current,
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(attached(cx, &view).as_deref(), Some(crate::demo::SID));
+    check(cx, "back", t0);
+}
+
+/// `n` running bash calls in the shown session's transcript, on screen.
+fn running_tools(cx: &mut TestAppContext, view: &Entity<AppView>, n: usize) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    view.update(cx, |v, cx| {
+        let t = &mut v.model.transcript;
+        t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+        for k in 0..n {
+            let id = format!("ui-run-{k}");
+            t.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id.clone() }),
+            });
+            t.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolUse {
+                    tool_name: "bash".into(),
+                    tool_id: id,
+                    input: serde_json::json!({"command": format!("cargo test -p crate{k}")}),
+                }),
+            });
+        }
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+/// Soul B (motion.md §10 amendment 15): a running call's lit bar blooms,
+/// a 1 px column beside it in the row's padding (nothing moves: the
+/// bloom is an absolute child); Off has none; it is gone once the bar
+/// has settled after the call ends.
+#[gpui_kit::test]
+fn a_running_bar_blooms_until_it_settles(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open_at(cx, (1440., 1800.), crate::theme::Panels::default().text_size);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    // Read off a frame of the app's own (a beat may have replayed it).
+    let blooms = |cx: &mut TestAppContext| {
+        view.update(cx, |_, cx| cx.notify());
+        cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+        cx.run_until_parked();
+        VisualTestContext::from_window(w, cx).debug_bounds("bar-bloom")
+    };
+    // The demo's own calls have ended: nothing blooms.
+    for _ in 0..6 {
+        beat(cx, w, &view);
+    }
+    assert!(blooms(cx).is_none(), "no call runs: no bloom");
+    running_tools(cx, &view, 1);
+    for _ in 0..4 {
+        beat(cx, w, &view);
+    }
+    let b = blooms(cx).expect("the running call's bar blooms");
+    assert_eq!(b.size.width, gpui_kit::px(1.), "1 px");
+    set_motion(cx, &view, crate::motion::Level::Off);
+    settle(cx, w, 4);
+    assert!(blooms(cx).is_none(), "Off: the static app, no bloom");
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    assert!(blooms(cx).is_some(), "lit again");
+    view.update(cx, |v, cx| {
+        v.model.transcript.apply(&SessionEvent::Stream {
+            event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "ok".into() }),
+        });
+        v.sync_list();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    // (Its light decays over SLOW on the wall clock: not sampled mid-way.)
+    for _ in 0..5 {
+        beat(cx, w, &view);
+    }
+    assert!(blooms(cx).is_none(), "settled to its hue: the bloom is gone");
+}
+
+/// One beat goes by: the motion clock and the executor's move on together,
+/// a millisecond at a time (the one timer fires when it is due, as it
+/// would), and what it drew settles. The motion clock is set at each step,
+/// not moved on: the wall time a slow runner spends in a step never adds up.
+fn beat(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    let ms = std::time::Duration::from_millis(1);
+    let t0 = view.read_with(cx, |v, _| v.fx.clock());
+    for k in 1..=crate::motion::BEAT.as_millis() as u32 {
+        view.read_with(cx, |v, _| v.fx.set_clock(t0 + ms * k));
+        cx.executor().advance_clock(ms);
+        cx.run_until_parked();
+    }
+    settle(cx, w, 4);
+}
+
+/// The app's frames (render, layout, prepaint) and the beat layer's paints.
+fn frames(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, u64) {
+    view.read_with(cx, |v, _| (v.fx.frames(), v.fx.layer_paints.get()))
+}
+
+/// Motion.md §10 amendment 13: 25 running glyphs (and scout's) scan on the
+/// beat, and a beat repaints only the beat layer over the app's cached
+/// frame: the app's view is not rendered, laid out or prepainted. Its own
+/// frames come only from the clocks' shared second (2 in 2 s), whatever
+/// the number of clocks.
+#[gpui_kit::test]
+fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1440., 1800.), crate::theme::Panels::default().text_size);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    running_tools(cx, &view, 25);
+    // The arrivals draw in and settle.
+    for _ in 0..12 {
+        beat(cx, w, &view);
+    }
+    assert!(!motion_pending(cx, &view).0, "settled: no display frames");
+    let sites = view.read_with(cx, |v, _| v.fx.sites());
+    let scans = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Scan(_))).count();
+    assert!(scans >= 25, "the running glyphs on screen are the layer's: {scans}");
+    let (f0, l0) = frames(cx, &view);
+    let p0 = view.read_with(cx, |v, _| v.fx.painted.borrow().len());
+    let mut layer_only = 0;
+    for _ in 0..16 {
+        layer_only += usize::from(view.read_with(cx, |v, _| v.fx.wakes()) == Some(crate::motion::Wake::Beat));
+        beat(cx, w, &view);
+    }
+    let (f1, l1) = frames(cx, &view);
+    // 2 s: the clocks' second twice (a third at most, as the edges fall).
+    assert!(layer_only >= 13, "the timer woke only the layer on {layer_only} of 16 beats");
+    // Every beat paints it, once (Shady N2: a beat painted twice is the
+    // regression the layer exists to prevent): a beat is painted again
+    // only by an app frame inside it.
+    assert_painted_once(cx, &view, p0, l1 - l0, f1 - f0);
+    assert!(f1 - f0 <= 3, "16 beats drew the app {} times: only the clocks' second may", f1 - f0);
+    assert_eq!(view.read_with(cx, |v, _| v.fx.sites().len()), sites.len(), "the cached frame keeps its sites");
+    // Off: the glyphs draw still in the app's frame; nothing for the layer.
+    set_motion(cx, &view, crate::motion::Level::Off);
+    assert!(view.read_with(cx, |v, _| v.fx.sites().is_empty()));
+    assert_eq!(motion_pending(cx, &view), (false, None));
+}
+
+/// Finish gate fix 2: an armed cancel's fuse burns before CONFIRM, 8 px
+/// from it, clear of the × the pointer armed it on (the armed row's right
+/// end, where CONFIRM is); one cell going dark a second.
+#[gpui_kit::test]
+fn the_fuse_burns_clear_of_the_pointer(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let scout = view.read_with(cx, |v, _| {
+        let (call, name) = v.model.stats.subagents.ident(1).expect("sa_1 named");
+        crate::wtabs::Who::new(1, name.to_string(), call.map(|c| c.to_string().into()))
+    });
+    view.update(cx, |v, cx| v.press_cancel(crate::demo::SID, &scout, crate::menu::How::Click(1), cx));
+    cx.run_until_parked();
+    settle(cx, w, 4);
+    let b = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel).expect(sel);
+    let (armed, fuse, confirm) = (b(cx, "tray-armed"), b(cx, "tray-fuse"), b(cx, "tray-confirm"));
+    assert_eq!(f32::from(confirm.left() - fuse.right()), 8., "8 px before CONFIRM");
+    assert!(f32::from(armed.right() - fuse.right()) >= 24., "clear of the ×'s end: {armed:?} {fuse:?}");
+    assert!(confirm.right() <= armed.right() && fuse.left() >= armed.left());
+}
+
+/// Finish gate fix 1: a turn that ends here hands the floor back: Handoff
+/// in's light travels down the composer's bar and is gone after `sig`
+/// (its colour, decaying into the bar: `motion::handoff_in_decays_into_the_bar`);
+/// Off draws none.
+#[gpui_kit::test]
+fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let client = view.update(cx, |v, _| v.client.take());
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    let busy = |cx: &mut TestAppContext, b: bool| {
+        view.update(cx, |v, cx| {
+            v.model.transcript.set_busy(b);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    view.update(cx, |v, _| {
+        v.client = client;
+        // Live (the demo's is parked): its turn's end says READY.
+        let m = v.model.sessions.iter_mut().find(|m| m.id == crate::demo::IDLE_CPU).expect("listed");
+        m.lifecycle = "live".into();
+    });
+    busy(cx, true);
+    for _ in 0..4 {
+        beat(cx, w, &view);
+    }
+    let seg = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("handoff-in");
+    assert!(seg(cx).is_none());
+    busy(cx, false);
+    assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current().map(|t| v.tab_state(t))), Some(crate::rail::State::Idle), "READY");
+    assert!(seg(cx).is_some(), "the turn ended here: the light travels down the bar");
+    for _ in 0..6 {
+        beat(cx, w, &view);
+    }
+    assert!(seg(cx).is_none(), "gone after sig");
+    set_motion(cx, &view, crate::motion::Level::Off);
+    busy(cx, true);
+    busy(cx, false);
+    assert!(seg(cx).is_none(), "Off: none");
+    assert_eq!(motion_pending(cx, &view), (false, None));
+}
+
+/// The other demo session (no worker, so no clock) with `n` calls running,
+/// their arrivals settled: what runs is only the beat.
+fn running_without_a_clock(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, n: usize) {
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, view, crate::tabs::Place::Current);
+    set_motion(cx, view, crate::motion::Level::Full);
+    running_tools(cx, view, n);
+    for _ in 0..12 {
+        beat(cx, w, view);
+    }
+    let scans = view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Scan(_))).count());
+    assert!(scans >= n, "the running glyphs are the layer's: {scans}");
+    assert!(view.read_with(cx, |v, _| v.tray.rows.is_empty()), "no worker: no clock");
+}
+
+/// Shady N2: with no clock on screen, 16 beats draw the app's view not
+/// once: each is one paint of the layer.
+#[gpui_kit::test]
+fn beats_without_a_clock_draw_no_app_frame(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    running_without_a_clock(cx, w, &view, 3);
+    let (f0, l0) = frames(cx, &view);
+    let p0 = view.read_with(cx, |v, _| v.fx.painted.borrow().len());
+    for _ in 0..16 {
+        assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::Beat), "the timer wakes the layer");
+        beat(cx, w, &view);
+    }
+    let (f1, l1) = frames(cx, &view);
+    assert_eq!(f1, f0, "16 beats drew the app's view {} times", f1 - f0);
+    assert_painted_once(cx, &view, p0, l1 - l0, 0);
+}
+
+/// The `paints` the layer made since its `p0`th: each a beat of its own
+/// (at most `again` repainted, by the app's own frames), in order, about
+/// one a test beat (a slow runner's wall time can carry the clock past a
+/// beat, and then its paints are for later beats, never the same one).
+fn assert_painted_once(cx: &mut TestAppContext, view: &Entity<AppView>, p0: usize, paints: u64, again: u64) {
+    let painted = view.read_with(cx, |v, _| v.fx.painted.borrow()[p0..].to_vec());
+    assert_eq!(painted.len() as u64, paints, "every paint had the beat's sites to paint");
+    assert!(painted.windows(2).all(|w| w[1] >= w[0]), "in order: {painted:?}");
+    let twice = painted.windows(2).filter(|w| w[1] == w[0]).count() as u64;
+    assert!(twice <= again, "{twice} beats painted twice ({again} app frames): {painted:?}");
+    assert!(painted.len() >= 12, "about a paint a beat: {painted:?}");
+}
+
+/// Shady N1: low power stops the beat (§7: no ambient). GPUI stores a
+/// power change without a refresh; the layer's next beat sees it, draws
+/// the app's view instead (its glyphs still, no sites) and arms nothing.
+#[gpui_kit::test]
+fn low_power_stops_the_beat_layer(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    running_without_a_clock(cx, w, &view, 3);
+    // Battery saver: only the field changes, as GPUI's handler does.
+    view.read_with(cx, |v, _| v.fx.force_low_power.set(true));
+    let f0 = frames(cx, &view).0;
+    beat(cx, w, &view);
+    assert!(frames(cx, &view).0 > f0, "the layer drew the app's view");
+    assert!(view.read_with(cx, |v, _| v.fx.sites().is_empty()), "drawn still: nothing on the layer");
+    assert_eq!(motion_pending(cx, &view), (false, None), "no beat armed, no frame asked for");
+    let (f1, l1) = frames(cx, &view);
+    for _ in 0..8 {
+        beat(cx, w, &view);
+    }
+    assert_eq!(frames(cx, &view), (f1, l1), "a second of beats: nothing drawn, nothing painted");
+    // Out of low power, the next frame scans again.
+    view.read_with(cx, |v, _| v.fx.force_low_power.set(false));
+    frame(cx, &view);
+    assert!(!view.read_with(cx, |v, _| v.fx.sites().is_empty()), "on the layer again");
+    assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::Beat));
+}
+
+/// Shady N6: the beat in the app's frame (`SYNAPS_DESKTOP_BEAT_IN_FRAME=1`,
+/// the measuring path, as before the layer): no sites; each beat is an app
+/// frame, and the running glyph's beam is drawn in it, one row down a beat.
+#[gpui_kit::test]
+fn the_beat_in_the_frame_scans_without_the_layer(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_with(cx, (1440., 900.), crate::theme::Panels::default().text_size, false);
+    running_without_a_clock_in_frame(cx, w, &view);
+    let beam = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("beam-row").expect("a beam row in the frame");
+    let at = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.frame_beat());
+    let (f0, b0, k0) = (frames(cx, &view).0, beam(cx), at(cx));
+    assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::App), "the timer wakes the app");
+    beat(cx, w, &view);
+    let (f1, b1, k1) = (frames(cx, &view).0, beam(cx), at(cx));
+    assert!(f1 > f0 && k1 > k0, "the beat is the app's frame");
+    assert!(view.read_with(cx, |v, _| v.fx.sites().is_empty()), "nothing on the layer");
+    // The row of the frame's own beat (one down a beat, back to the top
+    // after 8; a slow runner's clock may have crossed two).
+    let dy = f32::from(b1.origin.y - b0.origin.y);
+    assert_eq!(dy, crate::glyph::scan_row(k1) - crate::glyph::scan_row(k0), "the beam on the frame's beat ({k0} → {k1})");
+    // Off: still, no beam.
+    set_motion(cx, &view, crate::motion::Level::Off);
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("beam-row").is_none());
+    assert_eq!(motion_pending(cx, &view), (false, None));
+}
+
+/// [`running_without_a_clock`] without the layer: the sites stay empty.
+fn running_without_a_clock_in_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, view, crate::tabs::Place::Current);
+    set_motion(cx, view, crate::motion::Level::Full);
+    running_tools(cx, view, 1);
+    for _ in 0..12 {
+        beat(cx, w, view);
+    }
+}
+
+/// The app's view is cached: after beats that repainted only the layer,
+/// every real change still draws it: an event, a hover, a scroll, a
+/// resize, a focus change, a theme change, the motion level.
+#[gpui_kit::test]
+fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    for _ in 0..12 {
+        beat(cx, w, &view);
+    }
+    let drew = |cx: &mut TestAppContext, what: &str, change: &mut dyn FnMut(&mut TestAppContext)| {
+        for _ in 0..3 {
+            beat(cx, w, &view);
+        }
+        let f0 = frames(cx, &view).0;
+        change(cx);
+        cx.run_until_parked();
+        settle(cx, w, 4);
+        assert!(frames(cx, &view).0 > f0, "{what}: the app's view was not drawn");
+    };
+    let sites = view.read_with(cx, |v, _| v.fx.sites().len());
+    // As the pump hands it over (Shady N3): `apply_batch` notifies, not the test.
+    drew(cx, "an event", &mut |cx| {
+        use synaps_client::protocol::{LlmEvent, StreamEvent};
+        view.update(cx, |v, cx| {
+            let a = v.model.active.as_ref().expect("attached");
+            let (attach_seq, session_id) = (a.attach_seq, a.session_id.clone());
+            let ev = |seq: u64, event: StreamEvent| synaps_client::Event::Session {
+                attach_seq,
+                session_id: session_id.clone(),
+                seq,
+                event: SessionEvent::Stream { event },
+                raw: std::sync::Arc::new(serde_json::Value::Null),
+            };
+            let id = "ui-batch-0".to_string();
+            let start = LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id.clone() };
+            let input = serde_json::json!({"command": "cargo test -p relay"});
+            v.list.scroll_to_end();
+            v.apply_batch(
+                vec![
+                    ev(900, StreamEvent::Llm(LlmEvent::ResponseStart)),
+                    ev(901, StreamEvent::Llm(start)),
+                    ev(902, StreamEvent::Llm(LlmEvent::ToolUse { tool_name: "bash".into(), tool_id: id, input })),
+                ],
+                cx,
+            );
+        });
+    });
+    assert_eq!(view.read_with(cx, |v, _| v.fx.sites().len()), sites + 1, "the new call's glyph is on the layer");
+    let halt = VisualTestContext::from_window(w, cx).debug_bounds("halt").expect("HALT");
+    drew(cx, "a hover", &mut |cx| {
+        event(
+            cx,
+            w,
+            PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
+                position: halt.center(),
+                pressed_button: None,
+                modifiers: Default::default(),
+            }),
+        )
+    });
+    let top = view.read_with(cx, |v, _| v.list.logical_scroll_top());
+    drew(cx, "a scroll", &mut |cx| {
+        event(
+            cx,
+            w,
+            PlatformInput::Scroll(gpui_kit::ScrollEvent {
+                position: gpui_kit::point(px(720.), px(300.)),
+                delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(240.))),
+                ..Default::default()
+            }),
+        )
+    });
+    assert_ne!(view.read_with(cx, |v, _| v.list.logical_scroll_top()), top, "it scrolled");
+    drew(cx, "a resize", &mut |cx| {
+        VisualTestContext::from_window(w, cx).simulate_resize(size(px(1300.), px(900.)));
+    });
+    assert_eq!(view.read_with(cx, |v, _| v.width), 1300.);
+    drew(cx, "a focus change", &mut |cx| {
+        cx.update_window(w, |_, window, cx| {
+            let h = view.read(cx).composer.focus_handle(cx);
+            if h.is_focused(window) { window.blur(cx) } else { window.focus(&h, cx) }
+        })
+        .expect("the window");
+    });
+    drew(cx, "a theme change (a global)", &mut |cx| cx.update(|cx| crate::theme::update(cx, |c| c.accent = Some(0x00ff_8800))));
+    drew(cx, "the motion level (a global)", &mut |cx| {
+        cx.update(|cx| {
+            cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Reduced), lock: None });
+            crate::motion::Level::apply(cx);
+        })
+    });
+    assert!(view.read_with(cx, |v, _| v.fx.sites().is_empty()), "Reduced: no beat, nothing on the layer");
 }

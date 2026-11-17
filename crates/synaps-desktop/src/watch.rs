@@ -1244,7 +1244,9 @@ mod tests {
             line: String::new(),
             tools: None,
             elapsed: None,
+            tick: None,
             watchable: true,
+            demoted: false,
         };
         w.prune(t0, std::slice::from_ref(&done));
         assert_eq!(w.worker("sa_2").map(|v| v.next_seq), Some(4), "kept: its cursor too");
@@ -1309,7 +1311,9 @@ mod tests {
             line: String::new(),
             tools: None,
             elapsed: None,
+            tick: None,
             watchable: true,
+            demoted: false,
         };
         w.prune(t0, &[ended(5), ended(6)]);
         assert_eq!(kept(&w), [1, 2, 6, 7, 8, 9, 10, 11]);
@@ -1382,7 +1386,9 @@ mod tests {
                 line: String::new(),
                 tools: None,
                 elapsed: None,
+                tick: None,
                 watchable: true,
+                demoted: false,
             }],
         );
         assert!(w.worker("sa_3").is_none());
@@ -1454,7 +1460,9 @@ mod tests {
             line: String::new(),
             tools: None,
             elapsed: None,
+            tick: None,
             watchable: true,
+            demoted: false,
         };
         let t0 = Instant::now();
         let mut w = Watch::default();
@@ -1497,7 +1505,9 @@ mod tests {
             line: String::new(),
             tools: None,
             elapsed: None,
+            tick: None,
             watchable: true,
+            demoted: false,
         };
         let t0 = Instant::now();
         let mut w = Watch::default();
