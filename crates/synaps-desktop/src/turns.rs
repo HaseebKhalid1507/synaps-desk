@@ -750,22 +750,57 @@ fn span(t: &synaps_client::transcript::ToolCall, limit: Option<u64>) -> Option<S
     Some(Span { first, last, seen, rest })
 }
 
-/// A grep line with `context` set: a match (`path:N:text`, `N:text` for
-/// one file), not a context line (`path-N-text`) nor the `--` between
-/// groups. The first number between two of the same separator says.
-fn grep_match(l: &str) -> bool {
+/// Where a grep line's path can end (`grep.rs`: `path:N:text` a match,
+/// `path-N-text` around one; `N:text` / `N-text` for one file): before
+/// each `SNS` (S `:` or `-`, N digits), or at 0 before a leading `NS`;
+/// with its S, in order.
+fn grep_cuts(l: &str) -> Vec<(usize, u8)> {
     let b = l.as_bytes();
-    for j in 0..b.len() {
-        if !b[j].is_ascii_digit() || (j > 0 && (b[j - 1].is_ascii_digit() || !matches!(b[j - 1], b':' | b'-'))) {
-            continue;
-        }
-        let k = j + b[j..].iter().take_while(|c| c.is_ascii_digit()).count();
-        match b.get(k) {
-            Some(&c @ (b':' | b'-')) if j == 0 || b[j - 1] == c => return c == b':',
-            _ => {}
+    let digits = |from: usize| b.get(from..).map_or(0, |r| r.iter().take_while(|c| c.is_ascii_digit()).count());
+    let mut out = Vec::new();
+    let n = digits(0);
+    if n > 0 && matches!(b.get(n), Some(b':' | b'-')) {
+        out.push((0, b[n]));
+    }
+    for i in 1..b.len() {
+        let n = digits(i + 1);
+        if matches!(b[i], b':' | b'-') && n > 0 && b.get(i + 1 + n) == Some(&b[i]) {
+            out.push((i, b[i]));
         }
     }
-    false
+    out
+}
+
+/// A grep's matches with `context` set, in its text before the first
+/// blank line. A group's lines (`--` between groups) are one file's and
+/// their numbers differ, so a line's path ends at the last cut it shares
+/// with a line next to it: numbers in a path (`2026-11-17.md`) or in a
+/// text say nothing. A line alone is a match (context comes with one);
+/// one that shares no cut goes by its first.
+fn grep_matches(body: &str) -> usize {
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines
+        .split(|l| *l == "--")
+        .map(|g| {
+            let cuts: Vec<Vec<(usize, u8)>> = g.iter().map(|l| grep_cuts(l)).collect();
+            let shared = |j: usize, k: usize| {
+                cuts[j]
+                    .iter()
+                    .rev()
+                    .find(|(at, _)| cuts[k].iter().any(|(a, _)| a == at) && g[k].as_bytes()[..*at] == g[j].as_bytes()[..*at])
+                    .copied()
+            };
+            (0..g.len())
+                .filter(|&j| {
+                    let near = [j.checked_sub(1), (j + 1 < g.len()).then_some(j + 1)];
+                    match near.into_iter().flatten().filter_map(|k| shared(j, k)).max_by_key(|(at, _)| *at) {
+                        Some((_, sep)) => sep == b':',
+                        None => g.len() == 1 || cuts[j].first().is_some_and(|(_, sep)| *sep == b':'),
+                    }
+                })
+                .count()
+        })
+        .sum()
 }
 
 /// A grep's or find's hits (R4), from the engine's text (`search/mod.rs`):
@@ -782,7 +817,7 @@ fn hits(t: &synaps_client::transcript::ToolCall, context: bool) -> SharedString 
     let notes =
         |s: &str| s.split("\n\n").skip(1).any(|n| n.starts_with("... (") || n.contains("while searching, results may be incomplete"));
     let cut = !t.tail.is_empty() || notes(r) || t.tail.lines().any(|l| l.starts_with("... (") || l.contains("results may be incomplete"));
-    let n = body.lines().filter(|l| !l.trim().is_empty() && *l != "--" && (!context || grep_match(l))).count();
+    let n = if context { grep_matches(body) } else { body.lines().filter(|l| !l.trim().is_empty()).count() };
     match (n, cut) {
         (n, true) => format!("{n}+ hits").into(),
         (n, false) => plural(n, "hit", "hits"),
@@ -2478,6 +2513,16 @@ mod tests {
         assert_eq!(hits(ctx, shown), Some("2 hits".into()), "the text's own numbers say nothing");
         assert_eq!(hits(ctx, "src/c.rs-9-before\nsrc/c.rs:10:x y\n"), Some("1 hit".into()));
         assert_eq!(hits(ctx, "1-before\n2:x\n3-after"), Some("1 hit".into()), "one file: no path");
+        // Numbers in the path: dated notes, a numbered migration, a path
+        // that starts with its date, Windows.
+        let notes = "notes/2026-11-17.md-2-y\nnotes/2026-11-17.md:3:todo\nnotes/2026-11-17.md-4-z\n--\nnotes/2026-11-18.md:12:todo\nnotes/2026-11-18.md:13:todo 2026-11-18\nnotes/2026-11-18.md-14-z\n";
+        assert_eq!(hits(ctx, notes), Some("3 hits".into()), "a dated path's -11- is not a context line's");
+        assert_eq!(hits(ctx, "notes/2026-11-17.md:3:todo\n"), Some("1 hit".into()), "alone: a match");
+        assert_eq!(hits(ctx, "notes/2026-11-17.md-2-y\nnotes/2026-11-17.md:3:todo\n"), Some("1 hit".into()));
+        assert_eq!(hits(ctx, "migrations/20240101-1-init.sql:4:CREATE\nmigrations/20240101-1-init.sql-5-x\n"), Some("1 hit".into()));
+        assert_eq!(hits(ctx, "2026-11-17.md-2-y\n2026-11-17.md:3:x\n2026-11-17.md-4-3:z\n"), Some("1 hit".into()));
+        let win = "C:\\Users\\you\\notes\\2026-11-17.md-2-y\nC:\\Users\\you\\notes\\2026-11-17.md:3:todo\nC:\\Users\\you\\notes\\2026-11-17.md-4-z\n";
+        assert_eq!(hits(ctx, win), Some("1 hit".into()), "Windows");
         let mut big = call("grep", grep_in, "a.rs:1:x\nb.rs:2:…");
         big.tail = "z.rs:900:x".into();
         assert_eq!(card(&big, "").facts.as_deref(), Some("2+ hits"));
