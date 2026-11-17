@@ -276,7 +276,7 @@ fn main() {
             options.low_power_frame_interval = None;
             options.thermal_frame_interval = None;
         }
-        let (_, view) = beat::open_window(options, cx, |window, cx| {
+        let (_, view) = beat::open_window(options, cx, beat::layered_by_env(), |window, cx| {
             cx.new(|cx| {
                 let mut v = app::AppView::new(client, synthetic, window, cx);
                 v.start_session = start_session;

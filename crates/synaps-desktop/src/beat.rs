@@ -46,11 +46,20 @@ impl Render for BeatLayer {
     }
 }
 
+/// The beat goes to the layer, unless `SYNAPS_DESKTOP_BEAT_IN_FRAME=1`
+/// (measuring): then every beat is the app's frame, as before the layer.
+/// The app reads it; tests open their windows either way explicitly.
+pub(crate) fn layered_by_env() -> bool {
+    std::env::var_os("SYNAPS_DESKTOP_BEAT_IN_FRAME").is_none_or(|v| v != "1")
+}
+
 /// Opens the app's window: [`gpui_kit::open_window`] with the app's view
-/// under a [`Shell`]. Returns the app's view.
+/// under a [`Shell`], its beat on the layer (`layered`) or in its frame.
+/// Returns the app's view.
 pub(crate) fn open_window(
     options: WindowOptions,
     cx: &mut App,
+    layered: bool,
     build: impl FnOnce(&mut Window, &mut App) -> Entity<AppView>,
 ) -> anyhow::Result<(AnyWindowHandle, Entity<AppView>)> {
     let mut built = None;
@@ -58,9 +67,7 @@ pub(crate) fn open_window(
         let app = build(window, cx);
         built = Some(app.clone());
         let fx = app.read(cx).fx.clone();
-        // `SYNAPS_DESKTOP_BEAT_IN_FRAME=1` (measuring): every beat is the
-        // app's frame, as before the layer.
-        if std::env::var_os("SYNAPS_DESKTOP_BEAT_IN_FRAME").is_none_or(|v| v != "1") {
+        if layered {
             fx.set_layer();
         }
         let beat = cx.new(|_| BeatLayer { fx, app: app.entity_id() });

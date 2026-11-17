@@ -197,9 +197,35 @@ pub(crate) fn svg_cut(g: Glyph, k: u32) -> String {
 }
 
 /// A cut sprite's path: `glyph/ok.svg` cut at `k` is `glyph/ok~k.svg`.
-fn cut_path(g: Glyph, k: u32) -> Option<SharedString> {
+/// A static table: a write-on frame formats nothing.
+fn cut_path(g: Glyph, k: u32) -> Option<&'static str> {
+    const _: () = assert!(CUTS == 8, "one path per cut below");
+    macro_rules! cuts {
+        ($stem:literal) => {
+            &[
+                concat!($stem, "~1.svg"),
+                concat!($stem, "~2.svg"),
+                concat!($stem, "~3.svg"),
+                concat!($stem, "~4.svg"),
+                concat!($stem, "~5.svg"),
+                concat!($stem, "~6.svg"),
+                concat!($stem, "~7.svg"),
+            ]
+        };
+    }
     let base = g.sprite()?;
-    Some(if k >= CUTS { base.into() } else { format!("{}~{k}.svg", base.trim_end_matches(".svg")).into() })
+    if k >= CUTS {
+        return Some(base);
+    }
+    let table: &[&str; 7] = match g {
+        Glyph::Ok => cuts!("glyph/ok"),
+        Glyph::Failed => cuts!("glyph/failed"),
+        Glyph::Fold => cuts!("glyph/fold"),
+        Glyph::FoldOpen => cuts!("glyph/fold-open"),
+        Glyph::Close => cuts!("glyph/close"),
+        _ => return None,
+    };
+    table.get(k.checked_sub(1)? as usize).copied()
 }
 
 /// The glyph and cut a sprite path names.
@@ -226,7 +252,7 @@ pub(crate) fn draw_at(g: Glyph, p: f32, color: Hsla) -> AnyElement {
     if g.sprite().is_some() {
         let k = ((p * CUTS as f32).ceil() as u32).clamp(1, CUTS);
         let path = cut_path(g, k).unwrap_or_default();
-        return svg().path(path).flex_none().size(s).text_color(color).into_any_element();
+        return svg().path(SharedString::new_static(path)).flex_none().size(s).text_color(color).into_any_element();
     }
     let mut el = div().relative().flex_none().size(s);
     for &part in g.parts() {
@@ -257,8 +283,10 @@ pub(crate) fn scan(g: Glyph, beat: Option<u32>, mark: Hsla, ink: Hsla) -> AnyEle
             el = el.child(div().absolute().left(px(x)).top(px(top)).w(px(w)).h(px(h)).bg(mark));
         }
     }
+    let hot = beam(mark, ink).0;
     for (x, y, w, c) in beam_rows(g, beat, mark, ink) {
-        el = el.child(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(1.)).bg(c));
+        let row = div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(1.)).bg(c);
+        el = el.child(if c == hot { row.debug_selector(|| "beam-row".into()) } else { row });
     }
     el.into_any_element()
 }
@@ -433,15 +461,6 @@ pub(crate) fn bar(color: Hsla) -> Div {
 /// absolute child's length.
 pub(crate) fn bar_at(color: Hsla, p: f32) -> Div {
     if p >= 1. { bar(color) } else { div().absolute().left_0().top_0().w(px(2.)).h(relative(p.max(0.))).bg(color) }
-}
-
-/// [`bar_at`] with its leading 6 px (the end that draws) in `head` while
-/// it draws: the head that writes is hot (motion.md §10 amendment 15).
-pub(crate) fn bar_lit(color: Hsla, head: Hsla, p: f32) -> Div {
-    if p >= 1. {
-        return bar(color);
-    }
-    bar_at(color, p).child(div().absolute().left_0().bottom_0().w(px(2.)).h(px(6.)).max_h(relative(1.)).bg(head))
 }
 
 /// A lit bar's bloom: a 1 px column of `color` on the bar's right (x 2),
@@ -697,6 +716,19 @@ mod tests {
         }
         assert!(hot.l > glow.l && glow.l > mark.l, "lit toward the ink");
         assert_eq!(super::beam_rows(Glyph::Workers, 3, mark, ink).count() % 2, 0, "every fill the beam crosses trails too");
+    }
+
+    /// Every cut's static path names its glyph and cut (Shady N7: the
+    /// table stands in for a `format!` per write-on frame).
+    #[test]
+    fn every_cut_path_names_its_cut() {
+        for g in Glyph::ALL.into_iter().filter(|g| g.sprite().is_some()) {
+            for k in 1..=super::CUTS {
+                let path = super::cut_path(g, k).expect("a sprite glyph's cut");
+                assert_eq!(super::parse_cut(path), Some((g, k)), "{path}");
+            }
+        }
+        assert_eq!(super::cut_path(Glyph::Run, 3), None, "quads are not cut");
     }
 
     /// The drawing table is injective (`GO` is `Fold` by design: one
