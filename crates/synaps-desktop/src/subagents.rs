@@ -117,11 +117,13 @@ impl Liveness {
     /// but the view's when the list says no more than a start (the history
     /// alone holds it, or a re-attach demoted a running worker until it is
     /// heard again), and when the view says how it ended before the
-    /// session's stream does. Not attached, a running view is as last seen.
+    /// session's stream does. A view gone (offline) says neither: the
+    /// list's start stands. Not attached, a running view is as last seen.
     pub fn of_sources(status: Option<Status>, view: Option<Self>, attached: bool, known: bool) -> Self {
         let view = view.map(|v| if v == Liveness::Running && !attached { Liveness::LastSeen } else { v });
         match (status, view) {
-            (None | Some(Status::Started), Some(v)) => v,
+            (None, Some(v)) => v,
+            (Some(Status::Started), Some(v)) if v != Liveness::Gone => v,
             (Some(s), Some(v)) if !s.terminal() && v.ended() && v != Liveness::Gone => v,
             _ => Liveness::of(status, attached, known),
         }

@@ -545,6 +545,12 @@ mod tests {
         assert_eq!(both(None, Some(Liveness::Running), true, true), Liveness::Running);
         assert_eq!(both(Some(S::Started), Some(Liveness::Running), false, true), Liveness::LastSeen, "not attached: as last seen");
         assert_eq!(both(Some(S::Started), None, true, true), Liveness::Started);
+        assert_eq!(
+            both(Some(S::Started), Some(Liveness::Gone), true, true),
+            Liveness::Started,
+            "a re-attach's start, its view offline before its first page"
+        );
+        assert_eq!(both(None, Some(Liveness::Gone), true, true), Liveness::Gone, "only its view knows it: gone");
         assert_eq!(both(Some(S::Running), Some(Liveness::Done), true, true), Liveness::Done, "its pages said it ended first");
         assert_eq!(
             both(Some(S::Running), Some(Liveness::Gone), true, true),
