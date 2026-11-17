@@ -25,6 +25,7 @@
 #![recursion_limit = "256"]
 
 mod app;
+mod beat;
 mod bench;
 mod chart;
 mod chrome;
@@ -275,7 +276,7 @@ fn main() {
             options.low_power_frame_interval = None;
             options.thermal_frame_interval = None;
         }
-        let (_, view) = gpui_kit::open_window(options, cx, |window, cx| {
+        let (_, view) = beat::open_window(options, cx, |window, cx| {
             cx.new(|cx| {
                 let mut v = app::AppView::new(client, synthetic, window, cx);
                 v.start_session = start_session;

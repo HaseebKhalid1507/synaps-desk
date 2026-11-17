@@ -41,7 +41,7 @@ pub(crate) fn ticked(fx: &motion::Motion, facts: &SharedString, tick: &Option<(S
     match tick {
         Some((head, t)) if fx.on() => {
             let (s, next) = t.whole(fx.now());
-            fx.tick_at(next);
+            fx.tick_clock(next);
             let clock = crate::subagents::fmt_whole(s);
             if head.is_empty() { clock.into() } else { format!("{head} · {clock}").into() }
         }
@@ -569,9 +569,10 @@ mod tests {
         let l = Live { tick: Some(crate::subagents::Tick::new(41.4, t0)), ..live(Status::Running, "bash") };
         let r = TrayRow::of(l, false);
         assert_eq!(r.facts.as_ref(), "1 tool · 40.0s", "the row's own text, as the daemon said");
-        // Its next second (44) at 2.6 s: on the beat that crosses it while
-        // the heartbeat runs (2.625 s, its frame), else at the second.
-        for (level, low_power, at) in [(Level::Full, false, 2625), (Level::Reduced, false, 2600), (Level::Full, true, 2600)] {
+        // Its next second (44) at 2.6 s: on the grid's second that crosses
+        // it while the heartbeat runs (3 s: every clock's one app frame),
+        // else at the second.
+        for (level, low_power, at) in [(Level::Full, false, 3000), (Level::Reduced, false, 2600), (Level::Full, true, 2600)] {
             fx.begin_frame(level, low_power, t0 + Duration::from_millis(1700));
             assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 43s", "{level:?}");
             assert_eq!(fx.demand(), (false, Some(t0 + Duration::from_millis(at))), "{level:?} {low_power}: only its next second");

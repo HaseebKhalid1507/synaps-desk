@@ -288,9 +288,10 @@ fn epoch_ms(at: Instant) -> f64 {
 /// The bench script. Runs on the UI thread between frames.
 pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx: &mut App) {
     // Hard stop: never leave a window up if anything hangs.
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(30));
-        eprintln!("bench: watchdog fired at 30 s");
+    let limit = if opts.motion { 60 } else { 30 };
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(limit));
+        eprintln!("bench: watchdog fired at {limit} s");
         std::process::exit(3);
     });
     let (tx, rx) = async_channel::unbounded::<Event>();
@@ -508,8 +509,13 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 return;
             }
             if opts.motion {
-                let stats = |cx: &mut AsyncWindowContext, t0: Instant, t1: Instant, c0: u64| {
+                // The app's own frames and the beat layer's (a beat that
+                // repaints only the layer is not an app frame).
+                let counts =
+                    |cx: &mut AsyncWindowContext| view.update(cx, |v, _| (v.fx.frames(), v.fx.layer_paints.get())).unwrap_or((0, 0));
+                let stats = |cx: &mut AsyncWindowContext, t0: Instant, t1: Instant, c0: u64, f0: (u64, u64)| {
                     let cpu = cpu_ns().saturating_sub(c0) as f64 / 1e6;
+                    let f1 = counts(cx);
                     let mut v = view
                         .update(cx, |v, _| {
                             let b = v.bench.as_mut().unwrap();
@@ -521,6 +527,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let n = v["frames_presented"].as_u64().unwrap_or(0);
                     v["cpu_ms_per_s"] = json!(round(cpu / secs, 2));
                     v["cpu_ms_per_frame"] = json!((n > 0).then(|| round(cpu / n as f64, 2)));
+                    v["app_frames"] = json!(f1.0 - f0.0);
+                    v["layer_paints"] = json!(f1.1 - f0.1);
                     v
                 };
                 let level = |cx: &mut AsyncWindowContext, l: crate::motion::Level| {
@@ -535,9 +543,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // it is the beat's scene, not this one.)
                 let _ = upd(cx, &|v, _| v.model.set_local_session("bench-motion-idle"));
                 sleep(1.0).await;
-                let (t0, c0) = (Instant::now(), cpu_ns());
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
                 sleep(10.0).await;
-                out["idle_10s"] = stats(cx, t0, Instant::now(), c0);
+                out["idle_10s"] = stats(cx, t0, Instant::now(), c0, f0);
                 // A tool runs: its glyph scans on the beat (8 Hz), the foot's too.
                 let _ = upd(cx, &|v, _| {
                     v.model.set_local_session("bench-motion");
@@ -566,15 +574,39 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     v.list.scroll_to_end();
                 });
                 sleep(1.0).await;
-                let (t0, c0) = (Instant::now(), cpu_ns());
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
                 sleep(6.0).await;
-                out["beat"] = stats(cx, t0, Instant::now(), c0);
+                out["beat"] = stats(cx, t0, Instant::now(), c0, f0);
+                // 24 more: 25 glyphs scan on the one beat.
+                let _ = upd(cx, &|v, _| {
+                    let t = &mut v.model.transcript;
+                    for k in 0..24 {
+                        let id = format!("bench-run-{k}");
+                        t.apply(&SessionEvent::Stream {
+                            event: StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id.clone() }),
+                        });
+                        t.apply(&SessionEvent::Stream {
+                            event: StreamEvent::Llm(LlmEvent::ToolUse {
+                                tool_name: "bash".into(),
+                                tool_id: id,
+                                input: json!({"command": format!("cargo test -p crate{k}")}),
+                            }),
+                        });
+                    }
+                    v.sync_list();
+                    v.list.scroll_to_end();
+                });
+                sleep(1.0).await;
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                out["beat_25_sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
+                sleep(6.0).await;
+                out["beat_25"] = stats(cx, t0, Instant::now(), c0, f0);
                 level(cx, crate::motion::Level::Off);
                 let _ = upd(cx, &|_, _| {});
                 sleep(0.5).await;
-                let (t0, c0) = (Instant::now(), cpu_ns());
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
                 sleep(4.0).await;
-                out["beat_motion_off"] = stats(cx, t0, Instant::now(), c0);
+                out["beat_motion_off"] = stats(cx, t0, Instant::now(), c0, f0);
                 out["mem_end"] = mem::sample();
                 out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                 println!("{out}");

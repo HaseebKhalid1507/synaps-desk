@@ -1362,7 +1362,7 @@ pub(crate) fn glyph_code(g: Glyph) -> u64 {
 /// three times, then holds; a glyph that changed (`change`: when, and from
 /// what) writes on, draws its quads or (`fade`) cross-fades. Off: [`glyph::draw`].
 pub(crate) fn live_glyph(
-    fx: &Motion,
+    fx: &std::rc::Rc<Motion>,
     g: Glyph,
     mark: Hsla,
     ground: Hsla,
@@ -1371,9 +1371,14 @@ pub(crate) fn live_glyph(
     fade: bool,
 ) -> AnyElement {
     match g {
+        // The beat layer paints the scan over the cached frame.
+        Glyph::Run | Glyph::Workers if fx.layered() => glyph::on_beat(motion::Beat::Scan(g), mark, ground, fx),
         Glyph::Run | Glyph::Workers => glyph::scan(g, fx.beat(1), mark, ground),
         Glyph::Needs => {
             let step = breath.map(|t| fx.beats_since(t)).filter(|s| *s < motion::BREATH_BEATS * motion::BREATHS);
+            if let (Some(t), Some(_), true) = (breath, step, fx.layered()) {
+                return glyph::on_beat(motion::Beat::Breath(t), mark, ground, fx);
+            }
             // Only a breath in progress asks for the beat: a held one is still.
             glyph::breath(step.and_then(|s| fx.beat(1).map(|_| s)), mark, ground)
         }
