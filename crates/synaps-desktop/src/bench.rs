@@ -288,7 +288,7 @@ fn epoch_ms(at: Instant) -> f64 {
 /// The bench script. Runs on the UI thread between frames.
 pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx: &mut App) {
     // Hard stop: never leave a window up if anything hangs.
-    let limit = if opts.motion { 60 } else { 30 };
+    let limit = if opts.motion { 200 } else { 30 };
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(limit));
         eprintln!("bench: watchdog fired at {limit} s");
@@ -610,14 +610,148 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 sleep(1.0).await;
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
                 out["beat_25_sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
-                sleep(6.0).await;
-                out["beat_25"] = stats(cx, t0, Instant::now(), c0, f0);
+                sleep(30.0).await;
+                out["beat_25_30s"] = stats(cx, t0, Instant::now(), c0, f0);
                 level(cx, crate::motion::Level::Off);
                 let _ = upd(cx, &|_, _| {});
                 sleep(0.5).await;
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
                 sleep(4.0).await;
                 out["beat_motion_off"] = stats(cx, t0, Instant::now(), c0, f0);
+                // Q4's cases after the beat's (those as main runs them): a
+                // fresh transcript, motion Full again, nothing running.
+                level(cx, crate::motion::Level::Full);
+                let _ = upd(cx, &|v, _| {
+                    v.model.transcript = synaps_client::transcript::Transcript::new();
+                    v.sync_list();
+                });
+                sleep(0.5).await;
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                sleep(10.0).await;
+                out["idle_10s_after_beat"] = stats(cx, t0, Instant::now(), c0, f0);
+                // polish.md §6 gate 3: 30 s with a prompt pending, after its
+                // three breaths, and a demoted worker (a re-attach's
+                // "started", drawn still until a live source says again).
+                let _ = upd(cx, &|v, cx| {
+                    v.model.set_local_session("bench");
+                    let res = json!({"handle_id": "sa_1", "agent_name": "scout", "status": "running"}).to_string();
+                    let worker = [
+                        json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start", "tool_id": "w1",
+                            "input": {"agent": "scout", "task": "Map the relay's upstream calls"}}}),
+                        json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": "w1", "result": res}}),
+                        json!({"ev": "subagent_rows", "rows": [{"subagent_id": 1, "agent_name": "scout", "status": "running",
+                            "cancel_requested": false, "elapsed_secs": 3.0, "finished_elapsed": null, "step": "ls", "tools": 1}]}),
+                    ];
+                    v.apply_batch(worker.into_iter().filter_map(local_raw).collect(), cx);
+                    v.model.stats.subagents.reattached();
+                    if let Ok(request) = serde_json::from_value(json!({
+                        "id": 7, "kind": "confirm", "title": "Run a command?", "prompt": "Tool: bash\nInput that will run:\n$ cargo test"
+                    })) {
+                        v.model.transcript.apply(&SessionEvent::Prompt { request });
+                    }
+                    v.sync_list();
+                });
+                sleep(4.0).await;
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                sleep(30.0).await;
+                out["idle_30s_prompt"] = stats(cx, t0, Instant::now(), c0, f0);
+                out["idle_30s_prompt"]["demoted_worker"] =
+                    json!(view.update(cx, |v, _| v.model.stats.subagents.demoted(1)).unwrap_or(false));
+                out["idle_30s_prompt"]["prompt_pending"] =
+                    json!(view.update(cx, |v, _| !v.model.transcript.pending_prompts().is_empty()).unwrap_or(false));
+                // The link down with the prompt and the demoted worker still up:
+                // past its grace and its drain, held (only the connection
+                // word's dots step, on the beat at 2 Hz).
+                let _ = upd(cx, &|v, _| {
+                    v.synthetic = false;
+                    v.model.conn = crate::model::ConnState::Connected("bench".into());
+                });
+                sleep(1.0).await;
+                let _ = upd(cx, &|v, _| v.model.conn = crate::model::ConnState::Reconnecting);
+                sleep(2.0).await;
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                sleep(10.0).await;
+                out["held_drain_10s"] = stats(cx, t0, Instant::now(), c0, f0);
+                let _ = upd(cx, &|v, _| {
+                    v.model.conn = crate::model::ConnState::Off("offline".into());
+                    v.synthetic = true;
+                });
+                sleep(1.0).await;
+                // Q4's own motion, each on its own: a hover sweep down the
+                // rail (the pointer over every row for 2 s, one move a
+                // frame), a theme cross-fade (dark to dark, `slow`).
+                let rail = view.update(cx, |v, _| v.rail_list.viewport_bounds()).unwrap_or_default();
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                for i in 0..125 {
+                    let y = rail.top() + rail.size.height * (i as f32 / 125.);
+                    let _ = cx.update(|window, cx| {
+                        window.dispatch_event(
+                            PlatformInput::MouseMove(MouseMoveEvent {
+                                position: point(rail.left() + px(60.), y),
+                                pressed_button: None,
+                                modifiers: Modifiers::default(),
+                            }),
+                            cx,
+                        );
+                    });
+                    sleep(0.016).await;
+                }
+                sleep(0.3).await;
+                out["hover_sweep"] = stats(cx, t0, Instant::now(), c0, f0);
+                let theme = |cx: &mut AsyncWindowContext, name: &'static str| {
+                    let _ = cx.update(|_, cx| {
+                        if let Some((_, raw)) = crate::theme::builtin(name) {
+                            crate::theme::update(cx, |c| {
+                                c.theme = name.into();
+                                c.raw = raw;
+                            });
+                        }
+                    });
+                };
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                theme(cx, "night-city");
+                sleep(1.0).await;
+                out["cross_fade"] = stats(cx, t0, Instant::now(), c0, f0);
+                theme(cx, "nord");
+                sleep(1.0).await;
+                // polish.md §6 gate 4: 5 sessions × 5 workers, 30 s. Five
+                // busy sessions in the rail, each with five workers; the
+                // shown one's five in its tray and transcript, running.
+                let _ = upd(cx, &|v, cx| {
+                    let metas: Vec<SessionMeta> = (0..5)
+                        .filter_map(|k| {
+                            serde_json::from_value(
+                                json!({"id": if k == 0 { "bench".to_string() } else { format!("20261117-0900{k:02}-l{k:03}") },
+                                "title": format!("Load {}", k + 1), "model": "m", "lifecycle": "live", "busy": true, "subagents_running": 5,
+                                "messages": 12, "created_at": format!("2026-11-17T09:00:{k:02}Z")}),
+                            )
+                            .ok()
+                        })
+                        .collect();
+                    v.apply_batch(vec![Event::Sessions(metas)], cx);
+                    let mut evs = Vec::new();
+                    let mut rows = Vec::new();
+                    for n in 2..7u64 {
+                        let (id, name) = (format!("w{n}"), format!("worker-{n}"));
+                        let res = json!({"handle_id": format!("sa_{n}"), "agent_name": name, "status": "running"}).to_string();
+                        evs.push(json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start",
+                            "tool_id": id, "input": {"agent": name, "task": "go"}}}));
+                        evs.push(json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": id, "result": res}}));
+                        rows.push(json!({"subagent_id": n, "agent_name": name, "status": "running", "cancel_requested": false,
+                            "elapsed_secs": 3.0, "finished_elapsed": null, "step": "reading src", "tools": 2}));
+                    }
+                    evs.push(json!({"ev": "subagent_rows", "rows": rows}));
+                    v.apply_batch(evs.into_iter().filter_map(local_raw).collect(), cx);
+                    v.sync_list();
+                    v.list.scroll_to_end();
+                });
+                sleep(2.0).await;
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                sleep(30.0).await;
+                out["load_5x5_30s"] = stats(cx, t0, Instant::now(), c0, f0);
+                out["load_5x5_30s"]["workers_running"] =
+                    json!(view.update(cx, |v, _| v.model.stats.subagents.running_count()).unwrap_or(0));
+                out["load_5x5_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
                 out["mem_end"] = mem::sample();
                 out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                 println!("{out}");
@@ -954,6 +1088,13 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
 /// A synthetic event on the bench's local session (see
 /// `Model::set_local_session`), sent now: its rows carry the time, as a
 /// daemon's do.
+/// A raw daemon event of the bench's local session, decoded as the client
+/// decodes one.
+fn local_raw(raw: Value) -> Option<Event> {
+    let event = synaps_client::protocol::decode_event(&raw).ok()?;
+    Some(Event::session(LOCAL_SEQ, "bench", 1, event, Arc::new(raw)))
+}
+
 fn local_event(seq: u64, event: SessionEvent) -> Event {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     Event::session(LOCAL_SEQ, "bench", seq, event, Arc::new(Value::Null)).with_ts(ts)

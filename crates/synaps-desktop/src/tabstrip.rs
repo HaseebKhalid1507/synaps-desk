@@ -42,7 +42,7 @@ const ARROW_W: f32 = 46.;
 const WORD_MIN: f32 = 220.;
 
 /// Spring keys (the strip's own, [`crate::motion::Motion::spring`]).
-const IND_X: u64 = 0x7AB0 << 48;
+pub(crate) const IND_X: u64 = 0x7AB0 << 48;
 const IND_W: u64 = 0x7AB1 << 48;
 const OPEN_W: u64 = 0x7AB2 << 48;
 const LABEL: u64 = 0x7AB3 << 48;
@@ -340,16 +340,21 @@ impl AppView {
         slots.extend(placed.iter().enumerate().filter(|(_, p)| !**p).map(|(k, _)| Slot::Ghost(k)));
         // The indicator: a newly visible tab's fill and bar spring there
         // from where they were drawn (`snap`); at rest they follow the
-        // layout at once (a resize, an arrow scroll).
+        // layout at once (a resize, an arrow scroll). Its target is the
+        // tab's final slot (every tab at its width, no ghosts), not where
+        // the tab is this frame: a close's neighbour slides under a fill
+        // that stays put, never chased out and back (finish gate 1).
         let mut x = if lay.overflow { ARROW_W } else { 0. };
-        let mut target = None;
+        let mut goal_x = x;
+        let (mut target, mut goal) = (None, None);
         for slot in &slots {
             match *slot {
                 Slot::Tab(ix, w, _) => {
                     if active == Some(ix) {
-                        target = Some((x, w));
+                        (target, goal) = (Some((x, w)), Some((goal_x, lay.width)));
                     }
                     x += w;
+                    goal_x += lay.width;
                 }
                 Slot::Ghost(k) => x += ghosts[k].shown,
             }
@@ -359,13 +364,15 @@ impl AppView {
         let selected = active.and_then(|i| tabs.iter().nth(i)).map(|t| t.id);
         let moved = full && selected.is_some() && self.tab_fx.shown.is_some() && selected != self.tab_fx.shown;
         let mut quads = None;
-        if let Some((x, w)) = target {
+        if let (Some((x, w)), Some((tx, tw))) = (goal, target) {
             if moved && let (Some(x0), Some(w0)) = (fx.spring_at(IND_X), fx.spring_at(IND_W)) {
                 fx.spring_jump(IND_X, x0, x, snap);
                 fx.spring_jump(IND_W, w0, w, snap);
             }
             let ((qx, mx), (qw, mw)) = (fx.spring_held(IND_X, x, snap), fx.spring_held(IND_W, w, snap));
-            if mx || mw {
+            // Drawn as the quad while it moves, or while its tab is still
+            // on its way to the slot under it.
+            if mx || mw || (full && ((tx - x).abs() >= 0.5 || (tw - w).abs() >= 0.5)) {
                 quads = Some((qx, qw));
             }
         }

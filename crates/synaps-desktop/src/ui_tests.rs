@@ -2772,7 +2772,7 @@ fn indicator_retargets(cx: &mut TestAppContext) {
     wait(cx, w, &view, 600);
     let n = view.read_with(cx, |v, _| v.model.tabs.len());
     assert!(n >= 3, "three tabs: {n}");
-    let ind = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.spring_at(0x7AB0 << 48));
+    let ind = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.spring_at(crate::tabstrip::IND_X));
     let focus = |cx: &mut TestAppContext, ix: usize| {
         view.update(cx, |v, cx| {
             v.focus_tab(ix);
@@ -2800,12 +2800,59 @@ fn indicator_retargets(cx: &mut TestAppContext) {
     focus(cx, 1);
     wait(cx, w, &view, 7);
     let next = ind(cx).expect("moving");
-    assert!((next - last).abs() < far / 4., "no jump on a retarget: {last} → {next}");
+    // At most a frame of the spring's own travel (its top speed over the
+    // whole way is far × ω / e, ω = 2π / snap): 7 ms of it, with room.
+    let step = far * std::f32::consts::TAU / crate::motion::SNAP_RESPONSE / std::f32::consts::E * 0.007 * 1.5;
+    assert!((next - last).abs() < step, "no jump on a retarget: {last} → {next} (a frame is at most {step})");
     for _ in 0..80 {
         wait(cx, w, &view, 7);
     }
     assert_eq!(ind(cx).expect("at rest"), x_of(cx, 1) - x_of(cx, 0) + start, "lands on the tab");
     assert!(!motion_pending(cx, &view).0, "and asks for nothing more");
+}
+
+/// fluid.md §3.5 "Close" (finish gate 1): closing the visible tab, the
+/// indicator stays in the closed slot while its neighbour slides in under
+/// it; it never runs right and back.
+#[gpui_kit::test]
+fn closing_a_tab_keeps_the_indicator_in_its_slot(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, cx| {
+        v.client = None;
+        let ids: Vec<String> = v.model.sessions.iter().map(|s| s.id.clone()).take(3).collect();
+        for id in ids {
+            v.open_tab(crate::app::Open::Attach { session_id: id, fallback: None, open: false }, crate::tabs::Place::New);
+        }
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    wait(cx, w, &view, 600);
+    let n = view.read_with(cx, |v, _| v.model.tabs.len());
+    assert!(n >= 3, "three tabs: {n}");
+    let ind = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.spring_at(crate::tabstrip::IND_X));
+    view.update(cx, |v, cx| {
+        v.focus_tab(1);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    wait(cx, w, &view, 600);
+    let slot = ind(cx).expect("the indicator");
+    view.update(cx, |v, cx| {
+        v.close_tab(1);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let mut xs = vec![];
+    for _ in 0..60 {
+        wait(cx, w, &view, 7);
+        xs.push(ind(cx).unwrap_or(slot));
+    }
+    let worst = xs.iter().copied().fold(f32::MIN, f32::max);
+    assert!(worst <= slot + 0.5, "the indicator never leaves the closed slot to the right: {slot} → max {worst} ({xs:?})");
+    let quad = view.read_with(cx, |v, _| v.model.tabs.active());
+    assert!(quad.is_some(), "a tab is shown");
+    assert!(!motion_pending(cx, &view).0, "settled");
 }
 
 /// fluid.md §3.6: a switch within 150 ms of the last is instant (holding
@@ -2893,7 +2940,9 @@ fn overlay_replace_does_not_reenter(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn rail_reorder_waits_for_release(cx: &mut TestAppContext) {
     let (_w, view, _events) = open(cx);
-    let order = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.rail.rail.items.iter().map(|i| crate::rail::item_key(&v.rail.rail, i)).collect::<Vec<_>>());
+    let order = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.rail.rail.items.iter().map(|i| crate::rail::item_key(&v.rail.rail, i)).collect::<Vec<_>>())
+    };
     let (key, id) = view
         .read_with(cx, |v, _| v.rail.rail.rows.iter().find_map(|r| r.live.map(|i| (r.key, v.model.sessions[i].id.clone()))))
         .expect("a live row");
@@ -2901,7 +2950,8 @@ fn rail_reorder_waits_for_release(cx: &mut TestAppContext) {
     view.update(cx, |v, cx| {
         v.fx.press_down(crate::motion::key(crate::chrome::RAIL_TOUCH, key));
         // Another session is pinned (it moves up), and the held one renamed.
-        let other = v.model.sessions.iter_mut().rev().find(|s| s.id != id && !s.pinned && s.lifecycle != "ending").expect("another session");
+        let other =
+            v.model.sessions.iter_mut().rev().find(|s| s.id != id && !s.pinned && s.lifecycle != "ending").expect("another session");
         other.pinned = true;
         let s = v.model.sessions.iter_mut().find(|s| s.id == id).expect("its session");
         (s.name, s.title) = (None, Some("renamed while held".into()));

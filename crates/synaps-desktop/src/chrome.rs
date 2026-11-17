@@ -143,6 +143,12 @@ pub(crate) struct RailCache {
     pub(crate) targets: Option<Vec<Option<(f32, f32)>>>,
 }
 
+/// The key an item slides by (Flip): a row's own key, else the head's
+/// identity ([`rail::flip_id`]: its count may have changed).
+fn flip_key(rail: &Rail, ix: usize) -> Option<u64> {
+    rail.items.get(ix).map(|it| row_key(rail, it).unwrap_or_else(|| rail::flip_id(rail, it)))
+}
+
 /// A row's key, if the item is a row.
 pub(crate) fn row_key(rail: &Rail, item: &Item) -> Option<u64> {
     match item {
@@ -249,19 +255,19 @@ impl RailCache {
             }
             // Flip: where the rows on screen were, before the splice, and
             // where every item will be after it, from the old layout.
-            let old: Vec<(u64, u8, Option<(f32, f32)>)> = (0..self.rail.items.len())
+            let old: Vec<rail::Placed> = (0..self.rail.items.len())
                 .map(|ix| (self.keys[ix], rail::item_kind(&self.rail.items[ix]), item_y(list, ix).map(|(y, h, _)| (y, h))))
                 .collect();
             let new: Vec<(u64, u8)> = keys.iter().zip(&rail.items).map(|(&k, it)| (k, rail::item_kind(it))).collect();
             targets = Some(rail::flip_targets(&old, &new, range.clone(), count));
             let top = list.logical_scroll_top().item_ix;
             let scroll = -f32::from(list.scroll_px_offset_for_scrollbar().y);
-            for ix in top..self.rail.items.len() {
-                let Some((y, _)) = old[ix].2 else { break };
+            for (ix, o) in old.iter().enumerate().skip(top) {
+                let Some((y, _)) = o.2 else { break };
                 if y - scroll > f32::from(list.viewport_bounds().size.height) {
                     break;
                 }
-                if let Some(k) = row_key(&self.rail, &self.rail.items[ix]) {
+                if let Some(k) = flip_key(&self.rail, ix) {
                     flip_from.push((k, y));
                 }
             }
@@ -343,7 +349,9 @@ impl AppView {
     /// `err_mark_ch`, at heights hashed from the drop's time and the
     /// frame), or the Scan's 1 px `run_mark_ch` line with its 48 px trail
     /// of four bands of `run` (alpha .10, .07, .04, .02) above it.
-    pub(crate) fn render_link(&mut self, tear: Option<usize>, p: &Palette) -> Option<impl IntoElement + use<>> {
+    /// The Scan is drawn in `live` (not drained): the link is back, in
+    /// its live colour from the first frame, while the palette restores.
+    pub(crate) fn render_link(&mut self, tear: Option<usize>, p: &Palette, live: &Palette) -> Option<impl IntoElement + use<>> {
         let h = self.height.max(1.);
         let mut out = div().absolute().top_0().left_0().size_full();
         if let (Some(frame), Some(at)) = (tear, self.link.glitch) {
@@ -362,9 +370,9 @@ impl AppView {
         let y = (t * (h + 48.)).floor();
         for (i, a) in [0.10, 0.07, 0.04, 0.02].into_iter().enumerate() {
             let top = y - 12. * (i as f32 + 1.);
-            out = out.child(div().absolute().left_0().right_0().top(px(top)).h(px(12.)).bg(Hsla { a, ..p.run }));
+            out = out.child(div().absolute().left_0().right_0().top(px(top)).h(px(12.)).bg(Hsla { a, ..live.run }));
         }
-        out = out.child(div().absolute().left_0().right_0().top(px(y)).h(px(1.)).bg(p.run_mark_ch));
+        out = out.child(div().absolute().left_0().right_0().top(px(y)).h(px(1.)).bg(live.run_mark_ch));
         Some(deferred(out).with_priority(5))
     }
 
@@ -616,7 +624,7 @@ impl AppView {
         let list = &self.rail_list;
         let rail = &self.rail.rail;
         let fx = &self.fx;
-        let ix_of = |key: u64| rail.items.iter().position(|it| row_key(rail, it) == Some(key));
+        let ix_of = |key: u64| (0..rail.items.len()).find(|&ix| flip_key(rail, ix) == Some(key));
         let view_h = f32::from(list.viewport_bounds().size.height);
         // Where an item is: in a splice's frame, where it will be laid out
         // (never the list's bounds, wrong until it lays out again).
@@ -953,7 +961,19 @@ impl AppView {
     }
 
     /// One item of the rail's list (only the visible ones are built).
+    /// A rail item, a head sliding with the rows (Flip) when it moved.
     pub(crate) fn render_rail_item(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
+        let el = self.render_rail_item_at(ix, cx);
+        let rail = &self.rail.rail;
+        let head = rail.items.get(ix).is_some_and(|it| row_key(rail, it).is_none());
+        match flip_key(rail, ix).and_then(|k| self.rail_fx.offsets.get(&k)).filter(|_| head) {
+            // On its own ground, as a sliding row is: items that cross don't mix.
+            Some(&dy) => div().w_full().relative().top(px(dy)).bg(theme::palette(cx).chrome).child(el).into_any_element(),
+            None => el,
+        }
+    }
+
+    fn render_rail_item_at(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
         let p = theme::palette(cx);
         let rail = &self.rail.rail;
         let Some(item) = rail.items.get(ix) else { return div().into_any_element() };
@@ -974,7 +994,9 @@ impl AppView {
                     .items_baseline()
                     .gap(px(9.))
                     .cursor_pointer()
-                    .map(|d| self.lit(d, crate::motion::key(RAIL_TOUCH, crate::app::tkey("favs-head", 0)), (p.chrome, p.raised, p.press_ch), cx))
+                    .map(|d| {
+                        self.lit(d, crate::motion::key(RAIL_TOUCH, crate::app::tkey("favs-head", 0)), (p.chrome, p.raised, p.press_ch), cx)
+                    })
                     .child(div().absolute().left(px(7.)).top(px(19.)).child(glyph::draw(chevron, p.rest_mark)))
                     .child(display(label::FAVOURITES, size::D_S, p.dim_ch))
                     .child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_ch).child(fonts::JP_FAVOURITES))
@@ -1010,7 +1032,14 @@ impl AppView {
                     .gap(px(10.))
                     .items_baseline()
                     .cursor_pointer()
-                    .map(|d| self.lit(d, crate::motion::key(RAIL_TOUCH, crate::app::tkey("bucket", b as usize)), (p.chrome, p.raised, p.press_ch), cx))
+                    .map(|d| {
+                        self.lit(
+                            d,
+                            crate::motion::key(RAIL_TOUCH, crate::app::tkey("bucket", b as usize)),
+                            (p.chrome, p.raised, p.press_ch),
+                            cx,
+                        )
+                    })
                     .child(div().w(px(10.)).flex_none().child(mono(if *open { "−" } else { "+" }, size::META, color)))
                     .child(display(b.label(), size::D_S, color))
                     .child(div().flex_1())
@@ -1029,7 +1058,14 @@ impl AppView {
                     .pb(px(8.))
                     .cursor_pointer()
                     .child(display(text, size::D_S, p.dim_ch))
-                    .map(|d| self.lit(d, crate::motion::key(RAIL_TOUCH, crate::app::tkey("more", b as usize)), (p.chrome, p.raised, p.press_ch), cx))
+                    .map(|d| {
+                        self.lit(
+                            d,
+                            crate::motion::key(RAIL_TOUCH, crate::app::tkey("more", b as usize)),
+                            (p.chrome, p.raised, p.press_ch),
+                            cx,
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.expanded |= b.bit();
                         cx.notify();
@@ -1100,6 +1136,8 @@ impl AppView {
         let touch = crate::motion::key(RAIL_TOUCH, key);
         let (fill, dy) = fx.fill(touch, p.chrome, (shown && lit).then_some(p.raised), p.raised, p.press_ch);
         let flip = self.rail_fx.offsets.get(&key).copied().unwrap_or(0.);
+        // Sliding, a row is on its own ground: rows that cross don't mix.
+        let fill = fill.or((flip != 0.).then_some(p.chrome));
         // Line 2's room for the sub, past the word (and its count) and the
         // cost: under SUB_MIN_CELLS cells it is dropped.
         let cell = self.top_words.as_ref().map_or(7.2, |t| t.cell);
@@ -1255,6 +1293,7 @@ impl AppView {
         let touch = crate::motion::key(RAIL_TOUCH, key);
         let (fill, dy) = self.fx.fill(touch, p.chrome, None, p.raised, p.press_ch);
         let flip = self.rail_fx.offsets.get(&key).copied().unwrap_or(0.);
+        let fill = fill.or((flip != 0.).then_some(p.chrome));
         h_flex()
             .id(("rail-hist", key as usize))
             .group("rail-row")
@@ -1682,7 +1721,9 @@ impl AppView {
             .gap(px(8.))
             .items_center()
             .cursor_pointer()
-            .map(|d| self.lit_rest(d, crate::app::tkey("theme-config", 0), (p.chrome, p.raised, p.press_ch), follows.then_some(p.raised), cx))
+            .map(|d| {
+                self.lit_rest(d, crate::app::tkey("theme-config", 0), (p.chrome, p.raised, p.press_ch), follows.then_some(p.raised), cx)
+            })
             .child(div().size(px(12.)).flex_none().border_1().border_color(p.dim_ch))
             .child(display(label::SYNAPS_CONFIG, size::D_S, if follows { p.ink } else { p.prose_ch }).flex_none())
             .child(mono(format!("· {}", self.config_theme), size::META, p.dim_ch).flex_1().min_w_0().overflow_hidden().text_ellipsis())

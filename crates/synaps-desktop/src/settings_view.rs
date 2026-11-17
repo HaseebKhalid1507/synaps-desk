@@ -405,23 +405,17 @@ impl AppView {
             }
             drop(places);
             let sink = self.seg_places.clone();
-            let mut seg = h_flex()
-                .relative()
-                .h(px(28.))
-                .border_1()
-                .border_color(p.edge)
-                .child({
-                    let sink = sink.clone();
-                    canvas(
-                        move |b, _, _| {
-                            sink.borrow_mut().insert(at, (f32::from(b.origin.x), f32::from(b.size.width)));
-                        },
-                        |_, _, _, _| {},
-                    )
-                    .absolute()
-                    .inset_0()
-                })
-                .children(bar.map(|(x, w)| div().absolute().top_0().left(px(x)).w(px(w)).h(px(2.)).bg(p.you_bar)));
+            let mut seg = h_flex().relative().h(px(28.)).border_1().border_color(p.edge).child({
+                let sink = sink.clone();
+                canvas(
+                    move |b, _, _| {
+                        sink.borrow_mut().insert(at, (f32::from(b.origin.x), f32::from(b.size.width)));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0()
+            });
             for (i, o) in opts.into_iter().enumerate() {
                 let on = current == Some(o.as_ref());
                 let sink = sink.clone();
@@ -465,7 +459,11 @@ impl AppView {
                         .on_click(cx.listener(move |this, _, _, cx| this.settings_pick(what, &v, cx))),
                 );
             }
-            return seg.into_any_element();
+            // Over the segments: their fills (the new one's `raised`, a
+            // hover's) never cover it on its way.
+            return seg
+                .children(bar.map(|(x, w)| div().absolute().top_0().left(px(x)).w(px(w)).h(px(2.)).bg(p.you_bar)))
+                .into_any_element();
         }
         let open = self.settings.dropdown == Some(id);
         let shown: SharedString = current.map(|s| SharedString::from(s.to_string())).unwrap_or_else(|| "default".into());
