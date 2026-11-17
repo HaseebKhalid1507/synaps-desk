@@ -2774,7 +2774,7 @@ impl AppView {
             self.model.watch.steer_sent(&handle, &text);
             self.watch_note = None;
             // Handoff out: the composer's bar, then the watched row's.
-            self.fx.sent.set(Some((Instant::now(), true)));
+            self.fx.sent.set(Some((self.fx.clock(), true)));
             return true;
         }
         let busy = self.model.transcript.busy();
@@ -2789,7 +2789,7 @@ impl AppView {
         self.watch_note = None;
         // Handoff out: the composer's bar, then the new block's (a steer
         // lands in no block: the composer's alone).
-        self.fx.sent.set(Some((Instant::now(), busy)));
+        self.fx.sent.set(Some((self.fx.clock(), busy)));
         true
     }
 
