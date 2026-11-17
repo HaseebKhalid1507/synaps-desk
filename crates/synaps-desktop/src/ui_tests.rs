@@ -75,7 +75,20 @@ fn open_with(
         cx.notify();
     });
     cx.run_until_parked();
+    // The app has been up a second (the launch's column arrival and the
+    // card's charge are over), as a fast runner's wall time used to make it.
+    wait(cx, window, &view, 1000);
     (window, view, events)
+}
+
+/// `ms` go by on the test's clock: the motion clock and the executor's move
+/// on together in one step (what fell due fires; animations are where they
+/// are by then), and what that drew settles.
+fn wait(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ms: u64) {
+    let d = std::time::Duration::from_millis(ms);
+    view.read_with(cx, |v, _| v.fx.set_clock(v.fx.tick() + d));
+    cx.executor().advance_clock(d);
+    settle(cx, w, 8);
 }
 
 fn keystroke(cx: &TestAppContext, key: &str) -> Keystroke {
@@ -1951,18 +1964,6 @@ fn fluid_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVie
     cx.run_until_parked();
 }
 
-/// The launch's column arrives (fluid.md §3.6: one layer, the whole column
-/// gliding in): frames until it has, before a test reads where rows are.
-fn column_arrives(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
-    for _ in 0..200 {
-        if view.read_with(cx, |v, _| v.layer.is_none()) {
-            return;
-        }
-        fluid_frame(cx, w, view);
-    }
-    panic!("the column's layer never settled");
-}
-
 /// A turn starts streaming in the shown session.
 fn start_stream(cx: &mut TestAppContext, view: &Entity<AppView>) {
     use synaps_client::protocol::{LlmEvent, StreamEvent};
@@ -2045,7 +2046,6 @@ fn anchor_row_never_moves(cx: &mut TestAppContext) {
     view.update(cx, |v, _| v.client = None);
     start_stream(cx, &view);
     settle(cx, w, 8);
-    column_arrives(cx, w, &view);
     for k in 0..30 {
         stream_step(cx, &view, k);
         fluid_frame(cx, w, &view);
