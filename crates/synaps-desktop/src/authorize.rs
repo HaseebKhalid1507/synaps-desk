@@ -536,7 +536,7 @@ impl AppView {
         let (word, rest) = r.words();
         let k = self.fx.shot(Some(r.landed), Duration::ZERO, crate::motion::QUICK, &crate::motion::ease::OUT, crate::motion::Kind::Fade);
         let lift = crate::motion::LIFT + (1. - crate::motion::LIFT) * k;
-        let word_color = if r.answer == Answer::Denied { p.err_o } else { p.dim_t };
+        let word_color = if r.answer == Answer::Denied { p.err } else { p.dim_t };
         let row = r.row;
         crate::motion::lift(
             h_flex()
@@ -982,7 +982,7 @@ pub(crate) fn receipt_line(m: &Metrics) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answer, PromptRow, Receipt, asked, guard_shape, took, with_prompts};
+    use super::{Answer, PromptRow, Receipt, asked, guard_shape, status_beside, took, with_prompts};
     use crate::turns::{Disp, Gap, Kind, Who};
     use std::time::{Duration, Instant};
 
