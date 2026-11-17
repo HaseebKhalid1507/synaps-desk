@@ -1096,13 +1096,18 @@ impl AppView {
         let hue = if think { p.think } else { name_color };
         let running = if think { shown.busy() && shown.items().last().map(|i| i.id) == Some(id) } else { state.0 == Glyph::Run };
         let lit = motion::mix(hue, p.ink, 0.30);
-        let bar = match fx.change(Tag::Finished, id, u64::from(!running), None) {
-            _ if !fx.on() => hue,
-            _ if running => lit,
-            Some((at, 0)) => motion::mix(lit, hue, fx.shot(Some(at), Duration::ZERO, motion::SLOW, &ease::OUT, Mk::Decay)),
-            _ => hue,
+        // How lit it is: 1 while it runs, decaying to 0 as it settles.
+        let k = match fx.change(Tag::Finished, id, u64::from(!running), None) {
+            _ if !fx.on() => 0.,
+            _ if running => 1.,
+            Some((at, 0)) => 1. - fx.shot(Some(at), Duration::ZERO, motion::SLOW, &ease::OUT, Mk::Decay),
+            _ => 0.,
         };
+        let bar = motion::mix(hue, lit, k);
         let drawn = fx.draw(fx.birth(id), Duration::ZERO, motion::QUICK);
+        // Lit, it blooms: a still 1 px column of its light on its right, in
+        // the row's own padding (motion.md §10 amendment 15).
+        let bloom = (k > 0.).then(|| glyph::bloom_at(motion::mix(p.tool, motion::mix(lit, p.tool, BLOOM), k), drawn));
         let wait = fx.change(Tag::Waiting, id, u64::from(waiting), None);
         let warn = if waiting {
             Some(fx.draw(wait.filter(|w| w.1 == 0).map(|w| w.0), Duration::ZERO, motion::BASE))
@@ -1199,7 +1204,8 @@ impl AppView {
             .child(head)
             .children(worker.map(|(v, current)| self.subagent_block(v, current, id, block_at, p, m, lay, cx)))
             .children(body)
-            .child(glyph::bar_at(bar, drawn))
+            .children(bloom)
+            .child(glyph::bar_lit(bar, motion::mix(bar, p.ink, HEAD), drawn))
             .children(warn.map(|k| glyph::bar_at(p.warn_mark, k)))
             .into_any_element()
     }
@@ -1365,6 +1371,12 @@ pub(crate) fn glyph_code(g: Glyph) -> u64 {
     Glyph::ALL.iter().position(|x| *x == g).unwrap_or(0) as u64
 }
 
+/// A lit bar's bloom: how far toward the ground its light is (motion.md
+/// §10 amendment 15).
+const BLOOM: f32 = 0.62;
+/// A drawing bar's head: how far toward the ink it is.
+pub(crate) const HEAD: f32 = 0.65;
+
 /// A state glyph as it is now (motion.md §6, §7): `Run` and `Workers`
 /// scan on the beat; `Needs` breathes from `breath` (the prompt's arrival)
 /// three times, then holds; a glyph that changed (`change`: when, and from
@@ -1381,7 +1393,7 @@ pub(crate) fn live_glyph(
     match g {
         // The beat layer paints the scan over the cached frame.
         Glyph::Run | Glyph::Workers if fx.layered() => glyph::on_beat(motion::Beat::Scan(g), mark, ground, fx),
-        Glyph::Run | Glyph::Workers => glyph::scan(g, fx.beat(1), mark, ground),
+        Glyph::Run | Glyph::Workers => glyph::scan(g, fx.beat(1), mark, fx.ink()),
         Glyph::Needs => {
             let step = breath.map(|t| fx.beats_since(t)).filter(|s| *s < motion::BREATH_BEATS * motion::BREATHS);
             if let (Some(t), Some(_), true) = (breath, step, fx.layered()) {

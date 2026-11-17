@@ -247,37 +247,49 @@ pub(crate) fn scan_row(beat: u32) -> f32 {
     1. + (beat % 8) as f32
 }
 
-/// A running glyph (`Run`, `Workers`) at `beat`: its quads, and a 1 px row
-/// inside its fill in `mix(mark, ground, 0.55)`. Any other glyph: [`draw`].
-pub(crate) fn scan(g: Glyph, beat: Option<u32>, mark: Hsla, ground: Hsla) -> AnyElement {
+/// A running glyph (`Run`, `Workers`) at `beat`: its quads, and its beam
+/// ([`beam_rows`]). Any other glyph: [`draw`].
+pub(crate) fn scan(g: Glyph, beat: Option<u32>, mark: Hsla, ink: Hsla) -> AnyElement {
     let Some(beat) = beat.filter(|_| matches!(g, Glyph::Run | Glyph::Workers)) else { return draw(g, mark) };
-    let line = scan_line(mark, ground);
     let mut el = div().relative().flex_none().size(px(g.size()));
     for &part in g.parts() {
         if let Part::Fill(x, top, w, h) = part {
             el = el.child(div().absolute().left(px(x)).top(px(top)).w(px(w)).h(px(h)).bg(mark));
         }
     }
-    for (x, y, w) in scan_rows(g, beat) {
-        el = el.child(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(1.)).bg(line));
+    for (x, y, w, c) in beam_rows(g, beat, mark, ink) {
+        el = el.child(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(1.)).bg(c));
     }
     el.into_any_element()
 }
 
-/// The scan's 1 px rows in `g`'s box at `beat`: x, y, width (one per fill
-/// the row crosses). [`scan`] and the beat layer draw these.
-pub(crate) fn scan_rows(g: Glyph, beat: u32) -> impl Iterator<Item = (f32, f32, f32)> {
-    let y = scan_row(beat);
+/// The scan's phosphor beam in `g`'s box at `beat` (motion.md §10
+/// amendment 14): the 1 px row the beat is on, lit toward the ink
+/// (`mix(mark, ink, 0.6)`), and the row it left one beat ago, its
+/// afterglow (`mix(mark, ink, 0.22)`; none as the beam wraps to the top).
+/// x, y, width, colour: one per fill a row crosses. [`scan`] and the beat
+/// layer draw these.
+pub(crate) fn beam_rows(g: Glyph, beat: u32, mark: Hsla, ink: Hsla) -> impl Iterator<Item = (f32, f32, f32, Hsla)> {
+    let (hot, glow) = beam(mark, ink);
+    let trail = (!beat.is_multiple_of(8)).then(|| scan_row(beat - 1));
+    rows_at(g, scan_row(beat), hot).chain(trail.into_iter().flat_map(move |y| rows_at(g, y, glow)))
+}
+
+fn rows_at(g: Glyph, y: f32, c: Hsla) -> impl Iterator<Item = (f32, f32, f32, Hsla)> {
     g.parts().iter().filter_map(move |&part| match part {
-        Part::Fill(x, top, w, h) if (top..top + h).contains(&y) => Some((x, y, w)),
+        Part::Fill(x, top, w, h) if (top..top + h).contains(&y) => Some((x, y, w, c)),
         _ => None,
     })
 }
 
-/// The scan row's colour.
-pub(crate) fn scan_line(mark: Hsla, ground: Hsla) -> Hsla {
-    crate::motion::mix(mark, ground, 0.55)
+/// The beam's row and its afterglow's: the mark toward the ink.
+pub(crate) fn beam(mark: Hsla, ink: Hsla) -> (Hsla, Hsla) {
+    (crate::motion::mix(mark, ink, BEAM), crate::motion::mix(mark, ink, GLOW))
 }
+
+/// How far toward the ink the beam's row is lit, and its afterglow's.
+pub(crate) const BEAM: f32 = 0.6;
+pub(crate) const GLOW: f32 = 0.22;
 
 /// `Needs`' inner cell in its box: x, y, side.
 pub(crate) const BREATH_CELL: (f32, f32, f32) = (3., 3., 4.);
@@ -328,11 +340,11 @@ pub(crate) fn on_beat(beat: crate::motion::Beat, mark: Hsla, ground: Hsla, fx: &
         }
         crate::motion::Beat::Breath(_) => breath_box(mark, mark),
     };
-    let fx = fx.clone();
+    let (fx, ink) = (fx.clone(), fx.ink());
     el.child(
         canvas(
             |_, _, _| {},
-            move |b, _, window, _| fx.site(crate::motion::Site { origin: b.origin, mask: window.content_mask(), mark, ground, beat }),
+            move |b, _, window, _| fx.site(crate::motion::Site { origin: b.origin, mask: window.content_mask(), mark, ground, ink, beat }),
         )
         .absolute()
         .inset_0(),
@@ -421,6 +433,21 @@ pub(crate) fn bar(color: Hsla) -> Div {
 /// absolute child's length.
 pub(crate) fn bar_at(color: Hsla, p: f32) -> Div {
     if p >= 1. { bar(color) } else { div().absolute().left_0().top_0().w(px(2.)).h(relative(p.max(0.))).bg(color) }
+}
+
+/// [`bar_at`] with its leading 6 px (the end that draws) in `head` while
+/// it draws: the head that writes is hot (motion.md §10 amendment 15).
+pub(crate) fn bar_lit(color: Hsla, head: Hsla, p: f32) -> Div {
+    if p >= 1. {
+        return bar(color);
+    }
+    bar_at(color, p).child(div().absolute().left_0().bottom_0().w(px(2.)).h(px(6.)).max_h(relative(1.)).bg(head))
+}
+
+/// A lit bar's bloom: a 1 px column of `color` on the bar's right (x 2),
+/// drawn to `p` of its length as the bar is. Paint only.
+pub(crate) fn bloom_at(color: Hsla, p: f32) -> Div {
+    div().debug_selector(|| "bar-bloom".into()).absolute().left(px(2.)).top_0().w(px(1.)).h(relative(p.clamp(0., 1.))).bg(color)
 }
 
 /// A reveal button's glyph (design.md §5): its slot always kept, drawn
@@ -648,6 +675,29 @@ mod tests {
     use crate::subagents::Liveness;
     use gpui_kit::AssetSource;
     use synaps_client::transcript::ToolStatus;
+
+    /// The scan's beam (motion.md §10 amendment 14): on every beat a
+    /// running glyph's lit row and, one row above it, the row it left, its
+    /// afterglow: two quads a beat for `Run` (one as the beam wraps back to
+    /// the top), lit toward the ink.
+    #[test]
+    fn the_beam_lights_its_row_and_trails_one() {
+        let mark = gpui_kit::Hsla { h: 0.6, s: 0.5, l: 0.4, a: 1. };
+        let ink = gpui_kit::Hsla { h: 0., s: 0., l: 0.95, a: 1. };
+        let (hot, glow) = super::beam(mark, ink);
+        for beat in 0..24u32 {
+            let rows: Vec<_> = super::beam_rows(Glyph::Run, beat, mark, ink).collect();
+            let y = super::scan_row(beat);
+            assert_eq!(rows[0], (1., y, 8., hot), "beat {beat}");
+            if beat % 8 == 0 {
+                assert_eq!(rows.len(), 1, "beat {beat}: wrapping, no trail across the glyph");
+            } else {
+                assert_eq!(rows[1..], [(1., y - 1., 8., glow)], "beat {beat}");
+            }
+        }
+        assert!(hot.l > glow.l && glow.l > mark.l, "lit toward the ink");
+        assert_eq!(super::beam_rows(Glyph::Workers, 3, mark, ink).count() % 2, 0, "every fill the beam crosses trails too");
+    }
 
     /// The drawing table is injective (`GO` is `Fold` by design: one
     /// chevron) and every part stays inside its box, strokes
