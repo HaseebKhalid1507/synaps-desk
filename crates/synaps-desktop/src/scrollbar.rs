@@ -376,8 +376,6 @@ struct Inner {
     /// colour lerps (motion.md §6.4), Full only.
     was: bool,
     fade: Option<(bool, Instant)>,
-    /// The hide's 30 Hz tick is armed.
-    ticking: bool,
 }
 
 /// A bar showing lerps its thumb in from its ground over `quick`-exit
@@ -386,6 +384,39 @@ struct Inner {
 /// opaque ground: no opacity.
 const SHOW: Duration = Duration::from_millis(90);
 const HIDE: Duration = Duration::from_millis(270);
+
+thread_local! {
+    /// The views with a bar hiding, and whether their one shared timer is
+    /// armed: N bars cost one timer and 30 notifies a second, on the app's
+    /// decay grid ([`crate::motion::next_tick`], motion.md amendment 3).
+    static HIDING: RefCell<(bool, Vec<EntityId>)> = RefCell::default();
+}
+
+/// `view` has a bar hiding: it draws again on the next decay tick.
+fn hiding(view: EntityId, window: &mut Window, cx: &mut App) {
+    let arm = HIDING.with(|h| {
+        let mut h = h.borrow_mut();
+        if !h.1.contains(&view) {
+            h.1.push(view);
+        }
+        !std::mem::replace(&mut h.0, true)
+    });
+    if !arm {
+        return;
+    }
+    let at = crate::motion::next_tick(Instant::now());
+    window
+        .spawn(cx, async move |cx| {
+            cx.background_executor().timer(at.saturating_duration_since(Instant::now())).await;
+            let views = HIDING.with(|h| {
+                let mut h = h.borrow_mut();
+                h.0 = false;
+                std::mem::take(&mut h.1)
+            });
+            cx.update(|_, cx| views.into_iter().for_each(|v| cx.notify(v))).ok();
+        })
+        .detach();
+}
 
 /// How far a bar's fade is at `now`: (showing, its thumb's strength 0..1).
 fn fading(fade: Option<(bool, Instant)>, now: Instant) -> Option<(bool, f32)> {
@@ -615,7 +646,7 @@ impl<S: Scrolled> Frame<S> {
         let dragging = state.0.borrow().grab.is_some();
         // Hiding: the thumb as it was at rest, lerping to its ground.
         if let Some((false, k)) = fade {
-            let p = &cx.global::<crate::theme::Scheme>().p;
+            let p = &crate::theme::palette(cx);
             let (base, thin) = match ground {
                 Ground::Canvas => (p.canvas, p.thumb),
                 Ground::Chrome => (p.chrome, p.thumb_ch),
@@ -625,21 +656,10 @@ impl<S: Scrolled> Frame<S> {
             window.with_content_mask(Some(ContentMask { bounds: vp }), |window| {
                 window.paint_quad(fill(rect, crate::motion::mix(base, thin, k)));
             });
-            let mut s = state.0.borrow_mut();
-            if !s.ticking {
-                s.ticking = true;
-                let state = state.clone();
-                window
-                    .spawn(cx, async move |cx| {
-                        cx.background_executor().timer(crate::motion::DECAY_TICK).await;
-                        state.0.borrow_mut().ticking = false;
-                        cx.update(|_, cx| cx.notify(view)).ok();
-                    })
-                    .detach();
-            }
+            hiding(view, window, cx);
         }
         if look.0 {
-            let p = &cx.global::<crate::theme::Scheme>().p;
+            let p = &crate::theme::palette(cx);
             // At rest the `thumb*` role; hovered its ground's dim text;
             // dragged the focus colour (design.md §8.16).
             let (thin, rest, hot) = match ground {

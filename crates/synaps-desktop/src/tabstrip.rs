@@ -46,7 +46,7 @@ const IND_X: u64 = 0x7AB0 << 48;
 const IND_W: u64 = 0x7AB1 << 48;
 const OPEN_W: u64 = 0x7AB2 << 48;
 const LABEL: u64 = 0x7AB3 << 48;
-const TOUCH: u64 = 0x7AB4 << 48;
+pub(crate) const TOUCH: u64 = 0x7AB4 << 48;
 const CLOSE_W: u64 = 0x7AB5 << 48;
 
 /// What the strip's motion remembers between frames.
@@ -323,9 +323,14 @@ impl AppView {
         };
         ghosts_after(None, &mut slots);
         for (ix, t) in tabs.iter().enumerate().skip(lay.first).take(lay.shown) {
-            let from = fresh.contains(&t.id).then_some(0.);
-            let (w, opening) = if from.is_some() || fx.spring_at(crate::motion::key(OPEN_W, t.id)).is_some() {
-                fx.spring(crate::motion::key(OPEN_W, t.id), from, lay.width, snap)
+            // A new tab's width springs from 0; after that (settled) a new
+            // width is taken at once (a resize, a neighbour opening: fluid
+            // §3.8 `follow`), as for every tab from launch.
+            let key = crate::motion::key(OPEN_W, t.id);
+            let (w, opening) = if fresh.contains(&t.id) {
+                fx.spring(key, Some(0.), lay.width, snap)
+            } else if fx.spring_at(key).is_some() {
+                fx.spring_held(key, lay.width, snap)
             } else {
                 (lay.width, false)
             };
@@ -520,7 +525,7 @@ impl AppView {
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
         let view = !kind.attaches();
-        let rest_title = match st {
+        let title_of = |on: bool| match st {
             _ if view || kind == Kind::Worker => {
                 if on {
                     p.ink
@@ -537,7 +542,7 @@ impl AppView {
         // The label eases to `ink` over `quick` as its tab is shown, and
         // back over `hover_out` (fluid.md §3.5).
         let k = fx.ease_to(crate::motion::key(LABEL, id), if on { 1. } else { 0. }, crate::motion::QUICK, crate::motion::HOVER_OUT);
-        let title_color = if on || k <= 0. { rest_title } else { crate::motion::mix(rest_title, p.ink, k) };
+        let title_color = crate::motion::mix(title_of(false), title_of(true), k);
         // NEEDS YOU first: a worker tab's session's prompt too. Its bar
         // draws left to right over `base` (motion.md §6.3).
         let needs = st == State::NeedsYou;

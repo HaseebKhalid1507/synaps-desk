@@ -145,23 +145,39 @@ pub fn step(ground: u32, toward: u32, target: f64) -> u32 {
     step_upto(ground, toward, target, 80)
 }
 
-/// A pressed fill (fluid.md §3.9): `hover` stepped toward `toward` as far
-/// as [`STEP`] off it, but no further than every one of `texts` still
-/// reads on it at [`TEXT`] and every one of `marks` at [`MARK`].
+/// How far a pressed fill stands off its hover fill, at least: a press is
+/// always seen (fluid.md §3.9).
+pub const PRESS_MIN: f64 = 1.05;
+
+/// A pressed fill (fluid.md §3.9): `hover` stepped toward `toward` (the
+/// ink) until it stands [`STEP`] off it, no further than every one of
+/// `texts` still reads on it at [`TEXT`] and every one of `marks` at
+/// [`MARK`]. Where that way is blocked short of [`PRESS_MIN`] (texts
+/// floored onto the hover fill itself), it steps away from the ink: that
+/// only raises what is drawn on it. Never `hover` itself.
 pub fn pressed(hover: u32, toward: u32, texts: &[u32], marks: &[u32]) -> u32 {
     let ok = |c: u32| texts.iter().all(|&t| contrast(t, c) >= TEXT) && marks.iter().all(|&m| contrast(m, c) >= MARK);
-    let mut out = hover;
-    for i in 1..=80u8 {
-        let c = mix(hover, toward, f64::from(i) * 0.005);
-        if !ok(c) {
-            break;
+    let walk = |to: u32| {
+        let mut out = hover;
+        for i in 1..=80u8 {
+            let c = mix(hover, to, f64::from(i) * 0.005);
+            if !ok(c) {
+                break;
+            }
+            out = c;
+            if contrast(c, hover) >= STEP {
+                break;
+            }
         }
-        out = c;
-        if contrast(c, hover) >= STEP {
-            break;
-        }
+        out
+    };
+    let near = walk(toward);
+    if contrast(near, hover) >= PRESS_MIN {
+        return near;
     }
-    out
+    let away = if luminance(toward) > luminance(hover) { 0x000000 } else { 0xffffff };
+    let far = walk(away);
+    if contrast(far, hover) > contrast(near, hover) { far } else { near }
 }
 
 /// [`step`], at most `steps` half-percent steps toward `toward`.
@@ -407,11 +423,11 @@ roles! {
     // The filled buttons' hover (a step toward the ink); a scrollbar's
     // thumb at rest on the canvas, the chrome and the user surface.
     btn_hi, warn_hi, thumb, thumb_ch, thumb_u,
-    // Pressed (fluid.md §3.9): one step past each hover fill, held back
-    // until every text and mark drawn on it still meets its floor: on the
-    // canvas (hover `user`), the chrome (`raised`), the card (`card_hi`), a
-    // run (`tool_out`), and the two filled buttons.
-    press, press_ch, press_k, press_t, btn_press, warn_press,
+    // Pressed (fluid.md §3.9): a step off each hover fill, toward the ink
+    // or else away from it, never through a floor of what is drawn on it:
+    // on the chrome (`raised`), the card (`card_hi`), and the two filled
+    // buttons. (A run row's press waits for its row roles, Q1.)
+    press_ch, press_k, btn_press, warn_press,
     // The chrome, on `bg` and the raised row: text, then marks.
     prose_ch, dim_ch, header, warn_ch, run_ch, unread_ch, open_ch, ready_ch, err_ch, cost_ch, ok_ch, edit_ch, write_ch, bash_ch,
     sub_name, sub_status, sub_done, sub_time,
@@ -494,6 +510,11 @@ impl Palette {
             &mut p.ready_mark_ch,
             &mut p.err_mark_ch,
             &mut p.you_bar,
+            &mut p.agent,
+            &mut p.agent_u,
+            &mut p.sub_rule,
+            &mut p.sub_time_t,
+            &mut p.sub_time,
         ] {
             *c = drain_hsla(*c, t);
         }
@@ -779,8 +800,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     {
         f.log.push(Check { role, from, color: c, grounds: vec![ground], floor: HAIR });
     }
-    // Pressed: a step toward the ink past the hover fill, walked back until
-    // what is drawn on it reads; each of those is logged on it.
+    // Pressed ([`pressed`]): what is drawn on each is logged on it.
     {
         let (texts_ch, marks_ch) = (
             [r.ink, r.prose_ch, r.dim_ch, r.header, r.warn_ch, r.run_ch, r.unread_ch, r.open_ch, r.ready_ch, r.err_ch, r.cost_ch, r.ok_ch],
@@ -790,21 +810,14 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
             [r.ink, r.prose_k, r.dim_k, r.warn_k, r.err_k, r.run_k, r.ok_k],
             [r.run_mark_k, r.err_mark_k, r.rest_mark_k, r.focus_k, r.warn_mark],
         );
-        let texts_t = [
-            r.prose_t, r.dim_t, r.arg, r.ok, r.t_bash, r.t_read, r.t_write, r.t_edit, r.t_grep, r.t_find, r.t_ls, r.t_sub, r.t_ext, r.t_gen,
-        ];
-        let marks_t = [r.warn_mark, r.run_mark, r.you_mark_t, r.sub_rule];
-        let texts_u = [r.ink, r.dim_u, r.agent_u, r.head_u];
         let label = [chrome];
-        let sets: [(&'static str, u32, &[u32], &[u32]); 6] = [
-            ("press", user, &texts_u, &[]),
+        let sets: [(&'static str, u32, &[u32], &[u32]); 4] = [
             ("press_ch", raised, &texts_ch, &marks_ch),
             ("press_k", card_hi, &texts_k, &marks_k),
-            ("press_t", tool_out, &texts_t, &marks_t),
             ("btn_press", r.btn_hi, &label, &[]),
             ("warn_press", r.warn_hi, &label, &[]),
         ];
-        let mut out = [0u32; 6];
+        let mut out = [0u32; 4];
         for (i, (role, hover, texts, marks)) in sets.into_iter().enumerate() {
             let c = pressed(hover, ink, texts, marks);
             out[i] = c;
@@ -815,7 +828,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
                 f.log.push(Check { role, from: m, color: m, grounds: vec![c], floor: MARK });
             }
         }
-        [r.press, r.press_ch, r.press_k, r.press_t, r.btn_press, r.warn_press] = out;
+        [r.press_ch, r.press_k, r.btn_press, r.warn_press] = out;
     }
     // Series: five theme colours at the mark floor on the canvas; one that
     // lands within 1.25:1 of an earlier one is mixed 40 % toward the ink.
@@ -952,6 +965,12 @@ pub struct Scheme {
     /// The link is down (motion.md §5.3): how drained the palette is, as of
     /// the app's frame (0: not at all).
     pub drain: std::cell::Cell<f32>,
+    /// The blended palette for the last (fade, drain), so the many reads a
+    /// frame (one per transcript row) cost a copy, not a blend.
+    cache: std::cell::Cell<Option<(f32, f32, Palette)>>,
+    /// A cross-fade's kit theme and text views' style wait for its last
+    /// frame (motion.md §6.8).
+    sync_due: std::cell::Cell<bool>,
 }
 
 impl Scheme {
@@ -962,9 +981,19 @@ impl Scheme {
     }
 
     /// The app's frame sets when the cross-fade began (its first frame) and
-    /// how far it is (`t` 1: over).
-    pub fn fade(&self, at: std::time::Instant, t: f32) {
+    /// how far it is (`t` 1: over). True on its last frame: the kit's theme
+    /// and the text views' style are due ([`settle_fade`]).
+    pub fn fade(&self, at: std::time::Instant, t: f32) -> bool {
         self.from.set(self.from.get().filter(|_| t < 1.).map(|(p, _, _)| (p, Some(at), t)));
+        t >= 1. && self.sync_due.replace(false)
+    }
+
+    /// The cross-fade's blend, not drained.
+    fn blended(&self) -> Palette {
+        match self.from.get() {
+            Some((from, _, t)) => from.lerp(&self.p, t),
+            None => self.p,
+        }
     }
 }
 
@@ -979,21 +1008,36 @@ impl Scheme {
         // quoted, link and heading colours are the ones floored there.
         let on_user = Palette { prose: p.ink, dim: p.dim_u, agent: p.agent_u, head: p.head_u, ..p };
         let user_text = text_style(&on_user, &m, luminance(roles.canvas) < 0.5);
-        Scheme { choice, roles, p, m, user_text, from: Default::default(), drain: Default::default() }
+        Scheme {
+            choice,
+            roles,
+            p,
+            m,
+            user_text,
+            from: Default::default(),
+            drain: Default::default(),
+            cache: Default::default(),
+            sync_due: Default::default(),
+        }
     }
 }
 
 /// The palette, by value (no allocation).
 pub fn palette(cx: &App) -> Palette {
     let s = cx.global::<Scheme>();
-    let p = match s.from.get() {
-        Some((from, _, t)) => from.lerp(&s.p, t),
-        None => s.p,
-    };
-    match s.drain.get() {
-        k if k > 0. => p.drained(k),
-        _ => p,
+    let (k, fade) = (s.drain.get(), s.from.get());
+    if k <= 0. && fade.is_none() {
+        return s.p;
     }
+    let t = fade.map_or(1., |f| f.2);
+    if let Some((ck, ct, p)) = s.cache.get()
+        && (ck, ct) == (k, t)
+    {
+        return p;
+    }
+    let p = s.blended().drained(k);
+    s.cache.set(Some((k, t, p)));
+    p
 }
 
 /// A colour's relative luminance (WCAG).
@@ -1030,22 +1074,40 @@ pub fn apply(choice: Choice, cx: &mut App) {
         return;
     }
     let s = Scheme::new(choice);
-    let (p, m, roles) = (s.p, s.m, s.roles);
-    // A change while the window shows one (not the first): the palette
-    // cross-fades from what was painted (motion.md §6.8), under Full. The
-    // kit's theme and the text views' styles change at once.
-    if crate::motion::Level::current(cx) == crate::motion::Level::Full
-        && let Some(old) = cx.try_global::<Scheme>()
-    {
-        s.from.set(Some((palette(cx), None, 0.)));
-        let _ = old;
+    // A change of colour while the window shows one (not the first)
+    // cross-fades from what was painted (motion.md §6.8), under Full: the
+    // palette blends, and the kit's theme and the text views' style follow
+    // on its last frame. Not across a polarity (dark to light): text and
+    // ground would pass through each other's colour mid-fade, so that is
+    // instant, as is a text size (no colour changes).
+    let dark = luminance(s.roles.canvas) < 0.5;
+    let fade = crate::motion::Level::current(cx) == crate::motion::Level::Full
+        && cx.try_global::<Scheme>().is_some_and(|old| old.p != s.p && (luminance(old.roles.canvas) < 0.5) == dark);
+    if fade {
+        let old = cx.global::<Scheme>();
+        s.from.set(Some((old.blended(), None, 0.)));
+        s.sync_due.set(true);
+        s.drain.set(old.drain.get());
+    } else if let Some(old) = cx.try_global::<Scheme>() {
+        s.drain.set(old.drain.get());
     }
     cx.set_global(s);
+    if !fade {
+        settle_fade(cx);
+    }
+    // A global: cached views (the app's) don't see it change.
+    cx.refresh_windows();
+}
+
+/// The kit's theme (inputs, scrollbars, focus ring, code colours) and
+/// every text view's default style, from the scheme: at once, or on a
+/// cross-fade's last frame.
+pub fn settle_fade(cx: &mut App) {
+    let s = cx.global::<Scheme>();
+    let (p, m, roles) = (s.p, s.m, s.roles);
     sync_kit(&p, &roles, cx);
     let dark = luminance(roles.canvas) < 0.5;
     TextViewDefaults::global(cx).with_style(text_style(&p, &m, dark)).with_inherit_text_color(false).install(cx);
-    // A global: cached views (the app's) don't see it change.
-    cx.refresh_windows();
 }
 
 /// Change one part of the current [`Choice`].
@@ -1740,6 +1802,71 @@ mod tests {
         assert!(worst < 0.06, "the drain moved a contrast by {worst:.3}");
     }
 
+    /// A press is always seen (fluid.md §3.9): every pressed fill stands
+    /// [`PRESS_MIN`] off its hover fill, in every theme and accent, and
+    /// everything drawn on it still reads (its checks are in the log).
+    #[test]
+    fn press_is_visible_in_every_theme() {
+        let mut worst = (f64::MAX, String::new());
+        for (name, raw) in crate::palettes::THEMES {
+            for accent in [None, Some(0xe8132f), Some(0xf4b400), Some(0xcfa85a), Some(0x2d7bff), Some(0x35f2ff), Some(0x2bd47d)] {
+                let (r, log) = resolve(&raw, accent);
+                let raised = step(r.chrome, r.ink, STEP);
+                for (role, press, hover) in [
+                    ("press_ch", r.press_ch, raised),
+                    ("press_k", r.press_k, r.card_hi),
+                    ("btn_press", r.btn_press, r.btn_hi),
+                    ("warn_press", r.warn_press, r.warn_hi),
+                ] {
+                    let c = contrast(press, hover);
+                    assert_ne!(press, hover, "{name} {accent:?} {role}: the hover fill");
+                    if c < worst.0 {
+                        worst = (c, format!("{name} {accent:?} {role}"));
+                    }
+                }
+                for c in log.iter().filter(|c| c.role.contains("press")) {
+                    for &g in &c.grounds {
+                        assert!(contrast(c.color, g) >= c.floor - 1e-9, "{name} {accent:?} {}: {:06x} on {g:06x}", c.role, c.color);
+                    }
+                }
+            }
+        }
+        assert!(worst.0 >= PRESS_MIN, "a press too close to its hover: {:.3} ({})", worst.0, worst.1);
+    }
+
+    /// The drain keeps every floor the theme was lifted to: each check of
+    /// the log, re-run on the drained palette's colours.
+    #[test]
+    fn drained_checks_hold() {
+        let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        let lum = |c: Hsla| {
+            let c = Rgba::from(c);
+            f64::from(0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b))
+        };
+        let con = |a: Hsla, b: Hsla| {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        };
+        let mut bad = Vec::new();
+        for (name, raw) in crate::palettes::THEMES {
+            for accent in [None, Some(0xe8132f), Some(0x2d7bff)] {
+                let (_, log) = resolve(&raw, accent);
+                for c in &log {
+                    let d = drain_hsla(hsla(c.color), 0.7);
+                    for &g in &c.grounds {
+                        // The grounds that drain (button fills) drain too.
+                        let dg = drain_hsla(hsla(g), 0.7);
+                        let got = con(d, hsla(g)).min(con(d, dg));
+                        if got < c.floor - 0.01 {
+                            bad.push(format!("{name} {accent:?} {}: {got:.3} < {}", c.role, c.floor));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
     #[test]
     fn hex_parsing() {
         assert_eq!(parse_hex("#e8132f"), Some(0xe8132f));
@@ -1992,10 +2119,8 @@ mod tests {
             "focus_k",
             "open_ch",
             "you_bar",
-            "press",
             "press_ch",
             "press_k",
-            "press_t",
             "btn_press",
         ];
         for (name, raw) in palettes::THEMES {

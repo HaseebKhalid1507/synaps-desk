@@ -91,6 +91,13 @@ fn wait(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ms:
     settle(cx, w, 8);
 }
 
+/// [`wait`] to just past `ms` in two steps, so a timer due at `ms` fires
+/// on its own (a single jump lets the timers armed on the way chain past it).
+fn wait_past(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ms: u64) {
+    wait(cx, w, view, ms - 1);
+    wait(cx, w, view, 1);
+}
+
 fn keystroke(cx: &TestAppContext, key: &str) -> Keystroke {
     Keystroke::parse_with_os(key, cx.update(|cx| cx.platform_info().os)).expect("a keystroke")
 }
@@ -2735,14 +2742,14 @@ fn press_feedback_is_same_frame(cx: &mut TestAppContext) {
         frame(cx, &view);
         let travel = if level == crate::motion::Level::Full { 1. } else { 0. };
         assert_eq!(y(cx), y0 + px(travel), "{level:?}: the press, in the next frame");
-        let key = view.read_with(cx, |v, _| v.fx.pressed(crate::motion::key(0x7AB4 << 48, id)));
+        let key = view.read_with(cx, |v, _| v.fx.pressed(crate::motion::key(crate::tabstrip::TOUCH, id)));
         assert_eq!(key, (1., travel), "{level:?}: held: the press fill, {travel} px down");
         release_at(cx, w, at);
         for _ in 0..60 {
             wait(cx, w, &view, 7);
         }
         assert_eq!(y(cx), y0, "{level:?}: let go, back where it was");
-        assert_eq!(view.read_with(cx, |v, _| v.fx.pressed(crate::motion::key(0x7AB4 << 48, id))), (0., 0.), "{level:?}: at rest");
+        assert_eq!(view.read_with(cx, |v, _| v.fx.pressed(crate::motion::key(crate::tabstrip::TOUCH, id))), (0., 0.), "{level:?}: at rest");
     }
 }
 
@@ -2881,26 +2888,98 @@ fn overlay_replace_does_not_reenter(cx: &mut TestAppContext) {
 }
 
 /// motion.md §6.4: a reorder under a held rail row waits for the release:
-/// a row never moves away from a click.
+/// a row never moves away from a click. Only the order waits: a row's
+/// content (here a session's new title) is today's while held.
 #[gpui_kit::test]
 fn rail_reorder_waits_for_release(cx: &mut TestAppContext) {
     let (_w, view, _events) = open(cx);
-    let rows = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.rail.rail.items.len());
-    let key = view.read_with(cx, |v, _| v.rail.rail.rows.iter().find(|r| r.live.is_some()).map(|r| r.key)).expect("a live row");
-    let before = rows(cx);
+    let order = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.rail.rail.items.iter().map(|i| crate::rail::item_key(&v.rail.rail, i)).collect::<Vec<_>>());
+    let (key, id) = view
+        .read_with(cx, |v, _| v.rail.rail.rows.iter().find_map(|r| r.live.map(|i| (r.key, v.model.sessions[i].id.clone()))))
+        .expect("a live row");
+    let before = order(cx);
     view.update(cx, |v, cx| {
         v.fx.press_down(crate::motion::key(crate::chrome::RAIL_TOUCH, key));
-        v.chip = Some(crate::rail::Chip::Running);
+        // Another session is pinned (it moves up), and the held one renamed.
+        let other = v.model.sessions.iter_mut().rev().find(|s| s.id != id && !s.pinned && s.lifecycle != "ending").expect("another session");
+        other.pinned = true;
+        let s = v.model.sessions.iter_mut().find(|s| s.id == id).expect("its session");
+        (s.name, s.title) = (None, Some("renamed while held".into()));
+        v.model.rail_gen += 1;
         cx.notify();
     });
     frame(cx, &view);
-    assert_eq!(rows(cx), before, "held: the rail as it was");
+    assert_eq!(order(cx), before, "held: the order as it was");
+    let title = view.read_with(cx, |v, _| v.rail.rail.rows.iter().find(|r| r.key == key).map(|r| r.title.to_string()));
+    assert_eq!(title.as_deref(), Some("renamed while held"), "held: the row's content is today's");
     view.update(cx, |v, cx| {
         v.fx.press_up();
         cx.notify();
     });
     frame(cx, &view);
-    assert_ne!(rows(cx), before, "let go: the change lands");
+    assert_ne!(order(cx), before, "let go: the change lands");
+}
+
+/// Flip (motion.md §6.4) in a splice's own frame, before the list lays out
+/// again: a row that moved starts where it was and slides; the rows that
+/// didn't move get no offset; the next frame (laid out) agrees with where
+/// the splice frame said each row would be.
+#[gpui_kit::test]
+fn rail_reorder_flips_moved_rows_only(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    // Every live row's key and top, as laid out.
+    let tops = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let rail = &v.rail.rail;
+            rail.items
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, it)| Some((crate::chrome::row_key(rail, it)?, crate::chrome::item_y(&v.rail_list, ix)?.0)))
+                .collect::<std::collections::HashMap<u64, f32>>()
+        })
+    };
+    // Only rows on screen were seen where they were.
+    let view_h = view.read_with(cx, |v, _| f32::from(v.rail_list.viewport_bounds().size.height));
+    let before: std::collections::HashMap<u64, f32> = tops(cx).into_iter().filter(|&(_, y)| y < view_h).collect();
+    // The lowest OPEN row on screen is pinned: it moves up into PINNED.
+    let moved = view
+        .read_with(cx, |v, _| {
+            v.model
+                .sessions
+                .iter()
+                .filter(|s| !s.pinned && s.lifecycle != "ending")
+                .filter_map(|s| before.get(&crate::rail::key_of(&s.id)).map(|y| (*y, s.id.clone())))
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, id)| id)
+        })
+        .expect("an open session on screen");
+    view.update(cx, |v, cx| {
+        let s = v.model.sessions.iter_mut().find(|s| s.id == moved).expect("its session");
+        s.pinned = true;
+        v.model.rail_gen += 1;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let offsets = view.read_with(cx, |v, _| v.rail_fx.offsets.clone());
+    let after = tops(cx);
+    let key = crate::rail::key_of(&moved);
+    let mut slid = 0;
+    for (k, y) in &after {
+        let Some(was) = before.get(k) else { continue };
+        let off = offsets.get(k).copied().unwrap_or(0.);
+        if (was - y).abs() < 0.5 {
+            assert!(off.abs() < 0.5, "a row that didn't move has no offset ({off})");
+        } else {
+            let want = (was - y).clamp(-crate::chrome::FLIP_CAP, crate::chrome::FLIP_CAP);
+            assert!((off - want).abs() < 1., "a moved row starts where it was: {off} vs {want} (key {k:x})");
+            slid += 1;
+        }
+    }
+    assert!(slid >= 2 && before.get(&key) != after.get(&key), "the moved row and those it passed slide ({slid})");
+    wait(cx, w, &view, 400);
+    assert!(view.read_with(cx, |v, _| v.rail_fx.offsets.is_empty()), "settled");
 }
 
 /// motion.md §6.8: a theme change cross-fades the palette over `slow`
@@ -2911,6 +2990,7 @@ fn a_theme_change_cross_fades(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Full);
     let ink = |cx: &mut TestAppContext| cx.update(|cx| crate::theme::palette(cx).canvas);
+    let kit = |cx: &mut TestAppContext| cx.update(|cx| Theme::global(cx).colors.background);
     let to = |cx: &mut TestAppContext, name: &str| {
         cx.update(|cx| {
             let raw = crate::theme::builtin(name).expect("built in").1;
@@ -2921,23 +3001,39 @@ fn a_theme_change_cross_fades(cx: &mut TestAppContext) {
         });
         frame(cx, &view);
     };
+    let fading = |cx: &mut TestAppContext| cx.update(|cx| cx.global::<crate::theme::Scheme>().fading().is_some());
     wait(cx, w, &view, 400);
-    let old = ink(cx);
-    to(cx, "paper");
+    // Dark to dark: the palette blends; the kit and the text views follow
+    // on the last frame.
+    let (old, old_kit) = (ink(cx), kit(cx));
+    to(cx, "night-city");
     let new = cx.update(|cx| cx.global::<crate::theme::Scheme>().p.canvas);
-    assert_ne!(old, new, "paper's canvas is another colour");
+    assert_ne!(old, new, "night-city's canvas is another colour");
     assert_eq!(ink(cx), old, "its first frame: the old palette");
+    assert_eq!(kit(cx), old_kit, "the kit waits for the last frame");
     wait(cx, w, &view, 180);
     let mid = ink(cx);
     assert!(mid != old && mid != new, "between: {mid:?}");
     wait(cx, w, &view, 400);
     assert_eq!(ink(cx), new, "then the new one");
+    assert_ne!(kit(cx), old_kit, "the kit, synced on the last frame");
+    assert!(!fading(cx));
+    // Dark to light: at once (text and ground would cross mid-fade).
+    to(cx, "paper");
+    let paper = cx.update(|cx| cx.global::<crate::theme::Scheme>().p.canvas);
+    assert_eq!(ink(cx), paper, "a polarity change: at once");
+    assert!(!fading(cx));
+    // A text size: no colour changes, no fade.
+    cx.update(|cx| crate::theme::update(cx, |c| c.text = 18));
+    frame(cx, &view);
+    assert!(!fading(cx), "a text size never fades");
+    to(cx, "nord");
     for level in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
         set_motion(cx, &view, level);
+        to(cx, "night-city");
+        let nc = cx.update(|cx| cx.global::<crate::theme::Scheme>().p.canvas);
+        assert_eq!(ink(cx), nc, "{level:?}: at once");
         to(cx, "nord");
-        let nord = cx.update(|cx| cx.global::<crate::theme::Scheme>().p.canvas);
-        assert_eq!(ink(cx), nord, "{level:?}: at once");
-        to(cx, "paper");
     }
 }
 
@@ -3003,9 +3099,10 @@ fn saved_value_afterglows(cx: &mut TestAppContext) {
     };
     assert_eq!(k(cx, "a", false), 0., "first sight");
     assert_eq!(k(cx, "b", false), 0., "changed: its write is still to come");
-    wait(cx, w, &view, crate::app::SAVE_DELAY.as_millis() as u64 - 50);
-    assert_eq!(k(cx, "b", false), 0., "not written yet");
-    wait(cx, w, &view, 60);
+    wait(cx, w, &view, crate::app::SAVE_DELAY.as_millis() as u64 + 50);
+    assert_eq!(k(cx, "b", false), 0., "not written yet (no guess at when)");
+    // Its write finished (the one that saved it, or a later one).
+    view.update(cx, |v, _| v.settings.app_wrote = Some((u64::MAX, v.fx.now())));
     let lit = k(cx, "b", false);
     assert!(lit > 0.5, "written: lit ({lit})");
     wait(cx, w, &view, crate::motion::GLOW.as_millis() as u64);
@@ -3013,6 +3110,11 @@ fn saved_value_afterglows(cx: &mut TestAppContext) {
     assert_eq!(k(cx, "c", true), 0., "sending");
     wait(cx, w, &view, 50);
     assert_eq!(k(cx, "c", false), 1., "answered: lit at once");
+    // Settings not shown (this test's window shows a session): what it
+    // showed is forgotten, so a value changed meanwhile is first sight.
+    frame(cx, &view);
+    assert!(view.read_with(cx, |v, _| v.settings.saved.borrow().is_empty()), "hidden: forgotten");
+    assert_eq!(k(cx, "e", false), 0., "reopened: first sight, not a save");
     set_motion(cx, &view, crate::motion::Level::Off);
     settle(cx, w, 4);
     assert_eq!(k(cx, "d", true), 0.);
@@ -3048,13 +3150,14 @@ fn the_link_drops_drains_and_scans_back(cx: &mut TestAppContext) {
     wait(cx, w, &view, 700);
     assert!(view.read_with(cx, |v, _| v.link.scan.is_none()), "the scan is over");
     conn(cx, ConnState::Reconnecting);
-    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), 3., "the tear's first frame");
-    wait(cx, w, &view, 61);
-    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), -2., "its second");
-    assert_eq!(drain(cx), 0., "the drain waits for the tear");
-    wait(cx, w, &view, 40);
-    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), 0.);
-    wait(cx, w, &view, 400);
+    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), 0., "the grace: nothing yet");
+    assert_eq!(drain(cx), 0.);
+    wait_past(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64);
+    // (The tear's two frames, to the millisecond: motion.rs
+    // `the_link_tears_after_its_grace`.)
+    assert!(view.read_with(cx, |v, _| v.link.tore.is_some()), "past the grace: the tear");
+    wait(cx, w, &view, 500);
+    assert_eq!(view.read_with(cx, |v, _| v.conn_dy), 0., "the tear is over");
     assert_eq!(drain(cx), 1., "drained");
     let grey = run(cx);
     assert_ne!(grey, lit, "the live colours drain");
@@ -3075,6 +3178,7 @@ fn the_link_drops_drains_and_scans_back(cx: &mut TestAppContext) {
     set_motion(cx, &view, crate::motion::Level::Reduced);
     settle(cx, w, 4);
     conn(cx, ConnState::Reconnecting);
+    wait(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64);
     assert_eq!(view.read_with(cx, |v, _| v.conn_dy), 0., "Reduced: no tear");
     wait(cx, w, &view, 130);
     assert_eq!(drain(cx), 1., "Reduced: a quick drain");
@@ -3086,8 +3190,151 @@ fn the_link_drops_drains_and_scans_back(cx: &mut TestAppContext) {
     set_motion(cx, &view, crate::motion::Level::Off);
     settle(cx, w, 4);
     conn(cx, ConnState::Reconnecting);
+    wait(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64 + 500);
     assert_eq!(drain(cx), 0., "Off: none");
     assert_eq!(motion_pending(cx, &view), (false, None), "Off: the dots hold too");
+}
+
+/// A link set up for the link tests: Full, a live (not synthetic) link,
+/// up, its first Scan over.
+fn link_up(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<AppView>) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.synthetic = false);
+    set_conn(cx, &view, crate::model::ConnState::Connected("x".into()), false);
+    wait(cx, w, &view, 700);
+    (w, view)
+}
+
+fn set_conn(cx: &mut TestAppContext, view: &Entity<AppView>, c: crate::model::ConnState, reload: bool) {
+    view.update(cx, |v, cx| {
+        v.model.conn = c;
+        v.model.reload = reload;
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+/// A daemon reload is a planned handover (its sessions come back): no
+/// tear, no drain, no Scan, even when the new daemon takes a few seconds
+/// (the reconnect failing meanwhile). Past [`RELOAD_GRACE`] it is a loss.
+#[gpui_kit::test]
+fn a_reload_neither_tears_nor_scans(cx: &mut TestAppContext) {
+    use crate::model::ConnState;
+    let (w, view) = link_up(cx);
+    let quiet = |cx: &mut TestAppContext, what: &str| {
+        let (dy, glitch, scan) = view.read_with(cx, |v, _| (v.conn_dy, v.link.glitch, v.link.scan));
+        assert_eq!((dy, glitch.is_some(), scan.is_some()), (0., false, false), "{what}");
+        assert_eq!(cx.update(|cx| cx.global::<crate::theme::Scheme>().drain.get()), 0., "{what}: no drain");
+    };
+    set_conn(cx, &view, ConnState::Reconnecting, true);
+    quiet(cx, "the goodbye");
+    for n in 0..8 {
+        wait(cx, w, &view, 250);
+        // The new daemon is not up yet: the reconnect fails (Offline).
+        set_conn(cx, &view, ConnState::Off("refused".into()), view.read_with(cx, |v, _| v.model.reload));
+        quiet(cx, &format!("reloading, {} ms", 250 * (n + 1)));
+    }
+    set_conn(cx, &view, ConnState::Connected("x".into()), false);
+    quiet(cx, "back");
+    wait(cx, w, &view, 700);
+    quiet(cx, "settled");
+    assert!(!motion_pending(cx, &view).0, "settled: no frames");
+    // A reload that never comes back is a loss, after its grace.
+    set_conn(cx, &view, ConnState::Reconnecting, true);
+    wait_past(cx, w, &view, crate::motion::RELOAD_GRACE.as_millis() as u64);
+    assert!(view.read_with(cx, |v, _| v.link.tore.is_some()), "lost: the tear");
+}
+
+/// A storm of reloads (3 in 2 s), or of short drops, plays nothing; a
+/// storm of real losses tears at most once per [`FLASH_BUDGET`].
+#[gpui_kit::test]
+fn a_reload_storm_tears_at_most_once(cx: &mut TestAppContext) {
+    use crate::model::ConnState;
+    let (w, view) = link_up(cx);
+    let tears = std::rc::Rc::new(std::cell::Cell::new(0));
+    let scans = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut last = (None, None);
+    let mut count = |cx: &mut TestAppContext| {
+        let now = view.read_with(cx, |v, _| (v.link.tore, v.link.scanned));
+        if now.0 != last.0 {
+            tears.set(tears.get() + 1);
+        }
+        if now.1 != last.1 {
+            scans.set(scans.get() + 1);
+        }
+        last = now;
+    };
+    count(cx);
+    tears.set(0);
+    scans.set(0);
+    for _ in 0..3 {
+        set_conn(cx, &view, ConnState::Reconnecting, true);
+        count(cx);
+        wait(cx, w, &view, 120);
+        count(cx);
+        set_conn(cx, &view, ConnState::Connected("x".into()), false);
+        count(cx);
+        wait(cx, w, &view, 540);
+        count(cx);
+    }
+    assert_eq!((tears.get(), scans.get()), (0, 0), "a reload storm: nothing");
+    // Short drops (under the grace): nothing either.
+    for _ in 0..3 {
+        set_conn(cx, &view, ConnState::Reconnecting, false);
+        wait(cx, w, &view, 300);
+        set_conn(cx, &view, ConnState::Connected("x".into()), false);
+        wait(cx, w, &view, 300);
+        count(cx);
+    }
+    assert_eq!((tears.get(), scans.get()), (0, 0), "blips: nothing");
+    // Real losses, 3 in under 5 s: one tear, one Scan.
+    for _ in 0..3 {
+        set_conn(cx, &view, ConnState::Reconnecting, false);
+        wait(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64);
+        count(cx);
+        wait(cx, w, &view, 200);
+        set_conn(cx, &view, ConnState::Connected("x".into()), false);
+        count(cx);
+        wait(cx, w, &view, 100);
+        count(cx);
+    }
+    assert_eq!((tears.get(), scans.get()), (1, 1), "losses: at most one tear and one Scan per budget");
+}
+
+/// The drain turns from where it is (motion.md §8): back mid-tear,
+/// mid-drain or mid-restore, and down again mid-restore, the palette never
+/// moves by more than the curve's own step in a frame.
+#[gpui_kit::test]
+fn a_blip_never_jumps_the_palette(cx: &mut TestAppContext) {
+    use crate::model::ConnState;
+    let drain = |cx: &mut TestAppContext| cx.update(|cx| cx.global::<crate::theme::Scheme>().drain.get());
+    // `inout`'s steepest slope is 2.86× linear: a 7 ms frame's largest step.
+    let max_step = 7. / crate::motion::SLOW.as_millis() as f32 * 3.;
+    let grace = crate::motion::LINK_GRACE.as_millis() as u64;
+    for back_at in [50u64, 150, 300] {
+        let (w, view) = link_up(cx);
+        let prev = std::cell::Cell::new(drain(cx));
+        let frames = |cx: &mut TestAppContext, ms: u64, what: &str| {
+            for _ in 0..ms.div_ceil(7) {
+                wait(cx, w, &view, 7);
+                let d = drain(cx);
+                assert!((d - prev.get()).abs() <= max_step, "{what}, back at {back_at} ms: {} → {d}", prev.get());
+                prev.set(d);
+            }
+        };
+        set_conn(cx, &view, ConnState::Reconnecting, false);
+        frames(cx, grace + back_at, "down");
+        assert!(prev.get() > 0. || back_at < 100, "lost: draining ({})", prev.get());
+        set_conn(cx, &view, ConnState::Connected("x".into()), false);
+        frames(cx, 140, "back");
+        let mid = prev.get();
+        set_conn(cx, &view, ConnState::Reconnecting, false);
+        frames(cx, grace + 200, "down again mid-restore");
+        set_conn(cx, &view, ConnState::Connected("x".into()), false);
+        frames(cx, 500, "back again");
+        assert_eq!(prev.get(), 0., "restored (mid {mid})");
+    }
 }
 
 /// A worker tab opened by the pointer draws the tracer to it (motion.md

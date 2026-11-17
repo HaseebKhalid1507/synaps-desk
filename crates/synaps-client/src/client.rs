@@ -291,6 +291,10 @@ impl std::fmt::Debug for Command {
     }
 }
 
+/// `Status::Reconnecting`'s `why` when the daemon said goodbye for a reload
+/// (a planned handover: the sessions come back), not a lost transport.
+pub const RELOADING: &str = "daemon reloading";
+
 /// The control connection's health: the one source of connection status.
 /// Attachment state travels separately (`Attached` / `Reattaching` /
 /// `Detached`).
@@ -1079,7 +1083,7 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                         }
                     }
                     Ok(Some(DaemonFrame::Bye(Some(ByeReason::Reloading { retry_after_ms, .. })))) => {
-                        break ("daemon reloading".into(), Duration::from_millis(retry_after_ms.min(10_000)));
+                        break (RELOADING.into(), Duration::from_millis(retry_after_ms.min(10_000)));
                     }
                     Ok(Some(DaemonFrame::Bye(_))) => break ("daemon said bye".into(), Duration::ZERO),
                     Ok(Some(DaemonFrame::SavedSessionList { sessions, truncated, rejected })) => {
@@ -1236,7 +1240,7 @@ async fn attempt(sh: &Shared, target: &Target, mode: AttachMode, previous: Optio
                 return Attempt::Fatal(DecodeError { kind, error }.to_string());
             }
             Ok(Some(DaemonFrame::Bye(Some(ByeReason::Reloading { retry_after_ms, .. })))) => {
-                return Attempt::Retry { why: "daemon reloading".into(), after: Duration::from_millis(retry_after_ms.min(10_000)) };
+                return Attempt::Retry { why: RELOADING.into(), after: Duration::from_millis(retry_after_ms.min(10_000)) };
             }
             Ok(Some(DaemonFrame::Bye(_))) | Ok(None) => {
                 return Attempt::Retry { why: "daemon closed the connection before attaching".into(), after: Duration::ZERO };
@@ -1621,7 +1625,7 @@ async fn session_loop(
                     }
                     Ok(Some(DaemonFrame::Bye(Some(ByeReason::Reloading { generation: g, retry_after_ms })))) => {
                         generation = g;
-                        break 'conn ("daemon reloading".into(), Duration::from_millis(retry_after_ms.min(10_000)));
+                        break 'conn (RELOADING.into(), Duration::from_millis(retry_after_ms.min(10_000)));
                     }
                     Ok(Some(DaemonFrame::Bye(reason))) => {
                         unanswered(&events, attach_seq, &mut cancels, "the daemon said bye before it answered: look at the worker's row");
