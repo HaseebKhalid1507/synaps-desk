@@ -243,7 +243,7 @@ fn messages() -> Vec<Value> {
         json!({"role": "assistant", "content": [
             {"type": "thinking", "thinking": "Two refreshes both see the token as expiring, both rotate, and the second rotation invalidates the first caller's token. The retry in Session papers over that. Serialize rotation in the store instead.", "signature": "x"},
             {"type": "text", "text": "Looking at the refresh path first."},
-            {"type": "tool_use", "id": "toolu_d1", "name": "read", "input": {"path": p("crates/relay/src/token_store.rs")}}]}),
+            {"type": "tool_use", "id": "toolu_d1", "name": "read", "input": {"path": p("crates/relay/src/token_store.rs"), "offset": 40, "limit": 10}}]}),
         json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d1", "content": READ}]}),
         // Two workers: one still running (its rows below), one done.
         json!({"role": "assistant", "content": [
@@ -254,6 +254,12 @@ fn messages() -> Vec<Value> {
         json!({"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "toolu_s1", "content": "{\"agent_name\":\"scout\",\"handle_id\":\"sa_1\",\"status\":\"running\"}"},
             {"type": "tool_result", "tool_use_id": "toolu_s2", "content": "{\"agent_name\":\"reviewer\",\"handle_id\":\"sa_2\",\"status\":\"running\"}"}]}),
+        // The reviewer's end, collected: its spawn row says its result.
+        json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_c2", "name": "subagent_collect", "input": {"handle_id": "sa_2"}}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_c2", "content": json!({
+            "handle_id": "sa_2", "agent_name": "reviewer", "status": "completed", "elapsed_secs": 83.0, "tool_count": 9,
+            "output": "No token is lost in Session: a failed rotate re-reads the store before it retries.\n\nChecked session.rs and upstream.rs."}).to_string()}]}),
         json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_d2", "name": "edit", "input": {"path": p("crates/relay/src/token_store.rs"),
                 "old_string": "    pub async fn rotate(&self, id: SessionId) -> Result<Token> {\n        let mut inner = self.inner.lock().await;\n        inner.rotate(id).await\n    }",
