@@ -184,6 +184,9 @@ pub(crate) const WHEEL_RESPONSE: f32 = 0.12;
 pub(crate) const FLICK_RESPONSE: f32 = 0.16;
 /// `glide`: scroll jumps, a view arriving.
 pub(crate) const GLIDE_RESPONSE: f32 = 0.3;
+/// `sheet`: the largest surfaces (panels, the dock, the authorize card's
+/// collapse: polish.md P13), 426 ms to 0.5 px.
+pub(crate) const SHEET_RESPONSE: f32 = 0.36;
 /// An arriving block's or word's first strength: never lower (law 3).
 pub(crate) const LIFT: f32 = 0.7;
 /// A block or row arriving in a list travels this far, from below.
