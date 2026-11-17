@@ -1223,9 +1223,12 @@ fn heartbeat_is_one_timer(cx: &mut TestAppContext) {
     let (display, timer) = motion_pending(cx, &view);
     assert!(!display, "ambient asks for no display frames");
     let at = timer.expect("scout runs: the heartbeat is armed");
-    let now = view.read_with(cx, |v, _| v.fx.clock());
+    // The instant the timer was armed from: the last frame's (Shady M4: not
+    // the clock, which a slow runner's wall time has moved on since).
+    let now = view.read_with(cx, |v, _| v.fx.frame_now());
     assert!(at > now - std::time::Duration::from_millis(1));
-    assert!(at <= now + crate::motion::BEAT, "to the next beat");
+    let clock = view.read_with(cx, |v, _| v.fx.clock());
+    assert!(at <= clock + crate::motion::BEAT, "to the next beat");
     let arms = view.read_with(cx, |v, _| v.fx.arms.get());
     frame(cx, &view);
     let again = view.read_with(cx, |v, _| v.fx.arms.get());
@@ -1304,7 +1307,7 @@ fn transcript_heights_stable_across_frames(cx: &mut TestAppContext) {
 /// policy (`.motion(`), and no other file makes one. A lint over every
 /// source file: the text run's colour is not observable from a test window.
 #[test]
-fn no_text_view_gets_a_stream_fade() {
+fn one_stream_fade_policy() {
     assert_eq!(gpui_kit::base::TextViewMotion::default().stream_fade(), std::time::Duration::ZERO);
     assert!((crate::motion::stream_curve().sample(0.) - crate::motion::LIFT).abs() < 1e-4);
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1452,11 +1455,27 @@ fn click_at(cx: &mut TestAppContext, w: AnyWindowHandle, position: gpui_kit::Poi
 fn a_switch_replays_nothing(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Full);
-    settle(cx, w, 8);
+    // The motion clock moves with the executor's only (Shady M4): whether a
+    // switch is rapid never depends on how slow the runner is.
+    view.read_with(cx, |v, _| v.fx.pin_clock());
+    // `ms` on from the last frame's time (a timer the executor ran to may
+    // have put that past the clock): frames this far apart, at least.
+    let wait = |cx: &mut TestAppContext, ms: u64| {
+        let d = std::time::Duration::from_millis(ms);
+        view.read_with(cx, |v, _| v.fx.set_clock(v.fx.tick() + d));
+        cx.executor().advance_clock(d);
+        settle(cx, w, 8);
+    };
+    // The launch's column layer settles.
+    wait(cx, 400);
     // Nothing changed after `t0` (Shady N3: a change started on the switch
-    // and on any frame after it, not only the last frame's), and no
-    // display frame asked for.
-    let mark = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.clock());
+    // and on any frame after it, not only the last frame's), no row grows,
+    // and once the column's own layer (fluid.md §3.6, this view's, not a
+    // replay) has settled, no display frame asked for.
+    let mark = |cx: &mut TestAppContext| {
+        wait(cx, 300);
+        view.read_with(cx, |v, _| v.fx.clock())
+    };
     let check = |cx: &mut TestAppContext, what: &str, t0: std::time::Instant| {
         let fresh = view.read_with(cx, |v, _| v.fx.fresh());
         assert!(fresh.is_empty(), "{what}: replayed {fresh:?}");
@@ -1465,9 +1484,11 @@ fn a_switch_replays_nothing(cx: &mut TestAppContext) {
         let changed: Vec<_> =
             view.read_with(cx, |v, _| v.fx.changed_since(t0)).into_iter().filter(|(t, _)| *t != crate::motion::Tag::Watched).collect();
         assert!(changed.is_empty(), "{what}: replayed {changed:?}");
-        // The column's own arrival (fluid.md §3.6) is this view's, not a replay.
-        let layer = view.read_with(cx, |v, _| v.layer.is_some());
-        assert!(!motion_pending(cx, &view).0 || layer, "{what}: a display frame asked for");
+        assert_eq!(view.read_with(cx, |v, _| v.fx.growing()), 0, "{what}: a row grew");
+        assert!(view.read_with(cx, |v, _| v.layer.is_some()), "{what}: the column arrives as one layer");
+        wait(cx, 400);
+        assert!(view.read_with(cx, |v, _| v.layer.is_none()), "{what}: the layer settled");
+        assert!(!motion_pending(cx, &view).0, "{what}: a display frame asked for");
     };
     // A worker's view in place (its tray bar draws: that is this view's
     // own, not a replay), and out again.
@@ -2029,14 +2050,17 @@ fn stream_reveal_never_trails_a_line(cx: &mut TestAppContext) {
     start_stream(cx, &view);
     settle(cx, w, 8);
     let (mut glided, mut seen) = (0, 0);
-    for k in 0..80 {
+    for k in 0..100 {
         stream_step(cx, &view, k * 25 + 1);
         fluid_frame(cx, w, &view);
         let (state, line) = view.read_with(cx, |v, cx| {
             let id = v.disp.last().map(|d| d.id).unwrap_or(0);
             (v.fx.grow_of(id), crate::theme::metrics(cx).body_line)
         });
-        if let Some((shown, natural)) = state.filter(|(s, n)| s.is_finite() && n.is_finite()) {
+        // Its arrival reveals all of it on `snap` first (Shady N7); then its
+        // new lines glide.
+        let arriving = view.read_with(cx, |v, _| v.disp.last().is_some_and(|d| v.fx.arriving(d.id)));
+        if let Some((shown, natural)) = state.filter(|(s, n)| s.is_finite() && n.is_finite() && !arriving) {
             seen += 1;
             assert!(shown >= natural - line - 1e-3, "frame {k}: {shown} trails {natural} by more than a line ({line})");
             if shown < natural {
@@ -2128,4 +2152,184 @@ fn history_never_animates(cx: &mut TestAppContext) {
         assert_eq!(view.read_with(cx, |v, _| v.fx.growing()), 0, "frame {k}: no history row grows");
     }
     assert!(view.read_with(cx, |v, _| v.layer.is_none()), "the layer settled");
+}
+
+/// Shady H1, finish gate fix 2: a row that reveals or streams clips its
+/// body, not its gutter. Every frame the last prose row streams (wrapped),
+/// the write head is drawn on its shown bottom, left of the row, and its
+/// `AGENT` label is beside it.
+#[gpui_kit::test]
+fn the_gutter_stays_drawn_while_a_row_grows(cx: &mut TestAppContext) {
+    use gpui_kit::VisualTestContext;
+    // Wide enough that the labels hang in the gutter.
+    let (w, view, _events) = open_at(cx, (2200., 1000.), crate::theme::Panels::default().text_size);
+    assert!(view.read_with(cx, |v, _| v.layout.hang), "the labels hang");
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    start_stream(cx, &view);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.list.scroll_to_end());
+    fluid_frame(cx, w, &view);
+    let mut seen = 0;
+    for k in 0..40 {
+        stream_step(cx, &view, k * 25 + 1);
+        fluid_frame(cx, w, &view);
+        let id = view.read_with(cx, |v, _| v.disp.last().map(|d| d.id).filter(|id| v.fx.grow_of(*id).is_some()));
+        let Some(id) = id else { continue };
+        let mut vcx = VisualTestContext::from_window(w, cx);
+        let clip = vcx.debug_bounds(String::leak(format!("grow-clip-{id}"))).expect("the streaming row is wrapped");
+        let head = vcx.debug_bounds("write-head").unwrap_or_else(|| panic!("frame {k}: the write head is drawn"));
+        let label = vcx.debug_bounds(String::leak(format!("hang-label-{id}"))).unwrap_or_else(|| panic!("frame {k}: AGENT is drawn"));
+        assert!((head.bottom() - clip.bottom()).abs() < px(0.5), "frame {k}: the head {head:?} sits on the shown bottom of {clip:?}");
+        assert!(head.right() <= clip.left() && label.right() <= clip.left(), "frame {k}: both in the gutter");
+        seen += 1;
+    }
+    assert!(seen > 20, "the streaming row was wrapped ({seen} frames)");
+}
+
+/// Shady M1: rows that arrive below a view scrolled back by less than the
+/// list's overdraw are laid out off screen, never painted: they don't
+/// reveal (the 0 px an arrival starts at would stay in GPUI's heights).
+/// Within two frames the list's end is where their real heights put it.
+#[gpui_kit::test]
+fn arrivals_off_screen_keep_their_height(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    start_stream(cx, &view);
+    settle(cx, w, 8);
+    for k in 0..30 {
+        stream_step(cx, &view, k * 25 + 1);
+        fluid_frame(cx, w, &view);
+    }
+    for _ in 0..40 {
+        fluid_frame(cx, w, &view);
+    }
+    view.update(cx, |v, _| v.list.scroll_by(px(-200.)));
+    fluid_frame(cx, w, &view);
+    let max = |cx: &mut TestAppContext| view.read_with(cx, |v, _| f32::from(v.list.max_offset_for_scrollbar().y));
+    let (max0, n0) = (max(cx), view.read_with(cx, |v, _| v.list.item_count()));
+    view.update(cx, |v, cx| {
+        let t = &mut v.model.transcript;
+        for k in 0..3 {
+            let id = format!("off-{k}");
+            t.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id.clone() }),
+            });
+            t.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolUse {
+                    tool_name: "bash".into(),
+                    tool_id: id,
+                    input: serde_json::json!({"command": "ls"}),
+                }),
+            });
+        }
+        cx.notify();
+    });
+    fluid_frame(cx, w, &view);
+    fluid_frame(cx, w, &view);
+    let (max1, n1) = (max(cx), view.read_with(cx, |v, _| v.list.item_count()));
+    assert!(n1 > n0, "rows arrived");
+    assert!(view.read_with(cx, |v, _| !v.list.is_following_tail()), "still scrolled back");
+    // Their real heights: at the end, at rest.
+    view.update(cx, |v, _| v.list.scroll_to_end());
+    for _ in 0..60 {
+        fluid_frame(cx, w, &view);
+    }
+    let real: f32 = view.read_with(cx, |v, _| (n0..n1).filter_map(|ix| v.list.bounds_for_item(ix)).map(|b| f32::from(b.size.height)).sum());
+    assert!(real > 20., "the rows have height ({real})");
+    assert!((max1 - max0 - real).abs() < 1., "the end grew by {} for rows {real} tall", max1 - max0);
+}
+
+/// Finish gate fix 1, Shady M3 and L7: the column's layer starts on the
+/// first frame that draws the column (a tab's kept rows, its attach still
+/// on its way), and the attach replays nothing; it is keyed by the tab's
+/// id, so closing another tab moves nothing; a switch straight back
+/// (within 150 ms) shows no slide; Settings, none; back to the session from
+/// a worker's view, from above.
+#[gpui_kit::test]
+fn the_column_layer_starts_with_the_column(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.read_with(cx, |v, _| v.fx.pin_clock());
+    // `ms` on from the last frame's time (a timer the executor ran to may
+    // have put that past the clock): frames this far apart, at least.
+    let wait = |cx: &mut TestAppContext, ms: u64| {
+        let d = std::time::Duration::from_millis(ms);
+        view.read_with(cx, |v, _| v.fx.set_clock(v.fx.tick() + d));
+        cx.executor().advance_clock(d);
+        settle(cx, w, 8);
+    };
+    let layer = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.layer);
+    let focus = |cx: &mut TestAppContext, ix: usize| {
+        view.update(cx, |v, cx| {
+            v.focus_tab(ix);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    wait(cx, 400);
+    // A worker's view in place: from below; back to the session: from above.
+    scout_in_place(cx, w, &view);
+    assert_eq!(layer(cx).map(|l| (l.1, l.2)), Some((0., 1.)), "a worker's view, from below");
+    wait(cx, 400);
+    view.update(cx, |v, cx| v.leave_worker(false, cx));
+    cx.run_until_parked();
+    assert_eq!(layer(cx).map(|l| (l.1, l.2)), Some((0., -1.)), "back to the session, from above");
+    wait(cx, 400);
+    // A new tab right of this one: from the right.
+    let client = view.update(cx, |v, _| v.client.take());
+    open_idle_cpu(cx, &view, crate::tabs::Place::New);
+    assert_eq!(layer(cx).map(|l| (l.1, l.2)), Some((1., 0.)), "a tab to the right, from the right");
+    wait(cx, 400);
+    // Back to the first tab, its attach on its way: its kept rows draw, and
+    // the layer starts with them.
+    let tx = view.update(cx, |v, _| v.synthetic_tx.take());
+    focus(cx, 0);
+    let (attached_now, rows) = view.read_with(cx, |v, _| (v.model.active.is_some(), v.disp.len()));
+    assert!(!attached_now && rows > 0, "its kept rows on screen, not attached yet");
+    let (at, x, y) = layer(cx).expect("the layer starts on the frame that draws the column");
+    assert_eq!((x, y), (-1., 0.), "a tab to the left, from the left");
+    wait(cx, 20);
+    view.update(cx, |v, cx| {
+        v.synthetic_tx = tx;
+        v.synthetic_attach(crate::demo::SID, None, false);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(attached(cx, &view).as_deref(), Some(crate::demo::SID), "attached");
+    assert_eq!(layer(cx).map(|l| l.0), Some(at), "the attach replays nothing");
+    wait(cx, 400);
+    // A switch, and straight back within 150 ms: no slide. (Drawn frame by
+    // frame: nothing runs the executor on to a timer between the two.)
+    let draw = |cx: &mut TestAppContext, ix: usize, ms: u64| {
+        view.update(cx, |v, cx| {
+            v.fx.set_clock(v.fx.tick() + std::time::Duration::from_millis(ms));
+            v.focus_tab(ix);
+            cx.notify();
+        });
+        cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+    };
+    draw(cx, 1, 0);
+    assert!(layer(cx).is_some(), "a switch: a layer");
+    draw(cx, 0, 60);
+    assert_eq!(layer(cx), None, "a switch straight back shows no slide");
+    cx.run_until_parked();
+    wait(cx, 400);
+    // Closing the tab left of the one on screen moves nothing.
+    focus(cx, 1);
+    wait(cx, 400);
+    view.update(cx, |v, cx| {
+        v.close_tab(0);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.model.tabs.active()), Some(0));
+    assert_eq!(layer(cx), None, "the same column, at another place: no layer");
+    // Settings: its own pane, no layer.
+    view.update(cx, |v, cx| v.open_view(crate::tabs::Kind::Settings, cx));
+    cx.run_until_parked();
+    assert_eq!(layer(cx), None, "Settings: no layer");
+    view.update(cx, |v, _| v.client = client);
 }

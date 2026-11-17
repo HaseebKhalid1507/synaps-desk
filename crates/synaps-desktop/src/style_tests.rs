@@ -103,22 +103,42 @@ fn no_text_under_12_px() {
     assert!(bad.is_empty(), "text under 12 px:\n{}", bad.join("\n"));
 }
 
+/// `motion::lift`, from its `#[allow]` to its closing brace: in motion.rs
+/// the one place opacity (and its lint's allow) may be.
+fn lift_span(code: &str) -> std::ops::Range<usize> {
+    let head = "#[allow(clippy::disallowed_methods)]\npub(crate) fn lift";
+    let start = code.find(head).expect("motion::lift, allowed directly above");
+    let end = start + code[start..].find("\n}\n").expect("lift's end") + 2;
+    start..end
+}
+
 /// No state is drawn with opacity (design.md §5), by any of its names:
 /// only a chart's data fades (`chart::fade`), and something arriving lifts
-/// from 70 % (`motion::lift`, fluid.md law 3).
+/// from 70 % (`motion::lift`, fluid.md law 3): in motion.rs, inside `lift`
+/// only, once.
 #[test]
 fn no_opacity_outside_charts() {
+    let mut lifts = 0;
     let bad: Vec<String> = sources()
         .into_iter()
-        .filter(|(name, _)| name != "chart.rs" && name != "motion.rs")
+        .filter(|(name, _)| name != "chart.rs")
         .flat_map(|(name, code)| {
-            [".opacity(", ".alpha(", ".fade_out("]
-                .into_iter()
-                .flat_map(|o| code.match_indices(o).map(|(at, _)| format!("{name}:{} {o}", line_of(&code, at))).collect::<Vec<_>>())
-                .collect::<Vec<_>>()
+            let span = (name == "motion.rs").then(|| lift_span(&code));
+            let mut bad = Vec::new();
+            for o in [".opacity(", ".alpha(", ".fade_out("] {
+                for (at, _) in code.match_indices(o) {
+                    if span.as_ref().is_some_and(|s| s.contains(&at)) {
+                        lifts += 1;
+                    } else {
+                        bad.push(format!("{name}:{} {o}", line_of(&code, at)));
+                    }
+                }
+            }
+            bad
         })
         .collect();
-    assert!(bad.is_empty(), "opacity outside chart.rs:\n{}", bad.join("\n"));
+    assert!(bad.is_empty(), "opacity outside chart.rs and motion::lift:\n{}", bad.join("\n"));
+    assert_eq!(lifts, 1, "motion::lift sets opacity once");
 }
 
 /// One overlay box (design.md §8.9): every tooltip is built by
@@ -139,19 +159,24 @@ fn every_tooltip_is_the_overlay() {
 }
 
 /// The lint's way in, one per rule: `clippy::disallowed_methods` is
-/// allowed only where its rule lives (fonts.rs, chart.rs, overlay.rs,
-/// motion.rs's lift);
+/// allowed only where its rule lives (fonts.rs, chart.rs, overlay.rs, and
+/// in motion.rs once, directly above `lift`);
 /// the groups that hold it (`clippy::style`, `clippy::all`) nowhere.
 #[test]
 fn the_house_rules_are_allowed_only_where_they_live() {
     let mut bad = Vec::new();
     for (name, code) in sources() {
-        let home = ["fonts.rs", "chart.rs", "overlay.rs", "motion.rs"].contains(&name.as_str());
+        let home = ["fonts.rs", "chart.rs", "overlay.rs"].contains(&name.as_str());
+        let lift = (name == "motion.rs").then(|| lift_span(&code));
         for lint in ["disallowed_methods", "clippy::style", "clippy::all"] {
             if lint == "disallowed_methods" && home {
                 continue;
             }
             for (at, _) in code.match_indices(lint) {
+                // The one `#[allow]`, the line above `lift`.
+                if lint == "disallowed_methods" && lift.as_ref().is_some_and(|s| (s.start..s.start + 40).contains(&at)) {
+                    continue;
+                }
                 // A whole name: not `clippy::all_…`.
                 if !code[at + lint.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_') {
                     bad.push(format!("{name}:{} {lint}", line_of(&code, at)));
