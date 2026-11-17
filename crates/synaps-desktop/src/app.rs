@@ -1406,6 +1406,14 @@ pub struct AppView {
     /// The window's motion (motion.md): the frame's clock, what animates,
     /// the one timer.
     pub(crate) fx: Rc<crate::motion::Motion>,
+    /// The transcript's own scrolling (fluid.md §3.2).
+    pub(crate) scroller: crate::scroll::Scroller,
+    /// The column on screen (session, worker view) and its tab, and when
+    /// it last changed; the layer it arrives as: since, and from where
+    /// (fluid.md §3.1, §3.6).
+    column_key: (Option<String>, u64, Option<usize>),
+    column_at: Option<Instant>,
+    pub(crate) layer: Option<(Instant, f32, f32)>,
     /// The prompt on the card came while watched, at this instant: its frame
     /// traces, its glyph breathes (motion.md §6.3).
     card_at: Option<Instant>,
@@ -1842,6 +1850,10 @@ impl AppView {
             watch_poll: None,
             visible: i.visible,
             fx: Rc::default(),
+            scroller: crate::scroll::Scroller::default(),
+            column_key: (None, 0, None),
+            column_at: None,
+            layer: None,
             card_at: None,
             card_exit: None,
             #[cfg(test)]
@@ -2405,6 +2417,7 @@ impl AppView {
                 self.disp = c.disp;
                 self.summaries = c.summaries;
                 self.list = c.list;
+                self.scroller.cancel();
                 self.scroll_carry = None;
                 self.toggled = c.toggled;
                 self.open_runs = c.open_runs;
@@ -2903,6 +2916,95 @@ impl AppView {
     /// transcript's end would set the list following the tail (GPUI does
     /// at the end): `hold_back` stops it 2 px short instead, after the
     /// layout, still scrolled back.
+    /// The scroller's frame (fluid.md §3.2): before the list's layout, the
+    /// list moved by what the wheel, the finger or the coast did since the
+    /// last frame. `pad`: the list's bottom padding (its end is past it).
+    fn scroll_frame(&mut self, pad: f32) {
+        if !self.scroller.active() {
+            return;
+        }
+        if self.list.is_scrollbar_dragging() || self.fx.level() != crate::motion::Level::Full {
+            return self.scroller.cancel();
+        }
+        let room = crate::scroll::Room {
+            offset: -f32::from(self.list.scroll_px_offset_for_scrollbar().y),
+            max: f32::from(self.list.max_offset_for_scrollbar().y) + pad,
+            end_known: self.list.is_scrolled_to_end().is_some(),
+        };
+        let step = self.scroller.frame(self.fx.now(), room);
+        if step.follow {
+            self.list.scroll_to_end();
+        } else if step.by != 0. {
+            self.list.scroll_by(px(step.by));
+        }
+        if self.scroller.active() {
+            self.fx.want_frame();
+        }
+    }
+
+    /// The column changed (launch, a session, a tab, a worker's view): it
+    /// arrives as one layer, at its final layout, lifting 70 → 100 % and
+    /// travelling [`crate::motion::SHIFT`] → 0 on `glide` (fluid.md §3.6):
+    /// from a tab, from the tab's side; a worker's view, from below (out of
+    /// the tray and blocks); otherwise from below. A change within 150 ms of
+    /// the last is instant: a held ↓ never stacks them. Full only.
+    fn column_layer(&mut self) {
+        let key = (
+            self.model.active.as_ref().map(|a| a.session_id.clone()),
+            self.motion_column(),
+            self.model.tabs.active(),
+        );
+        // Nothing on screen yet (an attach in flight): the column it lands
+        // on is the change.
+        if key == self.column_key || (key.0.is_none() && self.model.watch.focus().is_none()) {
+            return;
+        }
+        let now = self.fx.now();
+        let rapid = self.column_at.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(150));
+        let (dx, dy) = match (self.column_key.2, key.2) {
+            (Some(a), Some(b)) if a != b && self.model.watch.focus().is_none() => (if b > a { 1. } else { -1. }, 0.),
+            _ => (0., 1.),
+        };
+        self.column_key = key;
+        self.column_at = Some(now);
+        self.layer = (self.fx.fluid() && !rapid).then_some((now, dx, dy));
+    }
+
+    /// The column's layer this frame: its offset and strength, or none.
+    fn layer_now(&mut self) -> Option<(f32, f32, f32)> {
+        let (at, dx, dy) = self.layer?;
+        let t = self.fx.now().saturating_duration_since(at).as_secs_f32();
+        let d = crate::motion::Spring::from_rest(crate::motion::SHIFT, crate::motion::GLIDE_RESPONSE, t);
+        let q = (t / crate::motion::QUICK.as_secs_f32()).min(1.);
+        let strength = crate::motion::LIFT + (1. - crate::motion::LIFT) * crate::motion::ease::OUT.sample(q);
+        if d < 0.5 && q >= 1. || !self.fx.fluid() {
+            self.layer = None;
+            return None;
+        }
+        self.fx.want_frame();
+        Some((dx * d, dy * d, strength))
+    }
+
+    /// Row `ix` as it arrives or grows (fluid.md §3.3, §3.4): a row that
+    /// arrived while watched reveals its height, its content rising
+    /// [`crate::motion::ARRIVE`] and lifting from 70 %; the streaming row's
+    /// new lines glide in. History, Reduced and Off: the row as is.
+    fn arrive(&self, ix: usize, row: AnyElement, cx: &App) -> AnyElement {
+        let Some(d) = self.disp.get(ix) else { return row };
+        let streaming = self.synced_busy && ix + 1 == self.disp.len() && d.kind == Kind::Prose;
+        let line = theme::metrics(cx).body_line;
+        match self.fx.grow(d.id, self.fx.birth(d.id), streaming, line) {
+            // Your own message was readable a frame ago: it doesn't lift.
+            Some(mut g) => {
+                if d.kind == Kind::User {
+                    g.strength = 1.;
+                }
+                crate::motion::grow_block(row, g)
+            }
+            None => row,
+        }
+    }
+
     fn keep_rows(&mut self, shift: f32, grew: bool) {
         // Between short and cramped the bars stay: what is owed stays owed.
         let carry = if shift != 0. { self.scroll_carry.take() } else { None };
@@ -3721,6 +3823,7 @@ impl AppView {
         self.disp = p.disp;
         self.summaries = p.summaries;
         self.list = p.list;
+        self.scroller.cancel();
         self.toggled = p.toggled;
         self.open_runs = p.open_runs;
         self.synced_busy = p.synced_busy;
@@ -3785,6 +3888,7 @@ impl AppView {
     /// Start the list over on a new transcript (the bench's scenarios): no
     /// row, height or fold of the old one survives.
     pub(crate) fn reset_transcript(&mut self) {
+        self.scroller.cancel();
         self.model.transcript = crate::model::transcript();
         self.rows.clear();
         self.disp.clear();
@@ -3845,6 +3949,7 @@ impl AppView {
         }
         // The clicked header stays put (motion.md §6.1): the list keeps its
         // top row and offset, tail-follow paused (it resumes at the end).
+        self.scroller.cancel();
         if self.list.is_following_tail() {
             let top = self.list.logical_scroll_top();
             self.list.pause_following_tail();
@@ -5218,6 +5323,8 @@ impl Render for AppView {
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
         self.fx.set_ink(p.ink);
+        self.scroll_frame((28. * m.r).round());
+        self.column_layer();
         // Settings or Usage came on screen (or one closed): after this
         // frame, never inside it, what it shows is asked for if stale.
         let view = self.model.tabs.view();
@@ -5349,7 +5456,13 @@ impl Render for AppView {
         // Nothing over the list but the tab strip: the first row's own gap
         // (20·r) is the transcript's top edge (design.md §8.14).
         let (pad_t, pad_b) = (0., (28. * m.r).round());
-        let list = list(self.list.clone(), cx.processor(|this, ix, _window, cx| this.render_disp(ix, cx)))
+        let list = list(
+            self.list.clone(),
+            cx.processor(|this, ix, _window, cx| {
+                let row = this.render_disp(ix, cx);
+                this.arrive(ix, row, cx)
+            }),
+        )
             .size_full()
             .pl(px(pad_l))
             .pr(px(pad_r))
@@ -5375,7 +5488,9 @@ impl Render for AppView {
             .size_0()
         });
         // Over the list's right padding, after its layout (and the hold-back's).
-        let transcript_bar = crate::scrollbar::rows(&self.list, pad_t + pad_b, &self.bars.transcript).always();
+        let layer = self.layer_now();
+        let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.scroller.clone(), self.fx.clone()));
+        let transcript_bar = crate::scrollbar::rows_gliding(&self.list, pad_t + pad_b, &self.bars.transcript, glide).always();
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
         // the end of a scrolled-back list set it following; it stops 2 px
         // short of the end instead, still scrolled back. Built only on the
@@ -5414,7 +5529,18 @@ impl Render for AppView {
                 .bg(p.canvas)
                 .child(tabs)
                 .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
-                .child(div().flex_1().min_h_0().child(list).children(hint_frame).children(hold_back).child(transcript_bar))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .relative()
+                        .when_some(layer, |d, (x, y, k)| crate::motion::lift(d.left(px(x)).top(px(y)), k))
+                        .child(list)
+                        .child(crate::scroll::owner(self.scroller.clone(), self.fx.clone()))
+                        .children(hint_frame)
+                        .children(hold_back)
+                        .child(transcript_bar),
+                )
                 .when(card_shown, |d| d.children(self.render_prompt(&p, &m, self.card_keys_live(window, cx), cx)))
                 // The card's slot over a worker's view: NEEDS YOU, folded.
                 .children(self.render_stub(&p, &m, cx))
