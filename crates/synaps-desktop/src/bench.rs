@@ -538,6 +538,124 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     });
                 };
                 level(cx, crate::motion::Level::Full);
+                // `SYNAPS_BENCH_LIFE=N` (Q3 evidence, polish.md §3 Life): after
+                // N s, a scripted turn on the bench's session, the scene a
+                // capture records: a bash call runs (the spinner, its sweep
+                // after 1 s, the composer's), workers spawn, run (their tool
+                // counts and steps roll) and end (the check writes on), a call
+                // fails (the cross), a prompt comes (NEEDS YOU's count rolls),
+                // a rail row is favourited (the star hops), the turn ends.
+                // `SYNAPS_BENCH_LIFE_LEVEL=full|reduced|off`: the level.
+                if let Some(after) = std::env::var("SYNAPS_BENCH_LIFE").ok().and_then(|s| s.parse::<f64>().ok()) {
+                    let lv = std::env::var("SYNAPS_BENCH_LIFE_LEVEL").ok().and_then(|s| crate::motion::Level::parse(&s));
+                    level(cx, lv.unwrap_or(crate::motion::Level::Full));
+                    let apply = |cx: &mut AsyncWindowContext, evs: Vec<Value>| {
+                        let _ = upd(cx, &|v, cx| {
+                            v.apply_batch(evs.iter().cloned().filter_map(local_raw).collect(), cx);
+                            v.sync_list();
+                        });
+                    };
+                    let row = |n: u64, name: &str, status: &str, tools: u64, step: &str, secs: f64| {
+                        let done = (status != "running").then_some(secs);
+                        json!({"subagent_id": n, "agent_name": name, "status": status, "cancel_requested": false,
+                            "elapsed_secs": secs, "finished_elapsed": done, "step": step, "tools": tools})
+                    };
+                    let spawn = |n: u64, name: &str, task: &str| {
+                        let id = format!("w{n}");
+                        let res = json!({"handle_id": format!("sa_{n}"), "agent_name": name, "status": "running"}).to_string();
+                        vec![
+                            json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start",
+                                "tool_id": id, "input": {"agent": name, "task": task}}}),
+                            json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": id, "result": res}}),
+                        ]
+                    };
+                    let call = |id: &str, tool: &str, input: Value| {
+                        json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": tool, "tool_id": id, "input": input}})
+                    };
+                    let result = |id: &str, text: &str| json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": id, "result": text}});
+                    let _ = upd(cx, &|v, cx| {
+                        v.model.set_local_session("bench");
+                        v.model.transcript.apply_history(&dated(synthetic::history(12, 3)));
+                        let metas: Vec<SessionMeta> = [
+                            ("bench", "Relay refresh race", true, 0),
+                            ("20261117-090001-l001", "Flaky e2e", true, 0),
+                            ("20261117-090002-l002", "Docs sweep", false, 2),
+                            ("20261117-090003-l003", "Idle CPU", false, 0),
+                        ]
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, (id, title, busy, subs))| {
+                            serde_json::from_value(json!({"id": id, "title": title, "model": "m", "lifecycle": "live", "busy": busy,
+                                "subagents_running": subs, "messages": 12, "created_at": format!("2026-11-17T09:00:{k:02}Z")}))
+                            .ok()
+                        })
+                        .collect();
+                        v.apply_batch(vec![Event::Sessions(metas)], cx);
+                        v.sync_list();
+                        v.list.set_follow_mode(FollowMode::Tail);
+                        v.list.scroll_to_end();
+                    });
+                    sleep(after).await;
+                    let _ = upd(cx, &|v, _| {
+                        let t = &mut v.model.transcript;
+                        t.apply(&SessionEvent::TurnStarted {
+                            turn_baseline: 12,
+                            trigger: "user".into(),
+                            user_text: Some("Find the refresh race and fix it.".into()),
+                        });
+                        t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                        v.sync_list();
+                        v.list.scroll_to_end();
+                    });
+                    apply(cx, vec![call("b1", "bash", json!({"command": "cargo test -p relay --test refresh_race"}))]);
+                    sleep(2.5).await;
+                    let mut evs = spawn(1, "scout", "Find every caller of TokenStore::rotate and say which hold the lock");
+                    evs.push(json!({"ev": "subagent_rows", "rows": [row(1, "scout", "running", 1, "reading crates/relay/src/upstream.rs", 0.5)]}));
+                    apply(cx, evs);
+                    sleep(2.0).await;
+                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": [row(1, "scout", "running", 2, "grep -n rotate crates/relay/src", 2.5)]})]);
+                    sleep(2.0).await;
+                    let names = ["reviewer", "fixer", "tester", "docs"];
+                    let mut evs = Vec::new();
+                    for (k, name) in names.iter().enumerate() {
+                        evs.extend(spawn(k as u64 + 2, name, "Review the retry path in Session for lost tokens"));
+                    }
+                    let mut rows = vec![row(1, "scout", "running", 3, "reading crates/relay/src/session.rs", 4.5)];
+                    rows.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "running", 1, "reading src", 0.2)));
+                    evs.push(json!({"ev": "subagent_rows", "rows": rows}));
+                    apply(cx, evs);
+                    sleep(2.0).await;
+                    apply(cx, vec![result("b1", "running 4 tests\ntest result: ok. 4 passed; 0 failed")]);
+                    sleep(1.5).await;
+                    apply(cx, vec![call("r1", "read", json!({"path": "crates/relay/src/gone.rs"})), result("r1", "Tool execution failed: no such file")]);
+                    sleep(1.5).await;
+                    let mut rows = vec![row(1, "scout", "completed", 4, "", 9.4)];
+                    rows.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "running", 2, "grep -n Stale src", 3.2)));
+                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": rows})]);
+                    sleep(2.0).await;
+                    let _ = upd(cx, &|v, _| {
+                        if let Ok(request) = serde_json::from_value(json!({
+                            "id": 7, "kind": "confirm", "title": "Run a command?", "prompt": "Tool: bash\nInput that will run:\n$ cargo test"
+                        })) {
+                            v.model.transcript.apply(&SessionEvent::Prompt { request });
+                        }
+                        v.sync_list();
+                    });
+                    sleep(2.0).await;
+                    let _ = upd(cx, &|v, _| v.toggle_fav_session("20261117-090001-l001"));
+                    sleep(1.5).await;
+                    let _ = upd(cx, &|v, _| {
+                        let t = &mut v.model.transcript;
+                        t.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
+                        t.apply(&SessionEvent::Idle);
+                        v.sync_list();
+                    });
+                    sleep(3.0).await;
+                    out["life_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
+                    println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
                 // `SYNAPS_BENCH_LINK=N`: only the link lost and back (motion.md
                 // §5.3), the scene a capture records, after N s: up 2 s, down
                 // 4 s (grace, tear, drain, held), up 3 s (Scan, restore). Every
