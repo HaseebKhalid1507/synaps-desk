@@ -546,10 +546,19 @@ impl AppView {
             }
         }
         // A chip toggles its filter; none selected shows everything. At
-        // 12 px the three take 255 px: the default rail holds them on one
-        // line ([`crate::app::FLOORS`]); one dragged narrower wraps the last.
-        let mut chips =
-            h_flex().flex_wrap().items_center().gap_x(px(12.)).gap_y(px(4.)).px(px(22.)).py(px(12.)).border_b_1().border_color(p.hair);
+        // 12 px, each count two cells wide whatever it is ([`chip_count`]),
+        // the three take 265.6 px: the default rail (268 inside) holds them
+        // on one line ([`crate::app::FLOORS`]) and a count's change never
+        // moves them; a rail narrower than that wraps the last.
+        let mut chips = h_flex()
+            .when(width < crate::app::FLOORS.0, |d| d.flex_wrap())
+            .items_center()
+            .gap_x(px(8.))
+            .gap_y(px(4.))
+            .px(px(22.))
+            .py(px(12.))
+            .border_b_1()
+            .border_color(p.hair);
         for (c, count) in [(Chip::NeedsYou, needs), (Chip::Running, running), (Chip::Unread, unread)] {
             let on = self.chip == Some(c);
             let tip = match c {
@@ -562,14 +571,14 @@ impl AppView {
                     .id(("chip", c as usize))
                     .relative()
                     .items_baseline()
-                    .gap(px(5.))
+                    .gap(px(4.))
                     .pb(px(4.))
                     .cursor_pointer()
                     // Selected: the 2-px `you_bar` (design.md §5), under it.
                     .when(on, |d| d.child(div().absolute().left_0().right_0().bottom_0().h(px(2.)).bg(p.you_bar)))
                     .child(display(c.label(), size::D_S, if on { p.ink } else { p.dim_ch }))
                     .child(mono(
-                        count.to_string(),
+                        chip_count(count),
                         size::META,
                         match c {
                             _ if count == 0 => p.dim_ch,
@@ -1354,9 +1363,28 @@ enum PickerAt {
     Bottom(f32),
 }
 
+/// A chip's count: two mono cells whatever it is (a no-break space after
+/// one digit), so a count crossing 10 moves nothing; 100 and more is
+/// `99+`, the one count a cell wider.
+fn chip_count(n: usize) -> String {
+    if n > 99 { "99+".into() } else { format!("{n:\u{a0}<2}") }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FIND, find_fits, prompt_gist};
+    use super::{FIND, chip_count, find_fits, prompt_gist};
+
+    /// Re-review N5: every count is two cells (`99+` past 99), so the chips
+    /// hold one line at the default rail whatever the counts. Their labels
+    /// at `d.s` 12 measured 194.4 px together (bella, 255 px with one-digit
+    /// counts at the old 12/5 gaps).
+    #[test]
+    fn the_chips_hold_one_line_at_the_default_rail() {
+        assert_eq!([0, 7, 10, 99, 100, 4321].map(chip_count), ["0\u{a0}", "7\u{a0}", "10", "99", "99+", "99+"]);
+        let (labels, cell, inside) = (194.4, 7.2, crate::app::FLOORS.0 - 2. * 22.);
+        let widest_two_cells = labels + 3. * (4. + 2. * cell) + 2. * 8.;
+        assert!(widest_two_cells <= inside, "{widest_two_cells} of {inside}");
+    }
 
     /// Finish gate F2: the find field's placeholder is whole or its first
     /// word, never cut mid-word: whole at the default rail, the word alone

@@ -249,6 +249,13 @@ impl Worker {
         self.status.is_some_and(|c| c.terminal() && s.terminal() && sure && (self.guessed || self.by_page))
     }
 
+    /// A sure source that names the end a guess held: the guess was right,
+    /// and its reason and run (`SubagentDone`'s `duration_secs`, the
+    /// daemon's own number) stand where the source says none.
+    fn confirms(&self, s: Status) -> bool {
+        self.guessed && self.status == Some(s)
+    }
+
     /// A weaker source never overrides a stronger one, and an end is
     /// final, unless it was a guess and a sure source says how it ended.
     fn may_take(&self, s: Status, sure: bool) -> bool {
@@ -257,17 +264,22 @@ impl Worker {
 
     fn set_status(&mut self, s: Status, reason: Option<String>, sure: bool) {
         // A page's end, then a guess from text: the page's word stands (it
-        // is the daemon's state), the guess's reason too if they agree.
+        // is the daemon's state). A guess that agrees closes the end: its
+        // reason and its run (`duration_secs`) are the daemon's own, and no
+        // later source rewrites them.
         if self.by_page && !sure && self.ended() {
-            if self.status == Some(s) && reason.is_some() {
-                self.reason = reason;
+            if self.status == Some(s) {
+                self.reason = reason.or(self.reason.take());
+                self.by_page = false;
             }
             return;
         }
         if !self.may_take(s, sure) {
             return;
         }
-        if self.corrects(s, sure) {
+        // A sure source that names another end: the guess's reason goes
+        // with it. One that agrees keeps it if it says none.
+        if self.corrects(s, sure) && self.status != Some(s) {
             self.reason = None;
         }
         self.status = Some(s);
@@ -835,8 +847,18 @@ impl Subagents {
             return false;
         }
         self.update(id, |w| {
+            let was_running = w.status.is_some_and(Status::running);
             w.set_status(status, None, true);
             w.by_page = w.ended();
+            // Its run until the daemon says it: its age at the page's end
+            // (a running worker's start is the daemon's clock), not its
+            // last running row's.
+            if w.by_page
+                && was_running
+                && let Some(t) = w.started
+            {
+                w.elapsed = Some(t.elapsed().as_secs_f64());
+            }
         });
         true
     }
@@ -1013,7 +1035,9 @@ impl Subagents {
                         if w.open(false) {
                             w.set_status(s, reason, false);
                             w.elapsed = Some(*duration_secs);
-                            if s == Status::Done {
+                            // The end held, not the guess: a page's other
+                            // word keeps its result line empty.
+                            if w.status == Some(Status::Done) {
                                 w.result = first_line(result_preview);
                                 w.preview(keep(result_preview));
                             }
@@ -1119,8 +1143,9 @@ impl Subagents {
         let tools = v.get("tool_count").and_then(Value::as_u64).map(|t| t as u32);
         self.update(n, |w| {
             if w.open(true) {
+                let kept = w.confirms(s);
                 w.set_status(s, reason, true);
-                w.elapsed = secs.or(w.elapsed);
+                w.elapsed = if kept { w.elapsed.or(secs) } else { secs.or(w.elapsed) };
                 w.tools = tools.or(w.tools);
             }
             w.tools = w.tools.or(tools);
@@ -1148,8 +1173,9 @@ impl Subagents {
             let Some(c) = completion(body) else { continue };
             self.update(c.n, |w| {
                 if w.open(true) {
+                    let kept = w.confirms(c.status);
                     w.set_status(c.status, c.reason, true);
-                    w.elapsed = c.secs.or(w.elapsed);
+                    w.elapsed = if kept { w.elapsed.or(c.secs) } else { c.secs.or(w.elapsed) };
                 }
                 if w.result.is_empty() {
                     w.result = c.preview;
@@ -1232,6 +1258,7 @@ impl Subagents {
             if w.ended() && !(ends && w.open(true)) {
                 return;
             }
+            let kept = status.as_ref().is_some_and(|(s, _)| w.confirms(*s)) && w.elapsed.is_some();
             if let Some((st, reason)) = status {
                 w.set_status(st, reason, true);
             }
@@ -1239,8 +1266,9 @@ impl Subagents {
             if let Some(e) = elapsed.filter(|_| !w.ended() && w.started.is_none()) {
                 w.started = Instant::now().checked_sub(Duration::from_secs_f64(e.max(0.)));
             }
-            // A finished worker's run: its age less the time since it ended.
-            if let Some(e) = elapsed {
+            // A finished worker's run: its age less the time since it ended
+            // (a guess it confirms keeps the daemon's `duration_secs`).
+            if let Some(e) = elapsed.filter(|_| !kept) {
                 w.elapsed = Some(match (w.ended(), ago) {
                     (true, Some(a)) => (e - a).max(0.),
                     _ => e,
@@ -1324,6 +1352,9 @@ impl Subagents {
         // `SYNAPS_DESKTOP_LOG=debug`: each change of how it is or how it
         // ended, whichever source said it.
         let f = |w: &mut Worker| {
+            if !log::log_enabled!(target: "synaps_desktop::workers", log::Level::Debug) {
+                return f(w);
+            }
             let before = (w.status, w.ended().then_some(w.elapsed).flatten(), w.reason.clone());
             f(w);
             if (w.status, w.ended().then_some(w.elapsed).flatten(), w.reason.as_ref()) != (before.0, before.1, before.2.as_ref()) {
@@ -1431,6 +1462,7 @@ mod tests {
 
     use super::{CARD_LINES, Liveness, Status, Subagents, View, completion_note, fmt_secs};
     use crate::glyph::{self, Family};
+    use std::time::{Duration, Instant};
 
     fn ev(s: &mut Subagents, v: Value) {
         s.on_session(&decode_event(&v).unwrap());
@@ -1544,19 +1576,42 @@ mod tests {
             rows(&mut s, json!([row(n, "scout", json!("running"), 3.0, None, "ls", 1)]));
             s
         };
-        let end = |s: &Subagents| s.info(1).map(|i| (i.status, i.line, i.elapsed));
-        // The stream's end: its reason and its duration, not the last row's age.
+        let end = |s: &Subagents| s.info(1).map(|i| (i.status, i.line, i.elapsed.map(|e| (e * 10.).round() / 10.)));
+        // The stream's end: its reason and its duration. Until then its run
+        // is its age at the page's end (its last row, at 3 s, is stale).
         let mut s = fresh(1);
+        s.update(1, |w| w.started = Instant::now().checked_sub(Duration::from_secs(20)));
         assert!(s.heard_page(1, Status::Failed), "its page said it first");
-        assert_eq!(end(&s), Some((Some(Status::Failed), String::new(), Some(3.0))), "the word alone: no reason, the last row's age");
+        assert_eq!(end(&s), Some((Some(Status::Failed), String::new(), Some(20.0))), "the word alone: no reason, its age then");
         done(&mut s, 1, "ERROR: boom", 12.5);
         assert_eq!(end(&s), Some((Some(Status::Failed), "reason: boom".into(), Some(12.5))), "why and how long");
+        // The done agreed with the page: the end is the daemon's, a row
+        // after it (no reason, its age less the time since) changes nothing.
+        rows(&mut s, json!([row(1, "scout", json!("failed"), 30.0, Some(4.0), "ls", 2)]));
+        assert_eq!(end(&s), Some((Some(Status::Failed), "reason: boom".into(), Some(12.5))), "page, done, then a row");
         assert!(!s.heard_page(1, Status::Done) && s.status(1) == Some(Status::Failed), "a page never takes an end back");
-        // A guess that disagrees with the page keeps the page's word.
+        // A guess that disagrees with the page keeps the page's word, and
+        // writes no result under it.
         let mut s = fresh(1);
         s.heard_page(1, Status::Cancelled);
         done(&mut s, 1, "partial notes", 9.0);
         assert_eq!(end(&s).map(|e| (e.0, e.2)), Some((Some(Status::Cancelled), Some(9.0))));
+        let i = s.info(1).unwrap();
+        assert!(i.result.is_empty() && !i.line.contains("partial"), "no result under CANCELLED: {:?}", (i.result, i.line));
+        // A guess (no page) that its row confirms: the guess's reason and
+        // the daemon's duration stand; the row has neither.
+        let mut s = fresh(1);
+        done(&mut s, 1, "ERROR: boom", 12.5);
+        rows(&mut s, json!([row(1, "scout", json!("failed"), 30.0, Some(4.0), "ls", 2)]));
+        assert_eq!(end(&s), Some((Some(Status::Failed), "reason: boom".into(), Some(12.5))), "done, then a row that agrees");
+        // A worker the list held as started (a re-attach) has no run to
+        // freeze: its page's end leaves what it had.
+        let mut s = fresh(1);
+        s.update(1, |w| {
+            w.demote();
+        });
+        s.heard_page(1, Status::Done);
+        assert_eq!(end(&s).map(|e| e.2), Some(Some(3.0)));
         // A success: its result kept.
         let mut s = fresh(1);
         s.heard_page(1, Status::Done);
