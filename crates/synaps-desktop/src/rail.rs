@@ -420,7 +420,7 @@ fn fav_row(m: &Model, ix: usize, f: &Favourite, entry: Option<SavedRef>, now: i6
             by_name: false,
         }),
         fav: Some(ix),
-        gone: f.gone,
+        gone: f.is_gone(),
         pinned: false,
     }
 }
@@ -561,9 +561,10 @@ pub fn build(m: &Model, view: &View, now: i64) -> Rail {
 }
 
 /// FAVOURITES: hidden when there are none (or, filtering, none match);
-/// folded to its head when closed (not while filtering, as a bucket).
-/// Returns the held sessions it has (shown or not): no other group lists
-/// them.
+/// folded to its head when closed (not while filtering, as a bucket), but
+/// a favourite that needs you or is running stays under it: it is in no
+/// other group, and the rail is where those are seen. Returns the held
+/// sessions it has (shown or not): no other group lists them.
 fn fav_items(m: &Model, view: &View, now: i64, rail: &mut Rail) -> Vec<usize> {
     let mut held = Vec::new();
     if m.favs.is_empty() {
@@ -571,6 +572,7 @@ fn fav_items(m: &Model, view: &View, now: i64, rail: &mut Rail) -> Vec<usize> {
     }
     let filtering = !view.find.is_empty() || view.chip.is_some();
     let n = &m.named;
+    // Each shown row, and whether it stays when folded.
     let mut rows = Vec::new();
     for (ix, f) in m.favs.list.iter().enumerate() {
         let live = m.sessions.iter().position(|s| s.lifecycle != "ending" && f.is(Source::Live(s)));
@@ -583,7 +585,8 @@ fn fav_items(m: &Model, view: &View, now: i64, rail: &mut Rail) -> Vec<usize> {
                         &view.find,
                         [s.name.as_deref(), s.title.as_deref(), s.cwd.as_deref(), shown_id(&s.id, s.name.as_deref(), s.title.as_deref())],
                     );
-                shows.then(|| live_row(m, i, now))
+                let busy = [Chip::NeedsYou, Chip::Running].into_iter().any(|c| m.chip_shows(c, s));
+                shows.then(|| (live_row(m, i, now), busy))
             }
             None => {
                 let entry = n
@@ -599,7 +602,7 @@ fn fav_items(m: &Model, view: &View, now: i64, rail: &mut Rail) -> Vec<usize> {
                 let name = f.named.then_some(f.label.as_str());
                 let shows = view.chip.is_none_or(|c| c.admits(st))
                     && found(&view.find, [name, Some(f.label.as_str()), f.cwd.as_deref(), (f.label == f.id).then_some(f.id.as_str())]);
-                shows.then(|| fav_row(m, ix, f, entry, now))
+                shows.then(|| (fav_row(m, ix, f, entry, now), false))
             }
         };
         rows.extend(row);
@@ -609,8 +612,8 @@ fn fav_items(m: &Model, view: &View, now: i64, rail: &mut Rail) -> Vec<usize> {
     }
     let open = filtering || !view.favs_closed;
     rail.items.push(Item::Favs { open, count: arc(rows.len().to_string()) });
-    if open {
-        for row in rows {
+    for (row, busy) in rows {
+        if open || busy {
             rail.rows.push(row);
             rail.items.push(Item::Row(rail.rows.len() - 1));
         }
@@ -812,7 +815,7 @@ pub fn readout_live(m: &Model, s: &SessionMeta, now: i64) -> Readout {
 pub fn readout_fav(m: &Model, f: &Favourite, now: i64) -> Readout {
     let mut lines = Vec::new();
     let (value, aside) = match m.fav_state(f) {
-        _ if f.gone => ("gone", "a resume found no journal for it; Remove takes it off this list"),
+        _ if f.is_gone() => ("gone", "a resume found no journal for it; Remove takes it off this list"),
         State::Opening => ("opening", "resume sent, waiting for the daemon"),
         State::Unread => ("unread", "saved · its last turn ended while you were elsewhere"),
         _ => ("saved", "a click resumes it in its folder"),
@@ -1081,6 +1084,15 @@ mod tests {
         ]))));
         let s = shape(&build(&m, &v("", Some(Chip::Running), false), NOW));
         assert_eq!(s[..2], ["[Favs 1]", "row Older open"], "{s:?}");
+        // M4: folded, a favourite that needs you or is running stays under
+        // the head (it is in no other group).
+        m.apply(Event::Sessions(metas(json!([
+            {"id": "o1", "lifecycle": "live", "created_at": at(600), "title": "Older open", "busy": true, "cwd": "/home/u/o1"},
+            {"id": "o2", "lifecycle": "live", "created_at": at(60), "title": "Newest open"},
+            {"id": "p2", "lifecycle": "live", "created_at": at(5), "name": "zulu", "pinned": true, "journal_id": "j-p2", "awaiting_input": 1},
+        ]))));
+        let s = shape(&build(&m, &v("", None, true), NOW));
+        assert_eq!(s[..4], ["[Favs+ 4]", "row zulu", "row Older open", "[Open 1]"], "{s:?}");
     }
 
     /// Brief 6: a favourite whose resume finds no journal shows GONE (with
@@ -1095,11 +1107,18 @@ mod tests {
         let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
         assert_eq!(rail.rows.iter().find(|r| &*r.title == "Deep history").unwrap().state, State::Opening);
         m.apply(Event::Detached { attach_seq: 40, session_id: None, reason: crate::named::LOCKED_AXEL.into() });
-        assert!(!m.favs.list[2].gone, "locked is not gone");
+        assert!(!m.favs.list[2].is_gone(), "locked is not gone");
+        // H1: the daemon down (its socket gone, a tunnel down): the client's
+        // own ENOENT is not gone, and the real reason is what is said.
+        m.resuming(deep(), 39, false);
+        let down = "attach gave up: connect /home/u/.synaps-cli/run/daemon.sock: No such file or directory (os error 2)";
+        m.apply(Event::Detached { attach_seq: 39, session_id: None, reason: down.into() });
+        assert!(!m.favs.list[2].is_gone(), "a stopped daemon is not gone");
+        assert!(m.named.error.as_deref().unwrap().contains("No such file or directory"), "{:?}", m.named.error);
         m.resuming(deep(), 41, false);
         let missing = "create session: Tool execution failed: Failed to load session 'j-deep': no session matching 'j-deep'";
         m.apply(Event::Detached { attach_seq: 41, session_id: None, reason: missing.into() });
-        assert!(m.favs.list[2].gone);
+        assert!(m.favs.list[2].is_gone());
         assert_eq!(
             m.named.error.as_deref(),
             Some("'Deep history' is gone: the daemon has no journal for it. It stays in FAVOURITES until you remove it.")
@@ -1112,6 +1131,102 @@ mod tests {
         // Removed by the user: gone from the list.
         assert!(m.favs.remove("j-deep"));
         assert_eq!(shape(&build(&m, &view(Bucket::DEFAULT_OPEN), NOW))[0], "[Favs 3]");
+    }
+
+    /// M2: a favourite the cached listing still has (asked for before the
+    /// verdict) stays GONE through the app's refresh step (`sync_favs`, then
+    /// the rail, as `AppView::refresh_rail` runs them); the verdict asks for
+    /// a fresh listing, and only that one can say it is there.
+    #[test]
+    fn gone_survives_the_cached_listing() {
+        let mut m = fav_scene();
+        let t3 = ResumeRequest { label: "today 3".into(), target: "t3".into(), cwd: Some("/home/u/t".into()), by_name: false };
+        m.resuming(t3, 50, false);
+        let missing = "create session: Tool execution failed: Failed to load session 't3': no session matching 't3'";
+        let fx = m.apply(Event::Detached { attach_seq: 50, session_id: None, reason: missing.into() });
+        assert!(
+            fx.iter().any(|f| matches!(f, crate::model::Effect::ListSaved { named_only: false, .. })),
+            "a fresh listing asked for: {fx:?}"
+        );
+        let gone = |m: &mut Model| {
+            m.sync_favs();
+            let rail = build(m, &view(Bucket::DEFAULT_OPEN), NOW);
+            keys_once(&rail);
+            rail.rows.iter().find(|r| &*r.title == "today 3").expect("never pruned").gone
+        };
+        assert!(gone(&mut m), "the cached listing has it: still gone");
+        assert!(gone(&mut m), "and on the next rebuild");
+        // The fresh listing lands without it: gone. With it (the journal is
+        // there after all): not.
+        let rest: Vec<Value> = m
+            .named
+            .recent
+            .iter()
+            .filter(|v| v.id != "t3")
+            .map(|v| json!({"id": v.id, "title": v.title, "updated_at": v.updated_at, "live": false}))
+            .collect();
+        m.apply(Event::SavedSessions { sessions: saved(Value::Array(rest)), truncated: true, rejected: 0 });
+        assert!(gone(&mut m));
+        m.refresh_saved_for_test();
+        m.apply(Event::SavedSessions {
+            sessions: saved(json!([{"id": "t3", "title": "today 3", "updated_at": at(3603), "live": false}])),
+            truncated: true,
+            rejected: 0,
+        });
+        assert!(!gone(&mut m), "a listing asked for after the verdict has it");
+    }
+
+    /// H2: one conversation is one row through its compactions: held (its
+    /// journal id moving under one live id), once and twice, open and
+    /// parked; evicted to history under its chain head; and resumed from an
+    /// old id the daemon followed forward.
+    #[test]
+    fn a_compacted_favourite_is_one_row() {
+        fn once(m: &mut Model, why: &str) {
+            m.sync_favs();
+            let rail = build(m, &view(Bucket::DEFAULT_OPEN), NOW);
+            keys_once(&rail);
+            let s = shape(&rail);
+            assert_eq!(s.iter().filter(|r| r.ends_with("Long talk")).count(), 1, "{why}: {s:?}");
+            assert_eq!(s[..2], ["[Favs 1]", "row Long talk"], "{why}");
+        }
+        let s = |journal: &str, life: &str| json!({"id": "c1", "lifecycle": life, "created_at": at(50), "title": "Long talk", "journal_id": journal});
+        let mut m = model(json!([s("c1", "live")]), json!([]), json!([]), false);
+        m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
+        once(&mut m, "favourited");
+        for (journal, life, why) in [("c2", "live", "one compaction, open"), ("c3", "live", "two, open"), ("c3", "parked", "two, parked")] {
+            m.apply(Event::Sessions(metas(json!([s(journal, life)]))));
+            once(&mut m, why);
+        }
+        assert_eq!((m.favs.list[0].id.as_str(), &m.favs.list[0].aliases[..]), ("c3", &["c1".to_string(), "c2".to_string()][..]));
+        // Evicted: listed under its chain head (c1 and c2 fold into it).
+        m.apply(Event::Sessions(vec![]));
+        m.refresh_saved_for_test();
+        m.apply(Event::SavedSessions {
+            sessions: saved(json!([{"id": "c3", "title": "Long talk", "updated_at": at(10), "live": false}])),
+            truncated: false,
+            rejected: 0,
+        });
+        once(&mut m, "evicted");
+        // Favourited at c1 and never seen since (the listing has only the
+        // head): a resume of c1 the daemon follows to c3.
+        let mut m = model(json!([]), json!([]), json!([{"id": "c3", "title": "Long talk", "updated_at": at(10), "live": false}]), false);
+        let old: SavedSession = serde_json::from_value(json!({"id": "c1", "title": "Long talk", "updated_at": at(900)})).unwrap();
+        m.favs.toggle(Source::Saved(&old), 1);
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+        assert_eq!(shape(&rail).iter().filter(|r| r.ends_with("Long talk")).count(), 2, "nothing ties them yet");
+        m.resuming(ResumeRequest { label: "Long talk".into(), target: "c1".into(), cwd: None, by_name: false }, 9, false);
+        let frame = json!({"type": "attached", "client": 2, "meta": {"id": "c3", "journal_id": "c3", "title": "Long talk"}, "conversation": {"api_messages": []}, "input_owner": 2});
+        let synaps_client::protocol::DaemonFrame::Attached(a) = synaps_client::protocol::decode_frame(&frame.to_string()).unwrap() else {
+            panic!()
+        };
+        m.apply(Event::Attached { attach_seq: 9, attached: a, mode: synaps_client::AttachMode::Mirror, reconnect: false });
+        assert_eq!(m.favs.list[0].id, "c3");
+        once(&mut m, "resumed from c1, before the session list says so");
+        m.apply(Event::Sessions(metas(
+            json!([{"id": "c3", "lifecycle": "live", "created_at": at(1), "title": "Long talk", "journal_id": "c3"}]),
+        )));
+        once(&mut m, "resumed, held");
     }
 
     /// Precedence: OPENING › NEEDS YOU › RUNNING › WORKERS › LOCKED › UNREAD

@@ -226,6 +226,13 @@ pub struct Named {
     /// is never matched to the wrong request.
     saved_in_flight: Option<SavedAsk>,
     saved_queue: VecDeque<SavedAsk>,
+    /// Listings asked for so far, on any connection (never reset): a
+    /// favourite's gone verdict holds against those (it was there before).
+    pub asks: u64,
+    /// The number (of [`Named::asks`]) of the one on its way, and of the
+    /// newest landed.
+    asked: u64,
+    pub listed: u64,
     pub resuming: Option<Resuming>,
     /// An attach from a Named row or Open by name: if the session ended
     /// since the last list, resume its journal instead.
@@ -482,6 +489,8 @@ impl Model {
         }
         if let Some(ask) = n.saved_queue.pop_front() {
             n.saved_in_flight = Some(ask);
+            n.asks += 1;
+            n.asked = n.asks;
             effects.push(match ask {
                 SavedAsk::Named => Effect::ListSaved { named_only: true, limit: SAVED_SESSIONS_MAX },
                 SavedAsk::Recent(limit) => Effect::ListSaved { named_only: false, limit },
@@ -635,11 +644,19 @@ impl Model {
             return false;
         }
         let n = &self.named;
-        let changed = self.favs.refresh(&self.sessions, n.recent.iter().chain(n.saved.iter()));
+        let changed = self.favs.refresh(&self.sessions, n.recent.iter().chain(n.saved.iter()), n.listed);
         if changed {
             self.rail_gen += 1;
         }
         changed
+    }
+
+    /// A listing asked for (as a resume or a session leaving asks).
+    #[cfg(test)]
+    pub fn refresh_saved_for_test(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.refresh_saved(&mut effects);
+        effects
     }
 
     #[cfg(test)]
@@ -655,9 +672,9 @@ impl Model {
     /// A favourite's state as its row shows it when nothing holds it:
     /// OPENING while its resume is on its way, UNREAD, else SAVED.
     pub fn fav_state(&self, f: &crate::favourites::Favourite) -> State {
-        if self.named.resuming.as_ref().is_some_and(|r| r.req.target == f.id) {
+        if self.named.resuming.as_ref().is_some_and(|r| f.knows(&r.req.target)) {
             State::Opening
-        } else if self.unread.contains(&f.id) {
+        } else if f.ids().any(|id| self.unread.contains(id)) {
             State::Unread
         } else {
             State::Saved
@@ -1401,6 +1418,7 @@ impl Model {
                 n.saved_note = (rejected > 0).then(|| format!("{rejected} saved sessions could not be read (skipped)."));
                 if asked.is_some() {
                     n.saved_failed = false;
+                    n.listed = n.asked;
                 }
                 match asked {
                     Some(SavedAsk::Named) => {
@@ -1492,6 +1510,11 @@ impl Model {
                     } else if r.req.by_name {
                         self.named.notice =
                             Some(format!("Opened '{}' by name: this daemon does not list saved folders, so it runs in ~.", r.req.label));
+                    }
+                    // A favourite's resume the daemon followed down its
+                    // compaction chain: the favourite follows it there.
+                    if !r.req.by_name {
+                        self.favs.follow(&r.req.target, &attached.meta);
                     }
                     self.refresh_saved(&mut effects);
                 }
@@ -1604,14 +1627,21 @@ impl Model {
                 match n.resuming.take_if(|r| r.attach_seq == attach_seq) {
                     Some(r) => {
                         n.error = Some(crate::named::resume_error(&r.req.label, &reason));
-                        // A favourite whose journal is not there: its row
-                        // says so (and offers Remove); never dropped here.
-                        if !r.req.by_name && crate::favourites::journal_missing(&reason) && self.favs.set_gone(&r.req.target) {
+                        // A favourite whose journal is not there (the
+                        // daemon's own refusal for that id, nothing else):
+                        // its row says so (and offers Remove); never dropped
+                        // here. A fresh listing is asked for: only one asked
+                        // after this says it is there after all.
+                        if !r.req.by_name
+                            && crate::favourites::journal_missing(&reason, &r.req.target)
+                            && self.favs.set_gone(&r.req.target, n.asks)
+                        {
                             n.error = Some(format!(
                                 "'{}' is gone: the daemon has no journal for it. It stays in FAVOURITES until you remove it.",
                                 r.req.label
                             ));
                             self.rail_gen += 1;
+                            self.refresh_saved(&mut effects);
                         }
                     }
                     None => match opening {

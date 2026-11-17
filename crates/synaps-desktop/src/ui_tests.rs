@@ -2514,9 +2514,18 @@ fn a_star_favourites_a_row_without_opening_it(cx: &mut TestAppContext) {
         assert_eq!(rows.iter().filter(|k| **k == key).count(), 1, "in FAVOURITES only");
         assert!(matches!(rail.items[1], Item::Row(r) if rail.rows[r].key == key && rail.rows[r].fav == Some(0)));
     });
-    // The key: the session on screen.
+    // The key: the session on screen; not while typing (the composer's
+    // Ctrl+D is a TUI hand's delete, never a toggle).
     let shown = view.read_with(cx, |v, _| v.model.tabs.current().and_then(|t| t.session.clone()).expect("the demo's session"));
-    down(cx, w, if cfg!(target_os = "macos") { "cmd-d" } else { "ctrl-d" }, false);
+    let fav_key = if cfg!(target_os = "macos") { "cmd-d" } else { "ctrl-d" };
+    focus_composer(cx, w, &view);
+    down(cx, w, fav_key, false);
+    up(cx, w, "d");
+    settle(cx, w, 4);
+    assert_eq!(view.read_with(cx, |v, _| v.model.favs.list.len()), 1, "typing: the key is the composer's");
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| window.focus(&v.focus, cx))).expect("the window");
+    settle(cx, w, 2);
+    down(cx, w, fav_key, false);
     up(cx, w, "d");
     settle(cx, w, 4);
     let live_key = view.read_with(cx, |v, _| {
