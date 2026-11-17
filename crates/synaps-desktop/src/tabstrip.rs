@@ -355,7 +355,7 @@ impl AppView {
         };
         let waits = if needs && worker.is_some() { " · its session needs you" } else { "" };
         let (tip, me) = (label.clone(), cx.weak_entity());
-        let menu_open = self.menu.is_some() || self.smenu.is_some();
+        let menu_open = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some();
         let close = h_flex()
             .id(("tab-x", id as usize))
             .debug_selector(|| format!("tab {id} x"))

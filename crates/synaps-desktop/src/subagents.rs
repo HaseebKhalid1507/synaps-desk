@@ -413,6 +413,10 @@ pub struct View {
     /// Running: the facts before its clock, and the clock (ticked where
     /// it is drawn, [`Tick`]).
     pub tick: Option<(SharedString, Tick)>,
+    /// [`View::facts`] and [`View::tick`] without the model: a spawn row
+    /// says `6 tools · 41s` (polish.md §2.4), its model in its hover card.
+    pub facts_bare: SharedString,
+    pub tick_bare: Option<(SharedString, Tick)>,
     /// Running (or last seen so): its step; finished: its result, or why
     /// it failed.
     pub line: Option<(SharedString, bool)>,
@@ -431,13 +435,16 @@ impl View {
         if !model.is_empty() {
             facts.push(model.rsplit_once('/').map_or(model.as_str(), |(_, m)| m).to_string());
         }
+        let skip = facts.len();
         if let Some(n) = w.tools.filter(|&n| n > 0) {
             facts.push(format!("{n} tool{}", if n == 1 { "" } else { "s" }));
         }
         let tick = w.tick().map(|t| (SharedString::from(facts.join(" · ")), t));
+        let tick_bare = w.tick().map(|t| (SharedString::from(facts[skip..].join(" · ")), t));
         if let Some(s) = w.elapsed {
             facts.push(fmt_secs(s));
         }
+        let facts_bare = facts[skip..].join(" · ").into();
         let reason = reason_shown(w.status, w.reason.as_deref()).filter(|_| matches!(w.status, Some(Status::Failed | Status::TimedOut)));
         let line = match (w.status, reason) {
             (_, Some(r)) => Some((format!("reason: {}", one_line(r, 200)).into(), true)),
@@ -456,6 +463,8 @@ impl View {
             name: name.into(),
             facts: facts.join(" · ").into(),
             tick,
+            facts_bare,
+            tick_bare,
             line,
             demoted: w.demoted,
         })

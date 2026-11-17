@@ -739,6 +739,7 @@ impl AppView {
     pub(crate) fn close_menu(&mut self) {
         self.menu = None;
         self.smenu = None;
+        self.wmenu = None;
         if self.model.cancels.disarm() {
             self.cancel_tick = None;
         }
@@ -969,11 +970,8 @@ impl AppView {
             return None;
         }
         let el = if armed {
-            // The name as the row's name column cuts it (18 characters).
-            let name = match who.name.char_indices().nth(18) {
-                Some((at, _)) => format!("{}…", &who.name[..at]),
-                None => who.name.to_string(),
-            };
+            // The name as its chip cuts it (what its width counts).
+            let name = crate::tray::cut(&who.name, crate::tray::NAME_CHARS);
             h_flex()
                 .id(("tray-x", who.id as usize))
                 .debug_selector(|| "tray-armed".into())

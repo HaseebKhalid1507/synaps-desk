@@ -18,6 +18,8 @@ pub(crate) const SID: &str = "20261113-041207-a1f0";
 /// A parked session whose turns are over: runs that fold (one with a
 /// failed call, one all ok), an edit's diff in each.
 pub(crate) const IDLE_CPU: &str = "20261113-161706-a1b9";
+/// A busy session whose turn is running a call.
+pub(crate) const FLAKY: &str = "20261113-033001-c3d9";
 /// A session from before message times: its history has none.
 pub(crate) const LEGACY: &str = "20261111-201530-0a6e";
 
@@ -70,7 +72,7 @@ fn sessions(now: i64, settled: bool) -> Vec<SessionMeta> {
             "created_at": ago(18_000)}),
         json!({"id": "20261113-184102-9d0e", "model": opus, "cwd": "/home/you/work/synaps-desktop", "lifecycle": "live", "messages": 0,
             "state_since": ago(0), "created_at": ago(0)}),
-        json!({"id": "20261113-033001-c3d9", "title": "Flaky e2e: checkout latency", "model": sonnet,
+        json!({"id": FLAKY, "title": "Flaky e2e: checkout latency", "model": sonnet,
             "cwd": "/home/you/work/shop", "busy": true, "cost_usd": 0.45, "lifecycle": "live", "messages": 12, "state_since": ago(7),
             "created_at": ago(30)}),
         json!({"id": SID, "name": "relay-refresh", "title": "Refresh race in session relay", "model": opus,
@@ -228,6 +230,12 @@ async fn concurrent_refreshes_rotate_once() {
     assert!(session.is_live());
 }";
 
+/// The relay's read, numbered as the engine's `read` numbers it (`N\t…`,
+/// then how many lines it left).
+const READ: &str = "41\tpub struct TokenStore {\n42\t    inner: Mutex<Inner>,\n43\t    rotation: Mutex<()>,\n44\t}\n45\t\n\
+    46\timpl TokenStore {\n47\t    pub async fn rotate(&self, id: SessionId) -> Result<Token> {\n48\t        let mut inner = self.inner.lock().await;\n\
+    49\t        inner.rotate(id).await\n50\t    }\n\n... (164 more lines)";
+
 fn messages() -> Vec<Value> {
     let p = |f: &str| format!("{CWD}/{f}");
     vec![
@@ -235,8 +243,8 @@ fn messages() -> Vec<Value> {
         json!({"role": "assistant", "content": [
             {"type": "thinking", "thinking": "Two refreshes both see the token as expiring, both rotate, and the second rotation invalidates the first caller's token. The retry in Session papers over that. Serialize rotation in the store instead.", "signature": "x"},
             {"type": "text", "text": "Looking at the refresh path first."},
-            {"type": "tool_use", "id": "toolu_d1", "name": "read", "input": {"path": p("crates/relay/src/token_store.rs")}}]}),
-        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d1", "content": "pub struct TokenStore {\n    inner: Mutex<Inner>,\n}\n…"}]}),
+            {"type": "tool_use", "id": "toolu_d1", "name": "read", "input": {"path": p("crates/relay/src/token_store.rs"), "offset": 40, "limit": 10}}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d1", "content": READ}]}),
         // Two workers: one still running (its rows below), one done.
         json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_s1", "name": "subagent_start", "input": {"agent": "scout",
@@ -246,14 +254,20 @@ fn messages() -> Vec<Value> {
         json!({"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "toolu_s1", "content": "{\"agent_name\":\"scout\",\"handle_id\":\"sa_1\",\"status\":\"running\"}"},
             {"type": "tool_result", "tool_use_id": "toolu_s2", "content": "{\"agent_name\":\"reviewer\",\"handle_id\":\"sa_2\",\"status\":\"running\"}"}]}),
+        // The reviewer's end, collected: its spawn row says its result.
+        json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_c2", "name": "subagent_collect", "input": {"handle_id": "sa_2"}}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_c2", "content": json!({
+            "handle_id": "sa_2", "agent_name": "reviewer", "status": "completed", "elapsed_secs": 83.0, "tool_count": 9,
+            "output": "No token is lost in Session: a failed rotate re-reads the store before it retries.\n\nChecked session.rs and upstream.rs."}).to_string()}]}),
         json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_d2", "name": "edit", "input": {"path": p("crates/relay/src/token_store.rs"),
                 "old_string": "    pub async fn rotate(&self, id: SessionId) -> Result<Token> {\n        let mut inner = self.inner.lock().await;\n        inner.rotate(id).await\n    }",
                 "new_string": "    pub async fn rotate(&self, id: SessionId) -> Result<Token> {\n        let _turn = self.rotation.lock().await;\n        let mut inner = self.inner.lock().await;\n        if let Some(t) = inner.fresh(id) {\n            return Ok(t);\n        }\n        inner.rotate(id).await\n    }"}}]}),
-        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d2", "content": "Edited crates/relay/src/token_store.rs"}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d2", "content": "Edited crates/relay/src/token_store.rs — replaced 4 line(s) with 8 line(s)"}]}),
         json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_d3", "name": "edit", "input": {"path": p("crates/relay/src/session.rs"), "old_string": OLD, "new_string": NEW}}]}),
-        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d3", "content": "Edited crates/relay/src/session.rs"}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d3", "content": format!("Edited crates/relay/src/session.rs — replaced {} line(s) with {} line(s)", OLD.lines().count(), NEW.lines().count())}]}),
         json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_d4", "name": "write", "input": {"path": p("crates/relay/tests/refresh_race.rs"), "content": TEST}}]}),
         json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d4", "content": "Wrote crates/relay/tests/refresh_race.rs"}]}),
@@ -406,10 +420,11 @@ fn idle_cpu() -> Vec<Value> {
         &mut out,
         "toolu_k02",
         "read",
-        json!({"path": p("chart.rs")}),
-        "    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window) {\n…",
+        json!({"path": p("chart.rs"), "offset": 84, "limit": 8}),
+        "85\timpl Element for Chart {\n86\t    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window) {\n87\t        if self.revealing() {\n\
+         88\t            window.request_animation_frame();\n89\t        }\n90\t        self.draw(bounds, window);\n91\t    }\n92\t}\n\n... (212 more lines)",
     );
-    ok(&mut out, "toolu_k03", "find", json!({"pattern": "*.rs", "path": p("")}), "app.rs\nbench.rs\nchart.rs\ntray.rs\n…");
+    ok(&mut out, "toolu_k03", "find", json!({"pattern": "*.rs", "path": p("")}), "app.rs\nbench.rs\nchart.rs\ndemo.rs\ntray.rs");
     ok(&mut out, "toolu_k04", "ls", json!({"path": p("")}), "app.rs  bench.rs  chart.rs  demo.rs  tray.rs  …");
     ok(
         &mut out,
@@ -520,6 +535,15 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
     } else if id != LEGACY {
         stamp(&mut msgs, id, 45, None);
     }
+    // The flaky-e2e session's turn runs a call as it attaches: it started
+    // 12 s ago (its row's clock counts from there).
+    if id == FLAKY && m.busy {
+        let mut call = json!({"role": "assistant", "content": [
+            {"type": "text", "text": "Re-running the checkout suite with tracing on."},
+            {"type": "tool_use", "id": "toolu_e2e", "name": "bash", "input": {"command": "npm run e2e -- --grep checkout --trace on"}}]});
+        call["_synaps_at"] = json!(rfc3339(now - 12));
+        msgs.push(call);
+    }
     let prompts: Vec<Value> = (1..=m.awaiting_input as u64)
         .map(|i| {
             json!({"id": i, "kind": "confirm", "title": "Confirm tool call",
@@ -532,10 +556,29 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
         "view": {"model": m.model, "thinking_level": "medium", "reasoning_level": "medium", "context_window": 200000},
         "conversation": {"header": {"title": m.title}, "messages_len": msgs.len(), "api_messages": msgs, "cost": m.cost_usd},
         "streaming": m.busy, "pending_prompts": prompts, "client_input": "shared", "input_owner": 2});
-    match decode_frame(&frame.to_string()) {
+    let mut out = match decode_frame(&frame.to_string()) {
         Ok(DaemonFrame::Attached(a)) => vec![Event::Attached { attach_seq, attached: a, mode: AttachMode::Mirror, reconnect: false }],
         _ => Vec::new(),
+    };
+    // The flaky-e2e session fans out: more workers than two lines of
+    // chips hold at 1280 (the rest in `+N more`).
+    if id == FLAKY && !out.is_empty() {
+        let row = |n: u64, name: &str, step: &str, secs: f64| {
+            json!({"subagent_id": n, "agent_name": name, "status": "running", "cancel_requested": false, "elapsed_secs": secs,
+                "finished_elapsed": null, "step": step, "tools": n + 2, "handle_id": format!("sa_{n}"), "model": "anthropic/claude-sonnet-4-5"})
+        };
+        let rows = json!({"ev": "subagent_rows", "rows": [
+            row(1, "trace-cart", "reading e2e/checkout/cart.spec.ts", 52.),
+            row(2, "trace-pay", "grep -rn \"waitForResponse\" e2e/", 47.),
+            row(3, "har-diff", "comparing 14 HAR captures", 38.),
+            row(4, "bisect", "git bisect run npm run e2e:checkout", 121.),
+            row(5, "flake-stats", "reading ci/runs.json", 19.),
+            row(6, "reviewer", "reading src/checkout/latency.ts", 7.)]});
+        if let Ok(event) = decode_event(&rows) {
+            out.push(Event::session(attach_seq, FLAKY, 1, event, Arc::new(rows)));
+        }
     }
+    out
 }
 
 fn attach_sid(attach_seq: u64) -> Vec<Event> {

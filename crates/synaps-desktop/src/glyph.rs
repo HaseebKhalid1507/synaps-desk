@@ -57,6 +57,10 @@ pub(crate) enum Glyph {
     /// The daemon pins it (kept loaded, never parked), on a favourite's
     /// row: a push pin side on (its cap, neck, flange and needle).
     Pinned,
+    /// Open a worker's view (a spawn row's OPEN button): ↗, stroked.
+    Open,
+    /// A worker's live step under its spawn row: ↳, two quads.
+    Elbow,
 }
 
 /// Open it (in a tab): the closed fold's chevron.
@@ -81,7 +85,7 @@ const STAR: &[(f32, f32)] =
     &[(5., 0.85), (6.18, 3.63), (9.18, 3.89), (6.9, 5.87), (7.59, 8.81), (5., 7.25), (2.41, 8.81), (3.1, 5.87), (0.82, 3.89), (3.82, 3.63)];
 
 impl Glyph {
-    pub(crate) const ALL: [Glyph; 20] = [
+    pub(crate) const ALL: [Glyph; 22] = [
         Glyph::Run,
         Glyph::Workers,
         Glyph::Needs,
@@ -102,6 +106,8 @@ impl Glyph {
         Glyph::Star,
         Glyph::Starred,
         Glyph::Pinned,
+        Glyph::Open,
+        Glyph::Elbow,
     ];
 
     /// Its box: 10 px; `Close` 8.
@@ -123,6 +129,7 @@ impl Glyph {
             Glyph::Close => "glyph/close.svg",
             Glyph::Star => "glyph/star.svg",
             Glyph::Starred => "glyph/starred.svg",
+            Glyph::Open => "glyph/open.svg",
             _ => return None,
         })
     }
@@ -150,6 +157,8 @@ impl Glyph {
             Glyph::Star => &[Line(STAR_CLOSED)],
             Glyph::Starred => &[Poly(STAR_CLOSED)],
             Glyph::Pinned => &[Fill(3., 1., 4., 2.), Fill(4., 3., 2., 2.), Fill(2., 5., 6., 1.), Fill(4., 6., 2., 3.)],
+            Glyph::Open => &[Line(&[(2., 8.), (8., 2.)]), Line(&[(3.5, 2.), (8., 2.), (8., 6.5)])],
+            Glyph::Elbow => &[Fill(2., 1., 2., 6.), Fill(2., 6., 7., 2.)],
         }
     }
 }
@@ -270,6 +279,7 @@ fn cut_path(g: Glyph, k: u32) -> Option<&'static str> {
         Glyph::Close => cuts!("glyph/close"),
         Glyph::Star => cuts!("glyph/star"),
         Glyph::Starred => cuts!("glyph/starred"),
+        Glyph::Open => cuts!("glyph/open"),
         _ => return None,
     };
     table.get(k.checked_sub(1)? as usize).copied()
@@ -510,12 +520,6 @@ pub(crate) fn bar_at(color: Hsla, p: f32) -> Div {
     if p >= 1. { bar(color) } else { div().absolute().left_0().top_0().w(px(2.)).h(relative(p.max(0.))).bg(color) }
 }
 
-/// A lit bar's bloom: a 1 px column of `color` on the bar's right (x 2),
-/// drawn to `p` of its length as the bar is. Paint only.
-pub(crate) fn bloom_at(color: Hsla, p: f32) -> Div {
-    div().debug_selector(|| "bar-bloom".into()).absolute().left(px(2.)).top_0().w(px(1.)).h(relative(p.clamp(0., 1.))).bg(color)
-}
-
 /// A reveal button's glyph (design.md §5): its slot always kept, drawn
 /// while `group` (its row) is hovered or `shown` (the row is selected), in
 /// `rest`; in `on` while the pointer is on the button itself (`own`, the
@@ -663,20 +667,6 @@ pub(crate) fn call(st: Option<ToolStatus>, waiting: bool, seen: bool) -> (Glyph,
     }
 }
 
-/// A folded run's trail glyph: its worst outcome, failed (or denied) >
-/// stopped at the limit > cancelled > ok.
-pub(crate) fn worst(failed: usize, stopped: usize, cancelled: usize) -> (Glyph, Family) {
-    if failed > 0 {
-        (Glyph::Failed, Family::Err)
-    } else if stopped > 0 {
-        (Glyph::Limit, Family::Warn)
-    } else if cancelled > 0 {
-        (Glyph::Cancelled, Family::Warn)
-    } else {
-        (Glyph::Ok, Family::Ok)
-    }
-}
-
 /// A worker's state as motion keys it: a re-attach's demoted start
 /// (`demoted`, [`crate::subagents::View::demoted`]) is still running, so
 /// neither the reconnect's demote nor its lift on the next page plays a
@@ -737,7 +727,7 @@ pub(crate) fn tally_bar<'a, T>(tally: &'a [T], n: impl Fn(&T) -> usize + 'a, h: 
 
 #[cfg(test)]
 mod tests {
-    use super::{Family, GO, Glyph, Part, Sprites, call, svg_of, tally_bar, worker, worst};
+    use super::{Family, GO, Glyph, Part, Sprites, call, svg_of, tally_bar, worker};
     use crate::subagents::Liveness;
     use gpui_kit::AssetSource;
     use synaps_client::transcript::ToolStatus;
@@ -823,7 +813,7 @@ mod tests {
             assert_eq!(&*svg, svg_of(g).as_bytes());
             assert_eq!(svg_of(g).matches('M').count(), lines, "{g:?}: one subpath per line");
         }
-        assert_eq!(paths.len(), 7);
+        assert_eq!(paths.len(), 8);
         assert_eq!(
             svg_of(Glyph::Ok),
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10"><path d="M1.5 5.5L4 8L8.5 2" fill="none" stroke="#000" stroke-width="1.5"/></svg>"##
@@ -834,7 +824,7 @@ mod tests {
         );
         assert!(Sprites.load("glyph/nope.svg").unwrap().is_none());
         assert!(Sprites.load("").unwrap().is_none());
-        assert_eq!(Sprites.list("glyph/").unwrap().len(), 7);
+        assert_eq!(Sprites.list("glyph/").unwrap().len(), 8);
         // The stars: one closed outline, joined round; the favourite's filled.
         let star = svg_of(Glyph::Star);
         assert!(star.contains(r#"L3.82 3.63Z" fill="none""#) && star.contains(r#"stroke-linejoin="round""#), "{star}");
@@ -883,10 +873,6 @@ mod tests {
         assert_eq!(c(None, true, true), (Glyph::Needs, Some("waiting"), Family::Warn));
         assert_eq!(c(Some(S::Running), false, true), (Glyph::Idle, Some("last seen running"), Family::Rest));
         assert_eq!(c(Some(S::Streaming), false, false), (Glyph::Run, Some("running"), Family::Run));
-        assert_eq!(worst(1, 1, 1), (Glyph::Failed, Family::Err));
-        assert_eq!(worst(0, 1, 1), (Glyph::Limit, Family::Warn));
-        assert_eq!(worst(0, 0, 1), (Glyph::Cancelled, Family::Warn));
-        assert_eq!(worst(0, 0, 0), (Glyph::Ok, Family::Ok));
     }
 
     /// A worker's states: one glyph each (started and last seen share the
