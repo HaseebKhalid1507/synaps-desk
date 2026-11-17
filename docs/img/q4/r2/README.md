@@ -13,11 +13,11 @@ daemon was stopped after the run.
 
 | t (s after t0) | frame | step | what the window does |
 |---|---|---|---|
-| 1.0 | 60 | `synaps daemon reload` | the connection words change (`reloading`), then come back. No tear, no drain, no scan |
-| 5.0–6.3 | 179–220 | a storm: 3 reloads in 2 s | the same: words only. Nothing replays |
+| 1.0 | 60 | `synaps daemon reload` | no tear, no drain, no scan. **Corrected in r3:** not "words only". The rail also blanked to `Not connected` and HISTORY went away until the hello, and NEEDS YOU moved about 60 px (the app's behaviour at the time). r3 keeps the rail and the words' width through a reload (`../r3/README.md`) |
+| 5.0–6.3 | 179–220 | a storm: 3 reloads in 2 s | the same as the single reload (corrected in r3: the rail blanked too). Nothing replays. That storm was short up/down cycles. r3 runs 4 reloads on the client's real schedule |
 | 11.5 | 375 | `synaps daemon stop` (a real loss) | `reconnecting ·`; colours unchanged for the 1 s grace |
 | | 404–406 | | the tear: three full-width `err_mark_ch` lines over 2 frames (`link-tear.png`, frames 403–407) |
-| | 407–420 | | the drain: every role but the grounds and the words greys toward its own luminance, then holds (`link-live-vs-drained.png`: frame 390 live, 450 drained) |
+| | 407–420 | | the drain: every role but the grounds and the words greys toward its own luminance, then holds (`link-live-vs-drained.png`: frame 390 live, 450 drained. **Corrected in r3:** the design re-gate found the drain stalled here. It ran 4 frames, then held for about 3 s and finished in one frame at f500, and the composer's bar never drained, so frame 450 isn't the settled drain. That is fixed, and `../r3/link-live-vs-drained.png` replaces this image) |
 | 17.5 | 556 | `synaps daemon start` | the client's reconnect backoff runs |
 | | 674–690 | | back: the Scan sweeps down in **live** colour (finish gate 2), and the palette restores from where the drain is (`link-scan-back.png`, frames 672–716 every 4th) |
 
