@@ -995,3 +995,32 @@ fn the_rail_readout_goes_under_the_session_menu(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(view.read_with(cx, |v, _| v.smenu.is_some() && v.readout.is_none()), "the menu, and no readout under it");
 }
+
+/// Frames with nothing changed (the pointer over the rail draws them, a
+/// row's hover the only difference): every markdown row keeps the text
+/// view it had (none dropped from the bounded cache, none made again and
+/// laid out a frame late), and none is stale. The text dropout seen in
+/// x11grab captures (docs/bench/text-dropout/README.md) was the capture
+/// reading a frame before the GPU had finished it; the frame the app hands
+/// the renderer is the same from one redraw to the next, and this keeps
+/// the app's half of that.
+#[gpui_kit::test]
+fn a_redraw_with_nothing_changed_keeps_every_text_view(cx: &mut TestAppContext) {
+    let (_w, view, _events) = open_at(cx, (1920., 1080.), 16);
+    let state = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let t = v.texts.borrow();
+            (t.frames(), t.entities())
+        })
+    };
+    let (first, kept) = state(cx);
+    assert!(!kept.is_empty(), "the demo's markdown rows drawn, their views kept");
+    for _ in 0..40 {
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+    }
+    let (last, again) = state(cx);
+    assert!(last >= first + 40, "each notify drew a frame: {first} then {last}");
+    assert_eq!(again, kept, "no text view dropped or made again across 40 frames");
+    assert_eq!(view.read_with(cx, |v, _| v.text_views().1), 0, "none stale");
+}
