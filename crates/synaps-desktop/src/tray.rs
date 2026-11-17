@@ -114,6 +114,22 @@ impl TrayRow {
     }
 }
 
+/// Which chips go first, so `+N more` never folds away a worker that
+/// needs a look while a quiet one is drawn (finish gate r2): failed (or
+/// timed out), then the watched one, then running (cancelling, started)
+/// newest first, then the ended, newest first. The daemon's workers have no
+/// waiting state (`Status`): a worker's prompt is its session's (the
+/// needs stub), so none ranks above a failure here.
+fn need(r: &TrayRow, watched: Option<u64>) -> (u8, std::cmp::Reverse<u64>) {
+    let rank = match r.live {
+        Liveness::Failed | Liveness::TimedOut => 0,
+        _ if watched == Some(r.id) => 1,
+        Liveness::Started | Liveness::Running | Liveness::Cancelling | Liveness::LastSeen => 2,
+        Liveness::Done | Liveness::Cancelled | Liveness::Gone => 3,
+    };
+    (rank, std::cmp::Reverse(r.id))
+}
+
 /// The tray's rows as last built: rebuilt when a worker changes, the
 /// focused view changes, or a finished worker's flash ends.
 #[derive(Default)]
@@ -361,13 +377,15 @@ impl AppView {
         let cancels = &self.model.cancels;
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
         let pending = |id: u64| session.is_some_and(|s| cancels.pending(s, &format!("sa_{id}")));
-        let rows: Vec<TrayRow> = rows
+        let mut rows: Vec<TrayRow> = rows
             .into_iter()
             .map(|l| {
                 let p = pending(l.id);
                 TrayRow::of(l, p)
             })
             .collect();
+        let watched = self.model.watch.focused().map(|w| w.subagent_id);
+        rows.sort_by_key(|r| need(r, watched));
         // Rows that came while watched draw in (staggered); rows that left fade out.
         let session = self.model.active.as_ref().map(|a| a.session_id.clone());
         let mut ghosts = std::mem::take(&mut self.tray.ghosts);
@@ -474,6 +492,71 @@ impl AppView {
         self.chips = Chips { slots: placed, more: if k < widths.len() { more } else { 0 }, more_line, lines: used };
     }
 
+    /// The workers menu (polish.md §2.5): `+N more`'s workers, each as its
+    /// chip would say it (name, state, step); picked, its view in place.
+    pub(crate) fn open_workers_menu(&mut self, pt: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let items: Vec<crate::menu::Item<u64>> = self.tray.rows[self.tray_drawn().min(self.tray.rows.len())..]
+            .iter()
+            .map(|r| {
+                let item = crate::menu::Item::new(r.id, format!("{}  {} · {}", r.name, glyph::worker(r.live).2, chip_step(r)));
+                if r.watchable { item } else { item.off(r.tip.clone()) }
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.close_menu();
+        if let Some(prev) = window.focused(cx).filter(|f| *f != self.focus)
+            && self.menu_focus_back.is_none()
+        {
+            self.menu_focus_back = Some(prev);
+        }
+        window.focus(&self.focus, cx);
+        self.gear_menu = false;
+        self.wmenu = Some(crate::menu::Menu::new(items, crate::menu::At::Point(pt), false));
+        cx.notify();
+    }
+
+    /// A worker of the workers menu picked: its view in place.
+    pub(crate) fn workers_menu_pick(&mut self, id: u64, how: crate::menu::How, _: &mut Window, cx: &mut Context<Self>) {
+        if !how.is_press() {
+            return;
+        }
+        self.close_menu();
+        if let Some(r) = self.tray.rows.iter().find(|r| r.id == id) {
+            let who = Who::new(r.id, r.name.clone(), r.call.clone());
+            self.watch_worker(&who, cx);
+        }
+    }
+
+    /// A key while the workers menu is open: `true` if it took it.
+    pub(crate) fn workers_menu_keydown(&mut self, ks: &Keystroke, press: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(m) = self.wmenu.as_mut() else { return false };
+        match m.key(&ks.key, ks.modifiers.shift, press) {
+            crate::menu::Key::Moved => {}
+            crate::menu::Key::Pick(id) => {
+                self.menu_picked = true;
+                self.workers_menu_pick(id, crate::menu::How::Key { press }, window, cx);
+            }
+            crate::menu::Key::Close => self.close_menu(),
+            crate::menu::Key::Other => {
+                self.close_menu();
+                cx.notify();
+                return false;
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// The workers menu, if open: at the root, over everything.
+    pub(crate) fn render_workers_menu(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let m = self.wmenu.as_ref()?;
+        let crate::menu::At::Point(pt) = m.at else { return None };
+        let body = crate::menu::render("workers-menu", m, p, AppView::workers_menu_pick, |this, _| this.close_menu(), cx);
+        Some(deferred(anchored().position(pt).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
+    }
+
     /// A menu opened from the keyboard over a tray row whose row is not
     /// drawn any more (its worker dropped, the window got short): it
     /// closes, never left taking keys unseen.
@@ -553,8 +636,11 @@ impl AppView {
                 .items_center()
                 .border_1()
                 .border_color(p.hair_t)
+                .cursor_pointer()
+                .hover(|d| d.bg(p.tool_out))
                 .child(mono(format!("+{} more", chips.more), m.meta, p.dim_t))
-                .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx));
+                .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
+                .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| this.open_workers_menu(ev.position(), window, cx)));
             if let Some(at) = lines.get_mut(chips.more_line.min(chips.lines - 1)) {
                 at.push(more.into_any_element());
             }
@@ -760,7 +846,7 @@ impl AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHIP_GAP, STEP_CHARS, TrayRow, chip_lines_needed, chip_pack, chip_w, cut, fit_caps};
+    use super::{CHIP_GAP, STEP_CHARS, TrayRow, chip_lines_needed, chip_pack, chip_w, cut, fit_caps, need};
     use crate::glyph::{self, Glyph};
     use crate::subagents::{Live, Liveness, Status};
     use crate::theme::Metrics;
@@ -778,6 +864,29 @@ mod tests {
             watchable: true,
             demoted: false,
         }
+    }
+
+    /// Chips go by need, not age: failed first, then the watched one, the
+    /// running newest first, the ended last (newest first).
+    #[test]
+    fn chips_go_by_need() {
+        let at = |id: u64, s: Status| TrayRow::of(Live { id, ..live(s, "x") }, false);
+        let mut rows = [
+            at(1, Status::Running),
+            at(2, Status::Done),
+            at(3, Status::Running),
+            at(4, Status::Failed),
+            at(5, Status::Running),
+            at(6, Status::TimedOut),
+            at(7, Status::Cancelled),
+            at(8, Status::Cancelling),
+        ];
+        rows.sort_by_key(|r| need(r, Some(1)));
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [6, 4, 1, 8, 5, 3, 7, 2]);
+        rows.sort_by_key(|r| need(r, None));
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [6, 4, 8, 5, 3, 1, 7, 2]);
+        rows.sort_by_key(|r| need(r, Some(4)));
+        assert_eq!(rows[0].id, 6, "a failed one watched is still a failure");
     }
 
     /// Steps read whole while every worker fits; a crowded tray cuts them

@@ -739,6 +739,7 @@ impl AppView {
     pub(crate) fn close_menu(&mut self) {
         self.menu = None;
         self.smenu = None;
+        self.wmenu = None;
         if self.model.cancels.disarm() {
             self.cancel_tick = None;
         }
