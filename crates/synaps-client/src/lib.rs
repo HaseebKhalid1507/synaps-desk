@@ -99,6 +99,7 @@ pub mod synthetic;
 pub mod transcript;
 
 pub use client::{
+    RELOADING,
     Client, ClientClosed, ClientOptions, Command, CreateOptions, Cwd, Error, Event, Expect, RequestError, STEER_UNSUPPORTED, Status,
     WatchReply,
 };

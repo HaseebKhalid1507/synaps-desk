@@ -281,6 +281,9 @@ fn refused_input(e: &Error) -> bool {
 
 pub struct Model {
     pub conn: ConnState,
+    /// The link went down for a daemon reload (a planned handover), not a
+    /// lost transport: kept until it is up again or drops otherwise.
+    pub reload: bool,
     pub sessions: Vec<SessionMeta>,
     pub active: Option<Active>,
     /// The attachment asked for last: events of any other are stale.
@@ -372,6 +375,7 @@ impl Model {
     pub fn new(conn: ConnState) -> Self {
         Self {
             conn,
+            reload: false,
             sessions: Vec::new(),
             active: None,
             wanted: None,
@@ -1414,6 +1418,11 @@ impl Model {
                     } else {
                         self.clear_saved();
                     }
+                }
+                match &s {
+                    Status::Reconnecting { why } => self.reload = why == synaps_client::RELOADING,
+                    Status::Connected { .. } => self.reload = false,
+                    _ => {}
                 }
                 self.conn = match s {
                     Status::Connecting => ConnState::Connecting,

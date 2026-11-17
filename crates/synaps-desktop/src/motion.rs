@@ -432,17 +432,47 @@ pub(crate) enum Kind {
     Decay,
 }
 
-/// The link's signatures (§5.1 Scan, §5.3 Glitch), never offline: up
-/// last frame (none: not seen yet), when the Scan began, when the link
-/// dropped (the tear, then the drain, held while down), when it came back
-/// (the drain restoring).
-#[derive(Clone, Copy, Debug, Default)]
+/// The link's signatures (§5.1 Scan, §5.3 Glitch), never offline. Only a
+/// real loss plays them: a daemon reload is a planned handover (its
+/// sessions come back), so a link that goes down for one is given
+/// [`RELOAD_GRACE`]; any other drop [`LINK_GRACE`]. Back within it, nothing
+/// happened. Past it, the link is lost: the tear (at most once per
+/// [`FLASH_BUDGET`]), then the palette drains, held while down. Back after
+/// a loss, it restores and scans (the Scan also at most once per budget).
+/// The drain is a [`Tween`]: a drop mid-restore or a return mid-drain
+/// turns from where it is, never from an end.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Link {
+    /// Up last frame (none: not seen yet).
     pub up: Option<bool>,
+    /// Since when it is down, and whether for a reload (the reason it went
+    /// down with, kept until it is up again).
+    pub down: Option<(Instant, bool)>,
+    /// The loss was seen (past the grace).
+    pub lost: bool,
     pub scan: Option<Instant>,
+    /// The tear that is playing (the drop's time, for its seed).
     pub glitch: Option<Instant>,
-    pub restore: Option<Instant>,
+    /// The last tear and the last Scan (the budget).
+    pub tore: Option<Instant>,
+    pub scanned: Option<Instant>,
+    /// How drained the palette is (0..1).
+    pub drain: Option<Tween>,
 }
+
+impl Default for Link {
+    fn default() -> Self {
+        Link { up: None, down: None, lost: false, scan: None, glitch: None, tore: None, scanned: None, drain: None }
+    }
+}
+
+/// How long a non-reload drop may last before it is a loss.
+pub(crate) const LINK_GRACE: Duration = Duration::from_millis(1000);
+/// How long a reload may take before it is a loss (the client waits up to
+/// 10 s on the daemon's `retry_after`).
+pub(crate) const RELOAD_GRACE: Duration = Duration::from_millis(6000);
+/// At most one tear, and one Scan, per this.
+pub(crate) const FLASH_BUDGET: Duration = Duration::from_secs(5);
 
 /// A worker tab opened from a row by the pointer (§6.2): the tracer, a
 /// 2 × 24 px line in `you_bar` from where it was opened to the new tab's
@@ -464,30 +494,65 @@ pub(crate) const TRACER_LEN: f32 = 24.;
 pub(crate) const TEAR: [Duration; 2] = [Duration::from_millis(60), Duration::from_millis(40)];
 
 impl Link {
-    /// The connection is `up` this frame, at `now`, under `level`: what
-    /// came up scans (Full), what dropped glitches (Full, Reduced), what
-    /// came back restores.
-    pub(crate) fn see(&mut self, up: bool, now: Instant, level: Level) {
+    /// The connection is `up` this frame (`reload`: it went down for a
+    /// daemon reload), at `now`, under `fx`'s level.
+    pub(crate) fn see(&mut self, up: bool, reload: bool, fx: &Motion) {
+        let (now, level) = (fx.now(), fx.level());
+        if level == Level::Off {
+            *self = Link { up: Some(up), down: (!up).then_some((now, reload)), ..Link::default() };
+            return;
+        }
+        let budget = |at: Option<Instant>| at.is_none_or(|t| now.saturating_duration_since(t) >= FLASH_BUDGET);
         match (self.up.replace(up), up) {
-            (Some(false) | None, true) => {
-                self.scan = (level == Level::Full).then_some(now);
-                if self.glitch.take().is_some() {
-                    self.restore = (level != Level::Off).then_some(now);
+            // The first hello scans (outside the budget: a return after a
+            // loss soon after launch scans too).
+            (None, true) => {
+                if level == Level::Full {
+                    self.scan = Some(now);
+                }
+            }
+            (Some(false), true) => {
+                self.down = None;
+                if std::mem::take(&mut self.lost) {
+                    self.glitch = None;
+                    self.retarget(0., fx);
+                    if level == Level::Full && budget(self.scanned) {
+                        (self.scan, self.scanned) = (Some(now), Some(now));
+                    }
                 }
             }
             (Some(true), false) => {
-                self.glitch = (level != Level::Off).then_some(now);
-                (self.scan, self.restore) = (None, None);
+                self.down = Some((now, reload));
+                self.scan = None;
             }
             _ => {}
         }
-        if level == Level::Off {
-            *self = Link { up: self.up, ..Link::default() };
+        let Some((since, reload)) = self.down.filter(|_| !self.lost && self.up == Some(false)) else { return };
+        let grace = if reload { RELOAD_GRACE } else { LINK_GRACE };
+        if now.saturating_duration_since(since) < grace {
+            fx.want_at(since + grace);
+            return;
+        }
+        self.lost = true;
+        let tear = level == Level::Full && budget(self.tore);
+        if tear {
+            (self.glitch, self.tore) = (Some(now), Some(now));
+        }
+        self.retarget(1., fx);
+        if tear && let Some(d) = self.drain.as_mut() {
+            // The drain waits for the tear.
+            d.delay(TEAR[0] + TEAR[1]);
         }
     }
 
+    fn retarget(&mut self, to: f32, fx: &Motion) {
+        let now = fx.now();
+        let dur = if fx.level() == Level::Full { SLOW } else { QUICK };
+        self.drain.get_or_insert(Tween::rest(0., now)).retarget(to, now, dur, &ease::INOUT);
+    }
+
     /// The tear's frame now (0, 1), if one is on: Full only.
-    pub(crate) fn tear(&self, fx: &Motion) -> Option<usize> {
+    pub(crate) fn tear(&mut self, fx: &Motion) -> Option<usize> {
         let g = self.glitch.filter(|_| fx.level() == Level::Full)?;
         let gone = fx.now().saturating_duration_since(g);
         if gone < TEAR[0] {
@@ -497,22 +562,29 @@ impl Link {
             fx.want_at(g + TEAR[0] + TEAR[1]);
             Some(1)
         } else {
+            self.glitch = None;
             None
         }
     }
 
     /// How drained the palette is (0..1): from the end of the tear over
     /// `slow` `inout` (Reduced: no tear, `quick`), held while down; back
-    /// over the same once up again.
+    /// over the same once up again, from wherever it was.
     pub(crate) fn drain(&mut self, fx: &Motion) -> f32 {
-        if let Some(g) = self.glitch {
-            let tear = if fx.level() == Level::Full { TEAR[0] + TEAR[1] } else { Duration::ZERO };
-            return fx.shot(Some(g), tear, SLOW, &ease::INOUT, Kind::Fade);
+        if fx.level() == Level::Off {
+            self.drain = None;
+            return 0.;
         }
-        let Some(r) = self.restore else { return 0. };
-        let k = 1. - fx.shot(Some(r), Duration::ZERO, SLOW, &ease::INOUT, Kind::Fade);
-        if k <= 0. {
-            self.restore = None;
+        let now = fx.now();
+        let Some(d) = self.drain else { return 0. };
+        let k = d.sample(now, &ease::INOUT);
+        if d.running(now) {
+            match d.starts() {
+                Some(at) if at > now => fx.want_at(at),
+                _ => fx.want_frame(),
+            }
+        } else if k <= 0. {
+            self.drain = None;
         }
         k
     }
@@ -627,7 +699,17 @@ impl Tween {
     }
 
     pub(crate) fn running(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.at) < self.dur
+        now < self.at || now.saturating_duration_since(self.at) < self.dur
+    }
+
+    /// Its travel starts `by` later (it holds its start value until then).
+    pub(crate) fn delay(&mut self, by: Duration) {
+        self.at += by;
+    }
+
+    /// When its travel starts, if it has one.
+    pub(crate) fn starts(&self) -> Option<Instant> {
+        (!self.dur.is_zero()).then_some(self.at)
     }
 
     /// Toward `to` from its value at `now`, over `full` × the distance.
@@ -788,8 +870,22 @@ pub(crate) struct Motion {
 
 impl Default for Motion {
     fn default() -> Self {
-        Motion::new(Instant::now())
+        // Tests: each window's clock is its own, so is its epoch.
+        if cfg!(test) { Motion::new(Instant::now()) } else { Motion::new(epoch()) }
     }
+}
+
+/// The process's motion epoch: every 30 Hz decay tick (the app's and a
+/// scrollbar's) is on its grid, so they land in the same frames.
+pub(crate) fn epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// The first 30 Hz tick on [`epoch`]'s grid after `now`.
+pub(crate) fn next_tick(now: Instant) -> Instant {
+    let ticks = now.saturating_duration_since(epoch()).as_nanos() / DECAY_TICK.as_nanos() + 1;
+    epoch() + Duration::from_nanos((DECAY_TICK.as_nanos() * ticks) as u64)
 }
 
 impl Motion {
@@ -1400,11 +1496,11 @@ impl Motion {
         if s.frame + 1 < frame || !full {
             *s = Sprung { target, x0: 0., v0: 0., at: now, frame, response };
         }
-        s.response = response;
         if s.target != target {
             let (x, v) = s.state(now);
             *s = Sprung { target, x0: x + s.target - target, v0: v, at: now, frame, response };
         }
+        s.response = response;
         s.frame = frame;
         if s.settled(now) {
             return (target, false);
@@ -1429,7 +1525,7 @@ impl Motion {
 
     /// Value `key` eased toward `to` (a label's colour, as 0..1): over `up`
     /// (rising) or `down` (falling) for a whole 0 → 1, from where it is.
-    /// First drawn, not drawn last frame, or not Full: at `to`. Reduced:
+    /// First drawn, not drawn last frame, or Off: at `to`. Reduced: over
     /// at most [`QUICK`].
     pub(crate) fn ease_to(&self, key: u64, to: f32, up: Duration, down: Duration) -> f32 {
         let (frame, now) = (self.frame.get(), self.now());
@@ -1835,7 +1931,7 @@ mod tests {
     use gpui_kit::{Bounds, point, px, size};
 
     use super::{
-        BASE, BEAT, GLOW, HEAD_HOLD, Kind, Level, Lock, Motion, QUICK, SLIDE_CAP, SLOW, STAGGER, STAGGER_CAP, Setting, Slide, Tag, Tween,
+        BASE, BEAT, GLOW, HEAD_HOLD, Kind, LINK_GRACE, Level, Link, Lock, Motion, RELOAD_GRACE, QUICK, SLIDE_CAP, SLOW, STAGGER, STAGGER_CAP, Setting, Slide, Tag, Tween,
         ease, exit, stagger,
     };
 
@@ -1879,6 +1975,46 @@ mod tests {
         // Clocks still tick.
         m.tick_at(t0 + ms(1000));
         assert_eq!(m.demand(), (false, Some(t0 + ms(1000))));
+    }
+
+    /// The link (§5.3): a drop is nothing for its grace; past it the tear's
+    /// two frames (60 ms, 40 ms), then the drain over `slow`; a reload's
+    /// grace is longer; back after a loss, it restores and scans; a second
+    /// loss within the budget doesn't tear again.
+    #[test]
+    fn the_link_tears_after_its_grace() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        let mut l = Link::default();
+        let at = |m: &Motion, l: &mut Link, t: u64, up: bool, reload: bool| {
+            m.begin_frame(Level::Full, false, t0 + ms(t));
+            l.see(up, reload, m);
+            (l.tear(m), l.drain(m))
+        };
+        at(&m, &mut l, 0, true, false);
+        assert!(l.scan.is_some(), "the first hello scans");
+        assert_eq!(at(&m, &mut l, 1000, false, false), (None, 0.), "dropped: the grace");
+        assert_eq!(m.demand(), (false, Some(t0 + ms(1000) + LINK_GRACE)), "one timer, at the grace's end");
+        assert_eq!(at(&m, &mut l, 1999, false, false), (None, 0.));
+        assert_eq!(at(&m, &mut l, 2000, false, false), (Some(0), 0.), "lost: the tear's first frame");
+        assert_eq!(at(&m, &mut l, 2061, false, false), (Some(1), 0.), "its second; the drain waits");
+        assert_eq!(at(&m, &mut l, 2101, false, false).0, None);
+        assert_eq!(at(&m, &mut l, 2100 + 360, false, false), (None, 1.), "drained");
+        assert_eq!(at(&m, &mut l, 2600, true, false).1, 1., "back: from where it is");
+        assert!(l.scan.is_some(), "back after a loss: it scans");
+        assert_eq!(at(&m, &mut l, 2600 + 360, true, false).1, 0., "restored");
+        // A reload: nothing for RELOAD_GRACE, then a loss (7 s after the
+        // last tear: it tears).
+        let rg = RELOAD_GRACE.as_millis() as u64;
+        assert_eq!(at(&m, &mut l, 3000, false, true), (None, 0.));
+        assert_eq!(at(&m, &mut l, 3000 + rg - 1, false, true), (None, 0.), "reloading");
+        assert_eq!(at(&m, &mut l, 3000 + rg, false, true).0, Some(0), "a reload that never came back: lost");
+        // Back, and lost again within FLASH_BUDGET: it drains, no tear.
+        at(&m, &mut l, 9200, true, false);
+        at(&m, &mut l, 9300, false, false);
+        assert_eq!(at(&m, &mut l, 10_300, false, false).0, None, "within the budget: no second tear");
+        assert!(l.lost);
+        assert!(at(&m, &mut l, 11_000, false, false).1 > 0.99, "it drains all the same");
     }
 
     /// After every one-shot is over, a frame asks for nothing.

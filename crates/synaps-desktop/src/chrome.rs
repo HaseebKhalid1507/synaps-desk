@@ -138,6 +138,9 @@ pub(crate) struct RailCache {
     /// Rows on screen before the last splice: their key and top, in the
     /// list's content (Flip, motion.md §6.4).
     pub(crate) flip_from: Vec<(u64, f32)>,
+    /// In the frame of a splice, where each item will be laid out (the
+    /// list can't say until it lays out again): [`rail::flip_targets`].
+    pub(crate) targets: Option<Vec<Option<(f32, f32)>>>,
 }
 
 /// A row's key, if the item is a row.
@@ -179,7 +182,7 @@ pub(crate) const RAIL_TOUCH: u64 = 0x7AC3 << 48;
 pub(crate) const READOUT_Y: u64 = 0x7AC4 << 48;
 /// Flip's cap (fluid.md §2.3): a row that moved farther starts this far
 /// from its new place, on its true side.
-const FLIP_CAP: f32 = 160.;
+pub(crate) const FLIP_CAP: f32 = 160.;
 /// The numbers' and meters' keys (motion.md §6.6).
 const GLOW: u64 = 0x7AC5 << 48;
 const METER: u64 = 0x7AC6 << 48;
@@ -206,7 +209,9 @@ impl RailCache {
         self.minute
     }
 
-    pub(crate) fn refresh(&mut self, m: &Model, view: &rail::View, list: &ListState) {
+    /// `hold`: a row is held down; a reorder waits for its release (the
+    /// rows' content does not: [`rail::keep_order`]).
+    pub(crate) fn refresh(&mut self, m: &Model, view: &rail::View, list: &ListState, hold: bool) {
         let now = now_secs();
         // With a chip on, which rows show follows their states (the attached
         // session's run ahead of the poll), and so does which favourites a
@@ -233,11 +238,26 @@ impl RailCache {
         let rail = rail::build(m, view, now);
         let keys: Vec<u64> = rail.items.iter().map(|i| rail::item_key(&rail, i)).collect();
         let mut flip_from = Vec::new();
+        let mut targets = None;
         if let Some((range, count)) = rail::splice(&self.keys, &keys) {
-            // Flip: where the rows on screen were, before the splice.
+            if hold && !self.keys.is_empty() {
+                // Held: the old order, today's content; built again every
+                // frame until the release (no generation kept).
+                self.rail = rail::keep_order(&self.rail, &rail);
+                (self.generation, self.view, self.states) = (None, view.clone(), states);
+                return;
+            }
+            // Flip: where the rows on screen were, before the splice, and
+            // where every item will be after it, from the old layout.
+            let old: Vec<(u64, u8, Option<(f32, f32)>)> = (0..self.rail.items.len())
+                .map(|ix| (self.keys[ix], rail::item_kind(&self.rail.items[ix]), item_y(list, ix).map(|(y, h, _)| (y, h))))
+                .collect();
+            let new: Vec<(u64, u8)> = keys.iter().zip(&rail.items).map(|(&k, it)| (k, rail::item_kind(it))).collect();
+            targets = Some(rail::flip_targets(&old, &new, range.clone(), count));
             let top = list.logical_scroll_top().item_ix;
+            let scroll = -f32::from(list.scroll_px_offset_for_scrollbar().y);
             for ix in top..self.rail.items.len() {
-                let Some((y, _, scroll)) = item_y(list, ix) else { break };
+                let Some((y, _)) = old[ix].2 else { break };
                 if y - scroll > f32::from(list.viewport_bounds().size.height) {
                     break;
                 }
@@ -251,7 +271,7 @@ impl RailCache {
             // measures new ones up front only once told they need it.
             list.remeasure_items(start..start + count);
         }
-        *self = RailCache { generation: Some(m.rail_gen), minute: now / 60, view: view.clone(), states, rail, keys, flip_from };
+        *self = RailCache { generation: Some(m.rail_gen), minute: now / 60, view: view.clone(), states, rail, keys, flip_from, targets };
     }
 }
 
@@ -327,7 +347,11 @@ impl AppView {
         let h = self.height.max(1.);
         let mut out = div().absolute().top_0().left_0().size_full();
         if let (Some(frame), Some(at)) = (tear, self.link.glitch) {
-            let seed = vhash(&format!("{at:?}{frame}"));
+            let seed = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (at, frame).hash(&mut h);
+                h.finish()
+            };
             for (i, thick) in [2., 1., 3.].into_iter().enumerate() {
                 let y = ((seed >> (i * 16)) & 0xFFFF) as f32 / 65535. * (h - 3.);
                 out = out.child(div().absolute().left_0().right_0().top(px(y.floor())).h(px(thick)).bg(p.err_mark_ch));
@@ -594,6 +618,14 @@ impl AppView {
         let fx = &self.fx;
         let ix_of = |key: u64| rail.items.iter().position(|it| row_key(rail, it) == Some(key));
         let view_h = f32::from(list.viewport_bounds().size.height);
+        // Where an item is: in a splice's frame, where it will be laid out
+        // (never the list's bounds, wrong until it lays out again).
+        let targets = self.rail.targets.take();
+        let scroll = -f32::from(list.scroll_px_offset_for_scrollbar().y);
+        let item_y = |list: &ListState, ix: usize| match &targets {
+            Some(t) => t.get(ix).copied().flatten().map(|(y, h)| (y, h, scroll)),
+            None => item_y(list, ix),
+        };
         let mut out = std::mem::take(&mut self.rail_fx);
         out.offsets.clear();
         for (key, from) in std::mem::take(&mut self.rail.flip_from) {
@@ -942,7 +974,7 @@ impl AppView {
                     .items_baseline()
                     .gap(px(9.))
                     .cursor_pointer()
-                    .map(|d| self.lit(d, crate::app::tkey("favs-head", 0), (p.chrome, p.raised, p.press_ch), cx))
+                    .map(|d| self.lit(d, crate::motion::key(RAIL_TOUCH, crate::app::tkey("favs-head", 0)), (p.chrome, p.raised, p.press_ch), cx))
                     .child(div().absolute().left(px(7.)).top(px(19.)).child(glyph::draw(chevron, p.rest_mark)))
                     .child(display(label::FAVOURITES, size::D_S, p.dim_ch))
                     .child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_ch).child(fonts::JP_FAVOURITES))
@@ -978,7 +1010,7 @@ impl AppView {
                     .gap(px(10.))
                     .items_baseline()
                     .cursor_pointer()
-                    .map(|d| self.lit(d, crate::app::tkey("bucket", b as usize), (p.chrome, p.raised, p.press_ch), cx))
+                    .map(|d| self.lit(d, crate::motion::key(RAIL_TOUCH, crate::app::tkey("bucket", b as usize)), (p.chrome, p.raised, p.press_ch), cx))
                     .child(div().w(px(10.)).flex_none().child(mono(if *open { "−" } else { "+" }, size::META, color)))
                     .child(display(b.label(), size::D_S, color))
                     .child(div().flex_1())
@@ -997,7 +1029,7 @@ impl AppView {
                     .pb(px(8.))
                     .cursor_pointer()
                     .child(display(text, size::D_S, p.dim_ch))
-                    .map(|d| self.lit(d, crate::app::tkey("more", b as usize), (p.chrome, p.raised, p.press_ch), cx))
+                    .map(|d| self.lit(d, crate::motion::key(RAIL_TOUCH, crate::app::tkey("more", b as usize)), (p.chrome, p.raised, p.press_ch), cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.expanded |= b.bit();
                         cx.notify();
@@ -1650,8 +1682,7 @@ impl AppView {
             .gap(px(8.))
             .items_center()
             .cursor_pointer()
-            .when(follows, |d| d.bg(p.raised))
-            .map(|d| self.lit(d, crate::app::tkey("theme-config", 0), (p.chrome, p.raised, p.press_ch), cx))
+            .map(|d| self.lit_rest(d, crate::app::tkey("theme-config", 0), (p.chrome, p.raised, p.press_ch), follows.then_some(p.raised), cx))
             .child(div().size(px(12.)).flex_none().border_1().border_color(p.dim_ch))
             .child(display(label::SYNAPS_CONFIG, size::D_S, if follows { p.ink } else { p.prose_ch }).flex_none())
             .child(mono(format!("· {}", self.config_theme), size::META, p.dim_ch).flex_1().min_w_0().overflow_hidden().text_ellipsis())
@@ -1669,8 +1700,7 @@ impl AppView {
                     .gap(px(8.))
                     .items_center()
                     .cursor_pointer()
-                    .when(on, |d| d.bg(p.raised))
-                    .map(|d| self.lit(d, crate::app::tkey("theme", i), (p.chrome, p.raised, p.press_ch), cx))
+                    .map(|d| self.lit_rest(d, crate::app::tkey("theme", i), (p.chrome, p.raised, p.press_ch), on.then_some(p.raised), cx))
                     .child(
                         h_flex()
                             .flex_none()
@@ -1696,8 +1726,7 @@ impl AppView {
                 .gap(px(8.))
                 .items_center()
                 .cursor_pointer()
-                .when(off, |d| d.bg(p.raised))
-                .map(|d| self.lit(d, crate::app::tkey("accent-off", 0), (p.chrome, p.raised, p.press_ch), cx))
+                .map(|d| self.lit_rest(d, crate::app::tkey("accent-off", 0), (p.chrome, p.raised, p.press_ch), off.then_some(p.raised), cx))
                 .child(div().size(px(12.)).flex_none().border_1().border_color(p.dim_ch))
                 .child(display(label::THEME, size::D_S, if off { p.ink } else { p.prose_ch }).flex_1())
                 .child(mono(if off { "✓" } else { " " }, size::META, p.focus_ch).w(px(10.)))
@@ -1714,8 +1743,7 @@ impl AppView {
                     .gap(px(8.))
                     .items_center()
                     .cursor_pointer()
-                    .when(on, |d| d.bg(p.raised))
-                    .map(|d| self.lit(d, crate::app::tkey("preset", i), (p.chrome, p.raised, p.press_ch), cx))
+                    .map(|d| self.lit_rest(d, crate::app::tkey("preset", i), (p.chrome, p.raised, p.press_ch), on.then_some(p.raised), cx))
                     .child(div().size(px(12.)).flex_none().bg(rgb(hex)))
                     .child(display(name, size::D_S, if on { p.ink } else { p.prose_ch }).flex_1().min_w_0().overflow_hidden())
                     .child(mono(if on { "✓" } else { " " }, size::META, p.focus_ch).w(px(10.)))
@@ -1846,16 +1874,16 @@ mod tests {
         let list = ListState::new(0, ListAlignment::Top, px(300.));
         let shows = |c: &RailCache| c.rail.items.iter().any(|i| matches!(i, Item::Row(r) if &*c.rail.rows[*r].title == "Relay"));
         let mut cache = RailCache::default();
-        cache.refresh(&m, &view, &list);
+        cache.refresh(&m, &view, &list, false);
         assert!(!shows(&cache), "folded, at rest: under the head's count only");
         let event = |event: SessionEvent| Event::session(1, "s", 0, event, std::sync::Arc::new(Value::Null));
         let before = m.rail_gen;
         m.apply(event(SessionEvent::TurnStarted { turn_baseline: 0, trigger: "user".into(), user_text: None }));
         assert_eq!(m.rail_gen, before, "a run starting is no list change");
-        cache.refresh(&m, &view, &list);
+        cache.refresh(&m, &view, &list, false);
         assert!(shows(&cache), "running: it shows under the folded head");
         m.apply(event(SessionEvent::Idle));
-        cache.refresh(&m, &view, &list);
+        cache.refresh(&m, &view, &list, false);
         assert!(!shows(&cache), "done: folded again");
     }
 

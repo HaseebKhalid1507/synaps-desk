@@ -102,7 +102,15 @@ const GROUPS: [&str; 7] = [
 
 /// A shown value's hash, whether it was being sent, and when its save's
 /// afterglow begins.
-type Saved = (u64, bool, Option<Instant>);
+/// The segmented control's bar: its x and width springs, and where the
+/// control was laid out (each a key space of its own).
+const SEG_X: u64 = 0x7AE0 << 48;
+const SEG_W: u64 = 0x7AE1 << 48;
+const SEG_AT: u64 = 0x7AE2 << 48;
+
+/// A shown value: its hash, whether it was being sent, when its afterglow
+/// begins, and the THIS APP write it waits for (its generation).
+type Saved = (u64, bool, Option<Instant>, Option<u64>);
 
 #[derive(Default)]
 pub(crate) struct SettingsUi {
@@ -134,6 +142,10 @@ pub(crate) struct SettingsUi {
     /// flush writes it again with what came after, and the late write
     /// then changes nothing (checked under the settings file's lock).
     app_writing: Option<(AppBatch, Arc<AtomicBool>)>,
+    /// THIS APP changes so far, and the last that a write saved (with when
+    /// it finished): a value's afterglow starts there, never on a guess.
+    app_gen: u64,
+    pub(crate) app_wrote: Option<(u64, Instant)>,
 }
 
 type AppBatch = BTreeMap<&'static str, Option<String>>;
@@ -221,6 +233,7 @@ impl AppView {
             return;
         }
         self.settings.app_note = None;
+        self.settings.app_gen += 1;
         self.settings.app_dirty.insert(key, value);
         self.arm_app_save(cx);
     }
@@ -240,6 +253,7 @@ impl AppView {
         let keys = std::mem::take(&mut self.settings.app_dirty);
         let Some(path) = theme::settings_path().filter(|_| !keys.is_empty()) else { return };
         let stop = Arc::new(AtomicBool::new(false));
+        let generation = self.settings.app_gen;
         self.settings.app_writing = Some((keys.clone(), stop.clone()));
         cx.spawn(async move |this, cx| {
             let saved = cx
@@ -251,10 +265,11 @@ impl AppView {
                 .await;
             let _ = this.update(cx, |v, cx| {
                 v.settings.app_writing = None;
-                if let Err((keys, e)) = saved {
-                    v.settings.app_note = Some((keys, format!("not saved: {e}")));
-                    v.views_changed(cx);
+                match saved {
+                    Err((keys, e)) => v.settings.app_note = Some((keys, format!("not saved: {e}"))),
+                    Ok(()) => v.settings.app_wrote = Some((generation, v.fx.now())),
                 }
+                v.views_changed(cx);
             });
         })
         .detach();
@@ -369,19 +384,21 @@ impl AppView {
             // `raised` fill moves at once.
             let sel = opts.iter().position(|o| current == Some(o.as_ref()));
             let fx = &self.fx;
-            let base = crate::app::tkey(id, 900);
+            // Each in a key space of its own (motion.md §2.2).
+            let h = crate::app::tkey(id, 900);
+            let (base, bar_x, bar_w, at) = (h, crate::motion::key(SEG_X, h), crate::motion::key(SEG_W, h), crate::motion::key(SEG_AT, h));
             let places = self.seg_places.borrow();
-            let origin = places.get(&(base | 3)).map(|p| p.0);
+            let origin = places.get(&at).map(|p| p.0);
             let place = |i: usize| places.get(&crate::app::tkey(id, i)).zip(origin).map(|(&(x, w), o)| (x - o, w));
             let moved = sel.and_then(|s| fx.changed(base, s as u64)).is_some_and(|(_, at)| at == fx.now());
             let mut bar = None;
             if let Some((x, w)) = sel.and_then(place) {
-                if moved && let (Some(x0), Some(w0)) = (fx.spring_at(base | 1), fx.spring_at(base | 2)) {
-                    fx.spring_jump(base | 1, x0, x, crate::motion::SNAP_RESPONSE);
-                    fx.spring_jump(base | 2, w0, w, crate::motion::SNAP_RESPONSE);
+                if moved && let (Some(x0), Some(w0)) = (fx.spring_at(bar_x), fx.spring_at(bar_w)) {
+                    fx.spring_jump(bar_x, x0, x, crate::motion::SNAP_RESPONSE);
+                    fx.spring_jump(bar_w, w0, w, crate::motion::SNAP_RESPONSE);
                 }
                 let ((bx, mx), (bw, mw)) =
-                    (fx.spring_held(base | 1, x, crate::motion::SNAP_RESPONSE), fx.spring_held(base | 2, w, crate::motion::SNAP_RESPONSE));
+                    (fx.spring_held(bar_x, x, crate::motion::SNAP_RESPONSE), fx.spring_held(bar_w, w, crate::motion::SNAP_RESPONSE));
                 if mx || mw {
                     bar = Some((bx, bw));
                 }
@@ -397,7 +414,7 @@ impl AppView {
                     let sink = sink.clone();
                     canvas(
                         move |b, _, _| {
-                            sink.borrow_mut().insert(base | 3, (f32::from(b.origin.x), f32::from(b.size.width)));
+                            sink.borrow_mut().insert(at, (f32::from(b.origin.x), f32::from(b.size.width)));
                         },
                         |_, _, _, _| {},
                     )
@@ -441,6 +458,9 @@ impl AppView {
                         })
                         .cursor_pointer()
                         .when(!on, |d| d.hover(|d| d.bg(p.raised)))
+                        // Pressed (fluid.md §3.9): state, in the frame the
+                        // pointer goes down.
+                        .active(|d| d.bg(p.press_ch))
                         .child(mono(o, 13., color))
                         .on_click(cx.listener(move |this, _, _, cx| this.settings_pick(what, &v, cx))),
                 );
@@ -497,9 +517,10 @@ impl AppView {
     /// A number or text field: its value in a box; click to edit (Enter
     /// saves, Esc leaves it).
     /// A shown value's afterglow once saved (motion.md §6.8: the
-    /// confirmation, no toast): a THIS APP value [`crate::app::SAVE_DELAY`]
-    /// after it changed (its write), a daemon one when its write is
-    /// answered. Never on first sight. Its `k`.
+    /// confirmation, no toast): a THIS APP value when the write that saved
+    /// it finished (none if it failed), a daemon one when its write is
+    /// answered. Never on first sight: what changed while Settings was not
+    /// shown is history (the map is cleared when it hides). Its `k`.
     pub(crate) fn saved_glow(&self, id: &SharedString, value: &str, sending: bool) -> f32 {
         let hash = {
             use std::hash::{Hash, Hasher};
@@ -509,21 +530,27 @@ impl AppView {
         };
         let now = self.fx.now();
         let mut saved = self.settings.saved.borrow_mut();
+        let wrote = self.settings.app_wrote;
         let since = match saved.get(id).copied() {
-            Some((was, was_sending, _)) if (was, was_sending) != (hash, sending) => {
-                let since = if sending {
-                    None
-                } else if was_sending {
-                    Some(now)
-                } else {
-                    Some(now + crate::app::SAVE_DELAY)
+            Some((was, was_sending, _, _)) if (was, was_sending) != (hash, sending) => {
+                let (since, wait) = match (sending, was_sending) {
+                    (true, _) => (None, None),
+                    (false, true) => (Some(now), None),
+                    (false, false) => (None, Some(self.settings.app_gen)),
                 };
-                saved.insert(id.clone(), (hash, sending, since));
+                saved.insert(id.clone(), (hash, sending, since, wait));
                 since
             }
-            Some((_, _, since)) => since,
+            Some((h, s, None, Some(g))) => match wrote.filter(|&(w, _)| w >= g) {
+                Some((_, at)) => {
+                    saved.insert(id.clone(), (h, s, Some(at), None));
+                    Some(at)
+                }
+                None => None,
+            },
+            Some((_, _, since, _)) => since,
             None => {
-                saved.insert(id.clone(), (hash, sending, None));
+                saved.insert(id.clone(), (hash, sending, None, None));
                 None
             }
         };

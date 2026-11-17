@@ -1663,8 +1663,22 @@ impl AppView {
     /// A control's hover fill (fluid.md §3.9): on `ground`, toward `hover`
     /// as the pointer comes (over `hover_in`) and back as it goes (over
     /// `hover_out`); held, `press`. Where `.hover(|d| d.bg(hover))` was.
-    pub(crate) fn lit(&self, el: Stateful<Div>, key: u64, (ground, hover, press): (Hsla, Hsla, Hsla), cx: &Context<Self>) -> Stateful<Div> {
-        let (fill, _) = self.fx.fill(key, ground, None, hover, press);
+    pub(crate) fn lit(&self, el: Stateful<Div>, key: u64, roles: (Hsla, Hsla, Hsla), cx: &Context<Self>) -> Stateful<Div> {
+        self.lit_rest(el, key, roles, None, cx)
+    }
+
+    /// [`AppView::lit`] for a control with a fill of its own at rest (a
+    /// selected picker row's `raised`): its hover starts from that, not
+    /// from the ground.
+    pub(crate) fn lit_rest(
+        &self,
+        el: Stateful<Div>,
+        key: u64,
+        (ground, hover, press): (Hsla, Hsla, Hsla),
+        rest: Option<Hsla>,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let (fill, _) = self.fx.fill(key, ground, rest, hover, press);
         Self::touch(el.when_some(fill, |d, c| d.bg(c)), key, cx)
     }
 
@@ -2371,12 +2385,16 @@ impl AppView {
     fn overlay_exits(&mut self) {
         let now = self.fx.now();
         if self.menu.is_none() {
-            if let Some(m) = self.menu_was.take().filter(|m| m.born.is_some()) {
+            // A row's menu has no exit drawn (it is anchored to the row).
+            if let Some(m) = self.menu_was.take().filter(|m| m.born.is_some() && matches!(m.at, crate::menu::At::Point(_))) {
                 self.menu_leaving = Some((m, now));
             }
         } else {
             self.menu_leaving = None;
-            self.menu_was = self.menu.as_ref().map(|m| m.0.clone());
+            // Kept once per menu opened, not cloned every frame.
+            if self.menu_was.as_ref().map(|m| m.born) != self.menu.as_ref().map(|m| m.0.born) {
+                self.menu_was = self.menu.as_ref().map(|m| m.0.clone());
+            }
         }
         if self.menu_leaving.as_ref().is_some_and(|(_, at)| self.fx.leave(*at).is_none()) {
             self.menu_leaving = None;
@@ -2387,7 +2405,9 @@ impl AppView {
             }
         } else {
             self.smenu_leaving = None;
-            self.smenu_was = self.smenu.as_ref().map(|m| m.0.clone());
+            if self.smenu_was.as_ref().map(|m| m.born) != self.smenu.as_ref().map(|m| m.0.born) {
+                self.smenu_was = self.smenu.as_ref().map(|m| m.0.clone());
+            }
         }
         if self.smenu_leaving.as_ref().is_some_and(|(_, at)| self.fx.leave(*at).is_none()) {
             self.smenu_leaving = None;
@@ -2424,7 +2444,8 @@ impl AppView {
             expanded: self.expanded,
             favs_closed: self.panels.favs_closed,
         };
-        self.rail.refresh(&self.model, &view, &self.rail_list);
+        let hold = self.fx.held(crate::chrome::RAIL_TOUCH);
+        self.rail.refresh(&self.model, &view, &self.rail_list, hold);
         self.find = view.find;
     }
 
@@ -5673,6 +5694,15 @@ impl Fill {
             Fill::Warn => (p.warn_fill, p.warn_hi),
         }
     }
+
+    /// Pressed (fluid.md §3.9): state, drawn in the frame the pointer goes
+    /// down, at every motion level.
+    fn press(self, p: &Palette) -> Hsla {
+        match self {
+            Fill::Btn => p.btn_press,
+            Fill::Warn => p.warn_press,
+        }
+    }
 }
 
 /// A filled button (AUTHORIZE, SEND, design.md §8.12): its label is the
@@ -5693,7 +5723,7 @@ pub(crate) fn fbtn_key(
     p: &Palette,
     m: &Metrics,
 ) -> Stateful<Div> {
-    let (bg, hi) = fill.roles(p);
+    let ((bg, hi), down) = (fill.roles(p), fill.press(p));
     let fg = if enabled { p.chrome } else { p.dim };
     div()
         .id(id)
@@ -5704,7 +5734,7 @@ pub(crate) fn fbtn_key(
         .flex_none()
         .gap(px(10.))
         .items_center()
-        .when(enabled, |d| d.bg(bg).cursor_pointer().hover(move |d| d.bg(hi)))
+        .when(enabled, |d| d.bg(bg).cursor_pointer().hover(move |d| d.bg(hi)).active(move |d| d.bg(down)))
         .when(!enabled, |d| d.child(div().absolute().inset_0().border_1().border_color(p.edge)))
         .child(display(text, m.label, fg))
         .when_some(key, |d, k| d.child(mono(k, m.meta, fg)))
@@ -5899,13 +5929,17 @@ impl Render for AppView {
         self.rename_when_shown(window, cx);
         // A reorder waits while a rail row is held (motion.md §6.4): a row
         // never moves away from a click. Its release draws.
-        if !self.fx.held(crate::chrome::RAIL_TOUCH) {
-            self.refresh_rail();
-        }
+        self.refresh_rail();
         self.rail_motion();
         self.overlay_exits();
         if let Some(b) = self.bench.as_mut() {
             b.on_render(&self.list, window);
+        }
+        // Settings hidden: what it showed is forgotten, so a value changed
+        // meanwhile (Ctrl+=, the top bar's THEME) is history when it opens
+        // again, not a save to glow for.
+        if self.model.tabs.view() != Some(crate::tabs::Kind::Settings) {
+            self.settings.saved.get_mut().clear();
         }
         // What moves in Settings or Usage (a segment's bar, a chart's
         // reveal) draws their pane again.
@@ -5920,7 +5954,7 @@ impl Render for AppView {
         // the palette restores. Settings and Usage draw with it.
         if !self.synthetic {
             let up = matches!(self.model.conn, ConnState::Connected(_));
-            self.link.see(up, self.fx.now(), self.fx.level());
+            self.link.see(up, self.model.reload, &self.fx);
         }
         let drain = self.link.drain(&self.fx);
         let scheme = cx.global::<theme::Scheme>();
@@ -5937,11 +5971,18 @@ impl Render for AppView {
             None => 0.,
         };
         // A theme change cross-fades over `slow` `inout` (motion.md §6.8),
-        // from the app's frame; Settings and Usage draw with it.
+        // from the app's frame; Settings and Usage draw with it. Sampled as
+        // `Spatial` (a colour, but Reduced wants it at once: a level change
+        // mid-fade ends it); its last frame syncs the kit and text views.
         if let Some((at, _)) = cx.global::<theme::Scheme>().fading() {
             let at = at.unwrap_or(self.fx.now());
             let t = self.fx.shot(Some(at), Duration::ZERO, crate::motion::SLOW, &crate::motion::ease::INOUT, crate::motion::Kind::Spatial);
-            cx.global::<theme::Scheme>().fade(at, t);
+            if cx.global::<theme::Scheme>().fade(at, t) {
+                cx.defer(|cx| {
+                    theme::settle_fade(cx);
+                    cx.refresh_windows();
+                });
+            }
             if let Some(k) = self.model.tabs.view() {
                 let pane = self.pane(k).clone();
                 cx.defer(move |cx| pane.update(cx, |_, cx| cx.notify()));
