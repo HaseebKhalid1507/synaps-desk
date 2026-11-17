@@ -90,3 +90,49 @@ fresh transcript at Full:
   runs (3–5 against under 2).
 - `hover_sweep` and `cross_fade` run at display rate while they move: about 190 and 105 ms/s for
   those 1–2 s. Both stop with the motion, and the following case starts at 0 presents.
+
+## r4: on the merged tree (main `e2db53f` + Q4, rebased), gates 3, 4 and 5 against main `e2db53f`
+
+Same harness as r2: headless gamescope at 144 Hz, 1920×1080, one run at a time, alternating main → Q4.
+Each run starts after the 1-minute load average falls under 6 (it was 1.4–5.8). Script: `r4/run.sh`. Raw: `r4/*.json`.
+- **main:** `e2db53f`, built from a detached worktree.
+- **Q4:** this branch rebased on it, at `fe27428`.
+- **`--bench-motion`:** main's is Q1's (idle, beat, 25 glyphs, Off: 31 s). Q4's adds its own cases (151 s).
+
+`--bench-motion`, Q4 (two runs; presents / app frames / CPU ms/s):
+
+| case | what | run 1 | run 2 |
+|---|---|---|---|
+| `idle_10s` | nothing running, 10 s | 0 / 0 / 2.73 | 0 / 0 / 1.36 |
+| `beat` | a tool runs, 6 s (the 8 Hz beat) | 48 / 0 / 12.31 | 48 / 0 / 11.71 |
+| `beat_25_30s` | 25 glyphs scanning, 30 s | 240 / 0 / 12.6 | 240 / 0 / 12.19 |
+| `beat_motion_off` | Motion Off, a tool running, 4 s | 0 / 0 / 1.38 | 0 / 0 / 2.19 |
+| `idle_10s_after_beat` | nothing running again, 10 s | 0 / 0 / 1.79 | 0 / 0 / 1.74 |
+| `idle_30s_prompt` | **gate 3**: a prompt pending + a demoted worker, 30 s | **0 / 0** / 1.6 | **0 / 0** / 1.51 |
+| `held_drain_10s` | the link down, drained and held | 20 / 20 / 6.07 | 20 / 20 / 6.77 |
+| `hover_sweep` | the pointer down a 12-row rail, 2.4 s | 234 / 234 / 219.9 | 232 / 232 / 229.99 |
+| `cross_fade` | a dark → dark theme change, 1 s | 54 / 54 / 115.51 | 54 / 54 / 115.71 |
+| `load_5x5_30s` | **gate 4**: 5 sessions × 5 workers, 30 s | **240** / 30 / **14.73** | **240** / 30 / **14.31** |
+
+main's `--bench-motion` (Q1's cases), for comparison: idle 10 s 0 / 0 (1.87, 1.76 ms/s); beat 48 presents (10.7,
+11.84 ms/s); 25 glyphs 48 presents in 6 s (11.65, 11.39 ms/s); Off 0.
+
+- **Gate 3 (idle = 0 presents): pass.** `idle_30s_prompt` gives 0 presents and 0 app frames over 30 s, in both runs. The JSON confirms the scene: `prompt_pending: true` (a confirm prompt, after its three breaths) and `demoted_worker: true` (a re-attach's "started").
+- **Gate 4 (under load): pass.**
+  - **The scene:** `load_5x5_30s` is five busy sessions in the rail, each with `subagents_running: 5`. The shown session's five workers run in its tray and transcript (`workers_running: 5`, 10 beat sites). A client only sees the other sessions' workers as their rail rows and counts, so this is the whole 5 × 5 as the desktop draws it.
+  - **Presents:** 240 in 30 s, which is 8.0/s (≤ 8 allowed). That is the single 8 Hz beat.
+  - **CPU:** 14.3–14.7 ms/s, 1.4–1.5 % of a core (≤ 6 % allowed).
+  - **App frames:** 30, the tray's clocks ticking once a second.
+  - **Not covered:** the "one sweep" row is Q3's.
+- **Gate 5 (memory): pass.** `--bench` `mem_end` is taken after 2,000 rows of history, a scroll and two panel drags:
+
+| | main r1 | main r2 | Q4 r1 | Q4 r2 | Q4 vs main (means) |
+|---|---|---|---|---|---|
+| RSS idle / end (MiB) | 169.6 / 234.1 | 169.4 / 234.4 | 169.5 / 234.5 | 169.2 / 234.3 | −0.1 % / **+0.09 %** |
+| PSS idle / end (MiB) | 92.0 / 156.3 | 91.8 / 156.7 | 91.8 / 156.7 | 91.5 / 156.5 | −0.3 % / **+0.08 %** |
+| end, GPU-driver mappings apart: RSS / PSS (MiB) | 156.8 / 126.5 | 157.1 / 126.8 | 157.3 / 126.9 | 157.0 / 126.7 | +0.12 % / +0.08 % |
+
+  - **After the 5 × 5 run:** main's motion bench has no 5 × 5 case, so there's no like-for-like figure. Q4's RSS at the end of its 151 s motion bench (after the 5 × 5) is 199.0 / 200.6 MiB. main's, after its 31 s bench, is 196.8 / 197.0 MiB: +1.5 %, and Q4 ran five more scenes.
+- **Rendering under `--bench`** (two runs each):
+  - **Streaming:** main 142.9 fps (7 and 5 frames dropped), draw p99 3.64 / 4.06 ms. Q4 142.9 / 143.1 fps (5 and 6 dropped), p99 4.64 / 4.40 ms.
+  - **Scroll:** draw p99 main 3.40 / 3.03 ms, Q4 3.32 / 3.00 ms.
