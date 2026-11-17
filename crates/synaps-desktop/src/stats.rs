@@ -1,4 +1,4 @@
-//! The numbers the session header and the right-hand panel show, all from
+//! The numbers the composer foot and the right-hand panel show, all from
 //! the daemon: the runtime view (`Attached.view`, `setting_changed`), the
 //! conversation's token totals and cost (`Attached.conversation`, every
 //! `Conversation` digest), the last model call's prompt size (`Usage`, for
@@ -57,7 +57,7 @@ impl Tokens {
     }
 }
 
-/// `RuntimeView`'s fields the header, the gauge and Settings' THIS
+/// `RuntimeView`'s fields the foot, the gauge and Settings' THIS
 /// SESSION use.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RuntimeInfo {

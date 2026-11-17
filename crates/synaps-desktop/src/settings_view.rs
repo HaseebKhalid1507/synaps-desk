@@ -17,7 +17,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{AppView, display, mono};
-use crate::chrome::glyph;
 use crate::dash::Fail;
 use crate::model::ConnState;
 use crate::rail::State;
@@ -460,7 +459,7 @@ impl AppView {
             .justify_end()
             .max_w(px(CONTROL + 120.))
             .child(mono(value, 12.5, p.dim).overflow_hidden().text_ellipsis())
-            .child(glyph(State::Locked, p))
+            .child(crate::glyph::session_mark(State::Locked, crate::glyph::Ground::Canvas, p))
             .into_any_element()
     }
 
@@ -1153,7 +1152,7 @@ impl AppView {
                         .child(sans(d.label, 14., 22., p.ink).flex_none())
                         .child(mono(d.key, 12., p.dim).flex_1().min_w_0().overflow_hidden().text_ellipsis())
                         .child(mono(value, 12.5, p.dim).flex_none().max_w(px(220.)).overflow_hidden().text_ellipsis())
-                        .child(glyph(State::Locked, p))
+                        .child(crate::glyph::session_mark(State::Locked, crate::glyph::Ground::Canvas, p))
                         .into_any_element(),
                 );
             }

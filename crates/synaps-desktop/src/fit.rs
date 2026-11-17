@@ -3,11 +3,10 @@
 //! where the form changes. The card and the composer are drawn with these
 //! sizes, so the thresholds hold for what is on screen.
 //!
-//! - **Full:** the 52-px top bar, the two-line session header, a well of
-//!   up to 12 lines on the authorization card.
-//! - **Short** ([`short_below`]): a 40-px top bar, the one-row header, a
-//!   well of up to 8 lines, the card's lead on one line, less padding
-//!   round the composer.
+//! - **Full:** the 52-px top bar, a well of up to 12 lines on the
+//!   authorization card.
+//! - **Short** ([`short_below`]): a 40-px top bar, a well of up to 8
+//!   lines, the card's lead on one line, less padding round the composer.
 //! - **Cramped** ([`cramped_below`]): short, and the card folds its lead
 //!   into its title row and pads less; the composer puts SEND beside the
 //!   text. A 3-line well, AUTHORIZE and the composer fit a 420-px window
@@ -19,6 +18,9 @@
 //! counts too: it moves the cramped line up, and in a cramped window the
 //! well gives way to it down to one line, so SEND stays on screen in a
 //! 420-px window at every text step with all of it open.
+//!
+//! The tab strip is the same in every form, and nothing sits between it
+//! and the transcript (the session header is gone: design.md §8.14).
 
 use crate::chrome::{TOP, TOP_SHORT};
 use crate::tabstrip::TAB_H;
@@ -35,9 +37,8 @@ pub(crate) const WELL_MAX_SHORT: f32 = 8.;
 /// The composer's text grows to this many rows, fewer when the window has
 /// no room for them under the card ([`composer_rows`]).
 pub(crate) const COMPOSER_ROWS: usize = 6;
-/// The session header, its hairline included: two lines, and one row.
-pub(crate) const HEADER_FULL: f32 = 92.;
-pub(crate) const HEADER_SHORT: f32 = 37.;
+/// The NEEDS YOU stub's gap above it (the dock gap; design.md §8.17).
+pub(crate) const STUB_GAP: f32 = 8.;
 /// What a full window keeps for the transcript under a 12-line card (at
 /// 16 px; scaled with the text).
 const LIST_ROOM: f32 = 55.;
@@ -79,17 +80,17 @@ pub(crate) fn notice_line(m: &Metrics) -> f32 {
 /// notice line under the card: the last error and, cramped, the draft's
 /// note (the composer keeps SEND beside its text).
 ///
-/// Drawn, not deciding the form: the breadcrumb over a worker's view
-/// (`crumb`; that view draws no card, whose least height the form keeps
-/// and the crumb is under) and the tray's rows over the composer (`tray`,
-/// [`tray_rows`]: what the room leaves).
+/// Drawn, not deciding the form: the NEEDS YOU stub over a worker's view
+/// while its session waits on a prompt (`stub`; that view draws no card,
+/// whose least height the form keeps and the stub is under) and the tray's
+/// rows over the composer (`tray`, [`tray_rows`]: what the room leaves).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Extras {
     pub(crate) naming: bool,
     pub(crate) naming_notes: u8,
     pub(crate) error: bool,
     pub(crate) note: bool,
-    pub(crate) crumb: bool,
+    pub(crate) stub: bool,
     pub(crate) tray: u8,
 }
 
@@ -102,9 +103,9 @@ impl Extras {
     pub(crate) fn height(&self, m: &Metrics, form: Form) -> f32 {
         let notes = if form == Form::Cramped { 0. } else { f32::from(self.naming_notes) * (NAMING_GAP + NAMING_NOTE) };
         let naming = if self.naming { naming_h(form) + notes } else { 0. };
-        let crumb = if self.crumb { crumb_h(form) } else { 0. };
+        let stub = if self.stub { stub_h(m) } else { 0. };
         let tray = if self.tray > 0 { tray_box(form) + f32::from(self.tray) * tray_row(m) } else { 0. };
-        naming + crumb + tray + if self.notice(form) { NOTICE_TOP + notice_line(m) } else { 0. }
+        naming + stub + tray + if self.notice(form) { NOTICE_TOP + notice_line(m) } else { 0. }
     }
 
     /// The fewest lines the well keeps in `form`: one when they take room
@@ -121,9 +122,9 @@ pub(crate) enum Form {
     Cramped,
 }
 
-/// The breadcrumb bar over a worker's view, its hairline included.
-pub(crate) fn crumb_h(form: Form) -> f32 {
-    if form == Form::Cramped { 29. } else { 35. }
+/// The NEEDS YOU stub and its gap: a row (32·r) and the dock gap.
+pub(crate) fn stub_h(m: &Metrics) -> f32 {
+    m.row + STUB_GAP
 }
 
 /// One tray row (a worker): a compact row.
@@ -283,15 +284,15 @@ impl Composer {
     }
 }
 
-/// The top bar and the session header in `form`.
+/// The top bar and the tab strip in `form`.
 pub(crate) fn above(form: Form) -> f32 {
     match form {
-        Form::Full => TOP + TAB_H + HEADER_FULL,
-        _ => TOP_SHORT + TAB_H + HEADER_SHORT,
+        Form::Full => TOP + TAB_H,
+        _ => TOP_SHORT + TAB_H,
     }
 }
 
-/// The window height `form` needs at `m`: the bars, the header, `ex`, a
+/// The window height `form` needs at `m`: the bars, `ex`, a
 /// card with its least well ([`Extras::well_min`]) and a one-line
 /// composer (no transcript).
 pub(crate) fn need(m: &Metrics, form: Form, ex: Extras) -> f32 {
@@ -300,13 +301,12 @@ pub(crate) fn need(m: &Metrics, form: Form, ex: Extras) -> f32 {
 
 /// The centre pane's height (under the full top bar) below which the
 /// window is short: the full chrome, a 12-line card and the composer would
-/// leave the transcript under 55 px. 740 at 16 px (a 792-px window: every
-/// 800-px-class laptop screen is short, a 900-px one is not); larger with
-/// larger text, and never smaller than at 16 px.
+/// leave the transcript under 55 px. 648 at 16 px (a 700-px window: a
+/// 1280×720 screen is full); larger with larger text, and never smaller
+/// than at 16 px.
 pub(crate) fn short_below(m: &Metrics) -> f32 {
     let m = if m.r < 1. { Metrics::at(DEFAULT_TEXT) } else { *m };
-    (TAB_H + HEADER_FULL + Card::of(&m, Form::Full).height(WELL_MAX) + Composer::of(&m, Form::Full).height(1) + (LIST_ROOM * m.r).round())
-        .floor()
+    (TAB_H + Card::of(&m, Form::Full).height(WELL_MAX) + Composer::of(&m, Form::Full).height(1) + (LIST_ROOM * m.r).round()).floor()
 }
 
 /// ...below which it is cramped: the short form would not fit a 3-line
@@ -531,20 +531,23 @@ mod tests {
         l.form()
     }
 
-    /// The 16-px figures the short window was introduced with.
+    /// The 16-px figures: the short window as introduced, less the
+    /// session header's 92 px (short) and 37 px (cramped), design.md §8.14.
     #[test]
     fn the_16_px_budget() {
         let m = Metrics::at(16);
-        assert_eq!(short_below(&m), 740.);
+        assert_eq!(short_below(&m), 648.);
         // The card's box with 8 lines: 330 px and the title's fraction (as drawn).
         assert_eq!(Card::of(&m, Form::Full).boxed(8.).floor(), 330.);
         assert_eq!(Composer::of(&m, Form::Full).height(1), 139.);
         assert_eq!(Composer::of(&m, Form::Short).height(1), 125.);
-        assert_eq!(cramped_below(&m, Extras::default()).floor(), 415.);
-        // Cramped at 22 px: 406 of the smallest window's 420.
-        assert_eq!(need(&Metrics::at(22), Form::Cramped, Extras::default()), 406.);
+        assert_eq!(cramped_below(&m, Extras::default()).floor(), 378.);
+        // A 1280×720 window is full; 700 is the first short height.
+        assert_eq!(short_below(&m) + TOP, 700.);
+        // Cramped at 22 px: 369 of the smallest window's 420.
+        assert_eq!(need(&Metrics::at(22), Form::Cramped, Extras::default()), 369.);
         // Smaller text never makes a window less short than at 16 px.
-        assert_eq!(short_below(&Metrics::at(14)), 740.);
+        assert_eq!(short_below(&Metrics::at(14)), 648.);
     }
 
     /// M1: at every text step, every window height from the smallest up:
@@ -574,26 +577,27 @@ mod tests {
                 assert!(composer_rows(&m, f, window, true, Extras::default()) >= 1);
             }
         }
-        // Step 22: full from 1018 px (792 at 16).
+        // Step 22: full from 926 px (700 at 16).
         let m = Metrics::at(22);
-        assert_eq!(short_below(&m) + TOP, 1018.);
-        assert_eq!(form(Layout::of(1000., 1018. - TOP, &m, Extras::default())), Form::Full);
-        assert_eq!(form(Layout::of(1000., 1017. - TOP, &m, Extras::default())), Form::Short);
+        assert_eq!(short_below(&m) + TOP, 926.);
+        assert_eq!(form(Layout::of(1000., 926. - TOP, &m, Extras::default())), Form::Full);
+        assert_eq!(form(Layout::of(1000., 925. - TOP, &m, Extras::default())), Form::Short);
         assert_eq!(form(Layout::of(1000., 420. - TOP, &m, Extras::default())), Form::Cramped);
     }
 
-    /// The well shows whole lines: 7 at 16 px in the smallest window, 3 at
-    /// 22 px; 8 in a 600-px window (short), 12 in a full one.
+    /// The well shows whole lines: 8 (its most) at 16 px in the smallest
+    /// window, 4 at 22 px; 8 in a 600-px window (short), 12 in a full one.
+    /// (7 and 3 with the session header.)
     #[test]
     fn the_well_shows_whole_lines() {
         let m = Metrics::at(16);
-        assert_eq!(well_lines(&m, Form::Cramped, 420., 1, 3., Extras::default()), 7.);
+        assert_eq!(well_lines(&m, Form::Cramped, 420., 1, 3., Extras::default()), 8.);
         assert_eq!(well_lines(&m, Form::Short, 600., 1, 3., Extras::default()), 8.);
         assert_eq!(well_lines(&m, Form::Full, 800., 1, 3., Extras::default()), 12.);
         // A taller draft takes its rows from the well.
-        assert_eq!(well_lines(&m, Form::Cramped, 420., 3, 3., Extras::default()), 4.);
+        assert_eq!(well_lines(&m, Form::Cramped, 420., 3, 3., Extras::default()), 6.);
         let m = Metrics::at(22);
-        assert_eq!(well_lines(&m, Form::Cramped, 420., 1, 3., Extras::default()), 3.);
+        assert_eq!(well_lines(&m, Form::Cramped, 420., 1, 3., Extras::default()), 4.);
         // Never under the floor (the layout clips, the well scrolls).
         assert_eq!(well_lines(&m, Form::Cramped, 300., 1, 3., Extras::default()), 3.);
         assert_eq!(well_lines(&m, Form::Cramped, 300., 1, 2., Extras::default()), 2.);
@@ -633,10 +637,11 @@ mod tests {
                 assert!(cramped_below(&m, ex) >= cramped_below(&m, Extras::default()));
             }
         }
-        // Step 22, the smallest window, everything open: 420 of 420.
+        // Step 22, the smallest window, everything open: 383 of 420 (420
+        // with the session header), a 2-line well.
         let (m, ex) = (Metrics::at(22), Extras { naming: true, error: true, note: true, naming_notes: 2, ..Extras::default() });
-        assert_eq!(need(&m, Form::Cramped, ex), 420.);
-        assert_eq!(well_lines(&m, Form::Cramped, 420., 1, WELL_MIN, ex), 1.);
+        assert_eq!(need(&m, Form::Cramped, ex), 383.);
+        assert_eq!(well_lines(&m, Form::Cramped, 420., 1, WELL_MIN, ex), 2.);
         // The note is on the notice line only when cramped (else in the
         // composer's own row); the error always.
         let note = Extras { note: true, ..Extras::default() };
@@ -654,24 +659,24 @@ mod tests {
         assert!(cramped_below(&m, notes) > cramped_below(&m, Extras { naming: true, ..Extras::default() }));
     }
 
-    /// The tray and a worker's breadcrumb only take what the room leaves:
-    /// at every text step, window height and mix of the rest, with a card
-    /// up or a worker's view (no card, its breadcrumb), SEND stays on
+    /// The tray and a worker's NEEDS YOU stub only take what the room
+    /// leaves: at every text step, window height and mix of the rest, with
+    /// a card up or a worker's view (no card, the stub), SEND stays on
     /// screen with the tray's rows and the composer's, and the transcript
     /// keeps its share under the tray.
     #[test]
-    fn the_tray_and_the_breadcrumb_fit_what_is_left() {
+    fn the_tray_and_the_stub_fit_what_is_left() {
         for step in TEXT_STEPS {
             let m = Metrics::at(step);
             for f in [Form::Full, Form::Short, Form::Cramped] {
-                assert!(Card::of(&m, f).height(1.) >= crumb_h(f), "step {step} {f:?}: the crumb is under the card it replaces");
+                assert!(Card::of(&m, f).height(1.) >= stub_h(&m), "step {step} {f:?}: the stub is under the card it replaces");
             }
             for ex in all_extras() {
                 for window in 420..1600 {
                     let window = window as f32;
                     let f = form(Layout::of(1000., window - TOP, &m, ex));
-                    for (card, crumb) in [(true, false), (false, true), (false, false)] {
-                        let base = Extras { crumb, ..ex };
+                    for (card, stub) in [(true, false), (false, true), (false, false)] {
+                        let base = Extras { stub, ..ex };
                         let n = tray_rows(&m, f, window, card, base, 9);
                         assert!(n <= tray_max(f));
                         let drawn = Extras { tray: n as u8, ..base };
@@ -705,7 +710,7 @@ mod tests {
     #[test]
     fn the_composer_grows_into_spare_room_only() {
         let m = Metrics::at(22);
-        assert_eq!(composer_rows(&m, Form::Cramped, 420., true, Extras::default()), 1);
+        assert_eq!(composer_rows(&m, Form::Cramped, 420., true, Extras::default()), 2);
         assert_eq!(composer_rows(&m, Form::Full, 1400., true, Extras::default()), COMPOSER_ROWS);
         let m = Metrics::at(16);
         let rows = composer_rows(&m, Form::Cramped, 420., true, Extras::default());

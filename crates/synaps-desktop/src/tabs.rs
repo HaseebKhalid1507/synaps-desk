@@ -1425,7 +1425,7 @@ mod tests {
         t.close(0);
         assert_eq!((strip(&t), shown(&t).as_deref()), (vec!["a/sa_1".to_string(), "b".into()], Some("a/sa_1")));
         assert_eq!((t.current_session(), t.holds("a"), t.is_open("a")), (Some("a"), true, false));
-        // Its breadcrumb (or a rail click) opens the session again: a tab
+        // Its MAIN (or a rail click) opens the session again: a tab
         // of its own, never the worker's.
         t.open("a", "a", Place::Current);
         assert_eq!((strip(&t), shown(&t).as_deref()), (vec!["a/sa_1".to_string(), "a".into(), "b".into()], Some("a")));

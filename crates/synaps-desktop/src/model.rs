@@ -306,7 +306,8 @@ pub struct Model {
     /// and how many have (the polls of an idle daemon included).
     pub sessions_listed: bool,
     pub lists: u64,
-    /// The attached session's numbers (header, right-hand panel).
+    /// The attached session's numbers (the composer's foot, the right-hand
+    /// panel).
     pub stats: Stats,
     /// Bumped whenever what the rail lists may have changed (anything but
     /// a session's own stream, and a session list equal to the last): the

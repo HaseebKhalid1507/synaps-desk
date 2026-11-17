@@ -6,7 +6,7 @@
 //!   Mission Control) from the session's own thread focuses the newest
 //!   worker (the tray's bottom row); more ↑ go to older ones, ↓ back to
 //!   newer ones, and past the newest to the session again. Esc goes back
-//!   too, as does a click on MAIN in the view's breadcrumb; a click on a
+//!   too, as does a click on MAIN in the composer's foot; a click on a
 //!   tray row opens that worker. The workers on offer are the running
 //!   background ones plus any whose view is open.
 //! - **Feeding.** While a worker's view is focused (and the window draws),
@@ -167,13 +167,10 @@ pub struct Worker {
     /// and whether the daemon's journal had dropped some before.
     pub dropped: usize,
     pub truncated: bool,
-    /// What the breadcrumb and the composer say, made when it changes:
-    /// `sleeper (sa_3)`; its model and the rows dropped; the hint.
-    pub crumb: SharedString,
+    /// What the composer's foot says, made when it changes: its model and
+    /// the rows dropped; the hint.
     pub facts: SharedString,
     pub hint: SharedString,
-    /// What its breadcrumb says while its session waits on a prompt.
-    pub needs: SharedString,
     /// What the right panel's FILES says over this view (they are the
     /// session's thread's, not this worker's).
     pub files_note: SharedString,
@@ -212,10 +209,8 @@ impl Worker {
             finished_at: None,
             dropped: 0,
             truncated: false,
-            crumb: SharedString::default(),
             facts: SharedString::default(),
             hint: SharedString::default(),
-            needs: SharedString::default(),
             files_note: SharedString::default(),
             unsent: None,
             tabbed: false,
@@ -240,10 +235,8 @@ impl Worker {
         self.notice(why);
     }
 
-    /// The breadcrumb's and the composer's strings, again.
+    /// The composer's strings, again.
     fn strings(&mut self) {
-        self.crumb = format!("{} ({})", self.name, self.handle_id).into();
-        self.needs = format!("{}'s session needs you → open", self.name).into();
         self.files_note = format!("the session's thread, not {}'s: tool inputs, not the disk", self.name).into();
         let model = self.model.rsplit_once('/').map_or(self.model.as_str(), |(_, m)| m);
         let dropped = (self.dropped > 0).then(|| format!("{} earlier rows dropped", self.dropped));
@@ -261,7 +254,7 @@ impl Worker {
         };
     }
 
-    /// What the breadcrumb says it is doing.
+    /// What its view says it is doing (its own pages').
     pub fn state(&self) -> &str {
         match (&self.gone, self.status.as_str()) {
             (Some(g), "") if g == OFFLINE => "offline",
@@ -270,6 +263,12 @@ impl Worker {
             (None, "timed_out") => "timed out",
             (None, s) => s,
         }
+    }
+
+    /// Who it is, as a tab, a menu or a tray row says it
+    /// ([`crate::wtabs::same_worker`]): its call if known, its name.
+    pub fn key(&self) -> (Option<&str>, &str) {
+        (self.call.as_deref(), &self.name)
     }
 
     /// Its view takes no input: it finished (or is gone).
@@ -314,7 +313,7 @@ impl Worker {
     /// follow the tail ([`SCROLLED_BACK`]). Whether anything it shows
     /// changed.
     fn apply(&mut self, page: WatchPage, now: Instant, scrolled_back: bool) -> bool {
-        // What the breadcrumb and the composer say ([`Worker::strings`]).
+        // What the composer says ([`Worker::strings`]).
         let mut said = false;
         let mut changed = !page.events.is_empty();
         if !page.agent_name.is_empty() && page.agent_name != self.name {
@@ -480,7 +479,6 @@ impl Watch {
         self.focused().map(|w| (w.handle_id.as_str(), w.generation))
     }
 
-    #[cfg(test)]
     pub fn worker(&self, handle_id: &str) -> Option<&Worker> {
         self.workers.get(handle_id)
     }
@@ -488,11 +486,6 @@ impl Watch {
     /// What it keeps, roughly (bytes).
     pub fn bytes(&self) -> usize {
         self.workers.values().map(Worker::bytes).sum()
-    }
-
-    /// Worker `handle_id`'s view's word ([`Worker::state`]), if it has one.
-    pub fn view_state(&self, handle_id: &str) -> Option<&str> {
-        self.workers.get(handle_id).map(Worker::state)
     }
 
     /// The workers on offer, oldest first: `running` (the tray's running
@@ -1115,7 +1108,7 @@ mod tests {
         w.on_reply("sa_2", since, WatchReply::Gone("no subagent sa_2 in this session".into()), t0);
         let v = w.focused().unwrap();
         assert!(v.read_only() && v.state() == "gone");
-        assert_eq!(w.view_state("sa_2"), Some("gone"));
+        assert_eq!(w.worker("sa_2").map(Worker::state), Some("gone"));
         assert!(matches!(w.steer_target(), Some(Err(_))));
     }
 

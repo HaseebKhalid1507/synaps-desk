@@ -46,8 +46,9 @@ use gpui_kit::*;
 
 use crate::app::{AppView, display, mono};
 use crate::fonts;
+use crate::glyph::{self, Ground};
 use crate::menu::{At, How, Item, Key, Menu};
-use crate::subagents::{Info, Status, Subagents, fmt_secs};
+use crate::subagents::{Info, Liveness, Subagents, fmt_secs};
 use crate::tabs::{Kind, Place};
 use crate::theme::{self, Palette};
 
@@ -281,6 +282,11 @@ impl Cancels {
         self.sent.iter().any(|s| s.session == session && s.handle == handle)
     }
 
+    /// [`Cancels::pending`] of `sa_{id}`, nothing allocated (per frame).
+    pub fn pending_id(&self, session: &str, id: u64) -> bool {
+        self.sent.iter().any(|s| s.session == session && s.handle.strip_prefix("sa_").and_then(|n| n.parse().ok()) == Some(id))
+    }
+
     /// The daemon's answer to the cancel of `handle` sent on attachment
     /// `attach_seq`: done, the rows will say it (it stays `cancelling`
     /// until they do); not done, the note to show.
@@ -312,80 +318,6 @@ impl Cancels {
 
 // ── what a worker is doing ────────────────────────────────────────────
 
-/// A worker's state as the menu and its tab's mark need it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WState {
-    /// Nothing heard yet (or only that it started).
-    Unknown,
-    Running,
-    Cancelling,
-    Done,
-    Failed,
-    Cancelled,
-    TimedOut,
-    /// The daemon no longer knows it (or there is no daemon), or its
-    /// handle names another worker now.
-    Gone,
-}
-
-impl WState {
-    fn of_status(s: Option<Status>) -> Self {
-        match s {
-            None | Some(Status::Started) => WState::Unknown,
-            Some(Status::Running) => WState::Running,
-            Some(Status::Cancelling) => WState::Cancelling,
-            Some(Status::Done) => WState::Done,
-            Some(Status::Failed) => WState::Failed,
-            Some(Status::Cancelled) => WState::Cancelled,
-            Some(Status::TimedOut) => WState::TimedOut,
-        }
-    }
-
-    /// From its view's word ([`crate::watch::Worker::state`]).
-    fn of_view(s: &str) -> Self {
-        match s {
-            "running" => WState::Running,
-            "completed" => WState::Done,
-            "failed" => WState::Failed,
-            "cancelled" => WState::Cancelled,
-            "timed out" => WState::TimedOut,
-            "gone" | "offline" => WState::Gone,
-            _ => WState::Unknown,
-        }
-    }
-
-    pub fn ended(self) -> bool {
-        matches!(self, WState::Done | WState::Failed | WState::Cancelled | WState::TimedOut | WState::Gone)
-    }
-
-    /// Its tab's mark, in the strip's spaced caps (as NEEDS YOU).
-    pub fn mark(self) -> Option<&'static str> {
-        Some(match self {
-            WState::Unknown => return None,
-            WState::Running => fonts::label::RUNNING,
-            WState::Cancelling => fonts::label::CANCELLING,
-            WState::Done => fonts::label::COMPLETED,
-            WState::Failed => fonts::label::FAILED,
-            WState::Cancelled => fonts::label::CANCELLED,
-            WState::TimedOut => fonts::label::TIMED_OUT,
-            WState::Gone => fonts::label::GONE,
-        })
-    }
-
-    pub fn word(self) -> &'static str {
-        match self {
-            WState::Unknown => "started",
-            WState::Running => "running",
-            WState::Cancelling => "cancelling",
-            WState::Done => "completed",
-            WState::Failed => "failed",
-            WState::Cancelled => "cancelled",
-            WState::TimedOut => "timed out",
-            WState::Gone => "gone",
-        }
-    }
-}
-
 /// The worker a menu is for (`who`, of `session`); `tab`: the worker tab
 /// it was opened on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -412,7 +344,7 @@ pub(crate) enum Act {
 pub(crate) struct Facts {
     pub name: String,
     pub handle: String,
-    pub state: WState,
+    pub state: Liveness,
     /// Why this window may not steer or cancel it (`None`: it may).
     pub read_only: Option<&'static str>,
     /// Its handle names another worker now (a cold-started daemon).
@@ -426,6 +358,11 @@ pub(crate) struct Facts {
     pub has_task: bool,
     /// The menu is its worker tab's (no "Open in new tab").
     pub tab: bool,
+}
+
+/// A worker's state in the menus' words: §4.2's Mono column.
+fn word(l: Liveness) -> &'static str {
+    glyph::worker(l).2
 }
 
 /// Why a worker's handle no longer names it.
@@ -446,12 +383,12 @@ pub(crate) fn items(f: &Facts) -> Vec<Item<Act>> {
     }
     let mut steer = Item::new(Act::Steer, "Steer…");
     if other.is_none() && f.state.ended() {
-        steer = steer.off(format!("{} is {}: nothing to steer", f.name, f.state.word()));
+        steer = steer.off(format!("{} is {}: nothing to steer", f.name, word(f.state)));
     } else if let Some(why) = f.read_only.filter(|_| other.is_none()) {
         steer = steer.off(why);
     }
     out.push(off(steer));
-    let cancel = match (f.pending || f.state == WState::Cancelling, f.armed) {
+    let cancel = match (f.pending || f.state == Liveness::Cancelling, f.armed) {
         (true, _) => Item::new(Act::Cancel, "cancelling").off(format!("{} stops at its next step", f.name)),
         (false, true) => {
             let mut i = Item::new(Act::Cancel, format!("Cancel {}?", f.name));
@@ -463,7 +400,7 @@ pub(crate) fn items(f: &Facts) -> Vec<Item<Act>> {
     out.push(if other.is_some() {
         off(cancel)
     } else if f.state.ended() && !f.pending {
-        cancel.off(format!("{} is {}: nothing to cancel", f.name, f.state.word()))
+        cancel.off(format!("{} is {}: nothing to cancel", f.name, word(f.state)))
     } else if let Some(why) = f.read_only {
         cancel.off(why)
     } else {
@@ -474,7 +411,7 @@ pub(crate) fn items(f: &Facts) -> Vec<Item<Act>> {
         Some((false, n)) => Item::new(Act::CopyResult, format!("Copy result preview (first {n} chars)")),
         _ => Item::new(Act::CopyResult, "Copy result"),
     };
-    if other.is_none() && (!f.state.ended() || f.state == WState::Gone) {
+    if other.is_none() && (!f.state.ended() || f.state == Liveness::Gone) {
         result = result.off("once it has finished");
     } else if other.is_none() && f.result.is_none() {
         result = result.off("no result heard: collect it (subagent_collect) or open its thread");
@@ -500,7 +437,7 @@ enum Blocked {
     /// The same call, under another name now than the menu or the row
     /// had (it was opened before the call's result named the worker).
     Renamed,
-    Ended(WState),
+    Ended(Liveness),
 }
 
 impl Blocked {
@@ -510,7 +447,7 @@ impl Blocked {
             Blocked::Unknown => format!("{} not cancelled: this window knows no worker by that handle", who.handle()),
             Blocked::Other => format!("{}: nothing sent", other_why(&who.handle(), &who.name)),
             Blocked::Renamed => format!("{} not cancelled: {} goes by another name now; open its menu again", who.handle(), who.name),
-            Blocked::Ended(s) => format!("{} is {}: nothing to cancel", who.name, s.word()),
+            Blocked::Ended(s) => format!("{} is {}: nothing to cancel", who.name, word(s)),
         }
     }
 }
@@ -576,7 +513,7 @@ impl AppView {
         }
     }
 
-    /// The breadcrumb's NEEDS YOU: the session of the worker on screen
+    /// The NEEDS YOU stub's click: the session of the worker on screen
     /// waits on a prompt. Its tab (opened if closed) with its thread on
     /// screen, and so its card: never answered from a worker's view.
     pub(crate) fn open_parent_card(&mut self, cx: &mut Context<Self>) {
@@ -597,27 +534,36 @@ impl AppView {
         Some(Who::new(id, name.to_string(), call.map(|c| c.to_string().into())))
     }
 
-    /// Worker `handle` (`sa_N`) of `session`: its view's word if it has
-    /// one, else the session's; a cancel on its way is `Cancelling`;
-    /// `expect` (who a tab or a menu says it is): another worker under the
-    /// handle now is `Gone`. Read per frame for a worker tab's mark:
-    /// nothing allocated.
-    pub(crate) fn worker_state(&self, session: &str, handle: &str, expect: Option<(Option<&str>, &str)>) -> WState {
-        let shown = self.model.is_active(session) || self.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(session);
+    /// Worker `handle` (`sa_N`) of `session`, as every surface shows it
+    /// ([`Liveness`], design.md §4.3): from its session's workers (attached
+    /// here, or as its tab last saw them) and its view's own word
+    /// ([`Liveness::of_sources`]). A cancel on its way is `Cancelling`;
+    /// `expect` (who a tab, a menu or the foot says it is): another worker
+    /// under the handle now is `Gone`, as is one an attached session does
+    /// not know. `None`: this window holds nothing of its session (not
+    /// attached, not cached). Read per frame for a worker tab's mark and
+    /// the composer foot: nothing allocated.
+    pub(crate) fn worker_state(&self, session: &str, handle: &str, expect: Option<(Option<&str>, &str)>) -> Option<Liveness> {
+        let attached = self.model.is_active(session);
+        let shown = attached || self.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(session);
         let (watch, subs) = match (shown, self.tab_cache.peek(session)) {
             (true, _) => (&self.model.watch, &self.model.stats.subagents),
             (false, Some(c)) => (&c.watch, &c.stats.subagents),
-            (false, None) => return WState::Unknown,
+            (false, None) => return None,
         };
         let id = handle.strip_prefix("sa_").and_then(|n| n.parse().ok());
-        if let (Some(e), Some(now)) = (expect, id.and_then(|id| subs.ident(id)))
+        let now = id.and_then(|id| subs.ident(id));
+        if let (Some(e), Some(now)) = (expect, now)
             && !same_worker(e, now)
         {
-            return WState::Gone;
+            return Some(Liveness::Gone);
         }
-        let from_view = watch.view_state(handle).map(WState::of_view).filter(|s| *s != WState::Unknown);
-        let s = from_view.unwrap_or_else(|| WState::of_status(id.and_then(|id| subs.status(id))));
-        if !s.ended() && self.model.cancels.pending(session, handle) { WState::Cancelling } else { s }
+        let status = id.and_then(|id| subs.status(id));
+        // Its view's word only if the view is of the worker the handle names
+        // now: a stale view of an earlier worker under it says nothing of this one.
+        let view = watch.worker(handle).filter(|w| now.is_none_or(|n| same_worker(w.key(), n))).and_then(|w| Liveness::of_view(w.state()));
+        let live = Liveness::of_sources(status, view, attached, !attached || now.is_some() || status.is_some());
+        Some(live.cancelling(self.model.cancels.pending(session, handle)))
     }
 
     /// Whether this window may steer or cancel `session`'s workers, else
@@ -651,8 +597,8 @@ impl AppView {
             return Some(Blocked::Renamed);
         }
         match self.worker_state(session, handle, Some(who.key())) {
-            WState::Running | WState::Unknown => None,
-            s => Some(Blocked::Ended(s)),
+            None | Some(Liveness::Running | Liveness::Started) => None,
+            Some(s) => Some(Blocked::Ended(s)),
         }
     }
 
@@ -752,7 +698,12 @@ impl AppView {
         let info = if other { None } else { subs.and_then(|s| s.info(t.who.id)) };
         Facts {
             name: t.who.name.to_string(),
-            state: if other { WState::Gone } else { self.worker_state(&t.session, &handle, Some(t.who.key())) },
+            // Nothing held of its session: not ended, as far as this window knows.
+            state: if other {
+                Liveness::Gone
+            } else {
+                self.worker_state(&t.session, &handle, Some(t.who.key())).unwrap_or(Liveness::Started)
+            },
             read_only: self.may_drive(&t.session).err(),
             other,
             armed: self.model.cancels.armed(&t.session, t.who.id, t.who.key(), now),
@@ -788,6 +739,7 @@ impl AppView {
     /// waits for its second press.
     pub(crate) fn close_menu(&mut self) {
         self.menu = None;
+        self.smenu = None;
         if self.model.cancels.disarm() {
             self.cancel_tick = None;
         }
@@ -1042,7 +994,7 @@ pub(crate) fn card_tip(me: WeakEntity<AppView>, who: Who, fallback: SharedString
             let v = v.read(cx);
             let session = v.worker_session()?;
             let info = v.info_of(&session, &who)?;
-            Some((info, v.worker_state(&session, &who.handle(), Some(who.key()))))
+            Some((info, v.worker_state(&session, &who.handle(), Some(who.key()))?))
         });
         let Some((info, state)) = info else { return Tooltip::new(fallback.clone()).build(window, cx) };
         let p = theme::palette(cx);
@@ -1055,15 +1007,13 @@ pub(crate) fn card_tip(me: WeakEntity<AppView>, who: Who, fallback: SharedString
     }
 }
 
-/// The card's body.
-fn card(i: &Info, state: WState, started: Option<&str>, p: &Palette) -> Div {
-    let color = match state {
-        WState::Running => p.run_ch,
-        WState::Done => p.ok_ch,
-        WState::Failed => p.err_ch,
-        WState::Cancelling | WState::Cancelled | WState::TimedOut => p.warn_ch,
-        WState::Unknown | WState::Gone => p.dim_ch,
-    };
+/// The card's body: the worker's glyph in the lead column, its name and
+/// handle, its word (§4.2's Display column) at the trail; its task, facts
+/// and step under them. On the kit's popover (the chrome) until overlays
+/// move to the card.
+fn card(i: &Info, state: Liveness, started: Option<&str>, p: &Palette) -> Div {
+    let (g, word, _, family) = glyph::worker(state);
+    let (color, mark) = glyph::ink(family, Ground::Chrome, p);
     let fact = |k: &'static str, v: String| {
         h_flex()
             .items_start()
@@ -1091,10 +1041,11 @@ fn card(i: &Info, state: WState, started: Option<&str>, p: &Palette) -> Div {
             h_flex()
                 .gap(px(8.))
                 .items_center()
+                .child(glyph::draw(g, mark))
                 .child(div().text_size(px(12.5)).text_color(p.ink).child(i.name.clone()))
                 .child(mono(format!("sa_{}", i.id), 11., p.dim_ch))
                 .child(div().flex_1())
-                .child(display(state.word(), 9.5, color)),
+                .child(display(word, 12., color)),
         )
         .when(!i.task.is_empty(), |d| {
             d.child(div().font_family(fonts::MONO).text_size(px(11.)).line_height(px(16.)).text_color(p.prose_ch).child(i.task.clone()))
@@ -1104,7 +1055,7 @@ fn card(i: &Info, state: WState, started: Option<&str>, p: &Palette) -> Div {
             d.child(
                 div()
                     .text_size(px(11.5))
-                    .text_color(if state == WState::Failed { p.err_ch } else { p.dim_ch })
+                    .text_color(if state == Liveness::Failed { p.err_ch } else { p.dim_ch })
                     .overflow_hidden()
                     .text_ellipsis()
                     .child(i.line.clone()),
@@ -1119,8 +1070,9 @@ mod tests {
     use gpui_kit::{Keystroke, MouseButton};
     use serde_json::json;
 
-    use super::{Act, CANCEL_WAIT, CONFIRM, Cancels, Facts, Press, Route, SETTLE, WState, Who, is_menu_key, items, route, same_worker};
+    use super::{Act, CANCEL_WAIT, CONFIRM, Cancels, Facts, Press, Route, SETTLE, Who, is_menu_key, items, route, same_worker};
     use crate::menu::How;
+    use crate::subagents::Liveness;
     use crate::subagents::Subagents;
 
     #[test]
@@ -1152,7 +1104,7 @@ mod tests {
         Facts {
             name: "sleeper".into(),
             handle: "sa_2".into(),
-            state: WState::Running,
+            state: Liveness::Running,
             read_only: None,
             other: false,
             armed: false,
@@ -1315,11 +1267,11 @@ mod tests {
         let sent = items(&Facts { pending: true, ..facts() });
         assert_eq!((sent[3].label.as_ref(), sent[3].enabled()), ("cancelling", false));
         // Finished with its whole result: copy it; no steer, no cancel.
-        let done = Facts { state: WState::Done, result: Some((true, 900)), ..facts() };
+        let done = Facts { state: Liveness::Done, result: Some((true, 900)), ..facts() };
         assert_eq!(acts(&done)[2..6], [(Steer, false), (Cancel, false), (CopyHandle, true), (CopyResult, true)]);
         assert_eq!(items(&done)[5].label.as_ref(), "Copy result");
         // M1: only a preview heard: it says so.
-        let preview = items(&Facts { state: WState::Done, result: Some((false, 120)), ..facts() });
+        let preview = items(&Facts { state: Liveness::Done, result: Some((false, 120)), ..facts() });
         assert_eq!((preview[5].label.as_ref(), preview[5].enabled()), ("Copy result preview (first 120 chars)", true));
         // A worker tab's menu: Show, no "in new tab".
         let tab = items(&Facts { tab: true, ..facts() });
@@ -1332,7 +1284,7 @@ mod tests {
     #[test]
     fn a_reused_handle_offers_nothing_of_the_other_worker() {
         use Act::*;
-        let f = Facts { other: true, state: WState::Gone, result: Some((true, 40)), ..facts() };
+        let f = Facts { other: true, state: Liveness::Gone, result: Some((true, 40)), ..facts() };
         assert_eq!(
             acts(&f),
             vec![
