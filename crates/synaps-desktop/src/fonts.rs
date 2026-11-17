@@ -73,9 +73,10 @@ pub fn register(cx: &mut App) {
 
 /// Every Japanese sub-label. `subset.sh` keeps exactly these glyphs.
 #[cfg(test)]
-const JP_LABELS: &[&str] = &[JP_SESSIONS, JP_CONTEXT, JP_TOKENS, JP_FILES, JP_PINNED, JP_OPEN, JP_HISTORY];
+const JP_LABELS: &[&str] = &[JP_SESSIONS, JP_CONTEXT, JP_TOKENS, JP_FILES, JP_FAVOURITES, JP_PINNED, JP_OPEN, JP_HISTORY];
 pub const JP_SESSIONS: &str = "セッション";
-/// The rail's groups: PINNED, OPEN, HISTORY.
+/// The rail's groups: FAVOURITES, PINNED, OPEN, HISTORY.
+pub const JP_FAVOURITES: &str = "お気に入り";
 pub const JP_PINNED: &str = "固定";
 pub const JP_OPEN: &str = "稼働";
 pub const JP_HISTORY: &str = "履歴";
@@ -143,6 +144,8 @@ pub mod label {
     pub const OPENING: &str = "O P E N I N G";
     pub const LOCKED: &str = "L O C K E D";
     pub const UNREAD: &str = "U N R E A D";
+    pub const FAVOURITES: &str = "F A V O U R I T E S";
+    pub const REMOVE: &str = "R E M O V E";
     pub const PINNED: &str = "P I N N E D";
     pub const OPEN_GROUP: &str = "O P E N";
     pub const HISTORY: &str = "H I S T O R Y";
