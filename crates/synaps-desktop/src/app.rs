@@ -58,8 +58,10 @@ pub(crate) struct RowCache {
     /// the local zone: parsed once here, never per frame or per sync.
     at: Option<Arc<str>>,
     pub(crate) time: Option<crate::times::Stamp>,
-    /// The same instant in UTC: a running call's clock counts from it.
-    pub(crate) started: Option<chrono::DateTime<chrono::Utc>>,
+    /// The same instant on this machine's clock, read once against the
+    /// wall clock: a running call's clock counts from it on the frame's
+    /// instant ([`crate::motion::Motion::now`]).
+    pub(crate) started: Option<Instant>,
 }
 
 impl RowCache {
@@ -68,8 +70,11 @@ impl RowCache {
         if self.at != item.at {
             self.at = item.at.clone();
             self.time = item.at.as_deref().and_then(crate::times::Stamp::local);
-            self.started =
-                item.at.as_deref().and_then(|a| chrono::DateTime::parse_from_rfc3339(a).ok()).map(|t| t.with_timezone(&chrono::Utc));
+            self.started = item.at.as_deref().and_then(|a| chrono::DateTime::parse_from_rfc3339(a).ok()).map(|t| {
+                let ago = (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).to_std().unwrap_or_default();
+                let now = Instant::now();
+                now.checked_sub(ago).unwrap_or(now)
+            });
         }
     }
 }
@@ -141,9 +146,11 @@ impl TabCache {
         let item = |i: &Item| {
             std::mem::size_of::<Item>()
                 + i.text.capacity()
-                + i.tool.as_ref().map_or(0, |t| t.tool_id.capacity() + t.name.capacity() + t.input.capacity() + t.result.capacity())
+                + i.tool
+                    .as_ref()
+                    .map_or(0, |t| t.tool_id.capacity() + t.name.capacity() + t.input.capacity() + t.result.capacity() + t.tail.capacity())
         };
-        let row = |r: &RowCache| std::mem::size_of::<RowCache>() + r.text.len() + r.arg.len() + r.result.len();
+        let row = |r: &RowCache| std::mem::size_of::<RowCache>() + r.text.len() + r.arg.len() + r.result.len() + r.card.bytes();
         self.transcript.items().iter().map(item).sum::<usize>()
             + self.transcript.len() * ITEM_OVERHEAD
             + self.rows.iter().map(row).sum::<usize>()
@@ -6174,7 +6181,7 @@ mod tests {
 
     use super::{
         ARM, Arm, CENTRE_MIN, CardChord, CardKey, FavsJob, FoldKeys, Foot, FootIn, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY,
-        above_list, authorize_ready, card_key, card_key_on, command_of, input_of, dragged, fav_key, fit_foot, held_back, hidden, left_cut,
+        above_list, authorize_ready, card_key, card_key_on, command_of, dragged, fav_key, fit_foot, held_back, hidden, input_of, left_cut,
         lines_below, one_line, panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled, well_body,
         worker_keys,
     };

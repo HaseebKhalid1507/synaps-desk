@@ -778,7 +778,8 @@ fn hits(t: &synaps_client::transcript::ToolCall, context: bool) -> SharedString 
         return "no hits".into();
     }
     let body = r.split("\n\n").next().unwrap_or_default();
-    let notes = |s: &str| s.split("\n\n").skip(1).any(|n| n.starts_with("... (") || n.contains("while searching, results may be incomplete"));
+    let notes =
+        |s: &str| s.split("\n\n").skip(1).any(|n| n.starts_with("... (") || n.contains("while searching, results may be incomplete"));
     let cut = !t.tail.is_empty() || notes(r) || t.tail.lines().any(|l| l.starts_with("... (") || l.contains("results may be incomplete"));
     let n = body.lines().filter(|l| !l.trim().is_empty() && *l != "--" && (!context || grep_match(l))).count();
     match (n, cut) {
@@ -788,9 +789,30 @@ fn hits(t: &synaps_client::transcript::ToolCall, context: bool) -> SharedString 
 }
 
 impl Card {
+    /// Its strings' bytes (a tab cache's budget).
+    pub(crate) fn bytes(&self) -> usize {
+        let n = |s: &SharedString| s.len();
+        n(&self.verb)
+            + n(&self.word)
+            + n(&self.key)
+            + n(&self.target)
+            + self.full.as_ref().map_or(0, n)
+            + self.server.as_ref().map_or(0, n)
+            + self.facts.as_ref().map_or(0, n)
+            + self.more.as_ref().map_or(0, n)
+            + self.path.as_ref().map_or(0, |(a, b)| n(a) + n(b))
+            + self.head.as_ref().map_or(0, |(a, b)| n(a) + b.as_ref().map_or(0, n))
+            + self.numbered.as_ref().map_or(0, |l| l.iter().map(|(a, b)| n(a) + n(b) + 2 * std::mem::size_of::<SharedString>()).sum())
+    }
+
     /// `arg`: the row's one-line argument ([`crate::app::row_cache`]);
     /// `input`: the call's input parsed.
-    pub(crate) fn of(t: &synaps_client::transcript::ToolCall, preview: Option<&Preview>, arg: &str, input: Option<&serde_json::Value>) -> Self {
+    pub(crate) fn of(
+        t: &synaps_client::transcript::ToolCall,
+        preview: Option<&Preview>,
+        arg: &str,
+        input: Option<&serde_json::Value>,
+    ) -> Self {
         let (word, server) = verb_of(&t.name);
         let cut = verb_cut(&word);
         let full = (cut.is_some() || word.as_ref() != t.name).then(|| SharedString::from(t.name.clone()));
@@ -1421,9 +1443,10 @@ fn target_el(card: &Card, arg: &SharedString, p: &Palette) -> Div {
 }
 
 /// A running call's clock (the TUI's `running 1.2s`): whole seconds since
-/// it started, ticking on the second while motion is on.
-fn clock(fx: &Motion, started: Option<chrono::DateTime<chrono::Utc>>) -> Option<SharedString> {
-    let ms = (chrono::Utc::now() - started?).num_milliseconds().max(0) as u64;
+/// it started, on the frame's instant, ticking on the second while motion
+/// is on.
+fn clock(fx: &Motion, started: Option<Instant>) -> Option<SharedString> {
+    let ms = fx.now().saturating_duration_since(started?).as_millis() as u64;
     if fx.on() {
         fx.tick_clock(fx.now() + Duration::from_millis(1000 - ms % 1000));
     }
@@ -1555,6 +1578,10 @@ impl AppView {
         });
         if let Some((v, current)) = worker {
             return self.render_spawn(row, v, current, id, geo, p, m, lay, cx);
+        }
+        if starts.is_some() {
+            // No worker yet: when it comes, its spawn row's bar draws.
+            self.fx.change(Tag::Block, id, 0, self.fx.birth(id));
         }
         let has_body = if think { !row.text.is_empty() } else { row.preview.is_some() || !row.result.is_empty() };
         let open = has_body && self.is_open(item, row);
@@ -1707,7 +1734,7 @@ impl AppView {
             false,
         );
         // Its task: the call's argument after the worker's label.
-        let task = row.arg.split_once(" · ").map_or_else(|| row.arg.clone(), |(_, t)| SharedString::from(t.to_string()));
+        let task = row.arg.split_once(" · ").map_or_else(|| row.arg.clone(), |(_, t)| SharedString::from(tilde(t, true)));
         let target = h_flex()
             .flex_1()
             .min_w_0()
@@ -1753,7 +1780,9 @@ impl AppView {
                 .hover(|d| d.border_color(p.frame))
                 // Hovered, it lights: its outline to `frame`, its word and
                 // arrow to `prose_t` (both floored on the hovered row).
-                .child(display(label::OPEN, fonts::size::D_S, p.dim_t).line_height(px(12.)).group_hover("wopen", |s| s.text_color(p.prose_t)))
+                .child(
+                    display(label::OPEN, fonts::size::D_S, p.dim_t).line_height(px(12.)).group_hover("wopen", |s| s.text_color(p.prose_t)),
+                )
                 .child(
                     svg()
                         .path(Glyph::Open.sprite().unwrap_or_default())
@@ -1783,7 +1812,8 @@ impl AppView {
             .child(meta)
             .children(button)
             .child(geo.fold_col(None));
-        // The block came under the call while watched: its bar draws.
+        // The worker came under the call while watched (its call was drawn
+        // without it: `render_work`): its bar draws.
         let came = fx.change(Tag::Block, key, 1, fx.birth(key)).map(|(at, _)| at);
         let line = |child: AnyElement| {
             div()
@@ -2425,9 +2455,13 @@ mod tests {
         assert_eq!((grep.target.as_ref(), grep.path.is_none(), grep.facts.as_deref()), ("Stale  src", true, Some("2 hits")));
         let hits = |input: &str, result: &str| card(&call("grep", input, result), "").facts.map(|f| f.to_string());
         assert_eq!(hits(grep_in, "No matches found."), Some("no hits".into()));
-        let ignored = "No matches found.\n\nNot searched: files excluded by .gitignore or .ignore, and node_modules and target directories.";
+        let ignored =
+            "No matches found.\n\nNot searched: files excluded by .gitignore or .ignore, and node_modules and target directories.";
         assert_eq!(hits(grep_in, ignored), Some("no hits".into()));
-        assert_eq!(hits(grep_in, "a.rs:1:x\n\n[1 error while searching, results may be incomplete. First: b: denied]"), Some("1+ hits".into()));
+        assert_eq!(
+            hits(grep_in, "a.rs:1:x\n\n[1 error while searching, results may be incomplete. First: b: denied]"),
+            Some("1+ hits".into())
+        );
         assert_eq!(hits(grep_in, "a.rs:1:x\nb.rs:1:y\n\n... (output truncated, more than 100 total bytes)"), Some("2+ hits".into()));
         assert_eq!(hits(grep_in, "a.rs:1:x\n\nNot searched: files excluded by .gitignore"), Some("1 hit".into()));
         let ctx = r#"{"path":"src","pattern":"x","context":1}"#;
