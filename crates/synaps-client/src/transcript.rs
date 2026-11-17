@@ -267,10 +267,11 @@ pub struct Transcript {
     items: Vec<Item>,
     next_id: u64,
     session_id: Option<String>,
-    /// The conversation's journal id ([`SessionMeta::journal_id`]), kept
-    /// current by clear, resume and compaction. The session's id stays the
-    /// same through those; a re-attach to another journal is another
-    /// conversation, and carries no time of this one's.
+    /// The journal of the conversation shown (the attach's header `id`),
+    /// kept current by clear, resume and compaction, whose events name the
+    /// new one. The session's id stays the same through those; a re-attach
+    /// to another journal is another conversation, and carries no time of
+    /// this one's.
     journal_id: String,
     /// `api_messages` folded so far, and where their items end.
     history_len: usize,
@@ -474,8 +475,12 @@ impl Transcript {
         }
         let same = self.session_id.as_deref() == Some(a.meta.id.as_str());
         // A clear, resume or compaction made while detached (in the TUI,
-        // another window) keeps the session's id and changes its journal's.
-        let carry = same && self.journal_id == a.meta.journal_id;
+        // another window) keeps the session's id and changes its journal.
+        // The journal is the header's: the attach's `meta.journal_id` is
+        // the one the session started with (0.11.1 sends its create-time
+        // meta), and only an older daemon's header has no id.
+        let journal = a.conversation.header.get("id").and_then(Value::as_str).unwrap_or(&a.meta.journal_id).to_string();
+        let carry = same && self.journal_id == journal;
         let (notes, mut reuse) = if same { self.take_rows(0) } else { (Vec::new(), Reuse::new()) };
         let (next_id, clean_len, before) = (self.next_id, self.clean_len, std::mem::take(&mut self.before));
         let no_subagent_notices = self.no_subagent_notices;
@@ -485,7 +490,7 @@ impl Transcript {
             before,
             no_subagent_notices,
             session_id: Some(a.meta.id.clone()),
-            journal_id: a.meta.journal_id.clone(),
+            journal_id: journal,
             ..Transcript::default()
         };
         self.dirty_from = Some(0);
