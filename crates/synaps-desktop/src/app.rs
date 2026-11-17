@@ -1194,11 +1194,13 @@ fn frame_composer(
 /// A call's input with more than one field (a `bash` with its `timeout`)
 /// as its row says it: its `command`, not its JSON (one field is shown
 /// bare already).
-fn command_of(input: &str) -> Option<String> {
-    if !input.starts_with('{') {
-        return None;
-    }
-    match serde_json::from_str::<serde_json::Value>(input).ok()?.get("command")? {
+/// A call's input as JSON, when it is an object (not a cut preview).
+pub(crate) fn input_of(input: &str) -> Option<serde_json::Value> {
+    input.starts_with('{').then(|| serde_json::from_str::<serde_json::Value>(input).ok()).flatten()
+}
+
+fn command_of(input: Option<&serde_json::Value>) -> Option<String> {
+    match input?.get("command")? {
         serde_json::Value::String(c) => Some(c.clone()),
         _ => None,
     }
@@ -5542,11 +5544,12 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
                 r.delta = ledger.delta(&t.tool_id);
                 r.counts = turns::Counts::of(r.delta.unwrap_or_default());
             }
+            let input = input_of(&t.input);
             r.arg = match (&r.preview, subs.arg(&t.tool_id)) {
                 (Some(pv), _) if !pv.title.is_empty() => pv.title.clone().into(),
                 // A subagent's call: its label and its task's first line.
                 (_, Some(arg)) => arg,
-                _ => match command_of(&t.input) {
+                _ => match command_of(input.as_ref()) {
                     Some(c) => one_line(&c, 200).into(),
                     None => one_line(&t.input, 200).into(),
                 },
@@ -5554,7 +5557,7 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
             let lines: Vec<&str> = t.result.lines().collect();
             r.result_more = lines.len().saturating_sub(RESULT_LINES);
             r.result = lines.iter().take(RESULT_LINES).copied().collect::<Vec<_>>().join("\n").into();
-            r.card = turns::Card::of(t, r.preview.as_deref(), &r.arg);
+            r.card = turns::Card::of(t, r.preview.as_deref(), &r.arg, input.as_ref());
         }
         ItemKind::Thinking => {
             r.text = item.text.clone().into();
@@ -6170,7 +6173,7 @@ mod tests {
 
     use super::{
         ARM, Arm, CENTRE_MIN, CardChord, CardKey, FavsJob, FoldKeys, Foot, FootIn, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY,
-        above_list, authorize_ready, card_key, card_key_on, command_of, dragged, fav_key, fit_foot, held_back, hidden, left_cut,
+        above_list, authorize_ready, card_key, card_key_on, command_of, input_of, dragged, fav_key, fit_foot, held_back, hidden, left_cut,
         lines_below, one_line, panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled, well_body,
         worker_keys,
     };
@@ -7079,10 +7082,11 @@ mod tests {
     fn one_line_arguments() {
         assert_eq!(one_line("  \nfirst\nsecond", 80), "first …");
         assert_eq!(one_line("abcdef", 3), "abc …");
-        assert_eq!(command_of(r#"{"command":"sleep 16 && echo step 1","timeout":30}"#).as_deref(), Some("sleep 16 && echo step 1"));
-        assert_eq!(command_of(r#"{"path":"a.rs","limit":3}"#), None);
-        assert_eq!(command_of(r#"{"command":"cut off at the prev"#), None, "a cut preview stays as it is");
-        assert_eq!(command_of("ls"), None);
+        let command = |s: &str| command_of(input_of(s).as_ref());
+        assert_eq!(command(r#"{"command":"sleep 16 && echo step 1","timeout":30}"#).as_deref(), Some("sleep 16 && echo step 1"));
+        assert_eq!(command(r#"{"path":"a.rs","limit":3}"#), None);
+        assert_eq!(command(r#"{"command":"cut off at the prev"#), None, "a cut preview stays as it is");
+        assert_eq!(command("ls"), None);
     }
 
     /// N-M1: a steer to scout, Esc out, scout finishes and its view goes,

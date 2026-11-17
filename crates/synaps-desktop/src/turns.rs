@@ -606,17 +606,18 @@ impl Counts {
 /// A tool's verb (polish.md §2.1a): lowercase mono machine words, the same
 /// in the row, its tooltip and the folded tally. `multi_edit` is an edit,
 /// a worker's start a `spawn`, another `subagent_*` its suffix, an MCP
-/// tool (`ext__server__tool`) a `tool` with its `[server]` in the meta.
-/// The full name is the tooltip's when the verb is not it.
+/// tool (`ext__server__tool`) its own name with its `[server]` in the meta
+/// (the TUI's `format_tool_name`). The full name is the tooltip's when the
+/// verb is not it.
 pub(crate) fn verb_of(name: &str) -> (SharedString, Option<SharedString>) {
+    let mcp = name.strip_prefix("ext__").and_then(|r| r.split_once("__")).filter(|(s, t)| !s.is_empty() && !t.is_empty());
+    if let Some((server, tool)) = mcp {
+        return (tool.to_string().into(), Some(format!("[{server}]").into()));
+    }
     match name {
         "multi_edit" => ("edit".into(), None),
         "subagent_start" | "subagent" => ("spawn".into(), None),
         n if n.starts_with("subagent_") => (n["subagent_".len()..].to_string().into(), None),
-        n if n.starts_with("ext__") => {
-            let server = n["ext__".len()..].split("__").next().filter(|s| !s.is_empty());
-            ("tool".into(), server.map(|s| format!("[{s}]").into()))
-        }
         n => (n.to_string().into(), None),
     }
 }
@@ -629,38 +630,35 @@ fn verb_cut(v: &str) -> Option<SharedString> {
     (v.chars().count() > VERB_CHARS - 1).then(|| format!("{}…", v.chars().take(VERB_CHARS - 1).collect::<String>()).into())
 }
 
-/// The user's home, as `$HOME` (`%USERPROFILE%` on Windows), read once.
-fn home() -> Option<&'static str> {
-    static HOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    HOME.get_or_init(|| {
-        let h = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok()?;
-        let h = h.trim_end_matches(['/', '\\']).to_string();
-        (h.len() > 1).then_some(h)
-    })
-    .as_deref()
-}
-
 /// `s` with the home folder said as `~` (R3: the TUI does), wherever a
-/// path to it starts.
-pub(crate) fn tilde(s: &str) -> String {
-    match home() {
-        Some(h) => tilde_in(s, h),
+/// path to it starts ([`crate::named::home_len`]: a Windows path however
+/// it is spelled). `quotes`: a quote starts a path too (JSON); not in a
+/// shell command, where `"~/x"` is not the home.
+pub(crate) fn tilde(s: &str, quotes: bool) -> String {
+    match crate::named::home() {
+        Some(h) => tilde_in(s, h, quotes),
         None => s.to_string(),
     }
 }
 
-fn tilde_in(s: &str, home: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(at) = rest.find(home) {
-        let after = &rest[at + home.len()..];
-        let starts = at == 0 || rest[..at].ends_with([' ', '"', '\'', '=', '(', ':']);
-        let ends = after.is_empty() || after.starts_with(['/', '\\', ' ', '"', '\'']);
-        out.push_str(&rest[..at]);
-        out.push_str(if starts && ends { "~" } else { home });
-        rest = after;
+fn tilde_in(s: &str, home: &str, quotes: bool) -> String {
+    let b = s.as_bytes();
+    let (mut out, mut from, mut i) = (String::with_capacity(s.len()), 0, 0);
+    while i < b.len() {
+        let starts = i == 0 || matches!(b[i - 1], b' ' | b'=' | b'(' | b':' | b'\t') || (quotes && matches!(b[i - 1], b'"' | b'\''));
+        if starts
+            && s.is_char_boundary(i)
+            && let Some(n) = crate::named::home_len(&s[i..], home)
+        {
+            out.push_str(&s[from..i]);
+            out.push('~');
+            i += n;
+            from = i;
+        } else {
+            i += 1;
+        }
     }
-    out.push_str(rest);
+    out.push_str(&s[from..]);
     out
 }
 
@@ -672,6 +670,10 @@ pub(crate) struct Card {
     /// the tooltip when the verb is not it.
     pub verb: SharedString,
     pub full: Option<SharedString>,
+    /// The verb whole (the folded tally's), and what the tally counts it
+    /// under: the verb, an MCP tool's full name (servers apart).
+    pub word: SharedString,
+    pub key: SharedString,
     /// An MCP tool's `[server]`, in the meta.
     pub server: Option<SharedString>,
     /// The target, `~` for the home folder.
@@ -679,13 +681,19 @@ pub(crate) struct Card {
     /// A path target: its folder (`arg`, with its last `/`) and its file
     /// (`prose_t`: the file is what one scans for).
     pub path: Option<(SharedString, SharedString)>,
-    /// A finished read's `214 lines`, a grep's or find's `11 hits` (R4).
+    /// A finished read's `214 lines`, a grep's or find's `11 hits` (R4), as
+    /// the whole result says: `90+ lines`, `40+ hits` when it can only
+    /// say at least, `no hits` for a miss.
     pub facts: Option<SharedString>,
     /// The well's header: its path, and on the right `replaced 3 → 6
-    /// lines` (an edit) or `lines 41–88` (a read).
+    /// lines` (an edit) or `lines 41–88` (a read; `of 664` when the file
+    /// goes on).
     pub head: Option<(SharedString, Option<SharedString>)>,
     /// A read's lines with the file's own numbers (R6): number, text.
     pub numbered: Option<Arc<[(SharedString, SharedString)]>>,
+    /// A read well's end: the lines read it does not show (`… 32 more
+    /// lines`; `… more lines` when how many is not known).
+    pub more: Option<SharedString>,
 }
 
 /// A read result's line, `N\t…` as the engine numbers it (`read.rs`).
@@ -697,7 +705,7 @@ fn numbered_line(l: &str) -> Option<(&str, &str)> {
 
 /// The engine's edit result: `Edited p — replaced 3 line(s) with 6 line(s)`.
 fn replaced(result: &str) -> Option<SharedString> {
-    let rest = &result[result.find("replaced ")? + "replaced ".len()..];
+    let rest = &result[result.rfind("replaced ")? + "replaced ".len()..];
     let (a, rest) = rest.split_once(" line(s) with ")?;
     let b = rest.split_once(" line(s)")?.0;
     let num = |s: &str| s.trim().parse::<u64>().ok();
@@ -708,72 +716,167 @@ fn plural(n: usize, one: &str, many: &str) -> SharedString {
     format!("{n} {}", if n == 1 { one } else { many }).into()
 }
 
+/// What a read returned, from its whole result (the engine's `read.rs`:
+/// `N\tline` from `offset + 1`, `limit` lines (500 unless given), then
+/// `... (M more lines)` when the file goes on): its first and last line's
+/// numbers, and the file's lines past them. `last` is `None` when the
+/// result was cut ([`synaps_client::transcript::ToolCall::tail`]) and its
+/// end says neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Span {
+    first: u64,
+    last: Option<u64>,
+    /// The last number the preview holds.
+    seen: u64,
+    rest: Option<u64>,
+}
+
+/// The engine's `... (M more lines)`.
+fn more_lines(l: &str) -> Option<u64> {
+    l.strip_prefix("... (")?.strip_suffix(" more lines)")?.parse().ok()
+}
+
+fn span(t: &synaps_client::transcript::ToolCall, limit: Option<u64>) -> Option<Span> {
+    let num = |l: &str| numbered_line(l).and_then(|(n, _)| n.parse::<u64>().ok());
+    let mut nums = t.result.lines().filter_map(num);
+    let first = nums.next()?;
+    let seen = nums.next_back().unwrap_or(first);
+    let end = if t.tail.is_empty() { t.result.as_str() } else { t.tail.as_str() };
+    let last = if t.tail.is_empty() { Some(seen) } else { t.tail.lines().rev().find_map(num) };
+    let rest = end.lines().rev().find_map(more_lines);
+    // The file goes on past it: it read all it was asked to.
+    let last = last.or_else(|| rest.map(|_| first + limit.unwrap_or(500) - 1));
+    Some(Span { first, last, seen, rest })
+}
+
+/// A grep line with `context` set: a match (`path:N:text`, `N:text` for
+/// one file), not a context line (`path-N-text`) nor the `--` between
+/// groups. The first number between two of the same separator says.
+fn grep_match(l: &str) -> bool {
+    let b = l.as_bytes();
+    for j in 0..b.len() {
+        if !b[j].is_ascii_digit() || (j > 0 && (b[j - 1].is_ascii_digit() || !matches!(b[j - 1], b':' | b'-'))) {
+            continue;
+        }
+        let k = j + b[j..].iter().take_while(|c| c.is_ascii_digit()).count();
+        match b.get(k) {
+            Some(&c @ (b':' | b'-')) if j == 0 || b[j - 1] == c => return c == b':',
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A grep's or find's hits (R4), from the engine's text (`search/mod.rs`):
+/// `no hits` for its `No matches found.` / `No files found.`; else its
+/// lines up to the first blank one (its notes come after one), matches
+/// only when `context` is set; `N+` when the result or the search was cut
+/// (the preview's slice, a truncation, a timeout, errors).
+fn hits(t: &synaps_client::transcript::ToolCall, context: bool) -> SharedString {
+    let r = t.result.as_str();
+    if r.starts_with("No matches found.") || r.starts_with("No files found.") {
+        return "no hits".into();
+    }
+    let body = r.split("\n\n").next().unwrap_or_default();
+    let notes = |s: &str| s.split("\n\n").skip(1).any(|n| n.starts_with("... (") || n.contains("while searching, results may be incomplete"));
+    let cut = !t.tail.is_empty() || notes(r) || t.tail.lines().any(|l| l.starts_with("... (") || l.contains("results may be incomplete"));
+    let n = body.lines().filter(|l| !l.trim().is_empty() && *l != "--" && (!context || grep_match(l))).count();
+    match (n, cut) {
+        (n, true) => format!("{n}+ hits").into(),
+        (n, false) => plural(n, "hit", "hits"),
+    }
+}
+
 impl Card {
-    /// `arg`: the row's one-line argument ([`crate::app::row_cache`]).
-    pub(crate) fn of(t: &synaps_client::transcript::ToolCall, preview: Option<&Preview>, arg: &str) -> Self {
-        let (verb, server) = verb_of(&t.name);
-        let cut = verb_cut(&verb);
-        let full = (cut.is_some() || verb.as_ref() != t.name).then(|| SharedString::from(t.name.clone()));
-        let input = t.input.starts_with('{').then(|| serde_json::from_str::<serde_json::Value>(&t.input).ok()).flatten();
-        let field = |k: &str| input.as_ref().and_then(|v| v.get(k)).and_then(|v| v.as_str()).map(str::to_string);
-        let target = match t.name.as_str() {
-            "grep" | "find" => match (field("pattern"), field("path")) {
-                (Some(pat), Some(path)) => format!("{pat}  {}", tilde(&path)),
-                (Some(pat), None) => pat,
-                _ => tilde(arg),
+    /// `arg`: the row's one-line argument ([`crate::app::row_cache`]);
+    /// `input`: the call's input parsed.
+    pub(crate) fn of(t: &synaps_client::transcript::ToolCall, preview: Option<&Preview>, arg: &str, input: Option<&serde_json::Value>) -> Self {
+        let (word, server) = verb_of(&t.name);
+        let cut = verb_cut(&word);
+        let full = (cut.is_some() || word.as_ref() != t.name).then(|| SharedString::from(t.name.clone()));
+        let key = if server.is_some() { SharedString::from(t.name.clone()) } else { word.clone() };
+        let field = |k: &str| input.and_then(|v| v.get(k)).and_then(|v| v.as_str());
+        let int = |k: &str| input.and_then(|v| v.get(k)).and_then(serde_json::Value::as_u64);
+        let file = matches!(t.name.as_str(), "read" | "write" | "edit" | "multi_edit" | "ls");
+        let target = match (t.name.as_str(), field("path")) {
+            ("grep" | "find", Some(path)) => match field("pattern") {
+                Some(pat) => format!("{pat}  {}", tilde(path, false)),
+                None => tilde(arg, true),
             },
-            _ => tilde(arg),
+            ("grep" | "find", None) => field("pattern").map_or_else(|| tilde(arg, true), str::to_string),
+            // A path and more (a read's offset, a write's content): the
+            // path; the rest says in the meta or the well's header.
+            (_, Some(path)) if file && preview.is_none_or(|pv| pv.title.is_empty()) => tilde(path, false),
+            ("bash", _) => tilde(arg, false),
+            _ => tilde(arg, true),
         };
-        let is_path = matches!(t.name.as_str(), "read" | "write" | "edit" | "multi_edit" | "ls")
-            && !target.contains(" +")
-            && !target.contains('\n')
-            && !target.starts_with('{');
+        let is_path = file && !target.contains(" +") && !target.contains('\n') && !target.starts_with('{');
         let path = is_path
             .then(|| target.rfind(['/', '\\']).filter(|at| at + 1 < target.len()))
             .flatten()
             .map(|at| (SharedString::from(target[..=at].to_string()), SharedString::from(target[at + 1..].to_string())));
         let done = t.status == Some(ToolStatus::Done);
-        let numbered: Option<Vec<(&str, &str)>> = (t.name == "read")
-            .then(|| {
-                let lines: Vec<&str> = t.result.lines().filter(|l| numbered_line(l).is_some()).collect();
-                (!lines.is_empty()).then(|| lines.into_iter().filter_map(numbered_line).collect())
-            })
-            .flatten();
-        let facts = match t.name.as_str() {
-            "read" if done => numbered.as_ref().map(|n| plural(n.len(), "line", "lines")),
-            "grep" | "find" if done => {
-                let hits = t.result.lines().filter(|l| !l.trim().is_empty() && !l.starts_with("...")).count();
-                Some(plural(hits, "hit", "hits"))
-            }
-            _ => None,
-        };
-        let head = match (preview, &numbered) {
-            (Some(pv), _) if !pv.title.is_empty() => Some((tilde(&pv.title).into(), replaced(&t.result))),
-            (_, Some(n)) if !n.is_empty() => {
-                let range = match (n.first(), n.last()) {
-                    (Some(a), Some(b)) if a.0 != b.0 => format!("lines {}–{}", a.0, b.0),
-                    (Some(a), _) => format!("line {}", a.0),
-                    _ => String::new(),
-                };
-                Some((target.clone().into(), (!range.is_empty()).then(|| range.into())))
-            }
-            _ => None,
-        };
-        let numbered = numbered.map(|n| {
-            n.into_iter()
+        let read = (t.name == "read").then(|| span(t, int("limit").filter(|l| *l > 0))).flatten();
+        let numbered: Option<Vec<(SharedString, SharedString)>> = read.map(|_| {
+            t.result
+                .lines()
+                .filter_map(numbered_line)
                 .take(crate::app::RESULT_LINES)
                 .map(|(a, b)| (SharedString::from(a.to_string()), SharedString::from(b.to_string())))
-                .collect::<Vec<_>>()
-                .into()
+                .collect()
         });
-        Card { verb: cut.unwrap_or(verb), full, server, target: target.into(), path, facts, head, numbered }
+        let facts = match t.name.as_str() {
+            "read" if done => read.map(|s| match s.last {
+                Some(last) => plural((last + 1).saturating_sub(s.first) as usize, "line", "lines"),
+                None => format!("{}+ lines", s.seen + 1 - s.first).into(),
+            }),
+            "grep" if done => Some(hits(t, int("context").is_some_and(|c| c > 0))),
+            "find" if done => Some(hits(t, false)),
+            _ => None,
+        };
+        let head = match (preview, read) {
+            (Some(pv), _) if !pv.title.is_empty() => Some((tilde(&pv.title, false).into(), replaced(&t.result))),
+            (_, Some(s)) => {
+                let range = match s.last {
+                    Some(last) if last != s.first => format!("lines {}–{last}", s.first),
+                    Some(_) => format!("line {}", s.first),
+                    None => format!("lines {}–{}+", s.first, s.seen),
+                };
+                let of = s.rest.zip(s.last).map(|(rest, last)| format!(" of {}", last + rest)).unwrap_or_default();
+                Some((target.clone().into(), Some(format!("{range}{of}").into())))
+            }
+            _ => None,
+        };
+        let more = read.and_then(|s| {
+            let shown = numbered.as_ref().and_then(|n| n.last()).and_then(|(n, _)| n.parse::<u64>().ok())?;
+            match s.last {
+                Some(last) if last > shown => Some(SharedString::from(format!("… {} more lines", last - shown))),
+                Some(_) => None,
+                None => Some("… more lines".into()),
+            }
+        });
+        Card {
+            verb: cut.unwrap_or_else(|| word.clone()),
+            full,
+            word,
+            key,
+            server,
+            target: target.into(),
+            path,
+            facts,
+            head,
+            numbered: numbered.map(Into::into),
+            more,
+        }
     }
 }
 
 /// One tool name in a summary's tally.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Tally {
+    /// Its verb whole, and what it counts under ([`Card::key`]).
     pub name: SharedString,
+    pub key: SharedString,
     pub n: usize,
     pub n_text: SharedString,
     pub hue: Hue,
@@ -881,11 +984,19 @@ impl RunSummary {
                 delta.written += d.written;
                 delta.approx |= d.approx;
             }
-            // By verb (polish.md §2.1a): `multi_edit` counts as an edit.
-            let name = if row.card.verb.is_empty() { &row.name } else { &row.card.verb };
-            match tally.iter_mut().find(|t| &t.name == name) {
+            // By verb (polish.md §2.1a): `multi_edit` counts as an edit;
+            // an MCP tool by its full name (two servers' `search` apart).
+            let (name, key) = if row.card.key.is_empty() { (&row.name, &row.name) } else { (&row.card.word, &row.card.key) };
+            match tally.iter_mut().find(|t| &t.key == key) {
                 Some(t) => t.n += 1,
-                None => tally.push(Tally { name: name.clone(), n: 1, n_text: SharedString::default(), hue: row.hue, name_chars: 0 }),
+                None => tally.push(Tally {
+                    name: name.clone(),
+                    key: key.clone(),
+                    n: 1,
+                    n_text: SharedString::default(),
+                    hue: row.hue,
+                    name_chars: 0,
+                }),
             }
         }
         // Stable: equal counts keep their first-use order.
@@ -1807,7 +1918,7 @@ fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metric
                         .child(div().flex_1().min_w_0().whitespace_normal().child(text.clone())),
                 );
             }
-            col.child(lines.when(row.result_more > 0, |d| d.child(more(row.result_more))))
+            col.child(lines.children(row.card.more.clone().map(|t| div().px(px(inset)).text_color(p.dim_o).child(t))))
         }
         _ => col.child(
             v_flex()
@@ -2243,31 +2354,95 @@ mod tests {
         use synaps_client::transcript::{ToolCall, ToolStatus};
         let v = |n: &str| verb_of(n).0.to_string();
         assert_eq!(
-            [v("read"), v("multi_edit"), v("subagent_start"), v("subagent_collect"), v("ext__github__search")],
-            ["read", "edit", "spawn", "collect", "tool"]
+            [v("read"), v("multi_edit"), v("subagent_start"), v("subagent_collect"), v("ext__github__search_issues")],
+            ["read", "edit", "spawn", "collect", "search_issues"]
         );
-        assert_eq!(verb_of("ext__github__search").1.as_deref(), Some("[github]"));
-        assert_eq!(tilde_in("/home/you/work/a.rs", "/home/you"), "~/work/a.rs");
-        assert_eq!(tilde_in("cd /home/you && ls /home/yourself", "/home/you"), "cd ~ && ls /home/yourself");
+        assert_eq!(verb_of("ext__github__search_issues").1.as_deref(), Some("[github]"));
+        assert_eq!(tilde_in("/home/you/work/a.rs", "/home/you", true), "~/work/a.rs");
+        assert_eq!(tilde_in("cd /home/you && ls /home/yourself", "/home/you", false), "cd ~ && ls /home/yourself");
+        // Quoted, a shell does not say the home as `~`; JSON does.
+        assert_eq!(tilde_in("cat \"/home/you/a\"", "/home/you", false), "cat \"/home/you/a\"");
+        assert_eq!(tilde_in(r#"{"path":"/home/you/a"}"#, "/home/you", true), r#"{"path":"~/a"}"#);
+        // Windows: any case, either separator, escaped in JSON.
+        let win = "C:\\Users\\you";
+        assert_eq!(tilde_in("type c:\\users\\you\\a.rs", win, false), "type ~\\a.rs");
+        assert_eq!(tilde_in("C:/Users/you/a.rs", win, true), "~/a.rs");
+        assert_eq!(tilde_in(r#"{"p":"C:\\Users\\you\\a.rs"}"#, win, true), r#"{"p":"~\\a.rs"}"#);
         assert_eq!(replaced("Edited a.rs — replaced 3 line(s) with 6 line(s)").as_deref(), Some("replaced 3 → 6 lines"));
+        assert_eq!(replaced("Edited replaced/a.rs — replaced 1 line(s) with 2 line(s)").as_deref(), Some("replaced 1 → 2 lines"));
         let call = |name: &str, input: &str, result: &str| ToolCall {
             tool_id: "t".into(),
             name: name.into(),
             input: input.into(),
             result: result.into(),
+            tail: String::new(),
             status: Some(ToolStatus::Done),
         };
-        let read = Card::of(&call("read", "src/a.rs", "41\tfn a() {\n42\t}\n\n... (9 more lines)"), None, "src/a.rs");
+        let card = |t: &ToolCall, arg: &str| Card::of(t, None, arg, crate::app::input_of(&t.input).as_ref());
+        // A read of 2 lines, the file going on for 9 more.
+        let read = card(&call("read", "src/a.rs", "41\tfn a() {\n42\t}\n\n... (9 more lines)"), "src/a.rs");
         assert_eq!(read.path, Some(("src/".into(), "a.rs".into())));
         assert_eq!(read.facts.as_deref(), Some("2 lines"));
-        assert_eq!(read.head, Some(("src/a.rs".into(), Some("lines 41–42".into()))));
+        assert_eq!(read.head, Some(("src/a.rs".into(), Some("lines 41–42 of 51".into()))));
         assert_eq!(read.numbered.as_deref().map(|n| n.len()), Some(2));
-        let grep = Card::of(&call("grep", r#"{"path":"src","pattern":"Stale"}"#, "a.rs:1: x\nb.rs:2: y"), None, "");
+        assert_eq!(read.more, None);
+        // Offset and limit: the path, not the input's JSON.
+        let input = r#"{"limit":50,"offset":40,"path":"src/a.rs"}"#;
+        let body: String = (41..=90).map(|n| format!("{n}\tx\n")).collect();
+        let read = card(&call("read", input, &body), input);
+        assert_eq!((read.target.as_ref(), read.facts.as_deref()), ("src/a.rs", Some("50 lines")));
+        assert_eq!(read.head.as_ref().and_then(|h| h.1.as_deref()), Some("lines 41–90"));
+        assert_eq!(read.more.as_deref(), Some("… 38 more lines"), "12 shown of 50");
+        // Cut to the preview: the count from the whole result's end, not
+        // the preview's slice.
+        let mut cut = call("read", "src/big.rs", &format!("{}…", (1..=90).map(|n| format!("{n}\tx\n")).collect::<String>()));
+        cut.tail = "499\tx\n500\tx\n\n... (164 more lines)".into();
+        let read = card(&cut, "src/big.rs");
+        assert_eq!(read.facts.as_deref(), Some("500 lines"));
+        assert_eq!(read.head.as_ref().and_then(|h| h.1.as_deref()), Some("lines 1–500 of 664"));
+        assert_eq!(read.more.as_deref(), Some("… 488 more lines"));
+        // Its end holds no whole line: it read all it was asked (500).
+        cut.tail = "\n... (164 more lines)".into();
+        assert_eq!(card(&cut, "src/big.rs").facts.as_deref(), Some("500 lines"));
+        // Nor that: at least what the preview holds.
+        cut.tail = "[Output virtualised: 30000 bytes, 600 lines]".into();
+        let read = card(&cut, "src/big.rs");
+        assert_eq!(read.facts.as_deref(), Some("90+ lines"));
+        assert_eq!(read.head.as_ref().and_then(|h| h.1.as_deref()), Some("lines 1–90+"));
+        assert_eq!(read.more.as_deref(), Some("… more lines"));
+        // Grep: matches only; a miss is none, its notes nothing; cut, at least.
+        let grep_in = r#"{"path":"src","pattern":"Stale"}"#;
+        let grep = card(&call("grep", grep_in, "a.rs:1: x\nb.rs:2: y"), "");
         assert_eq!((grep.target.as_ref(), grep.path.is_none(), grep.facts.as_deref()), ("Stale  src", true, Some("2 hits")));
-        let long = Card::of(&call("subagent_status", "", ""), None, "");
+        let hits = |input: &str, result: &str| card(&call("grep", input, result), "").facts.map(|f| f.to_string());
+        assert_eq!(hits(grep_in, "No matches found."), Some("no hits".into()));
+        let ignored = "No matches found.\n\nNot searched: files excluded by .gitignore or .ignore, and node_modules and target directories.";
+        assert_eq!(hits(grep_in, ignored), Some("no hits".into()));
+        assert_eq!(hits(grep_in, "a.rs:1:x\n\n[1 error while searching, results may be incomplete. First: b: denied]"), Some("1+ hits".into()));
+        assert_eq!(hits(grep_in, "a.rs:1:x\nb.rs:1:y\n\n... (output truncated, more than 100 total bytes)"), Some("2+ hits".into()));
+        assert_eq!(hits(grep_in, "a.rs:1:x\n\nNot searched: files excluded by .gitignore"), Some("1 hit".into()));
+        let ctx = r#"{"path":"src","pattern":"x","context":1}"#;
+        let shown = "src/a.rs-1-at 12:30:05\nsrc/a.rs:2:x on 2026-11-17\nsrc/a.rs-3-after\n--\nsrc/c.rs-9-before\nsrc/c.rs:10:x y\n";
+        assert_eq!(hits(ctx, shown), Some("2 hits".into()), "the text's own numbers say nothing");
+        assert_eq!(hits(ctx, "src/c.rs-9-before\nsrc/c.rs:10:x y\n"), Some("1 hit".into()));
+        assert_eq!(hits(ctx, "1-before\n2:x\n3-after"), Some("1 hit".into()), "one file: no path");
+        let mut big = call("grep", grep_in, "a.rs:1:x\nb.rs:2:…");
+        big.tail = "z.rs:900:x".into();
+        assert_eq!(card(&big, "").facts.as_deref(), Some("2+ hits"));
+        let find = |result: &str| card(&call("find", r#"{"pattern":"*.rs"}"#, result), "").facts.map(|f| f.to_string());
+        assert_eq!(find("No files found."), Some("no hits".into()));
+        assert_eq!(find("a.rs\nb.rs"), Some("2 hits".into()));
+        // MCP: the tool's own name, cut to the column; its server in the
+        // meta; counted apart from another server's.
+        let mcp = card(&call("ext__byteray__read_pseudocode", "", ""), "");
+        assert_eq!(
+            (mcp.verb.as_ref(), mcp.full.as_deref(), mcp.server.as_deref(), mcp.word.as_ref(), mcp.key.as_ref()),
+            ("read_pse…", Some("ext__byteray__read_pseudocode"), Some("[byteray]"), "read_pseudocode", "ext__byteray__read_pseudocode")
+        );
+        let long = card(&call("subagent_status", "", ""), "");
         assert_eq!((long.verb.as_ref(), long.full.as_deref()), ("status", Some("subagent_status")));
-        let odd = Card::of(&call("notebook_edit", "", ""), None, "");
-        assert_eq!((odd.verb.as_ref(), odd.full.as_deref()), ("notebook…", Some("notebook_edit")));
+        let odd = card(&call("notebook_edit", "", ""), "");
+        assert_eq!((odd.verb.as_ref(), odd.full.as_deref(), odd.key.as_ref()), ("notebook…", Some("notebook_edit"), "notebook_edit"));
     }
 
     #[test]
@@ -2304,6 +2479,7 @@ mod tests {
     fn a_tally_cut_short_names_what_fits_and_counts_the_rest() {
         let tal = |name: &str, n: usize| Tally {
             name: name.to_string().into(),
+            key: name.to_string().into(),
             n,
             n_text: n.to_string().into(),
             hue: Hue::of(name),

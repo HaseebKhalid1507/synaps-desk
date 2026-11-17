@@ -25,6 +25,8 @@ use crate::protocol::*;
 
 /// Bound on the tool input/result previews kept per tool row.
 const PREVIEW_MAX: usize = 4 * 1024;
+/// How much of a cut result's end a call keeps ([`ToolCall::tail`]).
+const TAIL_MAX: usize = 512;
 /// How far ahead id reuse looks for a row of the same kind.
 const REUSE_LOOKAHEAD: usize = 8;
 /// The host's record time of a history message (agent-core
@@ -194,6 +196,11 @@ pub struct ToolCall {
     pub name: String,
     pub input: String,
     pub result: String,
+    /// The result's end when [`preview`] cut it (`result` then ends `…`):
+    /// its last whole lines, at most [`TAIL_MAX`] bytes; empty otherwise. A
+    /// row says what the whole result held from it (a read's last line, a
+    /// note the engine ends with), not from the preview's slice.
+    pub tail: String,
     pub status: Option<ToolStatus>,
 }
 
@@ -673,6 +680,7 @@ impl Transcript {
                                 name: b.get("name").and_then(Value::as_str).unwrap_or("tool").to_string(),
                                 input: preview(&compact(b.get("input").unwrap_or(&Value::Null))),
                                 result: String::new(),
+                                tail: String::new(),
                                 status: Some(ToolStatus::Running),
                             };
                             self.push(ItemKind::Tool, String::new(), Some(tool), false, reuse);
@@ -686,6 +694,7 @@ impl Transcript {
                                 if let Some(t) = self.items[ix].tool.as_mut() {
                                     t.status = Some(tool_outcome(&result, is_error).status());
                                     t.result = preview(&result);
+                                    t.tail = tail(&result);
                                 }
                                 self.touch(ix);
                             }
@@ -958,6 +967,7 @@ impl Transcript {
                     if let Some(ix) = self.tool_mut(tool_id) {
                         if let Some(t) = self.items[ix].tool.as_mut() {
                             t.result = preview(result);
+                            t.tail = tail(result);
                             t.status = Some(tool_outcome(result, false).status());
                         }
                         self.items[ix].streaming = false;
@@ -1018,11 +1028,40 @@ fn preview(s: &str) -> String {
     format!("{}…", &s[..end])
 }
 
+/// The end of a result [`preview`] cuts: its last whole lines in at most
+/// `TAIL_MAX` bytes (the line the window starts in is left out).
+fn tail(s: &str) -> String {
+    if s.len() <= PREVIEW_MAX {
+        return String::new();
+    }
+    let mut start = s.len().saturating_sub(TAIL_MAX).max(PREVIEW_MAX);
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    let window = &s[start..];
+    match (s[..start].ends_with('\n'), window.find('\n')) {
+        (true, _) => window.to_string(),
+        (false, Some(at)) => window[at + 1..].to_string(),
+        (false, None) => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod outcome_tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A cut result keeps its last whole lines; one the preview holds, none.
+    #[test]
+    fn a_cut_result_keeps_its_end() {
+        assert_eq!(tail("1\ta\n2\tb\n"), "");
+        let read: String = (1..=600).map(|n| format!("{n}\tline {n}\n")).collect::<String>() + "\n... (64 more lines)";
+        let t = tail(&read);
+        assert!(t.len() <= TAIL_MAX && t.ends_with("600\tline 600\n\n... (64 more lines)"), "{t}");
+        assert!(t.split('\n').next().is_some_and(|l| l.split_once('\t').is_some_and(|(n, l)| l == format!("line {n}"))), "{t}");
+        assert_eq!(tail(&"x".repeat(9000)), "", "no whole line: nothing");
+    }
 
     /// The engine's own result texts (agent-engine origin/dev): none of them
     /// sets `is_error`.
