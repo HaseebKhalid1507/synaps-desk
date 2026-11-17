@@ -115,8 +115,9 @@ fn session_meta_counts_running_workers() {
 }
 
 /// The attach snapshot's `meta.continue_info` (a resume the daemon followed
-/// down a compaction chain, F24): decoded; `null` (a 0.11.1 capture) and
-/// missing (an older daemon) are `None`.
+/// down a compaction chain, F24): decoded; `null` (a 0.11.1 capture),
+/// missing (an older daemon) and a shape this client doesn't read (a newer
+/// one) are `None`, and the attach still decodes.
 #[test]
 fn session_meta_carries_continue_info() {
     assert_eq!(attached("attached_history.json").meta.continue_info, None, "null");
@@ -132,6 +133,17 @@ fn session_meta_carries_continue_info() {
     frame["meta"].as_object_mut().unwrap().remove("continue_info");
     let DaemonFrame::Attached(a) = decode_frame(&frame.to_string()).unwrap() else { panic!() };
     assert_eq!(a.meta.continue_info, None, "missing");
+    for bad in [
+        serde_json::json!("j1"),
+        serde_json::json!(["j1", "j3"]),
+        serde_json::json!({"session_id": 3, "resolved_via": "compacted", "query": "j1"}),
+        serde_json::json!({"session_id": "j3", "resolved_via": {"kind": "compacted"}, "query": "j1"}),
+    ] {
+        frame["meta"]["continue_info"] = bad.clone();
+        let DaemonFrame::Attached(a) = decode_frame(&frame.to_string()).unwrap() else { panic!("{bad}: the attach decodes") };
+        assert_eq!(a.meta.continue_info, None, "{bad}");
+        assert!(!a.meta.id.is_empty(), "{bad}: the rest of the meta is read");
+    }
 }
 
 /// M5: a new variant is `Ok(Unknown)`; a known one that changed shape is a

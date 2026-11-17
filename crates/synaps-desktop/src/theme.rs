@@ -1342,7 +1342,13 @@ const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 /// `wait` has passed; `None` (said on stderr): written unlocked. Never a
 /// blocking lock.
 fn lock_settings(lock: &Path, wait: std::time::Duration) -> Option<std::fs::File> {
-    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock).ok()?;
+    let f = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("synaps-desktop: {} not opened ({e}): settings written unlocked", lock.display());
+            return None;
+        }
+    };
     let deadline = std::time::Instant::now() + wait;
     loop {
         match f.try_lock() {
@@ -1914,7 +1920,8 @@ mod tests {
     /// R4: a write waits for another process's (the lock is advisory, on a
     /// file of its own: two opens conflict as two processes do). N4: never
     /// for longer than [`LOCK_WAIT`]: a holder that never lets go (stopped
-    /// mid-write) does not freeze it; it writes unlocked.
+    /// mid-write) does not freeze it; it writes unlocked, as it does when
+    /// the lock file can't be opened.
     #[test]
     fn a_write_waits_for_the_lock() {
         let dir = std::env::temp_dir().join(format!("synaps-desktop-lock-{}", std::process::id()));
@@ -1938,6 +1945,15 @@ mod tests {
         let waited = t0.elapsed();
         assert!(waited >= LOCK_WAIT && waited < LOCK_WAIT * 8, "{waited:?}");
         assert_eq!(load_accent(&path).as_deref(), Some("#35f2ff"));
+        // A lock file that can't be opened (a directory there): written
+        // unlocked at once, said on stderr.
+        drop(other);
+        std::fs::remove_file(path.with_extension("json.lock")).unwrap();
+        std::fs::create_dir(path.with_extension("json.lock")).unwrap();
+        let t0 = std::time::Instant::now();
+        save_settings(&path, &[("accent", "#ff2d7b".into())]).unwrap();
+        assert!(t0.elapsed() < LOCK_WAIT, "{:?}", t0.elapsed());
+        assert_eq!(load_accent(&path).as_deref(), Some("#ff2d7b"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
