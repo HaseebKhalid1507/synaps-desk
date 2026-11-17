@@ -233,6 +233,10 @@ pub(crate) trait Scrolled: Clone + 'static {
     fn content(&self) -> Size<Pixels>;
     fn offset(&self) -> Point<Pixels>;
     fn scroll_to(&self, at: Point<Pixels>);
+    /// A page toward a track click: where the target glides, at once here.
+    fn page_to(&self, at: Point<Pixels>) {
+        self.scroll_to(at);
+    }
     fn drag(&self, _on: bool) {}
     /// A drag begun on this bar is still this target's: false once another
     /// list took its place (a tab, a worker's view).
@@ -281,6 +285,9 @@ impl Scrolled for EditorScrollbarContext {
 pub(crate) struct Rows {
     list: ListState,
     pad: f32,
+    /// The transcript's scroller (Full): a page glides on `snap`, and a
+    /// drag or a jump stops whatever it was doing first.
+    glide: Option<(crate::scroll::Scroller, Rc<crate::motion::Motion>)>,
 }
 
 impl Scrolled for Rows {
@@ -298,7 +305,19 @@ impl Scrolled for Rows {
     /// GPUI's own scrollbar entry: a drag away from the end stops
     /// tail-following, one to the end re-arms it (the wheel's rule).
     fn scroll_to(&self, at: Point<Pixels>) {
+        if let Some((s, _)) = &self.glide {
+            s.cancel();
+        }
         self.list.set_offset_from_scrollbar(neg(at));
+    }
+    fn page_to(&self, at: Point<Pixels>) {
+        let Some((s, fx)) = &self.glide else { return self.scroll_to(at) };
+        let now = self.offset();
+        let view = f32::from(self.viewport().size.height);
+        let cut = s.jump(f32::from(at.y - now.y), true, view, fx.clock());
+        if cut != 0. {
+            self.list.scroll_by(px(cut));
+        }
     }
     fn drag(&self, on: bool) {
         if on {
@@ -434,7 +453,17 @@ impl<S: Scrolled> Bar<S> {
 
 /// A bar over a `gpui::list` padded `pad` px (top and bottom together).
 pub(crate) fn rows(list: &ListState, pad: f32, state: &BarState) -> Bar<Rows> {
-    Bar::new(Rows { list: list.clone(), pad }, state)
+    rows_gliding(list, pad, state, None)
+}
+
+/// The transcript's bar: its pages glide with the scroller (Full).
+pub(crate) fn rows_gliding(
+    list: &ListState,
+    pad: f32,
+    state: &BarState,
+    glide: Option<(crate::scroll::Scroller, Rc<crate::motion::Motion>)>,
+) -> Bar<Rows> {
+    Bar::new(Rows { list: list.clone(), pad, glide }, state)
 }
 
 /// The composer's bar, in place of the kit's (its editor calls this each
@@ -678,7 +707,7 @@ impl<S: Scrolled> Frame<S> {
                     scroll.scroll_to(place(axis, geo.jump(at, now), offset));
                     Some(geo.len() / 2.)
                 } else {
-                    scroll.scroll_to(place(axis, geo.page(now, at > thumb.start), offset));
+                    scroll.page_to(place(axis, geo.page(now, at > thumb.start), offset));
                     None
                 };
                 if let Some(g) = grab {

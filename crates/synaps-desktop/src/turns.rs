@@ -835,14 +835,20 @@ impl AppView {
         let view = match (keep, kept) {
             (Keep::Same, Some(v)) => v,
             (Keep::Append, Some(v)) => {
-                v.update(cx, |s, cx| s.set_text(text, cx));
+                // Text streamed in: its words start at 70 % and reach full
+                // colour (fluid.md §3.4; `motion::text_motion`, the one
+                // policy). Not in low power (the agent's motion stops).
+                let motion = if self.fx.fluid() { motion::text_motion() } else { Default::default() };
+                v.update(cx, |s, cx| {
+                    s.set_motion(motion);
+                    s.set_text(text, cx)
+                });
                 v
             }
             _ => {
-                // No `TextViewMotion` (`TextView::motion`): the kit's stream
-                // fade stays at its zero default. A glyph that starts
-                // transparent is a delayed glyph (motion.md rule 1); the
-                // write head marks where the agent writes instead.
+                // A view made with its text (history, a new row) has no
+                // motion policy: what it starts with is not streamed, and
+                // history never animates.
                 let v = cx.new(|cx| TextViewState::markdown(text, cx));
                 let redraw = cx.observe(&v, |_, _, cx| cx.notify());
                 self.texts.borrow_mut().put(id, text.clone(), (v.clone(), redraw), now);

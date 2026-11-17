@@ -27,6 +27,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::base::motion::Easing;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 // ── the setting ───────────────────────────────────────────────────────
@@ -173,6 +174,127 @@ pub(crate) fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
     let t = t.clamp(0., 1.);
     let l = |p: f32, q: f32| p + (q - p) * t;
     Hsla::from(Rgba { r: l(x.r, y.r), g: l(x.g, y.g), b: l(x.b, y.b), a: l(x.a, y.a) })
+}
+
+// ── fluid (cohesion/fluid.md §2): matter on springs ─────────────────
+
+/// `wheel`: wheel-notch scrolling (91 ms to 95 %).
+pub(crate) const WHEEL_RESPONSE: f32 = 0.12;
+/// `flick`: small travel (≤ 16 px): arrival offsets, streamed line growth.
+pub(crate) const FLICK_RESPONSE: f32 = 0.16;
+/// `glide`: scroll jumps, a view arriving.
+pub(crate) const GLIDE_RESPONSE: f32 = 0.3;
+/// An arriving block's or word's first strength: never lower (law 3).
+pub(crate) const LIFT: f32 = 0.7;
+/// A block or row arriving in a list travels this far, from below.
+pub(crate) const ARRIVE: f32 = 8.;
+/// A view (session, tab, worker) arriving travels this far, in its direction.
+pub(crate) const SHIFT: f32 = 12.;
+/// A streamed word reaches full strength over this.
+pub(crate) const STREAM_FADE: Duration = Duration::from_millis(180);
+/// Each further word of one update starts this much later.
+pub(crate) const STREAM_STAGGER: Duration = Duration::from_millis(12);
+/// Positions settle within this (px).
+const FLUID_EPSILON: f32 = 0.5;
+
+/// `stream`: a streamed word's strength, piecewise linear 0.70 at 0, 0.88
+/// at 0.35, 1.0 at 1: it starts at the floor, so no word is ever faint.
+pub(crate) fn stream_curve() -> Easing {
+    use gpui_kit::base::motion::LinearStop;
+    Easing::linear_stops([LinearStop::at(LIFT, 0.), LinearStop::at(0.88, 0.35), LinearStop::at(1., 1.)]).unwrap_or(Easing::Linear)
+}
+
+/// The one way a text view gets a motion policy (fluid.md §3.4): words
+/// streamed into it start at [`LIFT`] and reach full colour over
+/// [`STREAM_FADE`]. The kit plays it only while its reduce-motion flag is
+/// clear ([`Level::apply`]): Full.
+pub(crate) fn text_motion() -> gpui_kit::base::TextViewMotion {
+    gpui_kit::base::TextViewMotion::default()
+        .with_stream_fade(STREAM_FADE)
+        .with_stream_fade_stagger(STREAM_STAGGER)
+        .with_stream_fade_easing(stream_curve())
+}
+
+/// The one sanctioned opacity (fluid.md §3.6, law 3): something arriving
+/// lifts from [`LIFT`] to full, never lower. Opaque grounds only.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn lift<E: Styled>(el: E, strength: f32) -> E {
+    if strength >= 1. { el } else { el.opacity(strength.max(LIFT)) }
+}
+
+/// A critically damped spring's state (ζ = 1): its displacement `x` from
+/// the target and its velocity `v` (per second). Stepped analytically, so
+/// any frame interval samples the same curve; a retarget shifts `x` by the
+/// move and keeps the velocity.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Spring {
+    pub(crate) x: f32,
+    pub(crate) v: f32,
+}
+
+impl Spring {
+    /// `dt` seconds on, `response` the undamped period.
+    pub(crate) fn step(&mut self, response: f32, dt: f32) {
+        let w = std::f32::consts::TAU / response;
+        let e = (-w * dt).exp();
+        let c = self.v + w * self.x;
+        (self.x, self.v) = ((self.x + c * dt) * e, (self.v - w * c * dt) * e);
+    }
+
+    pub(crate) fn settled(&self, response: f32) -> bool {
+        self.x.abs() < FLUID_EPSILON && self.v.abs() < FLUID_EPSILON * std::f32::consts::TAU / response
+    }
+
+    /// The displacement `t` seconds after a rest at `x0`.
+    pub(crate) fn from_rest(x0: f32, response: f32, t: f32) -> f32 {
+        let mut s = Spring { x: x0, v: 0. };
+        s.step(response, t.max(0.));
+        s.x
+    }
+}
+
+/// How a row is drawn this frame ([`Motion::grow`]): clipped to `shown`
+/// (none: its own height), where its measured height goes, and (arriving)
+/// its content's travel from below and strength.
+#[derive(Clone, Debug)]
+pub(crate) struct Grow {
+    pub(crate) shown: Option<f32>,
+    pub(crate) sink: Rc<Cell<f32>>,
+    pub(crate) travel: f32,
+    pub(crate) strength: f32,
+}
+
+#[derive(Clone, Debug)]
+struct Growing {
+    shown: f32,
+    spring: Spring,
+    arriving: bool,
+    born: Option<Instant>,
+    at: Instant,
+    frame: u64,
+    sink: Rc<Cell<f32>>,
+}
+
+/// The clipped wrapper a growing row is drawn in: `g.shown` tall, its
+/// content laid out at its own height as the wrapper's child (one layout,
+/// not measured apart: no double layout however many rows arrive), and
+/// that height sent to the sink for the next frame.
+pub(crate) fn grow_block(el: AnyElement, g: Grow) -> AnyElement {
+    let sink = g.sink.clone();
+    let inner = div().w_full().flex_shrink_0().relative().top(px(g.travel)).child(el);
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .when_some(g.shown, |d, h| d.h(px(h)))
+        .child(lift(inner, g.strength))
+        .on_children_prepainted(move |b, _, _| {
+            if let Some(b) = b.first() {
+                sink.set(f32::from(b.size.height));
+            }
+        })
+        .into_any_element()
 }
 
 // ── what a value is, and how it runs ──────────────────────────────────
@@ -361,6 +483,8 @@ pub(crate) struct Motion {
     births: RefCell<HashMap<u64, Instant>>,
     slides: RefCell<HashMap<u64, Slide>>,
     turns: RefCell<HashMap<u64, (Tween, u64)>>,
+    /// Rows revealing or growing ([`Motion::grow`]).
+    grows: RefCell<HashMap<u64, Growing>>,
     /// The one timer.
     timer: RefCell<Option<Task<()>>>,
     /// The instant it is armed for, and whom it wakes (cleared as it fires).
@@ -420,6 +544,7 @@ impl Motion {
             births: RefCell::default(),
             slides: RefCell::default(),
             turns: RefCell::default(),
+            grows: RefCell::default(),
             timer: RefCell::default(),
             armed: Rc::default(),
             woke: Rc::default(),
@@ -460,9 +585,114 @@ impl Motion {
             self.seen.borrow_mut().retain(|k, _| !k.0.column());
         }
         self.turns.borrow_mut().clear();
+        self.grows.borrow_mut().clear();
         self.births.borrow_mut().clear();
         self.fold.set(None);
     }
+
+    /// Fluid motion the agent causes plays (fluid.md §5): Full, and not in
+    /// low power, which stops it (the user's scroll asks [`Motion::level`]).
+    pub(crate) fn fluid(&self) -> bool {
+        self.ambient.get()
+    }
+
+    /// Row `key`'s height this frame (fluid.md §3.3, §3.4), or none: drawn
+    /// as is (Reduced, Off, low power, history, at rest).
+    /// - `born` (it arrived while watched): its height reveals 0 → its own
+    ///   on `snap`, clipped. Its first frame is 0 px tall (measured, not
+    ///   shown), so the reveal runs to its true height from the start.
+    ///   Inside, the content travels [`ARRIVE`] → 0 (`flick`) and lifts
+    ///   [`LIFT`] → 1 (`quick`, `out`).
+    /// - `streaming`: a height that grows (a wrapped line) glides there on
+    ///   `flick` (an arrival's reveal on `snap`), never more than `line`
+    ///   short of its true height; it shrinks at once.
+    ///
+    /// Settled, a row that no longer streams is unwrapped (none): a row is
+    /// wrapped only while it moves or streams.
+    pub(crate) fn grow(&self, key: u64, born: Option<Instant>, streaming: bool, line: f32) -> Option<Grow> {
+        if !self.fluid() {
+            return None;
+        }
+        let (frame, now) = (self.frame.get(), self.now());
+        let mut grows = self.grows.borrow_mut();
+        let fresh = born.is_some_and(|b| now.saturating_duration_since(b) < QUICK);
+        let g = match grows.get_mut(&key) {
+            Some(g) if g.frame + 1 >= frame => g,
+            _ if fresh || streaming => {
+                let g = Growing {
+                    shown: f32::NAN,
+                    spring: Spring::default(),
+                    arriving: fresh,
+                    born: born.filter(|_| fresh),
+                    at: now,
+                    frame,
+                    sink: Rc::new(Cell::new(f32::NAN)),
+                };
+                grows.insert(key, g);
+                grows.get_mut(&key)?
+            }
+            _ => return None,
+        };
+        let dt = now.saturating_duration_since(g.at).as_secs_f32().min(0.05);
+        (g.at, g.frame) = (now, frame);
+        let natural = g.sink.get();
+        let since = g.born.map_or(1., |b| now.checked_duration_since(b).map_or(0., |d| d.as_secs_f32()));
+        let (travel, strength) = if g.arriving {
+            let q = (since / QUICK.as_secs_f32()).clamp(0., 1.);
+            (Spring::from_rest(ARRIVE, FLICK_RESPONSE, since), LIFT + (1. - LIFT) * ease::OUT.sample(q))
+        } else {
+            (0., 1.)
+        };
+        let content_moves = g.arriving && (travel >= FLUID_EPSILON || strength < 1.);
+        if natural.is_nan() {
+            // Not measured yet: an arrival is 0 px tall; a streaming row its own height.
+            self.want_frame();
+            return Some(Grow { shown: g.arriving.then_some(0.), sink: g.sink.clone(), travel, strength });
+        }
+        if g.shown.is_nan() {
+            g.shown = if g.arriving { 0. } else { natural };
+        }
+        if g.born.is_none_or(|b| b <= now) {
+            if natural < g.shown {
+                (g.shown, g.spring) = (natural, Spring::default());
+            } else {
+                let response = if g.arriving { SNAP_RESPONSE } else { FLICK_RESPONSE };
+                g.spring.x = g.shown - natural;
+                g.spring.step(response, dt);
+                if streaming {
+                    // The newest line is never more than a line away.
+                    g.spring.x = g.spring.x.max(-line);
+                }
+                g.shown = natural + g.spring.x;
+                if g.spring.settled(response) {
+                    (g.shown, g.spring) = (natural, Spring::default());
+                }
+            }
+        }
+        if g.shown == natural && !content_moves {
+            g.arriving = false;
+            if !streaming {
+                grows.remove(&key);
+                return None;
+            }
+        } else {
+            self.want_frame();
+        }
+        Some(Grow { shown: Some(g.shown), sink: g.sink.clone(), travel, strength })
+    }
+
+    /// Rows revealing or growing now (tests).
+    #[cfg(test)]
+    pub(crate) fn growing(&self) -> usize {
+        self.grows.borrow().len()
+    }
+
+    /// Row `key`'s drawn and measured heights (tests).
+    #[cfg(test)]
+    pub(crate) fn grow_of(&self, key: u64) -> Option<(f32, f32)> {
+        self.grows.borrow().get(&key).map(|g| (g.shown, g.sink.get()))
+    }
+
 
     pub(crate) fn level(&self) -> Level {
         self.level.get()
@@ -543,6 +773,7 @@ impl Motion {
         self.seen.borrow_mut().retain(|_, s| alive(s.frame));
         self.slides.borrow_mut().retain(|_, s| alive(s.frame));
         self.turns.borrow_mut().retain(|_, t| alive(t.1));
+        self.grows.borrow_mut().retain(|_, g| alive(g.frame));
         let cut = BASE + STAGGER_CAP + SIG;
         self.births.borrow_mut().retain(|_, at| now.saturating_duration_since(*at) < cut);
     }
@@ -1286,5 +1517,93 @@ mod tests {
         assert_eq!(stagger(5), STAGGER_CAP);
         assert_eq!(stagger(9), STAGGER_CAP);
         assert_eq!(BEAT * 8, Duration::from_secs(1));
+    }
+
+    /// Law 3 and §3.3: a row born now is 0 px tall on its first frame (its
+    /// text measured, not shown) at no less than [`super::LIFT`], reveals
+    /// to its measured height without overshoot, then is unwrapped.
+    #[test]
+    fn first_paint_text_at_least_lift() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Full, false, t0);
+        let g = m.grow(3, Some(t0), false, 20.).expect("an arrival grows");
+        assert_eq!(g.shown, Some(0.));
+        assert!(g.strength >= super::LIFT && g.strength < 1.);
+        assert!(g.travel > 7.9);
+        g.sink.set(120.);
+        let mut last = 0.;
+        let mut unwrapped = None;
+        for k in 1..80u64 {
+            m.begin_frame(Level::Full, false, t0 + Duration::from_micros(6944 * k));
+            match m.grow(3, Some(t0), false, 20.) {
+                Some(g) => {
+                    let h = g.shown.expect("clipped while revealing");
+                    assert!(h >= last && h <= 120., "frame {k}: {h} after {last}");
+                    assert!(g.strength >= super::LIFT);
+                    last = h;
+                }
+                None => {
+                    unwrapped = Some(k);
+                    break;
+                }
+            }
+        }
+        let k = unwrapped.expect("unwrapped once settled");
+        assert!(k > 20 && k < 60, "settled on snap: frame {k}");
+        assert_eq!(m.growing(), 0);
+        // Words: the stream curve starts at the floor and never goes under it.
+        let e = super::stream_curve();
+        assert!((e.sample(0.) - super::LIFT).abs() < 1e-4);
+        assert!((e.sample(0.35) - 0.88).abs() < 1e-4);
+        assert!((0..=100).all(|k| e.sample(k as f32 / 100.) >= super::LIFT - 1e-4));
+        assert_eq!(super::text_motion().stream_fade(), super::STREAM_FADE);
+    }
+
+    /// Reduced, Off and low power: nothing grows (rows as today); history
+    /// (no birth) never does.
+    #[test]
+    fn grow_is_full_and_live_only() {
+        let t0 = Instant::now();
+        for (level, low) in [(Level::Reduced, false), (Level::Off, false), (Level::Full, true)] {
+            let m = Motion::new(t0);
+            m.begin_frame(level, low, t0);
+            assert!(m.grow(1, Some(t0), true, 20.).is_none(), "{level:?} low power {low}");
+        }
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Full, false, t0);
+        assert!(m.grow(1, None, false, 20.).is_none(), "history");
+        m.begin_frame(Level::Full, false, t0 + ms(500));
+        assert!(m.grow(2, Some(t0), false, 20.).is_none(), "born long ago, first drawn now: as is");
+    }
+
+    /// §3.4: a streaming row's new line glides in on `flick`, never more
+    /// than a line short; a shrink is at once.
+    #[test]
+    fn stream_line_growth_glides_within_a_line() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Full, false, t0);
+        let g = m.grow(9, None, true, 24.).expect("streaming rows are tracked");
+        assert_eq!(g.shown, None, "unmeasured: its own height");
+        g.sink.set(100.);
+        m.begin_frame(Level::Full, false, t0 + ms(7));
+        assert_eq!(m.grow(9, None, true, 24.).and_then(|g| g.shown), Some(100.));
+        g.sink.set(172.);
+        let mut prev = 100.;
+        for k in 2..60u64 {
+            m.begin_frame(Level::Full, false, t0 + Duration::from_micros(6944 * k));
+            let h = m.grow(9, None, true, 24.).and_then(|g| g.shown).expect("still streaming");
+            assert!(h >= 172. - 24. - 1e-3, "trails by at most a line: {h}");
+            assert!(h >= prev);
+            prev = h;
+        }
+        assert_eq!(prev, 172.);
+        g.sink.set(150.);
+        m.begin_frame(Level::Full, false, t0 + ms(500));
+        assert_eq!(m.grow(9, None, true, 24.).and_then(|g| g.shown), Some(150.));
+        // Done streaming and at rest: unwrapped.
+        m.begin_frame(Level::Full, false, t0 + ms(507));
+        assert!(m.grow(9, None, false, 24.).is_none());
     }
 }

@@ -104,12 +104,13 @@ fn no_text_under_12_px() {
 }
 
 /// No state is drawn with opacity (design.md §5), by any of its names:
-/// only a chart's data fades (`chart::fade`).
+/// only a chart's data fades (`chart::fade`), and something arriving lifts
+/// from 70 % (`motion::lift`, fluid.md law 3).
 #[test]
 fn no_opacity_outside_charts() {
     let bad: Vec<String> = sources()
         .into_iter()
-        .filter(|(name, _)| name != "chart.rs")
+        .filter(|(name, _)| name != "chart.rs" && name != "motion.rs")
         .flat_map(|(name, code)| {
             [".opacity(", ".alpha(", ".fade_out("]
                 .into_iter()
@@ -138,13 +139,14 @@ fn every_tooltip_is_the_overlay() {
 }
 
 /// The lint's way in, one per rule: `clippy::disallowed_methods` is
-/// allowed only where its rule lives (fonts.rs, chart.rs, overlay.rs);
+/// allowed only where its rule lives (fonts.rs, chart.rs, overlay.rs,
+/// motion.rs's lift);
 /// the groups that hold it (`clippy::style`, `clippy::all`) nowhere.
 #[test]
 fn the_house_rules_are_allowed_only_where_they_live() {
     let mut bad = Vec::new();
     for (name, code) in sources() {
-        let home = ["fonts.rs", "chart.rs", "overlay.rs"].contains(&name.as_str());
+        let home = ["fonts.rs", "chart.rs", "overlay.rs", "motion.rs"].contains(&name.as_str());
         for lint in ["disallowed_methods", "clippy::style", "clippy::all"] {
             if lint == "disallowed_methods" && home {
                 continue;
