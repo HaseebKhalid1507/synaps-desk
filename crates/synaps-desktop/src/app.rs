@@ -1280,6 +1280,9 @@ impl FavsJob {
     }
 }
 
+/// Each worker chip's bounds (its worker's id) as last laid out.
+pub(crate) type ChipBounds = Vec<(u64, Bounds<Pixels>)>;
+
 pub struct AppView {
     pub client: Option<Client>,
     /// Connection, sessions, attachment and transcript. Events are applied
@@ -1503,6 +1506,8 @@ pub struct AppView {
     pub(crate) menu_leaving: Option<(crate::menu::Menu<crate::wtabs::Act>, Instant)>,
     smenu_was: Option<crate::menu::Menu<SessionAct>>,
     smenu_leaving: Option<(crate::menu::Menu<SessionAct>, Instant)>,
+    wmenu_was: Option<crate::menu::Menu<u64>>,
+    pub(crate) wmenu_leaving: Option<(crate::menu::Menu<u64>, Instant)>,
     pub(crate) gear_at: Option<Instant>,
     pub(crate) gear_leaving: Option<Instant>,
     gear_was: bool,
@@ -1535,6 +1540,9 @@ pub struct AppView {
     pub(crate) tracer_open: Option<u64>,
     pub(crate) tracer: Option<crate::motion::Tracer>,
     pub(crate) strip_at: std::rc::Rc<std::cell::Cell<Point<Pixels>>>,
+    /// Each worker chip's bounds as last laid out (the tracer starts from
+    /// the source chip's bar).
+    pub(crate) chip_bounds: Rc<RefCell<ChipBounds>>,
     view_seen: Option<(u64, theme::Choice)>,
     pub(crate) window_active: bool,
     /// The session's list while a worker's view is shown, and the worker
@@ -2087,6 +2095,8 @@ impl AppView {
             menu_leaving: None,
             smenu_was: None,
             smenu_leaving: None,
+            wmenu_was: None,
+            wmenu_leaving: None,
             gear_at: None,
             gear_leaving: None,
             gear_was: false,
@@ -2107,6 +2117,7 @@ impl AppView {
             tracer_open: None,
             tracer: None,
             strip_at: Default::default(),
+            chip_bounds: Default::default(),
             view_seen: None,
             window_active: true,
             main_pane: None,
@@ -2186,11 +2197,11 @@ impl AppView {
     pub(crate) fn apply_batch(&mut self, batch: Vec<Event>, cx: &mut Context<Self>) {
         self.model.view_dirty = false;
         for ev in batch {
-            // A worker's menu, or a cancel armed from the tray,
-            // means nothing across a reconnect (a restarted
-            // daemon numbers its workers anew).
+            // A worker's menu, the workers menu, or a cancel armed
+            // from the tray, means nothing across a reconnect (a
+            // restarted daemon numbers its workers anew).
             if matches!(ev, Event::Attached { .. } | Event::Reattaching { .. }) {
-                if self.menu.is_some() {
+                if self.menu.is_some() || self.wmenu.is_some() {
                     self.close_menu();
                     self.model.view_dirty = true;
                 } else if self.model.cancels.disarm() {
@@ -2424,6 +2435,21 @@ impl AppView {
         }
         if self.smenu_leaving.as_ref().is_some_and(|(_, at)| self.fx.leave(*at).is_none()) {
             self.smenu_leaving = None;
+        }
+        // The workers menu's items follow the tray while it is open: its
+        // exit shows the last of them.
+        if self.wmenu.is_none() {
+            if let Some(m) = self.wmenu_was.take().filter(|m| m.born.is_some()) {
+                self.wmenu_leaving = Some((m, now));
+            }
+        } else {
+            self.wmenu_leaving = None;
+            if self.wmenu_was.as_ref().map(|m| (m.born, &m.items)) != self.wmenu.as_ref().map(|m| (m.born, &m.items)) {
+                self.wmenu_was = self.wmenu.clone();
+            }
+        }
+        if self.wmenu_leaving.as_ref().is_some_and(|(_, at)| self.fx.leave(*at).is_none()) {
+            self.wmenu_leaving = None;
         }
         if self.gear_menu != self.gear_was {
             self.gear_was = self.gear_menu;
@@ -5902,13 +5928,22 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.rescope(self.motion_session(), self.motion_column());
-        // A worker tab opened by the pointer: the tracer from it (§6.2).
+        // A worker tab opened by the pointer: the tracer from it (§6.2),
+        // from the source chip's bar (its left edge, at its centre) when the
+        // click, or the menu picked from, was on a chip.
         if let Some(tab) = self.tracer_open.take()
             && self.fx.level() == crate::motion::Level::Full
             && !window.last_input_was_keyboard()
         {
-            self.tracer = Some(crate::motion::Tracer { tab, from: window.mouse_position(), at: self.fx.now(), to: None });
+            let mouse = window.mouse_position();
+            let src = match self.menu_was.as_ref().map(|m| m.at) {
+                Some(crate::menu::At::Point(pt)) => pt,
+                _ => mouse,
+            };
+            let chip = self.chip_bounds.borrow().iter().find(|(_, b)| b.contains(&src)).map(|(_, b)| point(b.left(), b.center().y));
+            self.tracer = Some(crate::motion::Tracer { tab, from: chip.unwrap_or(mouse), at: self.fx.now(), to: None });
         }
+        self.chip_bounds.borrow_mut().clear();
         if self.menu.is_none()
             && self.smenu.is_none()
             && self.wmenu.is_none()

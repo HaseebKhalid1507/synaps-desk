@@ -986,6 +986,83 @@ fn a_failed_worker_is_never_folded_into_more(cx: &mut TestAppContext) {
     });
 }
 
+/// The workers menu is a pointer menu like the others (fluid.md §3.10):
+/// it enters from the click and leaves without a hitbox. While open it
+/// says what `+N more` stands for now (a worker ended: its line and
+/// place), its selection kept on the same worker. A reconnect closes it
+/// (a restarted daemon numbers its workers anew: Shady #16 L-a, L-b).
+#[gpui_kit::test]
+fn the_workers_menu_follows_the_tray_and_closes_on_a_reconnect(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    let rows = |ended: Option<u64>| {
+        let rows: Vec<serde_json::Value> = (1..=12u64)
+            .map(|n| {
+                let status = if ended == Some(n) { "completed" } else { "running" };
+                serde_json::json!({"subagent_id": n, "agent_name": format!("worker-{n}"), "status": status, "cancel_requested": false,
+                    "elapsed_secs": 10.0 + n as f64, "finished_elapsed": if ended == Some(n) { serde_json::json!(20.0) } else { serde_json::Value::Null },
+                    "step": format!("reading src/part_{n}.rs"), "tools": n, "handle_id": format!("sa_{n}")})
+            })
+            .collect();
+        synaps_client::protocol::decode_event(&serde_json::json!({"ev": "subagent_rows", "rows": rows})).expect("a rows event")
+    };
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.on_session(&rows(None));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let at = VisualTestContext::from_window(w, cx).debug_bounds("tray-more").expect("+N more drawn").center();
+    click_at(cx, w, at);
+    let (born, items) = view.read_with(cx, |v, _| {
+        let m = v.wmenu.as_ref().expect("the workers menu");
+        (m.born, m.items.iter().map(|i| i.act).collect::<Vec<_>>())
+    });
+    assert!(born.is_some(), "the pointer opened it: it enters");
+    assert!(items.len() >= 3, "workers not drawn: {items:?}");
+    // The second item selected; the first one listed ends.
+    let (gone, kept) = (items[0], items[1]);
+    view.update(cx, |v, cx| {
+        v.wmenu.as_mut().expect("open").sel = Some(1);
+        v.model.stats.subagents.on_session(&rows(Some(gone)));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    view.read_with(cx, |v, _| {
+        let m = v.wmenu.as_ref().expect("still open");
+        let now: Vec<u64> = m.items.iter().map(|i| i.act).collect();
+        let expect: Vec<u64> = v.tray.rows[v.tray_drawn()..].iter().map(|r| r.id).collect();
+        assert_eq!(now, expect, "what +N more stands for now");
+        assert_ne!(now, items, "the ended one moved (ended last)");
+        assert_eq!(m.sel.map(|i| m.items[i].act), Some(kept), "the selection on the same worker");
+        let line = &m.items[now.iter().position(|&a| a == gone).expect("the ended one listed")].label;
+        assert!(line.contains(crate::glyph::worker(crate::subagents::Liveness::Done).2), "its line says it ended: {line}");
+    });
+    // A reconnect closes it; it leaves, then is gone.
+    view.update(cx, |v, cx| {
+        let seq = v.model.active.as_ref().expect("attached").attach_seq;
+        let events = crate::demo::attach(crate::demo::SID, seq)
+            .into_iter()
+            .filter_map(|e| match e {
+                synaps_client::Event::Attached { attach_seq, attached, mode, .. } => {
+                    Some(synaps_client::Event::Attached { attach_seq, attached, mode, reconnect: true })
+                }
+                _ => None,
+            })
+            .collect();
+        v.apply_batch(events, cx);
+    });
+    wait(cx, w, &view, 7);
+    view.read_with(cx, |v, _| {
+        assert!(v.wmenu.is_none(), "closed by the reconnect");
+        assert!(v.wmenu_leaving.is_some(), "leaving");
+    });
+    for _ in 0..30 {
+        wait(cx, w, &view, 7);
+    }
+    assert!(view.read_with(cx, |v, _| v.wmenu_leaving.is_none()), "gone");
+}
+
 /// The other demo session in a tab, attached (with no client, the
 /// synthetic transport answers its attach).
 fn open_idle_cpu(cx: &mut TestAppContext, view: &Entity<AppView>, place: crate::tabs::Place) {
@@ -3718,6 +3795,42 @@ fn a_blip_never_jumps_the_palette(cx: &mut TestAppContext) {
         frames(cx, 500, "back again");
         assert_eq!(prev.get(), 0., "restored (mid {mid})");
     }
+}
+
+/// The tracer starts from the source chip's bar (motion.md §6.2: its left
+/// edge, at its centre) when the pointer was on the chip; elsewhere, from
+/// the pointer.
+#[gpui_kit::test]
+fn tracer_starts_from_the_chips_bar(cx: &mut TestAppContext) {
+    use gpui_kit::{MouseMoveEvent, PlatformInput, point};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    let scout = view.read_with(cx, |v, _| {
+        let r = v.tray.rows.iter().find(|r| r.id == 1).expect("scout's tray row");
+        crate::wtabs::Who::new(1, r.name.clone(), r.call.clone())
+    });
+    let chip = view.read_with(cx, |v, _| v.chip_bounds.borrow().iter().find(|(id, _)| *id == 1).map(|(_, b)| *b)).expect("its chip laid out");
+    let to = |cx: &mut TestAppContext, at: gpui_kit::Point<gpui_kit::Pixels>| {
+        event(cx, w, PlatformInput::MouseMove(MouseMoveEvent { position: at, pressed_button: None, modifiers: Default::default() }));
+        view.update(cx, |v, cx| v.open_worker_tab(&scout, cx));
+        cx.run_until_parked();
+        wait(cx, w, &view, 7);
+        let from = view.read_with(cx, |v, _| v.tracer.map(|t| t.from)).expect("a tracer");
+        // Its tab closed: the next open is a new tab again.
+        view.update(cx, |v, cx| {
+            v.tracer = None;
+            let ix = v.model.tabs.iter().position(|t| t.worker.is_some()).expect("the worker's tab");
+            v.close_tab(ix);
+            cx.notify();
+        });
+        settle(cx, w, 4);
+        from
+    };
+    let on_chip = point(chip.left() + chip.size.width * 0.75, chip.center().y);
+    assert_eq!(to(cx, on_chip), point(chip.left(), chip.center().y), "from the chip's bar");
+    let off = point(chip.left(), chip.top() - gpui_kit::px(40.));
+    assert_eq!(to(cx, off), off, "elsewhere, from the pointer");
 }
 
 /// A worker tab opened by the pointer draws the tracer to it (motion.md

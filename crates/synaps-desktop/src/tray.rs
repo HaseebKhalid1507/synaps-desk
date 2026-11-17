@@ -498,14 +498,7 @@ impl AppView {
     /// The workers menu (polish.md §2.5): `+N more`'s workers, each as its
     /// chip would say it (name, state, step); picked, its view in place.
     pub(crate) fn open_workers_menu(&mut self, pt: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let items: Vec<crate::menu::Item<u64>> = self.tray.rows[self.tray_drawn().min(self.tray.rows.len())..]
-            .iter()
-            .map(|r| {
-                let item =
-                    crate::menu::Item::new(r.id, format!("{}  {} · {}", r.name, glyph::worker(r.live).2, cut(chip_step(r), MENU_STEP)));
-                if r.watchable { item } else { item.off(r.tip.clone()) }
-            })
-            .collect();
+        let items = self.workers_menu_items();
         if items.is_empty() {
             return;
         }
@@ -517,8 +510,39 @@ impl AppView {
         }
         window.focus(&self.focus, cx);
         self.gear_menu = false;
-        self.wmenu = Some(crate::menu::Menu::new(items, crate::menu::At::Point(pt), false));
+        self.wmenu = Some(crate::menu::Menu::new(items, crate::menu::At::Point(pt), false).born(self.fx.clock()));
         cx.notify();
+    }
+
+    /// The workers `+N more` stands for, each as its chip would say it.
+    fn workers_menu_items(&self) -> Vec<crate::menu::Item<u64>> {
+        self.tray.rows[self.tray_drawn().min(self.tray.rows.len())..]
+            .iter()
+            .map(|r| {
+                let item =
+                    crate::menu::Item::new(r.id, format!("{}  {} · {}", r.name, glyph::worker(r.live).2, cut(chip_step(r), MENU_STEP)));
+                if r.watchable { item } else { item.off(r.tip.clone()) }
+            })
+            .collect()
+    }
+
+    /// The open workers menu says what `+N more` stands for now (a worker
+    /// ended, or got a chip as another left), its selection kept on the
+    /// same worker; with none left it closes.
+    fn refresh_workers_menu(&mut self) {
+        let Some(m) = self.wmenu.as_ref() else { return };
+        let items = self.workers_menu_items();
+        if items == m.items {
+            return;
+        }
+        if items.is_empty() {
+            self.wmenu = None;
+            return;
+        }
+        let sel = m.sel.and_then(|i| m.items.get(i)).and_then(|was| items.iter().position(|n| n.act == was.act));
+        if let Some(m) = self.wmenu.as_mut() {
+            (m.items, m.sel) = (items, sel);
+        }
     }
 
     /// A worker of the workers menu picked: its view in place.
@@ -554,17 +578,26 @@ impl AppView {
     }
 
     /// The workers menu, if open: at the root, over everything.
+    /// One leaving (fluid.md §3.10) is drawn without a hitbox until gone.
     pub(crate) fn render_workers_menu(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
-        let m = self.wmenu.as_ref()?;
+        let (m, phase) = match self.wmenu.as_ref() {
+            Some(m) => (m, crate::menu::Phase::enter(&self.fx, m.born, -1.)),
+            None => {
+                let (m, at) = self.wmenu_leaving.as_ref()?;
+                (m, crate::menu::Phase::leave(&self.fx, *at, -1.)?)
+            }
+        };
         let crate::menu::At::Point(pt) = m.at else { return None };
-        let body = crate::menu::render("workers-menu", m, p, AppView::workers_menu_pick, |this, _| this.close_menu(), cx);
+        let body = crate::menu::render("workers-menu", m, p, AppView::workers_menu_pick, |this, _| this.close_menu(), phase, &self.fx, cx);
         Some(deferred(anchored().position(pt).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
     }
 
     /// A menu opened from the keyboard over a tray row whose row is not
     /// drawn any more (its worker dropped, the window got short): it
     /// closes, never left taking keys unseen.
+    /// The workers menu follows what `+N more` stands for.
     pub(crate) fn close_orphan_menu(&mut self) {
+        self.refresh_workers_menu();
         let Some(At::Row(id)) = self.menu.as_ref().map(|(m, _)| m.at) else { return };
         if !self.tray.rows[..self.tray_drawn()].iter().any(|r| r.id == id) {
             self.close_menu();
@@ -616,12 +649,14 @@ impl AppView {
                     };
                     // A chip that changed line slides from its last place.
                     let off = fx.slide(TRAY | r.id, line as f32 * (row_h + CHIP_GAP));
+                    let (bounds, id) = (self.chip_bounds.clone(), r.id);
                     at.push(
                         div()
                             .relative()
                             .top(px(off))
                             .flex_none()
                             .child(self.tray_row(r, is_watched, armed, w, row_h, bar, p, m, cx))
+                            .child(canvas(move |b, _, _| bounds.borrow_mut().push((id, b)), |_, _, _, _| {}).absolute().inset_0())
                             .into_any_element(),
                     );
                 }

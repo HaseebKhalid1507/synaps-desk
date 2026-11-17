@@ -148,15 +148,25 @@ fn no_opacity_outside_charts() {
 }
 
 /// No gradients anywhere (polish.md: "No gradients anywhere, on any card
-/// or control"; finish gate 6): flat fills only, and no shadow on a card
-/// (GPUI's `shadow_sm()` and kin too; `shadow_none()` takes one away).
+/// or control"; §6 finish gate 6): every fill is one opaque colour of the
+/// palette (the sweep's levels are four opaque steps), and no shadow on a
+/// card (GPUI's `shadow_sm()` and kin too; `shadow_none()` takes one away).
 #[test]
 fn no_gradients_anywhere() {
     let bad: Vec<String> = sources()
         .into_iter()
         .filter(|(name, _)| name != "style_tests.rs")
         .flat_map(|(name, code)| {
-            ["linear_gradient", "LinearColorStop", "radial_gradient", ".shadow(", "shadow_", "box_shadow(", "BoxShadow"]
+            [
+                "linear_gradient",
+                "LinearColorStop",
+                "radial_gradient",
+                "conic_gradient",
+                ".shadow(",
+                "shadow_",
+                "box_shadow(",
+                "BoxShadow",
+            ]
                 .into_iter()
                 .flat_map(|g| {
                     code.match_indices(g)
@@ -168,6 +178,21 @@ fn no_gradients_anywhere() {
         })
         .collect();
     assert!(bad.is_empty(), "a gradient or a shadow:\n{}", bad.join("\n"));
+}
+
+/// No press on a transcript row or a worker chip yet (Q4 leaves "press on
+/// tray rows, run headers and chips" for later): Q1's rows and chips
+/// (`turns.rs`, `tray.rs`) have hover fills only, so their inks (`err`,
+/// `warn`, `think`, `sub_*`) sit on no press fill. Wiring one adds those
+/// inks to a press set (`theme.rs` `pressed`) and the set to
+/// `press_is_visible_in_every_theme`, then drops its file here.
+#[test]
+fn rows_and_chips_have_no_press_yet() {
+    for (name, code) in sources().into_iter().filter(|(n, _)| ["turns.rs", "tray.rs"].contains(&n.as_str())) {
+        for g in ["press_ch", "press_k", "btn_press", "warn_press", ".active(", "fx.fill(", ".lit("] {
+            assert!(!code.contains(g), "{name}: a press ({g}): add its inks to a press set");
+        }
+    }
 }
 
 /// One overlay box (design.md §8.9): every tooltip is built by
@@ -214,21 +239,4 @@ fn the_house_rules_are_allowed_only_where_they_live() {
         }
     }
     assert!(bad.is_empty(), "the house rules allowed outside their home:\n{}", bad.join("\n"));
-}
-
-/// No gradients anywhere (polish.md §6 gate 6): every fill is one opaque
-/// colour of the palette; the sweep's levels are four opaque steps.
-#[test]
-fn no_gradients_anywhere_chrome() {
-    let bad: Vec<String> = sources()
-        .into_iter()
-        .filter(|(name, _)| name != "style_tests.rs")
-        .flat_map(|(name, code)| {
-            ["linear_gradient", "LinearColorStop", "radial_gradient", "conic_gradient"]
-                .into_iter()
-                .flat_map(|g| code.match_indices(g).map(|(at, _)| format!("{name}:{} {g}", line_of(&code, at))).collect::<Vec<_>>())
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    assert!(bad.is_empty(), "a gradient:\n{}", bad.join("\n"));
 }
