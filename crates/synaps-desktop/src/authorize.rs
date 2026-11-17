@@ -749,9 +749,11 @@ impl AppView {
         let ex = self.extras();
         let floor = crate::fit::well_floor(m, form, shown_lines.clamp(1., crate::fit::WELL_MIN), ex);
         let rows = self.composer.read(cx).text().lines_len().clamp(1, self.composer_rows.max(1));
-        let lines = crate::fit::well_lines(m, form, self.height, rows, floor, ex).min(shown_lines);
+        // A soft-wrapped line takes more than its one: the most is the
+        // window's room, the least the text's own lines (they scroll).
+        let lines = crate::fit::well_lines(m, form, self.height, rows, floor, ex);
         let well_pad = (8. * r).round();
-        let max_h = lines * m.code_line + 2. * well_pad;
+        let well_h = |lines: f32| lines * m.code_line + 2. * well_pad;
         let text: AnyElement = match &c.guard {
             Some(g) => h_flex()
                 .items_start()
@@ -768,7 +770,8 @@ impl AppView {
             .id("prompt-well")
             .debug_selector(|| "prompt-well".into())
             .flex_none()
-            .max_h(px(max_h.max(m.code_line + 2. * well_pad)))
+            .min_h(px(well_h(floor.min(shown_lines))))
+            .max_h(px(well_h(lines)))
             .overflow_y_scroll()
             .track_scroll(&c.scroll)
             .px(px((12. * r).round()))
