@@ -3028,6 +3028,9 @@ fn rail_reorder_flips_moved_rows_only(cx: &mut TestAppContext) {
         }
     }
     assert!(slid >= 2 && before.get(&key) != after.get(&key), "the moved row and those it passed slide ({slid})");
+    // The row that travels farthest is drawn over the ones it passes.
+    let leads = view.read_with(cx, |v, _| v.rail_fx.leads.keys().copied().collect::<Vec<_>>());
+    assert_eq!(leads, vec![key], "the moved row leads");
     wait(cx, w, &view, 400);
     assert!(view.read_with(cx, |v, _| v.rail_fx.offsets.is_empty()), "settled");
 }

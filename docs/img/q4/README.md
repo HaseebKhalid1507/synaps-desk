@@ -6,7 +6,7 @@ lossless at 30 fps, `MESA_VK_WSI_DEBUG=sw`), driven by xdotool. The binaries:
 - **main** = `c54ebd8` release (`dbuild synaps-desktop-q4 build --release` at that commit);
 - **Q4** = this branch's release build, installed as `bella:~/.local/bin/synaps-desktop-hybrid.q4`.
 
-The `*-drive.log` files give each step's wall time (the clip starts about 3.5 s before `t0`).
+The `*-drive.log` files give each step's wall time (the clip starts about 1 s before `t0`: frame ≈ 30 × (t − t0 + 1.0); corrected in r2, it said 3.5 s).
 
 ## Side by side with main (`side-<theme>-<size>.png`: main left, Q4 right)
 
@@ -52,9 +52,10 @@ springs to the new segment; the saved value afterglows after the save).
 app attached with `--profile desktopproto`; the drive stops the daemon and starts it again.
 `live-link-topbar-frames.png` is the top bar at frames 25–260:
 
-- frame 31: the drop (`reconnecting ·`, its disc at rest). The tear's lines and the connection cell's
-  +3 px / −2 px offset (60 ms, then 40 ms) fall between 30 fps captures here;
-  `the_link_drops_drains_and_scans_back` checks both frames.
+- frame 31: the drop (`reconnecting ·`, its disc at rest). **Corrected in r2:** the tear *is* in this
+  clip, at frames 30–32 (the finish gate decoded them); this note said it fell between captures. r2's
+  live clip shows it again full-window (`r2/link-tear.png`), and r2 no longer tears at the first
+  frame of a drop: a non-reload drop tears only after a 1 s grace (H1).
 - frame 35: the client gives up (`connect …` in `err_ch`, the disc `err_mark_ch`); frames 35–45: both
   drain to the grey of their own luminance over 360 ms and hold while the daemon is down.
 - frame 218: the daemon is back. `live-link-scan-frames.png` (frames 214–225): the Scan's 1 px line and

@@ -28,7 +28,65 @@ average fell under 6 (other agents' builds share the machine). `--refresh-hz 144
 | idle 10 s: presents / app frames | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
 | idle CPU ms/s | 2.23 | 2.35 | 2.13 | 2.20 |
 | a tool runs, 6 s: presents / app frames / CPU ms/s | 48 / 0 / 12.6 | 48 / 0 / 13.0 | 48 / 0 / 13.2 | 48 / 0 / 12.8 |
-| 25 glyphs scanning (≈ 5 × 5): presents / CPU ms/s | 48 / 13.5 | 48 / 13.7 | 48 / 13.3 | 48 / 13.2 |
+| 25 glyphs scanning (not 5 × 5: the beat's own sites; see r2 for the real 5 × 5): presents / CPU ms/s | 48 / 13.5 | 48 / 13.7 | 48 / 13.3 | 48 / 13.2 |
 | Motion Off, 4 s: presents | 0 | 0 | 0 | 0 |
 
 48 presents in 6 s is the 8 Hz beat (≤ 8/s); 13 ms/s is 1.3 % of a core.
+
+## r2 (the review fixes): gates 3, 4 and 5 run as written
+
+Same harness: a headless gamescope at 144 Hz, 1920×1080, one run at a time, each after the load
+average fell under 6. Raw: `r2/*.json`. main isn't re-run. Its numbers are r1's above, from the same
+harness and machine.
+
+`--bench` (two runs):
+
+| | Q4 r2 run 1 | Q4 r2 run 2 | main (r1, 3 runs) |
+|---|---|---|---|
+| streaming fps (dropped) | 142.9 (6) | 142.9 (6) | 142.3–142.9 |
+| streaming draw p50 / p99 ms | 2.03 / 3.32 | 2.01 / 4.42 | 2.65–2.70 / 4.85–5.05 |
+| scroll draw p50 / p99 ms | 1.35 / 3.30 | 1.62 / 3.00 | 2.16–2.18 / 3.90–5.72 |
+| wheel spin fps, draw p99 ms | 143.9, 3.70 | 143.6, 3.46 | 143.7–144.0, 3.71–3.94 |
+| rail edge drag draw p99 ms | 1.86 | 2.97 | 3.36–3.38 |
+| RSS idle / end (MiB) | 169.2 / 233.6 | 169.2 / 233.5 | 168.7–169.1 / 232.7–234.0 |
+| PSS idle / end (MiB) | 78.3 / 148.9 | 78.3 / 148.8 | 83.3–83.7 / 147.2–148.5 |
+| end, GPU-driver mappings apart: RSS / PSS (MiB) | 156.3 / 125.3 | 156.2 / 125.3 | 155.6–156.9 / 124.1–125.3 |
+
+**Memory (gate 5):** at the end (2,000 rows of history loaded), Q4 r2 is +0.2 % RSS and +0.8 % PSS
+over main's mean (+5 % allowed).
+
+`--bench-motion` (two runs). The r1 scenes come first, as main runs them. Then Q4's own cases, on a
+fresh transcript at Full:
+
+| case | what | run 1: presents / app frames / CPU ms/s | run 2 |
+|---|---|---|---|
+| `idle_10s` | nothing running, 10 s | 0 / 0 / 2.51 | 0 / 0 / 2.17 |
+| `beat` | a tool runs, 6 s (the 8 Hz beat) | 48 / 0 / 14.15 | 48 / 0 / 14.3 |
+| `beat_25_30s` | 25 glyphs scanning (the beat's sites), 30 s | 240 / 0 / 15.51 | 240 / 0 / 15.11 |
+| `beat_motion_off` | Motion Off, a tool running, 4 s | 0 / 0 / 2.55 | 0 / 0 / 1.78 |
+| `idle_10s_after_beat` | nothing running again, 10 s | 0 / 0 / 2.6 | 0 / 0 / 2.78 |
+| `idle_30s_prompt` | **gate 3**: a prompt pending + a demoted worker, 30 s | 0 / 0 / 2.4 | 0 / 0 / 2.14 |
+| `held_drain_10s` | the link down, drained and held, 10 s | 20 / 20 / 9.22 | 20 / 20 / 10.02 |
+| `hover_sweep` | the pointer down a 12-row rail, 2.4 s | 234 / 234 / 192.9 | 235 / 235 / 185.49 |
+| `cross_fade` | a dark → dark theme change, 1 s | 54 / 54 / 105.15 | 54 / 54 / 106.47 |
+| `load_5x5_30s` | **gate 4**: 5 sessions × 5 workers, 30 s | 240 / 30 / 18.91 | 240 / 30 / 18.99 |
+
+- **Gate 3 (idle = 0):** `idle_30s_prompt` is 30 s with a confirm prompt pending (after its three
+  breaths) and a demoted worker (a re-attach's "started": `demoted_worker: true` in the JSON). It
+  gives 0 presents and 0 app frames.
+- **Gate 4 (under load):** `load_5x5_30s` is five busy sessions in the rail, each with
+  `subagents_running: 5`. The shown session's five workers run in its tray and transcript
+  (`workers_running: 5`). That is 240 presents in 30 s, 8/s: the one 8 Hz beat, no more. At about
+  19 ms/s (18.9–19.0) it uses 1.9 % of a core (≤ 6 % allowed). Q3's sweep isn't in this branch, so there's no
+  "one sweep" row.
+- `held_drain_10s` is the link down past its grace and drain, holding. Only the connection word's
+  dots step (2 Hz, on the beat).
+- `hover_sweep` is the pointer down a 12-row rail at rest (13 items with the head), one move every 16 ms for 2 s.
+- `cross_fade` is a dark → dark theme change (`slow`, 360 ms, then settled).
+- `load_5x5_30s` shows 30 app frames in 30 s: the five workers' tray clocks tick once a second each
+  on the same second.
+- The beat's CPU here (14–15 ms/s) is a little above r1's (13 ms/s), with the presents the same (48 in
+  6 s, 240 in 30 s). r2's binary didn't change the beat. The machine's load was higher during these
+  runs (3–5 against under 2).
+- `hover_sweep` and `cross_fade` run at display rate while they move: about 190 and 105 ms/s for
+  those 1–2 s. Both stop with the motion, and the following case starts at 0 presents.
