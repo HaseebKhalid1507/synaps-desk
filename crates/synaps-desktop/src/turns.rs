@@ -310,6 +310,10 @@ pub(crate) enum Kind {
     /// The local date changed since the last dated row: a day line above
     /// its item's row ([`crate::times::Days`]); its `rev` is the day.
     Day,
+    /// A prompt's own row after its item (polish.md §2.6): the authorize
+    /// card, collapsing once answered, or a one-line receipt
+    /// ([`crate::authorize`]).
+    Prompt,
 }
 
 /// A day line's row id: its item's, with this bit (item ids count up from 1).
@@ -357,6 +361,16 @@ pub(crate) fn finished(s: Option<ToolStatus>) -> bool {
 
 fn status(i: &Item) -> Option<ToolStatus> {
     i.tool.as_ref().and_then(|t| t.status)
+}
+
+/// The call a prompt waits on: the last unfinished call of the last turn.
+pub(crate) fn waiting_call(items: &[Item]) -> Option<u64> {
+    items
+        .iter()
+        .rev()
+        .take_while(|i| i.kind != ItemKind::User)
+        .find(|i| i.kind == ItemKind::Tool && !finished(i.tool.as_ref().and_then(|t| t.status)))
+        .map(|i| i.id)
 }
 
 /// Where a rebuild after a change at item `k` starts: the turn holding
@@ -1342,6 +1356,7 @@ impl AppView {
             Kind::Summary { open, .. } => self.render_summary(d, open, &p, &m, cx),
             Kind::Work => self.render_work(item, row, d.id, &p, &m, lay, cx),
             Kind::Day => day_line(d, &p, &m),
+            Kind::Prompt => self.render_authorize(d, &p, &m, cx),
         };
         let who = match d.who {
             Who::None => None,
@@ -1376,23 +1391,25 @@ impl AppView {
         // streaming row's bottom-left in the gutter; lit while deltas come,
         // decaying once they stop. Touches no text.
         // Not on a day line over it (they share the item).
-        let head = (d.kind != Kind::Day && d.item + 1 == items.len() && matches!(item.kind, ItemKind::Assistant | ItemKind::Thinking))
-            .then(|| self.fx.change(Tag::Stream, item.id, item.text.len() as u64, self.fx.birth(item.id)))
-            .flatten()
-            .map(|(at, _)| self.fx.decay(Some(at), motion::HEAD_HOLD, motion::GLOW))
-            .filter(|k| *k > 0.)
-            .map(|k| {
-                let mark = if item.kind == ItemKind::Thinking { p.think } else { p.run_mark };
-                div()
-                    .absolute()
-                    // Clear of a gutter glyph's column (it ends at −8·r).
-                    .left(px((-6. * m.r).round()))
-                    .bottom_0()
-                    .w(px(2.))
-                    .h(px((26. * m.r).round()))
-                    .bg(motion::mix(p.canvas, mark, k))
-                    .debug_selector(|| "write-head".into())
-            });
+        let head = (!matches!(d.kind, Kind::Day | Kind::Prompt)
+            && d.item + 1 == items.len()
+            && matches!(item.kind, ItemKind::Assistant | ItemKind::Thinking))
+        .then(|| self.fx.change(Tag::Stream, item.id, item.text.len() as u64, self.fx.birth(item.id)))
+        .flatten()
+        .map(|(at, _)| self.fx.decay(Some(at), motion::HEAD_HOLD, motion::GLOW))
+        .filter(|k| *k > 0.)
+        .map(|k| {
+            let mark = if item.kind == ItemKind::Thinking { p.think } else { p.run_mark };
+            div()
+                .absolute()
+                // Clear of a gutter glyph's column (it ends at −8·r).
+                .left(px((-6. * m.r).round()))
+                .bottom_0()
+                .w(px(2.))
+                .h(px((26. * m.r).round()))
+                .bg(motion::mix(p.canvas, mark, k))
+                .debug_selector(|| "write-head".into())
+        });
         RowParts { body: out.child(block), label: hang, head }
     }
 }
@@ -1687,7 +1704,9 @@ impl AppView {
             .children(row.card.facts.clone().map(|f| div().text_color(p.dim_t).child(f)))
             .children(running.then(|| clock(fx, row.started)).flatten().map(|c| div().text_color(p.dim_t).child(c)))
             .when_some(state.1.filter(|_| !lay.tight && !think), |d, w| d.child(div().text_color(word_color).child(w)))
-            .children(row.card.server.clone().map(|s| div().text_color(p.dim_t).child(s)));
+            .children(row.card.server.clone().map(|s| div().text_color(p.dim_t).child(s)))
+            // An answered prompt's receipt (polish.md §2.6).
+            .children((!think).then(|| self.receipt_el(id, p)).flatten());
         let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
         let verb = if think {
             div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.think).child("think").into_any_element()
@@ -2137,6 +2156,7 @@ mod tests {
                 Kind::Summary { open: true, .. } => "unfold",
                 Kind::Work => "work",
                 Kind::Day => "day",
+                Kind::Prompt => "prompt",
             })
             .collect()
     }

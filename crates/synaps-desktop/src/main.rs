@@ -25,6 +25,7 @@
 #![recursion_limit = "256"]
 
 mod app;
+mod authorize;
 mod beat;
 mod bench;
 mod chart;
