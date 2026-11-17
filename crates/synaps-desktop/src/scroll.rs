@@ -238,11 +238,7 @@ impl Inner {
     fn track(&mut self, now: Instant) -> f32 {
         let n = self.packets.len();
         let (t_last, total) = self.packets[n - 1];
-        let interval = if n >= 3 {
-            self.packets[n - 1].0.saturating_duration_since(self.packets[n - 3].0) / 2
-        } else {
-            LAG
-        };
+        let interval = if n >= 3 { self.packets[n - 1].0.saturating_duration_since(self.packets[n - 3].0) / 2 } else { LAG };
         let lag = interval.min(LAG);
         let at = now.checked_sub(lag).unwrap_or(now);
         let shown = match self.packets.iter().position(|p| p.0 > at) {

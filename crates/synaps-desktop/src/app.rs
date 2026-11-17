@@ -2949,11 +2949,7 @@ impl AppView {
     /// the tray and blocks); otherwise from below. A change within 150 ms of
     /// the last is instant: a held ↓ never stacks them. Full only.
     fn column_layer(&mut self) {
-        let key = (
-            self.model.active.as_ref().map(|a| a.session_id.clone()),
-            self.motion_column(),
-            self.model.tabs.active(),
-        );
+        let key = (self.model.active.as_ref().map(|a| a.session_id.clone()), self.motion_column(), self.model.tabs.active());
         // Nothing on screen yet (an attach in flight): the column it lands
         // on is the change.
         if key == self.column_key || (key.0.is_none() && self.model.watch.focus().is_none()) {
@@ -5463,11 +5459,11 @@ impl Render for AppView {
                 this.arrive(ix, row, cx)
             }),
         )
-            .size_full()
-            .pl(px(pad_l))
-            .pr(px(pad_r))
-            .pt(px(pad_t))
-            .pb(px(pad_b));
+        .size_full()
+        .pl(px(pad_l))
+        .pr(px(pad_r))
+        .pt(px(pad_t))
+        .pb(px(pad_b));
         self.texts.borrow_mut().frame(lay.column, &m);
         self.hint_rows(&m);
         // After the list's layout: rows it has no height for get their hint
