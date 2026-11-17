@@ -348,6 +348,10 @@ roles! {
     // An opened call's well (polish.md §2.3): `code`, or `tool_out` where
     // the ink does not read on `code` (paper's code is a dark island).
     well,
+    // Rules drawn on Q1's boxes, each floored on its own ground and what is
+    // around it: a well's frame and header rule, a chip's frame, OPEN's
+    // outline (on a hovered row too).
+    hair_w, hair_t, edge_t,
     // Text on the canvas.
     ink, prose, dim, you, agent, head, th, td, warn, run, ready, cost, err, well_fg,
     // On the user surface (a user message's markdown, the composer).
@@ -526,6 +530,9 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.hair = f.at("hair", t.separator, ink, &[canvas, chrome], HAIR);
     r.edge = f.at("edge", t.border, ink, &[canvas, chrome, user], EDGE);
     r.frame = f.at("frame", t.border, ink, &[card, card_hi, canvas, chrome, tool_out], FRAME);
+    r.hair_w = f.at("hair_w", t.separator, ink, &[well, canvas], HAIR);
+    r.hair_t = f.at("hair_t", t.separator, ink, &[tool, tool_out, canvas], HAIR);
+    r.edge_t = f.at("edge_t", t.border, ink, &[canvas, tool_out], EDGE);
     r.ink = f.text("ink", ink, &[canvas, user, tool_out, chrome, raised, add_bg, del_bg, card, card_hi]);
     r.prose = f.text("prose", t.claude_text, &[canvas]);
     r.dim = f.text("dim", t.muted, &[canvas]);

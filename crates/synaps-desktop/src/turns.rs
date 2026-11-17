@@ -1312,7 +1312,8 @@ impl AppView {
                 let mark = if item.kind == ItemKind::Thinking { p.think } else { p.run_mark };
                 div()
                     .absolute()
-                    .left(px(-10.))
+                    // Clear of a gutter glyph's column (it ends at −8·r).
+                    .left(px((-6. * m.r).round()))
                     .bottom_0()
                     .w(px(2.))
                     .h(px((26. * m.r).round()))
@@ -1373,10 +1374,9 @@ impl Geo {
         let gap = (8. * m.r).round();
         let verb_w = text_w(VERB_CHARS, m.mono * 0.6);
         // Hanging: the glyph's 12·r column starts where the AGENT label
-        // ends (column − 20·r, C4), centred at column − 14·r; the fill
-        // reaches 4·r past it.
-        let edge = (4. * m.r).round();
-        let (out, pad, verb) = if lay.hang { (m.lead + edge, edge, 0.) } else { (0., 0., m.lead) };
+        // and its time end (column − 20·r, C4), centred at column − 14·r;
+        // the fill stops there too (it never paints under the label).
+        let (out, pad, verb) = if lay.hang { (m.hang, m.hang - m.lead, 0.) } else { (0., 0., m.lead) };
         Geo { out, pad, right: gap, verb_w, gap, verb, target: verb + verb_w + gap, fold: (12. * m.r).round() }
     }
 
@@ -1621,7 +1621,7 @@ impl AppView {
             .id(("row", id))
             .debug_selector(move || format!("tool-row {id}"))
             .when(has_body, |d| d.cursor_pointer().hover(|d| d.bg(p.tool_out)))
-            .child(glyph::lead(status_glyph, m))
+            .child(glyph::lead(status_glyph, m).debug_selector(move || format!("tool-status {id}")))
             .child(verb)
             .child(target)
             .child(meta)
@@ -1747,12 +1747,21 @@ impl AppView {
                 .px(px(8.))
                 .gap(px(6.))
                 .items_center()
+                .group("wopen")
                 .border_1()
-                .border_color(p.edge)
-                .text_color(p.dim_t)
-                .hover(|d| d.bg(p.tool_out).text_color(p.prose_t))
-                .child(display(label::OPEN, fonts::size::D_S, p.dim_t).line_height(px(12.)))
-                .child(glyph::draw(Glyph::Open, p.dim_t))
+                .border_color(p.edge_t)
+                .hover(|d| d.border_color(p.frame))
+                // Hovered, it lights: its outline to `frame`, its word and
+                // arrow to `prose_t` (both floored on the hovered row).
+                .child(display(label::OPEN, fonts::size::D_S, p.dim_t).line_height(px(12.)).group_hover("wopen", |s| s.text_color(p.prose_t)))
+                .child(
+                    svg()
+                        .path(Glyph::Open.sprite().unwrap_or_default())
+                        .flex_none()
+                        .size(px(Glyph::Open.size()))
+                        .text_color(p.dim_t)
+                        .group_hover("wopen", |s| s.text_color(p.prose_t)),
+                )
                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                     cx.stop_propagation();
                     this.worker_click(&who, true, ev, window, cx);
@@ -1863,7 +1872,7 @@ fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metric
         .mb(px((8. * m.r).round()))
         .bg(p.well)
         .border_1()
-        .border_color(p.hair)
+        .border_color(p.hair_w)
         .text_color(p.res);
     if let Some((path, right)) = &row.card.head {
         col = col.child(
@@ -1872,7 +1881,7 @@ fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metric
                 .py(px((4. * m.r).round()))
                 .gap(px(8.))
                 .border_b_1()
-                .border_color(p.hair)
+                .border_color(p.hair_w)
                 .text_px(m.meta)
                 .text_color(p.dim_o)
                 .whitespace_nowrap()

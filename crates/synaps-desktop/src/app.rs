@@ -5770,7 +5770,8 @@ impl Render for AppView {
         // The worker chips: the lines they need in the column, then how
         // many the room leaves. A chip fading out keeps its slot until its
         // fade is over.
-        let (slots, widths) = if view.is_none() { self.chip_widths(&m) } else { (Vec::new(), Vec::new()) };
+        let confirm = self.display_w(label::CONFIRM, fonts::size::D_S, window);
+        let (slots, widths) = if view.is_none() { self.chip_widths(lay.column, confirm, &m) } else { (Vec::new(), Vec::new()) };
         let needed = crate::tray::chip_lines_needed(&widths, lay.column, crate::tray::CHIP_GAP);
         self.tray_rows = crate::fit::chip_lines(&m, lay.form(), self.height, card_shown, ex, needed);
         self.pack_chips(slots, &widths, lay.column, self.tray_rows, &m);
