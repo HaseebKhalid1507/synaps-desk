@@ -692,15 +692,46 @@ mod tests {
         assert!(path.windows(2).all(|w| w[1] >= w[0]));
     }
 
-    /// A touchscreen (GPUI coasts it) and sideways scrolling are not ours.
+    /// A touchscreen (GPUI coasts it) and sideways scrolling are not ours;
+    /// a sideways packet inside a gesture (a diagonal swipe) is the same
+    /// finger: taken, its sideways part dropped (Shady L4).
     #[test]
     fn touch_and_sideways_pass_through() {
         let s = Scroller::coasting();
         let mut e = lines(-3.);
         e.source = ScrollSource::Touch;
         assert!(!s.wheel(&e, Instant::now()));
-        let mut e = lines(0.);
-        e.delta = ScrollDelta::Lines(point(-3., 0.));
-        assert!(!s.wheel(&e, Instant::now()));
+        let sideways = |y: f32| {
+            let mut e = lines(0.);
+            e.delta = ScrollDelta::Lines(point(-1.213, y));
+            e
+        };
+        assert!(!s.wheel(&sideways(-0.4), Instant::now()));
+        let t0 = Instant::now();
+        assert!(s.wheel(&lines(-0.813), t0));
+        assert!(s.wheel(&sideways(-0.413), t0 + ms(8)));
+        let path = run(&s, t0, 10, 0., |_, _| {});
+        assert!((path[9] - 20. * (0.813 + 0.413)).abs() < 0.01, "both packets' vertical parts: {}", path[9]);
+    }
+
+    /// A stall mid-coast (a minimised window, a long frame) slows it: no
+    /// frame moves it more than 50 ms of its own curve (Shady L5).
+    #[test]
+    fn a_stalled_coast_doesnt_jump() {
+        let s = Scroller::coasting();
+        let t0 = Instant::now();
+        let mut next = 0u32;
+        let mut path = run(&s, t0, 60, 0., |_, now| {
+            while next < 12 && t0 + ms(8 * next as u64) <= now {
+                assert!(s.wheel(&lines(-1.613), t0 + ms(8 * next as u64)));
+                next += 1;
+            }
+        });
+        assert!(s.active(), "coasting");
+        let before = *path.last().unwrap();
+        let step = s.frame(t0 + ms(60 * 7 + 500), Room { offset: before, ..ROOM });
+        path.push(before + step.by);
+        // At ≤ 4 px/ms, 50 ms of coast is under 200 px; 500 ms would be ~1300.
+        assert!(step.by > 0. && step.by < 200., "{}", step.by);
     }
 }
