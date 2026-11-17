@@ -224,6 +224,136 @@ fn a_real_turn_streams_into_the_same_transcript_as_its_history() {
     assert!(t.take_splice().is_none());
 }
 
+/// Message times: a history row carries its message's `_synaps_at`; a live
+/// row the `ts` of the event that started it, and keeps it when its
+/// history form lands (the daemon dates a message when its round ends:
+/// here the thinking streamed from 07:34:28, the history says 07:34:30).
+/// A legacy message has none.
+#[test]
+fn rows_carry_their_message_times() {
+    let at = |t: &Transcript| t.items().iter().map(|i| (i.kind, i.at.as_deref().map(str::to_string))).collect::<Vec<_>>();
+    let mut fresh = Transcript::new();
+    fresh.load_attached(&attached("attached_history.json")).unwrap();
+    let want: Vec<_> = at(&fresh);
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(want[0], (ItemKind::User, s("2026-11-13T07:34:27Z")));
+    assert!(want[1..want.len() - 1].iter().all(|(_, t)| *t == s("2026-11-13T07:34:30Z")), "{want:?}");
+    assert_eq!(want.last().unwrap(), &(ItemKind::Assistant, s("2026-11-13T07:34:32Z")));
+
+    // Live: a row has the `ts` of the event that started it, from then on.
+    let mut t = Transcript::new();
+    t.load_attached(&attached("attached_create.json")).unwrap();
+    let mut first: Vec<(u64, String)> = Vec::new();
+    for (env, ev) in events("turn_events.ndjson") {
+        t.apply_at(&ev, &env.ts);
+        for i in t.items() {
+            let at = i.at.as_deref().unwrap_or_else(|| panic!("row {} has a time", i.id));
+            match first.iter().find(|(id, _)| *id == i.id) {
+                Some((_, ts)) => assert_eq!(at, ts, "row {} keeps its first time", i.id),
+                None => first.push((i.id, at.to_string())),
+            }
+        }
+    }
+    let thinking = t.items().iter().find(|i| i.kind == ItemKind::Thinking).unwrap();
+    assert_eq!(thinking.at.as_deref(), Some("2026-11-13T07:34:28.569949873Z"), "not the history's 07:34:30");
+    assert_eq!(at(&t).iter().map(|r| r.0).collect::<Vec<_>>(), want.iter().map(|r| r.0).collect::<Vec<_>>());
+    // A re-attach (a reload) keeps them; a fresh one has the history's.
+    let seen = at(&t);
+    t.load_attached(&attached("attached_history.json")).unwrap();
+    assert_eq!(at(&t), seen);
+
+    // Legacy history: no time, never one made up.
+    let mut old = Transcript::new();
+    old.apply_history(&[serde_json::json!({"role": "user", "content": "hi"})]);
+    assert_eq!(old.items()[0].at, None);
+    // A live row keeps its time when its history form has none; another
+    // message at its id never takes it.
+    old.apply_at(
+        &SessionEvent::TurnStarted { turn_baseline: 1, trigger: "user".into(), user_text: Some("again".into()) },
+        "2026-11-13T07:40:00.5Z",
+    );
+    let row = old.items()[1].id;
+    let both = [serde_json::json!({"role": "user", "content": "hi"}), serde_json::json!({"role": "user", "content": "again"})];
+    old.apply_history(&both);
+    assert_eq!((old.items()[1].id, old.items()[1].at.as_deref()), (row, Some("2026-11-13T07:40:00.5Z")));
+    // A swapped conversation (cleared, resumed, compacted) reuses the ids,
+    // even for the same text: its legacy rows get no time of the old one's.
+    old.apply_at(&SessionEvent::Cleared { session_id: String::new() }, "2026-11-13T07:41:00Z");
+    old.apply_update(&HistoryUpdate::Replace { messages: both.to_vec() }).unwrap();
+    assert_eq!(old.items()[1].id, row, "the id is reused");
+    assert!(old.items().iter().filter(|i| !i.is_note()).all(|i| i.at.is_none()), "{:?}", at(&old));
+    old.apply_update(&HistoryUpdate::Replace { messages: vec![serde_json::json!({"role": "user", "content": "other"}); 2] }).unwrap();
+    assert!(old.items().iter().filter(|i| !i.is_note()).all(|i| i.at.is_none()), "{:?}", at(&old));
+}
+
+/// A swap the client sees no replacement for (a resume of the journal it
+/// shows: the digest matches) leaves first times on: the turn after it
+/// keeps its live times when its history lands, as any other.
+#[test]
+fn a_swap_with_no_replacement_keeps_live_times() {
+    let mut t = Transcript::new();
+    let a = attached("attached_create.json");
+    t.load_attached(&a).unwrap();
+    let id = a.meta.journal_id.clone();
+    let resumed = SessionEvent::Resumed { id: 1, old_id: id.clone(), new_id: id, via: None, clamp_notice: None };
+    t.apply_at(&resumed, "2026-11-13T07:34:20Z");
+    let mut appends = 0;
+    for (env, ev) in events("turn_events.ndjson") {
+        appends += usize::from(history_of(&ev).is_some());
+        t.apply_at(&ev, &env.ts);
+    }
+    assert_eq!(appends, 3, "every round's history is an append");
+    let thinking = t.items().iter().find(|i| i.kind == ItemKind::Thinking).unwrap();
+    assert_eq!(thinking.at.as_deref(), Some("2026-11-13T07:34:28.569949873Z"), "not the history's 07:34:30");
+}
+
+/// A re-attach after a clear made while the tab was detached (in the TUI,
+/// another window): the daemon session is the same, its journal is new,
+/// and the same question asked again is another message. Its row reuses
+/// the id and has the snapshot's time, not the old one's. The journal is
+/// the conversation header's: the attach's `meta.journal_id` still names
+/// the one the session started with, as 0.11.1 sends it. A reload of the
+/// same journal keeps the first times, and a clear seen live moves the
+/// journal the next re-attach is compared with.
+#[test]
+fn a_reattach_after_a_clear_elsewhere_carries_no_time() {
+    let mut t = Transcript::new();
+    t.load_attached(&attached("attached_history.json")).unwrap();
+    let asked = t.items()[0].clone();
+    assert_eq!((asked.kind, asked.at.as_deref()), (ItemKind::User, Some("2026-11-13T07:34:27Z")));
+    let again = |journal: &str, at: &str| {
+        let mut b = attached("attached_history.json");
+        assert_eq!(b.meta.journal_id, "20261113-073427-5fde", "the meta keeps the first journal");
+        b.conversation.header["id"] = serde_json::json!(journal);
+        let first = b.conversation.api_messages[0].clone();
+        b.conversation.api_messages =
+            vec![first, serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "Another answer."}]})];
+        for m in &mut b.conversation.api_messages {
+            m["_synaps_at"] = serde_json::json!(at);
+        }
+        b.conversation.messages_len = 2;
+        b
+    };
+    let at = |t: &Transcript| t.items().iter().filter(|i| !i.is_note()).map(|i| i.at.as_deref().map(str::to_string)).collect::<Vec<_>>();
+    let s = |v: &str| Some(v.to_string());
+
+    t.load_attached(&again("20261113-090000-c1ea", "2026-11-13T09:00:00Z")).unwrap();
+    assert_eq!((t.items()[0].id, t.items()[0].text.as_str()), (asked.id, asked.text.as_str()), "the same session: the id is reused");
+    assert_eq!(at(&t), [s("2026-11-13T09:00:00Z"), s("2026-11-13T09:00:00Z")], "the new conversation's times");
+
+    // A reload of that journal: the first times stay.
+    t.load_attached(&again("20261113-090000-c1ea", "2026-11-13T09:05:00Z")).unwrap();
+    assert_eq!(at(&t), [s("2026-11-13T09:00:00Z"), s("2026-11-13T09:00:00Z")]);
+
+    // A clear seen live: the next re-attach to its journal is a reload.
+    t.apply_at(&SessionEvent::Cleared { session_id: "20261113-091000-d2fb".into() }, "2026-11-13T09:10:00Z");
+    let cleared = again("20261113-091000-d2fb", "2026-11-13T09:11:00Z");
+    t.apply_update(&HistoryUpdate::Replace { messages: cleared.conversation.api_messages.clone() }).unwrap();
+    assert_eq!(at(&t), [s("2026-11-13T09:11:00Z"), s("2026-11-13T09:11:00Z")], "swapped: no carry");
+    t.load_attached(&again("20261113-091000-d2fb", "2026-11-13T09:15:00Z")).unwrap();
+    assert_eq!(at(&t), [s("2026-11-13T09:11:00Z"), s("2026-11-13T09:11:00Z")], "the same journal: kept");
+}
+
 /// H1/M6: the client's path. Every `MessageHistory` of a real turn is an
 /// append carrying only the new messages, every digest matches the mirror
 /// (no resync), and the result equals a fresh attach.
