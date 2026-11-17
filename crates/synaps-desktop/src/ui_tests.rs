@@ -1928,10 +1928,21 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
 
 /// One display frame (144 Hz) later: the motion clock and the executor's
 /// move on together, then the app draws.
+///
+/// The motion clock is pinned from the first of these on, so it moves
+/// 6.944 ms here and nowhere else. Unpinned, it also runs with the wall
+/// clock: on a loaded runner a draw took 110 ms, every motion timer was
+/// already due when armed, and `run_until_parked` drew frame after frame,
+/// so one of these "frames" played 675 ms of motion. A row streaming a
+/// delta a frame looked like one that had stopped 675 ms ago, its write
+/// head decayed out (main 8d6ecc5's CI); a glide or a reveal could end
+/// inside one frame.
 fn fluid_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     let dt = std::time::Duration::from_micros(6944);
-    let t = view.read_with(cx, |v, _| v.fx.clock());
-    view.read_with(cx, |v, _| v.fx.set_clock(t + dt));
+    view.read_with(cx, |v, _| {
+        v.fx.pin_clock();
+        v.fx.set_clock(v.fx.clock() + dt);
+    });
     cx.executor().advance_clock(dt);
     view.update(cx, |_, cx| cx.notify());
     cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
@@ -2358,6 +2369,8 @@ fn a_list_swap_stops_the_scroller(cx: &mut TestAppContext) {
             }),
         )
     };
+    // The glide stays in flight however long the runner takes ([`fluid_frame`]).
+    view.read_with(cx, |v, _| v.fx.pin_clock());
     notch(cx);
     assert!(view.read_with(cx, |v, _| v.scroller.active()), "a glide in flight");
     scout_in_place(cx, w, &view);
