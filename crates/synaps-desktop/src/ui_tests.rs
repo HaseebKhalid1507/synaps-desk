@@ -928,6 +928,57 @@ fn a_stale_view_under_a_reused_handle_says_nothing_of_its_worker(cx: &mut TestAp
     });
 }
 
+/// A fan-out wider than its chips' lines (polish.md §2.5, finish gate
+/// r2): the newest worker fails, and its chip is drawn, first, while
+/// quiet running ones go into `+N more`; `+N more` opens the workers
+/// menu, the workers not drawn, newest first; picked, its view in place.
+#[gpui_kit::test]
+fn a_failed_worker_is_never_folded_into_more(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    let rows = |failed: bool| {
+        let rows: Vec<serde_json::Value> = (1..=12u64)
+            .map(|n| {
+                let status = if failed && n == 12 { "failed" } else { "running" };
+                serde_json::json!({"subagent_id": n, "agent_name": format!("worker-{n}"), "status": status, "cancel_requested": false,
+                    "elapsed_secs": 10.0 + n as f64, "finished_elapsed": null, "step": format!("reading src/part_{n}.rs"), "tools": n,
+                    "handle_id": format!("sa_{n}")})
+            })
+            .collect();
+        synaps_client::protocol::decode_event(&serde_json::json!({"ev": "subagent_rows", "rows": rows})).expect("a rows event")
+    };
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.on_session(&rows(false));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.on_session(&rows(true));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let (ids, drawn, more) =
+        view.read_with(cx, |v, _| (v.tray.rows.iter().map(|r| r.id).collect::<Vec<_>>(), v.tray_drawn(), v.chips.more));
+    assert!(ids.contains(&12), "the failed one flashes in the tray: {ids:?}");
+    assert!(more > 0 && drawn + more == ids.len(), "more workers than lines: {drawn} drawn, +{more}");
+    assert_eq!(ids[0], 12, "the failure first: {ids:?}");
+    let running: Vec<u64> = ids[1..].to_vec();
+    assert!(running.windows(2).all(|p| p[0] > p[1]), "then the running, newest first: {running:?}");
+    // `+N more` opens the workers menu: the ones not drawn.
+    let at = VisualTestContext::from_window(w, cx).debug_bounds("tray-more").expect("+N more drawn").center();
+    click_at(cx, w, at);
+    let items = view.read_with(cx, |v, _| v.wmenu.as_ref().map(|m| m.items.iter().map(|i| i.act).collect::<Vec<_>>()));
+    assert_eq!(items.as_deref(), Some(&ids[drawn..]), "the workers menu lists those not drawn");
+    let pick = ids[drawn];
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.workers_menu_pick(pick, crate::menu::How::Click(1), window, cx)))
+        .expect("the window");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(v.wmenu.is_none(), "picked: closed");
+        assert_eq!(v.model.watch.focused().map(|w| w.subagent_id), Some(pick), "its view in place");
+    });
+}
+
 /// The other demo session in a tab, attached (with no client, the
 /// synthetic transport answers its attach).
 fn open_idle_cpu(cx: &mut TestAppContext, view: &Entity<AppView>, place: crate::tabs::Place) {

@@ -147,9 +147,12 @@ pub(crate) fn tray_box(form: Form) -> f32 {
     if form == Form::Cramped { 4. } else { 8. }
 }
 
-/// Most lines of chips (the `+N more` chip ends the last): two, cramped one.
-pub(crate) fn tray_max(form: Form) -> usize {
+/// Most lines of chips (the `+N more` chip ends the last) for `workers`:
+/// two, cramped one; full, three once there are five or more (finish gate
+/// r2: most of the old tray's at-a-glance view, under half its height).
+pub(crate) fn tray_max(form: Form, workers: usize) -> usize {
     match form {
+        Form::Full if workers >= 5 => 3,
         Form::Full | Form::Short => 2,
         Form::Cramped => 1,
     }
@@ -158,12 +161,12 @@ pub(crate) fn tray_max(form: Form) -> usize {
 /// What the transcript keeps under the chips (scaled with the text).
 const TRAY_LIST: f32 = 60.;
 
-/// The lines of chips drawn for chips that need `n` lines in a `window`
-/// this tall: as many as [`tray_max`] and the room leave after the bars,
+/// The lines of chips drawn for `workers`' chips that need `n` lines in a
+/// `window` this tall: as many as [`tray_max`] and the room leave after the bars,
 /// `ex` (without the chips), a card at its least well (`card`: one is
 /// up), a one-line composer and [`TRAY_LIST`] of transcript. Fewer lines
 /// than they need: the last ends with `+N more`.
-pub(crate) fn chip_lines(m: &Metrics, form: Form, window: f32, card: bool, ex: Extras, n: usize) -> usize {
+pub(crate) fn chip_lines(m: &Metrics, form: Form, window: f32, card: bool, ex: Extras, workers: usize, n: usize) -> usize {
     if n == 0 {
         return 0;
     }
@@ -171,7 +174,7 @@ pub(crate) fn chip_lines(m: &Metrics, form: Form, window: f32, card: bool, ex: E
     let spare =
         window - above(form) - ex.height(m, form) - card - Composer::of(m, form).height(1) - (TRAY_LIST * m.r).round() - tray_box(form);
     let fit = ((spare + chip_gap(form)) / (tray_row(m) + chip_gap(form))).floor().max(0.) as usize;
-    n.min(tray_max(form)).min(fit)
+    n.min(tray_max(form, workers)).min(fit)
 }
 
 /// A filled button's height (AUTHORIZE, SEND).
@@ -683,8 +686,8 @@ mod tests {
                     let f = form(Layout::of(1000., window - TOP, &m, ex));
                     for (card, stub) in [(true, false), (false, true), (false, false)] {
                         let base = Extras { stub, ..ex };
-                        let n = chip_lines(&m, f, window, card, base, 9);
-                        assert!(n <= tray_max(f));
+                        let n = chip_lines(&m, f, window, card, base, 9, 9);
+                        assert!(n <= tray_max(f, 9));
                         let drawn = Extras { tray: n as u8, ..base };
                         let rows = composer_rows(&m, f, window, card, drawn);
                         let card_h = if card { Card::of(&m, f).height(well_lines(&m, f, window, rows, WELL_MIN, drawn)) } else { 0. };
@@ -704,13 +707,16 @@ mod tests {
                 }
             }
         }
-        // Chips: two lines at most, cramped one (polish.md §2.5).
+        // Chips: two lines at most, full three for five workers or more,
+        // cramped one (polish.md §2.5).
         let m = Metrics::at(16);
-        assert_eq!(chip_lines(&m, Form::Full, 1200., false, Extras::default(), 9), 2);
-        assert_eq!(chip_lines(&m, Form::Full, 1200., false, Extras::default(), 1), 1);
-        assert_eq!(chip_lines(&m, Form::Short, 800., false, Extras::default(), 9), 2);
-        assert_eq!(chip_lines(&m, Form::Cramped, 600., false, Extras::default(), 2), 1);
-        assert_eq!(chip_lines(&m, Form::Full, 1200., true, Extras::default(), 0), 0);
+        assert_eq!(chip_lines(&m, Form::Full, 1200., false, Extras::default(), 4, 9), 2);
+        assert_eq!(chip_lines(&m, Form::Full, 1200., false, Extras::default(), 5, 9), 3);
+        assert_eq!(chip_lines(&m, Form::Full, 1200., false, Extras::default(), 9, 2), 2, "the lines they need, no more");
+        assert_eq!(chip_lines(&m, Form::Full, 1200., false, Extras::default(), 1, 1), 1);
+        assert_eq!(chip_lines(&m, Form::Short, 800., false, Extras::default(), 9, 9), 2);
+        assert_eq!(chip_lines(&m, Form::Cramped, 600., false, Extras::default(), 9, 2), 1);
+        assert_eq!(chip_lines(&m, Form::Full, 1200., true, Extras::default(), 0, 0), 0);
     }
 
     /// The composer grows only into room the card's 3-line form leaves.

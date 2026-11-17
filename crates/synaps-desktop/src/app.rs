@@ -1567,6 +1567,8 @@ pub struct AppView {
     /// A session's menu (a right-click on its tab or rail row): Rename…,
     /// Close tab.
     pub(crate) smenu: Option<(crate::menu::Menu<SessionAct>, SessionTarget)>,
+    /// The workers menu (`+N more`'s): its items' acts are worker ids.
+    pub(crate) wmenu: Option<crate::menu::Menu<u64>>,
     /// A rename asked for a session not on screen yet (and when): its
     /// naming row opens once it is attached, if that is soon and nothing
     /// else was shown meanwhile ([`RENAME_WAIT`]); else it is forgotten.
@@ -2000,6 +2002,7 @@ impl AppView {
             menu_focus_back: None,
             cancel_tick: None,
             smenu: None,
+            wmenu: None,
             rename_pending: None,
             halt_armed: None,
             halt_tick: None,
@@ -5653,6 +5656,7 @@ impl Render for AppView {
         self.fx.rescope(self.motion_session(), self.motion_column());
         if self.menu.is_none()
             && self.smenu.is_none()
+            && self.wmenu.is_none()
             && let Some(h) = self.menu_focus_back.take()
             && self.focus.is_focused(window)
         {
@@ -5801,9 +5805,9 @@ impl Render for AppView {
         // many the room leaves. A chip fading out keeps its slot until its
         // fade is over.
         let confirm = self.display_w(label::CONFIRM, fonts::size::D_S, window);
-        let (form, height) = (lay.form(), self.height);
+        let (form, height, workers) = (lay.form(), self.height, self.tray.rows.len());
         self.tray_rows = if view.is_none() {
-            self.fit_chips(lay.column, confirm, &m, |needed| crate::fit::chip_lines(&m, form, height, card_shown, ex, needed))
+            self.fit_chips(lay.column, confirm, &m, |needed| crate::fit::chip_lines(&m, form, height, card_shown, ex, workers, needed))
         } else {
             self.pack_chips(Vec::new(), &[], lay.column, 0, &m);
             0
@@ -6006,6 +6010,10 @@ impl Render for AppView {
                     cx.stop_propagation();
                     return;
                 }
+                if this.wmenu.is_some() && this.workers_menu_keydown(&ev.keystroke, this.chord_press, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 // The worker menu from the keyboard: from the session's
                 // thread or a worker's (the composer, the view), never over
                 // the accent picker or the find field.
@@ -6191,6 +6199,7 @@ impl Render for AppView {
             .when(self.gear_menu, |d| d.child(deferred(self.render_gear_menu(rail == Side::Strip, &p, cx)).with_priority(2)))
             .children(self.render_menu_at_point(&p, cx))
             .children(self.render_session_menu(&p, cx))
+            .children(self.render_workers_menu(&p, cx))
             // Painted last, after every row was rendered: what the frame's
             // motion asked for (a frame, the one timer, or nothing; with a
             // beat layer, it arms the timer after painting the beat).
