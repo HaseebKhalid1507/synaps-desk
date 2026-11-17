@@ -8,6 +8,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use crate::app::{AppView, EdgeDrag, STRIP, Side, ToggleRail, ToggleRight, count, display, mono, section, tbtn};
@@ -134,6 +135,69 @@ pub(crate) struct RailCache {
     states: u64,
     pub(crate) rail: Rail,
     keys: Vec<u64>,
+    /// Rows on screen before the last splice: their key and top, in the
+    /// list's content (Flip, motion.md §6.4).
+    pub(crate) flip_from: Vec<(u64, f32)>,
+}
+
+/// A row's key, if the item is a row.
+pub(crate) fn row_key(rail: &Rail, item: &Item) -> Option<u64> {
+    match item {
+        Item::Row(i) | Item::Hist(i) => rail.rows.get(*i).map(|r| r.key),
+        _ => None,
+    }
+}
+
+/// Item `ix`'s top and height in `list`'s content (not moved by a scroll),
+/// and the content's scroll offset, as of the last layout.
+pub(crate) fn item_y(list: &ListState, ix: usize) -> Option<(f32, f32, f32)> {
+    let vp = list.viewport_bounds();
+    let b = list.bounds_for_item(ix)?;
+    let scroll = -f32::from(list.scroll_px_offset_for_scrollbar().y);
+    Some((f32::from(b.top() - vp.top()) + scroll, f32::from(b.size.height), scroll))
+}
+
+/// What the rail's motion knows this frame (fluid.md §3.7): each row's
+/// paint offset (Flip), the selection quad (its top in the list's view and
+/// height, while it moves), the readout's y offset as it follows.
+#[derive(Default)]
+pub(crate) struct RailFx {
+    pub(crate) flips: Vec<u64>,
+    pub(crate) offsets: HashMap<u64, f32>,
+    pub(crate) sel: Option<u64>,
+    pub(crate) quad: Option<(f32, f32)>,
+    pub(crate) moving: bool,
+    /// The readout's y, as it follows from the row before.
+    pub(crate) readout_dy: f32,
+}
+
+/// Spring keys (the rail's own).
+const FLIP: u64 = 0x7AC0 << 48;
+const SEL_Y: u64 = 0x7AC1 << 48;
+const SEL_H: u64 = 0x7AC2 << 48;
+pub(crate) const RAIL_TOUCH: u64 = 0x7AC3 << 48;
+pub(crate) const READOUT_Y: u64 = 0x7AC4 << 48;
+/// Flip's cap (fluid.md §2.3): a row that moved farther starts this far
+/// from its new place, on its true side.
+const FLIP_CAP: f32 = 160.;
+/// The numbers' and meters' keys (motion.md §6.6).
+const GLOW: u64 = 0x7AC5 << 48;
+const METER: u64 = 0x7AC6 << 48;
+
+/// A shown value's hash, for its afterglow ([`crate::motion::Motion::glow`]).
+fn vhash(v: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
+/// The context gauge's colour class (`gauge_color`'s bands).
+fn gauge_class(ratio: Option<f64>) -> u64 {
+    match ratio.unwrap_or(0.) {
+        r if r < 0.5 => 0,
+        r if r < HOT => 1,
+        _ => 2,
+    }
 }
 
 impl RailCache {
@@ -168,14 +232,26 @@ impl RailCache {
         }
         let rail = rail::build(m, view, now);
         let keys: Vec<u64> = rail.items.iter().map(|i| rail::item_key(&rail, i)).collect();
+        let mut flip_from = Vec::new();
         if let Some((range, count)) = rail::splice(&self.keys, &keys) {
+            // Flip: where the rows on screen were, before the splice.
+            let top = list.logical_scroll_top().item_ix;
+            for ix in top..self.rail.items.len() {
+                let Some((y, _, scroll)) = item_y(list, ix) else { break };
+                if y - scroll > f32::from(list.viewport_bounds().size.height) {
+                    break;
+                }
+                if let Some(k) = row_key(&self.rail, &self.rail.items[ix]) {
+                    flip_from.push((k, y));
+                }
+            }
             let start = range.start;
             list.splice(range, count);
             // The rail measures every row, so its bar reaches its end; GPUI
             // measures new ones up front only once told they need it.
             list.remeasure_items(start..start + count);
         }
-        *self = RailCache { generation: Some(m.rail_gen), minute: now / 60, view: view.clone(), states, rail, keys };
+        *self = RailCache { generation: Some(m.rail_gen), minute: now / 60, view: view.clone(), states, rail, keys, flip_from };
     }
 }
 
@@ -400,6 +476,97 @@ impl AppView {
             )
     }
 
+    /// The gauge's bar colour: crossing a band (`HOT`), it cross-fades from
+    /// the band before over `slow` (motion.md §6.6).
+    fn gauge_bar(&self, key: u64, ratio: Option<f64>, p: &Palette) -> Hsla {
+        let bar = gauge_color(ratio, p);
+        let Some((prev, since)) = self.fx.changed(key, gauge_class(ratio)) else { return bar };
+        let was = [p.focus_ch, p.run_mark_ch, p.err_mark_ch][prev.min(2) as usize];
+        let t = self.fx.shot(Some(since), std::time::Duration::ZERO, crate::motion::SLOW, &crate::motion::ease::INOUT, crate::motion::Kind::Fade);
+        crate::motion::mix(was, bar, t)
+    }
+
+    /// The rail's motion this frame (fluid.md §3.7, motion.md §6.4), from
+    /// the list's last layout, before the list lays out again (its rows
+    /// can't ask it then):
+    /// - Flip: a row on screen before a splice (a reorder, a session
+    ///   starting or ending above it) starts where it was, at most
+    ///   [`FLIP_CAP`] away, and springs to its new place (`snap`);
+    /// - the selection: the shown row's `raised` fill and 2 px bar are one
+    ///   quad that springs from the row shown before (`snap`), from the
+    ///   view's edge if that row is off screen;
+    /// - the readout: replacing another within 300 ms, it springs its y from
+    ///   that row's (`snap`).
+    ///
+    /// Full only; at rest every row draws its own fill and bar.
+    pub(crate) fn rail_motion(&mut self) {
+        let snap = crate::motion::SNAP_RESPONSE;
+        let readout_from = self.readout_from.take();
+        let list = &self.rail_list;
+        let rail = &self.rail.rail;
+        let fx = &self.fx;
+        let ix_of = |key: u64| rail.items.iter().position(|it| row_key(rail, it) == Some(key));
+        let view_h = f32::from(list.viewport_bounds().size.height);
+        let mut out = std::mem::take(&mut self.rail_fx);
+        out.offsets.clear();
+        for (key, from) in std::mem::take(&mut self.rail.flip_from) {
+            if let Some((y, _, _)) = ix_of(key).and_then(|ix| item_y(list, ix))
+                && (from - y).abs() >= 0.5
+            {
+                fx.spring_jump(crate::motion::key(FLIP, key), y + (from - y).clamp(-FLIP_CAP, FLIP_CAP), y, snap);
+                if !out.flips.contains(&key) {
+                    out.flips.push(key);
+                }
+            }
+        }
+        out.flips.retain(|&key| {
+            let Some((y, _, _)) = ix_of(key).and_then(|ix| item_y(list, ix)) else { return false };
+            let (v, moving) = fx.spring_held(crate::motion::key(FLIP, key), y, snap);
+            if moving {
+                out.offsets.insert(key, v - y);
+            }
+            moving
+        });
+        // The row shown: the visible tab's session.
+        let sel = rail.items.iter().enumerate().find_map(|(ix, it)| match it {
+            Item::Row(r) => {
+                let row = &rail.rows[*r];
+                row.live.and_then(|i| self.model.sessions.get(i)).filter(|s| self.model.is_shown(&s.id)).map(|_| (ix, row.key))
+            }
+            _ => None,
+        });
+        out.quad = None;
+        out.moving = false;
+        match sel.and_then(|(ix, key)| item_y(list, ix).map(|y| (key, y))) {
+            Some((key, (y, h, scroll))) => {
+                if out.sel.is_some_and(|k| k != key)
+                    && let (Some(y0), Some(h0)) = (fx.spring_at(SEL_Y), fx.spring_at(SEL_H))
+                {
+                    // From where it was drawn; off screen, from that edge.
+                    let y0 = (y0 - scroll).clamp(-h0, view_h) + scroll;
+                    fx.spring_jump(SEL_Y, y0, y, snap);
+                    fx.spring_jump(SEL_H, h0, h, snap);
+                }
+                let ((qy, my), (qh, mh)) = (fx.spring_held(SEL_Y, y, snap), fx.spring_held(SEL_H, h, snap));
+                out.moving = my || mh;
+                if out.moving {
+                    out.quad = Some((qy - scroll, qh));
+                }
+                out.sel = Some(key);
+            }
+            None => out.sel = sel.map(|s| s.1),
+        }
+        out.readout_dy = 0.;
+        let shows = self.readout.or(self.readout_leaving.map(|l| l.0));
+        if let Some((y, _, _)) = shows.and_then(ix_of).and_then(|ix| item_y(list, ix)) {
+            if let Some(from) = readout_from {
+                fx.spring_jump(READOUT_Y, from, y, snap);
+            }
+            out.readout_dy = fx.spring_held(READOUT_Y, y, snap).0 - y;
+        }
+        self.rail_fx = out;
+    }
+
     /// The drag handle on a side panel's inner edge (`rail`, else the right
     /// panel's), over the rest of the window: its 1-px line is the panel's
     /// border, `line3` under the pointer, `ink3` while dragged. A strip has
@@ -465,7 +632,7 @@ impl AppView {
             .border_r_1()
             .border_color(p.hair)
             .cursor_pointer()
-            .hover(|d| d.bg(p.raised))
+            .map(|d| self.lit(d, crate::app::tkey("rail-strip", 0), (p.chrome, p.raised, p.press_ch), cx))
             .child(mono("›", 12., p.dim_ch))
             .child(div().size(px(8.)).rounded_full().bg(self.conn_disc(p)))
             .child(
@@ -499,11 +666,12 @@ impl AppView {
         let faded = p.faded();
         let q = if dim { &faded } else { p };
         let ratio = self.model.stats.context_ratio();
-        let bar = gauge_color(ratio, q);
+        let bar = self.gauge_bar(METER | 8, ratio, q);
         let filled = ratio.map(|r| ((r * STRIP_SEGMENTS as f64).round() as usize).min(STRIP_SEGMENTS)).unwrap_or(0);
         let mut gauge = v_flex().w(px(6.)).gap(px(2.));
+        // Bottom to top as it fills (motion.md §6.6).
         for i in (0..STRIP_SEGMENTS).rev() {
-            gauge = gauge.child(div().w_full().h(px(4.)).bg(if i < filled { bar } else { p.edge }));
+            gauge = gauge.child(div().w_full().h(px(4.)).bg(self.fx.segment(METER | 9, filled, i, p.edge, bar)));
         }
         let pct: SharedString = ratio.map(|r| format!("{:.0}", r * 100.0)).unwrap_or_else(|| "—".into()).into();
         let fits = crate::app::toggled(self.width, self.panels, false).is_some();
@@ -518,7 +686,7 @@ impl AppView {
             .border_l_1()
             .border_color(p.hair)
             .cursor_pointer()
-            .hover(|d| d.bg(p.raised))
+            .map(|d| self.lit(d, crate::app::tkey("right-strip", 0), (p.chrome, p.raised, p.press_ch), cx))
             .child(mono("‹", 12., p.dim_ch))
             .child(
                 v_flex()
@@ -647,6 +815,18 @@ impl AppView {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .relative()
+                    .overflow_hidden()
+                    .children(self.rail_fx.quad.map(|(y, h)| {
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .top(px(y))
+                            .h(px(h))
+                            .bg(p.raised)
+                            .child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(p.you_bar))
+                    }))
                     .child(items)
                     .child(crate::scrollbar::rows(&self.rail_list, 0., &self.bars.rail).ground(crate::scrollbar::Ground::Chrome)),
             )
@@ -675,7 +855,7 @@ impl AppView {
                     .items_baseline()
                     .gap(px(9.))
                     .cursor_pointer()
-                    .hover(|d| d.bg(p.raised))
+                    .map(|d| self.lit(d, crate::app::tkey("favs-head", 0), (p.chrome, p.raised, p.press_ch), cx))
                     .child(div().absolute().left(px(7.)).top(px(19.)).child(glyph::draw(chevron, p.rest_mark)))
                     .child(display(label::FAVOURITES, size::D_S, p.dim_ch))
                     .child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_ch).child(fonts::JP_FAVOURITES))
@@ -711,7 +891,7 @@ impl AppView {
                     .gap(px(10.))
                     .items_baseline()
                     .cursor_pointer()
-                    .hover(|d| d.bg(p.raised))
+                    .map(|d| self.lit(d, crate::app::tkey("bucket", b as usize), (p.chrome, p.raised, p.press_ch), cx))
                     .child(div().w(px(10.)).flex_none().child(mono(if *open { "−" } else { "+" }, size::META, color)))
                     .child(display(b.label(), size::D_S, color))
                     .child(div().flex_1())
@@ -730,7 +910,7 @@ impl AppView {
                     .pb(px(8.))
                     .cursor_pointer()
                     .child(display(text, size::D_S, p.dim_ch))
-                    .hover(|d| d.bg(p.raised))
+                    .map(|d| self.lit(d, crate::app::tkey("more", b as usize), (p.chrome, p.raised, p.press_ch), cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.expanded |= b.bit();
                         cx.notify();
@@ -782,16 +962,25 @@ impl AppView {
             _ => p.prose_ch,
         };
         let sub_color = p.dim_ch;
-        let bar = if st == State::NeedsYou {
-            Some(p.warn_mark_ch)
-        } else if shown {
-            Some(p.you_bar)
+        let key = row.key;
+        let fx = &self.fx;
+        // While the selection quad moves, it is this row's fill and bar.
+        let lit = !(self.rail_fx.moving && self.rail_fx.sel == Some(key));
+        // NEEDS YOU's bar draws top to bottom over `base` (motion.md §6.3).
+        let needs = st == State::NeedsYou;
+        let since = fx.change(crate::motion::Tag::RowNeeds, key, needs as u64, None).filter(|_| needs).map(|c| c.0);
+        let bar = if needs {
+            Some((p.warn_mark_ch, fx.draw(since, std::time::Duration::ZERO, crate::motion::BASE)))
+        } else if shown && lit {
+            Some((p.you_bar, 1.))
         } else if in_tab {
-            Some(p.rest_mark)
+            Some((p.rest_mark, 1.))
         } else {
             None
         };
-        let key = row.key;
+        let touch = crate::motion::key(RAIL_TOUCH, key);
+        let (fill, dy) = fx.fill(touch, p.chrome, (shown && lit).then_some(p.raised), p.raised, p.press_ch);
+        let flip = self.rail_fx.offsets.get(&key).copied().unwrap_or(0.);
         // Line 2's room for the sub, past the word (and its count) and the
         // cost: under SUB_MIN_CELLS cells it is dropped.
         let cell = self.top_words.as_ref().map_or(7.2, |t| t.cell);
@@ -837,19 +1026,21 @@ impl AppView {
                     cx.notify();
                 }))
         });
-        div()
+        let el = div()
             .id(("rail-row", key as usize))
             .group("rail-row")
             .relative()
+            .top(px(flip))
             .w_full()
             .px(px(22.))
             .py(px(8.))
             .cursor_pointer()
-            .when(shown, |d| d.bg(p.raised))
-            .hover(|d| d.bg(p.raised))
-            .when_some(bar, |d, c| d.child(div().absolute().left_0().top_0().bottom_0().w(px(if in_tab { 1. } else { 2. })).bg(c)))
+            .when_some(fill, |d, c| d.bg(c))
+            .when_some(bar, |d, (c, f)| {
+                d.child(div().absolute().left_0().top_0().h(relative(f)).w(px(if in_tab { 1. } else { 2. })).bg(c))
+            })
             .child(
-                h_flex().gap(px(10.)).items_start().child(lead.mt(px(5.))).child(
+                h_flex().relative().top(px(dy)).gap(px(10.)).items_start().child(lead.mt(px(5.))).child(
                     v_flex()
                         .flex_1()
                         .min_w_0()
@@ -908,8 +1099,13 @@ impl AppView {
                         ),
                 ),
             )
-            .when(self.readout == Some(key) && !menu_open, |d| d.child(self.render_readout(row, p)))
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
+            .children(self.readout_of(key, menu_open).map(|phase| self.render_readout(row, phase, p)))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.fx.set_hover(touch, *hovered);
+                this.hover_row(key, *hovered, cx);
+                cx.notify();
+            }))
+            .map(|d| AppView::pressable(d, touch, cx))
             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                 this.rail_click(key, crate::tabstrip::click_place(ev, cx));
                 cx.notify();
@@ -921,8 +1117,8 @@ impl AppView {
                 } else if ev.is_right_click() {
                     this.open_session_menu(crate::app::SessionAt::Row(key), ev.position(), window, cx);
                 }
-            }))
-            .into_any_element()
+            }));
+        el.into_any_element()
     }
 
     /// A HISTORY row: one fixed-height line, title and age, a mark only if
@@ -939,20 +1135,26 @@ impl AppView {
             _ if row.named => p.prose_ch,
             _ => p.dim_ch,
         };
+        let touch = crate::motion::key(RAIL_TOUCH, key);
+        let (fill, dy) = self.fx.fill(touch, p.chrome, None, p.raised, p.press_ch);
+        let flip = self.rail_fx.offsets.get(&key).copied().unwrap_or(0.);
         h_flex()
             .id(("rail-hist", key as usize))
             .group("rail-row")
             .relative()
+            .top(px(flip))
             .w_full()
             .h(px(25.))
             .px(px(22.))
             .gap(px(10.))
             .items_center()
             .cursor_pointer()
-            .hover(|d| d.bg(p.raised))
-            .child(glyph::session_mark(row.state, Ground::Chrome, p))
+            .when_some(fill, |d, c| d.bg(c))
+            .child(div().flex().flex_none().relative().top(px(dy)).child(glyph::session_mark(row.state, Ground::Chrome, p)))
             .child(
                 div()
+                    .relative()
+                    .top(px(dy))
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
@@ -963,10 +1165,15 @@ impl AppView {
                     .text_color(title_color)
                     .child(SharedString::from(&row.title)),
             )
-            .child(mono(&row.age, size::META, p.dim_ch))
+            .child(mono(&row.age, size::META, p.dim_ch).relative().top(px(dy)))
             .child(self.star(key, false, 25., p, cx))
-            .when(self.readout == Some(key) && !menu_open, |d| d.child(self.render_readout(row, p)))
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
+            .children(self.readout_of(key, menu_open).map(|phase| self.render_readout(row, phase, p)))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.fx.set_hover(touch, *hovered);
+                this.hover_row(key, *hovered, cx);
+                cx.notify();
+            }))
+            .map(|d| AppView::pressable(d, touch, cx))
             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                 this.rail_click(key, crate::tabstrip::click_place(ev, cx));
                 cx.notify();
@@ -1018,7 +1225,26 @@ impl AppView {
     /// The hover readout, beside the row over the session pane: drawn on
     /// top of everything (not clipped by the rail's scroll), only after the
     /// pointer has rested 400 ms.
-    fn render_readout(&self, row: &rail::Row, p: &Palette) -> AnyElement {
+    /// The readout of row `key` this frame, if it shows (or is leaving):
+    /// its strength, its x offset (its rise from the row's side) and y
+    /// (following from the row before, or sinking back as it leaves).
+    fn readout_of(&self, key: u64, menu_open: bool) -> Option<(f32, f32, f32)> {
+        if menu_open {
+            return None;
+        }
+        if self.readout == Some(key) {
+            let (a, rise) = self.fx.enter(self.readout_at);
+            return Some((a, -rise, self.rail_fx.readout_dy));
+        }
+        let (k, at) = self.readout_leaving?;
+        if k != key {
+            return None;
+        }
+        let (a, sink) = self.fx.leave(at)?;
+        Some((a, -sink, self.rail_fx.readout_dy))
+    }
+
+    fn render_readout(&self, row: &rail::Row, (strength, dx, dy): (f32, f32, f32), p: &Palette) -> AnyElement {
         let now = now_secs();
         let fav = row.fav.and_then(|i| self.model.favs.list.get(i));
         let r = match (row.live.and_then(|i| self.model.sessions.get(i)), row.saved.and_then(|s| rail::saved_entry(&self.model, s))) {
@@ -1041,7 +1267,10 @@ impl AppView {
             .absolute()
             .top_0()
             .left_0()
-            .child(deferred(anchored().offset(point(px(self.rail_width + 12.), px(2.))).child(body)).with_priority(2))
+            .child(
+                deferred(anchored().offset(point(px(self.rail_width + 12. + dx), px(2. + dy))).child(crate::motion::appear(body, strength)))
+                    .with_priority(2),
+            )
             .into_any_element()
     }
 
@@ -1058,11 +1287,14 @@ impl AppView {
         let ratio = s.context_ratio();
         let filled = ratio.map(|r| ((r * SEGMENTS as f64).round() as usize).min(SEGMENTS)).unwrap_or(0);
         let hot = ratio.is_some_and(|r| r >= HOT);
-        let bar = gauge_color(ratio, p);
+        let fx = &self.fx;
+        let bar = self.gauge_bar(METER, ratio, p);
         let mut segs = h_flex().gap(px(2.)).h(px(8.)).mt(px(20.));
         for i in 0..SEGMENTS {
-            segs = segs.child(div().flex_1().h_full().bg(if i < filled { bar } else { p.edge }));
+            segs = segs.child(div().flex_1().h_full().bg(fx.segment(METER | 2, filled, i, p.edge, bar)));
         }
+        // Changed numbers afterglow (motion.md §6.6).
+        let glow = |n: u64, v: &str, c: Hsla| fx.glow(GLOW | n, vhash(v), c);
         let scale: SharedString = match (s.context, window) {
             (Some(c), Some(w)) => format!("{} of {} tokens", compact(c), compact(w)).into(),
             (None, Some(_)) => "no model call seen yet".into(),
@@ -1092,18 +1324,20 @@ impl AppView {
                         Some(r) => h_flex()
                             .items_end()
                             .gap(px(3.))
-                            .child(display(format!("{:.1}", r * 100.0), 46., if hot { p.err_ch } else { p.ink }).line_height(px(46.)))
+                            .child({
+                                let v = format!("{:.1}", r * 100.0);
+                                let c = glow(1, &v, if hot { p.err_ch } else { p.ink });
+                                display(v, 46., c).line_height(px(46.))
+                            })
                             .child(display("%", 16., p.dim_ch).line_height(px(16.)).pb(px(5.)))
                             .into_any_element(),
                         None => display("—", 46., p.dim_ch).into_any_element(),
                     })
                     .child(div().flex_1())
                     .when_some(window, |d, w| {
-                        d.child(v_flex().items_end().gap(px(5.)).child(display(label::WINDOW, size::D_S, p.dim_ch)).child(mono(
-                            compact(w),
-                            13.,
-                            p.prose_ch,
-                        )))
+                        let v = compact(w);
+                        let c = glow(2, &v, p.prose_ch);
+                        d.child(v_flex().items_end().gap(px(5.)).child(display(label::WINDOW, size::D_S, p.dim_ch)).child(mono(v, 13., c)))
                     }),
             )
             .child(segs)
@@ -1123,16 +1357,28 @@ impl AppView {
             .child(
                 h_flex()
                     .mt(px(20.))
-                    .child(div().flex_1().child(kv(label::IN, num(|t| t.input), false, p.ink, p)))
-                    .child(div().flex_1().child(kv(label::OUT, num(|t| t.output), false, p.ink, p)))
-                    .child(div().flex_1().child(kv(label::CACHE, num(|t| t.cache_read), false, p.ink, p)))
-                    .child(div().flex_1().child(kv(label::WRITE, num(|t| t.cache_creation), false, p.ink, p))),
+                    .child(div().flex_1().child({
+                        let v = num(|t| t.input);
+                        kv(label::IN, v.clone(), false, glow(3, &v, p.ink), p)
+                    }))
+                    .child(div().flex_1().child({
+                        let v = num(|t| t.output);
+                        kv(label::OUT, v.clone(), false, glow(4, &v, p.ink), p)
+                    }))
+                    .child(div().flex_1().child({
+                        let v = num(|t| t.cache_read);
+                        kv(label::CACHE, v.clone(), false, glow(5, &v, p.ink), p)
+                    }))
+                    .child(div().flex_1().child({
+                        let v = num(|t| t.cache_creation);
+                        kv(label::WRITE, v.clone(), false, glow(6, &v, p.ink), p)
+                    })),
             )
             .child(
                 h_flex()
                     .mt(px(22.))
-                    .child(div().flex_1().child(kv(label::CACHE_HIT, hit, true, p.ink, p)))
-                    .child(div().flex_1().child(kv(label::COST, cost, true, p.cost_ch, p))),
+                    .child(div().flex_1().child(kv(label::CACHE_HIT, hit.clone(), true, glow(7, &hit, p.ink), p)))
+                    .child(div().flex_1().child(kv(label::COST, cost.clone(), true, glow(8, &cost, p.cost_ch), p))),
             );
         let ledger = &s.files;
         let (added, removed) = ledger.totals();
@@ -1318,7 +1564,7 @@ impl AppView {
             .items_center()
             .cursor_pointer()
             .when(follows, |d| d.bg(p.raised))
-            .hover(|d| d.bg(p.raised))
+            .map(|d| self.lit(d, crate::app::tkey("theme-config", 0), (p.chrome, p.raised, p.press_ch), cx))
             .child(div().size(px(12.)).flex_none().border_1().border_color(p.dim_ch))
             .child(display(label::SYNAPS_CONFIG, size::D_S, if follows { p.ink } else { p.prose_ch }).flex_none())
             .child(mono(format!("· {}", self.config_theme), size::META, p.dim_ch).flex_1().min_w_0().overflow_hidden().text_ellipsis())
@@ -1337,7 +1583,7 @@ impl AppView {
                     .items_center()
                     .cursor_pointer()
                     .when(on, |d| d.bg(p.raised))
-                    .hover(|d| d.bg(p.raised))
+                    .map(|d| self.lit(d, crate::app::tkey("theme", i), (p.chrome, p.raised, p.press_ch), cx))
                     .child(
                         h_flex()
                             .flex_none()
@@ -1364,7 +1610,7 @@ impl AppView {
                 .items_center()
                 .cursor_pointer()
                 .when(off, |d| d.bg(p.raised))
-                .hover(|d| d.bg(p.raised))
+                .map(|d| self.lit(d, crate::app::tkey("accent-off", 0), (p.chrome, p.raised, p.press_ch), cx))
                 .child(div().size(px(12.)).flex_none().border_1().border_color(p.dim_ch))
                 .child(display(label::THEME, size::D_S, if off { p.ink } else { p.prose_ch }).flex_1())
                 .child(mono(if off { "✓" } else { " " }, size::META, p.focus_ch).w(px(10.)))
@@ -1382,7 +1628,7 @@ impl AppView {
                     .items_center()
                     .cursor_pointer()
                     .when(on, |d| d.bg(p.raised))
-                    .hover(|d| d.bg(p.raised))
+                    .map(|d| self.lit(d, crate::app::tkey("preset", i), (p.chrome, p.raised, p.press_ch), cx))
                     .child(div().size(px(12.)).flex_none().bg(rgb(hex)))
                     .child(display(name, size::D_S, if on { p.ink } else { p.prose_ch }).flex_1().min_w_0().overflow_hidden())
                     .child(mono(if on { "✓" } else { " " }, size::META, p.focus_ch).w(px(10.)))

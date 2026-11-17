@@ -730,7 +730,10 @@ impl AppView {
             self.model.cancels.disarm();
         }
         let items = items(&self.facts(&t, Instant::now()));
-        self.menu = Some((Menu::new(items, at, keyboard), t));
+        let m = Menu::new(items, at, keyboard);
+        // A pointer's menu enters; the keyboard's is there at once.
+        let m = if keyboard { m } else { m.born(self.fx.clock()) };
+        self.menu = Some((m, t));
         cx.notify();
     }
 
@@ -753,9 +756,9 @@ impl AppView {
         if items == m.items {
             return;
         }
-        let (at, sel) = (m.at, m.sel);
+        let (at, sel, born) = (m.at, m.sel, m.born);
         if let Some((m, _)) = self.menu.as_mut() {
-            *m = Menu { items, sel, at };
+            *m = Menu { items, sel, at, born };
         }
     }
 
@@ -896,10 +899,17 @@ impl AppView {
 
     /// The menu, if open at a point (a right-click): at the root, over
     /// everything.
+    /// One leaving (fluid.md §3.10) is drawn without a hitbox until gone.
     pub(crate) fn render_menu_at_point(&self, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement> {
-        let (m, _) = self.menu.as_ref()?;
+        let (m, phase) = match self.menu.as_ref() {
+            Some((m, _)) => (m, crate::menu::Phase::enter(&self.fx, m.born, -1.)),
+            None => {
+                let (m, at) = self.menu_leaving.as_ref()?;
+                (m, crate::menu::Phase::leave(&self.fx, *at, -1.)?)
+            }
+        };
         let At::Point(pt) = m.at else { return None };
-        let body = crate::menu::render("worker-menu", m, p, AppView::menu_pick, |this, _| this.close_menu(), cx);
+        let body = crate::menu::render("worker-menu", m, p, AppView::menu_pick, |this, _| this.close_menu(), phase, &self.fx, cx);
         Some(deferred(anchored().position(pt).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
     }
 
@@ -910,7 +920,8 @@ impl AppView {
         if m.at != At::Row(id) {
             return None;
         }
-        let body = crate::menu::render("worker-menu", m, p, AppView::menu_pick, |this, _| this.close_menu(), cx);
+        let phase = crate::menu::Phase::enter(&self.fx, m.born, 1.);
+        let body = crate::menu::render("worker-menu", m, p, AppView::menu_pick, |this, _| this.close_menu(), phase, &self.fx, cx);
         Some(
             div()
                 .absolute()

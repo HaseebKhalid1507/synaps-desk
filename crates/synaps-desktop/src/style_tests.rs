@@ -105,17 +105,23 @@ fn no_text_under_12_px() {
 
 /// `motion::lift`, from its `#[allow]` to its closing brace: in motion.rs
 /// the one place opacity (and its lint's allow) may be.
-fn lift_span(code: &str) -> std::ops::Range<usize> {
-    let head = "#[allow(clippy::disallowed_methods)]\npub(crate) fn lift";
-    let start = code.find(head).expect("motion::lift, allowed directly above");
-    let end = start + code[start..].find("\n}\n").expect("lift's end") + 2;
-    start..end
+fn lift_span(code: &str) -> Vec<std::ops::Range<usize>> {
+    ["lift", "appear"]
+        .into_iter()
+        .map(|f| {
+            let head = format!("#[allow(clippy::disallowed_methods)]\npub(crate) fn {f}");
+            let start = code.find(&head).expect("motion::lift and motion::appear, allowed directly above");
+            let end = start + code[start..].find("\n}\n").expect("its end") + 2;
+            start..end
+        })
+        .collect()
 }
 
 /// No state is drawn with opacity (design.md §5), by any of its names:
-/// only a chart's data fades (`chart::fade`), and something arriving lifts
-/// from 70 % (`motion::lift`, fluid.md law 3): in motion.rs, inside `lift`
-/// only, once.
+/// only a chart's data fades (`chart::fade`), something arriving lifts
+/// from 70 % (`motion::lift`, fluid.md law 3), and an overlay enters and
+/// leaves (`motion::appear`, fluid.md §3.10): in motion.rs, inside those
+/// two only, once each.
 #[test]
 fn no_opacity_outside_charts() {
     let mut lifts = 0;
@@ -127,7 +133,7 @@ fn no_opacity_outside_charts() {
             let mut bad = Vec::new();
             for o in [".opacity(", ".alpha(", ".fade_out("] {
                 for (at, _) in code.match_indices(o) {
-                    if span.as_ref().is_some_and(|s| s.contains(&at)) {
+                    if span.as_ref().is_some_and(|s| s.iter().any(|s| s.contains(&at))) {
                         lifts += 1;
                     } else {
                         bad.push(format!("{name}:{} {o}", line_of(&code, at)));
@@ -138,7 +144,7 @@ fn no_opacity_outside_charts() {
         })
         .collect();
     assert!(bad.is_empty(), "opacity outside chart.rs and motion::lift:\n{}", bad.join("\n"));
-    assert_eq!(lifts, 1, "motion::lift sets opacity once");
+    assert_eq!(lifts, 2, "motion::lift and motion::appear set opacity once each");
 }
 
 /// No gradients anywhere (polish.md: "No gradients anywhere, on any card
@@ -183,7 +189,7 @@ fn every_tooltip_is_the_overlay() {
 
 /// The lint's way in, one per rule: `clippy::disallowed_methods` is
 /// allowed only where its rule lives (fonts.rs, chart.rs, overlay.rs, and
-/// in motion.rs once, directly above `lift`);
+/// in motion.rs directly above `lift` and `appear`);
 /// the groups that hold it (`clippy::style`, `clippy::all`) nowhere.
 #[test]
 fn the_house_rules_are_allowed_only_where_they_live() {
@@ -197,7 +203,7 @@ fn the_house_rules_are_allowed_only_where_they_live() {
             }
             for (at, _) in code.match_indices(lint) {
                 // The one `#[allow]`, the line above `lift`.
-                if lint == "disallowed_methods" && lift.as_ref().is_some_and(|s| (s.start..s.start + 40).contains(&at)) {
+                if lint == "disallowed_methods" && lift.as_ref().is_some_and(|s| s.iter().any(|s| (s.start..s.start + 40).contains(&at))) {
                     continue;
                 }
                 // A whole name: not `clippy::all_…`.
@@ -208,4 +214,21 @@ fn the_house_rules_are_allowed_only_where_they_live() {
         }
     }
     assert!(bad.is_empty(), "the house rules allowed outside their home:\n{}", bad.join("\n"));
+}
+
+/// No gradients anywhere (polish.md §6 gate 6): every fill is one opaque
+/// colour of the palette; the sweep's levels are four opaque steps.
+#[test]
+fn no_gradients_anywhere() {
+    let bad: Vec<String> = sources()
+        .into_iter()
+        .filter(|(name, _)| name != "style_tests.rs")
+        .flat_map(|(name, code)| {
+            ["linear_gradient", "LinearColorStop", "radial_gradient", "conic_gradient"]
+                .into_iter()
+                .flat_map(|g| code.match_indices(g).map(|(at, _)| format!("{name}:{} {g}", line_of(&code, at))).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(bad.is_empty(), "a gradient:\n{}", bad.join("\n"));
 }

@@ -1282,6 +1282,9 @@ fn idle_requests_no_frames(cx: &mut TestAppContext) {
     }
     assert!(drawn > 0, "the unfold animated");
     assert!(settle(cx, w, 8) <= 2);
+    // The switch's new numbers afterglow (motion.md §6.6, fluid.md §3.6):
+    // three steps on a timer over `glow`.
+    wait(cx, w, &view, crate::motion::GLOW.as_millis() as u64);
     assert_eq!(motion_pending(cx, &view), (false, None), "settled: no frame, no timer");
 }
 
@@ -2692,4 +2695,248 @@ fn a_star_favourites_a_row_without_opening_it(cx: &mut TestAppContext) {
         assert_eq!(v.model.favs.list.len(), 1);
         assert!(v.model.is_shown(&shown), "still the session on screen: nothing opened or closed");
     });
+}
+
+// ── chrome motion (polish.md Q4: fluid.md F2, motion.md PR 5) ─────────
+
+/// A left-button press at `at`, and its release.
+fn press_at(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>) {
+    let ev = gpui_kit::MouseDownEvent {
+        button: gpui_kit::MouseButton::Left,
+        position: at,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    };
+    event(cx, w, PlatformInput::MouseDown(ev));
+}
+
+fn release_at(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>) {
+    let ev = gpui_kit::MouseUpEvent { button: gpui_kit::MouseButton::Left, position: at, modifiers: Default::default(), click_count: 1 };
+    event(cx, w, PlatformInput::MouseUp(ev));
+}
+
+/// fluid.md §3.9: a press shows in the next frame, whatever the level: the
+/// content 1 px down (Full) and the press fill; let go, it springs back on
+/// `flick` and comes to rest where it was. Reduced: the fill, no travel.
+#[gpui_kit::test]
+fn press_feedback_is_same_frame(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    let id = view.read_with(cx, |v, _| v.model.tabs.iter().next().map(|t| t.id)).expect("a tab");
+    let title = format!("tab {id} title");
+    let leak: &'static str = Box::leak(title.into_boxed_str());
+    let y = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(leak).expect("the tab's title").origin.y;
+    for level in [crate::motion::Level::Full, crate::motion::Level::Reduced] {
+        set_motion(cx, &view, level);
+        settle(cx, w, 8);
+        let y0 = y(cx);
+        let at = VisualTestContext::from_window(w, cx).debug_bounds(leak).expect("the title").center();
+        press_at(cx, w, at);
+        frame(cx, &view);
+        let travel = if level == crate::motion::Level::Full { 1. } else { 0. };
+        assert_eq!(y(cx), y0 + px(travel), "{level:?}: the press, in the next frame");
+        let key = view.read_with(cx, |v, _| v.fx.pressed(crate::motion::key(0x7AB4 << 48, id)));
+        assert_eq!(key, (1., travel), "{level:?}: held: the press fill, {travel} px down");
+        release_at(cx, w, at);
+        for _ in 0..60 {
+            wait(cx, w, &view, 7);
+        }
+        assert_eq!(y(cx), y0, "{level:?}: let go, back where it was");
+        assert_eq!(view.read_with(cx, |v, _| v.fx.pressed(crate::motion::key(0x7AB4 << 48, id))), (0., 0.), "{level:?}: at rest");
+    }
+}
+
+/// fluid.md §3.5: the visible tab's fill and bar are one quad pair that
+/// springs to a newly visible tab; a switch mid-flight retargets from where
+/// it is (never a jump), and it lands exactly on the tab.
+#[gpui_kit::test]
+fn indicator_retargets(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, cx| {
+        v.client = None;
+        let ids: Vec<String> = v.model.sessions.iter().map(|s| s.id.clone()).take(3).collect();
+        for id in ids {
+            v.open_tab(crate::app::Open::Attach { session_id: id, fallback: None, open: false }, crate::tabs::Place::New);
+        }
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    wait(cx, w, &view, 600);
+    let n = view.read_with(cx, |v, _| v.model.tabs.len());
+    assert!(n >= 3, "three tabs: {n}");
+    let ind = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.spring_at(0x7AB0 << 48));
+    let focus = |cx: &mut TestAppContext, ix: usize| {
+        view.update(cx, |v, cx| {
+            v.focus_tab(ix);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let x_of = |cx: &mut TestAppContext, ix: usize| {
+        let id = view.read_with(cx, |v, _| v.model.tabs.iter().nth(ix).map(|t| t.id)).expect("the tab");
+        let s: &'static str = Box::leak(format!("tab {id}").into_boxed_str());
+        f32::from(VisualTestContext::from_window(w, cx).debug_bounds(s).expect("the tab").origin.x)
+    };
+    focus(cx, 0);
+    wait(cx, w, &view, 600);
+    let start = ind(cx).expect("the indicator");
+    focus(cx, n - 1);
+    let mut last = start;
+    for _ in 0..8 {
+        wait(cx, w, &view, 7);
+        last = ind(cx).expect("moving");
+    }
+    let far = x_of(cx, n - 1) - x_of(cx, 0);
+    assert!(last > start + 1. && last < start + far - 1., "mid-flight: {start} → {last} of {far}");
+    // Retarget to the middle tab: the next frame starts where it was.
+    focus(cx, 1);
+    wait(cx, w, &view, 7);
+    let next = ind(cx).expect("moving");
+    assert!((next - last).abs() < far / 4., "no jump on a retarget: {last} → {next}");
+    for _ in 0..80 {
+        wait(cx, w, &view, 7);
+    }
+    assert_eq!(ind(cx).expect("at rest"), x_of(cx, 1) - x_of(cx, 0) + start, "lands on the tab");
+    assert!(!motion_pending(cx, &view).0, "and asks for nothing more");
+}
+
+/// fluid.md §3.6: a switch within 150 ms of the last is instant (holding
+/// ↓ never stacks transitions); one after it plays.
+#[gpui_kit::test]
+fn rapid_switch_is_instant(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::New);
+    wait(cx, w, &view, 600);
+    let focus = |cx: &mut TestAppContext, ix: usize| {
+        view.update(cx, |v, cx| {
+            v.focus_tab(ix);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        frame(cx, &view);
+    };
+    focus(cx, 0);
+    assert!(view.read_with(cx, |v, _| v.layer.is_some()), "a switch on its own plays");
+    wait(cx, w, &view, 100);
+    focus(cx, 1);
+    assert!(view.read_with(cx, |v, _| v.layer.is_none()), "within 150 ms of the last: instant");
+    wait(cx, w, &view, 400);
+    focus(cx, 0);
+    assert!(view.read_with(cx, |v, _| v.layer.is_some()), "after it: plays");
+}
+
+/// fluid.md §3.10: a menu the keyboard opened is there at once (a keyboard
+/// user waits on its first item); one the pointer opened enters.
+#[gpui_kit::test]
+fn keyboard_menu_instant(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    menu_on(cx, w, &view, Act::Open);
+    let born = view.read_with(cx, |v, _| v.menu.as_ref().map(|m| m.0.born));
+    assert_eq!(born, Some(None), "opened from the keyboard: no enter");
+    view.update(cx, |v, _| v.close_menu());
+    cx.run_until_parked();
+    let key = view.read_with(cx, |v, _| v.rail.rail.rows.iter().find(|r| r.live.is_some()).map(|r| r.key)).expect("a live row");
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| v.open_session_menu(crate::app::SessionAt::Row(key), Default::default(), window, cx))
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    let (strength, rise) = view.read_with(cx, |v, _| v.fx.enter(v.smenu.as_ref().and_then(|m| m.0.born)));
+    assert!(strength < 1. && rise > 0., "the pointer's enters: {strength} {rise}");
+    wait(cx, w, &view, 400);
+    let (strength, rise) = view.read_with(cx, |v, _| v.fx.enter(v.smenu.as_ref().and_then(|m| m.0.born)));
+    assert_eq!((strength, rise), (1., 0.), "and lands");
+}
+
+/// motion.md §6.4 / fluid.md §3.10: the rail readout moving to the next row
+/// within 300 ms shows at once, at full strength, and follows from the row
+/// before (no re-enter).
+#[gpui_kit::test]
+fn overlay_replace_does_not_reenter(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let keys: Vec<u64> = view.read_with(cx, |v, _| v.rail.rail.rows.iter().filter(|r| r.live.is_some()).map(|r| r.key).take(2).collect());
+    assert_eq!(keys.len(), 2, "two live rows");
+    view.update(cx, |v, cx| v.hover_row(keys[0], true, cx));
+    wait(cx, w, &view, 500);
+    assert_eq!(view.read_with(cx, |v, _| v.readout), Some(keys[0]), "the first row's readout");
+    assert!(view.read_with(cx, |v, _| v.readout_at.is_some()), "it entered");
+    view.update(cx, |v, cx| {
+        v.hover_row(keys[0], false, cx);
+        v.hover_row(keys[1], true, cx);
+    });
+    frame(cx, &view);
+    let (now, at, from) = view.read_with(cx, |v, _| (v.readout, v.readout_at, v.rail_fx.readout_dy));
+    assert_eq!(now, Some(keys[1]), "the next row's, at once (no 400 ms wait)");
+    assert_eq!(at, None, "no enter: full strength from its first frame");
+    assert!(from != 0., "it follows from the row before: {from}");
+    for _ in 0..60 {
+        wait(cx, w, &view, 7);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.rail_fx.readout_dy), 0., "and lands on its row");
+}
+
+/// motion.md §6.4: a reorder under a held rail row waits for the release:
+/// a row never moves away from a click.
+#[gpui_kit::test]
+fn rail_reorder_waits_for_release(cx: &mut TestAppContext) {
+    let (_w, view, _events) = open(cx);
+    let rows = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.rail.rail.items.len());
+    let key = view.read_with(cx, |v, _| v.rail.rail.rows.iter().find(|r| r.live.is_some()).map(|r| r.key)).expect("a live row");
+    let before = rows(cx);
+    view.update(cx, |v, cx| {
+        v.fx.press_down(crate::motion::key(crate::chrome::RAIL_TOUCH, key));
+        v.chip = Some(crate::rail::Chip::Running);
+        cx.notify();
+    });
+    frame(cx, &view);
+    assert_eq!(rows(cx), before, "held: the rail as it was");
+    view.update(cx, |v, cx| {
+        v.fx.press_up();
+        cx.notify();
+    });
+    frame(cx, &view);
+    assert_ne!(rows(cx), before, "let go: the change lands");
+}
+
+/// motion.md §6.8: a theme change cross-fades the palette over `slow`
+/// under Full (its first frame the old colours, then between, then the
+/// new); Reduced and Off change it at once.
+#[gpui_kit::test]
+fn a_theme_change_cross_fades(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let ink = |cx: &mut TestAppContext| cx.update(|cx| crate::theme::palette(cx).canvas);
+    let to = |cx: &mut TestAppContext, name: &str| {
+        cx.update(|cx| {
+            let raw = crate::theme::builtin(name).expect("built in").1;
+            crate::theme::update(cx, |c| {
+                c.theme = name.into();
+                c.raw = raw;
+            });
+        });
+        frame(cx, &view);
+    };
+    wait(cx, w, &view, 400);
+    let old = ink(cx);
+    to(cx, "paper");
+    let new = cx.update(|cx| cx.global::<crate::theme::Scheme>().p.canvas);
+    assert_ne!(old, new, "paper's canvas is another colour");
+    assert_eq!(ink(cx), old, "its first frame: the old palette");
+    wait(cx, w, &view, 180);
+    let mid = ink(cx);
+    assert!(mid != old && mid != new, "between: {mid:?}");
+    wait(cx, w, &view, 400);
+    assert_eq!(ink(cx), new, "then the new one");
+    for level in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
+        set_motion(cx, &view, level);
+        to(cx, "nord");
+        let nord = cx.update(|cx| cx.global::<crate::theme::Scheme>().p.canvas);
+        assert_eq!(ink(cx), nord, "{level:?}: at once");
+        to(cx, "paper");
+    }
 }

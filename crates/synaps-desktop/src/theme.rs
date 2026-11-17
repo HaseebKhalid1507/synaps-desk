@@ -145,6 +145,25 @@ pub fn step(ground: u32, toward: u32, target: f64) -> u32 {
     step_upto(ground, toward, target, 80)
 }
 
+/// A pressed fill (fluid.md §3.9): `hover` stepped toward `toward` as far
+/// as [`STEP`] off it, but no further than every one of `texts` still
+/// reads on it at [`TEXT`] and every one of `marks` at [`MARK`].
+pub fn pressed(hover: u32, toward: u32, texts: &[u32], marks: &[u32]) -> u32 {
+    let ok = |c: u32| texts.iter().all(|&t| contrast(t, c) >= TEXT) && marks.iter().all(|&m| contrast(m, c) >= MARK);
+    let mut out = hover;
+    for i in 1..=80u8 {
+        let c = mix(hover, toward, f64::from(i) * 0.005);
+        if !ok(c) {
+            break;
+        }
+        out = c;
+        if contrast(c, hover) >= STEP {
+            break;
+        }
+    }
+    out
+}
+
 /// [`step`], at most `steps` half-percent steps toward `toward`.
 fn step_upto(ground: u32, toward: u32, target: f64, steps: u8) -> u32 {
     let mut out = ground;
@@ -322,6 +341,19 @@ macro_rules! roles {
                 Palette { $($name: hsla(r.$name),)* sel: Hsla { a: 0.35, ..hsla(r.focus) } }
             }
 
+            /// Every role `t` (0..1) of the way to `to`'s, mixed as an
+            /// opacity would paint it (motion.md §6.8's palette cross-fade);
+            /// the selection wash is `to`'s once there.
+            pub fn lerp(&self, to: &Palette, t: f32) -> Palette {
+                if t >= 1. {
+                    return *to;
+                }
+                if t <= 0. {
+                    return *self;
+                }
+                Palette { $($name: crate::motion::mix(self.$name, to.$name, t),)* sel: self.sel }
+            }
+
             /// A role by its name (the tests).
             #[cfg(test)]
             pub fn role(&self, name: &str) -> Option<Hsla> {
@@ -375,6 +407,11 @@ roles! {
     // The filled buttons' hover (a step toward the ink); a scrollbar's
     // thumb at rest on the canvas, the chrome and the user surface.
     btn_hi, warn_hi, thumb, thumb_ch, thumb_u,
+    // Pressed (fluid.md §3.9): one step past each hover fill, held back
+    // until every text and mark drawn on it still meets its floor: on the
+    // canvas (hover `user`), the chrome (`raised`), the card (`card_hi`), a
+    // run (`tool_out`), and the two filled buttons.
+    press, press_ch, press_k, press_t, btn_press, warn_press,
     // The chrome, on `bg` and the raised row: text, then marks.
     prose_ch, dim_ch, header, warn_ch, run_ch, unread_ch, open_ch, ready_ch, err_ch, cost_ch, ok_ch, edit_ch, write_ch, bash_ch,
     sub_name, sub_status, sub_done, sub_time,
@@ -664,6 +701,40 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     {
         f.log.push(Check { role, from, color: c, grounds: vec![ground], floor: HAIR });
     }
+    // Pressed: a step toward the ink past the hover fill, walked back until
+    // what is drawn on it reads; each of those is logged on it.
+    {
+        let (texts_ch, marks_ch) = (
+            [r.ink, r.prose_ch, r.dim_ch, r.header, r.warn_ch, r.run_ch, r.unread_ch, r.open_ch, r.ready_ch, r.err_ch, r.cost_ch, r.ok_ch],
+            [r.warn_mark_ch, r.run_mark_ch, r.unread_mark_ch, r.focus_ch, r.ready_mark_ch, r.err_mark_ch, r.rest_mark, r.you_bar],
+        );
+        let (texts_k, marks_k) =
+            ([r.ink, r.prose_k, r.dim_k, r.warn_k, r.err_k, r.run_k, r.ok_k], [r.run_mark_k, r.err_mark_k, r.rest_mark_k, r.focus_k, r.warn_mark]);
+        let texts_t = [r.prose_t, r.dim_t, r.arg, r.ok, r.t_bash, r.t_read, r.t_write, r.t_edit, r.t_grep, r.t_find, r.t_ls, r.t_sub, r.t_ext, r.t_gen];
+        let marks_t = [r.warn_mark, r.run_mark, r.you_mark_t, r.sub_rule];
+        let texts_u = [r.ink, r.dim_u, r.agent_u, r.head_u];
+        let label = [chrome];
+        let sets: [(&'static str, u32, &[u32], &[u32]); 6] = [
+            ("press", user, &texts_u, &[]),
+            ("press_ch", raised, &texts_ch, &marks_ch),
+            ("press_k", card_hi, &texts_k, &marks_k),
+            ("press_t", tool_out, &texts_t, &marks_t),
+            ("btn_press", r.btn_hi, &label, &[]),
+            ("warn_press", r.warn_hi, &label, &[]),
+        ];
+        let mut out = [0u32; 6];
+        for (i, (role, hover, texts, marks)) in sets.into_iter().enumerate() {
+            let c = pressed(hover, ink, texts, marks);
+            out[i] = c;
+            for &t in texts {
+                f.log.push(Check { role, from: t, color: t, grounds: vec![c], floor: TEXT });
+            }
+            for &m in marks {
+                f.log.push(Check { role, from: m, color: m, grounds: vec![c], floor: MARK });
+            }
+        }
+        [r.press, r.press_ch, r.press_k, r.press_t, r.btn_press, r.warn_press] = out;
+    }
     // Series: five theme colours at the mark floor on the canvas; one that
     // lands within 1.25:1 of an earlier one is mixed 40 % toward the ink.
     // Warning and error colours are never series (they keep their meaning).
@@ -792,6 +863,24 @@ pub struct Scheme {
     /// Agent prose (installed as every text view's default) and the user's
     /// own text, which only differs in its foreground.
     pub user_text: TextViewStyle,
+    /// A theme or accent change cross-fading (motion.md §6.8): the palette
+    /// before it, when it began, and how far it is as of the app's frame
+    /// ([`Scheme::fade`]). [`palette`] paints from that blend.
+    pub from: std::cell::Cell<Option<(Palette, Option<std::time::Instant>, f32)>>,
+}
+
+impl Scheme {
+    /// The cross-fade's start (none: its first frame is next) and its last
+    /// progress, if one runs.
+    pub fn fading(&self) -> Option<(Option<std::time::Instant>, f32)> {
+        self.from.get().map(|(_, at, t)| (at, t))
+    }
+
+    /// The app's frame sets when the cross-fade began (its first frame) and
+    /// how far it is (`t` 1: over).
+    pub fn fade(&self, at: std::time::Instant, t: f32) {
+        self.from.set(self.from.get().filter(|_| t < 1.).map(|(p, _, _)| (p, Some(at), t)));
+    }
 }
 
 impl Global for Scheme {}
@@ -805,13 +894,17 @@ impl Scheme {
         // quoted, link and heading colours are the ones floored there.
         let on_user = Palette { prose: p.ink, dim: p.dim_u, agent: p.agent_u, head: p.head_u, ..p };
         let user_text = text_style(&on_user, &m, luminance(roles.canvas) < 0.5);
-        Scheme { choice, roles, p, m, user_text }
+        Scheme { choice, roles, p, m, user_text, from: Default::default() }
     }
 }
 
 /// The palette, by value (no allocation).
 pub fn palette(cx: &App) -> Palette {
-    cx.global::<Scheme>().p
+    let s = cx.global::<Scheme>();
+    match s.from.get() {
+        Some((from, _, t)) => from.lerp(&s.p, t),
+        None => s.p,
+    }
 }
 
 pub fn metrics(cx: &App) -> Metrics {
@@ -828,6 +921,15 @@ pub fn apply(choice: Choice, cx: &mut App) {
     }
     let s = Scheme::new(choice);
     let (p, m, roles) = (s.p, s.m, s.roles);
+    // A change while the window shows one (not the first): the palette
+    // cross-fades from what was painted (motion.md §6.8), under Full. The
+    // kit's theme and the text views' styles change at once.
+    if crate::motion::Level::current(cx) == crate::motion::Level::Full
+        && let Some(old) = cx.try_global::<Scheme>()
+    {
+        s.from.set(Some((palette(cx), None, 0.)));
+        let _ = old;
+    }
     cx.set_global(s);
     sync_kit(&p, &roles, cx);
     let dark = luminance(roles.canvas) < 0.5;
@@ -1718,7 +1820,7 @@ mod tests {
         for (name, raw) in palettes::THEMES {
             let p = Palette::of(&resolve(&raw, None).0);
             let f = p.faded();
-            for role in super::ROLE_NAMES.iter().filter(|r| r.ends_with("_ch") && !["dim_ch", "thumb_ch"].contains(r)) {
+            for role in super::ROLE_NAMES.iter().filter(|r| r.ends_with("_ch") && !["dim_ch", "thumb_ch", "press_ch"].contains(r)) {
                 assert_ne!(p.role(role), f.role(role), "{name}: {role} stays bright on a faded panel");
             }
         }
@@ -1728,7 +1830,11 @@ mod tests {
     /// colour moves with it.
     #[test]
     fn the_accent_colours_you_and_focus_only() {
-        let allowed = ["you", "you_mark", "you_mark_t", "btn_fill", "btn_hi", "focus", "focus_ch", "focus_k", "open_ch", "you_bar"];
+        // The pressed fills are held back by the accent's marks drawn on them.
+        let allowed = [
+            "you", "you_mark", "you_mark_t", "btn_fill", "btn_hi", "focus", "focus_ch", "focus_k", "open_ch", "you_bar", "press", "press_ch",
+            "press_k", "press_t", "btn_press",
+        ];
         for (name, raw) in palettes::THEMES {
             let (a, base) = resolve(&raw, None);
             for &(_, accent) in PRESETS {
