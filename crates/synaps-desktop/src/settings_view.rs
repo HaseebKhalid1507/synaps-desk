@@ -355,9 +355,60 @@ impl AppView {
     ) -> AnyElement {
         let current = sending.or(selected);
         if opts.len() <= 4 {
-            let mut seg = h_flex().h(px(28.)).border_1().border_color(p.edge);
+            // The selected bar springs to a newly selected segment (`snap`,
+            // motion.md §6.8) from the segments' places last frame; the
+            // `raised` fill moves at once.
+            let sel = opts.iter().position(|o| current == Some(o.as_ref()));
+            let fx = &self.fx;
+            let base = crate::app::tkey(id, 900);
+            let places = self.seg_places.borrow();
+            let origin = places.get(&(base | 3)).map(|p| p.0);
+            let place = |i: usize| places.get(&crate::app::tkey(id, i)).zip(origin).map(|(&(x, w), o)| (x - o, w));
+            let moved = sel.and_then(|s| fx.changed(base, s as u64)).is_some_and(|(_, at)| at == fx.now());
+            let mut bar = None;
+            if let Some((x, w)) = sel.and_then(place) {
+                if moved && let (Some(x0), Some(w0)) = (fx.spring_at(base | 1), fx.spring_at(base | 2)) {
+                    fx.spring_jump(base | 1, x0, x, crate::motion::SNAP_RESPONSE);
+                    fx.spring_jump(base | 2, w0, w, crate::motion::SNAP_RESPONSE);
+                }
+                let ((bx, mx), (bw, mw)) =
+                    (fx.spring_held(base | 1, x, crate::motion::SNAP_RESPONSE), fx.spring_held(base | 2, w, crate::motion::SNAP_RESPONSE));
+                if mx || mw {
+                    bar = Some((bx, bw));
+                }
+            }
+            drop(places);
+            let sink = self.seg_places.clone();
+            let mut seg = h_flex()
+                .relative()
+                .h(px(28.))
+                .border_1()
+                .border_color(p.edge)
+                .child({
+                    let sink = sink.clone();
+                    canvas(
+                        move |b, _, _| {
+                            sink.borrow_mut().insert(base | 3, (f32::from(b.origin.x), f32::from(b.size.width)));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0()
+                })
+                .children(bar.map(|(x, w)| div().absolute().top_0().left(px(x)).w(px(w)).h(px(2.)).bg(p.you_bar)));
             for (i, o) in opts.into_iter().enumerate() {
                 let on = current == Some(o.as_ref());
+                let sink = sink.clone();
+                let key = crate::app::tkey(id, i);
+                // Where it is, for the bar's next move.
+                let place = canvas(
+                    move |b, _, _| {
+                        sink.borrow_mut().insert(key, (f32::from(b.origin.x), f32::from(b.size.width)));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0();
                 let color = match (on, sending.is_some()) {
                     (true, true) => p.dim,
                     (true, false) => p.ink,
@@ -373,10 +424,11 @@ impl AppView {
                         .flex()
                         .items_center()
                         .when(i > 0, |d| d.border_l_1().border_color(p.edge))
+                        .child(place)
                         // Selected (design.md §5): `raised` and a 2 px you bar on top.
-                        .when(on, |d| d.bg(p.raised).child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(p.you_bar)))
+                        .when(on, |d| d.bg(p.raised).when(bar.is_none(), |d| d.child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(p.you_bar))))
                         .cursor_pointer()
-                        .hover(|d| d.bg(p.raised))
+                        .when(!on, |d| d.hover(|d| d.bg(p.raised)))
                         .child(mono(o, 13., color))
                         .on_click(cx.listener(move |this, _, _, cx| this.settings_pick(what, &v, cx))),
                 );

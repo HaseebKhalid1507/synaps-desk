@@ -438,11 +438,14 @@ impl Render for ViewPane {
         let p = crate::theme::palette(cx);
         let vc = ViewCx { view: self.app.clone(), cx };
         let a = app.read(cx);
-        match self.kind {
+        a.fx.in_pane(true);
+        let el = match self.kind {
             Kind::Settings => a.render_settings(a.view_width, &p, &vc),
             Kind::Usage => a.render_usage(a.view_width, &p, &vc),
             Kind::Session | Kind::Worker => div().into_any_element(),
-        }
+        };
+        a.fx.in_pane(false);
+        el
     }
 }
 
@@ -1126,6 +1129,11 @@ impl AppView {
         let (ks, ku) = key_names();
         let items = vec![Item::new(Kind::Settings, "Settings").key(ks), Item::new(Kind::Usage, "Usage").key(ku)];
         let menu = Menu::new(items, At::Point(Point::default()), false);
+        // Above the gear: it rises from below (fluid.md §3.10).
+        let phase = match self.gear_leaving.filter(|_| !self.gear_menu) {
+            Some(at) => crate::menu::Phase::leave(&self.fx, at, 1.).unwrap_or(crate::menu::Phase { strength: 0., dy: 0., live: false }),
+            None => crate::menu::Phase::enter(&self.fx, self.gear_at, 1.),
+        };
         let pick = |this: &mut AppView, kind, _, _: &mut Window, cx: &mut Context<AppView>| this.open_view(kind, cx);
         let close = |this: &mut AppView, ev: &MouseDownEvent| {
             this.gear_dismissed = Some(ev.position);
@@ -1135,7 +1143,7 @@ impl AppView {
             .absolute()
             .left(px(if folded { 6. } else { 14. }))
             .bottom(px(FOOT + 4.))
-            .child(crate::menu::render("gear-menu", &menu, p, pick, close, cx).w(px(300.)))
+            .child(crate::menu::render("gear-menu", &menu, p, pick, close, phase, &self.fx, cx).w(px(300.)))
     }
 }
 
