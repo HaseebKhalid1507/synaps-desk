@@ -173,6 +173,12 @@ pub(crate) fn item_y(list: &ListState, ix: usize) -> Option<(f32, f32, f32)> {
 pub(crate) struct RailFx {
     pub(crate) flips: Vec<u64>,
     pub(crate) offsets: HashMap<u64, f32>,
+    /// The items travelling farthest (a row moved against the others): drawn
+    /// over the rest, clipped to the rail, so the ones it passes never hide
+    /// it. Each with its top in the rail's view and its height.
+    pub(crate) leads: HashMap<u64, (f32, f32)>,
+    /// The rail's view, as of the last layout (the leads' clip).
+    pub(crate) view: Size<Pixels>,
     pub(crate) sel: Option<u64>,
     pub(crate) quad: Option<(f32, f32)>,
     pub(crate) moving: bool,
@@ -636,6 +642,7 @@ impl AppView {
         };
         let mut out = std::mem::take(&mut self.rail_fx);
         out.offsets.clear();
+        out.leads.clear();
         for (key, from) in std::mem::take(&mut self.rail.flip_from) {
             if let Some((y, _, _)) = ix_of(key).and_then(|ix| item_y(list, ix))
                 && (from - y).abs() >= 0.5
@@ -654,6 +661,17 @@ impl AppView {
             }
             moving
         });
+        // Items moving farther than the rest pass over them.
+        let far = out.offsets.values().fold(0f32, |m, d| m.max(d.abs()));
+        let leads: Vec<u64> = out.offsets.iter().filter(|(_, d)| d.abs() >= 0.75 * far).map(|(&k, _)| k).collect();
+        out.view = list.viewport_bounds().size;
+        if far >= 1. && leads.len() < out.offsets.len() {
+            for key in leads {
+                if let Some((y, h, scroll)) = ix_of(key).and_then(|ix| item_y(list, ix)) {
+                    out.leads.insert(key, (y - scroll, h));
+                }
+            }
+        }
         // The row shown: the visible tab's session.
         let sel = rail.items.iter().enumerate().find_map(|(ix, it)| match it {
             Item::Row(r) => {
@@ -966,9 +984,26 @@ impl AppView {
         let el = self.render_rail_item_at(ix, cx);
         let rail = &self.rail.rail;
         let head = rail.items.get(ix).is_some_and(|it| row_key(rail, it).is_none());
-        match flip_key(rail, ix).and_then(|k| self.rail_fx.offsets.get(&k)).filter(|_| head) {
+        let key = flip_key(rail, ix);
+        let el = match key.and_then(|k| self.rail_fx.offsets.get(&k)).filter(|_| head) {
             // On its own ground, as a sliding row is: items that cross don't mix.
             Some(&dy) => div().w_full().relative().top(px(dy)).bg(theme::palette(cx).chrome).child(el).into_any_element(),
+            None => el,
+        };
+        // A lead: its place kept in the list, the item drawn over the rest,
+        // clipped to the rail's view.
+        match key.and_then(|k| self.rail_fx.leads.get(&k)) {
+            Some(&(top, h)) => {
+                let vp = self.rail_fx.view;
+                let over = div()
+                    .relative()
+                    .top(px(-top))
+                    .w(vp.width)
+                    .h(vp.height)
+                    .overflow_hidden()
+                    .child(div().absolute().left_0().top(px(top)).w(vp.width).child(el));
+                div().w_full().h(px(h)).child(deferred(over).with_priority(0)).into_any_element()
+            }
             None => el,
         }
     }

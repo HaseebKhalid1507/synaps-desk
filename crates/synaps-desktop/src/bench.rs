@@ -680,6 +680,18 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // Q4's own motion, each on its own: a hover sweep down the
                 // rail (the pointer over every row for 2 s, one move a
                 // frame), a theme cross-fade (dark to dark, `slow`).
+                // A rail of twelve sessions at rest to sweep.
+                let _ = upd(cx, &|v, cx| {
+                    let metas: Vec<SessionMeta> = (0..12)
+                        .filter_map(|k| {
+                            serde_json::from_value(json!({"id": format!("20261117-0800{k:02}-h{k:03}"), "title": format!("Rest {}", k + 1),
+                                "model": "m", "lifecycle": "live", "messages": 12, "created_at": format!("2026-11-17T08:00:{k:02}Z")}))
+                            .ok()
+                        })
+                        .collect();
+                    v.apply_batch(vec![Event::Sessions(metas)], cx);
+                });
+                sleep(1.0).await;
                 let rail = view.update(cx, |v, _| v.rail_list.viewport_bounds()).unwrap_or_default();
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
                 for i in 0..125 {
@@ -698,6 +710,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 }
                 sleep(0.3).await;
                 out["hover_sweep"] = stats(cx, t0, Instant::now(), c0, f0);
+                out["hover_sweep"]["rail_items"] = json!(view.update(cx, |v, _| v.rail.rail.items.len()).unwrap_or(0));
                 let theme = |cx: &mut AsyncWindowContext, name: &'static str| {
                     let _ = cx.update(|_, cx| {
                         if let Some((_, raw)) = crate::theme::builtin(name) {
