@@ -2017,18 +2017,33 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
         beat(cx, w, &view);
     }
     let seg = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("handoff-in");
+    // polish.md P2, P3: the composer's top edge sweeps while the turn runs,
+    // then makes one last pass with the Handoff light, from its corner.
+    let pass = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("settle-pass");
+    let sweep = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("sweep");
     assert!(seg(cx).is_none());
+    assert!(sweep(cx).is_some() && pass(cx).is_none(), "running: the composer sweeps");
     busy(cx, false);
     assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current().map(|t| v.tab_state(t))), Some(crate::rail::State::Idle), "READY");
     assert!(seg(cx).is_some(), "the turn ended here: the light travels down the bar");
+    let (s, p) = (seg(cx).unwrap(), pass(cx).expect("settle_pass_once_per_turn_end: the pass with the light"));
+    assert!(sweep(cx).is_none(), "the sweep is over");
+    assert!((f32::from(p.origin.y) - f32::from(s.origin.y)).abs() <= 1., "from the same corner: {p:?} / {s:?}");
     for _ in 0..6 {
         beat(cx, w, &view);
     }
     assert!(seg(cx).is_none(), "gone after sig");
+    assert!(pass(cx).is_none(), "one pass, then everything stops");
+    set_motion(cx, &view, crate::motion::Level::Reduced);
+    busy(cx, true);
+    assert!(sweep(cx).is_none(), "Reduced: the edge is unlit");
+    busy(cx, false);
+    assert!(pass(cx).is_none(), "Reduced: no pass (the bar's flash)");
     set_motion(cx, &view, crate::motion::Level::Off);
     busy(cx, true);
     busy(cx, false);
     assert!(seg(cx).is_none(), "Off: none");
+    assert!(pass(cx).is_none(), "Off: no pass");
     assert_eq!(motion_pending(cx, &view), (false, None));
 }
 
