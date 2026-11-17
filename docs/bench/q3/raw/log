@@ -1,0 +1,15 @@
+17:58:02 main-bench main-motion-1 load 5.91
+18:00:33 q3-bench q3-motion-1 load 4.43
+18:03:36 main-bench main-1 load 2.60
+18:04:03 q3-bench q3-1 load 2.70
+18:04:30 main-bench main-motion-2 load 2.37
+18:07:01 q3-bench q3-motion-2 load 1.34
+18:08:05 q3b-bench q3b-motion-1 load 4.90
+18:11:08 q3b-bench q3b-motion-2 load 2.02
+18:14:12 q3b-bench q3b-1 load 1.65
+BENCH2-DONE
+18:17:27 main-bench main-motion-3 load 5.97 gamescopes 0
+18:20:00 q3b-bench q3b-motion-3 load 2.40 gamescopes 0
+18:23:03 main-bench main-3 load 3.18 gamescopes 0
+18:23:30 q3b-bench q3b-3 load 2.56 gamescopes 0
+BENCH3-DONE

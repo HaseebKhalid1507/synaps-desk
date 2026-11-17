@@ -6,7 +6,9 @@ Recorded on bella with `scripts/capture-linux.sh` (a headless gamescope at 144 H
 - **main** = `4f87411`. The binary is Q4's release build (`bella:~/.local/bin/synaps-desktop-hybrid.q4`,
   sha256 `61e724e6…`). `git diff 609cf04 4f87411` is empty, and the md5 of every `.rs` file in bella's
   build mirror of that tree matches `git archive 4f87411`. No source file there is newer than the binary.
-- **Q3** = this branch's release build, installed as `bella:~/.local/bin/synaps-desktop-hybrid.q3`.
+- **Q3** = this branch at `c1e5f4c`, release build sha256 `b3cf93ce…`. The head after it (`e8f7afb`, r2 in
+  `docs/bench/q3`) changes only when the beat layer wakes while a sweep is on screen: a spinner step can land up to
+  one 30 Hz tick later. These clips are 30 fps, so that is at most one frame.
 
 ## Side by side at rest (`side-<theme>-<size>.png`: main left, Q3 right)
 
