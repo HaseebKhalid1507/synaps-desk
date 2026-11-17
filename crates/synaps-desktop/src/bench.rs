@@ -538,6 +538,40 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     });
                 };
                 level(cx, crate::motion::Level::Full);
+                // `SYNAPS_BENCH_LINK=N`: only the link lost and back (motion.md
+                // §5.3), the scene a capture records, after N s: up 2 s, down
+                // 4 s (grace, tear, drain, held), up 3 s (Scan, restore). Every
+                // frame's drain is in the debug log (`synaps_desktop::link`).
+                if let Some(after) = std::env::var("SYNAPS_BENCH_LINK").ok().and_then(|s| s.parse::<f64>().ok()) {
+                    sleep(after).await;
+                    let conn = |up: bool| {
+                        move |v: &mut AppView, _: &mut Context<AppView>| {
+                            v.synthetic = false;
+                            v.model.conn =
+                                if up { crate::model::ConnState::Connected("bench".into()) } else { crate::model::ConnState::Reconnecting };
+                        }
+                    };
+                    let _ = upd(cx, &|v, _| {
+                        v.model.set_local_session("bench-link");
+                        v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
+                        v.sync_list();
+                        v.list.scroll_to_end();
+                    });
+                    let _ = upd(cx, &conn(true));
+                    sleep(2.0).await;
+                    let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                    let _ = upd(cx, &conn(false));
+                    sleep(4.0).await;
+                    out["link_lost_4s"] = stats(cx, t0, Instant::now(), c0, f0);
+                    let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                    let _ = upd(cx, &conn(true));
+                    sleep(3.0).await;
+                    out["link_back_3s"] = stats(cx, t0, Instant::now(), c0, f0);
+                    out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
+                    println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
                 // A session at rest: nothing runs. (The synthetic history
                 // ends on a call with no result, which reads as running:
                 // it is the beat's scene, not this one.)
