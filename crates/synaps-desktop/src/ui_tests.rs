@@ -50,7 +50,18 @@ fn open_with(
         let bounds = Bounds { origin: Default::default(), size: size(px(w), px(h)) };
         let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
         crate::beat::open_window(options, cx, layered, |window, cx| {
-            cx.new(|cx| AppView::new(None, Some(crate::demo::events()), window, cx))
+            cx.new(|cx| {
+                let v = AppView::new(None, Some(crate::demo::events()), window, cx);
+                // The motion clock is the test's from the first frame: it
+                // stands still until a test moves it ([`beat`],
+                // [`fluid_frame`], `set_clock`), never with the runner's
+                // wall time. On a loaded runner a draw took 110 ms: every
+                // motion timer was already due when armed, `run_until_parked`
+                // drew frame after frame (with the beat in the frame, never
+                // parking), and a test step played hundreds of ms of motion.
+                v.fx.pin_clock();
+                v
+            })
         })
         .expect("a test window")
     });
@@ -1153,7 +1164,7 @@ fn off_is_static(cx: &mut TestAppContext) {
     assert_eq!(motion_pending(cx, &view), (false, None));
     // A send's Handoff (what `submit` stamps).
     view.update(cx, |v, cx| {
-        v.fx.sent.set(Some((std::time::Instant::now(), false)));
+        v.fx.sent.set(Some((v.fx.clock(), false)));
         cx.notify();
     });
     cx.run_until_parked();
@@ -1202,8 +1213,8 @@ fn idle_requests_no_frames(cx: &mut TestAppContext) {
     // The cascade runs on display frames, then stops by itself.
     let mut drawn = 0;
     while motion_pending(cx, &view).0 && drawn < 400 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        drawn += 1 + settle(cx, w, 1);
+        fluid_frame(cx, w, &view);
+        drawn += 1;
     }
     assert!(drawn > 0, "the unfold animated");
     assert!(settle(cx, w, 8) <= 2);
@@ -1240,8 +1251,12 @@ fn heartbeat_is_one_timer(cx: &mut TestAppContext) {
 fn heartbeat_stops_hidden(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Full);
-    settle(cx, w, 8);
-    assert!(motion_pending(cx, &view).1.is_some());
+    // A second goes by (the card's AUTHORIZE charge, display frames until
+    // it ends, arms no timer): on the test's clock, not the runner's.
+    for _ in 0..8 {
+        beat(cx, w, &view);
+    }
+    assert!(motion_pending(cx, &view).1.is_some(), "scout runs: the heartbeat is armed");
     cx.simulate_window_visibility_change(w, gpui_kit::WindowVisibility::Hidden);
     cx.run_until_parked();
     assert_eq!(motion_pending(cx, &view).1, None, "hidden: no timer");
@@ -1281,8 +1296,7 @@ fn transcript_heights_stable_across_frames(cx: &mut TestAppContext) {
     assert!(first.len() > 3, "rows on screen: {first:?}");
     let mut frames = 0;
     while motion_pending(cx, &view).0 && frames < 60 {
-        std::thread::sleep(std::time::Duration::from_millis(4));
-        settle(cx, w, 1);
+        fluid_frame(cx, w, &view);
         frames += 1;
         let now = heights(cx);
         for (id, h) in &now {
@@ -1342,7 +1356,7 @@ fn exiting_takes_no_click(cx: &mut TestAppContext) {
         let row = v.tray.rows.first().cloned().expect("scout's row");
         v.tray.rows.clear();
         // Left "later": its fade holds at full for the whole test.
-        v.tray.ghosts.push((0, row, std::time::Instant::now() + std::time::Duration::from_secs(60)));
+        v.tray.ghosts.push((0, row, v.fx.clock() + std::time::Duration::from_secs(60)));
         cx.notify();
     });
     cx.run_until_parked();
@@ -1366,7 +1380,7 @@ fn exiting_takes_no_click(cx: &mut TestAppContext) {
 /// frame. Off: it closes at once, as today.
 #[gpui_kit::test]
 fn the_answered_card_fades_in_its_slot(cx: &mut TestAppContext) {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Full);
     settle(cx, w, 8);
@@ -1399,7 +1413,7 @@ fn the_answered_card_fades_in_its_slot(cx: &mut TestAppContext) {
     resolve_prompt(cx, &view);
     // Held mid-fade for the test.
     view.update(cx, |v, cx| {
-        v.card_exit.as_mut().expect("answered on screen: it fades").at = Instant::now() + Duration::from_secs(60);
+        v.card_exit.as_mut().expect("answered on screen: it fades").at = v.fx.clock() + Duration::from_secs(60);
         cx.notify();
     });
     cx.run_until_parked();
@@ -1411,7 +1425,7 @@ fn the_answered_card_fades_in_its_slot(cx: &mut TestAppContext) {
     assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the leaving card took no press (the one is the live card's)");
     // Its time is up: the dock closes in one frame.
     view.update(cx, |v, cx| {
-        v.card_exit.as_mut().unwrap().at = Instant::now() - Duration::from_secs(1);
+        v.card_exit.as_mut().unwrap().at = v.fx.clock() - Duration::from_secs(1);
         cx.notify();
     });
     cx.run_until_parked();
@@ -1591,7 +1605,7 @@ fn a_running_bar_blooms_until_it_settles(cx: &mut TestAppContext) {
         cx.notify();
     });
     cx.run_until_parked();
-    // (Its light decays over SLOW on the wall clock: not sampled mid-way.)
+    // (Its light decays over SLOW: not sampled mid-way.)
     for _ in 0..5 {
         beat(cx, w, &view);
     }
@@ -1600,8 +1614,8 @@ fn a_running_bar_blooms_until_it_settles(cx: &mut TestAppContext) {
 
 /// One beat goes by: the motion clock and the executor's move on together,
 /// a millisecond at a time (the one timer fires when it is due, as it
-/// would), and what it drew settles. The motion clock is set at each step,
-/// not moved on: the wall time a slow runner spends in a step never adds up.
+/// would), and what it drew settles. The motion clock is the test's
+/// ([`open_with`]): only this moves it, a millisecond a step.
 fn beat(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     let ms = std::time::Duration::from_millis(1);
     let t0 = view.read_with(cx, |v, _| v.fx.clock());
@@ -1926,27 +1940,27 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
 
 // ── fluid (cohesion/fluid.md §7, F1) ──────────────────────────────────
 
-/// One display frame (144 Hz) later: the motion clock and the executor's
-/// move on together, then the app draws.
-///
-/// The motion clock is pinned from the first of these on, so it moves
-/// 6.944 ms here and nowhere else. Unpinned, it also runs with the wall
-/// clock: on a loaded runner a draw took 110 ms, every motion timer was
-/// already due when armed, and `run_until_parked` drew frame after frame,
-/// so one of these "frames" played 675 ms of motion. A row streaming a
-/// delta a frame looked like one that had stopped 675 ms ago, its write
-/// head decayed out (main 8d6ecc5's CI); a glide or a reveal could end
-/// inside one frame.
+/// One display frame (144 Hz) later: the motion clock (the test's, [`open_with`])
+/// and the executor's move on together, then the app draws.
 fn fluid_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     let dt = std::time::Duration::from_micros(6944);
-    view.read_with(cx, |v, _| {
-        v.fx.pin_clock();
-        v.fx.set_clock(v.fx.clock() + dt);
-    });
+    view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
     cx.executor().advance_clock(dt);
     view.update(cx, |_, cx| cx.notify());
     cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
     cx.run_until_parked();
+}
+
+/// The launch's column arrives (fluid.md §3.6: one layer, the whole column
+/// gliding in): frames until it has, before a test reads where rows are.
+fn column_arrives(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    for _ in 0..200 {
+        if view.read_with(cx, |v, _| v.layer.is_none()) {
+            return;
+        }
+        fluid_frame(cx, w, view);
+    }
+    panic!("the column's layer never settled");
 }
 
 /// A turn starts streaming in the shown session.
@@ -2031,6 +2045,7 @@ fn anchor_row_never_moves(cx: &mut TestAppContext) {
     view.update(cx, |v, _| v.client = None);
     start_stream(cx, &view);
     settle(cx, w, 8);
+    column_arrives(cx, w, &view);
     for k in 0..30 {
         stream_step(cx, &view, k);
         fluid_frame(cx, w, &view);
@@ -2369,8 +2384,6 @@ fn a_list_swap_stops_the_scroller(cx: &mut TestAppContext) {
             }),
         )
     };
-    // The glide stays in flight however long the runner takes ([`fluid_frame`]).
-    view.read_with(cx, |v, _| v.fx.pin_clock());
     notch(cx);
     assert!(view.read_with(cx, |v, _| v.scroller.active()), "a glide in flight");
     scout_in_place(cx, w, &view);
