@@ -314,7 +314,9 @@ impl Scrolled for Rows {
         let Some((s, fx)) = &self.glide else { return self.scroll_to(at) };
         let now = self.offset();
         let view = f32::from(self.viewport().size.height);
-        let cut = s.jump(f32::from(at.y - now.y), true, view, fx.clock());
+        // A page clicked mid-glide pages on from the glide's end (Shady N5):
+        // two quick clicks are two pages.
+        let cut = s.jump(f32::from(at.y - now.y) + s.remaining(), true, view, fx.clock());
         if cut != 0. {
             self.list.scroll_by(px(cut));
         }
