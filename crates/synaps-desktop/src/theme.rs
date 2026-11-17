@@ -983,9 +983,28 @@ fn sync_kit(p: &Palette, r: &Roles, cx: &mut App) {
 
 /// The settings file: `<config dir>/synaps-desktop/settings.json`.
 /// Linux/BSD: `$XDG_CONFIG_HOME` or `~/.config`; macOS: `~/Library/Application
-/// Support`; Windows: `%APPDATA%`.
+/// Support`; Windows: `%APPDATA%`. In a test, under the test process's own
+/// folder ([`test_home`]): no test reads or writes the user's.
 pub fn settings_path() -> Option<PathBuf> {
-    let env_dir = |k: &str| std::env::var_os(k).map(PathBuf::from).filter(|p| p.is_absolute());
+    let path = settings_path_in(env_var)?;
+    #[cfg(test)]
+    test_home::guard(&path);
+    Some(path)
+}
+
+#[cfg(not(test))]
+fn env_var(k: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(k)
+}
+
+#[cfg(test)]
+fn env_var(k: &str) -> Option<std::ffi::OsString> {
+    test_home::var(k)
+}
+
+/// [`settings_path`] in the environment `var` reads.
+fn settings_path_in(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let env_dir = |k: &str| var(k).map(PathBuf::from).filter(|p| p.is_absolute());
     let dir = if cfg!(windows) {
         env_dir("APPDATA")?
     } else if cfg!(target_os = "macos") {
@@ -994,6 +1013,43 @@ pub fn settings_path() -> Option<PathBuf> {
         env_dir("XDG_CONFIG_HOME").or_else(|| env_dir("HOME").map(|h| h.join(".config")))?
     };
     Some(dir.join("synaps-desktop").join("settings.json"))
+}
+
+/// Tests' config: `XDG_CONFIG_HOME`, `APPDATA` and `HOME` are a folder of
+/// the test process's own (the process environment is never changed: the
+/// tests run on threads, and C code reads it too).
+#[cfg(test)]
+pub(crate) mod test_home {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    pub fn root() -> &'static Path {
+        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| std::env::temp_dir().join(format!("synaps-desktop-test-home-{}", std::process::id())))
+    }
+
+    pub fn var(k: &str) -> Option<OsString> {
+        matches!(k, "XDG_CONFIG_HOME" | "APPDATA" | "HOME").then(|| root().join(k).into_os_string())
+    }
+
+    /// A test resolved the user's real settings file (or folder): it stops
+    /// there, before anything reads or writes it.
+    pub fn guard(path: &Path) {
+        if let Some(real) = super::settings_path_in(|k| std::env::var_os(k)) {
+            let dir = real.parent().unwrap_or(&real);
+            assert!(!path.starts_with(dir), "a test resolved the real settings file {}", path.display());
+        }
+    }
+
+    #[test]
+    fn tests_never_resolve_the_real_settings() {
+        let path = super::settings_path().unwrap();
+        assert!(path.starts_with(root()), "{}", path.display());
+        let real = super::settings_path_in(|k| std::env::var_os(k));
+        assert!(real.as_ref().is_none_or(|r| *r != path));
+        let caught = std::panic::catch_unwind(|| guard(&super::settings_path_in(|k| std::env::var_os(k)).unwrap_or_default()));
+        assert!(real.is_none() || caught.is_err(), "the guard stops the real path");
+    }
 }
 
 fn load_settings(path: &Path) -> Option<serde_json::Value> {
@@ -1239,19 +1295,50 @@ pub fn load_favourites(path: &Path, key: &str) -> Vec<crate::favourites::Favouri
 }
 
 /// Save the favourites under `key`, keeping every other daemon's and every
-/// other key (see [`save_settings`]).
-pub fn save_favourites(path: &Path, key: &str, list: &[crate::favourites::Favourite]) -> std::io::Result<()> {
-    update_settings(path, |v| {
-        if !v.get("favourites").is_some_and(serde_json::Value::is_object) {
-            v["favourites"] = serde_json::json!({});
+/// other key (see [`save_settings`]): `ours` merged into the list the file
+/// has now, from `base` (the list as this instance last read or wrote it;
+/// [`crate::favourites::merge`]), so another instance's adds and removes
+/// survive. Returns the list written. A `favourites` that is not an object,
+/// or a `favourites.<key>` that is not a list (a newer build's form, a hand
+/// edit), is not overwritten: an error says so.
+pub fn save_favourites(
+    path: &Path,
+    key: &str,
+    base: &[crate::favourites::Favourite],
+    ours: &[crate::favourites::Favourite],
+) -> std::io::Result<Vec<crate::favourites::Favourite>> {
+    let mut written = Vec::new();
+    try_update_settings(path, |v| {
+        let refuse = |what: String| Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{what}: not overwritten")));
+        match v.get("favourites") {
+            None => v["favourites"] = serde_json::json!({}),
+            Some(f) if !f.is_object() => return refuse("settings.json's favourites is not an object".into()),
+            Some(f) => {
+                if f.get(key).is_some_and(|l| !l.is_array()) {
+                    return refuse(format!("settings.json's favourites.{key} is not a list"));
+                }
+            }
         }
-        v["favourites"][key] = crate::favourites::to_json(list);
-    })
+        let theirs = v["favourites"].get(key).map(crate::favourites::from_json).unwrap_or_default();
+        written = crate::favourites::merge(&theirs, base, ours);
+        v["favourites"][key] = crate::favourites::to_json(&written);
+        Ok(())
+    })?;
+    Ok(written)
 }
 
 /// Change the settings file with `edit` (on its JSON object), as
 /// [`save_settings`] says.
 fn update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> std::io::Result<()> {
+    try_update_settings(path, |v| {
+        edit(v);
+        Ok(())
+    })
+}
+
+/// [`update_settings`] with an `edit` that may refuse: the file is then
+/// left as it was.
+fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value) -> std::io::Result<()>) -> std::io::Result<()> {
     use std::io::Write;
     // One writer at a time in this process: the theme (UI thread) and the
     // panels (background) each re-read and merge, so neither write is lost.
@@ -1266,7 +1353,7 @@ fn update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> st
         std::fs::copy(path, path.with_extension("json.bad"))?;
     }
     let mut v = parsed.unwrap_or_else(|| serde_json::json!({}));
-    edit(&mut v);
+    edit(&mut v)?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     let tmp = path.with_extension(format!("json.{}.{nanos}.tmp", std::process::id()));
     let written = (|| {
@@ -1684,8 +1771,8 @@ mod tests {
         a.toggle(Source::Saved(&saved("j-old", "/home/u/deep")), 10);
         a.toggle(Source::Saved(&saved("j-new", "/home/u/new")), 20);
         let b = vec![Favourite::of(Source::Saved(&saved("j-b", "/srv/b")), 30)];
-        save_favourites(&path, "socket:/a", &a.list).unwrap();
-        save_favourites(&path, "socket:/b", &b).unwrap();
+        assert_eq!(save_favourites(&path, "socket:/a", &[], &a.list).unwrap(), a.list);
+        save_favourites(&path, "socket:/b", &[], &b).unwrap();
         assert_eq!(load_favourites(&path, "socket:/a"), a.list, "order and snapshot kept");
         assert_eq!(load_favourites(&path, "socket:/b"), b, "another daemon's apart");
         assert!(load_favourites(&path, "offline").is_empty());
@@ -1698,14 +1785,25 @@ mod tests {
         assert_eq!(load_favourites(&path, "socket:/a"), a.list, "a write of another key keeps them");
         assert_eq!(load_tabs(&path, "socket:/a").map(|t| t.sessions), Some(vec!["s1".to_string()]));
         // Unfavourited: an empty list, not the daemon's key gone with the others.
-        save_favourites(&path, "socket:/a", &[]).unwrap();
+        assert!(save_favourites(&path, "socket:/a", &a.list, &[]).unwrap().is_empty());
         assert!(load_favourites(&path, "socket:/a").is_empty());
         assert_eq!(load_favourites(&path, "socket:/b"), b);
-        // Not an object: none (and the next save makes it one).
-        std::fs::write(&path, r#"{"favourites": [1, 2]}"#).unwrap();
-        assert!(load_favourites(&path, "socket:/b").is_empty());
-        save_favourites(&path, "socket:/b", &b).unwrap();
-        assert_eq!(load_favourites(&path, "socket:/b"), b);
+        // Another instance's add since this one read the file: kept.
+        let c = vec![Favourite::of(Source::Saved(&saved("j-c", "/srv/c")), 40)];
+        save_favourites(&path, "socket:/b", &b, &[b.clone(), c.clone()].concat()).unwrap();
+        let mine = vec![b[0].clone(), Favourite::of(Source::Saved(&saved("j-d", "/srv/d")), 50)];
+        let written = save_favourites(&path, "socket:/b", &b, &mine).unwrap();
+        assert_eq!(written.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["j-b", "j-c", "j-d"]);
+        assert_eq!(load_favourites(&path, "socket:/b"), written);
+        // Not an object, or a key's value not a list (a newer build's
+        // form, a hand edit): read as none, and never overwritten.
+        for odd in [r#"{"favourites": [1, 2]}"#, r#"{"favourites": {"socket:/b": {"v": 2, "list": []}}}"#] {
+            std::fs::write(&path, odd).unwrap();
+            assert!(load_favourites(&path, "socket:/b").is_empty());
+            let e = save_favourites(&path, "socket:/b", &[], &b).unwrap_err();
+            assert!(e.to_string().contains("not overwritten"), "{e}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), odd, "left as it was");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

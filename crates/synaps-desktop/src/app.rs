@@ -2770,8 +2770,11 @@ impl AppView {
         }));
     }
 
-    /// The favourites changed since the last save: saved [`SAVE_DELAY`]
-    /// later, off the UI thread, under the tabs' key (never in a bench).
+    /// The favourites changed since the last save (the set, or what a row
+    /// shows; an update time alone waits for quit): saved [`SAVE_DELAY`]
+    /// later, off the UI thread, under the tabs' key (never in a bench), as
+    /// a merge into what the file has now ([`crate::favourites::merge`]):
+    /// another window's adds and removes are kept, and taken.
     fn schedule_favs_save(&mut self, cx: &mut Context<Self>) {
         if self.tabs_key.is_none() || self.bench.is_some() || self.model.favs.generation == self.favs_saved {
             return;
@@ -2780,13 +2783,28 @@ impl AppView {
         self.favs_save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_DELAY).await;
             let job = this
-                .update(cx, |v, _| (theme::settings_path(), v.tabs_key.clone(), v.model.favs.list.clone(), v.model.favs.generation))
+                .update(cx, |v, _| {
+                    let f = &v.model.favs;
+                    (theme::settings_path(), v.tabs_key.clone(), f.base.clone(), f.list.clone(), f.generation)
+                })
                 .ok();
-            let Some((Some(path), Some(key), list, generation)) = job else { return };
-            let done = cx.background_spawn(async move { theme::save_favourites(&path, &key, &list) }).await;
+            let Some((Some(path), Some(key), base, sent, generation)) = job else { return };
+            let done = cx
+                .background_spawn(async move {
+                    let file = theme::save_favourites(&path, &key, &base, &sent);
+                    (file, sent)
+                })
+                .await;
             let _ = this.update(cx, |v, cx| match done {
-                Ok(()) => v.favs_written = v.favs_written.max(generation),
-                Err(e) => {
+                (Ok(file), sent) => {
+                    v.favs_written = v.favs_written.max(generation);
+                    v.model.favs.quiet = false;
+                    if v.model.favs.written(&sent, file) {
+                        v.model.rail_gen += 1;
+                        cx.notify();
+                    }
+                }
+                (Err(e), _) => {
                     v.model.named.notice = Some(format!("Favourites not saved: {e}"));
                     cx.notify();
                 }
@@ -2794,15 +2812,22 @@ impl AppView {
         }));
     }
 
-    /// Favourites changed since the last write, written now.
+    /// Favourites changed since the last write (an update time too),
+    /// written now, merged as [`AppView::schedule_favs_save`] does.
     fn flush_favs(&mut self) {
         self.favs_save = None;
-        if self.tabs_key.is_none() || self.bench.is_some() || self.model.favs.generation == self.favs_written {
+        let f = &self.model.favs;
+        if self.tabs_key.is_none() || self.bench.is_some() || (f.generation == self.favs_written && !f.quiet) {
             return;
         }
         if let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref()) {
-            match theme::save_favourites(&path, key, &self.model.favs.list) {
-                Ok(()) => self.favs_written = self.model.favs.generation,
+            let sent = f.list.clone();
+            match theme::save_favourites(&path, key, &f.base, &sent) {
+                Ok(file) => {
+                    self.favs_written = self.model.favs.generation;
+                    self.model.favs.quiet = false;
+                    self.model.favs.written(&sent, file);
+                }
                 Err(e) => eprintln!("synaps-desktop: favourites not saved: {e}"),
             }
         }
@@ -4202,20 +4227,27 @@ impl AppView {
         self.model.sessions.get(row.live?).map(|m| m.id.clone())
     }
 
-    /// Favourite a rail row's session, or unfavourite it: held, listed or
-    /// (a favourite's own row) remembered. Desktop only: nothing is sent.
+    /// Favourite a rail row's session, or unfavourite it: held, a
+    /// favourite (its own row) or listed. Looked up by the row's id in the
+    /// lists as they are now, never by an index the rail was built with (a
+    /// poll may have replaced the lists since). Desktop only: nothing is
+    /// sent.
     pub(crate) fn toggle_fav_row(&mut self, key: u64) {
         use crate::favourites::Source;
         let Some(row) = self.rail.rail.rows.iter().find(|r| r.key == key) else { return };
-        let (live, saved, fav) = (row.live, row.saved, row.fav);
+        let id = match &row.action {
+            RowAction::Attach(id) => id.clone(),
+            RowAction::Resume(r) if !r.by_name => r.target.clone(),
+            RowAction::Resume(_) => return,
+        };
         let now = crate::chrome::now_secs();
         let m = &mut self.model;
-        if let Some(s) = live.and_then(|i| m.sessions.get(i)) {
+        if let Some(s) = m.sessions.iter().find(|s| s.id == id) {
             m.favs.toggle(Source::Live(s), now);
-        } else if let Some(v) = saved.and_then(|r| crate::rail::saved_entry(m, r)).cloned() {
-            m.favs.toggle(Source::Saved(&v), now);
-        } else if let Some(id) = fav.and_then(|i| m.favs.list.get(i)).map(|f| f.id.clone()) {
+        } else if m.favs.position(&id).is_some() {
             m.favs.remove(&id);
+        } else if let Some(v) = m.named.recent.iter().chain(m.named.saved.iter()).find(|v| v.id == id).cloned() {
+            m.favs.toggle(Source::Saved(&v), now);
         } else {
             return;
         }
@@ -4242,8 +4274,21 @@ impl AppView {
         self.model.view_dirty = true;
     }
 
-    /// The favourite key: the session tab on screen.
-    fn fav_key_pressed(&mut self, cx: &mut Context<Self>) {
+    /// A text field has the keyboard (the composer, find, a name, a colour,
+    /// a secret, Settings' fields): keys are its text, not the app's.
+    fn typing(&self, window: &Window, cx: &App) -> bool {
+        self.composer.read(cx).focus_handle(cx).is_focused(window)
+            || [&self.find_input, &self.name_input, &self.hex_input, &self.secret_input, &self.settings_find, &self.settings_input]
+                .iter()
+                .any(|i| i.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    /// The favourite key: the session tab on screen. Not while typing (a
+    /// TUI hand's Ctrl+D there is no toggle of the favourites).
+    fn fav_key_pressed(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.typing(window, cx) {
+            return;
+        }
         let Some(id) = self.model.tabs.current().filter(|t| t.kind == crate::tabs::Kind::Session).and_then(|t| t.session.clone()) else {
             return;
         };
@@ -5965,7 +6010,7 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &WorkerDown, _, cx| this.worker_key(Step::Down, cx)))
             .on_action(cx.listener(|this, _: &WorkerTab, _, cx| this.worker_tab_key(cx)))
             .on_action(cx.listener(|this, _: &RenameSession, window, cx| this.rename_session(window, cx)))
-            .on_action(cx.listener(|this, _: &ToggleFavourite, _, cx| this.fav_key_pressed(cx)))
+            .on_action(cx.listener(|this, _: &ToggleFavourite, window, cx| this.fav_key_pressed(window, cx)))
             .map(|d| tab_actions(d, cx))
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
                 let k = &ev.keystroke.key;
