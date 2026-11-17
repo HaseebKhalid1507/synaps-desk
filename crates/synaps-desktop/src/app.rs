@@ -1373,6 +1373,12 @@ pub struct AppView {
     /// Frames drawn for the window are shown (GPUI's visibility: mapped and
     /// not wholly covered, not minimized). Nothing polls while it is not.
     visible: bool,
+    /// The window's motion (motion.md): the frame's clock, what animates,
+    /// the one timer.
+    pub(crate) fx: Rc<crate::motion::Motion>,
+    /// The prompt on the card came while watched, at this instant: its frame
+    /// traces, its glyph breathes (motion.md §6.3).
+    card_at: Option<Instant>,
     /// The card was on screen last frame (not behind a worker's view,
     /// Settings or Usage): one coming back waits again ([`Arm`]).
     card_was_up: bool,
@@ -1798,6 +1804,8 @@ impl AppView {
             full_rebuild: false,
             watch_poll: None,
             visible: i.visible,
+            fx: Rc::default(),
+            card_at: None,
             card_was_up: false,
             tray: crate::tray::TrayCache::default(),
             tray_due: None,
@@ -2698,6 +2706,8 @@ impl AppView {
             log::debug!(target: "synaps_desktop::send", "steer {handle} ({} chars)", text.chars().count());
             self.model.watch.steer_sent(&handle, &text);
             self.watch_note = None;
+            // Handoff out: the composer's bar, then the watched row's.
+            self.fx.sent.set(Some((Instant::now(), true)));
             return true;
         }
         let busy = self.model.transcript.busy();
@@ -2710,6 +2720,9 @@ impl AppView {
         self.model.sent(text);
         self.draft_note = None;
         self.watch_note = None;
+        // Handoff out: the composer's bar, then the new block's (a steer
+        // lands in no block: the composer's alone).
+        self.fx.sent.set(Some((Instant::now(), busy)));
         true
     }
 
@@ -2818,6 +2831,11 @@ impl AppView {
     fn visibility_changed(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible;
         self.arm_watch_poll(cx);
+        // Hidden, the heartbeat stops; shown again, the next frame re-arms it.
+        self.fx.set_visible(visible);
+        if visible {
+            cx.notify();
+        }
     }
 
     /// The visible tab shows its session as last seen (the tab cache, or
@@ -3421,9 +3439,12 @@ impl AppView {
     /// holding it ([`turns::build`]); only rows that differ are spliced
     /// (and so re-measured). A turn that ends can fold its last run.
     pub fn sync_list(&mut self) {
+        let pane_before = self.pane_of.clone();
+        let session_before = self.rows_session.clone();
         self.sync_pane();
         let busy = self.model.shown().busy();
         let mut splice = self.model.shown_mut().take_splice();
+        let live_splice = splice.as_ref().is_some_and(|sp| sp.start > 0 && sp.new_len <= sp.old_len + 16) && !self.full_rebuild;
         if std::mem::take(&mut self.full_rebuild) {
             let n = self.model.shown().len();
             splice = Some(synaps_client::transcript::Splice { start: 0, old_len: self.rows.len(), new_len: n });
@@ -3493,7 +3514,20 @@ impl AppView {
             .map(|i| i.id);
         let start = turns::turn_start(items, from);
         self.synced_busy = busy;
+        // Rows that arrive while watched (a tail splice of a few items, not
+        // an attach, a history load or another session's list) draw in:
+        // a burst staggered 30 ms each (motion.md §6.1).
+        let live = self.fx.on() && live_splice && self.pane_of == pane_before && self.rows_session == session_before;
+        let before: HashSet<u64> =
+            if live { self.disp.iter().skip_while(|d| d.item < start).map(|d| d.id).collect() } else { HashSet::new() };
         self.rebuild_from(start);
+        if live {
+            let now = Instant::now();
+            let fresh = self.disp.iter().skip_while(|d| d.item < start).filter(|d| !before.contains(&d.id));
+            for (k, d) in fresh.enumerate() {
+                self.fx.born(d.id, now + crate::motion::stagger(k));
+            }
+        }
         self.sync_counts();
         self.sync_subagents();
     }
@@ -3730,9 +3764,25 @@ impl AppView {
         if !self.open_runs.remove(&id) {
             self.open_runs.insert(id);
         }
+        // The clicked header stays put (motion.md §6.1): the list keeps its
+        // top row and offset, tail-follow paused (it resumes at the end).
+        if self.list.is_following_tail() {
+            let top = self.list.logical_scroll_top();
+            self.list.pause_following_tail();
+            self.list.scroll_to(top);
+        }
+        let before: HashSet<u64> = self.disp.iter().filter(|d| d.kind == Kind::Work).map(|d| d.id).collect();
         let items = self.model.shown().items();
         if let Some(start) = items.iter().position(|i| i.id == id).map(|ix| turns::turn_start(items, ix + 1)) {
             self.rebuild_from(start);
+        }
+        // The cascade: the rows the unfold brought draw their bars from the
+        // header down; a fold draws the tally's segments.
+        let now = Instant::now();
+        self.fx.fold.set(Some((id, now)));
+        let fresh = self.disp.iter().filter(|d| d.kind == Kind::Work && !before.contains(&d.id));
+        for (k, d) in fresh.enumerate() {
+            self.fx.born(d.id, now + crate::motion::stagger(k));
         }
     }
 
@@ -4189,6 +4239,19 @@ impl AppView {
             )
         } else {
             let yes = can && ready;
+            // AUTHORIZE charges (motion.md §6.3): the arm's wait drawn as 10
+            // cells lit left to right, 50 ms each; the last lit is the arm.
+            // A held read gate keeps them dark.
+            let charge = card
+                .filter(|c| can && !yes && self.fx.level() == crate::motion::Level::Full && !(below.is_some_and(|b| b > 1.) && !c.read))
+                .map(|c| {
+                    let cell = ARM / 10;
+                    let n = (Instant::now().saturating_duration_since(c.arm.shown).as_nanos() / cell.as_nanos()).min(10) as u32;
+                    if n < 10 {
+                        self.fx.want_at(c.arm.shown + cell * (n + 1));
+                    }
+                    n
+                });
             Some(
                 h_flex()
                     .gap(px(24.))
@@ -4196,15 +4259,17 @@ impl AppView {
                     // Clickable whenever the card may be answered: the read
                     // gate is checked at the click (as the keys do), not by
                     // this frame, laid out with the last one's bounds.
-                    .child(fbtn_key("p-yes", label::AUTHORIZE, (keys && yes).then_some(YES_KEY), yes, Fill::Warn, p, m).when_some(
-                        key.filter(|_| can),
-                        |d, key| {
-                            d.on_click(cx.listener(move |this, _, _, cx| {
-                                this.authorize(key);
-                                cx.notify();
-                            }))
-                        },
-                    ))
+                    .child(
+                        fbtn_charge("p-yes", label::AUTHORIZE, (keys && yes).then_some(YES_KEY), yes, charge, Fill::Warn, p, m).when_some(
+                            key.filter(|_| can),
+                            |d, key| {
+                                d.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.authorize(key);
+                                    cx.notify();
+                                }))
+                            },
+                        ),
+                    )
                     .child(
                         h_flex()
                             .gap(px(8.))
@@ -4288,12 +4353,33 @@ impl AppView {
             .line_height(px(m.code_line))
             .text_color(p.well_fg)
             .child(body);
-        let g = div()
-            .relative()
-            .size(px(10.))
-            .flex_none()
-            .child(div().absolute().inset_0().border_1().border_color(p.warn_mark))
-            .child(div().absolute().top(px(3.)).left(px(3.)).size(px(4.)).bg(p.warn_mark));
+        let g = crate::turns::live_glyph(&self.fx, glyph::Glyph::Needs, p.warn_mark, p.card, None, self.card_at, false);
+        // Its frame traces from the top-left corner: one stroke along the
+        // top and down the right, one down the left and along the bottom,
+        // meeting after `base` (paint only, over its 1 px border).
+        let trace = self.fx.draw(self.card_at, Duration::ZERO, crate::motion::BASE);
+        let warn_mark = p.warn_mark;
+        let tracer = (trace < 1.).then(|| {
+            canvas(
+                |_, _, _| {},
+                move |b, _, window, _| {
+                    let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
+                    let l = trace * (w + h);
+                    let line =
+                        |x: f32, y: f32, ww: f32, hh: f32| Bounds::new(point(b.origin.x + px(x), b.origin.y + px(y)), size(px(ww), px(hh)));
+                    let mut q = |r: Bounds<Pixels>| window.paint_quad(fill(r, warn_mark));
+                    q(line(0., 0., l.min(w), 1.));
+                    q(line(w - 1., 0., 1., (l - w).clamp(0., h)));
+                    q(line(0., 0., 1., l.min(h)));
+                    q(line(0., h - 1., (l - h).clamp(0., w), 1.));
+                },
+            )
+            .absolute()
+            .top(px(-1.))
+            .left(px(-1.))
+            .right(px(-1.))
+            .bottom(px(-1.))
+        });
         // Cramped: the lead is the title (the head when there is none).
         let title = if cramped && !lead.is_empty() {
             div()
@@ -4327,8 +4413,10 @@ impl AppView {
                 .px(px(m.pad_x))
                 .py(px(dims.pad_y))
                 .border_1()
-                .border_color(p.warn_mark)
+                .border_color(if tracer.is_some() { p.card } else { p.warn_mark })
                 .bg(p.card)
+                .relative()
+                .children(tracer)
                 // A click on a confirm card gives it the keys (a secret's
                 // field takes them itself).
                 .when(!secret, |d| {
@@ -4569,7 +4657,38 @@ impl AppView {
                 .tooltip(|window, cx| crate::overlay::tip("back to the session · Esc", window, cx))
                 .on_click(cx.listener(|this, _, _, cx| this.leave_worker(false, cx)))
         };
-        let glyph_el = || g.map(|g| div().flex().debug_selector(|| "foot-glyph".into()).child(glyph::draw(g, mark)).into_any_element());
+        // The glyph cross-fades and scans; NEEDS YOU breathes; a turn that
+        // ended here (busy → READY) hands the floor back: Handoff in
+        // (motion.md §5.2, §6.4). Keyed by whose foot it is: a switch is not a change.
+        let fx = &self.fx;
+        let foot_key = match worker {
+            Some(w) => (1 << 62) | w.subagent_id,
+            None => self.model.tabs.current().map_or(0, |t| t.id),
+        };
+        let foot_ch = g.and_then(|g| fx.change(crate::motion::Tag::Foot, foot_key, crate::turns::glyph_code(g), None));
+        let busy_glyph = |c: u64| {
+            [glyph::Glyph::Run, glyph::Glyph::Workers, glyph::Glyph::Needs, glyph::Glyph::Cancelling]
+                .iter()
+                .any(|g| crate::turns::glyph_code(*g) == c)
+        };
+        let handoff_in =
+            foot_ch.filter(|(_, prev)| worker.is_none() && drives && word == Some(label::READY) && busy_glyph(*prev)).map(|(at, _)| at);
+        let breath_at = foot_ch.filter(|_| g == Some(glyph::Glyph::Needs)).map(|c| c.0);
+        let mut foot_glyph = g.map(|g| {
+            div()
+                .flex()
+                .debug_selector(|| "foot-glyph".into())
+                .child(crate::turns::live_glyph(fx, g, mark, p.user, foot_ch, breath_at, true))
+                .into_any_element()
+        });
+        let mut glyph_el = || foot_glyph.take();
+        let lit = crate::motion::mix(p.you, p.ink, 0.35);
+        let out = fx.flash(fx.sent.get().map(|(at, _)| at));
+        let (bar_flash, segment) = match crate::motion::Level::current(cx) {
+            crate::motion::Level::Full => (out, fx.draw(handoff_in, Duration::ZERO, crate::motion::SIG)),
+            _ => (out.max(fx.flash(handoff_in)), 1.),
+        };
+        let bar = crate::motion::mix(p.you_mark, lit, bar_flash);
         // A worker tab's glyph says whose; the primary may shorten.
         // Its text at `inset` (design.md §8.11): the kit pads a multi-line
         // field's text by its own `input_px` whatever its appearance, so the
@@ -4691,7 +4810,19 @@ impl AppView {
                 .border_1()
                 .border_color(p.edge)
                 // The user's bar over the left border.
-                .child(div().absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(2.)).bg(p.you_mark))
+                .child(div().absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(2.)).bg(bar))
+                // Handoff in: a 24 px light travels down it.
+                .when(segment < 1., |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left(px(-1.))
+                            .top(px(-1.))
+                            .bottom(px(23.))
+                            .w(px(2.))
+                            .child(div().absolute().left_0().top(relative(segment)).w(px(2.)).h(px(24.)).bg(lit)),
+                    )
+                })
                 .text_px(m.body)
                 .line_height(px(m.body_line))
                 .text_color(p.ink)
@@ -4766,6 +4897,35 @@ pub(crate) fn fbtn_key(
         .when(!enabled, |d| d.child(div().absolute().inset_0().border_1().border_color(p.edge)))
         .child(display(text, m.label, fg))
         .when_some(key, |d, k| d.child(mono(k, m.meta, fg)))
+}
+
+/// [`fbtn_key`], disabled, its fill charging: `charge` of 10 cells lit in
+/// `fill`, left to right (motion.md §6.3). No charge: [`fbtn_key`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fbtn_charge(
+    id: &'static str,
+    text: &'static str,
+    key: Option<&'static str>,
+    enabled: bool,
+    charge: Option<u32>,
+    fill: Hsla,
+    p: &Palette,
+    m: &Metrics,
+) -> Stateful<Div> {
+    let Some(n) = charge.filter(|_| !enabled) else { return fbtn_key(id, text, key, enabled, fill, p, m) };
+    let cells = h_flex().absolute().inset_0().children((0..10).map(|i| div().flex_1().h_full().when(i < n, |d| d.bg(fill))));
+    div()
+        .id(id)
+        .relative()
+        .h(px(crate::fit::button_h(m)))
+        .px(px(16.))
+        .flex()
+        .flex_none()
+        .gap(px(10.))
+        .items_center()
+        .bg(p.edge)
+        .child(cells)
+        .child(display(text, m.label, p.dim).relative())
 }
 
 pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subagents::Subagents) -> RowCache {
@@ -4861,6 +5021,10 @@ impl Render for AppView {
         // Every frame drawn (`SYNAPS_DESKTOP_LOG=debug`): what an idle
         // window costs is countable.
         log::debug!(target: "synaps_desktop::frame", "frame");
+        // The frame's clock and level: every animated element samples them.
+        let low_power = cx.power_mode() == gpui_kit::PowerMode::LowPower;
+        self.fx.set_visible(self.visible);
+        self.fx.begin_frame(crate::motion::Level::current(cx), low_power, Instant::now());
         if self.menu.is_none()
             && self.smenu.is_none()
             && let Some(h) = self.menu_focus_back.take()
@@ -4878,6 +5042,17 @@ impl Render for AppView {
         }
         self.sync_list();
         self.sync_card(window, cx);
+        // Seen every frame, shown or not: a card that comes back (from a
+        // worker's view, Settings) is not new; another session's is history.
+        let prompt_key = self.model.card_key().map_or(0, |(e, id)| (e << 32) ^ id ^ (1 << 63));
+        let session_key = self.model.active.as_ref().map_or(0, |a| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            a.session_id.hash(&mut h);
+            h.finish()
+        });
+        self.card_at =
+            self.fx.change(crate::motion::Tag::Card, session_key, prompt_key, None).filter(|_| prompt_key != 0).map(|(at, _)| at);
         self.sync_tray(cx);
         self.rename_when_shown(window, cx);
         self.refresh_rail();
@@ -4990,7 +5165,8 @@ impl Render for AppView {
         // smallest form and the tray leave.
         let card_shown = self.card_shown();
         let ex = crate::fit::Extras { stub: self.stub_shown(), ..ex };
-        let tray_n = if view.is_none() { self.tray.rows.len() } else { 0 };
+        // A row fading out keeps its slot until its fade is over.
+        let tray_n = if view.is_none() { self.tray.rows.len() + self.tray.ghosts.len() } else { 0 };
         self.tray_rows = crate::fit::tray_rows(&m, lay.form(), self.height, card_shown, ex, tray_n);
         // A keyboard menu over a row no longer drawn closes.
         self.close_orphan_menu();
@@ -5331,6 +5507,12 @@ impl Render for AppView {
             .when(self.gear_menu, |d| d.child(deferred(self.render_gear_menu(rail == Side::Strip, &p, cx)).with_priority(2)))
             .children(self.render_menu_at_point(&p, cx))
             .children(self.render_session_menu(&p, cx))
+            // Painted last, after every row was rendered: what the frame's
+            // motion asked for (a frame, the one timer, or nothing).
+            .child({
+                let (fx, me) = (self.fx.clone(), cx.weak_entity());
+                canvas(|_, _, _| {}, move |_, _, window, cx| fx.end_frame(window, cx, me)).absolute().size_0()
+            })
     }
 }
 

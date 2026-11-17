@@ -1024,3 +1024,226 @@ fn a_redraw_with_nothing_changed_keeps_every_text_view(cx: &mut TestAppContext) 
     assert_eq!(again, kept, "no text view dropped or made again across 40 frames");
     assert_eq!(view.read_with(cx, |v, _| v.text_views().1), 0, "none stale");
 }
+
+// ── motion (cohesion/motion.md §10, PR 4) ─────────────────────────────
+
+/// Delivers next frames until the window asks for none (at most `max`):
+/// how many it drew.
+fn settle(cx: &mut TestAppContext, w: AnyWindowHandle, max: usize) -> usize {
+    for n in 0..max {
+        let ran = cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+        cx.run_until_parked();
+        if ran == 0 {
+            return n;
+        }
+    }
+    max
+}
+
+fn set_motion(cx: &mut TestAppContext, view: &Entity<AppView>, level: crate::motion::Level) {
+    cx.update(|cx| {
+        cx.set_global(crate::motion::Setting { level: Some(level), lock: None });
+        crate::motion::Level::apply(cx);
+    });
+    view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+}
+
+/// What the window's motion asked for after its last frame.
+fn motion_pending(cx: &mut TestAppContext, view: &Entity<AppView>) -> (bool, Option<std::time::Instant>) {
+    view.read_with(cx, |v, _| v.fx.pending())
+}
+
+/// Draws one more frame now.
+fn frame(cx: &mut TestAppContext, view: &Entity<AppView>) {
+    view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+}
+
+/// A run of the other demo session folded, then its id (it has three).
+fn a_folded_run(cx: &mut TestAppContext, view: &Entity<AppView>) -> u64 {
+    view.read_with(cx, |v, _| {
+        v.disp.iter().find(|d| matches!(d.kind, crate::turns::Kind::Summary { open: false, .. })).map(|d| d.id).expect("a folded run")
+    })
+}
+
+/// Off is the static app: whatever happens (a worker running, a fold, a
+/// send, a session switch), no frame and no timer of motion's; the window
+/// is idle within the static app's own follow-up frames.
+#[gpui_kit::test]
+fn off_is_static(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Off);
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "scout runs in the tray: nothing scans under Off");
+    // A send's Handoff (what `submit` stamps).
+    view.update(cx, |v, cx| {
+        v.fx.sent.set(Some((std::time::Instant::now(), false)));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "no Handoff under Off");
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    assert!(settle(cx, w, 8) <= 2);
+    let run = a_folded_run(cx, &view);
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(settle(cx, w, 8) <= 2, "the unfold's own frame, and the static app's hint");
+    assert_eq!(motion_pending(cx, &view), (false, None), "no cascade under Off");
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "no tally draw under Off");
+    cx.update(|cx| assert!(cx.reduce_motion(), "the kit's own motion is off too"));
+}
+
+/// Nothing running on screen, nothing moving: after the last animation the
+/// window asks for no frame and arms no timer.
+#[gpui_kit::test]
+fn idle_requests_no_frames(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    let run = a_folded_run(cx, &view);
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    // The cascade runs on display frames, then stops by itself.
+    let mut drawn = 0;
+    while motion_pending(cx, &view).0 && drawn < 400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        drawn += 1 + settle(cx, w, 1);
+    }
+    assert!(drawn > 0, "the unfold animated");
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "settled: no frame, no timer");
+}
+
+/// A screen full of running things: no display frames for ambient, one
+/// timer to the next beat; every glyph samples the one beat.
+#[gpui_kit::test]
+fn heartbeat_is_one_timer(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let (display, timer) = motion_pending(cx, &view);
+    assert!(!display, "ambient asks for no display frames");
+    let at = timer.expect("scout runs: the heartbeat is armed");
+    assert!(at > std::time::Instant::now() - std::time::Duration::from_millis(1));
+    assert!(at <= std::time::Instant::now() + crate::motion::BEAT, "to the next beat");
+    let arms = view.read_with(cx, |v, _| v.fx.arms.get());
+    frame(cx, &view);
+    let again = view.read_with(cx, |v, _| v.fx.arms.get());
+    assert!(again - arms <= 1, "one timer per beat, however many glyphs scan");
+}
+
+/// Hidden: the heartbeat's timer goes; shown again, the next frame arms it.
+#[gpui_kit::test]
+fn heartbeat_stops_hidden(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    assert!(motion_pending(cx, &view).1.is_some());
+    cx.simulate_window_visibility_change(w, gpui_kit::WindowVisibility::Hidden);
+    cx.run_until_parked();
+    assert_eq!(motion_pending(cx, &view).1, None, "hidden: no timer");
+    frame(cx, &view);
+    assert_eq!(motion_pending(cx, &view).1, None, "a frame while hidden arms nothing");
+    cx.simulate_window_visibility_change(w, gpui_kit::WindowVisibility::Visible);
+    cx.run_until_parked();
+    assert!(motion_pending(cx, &view).1.is_some(), "shown: armed again");
+}
+
+/// An unfold's cascade (bars drawing, the chevron turning) paints only:
+/// every row on screen has one height on every frame of it.
+#[gpui_kit::test]
+fn transcript_heights_stable_across_frames(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    settle(cx, w, 8);
+    let run = a_folded_run(cx, &view);
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(motion_pending(cx, &view).0, "the cascade is running");
+    let heights = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            (0..v.disp.len())
+                .filter_map(|ix| v.list.bounds_for_item(ix).map(|b| (v.disp[ix].id, f32::from(b.size.height))))
+                .collect::<Vec<_>>()
+        })
+    };
+    let first = heights(cx);
+    assert!(first.len() > 3, "rows on screen: {first:?}");
+    let mut frames = 0;
+    while motion_pending(cx, &view).0 && frames < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(4));
+        settle(cx, w, 1);
+        frames += 1;
+        let now = heights(cx);
+        for (id, h) in &now {
+            if let Some((_, h0)) = first.iter().find(|(i, _)| i == id) {
+                assert_eq!(h, h0, "row {id} changed height on frame {frames}");
+            }
+        }
+    }
+    assert!(frames > 0, "the cascade ran over frames ({frames})");
+}
+
+/// Words never wait: no text view is given a motion policy, so the kit's
+/// stream fade stays at its zero default (appended text is opaque on the
+/// frame it lands); the write head is a gutter bar, not a wash.
+#[test]
+fn stream_text_is_visible_on_its_first_frame() {
+    assert_eq!(gpui_kit::base::TextViewMotion::default().stream_fade(), std::time::Duration::ZERO);
+    for src in [include_str!("turns.rs"), include_str!("app.rs"), include_str!("chrome.rs"), include_str!("views.rs")] {
+        assert!(!src.contains(concat!(".mot", "ion(")), "a text view got a motion policy");
+        assert!(!src.contains(concat!("with_stream", "_fade")), "a stream fade");
+    }
+}
+
+/// A tray row leaving fades in its slot, but takes no click: the click
+/// lands on what is there after the exit (nothing opens).
+#[gpui_kit::test]
+fn exiting_takes_no_click(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    view.update(cx, |v, cx| {
+        let row = v.tray.rows.first().cloned().expect("scout's row");
+        v.tray.rows.clear();
+        // Left "later": its fade holds at full for the whole test.
+        v.tray.ghosts.push((0, row, std::time::Instant::now() + std::time::Duration::from_secs(60)));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    let b = vcx.debug_bounds("tray-ghost").expect("the leaving row is drawn");
+    let position = b.center();
+    vcx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 });
+    vcx.run_until_parked();
+    assert!(view.read_with(&vcx, |v, _| v.model.watch.focus().is_none() && v.menu.is_none()), "the click opened nothing");
+}

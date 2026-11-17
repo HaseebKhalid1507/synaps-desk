@@ -23,6 +23,7 @@ use crate::files::{CallDelta, LineKind, Preview};
 use crate::fonts::TextPx as _;
 use crate::fonts::{self, label};
 use crate::glyph::{self, Family, Glyph, Ground};
+use crate::motion::{self, Kind as Mk, Motion, Tag, ease};
 use crate::subagents::{self, Subagents};
 use crate::theme::{self, Metrics, Palette};
 
@@ -838,6 +839,10 @@ impl AppView {
                 v
             }
             _ => {
+                // No `TextViewMotion` (`TextView::motion`): the kit's stream
+                // fade stays at its zero default. A glyph that starts
+                // transparent is a delayed glyph (motion.md rule 1); the
+                // write head marks where the agent writes instead.
                 let v = cx.new(|cx| TextViewState::markdown(text, cx));
                 let redraw = cx.observe(&v, |_, _, cx| cx.notify());
                 self.texts.borrow_mut().put(id, text.clone(), (v.clone(), redraw), now);
@@ -869,21 +874,34 @@ impl AppView {
             _ => (None, px(0.)),
         };
         let block: AnyElement = match d.kind {
-            // The you bar over its left edge (design.md §8.11): the text at
-            // `inset`, the bar inside it.
-            Kind::User => div()
-                .relative()
-                .w_full()
-                .bg(p.user)
-                .child(crate::glyph::bar(p.you_mark))
-                .px(px(m.pad_x))
-                .py(px(m.pad_y))
-                .text_px(m.body)
-                .line_height(px(m.body_line))
-                .text_color(p.ink)
-                .min_h(min_h)
-                .children(md.map(|v| v.style(cx.global::<theme::Scheme>().user_text.clone())))
-                .into_any_element(),
+            Kind::User => {
+                // The you bar over its left edge (design.md §8.11): the
+                // text at `inset`, the bar inside it; drawn top down when
+                // the block arrives, and the target of a send's Handoff
+                // (motion.md §5.2).
+                let fx = &self.fx;
+                let born = fx.birth(item.id);
+                let lit = match (born, fx.sent.get()) {
+                    (Some(b), Some((at, false))) if b.saturating_duration_since(at) < Duration::from_secs(2) => {
+                        fx.flash(Some(at + 2 * motion::STAGGER))
+                    }
+                    _ => 0.,
+                };
+                let bar = motion::mix(p.you_mark, motion::mix(p.you, p.ink, 0.35), lit);
+                div()
+                    .relative()
+                    .w_full()
+                    .bg(p.user)
+                    .px(px(m.pad_x))
+                    .py(px(m.pad_y))
+                    .text_px(m.body)
+                    .line_height(px(m.body_line))
+                    .text_color(p.ink)
+                    .min_h(min_h)
+                    .children(md.map(|v| v.style(cx.global::<theme::Scheme>().user_text.clone())))
+                    .child(glyph::bar_at(bar, fx.draw(born, Duration::ZERO, motion::BASE)))
+                    .into_any_element()
+            }
             Kind::Prose => {
                 let body = div().w_full().min_h(min_h).text_px(m.body).line_height(px(m.body_line)).text_color(p.prose);
                 match md {
@@ -919,7 +937,19 @@ impl AppView {
                 out = out.child(l.mb(px((2. * m.r).round())));
             }
         }
-        out.child(block).into_any_element()
+        // The write head (motion.md §6.1): where the agent is writing, the
+        // streaming row's bottom-left in the gutter; lit while deltas come,
+        // decaying once they stop. Touches no text.
+        let head = (d.item + 1 == items.len() && matches!(item.kind, ItemKind::Assistant | ItemKind::Thinking))
+            .then(|| self.fx.change(Tag::Stream, item.id, item.text.len() as u64, self.fx.birth(item.id)))
+            .flatten()
+            .map(|(at, _)| self.fx.decay(Some(at), motion::HEAD_HOLD, motion::GLOW))
+            .filter(|k| *k > 0.)
+            .map(|k| {
+                let mark = if item.kind == ItemKind::Thinking { p.think } else { p.run_mark };
+                div().absolute().left(px(-10.)).bottom_0().w(px(2.)).h(px((26. * m.r).round())).bg(motion::mix(p.canvas, mark, k))
+            });
+        out.child(block).children(head).into_any_element()
     }
 
     /// A run's summary row (design.md §8.2): the fold, `7 tools`, the tally
@@ -989,8 +1019,13 @@ impl AppView {
         }
         // Open, the bar ends over the 1 px cut under it.
         let h = m.summary as u32 - u32::from(open);
-        let segments = glyph::tally_bar(&s.tally, |t| t.n, h)
-            .map(|(i, top, h)| div().absolute().left_0().top(px(top as f32)).w(px(2.)).h(px(h as f32)).bg(s.tally[i].hue.color(p)));
+        // Folded just now: the tally's segments draw, top first (motion.md §6.1).
+        let fx = &self.fx;
+        let folded_at = fx.fold.get().filter(|(f, _)| *f == id && !open).map(|(_, at)| at);
+        let segments = glyph::tally_bar(&s.tally, |t| t.n, h).map(|(i, top, h)| {
+            let k = fx.draw(folded_at, motion::stagger(i), motion::QUICK);
+            div().absolute().left_0().top(px(top as f32)).w(px(2.)).h(px(h as f32 * k)).bg(s.tally[i].hue.color(p))
+        });
         h_flex()
             .id(("run", id))
             .relative()
@@ -1005,7 +1040,7 @@ impl AppView {
             .text_color(p.prose_t)
             .cursor_pointer()
             .hover(|d| d.bg(p.tool_out))
-            .child(glyph::lead(Some(glyph::draw(if open { Glyph::FoldOpen } else { Glyph::Fold }, p.dim_t)), m))
+            .child(glyph::lead(Some(glyph::turn(fx.turn(id | RUN_KEY, open), p.dim_t)), m))
             .child(
                 h_flex()
                     .flex_1()
@@ -1053,14 +1088,40 @@ impl AppView {
         // The call a prompt waits on (the last one unfinished).
         let waiting = !think && self.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty();
         let state = glyph::call(st, waiting, self.model.active.is_none());
-        let bar = if think {
-            p.think
-        } else if state.0 == Glyph::Needs {
-            p.warn_mark
-        } else {
-            name_color
+        // Its bar (motion.md §6.1): drawn top down when the row arrives;
+        // lit while it runs, settling to its hue when it ends; a prompt's
+        // warn bar draws over it and un-draws from the bottom when answered.
+        let fx = &self.fx;
+        let shown = self.model.shown();
+        let hue = if think { p.think } else { name_color };
+        let running = if think { shown.busy() && shown.items().last().map(|i| i.id) == Some(id) } else { state.0 == Glyph::Run };
+        let lit = motion::mix(hue, p.ink, 0.30);
+        let bar = match fx.change(Tag::Finished, id, u64::from(!running), None) {
+            _ if !fx.on() => hue,
+            _ if running => lit,
+            Some((at, 0)) => motion::mix(lit, hue, fx.shot(Some(at), Duration::ZERO, motion::SLOW, &ease::OUT, Mk::Decay)),
+            _ => hue,
         };
-        let fold = has_body.then(|| glyph::draw(if open { Glyph::FoldOpen } else { Glyph::Fold }, p.dim_t));
+        let drawn = fx.draw(fx.birth(id), Duration::ZERO, motion::QUICK);
+        let wait = fx.change(Tag::Waiting, id, u64::from(waiting), None);
+        let warn = if waiting {
+            Some(fx.draw(wait.filter(|w| w.1 == 0).map(|w| w.0), Duration::ZERO, motion::BASE))
+        } else {
+            wait.filter(|w| w.1 == 1)
+                .map(|(at, _)| 1. - fx.shot(Some(at), Duration::ZERO, motion::exit(motion::QUICK), &ease::IN, Mk::Spatial))
+                .filter(|k| *k > 0.)
+        };
+        let (_, mark) = glyph::ink(state.2, Ground::Run, p);
+        let trail_glyph = live_glyph(
+            fx,
+            state.0,
+            mark,
+            p.tool,
+            fx.change(Tag::Outcome, id, glyph_code(state.0), None),
+            wait.filter(|w| waiting && w.1 == 0).map(|w| w.0),
+            false,
+        );
+        let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
         let head = h_flex()
             .id(("row", id))
             .w_full()
@@ -1087,7 +1148,7 @@ impl AppView {
                             .child(name),
                     )
                     .child(arg)
-                    .when(!think, |d| d.child(outcome(row, state, p, m, lay))),
+                    .when(!think, |d| d.child(outcome(row, state, trail_glyph, p, m, lay))),
             )
             .when(has_body, |d| {
                 d.on_click(cx.listener(move |this, _, _, cx| {
@@ -1118,10 +1179,16 @@ impl AppView {
                 }
             }
         });
-        let worker = item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name)).and_then(|t| {
+        let starts = item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name));
+        let worker = starts.and_then(|t| {
             let subs = self.model.shown_subagents();
             subs.view(&t.tool_id).map(|v| (v, subs.current(&t.tool_id)))
         });
+        // The block came under the call while watched: its rule draws.
+        let block_at = starts
+            .and_then(|_| fx.change(Tag::Block, id, u64::from(worker.is_some()), fx.birth(id)))
+            .filter(|_| worker.is_some())
+            .map(|(at, _)| at);
         v_flex()
             .relative()
             .w_full()
@@ -1130,9 +1197,10 @@ impl AppView {
             .text_px(m.mono)
             .line_height(px(m.mono_line))
             .child(head)
-            .children(worker.map(|(v, current)| self.subagent_block(v, current, p, m, lay, cx)))
+            .children(worker.map(|(v, current)| self.subagent_block(v, current, id, block_at, p, m, lay, cx)))
             .children(body)
-            .child(glyph::bar(bar))
+            .child(glyph::bar_at(bar, drawn))
+            .children(warn.map(|k| glyph::bar_at(p.warn_mark, k)))
             .into_any_element()
     }
 
@@ -1147,7 +1215,18 @@ impl AppView {
     /// `current`: no later call has its `sa_N` (a cold-started daemon
     /// numbers from 1 again); one that has is another worker's handle now,
     /// and the block does nothing.
-    fn subagent_block(&self, v: &subagents::View, current: bool, p: &Palette, m: &Metrics, lay: Layout, cx: &Context<Self>) -> AnyElement {
+    #[allow(clippy::too_many_arguments)]
+    fn subagent_block(
+        &self,
+        v: &subagents::View,
+        current: bool,
+        key: u64,
+        came: Option<Instant>,
+        p: &Palette,
+        m: &Metrics,
+        lay: Layout,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
         let pending = session.zip(v.id).is_some_and(|(s, id)| self.model.cancels.pending_id(s, id));
         let live = subagents::Liveness::of(v.status, session.is_some(), true).cancelling(pending);
@@ -1190,7 +1269,10 @@ impl AppView {
             .px(px(m.pad_x))
             .items_center()
             .whitespace_nowrap()
-            .child(glyph::lead(Some(glyph::draw(g, mark)), m))
+            .child(glyph::lead(
+                Some(live_glyph(&self.fx, g, mark, p.tool, self.fx.change(Tag::BlockGlyph, key, glyph_code(g), None), None, false)),
+                m,
+            ))
             .child(
                 h_flex()
                     .flex_1()
@@ -1229,10 +1311,14 @@ impl AppView {
                 .text_color(if err { p.err } else { p.dim_t })
                 .child(text)
         });
-        let block = div()
-            .w_full()
-            .pl(px(m.pad_x + m.lead))
-            .child(v_flex().relative().w_full().child(head).children(result).child(glyph::bar(p.sub_rule)));
+        let block = div().w_full().pl(px(m.pad_x + m.lead)).child(
+            v_flex()
+                .relative()
+                .w_full()
+                .child(head)
+                .children(result)
+                .child(glyph::bar_at(p.sub_rule, self.fx.draw(came, Duration::ZERO, motion::BASE))),
+        );
         let Some(who) = who else {
             // Its handle names a later worker now: nothing of that one's here.
             if let Some(id) = v.id.filter(|_| v.watchable && !current && self.model.watch.focus().is_none()) {
@@ -1259,11 +1345,56 @@ impl AppView {
     }
 }
 
+/// A summary's chevron is keyed apart from its first row's own.
+const RUN_KEY: u64 = 1 << 63;
+
+/// A glyph's index in the drawing table: what [`Motion::change`] remembers.
+pub(crate) fn glyph_code(g: Glyph) -> u64 {
+    Glyph::ALL.iter().position(|x| *x == g).unwrap_or(0) as u64
+}
+
+/// A state glyph as it is now (motion.md §6, §7): `Run` and `Workers`
+/// scan on the beat; `Needs` breathes from `breath` (the prompt's arrival)
+/// three times, then holds; a glyph that changed (`change`: when, and from
+/// what) writes on, draws its quads or (`fade`) cross-fades. Off: [`glyph::draw`].
+pub(crate) fn live_glyph(
+    fx: &Motion,
+    g: Glyph,
+    mark: Hsla,
+    ground: Hsla,
+    change: Option<(Instant, u64)>,
+    breath: Option<Instant>,
+    fade: bool,
+) -> AnyElement {
+    match g {
+        Glyph::Run | Glyph::Workers => glyph::scan(g, fx.beat(1), mark, ground),
+        Glyph::Needs => {
+            let step = breath.map(|t| fx.beats_since(t)).filter(|s| *s < motion::BREATH_BEATS * motion::BREATHS);
+            // Only a breath in progress asks for the beat: a held one is still.
+            glyph::breath(step.and_then(|s| fx.beat(1).map(|_| s)), mark, ground)
+        }
+        _ => match change.filter(|c| (c.1 as usize) < Glyph::ALL.len()) {
+            Some((at, prev)) => {
+                let p = if fade { fx.shot(Some(at), Duration::ZERO, motion::QUICK, &ease::INOUT, Mk::Fade) } else { fx.write_on(Some(at)) };
+                glyph::change(Some((Glyph::ALL[prev as usize], mark)), g, mark, ground, p, fade)
+            }
+            None => glyph::draw(g, mark),
+        },
+    }
+}
+
 /// A call's trail (design.md §8.1): its counts, its outcome's glyph and
 /// its word (none for ok, none in a tight pane; the glyph never drops).
 /// Nothing moves.
-fn outcome(row: &RowCache, (g, word, family): (Glyph, Option<&'static str>, Family), p: &Palette, m: &Metrics, lay: Layout) -> AnyElement {
-    let (text, mark) = glyph::ink(family, Ground::Run, p);
+fn outcome(
+    row: &RowCache,
+    (_, word, family): (Glyph, Option<&'static str>, Family),
+    mark: AnyElement,
+    p: &Palette,
+    m: &Metrics,
+    lay: Layout,
+) -> AnyElement {
+    let (text, _) = glyph::ink(family, Ground::Run, p);
     h_flex()
         .flex_none()
         .gap(px(8.))
@@ -1272,7 +1403,7 @@ fn outcome(row: &RowCache, (g, word, family): (Glyph, Option<&'static str>, Fami
         .whitespace_nowrap()
         // The ledger's committed counts: nothing unless the call succeeded.
         .children(row.counts.element(p))
-        .child(glyph::draw(g, mark))
+        .child(mark)
         .when_some(word.filter(|_| !lay.tight), |d, w| d.child(div().text_color(text).child(w)))
         .into_any_element()
 }

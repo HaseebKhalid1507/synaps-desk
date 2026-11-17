@@ -1,7 +1,7 @@
 //! Synaps Desktop (GPUI spike): a thin client for the Synaps daemon.
 //!
 //! ```text
-//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL|FILE]
+//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL|FILE] [--motion full|reduced|off]
 //! synaps-desktop --bench [--profile P --prompt TEXT] [--refresh-hz HZ]
 //! synaps-desktop --bench-tabs [--bench-history FILE] [--refresh-hz HZ]
 //! ```
@@ -17,6 +17,8 @@
 //! text size (Ctrl+= / Ctrl+- / Ctrl+0) and the open tabs (per daemon);
 //! `--bench` reads none of them.
 //! `--size`: the window's size in logical pixels (screenshots).
+//! Motion ([`motion`]): `$SYNAPS_NO_BOOT_FX` set turns it off, else
+//! `--motion` for this run, else the settings file, else the OS's.
 
 // serde_json's `json!` in the synthetic transport and its tests nests deep.
 #![recursion_limit = "256"]
@@ -35,6 +37,7 @@ mod glyph;
 mod mem;
 mod menu;
 mod model;
+mod motion;
 mod named;
 mod overlay;
 mod palettes;
@@ -86,6 +89,7 @@ fn main() {
     let mut open_picker = false;
     let mut window_size: Option<(f32, f32)> = None;
     let mut dash_flag: Option<String> = None;
+    let mut motion_flag: Option<String> = None;
     let mut args = std::env::args().skip(1);
     // A flag's value; another flag in its place is a usage error, not the value.
     let value = |args: &mut std::iter::Skip<std::env::Args>, flag: &str| match args.next() {
@@ -114,6 +118,7 @@ fn main() {
             "--refresh-hz" => refresh_hz = value(&mut args, "--refresh-hz").parse().ok(),
             "--accent" => accent = Some(value(&mut args, "--accent")),
             "--theme" => theme_flag = Some(value(&mut args, "--theme")),
+            "--motion" => motion_flag = Some(value(&mut args, "--motion")),
             "--session" => start_session = Some(value(&mut args, "--session")),
             "--accent-picker" => open_picker = true,
             "--dash" => {
@@ -139,7 +144,7 @@ fn main() {
             "-h" | "--help" => {
                 let names: Vec<&str> = palettes::THEMES.iter().map(|t| t.0).collect();
                 println!(
-                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL|FILE] [--bench [--prompt TEXT] [--refresh-hz HZ] | --bench-tabs [--bench-history FILE]]\n\
+                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL|FILE] [--motion full|reduced|off] [--bench [--prompt TEXT] [--refresh-hz HZ] | --bench-tabs [--bench-history FILE]]\n\
                      theme: --theme, else ${}, else the picker's settings file ({}), else `theme =` in the Synaps config, else {}\n\
                      themes: {}\n\
                      accent (overrides the theme's \"you\" and focus colours): --accent, else ${}, else the settings file, else none",
@@ -179,6 +184,12 @@ fn main() {
     if follows_config {
         warnings.extend(config_skipped);
     }
+    // Motion: the TUI's switch, the flag, the saved choice; a bench reads
+    // no saved setting (it measures the default).
+    let saved_motion = if bench { None } else { settings.as_deref().and_then(|p| theme::load_str(p, "motion")) };
+    let no_boot_fx = std::env::var(motion::ENV_NO_BOOT_FX).ok();
+    let (motion_setting, motion_warning) = motion::Setting::resolve(motion_flag.as_deref(), no_boot_fx.as_deref(), saved_motion.as_deref());
+    warnings.extend(motion_warning);
     for w in warnings {
         eprintln!("synaps-desktop: {w}");
     }
@@ -229,6 +240,10 @@ fn main() {
         diag::mark("app_run_callback");
         gpui_kit::init(cx);
         diag::mark("kit_init_done");
+        // After the kit read the OS's reduced-motion preference: a pinned
+        // level wins over it (the kit's own motion follows ours).
+        cx.set_global(motion_setting);
+        motion::Level::apply(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         fonts::register(cx);
         theme::apply(choice, cx);
