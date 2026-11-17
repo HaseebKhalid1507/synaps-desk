@@ -137,7 +137,8 @@ pub(crate) const CHIP_GAP: f32 = 8.;
 
 /// A chip's step, at most, and its name. The demo's steps run 20–36
 /// characters (median 31: `reading e2e/checkout/cart.spec.ts` is 33): at
-/// 36 they read whole (polish.md §2.5 said 32).
+/// 36 they read whole (polish.md §2.5 said 32) while every worker fits;
+/// a crowded tray cuts them shorter first ([`STEP_CAPS`]).
 pub(crate) const STEP_CHARS: usize = 36;
 pub(crate) const NAME_CHARS: usize = 18;
 /// A chip's clock slot: as wide as the widest it shows (`59m 59s`), so a
@@ -200,7 +201,7 @@ impl Chips {
 /// as drawn) takes the step's, the clock's and the ×'s room. No wider than
 /// the line (`line` px): the step gives way. With the least it may shrink
 /// to in a line's rest: its step cut at [`STEP_LEAST`].
-pub(crate) fn chip_w(r: &TrayRow, armed: bool, line: f32, confirm: f32, m: &Metrics) -> (f32, f32) {
+pub(crate) fn chip_w(r: &TrayRow, armed: bool, line: f32, confirm: f32, cap: usize, m: &Metrics) -> (f32, f32) {
     use crate::turns::text_w;
     let cw = m.meta * 0.6;
     let name = r.name.chars().count().min(NAME_CHARS);
@@ -213,7 +214,7 @@ pub(crate) fn chip_w(r: &TrayRow, armed: bool, line: f32, confirm: f32, m: &Metr
     }
     let fixed = base + if r.clocked() { 8. + text_w(CLOCK_CHARS, cw) } else { 0. } + if r.watchable { 8. + X_W } else { 0. };
     let room = (line - fixed - 8.).max(text_w(8, cw));
-    let step = chip_step(r).chars().count();
+    let step = chip_step(r).chars().count().min(cap);
     let w = fixed + 8. + text_w(step, cw).min(room);
     let least = fixed + 8. + text_w(step.min(STEP_LEAST), cw).min(room);
     (w.ceil(), least.ceil())
@@ -221,6 +222,31 @@ pub(crate) fn chip_w(r: &TrayRow, armed: bool, line: f32, confirm: f32, m: &Metr
 
 /// The least of a step a chip keeps when it shrinks into a line's rest.
 const STEP_LEAST: usize = 14;
+
+/// The step caps tried in turn: whole steps while every worker fits, then
+/// shorter ones before a worker goes into `+N more`.
+const STEP_CAPS: [usize; 3] = [STEP_CHARS, 24, 16];
+
+/// The step cap the chips are drawn at and the lines they take: the first
+/// of [`STEP_CAPS`] at which every chip fits the lines `lines(needed)`
+/// leaves (`widths(cap)`, `+N more` `more(n)` wide), else the shortest.
+pub(crate) fn fit_caps(
+    widths: impl Fn(usize) -> Vec<(f32, f32)>,
+    line: f32,
+    lines: impl Fn(usize) -> usize,
+    more: impl Fn(usize) -> f32,
+) -> (usize, usize) {
+    let mut pick = (STEP_CHARS, 0);
+    for cap in STEP_CAPS {
+        let ws = widths(cap);
+        let n = lines(chip_lines_needed(&ws, line, CHIP_GAP));
+        pick = (cap, n);
+        if chip_pack(&ws, line, CHIP_GAP, n, &more).1 == ws.len() {
+            break;
+        }
+    }
+    pick
+}
 
 /// A chip's step: what it does while it runs, else its state's word.
 fn chip_step(r: &TrayRow) -> &str {
@@ -410,7 +436,16 @@ impl AppView {
     /// need in the column (`avail` px) and, once [`crate::fit::chip_lines`]
     /// has said how many it has room for (`lines`), how they flow
     /// ([`AppView::chips`]).
-    pub(crate) fn chip_widths(&self, line: f32, confirm: f32, m: &Metrics) -> (Vec<Slot>, Vec<(f32, f32)>) {
+    /// Fits the chips into the column ([`fit_caps`]); the lines used.
+    pub(crate) fn fit_chips(&mut self, line: f32, confirm: f32, m: &Metrics, lines: impl Fn(usize) -> usize) -> usize {
+        let slots = self.tray_slots();
+        let (cap, n) = fit_caps(|cap| self.chip_widths(line, confirm, cap, m).1, line, lines, |k| more_w(k, m));
+        let (_, widths) = self.chip_widths(line, confirm, cap, m);
+        self.pack_chips(slots, &widths, line, n, m);
+        n
+    }
+
+    pub(crate) fn chip_widths(&self, line: f32, confirm: f32, cap: usize, m: &Metrics) -> (Vec<Slot>, Vec<(f32, f32)>) {
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
         let now = Instant::now();
         let slots = self.tray_slots();
@@ -420,9 +455,9 @@ impl AppView {
                 Slot::Row(i) => {
                     let r = &self.tray.rows[i];
                     let armed = session.is_some_and(|s| self.model.cancels.armed(s, r.id, (r.call.as_deref(), &r.name), now));
-                    chip_w(r, armed, line, confirm, m)
+                    chip_w(r, armed, line, confirm, cap, m)
                 }
-                Slot::Ghost(g) => chip_w(&self.tray.ghosts[g].1, false, line, confirm, m),
+                Slot::Ghost(g) => chip_w(&self.tray.ghosts[g].1, false, line, confirm, cap, m),
             })
             .collect();
         (slots, widths)
@@ -725,9 +760,10 @@ impl AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::{TrayRow, chip_lines_needed, chip_pack, cut};
+    use super::{CHIP_GAP, STEP_CHARS, TrayRow, chip_lines_needed, chip_pack, chip_w, cut, fit_caps};
     use crate::glyph::{self, Glyph};
     use crate::subagents::{Live, Liveness, Status};
+    use crate::theme::Metrics;
 
     fn live(status: Status, line: &str) -> Live {
         Live {
@@ -742,6 +778,23 @@ mod tests {
             watchable: true,
             demoted: false,
         }
+    }
+
+    /// Steps read whole while every worker fits; a crowded tray cuts them
+    /// shorter before a worker goes into `+N more`.
+    #[test]
+    fn a_crowded_tray_cuts_steps_before_hiding_workers() {
+        let m = Metrics::at(16);
+        let rows: Vec<TrayRow> = (0..6).map(|_| TrayRow::of(live(Status::Running, "reading e2e/checkout/cart.spec.ts"), false)).collect();
+        let (rows, m) = (&rows, &m);
+        let at = |k: usize| move |cap| rows[..k].iter().map(|r| chip_w(r, false, m.column, 60., cap, m)).collect::<Vec<_>>();
+        let more = |_| 50.;
+        assert_eq!(fit_caps(at(2), m.column, |n| n.min(2), more).0, STEP_CHARS, "two read whole");
+        let (cap, n) = fit_caps(at(6), m.column, |n| n.min(2), more);
+        assert!(cap < STEP_CHARS && n <= 2, "six in two lines: shorter steps ({cap}, {n})");
+        let shown = |cap| chip_pack(&at(6)(cap), m.column, CHIP_GAP, 2, more).1;
+        let (cut, whole) = (shown(cap), shown(STEP_CHARS));
+        assert!(cut > whole, "more workers shown: {cut} > {whole}");
     }
 
     /// Chips flow left to right in lines; past the lines they have, the
