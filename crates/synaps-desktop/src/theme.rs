@@ -530,7 +530,13 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.hair = f.at("hair", t.separator, ink, &[canvas, chrome], HAIR);
     r.edge = f.at("edge", t.border, ink, &[canvas, chrome, user], EDGE);
     r.frame = f.at("frame", t.border, ink, &[card, card_hi, canvas, chrome, tool_out], FRAME);
-    // Against a hovered row over its well too (paper's well is `tool_out`).
+    // A well's frame and header rule, floored on `tool_out` as well as the
+    // well and the canvas: a hovered row's `tool_out` fill sits 2·r over its
+    // well, and paper's well *is* `tool_out`, where a rule floored on the
+    // well alone drew nothing (finish gate r1: well and hovered row read as
+    // one grey L). So it reads heavier than `hair` in most themes (median
+    // 1.37:1 on the well; `hair` is ~1.16:1 on the canvas), on purpose: the
+    // wells are the only boxes in a run, and the design re-gate (r2) kept it.
     r.hair_w = f.at("hair_w", t.separator, ink, &[well, canvas, tool_out], HAIR);
     r.hair_t = f.at("hair_t", t.separator, ink, &[tool, tool_out, canvas], HAIR);
     r.edge_t = f.at("edge_t", t.border, ink, &[canvas, tool_out], EDGE);
