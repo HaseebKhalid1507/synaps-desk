@@ -80,26 +80,18 @@ fn ghost_tab(g: &Ghost, p: &Palette) -> AnyElement {
         .h_full()
         .overflow_hidden()
         .child(
-            h_flex()
-                .w(px(g.width))
-                .h_full()
-                .pl(px(34.))
-                .pr(px(34.))
-                .items_center()
-                .border_r_1()
-                .border_color(p.hair)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .when(g.named, |d| d.font_family(fonts::MONO).text_px(12.))
-                        .when(!g.named, |d| d.text_px(13.))
-                        .text_color(p.dim_ch)
-                        .child(g.label.clone()),
-                ),
+            h_flex().w(px(g.width)).h_full().pl(px(34.)).pr(px(34.)).items_center().border_r_1().border_color(p.hair).child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .when(g.named, |d| d.font_family(fonts::MONO).text_px(12.))
+                    .when(!g.named, |d| d.text_px(13.))
+                    .text_color(p.dim_ch)
+                    .child(g.label.clone()),
+            ),
         )
         .into_any_element()
 }
@@ -423,9 +415,14 @@ impl AppView {
             // While the indicator moves, its quads are the fill and bar.
             let lit = !(on && quads.is_some());
             let tab = self.render_tab(t.id, ix, (on, lit), t.kind, (st, worker), label, named, lay.width, p, cx);
-            row = row.child(if opening { div().flex_none().w(px(w)).h_full().overflow_hidden().child(tab).into_any_element() } else { tab.into_any_element() });
+            row = row.child(if opening {
+                div().flex_none().w(px(w)).h_full().overflow_hidden().child(tab).into_any_element()
+            } else {
+                tab.into_any_element()
+            });
         }
-        let needs = selected.and_then(|id| self.model.tabs.iter().find(|t| t.id == id)).is_some_and(|t| self.tab_state(t) == State::NeedsYou);
+        let needs =
+            selected.and_then(|id| self.model.tabs.iter().find(|t| t.id == id)).is_some_and(|t| self.tab_state(t) == State::NeedsYou);
         let quads = quads.map(|(qx, qw)| {
             div()
                 .absolute()
@@ -618,19 +615,19 @@ impl AppView {
             .border_color(p.hair)
             .cursor_pointer()
             .when_some(fill, |d, c| d.bg(c))
-            .when_some(bar, |d, (c, f)| {
-                d.child(div().absolute().top_0().left_0().w(px(((width - 1.) * f).max(0.))).h(px(2.)).bg(c))
-            })
-            .child(div().flex().flex_none().relative().top(px(dy)).child(match kind {
-                Kind::Settings => crate::views::gear(if on { p.you_bar } else { p.dim_ch }, None),
-                Kind::Usage => crate::views::bars_glyph(if on { p.you_bar } else { p.dim_ch }),
-                Kind::Session | Kind::Worker => div()
-                    .flex()
-                    .flex_none()
-                    .size(px(10.))
-                    .debug_selector(|| format!("tab {id} glyph"))
-                    .children(g.map(|g| glyph::draw(g, mark_color))),
-            }))
+            .when_some(bar, |d, (c, f)| d.child(div().absolute().top_0().left_0().w(px(((width - 1.) * f).max(0.))).h(px(2.)).bg(c)))
+            .child(
+                div().flex().flex_none().relative().top(px(dy)).child(match kind {
+                    Kind::Settings => crate::views::gear(if on { p.you_bar } else { p.dim_ch }, None),
+                    Kind::Usage => crate::views::bars_glyph(if on { p.you_bar } else { p.dim_ch }),
+                    Kind::Session | Kind::Worker => div()
+                        .flex()
+                        .flex_none()
+                        .size(px(10.))
+                        .debug_selector(|| format!("tab {id} glyph"))
+                        .children(g.map(|g| glyph::draw(g, mark_color))),
+                }),
+            )
             .child(
                 div()
                     .debug_selector(|| format!("tab {id} title"))

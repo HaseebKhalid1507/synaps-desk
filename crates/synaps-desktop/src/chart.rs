@@ -67,7 +67,8 @@ pub struct Reveal {
 
 impl Reveal {
     /// The whole reveal: the last column's start plus `slow`.
-    pub const SPAN: Duration = Duration::from_millis(crate::motion::SLOW.as_millis() as u64 + crate::motion::STAGGER_CAP.as_millis() as u64);
+    pub const SPAN: Duration =
+        Duration::from_millis(crate::motion::SLOW.as_millis() as u64 + crate::motion::STAGGER_CAP.as_millis() as u64);
 
     /// Column `i` of `n`'s drawn height (0..1).
     pub fn column(&self, i: usize, n: usize) -> f32 {
@@ -206,7 +207,9 @@ pub fn lines(
             }
             let mut clip = b;
             clip.size.width *= shown;
-            window.with_content_mask(Some(ContentMask { bounds: clip }), |window| paint_lines(b, &s, scale, &ink, &thin, dim_until, &paths, window));
+            window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+                paint_lines(b, &s, scale, &ink, &thin, dim_until, &paths, window)
+            });
         },
     )
     .size_full()
@@ -224,35 +227,35 @@ fn paint_lines(
     paths: &Paths,
     window: &mut Window,
 ) {
-            let n = s.days.len();
-            let step = b.size.width / n as f32;
-            let x_of = |i: usize| b.origin.x + step * (i as f32 + 0.5);
-            let y_of = |v: f64| b.origin.y + b.size.height * (1. - scale.at(v));
-            // A lone day is a dot (a quad, cheap): painted here each time.
-            for (si, l) in s.series.iter().enumerate() {
-                let thin = thin.get(si).copied().unwrap_or(false);
-                for i in 0..n {
-                    let alone = l.values[i].is_some() && (i == 0 || l.values[i - 1].is_none()) && (i + 1 == n || l.values[i + 1].is_none());
-                    if alone {
-                        let c = if dim_until.is_some_and(|d| i < d) { ink.grid } else { color_of(Stroke::Series(l.color, thin), ink) };
-                        let (x, y) = (x_of(i), y_of(l.values[i].unwrap_or(0.)));
-                        window.paint_quad(fill(Bounds::new(point(x - px(1.5), y - px(1.5)), size(px(3.), px(3.))), c));
-                    }
-                }
+    let n = s.days.len();
+    let step = b.size.width / n as f32;
+    let x_of = |i: usize| b.origin.x + step * (i as f32 + 0.5);
+    let y_of = |v: f64| b.origin.y + b.size.height * (1. - scale.at(v));
+    // A lone day is a dot (a quad, cheap): painted here each time.
+    for (si, l) in s.series.iter().enumerate() {
+        let thin = thin.get(si).copied().unwrap_or(false);
+        for i in 0..n {
+            let alone = l.values[i].is_some() && (i == 0 || l.values[i - 1].is_none()) && (i + 1 == n || l.values[i + 1].is_none());
+            if alone {
+                let c = if dim_until.is_some_and(|d| i < d) { ink.grid } else { color_of(Stroke::Series(l.color, thin), ink) };
+                let (x, y) = (x_of(i), y_of(l.values[i].unwrap_or(0.)));
+                window.paint_quad(fill(Bounds::new(point(x - px(1.5), y - px(1.5)), size(px(3.), px(3.))), c));
             }
-            let cached = paths.borrow().as_ref().filter(|(at, _)| *at == b.size).map(|(_, v)| v.clone());
-            let built = cached.unwrap_or_else(|| {
-                let v = build_lines(s, scale, thin, dim_until, b.size);
-                *paths.borrow_mut() = Some((b.size, v.clone()));
-                v
-            });
-            for (mut path, stroke) in built {
-                for v in &mut path.vertices {
-                    v.xy_position += b.origin;
-                }
-                path.bounds.origin += b.origin;
-                window.paint_path(path, color_of(stroke, ink));
-            }
+        }
+    }
+    let cached = paths.borrow().as_ref().filter(|(at, _)| *at == b.size).map(|(_, v)| v.clone());
+    let built = cached.unwrap_or_else(|| {
+        let v = build_lines(s, scale, thin, dim_until, b.size);
+        *paths.borrow_mut() = Some((b.size, v.clone()));
+        v
+    });
+    for (mut path, stroke) in built {
+        for v in &mut path.vertices {
+            v.xy_position += b.origin;
+        }
+        path.bounds.origin += b.origin;
+        window.paint_path(path, color_of(stroke, ink));
+    }
 }
 
 fn color_of(stroke: Stroke, ink: &Ink) -> Hsla {

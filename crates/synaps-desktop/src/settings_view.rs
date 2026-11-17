@@ -10,8 +10,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use gpui_kit::component::input::Input;
 use gpui_kit::component::{h_flex, v_flex};
@@ -100,13 +100,17 @@ const GROUPS: [&str; 7] = [
     "P L U G I N S",
 ];
 
+/// A shown value's hash, whether it was being sent, and when its save's
+/// afterglow begins.
+type Saved = (u64, bool, Option<Instant>);
+
 #[derive(Default)]
 pub(crate) struct SettingsUi {
     /// The find text, lowercase.
     pub find: String,
     /// Each value shown (by its control): what it was, whether it was being
     /// sent, and when its save's afterglow begins (motion.md §6.8).
-    pub saved: RefCell<HashMap<SharedString, (u64, bool, Option<Instant>)>>,
+    pub saved: RefCell<HashMap<SharedString, Saved>>,
     pub scroll: ScrollHandle,
     pub editing: Option<Edit>,
     /// The row whose whole help shows (by key).
@@ -431,7 +435,10 @@ impl AppView {
                         .when(i > 0, |d| d.border_l_1().border_color(p.edge))
                         .child(place)
                         // Selected (design.md §5): `raised` and a 2 px you bar on top.
-                        .when(on, |d| d.bg(p.raised).when(bar.is_none(), |d| d.child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(p.you_bar))))
+                        .when(on, |d| {
+                            d.bg(p.raised)
+                                .when(bar.is_none(), |d| d.child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(p.you_bar)))
+                        })
                         .cursor_pointer()
                         .when(!on, |d| d.hover(|d| d.bg(p.raised)))
                         .child(mono(o, 13., color))

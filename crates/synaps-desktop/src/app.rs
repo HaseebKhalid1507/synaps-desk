@@ -2459,7 +2459,10 @@ impl AppView {
             // one shows now and follows from it, without entering again
             // (fluid.md §3.10, motion.md §6.4).
             let now = self.fx.now();
-            let from = self.readout.take().or(self.readout_left.filter(|l| now.saturating_duration_since(l.1) < crate::motion::REPLACE).map(|l| l.0));
+            let from = self
+                .readout
+                .take()
+                .or(self.readout_left.filter(|l| now.saturating_duration_since(l.1) < crate::motion::REPLACE).map(|l| l.0));
             if let Some(old) = from.filter(|&k| k != key) {
                 let rail = &self.rail.rail;
                 let y = rail

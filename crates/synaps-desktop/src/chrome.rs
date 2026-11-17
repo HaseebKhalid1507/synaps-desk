@@ -350,7 +350,13 @@ impl AppView {
     pub(crate) fn render_tracer(&self, p: &Palette) -> Option<impl IntoElement + use<>> {
         let tr = self.tracer?;
         let to = tr.to?;
-        let t = self.fx.shot(Some(tr.at), std::time::Duration::ZERO, crate::motion::BASE, &crate::motion::ease::OUT, crate::motion::Kind::Spatial);
+        let t = self.fx.shot(
+            Some(tr.at),
+            std::time::Duration::ZERO,
+            crate::motion::BASE,
+            &crate::motion::ease::OUT,
+            crate::motion::Kind::Spatial,
+        );
         if t >= 1. {
             return None;
         }
@@ -447,7 +453,14 @@ impl AppView {
             // The state grammar (design.md §4.1): NEEDS YOU's glyph, or at rest the idle one.
             .child(if on { glyph::draw(glyph::Glyph::Needs, p.warn_mark_ch) } else { glyph::draw(glyph::Glyph::Idle, p.rest_mark) })
             // The count afterglows when it changes (motion.md §6.6).
-            .child(display(format!("{n}   {}", label::NEED_YOU), size::D_S, self.fx.glow(GLOW | 0xFFFF, n as u64, if on { p.warn_ch } else { p.dim_ch })).flex_none())
+            .child(
+                display(
+                    format!("{n}   {}", label::NEED_YOU),
+                    size::D_S,
+                    self.fx.glow(GLOW | 0xFFFF, n as u64, if on { p.warn_ch } else { p.dim_ch }),
+                )
+                .flex_none(),
+            )
             .when_some(first.filter(|_| fit.label > 0.), |d, s| d.child(cut(mono(s.label(), size::META, p.ink), fit.label)))
             .when_some(what.filter(|_| fit.gist > 0.), |d, w| d.child(cut(mono(w, size::META, p.dim_ch), fit.gist)))
             .when(n > 1, |d| d.child(mono(format!("+{}", n - 1), size::META, p.dim_ch).flex_none()))
@@ -550,7 +563,13 @@ impl AppView {
         let bar = gauge_color(ratio, p);
         let Some((prev, since)) = self.fx.changed(key, gauge_class(ratio)) else { return bar };
         let was = [p.focus_ch, p.run_mark_ch, p.err_mark_ch][prev.min(2) as usize];
-        let t = self.fx.shot(Some(since), std::time::Duration::ZERO, crate::motion::SLOW, &crate::motion::ease::INOUT, crate::motion::Kind::Fade);
+        let t = self.fx.shot(
+            Some(since),
+            std::time::Duration::ZERO,
+            crate::motion::SLOW,
+            &crate::motion::ease::INOUT,
+            crate::motion::Kind::Fade,
+        );
         crate::motion::mix(was, bar, t)
     }
 
@@ -1104,9 +1123,7 @@ impl AppView {
             .py(px(8.))
             .cursor_pointer()
             .when_some(fill, |d, c| d.bg(c))
-            .when_some(bar, |d, (c, f)| {
-                d.child(div().absolute().left_0().top_0().h(relative(f)).w(px(if in_tab { 1. } else { 2. })).bg(c))
-            })
+            .when_some(bar, |d, (c, f)| d.child(div().absolute().left_0().top_0().h(relative(f)).w(px(if in_tab { 1. } else { 2. })).bg(c)))
             .child(
                 h_flex().relative().top(px(dy)).gap(px(10.)).items_start().child(lead.mt(px(5.))).child(
                     v_flex()
@@ -1336,8 +1353,10 @@ impl AppView {
             .top_0()
             .left_0()
             .child(
-                deferred(anchored().offset(point(px(self.rail_width + 12. + dx), px(2. + dy))).child(crate::motion::appear(body, strength)))
-                    .with_priority(2),
+                deferred(
+                    anchored().offset(point(px(self.rail_width + 12. + dx), px(2. + dy))).child(crate::motion::appear(body, strength)),
+                )
+                .with_priority(2),
             )
             .into_any_element()
     }
