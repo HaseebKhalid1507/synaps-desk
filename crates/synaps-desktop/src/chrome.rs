@@ -14,6 +14,7 @@ use gpui_kit::component::tooltip::Tooltip;
 
 use crate::app::{AppView, EdgeDrag, STRIP, Side, ToggleRail, ToggleRight, count, display, mono, section, tbtn};
 use crate::fonts::{self, label};
+use crate::glyph::{self, Ground};
 use crate::model::{ConnState, Model};
 use crate::named::RowAction;
 use crate::rail::{self, Chip, Item, Rail, State};
@@ -40,12 +41,10 @@ pub(crate) const TOP_SHORT: f32 = 40.;
 const EDGE: f32 = 6.;
 /// The theme picker's narrowest width: two columns of theme names.
 const PICKER_MIN: f32 = 340.;
-/// The tab strip and the session header (full, and one row): a picker
-/// above the composer keeps below them and the top bar. The full one's
-/// clearance leaves out the header's 14-px bottom padding (the picker may
-/// cover that, not the title row or the state).
-const HEADER_CLEAR: f32 = crate::tabstrip::TAB_H + crate::fit::HEADER_FULL - 14.;
-const HEADER_CLEAR_SHORT: f32 = crate::tabstrip::TAB_H + crate::fit::HEADER_SHORT + 1.;
+/// The tab strip (full, and short): a picker above the composer keeps
+/// below it and the top bar.
+const TABS_CLEAR: f32 = crate::tabstrip::TAB_H;
+const TABS_CLEAR_SHORT: f32 = crate::tabstrip::TAB_H + 1.;
 
 /// The top bar's fixed words, measured in the faces they are drawn in.
 pub(crate) fn top_words(window: &Window) -> crate::fit::TopWords {
@@ -153,61 +152,33 @@ impl RailCache {
     }
 }
 
-/// A state's 10 px glyph: one or two axis-aligned rectangles, never a font
-/// glyph (the embedded fonts are subsets), in the state's theme role
-/// (rail recommendation, section 3): at rest, `muted`, lifted.
-pub(crate) fn glyph(st: State, p: &Palette) -> Div {
-    let at = |inset: f32| div().absolute().top(px(inset)).left(px(inset)).size(px(10. - 2. * inset));
-    let g = div().relative().size(px(10.)).flex_none();
-    let rest = p.rest_mark;
-    match st {
-        State::NeedsYou => g.child(at(0.).border_1().border_color(p.warn_mark_ch)).child(at(3.).bg(p.warn_mark_ch)),
-        State::Running => g.child(at(1.).bg(p.run_mark_ch)),
-        // Two small squares: work going on, not this session's own turn.
-        State::Workers => g
-            .child(div().absolute().top(px(1.)).left(px(1.)).size(px(4.)).bg(p.run_mark_ch))
-            .child(div().absolute().top(px(5.)).left(px(5.)).size(px(4.)).bg(p.run_mark_ch)),
-        State::Unread => g.child(at(3.).bg(p.unread_mark_ch)),
-        State::Idle => g.child(at(1.).border_1().border_color(rest)),
-        State::Parked => g.child(div().absolute().left(px(1.)).bottom(px(1.)).w(px(8.)).h(px(2.)).bg(rest)),
-        State::Opening => g.child(at(1.).border_t_1().border_l_1().border_color(p.focus_ch)),
-        State::Locked => {
-            g.child(at(1.).border_1().border_color(rest)).child(div().absolute().left(px(1.)).top(px(4.)).w(px(8.)).h(px(2.)).bg(rest))
-        }
-        State::Saved => g,
-    }
-}
-
-pub(crate) fn word_color(st: State, p: &Palette) -> Hsla {
-    match st {
-        State::NeedsYou => p.warn_ch,
-        State::Running | State::Workers => p.run_ch,
-        State::Unread => p.unread_ch,
-        State::Opening => p.open_ch,
-        _ => p.dim_ch,
-    }
-}
-
-/// What a top-bar ticker says about a prompt: the tool and the first line
-/// of what it will run or asks, from the daemon's confirm body
+/// What a top-bar ticker (and the NEEDS YOU stub) says about a prompt:
+/// the tool and what it will run or asks, from the daemon's confirm body
 /// (`Extension: …`, `Tool: …`, `Input that will run:`, `Message from …:`),
-/// else the body's first line that is not the closing question.
+/// else the body's first line that is not the closing question. A message
+/// that introduces a command (`… a command in ~/w:` then `$ cargo test`)
+/// says the command; a detail that names the tool itself is not prefixed
+/// with it again; a line that only introduces drops its colon.
 pub(crate) fn prompt_gist(title: &str, body: &str) -> String {
     let lines: Vec<&str> = body.lines().map(str::trim).collect();
     let tool = lines.iter().find_map(|l| l.strip_prefix("Tool: ")).filter(|t| !t.is_empty());
-    let after = |head: fn(&str) -> bool| lines.iter().skip_while(|l| !head(l)).skip(1).find(|l| !l.is_empty()).copied();
-    let detail =
+    let first_after = |at: usize| (at + 1..lines.len()).find(|&i| !lines[i].is_empty());
+    let after = |head: fn(&str) -> bool| lines.iter().position(|l| head(l)).and_then(first_after);
+    let at =
         after(|l| l == "Input that will run:").or_else(|| after(|l| l.starts_with("Message from ") && l.ends_with(':'))).or_else(|| {
             lines
                 .iter()
-                .copied()
-                .find(|l| !l.is_empty() && *l != "Allow this tool call?" && !l.starts_with("Extension: ") && !l.starts_with("Tool: "))
+                .position(|l| !l.is_empty() && *l != "Allow this tool call?" && !l.starts_with("Extension: ") && !l.starts_with("Tool: "))
         });
-    let text = match (tool, detail) {
-        (Some(t), Some(d)) => format!("{t}: {d}"),
-        (Some(t), None) => t.to_string(),
-        (None, Some(d)) => d.to_string(),
-        (None, None) => title.to_string(),
+    let command = at.filter(|&i| lines[i].ends_with(':')).and_then(first_after).and_then(|i| lines[i].strip_prefix("$ "));
+    let text = match (tool, at.map(|i| lines[i]), command) {
+        (Some(t), _, Some(c)) => format!("{t}: {c}"),
+        (None, _, Some(c)) => format!("$ {c}"),
+        (Some(t), Some(d), None) if d.split_whitespace().next() == Some(t) => d.trim_end_matches(':').to_string(),
+        (Some(t), Some(d), None) => format!("{t}: {}", d.trim_end_matches(':')),
+        (Some(t), None, None) => t.to_string(),
+        (None, Some(d), None) => d.trim_end_matches(':').to_string(),
+        (None, None, None) => title.to_string(),
     };
     crate::app::one_line(&text, 90)
 }
@@ -720,6 +691,9 @@ impl AppView {
     /// Its state is read per frame (the attached session runs ahead of the
     /// poll), its strings come from the cache; it never changes shape.
     fn render_row2(&self, r: usize, p: &Palette, cx: &Context<Self>) -> AnyElement {
+        // No readout under an open menu (a right-click's pointer rests on
+        // the row it opened from).
+        let menu_open = self.menu.is_some() || self.smenu.is_some();
         let row = &self.rail.rail.rows[r];
         let meta = row.live.and_then(|i| self.model.sessions.get(i));
         let st = meta.map(|s| self.model.state(s)).unwrap_or(row.state);
@@ -756,7 +730,7 @@ impl AppView {
                 .flex_none()
                 .items_baseline()
                 .gap(px(5.))
-                .child(display(w, 9.5, word_color(st, p)))
+                .child(display(w, 9.5, glyph::session_word(st, Ground::Chrome, p)))
                 .when(st == State::NeedsYou && waiting > 1, |d| d.child(mono(count(waiting), 10., p.warn_ch)))
                 .when(st == State::Workers, |d| d.child(mono(count(workers), 10., p.run_ch)))
         });
@@ -772,7 +746,7 @@ impl AppView {
             .hover(|d| d.bg(p.raised))
             .when_some(bar, |d, c| d.child(div().absolute().left_0().top_0().bottom_0().w(px(if in_tab { 1. } else { 2. })).bg(c)))
             .child(
-                h_flex().gap(px(10.)).items_start().child(glyph(st, p).mt(px(5.))).child(
+                h_flex().gap(px(10.)).items_start().child(glyph::session_mark(st, Ground::Chrome, p).mt(px(5.))).child(
                     v_flex()
                         .flex_1()
                         .min_w_0()
@@ -819,16 +793,18 @@ impl AppView {
                         ),
                 ),
             )
-            .when(self.readout == Some(key), |d| d.child(self.render_readout(row, p)))
+            .when(self.readout == Some(key) && !menu_open, |d| d.child(self.render_readout(row, p)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                 this.rail_click(key, crate::tabstrip::click_place(ev, cx));
                 cx.notify();
             }))
-            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+            .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 if ev.is_middle_click() {
                     this.rail_click(key, Place::New);
                     cx.notify();
+                } else if ev.is_right_click() {
+                    this.open_session_menu(crate::app::SessionAt::Row(key), ev.position(), window, cx);
                 }
             }))
             .into_any_element()
@@ -837,6 +813,9 @@ impl AppView {
     /// A HISTORY row: one fixed-height line, title and age, a mark only if
     /// it is unread (or being opened).
     fn render_hist(&self, r: usize, p: &Palette, cx: &Context<Self>) -> AnyElement {
+        // No readout under an open menu (a right-click's pointer rests on
+        // the row it opened from).
+        let menu_open = self.menu.is_some() || self.smenu.is_some();
         let row = &self.rail.rail.rows[r];
         let key = row.key;
         let title_color = match row.state {
@@ -855,7 +834,7 @@ impl AppView {
             .items_center()
             .cursor_pointer()
             .hover(|d| d.bg(p.raised))
-            .child(glyph(row.state, p))
+            .child(glyph::session_mark(row.state, Ground::Chrome, p))
             .child(
                 div()
                     .flex_1()
@@ -869,7 +848,7 @@ impl AppView {
                     .child(SharedString::from(&row.title)),
             )
             .child(mono(&row.age, 10., p.dim_ch))
-            .when(self.readout == Some(key), |d| d.child(self.render_readout(row, p)))
+            .when(self.readout == Some(key) && !menu_open, |d| d.child(self.render_readout(row, p)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(key, *hovered, cx)))
             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                 this.rail_click(key, crate::tabstrip::click_place(ev, cx));
@@ -1025,13 +1004,27 @@ impl AppView {
                     )))
                 },
             ))
+            // The session's folder (design.md §8.18): the paths under it are
+            // relative to it. Cut from the left, so its leaf stays.
+            .when_some(self.session_cwd(((width - 48.) / (12. * 0.6)).floor() as usize), |d, (cwd, whole)| {
+                d.child(
+                    mono(cwd, 12., p.prose_ch)
+                        .id("files-cwd")
+                        .mt(px(8.))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .tooltip(move |window, cx| Tooltip::new(whole.clone()).build(window, cx)),
+                )
+            })
             // Over a worker's view: still the session's thread's, not the
             // worker's on screen.
             .child(
                 match self.model.watch.focused() {
-                    Some(w) => mono(w.files_note.clone(), 9.5, p.dim_ch),
-                    None => mono("as the model asked: tool inputs, not the disk", 9.5, p.dim_ch),
+                    Some(w) => mono(w.files_note.clone(), 12., p.dim_ch),
+                    None => mono("as the model asked: tool inputs, not the disk", 12., p.dim_ch),
                 }
+                // At 12 px it is wider than a narrow pane: it wraps.
+                .whitespace_normal()
                 .mt(px(6.)),
             )
             .child(div().h(px(12.)));
@@ -1089,7 +1082,8 @@ impl AppView {
                         .child(display(label::VIA_SHELL, 10., p.prose_ch))
                         .child(mono("~", 11., p.dim_ch)),
                 )
-                .child(mono("bash commands that succeeded; no counts", 9.5, p.dim_ch).mt(px(6.)))
+                // The FILES note's size (design.md §8.18); it wraps.
+                .child(mono("bash commands that succeeded; no counts", 12., p.dim_ch).whitespace_normal().mt(px(6.)))
                 .child(div().h(px(8.)));
             for f in shell.iter().take(FILES_SHOWN) {
                 files = files.child(
@@ -1150,7 +1144,7 @@ impl AppView {
     /// tell them apart: canvas, `prompt_fg`, `claude_label`), then the
     /// accent override (THEME: none; the presets; a custom hex). Over the
     /// open right-hand column when it is wide enough, else above the
-    /// composer at the right: never over the header's NAME and HALT. It
+    /// composer at the right: never over the tab strip's `+`. It
     /// scrolls when the window is too short for it. A click applies and
     /// saves; Esc (the root's key handler) or a click outside closes it.
     pub(crate) fn render_picker(&self, p: &Palette, right: Side, cx: &Context<Self>) -> impl IntoElement {
@@ -1242,16 +1236,16 @@ impl AppView {
         let lifted = accent.is_some_and(|a| a != scheme.roles.you_bar || a != scheme.roles.focus);
         let (top, bottom) = (top_h(self.layout.short), 140.);
         // Over the open right panel, at least two columns of names wide,
-        // when that stays clear of the header's NAME and HALT (they end at
-        // the column's right edge); else above the composer, under the
-        // header.
+        // when that stays clear of the tab strip's `+` (it ends at the
+        // column's right edge); else above the composer, under the tab
+        // strip.
         let place = match right {
             Side::Open(w) if w.max(PICKER_MIN) - w + 8. <= self.layout.right => PickerAt::Top(w.max(PICKER_MIN)),
             _ => PickerAt::Bottom(right.width() + 24.),
         };
         let max_h = match place {
             PickerAt::Top(_) => self.height - top - 16.,
-            PickerAt::Bottom(_) => self.height - bottom - top - if self.layout.short { HEADER_CLEAR_SHORT } else { HEADER_CLEAR },
+            PickerAt::Bottom(_) => self.height - bottom - top - if self.layout.short { TABS_CLEAR_SHORT } else { TABS_CLEAR },
         };
         let body = v_flex()
             .flex_none()
@@ -1328,8 +1322,16 @@ mod tests {
 
     #[test]
     fn the_ticker_names_the_tool_and_what_it_runs() {
-        let body = "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n$ cargo test\n\nAllow this tool call?";
-        assert_eq!(prompt_gist("Confirm tool call", body), "bash: bash wants to run a command in ~/w:");
+        // The command the message introduces, not the introduction.
+        let body = "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n$ cargo test -p relay\n\nAllow this tool call?";
+        assert_eq!(prompt_gist("Confirm tool call", body), "bash: cargo test -p relay");
+        let crlf = body.replace('\n', "\r\n");
+        assert_eq!(prompt_gist("Confirm tool call", &crlf), "bash: cargo test -p relay", "a CRLF body reads the same");
+        // No command: the message, once named, with no dangling colon.
+        let bare = "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n\nAllow this tool call?";
+        assert_eq!(prompt_gist("Confirm tool call", bare), "bash wants to run a command in ~/w");
+        let other = "Extension: guard\nTool: edit\n\nMessage from guard:\nwrites outside the folder\n\nAllow this tool call?";
+        assert_eq!(prompt_gist("Confirm tool call", other), "edit: writes outside the folder");
         let rewritten = "Extension: a, b\nTool: edit\nInput rewritten by: b\nInput that will run:\n{\"path\": \"/w/x\"}\n\nMessage from a, b:\nok?\n\nAllow this tool call?";
         assert_eq!(prompt_gist("Confirm tool call", rewritten), "edit: {\"path\": \"/w/x\"}");
         assert_eq!(prompt_gist("Confirm tool activation", "Activate shell_start?"), "Activate shell_start?");

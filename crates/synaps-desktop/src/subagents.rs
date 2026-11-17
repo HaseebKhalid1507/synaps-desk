@@ -70,11 +70,13 @@ pub enum Status {
     TimedOut,
 }
 
-/// A worker's life as every surface shows it (design.md §4.3): its status
-/// and whether this window is attached to its session. Read by the
-/// transcript's worker block and the tray ([`crate::glyph::worker`]).
+/// A worker's life as every surface shows it (design.md §4.3): computed
+/// once from its status, whether this window is attached to its session,
+/// and whether its session knows it at all. Read by the transcript's worker
+/// block, the tray, the worker tab, the composer foot over its view, the
+/// hover card and the menus ([`crate::glyph::worker`] says its glyph and
+/// words).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum Liveness {
     /// Its start is all that is known.
     Started,
@@ -86,16 +88,18 @@ pub enum Liveness {
     TimedOut,
     /// Running when this window last looked (not attached now).
     LastSeen,
-    /// Its session has no word of it any more.
+    /// Its session has no word of it any more (or there is no daemon), or
+    /// its handle names another worker now.
     Gone,
 }
 
 impl Liveness {
     /// `None`: nothing but its handle is known yet (started). Not
     /// attached, a worker that was running is as last seen; how one ended
-    /// stays so.
-    pub fn of(status: Option<Status>, attached: bool) -> Self {
+    /// stays so. Not `known` to its session: gone.
+    pub fn of(status: Option<Status>, attached: bool, known: bool) -> Self {
         match status {
+            _ if !known => Liveness::Gone,
             None | Some(Status::Started) => Liveness::Started,
             Some(Status::Running | Status::Cancelling) if !attached => Liveness::LastSeen,
             Some(Status::Running) => Liveness::Running,
@@ -105,6 +109,50 @@ impl Liveness {
             Some(Status::Cancelled) => Liveness::Cancelled,
             Some(Status::TimedOut) => Liveness::TimedOut,
         }
+    }
+
+    /// A worker from its two sources: its session's list (`status`,
+    /// `attached`, `known` as for [`Liveness::of`]) and its view's own
+    /// word, polled from the daemon ([`Liveness::of_view`]). The list's,
+    /// but the view's when the list says no more than a start (the history
+    /// alone holds it, or a re-attach demoted a running worker until it is
+    /// heard again), and when the view says how it ended before the
+    /// session's stream does. A view gone (offline) says neither: the
+    /// list's start stands. Not attached, a running view is as last seen.
+    pub fn of_sources(status: Option<Status>, view: Option<Self>, attached: bool, known: bool) -> Self {
+        let view = view.map(|v| if v == Liveness::Running && !attached { Liveness::LastSeen } else { v });
+        match (status, view) {
+            (None, Some(v)) => v,
+            (Some(Status::Started), Some(v)) if v != Liveness::Gone => v,
+            (Some(s), Some(v)) if !s.terminal() && v.ended() && v != Liveness::Gone => v,
+            _ => Liveness::of(status, attached, known),
+        }
+    }
+
+    /// From a worker's view's own word ([`crate::watch::Worker::state`]),
+    /// for a worker its session's list does not say (`None`: nothing yet).
+    pub fn of_view(word: &str) -> Option<Self> {
+        Some(match word {
+            "running" => Liveness::Running,
+            "completed" => Liveness::Done,
+            "failed" => Liveness::Failed,
+            "cancelled" => Liveness::Cancelled,
+            "timed out" => Liveness::TimedOut,
+            "gone" | "offline" => Liveness::Gone,
+            _ => return None,
+        })
+    }
+
+    /// It will do nothing more: nothing to steer or cancel.
+    pub fn ended(self) -> bool {
+        matches!(self, Liveness::Done | Liveness::Failed | Liveness::Cancelled | Liveness::TimedOut | Liveness::Gone)
+    }
+
+    /// A cancel of it is on its way (`pending`): running (or started: a
+    /// re-attach says so of a running worker until it is heard again), it
+    /// is cancelling until its rows say how it stopped.
+    pub fn cancelling(self, pending: bool) -> Self {
+        if pending && matches!(self, Liveness::Running | Liveness::Started) { Liveness::Cancelling } else { self }
     }
 }
 
@@ -1411,7 +1459,7 @@ mod tests {
     }
     /// Its block's state word and family (attached).
     fn state(v: &View) -> (&'static str, Family) {
-        let (_, _, word, family) = glyph::worker(Liveness::of(v.status, true));
+        let (_, _, word, family) = glyph::worker(Liveness::of(v.status, true, true));
         (word, family)
     }
     /// `(state word, name, facts, line)` under call `id`.

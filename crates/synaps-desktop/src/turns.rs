@@ -750,9 +750,9 @@ pub(crate) struct Layout {
     pub hang: bool,
     /// Under 560 px: the gutter drops to 16, status words and hints go.
     pub tight: bool,
-    /// Under [`crate::fit::short_below`] tall (a 792-px window at 16 px,
-    /// more with larger text): a 40-px top bar, a one-row header, an 8-line
-    /// card well, less padding round the composer. Nothing in the list
+    /// Under [`crate::fit::short_below`] tall (a 700-px window at 16 px,
+    /// more with larger text): a 40-px top bar, an 8-line card well, less
+    /// padding round the composer. Nothing in the list
     /// changes, so it never remeasures for this.
     pub short: bool,
     /// Under [`crate::fit::cramped_below`] (short too): the card folds its
@@ -793,8 +793,8 @@ impl Layout {
         }
     }
 
-    /// The list's left and right padding (the header, card and composer
-    /// use the same, so their edges line up with the rows').
+    /// The list's left and right padding (the card, the tray and the
+    /// composer use the same, so their edges line up with the rows').
     pub(crate) fn padding(self) -> (f32, f32) {
         (self.left, self.right)
     }
@@ -1129,7 +1129,9 @@ impl AppView {
     /// numbers from 1 again); one that has is another worker's handle now,
     /// and the block does nothing.
     fn subagent_block(&self, v: &subagents::View, current: bool, p: &Palette, m: &Metrics, lay: Layout, cx: &Context<Self>) -> AnyElement {
-        let live = subagents::Liveness::of(v.status, self.model.active.is_some());
+        let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
+        let pending = session.zip(v.id).is_some_and(|(s, id)| self.model.cancels.pending_id(s, id));
+        let live = subagents::Liveness::of(v.status, session.is_some(), true).cancelling(pending);
         let (g, _, word, family) = glyph::worker(live);
         let (word_color, mark) = glyph::ink(family, Ground::Run, p);
         let ended = v.status.is_some_and(subagents::Status::terminal);
