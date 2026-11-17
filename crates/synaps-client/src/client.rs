@@ -390,6 +390,10 @@ pub enum Event {
         attach_seq: u64,
         session_id: String,
         seq: u64,
+        /// When the daemon sent it (its envelope's `ts`, RFC 3339; empty
+        /// if it had none): the time of the rows it starts
+        /// ([`crate::transcript::Transcript::apply_at`]).
+        ts: String,
         event: SessionEvent,
         raw: Arc<Value>,
     },
@@ -1486,7 +1490,7 @@ async fn session_loop(
                 }
                 frame = conn.recv() => match frame {
                     Ok(Some(DaemonFrame::Event(env))) => {
-                        let Envelope { session_id: esid, seq, event: mut v, .. } = env;
+                        let Envelope { session_id: esid, seq, ts, event: mut v } = env;
                         if let Some(m) = mirror.as_mut()
                             && is_message_history(&v)
                         {
@@ -1587,7 +1591,7 @@ async fn session_loop(
                             _ => {}
                         }
                         let ended = matches!(event, SessionEvent::Ended { .. });
-                        emit(&events, Event::Session { attach_seq, session_id: esid, seq, event, raw });
+                        emit(&events, Event::Session { attach_seq, session_id: esid, seq, ts, event, raw });
                         if ended {
                             unanswered(&events, attach_seq, &mut cancels, "the session ended before the daemon answered: look at the worker's row");
                             return Exit { session_id, reason: "session ended".into() };

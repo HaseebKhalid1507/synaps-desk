@@ -23,6 +23,9 @@ serde_json.workspace = true
 async-channel.workspace = true
 anyhow.workspace = true
 log = "0.4"
+# Message times in local time (the system's zone): already in the tree
+# through GPUI, with the same features.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 # GPUI's headless test window (`TestAppContext`) for the UI tests

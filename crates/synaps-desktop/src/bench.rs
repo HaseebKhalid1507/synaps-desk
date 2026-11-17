@@ -942,5 +942,5 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
 
 /// A synthetic event on the bench's local session (see `Model::set_local_session`).
 fn local_event(seq: u64, event: SessionEvent) -> Event {
-    Event::Session { attach_seq: LOCAL_SEQ, session_id: "bench".into(), seq, event, raw: Arc::new(Value::Null) }
+    Event::Session { attach_seq: LOCAL_SEQ, session_id: "bench".into(), seq, ts: String::new(), event, raw: Arc::new(Value::Null) }
 }

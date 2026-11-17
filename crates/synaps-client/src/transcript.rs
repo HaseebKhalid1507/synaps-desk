@@ -16,6 +16,7 @@
 //! the old/new lengths, so the UI remeasures only the rows that changed.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -26,6 +27,15 @@ use crate::protocol::*;
 const PREVIEW_MAX: usize = 4 * 1024;
 /// How far ahead id reuse looks for a row of the same kind.
 const REUSE_LOOKAHEAD: usize = 8;
+/// The host's record time of a history message (agent-core
+/// `session_journal::MESSAGE_AT_KEY`): RFC 3339, UTC, whole seconds. Only
+/// new messages carry it; a legacy one has none.
+pub const MESSAGE_AT_KEY: &str = "_synaps_at";
+
+/// When a history message was recorded ([`MESSAGE_AT_KEY`]), if it was.
+pub fn message_at(m: &Value) -> Option<&str> {
+    m.get(MESSAGE_AT_KEY).and_then(Value::as_str).filter(|s| !s.is_empty())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -197,6 +207,13 @@ pub struct Item {
     pub text: String,
     pub tool: Option<ToolCall>,
     pub streaming: bool,
+    /// When it happened, RFC 3339: a history row's message time
+    /// ([`message_at`]); a live row's, the `ts` of the event that started it
+    /// ([`Transcript::apply_at`], an attach's replay), until its history
+    /// form brings the message time (a history form without one keeps it).
+    /// `None`: no recorded time (legacy history, a row fed without one),
+    /// never "now". Not part of `rev`: read it when drawing.
+    pub at: Option<Arc<str>>,
     /// `Some(n)`: a client-side row (notice, error), not part of the
     /// history, shown after the first `n` history messages.
     anchor: Option<usize>,
@@ -268,6 +285,9 @@ pub struct Transcript {
     /// No notices for subagent starts and ends (a UI that shows the
     /// workers itself): [`Transcript::set_subagent_notices`].
     no_subagent_notices: bool,
+    /// The time new rows get ([`Item::at`]): the message being folded's,
+    /// or the event being applied's.
+    stamp: Option<Arc<str>>,
 }
 
 impl Transcript {
@@ -355,7 +375,7 @@ impl Transcript {
         if let Some(t) = &tool {
             self.tools.insert(t.tool_id.clone(), ix);
         }
-        self.items.push(Item { id, rev, kind, text, tool, streaming, anchor: None });
+        self.items.push(Item { id, rev, kind, text, tool, streaming, at: self.stamp.clone(), anchor: None });
         self.mark(ix);
         ix
     }
@@ -407,12 +427,19 @@ impl Transcript {
         }
         let before: HashMap<u64, Item> = std::mem::take(&mut self.before).into_iter().map(|i| (i.id, i)).collect();
         for it in self.items.iter_mut().filter(|i| i.anchor.is_none()) {
-            if let Some(o) = before.get(&it.id)
-                && o.kind == it.kind
-                && o.streaming == it.streaming
-                && o.text == it.text
-                && o.tool == it.tool
-            {
+            let Some(o) = before.get(&it.id) else { continue };
+            // A live row's time stays when its history form has none (a
+            // daemon that records no message times). Only its own form's:
+            // a swapped conversation reuses ids for other messages.
+            let same = match (&o.tool, &it.tool) {
+                (Some(a), Some(b)) => a.tool_id == b.tool_id,
+                (None, None) => o.text == it.text,
+                _ => false,
+            };
+            if it.at.is_none() && o.kind == it.kind && same {
+                it.at = o.at.clone();
+            }
+            if o.kind == it.kind && o.streaming == it.streaming && o.text == it.text && o.tool == it.tool {
                 it.rev = o.rev;
             }
         }
@@ -439,7 +466,7 @@ impl Transcript {
         self.busy = a.streaming;
         for env in &a.replay {
             if let Ok(ev) = env.decode() {
-                self.apply(&ev);
+                self.apply_at(&ev, &env.ts);
             }
         }
         if !a.streaming {
@@ -559,6 +586,12 @@ impl Transcript {
     }
 
     fn fold_message(&mut self, m: &Value, reuse: &mut Reuse) {
+        let outer = std::mem::replace(&mut self.stamp, message_at(m).map(Arc::from));
+        self.fold_blocks(m, reuse);
+        self.stamp = outer;
+    }
+
+    fn fold_blocks(&mut self, m: &Value, reuse: &mut Reuse) {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
         let content = m.get("content").unwrap_or(&Value::Null);
         match (role, content) {
@@ -670,6 +703,18 @@ impl Transcript {
     /// it is a drained event's payload, `<event …>`: its parent's
     /// business); a failure is an error row with its category.
     pub fn apply_watch(&mut self, ev: &WatchEvent) {
+        self.apply_watch_at(ev, "");
+    }
+
+    /// [`Transcript::apply_watch`] of an entry recorded at `at` (RFC 3339;
+    /// empty: unknown): the rows it starts carry it ([`Item::at`]).
+    pub fn apply_watch_at(&mut self, ev: &WatchEvent, at: &str) {
+        self.stamp = (!at.is_empty()).then(|| Arc::from(at));
+        self.watch_event(ev);
+        self.stamp = None;
+    }
+
+    fn watch_event(&mut self, ev: &WatchEvent) {
         match ev {
             WatchEvent::Steered { text } if !text.trim_start().starts_with("<event") => {
                 self.end_streaming_text();
@@ -727,6 +772,18 @@ impl Transcript {
 
     /// Apply one live session event.
     pub fn apply(&mut self, ev: &SessionEvent) {
+        self.apply_at(ev, "");
+    }
+
+    /// [`Transcript::apply`] of an event sent at `ts` (its envelope's, RFC
+    /// 3339; empty: unknown): the rows it starts carry it ([`Item::at`]).
+    pub fn apply_at(&mut self, ev: &SessionEvent, ts: &str) {
+        self.stamp = (!ts.is_empty()).then(|| Arc::from(ts));
+        self.apply_event(ev);
+        self.stamp = None;
+    }
+
+    fn apply_event(&mut self, ev: &SessionEvent) {
         match ev {
             SessionEvent::TurnStarted { user_text, .. } => {
                 self.busy = true;

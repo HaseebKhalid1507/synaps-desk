@@ -27,8 +27,8 @@
 //!                 client.resync()?;
 //!             }
 //!         }
-//!         Event::Session { event, raw, .. } => {
-//!             transcript.apply(&event); // `raw` has every field the mirror drops
+//!         Event::Session { event, ts, raw, .. } => {
+//!             transcript.apply_at(&event, &ts); // `raw` has every field the mirror drops
 //!         }
 //!         Event::Error { error, .. } => eprintln!("{error}"), // typed: Refused, Daemon, ...
 //!         Event::Detached { reason, .. } => eprintln!("detached: {reason}"),

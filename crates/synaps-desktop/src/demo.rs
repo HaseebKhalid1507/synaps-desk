@@ -18,6 +18,28 @@ pub(crate) const SID: &str = "20261113-041207-a1f0";
 /// A parked session whose turns are over: runs that fold (one with a
 /// failed call, one all ok), an edit's diff in each.
 pub(crate) const IDLE_CPU: &str = "20261113-161706-a1b9";
+/// A session from before message times: its history has none.
+pub(crate) const LEGACY: &str = "20261111-201530-0a6e";
+
+/// Message times (`_synaps_at`) on a demo history, as the host records
+/// them: from the local wall time in the session's id on, `step` seconds
+/// apart; from message `resumed` on (a session taken up again), the next
+/// morning at 09:12. Fixed local times: the same rows and day lines on any
+/// machine, at any hour.
+fn stamp(msgs: &mut [Value], id: &str, step: i64, resumed: Option<usize>) {
+    use chrono::{Duration, NaiveDateTime, NaiveTime, SecondsFormat, TimeZone as _, Utc};
+    let Some(start) = id.get(..15).and_then(|s| NaiveDateTime::parse_from_str(s, "%Y%m%d-%H%M%S").ok()) else { return };
+    let next = (start.date() + Duration::days(1)).and_time(NaiveTime::from_hms_opt(9, 12, 0).unwrap_or_default());
+    for (k, m) in msgs.iter_mut().enumerate() {
+        let at = match resumed {
+            Some(r) if k >= r => next + Duration::seconds(step * (k - r) as i64),
+            _ => start + Duration::seconds(step * k as i64),
+        };
+        if let (Some(t), Some(m)) = (chrono::Local.from_local_datetime(&at).earliest(), m.as_object_mut()) {
+            m.insert("_synaps_at".into(), json!(t.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Secs, true)));
+        }
+    }
+}
 
 /// RFC 3339 (UTC) of `secs` after the epoch.
 pub(crate) fn rfc3339(secs: i64) -> String {
@@ -492,6 +514,11 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
     }
     if id == IDLE_CPU {
         msgs = idle_cpu();
+        // Its last turn the next morning: a day line above it.
+        let last = msgs.iter().rposition(|m| m["role"] == "user" && m["content"].is_string());
+        stamp(&mut msgs, id, 25, last);
+    } else if id != LEGACY {
+        stamp(&mut msgs, id, 45, None);
     }
     let prompts: Vec<Value> = (1..=m.awaiting_input as u64)
         .map(|i| {
@@ -513,7 +540,8 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
 
 fn attach_sid(attach_seq: u64) -> Vec<Event> {
     let mut out = Vec::new();
-    let msgs = messages();
+    let mut msgs = messages();
+    stamp(&mut msgs, SID, 40, None);
     let attached = json!({"type": "attached", "client": 2,
         "meta": {"id": SID, "name": "relay-refresh", "title": "Refresh race in session relay", "model": "anthropic/claude-opus-4-1", "cwd": CWD,
             "lifecycle": "live", "busy": true, "awaiting_input": 1},
@@ -539,7 +567,7 @@ fn attach_sid(attach_seq: u64) -> Vec<Event> {
             "model": "anthropic/claude-sonnet-4-5"}]});
     for (seq, raw) in [(1, usage), (2, subagents)] {
         if let Ok(event) = decode_event(&raw) {
-            out.push(Event::Session { attach_seq, session_id: SID.into(), seq, event, raw: Arc::new(raw) });
+            out.push(Event::Session { attach_seq, session_id: SID.into(), seq, ts: String::new(), event, raw: Arc::new(raw) });
         }
     }
     out
