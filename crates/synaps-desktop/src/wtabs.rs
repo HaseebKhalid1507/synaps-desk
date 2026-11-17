@@ -559,7 +559,9 @@ impl AppView {
             return Some(Liveness::Gone);
         }
         let status = id.and_then(|id| subs.status(id));
-        let view = watch.view_state(handle).and_then(Liveness::of_view);
+        // Its view's word only if the view is of the worker the handle names
+        // now: a stale view of an earlier worker under it says nothing of this one.
+        let view = watch.worker(handle).filter(|w| now.is_none_or(|n| same_worker(w.key(), n))).and_then(|w| Liveness::of_view(w.state()));
         let live = Liveness::of_sources(status, view, attached, !attached || now.is_some() || status.is_some());
         Some(live.cancelling(self.model.cancels.pending(session, handle)))
     }

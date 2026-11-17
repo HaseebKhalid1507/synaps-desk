@@ -693,6 +693,78 @@ fn a_reattach_leaves_a_running_worker_running(cx: &mut TestAppContext) {
     assert_eq!(tab, Some(crate::subagents::Liveness::Running), "its tab: running too");
 }
 
+/// Shady N1: scout (sa_1) ended in a worker tab left in the background
+/// (not polled: its view still says completed); a cold-started daemon
+/// gave sa_1 to builder, running. Scout's stale view says nothing of
+/// builder: its state is RUNNING (the tray row, its menu, its hover card),
+/// and its menu's Cancel and its × cancel it.
+#[gpui_kit::test]
+fn a_stale_view_under_a_reused_handle_says_nothing_of_its_worker(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    let session = view.update(cx, |v, cx| {
+        let r = v.tray.rows.iter().find(|r| r.id == 1).expect("scout's tray row");
+        let scout = crate::wtabs::Who::new(1, r.name.clone(), r.call.clone());
+        v.open_worker_tab(&scout, cx);
+        assert_eq!(v.model.tabs.current_worker().map(|t| t.handle.as_str()), Some("sa_1"), "scout in a tab");
+        let s = v.model.watch.focused_mut().expect("scout's view");
+        s.gone = None;
+        s.status = "completed".into();
+        v.focus_tab(0);
+        cx.notify();
+        v.model.tabs.current_session().map(str::to_string).expect("the session")
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(v.model.watch.focus().is_none(), "back on the session's thread");
+        assert_eq!(v.model.watch.worker("sa_1").map(|w| w.state()), Some("completed"), "scout's view kept, ended");
+    });
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.append(&[
+            serde_json::json!({"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_new", "name": "subagent_start",
+                "input": {"agent": "builder", "task": "build it"}}]}),
+            serde_json::json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_new",
+                "content": "{\"agent_name\":\"builder\",\"handle_id\":\"sa_1\",\"status\":\"running\"}"}]}),
+        ]);
+        // Its live row: running (the history alone says started).
+        let row = serde_json::json!({"ev": "subagent_rows", "rows": [{"subagent_id": 1, "agent_name": "builder", "status": "running",
+            "cancel_requested": false, "elapsed_secs": 3.0, "finished_elapsed": null, "step": "cargo build", "tools": 1}]});
+        v.model.stats.subagents.on_session(&synaps_client::protocol::decode_event(&row).expect("a rows event"));
+        assert_eq!(v.model.stats.subagents.status(1), Some(crate::subagents::Status::Running), "the list: builder runs");
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let builder = view.read_with(cx, |v, _| {
+        let (call, name) = v.model.stats.subagents.ident(1).expect("sa_1 named");
+        assert_eq!(name, "builder");
+        crate::wtabs::Who::new(1, name.to_string(), call.map(|c| c.to_string().into()))
+    });
+    let state = view.read_with(cx, |v, _| v.worker_state(&session, "sa_1", Some(builder.key())));
+    assert_eq!(state, Some(crate::subagents::Liveness::Running), "builder runs, whatever scout's view said");
+    // Its menu (and hover card) read the same: Cancel and Steer can act.
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            let t = crate::wtabs::Target { session: session.clone(), who: builder.clone(), tab: None };
+            v.open_menu(t, crate::menu::At::Point(gpui_kit::point(px(700.), px(500.))), false, window, cx);
+        })
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        let (m, _) = v.menu.as_ref().expect("builder's menu");
+        let cancel = m.items.iter().find(|i| i.act == Act::Cancel).expect("a Cancel item");
+        assert_eq!(cancel.why_not, None, "Cancel can act: {}", cancel.label);
+    });
+    view.update(cx, |v, cx| {
+        v.close_menu();
+        v.press_cancel(&session, &builder, crate::menu::How::Click(1), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.watch_note, None, "the × was not refused");
+        assert!(v.model.cancels.armed(&session, 1, builder.key(), std::time::Instant::now()), "its cancel armed");
+    });
+}
+
 /// The other demo session in a tab, attached (with no client, the
 /// synthetic transport answers its attach).
 fn open_idle_cpu(cx: &mut TestAppContext, view: &Entity<AppView>, place: crate::tabs::Place) {

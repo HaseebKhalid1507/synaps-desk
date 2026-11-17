@@ -479,7 +479,6 @@ impl Watch {
         self.focused().map(|w| (w.handle_id.as_str(), w.generation))
     }
 
-    #[cfg(test)]
     pub fn worker(&self, handle_id: &str) -> Option<&Worker> {
         self.workers.get(handle_id)
     }
@@ -487,11 +486,6 @@ impl Watch {
     /// What it keeps, roughly (bytes).
     pub fn bytes(&self) -> usize {
         self.workers.values().map(Worker::bytes).sum()
-    }
-
-    /// Worker `handle_id`'s view's word ([`Worker::state`]), if it has one.
-    pub fn view_state(&self, handle_id: &str) -> Option<&str> {
-        self.workers.get(handle_id).map(Worker::state)
     }
 
     /// The workers on offer, oldest first: `running` (the tray's running
@@ -1114,7 +1108,7 @@ mod tests {
         w.on_reply("sa_2", since, WatchReply::Gone("no subagent sa_2 in this session".into()), t0);
         let v = w.focused().unwrap();
         assert!(v.read_only() && v.state() == "gone");
-        assert_eq!(w.view_state("sa_2"), Some("gone"));
+        assert_eq!(w.worker("sa_2").map(Worker::state), Some("gone"));
         assert!(matches!(w.steer_target(), Some(Err(_))));
     }
 
