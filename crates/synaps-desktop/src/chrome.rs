@@ -318,6 +318,32 @@ impl AppView {
         }
     }
 
+    /// The link's signatures over the whole window, never in its way
+    /// (motion.md §5.1, §5.3): the tear's three lines (2, 1 and 3 px in
+    /// `err_mark_ch`, at heights hashed from the drop's time and the
+    /// frame), or the Scan's 1 px `run_mark_ch` line with its 48 px trail
+    /// of four bands of `run` (alpha .10, .07, .04, .02) above it.
+    pub(crate) fn render_link(&mut self, tear: Option<usize>, p: &Palette) -> Option<impl IntoElement + use<>> {
+        let h = self.height.max(1.);
+        let mut out = div().absolute().top_0().left_0().size_full();
+        if let (Some(frame), Some(at)) = (tear, self.link.glitch) {
+            let seed = vhash(&format!("{at:?}{frame}"));
+            for (i, thick) in [2., 1., 3.].into_iter().enumerate() {
+                let y = ((seed >> (i * 16)) & 0xFFFF) as f32 / 65535. * (h - 3.);
+                out = out.child(div().absolute().left_0().right_0().top(px(y.floor())).h(px(thick)).bg(p.err_mark_ch));
+            }
+            return Some(deferred(out).with_priority(5));
+        }
+        let t = self.link.scan(&self.fx)?;
+        let y = (t * (h + 48.)).floor();
+        for (i, a) in [0.10, 0.07, 0.04, 0.02].into_iter().enumerate() {
+            let top = y - 12. * (i as f32 + 1.);
+            out = out.child(div().absolute().left_0().right_0().top(px(top)).h(px(12.)).bg(Hsla { a, ..p.run }));
+        }
+        out = out.child(div().absolute().left_0().right_0().top(px(y)).h(px(1.)).bg(p.run_mark_ch));
+        Some(deferred(out).with_priority(5))
+    }
+
     pub(crate) fn render_top(&self, p: &Palette, rail: Side, cx: &Context<Self>) -> impl IntoElement {
         let n = self.model.attention().count();
         let first = self.model.ticker();
@@ -436,7 +462,7 @@ impl AppView {
                     .flex_none()
                     .gap(px(18.))
                     .items_center()
-                    .when(fit.conn > 0., |d| d.child(cut(mono(conn, size::META, conn_color), fit.conn)))
+                    .when(fit.conn > 0., |d| d.child(cut(mono(conn, size::META, conn_color), fit.conn).relative().top(px(self.conn_dy))))
                     // The theme picker's own control: a swatch of the "you" colour.
                     .child(
                         h_flex()

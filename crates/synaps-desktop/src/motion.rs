@@ -432,6 +432,86 @@ pub(crate) enum Kind {
     Decay,
 }
 
+/// The link's signatures (§5.1 Scan, §5.3 Glitch), never offline: up
+/// last frame (none: not seen yet), when the Scan began, when the link
+/// dropped (the tear, then the drain, held while down), when it came back
+/// (the drain restoring).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Link {
+    pub up: Option<bool>,
+    pub scan: Option<Instant>,
+    pub glitch: Option<Instant>,
+    pub restore: Option<Instant>,
+}
+
+/// The tear's two frames (§5.3): 60 ms, then 40.
+pub(crate) const TEAR: [Duration; 2] = [Duration::from_millis(60), Duration::from_millis(40)];
+
+impl Link {
+    /// The connection is `up` this frame, at `now`, under `level`: what
+    /// came up scans (Full), what dropped glitches (Full, Reduced), what
+    /// came back restores.
+    pub(crate) fn see(&mut self, up: bool, now: Instant, level: Level) {
+        match (self.up.replace(up), up) {
+            (Some(false) | None, true) => {
+                self.scan = (level == Level::Full).then_some(now);
+                if self.glitch.take().is_some() {
+                    self.restore = (level != Level::Off).then_some(now);
+                }
+            }
+            (Some(true), false) => {
+                self.glitch = (level != Level::Off).then_some(now);
+                (self.scan, self.restore) = (None, None);
+            }
+            _ => {}
+        }
+        if level == Level::Off {
+            *self = Link { up: self.up, ..Link::default() };
+        }
+    }
+
+    /// The tear's frame now (0, 1), if one is on: Full only.
+    pub(crate) fn tear(&self, fx: &Motion) -> Option<usize> {
+        let g = self.glitch.filter(|_| fx.level() == Level::Full)?;
+        let gone = fx.now().saturating_duration_since(g);
+        if gone < TEAR[0] {
+            fx.want_at(g + TEAR[0]);
+            Some(0)
+        } else if gone < TEAR[0] + TEAR[1] {
+            fx.want_at(g + TEAR[0] + TEAR[1]);
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    /// How drained the palette is (0..1): from the end of the tear over
+    /// `slow` `inout` (Reduced: no tear, `quick`), held while down; back
+    /// over the same once up again.
+    pub(crate) fn drain(&mut self, fx: &Motion) -> f32 {
+        if let Some(g) = self.glitch {
+            let tear = if fx.level() == Level::Full { TEAR[0] + TEAR[1] } else { Duration::ZERO };
+            return fx.shot(Some(g), tear, SLOW, &ease::INOUT, Kind::Fade);
+        }
+        let Some(r) = self.restore else { return 0. };
+        let k = 1. - fx.shot(Some(r), Duration::ZERO, SLOW, &ease::INOUT, Kind::Fade);
+        if k <= 0. {
+            self.restore = None;
+        }
+        k
+    }
+
+    /// The Scan's line, 0..1 down the window (`sig` `out`), while it runs.
+    pub(crate) fn scan(&mut self, fx: &Motion) -> Option<f32> {
+        let t = fx.shot(self.scan, Duration::ZERO, SIG, &ease::OUT, Kind::Spatial);
+        if t >= 1. {
+            self.scan = None;
+            return None;
+        }
+        Some(t)
+    }
+}
+
 /// What an element remembers of a value between frames ([`Motion::change`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Tag {
