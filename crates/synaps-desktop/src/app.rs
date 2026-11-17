@@ -51,10 +51,15 @@ pub(crate) struct RowCache {
     /// succeeded), and as shown.
     pub(crate) delta: Option<files::CallDelta>,
     pub(crate) counts: turns::Counts,
+    /// The row's card parts (polish.md §2.1): its verb, a path target split
+    /// in two, the meta facts and the well's header and numbered lines.
+    pub(crate) card: turns::Card,
     /// The item's time ([`Item::at`], which is not in `rev`), and read in
     /// the local zone: parsed once here, never per frame or per sync.
     at: Option<Arc<str>>,
     pub(crate) time: Option<crate::times::Stamp>,
+    /// The same instant in UTC: a running call's clock counts from it.
+    pub(crate) started: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl RowCache {
@@ -63,12 +68,14 @@ impl RowCache {
         if self.at != item.at {
             self.at = item.at.clone();
             self.time = item.at.as_deref().and_then(crate::times::Stamp::local);
+            self.started =
+                item.at.as_deref().and_then(|a| chrono::DateTime::parse_from_rfc3339(a).ok()).map(|t| t.with_timezone(&chrono::Utc));
         }
     }
 }
 
 /// Result lines an open tool row shows.
-const RESULT_LINES: usize = 12;
+pub(crate) const RESULT_LINES: usize = 12;
 /// Background tabs whose transcript and rows are kept (switching back to
 /// one shows it at once, then its attach brings it up to date), at most
 /// this many and this many bytes (estimated, [`TabCache::bytes`]).
@@ -5516,8 +5523,10 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
         preview: None,
         delta: None,
         counts: turns::Counts::default(),
+        card: turns::Card::default(),
         at: None,
         time: None,
+        started: None,
     };
     r.retime(item);
     match item.kind {
@@ -5542,10 +5551,12 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
             let lines: Vec<&str> = t.result.lines().collect();
             r.result_more = lines.len().saturating_sub(RESULT_LINES);
             r.result = lines.iter().take(RESULT_LINES).copied().collect::<Vec<_>>().join("\n").into();
+            r.card = turns::Card::of(t, r.preview.as_deref(), &r.arg);
         }
         ItemKind::Thinking => {
             r.text = item.text.clone().into();
             r.arg = one_line(&item.text, 200).into();
+            r.card.verb = "think".into();
         }
         // A subagent's completion event: as the TUI says it.
         ItemKind::Notice => r.text = crate::subagents::completion_note(&item.text).unwrap_or_else(|| item.text.clone()).into(),

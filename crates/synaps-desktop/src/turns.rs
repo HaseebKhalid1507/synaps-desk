@@ -603,6 +603,173 @@ impl Counts {
     }
 }
 
+/// A tool's verb (polish.md §2.1a): lowercase mono machine words, the same
+/// in the row, its tooltip and the folded tally. `multi_edit` is an edit,
+/// a worker's start a `spawn`, another `subagent_*` its suffix, an MCP
+/// tool (`ext__server__tool`) a `tool` with its `[server]` in the meta.
+/// The full name is the tooltip's when the verb is not it.
+pub(crate) fn verb_of(name: &str) -> (SharedString, Option<SharedString>) {
+    match name {
+        "multi_edit" => ("edit".into(), None),
+        "subagent_start" | "subagent" => ("spawn".into(), None),
+        n if n.starts_with("subagent_") => (n["subagent_".len()..].to_string().into(), None),
+        n if n.starts_with("ext__") => {
+            let server = n["ext__".len()..].split("__").next().filter(|s| !s.is_empty());
+            ("tool".into(), server.map(|s| format!("[{s}]").into()))
+        }
+        n => (n.to_string().into(), None),
+    }
+}
+
+/// The verb column holds 8 characters and a space: a longer verb is cut
+/// to 8 and `…` (its full name in the tooltip).
+pub(crate) const VERB_CHARS: usize = 9;
+
+fn verb_cut(v: &str) -> Option<SharedString> {
+    (v.chars().count() > VERB_CHARS - 1).then(|| format!("{}…", v.chars().take(VERB_CHARS - 1).collect::<String>()).into())
+}
+
+/// The user's home, as `$HOME` (`%USERPROFILE%` on Windows), read once.
+fn home() -> Option<&'static str> {
+    static HOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let h = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok()?;
+        let h = h.trim_end_matches(['/', '\\']).to_string();
+        (h.len() > 1).then_some(h)
+    })
+    .as_deref()
+}
+
+/// `s` with the home folder said as `~` (R3: the TUI does), wherever a
+/// path to it starts.
+pub(crate) fn tilde(s: &str) -> String {
+    match home() {
+        Some(h) => tilde_in(s, h),
+        None => s.to_string(),
+    }
+}
+
+fn tilde_in(s: &str, home: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find(home) {
+        let after = &rest[at + home.len()..];
+        let starts = at == 0 || rest[..at].ends_with([' ', '"', '\'', '=', '(', ':']);
+        let ends = after.is_empty() || after.starts_with(['/', '\\', ' ', '"', '\'']);
+        out.push_str(&rest[..at]);
+        out.push_str(if starts && ends { "~" } else { home });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A tool row's parts as its card shows them (polish.md §2.1, §2.3),
+/// formatted once per change of the row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Card {
+    /// The verb as drawn (cut to the column), and the tool's own name for
+    /// the tooltip when the verb is not it.
+    pub verb: SharedString,
+    pub full: Option<SharedString>,
+    /// An MCP tool's `[server]`, in the meta.
+    pub server: Option<SharedString>,
+    /// The target, `~` for the home folder.
+    pub target: SharedString,
+    /// A path target: its folder (`arg`, with its last `/`) and its file
+    /// (`prose_t`: the file is what one scans for).
+    pub path: Option<(SharedString, SharedString)>,
+    /// A finished read's `214 lines`, a grep's or find's `11 hits` (R4).
+    pub facts: Option<SharedString>,
+    /// The well's header: its path, and on the right `replaced 3 → 6
+    /// lines` (an edit) or `lines 41–88` (a read).
+    pub head: Option<(SharedString, Option<SharedString>)>,
+    /// A read's lines with the file's own numbers (R6): number, text.
+    pub numbered: Option<Arc<[(SharedString, SharedString)]>>,
+}
+
+/// A read result's line, `N\t…` as the engine numbers it (`read.rs`).
+fn numbered_line(l: &str) -> Option<(&str, &str)> {
+    let (n, text) = l.split_once('\t')?;
+    let n = n.trim_start();
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some((n, text))
+}
+
+/// The engine's edit result: `Edited p — replaced 3 line(s) with 6 line(s)`.
+fn replaced(result: &str) -> Option<SharedString> {
+    let rest = &result[result.find("replaced ")? + "replaced ".len()..];
+    let (a, rest) = rest.split_once(" line(s) with ")?;
+    let b = rest.split_once(" line(s)")?.0;
+    let num = |s: &str| s.trim().parse::<u64>().ok();
+    Some(format!("replaced {} → {} lines", num(a)?, num(b)?).into())
+}
+
+fn plural(n: usize, one: &str, many: &str) -> SharedString {
+    format!("{n} {}", if n == 1 { one } else { many }).into()
+}
+
+impl Card {
+    /// `arg`: the row's one-line argument ([`crate::app::row_cache`]).
+    pub(crate) fn of(t: &synaps_client::transcript::ToolCall, preview: Option<&Preview>, arg: &str) -> Self {
+        let (verb, server) = verb_of(&t.name);
+        let cut = verb_cut(&verb);
+        let full = (cut.is_some() || verb.as_ref() != t.name).then(|| SharedString::from(t.name.clone()));
+        let input = t.input.starts_with('{').then(|| serde_json::from_str::<serde_json::Value>(&t.input).ok()).flatten();
+        let field = |k: &str| input.as_ref().and_then(|v| v.get(k)).and_then(|v| v.as_str()).map(str::to_string);
+        let target = match t.name.as_str() {
+            "grep" | "find" => match (field("pattern"), field("path")) {
+                (Some(pat), Some(path)) => format!("{pat}  {}", tilde(&path)),
+                (Some(pat), None) => pat,
+                _ => tilde(arg),
+            },
+            _ => tilde(arg),
+        };
+        let is_path = matches!(t.name.as_str(), "read" | "write" | "edit" | "multi_edit" | "ls")
+            && !target.contains(" +")
+            && !target.contains('\n')
+            && !target.starts_with('{');
+        let path = is_path
+            .then(|| target.rfind(['/', '\\']).filter(|at| at + 1 < target.len()))
+            .flatten()
+            .map(|at| (SharedString::from(target[..=at].to_string()), SharedString::from(target[at + 1..].to_string())));
+        let done = t.status == Some(ToolStatus::Done);
+        let numbered: Option<Vec<(&str, &str)>> = (t.name == "read")
+            .then(|| {
+                let lines: Vec<&str> = t.result.lines().filter(|l| numbered_line(l).is_some()).collect();
+                (!lines.is_empty()).then(|| lines.into_iter().filter_map(numbered_line).collect())
+            })
+            .flatten();
+        let facts = match t.name.as_str() {
+            "read" if done => numbered.as_ref().map(|n| plural(n.len(), "line", "lines")),
+            "grep" | "find" if done => {
+                let hits = t.result.lines().filter(|l| !l.trim().is_empty() && !l.starts_with("...")).count();
+                Some(plural(hits, "hit", "hits"))
+            }
+            _ => None,
+        };
+        let head = match (preview, &numbered) {
+            (Some(pv), _) if !pv.title.is_empty() => Some((tilde(&pv.title).into(), replaced(&t.result))),
+            (_, Some(n)) if !n.is_empty() => {
+                let range = match (n.first(), n.last()) {
+                    (Some(a), Some(b)) if a.0 != b.0 => format!("lines {}–{}", a.0, b.0),
+                    (Some(a), _) => format!("line {}", a.0),
+                    _ => String::new(),
+                };
+                Some((target.clone().into(), (!range.is_empty()).then(|| range.into())))
+            }
+            _ => None,
+        };
+        let numbered = numbered.map(|n| {
+            n.into_iter()
+                .take(crate::app::RESULT_LINES)
+                .map(|(a, b)| (SharedString::from(a.to_string()), SharedString::from(b.to_string())))
+                .collect::<Vec<_>>()
+                .into()
+        });
+        Card { verb: cut.unwrap_or(verb), full, server, target: target.into(), path, facts, head, numbered }
+    }
+}
+
 /// One tool name in a summary's tally.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Tally {
@@ -714,9 +881,11 @@ impl RunSummary {
                 delta.written += d.written;
                 delta.approx |= d.approx;
             }
-            match tally.iter_mut().find(|t| t.name == row.name) {
+            // By verb (polish.md §2.1a): `multi_edit` counts as an edit.
+            let name = if row.card.verb.is_empty() { &row.name } else { &row.card.verb };
+            match tally.iter_mut().find(|t| &t.name == name) {
                 Some(t) => t.n += 1,
-                None => tally.push(Tally { name: row.name.clone(), n: 1, n_text: SharedString::default(), hue: row.hue, name_chars: 0 }),
+                None => tally.push(Tally { name: name.clone(), n: 1, n_text: SharedString::default(), hue: row.hue, name_chars: 0 }),
             }
         }
         // Stable: equal counts keep their first-use order.
@@ -741,7 +910,7 @@ impl RunSummary {
         }
         RunSummary {
             tools,
-            label: format!("{tools} tools").into(),
+            label: format!("{tools} calls").into(),
             tally,
             ok,
             failed,
@@ -757,22 +926,23 @@ impl RunSummary {
     }
 
     /// Its trail's width at `meta` px (mono), as [`AppView::render_summary`]
-    /// lays it out: counts · glyph, then (not `tight`) the words, `·`
-    /// between, every part 8 px apart, each text a whole pixel wide.
+    /// lays it out: the counts, then (not `tight`) the words, `·` between,
+    /// every part 8 px apart, each text a whole pixel wide. Its worst
+    /// outcome's glyph is in the gutter.
     pub(crate) fn trail_w(&self, meta: f32, tight: bool) -> f32 {
         let cw = 0.6 * meta;
         let chars = |t: &SharedString| text_w(t.chars().count(), cw);
-        let (mut w, mut parts) = (self.worst.0.size(), 1);
+        let (mut w, mut parts) = (0., 0usize);
         let counts = [&self.counts.written, &self.counts.added, &self.counts.removed];
         let shown = counts.iter().filter(|c| c.is_some()).count();
         if shown > 0 {
-            // The counts (8 apart), and a `·`.
-            w += counts.iter().filter_map(|c| c.as_ref()).map(chars).sum::<f32>() + 8. * (shown - 1) as f32 + text_w(1, cw);
-            parts += 2;
+            // The counts, 8 apart: one part.
+            w += counts.iter().filter_map(|c| c.as_ref()).map(chars).sum::<f32>() + 8. * (shown - 1) as f32;
+            parts += 1;
         }
-        if !tight {
+        if !tight && !self.outcome.is_empty() {
             for (i, (text, _)) in self.outcome.iter().enumerate() {
-                if i > 0 {
+                if i > 0 || shown > 0 {
                     w += text_w(1, cw);
                     parts += 1;
                 }
@@ -780,7 +950,7 @@ impl RunSummary {
                 parts += 1;
             }
         }
-        w + 8. * (parts - 1) as f32
+        w + 8. * parts.saturating_sub(1) as f32
     }
 }
 
@@ -1064,22 +1234,112 @@ impl RowParts {
     }
 }
 
+/// Where a tool row's parts sit (polish.md §2.1, with F1 adopted): bare on
+/// the canvas, the verb on the prose column. With the labels hanging, the
+/// row's box reaches `out` into the gutter for its status glyph, so the
+/// hover fill takes the glyph in; in a narrow pane the glyph has the row's
+/// lead column.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Geo {
+    /// How far the row's box reaches left of the column.
+    pub out: f32,
+    /// The box's own padding, left (before the status glyph) and right.
+    pub pad: f32,
+    pub right: f32,
+    /// The verb column: 9 mono characters.
+    pub verb_w: f32,
+    /// Between the verb, the target, the meta and the fold.
+    pub gap: f32,
+    /// The verb's x and the target's x in the column (a well's left edge).
+    pub verb: f32,
+    pub target: f32,
+    /// The fold chevron's column, at the right end.
+    pub fold: f32,
+}
+
+impl Geo {
+    pub(crate) fn of(lay: Layout, m: &Metrics) -> Self {
+        let gap = (8. * m.r).round();
+        let verb_w = text_w(VERB_CHARS, m.mono * 0.6);
+        let (out, pad, verb) = if lay.hang { (m.lead + gap, gap, 0.) } else { (0., 0., m.lead) };
+        Geo { out, pad, right: gap, verb_w, gap, verb, target: verb + verb_w + gap, fold: (12. * m.r).round() }
+    }
+
+    /// A row's box: bare, `h` tall at least, reaching into the gutter.
+    fn frame(self, h: f32) -> Div {
+        h_flex().relative().ml(px(-self.out)).pl(px(self.pad)).pr(px(self.right)).min_h(px(h)).items_center()
+    }
+
+    /// The fold's column (kept without a body, so the metas line up).
+    fn fold_col(self, fold: Option<AnyElement>) -> Div {
+        div().flex_none().ml(px(self.gap)).w(px(self.fold)).flex().items_center().justify_end().children(fold)
+    }
+}
+
+/// A row's verb in its 9-character column, its tool's own name in the
+/// tooltip when the verb is not it.
+fn verb_el(card: &Card, key: (&'static str, u64), color: Hsla, geo: Geo) -> AnyElement {
+    let el = div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).overflow_hidden().whitespace_nowrap().text_color(color);
+    match &card.full {
+        Some(full) => {
+            let full = full.clone();
+            el.id(key).child(card.verb.clone()).tooltip(move |window, cx| crate::overlay::tip(full.clone(), window, cx)).into_any_element()
+        }
+        None => el.child(card.verb.clone()).into_any_element(),
+    }
+}
+
+/// A row's target: a path's folder in `arg` and its file in `prose_t` (the
+/// folder gives way first), anything else in `arg`, ellipsised.
+fn target_el(card: &Card, arg: &SharedString, p: &Palette) -> Div {
+    let text = if card.target.is_empty() { arg.clone() } else { card.target.clone() };
+    match &card.path {
+        Some((dir, base)) => h_flex()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(p.arg).child(dir.clone()))
+            .child(div().flex_none().text_color(p.prose_t).child(base.clone())),
+        None => div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(p.arg).child(text),
+    }
+}
+
+/// A running call's clock (the TUI's `running 1.2s`): whole seconds since
+/// it started, ticking on the second while motion is on.
+fn clock(fx: &Motion, started: Option<chrono::DateTime<chrono::Utc>>) -> Option<SharedString> {
+    let ms = (chrono::Utc::now() - started?).num_milliseconds().max(0) as u64;
+    if fx.on() {
+        fx.tick_clock(fx.now() + Duration::from_millis(1000 - ms % 1000));
+    }
+    Some(subagents::fmt_whole(ms / 1000).into())
+}
+
 impl AppView {
-    /// A run's summary row (design.md §8.2): the fold, `7 tools`, the tally
-    /// (names in their hues), then the trail: counts · its worst outcome's
-    /// glyph by the counts by outcome, worst first (`+3 −4 · ✕ 1 failed ·
-    /// 7 ok`; tight, the glyph alone: `+3 −4 · ✕`), so no glyph sits
-    /// between two numbers. On its lead edge the tally stacked into one
-    /// bar: the run's rows' bars, folded.
+    /// A run's summary row (polish.md §2.2): tool-row shaped, bare on the
+    /// canvas. Its worst outcome's glyph in the gutter, the stacked tally
+    /// bar beside it (the run's hues, folded), `ran`, `7 calls` and the
+    /// tally (names in their hues), then the counts and the words of what
+    /// did not end ok, worst first (`+3 −4 · 1 failed · 6 ok`; tight, the
+    /// counts alone), and the fold at the right end.
     fn render_summary(&self, d: Disp, open: bool, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
         let id = d.id;
         let Some(s) = self.summaries.get(id) else { return div().into_any_element() };
+        let lay = self.layout;
+        let geo = Geo::of(lay, m);
         // The tally names what fits (mono: measured without layout, every
         // text box a whole pixel), then `+N`; the whole of it in the tooltip.
-        let tight = self.layout.tight;
+        let tight = lay.tight;
         let (cw, gap) = (m.mono * 0.6, (14. * m.r).round());
-        let avail =
-            self.layout.column - 2. * m.pad_x - m.lead - 2. * m.run_gap - text_w(s.label.chars().count(), cw) - s.trail_w(m.meta, tight);
+        let content = lay.column + geo.out - geo.pad - geo.right;
+        let avail = content
+            - m.lead
+            - geo.verb_w
+            - geo.gap
+            - text_w(s.label.chars().count(), cw)
+            - m.run_gap
+            - (s.trail_w(m.meta, tight) + geo.gap)
+            - (geo.gap + geo.fold);
         // A pixel's slack for the shaper's sums.
         let named = tally_fit(&s.tally, avail - 1., cw, gap);
         let mut tally = h_flex()
@@ -1115,14 +1375,13 @@ impl AppView {
         }
         let (worst, family) = s.worst;
         let dot = || div().text_color(p.dim_t).child("·");
-        let mut trail = h_flex()
-            .flex_none()
-            .gap(px(8.))
-            .items_center()
-            .text_px(m.meta)
-            .when_some(s.counts.element(p), |d, c| d.child(c).child(dot()))
-            .child(glyph::draw(worst, glyph::ink(family, Ground::Run, p).1));
-        if !tight {
+        let counts = s.counts.element(p);
+        let mut trail = h_flex().flex_none().ml(px(geo.gap)).gap(px(8.)).items_center().text_px(m.meta).whitespace_nowrap();
+        let words = !tight && !s.outcome.is_empty();
+        if let Some(c) = counts {
+            trail = trail.child(c).when(words, |d| d.child(dot()));
+        }
+        if words {
             for (i, (text, family)) in s.outcome.iter().enumerate() {
                 if i > 0 {
                     trail = trail.child(dot());
@@ -1130,40 +1389,30 @@ impl AppView {
                 trail = trail.child(div().text_color(glyph::ink(*family, Ground::Run, p).0).child(text.clone()));
             }
         }
-        // Open, the bar ends over the 1 px cut under it.
-        let h = m.summary as u32 - u32::from(open);
         // Folded just now: the tally's segments draw, top first (motion.md §6.1).
         let fx = &self.fx;
+        let h = m.summary as u32;
         let folded_at = fx.fold.get().filter(|(f, _)| *f == id && !open).map(|(_, at)| at);
+        let bar_x = geo.pad + m.lead - (6. * m.r).round();
         let segments = glyph::tally_bar(&s.tally, |t| t.n, h).map(|(i, top, h)| {
             let k = fx.draw(folded_at, motion::stagger(i), motion::QUICK);
-            div().absolute().left_0().top(px(top as f32)).w(px(2.)).h(px(h as f32 * k)).bg(s.tally[i].hue.color(p))
+            div().absolute().left(px(bar_x)).top(px(top as f32)).w(px(2.)).h(px(h as f32 * k)).bg(s.tally[i].hue.color(p))
         });
-        h_flex()
+        geo.frame(m.summary)
             .id(("run", id))
-            .relative()
-            .w_full()
             .h(px(m.summary))
-            .px(px(m.pad_x))
-            .items_center()
-            .bg(p.tool)
-            .when(open, |d| d.border_b_1().border_color(p.canvas))
             .font_family(fonts::MONO)
             .text_px(m.mono)
             .text_color(p.prose_t)
             .cursor_pointer()
             .hover(|d| d.bg(p.tool_out))
-            .child(glyph::lead(Some(glyph::turn(fx.turn(id | RUN_KEY, open), p.dim_t)), m))
+            .child(glyph::lead(Some(glyph::draw(worst, glyph::ink(family, Ground::Run, p).1)), m))
+            .child(div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.prose_t).child("ran"))
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(m.run_gap))
-                    .items_center()
-                    .child(div().flex_none().child(s.label.clone()))
-                    .child(tally)
-                    .child(trail),
+                h_flex().flex_1().min_w_0().gap(px(m.run_gap)).items_center().child(div().flex_none().child(s.label.clone())).child(tally),
             )
+            .child(trail)
+            .child(geo.fold_col(Some(glyph::turn(fx.turn(id | RUN_KEY, open), p.dim_t))))
             .children(segments)
             .when_some(row_tip, |d, tip| d.tooltip(tip))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1173,18 +1422,29 @@ impl AppView {
             .into_any_element()
     }
 
-    /// A thinking or tool row in a run (design.md §8.1): the fold (blank
-    /// without a body), name, argument, outcome; its body when open; the
-    /// worker it started. On its lead edge a bar in its tool's hue, through
-    /// its body (`warn_mark` while a prompt waits on it).
+    /// A thinking or tool row in a run (polish.md §2.1, F1): bare on the
+    /// canvas, its status in the gutter, the verb in its tool's hue, the
+    /// target, the meta right (counts, read lines or hits, a running
+    /// clock, the word of an outcome that is not ok) and the fold at the
+    /// right end when it has a body. Opened, its body is a well under it.
+    /// A call that started a worker is its spawn row (§2.4).
     #[allow(clippy::too_many_arguments)]
     fn render_work(&self, item: &Item, row: &RowCache, id: u64, p: &Palette, m: &Metrics, lay: Layout, cx: &Context<Self>) -> AnyElement {
         let think = item.kind == ItemKind::Thinking;
         let st = status(item);
+        let geo = Geo::of(lay, m);
+        let starts = item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name));
+        let worker = starts.and_then(|t| {
+            let subs = self.model.shown_subagents();
+            subs.view(&t.tool_id).map(|v| (v, subs.current(&t.tool_id)))
+        });
+        if let Some((v, current)) = worker {
+            return self.render_spawn(row, v, current, id, geo, p, m, lay, cx);
+        }
         let has_body = if think { !row.text.is_empty() } else { row.preview.is_some() || !row.result.is_empty() };
         let open = has_body && self.is_open(item, row);
-        let (name, name_color): (SharedString, Hsla) = if think { ("think".into(), p.think) } else { (row.name.clone(), row.hue.color(p)) };
-        let arg = if think {
+        let hue = if think { p.think } else { row.hue.color(p) };
+        let target = if think {
             div()
                 .flex_1()
                 .min_w_0()
@@ -1196,82 +1456,61 @@ impl AppView {
                 .text_color(p.think)
                 .child(row.arg.clone())
         } else {
-            div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(p.arg).child(row.arg.clone())
+            target_el(&row.card, &row.arg, p)
         };
         // The call a prompt waits on (the last one unfinished).
         let waiting = !think && self.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty();
-        let state = glyph::call(st, waiting, self.model.active.is_none());
-        // Its bar (motion.md §6.1): drawn top down when the row arrives;
-        // lit while it runs, settling to its hue when it ends; a prompt's
-        // warn bar draws over it and un-draws from the bottom when answered.
         let fx = &self.fx;
         let shown = self.model.shown();
-        let hue = if think { p.think } else { name_color };
-        let running = if think { shown.busy() && shown.items().last().map(|i| i.id) == Some(id) } else { state.0 == Glyph::Run };
-        let lit = motion::mix(hue, p.ink, 0.30);
-        // How lit it is: 1 while it runs, decaying to 0 as it settles.
-        let k = match fx.change(Tag::Finished, id, u64::from(!running), None) {
-            _ if !fx.on() => 0.,
-            _ if running => 1.,
-            Some((at, 0)) => 1. - fx.shot(Some(at), Duration::ZERO, motion::SLOW, &ease::OUT, Mk::Decay),
-            _ => 0.,
-        };
-        let bar = motion::mix(hue, lit, k);
-        let born = fx.birth(id);
-        let drawn = fx.draw(born, Duration::ZERO, motion::QUICK);
-        // It draws hot, all of it, then cools to its light over `glow` once
-        // drawn (motion.md §10 amendment 15, as tuned by the finish gate).
-        let hot = fx.decay(born, motion::QUICK, motion::GLOW);
-        // Lit, it blooms: a still 1 px column of its light on its right, in
-        // the row's own padding (motion.md §10 amendment 15).
-        let bloom = (k > 0.).then(|| glyph::bloom_at(motion::mix(p.tool, motion::mix(lit, p.tool, BLOOM), k), drawn));
-        let wait = fx.change(Tag::Waiting, id, u64::from(waiting), None);
-        let warn = if waiting {
-            Some(fx.draw(wait.filter(|w| w.1 == 0).map(|w| w.0), Duration::ZERO, motion::BASE))
+        let state = if think {
+            let running = shown.busy() && shown.items().last().map(|i| i.id) == Some(id);
+            if running { (Glyph::Run, None, Family::Run) } else { (Glyph::Ok, None, Family::Ok) }
         } else {
-            wait.filter(|w| w.1 == 1)
-                .map(|(at, _)| 1. - fx.shot(Some(at), Duration::ZERO, motion::exit(motion::QUICK), &ease::IN, Mk::Spatial))
-                .filter(|k| *k > 0.)
+            glyph::call(st, waiting, self.model.active.is_none())
         };
-        let (_, mark) = glyph::ink(state.2, Ground::Run, p);
-        let trail_glyph = live_glyph(
+        let (word_color, mark) = glyph::ink(state.2, Ground::Run, p);
+        let wait = fx.change(Tag::Waiting, id, u64::from(waiting), None);
+        let status_glyph = live_glyph(
             fx,
             state.0,
             mark,
-            p.tool,
+            p.canvas,
             fx.change(Tag::Outcome, id, glyph_code(state.0), None),
             wait.filter(|w| waiting && w.1 == 0).map(|w| w.0),
             false,
         );
-        let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
-        let head = h_flex()
-            .id(("row", id))
-            .w_full()
-            .min_h(px(m.row))
-            .px(px(m.pad_x))
+        // Thinking done says nothing in the gutter: only its running mark.
+        let status_glyph = (!think || state.0 == Glyph::Run).then_some(status_glyph);
+        let running = state.0 == Glyph::Run && !think;
+        let meta = h_flex()
+            .flex_none()
+            .ml(px(geo.gap))
+            .gap(px(8.))
             .items_center()
+            .text_px(m.meta)
+            .whitespace_nowrap()
+            // The ledger's committed counts: nothing unless the call succeeded.
+            .children(row.counts.element(p))
+            .children(row.card.facts.clone().map(|f| div().text_color(p.dim_t).child(f)))
+            .children(running.then(|| clock(fx, row.started)).flatten().map(|c| div().text_color(p.dim_t).child(c)))
+            .when_some(state.1.filter(|_| !lay.tight && !think), |d, w| d.child(div().text_color(word_color).child(w)))
+            .children(row.card.server.clone().map(|s| div().text_color(p.dim_t).child(s)));
+        let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
+        let verb = if think {
+            div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.think).child("think").into_any_element()
+        } else {
+            verb_el(&row.card, ("verb", id), hue, geo)
+        };
+        let head = geo
+            .frame(m.row)
+            .id(("row", id))
+            .debug_selector(move || format!("tool-row {id}"))
             .when(has_body, |d| d.cursor_pointer().hover(|d| d.bg(p.tool_out)))
-            .child(glyph::lead(fold, m))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(m.run_gap))
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_none()
-                            .min_w(px(m.mono * 0.6 * 5.))
-                            .max_w(px(m.mono * 0.6 * 16.))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_color(name_color)
-                            .child(name),
-                    )
-                    .child(arg)
-                    .when(!think, |d| d.child(outcome(row, state, trail_glyph, p, m, lay))),
-            )
+            .child(glyph::lead(status_glyph, m))
+            .child(verb)
+            .child(target)
+            .child(meta)
+            .child(geo.fold_col(fold))
             .when(has_body, |d| {
                 d.on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle(id);
@@ -1280,180 +1519,193 @@ impl AppView {
             });
         let body = open.then(|| {
             if think {
+                // Prose, not code: no well, on the canvas under the target.
                 div()
-                    .w_full()
-                    .bg(p.tool_out)
-                    .pl(px(m.pad_x + m.lead))
-                    .pr(px(m.pad_x))
-                    .pt(px((8. * m.r).round()))
-                    .pb(px((12. * m.r).round()))
+                    .ml(px(geo.target))
+                    .pb(px((8. * m.r).round()))
+                    .pr(px(geo.right))
                     .font_family(fonts::SANS)
                     .text_px(m.think)
                     .line_height(px(m.think_line))
-                    .text_color(p.think_o)
+                    .text_color(p.think)
                     .child(row.text.clone())
                     .into_any_element()
             } else {
-                match &row.preview {
-                    Some(pv) => diff_body(pv, p, m).into_any_element(),
-                    None => result_body(&row.result, row.result_more, matches!(st, Some(ToolStatus::Failed | ToolStatus::Denied)), p, m)
-                        .into_any_element(),
-                }
+                let failed = matches!(st, Some(ToolStatus::Failed | ToolStatus::Denied));
+                well(row, failed, id, geo, p, m).into_any_element()
             }
         });
-        let starts = item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name));
-        let worker = starts.and_then(|t| {
-            let subs = self.model.shown_subagents();
-            subs.view(&t.tool_id).map(|v| (v, subs.current(&t.tool_id)))
-        });
-        // The block came under the call while watched: its rule draws.
-        let block_at = starts
-            .and_then(|_| fx.change(Tag::Block, id, u64::from(worker.is_some()), fx.birth(id)))
-            .filter(|_| worker.is_some())
-            .map(|(at, _)| at);
         v_flex()
             .relative()
             .w_full()
-            .bg(p.tool)
             .font_family(fonts::MONO)
             .text_px(m.mono)
             .line_height(px(m.mono_line))
             .child(head)
-            .children(worker.map(|(v, current)| self.subagent_block(v, current, id, block_at, p, m, lay, cx)))
             .children(body)
-            .children(bloom)
-            .child(glyph::bar_at(motion::mix(bar, motion::mix(bar, p.ink, HEAD), hot), drawn))
-            .children(warn.map(|k| glyph::bar_at(p.warn_mark, k)))
             .into_any_element()
     }
 
-    /// The worker a call started, under it (design.md §8.3; the tray row's
-    /// grammar): state glyph, name, its step while it runs, its facts
-    /// (model · tools · elapsed), its state word and `Go`; once it ended,
-    /// its result or why it failed under the row. Its `sub_rule` bar under
-    /// the call's name. It changes when an event or a row comes; under
-    /// motion its clock ticks while it runs ([`crate::tray::ticked`]). Not attached (a cached tab opening, a detached session): as
-    /// last seen. On the session's thread a background worker's block opens
-    /// it in a tab (history: [`crate::wtabs`]), `Go` drawn on hover.
-    /// `current`: no later call has its `sa_N` (a cold-started daemon
-    /// numbers from 1 again); one that has is another worker's handle now,
-    /// and the block does nothing.
+    /// A worker's spawn row (polish.md §2.4): one row, the worker's state
+    /// in the gutter (not the call's), `spawn`, its name and task, its facts
+    /// (the clock ticks while it runs here: [`crate::tray::ticked`]) and
+    /// OPEN ↗; under it while it runs its step (↳, `sub_status_t`), once
+    /// it ended its result (a failure's reason in `err`), at the target
+    /// column with the `sub_rule` bar. Not attached (a cached tab opening,
+    /// a detached session): as last seen. On the session's thread a
+    /// background worker's row opens it (ctrl, middle or double click: in a
+    /// tab; right click: its menu). `current`: no later call has its `sa_N`
+    /// (a cold-started daemon numbers from 1 again); one that has is
+    /// another worker's handle now, and the row opens nothing.
     #[allow(clippy::too_many_arguments)]
-    fn subagent_block(
+    fn render_spawn(
         &self,
+        row: &RowCache,
         v: &subagents::View,
         current: bool,
         key: u64,
-        came: Option<Instant>,
+        geo: Geo,
         p: &Palette,
         m: &Metrics,
         lay: Layout,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let fx = &self.fx;
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
         let pending = session.zip(v.id).is_some_and(|(s, id)| self.model.cancels.pending_id(s, id));
         let live = subagents::Liveness::of(v.status, session.is_some(), true).cancelling(pending);
         let (g, _, word, family) = glyph::worker(live);
         let (word_color, mark) = glyph::ink(family, Ground::Run, p);
         let ended = v.status.is_some_and(subagents::Status::terminal);
+        let running = matches!(live, subagents::Liveness::Running | subagents::Liveness::Cancelling);
         let (step, result) = if ended { (None, v.line.clone()) } else { (v.line.clone(), None) };
-        let step_color =
-            if matches!(live, subagents::Liveness::Running | subagents::Liveness::Cancelling) { p.sub_status_t } else { p.dim_t };
         // A background worker of the session on screen: it opens.
         let open = v.id.filter(|_| v.watchable && current && self.model.watch.focus().is_none());
         let who = open.map(|id| crate::wtabs::Who::new(id, v.name.clone(), v.call.clone()));
-        let go = who.clone().map(|who| {
-            h_flex()
-                .id(("wblock-open", who.id as usize))
-                .group("wblock-go")
-                .flex_none()
-                .items_center()
-                .child(glyph::reveal(glyph::GO, "wblock", "wblock-go", false, p.dim_t, p.ink))
-                .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                    cx.stop_propagation();
-                    if ev.click_count() > 1 {
-                        return;
-                    }
-                    this.swallow_clicks = Some(std::time::Instant::now() + crate::wtabs::MULTI_CLICK);
-                    this.open_worker_tab(&who, cx);
-                }))
-        });
-        let trail = h_flex()
+        let status = live_glyph(
+            fx,
+            g,
+            mark,
+            p.canvas,
+            fx.change(Tag::BlockGlyph, key, glyph_code(glyph::worker(glyph::steady(live, v.demoted)).0), None),
+            None,
+            false,
+        );
+        // Its task: the call's argument after the worker's label.
+        let task = row.arg.split_once(" · ").map_or_else(|| row.arg.clone(), |(_, t)| SharedString::from(t.to_string()));
+        let target = h_flex()
+            .flex_1()
+            .min_w_0()
+            .gap(px(geo.gap))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(m.mono * 0.6 * 24.))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_color(p.sub_name_t)
+                    .child(v.name.clone()),
+            )
+            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.arg).child(task));
+        // The state's word only when it is not going well (C10).
+        let warn = matches!(family, Family::Err | Family::Warn);
+        let tick = if running { &v.tick } else { &None };
+        let meta = h_flex()
             .flex_none()
+            .ml(px(geo.gap))
             .gap(px(8.))
             .items_center()
             .text_px(m.meta)
-            .when(!v.facts.is_empty(), |d| {
-                // Its clock ticks while it runs here (attached), else as last seen.
-                let tick = if matches!(live, subagents::Liveness::Running | subagents::Liveness::Cancelling) { &v.tick } else { &None };
-                d.child(div().text_color(p.sub_time_t).child(crate::tray::ticked(&self.fx, &v.facts, tick)))
-            })
-            .when(!lay.tight, |d| d.child(div().text_color(word_color).child(word)))
-            .children(go);
-        let head = h_flex()
-            .w_full()
-            .min_h(px(m.row))
-            .px(px(m.pad_x))
-            .items_center()
             .whitespace_nowrap()
-            .child(glyph::lead(
-                Some(live_glyph(
-                    &self.fx,
-                    g,
-                    mark,
-                    p.tool,
-                    self.fx.change(Tag::BlockGlyph, key, glyph_code(glyph::worker(glyph::steady(live, v.demoted)).0), None),
-                    None,
-                    false,
-                )),
-                m,
-            ))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(m.run_gap))
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_none()
-                            .max_w(px(m.mono * 0.6 * 24.))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_color(p.sub_name_t)
-                            .child(v.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .when_some(step, |d, (text, _)| d.text_color(step_color).child(text)),
-                    )
-                    .child(trail),
-            );
-        let result = result.map(|(text, err)| {
-            div()
-                .w_full()
-                .pl(px(m.pad_x + m.lead))
-                .pr(px(m.pad_x))
-                .pb(px((8. * m.r).round()))
-                .text_px(m.meta)
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .text_color(if err { p.err } else { p.dim_t })
-                .child(text)
+            .when(!v.facts.is_empty(), |d| d.child(div().text_color(p.sub_time_t).child(crate::tray::ticked(fx, &v.facts, tick))))
+            .when(warn && !lay.tight, |d| d.child(div().text_color(word_color).child(word)));
+        let button = who.clone().map(|who| {
+            let who2 = who.clone();
+            h_flex()
+                .id(("wblock-open", who.id as usize))
+                .debug_selector(move || format!("spawn-open {key}"))
+                .flex_none()
+                .ml(px(geo.gap))
+                .h(px((22. * m.r).round()))
+                .px(px(8.))
+                .gap(px(6.))
+                .items_center()
+                .border_1()
+                .border_color(p.edge)
+                .text_color(p.dim_t)
+                .hover(|d| d.bg(p.tool_out).text_color(p.prose_t))
+                .child(display(label::OPEN, fonts::size::D_S, p.dim_t).line_height(px(12.)))
+                .child(glyph::draw(Glyph::Open, p.dim_t))
+                .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.worker_click(&who, true, ev, window, cx);
+                }))
+                .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.worker_click(&who2, true, ev, window, cx);
+                }))
         });
-        let block = div().w_full().pl(px(m.pad_x + m.lead)).child(
-            v_flex()
+        let head = h_flex()
+            .pl(px(geo.pad))
+            .pr(px(geo.right))
+            .min_h(px(m.row))
+            .items_center()
+            .debug_selector(move || format!("spawn-row {key}"))
+            .child(glyph::lead(Some(status), m))
+            .child(verb_el(&row.card, ("verb", key), p.t_sub, geo))
+            .child(target)
+            .child(meta)
+            .children(button)
+            .child(geo.fold_col(None));
+        // The block came under the call while watched: its bar draws.
+        let came = fx.change(Tag::Block, key, 1, fx.birth(key)).map(|(at, _)| at);
+        let line = |child: AnyElement| {
+            div()
                 .relative()
-                .w_full()
-                .child(head)
-                .children(result)
-                .child(glyph::bar_at(p.sub_rule, self.fx.draw(came, Duration::ZERO, motion::BASE))),
-        );
+                .ml(px(geo.out + geo.target))
+                .mr(px(geo.right))
+                .mb(px((8. * m.r).round()))
+                .pl(px((12. * m.r).round()))
+                .child(child)
+                .child(glyph::bar_at(p.sub_rule, fx.draw(came, Duration::ZERO, motion::BASE)))
+        };
+        let under = if let Some((text, err)) = result {
+            Some(line(
+                div()
+                    .py(px((2. * m.r).round()))
+                    .text_px(m.meta)
+                    .line_height(px(m.mono_line))
+                    .whitespace_normal()
+                    .text_color(if err { p.err } else { p.prose_t })
+                    .child(text)
+                    .into_any_element(),
+            ))
+        } else {
+            step.map(|(text, _)| {
+                line(
+                    h_flex()
+                        .h(px((24. * m.r).round()))
+                        .gap(px(8.))
+                        .items_center()
+                        .text_px(m.meta)
+                        .whitespace_nowrap()
+                        .child(glyph::draw(Glyph::Elbow, p.dim_t))
+                        .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.sub_status_t).child(text))
+                        .into_any_element(),
+                )
+            })
+        };
+        // The whole of it is the hover's: its box reaches into the gutter.
+        let block = v_flex()
+            .relative()
+            .ml(px(-geo.out))
+            .font_family(fonts::MONO)
+            .text_px(m.mono)
+            .line_height(px(m.mono_line))
+            .child(head)
+            .children(under);
         let Some(who) = who else {
             // Its handle names a later worker now: nothing of that one's here.
             if let Some(id) = v.id.filter(|_| v.watchable && !current && self.model.watch.focus().is_none()) {
@@ -1480,6 +1732,91 @@ impl AppView {
     }
 }
 
+/// An opened call's body (polish.md §2.3): a well under its row, from the
+/// target column to the column's end, on the `well` ground (`code`) in a 1 px
+/// `hair` frame. A header line (the path; an edit's `replaced 3 → 6
+/// lines`, a read's `lines 41–88`) when it has a path; an edit's lines with
+/// their signs and washes, a read's with the file's own numbers, any other
+/// output as it came (a failure's in `err_o`).
+fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metrics) -> Div {
+    let inset = (12. * m.r).round();
+    let cw = m.mono * 0.6;
+    let mut col = v_flex()
+        .debug_selector(move || format!("well {id}"))
+        .ml(px(geo.target))
+        .mt(px((2. * m.r).round()))
+        .mb(px((8. * m.r).round()))
+        .bg(p.well)
+        .border_1()
+        .border_color(p.hair)
+        .text_color(p.res);
+    if let Some((path, right)) = &row.card.head {
+        col = col.child(
+            h_flex()
+                .px(px(inset))
+                .py(px((4. * m.r).round()))
+                .gap(px(8.))
+                .border_b_1()
+                .border_color(p.hair)
+                .text_px(m.meta)
+                .text_color(p.dim_o)
+                .whitespace_nowrap()
+                .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().child(path.clone()))
+                .children(right.clone().map(|r| div().flex_none().child(r))),
+        );
+    }
+    let pad = (6. * m.r).round();
+    let more = |n: usize| div().px(px(inset)).text_color(p.dim_o).child(format!("… {n} more lines"));
+    match (&row.preview, &row.card.numbered) {
+        (Some(pv), _) => {
+            let mut lines = v_flex().py(px(pad));
+            for l in &pv.lines {
+                let (sign, fg, sign_fg, bg) = match l.kind {
+                    LineKind::Add => ("+", p.ink, p.ok_o, Some(p.add_bg)),
+                    LineKind::Del => ("−", p.ink, p.err_o, Some(p.del_bg)),
+                    LineKind::Context => (" ", p.res, p.dim_o, None),
+                    LineKind::Note => (" ", p.dim_o, p.dim_o, None),
+                };
+                lines = lines.child(
+                    h_flex()
+                        .w_full()
+                        .px(px(inset))
+                        .items_start()
+                        .when_some(bg, |d, bg| d.bg(bg))
+                        .child(div().w(px(text_w(2, cw))).flex_none().text_color(sign_fg).child(sign))
+                        // `SharedString` from the line's `Arc<str>`: no copy per frame.
+                        .child(div().flex_1().min_w_0().text_color(fg).whitespace_normal().child(SharedString::from(&l.text))),
+                );
+            }
+            col.child(lines.when(pv.more > 0, |d| d.child(more(pv.more))))
+        }
+        (None, Some(numbered)) if !failed => {
+            let mut lines = v_flex().py(px(pad));
+            for (n, text) in numbered.iter() {
+                lines = lines.child(
+                    h_flex()
+                        .w_full()
+                        .px(px(inset))
+                        .items_start()
+                        .child(div().w(px(text_w(5, cw))).flex_none().flex().justify_end().text_color(p.dim_o).child(n.clone()))
+                        .child(div().w(px(text_w(2, cw))).flex_none())
+                        .child(div().flex_1().min_w_0().whitespace_normal().child(text.clone())),
+                );
+            }
+            col.child(lines.when(row.result_more > 0, |d| d.child(more(row.result_more))))
+        }
+        _ => col.child(
+            v_flex()
+                .px(px(inset))
+                .py(px(pad))
+                .whitespace_normal()
+                .text_color(if failed { p.err_o } else { p.res })
+                .child(row.result.clone())
+                .when(row.result_more > 0, |d| d.child(div().text_color(p.dim_o).child(format!("… {} more lines", row.result_more)))),
+        ),
+    }
+}
+
 /// A summary's chevron is keyed apart from its first row's own.
 const RUN_KEY: u64 = 1 << 63;
 
@@ -1487,12 +1824,6 @@ const RUN_KEY: u64 = 1 << 63;
 pub(crate) fn glyph_code(g: Glyph) -> u64 {
     Glyph::ALL.iter().position(|x| *x == g).unwrap_or(0) as u64
 }
-
-/// A lit bar's bloom: how far toward the ground its light is (motion.md
-/// §10 amendment 15).
-const BLOOM: f32 = 0.62;
-/// A new bar, hot: how far toward the ink it draws.
-pub(crate) const HEAD: f32 = 0.65;
 
 /// A state glyph as it is now (motion.md §6, §7): `Run` and `Workers`
 /// scan on the beat; `Needs` breathes from `breath` (the prompt's arrival)
@@ -1527,76 +1858,6 @@ pub(crate) fn live_glyph(
             None => glyph::draw(g, mark),
         },
     }
-}
-
-/// A call's trail (design.md §8.1): its counts, its outcome's glyph and
-/// its word (none for ok, none in a tight pane; the glyph never drops).
-/// Nothing moves.
-fn outcome(
-    row: &RowCache,
-    (_, word, family): (Glyph, Option<&'static str>, Family),
-    mark: AnyElement,
-    p: &Palette,
-    m: &Metrics,
-    lay: Layout,
-) -> AnyElement {
-    let (text, _) = glyph::ink(family, Ground::Run, p);
-    h_flex()
-        .flex_none()
-        .gap(px(8.))
-        .items_center()
-        .text_px(m.meta)
-        .whitespace_nowrap()
-        // The ledger's committed counts: nothing unless the call succeeded.
-        .children(row.counts.element(p))
-        .child(mark)
-        .when_some(word.filter(|_| !lay.tight), |d, w| d.child(div().text_color(text).child(w)))
-        .into_any_element()
-}
-
-/// An edit's diff on the result surface: its signs at the row's name (36),
-/// its text one inset in (52); added and removed lines washed 1.10:1 off it
-/// toward `tool_result_ok` / `error_color`.
-fn diff_body(pv: &Preview, p: &Palette, m: &Metrics) -> impl IntoElement {
-    let indent = m.pad_x + m.lead;
-    let mut col = v_flex().w_full().bg(p.tool_out).pt(px((8. * m.r).round())).pb(px((12. * m.r).round()));
-    for l in &pv.lines {
-        let (sign, fg, sign_fg, bg) = match l.kind {
-            LineKind::Add => ("+", p.ink, p.ok_o, Some(p.add_bg)),
-            LineKind::Del => ("−", p.ink, p.err_o, Some(p.del_bg)),
-            LineKind::Context => (" ", p.dim_o, p.dim_o, None),
-            LineKind::Note => (" ", p.dim_o, p.dim_o, None),
-        };
-        col = col.child(
-            h_flex()
-                .w_full()
-                .pl(px(indent))
-                .pr(px(m.pad_x))
-                .items_start()
-                .when_some(bg, |d, bg| d.bg(bg))
-                .child(div().w(px(m.pad_x)).flex_none().text_color(sign_fg).child(sign))
-                // `SharedString` from the line's `Arc<str>`: no copy per frame.
-                .child(div().flex_1().min_w_0().text_color(fg).whitespace_normal().child(SharedString::from(&l.text))),
-        );
-    }
-    if pv.more > 0 {
-        col = col.child(div().pl(px(indent)).text_color(p.dim_o).child(format!("… {} more lines", pv.more)));
-    }
-    col
-}
-
-fn result_body(result: &SharedString, more: usize, failed: bool, p: &Palette, m: &Metrics) -> impl IntoElement {
-    v_flex()
-        .w_full()
-        .bg(p.tool_out)
-        .pl(px(m.pad_x + m.lead))
-        .pr(px(m.pad_x))
-        .pt(px((8. * m.r).round()))
-        .pb(px((12. * m.r).round()))
-        .text_color(if failed { p.err_o } else { p.res })
-        .whitespace_normal()
-        .child(result.clone())
-        .when(more > 0, |d| d.child(div().text_color(p.dim_o).child(format!("… {more} more lines"))))
 }
 
 #[cfg(test)]
@@ -1970,6 +2231,41 @@ mod tests {
         s.outcome.iter().map(|(t, tone)| (t.as_ref(), *tone)).collect()
     }
 
+    /// Q1 cards (polish.md §2.1a, R1, R3, R4, R6): verbs, `~`, a path
+    /// split in two, read lines and hits, the well's header and numbers.
+    #[test]
+    fn a_card_says_its_verb_target_and_facts() {
+        use super::{Card, replaced, tilde_in, verb_of};
+        use synaps_client::transcript::{ToolCall, ToolStatus};
+        let v = |n: &str| verb_of(n).0.to_string();
+        assert_eq!(
+            [v("read"), v("multi_edit"), v("subagent_start"), v("subagent_collect"), v("ext__github__search")],
+            ["read", "edit", "spawn", "collect", "tool"]
+        );
+        assert_eq!(verb_of("ext__github__search").1.as_deref(), Some("[github]"));
+        assert_eq!(tilde_in("/home/you/work/a.rs", "/home/you"), "~/work/a.rs");
+        assert_eq!(tilde_in("cd /home/you && ls /home/yourself", "/home/you"), "cd ~ && ls /home/yourself");
+        assert_eq!(replaced("Edited a.rs — replaced 3 line(s) with 6 line(s)").as_deref(), Some("replaced 3 → 6 lines"));
+        let call = |name: &str, input: &str, result: &str| ToolCall {
+            tool_id: "t".into(),
+            name: name.into(),
+            input: input.into(),
+            result: result.into(),
+            status: Some(ToolStatus::Done),
+        };
+        let read = Card::of(&call("read", "src/a.rs", "41\tfn a() {\n42\t}\n\n... (9 more lines)"), None, "src/a.rs");
+        assert_eq!(read.path, Some(("src/".into(), "a.rs".into())));
+        assert_eq!(read.facts.as_deref(), Some("2 lines"));
+        assert_eq!(read.head, Some(("src/a.rs".into(), Some("lines 41–42".into()))));
+        assert_eq!(read.numbered.as_deref().map(|n| n.len()), Some(2));
+        let grep = Card::of(&call("grep", r#"{"path":"src","pattern":"Stale"}"#, "a.rs:1: x\nb.rs:2: y"), None, "");
+        assert_eq!((grep.target.as_ref(), grep.path.is_none(), grep.facts.as_deref()), ("Stale  src", true, Some("2 hits")));
+        let long = Card::of(&call("subagent_status", "", ""), None, "");
+        assert_eq!((long.verb.as_ref(), long.full.as_deref()), ("status", Some("subagent_status")));
+        let odd = Card::of(&call("notebook_edit", "", ""), None, "");
+        assert_eq!((odd.verb.as_ref(), odd.full.as_deref()), ("notebook…", Some("notebook_edit")));
+    }
+
     #[test]
     fn summaries_count_tools_failures_and_names() {
         let mut m = turn(5, "a");
@@ -1986,15 +2282,15 @@ mod tests {
         // A call that starts a worker wears the worker's hue.
         assert_eq!([Hue::of("subagent_start"), Hue::of("subagent_resume"), Hue::of("subagent")], [Hue::Sub; 3]);
         assert_eq!(Hue::of("subagent_collect"), Hue::Gen);
-        assert_eq!(s.label.as_ref(), "5 tools");
+        assert_eq!(s.label.as_ref(), "5 calls");
         assert_eq!(outcome(&s), [("1 failed", Family::Err), ("4 ok", Family::Ok)], "worst first: by its glyph");
         assert_eq!(s.worst, (Glyph::Failed, Family::Err));
         assert_eq!(s.tip.as_ref(), "bash 3\nread 2");
         assert_eq!(s.tally.iter().map(|t| t.name_chars).collect::<Vec<_>>(), [4, 4]);
-        // The trail at 10 px (6 a character): ✕ 10, `1 failed` 48, `·` 6,
-        // `4 ok` 24, 8 apart; tight, the glyph alone.
-        assert_eq!(s.trail_w(10., false), 10. + 48. + 6. + 24. + 3. * 8.);
-        assert_eq!(s.trail_w(10., true), 10.);
+        // The trail at 10 px (6 a character): `1 failed` 48, `·` 6, `4 ok`
+        // 24, 8 apart; tight, nothing (the glyph is in the gutter).
+        assert_eq!(s.trail_w(10., false), 48. + 6. + 24. + 2. * 8.);
+        assert_eq!(s.trail_w(10., true), 0.);
     }
 
     /// A tally names what fits and ends with `+N`, N the calls of the
