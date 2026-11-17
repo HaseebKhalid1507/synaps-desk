@@ -420,10 +420,11 @@ fn idle_cpu() -> Vec<Value> {
         &mut out,
         "toolu_k02",
         "read",
-        json!({"path": p("chart.rs")}),
-        "    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window) {\n…",
+        json!({"path": p("chart.rs"), "offset": 84, "limit": 8}),
+        "85\timpl Element for Chart {\n86\t    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window) {\n87\t        if self.revealing() {\n\
+         88\t            window.request_animation_frame();\n89\t        }\n90\t        self.draw(bounds, window);\n91\t    }\n92\t}\n\n... (212 more lines)",
     );
-    ok(&mut out, "toolu_k03", "find", json!({"pattern": "*.rs", "path": p("")}), "app.rs\nbench.rs\nchart.rs\ntray.rs\n…");
+    ok(&mut out, "toolu_k03", "find", json!({"pattern": "*.rs", "path": p("")}), "app.rs\nbench.rs\nchart.rs\ndemo.rs\ntray.rs");
     ok(&mut out, "toolu_k04", "ls", json!({"path": p("")}), "app.rs  bench.rs  chart.rs  demo.rs  tray.rs  …");
     ok(
         &mut out,
