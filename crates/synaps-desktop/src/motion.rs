@@ -89,10 +89,10 @@ pub(crate) struct Setting {
 impl Global for Setting {}
 
 impl Setting {
-    /// `SYNAPS_NO_BOOT_FX` (any value but empty or `0`), else `--motion`,
+    /// `SYNAPS_NO_BOOT_FX=1` (the TUI's switch, exactly), else `--motion`,
     /// else the saved choice, else unset (the OS's).
     pub(crate) fn resolve(flag: Option<&str>, no_boot_fx: Option<&str>, saved: Option<&str>) -> (Setting, Option<String>) {
-        if no_boot_fx.is_some_and(|v| !v.is_empty() && v != "0") {
+        if no_boot_fx == Some("1") {
             return (Setting { level: Some(Level::Off), lock: Some(Lock::NoBootFx) }, None);
         }
         if let Some(f) = flag {
@@ -201,6 +201,14 @@ pub(crate) enum Tag {
     Watched,
     /// A streaming row's text length (the write head).
     Stream,
+}
+
+impl Tag {
+    /// Keyed by the column's own ids (a transcript's item ids, which every
+    /// transcript numbers from 1): another column's are other things.
+    fn column(self) -> bool {
+        matches!(self, Tag::Outcome | Tag::Waiting | Tag::Finished | Tag::Block | Tag::BlockGlyph | Tag::Stream)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -318,6 +326,9 @@ pub(crate) struct Motion {
     pub(crate) sent: Cell<Option<(Instant, bool)>>,
     /// A fold or unfold: the clicked run's id, when (the cascade's origin).
     pub(crate) fold: Cell<Option<(u64, Instant)>>,
+    /// Whose state is remembered: the session's (id and attach) and the
+    /// column's (the session's thread or a worker's view) ([`Motion::rescope`]).
+    scope: Cell<(u64, u64)>,
 }
 
 impl Default for Motion {
@@ -346,7 +357,32 @@ impl Motion {
             arms: Cell::new(0),
             sent: Cell::new(None),
             fold: Cell::new(None),
+            scope: Cell::new((0, 0)),
         }
+    }
+
+    /// Who is on screen this frame: `session` (its id and attach) and
+    /// `column` (its thread or a worker's view). What was remembered under
+    /// another is forgotten, so nothing compares one's ids with another's:
+    /// a switch, a reconnect, a worker's view in or out come up at rest
+    /// (motion.md §8). The tray, the foot and the card are the session's;
+    /// the transcript's tags, turns and births are the column's.
+    pub(crate) fn rescope(&self, session: u64, column: u64) {
+        let (s0, c0) = self.scope.get();
+        if s0 == session && c0 == column {
+            return;
+        }
+        self.scope.set((session, column));
+        if s0 != session {
+            self.seen.borrow_mut().clear();
+            self.slides.borrow_mut().clear();
+            self.sent.set(None);
+        } else {
+            self.seen.borrow_mut().retain(|k, _| !k.0.column());
+        }
+        self.turns.borrow_mut().clear();
+        self.births.borrow_mut().clear();
+        self.fold.set(None);
     }
 
     pub(crate) fn level(&self) -> Level {
@@ -407,10 +443,12 @@ impl Motion {
         }
     }
 
-    fn want_tick(&self, from: Instant) {
-        let now = self.now();
-        let ticks = now.saturating_duration_since(from).as_nanos() / DECAY_TICK.as_nanos() + 1;
-        self.want_at(from + DECAY_TICK * ticks as u32);
+    /// The next 30 Hz tick, on the shared grid (phase-locked to the
+    /// epoch, as the beat is): N decays cost one timer and 30 frames/s,
+    /// whenever each started.
+    fn want_tick(&self) {
+        let ticks = self.now().saturating_duration_since(self.epoch).as_nanos() / DECAY_TICK.as_nanos() + 1;
+        self.want_at(self.epoch + Duration::from_nanos((DECAY_TICK.as_nanos() * ticks) as u64));
     }
 
     /// The beat (§7): its index, and the element changes again in `every`
@@ -433,9 +471,15 @@ impl Motion {
     }
 
     /// A clock (a running elapsed time, a fuse) changes at `at`: under
-    /// every level but Off (information, not motion).
+    /// every level but Off (information, not motion). While the heartbeat
+    /// runs it changes on the beat that crosses `at` (§7.1: the heartbeat's
+    /// frame, no extra one); without it, at `at` itself.
     pub(crate) fn tick_at(&self, at: Instant) {
-        self.want_at(at);
+        if !self.ambient.get() {
+            return self.want_at(at);
+        }
+        let n = at.saturating_duration_since(self.epoch).as_nanos().div_ceil(BEAT.as_nanos());
+        self.want_at(self.epoch + Duration::from_nanos((BEAT.as_nanos() * n) as u64));
     }
 
     // ── one-shots ─────────────────────────────────────────────────────
@@ -455,11 +499,12 @@ impl Motion {
             return 1.;
         }
         if now < start {
-            self.want_frame();
+            // A staggered start: nothing to draw until it comes.
+            self.want_at(start);
             return 0.;
         }
         match (self.level.get(), kind) {
-            (Level::Full, Kind::Decay) => self.want_tick(start),
+            (Level::Full, Kind::Decay) => self.want_tick(),
             _ => self.want_frame(),
         }
         ease.sample(now.saturating_duration_since(start).as_secs_f32() / dur.as_secs_f32())
@@ -601,6 +646,17 @@ impl Motion {
         *self.timer.borrow_mut() = Some((at, task));
     }
 
+    /// One-shots that started on this frame (tests: a switch starts none).
+    /// The watched bar's draw is the one a view opening here plays.
+    #[cfg(test)]
+    pub(crate) fn fresh(&self) -> Vec<(Tag, u64)> {
+        let now = self.now.get();
+        let mut v: Vec<(Tag, u64)> =
+            self.seen.borrow().iter().filter(|(k, s)| k.0 != Tag::Watched && s.since == Some(now)).map(|(k, _)| *k).collect();
+        v.extend(self.births.borrow().iter().filter(|(_, at)| **at >= now).map(|(id, _)| (Tag::Stream, *id)));
+        v
+    }
+
     /// What the last frame asked for: a frame, a timer at, nothing (tests).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pending(&self) -> (bool, Option<Instant>) {
@@ -609,7 +665,7 @@ impl Motion {
 
     /// The scheduler, as `end_frame` would leave it, without a window (tests).
     #[cfg(test)]
-    fn demand(&self) -> (bool, Option<Instant>) {
+    pub(crate) fn demand(&self) -> (bool, Option<Instant>) {
         self.in_frame.set(false);
         (self.display.get(), self.next.get())
     }
@@ -697,6 +753,23 @@ mod tests {
         m.begin_frame(Level::Full, false, t0 + ms(130));
         m.tick_at(t0 + ms(1000));
         assert_eq!(m.demand(), (false, Some(t0 + ms(1000))), "a clock alone: 1 frame/s");
+        // Three decays started 10 ms apart (a turn's end: the write head,
+        // two lit bars): one 30 Hz grid, not three.
+        let m = Motion::new(t0);
+        let starts = [t0 + ms(5), t0 + ms(15), t0 + ms(25)];
+        let (mut now, mut frames) = (t0 + ms(30), 0);
+        while now < t0 + ms(330) {
+            m.begin_frame(Level::Full, false, now);
+            for s in starts {
+                m.decay(Some(s), Duration::ZERO, SLOW);
+            }
+            let (display, next) = m.demand();
+            assert!(!display, "a decay rides the 30 Hz tick, not display frames");
+            let next = next.expect("decaying: a tick");
+            assert_eq!(next.duration_since(t0).as_nanos() % super::DECAY_TICK.as_nanos(), 0, "on the shared grid");
+            (now, frames) = (next, frames + 1);
+        }
+        assert_eq!(frames, 10, "the frame at 30 ms, then 300 ms at 30 Hz: whatever the starts");
     }
 
     /// Hidden or low power: no ambient demand.
@@ -771,19 +844,25 @@ mod tests {
         assert_eq!(m.change(Tag::Outcome, 5, 1, m.birth(5)), Some((t0 + ms(64), u64::MAX)));
     }
 
-    /// Every running glyph samples the same beat in a frame, and a glyph
-    /// that appears mid-cycle joins the phase (it does not start at 0).
+    /// Every running glyph samples the same beat in a frame, though the
+    /// wall clock crosses a beat while the frame's rows are built (they
+    /// read the frame's clock, not the time each is built at), and a row
+    /// born mid-cycle joins the phase (it does not start at 0).
     #[test]
     fn fresh_glyph_rows_scan_in_lockstep() {
-        let t0 = Instant::now();
-        let m = Motion::new(t0);
-        m.begin_frame(Level::Full, false, t0 + ms(3 * 125 + 10));
+        // The epoch put so that the next beat is 2 ms from now.
+        let m = Motion::new(Instant::now() - (BEAT * 3 - ms(2)));
+        m.begin_frame(Level::Full, false, Instant::now());
         let old = m.beat(1);
-        m.born(9, t0 + ms(3 * 125 + 10));
+        std::thread::sleep(ms(6));
+        m.born(9, Instant::now());
         let fresh = m.beat(1);
-        assert_eq!(old, Some(3));
-        assert_eq!(fresh, old);
+        assert_eq!(old, Some(2));
+        assert_eq!(fresh, old, "a row built after the wall clock crossed the beat scans with the rest");
         assert_eq!(crate::glyph::scan_row(old.unwrap()), crate::glyph::scan_row(fresh.unwrap()));
+        // The next frame: the next beat, for both.
+        m.begin_frame(Level::Full, false, Instant::now());
+        assert_eq!((m.beat(1), m.beat(1)), (Some(3), Some(3)));
     }
 
     /// The `roles_check` step (motion.md §10): every afterglow mix of
@@ -856,6 +935,7 @@ mod tests {
         );
         assert_eq!(Setting::resolve(None, None, Some("off")).0, Setting { level: Some(Level::Off), lock: None });
         assert_eq!(Setting::resolve(None, Some(""), None).0, Setting::default());
+        assert_eq!(Setting::resolve(None, Some("false"), None).0, Setting::default(), "the TUI's switch: 1 only");
         let (s, warn) = Setting::resolve(Some("fast"), None, Some("reduced"));
         assert_eq!(s.level, Some(Level::Reduced));
         assert!(warn.is_some());

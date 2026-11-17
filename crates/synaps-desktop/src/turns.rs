@@ -1208,8 +1208,8 @@ impl AppView {
     /// grammar): state glyph, name, its step while it runs, its facts
     /// (model · tools · elapsed), its state word and `Go`; once it ended,
     /// its result or why it failed under the row. Its `sub_rule` bar under
-    /// the call's name. Nothing moves: it changes when an event or a row
-    /// comes. Not attached (a cached tab opening, a detached session): as
+    /// the call's name. It changes when an event or a row comes; under
+    /// motion its clock ticks while it runs ([`crate::tray::ticked`]). Not attached (a cached tab opening, a detached session): as
     /// last seen. On the session's thread a background worker's block opens
     /// it in a tab (history: [`crate::wtabs`]), `Go` drawn on hover.
     /// `current`: no later call has its `sa_N` (a cold-started daemon
@@ -1260,7 +1260,11 @@ impl AppView {
             .gap(px(8.))
             .items_center()
             .text_px(m.meta)
-            .when(!v.facts.is_empty(), |d| d.child(div().text_color(p.sub_time_t).child(v.facts.clone())))
+            .when(!v.facts.is_empty(), |d| {
+                // Its clock ticks while it runs here (attached), else as last seen.
+                let tick = if matches!(live, subagents::Liveness::Running | subagents::Liveness::Cancelling) { &v.tick } else { &None };
+                d.child(div().text_color(p.sub_time_t).child(crate::tray::ticked(&self.fx, &v.facts, tick)))
+            })
             .when(!lay.tight, |d| d.child(div().text_color(word_color).child(word)))
             .children(go);
         let head = h_flex()
