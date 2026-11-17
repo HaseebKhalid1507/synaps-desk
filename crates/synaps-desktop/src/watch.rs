@@ -336,11 +336,18 @@ impl Worker {
             self.notice("… earlier output was dropped (the daemon keeps a worker's last 2 MiB)".into());
             changed = true;
         }
-        for ev in &page.events {
+        // When each entry happened (`crate::times::journal`); a page
+        // without journal times (an older daemon): none.
+        let wall = crate::views::now_ms();
+        let at = |k: usize| match (page.now_ms, page.at_ms.len() == page.events.len()) {
+            (Some(now), true) => crate::times::journal(page.at_ms[k], now, wall),
+            _ => None,
+        };
+        for (k, ev) in page.events.iter().enumerate() {
             if let WatchEvent::ToolUse { tool_id, tool_name, input } = ev {
                 self.files.tool_use(tool_name, tool_id, input);
             }
-            self.transcript.apply_watch(ev);
+            self.transcript.apply_watch_at(ev, at(k).as_deref().unwrap_or(""));
         }
         self.next_seq = page.next_seq;
         said |= self.steerable != page.steerable;
@@ -1155,6 +1162,44 @@ mod tests {
         assert!(b.transcript.items().iter().all(|i| i.text != "A"));
         assert!(b.files.preview("t").is_some(), "its edit has a diff of its own");
         assert_eq!(w.focus(), Some("sa_2"));
+    }
+
+    /// A worker's rows carry the time each entry was recorded: its journal
+    /// time (`at_ms`) less its age at the read (`now_ms`), on this
+    /// machine's clock. A page without journal times gives none.
+    #[test]
+    fn a_workers_rows_carry_their_journal_times() {
+        let t0 = Instant::now();
+        let mut w = Watch::default();
+        w.open(&Candidate::of(1, "a"), None, t0);
+        let _ = w.take_poll(t0);
+        let before = crate::views::now_ms();
+        w.on_reply(
+            "sa_1",
+            0,
+            page(json!({"handle_id": "sa_1", "status": "running", "next_seq": 2, "at_ms": [4_000, 12_000], "now_ms": 12_000,
+                "events": [{"kind": "steered", "text": "look again"}, {"kind": "text", "text": "A"}]})),
+            t0,
+        );
+        let after = crate::views::now_ms();
+        let ms = |w: &Watch, kind: ItemKind| {
+            let t = &w.worker("sa_1").unwrap().transcript;
+            let at = t.items().iter().rev().find(|i| i.kind == kind).and_then(|i| i.at.clone());
+            at.map(|a| chrono::DateTime::parse_from_rfc3339(&a).unwrap().timestamp_millis())
+        };
+        let (steer, reply) = (ms(&w, ItemKind::User).unwrap(), ms(&w, ItemKind::Assistant).unwrap());
+        assert_eq!(reply - steer, 8_000);
+        assert!((before..=after).contains(&reply), "{before} <= {reply} <= {after}");
+        let t1 = t0 + POLL_INTERVAL;
+        assert_eq!(w.take_poll(t1), Some(("sa_1".into(), 2)));
+        w.on_reply(
+            "sa_1",
+            2,
+            page(json!({"handle_id": "sa_1", "status": "running", "next_seq": 3,
+            "events": [{"kind": "steered", "text": "untimed"}]})),
+            t1,
+        );
+        assert_eq!(ms(&w, ItemKind::User), None, "an older daemon's page: no time");
     }
 
     /// Ctrl+↑ from the session goes to the newest worker, more ↑ to older

@@ -306,7 +306,13 @@ pub(crate) enum Kind {
     },
     /// A thinking or tool item in a run.
     Work,
+    /// The local date changed since the last dated row: a day line above
+    /// its item's row ([`crate::times::Days`]); its `rev` is the day.
+    Day,
 }
+
+/// A day line's row id: its item's, with this bit (item ids count up from 1).
+pub(crate) const DAY_ID: u64 = 1 << 63;
 
 /// One row of the virtual list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,8 +378,20 @@ pub(crate) fn build(items: &[Item], from: usize, busy: bool, open: &HashSet<u64>
     let mut agent = from > 0 && items[from].kind != ItemKind::User;
     let mut i = from;
     let gap = |i: usize| if i == 0 { Gap::First } else { Gap::Part };
+    let mut days = crate::times::Days::after(&items[..from.min(items.len())]);
     while i < items.len() {
         let it = &items[i];
+        if let Some(day) = days.next(it) {
+            // Its gap is the row's under it, which then sits a part below.
+            out.push(Disp {
+                item: i,
+                id: it.id | DAY_ID,
+                rev: crate::times::day_number(day),
+                kind: Kind::Day,
+                gap: Gap::Part,
+                who: Who::None,
+            });
+        }
         let row = |kind, gap, who| Disp { item: i, id: it.id, rev: it.rev, kind, gap, who };
         match it.kind {
             ItemKind::User => {
@@ -392,6 +410,11 @@ pub(crate) fn build(items: &[Item], from: usize, busy: bool, open: &HashSet<u64>
                 let (mut tools, mut done) = (0, true);
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 while let Some(x) = items.get(end).filter(|x| matches!(x.kind, ItemKind::Thinking | ItemKind::Tool)) {
+                    // A run that crosses midnight is two: the day line between.
+                    if end > start && days.turns(x) {
+                        break;
+                    }
+                    days.next(x);
                     if x.kind == ItemKind::Tool {
                         tools += 1;
                         done &= !live_call(x, subs);
@@ -441,6 +464,11 @@ pub(crate) fn build(items: &[Item], from: usize, busy: bool, open: &HashSet<u64>
             }
         }
     }
+    for k in 1..out.len() {
+        if out[k - 1].kind == Kind::Day {
+            out[k - 1].gap = std::mem::replace(&mut out[k].gap, Gap::Part);
+        }
+    }
     out
 }
 
@@ -453,6 +481,34 @@ pub(crate) fn diff(old: &[Disp], new: &[Disp]) -> Option<(std::ops::Range<usize>
     }
     let tail = old[head..].iter().rev().zip(new[head..].iter().rev()).take_while(|(a, b)| a == b).count();
     Some((head..old.len() - tail, new.len() - head - tail))
+}
+
+/// A labelled row's time (`crate::times`): local `HH:MM` in `m.meta` mono,
+/// `dim`; the date and seconds in its tooltip. Static text: it never
+/// animates (a history row's least of all).
+fn time_slot(t: chrono::DateTime<chrono::Local>, id: u64, p: &Palette, m: &Metrics) -> Stateful<Div> {
+    let tip: SharedString = crate::times::readout(t).into();
+    mono(crate::times::hhmm(t), m.meta, p.dim)
+        .line_height(px(m.mono_line))
+        .id(("time", id))
+        .debug_selector(move || format!("time {id}"))
+        .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
+}
+
+/// A day line (`crate::times::Days`): the date in `m.meta` mono, `dim`,
+/// between two `hair` rules, across the column.
+fn day_line(item: &Item, p: &Palette, m: &Metrics) -> AnyElement {
+    let Some(t) = crate::times::of(item) else { return div().into_any_element() };
+    let (id, rule) = (item.id, || div().flex_1().h(px(1.)).bg(p.hair));
+    h_flex()
+        .w_full()
+        .gap(px(m.run_gap))
+        .items_center()
+        .debug_selector(move || format!("day {id}"))
+        .child(rule())
+        .child(mono(crate::times::day_label(t.date_naive()), m.meta, p.dim).line_height(px(m.mono_line)))
+        .child(rule())
+        .into_any_element()
 }
 
 /// A tool name's colour role (`draw.rs` `tool_accent`).
@@ -921,6 +977,7 @@ impl AppView {
             }
             Kind::Summary { open, .. } => self.render_summary(d, open, &p, &m, cx),
             Kind::Work => self.render_work(item, row, d.id, &p, &m, lay, cx),
+            Kind::Day => day_line(item, &p, &m),
         };
         let who = match d.who {
             Who::None => None,
@@ -937,12 +994,18 @@ impl AppView {
         let mut out = v_flex().w_full().pt(px(gap)).relative();
         let mut hang = None;
         if let Some((text, color, top)) = who {
-            let l = display(text, m.label, color).line_height(px(m.body_line));
+            let id = d.id;
+            let l = display(text, m.label, color).line_height(px(m.body_line)).debug_selector(move || format!("label {id}"));
+            // Its time: under it in the margin, or at the line's end.
+            let time = crate::times::of(item).map(|t| time_slot(t, d.id, &p, &m));
             if lay.hang {
-                let id = d.id;
-                hang = Some((l.absolute().right(px(lay.column + m.hang)).debug_selector(move || format!("hang-label-{id}")), gap + top));
+                // The label and its time hang in the gutter, outside the
+                // row's reveal clip (`RowParts::label`).
+                let slot = v_flex().items_end().child(l).children(time);
+                hang = Some((slot.absolute().right(px(lay.column + m.hang)).debug_selector(move || format!("hang-label-{id}")), gap + top));
             } else {
-                out = out.child(l.mb(px((2. * m.r).round())));
+                let line = h_flex().w_full().justify_between().items_center().child(l).children(time);
+                out = out.child(line.mb(px((2. * m.r).round())));
             }
         }
         // The write head (motion.md §6.1): where the agent is writing, the
@@ -1536,8 +1599,8 @@ mod tests {
     use synaps_client::transcript::ItemKind;
 
     use super::{
-        Counts, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, Tally, TextRows,
-        Who, build, diff, digits, plus, tally_fit, text_lines, text_w, turn_start,
+        Counts, DAY_ID, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, Tally,
+        TextRows, Who, build, diff, digits, plus, tally_fit, text_lines, text_w, turn_start,
     };
     use crate::files::{CallDelta, Ledger};
     use crate::subagents::Subagents;
@@ -1576,6 +1639,7 @@ mod tests {
                 Kind::Summary { open: false, .. } => "fold",
                 Kind::Summary { open: true, .. } => "unfold",
                 Kind::Work => "work",
+                Kind::Day => "day",
             })
             .collect()
     }
@@ -1637,6 +1701,104 @@ mod tests {
         let t = transcript(&m);
         assert_eq!(kinds(&build(t.items(), 0, true, &HashSet::new(), &Subagents::default()))[1], "work", "busy: the last run is live");
         assert_eq!(kinds(&build(t.items(), 0, false, &HashSet::new(), &Subagents::default()))[1], "fold", "the turn ended");
+    }
+
+    fn dated(m: serde_json::Value, at: String) -> serde_json::Value {
+        let mut m = m;
+        m["_synaps_at"] = json!(at);
+        m
+    }
+
+    /// Day lines (`crate::times::Days`): one where the local date changes
+    /// between dated rows; none before the first dated row (it sets the
+    /// day), none for a legacy row. A session resumed the next day and a
+    /// compaction summary dated later get theirs. The line takes the gap of
+    /// the row under it, which sits a part below; a rebuild from any turn
+    /// agrees with a full build.
+    #[test]
+    fn a_day_line_where_the_local_date_changes() {
+        use crate::times::{day_number, utc_of};
+        let d1 = |h, mi| utc_of(2026, 11, 13, h, mi, 0);
+        let d2 = |h, mi| utc_of(2026, 11, 14, h, mi, 0);
+        let d3 = |h, mi| utc_of(2026, 11, 20, h, mi, 0);
+        let text = |t: &str| json!({"role": "assistant", "content": [{"type": "text", "text": t}]});
+        let m = vec![
+            json!({"role": "user", "content": "from before message times"}),
+            text("legacy"),
+            dated(json!({"role": "user", "content": "first dated"}), d1(23, 58)),
+            dated(text("late"), d1(23, 59)),
+            dated(json!({"role": "user", "content": "resumed the next morning"}), d2(9, 12)),
+            dated(text("morning"), d2(9, 13)),
+            dated(json!({"role": "user", "content": "<context-summary>what came before</context-summary>"}), d3(8, 0)),
+            dated(json!({"role": "user", "content": "after the compaction"}), d3(8, 1)),
+            dated(text("same day"), d3(8, 2)),
+        ];
+        let t = transcript(&m);
+        assert!(t.items()[..2].iter().all(|i| crate::times::of(i).is_none()), "legacy rows have no time");
+        let rows = build(t.items(), 0, false, &HashSet::new(), &Subagents::default());
+        assert_eq!(kinds(&rows), ["user", "prose", "user", "prose", "day", "user", "prose", "day", "note", "user", "prose"]);
+        let (day, under) = (rows[4], rows[5]);
+        assert_eq!((day.item, day.id, day.who), (under.item, under.id | DAY_ID, Who::None));
+        assert_eq!((day.gap, under.gap), (Gap::Turn, Gap::Part), "the line takes the turn's gap");
+        assert_eq!(day.rev, day_number(chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap()));
+        assert_eq!((rows[7].gap, rows[8].gap), (Gap::Part, Gap::Part), "a note's part gap, then a part");
+        for k in 0..t.len() {
+            let from = rows.partition_point(|d| d.item < turn_start(t.items(), k));
+            let part = build(t.items(), turn_start(t.items(), k), false, &HashSet::new(), &Subagents::default());
+            assert_eq!(&rows[from..], &part[..], "rebuilt from item {k}'s turn");
+        }
+        // Nothing dated: no line, whatever the history.
+        let legacy: Vec<serde_json::Value> = m
+            .into_iter()
+            .map(|mut m| {
+                m.as_object_mut().unwrap().remove("_synaps_at");
+                m
+            })
+            .collect();
+        let t = transcript(&legacy);
+        assert!(build(t.items(), 0, false, &HashSet::new(), &Subagents::default()).iter().all(|d| d.kind != Kind::Day));
+    }
+
+    /// A run that crosses midnight is two, the day line between: its rows
+    /// keep their order and the turn its one AGENT.
+    #[test]
+    fn a_run_across_midnight_splits_at_the_day_line() {
+        use crate::times::utc_of;
+        let mut m = vec![dated(json!({"role": "user", "content": "go"}), utc_of(2026, 11, 13, 23, 50, 0))];
+        for (id, at) in [("a", utc_of(2026, 11, 13, 23, 59, 0)), ("b", utc_of(2026, 11, 14, 0, 1, 0))] {
+            let (call, result) = tool(id, "bash");
+            m.push(dated(call, at.clone()));
+            m.push(dated(result, at));
+        }
+        m.push(dated(json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}), utc_of(2026, 11, 14, 0, 2, 0)));
+        let t = transcript(&m);
+        let rows = build(t.items(), 0, false, &HashSet::new(), &Subagents::default());
+        assert_eq!(kinds(&rows), ["user", "work", "day", "work", "prose"]);
+        assert_eq!(rows.iter().map(|d| d.who).collect::<Vec<_>>(), [Who::You, Who::Agent, Who::None, Who::None, Who::None]);
+        assert_eq!(rows.iter().map(|d| d.item).collect::<Vec<_>>(), [0, 1, 2, 2, 3]);
+    }
+
+    /// A live row's time (its event's `ts`) becomes its message time when
+    /// the history lands: same id, same `rev`, same `HH:MM`, the same
+    /// display rows. Nothing flickers, nothing is re-measured.
+    #[test]
+    fn a_live_time_becomes_the_history_time_unchanged() {
+        use crate::times::{hhmm, of, utc_of};
+        let at = utc_of(2026, 11, 16, 14, 5, 9);
+        let mut t = Transcript::new();
+        let started =
+            synaps_client::protocol::SessionEvent::TurnStarted { turn_baseline: 0, trigger: "user".into(), user_text: Some("go".into()) };
+        t.apply_at(&started, &at.replace('Z', ".794878606Z"));
+        let live = &t.items()[0];
+        let before = (live.id, live.rev, of(live).map(hhmm), live.at.clone());
+        let rows = build(t.items(), 0, true, &HashSet::new(), &Subagents::default());
+        t.apply_history(&[dated(json!({"role": "user", "content": "go"}), at.clone())]);
+        let it = &t.items()[0];
+        assert_eq!((it.id, it.rev, of(it).map(hhmm)), (before.0, before.1, Some("14:05".into())));
+        assert_eq!(before.2.as_deref(), Some("14:05"));
+        assert_eq!(it.at.as_deref(), Some(at.as_str()), "the history's time now");
+        assert_ne!(it.at, before.3);
+        assert_eq!(build(t.items(), 0, true, &HashSet::new(), &Subagents::default()), rows);
     }
 
     #[test]

@@ -1512,7 +1512,7 @@ impl Model {
                     self.view_dirty = true;
                 }
             }
-            Event::Session { attach_seq, event, raw, .. } if self.current(attach_seq) => {
+            Event::Session { attach_seq, ts, event, raw, .. } if self.current(attach_seq) => {
                 // The engine's note of a worker steer in the main conversation.
                 if raw["ev"] == "external" && raw["event"]["content"]["content_type"] == "subagent_steer" {
                     self.watch.steer_accepted(raw["event"]["content"]["data"]["handle_id"].as_str().unwrap_or(""));
@@ -1526,7 +1526,7 @@ impl Model {
                     }
                     _ => {}
                 }
-                self.transcript.apply(&event);
+                self.transcript.apply_at(&event, &ts);
                 if !self.answered.is_empty() {
                     let pending = self.transcript.pending_prompts();
                     self.answered.retain(|(_, id)| pending.iter().any(|p| p.id == *id));
@@ -1638,7 +1638,7 @@ mod tests {
     }
 
     fn session(attach_seq: u64, event: SessionEvent) -> Event {
-        Event::Session { attach_seq, session_id: "s".into(), seq: 0, event, raw: Arc::new(Value::Null) }
+        Event::Session { attach_seq, session_id: "s".into(), seq: 0, ts: String::new(), event, raw: Arc::new(Value::Null) }
     }
 
     fn attach(m: &mut Model, seq: u64) {
@@ -1865,7 +1865,14 @@ mod tests {
         // its text back (its view is on screen).
         let steer = |h: &str| {
             let raw = json!({"ev": "external", "event": {"content": {"content_type": "subagent_steer", "data": {"handle_id": h}}}});
-            Event::Session { attach_seq: 1, session_id: "s".into(), seq: 0, event: SessionEvent::Idle, raw: Arc::new(raw) }
+            Event::Session {
+                attach_seq: 1,
+                session_id: "s".into(),
+                seq: 0,
+                ts: String::new(),
+                event: SessionEvent::Idle,
+                raw: Arc::new(raw),
+            }
         };
         m.watch.steer_sent("sa_2", "stop after the next step");
         m.apply(steer("sa_2"));

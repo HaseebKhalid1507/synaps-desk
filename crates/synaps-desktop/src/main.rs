@@ -56,6 +56,7 @@ mod subagents;
 mod tabs;
 mod tabstrip;
 mod theme;
+mod times;
 mod tray;
 mod turns;
 #[cfg(test)]
