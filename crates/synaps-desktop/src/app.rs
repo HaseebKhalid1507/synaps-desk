@@ -6499,7 +6499,7 @@ impl Render for AppView {
             .children(self.render_menu_at_point(&p, cx))
             .children(self.render_session_menu(&p, cx))
             .children(self.render_workers_menu(&p, cx))
-            .children(self.render_link(tear, &p))
+            .children(self.render_link(tear, &p, &theme::live_palette(cx)))
             .children(self.render_tracer(&p))
             // Painted last, after every row was rendered: what the frame's
             // motion asked for (a frame, the one timer, or nothing; with a

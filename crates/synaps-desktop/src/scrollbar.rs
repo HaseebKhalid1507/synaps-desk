@@ -4,7 +4,9 @@
 //! theme roles only (the accent while dragged).
 //!
 //! A bar shows while the pointer is over its pane and for [`LINGER`] after
-//! a scroll, then it is gone: no fade, no motion. The transcript's shows
+//! a scroll, then it is gone. Under Full its colour fades (motion.md §6.4):
+//! in from its ground over 90 ms, out over 270 ms; it never moves. The
+//! transcript's shows
 //! whenever its rows are taller than the pane (the position cue matters on
 //! the main reading surface). A pane whose content fits draws nothing and
 //! listens to nothing; a hidden bar draws nothing and wakes nothing: one

@@ -441,7 +441,7 @@ pub(crate) enum Kind {
 /// a loss, it restores and scans (the Scan also at most once per budget).
 /// The drain is a [`Tween`]: a drop mid-restore or a return mid-drain
 /// turns from where it is, never from an end.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Link {
     /// Up last frame (none: not seen yet).
     pub up: Option<bool>,
@@ -458,12 +458,6 @@ pub(crate) struct Link {
     pub scanned: Option<Instant>,
     /// How drained the palette is (0..1).
     pub drain: Option<Tween>,
-}
-
-impl Default for Link {
-    fn default() -> Self {
-        Link { up: None, down: None, lost: false, scan: None, glitch: None, tore: None, scanned: None, drain: None }
-    }
 }
 
 /// How long a non-reload drop may last before it is a loss.
@@ -1931,8 +1925,8 @@ mod tests {
     use gpui_kit::{Bounds, point, px, size};
 
     use super::{
-        BASE, BEAT, GLOW, HEAD_HOLD, Kind, LINK_GRACE, Level, Link, Lock, Motion, RELOAD_GRACE, QUICK, SLIDE_CAP, SLOW, STAGGER, STAGGER_CAP, Setting, Slide, Tag, Tween,
-        ease, exit, stagger,
+        BASE, BEAT, GLOW, HEAD_HOLD, Kind, LINK_GRACE, Level, Link, Lock, Motion, QUICK, RELOAD_GRACE, SLIDE_CAP, SLOW, STAGGER,
+        STAGGER_CAP, Setting, Slide, Tag, Tween, ease, exit, stagger,
     };
 
     fn ms(n: u64) -> Duration {

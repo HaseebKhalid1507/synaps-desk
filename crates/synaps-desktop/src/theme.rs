@@ -370,6 +370,11 @@ macro_rules! roles {
                 Palette { $($name: crate::motion::mix(self.$name, to.$name, t),)* sel: self.sel }
             }
 
+            /// Every role, by name.
+            fn each_mut(&mut self, mut f: impl FnMut(&'static str, &mut Hsla)) {
+                $(f(stringify!($name), &mut self.$name);)*
+            }
+
             /// A role by its name (the tests).
             #[cfg(test)]
             pub fn role(&self, name: &str) -> Option<Hsla> {
@@ -438,86 +443,22 @@ roles! {
 }
 
 impl Palette {
-    /// The link down (motion.md §5.3): every status, identity and accent
-    /// role `k` of the way to its drained self (70 % toward its own grey);
-    /// grounds, surfaces, lines, text and code untouched.
+    /// The link is down (motion.md §5.3): every role but the grounds and
+    /// the ink `0.7 × k` of the way to the grey of its own luminance (so
+    /// every contrast stays): status, identity, accent, the chrome's heads
+    /// and wordmark, the rail's marks, tool hues, chart series. The window
+    /// is visibly stale; its words still read.
     pub fn drained(&self, k: f32) -> Palette {
         if k <= 0. {
             return *self;
         }
         let t = 0.7 * k.min(1.);
         let mut p = *self;
-        for c in [
-            &mut p.you,
-            &mut p.warn,
-            &mut p.run,
-            &mut p.ready,
-            &mut p.cost,
-            &mut p.err,
-            &mut p.think,
-            &mut p.ok,
-            &mut p.t_bash,
-            &mut p.t_read,
-            &mut p.t_write,
-            &mut p.t_edit,
-            &mut p.t_grep,
-            &mut p.t_find,
-            &mut p.t_ls,
-            &mut p.t_sub,
-            &mut p.t_ext,
-            &mut p.t_gen,
-            &mut p.sub_name_t,
-            &mut p.sub_status_t,
-            &mut p.ok_o,
-            &mut p.err_o,
-            &mut p.think_o,
-            &mut p.warn_k,
-            &mut p.err_k,
-            &mut p.run_k,
-            &mut p.ok_k,
-            &mut p.run_mark_k,
-            &mut p.err_mark_k,
-            &mut p.focus_k,
-            &mut p.you_mark,
-            &mut p.you_mark_t,
-            &mut p.warn_mark,
-            &mut p.run_mark,
-            &mut p.focus,
-            &mut p.btn_fill,
-            &mut p.warn_fill,
-            &mut p.btn_hi,
-            &mut p.warn_hi,
-            &mut p.btn_press,
-            &mut p.warn_press,
-            &mut p.warn_ch,
-            &mut p.run_ch,
-            &mut p.unread_ch,
-            &mut p.open_ch,
-            &mut p.ready_ch,
-            &mut p.err_ch,
-            &mut p.cost_ch,
-            &mut p.ok_ch,
-            &mut p.edit_ch,
-            &mut p.write_ch,
-            &mut p.bash_ch,
-            &mut p.sub_name,
-            &mut p.sub_status,
-            &mut p.sub_done,
-            &mut p.warn_mark_ch,
-            &mut p.run_mark_ch,
-            &mut p.unread_mark_ch,
-            &mut p.focus_ch,
-            &mut p.ready_mark_ch,
-            &mut p.err_mark_ch,
-            &mut p.you_bar,
-            &mut p.agent,
-            &mut p.agent_u,
-            &mut p.sub_rule,
-            &mut p.sub_time_t,
-            &mut p.sub_time,
-        ] {
-            *c = drain_hsla(*c, t);
-        }
+        p.each_mut(|name, c| {
+            if !UNDRAINED.contains(&name) {
+                *c = drain_hsla(*c, t);
+            }
+        });
         p
     }
 
@@ -1022,6 +963,12 @@ impl Scheme {
     }
 }
 
+/// The palette not drained (a cross-fade's blend): what the link's Scan
+/// is drawn in, live again from its first frame (motion.md §5.1).
+pub fn live_palette(cx: &App) -> Palette {
+    cx.global::<Scheme>().blended()
+}
+
 /// The palette, by value (no allocation).
 pub fn palette(cx: &App) -> Palette {
     let s = cx.global::<Scheme>();
@@ -1047,6 +994,13 @@ pub fn luminance_hsla(c: Hsla) -> f32 {
     let rgb = Rgba::from(c);
     0.2126 * lin(rgb.r) + 0.7152 * lin(rgb.g) + 0.0722 * lin(rgb.b)
 }
+
+/// What a drain leaves: the grounds (and what is a ground: fills, rules,
+/// thumbs), and the ink and prose the words are in.
+const UNDRAINED: &[&str] = &[
+    "chrome", "canvas", "user", "code", "tool", "tool_out", "card", "card_hi", "raised", "hair", "edge", "frame", "add_bg", "del_bg",
+    "thumb", "thumb_ch", "thumb_u", "press_ch", "press_k", "ink", "prose",
+];
 
 /// `c` mixed `t` toward the grey of its own relative luminance, in linear
 /// light (motion.md §5.3's drain): its luminance, so every contrast it
@@ -1797,6 +1751,23 @@ mod tests {
                     }
                 }
                 assert_eq!(p.drained(0.), p, "{name}: none at 0");
+                // Every role but the grounds and the words loses most of its
+                // hue (the wordmark and heads, rail marks, chart series too).
+                let chroma = |c: Hsla| {
+                    let c = Rgba::from(c);
+                    c.r.max(c.g).max(c.b) - c.r.min(c.g).min(c.b)
+                };
+                let (mut dp, mut pp) = (d, p);
+                let mut was = Vec::new();
+                pp.each_mut(|n, c| was.push((n, *c)));
+                let mut i = 0;
+                dp.each_mut(|n, c| {
+                    let (_, before) = was[i];
+                    i += 1;
+                    if !UNDRAINED.contains(&n) {
+                        assert!(chroma(*c) <= 0.5 * chroma(before) + 0.01, "{name}: {n} keeps its hue: {before:?} → {c:?}");
+                    }
+                });
             }
         }
         assert!(worst < 0.06, "the drain moved a contrast by {worst:.3}");
