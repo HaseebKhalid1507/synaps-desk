@@ -8,13 +8,19 @@
 //! whose journal id is still empty is keyed by its live id until the journal
 //! id appears. Never by a row's position or label.
 //!
-//! The journal id moves: a LinkedSuccessor compaction gives the same
-//! conversation a new one (the TUI's sessions on the daemon, every pin the
-//! daemon restores), and the saved listing folds the old one into it. So a
-//! favourite keeps every id it has been seen under (`aliases`) and follows
-//! the chain forward: a held session's new journal id (it is still matched
-//! by its live id), and the journal a resume of it attached to
-//! ([`Favourites::follow`]). One conversation is one favourite.
+//! A held session's journal id moves, and not only for the same
+//! conversation: a LinkedSuccessor compaction gives it a new one, but the
+//! TUI's `/clear` (a new, empty conversation) and `/resume` (another one)
+//! swap a different journal into the same live session. So a held session
+//! is this favourite only by its journal id (its live id says nothing), and
+//! a favourite follows a new journal only on the daemon's own word that it
+//! is the same conversation: the conversation's header, on the attached
+//! session (its attach, and every swap), names an id the favourite holds as
+//! its `parent_session` (set by compaction only; one hop per header, so a
+//! chain is followed swap by swap; [`Favourites::continued`]). A compaction
+//! of a session not attached here is not seen: its favourite and its new
+//! journal are two rows until it is attached. Never a wrong target, never
+//! two favourites the user added folded into one.
 //!
 //! Each keeps a snapshot (label, folder, model, last update): the saved
 //! listing is newest first and capped, so an old favourite may not be in it,
@@ -36,8 +42,9 @@ pub struct Favourite {
     /// The journal id (the newest seen); a held session's live id while it
     /// has none yet (`provisional`).
     pub id: String,
-    /// Every other id it has been seen under, oldest first: the journal
-    /// ids a compaction moved it from, and the live ids that held it.
+    /// Every other id it has been known by, oldest first: the journal ids
+    /// a compaction moved it from (and the live id it had while
+    /// provisional).
     pub aliases: Vec<String>,
     pub provisional: bool,
     /// What it was last called (its name, else its title).
@@ -115,10 +122,13 @@ impl Favourite {
         !id.is_empty() && self.ids().any(|i| i == id)
     }
 
-    /// `src` is this favourite.
+    /// `src` is this favourite: by its journal id (a held session's live
+    /// id stays when `/clear` or `/resume` swaps another conversation in);
+    /// by its live id only while this favourite has no journal id yet.
     pub fn is(&self, src: Source<'_>) -> bool {
         match src {
-            Source::Live(s) => self.knows(&s.id) || self.knows(&s.journal_id),
+            Source::Live(s) if self.provisional => s.id == self.id,
+            Source::Live(s) => self.knows(&s.journal_id),
             Source::Saved(v) => self.knows(&v.id),
         }
     }
@@ -143,10 +153,9 @@ impl Favourite {
         }
     }
 
-    /// Keyed by `journal` from now on, the old key kept. Never back to an
-    /// id it has left (a listing older than the sighting that moved it).
+    /// Keyed by `journal` from now on, the old key kept.
     fn rekey(&mut self, journal: &str) {
-        if journal.is_empty() || journal == self.id || self.aliases.iter().any(|a| a == journal) {
+        if journal.is_empty() || self.knows(journal) {
             return;
         }
         let old = std::mem::replace(&mut self.id, journal.to_string());
@@ -168,10 +177,12 @@ impl Favourite {
         let text = |s: &Option<String>| s.as_deref().filter(|t| !t.is_empty()).map(str::to_string);
         let (name, title, cwd, model, updated) = match src {
             Source::Live(s) => {
-                // Matched by its live id, its journal moved on (a
-                // compaction): it follows; the live id still matches it.
-                self.rekey(&s.journal_id);
-                self.alias(&s.id);
+                // Provisional (keyed by the live id): its journal id once
+                // it has one. Nothing else moves it.
+                if self.provisional && !s.journal_id.is_empty() {
+                    self.rekey(&s.journal_id);
+                    self.provisional = false;
+                }
                 // Held: it is there.
                 self.gone = None;
                 // A held session has no update time of its own: its state's.
@@ -295,40 +306,59 @@ impl Favourites {
         }
     }
 
-    /// A resume of `target` attached `meta`: the daemon followed the
-    /// compaction chain to its newest journal. The favourite follows.
-    pub fn follow(&mut self, target: &str, meta: &SessionMeta) -> bool {
-        let Some(f) = self.list.iter_mut().find(|f| f.knows(target)) else { return false };
-        let change = f.take(Source::Live(meta), 0);
-        self.settle(change)
+    /// The attached session's conversation is `header` (its attach's
+    /// snapshot, or a `Conversation` after a swap): if it names, as its
+    /// `parent_session`, an id a favourite holds, it is that favourite's
+    /// conversation compacted (the daemon sets it on a compaction's
+    /// successor only; `/clear` leaves it empty, `/resume` names the
+    /// resumed one's own), and the favourite follows it there. Not if
+    /// another favourite already holds the new id: two the user added stay
+    /// two. `true`: a favourite moved (written).
+    pub fn continued(&mut self, header: &Value) -> bool {
+        let id = header.get("id").and_then(Value::as_str).unwrap_or("");
+        let parent = header.get("parent_session").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() || parent.is_empty() || self.position(id).is_some() {
+            return false;
+        }
+        let Some(f) = self.list.iter_mut().find(|f| f.knows(parent)) else { return false };
+        f.rekey(id);
+        self.generation += 1;
+        true
     }
 
-    /// Every favourite held (`sessions`) or listed (`saved`, the listing
-    /// numbered `listed`): its snapshot refreshed, its key moved to the
-    /// journal id it has now, and seen, so not gone. A held one wins over
-    /// its listing (it is the newer). `true` if its row or its ids changed
-    /// (the rail rebuilds, the file is written); an update time alone is
-    /// kept quietly.
-    pub fn refresh<'a>(&mut self, sessions: &[SessionMeta], saved: impl Iterator<Item = &'a SavedSession> + Clone, listed: u64) -> bool {
+    /// Every favourite held (`sessions`) or listed (`lists`: each saved
+    /// listing with the number it was asked under, [`crate::model::Named`]'s
+    /// own per list): its snapshot refreshed,
+    /// a provisional one keyed by its journal id once it has one, and seen,
+    /// so not gone. A held one wins over its listings (it is the newer).
+    /// `true` if its row or its ids changed (the rail rebuilds, the file is
+    /// written); an update time alone is kept quietly.
+    pub fn refresh(&mut self, sessions: &[SessionMeta], lists: &[(&[SavedSession], u64)]) -> bool {
         let mut change = Change::None;
         for f in &mut self.list {
             let live = sessions.iter().find(|s| s.lifecycle != "ending" && f.is(Source::Live(s)));
             let src = match live {
-                Some(s) => Some(Source::Live(s)),
-                None => saved.clone().find(|v| f.is(Source::Saved(v))).map(Source::Saved),
+                Some(s) => Some((Source::Live(s), 0)),
+                // The newest listing that has it (each says only what it
+                // knew when it was asked).
+                None => lists
+                    .iter()
+                    .filter_map(|(l, n)| l.iter().find(|v| f.is(Source::Saved(v))).map(|v| (Source::Saved(v), *n)))
+                    .max_by_key(|(_, n)| *n),
             };
-            if let Some(src) = src {
+            if let Some((src, listed)) = src {
                 change = change.max(f.take(src, listed));
             }
         }
         self.settle(change)
     }
 
-    /// After sightings: two found to be one conversation (favourited by its
-    /// live id and again from its saved row, or before and after a
-    /// compaction) are one, the first kept. `true` if a write is due.
+    /// After sightings: a provisional favourite now keyed by a journal id
+    /// another already has (favourited by its live id, and again from its
+    /// saved row) is that one, the first kept. Nothing else is folded.
+    /// `true` if a write is due.
     fn settle(&mut self, change: Change) -> bool {
-        let merged = dedupe(&mut self.list);
+        let merged = dedupe_by_id(&mut self.list);
         self.quiet |= change == Change::Quiet;
         let shown = merged || change == Change::Shown;
         if shown {
@@ -349,7 +379,23 @@ impl Favourites {
     }
 }
 
-/// Entries of one conversation folded into the first. `true` if any were.
+/// Entries with one journal id folded into the first. `true` if any were.
+fn dedupe_by_id(list: &mut Vec<Favourite>) -> bool {
+    let n = list.len();
+    let mut out: Vec<Favourite> = Vec::with_capacity(n);
+    for f in list.drain(..) {
+        match out.iter_mut().find(|g| g.id == f.id) {
+            Some(g) => g.absorb(&f),
+            None => out.push(f),
+        }
+    }
+    *list = out;
+    list.len() != n
+}
+
+/// Entries of one conversation (they share an id: one instance followed a
+/// compaction the other's entry predates) folded into the first, as files
+/// are read and merged. `true` if any were.
 fn dedupe(list: &mut Vec<Favourite>) -> bool {
     let n = list.len();
     let mut out: Vec<Favourite> = Vec::with_capacity(n);
@@ -482,8 +528,19 @@ mod tests {
         .unwrap()
     }
 
-    fn none<'a>() -> std::iter::Empty<&'a SavedSession> {
-        std::iter::empty()
+    /// A saved listing, asked for as number `n`.
+    fn listed(v: &[SavedSession], n: u64) -> [(&[SavedSession], u64); 1] {
+        [(v, n)]
+    }
+
+    /// The header of the attached session's conversation, as the daemon
+    /// sends it (`SessionHeader`: `parent_session` set by compaction only).
+    fn header(id: &str, parent: Option<&str>) -> Value {
+        serde_json::json!({"id": id, "title": "t", "parent_session": parent})
+    }
+
+    fn ids(f: &Favourites) -> Vec<&str> {
+        f.list.iter().map(|f| f.id.as_str()).collect()
     }
 
     /// Brief 1: a held session with no journal id yet is keyed by its live
@@ -496,75 +553,134 @@ mod tests {
         assert!(f.toggle(Source::Live(&s), 100));
         assert_eq!((f.list[0].id.as_str(), f.list[0].provisional), ("20261117-100000-aaaa", true));
         let s = live("20261117-100000-aaaa", "j-relay", "Relay");
-        assert!(f.refresh(std::slice::from_ref(&s), none(), 0));
+        assert!(f.refresh(std::slice::from_ref(&s), &[]));
         assert_eq!((f.list[0].id.as_str(), f.list[0].provisional), ("j-relay", false));
         // Parked, then resumed under a new live id: the same favourite.
         let again = live("20261117-120000-bbbb", "j-relay", "Relay");
         assert!(f.contains(Source::Live(&again)));
         // Saved: the same journal.
         assert!(f.contains(Source::Saved(&saved("j-relay", "Relay", "/home/u/relay"))));
-        // Favourited by its live id, and again from its saved row: one.
+        // Its old live id now holding another journal is not it.
+        assert!(!f.contains(Source::Live(&live("20261117-100000-aaaa", "j-other", "x"))));
+        // Favourited by its live id, and again from its saved row: one (the
+        // same journal id).
         let mut f = Favourites::default();
         f.toggle(Source::Live(&live("L", "", "x")), 1);
         f.list.push(Favourite::of(Source::Saved(&saved("J", "x", "/")), 2));
-        f.refresh(&[live("L", "J", "x")], none(), 0);
+        f.refresh(&[live("L", "J", "x")], &[]);
         assert_eq!(f.list.len(), 1);
         assert_eq!(f.list[0].added_at, 1, "the first stays");
     }
 
-    /// H2: a LinkedSuccessor compaction moves the journal id of a session
-    /// that stays held (its live id does not move); the favourite follows,
-    /// once and twice, and is one favourite held, parked or listed under the
-    /// newest id. Never back to an id it left (a stale listing).
+    /// R1: a compaction seen here (the attached session's `Conversation`
+    /// after `CompactionApplied`, its header naming the old journal as its
+    /// parent: live-checked on 0.11.1) is followed, hop by hop; the
+    /// favourite is one, held, parked or listed under the newest id.
     #[test]
-    fn a_favourite_follows_its_compactions() {
+    fn a_compaction_is_followed() {
         let mut f = Favourites::default();
         f.toggle(Source::Live(&live("J1", "J1", "Relay")), 1);
-        assert_eq!(f.list[0].id, "J1");
-        // One compaction, held: J1's actor writes J2.
-        let once = live("J1", "J2", "Relay");
-        assert!(f.refresh(std::slice::from_ref(&once), none(), 0), "a new key: written");
+        let g = f.generation;
+        // The poll may land before the header: not matched for that poll
+        // (its journal is not one the favourite holds yet), never moved.
+        assert!(!f.refresh(&[live("J1", "J2", "Relay")], &[]));
+        assert_eq!(ids(&f), ["J1"]);
+        assert!(f.continued(&header("J2", Some("J1"))), "the daemon says J2 continues J1");
         assert_eq!((f.list[0].id.as_str(), &f.list[0].aliases[..]), ("J2", &["J1".to_string()][..]));
-        assert!(f.contains(Source::Live(&once)));
-        // Two: still held by J1's actor.
-        let twice = live("J1", "J3", "Relay");
-        assert!(f.contains(Source::Live(&twice)), "matched by its live id while its journal moves");
-        assert!(f.refresh(std::slice::from_ref(&twice), none(), 0));
+        assert_eq!(f.generation, g + 1, "written");
+        assert!(f.contains(Source::Live(&live("J1", "J2", "Relay"))));
+        assert!(!f.continued(&header("J2", Some("J1"))), "every later turn's header: once");
+        // Two: one hop each.
+        assert!(f.continued(&header("J3", Some("J2"))));
         assert_eq!(f.list[0].id, "J3");
-        // Parked: the same actor, the same ids.
-        let parked = SessionMeta { lifecycle: "parked".into(), ..twice.clone() };
-        assert!(!f.refresh(std::slice::from_ref(&parked), none(), 0));
+        // Parked: the same ids.
+        let parked = SessionMeta { lifecycle: "parked".into(), ..live("J1", "J3", "Relay") };
+        assert!(!f.refresh(std::slice::from_ref(&parked), &[]));
         // Evicted: listed under its chain head (the daemon folds J1, J2 into it).
-        let head = saved("J3", "Relay", "/home/u/relay");
-        assert!(f.contains(Source::Saved(&head)));
-        f.refresh(&[], std::iter::once(&head), 1);
+        let head = [saved("J3", "Relay", "/home/u/relay")];
+        assert!(f.contains(Source::Saved(&head[0])));
+        f.refresh(&[], &listed(&head, 1));
         assert_eq!((f.list.len(), f.list[0].id.as_str()), (1, "J3"));
         // Resumed: the actor is rebuilt as the head.
         assert!(f.contains(Source::Live(&live("J3", "J3", "Relay"))));
         // A listing from before the compaction never moves it back.
-        f.refresh(&[], std::iter::once(&saved("J2", "Relay", "/")), 2);
+        f.refresh(&[], &listed(&[saved("J2", "Relay", "/")], 2));
         assert_eq!(f.list[0].id, "J3");
-        // Favourited before and after (an old J1, and the head from
-        // history): one favourite once a sighting ties them.
-        let mut f = Favourites::default();
-        f.toggle(Source::Saved(&saved("J1", "Relay", "/")), 1);
-        f.toggle(Source::Saved(&saved("J3", "Relay", "/")), 2);
-        assert_eq!(f.list.len(), 2, "nothing ties them yet");
-        assert!(f.refresh(&[live("J1", "J3", "Relay")], none(), 0));
-        assert_eq!((f.list.len(), f.list[0].added_at, f.list[0].id.as_str()), (1, 1, "J3"));
     }
 
-    /// H2: a resume of an old id the daemon followed to the chain's newest
-    /// journal (the favourite not held meanwhile): the favourite follows the
-    /// attach.
+    /// R1: `/clear` (a new, empty conversation: its header has no parent)
+    /// in the live session that holds a favourite: not followed. The
+    /// favourite stays on its conversation (its saved row, its resume), and
+    /// the cleared one, under the same live id, is not it.
     #[test]
-    fn a_resume_that_lands_on_a_newer_journal_is_followed() {
-        let mut f = Favourites::new(vec![Favourite::of(Source::Saved(&saved("J1", "Relay", "/home/u/relay")), 1)]);
-        assert!(!f.follow("J9", &live("J3", "J3", "Relay")), "not a favourite's resume");
-        assert!(f.follow("J1", &live("J3", "J3", "Relay")));
-        assert_eq!((f.list[0].id.as_str(), &f.list[0].aliases[..]), ("J3", &["J1".to_string()][..]));
-        assert!(f.contains(Source::Saved(&saved("J3", "Relay", "/"))));
-        assert_eq!(f.position("J1"), Some(0));
+    fn a_clear_is_not_followed() {
+        let mut f = Favourites::default();
+        f.toggle(Source::Live(&live("J1", "J1", "Relay")), 1);
+        let g = f.generation;
+        assert!(!f.continued(&header("Y", None)));
+        let cleared = live("J1", "Y", "");
+        assert!(!f.contains(Source::Live(&cleared)), "the live id says nothing");
+        assert!(!f.refresh(std::slice::from_ref(&cleared), &[]));
+        assert_eq!((ids(&f), f.list[0].aliases.len(), f.generation), (vec!["J1"], 0, g));
+        assert!(f.contains(Source::Saved(&saved("J1", "Relay", "/"))), "its saved row is it");
+        // `/resume J1` back in that session: it is held again.
+        assert!(f.contains(Source::Live(&live("J1", "J1", "Relay"))));
+        // After a compaction it followed: `/clear` keeps it on the successor.
+        assert!(f.continued(&header("J2", Some("J1"))));
+        assert!(!f.continued(&header("Y2", None)));
+        assert!(!f.contains(Source::Live(&live("J1", "Y2", ""))));
+        assert_eq!(ids(&f), ["J2"]);
+    }
+
+    /// R1: `/resume` of another conversation in the live session holding a
+    /// favourite: not followed; if it is another favourite, the two stay
+    /// two (each matched by its own journal).
+    #[test]
+    fn a_resume_onto_another_favourite_merges_nothing() {
+        let mut f = Favourites::default();
+        f.toggle(Source::Live(&live("A", "A", "Alpha")), 1);
+        f.toggle(Source::Saved(&saved("B", "Bravo", "/")), 2);
+        // `/resume B` in A's session: B's own header (no parent).
+        assert!(!f.continued(&header("B", None)));
+        let swapped = live("A", "B", "Bravo");
+        assert!(f.refresh(std::slice::from_ref(&swapped), &[]), "B is held now (its row shows it)");
+        assert_eq!(ids(&f), ["A", "B"]);
+        assert_eq!(f.find(Source::Live(&swapped)), Some(1), "held: B's favourite, not A's");
+        assert!(f.contains(Source::Saved(&saved("A", "Alpha", "/"))), "A's saved row is still A's");
+        // B resumed is itself a compaction's successor (of B0, which A's
+        // favourite never held): not A's.
+        assert!(!f.continued(&header("B", Some("B0"))));
+        // A successor of A that B's favourite already holds: the user's two
+        // favourites stay two (no merge, no move).
+        let mut f = Favourites::default();
+        f.toggle(Source::Saved(&saved("A", "Alpha", "/")), 1);
+        f.toggle(Source::Saved(&saved("A2", "Alpha, compacted", "/")), 2);
+        assert!(!f.continued(&header("A2", Some("A"))));
+        assert_eq!((ids(&f), f.list[0].aliases.len()), (vec!["A", "A2"], 0));
+    }
+
+    /// R1: a compaction of a held session not attached here (the TUI's) is
+    /// not seen: the favourite and the new journal are two rows (it stays
+    /// on its old id, which resumes into the chain). Attached, the header
+    /// says so: one. A resume of the old id the daemon took down the chain
+    /// is followed only as far as the header proves (one hop).
+    #[test]
+    fn an_unseen_compaction_is_two_rows_until_attached() {
+        let mut f = Favourites::default();
+        f.toggle(Source::Live(&live("J1", "J1", "Relay")), 1);
+        let compacted = live("J1", "J2", "↳ Relay");
+        assert!(!f.contains(Source::Live(&compacted)), "two rows: the favourite, and J2 in OPEN");
+        assert!(!f.refresh(std::slice::from_ref(&compacted), &[]));
+        assert_eq!(ids(&f), ["J1"]);
+        // Attached (its row, or the favourite's resume): reconciled.
+        assert!(f.continued(&header("J2", Some("J1"))));
+        assert!(f.contains(Source::Live(&compacted)));
+        // Two compactions unseen, then a resume of the old id: the attach
+        // names only the last hop: not proven, not moved (two rows).
+        let mut f = Favourites::default();
+        f.toggle(Source::Saved(&saved("J1", "Relay", "/")), 1);
+        assert!(!f.continued(&header("J3", Some("J2"))));
+        assert_eq!(ids(&f), ["J1"]);
     }
 
     /// M1: what a held session's every turn changes (its state's time) is
@@ -576,11 +692,11 @@ mod tests {
         f.toggle(Source::Live(&s), 1);
         let g = f.generation;
         s.state_since = Some("2026-11-16T10:05:00Z".into());
-        assert!(!f.refresh(std::slice::from_ref(&s), none(), 0));
+        assert!(!f.refresh(std::slice::from_ref(&s), &[]));
         assert_eq!((f.generation, f.quiet), (g, true), "kept, not written");
         assert_eq!(f.list[0].updated_at.as_deref(), Some("2026-11-16T10:05:00Z"));
         s.title = Some("Relay, renamed".into());
-        assert!(f.refresh(std::slice::from_ref(&s), none(), 0));
+        assert!(f.refresh(std::slice::from_ref(&s), &[]));
         assert_eq!(f.generation, g + 1);
     }
 
@@ -589,15 +705,15 @@ mod tests {
     #[test]
     fn the_snapshot_follows_the_session() {
         let mut f = Favourites::default();
-        let v = saved("j1", "Old title", "/home/u/a");
-        f.toggle(Source::Saved(&v), 5);
+        let v = [saved("j1", "Old title", "/home/u/a")];
+        f.toggle(Source::Saved(&v[0]), 5);
         assert_eq!((f.list[0].label.as_str(), f.list[0].cwd.as_deref()), ("Old title", Some("/home/u/a")));
-        assert!(!f.refresh(&[], std::iter::once(&v), 1), "nothing new");
-        let v2 = saved("j1", "New title", "/home/u/b");
-        assert!(f.refresh(&[], std::iter::once(&v2), 1));
+        assert!(!f.refresh(&[], &listed(&v, 1)), "nothing new");
+        let v2 = [saved("j1", "New title", "/home/u/b")];
+        assert!(f.refresh(&[], &listed(&v2, 1)));
         assert_eq!((f.list[0].label.as_str(), f.list[0].cwd.as_deref()), ("New title", Some("/home/u/b")));
         let g = f.generation;
-        assert!(!f.refresh(&[], none(), 1), "out of the listing: kept as it was");
+        assert!(!f.refresh(&[], &listed(&[], 1)), "out of the listing: kept as it was");
         assert_eq!((f.generation, f.list[0].label.as_str()), (g, "New title"));
     }
 
@@ -607,17 +723,25 @@ mod tests {
     #[test]
     fn gone_holds_until_it_is_seen_again() {
         let mut f = Favourites::default();
-        let v = saved("j1", "Title", "/home/u/a");
-        f.toggle(Source::Saved(&v), 5);
+        let v = [saved("j1", "Title", "/home/u/a")];
+        f.toggle(Source::Saved(&v[0]), 5);
         // Two listings asked for so far; the resume failed.
         assert!(f.set_gone("j1", 2));
         assert!(!f.set_gone("j1", 2), "once");
-        assert!(!f.refresh(&[], std::iter::once(&v), 2), "the cached listing (ask 2): still gone");
+        assert!(!f.refresh(&[], &listed(&v, 2)), "the cached listing (ask 2): still gone");
         assert!(f.list[0].is_gone());
-        assert!(f.refresh(&[], std::iter::once(&v), 3), "asked for after: there");
+        assert!(f.refresh(&[], &listed(&v, 3)), "asked for after: there");
         assert!(!f.list[0].is_gone());
+        // R3: each list by its own number: a stale one that still has it
+        // (the named list, asked before the verdict) says nothing, whatever
+        // the other (newer, without it) says.
         f.set_gone("j1", 3);
-        assert!(f.refresh(&[live("L", "j1", "Title")], none(), 0), "held: there");
+        assert!(!f.refresh(&[], &[(&[], 5), (&v, 2)]), "named list from ask 2: still gone");
+        assert!(f.list[0].is_gone());
+        assert!(f.refresh(&[], &[(&v, 2), (&v, 4)]), "the newer list that has it says it is there");
+        assert!(!f.list[0].is_gone());
+        f.set_gone("j1", 4);
+        assert!(f.refresh(&[live("L", "j1", "Title")], &[]), "held: there");
         assert!(!f.list[0].is_gone());
     }
 
@@ -631,7 +755,8 @@ mod tests {
         f.toggle(Source::Live(&live("L1", "", "One")), 1);
         f.toggle(Source::Live(&live("L3", "J3", "Three")), 3);
         f.set_gone("j2", 0);
-        assert_eq!(f.list[2].aliases, ["L3"]);
+        assert!(f.continued(&header("J4", Some("J3"))));
+        assert_eq!(f.list[2].aliases, ["J3"]);
         let back = from_json(&to_json(&f.list));
         assert_eq!(back, f.list);
         let edited = serde_json::json!([{"label": "no id"}, {"id": "a"}, {"id": "a", "label": "twice"}, "junk"]);
@@ -677,6 +802,26 @@ mod tests {
         theirs.extra.insert("colour".into(), "teal".into());
         let out = merge(&[theirs], &start, &start);
         assert_eq!(out[0].extra.get("colour"), Some(&Value::from("teal")));
+    }
+
+    /// R5: a write's result taken even when the list changed while it ran:
+    /// a favourite removed meanwhile stays removed at the next write (with
+    /// the base the write left, it is this instance's remove, not another
+    /// instance's add).
+    #[test]
+    fn a_remove_during_a_write_stays_removed() {
+        let fav = |id: &str, at: i64| Favourite::of(Source::Saved(&saved(id, id, "/")), at);
+        let mut f = Favourites::new(vec![fav("a", 1)]);
+        f.list.push(fav("x", 2));
+        let sent = f.list.clone();
+        let file = merge(&[fav("a", 1)], &f.base, &sent);
+        // x unfavourited while the write ran.
+        f.remove("x");
+        f.written(&sent, file.clone());
+        assert_eq!(merge(&file, &f.base, &f.list).iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["a"]);
+        // Its result dropped (the bug): x comes back as another's.
+        let stale = Favourites::new(vec![fav("a", 1)]);
+        assert_eq!(merge(&file, &stale.base, &f.list).len(), 2);
     }
 
     /// H1: only the daemon's own refusal for the id resumed is gone; the

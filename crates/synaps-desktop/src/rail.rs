@@ -306,8 +306,20 @@ enum History {
     Listed,
 }
 
+/// A held session's row key (by its live id).
 pub fn key_of(id: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut h);
+    h.finish()
+}
+
+/// A journal's row key (a saved session, a favourite nothing holds): never
+/// a held row's, though a live id may be a journal id too (a session
+/// created as `J` keeps its live id `J` after `/clear` or a compaction gives
+/// it another journal, and `J` is listed, or a favourite, apart).
+fn saved_key(id: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "journal".hash(&mut h);
     id.hash(&mut h);
     h.finish()
 }
@@ -403,7 +415,7 @@ fn fav_row(m: &Model, ix: usize, f: &Favourite, entry: Option<SavedRef>, now: i6
         None => (f.model.as_deref().map(short_model).unwrap_or_default(), true),
     };
     Row {
-        key: key_of(&f.id),
+        key: saved_key(&f.id),
         live: None,
         saved: entry,
         title: arc(f.label.as_str()),
@@ -430,7 +442,7 @@ fn saved_row(m: &Model, r: SavedRef, v: &SavedSession, now: i64) -> Row {
     let name = named(&v.name);
     let title = name.or(v.title.as_deref().filter(|t| !t.is_empty())).unwrap_or(&v.id);
     Row {
-        key: key_of(&v.id),
+        key: saved_key(&v.id),
         live: None,
         saved: Some(r),
         title: arc(title),
@@ -1180,29 +1192,75 @@ mod tests {
         assert!(!gone(&mut m), "a listing asked for after the verdict has it");
     }
 
-    /// H2: one conversation is one row through its compactions: held (its
-    /// journal id moving under one live id), once and twice, open and
-    /// parked; evicted to history under its chain head; and resumed from an
-    /// old id the daemon followed forward.
+    /// An attach of `meta`, its conversation's header naming `parent`.
+    fn attached_frame(meta: Value, parent: Option<&str>) -> Box<synaps_client::Attached> {
+        let header = json!({"id": meta["journal_id"], "title": meta["title"], "parent_session": parent});
+        let frame = json!({"type": "attached", "client": 2, "meta": meta, "conversation": {"header": header, "api_messages": []}, "input_owner": 2});
+        let synaps_client::protocol::DaemonFrame::Attached(a) = synaps_client::protocol::decode_frame(&frame.to_string()).unwrap() else {
+            panic!()
+        };
+        a
+    }
+
+    /// The attached session's `Conversation` after a swap: its header.
+    fn swapped(seq: u64, id: &str, parent: Option<&str>) -> Event {
+        let digest = synaps_client::protocol::ConversationDigest {
+            header: json!({"id": id, "title": "Long talk", "parent_session": parent}),
+            ..Default::default()
+        };
+        Event::session(seq, "c1", 0, synaps_client::protocol::SessionEvent::Conversation { digest }, std::sync::Arc::new(Value::Null))
+    }
+
+    fn count(m: &mut Model, title: &str) -> (Vec<String>, usize) {
+        m.sync_favs();
+        let rail = build(m, &view(Bucket::DEFAULT_OPEN), NOW);
+        keys_once(&rail);
+        let s = shape(&rail);
+        let n = s.iter().filter(|r| r.ends_with(title)).count();
+        (s, n)
+    }
+
+    /// R1 (H2 as built): one conversation is one row through the
+    /// compactions seen here (the attached session's conversation header
+    /// names its parent), once and twice, open and parked; evicted to
+    /// history under its chain head. `/clear` there leaves the favourite on
+    /// its conversation, and `/resume` of another favourite merges nothing.
     #[test]
     fn a_compacted_favourite_is_one_row() {
         fn once(m: &mut Model, why: &str) {
-            m.sync_favs();
-            let rail = build(m, &view(Bucket::DEFAULT_OPEN), NOW);
-            keys_once(&rail);
-            let s = shape(&rail);
-            assert_eq!(s.iter().filter(|r| r.ends_with("Long talk")).count(), 1, "{why}: {s:?}");
+            let (s, n) = count(m, "Long talk");
+            assert_eq!(n, 1, "{why}: {s:?}");
             assert_eq!(s[..2], ["[Favs 1]", "row Long talk"], "{why}");
         }
         let s = |journal: &str, life: &str| json!({"id": "c1", "lifecycle": life, "created_at": at(50), "title": "Long talk", "journal_id": journal});
         let mut m = model(json!([s("c1", "live")]), json!([]), json!([]), false);
         m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
         once(&mut m, "favourited");
-        for (journal, life, why) in [("c2", "live", "one compaction, open"), ("c3", "live", "two, open"), ("c3", "parked", "two, parked")] {
+        m.want(5);
+        m.apply(Event::Attached {
+            attach_seq: 5,
+            attached: attached_frame(s("c1", "live"), None),
+            mode: synaps_client::AttachMode::Mirror,
+            reconnect: false,
+        });
+        for (journal, parent, life, why) in
+            [("c2", "c1", "live", "one compaction, open"), ("c3", "c2", "live", "two, open"), ("c3", "c2", "parked", "two, parked")]
+        {
+            m.apply(swapped(5, journal, Some(parent)));
             m.apply(Event::Sessions(metas(json!([s(journal, life)]))));
             once(&mut m, why);
         }
         assert_eq!((m.favs.list[0].id.as_str(), &m.favs.list[0].aliases[..]), ("c3", &["c1".to_string(), "c2".to_string()][..]));
+        // `/clear` in it: a new conversation under the same live id. The
+        // favourite stays on c3 (not held now: its row resumes c3), and the
+        // cleared one is in OPEN.
+        m.apply(swapped(5, "y", None));
+        m.apply(Event::Sessions(metas(json!([{"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "", "journal_id": "y"}]))));
+        let (rows, n) = count(&mut m, "Long talk");
+        assert_eq!((n, &rows[..2]), (1, &["[Favs 1]".to_string(), "row Long talk".to_string()][..]), "{rows:?}");
+        assert!(rows.contains(&"[Open 1]".to_string()), "{rows:?}");
+        assert_eq!(m.favs.list[0].id, "c3");
+        assert_eq!(m.fav_of(&m.sessions[0]), None, "the cleared conversation is not the favourite");
         // Evicted: listed under its chain head (c1 and c2 fold into it).
         m.apply(Event::Sessions(vec![]));
         m.refresh_saved_for_test();
@@ -1212,25 +1270,102 @@ mod tests {
             rejected: 0,
         });
         once(&mut m, "evicted");
-        // Favourited at c1 and never seen since (the listing has only the
-        // head): a resume of c1 the daemon follows to c3.
-        let mut m = model(json!([]), json!([]), json!([{"id": "c3", "title": "Long talk", "updated_at": at(10), "live": false}]), false);
-        let old: SavedSession = serde_json::from_value(json!({"id": "c1", "title": "Long talk", "updated_at": at(900)})).unwrap();
-        m.favs.toggle(Source::Saved(&old), 1);
-        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
-        assert_eq!(shape(&rail).iter().filter(|r| r.ends_with("Long talk")).count(), 2, "nothing ties them yet");
-        m.resuming(ResumeRequest { label: "Long talk".into(), target: "c1".into(), cwd: None, by_name: false }, 9, false);
-        let frame = json!({"type": "attached", "client": 2, "meta": {"id": "c3", "journal_id": "c3", "title": "Long talk"}, "conversation": {"api_messages": []}, "input_owner": 2});
-        let synaps_client::protocol::DaemonFrame::Attached(a) = synaps_client::protocol::decode_frame(&frame.to_string()).unwrap() else {
-            panic!()
-        };
-        m.apply(Event::Attached { attach_seq: 9, attached: a, mode: synaps_client::AttachMode::Mirror, reconnect: false });
-        assert_eq!(m.favs.list[0].id, "c3");
-        once(&mut m, "resumed from c1, before the session list says so");
+    }
+
+    /// R1: `/resume` of another favourite in the live session holding one:
+    /// both stay, each matched by its own journal; the swapped-in one shows
+    /// held, the other its saved row.
+    #[test]
+    fn a_resume_onto_another_favourite_keeps_both() {
+        let a = json!({"id": "la", "lifecycle": "live", "created_at": at(50), "title": "Alpha", "journal_id": "ja"});
+        let mut m = model(json!([a]), json!([]), json!([{"id": "jb", "title": "Bravo", "updated_at": at(900), "live": false}]), false);
+        m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
+        let jb = m.named.recent[0].clone();
+        m.favs.toggle(Source::Saved(&jb), 2);
+        m.want(6);
+        m.apply(Event::Attached {
+            attach_seq: 6,
+            attached: attached_frame(a.clone(), None),
+            mode: synaps_client::AttachMode::Mirror,
+            reconnect: false,
+        });
+        m.apply(swapped(6, "jb", None));
         m.apply(Event::Sessions(metas(
-            json!([{"id": "c3", "lifecycle": "live", "created_at": at(1), "title": "Long talk", "journal_id": "c3"}]),
+            json!([{"id": "la", "lifecycle": "live", "created_at": at(50), "title": "Bravo", "journal_id": "jb"}]),
         )));
-        once(&mut m, "resumed, held");
+        m.sync_favs();
+        assert_eq!(m.favs.list.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["ja", "jb"]);
+        assert_eq!(m.fav_of(&m.sessions[0]), Some(1), "held: Bravo's favourite");
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+        keys_once(&rail);
+        assert_eq!(shape(&rail)[..3], ["[Favs 2]", "row Alpha", "row Bravo"]);
+    }
+
+    /// R1: an unseen compaction (the TUI's, nothing attached here) is two
+    /// rows: the favourite on its old id, and its new journal in OPEN; once
+    /// it is attached the header says so, and it is one. A resume of an id
+    /// whose live session holds an unrelated journal (cleared elsewhere)
+    /// moves nothing, and says so.
+    #[test]
+    fn an_unseen_compaction_is_two_rows_until_attached() {
+        let c = |journal: &str| json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "Long talk", "journal_id": journal});
+        let mut m = model(json!([c("c1")]), json!([]), json!([]), false);
+        m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
+        m.apply(Event::Sessions(metas(json!([c("c2")]))));
+        let (rows, n) = count(&mut m, "Long talk");
+        assert_eq!(n, 2, "the favourite (c1) and c2 in OPEN: {rows:?}");
+        // Attached from its OPEN row: the header names c1.
+        m.want(7);
+        m.apply(Event::Attached {
+            attach_seq: 7,
+            attached: attached_frame(c("c2"), Some("c1")),
+            mode: synaps_client::AttachMode::Mirror,
+            reconnect: false,
+        });
+        let (rows, n) = count(&mut m, "Long talk");
+        assert_eq!((n, &rows[..2]), (1, &["[Favs 1]".to_string(), "row Long talk".to_string()][..]), "{rows:?}");
+        // Cleared elsewhere, then the favourite's resume: the daemon hands
+        // back the live session (it matches by live id), holding y.
+        m.apply(Event::Sessions(metas(json!([{"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "", "journal_id": "y"}]))));
+        m.resuming(ResumeRequest { label: "Long talk".into(), target: "c2".into(), cwd: None, by_name: false }, 8, false);
+        // The attach's meta names the journal the session started with (as
+        // 0.11.1 sends it after a swap); its header, the one it holds.
+        let mut a = attached_frame(json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "", "journal_id": "c2"}), None);
+        a.conversation.header = json!({"id": "y", "title": "", "parent_session": null});
+        m.apply(Event::Attached { attach_seq: 8, attached: a, mode: synaps_client::AttachMode::Mirror, reconnect: false });
+        assert_eq!(m.favs.list[0].id, "c2");
+        let notice = m.named.notice.clone().unwrap_or_default();
+        assert!(notice.contains("does not say it is the same conversation"), "{notice}");
+    }
+
+    /// R3: a named favourite whose resume found no journal stays GONE
+    /// against the named list asked for before the verdict, however new
+    /// the newest list is (it is cut, so it never says the named one is
+    /// there); a named list asked for after it says it is there.
+    #[test]
+    fn gone_holds_against_a_stale_named_list() {
+        let named = json!([{"id": "jn", "title": "Notes", "name": "notes", "updated_at": at(900_000), "live": false}]);
+        let recent = json!([{"id": "t0", "title": "today", "updated_at": at(100), "live": false}]);
+        let mut m = model(json!([]), named.clone(), recent.clone(), true);
+        let jn = m.named.saved[0].clone();
+        m.favs.toggle(Source::Saved(&jn), 1);
+        m.resuming(ResumeRequest { label: "notes".into(), target: "jn".into(), cwd: None, by_name: false }, 9, false);
+        let missing = "create session: Tool execution failed: Failed to load session 'jn': no session matching 'jn'";
+        m.apply(Event::Detached { attach_seq: 9, session_id: None, reason: missing.into() });
+        assert!(m.favs.list[0].is_gone());
+        // The verdict's fresh newest list lands (cut: not the named one).
+        m.apply(Event::SavedSessions { sessions: saved(recent), truncated: true, rejected: 0 });
+        m.sync_favs();
+        assert!(m.favs.list[0].is_gone(), "the named list it is in is from before the verdict");
+        // R7: clicked again, the same refusal says gone again.
+        m.resuming(ResumeRequest { label: "notes".into(), target: "jn".into(), cwd: None, by_name: false }, 10, false);
+        m.apply(Event::Detached { attach_seq: 10, session_id: None, reason: missing.into() });
+        assert!(m.named.error.as_deref().unwrap_or("").starts_with("'notes' is gone"), "{:?}", m.named.error);
+        // A named list asked for after the verdict has it: there.
+        m.want_named_for_test();
+        m.apply(Event::SavedSessions { sessions: saved(named), truncated: false, rejected: 0 });
+        m.sync_favs();
+        assert!(!m.favs.list[0].is_gone());
     }
 
     /// Precedence: OPENING › NEEDS YOU › RUNNING › WORKERS › LOCKED › UNREAD
