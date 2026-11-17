@@ -16,6 +16,7 @@
 //! the old/new lengths, so the UI remeasures only the rows that changed.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -26,6 +27,15 @@ use crate::protocol::*;
 const PREVIEW_MAX: usize = 4 * 1024;
 /// How far ahead id reuse looks for a row of the same kind.
 const REUSE_LOOKAHEAD: usize = 8;
+/// The host's record time of a history message (agent-core
+/// `session_journal::MESSAGE_AT_KEY`): RFC 3339, UTC, whole seconds. Only
+/// new messages carry it; a legacy one has none.
+pub const MESSAGE_AT_KEY: &str = "_synaps_at";
+
+/// When a history message was recorded ([`MESSAGE_AT_KEY`]), if it was.
+pub fn message_at(m: &Value) -> Option<&str> {
+    m.get(MESSAGE_AT_KEY).and_then(Value::as_str).filter(|s| !s.is_empty())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -197,6 +207,16 @@ pub struct Item {
     pub text: String,
     pub tool: Option<ToolCall>,
     pub streaming: bool,
+    /// When it happened, RFC 3339, the first time the row had: a live
+    /// row's is the `ts` of the event that started it
+    /// ([`Transcript::apply_at`], an attach's replay), kept when its history
+    /// form lands; a row first seen in history has its message time
+    /// ([`message_at`]). `None`: no recorded time (legacy history, a row fed
+    /// without one), never "now". Not part of `rev`: it can change with
+    /// `rev` unchanged (a live row without one, then its history form; a
+    /// row of a swapped conversation), so key anything derived from it on
+    /// it.
+    pub at: Option<Arc<str>>,
     /// `Some(n)`: a client-side row (notice, error), not part of the
     /// history, shown after the first `n` history messages.
     anchor: Option<usize>,
@@ -247,6 +267,12 @@ pub struct Transcript {
     items: Vec<Item>,
     next_id: u64,
     session_id: Option<String>,
+    /// The journal of the conversation shown (the attach's header `id`),
+    /// kept current by clear, resume and compaction, whose events name the
+    /// new one. The session's id stays the same through those; a re-attach
+    /// to another journal is another conversation, and carries no time of
+    /// this one's.
+    journal_id: String,
     /// `api_messages` folded so far, and where their items end.
     history_len: usize,
     history_end: usize,
@@ -268,6 +294,13 @@ pub struct Transcript {
     /// No notices for subagent starts and ends (a UI that shows the
     /// workers itself): [`Transcript::set_subagent_notices`].
     no_subagent_notices: bool,
+    /// The time new rows get ([`Item::at`]): the message being folded's,
+    /// or the event being applied's once a row takes it.
+    stamp: Option<Arc<str>>,
+    /// The `ts` of the event being applied (empty: none), shared into
+    /// `stamp` by the first row it starts: most events start no row, so
+    /// most never allocate.
+    event_ts: String,
 }
 
 impl Transcript {
@@ -355,7 +388,10 @@ impl Transcript {
         if let Some(t) = &tool {
             self.tools.insert(t.tool_id.clone(), ix);
         }
-        self.items.push(Item { id, rev, kind, text, tool, streaming, anchor: None });
+        if self.stamp.is_none() && !self.event_ts.is_empty() {
+            self.stamp = Some(Arc::from(self.event_ts.as_str()));
+        }
+        self.items.push(Item { id, rev, kind, text, tool, streaming, at: self.stamp.clone(), anchor: None });
         self.mark(ix);
         ix
     }
@@ -401,18 +437,30 @@ impl Transcript {
     /// strings and measured heights for `(id, rev)` stay valid, so a
     /// re-attach redraws only what changed. A row that differs keeps the
     /// newer `rev`, which is past every one it had.
-    fn keep_revs(&mut self) {
+    ///
+    /// A row's time is the first one it had ([`Item::at`]), as the TUI's
+    /// live rows: the daemon dates a message when its round ends, which can
+    /// be minutes after its row started streaming, and a time that moved
+    /// would move the row's day too. The history's time fills only a row
+    /// that had none. Unless `carry` is false (the conversation was
+    /// swapped: its ids are reused for other messages), and only from the
+    /// row's own form.
+    fn keep_revs(&mut self, carry: bool) {
         if self.before.is_empty() {
             return;
         }
         let before: HashMap<u64, Item> = std::mem::take(&mut self.before).into_iter().map(|i| (i.id, i)).collect();
         for it in self.items.iter_mut().filter(|i| i.anchor.is_none()) {
-            if let Some(o) = before.get(&it.id)
-                && o.kind == it.kind
-                && o.streaming == it.streaming
-                && o.text == it.text
-                && o.tool == it.tool
-            {
+            let Some(o) = before.get(&it.id) else { continue };
+            let same = match (&o.tool, &it.tool) {
+                (Some(a), Some(b)) => a.tool_id == b.tool_id,
+                (None, None) => o.text == it.text,
+                _ => false,
+            };
+            if carry && o.at.is_some() && o.kind == it.kind && same {
+                it.at = o.at.clone();
+            }
+            if o.kind == it.kind && o.streaming == it.streaming && o.text == it.text && o.tool == it.tool {
                 it.rev = o.rev;
             }
         }
@@ -426,11 +474,25 @@ impl Transcript {
             return Err(TranscriptError::DigestHistory);
         }
         let same = self.session_id.as_deref() == Some(a.meta.id.as_str());
+        // A clear, resume or compaction made while detached (in the TUI,
+        // another window) keeps the session's id and changes its journal.
+        // The journal is the header's: the attach's `meta.journal_id` is
+        // the one the session started with (0.11.1 sends its create-time
+        // meta), and only an older daemon's header has no id.
+        let journal = a.conversation.header.get("id").and_then(Value::as_str).unwrap_or(&a.meta.journal_id).to_string();
+        let carry = same && self.journal_id == journal;
         let (notes, mut reuse) = if same { self.take_rows(0) } else { (Vec::new(), Reuse::new()) };
         let (next_id, clean_len, before) = (self.next_id, self.clean_len, std::mem::take(&mut self.before));
         let no_subagent_notices = self.no_subagent_notices;
-        *self =
-            Transcript { next_id, clean_len, before, no_subagent_notices, session_id: Some(a.meta.id.clone()), ..Transcript::default() };
+        *self = Transcript {
+            next_id,
+            clean_len,
+            before,
+            no_subagent_notices,
+            session_id: Some(a.meta.id.clone()),
+            journal_id: journal,
+            ..Transcript::default()
+        };
         self.dirty_from = Some(0);
         self.title = a.meta.title.clone().or_else(|| a.conversation.header.get("title").and_then(Value::as_str).map(str::to_string));
         self.cost_usd = a.conversation.cost;
@@ -439,14 +501,14 @@ impl Transcript {
         self.busy = a.streaming;
         for env in &a.replay {
             if let Ok(ev) = env.decode() {
-                self.apply(&ev);
+                self.apply_at(&ev, &env.ts);
             }
         }
         if !a.streaming {
             self.busy = false;
             self.settle();
         }
-        self.keep_revs();
+        self.keep_revs(carry);
         Ok(())
     }
 
@@ -493,7 +555,10 @@ impl Transcript {
         if !self.busy {
             self.settle();
         }
-        self.keep_revs();
+        // An append matched this conversation's prefix: the rows it took
+        // are its own live ones, whatever swap came before it (a resume of
+        // the same journal has no replacement to consume the flag).
+        self.keep_revs(true);
     }
 
     /// Rebuild from a whole history (resync, rewrite, clear, compaction).
@@ -507,7 +572,8 @@ impl Transcript {
             }
         }
         let (mut notes, mut reuse) = self.take_rows(0);
-        if std::mem::take(&mut self.swapped) {
+        let swapped = std::mem::take(&mut self.swapped);
+        if swapped {
             notes.retain(|n| n.anchor == Some(usize::MAX));
         }
         self.fold_with_notes(messages, notes, &mut reuse);
@@ -515,7 +581,7 @@ impl Transcript {
         if !self.busy {
             self.settle();
         }
-        self.keep_revs();
+        self.keep_revs(!swapped);
     }
 
     /// Fold a whole history from empty, interleaving `notes` by anchor.
@@ -559,6 +625,13 @@ impl Transcript {
     }
 
     fn fold_message(&mut self, m: &Value, reuse: &mut Reuse) {
+        // Its rows have its time or none: never the event's it came in.
+        let outer = (std::mem::replace(&mut self.stamp, message_at(m).map(Arc::from)), std::mem::take(&mut self.event_ts));
+        self.fold_blocks(m, reuse);
+        (self.stamp, self.event_ts) = outer;
+    }
+
+    fn fold_blocks(&mut self, m: &Value, reuse: &mut Reuse) {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
         let content = m.get("content").unwrap_or(&Value::Null);
         match (role, content) {
@@ -670,6 +743,19 @@ impl Transcript {
     /// it is a drained event's payload, `<event …>`: its parent's
     /// business); a failure is an error row with its category.
     pub fn apply_watch(&mut self, ev: &WatchEvent) {
+        self.apply_watch_at(ev, "");
+    }
+
+    /// [`Transcript::apply_watch`] of an entry recorded at `at` (RFC 3339;
+    /// empty: unknown): the rows it starts carry it ([`Item::at`]).
+    pub fn apply_watch_at(&mut self, ev: &WatchEvent, at: &str) {
+        self.event_ts.push_str(at);
+        self.watch_event(ev);
+        self.event_ts.clear();
+        self.stamp = None;
+    }
+
+    fn watch_event(&mut self, ev: &WatchEvent) {
         match ev {
             WatchEvent::Steered { text } if !text.trim_start().starts_with("<event") => {
                 self.end_streaming_text();
@@ -727,6 +813,19 @@ impl Transcript {
 
     /// Apply one live session event.
     pub fn apply(&mut self, ev: &SessionEvent) {
+        self.apply_at(ev, "");
+    }
+
+    /// [`Transcript::apply`] of an event sent at `ts` (its envelope's, RFC
+    /// 3339; empty: unknown): the rows it starts carry it ([`Item::at`]).
+    pub fn apply_at(&mut self, ev: &SessionEvent, ts: &str) {
+        self.event_ts.push_str(ts);
+        self.apply_event(ev);
+        self.event_ts.clear();
+        self.stamp = None;
+    }
+
+    fn apply_event(&mut self, ev: &SessionEvent) {
         match ev {
             SessionEvent::TurnStarted { user_text, .. } => {
                 self.busy = true;
@@ -755,7 +854,8 @@ impl Transcript {
                 self.notice(ItemKind::Notice, "turn aborted");
             }
             SessionEvent::Ended { reason } => self.notice(ItemKind::Notice, format!("session ended ({reason})")),
-            SessionEvent::Cleared { .. } => {
+            SessionEvent::Cleared { session_id } => {
+                self.journal_id.clone_from(session_id);
                 // Clearing an empty conversation changes nothing: its digest
                 // matches, no replacement follows to consume the flag, and
                 // a later unrelated one would drop this conversation's notes.
@@ -764,13 +864,15 @@ impl Transcript {
             }
             SessionEvent::Resumed { new_id, clamp_notice, .. } => {
                 self.swapped = true;
+                self.journal_id.clone_from(new_id);
                 self.notice(ItemKind::Notice, format!("resumed {new_id}"));
                 if let Some(n) = clamp_notice {
                     self.notice(ItemKind::Notice, n.clone());
                 }
             }
-            SessionEvent::CompactionApplied { msg_count, .. } => {
+            SessionEvent::CompactionApplied { session_id, msg_count, .. } => {
                 self.swapped = true;
+                self.journal_id.clone_from(session_id);
                 self.notice(ItemKind::Notice, format!("conversation compacted ({msg_count} messages)"));
             }
             SessionEvent::CompactionFailed { message } => self.notice(ItemKind::Error, format!("compaction failed: {message}")),

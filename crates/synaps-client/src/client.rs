@@ -386,10 +386,19 @@ pub enum Event {
     /// A live event, decoded, with the raw wire event alongside (for fields
     /// and variants the mirror does not carry). `MessageHistory` never
     /// comes here in `Full` mode: see [`Event::History`].
+    ///
+    /// `#[non_exhaustive]`: build it with [`Event::session`] (and
+    /// [`Event::with_ts`]), match it with `..`; a field added later breaks
+    /// neither.
+    #[non_exhaustive]
     Session {
         attach_seq: u64,
         session_id: String,
         seq: u64,
+        /// When the daemon sent it (its envelope's `ts`, RFC 3339; empty
+        /// if it had none): the time of the rows it starts
+        /// ([`crate::transcript::Transcript::apply_at`]).
+        ts: String,
         event: SessionEvent,
         raw: Arc<Value>,
     },
@@ -486,6 +495,20 @@ pub enum WatchReply {
 }
 
 impl Event {
+    /// An [`Event::Session`] sent at no known time (`ts` empty).
+    pub fn session(attach_seq: u64, session_id: impl Into<String>, seq: u64, event: SessionEvent, raw: Arc<Value>) -> Self {
+        Event::Session { attach_seq, session_id: session_id.into(), seq, ts: String::new(), event, raw }
+    }
+
+    /// This [`Event::Session`] sent at `ts` (its envelope's, RFC 3339). Any
+    /// other event is returned as it is.
+    pub fn with_ts(mut self, ts: impl Into<String>) -> Self {
+        if let Event::Session { ts: t, .. } = &mut self {
+            *t = ts.into();
+        }
+        self
+    }
+
     /// The attachment this event belongs to, if it is an attachment event.
     pub fn attach_seq(&self) -> Option<u64> {
         match self {
@@ -1486,7 +1509,7 @@ async fn session_loop(
                 }
                 frame = conn.recv() => match frame {
                     Ok(Some(DaemonFrame::Event(env))) => {
-                        let Envelope { session_id: esid, seq, event: mut v, .. } = env;
+                        let Envelope { session_id: esid, seq, ts, event: mut v } = env;
                         if let Some(m) = mirror.as_mut()
                             && is_message_history(&v)
                         {
@@ -1587,7 +1610,7 @@ async fn session_loop(
                             _ => {}
                         }
                         let ended = matches!(event, SessionEvent::Ended { .. });
-                        emit(&events, Event::Session { attach_seq, session_id: esid, seq, event, raw });
+                        emit(&events, Event::Session { attach_seq, session_id: esid, seq, ts, event, raw });
                         if ended {
                             unanswered(&events, attach_seq, &mut cancels, "the session ended before the daemon answered: look at the worker's row");
                             return Exit { session_id, reason: "session ended".into() };

@@ -1883,12 +1883,14 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| {
             let a = v.model.active.as_ref().expect("attached");
             let (attach_seq, session_id) = (a.attach_seq, a.session_id.clone());
-            let ev = |seq: u64, event: StreamEvent| synaps_client::Event::Session {
-                attach_seq,
-                session_id: session_id.clone(),
-                seq,
-                event: SessionEvent::Stream { event },
-                raw: std::sync::Arc::new(serde_json::Value::Null),
+            let ev = |seq: u64, event: StreamEvent| {
+                synaps_client::Event::session(
+                    attach_seq,
+                    session_id.clone(),
+                    seq,
+                    SessionEvent::Stream { event },
+                    std::sync::Arc::new(serde_json::Value::Null),
+                )
             };
             let id = "ui-batch-0".to_string();
             let start = LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id.clone() };
@@ -2395,4 +2397,66 @@ fn a_list_swap_stops_the_scroller(cx: &mut TestAppContext) {
     view.update(cx, |v, _| v.client = None);
     open_idle_cpu(cx, &view, crate::tabs::Place::Current);
     assert!(view.read_with(cx, |v, _| !v.scroller.active()), "another session: stopped");
+}
+
+/// Message times (`crate::times`): the demo's sessions are dated (fixed
+/// local times, the same on any machine), so YOU and AGENT each show their
+/// row's `HH:MM`: under the label in the margin of a wide pane, at the end
+/// of the label's line in a narrow one. History never animates: no row of
+/// it is born. The parked session, resumed the next morning, has its one
+/// day line, over that turn.
+#[gpui_kit::test]
+fn labels_show_their_message_times(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    view.update(cx, |v, cx| {
+        v.client = None;
+        v.panels.rail_collapsed = true;
+        v.panels.right_collapsed = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let labelled = |cx: &mut VisualTestContext| {
+        view.read_with(cx, |v, _| {
+            let rows = v.disp.iter().filter(|d| d.who != crate::turns::Who::None);
+            rows.map(|d| (d.id, v.rows[d.item].time.as_ref().map(|t| t.hhmm.to_string()))).collect::<Vec<_>>()
+        })
+    };
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    let rows = labelled(&mut vcx);
+    assert!(rows.len() >= 2 && rows.iter().all(|(_, t)| t.is_some()), "every label has its time: {rows:?}");
+    assert_eq!(rows[0].1.as_deref(), Some("04:12"), "the first message, at the session's start");
+    let unborn = view.read_with(&vcx, |v, _| v.disp.iter().all(|d| v.fx.birth(d.id).is_none()));
+    assert!(unborn, "history rows are not drawn in");
+    let (id, _) = *rows.last().unwrap();
+    let (time, label) = (leak(format!("time {id}")), leak(format!("label {id}")));
+    for (width, hang) in [(1440., true), (640., false)] {
+        vcx.simulate_resize(size(px(width), px(900.)));
+        vcx.run_until_parked();
+        view.update(&mut vcx, |v, cx| {
+            let ix = v.disp.iter().position(|d| d.id == id).expect("the labelled row");
+            v.list.scroll_to(gpui_kit::ListOffset { item_ix: ix, offset_in_item: px(0.) });
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert_eq!(view.read_with(&vcx, |v, _| v.layout.hang), hang, "{width} px");
+        let (t, l) = (vcx.debug_bounds(time).expect("the time drawn"), vcx.debug_bounds(label).expect("the label drawn"));
+        if hang {
+            assert!((t.right() - l.right()).abs() < px(1.) && t.top() >= l.bottom() - px(1.), "under the label: {t:?} {l:?}");
+        } else {
+            let mid = |b: Bounds<gpui_kit::Pixels>| b.top() + b.size.height / 2.;
+            assert!(t.left() > l.right() + px(200.) && (mid(t) - mid(l)).abs() < px(2.), "at the line's end: {t:?} {l:?}");
+        }
+    }
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    let days = view.read_with(cx, |v, _| {
+        let items = v.model.shown().items();
+        let last_user = items.iter().rposition(|i| i.kind == synaps_client::transcript::ItemKind::User);
+        let days: Vec<_> = v.disp.iter().filter(|d| d.kind == crate::turns::Kind::Day).map(|d| Some(d.item)).collect();
+        (days, last_user)
+    });
+    assert_eq!(days.0, [days.1], "one day line, over the turn of the next morning");
+}
+
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
 }

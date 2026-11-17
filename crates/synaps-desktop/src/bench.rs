@@ -241,7 +241,7 @@ const TAB_SWITCHES: usize = 8;
 
 /// A synthetic history of `n` user turns.
 fn turns(n: usize, seed: u64) -> Vec<Value> {
-    let mut h = synthetic::history(n * 3, seed);
+    let mut h = dated(synthetic::history(n * 3, seed));
     let cut = h.iter().enumerate().filter(|(_, m)| m["role"] == "user" && m["content"].is_string()).nth(n).map(|(i, _)| i);
     h.truncate(cut.unwrap_or(h.len()));
     h
@@ -549,7 +549,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // A tool runs: its glyph scans on the beat (8 Hz), the foot's too.
                 let _ = upd(cx, &|v, _| {
                     v.model.set_local_session("bench-motion");
-                    v.model.transcript.apply_history(&synthetic::history(40, 3));
+                    v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
                     v.sync_list();
                     v.list.set_follow_mode(FollowMode::Tail);
                     v.list.scroll_to_end();
@@ -629,7 +629,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out["static_empty"] = stats(cx, t0, Instant::now());
                 let _ = upd(cx, &|v, _| {
                     v.model.set_local_session("diag");
-                    v.model.transcript.apply_history(&synthetic::history(opts.history_messages, 11));
+                    v.model.transcript.apply_history(&dated(synthetic::history(opts.history_messages, 11)));
                     v.sync_list();
                     v.list.set_follow_mode(FollowMode::Normal);
                     v.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
@@ -662,7 +662,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         v.plain_rows = plain;
                         v.model.set_local_session("diag-stream");
                         v.reset_transcript();
-                        v.model.transcript.apply_history(&synthetic::history(40, 3));
+                        v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
                         v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                         v.sync_list();
                         v.list.set_follow_mode(FollowMode::Tail);
@@ -698,7 +698,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             // 2. Streaming markdown at ~200 deltas/s into a short transcript.
             let _ = upd(cx, &|v, _| {
                 v.model.set_local_session("bench-stream");
-                v.model.transcript.apply_history(&synthetic::history(40, 3));
+                v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
                 v.model.transcript.apply(&SessionEvent::TurnStarted {
                     turn_baseline: 40,
                     trigger: "user".into(),
@@ -754,7 +754,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             let _ = upd(cx, &|v, _| {
                 v.model.set_local_session("bench-long");
                 v.reset_transcript();
-                v.model.transcript.apply_history(&synthetic::history(opts.history_messages, 11));
+                v.model.transcript.apply_history(&dated(synthetic::history(opts.history_messages, 11)));
                 v.sync_list();
                 v.list.set_follow_mode(FollowMode::Normal);
                 v.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
@@ -940,7 +940,22 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
         .detach();
 }
 
-/// A synthetic event on the bench's local session (see `Model::set_local_session`).
+/// A synthetic event on the bench's local session (see
+/// `Model::set_local_session`), sent now: its rows carry the time, as a
+/// daemon's do.
 fn local_event(seq: u64, event: SessionEvent) -> Event {
-    Event::Session { attach_seq: LOCAL_SEQ, session_id: "bench".into(), seq, event, raw: Arc::new(Value::Null) }
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    Event::session(LOCAL_SEQ, "bench", seq, event, Arc::new(Value::Null)).with_ts(ts)
+}
+
+/// `h` with message times (`_synaps_at`) a minute apart from a fixed
+/// start, as a daemon since 0.11 records them: the bench's rows carry
+/// times and day lines as a real session's do.
+fn dated(mut h: Vec<Value>) -> Vec<Value> {
+    let t0 = chrono::DateTime::from_timestamp(1_794_556_800, 0).unwrap_or_default();
+    for (i, m) in h.iter_mut().enumerate() {
+        let at = t0 + chrono::Duration::minutes(i as i64);
+        m[synaps_client::transcript::MESSAGE_AT_KEY] = json!(at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
+    h
 }
