@@ -3684,9 +3684,10 @@ fn a_reload_storm_tears_at_most_once(cx: &mut TestAppContext) {
     assert_eq!((tears.get(), scans.get()), (1, 1), "losses: at most one tear and one Scan per budget");
 }
 
-/// The drain turns from where it is (motion.md §8): back mid-tear,
-/// mid-drain or mid-restore, and down again mid-restore, the palette never
-/// moves by more than the curve's own step in a frame.
+/// The drain turns from where it is (motion.md §8): back mid-tear or
+/// mid-drain, then lost again (the grace outlasts the restore, so that one
+/// drains from where the restore ended), the palette never moves by more
+/// than the curve's own step in a frame.
 #[gpui_kit::test]
 fn a_blip_never_jumps_the_palette(cx: &mut TestAppContext) {
     use crate::model::ConnState;
@@ -3712,7 +3713,7 @@ fn a_blip_never_jumps_the_palette(cx: &mut TestAppContext) {
         frames(cx, 140, "back");
         let mid = prev.get();
         set_conn(cx, &view, ConnState::Reconnecting, false);
-        frames(cx, grace + 200, "down again mid-restore");
+        frames(cx, grace + 200, "lost again");
         set_conn(cx, &view, ConnState::Connected("x".into()), false);
         frames(cx, 500, "back again");
         assert_eq!(prev.get(), 0., "restored (mid {mid})");
