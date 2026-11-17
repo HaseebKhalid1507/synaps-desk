@@ -1,5 +1,17 @@
 # Q4 r3: evidence for round 3 (Shady R1–R4, the press decision, design re-gate 1–5)
 
+> **Correction (r4).** The `.mp4` files here are **not lossless**. They were packed from the lossless
+> captures with `libx264 -crf 20 -preset slow -pix_fmt yuv444p`, which keeps a keyframe every 250 frames.
+> At CRF 20 a slow colour fade is mostly skipped until the next keyframe. In
+> `live-reload-storm-loss-back.mp4` the drain therefore freezes part-way and pops at f750, and the restore
+> pops at f1000. The numbers below about the drain (the composer bar's 64 → 19 over 716–726, "drained
+> and settled since 726", the still at f733) were read from the **raw capture, not from this file**,
+> so this file doesn't show them. The r3 raw captures are deleted.
+> **`../r4/` replaces the link evidence.** It has a lossless clip, byte-identical to its capture, and
+> every number there is read from the file shipped. It also reproduces this artefact from a lossless
+> capture with the same packing command. The other r3 clips (press, tab close, theme changes, Usage)
+> have the same packing. The re-gate's measurements of them hold, but they aren't lossless.
+
 Recorded on bella with `scripts/capture-linux.sh` (headless gamescope at 144 Hz, 1920×1080, x11grab
 lossless at 30 fps, `MESA_VK_WSI_DEBUG=sw`), driven by xdotool, using this branch's release build (`d6d2af4` plus
 the reload-width fix, the r3 head). All captures were made after the Q1 worker's `pkill gamescope`. None of them overlapped it. Frame
@@ -38,11 +50,10 @@ The capture agrees. The window's mean chroma per frame falls 26.7 → 9.7 over f
 accent bar drains with the rest: its blue−red goes 64 → 19 over 716–726 and back to 64 by 972.
 `the_drain_and_the_restore_run_every_frame` checks that every frame steps, at 144 Hz.
 
-**About the stall the re-gate saw.** One of my test captures (`trace3`, not packed here) showed the
-same thing: no drain in the clip at all, while the app's frame log shows it drew all 52 drain frames
-7 ms apart (10382–10743 ms). Under gamescope's headless Xwayland, x11grab reads the window's pixmap,
-and that isn't refreshed for every presented frame, so a burst on an untouched window can be missed
-or land late. The app trace above is the authority. This clip happens to show the whole drain.
+**About the stall the re-gate saw.** *(Withdrawn in r4: the stall the re-gate measured is the packing,
+see the correction at the top. The x11grab explanation below was a guess, and it was wrong for this clip.)*
+One of my test captures (`trace3`, not packed here) showed no drain in the clip at all, while the app's
+frame log shows it drew all 52 drain frames 7 ms apart (10382–10743 ms).
 
 How much greys, using r2's method on frames 660 and 733 (3-px horizontal mean, chroma > 60): 342
 live, 2 drained (99.4 %). At chroma > 45: 667 → 28 (95.8 %). The mean chroma of the coloured pixels goes

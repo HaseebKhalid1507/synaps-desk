@@ -3446,7 +3446,7 @@ fn the_drain_and_the_restore_run_every_frame(cx: &mut TestAppContext) {
 /// 7 ms frame through a loss and a return, through the cached app view
 /// and its beat layer as the app opens them. It leaves the live colour on
 /// the drain's first frame, moves on every frame after, never by more
-/// than a quarter of the way, and is what render computed each frame.
+/// than 8 % of the way, and is what render computed each frame.
 #[gpui_kit::test]
 fn the_drain_is_painted_every_frame(cx: &mut TestAppContext) {
     let (w, view) = link_up(cx);
@@ -3495,8 +3495,9 @@ fn the_drain_is_painted_every_frame(cx: &mut TestAppContext) {
         let first = seen.iter().position(|c| *c != from).expect("it left");
         let last = seen.iter().position(|c| *c == to).expect("it got there");
         for (i, p) in seen.windows(2).enumerate() {
-            assert!(dist(p[0], p[1]) <= travel / 4. + 1e-4, "{what}: frame {i} → {}: a step over a quarter of the travel", i + 1);
-            if i + 1 > first && i + 1 <= last {
+            // `inout`'s steepest is 2.86× linear: 6 % of the way in 7 ms.
+            assert!(dist(p[0], p[1]) <= travel * 0.08 + 1e-4, "{what}: frame {i} → {}: a step over 8 % of the travel", i + 1);
+            if i >= first && i < last {
                 assert_ne!(p[0], p[1], "{what}: held at frame {} (moving {first}..{last})", i + 1);
             }
         }
