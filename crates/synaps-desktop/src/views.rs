@@ -365,6 +365,15 @@ pub(crate) type Loaded = Result<(Arc<Board>, Option<f64>), Fail>;
 
 /// Everything a Usage load asks, in order, done by `by` (blocking: a
 /// background thread).
+/// `--offline`'s Usage: `fixtures/usage/<host or all>.json` from the
+/// source tree, built at the fixtures' time. None without the tree.
+fn demo_board(host: Option<&str>, range: crate::usage::Range) -> Option<crate::usage::Board> {
+    let path = format!("{}/fixtures/usage/{}.json", env!("CARGO_MANIFEST_DIR"), host.unwrap_or("all"));
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let raw = crate::usage::Raw::from_fixture(&v).ok()?;
+    Some(crate::usage::Board::build(&raw, host, range, 1_794_654_869_189))
+}
+
 pub(crate) fn load_usage(t: &Target, host: Option<&str>, range: Range, now_ms: i64, chips: &[String], by: Instant) -> Loaded {
     let from = range.from(now_ms);
     let mut raw = Raw::default();
@@ -911,7 +920,16 @@ impl AppView {
     /// selection waits for the one running, then loads.
     pub(crate) fn usage_load(&mut self, cx: &mut Context<Self>) {
         if self.synthetic {
-            self.usage.error = Some("offline: no synaps-dash".into());
+            // The demo's Usage (re-gate 4): the design fixtures, where the
+            // source tree is (a dev build), at the fixtures' own time.
+            match demo_board(self.usage.host.as_deref(), self.usage.range) {
+                Some(board) => {
+                    self.usage.error = None;
+                    self.usage.clear_paths();
+                    self.usage.board = Some(std::sync::Arc::new(board));
+                }
+                None => self.usage.error = Some("offline: no synaps-dash".into()),
+            }
             return self.views_changed(cx);
         }
         if self.dash_stale(true) {

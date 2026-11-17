@@ -134,7 +134,7 @@ pub(crate) struct RailCache {
     view: rail::View,
     states: u64,
     pub(crate) rail: Rail,
-    keys: Vec<u64>,
+    pub(crate) keys: Vec<u64>,
     /// Rows on screen before the last splice: their key and top, in the
     /// list's content (Flip, motion.md §6.4).
     pub(crate) flip_from: Vec<(u64, f32)>,
@@ -378,6 +378,10 @@ impl AppView {
             let top = y - 12. * (i as f32 + 1.);
             out = out.child(div().absolute().left_0().right_0().top(px(top)).h(px(12.)).bg(Hsla { a, ..live.run }));
         }
+        #[cfg(test)]
+        {
+            self.scan_line = Some(live.run_mark_ch);
+        }
         out = out.child(div().absolute().left_0().right_0().top(px(y)).h(px(1.)).bg(live.run_mark_ch));
         Some(deferred(out).with_priority(5))
     }
@@ -445,7 +449,18 @@ impl AppView {
         };
         let (conn, conn_color): (SharedString, Hsla) = match &self.model.conn {
             _ if self.model.reattaching => (dots("reattaching"), p.dim_ch),
-            ConnState::Connected(v) => (format!("connected · {v}").into(), p.dim_ch),
+            ConnState::Connected(v) => {
+                let words: SharedString = format!("connected · {v}").into();
+                self.conn_held.set(words.chars().count());
+                (words, p.dim_ch)
+            }
+            // A daemon reload within its grace (re-gate 3): a planned
+            // handover, not a disconnect. The words say so and keep the
+            // connected words' width (mono), so nothing beside them moves.
+            _ if self.model.reload => {
+                let w = self.conn_held.get();
+                (format!("{:<w$}", dots("reloading")).into(), p.dim_ch)
+            }
             ConnState::Connecting => (dots("connecting"), p.dim_ch),
             ConnState::Reconnecting => (dots("reconnecting"), p.dim_ch),
             ConnState::Off(e) | ConnState::Incompatible(e) => {

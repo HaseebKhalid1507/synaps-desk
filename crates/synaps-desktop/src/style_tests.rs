@@ -219,7 +219,7 @@ fn the_house_rules_are_allowed_only_where_they_live() {
 /// No gradients anywhere (polish.md §6 gate 6): every fill is one opaque
 /// colour of the palette; the sweep's levels are four opaque steps.
 #[test]
-fn no_gradients_anywhere() {
+fn no_gradients_anywhere_chrome() {
     let bad: Vec<String> = sources()
         .into_iter()
         .filter(|(name, _)| name != "style_tests.rs")

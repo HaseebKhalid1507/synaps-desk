@@ -1523,6 +1523,13 @@ pub struct AppView {
     /// connection cell's tear offset this frame.
     pub(crate) link: crate::motion::Link,
     pub(crate) conn_dy: f32,
+    /// The connected words' width (chars, mono), held through a reload.
+    pub(crate) conn_held: std::cell::Cell<usize>,
+    /// What the composer's bar and the Scan's line were last drawn in (tests).
+    #[cfg(test)]
+    pub(crate) composer_bar: std::cell::Cell<Option<Hsla>>,
+    #[cfg(test)]
+    pub(crate) scan_line: Option<Hsla>,
     /// A worker tab opened this frame (its id), the tracer to it, and where
     /// the tab strip was painted last.
     pub(crate) tracer_open: Option<u64>,
@@ -2092,6 +2099,11 @@ impl AppView {
             seg_places: Default::default(),
             link: Default::default(),
             conn_dy: 0.,
+            conn_held: Default::default(),
+            #[cfg(test)]
+            composer_bar: Default::default(),
+            #[cfg(test)]
+            scan_line: None,
             tracer_open: None,
             tracer: None,
             strip_at: Default::default(),
@@ -2391,8 +2403,9 @@ impl AppView {
             }
         } else {
             self.menu_leaving = None;
-            // Kept once per menu opened, not cloned every frame.
-            if self.menu_was.as_ref().map(|m| m.born) != self.menu.as_ref().map(|m| m.0.born) {
+            // Kept once per menu opened or refreshed in place (its exit shows
+            // what it showed last), not cloned every frame.
+            if self.menu_was.as_ref().map(|m| (m.born, &m.items)) != self.menu.as_ref().map(|m| (m.0.born, &m.0.items)) {
                 self.menu_was = self.menu.as_ref().map(|m| m.0.clone());
             }
         }
@@ -5514,6 +5527,8 @@ impl AppView {
             _ => (out.max(fx.flash(handoff_in)), 1.),
         };
         let bar = crate::motion::mix(p.you_mark, lit, bar_flash);
+        #[cfg(test)]
+        self.composer_bar.set(Some(bar));
         // Handoff in's light (motion.md §10 amendment 17): lit as the beam
         // is, on at once, decaying into the bar over the last `glow` of its
         // travel: it lands as the bar, never switched off.
@@ -5954,9 +5969,18 @@ impl Render for AppView {
         // the palette restores. Settings and Usage draw with it.
         if !self.synthetic {
             let up = matches!(self.model.conn, ConnState::Connected(_));
-            self.link.see(up, self.model.reload, &self.fx);
+            self.link.see(up, self.model.reload.then_some(self.model.reload_seq), &self.fx);
+            // A reload past its grace is a loss: from here the rail and the
+            // words say so (re-gate 3).
+            if self.link.lost && self.model.reload {
+                self.model.reload = false;
+                self.model.rail_gen += 1;
+            }
         }
         let drain = self.link.drain(&self.fx);
+        if drain > 0. || self.link.lost {
+            log::debug!(target: "synaps_desktop::link", "drain {drain:.3} lost {} pending {:?}", self.link.lost, self.fx.pending());
+        }
         let scheme = cx.global::<theme::Scheme>();
         if scheme.drain.replace(drain) != drain
             && let Some(k) = self.model.tabs.view()
@@ -5982,6 +6006,8 @@ impl Render for AppView {
                     theme::settle_fade(cx);
                     cx.refresh_windows();
                 });
+            } else if t < 1. {
+                cx.defer(theme::blend_text);
             }
             if let Some(k) = self.model.tabs.view() {
                 let pane = self.pane(k).clone();

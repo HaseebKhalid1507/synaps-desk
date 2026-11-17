@@ -41,6 +41,58 @@ const BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// A connection that stayed up this long resets the backoff; one that drops
 /// sooner (accepts, greets, hangs up) keeps backing off instead of spinning.
 const STABLE_AFTER: Duration = Duration::from_secs(10);
+/// After a daemon reload's goodbye, how long the reconnect keeps to
+/// [`RELOAD_RETRY`] instead of backing off: a planned handover is not a
+/// failure. Longer than the `retry_after` cap (10 s) plus a boot.
+pub const RELOAD_WINDOW: Duration = Duration::from_secs(15);
+/// The reconnect's fixed retry inside a reload's window: back within a
+/// quarter second of the new daemon answering.
+pub const RELOAD_RETRY: Duration = Duration::from_millis(250);
+
+/// The reconnect schedule (the control and session loops'): doubling from
+/// 100 ms to 5 s, and back to 100 ms after a connection that stayed up
+/// 10 s. A daemon reload's goodbye instead starts [`RELOAD_WINDOW`] of
+/// tries every [`RELOAD_RETRY`] (after the daemon's `retry_after`), each
+/// new goodbye restarting it; past it, the doubling starts over.
+#[derive(Clone, Debug)]
+pub struct Backoff {
+    next: Duration,
+    reload_until: Option<std::time::Instant>,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Backoff { next: BACKOFF_START, reload_until: None }
+    }
+}
+
+impl Backoff {
+    /// A connection that was up for `up_for` ended at `now` (`reload`: on a
+    /// daemon reload's goodbye).
+    pub fn dropped(&mut self, up_for: Duration, reload: bool, now: std::time::Instant) {
+        if up_for >= STABLE_AFTER {
+            self.next = BACKOFF_START;
+        }
+        if reload {
+            self.reload_until = Some(now + RELOAD_WINDOW);
+        }
+    }
+
+    /// How long to wait at `now` before the next try (`after`: what the
+    /// daemon asked for, if anything); the schedule steps on.
+    pub fn wait(&mut self, after: Duration, now: std::time::Instant) -> Duration {
+        if let Some(until) = self.reload_until {
+            if now < until {
+                return after.max(RELOAD_RETRY);
+            }
+            self.reload_until = None;
+            self.next = BACKOFF_START;
+        }
+        let d = after.max(self.next);
+        self.next = (self.next * 2).min(BACKOFF_MAX);
+        d
+    }
+}
 /// The reason of a plain detach.
 const DETACHED: &str = "detached";
 /// The hint when an attempt to create a session was cut short.
@@ -992,7 +1044,7 @@ async fn until_shutdown<F: Future>(ctl: &mut mpsc::UnboundedReceiver<Ctl>, event
 async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: Option<Duration>, features: Features) {
     let events = &sh.events;
     let set_features = |f: Option<Vec<String>>| *features.lock().unwrap_or_else(|e| e.into_inner()) = f;
-    let mut backoff = BACKOFF_START;
+    let mut backoff = Backoff::default();
     emit(events, Event::Status(Status::Connecting));
     loop {
         let path = sh.endpoint.resolve();
@@ -1013,10 +1065,10 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                     continue;
                 }
                 emit(events, Event::Status(Status::Offline(format!("{e:#}"))));
-                if until_shutdown(&mut ctl, events, tokio::time::sleep(backoff)).await.is_none() {
+                let wait = backoff.wait(Duration::ZERO, Instant::now().into_std());
+                if until_shutdown(&mut ctl, events, tokio::time::sleep(wait)).await.is_none() {
                     return;
                 }
-                backoff = (backoff * 2).min(BACKOFF_MAX);
                 continue;
             }
         };
@@ -1133,14 +1185,13 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
             lost(events, p, &why);
         }
         drop(c);
+        let now = Instant::now().into_std();
+        backoff.dropped(up_at.elapsed(), why == RELOADING, now);
+        let wait = backoff.wait(delay, now);
         emit(events, Event::Status(Status::Reconnecting { why }));
-        if up_at.elapsed() >= STABLE_AFTER {
-            backoff = BACKOFF_START;
-        }
-        if until_shutdown(&mut ctl, events, tokio::time::sleep(delay.max(backoff))).await.is_none() {
+        if until_shutdown(&mut ctl, events, tokio::time::sleep(wait)).await.is_none() {
             return;
         }
-        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 
@@ -1363,7 +1414,7 @@ async fn session_loop(
     };
     let detached = |session_id: Option<String>| Exit { session_id, reason: DETACHED.into() };
     let mut previous: Option<Previous> = None;
-    let mut backoff = BACKOFF_START;
+    let mut backoff = Backoff::default();
     let mut deadline = Instant::now() + RECONNECT_BUDGET;
     let mut create_sent = false;
     loop {
@@ -1392,15 +1443,18 @@ async fn session_loop(
                 return Exit { session_id, reason };
             }
             Attempt::Retry { why, after } => {
-                let delay = after.max(backoff);
-                if Instant::now() + delay > deadline {
+                let now = Instant::now();
+                if why == RELOADING {
+                    backoff.dropped(Duration::ZERO, true, now.into_std());
+                }
+                let delay = backoff.wait(after, now.into_std());
+                if now + delay > deadline {
                     let what = if previous.is_some() { "reconnect" } else { "attach" };
                     return Exit { session_id, reason: format!("{what} gave up: {why}") };
                 }
                 if without_session(&mut cmds, &events, attach_seq, tokio::time::sleep(delay)).await.is_none() {
                     return detached(session_id);
                 }
-                backoff = (backoff * 2).min(BACKOFF_MAX);
                 continue;
             }
         };
@@ -1675,22 +1729,64 @@ async fn session_loop(
             &mut cancels,
             "the session connection dropped before the daemon answered: look at the worker's row",
         );
+        let reload = why == RELOADING;
         emit(&events, Event::Reattaching { attach_seq, session_id: sid.clone(), reason: why });
         previous = Some(Previous { client: me, session_id: sid, was_owner: owner == Some(me), generation });
         drop(conn);
         // A session that keeps dropping right after attaching backs off and
         // runs out of budget instead of reconnecting in a tight loop.
         if up_at.elapsed() >= STABLE_AFTER {
-            backoff = BACKOFF_START;
             deadline = Instant::now() + RECONNECT_BUDGET;
         }
-        let delay = delay.max(backoff);
-        if Instant::now() + delay > deadline {
+        let now = Instant::now();
+        backoff.dropped(up_at.elapsed(), reload, now.into_std());
+        let delay = backoff.wait(delay, now.into_std());
+        if now + delay > deadline {
             return Exit { session_id, reason: "reconnect gave up: the session connection keeps dropping".into() };
         }
         if without_session(&mut cmds, &events, attach_seq, tokio::time::sleep(delay)).await.is_none() {
             return detached(session_id);
         }
-        backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    /// A failing daemon is backed off from (100 ms doubling to 5 s); a
+    /// reload's goodbye is not a failure: the daemon's `retry_after`, then a
+    /// try every `RELOAD_RETRY` for `RELOAD_WINDOW` from the last goodbye,
+    /// however many came before; past the window, the doubling starts over.
+    #[test]
+    fn a_reload_retries_on_a_short_fixed_schedule() {
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| Duration::from_millis(n);
+        let mut b = Backoff::default();
+        let waits: Vec<u64> = (0..8).map(|_| b.wait(Duration::ZERO, t0).as_millis() as u64).collect();
+        assert_eq!(waits, [100, 200, 400, 800, 1600, 3200, 5000, 5000], "a failing daemon");
+        // A storm: four goodbyes, each after a short time up, the reconnect
+        // failing a few times in between (the new daemon booting).
+        let (mut t, mut last) = (t0, t0);
+        for _ in 0..4 {
+            last = t;
+            b.dropped(ms(300), true, t);
+            assert_eq!(b.wait(ms(50), t), RELOAD_RETRY, "the goodbye: retry_after, at least RELOAD_RETRY");
+            assert_eq!(b.wait(ms(3000), t), ms(3000), "a longer retry_after is kept");
+            for _ in 0..6 {
+                t += RELOAD_RETRY;
+                assert_eq!(b.wait(Duration::ZERO, t), RELOAD_RETRY, "booting: fixed, never doubling");
+            }
+        }
+        t = last + RELOAD_WINDOW - ms(1);
+        assert_eq!(b.wait(Duration::ZERO, t), RELOAD_RETRY, "the window runs from the last goodbye");
+        t += ms(1);
+        assert_eq!(b.wait(Duration::ZERO, t), BACKOFF_START, "past it, a failing daemon again: from the start");
+        assert_eq!(b.wait(Duration::ZERO, t), ms(200));
+        // A connection that stayed up resets the doubling; a short one doesn't.
+        b.dropped(ms(500), false, t);
+        assert_eq!(b.wait(Duration::ZERO, t), ms(400));
+        b.dropped(STABLE_AFTER, false, t);
+        assert_eq!(b.wait(Duration::ZERO, t), BACKOFF_START);
     }
 }

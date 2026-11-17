@@ -2855,6 +2855,48 @@ fn closing_a_tab_keeps_the_indicator_in_its_slot(cx: &mut TestAppContext) {
     assert!(!motion_pending(cx, &view).0, "settled");
 }
 
+/// fluid.md §3.8 (M3): a new tab's width springs open from 0; settled, a
+/// later change of width (the window widening, every tab with it) is taken
+/// at once, in the first frame, by every tab: none springs again.
+#[gpui_kit::test]
+fn a_settled_tab_takes_a_new_width_at_once(cx: &mut TestAppContext) {
+    use gpui_kit::VisualTestContext;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let ids = view.update(cx, |v, cx| {
+        v.client = None;
+        v.panels.rail_width = Some(220);
+        v.panels.right_width = Some(413);
+        let ids: Vec<String> = v.model.sessions.iter().map(|s| s.id.clone()).collect();
+        for id in ids {
+            v.open_tab(crate::app::Open::Attach { session_id: id, fallback: None, open: false }, crate::tabs::Place::New);
+        }
+        cx.notify();
+        v.model.tabs.iter().map(|t| t.id).collect::<Vec<_>>()
+    });
+    // Each tab's drawn width (its spring; the tab itself is laid out at
+    // the final width, clipped to this while it opens).
+    let widths = |vcx: &mut VisualTestContext| {
+        view.read_with(vcx, |v, _| {
+            ids.iter().filter_map(|id| v.fx.spring_at(crate::motion::key(crate::tabstrip::OPEN_W, *id))).collect::<Vec<_>>()
+        })
+    };
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    vcx.run_until_parked();
+    // Opening: springs from 0.
+    let opening = widths(&mut vcx);
+    wait(&mut vcx, w, &view, 600);
+    let settled = widths(&mut vcx);
+    assert!(!opening.is_empty() && opening.iter().zip(&settled).all(|(a, b)| a < b), "they opened on a spring: {opening:?} → {settled:?}");
+    vcx.simulate_resize(size(px(1000.), px(900.)));
+    vcx.run_until_parked();
+    let first = widths(&mut vcx);
+    wait(&mut vcx, w, &view, 600);
+    let end = widths(&mut vcx);
+    assert_ne!(settled, end, "the widening changed the tabs' width");
+    assert_eq!(first, end, "the new width in the first frame: no spring");
+}
+
 /// fluid.md §3.6: a switch within 150 ms of the last is instant (holding
 /// ↓ never stacks transitions); one after it plays.
 #[gpui_kit::test]
@@ -3067,8 +3109,14 @@ fn a_theme_change_cross_fades(cx: &mut TestAppContext) {
     wait(cx, w, &view, 180);
     let mid = ink(cx);
     assert!(mid != old && mid != new, "between: {mid:?}");
+    // Re-gate 5: the text views' colours (links, code spans) move with it,
+    // a frame behind at most, never after it.
+    let text_t = |cx: &mut TestAppContext| cx.update(|cx| cx.global::<crate::theme::Scheme>().text_t.get());
+    let tt = text_t(cx);
+    assert!(tt > 0.2 && tt < 0.8, "the text views' style mid-fade: {tt}");
     wait(cx, w, &view, 400);
     assert_eq!(ink(cx), new, "then the new one");
+    assert_eq!(text_t(cx), 1., "the text views' style at the end");
     assert_ne!(kit(cx), old_kit, "the kit, synced on the last frame");
     assert!(!fading(cx));
     // Dark to light: at once (text and ground would cross mid-fade).
@@ -3144,8 +3192,12 @@ fn saved_value_afterglows(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Full);
     settle(cx, w, 4);
-    let id: gpui_kit::SharedString = "field-test".into();
+    let id: gpui_kit::SharedString = "field-dash-url".into();
     let k = |cx: &mut TestAppContext, value: &str, sending: bool| view.read_with(cx, |v, _| v.saved_glow(&id, value, sending));
+    // A THIS APP key waiting for its write (`save_app` put it there).
+    view.update(cx, |v, _| {
+        v.settings.app_dirty.insert("dash_url", None);
+    });
     // Read outside a frame: at the motion clock, moved here alone.
     let wait = |cx: &mut TestAppContext, _: AnyWindowHandle, view: &Entity<AppView>, ms: u64| {
         view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + std::time::Duration::from_millis(ms)));
@@ -3163,6 +3215,14 @@ fn saved_value_afterglows(cx: &mut TestAppContext) {
     assert_eq!(k(cx, "c", true), 0., "sending");
     wait(cx, w, &view, 50);
     assert_eq!(k(cx, "c", false), 1., "answered: lit at once");
+    // Nit (cross-client): a change that isn't this app's pending write (a
+    // daemon value another client set) glows as it lands, not on this
+    // app's next unrelated write.
+    view.update(cx, |v, _| v.settings.app_dirty.clear());
+    let other: gpui_kit::SharedString = "field-model".into();
+    let k2 = |cx: &mut TestAppContext, value: &str| view.read_with(cx, |v, _| v.saved_glow(&other, value, false));
+    assert_eq!(k2(cx, "x"), 0., "first sight");
+    assert_eq!(k2(cx, "y"), 1., "another client's change: lit at once");
     // Settings not shown (this test's window shows a session): what it
     // showed is forgotten, so a value changed meanwhile is first sight.
     frame(cx, &view);
@@ -3222,6 +3282,15 @@ fn the_link_drops_drains_and_scans_back(cx: &mut TestAppContext) {
     assert!(!motion_pending(cx, &view).0, "holding draws nothing");
     conn(cx, ConnState::Connected("x".into()));
     assert!(view.read_with(cx, |v, _| v.link.scan.is_some()), "back: it scans");
+    // FG2: the Scan's line is drawn live from its first frame, while the
+    // palette is still drained.
+    let (line, live, drained) = (
+        view.read_with(cx, |v, _| v.scan_line),
+        cx.update(|cx| crate::theme::live_palette(cx).run_mark_ch),
+        cx.update(|cx| crate::theme::palette(cx).run_mark_ch),
+    );
+    assert_eq!(line, Some(live), "the Scan in the live colour");
+    assert_ne!(live, drained, "(while the palette is drained)");
     wait(cx, w, &view, 400);
     assert_eq!(drain(cx), 0., "restored");
     assert_eq!(run(cx), lit);
@@ -3248,6 +3317,77 @@ fn the_link_drops_drains_and_scans_back(cx: &mut TestAppContext) {
     assert_eq!(motion_pending(cx, &view), (false, None), "Off: the dots hold too");
 }
 
+/// Re-gate 1 (motion.md §5.3 "over `slow` 360 `inout`"): the drain and
+/// the restore run their whole tween at frame rate. From the tear's end
+/// every 7 ms frame asks for the next and moves the palette on (no step
+/// over a quarter of the way) until it is all the way, and the app's frame
+/// (the composer's bar with it) draws each step.
+#[gpui_kit::test]
+fn the_drain_and_the_restore_run_every_frame(cx: &mut TestAppContext) {
+    let (w, view) = link_up(cx);
+    let drain = |cx: &mut TestAppContext| cx.update(|cx| cx.global::<crate::theme::Scheme>().drain.get());
+    let bar = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.composer_bar.get());
+    let frames = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.frames());
+    let lit = bar(cx).expect("the composer's bar is drawn");
+    let run = |cx: &mut TestAppContext, to: f32, what: &str| {
+        let mut ks = vec![drain(cx)];
+        let mut bars = vec![bar(cx)];
+        for _ in 0..120 {
+            if ks.last() == Some(&to) {
+                break;
+            }
+            let (frame, timer) = motion_pending(cx, &view);
+            assert!(frame || timer.is_some(), "{what}: the window stopped asking for frames at {:?}", ks.last());
+            let f0 = frames(cx);
+            wait(cx, w, &view, 7);
+            ks.push(drain(cx));
+            bars.push(bar(cx));
+            assert!(frames(cx) > f0, "{what}: no frame drawn at {:?}", ks.last());
+        }
+        assert_eq!(ks.last(), Some(&to), "{what}: all the way ({ks:?})");
+        let moving: Vec<f32> = ks.iter().copied().filter(|k| *k > 0. && *k < 1.).collect();
+        assert!(moving.len() >= 360 / 7 - 4, "{what}: at frame rate, {} frames between ({ks:?})", moving.len());
+        for p in ks.windows(2) {
+            assert!((p[1] - p[0]).abs() <= 0.25, "{what}: a step over a quarter ({} → {})", p[0], p[1]);
+            assert!(if to > 0. { p[1] >= p[0] } else { p[1] <= p[0] }, "{what}: one way ({} → {})", p[0], p[1]);
+        }
+        let changes = bars.windows(2).filter(|p| p[0] != p[1]).count();
+        assert!(changes >= moving.len(), "{what}: the composer's bar moves with it ({changes} of {} frames)", moving.len());
+    };
+    status(cx, &view, synaps_client::Status::Reconnecting { why: "daemon closed the connection".into() });
+    wait_past(cx, w, &view, crate::motion::LINK_GRACE.as_millis() as u64);
+    assert!(view.read_with(cx, |v, _| v.link.tore.is_some()), "lost");
+    run(cx, 1., "the drain");
+    assert_ne!(bar(cx), Some(lit), "the composer's bar drained");
+    status(cx, &view, hello());
+    run(cx, 0., "the restore");
+    assert_eq!(bar(cx), Some(lit), "the composer's bar restored");
+}
+
+/// R2 (motion.md §5.1, §6.7): a real window starts at `Connecting`, so its
+/// first frames see the link down; the first hello still scans, however
+/// late it comes, and a launch that never connected tears nothing.
+#[gpui_kit::test]
+fn the_first_hello_scans_after_connecting(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, cx| {
+        v.synthetic = false;
+        v.link = Default::default();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    status(cx, &view, synaps_client::Status::Connecting);
+    wait(cx, w, &view, 3000);
+    status(cx, &view, synaps_client::Status::Offline("connection refused".into()));
+    wait(cx, w, &view, 3000);
+    let (tore, scan) = view.read_with(cx, |v, _| (v.link.tore, v.link.scan));
+    assert_eq!((tore, scan), (None, None), "never up yet: nothing to lose, nothing to scan");
+    status(cx, &view, hello());
+    assert!(view.read_with(cx, |v, _| v.link.scan.is_some()), "the first hello scans");
+    assert_eq!(view.read_with(cx, |v, _| v.scan_line), Some(cx.update(|cx| crate::theme::live_palette(cx).run_mark_ch)));
+}
+
 /// A link set up for the link tests: Full, a live (not synthetic) link,
 /// up, its first Scan over.
 fn link_up(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<AppView>) {
@@ -3268,35 +3408,213 @@ fn set_conn(cx: &mut TestAppContext, view: &Entity<AppView>, c: crate::model::Co
     cx.run_until_parked();
 }
 
+/// What the client says, as the model takes it (`Model::apply`): the
+/// link's reason (`reload`, `reload_seq`) is the model's own mapping.
+fn status(cx: &mut TestAppContext, view: &Entity<AppView>, s: synaps_client::Status) {
+    view.update(cx, |v, cx| {
+        let _ = v.model.apply(synaps_client::Event::Status(s));
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+fn goodbye() -> synaps_client::Status {
+    synaps_client::Status::Reconnecting { why: synaps_client::RELOADING.into() }
+}
+
+fn hello() -> synaps_client::Status {
+    synaps_client::Status::Connected { daemon_version: "x".into(), profile: None, pid: 1, features: vec![] }
+}
+
+/// The link shows nothing of a reload: no tear, no drain, no Scan.
+fn quiet(cx: &mut TestAppContext, view: &Entity<AppView>, what: &str) {
+    let (dy, glitch, scan, lost) = view.read_with(cx, |v, _| (v.conn_dy, v.link.glitch, v.link.scan, v.link.lost));
+    assert_eq!((dy, glitch.is_some(), scan.is_some(), lost), (0., false, false, false), "{what}");
+    assert_eq!(cx.update(|cx| cx.global::<crate::theme::Scheme>().drain.get()), 0., "{what}: no drain");
+}
+
+/// Frames every 100 ms (the reconnect failing every second meanwhile)
+/// until the link is lost: quiet before, and how long it was down (from
+/// the grace's start) when it was lost. (The harness's clock can jump a
+/// beat ahead: the grace is measured against the link's own `since`.)
+fn until_lost(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> std::time::Duration {
+    for n in 1..400 {
+        let since = view.read_with(cx, |v, _| v.link.down.map(|d| d.0)).expect("down");
+        wait(cx, w, view, 100);
+        if n % 10 == 0 {
+            status(cx, view, synaps_client::Status::Offline("connection refused".into()));
+        }
+        let (now, lost, tore) = view.read_with(cx, |v, _| (v.fx.now(), v.link.lost, v.link.tore));
+        if lost {
+            let tore = tore.expect("lost: the tear");
+            return tore.saturating_duration_since(since);
+        }
+        quiet(cx, view, &format!("{:?} down", now.saturating_duration_since(since)));
+    }
+    panic!("never lost");
+}
+
 /// A daemon reload is a planned handover (its sessions come back): no
-/// tear, no drain, no Scan, even when the new daemon takes a few seconds
-/// (the reconnect failing meanwhile). Past [`RELOAD_GRACE`] it is a loss.
+/// tear, no drain, no Scan, even when the new daemon takes 9 s (the
+/// reconnect failing every `RELOAD_RETRY` meanwhile, Offline). Past
+/// [`RELOAD_GRACE`] from its goodbye it is a loss.
 #[gpui_kit::test]
 fn a_reload_neither_tears_nor_scans(cx: &mut TestAppContext) {
-    use crate::model::ConnState;
+    use synaps_client::Status;
     let (w, view) = link_up(cx);
-    let quiet = |cx: &mut TestAppContext, what: &str| {
-        let (dy, glitch, scan) = view.read_with(cx, |v, _| (v.conn_dy, v.link.glitch, v.link.scan));
-        assert_eq!((dy, glitch.is_some(), scan.is_some()), (0., false, false), "{what}");
-        assert_eq!(cx.update(|cx| cx.global::<crate::theme::Scheme>().drain.get()), 0., "{what}: no drain");
-    };
-    set_conn(cx, &view, ConnState::Reconnecting, true);
-    quiet(cx, "the goodbye");
-    for n in 0..8 {
-        wait(cx, w, &view, 250);
-        // The new daemon is not up yet: the reconnect fails (Offline).
-        set_conn(cx, &view, ConnState::Off("refused".into()), view.read_with(cx, |v, _| v.model.reload));
-        quiet(cx, &format!("reloading, {} ms", 250 * (n + 1)));
+    let retry = synaps_client::RELOAD_RETRY.as_millis() as u64;
+    // An empty daemon (the sandbox's): the rail says "No open sessions".
+    view.update(cx, |v, cx| {
+        let _ = v.model.apply(synaps_client::Event::Sessions(Vec::new()));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let rail = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.rail.keys.clone());
+    let before = rail(cx);
+    status(cx, &view, goodbye());
+    quiet(cx, &view, "the goodbye");
+    // Re-gate 3: the rail keeps its last lists (no "Not connected", its
+    // HISTORY block kept) while the reload is within its grace.
+    assert_eq!(rail(cx), before, "the rail through a reload");
+    for n in 1..=9000 / retry {
+        wait(cx, w, &view, retry);
+        status(cx, &view, Status::Offline("connection refused".into()));
+        quiet(cx, &view, &format!("reloading, {} ms", retry * n));
     }
-    set_conn(cx, &view, ConnState::Connected("x".into()), false);
-    quiet(cx, "back");
+    assert_eq!(rail(cx), before, "the rail 9 s into a reload");
+    status(cx, &view, hello());
+    quiet(cx, &view, "back after 9 s");
     wait(cx, w, &view, 700);
-    quiet(cx, "settled");
+    quiet(cx, &view, "settled");
     assert!(!motion_pending(cx, &view).0, "settled: no frames");
-    // A reload that never comes back is a loss, after its grace.
-    set_conn(cx, &view, ConnState::Reconnecting, true);
-    wait_past(cx, w, &view, crate::motion::RELOAD_GRACE.as_millis() as u64);
-    assert!(view.read_with(cx, |v, _| v.link.tore.is_some()), "lost: the tear");
+    // A reload that never comes back is a loss, its grace after the goodbye
+    // (to the millisecond: motion.rs `the_link_tears_after_its_grace`).
+    status(cx, &view, goodbye());
+    let rg = crate::motion::RELOAD_GRACE;
+    let down = until_lost(cx, w, &view);
+    assert!(down >= rg && down < rg + std::time::Duration::from_millis(200), "lost {down:?} after the goodbye");
+    // From here the rail and the words say so (re-gate 3).
+    assert!(!view.read_with(cx, |v, _| v.model.reload), "a reload past its grace is a loss");
+    frame(cx, &view);
+    assert_ne!(rail(cx), before, "lost: the rail says it is not connected");
+}
+
+/// When the client is back for a moment between two frames and a second
+/// goodbye comes (the window never sees it up), the new goodbye restarts
+/// the grace: a slow storm is never a loss.
+#[gpui_kit::test]
+fn a_new_goodbye_restarts_the_reload_grace(cx: &mut TestAppContext) {
+    let (w, view) = link_up(cx);
+    let rg = crate::motion::RELOAD_GRACE.as_millis() as u64;
+    status(cx, &view, goodbye());
+    let first = view.read_with(cx, |v, _| v.link.down.map(|d| d.0)).expect("down");
+    wait(cx, w, &view, rg - 2000);
+    view.update(cx, |v, cx| {
+        let _ = v.model.apply(synaps_client::Event::Status(hello()));
+        let _ = v.model.apply(synaps_client::Event::Status(goodbye()));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let second = view.read_with(cx, |v, _| v.link.down.map(|d| d.0)).expect("down");
+    assert!(second.duration_since(first).as_millis() as u64 >= rg - 2000, "the second goodbye restarted the grace");
+    let down = until_lost(cx, w, &view);
+    let rg = crate::motion::RELOAD_GRACE;
+    assert!(down >= rg && down < rg + std::time::Duration::from_millis(200), "lost {down:?} after the second goodbye");
+}
+
+/// A daemon's availability for a reload storm: `n` reloads, each new daemon
+/// taking `boot` ms to answer, the next reload as soon as it does (the
+/// CLI's `daemon reload` returns once the new image answers a ping).
+/// Then what the client says and when, on the reconnect schedule `wait`
+/// (`after`, `now`, and whether this wait follows a goodbye).
+fn storm(n: u64, boot: u64, mut wait: impl FnMut(u64, u64, bool, u64) -> u64) -> Vec<(u64, synaps_client::Status)> {
+    let reloads: Vec<u64> = (0..n).map(|k| 1000 + k * (boot + 50)).collect();
+    let daemon_up = |t: u64| !reloads.iter().any(|&r| r <= t && t < r + boot);
+    let mut out = Vec::new();
+    let (mut up_since, mut next, mut k) = (Some(0u64), 0u64, 0usize);
+    loop {
+        if let Some(since) = up_since {
+            let Some(&r) = reloads.get(k) else { break };
+            k += 1;
+            out.push((r, goodbye()));
+            up_since = None;
+            // The goodbye's `retry_after_ms`: 500 here.
+            next = r + wait(500, r, true, r - since);
+            continue;
+        }
+        while reloads.get(k).is_some_and(|&r| r <= next) {
+            k += 1;
+        }
+        if daemon_up(next) {
+            out.push((next, hello()));
+            up_since = Some(next);
+        } else {
+            out.push((next, synaps_client::Status::Offline("connection refused".into())));
+            next += wait(0, next, false, 0);
+        }
+    }
+    out
+}
+
+/// The longest stretch the link is down in `events`, from its last goodbye.
+fn longest_from_goodbye(events: &[(u64, synaps_client::Status)]) -> u64 {
+    let (mut from, mut worst) = (None, 0);
+    for (t, s) in events {
+        match s {
+            synaps_client::Status::Reconnecting { .. } => from = Some(*t),
+            synaps_client::Status::Connected { .. } => worst = worst.max(from.take().map_or(0, |f| t - f)),
+            _ => {}
+        }
+    }
+    worst
+}
+
+/// A storm of four daemon reloads as the client lives it (R1): its real
+/// reconnect schedule (`synaps_client::Backoff`), each new daemon taking
+/// 1.6 s to boot (bella's sandbox, empty), the CLI reloading again as soon
+/// as the new one answers: about 7 s of the link down, nearly unbroken.
+/// No tear, no drain, no Scan at any step. (On the old schedule, doubling
+/// and never reset within 10 s, the same storm kept the link down past the
+/// old 6 s grace: the sim says so first.)
+#[gpui_kit::test]
+fn a_four_reload_storm_on_the_clients_schedule_plays_nothing(cx: &mut TestAppContext) {
+    use std::time::{Duration, Instant};
+    let base = Instant::now();
+    let mut b = synaps_client::Backoff::default();
+    let events = storm(4, 1600, |after, t, bye, up_for| {
+        let now = base + Duration::from_millis(t);
+        if bye {
+            b.dropped(Duration::from_millis(up_for), true, now);
+        }
+        b.wait(Duration::from_millis(after), now).as_millis() as u64
+    });
+    let mut old = 100u64;
+    let was = storm(4, 1600, |after, _, _, _| {
+        let w = after.max(old);
+        old = (old * 2).min(5000);
+        w
+    });
+    assert!(longest_from_goodbye(&was) > 6000, "the old schedule outlasted the old grace: {was:?}");
+    let rg = crate::motion::RELOAD_GRACE.as_millis() as u64;
+    assert!(longest_from_goodbye(&events) < rg / 2, "the client's schedule: {events:?}");
+    let (w, view) = link_up(cx);
+    let mut t = 0;
+    for (at, s) in events {
+        // Frames on the way, every 100 ms at most.
+        while t < at {
+            let d = (at - t).min(100);
+            wait(cx, w, &view, d);
+            t += d;
+            quiet(cx, &view, &format!("{t} ms"));
+        }
+        let what = format!("{s:?} at {at} ms");
+        status(cx, &view, s);
+        quiet(cx, &view, &what);
+    }
+    assert!(matches!(view.read_with(cx, |v, _| v.model.conn.clone()), crate::model::ConnState::Connected(_)), "back");
+    wait(cx, w, &view, 700);
+    quiet(cx, &view, "settled");
+    assert!(!motion_pending(cx, &view).0, "settled: no frames");
 }
 
 /// A storm of reloads (3 in 2 s), or of short drops, plays nothing; a

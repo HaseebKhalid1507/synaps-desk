@@ -523,11 +523,9 @@ pub fn build(m: &Model, view: &View, now: i64) -> Rail {
         }
         rail.items.push(Item::Group { group, count: arc(shown.len().to_string()) });
         if shown.is_empty() {
-            let empty = if m.sessions.is_empty() && !matches!(m.conn, crate::model::ConnState::Connected(_)) {
-                "Not connected"
-            } else {
-                "No open sessions"
-            };
+            // A daemon reload within its grace keeps the last lists (re-gate 3).
+            let up = matches!(m.conn, crate::model::ConnState::Connected(_)) || m.reload;
+            let empty = if m.sessions.is_empty() && !up { "Not connected" } else { "No open sessions" };
             rail.items.push(Item::Empty(empty));
         }
         for i in shown {
@@ -543,6 +541,7 @@ pub fn build(m: &Model, view: &View, now: i64) -> Rail {
         _ if n.saved_supported && n.saved_failed => History::Failed,
         _ if n.saved_supported => History::Loading,
         crate::model::ConnState::Connected(_) => History::Unsupported,
+        _ if m.reload => History::Unsupported,
         _ => History::Off,
     };
     match state {
