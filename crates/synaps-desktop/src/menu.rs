@@ -217,7 +217,8 @@ pub(crate) fn render<A: Copy + 'static>(
         let act = it.act;
         // The keyboard's row: the hover fill and a 1 px focus frame (§5).
         let key = crate::app::tkey(id, i);
-        let (fill, dy) = if on && phase.live { fx.fill(key, p.card, selected.then_some(p.card_hi), p.card_hi, p.press_k) } else { (None, 0.) };
+        let (fill, dy) =
+            if on && phase.live { fx.fill(key, p.card, selected.then_some(p.card_hi), p.card_hi, p.press_k) } else { (None, 0.) };
         let mut row = h_flex()
             .id(("menu-item", i))
             .relative()

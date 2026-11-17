@@ -1440,7 +1440,13 @@ impl Motion {
         }
         h.1 = frame;
         let full = match self.level.get() {
-            Level::Full => if to > h.0.sample(now, &ease::OUT) { up } else { down },
+            Level::Full => {
+                if to > h.0.sample(now, &ease::OUT) {
+                    up
+                } else {
+                    down
+                }
+            }
             _ => QUICK.min(if to > h.0.sample(now, &ease::OUT) { up } else { down }),
         };
         h.0.retarget(to, now, full, &ease::OUT);
@@ -2378,4 +2384,3 @@ mod tests {
         assert_eq!(m.glow_k(3, 11), 0., "Off: never");
     }
 }
-

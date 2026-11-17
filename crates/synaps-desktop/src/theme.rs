@@ -432,15 +432,68 @@ impl Palette {
         let t = 0.7 * k.min(1.);
         let mut p = *self;
         for c in [
-            &mut p.you, &mut p.warn, &mut p.run, &mut p.ready, &mut p.cost, &mut p.err, &mut p.think, &mut p.ok,
-            &mut p.t_bash, &mut p.t_read, &mut p.t_write, &mut p.t_edit, &mut p.t_grep, &mut p.t_find, &mut p.t_ls, &mut p.t_sub,
-            &mut p.t_ext, &mut p.t_gen, &mut p.sub_name_t, &mut p.sub_status_t, &mut p.ok_o, &mut p.err_o, &mut p.think_o,
-            &mut p.warn_k, &mut p.err_k, &mut p.run_k, &mut p.ok_k, &mut p.run_mark_k, &mut p.err_mark_k, &mut p.focus_k,
-            &mut p.you_mark, &mut p.you_mark_t, &mut p.warn_mark, &mut p.run_mark, &mut p.focus, &mut p.btn_fill, &mut p.warn_fill,
-            &mut p.btn_hi, &mut p.warn_hi, &mut p.btn_press, &mut p.warn_press, &mut p.warn_ch, &mut p.run_ch, &mut p.unread_ch,
-            &mut p.open_ch, &mut p.ready_ch, &mut p.err_ch, &mut p.cost_ch, &mut p.ok_ch, &mut p.edit_ch, &mut p.write_ch,
-            &mut p.bash_ch, &mut p.sub_name, &mut p.sub_status, &mut p.sub_done, &mut p.warn_mark_ch, &mut p.run_mark_ch,
-            &mut p.unread_mark_ch, &mut p.focus_ch, &mut p.ready_mark_ch, &mut p.err_mark_ch, &mut p.you_bar,
+            &mut p.you,
+            &mut p.warn,
+            &mut p.run,
+            &mut p.ready,
+            &mut p.cost,
+            &mut p.err,
+            &mut p.think,
+            &mut p.ok,
+            &mut p.t_bash,
+            &mut p.t_read,
+            &mut p.t_write,
+            &mut p.t_edit,
+            &mut p.t_grep,
+            &mut p.t_find,
+            &mut p.t_ls,
+            &mut p.t_sub,
+            &mut p.t_ext,
+            &mut p.t_gen,
+            &mut p.sub_name_t,
+            &mut p.sub_status_t,
+            &mut p.ok_o,
+            &mut p.err_o,
+            &mut p.think_o,
+            &mut p.warn_k,
+            &mut p.err_k,
+            &mut p.run_k,
+            &mut p.ok_k,
+            &mut p.run_mark_k,
+            &mut p.err_mark_k,
+            &mut p.focus_k,
+            &mut p.you_mark,
+            &mut p.you_mark_t,
+            &mut p.warn_mark,
+            &mut p.run_mark,
+            &mut p.focus,
+            &mut p.btn_fill,
+            &mut p.warn_fill,
+            &mut p.btn_hi,
+            &mut p.warn_hi,
+            &mut p.btn_press,
+            &mut p.warn_press,
+            &mut p.warn_ch,
+            &mut p.run_ch,
+            &mut p.unread_ch,
+            &mut p.open_ch,
+            &mut p.ready_ch,
+            &mut p.err_ch,
+            &mut p.cost_ch,
+            &mut p.ok_ch,
+            &mut p.edit_ch,
+            &mut p.write_ch,
+            &mut p.bash_ch,
+            &mut p.sub_name,
+            &mut p.sub_status,
+            &mut p.sub_done,
+            &mut p.warn_mark_ch,
+            &mut p.run_mark_ch,
+            &mut p.unread_mark_ch,
+            &mut p.focus_ch,
+            &mut p.ready_mark_ch,
+            &mut p.err_mark_ch,
+            &mut p.you_bar,
         ] {
             *c = drain_hsla(*c, t);
         }
@@ -733,9 +786,13 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
             [r.ink, r.prose_ch, r.dim_ch, r.header, r.warn_ch, r.run_ch, r.unread_ch, r.open_ch, r.ready_ch, r.err_ch, r.cost_ch, r.ok_ch],
             [r.warn_mark_ch, r.run_mark_ch, r.unread_mark_ch, r.focus_ch, r.ready_mark_ch, r.err_mark_ch, r.rest_mark, r.you_bar],
         );
-        let (texts_k, marks_k) =
-            ([r.ink, r.prose_k, r.dim_k, r.warn_k, r.err_k, r.run_k, r.ok_k], [r.run_mark_k, r.err_mark_k, r.rest_mark_k, r.focus_k, r.warn_mark]);
-        let texts_t = [r.prose_t, r.dim_t, r.arg, r.ok, r.t_bash, r.t_read, r.t_write, r.t_edit, r.t_grep, r.t_find, r.t_ls, r.t_sub, r.t_ext, r.t_gen];
+        let (texts_k, marks_k) = (
+            [r.ink, r.prose_k, r.dim_k, r.warn_k, r.err_k, r.run_k, r.ok_k],
+            [r.run_mark_k, r.err_mark_k, r.rest_mark_k, r.focus_k, r.warn_mark],
+        );
+        let texts_t = [
+            r.prose_t, r.dim_t, r.arg, r.ok, r.t_bash, r.t_read, r.t_write, r.t_edit, r.t_grep, r.t_find, r.t_ls, r.t_sub, r.t_ext, r.t_gen,
+        ];
         let marks_t = [r.warn_mark, r.run_mark, r.you_mark_t, r.sub_rule];
         let texts_u = [r.ink, r.dim_u, r.agent_u, r.head_u];
         let label = [chrome];
@@ -940,6 +997,7 @@ pub fn palette(cx: &App) -> Palette {
 }
 
 /// A colour's relative luminance (WCAG).
+#[cfg(test)]
 pub fn luminance_hsla(c: Hsla) -> f32 {
     let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
     let rgb = Rgba::from(c);
@@ -1658,9 +1716,20 @@ mod tests {
             for accent in [None, Some(0xe8132f), Some(0xf4b400), Some(0x2d7bff), Some(0x35f2ff)] {
                 let p = Palette::of(&resolve(&raw, accent).0);
                 let d = p.drained(1.);
-                assert_eq!((d.canvas, d.chrome, d.ink, d.prose, d.hair, d.tool, d.user), (p.canvas, p.chrome, p.ink, p.prose, p.hair, p.tool, p.user), "{name}");
+                assert_eq!(
+                    (d.canvas, d.chrome, d.ink, d.prose, d.hair, d.tool, d.user),
+                    (p.canvas, p.chrome, p.ink, p.prose, p.hair, p.tool, p.user),
+                    "{name}"
+                );
                 assert_ne!(d.run, p.run, "{name}: the live colour drains");
-                for (a, b) in [(p.run, d.run), (p.err_ch, d.err_ch), (p.warn_mark, d.warn_mark), (p.you_bar, d.you_bar), (p.ok, d.ok), (p.focus, d.focus)] {
+                for (a, b) in [
+                    (p.run, d.run),
+                    (p.err_ch, d.err_ch),
+                    (p.warn_mark, d.warn_mark),
+                    (p.you_bar, d.you_bar),
+                    (p.ok, d.ok),
+                    (p.focus, d.focus),
+                ] {
                     for ground in [p.canvas, p.chrome, p.tool, p.user] {
                         worst = worst.max((con(a, ground) - con(b, ground)).abs());
                     }
@@ -1913,8 +1982,21 @@ mod tests {
     fn the_accent_colours_you_and_focus_only() {
         // The pressed fills are held back by the accent's marks drawn on them.
         let allowed = [
-            "you", "you_mark", "you_mark_t", "btn_fill", "btn_hi", "focus", "focus_ch", "focus_k", "open_ch", "you_bar", "press", "press_ch",
-            "press_k", "press_t", "btn_press",
+            "you",
+            "you_mark",
+            "you_mark_t",
+            "btn_fill",
+            "btn_hi",
+            "focus",
+            "focus_ch",
+            "focus_k",
+            "open_ch",
+            "you_bar",
+            "press",
+            "press_ch",
+            "press_k",
+            "press_t",
+            "btn_press",
         ];
         for (name, raw) in palettes::THEMES {
             let (a, base) = resolve(&raw, None);
