@@ -99,8 +99,8 @@ pub mod synthetic;
 pub mod transcript;
 
 pub use client::{
-    Client, ClientClosed, ClientOptions, Command, CreateOptions, Cwd, Error, Event, Expect, RequestError, STEER_UNSUPPORTED, Status,
-    WatchReply,
+    Backoff, Client, ClientClosed, ClientOptions, Command, CreateOptions, Cwd, Error, Event, Expect, RELOAD_RETRY, RELOAD_WINDOW,
+    RELOADING, RequestError, STEER_UNSUPPORTED, Status, WatchReply,
 };
 pub use conn::{Endpoint, Identity, Incompatible, InvalidName};
 pub use history::HistoryUpdate;

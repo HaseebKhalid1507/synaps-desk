@@ -9,6 +9,7 @@
 //! glyph, first match wins (see [`State`]). A row never moves because its
 //! state changed: OPEN is ordered by `created_at`.
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -522,11 +523,9 @@ pub fn build(m: &Model, view: &View, now: i64) -> Rail {
         }
         rail.items.push(Item::Group { group, count: arc(shown.len().to_string()) });
         if shown.is_empty() {
-            let empty = if m.sessions.is_empty() && !matches!(m.conn, crate::model::ConnState::Connected(_)) {
-                "Not connected"
-            } else {
-                "No open sessions"
-            };
+            // A daemon reload within its grace keeps the last lists (re-gate 3).
+            let up = matches!(m.conn, crate::model::ConnState::Connected(_)) || m.reload;
+            let empty = if m.sessions.is_empty() && !up { "Not connected" } else { "No open sessions" };
             rail.items.push(Item::Empty(empty));
         }
         for i in shown {
@@ -542,6 +541,7 @@ pub fn build(m: &Model, view: &View, now: i64) -> Rail {
         _ if n.saved_supported && n.saved_failed => History::Failed,
         _ if n.saved_supported => History::Loading,
         crate::model::ConnState::Connected(_) => History::Unsupported,
+        _ if m.reload => History::Unsupported,
         _ => History::Off,
     };
     match state {
@@ -734,6 +734,23 @@ pub fn item_key(rail: &Rail, item: &Item) -> u64 {
     h.finish()
 }
 
+/// An item's identity across a change (Flip): [`item_key`] without the
+/// counts and open flags, so a head whose count changed is the same head
+/// and slides with its rows.
+pub fn flip_id(rail: &Rail, item: &Item) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(item).hash(&mut h);
+    match item {
+        Item::Favs { .. } => {}
+        Item::Group { group, .. } => group.hash(&mut h),
+        Item::Row(i) | Item::Hist(i) => rail.rows[*i].key.hash(&mut h),
+        Item::Bucket { bucket, .. } | Item::More { bucket, .. } => bucket.hash(&mut h),
+        Item::Note(t) => t.hash(&mut h),
+        Item::Empty(t) => t.hash(&mut h),
+    }
+    h.finish()
+}
+
 /// The splice that turns `old` into `new`: the changed middle between the
 /// longest common prefix and suffix, as `(old range, new count)`. `None`:
 /// nothing changed.
@@ -744,6 +761,82 @@ pub fn splice(old: &[u64], new: &[u64]) -> Option<(std::ops::Range<usize>, usize
     }
     let suf = old[pre..].iter().rev().zip(new[pre..].iter().rev()).take_while(|(a, b)| a == b).count();
     Some((pre..old.len() - suf, new.len() - suf - pre))
+}
+
+/// An item's kind (for [`flip_targets`]: items of a kind are one height).
+/// FAVOURITES' head and a group's are one kind (one line of Display caps,
+/// the same padding).
+pub fn item_kind(item: &Item) -> u8 {
+    match item {
+        Item::Favs { .. } | Item::Group { .. } => 1,
+        Item::Bucket { .. } => 3,
+        Item::Row(_) => 2,
+        Item::Hist(_) => 4,
+        Item::More { .. } => 5,
+        Item::Note(_) => 6,
+        Item::Empty(_) => 7,
+    }
+}
+
+/// An old item for [`flip_targets`]: its key, its kind ([`item_kind`]),
+/// and its measured top and height.
+pub type Placed = (u64, u8, Option<(f32, f32)>);
+
+/// Where each item of `new` will be laid out (its top and height in the
+/// list's content), computed in the frame of a splice from the old
+/// layout, before the list lays out again (until then it can't say:
+/// Flip, motion.md §6.4). `old`: each old item's key, kind and measured
+/// top and height; the splice turned `old[range]` into `count` new items.
+/// A new item's height is its key's old height (a reorder keeps
+/// heights), else that of the old range's item of its kind at its place,
+/// else any old item of its kind. Unknown: none (that row doesn't slide).
+pub fn flip_targets(old: &[Placed], new: &[(u64, u8)], range: std::ops::Range<usize>, count: usize) -> Vec<Option<(f32, f32)>> {
+    let mut out = vec![None; new.len()];
+    let by_key: HashMap<u64, f32> = old.iter().filter_map(|&(k, _, g)| g.map(|(_, h)| (k, h))).collect();
+    let mut in_range: Vec<(u8, f32)> = old[range.clone()].iter().filter_map(|&(_, kind, g)| g.map(|(_, h)| (kind, h))).collect();
+    let any_of = |kind: u8| old.iter().find(|o| o.1 == kind).and_then(|o| o.2).map(|g| g.1);
+    for i in 0..range.start.min(new.len()) {
+        out[i] = old[i].2;
+    }
+    let end_of = |i: usize| old.get(i).and_then(|o| o.2).map(|(y, h)| y + h);
+    let start_y = old.get(range.start).and_then(|o| o.2).map(|g| g.0).or_else(|| range.start.checked_sub(1).and_then(end_of));
+    let mut y = start_y;
+    for j in range.start..(range.start + count).min(new.len()) {
+        let (key, kind) = new[j];
+        let h = by_key.get(&key).copied().or_else(|| {
+            let at = in_range.iter().position(|&(k, _)| k == kind)?;
+            Some(in_range.remove(at).1)
+        });
+        let h = h.or_else(|| any_of(kind));
+        out[j] = y.zip(h);
+        y = y.zip(h).map(|(y, h)| y + h);
+    }
+    let old_end = old.get(range.end).and_then(|o| o.2).map(|g| g.0).or_else(|| range.end.checked_sub(1).and_then(end_of)).or(start_y);
+    let delta = y.zip(old_end).map(|(n, o)| n - o);
+    for (i, o) in old.iter().enumerate().skip(range.end) {
+        let j = i - range.end + range.start + count;
+        if j < new.len() {
+            out[j] = delta.zip(o.2).map(|(d, (y, h))| (y + d, h));
+        }
+    }
+    out
+}
+
+/// The rail as `fresh` says, in `held`'s order (a row is held down: a
+/// reorder waits for its release, motion.md §6.4, but nothing else does):
+/// `held`'s items, each row's content from `fresh`'s row of its key. A row
+/// gone from `fresh` keeps its strings but points at nothing.
+pub fn keep_order(held: &Rail, fresh: &Rail) -> Rail {
+    let by_key: HashMap<u64, &Row> = fresh.rows.iter().map(|r| (r.key, r)).collect();
+    let rows = held
+        .rows
+        .iter()
+        .map(|r| match by_key.get(&r.key) {
+            Some(&f) => f.clone(),
+            None => Row { live: None, saved: None, fav: None, ..r.clone() },
+        })
+        .collect();
+    Rail { rows, items: held.items.clone(), history_unread: fresh.history_unread }
 }
 
 /// `<1m`, `2m`, `3h`, `2d` until `ts` (`now` if it has passed).
@@ -889,6 +982,58 @@ mod tests {
     use crate::model::ConnState;
 
     const NOW: i64 = 1_794_600_000; // 2026-11-13T22:40:00Z
+
+    /// A head whose count changed is the same head to Flip (it slides with
+    /// its rows), and another group's head is not.
+    #[test]
+    fn a_heads_flip_id_ignores_its_count() {
+        let r = Rail::default();
+        let open = |n: &str| Item::Group { group: Group::Open, count: n.into() };
+        assert_eq!(flip_id(&r, &open("12")), flip_id(&r, &open("11")));
+        assert_ne!(item_key(&r, &open("12")), item_key(&r, &open("11")));
+        assert_ne!(flip_id(&r, &open("11")), flip_id(&r, &Item::Group { group: Group::Pinned, count: "11".into() }));
+        let favs = |open, n: &str| Item::Favs { open, count: n.into() };
+        assert_eq!(flip_id(&r, &favs(true, "1")), flip_id(&r, &favs(false, "2")));
+    }
+
+    /// Flip's targets in a splice's frame: a reorder (heights by key), a
+    /// header whose count changed (its kind's height at its place), rows
+    /// after the range moved by the range's change; a row of an unknown
+    /// kind (and what follows it) has none.
+    #[test]
+    fn flip_targets_from_the_old_layout() {
+        // head 20, rows a b c d (40 each), head 20, row e.
+        let old = [
+            (1, 1, Some((0., 20.))),
+            (10, 2, Some((20., 40.))),
+            (11, 2, Some((60., 40.))),
+            (12, 2, Some((100., 40.))),
+            (13, 2, Some((140., 40.))),
+            (2, 1, Some((180., 20.))),
+            (14, 2, Some((200., 40.))),
+        ];
+        let keys = |v: &[(u64, u8)]| v.to_vec();
+        // d moves to the front of the rows: the splice is a b c d → d a b c.
+        let new = keys(&[(1, 1), (13, 2), (10, 2), (11, 2), (12, 2), (2, 1), (14, 2)]);
+        let (range, count) =
+            super::splice(&old.iter().map(|o| o.0).collect::<Vec<_>>(), &new.iter().map(|n| n.0).collect::<Vec<_>>()).unwrap();
+        let t = flip_targets(&old, &new, range, count);
+        assert_eq!(t.iter().map(|t| t.map(|g| g.0)).collect::<Vec<_>>(), [0., 20., 60., 100., 140., 180., 200.].map(Some));
+        // A header's count changed (a new key, its kind's height) and a row
+        // left: what follows moves up by 40.
+        let new = keys(&[(3, 1), (10, 2), (11, 2), (12, 2), (2, 1), (14, 2)]);
+        let (range, count) =
+            super::splice(&old.iter().map(|o| o.0).collect::<Vec<_>>(), &new.iter().map(|n| n.0).collect::<Vec<_>>()).unwrap();
+        let t = flip_targets(&old, &new, range, count);
+        assert_eq!(t.iter().map(|t| t.map(|g| g.0)).collect::<Vec<_>>(), [0., 20., 60., 100., 140., 160.].map(Some));
+        // A kind the old layout never had: unknown from there on.
+        let new = keys(&[(1, 1), (99, 7), (10, 2), (11, 2), (12, 2), (13, 2), (2, 1), (14, 2)]);
+        let (range, count) =
+            super::splice(&old.iter().map(|o| o.0).collect::<Vec<_>>(), &new.iter().map(|n| n.0).collect::<Vec<_>>()).unwrap();
+        let t = flip_targets(&old, &new, range, count);
+        assert_eq!(t[0].map(|g| g.0), Some(0.));
+        assert!(t[1..].iter().all(Option::is_none), "{t:?}");
+    }
 
     fn at(secs_ago: i64) -> String {
         crate::demo::rfc3339(NOW - secs_ago)

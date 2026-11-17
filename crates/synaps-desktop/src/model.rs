@@ -281,6 +281,12 @@ fn refused_input(e: &Error) -> bool {
 
 pub struct Model {
     pub conn: ConnState,
+    /// The link went down for a daemon reload (a planned handover), not a
+    /// lost transport: kept until it is up again or drops otherwise.
+    pub reload: bool,
+    /// How many reload goodbyes have come: a new one restarts the link's
+    /// reload grace (a storm of reloads).
+    pub reload_seq: u64,
     pub sessions: Vec<SessionMeta>,
     pub active: Option<Active>,
     /// The attachment asked for last: events of any other are stale.
@@ -372,6 +378,8 @@ impl Model {
     pub fn new(conn: ConnState) -> Self {
         Self {
             conn,
+            reload: false,
+            reload_seq: 0,
             sessions: Vec::new(),
             active: None,
             wanted: None,
@@ -1414,6 +1422,14 @@ impl Model {
                     } else {
                         self.clear_saved();
                     }
+                }
+                match &s {
+                    Status::Reconnecting { why } => {
+                        self.reload = why == synaps_client::RELOADING;
+                        self.reload_seq += u64::from(self.reload);
+                    }
+                    Status::Connected { .. } => self.reload = false,
+                    _ => {}
                 }
                 self.conn = match s {
                     Status::Connecting => ConnState::Connecting,
@@ -2642,6 +2658,29 @@ mod tests {
         m.apply(at(200));
         assert!(m.watch.focus_key().unwrap().1 != generation, "another daemon: from 0");
         assert_eq!(m.watch.take_poll(Instant::now()), Some(("sa_2".into(), 0)));
+    }
+
+    /// The link's reason (motion.md §5.3): a reload's goodbye marks the
+    /// link down for a reload, counted, through the failed reconnects
+    /// (Offline) until it is up again; any other drop is not a reload.
+    #[test]
+    fn a_reload_goodbye_marks_the_link_until_it_is_up() {
+        let st = |s: Status| Event::Status(s);
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[]));
+        assert_eq!((m.reload, m.reload_seq), (false, 0));
+        m.apply(st(Status::Reconnecting { why: synaps_client::RELOADING.into() }));
+        assert_eq!((m.reload, m.reload_seq), (true, 1), "the goodbye");
+        m.apply(st(Status::Offline("connection refused".into())));
+        m.apply(st(Status::Connecting));
+        assert_eq!((m.reload, m.reload_seq), (true, 1), "kept through the failed reconnects");
+        m.apply(connected(&[]));
+        assert!(!m.reload, "up: over");
+        m.apply(st(Status::Reconnecting { why: synaps_client::RELOADING.into() }));
+        assert_eq!((m.reload, m.reload_seq), (true, 2), "a second goodbye counts");
+        m.apply(connected(&[]));
+        m.apply(st(Status::Reconnecting { why: "daemon closed the connection".into() }));
+        assert_eq!((m.reload, m.reload_seq), (false, 2), "any other drop is not a reload");
     }
 
     fn connected(features: &[&str]) -> Event {

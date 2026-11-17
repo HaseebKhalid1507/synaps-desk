@@ -4,9 +4,17 @@
 //! the glyph and gives the title the room). A worker's tab ([`Kind::Worker`]) says
 //! `sleeper · <its session>` with the worker's state mark, its session in
 //! its tooltip; right-click opens the worker's menu ([`crate::wtabs`]).
-//! Nothing moves on its own: no animation, a
-//! drag drops where it is let go, and tabs that do not fit scroll by the
+//! A drag drops where it is let go, and tabs that do not fit scroll by the
 //! arrows at the ends (never a second row).
+//!
+//! Motion (fluid.md §3.5, motion.md §6.4, Full only): the visible tab's
+//! `raised` fill and its 2 px `you_bar` are one quad pair that springs its
+//! x and width to a newly visible tab (`snap`); a tab opening springs its
+//! width 0 → its own and one closing back to 0, laid out at full width and
+//! clipped, the tabs beside it riding the layout; labels ease to `ink`
+//! over `quick` and back over `hover_out`; a NEEDS YOU bar draws left to
+//! right over `base`. At rest each tab draws its own fill and bar, as the
+//! static app does.
 
 use gpui_kit::component::h_flex;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -32,6 +40,61 @@ const ARROW_W: f32 = 46.;
 /// Tabs this wide show the state's word beside the title (C O M P L E T E D
 /// is 79.7 px at 12).
 const WORD_MIN: f32 = 220.;
+
+/// Spring keys (the strip's own, [`crate::motion::Motion::spring`]).
+pub(crate) const IND_X: u64 = 0x7AB0 << 48;
+const IND_W: u64 = 0x7AB1 << 48;
+pub(crate) const OPEN_W: u64 = 0x7AB2 << 48;
+const LABEL: u64 = 0x7AB3 << 48;
+pub(crate) const TOUCH: u64 = 0x7AB4 << 48;
+const CLOSE_W: u64 = 0x7AB5 << 48;
+
+/// What the strip's motion remembers between frames.
+#[derive(Default)]
+pub(crate) struct TabFx {
+    /// Every tab's id as of the last frame (none before the first).
+    ids: Option<Vec<u64>>,
+    /// The tabs drawn last frame, in order: id, width, label.
+    drawn: Vec<(u64, f32, SharedString, bool)>,
+    /// Tabs closing: the tab drawn before it, its width, its label.
+    ghosts: Vec<Ghost>,
+    /// The visible tab last frame.
+    shown: Option<u64>,
+}
+
+struct Ghost {
+    id: u64,
+    after: Option<u64>,
+    width: f32,
+    label: SharedString,
+    named: bool,
+    /// Its width this frame.
+    shown: f32,
+}
+
+/// A closing tab: its label, clipped to its width as it springs to 0.
+fn ghost_tab(g: &Ghost, p: &Palette) -> AnyElement {
+    div()
+        .flex_none()
+        .w(px(g.shown))
+        .h_full()
+        .overflow_hidden()
+        .child(
+            h_flex().w(px(g.width)).h_full().pl(px(34.)).pr(px(34.)).items_center().border_r_1().border_color(p.hair).child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .when(g.named, |d| d.font_family(fonts::MONO).text_px(12.))
+                    .when(!g.named, |d| d.text_px(13.))
+                    .text_color(p.dim_ch)
+                    .child(g.label.clone()),
+            ),
+        )
+        .into_any_element()
+}
 
 /// A click's place: Ctrl (Cmd on macOS) opens in a new tab.
 pub(crate) fn click_place(ev: &ClickEvent, cx: &App) -> Place {
@@ -215,8 +278,142 @@ impl AppView {
         self.tab_first = lay.first;
         self.tab_follow = visible;
         self.tab_room = fit;
-        let mut row = h_flex().h_full().flex_none();
+        // Opens and closes (fluid.md §3.5): a tab not there last frame
+        // springs its width from 0; one gone leaves a ghost springing to 0.
+        let snap = crate::motion::SNAP_RESPONSE;
+        let ids: Vec<u64> = tabs.iter().map(|t| t.id).collect();
+        let full = self.fx.level() == crate::motion::Level::Full;
+        let fresh: Vec<u64> = match &self.tab_fx.ids {
+            Some(last) if full => ids.iter().filter(|id| !last.contains(id)).copied().collect(),
+            _ => Vec::new(),
+        };
+        if full && self.tab_fx.ids.is_some() {
+            for (k, (id, w, label, named)) in self.tab_fx.drawn.iter().enumerate() {
+                if !ids.contains(id) && !self.tab_fx.ghosts.iter().any(|g| g.id == *id) {
+                    let after = k.checked_sub(1).map(|j| self.tab_fx.drawn[j].0);
+                    self.fx.spring_jump(crate::motion::key(CLOSE_W, *id), *w, 0., snap);
+                    self.tab_fx.ghosts.push(Ghost { id: *id, after, width: *w, label: label.clone(), named: *named, shown: *w });
+                }
+            }
+        } else {
+            self.tab_fx.ghosts.clear();
+        }
+        self.tab_fx.ids = Some(ids);
+        let fx = &self.fx;
+        self.tab_fx.ghosts.retain_mut(|g| {
+            let (w, moving) = fx.spring(crate::motion::key(CLOSE_W, g.id), Some(g.width), 0., snap);
+            g.shown = w;
+            moving && w >= 0.5
+        });
+        // The slots, in order: (a tab's index and width, opening) or a ghost.
+        enum Slot {
+            Tab(usize, f32, bool),
+            Ghost(usize),
+        }
+        let ghosts = &self.tab_fx.ghosts;
+        let mut slots = Vec::with_capacity(lay.shown + ghosts.len());
+        let mut placed = vec![false; ghosts.len()];
+        let mut ghosts_after = |after: Option<u64>, slots: &mut Vec<Slot>| {
+            for (k, g) in ghosts.iter().enumerate() {
+                if g.after == after && !placed[k] {
+                    placed[k] = true;
+                    slots.push(Slot::Ghost(k));
+                }
+            }
+        };
+        ghosts_after(None, &mut slots);
         for (ix, t) in tabs.iter().enumerate().skip(lay.first).take(lay.shown) {
+            // A new tab's width springs from 0; after that (settled) a new
+            // width is taken at once (a resize, a neighbour opening: fluid
+            // §3.8 `follow`), as for every tab from launch.
+            let key = crate::motion::key(OPEN_W, t.id);
+            let (w, opening) = if fresh.contains(&t.id) {
+                fx.spring(key, Some(0.), lay.width, snap)
+            } else if fx.spring_at(key).is_some() {
+                fx.spring_held(key, lay.width, snap)
+            } else {
+                (lay.width, false)
+            };
+            slots.push(Slot::Tab(ix, w, opening));
+            ghosts_after(Some(t.id), &mut slots);
+        }
+        slots.extend(placed.iter().enumerate().filter(|(_, p)| !**p).map(|(k, _)| Slot::Ghost(k)));
+        // The indicator: a newly visible tab's fill and bar spring there
+        // from where they were drawn (`snap`); at rest they follow the
+        // layout at once (a resize, an arrow scroll). Its target is the
+        // tab's final slot (every tab at its width, no ghosts), not where
+        // the tab is this frame: a close's neighbour slides under a fill
+        // that stays put, never chased out and back (finish gate 1).
+        let mut x = if lay.overflow { ARROW_W } else { 0. };
+        let mut goal_x = x;
+        let (mut target, mut goal) = (None, None);
+        for slot in &slots {
+            match *slot {
+                Slot::Tab(ix, w, _) => {
+                    if active == Some(ix) {
+                        (target, goal) = (Some((x, w)), Some((goal_x, lay.width)));
+                    }
+                    x += w;
+                    goal_x += lay.width;
+                }
+                Slot::Ghost(k) => x += ghosts[k].shown,
+            }
+        }
+        // The indicator is the selected tab's (its attach may still be on
+        // its way: the strip shows it selected at once).
+        let selected = active.and_then(|i| tabs.iter().nth(i)).map(|t| t.id);
+        let moved = full && selected.is_some() && self.tab_fx.shown.is_some() && selected != self.tab_fx.shown;
+        let mut quads = None;
+        if let (Some((x, w)), Some((tx, tw))) = (goal, target) {
+            if moved && let (Some(x0), Some(w0)) = (fx.spring_at(IND_X), fx.spring_at(IND_W)) {
+                fx.spring_jump(IND_X, x0, x, snap);
+                fx.spring_jump(IND_W, w0, w, snap);
+            }
+            let ((qx, mx), (qw, mw)) = (fx.spring_held(IND_X, x, snap), fx.spring_held(IND_W, w, snap));
+            // Drawn as the quad while it moves, or while its tab is still
+            // on its way to the slot under it.
+            if mx || mw || (full && ((tx - x).abs() >= 0.5 || (tw - w).abs() >= 0.5)) {
+                quads = Some((qx, qw));
+            }
+        }
+        // The tracer's target: the new tab's top-left corner (§6.2); once
+        // it lands, the tab's bar draws left to right over `quick` (the
+        // undrawn part covered in the tab's own fill).
+        let mut cover = None;
+        if let Some(tr) = self.tracer.as_mut() {
+            let mut x = if lay.overflow { ARROW_W } else { 0. };
+            let mut at = None;
+            for slot in &slots {
+                match *slot {
+                    Slot::Tab(ix, w, _) => {
+                        if tabs.iter().nth(ix).is_some_and(|t| t.id == tr.tab) {
+                            at = Some((x, w));
+                        }
+                        x += w;
+                    }
+                    Slot::Ghost(k) => x += ghosts[k].shown,
+                }
+            }
+            let origin = self.strip_at.get();
+            tr.to = at.map(|(x, _)| point(origin.x + px(x), origin.y));
+            let k = fx.draw(Some(tr.at), crate::motion::BASE, crate::motion::QUICK);
+            if at.is_none() || k >= 1. {
+                self.tracer = None;
+            } else if let Some((x, w)) = at {
+                cover = Some(div().absolute().top_0().left(px(x + w * k)).w(px(w * (1. - k))).h(px(2.)).bg(p.raised));
+            }
+        }
+        let mut row = h_flex().h_full().flex_none();
+        let mut drawn = Vec::with_capacity(lay.shown);
+        for slot in slots {
+            let (ix, w, opening) = match slot {
+                Slot::Ghost(k) => {
+                    row = row.child(ghost_tab(&ghosts[k], p));
+                    continue;
+                }
+                Slot::Tab(ix, w, opening) => (ix, w, opening),
+            };
+            let Some(t) = tabs.iter().nth(ix) else { continue };
             let st = self.tab_state(t);
             let (label, named) = self.tab_labels.labels.get(ix).cloned().unwrap_or_default();
             // A worker of a session not attached here: as last seen (as
@@ -225,8 +422,31 @@ impl AppView {
                 (Some(w), Some(s)) if t.kind == Kind::Worker => self.worker_state(s, &w.handle, Some(w.who())),
                 _ => None,
             };
-            row = row.child(self.render_tab(t.id, ix, active == Some(ix), t.kind, (st, worker), label, named, lay.width, p, cx));
+            drawn.push((t.id, lay.width, label.clone(), named));
+            let on = active == Some(ix);
+            // While the indicator moves, its quads are the fill and bar.
+            let lit = !(on && quads.is_some());
+            let tab = self.render_tab(t.id, ix, (on, lit), t.kind, (st, worker), label, named, lay.width, p, cx);
+            row = row.child(if opening {
+                div().flex_none().w(px(w)).h_full().overflow_hidden().child(tab).into_any_element()
+            } else {
+                tab.into_any_element()
+            });
         }
+        let needs =
+            selected.and_then(|id| self.model.tabs.iter().find(|t| t.id == id)).is_some_and(|t| self.tab_state(t) == State::NeedsYou);
+        let quads = quads.map(|(qx, qw)| {
+            div()
+                .absolute()
+                .top_0()
+                .left(px(qx))
+                .w(px(qw))
+                .h_full()
+                .bg(p.raised)
+                .when(!needs, |d| d.child(div().absolute().top_0().left_0().right(px(1.)).h(px(2.)).bg(p.you_bar)))
+        });
+        self.tab_fx.drawn = drawn;
+        self.tab_fx.shown = selected;
         let (before, after) = (lay.first, n - lay.first - lay.shown);
         if lay.overflow && self.tab_labels.arrows.0 != (before, after) {
             self.tab_labels.arrows = ((before, after), (format!("‹ {before}").into(), format!("{after} ›").into()));
@@ -245,11 +465,17 @@ impl AppView {
         };
         h_flex()
             .id("tab-strip")
+            .relative()
             .h(px(TAB_H))
             .flex_none()
             .w_full()
             .overflow_hidden()
             .bg(p.chrome)
+            .child({
+                let at = self.strip_at.clone();
+                canvas(move |b, _, _| at.set(b.origin), |_, _, _, _| {}).absolute().inset_0()
+            })
+            .children(quads)
             .border_b_1()
             .border_color(p.hair)
             .when(lay.overflow, |d| {
@@ -259,6 +485,7 @@ impl AppView {
                 })))
             })
             .child(row)
+            .children(cover)
             .when(lay.overflow, |d| {
                 d.child(arrow("tabs-right", right, after > 0).on_click(cx.listener(|this, _, _, cx| {
                     this.tab_first += 1;
@@ -295,7 +522,7 @@ impl AppView {
         &self,
         id: u64,
         ix: usize,
-        on: bool,
+        (on, lit): (bool, bool),
         kind: Kind,
         (st, worker): (State, Option<Liveness>),
         label: SharedString,
@@ -305,7 +532,7 @@ impl AppView {
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
         let view = !kind.attaches();
-        let title_color = match st {
+        let title_of = |on: bool| match st {
             _ if view || kind == Kind::Worker => {
                 if on {
                     p.ink
@@ -318,15 +545,29 @@ impl AppView {
             State::Parked | State::Locked | State::Saved => p.dim_ch,
             _ => p.prose_ch,
         };
-        // NEEDS YOU first: a worker tab's session's prompt too.
+        let fx = &self.fx;
+        // The label eases to `ink` over `quick` as its tab is shown, and
+        // back over `hover_out` (fluid.md §3.5).
+        let k = fx.ease_to(crate::motion::key(LABEL, id), if on { 1. } else { 0. }, crate::motion::QUICK, crate::motion::HOVER_OUT);
+        let title_color = crate::motion::mix(title_of(false), title_of(true), k);
+        // NEEDS YOU first: a worker tab's session's prompt too. Its bar
+        // draws left to right over `base` (motion.md §6.3).
         let needs = st == State::NeedsYou;
         let bar = if needs {
-            Some(p.warn_mark_ch)
-        } else if on {
-            Some(p.you_bar)
+            let since = fx.change(crate::motion::Tag::TabNeeds, id, 1, None).map(|c| c.0);
+            Some((p.warn_mark_ch, fx.draw(since, std::time::Duration::ZERO, crate::motion::BASE)))
         } else {
-            None
+            fx.change(crate::motion::Tag::TabNeeds, id, 0, None);
+            (on && lit).then_some((p.you_bar, 1.))
         };
+        // Hover and press (fluid.md §3.9): the fill on over `hover_in`, off
+        // over `hover_out`; held, `press_ch` and the content 1 px down.
+        let touch = crate::motion::key(TOUCH, id);
+        let (fill, dy) = fx.fill(touch, p.chrome, (on && lit).then_some(p.raised), p.raised, p.press_ch);
+        // The selected tab while the indicator's quads are up (it slides in
+        // under them on a close, re-gate 2): no fill of its own, so it never
+        // paints over them.
+        let fill = fill.filter(|_| lit || !on);
         // A worker tab: its worker's glyph and word (§4.2), whatever its
         // session waits on (the bar says that; the stub over its view too).
         // One this window holds nothing of: the rest glyph and no word.
@@ -389,22 +630,25 @@ impl AppView {
             .border_r_1()
             .border_color(p.hair)
             .cursor_pointer()
-            .when(on, |d| d.bg(p.raised))
-            .when(!on, |d| d.hover(|d| d.bg(p.raised)))
-            .when_some(bar, |d, c| d.child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(c)))
-            .child(match kind {
-                Kind::Settings => crate::views::gear(if on { p.you_bar } else { p.dim_ch }, None),
-                Kind::Usage => crate::views::bars_glyph(if on { p.you_bar } else { p.dim_ch }),
-                Kind::Session | Kind::Worker => div()
-                    .flex()
-                    .flex_none()
-                    .size(px(10.))
-                    .debug_selector(|| format!("tab {id} glyph"))
-                    .children(g.map(|g| glyph::draw(g, mark_color))),
-            })
+            .when_some(fill, |d, c| d.bg(c))
+            .when_some(bar, |d, (c, f)| d.child(div().absolute().top_0().left_0().w(px(((width - 1.) * f).max(0.))).h(px(2.)).bg(c)))
+            .child(
+                div().flex().flex_none().relative().top(px(dy)).child(match kind {
+                    Kind::Settings => crate::views::gear(if on { p.you_bar } else { p.dim_ch }, None),
+                    Kind::Usage => crate::views::bars_glyph(if on { p.you_bar } else { p.dim_ch }),
+                    Kind::Session | Kind::Worker => div()
+                        .flex()
+                        .flex_none()
+                        .size(px(10.))
+                        .debug_selector(|| format!("tab {id} glyph"))
+                        .children(g.map(|g| glyph::draw(g, mark_color))),
+                }),
+            )
             .child(
                 div()
                     .debug_selector(|| format!("tab {id} title"))
+                    .relative()
+                    .top(px(dy))
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
@@ -415,8 +659,8 @@ impl AppView {
                     .text_color(title_color)
                     .child(label),
             )
-            .when_some(word, |d, w| d.child(display(w, 12., word_color).flex_none()))
-            .child(close)
+            .when_some(word, |d, w| d.child(display(w, 12., word_color).flex_none().relative().top(px(dy))))
+            .child(close.relative().top(px(dy)))
             // Formatted on hover only.
             // Not under an open menu (a right-click's pointer rests on the
             // tab it opened from).
@@ -435,6 +679,7 @@ impl AppView {
                     crate::overlay::tip(text, window, cx)
                 })
             })
+            .map(|d| AppView::touch(d, touch, cx))
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 let ix = this.model.tabs.iter().position(|t| t.id == id);
                 if let Some(ix) = ix {

@@ -4,7 +4,9 @@
 //! theme roles only (the accent while dragged).
 //!
 //! A bar shows while the pointer is over its pane and for [`LINGER`] after
-//! a scroll, then it is gone: no fade, no motion. The transcript's shows
+//! a scroll, then it is gone. Under Full its colour fades (motion.md §6.4):
+//! in from its ground over 90 ms, out over 270 ms; it never moves. The
+//! transcript's shows
 //! whenever its rows are taller than the pane (the position cue matters on
 //! the main reading surface). A pane whose content fits draws nothing and
 //! listens to nothing; a hidden bar draws nothing and wakes nothing: one
@@ -372,6 +374,68 @@ struct Inner {
     ours: bool,
     /// Ends the drag on the target it began on (whatever is shown now).
     release: Option<Box<dyn FnOnce()>>,
+    /// Shown last frame; and showing (or hiding) since when, while its
+    /// colour lerps (motion.md §6.4), Full only.
+    was: bool,
+    fade: Option<(bool, Instant)>,
+}
+
+/// A bar showing lerps its thumb in from its ground over `quick`-exit
+/// (90 ms, `out`); hiding, back over `slow`-exit (270 ms, `in`) at 30 Hz
+/// (motion.md §6.4). The colour is what an opacity would paint on the
+/// opaque ground: no opacity.
+const SHOW: Duration = Duration::from_millis(90);
+const HIDE: Duration = Duration::from_millis(270);
+
+thread_local! {
+    /// The views with a bar hiding, and whether their one shared timer is
+    /// armed: N bars cost one timer and 30 notifies a second, on the app's
+    /// decay grid ([`crate::motion::next_tick`], motion.md amendment 3).
+    static HIDING: RefCell<(bool, Vec<EntityId>)> = RefCell::default();
+}
+
+/// `view` has a bar hiding: it draws again on the next decay tick.
+fn hiding(view: EntityId, window: &mut Window, cx: &mut App) {
+    let arm = HIDING.with(|h| {
+        let mut h = h.borrow_mut();
+        if !h.1.contains(&view) {
+            h.1.push(view);
+        }
+        !std::mem::replace(&mut h.0, true)
+    });
+    if !arm {
+        return;
+    }
+    /// Disarms when the timer is done, or dropped unfired (its window
+    /// gone): a bar can always arm the next.
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            HIDING.with(|h| h.borrow_mut().0 = false);
+        }
+    }
+    let at = crate::motion::next_tick(Instant::now());
+    let disarm = Disarm;
+    window
+        .spawn(cx, async move |cx| {
+            let _disarm = disarm;
+            cx.background_executor().timer(at.saturating_duration_since(Instant::now())).await;
+            let views = HIDING.with(|h| {
+                let mut h = h.borrow_mut();
+                h.0 = false;
+                std::mem::take(&mut h.1)
+            });
+            cx.update(|_, cx| views.into_iter().for_each(|v| cx.notify(v))).ok();
+        })
+        .detach();
+}
+
+/// How far a bar's fade is at `now`: (showing, its thumb's strength 0..1).
+fn fading(fade: Option<(bool, Instant)>, now: Instant) -> Option<(bool, f32)> {
+    let (show, at) = fade?;
+    let d = if show { SHOW } else { HIDE };
+    let t = now.saturating_duration_since(at).as_secs_f32() / d.as_secs_f32();
+    (t < 1.).then(|| (show, if show { crate::motion::ease::OUT.sample(t) } else { 1. - crate::motion::ease::IN.sample(t) }))
 }
 
 impl Inner {
@@ -488,6 +552,8 @@ pub(crate) struct Frame<S: Scrolled> {
     thumb_hit: Option<Hitbox>,
     look: (bool, bool),
     view: EntityId,
+    /// Its fade this frame (showing, strength).
+    fade: Option<(bool, f32)>,
 }
 
 impl<S: Scrolled> IntoElement for Bar<S> {
@@ -555,6 +621,15 @@ impl<S: Scrolled> Bar<S> {
         }
         st.last = Some(at);
         let look = st.look(self.always, now);
+        if look.0 != st.was {
+            st.was = look.0;
+            let full = crate::motion::Level::current(cx) == crate::motion::Level::Full;
+            st.fade = full.then_some((look.0, now));
+        }
+        let fade = fading(st.fade, now);
+        if fade.is_none() {
+            st.fade = None;
+        }
         // Under the pointer first, the pane over them (it blocks nothing):
         // the strip hides what is behind it from the pointer but not from
         // the wheel; the thumb takes the cursor.
@@ -572,17 +647,31 @@ impl<S: Scrolled> Bar<S> {
         let pane = window.insert_hitbox(vp, HitboxBehavior::Normal);
         let drawn = lane(axis, vp, if look.1 { WIDE } else { THIN });
         drop(st);
-        Some(Frame { bar: self, geo, offset, thumb, lane: drawn, vp, pane, strip: strip_hit, thumb_hit, look, view })
+        Some(Frame { bar: self, geo, offset, thumb, lane: drawn, vp, pane, strip: strip_hit, thumb_hit, look, view, fade })
     }
 }
 
 impl<S: Scrolled> Frame<S> {
     fn paint(self, window: &mut Window, cx: &mut App) {
-        let Frame { bar, geo, offset, thumb, lane, vp, pane, strip, thumb_hit, look, view } = self;
+        let Frame { bar, geo, offset, thumb, lane, vp, pane, strip, thumb_hit, look, view, fade } = self;
         let Bar { scroll, state, axis, ground, always, focus } = bar;
         let dragging = state.0.borrow().grab.is_some();
+        // Hiding: the thumb as it was at rest, lerping to its ground.
+        if let Some((false, k)) = fade {
+            let p = &crate::theme::palette(cx);
+            let (base, thin) = match ground {
+                Ground::Canvas => (p.canvas, p.thumb),
+                Ground::Chrome => (p.chrome, p.thumb_ch),
+                Ground::User => (p.user, p.thumb_u),
+            };
+            let rect = thumb_rect(axis, lane, thumb);
+            window.with_content_mask(Some(ContentMask { bounds: vp }), |window| {
+                window.paint_quad(fill(rect, crate::motion::mix(base, thin, k)));
+            });
+            hiding(view, window, cx);
+        }
         if look.0 {
-            let p = &cx.global::<crate::theme::Scheme>().p;
+            let p = &crate::theme::palette(cx);
             // At rest the `thumb*` role; hovered its ground's dim text;
             // dragged the focus colour (design.md §8.16).
             let (thin, rest, hot) = match ground {
@@ -596,6 +685,19 @@ impl<S: Scrolled> Frame<S> {
                 rest
             } else {
                 thin
+            };
+            // Showing: from its ground, at display rate.
+            let color = match fade {
+                Some((true, k)) => {
+                    window.request_animation_frame();
+                    let base = match ground {
+                        Ground::Canvas => p.canvas,
+                        Ground::Chrome => p.chrome,
+                        Ground::User => p.user,
+                    };
+                    crate::motion::mix(base, color, k)
+                }
+                _ => color,
             };
             let track = look.1.then_some(p.hair);
             let rect = thumb_rect(axis, lane, thumb);
@@ -759,6 +861,81 @@ mod tests {
     };
     use gpui_kit::{Axis, Bounds, point, px, size};
     use std::time::{Duration, Instant};
+
+    /// M7: any number of bars hiding share one timer, due on the motion's
+    /// decay grid (`next_tick`, within one 30 Hz tick); it wakes each view
+    /// once and disarms, so the next hide arms again.
+    #[gpui_kit::test]
+    fn hiding_bars_share_one_timer(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, Context, Entity, IntoElement, Render, Window, div};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct V;
+        impl Render for V {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        let w = cx.add_window(|_, _| V);
+        let views: Vec<Entity<V>> = (0..3).map(|_| cx.new(|_| V)).collect();
+        let woken = Rc::new(Cell::new(0));
+        let _subs: Vec<_> = cx.update(|cx| {
+            views
+                .iter()
+                .map(|v| {
+                    let woken = woken.clone();
+                    cx.observe(v, move |_, _| woken.set(woken.get() + 1))
+                })
+                .collect()
+        });
+        let hide = |cx: &mut gpui_kit::TestAppContext, v: &Entity<V>| {
+            let id = v.entity_id();
+            w.update(cx, |_, window, cx| super::hiding(id, window, cx)).unwrap();
+        };
+        let state = || super::HIDING.with(|h| (h.borrow().0, h.borrow().1.len()));
+        for v in views.iter().chain(views.iter()) {
+            hide(cx, v);
+        }
+        assert_eq!(state(), (true, 3), "one timer armed, each view once");
+        cx.executor().advance_clock(crate::motion::DECAY_TICK + Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!((woken.get(), state()), (3, (false, 0)), "each view woken once, disarmed");
+        hide(cx, &views[0]);
+        assert_eq!(state(), (true, 1), "the next hide arms again");
+        cx.executor().advance_clock(crate::motion::DECAY_TICK + Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!((woken.get(), state()), (4, (false, 0)));
+    }
+
+    /// M7: the bar's colours are the palette's (`theme::palette`, drained
+    /// and cross-faded), never a raw role or the kit's.
+    #[test]
+    fn the_bar_paints_from_the_palette() {
+        let src = include_str!("scrollbar.rs");
+        // (A Windows checkout has CRLF line ends.)
+        let code = &src[..src.find("mod tests {").expect("the tests")];
+        let reads = code.matches("crate::theme::palette(cx)").count();
+        assert!(reads >= 2, "the hide and the show read the palette ({reads})");
+        for raw in ["Scheme", ".roles", "colors.", "cx.theme()"] {
+            assert!(!code.contains(raw), "a raw colour source: {raw}");
+        }
+    }
+
+    /// The colour fade (motion.md §6.4): shown, the thumb comes up from its
+    /// ground over 90 ms `out`; hidden, it goes back over 270 ms `in`; then
+    /// it is at rest (no fade, no frames).
+    #[test]
+    fn the_thumb_fades_in_fast_and_out_slow() {
+        let t0 = Instant::now();
+        let at = |show: bool, ms: u64| super::fading(Some((show, t0)), t0 + Duration::from_millis(ms));
+        assert_eq!(at(true, 0), Some((true, 0.)));
+        assert!(at(true, 45).is_some_and(|(_, k)| k > 0.5 && k < 1.), "out: past half by half time");
+        assert_eq!(at(true, 90), None, "shown");
+        assert_eq!(at(false, 0), Some((false, 1.)));
+        assert!(at(false, 135).is_some_and(|(_, k)| k > 0.5 && k < 1.), "in: slow to leave");
+        assert_eq!(at(false, 270), None, "hidden");
+        assert_eq!(super::fading(None, t0), None);
+    }
 
     const G: Geo = Geo { track: 500., view: 500., content: 2000., warp: None };
 
