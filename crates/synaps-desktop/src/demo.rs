@@ -228,6 +228,12 @@ async fn concurrent_refreshes_rotate_once() {
     assert!(session.is_live());
 }";
 
+/// The relay's read, numbered as the engine's `read` numbers it (`N\t…`,
+/// then how many lines it left).
+const READ: &str = "41\tpub struct TokenStore {\n42\t    inner: Mutex<Inner>,\n43\t    rotation: Mutex<()>,\n44\t}\n45\t\n\
+    46\timpl TokenStore {\n47\t    pub async fn rotate(&self, id: SessionId) -> Result<Token> {\n48\t        let mut inner = self.inner.lock().await;\n\
+    49\t        inner.rotate(id).await\n50\t    }\n\n... (164 more lines)";
+
 fn messages() -> Vec<Value> {
     let p = |f: &str| format!("{CWD}/{f}");
     vec![
@@ -236,7 +242,7 @@ fn messages() -> Vec<Value> {
             {"type": "thinking", "thinking": "Two refreshes both see the token as expiring, both rotate, and the second rotation invalidates the first caller's token. The retry in Session papers over that. Serialize rotation in the store instead.", "signature": "x"},
             {"type": "text", "text": "Looking at the refresh path first."},
             {"type": "tool_use", "id": "toolu_d1", "name": "read", "input": {"path": p("crates/relay/src/token_store.rs")}}]}),
-        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d1", "content": "pub struct TokenStore {\n    inner: Mutex<Inner>,\n}\n…"}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d1", "content": READ}]}),
         // Two workers: one still running (its rows below), one done.
         json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_s1", "name": "subagent_start", "input": {"agent": "scout",
@@ -250,10 +256,10 @@ fn messages() -> Vec<Value> {
             {"type": "tool_use", "id": "toolu_d2", "name": "edit", "input": {"path": p("crates/relay/src/token_store.rs"),
                 "old_string": "    pub async fn rotate(&self, id: SessionId) -> Result<Token> {\n        let mut inner = self.inner.lock().await;\n        inner.rotate(id).await\n    }",
                 "new_string": "    pub async fn rotate(&self, id: SessionId) -> Result<Token> {\n        let _turn = self.rotation.lock().await;\n        let mut inner = self.inner.lock().await;\n        if let Some(t) = inner.fresh(id) {\n            return Ok(t);\n        }\n        inner.rotate(id).await\n    }"}}]}),
-        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d2", "content": "Edited crates/relay/src/token_store.rs"}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d2", "content": "Edited crates/relay/src/token_store.rs — replaced 4 line(s) with 8 line(s)"}]}),
         json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_d3", "name": "edit", "input": {"path": p("crates/relay/src/session.rs"), "old_string": OLD, "new_string": NEW}}]}),
-        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d3", "content": "Edited crates/relay/src/session.rs"}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d3", "content": format!("Edited crates/relay/src/session.rs — replaced {} line(s) with {} line(s)", OLD.lines().count(), NEW.lines().count())}]}),
         json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_d4", "name": "write", "input": {"path": p("crates/relay/tests/refresh_race.rs"), "content": TEST}}]}),
         json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_d4", "content": "Wrote crates/relay/tests/refresh_race.rs"}]}),

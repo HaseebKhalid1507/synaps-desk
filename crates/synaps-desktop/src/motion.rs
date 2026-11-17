@@ -122,6 +122,8 @@ impl Setting {
 
 pub(crate) const QUICK: Duration = Duration::from_millis(120);
 pub(crate) const BASE: Duration = Duration::from_millis(200);
+// The tool rows' lit bar settled on it; the token stays (motion.md §2).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SLOW: Duration = Duration::from_millis(360);
 pub(crate) const GLOW: Duration = Duration::from_millis(480);
 pub(crate) const SIG: Duration = Duration::from_millis(600);
@@ -402,10 +404,8 @@ pub(crate) enum Kind {
 pub(crate) enum Tag {
     /// A call's trail glyph.
     Outcome,
-    /// A prompt waits on the call (its warn bar).
+    /// A prompt waits on the call (its gutter glyph breathes).
     Waiting,
-    /// A call finished (its lit bar settles).
-    Finished,
     /// A worker block under its call (its rule draws).
     Block,
     /// A worker block's glyph.
@@ -426,7 +426,7 @@ impl Tag {
     /// Keyed by the column's own ids (a transcript's item ids, which every
     /// transcript numbers from 1): another column's are other things.
     fn column(self) -> bool {
-        matches!(self, Tag::Outcome | Tag::Waiting | Tag::Finished | Tag::Block | Tag::BlockGlyph | Tag::Stream)
+        matches!(self, Tag::Outcome | Tag::Waiting | Tag::Block | Tag::BlockGlyph | Tag::Stream)
     }
 }
 
@@ -1609,10 +1609,9 @@ mod tests {
 
     /// The `roles_check` step for the soul (amendments 14, 15): the scan's
     /// beam and its afterglow are a running glyph's light, so they hold
-    /// the mark floor (3:1) on every ground a running glyph is drawn on;
-    /// a new bar, drawn hot, holds it on the run surface, for every
-    /// tool's hue and thinking's; in every theme and accent. The bloom is
-    /// the lit bar's glow beside it (decoration: the bar is the state).
+    /// the mark floor (3:1) on every ground a running glyph is drawn on,
+    /// in every theme and accent. (Tool rows have no bar since Q1 cards:
+    /// their state is the gutter glyph.)
     #[test]
     fn the_beam_and_the_head_keep_the_mark_floor() {
         use crate::glyph::{BEAM, GLOW};
@@ -1634,14 +1633,6 @@ mod tests {
                             low = low.min(x);
                             assert!(x >= 3., "{name} {accent:?}: {what}'s beam at {k}: {x:.2}");
                         }
-                    }
-                }
-                for hue in [r.t_bash, r.t_read, r.t_write, r.t_edit, r.t_grep, r.t_find, r.t_ls, r.t_sub, r.t_ext, r.t_gen, r.think] {
-                    let lit = mix(hue, r.ink, 0.30);
-                    for bar in [hue, lit] {
-                        let x = contrast(mix(bar, r.ink, f64::from(crate::turns::HEAD)), r.tool);
-                        low = low.min(x);
-                        assert!(x >= 3., "{name} {accent:?}: a bar's head: {x:.2}");
                     }
                 }
             }

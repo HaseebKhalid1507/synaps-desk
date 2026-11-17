@@ -1577,52 +1577,56 @@ fn running_tools(cx: &mut TestAppContext, view: &Entity<AppView>, n: usize) {
     cx.run_until_parked();
 }
 
-/// Soul B (motion.md §10 amendment 15): a running call's lit bar blooms,
-/// a 1 px column beside it in the row's padding (nothing moves: the
-/// bloom is an absolute child); Off has none; it is gone once the bar
-/// has settled after the call ends.
+/// Q1 cards (polish.md §2.1, F1): a tool row is bare on the canvas. Its
+/// box reaches into the gutter for its status glyph (the hover fill takes
+/// the glyph in), its verb starts on the prose column, and nothing is drawn
+/// on its lead edge: no hue bar, no bloom, lit or settled. An opened body
+/// is a well at the target column, to the column's end.
 #[gpui_kit::test]
-fn a_running_bar_blooms_until_it_settles(cx: &mut TestAppContext) {
+fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
     use synaps_client::protocol::{LlmEvent, StreamEvent};
-    let (w, view, _events) = open_at(cx, (1440., 1800.), crate::theme::Panels::default().text_size);
+    let (w, view, _events) = open_at(cx, (2200., 1400.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
-    // Read off a frame of the app's own (a beat may have replayed it).
-    let blooms = |cx: &mut TestAppContext| {
-        view.update(cx, |_, cx| cx.notify());
-        cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
-        cx.run_until_parked();
-        VisualTestContext::from_window(w, cx).debug_bounds("bar-bloom")
-    };
-    // The demo's own calls have ended: nothing blooms.
-    for _ in 0..6 {
-        beat(cx, w, &view);
-    }
-    assert!(blooms(cx).is_none(), "no call runs: no bloom");
     running_tools(cx, &view, 1);
     for _ in 0..4 {
         beat(cx, w, &view);
     }
-    let b = blooms(cx).expect("the running call's bar blooms");
-    assert_eq!(b.size.width, gpui_kit::px(1.), "1 px");
-    set_motion(cx, &view, crate::motion::Level::Off);
-    settle(cx, w, 4);
-    assert!(blooms(cx).is_none(), "Off: the static app, no bloom");
-    set_motion(cx, &view, crate::motion::Level::Full);
-    settle(cx, w, 4);
-    assert!(blooms(cx).is_some(), "lit again");
+    let (id, lay, m) = view.read_with(cx, |v, cx| {
+        let id = v.model.transcript.items().last().map(|i| i.id).expect("the call");
+        (id, v.layout, crate::theme::metrics(cx))
+    });
+    assert!(lay.hang, "2200 px: the labels hang");
+    let geo = crate::turns::Geo::of(lay, &m);
+    let bounds = |cx: &mut TestAppContext, what: &'static str| {
+        view.update(cx, |_, cx| cx.notify());
+        cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+        cx.run_until_parked();
+        VisualTestContext::from_window(w, cx).debug_bounds(what)
+    };
+    let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the running call's row");
+    assert!(bounds(cx, "bar-bloom").is_none(), "no bloom: the bar is gone");
+    assert_eq!(f32::from(row.size.width), lay.column + geo.out, "the column and {} of the gutter", geo.out);
+    assert_eq!(row.size.height, gpui_kit::px(m.row), "one row");
     view.update(cx, |v, cx| {
         v.model.transcript.apply(&SessionEvent::Stream {
-            event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "ok".into() }),
+            event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "error: boom".into() }),
         });
         v.sync_list();
+        v.list.scroll_to_end();
         cx.notify();
     });
     cx.run_until_parked();
-    // (Its light decays over SLOW: not sampled mid-way.)
-    for _ in 0..5 {
+    for _ in 0..4 {
         beat(cx, w, &view);
     }
-    assert!(blooms(cx).is_none(), "settled to its hue: the bloom is gone");
+    let failed = view.read_with(cx, |v, _| v.model.transcript.items().last().and_then(|i| i.tool.as_ref()).and_then(|t| t.status));
+    if failed == Some(synaps_client::transcript::ToolStatus::Failed) {
+        let well = bounds(cx, leak(format!("well {id}"))).expect("a failed call opens on its well");
+        let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the row");
+        assert_eq!(f32::from(well.left()), f32::from(row.left()) + geo.out + geo.target, "the well at the target column");
+        assert_eq!(well.right(), row.right(), "to the column's end");
+    }
+    assert!(bounds(cx, "bar-bloom").is_none(), "settled: nothing on the lead edge");
 }
 
 /// One beat goes by: the motion clock and the executor's move on together,
