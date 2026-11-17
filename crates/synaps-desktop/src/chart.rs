@@ -1,13 +1,13 @@
 //! Usage's charts on GPUI's `canvas()`: bars are quads, lines one stroked
-//! path per run, grid lines `hair`. No chart library, no animation: a
-//! chart paints when its pane draws (data, a filter, the pointer, a
-//! scroll). The data and axes are laid out once per load
+//! path per run, grid lines `hair`. No chart library: a chart paints when
+//! its pane draws (data, a filter, the pointer, a scroll, its reveal). The data and axes are laid out once per load
 //! ([`crate::usage::Board`]); a line chart's paths are tessellated once per
 //! plot size ([`Paths`]) and only moved to where the plot is painted.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::*;
 
@@ -44,13 +44,47 @@ pub enum Stroke {
     Grid,
 }
 
-/// The colours a chart paints with.
+/// The colours a chart paints with, and how far its data is revealed.
 #[derive(Clone, Copy)]
 pub struct Ink {
     pub series: [Hsla; 6],
     pub grid: Hsla,
     pub rule: Hsla,
     pub hover: Hsla,
+    pub reveal: Reveal,
+}
+
+/// A chart's reveal on first open and on a range change (motion.md §6.8,
+/// Full only): bars grow from the baseline over `slow` `out`, column by
+/// column from the left (`stagger` 30, the whole sweep capped at 150);
+/// lines draw on left to right, clipped at x ≤ p · width. Grid, axes and
+/// figures are instant. Paint-only: nothing is laid out again.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Reveal {
+    /// When it began and the frame's time (none: shown whole).
+    pub at: Option<(Instant, Instant)>,
+}
+
+impl Reveal {
+    /// The whole reveal: the last column's start plus `slow`.
+    pub const SPAN: Duration = Duration::from_millis(crate::motion::SLOW.as_millis() as u64 + crate::motion::STAGGER_CAP.as_millis() as u64);
+
+    /// Column `i` of `n`'s drawn height (0..1).
+    pub fn column(&self, i: usize, n: usize) -> f32 {
+        let Some((at, now)) = self.at else { return 1. };
+        let delay = if n > 1 {
+            (crate::motion::STAGGER * i as u32).min(crate::motion::STAGGER_CAP.mul_f32(i as f32 / (n - 1) as f32))
+        } else {
+            Duration::ZERO
+        };
+        let t = now.saturating_duration_since(at + delay).as_secs_f32() / crate::motion::SLOW.as_secs_f32();
+        crate::motion::ease::OUT.sample(t.clamp(0., 1.))
+    }
+
+    /// A line chart's drawn width (0..1).
+    pub fn line(&self) -> f32 {
+        self.column(0, 1)
+    }
 }
 
 /// The day the pointer is over, from where the plot was painted.
@@ -103,6 +137,10 @@ pub fn bars(s: Arc<Stack>, ink: Ink, ticks: Vec<f32>, hover: Option<usize>, requ
             let gap = if w >= 4. { 1. } else { 0. };
             let h = f32::from(b.size.height);
             for i in 0..n {
+                let grown = ink.reveal.column(i, n);
+                if grown <= 0. {
+                    continue;
+                }
                 let x = f32::from(b.origin.x) + w * i as f32;
                 let mut y = f32::from(b.origin.y) + h;
                 for l in &s.series {
@@ -110,7 +148,7 @@ pub fn bars(s: Arc<Stack>, ink: Ink, ticks: Vec<f32>, hover: Option<usize>, requ
                     if v <= 0. {
                         continue;
                     }
-                    let bh = (v / s.max) as f32 * h;
+                    let bh = (v / s.max) as f32 * h * grown;
                     y -= bh;
                     window.paint_quad(fill(
                         Bounds::new(point(px(x), px(y)), size(px((w - gap).max(1.)), px(bh.max(0.5)))),
@@ -157,18 +195,46 @@ pub fn lines(
             }
             let step = b.size.width / n as f32;
             let x_of = |i: usize| b.origin.x + step * (i as f32 + 0.5);
-            let y_of = |v: f64| b.origin.y + b.size.height * (1. - scale.at(v));
             for &m in &marks {
                 let x = x_of(m).floor();
                 window.paint_quad(fill(Bounds::new(point(x, b.origin.y + b.size.height - px(6.)), size(px(1.), px(6.))), ink.rule));
             }
+            // The data drawn on, left to right.
+            let shown = ink.reveal.line();
+            if shown <= 0. {
+                return;
+            }
+            let mut clip = b;
+            clip.size.width *= shown;
+            window.with_content_mask(Some(ContentMask { bounds: clip }), |window| paint_lines(b, &s, scale, &ink, &thin, dim_until, &paths, window));
+        },
+    )
+    .size_full()
+}
+
+/// A line chart's dots and paths in `b`.
+#[allow(clippy::too_many_arguments)]
+fn paint_lines(
+    b: Bounds<Pixels>,
+    s: &Stack,
+    scale: Scale,
+    ink: &Ink,
+    thin: &[bool],
+    dim_until: Option<usize>,
+    paths: &Paths,
+    window: &mut Window,
+) {
+            let n = s.days.len();
+            let step = b.size.width / n as f32;
+            let x_of = |i: usize| b.origin.x + step * (i as f32 + 0.5);
+            let y_of = |v: f64| b.origin.y + b.size.height * (1. - scale.at(v));
             // A lone day is a dot (a quad, cheap): painted here each time.
             for (si, l) in s.series.iter().enumerate() {
                 let thin = thin.get(si).copied().unwrap_or(false);
                 for i in 0..n {
                     let alone = l.values[i].is_some() && (i == 0 || l.values[i - 1].is_none()) && (i + 1 == n || l.values[i + 1].is_none());
                     if alone {
-                        let c = if dim_until.is_some_and(|d| i < d) { ink.grid } else { color_of(Stroke::Series(l.color, thin), &ink) };
+                        let c = if dim_until.is_some_and(|d| i < d) { ink.grid } else { color_of(Stroke::Series(l.color, thin), ink) };
                         let (x, y) = (x_of(i), y_of(l.values[i].unwrap_or(0.)));
                         window.paint_quad(fill(Bounds::new(point(x - px(1.5), y - px(1.5)), size(px(3.), px(3.))), c));
                     }
@@ -176,7 +242,7 @@ pub fn lines(
             }
             let cached = paths.borrow().as_ref().filter(|(at, _)| *at == b.size).map(|(_, v)| v.clone());
             let built = cached.unwrap_or_else(|| {
-                let v = build_lines(&s, scale, &thin, dim_until, b.size);
+                let v = build_lines(s, scale, thin, dim_until, b.size);
                 *paths.borrow_mut() = Some((b.size, v.clone()));
                 v
             });
@@ -185,11 +251,8 @@ pub fn lines(
                     v.xy_position += b.origin;
                 }
                 path.bounds.origin += b.origin;
-                window.paint_path(path, color_of(stroke, &ink));
+                window.paint_path(path, color_of(stroke, ink));
             }
-        },
-    )
-    .size_full()
 }
 
 fn color_of(stroke: Stroke, ink: &Ink) -> Hsla {
@@ -254,7 +317,7 @@ pub fn scatter(points: Arc<[(f32, f32)]>, color: Hsla, grid: Hsla, ticks: Vec<f3
     canvas(
         |_, _, _| (),
         move |b, _, window, _| {
-            let ink = Ink { series: [color; 6], grid, rule: grid, hover: grid };
+            let ink = Ink { series: [color; 6], grid, rule: grid, hover: grid, reveal: Reveal::default() };
             grid_lines(b, &ticks, &ink, window);
             let c = fade(color, 0.5);
             let (w, h) = (b.size.width - px(2.), b.size.height - px(2.));

@@ -332,11 +332,18 @@ impl AppView {
                 s.title.clone().filter(|t| !t.is_empty() && s.name.is_some()).unwrap_or_default().into()
             }
         });
+        // On its way, the word's trailing dots step `·` → `··` → `···` at
+        // 2 Hz on the beat (motion.md §6.7: text, not a spinner); held at
+        // `···` without the heartbeat. Mono, padded: the word never moves.
+        let dots = |word: &str| -> SharedString {
+            let n = self.fx.beat(4).map_or(3, |b| (b / 4 % 3) as usize + 1);
+            format!("{word} {:<3}", "·".repeat(n)).into()
+        };
         let (conn, conn_color): (SharedString, Hsla) = match &self.model.conn {
-            _ if self.model.reattaching => ("reattaching".into(), p.dim_ch),
+            _ if self.model.reattaching => (dots("reattaching"), p.dim_ch),
             ConnState::Connected(v) => (format!("connected · {v}").into(), p.dim_ch),
-            ConnState::Connecting => ("connecting".into(), p.dim_ch),
-            ConnState::Reconnecting => ("reconnecting".into(), p.dim_ch),
+            ConnState::Connecting => (dots("connecting"), p.dim_ch),
+            ConnState::Reconnecting => (dots("reconnecting"), p.dim_ch),
             ConnState::Off(e) | ConnState::Incompatible(e) => {
                 (crate::app::one_line(e, 60).into(), if self.synthetic { p.dim_ch } else { p.err_ch })
             }

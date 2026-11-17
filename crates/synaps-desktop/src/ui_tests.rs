@@ -2940,3 +2940,81 @@ fn a_theme_change_cross_fades(cx: &mut TestAppContext) {
         to(cx, "paper");
     }
 }
+
+/// The Usage charts reveal on their first board and on another range,
+/// never on a refresh of the same (motion.md §6.8); at Full only: Reduced
+/// and Off show them whole.
+#[gpui_kit::test]
+fn chart_reveal_skipped_when_reduced(cx: &mut TestAppContext) {
+    use crate::usage::{Board, Range, Raw};
+    let (w, view, _events) = open(cx);
+    let board = |range: Range| {
+        let path = format!("{}/fixtures/usage/all.json", env!("CARGO_MANIFEST_DIR"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::sync::Arc::new(Board::build(&Raw::from_fixture(&v).unwrap(), None, range, 1_794_654_869_189))
+    };
+    let show = |cx: &mut TestAppContext, b: Option<Range>| {
+        view.update(cx, |v, _| {
+            if let Some(r) = b {
+                v.usage.board = Some(board(r));
+            }
+            v.usage_reveal()
+        })
+    };
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    let first = show(cx, Some(Range::ALL[0]));
+    assert!(first.at.is_some(), "the first board reveals");
+    assert_eq!(first.column(0, 30), 0., "from the baseline");
+    wait(cx, w, &view, 100);
+    let r = show(cx, None);
+    assert!(r.column(0, 30) > r.column(29, 30), "the left columns lead: {} {}", r.column(0, 30), r.column(29, 30));
+    assert!(r.line() > 0. && r.line() < 1., "the lines draw on: {}", r.line());
+    wait(cx, w, &view, chart_span());
+    assert_eq!(show(cx, None), crate::chart::Reveal::default(), "over: shown whole");
+    assert_eq!(show(cx, Some(Range::ALL[0])), crate::chart::Reveal::default(), "a refresh of the same range: no reveal");
+    assert!(show(cx, Some(Range::ALL[1])).at.is_some(), "another range reveals");
+    for level in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
+        set_motion(cx, &view, level);
+        settle(cx, w, 4);
+        wait(cx, w, &view, chart_span());
+        let k = if level == crate::motion::Level::Reduced { 2 } else { 0 };
+        assert_eq!(show(cx, Some(Range::ALL[k])), crate::chart::Reveal::default(), "{level:?}: shown whole");
+    }
+}
+
+fn chart_span() -> u64 {
+    crate::chart::Reveal::SPAN.as_millis() as u64 + 10
+}
+
+/// A saved setting's value afterglows (motion.md §6.8: the confirmation, no
+/// toast): a THIS APP value once its write is due, a daemon one when the
+/// write is answered; never on first sight, never under Off.
+#[gpui_kit::test]
+fn saved_value_afterglows(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    let id: gpui_kit::SharedString = "field-test".into();
+    let k = |cx: &mut TestAppContext, value: &str, sending: bool| view.read_with(cx, |v, _| v.saved_glow(&id, value, sending));
+    // Read outside a frame: at the motion clock, moved here alone.
+    let wait = |cx: &mut TestAppContext, _: AnyWindowHandle, view: &Entity<AppView>, ms: u64| {
+        view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + std::time::Duration::from_millis(ms)));
+    };
+    assert_eq!(k(cx, "a", false), 0., "first sight");
+    assert_eq!(k(cx, "b", false), 0., "changed: its write is still to come");
+    wait(cx, w, &view, crate::app::SAVE_DELAY.as_millis() as u64 - 50);
+    assert_eq!(k(cx, "b", false), 0., "not written yet");
+    wait(cx, w, &view, 60);
+    let lit = k(cx, "b", false);
+    assert!(lit > 0.5, "written: lit ({lit})");
+    wait(cx, w, &view, crate::motion::GLOW.as_millis() as u64);
+    assert_eq!(k(cx, "b", false), 0., "settled");
+    assert_eq!(k(cx, "c", true), 0., "sending");
+    wait(cx, w, &view, 50);
+    assert_eq!(k(cx, "c", false), 1., "answered: lit at once");
+    set_motion(cx, &view, crate::motion::Level::Off);
+    settle(cx, w, 4);
+    assert_eq!(k(cx, "d", true), 0.);
+    assert_eq!(k(cx, "d", false), 0., "Off: none");
+}

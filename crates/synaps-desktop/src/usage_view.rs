@@ -55,6 +55,9 @@ pub(crate) struct UsageUi {
     pub scroll: ScrollHandle,
     /// A selection made while a load ran: loaded after it.
     pub queued: bool,
+    /// The board last drawn, what it shows (its range and host), and when
+    /// its charts' reveal began (motion.md §6.8).
+    revealed: std::cell::Cell<Option<(usize, u64, Option<Instant>)>>,
     spots: [Spot; 5],
     paths: [Paths; 5],
 }
@@ -74,6 +77,7 @@ impl UsageUi {
             hover: None,
             scroll: ScrollHandle::new(),
             queued: false,
+            revealed: Default::default(),
             spots: Default::default(),
             paths: Default::default(),
         }
@@ -117,6 +121,7 @@ fn ink(p: &Palette) -> Ink {
         grid: p.hair,
         rule: p.dim,
         hover: crate::theme::mix_hsla(p.canvas, p.hair, 0.6),
+        reveal: chart::Reveal::default(),
     }
 }
 
@@ -135,6 +140,31 @@ impl AppView {
             self.usage_load(cx);
             self.views_changed(cx);
         }
+    }
+
+    /// The charts' reveal (motion.md §6.8): on the first board drawn and on
+    /// one for another range or host, never on a refresh of the same; at
+    /// Full only (Reduced and Off: shown whole). Its frames draw the pane.
+    pub(crate) fn usage_reveal(&self) -> chart::Reveal {
+        let Some(b) = self.usage.board.as_ref() else { return chart::Reveal::default() };
+        let ptr = Arc::as_ptr(b) as usize;
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (b.range.label(), &self.usage.host).hash(&mut h);
+            h.finish()
+        };
+        let at = match self.usage.revealed.get() {
+            Some((p, _, at)) if p == ptr => at,
+            seen => {
+                let fresh = seen.is_none_or(|(_, k, _)| k != key);
+                let at = if fresh && self.fx.level() == crate::motion::Level::Full { Some(self.fx.now()) } else { seen.and_then(|s| s.2) };
+                self.usage.revealed.set(Some((ptr, key, at)));
+                at
+            }
+        };
+        let t = self.fx.shot(at, std::time::Duration::ZERO, chart::Reveal::SPAN, &crate::motion::ease::OUT, crate::motion::Kind::Spatial);
+        chart::Reveal { at: at.filter(|_| t < 1.).map(|a| (a, self.fx.now())) }
     }
 
     fn usage_hover(&mut self, c: Chart, ix: Option<usize>, cx: &mut Context<Self>) {
@@ -315,7 +345,7 @@ impl AppView {
     }
 
     fn usage_body(&self, b: &Board, w: f32, span: &dyn Fn(f32) -> f32, narrow: bool, p: &Palette, cx: &ViewCx) -> AnyElement {
-        let ink = ink(p);
+        let ink = Ink { reveal: self.usage_reveal(), ..ink(p) };
         let money = |v: f64| usage::money(v);
         let mut out = v_flex().w(px(w));
         // 4.1 Headline.

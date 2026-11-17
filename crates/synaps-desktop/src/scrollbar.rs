@@ -372,6 +372,27 @@ struct Inner {
     ours: bool,
     /// Ends the drag on the target it began on (whatever is shown now).
     release: Option<Box<dyn FnOnce()>>,
+    /// Shown last frame; and showing (or hiding) since when, while its
+    /// colour lerps (motion.md §6.4), Full only.
+    was: bool,
+    fade: Option<(bool, Instant)>,
+    /// The hide's 30 Hz tick is armed.
+    ticking: bool,
+}
+
+/// A bar showing lerps its thumb in from its ground over `quick`-exit
+/// (90 ms, `out`); hiding, back over `slow`-exit (270 ms, `in`) at 30 Hz
+/// (motion.md §6.4). The colour is what an opacity would paint on the
+/// opaque ground: no opacity.
+const SHOW: Duration = Duration::from_millis(90);
+const HIDE: Duration = Duration::from_millis(270);
+
+/// How far a bar's fade is at `now`: (showing, its thumb's strength 0..1).
+fn fading(fade: Option<(bool, Instant)>, now: Instant) -> Option<(bool, f32)> {
+    let (show, at) = fade?;
+    let d = if show { SHOW } else { HIDE };
+    let t = now.saturating_duration_since(at).as_secs_f32() / d.as_secs_f32();
+    (t < 1.).then(|| (show, if show { crate::motion::ease::OUT.sample(t) } else { 1. - crate::motion::ease::IN.sample(t) }))
 }
 
 impl Inner {
@@ -488,6 +509,8 @@ pub(crate) struct Frame<S: Scrolled> {
     thumb_hit: Option<Hitbox>,
     look: (bool, bool),
     view: EntityId,
+    /// Its fade this frame (showing, strength).
+    fade: Option<(bool, f32)>,
 }
 
 impl<S: Scrolled> IntoElement for Bar<S> {
@@ -555,6 +578,15 @@ impl<S: Scrolled> Bar<S> {
         }
         st.last = Some(at);
         let look = st.look(self.always, now);
+        if look.0 != st.was {
+            st.was = look.0;
+            let full = crate::motion::Level::current(cx) == crate::motion::Level::Full;
+            st.fade = full.then_some((look.0, now));
+        }
+        let fade = fading(st.fade, now);
+        if fade.is_none() {
+            st.fade = None;
+        }
         // Under the pointer first, the pane over them (it blocks nothing):
         // the strip hides what is behind it from the pointer but not from
         // the wheel; the thumb takes the cursor.
@@ -572,15 +604,40 @@ impl<S: Scrolled> Bar<S> {
         let pane = window.insert_hitbox(vp, HitboxBehavior::Normal);
         let drawn = lane(axis, vp, if look.1 { WIDE } else { THIN });
         drop(st);
-        Some(Frame { bar: self, geo, offset, thumb, lane: drawn, vp, pane, strip: strip_hit, thumb_hit, look, view })
+        Some(Frame { bar: self, geo, offset, thumb, lane: drawn, vp, pane, strip: strip_hit, thumb_hit, look, view, fade })
     }
 }
 
 impl<S: Scrolled> Frame<S> {
     fn paint(self, window: &mut Window, cx: &mut App) {
-        let Frame { bar, geo, offset, thumb, lane, vp, pane, strip, thumb_hit, look, view } = self;
+        let Frame { bar, geo, offset, thumb, lane, vp, pane, strip, thumb_hit, look, view, fade } = self;
         let Bar { scroll, state, axis, ground, always, focus } = bar;
         let dragging = state.0.borrow().grab.is_some();
+        // Hiding: the thumb as it was at rest, lerping to its ground.
+        if let Some((false, k)) = fade {
+            let p = &cx.global::<crate::theme::Scheme>().p;
+            let (base, thin) = match ground {
+                Ground::Canvas => (p.canvas, p.thumb),
+                Ground::Chrome => (p.chrome, p.thumb_ch),
+                Ground::User => (p.user, p.thumb_u),
+            };
+            let rect = thumb_rect(axis, lane, thumb);
+            window.with_content_mask(Some(ContentMask { bounds: vp }), |window| {
+                window.paint_quad(fill(rect, crate::motion::mix(base, thin, k)));
+            });
+            let mut s = state.0.borrow_mut();
+            if !s.ticking {
+                s.ticking = true;
+                let state = state.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        cx.background_executor().timer(crate::motion::DECAY_TICK).await;
+                        state.0.borrow_mut().ticking = false;
+                        cx.update(|_, cx| cx.notify(view)).ok();
+                    })
+                    .detach();
+            }
+        }
         if look.0 {
             let p = &cx.global::<crate::theme::Scheme>().p;
             // At rest the `thumb*` role; hovered its ground's dim text;
@@ -596,6 +653,19 @@ impl<S: Scrolled> Frame<S> {
                 rest
             } else {
                 thin
+            };
+            // Showing: from its ground, at display rate.
+            let color = match fade {
+                Some((true, k)) => {
+                    window.request_animation_frame();
+                    let base = match ground {
+                        Ground::Canvas => p.canvas,
+                        Ground::Chrome => p.chrome,
+                        Ground::User => p.user,
+                    };
+                    crate::motion::mix(base, color, k)
+                }
+                _ => color,
             };
             let track = look.1.then_some(p.hair);
             let rect = thumb_rect(axis, lane, thumb);
@@ -759,6 +829,22 @@ mod tests {
     };
     use gpui_kit::{Axis, Bounds, point, px, size};
     use std::time::{Duration, Instant};
+
+    /// The colour fade (motion.md §6.4): shown, the thumb comes up from its
+    /// ground over 90 ms `out`; hidden, it goes back over 270 ms `in`; then
+    /// it is at rest (no fade, no frames).
+    #[test]
+    fn the_thumb_fades_in_fast_and_out_slow() {
+        let t0 = Instant::now();
+        let at = |show: bool, ms: u64| super::fading(Some((show, t0)), t0 + Duration::from_millis(ms));
+        assert_eq!(at(true, 0), Some((true, 0.)));
+        assert!(at(true, 45).is_some_and(|(_, k)| k > 0.5 && k < 1.), "out: past half by half time");
+        assert_eq!(at(true, 90), None, "shown");
+        assert_eq!(at(false, 0), Some((false, 1.)));
+        assert!(at(false, 135).is_some_and(|(_, k)| k > 0.5 && k < 1.), "in: slow to leave");
+        assert_eq!(at(false, 270), None, "hidden");
+        assert_eq!(super::fading(None, t0), None);
+    }
 
     const G: Geo = Geo { track: 500., view: 500., content: 2000., warp: None };
 
