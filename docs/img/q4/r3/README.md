@@ -38,6 +38,12 @@ The capture agrees. The window's mean chroma per frame falls 26.7 → 9.7 over f
 accent bar drains with the rest: its blue−red goes 64 → 19 over 716–726 and back to 64 by 972.
 `the_drain_and_the_restore_run_every_frame` checks that every frame steps, at 144 Hz.
 
+**About the stall the re-gate saw.** One of my test captures (`trace3`, not packed here) showed the
+same thing: no drain in the clip at all, while the app's frame log shows it drew all 52 drain frames
+7 ms apart (10382–10743 ms). Under gamescope's headless Xwayland, x11grab reads the window's pixmap,
+and that isn't refreshed for every presented frame, so a burst on an untouched window can be missed
+or land late. The app trace above is the authority. This clip happens to show the whole drain.
+
 How much greys, using r2's method on frames 660 and 733 (3-px horizontal mean, chroma > 60): 342
 live, 2 drained (99.4 %). At chroma > 45: 667 → 28 (95.8 %). The mean chroma of the coloured pixels goes
 60.6 → 29.9.
