@@ -541,11 +541,22 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // A session at rest: nothing runs. (The synthetic history
                 // ends on a call with no result, which reads as running:
                 // it is the beat's scene, not this one.)
-                let _ = upd(cx, &|v, _| v.model.set_local_session("bench-motion-idle"));
+                // `SYNAPS_BENCH_IDLE_SECS=N`: N s instead, over a finished
+                // history (its tool rows and prose at rest: the finish
+                // gate's idle with the transcript's rows drawn).
+                let idle = std::env::var("SYNAPS_BENCH_IDLE_SECS").ok().and_then(|s| s.parse::<u64>().ok());
+                let _ = upd(cx, &|v, _| {
+                    v.model.set_local_session("bench-motion-idle");
+                    if idle.is_some() {
+                        v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
+                        v.sync_list();
+                        v.list.scroll_to_end();
+                    }
+                });
                 sleep(1.0).await;
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
-                sleep(10.0).await;
-                out["idle_10s"] = stats(cx, t0, Instant::now(), c0, f0);
+                sleep(idle.unwrap_or(10) as f64).await;
+                out[format!("idle_{}s", idle.unwrap_or(10))] = stats(cx, t0, Instant::now(), c0, f0);
                 // A tool runs: its glyph scans on the beat (8 Hz), the foot's too.
                 let _ = upd(cx, &|v, _| {
                     v.model.set_local_session("bench-motion");
