@@ -25,7 +25,9 @@
 //! re-attach). An end read from a `SubagentDone`'s text is a guess until
 //! the daemon's own word (a row, the completion event, a collect, the
 //! blocking call's result) says how it ended: that may correct it, once.
-//! Nothing here ticks: the elapsed time moves when a row comes.
+//! Nothing here ticks: the elapsed time moves when a row comes. A running
+//! worker's [`Tick`] (the daemon's last count and when it arrived) is what
+//! the surfaces tick from, under motion (motion.md §6.2).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -228,9 +230,55 @@ pub struct Worker {
     /// says only the word, so the daemon's own end sources (its stream,
     /// rows, result, completion) still write how it ended, once.
     by_page: bool,
+    /// When `elapsed` arrived, if it arrived while it ran (a row).
+    reported: Option<Instant>,
+}
+
+/// A running worker's clock: the elapsed time the daemon last reported and
+/// the local instant that report arrived. Its time at a later instant is
+/// that count carried forward on this machine's monotonic clock: not an
+/// estimate of anything the daemon has not said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tick {
+    /// The reported elapsed, in milliseconds.
+    ms: u64,
+    at: Instant,
+}
+
+impl Tick {
+    pub fn new(secs: f64, at: Instant) -> Self {
+        Tick { ms: (secs.max(0.) * 1000.).round() as u64, at }
+    }
+
+    /// Whole seconds at `now`, and the instant that next changes.
+    pub fn whole(&self, now: Instant) -> (u64, Instant) {
+        let ms = self.ms + now.saturating_duration_since(self.at).as_millis() as u64;
+        let s = ms / 1000;
+        (s, self.at + Duration::from_millis((s + 1) * 1000 - self.ms))
+    }
+}
+
+/// A running clock: whole seconds (motion.md §6.2 "41s"); an ended run
+/// keeps its exact [`fmt_secs`].
+pub fn fmt_whole(s: u64) -> String {
+    if s < 60 { format!("{s}s") } else { fmt_secs(s as f64) }
 }
 
 impl Worker {
+    /// Running, attached (a live source said so): its clock, from the
+    /// daemon's last count (else from its live start, which this window
+    /// saw arrive).
+    fn tick(&self) -> Option<Tick> {
+        if !self.status.is_some_and(Status::running) {
+            return None;
+        }
+        match (self.elapsed, self.reported) {
+            (Some(e), Some(at)) => Some(Tick::new(e, at)),
+            (None, _) => self.started.map(|at| Tick::new(0., at)),
+            _ => None,
+        }
+    }
+
     fn ended(&self) -> bool {
         self.status.is_some_and(Status::terminal)
     }
@@ -333,7 +381,10 @@ impl Worker {
         }
         self.started = self.started.or(o.started);
         self.tools = self.tools.or(o.tools);
-        self.elapsed = self.elapsed.or(o.elapsed);
+        if self.elapsed.is_none() {
+            self.elapsed = o.elapsed;
+            self.reported = o.reported;
+        }
     }
 }
 
@@ -352,6 +403,9 @@ pub struct View {
     pub name: SharedString,
     /// `sonnet-5-5 · 6 tools · 41.0s`, what is known of it.
     pub facts: SharedString,
+    /// Running: the facts before its clock, and the clock (ticked where
+    /// it is drawn, [`Tick`]).
+    pub tick: Option<(SharedString, Tick)>,
     /// Running (or last seen so): its step; finished: its result, or why
     /// it failed.
     pub line: Option<(SharedString, bool)>,
@@ -371,6 +425,7 @@ impl View {
         if let Some(n) = w.tools.filter(|&n| n > 0) {
             facts.push(format!("{n} tool{}", if n == 1 { "" } else { "s" }));
         }
+        let tick = w.tick().map(|t| (SharedString::from(facts.join(" · ")), t));
         if let Some(s) = w.elapsed {
             facts.push(fmt_secs(s));
         }
@@ -391,6 +446,7 @@ impl View {
             status: w.status,
             name: name.into(),
             facts: facts.join(" · ").into(),
+            tick,
             line,
         })
     }
@@ -720,6 +776,8 @@ pub struct Live {
     pub line: String,
     pub tools: Option<u32>,
     pub elapsed: Option<f64>,
+    /// Running: its clock ([`Tick`]).
+    pub tick: Option<Tick>,
     /// A background worker (`sa_N`, `subagent_start` / `subagent_resume`):
     /// its journal can be watched and it can be steered. The blocking
     /// `subagent`'s cannot: the daemon's registry does not hold it.
@@ -807,7 +865,7 @@ impl Subagents {
             };
             let name = if w.name.is_empty() { label.to_string() } else { w.name.clone() };
             let call = call.filter(|c| c.named).map(|c| c.tool_id.clone());
-            Some(Live { id, call, name, status, line, tools: w.tools, elapsed: w.elapsed, watchable })
+            Some(Live { id, call, name, status, line, tools: w.tools, elapsed: w.elapsed, tick: w.tick(), watchable })
         };
         // Each id is the newest call's that has it (`by_id`): ids restart
         // at 1 with a cold-started daemon, and an earlier call's worker
@@ -1273,6 +1331,7 @@ impl Subagents {
                     (true, Some(a)) => (e - a).max(0.),
                     _ => e,
                 });
+                w.reported = (!w.ended()).then(Instant::now);
             }
             if !name.is_empty() {
                 w.name = name;
@@ -1460,7 +1519,7 @@ mod tests {
     use serde_json::{Value, json};
     use synaps_client::protocol::decode_event;
 
-    use super::{CARD_LINES, Liveness, Status, Subagents, View, completion_note, fmt_secs};
+    use super::{CARD_LINES, Liveness, Status, Subagents, View, completion_note, fmt_secs, fmt_whole};
     use crate::glyph::{self, Family};
     use std::time::{Duration, Instant};
 
@@ -2280,5 +2339,40 @@ mod tests {
         p.append(&[call("t", "subagent_start", json!({"agent": "scout", "task": "go"})), answer("t", &handle(3, "scout"))]);
         p.append(&[call("k", "subagent_status", json!({"handle_id": "sa_3"})), answer("k", &status)]);
         assert_eq!(shown(&p, "t").map(|v| (v.0, v.3)), Some(("completed", None)));
+    }
+
+    /// A running worker's clock advances with no row from the daemon: its
+    /// last count carried forward on the local monotonic clock, in whole
+    /// seconds; it stops with the run, which keeps the daemon's exact time.
+    #[test]
+    fn a_running_clock_ticks_between_rows_and_freezes_on_finish() {
+        let mut s = Subagents::default();
+        tool_use(&mut s, "t1", "subagent_start", json!({"agent": "scout", "task": "go"}));
+        result(&mut s, "t1", &handle(1, "scout"));
+        let before = Instant::now();
+        rows(&mut s, json!([row(1, "scout", json!("running"), 41.4, None, "⚙ bash (tool #2)", 2)]));
+        let after = Instant::now();
+        let l = &s.live()[0];
+        let t = l.tick.expect("a running row: its clock");
+        // Its report, then 1.7 s and 30 s later with no row.
+        assert_eq!(t.whole(after).0, 41);
+        let (s1, next) = t.whole(after + Duration::from_millis(1700));
+        assert_eq!(s1, 43, "41.4 + 1.7 s");
+        assert!(next >= before + Duration::from_millis(2600) && next <= after + Duration::from_millis(2600), "its next whole second, 44");
+        assert_eq!(t.whole(after + Duration::from_secs(30)).0, 71);
+        assert_eq!(fmt_whole(71), "1m 11s");
+        let v = s.view("t1").unwrap();
+        assert_eq!(v.tick.as_ref().map(|(head, _)| head.as_str()), Some("claude-sonnet-5-5 · 2 tools"));
+        assert_eq!(v.facts.as_str(), "claude-sonnet-5-5 · 2 tools · 41.4s", "Off: as the row said");
+        // It ends: no clock; its run as the daemon counted it.
+        rows(&mut s, json!([row(1, "scout", json!("completed"), 52.0, Some(0.0), "", 3)]));
+        assert_eq!(s.live()[0].tick, None);
+        let v = s.view("t1").unwrap();
+        assert_eq!((v.tick.is_none(), v.facts.as_str()), (true, "claude-sonnet-5-5 · 3 tools · 52.0s"));
+        // A history-only start (no live source): no clock either.
+        let mut h = Subagents::default();
+        tool_use(&mut h, "t2", "subagent_start", json!({"agent": "scout", "task": "go"}));
+        result(&mut h, "t2", &handle(2, "scout"));
+        assert!(h.live().iter().all(|l| l.tick.is_none()));
     }
 }

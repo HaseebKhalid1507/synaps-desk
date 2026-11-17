@@ -710,7 +710,9 @@ fn the_foot_never_says_another_worker_under_its_handle(cx: &mut TestAppContext) 
     let (w, view, _events) = open(cx);
     scout_in_place(cx, w, &view);
     view_running(cx, &view);
-    let tray = view.read_with(cx, |v, _| v.tray.rows.iter().find(|r| r.id == 1).map(|r| r.facts.to_string())).expect("scout's tray row");
+    let tray = view
+        .read_with(cx, |v, _| v.tray.rows.iter().find(|r| r.id == 1).map(|r| crate::tray::ticked(&v.fx, &r.facts, &r.tick).to_string()))
+        .expect("scout's tray row");
     assert_eq!(foot_of(cx, &view), (crate::subagents::Liveness::Running, tray), "scout, as its tray row says it");
     view.update(cx, |v, cx| {
         v.model.stats.subagents.append(&[
@@ -1067,15 +1069,27 @@ fn a_folded_run(cx: &mut TestAppContext, view: &Entity<AppView>) -> u64 {
     })
 }
 
-/// Off is the static app: whatever happens (a worker running, a fold, a
-/// send, a session switch), no frame and no timer of motion's; the window
-/// is idle within the static app's own follow-up frames.
+/// Off is the static app: whatever happens (a worker running, a send, a
+/// worker's view in and out, the card answered, a session switch, a fold
+/// and an unfold), motion asks for no frame and arms no timer: the guard is
+/// `motion_pending() == (false, None)` after every event. The frame counts
+/// (`settle`) are the static app's own: up to 2 follow-up frames after an
+/// event (its hint canvases measure on the next frame), as on main; motion
+/// adds none (0 frames of its own per event).
 #[gpui_kit::test]
 fn off_is_static(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Off);
     assert!(settle(cx, w, 8) <= 2);
     assert_eq!(motion_pending(cx, &view), (false, None), "scout runs in the tray: nothing scans under Off");
+    // A worker's view in, and out.
+    scout_in_place(cx, w, &view);
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "no bar draw opening a worker's view under Off");
+    view.update(cx, |v, cx| v.leave_worker(false, cx));
+    cx.run_until_parked();
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None));
     // A send's Handoff (what `submit` stamps).
     view.update(cx, |v, cx| {
         v.fx.sent.set(Some((std::time::Instant::now(), false)));
@@ -1084,6 +1098,11 @@ fn off_is_static(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(settle(cx, w, 8) <= 2);
     assert_eq!(motion_pending(cx, &view), (false, None), "no Handoff under Off");
+    // The card answered: it goes in the same frame.
+    resolve_prompt(cx, &view);
+    assert!(settle(cx, w, 8) <= 2);
+    assert_eq!(motion_pending(cx, &view), (false, None), "no exit fade under Off");
+    assert!(view.read_with(cx, |v, _| v.card_exit.is_none()));
     view.update(cx, |v, _| v.client = None);
     open_idle_cpu(cx, &view, crate::tabs::Place::Current);
     assert!(settle(cx, w, 8) <= 2);
@@ -1203,18 +1222,37 @@ fn transcript_heights_stable_across_frames(cx: &mut TestAppContext) {
         }
     }
     assert!(frames > 0, "the cascade ran over frames ({frames})");
+    // Every row, the user blocks with it (their bar is an absolute child
+    // now), is as high under Full as under Off, the static app.
+    let full = heights(cx);
+    assert!(view.read_with(cx, |v, _| v.disp.iter().any(|r| matches!(r.kind, crate::turns::Kind::User))), "user blocks on screen");
+    set_motion(cx, &view, crate::motion::Level::Off);
+    settle(cx, w, 8);
+    assert_eq!(heights(cx), full, "Off and Full lay the column out alike");
 }
 
-/// Words never wait: no text view is given a motion policy, so the kit's
-/// stream fade stays at its zero default (appended text is opaque on the
-/// frame it lands); the write head is a gutter bar, not a wash.
+/// Words never wait: no text view anywhere in the app is given a motion
+/// policy or a stream fade (nor the kit a global one), so appended text is
+/// opaque on the frame it lands at the kit's zero default; the write head
+/// is a gutter bar, not a wash. (A lint over every source file: the text
+/// run's colour is not observable from a test window.)
 #[test]
-fn stream_text_is_visible_on_its_first_frame() {
+fn no_text_view_gets_a_stream_fade() {
     assert_eq!(gpui_kit::base::TextViewMotion::default().stream_fade(), std::time::Duration::ZERO);
-    for src in [include_str!("turns.rs"), include_str!("app.rs"), include_str!("chrome.rs"), include_str!("views.rs")] {
-        assert!(!src.contains(concat!(".mot", "ion(")), "a text view got a motion policy");
-        assert!(!src.contains(concat!("with_stream", "_fade")), "a stream fade");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut n = 0;
+    for f in std::fs::read_dir(&dir).expect("src").flatten() {
+        let path = f.path();
+        if path.extension().is_none_or(|e| e != "rs") || path.ends_with("ui_tests.rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("a source file");
+        n += 1;
+        for bad in [concat!(".mot", "ion("), concat!("with_stream", "_fade")] {
+            assert!(!src.contains(bad), "{}: {bad}", path.display());
+        }
     }
+    assert!(n > 20, "every source file read ({n})");
 }
 
 /// A tray row leaving fades in its slot, but takes no click: the click
@@ -1246,4 +1284,109 @@ fn exiting_takes_no_click(cx: &mut TestAppContext) {
     vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 });
     vcx.run_until_parked();
     assert!(view.read_with(&vcx, |v, _| v.model.watch.focus().is_none() && v.menu.is_none()), "the click opened nothing");
+}
+
+/// The answered card fades in its own slot (the dock keeps its height),
+/// drawn as it last was and taking no click; then the dock closes in one
+/// frame. Off: it closes at once, as today.
+#[gpui_kit::test]
+fn the_answered_card_fades_in_its_slot(cx: &mut TestAppContext) {
+    use std::time::{Duration, Instant};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let bounds = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel);
+    let live = bounds(cx, "card").expect("relay-refresh's card is up");
+    // The live card takes a press (the control for the leaving one below).
+    click_at(cx, w, live.center());
+    assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the live card took the press");
+    resolve_prompt(cx, &view);
+    // Held mid-fade for the test.
+    view.update(cx, |v, cx| {
+        v.card_exit.as_mut().expect("answered on screen: it fades").at = Instant::now() + Duration::from_secs(60);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(bounds(cx, "card").is_none());
+    let ghost = bounds(cx, "card-exit").expect("the answered card, fading");
+    assert_eq!(ghost, live, "in its slot: nothing above or below it moved");
+    click_at(cx, w, ghost.center());
+    assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the leaving card took no press (the one is the live card's)");
+    // Its time is up: the dock closes in one frame.
+    view.update(cx, |v, cx| {
+        v.card_exit.as_mut().unwrap().at = Instant::now() - Duration::from_secs(1);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| v.card_exit.is_none()));
+    assert!(bounds(cx, "card-exit").is_none() && bounds(cx, "card").is_none());
+}
+
+/// Motion Off: an answered card goes in the frame its answer lands.
+#[gpui_kit::test]
+fn the_answered_card_goes_at_once_with_motion_off(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Off);
+    settle(cx, w, 8);
+    resolve_prompt(cx, &view);
+    assert!(view.read_with(cx, |v, _| v.card_exit.is_none()));
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("card-exit").is_none());
+}
+
+/// A left-button press and release at `position`.
+fn click_at(cx: &mut TestAppContext, w: AnyWindowHandle, position: gpui_kit::Point<gpui_kit::Pixels>) {
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    vcx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 });
+    vcx.run_until_parked();
+}
+
+/// Shady H1: motion's memory is the shown column's and session's. Every
+/// transcript numbers its rows from 1 (and every session its workers), so
+/// another's row 12 is not this one's: a session switch in the same tab (a
+/// rail click), a worker's view in and out, and back, all come up at rest:
+/// no write-on, settle, warn draw, chevron turn, write head or Handoff
+/// replayed from the other column, and no display frame asked for.
+#[gpui_kit::test]
+fn a_switch_replays_nothing(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let check = |cx: &mut TestAppContext, what: &str| {
+        let fresh = view.read_with(cx, |v, _| v.fx.fresh());
+        assert!(fresh.is_empty(), "{what}: replayed {fresh:?}");
+        assert!(!motion_pending(cx, &view).0, "{what}: a display frame asked for");
+    };
+    // A worker's view in place (its tray bar draws: that is this view's
+    // own, not a replay), and out again.
+    scout_in_place(cx, w, &view);
+    let fresh = view.read_with(cx, |v, _| v.fx.fresh());
+    assert!(fresh.is_empty(), "scout's view in: replayed {fresh:?}");
+    view.update(cx, |v, cx| v.leave_worker(false, cx));
+    cx.run_until_parked();
+    check(cx, "scout's view out");
+    // relay-refresh → Idle CPU in the same tab (its rows share ids with
+    // relay-refresh's; its turn is over, relay-refresh's foot was busy).
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    check(cx, "a switch in the tab");
+    assert_eq!(motion_pending(cx, &view), (false, None), "Idle CPU runs nothing: no frame, no timer");
+    // And back.
+    view.update(cx, |v, cx| {
+        v.open_tab(
+            crate::app::Open::Attach { session_id: crate::demo::SID.into(), fallback: None, open: false },
+            crate::tabs::Place::Current,
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(attached(cx, &view).as_deref(), Some(crate::demo::SID));
+    check(cx, "back");
 }

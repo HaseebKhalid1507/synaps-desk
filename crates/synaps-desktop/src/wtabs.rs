@@ -920,13 +920,10 @@ impl AppView {
         )
     }
 
-    /// A tray row's × (on hover, or while its row is the watched one;
-    /// armed: `Cancel sleeper? CONFIRM`), if this window may cancel it: the
-    /// row's full height `h`, so a near miss is not a click on the row. A
-    /// double-click's second click is not a second press
-    /// ([`Cancels::press`]).
     /// The fuse after an armed cancel's CONFIRM (motion.md §6.2): three
-    /// 4 px `err_mark` cells, one going dark per second of [`CONFIRM`] on
+    /// 4 px cells in the err family's mark on the tray's ground, which is
+    /// `err` itself there (design.md §4.4's table: `err_mark_ch` is the
+    /// chrome's, `err_mark_k` the card's), one going dark per second of [`CONFIRM`] on
     /// the clock; Reduced, all three until it runs out; Off, none.
     fn fuse(&self, p: &Palette) -> Option<Div> {
         let until = self.model.cancels.armed_until()?;
@@ -945,6 +942,11 @@ impl AppView {
         Some(h_flex().flex_none().gap(px(4.)).children((0..3).map(|i| div().size(px(4.)).when(i < lit, |d| d.bg(p.err)))))
     }
 
+    /// A tray row's × (on hover, or while its row is the watched one;
+    /// armed: `Cancel sleeper? CONFIRM`), if this window may cancel it: the
+    /// row's full height `h`, so a near miss is not a click on the row. A
+    /// double-click's second click is not a second press
+    /// ([`Cancels::press`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn cancel_x(
         &self,

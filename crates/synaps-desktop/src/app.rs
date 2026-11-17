@@ -939,6 +939,28 @@ impl Arm {
     }
 }
 
+/// The answered card leaving (motion.md §6.3): the card as its last frame
+/// drew it, fading over `quick`-exit in its slot with no listener (an exit
+/// takes no click), then the dock closes in one frame.
+pub(crate) struct CardExit {
+    pub(crate) card: PromptCard,
+    pub(crate) look: CardLook,
+    pub(crate) at: Instant,
+}
+
+/// What the card's last live frame showed of its state: the exit draws the
+/// same, so nothing but its opacity changes while it goes.
+#[derive(Clone, Default)]
+pub(crate) struct CardLook {
+    can: bool,
+    ready: bool,
+    keys: bool,
+    in_field: bool,
+    typed: bool,
+    footer: Option<SharedString>,
+    footer_warn: bool,
+}
+
 /// The prompt the authorization card shows.
 pub(crate) struct PromptCard {
     /// [`Model::card_key`]: `(epoch, prompt id)`.
@@ -946,6 +968,9 @@ pub(crate) struct PromptCard {
     /// A secret prompt's.
     secret: bool,
     arm: Arm,
+    /// The prompt as it came (its title, its kind): what the card says
+    /// while it fades out after the model has dropped it.
+    pr: synaps_client::protocol::PromptRequest,
     /// The body, verbatim (blank lines kept).
     pub(crate) body: SharedString,
     /// What the top bar says about it ([`crate::chrome::prompt_gist`]).
@@ -981,6 +1006,7 @@ impl PromptCard {
                 let (body, gist) = (well_body(&pr.prompt), crate::chrome::prompt_gist(&pr.title, &pr.prompt).into());
                 *card = Some(PromptCard {
                     key: k,
+                    pr: pr.clone(),
                     secret: pr.is_secret(),
                     arm: Arm::new(now),
                     body,
@@ -1379,6 +1405,13 @@ pub struct AppView {
     /// The prompt on the card came while watched, at this instant: its frame
     /// traces, its glyph breathes (motion.md §6.3).
     card_at: Option<Instant>,
+    /// The answered card fading out ([`CardExit`]).
+    pub(crate) card_exit: Option<CardExit>,
+    /// Presses the live card took (tests: a leaving card takes none).
+    #[cfg(test)]
+    pub(crate) card_presses: u32,
+    /// What the card's last frame showed ([`CardLook`]).
+    card_look: std::cell::RefCell<CardLook>,
     /// The card was on screen last frame (not behind a worker's view,
     /// Settings or Usage): one coming back waits again ([`Arm`]).
     card_was_up: bool,
@@ -1806,6 +1839,10 @@ impl AppView {
             visible: i.visible,
             fx: Rc::default(),
             card_at: None,
+            card_exit: None,
+            #[cfg(test)]
+            card_presses: 0,
+            card_look: Default::default(),
             card_was_up: false,
             tray: crate::tray::TrayCache::default(),
             tray_due: None,
@@ -2979,9 +3016,27 @@ impl AppView {
         }
     }
 
+    /// Motion's session scope ([`crate::motion::Motion::rescope`]): the
+    /// session on screen and its attach (a reconnect is history).
+    fn motion_session(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.model.active.as_ref().map(|a| (&a.session_id, a.epoch)).hash(&mut h);
+        h.finish()
+    }
+
+    /// Motion's column scope: the session's thread or a worker's view (in
+    /// place or a tab), each with its own item ids.
+    fn motion_column(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.model.watch.focus(), self.model.watch.in_tab()).hash(&mut h);
+        h.finish()
+    }
+
     /// The card on screen: the session's, not over a worker's view.
     fn card_shown(&self) -> bool {
-        self.model.watch.focus().is_none() && self.current_card().is_some()
+        self.model.watch.focus().is_none() && (self.current_card().is_some() || self.card_exit.is_some())
     }
 
     /// The session tab is on screen and its card shows the first prompt.
@@ -3147,6 +3202,24 @@ impl AppView {
         let view = f32::from(window.viewport_size().height);
         let now = Instant::now();
         let was = self.card.as_ref().map(|c| (c.key, c.secret));
+        // Answered (or resolved elsewhere) while on screen, in the same
+        // attachment: it fades in its slot. A switch, a reconnect or
+        // another prompt in its place: at once.
+        let fx_now = self.fx.now();
+        if self
+            .card_exit
+            .as_ref()
+            .is_some_and(|e| self.model.card_key().is_some() || fx_now >= e.at + crate::motion::exit(crate::motion::QUICK) || !self.fx.on())
+        {
+            self.card_exit = None;
+        }
+        let answered =
+            self.model.card_key().is_none() && self.card.as_ref().zip(self.model.active.as_ref()).is_some_and(|(c, a)| c.key.0 == a.epoch);
+        if answered && self.card_was_up && self.fx.on() && self.model.watch.focus().is_none() {
+            let card = self.card.take().expect("answered: there was a card");
+            log::info!(target: "synaps_desktop::card", "card {:?}: answered, fading", card.key);
+            self.card_exit = Some(CardExit { card, look: self.card_look.borrow().clone(), at: fx_now });
+        }
         let new = PromptCard::sync(&mut self.card, &self.model, now, view);
         if was.map(|w| w.0) != self.card.as_ref().map(|c| c.key) {
             if was.is_some_and(|w| w.1) {
@@ -3444,7 +3517,9 @@ impl AppView {
         self.sync_pane();
         let busy = self.model.shown().busy();
         let mut splice = self.model.shown_mut().take_splice();
-        let live_splice = splice.as_ref().is_some_and(|sp| sp.start > 0 && sp.new_len <= sp.old_len + 16) && !self.full_rebuild;
+        // A splice that adds items (a delta to the last one adds no row).
+        let live_splice = splice.as_ref().is_some_and(|sp| sp.start > 0 && sp.new_len > sp.old_len && sp.new_len <= sp.old_len + 16)
+            && !self.full_rebuild;
         if std::mem::take(&mut self.full_rebuild) {
             let n = self.model.shown().len();
             splice = Some(synaps_client::transcript::Splice { start: 0, old_len: self.rows.len(), new_len: n });
@@ -3985,7 +4060,7 @@ impl AppView {
         let row = self.tray.rows.iter().find(|r| {
             r.id == w.subagent_id && !r.facts.is_empty() && crate::wtabs::same_worker((r.call.as_deref(), r.name.as_ref()), w.key())
         });
-        (live, row.map_or_else(|| w.facts.clone(), |r| r.facts.clone()))
+        (live, row.map_or_else(|| w.facts.clone(), |r| crate::tray::ticked(&self.fx, &r.facts, &r.tick)))
     }
 
     /// HALT is drawn: this window drives the session's running turn (in a
@@ -4178,118 +4253,135 @@ impl AppView {
         let dims = crate::fit::Card::of(m, form);
         let cramped = form == crate::fit::Form::Cramped;
         let prompts = self.model.transcript.pending_prompts();
-        let pr = prompts.first()?;
+        // The answered card leaving: drawn as its last frame was, fading,
+        // with no listener ([`CardExit`]).
+        let exit = self.card_exit.as_ref().filter(|_| self.current_card().is_none());
+        let (pr, card) = match exit {
+            Some(e) => (&e.card.pr, Some(&e.card)),
+            None => (prompts.first()?, self.current_card()),
+        };
+        let look = exit.map(|e| e.look.clone());
         let secret = pr.is_secret();
-        let card = self.current_card();
-        let key = card.map(|c| c.key);
+        let key = card.filter(|_| exit.is_none()).map(|c| c.key);
         let sent = self.model.prompt_answered(pr.id);
         let armed = card.is_some_and(|c| c.armed());
-        let can = self.drives() && self.model.may_answer(pr.id) && armed;
+        let can = look.as_ref().map_or_else(|| self.drives() && self.model.may_answer(pr.id) && armed, |l| l.can);
         let below = card.and_then(|c| c.below(self.height));
-        let ready = card.is_some_and(|c| authorize_ready(c.armed(), below, c.read));
+        let ready = look.as_ref().map_or_else(|| card.is_some_and(|c| authorize_ready(c.armed(), below, c.read)), |l| l.ready);
         let (head, kind) = if secret { (label::SECRET, "secret") } else { (label::AUTHORIZATION, "confirm") };
         let lead: SharedString = pr.title.clone().into();
         let detached = self.model.active.is_none();
-        let in_field = keys == Some(true);
-        let keys = keys.is_some() && can && card.is_some_and(|c| c.keys_armed());
+        let in_field = look.as_ref().map_or(keys == Some(true), |l| l.in_field);
+        let keys = look.as_ref().map_or_else(|| keys.is_some() && can && card.is_some_and(|c| c.keys_armed()), |l| l.keys);
         let key_hint = |k: &'static str| mono(k, m.meta, p.dim_k).flex_none();
-        let typed = secret && !self.secret_input.read(cx).value().is_empty();
-        let actions = if detached {
-            None
-        } else if secret {
-            Some(
-                h_flex()
-                    .gap(px(24.))
-                    .items_center()
-                    .child(
-                        h_flex()
-                            .gap(px(8.))
-                            .items_center()
-                            .child(
-                                div()
-                                    .w(px((260. * m.r).round()))
-                                    .child(Input::new(&self.secret_input).disabled(!can).text_px(m.mono).border_color(p.frame)),
-                            )
-                            // Ctrl/Cmd+Enter takes the keys into the field.
-                            .when(keys && !in_field, |d| d.child(key_hint(YES_KEY))),
-                    )
-                    .child(
-                        fbtn_key(
-                            "p-submit",
-                            label::SUBMIT,
-                            (in_field && can && typed).then_some(if cfg!(target_os = "macos") { "RETURN" } else { "ENTER" }),
-                            can && typed,
-                            Fill::Warn,
-                            p,
-                            m,
+        let typed = look.as_ref().map_or_else(|| secret && !self.secret_input.read(cx).value().is_empty(), |l| l.typed);
+        // Listeners only on the live card.
+        let live = exit.is_none();
+        let actions =
+            if detached {
+                None
+            } else if secret {
+                Some(
+                    h_flex()
+                        .gap(px(24.))
+                        .items_center()
+                        .child(
+                            h_flex()
+                                .gap(px(8.))
+                                .items_center()
+                                .child(
+                                    div()
+                                        .w(px((260. * m.r).round()))
+                                        .child(Input::new(&self.secret_input).disabled(!can).text_px(m.mono).border_color(p.frame)),
+                                )
+                                // Ctrl/Cmd+Enter takes the keys into the field.
+                                .when(keys && !in_field, |d| d.child(key_hint(YES_KEY))),
                         )
-                        .when(can && typed, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(true, window, cx)))),
-                    )
-                    .child(
-                        h_flex()
-                            .gap(px(8.))
-                            .items_center()
-                            .child(
-                                tbtn("p-cancel", label::CANCEL, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
-                                    .text_px(m.label)
-                                    .when(can, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx)))),
+                        .child(
+                            fbtn_key(
+                                "p-submit",
+                                label::SUBMIT,
+                                (in_field && can && typed).then_some(if cfg!(target_os = "macos") { "RETURN" } else { "ENTER" }),
+                                can && typed,
+                                Fill::Warn,
+                                p,
+                                m,
                             )
-                            .when(keys, |d| d.child(key_hint("ESC"))),
-                    ),
-            )
-        } else {
-            let yes = can && ready;
-            // AUTHORIZE charges (motion.md §6.3): the arm's wait drawn as 10
-            // cells lit left to right, 50 ms each; the last lit is the arm.
-            // A held read gate keeps them dark.
-            let charge = card
-                .filter(|c| can && !yes && self.fx.level() == crate::motion::Level::Full && !(below.is_some_and(|b| b > 1.) && !c.read))
-                .map(|c| {
-                    let cell = ARM / 10;
-                    let n = (Instant::now().saturating_duration_since(c.arm.shown).as_nanos() / cell.as_nanos()).min(10) as u32;
-                    if n < 10 {
-                        self.fx.want_at(c.arm.shown + cell * (n + 1));
-                    }
-                    n
-                });
-            Some(
-                h_flex()
-                    .gap(px(24.))
-                    .items_center()
-                    // Clickable whenever the card may be answered: the read
-                    // gate is checked at the click (as the keys do), not by
-                    // this frame, laid out with the last one's bounds.
-                    .child(
-                        fbtn_charge("p-yes", label::AUTHORIZE, (keys && yes).then_some(YES_KEY), yes, charge, Fill::Warn, p, m).when_some(
-                            key.filter(|_| can),
-                            |d, key| {
-                                d.on_click(cx.listener(move |this, _, _, cx| {
-                                    this.authorize(key);
-                                    cx.notify();
-                                }))
-                            },
+                            .when(live && can && typed, |d| {
+                                d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(true, window, cx)))
+                            }),
+                        )
+                        .child(
+                            h_flex()
+                                .gap(px(8.))
+                                .items_center()
+                                .child(
+                                    tbtn("p-cancel", label::CANCEL, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
+                                        .text_px(m.label)
+                                        .when(live && can, |d| {
+                                            d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx)))
+                                        }),
+                                )
+                                .when(keys, |d| d.child(key_hint("ESC"))),
                         ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap(px(8.))
-                            .items_center()
-                            .child(
-                                tbtn("p-no", label::DENY, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
-                                    .text_px(m.label)
-                                    .when_some(key.filter(|_| can), |d, key| {
-                                        d.on_click(cx.listener(move |this, _, _, cx| {
-                                            this.answer(key, Some(CONFIRM_NO.into()));
-                                            cx.notify();
-                                        }))
-                                    }),
-                            )
-                            .when(keys, |d| d.child(key_hint("ESC"))),
-                    ),
-            )
-        };
+                )
+            } else {
+                let yes = can && ready;
+                // AUTHORIZE charges (motion.md §6.3): the arm's wait drawn as 10
+                // cells lit left to right, 50 ms each; the last lit is the arm.
+                // A held read gate keeps them dark.
+                let charge = card
+                    .filter(|c| {
+                        // Answerable here once armed (`can` waits on the arm: the charge is that wait).
+                        let may = self.drives() && self.model.may_answer(pr.id);
+                        live && may && !yes && self.fx.level() == crate::motion::Level::Full && !(below.is_some_and(|b| b > 1.) && !c.read)
+                    })
+                    .map(|c| {
+                        let cell = ARM / 10;
+                        let n = (self.fx.now().saturating_duration_since(c.arm.shown).as_nanos() / cell.as_nanos()).min(10) as u32;
+                        if n < 10 {
+                            self.fx.want_at(c.arm.shown + cell * (n + 1));
+                        }
+                        n
+                    });
+                Some(
+                    h_flex()
+                        .gap(px(24.))
+                        .items_center()
+                        // Clickable whenever the card may be answered: the read
+                        // gate is checked at the click (as the keys do), not by
+                        // this frame, laid out with the last one's bounds.
+                        .child(
+                            fbtn_charge("p-yes", label::AUTHORIZE, (keys && yes).then_some(YES_KEY), yes, charge, Fill::Warn, p, m)
+                                .when_some(key.filter(|_| can), |d, key| {
+                                    d.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.authorize(key);
+                                        cx.notify();
+                                    }))
+                                }),
+                        )
+                        .child(
+                            h_flex()
+                                .gap(px(8.))
+                                .items_center()
+                                .child(
+                                    tbtn("p-no", label::DENY, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
+                                        .text_px(m.label)
+                                        .when_some(key.filter(|_| can), |d, key| {
+                                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                                this.answer(key, Some(CONFIRM_NO.into()));
+                                                cx.notify();
+                                            }))
+                                        }),
+                                )
+                                .when(keys, |d| d.child(key_hint("ESC"))),
+                        ),
+                )
+            };
         let more = below.filter(|&b| b > 1.).map(|b| lines_below(b, m.code_line)).filter(|_| !card.is_some_and(|c| c.read));
-        let footer: Option<SharedString> = if detached && self.opening() {
+        let footer: Option<SharedString> = if let Some(l) = &look {
+            l.footer.clone()
+        } else if detached && self.opening() {
             Some("opening…".into())
         } else if detached {
             Some("detached: cannot answer".into())
@@ -4402,9 +4494,24 @@ impl AppView {
         let floor_box = dims.boxed(floor)
             - if has_well { 0. } else { dims.well_gap + dims.well(floor) }
             - if lead_row.is_some() || cramped { 0. } else { dims.lead.map_or(0., |(gap, line)| gap + line) };
+        let footer_warn = look.as_ref().map_or(more.is_some() && !sent, |l| l.footer_warn);
+        // Its content fades over `quick`-exit, `in` (motion.md §6.3).
+        let fade = exit.map_or(1., |e| {
+            1. - self.fx.shot(
+                Some(e.at),
+                Duration::ZERO,
+                crate::motion::exit(crate::motion::QUICK),
+                &crate::motion::ease::IN,
+                crate::motion::Kind::Fade,
+            )
+        });
+        if live {
+            *self.card_look.borrow_mut() = CardLook { can, ready, keys, in_field, typed, footer: footer.clone(), footer_warn };
+        }
         Some(
             v_flex()
                 .id("prompt-card")
+                .debug_selector(move || if live { "card".into() } else { "card-exit".into() })
                 .flex_shrink_1()
                 .min_h(px(floor_box))
                 .mt(px(dims.top))
@@ -4413,16 +4520,23 @@ impl AppView {
                 .px(px(m.pad_x))
                 .py(px(dims.pad_y))
                 .border_1()
-                .border_color(if tracer.is_some() { p.card } else { p.warn_mark })
+                // GPUI paints a border over the children: while the frame
+                // traces (a child), the border is clear (the card's ground
+                // shows through it, as it would in the card's colour).
+                .border_color(if tracer.is_some() { gpui_kit::transparent_black() } else { p.warn_mark })
                 .bg(p.card)
                 .relative()
                 .children(tracer)
                 // A click on a confirm card gives it the keys (a secret's
                 // field takes them itself).
-                .when(!secret, |d| {
+                .when(!secret && live, |d| {
                     d.on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
+                            #[cfg(test)]
+                            {
+                                this.card_presses += 1;
+                            }
                             if !this.focus.is_focused(window) {
                                 window.focus(&this.focus, cx);
                                 cx.notify();
@@ -4446,7 +4560,7 @@ impl AppView {
                 .when(has_well, |d| {
                     // A press on the bar gives a confirm card the keys, as one on the card does.
                     let bar = card.map(|c| crate::scrollbar::Bar::new(c.scroll.clone(), &c.bar));
-                    d.child(well).children(bar.map(|b| if secret { b } else { b.focus(self.focus.clone()) }))
+                    d.child(well).children(bar.map(|b| if secret || !live { b } else { b.focus(self.focus.clone()) }))
                 })
                 .child(
                     h_flex()
@@ -4460,14 +4574,23 @@ impl AppView {
                         .child(div().flex_1())
                         .when_some(footer, |d, f| {
                             d.child(
-                                mono(f, m.meta, if more.is_some() && !sent { p.warn_k } else { p.dim_k })
+                                mono(f, m.meta, if footer_warn { p.warn_k } else { p.dim_k })
                                     .ml(px(16.))
                                     .min_w_0()
                                     .overflow_hidden()
                                     .text_ellipsis(),
                             )
                         }),
-                ),
+                )
+                // Leaving: the column's own ground over it, from clear to
+                // solid (the colour opacity would paint on that opaque
+                // ground; no translucent text, design.md §5). No id: no
+                // hitbox.
+                .when(fade < 1., |d| {
+                    d.child(
+                        div().absolute().top(px(-1.)).left(px(-1.)).right(px(-1.)).bottom(px(-1.)).bg(Hsla { a: 1. - fade, ..p.canvas }),
+                    )
+                }),
         )
     }
 
@@ -4485,7 +4608,7 @@ impl AppView {
             (None, None) => return None,
         };
         let line = mono(text.clone(), m.meta, color).pt(px(crate::fit::NOTICE_TOP)).line_height(px(crate::fit::notice_line(m)));
-        let line = if self.current_card().is_some() {
+        let line = if self.current_card().is_some() || self.card_exit.is_some() {
             line.id("notice")
                 .min_w_0()
                 .overflow_hidden()
@@ -4661,10 +4784,8 @@ impl AppView {
         // ended here (busy → READY) hands the floor back: Handoff in
         // (motion.md §5.2, §6.4). Keyed by whose foot it is: a switch is not a change.
         let fx = &self.fx;
-        let foot_key = match worker {
-            Some(w) => (1 << 62) | w.subagent_id,
-            None => self.model.tabs.current().map_or(0, |t| t.id),
-        };
+        // The scope is the session's ([`AppView::motion_session`]).
+        let foot_key = worker.map_or(0, |w| (1 << 62) | w.subagent_id);
         let foot_ch = g.and_then(|g| fx.change(crate::motion::Tag::Foot, foot_key, crate::turns::glyph_code(g), None));
         let busy_glyph = |c: u64| {
             [glyph::Glyph::Run, glyph::Glyph::Workers, glyph::Glyph::Needs, glyph::Glyph::Cancelling]
@@ -4908,12 +5029,24 @@ pub(crate) fn fbtn_charge(
     key: Option<&'static str>,
     enabled: bool,
     charge: Option<u32>,
-    fill: Hsla,
+    fill: Fill,
     p: &Palette,
     m: &Metrics,
 ) -> Stateful<Div> {
     let Some(n) = charge.filter(|_| !enabled) else { return fbtn_key(id, text, key, enabled, fill, p, m) };
-    let cells = h_flex().absolute().inset_0().children((0..10).map(|i| div().flex_1().h_full().when(i < n, |d| d.bg(fill))));
+    // Drawn as a disabled button is (its `edge` outline, a `dim` label),
+    // the charge a meter along its foot inside the outline: 10 cells of
+    // the fill, 3 px, lit left to right. Under the label it would take the
+    // disabled label's contrast (motion.md §10 amendment 2).
+    let lit = fill.roles(p).0;
+    let cells = h_flex()
+        .absolute()
+        .left(px(1.))
+        .right(px(1.))
+        .bottom(px(1.))
+        .h(px(3.))
+        .gap(px(1.))
+        .children((0..10).map(|i| div().flex_1().h_full().when(i < n, |d| d.bg(lit))));
     div()
         .id(id)
         .relative()
@@ -4923,9 +5056,9 @@ pub(crate) fn fbtn_charge(
         .flex_none()
         .gap(px(10.))
         .items_center()
-        .bg(p.edge)
+        .child(div().absolute().inset_0().border_1().border_color(p.edge))
         .child(cells)
-        .child(display(text, m.label, p.dim).relative())
+        .child(display(text, m.label, p.dim))
 }
 
 pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subagents::Subagents) -> RowCache {
@@ -5025,6 +5158,7 @@ impl Render for AppView {
         let low_power = cx.power_mode() == gpui_kit::PowerMode::LowPower;
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, Instant::now());
+        self.fx.rescope(self.motion_session(), self.motion_column());
         if self.menu.is_none()
             && self.smenu.is_none()
             && let Some(h) = self.menu_focus_back.take()
@@ -5042,17 +5176,19 @@ impl Render for AppView {
         }
         self.sync_list();
         self.sync_card(window, cx);
-        // Seen every frame, shown or not: a card that comes back (from a
-        // worker's view, Settings) is not new; another session's is history.
-        let prompt_key = self.model.card_key().map_or(0, |(e, id)| (e << 32) ^ id ^ (1 << 63));
-        let session_key = self.model.active.as_ref().map_or(0, |a| {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            a.session_id.hash(&mut h);
-            h.finish()
-        });
-        self.card_at =
-            self.fx.change(crate::motion::Tag::Card, session_key, prompt_key, None).filter(|_| prompt_key != 0).map(|(at, _)| at);
+        // Seen every frame while attached, shown or not: a card that comes
+        // back (from a worker's view, Settings) is not new; another
+        // session's, or one a reconnect brings again, is history (the
+        // scope, [`AppView::motion_session`]). Keyed by the prompt's id, not
+        // the attach: the same prompt is the same card.
+        let prompt_key = self.model.transcript.pending_prompts().first().map_or(0, |pr| pr.id ^ (1 << 63));
+        self.card_at = self
+            .model
+            .active
+            .as_ref()
+            .and_then(|_| self.fx.change(crate::motion::Tag::Card, 0, prompt_key, None))
+            .filter(|_| prompt_key != 0)
+            .map(|(at, _)| at);
         self.sync_tray(cx);
         self.rename_when_shown(window, cx);
         self.refresh_rail();
@@ -6423,6 +6559,7 @@ mod tests {
             line: String::new(),
             tools: None,
             elapsed: None,
+            tick: None,
             watchable: true,
         };
         w.prune(t0, &[done]);

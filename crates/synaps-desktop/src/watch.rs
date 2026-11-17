@@ -1244,6 +1244,7 @@ mod tests {
             line: String::new(),
             tools: None,
             elapsed: None,
+            tick: None,
             watchable: true,
         };
         w.prune(t0, std::slice::from_ref(&done));
@@ -1309,6 +1310,7 @@ mod tests {
             line: String::new(),
             tools: None,
             elapsed: None,
+            tick: None,
             watchable: true,
         };
         w.prune(t0, &[ended(5), ended(6)]);
@@ -1382,6 +1384,7 @@ mod tests {
                 line: String::new(),
                 tools: None,
                 elapsed: None,
+                tick: None,
                 watchable: true,
             }],
         );
@@ -1454,6 +1457,7 @@ mod tests {
             line: String::new(),
             tools: None,
             elapsed: None,
+            tick: None,
             watchable: true,
         };
         let t0 = Instant::now();
@@ -1497,6 +1501,7 @@ mod tests {
             line: String::new(),
             tools: None,
             elapsed: None,
+            tick: None,
             watchable: true,
         };
         let t0 = Instant::now();

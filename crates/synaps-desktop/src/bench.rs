@@ -38,6 +38,21 @@ pub struct BenchOptions {
     /// history (a saved session's `api_messages`: a real one, with its
     /// tool results and edits), not the synthetic one.
     pub history_file: Option<std::path::PathBuf>,
+    /// `--bench-motion`: what motion costs (motion.md §9): presents over
+    /// 10 s idle, then a running tool's heartbeat (frames, phases, CPU per
+    /// frame), then the same with Motion off.
+    pub motion: bool,
+}
+
+/// CPU time of every thread of this process so far (`/proc/self/task/*/schedstat`,
+/// nanoseconds; Linux only, else 0).
+fn cpu_ns() -> u64 {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else { return 0 };
+    tasks
+        .flatten()
+        .filter_map(|t| std::fs::read_to_string(t.path().join("schedstat")).ok())
+        .filter_map(|s| s.split_whitespace().next()?.parse::<u64>().ok())
+        .sum()
 }
 
 pub struct BenchState {
@@ -486,6 +501,80 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     "uncached": keys.iter().map(|k| (k.to_string(), summary(true, k))).collect::<serde_json::Map<_, _>>(),
                     "runs": runs,
                 });
+                out["mem_end"] = mem::sample();
+                out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
+                println!("{out}");
+                let _ = cx.update(|_, cx| cx.quit());
+                return;
+            }
+            if opts.motion {
+                let stats = |cx: &mut AsyncWindowContext, t0: Instant, t1: Instant, c0: u64| {
+                    let cpu = cpu_ns().saturating_sub(c0) as f64 / 1e6;
+                    let mut v = view
+                        .update(cx, |v, _| {
+                            let b = v.bench.as_mut().unwrap();
+                            b.drain();
+                            b.stats(t0, t1, refresh_fallback)
+                        })
+                        .unwrap_or(Value::Null);
+                    let secs = t1.duration_since(t0).as_secs_f64();
+                    let n = v["frames_presented"].as_u64().unwrap_or(0);
+                    v["cpu_ms_per_s"] = json!(round(cpu / secs, 2));
+                    v["cpu_ms_per_frame"] = json!((n > 0).then(|| round(cpu / n as f64, 2)));
+                    v
+                };
+                let level = |cx: &mut AsyncWindowContext, l: crate::motion::Level| {
+                    let _ = cx.update(|_, cx| {
+                        cx.set_global(crate::motion::Setting { level: Some(l), lock: None });
+                        crate::motion::Level::apply(cx);
+                    });
+                };
+                level(cx, crate::motion::Level::Full);
+                // A session at rest: nothing runs. (The synthetic history
+                // ends on a call with no result, which reads as running:
+                // it is the beat's scene, not this one.)
+                let _ = upd(cx, &|v, _| v.model.set_local_session("bench-motion-idle"));
+                sleep(1.0).await;
+                let (t0, c0) = (Instant::now(), cpu_ns());
+                sleep(10.0).await;
+                out["idle_10s"] = stats(cx, t0, Instant::now(), c0);
+                // A tool runs: its glyph scans on the beat (8 Hz), the foot's too.
+                let _ = upd(cx, &|v, _| {
+                    v.model.set_local_session("bench-motion");
+                    v.model.transcript.apply_history(&synthetic::history(40, 3));
+                    v.sync_list();
+                    v.list.set_follow_mode(FollowMode::Tail);
+                    v.list.scroll_to_end();
+                    let t = &mut v.model.transcript;
+                    t.apply(&SessionEvent::TurnStarted {
+                        turn_baseline: 40,
+                        trigger: "user".into(),
+                        user_text: Some("Run the tests.".into()),
+                    });
+                    t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                    t.apply(&SessionEvent::Stream {
+                        event: StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: "bench-run".into() }),
+                    });
+                    t.apply(&SessionEvent::Stream {
+                        event: StreamEvent::Llm(LlmEvent::ToolUse {
+                            tool_name: "bash".into(),
+                            tool_id: "bench-run".into(),
+                            input: json!({"command": "cargo test --workspace"}),
+                        }),
+                    });
+                    v.sync_list();
+                    v.list.scroll_to_end();
+                });
+                sleep(1.0).await;
+                let (t0, c0) = (Instant::now(), cpu_ns());
+                sleep(6.0).await;
+                out["beat"] = stats(cx, t0, Instant::now(), c0);
+                level(cx, crate::motion::Level::Off);
+                let _ = upd(cx, &|_, _| {});
+                sleep(0.5).await;
+                let (t0, c0) = (Instant::now(), cpu_ns());
+                sleep(4.0).await;
+                out["beat_motion_off"] = stats(cx, t0, Instant::now(), c0);
                 out["mem_end"] = mem::sample();
                 out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                 println!("{out}");

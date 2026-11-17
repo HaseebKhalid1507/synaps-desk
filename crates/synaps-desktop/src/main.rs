@@ -4,6 +4,7 @@
 //! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL|FILE] [--motion full|reduced|off]
 //! synaps-desktop --bench [--profile P --prompt TEXT] [--refresh-hz HZ]
 //! synaps-desktop --bench-tabs [--bench-history FILE] [--refresh-hz HZ]
+//! synaps-desktop --bench-motion [--refresh-hz HZ]
 //! ```
 //! `--bench` connects to a daemon only when `--profile` or `--socket` is
 //! given (never the default daemon), runs the synthetic scenarios, prints
@@ -80,6 +81,7 @@ fn main() {
     let mut bench = false;
     let mut diag_mode = false;
     let mut bench_tabs = false;
+    let mut bench_motion = false;
     let mut history_file: Option<PathBuf> = None;
     let mut prompt: Option<String> = None;
     let mut refresh_hz: Option<f64> = None;
@@ -113,6 +115,10 @@ fn main() {
                 bench = true;
                 bench_tabs = true;
             }
+            "--bench-motion" => {
+                bench = true;
+                bench_motion = true;
+            }
             "--bench-history" => history_file = Some(PathBuf::from(value(&mut args, "--bench-history"))),
             "--prompt" => prompt = Some(value(&mut args, "--prompt")),
             "--refresh-hz" => refresh_hz = value(&mut args, "--refresh-hz").parse().ok(),
@@ -144,7 +150,7 @@ fn main() {
             "-h" | "--help" => {
                 let names: Vec<&str> = palettes::THEMES.iter().map(|t| t.0).collect();
                 println!(
-                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL|FILE] [--motion full|reduced|off] [--bench [--prompt TEXT] [--refresh-hz HZ] | --bench-tabs [--bench-history FILE]]\n\
+                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL|FILE] [--motion full|reduced|off] [--bench [--prompt TEXT] [--refresh-hz HZ] | --bench-tabs [--bench-history FILE] | --bench-motion]\n\
                      theme: --theme, else ${}, else the picker's settings file ({}), else `theme =` in the Synaps config, else {}\n\
                      themes: {}\n\
                      accent (overrides the theme's \"you\" and focus colours): --accent, else ${}, else the settings file, else none",
@@ -310,6 +316,7 @@ fn main() {
                 diag: diag_mode,
                 tabs: bench_tabs,
                 history_file,
+                motion: bench_motion,
             };
             let _ = cx.windows().first().and_then(|w| w.update(cx, |_, window, cx| bench::start(&view, opts, window, cx)).ok());
         }
