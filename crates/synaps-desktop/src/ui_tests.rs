@@ -3482,6 +3482,17 @@ fn a_reload_neither_tears_nor_scans(cx: &mut TestAppContext) {
         quiet(cx, &view, &format!("reloading, {} ms", retry * n));
     }
     assert_eq!(rail(cx), before, "the rail 9 s into a reload");
+    // The words say so, at the connected words' width (NEEDS YOU, centred
+    // beside them, never moves), and the disc stays lit.
+    let need = |cx: &mut TestAppContext| {
+        let mut vcx = gpui_kit::VisualTestContext::from_window(w, cx);
+        vcx.debug_bounds("attention").map(|b| f32::from(b.origin.x))
+    };
+    let during = need(cx);
+    status(cx, &view, hello());
+    let after = need(cx);
+    assert!(during.is_some() && during == after, "NEEDS YOU through a reload: {during:?} vs connected {after:?}");
+    status(cx, &view, goodbye());
     status(cx, &view, hello());
     quiet(cx, &view, "back after 9 s");
     wait(cx, w, &view, 700);

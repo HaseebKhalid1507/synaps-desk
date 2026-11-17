@@ -344,7 +344,8 @@ impl AppView {
     fn conn_disc(&self, p: &Palette) -> Hsla {
         match &self.model.conn {
             ConnState::Connected(_) => p.ready_mark_ch,
-            _ if self.synthetic => p.ready_mark_ch,
+            // A reload within its grace is not a disconnect (re-gate 3).
+            _ if self.synthetic || self.model.reload => p.ready_mark_ch,
             ConnState::Connecting | ConnState::Reconnecting => p.rest_mark,
             _ => p.err_mark_ch,
         }
@@ -458,8 +459,8 @@ impl AppView {
             // handover, not a disconnect. The words say so and keep the
             // connected words' width (mono), so nothing beside them moves.
             _ if self.model.reload => {
-                let w = self.conn_held.get();
-                (format!("{:<w$}", dots("reloading")).into(), p.dim_ch)
+                let (w, words) = (self.conn_held.get(), dots("reloading"));
+                (format!("{:<w$}", words.as_ref() as &str).into(), p.dim_ch)
             }
             ConnState::Connecting => (dots("connecting"), p.dim_ch),
             ConnState::Reconnecting => (dots("reconnecting"), p.dim_ch),
@@ -500,6 +501,7 @@ impl AppView {
         let on = n > 0;
         let ticker = h_flex()
             .id("attention")
+            .debug_selector(|| "attention".into())
             .flex_none()
             .gap(px(12.))
             .items_center()
@@ -563,7 +565,12 @@ impl AppView {
                     .flex_none()
                     .gap(px(18.))
                     .items_center()
-                    .when(fit.conn > 0., |d| d.child(cut(mono(conn, size::META, conn_color), fit.conn).relative().top(px(self.conn_dy))))
+                    .when(fit.conn > 0., |d| {
+                        // Through a reload the cell keeps the connected words'
+                        // width: NEEDS YOU, centred between, never moves.
+                        let cell = cut(mono(conn, size::META, conn_color), fit.conn).relative().top(px(self.conn_dy));
+                        d.child(if self.model.reload { cell.w(px(fit.conn)) } else { cell })
+                    })
                     // The theme picker's own control: a swatch of the "you" colour.
                     .child(
                         h_flex()
