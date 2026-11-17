@@ -689,8 +689,9 @@ pub(crate) struct Card {
     /// lines` (an edit) or `lines 41–88` (a read; `of 664` when the file
     /// goes on).
     pub head: Option<(SharedString, Option<SharedString>)>,
-    /// A read's lines with the file's own numbers (R6): number, text.
-    pub numbered: Option<Arc<[(SharedString, SharedString)]>>,
+    /// A read's lines with the file's own numbers (R6): number, indent
+    /// ([`crate::files::hang`]), text.
+    pub numbered: Option<Arc<[(SharedString, u16, SharedString)]>>,
     /// A read well's end: the lines read it does not show (`… 32 more
     /// lines`; `… more lines` when how many is not known).
     pub more: Option<SharedString>,
@@ -802,7 +803,7 @@ impl Card {
             + self.more.as_ref().map_or(0, n)
             + self.path.as_ref().map_or(0, |(a, b)| n(a) + n(b))
             + self.head.as_ref().map_or(0, |(a, b)| n(a) + b.as_ref().map_or(0, n))
-            + self.numbered.as_ref().map_or(0, |l| l.iter().map(|(a, b)| n(a) + n(b) + 2 * std::mem::size_of::<SharedString>()).sum())
+            + self.numbered.as_ref().map_or(0, |l| l.iter().map(|(a, _, b)| n(a) + n(b) + 2 * std::mem::size_of::<SharedString>()).sum())
     }
 
     /// `arg`: the row's one-line argument ([`crate::app::row_cache`]);
@@ -839,12 +840,15 @@ impl Card {
             .map(|at| (SharedString::from(target[..=at].to_string()), SharedString::from(target[at + 1..].to_string())));
         let done = t.status == Some(ToolStatus::Done);
         let read = (t.name == "read").then(|| span(t, int("limit").filter(|l| *l > 0))).flatten();
-        let numbered: Option<Vec<(SharedString, SharedString)>> = read.map(|_| {
+        let numbered: Option<Vec<(SharedString, u16, SharedString)>> = read.map(|_| {
             t.result
                 .lines()
                 .filter_map(numbered_line)
                 .take(crate::app::RESULT_LINES)
-                .map(|(a, b)| (SharedString::from(a.to_string()), SharedString::from(b.to_string())))
+                .map(|(a, b)| {
+                    let (indent, rest) = crate::files::hang(b);
+                    (SharedString::from(a.to_string()), indent, SharedString::from(rest.to_string()))
+                })
                 .collect()
         });
         let facts = match t.name.as_str() {
@@ -870,7 +874,7 @@ impl Card {
             _ => None,
         };
         let more = read.and_then(|s| {
-            let shown = numbered.as_ref().and_then(|n| n.last()).and_then(|(n, _)| n.parse::<u64>().ok())?;
+            let shown = numbered.as_ref().and_then(|n| n.last()).and_then(|(n, _, _)| n.parse::<u64>().ok())?;
             match s.last {
                 Some(last) if last > shown => Some(SharedString::from(format!("… {} more lines", last - shown))),
                 Some(_) => None,
@@ -955,7 +959,7 @@ fn plus(n: usize) -> SharedString {
 }
 
 /// What a folded run's summary says: `› 7 tools  bash 3  read 3  grep 1 …`
-/// and its worst outcome's glyph, every string formatted once per change
+/// and its last outcome's glyph, every string formatted once per change
 /// of the run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RunSummary {
@@ -973,14 +977,15 @@ pub(crate) struct RunSummary {
     /// The committed counts of its file tools (the ledger's).
     pub delta: CallDelta,
     pub counts: Counts,
-    /// Its worst outcome's glyph ([`glyph::worst`]).
-    pub worst: (Glyph, Family),
+    /// Its last call's outcome's glyph (how the run ended: a failure fixed
+    /// later reads ✓, its `1 failed` in the meta).
+    pub last: (Glyph, Family),
     /// The whole tally, a tool a line (`bash 4`, `read 3`, …): the tooltip
     /// of one cut short, as narrow as its longest name.
     pub tip: SharedString,
-    /// Nothing when every call is done (the glyph alone); else each count
-    /// that is not zero, worst first as [`glyph::worst`] ranks them, so the
-    /// glyph sits by its own word: `1 failed`, `1 stopped`, `5 ok`.
+    /// Each count of what did not end ok, worst first (failed or denied >
+    /// stopped at the limit > cancelled): `1 failed`, `1 stopped`. Ok is
+    /// silent: nothing when every call is done.
     pub outcome: Vec<(SharedString, Family)>,
 }
 
@@ -989,8 +994,11 @@ impl RunSummary {
         let mut tally: Vec<Tally> = Vec::new();
         let (mut tools, mut ok, mut failed, mut denied, mut cancelled, mut stopped) = (0, 0, 0, 0, 0, 0);
         let mut delta = CallDelta::default();
+        let mut last = (Glyph::Ok, Family::Ok);
         for (it, row) in items.iter().zip(rows).filter(|(i, _)| i.kind == ItemKind::Tool) {
             tools += 1;
+            let (g, _, family) = glyph::call(status(it), false, false);
+            last = (g, family);
             match status(it) {
                 Some(ToolStatus::Done) => ok += 1,
                 Some(ToolStatus::Failed) => failed += 1,
@@ -1027,20 +1035,17 @@ impl RunSummary {
             t.n_text = t.n.to_string().into();
             t.name_chars = t.name.chars().count();
         }
-        let tip = tally.iter().map(|t| format!("{} {}", t.name, t.n)).collect::<Vec<_>>().join("\n").into();
+        // The tools' own names, never cut (an MCP tool's full name).
+        let tip = tally.iter().map(|t| format!("{} {}", t.key, t.n)).collect::<Vec<_>>().join("\n").into();
         let parts = [
             (failed, "failed", Family::Err),
             (denied, "denied", Family::Err),
             (stopped, "stopped", Family::Warn),
             (cancelled, "cancelled", Family::Warn),
-            (ok, "ok", Family::Ok),
         ];
-        let mut outcome: Vec<(SharedString, Family)> = Vec::new();
-        if ok < tools {
-            for (n, word, family) in parts.into_iter().filter(|p| p.0 > 0) {
-                outcome.push((format!("{n} {word}").into(), family));
-            }
-        }
+        // Ok is silent (C10, polish.md §2.2): only what did not end ok.
+        let outcome: Vec<(SharedString, Family)> =
+            parts.into_iter().filter(|p| p.0 > 0).map(|(n, word, family)| (format!("{n} {word}").into(), family)).collect();
         RunSummary {
             tools,
             label: format!("{tools} calls").into(),
@@ -1052,7 +1057,7 @@ impl RunSummary {
             stopped,
             delta,
             counts: Counts::of(delta),
-            worst: glyph::worst(failed + denied, stopped, cancelled),
+            last,
             tip,
             outcome,
         }
@@ -1060,7 +1065,7 @@ impl RunSummary {
 
     /// Its trail's width at `meta` px (mono), as [`AppView::render_summary`]
     /// lays it out: the counts, then (not `tight`) the words, `·` between,
-    /// every part 8 px apart, each text a whole pixel wide. Its worst
+    /// every part 8 px apart, each text a whole pixel wide. Its last
     /// outcome's glyph is in the gutter.
     pub(crate) fn trail_w(&self, meta: f32, tight: bool) -> f32 {
         let cw = 0.6 * meta;
@@ -1384,7 +1389,7 @@ pub(crate) struct Geo {
     pub verb_w: f32,
     /// Between the verb, the target, the meta and the fold.
     pub gap: f32,
-    /// The verb's x and the target's x in the column (a well's left edge).
+    /// The verb's x in the column (a well's left edge) and the target's.
     pub verb: f32,
     pub target: f32,
     /// The fold chevron's column, at the right end.
@@ -1455,11 +1460,11 @@ fn clock(fx: &Motion, started: Option<Instant>) -> Option<SharedString> {
 
 impl AppView {
     /// A run's summary row (polish.md §2.2): tool-row shaped, bare on the
-    /// canvas. Its worst outcome's glyph in the gutter, the stacked tally
-    /// bar beside it (the run's hues, folded), `ran`, `7 calls` and the
-    /// tally (names in their hues), then the counts and the words of what
-    /// did not end ok, worst first (`+3 −4 · 1 failed · 6 ok`; tight, the
-    /// counts alone), and the fold at the right end.
+    /// canvas. Its last call's outcome's glyph in the gutter (how it
+    /// ended), the stacked tally bar beside it (the run's hues, folded),
+    /// `ran`, `7 calls` and the tally (names in their hues), then the
+    /// counts and the words of what did not end ok, worst first (`+3 −4 ·
+    /// 1 failed`; tight, the counts alone), and the fold at the right end.
     fn render_summary(&self, d: Disp, open: bool, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
         let id = d.id;
         let Some(s) = self.summaries.get(id) else { return div().into_any_element() };
@@ -1511,7 +1516,7 @@ impl AppView {
                 .child(div().debug_selector(|| format!("tally {id} more")).flex_none().text_color(p.dim_t).child(plus(rest)))
                 .tooltip(tip);
         }
-        let (worst, family) = s.worst;
+        let (last, family) = s.last;
         let dot = || div().text_color(p.dim_t).child("·");
         let counts = s.counts.element(p);
         let mut trail = h_flex().flex_none().ml(px(geo.gap)).gap(px(8.)).items_center().text_px(m.meta).whitespace_nowrap();
@@ -1544,7 +1549,7 @@ impl AppView {
             .text_color(p.prose_t)
             .cursor_pointer()
             .hover(|d| d.bg(p.tool_out))
-            .child(glyph::lead(Some(glyph::draw(worst, glyph::ink(family, Ground::Run, p).1)), m))
+            .child(glyph::lead(Some(glyph::draw(last, glyph::ink(family, Ground::Run, p).1)), m))
             .child(div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.prose_t).child("ran"))
             .child(
                 h_flex().flex_1().min_w_0().gap(px(m.run_gap)).items_center().child(div().flex_none().child(s.label.clone())).child(tally),
@@ -1750,7 +1755,9 @@ impl AppView {
                     .text_color(p.sub_name_t)
                     .child(v.name.clone()),
             )
-            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.arg).child(task));
+            // The task quiet, the name in its hue (noir; nord's name and
+            // `arg` were one blue).
+            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.dim_t).child(task));
         // The state's word only when it is not going well (C10).
         let warn = matches!(family, Family::Err | Family::Warn);
         let tick = if running { &v.tick_bare } else { &None };
@@ -1761,7 +1768,7 @@ impl AppView {
             .items_center()
             .text_px(m.meta)
             .whitespace_nowrap()
-            .when(!v.facts_bare.is_empty(), |d| d.child(div().text_color(p.sub_time_t).child(crate::tray::ticked(fx, &v.facts_bare, tick))))
+            .when(!v.facts_bare.is_empty(), |d| d.child(div().text_color(p.dim_t).child(crate::tray::ticked(fx, &v.facts_bare, tick))))
             .when(warn && !lay.tight, |d| d.child(div().text_color(word_color).child(word)));
         let button = who.clone().map(|who| {
             let who2 = who.clone();
@@ -1887,17 +1894,18 @@ impl AppView {
 }
 
 /// An opened call's body (polish.md §2.3): a well under its row, from the
-/// target column to the column's end, on the `well` ground (`code`) in a 1 px
-/// `hair` frame. A header line (the path; an edit's `replaced 3 → 6
-/// lines`, a read's `lines 41–88`) when it has a path; an edit's lines with
-/// their signs and washes, a read's with the file's own numbers, any other
-/// output as it came (a failure's in `err_o`).
+/// verb column to the column's end (noir's), on the `well` ground (`code`)
+/// in a 1 px `hair_w` frame. A header line (the path; an edit's `replaced
+/// 3 → 6 lines`, a read's `lines 41–88`) when it has a path; an edit's
+/// lines with their signs and washes, a read's with the file's own numbers,
+/// any other output as it came (a failure's in `err_o`). A code line that
+/// wraps hangs at its own indent, never left of it.
 fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metrics) -> Div {
     let inset = (12. * m.r).round();
     let cw = m.mono * 0.6;
     let mut col = v_flex()
         .debug_selector(move || format!("well {id}"))
-        .ml(px(geo.target))
+        .ml(px(geo.verb))
         .mt(px((2. * m.r).round()))
         .mb(px((8. * m.r).round()))
         .bg(p.well)
@@ -1938,6 +1946,7 @@ fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metric
                         .items_start()
                         .when_some(bg, |d, bg| d.bg(bg))
                         .child(div().w(px(text_w(2, cw))).flex_none().text_color(sign_fg).child(sign))
+                        .child(div().w(px(text_w(l.indent as usize, cw))).flex_none())
                         // `SharedString` from the line's `Arc<str>`: no copy per frame.
                         .child(div().flex_1().min_w_0().text_color(fg).whitespace_normal().child(SharedString::from(&l.text))),
                 );
@@ -1946,14 +1955,14 @@ fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metric
         }
         (None, Some(numbered)) if !failed => {
             let mut lines = v_flex().py(px(pad));
-            for (n, text) in numbered.iter() {
+            for (n, indent, text) in numbered.iter() {
                 lines = lines.child(
                     h_flex()
                         .w_full()
                         .px(px(inset))
                         .items_start()
                         .child(div().w(px(text_w(5, cw))).flex_none().flex().justify_end().text_color(p.dim_o).child(n.clone()))
-                        .child(div().w(px(text_w(2, cw))).flex_none())
+                        .child(div().w(px(text_w(2 + *indent as usize, cw))).flex_none())
                         .child(div().flex_1().min_w_0().whitespace_normal().child(text.clone())),
                 );
             }
@@ -2505,13 +2514,13 @@ mod tests {
         assert_eq!([Hue::of("subagent_start"), Hue::of("subagent_resume"), Hue::of("subagent")], [Hue::Sub; 3]);
         assert_eq!(Hue::of("subagent_collect"), Hue::Gen);
         assert_eq!(s.label.as_ref(), "5 calls");
-        assert_eq!(outcome(&s), [("1 failed", Family::Err), ("4 ok", Family::Ok)], "worst first: by its glyph");
-        assert_eq!(s.worst, (Glyph::Failed, Family::Err));
+        assert_eq!(outcome(&s), [("1 failed", Family::Err)], "ok is silent");
+        assert_eq!(s.last, (Glyph::Ok, Family::Ok), "a1 failed, a4 (the last) did not");
         assert_eq!(s.tip.as_ref(), "bash 3\nread 2");
+        assert_eq!(s.trail_w(10., false), 48.);
         assert_eq!(s.tally.iter().map(|t| t.name_chars).collect::<Vec<_>>(), [4, 4]);
-        // The trail at 10 px (6 a character): `1 failed` 48, `·` 6, `4 ok`
-        // 24, 8 apart; tight, nothing (the glyph is in the gutter).
-        assert_eq!(s.trail_w(10., false), 48. + 6. + 24. + 2. * 8.);
+        // The trail at 10 px (6 a character): `1 failed` 48; tight,
+        // nothing (the glyph is in the gutter).
         assert_eq!(s.trail_w(10., true), 0.);
     }
 
@@ -2556,14 +2565,14 @@ mod tests {
         assert_eq!(tally_fit(two, 101., 7.2, 14.), 1, "both do not fit: `bash 4` and `+3`");
     }
 
-    /// The `Ok` glyph alone only when every call finished normally; else
-    /// its worst outcome's glyph and the counts. HALT mid-run cancels the
-    /// rest, and a denied call says denied.
+    /// The glyph says how the run ended (its last call); the words say
+    /// what did not end ok, worst first. HALT mid-run cancels the rest, and
+    /// a denied call says denied.
     #[test]
     fn a_summary_ticks_only_when_every_call_is_done() {
         let t = transcript(&turn(5, "a"));
         let s = RunSummary::of(&t.items()[1..6], &rows(&t, &Ledger::default())[1..6]);
-        assert_eq!((outcome(&s), s.worst), (vec![], (Glyph::Ok, Family::Ok)));
+        assert_eq!((outcome(&s), s.last), (vec![], (Glyph::Ok, Family::Ok)));
 
         // HALT after two calls: the other three end canceled.
         let mut m = turn(5, "a");
@@ -2579,8 +2588,8 @@ mod tests {
         let Kind::Summary { end, .. } = rows[1].kind else { unreachable!() };
         let s = RunSummary::of(&t.items()[1..end], &self::rows(&t, &Ledger::default())[1..end]);
         assert_eq!((s.ok, s.cancelled), (2, 3));
-        assert_eq!(outcome(&s), [("3 cancelled", Family::Warn), ("2 ok", Family::Ok)]);
-        assert_eq!(s.worst, (Glyph::Cancelled, Family::Warn));
+        assert_eq!(outcome(&s), [("3 cancelled", Family::Warn)]);
+        assert_eq!(s.last, (Glyph::Cancelled, Family::Warn));
 
         // A denied call, and one stopped at the output limit.
         let mut m = turn(4, "a");
@@ -2591,8 +2600,8 @@ mod tests {
         let t = transcript(&m);
         let s = RunSummary::of(&t.items()[1..5], &self::rows(&t, &Ledger::default())[1..5]);
         assert_eq!((s.ok, s.failed, s.denied, s.stopped), (2, 0, 1, 1));
-        assert_eq!(outcome(&s), [("1 denied", Family::Err), ("1 stopped", Family::Warn), ("2 ok", Family::Ok)]);
-        assert_eq!(s.worst, (Glyph::Failed, Family::Err), "denied is the worst: failed > limit > cancelled");
+        assert_eq!(outcome(&s), [("1 denied", Family::Err), ("1 stopped", Family::Warn)], "worst first");
+        assert_eq!(s.last, (Glyph::Ok, Family::Ok), "it ended ok: the denial and the limit are in the words");
     }
 
     /// The transcript's counts are the FILES panel's: in the live shot a
@@ -2634,7 +2643,7 @@ mod tests {
         assert_eq!((s.delta.added, s.delta.removed), ledger.totals(), "the summary is the panel's");
         assert_eq!(ledger.files().iter().map(|f| f.written).sum::<u32>(), s.delta.written);
         assert_eq!(s.counts, Counts { added: Some("+3".into()), removed: Some("−1".into()), written: Some("~3".into()) });
-        assert_eq!(outcome(&s), [("1 failed", Family::Err), ("4 ok", Family::Ok)]);
+        assert_eq!(outcome(&s), [("1 failed", Family::Err)]);
         // An estimate keeps its `~`, on the first count shown.
         assert_eq!(
             Counts::of(CallDelta { added: 2, removed: 5, approx: true, written: 0 }),

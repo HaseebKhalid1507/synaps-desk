@@ -667,20 +667,6 @@ pub(crate) fn call(st: Option<ToolStatus>, waiting: bool, seen: bool) -> (Glyph,
     }
 }
 
-/// A folded run's trail glyph: its worst outcome, failed (or denied) >
-/// stopped at the limit > cancelled > ok.
-pub(crate) fn worst(failed: usize, stopped: usize, cancelled: usize) -> (Glyph, Family) {
-    if failed > 0 {
-        (Glyph::Failed, Family::Err)
-    } else if stopped > 0 {
-        (Glyph::Limit, Family::Warn)
-    } else if cancelled > 0 {
-        (Glyph::Cancelled, Family::Warn)
-    } else {
-        (Glyph::Ok, Family::Ok)
-    }
-}
-
 /// A worker's state as motion keys it: a re-attach's demoted start
 /// (`demoted`, [`crate::subagents::View::demoted`]) is still running, so
 /// neither the reconnect's demote nor its lift on the next page plays a
@@ -741,7 +727,7 @@ pub(crate) fn tally_bar<'a, T>(tally: &'a [T], n: impl Fn(&T) -> usize + 'a, h: 
 
 #[cfg(test)]
 mod tests {
-    use super::{Family, GO, Glyph, Part, Sprites, call, svg_of, tally_bar, worker, worst};
+    use super::{Family, GO, Glyph, Part, Sprites, call, svg_of, tally_bar, worker};
     use crate::subagents::Liveness;
     use gpui_kit::AssetSource;
     use synaps_client::transcript::ToolStatus;
@@ -887,10 +873,6 @@ mod tests {
         assert_eq!(c(None, true, true), (Glyph::Needs, Some("waiting"), Family::Warn));
         assert_eq!(c(Some(S::Running), false, true), (Glyph::Idle, Some("last seen running"), Family::Rest));
         assert_eq!(c(Some(S::Streaming), false, false), (Glyph::Run, Some("running"), Family::Run));
-        assert_eq!(worst(1, 1, 1), (Glyph::Failed, Family::Err));
-        assert_eq!(worst(0, 1, 1), (Glyph::Limit, Family::Warn));
-        assert_eq!(worst(0, 0, 1), (Glyph::Cancelled, Family::Warn));
-        assert_eq!(worst(0, 0, 0), (Glyph::Ok, Family::Ok));
     }
 
     /// A worker's states: one glyph each (started and last seen share the
