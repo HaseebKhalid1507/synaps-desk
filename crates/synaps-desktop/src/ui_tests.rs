@@ -1422,7 +1422,18 @@ fn idle_requests_no_frames(cx: &mut TestAppContext) {
     // The switch's new numbers afterglow (motion.md §6.6, fluid.md §3.6):
     // three steps on a timer over `glow`.
     wait(cx, w, &view, crate::motion::GLOW.as_millis() as u64);
-    assert_eq!(motion_pending(cx, &view), (false, None), "settled: no frame, no timer");
+    only_the_rail_spins(cx, &view, "settled: no frame; a timer only for the rail's running sessions");
+}
+
+/// Nothing runs in the column, the composer or the tray: no display frame,
+/// and a timer only if the rail shows a running session (its braille spins,
+/// polish.md P1); every site the beat paints is in the rail.
+fn only_the_rail_spins(cx: &mut TestAppContext, view: &Entity<AppView>, what: &str) {
+    let (frame, timer) = motion_pending(cx, view);
+    assert!(!frame, "{what}: a display frame");
+    let (sites, rail) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width));
+    assert!(sites.iter().all(|s| matches!(s.beat, crate::motion::Beat::Spin(_)) && f32::from(s.origin.x) < rail), "{what}: {sites:?}");
+    assert!(timer.is_none() || !sites.is_empty(), "{what}: a timer with nothing on the layer");
 }
 
 /// A screen full of running things: no display frames for ambient, one
@@ -1782,7 +1793,7 @@ fn a_switch_replays_nothing(cx: &mut TestAppContext) {
     let t0 = mark(cx);
     open_idle_cpu(cx, &view, crate::tabs::Place::Current);
     check(cx, "a switch in the tab", t0);
-    assert_eq!(motion_pending(cx, &view), (false, None), "Idle CPU runs nothing: no frame, no timer");
+    only_the_rail_spins(cx, &view, "Idle CPU runs nothing");
     // And back.
     let t0 = mark(cx);
     view.update(cx, |v, cx| {
@@ -1921,6 +1932,8 @@ fn frames(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, u64) {
 fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (1440., 1800.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
+    // The beat alone (the sweep's 30 Hz: `a_sweep_ticks_only_while_drawn`).
+    view.update(cx, |v, _| v.fx.no_sweep.set(true));
     running_tools(cx, &view, 25);
     // The arrivals draw in and settle.
     for _ in 0..12 {
@@ -1928,7 +1941,7 @@ fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     }
     assert!(!motion_pending(cx, &view).0, "settled: no display frames");
     let sites = view.read_with(cx, |v, _| v.fx.sites());
-    let scans = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Scan(_))).count();
+    let scans = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count();
     assert!(scans >= 25, "the running glyphs on screen are the layer's: {scans}");
     let (f0, l0) = frames(cx, &view);
     let p0 = view.read_with(cx, |v, _| v.fx.painted.borrow().len());
@@ -2029,7 +2042,7 @@ fn running_without_a_clock(cx: &mut TestAppContext, w: AnyWindowHandle, view: &E
     for _ in 0..12 {
         beat(cx, w, view);
     }
-    let scans = view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Scan(_))).count());
+    let scans = view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count());
     assert!(scans >= n, "the running glyphs are the layer's: {scans}");
     assert!(view.read_with(cx, |v, _| v.tray.rows.is_empty()), "no worker: no clock");
 }
@@ -2092,27 +2105,51 @@ fn low_power_stops_the_beat_layer(cx: &mut TestAppContext) {
 
 /// Shady N6: the beat in the app's frame (`SYNAPS_DESKTOP_BEAT_IN_FRAME=1`,
 /// the measuring path, as before the layer): no sites; each beat is an app
-/// frame, and the running glyph's beam is drawn in it, one row down a beat.
+/// frame, and the running glyph's braille frame is drawn in it, the
+/// frame's own beat's (polish.md P1).
 #[gpui_kit::test]
-fn the_beat_in_the_frame_scans_without_the_layer(cx: &mut TestAppContext) {
+fn the_beat_in_the_frame_spins_without_the_layer(cx: &mut TestAppContext) {
     let (w, view, _events) = open_with(cx, (1440., 900.), crate::theme::Panels::default().text_size, false);
     running_without_a_clock_in_frame(cx, w, &view);
-    let beam = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("beam-row").expect("a beam row in the frame");
     let at = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.frame_beat());
-    let (f0, b0, k0) = (frames(cx, &view).0, beam(cx), at(cx));
+    let drawn = |cx: &mut TestAppContext, k: u32| {
+        let dots = crate::glyph::spin_dots(crate::glyph::Glyph::Run, Some(k));
+        VisualTestContext::from_window(w, cx).debug_bounds(format!("spin-{dots:02x}").leak()).is_some()
+    };
+    let (f0, k0) = (frames(cx, &view).0, at(cx));
+    assert!(drawn(cx, k0), "the frame of beat {k0} in the frame");
     assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::App), "the timer wakes the app");
     beat(cx, w, &view);
-    let (f1, b1, k1) = (frames(cx, &view).0, beam(cx), at(cx));
+    let (f1, k1) = (frames(cx, &view).0, at(cx));
     assert!(f1 > f0 && k1 > k0, "the beat is the app's frame");
     assert!(view.read_with(cx, |v, _| v.fx.sites().is_empty()), "nothing on the layer");
-    // The row of the frame's own beat (one down a beat, back to the top
-    // after 8; a slow runner's clock may have crossed two).
-    let dy = f32::from(b1.origin.y - b0.origin.y);
-    assert_eq!(dy, crate::glyph::scan_row(k1) - crate::glyph::scan_row(k0), "the beam on the frame's beat ({k0} → {k1})");
-    // Off: still, no beam.
+    assert!(drawn(cx, k1), "the frame of beat {k1}: the snake moved on");
+    // Off: still, the ⠹ frame.
     set_motion(cx, &view, crate::motion::Level::Off);
-    assert!(VisualTestContext::from_window(w, cx).debug_bounds("beam-row").is_none());
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds(format!("spin-{:02x}", crate::glyph::STILL).leak()).is_some());
     assert_eq!(motion_pending(cx, &view), (false, None));
+}
+
+/// P2: a sweep on screen (the composer's top edge while the turn runs)
+/// ticks the beat layer at 30 Hz, one timer; Reduced draws none, and the
+/// timer goes back to the beat or nothing.
+#[gpui_kit::test]
+fn a_sweep_ticks_only_while_drawn(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    running_tools(cx, &view, 1);
+    for _ in 0..12 {
+        beat(cx, w, &view);
+    }
+    let sweeps = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.sweep_count());
+    assert!(sweeps(cx) >= 1, "the turn runs: the composer sweeps");
+    let (frame, at) = motion_pending(cx, &view);
+    let ahead = view.read_with(cx, |v, _| at.map(|t| t.saturating_duration_since(v.fx.clock())));
+    assert!(!frame && ahead.is_some_and(|d| d <= crate::motion::DECAY_TICK), "the next 30 Hz tick: {ahead:?}");
+    assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::Beat), "the layer, not the app");
+    set_motion(cx, &view, crate::motion::Level::Reduced);
+    assert_eq!(sweeps(cx), 0, "Reduced: the edge is unlit");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("sweep").is_none());
 }
 
 /// [`running_without_a_clock`] without the layer: the sites stay empty.
@@ -2146,7 +2183,7 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
         settle(cx, w, 4);
         assert!(frames(cx, &view).0 > f0, "{what}: the app's view was not drawn");
     };
-    let sites = view.read_with(cx, |v, _| v.fx.sites().len());
+    let sites = view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count());
     // As the pump hands it over (Shady N3): `apply_batch` notifies, not the test.
     drew(cx, "an event", &mut |cx| {
         use synaps_client::protocol::{LlmEvent, StreamEvent};
@@ -2176,7 +2213,10 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
             );
         });
     });
-    assert_eq!(view.read_with(cx, |v, _| v.fx.sites().len()), sites + 1, "the new call's glyph is on the layer");
+    let spins = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count())
+    };
+    assert_eq!(spins(cx), sites + 1, "the new call's glyph is on the layer");
     let halt = VisualTestContext::from_window(w, cx).debug_bounds("halt").expect("HALT");
     drew(cx, "a hover", &mut |cx| {
         event(
@@ -3024,6 +3064,10 @@ fn a_settled_tab_takes_a_new_width_at_once(cx: &mut TestAppContext) {
     wait(&mut vcx, w, &view, 600);
     let end = widths(&mut vcx);
     assert_ne!(settled, end, "the widening changed the tabs' width");
+    // The tabs still drawn (a tab the narrower strip no longer shows keeps
+    // its last width until a frame without it: the rail's spinners now
+    // draw only the beat layer, not the app's frame).
+    let first: Vec<f32> = first.iter().copied().filter(|x| end.contains(x)).collect();
     assert_eq!(first, end, "the new width in the first frame: no spring");
 }
 

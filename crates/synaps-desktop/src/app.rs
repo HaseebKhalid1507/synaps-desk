@@ -182,10 +182,10 @@ pub(crate) type AttachSource = Box<dyn Fn(&str, u64) -> Vec<Event>>;
 /// TUI's `CONFIRM_ARM_DELAY` is 400 ms): it pushes the list up, so a click
 /// meant for a row can land on it. Its keys wait longer ([`Arm`]).
 pub(crate) const ARM: Duration = Duration::from_millis(500);
-/// How far toward the ink Handoff in's light is: the beam's
-/// ([`crate::glyph::BEAM`]), the one "your turn" signature as bright as
-/// the column's brightest light.
-pub(crate) const HANDOFF_LIT: f32 = crate::glyph::BEAM;
+/// How far toward the ink Handoff in's light is (motion.md §10 amendment
+/// 17: the old scan beam's, the column's brightest light); the settle
+/// pass is the same light (polish.md P3).
+pub(crate) const HANDOFF_LIT: f32 = 0.6;
 /// How long a rename asked for another session waits for its attach.
 pub(crate) const RENAME_WAIT: Duration = Duration::from_secs(10);
 /// The chord that answers a card yes ([`card_key`]), as its button shows it.
@@ -4318,6 +4318,8 @@ impl AppView {
         self.bars.transcript.release();
         self.list.scrollbar_drag_ended();
         self.hold_back.set(false);
+        // An unfold's hold was this list's rows.
+        self.unfold_hold.clear();
         self.texts.borrow_mut().clear();
     }
 
@@ -4498,21 +4500,26 @@ impl AppView {
         // They reveal from 0 px (Full), so the list is still at its end the
         // frame after: GPUI's tail-follow would resume there and carry the
         // header up as they grow. Paused until they have (fluid.md §3.3).
-        self.unfold_hold = if self.fx.fluid() { fresh } else { Vec::new() };
+        // A second unfold during a reveal adds its rows: the first run's
+        // still grow (Shady #16 r4).
+        if self.fx.fluid() {
+            self.unfold_hold.extend(fresh);
+        } else {
+            self.unfold_hold.clear();
+        }
     }
 
     /// An unfold's rows revealing ([`Self::unfold_hold`]): tail-follow
     /// stays paused, the clicked header where it was. Before the list's
     /// layout, each frame.
     fn hold_unfold(&mut self) {
-        if self.unfold_hold.is_empty() {
-            return;
-        }
-        if self.list.is_following_tail() {
-            self.list.pause_following_tail();
-        }
+        // Rows that have finished leave first: a hold with none left
+        // pauses nothing (Shady #16 r4).
         let fx = &self.fx;
         self.unfold_hold.retain(|&id| fx.revealing(id));
+        if !self.unfold_hold.is_empty() && self.list.is_following_tail() {
+            self.list.pause_following_tail();
+        }
     }
 
     /// What the daemon said of the session on screen, each part if known:
@@ -5459,6 +5466,7 @@ impl AppView {
             }
         };
         let (word_color, mark) = glyph::ink(family, Ground::User, p);
+        let turn_runs = watched.is_none() && g == Some(glyph::Glyph::Run);
         // Model · effort, or the worker's facts.
         let (model, effort): (Option<SharedString>, Option<SharedString>) = match watched {
             Some((_, f)) => ((!f.is_empty()).then_some(f), None),
@@ -5559,6 +5567,18 @@ impl AppView {
         // is, on at once, decaying into the bar over the last `glow` of its
         // travel: it lands as the bar, never switched off.
         let segment_color = crate::motion::mix(bar, crate::motion::mix(p.you, p.ink, HANDOFF_LIT), fx.handoff_light(handoff_in));
+        // The composer's top edge (polish.md P2, P3; F10): the shade sweep
+        // while this session's turn runs (the TUI's header sweep), then, as
+        // the turn ends, one last pass in Handoff's light from the same
+        // corner over the same `sig`: one L-shaped light, down the bar and
+        // across the top. Full only; Reduced and Off leave the edge unlit.
+        let top_edge = if turn_runs {
+            Some(crate::motion::sweep(fx, p.run_mark, p.edge))
+        } else if segment < 1. && crate::motion::Level::current(cx) == crate::motion::Level::Full {
+            Some(crate::motion::pass(segment, crate::motion::mix(p.you, p.ink, HANDOFF_LIT), p.edge))
+        } else {
+            None
+        };
         // A worker tab's glyph says whose; the primary may shorten.
         // Its text at `inset` (design.md §8.11): the kit pads a multi-line
         // field's text by its own `input_px` whatever its appearance, so the
@@ -5683,6 +5703,7 @@ impl AppView {
                 .child(
                     div().debug_selector(|| "composer-bar".into()).absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(2.)).bg(bar),
                 )
+                .children(top_edge.map(|e| div().absolute().left(px(-1.)).right(px(-1.)).top(px(-1.)).h(px(1.)).child(e)))
                 // Handoff in: a 24 px light travels down it.
                 .when(segment < 1., |d| {
                     d.child(
@@ -6165,7 +6186,10 @@ impl Render for AppView {
         // many the room leaves. A chip fading out keeps its slot until its
         // fade is over.
         let confirm = self.display_w(label::CONFIRM, fonts::size::D_S, window);
-        let (form, height, workers) = (lay.form(), self.height, self.tray.rows.len());
+        // The 3-line rule counts the chips fading out too: 5 workers going
+        // to 4 keep their lines until the fifth's fade is over, so no
+        // `+1 more` blinks in for it (Shady #16 r4).
+        let (form, height, workers) = (lay.form(), self.height, self.tray.rows.len() + self.tray.ghosts.len());
         self.tray_rows = if view.is_none() {
             self.fit_chips(lay.column, confirm, &m, |needed| crate::fit::chip_lines(&m, form, height, card_shown, ex, workers, needed))
         } else {

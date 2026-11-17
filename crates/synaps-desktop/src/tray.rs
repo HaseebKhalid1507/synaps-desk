@@ -388,7 +388,14 @@ impl AppView {
             })
             .collect();
         let watched = self.model.watch.focused().map(|w| w.subagent_id);
-        rows.sort_by_key(|r| need(r, watched));
+        // The watched one goes up only if it would be folded into `+N
+        // more`: a chip clicked where it is drawn stays under the pointer
+        // (Shady #16 r4).
+        rows.sort_by_key(|r| need(r, None));
+        let drawn = self.chips.drawn();
+        if watched.is_some_and(|w| rows.iter().position(|r| r.id == w).is_none_or(|i| i >= drawn)) {
+            rows.sort_by_key(|r| need(r, watched));
+        }
         // Rows that came while watched draw in (staggered); rows that left fade out.
         let session = self.model.active.as_ref().map(|a| a.session_id.clone());
         let mut ghosts = std::mem::take(&mut self.tray.ghosts);
@@ -685,7 +692,10 @@ impl AppView {
                 .border_color(p.hair_t)
                 .cursor_pointer()
                 .hover(|d| d.bg(p.tool_out))
-                .child(mono(format!("+{} more", chips.more), m.meta, p.dim_t))
+                // It rolls as workers come and go (polish.md P5).
+                .child(motion::roll_count(&self.fx, motion::ROLL_MORE, chips.more, format!("+{} more", chips.more).into(), |t| {
+                    mono(t, m.meta, p.dim_t)
+                }))
                 // Its menu open: the menu says it (no tooltip over it).
                 .when(self.wmenu.is_none(), |d| d.tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)))
                 .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| this.open_workers_menu(ev.position(), window, cx)));
@@ -825,7 +835,7 @@ impl AppView {
             .text_px(m.meta)
             .border_1()
             .border_color(f(p.hair_t))
-            .child(glyph::draw(g, f(mark)))
+            .child(glyph::draw_on(g, f(mark), p.canvas))
             .child(div().flex_none().text_color(f(p.sub_name_t)).child(SharedString::from(cut(&r.name, NAME_CHARS))))
             .child(div().flex_1().min_w_0().overflow_hidden().text_color(f(word_color)).child(SharedString::from(chip_step(r).to_string())))
             .child(glyph::bar(f(p.sub_rule)))

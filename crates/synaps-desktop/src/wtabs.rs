@@ -1087,7 +1087,7 @@ fn card(i: &Info, state: Liveness, started: Option<&str>, p: &Palette) -> Div {
             h_flex()
                 .h(px(18.))
                 .items_center()
-                .child(div().w(px(12.)).flex_none().flex().justify_center().child(glyph::draw(g, mark)))
+                .child(div().w(px(12.)).flex_none().flex().justify_center().child(glyph::draw_on(g, mark, p.card)))
                 .child(
                     h_flex()
                         .ml(px(8.))

@@ -799,6 +799,20 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out["load_5x5_30s"]["workers_running"] =
                     json!(view.update(cx, |v, _| v.model.stats.subagents.running_count()).unwrap_or(0));
                 out["load_5x5_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
+                out["load_5x5_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                // Q3 (polish.md §6 gate 4's other half): the same five busy
+                // sessions spinning in the rail, the one shown at rest: no
+                // sweep on screen, only the beat.
+                let _ = upd(cx, &|v, _| {
+                    v.model.set_local_session("bench-rest");
+                    v.sync_list();
+                });
+                sleep(2.0).await;
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                sleep(30.0).await;
+                out["load_5x5_nosweep_30s"] = stats(cx, t0, Instant::now(), c0, f0);
+                out["load_5x5_nosweep_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
+                out["load_5x5_nosweep_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
                 out["mem_end"] = mem::sample();
                 out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                 println!("{out}");

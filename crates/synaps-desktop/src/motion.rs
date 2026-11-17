@@ -139,6 +139,22 @@ pub(crate) const DECAY_TICK: Duration = Duration::from_nanos(33_333_333);
 pub(crate) const HEAD_HOLD: Duration = Duration::from_millis(160);
 /// The needs-you breath: 19 beats a cycle (2.4 s), 3 cycles, then held.
 pub(crate) const BREATH_BEATS: u32 = 19;
+/// The shade sweep's step (polish.md P2, the one new token): its comet's
+/// band, 12 px, moved one band per [`DECAY_TICK`].
+pub(crate) const SWEEP_STEP: f32 = 12.;
+/// The comet's four opaque bands, head first: the TUI's `█ ▓ ▒ ░` as
+/// `mix(ground, mark, level)`. Never a gradient.
+pub(crate) const SWEEP_LEVELS: [f32; 4] = [1., 0.66, 0.4, 0.2];
+/// A running `bash` row sweeps once it has run this long (quick commands
+/// don't flicker).
+pub(crate) const BASH_SWEEP_AFTER: Duration = Duration::from_secs(1);
+/// The write-on waits this long, then draws over [`BASE`] (polish.md P4).
+pub(crate) const WRITE_DELAY: Duration = Duration::from_millis(40);
+/// The star hop (polish.md P6): an impulse `v` px/s on a critically damped
+/// spring of `glide`'s ω: up 4 px at 48 ms, back by ~300 ms, never past rest.
+pub(crate) const HOP_V: f32 = 227.;
+/// A roll is over within this much of its line (well under half a pixel).
+const ROLL_EPSILON: f32 = 0.02;
 pub(crate) const BREATHS: u32 = 3;
 
 /// An exit's duration: ×0.75.
@@ -644,6 +660,8 @@ pub(crate) enum Tag {
     TabNeeds,
     /// A rail row needs you (its bar draws).
     RowNeeds,
+    /// A rail row's favourite (its star hops, polish.md P6).
+    Star,
 }
 
 impl Tag {
@@ -657,8 +675,11 @@ impl Tag {
 /// What a glyph does on the beat alone, painted by the beat layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Beat {
-    /// A running glyph's scan row ([`crate::glyph::scan`]).
-    Scan(crate::glyph::Glyph),
+    /// A braille glyph's frame (polish.md P1, [`crate::glyph::spin`]).
+    Spin(crate::glyph::Glyph),
+    /// The shade sweep along a 1 px edge this wide (polish.md P2,
+    /// [`sweep_bands`]): 30 Hz, not the beat.
+    Sweep(f32),
     /// `Needs` breathing since the prompt came ([`crate::glyph::breath`]).
     Breath(Instant),
 }
@@ -672,8 +693,6 @@ pub(crate) struct Site {
     pub(crate) mask: ContentMask<Pixels>,
     pub(crate) mark: Hsla,
     pub(crate) ground: Hsla,
-    /// The ink a scan's beam is lit toward ([`crate::glyph::beam`]).
-    pub(crate) ink: Hsla,
     pub(crate) beat: Beat,
 }
 
@@ -812,7 +831,7 @@ impl Sprung {
 /// the last frame: nothing grows with history).
 pub(crate) struct Motion {
     level: Cell<Level>,
-    /// The palette's ink, as of the frame ([`crate::glyph::beam`]).
+    /// The palette's ink, as of the frame (afterglows).
     ink: Cell<Hsla>,
     ambient: Cell<bool>,
     visible: Cell<bool>,
@@ -840,6 +859,10 @@ pub(crate) struct Motion {
     /// The control held down (or pressed from the keyboard): its key, and
     /// when it was let go ([`Motion::pressed`]).
     press: Cell<Option<(u64, Option<Instant>)>>,
+    /// Counts and lines as last drawn, rolling ([`Motion::roll`]).
+    rolls: RefCell<HashMap<u64, Rolling>>,
+    /// The count each rolling count last showed (its direction).
+    roll_n: RefCell<HashMap<u64, u64>>,
     /// Numbers as last drawn, for their afterglow ([`Motion::glow`]):
     /// the window's, so a switch's new values glow (fluid.md §3.6).
     glows: RefCell<HashMap<u64, Seen>>,
@@ -885,7 +908,159 @@ pub(crate) struct Motion {
     /// Tests: the beat each layer paint with sites drew, in order.
     #[cfg(test)]
     pub(crate) painted: RefCell<Vec<u32>>,
+    /// Tests of the beat alone: no sweep is drawn (its 30 Hz is P2's).
+    #[cfg(test)]
+    pub(crate) no_sweep: Cell<bool>,
 }
+
+/// A count or a line as last drawn ([`Motion::roll`]).
+#[derive(Clone, Debug)]
+struct Rolling {
+    value: SharedString,
+    prev: SharedString,
+    since: Option<Instant>,
+    up: bool,
+    frame: u64,
+}
+
+/// The star hop's offset `t` s after the impulse (polish.md P6):
+/// `−v·t·e^(−ωt)`, ω = 2π / `glide`.
+pub(crate) fn hop_at(t: f32) -> f32 {
+    let w = std::f32::consts::TAU / GLIDE_RESPONSE;
+    -HOP_V * t * (-w * t).exp()
+}
+
+/// The shade sweep's comet at `tick` along a `w` px edge (polish.md P2):
+/// four bands of [`SWEEP_STEP`], head first, stepping one band a tick left
+/// to right and re-entering from the left (a lap is the edge and the
+/// comet: 672 px in 60 ticks, 2.0 s). Each band clipped to the edge: x,
+/// width, level.
+pub(crate) fn sweep_bands(w: f32, tick: u64) -> impl Iterator<Item = (f32, f32, f32)> {
+    let steps = ((w + SWEEP_STEP * 4.) / SWEEP_STEP).ceil().max(1.) as u64;
+    let head = ((tick % steps) + 1) as f32 * SWEEP_STEP;
+    band_at(w, head, |i| SWEEP_LEVELS[i])
+}
+
+/// The comet with its head's right edge at `head` px along a `w` px edge:
+/// its bands clipped to it, each at `level(i)`.
+pub(crate) fn band_at(w: f32, head: f32, level: impl Fn(usize) -> f32) -> impl Iterator<Item = (f32, f32, f32)> {
+    (0..SWEEP_LEVELS.len()).filter_map(move |i| {
+        let right = (head - SWEEP_STEP * i as f32).min(w);
+        let left = (head - SWEEP_STEP * (i + 1) as f32).max(0.);
+        (right > left).then(|| (left, right - left, level(i)))
+    })
+}
+
+/// The shade sweep (polish.md P2) along the bottom of its parent (a 1 px
+/// line, absolute: the parent is `relative`), in `mark` on `ground`: on
+/// the beat layer at Full (its site recorded), drawn in the app's frame
+/// without one; unlit under Reduced, Off and low power.
+pub(crate) fn sweep(fx: &Rc<Motion>, mark: Hsla, ground: Hsla) -> AnyElement {
+    #[cfg(test)]
+    if fx.no_sweep.get() {
+        return div().into_any_element();
+    }
+    if !fx.ambient() {
+        return div().into_any_element();
+    }
+    let fx = fx.clone();
+    let tick = if fx.layered() { None } else { fx.sweep_tick() };
+    let line = canvas(
+        |_, _, _| {},
+        move |b, _, window, _| {
+            let w = f32::from(b.size.width);
+            match tick {
+                None => fx.site(Site { origin: b.origin, mask: window.content_mask(), mark, ground, beat: Beat::Sweep(w) }),
+                Some(t) => {
+                    for (x, bw, level) in sweep_bands(w, t) {
+                        window
+                            .paint_quad(fill(Bounds::new(b.origin + point(px(x), px(0.)), size(px(bw), px(1.))), mix(ground, mark, level)));
+                    }
+                }
+            }
+        },
+    )
+    .size_full();
+    div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "sweep".into()).child(line).into_any_element()
+}
+
+/// The settle pass (polish.md P3): the composer sweep's one last pass, its
+/// head at `p` (0..1) of the edge and the comet, in `mark` on `ground`;
+/// the app's frame draws it (Handoff in's own frames).
+pub(crate) fn pass(p: f32, mark: Hsla, ground: Hsla) -> AnyElement {
+    let line = canvas(
+        |_, _, _| {},
+        move |b, _, window, _| {
+            let w = f32::from(b.size.width);
+            for (x, bw, level) in band_at(w, p * (w + SWEEP_STEP * 4.), |i| SWEEP_LEVELS[i]) {
+                window.paint_quad(fill(Bounds::new(b.origin + point(px(x), px(0.)), size(px(bw), px(1.))), mix(ground, mark, level)));
+            }
+        },
+    )
+    .size_full();
+    div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "settle-pass".into()).child(line).into_any_element()
+}
+
+/// A rolling text (polish.md P5): `make(text)` as it is at rest; while
+/// it rolls, inside one clipped line box, the new one coming in and the
+/// one it left going out, a line apart.
+/// `grow`: the line takes its row's rest (a live line), else its own width.
+pub(crate) fn rolled(fx: &Motion, key: u64, text: SharedString, up: bool, grow: bool, make: impl Fn(SharedString) -> Div) -> AnyElement {
+    let Some((old, x, up)) = fx.roll(key, &text, up) else { return make(text).into_any_element() };
+    // A line's travel: fractions of the line box (the new text's own).
+    let dir = if up { 1. } else { -1. };
+    // A count: only its changed cells roll (`12` → `13`: the `3`).
+    if let Some(cells) = changed_cells(&old, &text).filter(|_| !grow) {
+        let mut row = make(SharedString::default()).flex().flex_row().flex_none();
+        let mut run = String::new();
+        for (o, n, changed) in cells {
+            if !changed {
+                run.push(n);
+                continue;
+            }
+            if !run.is_empty() {
+                row = row.child(SharedString::from(std::mem::take(&mut run)));
+            }
+            let cell = div()
+                .relative()
+                .top(relative(dir * x))
+                .child(n.to_string())
+                .child(div().absolute().left_0().top(relative(-dir)).child(o.to_string()));
+            row = row.child(ClipY(div().flex_none().debug_selector(move || format!("rolling-{key:x}")).child(cell).into_any_element()));
+        }
+        if !run.is_empty() {
+            row = row.child(SharedString::from(run));
+        }
+        return row.into_any_element();
+    }
+    let inner = make(text).relative().top(relative(dir * x)).child(make(old).absolute().left_0().right_0().top(relative(-dir)));
+    let line = if grow { div().flex_1().min_w_0() } else { div().flex_none() };
+    ClipY(line.debug_selector(move || format!("rolling-{key:x}")).child(inner).into_any_element()).into_any_element()
+}
+
+/// A count's cells (`old` → `new`, one character each, the same number of
+/// them): each new one, what it was, and whether it changed. Other lengths
+/// (`9` → `10`) roll whole.
+pub(crate) fn changed_cells(old: &str, new: &str) -> Option<Vec<(char, char, bool)>> {
+    (old.chars().count() == new.chars().count()).then(|| old.chars().zip(new.chars()).map(|(o, n)| (o, n, o != n)).collect())
+}
+
+/// [`rolled`] for a count: up when it grew.
+pub(crate) fn roll_count(fx: &Motion, key: u64, n: usize, text: SharedString, make: impl Fn(SharedString) -> Div) -> AnyElement {
+    let up = fx.roll_was(key).is_none_or(|was| n as u64 >= was);
+    fx.roll_saw(key, n as u64);
+    rolled(fx, key, text, up, false, make)
+}
+
+/// What rolls (polish.md P5), each in its own key space: a worker's tool
+/// count and live line, a run's `N calls`, `+N more`, the NEEDS YOU count,
+/// the rail's chips. Never a clock, cost, tokens or a %.
+pub(crate) const ROLL_TOOLS: u64 = 0x7AD0 << 48;
+pub(crate) const ROLL_STEP: u64 = 0x7AD1 << 48;
+pub(crate) const ROLL_CALLS: u64 = 0x7AD2 << 48;
+pub(crate) const ROLL_MORE: u64 = 0x7AD3 << 48;
+pub(crate) const ROLL_NEEDS: u64 = 0x7AD4 << 48;
+pub(crate) const ROLL_RAIL: u64 = 0x7AD5 << 48;
 
 impl Default for Motion {
     fn default() -> Self {
@@ -930,6 +1105,8 @@ impl Motion {
             pane_wants: Cell::new(false),
             press: Cell::new(None),
             glows: RefCell::default(),
+            rolls: RefCell::default(),
+            roll_n: RefCell::default(),
             grows: RefCell::default(),
             quiet: RefCell::default(),
             timer: RefCell::default(),
@@ -951,6 +1128,8 @@ impl Motion {
             force_low_power: Cell::new(false),
             #[cfg(test)]
             painted: RefCell::default(),
+            #[cfg(test)]
+            no_sweep: Cell::new(false),
         }
     }
 
@@ -974,6 +1153,7 @@ impl Motion {
             self.seen.borrow_mut().retain(|k, _| !k.0.column());
         }
         self.turns.borrow_mut().clear();
+        self.rolls.borrow_mut().clear();
         self.grows.borrow_mut().clear();
         self.quiet.borrow_mut().clear();
         self.births.borrow_mut().clear();
@@ -1119,13 +1299,9 @@ impl Motion {
         self.level.get()
     }
 
-    /// The palette's ink, set as a frame begins (a scan's beam).
+    /// The palette's ink, set as a frame begins (afterglows).
     pub(crate) fn set_ink(&self, ink: Hsla) {
         self.ink.set(ink);
-    }
-
-    pub(crate) fn ink(&self) -> Hsla {
-        self.ink.get()
     }
 
     /// Motion is on at all (not [`Level::Off`]).
@@ -1218,6 +1394,11 @@ impl Motion {
         self.springs.borrow_mut().retain(|_, s| alive(s.frame));
         self.hovers.borrow_mut().retain(|_, h| alive(h.1));
         self.glows.borrow_mut().retain(|_, s| alive(s.frame));
+        self.rolls.borrow_mut().retain(|_, r| alive(r.frame));
+        {
+            let rolls = self.rolls.borrow();
+            self.roll_n.borrow_mut().retain(|k, _| rolls.contains_key(k));
+        }
         self.grows.borrow_mut().retain(|_, g| alive(g.frame));
         let cut = BASE + STAGGER_CAP + SIG;
         self.births.borrow_mut().retain(|_, at| now.saturating_duration_since(*at) < cut);
@@ -1263,6 +1444,11 @@ impl Motion {
     /// Glyphs the beat layer paints (the bench).
     pub(crate) fn site_count(&self) -> usize {
         self.sites.borrow().len()
+    }
+
+    /// Sweeps the beat layer paints (the bench).
+    pub(crate) fn sweep_count(&self) -> usize {
+        self.sites.borrow().iter().filter(|s| matches!(s.beat, Beat::Sweep(_))).count()
     }
 
     fn disarm(&self) {
@@ -1386,9 +1572,88 @@ impl Motion {
         self.shot(since, delay, dur, &ease::OUT, Kind::Spatial)
     }
 
-    /// `write_on`: a glyph's drawn fraction (its strokes cut at it).
+    /// `write_on`: a glyph's drawn fraction (its strokes cut at it):
+    /// [`WRITE_DELAY`], then [`BASE`] (polish.md P4: the stroke is seen;
+    /// the cross's two strokes 100 ms each).
     pub(crate) fn write_on(&self, since: Option<Instant>) -> f32 {
-        self.shot(since, Duration::ZERO, QUICK, &ease::OUT, Kind::Spatial)
+        self.shot(since, WRITE_DELAY, BASE, &ease::OUT, Kind::Spatial)
+    }
+
+    /// The 30 Hz tick a sweep is on (polish.md P2), its next asked for; `None`
+    /// when ambient is off (Reduced, Off, low power): the edge stays unlit.
+    pub(crate) fn sweep_tick(&self) -> Option<u64> {
+        if !self.ambient.get() {
+            return None;
+        }
+        self.want_tick();
+        Some((self.now().saturating_duration_since(self.epoch).as_nanos() / DECAY_TICK.as_nanos()) as u64)
+    }
+
+    /// Ambient runs this frame (Full, not low power): spinners spin, sweeps sweep.
+    pub(crate) fn ambient(&self) -> bool {
+        self.ambient.get()
+    }
+
+    /// The star hop's offset (polish.md P6), `since` the favouriting: `−v·t·e^(−ωt)`
+    /// on `glide`'s ω, never above 0 (critically damped: it rises and comes
+    /// back, no overshoot), 0 once settled. Full only.
+    pub(crate) fn hop(&self, since: Option<Instant>) -> f32 {
+        let Some(since) = since.filter(|_| self.level.get() == Level::Full) else { return 0. };
+        let t = self.now().saturating_duration_since(since).as_secs_f32();
+        let y = hop_at(t);
+        if t > 0.05 && y.abs() < 0.05 {
+            return 0.;
+        }
+        self.want_frame();
+        y
+    }
+
+    /// The sparks' progress along their 8 px (polish.md P6) on `glide`: 0 → 1;
+    /// `None` once there (or not Full).
+    pub(crate) fn sparks(&self, since: Option<Instant>) -> Option<f32> {
+        let since = since.filter(|_| self.level.get() == Level::Full)?;
+        let t = self.now().saturating_duration_since(since).as_secs_f32();
+        let x = 1. - Spring::from_rest(1., GLIDE_RESPONSE, t);
+        if x > 0.98 {
+            return None;
+        }
+        self.want_frame();
+        Some(x)
+    }
+
+    /// The count `key` showed last ([`roll_count`]).
+    pub(crate) fn roll_was(&self, key: u64) -> Option<u64> {
+        self.roll_n.borrow().get(&key).copied()
+    }
+
+    pub(crate) fn roll_saw(&self, key: u64, n: u64) {
+        self.roll_n.borrow_mut().insert(key, n);
+    }
+
+    /// `text` of `key` this frame (polish.md P5), rolling if it changed while
+    /// drawn at Full: the text it left, how far it still travels (1 → 0 of
+    /// its line, on `snap`: no overshoot) and which way (`up`: the new one
+    /// comes in from below). First drawn, not drawn last frame (history, a
+    /// switch), Reduced or Off: at rest.
+    pub(crate) fn roll(&self, key: u64, text: &SharedString, up: bool) -> Option<(SharedString, f32, bool)> {
+        let (frame, now) = (self.frame.get(), self.now());
+        let mut rolls = self.rolls.borrow_mut();
+        let r = rolls.entry(key).or_insert_with(|| Rolling { value: text.clone(), prev: text.clone(), since: None, up, frame });
+        if r.value != *text {
+            let watched = r.frame + 1 >= frame && self.level.get() == Level::Full;
+            r.prev = std::mem::replace(&mut r.value, text.clone());
+            r.since = watched.then_some(now);
+            r.up = up;
+        }
+        r.frame = frame;
+        let since = r.since?;
+        let x = Spring::from_rest(1., SNAP_RESPONSE, now.saturating_duration_since(since).as_secs_f32());
+        if x < ROLL_EPSILON {
+            r.since = None;
+            return None;
+        }
+        self.want_frame();
+        Some((r.prev.clone(), x, r.up))
     }
 
     /// `decay`: light switched on at `since` going off: 1 (lit) → 0, held
@@ -1839,7 +2104,8 @@ impl Motion {
         }
         let since = self.tick().saturating_duration_since(self.epoch);
         let beat = (since.as_nanos() / BEAT.as_nanos()) as u32;
-        let mut wants = false;
+        let tick = (since.as_nanos() / DECAY_TICK.as_nanos()) as u64;
+        let (mut wants, mut every, mut sweeps) = (false, 2, false);
         for s in self.sites.borrow().iter() {
             let quad = |x: f32, y: f32, w: f32, h: f32, c: Hsla, window: &mut Window| {
                 window.with_content_mask(Some(s.mask), |window| {
@@ -1847,10 +2113,17 @@ impl Motion {
                 });
             };
             match s.beat {
-                Beat::Scan(g) => {
+                Beat::Spin(g) => {
                     wants = true;
-                    for (x, y, w, c) in crate::glyph::beam_rows(g, beat, s.mark, s.ink) {
-                        quad(x, y, w, 1., c, window);
+                    every = every.min(g.spin_every());
+                    window.with_content_mask(Some(s.mask), |window| {
+                        crate::glyph::paint_dots(window, s.origin, crate::glyph::spin_dots(g, Some(beat)), s.mark, s.ground);
+                    });
+                }
+                Beat::Sweep(w) => {
+                    sweeps = true;
+                    for (x, bw, level) in sweep_bands(w, tick) {
+                        quad(x, 0., bw, 1., mix(s.ground, s.mark, level), window);
                     }
                 }
                 Beat::Breath(at) => {
@@ -1866,7 +2139,13 @@ impl Motion {
         if wants {
             #[cfg(test)]
             self.painted.borrow_mut().push(beat);
-            self.beat_next.set(Some(self.epoch + BEAT * (beat + 1)));
+            self.beat_next.set(Some(self.epoch + BEAT * ((beat / every + 1) * every)));
+        }
+        if sweeps {
+            // 30 Hz while a sweep is on screen (polish.md P2), on the
+            // shared grid; the beat's own frames are on it too.
+            let next = self.epoch + Duration::from_nanos((DECAY_TICK.as_nanos() * (tick as u128 + 1)) as u64);
+            self.beat_next.set(Some(self.beat_next.get().map_or(next, |b| b.min(next))));
         }
         if !self.display.get() {
             self.arm(cx, app, layer);
@@ -1946,11 +2225,11 @@ mod tests {
     // Not `super::*`: that brings in gpui's `test` attribute through `gpui_kit::*`.
     use std::time::{Duration, Instant};
 
-    use gpui_kit::{Bounds, point, px, size};
+    use gpui_kit::{Bounds, Hsla, SharedString, point, px, size};
 
     use super::{
-        BASE, BEAT, GLOW, HEAD_HOLD, Kind, LINK_GRACE, Level, Link, Lock, Motion, QUICK, RELOAD_GRACE, SLIDE_CAP, SLOW, STAGGER,
-        STAGGER_CAP, Setting, Slide, Tag, Tween, ease, exit, stagger,
+        BASE, BEAT, DECAY_TICK, GLOW, HEAD_HOLD, Kind, LINK_GRACE, Level, Link, Lock, Motion, QUICK, RELOAD_GRACE, SLIDE_CAP, SLOW,
+        STAGGER, STAGGER_CAP, SWEEP_LEVELS, Setting, Slide, Tag, Tween, ease, exit, hop_at, mix, stagger, sweep_bands,
     };
 
     fn ms(n: u64) -> Duration {
@@ -2230,7 +2509,8 @@ mod tests {
         let fresh = m.beat(1);
         assert_eq!(old, Some(2));
         assert_eq!(fresh, old, "a row built after the wall clock crossed the beat scans with the rest");
-        assert_eq!(crate::glyph::scan_row(old.unwrap()), crate::glyph::scan_row(fresh.unwrap()));
+        let run = crate::glyph::Glyph::Run;
+        assert_eq!(crate::glyph::spin_dots(run, old), crate::glyph::spin_dots(run, fresh));
         // The next frame: the next beat, for both.
         m.begin_frame(Level::Full, false, t0 + ms(6));
         assert_eq!((m.beat(1), m.beat(1)), (Some(3), Some(3)));
@@ -2294,37 +2574,121 @@ mod tests {
         assert!(worst < 0.06, "the drain moved a contrast by {worst:.3}");
     }
 
-    /// The `roles_check` step for the soul (amendments 14, 15): the scan's
-    /// beam and its afterglow are a running glyph's light, so they hold
-    /// the mark floor (3:1) on every ground a running glyph is drawn on,
-    /// in every theme and accent. (Tool rows have no bar since Q1 cards:
-    /// their state is the gutter glyph.)
+    /// Floors (polish.md gate 7): the sweep's head is its mark (level 1.0),
+    /// so it holds 3:1 on its edge's ground in every theme and accent: the
+    /// composer's `run_mark` on `user`, a bash row's lit hue on the canvas,
+    /// a worker's `sub_rule` on the canvas; and the settle pass's light
+    /// (Handoff's) on `user`.
     #[test]
-    fn the_beam_and_the_head_keep_the_mark_floor() {
-        use crate::glyph::{BEAM, GLOW};
+    fn the_sweep_head_keeps_the_mark_floor() {
         use crate::theme::{contrast, mix, resolve};
         let mut low = f64::MAX;
         for (name, raw) in crate::palettes::THEMES {
             for accent in [None, Some(0xe8132f), Some(0xf4b400), Some(0x2d7bff), Some(0x35f2ff)] {
                 let r = resolve(&raw, accent).0;
-                let marks = [
-                    (r.run_mark, vec![r.canvas, r.tool, r.tool_out, r.user], "run_mark"),
-                    (r.run_mark_ch, vec![r.chrome], "run_mark_ch"),
-                    (r.run_mark_k, vec![r.card, r.card_hi], "run_mark_k"),
+                let heads = [
+                    (r.run_mark, r.user, "composer run_mark"),
+                    (mix(r.t_bash, r.ink, 0.30), r.canvas, "bash lit hue"),
+                    (r.sub_rule, r.canvas, "sub_rule"),
+                    (mix(r.you, r.ink, f64::from(crate::app::HANDOFF_LIT)), r.user, "settle pass"),
                 ];
-                for (mark, grounds, what) in marks {
-                    for k in [BEAM, GLOW] {
-                        let c = mix(mark, r.ink, f64::from(k));
-                        for g in &grounds {
-                            let x = contrast(c, *g);
-                            low = low.min(x);
-                            assert!(x >= 3., "{name} {accent:?}: {what}'s beam at {k}: {x:.2}");
-                        }
-                    }
+                for (c, g, what) in heads {
+                    let x = contrast(c, g);
+                    low = low.min(x);
+                    assert!(x >= 3., "{name} {accent:?}: {what}: {x:.2}");
                 }
+                assert_eq!(SWEEP_LEVELS[0], 1., "the head is the mark");
             }
         }
         assert!(low >= 3., "{low}");
+    }
+
+    /// P2: the comet is four opaque steps (no alpha, no gradient: four
+    /// levels, each a solid band), stepping 12 px a tick, a 2.0 s lap on a
+    /// 672 px column; clipped to its edge.
+    #[test]
+    fn sweep_is_four_opaque_steps() {
+        assert_eq!(SWEEP_LEVELS, [1., 0.66, 0.4, 0.2]);
+        let g = Hsla { h: 0.6, s: 0.3, l: 0.2, a: 1. };
+        let m = Hsla { h: 0.3, s: 0.8, l: 0.6, a: 1. };
+        for l in SWEEP_LEVELS {
+            assert_eq!(mix(g, m, l).a, 1., "opaque");
+        }
+        let bands: Vec<_> = sweep_bands(672., 10).collect();
+        assert_eq!(bands, vec![(120., 12., 1.), (108., 12., 0.66), (96., 12., 0.4), (84., 12., 0.2)]);
+        assert_eq!(sweep_bands(672., 0).collect::<Vec<_>>(), vec![(0., 12., 1.)], "the head enters first");
+        let lap = (0..200u64).find(|&t| t > 0 && sweep_bands(672., t).next() == sweep_bands(672., 0).next()).unwrap();
+        assert_eq!(lap, 60, "60 ticks of 33 ms: a 2.0 s lap");
+        assert!((lap as f32 * DECAY_TICK.as_secs_f32() - 2.0).abs() < 0.01);
+        for t in 0..60 {
+            for (x, w, _) in sweep_bands(100., t) {
+                assert!(x >= 0. && x + w <= 100. && w > 0., "clipped to the edge");
+            }
+        }
+    }
+
+    /// P6: the hop rises 4 px at 48 ms and comes back with no overshoot.
+    #[test]
+    fn star_hop_never_passes_rest() {
+        let peak = (0..400).map(|ms| hop_at(ms as f32 / 1000.)).fold(0f32, f32::min);
+        assert!((peak + 4.).abs() < 0.1, "{peak}");
+        let at = (0..400).min_by(|a, b| hop_at(*a as f32 / 1000.).total_cmp(&hop_at(*b as f32 / 1000.))).unwrap();
+        assert!((47..=49).contains(&at), "{at} ms");
+        for ms in 0..2000 {
+            assert!(hop_at(ms as f32 / 1000.) <= 0., "never below rest");
+        }
+        assert!(hop_at(0.35).abs() < 0.1, "back by ~300 ms");
+    }
+
+    /// P5: a roll ends on its value, only while watched at Full; Reduced
+    /// and Off are instant; first drawn (history) never rolls.
+    #[test]
+    fn roll_ends_on_value() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        let (a, b): (SharedString, SharedString) = ("3".into(), "4".into());
+        m.begin_frame(Level::Full, false, t0);
+        assert!(m.roll(1, &a, true).is_none(), "first drawn: at rest");
+        m.begin_frame(Level::Full, false, t0 + ms(16));
+        let (old, x, up) = m.roll(1, &b, true).expect("it rolls");
+        assert_eq!((old.as_ref(), x, up), ("3", 1., true));
+        m.begin_frame(Level::Full, false, t0 + ms(116));
+        let x2 = m.roll(1, &b, true).unwrap().1;
+        assert!(x2 < 1. && x2 > 0.);
+        m.begin_frame(Level::Full, false, t0 + ms(900));
+        assert!(m.roll(1, &b, true).is_none(), "over: the value, exact");
+        for level in [Level::Reduced, Level::Off] {
+            m.begin_frame(level, false, t0 + ms(1000));
+            assert!(m.roll(1, &a, false).is_none(), "{level:?}: instant");
+        }
+    }
+
+    /// P5: only the changed digit cells of a count roll; a count that
+    /// changes length rolls whole.
+    #[test]
+    fn roll_changed_digits_only() {
+        let changed = |a: &str, b: &str| super::changed_cells(a, b).map(|c| c.iter().filter(|x| x.2).count());
+        assert_eq!(changed("12", "13"), Some(1));
+        assert_eq!(changed("+3 more", "+4 more"), Some(1));
+        assert_eq!(changed("19 calls", "20 calls"), Some(2));
+        assert_eq!(changed("9", "10"), None, "whole");
+        assert_eq!(super::changed_cells("7", "7").unwrap(), vec![('7', '7', false)]);
+    }
+
+    /// P4: a write-on waits 40 ms, then draws over `base`.
+    #[test]
+    fn write_on_is_base_after_a_delay() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Full, false, t0 + ms(30));
+        assert_eq!(m.write_on(Some(t0)), 0.);
+        m.begin_frame(Level::Full, false, t0 + ms(140));
+        let p = m.write_on(Some(t0));
+        assert!(p > 0. && p < 1.);
+        m.begin_frame(Level::Full, false, t0 + ms(240));
+        assert_eq!(m.write_on(Some(t0)), 1.);
+        m.begin_frame(Level::Reduced, false, t0 + ms(10));
+        assert_eq!(m.write_on(Some(t0)), 1., "Reduced: at once");
     }
 
     #[test]

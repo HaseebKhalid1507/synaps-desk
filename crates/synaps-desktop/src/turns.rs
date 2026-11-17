@@ -1595,10 +1595,19 @@ impl AppView {
             .text_color(p.prose_t)
             .cursor_pointer()
             .hover(|d| d.bg(p.tool_out))
-            .child(glyph::lead(Some(glyph::draw(last, glyph::ink(family, Ground::Run, p).1)), m))
+            .child(glyph::lead(Some(glyph::spinning(fx, last, glyph::ink(family, Ground::Run, p).1, p.canvas)), m))
             .child(div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.prose_t).child("ran"))
             .child(
-                h_flex().flex_1().min_w_0().gap(px(m.run_gap)).items_center().child(div().flex_none().child(s.label.clone())).child(tally),
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(m.run_gap))
+                    .items_center()
+                    // `N calls` rolls while the run grows (polish.md P5).
+                    .child(motion::roll_count(fx, motion::key(motion::ROLL_CALLS, id), s.tools, s.label.clone(), |t| {
+                        div().flex_none().child(t)
+                    }))
+                    .child(tally),
             )
             .child(trail)
             .child(geo.fold_col(Some(glyph::turn(fx.turn(id | RUN_KEY, open), p.dim_t))))
@@ -1675,6 +1684,18 @@ impl AppView {
         // Thinking done says nothing in the gutter: only its running mark.
         let status_glyph = (!think || state.0 == Glyph::Run).then_some(status_glyph);
         let running = state.0 == Glyph::Run && !think;
+        // A running bash call's bottom edge sweeps once it has run a second
+        // (polish.md P2.2: the TUI's bash trace), in the row's lit hue.
+        let bash_sweep = running
+            && fx.ambient()
+            && row.hue == Hue::Bash
+            && row.started.is_some_and(|t| {
+                let ran = fx.now().saturating_duration_since(t) >= motion::BASH_SWEEP_AFTER;
+                if !ran {
+                    fx.want_at(t + motion::BASH_SWEEP_AFTER);
+                }
+                ran
+            });
         let meta = h_flex()
             .flex_none()
             .ml(px(geo.gap))
@@ -1704,6 +1725,7 @@ impl AppView {
             .child(target)
             .child(meta)
             .child(geo.fold_col(fold))
+            .when(bash_sweep, |d| d.relative().child(motion::sweep(fx, motion::mix(hue, p.ink, 0.30), p.canvas)))
             .when(has_body, |d| {
                 d.on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle(id);
@@ -1814,7 +1836,7 @@ impl AppView {
             .items_center()
             .text_px(m.meta)
             .whitespace_nowrap()
-            .when(!v.facts_bare.is_empty(), |d| d.child(div().text_color(p.dim_t).child(crate::tray::ticked(fx, &v.facts_bare, tick))))
+            .when(!v.facts_bare.is_empty(), |d| d.child(spawn_facts(fx, key, &v.facts_bare, tick, p)))
             .when(warn && !lay.tight, |d| d.child(div().text_color(word_color).child(word)));
         let button = who.clone().map(|who| {
             let who2 = who.clone();
@@ -1899,7 +1921,12 @@ impl AppView {
                         .text_px(m.meta)
                         .whitespace_nowrap()
                         .child(glyph::draw(Glyph::Elbow, p.dim_t))
-                        .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.sub_status_t).child(text))
+                        // A changed step rolls (polish.md P5).
+                        .child(motion::rolled(fx, motion::key(motion::ROLL_STEP, key), text, true, true, |t| {
+                            div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.sub_status_t).child(t)
+                        }))
+                        // The live worker's sweep along its bottom (P2.3).
+                        .when(running, |d| d.relative().child(motion::sweep(fx, p.sub_rule, p.canvas)))
                         .into_any_element(),
                 )
             })
@@ -2026,6 +2053,28 @@ fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metric
     }
 }
 
+/// A spawn row's facts (polish.md §2.4): running, its tool count rolls
+/// (P5) and its clock ticks (never rolls); ended, as reported.
+fn spawn_facts(
+    fx: &std::rc::Rc<Motion>,
+    key: u64,
+    facts: &SharedString,
+    tick: &Option<(SharedString, subagents::Tick)>,
+    p: &Palette,
+) -> AnyElement {
+    let text = |t: SharedString| div().text_color(p.dim_t).child(t);
+    let Some((head, _)) = tick.as_ref().filter(|(h, _)| fx.on() && !h.is_empty()) else {
+        return text(crate::tray::ticked(fx, facts, tick)).into_any_element();
+    };
+    let whole = crate::tray::ticked(fx, facts, tick);
+    let clock: SharedString = whole.strip_prefix(head.as_ref()).unwrap_or_default().to_string().into();
+    let n = head.split(|c: char| !c.is_ascii_digit()).find(|d| !d.is_empty()).and_then(|d| d.parse().ok()).unwrap_or(0);
+    h_flex()
+        .child(motion::roll_count(fx, motion::key(motion::ROLL_TOOLS, key), n, head.clone(), text))
+        .child(text(clock))
+        .into_any_element()
+}
+
 /// A summary's chevron is keyed apart from its first row's own.
 const RUN_KEY: u64 = 1 << 63;
 
@@ -2034,8 +2083,8 @@ pub(crate) fn glyph_code(g: Glyph) -> u64 {
     Glyph::ALL.iter().position(|x| *x == g).unwrap_or(0) as u64
 }
 
-/// A state glyph as it is now (motion.md §6, §7): `Run` and `Workers`
-/// scan on the beat; `Needs` breathes from `breath` (the prompt's arrival)
+/// A state glyph as it is now (motion.md §6, §7): `Run`, `Workers` and
+/// `Opening` spin on the beat (polish.md P1); `Needs` breathes from `breath` (the prompt's arrival)
 /// three times, then holds; a glyph that changed (`change`: when, and from
 /// what) writes on, draws its quads or (`fade`) cross-fades. Off: [`glyph::draw`].
 pub(crate) fn live_glyph(
@@ -2048,9 +2097,9 @@ pub(crate) fn live_glyph(
     fade: bool,
 ) -> AnyElement {
     match g {
-        // The beat layer paints the scan over the cached frame.
-        Glyph::Run | Glyph::Workers if fx.layered() => glyph::on_beat(motion::Beat::Scan(g), mark, ground, fx),
-        Glyph::Run | Glyph::Workers => glyph::scan(g, fx.beat(1), mark, fx.ink()),
+        // The braille family spins (the beat layer paints it over the
+        // cached frame).
+        Glyph::Run | Glyph::Workers | Glyph::Opening => glyph::spinning(fx, g, mark, ground),
         Glyph::Needs => {
             let step = breath.map(|t| fx.beats_since(t)).filter(|s| *s < motion::BREATH_BEATS * motion::BREATHS);
             if let (Some(t), Some(_), true) = (breath, step, fx.layered()) {

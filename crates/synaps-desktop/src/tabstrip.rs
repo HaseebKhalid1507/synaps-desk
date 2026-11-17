@@ -641,7 +641,7 @@ impl AppView {
                         .flex_none()
                         .size(px(10.))
                         .debug_selector(|| format!("tab {id} glyph"))
-                        .children(g.map(|g| glyph::draw(g, mark_color))),
+                        .children(g.map(|g| glyph::spinning(fx, g, mark_color, fill.unwrap_or(p.chrome)))),
                 }),
             )
             .child(
