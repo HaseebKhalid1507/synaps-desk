@@ -1601,8 +1601,8 @@ mod tests {
         for (name, raw) in palettes::THEMES {
             for &accent in &accents {
                 let (r, _) = resolve(&raw, accent);
-                // The row on the canvas, hovered on `tool_out`; a chip on
-                // `tool`, the watched one on `tool_out`.
+                // The row on the canvas, hovered on `tool_out`; a chip too
+                // (no fill since the finish gate; `tool` before it).
                 let row = [r.canvas, r.tool_out];
                 let chip = [r.tool, r.tool_out];
                 let verbs = [r.t_bash, r.t_read, r.t_write, r.t_edit, r.t_grep, r.t_find, r.t_ls, r.t_sub, r.t_ext, r.t_gen];
@@ -1619,7 +1619,8 @@ mod tests {
                     ("failed output", r.err_o, vec![r.well, r.del_bg], TEXT),
                     ("added sign", r.ok_o, vec![r.add_bg], TEXT),
                     ("diff line", r.ink, vec![r.add_bg, r.del_bg], TEXT),
-                    ("spawn bar, chip bar", r.sub_rule, vec![r.canvas, r.tool], MARK),
+                    ("spawn bar, chip bar", r.sub_rule, vec![r.canvas, r.tool, r.tool_out], MARK),
+                    ("spawn task", r.dim_t, row.to_vec(), TEXT),
                     ("watched chip bar", r.you_mark_t, vec![r.tool_out], MARK),
                     ("gutter running", r.run_mark, row.to_vec(), MARK),
                     ("gutter waiting", r.warn_mark, row.to_vec(), MARK),

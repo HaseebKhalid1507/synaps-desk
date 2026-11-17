@@ -1580,7 +1580,7 @@ fn running_tools(cx: &mut TestAppContext, view: &Entity<AppView>, n: usize) {
 /// Q1 cards (polish.md §2.1, F1): a tool row is bare on the canvas. Its
 /// box reaches into the gutter for its status glyph (the hover fill takes
 /// the glyph in) and stops where the AGENT label ends; its verb starts on
-/// the prose column. A failed call opens on its well, at the target column
+/// the prose column. A failed call opens on its well, at the verb column
 /// to the column's end.
 #[gpui_kit::test]
 fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
@@ -1640,7 +1640,7 @@ fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
     assert_eq!(failed, Some(synaps_client::transcript::ToolStatus::Failed));
     let well = bounds(cx, leak(format!("well {id}"))).expect("a failed call opens on its well");
     let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the row");
-    assert_eq!(f32::from(well.left()), f32::from(row.left()) + geo.out + geo.target, "the well at the target column");
+    assert_eq!(f32::from(well.left()), f32::from(row.left()) + geo.out + geo.verb, "the well at the verb column");
     assert_eq!(well.right(), row.right(), "to the column's end");
     let status = bounds(cx, leak(format!("tool-status {id}"))).expect("its failed glyph");
     assert!(f32::from(status.right()) <= f32::from(row.left()) + geo.out, "still in the gutter");

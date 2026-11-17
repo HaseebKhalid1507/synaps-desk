@@ -135,9 +135,10 @@ const TRAY: u64 = 1 << 61;
 /// Between chips, and between their lines.
 pub(crate) const CHIP_GAP: f32 = 8.;
 
-/// A chip's step, at most (polish.md §2.5; a chip draws as much of it as
-/// leaves two chips a line: [`chip_w`]), and its name.
-pub(crate) const STEP_CHARS: usize = 32;
+/// A chip's step, at most, and its name. The demo's steps run 20–36
+/// characters (median 31: `reading e2e/checkout/cart.spec.ts` is 33): at
+/// 36 they read whole (polish.md §2.5 said 32).
+pub(crate) const STEP_CHARS: usize = 36;
 pub(crate) const NAME_CHARS: usize = 18;
 /// A chip's clock slot: as wide as the widest it shows (`59m 59s`), so a
 /// tick never reflows the chips.
@@ -193,12 +194,11 @@ impl Chips {
 
 /// The parts' widths of a chip (mono at `m.meta`, every text box a whole
 /// pixel): its 1 px frame, padding 12 (the bar and 10) and 10, the
-/// glyph, its name, its step, its clock's slot and the cancel ×'s, 8
-/// apart. Nothing in it changes with a tick. The step is cut to what
-/// leaves two chips on a line `line` px wide (polish.md §2.5's 32
-/// characters where there is room). An armed cancel's `Cancel name? ···
-/// C O N F I R M` (CONFIRM `confirm` px, as drawn) takes the step's, the
-/// clock's and the ×'s room.
+/// glyph, its name, its step (cut at [`STEP_CHARS`]), its clock's slot
+/// and the cancel ×'s, 8 apart. Nothing in it changes with a tick. An
+/// armed cancel's `Cancel name? ··· C O N F I R M` (CONFIRM `confirm` px,
+/// as drawn) takes the step's, the clock's and the ×'s room. No wider than
+/// the line (`line` px): the step gives way.
 pub(crate) fn chip_w(r: &TrayRow, armed: bool, line: f32, confirm: f32, m: &Metrics) -> f32 {
     use crate::turns::text_w;
     let cw = m.meta * 0.6;
@@ -210,8 +210,8 @@ pub(crate) fn chip_w(r: &TrayRow, armed: bool, line: f32, confirm: f32, m: &Metr
         base + 8. + text_w(name + 8, cw) + 6. + 22. + 6. + confirm
     } else {
         let fixed = base + if r.clocked() { 8. + text_w(CLOCK_CHARS, cw) } else { 0. } + if r.watchable { 8. + X_W } else { 0. };
-        let half = ((line - CHIP_GAP) / 2. - fixed - 8.).max(text_w(8, cw));
-        fixed + 8. + text_w(chip_step(r).chars().count(), cw).min(half)
+        let room = (line - fixed - 8.).max(text_w(8, cw));
+        fixed + 8. + text_w(chip_step(r).chars().count(), cw).min(room)
     };
     w.ceil()
 }
@@ -495,7 +495,6 @@ impl AppView {
                 .h(px(row_h))
                 .px(px(10.))
                 .items_center()
-                .bg(p.tool)
                 .border_1()
                 .border_color(p.hair_t)
                 .child(mono(format!("+{} more", chips.more), m.meta, p.dim_t))
@@ -515,8 +514,8 @@ impl AppView {
         ))
     }
 
-    /// A worker's chip (polish.md §2.5): on the `tool` ground in a 1 px
-    /// `hair` frame, `bar` on its left edge; its state glyph, name, step
+    /// A worker's chip (polish.md §2.5, made lighter at the finish gate):
+    /// no fill, a 1 px `hair_t` frame on the canvas, `bar` on its left edge; its state glyph, name, step
     /// (or its state's word once it ended; an armed cancel's `Cancel …?`
     /// and CONFIRM), its clock (ticking while it runs) and the cancel ×.
     #[allow(clippy::too_many_arguments)]
@@ -556,14 +555,15 @@ impl AppView {
             .overflow_hidden()
             .whitespace_nowrap()
             .text_px(m.meta)
-            .bg(if watched { p.tool_out } else { p.tool })
+            // No fill: a 1 px frame and its bar on the canvas (the watched
+            // one's bar is yours); hovered, the rows' quiet fill.
             .border_1()
             .border_color(p.hair_t)
             .child(crate::turns::live_glyph(
                 &self.fx,
                 g,
                 mark,
-                p.tool,
+                p.canvas,
                 self.fx.change(Tag::TrayGlyph, r.id, crate::turns::glyph_code(glyph::worker(glyph::steady(r.live, r.demoted)).0), None),
                 None,
                 false,
@@ -605,7 +605,7 @@ impl AppView {
         // No card over an open menu.
         row.when(self.menu.is_none(), |d| d.tooltip(crate::wtabs::card_tip(cx.weak_entity(), who.clone(), r.tip.clone())))
             .cursor_pointer()
-            .when(!watched, |d| d.hover(|d| d.bg(p.tool_out)))
+            .hover(|d| d.bg(p.tool_out))
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who, false, ev, window, cx)))
             .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who2, false, ev, window, cx)))
             .into_any_element()
@@ -613,14 +613,13 @@ impl AppView {
 
     /// A chip that left, fading (`fade` 1 → 0) in its slot: what it said,
     /// with no id, listener or hitbox (motion.md §8: an exit takes no click).
-    /// Its box fades into the canvas it sits on, its text and marks into
-    /// its fading ground, as colour mixes (what opacity would paint there;
-    /// no translucent text, design.md §5).
+    /// Its frame, text and marks fade into the canvas it sits on, as colour
+    /// mixes (what opacity would paint there; no translucent text,
+    /// design.md §5).
     fn tray_ghost(&self, r: &TrayRow, fade: f32, w: f32, h: f32, p: &Palette, m: &Metrics) -> AnyElement {
         let (g, _, _, family) = glyph::worker(r.live);
         let (word_color, mark) = glyph::ink(family, Ground::Run, p);
-        let ground = motion::mix(p.canvas, p.tool, fade);
-        let f = |c: Hsla| motion::mix(ground, c, fade);
+        let f = |c: Hsla| motion::mix(p.canvas, c, fade);
         h_flex()
             .debug_selector(|| "tray-ghost".into())
             .flex_none()
@@ -634,9 +633,8 @@ impl AppView {
             .overflow_hidden()
             .whitespace_nowrap()
             .text_px(m.meta)
-            .bg(ground)
             .border_1()
-            .border_color(motion::mix(p.canvas, p.hair_t, fade))
+            .border_color(f(p.hair_t))
             .child(glyph::draw(g, f(mark)))
             .child(div().flex_none().text_color(f(p.sub_name_t)).child(SharedString::from(cut(&r.name, NAME_CHARS))))
             .child(div().flex_1().min_w_0().overflow_hidden().text_color(f(word_color)).child(SharedString::from(chip_step(r).to_string())))

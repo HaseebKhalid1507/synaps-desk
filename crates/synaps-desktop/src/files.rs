@@ -51,8 +51,33 @@ pub enum LineKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffLine {
     pub kind: LineKind,
-    /// Shared, so a frame hands it to the renderer without a copy.
+    /// Its leading whitespace, in columns (a tab is 4; at most
+    /// [`INDENT_MAX`]): a wrapped line hangs there, never left of its code.
+    pub indent: u16,
+    /// After that whitespace. Shared, so a frame hands it to the renderer
+    /// without a copy.
     pub text: Arc<str>,
+}
+
+/// The most of a line's indent a well keeps as a hang.
+pub const INDENT_MAX: u16 = 24;
+
+/// `line`'s leading whitespace in columns (a tab is 4, the hang at most
+/// [`INDENT_MAX`]), and the rest: what a well hangs a wrapped line at.
+pub fn hang(line: &str) -> (u16, &str) {
+    let mut cols = 0u16;
+    for (at, c) in line.char_indices() {
+        let w = match c {
+            ' ' => 1,
+            '\t' => 4,
+            _ => return (cols, &line[at..]),
+        };
+        if cols + w > INDENT_MAX {
+            return (cols, &line[at..]);
+        }
+        cols += w;
+    }
+    (cols, "")
 }
 
 /// What a tool row draws under its header.
@@ -496,7 +521,8 @@ fn push(p: &mut Preview, kind: LineKind, text: &str) {
     if t.len() < text.len() {
         t.push('…');
     }
-    p.lines.push(DiffLine { kind, text: t.into() });
+    let (indent, rest) = hang(&t);
+    p.lines.push(DiffLine { kind, indent, text: rest.into() });
 }
 
 /// Append the line diff `old` → `new` to `p`; returns (added, removed,
@@ -642,6 +668,20 @@ mod tests {
     const OK: &str = "Edited the file";
     const DENIED: &str = "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this edit";
     const FAILED: &str = "Tool execution failed: old_string not found in '/w/r/src/a.rs'. Make sure it matches exactly, including whitespace and indentation.";
+
+    /// A wrapped code line hangs at its own indent: the indent in columns
+    /// (a tab is 4), at most INDENT_MAX, and the rest.
+    #[test]
+    fn a_line_hangs_at_its_own_indent() {
+        assert_eq!(hang("        // The tray's flash"), (8, "// The tray's flash"));
+        assert_eq!(hang("\t\tx"), (8, "x"));
+        assert_eq!(hang("x  y"), (0, "x  y"));
+        assert_eq!(hang("   "), (3, ""));
+        assert_eq!(hang(&format!("{}deep", " ".repeat(40))).0, INDENT_MAX);
+        let mut p = Preview::default();
+        push(&mut p, LineKind::Add, "    let x = 1;");
+        assert_eq!((p.lines[0].indent, &*p.lines[0].text), (4, "let x = 1;"));
+    }
 
     #[test]
     fn edit_diff_counts_and_context() {
