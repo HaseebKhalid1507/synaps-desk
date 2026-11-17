@@ -3089,3 +3089,44 @@ fn the_link_drops_drains_and_scans_back(cx: &mut TestAppContext) {
     assert_eq!(drain(cx), 0., "Off: none");
     assert_eq!(motion_pending(cx, &view), (false, None), "Off: the dots hold too");
 }
+
+/// A worker tab opened by the pointer draws the tracer to it (motion.md
+/// §6.2): the line lands on the new tab's top-left corner over `base`, the
+/// tab's bar draws over `quick`, then it is gone. Reduced: none.
+#[gpui_kit::test]
+fn tracer_lands_on_new_tab(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 4);
+    let scout = view.read_with(cx, |v, _| {
+        let r = v.tray.rows.iter().find(|r| r.id == 1).expect("scout's tray row");
+        crate::wtabs::Who::new(1, r.name.clone(), r.call.clone())
+    });
+    view.update(cx, |v, cx| v.open_worker_tab(&scout, cx));
+    cx.run_until_parked();
+    wait(cx, w, &view, 7);
+    let (tr, tab) = view.read_with(cx, |v, _| (v.tracer, v.model.tabs.current().map(|t| t.id)));
+    let tr = tr.expect("a tracer");
+    assert_eq!(Some(tr.tab), tab, "to the new tab");
+    let to = tr.to.expect("its target laid out");
+    let strip = view.read_with(cx, |v, _| v.strip_at.get());
+    assert!(strip.y > px(0.) && to.y == strip.y, "the tab's top edge: {to:?} {strip:?}");
+    // `base` + `quick`: 320 ms, 47 frames at 144 Hz.
+    for _ in 0..30 {
+        wait(cx, w, &view, 7);
+    }
+    assert!(view.read_with(cx, |v, _| v.tracer.is_some()), "the bar drawing");
+    for _ in 0..20 {
+        wait(cx, w, &view, 7);
+    }
+    let left = view.read_with(cx, |v, _| v.tracer.map(|t| (t, v.fx.clock().duration_since(t.at))));
+    assert!(left.is_none(), "landed, the bar drawn: gone ({left:?})");
+    // Reduced: none.
+    view.update(cx, |v, cx| v.leave_worker(false, cx));
+    set_motion(cx, &view, crate::motion::Level::Reduced);
+    settle(cx, w, 4);
+    view.update(cx, |v, cx| v.open_worker_tab(&scout, cx));
+    cx.run_until_parked();
+    settle(cx, w, 4);
+    assert!(view.read_with(cx, |v, _| v.tracer.is_none()), "Reduced: no tracer");
+}

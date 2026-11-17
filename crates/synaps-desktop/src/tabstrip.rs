@@ -372,6 +372,33 @@ impl AppView {
                 quads = Some((qx, qw));
             }
         }
+        // The tracer's target: the new tab's top-left corner (§6.2); once
+        // it lands, the tab's bar draws left to right over `quick` (the
+        // undrawn part covered in the tab's own fill).
+        let mut cover = None;
+        if let Some(tr) = self.tracer.as_mut() {
+            let mut x = if lay.overflow { ARROW_W } else { 0. };
+            let mut at = None;
+            for slot in &slots {
+                match *slot {
+                    Slot::Tab(ix, w, _) => {
+                        if tabs.iter().nth(ix).is_some_and(|t| t.id == tr.tab) {
+                            at = Some((x, w));
+                        }
+                        x += w;
+                    }
+                    Slot::Ghost(k) => x += ghosts[k].shown,
+                }
+            }
+            let origin = self.strip_at.get();
+            tr.to = at.map(|(x, _)| point(origin.x + px(x), origin.y));
+            let k = fx.draw(Some(tr.at), crate::motion::BASE, crate::motion::QUICK);
+            if at.is_none() || k >= 1. {
+                self.tracer = None;
+            } else if let Some((x, w)) = at {
+                cover = Some(div().absolute().top_0().left(px(x + w * k)).w(px(w * (1. - k))).h(px(2.)).bg(p.raised));
+            }
+        }
         let mut row = h_flex().h_full().flex_none();
         let mut drawn = Vec::with_capacity(lay.shown);
         for slot in slots {
@@ -435,6 +462,10 @@ impl AppView {
             .w_full()
             .overflow_hidden()
             .bg(p.chrome)
+            .child({
+                let at = self.strip_at.clone();
+                canvas(move |b, _, _| at.set(b.origin), |_, _, _, _| {}).absolute().inset_0()
+            })
             .children(quads)
             .border_b_1()
             .border_color(p.hair)
@@ -445,6 +476,7 @@ impl AppView {
                 })))
             })
             .child(row)
+            .children(cover)
             .when(lay.overflow, |d| {
                 d.child(arrow("tabs-right", right, after > 0).on_click(cx.listener(|this, _, _, cx| {
                     this.tab_first += 1;

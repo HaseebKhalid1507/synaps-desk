@@ -344,6 +344,40 @@ impl AppView {
         Some(deferred(out).with_priority(5))
     }
 
+    /// The tracer's line on its way (motion.md §6.2): its head `base` `out`
+    /// along the straight line from where the tab was opened to its top
+    /// edge, 24 px of it behind, 2 px in `you_bar`, over everything.
+    pub(crate) fn render_tracer(&self, p: &Palette) -> Option<impl IntoElement + use<>> {
+        let tr = self.tracer?;
+        let to = tr.to?;
+        let t = self.fx.shot(Some(tr.at), std::time::Duration::ZERO, crate::motion::BASE, &crate::motion::ease::OUT, crate::motion::Kind::Spatial);
+        if t >= 1. {
+            return None;
+        }
+        let (from, color) = (tr.from, p.you_bar);
+        let d = to - from;
+        let len = f32::from(d.x).hypot(f32::from(d.y)).max(1.);
+        let tail = (t - crate::motion::TRACER_LEN / len).max(0.);
+        Some(
+            deferred(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        let mut path = PathBuilder::stroke(px(2.));
+                        path.move_to(from + d * tail);
+                        path.line_to(from + d * t);
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, color);
+                        }
+                    },
+                )
+                .absolute()
+                .size_0(),
+            )
+            .with_priority(5),
+        )
+    }
+
     pub(crate) fn render_top(&self, p: &Palette, rail: Side, cx: &Context<Self>) -> impl IntoElement {
         let n = self.model.attention().count();
         let first = self.model.ticker();
@@ -412,7 +446,8 @@ impl AppView {
             .items_center()
             // The state grammar (design.md §4.1): NEEDS YOU's glyph, or at rest the idle one.
             .child(if on { glyph::draw(glyph::Glyph::Needs, p.warn_mark_ch) } else { glyph::draw(glyph::Glyph::Idle, p.rest_mark) })
-            .child(display(format!("{n}   {}", label::NEED_YOU), size::D_S, if on { p.warn_ch } else { p.dim_ch }).flex_none())
+            // The count afterglows when it changes (motion.md §6.6).
+            .child(display(format!("{n}   {}", label::NEED_YOU), size::D_S, self.fx.glow(GLOW | 0xFFFF, n as u64, if on { p.warn_ch } else { p.dim_ch })).flex_none())
             .when_some(first.filter(|_| fit.label > 0.), |d, s| d.child(cut(mono(s.label(), size::META, p.ink), fit.label)))
             .when_some(what.filter(|_| fit.gist > 0.), |d, w| d.child(cut(mono(w, size::META, p.dim_ch), fit.gist)))
             .when(n > 1, |d| d.child(mono(format!("+{}", n - 1), size::META, p.dim_ch).flex_none()))
