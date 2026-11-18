@@ -18,7 +18,6 @@ Binaries: **r2** `7bdac0c`, sha256 `875c8e0b…` (installed as `bella:~/.local/b
   - **r2: 0 frames** in the whole clip.
 - `park-f1330-r1-over-r2.png` (2× zoom, r1 above, r2 below): frames 1330, 1360 and 1390 differ between r1 and r2 in
   exactly 24 px, all inside the band (x 339–344, y 95–102, the spinner's dots on the `A` of `AGENT`), and in none
-  below it. The row's glyph keeps beating below the band in both.
 
 ## The authorize card under the band (`card-under-band-1280x440.png`)
 - 1280×440: the card is taller than the view, so at the tail its top is under the band.
