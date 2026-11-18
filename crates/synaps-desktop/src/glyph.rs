@@ -176,6 +176,9 @@ pub(crate) fn draw_on(g: Glyph, mark: Hsla, ground: Hsla) -> AnyElement {
 /// `g` in `color`: its quads, or its sprite tinted. A braille glyph: its
 /// still frame's lit dots only ([`draw_on`] draws the silhouette).
 pub(crate) fn draw(g: Glyph, color: Hsla) -> AnyElement {
+    if g == Glyph::Needs {
+        return needs(None, color, Hsla { a: 0., ..color });
+    }
     let s = px(g.size());
     if let Some(path) = g.sprite() {
         return svg().path(path).flex_none().size(s).text_color(color).into_any_element();
@@ -1206,6 +1209,22 @@ fn inked(lit: bool) -> Div {
 /// A pose's code back from its dots (a selector only: lit or not).
 fn pose_of(d: &crate::lattice::Dots) -> crate::lattice::Pose {
     d.a.map(|a| if a <= 0.004 { 0 } else { (1. + a * 3.).round() as u8 })
+}
+
+/// Needs you's 10 px lattice plus (the design gate of #23, S3: the rail,
+/// the tray, the tab strip, as the call's), with its one ping `k` in
+/// (`Motion::ping`; none: still).
+pub(crate) fn needs(k: Option<f32>, mark: Hsla, ground: Hsla) -> AnyElement {
+    let pose = crate::lattice::pose(crate::lattice::Pat::Needs, None);
+    let base = crate::lattice::Dots::of(pose);
+    crate::lattice::el(10., k.map_or(base, |k| ping_wave(base, k)), crate::lattice::code(pose), mark, ground).into_any_element()
+}
+
+/// The window's Needs you's ping (S3): the tab strip's attention and the
+/// tray's stub ping once, together, when a prompt comes in while watched.
+pub(crate) fn needs_ping(fx: &crate::motion::Motion, on: bool) -> Option<f32> {
+    let since = fx.change(crate::motion::Tag::Waiting, u64::MAX, u64::from(on), None).filter(|w| on && w.1 == 0).map(|w| w.0);
+    fx.ping(since, std::time::Duration::ZERO)
 }
 
 /// Needs you's one ping (indicators/proposal.md §2): a ring wave from the
