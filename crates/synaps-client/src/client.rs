@@ -250,6 +250,14 @@ pub enum Command {
         named_only: bool,
         limit: u32,
     },
+    /// `CatalogPage` on the control connection → `Event::CatalogPage` /
+    /// `CatalogPageFailed` with the same `req`. See [`Client::catalog_page`].
+    CatalogPage {
+        req: u64,
+        before: Option<CatalogCursor>,
+        limit: u32,
+        named_only: bool,
+    },
     /// `Rename` on the control connection → `Event::Renamed` / `RenameFailed`.
     Rename {
         session_id: String,
@@ -297,6 +305,7 @@ impl Command {
             Command::Answer { .. } | Command::AnswerOn { .. } => "answer",
             Command::Resync => "query",
             Command::SavedSessions { .. } => "saved_sessions",
+            Command::CatalogPage { .. } => "catalog_page",
             Command::Rename { .. } => "rename",
             Command::Detach => "detach",
             Command::Shutdown => "shutdown",
@@ -328,6 +337,13 @@ impl std::fmt::Debug for Command {
             Command::SavedSessions { named_only, limit } => {
                 f.debug_struct("SavedSessions").field("named_only", named_only).field("limit", limit).finish()
             }
+            Command::CatalogPage { req, before, limit, named_only } => f
+                .debug_struct("CatalogPage")
+                .field("req", req)
+                .field("before", before)
+                .field("limit", limit)
+                .field("named_only", named_only)
+                .finish(),
             Command::Rename { session_id, name, expect } => {
                 f.debug_struct("Rename").field("session_id", session_id).field("name", name).field("expect", expect).finish()
             }
@@ -504,6 +520,23 @@ pub enum Event {
     SavedSessionsFailed {
         reason: String,
     },
+    /// Reply to [`Client::catalog_page`] (its `req`). `sessions`: saved
+    /// rows (`lifecycle: "saved"`), newest `updated_at` first; `next`: pass
+    /// it as `before` for the following page, `None` at the end;
+    /// `rejected`: rows that did not decode (skipped, the page is kept).
+    CatalogPage {
+        req: u64,
+        sessions: Vec<SessionMeta>,
+        next: Option<CatalogCursor>,
+        rejected: usize,
+    },
+    /// A [`Client::catalog_page`] that got no page: the daemon's `error`
+    /// (an unreadable sessions dir, too many pages in flight), a dropped
+    /// connection, or not connected.
+    CatalogPageFailed {
+        req: u64,
+        reason: String,
+    },
     /// The daemon refused the create's `cwd` (gone on its machine) and the
     /// create was sent again in [`CreateOptions::fallback_cwd`]. `missing`:
     /// the folder as the daemon printed it; `cwd`: where it runs now.
@@ -615,6 +648,8 @@ impl Event {
             | Event::Sessions(_)
             | Event::SavedSessions { .. }
             | Event::SavedSessionsFailed { .. }
+            | Event::CatalogPage { .. }
+            | Event::CatalogPageFailed { .. }
             | Event::Renamed { .. }
             | Event::RenameFailed(_) => None,
         }
@@ -693,6 +728,8 @@ pub struct Client {
     seq: Arc<Mutex<u64>>,
     /// The control connection's `Welcome.features`; `None` while it is down.
     features: Features,
+    /// The last `CatalogPage.req` handed out.
+    reqs: Arc<AtomicU64>,
 }
 
 type Features = Arc<Mutex<Option<Vec<String>>>>;
@@ -707,7 +744,7 @@ impl Client {
         let features: Features = Arc::default();
         let f2 = features.clone();
         std::thread::Builder::new().name("synaps-conn".into()).spawn(move || rt.block_on(run(options, rx, etx, f2)))?;
-        Ok((Client { tx, seq: Arc::new(Mutex::new(0)), features }, erx))
+        Ok((Client { tx, seq: Arc::new(Mutex::new(0)), features, reqs: Arc::default() }, erx))
     }
 
     /// Discover the daemon for `profile` (`None`: `$SYNAPS_PROFILE`, else
@@ -789,6 +826,30 @@ impl Client {
             None => Err(RequestError::NotConnected),
             Some(f) if !f.iter().any(|x| x == FEATURE_SAVED_SESSIONS) => Err(RequestError::Unsupported { feature: FEATURE_SAVED_SESSIONS }),
             Some(_) => Ok(self.send(Command::SavedSessions { named_only, limit })?),
+        }
+    }
+
+    /// Ask for one page of the saved sessions (the daemon does not hold
+    /// them), newest `updated_at` first: from the newest (`before: None`) or
+    /// after a reply's `next`; at most `limit` rows (clamped to
+    /// 1..=[`CATALOG_PAGE_MAX`]); `named_only`: only named ones. Returns the
+    /// `req` the reply carries: `Event::CatalogPage` or
+    /// `Event::CatalogPageFailed`. Replies to several pages in flight can
+    /// come in any order. Only a daemon that lists [`FEATURE_SESSION_PAGE`]
+    /// is asked: otherwise `Err(Unsupported)` (or `NotConnected` while its
+    /// features are unknown), and nothing is sent. A cursor is only good on
+    /// the connection that gave it out: after a reconnect, page again from
+    /// `before: None`.
+    pub fn catalog_page(&self, before: Option<CatalogCursor>, limit: u32, named_only: bool) -> Result<u64, RequestError> {
+        let limit = limit.clamp(1, CATALOG_PAGE_MAX);
+        match self.features() {
+            None => Err(RequestError::NotConnected),
+            Some(f) if !f.iter().any(|x| x == FEATURE_SESSION_PAGE) => Err(RequestError::Unsupported { feature: FEATURE_SESSION_PAGE }),
+            Some(_) => {
+                let req = self.reqs.fetch_add(1, Ordering::Relaxed) + 1;
+                self.send(Command::CatalogPage { req, before, limit, named_only })?;
+                Ok(req)
+            }
         }
     }
 
@@ -917,6 +978,7 @@ struct Shared {
 enum Ctl {
     Refresh,
     SavedSessions { named_only: bool, limit: u32 },
+    CatalogPage { req: u64, before: Option<CatalogCursor>, limit: u32, named_only: bool },
     Rename { session_id: String, name: Option<String>, expect: Option<Option<String>> },
     Shutdown,
 }
@@ -926,8 +988,12 @@ enum Ctl {
 /// connection loop (`daemon/conn.rs`) awaits `rename_session` and
 /// `saved::saved_sessions` inline before it reads the next frame. If it
 /// ever spawns either, an `Error` could answer the wrong request.
+///
+/// `Catalog` is the exception: the daemon serves a page as a task, so its
+/// reply is matched by `req`, and can come after later replies.
 enum Pending {
     Saved,
+    Catalog(u64),
     Rename(String),
 }
 
@@ -935,6 +1001,7 @@ enum Pending {
 fn not_sent(events: &Events, ctl: Ctl) {
     match ctl {
         Ctl::SavedSessions { .. } => emit(events, Event::SavedSessionsFailed { reason: "not connected to the daemon".into() }),
+        Ctl::CatalogPage { req, .. } => emit(events, Event::CatalogPageFailed { req, reason: "not connected to the daemon".into() }),
         Ctl::Rename { session_id, .. } => emit(
             events,
             Event::RenameFailed(RenameFailure::new(session_id, RenameRefusal::Offline, "not connected to the daemon; nothing was renamed")),
@@ -947,6 +1014,7 @@ fn not_sent(events: &Events, ctl: Ctl) {
 fn lost(events: &Events, p: Pending, why: &str) {
     match p {
         Pending::Saved => emit(events, Event::SavedSessionsFailed { reason: format!("the connection dropped ({why})") }),
+        Pending::Catalog(req) => emit(events, Event::CatalogPageFailed { req, reason: format!("the connection dropped ({why})") }),
         Pending::Rename(sid) => emit(
             events,
             Event::RenameFailed(RenameFailure::new(
@@ -992,6 +1060,9 @@ async fn run(options: ClientOptions, mut rx: mpsc::UnboundedReceiver<Msg>, event
                     }
                     Command::SavedSessions { named_only, limit } => {
                         let _ = ctl_tx.send(Ctl::SavedSessions { named_only, limit });
+                    }
+                    Command::CatalogPage { req, before, limit, named_only } => {
+                        let _ = ctl_tx.send(Ctl::CatalogPage { req, before, limit, named_only });
                     }
                     Command::Rename { session_id, name, expect } => {
                         let _ = ctl_tx.send(Ctl::Rename { session_id, name, expect });
@@ -1117,6 +1188,7 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
         let w = &c.welcome;
         set_features(Some(w.features.clone()));
         let saved_ok = w.features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
+        let page_ok = w.features.iter().any(|f| f == FEATURE_SESSION_PAGE);
         emit(
             events,
             Event::Status(Status::Connected {
@@ -1148,6 +1220,16 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                     Some(Ctl::SavedSessions { named_only, limit }) => {
                         pending.push_back(Pending::Saved);
                         if let Err(e) = c.send(&ClientFrame::SavedSessions { named_only, limit }).await {
+                            break (e.to_string(), Duration::ZERO);
+                        }
+                    }
+                    Some(Ctl::CatalogPage { req, .. }) if !page_ok => {
+                        emit(events, Event::CatalogPageFailed { req, reason: format!("this daemon does not support {FEATURE_SESSION_PAGE}") });
+                        emit_error(events, None, Error::Unsupported { feature: FEATURE_SESSION_PAGE });
+                    }
+                    Some(Ctl::CatalogPage { req, before, limit, named_only }) => {
+                        pending.push_back(Pending::Catalog(req));
+                        if let Err(e) = c.send(&ClientFrame::CatalogPage { req, before, limit: limit.clamp(1, CATALOG_PAGE_MAX), named_only }).await {
                             break (e.to_string(), Duration::ZERO);
                         }
                     }
@@ -1183,6 +1265,16 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                         take_pending(&mut pending, |p| matches!(p, Pending::Saved));
                         emit(events, Event::SavedSessions { sessions, truncated, rejected });
                     }
+                    // Matched by `req`; one not pending (asked on a dropped
+                    // connection, or never) is not ours to report.
+                    Ok(Some(DaemonFrame::CatalogPage { req, sessions, next, rejected, error })) => {
+                        if take_pending(&mut pending, |p| matches!(p, Pending::Catalog(r) if *r == req)).is_some() {
+                            emit(events, match error {
+                                Some(reason) => Event::CatalogPageFailed { req, reason },
+                                None => Event::CatalogPage { req, sessions, next, rejected },
+                            });
+                        }
+                    }
                     Ok(Some(DaemonFrame::Renamed { session_id, name, in_memory_only })) => {
                         take_pending(&mut pending, |p| matches!(p, Pending::Rename(_)));
                         emit(events, Event::Renamed { session_id, name, in_memory_only });
@@ -1201,9 +1293,19 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                     }
                     // A control `Error` answers the oldest pending request:
                     // an older daemon's "malformed frame: unknown variant".
+                    // It carries no `req`: a page is its target only when it
+                    // names `catalog_page` or no in-order request waits.
                     Ok(Some(DaemonFrame::Error { session_id: None, message })) if !pending.is_empty() => {
                         let unknown = message.contains("unknown variant");
-                        match pending.pop_front() {
+                        let page = message.contains("catalog_page") || pending.iter().all(|p| matches!(p, Pending::Catalog(_)));
+                        let p = if page {
+                            take_pending(&mut pending, |p| matches!(p, Pending::Catalog(_)))
+                        } else {
+                            take_pending(&mut pending, |p| !matches!(p, Pending::Catalog(_)))
+                        }
+                        .or_else(|| pending.pop_front());
+                        match p {
+                            Some(Pending::Catalog(req)) => emit(events, Event::CatalogPageFailed { req, reason: message }),
                             Some(Pending::Rename(sid)) => {
                                 let r = if unknown { RenameRefusal::Unsupported } else { RenameRefusal::Failed };
                                 emit(events, Event::RenameFailed(RenameFailure::new(sid, r, message)));

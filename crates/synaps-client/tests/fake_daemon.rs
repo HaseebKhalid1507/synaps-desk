@@ -80,7 +80,41 @@ struct Opts {
     /// Predates `Rename`: answers it `Error{unknown variant}`.
     old: bool,
     /// Lists `saved_sessions` but cannot read the sessions dir: `Error`.
+    /// With `pages`: every page is a `catalog_page` with `error`.
     saved_error: bool,
+    /// `Welcome.features` lists `session_page` and answers `catalog_page`
+    /// from [`catalog`].
+    pages: bool,
+}
+
+/// The fake's saved sessions, newest first: five rows, the third named.
+fn catalog() -> Vec<Value> {
+    (0..5)
+        .map(|k| {
+            let id = format!("20261110-00000{k}-c{k:03}");
+            json!({"id": id, "journal_id": id, "lifecycle": "saved", "model": "m", "messages": k,
+                   "name": if k == 2 { json!("kept") } else { Value::Null },
+                   "updated_at": format!("2026-11-12T0{}:00:00Z", 9 - k)})
+        })
+        .collect()
+}
+
+/// The fake's `CatalogPage`: rows strictly after `before` in the order,
+/// at most `limit`, `next` if any are left; and an undecodable row on
+/// every page (skipped by the client, the page kept).
+fn catalog_reply(f: &Value) -> Value {
+    let key = |v: &Value| (v["updated_at"].as_str().unwrap_or_default().to_string(), v["id"].as_str().unwrap_or_default().to_string());
+    let rows: Vec<Value> = catalog()
+        .into_iter()
+        .filter(|r| !f["named_only"].as_bool().unwrap_or(false) || r["name"].is_string())
+        .filter(|r| f["before"].is_null() || key(r) < key(&f["before"]))
+        .collect();
+    let limit = f["limit"].as_u64().unwrap_or(50) as usize;
+    let more = rows.len() > limit;
+    let mut page: Vec<Value> = rows.into_iter().take(limit).collect();
+    let next = if more { page.last().map(|r| json!({"updated_at": r["updated_at"], "id": r["id"]})) } else { None };
+    page.push(json!({"id": 5, "lifecycle": "saved"}));
+    json!({"type": "catalog_page", "req": f["req"], "sessions": page, "next": next})
 }
 
 /// A second live session, unnamed.
@@ -98,7 +132,10 @@ fn attached_frame(client: u64) -> Value {
 }
 
 fn welcome(opts: Opts) -> Value {
-    let features: Vec<&str> = if opts.saved { vec!["owned_sessions", "saved_sessions"] } else { vec!["owned_sessions"] };
+    let mut features: Vec<&str> = if opts.saved { vec!["owned_sessions", "saved_sessions"] } else { vec!["owned_sessions"] };
+    if opts.pages {
+        features.push("session_page");
+    }
     json!({"type": "welcome", "protocol_version": 3, "daemon_version": "0.0.0-fake", "pid": 1, "profile": null,
            "sessions": [{"id": SID, "model": "m", "lifecycle": "live", "name": "named-one"},
                         {"id": SID2, "model": "m", "lifecycle": "live", "journal_id": "20261101-000000-bbbb"}],
@@ -181,6 +218,26 @@ impl Fake {
                                     &w,
                                     json!({"type": "error", "session_id": null,
                                     "message": "malformed frame: unknown variant `saved_sessions`"}),
+                                )
+                                .await;
+                            }
+                            Some("catalog_page") if opts.pages && opts.saved_error => {
+                                write(&w, json!({"type": "catalog_page", "req": f["req"], "sessions": [], "error": "saved sessions: Permission denied (os error 13)"}))
+                                    .await;
+                            }
+                            Some("catalog_page") if opts.pages => {
+                                // A reply to a page nobody asked for comes first: the
+                                // client must not pass it on.
+                                if f["req"] == 1 {
+                                    write(&w, json!({"type": "catalog_page", "req": 999, "sessions": catalog(), "next": null})).await;
+                                }
+                                write(&w, catalog_reply(&f)).await;
+                            }
+                            Some("catalog_page") => {
+                                write(
+                                    &w,
+                                    json!({"type": "error", "session_id": null,
+                                    "message": "malformed frame: unknown variant `catalog_page`"}),
                                 )
                                 .await;
                             }
@@ -1402,5 +1459,104 @@ async fn engine_command_wire_shape_and_replies() {
     let (_, name, r) = reply(&events).await;
     assert_eq!(name, "budget");
     assert!(matches!(r, NotRun(e) if e.contains("not connected")));
+    client.shutdown().unwrap();
+}
+
+/// Saved pages (`session_page`, SynapsCLI watch-sessions PR 4): the
+/// request is the pinned frame, each reply comes back as
+/// `Event::CatalogPage` with its `req`, and a reply's `next` sent back as
+/// `before` pages on to the end. A bad row on every page is counted, the
+/// page kept; a reply to a `req` nobody asked for is dropped.
+#[tokio::test]
+async fn catalog_pages_round_trip_their_cursor() {
+    let mut fake = Fake::start_with("pages", Opts { pages: true, ..Default::default() }).await;
+    let (client, events) = fake.client();
+    assert!(connected(&events).await.iter().any(|f| f == "session_page"));
+    assert!(client.supports(synaps_client::FEATURE_SESSION_PAGE));
+    let mut before = None;
+    let mut ids = Vec::new();
+    let mut reqs = Vec::new();
+    for round in 0.. {
+        assert!(round < 5, "paging never ended");
+        let req = client.catalog_page(before.clone(), 2, false).unwrap();
+        reqs.push(req);
+        let sent = fake.next_control().await;
+        let mut want = json!({"type": "catalog_page", "req": req, "limit": 2});
+        if let Some(c) = &before {
+            want["before"] = serde_json::to_value(c).unwrap();
+        }
+        assert_eq!(sent, want);
+        let (got, sessions, next, rejected) = wait(&events, "a page", |e| match e {
+            Event::CatalogPage { req, sessions, next, rejected } => Some((*req, sessions.clone(), next.clone(), *rejected)),
+            _ => None,
+        })
+        .await;
+        assert_eq!((got, rejected), (req, 1), "the stray req 999 is never passed on");
+        assert!(sessions.iter().all(|s| s.is_saved()));
+        ids.extend(sessions.iter().map(|s| s.id.clone()));
+        match next {
+            Some(c) => before = Some(c),
+            None => break,
+        }
+    }
+    let all: Vec<String> = catalog().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(ids, all, "every row once, newest first");
+    assert_eq!(reqs, [1, 2, 3]);
+
+    let req = client.catalog_page(None, u32::MAX, true).unwrap();
+    assert_eq!(fake.next_control().await, json!({"type": "catalog_page", "req": req, "limit": 200, "named_only": true}));
+    let named = wait(&events, "the named page", |e| match e {
+        Event::CatalogPage { sessions, next: None, .. } => Some(sessions.iter().map(|s| s.label()).collect::<Vec<_>>()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(named, ["kept"]);
+    client.shutdown().unwrap();
+}
+
+/// A page the daemon could not serve (`catalog_page` with `error`) is
+/// `Event::CatalogPageFailed` for that `req`.
+#[tokio::test]
+async fn a_catalog_page_error_fails_its_req() {
+    let mut fake = Fake::start_with("pages-err", Opts { pages: true, saved_error: true, ..Default::default() }).await;
+    let (client, events) = fake.client();
+    connected(&events).await;
+    let req = client.catalog_page(None, 50, false).unwrap();
+    fake.next_control().await;
+    let (got, reason) = wait(&events, "failed", |e| match e {
+        Event::CatalogPageFailed { req, reason } => Some((*req, reason.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(got, req);
+    assert!(reason.contains("Permission denied"), "{reason}");
+    client.shutdown().unwrap();
+}
+
+/// Feature gating: without `session_page` no `catalog_page` frame goes
+/// out. `catalog_page()` says `Unsupported`; a raw `Command::CatalogPage`
+/// fails its `req` and says `Error::Unsupported`.
+#[tokio::test]
+async fn without_the_feature_no_catalog_page_frame_is_sent() {
+    use synaps_client::Command;
+    let mut fake = Fake::start_with("no-pages", Opts { saved: true, ..Default::default() }).await;
+    let (client, events) = fake.client();
+    assert!(!connected(&events).await.iter().any(|f| f == "session_page"));
+    assert_eq!(client.catalog_page(None, 50, false), Err(synaps_client::RequestError::Unsupported { feature: "session_page" }));
+    client.send(Command::CatalogPage { req: 41, before: None, limit: 50, named_only: false }).unwrap();
+    let failed = wait(&events, "failed", |e| match e {
+        Event::CatalogPageFailed { req, .. } => Some(*req),
+        _ => None,
+    })
+    .await;
+    assert_eq!(failed, 41);
+    let err = wait(&events, "unsupported", |e| match e {
+        Event::Error { error, .. } => Some(error.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(err, Error::Unsupported { feature: "session_page" });
+    client.list_sessions().unwrap();
+    assert_eq!(fake.next_control().await["type"], "sessions", "no catalog_page frame may precede it");
     client.shutdown().unwrap();
 }
