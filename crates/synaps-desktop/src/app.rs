@@ -224,7 +224,9 @@ actions!(
         WorkerTab,
         RenameSession,
         ToggleFavourite,
-        CardTab
+        CardTab,
+        MenuTab,
+        MenuTabBack
     ]
 );
 
@@ -236,6 +238,12 @@ pub(crate) type PromptAt = (String, u64, Option<String>);
 /// Tab and Shift+Tab go to its box and back ([`AppView::card_tab`]), ahead
 /// of the kit's focus cycling.
 const ALLOW_ALL_CTX: &str = "AllowAll";
+
+/// The key context while a worker's, a session's or the workers menu is
+/// open: Tab and Shift+Tab step it ([`AppView::menu_tab`]), ahead of the
+/// kit's focus cycling (a binding, which runs before the menus' key
+/// listener).
+const MENU_CTX: &str = "Menu";
 
 /// Ctrl+B folds the sessions rail, Ctrl+Alt+B the right panel; Ctrl+= /
 /// Ctrl+- / Ctrl+0 step the centre pane's text size; the tab keys
@@ -288,6 +296,8 @@ pub fn bind_keys(cx: &mut App) {
     }
     keys.push(KeyBinding::new("tab", CardTab, Some(ALLOW_ALL_CTX)));
     keys.push(KeyBinding::new("shift-tab", CardTab, Some(ALLOW_ALL_CTX)));
+    keys.push(KeyBinding::new("tab", MenuTab, Some(MENU_CTX)));
+    keys.push(KeyBinding::new("shift-tab", MenuTabBack, Some(MENU_CTX)));
     keys.push(KeyBinding::new(RENAME_KEY, RenameSession, None));
     keys.push(KeyBinding::new(fav_key(mac), ToggleFavourite, None));
     cx.bind_keys(keys);
@@ -1876,7 +1886,10 @@ impl AppView {
             settings_pane,
             usage_pane,
             focus,
-            allow_all_focus: cx.focus_handle().tab_stop(true),
+            // Not a tab stop (Shady M1 of round 4): the kit's own Tab order
+            // would reach it from the composer. Only the card's Tab and a
+            // click focus it.
+            allow_all_focus: cx.focus_handle(),
             visible: window.is_visible(),
         };
         match (client, synthetic) {
@@ -3616,13 +3629,15 @@ impl AppView {
 
     /// The card's keys act: it is on screen in the active window with its
     /// buttons whole (a tiled window can be shorter than its minimum), no
-    /// overlay is open (the theme picker, the gear's menu), and nothing
+    /// overlay is open (the theme picker, the gear's menu, a worker's, a
+    /// session's or the workers menu: Tab steps them), and nothing
     /// typed in has the focus (the window's own), or a secret prompt's
     /// field does (`Some(true)`: Enter there submits). The composer, find
     /// and the other fields keep Enter and Esc.
     fn card_keys_live(&self, window: &Window, cx: &App) -> Option<bool> {
         let shown = self.card_on_screen();
-        if !self.card_up() || !shown || self.picker_open || self.gear_menu || !window.is_window_active() {
+        let menu = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some();
+        if !self.card_up() || !shown || self.picker_open || self.gear_menu || menu || !window.is_window_active() {
             None
         } else if self.secret_input.read(cx).focus_handle(cx).is_focused(window) {
             Some(true)
@@ -3636,6 +3651,18 @@ impl AppView {
     fn card_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let to = if self.allow_all_focus.is_focused(window) { &self.focus } else { &self.allow_all_focus };
         window.focus(to, cx);
+        cx.notify();
+    }
+
+    /// Tab (or Shift+Tab, `back`) in an open menu: its selection steps.
+    fn menu_tab(&mut self, back: bool, cx: &mut Context<Self>) {
+        if let Some((m, _)) = self.menu.as_mut() {
+            m.key("tab", back, true);
+        } else if let Some((m, _)) = self.smenu.as_mut() {
+            m.key("tab", back, true);
+        } else if let Some(m) = self.wmenu.as_mut() {
+            m.key("tab", back, true);
+        }
         cx.notify();
     }
 
@@ -6053,6 +6080,9 @@ impl Render for AppView {
             .track_focus(&self.focus)
             .when(card_tab, |d| d.key_context(ALLOW_ALL_CTX))
             .on_action(cx.listener(|this, _: &CardTab, window, cx| this.card_tab(window, cx)))
+            .when(self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some(), |d| d.key_context(MENU_CTX))
+            .on_action(cx.listener(|this, _: &MenuTab, _, cx| this.menu_tab(false, cx)))
+            .on_action(cx.listener(|this, _: &MenuTabBack, _, cx| this.menu_tab(true, cx)))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
             .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| match this.swallow_clicks {
@@ -6209,8 +6239,10 @@ impl Render for AppView {
                 {
                     // Space toggles Allow all only with its box focused: a new
                     // press, once the keys are armed (the toggle re-arms them).
+                    // Too early or held, it waits again, like Ctrl+Enter and
+                    // Esc ([`Arm`], Shady L3).
                     cx.stop_propagation();
-                    if this.chord_press && this.allow_all_offered() && this.current_card().is_some_and(|c| c.keys_armed()) {
+                    if this.allow_all_offered() && this.card_key_armed(cx) {
                         this.toggle_allow_all(cx);
                     }
                 } else if let Some(c) = card {
