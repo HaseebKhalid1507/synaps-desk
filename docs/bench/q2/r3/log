@@ -1,0 +1,13 @@
+19:44:51 main main-motion-1 load 9.43
+19:50:24 q2 q2-motion-1 load 10.05
+19:53:13 main main-motion-2 load 5.84
+19:56:23 q2 q2-motion-2 load 5.79
+20:00:58 main main-motion-3 load 5.81
+20:05:23 q2 q2-motion-3 load 5.88
+20:07:54 main main-bench-1 load 2.68
+20:08:21 q2 q2-bench-1 load 2.18
+20:08:48 main main-bench-2 load 1.89
+20:09:15 q2 q2-bench-2 load 1.63
+20:09:42 main main-bench-3 load 1.77
+20:10:09 q2 q2-bench-3 load 3.67
+MEM-DONE

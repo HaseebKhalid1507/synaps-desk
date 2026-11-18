@@ -310,6 +310,10 @@ pub(crate) enum Kind {
     /// The local date changed since the last dated row: a day line above
     /// its item's row ([`crate::times::Days`]); its `rev` is the day.
     Day,
+    /// A prompt's own row after its item (polish.md §2.6): the authorize
+    /// card, collapsing once answered, or a one-line receipt
+    /// ([`crate::authorize`]).
+    Prompt,
 }
 
 /// A day line's row id: its item's, with this bit (item ids count up from 1).
@@ -357,6 +361,27 @@ pub(crate) fn finished(s: Option<ToolStatus>) -> bool {
 
 fn status(i: &Item) -> Option<ToolStatus> {
     i.tool.as_ref().and_then(|t| t.status)
+}
+
+/// The call a prompt waits on: an unfinished call of the last turn, the
+/// first (Shady M1: the engine runs a response's calls that change things
+/// in one lane, in order, so only its head can be waiting on a confirm).
+/// With `pr`: the first whose tool is the one its scope names (and for a
+/// guard's shape, whose input holds the command's first line), else the
+/// first.
+pub(crate) fn waiting_call(items: &[Item], pr: Option<&synaps_client::protocol::PromptRequest>) -> Option<u64> {
+    let turn = items.iter().rposition(|i| i.kind == ItemKind::User).map_or(0, |u| u + 1);
+    let open: Vec<&Item> =
+        items[turn..].iter().filter(|i| i.kind == ItemKind::Tool && !finished(i.tool.as_ref().and_then(|t| t.status))).collect();
+    let tool = pr.and_then(|p| p.confirm_scope.as_ref()).and_then(|s| s.tool.as_deref()).filter(|t| !t.is_empty());
+    let line = pr.and_then(crate::authorize::guard_shape).map(|g| g.command.lines().next().unwrap_or_default().trim().to_string());
+    let named = |i: &&Item| {
+        i.tool
+            .as_ref()
+            .is_some_and(|t| tool.is_none_or(|n| t.name == n) && line.as_deref().is_none_or(|l| l.is_empty() || t.input.contains(l)))
+    };
+    let pick = if tool.is_some() || line.is_some() { open.iter().find(|i| named(i)) } else { None };
+    pick.or(open.first()).map(|i| i.id)
 }
 
 /// Where a rebuild after a change at item `k` starts: the turn holding
@@ -1342,6 +1367,7 @@ impl AppView {
             Kind::Summary { open, .. } => self.render_summary(d, open, &p, &m, cx),
             Kind::Work => self.render_work(item, row, d.id, &p, &m, lay, cx),
             Kind::Day => day_line(d, &p, &m),
+            Kind::Prompt => self.render_authorize(d, &p, &m, cx),
         };
         let who = match d.who {
             Who::None => None,
@@ -1376,23 +1402,25 @@ impl AppView {
         // streaming row's bottom-left in the gutter; lit while deltas come,
         // decaying once they stop. Touches no text.
         // Not on a day line over it (they share the item).
-        let head = (d.kind != Kind::Day && d.item + 1 == items.len() && matches!(item.kind, ItemKind::Assistant | ItemKind::Thinking))
-            .then(|| self.fx.change(Tag::Stream, item.id, item.text.len() as u64, self.fx.birth(item.id)))
-            .flatten()
-            .map(|(at, _)| self.fx.decay(Some(at), motion::HEAD_HOLD, motion::GLOW))
-            .filter(|k| *k > 0.)
-            .map(|k| {
-                let mark = if item.kind == ItemKind::Thinking { p.think } else { p.run_mark };
-                div()
-                    .absolute()
-                    // Clear of a gutter glyph's column (it ends at −8·r).
-                    .left(px((-6. * m.r).round()))
-                    .bottom_0()
-                    .w(px(2.))
-                    .h(px((26. * m.r).round()))
-                    .bg(motion::mix(p.canvas, mark, k))
-                    .debug_selector(|| "write-head".into())
-            });
+        let head = (!matches!(d.kind, Kind::Day | Kind::Prompt)
+            && d.item + 1 == items.len()
+            && matches!(item.kind, ItemKind::Assistant | ItemKind::Thinking))
+        .then(|| self.fx.change(Tag::Stream, item.id, item.text.len() as u64, self.fx.birth(item.id)))
+        .flatten()
+        .map(|(at, _)| self.fx.decay(Some(at), motion::HEAD_HOLD, motion::GLOW))
+        .filter(|k| *k > 0.)
+        .map(|k| {
+            let mark = if item.kind == ItemKind::Thinking { p.think } else { p.run_mark };
+            div()
+                .absolute()
+                // Clear of a gutter glyph's column (it ends at −8·r).
+                .left(px((-6. * m.r).round()))
+                .bottom_0()
+                .w(px(2.))
+                .h(px((26. * m.r).round()))
+                .bg(motion::mix(p.canvas, mark, k))
+                .debug_selector(|| "write-head".into())
+        });
         RowParts { body: out.child(block), label: hang, head }
     }
 }
@@ -1622,6 +1650,7 @@ impl AppView {
         let think = item.kind == ItemKind::Thinking;
         let st = status(item);
         let geo = Geo::of(lay, m);
+        let call_id = item.tool.as_ref().map(|t| t.tool_id.as_str());
         let starts = item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name));
         let worker = starts.and_then(|t| {
             let subs = self.model.shown_subagents();
@@ -1651,7 +1680,7 @@ impl AppView {
         } else {
             target_el(&row.card, &row.arg, p)
         };
-        // The call a prompt waits on (the last one unfinished).
+        // The call a prompt waits on ([`waiting_call`]).
         let waiting = !think && self.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty();
         let fx = &self.fx;
         let shown = self.model.shown();
@@ -1675,6 +1704,12 @@ impl AppView {
         // Thinking done says nothing in the gutter: only its running mark.
         let status_glyph = (!think || state.0 == Glyph::Run).then_some(status_glyph);
         let running = state.0 == Glyph::Run && !think;
+        let receipt = self.row_receipt(call_id).filter(|_| !think);
+        let counts = row.counts.element(p);
+        // A gated call runs from its answer (the wait is the receipt's).
+        let ran = running.then(|| clock(fx, crate::authorize::run_start(row.started, receipt))).flatten();
+        let word = crate::authorize::status_beside(state.1, receipt.map(|r| r.answer_for(st))).filter(|_| !lay.tight && !think);
+        let before = counts.is_some() || row.card.facts.is_some() || ran.is_some() || word.is_some() || row.card.server.is_some();
         let meta = h_flex()
             .flex_none()
             .ml(px(geo.gap))
@@ -1683,11 +1718,14 @@ impl AppView {
             .text_px(m.meta)
             .whitespace_nowrap()
             // The ledger's committed counts: nothing unless the call succeeded.
-            .children(row.counts.element(p))
+            .children(counts)
             .children(row.card.facts.clone().map(|f| div().text_color(p.dim_t).child(f)))
-            .children(running.then(|| clock(fx, row.started)).flatten().map(|c| div().text_color(p.dim_t).child(c)))
-            .when_some(state.1.filter(|_| !lay.tight && !think), |d, w| d.child(div().text_color(word_color).child(w)))
-            .children(row.card.server.clone().map(|s| div().text_color(p.dim_t).child(s)));
+            .children(ran.map(|c| div().text_color(p.dim_t).child(c)))
+            .when_some(word, |d, w| d.child(div().debug_selector(move || format!("tool-word {id}")).text_color(word_color).child(w)))
+            .children(row.card.server.clone().map(|s| div().text_color(p.dim_t).child(s)))
+            // An answered prompt's receipt (polish.md §2.6): `3s running ·
+            // allowed 19:14`, then `allowed 19:14 · 15s`.
+            .children(receipt.and_then(|_| self.receipt_el(call_id, st, before, running, p)));
         let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
         let verb = if think {
             div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.think).child("think").into_any_element()
@@ -2137,6 +2175,7 @@ mod tests {
                 Kind::Summary { open: true, .. } => "unfold",
                 Kind::Work => "work",
                 Kind::Day => "day",
+                Kind::Prompt => "prompt",
             })
             .collect()
     }

@@ -1,0 +1,22 @@
+| point | n | main RSS | Q2 RSS | Δ | main PSS | Q2 PSS | Δ | main anon | Q2 anon | Δ |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `--bench-motion` idle | 3/3 | 97,460 | 96,388 | -1.1 % | 73,432 | 71,726 | -2.3 % | 30,164 | 30,144 | -0.1 % |
+| `--bench-motion` end (after 5×5 load) | 3/3 | 126,748 | 126,068 | -0.5 % | 101,840 | 101,460 | -0.4 % | 58,112 | 57,488 | -1.1 % |
+| `--bench` idle | 3/3 | 97,232 | 96,276 | -1.0 % | 72,550 | 71,644 | -1.2 % | 30,168 | 30,212 | +0.1 % |
+| `--bench` long transcript | 3/3 | 152,240 | 151,664 | -0.4 % | 127,461 | 126,943 | -0.4 % | 83,276 | 83,272 | -0.0 % |
+| `--bench` end | 3/3 | 162,408 | 162,180 | -0.1 % | 137,619 | 137,100 | -0.4 % | 93,868 | 93,608 | -0.3 % |
+
+per run (PSS kB, excluding GPU driver):
+  `--bench-motion` idle                    main [73432, 73587, 72394] anon [30164, 30120, 30176]
+  `--bench-motion` idle                    q2   [73822, 71381, 71726] anon [30140, 30144, 30176]
+  `--bench-motion` end (after 5×5 load)    main [87478, 103423, 101840] anon [57480, 58608, 58112]
+  `--bench-motion` end (after 5×5 load)    q2   [97015, 101460, 101897] anon [58912, 57192, 57488]
+  `--bench` idle                           main [71993, 72550, 72814] anon [30088, 30300, 30168]
+  `--bench` idle                           q2   [71644, 71692, 71557] anon [30084, 30212, 30376]
+  `--bench` long transcript                main [126931, 127506, 127461] anon [83252, 83308, 83276]
+  `--bench` long transcript                q2   [127357, 126943, 126802] anon [83420, 83272, 83156]
+  `--bench` end                            main [137565, 137619, 138200] anon [93868, 93432, 94056]
+  `--bench` end                            q2   [137545, 137100, 130834] anon [93608, 93460, 93740]
+
+gate 3 idle_30s_prompt main: frames_presented [0, 0, 0], app_frames [0, 0, 0], cpu ms/s [2.83, 1.55, 2.74], prompt_pending [True, True, True]
+gate 3 idle_30s_prompt q2: frames_presented [0, 0, 0], app_frames [0, 0, 0], cpu ms/s [1.53, 1.5, 1.99], prompt_pending [True, True, True]

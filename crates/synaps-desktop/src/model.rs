@@ -3633,18 +3633,18 @@ mod fake_daemon {
         pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.may_answer(1));
         let mut card = None;
         let long_ago = Instant::now() - Duration::from_secs(5);
-        assert!(PromptCard::sync(&mut card, &m, long_ago, 1e4));
+        assert!(PromptCard::sync(&mut card, &m, long_ago, (0., 1e4)));
         assert!(card.as_ref().unwrap().armed(), "A's card has been up for 5 s");
         // A click switches to B's tab (the view drops its card on a switch);
         // B's prompt #1 attaches.
         m.tabs.open(B, "b", Place::New);
         let _cached_a = ui_switch(&mut m, &client, B, None);
         card = None;
-        assert!(!PromptCard::sync(&mut card, &m, Instant::now(), 1e4) && card.is_none(), "no card while B attaches");
+        assert!(!PromptCard::sync(&mut card, &m, Instant::now(), (0., 1e4)) && card.is_none(), "no card while B attaches");
         let mut b = attaches.recv_timeout(T).unwrap();
         b.send(attached_with_prompt(B, 1));
         pump(&mut m, &events, "B attached", |m| m.is_active(B) && m.may_answer(1));
-        assert!(PromptCard::sync(&mut card, &m, Instant::now(), 1e4), "B's prompt #1 is a new card");
+        assert!(PromptCard::sync(&mut card, &m, Instant::now(), (0., 1e4)), "B's prompt #1 is a new card");
         let c = card.as_ref().unwrap();
         assert!(!c.armed(), "unarmed: the double-click's second click lands on nothing");
         assert!(!crate::app::authorize_ready(c.armed(), Some(0.), true));
@@ -3691,9 +3691,9 @@ mod fake_daemon {
         a.send(attached_with(A, 1, "edit README.md"));
         pump(&mut m, &events, "A attached", |m| m.may_answer(1));
         let mut card = None;
-        assert!(PromptCard::sync(&mut card, &m, Instant::now() - ARM, 1e4), "a new card");
+        assert!(PromptCard::sync(&mut card, &m, Instant::now() - ARM, (0., 1e4)), "a new card");
         assert!(card.as_ref().is_some_and(|c| c.armed() && c.body.contains("edit README.md")));
-        assert!(!PromptCard::sync(&mut card, &m, Instant::now(), 1e4), "the same prompt keeps its card");
+        assert!(!PromptCard::sync(&mut card, &m, Instant::now(), (0., 1e4)), "the same prompt keeps its card");
         // The daemon goes away; the client reconnects (same attach_seq).
         let seq = m.active.as_ref().unwrap().attach_seq;
         drop(a);
@@ -3709,7 +3709,7 @@ mod fake_daemon {
         pump(&mut m, &events, "A reattached", |m| !m.reattaching && m.may_answer(1));
         assert_eq!(m.active.as_ref().unwrap().attach_seq, seq, "a reconnect keeps the attach_seq");
         assert_ne!(m.active.as_ref().unwrap().connection, stale, "a new connection");
-        assert!(PromptCard::sync(&mut card, &m, Instant::now(), 1e4), "the restarted daemon's #1 is a new card");
+        assert!(PromptCard::sync(&mut card, &m, Instant::now(), (0., 1e4)), "the restarted daemon's #1 is a new card");
         let c = card.as_ref().unwrap();
         assert!(c.body.contains("rm -rf ~/work") && !c.body.contains("README"), "the new text: {}", c.body);
         assert!(!c.armed(), "unarmed");
