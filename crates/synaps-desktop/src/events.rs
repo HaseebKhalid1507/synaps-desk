@@ -283,7 +283,10 @@ mod tests {
                 ask,
                 "<event id=\"e1\" type=\"message\" severity=\"medium\" source=\"agent-comms\" channel=\"comms\">[comms] #7 ask from kestrel: is the build green?\n↩ comms_send(re=7, text=...)</event>",
             ),
-            (alert, "<event id=\"e1\" type=\"message\" severity=\"critical\" source=\"cli\" channel=\"alerts\">disk at 91% on /srv</event>"),
+            (
+                alert,
+                "<event id=\"e1\" type=\"message\" severity=\"critical\" source=\"cli\" channel=\"alerts\">disk at 91% on /srv</event>",
+            ),
         ] {
             let history = ExternalEvent::from_payload(form).expect("the form parses");
             assert_eq!(EventView::of(&e.shown()), EventView::of(&history), "{form}");
