@@ -2097,8 +2097,13 @@ pub(crate) fn live_glyph(
         }
         _ => match change.filter(|c| (c.1 as usize) < Glyph::ALL.len()) {
             Some((at, prev)) => {
-                let p = if fade { fx.shot(Some(at), Duration::ZERO, motion::QUICK, &ease::INOUT, Mk::Fade) } else { fx.write_on(Some(at)) };
-                glyph::change(Some((Glyph::ALL[prev as usize], mark)), g, mark, ground, p, fade)
+                let from = Glyph::ALL[prev as usize];
+                if fade {
+                    let p = fx.shot(Some(at), Duration::ZERO, motion::QUICK, &ease::INOUT, Mk::Fade);
+                    return glyph::change(Some((from, mark)), g, mark, ground, p, true);
+                }
+                let (old, p) = fx.write_on(Some(at));
+                glyph::change_over(Some((from, fx.beat_at(at), mark)), g, mark, ground, old, p)
             }
             None => glyph::draw(g, mark),
         },

@@ -540,18 +540,21 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 level(cx, crate::motion::Level::Full);
                 // `SYNAPS_BENCH_LIFE=N` (Q3 evidence, polish.md §3 Life): after
                 // N s, a scripted turn on the bench's session, the scene a
-                // capture records: a bash call runs (the spinner, its sweep
-                // after 1 s, the composer's), workers spawn, run (their tool
-                // counts and steps roll) and end (the check writes on), a call
-                // fails (the cross), a prompt comes (NEEDS YOU's count rolls),
-                // a rail row is favourited (the star hops), the turn ends.
+                // capture records: a bash call runs (the spinner, its clock,
+                // the composer's sweep), workers spawn, run (their tool counts
+                // and steps roll) and end (the check writes on), a call fails
+                // (the cross), the fan-out widens past the tray's lines (`+N
+                // more` rolls), a prompt comes (NEEDS YOU's count rolls), a
+                // rail row is favourited (the star hops once it has landed),
+                // the turn ends. Every event stamped, as a daemon's are.
                 // `SYNAPS_BENCH_LIFE_LEVEL=full|reduced|off`: the level.
                 if let Some(after) = std::env::var("SYNAPS_BENCH_LIFE").ok().and_then(|s| s.parse::<f64>().ok()) {
                     let lv = std::env::var("SYNAPS_BENCH_LIFE_LEVEL").ok().and_then(|s| crate::motion::Level::parse(&s));
                     level(cx, lv.unwrap_or(crate::motion::Level::Full));
                     let apply = |cx: &mut AsyncWindowContext, evs: Vec<Value>| {
+                        let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
                         let _ = upd(cx, &|v, cx| {
-                            v.apply_batch(evs.iter().cloned().filter_map(local_raw).collect(), cx);
+                            v.apply_batch(evs.iter().cloned().filter_map(local_raw).map(|e| e.with_ts(ts.clone())).collect(), cx);
                             v.sync_list();
                         });
                     };
@@ -631,8 +634,31 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     sleep(1.5).await;
                     let mut rows = vec![row(1, "scout", "completed", 4, "", 9.4)];
                     rows.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "running", 2, "grep -n Stale src", 3.2)));
-                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": rows})]);
+                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": rows.clone()})]);
                     sleep(2.0).await;
+                    // A wider fan-out (P5's `+N more`): seven more workers, more
+                    // than the tray's chip lines hold, then one more (its count
+                    // rolls).
+                    let fan = |n: u64, rows: &mut Vec<Value>, evs: &mut Vec<Value>| {
+                        for k in 6..6 + n {
+                            let name = format!("probe-{k}");
+                            evs.extend(spawn(k, &name, "Probe one shard of the token store for stale entries"));
+                            // The first seven have run 1.5 s by the eighth.
+                            let secs = if n > 7 && k < 13 { 1.8 } else { 0.3 };
+                            rows.push(row(k, &name, "running", 1, "reading shard", secs));
+                        }
+                    };
+                    let (mut wide, mut evs) = (rows.clone(), Vec::new());
+                    fan(7, &mut wide, &mut evs);
+                    evs.push(json!({"ev": "subagent_rows", "rows": wide}));
+                    apply(cx, evs);
+                    sleep(1.5).await;
+                    let (mut wide, mut evs) = (rows, Vec::new());
+                    fan(8, &mut wide, &mut evs);
+                    evs.drain(..14);
+                    evs.push(json!({"ev": "subagent_rows", "rows": wide}));
+                    apply(cx, evs);
+                    sleep(1.5).await;
                     let _ = upd(cx, &|v, _| {
                         if let Ok(request) = serde_json::from_value(json!({
                             "id": 7, "kind": "confirm", "title": "Run a command?", "prompt": "Tool: bash\nInput that will run:\n$ cargo test"

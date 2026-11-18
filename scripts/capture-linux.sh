@@ -10,6 +10,8 @@
 #   CAPTURE_SETTINGS='{...}'     the settings file it starts with (default: text 16, nord)
 #   CAPTURE_WSI=sw               how the app's frames reach the X server (below); `dri3` is the
 #                                driver's own path, for showing the capture artefact
+#   CAPTURE_FPS=30               the recording's frame rate (60 for frame-by-frame motion)
+#   CAPTURE_HZ=144               gamescope's refresh (the app's display rate)
 # Leaves <outdir>/clip.mkv (libx264rgb -qp 0: every pixel as drawn), app.log, gs.log.
 # Frame-by-frame: scripts/frame-dips.py <outdir>/clip.mkv.
 #
@@ -40,7 +42,7 @@ esac
 app=$(printf '%q ' env XDG_CONFIG_HOME="$cfg" "${wsi[@]}" "$bin" "$@" --size "$size")
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 unset DISPLAY WAYLAND_DISPLAY
-ENABLE_GAMESCOPE_WSI=0 setsid gamescope --backend headless -r 144 -W "$w" -H "$h" -w "$w" -h "$h" -- \
+ENABLE_GAMESCOPE_WSI=0 setsid gamescope --backend headless -r "${CAPTURE_HZ:-144}" -W "$w" -H "$h" -w "$w" -h "$h" -- \
   bash -c "echo \$DISPLAY > '$out/display'; exec $app > '$out/app.log' 2>&1" > "$out/gs.log" 2>&1 < /dev/null &
 gs=$!
 hov=""
@@ -65,6 +67,6 @@ if [ "${CAPTURE_HOVER:-1}" = 1 ]; then
 fi
 sleep 0.5
 # The window's own pixels (-window_id): recording the root under gamescope gives black frames.
-ffmpeg -loglevel error -f x11grab -window_id "$wid" -framerate 30 -i "$DISPLAY" -t "$secs" \
+ffmpeg -loglevel error -f x11grab -window_id "$wid" -framerate "${CAPTURE_FPS:-30}" -i "$DISPLAY" -t "$secs" \
   -c:v libx264rgb -qp 0 -preset ultrafast -y "$out/clip.mkv"
 echo "$out/clip.mkv (${CAPTURE_WSI:-sw}, ${secs} s)"
