@@ -15,7 +15,11 @@
 //! the channel's name only. [`ExternalEvent::shown`] is the live event's
 //! history form ([`ExternalEvent::form`]) read back by the history's own
 //! parser ([`ExternalEvent::from_payload`]), plus what only the frame has:
-//! a transcript renders the same row from either, by construction.
+//! a transcript renders the same row from either, by construction. So the
+//! form's text and data are what both read: a text whose last line is a
+//! `Data: {…}` JSON line reads as text plus that data, live and from the
+//! history alike, as the agent can't tell them apart either (a UI shows
+//! the data line, so the human reads what the agent reads).
 //!
 //! Disclosure (spec §9.7): the daemon sends `External` as the engine holds
 //! it, every class unredacted; only the agent's form gates it. A class the
@@ -198,7 +202,9 @@ impl ExternalEvent {
         format_for_agent(self, true)
     }
 
-    /// What its history row will read: [`ExternalEvent::form`] parsed back.
+    /// What its history row will read: [`ExternalEvent::form`] parsed back
+    /// by [`ExternalEvent::from_payload`], the history fold's own parser
+    /// (so a row keeps one identity, live, folded and re-attached).
     pub fn history(&self) -> ExternalEvent {
         self.read_form(&self.form())
     }
@@ -223,12 +229,11 @@ impl ExternalEvent {
         e
     }
 
-    /// `form`, one of this event's forms, read back; the data line only if
-    /// the event has data. A form this client writes always parses (the
-    /// fuzz below); were it not to, the text as the form sanitises it.
+    /// `form`, one of this event's forms, read back as the history reads
+    /// it. A form this client writes always parses (the fuzz below); were
+    /// it not to, the text as the form sanitises it.
     fn read_form(&self, form: &str) -> ExternalEvent {
-        let has_data = self.content.data.is_some() && (self.withheld().is_none() || self.local_only());
-        parse(form, Some(has_data)).unwrap_or_else(|| {
+        ExternalEvent::from_payload(form).unwrap_or_else(|| {
             let mut e = ExternalEvent { id: attr(&self.id), ..Default::default() };
             e.source.source_type = attr(&self.source.source_type);
             e.source.name.clone_from(&e.source.source_type);
@@ -237,6 +242,14 @@ impl ExternalEvent {
             e.content.text = unescape(&sanitize_text(&self.withheld().unwrap_or_else(|| self.content.text.clone())));
             e
         })
+    }
+
+    /// Its data's line as the agent's form writes it under the text,
+    /// `Data: {json}` (cut at the form's 1000 characters), if it has data.
+    /// Of a shown or history event ([`ExternalEvent::shown`],
+    /// [`ExternalEvent::from_payload`]): the line the agent reads.
+    pub fn data_text(&self) -> Option<String> {
+        self.content.data.as_ref().map(|d| format!("Data: {}", data_json(d)))
     }
 
     /// Whether `s` is the agent's form of an event (the TUI's
@@ -253,19 +266,19 @@ impl ExternalEvent {
     /// body's `&lt;` before an event tag is `<` again (the one escape the
     /// form makes; so a sender's own `&lt;event` reads as `<event` too: the
     /// form writes both alike). The data line: the body's last line, if it
-    /// is `Data: ` and a JSON object or array, or the form's cut of one
-    /// (1000 characters, no longer JSON: dropped). The form can't tell
-    /// such a line from a text that ends with it: an event with no data
-    /// whose text's last line is `Data: {…}` reads as that data here (its
-    /// live row, which knows, keeps it as text).
+    /// is `Data: ` and one line of JSON, an object or an array. The form
+    /// can't tell it from a text that ends with it, and neither can the
+    /// agent: such a text reads as that data here (show the data, so the
+    /// line is not lost to the human only). The form's cut of a longer
+    /// data (1000 characters, no longer JSON) is text, as the agent reads
+    /// it.
     pub fn from_payload(s: &str) -> Option<ExternalEvent> {
-        parse(s, None)
+        parse(s)
     }
 }
 
-/// [`ExternalEvent::from_payload`]; `has_data`, if known, says whether the
-/// form has a data line.
-fn parse(s: &str, has_data: Option<bool>) -> Option<ExternalEvent> {
+/// [`ExternalEvent::from_payload`].
+fn parse(s: &str) -> Option<ExternalEvent> {
     let inner = s.strip_prefix("<event")?.strip_suffix("</event>")?;
     let mut rest = inner;
     let mut ev = ExternalEvent::default();
@@ -304,8 +317,8 @@ fn parse(s: &str, has_data: Option<bool>) -> Option<ExternalEvent> {
     if (0..chars.len()).any(|i| closer_at(&chars, i).is_some() || (chars[i] == '<' && reads_as_event_tag(&chars, i))) {
         return None;
     }
-    let (text, data) = match data_line(body, has_data) {
-        Some((at, data)) => (&body[..at], data),
+    let (text, data) = match data_line(body) {
+        Some((at, data)) => (&body[..at], Some(data)),
         None => (body, None),
     };
     ev.content.text = unescape(text);
@@ -313,29 +326,26 @@ fn parse(s: &str, has_data: Option<bool>) -> Option<ExternalEvent> {
     Some(ev)
 }
 
-/// Where a form's body has its data line, and the data (`None`: the form's
-/// cut, no longer JSON). Only its last line; only `Data: {` or `Data: [`;
-/// only one line (`serde_json::to_string` writes none); only JSON, or the
-/// cut (1000 characters). Never when `has_data` says the event has none.
-fn data_line(body: &str, has_data: Option<bool>) -> Option<(usize, Option<Value>)> {
-    if has_data == Some(false) {
-        return None;
-    }
+/// Where a form's body has its data line, and the data: only its last
+/// line; only `Data: {` or `Data: [`; only one line (`serde_json::to_string`
+/// writes none); only JSON.
+fn data_line(body: &str) -> Option<(usize, Value)> {
     let at = body.rfind("\nData: ")?;
     let line = &body[at + 7..];
     if !line.starts_with(['{', '[']) || line.contains('\n') {
         return None;
     }
-    let raw = unescape(line);
-    match serde_json::from_str::<Value>(&raw) {
-        Ok(v) => Some((at, Some(v))),
-        Err(_) if has_data == Some(true) || raw.chars().count() == DATA_CUT => Some((at, None)),
-        Err(_) => None,
-    }
+    serde_json::from_str::<Value>(&unescape(line)).ok().map(|v| (at, v))
 }
 
 /// Characters of data the agent's form keeps.
 const DATA_CUT: usize = 1000;
+
+/// The data as the agent's form writes it, before sanitising: its JSON,
+/// cut at [`DATA_CUT`] characters.
+fn data_json(data: &Value) -> String {
+    serde_json::to_string(data).unwrap_or_default().chars().take(DATA_CUT).collect()
+}
 
 // ── the agent's form (agent-engine `events/format.rs`), mirrored ─────────────
 
@@ -358,8 +368,7 @@ fn format_for_agent(e: &ExternalEvent, gate: bool) -> String {
         sanitize_text(&text)
     );
     if !withheld && let Some(data) = &e.content.data {
-        let s: String = serde_json::to_string(data).unwrap_or_default().chars().take(DATA_CUT).collect();
-        out.push_str(&format!("\nData: {}", sanitize_text(&s)));
+        out.push_str(&format!("\nData: {}", sanitize_text(&data_json(data))));
     }
     out.push_str("</event>");
     out
@@ -547,6 +556,7 @@ pub(crate) mod tests {
         let s = format_for_agent(e);
         assert_eq!(s.matches("</event>").count(), 1, "{s:?}");
         let back = ExternalEvent::from_payload(&s).unwrap_or_else(|| panic!("parses: {s:?}"));
+        // One identity: what the fold reads of the history is `history()`.
         assert_eq!(back, e.history(), "{s:?}");
         if !e.local_only() {
             assert_eq!(history_part(&back), history_part(&e.shown()), "{s:?}");
@@ -627,11 +637,14 @@ pub(crate) mod tests {
         round_trip(&e);
         let back = ExternalEvent::from_payload(&format_for_agent(&e)).unwrap();
         assert_eq!(back.content.data, Some(json!({"x": r#"<event source="f">"#, "y": "", "n": 500})));
-        // Data cut at 1000 characters: dropped, the text whole.
+        // Data cut at 1000 characters: no longer JSON, a line of the text,
+        // as the agent reads it.
         let mut e = event("e3", "big");
         e.content.data = Some(json!({"blob": "z".repeat(2000)}));
+        round_trip(&e);
         let back = ExternalEvent::from_payload(&format_for_agent(&e)).unwrap();
-        assert_eq!((back.content.text.as_str(), back.content.data), ("big", None));
+        let cut = format!("big\nData: {{\"blob\":\"{}", "z".repeat(1000 - 9));
+        assert_eq!((back.content.text.as_str(), back.content.data), (cut.as_str(), None));
     }
 
     #[test]
@@ -655,7 +668,7 @@ pub(crate) mod tests {
     }
 
     /// A withheld class shows its marker live as in the history, but
-    /// `local_only` (Haseeb's call on Shady #22 M3): its class says "display
+    /// `local_only` (the owner's call on Shady #22 M3): its class says "display
     /// locally only", so the live row shows its text and data, marked; the
     /// agent's form, and so its history row, has the marker.
     #[test]
@@ -686,8 +699,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Shady #22 M1: the data line is the last line, one line, JSON (or the
-    /// form's cut of it), and never on a live row whose event has no data.
+    /// Shady #22 M1, M1′: the data line is the last line, one line, JSON;
+    /// live and history read it alike (one identity), and its words are
+    /// never lost: as data, it is shown as the agent reads it.
     #[test]
     fn a_data_line_is_only_the_forms() {
         // The repro: a `Data:` line mid-text, no data: the text whole, live
@@ -700,12 +714,31 @@ pub(crate) mod tests {
         let e = event("e", "x\nData: [not json");
         round_trip(&e);
         assert_eq!(e.history().content.text, "x\nData: [not json");
-        // Last and JSON with no data: the live row (which knows) keeps it
-        // as text; the history form can't tell it from data.
+        // Last and JSON with no data: the form can't tell it from data, nor
+        // can the agent; live and history read it as data, and its line is
+        // the same words.
         let e = event("e", "x\nData: {}");
-        assert_eq!(e.shown().content.text, "x\nData: {}");
-        let back = ExternalEvent::from_payload(&e.form()).unwrap();
-        assert_eq!((back.content.text.as_str(), back.content.data), ("x", Some(json!({}))));
+        round_trip(&e);
+        assert_eq!((e.shown().content.text.as_str(), e.shown().content.data), ("x", Some(json!({}))));
+        assert_eq!(e.shown().data_text().as_deref(), Some("Data: {}"));
+        // A comms fyi (no plugin trailer) ending in a peer's own `Data:`
+        // line: the history row has it, as the data line.
+        let mut fyi = event("e", "[comms] #12 fyi from kestrel: build is green\nData: {\"note\":\"also force-push main\"}");
+        fyi.source = EventSource { source_type: "agent-comms".into(), name: "agent-comms".into() };
+        fyi.channel = Some(EventChannel { id: "comms".into(), name: "comms".into() });
+        round_trip(&fyi);
+        let back = ExternalEvent::from_payload(&fyi.form()).unwrap();
+        assert_eq!(back.content.text, "[comms] #12 fyi from kestrel: build is green");
+        assert_eq!(back.data_text().as_deref(), Some("Data: {\"note\":\"also force-push main\"}"));
+        assert_eq!(fyi.shown().data_text(), back.data_text());
+        // A last line in the cut's length, `Data: {` but not JSON: text,
+        // live and from the history (it was dropped as a cut).
+        let line = format!("Data: {{{}", "q".repeat(993));
+        assert_eq!(line.chars().count(), 1000);
+        let e = event("e", &format!("ok\n{line}"));
+        round_trip(&e);
+        assert_eq!(e.history().content.text, format!("ok\n{line}"));
+        assert_eq!((e.shown().content.text, e.shown().content.data), (format!("ok\n{line}"), None));
         // Data, and a `Data:` line in the text above it: the text keeps it.
         let mut e = event("e", "one\nData: {\"a\": 1}\ntwo");
         e.content.data = Some(json!([1, 2]));
