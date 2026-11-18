@@ -2,6 +2,17 @@
 
 Commit hashes are this repository's (`synaps-desk`). PR numbers other than synaps-desk#N are those of the archived `synaps-desktop` repository this history was rewritten from.
 
+## Since 9b0d263
+
+Engine events (synaps-desk `feat/events`). Additive; one behaviour change for history rows that are events.
+
+- New `events` module: `ExternalEvent` (with `EventSource`, `EventChannel`, `EventSender`, `EventContent`, `Severity`), the engine's `events::types::Event` mirrored leniently (`id`, `source` and `content` required, every other field optional, unknown fields ignored; `severity` any case, anything else `Medium`; `disclosure` kept as text). `ExternalEvent::from_payload` parses the history form (`format_event_for_agent`: `<event id type severity source [channel]>text[\nData: json]</event>`), strictly (a forged closer or opener, a missing attribute: `None`); `ExternalEvent::shown` puts a live event in the form its history row will have (the same text; a withheld disclosure class as the same marker, its data dropped); `is_payload`, `is_worker_note`, `withheld`, `severity`.
+- New `SessionEvent::External { event: Box<ExternalEvent> }` (it decoded to `Unknown` before; a body without `id`, `source` or `content` is now a `DecodeError`).
+- New `ItemKind::Event` and `Item::event: Option<Arc<ExternalEvent>>`. **Behaviour:** a history user message that is an event's form (not a worker's note) is an `Event` row, not a `Notice` of the raw text; a live `External` (or a `Steered` / `SteeringDelivered` carrying an event's form) adds one, a note until its history message lands, then that message's row (same id, its live time and fields kept). One row per event id; never a `User` row, never a `steered:` notice. Worker notes (`source = subagent`, `subagent_completion` / `_steer` / `_cancelled`) are `Notice`s as before and add no live row. A `<event` message that does not parse stays a `Notice`.
+- Tests: `events::tests` (decode, the `format.rs` vectors, forged forms, disclosure, a 3000-case fuzz) and `tests/events.rs` (wake and mid-turn parity, dedupe, worker notes).
+
+For synaps-avatar (nyx): nothing breaks (`ItemKind` and `SessionEvent` are `#[non_exhaustive]`); history events now come as `ItemKind::Event` rather than `Notice`.
+
 ## Since c9dc8c7
 
 Additive only (synaps-desk#11 `feat/favourites`): the daemon's word on a resume that followed a compaction chain. Nothing existing changes shape.
