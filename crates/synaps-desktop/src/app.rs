@@ -1066,6 +1066,8 @@ pub(crate) struct FoldGap {
     hold: bool,
     at: Instant,
     response: f32,
+    /// The clock at its last frame (a late frame pauses the spring).
+    seen: Instant,
 }
 
 impl FoldGap {
@@ -1074,12 +1076,13 @@ impl FoldGap {
         self.id == id
     }
 
-    /// The spring's response for `h` px: `sheet`, slower past 306 px. A
+    /// The spring's response for `h` px: `sheet`, slower past 252 px. A
     /// critically damped spring's peak speed is `h · 2π / (e · r)`: at
-    /// `h / 850`, 1965 px/s (33 px a 60 Hz frame; the gate's bar is about
-    /// 40), up to a 1020 px room.
+    /// `h / 700`, 1617 px/s, 27 px a 60 Hz frame and 34 px over three
+    /// 144 Hz frames (what a 60 Hz capture can see at once; the gate's bar
+    /// is about 40), up to a 1050 px room.
     fn response(h: f32) -> f32 {
-        (h / 850.).clamp(crate::motion::SHEET_RESPONSE, 1.2)
+        (h / 700.).clamp(crate::motion::SHEET_RESPONSE, 1.5)
     }
 
     /// Its room at `now`, whole pixels.
@@ -1786,15 +1789,12 @@ pub struct AppView {
     /// A run folding while watched: its rows' room under its summary
     /// ([`FoldGap`], [`AppView::fold_gap_now`]).
     pub(crate) fold_gap: RefCell<Option<FoldGap>>,
-    /// An open run's header, as last laid out (a fold whose header is above
-    /// the view keeps it just above the view's top: [`AppView::start_gap`]).
-    pub(crate) summary_h: Cell<f32>,
-    /// A body closing that the user clicked (S1): its row's id, and the
-    /// content under the view when it began.
+    /// The metrics the last frame drew with (a fold's header height:
+    /// [`AppView::start_gap`]).
+    pub(crate) metrics_last: Cell<Option<Metrics>>,
     /// A body the user opened or closed (S1): its row's id, the content
     /// under the view when it began, whether it opens, and the frame.
     pub(crate) body_hold: Cell<Option<(u64, f32, bool, u64)>>,
-    pub(crate) summary_est: Cell<f32>,
     /// Answered prompts' receipts, by session ([`crate::authorize::Receipt`]).
     pub(crate) receipts: HashMap<String, Vec<crate::authorize::Receipt>>,
     /// The answer this window sent to the card, until its prompt resolves.
@@ -2434,9 +2434,8 @@ impl AppView {
             card_exit: None,
             fold_slack: Cell::new(None),
             fold_gap: RefCell::new(None),
-            summary_h: Cell::new(0.),
+            metrics_last: Cell::new(None),
             body_hold: Cell::new(None),
-            summary_est: Cell::new(41.),
             receipts: HashMap::new(),
             sent: None,
             card_keys: Cell::new(None),
@@ -3946,6 +3945,22 @@ impl AppView {
         // draws the beat it was armed for, a few ms ahead): a position on a
         // spring steps by its frame's time only.
         let now = self.fx.clock();
+        // A late frame (a hitch, a busy machine) pauses the fold past a
+        // 60 Hz frame's time, its held room's spring with it: the column
+        // goes on from where it was, never skips (N1: ~40 px a frame).
+        let late = now.saturating_duration_since(g.seen).saturating_sub(Duration::from_micros(16_700));
+        let g = if late > Duration::ZERO && g.seen > g.at {
+            if let Some(mut s) = self.fold_slack.get()
+                && let Some((l, t, r)) = s.gone
+            {
+                s.gone = Some((l, t + late, r));
+                self.fold_slack.set(Some(s));
+            }
+            FoldGap { at: g.at + late, seen: now, ..g }
+        } else {
+            FoldGap { seen: now, ..g }
+        };
+        *self.fold_gap.borrow_mut() = Some(g.clone());
         let h = g.h(now);
         if h < 1. {
             *self.fold_gap.borrow_mut() = None;
@@ -3981,9 +3996,6 @@ impl AppView {
         let gone: Vec<usize> = (lo..hi).filter(|&ix| self.disp[ix].kind == Kind::Work && !kept(&self.disp[ix])).collect();
         let ys = |ix: usize| l.bounds_for_item(ix).map(|b| (f32::from(b.top()), f32::from(b.bottom())));
         let header = (lo..hi).find(|&ix| self.disp[ix].id == id && matches!(self.disp[ix].kind, Kind::Summary { .. })).and_then(ys);
-        if let Some((t, b)) = header {
-            self.summary_h.set(b - t);
-        }
         let last = gone.last().copied();
         let max = f32::from(l.max_offset_for_scrollbar().y);
         let at = -f32::from(l.scroll_px_offset_for_scrollbar().y);
@@ -4011,8 +4023,16 @@ impl AppView {
     fn start_gap(&mut self, folded: Option<Folded>) {
         let Some(f) = folded else { return };
         let fluid = self.fx.fluid();
-        let head = Some(self.summary_h.get()).filter(|h| *h > 0.).unwrap_or(self.summary_est.get());
         let summary = self.disp.iter().position(|d| d.id == f.id && matches!(d.kind, Kind::Summary { .. }));
+        // The summary's height as it folds (no bottom edge: its room goes
+        // on under it): the gap above it, its card's top edge, its row.
+        let head = match (summary.and_then(|ix| self.disp.get(ix)), self.metrics_last.get()) {
+            (Some(d), Some(m)) => {
+                let g = crate::cards::Geo::of(&m);
+                turns::gap_of(d.gap, &m) + g.inset + 1. + g.row
+            }
+            _ => 41.,
+        };
         // Where its room starts: under its header; with none (a live
         // turn's rows), under the new one in its first row's place; its
         // top above the view, at the view's top (the header just above).
@@ -4057,7 +4077,8 @@ impl AppView {
             self.fold_slack.set(Some(s));
         }
         let rows: Rc<[Disp]> = rows.into_iter().map(|r| r.0).collect();
-        *self.fold_gap.borrow_mut() = Some(FoldGap { id: f.id, rows, inner, from, below: f.below, hold: !f.following, at: now, response });
+        *self.fold_gap.borrow_mut() =
+            Some(FoldGap { id: f.id, rows, inner, from, below: f.below, hold: !f.following, at: now, response, seen: now });
         self.fx.want_frame();
     }
 
@@ -6931,9 +6952,7 @@ impl Render for AppView {
         let gap = self.fold_gap_now();
         let slack = self.tail_slack();
         let geo = crate::cards::Geo::of(&m);
-        if self.summary_h.get() <= 0. {
-            self.summary_est.set(geo.row + geo.inset + 1.);
-        }
+        self.metrics_last.set(Some(m));
         let list = list(
             self.list.clone(),
             cx.processor(move |this, ix, _window, cx| {

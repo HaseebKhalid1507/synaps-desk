@@ -318,7 +318,11 @@ mod tests {
                     assert!(con(text, bg) >= 4.45, "{name} {accent:?}: Allow's outlined label ({hovered}, {pressed})");
                 }
                 for style in [AllowStyle::Fill, AllowStyle::Outline] {
-                    assert_ne!(style.colors(&p, true, true).0, style.colors(&p, false, false).0, "{name} {accent:?}: {style:?} pressed shows");
+                    assert_ne!(
+                        style.colors(&p, true, true).0,
+                        style.colors(&p, false, false).0,
+                        "{name} {accent:?}: {style:?} pressed shows"
+                    );
                 }
             }
         }

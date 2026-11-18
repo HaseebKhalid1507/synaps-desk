@@ -269,7 +269,7 @@ pub(crate) fn mean_height(disp: &[Disp], rows: &[RowCache], m: &Metrics, cpl: f3
     total / disp.len() as f32
 }
 
-fn gap_of(gap: Gap, m: &Metrics) -> f32 {
+pub(crate) fn gap_of(gap: Gap, m: &Metrics) -> f32 {
     match gap {
         Gap::None => 0.,
         Gap::First => m.first_gap,
