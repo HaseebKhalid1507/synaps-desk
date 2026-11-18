@@ -1,0 +1,17 @@
+full-1280-trace.mp4 | h264,1280,720,gbrp,120 | 120 frames | | frame md5s de3337fb90df vs capture A 5.5-9.5 de3337fb90df IDENTICAL
+full-1280-hover-press.mp4 | h264,1280,720,gbrp,171 | 171 frames | | frame md5s db7c838d7419 vs capture A 15.5-21.2 db7c838d7419 IDENTICAL
+full-1280-allow-collapse.mp4 | h264,1280,720,gbrp,120 | 120 frames | | frame md5s da8743e923f8 vs capture A 20.8-24.8 da8743e923f8 IDENTICAL
+full-1280-deny-collapse.mp4 | h264,1280,720,gbrp,120 | 120 frames | | frame md5s 7455d066a12b vs capture A 39.5-43.5 7455d066a12b IDENTICAL
+full-1280-answered-elsewhere.mp4 | h264,1280,720,gbrp,120 | 120 frames | | frame md5s a107e993c5c4 vs capture A 60.5-64.5 a107e993c5c4 IDENTICAL
+full-1280-ctrlj-from-stub.mp4 | h264,1280,720,gbrp,291 | 291 frames | | frame md5s 51702b71e134 vs capture A 78.3-88 51702b71e134 IDENTICAL
+full-1280-allow-all.mp4 | h264,1280,720,gbrp,165 | 165 frames | | frame md5s 244e7b497aed vs capture A 104.5-110 244e7b497aed IDENTICAL
+full-1280-secret.mp4 | h264,1280,720,gbrp,465 | 465 frames | | frame md5s a91377b97992 vs capture A 127.5-143 a91377b97992 IDENTICAL
+reduced-1280-arrival.mp4 | h264,1280,720,gbrp,150 | 150 frames | | frame md5s 3d33ca53d311 vs capture reduced 4-9 3d33ca53d311 IDENTICAL
+reduced-1280-allow-collapse.mp4 | h264,1280,720,gbrp,114 | 114 frames | | frame md5s 1b484cebc21a vs capture reduced 15.2-19 1b484cebc21a IDENTICAL
+reduced-1280-deny-collapse.mp4 | h264,1280,720,gbrp,111 | 111 frames | | frame md5s ac6022ede8c1 vs capture reduced 34.3-38 ac6022ede8c1 IDENTICAL
+off-1280-arrival.mp4 | h264,1280,720,gbrp,150 | 150 frames | | frame md5s e983130ad87f vs capture off 4-9 e983130ad87f IDENTICAL
+off-1280-allow-collapse.mp4 | h264,1280,720,gbrp,114 | 114 frames | | frame md5s 38afa285304a vs capture off 15.2-19 38afa285304a IDENTICAL
+off-1280-deny-collapse.mp4 | h264,1280,720,gbrp,111 | 111 frames | | frame md5s 703378ff6ec6 vs capture off 34.3-38 703378ff6ec6 IDENTICAL
+paper-full-1280-hover-press-allowall.mp4 | h264,1280,720,gbrp,345 | 345 frames | | frame md5s f100682f9411 vs capture paper 15.5-27 f100682f9411 IDENTICAL
+full-860x640-card-allow.mp4 | h264,860,640,gbrp,330 | 330 frames | | frame md5s ae924b087330 vs capture n860x640 12-23 ae924b087330 IDENTICAL
+full-1280-trace-a02a930.mp4 | h264,1280,720,gbrp,120 | frame md5s c0b0de435905 vs capture T 5.5-9.5 c0b0de435905 IDENTICAL

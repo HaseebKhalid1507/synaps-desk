@@ -1,0 +1,11 @@
+0.00 Ctrl+T: a new sandbox session
+3.64 send: Use the bash tool to run exactly: echo q2-allow . Then reply ok.
+14.54 Esc
+16.04 located ALLOW 872,436 DENY 732,436 box 359,436
+16.44 hover DENY
+17.45 hover ALLOW
+18.45 press DENY (held, released off it)
+19.67 press ALLOW (held, released off it)
+21.18 click Allow all
+23.09 Ctrl+Enter (ALLOW)
+29.12 end
