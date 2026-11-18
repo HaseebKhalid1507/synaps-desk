@@ -2116,9 +2116,18 @@ mod tests {
     #[test]
     fn inline_code_chips_are_the_well() {
         for (name, raw) in palettes::THEMES {
-            let (r, _) = resolve(&raw, None);
+            let (r, checks) = resolve(&raw, None);
             assert!(contrast(r.code_in, r.well) >= TEXT - 1e-9, "{name}: code_in on its chip");
             assert!(contrast(r.well, r.canvas) >= SURFACE - 1e-9, "{name}: the chip stands off the canvas");
+            // A user message's inline code sits on its bubble too (Shady L1):
+            // Q3's own chip stands off it. (Where the chip is the code
+            // surface, as on main, it may be the user surface's colour.)
+            if r.well != r.code {
+                assert!(contrast(r.well, r.user) >= SURFACE - 1e-9, "{name}: the chip stands off the user bubble");
+            }
+            // Floored on the chip, whatever the chip is (Shady L2).
+            let c = checks.iter().find(|c| c.role == "code_in").expect("code_in is checked");
+            assert_eq!(c.grounds, vec![r.well], "{name}: code_in is floored on the well");
             if name == "paper" {
                 assert_ne!(r.well, r.code, "paper's chip is not its dark code island");
                 assert!(luminance(r.well) > 0.4 && luminance(r.code_in) < 0.2, "paper: a light chip, dark text");

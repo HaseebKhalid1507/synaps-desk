@@ -2638,9 +2638,6 @@ fn the_fuse_burns_clear_of_the_pointer(cx: &mut TestAppContext) {
     assert!(armed.right() <= chip.right() && confirm.right() <= chip.right(), "{confirm:?} in {chip:?}");
 }
 
-/// Finish gate fix 1: a turn that ends here hands the floor back: Handoff
-/// in's light travels down the composer's bar and is gone after `sig`
-/// (its colour, decaying into the bar: `motion::handoff_in_decays_into_the_bar`);
 /// A local session's events (the bench's way), `raw` each.
 fn local(cx: &mut TestAppContext, view: &Entity<AppView>, raws: Vec<serde_json::Value>) {
     view.update(cx, |v, cx| {
@@ -2747,7 +2744,12 @@ fn life_worker(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVie
     }
 }
 
-/// Off draws none.
+/// Finish gate fix 1: a turn that ends here hands the floor back: Handoff
+/// in's light travels down the composer's bar and is gone after `sig`
+/// (its colour, decaying into the bar: `motion::handoff_in_decays_into_the_bar`);
+/// Off draws none. P3 (polish.md, settle_pass_once_per_turn_end): the
+/// composer's sweep makes one last pass from the same corner, once; none
+/// under Reduced or Off.
 #[gpui_kit::test]
 fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
