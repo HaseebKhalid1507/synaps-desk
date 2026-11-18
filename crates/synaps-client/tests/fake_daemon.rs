@@ -1560,3 +1560,51 @@ async fn without_the_feature_no_catalog_page_frame_is_sent() {
     assert_eq!(fake.next_control().await["type"], "sessions", "no catalog_page frame may precede it");
     client.shutdown().unwrap();
 }
+
+/// Review F6: the daemon aborts a page still loading when its connection
+/// attaches, yet zero or one late reply may still arrive before `Attached`.
+/// After an `Attach`, every page outstanding on that connection is
+/// cancelled and a late reply is dropped. (The client's own pages go on the
+/// control connection, which never attaches; this is the connection's rule.)
+#[tokio::test]
+async fn an_attach_cancels_the_pages_outstanding_on_its_connection() {
+    use synaps_client::conn::Conn;
+    use synaps_client::protocol::{Attach, ClientFrame, DaemonFrame};
+    let dir = std::env::temp_dir().join(format!("synaps-fake-{}-attach-pages", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("d.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, w) = stream.into_split();
+        let w: Writer = Arc::new(Mutex::new(w));
+        let mut r = BufReader::new(r).lines();
+        r.next_line().await.unwrap();
+        write(&w, welcome(Opts { pages: true, ..Default::default() })).await;
+        let mut types = Vec::new();
+        for _ in 0..3 {
+            let f: Value = serde_json::from_str(&r.next_line().await.unwrap().unwrap()).unwrap();
+            types.push(f["type"].as_str().unwrap().to_string());
+        }
+        // One late reply (req 1), none for req 2, then `Attached`.
+        write(&w, json!({"type": "catalog_page", "req": 1, "sessions": catalog(), "next": null})).await;
+        write(&w, attached_frame(2)).await;
+        write(&w, json!({"type": "pong", "pid": 1, "uptime_s": 1, "sessions": 0})).await;
+        let _ = r.next_line().await;
+        types
+    });
+    let mut c = Conn::connect(&path, Identity::new("tester").unwrap().hello(None)).await.unwrap();
+    for req in [1, 2] {
+        c.send(&ClientFrame::CatalogPage { req, before: None, limit: 50, named_only: false }).await.unwrap();
+    }
+    assert!(c.cancelled().is_empty());
+    c.send(&ClientFrame::Attach(Attach::Existing { session_id: SID.into(), mode: AttachMode::Mirror })).await.unwrap();
+    assert_eq!(c.cancelled(), [1, 2], "every page outstanding on the connection");
+    let first = tokio::time::timeout(T, c.recv()).await.unwrap().unwrap().unwrap();
+    assert!(matches!(first, DaemonFrame::Attached(_)), "the late page is dropped: {first:?}");
+    assert!(c.cancelled().is_empty(), "`Attached` ends the window");
+    assert!(matches!(tokio::time::timeout(T, c.recv()).await.unwrap().unwrap(), Some(DaemonFrame::Pong { .. })));
+    drop(c);
+    assert_eq!(server.await.unwrap(), ["catalog_page", "catalog_page", "attach"]);
+}
