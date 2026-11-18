@@ -1011,8 +1011,87 @@ pub(crate) struct Slack {
     given: f32,
     base: f32,
     last: f32,
-    /// The turn ended: going on `sheet` from what was left, since when.
-    gone: Option<(f32, Instant)>,
+    /// The turn ended: going from what was left, since when, on what
+    /// response (`sheet`, or a run's fold's own: [`FoldGap`]).
+    gone: Option<(f32, Instant, f32)>,
+    /// A fold the user made (N1): it stays at the turn's end too, until a
+    /// scroll leaves the end or rows grow into it.
+    held: bool,
+    /// The list's scroll offset it holds (None: not yet laid out with it).
+    /// A scroll moves it; rows growing in under it don't (the top is held).
+    top: Option<f32>,
+}
+
+/// A run that folded in [`AppView::rebuild_from`] (its summary went open →
+/// closed): what of it was on screen as it went, and the list's scroll as
+/// it was (the design gate of #23, N1).
+pub(crate) struct Folded {
+    /// The run's summary (its display id).
+    id: u64,
+    /// Its rows that went and were laid out (top, height, window px).
+    rows: Vec<(Disp, f32, f32)>,
+    /// Its header's top and bottom, if it had one and it was laid out.
+    header: Option<(f32, f32)>,
+    /// Its first row's top, if laid out (with no header: where the new one
+    /// goes).
+    first: Option<f32>,
+    /// Its last row's bottom (None: under the view, not laid out).
+    end: Option<f32>,
+    /// Its rows ended above the list's top row (the run was above the view).
+    above: bool,
+    /// The list's top row and offset, and that row (id, a summary?).
+    top: ListOffset,
+    top_row: Option<(u64, bool)>,
+    view: (f32, f32),
+    following: bool,
+    /// Content under the view.
+    below: f32,
+}
+
+/// A run folding while watched (N1): its room on screen, `from` px, closes
+/// under its header on a spring, the card's bottom edge riding up with it
+/// over the rows it had (as they were drawn). The clicked header holds: the
+/// list keeps its top row; at the list's end the room past what was under
+/// the view is held (`hold`, [`AppView::tail_slack`]). Following the tail
+/// (a turn's end), the end holds and what is above comes down with it. A
+/// tall room goes slower than `sheet`: about 40 px a 60 Hz frame at most.
+#[derive(Clone, Debug)]
+pub(crate) struct FoldGap {
+    id: u64,
+    rows: Rc<[Disp]>,
+    /// The first row's top under the room's top (≤ 0: cut by the view).
+    inner: f32,
+    from: f32,
+    below: f32,
+    hold: bool,
+    at: Instant,
+    response: f32,
+}
+
+impl FoldGap {
+    /// Its run's summary is `id`.
+    pub(crate) fn is(&self, id: u64) -> bool {
+        self.id == id
+    }
+
+    /// The spring's response for `h` px: `sheet`, slower past 306 px. A
+    /// critically damped spring's peak speed is `h · 2π / (e · r)`: at
+    /// `h / 850`, 1965 px/s (33 px a 60 Hz frame; the gate's bar is about
+    /// 40), up to a 1020 px room.
+    fn response(h: f32) -> f32 {
+        (h / 850.).clamp(crate::motion::SHEET_RESPONSE, 1.2)
+    }
+
+    /// Its room at `now`, whole pixels.
+    fn h(&self, now: Instant) -> f32 {
+        (self.from * crate::motion::Spring::from_rest(1., self.response, now.saturating_duration_since(self.at).as_secs_f32())).round()
+    }
+
+    /// The room held at the list's end at `now` (what closed past what was
+    /// under the view).
+    fn held(&self, now: Instant) -> f32 {
+        if self.hold { ((self.from - self.h(now)) - self.below).max(0.) } else { 0. }
+    }
 }
 
 /// The composer foot's parts (design.md §8.11), as the room allows: what
@@ -1704,6 +1783,13 @@ pub struct AppView {
     /// grow in under it use it up, the list leaves its end, or the turn
     /// ends (then on `sheet`, with its run's fold) ([`AppView::tail_slack`]).
     pub(crate) fold_slack: Cell<Option<Slack>>,
+    /// A run folding while watched: its rows' room under its summary
+    /// ([`FoldGap`], [`AppView::fold_gap_now`]).
+    pub(crate) fold_gap: RefCell<Option<FoldGap>>,
+    /// An open run's header, as last laid out (a fold whose header is above
+    /// the view keeps it just above the view's top: [`AppView::start_gap`]).
+    pub(crate) summary_h: Cell<f32>,
+    pub(crate) summary_est: Cell<f32>,
     /// Answered prompts' receipts, by session ([`crate::authorize::Receipt`]).
     pub(crate) receipts: HashMap<String, Vec<crate::authorize::Receipt>>,
     /// The answer this window sent to the card, until its prompt resolves.
@@ -2342,6 +2428,9 @@ impl AppView {
             card_at: None,
             card_exit: None,
             fold_slack: Cell::new(None),
+            fold_gap: RefCell::new(None),
+            summary_h: Cell::new(0.),
+            summary_est: Cell::new(41.),
             receipts: HashMap::new(),
             sent: None,
             card_keys: Cell::new(None),
@@ -3837,6 +3926,135 @@ impl AppView {
     /// end, so its total height holds and the answered row stays where it
     /// is while the card folds up into it (what is below rises with it);
     /// once landed, it goes on `sheet`. Not fluid: none.
+    /// The folding run's room this frame ([`FoldGap`]): it, and its height.
+    /// Landed: none, and the room it held at the list's end stays there
+    /// ([`Slack`], held). None at Reduced and Off.
+    pub(crate) fn fold_gap_now(&self) -> Option<(FoldGap, f32)> {
+        let g = self.fold_gap.borrow().clone()?;
+        let here = self.disp.iter().any(|d| d.id == g.id && matches!(d.kind, Kind::Summary { open: false, .. }));
+        if !self.fx.fluid() || !here {
+            *self.fold_gap.borrow_mut() = None;
+            return None;
+        }
+        // The clock, not the frame's tick (a beat's timer waking early
+        // draws the beat it was armed for, a few ms ahead): a position on a
+        // spring steps by its frame's time only.
+        let now = self.fx.clock();
+        let h = g.h(now);
+        if h < 1. {
+            *self.fold_gap.borrow_mut() = None;
+            let held = g.held(now);
+            if held >= 1. && self.at_end() != Some(false) {
+                let prev = self.fold_slack.get().map_or(0., |s| s.last);
+                let given = prev + held;
+                let content = f32::from(self.list.max_offset_for_scrollbar().y) + f32::from(self.list.viewport_bounds().size.height);
+                self.fold_slack.set(Some(Slack { given, base: (content - given).round(), last: given, gone: None, held: true, top: None }));
+            }
+            return None;
+        }
+        self.fx.want_frame();
+        Some((g, h))
+    }
+
+    /// The list at its end, within half a pixel (a 125 % display snaps
+    /// heights to device pixels: Shady #23 r2b L1). None: not known.
+    pub(crate) fn at_end(&self) -> Option<bool> {
+        self.list.is_scrolled_to_end()?;
+        let max = f32::from(self.list.max_offset_for_scrollbar().y);
+        let at = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+        Some(max - at <= 0.5)
+    }
+
+    /// What of a run about to fold is on screen ([`Folded`]): before the
+    /// list's splice (`lo..hi` of [`AppView::disp`]; `fresh`, what comes).
+    fn folded(&self, id: u64, lo: usize, hi: usize, fresh: &[Disp]) -> Folded {
+        let kept = |d: &Disp| fresh.iter().any(|n| n.id == d.id && std::mem::discriminant(&n.kind) == std::mem::discriminant(&d.kind));
+        let l = &self.list;
+        let view = l.viewport_bounds();
+        let top = l.logical_scroll_top();
+        let gone: Vec<usize> = (lo..hi).filter(|&ix| self.disp[ix].kind == Kind::Work && !kept(&self.disp[ix])).collect();
+        let ys = |ix: usize| l.bounds_for_item(ix).map(|b| (f32::from(b.top()), f32::from(b.bottom())));
+        let header = (lo..hi).find(|&ix| self.disp[ix].id == id && matches!(self.disp[ix].kind, Kind::Summary { .. })).and_then(ys);
+        if let Some((t, b)) = header {
+            self.summary_h.set(b - t);
+        }
+        let last = gone.last().copied();
+        let max = f32::from(l.max_offset_for_scrollbar().y);
+        let at = -f32::from(l.scroll_px_offset_for_scrollbar().y);
+        Folded {
+            id,
+            rows: gone.iter().filter_map(|&ix| ys(ix).map(|(t, b)| (self.disp[ix], t, b - t))).collect(),
+            first: gone.first().copied().and_then(ys).map(|y| y.0),
+            header,
+            end: last.and_then(ys).map(|y| y.1),
+            above: last.is_some_and(|ix| ix < top.item_ix),
+            top,
+            top_row: self.disp.get(top.item_ix).map(|d| (d.id, matches!(d.kind, Kind::Summary { .. }))),
+            view: (f32::from(view.top()), f32::from(view.bottom())),
+            following: l.is_following_tail(),
+            below: (max - at).max(0.),
+        }
+    }
+
+    /// A run folded ([`AppView::folded`]): the list keeps its top row where
+    /// it was at every level (GPUI puts a top row in a splice at the
+    /// splice's start, its offset 0: the clicked header jumped by it), and
+    /// while watched its room on screen closes under its header
+    /// ([`FoldGap`]), with the room an answered card left at the list's end
+    /// on the same spring (their sum's speed is what moves the column).
+    fn start_gap(&mut self, folded: Option<Folded>) {
+        let Some(f) = folded else { return };
+        let fluid = self.fx.fluid();
+        let head = Some(self.summary_h.get()).filter(|h| *h > 0.).unwrap_or(self.summary_est.get());
+        let summary = self.disp.iter().position(|d| d.id == f.id && matches!(d.kind, Kind::Summary { .. }));
+        // Where its room starts: under its header; with none (a live
+        // turn's rows), under the new one in its first row's place; its
+        // top above the view, at the view's top (the header just above).
+        let vt = f.view.0;
+        let (gap_top, off) = match (f.header, f.first) {
+            (Some(h), _) => (h.1.max(vt), head),
+            (None, Some(t)) if t >= vt - 0.5 => (t + head, 0.),
+            _ => (vt, head),
+        };
+        // The top row, by identity: one before the run (or its header) at
+        // its offset; one of its rows: the header as above.
+        if !f.following
+            && let Some((id, sum)) = f.top_row
+        {
+            let same = self.disp.iter().position(|d| d.id == id && matches!(d.kind, Kind::Summary { .. }) == sum);
+            let to = match (same, summary) {
+                (Some(ix), _) => Some(ListOffset { item_ix: ix, offset_in_item: f.top.offset_in_item }),
+                (None, Some(ix)) => Some(ListOffset { item_ix: ix, offset_in_item: px(if fluid { off } else { 0. }) }),
+                (None, None) => None,
+            };
+            if let Some(to) = to {
+                self.list.scroll_to(to);
+            }
+        }
+        if !fluid || f.above {
+            return;
+        }
+        let end = f.end.unwrap_or(f.view.1).min(f.view.1);
+        let from = (end - gap_top).max(0.).round();
+        if from < 1. {
+            return;
+        }
+        let rows: Vec<(Disp, f32, f32)> = f.rows.into_iter().filter(|r| r.1 + r.2 > gap_top && r.1 < f.view.1).collect();
+        let inner = rows.first().map_or(0., |r| (r.1 - gap_top).min(0.));
+        let now = self.fx.clock();
+        let slack = if f.following { self.fold_slack.get().map_or(0., |s| s.last) } else { 0. };
+        let response = FoldGap::response(from + slack);
+        if f.following
+            && let Some(mut s) = self.fold_slack.get()
+        {
+            s.gone = Some((s.last, now, response));
+            self.fold_slack.set(Some(s));
+        }
+        let rows: Rc<[Disp]> = rows.into_iter().map(|r| r.0).collect();
+        *self.fold_gap.borrow_mut() = Some(FoldGap { id: f.id, rows, inner, from, below: f.below, hold: !f.following, at: now, response });
+        self.fx.want_frame();
+    }
+
     pub(crate) fn tail_slack(&self) -> f32 {
         if !self.fx.fluid() {
             self.fold_slack.set(None);
@@ -3845,36 +4063,67 @@ impl AppView {
         if let Some(e) = &self.card_exit {
             return e.given(self.fx.now());
         }
-        let Some(mut s) = self.fold_slack.get() else { return 0. };
-        // Left the end (a scroll): it goes, out of sight (the list holds
-        // its top there).
-        if self.list.is_scrolled_to_end() == Some(false) {
-            self.fold_slack.set(None);
-            return 0.;
+        let now = self.fx.now();
+        // A run folding with its header held (N1): what it closed past the
+        // view's bottom is held at the end, in the frame (no lag), on the
+        // clock its room closes on ([`AppView::fold_gap_now`]).
+        let folding = self.fold_gap.borrow().as_ref().map_or(0., |g| g.held(self.fx.clock()));
+        if folding > 0. || self.fold_gap.borrow().as_ref().is_some_and(|g| g.hold) {
+            self.list.pause_following_tail();
         }
+        let Some(mut s) = self.fold_slack.get() else { return folding };
+        // Left the end: a scroll moved the list's top (by more than 1.5 px:
+        // a 125 % display snaps the offset to device pixels, 0.8 px steps,
+        // Shady #23 r2b L1; a scroll is never that small; rows growing in
+        // under it don't move it, the top is held). Out of
+        // sight (all of it under the view's bottom): it goes. In sight: it
+        // goes on `sheet` (M3 (b): never a drop in one frame).
+        let max = f32::from(self.list.max_offset_for_scrollbar().y);
+        let at = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+        if s.gone.is_none() && s.top.is_some_and(|t| (at - t).abs() > 1.5) {
+            if max - at >= s.last {
+                self.fold_slack.set(None);
+                return folding;
+            }
+            s.gone = Some((s.last, now, crate::motion::SHEET_RESPONSE));
+        }
+        s.top = Some(at);
         // Rows that grew in under it since it landed take its room: the
         // column holds still until it is used up (the finish gate of #23,
-        // item 7: never a slide after the fold).
+        // item 7: never a slide after the fold). The list holds its top row
+        // meanwhile (M3 (a)): the room read from the last layout lags the
+        // growth a frame, and with the top held that frame's surplus is
+        // under the content, out of sight; following the tail it moved the
+        // column by each frame's growth.
         let over = f32::from(self.list.max_offset_for_scrollbar().y);
         if over > 0. && s.gone.is_none() {
             let content = over + f32::from(self.list.viewport_bounds().size.height) - s.last;
-            s.last = (s.given - (content - s.base).max(0.)).clamp(0., s.given);
+            s.last = (s.given - (content - s.base).max(0.)).clamp(0., s.given).round();
         }
         // The turn ended (its run folds, the column moves anyway): what is
-        // left goes on `sheet` with it.
-        if !self.synced_busy {
-            let now = self.fx.now();
-            let (from, at) = *s.gone.get_or_insert((s.last, now));
-            s.last =
-                from * crate::motion::Spring::from_rest(1., crate::motion::SHEET_RESPONSE, now.saturating_duration_since(at).as_secs_f32());
+        // left goes on `sheet` with it. A fold the user made stays.
+        if !self.synced_busy && !s.held && s.gone.is_none() {
+            s.gone = Some((s.last, now, crate::motion::SHEET_RESPONSE));
+        }
+        if let Some((from, at, response)) = s.gone {
+            s.last = (from * crate::motion::Spring::from_rest(1., response, now.saturating_duration_since(at).as_secs_f32())).round();
             self.fx.want_frame();
         }
-        if s.last < 0.5 {
+        if s.last < 1. {
             self.fold_slack.set(None);
-            return 0.;
+            // Used up by rows growing in under it, the list's top held:
+            // it follows the tail again (GPUI resumes only at the exact
+            // end, and the last frame's growth may be past it).
+            if s.gone.is_none() {
+                self.list.scroll_to_end();
+            }
+            return folding;
+        }
+        if s.gone.is_none() {
+            self.list.pause_following_tail();
         }
         self.fold_slack.set(Some(s));
-        s.last
+        s.last + folding
     }
 
     /// Row `ix` as it arrives or grows (fluid.md §3.3, §3.4): a row that
@@ -4324,7 +4573,16 @@ impl AppView {
                 // the room at the fold's end).
                 let given = e.given(fx_now);
                 let content = f32::from(self.list.max_offset_for_scrollbar().y) + f32::from(self.list.viewport_bounds().size.height);
-                self.fold_slack.set((keep && given >= 0.5).then_some(Slack { given, base: content - given, last: given, gone: None }));
+                // Whole pixels where it is made (Shady #23 r2b n2).
+                let given = given.round();
+                self.fold_slack.set((keep && given >= 1.).then_some(Slack {
+                    given,
+                    base: (content - given).round(),
+                    last: given,
+                    gone: None,
+                    held: false,
+                    top: None,
+                }));
                 self.card_exit = None;
             }
         }
@@ -4764,7 +5022,12 @@ impl AppView {
         let live = self.fx.on() && live_splice && self.pane_of == pane_before && self.rows_session == session_before;
         let before: HashSet<u64> =
             if live { self.disp.iter().skip_while(|d| d.item < start).map(|d| d.id).collect() } else { HashSet::new() };
-        self.rebuild_from(start);
+        let folded = self.rebuild_from(start);
+        // The turn's end folds its run on screen: its rows' room goes on a
+        // spring, never a cut (the design gate of #23, N1).
+        if self.pane_of == pane_before && self.rows_session == session_before {
+            self.start_gap(folded);
+        }
         if live {
             // The motion clock's time (in tests, the executor's), as every
             // reveal reads it.
@@ -4967,7 +5230,9 @@ impl AppView {
     }
 
     /// Display rows from item `start` (a turn's start) on.
-    fn rebuild_from(&mut self, start: usize) {
+    /// Returns a run that folded here (its summary went from open to
+    /// closed), as it was on screen: [`AppView::start_gap`].
+    fn rebuild_from(&mut self, start: usize) -> Option<Folded> {
         // The prompts' rows (the authorize card, its receipt lines): one
         // that changed before `start` rebuilds from its own turn.
         let prompts = self.prompt_rows();
@@ -4985,7 +5250,17 @@ impl AppView {
         let new = crate::cards::mark_edges(crate::authorize::with_prompts(new, &prompts, start));
         self.summaries.update(&new, items, &self.rows);
         let at = self.disp.partition_point(|d| d.item < start);
+        let mut folded = None;
         if let Some((range, count)) = turns::diff(&self.disp[at..], &new) {
+            let (old, fresh) = (&self.disp[at + range.start..at + range.end], &new[range.start..range.start + count]);
+            // Folded: an open summary closed (a click), or a live turn's
+            // rows (no summary yet: its first row has its id) closed under
+            // a new one (the turn's end).
+            let closed = fresh.iter().find(|n| {
+                matches!(n.kind, Kind::Summary { open: false, .. })
+                    && old.iter().any(|o| o.id == n.id && matches!(o.kind, Kind::Summary { open: true, .. } | Kind::Work))
+            });
+            folded = closed.map(|c| self.folded(c.id, at + range.start, at + range.end, fresh));
             self.list.splice(at + range.start..at + range.end, count);
             self.disp.splice(at + range.start..at + range.end, new[range.start..range.start + count].iter().copied());
         }
@@ -4999,6 +5274,7 @@ impl AppView {
                         0
                     ))
         );
+        folded
     }
 
     /// Open by default: a file tool's diff when it is short (unless the
@@ -5043,6 +5319,10 @@ impl AppView {
         self.sync_list();
         if !self.open_runs.remove(&id) {
             self.open_runs.insert(id);
+            // Unfolded mid-fold: its room goes with the fold.
+            if self.fold_gap.borrow().as_ref().is_some_and(|g| g.is(id)) {
+                *self.fold_gap.borrow_mut() = None;
+            }
         }
         // The clicked header stays put (motion.md §6.1): the list keeps its
         // top row and offset, tail-follow paused (it resumes at the end).
@@ -5055,7 +5335,10 @@ impl AppView {
         let before: HashSet<u64> = self.disp.iter().filter(|d| d.kind == Kind::Work).map(|d| d.id).collect();
         let items = self.model.shown().items();
         if let Some(start) = items.iter().position(|i| i.id == id).map(|ix| turns::turn_start(items, ix + 1)) {
-            self.rebuild_from(start);
+            // Folded: its rows' room goes on a spring under the header,
+            // which holds (N1).
+            let folded = self.rebuild_from(start);
+            self.start_gap(folded);
         }
         // The cascade: the rows the unfold brought draw their bars from the
         // header down; a fold draws the tally's segments.
@@ -6597,12 +6880,29 @@ impl Render for AppView {
         // it out (`crate::sticky`).
         let (pad_t, pad_b) = (0., list_pad_b(&m));
         // Read here: the list's own state is borrowed while it lays out.
+        let gap = self.fold_gap_now();
         let slack = self.tail_slack();
+        let geo = crate::cards::Geo::of(&m);
+        if self.summary_h.get() <= 0. {
+            self.summary_est.set(geo.row + geo.inset + 1.);
+        }
         let list = list(
             self.list.clone(),
             cx.processor(move |this, ix, _window, cx| {
                 let row = this.render_disp(ix, cx);
-                let el = this.arrive(ix, row);
+                let mut el = this.arrive(ix, row);
+                // A folding run's room, under its summary (N1): its card goes
+                // on, its bottom edge riding up over the rows it had.
+                if let Some((g, h)) =
+                    gap.as_ref().filter(|g| this.disp.get(ix).is_some_and(|d| d.id == g.0.id && matches!(d.kind, Kind::Summary { .. })))
+                {
+                    let rows = this.fold_rows(&g.rows, cx);
+                    let inner = div().w_full().h(px(*h)).overflow_hidden().child(v_flex().w_full().mt(px(g.inner)).children(rows));
+                    let p = theme::palette(cx);
+                    let room =
+                        crate::cards::slab(false, true, inner, &p, geo).h(px(*h + geo.inset + 1.)).debug_selector(|| "fold-gap".into());
+                    el = div().w_full().child(el).child(room).into_any_element();
+                }
                 // The room an answered card gave up, under the last row.
                 match Some(slack).filter(|s| *s > 0. && ix + 1 == this.disp.len()) {
                     // Whole pixels: the slack is a row's height too.
