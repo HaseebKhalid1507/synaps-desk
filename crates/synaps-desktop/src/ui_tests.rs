@@ -1785,6 +1785,10 @@ fn allow_all_is_the_input_owners(cx: &mut TestAppContext) {
     std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
     tap(cx, w, yes);
     assert_eq!(view.read_with(cx, |v, _| v.sent.as_ref().map(|s| s.answer)), Some(Answer::AllowedAll), "ALLOW sent \"always\"");
+    // How long you took counts from the card's first showing, not from
+    // the last toggle's re-arm (live: `allowed all · 1s` after 20 s).
+    let (took, shown) = view.read_with(cx, |v, _| (v.sent.as_ref().unwrap().took, v.current_card().unwrap().shown.elapsed()));
+    assert!(took + std::time::Duration::from_millis(250) >= shown && took >= 3 * crate::app::ARM, "took {took:?}, shown {shown:?} ago");
     // Answered: Space no longer toggles it (the card can't be answered).
     tap(cx, w, "space");
     assert!(checked(cx), "answer sent: unchanged");

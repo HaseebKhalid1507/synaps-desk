@@ -3532,7 +3532,7 @@ impl AppView {
             Some(_) => ("a secret", Answer::Provided),
             None => ("cancel", Answer::Cancelled),
         };
-        let took = self.card.as_ref().map_or(Duration::ZERO, |c| c.arm.shown_at().elapsed());
+        let took = self.card.as_ref().map_or(Duration::ZERO, |c| c.shown.elapsed());
         match c.answer_on(connection, key.1, value) {
             Ok(()) => {
                 log::info!(target: "synaps_desktop::card", "card {key:?}: answered {what}");
@@ -3791,7 +3791,7 @@ impl AppView {
     /// else `resolved`, saying nothing it does not know.
     fn resolved_by(&self, c: &PromptCard, sid: &str) -> crate::authorize::Answer {
         use crate::authorize::Answer;
-        let halted = self.halted.as_ref().is_some_and(|(s, at)| s == sid && *at >= c.arm.shown_at());
+        let halted = self.halted.as_ref().is_some_and(|(s, at)| s == sid && *at >= c.shown);
         if halted || !self.model.transcript.busy() || self.model.reload {
             return Answer::Cancelled;
         }
