@@ -73,7 +73,8 @@ pub fn register(cx: &mut App) {
 
 /// Every Japanese sub-label. `subset.sh` keeps exactly these glyphs.
 #[cfg(test)]
-const JP_LABELS: &[&str] = &[JP_SESSIONS, JP_CONTEXT, JP_TOKENS, JP_FILES, JP_FAVOURITES, JP_PINNED, JP_OPEN, JP_HISTORY];
+const JP_LABELS: &[&str] =
+    &[JP_SESSIONS, JP_CONTEXT, JP_TOKENS, JP_FILES, JP_FAVOURITES, JP_PINNED, JP_OPEN, JP_HISTORY, JP_WORKERS, JP_COMMANDS, JP_VIEWS];
 pub const JP_SESSIONS: &str = "セッション";
 /// The rail's groups: FAVOURITES, PINNED, OPEN, HISTORY.
 pub const JP_FAVOURITES: &str = "お気に入り";
@@ -83,6 +84,11 @@ pub const JP_HISTORY: &str = "履歴";
 pub const JP_CONTEXT: &str = "文脈";
 pub const JP_TOKENS: &str = "トークン";
 pub const JP_FILES: &str = "変更";
+/// The palette's WORKERS and COMMANDS heads (polish.md P16).
+pub const JP_WORKERS: &str = "ワーカー";
+pub const JP_COMMANDS: &str = "コマンド";
+/// The palette's VIEWS head (Settings, Usage).
+pub const JP_VIEWS: &str = "表示";
 
 /// Tracked display labels.
 pub mod label {
@@ -108,6 +114,7 @@ pub mod label {
     pub const WINDOW: &str = "W I N D O W";
     pub const AGENT: &str = "A G E N T";
     pub const YOU: &str = "Y O U";
+    pub const SYNAPS: &str = "S Y N A P S";
     pub const READY: &str = "R E A D Y";
     pub const THEME: &str = "T H E M E";
     pub const SYNAPS_CONFIG: &str = "S Y N A P S   C O N F I G";
@@ -156,6 +163,10 @@ pub mod label {
     pub const THIS_MONTH: &str = "T H I S   M O N T H";
     pub const OLDER: &str = "O L D E R";
     pub const MORE: &str = "M O R E";
+    // The palette (polish.md P16).
+    pub const GO_TO: &str = "G O   T O";
+    pub const COMMANDS: &str = "C O M M A N D S";
+    pub const VIEWS: &str = "V I E W S";
     // The hover readout's keys.
     pub const R_STATE: &str = "S T A T E";
     pub const R_HELD: &str = "H E L D";

@@ -1,0 +1,5 @@
+anon (heap, stacks, [..])	USS 38360	clean 0	dirty 38360	RSS 38376
+binary	USS 33528	clean 32112	dirty 1416	RSS 33528
+gpu driver	USS 24412	clean 12952	dirty 11460	RSS 106392
+other files (libs, fonts)	USS 4232	clean 3564	dirty 668	RSS 13588
+total	USS 100532	clean 48628	dirty 51904	RSS 191884

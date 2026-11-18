@@ -48,6 +48,9 @@ pub enum ItemKind {
     Tool,
     Notice,
     Error,
+    /// A slash command's answer ([`Transcript::output`]): this client's,
+    /// never sent and not in the history.
+    Output,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -746,6 +749,14 @@ impl Transcript {
 
     fn tool_mut(&mut self, tool_id: &str) -> Option<usize> {
         self.tools.get(tool_id).copied().filter(|&ix| ix < self.items.len())
+    }
+
+    /// Slash command `name`'s answer, as the TUI prints it into its
+    /// scrollback: a client-side row at the end ([`ItemKind::Output`]), its
+    /// command on the first line, then `text`. Never sent, not in the
+    /// history; kept across history refolds as a notice is.
+    pub fn output(&mut self, name: &str, text: &str) {
+        self.notice(ItemKind::Output, format!("/{name}\n{}", text.trim_end()));
     }
 
     /// A client-side row: kept across history refolds.

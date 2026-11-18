@@ -226,7 +226,9 @@ actions!(
         ToggleFavourite,
         CardTab,
         MenuTab,
-        MenuTabBack
+        MenuTabBack,
+        OpenGoTo,
+        OpenCommands
     ]
 );
 
@@ -300,7 +302,17 @@ pub fn bind_keys(cx: &mut App) {
     keys.push(KeyBinding::new("shift-tab", MenuTabBack, Some(MENU_CTX)));
     keys.push(KeyBinding::new(RENAME_KEY, RenameSession, None));
     keys.push(KeyBinding::new(fav_key(mac), ToggleFavourite, None));
+    let (goto, commands) = palette_keys(mac);
+    keys.push(KeyBinding::new(goto, OpenGoTo, None));
+    keys.push(KeyBinding::new(commands, OpenCommands, None));
     cx.bind_keys(keys);
+}
+
+/// The palette's keys (polish.md P16), as VS Code's: Ctrl+P goes to,
+/// Ctrl+K runs a command; Cmd on macOS. Bound at the root with no context,
+/// so the composer's input (which binds neither) never swallows them.
+pub(crate) const fn palette_keys(mac: bool) -> (&'static str, &'static str) {
+    if mac { ("cmd-p", "cmd-k") } else { ("ctrl-p", "ctrl-k") }
 }
 
 /// Favourites the session on screen, or unfavourites it (as a browser's
@@ -414,7 +426,7 @@ const fn text_keys(mac: bool) -> [&'static str; 5] {
 
 /// The fold keys (`KeyBinding::new` does not resolve `secondary-`, and
 /// panics on a keystroke it cannot parse: spelled per OS).
-const fn panel_keys(mac: bool) -> (&'static str, &'static str) {
+pub(crate) const fn panel_keys(mac: bool) -> (&'static str, &'static str) {
     if mac { ("cmd-b", "cmd-alt-b") } else { ("ctrl-b", "ctrl-alt-b") }
 }
 
@@ -1210,7 +1222,7 @@ pub struct AppView {
     pub(crate) summaries: Summaries,
     pub list: ListState,
     /// Rows whose open/closed state the user flipped from its default.
-    toggled: HashSet<u64>,
+    pub(crate) toggled: HashSet<u64>,
     /// Runs the user unfolded (by their first item's id).
     open_runs: HashSet<u64>,
     /// The rows an unfold under Full is revealing: tail-follow is held
@@ -1343,6 +1355,14 @@ pub struct AppView {
     /// Refused input to put back in the composer (needs a `Window`: done
     /// at the next frame).
     restore: Option<String>,
+    /// A slash command the composer sent (its name, its text): the text
+    /// stays in the composer until the daemon has run it.
+    cmd_draft: Option<(String, String)>,
+    /// That text, run: out of the composer if it still holds it.
+    cmd_clear: Option<String>,
+    /// The note last set by a command that went out or was answered: shown
+    /// quiet (`dim`), not as a warning, while it is the note on screen.
+    pub(crate) quiet_note: Option<SharedString>,
     /// Each tab's composer draft by session (kept when its tab is left,
     /// put back when it is shown again), and the tab whose draft the
     /// composer holds.
@@ -1466,6 +1486,12 @@ pub struct AppView {
     pub(crate) tracer_open: Option<u64>,
     pub(crate) tracer: Option<crate::motion::Tracer>,
     pub(crate) strip_at: std::rc::Rc<std::cell::Cell<Point<Pixels>>>,
+    /// The composer's frame's top as last laid out (the palette ends
+    /// above it).
+    pub(crate) composer_top: std::rc::Rc<std::cell::Cell<f32>>,
+    /// The top of what is drawn over the composer (the stub, a notice, the
+    /// worker chips) as last laid out; `INFINITY` while none is.
+    pub(crate) over_composer: std::rc::Rc<std::cell::Cell<f32>>,
     /// Each worker chip's bounds as last laid out (the tracer starts from
     /// the source chip's bar).
     pub(crate) chip_bounds: Rc<RefCell<ChipBounds>>,
@@ -1561,6 +1587,22 @@ pub struct AppView {
     /// What had the focus when the menu opened (it takes the keys while
     /// open): given back once it closes, if nothing else took it.
     pub(crate) menu_focus_back: Option<FocusHandle>,
+    /// The palette, open (polish.md P16), its query field, what had the
+    /// focus when it opened (given back when it closes), the row its quad
+    /// was last drawn on, its list's scroll, and the lists it was built
+    /// from ([`AppView::refresh_palette`]).
+    pub(crate) palette: Option<crate::palette::Palette>,
+    pub(crate) palette_input: Entity<InputState>,
+    pub(crate) palette_back: Option<FocusHandle>,
+    pub(crate) palette_sel: Cell<Option<usize>>,
+    pub(crate) palette_scroll: ScrollHandle,
+    pub(crate) palette_gen: u64,
+    /// The palette's list height and quad as last drawn, and their targets.
+    #[cfg(test)]
+    pub(crate) palette_drawn: Cell<(f32, f32, f32, f32)>,
+    /// The palette box's top and its tallest bottom as last drawn.
+    #[cfg(test)]
+    pub(crate) palette_box: Cell<(f32, f32)>,
     pub(crate) cancel_tick: Option<Task<()>>,
     /// A session's menu (a right-click on its tab or rail row): Rename…,
     /// Close tab.
@@ -1727,6 +1769,7 @@ impl AppView {
             s
         });
         let find_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::chrome::FIND.0));
+        let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::palette::PLACEHOLDER));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
         let secret_input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("answer (hidden)"));
@@ -1749,6 +1792,16 @@ impl AppView {
                     cx.notify();
                 }
                 _ => {}
+            }),
+            // The palette filters as it is typed.
+            cx.subscribe_in(&palette_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
+                if let InputEvent::Change = ev
+                    && let Some(p) = this.palette.as_mut()
+                {
+                    p.set_query(&input.read(cx).value());
+                    this.palette_scroll.set_offset(Point::default());
+                    cx.notify();
+                }
             }),
             // Find filters as it is typed; Enter opens by exact name. The
             // typed name stays until the outcome is known: cleared on
@@ -1889,6 +1942,7 @@ impl AppView {
         let inputs = Inputs {
             composer,
             find_input,
+            palette_input,
             name_input,
             hex_input,
             secret_input,
@@ -2007,6 +2061,9 @@ impl AppView {
             rail: Default::default(),
             focus: i.focus,
             restore: None,
+            cmd_draft: None,
+            cmd_clear: None,
+            quiet_note: None,
             drafts: Default::default(),
             composer_of: None,
             draft_note: None,
@@ -2076,6 +2133,8 @@ impl AppView {
             tracer_open: None,
             tracer: None,
             strip_at: Default::default(),
+            composer_top: Default::default(),
+            over_composer: std::rc::Rc::new(std::cell::Cell::new(f32::INFINITY)),
             chip_bounds: Default::default(),
             view_seen: None,
             window_active: true,
@@ -2116,6 +2175,16 @@ impl AppView {
             placeholder_of: None,
             menu: None,
             menu_focus_back: None,
+            palette: None,
+            palette_input: i.palette_input,
+            palette_back: None,
+            palette_sel: Cell::new(None),
+            palette_scroll: ScrollHandle::new(),
+            palette_gen: 0,
+            #[cfg(test)]
+            palette_drawn: Cell::new((0., 0., 0., 0.)),
+            #[cfg(test)]
+            palette_box: Cell::new((0., 0.)),
             cancel_tick: None,
             smenu: None,
             wmenu: None,
@@ -2178,6 +2247,21 @@ impl AppView {
                     self.model.view_dirty = true;
                 }
             }
+            // The compaction a `/compact` asked for has its notice in the
+            // transcript now: the note that asked is done.
+            if let Event::Session { attach_seq, event, .. } = &ev
+                && matches!(
+                    event,
+                    synaps_client::protocol::SessionEvent::CompactionApplied { .. }
+                        | synaps_client::protocol::SessionEvent::CompactionFailed { .. }
+                        | synaps_client::protocol::SessionEvent::CompactionCancelled
+                )
+                && self.model.active.as_ref().is_some_and(|a| a.attach_seq == *attach_seq)
+                && self.watch_note.as_ref().is_some_and(|n| n.starts_with("/compact:"))
+            {
+                self.watch_note = None;
+                self.model.view_dirty = true;
+            }
             for fx in self.model.apply(ev) {
                 self.effect(fx);
             }
@@ -2234,6 +2318,15 @@ impl AppView {
             Effect::Attach { session_id, fallback, open, place } => self.open_tab(Open::Attach { session_id, fallback, open }, place),
             Effect::Resume { req, open, place } => self.open_tab(Open::Resume { req, open }, place),
             Effect::WorkerNote(note) => self.watch_note = Some(note.into()),
+            Effect::Command { name, reply } => {
+                self.watch_note = Some(crate::palette::reply_note(&name, &reply).into());
+                self.quiet_note = self.watch_note.clone().filter(|_| matches!(reply, synaps_client::CommandReply::Done(_)));
+                if let Some((_, text)) = self.cmd_draft.take_if(|d| d.0 == name)
+                    && matches!(reply, synaps_client::CommandReply::Done(_))
+                {
+                    self.cmd_clear = Some(text);
+                }
+            }
         }
     }
 
@@ -2301,10 +2394,28 @@ impl AppView {
         {
             o.0 = into;
         }
+        // A slash command the daemon ran: its text leaves the composer,
+        // if the composer still holds it (the tab's, unedited).
+        if let Some(text) = self.cmd_clear.take()
+            && self.composer_owned()
+            && self.composer.read(cx).value().trim() == text
+        {
+            self.composer.update(cx, |c, cx| c.set_value("", window, cx));
+        }
         // A view on screen leaves the session tab behind it current: the
         // composer stays that tab's.
         if self.restore.is_none() && self.composer_owned() {
             return;
+        }
+        // A tab left while its slash command was out: the answer goes to
+        // an attachment no longer on screen (never shown here), so the
+        // command's text leaves with it, as a sent message's does: the tab's
+        // draft is not left holding a command already run.
+        if !self.composer_owned()
+            && let Some((_, sent)) = self.cmd_draft.take()
+            && self.composer.read(cx).value().trim() == sent
+        {
+            self.composer.update(cx, |c, cx| c.set_value("", window, cx));
         }
         let c = self.composer.read(cx);
         let (text, cursor) = (c.value(), c.cursor());
@@ -3200,6 +3311,33 @@ impl AppView {
             });
             return false;
         }
+        // `//text`: `/text`, a message (the TUI's escape), never a command.
+        let escaped = text.trim_start().strip_prefix('/').filter(|r| r.starts_with('/')).map(str::to_string);
+        let text = match escaped {
+            Some(t) => t,
+            None => {
+                // `/compact`, `/workers cancel sa_3` ...: the whole text one
+                // valid invocation of an engine command. The engine runs it
+                // (the palette's Commands take this path too; while a turn
+                // runs, neither does, as the TUI); its text stays until the
+                // daemon has.
+                if let Some((name, arg)) = crate::palette::invocation(&text) {
+                    if self.run_command(name, arg) {
+                        self.cmd_draft = Some((name.to_string(), text));
+                    }
+                    return false;
+                }
+                // A command's own words its grammar does not take (a bare
+                // `/model`, `/budget time 30`): its usage, the text kept,
+                // nothing sent. Anything else is a message, as it always was.
+                if let Some(name) = crate::palette::near_miss(&text) {
+                    self.watch_note = Some(crate::palette::usage(name).into());
+                    self.model.view_dirty = true;
+                    return false;
+                }
+                text
+            }
+        };
         // In a worker's view, Enter steers that worker (never the session).
         if let Some(target) = self.model.watch.steer_target() {
             let handle = match target {
@@ -3604,6 +3742,12 @@ impl AppView {
         self.watch_note.clone().or_else(|| self.draft_note.map(SharedString::from))
     }
 
+    /// A note's colour: a command that went out or was answered, quiet
+    /// (`dim_u`); anything else (refused, not run, a warning) `warn`.
+    pub(crate) fn note_color(&self, note: &SharedString, p: &Palette) -> Hsla {
+        if self.quiet_note.as_ref() == Some(note) { p.dim_u } else { p.warn }
+    }
+
     /// What the centre column draws besides the bars, the card and the
     /// composer ([`crate::fit::Extras`]).
     pub(crate) fn extras(&self) -> crate::fit::Extras {
@@ -3646,13 +3790,14 @@ impl AppView {
     /// The card's keys act: it is on screen in the active window with its
     /// buttons whole (a tiled window can be shorter than its minimum), no
     /// overlay is open (the theme picker, the gear's menu, a worker's, a
-    /// session's or the workers menu: Tab steps them), and nothing
+    /// session's or the workers menu: Tab steps them; the palette: Tab
+    /// flips its mode), and nothing
     /// typed in has the focus (the window's own), or a secret prompt's
     /// field does (`Some(true)`: Enter there submits). The composer, find
     /// and the other fields keep Enter and Esc.
     fn card_keys_live(&self, window: &Window, cx: &App) -> Option<bool> {
         let shown = self.card_on_screen();
-        let menu = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some();
+        let menu = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some() || self.palette.is_some();
         if !self.card_up() || !shown || self.picker_open || self.gear_menu || menu || !window.is_window_active() {
             None
         } else if self.secret_input.read(cx).focus_handle(cx).is_focused(window) {
@@ -4571,7 +4716,8 @@ impl AppView {
         if !self.toggled.remove(&id) {
             self.toggled.insert(id);
         }
-        if let Some(ix) = self.disp.iter().position(|d| d.id == id && d.kind == Kind::Work) {
+        // A call's row, or a slash command's answer (a note).
+        if let Some(ix) = self.disp.iter().position(|d| d.id == id && matches!(d.kind, Kind::Work | Kind::Note)) {
             self.list.remeasure_items(ix..ix + 1);
         }
     }
@@ -4620,6 +4766,47 @@ impl AppView {
         } else {
             self.unfold_hold.clear();
         }
+    }
+
+    /// Every finished run folded, or unfolded (the palette's commands): at
+    /// once, no cascade (a bulk change is not a reveal). The list keeps its
+    /// top row, as one run's fold does; following the tail, it follows on.
+    pub(crate) fn fold_all_runs(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.sync_list();
+        let runs: Vec<u64> = self.disp.iter().filter(|d| matches!(d.kind, Kind::Summary { .. })).map(|d| d.id).collect();
+        let before = self.open_runs.len();
+        if open {
+            self.open_runs.extend(runs);
+        } else {
+            self.open_runs.clear();
+        }
+        if self.open_runs.len() == before && (open || before == 0) {
+            return;
+        }
+        self.scroller.cancel();
+        // The row at the top before (and how far into it), found again
+        // after: itself, or the run's summary that folded it away (at its
+        // top). One splice from the first changed row to the last would
+        // put the list's top at the first run that changed.
+        let following = self.list.is_following_tail();
+        let top = self.list.logical_scroll_top();
+        let was = self.disp.get(top.item_ix).copied();
+        self.unfold_hold.clear();
+        self.rebuild_from(0);
+        if !following && let Some(was) = was {
+            let summary = |d: &Disp| matches!(d.kind, Kind::Summary { .. });
+            let same = self.disp.iter().position(|d| d.id == was.id && summary(d) == summary(&was));
+            let into =
+                || self.disp.iter().position(|d| matches!(d.kind, Kind::Summary { end, .. } if d.item <= was.item && was.item < end));
+            let to = match same {
+                Some(ix) => ListOffset { item_ix: ix, offset_in_item: top.offset_in_item },
+                None => {
+                    ListOffset { item_ix: into().unwrap_or(top.item_ix.min(self.disp.len().saturating_sub(1))), offset_in_item: px(0.) }
+                }
+            };
+            self.list.scroll_to(to);
+        }
+        cx.notify();
     }
 
     /// An unfold's rows revealing ([`Self::unfold_hold`]): tail-follow
@@ -4778,7 +4965,7 @@ impl AppView {
 
     /// The favourite key: the session tab on screen. Not while typing (a
     /// TUI hand's Ctrl+D there is no toggle of the favourites).
-    fn fav_key_pressed(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn fav_key_pressed(&mut self, window: &Window, cx: &mut Context<Self>) {
         if self.typing(window, cx) {
             return;
         }
@@ -5102,7 +5289,7 @@ impl AppView {
         let (text, color): (SharedString, Hsla) = match (self.model.last_error.clone(), note) {
             (Some(e), Some(n)) => (format!("{e} · {n}").into(), p.err),
             (Some(e), None) => (e.into(), p.err),
-            (None, Some(n)) => (n, p.warn),
+            (None, Some(n)) => (n.clone(), self.note_color(&n, p)),
             (None, None) => return None,
         };
         let line = mono(text.clone(), m.meta, color).pt(px(crate::fit::NOTICE_TOP)).line_height(px(crate::fit::notice_line(m)));
@@ -5148,7 +5335,7 @@ impl AppView {
         // Only what is out of the ordinary: the routine two are SEND's and
         // STEER's tooltips.
         let hint: Option<(SharedString, Hsla)> = if let Some(n) = self.composer_note() {
-            Some((n, p.warn))
+            Some((n.clone(), self.note_color(&n, p)))
         } else if self.client.is_none() && !self.synthetic {
             Some(("offline: no daemon to send to".into(), p.dim_u))
         } else if self.client.is_none() {
@@ -5421,8 +5608,18 @@ impl AppView {
                         d.child(mono("·", m.meta, p.dim_u).flex_none()).child(mono(e, m.meta, p.dim_u).flex_none())
                     })
             });
-            let hint =
-                hint.filter(|_| fit.hint).map(|(h, c)| mono(h, m.meta, c).ml(px(16.)).flex_1().min_w_0().overflow_hidden().text_ellipsis());
+            // Cut short, its tooltip has it whole.
+            let hint = hint.filter(|_| fit.hint).map(|(h, c)| {
+                mono(h.clone(), m.meta, c)
+                    .id("composer-note")
+                    .debug_selector(|| "composer-note".into())
+                    .ml(px(16.))
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .tooltip(move |window, cx| crate::overlay::tip(h.clone(), window, cx))
+            });
             let filler = hint.is_none().then(|| div().flex_1());
             v_flex().child(field).child(
                 h_flex()
@@ -5451,6 +5648,10 @@ impl AppView {
                 .relative()
                 .border_1()
                 .border_color(p.edge)
+                .child({
+                    let at = self.composer_top.clone();
+                    canvas(move |b, _, _| at.set(f32::from(b.origin.y)), |_, _, _, _| {}).absolute().inset_0()
+                })
                 // The user's bar over the left border.
                 .child(
                     div().debug_selector(|| "composer-bar".into()).absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(2.)).bg(bar),
@@ -5681,6 +5882,7 @@ pub(crate) fn one_line(s: &str, max: usize) -> String {
 struct Inputs {
     composer: Entity<TextareaState>,
     find_input: Entity<InputState>,
+    palette_input: Entity<InputState>,
     name_input: Entity<InputState>,
     hex_input: Entity<InputState>,
     pub(crate) secret_input: Entity<InputState>,
@@ -5733,6 +5935,7 @@ impl Render for AppView {
             self.disarm_halt();
         }
         self.sync_composer(window, cx);
+        self.refresh_palette(window, cx);
         if std::mem::take(&mut self.model.named.opened) {
             self.find_input.update(cx, |s, cx| s.set_value("", window, cx));
             self.find.clear();
@@ -6088,6 +6291,15 @@ impl Render for AppView {
             self.view_width = view_pane;
             AnyView::from(self.pane(k).clone()).cached(StyleRefinement::default().size_full())
         });
+        let session = shown_view.is_none();
+        // As elements now (they borrow nothing after this).
+        let stub = session.then(|| self.render_stub(&p, &m, cx).map(IntoElement::into_any_element)).flatten();
+        let notice = session.then(|| self.render_notice(&p, &m).map(IntoElement::into_any_element)).flatten();
+        let tray = session.then(|| self.render_tray(&p, &m, cx).map(IntoElement::into_any_element)).flatten();
+        let over = (stub.is_some() || notice.is_some() || tray.is_some()).then(|| self.over_composer.clone());
+        if over.is_none() {
+            self.over_composer.set(f32::INFINITY);
+        }
         let main = if let Some(v) = shown_view {
             v_flex().flex_1().h_full().min_w_0().bg(p.canvas).child(tabs).child(div().flex_1().min_h_0().child(v))
         } else {
@@ -6118,11 +6330,14 @@ impl Render for AppView {
                         .children(hold_back)
                         .child(transcript_bar),
                 )
+                // The top of what is drawn over the composer (the stub, a
+                // notice, the chips), as laid out: the palette ends above it.
+                .when_some(over, |d, at| d.child(canvas(move |b, _, _| at.set(f32::from(b.origin.y)), |_, _, _, _| {}).w_full().h(px(0.))))
                 // The card off screen (scrolled away, or a worker's view):
                 // NEEDS YOU, folded, over the chips.
-                .children(self.render_stub(&p, &m, cx))
-                .children(self.render_notice(&p, &m))
-                .children(self.render_tray(&p, &m, cx))
+                .children(stub)
+                .children(notice)
+                .children(tray)
                 .children(crate::motion::probe(&self.fx, "composer"))
                 .child(self.render_composer(
                     &p,
@@ -6141,6 +6356,9 @@ impl Render for AppView {
             .when(self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some(), |d| d.key_context(MENU_CTX))
             .on_action(cx.listener(|this, _: &MenuTab, _, cx| this.menu_tab(false, cx)))
             .on_action(cx.listener(|this, _: &MenuTabBack, _, cx| this.menu_tab(true, cx)))
+            .on_action(cx.listener(|this, _: &OpenGoTo, window, cx| this.open_palette(crate::palette::Mode::GoTo, window, cx)))
+            .on_action(cx.listener(|this, _: &OpenCommands, window, cx| this.open_palette(crate::palette::Mode::Commands, window, cx)))
+            .map(|d| crate::palette::capture_keys(d, cx))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
             .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| match this.swallow_clicks {
@@ -6168,6 +6386,9 @@ impl Render for AppView {
                     && !this.model.transcript.pending_prompts().is_empty()
                 {
                     cx.stop_propagation();
+                    if this.palette.is_some() {
+                        this.close_palette(window, cx);
+                    }
                     this.jump_to_card(window, cx);
                     return;
                 }
@@ -6407,6 +6628,14 @@ impl Render for AppView {
             .children(self.render_menu_at_point(&p, cx))
             .children(self.render_session_menu(&p, cx))
             .children(self.render_workers_menu(&p, cx))
+            .children(self.render_palette(
+                crate::chrome::MARK + rail.width(),
+                if view.is_some() { view_pane } else { pane },
+                // Over a view there is no composer: the window's end.
+                if view.is_some() { self.height } else { self.composer_top.get().min(self.over_composer.get()) },
+                &p,
+                cx,
+            ))
             .children(self.render_link(tear, &p, &theme::live_palette(cx)))
             .children(self.render_tracer(&p))
             // Painted last, after every row was rendered: what the frame's
@@ -6436,8 +6665,8 @@ mod tests {
     use super::{
         ARM, Arm, CENTRE_MIN, CardChord, CardKey, FavsJob, FoldKeys, Foot, FootIn, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY,
         above_list, authorize_ready, card_key, card_key_on, command_of, dragged, fav_key, fit_foot, held_back, hidden, input_of, left_cut,
-        lines_below, one_line, panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled, well_body,
-        worker_keys,
+        lines_below, one_line, palette_keys, panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled,
+        well_body, worker_keys,
     };
     use crate::theme::{Metrics, Panels};
     use crate::turns::Layout;
@@ -6764,8 +6993,13 @@ mod tests {
         }
         for mac in [false, true] {
             let (a, b) = panel_keys(mac);
-            // Ctrl+D / Cmd+D, the favourite key, with them.
-            let mut app: Vec<_> = [a, b, fav_key(mac)].into_iter().chain(text_keys(mac)).map(|k| (parse(k), None)).collect();
+            // Ctrl+D / Cmd+D, the favourite key, and the palette's
+            // Ctrl+P / Ctrl+K (Cmd on macOS) with them; Ctrl+J (the card) is
+            // read off the key itself, so no binding is it either.
+            let (goto, commands) = palette_keys(mac);
+            let mut app: Vec<_> =
+                [a, b, fav_key(mac), goto, commands].into_iter().chain(text_keys(mac)).map(|k| (parse(k), None)).collect();
+            assert!(!app.iter().any(|(k, _)| k.key == "j" && k.modifiers.control), "Ctrl+J is the card's");
             app.extend(tab_keys(mac).iter().map(|(k, what)| (parse(k), Some(*what))));
             for (i, (k, what)) in app.iter().enumerate() {
                 assert!(!input.contains(k), "{k:?} is an input key");

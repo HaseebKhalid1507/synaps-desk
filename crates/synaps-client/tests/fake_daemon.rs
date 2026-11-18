@@ -1278,3 +1278,129 @@ async fn cancel_worker_sends_one_handle_and_always_answers() {
     assert!(r.is_err_and(|e| e.contains("detached")));
     client.shutdown().unwrap();
 }
+
+/// A slash command (`/compact`, `/context` ...): the engine command the
+/// daemon reads, and its `QueryResult` by id as `Event::EngineReply`. The
+/// replies are the daemon's own shapes (agent-engine `engine_command_reply`
+/// and the commands' texts, identical on v0.11.1 and v0.12 dev): `none` is
+/// done (a `/compact`), `output` and `notice` done with their text, `error`
+/// and `unhandled` not run, a `/model x` notice naming another model not a
+/// switch, a kind this client does not know unknown. A non-owner's refusal
+/// goes to the oldest engine command in flight, a worker cancel's or a
+/// slash command's; one in flight when the link drops: unknown (it may
+/// have run); one sent while not connected: not run.
+#[tokio::test]
+async fn engine_command_wire_shape_and_replies() {
+    use synaps_client::CommandReply::{Done, NotRun, Unknown};
+    let mut fake = Fake::start("engine").await;
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    let reply = |events| async move {
+        wait(events, "engine reply", |e| match e {
+            Event::EngineReply { attach_seq, name, reply } => Some((*attach_seq, name.clone(), reply.clone())),
+            _ => None,
+        })
+        .await
+    };
+
+    client.engine_command("compact", "").unwrap();
+    let cmd = conn.recv_cmd().await;
+    let id = cmd["id"].as_u64().unwrap();
+    assert!(id < synaps_client::protocol::RESERVED_QUERY_ID_BASE);
+    assert_eq!(cmd, json!({"cmd": "engine_command", "id": id, "name": "compact", "arg": ""}));
+    conn.event(40, json!({"ev": "query_result", "id": id ^ 1, "value": {"kind": "output", "text": "not ours"}})).await;
+    conn.event(41, json!({"ev": "query_result", "id": id, "value": {"kind": "none"}})).await;
+    assert_eq!(reply(&events).await, (seq, "compact".into(), Done(String::new())));
+
+    // Each command with its argument, and the daemon's reply as it sends it.
+    let model_ok = json!({"kind": "notice", "event": "model_changed", "text": "model → openai/gpt-5.1",
+        "model": "openai/gpt-5.1", "clamp": null});
+    let model_clamped = json!({"kind": "notice", "event": "model_changed",
+        "text": "model → claude-haiku-4-5\nthinking → low (clamped from high: not supported by claude-haiku-4-5)",
+        "model": "claude-haiku-4-5", "clamp": {"from": "high", "to": "low"}});
+    // `set_model` swallowed the error: the model in use is the old one.
+    let model_kept = json!({"kind": "notice", "event": "model_changed", "text": "model → openai/nope-9",
+        "model": "claude-opus-4-6", "clamp": null});
+    const BUDGET_USAGE: &str = "usage: /budget [status] | /budget time <duration> (positive whole seconds/minutes/hours, e.g. 30m or 4h; maximum 24h) | /budget time off";
+    let workers = "Workers (2):\n  sa_1  scout  running  0m\n  sa_2  wren  completed  3m";
+    let budget = "Turn budget (configured for future turns, not live usage):\n  time: 1800s\n  provider rounds: off";
+    let cases: Vec<(&str, &str, Value, synaps_client::CommandReply)> = vec![
+        ("compact", "keep the auth bits", json!({"kind": "none"}), Done(String::new())),
+        ("model", "openai/gpt-5.1", model_ok, Done("model → openai/gpt-5.1".into())),
+        ("model", "claude-haiku-4-5", model_clamped.clone(), Done(model_clamped["text"].as_str().unwrap().into())),
+        ("model", "openai/nope-9", model_kept, NotRun("not switched: the model is still claude-opus-4-6".into())),
+        (
+            "context",
+            "",
+            json!({"kind": "output", "text": "Context: 41 messages\nsystem 12 KB"}),
+            Done("Context: 41 messages\nsystem 12 KB".into()),
+        ),
+        ("context", "auto x 2", json!({"kind": "error", "text": "invalid pressure tokens"}), NotRun("invalid pressure tokens".into())),
+        (
+            "trace",
+            "next",
+            json!({"kind": "output", "text": "trace armed for the next request (metadata only, then auto-disabled)"}),
+            Done("trace armed for the next request (metadata only, then auto-disabled)".into()),
+        ),
+        ("budget", "", json!({"kind": "output", "text": budget}), Done(budget.into())),
+        ("budget", "time 99h", json!({"kind": "error", "text": BUDGET_USAGE}), NotRun(BUDGET_USAGE.into())),
+        ("workers", "", json!({"kind": "output", "text": workers}), Done(workers.into())),
+        (
+            "workers",
+            "cancel sa_9",
+            json!({"kind": "error", "text": "no worker sa_9 (see /workers)"}),
+            NotRun("no worker sa_9 (see /workers)".into()),
+        ),
+        (
+            "confirms",
+            "reset",
+            json!({"kind": "output", "text": "Nothing to revoke: no extension had \"Allow all\"."}),
+            Done("Nothing to revoke: no extension had \"Allow all\".".into()),
+        ),
+        ("frobnicate", "", json!({"kind": "unhandled"}), NotRun("the daemon does not run /frobnicate".into())),
+        (
+            "trace",
+            "",
+            json!({"kind": "something-new", "text": "?"}),
+            Unknown("the daemon answered `something-new`, which this app does not read".into()),
+        ),
+    ];
+    for (k, (name, arg, value, want)) in cases.into_iter().enumerate() {
+        client.engine_command(name, arg).unwrap();
+        let cmd = conn.recv_cmd().await;
+        assert_eq!((cmd["name"].as_str(), cmd["arg"].as_str()), (Some(name), Some(arg)));
+        let id = cmd["id"].as_u64().unwrap();
+        conn.event(50 + k as u64, json!({"ev": "query_result", "id": id, "value": value})).await;
+        assert_eq!(reply(&events).await, (seq, name.into(), want), "{name} {arg}");
+    }
+
+    // Refusals in order: the cancel sent first takes the first.
+    client.cancel_worker("sa_2").unwrap();
+    let _ = conn.recv_cmd().await;
+    client.engine_command("context", "").unwrap();
+    let _ = conn.recv_cmd().await;
+    conn.event(80, json!({"ev": "refused", "client": 2, "command": "engine_command", "reason": "observing"})).await;
+    let cancel = wait(&events, "cancel reply", |e| match e {
+        Event::WorkerCancel { handle_id, result, .. } => Some((handle_id.clone(), result.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(cancel, ("sa_2".into(), Err("refused: observing".into())));
+    conn.event(81, json!({"ev": "refused", "client": 2, "command": "engine_command", "reason": "observing"})).await;
+    assert_eq!(reply(&events).await, (seq, "context".into(), NotRun("refused: observing".into())));
+
+    // In flight when the link drops: unknown, it may have run.
+    client.engine_command("trace", "").unwrap();
+    let _ = conn.recv_cmd().await;
+    drop(conn);
+    let (_, name, r) = reply(&events).await;
+    assert_eq!(name, "trace");
+    assert_eq!(r, Unknown("the link dropped before the daemon answered".into()));
+    // Sent while not connected: never reached the daemon, not run.
+    client.engine_command("budget", "").unwrap();
+    let (_, name, r) = reply(&events).await;
+    assert_eq!(name, "budget");
+    assert!(matches!(r, NotRun(e) if e.contains("not connected")));
+    client.shutdown().unwrap();
+}

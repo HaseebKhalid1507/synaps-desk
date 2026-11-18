@@ -292,6 +292,9 @@ pub(crate) enum Who {
     None,
     You,
     Agent,
+    /// A slash command's answer ([`ItemKind::Output`]): synaps's words,
+    /// not the model's (the TUI's system lines), a message of its own.
+    Synaps,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,7 +423,9 @@ pub(crate) fn build(
     subs: &Subagents,
 ) -> Vec<Disp> {
     let mut out = Vec::new();
-    let mut agent = from > 0 && items[from].kind != ItemKind::User;
+    let mut agent = from > 0
+        && items[from].kind != ItemKind::User
+        && items[..from].iter().rev().find(|x| !x.is_note() || x.kind == ItemKind::Output).is_none_or(|x| x.kind != ItemKind::Output);
     let mut i = from;
     let gap = |i: usize| if i == 0 { Gap::First } else { Gap::Part };
     let day = |i: usize| if items[i].is_note() { None } else { day(i) };
@@ -504,6 +509,13 @@ pub(crate) fn build(
                 }
                 i = end;
             }
+            // A command's answer: its own label; the agent's next words
+            // are labelled again.
+            ItemKind::Output => {
+                out.push(row(Kind::Note, gap(i), Who::Synaps));
+                agent = false;
+                i += 1;
+            }
             _ => {
                 out.push(row(Kind::Note, gap(i), Who::None));
                 i += 1;
@@ -542,6 +554,12 @@ pub(crate) fn who_of(d: &Disp, p: &Palette, m: &Metrics) -> Option<(&'static str
                 _ => m.row,
             };
             Some((label::AGENT, p.agent, ((row - m.body_line) / 2.).max(0.)))
+        }
+        // Level with the well's head line (its frame, padding, one mono
+        // line: [`AppView::render_output`]).
+        Who::Synaps => {
+            let head = 2. + 2. * (4. * m.r).round() + m.mono_line;
+            Some((label::SYNAPS, p.dim, ((head - m.body_line) / 2.).max(0.)))
         }
     }
 }
@@ -1381,6 +1399,7 @@ impl AppView {
                     None => body.child(row.text.clone()).into_any_element(),
                 }
             }
+            Kind::Note if item.kind == ItemKind::Output => self.render_output(item, row, &p, &m, cx),
             Kind::Note => {
                 let color = if item.kind == ItemKind::Error { p.err } else { p.dim };
                 mono(row.text.clone(), m.meta, color).w_full().whitespace_normal().into_any_element()
@@ -2061,6 +2080,84 @@ impl AppView {
     }
 }
 
+/// A slash command's answer shown folded to this many lines, when that
+/// hides at least two (the `… more` line is a line itself: a 9-line
+/// answer shows whole).
+pub(crate) const OUTPUT_LINES: usize = 8;
+
+/// Whether an answer of `n` lines is shown folded.
+pub(crate) fn output_folds(n: usize) -> bool {
+    n >= OUTPUT_LINES + 2
+}
+
+impl AppView {
+    /// A slash command's answer ([`ItemKind::Output`], this client's row):
+    /// whole, as the TUI prints it into its scrollback, in the house well
+    /// (`well` in a 1 px `hair_w` frame, mono `res`), its command over it;
+    /// past [`OUTPUT_LINES`] lines folded, a click on its head or its
+    /// `… more` line opens and folds it.
+    fn render_output(&self, item: &Item, row: &RowCache, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
+        let inset = (12. * m.r).round();
+        let pad = (6. * m.r).round();
+        let id = item.id;
+        let (name, body) = row.text.split_once('\n').unwrap_or((&row.text, ""));
+        let lines: Vec<&str> = body.lines().collect();
+        let long = output_folds(lines.len());
+        let open = !long || self.toggled.contains(&id);
+        let shown = if open { lines.len() } else { OUTPUT_LINES };
+        let toggle = |d: Stateful<Div>, cx: &Context<Self>| {
+            d.cursor_pointer().hover(|d| d.bg(p.tool_out)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.toggle(id);
+                cx.notify();
+            }))
+        };
+        let count = format!(
+            "{} line{}{}",
+            lines.len(),
+            if lines.len() == 1 { "" } else { "s" },
+            if long { if open { " · fold" } else { " · show all" } } else { "" }
+        );
+        let head = h_flex()
+            .id(("output-head", id as usize))
+            .px(px(inset))
+            .py(px((4. * m.r).round()))
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(p.hair_w)
+            .text_px(m.meta)
+            .text_color(p.dim_o)
+            .whitespace_nowrap()
+            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().child(SharedString::from(name.to_string())))
+            .child(div().flex_none().child(count));
+        let head = if long { toggle(head, cx) } else { head };
+        let mut col = v_flex().px(px(inset)).py(px(pad)).text_color(p.res);
+        for l in &lines[..shown] {
+            // A line's own indent kept (the daemon aligns its columns).
+            col = col.child(div().w_full().min_h(px(m.mono_line)).whitespace_normal().child(SharedString::from(l.to_string())));
+        }
+        let more = (long && !open).then(|| {
+            toggle(div().id(("output-more", id as usize)), cx)
+                .px(px(inset))
+                .pb(px(pad))
+                .text_color(p.dim_o)
+                .child(format!("… {} more lines", lines.len() - shown))
+        });
+        v_flex()
+            .debug_selector(move || format!("output {id}"))
+            .w_full()
+            .bg(p.well)
+            .border_1()
+            .border_color(p.hair_w)
+            .font_family(fonts::MONO)
+            .text_px(m.mono)
+            .line_height(px(m.mono_line))
+            .child(head)
+            .child(col)
+            .children(more)
+            .into_any_element()
+    }
+}
+
 /// An opened call's body (polish.md §2.3): a well under its row, from the
 /// verb column to the column's end (noir's), on the `well` ground (`code`)
 /// in a 1 px `hair_w` frame. A header line (the path; an edit's `replaced
@@ -2274,6 +2371,34 @@ mod tests {
                 Kind::Prompt => "prompt",
             })
             .collect()
+    }
+
+    /// Shady #20 N4: a command's answer is synaps's words, not the
+    /// agent's: its own label, and the agent's next words labelled again.
+    #[test]
+    fn a_command_answer_is_labelled_its_own() {
+        use synaps_client::protocol::{LlmEvent, StreamEvent};
+        let mut t = transcript(&[
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "one"}]}),
+        ]);
+        t.output("budget", "Budget: none set");
+        t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { text: "two".into() }) });
+        let rows = build(t.items(), 0, false, &HashSet::new(), &Subagents::default());
+        assert_eq!(kinds(&rows), ["user", "prose", "note", "prose"]);
+        assert_eq!(rows.iter().map(|d| d.who).collect::<Vec<_>>(), [Who::You, Who::Agent, Who::Synaps, Who::Agent]);
+        // Rebuilt from the row after it: the same.
+        let from = build(t.items(), 3, false, &HashSet::new(), &Subagents::default());
+        assert_eq!(from.iter().map(|d| d.who).collect::<Vec<_>>(), [Who::Agent]);
+    }
+
+    /// Shady #20 N6: folded only when that hides two lines or more (the
+    /// `… more` line is a line itself).
+    #[test]
+    fn an_answer_folds_only_where_it_saves_lines() {
+        assert!(!super::output_folds(8));
+        assert!(!super::output_folds(9), "9 lines: whole");
+        assert!(super::output_folds(10), "8 shown, 2 more");
     }
 
     #[test]

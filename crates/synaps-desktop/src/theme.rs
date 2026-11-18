@@ -435,14 +435,16 @@ roles! {
     res, dim_o, think_o, ok_o, err_o,
     // On the card (the permission card, the NEEDS YOU stub, overlays) and
     // its hovered step: text, then marks.
-    prose_k, dim_k, warn_k, err_k, run_k, ok_k, run_mark_k, err_mark_k, rest_mark_k, focus_k,
+    // (`you_k`: the palette's matched letters, the accent floored as text.)
+    prose_k, dim_k, warn_k, err_k, run_k, ok_k, you_k, run_mark_k, err_mark_k, rest_mark_k, focus_k,
     // Marks (3:1): the user's bar (on the canvas and user, and on a run:
     // the watched tray row), bullets, state glyphs and borders, focus, the
     // table rule, the two filled buttons.
     you_mark, you_mark_t, bullet, warn_mark, run_mark, focus, tb2, btn_fill, warn_fill,
     // The filled buttons' hover (a step toward the ink); a scrollbar's
-    // thumb at rest on the canvas, the chrome and the user surface.
-    btn_hi, warn_hi, thumb, thumb_ch, thumb_u,
+    // thumb at rest on the canvas, the chrome, the user surface and the
+    // card (the palette's list).
+    btn_hi, warn_hi, thumb, thumb_ch, thumb_u, thumb_k,
     // Pressed (fluid.md §3.9): a step off each hover fill, toward the ink
     // or else away from it, never through a floor of what is drawn on it:
     // on the chrome (`raised`), the card (`card_hi`), and the two filled
@@ -701,6 +703,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.well_fg = f.at("well_fg", t.code_fg, ink, &[canvas], loud);
     r.run_k = f.text("run_k", t.status_streaming, &k);
     r.ok_k = f.text("ok_k", t.tool_result_ok, &k);
+    r.you_k = f.text("you_k", you, &k);
     r.run_mark_k = f.mark("run_mark_k", t.status_streaming, &k);
     r.err_mark_k = f.mark("err_mark_k", t.error_color, &k);
     r.rest_mark_k = f.mark("rest_mark_k", t.muted, &k);
@@ -757,11 +760,17 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     // A thumb at rest: its ground's dim text, 55 % of the way off the
     // ground (what `opacity(0.55)` painted). It stands off the ground as a
     // divider does.
-    [r.thumb, r.thumb_ch, r.thumb_u] = [mix(canvas, r.dim, 0.55), mix(chrome, r.dim_ch, 0.55), mix(user, r.dim_u, 0.55)];
-    for (role, ground, from, c) in
-        [("thumb", canvas, r.dim, r.thumb), ("thumb_ch", chrome, r.dim_ch, r.thumb_ch), ("thumb_u", user, r.dim_u, r.thumb_u)]
-    {
-        f.log.push(Check { role, from, color: c, grounds: vec![ground], floor: HAIR });
+    [r.thumb, r.thumb_ch, r.thumb_u, r.thumb_k] =
+        [mix(canvas, r.dim, 0.55), mix(chrome, r.dim_ch, 0.55), mix(user, r.dim_u, 0.55), mix(card, r.dim_k, 0.55)];
+    // `thumb_k` is drawn on the card and on its selected row's `card_hi`
+    // (the palette's bar lies over the selection quad).
+    for (role, grounds, from, c) in [
+        ("thumb", vec![canvas], r.dim, r.thumb),
+        ("thumb_ch", vec![chrome], r.dim_ch, r.thumb_ch),
+        ("thumb_u", vec![user], r.dim_u, r.thumb_u),
+        ("thumb_k", vec![card, card_hi], r.dim_k, r.thumb_k),
+    ] {
+        f.log.push(Check { role, from, color: c, grounds, floor: HAIR });
     }
     // Pressed ([`pressed`]): what is drawn on each is logged on it.
     {
@@ -1027,7 +1036,7 @@ pub fn luminance_hsla(c: Hsla) -> f32 {
 /// thumbs), and the ink and prose the words are in.
 const UNDRAINED: &[&str] = &[
     "chrome", "canvas", "user", "code", "tool", "tool_out", "card", "card_hi", "raised", "hair", "edge", "frame", "add_bg", "del_bg",
-    "thumb", "thumb_ch", "thumb_u", "press_ch", "press_k", "ink", "prose",
+    "thumb", "thumb_ch", "thumb_u", "thumb_k", "press_ch", "press_k", "ink", "prose",
     // Q1's (PR #16) ground and rules (a well greys while the code beside
     // it doesn't): `grounds_and_rules_never_drain` fails on any new one
     // missing here.
@@ -2156,6 +2165,33 @@ mod tests {
 
     /// Every role is in the `Check` log (so the floor test covers it), but
     /// the two grounds a theme gives as they are.
+    /// Design re-gate #20 (4): the palette's matched letters (`you_k`, the
+    /// accent) read as text on the card and on the selected row, with
+    /// every accent.
+    #[test]
+    fn you_k_reads_on_the_card_and_its_selection() {
+        for (name, raw) in palettes::THEMES {
+            for accent in std::iter::once(None).chain(PRESETS.iter().map(|p| Some(p.1))) {
+                let (r, checks) = resolve(&raw, accent);
+                let c = checks.iter().find(|c| c.role == "you_k").expect("you_k is checked");
+                assert_eq!((c.grounds.clone(), c.floor), (vec![r.card, r.card_hi], TEXT), "{name}");
+                assert!(contrast(r.you_k, r.card_hi) >= TEXT - 1e-9 && contrast(r.you_k, r.card) >= TEXT - 1e-9, "{name} {accent:06x?}");
+            }
+        }
+    }
+
+    /// Shady #20 N5: the card's scrollbar thumb is drawn over the palette's
+    /// selected row too: it meets its floor on `card_hi` as on `card`.
+    #[test]
+    fn thumb_k_reads_on_the_card_and_its_selection() {
+        for (name, raw) in palettes::THEMES {
+            let (r, checks) = resolve(&raw, None);
+            let c = checks.iter().find(|c| c.role == "thumb_k").expect("thumb_k is checked");
+            assert_eq!(c.grounds, vec![r.card, r.card_hi], "{name}");
+            assert!(contrast(r.thumb_k, r.card_hi) >= HAIR, "{name}");
+        }
+    }
+
     #[test]
     fn every_role_is_checked() {
         for (name, raw) in palettes::THEMES {
@@ -2195,6 +2231,7 @@ mod tests {
             "focus",
             "focus_ch",
             "focus_k",
+            "you_k",
             "open_ch",
             "you_bar",
             "press_ch",
