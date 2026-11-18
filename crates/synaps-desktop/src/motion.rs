@@ -1542,16 +1542,6 @@ impl Motion {
         Some(Grow { key, shown: Some(g.shown), sink: g.sink.clone(), travel, strength, floor: LIFT })
     }
 
-    /// A body under its row as it opens or closes (cards4/proposal.md §8
-    /// #6, #12): the fraction of its height shown (the header never moves:
-    /// the clip is the body's), on `glide`, and the cell its height is
-    /// measured into. `None`: at rest (open: all of it; closed: none). A
-    /// body seen for the first time (history, scrolled in, a switch) is at
-    /// rest; Reduced, Off and low power: at once. `delay`: a turn that
-    /// starts now waits this long (a success's streamed body folds @ +180).
-    /// `generation`: what it holds (its call's state); open and at rest, a
-    /// change of it (a failure's output in place of the streamed lines)
-    /// glides its height from the one it had, never a jump.
     /// The frame's number (counts up a frame at a time).
     pub(crate) fn frame(&self) -> u64 {
         self.frame.get()
@@ -1571,6 +1561,16 @@ impl Motion {
         Some((r.open, shown, h, done || r.at.is_none()))
     }
 
+    /// A body under its row as it opens or closes (cards4/proposal.md §8
+    /// #6, #12): the fraction of its height shown (the header never moves:
+    /// the clip is the body's), on `glide`, and the cell its height is
+    /// measured into. `None`: at rest (open: all of it; closed: none). A
+    /// body seen for the first time (history, scrolled in, a switch) is at
+    /// rest; Reduced, Off and low power: at once. `delay`: a turn that
+    /// starts now waits this long (a success's streamed body folds @ +180).
+    /// `generation`: what it holds (its call's state); open and at rest, a
+    /// change of it (a failure's output in place of the streamed lines)
+    /// glides its height from the one it had, never a jump.
     pub(crate) fn reveal(&self, key: u64, open: bool, delay: Duration, generation: u64) -> (Option<f32>, Rc<Cell<f32>>) {
         let (frame, now) = (self.frame.get(), self.now());
         let fluid = self.fluid();
@@ -2724,11 +2724,6 @@ impl Motion {
         let beat = (since.as_nanos() / BEAT.as_nanos()) as u32;
         let (mut wants, mut next) = (false, None::<u32>);
         for s in self.sites.borrow().iter() {
-            let quad = |x: f32, y: f32, w: f32, h: f32, c: Hsla, window: &mut Window| {
-                window.with_content_mask(Some(s.mask), |window| {
-                    window.paint_quad(fill(Bounds::new(s.origin + point(px(x), px(y)), size(px(w), px(h))), c));
-                });
-            };
             // A lattice (indicators/proposal.md §6): its pose at this beat,
             // and the beat it next changes on (the timer goes there).
             let mut lattice = |n: f32, pat: crate::lattice::Pat, window: &mut Window| {
@@ -2749,8 +2744,8 @@ impl Motion {
                         // Its cell steps every other beat (as before).
                         let b = (beat / 2 + 1) * 2;
                         next = Some(next.map_or(b, |n: u32| n.min(b)));
-                        let (x, y, w) = crate::glyph::BREATH_CELL;
-                        quad(x, y, w, w, crate::glyph::breath_cell(step, s.mark, s.ground), window);
+                        let d = crate::glyph::breath_dots(step);
+                        window.with_content_mask(Some(s.mask), |window| crate::lattice::paint(window, s.origin, 10., d, s.mark, s.ground));
                     }
                 }
             }

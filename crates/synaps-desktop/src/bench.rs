@@ -751,19 +751,35 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         });
                         if std::env::var("SYNAPS_BENCH_FOLDS").is_ok() {
                             // `SYNAPS_BENCH_FOLDS=1` (the design gate of #23,
-                            // N1, S1): the folds a click makes, as its
-                            // listener makes them (`toggle_run`, `toggle`):
-                            // the run unfolded, its header a third of the
-                            // way down the view, folded there; unfolded and
-                            // folded at the list's end; the last call's body
-                            // opened and closed at the end.
+                            // N1, N3, S1; Shady #23 r3 H1, H2): the folds a
+                            // click makes, as its listener makes them
+                            // (`toggle_run`, `toggle`), each mark on stderr
+                            // (`FOLDS <what> <s>`, the bench's clock):
+                            // - unfolded at the end; its header a third of
+                            //   the way down the view, folded there;
+                            // - unfolded there, no scroll (the cascade alone);
+                            // - at the end, folded there (its header holds);
+                            //   another tab, and back (its room stays home);
+                            // - unfolded as the list is sent to its end (the
+                            //   rows reveal under the view), folded there;
+                            // - unfolded, at the end: the last call's body
+                            //   opened (the list shows its first lines) and
+                            //   closed;
+                            // - a new turn's call streams into the held room
+                            //   while the reader scrolls up 0.5 px a frame
+                            //   (a touchpad) for 3 s, and after.
+                            let t0 = Instant::now();
+                            let mark = |what: &str| eprintln!("FOLDS {what} {:.3}", t0.elapsed().as_secs_f64());
                             let run = |v: &AppView| v.disp.iter().rev().find(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id);
-                            sleep(2.5).await;
-                            let _ = upd(cx, &|v, _| {
+                            let last = |v: &AppView| v.disp.iter().rev().find(|d| d.kind == crate::turns::Kind::Work).map(|d| d.id);
+                            let flip = |v: &mut AppView| {
                                 if let Some(id) = run(v) {
                                     v.toggle_run(id);
                                 }
-                            });
+                            };
+                            sleep(2.5).await;
+                            mark("unfold-end");
+                            let _ = upd(cx, &|v, _| flip(v));
                             sleep(2.).await;
                             let _ = upd(cx, &|v, _| {
                                 if let Some(ix) = run(v).and_then(|id| v.disp.iter().position(|d| d.id == id)) {
@@ -773,45 +789,89 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                                 }
                             });
                             sleep(1.5).await;
+                            mark("fold-mid");
+                            let _ = upd(cx, &|v, _| flip(v));
+                            sleep(2.5).await;
+                            mark("unfold-mid");
+                            let _ = upd(cx, &|v, _| flip(v));
+                            sleep(2.).await;
+                            let _ = upd(cx, &|v, _| v.list.scroll_to_end());
+                            sleep(1.).await;
+                            mark("fold-end");
+                            let _ = upd(cx, &|v, _| flip(v));
+                            sleep(2.5).await;
+                            mark("tab-other");
                             let _ = upd(cx, &|v, _| {
-                                if let Some(id) = run(v) {
-                                    v.toggle_run(id);
+                                if v.client.is_none() {
+                                    let other = Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false };
+                                    v.open_tab(other, crate::tabs::Place::New);
                                 }
                             });
-                            sleep(2.5).await;
+                            sleep(2.).await;
+                            mark("tab-back");
+                            let _ = upd(cx, &|v, _| v.focus_tab(0));
+                            sleep(2.).await;
+                            mark("unfold-to-end");
                             let _ = upd(cx, &|v, _| {
-                                if let Some(id) = run(v) {
-                                    v.toggle_run(id);
-                                }
+                                flip(v);
                                 v.list.scroll_to_end();
                             });
                             sleep(2.).await;
-                            let _ = upd(cx, &|v, _| {
-                                if let Some(id) = run(v) {
-                                    v.toggle_run(id);
-                                }
-                            });
+                            mark("fold-rows-under");
+                            let _ = upd(cx, &|v, _| flip(v));
                             sleep(2.5).await;
-                            let last = |v: &AppView| v.disp.iter().rev().find(|d| d.kind == crate::turns::Kind::Work).map(|d| d.id);
-                            let _ = upd(cx, &|v, _| {
-                                if let Some(id) = run(v) {
-                                    v.toggle_run(id);
-                                }
-                                v.list.scroll_to_end();
-                            });
-                            sleep(2.).await;
+                            mark("unfold-for-body");
+                            let _ = upd(cx, &|v, _| flip(v));
+                            sleep(1.5).await;
+                            let _ = upd(cx, &|v, _| v.list.scroll_to_end());
+                            sleep(1.).await;
+                            mark("body-open");
                             let _ = upd(cx, &|v, _| {
                                 if let Some(id) = last(v) {
                                     v.toggle(id);
                                 }
                             });
                             sleep(2.).await;
+                            mark("body-close");
                             let _ = upd(cx, &|v, _| {
                                 if let Some(id) = last(v) {
                                     v.toggle(id);
                                 }
                             });
-                            sleep(2.5).await;
+                            sleep(2.).await;
+                            mark("turn-stream");
+                            let _ = upd(cx, &|v, _| {
+                                let t = &mut v.model.transcript;
+                                t.apply(&SessionEvent::TurnStarted {
+                                    turn_baseline: 14,
+                                    trigger: "user".into(),
+                                    user_text: Some("Tail the log.".into()),
+                                });
+                                t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                                v.sync_list();
+                            });
+                            apply(cx, vec![call("z9", "bash", cmd("tail -f logs/relay.log")), started("z9")]);
+                            sleep(1.).await;
+                            mark("slow-scroll");
+                            for k in 0..430 {
+                                let _ = upd(cx, &|v, _| {
+                                    v.scroller.touch();
+                                    v.list.scroll_by(gpui::px(-0.5));
+                                });
+                                if k % 40 == 0 {
+                                    apply(cx, vec![delta("z9", &format!("relay: refresh {k} ok\n"))]);
+                                }
+                                sleep(0.007).await;
+                            }
+                            mark("scroll-stopped");
+                            for k in 0..8 {
+                                apply(cx, vec![delta("z9", &format!("relay: refresh {} ok\n", 500 + k))]);
+                                sleep(0.3).await;
+                            }
+                            mark("done");
+                            println!("{out}");
+                            let _ = cx.update(|_, cx| cx.quit());
+                            return;
                         } else {
                             sleep(9.5).await;
                         }

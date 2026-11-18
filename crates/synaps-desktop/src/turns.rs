@@ -1354,7 +1354,6 @@ impl AppView {
         (TextView::new(&view), px(h))
     }
 
-    /// One display row: its gap, its label and the block.
     /// A folding run's rows (N1), as they were drawn: the blocks inside its
     /// card, which the room under its header draws round them.
     pub(crate) fn fold_rows(&self, rows: &[Disp], cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1369,6 +1368,7 @@ impl AppView {
             .collect()
     }
 
+    /// One display row: its gap, its label and the block.
     pub(crate) fn render_disp(&self, ix: usize, cx: &mut Context<Self>) -> RowParts {
         let Some(&d) = self.disp.get(ix) else { return RowParts::empty() };
         let items = self.model.shown().items();
@@ -1445,8 +1445,7 @@ impl AppView {
             _ if !crate::cards::in_card(&d) => None,
             (top, bottom) => {
                 // Folding (N1): its card goes on in the room under it.
-                let bottom =
-                    bottom && !self.fold_gap.borrow().as_ref().is_some_and(|g| g.is(d.id) && matches!(d.kind, Kind::Summary { .. }));
+                let bottom = bottom && !self.fold_gap.borrow().iter().any(|g| g.is(d.id) && matches!(d.kind, Kind::Summary { .. }));
                 let (pal, geo) = (p, crate::cards::Geo::of(&m));
                 let id = d.id;
                 let click = matches!(d.kind, Kind::Summary { .. }).then(|| {
