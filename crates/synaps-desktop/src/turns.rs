@@ -1522,12 +1522,14 @@ fn target_el(card: &Card, arg: &SharedString, p: &Palette) -> Div {
 }
 
 /// A running call's clock (the TUI's `running 1.2s`): whole seconds since
-/// it started, on the frame's instant, ticking on the second while motion
+/// it started, as of the frame's grid second, ticking on the second while motion
 /// is on.
-fn clock(fx: &Motion, started: Option<Instant>) -> Option<SharedString> {
-    let ms = fx.now().saturating_duration_since(started?).as_millis() as u64;
+pub(crate) fn clock(fx: &Motion, started: Option<Instant>) -> Option<SharedString> {
+    // As of the frame's grid second (Shady #17 M2), as every clock.
+    let at = fx.clock_now();
+    let ms = at.saturating_duration_since(started?).as_millis() as u64;
     if fx.on() {
-        fx.tick_clock(fx.now() + Duration::from_millis(1000 - ms % 1000));
+        fx.tick_clock(at + Duration::from_millis(1000 - ms % 1000));
     }
     Some(subagents::fmt_whole(ms / 1000).into())
 }
@@ -1623,10 +1625,19 @@ impl AppView {
             .text_color(p.prose_t)
             .cursor_pointer()
             .hover(|d| d.bg(p.tool_out))
-            .child(glyph::lead(Some(glyph::draw(last, glyph::ink(family, Ground::Run, p).1)), m))
+            .child(glyph::lead(Some(glyph::spinning(fx, last, glyph::ink(family, Ground::Run, p).1, p.canvas)), m))
             .child(div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.prose_t).child("ran"))
             .child(
-                h_flex().flex_1().min_w_0().gap(px(m.run_gap)).items_center().child(div().flex_none().child(s.label.clone())).child(tally),
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(m.run_gap))
+                    .items_center()
+                    // `N calls` rolls while the run grows (polish.md P5).
+                    .child(motion::roll_count(fx, motion::key(motion::ROLL_CALLS, id), s.tools, s.label.clone(), |t| {
+                        div().flex_none().child(t)
+                    }))
+                    .child(tally),
             )
             .child(trail)
             .child(geo.fold_col(Some(glyph::turn(fx.turn(id | RUN_KEY, open), p.dim_t))))
@@ -1852,7 +1863,7 @@ impl AppView {
             .items_center()
             .text_px(m.meta)
             .whitespace_nowrap()
-            .when(!v.facts_bare.is_empty(), |d| d.child(div().text_color(p.dim_t).child(crate::tray::ticked(fx, &v.facts_bare, tick))))
+            .when(!v.facts_bare.is_empty(), |d| d.child(spawn_facts(fx, &v.facts_bare, tick, p)))
             .when(warn && !lay.tight, |d| d.child(div().text_color(word_color).child(word)));
         let button = who.clone().map(|who| {
             let who2 = who.clone();
@@ -1937,6 +1948,9 @@ impl AppView {
                         .text_px(m.meta)
                         .whitespace_nowrap()
                         .child(glyph::draw(Glyph::Elbow, p.dim_t))
+                        // A changed step swaps in place: under a live fan-out a
+                        // roll is an app frame at 30 Hz for every change
+                        // (polish.md P5, gate 4).
                         .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.sub_status_t).child(text))
                         .into_any_element(),
                 )
@@ -2064,6 +2078,13 @@ fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metric
     }
 }
 
+/// A spawn row's facts (polish.md §2.4): running, its clock ticks; its
+/// tool count changes in place (P5: under a live fan-out a roll is an app
+/// frame at 30 Hz for every change, gate 4); ended, as reported.
+fn spawn_facts(fx: &std::rc::Rc<Motion>, facts: &SharedString, tick: &Option<(SharedString, subagents::Tick)>, p: &Palette) -> AnyElement {
+    div().text_color(p.dim_t).child(crate::tray::ticked(fx, facts, tick)).into_any_element()
+}
+
 /// A summary's chevron is keyed apart from its first row's own.
 const RUN_KEY: u64 = 1 << 63;
 
@@ -2072,8 +2093,8 @@ pub(crate) fn glyph_code(g: Glyph) -> u64 {
     Glyph::ALL.iter().position(|x| *x == g).unwrap_or(0) as u64
 }
 
-/// A state glyph as it is now (motion.md §6, §7): `Run` and `Workers`
-/// scan on the beat; `Needs` breathes from `breath` (the prompt's arrival)
+/// A state glyph as it is now (motion.md §6, §7): `Run`, `Workers` and
+/// `Opening` spin on the beat (polish.md P1); `Needs` breathes from `breath` (the prompt's arrival)
 /// three times, then holds; a glyph that changed (`change`: when, and from
 /// what) writes on, draws its quads or (`fade`) cross-fades. Off: [`glyph::draw`].
 pub(crate) fn live_glyph(
@@ -2086,9 +2107,9 @@ pub(crate) fn live_glyph(
     fade: bool,
 ) -> AnyElement {
     match g {
-        // The beat layer paints the scan over the cached frame.
-        Glyph::Run | Glyph::Workers if fx.layered() => glyph::on_beat(motion::Beat::Scan(g), mark, ground, fx),
-        Glyph::Run | Glyph::Workers => glyph::scan(g, fx.beat(1), mark, fx.ink()),
+        // The braille family spins (the beat layer paints it over the
+        // cached frame).
+        Glyph::Run | Glyph::Workers | Glyph::Opening => glyph::spinning(fx, g, mark, ground),
         Glyph::Needs => {
             let step = breath.map(|t| fx.beats_since(t)).filter(|s| *s < motion::BREATH_BEATS * motion::BREATHS);
             if let (Some(t), Some(_), true) = (breath, step, fx.layered()) {
@@ -2099,8 +2120,13 @@ pub(crate) fn live_glyph(
         }
         _ => match change.filter(|c| (c.1 as usize) < Glyph::ALL.len()) {
             Some((at, prev)) => {
-                let p = if fade { fx.shot(Some(at), Duration::ZERO, motion::QUICK, &ease::INOUT, Mk::Fade) } else { fx.write_on(Some(at)) };
-                glyph::change(Some((Glyph::ALL[prev as usize], mark)), g, mark, ground, p, fade)
+                let from = Glyph::ALL[prev as usize];
+                if fade {
+                    let p = fx.shot(Some(at), Duration::ZERO, motion::QUICK, &ease::INOUT, Mk::Fade);
+                    return glyph::change(Some((from, mark)), g, mark, ground, p, true);
+                }
+                let (old, p) = fx.write_on(Some(at));
+                glyph::change_over(Some((from, fx.beat_at(at), mark)), g, mark, ground, old, p)
             }
             None => glyph::draw(g, mark),
         },

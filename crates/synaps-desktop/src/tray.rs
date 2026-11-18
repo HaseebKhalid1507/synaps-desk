@@ -40,7 +40,7 @@ use crate::wtabs::Who;
 pub(crate) fn ticked(fx: &motion::Motion, facts: &SharedString, tick: &Option<(SharedString, crate::subagents::Tick)>) -> SharedString {
     match tick {
         Some((head, t)) if fx.on() => {
-            let (s, next) = t.whole(fx.now());
+            let (s, next) = t.whole(fx.clock_now());
             fx.tick_clock(next);
             let clock = crate::subagents::fmt_whole(s);
             if head.is_empty() { clock.into() } else { format!("{head} · {clock}").into() }
@@ -171,7 +171,7 @@ const X_W: f32 = 16.;
 fn chip_clock(fx: &motion::Motion, r: &TrayRow) -> Option<SharedString> {
     match &r.tick {
         Some((_, t)) if fx.on() => {
-            let (s, next) = t.whole(fx.now());
+            let (s, next) = t.whole(fx.clock_now());
             fx.tick_clock(next);
             Some(crate::subagents::fmt_whole(s).into())
         }
@@ -388,7 +388,14 @@ impl AppView {
             })
             .collect();
         let watched = self.model.watch.focused().map(|w| w.subagent_id);
-        rows.sort_by_key(|r| need(r, watched));
+        // The watched one goes up only if it would be folded into `+N
+        // more`: a chip clicked where it is drawn stays under the pointer
+        // (Shady #16 r4).
+        rows.sort_by_key(|r| need(r, None));
+        let drawn = self.chips.drawn();
+        if watched.is_some_and(|w| rows.iter().position(|r| r.id == w).is_none_or(|i| i >= drawn)) {
+            rows.sort_by_key(|r| need(r, watched));
+        }
         // Rows that came while watched draw in (staggered); rows that left fade out.
         let session = self.model.active.as_ref().map(|a| a.session_id.clone());
         let mut ghosts = std::mem::take(&mut self.tray.ghosts);
@@ -685,7 +692,10 @@ impl AppView {
                 .border_color(p.hair_t)
                 .cursor_pointer()
                 .hover(|d| d.bg(p.tool_out))
-                .child(mono(format!("+{} more", chips.more), m.meta, p.dim_t))
+                // It rolls as workers come and go (polish.md P5).
+                .child(motion::roll_count(&self.fx, motion::ROLL_MORE, chips.more, format!("+{} more", chips.more).into(), |t| {
+                    mono(t, m.meta, p.dim_t)
+                }))
                 // Its menu open: the menu says it (no tooltip over it).
                 .when(self.wmenu.is_none(), |d| d.tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)))
                 .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| this.open_workers_menu(ev.position(), window, cx)));
@@ -825,7 +835,7 @@ impl AppView {
             .text_px(m.meta)
             .border_1()
             .border_color(f(p.hair_t))
-            .child(glyph::draw(g, f(mark)))
+            .child(glyph::draw_on(g, f(mark), p.canvas))
             .child(div().flex_none().text_color(f(p.sub_name_t)).child(SharedString::from(cut(&r.name, NAME_CHARS))))
             .child(div().flex_1().min_w_0().overflow_hidden().text_color(f(word_color)).child(SharedString::from(chip_step(r).to_string())))
             .child(glyph::bar(f(p.sub_rule)))
@@ -1028,15 +1038,68 @@ mod tests {
         let l = Live { tick: Some(crate::subagents::Tick::new(41.4, t0)), ..live(Status::Running, "bash") };
         let r = TrayRow::of(l, false);
         assert_eq!(r.facts.as_ref(), "1 tool · 40.0s", "the row's own text, as the daemon said");
-        // Its next second (44) at 2.6 s: on the grid's second that crosses
-        // it (3 s: every clock's one app frame), at every level.
-        for (level, low_power, at) in [(Level::Full, false, 3000), (Level::Reduced, false, 3000), (Level::Full, true, 3000)] {
+        // A frame at 1.7 s reads the clock at its grid second (1 s: 42.4,
+        // `42s`); its next second (43) at 1.6 s is on the grid's second
+        // that crosses it (2 s: every clock's one app frame), at every level.
+        for (level, low_power, at) in [(Level::Full, false, 2000), (Level::Reduced, false, 2000), (Level::Full, true, 2000)] {
             fx.begin_frame(level, low_power, t0 + Duration::from_millis(1700));
-            assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 43s", "{level:?}");
+            assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 42s", "{level:?}");
             assert_eq!(fx.demand(), (false, Some(t0 + Duration::from_millis(at))), "{level:?} {low_power}: only its next second");
         }
         fx.begin_frame(Level::Off, false, t0 + Duration::from_secs(9));
         assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 40.0s");
         assert_eq!(fx.demand(), (false, None), "Off: no clock ticks");
+    }
+
+    /// Shady #17 M2: a clock whose second falls just after the grid's
+    /// (2 ms) and a frame late by a refresh (5 ms): the frame asks for the
+    /// very next grid second, and that one shows the next whole second.
+    /// Read at the frame's own instant, it showed 43 at once, asked for
+    /// 3 s, and 2 s was never drawn (the clock jumped two).
+    #[test]
+    fn a_late_frame_never_skips_a_clocks_second() {
+        use crate::motion::{Level, Motion};
+        use std::time::{Duration, Instant};
+        let base = Instant::now();
+        let t0 = base + Duration::from_secs(5);
+        let ms = Duration::from_millis;
+        let fx = Motion::new(t0);
+        let l = Live { tick: Some(crate::subagents::Tick::new(41.998, t0)), ..live(Status::Running, "bash") };
+        let r = TrayRow::of(l, false);
+        fx.begin_frame(Level::Full, false, t0 + ms(1005));
+        assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 42s");
+        assert_eq!(fx.demand(), (false, Some(t0 + ms(2000))), "the next grid second, not the one after");
+        fx.begin_frame(Level::Full, false, t0 + ms(2005));
+        assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 43s", "one second on");
+        assert_eq!(fx.demand(), (false, Some(t0 + ms(3000))));
+        // The transcript's own clocks (a running call's) read the same second.
+        fx.begin_frame(Level::Full, false, t0 + ms(3005));
+        assert_eq!(crate::turns::clock(&fx, Some(base + ms(2))).as_deref(), Some("7s"), "as of 3 s: 7.998");
+        assert_eq!(fx.demand(), (false, Some(t0 + ms(4000))));
+    }
+
+    /// Shady #17 R2-L1 (motion.md §5.3): the link lost at 2.4 s, every
+    /// clock holds its count as of then, frame after frame, and asks for no
+    /// second; back, they count from the time again.
+    #[test]
+    fn a_lost_link_holds_the_clocks() {
+        use crate::motion::{Level, Motion};
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now() + Duration::from_secs(5);
+        let ms = Duration::from_millis;
+        let fx = Motion::new(t0);
+        let l = Live { tick: Some(crate::subagents::Tick::new(40., t0)), ..live(Status::Running, "bash") };
+        let r = TrayRow::of(l, false);
+        for at in [2500, 3000, 9000, 60_000] {
+            fx.begin_frame(Level::Full, false, t0 + ms(at));
+            fx.hold_still(Some(t0 + ms(2400)));
+            assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 42s", "held at {at} ms");
+            assert_eq!(super::chip_clock(&fx, &r).as_deref(), Some("42s"), "the chip, held at {at} ms");
+            assert_eq!(crate::turns::clock(&fx, Some(t0)).as_deref(), Some("2s"), "a call's, held at {at} ms");
+            assert_eq!(fx.demand(), (false, None), "no clock asks for a second at {at} ms");
+        }
+        fx.begin_frame(Level::Full, false, t0 + ms(61_000));
+        assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 1m 41s", "back: the time again");
+        assert_eq!(fx.demand(), (false, Some(t0 + ms(62_000))));
     }
 }

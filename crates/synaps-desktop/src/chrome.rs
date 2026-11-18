@@ -445,7 +445,7 @@ impl AppView {
         // 2 Hz on the beat (motion.md §6.7: text, not a spinner); held at
         // `···` without the heartbeat. Mono, padded: the word never moves.
         let dots = |word: &str| -> SharedString {
-            let n = self.fx.beat(4).map_or(3, |b| (b / 4 % 3) as usize + 1);
+            let n = self.fx.words_beat(4).map_or(3, |b| (b / 4 % 3) as usize + 1);
             format!("{word} {:<3}", "·".repeat(n)).into()
         };
         let (conn, conn_color): (SharedString, Hsla) = match &self.model.conn {
@@ -516,15 +516,14 @@ impl AppView {
             .items_center()
             // The state grammar (design.md §4.1): NEEDS YOU's glyph, or at rest the idle one.
             .child(if on { glyph::draw(glyph::Glyph::Needs, p.warn_mark_ch) } else { glyph::draw(glyph::Glyph::Idle, p.rest_mark) })
-            // The count afterglows when it changes (motion.md §6.6).
-            .child(
-                display(
-                    format!("{n}   {}", label::NEED_YOU),
-                    size::D_S,
-                    self.fx.glow(GLOW | 0xFFFF, n as u64, if on { p.warn_ch } else { p.dim_ch }),
-                )
-                .flex_none(),
-            )
+            // The count rolls (polish.md P5) and afterglows (motion.md
+            // §6.6) when it changes; the words stay.
+            // One text at rest, as before; rolling, only its changed cells.
+            .child({
+                let c = self.fx.glow(GLOW | 0xFFFF, n as u64, if on { p.warn_ch } else { p.dim_ch });
+                let text = format!("{n}   {}", label::NEED_YOU).into();
+                crate::motion::roll_count(&self.fx, crate::motion::ROLL_NEEDS, n, text, |t| display(t, size::D_S, c).flex_none())
+            })
             .when_some(first.filter(|_| fit.label > 0.), |d, s| d.child(cut(mono(s.label(), size::META, p.ink), fit.label)))
             .when_some(what.filter(|_| fit.gist > 0.), |d, w| d.child(cut(mono(w, size::META, p.dim_ch), fit.gist)))
             .when(n > 1, |d| d.child(mono(format!("+{}", n - 1), size::META, p.dim_ch).flex_none()))
@@ -542,6 +541,11 @@ impl AppView {
                         cx.notify();
                     }))
             });
+        #[cfg(test)]
+        let ticker = ticker.when_some(self.roll_probe, |d, n| {
+            let text = format!("{n} tool{}", if n == 1 { "" } else { "s" }).into();
+            d.child(crate::motion::roll_count(&self.fx, crate::motion::ROLL_PROBE, n, text, |t| mono(t, size::META, p.dim_ch).flex_none()))
+        });
         h_flex()
             .h(px(top_h(self.layout.short)))
             .flex_none()
@@ -933,16 +937,17 @@ impl AppView {
                     // Selected: the 2-px `you_bar` (design.md §5), under it.
                     .when(on, |d| d.child(div().absolute().left_0().right_0().bottom_0().h(px(2.)).bg(p.you_bar)))
                     .child(display(c.label(), size::D_S, if on { p.ink } else { p.dim_ch }))
-                    .child(mono(
-                        chip_count(count),
-                        size::META,
-                        match c {
+                    // Its count rolls (polish.md P5).
+                    .child({
+                        let color = match c {
                             _ if count == 0 => p.dim_ch,
                             Chip::NeedsYou => p.warn_ch,
                             Chip::Running => p.run_ch,
                             Chip::Unread => p.unread_ch,
-                        },
-                    ))
+                        };
+                        let key = crate::motion::key(crate::motion::ROLL_RAIL, c as u64);
+                        crate::motion::roll_count(&self.fx, key, count, chip_count(count).into(), move |t| mono(t, size::META, color))
+                    })
                     .tooltip(move |window, cx| crate::overlay::tip(tip, window, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.chip = if this.chip == Some(c) { None } else { Some(c) };
@@ -1237,7 +1242,8 @@ impl AppView {
         let lead = if gone {
             div().flex().flex_none().size(px(10.)).child(glyph::draw(glyph::Glyph::Gone, p.rest_mark))
         } else {
-            glyph::session_mark(st, Ground::Chrome, p)
+            // A running, workers or opening session spins (polish.md P1).
+            glyph::session_live(st, Ground::Chrome, fill.unwrap_or(p.chrome), p, &self.fx)
         };
         let remove = gone.then(|| {
             let id = row.fav.and_then(|i| self.model.favs.list.get(i)).map(|f| f.id.clone()).unwrap_or_default();
@@ -1376,7 +1382,13 @@ impl AppView {
             .items_center()
             .cursor_pointer()
             .when_some(fill, |d, c| d.bg(c))
-            .child(div().flex().flex_none().relative().top(px(dy)).child(glyph::session_mark(row.state, Ground::Chrome, p)))
+            .child(div().flex().flex_none().relative().top(px(dy)).child(glyph::session_live(
+                row.state,
+                Ground::Chrome,
+                fill.unwrap_or(p.chrome),
+                p,
+                &self.fx,
+            )))
             .child(
                 div()
                     .relative()
@@ -1420,9 +1432,62 @@ impl AppView {
     /// filled, always drawn (accent through `focus_ch`: it is yours); any
     /// other row's outline, drawn while the row is hovered. A click
     /// (favourite or not) is the star's only: the row does not open.
+    /// Row `key`, favourited `at`: when it landed (its Flip offset gone, a
+    /// frame after the favouriting at the earliest), which is when its star
+    /// hops; `None` while it moves (a frame asked for). Moving a second
+    /// on, it hops anyway; first seen a second after `at` (drawn again
+    /// after a switch), it hopped long ago.
+    fn star_landed(&self, key: u64, at: std::time::Instant) -> Option<std::time::Instant> {
+        let now = self.fx.now();
+        let moving = self.rail_fx.offsets.get(&key).is_some_and(|d| *d != 0.);
+        let late = now.saturating_duration_since(at) >= std::time::Duration::from_secs(1);
+        let mut land = self.star_land.borrow_mut();
+        land.retain(|_, (t, _)| now.saturating_duration_since(*t) < std::time::Duration::from_secs(10));
+        let e = land.entry(key).or_insert((at, late.then_some(at)));
+        if e.0 != at {
+            *e = (at, late.then_some(at));
+        }
+        if e.1.is_none() {
+            if (moving || now <= at) && !late {
+                self.fx.want_frame();
+                return None;
+            }
+            e.1 = Some(now);
+        }
+        e.1
+    }
+
     fn star(&self, key: u64, fav: bool, h: f32, p: &Palette, cx: &Context<Self>) -> Stateful<Div> {
+        // Favourited while drawn (a click, Ctrl+D): the star hops on an
+        // impulse, critically damped, and four sparks leave it (polish.md
+        // P6). Unfavourited: the fill clears at once. Reduced, Off: the fill.
+        // It hops once its row has landed (finish gate #17): favouriting
+        // moves the row into FAVOURITES, and the acknowledgement lands on a
+        // still row. On device pixels, hop and sparks (Shady #17).
+        let fx = &self.fx;
+        let since = fx.change(crate::motion::Tag::Star, key, u64::from(fav), None).filter(|c| fav && c.1 == 0).map(|c| c.0);
+        let since = match since {
+            Some(at) => self.star_landed(key, at),
+            None => {
+                self.star_land.borrow_mut().remove(&key);
+                None
+            }
+        };
         let mark = if fav {
-            div().flex().flex_none().size(px(10.)).child(glyph::draw(glyph::Glyph::Starred, p.focus_ch))
+            let sparks = fx.sparks(since).map(|x| {
+                let d = 8. * x * std::f32::consts::FRAC_1_SQRT_2;
+                let c = if x < 0.55 { p.you_bar } else { crate::motion::mix(p.you_bar, p.chrome, (x - 0.55) / 0.45) };
+                [(-1., -1.), (1., -1.), (-1., 1.), (1., 1.)]
+                    .map(|(sx, sy)| div().absolute().left(px(fx.snap(4. + sx * d))).top(px(fx.snap(4. + sy * d))).size(px(2.)).bg(c))
+            });
+            div()
+                .flex()
+                .flex_none()
+                .size(px(10.))
+                .relative()
+                .top(px(fx.snap(fx.hop(since))))
+                .child(glyph::draw(glyph::Glyph::Starred, p.focus_ch))
+                .children(sparks.into_iter().flatten())
         } else {
             glyph::reveal(glyph::Glyph::Star, "rail-row", "rail-star", false, p.dim_ch, p.ink)
         };
