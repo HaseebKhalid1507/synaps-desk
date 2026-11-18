@@ -2407,11 +2407,6 @@ mod tests {
         assert!(m.find_enter("cafe", &[]).is_empty(), "another text in between: told again");
     }
 
-    /// M2: UNREAD is what the user has not seen. The session on screen is
-    /// seen as its transcript has it (ahead of the poll): moving away right
-    /// after its turn ends marks nothing. A turn this window sent and left
-    /// running marks when it ends (PR #8 re-review N1); one in a session a
-    /// TUI shows never does (read there).
     #[test]
     fn an_event_on_a_session_not_on_screen_marks_it_unread() {
         // BRIEF-events §4: an event to a session not on screen is news, from
@@ -2447,6 +2442,11 @@ mod tests {
         assert_eq!(st(&m), State::Idle);
     }
 
+    /// M2: UNREAD is what the user has not seen. The session on screen is
+    /// seen as its transcript has it (ahead of the poll): moving away right
+    /// after its turn ends marks nothing. A turn this window sent and left
+    /// running marks when it ends (PR #8 re-review N1); one in a session a
+    /// TUI shows never does (read there).
     #[test]
     fn unread_is_what_was_not_seen() {
         let mut m = Model::new(ConnState::Connecting);
