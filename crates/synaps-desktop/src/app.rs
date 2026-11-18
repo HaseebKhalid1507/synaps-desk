@@ -1688,9 +1688,9 @@ pub struct AppView {
     /// The palette's list height and quad as last drawn, and their targets.
     #[cfg(test)]
     pub(crate) palette_drawn: Cell<(f32, f32, f32, f32)>,
-    /// The palette box's top and its tallest bottom as last drawn.
+    /// The palette box's top, its tallest bottom, its left and width as last drawn.
     #[cfg(test)]
-    pub(crate) palette_box: Cell<(f32, f32)>,
+    pub(crate) palette_box: Cell<(f32, f32, f32, f32)>,
     pub(crate) cancel_tick: Option<Task<()>>,
     /// A session's menu (a right-click on its tab or rail row): Rename…,
     /// Close tab.
@@ -2276,7 +2276,7 @@ impl AppView {
             #[cfg(test)]
             palette_drawn: Cell::new((0., 0., 0., 0.)),
             #[cfg(test)]
-            palette_box: Cell::new((0., 0.)),
+            palette_box: Cell::new((0., 0., 0., 0.)),
             cancel_tick: None,
             smenu: None,
             wmenu: None,
