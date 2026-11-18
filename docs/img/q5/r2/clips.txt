@@ -1,0 +1,6 @@
+clip r2-chips frames-md5 mkv=56184428fd7b mp4=56184428fd7b header=h264,High 4:4:4 Predictive,1280,720,gbrp,60/1,596 07:54:36
+clip r2-bench-panels frames-md5 mkv=3b6f1c981573 mp4=3b6f1c981573 header=h264,High 4:4:4 Predictive,1280,720,gbrp,60/1,620 07:54:57
+clip r2-full frames-md5 mkv=3a09ba5ea556 mp4=3a09ba5ea556 header=h264,High 4:4:4 Predictive,1280,720,gbrp,60/1,1920 07:55:52
+clip r2-reduced frames-md5 mkv=407de8c77078 mp4=407de8c77078 header=h264,High 4:4:4 Predictive,1280,720,gbrp,60/1,1920 07:56:46
+clip r2-off frames-md5 mkv=369686af5a1e mp4=369686af5a1e header=h264,High 4:4:4 Predictive,1280,720,gbrp,60/1,1920 07:57:40
+CLIPS-DONE
