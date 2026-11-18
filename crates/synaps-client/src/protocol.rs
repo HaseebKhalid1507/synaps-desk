@@ -1096,6 +1096,15 @@ pub struct PromptRequest {
     pub title: String,
     #[serde(default)]
     pub prompt: String,
+    /// When the daemon raised it (RFC 3339, UTC). Missing or not a string:
+    /// `None`, never a failed decode.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub raised_at: Option<String>,
+    /// An extension tool-call confirm's source and tool (agent-engine
+    /// `ConfirmScope`): what "Allow all" would latch. Missing, `null` or a
+    /// shape this client doesn't read: `None` (no Allow all offered).
+    #[serde(default, deserialize_with = "lenient_scope")]
+    pub confirm_scope: Option<ConfirmScope>,
 }
 
 impl PromptRequest {
@@ -1103,6 +1112,64 @@ impl PromptRequest {
     pub fn is_secret(&self) -> bool {
         self.kind.as_str() == Some("secret")
     }
+
+    /// Its scope, if "Allow all" can be offered for it (a confirm with at
+    /// least one extension to latch).
+    pub fn allow_all(&self) -> Option<&ConfirmScope> {
+        self.confirm_scope.as_ref().filter(|s| !s.extensions.is_empty() && !self.is_secret())
+    }
+}
+
+/// The answer that allows a confirm and latches its extensions for the
+/// session (agent-engine `CONFIRM_ANSWER_ALLOW_ALL`); input owner only.
+pub const CONFIRM_ANSWER_ALLOW_ALL: &str = "always";
+
+/// `PromptRequest.confirm_scope` (agent-engine `session::types::ConfirmScope`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ConfirmScope {
+    /// The extensions whose confirm it resolves: "Allow all" latches these.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// The tool the call targets (display only).
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// Extensions whose `Modify` rewrote the input it approves.
+    #[serde(default)]
+    pub rewritten_by: Vec<String>,
+}
+
+impl ConfirmScope {
+    /// `a` or `a, b` (the daemon's `extensions_label`).
+    pub fn extensions_label(&self) -> String {
+        self.extensions.join(", ")
+    }
+
+    /// The daemon's own "Allow all" text (`allow_all_label`).
+    pub fn allow_all_label(&self) -> String {
+        format!("Allow all from {} this session", self.extensions_label())
+    }
+
+    /// What "Allow all" reaches (`allow_all_scope`).
+    pub fn allow_all_scope(&self) -> String {
+        format!(
+            "Allow all: later confirms from {} (any tool) are approved without asking until /new or /confirms reset. Other extensions still ask.",
+            self.extensions_label()
+        )
+    }
+}
+
+fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => Some(s),
+        _ => None,
+    })
+}
+
+fn lenient_scope<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ConfirmScope>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        v @ Value::Object(_) => serde_json::from_value(v).ok(),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

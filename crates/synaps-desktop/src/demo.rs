@@ -583,6 +583,18 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
 
 fn attach_sid(attach_seq: u64) -> Vec<Event> {
     let mut out = Vec::new();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    // The daemon's confirm body (agent-engine `confirm_prompt_body`), its
+    // time and scope; `SYNAPS_DEMO_PROMPT=secret`: a secret prompt instead
+    // (the authorize card's evidence).
+    let prompt = if std::env::var("SYNAPS_DEMO_PROMPT").as_deref() == Ok("secret") {
+        json!({"id": 7, "kind": "secret", "title": "API key", "raised_at": rfc3339(now - 7),
+            "prompt": "relay-gateway needs RELAY_SIGNING_KEY to replay the refresh race against staging."})
+    } else {
+        json!({"id": 7, "kind": "confirm", "title": "Confirm tool call", "raised_at": rfc3339(now - 7),
+            "confirm_scope": {"extensions": ["guard"], "tool": "bash"},
+            "prompt": "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/work/relay-gateway:\n$ cargo test -p relay --test refresh_race\n\nAllow this tool call?"})
+    };
     let mut msgs = messages();
     stamp(&mut msgs, SID, 40, None);
     let attached = json!({"type": "attached", "client": 2,
@@ -592,9 +604,7 @@ fn attach_sid(attach_seq: u64) -> Vec<Event> {
         "conversation": {"header": {"title": "Refresh race in session relay"}, "messages_len": msgs.len(), "api_messages": msgs, "cost": 4.95,
             "tokens": {"input": 18_500, "output": 10_040, "cache_read": 1_410_000, "cache_creation": 96_200}},
         "streaming": true,
-        "pending_prompts": [{"id": 7, "kind": "confirm", "title": "Confirm tool call",
-            // The daemon's confirm body (agent-engine `confirm_prompt_body`).
-            "prompt": "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/work/relay-gateway:\n$ cargo test -p relay --test refresh_race\n\nAllow this tool call?"}],
+        "pending_prompts": [prompt],
         "client_input": "shared", "input_owner": 2});
     if let Ok(DaemonFrame::Attached(a)) = decode_frame(&attached.to_string()) {
         out.push(Event::Attached { attach_seq, attached: a, mode: AttachMode::Mirror, reconnect: false });

@@ -289,6 +289,9 @@ pub struct Transcript {
     busy: bool,
     title: Option<String>,
     pending_prompts: Vec<PromptRequest>,
+    /// The last prompts resolved, each with whether a turn ran as it did
+    /// ([`Transcript::resolved_busy`]).
+    resolved: VecDeque<(u64, bool)>,
     subagents: Vec<Value>,
     cost_usd: f64,
     /// The conversation was swapped (clear, resume, compaction): the next
@@ -338,6 +341,13 @@ impl Transcript {
 
     pub fn pending_prompts(&self) -> &[PromptRequest] {
         &self.pending_prompts
+    }
+
+    /// Whether a turn ran when prompt `id` resolved: an answer lets it go
+    /// on, a cancel resolves it first and ends the turn after. `None`: not
+    /// among the last few resolved here.
+    pub fn resolved_busy(&self, id: u64) -> Option<bool> {
+        self.resolved.iter().rev().find(|r| r.0 == id).map(|r| r.1)
     }
 
     pub fn subagents(&self) -> &[Value] {
@@ -854,7 +864,13 @@ impl Transcript {
                 self.settle();
             }
             SessionEvent::Prompt { request } => self.pending_prompts.push(request.clone()),
-            SessionEvent::PromptResolved { prompt_id } => self.pending_prompts.retain(|p| p.id != *prompt_id),
+            SessionEvent::PromptResolved { prompt_id } => {
+                self.pending_prompts.retain(|p| p.id != *prompt_id);
+                if self.resolved.len() == 16 {
+                    self.resolved.pop_front();
+                }
+                self.resolved.push_back((*prompt_id, self.busy));
+            }
             SessionEvent::Steered { text, .. } => self.notice(ItemKind::Notice, format!("steered: {text}")),
             SessionEvent::SystemNotice { text } => self.notice(ItemKind::Notice, text.clone()),
             SessionEvent::Aborted { .. } => {
@@ -1217,5 +1233,17 @@ mod outcome_tests {
         off.apply(&start);
         off.apply(&done);
         assert!(off.items().is_empty());
+    }
+
+    /// A prompt remembers whether a turn ran when it resolved: an answer
+    /// lets the turn go on, a cancel resolves it first and ends it after.
+    #[test]
+    fn a_resolved_prompt_remembers_whether_a_turn_ran() {
+        let mut t = Transcript::new();
+        t.apply(&SessionEvent::TurnStarted { turn_baseline: 0, trigger: String::new(), user_text: None });
+        t.apply(&SessionEvent::PromptResolved { prompt_id: 3 });
+        t.apply(&SessionEvent::Idle);
+        t.apply(&SessionEvent::PromptResolved { prompt_id: 4 });
+        assert_eq!((t.resolved_busy(3), t.resolved_busy(4), t.resolved_busy(5)), (Some(true), Some(false), None));
     }
 }

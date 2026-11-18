@@ -842,11 +842,11 @@ impl AppView {
             .into_any_element()
     }
 
-    /// The NEEDS YOU stub (design.md §8.17): the authorization card folded
-    /// to its header line, where the card docks, while a worker's view is
-    /// on screen (in place or in its tab) and its session waits on a prompt
-    /// (the card is never shown, nor answered, over a worker's view). One
-    /// target: it goes back to the session with the card up.
+    /// The NEEDS YOU stub (design.md §8.17, polish.md §2.6): the authorize
+    /// card folded to one line over the chips while its row is not on
+    /// screen: scrolled away, or a worker's view is (in place or in its
+    /// tab: the card is never shown, nor answered, over a worker's view).
+    /// One target, as Ctrl+J: back to the session, the card in view.
     pub(crate) fn render_stub(&self, p: &Palette, m: &Metrics, cx: &Context<Self>) -> Option<impl IntoElement> {
         if !self.stub_shown() {
             return None;
@@ -887,18 +887,22 @@ impl AppView {
                     .text_color(p.prose_k)
                     .when_some(gist.filter(|_| !lay.tight), |d, g| d.child(g)),
             )
+            .child(mono("ctrl j", m.meta, p.dim_k).flex_none().ml(px(12.)).debug_selector(|| "needs-stub-key".into()))
             .child(div().flex_none().ml(px(12.)).child(glyph::reveal(glyph::GO, "needs-stub", "needs-stub", true, p.dim_k, p.ink)))
-            .tooltip(|window, cx| crate::overlay::tip("A prompt waits in this session: answer it there.", window, cx))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.open_parent_card(cx);
+            .tooltip(|window, cx| crate::overlay::tip("A prompt waits in this session: Ctrl+J goes to it.", window, cx))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.jump_to_card(window, cx);
                 cx.notify();
             }));
         Some(column(lay, row).flex_none().pt(px(crate::fit::STUB_GAP)))
     }
 
-    /// A worker's view is on screen and its session waits on a prompt.
+    /// The session waits on a prompt whose card is not on screen: a
+    /// worker's view is, or its row is scrolled away.
     pub(crate) fn stub_shown(&self) -> bool {
-        self.model.tabs.view().is_none() && self.model.watch.focus().is_some() && !self.model.transcript.pending_prompts().is_empty()
+        self.model.tabs.view().is_none()
+            && !self.model.transcript.pending_prompts().is_empty()
+            && (self.model.watch.focus().is_some() || !self.card_on_screen())
     }
 }
 
