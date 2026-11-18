@@ -1399,6 +1399,10 @@ pub struct AppView {
     panels_save: Option<Task<()>>,
     /// A drag of a panel's edge, from the mouse-down on its handle.
     pub(crate) drag: Option<EdgeGrab>,
+    /// A drag let go near a detent, its panel springing there: the
+    /// transcript's thumb holds until it lands, as through the drag (the
+    /// gate's S6).
+    springback: bool,
     /// The side panels' widths on their springs, and the column's wrap
     /// width while they move (fluid.md §3.8).
     pub(crate) panel_fx: crate::chrome::PanelFx,
@@ -2144,6 +2148,7 @@ impl AppView {
             panels_writing: Default::default(),
             panels_save: None,
             drag: None,
+            springback: false,
             panel_fx: crate::chrome::PanelFx::default(),
             fold_keys: FoldKeys::default(),
             width: 0.,
@@ -4435,6 +4440,7 @@ impl AppView {
             // Let go near a detent: the panel springs there (`snap`).
             if let Some(p) = detent(self.width, g.start, self.panels, g.rail, g.want) {
                 self.fly_to(p, crate::motion::SNAP_RESPONSE);
+                self.springback = true;
                 self.panels = p;
                 cx.notify();
             }
@@ -6496,12 +6502,14 @@ impl Render for AppView {
         // Over the list's right padding, after its layout (and the hold-back's).
         let layer = self.layer_now();
         let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.scroller.clone(), self.fx.clone()));
-        // Held while an edge is dragged, and in the frame a new column
-        // re-wraps the rows (on their estimates): the next frame draws it
-        // from their heights (the gate's S3, and the landing's frame).
+        // Held while an edge is dragged and as it springs to a detent after,
+        // and in the frame a new column re-wraps the rows (on their
+        // estimates): the next frame draws it from their heights (the
+        // gate's S3 and S6, and the landing's frame).
+        self.springback &= self.panel_fx.moving();
         let transcript_bar = crate::scrollbar::rows_gliding(&self.list, pad_t + pad_b, &self.bars.transcript, glide)
             .always()
-            .still(self.drag.is_some() || rewrap);
+            .still(self.drag.is_some() || self.springback || rewrap);
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
         // the end of a scrolled-back list set it following; it stops 2 px
         // short of the end instead, still scrolled back. Built only on the

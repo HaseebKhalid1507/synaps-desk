@@ -599,9 +599,11 @@ impl AppView {
                             .top(px(off))
                             .left(px(dx))
                             .flex_none()
-                            // Moving, on the canvas: a chip it passes is
-                            // under it, never text through text.
-                            .when(off != 0. || dx != 0., |d| d.bg(p.canvas))
+                            // On the canvas (the dock's ground: at rest it
+                            // shows nothing), so one chip passing another
+                            // covers it or is covered, whichever is drawn
+                            // later: never text through text (Shady R3-L1).
+                            .bg(p.canvas)
                             .child(motion::lift(
                                 div().relative().top(px(travel)).child(self.tray_row(r, is_watched, armed, w, row_h, bar, p, m, cx)),
                                 strength,

@@ -6899,7 +6899,7 @@ fn rail_section_folds_on_sheet(cx: &mut TestAppContext) {
             if let Some(f) = view.read_with(cx, |v, _| v.rail_fx.fold.clone()) {
                 os.push(f.o);
                 if open {
-                    let shown: f32 = (f.start + 1..f.after).filter_map(|ix| f.shown(ix)).sum();
+                    let shown: f32 = (f.start + 1..f.after).filter_map(|ix| f.shown(ix)).map(|s| s.0).sum();
                     let total: f32 = f.heights.iter().sum();
                     assert!((shown - (total + f.o)).abs() < 0.5, "the body shows down to what follows ({shown} {total} {})", f.o);
                 }
@@ -7540,41 +7540,11 @@ fn the_column_holds_through_a_flight_at_fractional_scales(cx: &mut TestAppContex
 #[gpui_kit::test]
 fn favourites_fold_keeping_a_busy_one_leaves_no_gap(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (1280., 900.), crate::theme::Panels::default().text_size);
-    set_motion(cx, &view, crate::motion::Level::Full);
-    settle(cx, w, 8);
-    let ids: Vec<String> = view.read_with(cx, |v, _| {
-        let m = &v.model;
-        let idle: Vec<String> =
-            m.sessions.iter().filter(|s| s.id != crate::demo::SID && !crate::rail::busy(m, s)).take(2).map(|s| s.id.clone()).collect();
-        assert!(m.sessions.iter().find(|s| s.id == crate::demo::SID).is_some_and(|s| crate::rail::busy(m, s)), "SID needs you");
-        vec![idle[0].clone(), crate::demo::SID.to_string(), idle[1].clone()]
-    });
-    // None of them a favourite, then the three in order (the one that
-    // needs you in the middle).
-    let fav = |v: &AppView, id: &str| v.model.sessions.iter().find(|s| s.id == id).and_then(|s| v.model.fav_of(s)).is_some();
-    for (on, id) in ids.iter().map(|id| (false, id)).chain(ids.iter().map(|id| (true, id))) {
-        view.update(cx, |v, cx| {
-            if fav(v, id) != on {
-                v.toggle_fav_session(id);
-            }
-            cx.notify();
-        });
-        settle(cx, w, 8);
-    }
-    fly(cx, w, &view, 400, |_| {});
-    settle(cx, w, 8);
+    let (head, body, star) = three_favourites(cx, w, &view);
     let place = |v: &AppView, ix: usize| {
         let vp = v.rail_list.viewport_bounds();
         v.rail_list.bounds_for_item(ix).map(|r| (f32::from(r.top() - vp.top()), f32::from(r.size.height)))
     };
-    let head = view.read_with(cx, |v, _| v.rail.rail.items.iter().position(|i| matches!(i, crate::rail::Item::Favs { open: true, .. })));
-    let head = head.expect("FAVOURITES open");
-    let body =
-        view.read_with(cx, |v, _| v.rail.rail.items[head + 1..].iter().take_while(|i| matches!(i, crate::rail::Item::Row(_))).count());
-    assert!(body >= 3, "three favourites under the head ({body})");
-    // The one it keeps, as drawn (its star: only a drawn row has one).
-    let key = view.read_with(cx, |v, _| crate::chrome::row_key(&v.rail.rail, &v.rail.rail.items[head + 2]).expect("a row"));
-    let star = format!("star {key}");
     let star_y = |cx: &mut TestAppContext| drawn(cx, w, star.clone()).map(|b| b[1]);
     let mut stars = vec![star_y(cx).expect("its star drawn")];
     catch_up(cx, &view);
@@ -7618,6 +7588,118 @@ fn favourites_fold_keeping_a_busy_one_leaves_no_gap(cx: &mut TestAppContext) {
     });
 }
 
+/// Shady R3-M1, the gate's r3 C (PR #21): FAVOURITES unfolding with the
+/// favourite it kept (one that needs you, a favourite before it and one
+/// after) is its fold run backwards: the kept one is drawn whole in
+/// every frame, only going down as the one above it opens, then the one
+/// under it. Turned round either way mid-flight (a double click), it
+/// goes on from where the kept one is drawn: no step.
+#[gpui_kit::test]
+fn favourites_unfold_keeping_a_busy_one_draws_it_every_frame(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1280., 900.), crate::theme::Panels::default().text_size);
+    let (head, _, star) = three_favourites(cx, w, &view);
+    let star_y = |cx: &mut TestAppContext| drawn(cx, w, star.clone()).map(|b| b[1]);
+    let toggle = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| v.toggle_favs_group(cx));
+        cx.run_until_parked();
+    };
+    catch_up(cx, &view);
+    toggle(cx);
+    fly(cx, w, &view, 400, |_| {});
+    settle(cx, w, 8);
+    let folded = star_y(cx).expect("folded: the kept one drawn");
+    // Unfolding: whole, from under the head, down only.
+    let mut stars = vec![folded];
+    let mut opens = 0;
+    catch_up(cx, &view);
+    toggle(cx);
+    let frames = fly(cx, w, &view, 400, |cx| {
+        view.read_with(cx, |v, _| {
+            let Some(f) = v.rail_fx.fold.as_ref().filter(|f| f.o <= -1.) else { return };
+            assert!(f.after == f.start + 4 && f.kept == [false, true, false], "two open, one kept: {f:?}");
+            let (s, _) = f.shown(f.start + 2).expect("in the body");
+            assert_eq!(s, f.heights[1], "the kept one whole");
+            let all: f32 = (f.start + 1..f.after).filter_map(|ix| f.shown(ix)).map(|s| s.0).sum();
+            let total: f32 = f.heights.iter().sum();
+            assert!((all - (total + f.o)).abs() < 0.5, "the body down to what follows ({all} {total} {})", f.o);
+            opens += 1;
+        });
+        stars.push(star_y(cx).expect("the kept one drawn in every frame"));
+    });
+    let most = stars.windows(2).fold(0f32, |m, p| m.max((p[1] - p[0]).abs()));
+    assert!(frames > 30 && opens > 30, "{frames} frames, {opens} unfolding");
+    assert!(stars.windows(2).all(|p| p[1] >= p[0] - 1e-3) && most < 8., "the kept one goes down as drawn, never jumps: {stars:?}");
+    assert!(stars.last().copied().unwrap_or(0.) - folded > 20., "it ends under the one above it: {stars:?}");
+    settle(cx, w, 8);
+    view.read_with(cx, |v, _| {
+        assert!(v.rail.rail.items.get(head).is_some_and(|i| matches!(i, crate::rail::Item::Favs { open: true, .. })), "open")
+    });
+    // Turned round: open → folding → unfolding, then folded → unfolding
+    // → folding; the kept one drawn in every frame, no step.
+    for (open, turn) in [(true, 12), (true, 20), (false, 12), (false, 20)] {
+        let at = view.read_with(cx, |v, _| matches!(v.rail.rail.items.get(head), Some(crate::rail::Item::Favs { open: true, .. })));
+        if at != open {
+            catch_up(cx, &view);
+            toggle(cx);
+            fly(cx, w, &view, 400, |_| {});
+            settle(cx, w, 8);
+        }
+        let mut stars = vec![star_y(cx).expect("drawn")];
+        catch_up(cx, &view);
+        toggle(cx);
+        for n in 0..200 {
+            if n == turn {
+                toggle(cx);
+            }
+            fluid_frame(cx, w, &view);
+            stars.push(star_y(cx).expect("the kept one drawn in every frame"));
+        }
+        settle(cx, w, 8);
+        let most = stars.windows(2).fold(0f32, |m, p| m.max((p[1] - p[0]).abs()));
+        assert!(most < 8., "{open}, turned at frame {turn}: the kept one jumped {most} px: {stars:?}");
+        assert!((stars[0] - stars.last().copied().unwrap_or(0.)).abs() < 0.5, "back where it was: {stars:?}");
+    }
+}
+
+/// Three favourites, the one that needs you in the middle, FAVOURITES
+/// open and at rest at Full: its head, how many rows under it, and the
+/// kept one's star (only a drawn row has one).
+fn three_favourites(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> (usize, usize, String) {
+    set_motion(cx, view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let ids: Vec<String> = view.read_with(cx, |v, _| {
+        let m = &v.model;
+        let idle: Vec<String> =
+            m.sessions.iter().filter(|s| s.id != crate::demo::SID && !crate::rail::busy(m, s)).take(2).map(|s| s.id.clone()).collect();
+        assert!(m.sessions.iter().find(|s| s.id == crate::demo::SID).is_some_and(|s| crate::rail::busy(m, s)), "SID needs you");
+        vec![idle[0].clone(), crate::demo::SID.to_string(), idle[1].clone()]
+    });
+    // None of them a favourite, then the three in order (the one that
+    // needs you in the middle).
+    let fav = |v: &AppView, id: &str| v.model.sessions.iter().find(|s| s.id == id).and_then(|s| v.model.fav_of(s)).is_some();
+    for (on, id) in ids.iter().map(|id| (false, id)).chain(ids.iter().map(|id| (true, id))) {
+        view.update(cx, |v, cx| {
+            if fav(v, id) != on {
+                v.toggle_fav_session(id);
+            }
+            cx.notify();
+        });
+        settle(cx, w, 8);
+    }
+    fly(cx, w, view, 400, |_| {});
+    settle(cx, w, 8);
+    let head = view.read_with(cx, |v, _| v.rail.rail.items.iter().position(|i| matches!(i, crate::rail::Item::Favs { open: true, .. })));
+    let head = head.expect("FAVOURITES open");
+    let body =
+        view.read_with(cx, |v, _| v.rail.rail.items[head + 1..].iter().take_while(|i| matches!(i, crate::rail::Item::Row(_))).count());
+    assert!(body >= 3, "three favourites under the head ({body})");
+    // The one it keeps, as drawn (its star: only a drawn row has one).
+    let key = view.read_with(cx, |v, _| crate::chrome::row_key(&v.rail.rail, &v.rail.rail.items[head + 2]).expect("a row"));
+    let star = format!("star {key}");
+    assert!(drawn(cx, w, star.clone()).is_some(), "its star drawn");
+    (head, body, star)
+}
+
 /// The gate's S3 (PR #21): dragging the rail's edge re-wraps the column
 /// at every new width (1280: under the cap), and the frame that does
 /// reads the rows not yet measured at their estimates. The transcript's
@@ -7647,6 +7729,98 @@ fn the_thumb_holds_while_an_edge_is_dragged(cx: &mut TestAppContext) {
     fly(cx, w, &view, 400, |_| {});
     settle(cx, w, 8);
     assert!(bar(cx).is_some(), "let go: drawn from the rows again");
+}
+
+/// The gate's S6 and the landing's rewrap frame (`ff642fe`, PR #21), as
+/// painted: an edge dragged out and let go near its detent springs back
+/// with the transcript's thumb where it was through the whole gesture; a
+/// rail fold's landing re-wraps the column, and that frame paints the
+/// thumb as the one before it did (the rows are on their estimates), the
+/// next from the rows.
+#[gpui_kit::test]
+fn the_thumb_holds_through_a_springback_and_a_landing_rewrap(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1280., 720.), crate::theme::Panels::default().text_size);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, cx| {
+        v.list.scroll_to(gpui_kit::ListOffset { item_ix: 2, offset_in_item: px(13.) });
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let painted = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.bars.transcript.painted());
+    let same = |a: Option<(f32, f32)>, b: (f32, f32)| a.is_some_and(|a| (a.0 - b.0).abs() < 0.5 && (a.1 - b.1).abs() < 0.5);
+    let before = painted(cx).expect("the thumb painted");
+    let (w0, _, _) = panel(cx, &view, true);
+    press_at(cx, w, gpui_kit::point(px(w0 - 1.), px(400.)));
+    for x in [w0 + 5., w0 + 12., w0 + 20.] {
+        drag_to(cx, w, x);
+    }
+    release_at(cx, w, gpui_kit::point(px(w0 + 20.), px(400.)));
+    // Every frame of the flight (landed, it paints it from the rows).
+    let mut seen = Vec::new();
+    fly(cx, w, &view, 400, |cx| {
+        if panel(cx, &view, true).2 {
+            seen.push(painted(cx));
+        }
+    });
+    assert!(seen.len() > 5, "it sprang back ({})", seen.len());
+    assert!(seen.iter().all(|&p| same(p, before)), "the thumb never moved: {before:?} {seen:?}");
+    settle(cx, w, 8);
+    assert!((panel(cx, &view, true).0 - w0).abs() < 0.5, "back at its detent");
+    // The rail folds: the column widens when it lands (nothing else holds
+    // the thumb in this flight). The frame that re-wraps paints it as the
+    // one before did; the next, from the rows.
+    let column = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.layout.column);
+    let col0 = column(cx);
+    let bars = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.bars.transcript.paints());
+    bars(cx);
+    catch_up(cx, &view);
+    view.update(cx, |v, cx| v.toggle_panel(true, cx));
+    cx.run_until_parked();
+    fly(cx, w, &view, 400, |_| {});
+    settle(cx, w, 8);
+    let paints = bars(cx);
+    assert!(column(cx) > col0 + 10., "a wider column ({col0} → {})", column(cx));
+    let held: Vec<usize> = (1..paints.len()).filter(|&i| paints[i].2).collect();
+    assert!(!held.is_empty() && paints.len() > 30, "the landing's frame held: {paints:?}");
+    for i in held {
+        let (a, b) = (paints[i - 1], paints[i]);
+        assert!((a.0 - b.0).abs() < 0.5 && (a.1 - b.1).abs() < 0.5, "held as the frame before painted it: {a:?} {b:?}");
+    }
+    let (end, last) = (paints.last().copied().expect("painted"), paints[0]);
+    assert!(!end.2 && end.0 < last.0 - 10., "then from the rows: a wider column is shorter ({last:?} {end:?})");
+}
+
+/// Shady N2 (PR #21): a panel turned round mid-flight (its fold key
+/// twice) turns with its velocity (fluid.md §2.1): it goes on the way it
+/// went for a frame, slowing, then back to where it was, never a step out
+/// of line.
+#[gpui_kit::test]
+fn a_panel_turned_round_keeps_its_velocity(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1280., 720.), crate::theme::Panels::default().text_size);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    for rail in [true, false] {
+        let (w0, _, _) = panel(cx, &view, rail);
+        catch_up(cx, &view);
+        view.update(cx, |v, cx| v.toggle_panel(rail, cx));
+        cx.run_until_parked();
+        let mut ws = vec![w0];
+        for _ in 0..8 {
+            fluid_frame(cx, w, &view);
+            ws.push(panel(cx, &view, rail).0);
+        }
+        let v0 = ws[8] - ws[7];
+        assert!(v0 < -2., "{rail}: folding fast: {ws:?}");
+        view.update(cx, |v, cx| v.toggle_panel(rail, cx));
+        cx.run_until_parked();
+        fluid_frame(cx, w, &view);
+        let w1 = panel(cx, &view, rail).0;
+        assert!(w1 < ws[8], "{rail}: turned round, it goes on folding for a frame first: {ws:?} {w1}");
+        assert!(ws[8] - w1 <= -v0 + 0.5, "{rail}: slowing ({v0} then {})", w1 - ws[8]);
+        fly(cx, w, &view, 400, |_| {});
+        settle(cx, w, 8);
+        assert!((panel(cx, &view, rail).0 - w0).abs() < 0.5, "{rail}: open again");
+    }
 }
 
 /// Shady R2-L2 (PR #21): a section's head clicked again mid-fold (a double
