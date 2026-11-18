@@ -3,15 +3,29 @@
 Captured on bella with headless gamescope at 144 Hz (`scripts/capture-linux.sh`, with an absolute `XDG_CONFIG_HOME`
 under `~/.cache/q5r4`), `--offline`, nord, 1280×720. Recorded with x11grab at 60 fps and re-encoded losslessly:
 libx264rgb, qp 0, gbrp, High 4:4:4 Predictive. Every clip's per-frame md5 equals the raw capture's (`clips.txt`;
-recomputed from the committed files, they match).
+recomputed from the lossless files, they match).
+
+The repo is public and a merged blob stays in its history, so the lossless clips are kept off the repo, in the
+maintainer's `synaps-desktop/q5-evidence/` folder, at the same paths (`docs/img/q5/<path>.mp4` is
+`q5-evidence/img/q5/<path>.mp4`), with `MANIFEST.md`: each clip's sha256 and per-frame md5, and the preview commands.
+The `clips.txt` manifests are kept both here and there. The raw x11grab captures were deleted after each clip's frame
+md5 was checked against them. The PNGs here are reduced to a 256-colour palette (no dither) to keep them small; the
+full-colour originals are in `q5-evidence/` at the same paths. Every frame number in these READMEs is a frame of the
+lossless clip.
+
+Previews in the repo (`*-preview.mp4`): H.264 `-crf 23 -preset veryslow -tune animation`, yuv420p, made from the
+lossless clips at their full 1280×720 and 60 fps, every frame kept, so a frame number here is the same frame in the
+preview. Lossy: they show the motion, not exact pixels; the traces and the pixel claims below are from the lossless
+clips. Here: `r4-full-preview.mp4`, `r4-reduced-preview.mp4`, `r4-off-preview.mp4` and
+`r4-r2drive-full-preview.mp4`. The r2drive clips at Reduced and Off are off the repo only.
 
 The binary is the release build of `de9435f` (the rebased branch plus r4's fixes), sha256 `2924cdcf…c0a45a88`. bella's
 load was 7–8 from other work while filming, so the 60 fps frames are spaced unevenly, as in r3.
 
 | file | what | script |
 |---|---|---|
-| `r4-{full,reduced,off}.mp4` | 1,620 frames. Three favourites (docs-sync, relay-refresh = NEEDS YOU, ci-cache): FAVOURITES folded, unfolded; a double click (a fold turned round); folded, a double click (an unfold turned round), unfolded; the rail's edge dragged out and let go; the transcript wheeled up; Ctrl+J | `clip.sh` (drive times `r4-clip-*-drive.txt`) |
-| `r4-r2drive-{full,reduced,off}.mp4` | 1,920 frames. r2's drive again (`r2/clip.sh`): Ctrl+B ×2, Ctrl+Alt+B ×2 at 1280, the edge, Ctrl+J, NAMED folded and unfolded mid-rail | `r2drive.sh` |
+| `r4-{full,reduced,off}.mp4` (off the repo; previews `r4-{full,reduced,off}-preview.mp4`) | 1,620 frames. Three favourites (docs-sync, relay-refresh = NEEDS YOU, ci-cache): FAVOURITES folded, unfolded; a double click (a fold turned round); folded, a double click (an unfold turned round), unfolded; the rail's edge dragged out and let go; the transcript wheeled up; Ctrl+J | `clip.sh` (drive times `r4-clip-*-drive.txt`) |
+| `r4-r2drive-{full,reduced,off}.mp4` (off the repo; preview `r4-r2drive-full-preview.mp4`) | 1,920 frames. r2's drive again (`r2/clip.sh`): Ctrl+B ×2, Ctrl+Alt+B ×2 at 1280, the edge, Ctrl+J, NAMED folded and unfolded mid-rail | `r2drive.sh` |
 | `bar-trace.txt` | relay-refresh's warn bar (x 0, `(235,203,139)`), every change over the whole clip | `bar.py` |
 | `thumb-1280.txt` | the transcript's thumb in every clip | `../r3/thumb.py` |
 | `named-rules.txt` | the rail's section rules through NAMED's fold, r2 against r4 | `rules.py` |

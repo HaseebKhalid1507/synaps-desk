@@ -5,11 +5,26 @@ recorded with x11grab and re-encoded losslessly: libx264rgb, qp 0, gbrp, High 4:
 md5 equals the raw capture's (`clips.txt`). The binary is the PR head's release build, sha256
 `abba38dee70931216a71e7c3464b15ef07c543ce246df93823c663058bcd3b24`.
 
+The repo is public and a merged blob stays in its history, so the lossless clips are kept off the repo, in the
+maintainer's `synaps-desktop/q5-evidence/` folder, at the same paths (`docs/img/q5/<path>.mp4` is
+`q5-evidence/img/q5/<path>.mp4`), with `MANIFEST.md`: each clip's sha256 and per-frame md5, and the preview commands.
+The `clips.txt` manifests are kept both here and there. The raw x11grab captures were deleted after each clip's frame
+md5 was checked against them. The PNGs here are reduced to a 256-colour palette (no dither) to keep them small; the
+full-colour originals are in `q5-evidence/` at the same paths. Every frame number in these READMEs is a frame of the
+lossless clip.
+
+Previews in the repo (`*-preview.mp4`): H.264 `-crf 23 -preset veryslow -tune animation`, yuv420p, made from the
+lossless clips at their full 1280×720 and 60 fps, every frame kept, so a frame number here is the same frame in the
+preview. Lossy: they show the motion, not exact pixels; the traces and the pixel claims below are from the lossless
+clips. Here: `r2-bench-panels-preview.mp4` (the composer's growth and
+shrink). r2's other clips have no preview: r4's `r4-r2drive-*` re-run their drive on the final build, and r3's
+`r3-chips` the chips.
+
 | file | what | script |
 |---|---|---|
-| `r2-full.mp4`, `r2-reduced.mp4`, `r2-off.mp4` | 1280×720 nord, `--offline`, 60 fps, 1,920 frames: Ctrl+D, FAVOURITES folded and unfolded, Ctrl+D; Ctrl+B ×2, Ctrl+Alt+B ×2; the rail's edge dragged 21 px out and let go; the transcript wheeled up (the stub), Ctrl+J; the rail wheeled down to HISTORY, NAMED folded and unfolded | `clip.sh` (drive times: `r2-clip-*-drive.txt`) |
-| `r2-bench-panels.mp4` | 1280×720 nord, Full, 60 fps: the `--bench-panels` scene (folds and unfolds over a 400-turn transcript, then the draft set to three lines and cleared) | `composer.sh` |
-| `r2-chips.mp4`, `r2-chips.json` | 1280×720 nord, Full, 60 fps: `SYNAPS_BENCH_CHIPS=3`, steps changing every 0.4 s (2 to 55 characters), clocks ticking, the pointer on a chip for 0.5 s, then one worker done and one failed; the JSON has every chip's bounds after each change | `chipclip.sh` |
+| `r2-full.mp4`, `r2-reduced.mp4`, `r2-off.mp4` (off the repo) | 1280×720 nord, `--offline`, 60 fps, 1,920 frames: Ctrl+D, FAVOURITES folded and unfolded, Ctrl+D; Ctrl+B ×2, Ctrl+Alt+B ×2; the rail's edge dragged 21 px out and let go; the transcript wheeled up (the stub), Ctrl+J; the rail wheeled down to HISTORY, NAMED folded and unfolded | `clip.sh` (drive times: `r2-clip-*-drive.txt`) |
+| `r2-bench-panels.mp4` (off the repo; preview `r2-bench-panels-preview.mp4`) | 1280×720 nord, Full, 60 fps: the `--bench-panels` scene (folds and unfolds over a 400-turn transcript, then the draft set to three lines and cleared) | `composer.sh` |
+| `r2-chips.mp4` (off the repo), `r2-chips.json` | 1280×720 nord, Full, 60 fps: `SYNAPS_BENCH_CHIPS=3`, steps changing every 0.4 s (2 to 55 characters), clocks ticking, the pointer on a chip for 0.5 s, then one worker done and one failed; the JSON has every chip's bounds after each change | `chipclip.sh` |
 | `stills/chips-{nord,paper}-{1920x1080,1280x720}-{1,3,6}.png` | the chips with 1, 3 and 6 workers, 3.5 s into the scene | `chips.sh` |
 | `sheets/*.png` | frame sheets cut from the clips (frame numbers in the names) | below |
 
