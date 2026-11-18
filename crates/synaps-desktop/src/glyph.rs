@@ -1138,6 +1138,7 @@ pub(crate) fn indicator(
             return boxed()
                 .debug_selector(move || format!("life-turn {}", t.as_millis() / TURN.as_millis()))
                 .child(dots(d, mark))
+                .child(inked(d.a.iter().any(|a| *a > 0.004)))
                 .into_any_element();
         }
     }
@@ -1183,13 +1184,23 @@ pub(crate) fn indicator(
             if out.is_some() {
                 fx.want_frame();
             }
+            // Never a blank frame (the finish gate of #23, item 5): the old
+            // dots, the ring or the mark's first cut is always drawn.
+            let lit = out.is_some() || (ring > 0. && ring_ink.is_some()) || mark_p * LIFE_CUTS as f32 >= 1.;
             boxed()
                 .debug_selector(move || format!("life-settle {l:?}"))
                 .children(out.map(|d| dots(d, old_mark)))
                 .child(life_at(l, LifeInk { ring: ring_ink, mark, ground }, 1., mark_p).absolute().top_0().left_0())
+                .child(inked(lit))
                 .into_any_element()
         }
     }
+}
+
+/// Whether a changing glyph draws anything (`ink-1`) or nothing (`ink-0`):
+/// a zero-size marker for the tests.
+fn inked(lit: bool) -> Div {
+    div().absolute().size_0().debug_selector(move || format!("ink-{}", u8::from(lit)))
 }
 
 /// A pose's code back from its dots (a selector only: lit or not).

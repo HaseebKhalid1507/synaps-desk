@@ -2015,7 +2015,7 @@ impl AppView {
                 well(row, failed, id, &streamed, p, m).into_any_element()
             }
         });
-        let body = body.map(|b| revealed(b, reveal, sink));
+        let body = body.map(|b| revealed(b, reveal, sink).debug_selector(move || format!("reveal {id}")));
         v_flex()
             .relative()
             .w_full()
@@ -2311,7 +2311,7 @@ impl AppView {
 /// `dim`. The path and the range are the row's (its target and facts).
 /// A body as it opens or closes ([`Motion::reveal`]): clipped to `shown`
 /// of its height (none: all of it), measured into `sink`.
-fn revealed(body: AnyElement, shown: Option<f32>, sink: std::rc::Rc<std::cell::Cell<f32>>) -> AnyElement {
+fn revealed(body: AnyElement, shown: Option<f32>, sink: std::rc::Rc<std::cell::Cell<f32>>) -> Div {
     let h = sink.get();
     div()
         .w_full()
@@ -2326,7 +2326,6 @@ fn revealed(body: AnyElement, shown: Option<f32>, sink: std::rc::Rc<std::cell::C
                 sink.set(f32::from(b.size.height));
             }
         })
-        .into_any_element()
 }
 
 fn well(row: &RowCache, failed: bool, id: u64, streamed: &[(usize, f32, f32)], p: &Palette, m: &Metrics) -> Div {
@@ -2398,6 +2397,7 @@ fn well(row: &RowCache, failed: bool, id: u64, streamed: &[(usize, f32, f32)], p
                     div().w_full().flex_shrink_0().child(SharedString::from(if l.is_empty() { " ".to_string() } else { l.to_string() }));
                 match streamed.iter().find(|s| s.0 == i) {
                     Some(&(_, clip, k)) => div()
+                        .debug_selector(move || format!("stream-line {id} {i}"))
                         .w_full()
                         .flex()
                         .flex_col()

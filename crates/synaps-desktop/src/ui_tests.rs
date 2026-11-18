@@ -3194,6 +3194,152 @@ fn a_finished_call_turns_its_lattice_or_not(cx: &mut TestAppContext) {
     }
 }
 
+/// The finish gate of #23, item 1 (indicators/proposal.md §8): a call's
+/// body opens and closes under its row on `glide`: the frame after the
+/// toggle shows less than all of it, `glide` later all of it (or none).
+#[gpui_kit::test]
+fn a_call_body_reveals_on_glide(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    running_tools(cx, &view, 1);
+    view.update(cx, |v, cx| {
+        v.model.transcript.apply(&SessionEvent::Stream {
+            event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "line one\nline two\nline three".into() }),
+        });
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    wait(cx, w, &view, 1000);
+    let id = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| i.id)).expect("the call");
+    let b = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel));
+    assert!(b(cx, format!("reveal {id}")).is_none(), "a done call's body is closed");
+    let toggle = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| {
+            v.toggle(id);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    toggle(cx);
+    let mut first = None;
+    for _ in 0..3 {
+        fluid_frame(cx, w, &view);
+        if let Some(r) = b(cx, format!("reveal {id}")).filter(|r| r.size.height > gpui_kit::px(0.)) {
+            first.get_or_insert(r.size.height);
+        }
+    }
+    let well = b(cx, format!("well {id}")).expect("its well, laid out whole");
+    let first = first.expect("the body showing");
+    assert!(first < well.size.height, "opening: {first:?} of {:?}", well.size.height);
+    for _ in 0..80 {
+        fluid_frame(cx, w, &view);
+    }
+    let open = b(cx, format!("reveal {id}")).expect("open");
+    assert!(open.size.height >= well.size.height, "open: all of it ({open:?}, {well:?})");
+    toggle(cx);
+    fluid_frame(cx, w, &view);
+    fluid_frame(cx, w, &view);
+    let closing = b(cx, format!("reveal {id}")).expect("closing: still drawn");
+    assert!(closing.size.height < open.size.height && closing.size.height > gpui_kit::px(0.), "closing: {closing:?}");
+    for _ in 0..80 {
+        fluid_frame(cx, w, &view);
+    }
+    assert!(b(cx, format!("reveal {id}")).is_none(), "closed");
+    // Off: at once.
+    set_motion(cx, &view, crate::motion::Level::Off);
+    toggle(cx);
+    let at_once = b(cx, format!("reveal {id}")).expect("Off: open at once");
+    assert_eq!(at_once.size.height, open.size.height);
+}
+
+/// The finish gate of #23, item 2 (cards4/proposal.md §8 #4): a running
+/// call's output streams into its open body a line at a time, each new
+/// line's clip growing from nothing to its line on `flick`.
+#[gpui_kit::test]
+fn running_output_grows_a_line_at_a_time(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    running_tools(cx, &view, 1);
+    let delta = |cx: &mut TestAppContext, text: &str| {
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: "ui-run-0".into(), delta: text.into() }),
+            });
+            v.sync_list();
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    delta(cx, "running 3 tests\n");
+    wait(cx, w, &view, 600);
+    let id = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| i.id)).expect("the call");
+    let b = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel));
+    assert!(b(cx, format!("well {id}")).is_some(), "a running call with output opens on it");
+    let r = cx.update(|cx| crate::theme::metrics(cx).r);
+    let line = gpui_kit::px((19. * r).round());
+    delta(cx, "test a ... ok\n");
+    let mut heights = Vec::new();
+    for _ in 0..40 {
+        fluid_frame(cx, w, &view);
+        heights.push(b(cx, format!("stream-line {id} 1")).map(|l| l.size.height));
+    }
+    let grown: Vec<_> = heights.iter().flatten().collect();
+    assert!(!grown.is_empty(), "the new line grows in its clip");
+    assert!(*grown[0] < line, "it starts short of its line: {heights:?}");
+    assert!(grown.windows(2).all(|w| w[1] >= w[0]), "and only grows: {heights:?}");
+    assert!(heights.last().unwrap().is_none_or(|h| h == line), "then it is a plain line: {heights:?}");
+    // Off: the line is there at once, no clip.
+    set_motion(cx, &view, crate::motion::Level::Off);
+    delta(cx, "test b ... ok\n");
+    assert!(b(cx, format!("stream-line {id} 2")).is_none(), "Off: no growth");
+}
+
+/// The finish gate of #23, item 5 (indicators/proposal.md §8): a call that
+/// fails while watched never draws a blank glyph: through the turn (H2) or
+/// at once (H1), the old dots, the ring or the cross is on every frame.
+#[gpui_kit::test]
+fn a_failed_glyph_is_never_blank(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    for turn in [true, false] {
+        let (w, view, _events) = open(cx);
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| {
+            v.client = None;
+            v.fx.turn.set(turn);
+        });
+        running_tools(cx, &view, 1);
+        for _ in 0..4 {
+            beat(cx, w, &view);
+        }
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResult {
+                    tool_id: "ui-run-0".into(),
+                    result: "Tool execution failed: Command failed (exit 2):\nboom".into(),
+                }),
+            });
+            v.sync_list();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let has = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel).is_some();
+        let mut changing = 0;
+        for k in 0..60 {
+            fluid_frame(cx, w, &view);
+            assert!(!has(cx, "ink-0"), "{turn}: frame {k} draws nothing");
+            changing += usize::from(has(cx, "ink-1"));
+        }
+        assert!(changing > 10, "{turn}: it changed while watched ({changing} frames)");
+        assert!(has(cx, "life-Failed"), "{turn}: the cross at rest");
+    }
+}
+
 /// Shady #17 M1 (motion.md §5.3): the link lost mid-turn, the window is
 /// visibly stale and nothing in it is live. Past the grace and the drain,
 /// no orbit and no spinner is on the layer, and the one timer left is the
