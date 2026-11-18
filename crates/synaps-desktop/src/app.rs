@@ -196,6 +196,50 @@ pub(crate) const RENAME_WAIT: Duration = Duration::from_secs(10);
 pub(crate) const YES_KEY: &str = if cfg!(target_os = "macos") { "⌘ENTER" } else { "CTRL+ENTER" };
 /// A folded side panel's strip.
 pub(crate) const STRIP: f32 = 32.;
+/// The dock's and the composer field's heights on their springs. Q5's
+/// motion keys share `0x7AF*`: `0x7AF0` the panels' widths and
+/// `0x7AF3` a rail section's fold and FAVOURITES' chevron (chrome.rs),
+/// `0x7AF1` / `0x7AF2` these, `0x7AF4` a chip's cell (tray.rs).
+const DOCK_H: u64 = 0x7AF1 << 48;
+const COMPOSER_H: u64 = 0x7AF2 << 48;
+
+/// `el`, whose laid-out height goes to `sink`: when it changes under
+/// [`crate::motion::Level::Full`], one more frame, so its box springs to
+/// it (the dock, the composer's field).
+fn measured(el: Div, sink: &std::rc::Rc<std::cell::Cell<f32>>, full: bool) -> Div {
+    let sink = sink.clone();
+    el.relative().child(
+        canvas(
+            move |b, window, _| {
+                let h = f32::from(b.size.height);
+                let was = sink.replace(h);
+                if full && was.is_finite() && was != h {
+                    window.request_animation_frame();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0(),
+    )
+}
+
+/// What `measured` measured, in a box `shown` tall on a spring, anchored
+/// at its bottom (it grows upward; the line at its foot stays put) and
+/// clipped to the box's top and bottom. `edge`: drawn over its top while
+/// it cuts into what leads it (a sheet coming up leads with its edge).
+fn sprung(el: Div, shown: f32, name: &'static str, edge: Option<AnyElement>) -> AnyElement {
+    crate::motion::clip_y(
+        div()
+            .debug_selector(move || name.into())
+            .relative()
+            .w_full()
+            .h(px(shown))
+            .child(div().absolute().left_0().right_0().bottom_0().child(el))
+            .children(edge)
+            .into_any_element(),
+    )
+}
 /// Narrower than this, the open right panel is not drawn (the session wins).
 const CENTRE_MIN: f32 = 480.;
 
@@ -476,6 +520,9 @@ pub(crate) struct EdgeGrab {
     start: theme::Panels,
     width: f32,
     pub(crate) moved: bool,
+    /// The width the pointer asks for (unclamped): a release near the fold
+    /// threshold folds ([`detent`]).
+    want: f32,
 }
 
 /// GPUI's drag value for an edge handle, and the (empty) view it draws at
@@ -576,6 +623,45 @@ pub(crate) fn dragged(window: f32, start: theme::Panels, rail: bool, width: f32)
         p.rail_width = pin(other, want_l).or(p.rail_width);
     }
     p
+}
+
+/// A drag let go this close to a detent springs to it (fluid.md §3.8).
+pub(crate) const DETENT: f32 = 24.;
+
+/// The panels a drag of panel `rail` (else the right one) settles to when
+/// let go with the pointer asking for `want` px, if it is within
+/// [`DETENT`] of a detent: the fold threshold (it folds, keeping the width
+/// it had when the drag began, `start`: the drag clamped it to its limit
+/// on the way), the auto width (it is auto again) or the floor
+/// ([`FLOORS`], 312 for the rail). None: it stays where it was let go.
+pub(crate) fn detent(window: f32, start: theme::Panels, panels: theme::Panels, rail: bool, want: f32) -> Option<theme::Panels> {
+    let pick = |(l, r): (Side, Side)| if rail { l } else { r };
+    let Side::Open(w) = pick(sides(window, panels, crate::chrome::MARK)) else { return None };
+    let fold = limits(rail).0 * SNAP;
+    if want >= fold && want < fold + DETENT {
+        // Dragged out of its strip and back: the strip it was.
+        return match pick(sides(window, start, crate::chrome::MARK)) {
+            Side::Open(_) => toggled(window, start, rail),
+            Side::Strip => Some(start),
+        };
+    }
+    let auto = if rail { side_widths(window).0 } else { side_widths(window).1 };
+    let floor = if rail { FLOORS.0 } else { FLOORS.1 };
+    let set = |width: Option<u16>| {
+        let mut p = panels;
+        if rail {
+            p.rail_width = width;
+        } else {
+            p.right_width = width;
+        }
+        p
+    };
+    let to = [(auto, None), (floor, Some(floor as u16))]
+        .into_iter()
+        .filter(|(d, _)| (w - d).abs() <= DETENT)
+        .min_by(|a, b| (w - a.0).abs().total_cmp(&(w - b.0).abs()))?;
+    let p = set(to.1);
+    (p != panels).then_some(p)
 }
 
 /// The panels after the user folds or unfolds one (`rail`, else the right
@@ -1327,6 +1413,13 @@ pub struct AppView {
     panels_save: Option<Task<()>>,
     /// A drag of a panel's edge, from the mouse-down on its handle.
     pub(crate) drag: Option<EdgeGrab>,
+    /// A drag let go near a detent, its panel springing there: the
+    /// transcript's thumb holds until it lands, as through the drag (the
+    /// gate's S6).
+    springback: bool,
+    /// The side panels' widths on their springs, and the column's wrap
+    /// width while they move (fluid.md §3.8).
+    pub(crate) panel_fx: crate::chrome::PanelFx,
     fold_keys: FoldKeys,
     /// The window's width at the last frame (what a fold acts on).
     pub(crate) width: f32,
@@ -1512,6 +1605,13 @@ pub struct AppView {
     /// The top of what is drawn over the composer (the stub, a notice, the
     /// worker chips) as last laid out; `INFINITY` while none is.
     pub(crate) over_composer: std::rc::Rc<std::cell::Cell<f32>>,
+    /// The dock's (stub, notice, chips) and the composer's field's heights
+    /// as last laid out: their boxes spring to them (polish.md P13, P14).
+    pub(crate) dock_h: std::rc::Rc<std::cell::Cell<f32>>,
+    pub(crate) composer_h: std::rc::Rc<std::cell::Cell<f32>>,
+    /// The session and column they were measured in: another's is not a
+    /// change (it is drawn at its height at once).
+    dock_scope: u64,
     /// Each worker chip's bounds as last laid out (the tracer starts from
     /// the source chip's bar).
     pub(crate) chip_bounds: Rc<RefCell<ChipBounds>>,
@@ -1570,6 +1670,11 @@ pub struct AppView {
     /// [`Model::card_key`]) once its row is built; dropped when that card
     /// goes (Shady M5: a later card never takes the keys from the composer).
     pub(crate) jump_card: Option<(u64, u64)>,
+    /// Ctrl+J went to this card (its [`Model::card_key`]): its NEEDS YOU
+    /// stub leaves at once, not once the card is on screen, so the jump
+    /// aims at the view as it will be and the card moves one way. Cleared
+    /// once the card is on screen (scrolled away again, the stub returns).
+    pub(crate) stub_away: Option<(u64, u64)>,
     /// The session this window last sent HALT to, and when: a prompt that
     /// resolves after it was cancelled here, not answered elsewhere.
     pub(crate) halted: Option<(String, Instant)>,
@@ -1632,9 +1737,9 @@ pub struct AppView {
     /// The palette's list height and quad as last drawn, and their targets.
     #[cfg(test)]
     pub(crate) palette_drawn: Cell<(f32, f32, f32, f32)>,
-    /// The palette box's top and its tallest bottom as last drawn.
+    /// The palette box's top, its tallest bottom, its left and width as last drawn.
     #[cfg(test)]
-    pub(crate) palette_box: Cell<(f32, f32)>,
+    pub(crate) palette_box: Cell<(f32, f32, f32, f32)>,
     pub(crate) cancel_tick: Option<Task<()>>,
     /// A session's menu (a right-click on its tab or rail row): Rename…,
     /// Close tab.
@@ -2073,6 +2178,8 @@ impl AppView {
             panels_writing: Default::default(),
             panels_save: None,
             drag: None,
+            springback: false,
+            panel_fx: crate::chrome::PanelFx::default(),
             fold_keys: FoldKeys::default(),
             width: 0.,
             height: 0.,
@@ -2168,6 +2275,9 @@ impl AppView {
             strip_at: Default::default(),
             composer_top: Default::default(),
             over_composer: std::rc::Rc::new(std::cell::Cell::new(f32::INFINITY)),
+            dock_h: std::rc::Rc::new(std::cell::Cell::new(f32::NAN)),
+            composer_h: std::rc::Rc::new(std::cell::Cell::new(f32::NAN)),
+            dock_scope: 0,
             chip_bounds: Default::default(),
             view_seen: None,
             window_active: true,
@@ -2192,6 +2302,7 @@ impl AppView {
             sent: None,
             card_keys: Cell::new(None),
             jump_card: None,
+            stub_away: None,
             halted: None,
             allow_all_focus: i.allow_all_focus,
             card_first: Vec::new(),
@@ -2220,7 +2331,7 @@ impl AppView {
             #[cfg(test)]
             palette_drawn: Cell::new((0., 0., 0., 0.)),
             #[cfg(test)]
-            palette_box: Cell::new((0., 0.)),
+            palette_box: Cell::new((0., 0., 0., 0.)),
             cancel_tick: None,
             smenu: None,
             wmenu: None,
@@ -2684,6 +2795,7 @@ impl AppView {
         let mut p = self.panels;
         p.history_open ^= b.bit();
         let open = p.history_open & b.bit() != 0;
+        self.rail.fold = true;
         if !open {
             self.expanded &= !b.bit();
         }
@@ -4359,16 +4471,30 @@ impl AppView {
     }
 
     /// Fold or unfold a side panel (`rail`: the sessions rail, else the
-    /// right panel) as [`toggled`] says, at once (nothing animates); saved
-    /// [`SAVE_DELAY`] later. The list re-measures its rows for the new
-    /// width by itself.
+    /// right panel) as [`toggled`] says: its width flies on `sheet`
+    /// (fluid.md §3.8, [`crate::chrome::PanelFx`]); saved [`SAVE_DELAY`]
+    /// later. The column keeps its wrap until it lands.
     pub(crate) fn toggle_panel(&mut self, rail: bool, cx: &mut Context<Self>) {
         // A fold mid-drag commits the drag where it is first; the rest of
         // GPUI's drag then moves nothing (`drag_edge` needs `self.drag`).
         self.end_drag(cx);
         self.drag = None;
         let Some(p) = toggled(self.width, self.panels, rail) else { return };
+        self.fly_to(p, crate::motion::SHEET_RESPONSE);
         self.set_panels(p, cx);
+    }
+
+    /// The panels go to `p` on their springs (fluid.md §3.8): each one whose
+    /// width changes flies there from where it is drawn, on `response`; one
+    /// that folds or unfolds slides (`sheet`).
+    pub(crate) fn fly_to(&mut self, p: theme::Panels, response: f32) {
+        let (a, b) = (sides(self.width, self.panels, crate::chrome::MARK), sides(self.width, p, crate::chrome::MARK));
+        for (rail, was, now) in [(true, a.0, b.0), (false, a.1, b.1)] {
+            if was != now {
+                let slide = matches!(was, Side::Strip) != matches!(now, Side::Strip);
+                self.panel_fx.fly(rail, if slide { crate::motion::SHEET_RESPONSE } else { response }, slide);
+            }
+        }
     }
 
     /// Every row's height changes with the text size: re-measured now (a
@@ -4406,7 +4532,7 @@ impl AppView {
     pub(crate) fn grab_edge(&mut self, rail: bool, x: f32) {
         let (l, r) = sides(self.width, self.panels, crate::chrome::MARK);
         let width = if rail { l.width() } else { r.width() };
-        self.drag = Some(EdgeGrab { rail, x, start: self.panels, width, moved: false });
+        self.drag = Some(EdgeGrab { rail, x, start: self.panels, width, moved: false, want: width });
     }
 
     /// The pointer is at `x` during a drag of an edge (anywhere: GPUI
@@ -4415,6 +4541,7 @@ impl AppView {
         let Some(g) = self.drag.as_mut() else { return };
         g.moved = true;
         let width = if g.rail { g.width + (x - g.x) } else { g.width - (x - g.x) };
+        g.want = width;
         let p = dragged(self.width, g.start, g.rail, width);
         if p != self.panels {
             self.panels = p;
@@ -4425,6 +4552,13 @@ impl AppView {
     /// The drag let go: what it left is saved, once.
     fn end_drag(&mut self, cx: &mut Context<Self>) {
         if let Some(g) = self.drag.take_if(|g| g.moved) {
+            // Let go near a detent: the panel springs there (`snap`).
+            if let Some(p) = detent(self.width, g.start, self.panels, g.rail, g.want) {
+                self.fly_to(p, crate::motion::SNAP_RESPONSE);
+                self.springback = true;
+                self.panels = p;
+                cx.notify();
+            }
             self.panels_changed(g.start, cx);
         }
     }
@@ -4441,6 +4575,7 @@ impl AppView {
             } else {
                 p.right_width = None;
             }
+            self.fly_to(p, crate::motion::SHEET_RESPONSE);
             self.set_panels(p, cx);
         } else if (if rail { l } else { r }) == Side::Strip {
             self.toggle_panel(rail, cx);
@@ -5104,6 +5239,7 @@ impl AppView {
     pub(crate) fn toggle_favs_group(&mut self, cx: &mut Context<Self>) {
         let mut p = self.panels;
         p.favs_closed = !p.favs_closed;
+        self.rail.fold = true;
         self.set_panels(p, cx);
         cx.notify();
     }
@@ -5440,6 +5576,54 @@ impl AppView {
     /// foot: the glyph, HALT and the primary sit beside the text (a note
     /// about the draft keeps its row). `to_card`: it has the focus while a
     /// card waits; its hint says how to answer from the keyboard.
+    /// How much the dock has still to grow on its spring: the list's view
+    /// ends this much higher once it lands (a reveal aims there).
+    pub(crate) fn dock_growth(&self) -> f32 {
+        let natural = self.dock_h.get();
+        match self.fx.spring_at(DOCK_H) {
+            Some(shown) if natural.is_finite() => (natural - shown).max(0.),
+            _ => 0.,
+        }
+    }
+
+    /// The dock over the composer: the NEEDS YOU stub, a notice and the
+    /// worker chips (polish.md P13). Under Full its height springs on
+    /// `sheet` to what they take (a stub arrives, the chips wrap or unwrap,
+    /// the last one leaves), growing upward and clipped; else it takes it
+    /// at once. `stub`: it leads with the NEEDS YOU stub, whose frame's
+    /// top is drawn at the box's top while the box cuts into it.
+    fn dock(&self, parts: Vec<AnyElement>, stub: Option<Hsla>) -> Option<AnyElement> {
+        let full = self.fx.level() == crate::motion::Level::Full;
+        if parts.is_empty() && self.dock_h.get().is_finite() {
+            self.dock_h.set(0.);
+        }
+        let natural = self.dock_h.get();
+        let shown = (full && natural.is_finite()).then(|| self.fx.spring(DOCK_H, None, natural, crate::motion::SHEET_RESPONSE).0);
+        if parts.is_empty() && shown.is_none_or(|h| h < 0.5) {
+            return None;
+        }
+        let content = measured(v_flex().w_full().debug_selector(|| "dock".into()).children(parts), &self.dock_h, full);
+        Some(match shown {
+            Some(h) => {
+                // The stub's row starts `STUB_GAP` under the content's top.
+                let lay = self.layout;
+                let edge = stub.filter(|_| natural - h > crate::fit::STUB_GAP && h >= 1.).map(|c| {
+                    div()
+                        .debug_selector(|| "dock-edge".into())
+                        .absolute()
+                        .top_0()
+                        .left(px(lay.left))
+                        .w(px(lay.column))
+                        .h(px(1.))
+                        .bg(c)
+                        .into_any_element()
+                });
+                sprung(content, h, "dock-box", edge)
+            }
+            None => content.into_any_element(),
+        })
+    }
+
     fn render_composer(&self, p: &Palette, m: &Metrics, to_card: bool, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let lay = self.layout;
         let dims = crate::fit::Composer::of(m, lay.form());
@@ -5661,6 +5845,16 @@ impl AppView {
                 .line_height(px(m.body_line))
                 .text_color(p.ink),
         );
+        // A line more or less: its box springs there on `flick`, growing
+        // upward (the caret's line stays put; fluid.md §3.8).
+        let full = self.fx.level() == crate::motion::Level::Full;
+        let natural = self.composer_h.get();
+        let field = measured(field, &self.composer_h, full);
+        let field = match (full && natural.is_finite()).then(|| self.fx.spring(COMPOSER_H, None, natural, crate::motion::FLICK_RESPONSE).0)
+        {
+            Some(h) => sprung(field, h, "composer-box", None),
+            None => field.into_any_element(),
+        };
         // Cramped, the draft's note is on the notice line.
         let inline = dims.row_gap.is_none();
         let inner = if inline {
@@ -6001,6 +6195,13 @@ impl Render for AppView {
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
         self.fx.rescope(self.motion_session(), self.motion_column());
+        // Another session, or a worker's view in or out: its dock and draft
+        // are drawn at their heights (a switch replays nothing).
+        let scope = self.motion_session() ^ self.motion_column().rotate_left(17);
+        if std::mem::replace(&mut self.dock_scope, scope) != scope {
+            self.dock_h.set(f32::NAN);
+            self.composer_h.set(f32::NAN);
+        }
         // A worker tab opened by the pointer: the tracer from it (§6.2),
         // from the source chip's bar (its left edge, at its centre) when the
         // click, or the menu picked from, was on a chip.
@@ -6039,6 +6240,9 @@ impl Render for AppView {
         self.sync_card(window, cx);
         self.sync_list();
         self.read_card_on_screen();
+        if self.stub_away.is_some() && (self.card_on_screen() || self.stub_away != self.model.card_key()) {
+            self.stub_away = None;
+        }
         self.card_keys.set(self.card_keys_live(window, cx));
         // Ctrl+J from a worker's view: the card once its row is built (that
         // card only: another, or none, drops it).
@@ -6184,7 +6388,7 @@ impl Render for AppView {
         }
         // Wide windows widen the side panels; narrow ones fold the open
         // numbers, then the open rail, to strips before the session gives.
-        self.width = window.viewport_size().width.into();
+        let width: f32 = window.viewport_size().width.into();
         let height: f32 = window.viewport_size().height.into();
         // L5: the card's read gate and AUTHORIZE are drawn from the last
         // frame's bounds: after a resize, one more frame draws them from
@@ -6192,6 +6396,14 @@ impl Render for AppView {
         if height != self.height && self.card.is_some() {
             window.request_animation_frame();
         }
+        // A window resize is the window manager's (fluid.md §3.8, `follow`):
+        // the dock and the draft take the heights it gives them at once, as
+        // after a switch.
+        if (width, height) != (self.width, self.height) {
+            self.dock_h.set(f32::NAN);
+            self.composer_h.set(f32::NAN);
+        }
+        self.width = width;
         self.height = height;
         let (rail, right) = sides(self.width, self.panels, crate::chrome::MARK);
         if let Side::Open(w) = rail {
@@ -6202,10 +6414,23 @@ impl Render for AppView {
         // column as its item width: while the column is capped, a resize or
         // a panel drag changes only the padding, and the list keeps every
         // measured row (it re-measures when its item width changes).
-        let pane = (self.width - crate::chrome::MARK - rail.width() - right.width()).max(0.);
+        // The panels as drawn, on their springs (fluid.md §3.8); while one
+        // moves, the column keeps the wrap of the flight's narrowest pane.
+        let (rail_w, right_w) = self.panel_frame(rail, right);
+        // In device pixels, one division, as the layout rounds the pane's
+        // box (R2-M1): at 125/150/175 % three widths each divided apart
+        // differ from it in the last bit, frame to frame, and the list
+        // would forget its heights as at a fractional width.
+        let s = window.scale_factor();
+        let dp = |v: f32| (v * s).round();
+        let pane_of = |less: &[f32]| ((dp(self.width) - less.iter().map(|&v| dp(v)).sum::<f32>()) / s).max(0.);
+        let pane = pane_of(&[crate::chrome::MARK, rail_w, right_w]);
+        let pane_to = pane_of(&[crate::chrome::MARK, rail.width(), right.width()]);
+        self.panel_fx.freeze = self.panel_fx.moving().then(|| self.panel_fx.freeze.unwrap_or(pane).min(pane).min(pane_to));
+        let wrap = self.panel_fx.freeze.unwrap_or(pane);
         // A view is not a session: no right panel (it describes one); the
         // pane takes its width. The session's column keeps its layout.
-        let view_pane = (self.width - crate::chrome::MARK - rail.width()).max(0.);
+        let view_pane = pane_of(&[crate::chrome::MARK, rail_w]);
         // Its height under the full top bar, whatever bar is drawn.
         if self.top_words.is_none() {
             let words = crate::chrome::top_words(window);
@@ -6230,10 +6455,19 @@ impl Render for AppView {
         }
         // The form from what decides it (not the stub or the tray).
         let ex = crate::fit::Extras { stub: false, tray: 0, ..self.extras() };
-        let lay = Layout::of(pane, self.height - crate::chrome::TOP, &m, ex);
+        let lay = Layout::of_in(pane, wrap, self.height - crate::chrome::TOP, &m, ex);
         if (lay.hang, lay.tight) != (self.layout.hang, self.layout.tight) {
             self.list.remeasure();
             self.metrics_gen += 1;
+        }
+        // A new column re-wraps the rows: this frame's scrollbar would read
+        // the rows not yet measured at their estimates (it is held as it
+        // was, `Bar::still`). One more frame draws it from their heights,
+        // at every level (a fold at Off draws one frame, and its bar would
+        // keep the estimate until the next change).
+        let rewrap = lay.column != self.layout.column;
+        if rewrap {
+            window.request_animation_frame();
         }
         // Short or not: the list's top edge moves by what the bars above it
         // gain or lose, and the rows keep their place on screen; after a
@@ -6257,15 +6491,14 @@ impl Render for AppView {
         // The worker chips: the lines they need in the column, then how
         // many the room leaves. A chip fading out keeps its slot until its
         // fade is over.
-        let confirm = self.display_w(label::CONFIRM, fonts::size::D_S, window);
         // The 3-line rule counts the chips fading out too: 5 workers going
         // to 4 keep their lines until the fifth's fade is over, so no
         // `+1 more` blinks in for it (Shady #16 r4).
         let (form, height, workers) = (lay.form(), self.height, self.tray.rows.len() + self.tray.ghosts.len());
         self.tray_rows = if view.is_none() {
-            self.fit_chips(lay.column, confirm, &m, |needed| crate::fit::chip_lines(&m, form, height, card_shown, ex, workers, needed))
+            self.fit_chips(lay.column, &m, |needed| crate::fit::chip_lines(&m, form, height, card_shown, ex, workers, needed))
         } else {
-            self.pack_chips(Vec::new(), &[], lay.column, 0, &m);
+            self.pack_chips(Vec::new(), lay.column, 0, &m);
             0
         };
         // A keyboard menu over a row no longer drawn closes; a workers menu
@@ -6363,7 +6596,14 @@ impl Render for AppView {
         // Over the list's right padding, after its layout (and the hold-back's).
         let layer = self.layer_now();
         let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.scroller.clone(), self.fx.clone()));
-        let transcript_bar = crate::scrollbar::rows_gliding(&self.list, pad_t + pad_b, &self.bars.transcript, glide).always();
+        // Held while an edge is dragged and as it springs to a detent after,
+        // and in the frame a new column re-wraps the rows (on their
+        // estimates): the next frame draws it from their heights (the
+        // gate's S3 and S6, and the landing's frame).
+        self.springback &= self.panel_fx.moving();
+        let transcript_bar = crate::scrollbar::rows_gliding(&self.list, pad_t + pad_b, &self.bars.transcript, glide)
+            .always()
+            .still(self.drag.is_some() || self.springback || rewrap);
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
         // the end of a scrolled-back list set it following; it stops 2 px
         // short of the end instead, still scrolled back. Built only on the
@@ -6395,9 +6635,11 @@ impl Render for AppView {
         let session = shown_view.is_none();
         // As elements now (they borrow nothing after this).
         let stub = session.then(|| self.render_stub(&p, &m, cx).map(IntoElement::into_any_element)).flatten();
+        let lead = stub.is_some().then_some(p.warn_mark);
         let notice = session.then(|| self.render_notice(&p, &m).map(IntoElement::into_any_element)).flatten();
         let tray = session.then(|| self.render_tray(&p, &m, cx).map(IntoElement::into_any_element)).flatten();
-        let over = (stub.is_some() || notice.is_some() || tray.is_some()).then(|| self.over_composer.clone());
+        let dock = session.then(|| self.dock([stub, notice, tray].into_iter().flatten().collect(), lead)).flatten();
+        let over = dock.is_some().then(|| self.over_composer.clone());
         if over.is_none() {
             self.over_composer.set(f32::INFINITY);
         }
@@ -6436,9 +6678,7 @@ impl Render for AppView {
                 .when_some(over, |d, at| d.child(canvas(move |b, _, _| at.set(f32::from(b.origin.y)), |_, _, _, _| {}).w_full().h(px(0.))))
                 // The card off screen (scrolled away, or a worker's view):
                 // NEEDS YOU, folded, over the chips.
-                .children(stub)
-                .children(notice)
-                .children(tray)
+                .children(dock)
                 .children(crate::motion::probe(&self.fx, "composer"))
                 .child(self.render_composer(
                     &p,
@@ -6704,21 +6944,13 @@ impl Render for AppView {
                     h_flex()
                         .flex_1()
                         .min_h_0()
-                        .map(|d| match rail {
-                            Side::Open(w) => d.child(self.render_rail(w, &p, cx)),
-                            Side::Strip => d.child(self.render_rail_strip(&p, cx)),
-                        })
+                        .child(self.render_side(true, rail, &p, cx))
                         .child(main)
-                        .when(view.is_none(), |d| match right {
-                            Side::Open(w) => {
-                                d.child(self.render_right(w, &p, cx)).child(self.bars.right.bar(crate::scrollbar::Ground::Chrome))
-                            }
-                            Side::Strip => d.child(self.render_right_strip(&p, cx)),
-                        }),
+                        .when(view.is_none(), |d| d.child(self.render_side(false, right, &p, cx))),
                 ),
             )
-            .children(self.render_edge(true, rail, &p, cx))
-            .children(view.is_none().then(|| self.render_edge(false, right, &p, cx)).flatten())
+            .children(self.render_edge(true, rail, rail_w, &p, cx))
+            .children(view.is_none().then(|| self.render_edge(false, right, right_w, &p, cx)).flatten())
             .when(self.picker_open, |d| {
                 d.child(deferred(self.render_picker(&p, if view.is_some() { Side::Open(0.) } else { right }, cx)).with_priority(1))
                     .child(deferred(self.bars.picker.bar(crate::scrollbar::Ground::Chrome)).with_priority(1))
@@ -6730,7 +6962,7 @@ impl Render for AppView {
             .children(self.render_session_menu(&p, cx))
             .children(self.render_workers_menu(&p, cx))
             .children(self.render_palette(
-                crate::chrome::MARK + rail.width(),
+                crate::chrome::MARK + rail_w,
                 if view.is_some() { view_pane } else { pane },
                 // Over a view there is no composer: the window's end.
                 if view.is_some() { self.height } else { self.composer_top.get().min(self.over_composer.get()) },

@@ -1,0 +1,20 @@
+t0 1795006611.955005235
+0.000680447 key ctrl+d
+1.53019 mousemove 61 213
+1.93489 click 1
+3.24142 click 1
+4.54958 key ctrl+d
+6.0781 mousemove 640 300
+6.38177 key ctrl+b
+7.71112 key ctrl+b
+9.04408 key ctrl+alt+b
+10.3964 key ctrl+alt+b
+11.7395 mousemove 311 400
+11.9447 mousedown 1
+12.1503 mouseup 1
+13.3547 mousemove 640 300
+15.8169 key ctrl+j
+17.4462 mousemove 150 500
+19.1665 mousemove 70 350
+19.7703 click 1
+21.1757 click 1

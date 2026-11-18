@@ -1,0 +1,6 @@
+t0 1795011912.796652566
+0.000966072 mousemove 900 400
+0.308984 key ctrl+b
+1.64451 key ctrl+b
+2.97433 key ctrl+alt+b
+4.32579 key ctrl+alt+b

@@ -1,0 +1,15 @@
+t0 1795015014.563956090
+0.000966787 mousemove 61 213
+0.404886 click 1
+1.81028 click 1
+3.21642 click 1
+3.44074 click 1
+4.84575 click 1
+6.25045 click 1
+6.47541 click 1
+7.88174 click 1
+9.28649 mousemove 311 400
+9.49054 mousedown 1
+9.69379 mouseup 1
+10.8976 mousemove 640 300
+13.362 key ctrl+j

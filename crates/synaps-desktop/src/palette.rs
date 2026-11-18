@@ -1079,7 +1079,7 @@ impl AppView {
         let bottom = if bottom > top { bottom } else { self.height };
         let max = LIST_MAX.min((bottom - ABOVE_COMPOSER - top - CHROME_H).max(ROW_H * 3.));
         #[cfg(test)]
-        self.palette_box.set((top, top + CHROME_H + max));
+        self.palette_box.set((top, top + CHROME_H + max, x, w));
         // A miss (or nothing yet) is a row: its "Nothing matches" shows.
         let target = if lines.is_empty() { ROW_H } else { content.min(max) };
         let snap = crate::motion::SNAP_RESPONSE;

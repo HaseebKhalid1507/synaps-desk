@@ -986,15 +986,19 @@ impl AppView {
         let el = if armed {
             // The name as its chip cuts it (what its width counts).
             let name = crate::tray::cut(&who.name, crate::tray::NAME_CHARS);
+            // The chip's rest (its width is the grid's): `Cancel name?`
+            // gives way, cut `…`; the fuse and CONFIRM end the chip, where
+            // the × was.
             h_flex()
                 .id(("tray-x", who.id as usize))
                 .debug_selector(|| "tray-armed".into())
-                .flex_none()
+                .flex_1()
+                .min_w_0()
                 .h(px(h))
                 .gap(px(6.))
                 .items_center()
                 .cursor_pointer()
-                .child(div().text_color(p.err).child(format!("Cancel {name}?")))
+                .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.err).child(format!("Cancel {name}?")))
                 // Before CONFIRM, 8 px from it: the pointer that armed it
                 // rests on the ×'s end, where CONFIRM is (finish gate fix 2).
                 .children(self.fuse(p).map(|f| f.mr(px(2.))))
