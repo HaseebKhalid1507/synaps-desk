@@ -2413,6 +2413,41 @@ mod tests {
     /// running marks when it ends (PR #8 re-review N1); one in a session a
     /// TUI shows never does (read there).
     #[test]
+    fn an_event_on_a_session_not_on_screen_marks_it_unread() {
+        // BRIEF-events §4: an event to a session not on screen is news, from
+        // the watch listing alone (no live frame there). Injected while idle,
+        // it is a message more (and with the auto-turn, a turn that ends);
+        // steered into a running turn, the turn ends with it. On screen, or
+        // on a TUI's screen, it is not.
+        let mut m = Model::new(ConnState::Connecting);
+        let list = |busy: bool, messages: usize, roster: Value| {
+            metas(json!([{"id": "s", "lifecycle": "live"},
+                         {"id": "b", "lifecycle": "live", "busy": busy, "messages": messages, "roster": roster}]))
+        };
+        let st = |m: &Model| m.state(m.sessions.iter().find(|s| s.id == "b").unwrap());
+        m.apply(Event::Sessions(list(false, 4, json!([]))));
+        attach(&mut m, 1);
+        // auto_turn off: injected, no turn.
+        m.apply(Event::Sessions(list(false, 5, json!([]))));
+        assert_eq!(st(&m), State::Unread);
+        // Seen (attached), then an event wakes it: the turn runs, then ends.
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(Event::Sessions(list(false, 4, json!([]))));
+        attach(&mut m, 1);
+        m.apply(Event::Sessions(list(true, 5, json!([]))));
+        assert_eq!(st(&m), State::Running);
+        m.apply(Event::Sessions(list(false, 6, json!([]))));
+        assert_eq!(st(&m), State::Unread, "the tab and the rail row say so");
+        // A TUI has it on screen: not news here.
+        let mut m = Model::new(ConnState::Connecting);
+        let tui = json!([{"id": 1, "kind": "tui", "name": "tui"}]);
+        m.apply(Event::Sessions(list(false, 4, tui.clone())));
+        attach(&mut m, 1);
+        m.apply(Event::Sessions(list(false, 5, tui)));
+        assert_eq!(st(&m), State::Idle);
+    }
+
+    #[test]
     fn unread_is_what_was_not_seen() {
         let mut m = Model::new(ConnState::Connecting);
         let list = |busy: bool, messages: usize, roster: Value| {

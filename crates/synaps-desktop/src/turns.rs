@@ -255,7 +255,7 @@ pub(crate) fn mean_height(disp: &[Disp], rows: &[RowCache], m: &Metrics, cpl: f3
         .iter()
         .map(|d| {
             let lines = match d.kind {
-                Kind::User | Kind::Prose | Kind::Note => rows.get(d.item).map_or(1., |r| text_lines(&r.text, cpl)),
+                Kind::User | Kind::Prose | Kind::Note | Kind::Event => rows.get(d.item).map_or(1., |r| text_lines(&r.text, cpl)),
                 _ => 1.,
             };
             gap_of(d.gap, m) + lines * m.body_line + 2. * m.pad_y
@@ -303,6 +303,9 @@ pub(crate) enum Kind {
     Prose,
     /// A notice or an error: one mono line.
     Note,
+    /// An engine event ([`crate::events`]): a message of its own, as the
+    /// user's is (the agent's reply under it is labelled).
+    Event,
     /// A foldable run's summary: its items are `item..end`.
     Summary {
         end: usize,
@@ -509,6 +512,14 @@ pub(crate) fn build(
                 }
                 i = end;
             }
+            // An event: a message the agent answers, as a user's is (a
+            // turn's gap above it, the agent's next words labelled); never
+            // a user row.
+            ItemKind::Event => {
+                out.push(row(Kind::Event, if i == 0 { Gap::First } else { Gap::Turn }, Who::None));
+                agent = false;
+                i += 1;
+            }
             // A command's answer: its own label; the agent's next words
             // are labelled again.
             ItemKind::Output => {
@@ -572,7 +583,7 @@ fn time_text(t: &crate::times::Stamp, p: &Palette, m: &Metrics) -> Div {
 /// A labelled row's time (`crate::times`): [`time_text`], the date and
 /// seconds in its tooltip, made when that opens.
 /// Static text: it never animates (a history row's least of all).
-fn time_slot(t: &crate::times::Stamp, id: u64, p: &Palette, m: &Metrics) -> Stateful<Div> {
+pub(crate) fn time_slot(t: &crate::times::Stamp, id: u64, p: &Palette, m: &Metrics) -> Stateful<Div> {
     let at = t.clone();
     time_text(t, p, m)
         .id(("time", id))
@@ -1400,6 +1411,10 @@ impl AppView {
                 }
             }
             Kind::Note if item.kind == ItemKind::Output => self.render_output(item, row, &p, &m, cx),
+            Kind::Event => match row.event.as_deref() {
+                Some(v) => self.render_event(item.id, v, row.time.as_ref(), &p, &m, cx),
+                None => mono(row.text.clone(), m.meta, p.dim).w_full().whitespace_normal().into_any_element(),
+            },
             Kind::Note => {
                 let color = if item.kind == ItemKind::Error { p.err } else { p.dim };
                 mono(row.text.clone(), m.meta, color).w_full().whitespace_normal().into_any_element()
@@ -2364,6 +2379,7 @@ mod tests {
                 Kind::User => "user",
                 Kind::Prose => "prose",
                 Kind::Note => "note",
+                Kind::Event => "event",
                 Kind::Summary { open: false, .. } => "fold",
                 Kind::Summary { open: true, .. } => "unfold",
                 Kind::Work => "work",

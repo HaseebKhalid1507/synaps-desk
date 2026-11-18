@@ -1393,6 +1393,11 @@ pub enum SessionEvent {
         #[serde(default)]
         lifecycle: String,
     },
+    /// An engine event the session drained (`synaps send`, agent-comms, a
+    /// watcher, a worker's completion): [`crate::events`].
+    External {
+        event: Box<crate::events::ExternalEvent>,
+    },
     #[serde(other)]
     Unknown,
 }

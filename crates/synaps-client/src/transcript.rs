@@ -11,6 +11,16 @@
 //! system notices) are not part of the history; they are kept across
 //! refolds, anchored to the history position they arrived at.
 //!
+//! An engine event ([`crate::events`]: `synaps send`, agent-comms, a
+//! watcher) is one [`ItemKind::Event`] row, never a user row, whichever way
+//! it came: the live `External` frame, the steer that carried it into a
+//! running turn, or its `<event …>` message in the history. One event id is
+//! one row: a live row is a note until its history message lands, then it
+//! is that message's row (same id, its live time and sender kept). The
+//! engine's notes about the session's own workers
+//! ([`crate::events::is_worker_note`]) stay notices from the history, as
+//! before, and add no live row.
+//!
 //! Change tracking is splice-shaped for a virtual list: after a batch of
 //! updates, [`Transcript::take_splice`] reports the first changed index and
 //! the old/new lengths, so the UI remeasures only the rows that changed.
@@ -20,6 +30,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::events::ExternalEvent;
 use crate::history::HistoryUpdate;
 use crate::protocol::*;
 
@@ -51,6 +62,8 @@ pub enum ItemKind {
     /// A slash command's answer ([`Transcript::output`]): this client's,
     /// never sent and not in the history.
     Output,
+    /// An engine event ([`Item::event`]); `text` is its text as shown.
+    Event,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +240,9 @@ pub struct Item {
     /// row of a swapped conversation), so key anything derived from it on
     /// it.
     pub at: Option<Arc<str>>,
+    /// An [`ItemKind::Event`] row's event, as shown
+    /// ([`ExternalEvent::shown`]; from the history: what its form keeps).
+    pub event: Option<Arc<ExternalEvent>>,
     /// `Some(n)`: a client-side row (notice, error), not part of the
     /// history, shown after the first `n` history messages.
     anchor: Option<usize>,
@@ -314,6 +330,9 @@ pub struct Transcript {
     /// `stamp` by the first row it starts: most events start no row, so
     /// most never allocate.
     event_ts: String,
+    /// Live event rows whose history message is in the fold under way: the
+    /// message takes its row ([`Transcript::fold_event`]).
+    held: Vec<Item>,
 }
 
 impl Transcript {
@@ -411,7 +430,7 @@ impl Transcript {
         if self.stamp.is_none() && !self.event_ts.is_empty() {
             self.stamp = Some(Arc::from(self.event_ts.as_str()));
         }
-        self.items.push(Item { id, rev, kind, text, tool, streaming, at: self.stamp.clone(), anchor: None });
+        self.items.push(Item { id, rev, kind, text, tool, streaming, at: self.stamp.clone(), event: None, anchor: None });
         self.mark(ix);
         ix
     }
@@ -480,7 +499,7 @@ impl Transcript {
             if carry && o.at.is_some() && o.kind == it.kind && same {
                 it.at = o.at.clone();
             }
-            if o.kind == it.kind && o.streaming == it.streaming && o.text == it.text && o.tool == it.tool {
+            if o.kind == it.kind && o.streaming == it.streaming && o.text == it.text && o.tool == it.tool && o.event == it.event {
                 it.rev = o.rev;
             }
         }
@@ -563,10 +582,12 @@ impl Transcript {
     /// kind); notes among them stay, after the new rows.
     fn append_history(&mut self, messages: &[Value]) {
         let (notes, mut reuse) = self.take_rows(self.history_end);
+        let mut notes = self.hold_events(notes, messages);
         for m in messages {
             self.fold_message(m, &mut reuse);
         }
         self.history_len += messages.len();
+        notes.append(&mut self.held);
         for n in notes {
             self.push_note(n, self.history_len);
         }
@@ -605,7 +626,8 @@ impl Transcript {
     }
 
     /// Fold a whole history from empty, interleaving `notes` by anchor.
-    fn fold_with_notes(&mut self, messages: &[Value], mut notes: Vec<Item>, reuse: &mut Reuse) {
+    fn fold_with_notes(&mut self, messages: &[Value], notes: Vec<Item>, reuse: &mut Reuse) {
+        let mut notes = self.hold_events(notes, messages);
         notes.sort_by_key(|n| n.anchor);
         let mut notes = notes.into_iter().peekable();
         for (i, m) in messages.iter().enumerate() {
@@ -614,11 +636,75 @@ impl Transcript {
             }
             self.fold_message(m, reuse);
         }
-        for n in notes {
+        for n in notes.chain(std::mem::take(&mut self.held)) {
             self.push_note(n, messages.len());
         }
         self.history_len = messages.len();
         self.history_end = self.items.len();
+    }
+
+    /// The live event rows among `notes` whose message is in `messages`,
+    /// held for it ([`Transcript::held`]); the other notes back.
+    fn hold_events(&mut self, notes: Vec<Item>, messages: &[Value]) -> Vec<Item> {
+        if !notes.iter().any(|n| n.kind == ItemKind::Event) {
+            return notes;
+        }
+        let ids: std::collections::HashSet<String> = messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .filter(|s| ExternalEvent::is_payload(s))
+            .filter_map(ExternalEvent::from_payload)
+            .map(|e| e.id)
+            .collect();
+        let (held, rest) = notes.into_iter().partition(|n| n.event.as_ref().is_some_and(|e| ids.contains(&e.id)));
+        self.held = held;
+        rest
+    }
+
+    /// A history message that is an event's agent form (`<event …>`): its
+    /// row, the live one if it was seen ([`Transcript::held`]: same id, its
+    /// live time and the fields only the live frame has), else a new one. A
+    /// worker's note, or a form that does not parse, is a notice of the
+    /// raw text, as before.
+    fn fold_event(&mut self, s: &str, reuse: &mut Reuse) {
+        let Some(ev) = ExternalEvent::from_payload(s).filter(|e| !e.is_worker_note()) else {
+            self.push(ItemKind::Notice, s.to_string(), None, false, reuse);
+            return;
+        };
+        if let Some(k) = self.held.iter().position(|h| h.event.as_ref().is_some_and(|e| e.id == ev.id)) {
+            let mut it = self.held.swap_remove(k);
+            it.anchor = None;
+            let ix = self.items.len();
+            self.items.push(it);
+            self.mark(ix);
+            return;
+        }
+        let ix = self.push(ItemKind::Event, ev.content.text.clone(), None, false, reuse);
+        self.items[ix].event = Some(Arc::new(ev));
+    }
+
+    /// A live event (the `External` frame, or the steer that carried it):
+    /// its row at the end, a note until its history message lands. Not
+    /// again if a row has its id (from the history, or the frame before
+    /// the steer); that row takes what only the live frame has.
+    fn live_event(&mut self, ev: ExternalEvent) {
+        if ev.is_worker_note() {
+            return;
+        }
+        if let Some(ix) = self.items.iter().rposition(|i| i.event.as_ref().is_some_and(|e| e.id == ev.id)) {
+            let had = self.items[ix].event.as_deref().expect("an event row");
+            if ev.timestamp.is_some() && had.timestamp.is_none() {
+                let mut ev = ev;
+                ev.content.text.clone_from(&had.content.text);
+                self.items[ix].event = Some(Arc::new(ev));
+                self.touch(ix);
+            }
+            return;
+        }
+        self.end_streaming_text();
+        let ix = self.push_new(ItemKind::Event, ev.content.text.clone(), None, false);
+        self.items[ix].event = Some(Arc::new(ev));
+        self.items[ix].anchor = Some(self.history_len);
     }
 
     /// No turn runs: nothing streams and no tool is still pending. Tools
@@ -655,8 +741,9 @@ impl Transcript {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
         let content = m.get("content").unwrap_or(&Value::Null);
         match (role, content) {
+            ("user", Value::String(s)) if s.starts_with("<event") => self.fold_event(s, reuse),
             ("user", Value::String(s)) => {
-                let kind = if s.starts_with("<event") || s.starts_with("<context-summary>") { ItemKind::Notice } else { ItemKind::User };
+                let kind = if s.starts_with("<context-summary>") { ItemKind::Notice } else { ItemKind::User };
                 self.push(kind, s.clone(), None, false, reuse);
             }
             ("assistant", Value::String(s)) => {
@@ -673,6 +760,11 @@ impl Transcript {
                 };
                 for b in blocks {
                     match b.get("type").and_then(Value::as_str).unwrap_or("") {
+                        // An event's form in a user message's blocks: its row.
+                        "text" if role == "user" && b.get("text").and_then(Value::as_str).is_some_and(ExternalEvent::is_payload) => {
+                            flush(self, &mut text, reuse);
+                            self.fold_event(b.get("text").and_then(Value::as_str).unwrap_or(""), reuse);
+                        }
                         "text" => {
                             if !text.is_empty() {
                                 text.push_str("\n\n");
@@ -791,6 +883,8 @@ impl Transcript {
                 self.end_streaming_text();
                 self.push_new(ItemKind::User, text.clone(), None, false);
             }
+            // A drained event's payload: its parent's business.
+            WatchEvent::Steered { .. } => {}
             WatchEvent::Failed { category } => self.notice(ItemKind::Error, format!("subagent failed [{category}]")),
             other => {
                 if let Some(s) = other.to_stream() {
@@ -882,7 +976,13 @@ impl Transcript {
                 }
                 self.resolved.push_back((*prompt_id, self.busy));
             }
-            SessionEvent::Steered { text, .. } => self.notice(ItemKind::Notice, format!("steered: {text}")),
+            SessionEvent::External { event } => self.live_event(event.shown()),
+            // An event steered into the running turn is its event's row,
+            // never the user's steer.
+            SessionEvent::Steered { text, .. } => match steered_event(text) {
+                Some(ev) => self.live_event(ev),
+                None => self.notice(ItemKind::Notice, format!("steered: {text}")),
+            },
             SessionEvent::SystemNotice { text } => self.notice(ItemKind::Notice, text.clone()),
             SessionEvent::Aborted { .. } => {
                 self.busy = false;
@@ -1011,6 +1111,11 @@ impl Transcript {
                 _ => {}
             },
             StreamEvent::Agent(a) => match a {
+                AgentEvent::SteeringDelivered { message } => {
+                    if let Some(ev) = steered_event(message) {
+                        self.live_event(ev);
+                    }
+                }
                 AgentEvent::SubagentStart { agent_name, task_preview, .. } if !self.no_subagent_notices => {
                     self.notice(ItemKind::Notice, format!("subagent {agent_name} started: {task_preview}"))
                 }
@@ -1022,6 +1127,11 @@ impl Transcript {
             StreamEvent::Unknown => {}
         }
     }
+}
+
+/// The event a steer carries (its agent form), if it is one.
+fn steered_event(text: &str) -> Option<ExternalEvent> {
+    ExternalEvent::is_payload(text).then(|| ExternalEvent::from_payload(text)).flatten()
 }
 
 fn compact(v: &Value) -> String {
