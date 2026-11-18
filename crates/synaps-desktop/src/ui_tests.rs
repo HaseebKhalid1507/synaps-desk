@@ -7313,3 +7313,37 @@ fn a_chip_is_the_columns_share_whatever_it_says(cx: &mut TestAppContext) {
     set(cx, rows("git status", 3600., "failed"));
     assert_eq!(geo(cx), landed, "the third failed");
 }
+
+/// Shady L2 (PR #21): another splice of the rail while a section folds
+/// (a session favourited: its row moves) ends the fold, so no rows are
+/// offset by a fold whose indices are no longer theirs.
+#[gpui_kit::test]
+fn a_rail_splice_mid_fold_ends_the_fold(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1280., 720.), crate::theme::Panels::default().text_size);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let b = view
+        .read_with(cx, |v, _| {
+            v.rail.rail.items.iter().find_map(|i| match i {
+                crate::rail::Item::Bucket { bucket, open: true, .. } => Some(*bucket),
+                _ => None,
+            })
+        })
+        .expect("an open bucket");
+    catch_up(cx, &view);
+    view.update(cx, |v, cx| v.toggle_bucket(b, cx));
+    cx.run_until_parked();
+    fluid_frame(cx, w, &view);
+    fluid_frame(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| v.rail_fx.fold.is_some()), "folding");
+    view.update(cx, |v, cx| {
+        v.toggle_fav_session(crate::demo::SID);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    fluid_frame(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| v.rail_fx.fold.is_none()), "the splice ended the fold");
+    fly(cx, w, &view, 400, |_| {});
+    settle(cx, w, 8);
+    assert!(view.read_with(cx, |v, _| v.rail_fx.fold.is_none() && v.rail_fx.offsets.is_empty()), "at rest: nothing offset");
+}
