@@ -1925,6 +1925,7 @@ impl AppView {
                             }
                         }
                         this.find = find;
+                        this.model.deep_wanted(!this.find.is_empty() || this.panels.history_open & Bucket::Older.bit() != 0);
                         cx.notify();
                     }
                 }
@@ -2790,6 +2791,9 @@ impl AppView {
             self.expanded &= !b.bit();
         }
         self.set_panels(p, cx);
+        if b == Bucket::Older {
+            self.model.deep_wanted(open || !self.find.is_empty());
+        }
         if open && b == Bucket::Older {
             for fx in self.model.want_deep() {
                 self.effect(fx);

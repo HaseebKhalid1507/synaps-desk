@@ -261,8 +261,12 @@ pub struct Named {
     pub recent_truncated: bool,
     /// The newest list has landed at least once (HISTORY can be drawn).
     pub recent_loaded: bool,
-    /// The cap has been asked for (OLDER opened, or find used).
+    /// The cap has been asked for (OLDER opened, or find used); dropped
+    /// when neither is so any more, and on connecting (set again from
+    /// [`Named::deep_wanted`]), so refreshes go back to the newest page.
     pub deep: bool,
+    /// OLDER is open or find has text: the cap is what is wanted.
+    pub deep_wanted: bool,
     /// The named list must be asked for too if the newest list is cut:
     /// not listed on this connection yet, a rename, an Open by name.
     named_stale: bool,
@@ -579,6 +583,15 @@ impl Model {
         n.saved_queue.push_front(SavedAsk::Recent(SAVED_SESSIONS_MAX));
         self.pump_saved(&mut effects);
         effects
+    }
+
+    /// OLDER is open or find has text (`wanted`), or neither is any more:
+    /// then later refreshes ask for the newest page only.
+    pub fn deep_wanted(&mut self, wanted: bool) {
+        self.named.deep_wanted = wanted;
+        if !wanted {
+            self.named.deep = false;
+        }
     }
 
     /// `--offline`: the synthetic transport answers `catalog_page` itself.
@@ -1589,6 +1602,7 @@ impl Model {
                     self.named.pages = features.iter().any(|f| f == FEATURE_SESSION_PAGE);
                     self.named.saved_supported = self.named.pages || features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
                     self.named.polled = None;
+                    self.named.deep = self.named.deep_wanted;
                     self.named.named_stale = true;
                     if self.named.saved_supported {
                         self.refresh_saved(&mut effects);
