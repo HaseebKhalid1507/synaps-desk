@@ -3,6 +3,9 @@
 Recorded on bella with `scripts/capture-linux.sh` (a headless gamescope at 144 Hz, x11grab lossless,
 `MESA_VK_WSI_DEBUG=sw`), the `--offline` demo, settings `{"text_size": 16, "theme": <theme>}`. The binaries:
 
+Every run's config is a scratch folder under `~/.cache/q6` (`capture-linux.sh`'s absolute `$out/config`); the real
+`~/.config/synaps-desktop/settings.json` kept its mtime (00:54:01, before the first run) through every run.
+
 - **main** = `0a78bb7` release, built the same way (`dbuild synaps-desktop-q6 build --release --locked -p synaps-desktop`
   at that commit), sha256 `ccea70a2…48bbe`;
 - **Q6** = this branch's release build, sha256 `20f3017f…551080b2`, installed as
