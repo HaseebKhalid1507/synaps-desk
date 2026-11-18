@@ -465,7 +465,7 @@ pub(crate) fn on_beat(beat: crate::motion::Beat, mark: Hsla, ground: Hsla, fx: &
     let el = match beat {
         crate::motion::Beat::Spin(g) => spin(g, None, mark, ground),
         crate::motion::Beat::Breath(_) => breath_box(mark, mark),
-        crate::motion::Beat::Sweep { .. } => div(),
+        crate::motion::Beat::Sweep { .. } | crate::motion::Beat::Orbit => div(),
     };
     let fx = fx.clone();
     el.child(
@@ -563,6 +563,9 @@ pub(crate) struct Sprites;
 
 impl AssetSource for Sprites {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
+        if path.starts_with("life/") {
+            return Ok(life_svg(path).map(|s| Cow::Owned(s.into_bytes())));
+        }
         Ok(parse_cut(path).map(|(g, k)| Cow::Owned(svg_cut(g, k).into_bytes())))
     }
 
@@ -762,15 +765,19 @@ pub(crate) fn foot(st: State) -> (Option<Glyph>, Option<&'static str>, Family) {
 pub(crate) fn call(st: Option<ToolStatus>, waiting: bool, seen: bool) -> (Glyph, Option<&'static str>, Family) {
     match st {
         Some(ToolStatus::Done) => (Glyph::Ok, None, Family::Ok),
-        Some(ToolStatus::Failed) => (Glyph::Failed, Some("failed"), Family::Err),
-        Some(ToolStatus::Denied) => (Glyph::Failed, Some("denied"), Family::Err),
-        Some(ToolStatus::Cancelled) => (Glyph::Cancelled, Some("cancelled"), Family::Warn),
-        // The daemon stopped it at its output limit: neither ok nor failed.
-        Some(ToolStatus::Unknown) => (Glyph::Limit, Some("stopped at limit"), Family::Warn),
-        Some(ToolStatus::Queued) => (Glyph::Idle, Some("queued"), Family::Rest),
-        _ if waiting => (Glyph::Needs, Some("waiting"), Family::Warn),
-        _ if seen => (Glyph::Idle, Some("last seen running"), Family::Rest),
-        _ => (Glyph::Run, Some("running"), Family::Run),
+        // Cards D (cards4/proposal.md §2, §4): sentence-case Sans words; a
+        // failed bash says its exit code instead (`turns::exit_code`).
+        Some(ToolStatus::Failed) => (Glyph::Failed, Some("Failed"), Family::Err),
+        Some(ToolStatus::Denied) => (Glyph::Failed, Some("Denied"), Family::Err),
+        Some(ToolStatus::Cancelled) => (Glyph::Cancelled, Some("Cancelled"), Family::Warn),
+        // The daemon stopped it at its output limit: neither ok nor failed;
+        // its facts say so.
+        Some(ToolStatus::Unknown) => (Glyph::Limit, Some("stopped at output limit"), Family::Warn),
+        Some(ToolStatus::Queued) => (Glyph::Idle, Some("Queued"), Family::Rest),
+        _ if waiting => (Glyph::Needs, Some("Waiting for you"), Family::Warn),
+        _ if seen => (Glyph::Idle, Some("Last seen running"), Family::Rest),
+        // Running says nothing: its orbit and its clock do.
+        _ => (Glyph::Run, None, Family::Run),
     }
 }
 
@@ -808,6 +815,9 @@ pub(crate) fn worker(l: Liveness) -> (Glyph, &'static str, &'static str, Family)
 /// within 1 px of each other, heights never grow down the tally, and the
 /// tools not drawn take no one's colour. Yields (index, top, height), top
 /// to bottom; nothing allocated (K ≤ h/4: a rank is K steps).
+// Cards D folds a run without its bar (C5 bent); kept, with its tests,
+// for the rail pass.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn tally_bar<'a, T>(tally: &'a [T], n: impl Fn(&T) -> usize + 'a, h: u32) -> impl Iterator<Item = (usize, u32, u32)> + 'a {
     let k = tally.len().min(h as usize / 4);
     let drawn = &tally[..k];
@@ -830,6 +840,361 @@ pub(crate) fn tally_bar<'a, T>(tally: &'a [T], n: impl Fn(&T) -> usize + 'a, h: 
         top += s;
         seg
     })
+}
+
+// ── Cards D's life glyphs (cards4/proposal.md §4, §9) ─────────────────────
+
+/// A call's or a worker's state in a card (cards4/proposal.md §4): one
+/// 16 px stroked family, 1.5 px strokes, each its own sprite (rasterized
+/// once per size and scale, batched with the text). The rail and the tabs
+/// keep the braille family above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Life {
+    /// A dotted ring, `dim`.
+    Queued,
+    /// The orbit: an arc lapping a faint ring, `acc` ([`orbit`]).
+    Orbit,
+    /// Not attached: as last seen, the arc held still in `dim`.
+    Seen,
+    /// A tick, `dim` (lit `ok` as it lands live).
+    Done,
+    /// A cross on a 35 % `err` ring.
+    Failed,
+    /// A dash on a `dim` ring: stopped at the output limit.
+    Limit,
+    /// An `acc` dot in an `acc` ring at 55 %.
+    Wait,
+    /// A ring and a slash, `err`.
+    Denied,
+    /// A dash on a 45 % `dim` ring.
+    Cancelled,
+}
+
+impl Life {
+    pub(crate) const ALL: [Life; 9] =
+        [Life::Queued, Life::Orbit, Life::Seen, Life::Done, Life::Failed, Life::Limit, Life::Wait, Life::Denied, Life::Cancelled];
+
+    /// Its index: what [`crate::motion::Motion::change`] remembers.
+    pub(crate) fn code(self) -> u64 {
+        Life::ALL.iter().position(|l| *l == self).unwrap_or(0) as u64
+    }
+
+    pub(crate) fn of_code(c: u64) -> Option<Life> {
+        Life::ALL.get(c as usize).copied()
+    }
+
+    /// Its mark's strokes (the part that writes on), and its ring.
+    fn mark(self) -> Option<Mark> {
+        Some(match self {
+            Life::Done => Mark::Tick,
+            Life::Failed => Mark::Cross,
+            Life::Denied => Mark::Slash,
+            Life::Limit | Life::Cancelled => Mark::Dash,
+            Life::Wait => Mark::Dot,
+            Life::Queued | Life::Orbit | Life::Seen => return None,
+        })
+    }
+}
+
+/// The box every life glyph is drawn in.
+pub(crate) const LIFE: f32 = 16.;
+/// Its ring's radius and stroke.
+const LIFE_R: f32 = 6.;
+const LIFE_STROKE: f32 = 1.5;
+
+/// A life glyph's mark (its strokes cut for the write-on, as [`CUTS`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mark {
+    Tick,
+    Cross,
+    Slash,
+    Dash,
+    Dot,
+}
+
+impl Mark {
+    const ALL: [Mark; 5] = [Mark::Tick, Mark::Cross, Mark::Slash, Mark::Dash, Mark::Dot];
+
+    fn stem(self) -> &'static str {
+        match self {
+            Mark::Tick => "life/tick",
+            Mark::Cross => "life/cross",
+            Mark::Slash => "life/slash",
+            Mark::Dash => "life/dash",
+            Mark::Dot => "life/dot",
+        }
+    }
+
+    fn lines(self) -> &'static [&'static [(f32, f32)]] {
+        match self {
+            Mark::Tick => &[&[(4.5, 8.3), (7., 10.8), (11.5, 5.4)]],
+            Mark::Cross => &[&[(5.6, 5.6), (10.4, 10.4)], &[(10.4, 5.6), (5.6, 10.4)]],
+            // Ring to ring at 45°.
+            Mark::Slash => &[&[(3.76, 12.24), (12.24, 3.76)]],
+            Mark::Dash => &[&[(5., 8.), (11., 8.)]],
+            Mark::Dot => &[],
+        }
+    }
+}
+
+/// The sprite paths, built once: `life/ring.svg`, `life/dots.svg`, the
+/// arc at each whole percent of the turn (`life/arc~N.svg`, 1..=100), each
+/// mark at each cut (`life/tick~k.svg`, `k` 1..=CUTS), and the ping's ring
+/// at each half pixel of its radius (`life/ping~R.svg`, `R` 12..=22, in a
+/// 24 px box).
+struct LifePaths {
+    arcs: Vec<SharedString>,
+    marks: Vec<Vec<SharedString>>,
+    pings: Vec<SharedString>,
+}
+
+static LIFE_PATHS: std::sync::LazyLock<LifePaths> = std::sync::LazyLock::new(|| LifePaths {
+    arcs: (1..=100).map(|n| SharedString::from(format!("life/arc~{n}.svg"))).collect(),
+    marks: Mark::ALL.iter().map(|m| (1..=CUTS).map(|k| SharedString::from(format!("{}~{k}.svg", m.stem()))).collect()).collect(),
+    pings: (PING_FROM..=PING_TO).map(|r| SharedString::from(format!("life/ping~{r}.svg"))).collect(),
+});
+
+/// The ping's ring, in half pixels of its radius: 6 → 11 (§8 #7).
+const PING_FROM: u32 = 12;
+const PING_TO: u32 = 22;
+const PING_BOX: f32 = 24.;
+
+const RING: &str = "life/ring.svg";
+const DOTTED: &str = "life/dots.svg";
+
+/// The arc `len` (turns) long: its sprite, at a whole percent (none under 1 %).
+fn arc_path(len: f32) -> Option<SharedString> {
+    let n = (len * 100.).round().clamp(0., 100.) as usize;
+    (n > 0).then(|| LIFE_PATHS.arcs[n - 1].clone())
+}
+
+fn mark_path(m: Mark, k: u32) -> Option<SharedString> {
+    let i = Mark::ALL.iter().position(|x| *x == m)?;
+    (k > 0).then(|| LIFE_PATHS.marks[i][(k.min(CUTS) - 1) as usize].clone())
+}
+
+/// A life sprite's SVG, written from the table above.
+fn life_svg(path: &str) -> Option<String> {
+    let (s, w) = (LIFE, LIFE_STROKE);
+    let head = |size: f32| format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 {size} {size}">"#);
+    let c = LIFE / 2.;
+    let body = match path {
+        RING => format!(r##"<circle cx="{c}" cy="{c}" r="{LIFE_R}" fill="none" stroke="#000" stroke-width="{w}"/>"##),
+        DOTTED => format!(r##"<circle cx="{c}" cy="{c}" r="{LIFE_R}" fill="none" stroke="#000" stroke-width="{w}" stroke-dasharray="1.4 1.74"/>"##),
+        _ => {
+            let (stem, k) = path.strip_suffix(".svg")?.rsplit_once('~')?;
+            let k: u32 = k.parse().ok()?;
+            match stem {
+                "life/arc" if (1..=100).contains(&k) => {
+                    if k == 100 {
+                        format!(r##"<circle cx="{c}" cy="{c}" r="{LIFE_R}" fill="none" stroke="#000" stroke-width="{w}"/>"##)
+                    } else {
+                        let a = k as f32 / 100. * std::f32::consts::TAU;
+                        let (x, y) = (c + LIFE_R * a.sin(), c - LIFE_R * a.cos());
+                        let large = u8::from(k > 50);
+                        format!(
+                            r##"<path d="M{c} {} A{LIFE_R} {LIFE_R} 0 {large} 1 {:.3} {:.3}" fill="none" stroke="#000" stroke-width="{w}" stroke-linecap="round"/>"##,
+                            c - LIFE_R,
+                            x,
+                            y
+                        )
+                    }
+                }
+                "life/ping" if (PING_FROM..=PING_TO).contains(&k) => {
+                    let c = PING_BOX / 2.;
+                    return Some(format!(
+                        r##"{}<circle cx="{c}" cy="{c}" r="{}" fill="none" stroke="#000" stroke-width="{w}"/></svg>"##,
+                        head(PING_BOX),
+                        k as f32 / 2.
+                    ));
+                }
+                _ => {
+                    let m = Mark::ALL.into_iter().find(|m| m.stem() == stem)?;
+                    if !(1..=CUTS).contains(&k) {
+                        return None;
+                    }
+                    if m == Mark::Dot {
+                        format!(r##"<circle cx="{c}" cy="{c}" r="{}" fill="#000"/>"##, 2.5 * k as f32 / CUTS as f32)
+                    } else {
+                        format!(r##"<path d="{}" fill="none" stroke="#000" stroke-width="{w}" stroke-linecap="round" stroke-linejoin="round"/>"##, cut_lines(m.lines(), k))
+                    }
+                }
+            }
+        }
+    };
+    Some(format!("{}{body}</svg>", head(s)))
+}
+
+/// Polylines drawn to `k / CUTS` of their whole length, in order: an SVG path.
+fn cut_lines(lines: &[&[(f32, f32)]], k: u32) -> String {
+    let seg = |a: (f32, f32), b: (f32, f32)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    let total: f32 = lines.iter().map(|pts| pts.windows(2).map(|w| seg(w[0], w[1])).sum::<f32>()).sum();
+    let mut left = total * k.min(CUTS) as f32 / CUTS as f32;
+    let mut d = String::new();
+    for pts in lines {
+        if left <= 1e-4 {
+            break;
+        }
+        let _ = write!(d, "M{} {}", pts[0].0, pts[0].1);
+        for w in pts.windows(2) {
+            let l = seg(w[0], w[1]);
+            if left >= l - 1e-4 {
+                let _ = write!(d, "L{} {}", w[1].0, w[1].1);
+                left -= l;
+            } else {
+                let t = left / l;
+                let _ = write!(d, "L{:.2} {:.2}", w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t);
+                left = 0.;
+                break;
+            }
+        }
+    }
+    d
+}
+
+/// A sprite filling the 16 px box, in `color`.
+fn sprite16(path: impl Into<SharedString>, color: Hsla) -> Svg {
+    svg().path(path).absolute().top_0().left_0().size(px(LIFE)).text_color(color)
+}
+
+/// What a life glyph is painted in (§4), on `ground` (the row's fill):
+/// its ring (none for queued, done and the orbit's own track) and its mark.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LifeInk {
+    pub(crate) ring: Option<Hsla>,
+    pub(crate) mark: Hsla,
+}
+
+/// A life glyph's colours (§4): `dim`, `err` and `acc` on the card's ground.
+pub(crate) fn life_ink(l: Life, ground: Hsla, p: &Palette) -> LifeInk {
+    use crate::motion::mix;
+    let (ring, mark) = match l {
+        Life::Queued | Life::Seen => (None, p.dim_t),
+        Life::Orbit => (Some(mix(ground, p.dim_t, 0.28)), p.acc),
+        Life::Done => (None, p.dim_t),
+        Life::Failed => (Some(mix(ground, p.err, 0.35)), p.err),
+        Life::Limit => (Some(p.dim_t), p.dim_t),
+        Life::Wait => (Some(mix(ground, p.acc, 0.55)), p.acc),
+        Life::Denied => (Some(p.err), p.err),
+        Life::Cancelled => (Some(mix(ground, p.dim_t, 0.45)), p.dim_t),
+    };
+    LifeInk { ring, mark }
+}
+
+/// A life glyph at rest (§4): its ring and its whole mark, or the dotted
+/// ring, or the arc held still ([`crate::motion::ORBIT_STILL`]).
+pub(crate) fn life(l: Life, ink: LifeInk) -> Div {
+    life_at(l, ink, 1., 1.)
+}
+
+/// A life glyph with its ring at `ring` (0..1 of its colour, from the
+/// ground: the caller mixes) and its mark drawn to `p` (the write-on: 0..1
+/// of its strokes; the dot grows).
+pub(crate) fn life_at(l: Life, ink: LifeInk, ring: f32, p: f32) -> Div {
+    let el = div().relative().flex_none().size(px(LIFE)).debug_selector(move || format!("life-{l:?}"));
+    match l {
+        Life::Queued => el.child(sprite16(DOTTED, ink.mark)),
+        Life::Orbit | Life::Seen => el
+            .children(ink.ring.map(|c| sprite16(RING, c)))
+            .children(arc_path(crate::motion::ORBIT_STILL).map(|a| sprite16(a, ink.mark))),
+        _ => {
+            let k = ((p * CUTS as f32).ceil() as u32).min(CUTS);
+            el.children(ink.ring.filter(|_| ring > 0.).map(|c| sprite16(RING, c)))
+                .children(l.mark().and_then(|m| mark_path(m, k)).map(|m| sprite16(m, ink.mark)))
+        }
+    }
+}
+
+/// An arc `len` turns long, starting `start` turns from twelve o'clock: the
+/// arc's sprite turned (no path: a GPUI path costs a full-window MSAA pass).
+pub(crate) fn arc(start: f32, len: f32, color: Hsla) -> Option<Svg> {
+    Some(sprite16(arc_path(len)?, color).with_transformation(Transformation::rotate(radians(start * std::f32::consts::TAU))))
+}
+
+/// The ring closing over the arc, `p` (0..1) of the way from `len`: the
+/// success transition's first beat (§8 #5).
+pub(crate) fn closing(start: f32, len: f32, p: f32, color: Hsla) -> Option<Svg> {
+    arc(start * (1. - p), len + (1. - len) * p, color)
+}
+
+/// The running orbit (§4, §8 #2, #3): the faint track, and the arc lapping
+/// it on the 30 Hz grid. `grow`: the arc's growth from nothing as the call
+/// starts (0..1). With a beat layer and ambient on, the arc is the layer's
+/// (the frame draws the track and records the site); without one, the
+/// frame draws it (and asks for the next tick). Reduced, Off, low power:
+/// the still arc, no frames.
+pub(crate) fn orbit(fx: &std::rc::Rc<crate::motion::Motion>, ink: LifeInk, grow: f32) -> Div {
+    #[cfg(test)]
+    if fx.no_orbit.get() {
+        // Tests of the 8 Hz beat alone: the rail's spinner in its place.
+        return div().flex().flex_none().size(px(LIFE)).items_center().justify_center().child(spinning(fx, Glyph::Run, ink.mark, ink.mark));
+    }
+    let el = div().relative().flex_none().size(px(LIFE)).debug_selector(|| "life-Orbit".into()).children(ink.ring.map(|c| sprite16(RING, c)));
+    if grow >= 1. && fx.layered() {
+        let (fx, mark) = (fx.clone(), ink.mark);
+        return el.child(
+            canvas(
+                |_, _, _| {},
+                move |b, _, window, _| {
+                    fx.site(crate::motion::Site { origin: b.origin, mask: window.content_mask(), mark, ground: mark, beat: crate::motion::Beat::Orbit })
+                },
+            )
+            .absolute()
+            .inset_0(),
+        );
+    }
+    let (start, len) = fx.orbit().unwrap_or((0., crate::motion::ORBIT_STILL));
+    el.children(arc(start, len * grow.clamp(0., 1.), ink.mark))
+}
+
+/// The beat layer's orbit (§9): the arc's sprite at `origin`, turned.
+pub(crate) fn paint_arc(window: &mut Window, cx: &App, origin: Point<Pixels>, (start, len): (f32, f32), color: Hsla) {
+    let Some(path) = arc_path(len) else { return };
+    let bounds = Bounds::new(origin, size(px(LIFE), px(LIFE)));
+    let s = window.scale_factor();
+    let c = bounds.center();
+    let m = TransformationMatrix::unit().translate(c.scale(s)).rotate(radians(start * std::f32::consts::TAU)).translate(c.scale(-s));
+    let _ = window.paint_svg(bounds, path, None, m, color, cx);
+}
+
+/// The ping (§8 #7, #8): a ring going out from the glyph's centre, `p`
+/// (0..1) of the way, r 6 → 11, its colour `0.7 → 0` of the way off the
+/// ground. Absolute, centred on the 16 px box (it overflows it).
+pub(crate) fn ping(p: f32, color: Hsla, ground: Hsla) -> Svg {
+    let r = (PING_FROM as f32 + (PING_TO - PING_FROM) as f32 * p).round() as u32;
+    let path = LIFE_PATHS.pings[(r.clamp(PING_FROM, PING_TO) - PING_FROM) as usize].clone();
+    let off = (LIFE - PING_BOX) / 2.;
+    svg().path(path).absolute().left(px(off)).top(px(off)).size(px(PING_BOX)).text_color(crate::motion::mix(ground, color, 0.7 * (1. - p)))
+}
+
+/// A call's life glyph (§4) from its status: `waiting` on a prompt, `seen`
+/// (not attached: a call not ended is as last seen).
+pub(crate) fn life_of_call(st: Option<ToolStatus>, waiting: bool, seen: bool) -> Life {
+    match st {
+        Some(ToolStatus::Done) => Life::Done,
+        Some(ToolStatus::Failed) => Life::Failed,
+        Some(ToolStatus::Denied) => Life::Denied,
+        Some(ToolStatus::Cancelled) => Life::Cancelled,
+        Some(ToolStatus::Unknown) => Life::Limit,
+        Some(ToolStatus::Queued) => Life::Queued,
+        _ if waiting => Life::Wait,
+        _ if seen => Life::Seen,
+        _ => Life::Orbit,
+    }
+}
+
+/// A worker's life glyph (§4, a spawn row and a chip).
+pub(crate) fn life_of_worker(l: Liveness) -> Life {
+    match l {
+        Liveness::Started => Life::Queued,
+        Liveness::Running => Life::Orbit,
+        Liveness::Cancelling => Life::Orbit,
+        Liveness::Done => Life::Done,
+        Liveness::Failed => Life::Failed,
+        Liveness::Cancelled => Life::Cancelled,
+        Liveness::TimedOut => Life::Limit,
+        Liveness::LastSeen | Liveness::Gone => Life::Seen,
+    }
 }
 
 #[cfg(test)]
@@ -1004,16 +1369,29 @@ mod tests {
     fn calls_map_to_one_glyph_word_and_family() {
         use ToolStatus as S;
         let c = |st, waiting, seen| call(st, waiting, seen);
+        // Cards D (cards4/proposal.md §2, §4, an intended change): the
+        // words in sentence case, running silent (its orbit and clock say it).
         assert_eq!(c(Some(S::Done), false, false), (Glyph::Ok, None, Family::Ok));
-        assert_eq!(c(Some(S::Failed), false, false), (Glyph::Failed, Some("failed"), Family::Err));
-        assert_eq!(c(Some(S::Denied), true, false), (Glyph::Failed, Some("denied"), Family::Err), "ended: a prompt no longer waits on it");
-        assert_eq!(c(Some(S::Cancelled), false, false), (Glyph::Cancelled, Some("cancelled"), Family::Warn));
-        assert_eq!(c(Some(S::Unknown), false, false), (Glyph::Limit, Some("stopped at limit"), Family::Warn));
-        assert_eq!(c(Some(S::Queued), false, false), (Glyph::Idle, Some("queued"), Family::Rest));
-        assert_eq!(c(Some(S::Running), true, false), (Glyph::Needs, Some("waiting"), Family::Warn));
-        assert_eq!(c(None, true, true), (Glyph::Needs, Some("waiting"), Family::Warn));
-        assert_eq!(c(Some(S::Running), false, true), (Glyph::Idle, Some("last seen running"), Family::Rest));
-        assert_eq!(c(Some(S::Streaming), false, false), (Glyph::Run, Some("running"), Family::Run));
+        assert_eq!(c(Some(S::Failed), false, false), (Glyph::Failed, Some("Failed"), Family::Err));
+        assert_eq!(c(Some(S::Denied), true, false), (Glyph::Failed, Some("Denied"), Family::Err), "ended: a prompt no longer waits on it");
+        assert_eq!(c(Some(S::Cancelled), false, false), (Glyph::Cancelled, Some("Cancelled"), Family::Warn));
+        assert_eq!(c(Some(S::Unknown), false, false), (Glyph::Limit, Some("stopped at output limit"), Family::Warn));
+        assert_eq!(c(Some(S::Queued), false, false), (Glyph::Idle, Some("Queued"), Family::Rest));
+        assert_eq!(c(Some(S::Running), true, false), (Glyph::Needs, Some("Waiting for you"), Family::Warn));
+        assert_eq!(c(None, true, true), (Glyph::Needs, Some("Waiting for you"), Family::Warn));
+        assert_eq!(c(Some(S::Running), false, true), (Glyph::Idle, Some("Last seen running"), Family::Rest));
+        assert_eq!(c(Some(S::Streaming), false, false), (Glyph::Run, None, Family::Run));
+        // One life glyph each (§4), a worker's too.
+        use super::{Life, life_of_call, life_of_worker};
+        let lives: Vec<Life> = [Some(S::Done), Some(S::Failed), Some(S::Denied), Some(S::Cancelled), Some(S::Unknown), Some(S::Queued)]
+            .into_iter()
+            .map(|s| life_of_call(s, false, false))
+            .chain([life_of_call(Some(S::Running), true, false), life_of_call(Some(S::Running), false, true), life_of_call(Some(S::Running), false, false)])
+            .collect();
+        assert_eq!(lives, [Life::Done, Life::Failed, Life::Denied, Life::Cancelled, Life::Limit, Life::Queued, Life::Wait, Life::Seen, Life::Orbit]);
+        assert_eq!(life_of_worker(Liveness::Running), Life::Orbit);
+        assert_eq!(life_of_worker(Liveness::Done), Life::Done);
+        assert_eq!(life_of_worker(Liveness::Failed), Life::Failed);
     }
 
     /// A worker's states: one glyph each (started and last seen share the

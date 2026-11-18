@@ -28,6 +28,7 @@ mod app;
 mod authorize;
 mod beat;
 mod bench;
+mod cards;
 mod chart;
 mod chrome;
 mod dash;

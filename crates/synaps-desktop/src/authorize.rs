@@ -29,10 +29,9 @@ use gpui_kit::*;
 use synaps_client::protocol::PromptRequest;
 use synaps_client::transcript::{Item, ToolStatus};
 
-use crate::app::{ARM, AppView, Arm, Fill, YES_KEY, authorize_ready, display, fbtn_charge, fbtn_key, hidden, lines_below, mono, tbtn};
+use crate::app::{ARM, AppView, Arm, authorize_ready, hidden, lines_below, mono};
 use crate::fonts::TextPx as _;
-use crate::fonts::{self, label};
-use crate::glyph;
+use crate::fonts;
 use crate::model::{CONFIRM_NO, Model};
 use crate::theme::{Metrics, Palette};
 use crate::turns::{Disp, Kind};
@@ -41,13 +40,12 @@ use crate::turns::{Disp, Kind};
 /// `DAY_ID` is `1 << 63`).
 pub(crate) const PROMPT_ID: u64 = 1 << 61;
 
-/// The key that allows, as the button shows it.
-pub(crate) const ALLOW_KEY: &str = if cfg!(target_os = "macos") { "⌘ ↵" } else { "ctrl ↵" };
-
-/// The dashes along the card's top edge (F7): 8 on, 4 off, 2 px.
+/// The dashes along the card's top edge (F7): 8 on, 4 off.
+// Q2's, kept while its tests stand: Cards D retires them (cards4/proposal.md §5, C13).
+#[cfg_attr(not(test), allow(dead_code))]
 const DASH: f32 = 8.;
+#[cfg_attr(not(test), allow(dead_code))]
 const DASH_GAP: f32 = 4.;
-const DASH_H: f32 = 2.;
 /// The allow-all box (drawn: 1 px frame, a 6×6 square when checked).
 const CHECK: f32 = 12.;
 const CHECK_IN: f32 = 6.;
@@ -217,6 +215,8 @@ pub(crate) struct CardExit {
     /// Where its height lands: 0, or a receipt line's.
     pub(crate) to: f32,
     pub(crate) sink: Rc<Cell<f32>>,
+    /// How it was answered (its button shows pressed as it folds).
+    pub(crate) answer: Answer,
 }
 
 impl CardExit {
@@ -382,7 +382,7 @@ pub(crate) fn guard_shape(pr: &PromptRequest) -> Option<Guard> {
 /// already says it, so the meta never reads `denied denied 14:22` or
 /// `cancelled cancelled 19:20`.
 pub(crate) fn status_beside(word: Option<&'static str>, receipt: Option<Answer>) -> Option<&'static str> {
-    word.filter(|w| receipt.is_none_or(|a| Receipt::word(a) != *w))
+    word.filter(|w| receipt.is_none_or(|a| !Receipt::word(a).eq_ignore_ascii_case(w)))
 }
 
 /// The header's right: `bash · guard · asked 14:21`, from the scope's tool
@@ -624,9 +624,12 @@ impl AppView {
         let words = self.receipt_words(r, r.answer_for(status), running, p);
         let row = r.row;
         // The meta's 8 px gap is the separator's first space.
+        // Cards D: the facts' dot before it (cards4/proposal.md §3).
         Some(if after {
             h_flex()
-                .child(div().debug_selector(move || format!("receipt-sep {row}")).text_color(p.dim_t).child("· "))
+                .gap(px(6.))
+                .items_center()
+                .child(crate::cards::dot(p).debug_selector(move || format!("receipt-sep {row}")))
                 .child(words)
                 .into_any_element()
         } else {
@@ -647,15 +650,26 @@ impl AppView {
         let word = Receipt::word(answer);
         let k = self.fx.shot(Some(r.landed), Duration::ZERO, crate::motion::QUICK, &crate::motion::ease::OUT, crate::motion::Kind::Fade);
         let lift = crate::motion::LIFT + (1. - crate::motion::LIFT) * k;
-        let word_color = if answer == Answer::Denied { p.err } else { p.dim_t };
+        // Cards D (cards4/proposal.md §8 #9): an Allow's receipt is lit in
+        // the accent as it lands and decays to `dim` (`glow` from +240); a
+        // Deny's stays `err`.
+        let lit = self.fx.decay(Some(r.landed + Duration::from_millis(240)), Duration::ZERO, crate::motion::GLOW);
+        let rest_color = crate::motion::mix(p.dim_t, p.acc, lit);
+        let word_color = if answer == Answer::Denied { p.err } else { rest_color };
         let row = r.row;
+        // Sentence case: "Allowed 08:31 · 2s", "Denied 14:22".
+        let shown: SharedString = {
+            let mut c = word.chars();
+            c.next().map(|f| f.to_uppercase().chain(c).collect::<String>()).unwrap_or_default().into()
+        };
         crate::motion::lift(
             h_flex()
                 .debug_selector(move || format!("receipt {row}"))
                 .flex_none()
                 .whitespace_nowrap()
-                .child(div().debug_selector(move || format!("receipt-word {row} {word}")).text_color(word_color).child(word))
-                .child(div().text_color(p.dim_t).child(SharedString::from(rest))),
+                .font_family(fonts::SANS)
+                .child(div().debug_selector(move || format!("receipt-word {row} {word}")).text_color(word_color).child(shown))
+                .child(div().text_color(if answer == Answer::Denied { p.err } else { rest_color }).child(SharedString::from(rest))),
             lift,
         )
     }
@@ -703,8 +717,7 @@ impl AppView {
     /// listener, its state as it was); `None`: the live card.
     fn render_card(&self, c: &PromptCard, look: Option<&CardLook>, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> Stateful<Div> {
         let r = m.r;
-        let pad = (16. * r).round();
-        let live = look.is_none();
+            let live = look.is_none();
         let pr = &c.pr;
         let secret = c.secret;
         let sent = live && self.model.prompt_answered(pr.id);
@@ -716,18 +729,87 @@ impl AppView {
         let detached = self.model.active.is_none();
         let in_field = look.map_or(keys_state == Some(true), |l| l.in_field);
         let keys = look.map_or_else(|| keys_state.is_some() && can && c.keys_armed(), |l| l.keys);
-        let key_hint = |k: &'static str| mono(k, m.meta, p.dim_k).flex_none();
         let typed = look.map_or_else(|| secret && !self.secret_input.read(cx).value().is_empty(), |l| l.typed);
         let key = live.then_some(c.key);
         let offered = look.map_or_else(|| self.allow_all_offered(), |l| l.offered);
         let allow_all = offered && c.allow_all;
+        // Cards D's buttons (cards4/proposal.md §5): Deny a ghost (`card_d`
+        // in a `line` edge), Allow the accent ([`ALLOW_STYLE`]), each with
+        // its key at 72 %. Pressed (the collapse's first 90 ms, §8 #9): down
+        // `PRESS`, Allow's fill 18 % toward the ink, Deny's `hover`.
+        let pressed = look.and_then(|_| self.card_exit.as_ref().filter(|e| e.card.row == c.row)).and_then(|e| {
+            (self.fx.on() && self.fx.now().saturating_duration_since(e.at) < crate::motion::exit(crate::motion::QUICK)).then(|| {
+                self.fx.want_at(e.at + crate::motion::exit(crate::motion::QUICK));
+                e.answer
+            })
+        });
+        let tight = self.layout.tight;
+        let key_hint = |k: &'static str, color: Hsla, ground: Hsla| {
+            div().flex_none().font_family(fonts::SANS).text_px(m.meta).text_color(crate::motion::mix(ground, color, 0.72)).child(k)
+        };
+        let ghost = |id: &'static str, text: &'static str, key: Option<&'static str>, enabled: bool, down: bool| {
+            let fg = if enabled { p.ink } else { p.dim_k };
+            let bg = if down { p.hover } else { p.card_d };
+            h_flex()
+                .id(id)
+                .relative()
+                .when(down, |d| d.top(px(crate::motion::PRESS)))
+                .flex_none()
+                .h(px(crate::fit::button_h(m)))
+                .px(px(12.))
+                .gap(px(8.))
+                .items_center()
+                .rounded(px(5.))
+                .border_1()
+                .border_color(p.line)
+                .bg(bg)
+                .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(p.hover)))
+                .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(fg).child(text))
+                .children(key.map(|k| key_hint(k, fg, bg)))
+        };
+        let allow_btn = |id: &'static str, text: &'static str, key: Option<&'static str>, enabled: bool, charge: Option<u32>, down: bool| {
+            let (bg, edge, fg) = ALLOW_STYLE.colors(p, false, down);
+            let (hi, _, _) = ALLOW_STYLE.colors(p, true, false);
+            let (bg, edge, fg) = if enabled || down { (bg, edge, fg) } else { (p.card_d, p.line, p.dim_k) };
+            let lit = ALLOW_STYLE.colors(p, false, false).0;
+            h_flex()
+                .id(id)
+                .relative()
+                .when(down, |d| d.top(px(crate::motion::PRESS)))
+                .flex_none()
+                .h(px(crate::fit::button_h(m)))
+                .px(px(14.))
+                .gap(px(8.))
+                .items_center()
+                .rounded(px(5.))
+                .overflow_hidden()
+                .border_1()
+                .border_color(edge)
+                .bg(bg)
+                .when(enabled, |d| d.cursor_pointer().hover(move |d| d.bg(hi).border_color(if ALLOW_STYLE == crate::cards::AllowStyle::Fill { hi } else { edge })))
+                // The arm's charge (motion.md §6.3): ten cells of the fill
+                // lit left to right along the foot, as before.
+                .children(charge.filter(|_| !enabled).map(|n| {
+                    h_flex()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(3.))
+                        .gap(px(1.))
+                        .children((0..10).map(move |i| div().flex_1().h_full().when(i < n, |d| d.bg(lit))))
+                }))
+                .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(fg).child(text))
+                .children(key.map(|k| key_hint(k, fg, bg)))
+                .debug_selector(move || if ALLOW_STYLE == crate::cards::AllowStyle::Fill { "allow-fill".into() } else { "allow-outline".into() })
+        };
         let actions =
             if detached {
                 None
             } else if secret {
                 Some(
                     h_flex()
-                        .gap(px(24.))
+                        .gap(px(12.))
                         .items_center()
                         .child(
                             h_flex()
@@ -741,34 +823,22 @@ impl AppView {
                                         gpui_kit::component::input::Input::new(&self.secret_input)
                                             .disabled(!can)
                                             .text_px(m.mono)
-                                            .border_color(p.frame),
+                                            .border_color(p.line),
                                     ),
-                                )
-                                // Ctrl/Cmd+Enter takes the keys into the field.
-                                .when(keys && !in_field, |d| d.child(key_hint(YES_KEY))),
+                                ),
                         )
+                        .child(ghost("p-cancel", "Cancel", keys.then_some("Esc"), can, pressed == Some(Answer::Cancelled)).when(
+                            live && can,
+                            |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx))),
+                        ))
                         .child(
-                            h_flex()
-                                .gap(px(8.))
-                                .items_center()
-                                .child(
-                                    tbtn("p-cancel", label::CANCEL, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
-                                        .text_px(m.label)
-                                        .when(live && can, |d| {
-                                            d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx)))
-                                        }),
-                                )
-                                .when(keys, |d| d.child(key_hint("esc"))),
-                        )
-                        .child(
-                            fbtn_key(
+                            allow_btn(
                                 "p-submit",
-                                label::SUBMIT,
-                                (in_field && can && typed).then_some(if cfg!(target_os = "macos") { "↵" } else { "enter" }),
+                                "Submit",
+                                (in_field && can && typed).then_some(if cfg!(target_os = "macos") { "↵" } else { "Enter" }),
                                 can && typed,
-                                Fill::Warn,
-                                p,
-                                m,
+                                None,
+                                pressed == Some(Answer::Provided),
                             )
                             .when(live && can && typed, |d| {
                                 d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(true, window, cx)))
@@ -793,37 +863,38 @@ impl AppView {
                         }
                         n
                     });
+                let allow_key = if cfg!(target_os = "macos") { "⌘ ↵" } else { "Ctrl ↵" };
                 Some(
                     h_flex()
-                        .gap(px(24.))
+                        .gap(px(8.))
                         .items_center()
-                        .child(
-                            h_flex()
-                                .gap(px(8.))
-                                .items_center()
-                                .child(
-                                    tbtn("p-no", label::DENY, if can { p.err_k } else { p.dim_k }, if can { p.ink } else { p.dim_k })
-                                        .text_px(m.label)
-                                        .when_some(key.filter(|_| can), |d, key| {
-                                            d.on_click(cx.listener(move |this, _, _, cx| {
-                                                this.answer(key, Some(CONFIRM_NO.into()));
-                                                cx.notify();
-                                            }))
-                                        }),
-                                )
-                                .when(keys, |d| d.child(key_hint("esc"))),
-                        )
+                        .child(ghost("p-no", "Deny", keys.then_some("Esc"), can, pressed == Some(Answer::Denied)).when_some(
+                            key.filter(|_| can),
+                            |d, key| {
+                                d.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.answer(key, Some(CONFIRM_NO.into()));
+                                    cx.notify();
+                                }))
+                            },
+                        ))
                         // Clickable whenever the card may be answered: the read
                         // gate is checked at the click (as the keys do), not by
                         // this frame, laid out with the last one's bounds.
                         .child(
-                            fbtn_charge("p-yes", label::ALLOW, (keys && yes).then_some(ALLOW_KEY), yes, charge, Fill::Warn, p, m)
-                                .when_some(key.filter(|_| can), |d, key| {
-                                    d.on_click(cx.listener(move |this, _, _, cx| {
-                                        this.authorize(key);
-                                        cx.notify();
-                                    }))
-                                }),
+                            allow_btn(
+                                "p-yes",
+                                "Allow",
+                                (keys && yes).then_some(allow_key),
+                                yes,
+                                charge,
+                                matches!(pressed, Some(Answer::Allowed | Answer::AllowedAll)),
+                            )
+                            .when_some(key.filter(|_| can), |d, key| {
+                                d.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.authorize(key);
+                                    cx.notify();
+                                }))
+                            }),
                         ),
                 )
             };
@@ -859,9 +930,9 @@ impl AppView {
         if live {
             *self.card_look.borrow_mut() = CardLook { can, ready, keys, in_field, typed, footer: footer.clone(), footer_warn, offered };
         }
-        // The well: a guard's command alone, its `$` in `you`; else the
-        // whole body, verbatim. Up to the form's most lines, the rest
-        // scrolls (and ALLOW waits for its end).
+        // The command strip (§5): a guard's command alone, `$` in `dim`;
+        // else the whole body, verbatim. Up to the form's most lines, the
+        // rest scrolls (and Allow waits for its end).
         // As many whole lines as the window has room for beside the
         // composer (fit.rs: from 3, fewer if the text has fewer, to the
         // form's most), so the whole card fits the list's view.
@@ -881,7 +952,7 @@ impl AppView {
         let text: AnyElement = match &c.guard {
             Some(g) => h_flex()
                 .items_start()
-                .child(div().flex_none().text_color(p.you).child("$ "))
+                .child(div().flex_none().text_color(p.dim_t).child("$ "))
                 .child(div().min_w_0().child(g.command.clone()))
                 .into_any_element(),
             None => div().child(c.body.clone()).into_any_element(),
@@ -905,95 +976,73 @@ impl AppView {
                 b.bottom = Some(px(well_pad).into());
                 d
             })
-            .border_color(p.canvas)
-            .bg(p.canvas)
+            .border_color(p.well_d)
+            .bg(p.well_d)
             .font_family(fonts::MONO)
             .text_px(m.mono)
             .line_height(px(m.code_line))
-            .text_color(p.well_fg)
+            .text_color(p.ink)
             .child(text);
-        // Collapsing, it holds still: no breath (the beat layer's, painted
-        // over the app's frame, would show through the clip).
-        let g = crate::turns::live_glyph(&self.fx, glyph::Glyph::Needs, p.warn_mark, p.card, None, self.card_at.filter(|_| live), false);
-        // Its frame traces from the top-left corner: one stroke along the
-        // top and down the right, one down the left and along the bottom,
-        // meeting after `base` (paint only, over its 1 px border).
-        let trace = if live {
-            self.fx.shot(self.card_at, Duration::ZERO, crate::motion::BASE, &crate::motion::ease::INOUT, crate::motion::Kind::Spatial)
-        } else {
-            1.
+        // The card asks once (§8 #8): its flush, 12 % of the accent off the
+        // card, and its header dot's one ping, from +60 over `sig`; then
+        // still until answered. Collapsing, as its last frame.
+        let arrived = self.card_at.filter(|_| live);
+        let flush = self.fx.decay(arrived.map(|a| a + 2 * crate::motion::STAGGER), Duration::ZERO, crate::motion::SIG);
+        let ping = self.fx.ping(arrived, 2 * crate::motion::STAGGER);
+        let card_bg = crate::motion::mix(p.card_d, p.acc, 0.12 * flush);
+        let dot = div()
+            .relative()
+            .flex_none()
+            .size(px(16.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(div().size(px(6.)).rounded(px(3.)).bg(p.acc))
+            .children(ping.map(|k| crate::glyph::ping(k, p.acc, card_bg)))
+            .debug_selector(|| "card-dot".into());
+        let title = match (secret, &c.guard) {
+            (true, _) => "Provide a secret?",
+            (false, Some(_)) => "Run this command?",
+            (false, None) => "Allow this?",
         };
-        let warn_mark = p.warn_mark;
-        let tracer = (trace < 1.).then(|| {
-            canvas(
-                |_, _, _| {},
-                move |b, _, window, _| {
-                    let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
-                    let l = trace * (w + h);
-                    let line =
-                        |x: f32, y: f32, ww: f32, hh: f32| Bounds::new(point(b.origin.x + px(x), b.origin.y + px(y)), size(px(ww), px(hh)));
-                    let mut q = |r: Bounds<Pixels>| window.paint_quad(fill(r, warn_mark));
-                    q(line(0., 0., l.min(w), 1.));
-                    q(line(w - 1., 0., 1., (l - w).clamp(0., h)));
-                    q(line(0., 0., 1., l.min(h)));
-                    q(line(0., h - 1., (l - h).clamp(0., w), 1.));
-                },
-            )
-            .absolute()
-            .top(px(-1.))
-            .left(px(-1.))
-            .right(px(-1.))
-            .bottom(px(-1.))
-        });
-        // The dashes (F7): static quads along the top edge, inside the
-        // frame, laid behind the trace's top stroke as it passes (all at
-        // once they read as a second arrival, finish gate of #18).
-        let dashes = (trace > 0.).then(|| {
-            canvas(
-                |_, _, _| {},
-                move |b, _, window, _| {
-                    let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
-                    // The stroke's head, in this layer's x (the tracer is the
-                    // card's size and 1 px out on every side).
-                    let head = if trace >= 1. { f32::INFINITY } else { trace * (w + 2. + h + 2.) - 1. };
-                    for (x, dw) in dash_spans(w, head) {
-                        window.paint_quad(fill(Bounds::new(point(b.origin.x + px(x), b.origin.y), size(px(dw), px(DASH_H))), warn_mark));
-                    }
-                },
-            )
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .bottom_0()
-        });
-        let head = if secret { label::SECRET } else { label::AUTHORIZE };
         let header = h_flex()
             .flex_none()
-            .pt(px((12. * r).round()))
-            .px(px(pad))
-            .gap(px(12.))
+            .gap(px(8.))
             .items_center()
-            .child(g)
-            .child(display(head, fonts::size::D_M, p.warn_k).flex_none())
+            .child(dot)
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(fonts::SANS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_px(m.card_title)
+                    .text_color(p.ink)
+                    .debug_selector(|| "card-title".into())
+                    .child(title),
+            )
             .child(div().flex_1())
-            .children(
-                c.asked
-                    .clone()
-                    .filter(|_| !self.layout.tight)
-                    .map(|a| mono(a, m.meta, p.dim_k).min_w_0().overflow_hidden().text_ellipsis().debug_selector(|| "card-asked".into())),
-            );
+            .children(c.asked.clone().filter(|_| !self.layout.tight).map(|a| {
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .font_family(fonts::SANS)
+                    .text_px(m.meta)
+                    .text_color(p.dim_t)
+                    .debug_selector(|| "card-asked".into())
+                    .child(a)
+            }));
         let folder = c.guard.as_ref().map(|g| {
-            mono(SharedString::from(format!("in {}", g.dir)), m.meta, p.dim_k)
-                .min_w_0()
-                .overflow_hidden()
-                .text_ellipsis()
-                .debug_selector(|| "card-folder".into())
+            mono(g.dir.clone(), m.meta, p.dim_t).min_w_0().flex_shrink(1.).overflow_hidden().text_ellipsis().whitespace_nowrap().debug_selector(|| "card-folder".into())
         });
         let scope = pr.allow_all().filter(|_| offered).cloned();
         let check_focused = live && c.box_focus && keys;
         let check = scope.map(|s| {
-            let (text, tip): (SharedString, SharedString) = (s.allow_all_label().into(), s.allow_all_scope().into());
+            let tip: SharedString = s.allow_all_scope().into();
+            // "Don't ask again for guard this session" (§5); at 1280 the short label.
+            let what: SharedString = s.allow_all_label().into();
+            let text = if tight { SharedString::new_static("Don't ask again") } else { what };
             h_flex()
                 .id("p-all")
                 .debug_selector(|| "card-allow-all".into())
@@ -1006,18 +1055,23 @@ impl AppView {
                     div()
                         .flex_none()
                         .size(px(CHECK))
+                        .rounded(px(3.))
                         .border_1()
                         // Focused (Tab, a click): Space toggles it.
-                        .border_color(if check_focused { p.focus_k } else { p.dim_k })
+                        .border_color(if check_focused { p.focus_k } else { p.dim_t })
                         .flex()
                         .items_center()
                         .justify_center()
-                        .when(allow_all, |d| d.child(div().size(px(CHECK_IN)).bg(p.focus_k).debug_selector(|| "card-allow-all-on".into()))),
+                        .when(allow_all, |d| d.child(div().size(px(CHECK_IN)).rounded(px(1.)).bg(p.acc).debug_selector(|| "card-allow-all-on".into()))),
                 )
-                // The daemon's words, machine text (C2): mono, dim until
-                // checked (the finish gate of #18: the command is the card's
-                // first read, never this).
-                .child(mono(text, m.meta, if allow_all { p.prose_k } else { p.dim_k }).whitespace_nowrap())
+                .child(
+                    div()
+                        .font_family(fonts::SANS)
+                        .text_px(m.meta)
+                        .whitespace_nowrap()
+                        .text_color(if allow_all { p.prose_t } else { p.dim_t })
+                        .child(text),
+                )
                 .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
                 .when(live && can, |d| {
                     d.on_click(cx.listener(|this, _, window, cx| {
@@ -1026,56 +1080,46 @@ impl AppView {
                     }))
                 })
         });
-        // The footer says what the card is waiting on: on its own line under
-        // the well (where a guard's folder sits, right of it), whole, never
-        // cut to a fragment beside the buttons (the finish gate of #18).
+        // What the card is waiting on: on its own line under the strip,
+        // whole, never cut to a fragment beside the buttons.
         let foot = footer.map(|f| {
-            mono(f, m.meta, if footer_warn { p.warn_k } else { p.dim_k })
+            div()
                 .flex_none()
                 .whitespace_nowrap()
+                .font_family(fonts::SANS)
+                .text_px(m.meta)
+                .text_color(if footer_warn { p.warn } else { p.dim_t })
                 .debug_selector(|| "card-footer".into())
+                .child(f)
         });
-        let status = (folder.is_some() || foot.is_some()).then(|| {
-            h_flex()
-                .flex_none()
-                .mt(px((8. * r).round()))
-                .px(px(pad))
-                .gap(px(16.))
-                .items_center()
-                .children(folder)
-                .child(div().flex_1())
-                .children(foot)
-        });
-        // Allow all left, the buttons right; in a narrow card the buttons
-        // wrap under it, still right (never pushed past the frame).
+        let status = foot.map(|f| h_flex().flex_none().mt(px(8.)).items_center().child(f));
+        // The folder and the box left, the buttons right; in a narrow card
+        // the buttons wrap under them, still right.
         let line = h_flex()
             .id("prompt-actions")
             .flex_none()
             .flex_wrap()
-            .mt(px((12. * r).round()))
-            .mb(px(pad))
-            .px(px(pad))
+            .mt(px((10. * r).round()))
             .min_h(px(crate::fit::button_h(m)))
             .gap_x(px(16.))
             .gap_y(px(8.))
             .items_center()
             .justify_between()
             .track_scroll(&c.actions)
-            .children(check)
-            .children(actions.map(|a| a.flex_grow(1.).justify_end()));
+            .child(h_flex().flex_1().min_w_0().gap(px(16.)).items_center().children(folder).children(check))
+            .children(actions.map(|a| a.flex_none().justify_end()));
         v_flex()
             .id("prompt-card")
             .debug_selector(move || if live { "card".into() } else { "card-exit".into() })
             .w_full()
-            .border_1()
-            // GPUI paints a border over the children: while the frame
-            // traces (a child), the border is clear (the card's ground
-            // shows through it, as it would in the card's colour).
-            .border_color(if tracer.is_some() { gpui_kit::transparent_black() } else { p.warn_mark })
-            .bg(p.card)
             .relative()
-            .children(tracer)
-            .children(dashes)
+            .rounded(px(8.))
+            .border_1()
+            .border_color(p.acc_line)
+            .bg(card_bg)
+            .px(px((14. * r).round()))
+            .pt(px((12. * r).round()))
+            .pb(px((12. * r).round()))
             // A click on a confirm card gives it the keys (a secret's
             // field takes them itself).
             .when(!secret && live, |d| {
@@ -1098,15 +1142,33 @@ impl AppView {
                 // A press on the bar gives a confirm card the keys, as one on the card does.
                 let bar = crate::scrollbar::Bar::new(c.scroll.clone(), &c.bar);
                 let bar = if secret || !live { bar } else { bar.focus(self.focus.clone()) };
-                d.child(div().mt(px((12. * r).round())).mx(px(pad)).relative().child(well).child(bar))
+                d.child(
+                    div()
+                        .mt(px((10. * r).round()))
+                        .relative()
+                        .rounded(px(5.))
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(p.line)
+                        .child(well)
+                        .child(bar),
+                )
             })
             .children(status)
             .child(line)
     }
 }
 
+/// Allow's style (Haseeb, 08:07: "make fill vs outline trivially
+/// switchable"): the accent filled (the default, cards4/proposal.md §5),
+/// or `AllowStyle::Outline`, the accent's label in its `acc_line` edge on
+/// the card. Both paint and are tested (`cards::tests`).
+pub(crate) const ALLOW_STYLE: crate::cards::AllowStyle = crate::cards::AllowStyle::Fill;
+
 /// Where the top edge's dashes start, `DASH` on and about `DASH_GAP` off,
 /// the gaps spread so the run starts and ends on a dash at both corners.
+// Q2's, kept while its tests stand: Cards D retires it (cards4/proposal.md §5, C2, C13).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn dash_xs(w: f32) -> Vec<f32> {
     if w < DASH {
         return Vec::new();
@@ -1121,6 +1183,8 @@ pub(crate) fn dash_xs(w: f32) -> Vec<f32> {
 
 /// The dashes the trace's top stroke has passed, its head at `head`: the
 /// whole ones, and the one under the head cut there.
+// Q2's, kept while its tests stand: Cards D retires it (cards4/proposal.md §5, C2, C13).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn dash_spans(w: f32, head: f32) -> Vec<(f32, f32)> {
     dash_xs(w).into_iter().map(|x| (x, (head - x).clamp(0., DASH))).filter(|&(_, dw)| dw > 0.).collect()
 }

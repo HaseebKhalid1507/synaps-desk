@@ -153,6 +153,31 @@ pub(crate) const HOP_V: f32 = 227.;
 /// A roll is over within this much of its line (well under half a pixel).
 const ROLL_EPSILON: f32 = 0.02;
 pub(crate) const BREATHS: u32 = 3;
+/// Cards D's running orbit (cards4/proposal.md §4, §8 #3, the two new
+/// tokens): an arc laps its faint ring once a second while its length
+/// breathes between [`ORBIT_SHORT`] and [`ORBIT_LONG`] of the turn over
+/// 1.6 s, painted on the 30 Hz [`DECAY_TICK`] grid only (12° a tick at a
+/// 1 s lap; the 8 Hz beat's 45° would read as ticking), phase-locked
+/// app-wide.
+pub(crate) const ORBIT_LAP: Duration = Duration::from_millis(1000);
+pub(crate) const ORBIT_BREATH: Duration = Duration::from_millis(1600);
+pub(crate) const ORBIT_SHORT: f32 = 0.18;
+pub(crate) const ORBIT_LONG: f32 = 0.40;
+/// The arc held still (Reduced, Off, low power, history): 30 % of the
+/// ring from twelve o'clock.
+pub(crate) const ORBIT_STILL: f32 = 0.30;
+/// `flick` as a duration (its spring's response): a one-shot's length
+/// where the proposal names the spring.
+pub(crate) const FLICK: Duration = Duration::from_millis(160);
+
+/// The orbit `t` after the window's epoch: where its arc starts (turns,
+/// 0..1 from twelve o'clock, clockwise) and its length (turns).
+pub(crate) fn orbit_at(t: Duration) -> (f32, f32) {
+    let lap = (t.as_nanos() % ORBIT_LAP.as_nanos()) as f32 / ORBIT_LAP.as_nanos() as f32;
+    let b = (t.as_nanos() % ORBIT_BREATH.as_nanos()) as f32 / ORBIT_BREATH.as_nanos() as f32;
+    let breath = 0.5 - 0.5 * (b * std::f32::consts::TAU).cos();
+    (lap, ORBIT_SHORT + (ORBIT_LONG - ORBIT_SHORT) * breath)
+}
 
 /// An exit's duration: ×0.75.
 pub(crate) const fn exit(d: Duration) -> Duration {
@@ -708,6 +733,9 @@ pub(crate) enum Beat {
     Sweep(f32),
     /// `Needs` breathing since the prompt came ([`crate::glyph::breath`]).
     Breath(Instant),
+    /// Cards D's running orbit ([`orbit_at`], [`crate::glyph::orbit`]):
+    /// its arc on the 30 Hz grid, over the track the frame drew.
+    Orbit,
 }
 
 /// A glyph drawn still in the app's frame whose beat the beat layer
@@ -949,6 +977,10 @@ pub(crate) struct Motion {
     /// Tests of the beat alone: no sweep is drawn (its 30 Hz is P2's).
     #[cfg(test)]
     pub(crate) no_sweep: Cell<bool>,
+    /// Tests of the beat alone: a running row's orbit draws as the rail's
+    /// braille spinner (its 30 Hz is Cards D's, tested on its own).
+    #[cfg(test)]
+    pub(crate) no_orbit: Cell<bool>,
 }
 
 /// A count or a line as last drawn ([`Motion::roll`]).
@@ -1343,6 +1375,8 @@ impl Motion {
             painted: RefCell::default(),
             #[cfg(test)]
             no_sweep: Cell::new(false),
+            #[cfg(test)]
+            no_orbit: Cell::new(false),
         }
     }
 
@@ -1860,6 +1894,67 @@ impl Motion {
     /// takes over. `None` (its still) when ambient is off.
     pub(crate) fn beat_at(&self, at: Instant) -> Option<u32> {
         self.ambient.get().then(|| (at.saturating_duration_since(self.epoch).as_nanos() / BEAT.as_nanos()) as u32)
+    }
+
+    /// The running orbit this frame (cards4/proposal.md §8 #3): where its
+    /// arc starts and its length, as of the frame's 30 Hz tick, the next
+    /// tick asked for. `None` when ambient is off (Reduced, Off, low power,
+    /// the link lost): the arc is drawn still and asks for nothing. Only a
+    /// running glyph drawn this frame asks: nothing runs, nothing moves.
+    pub(crate) fn orbit(&self) -> Option<(f32, f32)> {
+        if !self.ambient.get() {
+            return None;
+        }
+        self.want_tick();
+        Some(orbit_at(self.on_tick(self.now())))
+    }
+
+    /// A text slot rolling from one value to the next (cards4/proposal.md
+    /// §8 #5's clock, #17's step) since `at`: the old one's travel out (90
+    /// ms, `in`) and the new one's in (`snap` from +60, 2 × `STAGGER`), each
+    /// 0..1. The old is gone before the new is half in. At rest: (1, 1).
+    pub(crate) fn handover(&self, at: Option<Instant>) -> (f32, f32) {
+        let old = self.shot(at, Duration::ZERO, exit(QUICK), &ease::IN, Kind::Spatial);
+        let Some(at) = at.filter(|_| self.level.get() == Level::Full) else { return (old, 1.) };
+        let start = at + 2 * STAGGER;
+        let now = self.now();
+        if now < start {
+            self.want_at(start);
+            return (old, 0.);
+        }
+        // `snap`'s spring, from rest: no overshoot.
+        let x = Spring::from_rest(1., SNAP_RESPONSE, now.saturating_duration_since(start).as_secs_f32());
+        if x < ROLL_EPSILON {
+            return (old, 1.);
+        }
+        self.want_frame();
+        (old, 1. - x)
+    }
+
+    /// The orbit as it was at `at` (where a success's ring closes from):
+    /// still when ambient is off.
+    pub(crate) fn orbit_then(&self, at: Instant) -> (f32, f32) {
+        if self.ambient.get() { orbit_at(self.on_tick(at)) } else { (0., ORBIT_STILL) }
+    }
+
+    /// `at`, from the epoch, floored to the 30 Hz grid.
+    fn on_tick(&self, at: Instant) -> Duration {
+        let ticks = at.saturating_duration_since(self.epoch).as_nanos() / DECAY_TICK.as_nanos();
+        Duration::from_nanos((DECAY_TICK.as_nanos() * ticks) as u64)
+    }
+
+    /// A ping (cards4/proposal.md §8 #7, #8): one ring going out from a
+    /// glyph over `sig`, `delay` after `since`, once: its progress 0..1
+    /// while it runs, `None` before and after (and under Reduced and Off,
+    /// where it never plays). Never a loop: a held wait is still.
+    pub(crate) fn ping(&self, since: Option<Instant>, delay: Duration) -> Option<f32> {
+        let since = since.filter(|_| self.level.get() == Level::Full)?;
+        if self.now() < since + delay {
+            self.want_at(since + delay);
+            return None;
+        }
+        let p = self.shot(Some(since), delay, SIG, &ease::OUT, Kind::Spatial);
+        (p < 1.).then_some(p)
     }
 
     /// The 30 Hz tick a sweep is on (polish.md P2), its next asked for; `None`
@@ -2429,6 +2524,7 @@ impl Motion {
         let beat = (since.as_nanos() / BEAT.as_nanos()) as u32;
         let tick = (since.as_nanos() / DECAY_TICK.as_nanos()) as u64;
         let (mut wants, mut every, mut sweeps) = (false, 2, false);
+        let orbit = orbit_at(Duration::from_nanos((DECAY_TICK.as_nanos() * tick as u128) as u64));
         for s in self.sites.borrow().iter() {
             let quad = |x: f32, y: f32, w: f32, h: f32, c: Hsla, window: &mut Window| {
                 window.with_content_mask(Some(s.mask), |window| {
@@ -2456,6 +2552,11 @@ impl Motion {
                         let (x, y, w) = crate::glyph::BREATH_CELL;
                         quad(x, y, w, w, crate::glyph::breath_cell(step, s.mark, s.ground), window);
                     }
+                }
+                Beat::Orbit => {
+                    // The 30 Hz grid, as a sweep's (the spinners ride it).
+                    sweeps = true;
+                    window.with_content_mask(Some(s.mask), |window| crate::glyph::paint_arc(window, cx, s.origin, orbit, s.mark));
                 }
             }
         }
@@ -2562,6 +2663,105 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    /// Cards D (cards4/proposal.md §8 #3): the orbit asks for the 30 Hz
+    /// tick only while a running glyph is drawn: a frame that draws none
+    /// asks for nothing. It is phase-locked: two orbits drawn in one frame
+    /// read the same.
+    #[test]
+    fn orbit_requests_ticks_only_while_running() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        m.begin_frame(Level::Full, false, t0 + ms(5));
+        let a = m.orbit().expect("Full: it laps");
+        assert_eq!(m.orbit(), Some(a), "one clock app-wide");
+        let (display, next) = m.demand();
+        assert!(!display, "no display-rate frame: the 30 Hz tick");
+        let next = next.expect("the next tick asked for");
+        assert!(next.saturating_duration_since(t0) <= DECAY_TICK, "on the 30 Hz grid: {next:?}");
+        m.begin_frame(Level::Full, false, t0 + ms(40));
+        assert_ne!(m.orbit(), Some(a), "a tick later it has moved");
+        m.begin_frame(Level::Full, false, t0 + ms(80));
+        assert_eq!(m.demand(), (false, None), "nothing running drawn: nothing asked");
+        // A lap a second, its length breathing 18 → 40 %.
+        let (s0, l0) = super::orbit_at(ms(0));
+        let (s1, _) = super::orbit_at(ms(250));
+        assert!((s1 - s0 - 0.25).abs() < 1e-4 && (l0 - super::ORBIT_SHORT).abs() < 1e-4);
+        assert!((super::orbit_at(super::ORBIT_BREATH / 2).1 - super::ORBIT_LONG).abs() < 1e-4);
+    }
+
+    /// Reduced, Off and low power: the orbit is the still arc and asks for
+    /// no frame (§8 #3: 0 frames).
+    #[test]
+    fn orbit_is_still_when_reduced_or_off() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        for (level, low) in [(Level::Reduced, false), (Level::Off, false), (Level::Full, true)] {
+            m.begin_frame(level, low, t0 + ms(10));
+            assert_eq!(m.orbit(), None, "{level:?} low power {low}: still");
+            assert_eq!(m.orbit_then(t0), (0., super::ORBIT_STILL));
+            assert_eq!(m.demand(), (false, None), "{level:?}: no frames");
+        }
+    }
+
+    /// A wait pings once (§8 #7): its ring goes out over `sig` and is gone;
+    /// a wait held for a minute does not ping again. Reduced and Off: no ping.
+    #[test]
+    fn ping_runs_once_per_wait() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        let mut seen = 0;
+        for k in 0..=120 {
+            m.begin_frame(Level::Full, false, t0 + ms(k * 10));
+            if let Some(p) = m.ping(Some(t0), Duration::ZERO) {
+                assert!((0. ..1.).contains(&p));
+                seen += 1;
+            }
+        }
+        assert!((50..=61).contains(&seen), "one ping over sig: {seen} frames");
+        m.begin_frame(Level::Full, false, t0 + ms(60_000));
+        assert_eq!(m.ping(Some(t0), Duration::ZERO), None, "held: still");
+        assert_eq!(m.demand(), (false, None));
+        for level in [Level::Reduced, Level::Off] {
+            m.begin_frame(level, false, t0 + ms(100));
+            assert_eq!(m.ping(Some(t0), Duration::ZERO), None, "{level:?}: no ping");
+        }
+    }
+
+    /// A rolling slot hands over (§8 #5, #17): the old value is all the
+    /// way out before the new one is half in, at every frame.
+    #[test]
+    fn a_step_roll_never_overlaps() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        for k in 0..400 {
+            m.begin_frame(Level::Full, false, t0 + ms(k));
+            let (old, new) = m.handover(Some(t0));
+            assert!(new <= 0.5 || old >= 1., "at {k} ms: old {old}, new {new}");
+        }
+        m.begin_frame(Level::Reduced, false, t0 + ms(1));
+        assert_eq!(m.handover(Some(t0)), (1., 1.), "Reduced: at once");
+    }
+
+    /// History never animates (§8): a card's state first seen (it loaded
+    /// with the session, or scrolled back in) is at rest, its glyph drawn
+    /// whole; only a change watched in the next frame plays.
+    #[test]
+    fn history_cards_are_drawn_at_rest() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        let (done, orbit) = (crate::glyph::Life::Done.code(), crate::glyph::Life::Orbit.code());
+        m.begin_frame(Level::Full, false, t0);
+        assert_eq!(m.change(Tag::Outcome, 7, done, None), None, "loaded done: at rest");
+        assert_eq!(m.change(Tag::Outcome, 8, orbit, None), None);
+        m.begin_frame(Level::Full, false, t0 + ms(16));
+        assert_eq!(m.change(Tag::Outcome, 8, done, None).map(|c| c.1), Some(orbit), "watched: it plays from the orbit");
+        // Not drawn for a frame (scrolled away): back at rest.
+        m.begin_frame(Level::Full, false, t0 + ms(32));
+        m.begin_frame(Level::Full, false, t0 + ms(48));
+        m.begin_frame(Level::Full, false, t0 + ms(64));
+        assert_eq!(m.change(Tag::Outcome, 7, crate::glyph::Life::Failed.code(), None), None, "unseen change: at rest");
     }
 
     /// Off: nothing samples anything but the end state, nothing asks for a
