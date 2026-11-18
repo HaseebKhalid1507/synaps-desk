@@ -62,6 +62,8 @@ pub(crate) struct RowCache {
     /// wall clock: a running call's clock counts from it on the frame's
     /// instant ([`crate::motion::Motion::now`]).
     pub(crate) started: Option<Instant>,
+    /// An event row's words ([`crate::events::EventView`]).
+    pub(crate) event: Option<Arc<crate::events::EventView>>,
 }
 
 impl RowCache {
@@ -4725,7 +4727,7 @@ impl AppView {
             self.toggled.insert(id);
         }
         // A call's row, or a slash command's answer (a note).
-        if let Some(ix) = self.disp.iter().position(|d| d.id == id && matches!(d.kind, Kind::Work | Kind::Note)) {
+        if let Some(ix) = self.disp.iter().position(|d| d.id == id && matches!(d.kind, Kind::Work | Kind::Note | Kind::Event)) {
             self.list.remeasure_items(ix..ix + 1);
         }
     }
@@ -5784,6 +5786,7 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
         at: None,
         time: None,
         started: None,
+        event: None,
     };
     r.retime(item);
     match item.kind {
@@ -5815,6 +5818,10 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
             r.text = item.text.clone().into();
             r.arg = one_line(&item.text, 200).into();
             r.card.verb = "think".into();
+        }
+        ItemKind::Event => {
+            r.text = item.text.clone().into();
+            r.event = item.event.as_deref().map(|e| Arc::new(crate::events::EventView::of(e)));
         }
         // A subagent's completion event: as the TUI says it.
         ItemKind::Notice => r.text = crate::subagents::completion_note(&item.text).unwrap_or_else(|| item.text.clone()).into(),

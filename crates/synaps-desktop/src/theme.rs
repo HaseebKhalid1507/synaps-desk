@@ -2139,6 +2139,56 @@ mod tests {
         }
     }
 
+    /// Event rows ([`crate::events::roles`]): each severity's label and
+    /// mark, ASK, the meta and the text, on the canvas, meet their floors in
+    /// all 20 themes, without an accent and with every preset and the odd
+    /// ones; high and critical never read as the quiet ones.
+    #[test]
+    fn event_rows_draw_every_severity_above_its_floor() {
+        use synaps_client::events::Severity;
+        let mut accents: Vec<Option<u32>> = vec![None];
+        accents.extend(PRESETS.iter().map(|p| Some(p.1)));
+        accents.extend([Some(0x0a1a40), Some(0x050505), Some(0xffffff), Some(0x777777)]);
+        let mut bad = Vec::new();
+        for (name, raw) in palettes::THEMES {
+            for &accent in &accents {
+                let (r, _) = resolve(&raw, accent);
+                let p = Palette::of(&r);
+                let want = [
+                    (Severity::Low, r.dim, r.dim),
+                    (Severity::Medium, r.dim, r.dim),
+                    (Severity::High, r.warn, r.warn_mark),
+                    (Severity::Critical, r.err, r.err),
+                ];
+                for (s, tone, mark) in want {
+                    assert_eq!(crate::events::roles(s, &p), (hsla(tone), hsla(mark)), "{name} {s:?}");
+                    for (what, c, floor) in [("label", tone, TEXT), ("mark", mark, MARK)] {
+                        let k = contrast(c, r.canvas);
+                        if k < floor - 1e-9 {
+                            bad.push(format!("{name} {accent:?} {s:?} {what}: #{c:06x} on canvas {k:.3} < {floor}"));
+                        }
+                    }
+                }
+                for (what, c) in [("ASK", r.you), ("text", r.prose), ("meta", r.dim)] {
+                    if contrast(c, r.canvas) < TEXT - 1e-9 {
+                        bad.push(format!("{name} {accent:?} {what}"));
+                    }
+                }
+                for (what, a, b) in [
+                    ("high label", r.warn, r.dim),
+                    ("critical label", r.err, r.dim),
+                    ("high mark", r.warn_mark, r.dim),
+                    ("critical mark", r.err, r.dim),
+                ] {
+                    if a == b {
+                        bad.push(format!("{name} {accent:?}: {what} #{a:06x} is the quiet one's"));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
     /// Q1 cards: every pair the rows, wells, spawn rows and chips draw, as
     /// drawn (a colour on the ground it is painted over), meets its floor
     /// in every theme and accent, whatever grounds its role was floored on
