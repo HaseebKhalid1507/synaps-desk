@@ -260,6 +260,21 @@ pub(crate) fn text_motion() -> gpui_kit::base::TextViewMotion {
         .with_stream_fade_easing(stream_curve())
 }
 
+/// Tests: a size-0 mark that logs `what` when it paints, in paint order
+/// ([`Motion::paint_log`]); outside tests, nothing.
+pub(crate) fn probe(fx: &Rc<Motion>, what: &'static str) -> Option<AnyElement> {
+    #[cfg(test)]
+    {
+        let fx = fx.clone();
+        Some(canvas(|_, _, _| {}, move |_, _, _, _| fx.painted(what)).absolute().size_0().into_any_element())
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (fx, what);
+        None
+    }
+}
+
 /// The one sanctioned opacity (fluid.md §3.6, law 3): something arriving
 /// lifts from [`LIFT`] to full, never lower. Opaque grounds only.
 #[allow(clippy::disallowed_methods)]
@@ -1636,6 +1651,24 @@ impl Motion {
     /// A glyph drawn still was painted here: the layer paints its beat.
     pub(crate) fn site(&self, site: Site) {
         self.sites.borrow_mut().push(site);
+    }
+
+    /// An opaque strip painted over the list after its glyphs (the sticky
+    /// band, polish.md F8): the beat layer, painted after the whole frame,
+    /// paints nothing under it. Every site recorded so far whose clip meets
+    /// `cover` starts below it. The band spans the column from the view's
+    /// top, so trimming the top is exact: the clip's part it also drops,
+    /// in the gutters beside the band, holds no glyph. Sites recorded
+    /// outside the list (the rail, the tabs) never meet it.
+    pub(crate) fn cover_top(&self, cover: Bounds<Pixels>) {
+        for s in self.sites.borrow_mut().iter_mut() {
+            let m = &mut s.mask.bounds;
+            if m.intersects(&cover) {
+                let bottom = m.bottom();
+                m.origin.y = cover.bottom().min(bottom);
+                m.size.height = bottom - m.origin.y;
+            }
+        }
     }
 
     #[cfg(test)]

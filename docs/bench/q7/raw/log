@@ -1,0 +1,13 @@
+01:03:51 main-0a78bb7 main-motion-1 load 4.25 swapins 7196
+01:08:28 q7-3e2093d q7-motion-1 load 3.13 swapins 3869
+01:08:54 main-0a78bb7 main-mem-1 load 4.02 swapins 51
+01:09:21 q7-3e2093d q7-mem-1 load 3.26 swapins 340
+01:13:58 main-0a78bb7 main-motion-2 load 2.84 swapins 5787
+01:18:35 q7-3e2093d q7-motion-2 load 5.27 swapins 3038
+01:19:02 main-0a78bb7 main-mem-2 load 2.32 swapins 85
+01:19:28 q7-3e2093d q7-mem-2 load 2.81 swapins 45
+01:24:05 main-0a78bb7 main-motion-3 load 2.46 swapins 37138
+01:28:42 q7-3e2093d q7-motion-3 load 2.16 swapins 724
+01:29:09 main-0a78bb7 main-mem-3 load 1.55 swapins 35
+01:29:35 q7-3e2093d q7-mem-3 load 1.89 swapins 37
+BENCH-DONE
