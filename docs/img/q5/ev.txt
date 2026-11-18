@@ -1,0 +1,17 @@
+side/fly-nord-1920x1080.png first-moved f59
+rest-diff nord 1920x1080 7.5817 (3.6563e-06) px 04:45:49
+side/fly-nord-1280x720.png first-moved f58
+rest-diff nord 1280x720 7.5817 (8.22667e-06) px 04:46:11
+side/fly-night-city-1920x1080.png first-moved f59
+rest-diff night-city 1920x1080 0 (0) px 04:46:34
+side/fly-night-city-1280x720.png first-moved f58
+rest-diff night-city 1280x720 8.32418 (9.03232e-06) px 04:46:57
+side/fly-default-1920x1080.png first-moved f59
+rest-diff default 1920x1080 0 (0) px 04:47:20
+side/fly-default-1280x720.png first-moved f59
+rest-diff default 1280x720 0 (0) px 04:47:42
+side/fly-paper-1920x1080.png first-moved f59
+rest-diff paper 1920x1080 0 (0) px 04:48:05
+side/fly-paper-1280x720.png first-moved f58
+rest-diff paper 1280x720 16.9908 (1.84363e-05) px 04:48:28
+EV-DONE
