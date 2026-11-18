@@ -802,7 +802,8 @@ impl AppView {
             div().flex_none().font_family(fonts::SANS).text_px(m.meta).text_color(crate::motion::mix(ground, color, 0.72)).child(k)
         };
         let ghost = |id: &'static str, text: &'static str, key: Option<&'static str>, enabled: bool, down: bool| {
-            let fg = if enabled { p.ink } else { p.dim_k };
+            // Pressed, its label stays (Shady #23 r2 L2): as Allow's.
+            let fg = if enabled || down { p.ink } else { p.dim_k };
             let bg = if down { p.hover } else { p.card_d };
             h_flex()
                 .id(id)

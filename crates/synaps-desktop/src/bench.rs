@@ -749,7 +749,72 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             v.model.transcript.apply(&SessionEvent::Idle);
                             v.sync_list();
                         });
-                        sleep(9.5).await;
+                        if std::env::var("SYNAPS_BENCH_FOLDS").is_ok() {
+                            // `SYNAPS_BENCH_FOLDS=1` (the design gate of #23,
+                            // N1, S1): the folds a click makes, as its
+                            // listener makes them (`toggle_run`, `toggle`):
+                            // the run unfolded, its header a third of the
+                            // way down the view, folded there; unfolded and
+                            // folded at the list's end; the last call's body
+                            // opened and closed at the end.
+                            let run = |v: &AppView| v.disp.iter().rev().find(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id);
+                            sleep(2.5).await;
+                            let _ = upd(cx, &|v, _| {
+                                if let Some(id) = run(v) {
+                                    v.toggle_run(id);
+                                }
+                            });
+                            sleep(2.).await;
+                            let _ = upd(cx, &|v, _| {
+                                if let Some(ix) = run(v).and_then(|id| v.disp.iter().position(|d| d.id == id)) {
+                                    let third = f32::from(v.list.viewport_bounds().size.height) / 3.;
+                                    v.list.scroll_to(gpui::ListOffset { item_ix: ix, offset_in_item: gpui::px(0.) });
+                                    v.list.scroll_by(gpui::px(-third));
+                                }
+                            });
+                            sleep(1.5).await;
+                            let _ = upd(cx, &|v, _| {
+                                if let Some(id) = run(v) {
+                                    v.toggle_run(id);
+                                }
+                            });
+                            sleep(2.5).await;
+                            let _ = upd(cx, &|v, _| {
+                                if let Some(id) = run(v) {
+                                    v.toggle_run(id);
+                                }
+                                v.list.scroll_to_end();
+                            });
+                            sleep(2.).await;
+                            let _ = upd(cx, &|v, _| {
+                                if let Some(id) = run(v) {
+                                    v.toggle_run(id);
+                                }
+                            });
+                            sleep(2.5).await;
+                            let last = |v: &AppView| v.disp.iter().rev().find(|d| d.kind == crate::turns::Kind::Work).map(|d| d.id);
+                            let _ = upd(cx, &|v, _| {
+                                if let Some(id) = run(v) {
+                                    v.toggle_run(id);
+                                }
+                                v.list.scroll_to_end();
+                            });
+                            sleep(2.).await;
+                            let _ = upd(cx, &|v, _| {
+                                if let Some(id) = last(v) {
+                                    v.toggle(id);
+                                }
+                            });
+                            sleep(2.).await;
+                            let _ = upd(cx, &|v, _| {
+                                if let Some(id) = last(v) {
+                                    v.toggle(id);
+                                }
+                            });
+                            sleep(2.5).await;
+                        } else {
+                            sleep(9.5).await;
+                        }
                         // A new turn, detached with its call still running:
                         // as last seen.
                         let _ = upd(cx, &|v, _| {
