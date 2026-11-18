@@ -435,7 +435,8 @@ roles! {
     res, dim_o, think_o, ok_o, err_o,
     // On the card (the permission card, the NEEDS YOU stub, overlays) and
     // its hovered step: text, then marks.
-    prose_k, dim_k, warn_k, err_k, run_k, ok_k, run_mark_k, err_mark_k, rest_mark_k, focus_k,
+    // (`you_k`: the palette's matched letters, the accent floored as text.)
+    prose_k, dim_k, warn_k, err_k, run_k, ok_k, you_k, run_mark_k, err_mark_k, rest_mark_k, focus_k,
     // Marks (3:1): the user's bar (on the canvas and user, and on a run:
     // the watched tray row), bullets, state glyphs and borders, focus, the
     // table rule, the two filled buttons.
@@ -702,6 +703,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.well_fg = f.at("well_fg", t.code_fg, ink, &[canvas], loud);
     r.run_k = f.text("run_k", t.status_streaming, &k);
     r.ok_k = f.text("ok_k", t.tool_result_ok, &k);
+    r.you_k = f.text("you_k", you, &k);
     r.run_mark_k = f.mark("run_mark_k", t.status_streaming, &k);
     r.err_mark_k = f.mark("err_mark_k", t.error_color, &k);
     r.rest_mark_k = f.mark("rest_mark_k", t.muted, &k);
@@ -2163,6 +2165,21 @@ mod tests {
 
     /// Every role is in the `Check` log (so the floor test covers it), but
     /// the two grounds a theme gives as they are.
+    /// Design re-gate #20 (4): the palette's matched letters (`you_k`, the
+    /// accent) read as text on the card and on the selected row, with
+    /// every accent.
+    #[test]
+    fn you_k_reads_on_the_card_and_its_selection() {
+        for (name, raw) in palettes::THEMES {
+            for accent in std::iter::once(None).chain(PRESETS.iter().map(|p| Some(p.1))) {
+                let (r, checks) = resolve(&raw, accent);
+                let c = checks.iter().find(|c| c.role == "you_k").expect("you_k is checked");
+                assert_eq!((c.grounds.clone(), c.floor), (vec![r.card, r.card_hi], TEXT), "{name}");
+                assert!(contrast(r.you_k, r.card_hi) >= TEXT - 1e-9 && contrast(r.you_k, r.card) >= TEXT - 1e-9, "{name} {accent:06x?}");
+            }
+        }
+    }
+
     /// Shady #20 N5: the card's scrollbar thumb is drawn over the palette's
     /// selected row too: it meets its floor on `card_hi` as on `card`.
     #[test]
@@ -2214,6 +2231,7 @@ mod tests {
             "focus",
             "focus_ch",
             "focus_k",
+            "you_k",
             "open_ch",
             "you_bar",
             "press_ch",

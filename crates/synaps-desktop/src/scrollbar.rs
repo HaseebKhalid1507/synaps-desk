@@ -494,12 +494,14 @@ pub(crate) struct Bar<S: Scrolled> {
     axis: Axis,
     ground: Ground,
     always: bool,
+    /// Shown with its surface, at once (no fade in): the palette's.
+    instant: bool,
     focus: Option<FocusHandle>,
 }
 
 impl<S: Scrolled> Bar<S> {
     pub(crate) fn new(scroll: S, state: &BarState) -> Self {
-        Bar { scroll, state: state.clone(), axis: Axis::Vertical, ground: Ground::Canvas, always: false, focus: None }
+        Bar { scroll, state: state.clone(), axis: Axis::Vertical, ground: Ground::Canvas, always: false, instant: false, focus: None }
     }
 
     pub(crate) fn ground(mut self, ground: Ground) -> Self {
@@ -510,6 +512,13 @@ impl<S: Scrolled> Bar<S> {
     /// Shown whenever there is something to scroll.
     pub(crate) fn always(mut self) -> Self {
         self.always = true;
+        self
+    }
+
+    /// Part of a surface that opens at once (the palette, P11's keyboard
+    /// open): drawn whole on its first frame, never fading in.
+    pub(crate) fn instant(mut self) -> Self {
+        self.instant = true;
         self
     }
 
@@ -628,7 +637,7 @@ impl<S: Scrolled> Bar<S> {
         if look.0 != st.was {
             st.was = look.0;
             let full = crate::motion::Level::current(cx) == crate::motion::Level::Full;
-            st.fade = full.then_some((look.0, now));
+            st.fade = (full && !(self.instant && look.0)).then_some((look.0, now));
         }
         let fade = fading(st.fade, now);
         if fade.is_none() {
@@ -658,7 +667,7 @@ impl<S: Scrolled> Bar<S> {
 impl<S: Scrolled> Frame<S> {
     fn paint(self, window: &mut Window, cx: &mut App) {
         let Frame { bar, geo, offset, thumb, lane, vp, pane, strip, thumb_hit, look, view, fade } = self;
-        let Bar { scroll, state, axis, ground, always, focus } = bar;
+        let Bar { scroll, state, axis, ground, always, focus, .. } = bar;
         let dragging = state.0.borrow().grab.is_some();
         // Hiding: the thumb as it was at rest, lerping to its ground.
         if let Some((false, k)) = fade {

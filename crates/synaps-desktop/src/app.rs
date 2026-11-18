@@ -1360,6 +1360,9 @@ pub struct AppView {
     cmd_draft: Option<(String, String)>,
     /// That text, run: out of the composer if it still holds it.
     cmd_clear: Option<String>,
+    /// The note last set by a command that went out or was answered: shown
+    /// quiet (`dim`), not as a warning, while it is the note on screen.
+    pub(crate) quiet_note: Option<SharedString>,
     /// Each tab's composer draft by session (kept when its tab is left,
     /// put back when it is shown again), and the tab whose draft the
     /// composer holds.
@@ -1486,6 +1489,9 @@ pub struct AppView {
     /// The composer's frame's top as last laid out (the palette ends
     /// above it).
     pub(crate) composer_top: std::rc::Rc<std::cell::Cell<f32>>,
+    /// The top of what is drawn over the composer (the stub, a notice, the
+    /// worker chips) as last laid out; `INFINITY` while none is.
+    pub(crate) over_composer: std::rc::Rc<std::cell::Cell<f32>>,
     /// Each worker chip's bounds as last laid out (the tracer starts from
     /// the source chip's bar).
     pub(crate) chip_bounds: Rc<RefCell<ChipBounds>>,
@@ -2057,6 +2063,7 @@ impl AppView {
             restore: None,
             cmd_draft: None,
             cmd_clear: None,
+            quiet_note: None,
             drafts: Default::default(),
             composer_of: None,
             draft_note: None,
@@ -2127,6 +2134,7 @@ impl AppView {
             tracer: None,
             strip_at: Default::default(),
             composer_top: Default::default(),
+            over_composer: std::rc::Rc::new(std::cell::Cell::new(f32::INFINITY)),
             chip_bounds: Default::default(),
             view_seen: None,
             window_active: true,
@@ -2239,6 +2247,21 @@ impl AppView {
                     self.model.view_dirty = true;
                 }
             }
+            // The compaction a `/compact` asked for has its notice in the
+            // transcript now: the note that asked is done.
+            if let Event::Session { attach_seq, event, .. } = &ev
+                && matches!(
+                    event,
+                    synaps_client::protocol::SessionEvent::CompactionApplied { .. }
+                        | synaps_client::protocol::SessionEvent::CompactionFailed { .. }
+                        | synaps_client::protocol::SessionEvent::CompactionCancelled
+                )
+                && self.model.active.as_ref().is_some_and(|a| a.attach_seq == *attach_seq)
+                && self.watch_note.as_ref().is_some_and(|n| n.starts_with("/compact:"))
+            {
+                self.watch_note = None;
+                self.model.view_dirty = true;
+            }
             for fx in self.model.apply(ev) {
                 self.effect(fx);
             }
@@ -2297,6 +2320,7 @@ impl AppView {
             Effect::WorkerNote(note) => self.watch_note = Some(note.into()),
             Effect::Command { name, reply } => {
                 self.watch_note = Some(crate::palette::reply_note(&name, &reply).into());
+                self.quiet_note = self.watch_note.clone().filter(|_| matches!(reply, synaps_client::CommandReply::Done(_)));
                 if let Some((_, text)) = self.cmd_draft.take_if(|d| d.0 == name)
                     && matches!(reply, synaps_client::CommandReply::Done(_))
                 {
@@ -3716,6 +3740,12 @@ impl AppView {
     /// key's or a refused steer's note, else the draft's.
     fn composer_note(&self) -> Option<SharedString> {
         self.watch_note.clone().or_else(|| self.draft_note.map(SharedString::from))
+    }
+
+    /// A note's colour: a command that went out or was answered, quiet
+    /// (`dim_u`); anything else (refused, not run, a warning) `warn`.
+    pub(crate) fn note_color(&self, note: &SharedString, p: &Palette) -> Hsla {
+        if self.quiet_note.as_ref() == Some(note) { p.dim_u } else { p.warn }
     }
 
     /// What the centre column draws besides the bars, the card and the
@@ -5259,7 +5289,7 @@ impl AppView {
         let (text, color): (SharedString, Hsla) = match (self.model.last_error.clone(), note) {
             (Some(e), Some(n)) => (format!("{e} · {n}").into(), p.err),
             (Some(e), None) => (e.into(), p.err),
-            (None, Some(n)) => (n, p.warn),
+            (None, Some(n)) => (n.clone(), self.note_color(&n, p)),
             (None, None) => return None,
         };
         let line = mono(text.clone(), m.meta, color).pt(px(crate::fit::NOTICE_TOP)).line_height(px(crate::fit::notice_line(m)));
@@ -5305,7 +5335,7 @@ impl AppView {
         // Only what is out of the ordinary: the routine two are SEND's and
         // STEER's tooltips.
         let hint: Option<(SharedString, Hsla)> = if let Some(n) = self.composer_note() {
-            Some((n, p.warn))
+            Some((n.clone(), self.note_color(&n, p)))
         } else if self.client.is_none() && !self.synthetic {
             Some(("offline: no daemon to send to".into(), p.dim_u))
         } else if self.client.is_none() {
@@ -5578,8 +5608,18 @@ impl AppView {
                         d.child(mono("·", m.meta, p.dim_u).flex_none()).child(mono(e, m.meta, p.dim_u).flex_none())
                     })
             });
-            let hint =
-                hint.filter(|_| fit.hint).map(|(h, c)| mono(h, m.meta, c).ml(px(16.)).flex_1().min_w_0().overflow_hidden().text_ellipsis());
+            // Cut short, its tooltip has it whole.
+            let hint = hint.filter(|_| fit.hint).map(|(h, c)| {
+                mono(h.clone(), m.meta, c)
+                    .id("composer-note")
+                    .debug_selector(|| "composer-note".into())
+                    .ml(px(16.))
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .tooltip(move |window, cx| crate::overlay::tip(h.clone(), window, cx))
+            });
             let filler = hint.is_none().then(|| div().flex_1());
             v_flex().child(field).child(
                 h_flex()
@@ -6251,6 +6291,15 @@ impl Render for AppView {
             self.view_width = view_pane;
             AnyView::from(self.pane(k).clone()).cached(StyleRefinement::default().size_full())
         });
+        let session = shown_view.is_none();
+        // As elements now (they borrow nothing after this).
+        let stub = session.then(|| self.render_stub(&p, &m, cx).map(IntoElement::into_any_element)).flatten();
+        let notice = session.then(|| self.render_notice(&p, &m).map(IntoElement::into_any_element)).flatten();
+        let tray = session.then(|| self.render_tray(&p, &m, cx).map(IntoElement::into_any_element)).flatten();
+        let over = (stub.is_some() || notice.is_some() || tray.is_some()).then(|| self.over_composer.clone());
+        if over.is_none() {
+            self.over_composer.set(f32::INFINITY);
+        }
         let main = if let Some(v) = shown_view {
             v_flex().flex_1().h_full().min_w_0().bg(p.canvas).child(tabs).child(div().flex_1().min_h_0().child(v))
         } else {
@@ -6281,11 +6330,14 @@ impl Render for AppView {
                         .children(hold_back)
                         .child(transcript_bar),
                 )
+                // The top of what is drawn over the composer (the stub, a
+                // notice, the chips), as laid out: the palette ends above it.
+                .when_some(over, |d, at| d.child(canvas(move |b, _, _| at.set(f32::from(b.origin.y)), |_, _, _, _| {}).w_full().h(px(0.))))
                 // The card off screen (scrolled away, or a worker's view):
                 // NEEDS YOU, folded, over the chips.
-                .children(self.render_stub(&p, &m, cx))
-                .children(self.render_notice(&p, &m))
-                .children(self.render_tray(&p, &m, cx))
+                .children(stub)
+                .children(notice)
+                .children(tray)
                 .children(crate::motion::probe(&self.fx, "composer"))
                 .child(self.render_composer(
                     &p,
@@ -6580,7 +6632,7 @@ impl Render for AppView {
                 crate::chrome::MARK + rail.width(),
                 if view.is_some() { view_pane } else { pane },
                 // Over a view there is no composer: the window's end.
-                if view.is_some() { self.height } else { self.composer_top.get() },
+                if view.is_some() { self.height } else { self.composer_top.get().min(self.over_composer.get()) },
                 &p,
                 cx,
             ))
