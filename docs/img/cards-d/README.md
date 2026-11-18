@@ -65,6 +65,28 @@ libx264rgb `qp=0` (High 4:4:4 Predictive, gbrp; checked in each header):
 
 `runs.py` beside them lists every run of changed frames in a band (`python3 runs.py <clip> x0,y0,x1,y1`).
 
+## Bench vs main (`--bench-motion`, bella, headless gamescope, `dri3`; main `9b0d263` and the PR alternating)
+
+| case | cardsd-1 | cardsd-2 | cardsd-3 | main-1 | main-2 | main-3 |
+|---|---|---|---|---|---|---|
+| idle_30s_prompt.frames_presented | 0 | 0 | 0 | 0 | 0 | 0 |
+| idle_10s_after_beat.frames_presented | 0 | 0 | 0 | 0 | 0 | 0 |
+| beat_25_30s.frames_presented | 900 | 900 | 900 | 900 | 900 | 899 |
+| beat_25_30s.cpu_ms_per_s | 45.38 | 63.47 | 39.25 | 67.42 | 46.5 | 41.2 |
+| load_5x5_30s.frames_presented | 899 | 900 | 899 | 240 | 240 | 240 |
+| load_5x5_30s.cpu_ms_per_s | 52.83 | 48.44 | 43.41 | 17.17 | 19.31 | 16.91 |
+| load_5x5_sweep_30s.frames_presented | 900 | 900 | 900 | 900 | 899 | 900 |
+| load_5x5_sweep_30s.cpu_ms_per_s | 53.05 | 63.85 | 41.27 | 47.21 | 45.49 | 45.95 |
+| load_5x5_sweep_30s.orbits | 6 | 6 | 6 | None | None | None |
+| load_5x5_sweep_30s.sweeps | None | None | None | 1 | 1 | 1 |
+| mem_end.anon_kb | 74020 | 73928 | 73904 | 76068 | 74160 | 73952 |
+| mem_end.uss_kb | 117948 | 117136 | 100584 | 120004 | 118240 | 117724 |
+| mem_after_load_5x5.anon_kb | 69212 | 69164 | 69148 | 69804 | 68880 | 68376 |
+| mem_after_load_5x5.uss_kb | 98632 | 112460 | 108400 | 99596 | 112996 | 112460 |
+
+`cpu_ms_per_s` is the app's CPU per second of the case. The JSON is in
+`~/Jawz/workspace/synaps-desktop/cardsd-evidence/bench/`. The PR's JSON says `orbits` where main's says `sweeps`.
+
 ## Not covered
 
 - Chips stepping (build step 7) and the event row (step 6): not in this PR (#21 and #22 are open).
