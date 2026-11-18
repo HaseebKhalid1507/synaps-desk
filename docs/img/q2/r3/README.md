@@ -38,7 +38,10 @@ behaviour.
 `scripts/capture-linux.sh` at 640×420 panics in wgpu (`Surface is not configured for presentation`). Main's
 build panics the same way, so the 640×420 shots (`live-640x420-*.png`) were taken differently: the same
 binary, live on the sandbox, `--motion off`, and `import -window` between steps. The steps were a confirm,
-Esc, 6 wheel notches up, Ctrl+J, Ctrl+Enter.
+Esc, 6 wheel notches up, Ctrl+J, Ctrl+Enter. **The wheel notches never scrolled the list:** `2-card` and
+`4-ctrlj` are pixel-identical, and `3-stub` differs from them only in the scrollbar (x 609–640); it shows the
+card, not the stub. So at 640×420 these shots prove only the wrapped actions with ALLOW on the card. The stub
+and Ctrl+J are proven at 1280×720 only (`full-1280-ctrlj-from-stub.mp4`, `ctrlj-*.png`).
 
 ## Clips: all lossless
 
@@ -87,7 +90,7 @@ each clip's own). The call row's tick and receipt follow in the next frame.
 | `secret-card-nord.png`, `receipt-secret-cancelled-nord.png` | the `sudo` secret card; `secret · cancelled 19:16 · 5s` |
 | `ctrlj-0-stub-nord.png`, `ctrlj-1-landed-nord.png` | the stub; after Ctrl+J, the card in view with its buttons |
 | `card-860x640-nord.png`, `receipt-860x640-nord.png` | 860×640 |
-| `live-640x420-{1-arrived,2-card,3-stub,4-ctrlj,5-receipt}.png` | 640×420: the actions wrap onto their own line, and ALLOW stays on the card |
+| `live-640x420-{1-arrived,2-card,3-stub,4-ctrlj,5-receipt}.png` | 640×420: the actions wrap onto their own line, and ALLOW stays on the card. `3-stub` and `4-ctrlj` show no stub and no glide: the list never scrolled (see above) |
 | `offline-{nord,paper}-1280-1-card.png` | offline demo, `1e640db` |
 | `offline-{nord,paper}-{1280,860}-secret-2-secret.png` | the secret card at 1280×720 and 860×640: the status line has its own row and reads in full (`offline: nothing to answer`) |
 
