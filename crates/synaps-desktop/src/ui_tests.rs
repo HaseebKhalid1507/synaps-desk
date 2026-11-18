@@ -1735,9 +1735,11 @@ fn card_keys(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>
 
 /// Q2 (polish.md §2.6): Allow all is the input owner's. Not the owner (the
 /// session's input shared, another client owning it): no box, Space does
-/// nothing, ALLOW sends `y`. The owner: the box, Space (a new press, the
-/// keys armed) checks it, and ALLOW sends `"always"`. The header says what
-/// asked; a guard's well holds its command and the folder line its folder.
+/// nothing, ALLOW sends `y`. The owner: the box; Space checks it only with
+/// the box focused (clicked), a new press, the keys armed (Shady M2), and
+/// every toggle re-arms the keys, so ALLOW right after it does nothing;
+/// once armed again ALLOW sends `"always"`. The header says what asked; a
+/// guard's well holds its command and the folder line its folder.
 #[gpui_kit::test]
 fn allow_all_is_the_input_owners(cx: &mut TestAppContext) {
     use crate::authorize::Answer;
@@ -1761,20 +1763,40 @@ fn allow_all_is_the_input_owners(cx: &mut TestAppContext) {
     set_owner(cx, 2);
     assert!(has(cx, "card-allow-all") && !has(cx, "card-allow-all-on"));
     tap(cx, w, "space");
-    assert!(checked(cx) && has(cx, "card-allow-all-on"), "Space checks it");
+    assert!(!checked(cx), "Space with the card's keys but not the box's focus: nothing");
+    let at = VisualTestContext::from_window(w, cx).debug_bounds("card-allow-all").expect("the box").center();
+    click_at(cx, w, at);
+    settle(cx, w, 8);
+    assert!(checked(cx) && has(cx, "card-allow-all-on"), "a click checks it");
+    assert!(view.read_with(cx, |v, _| v.current_card().is_some_and(|c| c.box_focus)), "and focuses it");
+    let yes = if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" };
+    tap(cx, w, yes);
+    assert!(view.read_with(cx, |v, _| v.sent.is_none()), "the toggle re-armed the keys: ALLOW waits");
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    tap(cx, w, "space");
+    assert!(!checked(cx), "Space on the focused box unchecks it");
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    tap(cx, w, "space");
+    assert!(checked(cx), "and checks it");
     // A held Space toggles nothing more (its repeats are not presses).
     down(cx, w, "space", true);
     up(cx, w, "space");
     assert!(checked(cx), "held: unchanged");
-    tap(cx, w, if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" });
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    tap(cx, w, yes);
     assert_eq!(view.read_with(cx, |v, _| v.sent.as_ref().map(|s| s.answer)), Some(Answer::AllowedAll), "ALLOW sent \"always\"");
+    // Answered: Space no longer toggles it (the card can't be answered).
+    tap(cx, w, "space");
+    assert!(checked(cx), "answer sent: unchanged");
     // Resolved: the receipt in the call's row; the card's state goes.
     resolve_prompt(cx, &view);
     wait(cx, w, &view, 1000);
     view.read_with(cx, |v, _| {
         assert!(v.card.is_none() && v.card_exit.is_none() && v.sent.is_none(), "authorize_entity_dropped_on_answer");
         let r = v.receipts.values().flatten().last().expect("a receipt");
-        assert_eq!((r.answer, r.own, Some(r.after)), (Answer::AllowedAll, false, v.waiting_on));
+        let call =
+            v.model.transcript.items().iter().find(|i| Some(i.id) == v.waiting_on).and_then(|i| i.tool.as_ref()).map(|t| t.tool_id.clone());
+        assert_eq!((r.answer, r.own, Some(r.call.to_string())), (Answer::AllowedAll, false, call));
     });
 }
 
@@ -1821,7 +1843,8 @@ fn a_receipt_says_who_answered(cx: &mut TestAppContext) {
         let r = v.receipts.values().flatten().last().expect("a receipt");
         assert_eq!(r.answer, Answer::Denied);
         assert!(r.took.is_some());
-        r.after
+        let items = v.model.transcript.items();
+        items[crate::authorize::call_ix(items, &r.call).expect("its call")].id
     });
     let words = view.read_with(cx, |v, _| v.receipts.values().flatten().last().unwrap().words());
     assert_eq!(words.0, "denied");
@@ -1845,9 +1868,159 @@ fn a_receipt_says_who_answered(cx: &mut TestAppContext) {
     wait(cx, w, &view, 1000);
     view.read_with(cx, |v, _| {
         let r = v.receipts.values().flatten().last().unwrap();
-        assert_eq!((r.answer, r.took), (Answer::Elsewhere, None));
-        assert!(r.words().0 == "answered elsewhere");
+        assert_eq!((r.answer, r.took), (Answer::Resolved, None), "this window owns the input: nothing says who");
+        assert!(r.words().0 == "resolved");
     });
+    // Resolved while another client owns the input: answered elsewhere.
+    raise(cx, &view, 10);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.model.active.as_mut().unwrap().owner = Some(99));
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert_eq!(view.read_with(cx, |v, _| v.receipts.values().flatten().last().unwrap().answer), Answer::Elsewhere);
+    // Shady M4: HALT from here, then the daemon resolves the prompt (with
+    // no answer: the tool is blocked): cancelled, never answered elsewhere.
+    view.update(cx, |v, _| v.model.active.as_mut().unwrap().owner = Some(2));
+    raise(cx, &view, 11);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.halt());
+    assert!(view.read_with(cx, |v, _| v.halted.is_some()), "this window halted");
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert_eq!(view.read_with(cx, |v, _| v.receipts.values().flatten().last().unwrap().answer), Answer::Cancelled);
+    // The turn already over (another client's HALT, a revoke): cancelled too.
+    view.update(cx, |v, _| v.halted = None);
+    raise(cx, &view, 12);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.model.transcript.set_busy(false));
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert_eq!(view.read_with(cx, |v, _| v.receipts.values().flatten().last().unwrap().answer), Answer::Cancelled);
+}
+
+/// A guard's confirm for the demo's waiting call, id `id`, raised now.
+fn raise(cx: &mut TestAppContext, view: &Entity<AppView>, id: u64) {
+    view.update(cx, |v, cx| {
+        let request = synaps_client::protocol::PromptRequest {
+            id,
+            kind: serde_json::json!("confirm"),
+            title: "Confirm tool call".into(),
+            prompt: "Tool: bash\n\nAllow this tool call?".into(),
+            raised_at: None,
+            confirm_scope: None,
+        };
+        v.model.transcript.apply(&SessionEvent::Prompt { request });
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+/// Shady M1: three calls from one response, all unfinished. The engine runs
+/// them in order, so the confirm is the first's: its card under the first,
+/// unless the prompt names another (its scope's tool, a guard's command).
+#[gpui_kit::test]
+fn the_card_goes_under_the_call_it_gates(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    // The demo's call done, three new ones from one response.
+    view.update(cx, |v, _| {
+        let id =
+            v.model.transcript.items().iter().find(|i| Some(i.id) == v.waiting_on).and_then(|i| i.tool.as_ref()).unwrap().tool_id.clone();
+        v.model
+            .transcript
+            .apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: id, result: "ok".into() }) });
+    });
+    running_tools(cx, &view, 3);
+    let id_of =
+        |v: &AppView, c: &str| v.model.transcript.items().iter().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == c)).map(|i| i.id);
+    view.read_with(cx, |v, _| {
+        let items = v.model.transcript.items();
+        assert_eq!(crate::turns::waiting_call(items, None), id_of(v, "ui-run-0"), "the first unfinished");
+        let named = serde_json::from_value::<synaps_client::protocol::PromptRequest>(serde_json::json!({
+            "id": 30, "kind": "confirm", "title": "Confirm tool call",
+            "prompt": "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n$ cargo test -p crate1\n\nAllow this tool call?",
+            "confirm_scope": {"extensions": ["guard"], "tool": "bash"}
+        }))
+        .unwrap();
+        assert_eq!(crate::turns::waiting_call(items, Some(&named)), id_of(v, "ui-run-1"), "the one its command names");
+        let other = serde_json::from_value::<synaps_client::protocol::PromptRequest>(serde_json::json!({
+            "id": 31, "kind": "confirm", "title": "Confirm tool call", "prompt": "Tool: edit",
+            "confirm_scope": {"extensions": ["lint"], "tool": "edit"}
+        }))
+        .unwrap();
+        assert_eq!(crate::turns::waiting_call(items, Some(&other)), id_of(v, "ui-run-0"), "none named: the first");
+    });
+    raise(cx, &view, 20);
+    settle(cx, w, 8);
+    view.read_with(cx, |v, _| {
+        let row = v.current_card().expect("a card").row;
+        let ix = v.disp.iter().position(|d| d.id == row).expect("its row");
+        let call = id_of(v, "ui-run-0").unwrap();
+        assert_eq!(v.disp[ix - 1].item, v.model.transcript.items().iter().position(|i| i.id == call).unwrap(), "under the first call");
+    });
+}
+
+/// Shady M6: a card placed above other rows that the list never drew is
+/// not on screen (only the last row's first frame counts as shown): the
+/// stub stays, and Esc does not deny a card nobody saw.
+#[gpui_kit::test]
+fn an_undrawn_card_above_other_rows_is_not_on_screen(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    running_tools(cx, &view, 40);
+    // The first call's confirm (the guard names it): its card far above the end.
+    view.update(cx, |v, cx| {
+        let request = serde_json::from_value::<synaps_client::protocol::PromptRequest>(serde_json::json!({
+            "id": 40, "kind": "confirm", "title": "Confirm tool call",
+            "prompt": "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n$ cargo test -p crate0\n\nAllow this tool call?",
+            "confirm_scope": {"extensions": ["guard"], "tool": "bash"}
+        }))
+        .unwrap();
+        v.model.transcript.apply(&SessionEvent::Prompt { request });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    view.read_with(cx, |v, _| {
+        let ix = v.card_ix().expect("its row");
+        assert!(ix + 1 < v.disp.len(), "rows under it");
+        assert!(v.current_card().unwrap().height.get().is_nan(), "never drawn");
+        assert!(!v.card_on_screen(), "not on screen");
+    });
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("needs-stub").is_some(), "the stub stands in");
+    cx.update_window(w, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |v, cx| window.focus(&v.focus, cx))
+    })
+    .unwrap();
+    settle(cx, w, 8);
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    tap(cx, w, "escape");
+    assert!(view.read_with(cx, |v, _| v.sent.is_none()), "Esc denies nothing unseen");
+}
+
+/// Shady M5: Ctrl+J is for the card it was pressed for. That card gone,
+/// the next one never takes the keys from the composer.
+#[gpui_kit::test]
+fn ctrl_j_is_for_one_card(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    view.update(cx, |v, cx| {
+        v.jump_card = v.model.card_key().map(|(e, id)| (e, id + 1000));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    assert!(view.read_with(cx, |v, _| v.jump_card.is_none()), "another card's jump is dropped");
+    view.update(cx, |v, _| v.jump_card = v.model.card_key());
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert!(view.read_with(cx, |v, _| v.jump_card.is_none()), "its card went: dropped");
+    focus_composer(cx, w, &view);
+    raise(cx, &view, 50);
+    settle(cx, w, 8);
+    assert!(composer_focused(cx, w, &view), "the next card leaves the composer its keys");
 }
 
 /// Motion Off: an answered card goes in the frame its answer lands.
