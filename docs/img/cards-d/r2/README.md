@@ -60,3 +60,11 @@ transcript's box):
 - **Reduced:** 33 and 38 runs. The 7 longer ones are colour only (a wash's flush, the receipt's light, the
   composer's word), shortened to `quick` or less. Spatial changes are cuts. The lattice never steps: 0 frames
   between changes.
+
+## Merge with main (#21)
+
+From the merged head's release build:
+- `merge-21-chips-f960.png` and `merge-21-chip-3x.png` show the life scene's worker chips at f960. Each is Q5's fixed-width chip, with H2's running lattice as its glyph, whole and on the chip's ground.
+- `merge-21-rail-fold-f178-214.png` is the `--offline` demo's rail folding on `sheet` (`ctrl+b`), every 4th frame. Its running and needs-you rows slide under the window's edge with the content.
+
+In `railfold-merged.mkv` (off-repo, `cardsd-evidence/r3/clips/`) the rail band changes on 11 single frames before the fold (lattice pose steps) and on none while folded (f217–360). The only changes then are the composer's state cell and its clock.
