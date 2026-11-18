@@ -749,12 +749,19 @@ fn catalog_pages_decode() {
     assert_eq!((axel.name.as_deref(), axel.messages, axel.updated_at.as_deref()), (Some("axel"), 40, Some("2026-11-12T04:00:00Z")));
     assert_eq!(next, &Some(CatalogCursor { updated_at: "2026-11-12T04:00:00Z".into(), id: "20261110-202033-64fb".into() }));
     let v = axel.to_saved();
-    assert_eq!((v.id.as_str(), v.name.as_deref(), v.title.as_deref()), ("20261110-202033-64fb", Some("axel"), Some("wire the desktop app")));
+    assert_eq!(
+        (v.id.as_str(), v.name.as_deref(), v.title.as_deref()),
+        ("20261110-202033-64fb", Some("axel"), Some("wire the desktop app"))
+    );
     assert_eq!((v.cwd.as_deref(), v.message_count, v.live), (Some("/home/u/Projects/x"), Some(40), false));
     assert_eq!((v.model.as_deref(), v.updated_at.as_deref()), (Some("claude-opus-4-6"), Some("2026-11-12T04:00:00Z")));
 
-    assert!(matches!(&frames[1], DaemonFrame::CatalogPage { req: 3, sessions, next: None, error: Some(e), .. } if sessions.is_empty() && e == "busy"));
-    assert!(matches!(&frames[2], DaemonFrame::CatalogPage { req: 9, sessions, next: None, rejected: 0, error: None } if sessions.is_empty()));
+    assert!(
+        matches!(&frames[1], DaemonFrame::CatalogPage { req: 3, sessions, next: None, error: Some(e), .. } if sessions.is_empty() && e == "busy")
+    );
+    assert!(
+        matches!(&frames[2], DaemonFrame::CatalogPage { req: 9, sessions, next: None, rejected: 0, error: None } if sessions.is_empty())
+    );
 
     let DaemonFrame::CatalogPage { req: 8, sessions, next: None, rejected, error: None } = &frames[3] else { panic!("{:?}", frames[3]) };
     assert_eq!(*rejected, 3, "a number id, a string, a row without an id");

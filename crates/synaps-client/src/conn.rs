@@ -187,6 +187,12 @@ pub struct Conn {
     pub frames: mpsc::UnboundedReceiver<Incoming>,
     pub welcome: Welcome,
     reader: tokio::task::JoinHandle<()>,
+    /// `CatalogPage` reqs sent on this connection and not answered.
+    pages: Vec<u64>,
+    /// Reqs an `Attach` cancelled: the daemon aborts a page still loading
+    /// when the connection attaches, but zero or one late reply each may
+    /// still arrive before `Attached`. [`Conn::recv`] drops them.
+    cancelled: Vec<u64>,
 }
 
 impl Drop for Conn {
@@ -234,21 +240,47 @@ impl Conn {
             }
             .into());
         }
-        Ok(Conn { writer, frames, welcome, reader })
+        Ok(Conn { writer, frames, welcome, reader, pages: Vec::new(), cancelled: Vec::new() })
     }
 
+    /// Send `frame`. An `Attach` cancels every `CatalogPage` outstanding
+    /// on this connection (see [`Conn::cancelled`]).
     pub async fn send(&mut self, frame: &ClientFrame) -> anyhow::Result<()> {
         let line = encode_frame(frame).map_err(|e| anyhow!(e))?;
         self.writer.write_all(line.as_bytes()).await?;
+        match frame {
+            ClientFrame::CatalogPage { req, .. } => self.pages.push(*req),
+            ClientFrame::Attach(_) => self.cancelled.append(&mut self.pages),
+            _ => {}
+        }
         Ok(())
     }
 
-    /// Next frame; `Ok(None)` on clean EOF.
+    /// The `CatalogPage` reqs an `Attach` on this connection cancelled and
+    /// not yet answered: no page will come for them.
+    pub fn cancelled(&self) -> &[u64] {
+        &self.cancelled
+    }
+
+    /// Next frame; `Ok(None)` on clean EOF. A late reply to a cancelled
+    /// page is dropped; `Attached` ends the window for them.
     pub async fn recv(&mut self) -> anyhow::Result<Option<DaemonFrame>> {
-        match self.frames.recv().await {
-            Some(Incoming::Frame(f)) => Ok(Some(f)),
-            Some(Incoming::Failed(e)) => Err(anyhow!(e)),
-            Some(Incoming::Closed) | None => Ok(None),
+        loop {
+            match self.frames.recv().await {
+                Some(Incoming::Frame(DaemonFrame::CatalogPage { req, .. })) if self.cancelled.contains(&req) => {
+                    self.cancelled.retain(|r| *r != req);
+                }
+                Some(Incoming::Frame(f)) => {
+                    match &f {
+                        DaemonFrame::CatalogPage { req, .. } => self.pages.retain(|r| r != req),
+                        DaemonFrame::Attached(_) => self.cancelled.clear(),
+                        _ => {}
+                    }
+                    return Ok(Some(f));
+                }
+                Some(Incoming::Failed(e)) => return Err(anyhow!(e)),
+                Some(Incoming::Closed) | None => return Ok(None),
+            }
         }
     }
 
