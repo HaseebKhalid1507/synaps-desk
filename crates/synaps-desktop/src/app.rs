@@ -5846,13 +5846,22 @@ impl AppView {
         let breath_at = foot_ch.filter(|_| g == Some(glyph::Glyph::Needs)).map(|c| c.0);
         let mut foot_glyph = g.map(|g| {
             // Running, the state cell is the cards' 16 px lattice
-            // (indicators/proposal.md §8): streaming while the turn's last
-            // item is being written, else running (P2's sweep retired: one
-            // ambient per object, motion.md §6.1).
+            // (indicators/proposal.md §8): streaming while text is arriving
+            // (the turn's last item: prose or thinking being written, or a
+            // call's output coming in, as its row says), else running. A
+            // call is `streaming` from its start to its result: running,
+            // not writing (Shady #23 round 2 M2). P2's sweep retired: one
+            // ambient per object, motion.md §6.1.
             let el = if g == glyph::Glyph::Run {
-                let writing = self.model.shown().items().last().is_some_and(|i| i.streaming);
+                let writing = self.model.shown().items().last().is_some_and(|i| match &i.tool {
+                    Some(t) => i.streaming && !t.result.is_empty(),
+                    None => i.streaming,
+                });
                 let pat = if writing { crate::lattice::Pat::Stream } else { crate::lattice::Pat::Run };
-                div().debug_selector(|| "foot-lattice".into()).child(glyph::live16(fx, pat, p.acc, p.user)).into_any_element()
+                div()
+                    .debug_selector(|| "foot-lattice".into())
+                    .child(div().debug_selector(move || format!("foot-{pat:?}")).child(glyph::live16(fx, pat, p.acc, p.user)))
+                    .into_any_element()
             } else {
                 crate::turns::live_glyph(fx, g, mark, p.user, foot_ch, breath_at, true)
             };

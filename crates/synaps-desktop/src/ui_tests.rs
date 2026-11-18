@@ -3541,6 +3541,45 @@ fn a_call_the_user_closed_stays_closed_when_it_succeeds(cx: &mut TestAppContext)
     }
 }
 
+/// Shady #23 round 2 M2: the composer's state cell streams only while text
+/// arrives (prose being written, or a call's output coming in) and runs
+/// while a call runs without output, as the call's own row does. A call is
+/// `streaming` from its start to its result: that alone is not writing.
+#[gpui_kit::test]
+fn the_composer_streams_only_while_text_arrives(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    running_tools(cx, &view, 1);
+    view.update(cx, |v, cx| {
+        v.model.transcript.set_busy(true);
+        cx.notify();
+    });
+    let send = |cx: &mut TestAppContext, e: LlmEvent| {
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(e) });
+            v.sync_list();
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        for _ in 0..4 {
+            beat(cx, w, &view);
+        }
+    };
+    let has = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel).is_some();
+    send(cx, LlmEvent::ToolStarted { tool_id: "ui-run-0".into() });
+    assert!(has(cx, "foot-Run") && !has(cx, "foot-Stream"), "a call running, no output: Run");
+    send(cx, LlmEvent::ToolResultDelta { tool_id: "ui-run-0".into(), delta: "running 3 tests\n".into() });
+    assert!(has(cx, "foot-Stream"), "its output coming in: Stream");
+    send(cx, LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "ok".into() });
+    assert!(has(cx, "foot-Run") && !has(cx, "foot-Stream"), "the call done, the turn running: Run");
+    send(cx, LlmEvent::Text { text: "Here is what changed: ".into() });
+    assert!(has(cx, "foot-Stream"), "prose being written: Stream");
+}
+
 /// Finish gate #6 (live-full-allow f2841): a call drawn running never
 /// steps back to "Queued" when its queued status comes again.
 #[gpui_kit::test]
