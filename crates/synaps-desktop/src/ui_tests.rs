@@ -1441,7 +1441,8 @@ fn the_rails_lattices_and_its_fold_never_fight(cx: &mut TestAppContext) {
     open_idle_cpu(cx, &view, crate::tabs::Place::Current);
     settle(cx, w, 8);
     wait(cx, w, &view, crate::motion::GLOW.as_millis() as u64);
-    let spins = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, Beat::Spin(_))).count());
+    let spins =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, Beat::Spin(_))).count());
     let busy = |cx: &mut TestAppContext, on: bool| {
         view.update(cx, |v, cx| {
             for (k, m) in v.model.sessions.iter_mut().enumerate() {
