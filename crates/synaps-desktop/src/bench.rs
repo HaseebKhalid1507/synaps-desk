@@ -668,6 +668,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let mut wide = crew();
                     wide.extend((6..13).map(|k| probe(k, age(probes_at))));
                     wide.push(probe(13, 0.));
+                    let last_at = Instant::now();
                     let mut evs = spawn(13, "probe-13", "Probe one shard of the token store for stale entries");
                     evs.push(json!({"ev": "subagent_rows", "rows": wide}));
                     apply(cx, evs);
@@ -683,10 +684,26 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     sleep(2.0).await;
                     let _ = upd(cx, &|v, _| v.toggle_fav_session("20261117-090001-l001"));
                     sleep(1.5).await;
+                    // The prompt answered: RUNNING again (the composer's sweep).
                     let _ = upd(cx, &|v, _| {
-                        let t = &mut v.model.transcript;
-                        t.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
-                        t.apply(&SessionEvent::Idle);
+                        v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
+                        v.sync_list();
+                    });
+                    sleep(1.5).await;
+                    // Every worker done (their checks write on).
+                    let mut done = vec![row(1, "scout", "completed", 4, "", scout_done)];
+                    let crew_done = age(crew_at);
+                    done.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "completed", 3, "", crew_done)));
+                    let probes_done = age(probes_at);
+                    done.extend((6..13).map(|k| row(k, &format!("probe-{k}"), "completed", 2, "", probes_done)));
+                    done.push(row(13, "probe-13", "completed", 2, "", age(last_at)));
+                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": done})]);
+                    sleep(2.0).await;
+                    // The turn ends from RUNNING, the sweep on screen: READY
+                    // hands the floor back (Handoff in down the bar, the
+                    // sweep's one last pass across the top, polish.md P3).
+                    let _ = upd(cx, &|v, _| {
+                        v.model.transcript.apply(&SessionEvent::Idle);
                         v.sync_list();
                     });
                     sleep(3.0).await;
