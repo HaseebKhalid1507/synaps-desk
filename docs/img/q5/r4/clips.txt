@@ -1,0 +1,7 @@
+clip r4-full frames-md5 mkv=a20ead1c5785 mp4=a20ead1c5785 header=h264,High 4:4:4 Predictive,1280,720,gbrp,60/1,1620 10:17:37
+clip r4-reduced frames-md5 mkv=da041708448e mp4=da041708448e header=h264,High 4:4:4 Predictive,1280,720,gbrp,60/1,1620 10:18:31
+clip r4-off frames-md5 mkv=8b6a6e287165 mp4=8b6a6e287165 header=h264,High 4:4:4 Predictive,1280,720,gbrp,60/1,1620 10:19:21
+clip r4-r2drive-full frames-md5 mkv=ad02e783dcfa mp4=ad02e783dcfa header=h264,High 4:4:4 Predictive,1280,720,gbrp,60/1,1920 10:20:19
+clip r4-r2drive-reduced frames-md5 mkv=9fc33c5358e1 mp4=9fc33c5358e1 header=h264,High 4:4:4 Predictive,1280,720,gbrp,60/1,1920 10:21:22
+clip r4-r2drive-off frames-md5 mkv=b4d22998b298 mp4=b4d22998b298 header=h264,High 4:4:4 Predictive,1280,720,gbrp,60/1,1920 10:22:24
+CLIPS-DONE
