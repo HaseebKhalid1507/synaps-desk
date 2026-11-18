@@ -349,6 +349,20 @@ impl BarState {
         self.0.borrow().kept
     }
 
+    /// Tests: the content's length and the offset the thumb was last
+    /// painted at (held or not).
+    #[cfg(test)]
+    pub(crate) fn painted(&self) -> Option<(f32, f32)> {
+        self.0.borrow().painted
+    }
+
+    /// Tests: every paint since the last call (a test's step can draw
+    /// twice): the content's length, the offset, and whether it was held.
+    #[cfg(test)]
+    pub(crate) fn paints(&self) -> Vec<(f32, f32, bool)> {
+        std::mem::take(&mut self.0.borrow_mut().paints)
+    }
+
     /// Its target goes (another list takes its place): a drag ends on it,
     /// and nothing of where its thumb was carries over.
     pub(crate) fn release(&self) {
@@ -375,6 +389,10 @@ struct Inner {
     /// The content's length and the offset as last drawn not held still
     /// ([`Bar::still`]).
     kept: Option<(f32, f32)>,
+    #[cfg(test)]
+    painted: Option<(f32, f32)>,
+    #[cfg(test)]
+    paints: Vec<(f32, f32, bool)>,
     /// Shown until then, after a scroll; its timer is armed.
     until: Option<Instant>,
     timer: bool,
@@ -629,6 +647,11 @@ impl<S: Scrolled> Bar<S> {
         match st.kept {
             Some((content, was)) if self.still => (geo.content, at) = (content, was),
             _ => st.kept = Some((geo.content, at)),
+        }
+        #[cfg(test)]
+        {
+            st.painted = Some((geo.content, at));
+            st.paints.push((geo.content, at, self.still));
         }
         if !geo.overflows() || (st.grab.is_some() && !self.scroll.held()) {
             // Nothing to scroll (any more), or another list in place of the
