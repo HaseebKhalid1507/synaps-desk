@@ -667,9 +667,11 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             cx,
                             vec![started("q1"), result("r2", "running 4 tests\ntest result: ok. 4 passed; 0 failed"), result("k9", "Canceled by user")],
                         );
-                        let _ = upd(cx, &|v, _| {
+                        let _ = upd(cx, &|v, cx| {
+                            // Not `sync_list` here: the frame resolves the card
+                            // first (it folds into its row), as a daemon's event.
                             v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
-                            v.sync_list();
+                            cx.notify();
                         });
                         sleep(1.5).await;
                         apply(cx, vec![result("s3", "Tool execution failed: Command failed (exit 1):\ntest refresh_10 ... FAILED")]);
@@ -772,9 +774,11 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let _ = upd(cx, &|v, _| v.toggle_fav_session("20261117-090001-l001"));
                     sleep(1.5).await;
                     // The prompt answered: RUNNING again (the composer's orbit).
-                    let _ = upd(cx, &|v, _| {
+                    let _ = upd(cx, &|v, cx| {
+                        // Not `sync_list` here: the frame resolves the card
+                        // first (it folds into its row), as a daemon's event.
                         v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
-                        v.sync_list();
+                        cx.notify();
                     });
                     sleep(1.5).await;
                     // Every worker done (their checks write on).
