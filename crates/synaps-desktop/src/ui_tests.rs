@@ -5455,7 +5455,7 @@ fn the_composer_runs_only_whole_valid_commands(cx: &mut TestAppContext) {
     assert_eq!(kind, synaps_client::transcript::ItemKind::Output);
     assert!(note && text.starts_with("/workers\nWorkers (12):") && text.ends_with("sa_12  scout  running  0m"), "{text}");
     assert_eq!(in_flight(cx, &view).len(), messages, "never sent");
-    assert!(view.read_with(cx, |v, _| v.watch_note.clone()).is_some_and(|n| n.contains("+12 lines in the transcript")));
+    assert!(view.read_with(cx, |v, _| v.watch_note.clone()).is_some_and(|n| n.contains("/workers: 13 lines ↓")));
 }
 
 /// Shady #20 H2: while a turn runs, prose that starts with a command word
