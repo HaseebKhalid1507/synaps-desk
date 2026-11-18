@@ -585,6 +585,12 @@ impl Link {
         }
     }
 
+    /// When the loss was seen (the end of its grace), while lost.
+    pub(crate) fn lost_at(&self) -> Option<Instant> {
+        let (since, reload) = self.down.filter(|_| self.lost)?;
+        Some(since + if reload.is_some() { RELOAD_GRACE } else { LINK_GRACE })
+    }
+
     fn retarget(&mut self, to: f32, fx: &Motion) {
         let now = fx.now();
         let dur = if fx.level() == Level::Full { SLOW } else { QUICK };
@@ -844,6 +850,9 @@ pub(crate) struct Motion {
     /// Ambient as the level and power have it, held still or not
     /// ([`Self::words_beat`]).
     lively: Cell<bool>,
+    /// The link was lost at this instant (as of the frame, R2-L1): every
+    /// clock shows its count as of then and asks for no second.
+    stale: Cell<Option<Instant>>,
     visible: Cell<bool>,
     now: Cell<Instant>,
     frame: Cell<u64>,
@@ -1207,6 +1216,7 @@ impl Motion {
             ambient: Cell::new(true),
             scale: Cell::new(1.),
             lively: Cell::new(true),
+            stale: Cell::new(None),
             visible: Cell::new(true),
             now: Cell::new(epoch),
             frame: Cell::new(0),
@@ -1500,6 +1510,7 @@ impl Motion {
         self.level.set(level);
         self.ambient.set(level == Level::Full && !low_power);
         self.lively.set(self.ambient.get());
+        self.stale.set(None);
         self.now.set(now);
         let frame = self.frame.get() + 1;
         self.frame.set(frame);
@@ -1664,7 +1675,9 @@ impl Motion {
     /// for less than a second). At every level but Off, and in low power,
     /// where frames matter most (Shady N5).
     pub(crate) fn tick_clock(&self, at: Instant) {
-        self.want_at(self.on_grid(at, BEAT * 8));
+        if self.stale.get().is_none() {
+            self.want_at(self.on_grid(at, BEAT * 8));
+        }
     }
 
     /// The second this frame belongs to (Shady #17 M2): the last instant of
@@ -1673,9 +1686,11 @@ impl Motion {
     /// up to a refresh: read late, a clock whose next second fell inside
     /// that lateness showed it already, asked for the one after (rounded
     /// up a whole second), and the second between was never drawn.
+    /// The link lost (R2-L1), the instant of the loss: the clocks hold.
     pub(crate) fn clock_now(&self) -> Instant {
         let grid = (BEAT * 8).as_nanos();
-        let n = self.now().saturating_duration_since(self.epoch).as_nanos() / grid;
+        let now = self.stale.get().map_or(self.now(), |at| at.min(self.now()));
+        let n = now.saturating_duration_since(self.epoch).as_nanos() / grid;
         self.epoch + Duration::from_nanos((grid * n) as u64)
     }
 
@@ -1758,12 +1773,15 @@ impl Motion {
         (v * s).round() / s
     }
 
-    /// The link is lost (motion.md §5.3, Shady #17 M1): the window is
-    /// visibly stale and nothing in it is live. No ambient from here to the
-    /// frame's end: the spinners draw still, the sweep is unlit; the
-    /// connection words' dots are all that steps.
-    pub(crate) fn hold_still(&self) {
+    /// The link is lost (motion.md §5.3, Shady #17 M1), `since` then: the
+    /// window is visibly stale and nothing in it is live. No ambient from
+    /// here to the frame's end: the spinners draw still, the sweep is
+    /// unlit, and the clocks hold their count as of the loss (R2-L1: a
+    /// worker's clock never counts through an outage); the connection
+    /// words' dots are all that steps.
+    pub(crate) fn hold_still(&self, since: Option<Instant>) {
         self.ambient.set(false);
+        self.stale.set(since);
     }
 
     /// Ambient runs this frame (Full, not low power): spinners spin, sweeps sweep.
