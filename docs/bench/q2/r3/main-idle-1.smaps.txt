@@ -1,0 +1,26 @@
+   31772    31772     1412  /home/haseeb/.cache/q2-mem/main
+   31592    31592    31592  [heap]
+   30444     6033     2984  /usr/lib/libnvidia-gpucomp.so.620.70.06
+   26380     4121     1340  /usr/lib/libLLVM.so.23.1
+   11024     3826      232  /usr/lib/libnvidia-rtcore.so.620.70.06
+    9888     3500     2004  /usr/lib/libnvidia-glcore.so.620.70.06
+    9116     9116     9116  [anon]
+    8672     2701     1608  /usr/lib/libgallium-26.2.6-arch3.1.so
+    6908     2310     1764  /usr/lib/libnvidia-eglcore.so.620.70.06
+    4888     1208      500  /usr/lib/libvulkan_intel.so
+    3508      768      224  /usr/lib/libnvidia-glvkspirv.so.620.70.06
+    2816     1253        0  /usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc
+    1852       34       24  /usr/lib/libc.so.6
+    1580      163       72  /usr/lib/libstdc++.so.6.0.36
+    1044      463      360  /usr/lib/libGLX_nvidia.so.620.70.06
+     940      207      112  /usr/lib/libEGL_nvidia.so.620.70.06
+     680      114       12  /usr/lib/libvulkan.so.1.4.363
+     668      102       24  /usr/lib/libX11.so.6.4.0
+     540       88       28  /usr/lib/libnvidia-glsi.so.620.70.06
+     520       42        8  /usr/lib/libm.so.6
+     464      111       80  /usr/lib/libicuuc.so.78.3
+     464       96        8  /usr/lib/libzstd.so.1.5.7
+     420      103       56  /usr/lib/libEGL_mesa.so.0.0.0
+     384       73       12  /usr/lib/libxkbcommon.so.0.13.2
+     380       32       12  /usr/lib/libdbus-1.so.3.38.5
+  192900   101364    54472  TOTAL (rss pss anon kB)

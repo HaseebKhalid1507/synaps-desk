@@ -1,0 +1,76 @@
+4e81d22b7c5ffbdd51a5437eb91d7a4e9c15cabb30d9a4a11448e897017c8534  main
+66a9ab19059d08b38817831c5c2615fee51c1a1bd0d17d99acb513e99b3179a7  q2
+-rwxr-xr-x 1 haseeb haseeb 38109544 Nov 17 19:41 main
+-rwxr-xr-x 1 haseeb haseeb 38184432 Nov 17 19:41 q2
+main  :
+section                  size       addr
+.interp                    28        736
+.note.ABI-tag              32        764
+.note.gnu.build-id         36        796
+.dynsym                  5976        832
+.gnu.version              498       6808
+.gnu.version_r            640       7308
+.gnu.hash                  28       7952
+.dynstr                  3644       7980
+.rela.dyn             1841112      11624
+.rela.plt                  72    1852736
+.rodata               3852004    1852928
+.gcc_except_table        8104    5704932
+.eh_frame_hdr          284204    5713036
+.eh_frame             1983556    5997240
+.text                28561752    7984896
+.init                      27   36546648
+.fini                      13   36546676
+.plt                       64   36546704
+.tdata                    704   36550864
+.tbss                     936   36551568
+.fini_array                 8   36551568
+.init_array               928   36551576
+.data.rel.ro          1368816   36552504
+.dynamic                  528   37921320
+.got                    49512   37921848
+.got.plt                   48   37971360
+.relro_padding           2608   37971408
+.tm_clone_table             0   37975504
+.data                  143672   37975552
+.bss                      676   38119224
+.comment                  167          0
+Total                38110393
+
+
+q2  :
+section                  size       addr
+.interp                    28        736
+.note.ABI-tag              32        764
+.note.gnu.build-id         36        796
+.dynsym                  5976        832
+.gnu.version              498       6808
+.gnu.version_r            640       7308
+.gnu.hash                  28       7952
+.dynstr                  3644       7980
+.rela.dyn             1842000      11624
+.rela.plt                  72    1853624
+.rodata               3853028    1853696
+.gcc_except_table        8104    5706724
+.eh_frame_hdr          284772    5714828
+.eh_frame             1987456    5999600
+.text                28629720    7991152
+.init                      27   36620872
+.fini                      13   36620900
+.plt                       64   36620928
+.tdata                    704   36625088
+.tbss                     936   36625792
+.fini_array                 8   36625792
+.init_array               928   36625800
+.data.rel.ro          1369472   36626728
+.dynamic                  528   37996200
+.got                    49536   37996728
+.got.plt                   48   38046264
+.relro_padding           1432   38046312
+.tm_clone_table             0   38050408
+.data                  143680   38050432
+.bss                      676   38194112
+.comment                  167          0
+Total                38184253
+
+
