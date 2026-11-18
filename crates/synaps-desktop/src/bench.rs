@@ -630,7 +630,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     sleep(2.0).await;
                     apply(cx, vec![result("b1", "running 4 tests\ntest result: ok. 4 passed; 0 failed")]);
                     sleep(1.5).await;
-                    apply(cx, vec![call("r1", "read", json!({"path": "crates/relay/src/gone.rs"})), result("r1", "Tool execution failed: no such file")]);
+                    apply(cx, vec![call("r1", "read", json!({"path": "crates/relay/src/gone.rs"}))]);
+                    sleep(0.8).await;
+                    apply(cx, vec![result("r1", "Tool execution failed: no such file")]);
                     sleep(1.5).await;
                     let mut rows = vec![row(1, "scout", "completed", 4, "", 9.4)];
                     rows.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "running", 2, "grep -n Stale src", 3.2)));
