@@ -255,7 +255,9 @@ pub(crate) fn mean_height(disp: &[Disp], rows: &[RowCache], m: &Metrics, cpl: f3
         .iter()
         .map(|d| {
             let lines = match d.kind {
-                Kind::User | Kind::Prose | Kind::Note | Kind::Event => rows.get(d.item).map_or(1., |r| text_lines(&r.text, cpl)),
+                Kind::User | Kind::Prose | Kind::Note => rows.get(d.item).map_or(1., |r| text_lines(&r.text, cpl)),
+                // Folded (its first lines) under its head line.
+                Kind::Event => rows.get(d.item).map_or(1., |r| text_lines(&r.text, cpl).min(crate::events::EVENT_LINES as f32) + 1.),
                 _ => 1.,
             };
             gap_of(d.gap, m) + lines * m.body_line + 2. * m.pad_y
@@ -2406,6 +2408,56 @@ mod tests {
         // Rebuilt from the row after it: the same.
         let from = build(t.items(), 3, false, &HashSet::new(), &Subagents::default());
         assert_eq!(from.iter().map(|d| d.who).collect::<Vec<_>>(), [Who::Agent]);
+    }
+
+    /// Shady #22 H1: an event that comes while the agent's reply streams
+    /// sits under the reply until the engine delivers it: one AGENT
+    /// response, never two around the event; the same rows when its
+    /// history lands. Delivered between rounds, the next round's words
+    /// are labelled again, under it, as its history has them.
+    #[test]
+    fn an_event_mid_reply_never_splits_the_agents_words() {
+        let ev = |v: serde_json::Value| synaps_client::protocol::decode_event(&v).unwrap();
+        let text = |t: &str| ev(json!({"ev": "stream", "event": {"kind": "llm", "llm": "text", "text": t}}));
+        let start = || ev(json!({"ev": "stream", "event": {"kind": "llm", "llm": "response_start"}}));
+        let form = "<event id=\"ev-1\" type=\"message\" severity=\"high\" source=\"cli\">deploy finished</event>";
+        let frame = json!({"ev": "external", "event": {"id": "ev-1", "timestamp": "2031-02-03T04:05:06Z",
+            "source": {"source_type": "cli", "name": "cli"}, "sender": {"id": "u", "name": "ci", "sender_type": "user"},
+            "content": {"text": "deploy finished", "content_type": "message", "severity": "High"}, "expects_response": false}});
+        let who = |t: &Transcript| {
+            let rows = build(t.items(), 0, true, &HashSet::new(), &Subagents::default());
+            (kinds(&rows), rows.iter().map(|d| d.who).collect::<Vec<_>>())
+        };
+        let mut t = Transcript::new();
+        t.apply(&ev(json!({"ev": "turn_started", "trigger": "user", "user_text": "go"})));
+        t.apply(&start());
+        t.apply(&text("one "));
+        t.apply(&ev(frame.clone()));
+        t.apply(&text("two"));
+        let live = who(&t);
+        assert_eq!(live, (vec!["user", "prose", "event"], vec![Who::You, Who::Agent, Who::None]));
+        t.apply_history(&[
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "one two"}]}),
+            json!({"role": "user", "content": form}),
+        ]);
+        assert_eq!(who(&t), live, "the history the same");
+        // Then a tool round, the event delivered after its result.
+        let mut t = Transcript::new();
+        t.apply(&ev(json!({"ev": "turn_started", "trigger": "user", "user_text": "go"})));
+        t.apply(&start());
+        t.apply(&text("checking "));
+        t.apply(&ev(frame));
+        t.apply(&text("now"));
+        t.apply(&ev(json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use_start", "tool_name": "bash", "tool_id": "t1"}})));
+        t.apply(&ev(json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": "t1", "result": "ok"}})));
+        t.apply(&ev(json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": form}})));
+        t.apply(&start());
+        t.apply(&text("done"));
+        assert_eq!(
+            who(&t),
+            (vec!["user", "prose", "work", "event", "prose"], vec![Who::You, Who::Agent, Who::None, Who::None, Who::Agent])
+        );
     }
 
     /// Shady #20 N6: folded only when that hides two lines or more (the
