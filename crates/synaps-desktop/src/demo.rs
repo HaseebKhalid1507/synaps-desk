@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use synaps_client::protocol::{DaemonFrame, SessionMeta, decode_event, decode_frame};
-use synaps_client::{AttachMode, Event, synthetic};
+use synaps_client::{AttachMode, CatalogCursor, Event, synthetic};
 
 const CWD: &str = "/home/you/work/relay-gateway";
 /// The session `--offline` opens: it waits on a tool-call confirmation.
@@ -114,11 +114,30 @@ fn sessions(now: i64, settled: bool) -> Vec<SessionMeta> {
     rows.into_iter().filter_map(|r| serde_json::from_value(r).ok()).collect()
 }
 
-/// The synthetic daemon's saved sessions (`SavedSessionList`, decoded by
-/// the client's own decoder), as `saved_sessions(named_only, limit)` would
-/// list them: newest first, `truncated` past the limit.
-pub fn saved(named_only: bool, limit: u32) -> Event {
+/// One page of the synthetic daemon's saved sessions (`CatalogPage`,
+/// decoded by the client's own decoder), as `catalog_page(before, limit,
+/// named_only)` would answer `req`: saved rows only (a held session is
+/// never in a page), newest `updated_at` first, then `id`; `before`
+/// exclusive; `next` while rows are left.
+pub fn catalog_page(req: u64, before: Option<&CatalogCursor>, limit: u32, named_only: bool) -> Event {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let key = |v: &Value| (v["updated_at"].as_str().unwrap_or_default().to_string(), v["id"].as_str().unwrap_or_default().to_string());
+    let after = |v: &Value| before.is_none_or(|c| key(v) < (c.updated_at.clone(), c.id.clone()));
+    let rows: Vec<Value> = catalog(now).into_iter().filter(|v| (!named_only || v["name"].is_string()) && after(v)).collect();
+    let limit = limit.clamp(1, synaps_client::CATALOG_PAGE_MAX) as usize;
+    let more = rows.len() > limit;
+    let page: Vec<Value> = rows.into_iter().take(limit).collect();
+    let next = if more { page.last().map(|v| json!({"updated_at": v["updated_at"], "id": v["id"]})) } else { None };
+    let frame = json!({"type": "catalog_page", "req": req, "sessions": page, "next": next});
+    match decode_frame(&frame.to_string()) {
+        Ok(DaemonFrame::CatalogPage { req, sessions, next, rejected, error: None }) => Event::CatalogPage { req, sessions, next, rejected },
+        other => Event::CatalogPageFailed { req, reason: format!("synthetic catalog page did not decode: {other:?}") },
+    }
+}
+
+/// The synthetic daemon's saved rows (`SessionMeta`, `lifecycle: saved`),
+/// newest first. The held `ledger-drift` is not one.
+fn catalog(now: i64) -> Vec<Value> {
     let named = [
         ("myx", "Mixer: per-channel gain staging", 3 * 3600),
         ("reload-bugs", "Daemon reload: owned sessions and aliases", 11 * 3600),
@@ -169,7 +188,7 @@ pub fn saved(named_only: bool, limit: u32) -> Event {
             (
                 now - age,
                 json!({"id": format!("20261020-0900{i:02}-n{i:03}"), "name": name, "title": title, "model": "anthropic/claude-opus-4-1",
-                "cwd": folders[i % folders.len()], "message_count": 40 + i * 37, "updated_at": rfc3339(now - age), "live": false}),
+                "cwd": folders[i % folders.len()], "messages": 40 + i * 37, "updated_at": rfc3339(now - age), "lifecycle": "saved"}),
             )
         })
         .collect();
@@ -186,20 +205,11 @@ pub fn saved(named_only: bool, limit: u32) -> Event {
         rows.push((
             now - age,
             json!({"id": format!("20261001-1000{i:03}-u{i:03}"), "title": title, "model": "anthropic/claude-sonnet-4-5",
-            "cwd": folders[i as usize % folders.len()], "message_count": 12 + i * 7, "updated_at": rfc3339(now - age), "live": false}),
+            "cwd": folders[i as usize % folders.len()], "messages": 12 + i * 7, "updated_at": rfc3339(now - age), "lifecycle": "saved"}),
         ));
     }
-    // Held by the daemon: listed `live`, never in HISTORY.
-    rows.push((now - 60, json!({"id": "20261112-224410-9f00", "name": "ledger-drift", "updated_at": rfc3339(now - 60), "live": true})));
-    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
-    let listed: Vec<Value> = rows.into_iter().map(|r| r.1).filter(|v| !named_only || v["name"].is_string()).collect();
-    let truncated = listed.len() > limit as usize;
-    let sessions: Vec<Value> = listed.into_iter().take(limit as usize).collect();
-    let frame = json!({"type": "saved_session_list", "sessions": sessions, "truncated": truncated});
-    match decode_frame(&frame.to_string()) {
-        Ok(DaemonFrame::SavedSessionList { sessions, truncated, rejected }) => Event::SavedSessions { sessions, truncated, rejected },
-        other => Event::SavedSessionsFailed { reason: format!("synthetic saved list did not decode: {other:?}") },
-    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1["id"].as_str().cmp(&a.1["id"].as_str())));
+    rows.into_iter().map(|r| r.1).collect()
 }
 
 const OLD: &str = "        if self.token.expires_within(REFRESH_SKEW) {
@@ -720,22 +730,37 @@ mod tests {
         assert_eq!(listed, Some(idle_cpu().len()));
     }
 
-    /// `--offline` answers `saved_sessions` through the same path as a
+    /// `--offline` answers `catalog_page` through the same path as a
     /// daemon: the model asks, the synthetic catalog replies, HISTORY fills.
     #[test]
-    fn the_demo_answers_saved_sessions() {
+    fn the_demo_answers_catalog_pages() {
         let mut m = Model::new(ConnState::Off("offline".into()));
         let mut asks = m.offer_saved();
-        let mut n = 0;
-        while let Some(Effect::ListSaved { named_only, limit }) = asks.pop() {
-            n += 1;
-            asks.extend(m.apply(saved(named_only, limit)));
+        let mut req = 0;
+        while let Some(Effect::CatalogPage { before, limit, named_only }) = asks.pop() {
+            req += 1;
+            m.page_sent(req);
+            asks.extend(m.apply(catalog_page(req, before.as_ref(), limit, named_only)));
         }
-        assert_eq!(n, 1, "the newest 200 hold them all: no named list asked");
-        assert_eq!(m.named.recent.iter().filter(|v| v.name.is_some()).count(), 12, "eleven saved and one held");
+        assert_eq!(req, 1, "one page of 200 holds them all: no named list asked");
+        assert_eq!(m.named.recent.iter().filter(|v| v.name.is_some()).count(), 11, "the held one is in no page");
         assert!(m.named.recent_loaded && !m.named.recent_truncated);
-        assert_eq!(crate::rail::history(&m).len(), 131, "the held one is not history");
-        let Event::SavedSessions { sessions, truncated, .. } = saved(false, 5) else { panic!() };
-        assert_eq!((sessions.len(), truncated), (5, true));
+        assert_eq!(crate::rail::history(&m).len(), 131);
+        // Paged by its cursor: every row once, in order.
+        let mut before = None;
+        let mut ids = Vec::new();
+        loop {
+            let Event::CatalogPage { sessions, next, rejected: 0, .. } = catalog_page(9, before.as_ref(), 50, false) else { panic!() };
+            assert!(sessions.iter().all(SessionMeta::is_saved));
+            ids.extend(sessions.into_iter().map(|s| s.id));
+            match next {
+                Some(c) => before = Some(c),
+                None => break,
+            }
+        }
+        let all: Vec<String> = catalog(0).iter().map(|v| v["id"].as_str().unwrap_or_default().to_string()).collect();
+        assert_eq!((ids.len(), ids), (131, all));
+        let Event::CatalogPage { sessions, next: None, .. } = catalog_page(9, None, 200, true) else { panic!() };
+        assert_eq!(sessions.len(), 11);
     }
 }
