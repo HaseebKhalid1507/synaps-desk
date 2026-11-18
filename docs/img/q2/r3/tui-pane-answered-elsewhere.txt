@@ -1,0 +1,26 @@
+  SynapsCLI ❯ ~/.cache/q2-live · Use the bash tool to run exactly: echo …                                                      2 clients     ⠼ tools
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+
+                                    ┃
+                                    ┃ Confirm tool call
+                                    ┃ Extension: guard
+                                    ┃ Tool: bash
+                                    ┃
+                                    ┃ Message from guard:
+                                    ┃ bash wants to run a command in ~:
+                                    ┃ $ echo q2-elsewhere .
+                                    ┃
+                                    ┃ Allow this tool call?
+                                    ┃
+                                    ┃ [ Allow (y) ]   [ Allow all from guard this session ]   [ Deny (n) ]
+                                    ┃
+                                    ┃ Allow all: later confirms from guard (any tool) are approved without asking until
+                                    ┃ /new or /confirms reset. Other extensions still ask.
+                                    ┃
+                                    ┃ y allow · n/Esc deny · Tab/←/→ select · Enter presses the selected button · Allow
+                                    ┃ all: select it, Enter, then Enter again
+
+ ▗▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▖
+ ▐ ❯                                                                                                                                                          ▌
+ ▝▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▘
+ ctrl+c quit   esc abort   shift+↑↓ scroll   ctrl+o compact   enter send                $0.0197 840↑ 208↓  ░░░░░░░░░░░░░░ 2% θ low   anthropic/claude-haiku-4-5

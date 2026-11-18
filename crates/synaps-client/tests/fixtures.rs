@@ -872,3 +872,38 @@ fn a_live_only_transcript_trims_its_oldest_rows() {
     h.apply_history(&[serde_json::json!({"role": "user", "content": "hi"}), serde_json::json!({"role": "assistant", "content": "yo"})]);
     assert_eq!(h.trim_live_front(1, 0), 0);
 }
+
+/// A prompt's `raised_at` and `confirm_scope` (agent-engine
+/// `session::types::PromptRequest`) decode when they are there; missing,
+/// `null` or a shape this client doesn't read is `None`, never a failed
+/// prompt (or a failed attach).
+#[test]
+fn a_prompts_raised_at_and_scope_are_read_leniently() {
+    let full: PromptRequest = serde_json::from_value(serde_json::json!({
+        "id": 7, "kind": "confirm", "title": "Confirm tool call", "prompt": "Allow?",
+        "raised_at": "2026-11-17T14:21:05.123Z",
+        "confirm_scope": {"extensions": ["guard"], "tool": "bash"}
+    }))
+    .unwrap();
+    assert_eq!(full.raised_at.as_deref(), Some("2026-11-17T14:21:05.123Z"));
+    let scope = full.allow_all().expect("a confirm with an extension offers Allow all");
+    assert_eq!(scope.tool.as_deref(), Some("bash"));
+    assert_eq!(scope.allow_all_label(), "Allow all from guard this session");
+    assert!(scope.rewritten_by.is_empty());
+    for odd in [
+        serde_json::json!({"id": 1}),
+        serde_json::json!({"id": 1, "raised_at": null, "confirm_scope": null}),
+        serde_json::json!({"id": 1, "raised_at": 17, "confirm_scope": ["guard"]}),
+        serde_json::json!({"id": 1, "raised_at": {}, "confirm_scope": {"extensions": "guard"}}),
+    ] {
+        let pr: PromptRequest = serde_json::from_value(odd.clone()).unwrap_or_else(|e| panic!("{odd}: {e}"));
+        assert_eq!((pr.raised_at, pr.confirm_scope), (None, None), "{odd}");
+    }
+    // No extension to latch, or a secret: no Allow all.
+    let empty: PromptRequest =
+        serde_json::from_value(serde_json::json!({"id": 2, "confirm_scope": {"extensions": [], "tool": "bash"}})).unwrap();
+    assert!(empty.confirm_scope.is_some() && empty.allow_all().is_none());
+    let secret: PromptRequest =
+        serde_json::from_value(serde_json::json!({"id": 3, "kind": "secret", "confirm_scope": {"extensions": ["guard"]}})).unwrap();
+    assert!(secret.allow_all().is_none());
+}
