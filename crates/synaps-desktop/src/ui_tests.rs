@@ -1342,6 +1342,55 @@ fn a_folded_run(cx: &mut TestAppContext, view: &Entity<AppView>) -> u64 {
     })
 }
 
+/// The design gate of #23, S1 (T4): a body opened or closed at the list's
+/// end leaves its clicked row where it is: opening, the list keeps its top
+/// row and the body grows down; closing, its room past what was under the
+/// view is held at the end as it glides.
+#[gpui_kit::test]
+fn a_body_at_the_end_keeps_its_row_put(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| {
+        v.client = None;
+        v.model.transcript.set_busy(true);
+    });
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    running_tools(cx, &view, 1);
+    view.update(cx, |v, cx| {
+        let out: String = (0..12).map(|k| format!("line {k}\n")).collect();
+        v.model
+            .transcript
+            .apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: out }) });
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    wait(cx, w, &view, 1000);
+    let id = view.read_with(cx, |v, _| v.model.transcript.items().iter().rev().find(|i| i.tool.is_some()).map(|i| i.id)).expect("the call");
+    let top = |cx: &mut TestAppContext| {
+        VisualTestContext::from_window(w, cx)
+            .debug_bounds(String::leak(format!("tool-row {id}")))
+            .map(|b| f32::from(b.top()))
+            .expect("its row")
+    };
+    let well = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("well {id}"))).is_some();
+    for open in [!well(cx), well(cx) == false] {
+        let at = top(cx);
+        view.update(cx, |v, cx| {
+            v.toggle(id);
+            cx.notify();
+        });
+        let mut ys = vec![];
+        for _ in 0..150 {
+            fluid_frame(cx, w, &view);
+            ys.push(top(cx) - at);
+        }
+        assert!(ys.iter().all(|d| d.abs() <= 0.5), "{}: its row's offsets {ys:?}", if open { "opening" } else { "closing" });
+    }
+}
+
 /// Every row on screen, by identity: its top (the gate's "column").
 fn row_tops(cx: &mut TestAppContext, view: &Entity<AppView>) -> std::collections::HashMap<(u64, bool), f32> {
     view.read_with(cx, |v, _| {
