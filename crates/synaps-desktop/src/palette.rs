@@ -186,9 +186,21 @@ pub(crate) fn near_miss(text: &str) -> Option<&'static str> {
 }
 
 /// What a command says while a turn runs (the TUI's rule, for the
-/// composer and the palette alike): it is not run.
+/// composer and the palette alike): it is not run. (HALT is in the foot.)
 pub(crate) fn mid_turn(name: &str) -> String {
-    format!("/{name} can't run while a turn runs: halt it first (Esc, Esc), or wait")
+    format!("/{name}: not while a turn runs")
+}
+
+/// What a command says where this window may not drive the session
+/// (`why`: [`crate::model::Model::input_gate`]'s), short enough for the
+/// composer's foot at 1280 (its tooltip has it whole too).
+pub(crate) fn not_here(name: &str, why: &str) -> String {
+    match why {
+        "read-only here: another client owns this session's input" => format!("/{name}: owner only · another client has the input"),
+        "read-only: this window observes the session" => format!("/{name}: owner only · this window observes"),
+        // Reconnecting, switching, not attached: the reason's head.
+        why => format!("/{name} not run · {}", why.split(':').next().unwrap_or(why)),
+    }
 }
 
 /// `arg` as `name`'s grammar (the daemon's, agent-engine
@@ -245,13 +257,13 @@ pub(crate) fn reply_note(name: &str, reply: &CommandReply) -> String {
     let first = |t: &str| t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string();
     match reply {
         // `/compact` answers nothing: whether it started, the log says.
-        CommandReply::Done(t) if first(t).is_empty() && name == "compact" => "/compact: asked, see the log".into(),
+        CommandReply::Done(t) if first(t).is_empty() && name == "compact" => "/compact: asked · see the transcript".into(),
         CommandReply::Done(t) if first(t).is_empty() => format!("/{name}: done"),
         // More than a line: the transcript's row has it, just above (a
         // first line is often a header: never the note's last word).
         CommandReply::Done(t) => match t.trim().lines().count() {
             1 => format!("/{name}: {}", first(t)),
-            n => format!("/{name}: {n} lines ↓"),
+            n => format!("/{name}: {n} lines, in the transcript"),
         },
         CommandReply::NotRun(why) => format!("/{name} not run: {}", first(why)),
         CommandReply::Unknown(why) => format!("/{name}: unknown — {}", first(why)),
@@ -858,7 +870,7 @@ impl AppView {
             e.key = gate.is_some().then(|| "owner".into());
             e.rank = 100 + i as u32;
             e.off = match gate {
-                Some(why) => Some(format!("/{name} is the session owner's: {why}").into()),
+                Some(why) => Some(not_here(name, why).into()),
                 None => busy.then(|| mid_turn(name).into()),
             };
             commands.push(e);
@@ -934,7 +946,7 @@ impl AppView {
     /// (both doors: one rule). Its answer comes back as the composer's note.
     pub(crate) fn run_command(&mut self, name: &'static str, arg: String) -> bool {
         if let Err(why) = self.model.input_gate() {
-            self.watch_note = Some(format!("/{name} is the session owner's: {why}").into());
+            self.watch_note = Some(not_here(name, why).into());
             self.model.view_dirty = true;
             return false;
         }
@@ -953,6 +965,7 @@ impl AppView {
         }
         log::debug!(target: "synaps_desktop::send", "/{name}");
         self.watch_note = Some(format!("/{name}: sent, waiting for the daemon").into());
+        self.quiet_note = self.watch_note.clone();
         self.model.view_dirty = true;
         true
     }
@@ -1067,7 +1080,8 @@ impl AppView {
         let max = LIST_MAX.min((bottom - ABOVE_COMPOSER - top - CHROME_H).max(ROW_H * 3.));
         #[cfg(test)]
         self.palette_box.set((top, top + CHROME_H + max));
-        let target = content.min(max);
+        // A miss (or nothing yet) is a row: its "Nothing matches" shows.
+        let target = if lines.is_empty() { ROW_H } else { content.min(max) };
         let snap = crate::motion::SNAP_RESPONSE;
         let (h, _) = fx.spring(PAL_H, None, target, snap);
         let h = fx.snap(h);
@@ -1140,6 +1154,9 @@ impl AppView {
                         Lead::None => div().flex_none().size(px(10.)).into_any_element(),
                     };
                     let title = if e.off.is_some() { p.dim_k } else { p.prose_k };
+                    // Matched letters: the accent as card text; on a row that
+                    // cannot act, plain text (never the accent over "off").
+                    let lit = if e.off.is_some() { p.prose_k } else { p.you_k };
                     h_flex()
                         .id(("palette-row", k))
                         .h(px(ROW_H))
@@ -1164,7 +1181,7 @@ impl AppView {
                                         .when(e.mono, |d| d.font_family(fonts::MONO).text_px(MONO_TITLE))
                                         .when(!e.mono, |d| d.text_px(size::UI))
                                         .text_color(title)
-                                        .child(marked(&e.title, &marks.0, p.you)),
+                                        .child(marked(&e.title, &marks.0, lit)),
                                 )
                                 .when(!e.meta.is_empty(), |d| {
                                     d.child(
@@ -1175,7 +1192,7 @@ impl AppView {
                                             .min_w_0()
                                             .overflow_hidden()
                                             .text_ellipsis()
-                                            .child(marked(&e.meta, &marks.1, p.you)),
+                                            .child(marked(&e.meta, &marks.1, lit)),
                                     )
                                 }),
                         )
@@ -1193,7 +1210,11 @@ impl AppView {
         }
         if lines.is_empty() {
             let why = if pal.query.is_empty() { "Nothing here yet" } else { "Nothing matches" };
-            list = list.child(h_flex().h(px(ROW_H)).px(px(16.)).items_center().child(mono(why, size::META, p.dim_k)));
+            list = list.child(h_flex().h(px(ROW_H)).px(px(16.)).items_center().debug_selector(|| "palette-empty".into()).child(mono(
+                why,
+                size::META,
+                p.dim_k,
+            )));
         }
         let seg = |mode: Mode, text: &'static str| {
             let on = pal.mode == mode;
@@ -1263,7 +1284,10 @@ impl AppView {
             .child(div().h(px(8.)))
             // The house scrollbar, at rest too: the list goes on below.
             .child(
-                crate::scrollbar::Bar::new(self.palette_scroll.clone(), &self.bars.palette).ground(crate::scrollbar::Ground::Card).always(),
+                crate::scrollbar::Bar::new(self.palette_scroll.clone(), &self.bars.palette)
+                    .ground(crate::scrollbar::Ground::Card)
+                    .always()
+                    .instant(),
             );
         Some(deferred(anchored().position(point(px(x), px(top))).child(body)).with_priority(4))
     }
@@ -1370,10 +1394,10 @@ mod tests {
     /// transcript; no answer is unknown, not "not run".
     #[test]
     fn reply_notes_say_what_happened() {
-        assert_eq!(reply_note("compact", &Done(String::new())), "/compact: asked, see the log");
+        assert_eq!(reply_note("compact", &Done(String::new())), "/compact: asked · see the transcript");
         assert_eq!(reply_note("confirms", &Done(String::new())), "/confirms: done");
         let workers = "Workers (2):\n  sa_1  scout  running  0m\n  sa_2  wren  completed  3m";
-        assert_eq!(reply_note("workers", &Done(workers.into())), "/workers: 3 lines ↓");
+        assert_eq!(reply_note("workers", &Done(workers.into())), "/workers: 3 lines, in the transcript");
         assert_eq!(
             reply_note("model", &NotRun("not switched: the model is still claude-opus-4-6".into())),
             "/model not run: not switched: the model is still claude-opus-4-6"

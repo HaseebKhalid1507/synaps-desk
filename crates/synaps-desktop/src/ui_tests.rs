@@ -5342,10 +5342,10 @@ fn palette_engine_commands_are_the_owners(cx: &mut TestAppContext) {
     let sel = view.read_with(cx, |v, _| v.palette.as_ref().and_then(|p| p.selected().cloned())).expect("a row");
     assert_eq!(sel.act, crate::palette::Act::Engine("compact"));
     assert_eq!(sel.key.as_deref(), Some("owner"), "marked");
-    assert!(sel.off.as_deref().is_some_and(|o| o.contains("owner's") && o.contains("observes")), "{:?}", sel.off);
+    assert!(sel.off.as_deref().is_some_and(|o| o.contains("owner only") && o.contains("observes")), "{:?}", sel.off);
     tap(cx, w, "enter");
     let note = view.read_with(cx, |v, _| v.watch_note.clone()).expect("a note");
-    assert!(note.contains("owner's"), "refused politely: {note}");
+    assert!(note.contains("owner only"), "refused politely: {note}");
     // Driving: it goes out (the client takes it; its daemon is nowhere).
     view.update(cx, |v, cx| {
         v.model.active.as_mut().unwrap().mode = mode;
@@ -5459,7 +5459,7 @@ fn the_composer_runs_only_whole_valid_commands(cx: &mut TestAppContext) {
     assert_eq!(kind, synaps_client::transcript::ItemKind::Output);
     assert!(note && text.starts_with("/workers\nWorkers (12):") && text.ends_with("sa_12  scout  running  0m"), "{text}");
     assert_eq!(in_flight(cx, &view).len(), messages, "never sent");
-    assert!(view.read_with(cx, |v, _| v.watch_note.clone()).is_some_and(|n| n.contains("/workers: 13 lines ↓")));
+    assert!(view.read_with(cx, |v, _| v.watch_note.clone()).is_some_and(|n| n.contains("/workers: 13 lines, in the transcript")));
 }
 
 /// Shady #20 H2: while a turn runs, prose that starts with a command word
@@ -5477,7 +5477,7 @@ fn mid_turn_a_command_is_not_run_and_prose_steers(cx: &mut TestAppContext) {
         assert_eq!(in_flight(cx, &view).len(), before, "{t}: nothing sent");
         assert_eq!(composer_text(cx, &view), t, "{t}: the text stays");
         let note = view.read_with(cx, |v, _| v.watch_note.clone()).expect("a note");
-        assert!(note.contains("can't run while a turn runs"), "{note}");
+        assert!(note.contains("not while a turn runs"), "{note}");
     }
     send_in_composer(cx, w, &view, "/workers are stuck, look");
     assert_eq!(in_flight(cx, &view).last().map(String::as_str), Some("/workers are stuck, look"), "a steer");
@@ -5555,6 +5555,69 @@ fn palette_fits(cx: &mut TestAppContext, (wd, ht): (f32, f32)) {
     assert!(strip > crate::tabstrip::TAB_H && composer > top, "laid out: strip {strip}, composer {composer}");
     assert!(top >= strip + 8., "{wd}: the box's top {top} under the strip's bottom {strip}");
     assert!(bottom <= composer - 12., "{wd}: the box's bottom {bottom}, the composer's top {composer}");
+    // Design re-gate #20 (1): the demo's worker chips show over the
+    // composer: the box ends 12 px or more above them too.
+    let chips = view.read_with(cx, |v, _| v.chip_bounds.borrow().iter().map(|c| f32::from(c.1.origin.y)).reduce(f32::min));
+    let chips = chips.expect("the demo's chips show");
+    assert!(chips < composer, "the chips over the composer: {chips}, {composer}");
+    assert!(bottom <= chips - 12., "{wd}: the box's bottom {bottom}, the chips' top {chips}");
+}
+
+/// Design re-gate #20 (3): an answered command's note is quiet (`dim_u`),
+/// a refusal a warning; `/compact`'s "asked" note goes once the compaction
+/// it asked for has its notice in the transcript; and a note cut short has
+/// the house tooltip.
+#[gpui_kit::test]
+fn command_notes_are_quiet_and_never_stale(cx: &mut TestAppContext) {
+    use synaps_client::CommandReply::Done;
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    idle(cx, &view);
+    let color = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, cx| {
+            let p = crate::theme::palette(cx);
+            let n = v.watch_note.clone().expect("a note");
+            (v.note_color(&n, &p) == p.dim_u, v.note_color(&n, &p) == p.warn)
+        })
+    };
+    send_in_composer(cx, w, &view, "/compact");
+    assert_eq!(color(cx), (true, false), "sent: quiet");
+    reply(cx, &view, "compact", Done(String::new()));
+    assert_eq!(note(cx, &view), "/compact: asked · see the transcript");
+    assert_eq!(color(cx), (true, false), "answered: quiet");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("composer-note").is_some(), "drawn in the foot");
+    view.update(cx, |v, cx| {
+        let seq = v.model.active.as_ref().expect("attached").attach_seq;
+        let sid = v.model.active.as_ref().expect("attached").session_id.clone();
+        let ev = synaps_client::protocol::SessionEvent::CompactionApplied {
+            previous_session_id: sid.clone(),
+            session_id: sid.clone(),
+            msg_count: 2,
+        };
+        v.apply_batch(vec![synaps_client::Event::session(seq, sid, 1, ev, std::sync::Arc::new(serde_json::Value::Null))], cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(note(cx, &view), "", "the compaction's notice is in the transcript: the note is done");
+    // Refused (mid-turn): a warning.
+    start_stream(cx, &view);
+    send_in_composer(cx, w, &view, "/budget");
+    assert_eq!(color(cx), (false, true), "refused: a warning");
+}
+
+/// Design re-gate #20 (2): a query that matches nothing shows "Nothing
+/// matches": the list is a row high, never 0.
+#[gpui_kit::test]
+fn palette_miss_shows_nothing_matches(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(true));
+    type_in(cx, w, "zzqxv");
+    for _ in 0..20 {
+        wait(cx, w, &view, 33);
+    }
+    let (h, target, _, _) = view.read_with(cx, |v, _| v.palette_drawn.get());
+    assert_eq!((h, target), (crate::palette::ROW_H, crate::palette::ROW_H), "a row high");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("palette-empty").is_some_and(|b| b.size.height > px(0.)), "drawn");
 }
 
 #[gpui_kit::test]
