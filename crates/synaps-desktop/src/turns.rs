@@ -256,6 +256,11 @@ pub(crate) fn mean_height(disp: &[Disp], rows: &[RowCache], m: &Metrics, cpl: f3
         .map(|d| {
             let lines = match d.kind {
                 Kind::User | Kind::Prose | Kind::Note => rows.get(d.item).map_or(1., |r| text_lines(&r.text, cpl)),
+                // Folded (its first lines) under its head line.
+                Kind::Event => rows.get(d.item).map_or(1., |r| {
+                    let data = r.event.as_ref().is_some_and(|e| e.data.is_some());
+                    text_lines(&r.text, cpl).min(crate::events::EVENT_LINES as f32) + 1. + f32::from(u8::from(data))
+                }),
                 _ => 1.,
             };
             gap_of(d.gap, m) + lines * m.body_line + 2. * m.pad_y
@@ -303,6 +308,9 @@ pub(crate) enum Kind {
     Prose,
     /// A notice or an error: one mono line.
     Note,
+    /// An engine event ([`crate::events`]): a message of its own, as the
+    /// user's is (the agent's reply under it is labelled).
+    Event,
     /// A foldable run's summary: its items are `item..end`.
     Summary {
         end: usize,
@@ -509,6 +517,14 @@ pub(crate) fn build(
                 }
                 i = end;
             }
+            // An event: a message the agent answers, as a user's is (a
+            // turn's gap above it, the agent's next words labelled); never
+            // a user row.
+            ItemKind::Event => {
+                out.push(row(Kind::Event, if i == 0 { Gap::First } else { Gap::Turn }, Who::None));
+                agent = false;
+                i += 1;
+            }
             // A command's answer: its own label; the agent's next words
             // are labelled again.
             ItemKind::Output => {
@@ -572,7 +588,7 @@ fn time_text(t: &crate::times::Stamp, p: &Palette, m: &Metrics) -> Div {
 /// A labelled row's time (`crate::times`): [`time_text`], the date and
 /// seconds in its tooltip, made when that opens.
 /// Static text: it never animates (a history row's least of all).
-fn time_slot(t: &crate::times::Stamp, id: u64, p: &Palette, m: &Metrics) -> Stateful<Div> {
+pub(crate) fn time_slot(t: &crate::times::Stamp, id: u64, p: &Palette, m: &Metrics) -> Stateful<Div> {
     let at = t.clone();
     time_text(t, p, m)
         .id(("time", id))
@@ -1400,6 +1416,10 @@ impl AppView {
                 }
             }
             Kind::Note if item.kind == ItemKind::Output => self.render_output(item, row, &p, &m, cx),
+            Kind::Event => match row.event.as_deref() {
+                Some(v) => self.render_event(item.id, v, row.time.as_ref(), &p, &m, cx),
+                None => mono(row.text.clone(), m.meta, p.dim).w_full().whitespace_normal().into_any_element(),
+            },
             Kind::Note => {
                 let color = if item.kind == ItemKind::Error { p.err } else { p.dim };
                 mono(row.text.clone(), m.meta, color).w_full().whitespace_normal().into_any_element()
@@ -2364,6 +2384,7 @@ mod tests {
                 Kind::User => "user",
                 Kind::Prose => "prose",
                 Kind::Note => "note",
+                Kind::Event => "event",
                 Kind::Summary { open: false, .. } => "fold",
                 Kind::Summary { open: true, .. } => "unfold",
                 Kind::Work => "work",
@@ -2390,6 +2411,56 @@ mod tests {
         // Rebuilt from the row after it: the same.
         let from = build(t.items(), 3, false, &HashSet::new(), &Subagents::default());
         assert_eq!(from.iter().map(|d| d.who).collect::<Vec<_>>(), [Who::Agent]);
+    }
+
+    /// Shady #22 H1: an event that comes while the agent's reply streams
+    /// sits under the reply until the engine delivers it: one AGENT
+    /// response, never two around the event; the same rows when its
+    /// history lands. Delivered between rounds, the next round's words
+    /// are labelled again, under it, as its history has them.
+    #[test]
+    fn an_event_mid_reply_never_splits_the_agents_words() {
+        let ev = |v: serde_json::Value| synaps_client::protocol::decode_event(&v).unwrap();
+        let text = |t: &str| ev(json!({"ev": "stream", "event": {"kind": "llm", "llm": "text", "text": t}}));
+        let start = || ev(json!({"ev": "stream", "event": {"kind": "llm", "llm": "response_start"}}));
+        let form = "<event id=\"ev-1\" type=\"message\" severity=\"high\" source=\"cli\">deploy finished</event>";
+        let frame = json!({"ev": "external", "event": {"id": "ev-1", "timestamp": "2031-02-03T04:05:06Z",
+            "source": {"source_type": "cli", "name": "cli"}, "sender": {"id": "u", "name": "ci", "sender_type": "user"},
+            "content": {"text": "deploy finished", "content_type": "message", "severity": "High"}, "expects_response": false}});
+        let who = |t: &Transcript| {
+            let rows = build(t.items(), 0, true, &HashSet::new(), &Subagents::default());
+            (kinds(&rows), rows.iter().map(|d| d.who).collect::<Vec<_>>())
+        };
+        let mut t = Transcript::new();
+        t.apply(&ev(json!({"ev": "turn_started", "trigger": "user", "user_text": "go"})));
+        t.apply(&start());
+        t.apply(&text("one "));
+        t.apply(&ev(frame.clone()));
+        t.apply(&text("two"));
+        let live = who(&t);
+        assert_eq!(live, (vec!["user", "prose", "event"], vec![Who::You, Who::Agent, Who::None]));
+        t.apply_history(&[
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "one two"}]}),
+            json!({"role": "user", "content": form}),
+        ]);
+        assert_eq!(who(&t), live, "the history the same");
+        // Then a tool round, the event delivered after its result.
+        let mut t = Transcript::new();
+        t.apply(&ev(json!({"ev": "turn_started", "trigger": "user", "user_text": "go"})));
+        t.apply(&start());
+        t.apply(&text("checking "));
+        t.apply(&ev(frame));
+        t.apply(&text("now"));
+        t.apply(&ev(json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use_start", "tool_name": "bash", "tool_id": "t1"}})));
+        t.apply(&ev(json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": "t1", "result": "ok"}})));
+        t.apply(&ev(json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": form}})));
+        t.apply(&start());
+        t.apply(&text("done"));
+        assert_eq!(
+            who(&t),
+            (vec!["user", "prose", "work", "event", "prose"], vec![Who::You, Who::Agent, Who::None, Who::None, Who::Agent])
+        );
     }
 
     /// Shady #20 N6: folded only when that hides two lines or more (the

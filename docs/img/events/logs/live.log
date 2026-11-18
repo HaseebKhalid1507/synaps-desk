@@ -1,0 +1,20 @@
+07:25:15 config sha before c1b7ac413e69b481f888f4099010600b7183fc342bc5a6926f886a59b0320edd; settings.json mtime 2026-11-18 07:04:07.671430641 -0500
+07:25:15 temp auth lines added: 2
+07:25:18 daemon pid 999723
+07:25:58 main 20261118-122518-6baa side 20261118-122538-e34b
+Event sent to session 20261118-122518-6baa via socket.
+Event sent to session 20261118-122518-6baa via socket.
+07:27:17 frames logged: 41 lines
+Event sent to session 20261118-122518-6baa via socket.
+Event sent to session 20261118-122518-6baa via socket.
+Event sent to session 20261118-122518-6baa via socket.
+Event sent to session 20261118-122518-6baa via socket.
+Event sent to session 20261118-122518-6baa via socket.
+Event sent to session 20261118-122538-e34b via socket.
+Event sent to session 20261118-122518-6baa via socket.
+07:30:01 record done
+07:33:26 reload done
+07:35:15 reload done
+daemon stopped (pid 999723)
+07:35:34 config restored sha c1b7ac413e69b481f888f4099010600b7183fc342bc5a6926f886a59b0320edd (before c1b7ac413e69b481f888f4099010600b7183fc342bc5a6926f886a59b0320edd), auth lines 0
+07:35:34 settings.json mtime 2026-11-18 07:04:07.671430641 -0500
