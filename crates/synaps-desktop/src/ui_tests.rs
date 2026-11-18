@@ -3853,6 +3853,44 @@ fn fluid_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVie
     cx.run_until_parked();
 }
 
+/// Shady #23 r2 H1: the list's end is its bottom, exactly, whatever frames
+/// land mid-growth. Each frame rate puts different rows out of view in the
+/// middle of their growth, where the list keeps the height it last
+/// measured; a fractional one put CI's end an f32 ulp off. At 24 to 240 Hz:
+/// the end is the bottom every frame, and every row drawn is whole.
+#[gpui_kit::test]
+fn the_lists_end_is_exact_at_any_frame_rate(cx: &mut TestAppContext) {
+    for hz in [24u64, 37, 60, 144, 240] {
+        let (w, view, _events) = open(cx);
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| v.client = None);
+        start_stream(cx, &view);
+        settle(cx, w, 8);
+        view.update(cx, |v, _| v.list.scroll_to_end());
+        let dt = std::time::Duration::from_micros(1_000_000 / hz);
+        for k in 0..90 {
+            stream_step(cx, &view, k);
+            view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
+            cx.executor().advance_clock(dt);
+            view.update(cx, |_, cx| cx.notify());
+            cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+            cx.run_until_parked();
+            let (gap, pad, frac) = view.read_with(cx, |v, cx| {
+                let n = v.list.item_count();
+                let pad = (28. * crate::theme::metrics(cx).r).round();
+                let gap = v.list.bounds_for_item(n - 1).map(|b| f32::from(v.list.viewport_bounds().bottom() - b.bottom()));
+                let frac: Vec<(usize, f32)> = (0..n)
+                    .filter_map(|ix| v.list.bounds_for_item(ix).map(|b| (ix, f32::from(b.size.height))))
+                    .filter(|r| r.1.fract() != 0.)
+                    .collect();
+                (gap, pad, frac)
+            });
+            assert!(frac.is_empty(), "{hz} Hz, frame {k}: rows off the pixel grid {frac:?}");
+            assert_eq!(gap, Some(pad), "{hz} Hz, frame {k}: the end is the bottom");
+        }
+    }
+}
+
 /// A turn starts streaming in the shown session.
 fn start_stream(cx: &mut TestAppContext, view: &Entity<AppView>) {
     use synaps_client::protocol::{LlmEvent, StreamEvent};

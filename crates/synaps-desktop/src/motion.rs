@@ -438,7 +438,11 @@ pub(crate) fn grow_block(body: AnyElement, label: Option<(Div, f32)>, head: Opti
         .flex()
         .flex_col()
         .debug_selector(move || format!("grow-clip-{key}"))
-        .when_some(g.shown, |d, h| d.h(px(h)))
+        // Whole pixels, every frame: a fractional height left in the
+        // list's sums by a row that scrolls out of view mid-growth (never
+        // measured again) puts its end an f32 ulp off (Shady #23 r2 H1:
+        // which frames land mid-growth differs by runner).
+        .when_some(g.shown, |d, h| d.h(px(h.round())))
         .child(lift_from(content, g.strength, g.floor))
         .on_children_prepainted(move |b, _, _| {
             if let Some(b) = b.first() {
