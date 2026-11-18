@@ -1422,7 +1422,36 @@ fn idle_requests_no_frames(cx: &mut TestAppContext) {
     // The switch's new numbers afterglow (motion.md §6.6, fluid.md §3.6):
     // three steps on a timer over `glow`.
     wait(cx, w, &view, crate::motion::GLOW.as_millis() as u64);
-    assert_eq!(motion_pending(cx, &view), (false, None), "settled: no frame, no timer");
+    only_the_rail_spins(cx, w, &view, "settled");
+}
+
+/// Nothing runs in the column, the composer or the tray (Shady #17 M3,
+/// pinned): no display frame; no sweep; the only sites are the rail's
+/// running sessions' spinners (polish.md P1); and the only timer, if any,
+/// is theirs: the beat layer's, on the beat grid. Then, the rail's
+/// sessions at rest too, gate 3 exactly: no frame and no timer.
+fn only_the_rail_spins(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, what: &str) {
+    let (frame, timer) = motion_pending(cx, view);
+    assert!(!frame, "{what}: a display frame");
+    let (sites, rail, sweeps) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width, v.fx.sweep_count()));
+    assert_eq!(sweeps, 0, "{what}: a sweep");
+    assert!(sites.iter().all(|s| matches!(s.beat, crate::motion::Beat::Spin(_)) && f32::from(s.origin.x) < rail), "{what}: {sites:?}");
+    let at = timer.expect("the demo's rail runs: its spinners' beat");
+    assert!(!sites.is_empty(), "{what}: a timer with nothing on the layer");
+    assert!(view.read_with(cx, |v, _| v.fx.on_beats(at, 1)), "{what}: the timer is the beat's, not 30 Hz or a frame's");
+    assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::Beat), "{what}: the layer's beat, not the app");
+    view.update(cx, |v, cx| {
+        for m in v.model.sessions.iter_mut() {
+            (m.busy, m.subagents_running) = (false, 0);
+        }
+        v.model.rail_gen += 1;
+        cx.notify();
+    });
+    for _ in 0..4 {
+        wait(cx, w, view, 500);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.fx.sites().len()), 0, "{what}, the rail at rest: nothing on the layer");
+    assert_eq!(motion_pending(cx, view), (false, None), "{what}, the rail at rest: no frame, no timer");
 }
 
 /// A screen full of running things: no display frames for ambient, one
@@ -1572,6 +1601,41 @@ fn an_unfold_under_full_keeps_its_header_put(cx: &mut TestAppContext) {
     assert!(opened >= 5, "its rows are in the list ({opened})");
     settle(cx, w, 8);
     assert_eq!(header(cx, run), Some(at), "at rest");
+}
+
+/// A fold during its own unfold's reveal takes its rows out of the hold
+/// at once (Shady #17 L3): the hold never keeps ids no longer listed.
+#[gpui_kit::test]
+fn a_fold_drops_its_rows_from_the_unfold_hold(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    settle(cx, w, 8);
+    let run = view.read_with(cx, |v, _| {
+        v.disp
+            .iter()
+            .filter(|d| matches!(d.kind, crate::turns::Kind::Summary { open: false, .. }))
+            .map(|d| d.id)
+            .next_back()
+            .expect("a folded run")
+    });
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    let held = view.read_with(cx, |v, _| v.unfold_hold.len());
+    assert!(held > 0, "the unfold's rows are held while they reveal");
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    let left = view.read_with(cx, |v, _| {
+        let shown: std::collections::HashSet<u64> = v.disp.iter().map(|d| d.id).collect();
+        v.unfold_hold.iter().filter(|id| !shown.contains(id)).count()
+    });
+    assert_eq!(left, 0, "folded: none of its rows stay held");
+    assert!(view.read_with(cx, |v, _| v.unfold_hold.is_empty()), "nothing else was held");
 }
 
 /// Words arrive readable (fluid.md law 3, §3.4): the one stream fade in
@@ -2413,7 +2477,7 @@ fn a_switch_replays_nothing(cx: &mut TestAppContext) {
     let t0 = mark(cx);
     open_idle_cpu(cx, &view, crate::tabs::Place::Current);
     check(cx, "a switch in the tab", t0);
-    assert_eq!(motion_pending(cx, &view), (false, None), "Idle CPU runs nothing: no frame, no timer");
+    only_the_rail_spins(cx, w, &view, "Idle CPU runs nothing");
     // And back.
     let t0 = mark(cx);
     view.update(cx, |v, cx| {
@@ -2552,6 +2616,8 @@ fn frames(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, u64) {
 fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (1440., 1800.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
+    // The beat alone (the sweep's 30 Hz: `a_sweep_ticks_only_while_drawn`).
+    view.update(cx, |v, _| v.fx.no_sweep.set(true));
     running_tools(cx, &view, 25);
     // The arrivals draw in and settle.
     for _ in 0..12 {
@@ -2559,7 +2625,7 @@ fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     }
     assert!(!motion_pending(cx, &view).0, "settled: no display frames");
     let sites = view.read_with(cx, |v, _| v.fx.sites());
-    let scans = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Scan(_))).count();
+    let scans = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count();
     assert!(scans >= 25, "the running glyphs on screen are the layer's: {scans}");
     let (f0, l0) = frames(cx, &view);
     let p0 = view.read_with(cx, |v, _| v.fx.painted.borrow().len());
@@ -2607,10 +2673,211 @@ fn the_fuse_burns_clear_of_the_pointer(cx: &mut TestAppContext) {
     assert!(armed.right() <= chip.right() && confirm.right() <= chip.right(), "{confirm:?} in {chip:?}");
 }
 
+/// A local session's events (the bench's way), `raw` each.
+fn local(cx: &mut TestAppContext, view: &Entity<AppView>, raws: Vec<serde_json::Value>) {
+    view.update(cx, |v, cx| {
+        let evs = raws
+            .into_iter()
+            .filter_map(|raw| {
+                let event = synaps_client::protocol::decode_event(&raw).ok()?;
+                Some(synaps_client::Event::session(crate::model::LOCAL_SEQ, "life", 1, event, std::sync::Arc::new(raw)))
+            })
+            .collect();
+        v.apply_batch(evs, cx);
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+}
+
+/// A worker's rows event: `tools` and `step`, running.
+fn worker_rows(tools: u64, step: &str) -> serde_json::Value {
+    serde_json::json!({"ev": "subagent_rows", "rows": [{"subagent_id": 1, "agent_name": "scout", "status": "running",
+        "cancel_requested": false, "elapsed_secs": 2.0, "finished_elapsed": null, "step": step, "tools": tools}]})
+}
+
+/// What painted in the last app frame, in order (`Motion::paint_log`).
+fn painted(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<&'static str> {
+    view.read_with(cx, |v, _| v.fx.paint_log.borrow().clone())
+}
+
+/// `a` painted, after `b` painted.
+fn painted_after(order: &[&str], a: &str, b: &str) -> bool {
+    matches!((order.iter().position(|o| *o == a), order.iter().position(|o| *o == b)), (Some(x), Some(y)) if x > y)
+}
+
+/// polish.md P5's word swap, in a window: a count whose words change with
+/// it (`1 tool` → `2 tools`) keeps its old words until the digits cross
+/// mid-roll, then the new ones; never `1 tools`. No count left rolling in
+/// the app has a plural (worker rows change in place since Q3 r4; `+N
+/// more`, NEEDS YOU and the rail chips have none; `N calls` never changes
+/// while drawn), so a test-only count in the top bar
+/// (`AppView::roll_probe`) rolls through the same element.
+#[gpui_kit::test]
+fn a_counts_words_swap_as_its_digits_cross(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let probe = |cx: &mut TestAppContext, n: usize| {
+        view.update(cx, |v, cx| {
+            v.roll_probe = Some(n);
+            cx.notify();
+        });
+    };
+    probe(cx, 1);
+    wait(cx, w, &view, 16);
+    wait(cx, w, &view, 16);
+    let k = crate::motion::ROLL_PROBE;
+    let words =
+        |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
+    let rolling = |cx: &mut TestAppContext| !view.read_with(cx, |v, _| v.fx.rolling_in(Some(k))).is_empty();
+    assert!(!rolling(cx) && !words(cx), "at rest");
+    probe(cx, 2);
+    wait(cx, w, &view, 16);
+    assert!(rolling(cx), "`1 tool` → `2 tools` rolls");
+    assert!(words(cx), "the first frames: `1 tool`, the digit leaving");
+    let mut crossed = false;
+    for _ in 0..40 {
+        wait(cx, w, &view, 16);
+        crossed |= rolling(cx) && !words(cx);
+        assert!(!crossed || !words(cx), "the old word never comes back");
+    }
+    assert!(crossed, "mid-roll: `2 tools`, the digit still arriving");
+    assert!(!rolling(cx) && !words(cx), "landed: one text");
+}
+
+/// polish.md P5: a count that still rolls (the top bar's NEEDS YOU, one
+/// more session waiting) rolls only its changed digit cells, on the frame
+/// after it changes: the new text and the old a line apart, in px, on
+/// screen, constant as they travel, then one text at rest. Its words are
+/// the same (`N   NEED YOU`): no old words are drawn (`rolled-words`).
+#[gpui_kit::test]
+fn a_count_rolls_in_its_digit_cells(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let rolling = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.rolling_in(Some(crate::motion::ROLL_NEEDS)));
+    assert!(rolling(cx).is_empty(), "at rest");
+    view.update(cx, |v, cx| {
+        let id = v
+            .model
+            .sessions
+            .iter()
+            .find(|m| m.awaiting_input == 0 && m.lifecycle != "ending" && !v.model.is_active(&m.id))
+            .map(|m| m.id.clone())
+            .expect("a session not waiting");
+        if let Some(m) = v.model.sessions.iter_mut().find(|m| m.id == id) {
+            m.awaiting_input = 1;
+        }
+        v.model.rail_gen += 1;
+        cx.notify();
+    });
+    wait(cx, w, &view, 16);
+    let keys = rolling(cx);
+    assert_eq!(keys.len(), 1, "NEEDS YOU's count rolls");
+    let k = keys[0];
+    let apart = |cx: &mut TestAppContext| {
+        let mut vcx = VisualTestContext::from_window(w, cx);
+        let new = vcx.debug_bounds(format!("rolling-{k:x}").leak()).expect("the new text drawn");
+        let old = vcx.debug_bounds(format!("rolled-{k:x}").leak()).expect("the old text drawn");
+        f32::from(new.origin.y) - f32::from(old.origin.y)
+    };
+    let d0 = apart(cx);
+    assert!(d0 > 8., "a line apart, the new one coming up from below: {d0}");
+    let words =
+        |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
+    assert!(!words(cx), "the words are the same: drawn once, in place");
+    for _ in 0..3 {
+        wait(cx, w, &view, 16);
+    }
+    let d1 = apart(cx);
+    assert!(d1 > 0. && (d1 - d0).abs() < 0.01, "a line apart all the way: {d0} {d1}");
+    for _ in 0..40 {
+        wait(cx, w, &view, 16);
+    }
+    assert!(rolling(cx).is_empty(), "landed");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds(format!("rolling-{k:x}").leak()).is_none(), "at rest: one text");
+}
+
+/// Q3 r4 (polish.md P5, gate 4 under a live fan-out; the design's final):
+/// a spawn row's tool count and its live step swap in one frame, at every
+/// level, with no roll and no fade. The frame they change on draws them,
+/// nothing rolls, no display frame is asked for, and no frames follow for
+/// them (a roll was 30 Hz of app frames for ~200 ms): at most a clock's
+/// second (none under Off, where the clocks hold).
+#[gpui_kit::test]
+fn a_spawn_rows_count_and_step_swap_in_one_frame(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    life_worker(cx, w, &view);
+    let levels = [crate::motion::Level::Full, crate::motion::Level::Reduced, crate::motion::Level::Off];
+    for (k, level) in levels.into_iter().enumerate() {
+        set_motion(cx, &view, level);
+        settle(cx, w, 8);
+        let f0 = frames(cx, &view).0;
+        local(cx, &view, vec![worker_rows(2 + k as u64, ["grep -n rotate src", "reading src/b.rs", "cargo check"][k])]);
+        wait(cx, w, &view, 16);
+        let f1 = frames(cx, &view).0;
+        assert!(f1 > f0, "{level:?}: the change drew");
+        assert_eq!(view.read_with(cx, |v, _| v.fx.rolling_in(None)), Vec::<u64>::new(), "{level:?}: nothing rolls");
+        assert!(!motion_pending(cx, &view).0, "{level:?}: no display frame asked for");
+        for _ in 0..18 {
+            wait(cx, w, &view, 16);
+        }
+        let more = frames(cx, &view).0 - f1;
+        assert!(more <= 1, "{level:?}: no frames for it, at most a clock's second: {more}");
+    }
+}
+
+/// polish.md P5: clocks, cost, tokens and % never roll. A running worker's
+/// clocks (its spawn row's and its tray chip's) tick for three seconds:
+/// every frame they draw rolls nothing.
+#[gpui_kit::test]
+fn clocks_never_roll(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    life_worker(cx, w, &view);
+    let f0 = frames(cx, &view).0;
+    for _ in 0..30 {
+        wait(cx, w, &view, 100);
+        assert_eq!(view.read_with(cx, |v, _| v.fx.rolling_in(None)), Vec::<u64>::new(), "a clock's second rolled");
+    }
+    assert!(frames(cx, &view).0 >= f0 + 3, "the clocks ticked (their frames)");
+}
+
+/// The bench's life scene's worker (`SYNAPS_BENCH_LIFE`): a local session,
+/// a turn, scout spawned and running (`1 tool`, its step), at rest.
+fn life_worker(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    view.update(cx, |v, cx| {
+        v.client = None;
+        v.model.set_local_session("life");
+        let t = &mut v.model.transcript;
+        t.apply(&SessionEvent::TurnStarted { turn_baseline: 0, trigger: "user".into(), user_text: Some("go".into()) });
+        v.sync_list();
+        cx.notify();
+    });
+    let res = serde_json::json!({"handle_id": "sa_1", "agent_name": "scout", "status": "running"}).to_string();
+    local(
+        cx,
+        view,
+        vec![
+            serde_json::json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start",
+                "tool_id": "w1", "input": {"agent": "scout", "task": "find the callers"}}}),
+            serde_json::json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": "w1", "result": res}}),
+            worker_rows(1, "reading src/a.rs"),
+        ],
+    );
+    // Two seconds: its clock ticks (the app draws) in between.
+    for _ in 0..25 {
+        wait(cx, w, view, 100);
+    }
+}
+
 /// Finish gate fix 1: a turn that ends here hands the floor back: Handoff
 /// in's light travels down the composer's bar and is gone after `sig`
 /// (its colour, decaying into the bar: `motion::handoff_in_decays_into_the_bar`);
-/// Off draws none.
+/// Off draws none. P3 (polish.md, settle_pass_once_per_turn_end): the
+/// composer's sweep makes one last pass from the same corner, once; none
+/// under Reduced or Off.
 #[gpui_kit::test]
 fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
@@ -2635,18 +2902,43 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
         beat(cx, w, &view);
     }
     let seg = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("handoff-in");
+    // polish.md P2, P3: the composer's top edge sweeps while the turn runs,
+    // then makes one last pass with the Handoff light, from its corner.
+    let pass = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("settle-pass");
+    let sweep = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("sweep");
     assert!(seg(cx).is_none());
+    assert!(sweep(cx).is_some() && pass(cx).is_none(), "running: the composer sweeps");
     busy(cx, false);
     assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current().map(|t| v.tab_state(t))), Some(crate::rail::State::Idle), "READY");
     assert!(seg(cx).is_some(), "the turn ended here: the light travels down the bar");
+    let (s, p) = (seg(cx).unwrap(), pass(cx).expect("settle_pass_once_per_turn_end: the pass with the light"));
+    assert!(sweep(cx).is_none(), "the sweep is over");
+    assert!((f32::from(p.origin.y) - f32::from(s.origin.y)).abs() <= 1., "from the same corner: {p:?} / {s:?}");
+    // Shady #17 R3-M2: the pass lies on the composer's top border, which
+    // GPUI paints after the composer's children: drawn among them, the
+    // border covered it (4c63a0c; `debug_bounds` above still found it). It
+    // paints after the root's last child, so over every border.
+    let order = painted(cx, &view);
+    assert!(painted_after(&order, "settle-pass", "end-frame"), "the pass paints over the composer's border: {order:?}");
     for _ in 0..6 {
         beat(cx, w, &view);
     }
     assert!(seg(cx).is_none(), "gone after sig");
+    assert!(pass(cx).is_none(), "one pass, then everything stops");
+    // Nothing of it still animates (the design's final): no display frame,
+    // no sweep, and what is left on the layer is the rail's other sessions'
+    // spinners; with those at rest, nothing at all.
+    only_the_rail_spins(cx, w, &view, "after the pass (Full)");
+    set_motion(cx, &view, crate::motion::Level::Reduced);
+    busy(cx, true);
+    assert!(sweep(cx).is_none(), "Reduced: the edge is unlit");
+    busy(cx, false);
+    assert!(pass(cx).is_none(), "Reduced: no pass (the bar's flash)");
     set_motion(cx, &view, crate::motion::Level::Off);
     busy(cx, true);
     busy(cx, false);
     assert!(seg(cx).is_none(), "Off: none");
+    assert!(pass(cx).is_none(), "Off: no pass");
     assert_eq!(motion_pending(cx, &view), (false, None));
 }
 
@@ -2660,7 +2952,7 @@ fn running_without_a_clock(cx: &mut TestAppContext, w: AnyWindowHandle, view: &E
     for _ in 0..12 {
         beat(cx, w, view);
     }
-    let scans = view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Scan(_))).count());
+    let scans = view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count());
     assert!(scans >= n, "the running glyphs are the layer's: {scans}");
     assert!(view.read_with(cx, |v, _| v.tray.rows.is_empty()), "no worker: no clock");
 }
@@ -2723,27 +3015,178 @@ fn low_power_stops_the_beat_layer(cx: &mut TestAppContext) {
 
 /// Shady N6: the beat in the app's frame (`SYNAPS_DESKTOP_BEAT_IN_FRAME=1`,
 /// the measuring path, as before the layer): no sites; each beat is an app
-/// frame, and the running glyph's beam is drawn in it, one row down a beat.
+/// frame, and the running glyph's braille frame is drawn in it, the
+/// frame's own beat's (polish.md P1).
 #[gpui_kit::test]
-fn the_beat_in_the_frame_scans_without_the_layer(cx: &mut TestAppContext) {
+fn the_beat_in_the_frame_spins_without_the_layer(cx: &mut TestAppContext) {
     let (w, view, _events) = open_with(cx, (1440., 900.), crate::theme::Panels::default().text_size, false);
     running_without_a_clock_in_frame(cx, w, &view);
-    let beam = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("beam-row").expect("a beam row in the frame");
     let at = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.frame_beat());
-    let (f0, b0, k0) = (frames(cx, &view).0, beam(cx), at(cx));
+    let drawn = |cx: &mut TestAppContext, k: u32| {
+        let dots = crate::glyph::spin_dots(crate::glyph::Glyph::Run, Some(k));
+        VisualTestContext::from_window(w, cx).debug_bounds(format!("spin-{dots:02x}").leak()).is_some()
+    };
+    let (f0, k0) = (frames(cx, &view).0, at(cx));
+    assert!(drawn(cx, k0), "the frame of beat {k0} in the frame");
     assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::App), "the timer wakes the app");
     beat(cx, w, &view);
-    let (f1, b1, k1) = (frames(cx, &view).0, beam(cx), at(cx));
+    let (f1, k1) = (frames(cx, &view).0, at(cx));
     assert!(f1 > f0 && k1 > k0, "the beat is the app's frame");
     assert!(view.read_with(cx, |v, _| v.fx.sites().is_empty()), "nothing on the layer");
-    // The row of the frame's own beat (one down a beat, back to the top
-    // after 8; a slow runner's clock may have crossed two).
-    let dy = f32::from(b1.origin.y - b0.origin.y);
-    assert_eq!(dy, crate::glyph::scan_row(k1) - crate::glyph::scan_row(k0), "the beam on the frame's beat ({k0} → {k1})");
-    // Off: still, no beam.
+    assert!(drawn(cx, k1), "the frame of beat {k1}: the snake moved on");
+    // The composer's sweep in the app's frame (no layer) lies on its top
+    // border too: it paints over it, after the root's last child (R3-M2).
+    view.update(cx, |v, cx| {
+        v.model.transcript.set_busy(true);
+        cx.notify();
+    });
+    beat(cx, w, &view);
+    let order = painted(cx, &view);
+    assert!(painted_after(&order, "sweep", "end-frame"), "the sweep paints over the composer's border: {order:?}");
+    // Off: still, the ⠹ frame.
     set_motion(cx, &view, crate::motion::Level::Off);
-    assert!(VisualTestContext::from_window(w, cx).debug_bounds("beam-row").is_none());
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds(format!("spin-{:02x}", crate::glyph::STILL).leak()).is_some());
     assert_eq!(motion_pending(cx, &view), (false, None));
+}
+
+/// P2: a sweep on screen (the composer's top edge while the turn runs)
+/// ticks the beat layer at 30 Hz, one timer; Reduced draws none, and the
+/// timer goes back to the beat or nothing.
+#[gpui_kit::test]
+fn a_sweep_ticks_only_while_drawn(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    // A session with no prompt waiting (the demo's NEEDS YOU stills the edge).
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    running_tools(cx, &view, 1);
+    view.update(cx, |v, cx| {
+        v.model.transcript.set_busy(true);
+        cx.notify();
+    });
+    for _ in 0..12 {
+        beat(cx, w, &view);
+    }
+    let sweeps = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.sweep_count());
+    assert!(sweeps(cx) >= 1, "the turn runs: the composer sweeps");
+    let (frame, at) = motion_pending(cx, &view);
+    let ahead = view.read_with(cx, |v, _| at.map(|t| t.saturating_duration_since(v.fx.clock())));
+    assert!(!frame && ahead.is_some_and(|d| d <= crate::motion::DECAY_TICK), "the next 30 Hz tick: {ahead:?}");
+    assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::Beat), "the layer, not the app");
+    set_motion(cx, &view, crate::motion::Level::Reduced);
+    assert_eq!(sweeps(cx), 0, "Reduced: the edge is unlit");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("sweep").is_none());
+    // Shady #17 M3: the 30 Hz tick went with it (a clock's second may stay).
+    settle(cx, w, 4);
+    let (frame, at) = motion_pending(cx, &view);
+    assert!(!frame);
+    assert!(at.is_none_or(|t| view.read_with(cx, |v, _| v.fx.on_beats(t, 8))), "no 30 Hz tick: only a clock's second, or nothing");
+}
+
+/// Shady #17 M1 (motion.md §5.3): the link lost mid-turn, the window is
+/// visibly stale and nothing in it is live. Past the grace and the drain,
+/// no sweep and no spinner is on the layer, and the one timer left is the
+/// connection words' dots (2 Hz): never the sweep's 30 Hz, never the beat.
+#[gpui_kit::test]
+fn a_lost_link_stills_every_ambient(cx: &mut TestAppContext) {
+    use crate::model::ConnState;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    running_tools(cx, &view, 1);
+    view.update(cx, |v, cx| {
+        v.model.transcript.set_busy(true);
+        cx.notify();
+    });
+    let conn = |cx: &mut TestAppContext, c: ConnState| {
+        view.update(cx, |v, cx| {
+            v.synthetic = false;
+            v.model.conn = c;
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    conn(cx, ConnState::Connected("x".into()));
+    for _ in 0..6 {
+        beat(cx, w, &view);
+    }
+    let ambient = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let sites = v.fx.sites();
+            (
+                sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Sweep(_))).count(),
+                sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count(),
+            )
+        })
+    };
+    let (sweeps, spins) = ambient(cx);
+    assert!(sweeps >= 1 && spins >= 1, "running: the composer sweeps, the spinners spin ({sweeps}, {spins})");
+    conn(cx, ConnState::Reconnecting);
+    wait_past(cx, w, &view, (crate::motion::LINK_GRACE + crate::motion::SLOW).as_millis() as u64);
+    wait(cx, w, &view, 600);
+    assert!(view.read_with(cx, |v, _| v.link.lost), "lost");
+    assert_eq!(ambient(cx), (0, 0), "held: no sweep, no spinner");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("sweep").is_none(), "the edge unlit");
+    for _ in 0..8 {
+        beat(cx, w, &view);
+    }
+    assert_eq!(ambient(cx), (0, 0), "still held");
+    let (frame, at) = motion_pending(cx, &view);
+    assert!(!frame, "no display frames while held");
+    let at = at.expect("the dots step");
+    assert!(view.read_with(cx, |v, _| v.fx.on_beats(at, 4)), "only the dots' 2 Hz step, not the beat or 30 Hz");
+    assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::App), "the words' frame, no layer");
+}
+
+/// Shady #17 R2-L1 (motion.md §5.3): the link lost, a running worker's
+/// clocks hold their count as of the loss, frame after frame, while the
+/// connection words' dots step; back, they count again.
+#[gpui_kit::test]
+fn a_lost_link_holds_every_clock(cx: &mut TestAppContext) {
+    use crate::model::ConnState;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    life_worker(cx, w, &view);
+    let conn = |cx: &mut TestAppContext, c: ConnState| {
+        view.update(cx, |v, cx| {
+            v.synthetic = false;
+            v.model.conn = c;
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    conn(cx, ConnState::Connected("x".into()));
+    wait(cx, w, &view, 500);
+    // What the clocks show as of the last frame (the tray's and the chips'
+    // text, which the frame's state decides).
+    let shown = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            v.tray
+                .rows
+                .iter()
+                .filter(|r| r.tick.is_some())
+                .map(|r| crate::tray::ticked(&v.fx, &r.facts, &r.tick).to_string())
+                .collect::<Vec<_>>()
+        })
+    };
+    conn(cx, ConnState::Reconnecting);
+    wait_past(cx, w, &view, (crate::motion::LINK_GRACE + crate::motion::SLOW).as_millis() as u64);
+    wait(cx, w, &view, 600);
+    assert!(view.read_with(cx, |v, _| v.link.lost), "lost");
+    let held = shown(cx);
+    assert!(!held.is_empty(), "a running worker's clock");
+    let f0 = frames(cx, &view).0;
+    for _ in 0..30 {
+        wait(cx, w, &view, 100);
+        assert_eq!(shown(cx), held, "held through the outage");
+    }
+    assert!(frames(cx, &view).0 > f0, "the dots stepped (the app drew) meanwhile");
+    conn(cx, ConnState::Connected("x".into()));
+    for _ in 0..15 {
+        wait(cx, w, &view, 100);
+    }
+    assert_ne!(shown(cx), held, "back: the clocks count again");
 }
 
 /// [`running_without_a_clock`] without the layer: the sites stay empty.
@@ -2777,7 +3220,7 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
         settle(cx, w, 4);
         assert!(frames(cx, &view).0 > f0, "{what}: the app's view was not drawn");
     };
-    let sites = view.read_with(cx, |v, _| v.fx.sites().len());
+    let sites = view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count());
     // As the pump hands it over (Shady N3): `apply_batch` notifies, not the test.
     drew(cx, "an event", &mut |cx| {
         use synaps_client::protocol::{LlmEvent, StreamEvent};
@@ -2807,7 +3250,10 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
             );
         });
     });
-    assert_eq!(view.read_with(cx, |v, _| v.fx.sites().len()), sites + 1, "the new call's glyph is on the layer");
+    let spins = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count())
+    };
+    assert_eq!(spins(cx), sites + 1, "the new call's glyph is on the layer");
     let halt = VisualTestContext::from_window(w, cx).debug_bounds("halt").expect("HALT");
     drew(cx, "a hover", &mut |cx| {
         event(
@@ -3373,6 +3819,49 @@ fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
+/// polish.md P6 (finish gate #17): favouriting moves the row into
+/// FAVOURITES (its Flip); its star hops, and its sparks leave, only once the
+/// row has landed: never while it moves.
+#[gpui_kit::test]
+fn a_star_hops_once_its_row_has_landed(cx: &mut TestAppContext) {
+    use crate::rail::Item;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    // A live session's row, favourited (Ctrl+D's way: the pointer is not on
+    // the rail, which holds its order under it).
+    let key = view.update(cx, |v, cx| {
+        let rail = &v.rail.rail;
+        let id = crate::demo::IDLE_CPU;
+        let ix = v.model.sessions.iter().position(|s| s.id == id).expect("listed");
+        let key = rail
+            .items
+            .iter()
+            .find_map(|i| if let Item::Row(r) = i { (rail.rows[*r].live == Some(ix)).then_some(rail.rows[*r].key) } else { None })
+            .expect("its row");
+        v.toggle_fav_session(id);
+        cx.notify();
+        key
+    });
+    let (mut moving_frames, mut landed_at) = (0, None);
+    for k in 0..80 {
+        let (moving, landed) = view.read_with(cx, |v, _| {
+            (v.rail_fx.offsets.get(&key).is_some_and(|d| *d != 0.), v.star_land.borrow().get(&key).and_then(|e| e.1))
+        });
+        if moving {
+            moving_frames += 1;
+            assert!(landed.is_none(), "frame {k}: the star hops while its row moves");
+        }
+        if landed.is_some() && landed_at.is_none() {
+            landed_at = Some(k);
+        }
+        wait(cx, w, &view, 8);
+    }
+    let flips = view.read_with(cx, |v, _| format!("{:?} {:?}", v.rail_fx.flips, v.rail_fx.offsets));
+    assert!(moving_frames > 0, "the row slid into FAVOURITES: {flips}");
+    assert!(landed_at.is_some(), "then it landed, and the star hopped");
+}
+
 /// Favourites (desktop only): a HISTORY row's star is laid out before it
 /// is drawn (the row's text never moves when it shows), a click on it
 /// favourites the row without opening it (no resume, nothing sent), and
@@ -3666,6 +4155,10 @@ fn a_settled_tab_takes_a_new_width_at_once(cx: &mut TestAppContext) {
     wait(&mut vcx, w, &view, 600);
     let end = widths(&mut vcx);
     assert_ne!(settled, end, "the widening changed the tabs' width");
+    // The tabs still drawn (a tab the narrower strip no longer shows keeps
+    // its last width until a frame without it: the rail's spinners now
+    // draw only the beat layer, not the app's frame).
+    let first: Vec<f32> = first.iter().copied().filter(|x| end.contains(x)).collect();
     assert_eq!(first, end, "the new width in the first frame: no spring");
 }
 

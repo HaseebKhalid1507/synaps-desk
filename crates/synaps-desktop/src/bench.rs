@@ -288,7 +288,7 @@ fn epoch_ms(at: Instant) -> f64 {
 /// The bench script. Runs on the UI thread between frames.
 pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx: &mut App) {
     // Hard stop: never leave a window up if anything hangs.
-    let limit = if opts.motion { 200 } else { 30 };
+    let limit = if opts.motion { 400 } else { 30 };
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(limit));
         eprintln!("bench: watchdog fired at {limit} s");
@@ -538,6 +538,191 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     });
                 };
                 level(cx, crate::motion::Level::Full);
+                // `SYNAPS_BENCH_LIFE=N` (Q3 evidence, polish.md §3 Life): after
+                // N s, a scripted turn on the bench's session, the scene a
+                // capture records: a bash call runs (the spinner, its clock,
+                // the composer's sweep), workers spawn, run (their tool counts
+                // and steps roll) and end (the check writes on), a call fails
+                // (the cross), the fan-out widens past the tray's lines (`+N
+                // more` rolls), a prompt comes (NEEDS YOU's count rolls), a
+                // rail row is favourited (the star hops once it has landed),
+                // the turn ends. Every event stamped, as a daemon's are.
+                // `SYNAPS_BENCH_LIFE_LEVEL=full|reduced|off`: the level.
+                if let Some(after) = std::env::var("SYNAPS_BENCH_LIFE").ok().and_then(|s| s.parse::<f64>().ok()) {
+                    let lv = std::env::var("SYNAPS_BENCH_LIFE_LEVEL").ok().and_then(|s| crate::motion::Level::parse(&s));
+                    level(cx, lv.unwrap_or(crate::motion::Level::Full));
+                    let apply = |cx: &mut AsyncWindowContext, evs: Vec<Value>| {
+                        let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                        let _ = upd(cx, &|v, cx| {
+                            v.apply_batch(evs.iter().cloned().filter_map(local_raw).map(|e| e.with_ts(ts.clone())).collect(), cx);
+                            v.sync_list();
+                        });
+                    };
+                    let row = |n: u64, name: &str, status: &str, tools: u64, step: &str, secs: f64| {
+                        let done = (status != "running").then_some(secs);
+                        json!({"subagent_id": n, "agent_name": name, "status": status, "cancel_requested": false,
+                            "elapsed_secs": secs, "finished_elapsed": done, "step": step, "tools": tools})
+                    };
+                    let spawn = |n: u64, name: &str, task: &str| {
+                        let id = format!("w{n}");
+                        let res = json!({"handle_id": format!("sa_{n}"), "agent_name": name, "status": "running"}).to_string();
+                        vec![
+                            json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start",
+                                "tool_id": id, "input": {"agent": name, "task": task}}}),
+                            json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": id, "result": res}}),
+                        ]
+                    };
+                    let call = |id: &str, tool: &str, input: Value| {
+                        json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": tool, "tool_id": id, "input": input}})
+                    };
+                    let result = |id: &str, text: &str| json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": id, "result": text}});
+                    let _ = upd(cx, &|v, cx| {
+                        v.model.set_local_session("bench");
+                        // Its session is this window's to drive: its turn's end
+                        // hands the floor back (Handoff in, the settle pass, P3).
+                        v.owner_here = true;
+                        v.model.transcript.apply_history(&dated(synthetic::history(12, 3)));
+                        let metas: Vec<SessionMeta> = [
+                            ("bench", "Relay refresh race", true, 0),
+                            ("20261117-090001-l001", "Flaky e2e", true, 0),
+                            ("20261117-090002-l002", "Docs sweep", false, 2),
+                            ("20261117-090003-l003", "Idle CPU", false, 0),
+                        ]
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, (id, title, busy, subs))| {
+                            serde_json::from_value(json!({"id": id, "title": title, "model": "m", "lifecycle": "live", "busy": busy,
+                                "subagents_running": subs, "messages": 12, "created_at": format!("2026-11-17T09:00:{k:02}Z")}))
+                            .ok()
+                        })
+                        .collect();
+                        v.apply_batch(vec![Event::Sessions(metas)], cx);
+                        v.sync_list();
+                        v.list.set_follow_mode(FollowMode::Tail);
+                        v.list.scroll_to_end();
+                    });
+                    sleep(after).await;
+                    let _ = upd(cx, &|v, _| {
+                        let t = &mut v.model.transcript;
+                        t.apply(&SessionEvent::TurnStarted {
+                            turn_baseline: 12,
+                            trigger: "user".into(),
+                            user_text: Some("Find the refresh race and fix it.".into()),
+                        });
+                        t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                        v.sync_list();
+                        v.list.scroll_to_end();
+                    });
+                    apply(cx, vec![call("b1", "bash", json!({"command": "cargo test -p relay --test refresh_race"}))]);
+                    sleep(2.5).await;
+                    // Each worker's clock is its time since it spawned, as a
+                    // daemon's is (re-gate #17: never a clock going back).
+                    let age = |at: Instant| round(at.elapsed().as_secs_f64(), 1);
+                    let scout_at = Instant::now();
+                    let mut evs = spawn(1, "scout", "Find every caller of TokenStore::rotate and say which hold the lock");
+                    evs.push(json!({"ev": "subagent_rows", "rows": [row(1, "scout", "running", 1, "reading crates/relay/src/upstream.rs", 0.)]}));
+                    apply(cx, evs);
+                    sleep(2.0).await;
+                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": [row(1, "scout", "running", 2, "grep -n rotate crates/relay/src", age(scout_at))]})]);
+                    sleep(2.0).await;
+                    let names = ["reviewer", "fixer", "tester", "docs"];
+                    let crew_at = Instant::now();
+                    let mut evs = Vec::new();
+                    for (k, name) in names.iter().enumerate() {
+                        evs.extend(spawn(k as u64 + 2, name, "Review the retry path in Session for lost tokens"));
+                    }
+                    let mut rows = vec![row(1, "scout", "running", 3, "reading crates/relay/src/session.rs", age(scout_at))];
+                    rows.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "running", 1, "reading src", 0.)));
+                    evs.push(json!({"ev": "subagent_rows", "rows": rows}));
+                    apply(cx, evs);
+                    sleep(2.0).await;
+                    apply(cx, vec![result("b1", "running 4 tests\ntest result: ok. 4 passed; 0 failed")]);
+                    sleep(1.5).await;
+                    apply(cx, vec![call("r1", "read", json!({"path": "crates/relay/src/gone.rs"}))]);
+                    sleep(0.8).await;
+                    apply(cx, vec![result("r1", "Tool execution failed: no such file")]);
+                    sleep(1.5).await;
+                    let scout_done = age(scout_at);
+                    // Scout done; the four at their second tool, as of now.
+                    let crew = || {
+                        let mut rows = vec![row(1, "scout", "completed", 4, "", scout_done)];
+                        rows.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "running", 2, "grep -n Stale src", age(crew_at))));
+                        rows
+                    };
+                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": crew()})]);
+                    sleep(2.0).await;
+                    // A wider fan-out (P5's `+N more`): seven more workers, more
+                    // than the tray's chip lines hold, then one more (its count
+                    // rolls).
+                    let probe = |k: u64, secs: f64| row(k, &format!("probe-{k}"), "running", 1, "reading shard", secs);
+                    let probes_at = Instant::now();
+                    let (mut wide, mut evs) = (crew(), Vec::new());
+                    for k in 6..13 {
+                        evs.extend(spawn(k, &format!("probe-{k}"), "Probe one shard of the token store for stale entries"));
+                        wide.push(probe(k, 0.));
+                    }
+                    evs.push(json!({"ev": "subagent_rows", "rows": wide}));
+                    apply(cx, evs);
+                    sleep(1.5).await;
+                    // The eighth: its own spawn only (Shady N5).
+                    let mut wide = crew();
+                    wide.extend((6..13).map(|k| probe(k, age(probes_at))));
+                    wide.push(probe(13, 0.));
+                    let last_at = Instant::now();
+                    let mut evs = spawn(13, "probe-13", "Probe one shard of the token store for stale entries");
+                    evs.push(json!({"ev": "subagent_rows", "rows": wide}));
+                    apply(cx, evs);
+                    sleep(1.5).await;
+                    let _ = upd(cx, &|v, _| {
+                        if let Ok(request) = serde_json::from_value(json!({
+                            "id": 7, "kind": "confirm", "title": "Run a command?", "prompt": "Tool: bash\nInput that will run:\n$ cargo test"
+                        })) {
+                            v.model.transcript.apply(&SessionEvent::Prompt { request });
+                        }
+                        v.sync_list();
+                    });
+                    sleep(2.0).await;
+                    let _ = upd(cx, &|v, _| v.toggle_fav_session("20261117-090001-l001"));
+                    sleep(1.5).await;
+                    // The prompt answered: RUNNING again (the composer's sweep).
+                    let _ = upd(cx, &|v, _| {
+                        v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
+                        v.sync_list();
+                    });
+                    sleep(1.5).await;
+                    // Every worker done (their checks write on).
+                    let mut done = vec![row(1, "scout", "completed", 4, "", scout_done)];
+                    let crew_done = age(crew_at);
+                    done.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "completed", 3, "", crew_done)));
+                    let probes_done = age(probes_at);
+                    done.extend((6..13).map(|k| row(k, &format!("probe-{k}"), "completed", 2, "", probes_done)));
+                    done.push(row(13, "probe-13", "completed", 2, "", age(last_at)));
+                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": done})]);
+                    // The rail's other sessions settle too: after the turn's
+                    // end nothing in the window runs (P3: then 0 presents).
+                    let _ = upd(cx, &|v, cx| {
+                        let metas: Vec<SessionMeta> = v
+                            .model
+                            .sessions
+                            .iter()
+                            .map(|m| SessionMeta { busy: false, subagents_running: 0, ..m.clone() })
+                            .collect();
+                        v.apply_batch(vec![Event::Sessions(metas)], cx);
+                    });
+                    sleep(2.0).await;
+                    // The turn ends from RUNNING, the sweep on screen: READY
+                    // hands the floor back (Handoff in down the bar, the
+                    // sweep's one last pass across the top, polish.md P3).
+                    let _ = upd(cx, &|v, _| {
+                        v.model.transcript.apply(&SessionEvent::Idle);
+                        v.sync_list();
+                    });
+                    sleep(3.0).await;
+                    out["life_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
+                    println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
                 // `SYNAPS_BENCH_LINK=N`: only the link lost and back (motion.md
                 // §5.3), the scene a capture records, after N s: up 2 s, down
                 // 4 s (grace, tear, drain, held), up 3 s (Scan, restore). Every
@@ -764,6 +949,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // polish.md §6 gate 4: 5 sessions × 5 workers, 30 s. Five
                 // busy sessions in the rail, each with five workers; the
                 // shown one's five in its tray and transcript, running.
+                let load_at = Instant::now();
                 let _ = upd(cx, &|v, cx| {
                     let metas: Vec<SessionMeta> = (0..5)
                         .filter_map(|k| {
@@ -799,6 +985,72 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out["load_5x5_30s"]["workers_running"] =
                     json!(view.update(cx, |v, _| v.model.stats.subagents.running_count()).unwrap_or(0));
                 out["load_5x5_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
+                out["load_5x5_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                // Gate 5's sample after the 5 × 5, where main's run ends
+                // (its `mem_end`): the cases after it are Q3's own.
+                out["mem_after_load_5x5"] = mem::sample();
+                // Q3 (polish.md §6 gate 4, the worst case): the same, and the
+                // shown session's turn runs: the composer sweeps (the one
+                // sweep left, P2) over the 25 spinners. Gate 3's prompt is
+                // answered first (NEEDS YOU outranks RUNNING: no sweep).
+                let _ = upd(cx, &|v, _| {
+                    let t = &mut v.model.transcript;
+                    t.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
+                    t.apply(&SessionEvent::TurnStarted { turn_baseline: 12, trigger: "user".into(), user_text: Some("Go on.".into()) });
+                    t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                    v.sync_list();
+                    v.list.scroll_to_end();
+                });
+                sleep(2.0).await;
+                let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                sleep(30.0).await;
+                out["load_5x5_sweep_30s"] = stats(cx, t0, Instant::now(), c0, f0);
+                out["load_5x5_sweep_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
+                out["load_5x5_sweep_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                out["load_5x5_sweep_30s"]["state"] = json!(view.update(cx, |v, _| {
+                    v.model.tabs.current().map(|t| format!("{:?}", v.tab_state(t))).unwrap_or_default()
+                }).unwrap_or_default());
+                // Shady #17 R2-M1 (gate 4 with P5 rolls from a live fan-out):
+                // the same, and the shown session's five workers each call a
+                // tool every 1.5 s, staggered (one every 0.3 s): its tool
+                // count and step change (and roll). Then the same with the
+                // step held, only the count changing. Then the first again
+                // under Reduced (Shady #17 R3-M1): no sweep, no spinners, the
+                // same data frames; Full minus it is what the motion costs.
+                let steps = ["reading src/relay.rs", "grep -n rotate src", "reading src/session.rs", "cargo check -p relay", "reading src/store.rs"];
+                let mut tools = [2u64; 5];
+                let cases = [
+                    ("load_5x5_fanout_30s", true, crate::motion::Level::Full),
+                    ("load_5x5_fanout_tools_30s", false, crate::motion::Level::Full),
+                    ("load_5x5_fanout_reduced_30s", true, crate::motion::Level::Reduced),
+                ];
+                for (case, step_moves, lv) in cases {
+                    level(cx, lv);
+                    sleep(1.0).await;
+                    let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                    let mut changes = 0u64;
+                    while t0.elapsed() < Duration::from_secs(30) {
+                        tools[changes as usize % 5] += 1;
+                        let secs = round(3.0 + load_at.elapsed().as_secs_f64(), 1);
+                        let rows: Vec<Value> = (0..5usize)
+                            .map(|j| {
+                                let step = if step_moves { steps[tools[j] as usize % steps.len()] } else { "reading src" };
+                                json!({"subagent_id": j as u64 + 2, "agent_name": format!("worker-{}", j + 2), "status": "running",
+                                    "cancel_requested": false, "elapsed_secs": secs, "finished_elapsed": null, "step": step, "tools": tools[j]})
+                            })
+                            .collect();
+                        let _ = upd(cx, &|v, cx| {
+                            v.apply_batch(local_raw(json!({"ev": "subagent_rows", "rows": rows.clone()})).into_iter().collect(), cx);
+                            v.sync_list();
+                        });
+                        changes += 1;
+                        sleep(0.3).await;
+                    }
+                    out[case] = stats(cx, t0, Instant::now(), c0, f0);
+                    out[case]["changes"] = json!(changes);
+                    out[case]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                    out[case]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
+                }
                 out["mem_end"] = mem::sample();
                 out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                 println!("{out}");

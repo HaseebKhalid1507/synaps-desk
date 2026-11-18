@@ -1,0 +1,9 @@
+20:38:44 main5-bench main-motion-1 load 5.40 gamescopes 0
+20:43:23 q3r2-bench q3r2-motion-1 load 5.99 gamescopes 0
+20:46:29 main5-bench main-motion-2 load 3.99 gamescopes 0
+20:49:01 q3r2-bench q3r2-motion-2 load 3.23 gamescopes 0
+20:52:06 main5-bench main-motion-3 load 2.83 gamescopes 0
+20:54:39 q3r2-bench q3r2-motion-3 load 5.98 gamescopes 0
+20:57:43 main5-bench main-mem load 1.72 gamescopes 0
+20:58:10 q3r2-bench q3r2-mem load 1.61 gamescopes 0
+BENCH5-DONE

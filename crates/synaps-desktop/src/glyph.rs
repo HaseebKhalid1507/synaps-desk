@@ -137,13 +137,15 @@ impl Glyph {
     pub(crate) fn parts(self) -> &'static [Part] {
         use Part::{Fill, Frame, Line, Poly};
         match self {
-            Glyph::Run => &[Fill(1., 1., 8., 8.)],
-            Glyph::Workers => &[Fill(1., 1., 4., 4.), Fill(5., 5., 4., 4.)],
+            // The braille family (polish.md P1): each still frame's lit
+            // dots (the unlit ones are drawn on their ground, [`spin`]).
+            Glyph::Run => &[Fill(2., 1., 2., 2.), Fill(6., 1., 2., 2.), Fill(6., 4., 2., 2.), Fill(6., 7., 2., 2.)],
+            Glyph::Workers => &[Fill(2., 1., 2., 2.), Fill(6., 7., 2., 2.)],
             Glyph::Needs => &[Frame(0., 0., 10., 10.), Fill(3., 3., 4., 4.)],
             Glyph::Unread => &[Fill(3., 3., 4., 4.)],
             Glyph::Idle => &[Frame(1., 1., 8., 8.)],
             Glyph::Parked => &[Fill(1., 7., 8., 2.)],
-            Glyph::Opening => &[Fill(1., 1., 8., 1.), Fill(1., 1., 1., 8.)],
+            Glyph::Opening => &[Fill(2., 1., 2., 2.)],
             Glyph::Locked => &[Frame(1., 1., 8., 8.), Fill(1., 4., 8., 2.)],
             Glyph::Gone => &[Fill(0., 0., 2., 2.), Fill(8., 0., 2., 2.), Fill(0., 8., 2., 2.), Fill(8., 8., 2., 2.)],
             Glyph::Cancelling => &[Fill(2., 1., 2., 8.), Fill(6., 1., 2., 8.)],
@@ -163,7 +165,14 @@ impl Glyph {
     }
 }
 
-/// `g` in `color`: its quads, or its sprite tinted.
+/// `g` in `mark` on `ground`: a braille glyph's still frame with its
+/// unlit dots ([`spin`]), else [`draw`].
+pub(crate) fn draw_on(g: Glyph, mark: Hsla, ground: Hsla) -> AnyElement {
+    if g.spins() { spin(g, None, mark, ground).into_any_element() } else { draw(g, mark) }
+}
+
+/// `g` in `color`: its quads, or its sprite tinted. A braille glyph: its
+/// still frame's lit dots only ([`draw_on`] draws the silhouette).
 pub(crate) fn draw(g: Glyph, color: Hsla) -> AnyElement {
     let s = px(g.size());
     if let Some(path) = g.sprite() {
@@ -324,57 +333,97 @@ pub(crate) fn draw_at(g: Glyph, p: f32, color: Hsla) -> AnyElement {
     el.into_any_element()
 }
 
-/// The scan's row in the glyph box at `beat` (motion.md §7.1): one device
-/// pixel down per beat, a 1 s cycle.
-pub(crate) fn scan_row(beat: u32) -> f32 {
-    1. + (beat % 8) as f32
+/// The TUI's running mark (agent-tui `app.rs:399` `SPINNER_FRAMES`):
+/// a 3–4 dot snake round the six top dots of a braille cell.
+pub(crate) const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Braille dots 1–6 in the 10 box (polish.md P1): columns at x 2 (dots
+/// 1 2 3) and 6 (4 5 6), rows at y 1, 4 and 7; each a 2 px square.
+pub(crate) const DOTS: [(f32, f32); 6] = [(2., 1.), (2., 4.), (2., 7.), (6., 1.), (6., 4.), (6., 7.)];
+pub(crate) const DOT: f32 = 2.;
+
+/// An unlit dot: `UNLIT` of the way from the ground to the mark, so the
+/// 2×3 silhouette always reads as one glyph, by shape.
+pub(crate) const UNLIT: f32 = 0.2;
+
+/// A braille character's dots 1–6 (bit n−1: dot n), as Unicode numbers them.
+pub(crate) const fn dots_of(c: char) -> u8 {
+    ((c as u32 - 0x2800) & 0x3f) as u8
 }
 
-/// A running glyph (`Run`, `Workers`) at `beat`: its quads, and its beam
-/// ([`beam_rows`]). Any other glyph: [`draw`].
-pub(crate) fn scan(g: Glyph, beat: Option<u32>, mark: Hsla, ink: Hsla) -> AnyElement {
-    let Some(beat) = beat.filter(|_| matches!(g, Glyph::Run | Glyph::Workers)) else { return draw(g, mark) };
-    let mut el = div().relative().flex_none().size(px(g.size()));
-    for &part in g.parts() {
-        if let Part::Fill(x, top, w, h) = part {
-            el = el.child(div().absolute().left(px(x)).top(px(top)).w(px(w)).h(px(h)).bg(mark));
-        }
+/// The running snake, one frame a beat: [`SPINNER_FRAMES`] decoded.
+pub(crate) const RUN_FRAMES: [u8; 10] = {
+    let mut out = [0; 10];
+    let mut i = 0;
+    while i < 10 {
+        out[i] = dots_of(SPINNER_FRAMES[i]);
+        i += 1;
     }
-    let hot = beam(mark, ink).0;
-    for (x, y, w, c) in beam_rows(g, beat, mark, ink) {
-        let row = div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(1.)).bg(c);
-        el = el.child(if c == hot { row.debug_selector(|| "beam-row".into()) } else { row });
+    out
+};
+
+/// Workers running in an idle session: two opposite dots, {1,6} → {4,3} →
+/// {5,2}, one step every two beats.
+pub(crate) const WORKERS_FRAMES: [u8; 3] = [0b10_0001, 0b00_1100, 0b01_0010];
+
+/// Opening: one dot round the ring (1 → 4 → 5 → 6 → 3 → 2), one step
+/// every two beats: a dial.
+pub(crate) const OPENING_FRAMES: [u8; 6] = [0b00_0001, 0b00_1000, 0b01_0000, 0b10_0000, 0b00_0100, 0b00_0010];
+
+/// The still frame (Reduced, Off, low power, history): `Run` ⠹ (dots
+/// 1 4 5 6); `Workers` and `Opening` their first frames (two dots, one).
+pub(crate) const STILL: u8 = dots_of('⠹');
+
+impl Glyph {
+    /// One of the braille family (polish.md P1).
+    pub(crate) fn spins(self) -> bool {
+        matches!(self, Glyph::Run | Glyph::Workers | Glyph::Opening)
     }
-    el.into_any_element()
+
+    /// Beats a frame of its spin lasts: the snake 1, the two heads and the
+    /// dial 2.
+    pub(crate) fn spin_every(self) -> u32 {
+        if self == Glyph::Run { 1 } else { 2 }
+    }
 }
 
-/// The scan's phosphor beam in `g`'s box at `beat` (motion.md §10
-/// amendment 14): the 1 px row the beat is on, lit toward the ink
-/// (`mix(mark, ink, 0.6)`), and the row it left one beat ago, its
-/// afterglow (`mix(mark, ink, 0.22)`; none as the beam wraps to the top).
-/// x, y, width, colour: one per fill a row crosses. [`scan`] and the beat
-/// layer draw these.
-pub(crate) fn beam_rows(g: Glyph, beat: u32, mark: Hsla, ink: Hsla) -> impl Iterator<Item = (f32, f32, f32, Hsla)> {
-    let (hot, glow) = beam(mark, ink);
-    let trail = (!beat.is_multiple_of(8)).then(|| scan_row(beat - 1));
-    rows_at(g, scan_row(beat), hot).chain(trail.into_iter().flat_map(move |y| rows_at(g, y, glow)))
+/// A braille glyph's lit dots at `beat` (phase-locked app-wide: every
+/// running thing spins in step); `None`: its still frame.
+pub(crate) fn spin_dots(g: Glyph, beat: Option<u32>) -> u8 {
+    match (g, beat) {
+        (Glyph::Run, Some(b)) => RUN_FRAMES[(b % 10) as usize],
+        (Glyph::Run, None) => STILL,
+        (Glyph::Workers, b) => WORKERS_FRAMES[(b.unwrap_or(0) / 2 % 3) as usize],
+        (_, b) => OPENING_FRAMES[(b.unwrap_or(0) / 2 % 6) as usize],
+    }
 }
 
-fn rows_at(g: Glyph, y: f32, c: Hsla) -> impl Iterator<Item = (f32, f32, f32, Hsla)> {
-    g.parts().iter().filter_map(move |&part| match part {
-        Part::Fill(x, top, w, h) if (top..top + h).contains(&y) => Some((x, y, w, c)),
-        _ => None,
-    })
+/// Paints a braille frame (`dots` lit) in the box at `origin`: six quads,
+/// origins and sizes on device pixels (a 2 px dot stays one solid square at
+/// 1.25× or 1.5×). The app's frame and the beat layer paint the same.
+pub(crate) fn paint_dots(window: &mut Window, origin: Point<Pixels>, dots: u8, mark: Hsla, ground: Hsla) {
+    let s = window.scale_factor();
+    let snap = |v: f32| (v * s).round() / s;
+    let d = snap(DOT).max(1. / s);
+    let unlit = crate::motion::mix(ground, mark, UNLIT);
+    let (ox, oy) = (f32::from(origin.x), f32::from(origin.y));
+    for (i, &(x, y)) in DOTS.iter().enumerate() {
+        let c = if dots & (1 << i) != 0 { mark } else { unlit };
+        window.paint_quad(fill(Bounds::new(point(px(snap(ox + x)), px(snap(oy + y))), size(px(d), px(d))), c));
+    }
 }
 
-/// The beam's row and its afterglow's: the mark toward the ink.
-pub(crate) fn beam(mark: Hsla, ink: Hsla) -> (Hsla, Hsla) {
-    (crate::motion::mix(mark, ink, BEAM), crate::motion::mix(mark, ink, GLOW))
+/// A braille glyph (polish.md P1) at `beat` (`None`: still), in `mark`
+/// on `ground`: its six dots, painted on device pixels.
+pub(crate) fn spin(g: Glyph, beat: Option<u32>, mark: Hsla, ground: Hsla) -> Div {
+    let dots = spin_dots(g, beat);
+    div()
+        .relative()
+        .flex_none()
+        .size(px(10.))
+        .debug_selector(move || format!("spin-{dots:02x}"))
+        .child(canvas(|_, _, _| {}, move |b, _, window, _| paint_dots(window, b.origin, dots, mark, ground)).absolute().inset_0())
 }
-
-/// How far toward the ink the beam's row is lit, and its afterglow's.
-pub(crate) const BEAM: f32 = 0.6;
-pub(crate) const GLOW: f32 = 0.22;
 
 /// `Needs`' inner cell in its box: x, y, side.
 pub(crate) const BREATH_CELL: (f32, f32, f32) = (3., 3., 4.);
@@ -408,28 +457,21 @@ fn breath_box(cell: Hsla, mark: Hsla) -> Div {
 }
 
 /// A glyph whose beat the beat layer paints ([`crate::motion::Beat`]):
-/// drawn still (a scan's quads without its row; a breath's cell at
-/// `mark`, where it ends), and where it was painted recorded for the
-/// layer. Pixel for pixel what [`scan`] and [`breath`] draw, the layer's
-/// row or cell painted over it.
+/// drawn still (a spinner's still frame; a breath's cell at `mark`, where
+/// it ends), and where it was painted recorded for the layer. Pixel for
+/// pixel what [`spin`] and [`breath`] draw, the layer's dots or cell
+/// painted over it.
 pub(crate) fn on_beat(beat: crate::motion::Beat, mark: Hsla, ground: Hsla, fx: &std::rc::Rc<crate::motion::Motion>) -> AnyElement {
     let el = match beat {
-        crate::motion::Beat::Scan(g) => {
-            let mut el = div().relative().flex_none().size(px(g.size()));
-            for &part in g.parts() {
-                if let Part::Fill(x, top, w, h) = part {
-                    el = el.child(div().absolute().left(px(x)).top(px(top)).w(px(w)).h(px(h)).bg(mark));
-                }
-            }
-            el
-        }
+        crate::motion::Beat::Spin(g) => spin(g, None, mark, ground),
         crate::motion::Beat::Breath(_) => breath_box(mark, mark),
+        crate::motion::Beat::Sweep { .. } => div(),
     };
-    let (fx, ink) = (fx.clone(), fx.ink());
+    let fx = fx.clone();
     el.child(
         canvas(
             |_, _, _| {},
-            move |b, _, window, _| fx.site(crate::motion::Site { origin: b.origin, mask: window.content_mask(), mark, ground, ink, beat }),
+            move |b, _, window, _| fx.site(crate::motion::Site { origin: b.origin, mask: window.content_mask(), mark, ground, beat }),
         )
         .absolute()
         .inset_0(),
@@ -444,14 +486,9 @@ pub(crate) fn on_beat(beat: crate::motion::Beat, mark: Hsla, ground: Hsla, fx: &
 /// it: a cross-fade by colour, as an opacity would paint it.
 pub(crate) fn change(from: Option<(Glyph, Hsla)>, to: Glyph, mark: Hsla, ground: Hsla, p: f32, fade: bool) -> AnyElement {
     if p >= 1. {
-        return draw(to, mark);
+        return draw_on(to, mark, ground);
     }
-    let draws = match to {
-        Glyph::Ok | Glyph::Failed => true,
-        Glyph::Cancelled | Glyph::Limit | Glyph::Cancelling => from.is_none_or(|(g, _)| g != Glyph::Cancelling),
-        _ => false,
-    };
-    if draws && !fade {
+    if draws(from.map(|f| f.0), to) && !fade {
         return draw_at(to, p, mark);
     }
     let s = px(to.size().max(from.map_or(0., |(g, _)| g.size())));
@@ -459,8 +496,44 @@ pub(crate) fn change(from: Option<(Glyph, Hsla)>, to: Glyph, mark: Hsla, ground:
         .relative()
         .flex_none()
         .size(s)
-        .children(from.filter(|(g, _)| *g != to).map(|(g, c)| div().absolute().inset_0().child(draw(g, crate::motion::mix(c, ground, p)))))
-        .child(div().absolute().inset_0().child(draw(to, crate::motion::mix(ground, mark, p))))
+        .children(
+            from.filter(|(g, _)| *g != to)
+                .map(|(g, c)| div().absolute().inset_0().child(draw_on(g, crate::motion::mix(c, ground, p), ground))),
+        )
+        .child(div().absolute().inset_0().child(draw_on(to, crate::motion::mix(ground, mark, p), ground)))
+        .into_any_element()
+}
+
+/// A change to `to` from `from` draws its strokes (or quads) on.
+fn draws(from: Option<Glyph>, to: Glyph) -> bool {
+    match to {
+        Glyph::Ok | Glyph::Failed => true,
+        Glyph::Cancelled | Glyph::Limit | Glyph::Cancelling => from != Some(Glyph::Cancelling),
+        _ => false,
+    }
+}
+
+/// [`change`] without the fade (polish.md P4, finish gate #17): to a mark
+/// that draws, its strokes write on (`p`) over the glyph it replaces, which
+/// goes to the ground meanwhile (`old`, 1 → 0; a spinner in the frame it
+/// showed then, `beat`). The box is never empty. Else [`change`]'s
+/// cross-fade, on `p`.
+pub(crate) fn change_over(from: Option<(Glyph, Option<u32>, Hsla)>, to: Glyph, mark: Hsla, ground: Hsla, old: f32, p: f32) -> AnyElement {
+    if !draws(from.map(|f| f.0), to) || (p >= 1. && old <= 0.) {
+        return change(from.map(|(g, _, c)| (g, c)), to, mark, ground, p, false);
+    }
+    let s = px(to.size().max(from.map_or(0., |(g, ..)| g.size())));
+    let centred = |el: AnyElement| div().absolute().inset_0().flex().items_center().justify_center().child(el);
+    div()
+        .relative()
+        .flex_none()
+        .size(s)
+        .debug_selector(move || format!("write-on {old:.2} {p:.2}"))
+        .children(from.filter(|(g, ..)| old > 0. && *g != to).map(|(g, beat, c)| {
+            let c = crate::motion::mix(ground, c, old);
+            centred(if g.spins() { spin(g, beat, c, ground).into_any_element() } else { draw(g, c) })
+        }))
+        .children((p > 0.).then(|| centred(draw_at(to, p, mark))))
         .into_any_element()
 }
 
@@ -622,11 +695,45 @@ pub(crate) fn session(st: State) -> (Option<Glyph>, Family) {
     }
 }
 
-/// A session's glyph on `ground`, in a 10 px box (empty when it has none).
+/// A session's glyph on `ground`, in a 10 px box (empty when it has none),
+/// still.
 pub(crate) fn session_mark(st: State, ground: Ground, p: &Palette) -> Div {
     let (g, f) = session(st);
     let (_, mark) = ink(f, ground, p);
-    div().flex().flex_none().size(px(10.)).children(g.map(|g| draw(g, mark)))
+    div().flex().flex_none().size(px(10.)).children(g.map(|g| draw_on(g, mark, ground.color(p))))
+}
+
+/// [`session_mark`] live, on `bg` (the row's or tab's fill): a running,
+/// workers or opening glyph spins on the beat (polish.md P1).
+pub(crate) fn session_live(st: State, ground: Ground, bg: Hsla, p: &Palette, fx: &std::rc::Rc<crate::motion::Motion>) -> Div {
+    let (g, f) = session(st);
+    let (_, mark) = ink(f, ground, p);
+    div().flex().flex_none().size(px(10.)).children(g.map(|g| spinning(fx, g, mark, bg)))
+}
+
+/// `g` as the beat has it: a braille glyph spins (the beat layer paints it
+/// over its still frame; without one, the app's frame draws the beat's);
+/// any other is drawn.
+pub(crate) fn spinning(fx: &std::rc::Rc<crate::motion::Motion>, g: Glyph, mark: Hsla, ground: Hsla) -> AnyElement {
+    if !g.spins() {
+        return draw(g, mark);
+    }
+    if fx.layered() {
+        return on_beat(crate::motion::Beat::Spin(g), mark, ground, fx);
+    }
+    spin(g, fx.beat(g.spin_every()), mark, ground).into_any_element()
+}
+
+impl Ground {
+    /// The ground's own colour.
+    pub(crate) fn color(self, p: &Palette) -> Hsla {
+        match self {
+            Ground::Canvas | Ground::Run => p.canvas,
+            Ground::User => p.user,
+            Ground::Chrome => p.chrome,
+            Ground::Card => p.card,
+        }
+    }
 }
 
 /// A session's word colour on `ground` (its state word and counts).
@@ -732,27 +839,64 @@ mod tests {
     use gpui_kit::AssetSource;
     use synaps_client::transcript::ToolStatus;
 
-    /// The scan's beam (motion.md §10 amendment 14): on every beat a
-    /// running glyph's lit row and, one row above it, the row it left, its
-    /// afterglow: two quads a beat for `Run` (one as the beam wraps back to
-    /// the top), lit toward the ink.
+    /// P1: the running frames are the TUI's `SPINNER_FRAMES` decoded, each
+    /// a 3–4 dot snake on the six top dots (the polish.md table, written
+    /// out here so the decode itself is checked); the two heads and the
+    /// dial keep their counts; one beat (or two) a frame, phase-locked.
     #[test]
-    fn the_beam_lights_its_row_and_trails_one() {
-        let mark = gpui_kit::Hsla { h: 0.6, s: 0.5, l: 0.4, a: 1. };
-        let ink = gpui_kit::Hsla { h: 0., s: 0., l: 0.95, a: 1. };
-        let (hot, glow) = super::beam(mark, ink);
-        for beat in 0..24u32 {
-            let rows: Vec<_> = super::beam_rows(Glyph::Run, beat, mark, ink).collect();
-            let y = super::scan_row(beat);
-            assert_eq!(rows[0], (1., y, 8., hot), "beat {beat}");
-            if beat % 8 == 0 {
-                assert_eq!(rows.len(), 1, "beat {beat}: wrapping, no trail across the glyph");
-            } else {
-                assert_eq!(rows[1..], [(1., y - 1., 8., glow)], "beat {beat}");
-            }
+    fn braille_frames_match_spinner_frames() {
+        let table: [&[u8]; 10] = [
+            &[1, 2, 4],
+            &[1, 4, 5],
+            &[1, 4, 5, 6],
+            &[4, 5, 6],
+            &[3, 4, 5, 6],
+            &[3, 5, 6],
+            &[2, 3, 6],
+            &[1, 2, 3, 6],
+            &[1, 2, 3],
+            &[1, 2, 3, 4],
+        ];
+        let bits = |d: &[u8]| d.iter().fold(0u8, |b, n| b | 1 << (n - 1));
+        for (i, lit) in table.iter().enumerate() {
+            assert_eq!(super::RUN_FRAMES[i], bits(lit), "frame {i} ({})", super::SPINNER_FRAMES[i]);
+            assert!((3..=4).contains(&super::RUN_FRAMES[i].count_ones()));
         }
-        assert!(hot.l > glow.l && glow.l > mark.l, "lit toward the ink");
-        assert_eq!(super::beam_rows(Glyph::Workers, 3, mark, ink).count() % 2, 0, "every fill the beam crosses trails too");
+        assert_eq!(super::STILL, bits(&[1, 4, 5, 6]), "⠹");
+        for b in 0..40u32 {
+            assert_eq!(super::spin_dots(Glyph::Run, Some(b)), super::RUN_FRAMES[(b % 10) as usize], "one frame a beat: a 1.25 s lap");
+            assert_eq!(super::spin_dots(Glyph::Workers, Some(b)).count_ones(), 2, "two heads");
+            assert_eq!(super::spin_dots(Glyph::Opening, Some(b)).count_ones(), 1, "a dial");
+            assert_eq!(super::spin_dots(Glyph::Workers, Some(b)), super::spin_dots(Glyph::Workers, Some(b / 2 * 2)), "every two beats");
+        }
+        // The heads are opposite (1–6, 4–3, 5–2) and the dial walks the ring.
+        assert_eq!(super::WORKERS_FRAMES, [bits(&[1, 6]), bits(&[4, 3]), bits(&[5, 2])]);
+        assert_eq!(super::OPENING_FRAMES, [1u8, 4, 5, 6, 3, 2].map(|n| 1u8 << (n - 1)));
+        // Still: the snake's ⠹, the heads' and the dial's first frames.
+        assert_eq!(super::spin_dots(Glyph::Run, None), super::STILL);
+        assert_eq!(super::spin_dots(Glyph::Workers, None), super::WORKERS_FRAMES[0]);
+        assert_eq!(super::spin_dots(Glyph::Opening, None), super::OPENING_FRAMES[0]);
+    }
+
+    /// P1: a braille glyph is six 2×2 dots in the box (columns x 2 and 6,
+    /// rows y 1, 4 and 7), its drawing table the still frame's lit ones.
+    #[test]
+    fn glyph_silhouette_is_six_dots() {
+        assert_eq!(super::DOTS.len(), 6);
+        for &(x, y) in &super::DOTS {
+            assert!([2., 6.].contains(&x) && [1., 4., 7.].contains(&y) && x + super::DOT <= 10. && y + super::DOT <= 10.);
+        }
+        for g in [Glyph::Run, Glyph::Workers, Glyph::Opening] {
+            assert!(g.spins());
+            let lit: Vec<Part> = super::DOTS
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| super::spin_dots(g, None) & (1 << i) != 0)
+                .map(|(_, &(x, y))| Part::Fill(x, y, super::DOT, super::DOT))
+                .collect();
+            assert_eq!(g.parts(), &lit[..], "{g:?}: its still frame");
+        }
+        assert_eq!(Glyph::ALL.iter().filter(|g| g.spins()).count(), 3);
     }
 
     /// Every cut's static path names its glyph and cut (Shady N7: the
@@ -852,9 +996,6 @@ mod tests {
         // Half of `Failed` is its first stroke, whole; a quarter, half of it.
         assert!(svg_cut(Glyph::Failed, CUTS / 2).contains(r#"d="M2 2L8 8""#), "{}", svg_cut(Glyph::Failed, 4));
         assert!(svg_cut(Glyph::Failed, CUTS / 4).contains(r#"d="M2 2L5 5""#), "{}", svg_cut(Glyph::Failed, 2));
-        assert_eq!(super::scan_row(0), 1.);
-        assert_eq!(super::scan_row(7), 8.);
-        assert_eq!(super::scan_row(8), 1.);
     }
 
     /// A call's state: the glyph never drops, ok has no word, and the

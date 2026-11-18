@@ -1,0 +1,7 @@
+23:57:04 q3r4-bench q3r4-motion-1 load 1.23 swap_mb 7965 -> 7947
+23:59:36 main8-bench main-motion-1 load 0.89 swap_mb 7947 -> 7910
+00:04:12 q3r4-bench q3r4-motion-2 load 0.77 swap_mb 7910 -> 7898
+00:06:44 main8-bench main-motion-2 load 0.90 swap_mb 7898 -> 7897
+00:11:21 q3r4-bench q3r4-motion-3 load 2.64 swap_mb 7897 -> 7878
+00:13:52 main8-bench main-motion-3 load 2.36 swap_mb 7878 -> 7864
+BENCH8-DONE
