@@ -2319,7 +2319,17 @@ fn revealed(body: AnyElement, shown: Option<f32>, sink: std::rc::Rc<std::cell::C
         .flex_col()
         // Whole pixels: a fractional height would put every row under it
         // off the pixel grid (and the following list's end off its bottom).
-        .when_some(shown, |d, k| d.overflow_hidden().h(px(if h.is_nan() { 0. } else { (h * k).round() })))
+        // All of it (a resize's first frame holding the height it had):
+        // its own measured height, as laid out unclipped.
+        .when_some(shown, |d, k| {
+            d.overflow_hidden().h(px(if h.is_nan() {
+                0.
+            } else if k == 1. {
+                h
+            } else {
+                (h * k).round()
+            }))
+        })
         .child(div().w_full().flex_shrink_0().child(body))
         .on_children_prepainted(move |b, _, _| {
             if let Some(b) = b.first() {
