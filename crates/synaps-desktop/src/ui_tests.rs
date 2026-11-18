@@ -3807,6 +3807,36 @@ fn stream_step(cx: &mut TestAppContext, view: &Entity<AppView>, k: usize) {
     });
 }
 
+/// Shady #23 round 2 H1 (CI run 44363749232): every transcript row rests
+/// on whole pixels, at every text size and at the tight width. The demo's
+/// authorize card was 157.5 px (its 15 px title's 1.5 line height): a half
+/// pixel in the list's sum put `follow_offset_is_end_every_frame`'s end
+/// an f32 ulp off its bottom on CI's runners (28.000061 for 28), while
+/// bella's content happened to sum exactly.
+#[gpui_kit::test]
+fn every_row_rests_on_whole_pixels(cx: &mut TestAppContext) {
+    for text in [13u8, 14, 15, 16, 17, 18, 20] {
+        for width in [1440f32, 1100.] {
+            let (w, view, _events) = open_at(cx, (width, 9000.), text);
+            set_motion(cx, &view, crate::motion::Level::Full);
+            view.update(cx, |v, _| v.client = None);
+            settle(cx, w, 8);
+            let (n, frac) = view.read_with(cx, |v, _| {
+                let n = v.list.item_count();
+                let frac: Vec<_> = (0..n)
+                    .filter_map(|ix| v.list.bounds_for_item(ix).map(|b| (ix, v.disp.get(ix).map(|d| d.kind), f32::from(b.size.height))))
+                    .filter(|r| r.2.fract() != 0.)
+                    .collect();
+                (n, frac)
+            });
+            assert!(n > 5, "the demo's rows");
+            assert!(frac.is_empty(), "text {text} at {width}: rows off the pixel grid {frac:?}");
+            let card = VisualTestContext::from_window(w, cx).debug_bounds("card").expect("the demo's card");
+            assert_eq!(f32::from(card.size.height).fract(), 0., "text {text} at {width}: the card {card:?}");
+        }
+    }
+}
+
 /// Invariant (a): while following, the end of content is the bottom of the
 /// view on every frame, as text streams into the last row (its new lines
 /// gliding in) and rows arrive (revealing their height).

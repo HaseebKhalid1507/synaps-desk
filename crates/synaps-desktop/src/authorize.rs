@@ -1073,6 +1073,10 @@ impl AppView {
             (false, Some(_)) => "Run this command?",
             (false, None) => "Allow this?",
         };
+        // Whole-pixel line heights: the text's own (1.5 × its size) is a
+        // half pixel at 15 or 13, and a card a half pixel tall puts every
+        // row under it, and the following list's end, off the pixel grid.
+        let line = |size: f32| px((size * 1.5).round());
         let header = h_flex()
             .flex_none()
             .gap(px(8.))
@@ -1084,6 +1088,7 @@ impl AppView {
                     .font_family(fonts::SANS)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_px(m.card_title)
+                    .line_height(line(m.card_title))
                     .text_color(p.ink)
                     .debug_selector(|| "card-title".into())
                     .child(title),
@@ -1097,12 +1102,14 @@ impl AppView {
                     .whitespace_nowrap()
                     .font_family(fonts::SANS)
                     .text_px(m.meta)
+                    .line_height(line(m.meta))
                     .text_color(p.dim_t)
                     .debug_selector(|| "card-asked".into())
                     .child(a)
             }));
         let folder = c.guard.as_ref().map(|g| {
             mono(g.dir.clone(), m.meta, p.dim_t)
+                .line_height(line(m.meta))
                 .min_w_0()
                 .flex_shrink(1.)
                 .overflow_hidden()
