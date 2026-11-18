@@ -42,6 +42,10 @@ pub struct BenchOptions {
     /// 10 s idle, then a running tool's heartbeat (frames, phases, CPU per
     /// frame), then the same with Motion off.
     pub motion: bool,
+    /// `--bench-panels`: the side panels folded and unfolded and the
+    /// composer grown a line and back, over a long transcript (polish.md
+    /// P14): each one's frames, draw times and CPU, then what follows it.
+    pub panels: bool,
 }
 
 /// CPU time of every thread of this process so far (`/proc/self/task/*/schedstat`,
@@ -504,6 +508,67 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 });
                 out["mem_end"] = mem::sample();
                 out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
+                println!("{out}");
+                let _ = cx.update(|_, cx| cx.quit());
+                return;
+            }
+            if opts.panels {
+                // A 400-turn transcript at its end; each action, then its
+                // next 0.8 s (presents, draws, CPU, app frames) and the 1 s
+                // after it (nothing moves: 0).
+                let frames = |cx: &mut AsyncWindowContext| view.update(cx, |v, _| v.fx.frames()).unwrap_or(0);
+                let _ = upd(cx, &|v, _| {
+                    v.model.set_local_session("bench-panels");
+                    v.reset_transcript();
+                    v.model.transcript.apply_history(&turns(DRAG_TURNS, 13));
+                    v.sync_list();
+                    v.list.set_follow_mode(FollowMode::Tail);
+                    v.list.scroll_to_end();
+                });
+                sleep(1.5).await;
+                let long = "A draft that runs past the end of its first line and onto a second one, so the composer grows by \
+                            a line: the field's height and the transcript above it make room, then it shrinks back once cleared.";
+                for (name, act) in [
+                    ("rail_fold", 0u8),
+                    ("rail_unfold", 0),
+                    ("right_fold", 1),
+                    ("right_unfold", 1),
+                    ("composer_grow", 2),
+                    ("composer_shrink", 3),
+                ] {
+                    let (t0, c0, f0) = (Instant::now(), cpu_ns(), frames(cx));
+                    let _ = cx.update(|window, cx| {
+                        let _ = view.update(cx, |v, cx| {
+                            match act {
+                                0 => v.toggle_panel(true, cx),
+                                1 => v.toggle_panel(false, cx),
+                                2 => v.composer.update(cx, |s, cx| s.set_value(long, window, cx)),
+                                _ => v.composer.update(cx, |s, cx| s.set_value("", window, cx)),
+                            }
+                            cx.notify();
+                        });
+                    });
+                    sleep(0.8).await;
+                    let (t1, cpu, f1) = (Instant::now(), cpu_ns().saturating_sub(c0) as f64 / 1e6, frames(cx));
+                    sleep(1.0).await;
+                    let (t2, f2) = (Instant::now(), frames(cx));
+                    let mut s = view
+                        .update(cx, |v, _| {
+                            let b = v.bench.as_mut().unwrap();
+                            b.drain();
+                            let mut s = b.stats(t0, t1, refresh_fallback);
+                            s["presents_after"] = b.stats(t1, t2, refresh_fallback)["frames_presented"].clone();
+                            s
+                        })
+                        .unwrap_or(Value::Null);
+                    s["cpu_ms"] = json!(round(cpu, 2));
+                    s["app_frames"] = json!(f1 - f0);
+                    s["app_frames_after"] = json!(f2 - f1);
+                    out[name] = s;
+                }
+                out["rows"] = json!(view.update(cx, |v, _| v.model.transcript.len()).unwrap_or(0));
+                out["window_w"] = json!(view.update(cx, |v, _| v.width).unwrap_or(0.));
+                out["mem_end"] = mem::sample();
                 println!("{out}");
                 let _ = cx.update(|_, cx| cx.quit());
                 return;
