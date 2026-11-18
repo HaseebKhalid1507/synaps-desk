@@ -5549,7 +5549,7 @@ fn palette_fits(cx: &mut TestAppContext, (wd, ht): (f32, f32)) {
     focus_composer(cx, w, &view);
     tap(cx, w, palette_key(false));
     frame(cx, &view);
-    let (top, bottom) = view.read_with(cx, |v, _| v.palette_box.get());
+    let (top, bottom, ..) = view.read_with(cx, |v, _| v.palette_box.get());
     let strip = view.read_with(cx, |v, _| f32::from(v.strip_at.get().y)) + crate::tabstrip::TAB_H;
     let composer = view.read_with(cx, |v, _| v.composer_top.get());
     assert!(strip > crate::tabstrip::TAB_H && composer > top, "laid out: strip {strip}, composer {composer}");
@@ -6499,6 +6499,60 @@ fn column_rewraps_at_most_once_per_panel_motion(cx: &mut TestAppContext) {
             assert_eq!(changes[0], 1, "{fold}: narrowing rewraps at the start");
         }
     }
+}
+
+/// Q5: what is placed from the panes follows a panel in flight in its
+/// frame: Q7's pinned label stays pinned, on its band on the column as drawn
+/// while inline, and Q6's palette stays centred on the centre pane as drawn, under
+/// the tab strip, every frame of a rail fold and unfold.
+#[gpui_kit::test]
+fn sticky_and_palette_follow_a_panel_in_flight(cx: &mut TestAppContext) {
+    let (w, view, _events) = sticky_open(cx, (1440., 900.));
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let (l, id, _) = long_agent_message(cx, &view);
+    let pinned = format!("sticky {id}");
+    scroll_list(cx, w, &view, l, 0.);
+    let off = drawn(cx, w, format!("label {id}")).expect("the label line")[1] - viewport(cx, &view).1;
+    scroll_list(cx, w, &view, l, off + 1.);
+    let line = view.read_with(cx, |_, cx| crate::theme::metrics(cx).body_line);
+    let mut bands = 0;
+    for _ in 0..2 {
+        view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        cx.run_until_parked();
+        let frames = fly(cx, w, &view, 400, |cx| {
+            let (x, top) = viewport(cx, &view);
+            let (hang, left, column) = view.read_with(cx, |v, _| (v.layout.hang, v.layout.left, v.layout.column));
+            let band = drawn(cx, w, pinned.clone()).expect("pinned in every frame");
+            // Hanging (the pane wide enough, once the fold lands), the label
+            // sits in the gutter: Q7's own tests place it.
+            if !hang {
+                bands += 1;
+                assert!(near(band, [x + left, top, column, line]), "on the column as drawn: {band:?} {x} {left} {column}");
+            }
+        });
+        assert!(frames > 30, "{frames}");
+    }
+    assert!(bands > 30, "inline in flight: {bands}");
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(false));
+    frame(cx, &view);
+    assert!(palette_mode(cx, &view).is_some(), "open");
+    for _ in 0..2 {
+        view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        cx.run_until_parked();
+        let frames = fly(cx, w, &view, 400, |cx| {
+            view.read_with(cx, |v, _| {
+                let left = crate::chrome::MARK + v.panel_fx.sides[0].shown;
+                let pane = v.width - left - v.panel_fx.sides[1].shown;
+                let (_, _, x, pw) = v.palette_box.get();
+                let strip = f32::from(v.strip_at.get().y) + crate::tabstrip::TAB_H;
+                assert!((x + pw / 2. - (left + pane / 2.)).abs() <= 0.5, "centred on the pane as drawn: {x} {pw} {left} {pane}");
+                assert!(v.palette_box.get().0 >= strip + 8., "under the strip");
+            })
+        });
+        assert!(frames > 30, "{frames}");
+    }
+    assert!(palette_mode(cx, &view).is_some(), "still open");
 }
 
 /// fluid.md §3.8: a drag follows the pointer 1:1 (no spring), in every frame.
