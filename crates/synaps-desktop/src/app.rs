@@ -6404,11 +6404,14 @@ impl Render for AppView {
             // beat layer, it arms the timer after painting the beat).
             .child({
                 let (fx, me) = (self.fx.clone(), cx.entity_id());
-                canvas(|_, _, _| {}, move |_, _, window, cx| {
-                    #[cfg(test)]
-                    fx.painted("end-frame");
-                    fx.end_frame(window, cx, me)
-                })
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, cx| {
+                        #[cfg(test)]
+                        fx.painted("end-frame");
+                        fx.end_frame(window, cx, me)
+                    },
+                )
                 .absolute()
                 .size_0()
             })

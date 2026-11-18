@@ -2727,7 +2727,8 @@ fn a_counts_words_swap_as_its_digits_cross(cx: &mut TestAppContext) {
     wait(cx, w, &view, 16);
     wait(cx, w, &view, 16);
     let k = crate::motion::ROLL_PROBE;
-    let words = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
+    let words =
+        |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
     let rolling = |cx: &mut TestAppContext| !view.read_with(cx, |v, _| v.fx.rolling_in(Some(k))).is_empty();
     assert!(!rolling(cx) && !words(cx), "at rest");
     probe(cx, 2);
