@@ -23,7 +23,8 @@ right panel's edge over f600–f760 (`thumb2.py`). At rest it is 424–546.
 - Right panel, Full: 424–546 in every frame of both flights while its x rides from 974 to 1238 and back. Landed: 423
   (f662); the unfold's first frame 384 (f713), then 424.
 - Reduced and Off: the same settled thumbs (folded 423, open 424). Off's rail fold goes straight to 423; Reduced's has
-  the one 382 frame (f471), as Full's.
+  the one 382 frame (f471), as Full's. (Corrected in r3, from the re-gate: the right panel at Off has the one
+  in-between frame both ways too, f632 382 → f633 423 and f713 384 → f714 424.)
 - r1 strobed by 34 px every 1–3 frames through each flight. What is left is the landing re-wrap: one frame on estimated
   heights before the next frame draws the measured ones (`AppView` asks for that frame when the column changes).
 
@@ -33,7 +34,9 @@ FAVOURITES keeps showing, so no body folds here; a section's body folding is NAM
 
 **NAMED, mid-rail, the rail scrolled (must-fixes 2 and 3).** `sheets/full-named-fold-f1275-1305.png` and
 `full-named-unfold-f1359-1389.png` (every second frame). Folding: the rows below rise over NAMED's body, which stays
-drawn under them; no band opens, and the rows above NAMED do not move. Unfolding: from the first frame TODAY and what
+drawn under them; no band opens, and the rows above NAMED hold while it does (f1277–f1292). (Corrected in r3, from
+the re-gate: the rail is scrolled to its end, so its offset then gives way to the shorter rail as the fold's held
+length goes, and the rows above glide down 15 px over f1293–f1305: a second beat, smooth.) Unfolding: from the first frame TODAY and what
 follows ride down whole to the rail's foot; no frame drops the lower half.
 
 **The composer (E1).** `sheets/bench-composer-grows-f402-417.png`: the draft's last line stays at one y while the box
@@ -47,5 +50,6 @@ up, then rests.
 
 **The chips (Haseeb's item).** `r2-chips.json`: over 21 changes (steps, clocks, one done and one failed) every chip
 stays 308 × 24 px at one of three places. The only change is the reorder when the two end (an ended worker goes after
-the running ones, by need, as before), and that moves chips by whole cells. `sheets/chips-steps-f240-520.png` shows
+the running ones, by need, as before), and that moves chips by whole cells. (Corrected in r3: at rest. Mid-slide the x spring stopped
+half a cell short and jumped the rest, f381–f384; see `../r3/`.) `sheets/chips-steps-f240-520.png` shows
 frames 240–520 of the clip.
