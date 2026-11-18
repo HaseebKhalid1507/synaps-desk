@@ -5382,8 +5382,11 @@ fn sticky_label_on_a_band_when_inline(cx: &mut TestAppContext) {
     }
 }
 
-/// P15: the pinned label takes no click and no wheel: both reach the row
-/// under it (a folded run's header under the band: the click unfolds it).
+/// P15: the pinned label never takes the wheel: it scrolls the list under
+/// it. F8's band hides live rows, so it takes the pointer (Shady #19 M1): a
+/// click on it reaches nothing under it (a folded run's header there stays
+/// folded); 1 px under it, the click unfolds the run. (Hanging, the label
+/// sits on the empty gutter, with no hitbox at all.)
 #[gpui_kit::test]
 fn sticky_label_takes_no_click(cx: &mut TestAppContext) {
     use gpui_kit::{
@@ -5426,42 +5429,144 @@ fn sticky_label_takes_no_click(cx: &mut TestAppContext) {
     );
     settle(cx, w, 2);
     assert_eq!(offset(cx) - before, 60., "the wheel went through");
-    // A click on the band unfolds the run under it.
+    let click = |cx: &mut TestAppContext, at: gpui_kit::Point<gpui_kit::Pixels>| {
+        let mut vcx = VisualTestContext::from_window(w, cx);
+        vcx.simulate_event(MouseMoveEvent { position: at, pressed_button: None, modifiers: Modifiers::default() });
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1 });
+        vcx.run_until_parked();
+        settle(cx, w, 4);
+        view.read_with(cx, |v, _| v.disp.iter().any(|d| d.id == run && matches!(d.kind, crate::turns::Kind::Summary { open: true, .. })))
+    };
+    // A click on the band: the run under it stays folded.
     let at = under(cx);
-    let mut vcx = VisualTestContext::from_window(w, cx);
-    vcx.simulate_event(MouseDownEvent {
-        button: MouseButton::Left,
-        position: at,
-        modifiers: Modifiers::default(),
-        click_count: 1,
-        first_mouse: false,
+    assert!(!click(cx, at), "the band took the click");
+    // 1 px under the band and its rule, on the header: it unfolds.
+    let at = point(at.x, px(top + line + 2.));
+    assert!(drawn(cx, w, format!("sticky-rule {msg}")).is_some_and(|r| r[1] + r[3] < f32::from(at.y)), "under the rule");
+    assert!(click(cx, at), "the click reached the run's header");
+}
+
+/// F8 (Shady #19 M2): at Full, the band hides the beat under it. Running
+/// rows scrolled under it keep their glyphs and sweeps on the beat layer
+/// (painted after the app's whole frame, so over the band), but no site's
+/// clip meets the band: their beats show only below it.
+#[gpui_kit::test]
+fn sticky_band_hides_the_beat(cx: &mut TestAppContext) {
+    let (w, view, _events) = sticky_open(cx, (1440., 900.));
+    assert!(!view.read_with(cx, |v, _| v.layout.hang), "the labels are inline");
+    set_motion(cx, &view, crate::motion::Level::Full);
+    running_tools(cx, &view, 25);
+    for _ in 0..12 {
+        beat(cx, w, &view);
+    }
+    // A running row (the last 25 rows are), 6 px out of the top: its
+    // message's label is above it.
+    let (ix, id) = view.read_with(cx, |v, _| {
+        let ix = v.disp.len() - 12;
+        let l = (0..ix).rev().find(|&i| v.disp[i].who != crate::turns::Who::None).expect("the running message");
+        (ix, v.disp[l].id)
     });
-    vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1 });
-    vcx.run_until_parked();
-    let open =
-        view.read_with(&vcx, |v, _| v.disp.iter().any(|d| d.id == run && matches!(d.kind, crate::turns::Kind::Summary { open: true, .. })));
-    assert!(open, "the click reached the run's header");
+    let line = view.read_with(cx, |_, cx| crate::theme::metrics(cx).body_line);
+    scroll_list(cx, w, &view, ix, 6.);
+    beat(cx, w, &view);
+    let (_, top) = viewport(cx, &view);
+    let band = drawn(cx, w, format!("sticky {id}")).expect("the band");
+    let cover = Bounds::new(gpui_kit::point(px(band[0]), px(top)), size(px(band[2]), px(line + 1.)));
+    assert_eq!(band[1], top, "{band:?}");
+    let sites = view.read_with(cx, |v, _| v.fx.sites());
+    let under = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_)) && s.origin.y < cover.bottom()).count();
+    assert!(under >= 1, "a running glyph under the band: {sites:?}");
+    for s in &sites {
+        assert!(!s.mask.bounds.intersects(&cover), "a beat over the band: {s:?}, band {cover:?}");
+    }
+    // Under the band, the next rows' glyphs still beat.
+    assert!(sites.iter().any(|s| s.mask.bounds.size.height > px(0.) && s.origin.y > cover.bottom()), "the rest beat on");
+}
+
+/// Q2 L1 (Shady #19): with the labels inline, Ctrl+J lands a card scrolled
+/// out of the top below the sticky band, not under it: its top edge (F7's
+/// dashed mark, the trace) shows.
+#[gpui_kit::test]
+fn ctrl_j_lands_the_card_below_the_band(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    assert!(!view.read_with(cx, |v, _| v.layout.hang), "the labels are inline");
+    let (ix, msg, line) = view.read_with(cx, |v, cx| {
+        let ix = v.card_ix().expect("a card");
+        let msg = (0..ix).rev().find(|&i| v.disp[i].who != crate::turns::Who::None).expect("its message's label above it");
+        (ix, v.disp[msg].id, crate::theme::metrics(cx).body_line)
+    });
+    view.update(cx, |v, cx| {
+        v.list.scroll_to(gpui_kit::ListOffset { item_ix: ix, offset_in_item: px(60.) });
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    settle(cx, w, 8);
+    focus_composer(cx, w, &view);
+    tap(cx, w, "ctrl-j");
+    for _ in 0..120 {
+        fluid_frame(cx, w, &view);
+    }
+    settle(cx, w, 8);
+    let (_, top) = viewport(cx, &view);
+    let card = view.read_with(cx, |v, _| v.list.bounds_for_item(ix)).expect("the card drawn");
+    assert!((f32::from(card.top()) - (top + line + 1.)).abs() < 0.5, "the card's top {:?}, the view's {top}", card.top());
+    let band = drawn(cx, w, format!("sticky {msg}")).expect("the band");
+    let rule = drawn(cx, w, format!("sticky-rule {msg}")).expect("the rule");
+    assert!(band[1] == top && rule[1] + rule[3] <= f32::from(card.top()) + 0.5, "{band:?} {rule:?} {card:?}");
+    assert!(view.read_with(cx, |v, _| v.card_on_screen()), "in view");
 }
 
 /// polish.md P15: F1's four transcript tests and the unfold-hold tests
-/// run unchanged with the sticky layer: each is byte for byte main
-/// `0a78bb7`'s (FNV-1a 64 of its text, `fn` to its closing brace).
+/// run unchanged with the sticky layer: each, with its attributes (an added
+/// `#[ignore]` is a change), and every helper they call, all the way down,
+/// is byte for byte main `0a78bb7`'s (FNV-1a 64 of its text, its first
+/// attribute or `fn` to its closing brace).
 #[test]
 fn scroll_tests_unchanged() {
     let src = include_str!("ui_tests.rs").replace("\r\n", "\n");
     let text = |name: &str| {
-        let at = src.find(&format!("\nfn {name}(")).unwrap_or_else(|| panic!("{name}")) + 1;
+        let at = src.find(&format!("\nfn {name}(")).or_else(|| src.find(&format!("\nfn {name}<"))).unwrap_or_else(|| panic!("{name}")) + 1;
+        let mut start = at;
+        while let Some(prev) = src[..start - 1].rfind('\n').map(|i| i + 1) {
+            if !src[prev..start].starts_with("#[") {
+                break;
+            }
+            start = prev;
+        }
         let end = src[at..].find("\n}\n").unwrap_or_else(|| panic!("{name}")) + at + 2;
-        src[at..end].to_string()
+        src[start..end].to_string()
     };
     let fnv = |s: &str| s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
     for (name, main) in [
-        ("follow_offset_is_end_every_frame", 0xd6a5_1c48_a2b4_d120_u64),
-        ("anchor_row_never_moves", 0xedda_bdcc_4e68_cbd3),
-        ("transcript_heights_stable_across_frames", 0x4b67_49d3_c69a_82ae),
-        ("history_never_animates", 0x2881_7020_6083_c39b),
-        ("an_unfold_under_full_keeps_its_header_put", 0x55da_8425_990a_6ac9),
-        ("a_fold_drops_its_rows_from_the_unfold_hold", 0xdb81_4aad_0cb3_e70d),
+        ("follow_offset_is_end_every_frame", 0xa949_8145_0e4f_434f_u64),
+        ("anchor_row_never_moves", 0xd93f_4109_d027_0d82),
+        ("transcript_heights_stable_across_frames", 0x965d_5b2a_f1a0_6043),
+        ("history_never_animates", 0x72d1_37a0_9793_8774),
+        ("an_unfold_under_full_keeps_its_header_put", 0x4a16_3437_267f_75aa),
+        ("a_fold_drops_its_rows_from_the_unfold_hold", 0x1661_ce04_ee7a_42a2),
+        // The helpers they call.
+        ("a_folded_run", 0x19bc_8ea1_9ee7_246c),
+        ("attached", 0x121a_81e7_74c9_398c),
+        ("fluid_frame", 0xbbfc_1d0b_594d_4177),
+        ("frame", 0xb938_3690_352a_5ffb),
+        ("frames", 0x78aa_3c16_3afd_0efe),
+        ("motion_pending", 0x8743_a6e6_23ae_a4c0),
+        ("open", 0xcf0d_a8e3_2704_f4a4),
+        ("open_at", 0x280c_3155_84e0_4e3c),
+        ("open_idle_cpu", 0xc019_bf9d_983b_e771),
+        ("open_with", 0x6980_8528_8613_00f9),
+        ("set_motion", 0x7be3_0ca6_f053_6887),
+        ("settle", 0xb6b3_4f31_3ec9_964a),
+        ("start_stream", 0xd6a2_22bc_4ece_7d58),
+        ("stream_step", 0xbfc1_6760_b75a_fb66),
+        ("wait", 0x1217_4e34_2ad1_06e7),
     ] {
         assert_eq!(fnv(&text(name)), main, "{name} changed");
     }

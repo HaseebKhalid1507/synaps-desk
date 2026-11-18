@@ -9,10 +9,32 @@
 //! list's top row (`ListState::logical_scroll_top`) and the rows' bounds,
 //! so it follows the scroll 1:1, with no spring. Placement, not motion: the
 //! same at Full, Reduced and Off; it asks for no frame and moves no row.
-//! It has no hitbox: every click and wheel goes to what is under it.
+//! It is rebuilt on every app frame (two small trees, no cache).
+//! - Hanging (wide panes): the label sits on the empty gutter and has no
+//!   hitbox; every click, hover and wheel goes to what is under it.
+//! - Inline (F8, narrow panes): the band hides live rows, so it takes the
+//!   pointer but not the wheel (nothing hidden under it can be clicked or
+//!   hovered; the wheel still scrolls the list), and it hides the beat
+//!   layer's spinners and sweeps under it ([`crate::motion::Motion::cover_top`]).
+//!
+//! What it assumes of the list:
+//! - No top padding: GPUI's `bounds_for_item` leaves `padding.top` out while
+//!   painted rows include it, so a top padding would shift every pin by it
+//!   (the list's `pad_t` is 0, app.rs).
+//! - Every labelled row's gap is at least the pin's offset (part 16, turn 40,
+//!   first 20, all ·r, against `pad_y` 12·r): when the top row changes, the
+//!   next label is already at or below the pin, so nothing pops.
+//!
+//! Transients it accepts: during Q4's lift the pane is drawn at α k, the
+//! fill included, so the original label shows through it by k·(1−k) for
+//! `QUICK`; during Q1's arrival a pushing label is drawn `travel` lower than
+//! its slot, a gap, never an overlap.
+
+use std::rc::Rc;
 
 use gpui_kit::*;
 
+use crate::motion::Motion;
 use crate::turns::{Disp, Kind, Who};
 
 /// A label pinned: the display row that carries it, and its top, in px
@@ -64,18 +86,26 @@ pub(crate) fn place(
 
 /// What the layer draws, built after the list's layout from the layer's
 /// bounds (the list's): the pinned labels at their places, or nothing.
-type Build = Box<dyn Fn(Bounds<Pixels>, &mut Window, &mut App) -> Option<AnyElement>>;
+pub(crate) struct Pinned {
+    pub el: AnyElement,
+    /// An opaque strip across the column from the view's top (the band), in
+    /// window px: the beat layer paints nothing under it.
+    pub cover: Option<Bounds<Pixels>>,
+}
+
+type Build = Box<dyn Fn(Bounds<Pixels>, &mut Window, &mut App) -> Option<Pinned>>;
 
 /// The layer over the list: an absolute box over it whose content is
 /// built in its prepaint, after the list's (it comes after the list among
 /// the pane's children), and clipped to it.
 pub(crate) struct Layer {
+    fx: Rc<Motion>,
     build: Build,
-    child: Option<AnyElement>,
+    child: Option<Pinned>,
 }
 
-pub(crate) fn layer(build: impl Fn(Bounds<Pixels>, &mut Window, &mut App) -> Option<AnyElement> + 'static) -> Layer {
-    Layer { build: Box::new(build), child: None }
+pub(crate) fn layer(fx: Rc<Motion>, build: impl Fn(Bounds<Pixels>, &mut Window, &mut App) -> Option<Pinned> + 'static) -> Layer {
+    Layer { fx, build: Box::new(build), child: None }
 }
 
 impl IntoElement for Layer {
@@ -119,7 +149,7 @@ impl Element for Layer {
         cx: &mut App,
     ) {
         self.child = (self.build)(bounds, window, cx);
-        if let Some(child) = self.child.as_mut() {
+        if let Some(Pinned { el: child, .. }) = self.child.as_mut() {
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                 child.layout_as_root(
                     size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::Definite(bounds.size.height)),
@@ -141,8 +171,13 @@ impl Element for Layer {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(child) = self.child.as_mut() {
-            window.with_content_mask(Some(ContentMask { bounds }), |window| child.paint(window, cx));
+        if let Some(Pinned { el, cover }) = self.child.as_mut() {
+            window.with_content_mask(Some(ContentMask { bounds }), |window| el.paint(window, cx));
+            // The list has painted and recorded its glyphs' sites; the beat
+            // layer paints them after this whole frame, so over the band.
+            if let Some(c) = cover.map(|c| c.intersect(&bounds)).filter(|c| !c.is_empty()) {
+                self.fx.cover_top(c);
+            }
         }
     }
 }
