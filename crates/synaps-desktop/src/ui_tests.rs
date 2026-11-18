@@ -2291,6 +2291,25 @@ fn the_end_and_the_held_room_at_125_percent(cx: &mut TestAppContext) {
     }
 }
 
+/// The design gate of #23, S3: Needs you is the lattice plus everywhere
+/// (the tab strip's attention, the tray's stub, the rail), as the call's;
+/// the strip's and the stub's ping once when the prompt comes in, then
+/// hold still (0 frames).
+#[gpui_kit::test]
+fn needs_you_is_the_plus_and_pings_once(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let plus = crate::lattice::code(crate::lattice::pose(crate::lattice::Pat::Needs, None));
+    let sel = String::leak(format!("lattice-{plus:07x}"));
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds(sel).is_some(), "a still plus");
+    assert!(view.read_with(cx, |v, _| !v.model.transcript.pending_prompts().is_empty()), "a prompt waits");
+    let k = view.read_with(cx, |v, _| crate::glyph::needs_ping(&v.fx, true));
+    assert!(k.is_none(), "the prompt was there before: history never pings");
+    settle(cx, w, 8);
+    assert_eq!(motion_pending(cx, &view).0, false, "still: no frame");
+}
+
 /// Shady #23 r2 L1: the Outline Allow draws, charged in `acc_line`, and
 /// folds its card into its row like the fill (`TEST_ALLOW`).
 #[gpui_kit::test]
