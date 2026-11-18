@@ -6477,8 +6477,7 @@ fn column_rewraps_at_most_once_per_panel_motion(cx: &mut TestAppContext) {
                 assert!(following && end != Some(false), "{fold}: following, at the end");
             } else {
                 let now = view.read_with(cx, |v, _| v.list.bounds_for_item(anchor).map(|b| b.top()));
-                let why = view.read_with(cx, |v, _| (v.dock_h.get(), v.list.logical_scroll_top(), v.panel_fx));
-                assert_eq!(now, top, "{fold}: the top row moved, frame {}: {why:?} {c:?}", seen.len());
+                assert_eq!(now, top, "{fold}: the top row moved, frame {}", seen.len());
             }
         };
         check(cx, &mut seen);
@@ -6621,8 +6620,14 @@ fn dock_height_springs_on_sheet(cx: &mut TestAppContext) {
     let before = drawn(cx, w, "dock-box".into()).expect("scout's chip in the dock");
     let natural = dock(cx);
     assert!((before[3] - natural).abs() < 0.5, "at rest, the dock is its height");
-    // A worker's view in place: the card is off screen, its stub comes.
-    scout_in_place(cx, w, &view);
+    // The card scrolled away: its stub comes.
+    view.update(cx, |v, cx| {
+        v.list.scroll_to(gpui_kit::ListOffset { item_ix: 0, offset_in_item: px(0.) });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    // Its frames as laid out (the clock still: the spring at its start).
+    settle(cx, w, 8);
     let mut heights = Vec::new();
     let frames = fly(cx, w, &view, 400, |cx| {
         let comp = drawn(cx, w, "composer-bar".into()).expect("the composer");
@@ -6639,19 +6644,20 @@ fn dock_height_springs_on_sheet(cx: &mut TestAppContext) {
     assert!(moved > 20, "the dock's top rose over frames, not at once ({moved})");
     assert!(heights.windows(2).all(|p| p[1].0 <= p[0].0 + 1e-3), "and only rose");
     assert!(settle(cx, w, 8) <= 2);
-    view.update(cx, |v, cx| v.leave_worker(false, cx));
-    cx.run_until_parked();
+    // The prompt answered elsewhere: the stub goes.
+    resolve_prompt(cx, &view);
+    settle(cx, w, 8);
     let frames = fly(cx, w, &view, 400, |_| {});
     assert!(frames > 30, "the stub left on `sheet` ({frames})");
     assert!((dock(cx) - natural).abs() < 0.5);
-    // Reduced: in one frame.
+    assert!(settle(cx, w, 8) <= 2);
+    // Reduced: no box on a spring, the dock its height at once.
     set_motion(cx, &view, crate::motion::Level::Reduced);
     settle(cx, w, 8);
-    scout_in_place(cx, w, &view);
     assert!(!motion_pending(cx, &view).0, "Reduced: no frame");
     assert!(drawn(cx, w, "dock-box".into()).is_none(), "Reduced: no box on a spring");
     let b = drawn(cx, w, "dock".into()).expect("the dock");
-    assert!((b[3] - grown).abs() < 0.5, "Reduced: at its height at once ({b:?} {grown})");
+    assert!((b[3] - natural).abs() < 0.5, "Reduced: at its height ({b:?} {natural})");
 }
 
 /// fluid.md §3.8: the composer grows a line on `flick`, upward: its
@@ -6715,7 +6721,6 @@ fn rail_section_folds_on_sheet(cx: &mut TestAppContext) {
     for open in [false, true] {
         view.update(cx, |v, cx| v.toggle_bucket(b, cx));
         cx.run_until_parked();
-        let first = view.read_with(cx, |v, _| (v.rail_fx.fold.clone(), v.rail.rail.items.len(), v.fx.pending()));
         let mut os = Vec::new();
         let frames = fly(cx, w, &view, 400, |cx| {
             if let Some(f) = view.read_with(cx, |v, _| v.rail_fx.fold.clone()) {
@@ -6727,11 +6732,7 @@ fn rail_section_folds_on_sheet(cx: &mut TestAppContext) {
                 }
             }
         });
-        let why = view.read_with(cx, |v, _| {
-            let ix = v.rail.rail.items.iter().position(|it| matches!(it, crate::rail::Item::Bucket { bucket, .. } if *bucket == b));
-            (ix, ix.and_then(|ix| crate::chrome::item_y(&v.rail_list, ix)), v.rail.rail.items.len(), v.rail_list.viewport_bounds())
-        });
-        assert!(frames > 30 && os.len() > 30, "{open}: {frames} frames, {} on the fold {why:?} {first:?}", os.len());
+        assert!(frames > 30 && os.len() > 30, "{open}: {frames} frames, {} on the fold", os.len());
         assert!(if open { os[0] < -20. } else { os[0] > 20. }, "{open}: it starts where the rows were ({})", os[0]);
         assert!(os.windows(2).all(|p| p[1].abs() <= p[0].abs() + 1e-3), "{open}: toward 0 only");
         assert!(view.read_with(cx, |v, _| v.rail_fx.fold.is_none()));
