@@ -206,8 +206,8 @@ pub(crate) fn usage(name: &str) -> &'static str {
     }
 }
 
-/// What the composer's note line says of a slash command's answer: a line.
-/// The whole answer, more than a line, is in the transcript
+/// What the composer's note line says of a slash command's answer: a line,
+/// or how many lines its row at the transcript's end holds
 /// ([`synaps_client::Transcript::output`]).
 pub(crate) fn reply_note(name: &str, reply: &CommandReply) -> String {
     let first = |t: &str| t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string();
@@ -215,9 +215,11 @@ pub(crate) fn reply_note(name: &str, reply: &CommandReply) -> String {
         // `/compact` answers nothing: whether it started, the log says.
         CommandReply::Done(t) if first(t).is_empty() && name == "compact" => "/compact: asked (the log shows how it goes)".into(),
         CommandReply::Done(t) if first(t).is_empty() => format!("/{name}: done"),
+        // More than a line: the transcript's row has it, just above (a
+        // first line is often a header: never the note's last word).
         CommandReply::Done(t) => match t.trim().lines().count() {
             1 => format!("/{name}: {}", first(t)),
-            n => format!("/{name}: {} (+{} lines in the transcript)", first(t), n - 1),
+            n => format!("/{name}: {n} lines ↓"),
         },
         CommandReply::NotRun(why) => format!("/{name} not run: {}", first(why)),
         CommandReply::Unknown(why) => format!("/{name}: unknown — {}", first(why)),
@@ -646,9 +648,12 @@ impl AppView {
         let Some(p) = self.palette.as_mut() else { return };
         p.step(by, wrap);
         // The quad is the list's first child: a line's is one on.
-        if let Some(k) = p.lines().iter().position(|l| *l == Line::Row(p.sel)) {
-            // A group's first row brings its head into view with it.
-            self.palette_scroll.scroll_to_item(if k > 0 && p.sel == 0 { 1 } else { k + 1 });
+        let lines = p.lines();
+        if let Some(k) = lines.iter().position(|l| *l == Line::Row(p.sel)) {
+            // A group's first row (any group's) brings its head into view
+            // with it.
+            let head = k > 0 && matches!(lines[k - 1], Line::Head(_));
+            self.palette_scroll.scroll_to_item(if head { k } else { k + 1 });
         }
         cx.notify();
     }
@@ -1325,7 +1330,7 @@ mod tests {
         assert_eq!(reply_note("compact", &Done(String::new())), "/compact: asked (the log shows how it goes)");
         assert_eq!(reply_note("confirms", &Done(String::new())), "/confirms: done");
         let workers = "Workers (2):\n  sa_1  scout  running  0m\n  sa_2  wren  completed  3m";
-        assert_eq!(reply_note("workers", &Done(workers.into())), "/workers: Workers (2): (+2 lines in the transcript)");
+        assert_eq!(reply_note("workers", &Done(workers.into())), "/workers: 3 lines ↓");
         assert_eq!(
             reply_note("model", &NotRun("not switched: the model is still claude-opus-4-6".into())),
             "/model not run: not switched: the model is still claude-opus-4-6"
