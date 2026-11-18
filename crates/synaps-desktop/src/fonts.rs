@@ -74,7 +74,7 @@ pub fn register(cx: &mut App) {
 /// Every Japanese sub-label. `subset.sh` keeps exactly these glyphs.
 #[cfg(test)]
 const JP_LABELS: &[&str] =
-    &[JP_SESSIONS, JP_CONTEXT, JP_TOKENS, JP_FILES, JP_FAVOURITES, JP_PINNED, JP_OPEN, JP_HISTORY, JP_WORKERS, JP_COMMANDS];
+    &[JP_SESSIONS, JP_CONTEXT, JP_TOKENS, JP_FILES, JP_FAVOURITES, JP_PINNED, JP_OPEN, JP_HISTORY, JP_WORKERS, JP_COMMANDS, JP_VIEWS];
 pub const JP_SESSIONS: &str = "セッション";
 /// The rail's groups: FAVOURITES, PINNED, OPEN, HISTORY.
 pub const JP_FAVOURITES: &str = "お気に入り";
@@ -87,6 +87,8 @@ pub const JP_FILES: &str = "変更";
 /// The palette's WORKERS and COMMANDS heads (polish.md P16).
 pub const JP_WORKERS: &str = "ワーカー";
 pub const JP_COMMANDS: &str = "コマンド";
+/// The palette's VIEWS head (Settings, Usage).
+pub const JP_VIEWS: &str = "表示";
 
 /// Tracked display labels.
 pub mod label {

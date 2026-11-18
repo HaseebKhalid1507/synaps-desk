@@ -441,8 +441,9 @@ roles! {
     // table rule, the two filled buttons.
     you_mark, you_mark_t, bullet, warn_mark, run_mark, focus, tb2, btn_fill, warn_fill,
     // The filled buttons' hover (a step toward the ink); a scrollbar's
-    // thumb at rest on the canvas, the chrome and the user surface.
-    btn_hi, warn_hi, thumb, thumb_ch, thumb_u,
+    // thumb at rest on the canvas, the chrome, the user surface and the
+    // card (the palette's list).
+    btn_hi, warn_hi, thumb, thumb_ch, thumb_u, thumb_k,
     // Pressed (fluid.md §3.9): a step off each hover fill, toward the ink
     // or else away from it, never through a floor of what is drawn on it:
     // on the chrome (`raised`), the card (`card_hi`), and the two filled
@@ -757,10 +758,14 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     // A thumb at rest: its ground's dim text, 55 % of the way off the
     // ground (what `opacity(0.55)` painted). It stands off the ground as a
     // divider does.
-    [r.thumb, r.thumb_ch, r.thumb_u] = [mix(canvas, r.dim, 0.55), mix(chrome, r.dim_ch, 0.55), mix(user, r.dim_u, 0.55)];
-    for (role, ground, from, c) in
-        [("thumb", canvas, r.dim, r.thumb), ("thumb_ch", chrome, r.dim_ch, r.thumb_ch), ("thumb_u", user, r.dim_u, r.thumb_u)]
-    {
+    [r.thumb, r.thumb_ch, r.thumb_u, r.thumb_k] =
+        [mix(canvas, r.dim, 0.55), mix(chrome, r.dim_ch, 0.55), mix(user, r.dim_u, 0.55), mix(card, r.dim_k, 0.55)];
+    for (role, ground, from, c) in [
+        ("thumb", canvas, r.dim, r.thumb),
+        ("thumb_ch", chrome, r.dim_ch, r.thumb_ch),
+        ("thumb_u", user, r.dim_u, r.thumb_u),
+        ("thumb_k", card, r.dim_k, r.thumb_k),
+    ] {
         f.log.push(Check { role, from, color: c, grounds: vec![ground], floor: HAIR });
     }
     // Pressed ([`pressed`]): what is drawn on each is logged on it.
@@ -1027,7 +1032,7 @@ pub fn luminance_hsla(c: Hsla) -> f32 {
 /// thumbs), and the ink and prose the words are in.
 const UNDRAINED: &[&str] = &[
     "chrome", "canvas", "user", "code", "tool", "tool_out", "card", "card_hi", "raised", "hair", "edge", "frame", "add_bg", "del_bg",
-    "thumb", "thumb_ch", "thumb_u", "press_ch", "press_k", "ink", "prose",
+    "thumb", "thumb_ch", "thumb_u", "thumb_k", "press_ch", "press_k", "ink", "prose",
     // Q1's (PR #16) ground and rules (a well greys while the code beside
     // it doesn't): `grounds_and_rules_never_drain` fails on any new one
     // missing here.

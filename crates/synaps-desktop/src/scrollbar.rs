@@ -57,6 +57,8 @@ pub(crate) enum Ground {
     Canvas,
     Chrome,
     User,
+    /// The card (the palette's list).
+    Card,
 }
 
 /// A scroll's geometry along the bar's axis (px): the track's length, the
@@ -481,6 +483,8 @@ pub(crate) struct Bars {
     /// The session's system prompt in Settings.
     pub prompt: Pane,
     pub usage: BarState,
+    /// The palette's list.
+    pub palette: BarState,
 }
 
 /// A bar over `scroll`.
@@ -663,6 +667,7 @@ impl<S: Scrolled> Frame<S> {
                 Ground::Canvas => (p.canvas, p.thumb),
                 Ground::Chrome => (p.chrome, p.thumb_ch),
                 Ground::User => (p.user, p.thumb_u),
+                Ground::Card => (p.card, p.thumb_k),
             };
             let rect = thumb_rect(axis, lane, thumb);
             window.with_content_mask(Some(ContentMask { bounds: vp }), |window| {
@@ -678,6 +683,7 @@ impl<S: Scrolled> Frame<S> {
                 Ground::Canvas => (p.thumb, p.dim, p.focus),
                 Ground::Chrome => (p.thumb_ch, p.dim_ch, p.focus_ch),
                 Ground::User => (p.thumb_u, p.dim_u, p.focus),
+                Ground::Card => (p.thumb_k, p.dim_k, p.focus_k),
             };
             let color = if dragging {
                 hot
@@ -694,6 +700,7 @@ impl<S: Scrolled> Frame<S> {
                         Ground::Canvas => p.canvas,
                         Ground::Chrome => p.chrome,
                         Ground::User => p.user,
+                        Ground::Card => p.card,
                     };
                     crate::motion::mix(base, color, k)
                 }
