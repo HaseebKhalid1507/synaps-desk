@@ -52,6 +52,7 @@ mod settings;
 mod settings_view;
 mod shell;
 mod stats;
+mod sticky;
 #[cfg(test)]
 mod style_tests;
 mod subagents;

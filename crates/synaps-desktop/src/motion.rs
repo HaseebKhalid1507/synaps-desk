@@ -260,6 +260,21 @@ pub(crate) fn text_motion() -> gpui_kit::base::TextViewMotion {
         .with_stream_fade_easing(stream_curve())
 }
 
+/// Tests: a size-0 mark that logs `what` when it paints, in paint order
+/// ([`Motion::paint_log`]); outside tests, nothing.
+pub(crate) fn probe(fx: &Rc<Motion>, what: &'static str) -> Option<AnyElement> {
+    #[cfg(test)]
+    {
+        let fx = fx.clone();
+        Some(canvas(|_, _, _| {}, move |_, _, _, _| fx.painted(what)).absolute().size_0().into_any_element())
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (fx, what);
+        None
+    }
+}
+
 /// The one sanctioned opacity (fluid.md §3.6, law 3): something arriving
 /// lifts from [`LIFT`] to full, never lower. Opaque grounds only.
 #[allow(clippy::disallowed_methods)]
