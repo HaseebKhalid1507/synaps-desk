@@ -1,4 +1,7 @@
-# Cards D: evidence
+# Cards D: evidence (round 1, head 178939d)
+
+Round 2 (the finish gate, Shady's review, H2 "Turning lattice") is in [`r2/`](r2/README.md); where they
+differ, round 2 is current.
 
 Built from `cards4/proposal.md` (direction D, approved as is). Head of `design/cards-d`; binary
 `bella:~/.local/bin/synaps-desktop-hybrid.cardsd`. Every run: a headless gamescope on bella (144 Hz,
@@ -39,12 +42,13 @@ Frame strips (`frames/`, every Nth frame of the lossless clips):
 - `live-allow-fold-full-f1538-1584.png`: Allow pressed, the card folds under its call row on `glide`, the
   receipt lands lit and decays, the orbit closes to the tick.
 - `live-deny-fold-full-f4294-4324.png`: the same for Deny.
-- `call-unfold-full-f55-78.png`, `call-fold-full-f243-253.png`: a failed call's well opens and closes (17 and
-  7 frames at 60 fps).
+- `run-unfold-4calls-full-f55-78.png`, `run-fold-4calls-full-f243-253.png`: the "4 tool calls" run unfolds and
+  folds (17 and 7 frames at 60 fps). Round 1 labelled these `call-*`; they are the run (finish gate).
 - `run-unfold-full-f368-398.png`, `run-fold-full-f525-537.png`: a folded run opens (its rows staggered in,
   25 frames) and closes (9).
-- `call-arrives-full-f90-110.png`, `orbit-full-f332-348-4x.png`, `tick-writeon-glyph-4x-f1692-1712.png`
-  (a success's tick lit `ok`, settling to `dim`), `turn-end-full-f1788-1820.png` (the settle pass; no sweep).
+- `call-arrives-full-f90-110.png`, `turn-end-full-f1788-1820.png` (the settle pass; no sweep). Round 1's orbit
+  and tick strips were mis-cropped and are removed; the orbit is replaced by H2's lattice, and round 2's strips
+  are in [`r2/`](r2/README.md).
 
 Reduced and Off (`fold-reduced`, `fold-off`): every fold and unfold is one changed frame (spatial ends at
 once at Reduced; nothing moves at Off). The life scene at Reduced changes on 42 runs of frames, at Off on 17
