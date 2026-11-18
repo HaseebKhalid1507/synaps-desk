@@ -2,6 +2,18 @@
 
 Commit hashes are this repository's (`synaps-desk`). PR numbers other than synaps-desk#N are those of the archived `synaps-desktop` repository this history was rewritten from.
 
+## Since c89cc05
+
+Additive only: saved sessions as catalog pages (SynapsCLI watch-sessions PR 4, `session_page`), the replacement of #408's `saved_sessions`. Nothing existing changes shape; `saved_sessions` / `SavedSessionList` stay for daemons that still speak them.
+
+- New `FEATURE_SESSION_PAGE` (`"session_page"`) and `CATALOG_PAGE_MAX` (200, the daemon's ceiling).
+- New `ClientFrame::CatalogPage { req, before, limit, named_only }`, encoded as PR 4 pins it (`{"type":"catalog_page","req":7,"before":{…},"limit":50}`; `before` and a false `named_only` omitted), and `protocol::CatalogCursor { updated_at, id }` (opaque: a reply's `next` goes back as `before`).
+- New `DaemonFrame::CatalogPage { req, sessions, next, rejected, error }`. Rows decode one by one: an undecodable row is skipped and counted in `rejected`, the page is kept. A missing or `null` `sessions` is empty.
+- New `Client::catalog_page(before, limit, named_only) -> Result<u64, RequestError>`: returns the `req`; `limit` clamped to 1..=200. Only to a daemon that lists `session_page` (else `Unsupported`, or `NotConnected` while features are unknown; nothing is sent). New `Command::CatalogPage { req, .. }` (a raw one to a daemon without the feature fails its `req` and says `Error::Unsupported`).
+- New `Event::CatalogPage { req, sessions, next, rejected }` and `Event::CatalogPageFailed { req, reason }` (the reply's `error`, a dropped connection, not connected). Replies are matched by `req`, not order (the daemon serves pages as tasks); a reply to a `req` not outstanding is dropped. A control `Error` (no `req`) fails a page only if it names `catalog_page` or only pages wait.
+- New `SessionMeta::updated_at: Option<String>` (set on saved rows; held rows omit it), `SessionMeta::is_saved()` (`lifecycle == "saved"`), and `SessionMeta::to_saved()` (the row as a `SavedSession`, journal id as `id`, `live: false`).
+- `conn::Conn`: an `Attach` sent on a connection cancels the `CatalogPage` reqs outstanding on it (`Conn::cancelled()`); a late reply to one (zero or one may come before `Attached`) is dropped by `Conn::recv`. `Client` itself sends pages only on its control connection, which never attaches.
+
 ## Since 461a006
 
 Additive only: workers in session lists from a `dev` daemon (SynapsCLI #416, which replaces #410's `subagents_running`).
