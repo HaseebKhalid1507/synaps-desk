@@ -6367,11 +6367,13 @@ impl Render for AppView {
             self.list.remeasure();
             self.metrics_gen += 1;
         }
-        // A new column re-wraps the rows: this frame's scrollbar reads the
-        // rows not yet measured at their estimates. One more frame draws it
-        // from their heights, at every level (a fold at Off draws one frame,
-        // and its bar would keep the estimate until the next change).
-        if lay.column != self.layout.column {
+        // A new column re-wraps the rows: this frame's scrollbar would read
+        // the rows not yet measured at their estimates (it is held as it
+        // was, `Bar::still`). One more frame draws it from their heights,
+        // at every level (a fold at Off draws one frame, and its bar would
+        // keep the estimate until the next change).
+        let rewrap = lay.column != self.layout.column;
+        if rewrap {
             window.request_animation_frame();
         }
         // Short or not: the list's top edge moves by what the bars above it
@@ -6494,8 +6496,12 @@ impl Render for AppView {
         // Over the list's right padding, after its layout (and the hold-back's).
         let layer = self.layer_now();
         let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.scroller.clone(), self.fx.clone()));
-        let transcript_bar =
-            crate::scrollbar::rows_gliding(&self.list, pad_t + pad_b, &self.bars.transcript, glide).always().still(self.drag.is_some());
+        // Held while an edge is dragged, and in the frame a new column
+        // re-wraps the rows (on their estimates): the next frame draws it
+        // from their heights (the gate's S3, and the landing's frame).
+        let transcript_bar = crate::scrollbar::rows_gliding(&self.list, pad_t + pad_b, &self.bars.transcript, glide)
+            .always()
+            .still(self.drag.is_some() || rewrap);
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
         // the end of a scrolled-back list set it following; it stops 2 px
         // short of the end instead, still scrolled back. Built only on the
