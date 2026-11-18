@@ -6107,7 +6107,10 @@ impl Render for AppView {
                         .child(list)
                         // Right after the list's layout, reading it as it
                         // paints: the top message's label pinned (P15).
-                        .child(crate::sticky::layer(self.fx.clone(), cx.processor(|this, b: Bounds<Pixels>, _, cx| this.sticky_label(b, cx))))
+                        .child(crate::sticky::layer(
+                            self.fx.clone(),
+                            cx.processor(|this, b: Bounds<Pixels>, _, cx| this.sticky_label(b, cx)),
+                        ))
                         .children(crate::motion::probe(&self.fx, "sticky"))
                         .child(crate::scroll::owner(self.scroller.clone(), self.fx.clone()))
                         .children(unpainted)
