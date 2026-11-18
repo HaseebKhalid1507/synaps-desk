@@ -6746,6 +6746,58 @@ fn rail_section_folds_on_sheet(cx: &mut TestAppContext) {
     assert!(!motion_pending(cx, &view).0);
 }
 
+/// A section unfolding with more of the rail below than the view shows:
+/// what follows rides down from where it was, the items whose place is
+/// below the view included (the list draws only what is in view where it
+/// lays out: they are drawn over it), so the rail never shows short.
+#[gpui_kit::test]
+fn a_section_unfolding_never_leaves_the_rail_short(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1440., 700.), crate::theme::Panels::default().text_size);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let (b, ix) = view
+        .read_with(cx, |v, _| {
+            let items = &v.rail.rail.items;
+            items.windows(2).enumerate().find_map(|(ix, p)| match p {
+                [crate::rail::Item::Bucket { bucket, open: true, .. }, crate::rail::Item::Hist(_)] => Some((*bucket, ix)),
+                _ => None,
+            })
+        })
+        .expect("an open HISTORY bucket in the demo");
+    // The bucket at the top of the rail's view, folded.
+    view.update(cx, |v, cx| {
+        v.rail_list.scroll_to(gpui_kit::ListOffset { item_ix: ix, offset_in_item: px(0.) });
+        v.toggle_bucket(b, cx);
+    });
+    settle(cx, w, 60);
+    view.update(cx, |v, cx| v.toggle_bucket(b, cx));
+    cx.run_until_parked();
+    let mut tails = 0;
+    fly(cx, w, &view, 400, |cx| {
+        view.read_with(cx, |v, _| {
+            let Some(f) = v.rail_fx.fold.as_ref().filter(|f| f.o < 0.) else { return };
+            let vh = f32::from(v.rail_list.viewport_bounds().size.height);
+            let tail = &v.rail_fx.tail;
+            let h = |ix: usize| v.rail_list.bounds_for_item(ix).map(|b| f32::from(b.size.height)).unwrap_or(0.);
+            if tails == 0 {
+                assert!(!tail.is_empty(), "the first frame: rows below the view's end ride into it");
+            }
+            if let Some(&(last, top)) = tail.last() {
+                tails += 1;
+                assert!(top + h(last) >= vh - 0.5 || last + 1 == v.rail.rail.items.len(), "down to the view's end ({top} {vh})");
+                for p in tail.windows(2) {
+                    assert!((p[1].1 - (p[0].1 + h(p[0].0))).abs() < 0.5 && p[1].0 == p[0].0 + 1, "contiguous: {p:?}");
+                }
+                let first = tail[0];
+                let at = v.rail_list.bounds_for_item(first.0).map(|b| f32::from(b.top() - v.rail_list.viewport_bounds().top()));
+                assert!(at.is_some_and(|y| y >= vh - 0.5 && (y + f.o - first.1).abs() < 0.5), "its place, ridden: {at:?} {first:?}");
+            }
+        })
+    });
+    assert!(tails > 3, "{tails}");
+    assert!(view.read_with(cx, |v, _| v.rail_fx.fold.is_none() && v.rail_fx.tail.is_empty()));
+}
+
 /// P13: a chip that comes rises 8 px on `flick` and lifts from 70 %; a
 /// chip that leaves keeps its slot while it fades, then the line closes.
 #[test]

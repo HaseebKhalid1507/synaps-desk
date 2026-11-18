@@ -220,6 +220,10 @@ pub(crate) struct RailFx {
     pub(crate) readout_dy: f32,
     /// A section folding or unfolding.
     pub(crate) fold: Option<Fold>,
+    /// Unfolding, the items after it that ride into view from where they
+    /// were but whose place is below it (the list draws only what is in
+    /// view where it lays out): each with its top in the rail's view.
+    pub(crate) tail: Vec<(usize, f32)>,
 }
 
 /// Spring keys (the rail's own).
@@ -840,6 +844,19 @@ impl AppView {
                 out.fold = None;
             }
         }
+        out.tail.clear();
+        if let Some(f) = out.fold.as_ref().filter(|f| f.o < 0.) {
+            for ix in f.after..rail.items.len() {
+                let Some((y, _, scroll)) = item_y(list, ix) else { break };
+                let top = y - scroll;
+                if top + f.o >= view_h {
+                    break;
+                }
+                if top >= view_h {
+                    out.tail.push((ix, top + f.o));
+                }
+            }
+        }
         for (key, from) in std::mem::take(&mut self.rail.flip_from) {
             if let Some((y, _, _)) = ix_of(key).and_then(|ix| item_y(list, ix))
                 && (from - y).abs() >= 0.5
@@ -1280,6 +1297,12 @@ impl AppView {
                             .child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(p.you_bar))
                     }))
                     .child(items)
+                    .children(
+                        self.rail_fx
+                            .tail
+                            .iter()
+                            .map(|&(ix, top)| div().absolute().left_0().right_0().top(px(top)).child(self.render_rail_item_at(ix, cx))),
+                    )
                     .child(crate::scrollbar::rows(&self.rail_list, 0., &self.bars.rail).ground(crate::scrollbar::Ground::Chrome)),
             )
             .child(self.render_foot(p, cx))
