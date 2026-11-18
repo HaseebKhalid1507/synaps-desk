@@ -875,12 +875,15 @@ pub(crate) fn session_items(f: MenuFor) -> Vec<crate::menu::Item<SessionAct>> {
 const CLOSE_KEY: &str = if cfg!(target_os = "macos") { "⌘W" } else { "Ctrl+W" };
 
 /// The room a folded card gave up ([`AppView::fold_slack`]): how much it
-/// gave, the list's content without it when it landed, and what was drawn.
+/// gave, the list's content without it when it landed, what was drawn,
+/// and once the turn ended, its going.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Slack {
     given: f32,
     base: f32,
     last: f32,
+    /// The turn ended: going on `sheet` from what was left, since when.
+    gone: Option<(f32, Instant)>,
 }
 
 /// The composer foot's parts (design.md §8.11), as the room allows: what
@@ -1554,8 +1557,8 @@ pub struct AppView {
     pub(crate) card_exit: Option<CardExit>,
     /// The room a folded card gave up, kept at the list's end as it folded
     /// (the answered row holds still) and after it landed, until rows that
-    /// grow in under it use it up or the list leaves its end
-    /// ([`AppView::tail_slack`]).
+    /// grow in under it use it up, the list leaves its end, or the turn
+    /// ends (then on `sheet`, with its run's fold) ([`AppView::tail_slack`]).
     pub(crate) fold_slack: Cell<Option<Slack>>,
     /// Answered prompts' receipts, by session ([`crate::authorize::Receipt`]).
     pub(crate) receipts: HashMap<String, Vec<crate::authorize::Receipt>>,
@@ -3697,9 +3700,17 @@ impl AppView {
         // column holds still until it is used up (the finish gate of #23,
         // item 7: never a slide after the fold).
         let over = f32::from(self.list.max_offset_for_scrollbar().y);
-        if over > 0. {
+        if over > 0. && s.gone.is_none() {
             let content = over + f32::from(self.list.viewport_bounds().size.height) - s.last;
             s.last = (s.given - (content - s.base).max(0.)).clamp(0., s.given);
+        }
+        // The turn ended (its run folds, the column moves anyway): what is
+        // left goes on `sheet` with it.
+        if !self.synced_busy {
+            let now = self.fx.now();
+            let (from, at) = *s.gone.get_or_insert((s.last, now));
+            s.last = from * crate::motion::Spring::from_rest(1., crate::motion::SHEET_RESPONSE, now.saturating_duration_since(at).as_secs_f32());
+            self.fx.want_frame();
         }
         if s.last < 0.5 {
             self.fold_slack.set(None);
@@ -4153,7 +4164,7 @@ impl AppView {
                 // the room at the fold's end).
                 let given = e.given(fx_now);
                 let content = f32::from(self.list.max_offset_for_scrollbar().y) + f32::from(self.list.viewport_bounds().size.height);
-                self.fold_slack.set((keep && given >= 0.5).then_some(Slack { given, base: content - given, last: given }));
+                self.fold_slack.set((keep && given >= 0.5).then_some(Slack { given, base: content - given, last: given, gone: None }));
                 self.card_exit = None;
             }
         }
