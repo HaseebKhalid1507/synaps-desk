@@ -2696,6 +2696,54 @@ fn worker_rows(tools: u64, step: &str) -> serde_json::Value {
         "cancel_requested": false, "elapsed_secs": 2.0, "finished_elapsed": null, "step": step, "tools": tools}]})
 }
 
+/// What painted in the last app frame, in order (`Motion::paint_log`).
+fn painted(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<&'static str> {
+    view.read_with(cx, |v, _| v.fx.paint_log.borrow().clone())
+}
+
+/// `a` painted, after `b` painted.
+fn painted_after(order: &[&str], a: &str, b: &str) -> bool {
+    matches!((order.iter().position(|o| *o == a), order.iter().position(|o| *o == b)), (Some(x), Some(y)) if x > y)
+}
+
+/// polish.md P5's word swap, in a window: a count whose words change with
+/// it (`1 tool` → `2 tools`) keeps its old words until the digits cross
+/// mid-roll, then the new ones; never `1 tools`. No count left rolling in
+/// the app has a plural (worker rows change in place since Q3 r4; `+N
+/// more`, NEEDS YOU and the rail chips have none; `N calls` never changes
+/// while drawn), so a test-only count in the top bar
+/// (`AppView::roll_probe`) rolls through the same element.
+#[gpui_kit::test]
+fn a_counts_words_swap_as_its_digits_cross(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    let probe = |cx: &mut TestAppContext, n: usize| {
+        view.update(cx, |v, cx| {
+            v.roll_probe = Some(n);
+            cx.notify();
+        });
+    };
+    probe(cx, 1);
+    wait(cx, w, &view, 16);
+    wait(cx, w, &view, 16);
+    let k = crate::motion::ROLL_PROBE;
+    let words = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
+    let rolling = |cx: &mut TestAppContext| !view.read_with(cx, |v, _| v.fx.rolling_in(Some(k))).is_empty();
+    assert!(!rolling(cx) && !words(cx), "at rest");
+    probe(cx, 2);
+    wait(cx, w, &view, 16);
+    assert!(rolling(cx), "`1 tool` → `2 tools` rolls");
+    assert!(words(cx), "the first frames: `1 tool`, the digit leaving");
+    let mut crossed = false;
+    for _ in 0..40 {
+        wait(cx, w, &view, 16);
+        crossed |= rolling(cx) && !words(cx);
+        assert!(!crossed || !words(cx), "the old word never comes back");
+    }
+    assert!(crossed, "mid-roll: `2 tools`, the digit still arriving");
+    assert!(!rolling(cx) && !words(cx), "landed: one text");
+}
+
 /// polish.md P5: a count that still rolls (the top bar's NEEDS YOU, one
 /// more session waiting) rolls only its changed digit cells, on the frame
 /// after it changes: the new text and the old a line apart, in px, on
@@ -2858,6 +2906,12 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
     let (s, p) = (seg(cx).unwrap(), pass(cx).expect("settle_pass_once_per_turn_end: the pass with the light"));
     assert!(sweep(cx).is_none(), "the sweep is over");
     assert!((f32::from(p.origin.y) - f32::from(s.origin.y)).abs() <= 1., "from the same corner: {p:?} / {s:?}");
+    // Shady #17 R3-M2: the pass lies on the composer's top border, which
+    // GPUI paints after the composer's children: drawn among them, the
+    // border covered it (4c63a0c; `debug_bounds` above still found it). It
+    // paints after the root's last child, so over every border.
+    let order = painted(cx, &view);
+    assert!(painted_after(&order, "settle-pass", "end-frame"), "the pass paints over the composer's border: {order:?}");
     for _ in 0..6 {
         beat(cx, w, &view);
     }
@@ -2968,6 +3022,15 @@ fn the_beat_in_the_frame_spins_without_the_layer(cx: &mut TestAppContext) {
     assert!(f1 > f0 && k1 > k0, "the beat is the app's frame");
     assert!(view.read_with(cx, |v, _| v.fx.sites().is_empty()), "nothing on the layer");
     assert!(drawn(cx, k1), "the frame of beat {k1}: the snake moved on");
+    // The composer's sweep in the app's frame (no layer) lies on its top
+    // border too: it paints over it, after the root's last child (R3-M2).
+    view.update(cx, |v, cx| {
+        v.model.transcript.set_busy(true);
+        cx.notify();
+    });
+    beat(cx, w, &view);
+    let order = painted(cx, &view);
+    assert!(painted_after(&order, "sweep", "end-frame"), "the sweep paints over the composer's border: {order:?}");
     // Off: still, the ⠹ frame.
     set_motion(cx, &view, crate::motion::Level::Off);
     assert!(VisualTestContext::from_window(w, cx).debug_bounds(format!("spin-{:02x}", crate::glyph::STILL).leak()).is_some());

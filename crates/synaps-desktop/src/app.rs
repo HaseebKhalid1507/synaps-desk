@@ -1284,6 +1284,10 @@ pub struct AppView {
     /// this window's to drive, as a user's own session is (its turn's end
     /// hands the floor back: Handoff in and the settle pass, polish.md P3).
     pub(crate) owner_here: bool,
+    /// Tests: a count with a plural in the top bar, rolling as the rarer
+    /// counts do (the word swap's UI test: no count left rolling has one).
+    #[cfg(test)]
+    pub(crate) roll_probe: Option<usize>,
     /// The side panels folded to strips and the open HISTORY buckets
     /// (saved with the accent).
     pub panels: theme::Panels,
@@ -1976,6 +1980,8 @@ impl AppView {
             rail_fx: Default::default(),
             star_land: Default::default(),
             owner_here: false,
+            #[cfg(test)]
+            roll_probe: None,
             panels: theme::Panels::default(),
             panels_dirty: Default::default(),
             panels_writing: Default::default(),
@@ -3351,7 +3357,8 @@ impl AppView {
     }
 
     /// A daemon is connected and this attachment may drive it (the
-    /// synthetic transport never can).
+    /// synthetic transport never can), or the bench's life scene says its
+    /// local session is this window's ([`Self::owner_here`]).
     pub(crate) fn drives(&self) -> bool {
         (self.client.is_some() || self.owner_here) && self.model.can_send()
     }
@@ -5320,7 +5327,7 @@ impl AppView {
         let top_edge = if turn_runs {
             Some(crate::motion::sweep(fx, p.run_mark, p.edge))
         } else if segment < 1. && crate::motion::Level::current(cx) == crate::motion::Level::Full {
-            Some(crate::motion::pass(segment, crate::motion::mix(p.you, p.ink, HANDOFF_LIT), p.edge))
+            Some(crate::motion::pass(fx, segment, crate::motion::mix(p.you, p.ink, HANDOFF_LIT), p.edge))
         } else {
             None
         };
@@ -6397,7 +6404,13 @@ impl Render for AppView {
             // beat layer, it arms the timer after painting the beat).
             .child({
                 let (fx, me) = (self.fx.clone(), cx.entity_id());
-                canvas(|_, _, _| {}, move |_, _, window, cx| fx.end_frame(window, cx, me)).absolute().size_0()
+                canvas(|_, _, _| {}, move |_, _, window, cx| {
+                    #[cfg(test)]
+                    fx.painted("end-frame");
+                    fx.end_frame(window, cx, me)
+                })
+                .absolute()
+                .size_0()
             })
     }
 }
