@@ -188,8 +188,8 @@ impl PromptCard {
         if b.size.height <= px(0.) {
             return None;
         }
-        let over = (top - f32::from(b.top())).max(0.);
-        Some(hidden(f32::from(self.scroll.max_offset().y + self.scroll.offset().y), f32::from(b.bottom()), view) + over)
+        let rest = f32::from(self.scroll.max_offset().y + self.scroll.offset().y);
+        Some(unseen((f32::from(b.top()), f32::from(b.bottom())), rest, (top, view)))
     }
 
     /// Its buttons were laid out whole inside the list's view `top..view`
@@ -1072,6 +1072,13 @@ pub(crate) fn dash_spans(w: f32, head: f32) -> Vec<(f32, f32)> {
     dash_xs(w).into_iter().map(|x| (x, (head - x).clamp(0., DASH))).filter(|&(_, dw)| dw > 0.).collect()
 }
 
+/// What of a well `top..bottom` (window px) is unseen: its own overflow
+/// still below (`rest`), and what lies outside the list's view `top..view`,
+/// above it (Shady M3: in the log the card's top can scroll away) or under it.
+pub(crate) fn unseen((well_top, well_bottom): (f32, f32), rest: f32, (top, view): (f32, f32)) -> f32 {
+    hidden(rest, well_bottom, view) + (top - well_top).max(0.)
+}
+
 /// The card in its row: 8·r above it, 12·r below (polish.md §2.6), as
 /// padding, so the row's measure is all of it.
 fn card_slot(card: Stateful<Div>, m: &Metrics) -> Div {
@@ -1189,6 +1196,22 @@ mod tests {
             }
         }
         assert!(dash_xs(4.).is_empty());
+    }
+
+    /// Shady M3: the read gate counts the well's top edge against the list's
+    /// view, not only its bottom against the window's.
+    #[test]
+    fn a_well_scrolled_above_the_list_is_not_read() {
+        use super::unseen;
+        use crate::app::authorize_ready;
+        let view = (120., 640.);
+        assert_eq!(unseen((200., 300.), 0., view), 0., "whole in the view");
+        assert_eq!(unseen((80., 300.), 0., view), 40., "40 px above the list's top");
+        assert_eq!(unseen((500., 700.), 0., view), 60., "60 px under its bottom");
+        assert_eq!(unseen((200., 300.), 25., view), 25., "its own overflow");
+        assert!(!authorize_ready(true, Some(unseen((80., 300.), 0., view)), false), "its top unseen: not ready");
+        assert!(authorize_ready(true, Some(unseen((80., 300.), 0., view)), true), "once read whole: ready");
+        assert!(authorize_ready(true, Some(unseen((121., 300.), 0., view)), false));
     }
 
     /// The finish gate of #18: the dashes don't land all at once when the
