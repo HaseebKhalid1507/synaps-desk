@@ -6034,6 +6034,9 @@ impl Render for AppView {
                 self.model.reload = false;
                 self.model.rail_gen += 1;
             }
+            if self.link.lost {
+                self.fx.hold_still();
+            }
         }
         let drain = self.link.drain(&self.fx);
         if drain > 0. || self.link.lost {

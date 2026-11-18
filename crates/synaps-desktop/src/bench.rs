@@ -918,19 +918,22 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     json!(view.update(cx, |v, _| v.model.stats.subagents.running_count()).unwrap_or(0));
                 out["load_5x5_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
                 out["load_5x5_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
-                // Q3 (polish.md §6 gate 4's other half): the same five busy
-                // sessions spinning in the rail, the one shown at rest: no
-                // sweep on screen, only the beat.
+                // Q3 (polish.md §6 gate 4, the worst case): the same, and the
+                // shown session's turn runs: the composer sweeps (the one
+                // sweep left, P2) over the 25 spinners.
                 let _ = upd(cx, &|v, _| {
-                    v.model.set_local_session("bench-rest");
+                    let t = &mut v.model.transcript;
+                    t.apply(&SessionEvent::TurnStarted { turn_baseline: 12, trigger: "user".into(), user_text: Some("Go on.".into()) });
+                    t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                     v.sync_list();
+                    v.list.scroll_to_end();
                 });
                 sleep(2.0).await;
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
                 sleep(30.0).await;
-                out["load_5x5_nosweep_30s"] = stats(cx, t0, Instant::now(), c0, f0);
-                out["load_5x5_nosweep_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
-                out["load_5x5_nosweep_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                out["load_5x5_sweep_30s"] = stats(cx, t0, Instant::now(), c0, f0);
+                out["load_5x5_sweep_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
+                out["load_5x5_sweep_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
                 out["mem_end"] = mem::sample();
                 out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                 println!("{out}");

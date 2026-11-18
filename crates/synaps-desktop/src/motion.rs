@@ -145,9 +145,6 @@ pub(crate) const SWEEP_STEP: f32 = 12.;
 /// The comet's four opaque bands, head first: the TUI's `█ ▓ ▒ ░` as
 /// `mix(ground, mark, level)`. Never a gradient.
 pub(crate) const SWEEP_LEVELS: [f32; 4] = [1., 0.66, 0.4, 0.2];
-/// A running `bash` row sweeps once it has run this long (quick commands
-/// don't flicker).
-pub(crate) const BASH_SWEEP_AFTER: Duration = Duration::from_secs(1);
 /// The write-on waits this long, then draws over [`BASE`] (polish.md P4).
 pub(crate) const WRITE_DELAY: Duration = Duration::from_millis(40);
 /// The star hop (polish.md P6): an impulse `v` px/s on a critically damped
@@ -834,6 +831,9 @@ pub(crate) struct Motion {
     /// The palette's ink, as of the frame (afterglows).
     ink: Cell<Hsla>,
     ambient: Cell<bool>,
+    /// Ambient as the level and power have it, held still or not
+    /// ([`Self::words_beat`]).
+    lively: Cell<bool>,
     visible: Cell<bool>,
     now: Cell<Instant>,
     frame: Cell<u64>,
@@ -1001,48 +1001,149 @@ pub(crate) fn pass(p: f32, mark: Hsla, ground: Hsla) -> AnyElement {
     div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "settle-pass".into()).child(line).into_any_element()
 }
 
-/// A rolling text (polish.md P5): `make(text)` as it is at rest; while
-/// it rolls, inside one clipped line box, the new one coming in and the
-/// one it left going out, a line apart.
-/// `grow`: the line takes its row's rest (a live line), else its own width.
+/// A rolling text (polish.md P5): `make(text)` as it is at rest; while it
+/// rolls, the new text coming in and the one it left going out, a line
+/// apart, clipped to the line ([`Roll`]). A count (`grow` false) rolls only
+/// its number's changed digit cells (`12` → `13`: the `3`; `9` → `10`: the
+/// number): its words, and everything beside it, stay where they are at
+/// rest, laid out by the same element. `grow`: a live line, which rolls
+/// whole at its row's width.
 pub(crate) fn rolled(fx: &Motion, key: u64, text: SharedString, up: bool, grow: bool, make: impl Fn(SharedString) -> Div) -> AnyElement {
     let Some((old, x, up)) = fx.roll(key, &text, up) else { return make(text).into_any_element() };
-    // A line's travel: fractions of the line box (the new text's own).
-    let dir = if up { 1. } else { -1. };
-    // A count: only its changed cells roll (`12` → `13`: the `3`).
-    if let Some(cells) = changed_cells(&old, &text).filter(|_| !grow) {
-        let mut row = make(SharedString::default()).flex().flex_row().flex_none();
-        let mut run = String::new();
-        for (o, n, changed) in cells {
-            if !changed {
-                run.push(n);
-                continue;
-            }
-            if !run.is_empty() {
-                row = row.child(SharedString::from(std::mem::take(&mut run)));
-            }
-            let cell = div()
-                .relative()
-                .top(relative(dir * x))
-                .child(n.to_string())
-                .child(div().absolute().left_0().top(relative(-dir)).child(o.to_string()));
-            row = row.child(ClipY(div().flex_none().debug_selector(move || format!("rolling-{key:x}")).child(cell).into_any_element()));
-        }
-        if !run.is_empty() {
-            row = row.child(SharedString::from(run));
-        }
-        return row.into_any_element();
+    let cells = if grow { None } else { changed_cells(&old, &text) };
+    let tagged = |sel: String, t: SharedString| div().debug_selector(move || sel).child(make(t)).into_any_element();
+    let cut = |at: usize| make(SharedString::from(text[..at].to_string())).into_any_element();
+    Roll {
+        left: cells.filter(|c| c.0 > 0).map(|_| make(text.clone()).into_any_element()),
+        measure: cells.map(|(a, b)| ((a > 0).then(|| cut(a)), cut(b))),
+        rolling: tagged(format!("rolling-{key:x}"), text.clone()),
+        old: tagged(format!("rolled-{key:x}"), old),
+        new: make(text).into_any_element(),
+        dir: if up { 1. } else { -1. },
+        x,
+        grow,
     }
-    let inner = make(text).relative().top(relative(dir * x)).child(make(old).absolute().left_0().right_0().top(relative(-dir)));
-    let line = if grow { div().flex_1().min_w_0() } else { div().flex_none() };
-    ClipY(line.debug_selector(move || format!("rolling-{key:x}")).child(inner).into_any_element()).into_any_element()
+    .into_any_element()
 }
 
-/// A count's cells (`old` → `new`, one character each, the same number of
-/// them): each new one, what it was, and whether it changed. Other lengths
-/// (`9` → `10`) roll whole.
-pub(crate) fn changed_cells(old: &str, new: &str) -> Option<Vec<(char, char, bool)>> {
-    (old.chars().count() == new.chars().count()).then(|| old.chars().zip(new.chars()).map(|(o, n)| (o, n, o != n)).collect())
+/// The changed digit cells of a count going `old` → `new` (polish.md P5),
+/// as a byte range of `new`: its number's changed digits when both numbers
+/// are as long (`19 calls` → `20 calls`: `20`; `12` → `13`: `3`), its whole
+/// number when not (`9` → `10`); empty when the number is the same. `None`
+/// (the whole text rolls) when either has no number or what comes before
+/// it changed.
+pub(crate) fn changed_cells(old: &str, new: &str) -> Option<(usize, usize)> {
+    let number = |s: &str| {
+        let a = s.find(|c: char| c.is_ascii_digit())?;
+        Some((a, s[a..].find(|c: char| !c.is_ascii_digit()).map_or(s.len(), |n| a + n)))
+    };
+    let ((oa, ob), (na, nb)) = (number(old)?, number(new)?);
+    if old[..oa] != new[..na] {
+        return None;
+    }
+    let (o, n) = (&old.as_bytes()[oa..ob], &new.as_bytes()[na..nb]);
+    if o.len() != n.len() {
+        return Some((na, nb));
+    }
+    let Some(first) = o.iter().zip(n).position(|(a, b)| a != b) else { return Some((na, na)) };
+    let last = o.iter().zip(n).rposition(|(a, b)| a != b).unwrap_or(first);
+    Some((na + first, na + last + 1))
+}
+
+/// [`rolled`]'s element. `new` is in the flow, laid out as at rest (so
+/// nothing beside it moves while it rolls); the rest are copies drawn over
+/// its box: `rolling` (the new text, `x` of a line from its place) and `old`
+/// (the one it left, a line on), clipped to its top and bottom; for a
+/// count, to its changed cells, `new` itself and `left` drawing the rest
+/// in place. `measure`: the texts before and through the cells (laid out
+/// only, for their x). Offsets in px, from the box's own height.
+struct Roll {
+    new: AnyElement,
+    left: Option<AnyElement>,
+    rolling: AnyElement,
+    old: AnyElement,
+    measure: Option<(Option<AnyElement>, AnyElement)>,
+    dir: f32,
+    x: f32,
+    grow: bool,
+}
+
+impl IntoElement for Roll {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for Roll {
+    type RequestLayoutState = ();
+    /// The cells' x span (none: the whole line rolls).
+    type PrepaintState = Option<(Pixels, Pixels)>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
+        (self.new.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<(Pixels, Pixels)> {
+        let fit = size(AvailableSpace::MinContent, AvailableSpace::MinContent);
+        let wide = size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::MinContent);
+        let cut = self.measure.as_mut().map(|(a, b)| {
+            let x0 = a.as_mut().map_or(px(0.), |a| a.layout_as_root(fit, window, cx).width);
+            let x1 = b.layout_as_root(fit, window, cx).width.max(x0);
+            (bounds.left() + x0, bounds.left() + x1)
+        });
+        self.new.prepaint(window, cx);
+        if let Some(left) = self.left.as_mut() {
+            left.prepaint_as_root(bounds.origin, wide, window, cx);
+        }
+        let h = bounds.size.height;
+        self.rolling.prepaint_as_root(bounds.origin + point(px(0.), h * (self.dir * self.x)), wide, window, cx);
+        let old_fit = if self.grow { wide } else { fit };
+        self.old.prepaint_as_root(bounds.origin + point(px(0.), h * (self.dir * (self.x - 1.))), old_fit, window, cx);
+        cut
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        cut: &mut Option<(Pixels, Pixels)>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let far = px(1.0e6);
+        let band = |l: Pixels, r: Pixels| ContentMask { bounds: Bounds::from_corners(point(l, bounds.top()), point(r, bounds.bottom())) };
+        let (x0, x1) = cut.unwrap_or((bounds.left() - far, bounds.right() + far));
+        if cut.is_some() {
+            window.with_content_mask(Some(band(x1, bounds.right() + far)), |window| self.new.paint(window, cx));
+            if let Some(left) = self.left.as_mut() {
+                window.with_content_mask(Some(band(bounds.left() - far, x0)), |window| left.paint(window, cx));
+            }
+        }
+        window.with_content_mask(Some(band(x0, x1)), |window| {
+            self.rolling.paint(window, cx);
+            self.old.paint(window, cx);
+        });
+    }
 }
 
 /// [`rolled`] for a count: up when it grew.
@@ -1088,6 +1189,7 @@ impl Motion {
             level: Cell::new(Level::Full),
             ink: Cell::new(Hsla::default()),
             ambient: Cell::new(true),
+            lively: Cell::new(true),
             visible: Cell::new(true),
             now: Cell::new(epoch),
             frame: Cell::new(0),
@@ -1380,6 +1482,7 @@ impl Motion {
     pub(crate) fn begin_frame(&self, level: Level, low_power: bool, now: Instant) {
         self.level.set(level);
         self.ambient.set(level == Level::Full && !low_power);
+        self.lively.set(self.ambient.get());
         self.now.set(now);
         let frame = self.frame.get() + 1;
         self.frame.set(frame);
@@ -1500,6 +1603,20 @@ impl Motion {
         if !self.ambient.get() {
             return None;
         }
+        self.beat_on(every)
+    }
+
+    /// The connection words' dots' beat (motion.md §6.7: text, not a
+    /// spinner): [`Self::beat`], and on while the link is lost
+    /// ([`Self::hold_still`]): the one thing that steps then.
+    pub(crate) fn words_beat(&self, every: u32) -> Option<u32> {
+        if !self.lively.get() {
+            return None;
+        }
+        self.beat_on(every)
+    }
+
+    fn beat_on(&self, every: u32) -> Option<u32> {
         let since = self.now().saturating_duration_since(self.epoch);
         let beat = (since.as_nanos() / BEAT.as_nanos()) as u32;
         let next = (beat / every.max(1) + 1) * every.max(1);
@@ -1531,6 +1648,18 @@ impl Motion {
     /// where frames matter most (Shady N5).
     pub(crate) fn tick_clock(&self, at: Instant) {
         self.want_at(self.on_grid(at, BEAT * 8));
+    }
+
+    /// The second this frame belongs to (Shady #17 M2): the last instant of
+    /// the window's 1 s grid at or before the frame's. Clocks read their
+    /// whole seconds here, not at the frame's own instant, which is late by
+    /// up to a refresh: read late, a clock whose next second fell inside
+    /// that lateness showed it already, asked for the one after (rounded
+    /// up a whole second), and the second between was never drawn.
+    pub(crate) fn clock_now(&self) -> Instant {
+        let grid = (BEAT * 8).as_nanos();
+        let n = self.now().saturating_duration_since(self.epoch).as_nanos() / grid;
+        self.epoch + Duration::from_nanos((grid * n) as u64)
     }
 
     /// The first instant of the window's `grid` at or after `at`.
@@ -1589,6 +1718,14 @@ impl Motion {
         Some((self.now().saturating_duration_since(self.epoch).as_nanos() / DECAY_TICK.as_nanos()) as u64)
     }
 
+    /// The link is lost (motion.md §5.3, Shady #17 M1): the window is
+    /// visibly stale and nothing in it is live. No ambient from here to the
+    /// frame's end: the spinners draw still, the sweep is unlit; the
+    /// connection words' dots are all that steps.
+    pub(crate) fn hold_still(&self) {
+        self.ambient.set(false);
+    }
+
     /// Ambient runs this frame (Full, not low power): spinners spin, sweeps sweep.
     pub(crate) fn ambient(&self) -> bool {
         self.ambient.get()
@@ -1619,6 +1756,20 @@ impl Motion {
         }
         self.want_frame();
         Some(x)
+    }
+
+    /// How many beats (of `every`) from the window's epoch `at` is, if it
+    /// is on that grid (tests: what a timer is armed for).
+    #[cfg(test)]
+    pub(crate) fn on_beats(&self, at: Instant, every: u32) -> bool {
+        at.saturating_duration_since(self.epoch).as_nanos() % (BEAT * every).as_nanos() == 0
+    }
+
+    /// The rolls under way in the key space `space` (all: `None`) (tests).
+    #[cfg(test)]
+    pub(crate) fn rolling_in(&self, space: Option<u64>) -> Vec<u64> {
+        let rolls = self.rolls.borrow();
+        rolls.iter().filter(|(k, r)| space.is_none_or(|s| *k & (0xFFFF << 48) == s) && r.since.is_some()).map(|(k, _)| *k).collect()
     }
 
     /// The count `key` showed last ([`roll_count`]).
@@ -2672,12 +2823,16 @@ mod tests {
     /// changes length rolls whole.
     #[test]
     fn roll_changed_digits_only() {
-        let changed = |a: &str, b: &str| super::changed_cells(a, b).map(|c| c.iter().filter(|x| x.2).count());
-        assert_eq!(changed("12", "13"), Some(1));
-        assert_eq!(changed("+3 more", "+4 more"), Some(1));
-        assert_eq!(changed("19 calls", "20 calls"), Some(2));
-        assert_eq!(changed("9", "10"), None, "whole");
-        assert_eq!(super::changed_cells("7", "7").unwrap(), vec![('7', '7', false)]);
+        use super::changed_cells as cells;
+        assert_eq!(cells("12", "13"), Some((1, 2)), "the 3");
+        assert_eq!(cells("+3 more", "+4 more"), Some((1, 2)), "the 4, not `more`");
+        assert_eq!(cells("19 calls", "20 calls"), Some((0, 2)));
+        assert_eq!(cells("109", "200"), Some((0, 3)));
+        assert_eq!(cells("9", "10"), Some((0, 2)), "a longer number rolls whole, not its words");
+        assert_eq!(cells("1 tool", "2 tools"), Some((0, 1)), "the 2; the plural swaps in place");
+        assert_eq!(cells("9   NEED YOU", "10   NEED YOU"), Some((0, 2)));
+        assert_eq!(cells("7", "7"), Some((0, 0)), "nothing rolls");
+        assert_eq!(cells("reading a.rs", "grep b"), None, "no number: the whole line");
     }
 
     /// P4: a write-on waits 40 ms, then draws over `base`.
