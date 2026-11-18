@@ -5863,7 +5863,9 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
             r.name = t.name.clone().into();
             r.hue = turns::Hue::of(&t.name);
             if files::is_file_tool(&t.name) {
-                r.preview = ledger.preview(&t.tool_id);
+                // An edit with nothing to show (a refused one, no diff) has
+                // no preview: its result is its body.
+                r.preview = ledger.preview(&t.tool_id).filter(|p| !p.lines.is_empty());
                 r.delta = ledger.delta(&t.tool_id);
                 r.counts = turns::Counts::of(r.delta.unwrap_or_default());
             }

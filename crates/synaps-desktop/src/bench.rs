@@ -613,6 +613,92 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         v.sync_list();
                         v.list.scroll_to_end();
                     });
+                    // `SYNAPS_BENCH_STATES=1` (H2 evidence, indicators/proposal.md
+                    // §6): instead, one run with a call in each of the
+                    // indicator's states (waiting, queued, running, streaming,
+                    // done, failed, at its limit, denied, cancelled), held 5 s,
+                    // then the live ones change (the quarter-turn), and the turn ends.
+                    if std::env::var("SYNAPS_BENCH_STATES").is_ok() {
+                        let delta = |id: &str, text: &str| {
+                            json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result_delta", "tool_id": id, "delta": text}})
+                        };
+                        let queued = |id: &str| json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_queued", "tool_id": id}});
+                        let started = |id: &str| json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_started", "tool_id": id}});
+                        let cmd = |c: &str| json!({"command": c});
+                        apply(
+                            cx,
+                            vec![
+                                call("w0", "bash", cmd("rm -rf target/tmp")),
+                                call("q1", "bash", cmd("cargo build -p relay")),
+                                queued("q1"),
+                                call("r2", "bash", cmd("cargo test -p relay --test refresh_race")),
+                                call("s3", "bash", cmd("cargo test -p session")),
+                                delta("s3", "running 6 tests\n"),
+                                call("d4", "read", json!({"path": "crates/relay/src/session.rs"})),
+                                result("d4", "1  use std::sync::Arc;\n2  use tokio::sync::Mutex;"),
+                                call("f5", "bash", cmd("cargo clippy -p relay")),
+                                result("f5", "Tool execution failed: Command failed (exit 101):\nerror: unused variable `token`"),
+                                call("l6", "bash", cmd("cat logs/relay.log")),
+                                result("l6", "relay up\nrelay up\n[output truncated at 30000 bytes]"),
+                                call("x7", "edit", json!({"path": "crates/relay/src/upstream.rs"})),
+                                result("x7", "Tool call denied: guard"),
+                                call("c8", "bash", cmd("cargo bench -p relay")),
+                                result("c8", "Canceled by user"),
+                                call("k9", "bash", cmd("cargo run -p relay -- --watch")),
+                            ],
+                        );
+                        let _ = upd(cx, &|v, _| {
+                            if let Ok(request) = serde_json::from_value(json!({
+                                "id": 7, "kind": "confirm", "title": "Run a command?", "prompt": "Tool: bash\nInput that will run:\n$ rm -rf target/tmp"
+                            })) {
+                                v.model.transcript.apply(&SessionEvent::Prompt { request });
+                            }
+                            v.sync_list();
+                            v.list.scroll_to_end();
+                        });
+                        for k in 0..10 {
+                            sleep(0.5).await;
+                            apply(cx, vec![delta("s3", &format!("test refresh_{k} ... ok\n"))]);
+                        }
+                        // The live ones change: queued starts, running ends,
+                        // one is cancelled, streaming fails, the prompt is answered.
+                        apply(
+                            cx,
+                            vec![started("q1"), result("r2", "running 4 tests\ntest result: ok. 4 passed; 0 failed"), result("k9", "Canceled by user")],
+                        );
+                        let _ = upd(cx, &|v, _| {
+                            v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
+                            v.sync_list();
+                        });
+                        sleep(1.5).await;
+                        apply(cx, vec![result("s3", "Tool execution failed: Command failed (exit 1):\ntest refresh_10 ... FAILED")]);
+                        sleep(1.5).await;
+                        apply(cx, vec![result("q1", "Finished `dev` profile"), result("w0", "")]);
+                        sleep(2.5).await;
+                        // The turn ends: the run folds. Then 9.5 s for a
+                        // capture's clicks (the run unfolds, a call opens).
+                        let _ = upd(cx, &|v, _| {
+                            v.model.transcript.apply(&SessionEvent::Idle);
+                            v.sync_list();
+                        });
+                        sleep(9.5).await;
+                        // A new turn, detached with its call still running:
+                        // as last seen.
+                        let _ = upd(cx, &|v, _| {
+                            let t = &mut v.model.transcript;
+                            t.apply(&SessionEvent::TurnStarted { turn_baseline: 14, trigger: "user".into(), user_text: Some("Tail the log.".into()) });
+                            t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                            v.sync_list();
+                            v.list.scroll_to_end();
+                        });
+                        apply(cx, vec![call("z9", "bash", cmd("tail -f logs/relay.log"))]);
+                        sleep(1.5).await;
+                        let _ = upd(cx, &|v, _| v.model.active = None);
+                        sleep(2.5).await;
+                        println!("{out}");
+                        let _ = cx.update(|_, cx| cx.quit());
+                        return;
+                    }
                     apply(cx, vec![call("b1", "bash", json!({"command": "cargo test -p relay --test refresh_race"}))]);
                     sleep(2.5).await;
                     // Each worker's clock is its time since it spawned, as a
