@@ -1,0 +1,28 @@
+t0 1795004851.962455397
+0.00119352 still live-open
+0.118073 event low, synaps send
+7.12478 still live-low
+7.21511 event medium, channel
+16.2222 still live-medium-channel
+16.3082 event comms ask, expects_response
+ac3e93b8-c678-407f-a181-95540597ee5a
+26.3287 still live-ask
+26.4132 event high
+35.4195 still live-high
+35.5181 event critical, long
+45.5242 still live-critical
+45.6162 event mid-turn: prompt a bash sleep
+45.618 mousemove 960 985 click 1
+46.1248 type --delay 30 Use the bash tool to run exactly: sleep 12; echo slept. Then reply with one word: done.
+49.0147 key Return
+55.0349 still live-midturn-running
+55.1306 event medium during the tool
+58.1364 still live-midturn-event
+78.2326 still live-midturn-after
+78.3646 event to ev-side (not on screen)
+104.375 still live-side-mark
+104.466 mousemove 960 400
+104.474 click 4 click 4 click 4 click 4 click 4 click 4
+106.082 still live-scrolled
+106.174 event low while scrolled up
+115.18 still live-scrolled-after

@@ -1,0 +1,41 @@
+   0.000 frame welcome
+   0.000 frame attached
+   0.000 seq 52 client_joined
+== idle: synaps send (high, channel alerts) wakes a turn
+   1.990 seq 53 external id=755ce4e5-1a11-4b20-acbf-580e9c839033 source=cli severity=High expects_response=False
+   1.990 seq 54 conversation messages_len=3
+   1.990 seq 55 turn_started trigger=event_auto user_text=none
+   1.995 seq 57 conversation messages_len=3
+   2.850 seq 58 stream/llm/response_start
+   3.557   (30 deltas)
+   3.557 seq 89 stream/session/usage
+   3.558 seq 91 conversation messages_len=4
+   3.558 seq 92 stream/session/done
+   3.559 seq 93 conversation messages_len=4
+   3.562 seq 94 idle
+== mid-turn: a turn running bash sleep, then synaps send (medium)
+  24.026 seq 95 input_owner_changed
+  24.026 seq 97 client_joined
+  28.002 seq 98 turn_started trigger=user user_text=set
+  28.005 seq 100 conversation messages_len=5
+  28.577 seq 101 stream/llm/response_start
+  29.004   (13 deltas)
+  29.004 seq 115 stream/llm/tool_use_start bash toolu_01DyhEwJfQdbZEYD9jx7a3iC
+  29.170   (6 deltas)
+  29.170 seq 122 stream/llm/tool_use bash toolu_01DyhEwJfQdbZEYD9jx7a3iC
+  29.170 seq 123 stream/session/usage
+  37.006 seq 124 external id=e90b4e49-3274-4bac-800e-34cf17b9ec58 source=cli severity=Medium expects_response=False
+  37.007 seq 125 conversation messages_len=5
+  41.211   (1 deltas)
+  41.211 seq 127 stream/llm/tool_result  toolu_01DyhEwJfQdbZEYD9jx7a3iC
+  41.211 seq 128 stream/agent/steering_delivered event-payload id=e90b4e49-3274-4bac-800e-34cf17b9ec58
+  41.211 seq 130 conversation messages_len=8
+  41.678 seq 131 stream/llm/response_start
+  42.200   (22 deltas)
+  42.200 seq 154 stream/session/usage
+  42.202 seq 156 conversation messages_len=9
+  42.202 seq 157 stream/session/done
+  42.202 seq 158 conversation messages_len=9
+  42.204 seq 159 idle
+  67.016 seq 160 client_left
+  67.016 seq 161 input_owner_changed

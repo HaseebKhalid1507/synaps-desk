@@ -45,10 +45,11 @@ pub(crate) struct Stuck {
     pub y: f32,
 }
 
-/// Where a message starts: a labelled row, or a day line (a day line
-/// between turns ends the message above it).
+/// Where a message starts: a labelled row, a day line (a day line
+/// between turns ends the message above it), or an engine event (a message
+/// of its own, with no label to pin: never the agent's above it).
 fn starts(d: &Disp) -> bool {
-    d.who != Who::None || d.kind == Kind::Day
+    d.who != Who::None || matches!(d.kind, Kind::Day | Kind::Event)
 }
 
 /// The labels to pin over `disp`, the list's top row being `top`. `at(i)`:
@@ -261,5 +262,16 @@ mod tests {
         let notes = vec![row(Kind::Note, Who::None), row(Kind::Note, Who::None)];
         assert_eq!(one(place(&notes, 1, |_| None, 12., |_| 46.)), None);
         assert_eq!(one(place(&[], 0, |_| None, 12., |_| 46.)), None);
+    }
+
+    /// An engine event ends the agent's message above: it pushes AGENT's
+    /// label like the next label, and on top, nothing is pinned over it.
+    #[test]
+    fn an_event_ends_the_message_above() {
+        let mut d = turns();
+        d.insert(6, row(Kind::Event, Who::None));
+        assert_eq!(one(place(&d, 5, |i| (i == 6).then_some(40.), 12., |_| 46.)), Some(Stuck { row: 1, y: -6. }));
+        assert_eq!(one(place(&d, 6, |_| Some(-10.), 12., |_| 46.)), None);
+        assert_eq!(one(place(&d, 6, |i| (i == 6).then_some(-30.), 12., |_| 46.)), None);
     }
 }
