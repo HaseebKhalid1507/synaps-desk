@@ -1000,7 +1000,10 @@ pub(crate) fn sweep(fx: &Rc<Motion>, mark: Hsla, ground: Hsla) -> AnyElement {
         },
     )
     .size_full();
-    div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "sweep".into()).child(line).into_any_element()
+    let el = div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "sweep".into()).child(line);
+    // Drawn in the app's frame (no layer), it lies on its parent's border,
+    // which GPUI paints after the children: deferred, it paints over it.
+    if tick.is_some() { deferred(el).into_any_element() } else { el.into_any_element() }
 }
 
 /// The settle pass (polish.md P3): the composer sweep's one last pass, its
@@ -1017,7 +1020,10 @@ pub(crate) fn pass(p: f32, mark: Hsla, ground: Hsla) -> AnyElement {
         },
     )
     .size_full();
-    div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "settle-pass".into()).child(line).into_any_element()
+    // On the composer's top border, which GPUI paints after its children:
+    // deferred, the pass paints over it (the comet is the beat layer's,
+    // painted over the frame), clipped as in place.
+    deferred(div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "settle-pass".into()).child(line)).into_any_element()
 }
 
 /// A rolling text (polish.md P5): `make(text)` as it is at rest; while it
