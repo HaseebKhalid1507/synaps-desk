@@ -3709,7 +3709,8 @@ impl AppView {
         if !self.synced_busy {
             let now = self.fx.now();
             let (from, at) = *s.gone.get_or_insert((s.last, now));
-            s.last = from * crate::motion::Spring::from_rest(1., crate::motion::SHEET_RESPONSE, now.saturating_duration_since(at).as_secs_f32());
+            s.last =
+                from * crate::motion::Spring::from_rest(1., crate::motion::SHEET_RESPONSE, now.saturating_duration_since(at).as_secs_f32());
             self.fx.want_frame();
         }
         if s.last < 0.5 {
