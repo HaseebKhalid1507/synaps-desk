@@ -6602,7 +6602,8 @@ impl Render for AppView {
                 let el = this.arrive(ix, row);
                 // The room an answered card gave up, under the last row.
                 match Some(slack).filter(|s| *s > 0. && ix + 1 == this.disp.len()) {
-                    Some(s) => div().w_full().child(el).child(div().h(px(s)).debug_selector(|| "fold-slack".into())).into_any_element(),
+                    // Whole pixels: the slack is a row's height too.
+                    Some(s) => div().w_full().child(el).child(div().h(px(s.round())).debug_selector(|| "fold-slack".into())).into_any_element(),
                     None => el,
                 }
             }),
