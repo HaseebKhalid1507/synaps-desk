@@ -1,0 +1,25 @@
+t0 1794987437.120022908
+0.000990868 still drive-open
+0.052494 mousemove 640 625 click 1
+0.65905 type --delay 60 /budget
+1.39618 key Return
+3.91858 still budget
+3.97192 type --delay 60 /context
+4.76285 key Return
+7.28377 still context
+7.33352 type --delay 60 /workers
+8.12943 key Return
+10.1507 still workers
+10.2068 type --delay 60 /trace
+10.879 key Return
+12.8975 still trace
+12.9448 type --delay 60 /confirms
+13.8013 key Return
+15.8218 still confirms
+15.8723 key ctrl+k
+16.5012 type --delay 80 compact
+17.6783 still compact-palette
+17.7328 key Return
+18.0009 still compact-sent
+19.5525 still compact-asked
+37.602 still compact-after
