@@ -30,9 +30,9 @@ Per-frame pixel diffs (`diffs.py` boxes of what changed) back every line below.
 | 626–643 (`full-check-f626-643-x5.png`) | **Write-on (P4):** `bash` ends ok. The spinner's frame fades while the check draws over it. Every frame in the 24×22 gutter box has ink: at least 41 lit pixels (55 before, 58 after). |
 | 766–779 (`full-cross-f762-779-x5.png`) | The failed `read`: the cross writes on over its spinner, at least 15 lit pixels in every frame (36 at rest). |
 | 856–868 (`full-worker-done-f855-868-x5.png`) | The scout's row completes: the same, at least 33 lit pixels (50 at rest). |
-| 1066–1078 (`full-more-roll-f1064-1079-x3.png`) | `+7 more` → `+8 more`: only the digit cell (x 1222–1230) changes. |
+| 1066–1078 (`full-more-roll-f1064-1079-x3.png`) | `+6 more` → `+7 more` (**r3 fix:** not `+7 → +8`; the prompt rolls it back to `+6` at 1158–1170): only the digit cell (x 1222–1230) changes. |
 | 1156–1168 (`full-needs-roll-f1155-1169-x2.png`, `full-rail-chips-roll-f1155-1169-x2.png`) | The prompt: the top bar's NEEDS YOU digit rolls 0 → 1 (x 809–815; the word re-colours, it does not roll). The rail's NEEDS YOU and RUNNING chips roll their digits. Diffed against the frames before and after, the only pixels that change are inside the two digit cells (x 102–111 and 190–199), so the chips beside them stay still. |
-| 1276–1305 (`full-star-f1284-1305-x5.png`) | **Star (P6):** the favourited row slides into FAVOURITES. Its title reaches rest (y 241) at 1292. Then the star rises 3 px (238 at 1294–1296), the four sparks show (1296–1302), and it settles at 241 by 1303. No hop or spark appears during the slide. |
+| 1276–1305 (`full-star-f1284-1305-x5.png`) | **Star (P6):** the favourited row slides into FAVOURITES. Its title reaches rest (y 241) at 1292. Then the star rises **4 px** (**r3 fix:** not 3; its top 242 → 238 at 1294–1296, by the box of its lit pixels), the four sparks show (1296–1310), and it is back at rest by 1306. No hop or spark appears during the slide. |
 
 **Reduced and Off** (`life-reduced-1920.mp4`, `life-off-1920.mp4`): no sweep, no roll, and no write-on: a glyph or
 a count changes between two frames. In Reduced the clocks tick once a second; in Off they hold.

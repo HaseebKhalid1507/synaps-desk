@@ -288,7 +288,7 @@ fn epoch_ms(at: Instant) -> f64 {
 /// The bench script. Runs on the UI thread between frames.
 pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx: &mut App) {
     // Hard stop: never leave a window up if anything hangs.
-    let limit = if opts.motion { 200 } else { 30 };
+    let limit = if opts.motion { 330 } else { 30 };
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(limit));
         eprintln!("bench: watchdog fired at {limit} s");
