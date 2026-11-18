@@ -13,13 +13,24 @@
 //!
 //! An engine event ([`crate::events`]: `synaps send`, agent-comms, a
 //! watcher) is one [`ItemKind::Event`] row, never a user row, whichever way
-//! it came: the live `External` frame, the steer that carried it into a
-//! running turn, or its `<event …>` message in the history. One event id is
-//! one row: a live row is a note until its history message lands, then it
-//! is that message's row (same id, its live time and sender kept). The
-//! engine's notes about the session's own workers
+//! it came: the live `External` frame, the `steering_delivered` that
+//! carried it into a running turn, or its `<event …>` message in the
+//! history. One event is one row: a live row is a note until its history
+//! message lands, then it is that message's row (same id, its live time and
+//! sender kept). The engine's notes about the session's own workers
 //! ([`crate::events::is_worker_note`]) stay notices from the history, as
 //! before, and add no live row.
+//!
+//! The frame comes when the engine drains the event; the history has it
+//! where the engine delivered it, which can be later: between two rounds
+//! (a steer), at the turn's end (one buffered, or steered and not taken).
+//! Until then its live row is held last, every row that streams meanwhile
+//! going above it, so it never splits a response and never jumps when its
+//! message lands. Delivered (`steering_delivered` with its form, a turn's
+//! start, end or abort, or its message in the history), it stays where it
+//! is, where the history has it. A stream retry (`response_reset`) keeps
+//! it. A `never_persist` event never reaches the history: its row is placed
+//! as any live row, and stays a note.
 //!
 //! Change tracking is splice-shaped for a virtual list: after a batch of
 //! updates, [`Transcript::take_splice`] reports the first changed index and
@@ -243,6 +254,10 @@ pub struct Item {
     /// An [`ItemKind::Event`] row's event, as shown
     /// ([`ExternalEvent::shown`]; from the history: what its form keeps).
     pub event: Option<Arc<ExternalEvent>>,
+    /// An event row's history form, read ([`ExternalEvent::history`]): what
+    /// tells its message, a replay of its frame, or another event with the
+    /// same id.
+    form: Option<Arc<ExternalEvent>>,
     /// `Some(n)`: a client-side row (notice, error), not part of the
     /// history, shown after the first `n` history messages.
     anchor: Option<usize>,
@@ -333,6 +348,9 @@ pub struct Transcript {
     /// Live event rows whose history message is in the fold under way: the
     /// message takes its row ([`Transcript::fold_event`]).
     held: Vec<Item>,
+    /// Live event rows the engine has not delivered yet (row ids): always
+    /// the last rows, live rows going in above them ([`Transcript::live_end`]).
+    pending: Vec<u64>,
 }
 
 impl Transcript {
@@ -410,6 +428,11 @@ impl Transcript {
     }
 
     fn push(&mut self, kind: ItemKind, text: String, tool: Option<ToolCall>, streaming: bool, reuse: &mut Reuse) -> usize {
+        self.push_at(self.items.len(), kind, text, tool, streaming, reuse)
+    }
+
+    /// A row at `ix` (rows after it move down one).
+    fn push_at(&mut self, ix: usize, kind: ItemKind, text: String, tool: Option<ToolCall>, streaming: bool, reuse: &mut Reuse) -> usize {
         // Reuse the next row of this kind within a short lookahead, dropping
         // the rows skipped over (each entry is consumed at most once).
         let found = reuse.iter().take(REUSE_LOOKAHEAD).position(|&(k, ..)| k == kind);
@@ -423,20 +446,50 @@ impl Transcript {
                 (self.next_id, 0)
             }
         };
-        let ix = self.items.len();
+        if ix < self.items.len() {
+            for t in self.tools.values_mut().filter(|t| **t >= ix) {
+                *t += 1;
+            }
+        }
         if let Some(t) = &tool {
             self.tools.insert(t.tool_id.clone(), ix);
         }
         if self.stamp.is_none() && !self.event_ts.is_empty() {
             self.stamp = Some(Arc::from(self.event_ts.as_str()));
         }
-        self.items.push(Item { id, rev, kind, text, tool, streaming, at: self.stamp.clone(), event: None, anchor: None });
+        self.items.insert(ix, Item { id, rev, kind, text, tool, streaming, at: self.stamp.clone(), event: None, form: None, anchor: None });
         self.mark(ix);
         ix
     }
 
+    /// A live row: above the events not delivered yet.
     fn push_new(&mut self, kind: ItemKind, text: String, tool: Option<ToolCall>, streaming: bool) -> usize {
-        self.push(kind, text, tool, streaming, &mut Reuse::new())
+        self.push_at(self.live_end(), kind, text, tool, streaming, &mut Reuse::new())
+    }
+
+    /// Where live rows end: the first of the last rows that are events not
+    /// delivered yet ([`Transcript::pending`]), else the end.
+    fn live_end(&self) -> usize {
+        let mut end = self.items.len();
+        while end > self.history_end && self.pending.contains(&self.items[end - 1].id) {
+            end -= 1;
+        }
+        end
+    }
+
+    /// Every event not delivered yet is (a turn started, ended or was
+    /// aborted: the engine has put them in the conversation): their rows
+    /// stay where they are, and live rows go after them. A `never_persist`
+    /// one right after the history is part of it now, kept there as a note
+    /// is (no message will ever take it).
+    fn deliver_all(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        while let Some(it) = self.items.get(self.history_end).filter(|i| pending.contains(&i.id)) {
+            if it.event.as_ref().is_none_or(|e| e.content.disclosure.as_deref() != Some("never_persist")) {
+                break;
+            }
+            self.history_end += 1;
+        }
     }
 
     /// Re-insert a kept note (same id; rev bumped as its index may differ).
@@ -491,6 +544,19 @@ impl Transcript {
         let before: HashMap<u64, Item> = std::mem::take(&mut self.before).into_iter().map(|i| (i.id, i)).collect();
         for it in self.items.iter_mut().filter(|i| i.anchor.is_none()) {
             let Some(o) = before.get(&it.id) else { continue };
+            // An event row refolded from its form keeps what only its frame
+            // had (sender, ASK, time; a `local_only` text): the same event.
+            if carry
+                && o.kind == ItemKind::Event
+                && it.kind == ItemKind::Event
+                && o.event.as_ref().is_some_and(|e| e.timestamp.is_some())
+                && it.event.as_ref().is_some_and(|e| e.timestamp.is_none())
+                && o.form.is_some()
+                && o.form == it.form
+            {
+                it.event.clone_from(&o.event);
+                it.text.clone_from(&o.text);
+            }
             let same = match (&o.tool, &it.tool) {
                 (Some(a), Some(b)) => a.tool_id == b.tool_id,
                 (None, None) => o.text == it.text,
@@ -523,11 +589,13 @@ impl Transcript {
         let (notes, mut reuse) = if same { self.take_rows(0) } else { (Vec::new(), Reuse::new()) };
         let (next_id, clean_len, before) = (self.next_id, self.clean_len, std::mem::take(&mut self.before));
         let no_subagent_notices = self.no_subagent_notices;
+        let pending = if same { std::mem::take(&mut self.pending) } else { Vec::new() };
         *self = Transcript {
             next_id,
             clean_len,
             before,
             no_subagent_notices,
+            pending,
             session_id: Some(a.meta.id.clone()),
             journal_id: journal,
             ..Transcript::default()
@@ -582,16 +650,18 @@ impl Transcript {
     /// kind); notes among them stay, after the new rows.
     fn append_history(&mut self, messages: &[Value]) {
         let (notes, mut reuse) = self.take_rows(self.history_end);
-        let mut notes = self.hold_events(notes, messages);
+        let notes = self.hold_events(notes, messages);
         for m in messages {
             self.fold_message(m, &mut reuse);
         }
         self.history_len += messages.len();
+        let (pending, mut notes): (Vec<Item>, Vec<Item>) = notes.into_iter().partition(|n| self.pending.contains(&n.id));
         notes.append(&mut self.held);
         for n in notes {
             self.push_note(n, self.history_len);
         }
         self.history_end = self.items.len();
+        self.push_pending(pending);
         self.response_start = None;
         if !self.busy {
             self.settle();
@@ -626,8 +696,10 @@ impl Transcript {
     }
 
     /// Fold a whole history from empty, interleaving `notes` by anchor.
+    /// Events not delivered yet go last, whatever their anchors.
     fn fold_with_notes(&mut self, messages: &[Value], notes: Vec<Item>, reuse: &mut Reuse) {
-        let mut notes = self.hold_events(notes, messages);
+        let notes = self.hold_events(notes, messages);
+        let (pending, mut notes): (Vec<Item>, Vec<Item>) = notes.into_iter().partition(|n| self.pending.contains(&n.id));
         notes.sort_by_key(|n| n.anchor);
         let mut notes = notes.into_iter().peekable();
         for (i, m) in messages.iter().enumerate() {
@@ -641,23 +713,41 @@ impl Transcript {
         }
         self.history_len = messages.len();
         self.history_end = self.items.len();
+        self.push_pending(pending);
+    }
+
+    /// The rows of events not delivered yet, back after a fold: last, and
+    /// after the history's end, so the next fold takes them again (for their
+    /// message, or to put them last again).
+    fn push_pending(&mut self, pending: Vec<Item>) {
+        for n in pending {
+            self.push_note(n, self.history_len);
+        }
     }
 
     /// The live event rows among `notes` whose message is in `messages`,
-    /// held for it ([`Transcript::held`]); the other notes back.
+    /// held for it ([`Transcript::held`]; delivered); the other notes back.
     fn hold_events(&mut self, notes: Vec<Item>, messages: &[Value]) -> Vec<Item> {
         if !notes.iter().any(|n| n.kind == ItemKind::Event) {
             return notes;
         }
-        let ids: std::collections::HashSet<String> = messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
-            .filter(|s| ExternalEvent::is_payload(s))
-            .filter_map(ExternalEvent::from_payload)
-            .map(|e| e.id)
-            .collect();
-        let (held, rest) = notes.into_iter().partition(|n| n.event.as_ref().is_some_and(|e| ids.contains(&e.id)));
-        self.held = held;
+        let mut forms: Vec<ExternalEvent> =
+            messages.iter().flat_map(event_forms).filter_map(ExternalEvent::from_payload).filter(|e| !e.is_worker_note()).collect();
+        let mut rest = Vec::new();
+        for n in notes {
+            let k = forms
+                .iter()
+                .position(|f| n.form.as_deref() == Some(f))
+                .or_else(|| forms.iter().position(|f| n.event.as_ref().is_some_and(|e| e.id == f.id)));
+            match k.filter(|_| n.kind == ItemKind::Event) {
+                Some(k) => {
+                    forms.remove(k);
+                    self.pending.retain(|&p| p != n.id);
+                    self.held.push(n);
+                }
+                None => rest.push(n),
+            }
+        }
         rest
     }
 
@@ -671,39 +761,104 @@ impl Transcript {
             self.push(ItemKind::Notice, s.to_string(), None, false, reuse);
             return;
         };
-        if let Some(k) = self.held.iter().position(|h| h.event.as_ref().is_some_and(|e| e.id == ev.id)) {
-            let mut it = self.held.swap_remove(k);
+        let ev = Arc::new(ev);
+        let k = self
+            .held
+            .iter()
+            .position(|h| h.form.as_ref() == Some(&ev))
+            .or_else(|| self.held.iter().position(|h| h.event.as_ref().is_some_and(|e| e.id == ev.id)));
+        if let Some(k) = k {
+            let mut it = self.held.remove(k);
             it.anchor = None;
+            it.form = Some(ev);
             let ix = self.items.len();
             self.items.push(it);
             self.mark(ix);
             return;
         }
         let ix = self.push(ItemKind::Event, ev.content.text.clone(), None, false, reuse);
-        self.items[ix].event = Some(Arc::new(ev));
+        self.items[ix].event = Some(ev.clone());
+        self.items[ix].form = Some(ev);
     }
 
-    /// A live event (the `External` frame, or the steer that carried it):
-    /// its row at the end, a note until its history message lands. Not
-    /// again if a row has its id (from the history, or the frame before
-    /// the steer); that row takes what only the live frame has.
-    fn live_event(&mut self, ev: ExternalEvent) {
+    /// The `External` frame: its row, last (above it, every row streamed
+    /// before; under it, none until the engine delivers it), a note until
+    /// its message lands. A `never_persist` event, which the engine never
+    /// delivers, is held so for the turn it came in (it stays where it was
+    /// when the turn ends); idle, it goes where any live row goes. Not again for the same
+    /// event ([`same_event`]: a replay, a frame after its history row),
+    /// whose row then takes what only the frame has; another event with
+    /// the same id is another row.
+    fn live_event(&mut self, ev: &ExternalEvent) {
         if ev.is_worker_note() {
             return;
         }
-        if let Some(ix) = self.items.iter().rposition(|i| i.event.as_ref().is_some_and(|e| e.id == ev.id)) {
-            let had = self.items[ix].event.as_deref().expect("an event row");
-            if ev.timestamp.is_some() && had.timestamp.is_none() {
-                let mut ev = ev;
-                ev.content.text.clone_from(&had.content.text);
-                self.items[ix].event = Some(Arc::new(ev));
+        let shown = ev.shown();
+        let form = ev.history();
+        let hold = self.busy || ev.content.disclosure.as_deref() != Some("never_persist");
+        if let Some(ix) = self.items.iter().rposition(|i| same_event(i, &shown, &form)) {
+            if self.items[ix].event.as_ref().is_some_and(|e| e.timestamp.is_none()) && shown.timestamp.is_some() {
+                self.items[ix].text.clone_from(&shown.content.text);
+                self.items[ix].event = Some(Arc::new(shown));
                 self.touch(ix);
+            }
+            // A replay (an attach's) of one not delivered: last again, until
+            // its delivery replays too.
+            let id = self.items[ix].id;
+            if hold && self.items[ix].is_note() && !self.pending.contains(&id) && ix >= self.history_end {
+                let it = self.items.remove(ix);
+                for t in self.tools.values_mut().filter(|t| **t > ix) {
+                    *t -= 1;
+                }
+                if let Some(s) = self.response_start.as_mut().filter(|s| **s > ix) {
+                    *s -= 1;
+                }
+                self.items.push(it);
+                self.mark(ix);
+                self.pending.push(id);
             }
             return;
         }
-        self.end_streaming_text();
-        let ix = self.push_new(ItemKind::Event, ev.content.text.clone(), None, false);
-        self.items[ix].event = Some(Arc::new(ev));
+        let at = if hold { self.items.len() } else { self.live_end() };
+        let ix = self.push_at(at, ItemKind::Event, shown.content.text.clone(), None, false, &mut Reuse::new());
+        let it = &mut self.items[ix];
+        it.event = Some(Arc::new(shown));
+        it.form = Some(Arc::new(form));
+        it.anchor = Some(self.history_len);
+        if hold {
+            self.pending.push(it.id);
+        }
+    }
+
+    /// `steering_delivered` with an event's form: the engine put it in the
+    /// conversation, between two rounds, where its message will be. Its row
+    /// (the frame's) goes first among those not delivered yet, and live rows
+    /// go under it. Without a frame (attached after it), a row from the
+    /// form, there.
+    fn delivered(&mut self, h: ExternalEvent) {
+        if h.is_worker_note() {
+            return;
+        }
+        let run = self.live_end();
+        let rows = &self.items[run..];
+        let k = rows
+            .iter()
+            .position(|i| i.form.as_deref() == Some(&h))
+            .or_else(|| rows.iter().position(|i| i.event.as_ref().is_some_and(|e| e.id == h.id)));
+        if let Some(k) = k {
+            let it = self.items.remove(run + k);
+            self.pending.retain(|&p| p != it.id);
+            self.items.insert(run, it);
+            self.mark(run);
+            return;
+        }
+        if self.items.iter().any(|i| i.form.as_deref() == Some(&h)) {
+            return;
+        }
+        let ix = self.push_new(ItemKind::Event, h.content.text.clone(), None, false);
+        let h = Arc::new(h);
+        self.items[ix].event = Some(h.clone());
+        self.items[ix].form = Some(h);
         self.items[ix].anchor = Some(self.history_len);
     }
 
@@ -741,7 +896,7 @@ impl Transcript {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
         let content = m.get("content").unwrap_or(&Value::Null);
         match (role, content) {
-            ("user", Value::String(s)) if s.starts_with("<event") => self.fold_event(s, reuse),
+            ("user", Value::String(s)) if is_event_form(role, s) => self.fold_event(s, reuse),
             ("user", Value::String(s)) => {
                 let kind = if s.starts_with("<context-summary>") { ItemKind::Notice } else { ItemKind::User };
                 self.push(kind, s.clone(), None, false, reuse);
@@ -761,7 +916,7 @@ impl Transcript {
                 for b in blocks {
                     match b.get("type").and_then(Value::as_str).unwrap_or("") {
                         // An event's form in a user message's blocks: its row.
-                        "text" if role == "user" && b.get("text").and_then(Value::as_str).is_some_and(ExternalEvent::is_payload) => {
+                        "text" if b.get("text").and_then(Value::as_str).is_some_and(|t| is_event_form(role, t)) => {
                             flush(self, &mut text, reuse);
                             self.fold_event(b.get("text").and_then(Value::as_str).unwrap_or(""), reuse);
                         }
@@ -814,7 +969,7 @@ impl Transcript {
     }
 
     fn live_tail(&self, kind: ItemKind) -> Option<usize> {
-        let ix = self.items.len().checked_sub(1)?;
+        let ix = self.live_end().checked_sub(1)?;
         let it = &self.items[ix];
         (ix >= self.history_end && it.kind == kind && it.streaming).then_some(ix)
     }
@@ -830,7 +985,7 @@ impl Transcript {
     }
 
     fn end_streaming_text(&mut self) {
-        if let Some(ix) = self.items.len().checked_sub(1)
+        if let Some(ix) = self.live_end().checked_sub(1)
             && self.items[ix].streaming
             && self.items[ix].kind != ItemKind::Tool
         {
@@ -879,7 +1034,7 @@ impl Transcript {
 
     fn watch_event(&mut self, ev: &WatchEvent) {
         match ev {
-            WatchEvent::Steered { text } if !text.trim_start().starts_with("<event") => {
+            WatchEvent::Steered { text } if !ExternalEvent::is_payload(text.trim_start()) => {
                 self.end_streaming_text();
                 self.push_new(ItemKind::User, text.clone(), None, false);
             }
@@ -953,6 +1108,7 @@ impl Transcript {
         match ev {
             SessionEvent::TurnStarted { user_text, .. } => {
                 self.busy = true;
+                self.deliver_all();
                 if let Some(t) = user_text {
                     self.push_new(ItemKind::User, t.clone(), None, false);
                 }
@@ -966,6 +1122,7 @@ impl Transcript {
             }
             SessionEvent::Idle => {
                 self.busy = false;
+                self.deliver_all();
                 self.settle();
             }
             SessionEvent::Prompt { request } => self.pending_prompts.push(request.clone()),
@@ -976,16 +1133,14 @@ impl Transcript {
                 }
                 self.resolved.push_back((*prompt_id, self.busy));
             }
-            SessionEvent::External { event } => self.live_event(event.shown()),
-            // An event steered into the running turn is its event's row,
-            // never the user's steer.
-            SessionEvent::Steered { text, .. } => match steered_event(text) {
-                Some(ev) => self.live_event(ev),
-                None => self.notice(ItemKind::Notice, format!("steered: {text}")),
-            },
+            SessionEvent::External { event } => self.live_event(event),
+            // The input owner's own steer, whatever it looks like: events
+            // come as `External` and `steering_delivered`, never so.
+            SessionEvent::Steered { text, .. } => self.notice(ItemKind::Notice, format!("steered: {text}")),
             SessionEvent::SystemNotice { text } => self.notice(ItemKind::Notice, text.clone()),
             SessionEvent::Aborted { .. } => {
                 self.busy = false;
+                self.deliver_all();
                 self.settle();
                 self.notice(ItemKind::Notice, "turn aborted");
             }
@@ -1023,11 +1178,13 @@ impl Transcript {
             StreamEvent::Llm(l) => match l {
                 LlmEvent::ResponseStart => {
                     self.end_streaming_text();
-                    self.response_start = Some(self.items.len());
+                    self.response_start = Some(self.live_end());
                 }
+                // The response's rows go; an event's that came meanwhile stays.
                 LlmEvent::ResponseReset => {
                     if let Some(s) = self.response_start.filter(|&s| s >= self.history_end && s <= self.items.len()) {
-                        self.items.truncate(s);
+                        let kept: Vec<Item> = self.items.drain(s..).filter(|i| i.kind == ItemKind::Event && i.is_note()).collect();
+                        self.items.extend(kept);
                         self.tools.retain(|_, ix| *ix < s);
                         self.mark(s);
                     }
@@ -1113,7 +1270,7 @@ impl Transcript {
             StreamEvent::Agent(a) => match a {
                 AgentEvent::SteeringDelivered { message } => {
                     if let Some(ev) = steered_event(message) {
-                        self.live_event(ev);
+                        self.delivered(ev);
                     }
                 }
                 AgentEvent::SubagentStart { agent_name, task_preview, .. } if !self.no_subagent_notices => {
@@ -1132,6 +1289,40 @@ impl Transcript {
 /// The event a steer carries (its agent form), if it is one.
 fn steered_event(text: &str) -> Option<ExternalEvent> {
     ExternalEvent::is_payload(text).then(|| ExternalEvent::from_payload(text)).flatten()
+}
+
+/// Whether a history message's text (its content, or a text block of it)
+/// from `role` is an event's agent form: the one test the fold and
+/// [`Transcript::hold_events`] share. One that does not parse is a notice.
+fn is_event_form(role: &str, text: &str) -> bool {
+    role == "user" && ExternalEvent::is_payload(text)
+}
+
+/// The event forms in a history message ([`is_event_form`]).
+fn event_forms(m: &Value) -> Vec<&str> {
+    let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+    match m.get("content") {
+        Some(Value::String(s)) if is_event_form(role, s) => vec![s.as_str()],
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .filter(|t| is_event_form(role, t))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether row `it` is the event `shown` (its history form `form`): the
+/// same id and, if the row has a time (a frame's), the same time (a
+/// replay); if not (from the history), the same form.
+fn same_event(it: &Item, shown: &ExternalEvent, form: &ExternalEvent) -> bool {
+    let Some(e) = it.event.as_deref() else { return false };
+    e.id == shown.id
+        && match &e.timestamp {
+            Some(t) => shown.timestamp.as_ref() == Some(t),
+            None => it.form.as_deref() == Some(form),
+        }
 }
 
 fn compact(v: &Value) -> String {
