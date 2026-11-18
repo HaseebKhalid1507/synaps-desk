@@ -120,6 +120,10 @@ impl Setting {
 
 // ── tokens (§4) ───────────────────────────────────────────────────────
 
+/// How early an OS timer may fire and still be the frame it was armed for
+/// ([`Motion::tick`]): a coarse timer's slack (Windows' 15.6 ms), with room.
+pub(crate) const EARLY: Duration = Duration::from_millis(20);
+
 pub(crate) const QUICK: Duration = Duration::from_millis(120);
 pub(crate) const BASE: Duration = Duration::from_millis(200);
 pub(crate) const SLOW: Duration = Duration::from_millis(360);
@@ -153,31 +157,24 @@ pub(crate) const HOP_V: f32 = 227.;
 /// A roll is over within this much of its line (well under half a pixel).
 const ROLL_EPSILON: f32 = 0.02;
 pub(crate) const BREATHS: u32 = 3;
-/// Cards D's running orbit (cards4/proposal.md §4, §8 #3, the two new
-/// tokens): an arc laps its faint ring once a second while its length
-/// breathes between [`ORBIT_SHORT`] and [`ORBIT_LONG`] of the turn over
-/// 1.6 s, painted on the 30 Hz [`DECAY_TICK`] grid only (12° a tick at a
-/// 1 s lap; the 8 Hz beat's 45° would read as ticking), phase-locked
-/// app-wide.
-pub(crate) const ORBIT_LAP: Duration = Duration::from_millis(1000);
-pub(crate) const ORBIT_BREATH: Duration = Duration::from_millis(1600);
-pub(crate) const ORBIT_SHORT: f32 = 0.18;
-pub(crate) const ORBIT_LONG: f32 = 0.40;
-/// The arc held still (Reduced, Off, low power, history): 30 % of the
-/// ring from twelve o'clock.
-pub(crate) const ORBIT_STILL: f32 = 0.30;
+/// H2's state-change turn (indicators/proposal.md §6): every change of a
+/// live indicator's state turns its grid a quarter onto the new state
+/// ([`crate::lattice::turning`]); `false` is H1, the new state at once
+/// (the fallback, kept switchable: [`Motion::turn_on_change`]).
+pub(crate) const TURN_ON_CHANGE: bool = true;
+/// [`TURN_ON_CHANGE`], or `SYNAPS_DESK_TURN=0` (H1) for a look at the
+/// fallback (evidence).
+fn turn_on_change() -> bool {
+    match std::env::var("SYNAPS_DESK_TURN").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => TURN_ON_CHANGE,
+    }
+}
+
 /// `flick` as a duration (its spring's response): a one-shot's length
 /// where the proposal names the spring.
 pub(crate) const FLICK: Duration = Duration::from_millis(160);
-
-/// The orbit `t` after the window's epoch: where its arc starts (turns,
-/// 0..1 from twelve o'clock, clockwise) and its length (turns).
-pub(crate) fn orbit_at(t: Duration) -> (f32, f32) {
-    let lap = (t.as_nanos() % ORBIT_LAP.as_nanos()) as f32 / ORBIT_LAP.as_nanos() as f32;
-    let b = (t.as_nanos() % ORBIT_BREATH.as_nanos()) as f32 / ORBIT_BREATH.as_nanos() as f32;
-    let breath = 0.5 - 0.5 * (b * std::f32::consts::TAU).cos();
-    (lap, ORBIT_SHORT + (ORBIT_LONG - ORBIT_SHORT) * breath)
-}
 
 /// An exit's duration: ×0.75.
 pub(crate) const fn exit(d: Duration) -> Duration {
@@ -302,9 +299,16 @@ pub(crate) fn probe(fx: &Rc<Motion>, what: &'static str) -> Option<AnyElement> {
 
 /// The one sanctioned opacity (fluid.md §3.6, law 3): something arriving
 /// lifts from [`LIFT`] to full, never lower. Opaque grounds only.
-#[allow(clippy::disallowed_methods)]
 pub(crate) fn lift<E: Styled>(el: E, strength: f32) -> E {
-    if strength >= 1. { el } else { el.opacity(strength.max(LIFT)) }
+    lift_from(el, strength, LIFT)
+}
+
+/// [`lift`] from `floor`: [`LIFT`], or below it only for content on its own
+/// opaque card (a card row's, cards4/proposal.md §8 #1, #13: the card's
+/// slice is drawn at full strength round it).
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn lift_from<E: Styled>(el: E, strength: f32, floor: f32) -> E {
+    if strength >= 1. { el } else { el.opacity(strength.max(floor.clamp(0., LIFT))) }
 }
 
 /// The overlay's strength (fluid.md §3.10): transient chrome appearing
@@ -357,6 +361,9 @@ pub(crate) struct Grow {
     pub(crate) sink: Rc<Cell<f32>>,
     pub(crate) travel: f32,
     pub(crate) strength: f32,
+    /// The lowest the content's strength is drawn at: [`LIFT`], or 0 for a
+    /// card row's content on its opaque card (cards4/proposal.md §8 #1).
+    pub(crate) floor: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -370,6 +377,42 @@ struct Growing {
     at: Instant,
     frame: u64,
     sink: Rc<Cell<f32>>,
+}
+
+/// A body's reveal ([`Motion::reveal`]): open or not, since when (none:
+/// at rest), the fraction shown when it turned, and its measured height.
+#[derive(Clone, Debug)]
+struct Reveal {
+    open: bool,
+    at: Option<Instant>,
+    from: f32,
+    frame: u64,
+    sink: Rc<Cell<f32>>,
+}
+
+impl Reveal {
+    fn target(&self) -> f32 {
+        if self.open { 1. } else { 0. }
+    }
+
+    /// The fraction shown at `now`, and whether it has settled.
+    fn at(&self, now: Instant) -> (f32, bool) {
+        let Some(at) = self.at else { return (self.target(), true) };
+        let x = Spring::from_rest(1., GLIDE_RESPONSE, now.saturating_duration_since(at).as_secs_f32());
+        let left = (self.from - self.target()) * x;
+        let h = self.sink.get();
+        let done = if h.is_nan() { x < 0.002 } else { (left * h).abs() < FLUID_EPSILON };
+        (self.target() + left, done)
+    }
+}
+
+/// Lines streaming into a body ([`Motion::streamed`]): how many it had, and
+/// when each that came while watched arrived.
+#[derive(Clone, Debug)]
+struct Streamed {
+    n: usize,
+    frame: u64,
+    born: Vec<(usize, Instant)>,
 }
 
 /// The wrapper a growing row is drawn in: `g.shown` tall, its body laid
@@ -389,7 +432,7 @@ pub(crate) fn grow_block(body: AnyElement, label: Option<(Div, f32)>, head: Opti
         .flex_col()
         .debug_selector(move || format!("grow-clip-{key}"))
         .when_some(g.shown, |d, h| d.h(px(h)))
-        .child(lift(content, g.strength))
+        .child(lift_from(content, g.strength, g.floor))
         .on_children_prepainted(move |b, _, _| {
             if let Some(b) = b.first() {
                 sink.set(f32::from(b.size.height));
@@ -401,7 +444,7 @@ pub(crate) fn grow_block(body: AnyElement, label: Option<(Div, f32)>, head: Opti
         .flex()
         .flex_col()
         .child(ClipY(clip.into_any_element()))
-        .children(label.map(|(l, top)| lift(l.top(px(top + g.travel)), g.strength)))
+        .children(label.map(|(l, top)| lift_from(l.top(px(top + g.travel)), g.strength, g.floor)))
         .children(head)
         .into_any_element()
 }
@@ -726,13 +769,14 @@ impl Tag {
 /// What a glyph does on the beat alone, painted by the beat layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Beat {
-    /// A braille glyph's frame (polish.md P1, [`crate::glyph::spin`]).
+    /// A 10 px live glyph's lattice (the rail, the tabs, a chip; was the
+    /// braille's frame, polish.md P1): [`crate::glyph::spin`].
     Spin(crate::glyph::Glyph),
     /// `Needs` breathing since the prompt came ([`crate::glyph::breath`]).
     Breath(Instant),
-    /// Cards D's running orbit ([`orbit_at`], [`crate::glyph::orbit`]):
-    /// its arc on the 30 Hz grid, over the track the frame drew.
-    Orbit,
+    /// A 16 px lattice (a card's, the composer's cell), its pose on the
+    /// beat ([`crate::lattice::pose`]).
+    Lattice(crate::lattice::Pat),
 }
 
 /// A glyph drawn still in the app's frame whose beat the beat layer
@@ -931,6 +975,10 @@ pub(crate) struct Motion {
     glows: RefCell<HashMap<u64, Seen>>,
     /// Rows revealing or growing ([`Motion::grow`]).
     grows: RefCell<HashMap<u64, Growing>>,
+    /// Bodies opening and closing under their rows ([`Motion::reveal`]).
+    reveals: RefCell<HashMap<u64, Reveal>>,
+    /// Lines streaming into a body ([`Motion::streamed`]).
+    streams: RefCell<HashMap<u64, Streamed>>,
     /// Rows born that will not reveal: first drawn off screen, in the
     /// list's overdraw ([`Motion::unpainted`]).
     quiet: RefCell<std::collections::HashSet<u64>>,
@@ -939,7 +987,7 @@ pub(crate) struct Motion {
     /// The instant it is armed for, and whom it wakes (cleared as it fires).
     armed: Rc<Cell<Option<(Instant, Wake)>>>,
     /// The instant the timer last fired for ([`Motion::tick`]).
-    woke: Rc<Cell<Option<Instant>>>,
+    woke: Rc<Cell<Option<(Instant, Wake)>>>,
     /// A beat layer paints the beat ([`crate::beat::BeatLayer`]); without
     /// one the app's frame draws it (and each beat is the app's frame).
     layer: Cell<bool>,
@@ -961,20 +1009,20 @@ pub(crate) struct Motion {
     /// Tests move the clock with the executor's ([`Motion::clock`]): the
     /// clock's offset from the wall clock, in signed nanoseconds.
     #[cfg(test)]
-    skew: Cell<i128>,
+    skew: Rc<Cell<i128>>,
     /// Tests: the clock stands at this instant until set ([`Motion::pin_clock`]).
     #[cfg(test)]
-    pin: Cell<Option<Instant>>,
+    pin: Rc<Cell<Option<Instant>>>,
+    /// H2's turn on a change ([`TURN_ON_CHANGE`]), or H1 (`false`):
+    /// `SYNAPS_DESK_TURN=0` for the fallback, and tests of both.
+    pub(crate) turn: Cell<bool>,
     /// Tests: the OS in low power ([`Motion::low_power`]).
     #[cfg(test)]
     pub(crate) force_low_power: Cell<bool>,
     /// Tests: the beat each layer paint with sites drew, in order.
     #[cfg(test)]
     pub(crate) painted: RefCell<Vec<u32>>,
-    /// Tests of the beat alone: a running row's orbit draws as the rail's
-    /// braille spinner (its 30 Hz is Cards D's, tested on its own).
-    #[cfg(test)]
-    pub(crate) no_orbit: Cell<bool>,
+
 }
 
 /// A count or a line as last drawn ([`Motion::roll`]).
@@ -1297,6 +1345,8 @@ impl Motion {
             rolls: RefCell::default(),
             roll_n: RefCell::default(),
             grows: RefCell::default(),
+            reveals: RefCell::default(),
+            streams: RefCell::default(),
             quiet: RefCell::default(),
             timer: RefCell::default(),
             armed: Rc::default(),
@@ -1310,15 +1360,14 @@ impl Motion {
             fold: Cell::new(None),
             scope: Cell::new((0, 0)),
             #[cfg(test)]
-            skew: Cell::new(0),
+            skew: Rc::default(),
             #[cfg(test)]
-            pin: Cell::new(None),
+            pin: Rc::default(),
             #[cfg(test)]
             force_low_power: Cell::new(false),
+            turn: Cell::new(turn_on_change()),
             #[cfg(test)]
             painted: RefCell::default(),
-            #[cfg(test)]
-            no_orbit: Cell::new(false),
         }
     }
 
@@ -1344,6 +1393,8 @@ impl Motion {
         self.turns.borrow_mut().clear();
         self.rolls.borrow_mut().clear();
         self.grows.borrow_mut().clear();
+        self.reveals.borrow_mut().clear();
+        self.streams.borrow_mut().clear();
         self.quiet.borrow_mut().clear();
         self.births.borrow_mut().clear();
         self.fold.set(None);
@@ -1370,7 +1421,14 @@ impl Motion {
     ///
     /// Settled, a row that no longer streams is unwrapped (none): a row is
     /// wrapped only while it moves or streams. `ix`: its row in the list.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn grow(&self, key: u64, ix: usize, born: Option<Instant>, streaming: bool, line: f32) -> Option<Grow> {
+        self.grow_on(key, ix, born, streaming, line, SNAP_RESPONSE)
+    }
+
+    /// [`Motion::grow`], an arrival's height revealing on `response`'s
+    /// spring (the authorize card's on `glide`, cards4/proposal.md §8 #8).
+    pub(crate) fn grow_on(&self, key: u64, ix: usize, born: Option<Instant>, streaming: bool, line: f32, response: f32) -> Option<Grow> {
         if !self.fluid() {
             return None;
         }
@@ -1409,7 +1467,7 @@ impl Motion {
         if natural.is_nan() {
             // Not measured yet: an arrival is 0 px tall; a streaming row its own height.
             self.want_frame();
-            return Some(Grow { key, shown: g.arriving.then_some(0.), sink: g.sink.clone(), travel, strength });
+            return Some(Grow { key, shown: g.arriving.then_some(0.), sink: g.sink.clone(), travel, strength, floor: LIFT });
         }
         if g.shown.is_nan() {
             g.shown = if g.arriving { 0. } else { natural };
@@ -1418,7 +1476,7 @@ impl Motion {
             if natural < g.shown {
                 (g.shown, g.spring) = (natural, Spring::default());
             } else {
-                let response = if g.arriving { SNAP_RESPONSE } else { FLICK_RESPONSE };
+                let response = if g.arriving { response } else { FLICK_RESPONSE };
                 g.spring.x = g.shown - natural;
                 g.spring.step(response, dt);
                 if streaming && !g.arriving {
@@ -1445,7 +1503,72 @@ impl Motion {
         } else {
             self.want_frame();
         }
-        Some(Grow { key, shown: Some(g.shown), sink: g.sink.clone(), travel, strength })
+        Some(Grow { key, shown: Some(g.shown), sink: g.sink.clone(), travel, strength, floor: LIFT })
+    }
+
+    /// A body under its row as it opens or closes (cards4/proposal.md §8
+    /// #6, #12): the fraction of its height shown (the header never moves:
+    /// the clip is the body's), on `glide`, and the cell its height is
+    /// measured into. `None`: at rest (open: all of it; closed: none). A
+    /// body seen for the first time (history, scrolled in, a switch) is at
+    /// rest; Reduced, Off and low power: at once. `delay`: a turn that
+    /// starts now waits this long (a success's streamed body folds @ +180).
+    pub(crate) fn reveal(&self, key: u64, open: bool, delay: Duration) -> (Option<f32>, Rc<Cell<f32>>) {
+        let (frame, now) = (self.frame.get(), self.now());
+        let fluid = self.fluid();
+        let mut reveals = self.reveals.borrow_mut();
+        let r = reveals.entry(key).or_insert_with(|| Reveal { open, at: None, from: 0., frame, sink: Rc::new(Cell::new(f32::NAN)) });
+        if r.frame + 1 < frame || !fluid {
+            (r.open, r.at) = (open, None);
+        } else if r.open != open {
+            let (shown, _) = r.at(now);
+            (r.open, r.from, r.at) = (open, shown, Some(now + delay));
+        }
+        r.frame = frame;
+        let (shown, done) = r.at(now);
+        if done {
+            r.at = None;
+            return (None, r.sink.clone());
+        }
+        self.want_frame();
+        (Some(shown.clamp(0., 1.)), r.sink.clone())
+    }
+
+    /// Lines streaming into a body (cards4/proposal.md §8 #4): of the `n`
+    /// it holds now, those that came while watched, as `(line, clip,
+    /// strength)`: each line's clip 0 → 1 of its height on `flick`, its
+    /// text from 70 % on [`STREAM_FADE`] ([`stream_curve`]), in arrival
+    /// order, lines that came in one frame [`STREAM_STAGGER`] apart. Empty
+    /// at rest: history, a body seen for the first time, Reduced, Off.
+    pub(crate) fn streamed(&self, key: u64, n: usize) -> Vec<(usize, f32, f32)> {
+        let (frame, now) = (self.frame.get(), self.now());
+        let fluid = self.fluid();
+        let mut streams = self.streams.borrow_mut();
+        let s = streams.entry(key).or_insert_with(|| Streamed { n, frame, born: Vec::new() });
+        if s.frame + 1 < frame || !fluid || n < s.n {
+            s.born.clear();
+        } else if n > s.n {
+            let first = s.born.last().map_or(now, |b| b.1.max(now));
+            s.born.extend((s.n..n).enumerate().map(|(k, i)| (i, first + STREAM_STAGGER * k.min(12) as u32)));
+        }
+        (s.n, s.frame) = (n, frame);
+        let curve = stream_curve();
+        s.born.retain(|(_, at)| now < *at || Spring::from_rest(1., FLICK_RESPONSE, now.saturating_duration_since(*at).as_secs_f32()) > 0.01 || now.saturating_duration_since(*at) < STREAM_FADE);
+        if s.born.is_empty() {
+            return Vec::new();
+        }
+        self.want_frame();
+        s.born
+            .iter()
+            .map(|&(i, at)| {
+                let t = now.checked_duration_since(at).map_or(-1., |d| d.as_secs_f32());
+                if t < 0. {
+                    return (i, 0., LIFT);
+                }
+                let clip = 1. - Spring::from_rest(1., FLICK_RESPONSE, t);
+                (i, clip, curve.sample((t / STREAM_FADE.as_secs_f32()).min(1.)))
+            })
+            .collect()
     }
 
     /// After the list's layout: arrivals it drew this frame but did not
@@ -1509,7 +1632,7 @@ impl Motion {
     /// beat before (Shady N2). Once that instant is past, the clock.
     pub(crate) fn tick(&self) -> Instant {
         let now = self.clock();
-        self.woke.get().map_or(now, |due| due.max(now))
+        self.woke.get().map_or(now, |(due, _)| due.max(now))
     }
 
     /// The OS is in low power: no ambient (§7).
@@ -1523,17 +1646,26 @@ impl Motion {
 
     /// The time (tests: moved on with the test executor's clock).
     pub(crate) fn clock(&self) -> Instant {
+        self.clock_fn()()
+    }
+
+    /// The clock, to read later (a timer's task).
+    fn clock_fn(&self) -> impl Fn() -> Instant + 'static {
         #[cfg(test)]
-        if let Some(at) = self.pin.get() {
-            return at;
+        let (pin, skew) = (self.pin.clone(), self.skew.clone());
+        move || {
+            #[cfg(test)]
+            if let Some(at) = pin.get() {
+                return at;
+            }
+            let now = Instant::now();
+            #[cfg(test)]
+            let now = {
+                let (s, d) = (skew.get(), Duration::from_nanos(skew.get().unsigned_abs() as u64));
+                if s >= 0 { now + d } else { now - d }
+            };
+            now
         }
-        let now = Instant::now();
-        #[cfg(test)]
-        let now = {
-            let (s, d) = (self.skew.get(), Duration::from_nanos(self.skew.get().unsigned_abs() as u64));
-            if s >= 0 { now + d } else { now - d }
-        };
-        now
     }
 
     /// Tests: the clock reads `at` now (then runs on with the wall clock).
@@ -1657,9 +1789,9 @@ impl Motion {
         self.sites.borrow().len()
     }
 
-    /// Orbits the beat layer paints (the bench; Cards D retired P2's sweep).
-    pub(crate) fn orbit_count(&self) -> usize {
-        self.sites.borrow().iter().filter(|s| matches!(s.beat, Beat::Orbit)).count()
+    /// Lattices the beat layer paints (the bench: `indicators`).
+    pub(crate) fn lattice_count(&self) -> usize {
+        self.sites.borrow().iter().filter(|s| matches!(s.beat, Beat::Lattice(_) | Beat::Spin(_))).count()
     }
 
     fn disarm(&self) {
@@ -1838,17 +1970,19 @@ impl Motion {
         self.ambient.get().then(|| (at.saturating_duration_since(self.epoch).as_nanos() / BEAT.as_nanos()) as u32)
     }
 
-    /// The running orbit this frame (cards4/proposal.md §8 #3): where its
-    /// arc starts and its length, as of the frame's 30 Hz tick, the next
-    /// tick asked for. `None` when ambient is off (Reduced, Off, low power,
-    /// the link lost): the arc is drawn still and asks for nothing. Only a
-    /// running glyph drawn this frame asks: nothing runs, nothing moves.
-    pub(crate) fn orbit(&self) -> Option<(f32, f32)> {
+    /// A live indicator's beat (indicators/proposal.md §6): the shared
+    /// grid's beat now, the next frame asked for where `pat`'s pose next
+    /// changes (none for one that holds). `None` when ambient is off
+    /// (Reduced, Off, low power): its still pose.
+    pub(crate) fn lattice_beat(&self, pat: crate::lattice::Pat) -> Option<u32> {
         if !self.ambient.get() {
             return None;
         }
-        self.want_tick();
-        Some(orbit_at(self.on_tick(self.now())))
+        let beat = (self.now().saturating_duration_since(self.epoch).as_nanos() / BEAT.as_nanos()) as u32;
+        if let Some(next) = crate::lattice::next_change(pat, beat) {
+            self.want_at(self.epoch + BEAT * next);
+        }
+        Some(beat)
     }
 
     /// A text slot rolling from one value to the next (cards4/proposal.md
@@ -1871,18 +2005,6 @@ impl Motion {
         }
         self.want_frame();
         (old, 1. - x)
-    }
-
-    /// The orbit as it was at `at` (where a success's ring closes from):
-    /// still when ambient is off.
-    pub(crate) fn orbit_then(&self, at: Instant) -> (f32, f32) {
-        if self.ambient.get() { orbit_at(self.on_tick(at)) } else { (0., ORBIT_STILL) }
-    }
-
-    /// `at`, from the epoch, floored to the 30 Hz grid.
-    fn on_tick(&self, at: Instant) -> Duration {
-        let ticks = at.saturating_duration_since(self.epoch).as_nanos() / DECAY_TICK.as_nanos();
-        Duration::from_nanos((DECAY_TICK.as_nanos() * ticks) as u64)
     }
 
     /// A ping (cards4/proposal.md §8 #7, #8): one ring going out from a
@@ -2448,49 +2570,47 @@ impl Motion {
         }
         let since = self.tick().saturating_duration_since(self.epoch);
         let beat = (since.as_nanos() / BEAT.as_nanos()) as u32;
-        let tick = (since.as_nanos() / DECAY_TICK.as_nanos()) as u64;
-        let (mut wants, mut every, mut ticks) = (false, 2, false);
-        let orbit = orbit_at(Duration::from_nanos((DECAY_TICK.as_nanos() * tick as u128) as u64));
+        let (mut wants, mut next) = (false, None::<u32>);
         for s in self.sites.borrow().iter() {
             let quad = |x: f32, y: f32, w: f32, h: f32, c: Hsla, window: &mut Window| {
                 window.with_content_mask(Some(s.mask), |window| {
                     window.paint_quad(fill(Bounds::new(s.origin + point(px(x), px(y)), size(px(w), px(h))), c));
                 });
             };
-            match s.beat {
-                Beat::Spin(g) => {
-                    wants = true;
-                    every = every.min(g.spin_every());
-                    window.with_content_mask(Some(s.mask), |window| {
-                        crate::glyph::paint_dots(window, s.origin, crate::glyph::spin_dots(g, Some(beat)), s.mark, s.ground);
-                    });
+            // A lattice (indicators/proposal.md §6): its pose at this beat,
+            // and the beat it next changes on (the timer goes there).
+            let mut lattice = |n: f32, pat: crate::lattice::Pat, window: &mut Window| {
+                wants = true;
+                let d = crate::lattice::Dots::of(crate::lattice::pose(pat, Some(beat)));
+                window.with_content_mask(Some(s.mask), |window| crate::lattice::paint(window, s.origin, n, d, s.mark, s.ground));
+                if let Some(b) = crate::lattice::next_change(pat, beat) {
+                    next = Some(next.map_or(b, |n: u32| n.min(b)));
                 }
+            };
+            match s.beat {
+                Beat::Spin(g) => lattice(10., crate::glyph::live_pat(g), window),
+                Beat::Lattice(pat) => lattice(crate::glyph::LIFE, pat, window),
                 Beat::Breath(at) => {
                     let step = beat.saturating_sub((at.saturating_duration_since(self.epoch).as_nanos() / BEAT.as_nanos()) as u32);
                     if step < BREATH_BEATS * BREATHS {
                         wants = true;
+                        // Its cell steps every other beat (as before).
+                        let b = (beat / 2 + 1) * 2;
+                        next = Some(next.map_or(b, |n: u32| n.min(b)));
                         let (x, y, w) = crate::glyph::BREATH_CELL;
                         quad(x, y, w, w, crate::glyph::breath_cell(step, s.mark, s.ground), window);
                     }
-                }
-                Beat::Orbit => {
-                    // The 30 Hz grid (the spinners ride it).
-                    ticks = true;
-                    window.with_content_mask(Some(s.mask), |window| crate::glyph::paint_arc(window, cx, s.origin, orbit, s.mark));
                 }
             }
         }
         if wants {
             #[cfg(test)]
             self.painted.borrow_mut().push(beat);
-            self.beat_next.set(Some(self.epoch + BEAT * ((beat / every + 1) * every)));
         }
-        if ticks {
-            // 30 Hz while an orbit is on screen (Cards D), on the
-            // shared grid. The spinners ride its ticks (each samples the
-            // beat it is in, at most a tick late): 30 paints a second, not
-            // 30 and the beats between them.
-            self.beat_next.set(Some(self.epoch + Duration::from_nanos((DECAY_TICK.as_nanos() * (tick as u128 + 1)) as u64)));
+        // The one timer to the earliest pose change (running: twice a
+        // 4-beat step; streaming, a chase and the breath: every beat).
+        if let Some(n) = next {
+            self.beat_next.set(Some(self.epoch + BEAT * n));
         }
         if !self.display.get() {
             self.arm(cx, app, layer);
@@ -2518,10 +2638,20 @@ impl Motion {
         self.armed.set(Some((at, wake)));
         let (armed, woke, who) = (self.armed.clone(), self.woke.clone(), if wake == Wake::App { app } else { layer });
         let wait = at.saturating_duration_since(self.clock());
+        let clock = self.clock_fn();
         let task = cx.spawn(async move |cx| {
             cx.background_executor().timer(wait).await;
+            // The beat layer's wake is for a pose change that can be beats
+            // away (indicators/proposal.md §6): one that fired more than an
+            // OS timer's slack ([`EARLY`]) ahead of it sleeps the rest.
+            if wake == Wake::Beat {
+                let rest = at.saturating_duration_since(clock());
+                if rest > EARLY {
+                    cx.background_executor().timer(rest).await;
+                }
+            }
             armed.set(None);
-            woke.set(Some(at));
+            woke.set(Some((at, wake)));
             cx.update(|cx| cx.notify(who));
         });
         *self.timer.borrow_mut() = Some(task);
@@ -2585,42 +2715,50 @@ mod tests {
         Duration::from_millis(n)
     }
 
-    /// Cards D (cards4/proposal.md §8 #3): the orbit asks for the 30 Hz
-    /// tick only while a running glyph is drawn: a frame that draws none
-    /// asks for nothing. It is phase-locked: two orbits drawn in one frame
-    /// read the same.
+    /// H2 (indicators/proposal.md §6, §8 `lattice_wakes_only_on_pose_changes`):
+    /// a running lattice asks for a frame only where its pose next changes,
+    /// on the shared beat grid: running twice a 4-beat step (4 a second),
+    /// streaming and a chase every beat. Phase-locked: two drawn in a frame
+    /// read the same. A frame that draws none asks for nothing.
     #[test]
-    fn orbit_requests_ticks_only_while_running() {
+    fn lattice_wakes_only_on_pose_changes() {
+        use crate::lattice::{Pat, next_change, pose};
         let t0 = Instant::now();
         let m = Motion::new(t0);
-        m.begin_frame(Level::Full, false, t0 + ms(5));
-        let a = m.orbit().expect("Full: it laps");
-        assert_eq!(m.orbit(), Some(a), "one clock app-wide");
-        let (display, next) = m.demand();
-        assert!(!display, "no display-rate frame: the 30 Hz tick");
-        let next = next.expect("the next tick asked for");
-        assert!(next.saturating_duration_since(t0) <= DECAY_TICK, "on the 30 Hz grid: {next:?}");
-        m.begin_frame(Level::Full, false, t0 + ms(40));
-        assert_ne!(m.orbit(), Some(a), "a tick later it has moved");
-        m.begin_frame(Level::Full, false, t0 + ms(80));
+        let mut wakes = Vec::new();
+        let mut at = t0 + ms(5);
+        // Two seconds of a running lattice, frame by frame at its wakes.
+        while at < t0 + ms(2000) {
+            m.begin_frame(Level::Full, false, at);
+            let b = m.lattice_beat(Pat::Run).expect("Full: it runs");
+            assert_eq!(m.lattice_beat(Pat::Run), Some(b), "one clock app-wide");
+            let (display, next) = m.demand();
+            assert!(!display, "no display-rate frame");
+            let next = next.expect("its next pose asked for");
+            assert_eq!(next, t0 + BEAT * next_change(Pat::Run, b).unwrap(), "at its next pose change");
+            assert_ne!(pose(Pat::Run, Some(b)), pose(Pat::Run, Some((next.duration_since(t0).as_nanos() / BEAT.as_nanos()) as u32)));
+            wakes.push(next);
+            at = next;
+        }
+        assert_eq!(wakes.len(), 8, "4 wakes a second: {wakes:?}");
+        m.begin_frame(Level::Full, false, at);
+        let b = m.lattice_beat(Pat::Stream).unwrap();
+        assert_eq!(m.demand().1, Some(t0 + BEAT * (b + 1)), "streaming: every beat");
+        m.begin_frame(Level::Full, false, at + ms(1));
         assert_eq!(m.demand(), (false, None), "nothing running drawn: nothing asked");
-        // A lap a second, its length breathing 18 → 40 %.
-        let (s0, l0) = super::orbit_at(ms(0));
-        let (s1, _) = super::orbit_at(ms(250));
-        assert!((s1 - s0 - 0.25).abs() < 1e-4 && (l0 - super::ORBIT_SHORT).abs() < 1e-4);
-        assert!((super::orbit_at(super::ORBIT_BREATH / 2).1 - super::ORBIT_LONG).abs() < 1e-4);
     }
 
-    /// Reduced, Off and low power: the orbit is the still arc and asks for
-    /// no frame (§8 #3: 0 frames).
+    /// Reduced, Off and low power: a lattice is its still pose and asks for
+    /// no frame (0 frames).
     #[test]
-    fn orbit_is_still_when_reduced_or_off() {
+    fn lattice_is_still_when_reduced_or_off() {
         let t0 = Instant::now();
         let m = Motion::new(t0);
         for (level, low) in [(Level::Reduced, false), (Level::Off, false), (Level::Full, true)] {
             m.begin_frame(level, low, t0 + ms(10));
-            assert_eq!(m.orbit(), None, "{level:?} low power {low}: still");
-            assert_eq!(m.orbit_then(t0), (0., super::ORBIT_STILL));
+            for p in [crate::lattice::Pat::Run, crate::lattice::Pat::Stream, crate::lattice::Pat::Reconnect] {
+                assert_eq!(m.lattice_beat(p), None, "{level:?} low power {low}: still");
+            }
             assert_eq!(m.demand(), (false, None), "{level:?}: no frames");
         }
     }
@@ -2671,7 +2809,7 @@ mod tests {
     fn history_cards_are_drawn_at_rest() {
         let t0 = Instant::now();
         let m = Motion::new(t0);
-        let (done, orbit) = (crate::glyph::Life::Done.code(), crate::glyph::Life::Orbit.code());
+        let (done, orbit) = (crate::glyph::Life::Done.code(), crate::glyph::Life::Run.code());
         m.begin_frame(Level::Full, false, t0);
         assert_eq!(m.change(Tag::Outcome, 7, done, None), None, "loaded done: at rest");
         assert_eq!(m.change(Tag::Outcome, 8, orbit, None), None);
@@ -2957,8 +3095,8 @@ mod tests {
         let fresh = m.beat(1);
         assert_eq!(old, Some(2));
         assert_eq!(fresh, old, "a row built after the wall clock crossed the beat scans with the rest");
-        let run = crate::glyph::Glyph::Run;
-        assert_eq!(crate::glyph::spin_dots(run, old), crate::glyph::spin_dots(run, fresh));
+        let run = crate::glyph::live_pat(crate::glyph::Glyph::Run);
+        assert_eq!(crate::lattice::pose(run, old), crate::lattice::pose(run, fresh));
         // The next frame: the next beat, for both.
         m.begin_frame(Level::Full, false, t0 + ms(6));
         assert_eq!((m.beat(1), m.beat(1)), (Some(3), Some(3)));
