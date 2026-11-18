@@ -3378,6 +3378,7 @@ fn a_failed_body_glides_to_its_output(cx: &mut TestAppContext) {
     assert!(after < before, "the failure's output is shorter: {after:?} < {before:?}");
     let h: Vec<f32> = heights.into_iter().flatten().collect();
     assert!(h.len() > 5, "it glided over frames: {h:?}");
+    assert!(h[0] >= f32::from(before) - 1., "its first frame holds the height it had: {h:?} ({before:?})");
     let step = h.windows(2).map(|p| (p[0] - p[1]).abs()).fold(0f32, f32::max);
     assert!(step < f32::from(before - after) * 0.6, "no one-frame jump: {h:?}");
 }
