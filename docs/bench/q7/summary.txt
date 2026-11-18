@@ -1,0 +1,12 @@
+main-mem-1 swapins 51 load 4.02 | mem_end anon 93488 uss 126316
+main-motion-1 swapins 7196 load 4.25 | idle_30s_prompt presents 0 app_frames 0 layer_paints 0 cpu_ms/s 1.94 prompt True demoted True
+q7-mem-1 swapins 340 load 3.26 | mem_end anon 93456 uss 124360
+q7-motion-1 swapins 3869 load 3.13 | idle_30s_prompt presents 0 app_frames 0 layer_paints 0 cpu_ms/s 2.17 prompt True demoted True
+main-mem-2 swapins 85 load 2.32 | mem_end anon 93720 uss 123244
+main-motion-2 swapins 5787 load 2.84 | idle_30s_prompt presents 0 app_frames 0 layer_paints 0 cpu_ms/s 1.97 prompt True demoted True
+q7-mem-2 swapins 45 load 2.81 | mem_end anon 93772 uss 124316
+q7-motion-2 swapins 3038 load 5.27 | idle_30s_prompt presents 0 app_frames 0 layer_paints 0 cpu_ms/s 2.28 prompt True demoted True
+main-mem-3 swapins 35 load 1.55 | mem_end anon 93792 uss 123548
+main-motion-3 swapins 37138 load 2.46 | idle_30s_prompt presents 0 app_frames 0 layer_paints 0 cpu_ms/s 2.29 prompt True demoted True
+q7-mem-3 swapins 37 load 1.89 | mem_end anon 94608 uss 125464
+q7-motion-3 swapins 724 load 2.16 | idle_30s_prompt presents 0 app_frames 0 layer_paints 0 cpu_ms/s 2.24 prompt True demoted True
