@@ -1,0 +1,15 @@
+t0 1794982414.985274993
+0.00133562 key ctrl+k
+1.23019 key Down
+1.84841 key Down
+2.46972 key Down
+3.08835 key Up
+4.1078 type --delay 120 fold
+5.79735 key BackSpace BackSpace BackSpace BackSpace
+7.05416 key Tab
+8.07073 key Down
+8.68803 key Down
+9.30836 type --delay 120 ledger
+11.2389 key Escape
+12.2558 key ctrl+p
+13.2849 key Escape
