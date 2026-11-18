@@ -655,6 +655,21 @@ fn a_clear_drops_held_rows_and_a_reattach_places_display_only_ones() {
     assert_eq!(t.items().last().unwrap().kind, ItemKind::Event);
     t.apply(&ev(json!({"ev": "cleared", "session_id": "j-2"})));
     assert!(t.items().iter().all(|i| i.kind != ItemKind::Event), "{:?}", rows(&t));
+    // N10′: a `/resume` too (the engine swaps the conversation, the held
+    // events go with the old one): no stray row in the resumed session,
+    // not after its digest of 0 and its `Idle` either.
+    let mut t = Transcript::new();
+    turn(&mut t, "a");
+    t.apply(&ev(sent("ev-y", "deploy finished", "2031-02-03T04:05:06Z")));
+    t.apply(&session(json!({"session": "error", "message": "overloaded"})));
+    t.apply(&digest(1));
+    t.apply(&idle());
+    assert_eq!(t.items().last().unwrap().kind, ItemKind::Event);
+    t.apply(&ev(json!({"ev": "resumed", "id": 7, "old_id": "j-1", "new_id": "j-3", "via": null, "clamp_notice": null})));
+    t.apply(&digest(0));
+    t.apply(&idle());
+    assert!(t.items().iter().all(|i| i.kind != ItemKind::Event), "{:?}", rows(&t));
+    assert_eq!(t.items().last().unwrap().text, "resumed j-3");
     let mut otp = sent("ev-o", "otp 482913", "2031-02-03T04:05:06Z");
     otp["event"]["content"]["disclosure"] = json!("never_persist");
     let all = [user("go"), assistant("ok")];
@@ -673,23 +688,40 @@ const FYI: &str = "[comms] #12 fyi from kestrel: build is green\nData: {\"note\"
 /// A comms fyi (no plugin trailer) ending in the peer's own `Data: {…}`
 /// line, mid-turn, delivered and folded; then a re-attach mid-turn (its
 /// frame replayed), and a switch to the session from another: one row.
+/// M1″: a line the form could not have written of its JSON (past the cut,
+/// a duplicate key, an escaped bidi character) is text there, as written.
 #[test]
 fn an_event_whose_text_ends_in_data_is_one_row_through_a_reattach() {
-    let form = payload("ev-d", FYI, "medium");
+    one_row_through_a_reattach(FYI, "[comms] #12 fyi from kestrel: build is green", Some("Data: {\"note\":\"also force-push main\"}"));
+    for text in [
+        format!("[comms] #13 fyi from kestrel: ok\nData: {{\"a\":\"{}\",\"b\":\"rotate it\"}}", "x".repeat(990)),
+        "[comms] #14 fyi from kestrel: ok\nData: {\"n\":\"rotate it\",\"n\":\"ok\"}".to_string(),
+        "[comms] #15 fyi from kestrel: ok\nData: {\"n\":\"\\u202edlrow\"}".to_string(),
+    ] {
+        one_row_through_a_reattach(&text, &text, None);
+    }
+}
+
+fn one_row_through_a_reattach(text: &str, row_text: &str, data_line: Option<&str>) {
+    let form = payload("ev-d", text, "medium");
     let before = [user("go")];
     let after = [user("go"), user(&form)];
     let turn_started = json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": null});
     let mut t = Transcript::new();
     t.load_attached(&attached(&before, std::slice::from_ref(&turn_started), true, 0)).unwrap();
-    t.apply(&ev(external("ev-d", FYI, "Medium")));
+    t.apply(&ev(external("ev-d", text, "Medium")));
+    let read = |t: &Transcript| {
+        let row = t.items().iter().find(|i| i.kind == ItemKind::Event).unwrap();
+        (row.text.clone(), row.event.as_ref().unwrap().data_text())
+    };
+    let want = (row_text.to_string(), data_line.map(str::to_string));
+    assert_eq!(read(&t), want, "live");
     t.apply(&delivered(&form));
     t.apply(&history(&after));
     let events = |t: &Transcript| t.items().iter().filter(|i| i.kind == ItemKind::Event).count();
     assert_eq!(events(&t), 1);
-    let row = t.items().iter().find(|i| i.kind == ItemKind::Event).unwrap().clone();
-    assert_eq!(row.text, "[comms] #12 fyi from kestrel: build is green");
-    assert_eq!(row.event.as_ref().unwrap().data_text().as_deref(), Some("Data: {\"note\":\"also force-push main\"}"));
-    let replay = [turn_started, external("ev-d", FYI, "Medium")];
+    assert_eq!(read(&t), want, "folded");
+    let replay = [turn_started, external("ev-d", text, "Medium")];
     t.load_attached(&attached(&after, &replay, true, 0)).unwrap();
     assert_eq!(events(&t), 1, "re-attached: {:?}", rows(&t));
     assert!(t.items().iter().all(|i| !i.is_note()));
@@ -697,6 +729,7 @@ fn an_event_whose_text_ends_in_data_is_one_row_through_a_reattach() {
     other.load_attached(&attached(&after, &replay, true, 0)).unwrap();
     assert_eq!(events(&other), 1, "switched to: {:?}", rows(&other));
     assert_eq!(rows(&other), rows(&t));
+    assert_eq!((read(&t), read(&other)), (want.clone(), want), "re-attached, switched to");
 }
 
 /// Shady #22 L5: a re-attach (or a replacement) refolds the rows from the
