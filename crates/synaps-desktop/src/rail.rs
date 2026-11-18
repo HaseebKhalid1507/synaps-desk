@@ -2049,6 +2049,43 @@ mod tests {
         assert_eq!(m.apply(Event::Sessions(metas(a))), first(), "counted again after a reconnect");
     }
 
+    /// Review F6: the page loop's own bound. A daemon that sends `next`
+    /// with no rows kept is asked `want / 200 + 2` pages, then the list
+    /// lands cut; one that sends back the `before` it was given, once.
+    #[test]
+    fn the_page_loop_ends_on_its_own() {
+        use crate::model::Effect;
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        let held = json!([{"id": "h", "lifecycle": "live", "updated_at": at(5)}]);
+        let mut asked = 1;
+        let mut req = 1;
+        loop {
+            m.page_sent(req);
+            let fx = m.apply(page(req, held.clone(), Some(&json!({"updated_at": at(req as i64), "id": format!("c{req}")}))));
+            req += 1;
+            match fx.as_slice() {
+                [Effect::CatalogPage { named_only: false, before: Some(_), .. }] => asked += 1,
+                _ => break,
+            }
+            assert!(asked < 10, "asked forever");
+        }
+        assert_eq!(asked, 200 / 200 + 2);
+        assert!(m.named.recent_loaded && m.named.recent_truncated);
+        // The same cursor back: one page, then it lands.
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        m.want_deep();
+        m.page_sent(1);
+        let rows = saved_rows(3, 60);
+        let fx = m.apply(page(1, json!(rows), Some(&rows[2])));
+        assert!(matches!(fx.as_slice(), [Effect::CatalogPage { before: Some(_), .. }]), "{fx:?}");
+        m.page_sent(2);
+        m.apply(page(2, json!([]), Some(&rows[2])));
+        assert!(m.named.recent_loaded && m.named.recent_truncated, "landed, cut");
+        assert_eq!(m.named.recent.len(), 3);
+    }
+
     /// A page reply after a reconnect, to a `req` asked on the old
     /// connection, is dropped: only the page asked since lands.
     #[test]
