@@ -698,6 +698,17 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     done.extend((6..13).map(|k| row(k, &format!("probe-{k}"), "completed", 2, "", probes_done)));
                     done.push(row(13, "probe-13", "completed", 2, "", age(last_at)));
                     apply(cx, vec![json!({"ev": "subagent_rows", "rows": done})]);
+                    // The rail's other sessions settle too: after the turn's
+                    // end nothing in the window runs (P3: then 0 presents).
+                    let _ = upd(cx, &|v, cx| {
+                        let metas: Vec<SessionMeta> = v
+                            .model
+                            .sessions
+                            .iter()
+                            .map(|m| SessionMeta { busy: false, subagents_running: 0, ..m.clone() })
+                            .collect();
+                        v.apply_batch(vec![Event::Sessions(metas)], cx);
+                    });
                     sleep(2.0).await;
                     // The turn ends from RUNNING, the sweep on screen: READY
                     // hands the floor back (Handoff in down the bar, the

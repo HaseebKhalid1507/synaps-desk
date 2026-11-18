@@ -1014,7 +1014,10 @@ pub(crate) fn pass(p: f32, mark: Hsla, ground: Hsla) -> AnyElement {
         |_, _, _| {},
         move |b, _, window, _| {
             let w = f32::from(b.size.width);
-            for (x, bw, level) in band_at(w, p * (w + SWEEP_STEP * 4.), |i| SWEEP_LEVELS[i]) {
+            // Its head one band in at 0 (the corner lit both ways on the
+            // turn's last frame, as Handoff's 24 px light is), past the end
+            // with its tail at 1.
+            for (x, bw, level) in band_at(w, SWEEP_STEP + p * (w + SWEEP_STEP * 3.), |i| SWEEP_LEVELS[i]) {
                 window.paint_quad(fill(Bounds::new(b.origin + point(px(x), px(0.)), size(px(bw), px(1.))), mix(ground, mark, level)));
             }
         },
