@@ -550,8 +550,10 @@ impl AppView {
     pub(crate) fn reveal_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.card_ix() else { return };
         let (top, bottom) = self.list_view();
-        // Below the sticky band, when the labels are inline (polish.md F8).
+        // Below the sticky band, when the labels are inline (polish.md F8);
+        // above the dock as it will be once it lands (polish.md P13).
         let top = top + self.sticky_inset(cx);
+        let bottom = bottom - self.dock_growth();
         match self.list.bounds_for_item(ix) {
             Some(b) => {
                 let (t, bt) = (f32::from(b.top()), f32::from(b.bottom()));
@@ -571,7 +573,13 @@ impl AppView {
                     }
                 }
             }
-            None => self.list.scroll_to_reveal_item(ix),
+            None => {
+                self.list.scroll_to_reveal_item(ix);
+                // Drawn next frame: placed again then, the dock as it lands.
+                if self.dock_growth() > 0.5 {
+                    self.jump_card = self.model.card_key();
+                }
+            }
         }
         let secret = self.current_card().is_some_and(|c| c.secret);
         if secret {

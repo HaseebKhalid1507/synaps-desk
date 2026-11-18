@@ -1577,8 +1577,8 @@ pub struct AppView {
     /// as last laid out: their boxes spring to them (polish.md P13, P14).
     pub(crate) dock_h: std::rc::Rc<std::cell::Cell<f32>>,
     pub(crate) composer_h: std::rc::Rc<std::cell::Cell<f32>>,
-    /// The session they were measured in: another's is not a change (it
-    /// is drawn at its height at once).
+    /// The session and column they were measured in: another's is not a
+    /// change (it is drawn at its height at once).
     dock_scope: u64,
     /// Each worker chip's bounds as last laid out (the tracer starts from
     /// the source chip's bar).
@@ -5432,6 +5432,16 @@ impl AppView {
     /// foot: the glyph, HALT and the primary sit beside the text (a note
     /// about the draft keeps its row). `to_card`: it has the focus while a
     /// card waits; its hint says how to answer from the keyboard.
+    /// How much the dock has still to grow on its spring: the list's view
+    /// ends this much higher once it lands (a reveal aims there).
+    pub(crate) fn dock_growth(&self) -> f32 {
+        let natural = self.dock_h.get();
+        match self.fx.spring_at(DOCK_H) {
+            Some(shown) if natural.is_finite() => (natural - shown).max(0.),
+            _ => 0.,
+        }
+    }
+
     /// The dock over the composer: the NEEDS YOU stub, a notice and the
     /// worker chips (polish.md P13). Under Full its height springs on
     /// `sheet` to what they take (a stub arrives, the chips wrap or unwrap,
@@ -6060,8 +6070,9 @@ impl Render for AppView {
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
         self.fx.rescope(self.motion_session(), self.motion_column());
-        // Another session: its dock and draft are drawn at their heights.
-        let scope = self.motion_session();
+        // Another session, or a worker's view in or out: its dock and draft
+        // are drawn at their heights (a switch replays nothing).
+        let scope = self.motion_session() ^ self.motion_column().rotate_left(17);
         if std::mem::replace(&mut self.dock_scope, scope) != scope {
             self.dock_h.set(f32::NAN);
             self.composer_h.set(f32::NAN);
