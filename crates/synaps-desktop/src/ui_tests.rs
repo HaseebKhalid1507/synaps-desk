@@ -2260,6 +2260,30 @@ fn the_end_and_the_held_room_at_125_percent(cx: &mut TestAppContext) {
     }
 }
 
+/// Shady #23 r2 L1: the Outline Allow draws, charged in `acc_line`, and
+/// folds its card into its row like the fill (`TEST_ALLOW`).
+#[gpui_kit::test]
+fn the_outline_allow_draws_and_folds(cx: &mut TestAppContext) {
+    use crate::authorize::Answer;
+    crate::authorize::TEST_ALLOW.with(|c| c.set(Some(crate::cards::AllowStyle::Outline)));
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let at = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel);
+    assert!(at(cx, "allow-outline").is_some() && at(cx, "allow-fill").is_none(), "the Outline Allow");
+    card_keys(cx, w, &view);
+    tap(cx, w, if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" });
+    assert_eq!(view.read_with(cx, |v, _| v.sent.as_ref().map(|s| s.answer)), Some(Answer::Allowed));
+    settle(cx, w, 2);
+    resolve_prompt(cx, &view);
+    assert!(at(cx, "card-exit").is_some(), "it folds");
+    let pressed = at(cx, "allow-outline").expect("Allow, pressed, outlined");
+    assert!(at(cx, "card-exit").expect("folding").contains(&pressed.center()));
+    wait(cx, w, &view, 1000);
+    assert!(at(cx, "card-exit").is_none() && at(cx, "card").is_none(), "folded away");
+    crate::authorize::TEST_ALLOW.with(|c| c.set(None));
+}
+
 /// The card's keys: the window's focus (a click on the card), a frame for
 /// them to go live, and their arm's wait (real time: [`crate::app::Arm`]).
 fn card_keys(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
@@ -4159,6 +4183,27 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
         });
     });
     assert!(spins(cx) > sites, "the new call's glyph is on the layer");
+    // Exactly one, its row's (Shady #23 r2 L5): the call's lattice is on the
+    // layer once, and no site is drawn twice (whatever else the turn's start
+    // lit: the composer's cell, the rail's and the tab's).
+    let call = view.read_with(cx, |v, _| {
+        v.model.transcript.items().iter().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == "ui-batch-0")).map(|i| i.id)
+    });
+    let call = call.expect("the new call");
+    let row = VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("tool-row {call}"))).expect("its row");
+    let origins: Vec<(f32, f32)> = view.read_with(cx, |v, _| {
+        v.fx.sites()
+            .iter()
+            .filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_) | crate::motion::Beat::Lattice(_)))
+            .map(|s| (f32::from(s.origin.x), f32::from(s.origin.y)))
+            .collect()
+    });
+    let mut seen = origins.clone();
+    seen.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    seen.dedup();
+    assert_eq!(seen.len(), origins.len(), "no site twice: {origins:?}");
+    let mine = origins.iter().filter(|o| row.contains(&gpui_kit::point(px(o.0), px(o.1)))).count();
+    assert_eq!(mine, 1, "the new call's lattice, once: {origins:?} in {row:?}");
     let halt = VisualTestContext::from_window(w, cx).debug_bounds("halt").expect("HALT");
     drew(cx, "a hover", &mut |cx| {
         event(

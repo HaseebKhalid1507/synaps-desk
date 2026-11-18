@@ -297,22 +297,29 @@ mod tests {
 
     /// Allow's two styles both paint (the switch is one const in
     /// `authorize.rs`): the fill's label is `acc_ink` on the accent; the
-    /// outline's the accent on the card, in `acc_line`.
+    /// outline's the accent on the card, in `acc_line`. At rest, hovered and
+    /// pressed, in every theme and accent preset (Shady #23 r2 L1); pressed
+    /// is not rest.
     #[test]
     fn allow_paints_filled_or_outlined() {
         for (name, raw) in crate::palettes::THEMES {
-            let p = crate::theme::Palette::of(&crate::theme::resolve(&raw, None).0);
-            let lum = |c: gpui_kit::Hsla| crate::theme::luminance_hsla(c);
-            let con = |a, b| {
-                let (x, y) = (lum(a), lum(b));
-                (x.max(y) + 0.05) / (x.min(y) + 0.05)
-            };
-            for hovered in [false, true] {
-                let (bg, _, text) = AllowStyle::Fill.colors(&p, hovered, false);
-                assert!(con(text, bg) >= 4.45, "{name}: Allow's label on its fill");
-                let (bg, edge, text) = AllowStyle::Outline.colors(&p, hovered, false);
-                assert_eq!(edge, p.acc_line);
-                assert!(con(text, bg) >= 4.45, "{name}: Allow's outlined label");
+            for accent in [None, Some(0xe8132f), Some(0xf4b400), Some(0x2d7bff), Some(0x35f2ff)] {
+                let p = crate::theme::Palette::of(&crate::theme::resolve(&raw, accent).0);
+                let lum = |c: gpui_kit::Hsla| crate::theme::luminance_hsla(c);
+                let con = |a, b| {
+                    let (x, y) = (lum(a), lum(b));
+                    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+                };
+                for (hovered, pressed) in [(false, false), (true, false), (true, true)] {
+                    let (bg, _, text) = AllowStyle::Fill.colors(&p, hovered, pressed);
+                    assert!(con(text, bg) >= 4.45, "{name} {accent:?}: Allow's label on its fill ({hovered}, {pressed})");
+                    let (bg, edge, text) = AllowStyle::Outline.colors(&p, hovered, pressed);
+                    assert_eq!(edge, p.acc_line);
+                    assert!(con(text, bg) >= 4.45, "{name} {accent:?}: Allow's outlined label ({hovered}, {pressed})");
+                }
+                for style in [AllowStyle::Fill, AllowStyle::Outline] {
+                    assert_ne!(style.colors(&p, true, true).0, style.colors(&p, false, false).0, "{name} {accent:?}: {style:?} pressed shows");
+                }
             }
         }
     }
