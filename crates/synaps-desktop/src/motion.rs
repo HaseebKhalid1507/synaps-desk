@@ -375,22 +375,43 @@ pub(crate) fn grow_block(body: AnyElement, label: Option<(Div, f32)>, head: Opti
         .w_full()
         .flex()
         .flex_col()
-        .child(ClipY(clip.into_any_element()))
+        .child(ClipY(clip.into_any_element(), None))
         .children(label.map(|(l, top)| lift(l.top(px(top + g.travel)), g.strength)))
         .children(head)
         .into_any_element()
+}
+
+/// `el` clipped to its own top and bottom only (x is left to the parents):
+/// a box whose height is on a spring (the composer's growth, the dock).
+pub(crate) fn clip_y(el: AnyElement) -> AnyElement {
+    ClipY(el, None).into_any_element()
+}
+
+/// `el` laid out at its own height, drawn only down to `h` px under its
+/// top (a section's body as it unfolds: its place in the list is its own).
+pub(crate) fn clip_h(el: AnyElement, h: f32) -> AnyElement {
+    ClipY(el, Some(h)).into_any_element()
 }
 
 /// Its child, clipped to its own top and bottom and nothing else: a
 /// revealing row's gutter (the hanging labels, the write head, left of the
 /// row's box) stays drawn. GPUI's `overflow_*` clip x as well, whichever
 /// axis they hide. The list's own mask still bounds x.
-struct ClipY(AnyElement);
+struct ClipY(AnyElement, Option<f32>);
 
 impl ClipY {
     fn mask(b: Bounds<Pixels>) -> ContentMask<Pixels> {
         let wide = px(1.0e6);
         ContentMask { bounds: Bounds::from_corners(point(b.left() - wide, b.top()), point(b.right() + wide, b.bottom())) }
+    }
+
+    /// [`ClipY::mask`], down to its limit if it has one.
+    fn mask_of(&self, b: Bounds<Pixels>) -> ContentMask<Pixels> {
+        let mut m = Self::mask(b);
+        if let Some(h) = self.1 {
+            m.bounds.size.height = m.bounds.size.height.min(px(h.max(0.)));
+        }
+        m
     }
 }
 
@@ -433,7 +454,8 @@ impl Element for ClipY {
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_content_mask(Some(Self::mask(bounds)), |window| {
+        let mask = self.mask_of(bounds);
+        window.with_content_mask(Some(mask), |window| {
             self.0.prepaint(window, cx);
         });
     }
@@ -448,7 +470,8 @@ impl Element for ClipY {
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_content_mask(Some(Self::mask(bounds)), |window| self.0.paint(window, cx));
+        let mask = self.mask_of(bounds);
+        window.with_content_mask(Some(mask), |window| self.0.paint(window, cx));
     }
 }
 
@@ -2027,6 +2050,26 @@ impl Motion {
 
     pub(crate) fn birth(&self, id: u64) -> Option<Instant> {
         self.births.borrow().get(&id).copied()
+    }
+
+    /// Something small arriving in a row (a worker chip, polish.md P13),
+    /// `born` then (staggered: maybe still to come): its content's travel
+    /// from below ([`ARRIVE`] → 0 on `flick`) and its strength ([`LIFT`] →
+    /// 1 over `quick` `out`). Not born, or not fluid: at rest.
+    pub(crate) fn arrival(&self, born: Option<Instant>) -> (f32, f32) {
+        let Some(born) = born.filter(|_| self.fluid()) else { return (0., 1.) };
+        let Some(since) = self.now().checked_duration_since(born) else {
+            self.want_at(born);
+            return (ARRIVE, LIFT);
+        };
+        let t = since.as_secs_f32();
+        let travel = Spring::from_rest(ARRIVE, FLICK_RESPONSE, t);
+        let strength = LIFT + (1. - LIFT) * ease::OUT.sample((t / QUICK.as_secs_f32()).clamp(0., 1.));
+        if travel < FLUID_EPSILON && strength >= 1. {
+            return (0., 1.);
+        }
+        self.want_frame();
+        (travel, strength)
     }
 
     /// Row `key` is revealing: growing, or born too lately to have begun.

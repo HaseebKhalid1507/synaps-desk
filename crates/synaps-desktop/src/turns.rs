@@ -1288,13 +1288,21 @@ impl Layout {
     /// read the height, the text step and `ex` (the model's state) only:
     /// nothing they change feeds back.
     pub(crate) fn of(pane: f32, height: f32, m: &Metrics, ex: crate::fit::Extras) -> Self {
-        let tight = pane < 560.;
+        Self::of_in(pane, pane, height, m, ex)
+    }
+
+    /// [`Layout::of`] with the column laid out for a `wrap` px pane (its
+    /// width, the labels' hang, the tight gutter) and centred in `pane`:
+    /// while a side panel flies, `wrap` is the flight's narrowest pane, so
+    /// the rows keep their wrap and only the padding moves (fluid.md §3.8).
+    pub(crate) fn of_in(pane: f32, wrap: f32, height: f32, m: &Metrics, ex: crate::fit::Extras) -> Self {
+        let tight = wrap < 560.;
         let gutter = if tight { 16. } else { 24. };
-        let column = m.column.min(pane - 2. * gutter).max(200.).floor();
+        let column = m.column.min(wrap - 2. * gutter).max(200.).floor();
         let left = ((pane - column) / 2.).floor().max(0.);
         Layout {
             column,
-            hang: pane >= (672. + 200.) * m.r,
+            hang: wrap >= (672. + 200.) * m.r,
             tight,
             short: height < crate::fit::short_below(m),
             cramped: height < crate::fit::cramped_below(m, ex),
