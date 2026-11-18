@@ -1,5 +1,84 @@
 # Q3 Life: main vs Q3 (bella, headless gamescope)
 
+## Round 3 (`r3/`): the merged tree, main `9121dba`
+
+The harness is round 2's:
+- headless gamescope `-r 144`, 1920×1080, `--refresh-hz 144`;
+- one run at a time, each started after the 1-minute load average fell under 6;
+- `r3/run.sh` runs Q3 and main alternately: three `--bench-motion` runs each, then three `--bench` runs each.
+
+`r3/log` records the load and bella's swap use before and after every run. Swap stayed at 8.5–9.2 GB and never grew
+during a run. Every run's RSS at its end is above its idle RSS, so no run was paged out and none is skipped.
+
+- **main:** `9121dba`. Its tree is identical to `c81ab14`, and the binary is Q2's release build of that tree
+  (`synaps-desktop-hybrid.q2`, sha256 `e8ee38d9…`; provenance in `docs/img/q3/r3/README.md`).
+- **Q3 r3:** `699f1b2`, release build sha256 `b4fb51d4…`. Gate 5's like-for-like 5 × 5 sample is from the head
+  `f72f5ad` (`r3/q3r3g-*`), which adds only that sample.
+
+`--bench-motion`, presents / app frames / CPU ms per s:
+
+| case | main #1 | main #2 | main #3 | Q3 r3 #1 | Q3 r3 #2 | Q3 r3 #3 |
+|---|---|---|---|---|---|---|
+| `idle_10s` | 0 / 0 / 2.11 | 0 / 0 / 2.23 | 0 / 0 / 2.31 | 0 / 0 / 2.09 | 0 / 0 / 2.15 | 0 / 0 / 2.43 |
+| `beat` | 48 / 0 / 15.15 | 48 / 0 / 15.33 | 48 / 0 / 13.43 | 180 / 0 / 39.12 | 180 / 0 / 39.11 | 180 / 0 / 42.8 |
+| `beat_25_30s` | 240 / 0 / 14.94 | 240 / 0 / 15.81 | 240 / 0 / 14.06 | 900 / 0 / 49.73 | 900 / 0 / 46.5 | 900 / 0 / 46.81 |
+| `beat_motion_off` | 0 / 0 / 2.31 | 0 / 0 / 2.13 | 0 / 0 / 2.43 | 0 / 0 / 3.08 | 0 / 0 / 2.45 | 0 / 0 / 2.8 |
+| `idle_10s_after_beat` | 0 / 0 / 1.96 | 0 / 0 / 2.42 | 0 / 0 / 2.43 | 0 / 0 / 2.46 | 0 / 0 / 2.33 | 0 / 0 / 2.16 |
+| `idle_30s_prompt` | 0 / 0 / 2.35 | 0 / 0 / 2.18 | 0 / 0 / 1.84 | 0 / 0 / 2.03 | 0 / 0 / 2.19 | 0 / 0 / 2.18 |
+| `held_drain_10s` | 20 / 20 / 9.91 | 20 / 20 / 11.14 | 20 / 20 / 8.45 | 20 / 20 / 8.05 | 20 / 20 / 9.03 | 20 / 20 / 7.52 |
+| `load_5x5_30s` | 240 / 30 / 18.94 | 240 / 30 / 18.02 | 240 / 30 / 17.12 | 240 / 30 / 18.29 | 240 / 30 / 18.93 | 240 / 30 / 19.63 |
+| `load_5x5_sweep_30s` | n/a | n/a | n/a | 900 / 30 / 49.24 | 900 / 30 / 50.05 | 900 / 30 / 47.85 |
+| `load_5x5_fanout_30s` | n/a | n/a | n/a | 986 / 805 / 117.78 | 975 / 804 / 121.51 | 970 / 803 / 121.58 |
+| `load_5x5_fanout_tools_30s` | n/a | n/a | n/a | 968 / 808 / 121.16 | 981 / 811 / 121.9 | 980 / 809 / 117.51 |
+
+**Gate 3 (idle = 0 presents): pass.** `idle_30s_prompt` gives 0 presents and 0 app frames in all six runs, and the JSON
+shows `prompt_pending: true` and `demoted_worker: true`.
+
+**Gate 4, no sweep: pass.** `load_5x5_30s` gives 240 presents in 30 s (8/s) at 18.3–19.6 ms/s. Main does the same scene
+at 17.1–18.9.
+
+**Gate 4, the composer sweeping over the 5 × 5: pass.** `load_5x5_sweep_30s` gives 900 presents in 30 s (30/s) at
+47.9–50.1 ms/s (4.8–5.0 % of a core). App frames are 30 in 30 s, so the rest are beat-layer paints. The JSON shows
+`sweeps: 1`, `state: Running` and 18 sites.
+
+**Gate 4 with P5 rolls from a live fan-out (Shady R2-M1): FAIL, 11.8–12.2 % of a core.**
+- **The scene, `load_5x5_fanout_30s`:** the sweep scene, plus the shown session's five workers each calling a tool every
+  1.5 s, staggered (one change every 0.3 s, 100 in 30 s). Each change moves a worker's tool count and its step, and
+  both roll.
+  - 970–986 presents in 30 s (32–33/s): the 30 Hz grid, plus the changes' own frames.
+  - 803–805 app frames.
+  - **117.8–121.6 ms/s.**
+- **The live line isn't the cost.** In `load_5x5_fanout_tools_30s` the step is held, so the live line never changes and
+  only the tool count rolls. It gives 968–981 presents, 808–811 app frames and **117.5–121.9 ms/s**, the same.
+  - The cost is the count rolls' app frames: about 27 a second (a roll is about 200 ms of 30 Hz app frames, and the
+    rolls overlap).
+  - Stopping the live line's roll would change nothing, so it is not done.
+- **Round 3 already moved rolls to the 30 Hz grid** (`b1e3c17`). Before that (`de95f1c`, one run, not kept in `r3/`)
+  they ran at the display's rate: **259.7 / 261.9 ms/s** (3,347 presents and 3,101 app frames in 30 s).
+- **Estimate, not measured:** with no rolls at all, the same changes would cost about the sweep scene's 49 ms/s plus one
+  app frame per change. That is about 3.3/s at the roughly 3 ms per app frame of `held_drain_10s`, so around 59 ms/s,
+  right at the gate.
+
+**Clocks:** exactly 30 app frames in 30 s in `load_5x5_30s` (all six runs) and in `load_5x5_sweep_30s` (Q3's three).
+
+**Gate 5, memory** (GPU-driver mappings apart, KiB, anon / USS):
+- **After 2,000 rows of history** (`--bench` `mem_end`, three runs each, alternating):
+  - main: 93,892 / 126,104, 93,784 / 126,372, 93,452 / 125,840;
+  - Q3: 93,260 / 125,600, 93,868 / 126,304, 93,788 / 126,240;
+  - **means: anon −0.07 %, USS −0.05 %. Pass.** Streaming ran at 142.7–143.1 fps on main and 143.3–143.5 on Q3.
+- **After the 5 × 5** (`--bench-motion`): main's `mem_end` is taken right after `load_5x5_30s`, where its script ends.
+  Q3's `mem_end` comes after another 90 s of Q3-only cases (the sweep scene and both fan-outs), so it is not
+  comparable: 64,108–65,988 anon against main's 57,396–57,496. The like-for-like sample, `mem_after_load_5x5`, taken
+  at the same point (`f72f5ad`, three runs, after main's three):
+  - main `mem_end`: 57,396 / 90,692, 57,496 / 89,988, 57,480 / 90,752;
+  - Q3 `mem_after_load_5x5`: 59,148 / 94,032, 58,952 / 94,468, 58,572 / 94,544;
+  - **means: anon +2.5 %, USS +4.3 %. Both are within +5 %: pass.** Two caveats:
+    - these Q3 runs (`r3/run-mem.sh`, `r3/log-q3r3g`) ran after main's three, not alternating with them;
+    - their USS at idle, before any scene, was already 4.5 MB over both main's and Q3 `699f1b2`'s (64,080–64,828
+      against 59,736–60,560), with anon equal (30,096–30,240). From idle to after the 5 × 5, USS grew 29,968 on Q3
+      and 30,620 on main, so the USS gap is that idle offset (private file-backed pages of this build's runs), not
+      growth. Anon grew 1,452 KiB more on Q3 (+5 % of the growth, +2.5 % of the total).
+
 ## Round 2 (`r2/`): the per-row sweeps cut
 
 Harness as below: headless gamescope `-r 144`, 1920×1080, `--refresh-hz 144`, one run at a time, each after the 1-minute
