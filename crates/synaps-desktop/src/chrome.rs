@@ -149,6 +149,10 @@ pub(crate) struct RailCache {
     /// Each item kind's height as last laid out: a section unfolding
     /// whose rows' kind is on screen nowhere else.
     kind_h: HashMap<u8, f32>,
+    /// A fold under way, as last drawn: its head, the first item after
+    /// it, and `o` (what follows is drawn `o` from its place). A splice
+    /// then measures from where things were drawn, not laid out (R2-L2).
+    pub(crate) riding: Option<(usize, usize, f32)>,
 }
 
 /// A section folding or unfolding in the rail (fluid.md §3.7, polish.md
@@ -165,7 +169,44 @@ pub(crate) struct Fold {
     pub(crate) heights: Vec<f32>,
     pub(crate) from: f32,
     pub(crate) o: f32,
-    pub(crate) ghost: Option<std::rc::Rc<(Rail, std::ops::Range<usize>)>>,
+    pub(crate) ghost: Option<std::rc::Rc<Ghost>>,
+}
+
+/// A folding section's body as it was ([`Fold`]): drawn under its head as
+/// what follows rises over it.
+#[derive(Debug)]
+pub(crate) struct Ghost {
+    pub(crate) rail: Rail,
+    pub(crate) body: std::ops::Range<usize>,
+    /// Each body item: whether it stays (a folded FAVOURITES keeps the
+    /// favourites that run or need you), and its height.
+    pub(crate) items: Vec<(bool, f32)>,
+}
+
+impl Ghost {
+    /// What stays, in all.
+    pub(crate) fn kept(&self) -> f32 {
+        self.items.iter().filter(|i| i.0).map(|i| i.1).sum()
+    }
+
+    /// Each body item's height shown with `o` px of what goes left: what
+    /// stays whole, what goes top down (the last goes first, under what
+    /// rises; one that stays rises with it once it reaches it). All of it
+    /// going: the body clipped at `o`, the unfold's reveal backwards.
+    pub(crate) fn shown(&self, o: f32) -> Vec<f32> {
+        let mut left = o.max(0.);
+        self.items
+            .iter()
+            .map(|&(kept, h)| {
+                if kept {
+                    return h;
+                }
+                let s = left.min(h);
+                left -= s;
+                s
+            })
+            .collect()
+    }
 }
 
 impl Fold {
@@ -294,7 +335,11 @@ impl PanelFx {
     /// on `response` (`sheet` for a fold or a reset, `snap` to a detent).
     pub(crate) fn fly(&mut self, rail: bool, response: f32, slide: bool) {
         let f = &mut self.sides[usize::from(!rail)];
-        f.from = Some(f.shown);
+        // In flight already (a reversal): it turns from where it is, with
+        // its velocity (fluid.md §2.1, Shady N2): only the target moves.
+        if !f.moving {
+            f.from = Some(f.shown);
+        }
         f.start = f.shown;
         f.response = response;
         f.slide = slide;
@@ -403,8 +448,23 @@ impl RailCache {
                     .map(|(y, hs)| y + hs.iter().sum::<f32>());
                 let from = old_end.zip(new_end).map(|(o, n)| o - n);
                 let from = if count > range.len() { from.or(heights.as_ref().map(|h| -h.iter().sum::<f32>())) } else { from };
-                // Folding to its head alone: the body it had goes under it.
-                let ghost = (count == 1 && range.len() > 1).then(|| std::rc::Rc::new((self.rail.clone(), range.start + 1..range.end)));
+                // A reversal mid-fold (a double click on the head): from
+                // where what follows was drawn, its `o` with it (R2-L2).
+                let from = from.map(|f| f + self.riding.filter(|r| r.0 == range.start).map_or(0., |r| r.2));
+                // Folding (to its head, or to the favourites it keeps): the
+                // body it had goes under it, what stays in it whole.
+                let body = range.start + 1..range.end;
+                let stays: Vec<u64> = keys.get(range.start + 1..after).map(<[u64]>::to_vec).unwrap_or_default();
+                let items: Option<Vec<(bool, f32)>> = body
+                    .clone()
+                    .map(|ix| {
+                        let o = old.get(ix)?;
+                        o.2.map(|g| g.1).or_else(|| self.kind_h.get(&o.1).copied()).map(|h| (stays.contains(&o.0), h))
+                    })
+                    .collect();
+                let ghost = items
+                    .filter(|it| range.len() > count && count >= 1 && it.iter().filter(|i| i.0).count() == stays.len())
+                    .map(|items| std::rc::Rc::new(Ghost { rail: self.rail.clone(), body, items }));
                 folded = from.filter(|f| f.abs() >= 0.5).map(|from| Fold {
                     start: range.start,
                     after,
@@ -423,7 +483,9 @@ impl RailCache {
                     break;
                 }
                 if let Some(k) = flip_key(&self.rail, ix).filter(|_| !fold) {
-                    flip_from.push((k, y));
+                    // Riding a fold: where it was drawn (R2-L2).
+                    let o = self.riding.filter(|r| ix >= r.1).map_or(0., |r| r.2);
+                    flip_from.push((k, y + o));
                 }
             }
             let start = range.start;
@@ -444,6 +506,7 @@ impl RailCache {
             fold: false,
             folded,
             kind_h: std::mem::take(&mut self.kind_h),
+            riding: self.riding,
         };
     }
 }
@@ -863,6 +926,7 @@ impl AppView {
             out.tail.clear();
             out.ghost_at = None;
         }
+        let riding = out.fold.as_ref().map(|f| (f.start, f.after, f.o));
         for (key, from) in std::mem::take(&mut self.rail.flip_from) {
             if let Some((y, _, _)) = ix_of(key).and_then(|ix| item_y(list, ix))
                 && (from - y).abs() >= 0.5
@@ -930,6 +994,7 @@ impl AppView {
             out.readout_dy = fx.spring_held(READOUT_Y, y, snap).0 - y;
         }
         self.rail_fx = out;
+        self.rail.riding = riding;
     }
 
     /// The drag handle on a side panel's inner edge (`rail`, else the right
@@ -1375,12 +1440,17 @@ impl AppView {
                 drawn.push((rows.into_any_element(), y, view_h));
             }
         } else if let Some(g) = f.ghost.as_ref() {
-            // Its head's foot (where what follows is laid out).
-            let at = place(f.start).map(|(t, h)| t + h).or_else(|| place(f.after).map(|(t, _)| t));
-            if let Some(y) = at.filter(|&y| y < view_h && y + f.o > 0.) {
-                let rows = v_flex().w_full().children(g.1.clone().map(|ix| self.render_rail_item_in(&g.0, ix, cx)));
-                drawn.push((crate::motion::clip_h(rows.into_any_element(), f.o), y, y + f.o));
-                ghost_at = Some((y, f.o, g.1.len()));
+            // Its head's foot, down to what follows (laid out under what
+            // stays, drawn `o` lower).
+            let at = place(f.start).map(|(t, h)| t + h).or_else(|| place(f.after).map(|(t, _)| t - g.kept()));
+            let h = g.kept() + f.o;
+            if let Some(y) = at.filter(|&y| y < view_h && y + h > 0.) {
+                let shown = g.shown(f.o);
+                let rows = v_flex()
+                    .w_full()
+                    .children(g.body.clone().zip(shown).map(|(ix, s)| crate::motion::clip_h(self.render_rail_item_in(&g.rail, ix, cx), s)));
+                drawn.push((crate::motion::clip_h(rows.into_any_element(), h), y, y + h));
+                ghost_at = Some((y, h, g.body.len()));
             }
         }
         self.rail_fx.tail = tail;
@@ -1413,6 +1483,12 @@ impl AppView {
         // shows down to it (clipped, never squeezed).
         let el = match self.rail_fx.fold.as_ref() {
             Some(f) if ix >= f.after => div().w_full().relative().top(px(f.o)).child(el).into_any_element(),
+            // What a fold keeps is drawn in the body going (its ghost)
+            // until it lands: here, its place held (its height as it was).
+            Some(Fold { ghost: Some(g), start, .. }) if ix > *start => {
+                let h = g.items.iter().filter(|i| i.0).nth(ix - start - 1).map_or(0., |i| i.1);
+                div().w_full().h(px(h)).into_any_element()
+            }
             Some(f) => match f.shown(ix) {
                 Some(h) => crate::motion::clip_h(el, h),
                 None => el,

@@ -6324,13 +6324,20 @@ impl Render for AppView {
         // The panels as drawn, on their springs (fluid.md §3.8); while one
         // moves, the column keeps the wrap of the flight's narrowest pane.
         let (rail_w, right_w) = self.panel_frame(rail, right);
-        let pane = (self.width - crate::chrome::MARK - rail_w - right_w).max(0.);
-        let pane_to = (self.width - crate::chrome::MARK - rail.width() - right.width()).max(0.);
+        // In device pixels, one division, as the layout rounds the pane's
+        // box (R2-M1): at 125/150/175 % three widths each divided apart
+        // differ from it in the last bit, frame to frame, and the list
+        // would forget its heights as at a fractional width.
+        let s = window.scale_factor();
+        let dp = |v: f32| (v * s).round();
+        let pane_of = |less: &[f32]| ((dp(self.width) - less.iter().map(|&v| dp(v)).sum::<f32>()) / s).max(0.);
+        let pane = pane_of(&[crate::chrome::MARK, rail_w, right_w]);
+        let pane_to = pane_of(&[crate::chrome::MARK, rail.width(), right.width()]);
         self.panel_fx.freeze = self.panel_fx.moving().then(|| self.panel_fx.freeze.unwrap_or(pane).min(pane).min(pane_to));
         let wrap = self.panel_fx.freeze.unwrap_or(pane);
         // A view is not a session: no right panel (it describes one); the
         // pane takes its width. The session's column keeps its layout.
-        let view_pane = (self.width - crate::chrome::MARK - rail_w).max(0.);
+        let view_pane = pane_of(&[crate::chrome::MARK, rail_w]);
         // Its height under the full top bar, whatever bar is drawn.
         if self.top_words.is_none() {
             let words = crate::chrome::top_words(window);
@@ -6487,7 +6494,8 @@ impl Render for AppView {
         // Over the list's right padding, after its layout (and the hold-back's).
         let layer = self.layer_now();
         let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.scroller.clone(), self.fx.clone()));
-        let transcript_bar = crate::scrollbar::rows_gliding(&self.list, pad_t + pad_b, &self.bars.transcript, glide).always();
+        let transcript_bar =
+            crate::scrollbar::rows_gliding(&self.list, pad_t + pad_b, &self.bars.transcript, glide).always().still(self.drag.is_some());
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
         // the end of a scrolled-back list set it following; it stops 2 px
         // short of the end instead, still scrolled back. Built only on the
