@@ -33,6 +33,14 @@ pub const FEATURE_OWNED_SESSIONS: &str = "owned_sessions";
 pub const FEATURE_SAVED_SESSIONS: &str = "saved_sessions";
 /// Most entries a `SavedSessions` asks for (the client clamps to it).
 pub const SAVED_SESSIONS_MAX: u32 = 1000;
+/// `Welcome.features` entry: the daemon answers `CatalogPage` (saved
+/// sessions as `SessionMeta` rows with `lifecycle: "saved"`, paged; the
+/// watch-sessions replacement of `saved_sessions`). An older daemon
+/// answers the frame with `Error{unknown variant}`.
+pub const FEATURE_SESSION_PAGE: &str = "session_page";
+/// The most rows one `CatalogPage` returns (`wire::CATALOG_PAGE_MAX_LIMIT`;
+/// the client clamps to it).
+pub const CATALOG_PAGE_MAX: u32 = 200;
 /// The daemon's `Error` for a create whose `cwd` is relative or missing on
 /// the daemon's machine (`daemon/conn.rs`: `format!("cwd must be an
 /// absolute existing directory: {}", cwd.display())`, then `Bye`). Nothing
@@ -67,6 +75,19 @@ pub enum ClientFrame {
         named_only: bool,
         limit: u32,
     },
+    /// Control fast path: one page of the saved sessions (not held by the
+    /// daemon), newest `updated_at` first. `before` (exclusive) continues
+    /// from a reply's `next`. Only to a daemon that lists
+    /// [`FEATURE_SESSION_PAGE`]. Reply: `CatalogPage` with the same `req`
+    /// (not necessarily in order: the daemon serves pages as tasks).
+    CatalogPage {
+        req: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        before: Option<CatalogCursor>,
+        limit: u32,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        named_only: bool,
+    },
     /// Control fast path: name (`Some`) or unname (`None`) a live or parked
     /// session (`/saveas` rules). `expect`: absent = replace any name,
     /// `Some(None)` = only if unnamed, `Some(Some(x))` = only if named `x`.
@@ -95,6 +116,13 @@ impl std::fmt::Debug for ClientFrame {
             Self::SavedSessions { named_only, limit } => {
                 f.debug_struct("SavedSessions").field("named_only", named_only).field("limit", limit).finish()
             }
+            Self::CatalogPage { req, before, limit, named_only } => f
+                .debug_struct("CatalogPage")
+                .field("req", req)
+                .field("before", before)
+                .field("limit", limit)
+                .field("named_only", named_only)
+                .finish(),
             Self::Rename { session_id, name, expect } => {
                 f.debug_struct("Rename").field("session_id", session_id).field("name", name).field("expect", expect).finish()
             }
@@ -462,6 +490,17 @@ pub enum DaemonFrame {
         truncated: bool,
         rejected: usize,
     },
+    /// Reply to `CatalogPage` (same `req`). `sessions`: saved rows, newest
+    /// first; `next`: the cursor of the following page, `None` at the end;
+    /// `rejected`: rows that did not decode (skipped, the page is kept);
+    /// `error`: the page could not be served (`sessions` is empty).
+    CatalogPage {
+        req: u64,
+        sessions: Vec<SessionMeta>,
+        next: Option<CatalogCursor>,
+        rejected: usize,
+        error: Option<String>,
+    },
     /// Reply to `Rename`: the session's name is now `name` (`None`: cleared).
     Renamed {
         session_id: String,
@@ -519,6 +558,16 @@ enum RawFrame {
         #[serde(default)]
         truncated: bool,
     },
+    CatalogPage {
+        #[serde(default)]
+        req: u64,
+        #[serde(default, deserialize_with = "null_vec")]
+        sessions: Vec<Value>,
+        #[serde(default)]
+        next: Option<CatalogCursor>,
+        #[serde(default)]
+        error: Option<String>,
+    },
     Renamed {
         session_id: String,
         #[serde(default)]
@@ -569,6 +618,10 @@ pub fn decode_frame(line: &str) -> Result<DaemonFrame, String> {
                 let (sessions, rejected) = lenient(sessions);
                 DaemonFrame::SavedSessionList { sessions, truncated, rejected }
             }
+            RawFrame::CatalogPage { req, sessions, next, error } => {
+                let (sessions, rejected) = lenient(sessions);
+                DaemonFrame::CatalogPage { req, sessions, next, rejected, error }
+            }
             RawFrame::Renamed { session_id, name, in_memory_only } => DaemonFrame::Renamed { session_id, name, in_memory_only },
             RawFrame::RenameFailed(f) => DaemonFrame::RenameFailed(f),
             RawFrame::Bye { reason } => DaemonFrame::Bye(reason),
@@ -589,6 +642,7 @@ pub fn decode_frame(line: &str) -> Result<DaemonFrame, String> {
                 "event",
                 "error",
                 "saved_session_list",
+                "catalog_page",
                 "renamed",
                 "rename_failed",
                 "bye",
@@ -662,6 +716,15 @@ fn one() -> u64 {
     1
 }
 
+/// A position in the saved-session order (`wire::CatalogCursor`):
+/// `updated_at` descending, then `id` descending. Opaque to the client: a
+/// reply's `next` goes back as the next request's `before`, unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogCursor {
+    pub updated_at: String,
+    pub id: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct SessionMeta {
     pub id: String,
@@ -732,6 +795,10 @@ pub struct SessionMeta {
     /// read (it never fails the attach).
     #[serde(default, deserialize_with = "lenient_continue_info")]
     pub continue_info: Option<ContinueInfo>,
+    /// RFC 3339: the conversation's last save. Set on saved rows
+    /// (`CatalogPage`); held rows omit it.
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 /// `SessionMeta.continue_info` (the daemon's `ContinueInfoWire`, v0.11.1):
@@ -803,6 +870,29 @@ impl SessionMeta {
 
     pub fn is_parked(&self) -> bool {
         self.lifecycle == "parked"
+    }
+
+    /// A saved row (`CatalogPage`): on disk, not held by the daemon. Held
+    /// sessions (live, parked) come from `Sessions` and never are.
+    pub fn is_saved(&self) -> bool {
+        self.lifecycle == "saved"
+    }
+
+    /// This saved row as a `saved_sessions` entry (`live: false`), for a
+    /// client that already draws those. The id is the journal's.
+    pub fn to_saved(&self) -> SavedSession {
+        let id = if self.journal_id.is_empty() { self.id.clone() } else { self.journal_id.clone() };
+        SavedSession {
+            id,
+            name: self.name.clone(),
+            title: self.title.clone().filter(|t| !t.is_empty()),
+            model: Some(self.model.clone()).filter(|m| !m.is_empty()),
+            cwd: self.cwd.clone(),
+            created_at: Some(self.created_at.clone()).filter(|c| !c.is_empty()),
+            updated_at: self.updated_at.clone(),
+            message_count: Some(self.messages as u64),
+            live: false,
+        }
     }
 
     /// Background workers running, from whichever field the daemon sends:
