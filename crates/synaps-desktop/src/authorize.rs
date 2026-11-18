@@ -1073,9 +1073,12 @@ impl AppView {
             (false, Some(_)) => "Run this command?",
             (false, None) => "Allow this?",
         };
-        // Whole-pixel line heights: the text's own (1.5 × its size) is a
-        // half pixel at 15 or 13, and a card a half pixel tall puts every
-        // row under it, and the following list's end, off the pixel grid.
+        // Whole-pixel line heights on every text that sets a row's height
+        // (the title, "asked", the folder, "allow all", the footer): the
+        // text's own (1.5 × its size) is a half pixel at 15 or 13, and a
+        // card a half pixel tall puts every row under it, and the
+        // following list's end, off the pixel grid (CI's runners land an
+        // f32 ulp off where bella's content summed exactly).
         let line = |size: f32| px((size * 1.5).round());
         let header = h_flex()
             .flex_none()
@@ -1151,6 +1154,7 @@ impl AppView {
                     div()
                         .font_family(fonts::SANS)
                         .text_px(m.meta)
+                        .line_height(line(m.meta))
                         .whitespace_nowrap()
                         .text_color(if allow_all { p.prose_t } else { p.dim_t })
                         .child(text),
@@ -1171,6 +1175,7 @@ impl AppView {
                 .whitespace_nowrap()
                 .font_family(fonts::SANS)
                 .text_px(m.meta)
+                .line_height(line(m.meta))
                 .text_color(if footer_warn { p.warn } else { p.dim_t })
                 .debug_selector(|| "card-footer".into())
                 .child(f)

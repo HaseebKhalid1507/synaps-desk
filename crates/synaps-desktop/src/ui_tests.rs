@@ -3923,6 +3923,18 @@ fn every_row_rests_on_whole_pixels(cx: &mut TestAppContext) {
             assert!(frac.is_empty(), "text {text} at {width}: rows off the pixel grid {frac:?}");
             let card = VisualTestContext::from_window(w, cx).debug_bounds("card").expect("the demo's card");
             assert_eq!(f32::from(card.size.height).fract(), 0., "text {text} at {width}: the card {card:?}");
+            // A turn running: the card says so in its footer (the state
+            // `follow_offset_is_end_every_frame` starts from).
+            start_stream(cx, &view);
+            settle(cx, w, 8);
+            assert!(VisualTestContext::from_window(w, cx).debug_bounds("card-footer").is_some(), "text {text}: the card's footer");
+            let frac = view.read_with(cx, |v, _| {
+                (0..v.list.item_count())
+                    .filter_map(|ix| v.list.bounds_for_item(ix).map(|b| (ix, v.disp.get(ix).map(|d| d.kind), f32::from(b.size.height))))
+                    .filter(|r| r.2.fract() != 0.)
+                    .collect::<Vec<_>>()
+            });
+            assert!(frac.is_empty(), "text {text} at {width}, a turn running: rows off the pixel grid {frac:?}");
         }
     }
 }
