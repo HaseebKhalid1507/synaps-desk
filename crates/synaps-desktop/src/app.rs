@@ -189,6 +189,8 @@ pub(crate) const HANDOFF_LIT: f32 = 0.6;
 /// How long a rename asked for another session waits for its attach.
 pub(crate) const RENAME_WAIT: Duration = Duration::from_secs(10);
 /// The chord that answers a card yes ([`card_key`]), as its button shows it.
+// Q2's, kept while its tests stand: Cards D retires it (cards4/proposal.md §5, C2, C13).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const YES_KEY: &str = if cfg!(target_os = "macos") { "⌘ENTER" } else { "CTRL+ENTER" };
 /// A folded side panel's strip.
 pub(crate) const STRIP: f32 = 32.;
@@ -1564,6 +1566,9 @@ pub struct AppView {
     pub(crate) card_presses: u32,
     /// What the card's last frame showed ([`CardLook`]).
     pub(crate) card_look: std::cell::RefCell<CardLook>,
+    /// Cards D: how long each call that finished while watched took (its
+    /// row's facts; a call from history has no measured duration), by item id.
+    pub(crate) took: std::cell::RefCell<HashMap<u64, Duration>>,
     /// The card was on screen last frame (not behind a worker's view,
     /// Settings or Usage): one coming back waits again ([`Arm`]).
     card_was_up: bool,
@@ -2166,6 +2171,7 @@ impl AppView {
             #[cfg(test)]
             card_presses: 0,
             card_look: Default::default(),
+            took: Default::default(),
             card_was_up: false,
             tray: crate::tray::TrayCache::default(),
             tray_due: None,
@@ -4002,7 +4008,7 @@ impl AppView {
         if on_screen && self.fx.fluid() && !c.height.get().is_nan() {
             let to = if own && line { crate::authorize::receipt_line(&theme::metrics(cx)) } else { 0. };
             let look = self.card_look.borrow().clone();
-            self.card_exit = Some(CardExit { card: c, look, at: fx_now, session: sid, after, to, sink: Rc::new(Cell::new(f32::NAN)) });
+            self.card_exit = Some(CardExit { card: c, look, at: fx_now, session: sid, after, to, sink: Rc::new(Cell::new(f32::NAN)), answer });
         }
     }
 
@@ -4441,6 +4447,7 @@ impl AppView {
                         self.summaries.clear();
                         self.toggled.clear();
                         self.open_runs.clear();
+                        self.took.borrow_mut().clear();
                     }
                 }
                 sp.start
@@ -4680,7 +4687,7 @@ impl AppView {
         let rows = &self.rows;
         let day = |i: usize| rows.get(i).and_then(|r| r.time.as_ref()).map(crate::times::Stamp::day);
         let new = turns::build(items, &day, start, shown.busy(), &self.open_runs, self.model.shown_subagents());
-        let new = crate::authorize::with_prompts(new, &prompts, start);
+        let new = crate::cards::mark_edges(crate::authorize::with_prompts(new, &prompts, start));
         self.summaries.update(&new, items, &self.rows);
         let at = self.disp.partition_point(|d| d.item < start);
         if let Some((range, count)) = turns::diff(&self.disp[at..], &new) {
@@ -4691,11 +4698,11 @@ impl AppView {
         debug_assert!(
             items.len() > 2_000
                 || self.disp
-                    == crate::authorize::with_prompts(
+                    == crate::cards::mark_edges(crate::authorize::with_prompts(
                         turns::build(items, &day, 0, shown.busy(), &self.open_runs, self.model.shown_subagents()),
                         &prompts,
                         0
-                    )
+                    ))
         );
     }
 
@@ -5700,7 +5707,6 @@ pub(crate) fn tbtn(id: &'static str, text: &'static str, color: Hsla, hover: Hsl
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fill {
     Btn,
-    Warn,
 }
 
 impl Fill {
@@ -5708,7 +5714,6 @@ impl Fill {
     fn roles(self, p: &Palette) -> (Hsla, Hsla) {
         match self {
             Fill::Btn => (p.btn_fill, p.btn_hi),
-            Fill::Warn => (p.warn_fill, p.warn_hi),
         }
     }
 
@@ -5717,7 +5722,6 @@ impl Fill {
     fn press(self, p: &Palette) -> Hsla {
         match self {
             Fill::Btn => p.btn_press,
-            Fill::Warn => p.warn_press,
         }
     }
 }
@@ -5755,47 +5759,6 @@ pub(crate) fn fbtn_key(
         .when(!enabled, |d| d.child(div().absolute().inset_0().border_1().border_color(p.edge)))
         .child(display(text, m.label, fg))
         .when_some(key, |d, k| d.child(mono(k, m.meta, fg)))
-}
-
-/// [`fbtn_key`], disabled, its fill charging: `charge` of 10 cells lit in
-/// `fill`, left to right (motion.md §6.3). No charge: [`fbtn_key`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fbtn_charge(
-    id: &'static str,
-    text: &'static str,
-    key: Option<&'static str>,
-    enabled: bool,
-    charge: Option<u32>,
-    fill: Fill,
-    p: &Palette,
-    m: &Metrics,
-) -> Stateful<Div> {
-    let Some(n) = charge.filter(|_| !enabled) else { return fbtn_key(id, text, key, enabled, fill, p, m) };
-    // Drawn as a disabled button is (its `edge` outline, a `dim` label),
-    // the charge a meter along its foot inside the outline: 10 cells of
-    // the fill, 3 px, lit left to right. Under the label it would take the
-    // disabled label's contrast (motion.md §10 amendment 2).
-    let lit = fill.roles(p).0;
-    let cells = h_flex()
-        .absolute()
-        .left(px(1.))
-        .right(px(1.))
-        .bottom(px(1.))
-        .h(px(3.))
-        .gap(px(1.))
-        .children((0..10).map(|i| div().flex_1().h_full().when(i < n, |d| d.bg(lit))));
-    div()
-        .id(id)
-        .relative()
-        .h(px(crate::fit::button_h(m)))
-        .px(px(16.))
-        .flex()
-        .flex_none()
-        .gap(px(10.))
-        .items_center()
-        .child(div().absolute().inset_0().border_1().border_color(p.edge))
-        .child(cells)
-        .child(display(text, m.label, p.dim))
 }
 
 pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subagents::Subagents) -> RowCache {

@@ -1738,7 +1738,9 @@ fn the_answered_card_collapses_in_its_row(cx: &mut TestAppContext) {
             v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Breath(_)) && b.contains(&s.origin)).count()
         })
     };
-    assert_eq!(in_card(cx, live), 1, "the live card's glyph breathes on the beat layer");
+    // Cards D (cards4/proposal.md §8 #8, an intended change): the card asks
+    // once, its dot pings; nothing on it breathes.
+    assert_eq!(in_card(cx, live), 0, "the live card holds still on the beat layer");
     // The live card takes a press (the control for the collapsing one below).
     click_at(cx, w, live.center());
     assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the live card took the press");
@@ -2518,13 +2520,13 @@ fn running_tools(cx: &mut TestAppContext, view: &Entity<AppView>, n: usize) {
     cx.run_until_parked();
 }
 
-/// Q1 cards (polish.md §2.1, F1): a tool row is bare on the canvas. Its
-/// box reaches into the gutter for its status glyph (the hover fill takes
-/// the glyph in) and stops where the AGENT label ends; its verb starts on
-/// the prose column. A failed call opens on its well, at the verb column
-/// to the column's end.
+/// Cards D (cards4/proposal.md §3, an intended change to Q1's bare row):
+/// a tool row sits in its run's card, the column wide less the card's
+/// hairline and 3 px inset, 34 px tall, its life glyph inside it; its
+/// AGENT label hangs left of the card. A failed call opens on its well at
+/// the verb column (36 px in), to the row's padding.
 #[gpui_kit::test]
-fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
+fn a_tool_row_sits_in_its_runs_card(cx: &mut TestAppContext) {
     use synaps_client::protocol::{LlmEvent, StreamEvent};
     let (w, view, _events) = open_at(cx, (2200., 1400.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
@@ -2546,7 +2548,7 @@ fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
         (id, v.layout, crate::theme::metrics(cx))
     });
     assert!(lay.hang, "2200 px: the labels hang");
-    let geo = crate::turns::Geo::of(lay, &m);
+    let g = crate::cards::Geo::of(&m);
     let bounds = |cx: &mut TestAppContext, what: &'static str| {
         view.update(cx, |_, cx| cx.notify());
         cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
@@ -2554,17 +2556,13 @@ fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
         VisualTestContext::from_window(w, cx).debug_bounds(what)
     };
     let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the running call's row");
-    assert_eq!(f32::from(row.size.width), lay.column + geo.out, "the column and {} of the gutter", geo.out);
-    assert_eq!(row.size.height, gpui_kit::px(m.row), "one row");
-    let column = f32::from(row.left()) + geo.out;
-    let status = bounds(cx, leak(format!("tool-status {id}"))).expect("the status glyph's column");
-    assert!(
-        f32::from(status.left()) >= f32::from(row.left()) && f32::from(status.right()) <= column,
-        "{status:?}: in the gutter, inside the row's box"
-    );
-    // Its AGENT label ends where the row's box starts.
+    assert_eq!(f32::from(row.size.width), lay.column - 2. - 2. * g.inset, "the column less the card's edge and inset");
+    assert_eq!(row.size.height, gpui_kit::px(g.row), "one row");
+    let status = bounds(cx, leak(format!("tool-status {id}"))).expect("the status glyph");
+    assert!(f32::from(status.left()) >= f32::from(row.left()) + g.pad - 0.5 && status.right() <= row.right(), "{status:?}: inside the row");
+    // Its AGENT label hangs left of the card.
     let label = bounds(cx, leak(format!("hang-label-{id}"))).expect("the call's AGENT label");
-    assert!(label.right() <= row.left(), "the hover fill stops at the label: {label:?} {row:?}");
+    assert!(label.right() <= row.left(), "the label hangs outside the card: {label:?} {row:?}");
     view.update(cx, |v, cx| {
         v.model.transcript.apply(&SessionEvent::Stream {
             event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "Tool execution failed: boom".into() }),
@@ -2581,10 +2579,10 @@ fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
     assert_eq!(failed, Some(synaps_client::transcript::ToolStatus::Failed));
     let well = bounds(cx, leak(format!("well {id}"))).expect("a failed call opens on its well");
     let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the row");
-    assert_eq!(f32::from(well.left()), f32::from(row.left()) + geo.out + geo.verb, "the well at the verb column");
-    assert_eq!(well.right(), row.right(), "to the column's end");
+    assert_eq!(f32::from(well.left()), f32::from(row.left()) + g.indent, "the well at the verb column");
+    assert_eq!(f32::from(well.right()), f32::from(row.right()) - g.pad, "to the row's padding");
     let status = bounds(cx, leak(format!("tool-status {id}"))).expect("its failed glyph");
-    assert!(f32::from(status.right()) <= f32::from(row.left()) + geo.out, "still in the gutter");
+    assert!(status.right() <= row.right() && status.left() >= row.left(), "still in its row");
 }
 
 /// One beat goes by: the motion clock and the executor's move on together,
@@ -2616,8 +2614,12 @@ fn frames(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, u64) {
 fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (1440., 1800.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
-    // The beat alone (the sweep's 30 Hz: `a_sweep_ticks_only_while_drawn`).
-    view.update(cx, |v, _| v.fx.no_sweep.set(true));
+    // The beat alone (the sweep's 30 Hz: `a_sweep_ticks_only_while_drawn`;
+    // the orbit's: `orbit_requests_ticks_only_while_running`).
+    view.update(cx, |v, _| {
+        v.fx.no_sweep.set(true);
+        v.fx.no_orbit.set(true);
+    });
     running_tools(cx, &view, 25);
     // The arrivals draw in and settle.
     for _ in 0..12 {
@@ -2948,7 +2950,11 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
 /// The other demo session (no worker, so no clock) with `n` calls running,
 /// their arrivals settled: what runs is only the beat.
 fn running_without_a_clock(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, n: usize) {
-    view.update(cx, |v, _| v.client = None);
+    // The beat alone: the rows' orbits as the rail's spinner (Cards D).
+    view.update(cx, |v, _| {
+        v.client = None;
+        v.fx.no_orbit.set(true);
+    });
     open_idle_cpu(cx, view, crate::tabs::Place::Current);
     set_motion(cx, view, crate::motion::Level::Full);
     running_tools(cx, view, n);
@@ -3210,6 +3216,8 @@ fn running_without_a_clock_in_frame(cx: &mut TestAppContext, w: AnyWindowHandle,
 #[gpui_kit::test]
 fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
+    // The beat alone: the rows' orbits as the rail's spinner (Cards D).
+    view.update(cx, |v, _| v.fx.no_orbit.set(true));
     set_motion(cx, &view, crate::motion::Level::Full);
     for _ in 0..12 {
         beat(cx, w, &view);
@@ -6080,6 +6088,8 @@ fn sticky_label_takes_no_click(cx: &mut TestAppContext) {
 fn sticky_band_hides_the_beat(cx: &mut TestAppContext) {
     let (w, view, _events) = sticky_open(cx, (1440., 900.));
     assert!(!view.read_with(cx, |v, _| v.layout.hang), "the labels are inline");
+    // The beat alone: the rows' orbits as the rail's spinner (Cards D).
+    view.update(cx, |v, _| v.fx.no_orbit.set(true));
     set_motion(cx, &view, crate::motion::Level::Full);
     running_tools(cx, &view, 60);
     for _ in 0..12 {

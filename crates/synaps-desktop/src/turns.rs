@@ -628,21 +628,6 @@ impl Hue {
             _ => Hue::Gen,
         }
     }
-
-    pub(crate) fn color(self, p: &Palette) -> Hsla {
-        match self {
-            Hue::Bash => p.t_bash,
-            Hue::Read => p.t_read,
-            Hue::Write => p.t_write,
-            Hue::Edit => p.t_edit,
-            Hue::Grep => p.t_grep,
-            Hue::Find => p.t_find,
-            Hue::Ls => p.t_ls,
-            Hue::Sub => p.t_sub,
-            Hue::Ext => p.t_ext,
-            Hue::Gen => p.t_gen,
-        }
-    }
 }
 
 /// Line counts as a row or a summary shows them, formatted once: `+3` `−1`
@@ -1409,6 +1394,27 @@ impl AppView {
             Kind::Day => day_line(d, &p, &m),
             Kind::Prompt => self.render_authorize(d, &p, &m, cx),
         };
+        // A run is one card (cards4/proposal.md §3): each of its rows draws
+        // its slice, the first and last its edges.
+        let block = match crate::cards::edges(&self.disp, ix) {
+            _ if !crate::cards::in_card(&d) => block,
+            (top, bottom) => {
+                let slab = crate::cards::slab(top, bottom, block, &p, crate::cards::Geo::of(&m));
+                if matches!(d.kind, Kind::Summary { .. }) {
+                    // Its card's edge and inset unfold it too.
+                    let id = d.id;
+                    slab.id(("run-card", id))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_run(id);
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                } else {
+                    slab.into_any_element()
+                }
+            }
+        };
         let who = who_of(&d, &p, &m);
         let mut out = v_flex().w_full().pt(px(gap)).relative();
         let mut hang = None;
@@ -1569,44 +1575,24 @@ impl Geo {
         let (out, pad, verb) = if lay.hang { (m.hang, m.hang - m.lead, 0.) } else { (0., 0., m.lead) };
         Geo { out, pad, right: gap, verb_w, gap, verb, target: verb + verb_w + gap, fold: (12. * m.r).round() }
     }
-
-    /// A row's box: bare, `h` tall at least, reaching into the gutter.
-    fn frame(self, h: f32) -> Div {
-        h_flex().relative().ml(px(-self.out)).pl(px(self.pad)).pr(px(self.right)).min_h(px(h)).items_center()
-    }
-
-    /// The fold's column (kept without a body, so the metas line up).
-    fn fold_col(self, fold: Option<AnyElement>) -> Div {
-        div().flex_none().ml(px(self.gap)).w(px(self.fold)).flex().items_center().justify_end().children(fold)
-    }
 }
 
-/// A row's verb in its 9-character column, its tool's own name in the
-/// tooltip when the verb is not it.
-fn verb_el(card: &Card, key: (&'static str, u64), color: Hsla, geo: Geo) -> AnyElement {
-    let el = div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).overflow_hidden().whitespace_nowrap().text_color(color);
-    match &card.full {
-        Some(full) => {
-            let full = full.clone();
-            el.id(key).child(card.verb.clone()).tooltip(move |window, cx| crate::overlay::tip(full.clone(), window, cx)).into_any_element()
-        }
-        None => el.child(card.verb.clone()).into_any_element(),
-    }
-}
-
-/// A row's target: a path's folder in `arg` and its file in `prose_t` (the
-/// folder gives way first), anything else in `arg`, ellipsised.
-fn target_el(card: &Card, arg: &SharedString, p: &Palette) -> Div {
+/// A row's target (cards4/proposal.md §2): mono, the scanned part (a
+/// path's file, a command) in `prose_t`, a path's folder in `dim_t` (the
+/// folder gives way first), ellipsised. `quiet` (cancelled, denied): all
+/// of it `dim_t`.
+fn target_el(card: &Card, arg: &SharedString, quiet: bool, p: &Palette) -> Div {
     let text = if card.target.is_empty() { arg.clone() } else { card.target.clone() };
+    let lit = if quiet { p.dim_t } else { p.prose_t };
     match &card.path {
         Some((dir, base)) => h_flex()
             .flex_1()
             .min_w_0()
             .overflow_hidden()
             .whitespace_nowrap()
-            .child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(p.arg).child(dir.clone()))
-            .child(div().flex_none().text_color(p.prose_t).child(base.clone())),
-        None => div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(p.arg).child(text),
+            .child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(p.dim_t).child(dir.clone()))
+            .child(div().flex_none().text_color(lit).child(base.clone())),
+        None => div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(lit).child(text),
     }
 }
 
@@ -1624,132 +1610,144 @@ pub(crate) fn clock(fx: &Motion, started: Option<Instant>) -> Option<SharedStrin
 }
 
 impl AppView {
-    /// A run's summary row (polish.md §2.2): tool-row shaped, bare on the
-    /// canvas. Its last call's outcome's glyph in the gutter (how it
-    /// ended), the stacked tally bar beside it (the run's hues, folded),
-    /// `ran`, `7 calls` and the tally (names in their hues), then the
-    /// counts and the words of what did not end ok, worst first (`+3 −4 ·
-    /// 1 failed`; tight, the counts alone), and the fold at the right end.
+    /// A folded run's summary row (cards4/proposal.md §3): the run's first
+    /// row, tool-row shaped. Its last outcome's life glyph, "20 tool calls"
+    /// (Sans 600 `prose_t`), the tally in Sans `dim` ("Run 6 · Read 4 ·
+    /// Search 3", what fits, then "+N more"), the counts, the words of what
+    /// did not end ok in their colour ("1 failed"), the chevron. Opened, a
+    /// 1 px `line` rule under it parts it from the rows.
     fn render_summary(&self, d: Disp, open: bool, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
         let id = d.id;
         let Some(s) = self.summaries.get(id) else { return div().into_any_element() };
         let lay = self.layout;
-        let geo = Geo::of(lay, m);
-        // The tally names what fits (mono: measured without layout, every
-        // text box a whole pixel), then `+N`; the whole of it in the tooltip.
+        let g = crate::cards::Geo::of(m);
         let tight = lay.tight;
-        let (cw, gap) = (m.mono * 0.6, (14. * m.r).round());
-        let content = lay.column + geo.out - geo.pad - geo.right;
-        let avail = content
-            - m.lead
-            - geo.verb_w
-            - geo.gap
-            - text_w(s.label.chars().count(), cw)
-            - m.run_gap
-            - (s.trail_w(m.meta, tight) + geo.gap)
-            - (geo.gap + geo.fold);
-        // A pixel's slack for the shaper's sums.
-        let named = tally_fit(&s.tally, avail - 1., cw, gap);
+        // The tally names what fits (Sans 12, measured without layout at a
+        // mono cell's width: a little room to spare), then `+N more`.
+        let cw = m.meta * 0.6;
+        let calls = format!("{} tool call{}", s.tools, if s.tools == 1 { "" } else { "s" });
+        let label_w = text_w(calls.chars().count(), m.label * 0.6);
+        // The card's edges and inset, the row's padding, the glyph, the
+        // label, the trail and the chevron, the four gaps between them.
+        let trail = s.trail_w(m.meta, tight);
+        let avail = lay.column - 2. - 2. * g.inset - 2. * g.pad - g.glyph - label_w - trail - g.chevron - 4. * g.gap;
+        // `+N more` and the dot before it.
+        let more_w = text_w(5, cw) + 3. + 12.;
+        let names: Vec<SharedString> = s.tally.iter().map(|t| crate::cards::verb(&t.name)).collect();
+        let fit_tally: Vec<Tally> = s
+            .tally
+            .iter()
+            .zip(&names)
+            .map(|(t, n)| Tally { name_chars: n.chars().count(), ..t.clone() })
+            .collect();
+        let all = tally_fit(&fit_tally, avail - 1., cw, 15.) == fit_tally.len();
+        let named = if all { fit_tally.len() } else { tally_fit(&fit_tally, avail - 1. - more_w, cw, 15.) }.min(if tight { 3 } else { 5 });
         let mut tally = h_flex()
             .id(("tally", id))
             .debug_selector(|| format!("tally {id}"))
             .flex_1()
             .min_w_0()
-            .gap(px(gap))
+            .gap(px(6.))
+            .items_center()
             .overflow_hidden()
-            .whitespace_nowrap();
-        for (i, t) in s.tally[..named].iter().enumerate() {
+            .whitespace_nowrap()
+            .font_family(fonts::SANS)
+            .text_px(m.meta);
+        for (i, (t, name)) in s.tally[..named].iter().zip(&names).enumerate() {
+            if i > 0 {
+                tally = tally.child(crate::cards::dot(p));
+            }
             tally = tally.child(
                 h_flex()
                     .when(i + 1 == named, |d| d.debug_selector(|| format!("tally {id} last")))
                     .flex_none()
-                    .gap(px(cw))
-                    .child(div().text_color(t.hue.color(p)).child(t.name.clone()))
-                    .child(div().text_color(p.dim_t).child(t.n_text.clone())),
+                    .gap(px(4.))
+                    .child(div().text_color(p.dim_t).child(name.clone()))
+                    .child(div().text_color(p.prose_t).child(t.n_text.clone())),
             );
         }
-        // Cut short: the whole tally in a tooltip, on the tally, or on the
-        // row when not one name fits (the tally is an empty strip then).
         let tip = (named < s.tally.len()).then(|| {
             let tip = s.tip.clone();
             move |window: &mut Window, cx: &mut App| crate::overlay::tip(tip.clone(), window, cx)
         });
         let (tally_tip, row_tip) = if named > 0 { (tip, None) } else { (None, tip) };
         if let Some(tip) = tally_tip {
-            let rest = s.tally[named..].iter().map(|t| t.n).sum();
+            let rest: usize = s.tally[named..].iter().map(|t| t.n).sum();
             tally = tally
-                .child(div().debug_selector(|| format!("tally {id} more")).flex_none().text_color(p.dim_t).child(plus(rest)))
+                .child(crate::cards::dot(p))
+                .child(div().debug_selector(|| format!("tally {id} more")).flex_none().text_color(p.dim_t).child(format!("{} more", plus(rest))))
                 .tooltip(tip);
         }
-        let (last, family) = s.last;
-        let dot = || div().text_color(p.dim_t).child("·");
-        let counts = s.counts.element(p);
-        let mut trail = h_flex().flex_none().ml(px(geo.gap)).gap(px(8.)).items_center().text_px(m.meta).whitespace_nowrap();
-        let words = !tight && !s.outcome.is_empty();
-        if let Some(c) = counts {
-            trail = trail.child(c).when(words, |d| d.child(dot()));
+        let (last, _) = s.last;
+        let life = match last {
+            Glyph::Failed => glyph::Life::Failed,
+            Glyph::Cancelled => glyph::Life::Cancelled,
+            Glyph::Limit => glyph::Life::Limit,
+            _ => glyph::Life::Done,
+        };
+        let fx = &self.fx;
+        let mut parts: Vec<AnyElement> = Vec::new();
+        if let Some(c) = s.counts.element(p) {
+            parts.push(c.into_any_element());
         }
-        if words {
-            for (i, (text, family)) in s.outcome.iter().enumerate() {
-                if i > 0 {
-                    trail = trail.child(dot());
-                }
-                trail = trail.child(div().text_color(glyph::ink(*family, Ground::Run, p).0).child(text.clone()));
+        if !tight {
+            for (text, family) in &s.outcome {
+                let color = if *family == Family::Err { p.err } else { p.dim_t };
+                parts.push(div().font_weight(FontWeight::SEMIBOLD).text_color(color).child(text.clone()).into_any_element());
             }
         }
-        // Folded just now: the tally's segments draw, top first (motion.md §6.1).
-        let fx = &self.fx;
-        let h = m.summary as u32;
-        let folded_at = fx.fold.get().filter(|(f, _)| *f == id && !open).map(|(_, at)| at);
-        let bar_x = geo.pad + m.lead - (6. * m.r).round();
-        let segments = glyph::tally_bar(&s.tally, |t| t.n, h).map(|(i, top, h)| {
-            let k = fx.draw(folded_at, motion::stagger(i), motion::QUICK);
-            div().absolute().left(px(bar_x)).top(px(top as f32)).w(px(2.)).h(px(h as f32 * k)).bg(s.tally[i].hue.color(p))
-        });
-        geo.frame(m.summary)
+        let row = h_flex()
             .id(("run", id))
-            .h(px(m.summary))
+            .debug_selector(move || format!("run-summary {id}"))
+            .h(px(g.row))
+            .px(px(g.pad))
+            .gap(px(g.gap))
+            .items_center()
+            .rounded(px(g.row_radius))
             .font_family(fonts::MONO)
             .text_px(m.mono)
-            .text_color(p.prose_t)
             .cursor_pointer()
-            .hover(|d| d.bg(p.tool_out))
-            .child(glyph::lead(Some(glyph::spinning(fx, last, glyph::ink(family, Ground::Run, p).1, p.canvas)), m))
-            .child(div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.prose_t).child("ran"))
+            .hover(|d| d.bg(p.hover))
+            .child(glyph::life(life, glyph::life_ink(life, p.card_d, p)))
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(m.run_gap))
-                    .items_center()
-                    // `N calls` rolls while the run grows (polish.md P5).
-                    .child(motion::roll_count(fx, motion::key(motion::ROLL_CALLS, id), s.tools, s.label.clone(), |t| {
-                        div().flex_none().child(t)
-                    }))
-                    .child(tally),
+                // `N tool calls` rolls while the run grows (polish.md P5).
+                motion::roll_count(fx, motion::key(motion::ROLL_CALLS, id), s.tools, calls.into(), |t| {
+                    div().flex_none().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(p.prose_t).child(t)
+                }),
             )
-            .child(trail)
-            .child(geo.fold_col(Some(glyph::turn(fx.turn(id | RUN_KEY, open), p.dim_t))))
-            .children(segments)
-            .when_some(row_tip, |d, tip| d.tooltip(tip))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_run(id);
-                cx.notify();
-            }))
-            .into_any_element()
+            .child(tally)
+            .child(crate::cards::facts(parts, p, m))
+            .child(div().flex_none().w(px(g.chevron)).flex().items_center().justify_end().child(glyph::turn(fx.turn(id | RUN_KEY, open), p.dim_t)))
+            .when_some(row_tip, |d, tip| d.tooltip(tip));
+        let _ = cx;
+        // Opened: the 1 px `line` rule under it, and the card's inset under
+        // that, so the row is as tall open as folded (its card's bottom
+        // edge goes to the run's last row): nothing below it moves.
+        if open {
+            return v_flex()
+                .child(row)
+                .child(div().h(px(1.)).bg(p.line).debug_selector(move || format!("run-rule {id}")))
+                .pb(px(g.inset))
+                .into_any_element();
+        }
+        row.into_any_element()
     }
 
-    /// A thinking or tool row in a run (polish.md §2.1, F1): bare on the
-    /// canvas, its status in the gutter, the verb in its tool's hue, the
-    /// target, the meta right (counts, read lines or hits, a running
-    /// clock, the word of an outcome that is not ok) and the fold at the
-    /// right end when it has a body. Opened, its body is a well under it.
-    /// A call that started a worker is its spawn row (§2.4).
+    /// A thinking or tool row in a run (cards4/proposal.md §3, §4): one
+    /// quiet 34 px row in its run's card. Its life glyph, the verb in Sans,
+    /// the target in mono (the scanned part `prose_t`, a path's folder
+    /// `dim_t`), the facts right in Sans 12 `dim` (`+add −del`, counts, the
+    /// duration or the live clock in `acc`, the receipt), the state word in
+    /// its colour, the chevron when it has a body. Hover fills it with
+    /// `hover` (colour only). A failed row rests on a 7.5 % `err` wash, a
+    /// waiting one on 6 % of the accent. Opened, its body is a `well_d`
+    /// under the verb. A call that started a worker is its spawn row.
     #[allow(clippy::too_many_arguments)]
     fn render_work(&self, item: &Item, row: &RowCache, id: u64, p: &Palette, m: &Metrics, lay: Layout, cx: &Context<Self>) -> AnyElement {
         let think = item.kind == ItemKind::Thinking;
         let st = status(item);
         let geo = Geo::of(lay, m);
+        let g = crate::cards::Geo::of(m);
         let call_id = item.tool.as_ref().map(|t| t.tool_id.as_str());
         let starts = item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name));
         let worker = starts.and_then(|t| {
@@ -1765,7 +1763,6 @@ impl AppView {
         }
         let has_body = if think { !row.text.is_empty() } else { row.preview.is_some() || !row.result.is_empty() };
         let open = has_body && self.is_open(item, row);
-        let hue = if think { p.think } else { row.hue.color(p) };
         let target = if think {
             div()
                 .flex_1()
@@ -1778,70 +1775,146 @@ impl AppView {
                 .text_color(p.think)
                 .child(row.arg.clone())
         } else {
-            target_el(&row.card, &row.arg, p)
+            target_el(&row.card, &row.arg, matches!(st, Some(ToolStatus::Cancelled | ToolStatus::Denied)), p)
         };
         // The call a prompt waits on ([`waiting_call`]).
         let waiting = !think && self.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty();
         let fx = &self.fx;
         let shown = self.model.shown();
+        let running_think = think && shown.busy() && shown.items().last().map(|i| i.id) == Some(id);
         let state = if think {
-            let running = shown.busy() && shown.items().last().map(|i| i.id) == Some(id);
-            if running { (Glyph::Run, None, Family::Run) } else { (Glyph::Ok, None, Family::Ok) }
+            if running_think { (Glyph::Run, None, Family::Run) } else { (Glyph::Ok, None, Family::Ok) }
         } else {
             glyph::call(st, waiting, self.model.active.is_none())
         };
-        let (word_color, mark) = glyph::ink(state.2, Ground::Run, p);
-        let wait = fx.change(Tag::Waiting, id, u64::from(waiting), None);
-        let status_glyph = live_glyph(
-            fx,
-            state.0,
-            mark,
-            p.canvas,
-            fx.change(Tag::Outcome, id, glyph_code(state.0), None),
-            wait.filter(|w| waiting && w.1 == 0).map(|w| w.0),
-            false,
-        );
-        // Thinking done says nothing in the gutter: only its running mark.
-        let status_glyph = (!think || state.0 == Glyph::Run).then_some(status_glyph);
-        let running = state.0 == Glyph::Run && !think;
-        let receipt = self.row_receipt(call_id).filter(|_| !think);
-        let counts = row.counts.element(p);
-        // A gated call runs from its answer (the wait is the receipt's).
-        let ran = running.then(|| clock(fx, crate::authorize::run_start(row.started, receipt))).flatten();
-        let word = crate::authorize::status_beside(state.1, receipt.map(|r| r.answer_for(st))).filter(|_| !lay.tight && !think);
-        let before = counts.is_some() || row.card.facts.is_some() || ran.is_some() || word.is_some() || row.card.server.is_some();
-        let meta = h_flex()
-            .flex_none()
-            .ml(px(geo.gap))
-            .gap(px(8.))
-            .items_center()
-            .text_px(m.meta)
-            .whitespace_nowrap()
-            // The ledger's committed counts: nothing unless the call succeeded.
-            .children(counts)
-            .children(row.card.facts.clone().map(|f| div().text_color(p.dim_t).child(f)))
-            .children(ran.map(|c| div().text_color(p.dim_t).child(c)))
-            .when_some(word, |d, w| d.child(div().debug_selector(move || format!("tool-word {id}")).text_color(word_color).child(w)))
-            .children(row.card.server.clone().map(|s| div().text_color(p.dim_t).child(s)))
-            // An answered prompt's receipt (polish.md §2.6): `3s running ·
-            // allowed 19:14`, then `allowed 19:14 · 15s`.
-            .children(receipt.and_then(|_| self.receipt_el(call_id, st, before, running, p)));
-        let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
-        let verb = if think {
-            div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.think).child("think").into_any_element()
+        let life = if think {
+            if running_think { glyph::Life::Orbit } else { glyph::Life::Done }
         } else {
-            verb_el(&row.card, ("verb", id), hue, geo)
+            glyph::life_of_call(st, waiting, self.model.active.is_none())
         };
-        let head = geo
-            .frame(m.row)
+        let change = fx.change(Tag::Outcome, id, life.code(), None);
+        let wait = fx.change(Tag::Waiting, id, u64::from(waiting), None).filter(|w| waiting && w.1 == 0).map(|w| w.0);
+        // The row's wash (§1): the state colour mixed into the card, one
+        // quad behind the row. A failure flushes at 18 % and calms to 7.5 %
+        // (§8 #6); a wait at 16 % and holds at 6 % (#7). Off: at rest.
+        let you = p.acc;
+        let wash = match life {
+            glyph::Life::Failed => {
+                let k = fx.decay(change.filter(|c| c.1 == glyph::Life::Orbit.code()).map(|c| c.0), Duration::ZERO, motion::GLOW);
+                Some(motion::mix(p.card_d, p.err, theme::D_FAIL_REST + (theme::D_FAIL_PEAK - theme::D_FAIL_REST) * k))
+            }
+            glyph::Life::Wait => {
+                let k = fx.decay(wait, Duration::ZERO, motion::SIG);
+                Some(motion::mix(p.card_d, you, theme::D_WAIT_REST + (theme::D_WAIT_PEAK - theme::D_WAIT_REST) * k))
+            }
+            _ => None,
+        };
+        let ground = wash.unwrap_or(p.card_d);
+        let status_glyph = life_glyph(fx, life, ground, p, change, wait);
+        // Thinking done says nothing: only its running mark.
+        let status_glyph = (!think || running_think).then_some(status_glyph);
+        let running = life == glyph::Life::Orbit && !think;
+        let receipt = self.row_receipt(call_id).filter(|_| !think);
+        // A gated call runs from its answer (the wait is the receipt's).
+        let start = crate::authorize::run_start(row.started, receipt);
+        let ran = running.then(|| clock(fx, start)).flatten();
+        // Finished while watched: how long it took (§3; history has none).
+        if let (Some((at, prev)), false, Some(s)) = (change, running, start)
+            && prev == glyph::Life::Orbit.code()
+        {
+            self.took.borrow_mut().entry(id).or_insert_with(|| at.saturating_duration_since(s));
+        }
+        let took = (!running && !think).then(|| self.took.borrow().get(&id).copied()).flatten();
+        // The state word (§4): a failed command its exit code.
+        let exit = (st == Some(ToolStatus::Failed)).then(|| crate::cards::exit_code(&row.result)).flatten();
+        let word: Option<SharedString> = match exit {
+            Some(n) => Some(format!("Exit {n}").into()),
+            None => crate::authorize::status_beside(state.1.filter(|w| *w != "stopped at output limit"), receipt.map(|r| r.answer_for(st)))
+                .map(SharedString::new_static),
+        }
+        .filter(|_| !think && !(lay.tight && receipt.is_some()));
+        let limit = st == Some(ToolStatus::Unknown);
+        let word_color = match life {
+            glyph::Life::Failed | glyph::Life::Denied => p.err,
+            glyph::Life::Wait => p.acc,
+            _ => p.dim_t,
+        };
+        let mut parts: Vec<AnyElement> = Vec::new();
+        if let Some(c) = row.counts.element(p) {
+            parts.push(c.into_any_element());
+        }
+        // A read's range or an edit's `replaced 9 → 4 lines` (the well's
+        // header before D), else the row's own facts.
+        if let Some(f) = row.card.head.as_ref().and_then(|h| h.1.clone()).or_else(|| row.card.facts.clone()) {
+            parts.push(div().text_color(p.dim_t).child(f).into_any_element());
+        }
+        if limit {
+            parts.push(div().text_color(p.dim_t).child("stopped at output limit").into_any_element());
+        }
+        if let Some(c) = ran {
+            parts.push(div().text_color(p.acc).child(c).into_any_element());
+        } else if let Some(t) = took {
+            // The live clock rolls over into the final duration (§8 #5).
+            let from = change.filter(|c| c.1 == glyph::Life::Orbit.code()).zip(start).map(|((at, _), s)| {
+                (at, subagents::fmt_whole(at.saturating_duration_since(s).as_secs()))
+            });
+            parts.push(clock_roll(fx, from, crate::cards::took(t), p, m));
+        }
+        if let Some(s) = row.card.server.clone() {
+            parts.push(div().text_color(p.dim_t).child(s).into_any_element());
+        }
+        let after = !parts.is_empty();
+        let receipt_el = receipt.and_then(|_| self.receipt_el(call_id, st, after, running, p));
+        let facts = crate::cards::facts(parts, p, m).children(receipt_el);
+        // "Exit N" slides in from +6 as the cross writes on (§8 #6).
+        let word_el = word.map(|w| {
+            let since = change.filter(|c| c.1 == glyph::Life::Orbit.code() || c.1 == glyph::Life::Queued.code()).map(|c| c.0);
+            let k = fx.shot(since, Duration::ZERO, motion::QUICK, &ease::OUT, Mk::Fade);
+            let x = (1. - fx.shot(since, Duration::ZERO, motion::FLICK, &ease::OUT, Mk::Spatial)) * 6.;
+            div()
+                .debug_selector(move || format!("tool-word {id}"))
+                .flex_none()
+                .relative()
+                .left(px(x))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_px(m.meta)
+                .whitespace_nowrap()
+                .text_color(motion::mix(ground, word_color, k))
+                .child(w)
+        });
+        let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
+        let verb_text = if think { SharedString::new_static("Think") } else { crate::cards::verb(&row.name) };
+        let verb = div()
+            .flex_none()
+            .w(px(g.verb))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .font_family(fonts::SANS)
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_px(m.label)
+            .text_color(p.prose_t)
+            .id(("verb", id))
+            .when_some(row.card.full.clone(), |d, full| d.tooltip(move |window, cx| crate::overlay::tip(full.clone(), window, cx)))
+            .child(verb_text);
+        let head = h_flex()
             .id(("row", id))
             .debug_selector(move || format!("tool-row {id}"))
-            .when(has_body, |d| d.cursor_pointer().hover(|d| d.bg(p.tool_out)))
-            .child(glyph::lead(status_glyph, m).debug_selector(move || format!("tool-status {id}")))
+            .relative()
+            .h(px(g.row))
+            .px(px(g.pad))
+            .gap(px(g.gap))
+            .items_center()
+            .rounded(px(g.row_radius))
+            .when_some(wash, |d, w| d.bg(w))
+            .when(has_body && wash.is_none(), |d| d.cursor_pointer().hover(|d| d.bg(p.hover)))
+            .when(has_body && wash.is_some(), |d| d.cursor_pointer())
+            .child(div().flex_none().size(px(g.glyph)).children(status_glyph).debug_selector(move || format!("tool-status {id}")))
             .child(verb)
             .child(target)
-            .child(meta)
-            .child(geo.fold_col(fold))
+            .child(facts)
+            .children(word_el)
+            .child(div().flex_none().w(px(g.chevron)).flex().items_center().justify_end().children(fold))
             .when(has_body, |d| {
                 d.on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle(id);
@@ -1850,11 +1923,11 @@ impl AppView {
             });
         let body = open.then(|| {
             if think {
-                // Prose, not code: no well, on the canvas under the target.
+                // Prose, not code: no well, under the target.
                 div()
-                    .ml(px(geo.target))
+                    .ml(px(g.indent + g.verb + g.gap))
                     .pb(px((8. * m.r).round()))
-                    .pr(px(geo.right))
+                    .pr(px(g.pad))
                     .font_family(fonts::SANS)
                     .text_px(m.think)
                     .line_height(px(m.think_line))
@@ -1913,15 +1986,11 @@ impl AppView {
         // A background worker of the session on screen: it opens.
         let open = v.id.filter(|_| v.watchable && current && self.model.watch.focus().is_none());
         let who = open.map(|id| crate::wtabs::Who::new(id, v.name.clone(), v.call.clone()));
-        let status = live_glyph(
-            fx,
-            g,
-            mark,
-            p.canvas,
-            fx.change(Tag::BlockGlyph, key, glyph_code(glyph::worker(glyph::steady(live, v.demoted)).0), None),
-            None,
-            false,
-        );
+        let _ = (g, mark);
+        let d = crate::cards::Geo::of(m);
+        let life = glyph::life_of_worker(live);
+        let steady = glyph::life_of_worker(glyph::steady(live, v.demoted));
+        let status = life_glyph(fx, life, p.card_d, p, fx.change(Tag::BlockGlyph, key, steady.code(), None), None);
         // Its task: the call's argument after the worker's label.
         let task = row.arg.split_once(" · ").map_or_else(|| row.arg.clone(), |(_, t)| SharedString::from(tilde(t, true)));
         let target = h_flex()
@@ -1936,7 +2005,10 @@ impl AppView {
                     .max_w(px(m.mono * 0.6 * 24.))
                     .overflow_hidden()
                     .text_ellipsis()
-                    .text_color(p.sub_name_t)
+                    .font_family(fonts::SANS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_px(m.label)
+                    .text_color(p.prose_t)
                     .child(v.name.clone()),
             )
             // The task quiet, the name in its hue (noir; nord's name and
@@ -1966,21 +2038,27 @@ impl AppView {
                 .gap(px(6.))
                 .items_center()
                 .group("wopen")
+                .rounded(px(4.))
                 .border_1()
-                .border_color(p.edge_t)
-                .hover(|d| d.border_color(p.frame))
+                .border_color(p.line)
+                .bg(p.card_d)
+                .hover(|d| d.bg(p.hover))
                 // Hovered, it lights: its outline to `frame`, its word and
                 // arrow to `prose_t` (both floored on the hovered row).
                 .child(
-                    display(label::OPEN, fonts::size::D_S, p.dim_t).line_height(px(12.)).group_hover("wopen", |s| s.text_color(p.prose_t)),
+                    div()
+                        .font_family(fonts::SANS)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_px(m.meta)
+                        .text_color(p.prose_t)
+                        .child("Open"),
                 )
                 .child(
                     svg()
                         .path(Glyph::Open.sprite().unwrap_or_default())
                         .flex_none()
                         .size(px(Glyph::Open.size()))
-                        .text_color(p.dim_t)
-                        .group_hover("wopen", |s| s.text_color(p.prose_t)),
+                        .text_color(p.prose_t),
                 )
                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                     cx.stop_propagation();
@@ -1992,36 +2070,38 @@ impl AppView {
                 }))
         });
         let head = h_flex()
-            .pl(px(geo.pad))
-            .pr(px(geo.right))
-            .min_h(px(m.row))
+            .h(px(d.row))
+            .px(px(d.pad))
+            .gap(px(d.gap))
             .items_center()
             .debug_selector(move || format!("spawn-row {key}"))
-            .child(glyph::lead(Some(status), m))
-            .child(verb_el(&row.card, ("verb", key), p.t_sub, geo))
+            .child(div().flex_none().size(px(d.glyph)).child(status))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(d.verb))
+                    .font_family(fonts::SANS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_px(m.label)
+                    .text_color(p.prose_t)
+                    .child("Spawn"),
+            )
             .child(target)
-            .child(meta)
+            .child(meta.font_family(fonts::SANS))
             .children(button)
-            .child(geo.fold_col(None));
+            .child(div().flex_none().w(px(d.chevron)));
         // The worker came under the call while watched (its call was drawn
         // without it: `render_work`): its bar draws.
         let came = fx.change(Tag::Block, key, 1, fx.birth(key)).map(|(at, _)| at);
-        let line = |child: AnyElement| {
-            div()
-                .relative()
-                .ml(px(geo.out + geo.target))
-                .mr(px(geo.right))
-                .mb(px((8. * m.r).round()))
-                .pl(px((12. * m.r).round()))
-                .child(child)
-                .child(glyph::bar_at(p.sub_rule, fx.draw(came, Duration::ZERO, motion::BASE)))
-        };
+        // Under the target (§3): no bar in a card (C5).
+        let _ = came;
+        let line = |child: AnyElement| div().relative().ml(px(d.indent + d.verb + d.gap)).mr(px(d.pad)).mt(px(-6.)).mb(px(8.)).child(child);
         let under = if let Some((text, err)) = result {
             Some(line(
                 div()
-                    .py(px((2. * m.r).round()))
-                    .text_px(m.meta)
-                    .line_height(px(m.mono_line))
+                    .font_family(fonts::SANS)
+                    .text_px(m.think)
+                    .line_height(px(m.think_line))
                     .whitespace_normal()
                     .text_color(if err { p.err } else { p.prose_t })
                     .child(text)
@@ -2031,16 +2111,16 @@ impl AppView {
             step.map(|(text, _)| {
                 line(
                     h_flex()
-                        .h(px((24. * m.r).round()))
+                        .h(px((18. * m.r).round()))
                         .gap(px(8.))
                         .items_center()
+                        .font_family(fonts::SANS)
                         .text_px(m.meta)
                         .whitespace_nowrap()
-                        .child(glyph::draw(Glyph::Elbow, p.dim_t))
                         // A changed step swaps in place: under a live fan-out a
                         // roll is an app frame at 30 Hz for every change
                         // (polish.md P5, gate 4).
-                        .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.sub_status_t).child(text))
+                        .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.dim_t).child(text))
                         .into_any_element(),
                 )
             })
@@ -2048,7 +2128,7 @@ impl AppView {
         // The whole of it is the hover's: its box reaches into the gutter.
         let block = v_flex()
             .relative()
-            .ml(px(-geo.out))
+            .rounded(px(d.row_radius))
             .font_family(fonts::MONO)
             .text_px(m.mono)
             .line_height(px(m.mono_line))
@@ -2072,7 +2152,7 @@ impl AppView {
             .id(("wblock", id as usize))
             .group("wblock")
             .cursor_pointer()
-            .hover(|d| d.bg(p.tool_out))
+            .hover(|d| d.bg(p.hover))
             .when(self.menu.is_none(), |d| d.tooltip(crate::wtabs::card_tip(cx.weak_entity(), who.clone(), tip)))
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who, true, ev, window, cx)))
             .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who2, true, ev, window, cx)))
@@ -2158,42 +2238,34 @@ impl AppView {
     }
 }
 
-/// An opened call's body (polish.md §2.3): a well under its row, from the
-/// verb column to the column's end (noir's), on the `well` ground (`code`)
-/// in a 1 px `hair_w` frame. A header line (the path; an edit's `replaced
-/// 3 → 6 lines`, a read's `lines 41–88`) when it has a path; an edit's
-/// lines with their signs and washes, a read's with the file's own numbers,
-/// any other output as it came (a failure's in `err_o`). A code line that
-/// wraps hangs at its own indent, never left of it.
-fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metrics) -> Div {
-    let inset = (12. * m.r).round();
+/// An opened call's body (cards4/proposal.md §3): under its row on
+/// `well_d`, radius 4, no frame, indented to the verb column (36 px from
+/// the row's edge), to the card's inner edge. An edit's lines full width on
+/// their washes, the sign hanging in an 18 px column; a read's with the
+/// file's own numbers right-aligned in a 30 px column; any other output as
+/// it came (a failure's in `err_o`). The cut says "N more lines" in Sans 12
+/// `dim`. The path and the range are the row's (its target and facts).
+fn well(row: &RowCache, failed: bool, id: u64, _geo: Geo, p: &Palette, m: &Metrics) -> Div {
+    let g = crate::cards::Geo::of(m);
+    let inset = (10. * m.r).round();
     let cw = m.mono * 0.6;
-    let mut col = v_flex()
+    let col = v_flex()
         .debug_selector(move || format!("well {id}"))
-        .ml(px(geo.verb))
-        .mt(px((2. * m.r).round()))
+        .ml(px(g.indent))
+        .mr(px(g.pad))
+        .mt(px(1.))
         .mb(px((8. * m.r).round()))
-        .bg(p.well)
-        .border_1()
-        .border_color(p.hair_w)
-        .text_color(p.res);
-    if let Some((path, right)) = &row.card.head {
-        col = col.child(
-            h_flex()
-                .px(px(inset))
-                .py(px((4. * m.r).round()))
-                .gap(px(8.))
-                .border_b_1()
-                .border_color(p.hair_w)
-                .text_px(m.meta)
-                .text_color(p.dim_o)
-                .whitespace_nowrap()
-                .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().child(path.clone()))
-                .children(right.clone().map(|r| div().flex_none().child(r))),
-        );
-    }
+        .rounded(px(4.))
+        .overflow_hidden()
+        .bg(p.well_d)
+        .text_color(p.res)
+        .text_px(m.mono)
+        .line_height(px((19. * m.r).round()));
     let pad = (6. * m.r).round();
-    let more = |n: usize| div().px(px(inset)).text_color(p.dim_o).child(format!("… {n} more lines"));
+    let more_el = |t: SharedString| {
+        div().px(px(inset)).pt(px(2.)).font_family(fonts::SANS).text_px(m.meta).text_color(p.dim_o).child(t)
+    };
+    let more = |n: usize| more_el(format!("{n} more lines").into());
     match (&row.preview, &row.card.numbered) {
         (Some(pv), _) => {
             let mut lines = v_flex().py(px(pad));
@@ -2207,10 +2279,10 @@ fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metric
                 lines = lines.child(
                     h_flex()
                         .w_full()
-                        .px(px(inset))
+                        .pr(px(inset))
                         .items_start()
                         .when_some(bg, |d, bg| d.bg(bg))
-                        .child(div().w(px(text_w(2, cw))).flex_none().text_color(sign_fg).child(sign))
+                        .child(div().w(px(18.)).flex_none().flex().justify_center().text_color(sign_fg).child(sign))
                         .child(div().w(px(text_w(l.indent as usize, cw))).flex_none())
                         // `SharedString` from the line's `Arc<str>`: no copy per frame.
                         .child(div().flex_1().min_w_0().text_color(fg).whitespace_normal().child(SharedString::from(&l.text))),
@@ -2224,14 +2296,15 @@ fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metric
                 lines = lines.child(
                     h_flex()
                         .w_full()
-                        .px(px(inset))
+                        .pr(px(inset))
                         .items_start()
-                        .child(div().w(px(text_w(5, cw))).flex_none().flex().justify_end().text_color(p.dim_o).child(n.clone()))
+                        .child(div().w(px(30.)).flex_none().flex().justify_end().text_color(p.dim_o).child(n.clone()))
                         .child(div().w(px(text_w(2 + *indent as usize, cw))).flex_none())
                         .child(div().flex_1().min_w_0().whitespace_normal().child(text.clone())),
                 );
             }
-            col.child(lines.children(row.card.more.clone().map(|t| div().px(px(inset)).text_color(p.dim_o).child(t))))
+            let cut = row.card.more.clone().map(|t| SharedString::from(t.trim_start_matches("… ").to_string()));
+            col.child(lines.children(cut.map(more_el)))
         }
         _ => col.child(
             v_flex()
@@ -2240,7 +2313,7 @@ fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metric
                 .whitespace_normal()
                 .text_color(if failed { p.err_o } else { p.res })
                 .child(row.result.clone())
-                .when(row.result_more > 0, |d| d.child(div().text_color(p.dim_o).child(format!("… {} more lines", row.result_more)))),
+                .when(row.result_more > 0, |d| d.child(more(row.result_more))),
         ),
     }
 }
@@ -2298,6 +2371,98 @@ pub(crate) fn live_glyph(
             None => glyph::draw(g, mark),
         },
     }
+}
+
+/// A call's life glyph as it is now (cards4/proposal.md §4, §8): the
+/// orbit laps while it runs (growing in from a queued or waiting start,
+/// #2); a success closes the arc into a ring that fades as the tick
+/// writes on, lit `ok`, then quiet `dim` (#5); a failure's cross writes on
+/// over its ring (#6); a wait pings once (#7); a denial's slash writes on
+/// (#10); a cancel's arc goes out as the dash comes (#11). `change`: when
+/// it changed while watched, and from what ([`glyph::Life::code`]);
+/// `wait`: when a prompt came to wait on it. History, Reduced and Off: at
+/// rest ([`Motion::shot`]).
+pub(crate) fn life_glyph(
+    fx: &std::rc::Rc<Motion>,
+    l: glyph::Life,
+    ground: Hsla,
+    p: &Palette,
+    change: Option<(Instant, u64)>,
+    wait: Option<Instant>,
+) -> AnyElement {
+    use glyph::Life as L;
+    let ink = glyph::life_ink(l, ground, p);
+    let from = change.and_then(|c| L::of_code(c.1));
+    let at = change.map(|c| c.0);
+    let shot = |delay: u64, dur: Duration, e: &gpui_kit::base::motion::Easing, k: Mk| fx.shot(at, Duration::from_millis(delay), dur, e, k);
+    let boxed = || div().relative().flex_none().size(px(glyph::LIFE));
+    match (l, from) {
+        (L::Orbit, from) => {
+            let grow = if matches!(from, Some(L::Queued | L::Wait | L::Seen)) { shot(0, motion::FLICK, &ease::OUT, Mk::Spatial) } else { 1. };
+            glyph::orbit(fx, ink, grow).into_any_element()
+        }
+        (L::Done, Some(L::Orbit)) => {
+            let (start, len) = at.map_or((0., motion::ORBIT_STILL), |a| fx.orbit_then(a));
+            let close = shot(0, motion::FLICK, &ease::OUT, Mk::Spatial);
+            let gone = shot(140, motion::QUICK, &ease::IN, Mk::Fade);
+            let tick = shot(110, motion::BASE, &ease::WRITE, Mk::Spatial);
+            let calm = shot(400, motion::GLOW, &ease::OUT, Mk::Decay);
+            let mark = motion::mix(p.ok, p.dim_t, calm);
+            boxed()
+                .debug_selector(move || format!("life-close {close:.2} {tick:.2}"))
+                .children((gone < 1.).then(|| glyph::closing(start, len, close, motion::mix(p.acc, ground, gone))).flatten())
+                .child(glyph::life_at(L::Done, glyph::LifeInk { ring: None, mark }, 1., tick).absolute().top_0().left_0())
+                .into_any_element()
+        }
+        (L::Failed | L::Denied, Some(L::Orbit | L::Wait | L::Queued)) => {
+            // Its ring comes up as the mark writes on (the slash after the fold).
+            let delay = if l == L::Denied { 120 } else { 0 };
+            let ring = shot(delay, motion::QUICK, &ease::OUT, Mk::Fade);
+            let mark = shot(delay, motion::BASE, &ease::WRITE, Mk::Spatial);
+            let ink = glyph::LifeInk { ring: ink.ring.map(|c| motion::mix(ground, c, ring)), mark: ink.mark };
+            glyph::life_at(l, ink, ring, mark).into_any_element()
+        }
+        (L::Cancelled, Some(L::Orbit)) => {
+            let (start, len) = at.map_or((0., motion::ORBIT_STILL), |a| fx.orbit_then(a));
+            let out = shot(0, motion::QUICK, &ease::IN, Mk::Fade);
+            let come = shot(60, motion::QUICK, &ease::OUT, Mk::Fade);
+            let ink = glyph::LifeInk { ring: ink.ring.map(|c| motion::mix(ground, c, come)), mark: motion::mix(ground, ink.mark, come) };
+            boxed()
+                .children((out < 1.).then(|| glyph::arc(start, len, motion::mix(p.acc, ground, out))).flatten())
+                .child(glyph::life(l, ink).absolute().top_0().left_0())
+                .into_any_element()
+        }
+        (L::Wait, _) => {
+            // One ping out of the dot (§8 #7), then still until answered.
+            let ping = fx.ping(wait, Duration::ZERO);
+            glyph::life(l, ink).children(ping.map(|k| glyph::ping(k, p.acc, ground))).into_any_element()
+        }
+        _ => glyph::life(l, ink).into_any_element(),
+    }
+}
+
+/// The clock rolling over into the call's final duration (§8 #5): the old
+/// whole seconds up 8 px and out (90 ms, `in`), the duration up from 8 px
+/// (`snap` from +60, so they never overlap), in a one-line clip. `from`:
+/// when it finished while watched, and the clock it showed then; none: the
+/// duration at rest.
+fn clock_roll(fx: &std::rc::Rc<Motion>, from: Option<(Instant, String)>, took: SharedString, p: &Palette, m: &Metrics) -> AnyElement {
+    let (old, new) = fx.handover(from.as_ref().map(|f| f.0));
+    if new >= 1. {
+        return div().text_color(p.dim_t).child(took).into_any_element();
+    }
+    let line = px(m.mono_line);
+    let travel = 8.;
+    div()
+        .relative()
+        .h(line)
+        .overflow_hidden()
+        .child(div().invisible().child(took.clone()))
+        .children(from.filter(|_| old < 1.).map(|(_, text)| {
+            div().absolute().right_0().top(px(-travel * old)).text_color(motion::mix(p.acc, p.card_d, old)).child(text)
+        }))
+        .child(div().absolute().right_0().top(px(travel * (1. - new))).text_color(motion::mix(p.card_d, p.dim_t, new)).child(took))
+        .into_any_element()
 }
 
 #[cfg(test)]
