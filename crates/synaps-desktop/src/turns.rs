@@ -363,14 +363,25 @@ fn status(i: &Item) -> Option<ToolStatus> {
     i.tool.as_ref().and_then(|t| t.status)
 }
 
-/// The call a prompt waits on: the last unfinished call of the last turn.
-pub(crate) fn waiting_call(items: &[Item]) -> Option<u64> {
-    items
-        .iter()
-        .rev()
-        .take_while(|i| i.kind != ItemKind::User)
-        .find(|i| i.kind == ItemKind::Tool && !finished(i.tool.as_ref().and_then(|t| t.status)))
-        .map(|i| i.id)
+/// The call a prompt waits on: an unfinished call of the last turn, the
+/// first (Shady M1: the engine runs a response's calls that change things
+/// in one lane, in order, so only its head can be waiting on a confirm).
+/// With `pr`: the first whose tool is the one its scope names (and for a
+/// guard's shape, whose input holds the command's first line), else the
+/// first.
+pub(crate) fn waiting_call(items: &[Item], pr: Option<&synaps_client::protocol::PromptRequest>) -> Option<u64> {
+    let turn = items.iter().rposition(|i| i.kind == ItemKind::User).map_or(0, |u| u + 1);
+    let open: Vec<&Item> =
+        items[turn..].iter().filter(|i| i.kind == ItemKind::Tool && !finished(i.tool.as_ref().and_then(|t| t.status))).collect();
+    let tool = pr.and_then(|p| p.confirm_scope.as_ref()).and_then(|s| s.tool.as_deref()).filter(|t| !t.is_empty());
+    let line = pr.and_then(crate::authorize::guard_shape).map(|g| g.command.lines().next().unwrap_or_default().trim().to_string());
+    let named = |i: &&Item| {
+        i.tool
+            .as_ref()
+            .is_some_and(|t| tool.is_none_or(|n| t.name == n) && line.as_deref().is_none_or(|l| l.is_empty() || t.input.contains(l)))
+    };
+    let pick = if tool.is_some() || line.is_some() { open.iter().find(|i| named(i)) } else { None };
+    pick.or(open.first()).map(|i| i.id)
 }
 
 /// Where a rebuild after a change at item `k` starts: the turn holding
@@ -1639,6 +1650,7 @@ impl AppView {
         let think = item.kind == ItemKind::Thinking;
         let st = status(item);
         let geo = Geo::of(lay, m);
+        let call_id = item.tool.as_ref().map(|t| t.tool_id.as_str());
         let starts = item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name));
         let worker = starts.and_then(|t| {
             let subs = self.model.shown_subagents();
@@ -1704,12 +1716,12 @@ impl AppView {
             .children(row.card.facts.clone().map(|f| div().text_color(p.dim_t).child(f)))
             .children(running.then(|| clock(fx, row.started)).flatten().map(|c| div().text_color(p.dim_t).child(c)))
             .when_some(
-                crate::authorize::status_beside(state.1, self.row_receipt(id).map(|r| r.answer)).filter(|_| !lay.tight && !think),
+                crate::authorize::status_beside(state.1, self.row_receipt(call_id).map(|r| r.answer)).filter(|_| !lay.tight && !think),
                 |d, w| d.child(div().text_color(word_color).child(w)),
             )
             .children(row.card.server.clone().map(|s| div().text_color(p.dim_t).child(s)))
             // An answered prompt's receipt (polish.md §2.6).
-            .children((!think).then(|| self.receipt_el(id, p)).flatten());
+            .children((!think).then(|| self.receipt_el(call_id, p)).flatten());
         let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
         let verb = if think {
             div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.think).child("think").into_any_element()

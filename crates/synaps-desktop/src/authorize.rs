@@ -103,6 +103,9 @@ pub(crate) struct PromptCard {
     pub(crate) read: bool,
     /// Allow all is checked: ALLOW sends `"always"`.
     pub(crate) allow_all: bool,
+    /// The Allow all box was clicked: Space toggles it then only (Shady
+    /// M2; never from the card's keys alone).
+    pub(crate) box_focus: bool,
     /// Its row's height as last drawn (what a collapse starts from).
     pub(crate) height: Rc<Cell<f32>>,
     /// The item its row follows (an id), and whether that is its own
@@ -117,9 +120,9 @@ impl PromptCard {
     /// same key keeps its arm and read state; a new prompt, the same id in
     /// another attachment or after a reconnect (a restarted daemon numbers
     /// its prompts from 1 again) starts over, unarmed and unread, at `now`.
-    /// True when the card is new. `view`: the bottom of what is on screen
-    /// of the list (the window's height before it is laid out).
-    pub(crate) fn sync(card: &mut Option<PromptCard>, m: &Model, now: Instant, view: f32) -> bool {
+    /// True when the card is new. `view`: what is on screen of the list,
+    /// top and bottom (the window before it is laid out).
+    pub(crate) fn sync(card: &mut Option<PromptCard>, m: &Model, now: Instant, view: (f32, f32)) -> bool {
         match (m.card_key(), card.as_mut()) {
             (Some(k), Some(c)) if c.key == k => {
                 if c.below(view).is_some_and(|b| b <= 1.) {
@@ -149,7 +152,7 @@ impl PromptCard {
             arm: Arm::new(now),
             body: crate::app::well_body(&pr.prompt),
             gist: crate::chrome::prompt_gist(&pr.title, &pr.prompt).into(),
-            guard: (!secret).then(|| guard_shape(&pr.prompt)).flatten(),
+            guard: guard_shape(pr),
             asked: asked(pr).map(Into::into),
             pr: pr.clone(),
             scroll: ScrollHandle::new(),
@@ -157,6 +160,7 @@ impl PromptCard {
             actions: ScrollHandle::new(),
             read: false,
             allow_all: false,
+            box_focus: false,
             height: Rc::new(Cell::new(f32::NAN)),
             after: Cell::new(None),
             _arm: None,
@@ -171,15 +175,17 @@ impl PromptCard {
         self.arm.keys_armed(Instant::now())
     }
 
-    /// What of the well is out of sight with the list's view ending at
-    /// `view`, once it has been laid out: below its own view, or under the
-    /// list's bottom (the dock and the composer are not a place to read).
-    pub(crate) fn below(&self, view: f32) -> Option<f32> {
+    /// What of the well is out of sight with the list's view `top..view`,
+    /// once it has been laid out: below its own view, under the list's
+    /// bottom (the composer is not a place to read), or above the list's
+    /// top (Shady M3: in the list the card's top can scroll away).
+    pub(crate) fn below(&self, (top, view): (f32, f32)) -> Option<f32> {
         let b = self.scroll.bounds();
         if b.size.height <= px(0.) {
             return None;
         }
-        Some(hidden(f32::from(self.scroll.max_offset().y + self.scroll.offset().y), f32::from(b.bottom()), view))
+        let over = (top - f32::from(b.top())).max(0.);
+        Some(hidden(f32::from(self.scroll.max_offset().y + self.scroll.offset().y), f32::from(b.bottom()), view) + over)
     }
 
     /// Its buttons were laid out whole inside the list's view `top..view`
@@ -230,14 +236,18 @@ pub(crate) enum Answer {
     Provided,
     Cancelled,
     Elsewhere,
+    /// Resolved with no answer from here, and nothing says who: neutral.
+    Resolved,
 }
 
 /// An answered prompt's receipt, kept for its session while the window
 /// lives (the daemon keeps no record of who answered when).
 #[derive(Clone, Debug)]
 pub(crate) struct Receipt {
-    /// The call's row it sits in, or (`own`) the item its own row follows.
-    pub(crate) after: u64,
+    /// The call it belongs to: its daemon tool-use id (Shady H2: item ids
+    /// are one transcript's, a reopened tab or a compaction renumbers
+    /// them). In that call's row (its meta), or (`own`) a line after it.
+    pub(crate) call: SharedString,
     pub(crate) own: bool,
     pub(crate) row: u64,
     pub(crate) secret: bool,
@@ -261,8 +271,13 @@ impl Receipt {
             Answer::Provided => "provided",
             Answer::Cancelled => "cancelled",
             Answer::Elsewhere => "answered elsewhere",
+            Answer::Resolved => "resolved",
         };
-        let took = self.took.filter(|_| self.answer != Answer::Elsewhere).map(|d| format!(" · {}", took(d))).unwrap_or_default();
+        let took = self
+            .took
+            .filter(|_| !matches!(self.answer, Answer::Elsewhere | Answer::Resolved))
+            .map(|d| format!(" · {}", took(d)))
+            .unwrap_or_default();
         (word, format!(" {}{took}", self.at))
     }
 }
@@ -296,14 +311,36 @@ pub(crate) struct Guard {
     pub(crate) dir: SharedString,
 }
 
-pub(crate) fn guard_shape(body: &str) -> Option<Guard> {
-    let lines: Vec<&str> = body.lines().map(str::trim).collect();
-    let first_after = |at: usize| (at + 1..lines.len()).find(|&i| !lines[i].is_empty());
-    let intro = lines.iter().position(|l| l.starts_with("Message from ") && l.ends_with(':')).and_then(first_after)?;
-    let command = lines.get(first_after(intro)?)?.strip_prefix("$ ")?;
-    let line = lines[intro].strip_suffix(':')?;
-    let dir = line.rsplit_once(" in ")?.1.trim();
-    (!dir.is_empty() && !command.trim().is_empty()).then(|| Guard { command: command.to_string().into(), dir: dir.to_string().into() })
+///
+/// Only for a confirm the daemon framed cleanly (Shady H1): it has a scope,
+/// no extension rewrote the input (no `Input rewritten by` / `Input that
+/// will run`: the well must show what runs, so such a prompt is shown
+/// whole), and the daemon's header before `Message from …:` is exactly its
+/// `Extension:` and `Tool:` lines. The well then shows the message whole
+/// after its intro, every line up to `Allow this tool call?`.
+pub(crate) fn guard_shape(pr: &PromptRequest) -> Option<Guard> {
+    let scope = pr.confirm_scope.as_ref()?;
+    if !scope.rewritten_by.is_empty() || pr.is_secret() {
+        return None;
+    }
+    let lines: Vec<&str> = pr.prompt.lines().map(str::trim_end).collect();
+    let from = lines.iter().position(|l| l.starts_with("Message from ") && l.ends_with(':'))?;
+    let head: Vec<&str> = lines[..from].iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    if head.len() != 2 || !head[0].starts_with("Extension: ") || !head[1].starts_with("Tool: ") {
+        return None;
+    }
+    let first_after = |at: usize| (at + 1..lines.len()).find(|&i| !lines[i].trim().is_empty());
+    let intro = first_after(from)?;
+    let start = first_after(intro)?;
+    let command = lines[start].trim_start().strip_prefix("$ ")?;
+    let end = lines.iter().rposition(|l| l.trim() == "Allow this tool call?").filter(|&e| e > start).unwrap_or(lines.len());
+    let mut rest: Vec<&str> = lines[start + 1..end].to_vec();
+    while rest.last().is_some_and(|l| l.trim().is_empty()) {
+        rest.pop();
+    }
+    let command = std::iter::once(command).chain(rest).collect::<Vec<_>>().join("\n");
+    let dir = lines[intro].trim().strip_suffix(':')?.rsplit_once(" in ")?.1.trim();
+    (!dir.is_empty() && !command.trim().is_empty()).then(|| Guard { command: command.into(), dir: dir.to_string().into() })
 }
 
 /// A call row's status word beside its receipt: none when the receipt
@@ -356,10 +393,15 @@ pub(crate) fn built(disp: &[Disp]) -> Vec<PromptRow> {
     disp.iter().filter(|d| d.kind == Kind::Prompt).map(|d| PromptRow { after: d.item, id: d.id, rev: d.rev }).collect()
 }
 
-/// The index of item `id` in `items` (ids count up).
+/// The index of item `id` in `items` (ids are not sorted: notes keep
+/// theirs, a refold reuses some).
 fn index_of(items: &[Item], id: u64) -> Option<usize> {
-    let i = items.partition_point(|x| x.id < id);
-    items.get(i).filter(|x| x.id == id).map(|_| i)
+    items.iter().rposition(|x| x.id == id)
+}
+
+/// The index of the call with daemon tool-use id `call` in `items`.
+pub(crate) fn call_ix(items: &[Item], call: &str) -> Option<usize> {
+    items.iter().rposition(|x| x.tool.as_ref().is_some_and(|t| t.tool_id == call))
 }
 
 impl AppView {
@@ -380,7 +422,8 @@ impl AppView {
         // The collapsing card's row becomes its receipt line when it lands.
         let exit = self.card_exit.as_ref().filter(|e| e.session == sid);
         for r in self.receipts.get(sid).into_iter().flatten().filter(|r| r.own && exit.is_none_or(|e| e.card.row != r.row)) {
-            if let Some(after) = index_of(items, r.after) {
+            // Its call gone (compacted away): no line, never a wrong one.
+            if let Some(after) = call_ix(items, &r.call) {
                 out.push(PromptRow { after, id: r.row, rev: 1 });
             }
         }
@@ -439,9 +482,11 @@ impl AppView {
         let Some(ix) = self.card_ix() else { return false };
         match self.list.bounds_for_item(ix) {
             Some(b) => f32::from(b.top()) < bottom && f32::from(b.bottom()) > top && c.buttons_shown(top, bottom),
-            // Not drawn yet: the frame that draws a new card (at the end,
-            // where the list follows) counts it shown, as its buttons do.
-            None => c.height.get().is_nan() && self.list.is_following_tail(),
+            // Not drawn yet: the frame that draws a new card at the end,
+            // where the list follows, counts it shown, as its buttons do.
+            // Only as the last row (Shady M6): one placed above others is
+            // virtualised away, unseen.
+            None => c.height.get().is_nan() && self.list.is_following_tail() && ix + 1 == self.disp.len(),
         }
     }
 
@@ -457,7 +502,7 @@ impl AppView {
         }
         if self.model.watch.focus().is_some() {
             self.open_parent_card(cx);
-            self.jump_card = true;
+            self.jump_card = self.model.card_key();
             cx.notify();
             return;
         }
@@ -499,11 +544,17 @@ impl AppView {
         cx.notify();
     }
 
-    /// Space with the card's keys: Allow all on or off (when offered).
+    /// Space on the focused box, or a click: Allow all on or off (when
+    /// offered, and the card may be answered from here now). Its buttons
+    /// and keys wait again (Shady M2: a toggle and an ALLOW are never one
+    /// motion).
     pub(crate) fn toggle_allow_all(&mut self, cx: &mut Context<Self>) {
         let offered = self.allow_all_offered();
-        if let Some(c) = self.card.as_mut().filter(|_| offered) {
+        let may = self.card_answerable().is_some() && self.card.as_ref().is_some_and(|c| !self.model.prompt_answered(c.key.1));
+        if let Some(c) = self.card.as_mut().filter(|_| offered && may) {
             c.allow_all = !c.allow_all;
+            c.arm = Arm::new(Instant::now());
+            c._arm = Some(Self::arm_repaint(cx));
             log::info!(target: "synaps_desktop::card", "card {:?}: allow all {}", c.key, if c.allow_all { "on" } else { "off" });
             cx.notify();
         }
@@ -517,19 +568,21 @@ impl AppView {
         owner && self.current_card().is_some_and(|c| c.pr.allow_all().is_some())
     }
 
-    /// A tool row's receipt (its meta's last part), lifting in over `QUICK`.
-    pub(crate) fn receipt_el(&self, item: u64, p: &Palette) -> Option<AnyElement> {
+    /// A call row's receipt (its meta's last part), lifting in over `QUICK`.
+    pub(crate) fn receipt_el(&self, call: Option<&str>, p: &Palette) -> Option<AnyElement> {
         if self.model.watch.focus().is_some() {
             return None;
         }
-        let r = self.row_receipt(item)?;
+        let r = self.row_receipt(call)?;
         Some(self.receipt_words(r, p).into_any_element())
     }
 
-    /// The receipt a call's row carries in its meta, if any.
-    pub(crate) fn row_receipt(&self, item: u64) -> Option<&Receipt> {
+    /// The receipt the row of call `call` (its tool-use id) carries in its
+    /// meta, if any.
+    pub(crate) fn row_receipt(&self, call: Option<&str>) -> Option<&Receipt> {
+        let call = call?;
         let sid = self.model.active.as_ref()?.session_id.as_str();
-        self.receipts.get(sid)?.iter().rev().find(|r| !r.own && r.after == item)
+        self.receipts.get(sid)?.iter().rev().find(|r| !r.own && r.call == call)
     }
 
     fn receipt_words(&self, r: &Receipt, p: &Palette) -> Div {
@@ -600,8 +653,7 @@ impl AppView {
         let armed = live && c.armed();
         let keys_state = if live { self.card_keys.get() } else { None };
         let can = look.map_or_else(|| self.drives() && self.model.may_answer(pr.id) && armed, |l| l.can);
-        let (_, view) = self.list_view();
-        let below = c.below(view);
+        let below = c.below(self.list_view());
         let ready = look.map_or_else(|| authorize_ready(c.armed(), below, c.read), |l| l.ready);
         let detached = self.model.active.is_none();
         let in_field = look.map_or(keys_state == Some(true), |l| l.in_field);
@@ -621,10 +673,13 @@ impl AppView {
                         .items_center()
                         .child(
                             h_flex()
+                                .flex_1()
+                                .min_w(px((120. * r).round()))
+                                .max_w(px((260. * r).round() + 64.))
                                 .gap(px(8.))
                                 .items_center()
                                 .child(
-                                    div().w(px((260. * r).round())).child(
+                                    div().flex_1().min_w_0().max_w(px((260. * r).round())).child(
                                         gpui_kit::component::input::Input::new(&self.secret_input)
                                             .disabled(!can)
                                             .text_px(m.mono)
@@ -839,11 +894,8 @@ impl AppView {
                 |_, _, _| {},
                 move |b, _, window, _| {
                     let w = f32::from(b.size.width);
-                    let mut x = 0.;
-                    while x < w {
-                        let run = DASH.min(w - x);
-                        window.paint_quad(fill(Bounds::new(point(b.origin.x + px(x), b.origin.y), size(px(run), px(DASH_H))), warn_mark));
-                        x += DASH + DASH_GAP;
+                    for x in dash_xs(w) {
+                        window.paint_quad(fill(Bounds::new(point(b.origin.x + px(x), b.origin.y), size(px(DASH), px(DASH_H))), warn_mark));
                     }
                 },
             )
@@ -871,13 +923,13 @@ impl AppView {
             );
         let folder = c.guard.as_ref().map(|g| {
             mono(SharedString::from(format!("in {}", g.dir)), m.meta, p.dim_k)
-                .px(px(pad))
                 .min_w_0()
                 .overflow_hidden()
                 .text_ellipsis()
                 .debug_selector(|| "card-folder".into())
         });
         let scope = pr.allow_all().filter(|_| offered).cloned();
+        let check_focused = live && c.box_focus && keys;
         let check = scope.map(|s| {
             let (text, tip): (SharedString, SharedString) = (s.allow_all_label().into(), s.allow_all_scope().into());
             h_flex()
@@ -886,47 +938,70 @@ impl AppView {
                 .flex_none()
                 .gap(px(8.))
                 .items_center()
-                .cursor_pointer()
+                .when(live && can, |d| d.cursor_pointer())
                 .child(
                     div()
                         .flex_none()
                         .size(px(CHECK))
                         .border_1()
-                        .border_color(p.dim_k)
+                        // Focused (clicked): Space toggles it.
+                        .border_color(if check_focused { p.focus_k } else { p.dim_k })
                         .flex()
                         .items_center()
                         .justify_center()
                         .when(allow_all, |d| d.child(div().size(px(CHECK_IN)).bg(p.focus_k).debug_selector(|| "card-allow-all-on".into()))),
                 )
-                .child(div().text_px(fonts::size::TITLE).text_color(p.prose_k).whitespace_nowrap().child(text))
+                // The daemon's words, machine text (C2): mono, dim until
+                // checked (the finish gate of #18: the command is the card's
+                // first read, never this).
+                .child(mono(text, m.meta, if allow_all { p.prose_k } else { p.dim_k }).whitespace_nowrap())
                 .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
                 .when(live && can, |d| {
                     d.on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(c) = this.card.as_mut() {
+                            c.box_focus = true;
+                        }
                         this.toggle_allow_all(cx);
                     }))
                 })
         });
+        // The footer says what the card is waiting on: on its own line under
+        // the well (where a guard's folder sits, right of it), whole, never
+        // cut to a fragment beside the buttons (the finish gate of #18).
         let foot = footer.map(|f| {
             mono(f, m.meta, if footer_warn { p.warn_k } else { p.dim_k })
-                .min_w_0()
-                .overflow_hidden()
-                .text_ellipsis()
+                .flex_none()
+                .whitespace_nowrap()
                 .debug_selector(|| "card-footer".into())
         });
+        let status = (folder.is_some() || foot.is_some()).then(|| {
+            h_flex()
+                .flex_none()
+                .mt(px((8. * r).round()))
+                .px(px(pad))
+                .gap(px(16.))
+                .items_center()
+                .children(folder)
+                .child(div().flex_1())
+                .children(foot)
+        });
+        // Allow all left, the buttons right; in a narrow card the buttons
+        // wrap under it, still right (never pushed past the frame).
         let line = h_flex()
             .id("prompt-actions")
             .flex_none()
+            .flex_wrap()
             .mt(px((12. * r).round()))
             .mb(px(pad))
             .px(px(pad))
-            .h(px(crate::fit::button_h(m)))
-            .gap(px(16.))
+            .min_h(px(crate::fit::button_h(m)))
+            .gap_x(px(16.))
+            .gap_y(px(8.))
             .items_center()
+            .justify_between()
             .track_scroll(&c.actions)
             .children(check)
-            .children(foot)
-            .child(div().flex_1())
-            .children(actions);
+            .children(actions.map(|a| a.flex_grow(1.).justify_end()));
         v_flex()
             .id("prompt-card")
             .debug_selector(move || if live { "card".into() } else { "card-exit".into() })
@@ -964,9 +1039,23 @@ impl AppView {
                 let bar = if secret || !live { bar } else { bar.focus(self.focus.clone()) };
                 d.child(div().mt(px((12. * r).round())).mx(px(pad)).relative().child(well).child(bar))
             })
-            .children(folder.map(|f| f.mt(px((8. * r).round()))))
+            .children(status)
             .child(line)
     }
+}
+
+/// Where the top edge's dashes start, `DASH` on and about `DASH_GAP` off,
+/// the gaps spread so the run starts and ends on a dash at both corners.
+pub(crate) fn dash_xs(w: f32) -> Vec<f32> {
+    if w < DASH {
+        return Vec::new();
+    }
+    let n = ((w + DASH_GAP) / (DASH + DASH_GAP)).floor().max(1.) as usize;
+    if n == 1 {
+        return vec![((w - DASH) / 2.).round()];
+    }
+    let step = (w - DASH) / (n - 1) as f32;
+    (0..n).map(|i| (i as f32 * step).round()).collect()
 }
 
 /// The card in its row: 8·r above it, 12·r below (polish.md §2.6), as
@@ -982,21 +1071,110 @@ pub(crate) fn receipt_line(m: &Metrics) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answer, PromptRow, Receipt, asked, guard_shape, status_beside, took, with_prompts};
+    use super::{Answer, PromptRow, Receipt, asked, call_ix, dash_xs, guard_shape, status_beside, took, with_prompts};
     use crate::turns::{Disp, Gap, Kind, Who};
     use std::time::{Duration, Instant};
 
     const GUARD: &str = "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/work/relay-gateway:\n$ cargo test -p relay --test refresh_race\n\nAllow this tool call?";
 
+    /// A confirm as the daemon sends it: `body`, and a scope (`None`: none).
+    fn confirm(body: &str, scope: Option<serde_json::Value>) -> synaps_client::protocol::PromptRequest {
+        let mut v = serde_json::json!({"id": 1, "kind": "confirm", "title": "Confirm tool call", "prompt": body});
+        if let Some(s) = scope {
+            v["confirm_scope"] = s;
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn guard_scope() -> Option<serde_json::Value> {
+        Some(serde_json::json!({"extensions": ["guard"], "tool": "bash"}))
+    }
+
     #[test]
     fn a_guard_confirm_shows_its_command_and_folder() {
-        let g = guard_shape(GUARD).expect("a guard's shape");
+        let g = guard_shape(&confirm(GUARD, guard_scope())).expect("a guard's shape");
         assert_eq!((g.command.as_ref(), g.dir.as_ref()), ("cargo test -p relay --test refresh_race", "~/work/relay-gateway"));
-        assert_eq!(guard_shape(&GUARD.replace("\n", "\r\n")), Some(g), "CRLF reads the same");
+        assert_eq!(guard_shape(&confirm(&GUARD.replace("\n", "\r\n"), guard_scope())), Some(g), "CRLF reads the same");
         // Anything else is the whole body, as today.
-        assert_eq!(guard_shape("Tool: bash\n\nInput that will run:\n$ ls\n\nAllow this tool call?"), None);
-        assert_eq!(guard_shape("Extension: guard\n\nMessage from guard:\nedit writes outside the folder:\n{}"), None);
-        assert_eq!(guard_shape("Activate shell_start?"), None);
+        assert_eq!(guard_shape(&confirm("Tool: bash\n\nInput that will run:\n$ ls\n\nAllow this tool call?", guard_scope())), None);
+        assert_eq!(
+            guard_shape(&confirm("Extension: guard\n\nMessage from guard:\nedit writes outside the folder:\n{}", guard_scope())),
+            None
+        );
+        assert_eq!(guard_shape(&confirm("Activate shell_start?", guard_scope())), None);
+    }
+
+    /// Shady H1: the guard's shape only where the daemon framed the prompt
+    /// cleanly and nothing rewrote what runs; its message whole.
+    #[test]
+    fn a_rewritten_or_unscoped_confirm_is_shown_whole() {
+        assert_eq!(guard_shape(&confirm(GUARD, None)), None, "no scope: who asks is unknown");
+        let rewritten = "Extension: guard\nTool: bash\nInput rewritten by: wrap\nInput that will run:\n{\"command\": \"wrap cargo test\"}\n\
+                         Message from guard:\nbash wants to run a command in ~/w:\n$ cargo test\n\nAllow this tool call?";
+        let scope = |by: &[&str]| Some(serde_json::json!({"extensions": ["guard"], "tool": "bash", "rewritten_by": by}));
+        assert_eq!(guard_shape(&confirm(rewritten, scope(&["wrap"]))), None, "rewritten: the well shows what runs");
+        assert_eq!(guard_shape(&confirm(rewritten, scope(&[]))), None, "the daemon's header holds more than its two lines");
+        let spoof = "Message from guard:\nbash wants to run a command in ~/w:\n$ ls\n\nAllow this tool call?";
+        assert_eq!(guard_shape(&confirm(spoof, guard_scope())), None, "no daemon header above the message");
+        let many = "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n$ make a \\\n  && make b\nwarning: touches /etc\n\nAllow this tool call?";
+        let g = guard_shape(&confirm(many, guard_scope())).expect("a guard's shape");
+        assert_eq!(g.command.as_ref(), "make a \\\n  && make b\nwarning: touches /etc", "every line of the message after its intro");
+    }
+
+    /// Shady H2: a receipt names its call by the daemon's tool-use id, so a
+    /// fresh fold (a reopened tab, a cache miss) that numbers the items
+    /// anew still finds it, and a compaction that dropped it finds nothing.
+    #[test]
+    fn a_receipt_finds_its_call_after_a_refold() {
+        use synaps_client::protocol::{LlmEvent, SessionEvent, StreamEvent};
+        let mut live = synaps_client::transcript::Transcript::new();
+        live.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+        for id in ["toolu_a", "toolu_b", "toolu_c"] {
+            live.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolUse {
+                    tool_name: "bash".into(),
+                    tool_id: id.into(),
+                    input: serde_json::json!({"command": id}),
+                }),
+            });
+        }
+        let call = |id: &str| serde_json::json!({"type": "tool_use", "id": id, "name": "bash", "input": {"command": id}});
+        let result = |id: &str| serde_json::json!({"type": "tool_result", "tool_use_id": id, "content": "ok"});
+        let mut fresh = synaps_client::transcript::Transcript::new();
+        fresh.apply_history(&[
+            serde_json::json!({"role": "user", "content": "first"}),
+            serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "on it"}, call("toolu_a"), call("toolu_b"), call("toolu_c")]}),
+            serde_json::json!({"role": "user", "content": [result("toolu_a"), result("toolu_b"), result("toolu_c")]}),
+        ]);
+        let id_of = |t: &synaps_client::transcript::Transcript, c: &str| call_ix(t.items(), c).map(|ix| t.items()[ix].id);
+        assert_ne!(id_of(&live, "toolu_b"), id_of(&fresh, "toolu_b"), "the fold numbers its items anew");
+        for t in [&live, &fresh] {
+            let ix = call_ix(t.items(), "toolu_b").expect("found by its tool-use id");
+            assert_eq!(t.items()[ix].tool.as_ref().unwrap().tool_id, "toolu_b");
+        }
+        let mut compacted = synaps_client::transcript::Transcript::new();
+        compacted.apply_history(&[
+            serde_json::json!({"role": "user", "content": "summary of what came before"}),
+            serde_json::json!({"role": "assistant", "content": [call("toolu_c")]}),
+        ]);
+        assert_eq!(call_ix(compacted.items(), "toolu_a"), None, "compacted away: no receipt line, never a wrong one");
+        assert!(call_ix(compacted.items(), "toolu_c").is_some());
+    }
+
+    /// The finish gate of #18 (optional, taken): the dashes start and end on
+    /// a dash at both corners, at any width.
+    #[test]
+    fn the_dashes_end_on_both_corners() {
+        for w in [100., 591., 592., 600., 624., 672., 700., 1234.5] {
+            let xs = dash_xs(w);
+            assert_eq!(xs[0], 0., "{w}");
+            assert!((xs.last().unwrap() + super::DASH - w).abs() <= 0.5, "{w}: {xs:?}");
+            for p in xs.windows(2) {
+                let gap = p[1] - p[0] - super::DASH;
+                assert!((super::DASH_GAP - 1.5..=super::DASH_GAP + 3.).contains(&gap), "{w}: gap {gap}");
+            }
+        }
+        assert!(dash_xs(4.).is_empty());
     }
 
     #[test]
@@ -1019,7 +1197,7 @@ mod tests {
     #[test]
     fn a_receipt_says_what_and_when() {
         let r = |answer, took| Receipt {
-            after: 1,
+            call: "toolu_1".into(),
             own: false,
             row: 1,
             secret: false,
@@ -1036,6 +1214,8 @@ mod tests {
         assert_eq!(words(r(Answer::Denied, None)), "denied 14:21");
         assert_eq!(words(r(Answer::Elsewhere, Some(Duration::from_secs(3)))), "answered elsewhere 14:21", "not ours: no wait");
         assert_eq!(words(r(Answer::Provided, None)), "provided 14:21");
+        assert_eq!(words(r(Answer::Cancelled, Some(Duration::from_secs(4)))), "cancelled 14:21 · 4s");
+        assert_eq!(words(r(Answer::Resolved, Some(Duration::from_secs(4)))), "resolved 14:21", "not ours: no wait");
         assert_eq!(status_beside(Some("denied"), Some(Answer::Denied)), None, "one denied, the receipt's");
         assert_eq!(status_beside(Some("denied"), None), Some("denied"));
         assert_eq!(status_beside(Some("failed"), Some(Answer::Allowed)), Some("failed"));

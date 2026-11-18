@@ -1482,9 +1482,13 @@ pub struct AppView {
     pub(crate) sent: Option<crate::authorize::Sent>,
     /// This frame's [`AppView::card_keys_live`] (the card's row reads it).
     pub(crate) card_keys: Cell<Option<bool>>,
-    /// Ctrl+J from a worker's view or a pane: reveal the card once its
-    /// row is built.
-    pub(crate) jump_card: bool,
+    /// Ctrl+J from a worker's view or a pane: reveal this card (its
+    /// [`Model::card_key`]) once its row is built; dropped when that card
+    /// goes (Shady M5: a later card never takes the keys from the composer).
+    pub(crate) jump_card: Option<(u64, u64)>,
+    /// The session this window last sent HALT to, and when: a prompt that
+    /// resolves after it was cancelled here, not answered elsewhere.
+    pub(crate) halted: Option<(String, Instant)>,
     /// The list's view (top, bottom) as its last layout left it.
     pub(crate) list_box: Cell<(f32, f32)>,
     /// The card's row was on screen, buttons whole, at the frame's start.
@@ -1562,6 +1566,7 @@ pub struct AppView {
     /// HALTs sent ([`AppView::halt`]): the UI tests' record.
     #[cfg(test)]
     pub(crate) halts: usize,
+
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -2045,7 +2050,8 @@ impl AppView {
             receipts: HashMap::new(),
             sent: None,
             card_keys: Cell::new(None),
-            jump_card: false,
+            jump_card: None,
+            halted: None,
             list_box: Cell::new((0., 0.)),
             card_seen: Cell::new(false),
             #[cfg(test)]
@@ -2076,6 +2082,7 @@ impl AppView {
             submits: Vec::new(),
             #[cfg(test)]
             halts: 0,
+
             _tasks: Vec::new(),
             _subs: subs,
         }
@@ -3616,7 +3623,7 @@ impl AppView {
 
     /// Repaint the card when its arm runs out (its buttons, and the keys
     /// they show, light up).
-    fn arm_repaint(cx: &mut Context<Self>) -> Task<()> {
+    pub(crate) fn arm_repaint(cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(ARM).await;
             let _ = this.update(cx, |_, cx| cx.notify());
@@ -3654,7 +3661,7 @@ impl AppView {
 
     /// The card's prompt, if this window may answer it now (as its
     /// buttons: driving, not yet answered, armed).
-    fn card_answerable(&self) -> Option<(&PromptCard, bool)> {
+    pub(crate) fn card_answerable(&self) -> Option<(&PromptCard, bool)> {
         let c = self.current_card()?;
         let pr = self.model.transcript.pending_prompts().first()?;
         (self.drives() && self.model.may_answer(pr.id) && c.armed()).then_some((c, pr.is_secret()))
@@ -3707,8 +3714,7 @@ impl AppView {
 
     /// AUTHORIZE: only once the whole body has been on screen.
     pub(crate) fn authorize(&mut self, key: (u64, u64)) {
-        let (_, view) = self.list_view();
-        let ready = self.card.as_ref().is_some_and(|c| c.key == key && authorize_ready(c.armed(), c.below(view), c.read));
+        let ready = self.card.as_ref().is_some_and(|c| c.key == key && authorize_ready(c.armed(), c.below(self.list_view()), c.read));
         if ready {
             // Allow all, checked (and still offered: this client owns the input).
             let all = self.allow_all_offered() && self.card.as_ref().is_some_and(|c| c.allow_all);
@@ -3737,17 +3743,28 @@ impl AppView {
         let Some(sid) = self.model.active.as_ref().map(|a| a.session_id.clone()) else { return };
         let items = self.model.transcript.items();
         let Some(last) = items.last().map(|i| i.id) else { return };
-        let (after, own) = c.after.get().unwrap_or_else(|| match turns::waiting_call(items).filter(|_| !c.secret) {
+        let (after, own) = c.after.get().unwrap_or_else(|| match turns::waiting_call(items, Some(&c.pr)).filter(|_| !c.secret) {
             Some(call) => (call, false),
             None => (last, true),
         });
-        let (answer, at, took) = match self.sent.take().filter(|s| s.key == c.key) {
+        // The call it belongs to, by its tool-use id (Shady H2): the one it
+        // sits under, or for its own line the call it waited in (else the
+        // last call before it). None: no receipt (nothing to hang it on).
+        let ix = items.iter().rposition(|i| i.id == after);
+        let call = ix.and_then(|ix| {
+            let gated = turns::waiting_call(items, Some(&c.pr)).and_then(|id| items.iter().rposition(|i| i.id == id));
+            let at = if own { gated.filter(|&g| g <= ix).unwrap_or(ix) } else { ix };
+            items[..=at].iter().rev().find_map(|i| i.tool.as_ref()).map(|t| SharedString::from(t.tool_id.clone()))
+        });
+        let mine = self.sent.take().filter(|s| s.key == c.key);
+        let (answer, at, took) = match mine {
             Some(s) => (s.answer, s.at, Some(s.took)),
-            None => (crate::authorize::Answer::Elsewhere, crate::authorize::hhmm_now(), None),
+            None => (self.resolved_by(&c, &sid), crate::authorize::hhmm_now(), None),
         };
         log::info!(target: "synaps_desktop::card", "card {:?}: resolved ({answer:?})", c.key);
+        let Some(call) = call else { return };
         let receipts = self.receipts.entry(sid.clone()).or_default();
-        receipts.push(crate::authorize::Receipt { after, own, row: c.row, secret: c.secret, answer, at, took, landed: fx_now });
+        receipts.push(crate::authorize::Receipt { call, own, row: c.row, secret: c.secret, answer, at, took, landed: fx_now });
         if receipts.len() > crate::authorize::RECEIPTS {
             receipts.remove(0);
         }
@@ -3767,6 +3784,23 @@ impl AppView {
         }
     }
 
+    /// What resolved a prompt this window did not answer (Shady M4): a HALT
+    /// from here since it was shown, or its turn already over (a cancel, a
+    /// revoke, a reload's drain), is `cancelled` (the tool saw no answer:
+    /// blocked); another client owning the input, `answered elsewhere`;
+    /// else `resolved`, saying nothing it does not know.
+    fn resolved_by(&self, c: &PromptCard, sid: &str) -> crate::authorize::Answer {
+        use crate::authorize::Answer;
+        let halted = self.halted.as_ref().is_some_and(|(s, at)| s == sid && *at >= c.arm.shown_at());
+        if halted || !self.model.transcript.busy() || self.model.reload {
+            return Answer::Cancelled;
+        }
+        match self.model.active.as_ref() {
+            Some(a) if a.owner.is_some() && a.owner != Some(a.client) => Answer::Elsewhere,
+            _ => Answer::Resolved,
+        }
+    }
+
     /// Keep the card's state with the prompt it shows ([`PromptCard::sync`]).
     /// Another card, or none, clears what the secret field holds (its undo
     /// history too): it was meant for the card that went. A secret card
@@ -3779,7 +3813,7 @@ impl AppView {
     /// came back (the card came into view, an overlay closed, the focus or
     /// the window came to it) wait again.
     fn sync_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (_, view) = self.list_view();
+        let view = self.list_view();
         let now = Instant::now();
         let was = self.card.as_ref().map(|c| (c.key, c.secret));
         // The collapse lands; a switch, a reconnect or motion turned down
@@ -4171,7 +4205,7 @@ impl AppView {
                 return self.sync_subagents();
             }
         };
-        self.waiting_on = turns::waiting_call(items);
+        self.waiting_on = turns::waiting_call(items, self.model.shown().pending_prompts().first());
         let start = turns::turn_start(items, from);
         self.synced_busy = busy;
         // Rows that arrive while watched (a tail splice of a few items, not
@@ -4805,6 +4839,7 @@ impl AppView {
             && self.model.can_send()
         {
             let _ = c.abort();
+            self.halted = self.model.active.as_ref().map(|a| (a.session_id.clone(), Instant::now()));
             #[cfg(test)]
             {
                 self.halts += 1;
@@ -5578,9 +5613,17 @@ impl Render for AppView {
         self.sync_list();
         self.read_card_on_screen();
         self.card_keys.set(self.card_keys_live(window, cx));
-        // Ctrl+J from a worker's view: the card once its row is built.
-        if self.jump_card && self.model.watch.focus().is_none() && self.model.tabs.view().is_none() && self.card_ix().is_some() {
-            self.jump_card = false;
+        // Ctrl+J from a worker's view: the card once its row is built (that
+        // card only: another, or none, drops it).
+        if self.jump_card.is_some() && self.jump_card != self.model.card_key() {
+            self.jump_card = None;
+        }
+        if self.jump_card.is_some_and(|k| self.current_card().is_some_and(|c| c.key == k))
+            && self.model.watch.focus().is_none()
+            && self.model.tabs.view().is_none()
+            && self.card_ix().is_some()
+        {
+            self.jump_card = None;
             self.reveal_card(window, cx);
         }
         // Seen every frame while attached, shown or not: a card that comes
@@ -6095,10 +6138,15 @@ impl Render for AppView {
                 let blocked = this.focus.is_focused(window) && this.text_keys_blocked(Instant::now());
                 let card = card_key(&ev.keystroke).filter(|_| this.card_keys_live(window, cx) == Some(false));
                 let bare = !(m.control || m.alt || m.shift || m.platform || m.function);
-                if ev.keystroke.key == "space" && bare && this.card_keys_live(window, cx) == Some(false) && this.allow_all_offered() {
-                    // Space toggles Allow all: a new press, once the keys are armed.
+                if ev.keystroke.key == "space"
+                    && bare
+                    && this.current_card().is_some_and(|c| c.box_focus)
+                    && this.card_keys_live(window, cx) == Some(false)
+                {
+                    // Space toggles Allow all only with its box focused: a new
+                    // press, once the keys are armed (the toggle re-arms them).
                     cx.stop_propagation();
-                    if this.chord_press && this.current_card().is_some_and(|c| c.keys_armed()) {
+                    if this.chord_press && this.allow_all_offered() && this.current_card().is_some_and(|c| c.keys_armed()) {
                         this.toggle_allow_all(cx);
                     }
                 } else if let Some(c) = card {
