@@ -1067,6 +1067,11 @@ pub struct ConversationSnapshot {
     /// (`ConversationTokens`); `Null` from a daemon that predates them.
     #[serde(default)]
     pub keepwarm_tokens: Value,
+    /// Events the engine holds, not in the history yet (buffered in a
+    /// turn, or kept after a failed turn or compaction until the next
+    /// turn's end), as on [`ConversationDigest::pending_events_len`].
+    #[serde(default)]
+    pub pending_events_len: usize,
 }
 
 /// `wire::ConversationDigest`: what `Conversation` carries on the wire.
@@ -1085,6 +1090,12 @@ pub struct ConversationDigest {
     pub cost: f64,
     #[serde(default)]
     pub queued_message: Option<String>,
+    /// Events the engine holds, not in the history yet: buffered while a
+    /// turn or a compaction runs (flushed at the turn's end), or put back
+    /// by a failed turn (`clear_stream`) or kept by a failed compaction,
+    /// until the next turn's end.
+    #[serde(default)]
+    pub pending_events_len: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
