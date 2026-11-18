@@ -1,0 +1,19 @@
+04:51:01 main-bench main-panels-1280x720-1 load 3.16 swapins 28
+04:51:15 q5 q5-panels-1280x720-1 load 2.70 swapins 49
+04:51:30 main-bench main-panels-1920x1080-1 load 2.32 swapins 16
+04:51:44 q5 q5-panels-1920x1080-1 load 2.24 swapins 31
+04:51:58 main-bench main-panels-1280x720-2 load 2.14 swapins 47
+04:52:13 q5 q5-panels-1280x720-2 load 1.73 swapins 37
+04:52:27 main-bench main-panels-1920x1080-2 load 1.57 swapins 16
+04:52:41 q5 q5-panels-1920x1080-2 load 1.37 swapins 31
+04:52:56 main-bench main-panels-1280x720-3 load 1.29 swapins 113
+04:53:10 q5 q5-panels-1280x720-3 load 1.16 swapins 24
+04:53:24 main-bench main-panels-1920x1080-3 load 1.35 swapins 44
+04:53:39 q5 q5-panels-1920x1080-3 load 1.41 swapins 61
+04:58:15 main main-motion-1 load 1.27 swapins 96702
+05:02:52 q5 q5-motion-1 load 1.13 swapins 35847
+05:07:29 main main-motion-2 load 1.33 swapins 3025
+05:12:05 q5 q5-motion-2 load 1.20 swapins 5374
+05:16:42 main main-motion-3 load 0.70 swapins 291
+05:21:18 q5 q5-motion-3 load 1.10 swapins 307
+BENCH-DONE

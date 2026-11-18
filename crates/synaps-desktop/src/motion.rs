@@ -239,6 +239,9 @@ pub(crate) const STREAM_FADE: Duration = Duration::from_millis(180);
 pub(crate) const STREAM_STAGGER: Duration = Duration::from_millis(12);
 /// Positions settle within this (px).
 const FLUID_EPSILON: f32 = 0.5;
+/// [`Motion::spring_px`]: a change due within a 144 Hz frame is the next
+/// frame's; one due later, a timer's.
+const PX_FRAME: Duration = Duration::from_micros(6944);
 /// A press's release has settled (its fill and travel, as progress).
 const PRESS_EPSILON: f32 = 0.002;
 
@@ -375,22 +378,43 @@ pub(crate) fn grow_block(body: AnyElement, label: Option<(Div, f32)>, head: Opti
         .w_full()
         .flex()
         .flex_col()
-        .child(ClipY(clip.into_any_element()))
+        .child(ClipY(clip.into_any_element(), None))
         .children(label.map(|(l, top)| lift(l.top(px(top + g.travel)), g.strength)))
         .children(head)
         .into_any_element()
+}
+
+/// `el` clipped to its own top and bottom only (x is left to the parents):
+/// a box whose height is on a spring (the composer's growth, the dock).
+pub(crate) fn clip_y(el: AnyElement) -> AnyElement {
+    ClipY(el, None).into_any_element()
+}
+
+/// `el` laid out at its own height, drawn only down to `h` px under its
+/// top (a section's body as it unfolds: its place in the list is its own).
+pub(crate) fn clip_h(el: AnyElement, h: f32) -> AnyElement {
+    ClipY(el, Some(h)).into_any_element()
 }
 
 /// Its child, clipped to its own top and bottom and nothing else: a
 /// revealing row's gutter (the hanging labels, the write head, left of the
 /// row's box) stays drawn. GPUI's `overflow_*` clip x as well, whichever
 /// axis they hide. The list's own mask still bounds x.
-struct ClipY(AnyElement);
+struct ClipY(AnyElement, Option<f32>);
 
 impl ClipY {
     fn mask(b: Bounds<Pixels>) -> ContentMask<Pixels> {
         let wide = px(1.0e6);
         ContentMask { bounds: Bounds::from_corners(point(b.left() - wide, b.top()), point(b.right() + wide, b.bottom())) }
+    }
+
+    /// [`ClipY::mask`], down to its limit if it has one.
+    fn mask_of(&self, b: Bounds<Pixels>) -> ContentMask<Pixels> {
+        let mut m = Self::mask(b);
+        if let Some(h) = self.1 {
+            m.bounds.size.height = m.bounds.size.height.min(px(h.max(0.)));
+        }
+        m
     }
 }
 
@@ -433,7 +457,8 @@ impl Element for ClipY {
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_content_mask(Some(Self::mask(bounds)), |window| {
+        let mask = self.mask_of(bounds);
+        window.with_content_mask(Some(mask), |window| {
             self.0.prepaint(window, cx);
         });
     }
@@ -448,7 +473,8 @@ impl Element for ClipY {
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_content_mask(Some(Self::mask(bounds)), |window| self.0.paint(window, cx));
+        let mask = self.mask_of(bounds);
+        window.with_content_mask(Some(mask), |window| self.0.paint(window, cx));
     }
 }
 
@@ -889,6 +915,8 @@ pub(crate) struct Motion {
     /// Chrome on springs (the tab indicator, the rail's selection, a
     /// segment's bar, the readout's y): the window's, never rescoped.
     springs: RefCell<HashMap<u64, Sprung>>,
+    /// Each [`Motion::cell_slide`]'s cell, and the frame that drew it.
+    cells: RefCell<HashMap<u64, (u64, u64)>>,
     /// A view pane is drawing, and something in it asked for a frame.
     pane: Cell<bool>,
     pane_wants: Cell<bool>,
@@ -1313,6 +1341,7 @@ impl Motion {
             slides: RefCell::default(),
             turns: RefCell::default(),
             springs: RefCell::default(),
+            cells: RefCell::default(),
             hovers: RefCell::default(),
             pane: Cell::new(false),
             pane_wants: Cell::new(false),
@@ -1609,6 +1638,7 @@ impl Motion {
         self.slides.borrow_mut().retain(|_, s| alive(s.frame));
         self.turns.borrow_mut().retain(|_, t| alive(t.1));
         self.springs.borrow_mut().retain(|_, s| alive(s.frame));
+        self.cells.borrow_mut().retain(|_, c| alive(c.1));
         self.hovers.borrow_mut().retain(|_, h| alive(h.1));
         self.glows.borrow_mut().retain(|_, s| alive(s.frame));
         self.rolls.borrow_mut().retain(|_, r| alive(r.frame));
@@ -2029,6 +2059,26 @@ impl Motion {
         self.births.borrow().get(&id).copied()
     }
 
+    /// Something small arriving in a row (a worker chip, polish.md P13),
+    /// `born` then (staggered: maybe still to come): its content's travel
+    /// from below ([`ARRIVE`] → 0 on `flick`) and its strength ([`LIFT`] →
+    /// 1 over `quick` `out`). Not born, or not fluid: at rest.
+    pub(crate) fn arrival(&self, born: Option<Instant>) -> (f32, f32) {
+        let Some(born) = born.filter(|_| self.fluid()) else { return (0., 1.) };
+        let Some(since) = self.now().checked_duration_since(born) else {
+            self.want_at(born);
+            return (ARRIVE, LIFT);
+        };
+        let t = since.as_secs_f32();
+        let travel = Spring::from_rest(ARRIVE, FLICK_RESPONSE, t);
+        let strength = LIFT + (1. - LIFT) * ease::OUT.sample((t / QUICK.as_secs_f32()).clamp(0., 1.));
+        if travel < FLUID_EPSILON && strength >= 1. {
+            return (0., 1.);
+        }
+        self.want_frame();
+        (travel, strength)
+    }
+
     /// Row `key` is revealing: growing, or born too lately to have begun.
     pub(crate) fn revealing(&self, key: u64) -> bool {
         self.grows.borrow().contains_key(&key) || self.birth(key).is_some_and(|b| self.now().saturating_duration_since(b) < QUICK)
@@ -2130,6 +2180,35 @@ impl Motion {
         self.spring(key, None, target, response)
     }
 
+    /// [`Motion::spring_held`] on whole device pixels (a side panel's
+    /// width: GPUI lays boxes out on them anyway). Its value snapped; the
+    /// next frame is asked for only when the snapped value will have
+    /// changed by then, else a timer for the instant it does (or the spring
+    /// settles): the slow tail moves under a pixel a frame, and no frame
+    /// draws what the last one drew. Its value, and whether it moves.
+    pub(crate) fn spring_px(&self, key: u64, target: f32, response: f32) -> (f32, bool) {
+        let asked = (self.display.get(), self.pane_wants.get());
+        let (v, moving) = self.spring_held(key, target, response);
+        let shown = self.snap(v);
+        if !moving {
+            return (shown, false);
+        }
+        self.display.set(asked.0);
+        self.pane_wants.set(asked.1);
+        let now = self.now();
+        let Some(s) = self.springs.borrow().get(&key).copied() else { return (shown, true) };
+        let next = (1..=1000u64)
+            .map(|k| now + Duration::from_millis(k))
+            .find(|&t| s.settled(t) || self.snap(s.target + s.state(t).0) != shown)
+            .unwrap_or(now + Duration::from_secs(1));
+        if next <= now + PX_FRAME {
+            self.want_frame();
+        } else {
+            self.want_at(next);
+        }
+        (shown, true)
+    }
+
     /// Value `key` eased toward `to` (a label's colour, as 0..1): over `up`
     /// (rising) or `down` (falling) for a whole 0 → 1, from where it is.
     /// First drawn, not drawn last frame, or Off: at `to`. Reduced: over
@@ -2167,6 +2246,21 @@ impl Motion {
         }
         let (frame, now) = (self.frame.get(), self.now());
         self.springs.borrow_mut().insert(key, Sprung { target, x0: at - target, v0: 0., at: now, frame, response });
+    }
+
+    /// A grid item's place on one axis, `at` px: cell `cell` of its grid
+    /// (a worker chip's column or line). A new cell is a move: from where
+    /// it was drawn, in px on `snap`, to the end (no cap, no half-cell
+    /// rest: [`Slide`]'s epsilon is a pixel's). A new pitch in the same
+    /// cell (the column's share as a panel lands) is taken at once. Its
+    /// paint offset. Not drawn last frame, or not [`Level::Full`]: 0.
+    pub(crate) fn cell_slide(&self, key: u64, cell: u64, at: f32) -> f32 {
+        let frame = self.frame.get();
+        let moved = self.cells.borrow_mut().insert(key, (cell, frame)).is_some_and(|(c, f)| c != cell && f + 1 >= frame);
+        if moved && let Some(was) = self.spring_at(key) {
+            self.spring_jump(key, was, at, SNAP_RESPONSE);
+        }
+        self.spring_held(key, at, SNAP_RESPONSE).0 - at
     }
 
     /// Where chrome position `key` was drawn last, if it is on a spring.
@@ -2562,6 +2656,44 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    /// A side panel's width on whole pixels ([`Motion::spring_px`]): a
+    /// frame is asked for only when the width drawn will have changed by
+    /// then, else a timer for the instant it does. Driven as the app is (the
+    /// next 144 Hz frame, or the timer), a 280-px `sheet` fold draws each
+    /// width once (the landing frame apart) and lands as the spring does:
+    /// ~52 frames where drawing every frame of it takes ~71.
+    #[test]
+    fn a_pixel_spring_draws_each_width_once() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        let sheet = super::SHEET_RESPONSE;
+        m.begin_frame(Level::Full, false, t0);
+        m.spring_jump(9, 280., 0., sheet);
+        let (mut t, mut drawn) = (t0, Vec::new());
+        for _ in 0..200 {
+            m.begin_frame(Level::Full, false, t);
+            let (v, moving) = m.spring_px(9, 0., sheet);
+            assert_eq!(v, v.round(), "whole pixels");
+            drawn.push(v);
+            if !moving {
+                break;
+            }
+            t = match m.demand() {
+                (true, _) => t + Duration::from_micros(6944),
+                (false, Some(at)) => at,
+                (false, None) => panic!("moving, and nothing asked for"),
+            };
+        }
+        let ms = t.duration_since(t0).as_millis();
+        assert_eq!(drawn.last(), Some(&0.), "landed");
+        assert!((470..=520).contains(&ms), "as long as the spring: {ms} ms");
+        let same = drawn.windows(2).filter(|p| p[0] == p[1]).count();
+        assert!(same <= 1, "each width drawn once: {drawn:?}");
+        assert!((45..=60).contains(&drawn.len()), "{} frames", drawn.len());
+        assert!(drawn.windows(2).all(|p| p[1] <= p[0]), "one way");
+        assert_eq!(m.demand(), (false, None), "at rest: nothing asked for");
     }
 
     /// Off: nothing samples anything but the end state, nothing asks for a
