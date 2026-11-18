@@ -3941,8 +3941,11 @@ impl AppView {
         let h = turns::mean_height(above, &self.rows, m, turns::cpl(self.layout.column, m));
         if h > 0. {
             // A builder, on a clone: `ListState` is shared, so the hint lands
-            // on the list itself.
-            let _ = l.clone().with_uniform_item_height(px(h));
+            // on the list itself. Whole pixels (Shady #23 r2 H1): a mean is a
+            // ninth or a seventh, and a hint stays in the list's sums until
+            // its row is drawn, putting every position under it, and the
+            // following list's end, an f32 ulp off (28.000061 on CI).
+            let _ = l.clone().with_uniform_item_height(px(h.round().max(1.)));
         }
     }
 

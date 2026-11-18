@@ -3856,8 +3856,10 @@ fn fluid_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVie
 /// Shady #23 r2 H1: the list's end is its bottom, exactly, whatever frames
 /// land mid-growth. Each frame rate puts different rows out of view in the
 /// middle of their growth, where the list keeps the height it last
-/// measured; a fractional one put CI's end an f32 ulp off. At 24 to 240 Hz:
-/// the end is the bottom every frame, and every row drawn is whole.
+/// measured; the rows never drawn keep a hint, the mean of the rows above
+/// (a ninth: `.2222`). A fractional one put CI's end an f32 ulp off. At 24
+/// to 240 Hz: the end is the bottom every frame, every row drawn is whole,
+/// and so is the list's extent (the hints too).
 #[gpui_kit::test]
 fn the_lists_end_is_exact_at_any_frame_rate(cx: &mut TestAppContext) {
     for hz in [24u64, 37, 60, 144, 240] {
@@ -3866,6 +3868,9 @@ fn the_lists_end_is_exact_at_any_frame_rate(cx: &mut TestAppContext) {
         view.update(cx, |v, _| v.client = None);
         start_stream(cx, &view);
         settle(cx, w, 8);
+        let (extent, vh) =
+            view.read_with(cx, |v, _| (f32::from(v.list.max_offset_for_scrollbar().y), f32::from(v.list.viewport_bounds().size.height)));
+        assert_eq!((extent + vh).fract(), 0., "{hz} Hz: opened, the rows' sum ({extent} past {vh}; the rows above, hinted)");
         view.update(cx, |v, _| v.list.scroll_to_end());
         let dt = std::time::Duration::from_micros(1_000_000 / hz);
         for k in 0..90 {
@@ -3887,6 +3892,12 @@ fn the_lists_end_is_exact_at_any_frame_rate(cx: &mut TestAppContext) {
             });
             assert!(frac.is_empty(), "{hz} Hz, frame {k}: rows off the pixel grid {frac:?}");
             assert_eq!(gap, Some(pad), "{hz} Hz, frame {k}: the end is the bottom");
+            // The rows not drawn too (their hints): the rows' sum is whole
+            // (the extent past a viewport that a dock's spring may hold
+            // mid-pixel).
+            let (extent, vh) = view
+                .read_with(cx, |v, _| (f32::from(v.list.max_offset_for_scrollbar().y), f32::from(v.list.viewport_bounds().size.height)));
+            assert_eq!((extent + vh).fract(), 0., "{hz} Hz, frame {k}: the rows' sum ({extent} past {vh})");
         }
     }
 }
