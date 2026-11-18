@@ -29,8 +29,11 @@ Every run is listed in `summary.txt`. The run-to-run spread of **one** binary is
 - `--bench` idle PSS for main: 71,993 / 72,550 / 72,814.
 
 r1 had idle PSS at +5.3 % (`--bench`) and +6.1 % (`--bench-motion`), one run each against the installed
-`.q4`. Those deltas don't reproduce here. With three runs each, Q2 is at or below main at every point, and
-anonymous memory is equal within 1.1 %.
+`.q4`. Those deltas don't reproduce here. With three runs each there is **no measurable difference**:
+anonymous memory is equal within 1.1 % at every point. PSS can't resolve a ±2 % delta on this machine
+(main's own spread, above, is up to 18 %), so the PSS medians in the table are context, not a result.
+Motion runs 1 ran at load 9.43 (main) and 10.05 (Q2), over the bound of 6: `quiet()` gave up after 180 s
+(`log`). The other ten runs started under 6.
 
 ## Where it would have come from: the binary
 

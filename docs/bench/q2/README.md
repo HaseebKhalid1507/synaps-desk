@@ -1,5 +1,9 @@
 # Q2 Authorize: gates 3 and 5, main vs Q2 (one run each)
 
+**Superseded by [`r3/`](r3/README.md):** the +5.3 % / +6.1 % idle PSS below came from one run each against a
+differently built binary (the installed `.q4`), inside PSS noise. With both binaries built the same way and
+three runs each, there is no measurable difference (anon equal within 1.1 %).
+
 `run.sh` on bella: `--bench-motion` then `--bench`, alternating main and q2, each in a headless gamescope at
 144 Hz and 1920×1080, after the 1-minute load average falls under 6. This follows `docs/bench/q4/r4/run.sh`.
 main is the installed `synaps-desktop-hybrid.q4` (609cf04's tree, identical to 4f87411); q2 is 4475cdf.
