@@ -30,8 +30,8 @@ use synaps_client::protocol::PromptRequest;
 use synaps_client::transcript::{Item, ToolStatus};
 
 use crate::app::{ARM, AppView, Arm, authorize_ready, hidden, lines_below, mono};
-use crate::fonts::TextPx as _;
 use crate::fonts;
+use crate::fonts::TextPx as _;
 use crate::model::{CONFIRM_NO, Model};
 use crate::theme::{Metrics, Palette};
 use crate::turns::{Disp, Kind};
@@ -717,7 +717,7 @@ impl AppView {
     /// listener, its state as it was); `None`: the live card.
     fn render_card(&self, c: &PromptCard, look: Option<&CardLook>, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> Stateful<Div> {
         let r = m.r;
-            let live = look.is_none();
+        let live = look.is_none();
         let pr = &c.pr;
         let secret = c.secret;
         let sent = live && self.model.prompt_answered(pr.id);
@@ -767,137 +767,142 @@ impl AppView {
                 .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(fg).child(text))
                 .children(key.map(|k| key_hint(k, fg, bg)))
         };
-        let allow_btn = |id: &'static str, text: &'static str, key: Option<&'static str>, enabled: bool, charge: Option<u32>, down: bool| {
-            let (bg, edge, fg) = ALLOW_STYLE.colors(p, false, down);
-            let (hi, _, _) = ALLOW_STYLE.colors(p, true, false);
-            let (bg, edge, fg) = if enabled || down { (bg, edge, fg) } else { (p.card_d, p.line, p.dim_k) };
-            let lit = ALLOW_STYLE.colors(p, false, false).0;
-            h_flex()
-                .id(id)
-                .relative()
-                .when(down, |d| d.top(px(crate::motion::PRESS)))
-                .flex_none()
-                .h(px(crate::fit::button_h(m)))
-                .px(px(14.))
-                .gap(px(8.))
-                .items_center()
-                .rounded(px(5.))
-                .overflow_hidden()
-                .border_1()
-                .border_color(edge)
-                .bg(bg)
-                .when(enabled, |d| d.cursor_pointer().hover(move |d| d.bg(hi).border_color(if ALLOW_STYLE == crate::cards::AllowStyle::Fill { hi } else { edge })))
-                // The arm's charge (motion.md §6.3): ten cells of the fill
-                // lit left to right along the foot, as before.
-                .children(charge.filter(|_| !enabled).map(|n| {
-                    h_flex()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .h(px(3.))
-                        .gap(px(1.))
-                        .children((0..10).map(move |i| div().flex_1().h_full().when(i < n, |d| d.bg(lit))))
-                }))
-                .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(fg).child(text))
-                .children(key.map(|k| key_hint(k, fg, bg)))
-                .debug_selector(move || if ALLOW_STYLE == crate::cards::AllowStyle::Fill { "allow-fill".into() } else { "allow-outline".into() })
-        };
-        let actions =
-            if detached {
-                None
-            } else if secret {
-                Some(
-                    h_flex()
-                        .gap(px(12.))
-                        .items_center()
-                        .child(
-                            h_flex()
-                                .flex_1()
-                                .min_w(px((120. * r).round()))
-                                .max_w(px((260. * r).round() + 64.))
-                                .gap(px(8.))
-                                .items_center()
-                                .child(
-                                    div().flex_1().min_w_0().max_w(px((260. * r).round())).child(
-                                        gpui_kit::component::input::Input::new(&self.secret_input)
-                                            .disabled(!can)
-                                            .text_px(m.mono)
-                                            .border_color(p.line),
-                                    ),
-                                ),
-                        )
-                        .child(ghost("p-cancel", "Cancel", keys.then_some("Esc"), can, pressed == Some(Answer::Cancelled)).when(
-                            live && can,
-                            |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx))),
-                        ))
-                        .child(
-                            allow_btn(
-                                "p-submit",
-                                "Submit",
-                                (in_field && can && typed).then_some(if cfg!(target_os = "macos") { "↵" } else { "Enter" }),
-                                can && typed,
-                                None,
-                                pressed == Some(Answer::Provided),
-                            )
-                            .when(live && can && typed, |d| {
-                                d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(true, window, cx)))
-                            }),
-                        ),
-                )
-            } else {
-                let yes = can && ready;
-                // ALLOW charges (motion.md §6.3): the arm's wait drawn as 10
-                // cells lit left to right, 50 ms each; the last lit is the arm.
-                // A held read gate keeps them dark.
-                let charge = Some(c)
-                    .filter(|c| {
-                        let may = self.drives() && self.model.may_answer(pr.id);
-                        live && may && !yes && self.fx.level() == crate::motion::Level::Full && !(below.is_some_and(|b| b > 1.) && !c.read)
+        let allow_btn =
+            |id: &'static str, text: &'static str, key: Option<&'static str>, enabled: bool, charge: Option<u32>, down: bool| {
+                let (bg, edge, fg) = ALLOW_STYLE.colors(p, false, down);
+                let (hi, _, _) = ALLOW_STYLE.colors(p, true, false);
+                let (bg, edge, fg) = if enabled || down { (bg, edge, fg) } else { (p.card_d, p.line, p.dim_k) };
+                let lit = ALLOW_STYLE.colors(p, false, false).0;
+                h_flex()
+                    .id(id)
+                    .relative()
+                    .when(down, |d| d.top(px(crate::motion::PRESS)))
+                    .flex_none()
+                    .h(px(crate::fit::button_h(m)))
+                    .px(px(14.))
+                    .gap(px(8.))
+                    .items_center()
+                    .rounded(px(5.))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(edge)
+                    .bg(bg)
+                    .when(enabled, |d| {
+                        d.cursor_pointer()
+                            .hover(move |d| d.bg(hi).border_color(if ALLOW_STYLE == crate::cards::AllowStyle::Fill { hi } else { edge }))
                     })
-                    .map(|c| {
-                        let cell = ARM / 10;
-                        let n = (self.fx.now().saturating_duration_since(c.arm.shown_at()).as_nanos() / cell.as_nanos()).min(10) as u32;
-                        if n < 10 {
-                            self.fx.want_at(c.arm.shown_at() + cell * (n + 1));
-                        }
-                        n
-                    });
-                let allow_key = if cfg!(target_os = "macos") { "⌘ ↵" } else { "Ctrl ↵" };
-                Some(
-                    h_flex()
-                        .gap(px(8.))
-                        .items_center()
-                        .child(ghost("p-no", "Deny", keys.then_some("Esc"), can, pressed == Some(Answer::Denied)).when_some(
-                            key.filter(|_| can),
-                            |d, key| {
-                                d.on_click(cx.listener(move |this, _, _, cx| {
-                                    this.answer(key, Some(CONFIRM_NO.into()));
-                                    cx.notify();
-                                }))
-                            },
-                        ))
-                        // Clickable whenever the card may be answered: the read
-                        // gate is checked at the click (as the keys do), not by
-                        // this frame, laid out with the last one's bounds.
-                        .child(
-                            allow_btn(
-                                "p-yes",
-                                "Allow",
-                                (keys && yes).then_some(allow_key),
-                                yes,
-                                charge,
-                                matches!(pressed, Some(Answer::Allowed | Answer::AllowedAll)),
-                            )
-                            .when_some(key.filter(|_| can), |d, key| {
-                                d.on_click(cx.listener(move |this, _, _, cx| {
-                                    this.authorize(key);
-                                    cx.notify();
-                                }))
-                            }),
-                        ),
-                )
+                    // The arm's charge (motion.md §6.3): ten cells of the fill
+                    // lit left to right along the foot, as before.
+                    .children(charge.filter(|_| !enabled).map(|n| {
+                        h_flex()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .h(px(3.))
+                            .gap(px(1.))
+                            .children((0..10).map(move |i| div().flex_1().h_full().when(i < n, |d| d.bg(lit))))
+                    }))
+                    .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(fg).child(text))
+                    .children(key.map(|k| key_hint(k, fg, bg)))
+                    .debug_selector(move || {
+                        if ALLOW_STYLE == crate::cards::AllowStyle::Fill { "allow-fill".into() } else { "allow-outline".into() }
+                    })
             };
+        let actions = if detached {
+            None
+        } else if secret {
+            Some(
+                h_flex()
+                    .gap(px(12.))
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w(px((120. * r).round()))
+                            .max_w(px((260. * r).round() + 64.))
+                            .gap(px(8.))
+                            .items_center()
+                            .child(
+                                div().flex_1().min_w_0().max_w(px((260. * r).round())).child(
+                                    gpui_kit::component::input::Input::new(&self.secret_input)
+                                        .disabled(!can)
+                                        .text_px(m.mono)
+                                        .border_color(p.line),
+                                ),
+                            ),
+                    )
+                    .child(
+                        ghost("p-cancel", "Cancel", keys.then_some("Esc"), can, pressed == Some(Answer::Cancelled))
+                            .when(live && can, |d| d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(false, window, cx)))),
+                    )
+                    .child(
+                        allow_btn(
+                            "p-submit",
+                            "Submit",
+                            (in_field && can && typed).then_some(if cfg!(target_os = "macos") { "↵" } else { "Enter" }),
+                            can && typed,
+                            None,
+                            pressed == Some(Answer::Provided),
+                        )
+                        .when(live && can && typed, |d| {
+                            d.on_click(cx.listener(|this, _, window, cx| this.answer_secret(true, window, cx)))
+                        }),
+                    ),
+            )
+        } else {
+            let yes = can && ready;
+            // ALLOW charges (motion.md §6.3): the arm's wait drawn as 10
+            // cells lit left to right, 50 ms each; the last lit is the arm.
+            // A held read gate keeps them dark.
+            let charge = Some(c)
+                .filter(|c| {
+                    let may = self.drives() && self.model.may_answer(pr.id);
+                    live && may && !yes && self.fx.level() == crate::motion::Level::Full && !(below.is_some_and(|b| b > 1.) && !c.read)
+                })
+                .map(|c| {
+                    let cell = ARM / 10;
+                    let n = (self.fx.now().saturating_duration_since(c.arm.shown_at()).as_nanos() / cell.as_nanos()).min(10) as u32;
+                    if n < 10 {
+                        self.fx.want_at(c.arm.shown_at() + cell * (n + 1));
+                    }
+                    n
+                });
+            let allow_key = if cfg!(target_os = "macos") { "⌘ ↵" } else { "Ctrl ↵" };
+            Some(
+                h_flex()
+                    .gap(px(8.))
+                    .items_center()
+                    .child(ghost("p-no", "Deny", keys.then_some("Esc"), can, pressed == Some(Answer::Denied)).when_some(
+                        key.filter(|_| can),
+                        |d, key| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                this.answer(key, Some(CONFIRM_NO.into()));
+                                cx.notify();
+                            }))
+                        },
+                    ))
+                    // Clickable whenever the card may be answered: the read
+                    // gate is checked at the click (as the keys do), not by
+                    // this frame, laid out with the last one's bounds.
+                    .child(
+                        allow_btn(
+                            "p-yes",
+                            "Allow",
+                            (keys && yes).then_some(allow_key),
+                            yes,
+                            charge,
+                            matches!(pressed, Some(Answer::Allowed | Answer::AllowedAll)),
+                        )
+                        .when_some(key.filter(|_| can), |d, key| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                this.authorize(key);
+                                cx.notify();
+                            }))
+                        }),
+                    ),
+            )
+        };
         let more = below.filter(|&b| b > 1.).map(|b| lines_below(b, m.code_line)).filter(|_| !c.read);
         let prompts = self.model.transcript.pending_prompts();
         let footer: Option<SharedString> = if let Some(l) = look {
@@ -1034,7 +1039,13 @@ impl AppView {
                     .child(a)
             }));
         let folder = c.guard.as_ref().map(|g| {
-            mono(g.dir.clone(), m.meta, p.dim_t).min_w_0().flex_shrink(1.).overflow_hidden().text_ellipsis().whitespace_nowrap().debug_selector(|| "card-folder".into())
+            mono(g.dir.clone(), m.meta, p.dim_t)
+                .min_w_0()
+                .flex_shrink(1.)
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .debug_selector(|| "card-folder".into())
         });
         let scope = pr.allow_all().filter(|_| offered).cloned();
         let check_focused = live && c.box_focus && keys;
@@ -1062,7 +1073,9 @@ impl AppView {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .when(allow_all, |d| d.child(div().size(px(CHECK_IN)).rounded(px(1.)).bg(p.acc).debug_selector(|| "card-allow-all-on".into()))),
+                        .when(allow_all, |d| {
+                            d.child(div().size(px(CHECK_IN)).rounded(px(1.)).bg(p.acc).debug_selector(|| "card-allow-all-on".into()))
+                        }),
                 )
                 .child(
                     div()

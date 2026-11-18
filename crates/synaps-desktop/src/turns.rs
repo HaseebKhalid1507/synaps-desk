@@ -1634,12 +1634,7 @@ impl AppView {
         // `+N more` and the dot before it.
         let more_w = text_w(5, cw) + 3. + 12.;
         let names: Vec<SharedString> = s.tally.iter().map(|t| crate::cards::verb(&t.name)).collect();
-        let fit_tally: Vec<Tally> = s
-            .tally
-            .iter()
-            .zip(&names)
-            .map(|(t, n)| Tally { name_chars: n.chars().count(), ..t.clone() })
-            .collect();
+        let fit_tally: Vec<Tally> = s.tally.iter().zip(&names).map(|(t, n)| Tally { name_chars: n.chars().count(), ..t.clone() }).collect();
         let all = tally_fit(&fit_tally, avail - 1., cw, 15.) == fit_tally.len();
         let named = if all { fit_tally.len() } else { tally_fit(&fit_tally, avail - 1. - more_w, cw, 15.) }.min(if tight { 3 } else { 5 });
         let mut tally = h_flex()
@@ -1675,7 +1670,13 @@ impl AppView {
             let rest: usize = s.tally[named..].iter().map(|t| t.n).sum();
             tally = tally
                 .child(crate::cards::dot(p))
-                .child(div().debug_selector(|| format!("tally {id} more")).flex_none().text_color(p.dim_t).child(format!("{} more", plus(rest))))
+                .child(
+                    div()
+                        .debug_selector(|| format!("tally {id} more"))
+                        .flex_none()
+                        .text_color(p.dim_t)
+                        .child(format!("{} more", plus(rest))),
+                )
                 .tooltip(tip);
         }
         let (last, _) = s.last;
@@ -1712,12 +1713,26 @@ impl AppView {
             .child(
                 // `N tool calls` rolls while the run grows (polish.md P5).
                 motion::roll_count(fx, motion::key(motion::ROLL_CALLS, id), s.tools, calls.into(), |t| {
-                    div().flex_none().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(p.prose_t).child(t)
+                    div()
+                        .flex_none()
+                        .font_family(fonts::SANS)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_px(m.label)
+                        .text_color(p.prose_t)
+                        .child(t)
                 }),
             )
             .child(tally)
             .child(crate::cards::facts(parts, p, m))
-            .child(div().flex_none().w(px(g.chevron)).flex().items_center().justify_end().child(glyph::turn(fx.turn(id | RUN_KEY, open), p.dim_t)))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(g.chevron))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .child(glyph::turn(fx.turn(id | RUN_KEY, open), p.dim_t)),
+            )
             .when_some(row_tip, |d, tip| d.tooltip(tip));
         let _ = cx;
         // Opened: the 1 px `line` rule under it, and the card's inset under
@@ -1855,9 +1870,10 @@ impl AppView {
             parts.push(div().text_color(p.acc).child(c).into_any_element());
         } else if let Some(t) = took {
             // The live clock rolls over into the final duration (§8 #5).
-            let from = change.filter(|c| c.1 == glyph::Life::Orbit.code()).zip(start).map(|((at, _), s)| {
-                (at, subagents::fmt_whole(at.saturating_duration_since(s).as_secs()))
-            });
+            let from = change
+                .filter(|c| c.1 == glyph::Life::Orbit.code())
+                .zip(start)
+                .map(|((at, _), s)| (at, subagents::fmt_whole(at.saturating_duration_since(s).as_secs())));
             parts.push(clock_roll(fx, from, crate::cards::took(t), p, m));
         }
         if let Some(s) = row.card.server.clone() {
@@ -2045,21 +2061,8 @@ impl AppView {
                 .hover(|d| d.bg(p.hover))
                 // Hovered, it lights: its outline to `frame`, its word and
                 // arrow to `prose_t` (both floored on the hovered row).
-                .child(
-                    div()
-                        .font_family(fonts::SANS)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_px(m.meta)
-                        .text_color(p.prose_t)
-                        .child("Open"),
-                )
-                .child(
-                    svg()
-                        .path(Glyph::Open.sprite().unwrap_or_default())
-                        .flex_none()
-                        .size(px(Glyph::Open.size()))
-                        .text_color(p.prose_t),
-                )
+                .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.meta).text_color(p.prose_t).child("Open"))
+                .child(svg().path(Glyph::Open.sprite().unwrap_or_default()).flex_none().size(px(Glyph::Open.size())).text_color(p.prose_t))
                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                     cx.stop_propagation();
                     this.worker_click(&who, true, ev, window, cx);
@@ -2262,9 +2265,7 @@ fn well(row: &RowCache, failed: bool, id: u64, _geo: Geo, p: &Palette, m: &Metri
         .text_px(m.mono)
         .line_height(px((19. * m.r).round()));
     let pad = (6. * m.r).round();
-    let more_el = |t: SharedString| {
-        div().px(px(inset)).pt(px(2.)).font_family(fonts::SANS).text_px(m.meta).text_color(p.dim_o).child(t)
-    };
+    let more_el = |t: SharedString| div().px(px(inset)).pt(px(2.)).font_family(fonts::SANS).text_px(m.meta).text_color(p.dim_o).child(t);
     let more = |n: usize| more_el(format!("{n} more lines").into());
     match (&row.preview, &row.card.numbered) {
         (Some(pv), _) => {
@@ -2398,7 +2399,8 @@ pub(crate) fn life_glyph(
     let boxed = || div().relative().flex_none().size(px(glyph::LIFE));
     match (l, from) {
         (L::Orbit, from) => {
-            let grow = if matches!(from, Some(L::Queued | L::Wait | L::Seen)) { shot(0, motion::FLICK, &ease::OUT, Mk::Spatial) } else { 1. };
+            let grow =
+                if matches!(from, Some(L::Queued | L::Wait | L::Seen)) { shot(0, motion::FLICK, &ease::OUT, Mk::Spatial) } else { 1. };
             glyph::orbit(fx, ink, grow).into_any_element()
         }
         (L::Done, Some(L::Orbit)) => {
@@ -2458,9 +2460,11 @@ fn clock_roll(fx: &std::rc::Rc<Motion>, from: Option<(Instant, String)>, took: S
         .h(line)
         .overflow_hidden()
         .child(div().invisible().child(took.clone()))
-        .children(from.filter(|_| old < 1.).map(|(_, text)| {
-            div().absolute().right_0().top(px(-travel * old)).text_color(motion::mix(p.acc, p.card_d, old)).child(text)
-        }))
+        .children(
+            from.filter(|_| old < 1.).map(|(_, text)| {
+                div().absolute().right_0().top(px(-travel * old)).text_color(motion::mix(p.acc, p.card_d, old)).child(text)
+            }),
+        )
         .child(div().absolute().right_0().top(px(travel * (1. - new))).text_color(motion::mix(p.card_d, p.dim_t, new)).child(took))
         .into_any_element()
 }

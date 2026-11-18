@@ -642,8 +642,24 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
         let c = lift(t.thinking_color, t.claude_text, g, TEXT);
         f.text(role, c, g)
     };
-    let mut r =
-        Roles { chrome, canvas, user, code, tool, tool_out, card, card_hi, raised, add_bg, del_bg, well, card_d, hover, well_d, ..Roles::default() };
+    let mut r = Roles {
+        chrome,
+        canvas,
+        user,
+        code,
+        tool,
+        tool_out,
+        card,
+        card_hi,
+        raised,
+        add_bg,
+        del_bg,
+        well,
+        card_d,
+        hover,
+        well_d,
+        ..Roles::default()
+    };
     f.log.push(Check { role: "card_d", from: canvas, color: card_d, grounds: vec![canvas], floor: D_CARD });
     f.log.push(Check { role: "hover", from: card_d, color: hover, grounds: vec![card_d], floor: D_CARD });
     f.log.push(Check { role: "well_d", from: card_d, color: well_d, grounds: vec![card_d], floor: D_CARD });
@@ -1105,8 +1121,7 @@ const UNDRAINED: &[&str] = &[
     // Q1's (PR #16) ground and rules (a well greys while the code beside
     // it doesn't): `grounds_and_rules_never_drain` fails on any new one
     // missing here.
-    "well", "hair_w", "hair_t", "edge_t",
-    // Cards D's grounds and rules.
+    "well", "hair_w", "hair_t", "edge_t", // Cards D's grounds and rules.
     "card_d", "line", "hover", "well_d",
 ];
 
@@ -2077,7 +2092,8 @@ mod tests {
                 at(r.line, &[r.card_d, r.canvas, r.hover], D_LINE, "line");
                 let you = a.unwrap_or(raw.prompt_fg);
                 let fail = [r.card_d, r.hover, mix(r.card_d, raw.error_color, f64::from(D_FAIL_REST))];
-                for (what, c) in [("prose_t", r.prose_t), ("dim_t", r.dim_t), ("arg", r.arg), ("ok", r.ok), ("err", r.err), ("ink", r.ink)] {
+                for (what, c) in [("prose_t", r.prose_t), ("dim_t", r.dim_t), ("arg", r.arg), ("ok", r.ok), ("err", r.err), ("ink", r.ink)]
+                {
                     at(c, &fail, TEXT, what);
                 }
                 at(r.err, &[mix(r.card_d, raw.error_color, f64::from(D_FAIL_PEAK))], TEXT, "err on the flush");

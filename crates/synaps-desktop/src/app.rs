@@ -4008,7 +4008,8 @@ impl AppView {
         if on_screen && self.fx.fluid() && !c.height.get().is_nan() {
             let to = if own && line { crate::authorize::receipt_line(&theme::metrics(cx)) } else { 0. };
             let look = self.card_look.borrow().clone();
-            self.card_exit = Some(CardExit { card: c, look, at: fx_now, session: sid, after, to, sink: Rc::new(Cell::new(f32::NAN)), answer });
+            self.card_exit =
+                Some(CardExit { card: c, look, at: fx_now, session: sid, after, to, sink: Rc::new(Cell::new(f32::NAN)), answer });
         }
     }
 
@@ -5493,11 +5494,16 @@ impl AppView {
             foot_ch.filter(|(_, prev)| worker.is_none() && drives && word == Some(label::READY) && busy_glyph(*prev)).map(|(at, _)| at);
         let breath_at = foot_ch.filter(|_| g == Some(glyph::Glyph::Needs)).map(|c| c.0);
         let mut foot_glyph = g.map(|g| {
-            div()
-                .flex()
-                .debug_selector(|| "foot-glyph".into())
-                .child(crate::turns::live_glyph(fx, g, mark, p.user, foot_ch, breath_at, true))
-                .into_any_element()
+            // Cards D (cards4/proposal.md build step 8): running, the state
+            // cell laps the cards' orbit (P2's sweep retired: one ambient
+            // per object, motion.md §6.1).
+            let el = if g == glyph::Glyph::Run {
+                let ink = glyph::life_ink(glyph::Life::Orbit, p.user, p);
+                div().debug_selector(|| "foot-orbit".into()).child(glyph::orbit(fx, ink, 1.)).into_any_element()
+            } else {
+                crate::turns::live_glyph(fx, g, mark, p.user, foot_ch, breath_at, true)
+            };
+            div().flex().debug_selector(|| "foot-glyph".into()).child(el).into_any_element()
         });
         let mut glyph_el = || foot_glyph.take();
         let lit = crate::motion::mix(p.you, p.ink, 0.35);
@@ -5513,13 +5519,13 @@ impl AppView {
         // is, on at once, decaying into the bar over the last `glow` of its
         // travel: it lands as the bar, never switched off.
         let segment_color = crate::motion::mix(bar, crate::motion::mix(p.you, p.ink, HANDOFF_LIT), fx.handoff_light(handoff_in));
-        // The composer's top edge (polish.md P2, P3; F10): the shade sweep
-        // while this session's turn runs (the TUI's header sweep), then, as
-        // the turn ends, one last pass in Handoff's light from the same
-        // corner over the same `sig`: one L-shaped light, down the bar and
-        // across the top. Full only; Reduced and Off leave the edge unlit.
+        // The composer's top edge (polish.md P3; F10): as the turn ends,
+        // one pass in Handoff's light from the bar's corner over `sig`: one
+        // L-shaped light, down the bar and across the top. Full only;
+        // Reduced and Off leave the edge unlit. (P2's sweep while the turn
+        // ran is retired under Cards D: the state cell's orbit says it.)
         let top_edge = if turn_runs {
-            Some(crate::motion::sweep(fx, p.run_mark, p.edge))
+            None
         } else if segment < 1. && crate::motion::Level::current(cx) == crate::motion::Level::Full {
             Some(crate::motion::pass(fx, segment, crate::motion::mix(p.you, p.ink, HANDOFF_LIT), p.edge))
         } else {

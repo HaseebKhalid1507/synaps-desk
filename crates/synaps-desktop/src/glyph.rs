@@ -465,7 +465,7 @@ pub(crate) fn on_beat(beat: crate::motion::Beat, mark: Hsla, ground: Hsla, fx: &
     let el = match beat {
         crate::motion::Beat::Spin(g) => spin(g, None, mark, ground),
         crate::motion::Beat::Breath(_) => breath_box(mark, mark),
-        crate::motion::Beat::Sweep { .. } | crate::motion::Beat::Orbit => div(),
+        crate::motion::Beat::Orbit => div(),
     };
     let fx = fx.clone();
     el.child(
@@ -976,11 +976,14 @@ fn mark_path(m: Mark, k: u32) -> Option<SharedString> {
 /// A life sprite's SVG, written from the table above.
 fn life_svg(path: &str) -> Option<String> {
     let (s, w) = (LIFE, LIFE_STROKE);
-    let head = |size: f32| format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 {size} {size}">"#);
+    let head =
+        |size: f32| format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 {size} {size}">"#);
     let c = LIFE / 2.;
     let body = match path {
         RING => format!(r##"<circle cx="{c}" cy="{c}" r="{LIFE_R}" fill="none" stroke="#000" stroke-width="{w}"/>"##),
-        DOTTED => format!(r##"<circle cx="{c}" cy="{c}" r="{LIFE_R}" fill="none" stroke="#000" stroke-width="{w}" stroke-dasharray="1.4 1.74"/>"##),
+        DOTTED => format!(
+            r##"<circle cx="{c}" cy="{c}" r="{LIFE_R}" fill="none" stroke="#000" stroke-width="{w}" stroke-dasharray="1.4 1.74"/>"##
+        ),
         _ => {
             let (stem, k) = path.strip_suffix(".svg")?.rsplit_once('~')?;
             let k: u32 = k.parse().ok()?;
@@ -1016,7 +1019,10 @@ fn life_svg(path: &str) -> Option<String> {
                     if m == Mark::Dot {
                         format!(r##"<circle cx="{c}" cy="{c}" r="{}" fill="#000"/>"##, 2.5 * k as f32 / CUTS as f32)
                     } else {
-                        format!(r##"<path d="{}" fill="none" stroke="#000" stroke-width="{w}" stroke-linecap="round" stroke-linejoin="round"/>"##, cut_lines(m.lines(), k))
+                        format!(
+                            r##"<path d="{}" fill="none" stroke="#000" stroke-width="{w}" stroke-linecap="round" stroke-linejoin="round"/>"##,
+                            cut_lines(m.lines(), k)
+                        )
                     }
                 }
             }
@@ -1094,9 +1100,9 @@ pub(crate) fn life_at(l: Life, ink: LifeInk, ring: f32, p: f32) -> Div {
     let el = div().relative().flex_none().size(px(LIFE)).debug_selector(move || format!("life-{l:?}"));
     match l {
         Life::Queued => el.child(sprite16(DOTTED, ink.mark)),
-        Life::Orbit | Life::Seen => el
-            .children(ink.ring.map(|c| sprite16(RING, c)))
-            .children(arc_path(crate::motion::ORBIT_STILL).map(|a| sprite16(a, ink.mark))),
+        Life::Orbit | Life::Seen => {
+            el.children(ink.ring.map(|c| sprite16(RING, c))).children(arc_path(crate::motion::ORBIT_STILL).map(|a| sprite16(a, ink.mark)))
+        }
         _ => {
             let k = ((p * CUTS as f32).ceil() as u32).min(CUTS);
             el.children(ink.ring.filter(|_| ring > 0.).map(|c| sprite16(RING, c)))
@@ -1129,14 +1135,21 @@ pub(crate) fn orbit(fx: &std::rc::Rc<crate::motion::Motion>, ink: LifeInk, grow:
         // Tests of the 8 Hz beat alone: the rail's spinner in its place.
         return div().flex().flex_none().size(px(LIFE)).items_center().justify_center().child(spinning(fx, Glyph::Run, ink.mark, ink.mark));
     }
-    let el = div().relative().flex_none().size(px(LIFE)).debug_selector(|| "life-Orbit".into()).children(ink.ring.map(|c| sprite16(RING, c)));
+    let el =
+        div().relative().flex_none().size(px(LIFE)).debug_selector(|| "life-Orbit".into()).children(ink.ring.map(|c| sprite16(RING, c)));
     if grow >= 1. && fx.layered() {
         let (fx, mark) = (fx.clone(), ink.mark);
         return el.child(
             canvas(
                 |_, _, _| {},
                 move |b, _, window, _| {
-                    fx.site(crate::motion::Site { origin: b.origin, mask: window.content_mask(), mark, ground: mark, beat: crate::motion::Beat::Orbit })
+                    fx.site(crate::motion::Site {
+                        origin: b.origin,
+                        mask: window.content_mask(),
+                        mark,
+                        ground: mark,
+                        beat: crate::motion::Beat::Orbit,
+                    })
                 },
             )
             .absolute()
@@ -1386,9 +1399,16 @@ mod tests {
         let lives: Vec<Life> = [Some(S::Done), Some(S::Failed), Some(S::Denied), Some(S::Cancelled), Some(S::Unknown), Some(S::Queued)]
             .into_iter()
             .map(|s| life_of_call(s, false, false))
-            .chain([life_of_call(Some(S::Running), true, false), life_of_call(Some(S::Running), false, true), life_of_call(Some(S::Running), false, false)])
+            .chain([
+                life_of_call(Some(S::Running), true, false),
+                life_of_call(Some(S::Running), false, true),
+                life_of_call(Some(S::Running), false, false),
+            ])
             .collect();
-        assert_eq!(lives, [Life::Done, Life::Failed, Life::Denied, Life::Cancelled, Life::Limit, Life::Queued, Life::Wait, Life::Seen, Life::Orbit]);
+        assert_eq!(
+            lives,
+            [Life::Done, Life::Failed, Life::Denied, Life::Cancelled, Life::Limit, Life::Queued, Life::Wait, Life::Seen, Life::Orbit]
+        );
         assert_eq!(life_of_worker(Liveness::Running), Life::Orbit);
         assert_eq!(life_of_worker(Liveness::Done), Life::Done);
         assert_eq!(life_of_worker(Liveness::Failed), Life::Failed);
