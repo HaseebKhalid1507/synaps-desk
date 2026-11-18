@@ -150,7 +150,7 @@ pub(crate) struct TrayCache {
 
 /// Tray rows' keys in [`motion::Motion`], apart from item ids.
 const TRAY: u64 = 1 << 61;
-/// A chip's x in its line (its slide when the line closes).
+/// A chip's x in its line ([`motion::Motion::cell_slide`]).
 const TRAY_X: u64 = 0x7AF4 << 48;
 
 /// Between chips, and between their lines.
@@ -245,13 +245,17 @@ pub(crate) fn more_w(m: &Metrics) -> f32 {
 /// `n` slots (chips and the ghosts of chips that left) in the grid, `k` a
 /// line, each `w` wide in `column` px, as many as `lines` lines hold: each
 /// one's line, and how many are drawn. All of them, else as many as fit
-/// with `+N more` (`more` px) ending the last line.
+/// with `+N more` (`more` px) ending the last line. One a line, the last
+/// still has one beside it (narrower: [`AppView::pack_chips`]), so one
+/// line never shows only `+N more`.
 pub(crate) fn grid_pack(n: usize, k: usize, w: f32, column: f32, lines: usize, more: f32) -> (Vec<usize>, usize) {
     if lines == 0 || k == 0 {
         return (Vec::new(), 0);
     }
     let fit = if n <= k * lines {
         n
+    } else if k == 1 {
+        lines
     } else {
         let beside = ((column - more) / (w + CHIP_GAP)).floor().max(0.) as usize;
         k * (lines - 1) + beside.min(k)
@@ -290,7 +294,7 @@ impl AppView {
             // A worker tab closed: its view and list go now.
             self.model.tabs.generation,
         );
-        if self.tray.key == Some(key) && self.tray.until.is_none_or(|u| now < u) {
+        if self.tray.key == Some(key) && self.tray.until.is_none_or(|u| fx_now < u) {
             return;
         }
         let live = if attached { self.model.stats.subagents.live() } else { Vec::new() };
@@ -299,9 +303,11 @@ impl AppView {
         // worker tabs past the most recently shown few, and their lists.
         let held = self.model.held_views();
         self.model.watch.hold(held);
-        self.model.watch.prune(now, &live);
+        // A finished worker's flash on the motion clock too (tests: the
+        // test's own, never a slow runner's wall time).
+        self.model.watch.prune(fx_now, &live);
         self.drop_released_panes();
-        let (rows, until) = self.model.watch.tray(live, now);
+        let (rows, until) = self.model.watch.tray(live, fx_now);
         let cancels = &self.model.cancels;
         let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
         let pending = |id: u64| session.is_some_and(|s| cancels.pending(s, &format!("sa_{id}")));
@@ -345,7 +351,7 @@ impl AppView {
         match until {
             Some(u) if self.tray_due.as_ref().map(|d| d.0) != Some(u) => {
                 let task = cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(u.saturating_duration_since(Instant::now())).await;
+                    cx.background_executor().timer(u.saturating_duration_since(fx_now)).await;
                     let _ = this.update(cx, |v, cx| {
                         v.tray_due = None;
                         cx.notify();
@@ -400,7 +406,10 @@ impl AppView {
         let (k, w) = grid(column, m);
         let (on, fit) = grid_pack(slots.len(), k, w, column, lines, more_w(m));
         let all = fit == slots.len();
-        let placed: Vec<(Slot, usize, f32)> = slots.into_iter().zip(on).map(|(s, l)| (s, l, w)).collect();
+        // One a line, with `+N more`: the last line's chip gives it room.
+        let last = (column - more_w(m) - CHIP_GAP).floor().max(0.);
+        let w_of = |l: usize| if !all && k == 1 && l + 1 == lines { last } else { w };
+        let placed: Vec<(Slot, usize, f32)> = slots.into_iter().zip(on).map(|(s, l)| (s, l, w_of(l))).collect();
         let drawn = placed.iter().filter(|s| matches!(s.0, Slot::Row(_))).count();
         let more = self.tray.rows.len().saturating_sub(drawn);
         let used = if all { placed.last().map_or(0, |s| s.1 + 1) } else { lines };
@@ -575,11 +584,13 @@ impl AppView {
                     } else {
                         glyph::bar_at(p.sub_rule, fx.draw(fx.birth(TRAY | r.id), std::time::Duration::ZERO, motion::QUICK))
                     };
-                    // A chip that changed line slides from its last place;
-                    // one that came rises 8 px and lifts from 70 %, in
-                    // turn (polish.md P13).
+                    // A chip whose cell changed slides there from where it
+                    // was drawn, x and y on `snap` from one instant (a
+                    // diagonal), in px to the end; a new share of the column
+                    // moves none. One that came rises 8 px and lifts from
+                    // 70 %, in turn (polish.md P13).
                     let off = fx.slide(TRAY | r.id, line as f32 * (row_h + CHIP_GAP));
-                    let dx = fx.slide(TRAY_X | r.id, col as f32) * (w + CHIP_GAP);
+                    let dx = fx.cell_slide(TRAY_X | r.id, col as u64, col as f32 * (w + CHIP_GAP));
                     let (travel, strength) = fx.arrival(fx.birth(TRAY | r.id));
                     let (bounds, id) = (self.chip_bounds.clone(), r.id);
                     at.push(
@@ -588,6 +599,9 @@ impl AppView {
                             .top(px(off))
                             .left(px(dx))
                             .flex_none()
+                            // Moving, on the canvas: a chip it passes is
+                            // under it, never text through text.
+                            .when(off != 0. || dx != 0., |d| d.bg(p.canvas))
                             .child(motion::lift(
                                 div().relative().top(px(travel)).child(self.tray_row(r, is_watched, armed, w, row_h, bar, p, m, cx)),
                                 strength,
@@ -900,7 +914,8 @@ mod tests {
         assert_eq!(grid_pack(3, 2, 308., 624., 2, 80.), (vec![0, 0, 1], 3));
         assert_eq!(grid_pack(4, 2, 308., 624., 2, 80.), (vec![0, 0, 1, 1], 4));
         assert_eq!(grid_pack(5, 2, 308., 624., 2, 80.), (vec![0, 0, 1], 3), "two lines: one beside +2 more");
-        assert_eq!(grid_pack(5, 1, 527., 527., 2, 80.), (vec![0], 1), "one a line: +4 more has the last");
+        assert_eq!(grid_pack(5, 1, 527., 527., 2, 80.), (vec![0, 1], 2), "one a line: the last's one beside +3 more");
+        assert_eq!(grid_pack(3, 1, 400., 400., 1, 80.), (vec![0], 1), "one line of one: a chip and +2 more (R2-L1)");
         assert_eq!(grid_pack(5, 2, 308., 624., 0, 80.), (vec![], 0));
         assert_eq!(cut("reading crates/relay/src/upstream.rs", 12), "reading cra…");
         assert_eq!(cut("short", 12), "short");

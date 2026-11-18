@@ -342,6 +342,13 @@ impl Scrolled for Rows {
 pub(crate) struct BarState(Rc<RefCell<Inner>>);
 
 impl BarState {
+    /// Tests: the content's length and the offset the thumb was last drawn
+    /// from.
+    #[cfg(test)]
+    pub(crate) fn drawn(&self) -> Option<(f32, f32)> {
+        self.0.borrow().kept
+    }
+
     /// Its target goes (another list takes its place): a drag ends on it,
     /// and nothing of where its thumb was carries over.
     pub(crate) fn release(&self) {
@@ -365,6 +372,9 @@ struct Inner {
     held: f32,
     /// The offset last drawn (`None`: never drawn).
     last: Option<f32>,
+    /// The content's length and the offset as last drawn not held still
+    /// ([`Bar::still`]).
+    kept: Option<(f32, f32)>,
     /// Shown until then, after a scroll; its timer is armed.
     until: Option<Instant>,
     timer: bool,
@@ -496,12 +506,32 @@ pub(crate) struct Bar<S: Scrolled> {
     always: bool,
     /// Shown with its surface, at once (no fade in): the palette's.
     instant: bool,
+    /// Held where it was last drawn from settled rows ([`Bar::still`]).
+    still: bool,
     focus: Option<FocusHandle>,
 }
 
 impl<S: Scrolled> Bar<S> {
     pub(crate) fn new(scroll: S, state: &BarState) -> Self {
-        Bar { scroll, state: state.clone(), axis: Axis::Vertical, ground: Ground::Canvas, always: false, instant: false, focus: None }
+        Bar {
+            scroll,
+            state: state.clone(),
+            axis: Axis::Vertical,
+            ground: Ground::Canvas,
+            always: false,
+            instant: false,
+            still: false,
+            focus: None,
+        }
+    }
+
+    /// While `on` (a side panel's edge dragged: every new width re-wraps
+    /// the rows, and the frame that does reads those not yet measured at
+    /// their estimates), the thumb stays where the last frame without it
+    /// drew it (the gate's S3, PR #21); it moves again once let go.
+    pub(crate) fn still(mut self, on: bool) -> Self {
+        self.still = on;
+        self
     }
 
     pub(crate) fn ground(mut self, ground: Ground) -> Self {
@@ -595,7 +625,11 @@ impl<S: Scrolled> Bar<S> {
         let mut geo =
             Geo { track: length(axis, lane0.size), view: length(axis, vp.size), content: length(axis, self.scroll.content()), warp: None };
         let offset = self.scroll.offset();
-        let at = along(axis, offset);
+        let mut at = along(axis, offset);
+        match st.kept {
+            Some((content, was)) if self.still => (geo.content, at) = (content, was),
+            _ => st.kept = Some((geo.content, at)),
+        }
         if !geo.overflows() || (st.grab.is_some() && !self.scroll.held()) {
             // Nothing to scroll (any more), or another list in place of the
             // one dragged: the drag ends where it began.

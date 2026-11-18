@@ -527,7 +527,7 @@ impl AppView {
     }
 
     /// Ctrl+J: the card's row into view (on F1's glide when it was drawn,
-    /// at once when not), from a worker's view back to the session first,
+    /// at Full; at once when not, and at Reduced and Off), from a worker's view back to the session first,
     /// and the keys to it (a secret's to its field).
     pub(crate) fn jump_to_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.transcript.pending_prompts().is_empty() {
@@ -574,7 +574,13 @@ impl AppView {
                 };
                 if by.abs() > 0.5 {
                     self.list.pause_following_tail();
-                    let cut = self.scroller.jump(by, false, bottom - top, self.fx.clock());
+                    // Reduced and Off: a cut, in this frame (the stub goes
+                    // with it); there is no glide to play.
+                    let cut = if self.fx.level() == crate::motion::Level::Full {
+                        self.scroller.jump(by, false, bottom - top, self.fx.clock())
+                    } else {
+                        by
+                    };
                     if cut != 0. {
                         self.list.scroll_by(px(cut));
                     }

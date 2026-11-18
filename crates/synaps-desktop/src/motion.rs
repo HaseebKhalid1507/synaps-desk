@@ -915,6 +915,8 @@ pub(crate) struct Motion {
     /// Chrome on springs (the tab indicator, the rail's selection, a
     /// segment's bar, the readout's y): the window's, never rescoped.
     springs: RefCell<HashMap<u64, Sprung>>,
+    /// Each [`Motion::cell_slide`]'s cell, and the frame that drew it.
+    cells: RefCell<HashMap<u64, (u64, u64)>>,
     /// A view pane is drawing, and something in it asked for a frame.
     pane: Cell<bool>,
     pane_wants: Cell<bool>,
@@ -1339,6 +1341,7 @@ impl Motion {
             slides: RefCell::default(),
             turns: RefCell::default(),
             springs: RefCell::default(),
+            cells: RefCell::default(),
             hovers: RefCell::default(),
             pane: Cell::new(false),
             pane_wants: Cell::new(false),
@@ -1635,6 +1638,7 @@ impl Motion {
         self.slides.borrow_mut().retain(|_, s| alive(s.frame));
         self.turns.borrow_mut().retain(|_, t| alive(t.1));
         self.springs.borrow_mut().retain(|_, s| alive(s.frame));
+        self.cells.borrow_mut().retain(|_, c| alive(c.1));
         self.hovers.borrow_mut().retain(|_, h| alive(h.1));
         self.glows.borrow_mut().retain(|_, s| alive(s.frame));
         self.rolls.borrow_mut().retain(|_, r| alive(r.frame));
@@ -2242,6 +2246,21 @@ impl Motion {
         }
         let (frame, now) = (self.frame.get(), self.now());
         self.springs.borrow_mut().insert(key, Sprung { target, x0: at - target, v0: 0., at: now, frame, response });
+    }
+
+    /// A grid item's place on one axis, `at` px: cell `cell` of its grid
+    /// (a worker chip's column or line). A new cell is a move: from where
+    /// it was drawn, in px on `snap`, to the end (no cap, no half-cell
+    /// rest: [`Slide`]'s epsilon is a pixel's). A new pitch in the same
+    /// cell (the column's share as a panel lands) is taken at once. Its
+    /// paint offset. Not drawn last frame, or not [`Level::Full`]: 0.
+    pub(crate) fn cell_slide(&self, key: u64, cell: u64, at: f32) -> f32 {
+        let frame = self.frame.get();
+        let moved = self.cells.borrow_mut().insert(key, (cell, frame)).is_some_and(|(c, f)| c != cell && f + 1 >= frame);
+        if moved && let Some(was) = self.spring_at(key) {
+            self.spring_jump(key, was, at, SNAP_RESPONSE);
+        }
+        self.spring_held(key, at, SNAP_RESPONSE).0 - at
     }
 
     /// Where chrome position `key` was drawn last, if it is on a spring.
