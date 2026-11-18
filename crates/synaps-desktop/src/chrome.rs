@@ -445,7 +445,7 @@ impl AppView {
         // 2 Hz on the beat (motion.md §6.7: text, not a spinner); held at
         // `···` without the heartbeat. Mono, padded: the word never moves.
         let dots = |word: &str| -> SharedString {
-            let n = self.fx.beat(4).map_or(3, |b| (b / 4 % 3) as usize + 1);
+            let n = self.fx.words_beat(4).map_or(3, |b| (b / 4 % 3) as usize + 1);
             format!("{word} {:<3}", "·".repeat(n)).into()
         };
         let (conn, conn_color): (SharedString, Hsla) = match &self.model.conn {

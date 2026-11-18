@@ -40,7 +40,7 @@ use crate::wtabs::Who;
 pub(crate) fn ticked(fx: &motion::Motion, facts: &SharedString, tick: &Option<(SharedString, crate::subagents::Tick)>) -> SharedString {
     match tick {
         Some((head, t)) if fx.on() => {
-            let (s, next) = t.whole(fx.now());
+            let (s, next) = t.whole(fx.clock_now());
             fx.tick_clock(next);
             let clock = crate::subagents::fmt_whole(s);
             if head.is_empty() { clock.into() } else { format!("{head} · {clock}").into() }
@@ -171,7 +171,7 @@ const X_W: f32 = 16.;
 fn chip_clock(fx: &motion::Motion, r: &TrayRow) -> Option<SharedString> {
     match &r.tick {
         Some((_, t)) if fx.on() => {
-            let (s, next) = t.whole(fx.now());
+            let (s, next) = t.whole(fx.clock_now());
             fx.tick_clock(next);
             Some(crate::subagents::fmt_whole(s).into())
         }
@@ -1034,15 +1034,43 @@ mod tests {
         let l = Live { tick: Some(crate::subagents::Tick::new(41.4, t0)), ..live(Status::Running, "bash") };
         let r = TrayRow::of(l, false);
         assert_eq!(r.facts.as_ref(), "1 tool · 40.0s", "the row's own text, as the daemon said");
-        // Its next second (44) at 2.6 s: on the grid's second that crosses
-        // it (3 s: every clock's one app frame), at every level.
-        for (level, low_power, at) in [(Level::Full, false, 3000), (Level::Reduced, false, 3000), (Level::Full, true, 3000)] {
+        // A frame at 1.7 s reads the clock at its grid second (1 s: 42.4,
+        // `42s`); its next second (43) at 1.6 s is on the grid's second
+        // that crosses it (2 s: every clock's one app frame), at every level.
+        for (level, low_power, at) in [(Level::Full, false, 2000), (Level::Reduced, false, 2000), (Level::Full, true, 2000)] {
             fx.begin_frame(level, low_power, t0 + Duration::from_millis(1700));
-            assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 43s", "{level:?}");
+            assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 42s", "{level:?}");
             assert_eq!(fx.demand(), (false, Some(t0 + Duration::from_millis(at))), "{level:?} {low_power}: only its next second");
         }
         fx.begin_frame(Level::Off, false, t0 + Duration::from_secs(9));
         assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 40.0s");
         assert_eq!(fx.demand(), (false, None), "Off: no clock ticks");
+    }
+
+    /// Shady #17 M2: a clock whose second falls just after the grid's
+    /// (2 ms) and a frame late by a refresh (5 ms): the frame asks for the
+    /// very next grid second, and that one shows the next whole second.
+    /// Read at the frame's own instant, it showed 43 at once, asked for
+    /// 3 s, and 2 s was never drawn (the clock jumped two).
+    #[test]
+    fn a_late_frame_never_skips_a_clocks_second() {
+        use crate::motion::{Level, Motion};
+        use std::time::{Duration, Instant};
+        let base = Instant::now();
+        let t0 = base + Duration::from_secs(5);
+        let ms = Duration::from_millis;
+        let fx = Motion::new(t0);
+        let l = Live { tick: Some(crate::subagents::Tick::new(41.998, t0)), ..live(Status::Running, "bash") };
+        let r = TrayRow::of(l, false);
+        fx.begin_frame(Level::Full, false, t0 + ms(1005));
+        assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 42s");
+        assert_eq!(fx.demand(), (false, Some(t0 + ms(2000))), "the next grid second, not the one after");
+        fx.begin_frame(Level::Full, false, t0 + ms(2005));
+        assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 43s", "one second on");
+        assert_eq!(fx.demand(), (false, Some(t0 + ms(3000))));
+        // The transcript's own clocks (a running call's) read the same second.
+        fx.begin_frame(Level::Full, false, t0 + ms(3005));
+        assert_eq!(crate::turns::clock(&fx, Some(base + ms(2))).as_deref(), Some("7s"), "as of 3 s: 7.998");
+        assert_eq!(fx.demand(), (false, Some(t0 + ms(4000))));
     }
 }

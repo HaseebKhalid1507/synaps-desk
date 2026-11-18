@@ -1494,12 +1494,14 @@ fn target_el(card: &Card, arg: &SharedString, p: &Palette) -> Div {
 }
 
 /// A running call's clock (the TUI's `running 1.2s`): whole seconds since
-/// it started, on the frame's instant, ticking on the second while motion
+/// it started, as of the frame's grid second, ticking on the second while motion
 /// is on.
-fn clock(fx: &Motion, started: Option<Instant>) -> Option<SharedString> {
-    let ms = fx.now().saturating_duration_since(started?).as_millis() as u64;
+pub(crate) fn clock(fx: &Motion, started: Option<Instant>) -> Option<SharedString> {
+    // As of the frame's grid second (Shady #17 M2), as every clock.
+    let at = fx.clock_now();
+    let ms = at.saturating_duration_since(started?).as_millis() as u64;
     if fx.on() {
-        fx.tick_clock(fx.now() + Duration::from_millis(1000 - ms % 1000));
+        fx.tick_clock(at + Duration::from_millis(1000 - ms % 1000));
     }
     Some(subagents::fmt_whole(ms / 1000).into())
 }
@@ -1684,18 +1686,6 @@ impl AppView {
         // Thinking done says nothing in the gutter: only its running mark.
         let status_glyph = (!think || state.0 == Glyph::Run).then_some(status_glyph);
         let running = state.0 == Glyph::Run && !think;
-        // A running bash call's bottom edge sweeps once it has run a second
-        // (polish.md P2.2: the TUI's bash trace), in the row's lit hue.
-        let bash_sweep = running
-            && fx.ambient()
-            && row.hue == Hue::Bash
-            && row.started.is_some_and(|t| {
-                let ran = fx.now().saturating_duration_since(t) >= motion::BASH_SWEEP_AFTER;
-                if !ran {
-                    fx.want_at(t + motion::BASH_SWEEP_AFTER);
-                }
-                ran
-            });
         let meta = h_flex()
             .flex_none()
             .ml(px(geo.gap))
@@ -1725,7 +1715,6 @@ impl AppView {
             .child(target)
             .child(meta)
             .child(geo.fold_col(fold))
-            .when(bash_sweep, |d| d.relative().child(motion::sweep(fx, motion::mix(hue, p.ink, 0.30), p.canvas)))
             .when(has_body, |d| {
                 d.on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle(id);
@@ -1925,8 +1914,6 @@ impl AppView {
                         .child(motion::rolled(fx, motion::key(motion::ROLL_STEP, key), text, true, true, |t| {
                             div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.sub_status_t).child(t)
                         }))
-                        // The live worker's sweep along its bottom (P2.3).
-                        .when(running, |d| d.relative().child(motion::sweep(fx, p.sub_rule, p.canvas)))
                         .into_any_element(),
                 )
             })
