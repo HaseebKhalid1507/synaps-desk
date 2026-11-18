@@ -1,0 +1,40 @@
+   0.000 frame welcome
+   0.000 frame attached
+   0.000 seq 51 client_joined
+   1.529 seq 52 input_owner_changed
+   1.529 seq 54 client_joined
+   9.398 seq 55 turn_started trigger=user user_text=set
+   9.406 seq 57 conversation messages_len=3
+   9.846 seq 58 stream/llm/response_start
+  11.616   (20 thinking, 50 text deltas)
+  11.616 seq 129 external id=7a6c16d0-41ca-42c4-acf9-24f882bce670 source=cli severity=High expects_response=False
+  11.616 seq 130 conversation messages_len=3
+  13.820   (89 text deltas)
+  13.820 seq 220 external id=7400ed73-b400-49dc-9515-ebe68b0369a0 source=cli severity=Medium expects_response=False
+  13.820 seq 221 conversation messages_len=3
+  18.942   (203 text deltas)
+  18.942 seq 425 stream/session/usage
+  18.947 seq 426 stream/agent/steering_delivered event-payload id=7a6c16d0-41ca-42c4-acf9-24f882bce670
+  18.947 seq 427 stream/agent/steering_delivered event-payload id=7400ed73-b400-49dc-9515-ebe68b0369a0
+  18.947 seq 429 conversation messages_len=6
+  19.503 seq 430 stream/llm/response_start
+  21.453   (62 thinking, 15 text deltas)
+  21.453 seq 508 stream/session/usage
+  21.455 seq 510 conversation messages_len=7
+  21.455 seq 511 stream/session/done
+  21.455 seq 512 conversation messages_len=7
+  21.457 seq 513 idle
+  41.239 seq 514 external id=bddd950c-bdff-4bc0-bd76-1327ba915593 source=cli severity=Medium expects_response=False
+  41.239 seq 515 conversation messages_len=8
+  41.239 seq 516 turn_started trigger=event_auto user_text=none
+  41.243 seq 517 query_result
+  41.246 seq 519 conversation messages_len=8
+  41.750 seq 520 stream/llm/response_start
+  42.729   (28 thinking, 11 text deltas)
+  42.729 seq 560 stream/session/usage
+  42.730 seq 562 conversation messages_len=9
+  42.730 seq 563 stream/session/done
+  42.730 seq 564 conversation messages_len=9
+  42.732 seq 565 idle
+  71.136 seq 566 client_left
+  71.136 seq 567 input_owner_changed
