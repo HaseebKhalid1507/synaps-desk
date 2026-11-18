@@ -1913,15 +1913,52 @@ fn ctrl_j_goes_to_the_card(cx: &mut TestAppContext) {
     assert!(view.read_with(cx, |v, _| !v.card_on_screen()), "scrolled away");
     assert!(has(cx, "needs-stub") && has(cx, "needs-stub-key"), "the stub says ctrl j");
     focus_composer(cx, w, &view);
+    // The card's top, frame by frame: one way (the gate's S2, PR #21: the
+    // stub leaves as the jump starts, which aims at the view without it).
+    let card_top_of = |v: &AppView| v.card_ix().and_then(|ix| v.list.bounds_for_item(ix)).map(|b| f32::from(b.top()));
+    let card_top = |cx: &mut TestAppContext| view.read_with(cx, |v, _| card_top_of(v));
+    let one_way = |tops: &[f32]| {
+        let d: Vec<f32> = tops.windows(2).map(|p| p[1] - p[0]).collect();
+        d.iter().all(|d| *d <= 0.01) || d.iter().all(|d| *d >= -0.01)
+    };
     tap(cx, w, "ctrl-j");
     // F1's glide, frame by frame.
+    let mut tops = Vec::new();
     for _ in 0..120 {
         fluid_frame(cx, w, &view);
+        tops.extend(card_top(cx));
     }
     settle(cx, w, 8);
     assert!(view.read_with(cx, |v, _| v.card_on_screen()), "back in view");
     assert!(!has(cx, "needs-stub"), "the stub goes");
     assert!(!view.read_with(cx, |v, cx| v.composer.read(cx).text().to_string().contains('\n')), "Ctrl+J typed nothing");
+    assert!(tops.len() > 10 && one_way(&tops), "one way: {tops:?}");
+    // Just under the view's end (the stub over it): it goes no further up
+    // than the view without the stub needs, and not back down.
+    view.update(cx, |v, cx| {
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let (t0, vb) = view.read_with(cx, |v, _| (card_top_of(v), v.list_view().1));
+    view.update(cx, |v, cx| {
+        v.list.scroll_by(px(-(vb + 10. - t0.expect("the card drawn"))));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    fly(cx, w, &view, 400, |_| {});
+    settle(cx, w, 8);
+    assert!(has(cx, "needs-stub"), "under the view: the stub");
+    tap(cx, w, "ctrl-j");
+    let mut tops: Vec<f32> = card_top(cx).into_iter().collect();
+    for _ in 0..120 {
+        fluid_frame(cx, w, &view);
+        tops.extend(card_top(cx));
+    }
+    settle(cx, w, 8);
+    assert!(view.read_with(cx, |v, _| v.card_on_screen()) && !has(cx, "needs-stub"), "in view, no stub");
+    assert!(one_way(&tops), "one way: {tops:?}");
 }
 
 /// Q2: an answer from this window is its receipt (`denied` here); one this
@@ -6357,7 +6394,17 @@ fn flight(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, r
     (end.duration_since(t0).as_millis(), widths)
 }
 
-/// Fluid frames until nothing moves (at most `max`): how many.
+/// The motion clock brought up to the last timer that woke the app: a
+/// test's setup can run the executor's clock ahead of motion's (a timer
+/// then fires early and every frame samples its instant until the clock
+/// gets there, then jumps).
+fn catch_up(cx: &mut TestAppContext, view: &Entity<AppView>) {
+    view.read_with(cx, |v, _| v.fx.set_clock(v.fx.tick()));
+}
+
+/// Fluid frames until nothing moves (at most `max`): how many. A panel in
+/// its slow tail asks for a timer, not a frame (`Motion::spring_px`): it
+/// moves until it lands.
 fn fly(
     cx: &mut TestAppContext,
     w: AnyWindowHandle,
@@ -6366,7 +6413,7 @@ fn fly(
     mut each: impl FnMut(&mut TestAppContext),
 ) -> usize {
     let mut n = 0;
-    while motion_pending(cx, view).0 && n < max {
+    while (motion_pending(cx, view).0 || view.read_with(cx, |v, _| v.panel_fx.moving())) && n < max {
         fluid_frame(cx, w, view);
         each(cx);
         n += 1;
@@ -6471,10 +6518,23 @@ fn column_rewraps_at_most_once_per_panel_motion(cx: &mut TestAppContext) {
         let check = |cx: &mut TestAppContext, seen: &mut Vec<(f32, bool, f32, f32)>| {
             let c = col(cx);
             assert!((c.2 - ((c.3 - c.0) / 2.).floor()).abs() <= 1., "{fold}: centred in the pane as drawn {c:?}");
+            // GPUI's item width (the list's width less its padding) is the
+            // column, bit for bit, in every frame (Shady H1: a fraction of a
+            // pixel more or less and the list forgets every row's height).
+            let item = view.read_with(cx, |v, _| {
+                let ix = if follow { v.disp.len() - 1 } else { anchor };
+                v.list.bounds_for_item(ix).map(|b| f32::from(b.size.width))
+            });
+            assert_eq!(item, Some(c.0), "{fold}: the list's item width is the column, frame {}", seen.len());
+            // (`seen` starts with this frame's own: the first compares
+            // with the frame before the flight.)
+            let rewrapped = (seen.len() == 1 && c.0 != before.0) || seen.last().is_some_and(|p| p.0 != c.0);
             seen.push(c);
             if follow {
                 let (following, end) = view.read_with(cx, |v, _| (v.list.is_following_tail(), v.list.is_scrolled_to_end()));
-                assert!(following && end != Some(false), "{fold}: following, at the end");
+                // Every height known (none dropped), at the end; the frame
+                // that rewraps measures again.
+                assert!(following && (end == Some(true) || rewrapped), "{fold}: following, at the end ({end:?})");
             } else {
                 let now = view.read_with(cx, |v, _| v.list.bounds_for_item(anchor).map(|b| b.top()));
                 assert_eq!(now, top, "{fold}: the top row moved, frame {}", seen.len());
@@ -6606,12 +6666,16 @@ fn detent_settles(cx: &mut TestAppContext) {
     drag_to(cx, w, lo * 0.6 + 10.);
     release_at(cx, w, gpui_kit::point(px(lo * 0.6 + 10.), px(400.)));
     assert_eq!(panel(cx, &view, true).1, crate::app::STRIP, "folded");
+    // Folded keeping the width it had when the drag began (Shady M1: not
+    // the limit the drag clamped it to on the way).
+    assert_eq!(view.read_with(cx, |v, _| v.panels.rail_width), None, "still auto");
     fly(cx, w, &view, 400, |_| {});
     view.update(cx, |v, cx| v.toggle_panel(true, cx));
     cx.run_until_parked();
     fly(cx, w, &view, 400, |_| {});
     // A width of its own, then a double-click on the edge: auto, on `sheet`.
     let w1 = panel(cx, &view, true).0;
+    assert_eq!(w1, w0, "it opens at the width it had");
     press_at(cx, w, gpui_kit::point(px(w1 - 1.), px(400.)));
     drag_to(cx, w, w1 + 2.);
     drag_to(cx, w, w0 + 99.);
@@ -6649,7 +6713,16 @@ fn window_resize_never_animates(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (2400., 900.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
     settle(cx, w, 8);
+    // A draft that wraps to more lines as the window narrows: the
+    // composer (and the dock) take their new heights at once too (Shady
+    // L3, PR #21).
+    let draft = "a draft that wraps onto more lines as the window narrows and fewer as it widens, ".repeat(2);
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.composer.update(cx, |s, cx| s.set_value(&draft, window, cx))))
+        .expect("the window");
+    cx.run_until_parked();
+    fly(cx, w, &view, 400, |_| {});
     let (w0, _, _) = panel(cx, &view, true);
+    let mut heights = Vec::new();
     for width in [1300., 2600., 900., 2400.] {
         VisualTestContext::from_window(w, cx).simulate_resize(size(px(width), px(900.)));
         cx.run_until_parked();
@@ -6658,8 +6731,10 @@ fn window_resize_never_animates(cx: &mut TestAppContext) {
             assert!(s == t && !moving, "{width} {rail}: at once ({s} {t})");
         }
         assert!(!motion_pending(cx, &view).0, "{width}: no frame");
+        heights.push(drawn(cx, w, "composer-bar".into()).expect("the composer")[3]);
     }
     assert_eq!(panel(cx, &view, true).0, w0);
+    assert!(heights.iter().any(|h| *h != heights[0]), "the draft rewrapped: {heights:?}");
 }
 
 /// polish.md P13: the dock (the NEEDS YOU stub and the chips) grows and
@@ -6682,15 +6757,30 @@ fn dock_height_springs_on_sheet(cx: &mut TestAppContext) {
     cx.run_until_parked();
     // Its frames as laid out (the clock still: the spring at its start).
     settle(cx, w, 8);
+    // Not following: the top row's top never moves (the list's view ends
+    // higher each frame; its rows keep their place).
+    let top_row = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.list.bounds_for_item(0).map(|b| b.top()));
+    let top0 = top_row(cx);
+    assert!(top0.is_some() && view.read_with(cx, |v, _| !v.list.is_following_tail()));
     let mut heights = Vec::new();
+    let mut edges = 0;
     let frames = fly(cx, w, &view, 400, |cx| {
         let comp = drawn(cx, w, "composer-bar".into()).expect("the composer");
         let b = drawn(cx, w, "dock-box".into()).expect("the dock");
         heights.push((b[1], comp[1]));
+        assert_eq!(top_row(cx), top0, "the top row stays put, frame {}", heights.len());
+        // The gate's S1 (PR #21): while the box cuts into the stub, the
+        // stub's frame leads it: its top line at the box's top.
+        if dock(cx) - b[3] > crate::fit::STUB_GAP && b[3] >= 1. {
+            let e = drawn(cx, w, "dock-edge".into()).expect("the stub's top edge leads");
+            assert!((e[1] - b[1]).abs() < 0.5 && (e[3] - 1.).abs() < 1e-3, "at the box's top: {e:?} {b:?}");
+            edges += 1;
+        }
     });
     let grown = dock(cx);
     assert!(grown > natural + 20., "the stub came ({natural} → {grown})");
     assert!(frames > 30, "{frames} frames");
+    assert!(edges > 5, "it led with its edge ({edges} frames)");
     // Its content's foot sits on the composer; its top rises.
     let comp = heights.last().map(|h| h.1).expect("frames");
     assert!(heights.iter().all(|h| (h.1 - comp).abs() < 0.5), "the composer stays put");
@@ -6701,7 +6791,8 @@ fn dock_height_springs_on_sheet(cx: &mut TestAppContext) {
     // The prompt answered elsewhere: the stub goes.
     resolve_prompt(cx, &view);
     settle(cx, w, 8);
-    let frames = fly(cx, w, &view, 400, |_| {});
+    let top0 = top_row(cx);
+    let frames = fly(cx, w, &view, 400, |cx| assert_eq!(top_row(cx), top0, "the top row stays put"));
     assert!(frames > 30, "the stub left on `sheet` ({frames})");
     assert!((dock(cx) - natural).abs() < 0.5);
     assert!(settle(cx, w, 8) <= 2);
@@ -6722,15 +6813,30 @@ fn composer_grows_upward_on_flick(cx: &mut TestAppContext) {
     set_motion(cx, &view, crate::motion::Level::Full);
     settle(cx, w, 8);
     let long = "a draft long enough to wrap onto a second line of the composer, and then some more words to be sure of it";
-    for (text, grows) in [(long, true), ("short", false)] {
+    // Following (the end stays the bottom), then scrolled back (the top
+    // row stays put), every frame (Shady L4, PR #21).
+    let follow = std::cell::Cell::new(true);
+    let top_row = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.list.bounds_for_item(1).map(|b| b.top()));
+    let mut top0 = None;
+    let invariant = |cx: &mut TestAppContext, top0: Option<gpui_kit::Pixels>| {
+        if follow.get() {
+            let (following, end) = view.read_with(cx, |v, _| (v.list.is_following_tail(), v.list.is_scrolled_to_end()));
+            assert!(following && end == Some(true), "following, at the end ({end:?})");
+        } else {
+            assert_eq!(top_row(cx), top0, "the top row stays put");
+        }
+    };
+    for (text, grows) in [(long, true), ("short", false), (long, true), ("short", false)] {
         let before = drawn(cx, w, "composer-bar".into()).expect("the composer");
         cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.composer.update(cx, |s, cx| s.set_value(text, window, cx))))
             .expect("the window");
         cx.run_until_parked();
+        invariant(cx, top0);
         let mut bars = vec![drawn(cx, w, "composer-bar".into()).expect("the composer")];
         // Its new height is measured as it is laid out: the frame after.
         for _ in 0..60 {
             fluid_frame(cx, w, &view);
+            invariant(cx, top0);
             bars.push(drawn(cx, w, "composer-bar".into()).expect("the composer"));
         }
         let after = *bars.last().expect("frames");
@@ -6742,6 +6848,19 @@ fn composer_grows_upward_on_flick(cx: &mut TestAppContext) {
         let between = bars.iter().filter(|b| b[3] > before[3].min(after[3]) + 0.5 && b[3] < before[3].max(after[3]) - 0.5).count();
         assert!(between >= 1, "{grows}: it travelled ({between} frames between)");
         assert!(!motion_pending(cx, &view).0);
+        if follow.get() && !grows {
+            // Scrolled back: the stub comes for the card; let it land.
+            follow.set(false);
+            view.update(cx, |v, cx| {
+                v.list.scroll_to(gpui_kit::ListOffset { item_ix: 1, offset_in_item: px(0.) });
+                cx.notify();
+            });
+            cx.run_until_parked();
+            fly(cx, w, &view, 400, |_| {});
+            settle(cx, w, 8);
+            top0 = top_row(cx);
+            assert!(top0.is_some() && view.read_with(cx, |v, _| !v.list.is_following_tail()));
+        }
     }
     set_motion(cx, &view, crate::motion::Level::Reduced);
     settle(cx, w, 8);
@@ -6871,4 +6990,223 @@ fn a_chip_arrives_from_below_at_lift() {
     assert_eq!(last, (0., 1.), "at rest");
     fx.begin_frame(Level::Reduced, false, t0);
     assert_eq!(fx.arrival(Some(t0)), (0., 1.), "Reduced: no travel");
+}
+
+/// Shady H1, the gate's must-fix 1 (PR #21): a panel flies on whole
+/// pixels, so the transcript list's item width is the same in every frame
+/// of a fold or an unfold, and GPUI keeps every measured row height. At
+/// 1920 (the column capped: nothing rewraps) the scroll range and offset,
+/// so the scrollbar, are the same before, in and after the flight of
+/// either panel, scrolled back (no follow to re-end it).
+#[gpui_kit::test]
+fn a_fold_keeps_the_transcripts_measured_heights(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1920., 700.), crate::theme::Panels::default().text_size);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.list.scroll_to(gpui_kit::ListOffset { item_ix: 2, offset_in_item: px(13.) }));
+    frame(cx, &view);
+    // The card scrolled away: its stub comes (the view shortens); landed.
+    settle(cx, w, 8);
+    catch_up(cx, &view);
+    fly(cx, w, &view, 400, |_| {});
+    settle(cx, w, 8);
+    let geo = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let item = v.list.bounds_for_item(2).map(|b| f32::from(b.size.width));
+            (v.list.max_offset_for_scrollbar().y, v.list.scroll_px_offset_for_scrollbar().y, item, v.layout.column)
+        })
+    };
+    let before = geo(cx);
+    assert!(before.0 > px(0.) && before.2 == Some(before.3), "scrolled back, scrollable: {before:?}");
+    for rail in [true, false] {
+        for _ in 0..2 {
+            catch_up(cx, &view);
+            view.update(cx, |v, cx| v.toggle_panel(rail, cx));
+            cx.run_until_parked();
+            assert_eq!(geo(cx), before, "{rail}: its first frame");
+            let frames = fly(cx, w, &view, 400, |cx| assert_eq!(geo(cx), before, "{rail}: in flight"));
+            assert!(frames > 30, "{rail}: it flew ({frames})");
+            settle(cx, w, 8);
+            assert_eq!(geo(cx), before, "{rail}: landed");
+        }
+    }
+}
+
+/// Shady M2 (PR #21): a panel's edge takes no press while the panel flies
+/// (a drag caught in flight would start from where it is going, not where
+/// it is drawn); landed, it is back. A drag of one panel's edge leaves the
+/// other's flight flying, from where it is.
+#[gpui_kit::test]
+fn an_edge_waits_for_its_panel_to_land(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    assert!(drawn(cx, w, "rail-edge".into()).is_some(), "at rest: the edge");
+    view.update(cx, |v, cx| v.toggle_panel(true, cx));
+    cx.run_until_parked();
+    for _ in 0..10 {
+        fluid_frame(cx, w, &view);
+    }
+    let (s, t, moving) = panel(cx, &view, true);
+    assert!(moving && s > t + 50., "in flight ({s} {t})");
+    assert!(drawn(cx, w, "rail-edge".into()).is_none(), "in flight: no edge");
+    press_at(cx, w, gpui_kit::point(px(s - 1.), px(400.)));
+    drag_to(cx, w, s + 40.);
+    assert!(view.read_with(cx, |v, _| v.drag.is_none()), "no drag of the edge");
+    release_at(cx, w, gpui_kit::point(px(s + 40.), px(400.)));
+    fly(cx, w, &view, 400, |_| {});
+    assert_eq!(panel(cx, &view, true), (t, t, false), "it landed where it was going");
+    assert!(drawn(cx, w, "rail-edge".into()).is_some(), "landed: the strip's edge");
+    // The rail opens again; the right panel folds, and while it flies the
+    // rail's edge is dragged: the right panel flies on, one way, to its strip.
+    view.update(cx, |v, cx| v.toggle_panel(true, cx));
+    cx.run_until_parked();
+    fly(cx, w, &view, 400, |_| {});
+    let (r0, _, _) = panel(cx, &view, true);
+    view.update(cx, |v, cx| v.toggle_panel(false, cx));
+    cx.run_until_parked();
+    for _ in 0..8 {
+        fluid_frame(cx, w, &view);
+    }
+    let mut last = panel(cx, &view, false).0;
+    press_at(cx, w, gpui_kit::point(px(r0 - 1.), px(400.)));
+    for k in 1..=6 {
+        drag_to(cx, w, r0 + 2. + 5. * k as f32);
+        fluid_frame(cx, w, &view);
+        let (s, t, moving) = panel(cx, &view, false);
+        assert!(s <= last + 1e-3, "the right panel flies on to its strip ({last} → {s})");
+        assert!(moving || s == t, "{s} {t}");
+        last = s;
+    }
+    assert!(panel(cx, &view, false).2, "still flying (not snapped to its target)");
+    release_at(cx, w, gpui_kit::point(px(r0 + 31.), px(400.)));
+    fly(cx, w, &view, 400, |_| {});
+    assert_eq!(panel(cx, &view, false), (crate::app::STRIP, crate::app::STRIP, false));
+}
+
+/// The gate's must-fix 2 and 3 (PR #21): a section mid-rail, the rail
+/// scrolled to its end. Folding: from its first frame its body is drawn
+/// under its head down to what follows as that rises over it (no empty
+/// band opens), and the rows above it never jump (the rail keeps its
+/// length until the fold lands: its offset gives way with the fold, never
+/// in one frame). Unfolding: from its first frame the rows after it are
+/// drawn whole down to the view's end (the list's, then the ridden tail).
+#[gpui_kit::test]
+fn a_section_folds_and_unfolds_mid_rail_in_a_scrolled_rail(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1280., 720.), crate::theme::Panels::default().text_size);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    // The last open bucket with rows under it (in view at the rail's end),
+    // past the rail's first item.
+    let (b, ix) = view
+        .read_with(cx, |v, _| {
+            let items = &v.rail.rail.items;
+            items.windows(2).enumerate().skip(1).collect::<Vec<_>>().into_iter().rev().find_map(|(ix, p)| match p {
+                [crate::rail::Item::Bucket { bucket, open: true, .. }, crate::rail::Item::Hist(_)] => Some((*bucket, ix)),
+                _ => None,
+            })
+        })
+        .expect("an open HISTORY bucket in the demo");
+    let to_end = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| {
+            let n = v.rail.rail.items.len();
+            v.rail_list.scroll_to(gpui_kit::ListOffset { item_ix: n, offset_in_item: px(0.) });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        settle(cx, w, 8);
+    };
+    to_end(cx);
+    let (scrolled, head0) = view.read_with(cx, |v, _| {
+        let vp = v.rail_list.viewport_bounds();
+        (-f32::from(v.rail_list.scroll_px_offset_for_scrollbar().y), v.rail_list.bounds_for_item(ix).map(|r| f32::from(r.top() - vp.top())))
+    });
+    assert!(scrolled > 0.5 && head0.is_some(), "the rail scrolled ({scrolled}), the bucket in view ({head0:?})");
+    // Where an item is in the view, as laid out this frame.
+    let place = |v: &AppView, ix: usize| {
+        let vp = v.rail_list.viewport_bounds();
+        v.rail_list.bounds_for_item(ix).map(|r| (f32::from(r.top() - vp.top()), f32::from(r.size.height)))
+    };
+    // Fold.
+    catch_up(cx, &view);
+    view.update(cx, |v, cx| v.toggle_bucket(b, cx));
+    cx.run_until_parked();
+    let mut heads = vec![head0.expect("the head")];
+    let mut ghosts = 0;
+    let mut check = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let head = place(v, ix).expect("the head in view").0;
+            heads.push(head);
+            let Some(f) = v.rail_fx.fold.as_ref().filter(|f| f.o >= 1.) else { return };
+            let (y, h, n) = v.rail_fx.ghost_at.expect("its body drawn under its head");
+            let (ht, hh) = place(v, f.start).expect("the head");
+            assert!(
+                (y - (ht + hh)).abs() < 0.5 && (h - f.o).abs() < 1e-3,
+                "under the head, down to what follows: {y} {h} {ht}+{hh} {}",
+                f.o
+            );
+            assert!(n > 0 && f.after == f.start + 1, "{n} {f:?}");
+            if let Some((at, _)) = place(v, f.after) {
+                assert!((at - (ht + hh)).abs() < 0.5, "what follows rides from the head's foot: {at}");
+            }
+            ghosts += 1;
+        })
+    };
+    check(cx);
+    let frames = fly(cx, w, &view, 400, &mut check);
+    assert!(frames > 30 && ghosts > 30, "{frames} frames, {ghosts} with the body drawn");
+    assert_eq!(heads[1], heads[0], "the rows above don't move in the fold's first frame");
+    assert!(heads.windows(2).all(|p| (p[1] - p[0]).abs() <= 13.), "the rows above glide, never jump: {heads:?}");
+    assert!(view.read_with(cx, |v, _| v.rail_fx.fold.is_none() && v.rail_fx.ghost_at.is_none()));
+    // Unfold, scrolled to the end again.
+    to_end(cx);
+    catch_up(cx, &view);
+    view.update(cx, |v, cx| v.toggle_bucket(b, cx));
+    cx.run_until_parked();
+    let mut tails = 0;
+    let mut first = true;
+    let mut cover = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let Some(f) = v.rail_fx.fold.as_ref().filter(|f| f.o < 0.) else { return };
+            let vh = f32::from(v.rail_list.viewport_bounds().size.height);
+            let n = v.rail.rail.items.len();
+            // The list draws the items whose place is in the view, `o` up.
+            let mut end = None;
+            let mut next = f.after;
+            while next < n {
+                let Some((t, h)) = place(v, next) else { break };
+                if t >= vh {
+                    break;
+                }
+                end = Some(t + h + f.o);
+                next += 1;
+            }
+            // What follows starts below the view: the body revealed fills it.
+            if place(v, f.after).is_some_and(|(t, _)| t + f.o >= vh - 0.5) {
+                first = false;
+                return;
+            }
+            // Then the tail, contiguous, from the next one.
+            for &(tix, top) in &v.rail_fx.tail {
+                assert_eq!(tix, next, "the tail goes on from the list's last: {:?}", v.rail_fx.tail);
+                if let Some(e) = end {
+                    assert!((top - e).abs() < 0.5, "contiguous: {top} after {e}");
+                }
+                end = Some(top + place(v, tix).expect("laid out").1);
+                next += 1;
+                tails += 1;
+            }
+            assert!(
+                next == n || end.is_some_and(|e| e >= vh - 0.5),
+                "whole down to the view's end{}: {end:?} {vh}",
+                if first { " (first frame)" } else { "" }
+            );
+            first = false;
+        })
+    };
+    cover(cx);
+    let frames = fly(cx, w, &view, 400, &mut cover);
+    assert!(frames > 30 && tails > 3, "{frames} frames, {tails} tail rows");
+    assert!(!first, "checked from its first frame");
+    assert!(view.read_with(cx, |v, _| v.rail_fx.fold.is_none() && v.rail_fx.tail.is_empty()));
 }

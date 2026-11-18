@@ -918,6 +918,7 @@ impl AppView {
         self.model.tabs.view().is_none()
             && !self.model.transcript.pending_prompts().is_empty()
             && (self.model.watch.focus().is_some() || !self.card_on_screen())
+            && (self.stub_away.is_none() || self.stub_away != self.model.card_key())
     }
 }
 

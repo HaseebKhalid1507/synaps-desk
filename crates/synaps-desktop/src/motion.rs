@@ -239,6 +239,9 @@ pub(crate) const STREAM_FADE: Duration = Duration::from_millis(180);
 pub(crate) const STREAM_STAGGER: Duration = Duration::from_millis(12);
 /// Positions settle within this (px).
 const FLUID_EPSILON: f32 = 0.5;
+/// [`Motion::spring_px`]: a change due within a 144 Hz frame is the next
+/// frame's; one due later, a timer's.
+const PX_FRAME: Duration = Duration::from_micros(6944);
 /// A press's release has settled (its fill and travel, as progress).
 const PRESS_EPSILON: f32 = 0.002;
 
@@ -2173,6 +2176,35 @@ impl Motion {
         self.spring(key, None, target, response)
     }
 
+    /// [`Motion::spring_held`] on whole device pixels (a side panel's
+    /// width: GPUI lays boxes out on them anyway). Its value snapped; the
+    /// next frame is asked for only when the snapped value will have
+    /// changed by then, else a timer for the instant it does (or the spring
+    /// settles): the slow tail moves under a pixel a frame, and no frame
+    /// draws what the last one drew. Its value, and whether it moves.
+    pub(crate) fn spring_px(&self, key: u64, target: f32, response: f32) -> (f32, bool) {
+        let asked = (self.display.get(), self.pane_wants.get());
+        let (v, moving) = self.spring_held(key, target, response);
+        let shown = self.snap(v);
+        if !moving {
+            return (shown, false);
+        }
+        self.display.set(asked.0);
+        self.pane_wants.set(asked.1);
+        let now = self.now();
+        let Some(s) = self.springs.borrow().get(&key).copied() else { return (shown, true) };
+        let next = (1..=1000u64)
+            .map(|k| now + Duration::from_millis(k))
+            .find(|&t| s.settled(t) || self.snap(s.target + s.state(t).0) != shown)
+            .unwrap_or(now + Duration::from_secs(1));
+        if next <= now + PX_FRAME {
+            self.want_frame();
+        } else {
+            self.want_at(next);
+        }
+        (shown, true)
+    }
+
     /// Value `key` eased toward `to` (a label's colour, as 0..1): over `up`
     /// (rising) or `down` (falling) for a whole 0 → 1, from where it is.
     /// First drawn, not drawn last frame, or Off: at `to`. Reduced: over
@@ -2605,6 +2637,44 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    /// A side panel's width on whole pixels ([`Motion::spring_px`]): a
+    /// frame is asked for only when the width drawn will have changed by
+    /// then, else a timer for the instant it does. Driven as the app is (the
+    /// next 144 Hz frame, or the timer), a 280-px `sheet` fold draws each
+    /// width once (the landing frame apart) and lands as the spring does:
+    /// ~52 frames where drawing every frame of it takes ~71.
+    #[test]
+    fn a_pixel_spring_draws_each_width_once() {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        let sheet = super::SHEET_RESPONSE;
+        m.begin_frame(Level::Full, false, t0);
+        m.spring_jump(9, 280., 0., sheet);
+        let (mut t, mut drawn) = (t0, Vec::new());
+        for _ in 0..200 {
+            m.begin_frame(Level::Full, false, t);
+            let (v, moving) = m.spring_px(9, 0., sheet);
+            assert_eq!(v, v.round(), "whole pixels");
+            drawn.push(v);
+            if !moving {
+                break;
+            }
+            t = match m.demand() {
+                (true, _) => t + Duration::from_micros(6944),
+                (false, Some(at)) => at,
+                (false, None) => panic!("moving, and nothing asked for"),
+            };
+        }
+        let ms = t.duration_since(t0).as_millis();
+        assert_eq!(drawn.last(), Some(&0.), "landed");
+        assert!((470..=520).contains(&ms), "as long as the spring: {ms} ms");
+        let same = drawn.windows(2).filter(|p| p[0] == p[1]).count();
+        assert!(same <= 1, "each width drawn once: {drawn:?}");
+        assert!((45..=60).contains(&drawn.len()), "{} frames", drawn.len());
+        assert!(drawn.windows(2).all(|p| p[1] <= p[0]), "one way");
+        assert_eq!(m.demand(), (false, None), "at rest: nothing asked for");
     }
 
     /// Off: nothing samples anything but the end state, nothing asks for a

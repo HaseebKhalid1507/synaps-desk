@@ -551,9 +551,16 @@ impl AppView {
         let Some(ix) = self.card_ix() else { return };
         let (top, bottom) = self.list_view();
         // Below the sticky band, when the labels are inline (polish.md F8);
-        // above the dock as it will be once it lands (polish.md P13).
+        // above the dock as it will be once it lands (polish.md P13): the
+        // stub leaves now (it pointed here), its room is the view's.
         let top = top + self.sticky_inset(cx);
-        let bottom = bottom - self.dock_growth();
+        let leaves = if self.stub_shown() && self.model.watch.focus().is_none() {
+            self.stub_away = self.model.card_key();
+            crate::fit::STUB_GAP + crate::theme::metrics(cx).row
+        } else {
+            0.
+        };
+        let bottom = bottom - self.dock_growth() + leaves;
         match self.list.bounds_for_item(ix) {
             Some(b) => {
                 let (t, bt) = (f32::from(b.top()), f32::from(b.bottom()));

@@ -153,8 +153,11 @@ pub(crate) struct RailCache {
 
 /// A section folding or unfolding in the rail (fluid.md §3.7, polish.md
 /// P14): the items after it are drawn `o` px from their place, `o`
-/// springing to 0 on `sheet`; unfolding, its body (the items from `start`
-/// + 1, their heights) is revealed down to them, clipped.
+/// springing to 0 on `sheet`. Unfolding, its body (the items after
+/// `start`, their heights) is revealed down to them, clipped; folding,
+/// the body it had (`ghost`: the rail before, and the body's items in it)
+/// is drawn under its head, clipped at them as they rise over it: the
+/// same reveal, run backwards.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Fold {
     pub(crate) start: usize,
@@ -162,6 +165,7 @@ pub(crate) struct Fold {
     pub(crate) heights: Vec<f32>,
     pub(crate) from: f32,
     pub(crate) o: f32,
+    pub(crate) ghost: Option<std::rc::Rc<(Rail, std::ops::Range<usize>)>>,
 }
 
 impl Fold {
@@ -222,8 +226,12 @@ pub(crate) struct RailFx {
     pub(crate) fold: Option<Fold>,
     /// Unfolding, the items after it that ride into view from where they
     /// were but whose place is below it (the list draws only what is in
-    /// view where it lays out): each with its top in the rail's view.
+    /// view where it lays out): each with its top in the rail's view, as
+    /// [`AppView::rail_layer`] drew them last.
     pub(crate) tail: Vec<(usize, f32)>,
+    /// Folding, the body it had as that layer drew it last: its top in the
+    /// rail's view, the height shown, how many items.
+    pub(crate) ghost_at: Option<(f32, f32, usize)>,
 }
 
 /// Spring keys (the rail's own).
@@ -395,12 +403,15 @@ impl RailCache {
                     .map(|(y, hs)| y + hs.iter().sum::<f32>());
                 let from = old_end.zip(new_end).map(|(o, n)| o - n);
                 let from = if count > range.len() { from.or(heights.as_ref().map(|h| -h.iter().sum::<f32>())) } else { from };
+                // Folding to its head alone: the body it had goes under it.
+                let ghost = (count == 1 && range.len() > 1).then(|| std::rc::Rc::new((self.rail.clone(), range.start + 1..range.end)));
                 folded = from.filter(|f| f.abs() >= 0.5).map(|from| Fold {
                     start: range.start,
                     after,
                     heights: if from < 0. { heights.unwrap_or_default() } else { Vec::new() },
                     from,
                     o: from,
+                    ghost: ghost.filter(|_| from > 0.),
                 });
             }
             targets = Some(at);
@@ -833,9 +844,13 @@ impl AppView {
         out.offsets.clear();
         out.leads.clear();
         // A section folding: what follows it rides `o` to 0 on `sheet`.
+        // Any other splice (a session starting, a reorder, find) ends a
+        // fold under way: its items are not where they were.
         if let Some(f) = self.rail.folded.take() {
             fx.spring_jump(FOLD_Y, f.from, 0., crate::motion::SHEET_RESPONSE);
             out.fold = Some(f);
+        } else if targets.is_some() {
+            out.fold = None;
         }
         if let Some(f) = out.fold.as_mut() {
             let (o, moving) = fx.spring_held(FOLD_Y, 0., crate::motion::SHEET_RESPONSE);
@@ -844,18 +859,9 @@ impl AppView {
                 out.fold = None;
             }
         }
-        out.tail.clear();
-        if let Some(f) = out.fold.as_ref().filter(|f| f.o < 0.) {
-            for ix in f.after..rail.items.len() {
-                let Some((y, _, scroll)) = item_y(list, ix) else { break };
-                let top = y - scroll;
-                if top + f.o >= view_h {
-                    break;
-                }
-                if top >= view_h {
-                    out.tail.push((ix, top + f.o));
-                }
-            }
+        if out.fold.is_none() {
+            out.tail.clear();
+            out.ghost_at = None;
         }
         for (key, from) in std::mem::take(&mut self.rail.flip_from) {
             if let Some((y, _, _)) = ix_of(key).and_then(|ix| item_y(list, ix))
@@ -931,6 +937,9 @@ impl AppView {
     /// border, `line3` under the pointer, `ink3` while dragged. A strip has
     /// one too (dragged out, it opens), unless the window cannot open it.
     /// `shown`: the panel's width as drawn (on its spring, fluid.md §3.8).
+    /// None while the panel flies: a drag starts from a panel at rest (one
+    /// caught in flight would start from where it is going, not where it
+    /// is drawn).
     pub(crate) fn render_edge(
         &self,
         rail: bool,
@@ -942,6 +951,9 @@ impl AppView {
         if side == Side::Strip && crate::app::toggled(self.width, self.panels, rail).is_none() {
             return None;
         }
+        if self.panel_fx.sides[usize::from(!rail)].moving {
+            return None;
+        }
         let dragged = self.drag.is_some_and(|g| g.moved && g.rail == rail);
         // Mostly over the panel: the border is the rail's last pixel and
         // the right panel's first.
@@ -950,6 +962,7 @@ impl AppView {
         Some(
             div()
                 .id(id)
+                .debug_selector(move || id.into())
                 .group(group)
                 .absolute()
                 .top(px(top_h(self.layout.short)))
@@ -986,8 +999,14 @@ impl AppView {
     /// from where the panel is drawn; anything else (a window resize, the
     /// auto width giving way) is taken at once, and a drag follows the
     /// pointer. Reduced and Off: at once.
+    ///
+    /// On whole device pixels ([`crate::motion::Motion::spring_px`]): the
+    /// centre pane, and so the transcript list's item width (the column,
+    /// its padding whole pixels too), is the same in every frame of a
+    /// flight. GPUI forgets every measured row height when the item width
+    /// changes at all (`list.rs` prepaint), and its scrollbar with them.
     pub(crate) fn panel_frame(&mut self, rail: Side, right: Side) -> (f32, f32) {
-        let dragging = self.drag.is_some_and(|g| g.moved);
+        let dragged = self.drag.filter(|g| g.moved).map(|g| usize::from(!g.rail));
         let now = self.fx.now();
         for (i, side) in [rail, right].into_iter().enumerate() {
             let f = &mut self.panel_fx.sides[i];
@@ -998,11 +1017,13 @@ impl AppView {
             if let Some(from) = f.from.take() {
                 self.fx.spring_jump(PANEL_W[i], from, to, f.response);
             }
-            if dragging {
+            // The dragged edge follows the pointer; the other panel, if it
+            // flies, flies on.
+            if dragged == Some(i) {
                 self.fx.spring_jump(PANEL_W[i], to, to, f.response);
             }
             let was = f.moving;
-            let (w, moving) = self.fx.spring_held(PANEL_W[i], to, f.response);
+            let (w, moving) = self.fx.spring_px(PANEL_W[i], to, f.response);
             (f.shown, f.moving) = (w, moving);
             if let Side::Open(ow) = side {
                 f.open = ow;
@@ -1251,7 +1272,13 @@ impl AppView {
                 div().flex_1().min_w_0().font_family(fonts::MONO).text_px(size::META).child(Input::new(&self.find_input).appearance(false)),
             )
             .child(div().px(px(5.)).border_1().border_color(p.edge).child(mono("/", size::META, p.dim_ch)));
-        let items = list(self.rail_list.clone(), cx.processor(|this, ix, _window, cx| this.render_rail_item(ix, cx))).size_full();
+        // A section folding holds the rail's length until it lands (shorter
+        // at once, a rail scrolled to its end would jump down): what goes
+        // is drawn ([`AppView::rail_layer`]) and its room kept.
+        let fold_o = self.rail_fx.fold.as_ref().map_or(0., |f| f.o);
+        let items = list(self.rail_list.clone(), cx.processor(|this, ix, _window, cx| this.render_rail_item(ix, cx)))
+            .size_full()
+            .pb(px(fold_o.max(0.)));
         v_flex()
             .w(px(width))
             .h_full()
@@ -1297,15 +1324,77 @@ impl AppView {
                             .child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(p.you_bar))
                     }))
                     .child(items)
-                    .children(
-                        self.rail_fx
-                            .tail
-                            .iter()
-                            .map(|&(ix, top)| div().absolute().left_0().right_0().top(px(top)).child(self.render_rail_item_at(ix, cx))),
-                    )
-                    .child(crate::scrollbar::rows(&self.rail_list, 0., &self.bars.rail).ground(crate::scrollbar::Ground::Chrome)),
+                    // Right after the list's layout, in its frame: what a
+                    // section folding or unfolding has that the list doesn't
+                    // draw.
+                    .when(self.rail_fx.fold.is_some(), |d| {
+                        d.child(crate::sticky::layer(
+                            self.fx.clone(),
+                            cx.processor(|this, b: Bounds<Pixels>, _, cx| this.rail_layer(b, cx)),
+                        ))
+                    })
+                    // Its length as drawn: the fold's offset in it.
+                    .child(crate::scrollbar::rows(&self.rail_list, fold_o, &self.bars.rail).ground(crate::scrollbar::Ground::Chrome)),
             )
             .child(self.render_foot(p, cx))
+    }
+
+    /// Over the rail's list, laid out after it in the same frame (a layer,
+    /// as the transcript's pinned labels are: [`crate::sticky`]): what a
+    /// section folding or unfolding shows that the list doesn't draw, from
+    /// where the list has just laid its items out.
+    /// - Unfolding: the items after it whose place is below the view (the
+    ///   list draws only those whose place is in it) ride into it from where
+    ///   they were, `o` above their place.
+    /// - Folding: the body it had, under its head, down to what follows as
+    ///   it rises over it (clipped there): the unfold's reveal, backwards.
+    ///
+    /// Decorations: they take no pointer (the wheel still scrolls the rail).
+    pub(crate) fn rail_layer(&mut self, _: Bounds<Pixels>, cx: &mut Context<Self>) -> Option<crate::sticky::Pinned> {
+        let f = self.rail_fx.fold.clone()?;
+        let vp = self.rail_list.viewport_bounds();
+        let view_h = f32::from(vp.size.height);
+        let list = self.rail_list.clone();
+        let place = |ix: usize| list.bounds_for_item(ix).map(|b| (f32::from(b.top() - vp.top()), f32::from(b.size.height)));
+        let mut tail = Vec::new();
+        let mut ghost_at = None;
+        // Each piece, and the band it covers in the view.
+        let mut drawn: Vec<(AnyElement, f32, f32)> = Vec::new();
+        if f.o < 0. {
+            for ix in f.after..self.rail.rail.items.len() {
+                let Some((top, _)) = place(ix) else { break };
+                if top + f.o >= view_h {
+                    break;
+                }
+                if top >= view_h {
+                    tail.push((ix, top + f.o));
+                }
+            }
+            if let Some(&(_, y)) = tail.first() {
+                let rows = v_flex().w_full().children(tail.iter().map(|&(ix, _)| self.render_rail_item_at(ix, cx)));
+                drawn.push((rows.into_any_element(), y, view_h));
+            }
+        } else if let Some(g) = f.ghost.as_ref() {
+            // Its head's foot (where what follows is laid out).
+            let at = place(f.start).map(|(t, h)| t + h).or_else(|| place(f.after).map(|(t, _)| t));
+            if let Some(y) = at.filter(|&y| y < view_h && y + f.o > 0.) {
+                let rows = v_flex().w_full().children(g.1.clone().map(|ix| self.render_rail_item_in(&g.0, ix, cx)));
+                drawn.push((crate::motion::clip_h(rows.into_any_element(), f.o), y, y + f.o));
+                ghost_at = Some((y, f.o, g.1.len()));
+            }
+        }
+        self.rail_fx.tail = tail;
+        self.rail_fx.ghost_at = ghost_at;
+        if drawn.is_empty() {
+            return None;
+        }
+        let el = div().size_full().relative().children(drawn.into_iter().flat_map(|(el, y, end)| {
+            [
+                div().absolute().left_0().right_0().top(px(y)).child(el).into_any_element(),
+                div().absolute().left_0().right_0().top(px(y)).h(px(end - y)).block_mouse_except_scroll().into_any_element(),
+            ]
+        }));
+        Some(crate::sticky::Pinned { el: el.into_any_element(), cover: None })
     }
 
     /// One item of the rail's list (only the visible ones are built).
@@ -1349,8 +1438,13 @@ impl AppView {
     }
 
     fn render_rail_item_at(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
+        self.render_rail_item_in(&self.rail.rail, ix, cx)
+    }
+
+    /// Item `ix` of `rail` (the rail now, or the one before a section
+    /// folded: its body, drawn as it goes).
+    fn render_rail_item_in(&self, rail: &Rail, ix: usize, cx: &Context<Self>) -> AnyElement {
         let p = theme::palette(cx);
-        let rail = &self.rail.rail;
         let Some(item) = rail.items.get(ix) else { return div().into_any_element() };
         match item {
             // A group's head (the first: no rule above it) that folds, as a
@@ -1393,8 +1487,8 @@ impl AppView {
                 .child(div().flex_1())
                 .child(mono(count, size::META, p.dim_ch))
                 .into_any_element(),
-            Item::Row(r) => self.render_row2(*r, &p, cx),
-            Item::Hist(r) => self.render_hist(*r, &p, cx),
+            Item::Row(r) => self.render_row2(&rail.rows[*r], &p, cx),
+            Item::Hist(r) => self.render_hist(&rail.rows[*r], &p, cx),
             Item::Bucket { bucket, open, count } => {
                 let b = *bucket;
                 let color = if *open { p.prose_ch } else { p.dim_ch };
@@ -1465,11 +1559,10 @@ impl AppView {
     /// (if not at rest), the folder or a named session's title, the cost.
     /// Its state is read per frame (the attached session runs ahead of the
     /// poll), its strings come from the cache; it never changes shape.
-    fn render_row2(&self, r: usize, p: &Palette, cx: &Context<Self>) -> AnyElement {
+    fn render_row2(&self, row: &rail::Row, p: &Palette, cx: &Context<Self>) -> AnyElement {
         // No readout under an open menu (a right-click's pointer rests on
         // the row it opened from).
         let menu_open = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some();
-        let row = &self.rail.rail.rows[r];
         let meta = row.live.and_then(|i| self.model.sessions.get(i));
         let st = meta.map(|s| self.model.state(s)).unwrap_or(row.state);
         let on = meta.is_some_and(|s| self.model.is_active(&s.id));
@@ -1654,11 +1747,10 @@ impl AppView {
 
     /// A HISTORY row: one fixed-height line, title and age, a mark only if
     /// it is unread (or being opened).
-    fn render_hist(&self, r: usize, p: &Palette, cx: &Context<Self>) -> AnyElement {
+    fn render_hist(&self, row: &rail::Row, p: &Palette, cx: &Context<Self>) -> AnyElement {
         // No readout under an open menu (a right-click's pointer rests on
         // the row it opened from).
         let menu_open = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some();
-        let row = &self.rail.rail.rows[r];
         let key = row.key;
         let title_color = match row.state {
             State::Unread => p.ink,
@@ -1860,7 +1952,9 @@ impl AppView {
             .left_0()
             .child(
                 deferred(
-                    anchored().offset(point(px(self.rail_width + 12. + dx), px(2. + dy))).child(crate::motion::appear(body, strength)),
+                    anchored()
+                        .offset(point(px(self.panel_fx.sides[0].shown + 12. + dx), px(2. + dy)))
+                        .child(crate::motion::appear(body, strength)),
                 )
                 .with_priority(2),
             )
@@ -2232,9 +2326,11 @@ impl AppView {
         // when that stays clear of the tab strip's `+` (it ends at the
         // column's right edge); else above the composer, under the tab
         // strip.
+        // The panel as drawn (it may be flying).
+        let w = self.panel_fx.sides[1].shown;
         let place = match right {
-            Side::Open(w) if w.max(PICKER_MIN) - w + 8. <= self.layout.right => PickerAt::Top(w.max(PICKER_MIN)),
-            _ => PickerAt::Bottom(right.width() + 24.),
+            Side::Open(_) if w.max(PICKER_MIN) - w + 8. <= self.layout.right => PickerAt::Top(w.max(PICKER_MIN)),
+            _ => PickerAt::Bottom(w + 24.),
         };
         let max_h = match place {
             PickerAt::Top(_) => self.height - top - 16.,
