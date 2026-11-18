@@ -1799,7 +1799,7 @@ impl AppView {
                     && let Some(p) = this.palette.as_mut()
                 {
                     p.set_query(&input.read(cx).value());
-                    this.palette_scroll.scroll_to_item(0);
+                    this.palette_scroll.set_offset(Point::default());
                     cx.notify();
                 }
             }),

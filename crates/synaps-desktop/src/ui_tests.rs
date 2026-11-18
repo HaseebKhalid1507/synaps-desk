@@ -5342,10 +5342,10 @@ fn palette_engine_commands_are_the_owners(cx: &mut TestAppContext) {
     let sel = view.read_with(cx, |v, _| v.palette.as_ref().and_then(|p| p.selected().cloned())).expect("a row");
     assert_eq!(sel.act, crate::palette::Act::Engine("compact"));
     assert_eq!(sel.key.as_deref(), Some("owner"), "marked");
-    assert!(sel.off.as_deref().is_some_and(|o| o.contains("owner only") && o.contains("observes")), "{:?}", sel.off);
+    assert_eq!(sel.off.as_deref(), Some("/compact: this window observes"), "{:?}", sel.off);
     tap(cx, w, "enter");
     let note = view.read_with(cx, |v, _| v.watch_note.clone()).expect("a note");
-    assert!(note.contains("owner only"), "refused politely: {note}");
+    assert_eq!(note.as_ref(), "/compact: this window observes", "refused politely");
     // Driving: it goes out (the client takes it; its daemon is nowhere).
     view.update(cx, |v, cx| {
         v.model.active.as_mut().unwrap().mode = mode;
@@ -5602,6 +5602,30 @@ fn command_notes_are_quiet_and_never_stale(cx: &mut TestAppContext) {
     start_stream(cx, &view);
     send_in_composer(cx, w, &view, "/budget");
     assert_eq!(color(cx), (false, true), "refused: a warning");
+}
+
+/// Design re-gate #20 (5), found in its clip: reopened after scrolling
+/// down, the list is at its top again, its first group's head in view (the
+/// quad is the list's first child: scrolled to, it hid the head).
+#[gpui_kit::test]
+fn palette_reopens_at_the_top(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(false));
+    for _ in 0..12 {
+        tap(cx, w, "down");
+    }
+    tap(cx, w, "pagedown");
+    settle(cx, w, 8);
+    let y = |cx: &mut TestAppContext| view.read_with(cx, |v, _| f32::from(v.palette_scroll.offset().y));
+    assert!(y(cx) < 0., "scrolled down");
+    tap(cx, w, "escape");
+    tap(cx, w, palette_key(false));
+    settle(cx, w, 8);
+    assert_eq!(y(cx), 0., "at the top: the head in view");
+    type_in(cx, w, "e");
+    settle(cx, w, 8);
+    assert_eq!(y(cx), 0., "a query: the top too");
 }
 
 /// Design re-gate #20 (2): a query that matches nothing shows "Nothing

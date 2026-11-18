@@ -196,8 +196,8 @@ pub(crate) fn mid_turn(name: &str) -> String {
 /// composer's foot at 1280 (its tooltip has it whole too).
 pub(crate) fn not_here(name: &str, why: &str) -> String {
     match why {
-        "read-only here: another client owns this session's input" => format!("/{name}: owner only · another client has the input"),
-        "read-only: this window observes the session" => format!("/{name}: owner only · this window observes"),
+        "read-only here: another client owns this session's input" => format!("/{name}: another client has the input"),
+        "read-only: this window observes the session" => format!("/{name}: this window observes"),
         // Reconnecting, switching, not attached: the reason's head.
         why => format!("/{name} not run · {}", why.split(':').next().unwrap_or(why)),
     }
@@ -633,7 +633,7 @@ impl AppView {
             if p.mode != mode {
                 p.set_mode(mode);
                 self.palette_placeholder(window, cx);
-                self.palette_scroll.scroll_to_item(0);
+                self.palette_scroll.set_offset(Point::default());
             }
             cx.notify();
             return;
@@ -648,7 +648,7 @@ impl AppView {
         self.palette_gen = self.palette_sig(cx);
         self.palette = Some(Palette::new(mode, goto, commands));
         self.palette_sel.set(None);
-        self.palette_scroll.scroll_to_item(0);
+        self.palette_scroll.set_offset(Point::default());
         self.palette_input.update(cx, |s, cx| {
             s.set_value("", window, cx);
             s.focus(window, cx);
@@ -684,7 +684,7 @@ impl AppView {
             p.flip();
         }
         self.palette_placeholder(window, cx);
-        self.palette_scroll.scroll_to_item(0);
+        self.palette_scroll.set_offset(Point::default());
         cx.notify();
     }
 
