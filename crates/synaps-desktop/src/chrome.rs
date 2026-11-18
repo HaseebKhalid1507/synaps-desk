@@ -141,6 +141,40 @@ pub(crate) struct RailCache {
     /// In the frame of a splice, where each item will be laid out (the
     /// list can't say until it lays out again): [`rail::flip_targets`].
     pub(crate) targets: Option<Vec<Option<(f32, f32)>>>,
+    /// The next splice is a section's fold or unfold (FAVOURITES, a
+    /// HISTORY bucket): it reveals instead of Flipping ([`Fold`]).
+    pub(crate) fold: bool,
+    /// That splice's fold, for [`AppView::rail_motion`] to start.
+    pub(crate) folded: Option<Fold>,
+    /// Each item kind's height as last laid out: a section unfolding
+    /// whose rows' kind is on screen nowhere else.
+    kind_h: HashMap<u8, f32>,
+}
+
+/// A section folding or unfolding in the rail (fluid.md §3.7, polish.md
+/// P14): the items after it are drawn `o` px from their place, `o`
+/// springing to 0 on `sheet`; unfolding, its body (the items from `start`
+/// + 1, their heights) is revealed down to them, clipped.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Fold {
+    pub(crate) start: usize,
+    pub(crate) after: usize,
+    pub(crate) heights: Vec<f32>,
+    pub(crate) from: f32,
+    pub(crate) o: f32,
+}
+
+impl Fold {
+    /// Body item `ix`'s height shown (none: all of it).
+    pub(crate) fn shown(&self, ix: usize) -> Option<f32> {
+        if ix <= self.start || ix >= self.after || self.from >= 0. {
+            return None;
+        }
+        let k = ix - self.start - 1;
+        let above: f32 = self.heights[..k].iter().sum();
+        let total: f32 = self.heights.iter().sum();
+        Some((total + self.o - above).clamp(0., self.heights[k]))
+    }
 }
 
 /// The key an item slides by (Flip): a row's own key, else the head's
@@ -184,6 +218,8 @@ pub(crate) struct RailFx {
     pub(crate) moving: bool,
     /// The readout's y, as it follows from the row before.
     pub(crate) readout_dy: f32,
+    /// A section folding or unfolding.
+    pub(crate) fold: Option<Fold>,
 }
 
 /// Spring keys (the rail's own).
@@ -198,6 +234,60 @@ pub(crate) const FLIP_CAP: f32 = 160.;
 /// The numbers' and meters' keys (motion.md §6.6).
 const GLOW: u64 = 0x7AC5 << 48;
 const METER: u64 = 0x7AC6 << 48;
+/// The side panels' shown widths (fluid.md §3.8): the rail's, the right
+/// panel's.
+const PANEL_W: [u64; 2] = [0x7AF0 << 48, (0x7AF0 << 48) | 1];
+/// A rail section's fold: the offset of what follows it.
+const FOLD_Y: u64 = 0x7AF3 << 48;
+/// FAVOURITES' chevron.
+const FAVS_TURN: u64 = (0x7AF3 << 48) | 1;
+
+/// A side panel's width on its spring (fluid.md §3.8, polish.md P14).
+/// Only what the app does moves it (a fold, a reset, a detent); a window
+/// resize and a drag take the new width at once (`follow`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Flight {
+    /// A move asked for this frame: from the width shown, on `response`.
+    pub(crate) from: Option<f32>,
+    pub(crate) response: f32,
+    /// A fold or an unfold: the panel's content, laid out at its open
+    /// width, slides under the window's side; else (a width change) it is
+    /// clipped at the inner edge.
+    pub(crate) slide: bool,
+    /// The width drawn this frame, and whether it moves.
+    pub(crate) shown: f32,
+    pub(crate) moving: bool,
+    /// The width its content is laid out at: the open one (while it folds,
+    /// the one it had).
+    pub(crate) open: f32,
+    /// When it landed on its strip: the strip's glyphs lift in over `quick`.
+    pub(crate) landed: Option<std::time::Instant>,
+}
+
+/// Both side panels' flights, and the column's wrap width while they fly.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PanelFx {
+    pub(crate) sides: [Flight; 2],
+    /// The narrowest centre pane of the flight: the column is laid out
+    /// for it until every panel is at rest (it rewraps once, at the start
+    /// when it narrows, at the end when it widens; fluid.md §3.8).
+    pub(crate) freeze: Option<f32>,
+}
+
+impl PanelFx {
+    /// Panel `rail` (else the right one) moves from where it is drawn now,
+    /// on `response` (`sheet` for a fold or a reset, `snap` to a detent).
+    pub(crate) fn fly(&mut self, rail: bool, response: f32, slide: bool) {
+        let f = &mut self.sides[usize::from(!rail)];
+        f.from = Some(f.shown);
+        f.response = response;
+        f.slide = slide;
+    }
+
+    pub(crate) fn moving(&self) -> bool {
+        self.sides.iter().any(|f| f.moving)
+    }
+}
 
 /// A shown value's hash, for its afterglow ([`crate::motion::Motion::glow`]).
 fn vhash(v: &str) -> u64 {
@@ -251,6 +341,8 @@ impl RailCache {
         let keys: Vec<u64> = rail.items.iter().map(|i| rail::item_key(&rail, i)).collect();
         let mut flip_from = Vec::new();
         let mut targets = None;
+        let mut folded = None;
+        let fold = std::mem::take(&mut self.fold);
         if let Some((range, count)) = rail::splice(&self.keys, &keys) {
             if hold && !self.keys.is_empty() {
                 // Held: the old order, today's content; built again every
@@ -265,7 +357,45 @@ impl RailCache {
                 .map(|ix| (self.keys[ix], rail::item_kind(&self.rail.items[ix]), item_y(list, ix).map(|(y, h, _)| (y, h))))
                 .collect();
             let new: Vec<(u64, u8)> = keys.iter().zip(&rail.items).map(|(&k, it)| (k, rail::item_kind(it))).collect();
-            targets = Some(rail::flip_targets(&old, &new, range.clone(), count));
+            let at = rail::flip_targets(&old, &new, range.clone(), count);
+            let after = range.start + count;
+            for o in &old {
+                if let Some((_, h)) = o.2 {
+                    self.kind_h.insert(o.1, h);
+                }
+            }
+            if fold {
+                // A section's fold: what follows rides it (no Flip); its
+                // body, unfolding, is revealed.
+                let h_of = |ix: usize| {
+                    at.get(ix).copied().flatten().map(|t| t.1).or_else(|| new.get(ix).and_then(|n| self.kind_h.get(&n.1).copied()))
+                };
+                let heights: Option<Vec<f32>> = (range.start + 1..after).map(h_of).collect();
+                // What follows starts where it was: the old range's end, less
+                // the new one's.
+                let end_of = |o: Option<(f32, f32)>| o.map(|(y, h)| y + h);
+                let old_end = old
+                    .get(range.end)
+                    .and_then(|o| o.2)
+                    .map(|g| g.0)
+                    .or_else(|| range.end.checked_sub(1).and_then(|i| end_of(old.get(i).and_then(|o| o.2))));
+                let new_end = old
+                    .get(range.start)
+                    .and_then(|o| o.2)
+                    .map(|g| g.0)
+                    .zip((range.start..after).map(h_of).collect::<Option<Vec<f32>>>())
+                    .map(|(y, hs)| y + hs.iter().sum::<f32>());
+                let from = old_end.zip(new_end).map(|(o, n)| o - n);
+                let from = if count > range.len() { from.or(heights.as_ref().map(|h| -h.iter().sum::<f32>())) } else { from };
+                folded = from.filter(|f| f.abs() >= 0.5).map(|from| Fold {
+                    start: range.start,
+                    after,
+                    heights: if from < 0. { heights.unwrap_or_default() } else { Vec::new() },
+                    from,
+                    o: from,
+                });
+            }
+            targets = Some(at);
             let top = list.logical_scroll_top().item_ix;
             let scroll = -f32::from(list.scroll_px_offset_for_scrollbar().y);
             for (ix, o) in old.iter().enumerate().skip(top) {
@@ -273,7 +403,7 @@ impl RailCache {
                 if y - scroll > f32::from(list.viewport_bounds().size.height) {
                     break;
                 }
-                if let Some(k) = flip_key(&self.rail, ix) {
+                if let Some(k) = flip_key(&self.rail, ix).filter(|_| !fold) {
                     flip_from.push((k, y));
                 }
             }
@@ -283,7 +413,19 @@ impl RailCache {
             // measures new ones up front only once told they need it.
             list.remeasure_items(start..start + count);
         }
-        *self = RailCache { generation: Some(m.rail_gen), minute: now / 60, view: view.clone(), states, rail, keys, flip_from, targets };
+        *self = RailCache {
+            generation: Some(m.rail_gen),
+            minute: now / 60,
+            view: view.clone(),
+            states,
+            rail,
+            keys,
+            flip_from,
+            targets,
+            fold: false,
+            folded,
+            kind_h: std::mem::take(&mut self.kind_h),
+        };
     }
 }
 
@@ -682,6 +824,18 @@ impl AppView {
         let mut out = std::mem::take(&mut self.rail_fx);
         out.offsets.clear();
         out.leads.clear();
+        // A section folding: what follows it rides `o` to 0 on `sheet`.
+        if let Some(f) = self.rail.folded.take() {
+            fx.spring_jump(FOLD_Y, f.from, 0., crate::motion::SHEET_RESPONSE);
+            out.fold = Some(f);
+        }
+        if let Some(f) = out.fold.as_mut() {
+            let (o, moving) = fx.spring_held(FOLD_Y, 0., crate::motion::SHEET_RESPONSE);
+            f.o = o;
+            if !moving {
+                out.fold = None;
+            }
+        }
         for (key, from) in std::mem::take(&mut self.rail.flip_from) {
             if let Some((y, _, _)) = ix_of(key).and_then(|ix| item_y(list, ix))
                 && (from - y).abs() >= 0.5
@@ -755,14 +909,22 @@ impl AppView {
     /// panel's), over the rest of the window: its 1-px line is the panel's
     /// border, `line3` under the pointer, `ink3` while dragged. A strip has
     /// one too (dragged out, it opens), unless the window cannot open it.
-    pub(crate) fn render_edge(&self, rail: bool, side: Side, p: &Palette, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
+    /// `shown`: the panel's width as drawn (on its spring, fluid.md §3.8).
+    pub(crate) fn render_edge(
+        &self,
+        rail: bool,
+        side: Side,
+        shown: f32,
+        p: &Palette,
+        cx: &Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
         if side == Side::Strip && crate::app::toggled(self.width, self.panels, rail).is_none() {
             return None;
         }
         let dragged = self.drag.is_some_and(|g| g.moved && g.rail == rail);
         // Mostly over the panel: the border is the rail's last pixel and
         // the right panel's first.
-        let (left, line) = if rail { (MARK + side.width() - 4., 3.) } else { (self.width - side.width() - 2., 2.) };
+        let (left, line) = if rail { (MARK + shown - 4., 3.) } else { (self.width - shown - 2., 2.) };
         let (id, group) = if rail { ("rail-edge", "rail-edge") } else { ("right-edge", "right-edge") };
         Some(
             div()
@@ -796,6 +958,104 @@ impl AppView {
                 .on_drag(EdgeDrag, |d, _, _, cx| cx.new(|_| *d))
                 .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| this.click_edge(rail, ev.click_count(), cx))),
         )
+    }
+
+    /// The side panels this frame (fluid.md §3.8): their widths as drawn,
+    /// on their springs. A move the app asked for ([`PanelFx::fly`]) starts
+    /// from where the panel is drawn; anything else (a window resize, the
+    /// auto width giving way) is taken at once, and a drag follows the
+    /// pointer. Reduced and Off: at once.
+    pub(crate) fn panel_frame(&mut self, rail: Side, right: Side) -> (f32, f32) {
+        let dragging = self.drag.is_some_and(|g| g.moved);
+        let now = self.fx.now();
+        for (i, side) in [rail, right].into_iter().enumerate() {
+            let f = &mut self.panel_fx.sides[i];
+            let to = side.width();
+            if f.response == 0. {
+                f.response = crate::motion::SHEET_RESPONSE;
+            }
+            if let Some(from) = f.from.take() {
+                self.fx.spring_jump(PANEL_W[i], from, to, f.response);
+            }
+            if dragging {
+                self.fx.spring_jump(PANEL_W[i], to, to, f.response);
+            }
+            let was = f.moving;
+            let (w, moving) = self.fx.spring_held(PANEL_W[i], to, f.response);
+            (f.shown, f.moving) = (w, moving);
+            if let Side::Open(ow) = side {
+                f.open = ow;
+            }
+            f.landed = match side {
+                Side::Strip if was && !moving => Some(now),
+                Side::Strip => f.landed.filter(|_| !moving),
+                Side::Open(_) => None,
+            };
+        }
+        (self.panel_fx.sides[0].shown, self.panel_fx.sides[1].shown)
+    }
+
+    /// A side panel (`rail`, else the right one) as drawn this frame. In
+    /// flight it is its open content at full width in a box as wide as the
+    /// spring says, clipped, never squeezed: a fold or an unfold slides it
+    /// under the window's side, a width change clips it at the inner edge.
+    /// Landed on its strip, the strip's glyphs lift in over `quick`.
+    pub(crate) fn render_side(&self, rail: bool, side: Side, p: &Palette, cx: &Context<Self>) -> AnyElement {
+        let f = self.panel_fx.sides[usize::from(!rail)];
+        let content = |w: f32| -> AnyElement {
+            if rail {
+                self.render_rail(w, p, cx).into_any_element()
+            } else {
+                h_flex()
+                    .h_full()
+                    .child(self.render_right(w, p, cx))
+                    .child(self.bars.right.bar(crate::scrollbar::Ground::Chrome))
+                    .into_any_element()
+            }
+        };
+        if !f.moving {
+            return match side {
+                Side::Open(w) => content(w),
+                Side::Strip => {
+                    let k = crate::motion::LIFT
+                        + (1. - crate::motion::LIFT)
+                            * self.fx.shot(
+                                f.landed,
+                                std::time::Duration::ZERO,
+                                crate::motion::QUICK,
+                                &crate::motion::ease::OUT,
+                                crate::motion::Kind::Fade,
+                            );
+                    let strip = if rail {
+                        self.render_rail_strip(p, cx).into_any_element()
+                    } else {
+                        self.render_right_strip(p, cx).into_any_element()
+                    };
+                    crate::motion::lift(div().h_full().flex_none().child(strip), k).into_any_element()
+                }
+            };
+        }
+        let cw = match side {
+            Side::Open(w) => w,
+            Side::Strip => f.open,
+        };
+        // Its content's left in the box: a rail sliding keeps its inner
+        // edge on the box's; a right panel's slides with its own left edge.
+        let x = match (rail, f.slide) {
+            (true, true) | (false, false) => f.shown - cw,
+            _ => 0.,
+        };
+        div()
+            .id(if rail { "rail-flight" } else { "right-flight" })
+            .debug_selector(move || format!("{}-flight", if rail { "rail" } else { "right" }))
+            .relative()
+            .w(px(f.shown))
+            .h_full()
+            .flex_none()
+            .overflow_hidden()
+            .bg(p.chrome)
+            .child(div().absolute().top_0().bottom_0().left(px(x)).w(px(cw)).flex().child(content(cw)))
+            .into_any_element()
     }
 
     /// The folded rail: the connection disc and how many sessions need
@@ -1030,6 +1290,16 @@ impl AppView {
             Some(&dy) => div().w_full().relative().top(px(dy)).bg(theme::palette(cx).chrome).child(el).into_any_element(),
             None => el,
         };
+        // A section folding: what follows it rides the fold; its body
+        // shows down to it (clipped, never squeezed).
+        let el = match self.rail_fx.fold.as_ref() {
+            Some(f) if ix >= f.after => div().w_full().relative().top(px(f.o)).child(el).into_any_element(),
+            Some(f) => match f.shown(ix) {
+                Some(h) => crate::motion::clip_h(el, h),
+                None => el,
+            },
+            None => el,
+        };
         // A lead: its place kept in the list, the item drawn over the rest,
         // clipped to the rail's view.
         match key.and_then(|k| self.rail_fx.leads.get(&k)) {
@@ -1057,7 +1327,6 @@ impl AppView {
             // bucket does: its chevron in the left inset, so the label
             // lines up with the other groups'.
             Item::Favs { open, count } => {
-                let chevron = if *open { glyph::Glyph::FoldOpen } else { glyph::Glyph::Fold };
                 h_flex()
                     .id("favs-head")
                     .debug_selector(|| "favs-head".into())
@@ -1072,7 +1341,8 @@ impl AppView {
                     .map(|d| {
                         self.lit(d, crate::motion::key(RAIL_TOUCH, crate::app::tkey("favs-head", 0)), (p.chrome, p.raised, p.press_ch), cx)
                     })
-                    .child(div().absolute().left(px(7.)).top(px(19.)).child(glyph::draw(chevron, p.rest_mark)))
+                    // It turns as the section folds (fluid.md §3.7).
+                    .child(div().absolute().left(px(7.)).top(px(19.)).child(glyph::turn(self.fx.turn(FAVS_TURN, *open), p.rest_mark)))
                     .child(display(label::FAVOURITES, size::D_S, p.dim_ch))
                     .child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_ch).child(fonts::JP_FAVOURITES))
                     .child(div().flex_1())

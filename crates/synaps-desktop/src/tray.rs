@@ -150,6 +150,8 @@ pub(crate) struct TrayCache {
 
 /// Tray rows' keys in [`motion::Motion`], apart from item ids.
 const TRAY: u64 = 1 << 61;
+/// A chip's x in its line (its slide when the line closes).
+const TRAY_X: u64 = 0x7AF4 << 48;
 
 /// Between chips, and between their lines.
 pub(crate) const CHIP_GAP: f32 = 8.;
@@ -641,8 +643,13 @@ impl AppView {
         let steer = fx.flash(fx.sent.get().filter(|s| s.1 && watched.is_some()).map(|s| s.0 + 2 * motion::STAGGER));
         let you_color = motion::mix(p.you_mark_t, motion::mix(p.you, p.ink, 0.35), steer);
         let mut lines: Vec<Vec<AnyElement>> = (0..chips.lines).map(|_| Vec::new()).collect();
+        // Each line's next chip's x: a chip whose x changed (one before it
+        // left, polish.md P13) slides there.
+        let mut xs = vec![0f32; chips.lines];
         for &(slot, line, w) in &chips.slots {
             let Some(at) = lines.get_mut(line) else { continue };
+            let x = xs[line];
+            xs[line] += w + CHIP_GAP;
             match slot {
                 Slot::Ghost(g) => {
                     let Some(g) = self.tray.ghosts.get(g) else { continue };
@@ -662,15 +669,23 @@ impl AppView {
                     } else {
                         glyph::bar_at(p.sub_rule, fx.draw(fx.birth(TRAY | r.id), std::time::Duration::ZERO, motion::QUICK))
                     };
-                    // A chip that changed line slides from its last place.
+                    // A chip that changed line slides from its last place;
+                    // one that came rises 8 px and lifts from 70 %, in
+                    // turn (polish.md P13).
                     let off = fx.slide(TRAY | r.id, line as f32 * (row_h + CHIP_GAP));
+                    let dx = fx.slide(TRAY_X | r.id, x);
+                    let (travel, strength) = fx.arrival(fx.birth(TRAY | r.id));
                     let (bounds, id) = (self.chip_bounds.clone(), r.id);
                     at.push(
                         div()
                             .relative()
                             .top(px(off))
+                            .left(px(dx))
                             .flex_none()
-                            .child(self.tray_row(r, is_watched, armed, w, row_h, bar, p, m, cx))
+                            .child(motion::lift(
+                                div().relative().top(px(travel)).child(self.tray_row(r, is_watched, armed, w, row_h, bar, p, m, cx)),
+                                strength,
+                            ))
                             .child(canvas(move |b, _, _| bounds.borrow_mut().push((id, b)), |_, _, _, _| {}).absolute().inset_0())
                             .into_any_element(),
                     );
