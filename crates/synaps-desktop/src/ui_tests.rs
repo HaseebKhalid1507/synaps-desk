@@ -1426,15 +1426,15 @@ fn idle_requests_no_frames(cx: &mut TestAppContext) {
 }
 
 /// Nothing runs in the column, the composer or the tray (Shady #17 M3,
-/// pinned): no display frame; no sweep; the only sites are the rail's
+/// pinned): no display frame; no orbit; the only sites are the rail's
 /// running sessions' spinners (polish.md P1); and the only timer, if any,
 /// is theirs: the beat layer's, on the beat grid. Then, the rail's
 /// sessions at rest too, gate 3 exactly: no frame and no timer.
 fn only_the_rail_spins(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, what: &str) {
     let (frame, timer) = motion_pending(cx, view);
     assert!(!frame, "{what}: a display frame");
-    let (sites, rail, sweeps) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width, v.fx.sweep_count()));
-    assert_eq!(sweeps, 0, "{what}: a sweep");
+    let (sites, rail, orbits) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width, v.fx.orbit_count()));
+    assert_eq!(orbits, 0, "{what}: an orbit");
     assert!(sites.iter().all(|s| matches!(s.beat, crate::motion::Beat::Spin(_)) && f32::from(s.origin.x) < rail), "{what}: {sites:?}");
     let at = timer.expect("the demo's rail runs: its spinners' beat");
     assert!(!sites.is_empty(), "{what}: a timer with nothing on the layer");
@@ -1783,6 +1783,37 @@ fn the_answered_card_collapses_in_its_row(cx: &mut TestAppContext) {
     assert!(bounds(cx, "card-exit").is_none() && bounds(cx, "card").is_none());
     assert!(view.read_with(cx, |v, _| v.disp.iter().all(|d| d.kind != crate::turns::Kind::Prompt)), "its row is gone");
     assert!(bounds(cx, &format!("receipt {row}")).is_some(), "the receipt stays");
+}
+/// Cards D (cards4/proposal.md §8 #9, build step 10): Allow by its key
+/// presses the button (drawn down, the accent's fill) through the fold's
+/// first 90 ms; the card folds in its row on `glide`, and its call's row
+/// takes the receipt, `Allowed` lit in the accent, then quiet.
+#[gpui_kit::test]
+fn allow_folds_the_card_into_its_row(cx: &mut TestAppContext) {
+    use crate::authorize::Answer;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let row = view.read_with(cx, |v, _| v.current_card().expect("the demo's card").row);
+    let at = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel));
+    assert!(at(cx, "allow-fill".into()).is_some(), "Allow is the accent's fill");
+    card_keys(cx, w, &view);
+    tap(cx, w, if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" });
+    assert_eq!(view.read_with(cx, |v, _| v.sent.as_ref().map(|s| s.answer)), Some(Answer::Allowed));
+    settle(cx, w, 2);
+    let live = at(cx, "card".into()).expect("the live card, its answer sent");
+    resolve_prompt(cx, &view);
+    // The fold's first frame: in its row, Allow drawn pressed.
+    assert_eq!(view.read_with(cx, |v, _| v.card_exit.as_ref().map(|e| e.answer)), Some(Answer::Allowed), "answered on screen: it folds");
+    let ghost = at(cx, "card-exit".into()).expect("the answered card, folding");
+    assert_eq!(ghost, live, "in its row");
+    let pressed = at(cx, "allow-fill".into()).expect("Allow, pressed");
+    assert!(ghost.contains(&pressed.center()), "the pressed Allow is the folding card's");
+    assert!(at(cx, format!("receipt-word {row} allowed")).is_some(), "the receipt lands as it folds");
+    wait(cx, w, &view, 1000);
+    assert!(at(cx, "card-exit".into()).is_none() && at(cx, "card".into()).is_none(), "folded away");
+    assert!(view.read_with(cx, |v, _| v.card_exit.is_none()));
+    assert!(at(cx, format!("receipt-word {row} allowed")).is_some(), "its call's row keeps the receipt");
 }
 
 /// The card's keys: the window's focus (a click on the card), a frame for
@@ -2614,12 +2645,8 @@ fn frames(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, u64) {
 fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (1440., 1800.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
-    // The beat alone (the sweep's 30 Hz: `a_sweep_ticks_only_while_drawn`;
-    // the orbit's: `orbit_requests_ticks_only_while_running`).
-    view.update(cx, |v, _| {
-        v.fx.no_sweep.set(true);
-        v.fx.no_orbit.set(true);
-    });
+    // The beat alone (the orbit's 30 Hz: `orbit_requests_ticks_only_while_running`).
+    view.update(cx, |v, _| v.fx.no_orbit.set(true));
     running_tools(cx, &view, 25);
     // The arrivals draw in and settle.
     for _ in 0..12 {
@@ -2878,8 +2905,9 @@ fn life_worker(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVie
 /// in's light travels down the composer's bar and is gone after `sig`
 /// (its colour, decaying into the bar: `motion::handoff_in_decays_into_the_bar`);
 /// Off draws none. P3 (polish.md, settle_pass_once_per_turn_end): the
-/// composer's sweep makes one last pass from the same corner, once; none
-/// under Reduced or Off.
+/// composer's top edge makes one pass from the same corner, once; none
+/// under Reduced or Off. Cards D (an intended change): P2's sweep is
+/// retired; while the turn runs, the state cell laps the orbit.
 #[gpui_kit::test]
 fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
@@ -2904,17 +2932,19 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
         beat(cx, w, &view);
     }
     let seg = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("handoff-in");
-    // polish.md P2, P3: the composer's top edge sweeps while the turn runs,
-    // then makes one last pass with the Handoff light, from its corner.
+    // polish.md P3: the composer's state cell laps the orbit while the turn
+    // runs (no sweep: Cards D), then its top edge makes one pass with the
+    // Handoff light, from its corner.
     let pass = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("settle-pass");
     let sweep = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("sweep");
+    let orbit = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("foot-orbit");
     assert!(seg(cx).is_none());
-    assert!(sweep(cx).is_some() && pass(cx).is_none(), "running: the composer sweeps");
+    assert!(orbit(cx).is_some() && sweep(cx).is_none() && pass(cx).is_none(), "running: the state cell's orbit, no sweep");
     busy(cx, false);
     assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current().map(|t| v.tab_state(t))), Some(crate::rail::State::Idle), "READY");
     assert!(seg(cx).is_some(), "the turn ended here: the light travels down the bar");
     let (s, p) = (seg(cx).unwrap(), pass(cx).expect("settle_pass_once_per_turn_end: the pass with the light"));
-    assert!(sweep(cx).is_none(), "the sweep is over");
+    assert!(orbit(cx).is_none(), "the orbit is over");
     assert!((f32::from(p.origin.y) - f32::from(s.origin.y)).abs() <= 1., "from the same corner: {p:?} / {s:?}");
     // Shady #17 R3-M2: the pass lies on the composer's top border, which
     // GPUI paints after the composer's children: drawn among them, the
@@ -2931,12 +2961,13 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
     assert!(seg(cx).is_none(), "gone after sig");
     assert!(pass(cx).is_none(), "one pass, then everything stops");
     // Nothing of it still animates (the design's final): no display frame,
-    // no sweep, and what is left on the layer is the rail's other sessions'
+    // no orbit, and what is left on the layer is the rail's other sessions'
     // spinners; with those at rest, nothing at all.
     only_the_rail_spins(cx, w, &view, "after the pass (Full)");
     set_motion(cx, &view, crate::motion::Level::Reduced);
     busy(cx, true);
     assert!(sweep(cx).is_none(), "Reduced: the edge is unlit");
+    assert!(view.read_with(cx, |v, _| v.fx.orbit_count()) == 0, "Reduced: the orbit is still, off the layer");
     busy(cx, false);
     assert!(pass(cx).is_none(), "Reduced: no pass (the bar's flash)");
     set_motion(cx, &view, crate::motion::Level::Off);
@@ -3043,27 +3074,21 @@ fn the_beat_in_the_frame_spins_without_the_layer(cx: &mut TestAppContext) {
     assert!(f1 > f0 && k1 > k0, "the beat is the app's frame");
     assert!(view.read_with(cx, |v, _| v.fx.sites().is_empty()), "nothing on the layer");
     assert!(drawn(cx, k1), "the frame of beat {k1}: the snake moved on");
-    // The composer's sweep in the app's frame (no layer) lies on its top
-    // border too: it paints over it, after the root's last child (R3-M2).
-    view.update(cx, |v, cx| {
-        v.model.transcript.set_busy(true);
-        cx.notify();
-    });
-    beat(cx, w, &view);
-    let order = painted(cx, &view);
-    assert!(painted_after(&order, "sweep", "end-frame"), "the sweep paints over the composer's border: {order:?}");
-    assert!(painted_after(&order, "composer", "sticky") && painted_after(&order, "sweep", "sticky"), "P15: under both: {order:?}");
+    // (Cards D retired the composer's sweep, which this checked painted
+    // over the composer's border: the pass's order is
+    // `handoff_in_travels_and_goes`'.)
     // Off: still, the ⠹ frame.
     set_motion(cx, &view, crate::motion::Level::Off);
     assert!(VisualTestContext::from_window(w, cx).debug_bounds(format!("spin-{:02x}", crate::glyph::STILL).leak()).is_some());
     assert_eq!(motion_pending(cx, &view), (false, None));
 }
 
-/// P2: a sweep on screen (the composer's top edge while the turn runs)
-/// ticks the beat layer at 30 Hz, one timer; Reduced draws none, and the
+/// Cards D (step 8, replacing P2's `a_sweep_ticks_only_while_drawn`): the
+/// composer's orbit on screen (its state cell while the turn runs) ticks
+/// the beat layer at 30 Hz, one timer; Reduced draws it still, and the
 /// timer goes back to the beat or nothing.
 #[gpui_kit::test]
-fn a_sweep_ticks_only_while_drawn(cx: &mut TestAppContext) {
+fn the_composers_orbit_ticks_only_while_drawn(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Full);
     // A session with no prompt waiting (the demo's NEEDS YOU stills the edge).
@@ -3077,15 +3102,15 @@ fn a_sweep_ticks_only_while_drawn(cx: &mut TestAppContext) {
     for _ in 0..12 {
         beat(cx, w, &view);
     }
-    let sweeps = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.sweep_count());
-    assert!(sweeps(cx) >= 1, "the turn runs: the composer sweeps");
+    let orbits = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.orbit_count());
+    assert!(orbits(cx) >= 2, "the turn runs: the call's orbit and the composer's");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("foot-orbit").is_some());
     let (frame, at) = motion_pending(cx, &view);
     let ahead = view.read_with(cx, |v, _| at.map(|t| t.saturating_duration_since(v.fx.clock())));
     assert!(!frame && ahead.is_some_and(|d| d <= crate::motion::DECAY_TICK), "the next 30 Hz tick: {ahead:?}");
     assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::Beat), "the layer, not the app");
     set_motion(cx, &view, crate::motion::Level::Reduced);
-    assert_eq!(sweeps(cx), 0, "Reduced: the edge is unlit");
-    assert!(VisualTestContext::from_window(w, cx).debug_bounds("sweep").is_none());
+    assert_eq!(orbits(cx), 0, "Reduced: the orbits are still");
     // Shady #17 M3: the 30 Hz tick went with it (a clock's second may stay).
     settle(cx, w, 4);
     let (frame, at) = motion_pending(cx, &view);
@@ -3095,8 +3120,8 @@ fn a_sweep_ticks_only_while_drawn(cx: &mut TestAppContext) {
 
 /// Shady #17 M1 (motion.md §5.3): the link lost mid-turn, the window is
 /// visibly stale and nothing in it is live. Past the grace and the drain,
-/// no sweep and no spinner is on the layer, and the one timer left is the
-/// connection words' dots (2 Hz): never the sweep's 30 Hz, never the beat.
+/// no orbit and no spinner is on the layer, and the one timer left is the
+/// connection words' dots (2 Hz): never the orbit's 30 Hz, never the beat.
 #[gpui_kit::test]
 fn a_lost_link_stills_every_ambient(cx: &mut TestAppContext) {
     use crate::model::ConnState;
@@ -3125,19 +3150,18 @@ fn a_lost_link_stills_every_ambient(cx: &mut TestAppContext) {
         view.read_with(cx, |v, _| {
             let sites = v.fx.sites();
             (
-                sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Sweep(_))).count(),
+                sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Orbit)).count(),
                 sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count(),
             )
         })
     };
-    let (sweeps, spins) = ambient(cx);
-    assert!(sweeps >= 1 && spins >= 1, "running: the composer sweeps, the spinners spin ({sweeps}, {spins})");
+    let (orbits, spins) = ambient(cx);
+    assert!(orbits >= 1 && spins >= 1, "running: the orbits lap, the spinners spin ({orbits}, {spins})");
     conn(cx, ConnState::Reconnecting);
     wait_past(cx, w, &view, (crate::motion::LINK_GRACE + crate::motion::SLOW).as_millis() as u64);
     wait(cx, w, &view, 600);
     assert!(view.read_with(cx, |v, _| v.link.lost), "lost");
-    assert_eq!(ambient(cx), (0, 0), "held: no sweep, no spinner");
-    assert!(VisualTestContext::from_window(w, cx).debug_bounds("sweep").is_none(), "the edge unlit");
+    assert_eq!(ambient(cx), (0, 0), "held: no orbit, no spinner");
     for _ in 0..8 {
         beat(cx, w, &view);
     }

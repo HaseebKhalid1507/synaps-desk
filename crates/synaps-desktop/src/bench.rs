@@ -985,7 +985,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out["load_5x5_30s"]["workers_running"] =
                     json!(view.update(cx, |v, _| v.model.stats.subagents.running_count()).unwrap_or(0));
                 out["load_5x5_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
-                out["load_5x5_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                out["load_5x5_30s"]["orbits"] = json!(view.update(cx, |v, _| v.fx.orbit_count()).unwrap_or(0));
                 // Gate 5's sample after the 5 × 5, where main's run ends
                 // (its `mem_end`): the cases after it are Q3's own.
                 out["mem_after_load_5x5"] = mem::sample();
@@ -1006,7 +1006,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 sleep(30.0).await;
                 out["load_5x5_sweep_30s"] = stats(cx, t0, Instant::now(), c0, f0);
                 out["load_5x5_sweep_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
-                out["load_5x5_sweep_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                out["load_5x5_sweep_30s"]["orbits"] = json!(view.update(cx, |v, _| v.fx.orbit_count()).unwrap_or(0));
                 out["load_5x5_sweep_30s"]["state"] = json!(view.update(cx, |v, _| {
                     v.model.tabs.current().map(|t| format!("{:?}", v.tab_state(t))).unwrap_or_default()
                 }).unwrap_or_default());
@@ -1048,7 +1048,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     }
                     out[case] = stats(cx, t0, Instant::now(), c0, f0);
                     out[case]["changes"] = json!(changes);
-                    out[case]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                    out[case]["orbits"] = json!(view.update(cx, |v, _| v.fx.orbit_count()).unwrap_or(0));
                     out[case]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
                 }
                 out["mem_end"] = mem::sample();

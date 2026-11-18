@@ -728,9 +728,6 @@ impl Tag {
 pub(crate) enum Beat {
     /// A braille glyph's frame (polish.md P1, [`crate::glyph::spin`]).
     Spin(crate::glyph::Glyph),
-    /// The shade sweep along a 1 px edge this wide (polish.md P2,
-    /// [`sweep_bands`]): 30 Hz, not the beat.
-    Sweep(f32),
     /// `Needs` breathing since the prompt came ([`crate::glyph::breath`]).
     Breath(Instant),
     /// Cards D's running orbit ([`orbit_at`], [`crate::glyph::orbit`]):
@@ -974,9 +971,6 @@ pub(crate) struct Motion {
     /// Tests: the beat each layer paint with sites drew, in order.
     #[cfg(test)]
     pub(crate) painted: RefCell<Vec<u32>>,
-    /// Tests of the beat alone: no sweep is drawn (its 30 Hz is P2's).
-    #[cfg(test)]
-    pub(crate) no_sweep: Cell<bool>,
     /// Tests of the beat alone: a running row's orbit draws as the rail's
     /// braille spinner (its 30 Hz is Cards D's, tested on its own).
     #[cfg(test)]
@@ -1000,17 +994,6 @@ pub(crate) fn hop_at(t: f32) -> f32 {
     -HOP_V * t * (-w * t).exp()
 }
 
-/// The shade sweep's comet at `tick` along a `w` px edge (polish.md P2):
-/// four bands of [`SWEEP_STEP`], head first, stepping one band a tick left
-/// to right and re-entering from the left (a lap is the edge and the
-/// comet: 672 px in 60 ticks, 2.0 s). Each band clipped to the edge: x,
-/// width, level.
-pub(crate) fn sweep_bands(w: f32, tick: u64) -> impl Iterator<Item = (f32, f32, f32)> {
-    let steps = ((w + SWEEP_STEP * 4.) / SWEEP_STEP).ceil().max(1.) as u64;
-    let head = ((tick % steps) + 1) as f32 * SWEEP_STEP;
-    band_at(w, head, |i| SWEEP_LEVELS[i])
-}
-
 /// The comet with its head's right edge at `head` px along a `w` px edge:
 /// its bands clipped to it, each at `level(i)`.
 pub(crate) fn band_at(w: f32, head: f32, level: impl Fn(usize) -> f32) -> impl Iterator<Item = (f32, f32, f32)> {
@@ -1019,45 +1002,6 @@ pub(crate) fn band_at(w: f32, head: f32, level: impl Fn(usize) -> f32) -> impl I
         let left = (head - SWEEP_STEP * (i + 1) as f32).max(0.);
         (right > left).then(|| (left, right - left, level(i)))
     })
-}
-
-/// The shade sweep (polish.md P2) along the bottom of its parent (a 1 px
-/// line, absolute: the parent is `relative`), in `mark` on `ground`: on
-/// the beat layer at Full (its site recorded), drawn in the app's frame
-/// without one; unlit under Reduced, Off and low power.
-pub(crate) fn sweep(fx: &Rc<Motion>, mark: Hsla, ground: Hsla) -> AnyElement {
-    #[cfg(test)]
-    if fx.no_sweep.get() {
-        return div().into_any_element();
-    }
-    if !fx.ambient() {
-        return div().into_any_element();
-    }
-    let fx = fx.clone();
-    let tick = if fx.layered() { None } else { fx.sweep_tick() };
-    let line = canvas(
-        |_, _, _| {},
-        move |b, _, window, _| {
-            let w = f32::from(b.size.width);
-            match tick {
-                None => fx.site(Site { origin: b.origin, mask: window.content_mask(), mark, ground, beat: Beat::Sweep(w) }),
-                Some(t) => {
-                    #[cfg(test)]
-                    fx.painted("sweep");
-                    for (x, bw, level) in sweep_bands(w, t) {
-                        window
-                            .paint_quad(fill(Bounds::new(b.origin + point(px(x), px(0.)), size(px(bw), px(1.))), mix(ground, mark, level)));
-                    }
-                }
-            }
-        },
-    )
-    .size_full();
-    let el = div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "sweep".into()).child(line);
-    // Drawn in the app's frame (no layer), it lies on its parent's border,
-    // which GPUI paints after the children: deferred, it paints over it
-    // (not clipped by its ancestors: none clips the composer's edge).
-    if tick.is_some() { deferred(el).into_any_element() } else { el.into_any_element() }
 }
 
 /// The settle pass (polish.md P3): the composer sweep's one last pass, its
@@ -1373,8 +1317,6 @@ impl Motion {
             force_low_power: Cell::new(false),
             #[cfg(test)]
             painted: RefCell::default(),
-            #[cfg(test)]
-            no_sweep: Cell::new(false),
             #[cfg(test)]
             no_orbit: Cell::new(false),
         }
@@ -1715,9 +1657,9 @@ impl Motion {
         self.sites.borrow().len()
     }
 
-    /// Sweeps the beat layer paints (the bench).
-    pub(crate) fn sweep_count(&self) -> usize {
-        self.sites.borrow().iter().filter(|s| matches!(s.beat, Beat::Sweep(_))).count()
+    /// Orbits the beat layer paints (the bench; Cards D retired P2's sweep).
+    pub(crate) fn orbit_count(&self) -> usize {
+        self.sites.borrow().iter().filter(|s| matches!(s.beat, Beat::Orbit)).count()
     }
 
     fn disarm(&self) {
@@ -1957,16 +1899,6 @@ impl Motion {
         (p < 1.).then_some(p)
     }
 
-    /// The 30 Hz tick a sweep is on (polish.md P2), its next asked for; `None`
-    /// when ambient is off (Reduced, Off, low power): the edge stays unlit.
-    pub(crate) fn sweep_tick(&self) -> Option<u64> {
-        if !self.ambient.get() {
-            return None;
-        }
-        self.want_tick();
-        Some((self.now().saturating_duration_since(self.epoch).as_nanos() / DECAY_TICK.as_nanos()) as u64)
-    }
-
     pub(crate) fn set_scale(&self, scale: f32) {
         self.scale.set(scale.max(0.5));
     }
@@ -1980,18 +1912,12 @@ impl Motion {
 
     /// The link is lost (motion.md §5.3, Shady #17 M1), `since` then: the
     /// window is visibly stale and nothing in it is live. No ambient from
-    /// here to the frame's end: the spinners draw still, the sweep is
-    /// unlit, and the clocks hold their count as of the loss (R2-L1: a
+    /// here to the frame's end: the spinners and orbits draw still, and the clocks hold their count as of the loss (R2-L1: a
     /// worker's clock never counts through an outage); the connection
     /// words' dots are all that steps.
     pub(crate) fn hold_still(&self, since: Option<Instant>) {
         self.ambient.set(false);
         self.stale.set(since);
-    }
-
-    /// Ambient runs this frame (Full, not low power): spinners spin, sweeps sweep.
-    pub(crate) fn ambient(&self) -> bool {
-        self.ambient.get()
     }
 
     /// The star hop's offset (polish.md P6), `since` the favouriting: `−v·t·e^(−ωt)`
@@ -2523,7 +2449,7 @@ impl Motion {
         let since = self.tick().saturating_duration_since(self.epoch);
         let beat = (since.as_nanos() / BEAT.as_nanos()) as u32;
         let tick = (since.as_nanos() / DECAY_TICK.as_nanos()) as u64;
-        let (mut wants, mut every, mut sweeps) = (false, 2, false);
+        let (mut wants, mut every, mut ticks) = (false, 2, false);
         let orbit = orbit_at(Duration::from_nanos((DECAY_TICK.as_nanos() * tick as u128) as u64));
         for s in self.sites.borrow().iter() {
             let quad = |x: f32, y: f32, w: f32, h: f32, c: Hsla, window: &mut Window| {
@@ -2539,12 +2465,6 @@ impl Motion {
                         crate::glyph::paint_dots(window, s.origin, crate::glyph::spin_dots(g, Some(beat)), s.mark, s.ground);
                     });
                 }
-                Beat::Sweep(w) => {
-                    sweeps = true;
-                    for (x, bw, level) in sweep_bands(w, tick) {
-                        quad(x, 0., bw, 1., mix(s.ground, s.mark, level), window);
-                    }
-                }
                 Beat::Breath(at) => {
                     let step = beat.saturating_sub((at.saturating_duration_since(self.epoch).as_nanos() / BEAT.as_nanos()) as u32);
                     if step < BREATH_BEATS * BREATHS {
@@ -2554,8 +2474,8 @@ impl Motion {
                     }
                 }
                 Beat::Orbit => {
-                    // The 30 Hz grid, as a sweep's (the spinners ride it).
-                    sweeps = true;
+                    // The 30 Hz grid (the spinners ride it).
+                    ticks = true;
                     window.with_content_mask(Some(s.mask), |window| crate::glyph::paint_arc(window, cx, s.origin, orbit, s.mark));
                 }
             }
@@ -2565,8 +2485,8 @@ impl Motion {
             self.painted.borrow_mut().push(beat);
             self.beat_next.set(Some(self.epoch + BEAT * ((beat / every + 1) * every)));
         }
-        if sweeps {
-            // 30 Hz while a sweep is on screen (polish.md P2), on the
+        if ticks {
+            // 30 Hz while an orbit is on screen (Cards D), on the
             // shared grid. The spinners ride its ticks (each samples the
             // beat it is in, at most a tick late): 30 paints a second, not
             // 30 and the beats between them.
@@ -2654,11 +2574,11 @@ mod tests {
     // Not `super::*`: that brings in gpui's `test` attribute through `gpui_kit::*`.
     use std::time::{Duration, Instant};
 
-    use gpui_kit::{Bounds, Hsla, SharedString, point, px, size};
+    use gpui_kit::{Bounds, SharedString, point, px, size};
 
     use super::{
         BASE, BEAT, DECAY_TICK, GLOW, HEAD_HOLD, Kind, LINK_GRACE, Level, Link, Lock, Motion, QUICK, RELOAD_GRACE, SLIDE_CAP, SLOW,
-        STAGGER, STAGGER_CAP, SWEEP_LEVELS, Setting, Slide, Tag, Tween, ease, exit, hop_at, mix, stagger, sweep_bands,
+        STAGGER, STAGGER_CAP, Setting, Slide, Tag, Tween, ease, exit, hop_at, stagger,
     };
 
     fn ms(n: u64) -> Duration {
@@ -3100,59 +3020,6 @@ mod tests {
         }
         assert!(low >= 4.5, "{low}");
         assert!(worst < 0.06, "the drain moved a contrast by {worst:.3}");
-    }
-
-    /// Floors (polish.md gate 7): the sweep's head is its mark (level 1.0),
-    /// so it holds 3:1 on its edge's ground in every theme and accent: the
-    /// composer's `run_mark` on `user`, a bash row's lit hue on the canvas,
-    /// a worker's `sub_rule` on the canvas; and the settle pass's light
-    /// (Handoff's) on `user`.
-    #[test]
-    fn the_sweep_head_keeps_the_mark_floor() {
-        use crate::theme::{contrast, mix, resolve};
-        let mut low = f64::MAX;
-        for (name, raw) in crate::palettes::THEMES {
-            for accent in [None, Some(0xe8132f), Some(0xf4b400), Some(0x2d7bff), Some(0x35f2ff)] {
-                let r = resolve(&raw, accent).0;
-                let heads = [
-                    (r.run_mark, r.user, "composer run_mark"),
-                    (mix(r.t_bash, r.ink, 0.30), r.canvas, "bash lit hue"),
-                    (r.sub_rule, r.canvas, "sub_rule"),
-                    (mix(r.you, r.ink, f64::from(crate::app::HANDOFF_LIT)), r.user, "settle pass"),
-                ];
-                for (c, g, what) in heads {
-                    let x = contrast(c, g);
-                    low = low.min(x);
-                    assert!(x >= 3., "{name} {accent:?}: {what}: {x:.2}");
-                }
-                assert_eq!(SWEEP_LEVELS[0], 1., "the head is the mark");
-            }
-        }
-        assert!(low >= 3., "{low}");
-    }
-
-    /// P2: the comet is four opaque steps (no alpha, no gradient: four
-    /// levels, each a solid band), stepping 12 px a tick, a 2.0 s lap on a
-    /// 672 px column; clipped to its edge.
-    #[test]
-    fn sweep_is_four_opaque_steps() {
-        assert_eq!(SWEEP_LEVELS, [1., 0.66, 0.4, 0.2]);
-        let g = Hsla { h: 0.6, s: 0.3, l: 0.2, a: 1. };
-        let m = Hsla { h: 0.3, s: 0.8, l: 0.6, a: 1. };
-        for l in SWEEP_LEVELS {
-            assert_eq!(mix(g, m, l).a, 1., "opaque");
-        }
-        let bands: Vec<_> = sweep_bands(672., 10).collect();
-        assert_eq!(bands, vec![(120., 12., 1.), (108., 12., 0.66), (96., 12., 0.4), (84., 12., 0.2)]);
-        assert_eq!(sweep_bands(672., 0).collect::<Vec<_>>(), vec![(0., 12., 1.)], "the head enters first");
-        let lap = (0..200u64).find(|&t| t > 0 && sweep_bands(672., t).next() == sweep_bands(672., 0).next()).unwrap();
-        assert_eq!(lap, 60, "60 ticks of 33 ms: a 2.0 s lap");
-        assert!((lap as f32 * DECAY_TICK.as_secs_f32() - 2.0).abs() < 0.01);
-        for t in 0..60 {
-            for (x, w, _) in sweep_bands(100., t) {
-                assert!(x >= 0. && x + w <= 100. && w > 0., "clipped to the edge");
-            }
-        }
     }
 
     /// P6: the hop rises 4 px at 48 ms and comes back with no overshoot.

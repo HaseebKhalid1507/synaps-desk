@@ -38,18 +38,7 @@ impl Geo {
     pub(crate) fn of(m: &Metrics) -> Self {
         let px = |v: f32| (v * m.r).round();
         let (pad, gap, glyph) = (px(10.), px(10.), crate::glyph::LIFE);
-        Geo {
-            inset: 3.,
-            row: px(34.),
-            pad,
-            gap,
-            glyph,
-            verb: px(56.),
-            indent: pad + glyph + gap,
-            chevron: 10.,
-            radius: 6.,
-            row_radius: 4.,
-        }
+        Geo { inset: 3., row: px(34.), pad, gap, glyph, verb: px(56.), indent: pad + glyph + gap, chevron: 10., radius: 6., row_radius: 4. }
     }
 }
 
@@ -197,11 +186,23 @@ impl AllowStyle {
     pub(crate) fn colors(self, p: &Palette, hovered: bool, pressed: bool) -> (Hsla, Hsla, Hsla) {
         match self {
             AllowStyle::Fill => {
-                let bg = if pressed { crate::motion::mix(p.btn_fill, p.ink, 0.18) } else if hovered { p.btn_hi } else { p.btn_fill };
+                let bg = if pressed {
+                    crate::motion::mix(p.btn_fill, p.ink, 0.18)
+                } else if hovered {
+                    p.btn_hi
+                } else {
+                    p.btn_fill
+                };
                 (bg, bg, p.acc_ink)
             }
             AllowStyle::Outline => {
-                let bg = if pressed { crate::motion::mix(p.card_d, p.acc, 0.18) } else if hovered { p.acc_soft } else { p.card_d };
+                let bg = if pressed {
+                    crate::motion::mix(p.card_d, p.acc, 0.18)
+                } else if hovered {
+                    p.acc_soft
+                } else {
+                    p.card_d
+                };
                 (bg, p.acc_line, p.acc)
             }
         }
@@ -231,7 +232,10 @@ mod tests {
             d(Kind::Summary { end: 3, open: false }, Gap::Part),
         ];
         let e: Vec<(bool, bool)> = (0..rows.len()).map(|i| edges(&rows, i)).collect();
-        assert_eq!(e, [(false, false), (true, false), (false, false), (false, true), (false, false), (true, true), (false, false), (true, true)]);
+        assert_eq!(
+            e,
+            [(false, false), (true, false), (false, false), (false, true), (false, false), (true, true), (false, false), (true, true)]
+        );
         let marked = mark_edges(rows.to_vec());
         assert_eq!(marked[1].rev, EDGE_TOP);
         assert_eq!(marked[3].rev, EDGE_BOTTOM);
