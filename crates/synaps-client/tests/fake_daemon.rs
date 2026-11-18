@@ -1278,3 +1278,70 @@ async fn cancel_worker_sends_one_handle_and_always_answers() {
     assert!(r.is_err_and(|e| e.contains("detached")));
     client.shutdown().unwrap();
 }
+
+/// A slash command (`/compact`, `/context` ...): the engine command the
+/// daemon reads, its `QueryResult` by id as `Event::EngineReply`, the
+/// daemon's error, `unhandled` and a non-owner's refusal as `Err`; a
+/// refusal goes to the oldest engine command in flight, a worker cancel's
+/// or a slash command's, in the order they were sent.
+#[tokio::test]
+async fn engine_command_wire_shape_and_replies() {
+    let mut fake = Fake::start("engine").await;
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    let reply = |events| async move {
+        wait(events, "engine reply", |e| match e {
+            Event::EngineReply { attach_seq, name, result } => Some((*attach_seq, name.clone(), result.clone())),
+            _ => None,
+        })
+        .await
+    };
+
+    client.engine_command("compact", "").unwrap();
+    let cmd = conn.recv_cmd().await;
+    let id = cmd["id"].as_u64().unwrap();
+    assert!(id < synaps_client::protocol::RESERVED_QUERY_ID_BASE);
+    assert_eq!(cmd, json!({"cmd": "engine_command", "id": id, "name": "compact", "arg": ""}));
+    conn.event(40, json!({"ev": "query_result", "id": id ^ 1, "value": {"kind": "output", "text": "not ours"}})).await;
+    conn.event(41, json!({"ev": "query_result", "id": id, "value": {"kind": "notice", "text": "compacting"}})).await;
+    assert_eq!(reply(&events).await, (seq, "compact".into(), Ok("compacting".into())));
+
+    client.engine_command("model", "nope/x").unwrap();
+    let id = conn.recv_cmd().await["id"].as_u64().unwrap();
+    conn.event(42, json!({"ev": "query_result", "id": id, "value": {"kind": "error", "text": "unknown model"}})).await;
+    assert_eq!(reply(&events).await, (seq, "model".into(), Err("unknown model".into())));
+
+    client.engine_command("model", "").unwrap();
+    let id = conn.recv_cmd().await["id"].as_u64().unwrap();
+    conn.event(43, json!({"ev": "query_result", "id": id, "value": {"kind": "unhandled", "text": ""}})).await;
+    assert_eq!(reply(&events).await, (seq, "model".into(), Err("the daemon does not run /model".into())));
+
+    // Refusals in order: the cancel sent first takes the first.
+    client.cancel_worker("sa_2").unwrap();
+    let _ = conn.recv_cmd().await;
+    client.engine_command("context", "").unwrap();
+    let _ = conn.recv_cmd().await;
+    conn.event(44, json!({"ev": "refused", "client": 2, "command": "engine_command", "reason": "observing"})).await;
+    let cancel = wait(&events, "cancel reply", |e| match e {
+        Event::WorkerCancel { handle_id, result, .. } => Some((handle_id.clone(), result.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(cancel, ("sa_2".into(), Err("refused: observing".into())));
+    conn.event(45, json!({"ev": "refused", "client": 2, "command": "engine_command", "reason": "observing"})).await;
+    assert_eq!(reply(&events).await, (seq, "context".into(), Err("refused: observing".into())));
+
+    // In flight when the connection drops: answered.
+    client.engine_command("trace", "").unwrap();
+    let _ = conn.recv_cmd().await;
+    drop(conn);
+    let (_, name, r) = reply(&events).await;
+    assert_eq!(name, "trace");
+    assert!(r.is_err_and(|e| e.contains("dropped") && !e.contains("worker")));
+    client.engine_command("budget", "").unwrap();
+    let (_, name, r) = reply(&events).await;
+    assert_eq!(name, "budget");
+    assert!(r.is_err_and(|e| e.contains("not connected")));
+    client.shutdown().unwrap();
+}

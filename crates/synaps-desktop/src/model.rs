@@ -142,7 +142,8 @@ pub enum Effect {
         open: bool,
         place: Place,
     },
-    /// What the composer's note line says of a worker (a cancel refused).
+    /// What the composer's note line says: of a worker (a cancel
+    /// refused), or a slash command's answer.
     WorkerNote(String),
 }
 
@@ -1387,6 +1388,17 @@ impl Model {
                 log::debug!(target: "synaps_desktop::watch", "cancel {handle_id}: {result:?}");
                 if let Some(note) = self.cancels.answered(attach_seq, &handle_id, &result) {
                     effects.push(Effect::WorkerNote(note));
+                    self.view_dirty = true;
+                }
+                return effects;
+            }
+            // A slash command answered (the palette's, the composer's): its
+            // first line, or why not, on the composer's note line; another
+            // attachment's (a switch since) says nothing here.
+            Event::EngineReply { attach_seq, name, result } => {
+                log::debug!(target: "synaps_desktop::send", "/{name}: {}", if result.is_ok() { "ok" } else { "not run" });
+                if self.active.as_ref().is_some_and(|a| a.attach_seq == attach_seq) {
+                    effects.push(Effect::WorkerNote(crate::palette::reply_note(&name, &result)));
                     self.view_dirty = true;
                 }
                 return effects;
