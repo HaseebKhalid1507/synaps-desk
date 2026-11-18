@@ -122,7 +122,7 @@ fn sessions(now: i64, settled: bool) -> Vec<SessionMeta> {
 pub fn catalog_page(req: u64, before: Option<&CatalogCursor>, limit: u32, named_only: bool) -> Event {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let key = |v: &Value| (v["updated_at"].as_str().unwrap_or_default().to_string(), v["id"].as_str().unwrap_or_default().to_string());
-    let after = |v: &Value| before.is_none_or(|c| key(v) < (c.updated_at.clone(), c.id.clone()));
+    let after = |v: &Value| before.is_none_or(|c| key(v) < key(&c.0));
     let rows: Vec<Value> = catalog(now).into_iter().filter(|v| (!named_only || v["name"].is_string()) && after(v)).collect();
     let limit = limit.clamp(1, synaps_client::CATALOG_PAGE_MAX) as usize;
     let more = rows.len() > limit;

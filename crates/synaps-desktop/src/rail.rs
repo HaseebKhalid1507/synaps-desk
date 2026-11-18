@@ -1895,7 +1895,10 @@ mod tests {
         for (k, chunk) in all.chunks(200).enumerate() {
             assert!(matches!(fx.as_slice(), [crate::model::Effect::CatalogPage { limit: 200, named_only: false, .. }]), "{fx:?}");
             let crate::model::Effect::CatalogPage { before, .. } = &fx[0] else { unreachable!() };
-            assert_eq!(before.as_ref().map(|c| c.id.clone()), (k > 0).then(|| all[k * 200 - 1]["id"].as_str().unwrap().to_string()));
+            assert_eq!(
+                before.as_ref().map(|c| c.0["id"].as_str().unwrap().to_string()),
+                (k > 0).then(|| all[k * 200 - 1]["id"].as_str().unwrap().to_string())
+            );
             m.page_sent(10 + k as u64);
             fx = m.apply(page(10 + k as u64, json!(chunk), all.get(k * 200 + 199)));
         }

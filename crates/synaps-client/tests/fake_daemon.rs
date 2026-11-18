@@ -85,6 +85,9 @@ struct Opts {
     /// `Welcome.features` lists `session_page` and answers `catalog_page`
     /// from [`catalog`].
     pages: bool,
+    /// With `pages`: every page reply is a `catalog_page` that does not
+    /// decode (`sessions` not a list).
+    malformed: bool,
 }
 
 /// The fake's saved sessions, newest first: five rows, the third named.
@@ -220,6 +223,9 @@ impl Fake {
                                     "message": "malformed frame: unknown variant `saved_sessions`"}),
                                 )
                                 .await;
+                            }
+                            Some("catalog_page") if opts.pages && opts.malformed => {
+                                write(&w, json!({"type": "catalog_page", "req": f["req"], "sessions": "not a list"})).await;
                             }
                             Some("catalog_page") if opts.pages && opts.saved_error => {
                                 write(&w, json!({"type": "catalog_page", "req": f["req"], "sessions": [], "error": "saved sessions: Permission denied (os error 13)"}))
@@ -1530,6 +1536,25 @@ async fn a_catalog_page_error_fails_its_req() {
     .await;
     assert_eq!(got, req);
     assert!(reason.contains("Permission denied"), "{reason}");
+    client.shutdown().unwrap();
+}
+
+/// Review F2: a `catalog_page` reply that does not decode fails the oldest
+/// page waiting (its `req` cannot be trusted), so nothing waits for good.
+#[tokio::test]
+async fn an_undecodable_page_fails_the_oldest_page() {
+    let mut fake = Fake::start_with("pages-bad", Opts { pages: true, malformed: true, ..Default::default() }).await;
+    let (client, events) = fake.client();
+    connected(&events).await;
+    let req = client.catalog_page(None, 50, false).unwrap();
+    fake.next_control().await;
+    let (got, reason) = wait(&events, "failed", |e| match e {
+        Event::CatalogPageFailed { req, reason } => Some((*req, reason.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(got, req);
+    assert!(reason.contains("did not decode"), "{reason}");
     client.shutdown().unwrap();
 }
 

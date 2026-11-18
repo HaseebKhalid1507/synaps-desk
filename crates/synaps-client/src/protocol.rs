@@ -716,14 +716,13 @@ fn one() -> u64 {
     1
 }
 
-/// A position in the saved-session order (`wire::CatalogCursor`):
-/// `updated_at` descending, then `id` descending. Opaque to the client: a
-/// reply's `next` goes back as the next request's `before`, unchanged.
+/// A position in the saved-session order (`wire::CatalogCursor`, today
+/// `{updated_at, id}`). Opaque to the client: whatever JSON a reply's
+/// `next` is goes back as the next request's `before`, unchanged, so a
+/// change of the cursor's shape never makes a page undecodable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CatalogCursor {
-    pub updated_at: String,
-    pub id: String,
-}
+#[serde(transparent)]
+pub struct CatalogCursor(pub Value);
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct SessionMeta {
