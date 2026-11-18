@@ -114,6 +114,7 @@ pub mod label {
     pub const WINDOW: &str = "W I N D O W";
     pub const AGENT: &str = "A G E N T";
     pub const YOU: &str = "Y O U";
+    pub const SYNAPS: &str = "S Y N A P S";
     pub const READY: &str = "R E A D Y";
     pub const THEME: &str = "T H E M E";
     pub const SYNAPS_CONFIG: &str = "S Y N A P S   C O N F I G";

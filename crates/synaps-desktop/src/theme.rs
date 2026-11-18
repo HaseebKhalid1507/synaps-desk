@@ -760,13 +760,15 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     // divider does.
     [r.thumb, r.thumb_ch, r.thumb_u, r.thumb_k] =
         [mix(canvas, r.dim, 0.55), mix(chrome, r.dim_ch, 0.55), mix(user, r.dim_u, 0.55), mix(card, r.dim_k, 0.55)];
-    for (role, ground, from, c) in [
-        ("thumb", canvas, r.dim, r.thumb),
-        ("thumb_ch", chrome, r.dim_ch, r.thumb_ch),
-        ("thumb_u", user, r.dim_u, r.thumb_u),
-        ("thumb_k", card, r.dim_k, r.thumb_k),
+    // `thumb_k` is drawn on the card and on its selected row's `card_hi`
+    // (the palette's bar lies over the selection quad).
+    for (role, grounds, from, c) in [
+        ("thumb", vec![canvas], r.dim, r.thumb),
+        ("thumb_ch", vec![chrome], r.dim_ch, r.thumb_ch),
+        ("thumb_u", vec![user], r.dim_u, r.thumb_u),
+        ("thumb_k", vec![card, card_hi], r.dim_k, r.thumb_k),
     ] {
-        f.log.push(Check { role, from, color: c, grounds: vec![ground], floor: HAIR });
+        f.log.push(Check { role, from, color: c, grounds, floor: HAIR });
     }
     // Pressed ([`pressed`]): what is drawn on each is logged on it.
     {
@@ -2161,6 +2163,18 @@ mod tests {
 
     /// Every role is in the `Check` log (so the floor test covers it), but
     /// the two grounds a theme gives as they are.
+    /// Shady #20 N5: the card's scrollbar thumb is drawn over the palette's
+    /// selected row too: it meets its floor on `card_hi` as on `card`.
+    #[test]
+    fn thumb_k_reads_on_the_card_and_its_selection() {
+        for (name, raw) in palettes::THEMES {
+            let (r, checks) = resolve(&raw, None);
+            let c = checks.iter().find(|c| c.role == "thumb_k").expect("thumb_k is checked");
+            assert_eq!(c.grounds, vec![r.card, r.card_hi], "{name}");
+            assert!(contrast(r.thumb_k, r.card_hi) >= HAIR, "{name}");
+        }
+    }
+
     #[test]
     fn every_role_is_checked() {
         for (name, raw) in palettes::THEMES {
