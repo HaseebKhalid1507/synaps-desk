@@ -1949,6 +1949,33 @@ mod tests {
         assert!(matches!(m.apply(Event::Sessions(metas(json!([b])))).as_slice(), [Effect::ListSaved { named_only: false, .. }]));
     }
 
+    /// Review F1: `/clear` (or `/resume`) in the attached session. Its
+    /// `Conversation` writes the new journal into the session list at once;
+    /// the poll that then agrees is still a change from the last poll, so
+    /// the conversation just left is asked for.
+    #[test]
+    fn a_swap_in_the_attached_session_asks_on_the_poll_that_agrees() {
+        use crate::model::Effect;
+        let first = || vec![Effect::CatalogPage { before: None, limit: 200, named_only: false }];
+        let s = |journal: &str| json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "t", "journal_id": journal});
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        m.page_sent(1);
+        m.apply(Event::Sessions(metas(json!([s("c1")]))));
+        m.apply(page(1, json!([]), None));
+        m.want(5);
+        m.apply(Event::Attached {
+            attach_seq: 5,
+            attached: attached_frame(s("c1"), None),
+            mode: synaps_client::AttachMode::Mirror,
+            reconnect: false,
+        });
+        assert!(!m.saved_listing() && m.named.recent_loaded);
+        assert!(m.apply(swapped(5, "y", None)).is_empty());
+        assert_eq!(m.sessions[0].journal_id, "y", "held at once");
+        assert_eq!(m.apply(Event::Sessions(metas(json!([s("y")])))), first(), "the poll that agrees still asks");
+    }
+
     /// A page reply after a reconnect, to a `req` asked on the old
     /// connection, is dropped: only the page asked since lands.
     #[test]
