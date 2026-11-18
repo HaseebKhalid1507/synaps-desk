@@ -1026,7 +1026,8 @@ pub(crate) fn pass(p: f32, mark: Hsla, ground: Hsla) -> AnyElement {
     // On the composer's top border, which GPUI paints after its children:
     // deferred, the pass paints over it (the comet is the beat layer's,
     // painted over the frame), clipped as in place.
-    deferred(div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "settle-pass".into()).child(line)).into_any_element()
+    deferred(div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "settle-pass".into()).child(line))
+        .into_any_element()
 }
 
 /// A rolling text (polish.md P5): `make(text)` as it is at rest; while it
@@ -1045,7 +1046,9 @@ pub(crate) fn rolled(fx: &Motion, key: u64, text: SharedString, up: bool, grow: 
     // ones stay until the digits cross mid-roll (re-gate #17: never `1 tools`).
     let words = cells.and_then(|(_, b)| {
         let ob = old_cells_end(&old, &text, b)?;
-        (old[ob..] != text[b..]).then(|| (tagged(format!("rolled-words-{key:x}"), old.clone()), make(SharedString::from(old[..ob].to_string())).into_any_element()))
+        (old[ob..] != text[b..]).then(|| {
+            (tagged(format!("rolled-words-{key:x}"), old.clone()), make(SharedString::from(old[..ob].to_string())).into_any_element())
+        })
     });
     Roll {
         left: cells.filter(|c| c.0 > 0).map(|_| make(text.clone()).into_any_element()),

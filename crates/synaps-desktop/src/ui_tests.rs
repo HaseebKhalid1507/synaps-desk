@@ -1617,7 +1617,7 @@ fn a_fold_drops_its_rows_from_the_unfold_hold(cx: &mut TestAppContext) {
             .iter()
             .filter(|d| matches!(d.kind, crate::turns::Kind::Summary { open: false, .. }))
             .map(|d| d.id)
-            .last()
+            .next_back()
             .expect("a folded run")
     });
     view.update(cx, |v, cx| {
@@ -2725,7 +2725,8 @@ fn transcript_counts_roll(cx: &mut TestAppContext) {
     let d0 = apart(cx, k);
     // `1 tool` → `2 tools`: the old word stays until the digits cross
     // mid-roll, then the new one (re-gate #17: never `1 tools`).
-    let words = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
+    let words =
+        |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
     assert!(words(cx), "the first frames: `1 tool`, the digit leaving");
     for _ in 0..3 {
         wait(cx, w, &view, 16);
@@ -3059,7 +3060,12 @@ fn a_lost_link_holds_every_clock(cx: &mut TestAppContext) {
     // text, which the frame's state decides).
     let shown = |cx: &mut TestAppContext| {
         view.read_with(cx, |v, _| {
-            v.tray.rows.iter().filter(|r| r.tick.is_some()).map(|r| crate::tray::ticked(&v.fx, &r.facts, &r.tick).to_string()).collect::<Vec<_>>()
+            v.tray
+                .rows
+                .iter()
+                .filter(|r| r.tick.is_some())
+                .map(|r| crate::tray::ticked(&v.fx, &r.facts, &r.tick).to_string())
+                .collect::<Vec<_>>()
         })
     };
     conn(cx, ConnState::Reconnecting);
