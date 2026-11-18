@@ -92,6 +92,7 @@
 pub mod client;
 pub mod conn;
 pub mod discovery;
+pub mod events;
 pub mod history;
 pub mod ipc;
 pub mod protocol;
