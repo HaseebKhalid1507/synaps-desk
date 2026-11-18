@@ -1314,7 +1314,15 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                             _ => emit(events, Event::SavedSessionsFailed { reason: message }),
                         }
                     }
+                    // A page reply that did not decode carries no `req` we
+                    // can trust: it answers the oldest page (replies come in
+                    // order), which fails rather than waiting for good.
                     Ok(Some(DaemonFrame::Malformed { kind, error })) => {
+                        if kind == "catalog_page"
+                            && let Some(Pending::Catalog(req)) = take_pending(&mut pending, |p| matches!(p, Pending::Catalog(_)))
+                        {
+                            emit(events, Event::CatalogPageFailed { req, reason: format!("catalog_page did not decode: {error}") });
+                        }
                         emit_error(events, None, Error::Decode(DecodeError { kind, error }));
                     }
                     Ok(Some(_)) => {}

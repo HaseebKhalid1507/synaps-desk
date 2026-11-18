@@ -747,7 +747,7 @@ fn catalog_pages_decode() {
     let axel = &sessions[0];
     assert!(axel.is_saved() && !axel.is_parked());
     assert_eq!((axel.name.as_deref(), axel.messages, axel.updated_at.as_deref()), (Some("axel"), 40, Some("2026-11-12T04:00:00Z")));
-    assert_eq!(next, &Some(CatalogCursor { updated_at: "2026-11-12T04:00:00Z".into(), id: "20261110-202033-64fb".into() }));
+    assert_eq!(next, &Some(CatalogCursor(serde_json::json!({"updated_at": "2026-11-12T04:00:00Z", "id": "20261110-202033-64fb"}))));
     let v = axel.to_saved();
     assert_eq!(
         (v.id.as_str(), v.name.as_deref(), v.title.as_deref()),
@@ -771,6 +771,12 @@ fn catalog_pages_decode() {
     let held: SessionMeta = serde_json::from_value(serde_json::json!({"id": "a", "lifecycle": "parked"})).unwrap();
     assert!(!held.is_saved() && held.updated_at.is_none());
     assert!(matches!(decode_frame(r#"{"type":"catalog_page","req":"x"}"#).unwrap(), DaemonFrame::Malformed { .. }));
+
+    // Review F2: a `next` of another shape is still a cursor, sent back as is.
+    let DaemonFrame::CatalogPage { req: 11, next: Some(c), error: None, .. } = &frames[4] else { panic!("{:?}", frames[4]) };
+    assert_eq!(c.0, "v2:opaque-cursor/2026-11-12");
+    let again = encode_frame(&ClientFrame::CatalogPage { req: 12, before: Some(c.clone()), limit: 50, named_only: false }).unwrap();
+    assert_eq!(again, "{\"type\":\"catalog_page\",\"req\":12,\"before\":\"v2:opaque-cursor/2026-11-12\",\"limit\":50}\n");
 }
 
 /// `CatalogPage` requests, byte for byte as PR 4's `wire.rs` pins them.
@@ -778,11 +784,12 @@ fn catalog_pages_decode() {
 fn catalog_page_requests_encode_as_the_daemon_expects() {
     let first = encode_frame(&ClientFrame::CatalogPage { req: 7, before: None, limit: 50, named_only: false }).unwrap();
     assert_eq!(first, "{\"type\":\"catalog_page\",\"req\":7,\"limit\":50}\n");
-    let before = Some(CatalogCursor { updated_at: "2026-11-12T04:00:00Z".into(), id: "20261110-202033-64fb".into() });
+    let before = Some(CatalogCursor(serde_json::json!({"updated_at": "2026-11-12T04:00:00Z", "id": "20261110-202033-64fb"})));
     let later = encode_frame(&ClientFrame::CatalogPage { req: 7, before, limit: 50, named_only: false }).unwrap();
+    // The cursor is opaque JSON, relayed as a value: its keys in serde_json's order.
     assert_eq!(
         later,
-        "{\"type\":\"catalog_page\",\"req\":7,\"before\":{\"updated_at\":\"2026-11-12T04:00:00Z\",\"id\":\"20261110-202033-64fb\"},\"limit\":50}\n"
+        "{\"type\":\"catalog_page\",\"req\":7,\"before\":{\"id\":\"20261110-202033-64fb\",\"updated_at\":\"2026-11-12T04:00:00Z\"},\"limit\":50}\n"
     );
     let named = encode_frame(&ClientFrame::CatalogPage { req: 1, before: None, limit: 200, named_only: true }).unwrap();
     assert_eq!(named, "{\"type\":\"catalog_page\",\"req\":1,\"limit\":200,\"named_only\":true}\n");

@@ -2,3 +2,4 @@
 {"type":"catalog_page","req":3,"sessions":[],"error":"busy"}
 {"type":"catalog_page","req":9}
 {"type":"catalog_page","req":8,"sessions":[{"id":5,"lifecycle":"saved"},{"id":"20261101-030919-1e8a","journal_id":"20261101-030919-1e8a","lifecycle":"saved","title":"","messages":3,"updated_at":"2026-11-02T10:00:00Z","from_the_future":{"x":1}},"not a row",{"name":"no-id","lifecycle":"saved"}],"next":null}
+{"type":"catalog_page","req":11,"sessions":[],"next":"v2:opaque-cursor/2026-11-12"}
