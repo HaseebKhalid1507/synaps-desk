@@ -791,10 +791,12 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // `SYNAPS_BENCH_CHIPS=N` (Q5 r2 evidence, Haseeb's chips): N
                 // workers running over the composer; after 2 s their steps
                 // change one by one every 0.4 s (short, long, longer than the
-                // chip), their clocks tick; at 5 s the first one's cancel
-                // arms (CONFIRM), at 8.5 s the second is done and the third
-                // fails. Every chip's bounds after each change, in the JSON
-                // (`chips`): what a capture of it shows, that none moves.
+                // chip), their clocks tick; at 8.5 s the second is done and
+                // the third fails. Every chip's bounds after each change, in
+                // the JSON (`chips`): what a capture of it shows, that none
+                // moves. (No cancel arms here: the bench has no daemon to
+                // send one to; `a_chip_is_the_columns_share_whatever_it_says`
+                // arms one.)
                 if let Some(n) = std::env::var("SYNAPS_BENCH_CHIPS").ok().and_then(|s| s.parse::<u64>().ok()) {
                     let ts = || chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
                     let apply = |cx: &mut AsyncWindowContext, evs: Vec<Value>| {
@@ -866,14 +868,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     for i in 0..20usize {
                         let k = i % n as usize;
                         at[k] += 1;
-                        let what = if i == 7 {
-                            // The first worker's cancel armed (CONFIRM).
-                            let _ = upd(cx, &|v, cx| {
-                                let who = crate::wtabs::Who::new(1, names[0].to_string(), None);
-                                v.press_cancel("bench-chips", &who, crate::menu::How::Click(1), cx);
-                            });
-                            "armed".to_string()
-                        } else if i == 16 && n >= 3 {
+                        let what = if i == 16 && n >= 3 {
                             status = vec!["running", "completed", "failed"];
                             "done, failed".to_string()
                         } else {

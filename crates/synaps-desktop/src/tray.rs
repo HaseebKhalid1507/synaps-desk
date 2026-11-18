@@ -662,6 +662,8 @@ impl AppView {
         let clock = chip_clock(&self.fx, r);
         let x = r.watchable.then(|| self.cancel_x(&who, &r.handle, armed, watched, h, p, cx)).flatten();
         let (x, armed_el) = if armed { (None, x) } else { (x, None) };
+        // Armed and drawn so (a cancel this window may send).
+        let armed = armed_el.is_some();
         let cw = m.meta * 0.6;
         let id = r.id;
         let row = h_flex()
