@@ -550,6 +550,8 @@ impl AppView {
     pub(crate) fn reveal_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.card_ix() else { return };
         let (top, bottom) = self.list_view();
+        // Below the sticky band, when the labels are inline (polish.md F8).
+        let top = top + self.sticky_inset(cx);
         match self.list.bounds_for_item(ix) {
             Some(b) => {
                 let (t, bt) = (f32::from(b.top()), f32::from(b.bottom()));
