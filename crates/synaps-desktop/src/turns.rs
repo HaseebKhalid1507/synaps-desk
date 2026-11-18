@@ -1708,7 +1708,7 @@ impl AppView {
         let counts = row.counts.element(p);
         // A gated call runs from its answer (the wait is the receipt's).
         let ran = running.then(|| clock(fx, crate::authorize::run_start(row.started, receipt))).flatten();
-        let word = crate::authorize::status_beside(state.1, receipt.map(|r| r.answer)).filter(|_| !lay.tight && !think);
+        let word = crate::authorize::status_beside(state.1, receipt.map(|r| r.answer_for(st))).filter(|_| !lay.tight && !think);
         let before = counts.is_some() || row.card.facts.is_some() || ran.is_some() || word.is_some() || row.card.server.is_some();
         let meta = h_flex()
             .flex_none()
@@ -1721,11 +1721,11 @@ impl AppView {
             .children(counts)
             .children(row.card.facts.clone().map(|f| div().text_color(p.dim_t).child(f)))
             .children(ran.map(|c| div().text_color(p.dim_t).child(c)))
-            .when_some(word, |d, w| d.child(div().text_color(word_color).child(w)))
+            .when_some(word, |d, w| d.child(div().debug_selector(move || format!("tool-word {id}")).text_color(word_color).child(w)))
             .children(row.card.server.clone().map(|s| div().text_color(p.dim_t).child(s)))
             // An answered prompt's receipt (polish.md §2.6): `3s running ·
             // allowed 19:14`, then `allowed 19:14 · 15s`.
-            .children(receipt.and_then(|_| self.receipt_el(call_id, before, running, p)));
+            .children(receipt.and_then(|_| self.receipt_el(call_id, st, before, running, p)));
         let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
         let verb = if think {
             div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.think).child("think").into_any_element()

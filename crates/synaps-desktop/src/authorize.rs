@@ -27,7 +27,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use synaps_client::protocol::PromptRequest;
-use synaps_client::transcript::Item;
+use synaps_client::transcript::{Item, ToolStatus};
 
 use crate::app::{ARM, AppView, Arm, Fill, YES_KEY, authorize_ready, display, fbtn_charge, fbtn_key, hidden, lines_below, mono, tbtn};
 use crate::fonts::TextPx as _;
@@ -284,6 +284,17 @@ impl Receipt {
             .map(|d| format!(" · {}", took(d)))
             .unwrap_or_default();
         (Self::word(self.answer), format!(" {}{took}", self.at))
+    }
+
+    /// What it says once its call's end is known (Shady L4): resolved with
+    /// no answer from here, and the call cancelled, it was a cancel (a HALT
+    /// from another client resolves the prompt while the turn still runs).
+    /// Read when drawn, from the call's final status: no race.
+    pub(crate) fn answer_for(&self, call: Option<ToolStatus>) -> Answer {
+        match self.answer {
+            Answer::Elsewhere | Answer::Resolved if call == Some(ToolStatus::Cancelled) => Answer::Cancelled,
+            a => a,
+        }
     }
 
     /// The receipt's first word for `a`.
@@ -596,12 +607,19 @@ impl AppView {
     /// A call row's receipt (its meta's last part, after a ` · ` when
     /// something comes before it), lifting in over `QUICK`. While its call
     /// runs, without the wait (the clock beside it counts the run).
-    pub(crate) fn receipt_el(&self, call: Option<&str>, after: bool, running: bool, p: &Palette) -> Option<AnyElement> {
+    pub(crate) fn receipt_el(
+        &self,
+        call: Option<&str>,
+        status: Option<ToolStatus>,
+        after: bool,
+        running: bool,
+        p: &Palette,
+    ) -> Option<AnyElement> {
         if self.model.watch.focus().is_some() {
             return None;
         }
         let r = self.row_receipt(call)?;
-        let words = self.receipt_words(r, running, p);
+        let words = self.receipt_words(r, r.answer_for(status), running, p);
         let row = r.row;
         // The meta's 8 px gap is the separator's first space.
         Some(if after {
@@ -622,18 +640,19 @@ impl AppView {
         self.receipts.get(sid)?.iter().rev().find(|r| !r.own && r.call == call)
     }
 
-    fn receipt_words(&self, r: &Receipt, running: bool, p: &Palette) -> Div {
-        let (word, rest) = r.words_while(running);
+    fn receipt_words(&self, r: &Receipt, answer: Answer, running: bool, p: &Palette) -> Div {
+        let (_, rest) = r.words_while(running);
+        let word = Receipt::word(answer);
         let k = self.fx.shot(Some(r.landed), Duration::ZERO, crate::motion::QUICK, &crate::motion::ease::OUT, crate::motion::Kind::Fade);
         let lift = crate::motion::LIFT + (1. - crate::motion::LIFT) * k;
-        let word_color = if r.answer == Answer::Denied { p.err } else { p.dim_t };
+        let word_color = if answer == Answer::Denied { p.err } else { p.dim_t };
         let row = r.row;
         crate::motion::lift(
             h_flex()
                 .debug_selector(move || format!("receipt {row}"))
                 .flex_none()
                 .whitespace_nowrap()
-                .child(div().text_color(word_color).child(word))
+                .child(div().debug_selector(move || format!("receipt-word {row} {word}")).text_color(word_color).child(word))
                 .child(div().text_color(p.dim_t).child(SharedString::from(rest))),
             lift,
         )
@@ -674,7 +693,7 @@ impl AppView {
             .debug_selector(move || format!("receipt-row {}", d.id))
             // On the call rows' verb column (the finish gate of #18).
             .child(div().pl(px(crate::turns::Geo::of(self.layout, m).verb)).text_color(p.dim_t).child(format!("{kind} · ")))
-            .child(self.receipt_words(rc, false, p))
+            .child(self.receipt_words(rc, rc.answer, false, p))
             .into_any_element()
     }
 
@@ -1311,6 +1330,15 @@ mod tests {
         assert_eq!(status_beside(Some("denied"), None), Some("denied"));
         assert_eq!(status_beside(Some("cancelled"), Some(Answer::Cancelled)), None, "a HALT under the card: one cancelled");
         assert_eq!(status_beside(Some("cancelled"), Some(Answer::Elsewhere)), Some("cancelled"));
+        // Shady L4: not ours, and its call cancelled: a cancel, said once.
+        use synaps_client::transcript::ToolStatus;
+        let cancelled = Some(ToolStatus::Cancelled);
+        assert_eq!(r(Answer::Elsewhere, None).answer_for(cancelled), Answer::Cancelled, "a HALT from another client");
+        assert_eq!(r(Answer::Resolved, None).answer_for(cancelled), Answer::Cancelled);
+        assert_eq!(r(Answer::Elsewhere, None).answer_for(Some(ToolStatus::Done)), Answer::Elsewhere);
+        assert_eq!(r(Answer::Elsewhere, None).answer_for(None), Answer::Elsewhere, "still running");
+        assert_eq!(r(Answer::Allowed, None).answer_for(cancelled), Answer::Allowed, "ours stays ours");
+        assert_eq!(status_beside(Some("cancelled"), Some(r(Answer::Elsewhere, None).answer_for(cancelled))), None);
         assert_eq!(status_beside(Some("failed"), Some(Answer::Allowed)), Some("failed"));
         assert_eq!(status_beside(Some("waiting"), Some(Answer::Allowed)), Some("waiting"), "a secret still to come");
         assert_eq!((took(Duration::from_secs(125)), took(Duration::from_secs(3780))), ("2m 05s".into(), "1h 03m".into()));
