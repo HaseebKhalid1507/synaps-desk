@@ -1,0 +1,57 @@
+t0 1794990188.438153169
+0.000969172 still drive-open
+0.0507679 mousemove 640 625 click 1
+0.65552 type --delay 60 /budget
+1.38666 key Return
+3.90525 still budget
+3.96432 type --delay 60 /context
+4.75783 key Return
+7.27479 still context
+7.32781 type --delay 60 /workers
+8.11577 key Return
+10.1326 still workers
+10.1828 type --delay 60 /model
+10.8529 key Return
+11.8726 still model-bare
+11.924 key ctrl+a BackSpace
+12.2686 type --delay 60 /workers cancel scout
+13.8537 key Return
+14.8747 still workers-cancel-scout
+14.93 key ctrl+a BackSpace
+15.2745 type --delay 40 Write a 500-word story about a lighthouse keeper.
+17.2903 key Return
+18.1088 key ctrl+k
+18.7418 type --delay 80 workers
+19.9238 still midturn-palette
+19.9841 key Return
+20.6007 still midturn-refused
+42.6609 type --delay 40 //etc/hosts: what is it? One short sentence.
+44.4731 key Return
+52.4917 still slash-escaped
+52.5505 key ctrl+k
+53.1828 type --delay 80 compact
+54.3592 key Return
+54.6281 still compact-sent
+56.1822 still compact-asked
+72.2362 still compact-after
+72.2895 mousemove 640 300
+72.2932 click 4 click 4
+72.9988 still scroll-1
+73.0546 click 4 click 4
+73.7604 still scroll-2
+73.8134 click 4 click 4
+74.5202 still scroll-3
+74.5749 click 4 click 4
+75.2828 still scroll-4
+75.3343 click 4 click 4
+76.0412 still scroll-5
+76.0926 click 4 click 4
+76.7982 still scroll-6
+76.8546 click 4 click 4
+77.5621 still scroll-7
+77.6202 click 4 click 4
+78.3265 still scroll-8
+78.3838 click 4 click 4
+79.0884 still scroll-9
+79.0952 click 4 click 4
+79.5998 still scroll-10
