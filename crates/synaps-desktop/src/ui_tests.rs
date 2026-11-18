@@ -7210,3 +7210,106 @@ fn a_section_folds_and_unfolds_mid_rail_in_a_scrolled_rail(cx: &mut TestAppConte
     assert!(!first, "checked from its first frame");
     assert!(view.read_with(cx, |v, _| v.rail_fx.fold.is_none() && v.rail_fx.tail.is_empty()));
 }
+
+/// Haseeb's chips (Q5 r2): a chip is the column's share, whatever it says.
+/// A line holds as many as are `MIN_CHIP` wide (two in the 1280-px window
+/// with both panels open), each as wide as the others, `CHIP_GAP` apart,
+/// filling the column. A new step, its clock, the hover's ×, an armed
+/// cancel or a state's change moves no chip and leaves the dock its
+/// height. A panel in flight leaves them be (the frozen column); landed,
+/// they take the new column's share.
+#[gpui_kit::test]
+fn a_chip_is_the_columns_share_whatever_it_says(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseMoveEvent};
+    let (w, view, _events) = open_at(cx, (1280., 800.), 16);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    // The demo's session attached (its rows in) before these replace them.
+    for _ in 0..50 {
+        if view.read_with(cx, |v, _| v.model.stats.subagents.ident(1).is_some()) {
+            break;
+        }
+        settle(cx, w, 2);
+    }
+    assert!(view.read_with(cx, |v, _| v.model.stats.subagents.ident(1).is_some()), "the demo attached");
+    // The demo's own workers (1, 2) ended: these are 11–13.
+    let names = ["scout", "flake-statistics-collector", "bisect"];
+    let rows = |step: &str, secs: f64, third: &str| {
+        let rows: Vec<serde_json::Value> = (11..=13u64)
+            .map(|n| {
+                let status = if n == 13 { third } else { "running" };
+                let done = (status != "running").then_some(secs);
+                serde_json::json!({"subagent_id": n, "agent_name": names[n as usize - 11], "status": status, "cancel_requested": false,
+                    "elapsed_secs": secs, "finished_elapsed": done, "step": step, "tools": n, "handle_id": format!("sa_{n}")})
+            })
+            .collect();
+        synaps_client::protocol::decode_event(&serde_json::json!({"ev": "subagent_rows", "rows": rows})).expect("a rows event")
+    };
+    let set = |cx: &mut TestAppContext, ev: synaps_client::protocol::SessionEvent| {
+        view.update(cx, |v, cx| {
+            v.model.stats.subagents.on_session(&ev);
+            cx.notify();
+        });
+        settle(cx, w, 8);
+        catch_up(cx, &view);
+        // Long enough for an arrival (not for an ended one's flash to end:
+        // the clocks keep frames coming).
+        for _ in 0..72 {
+            fluid_frame(cx, w, &view);
+        }
+        settle(cx, w, 8);
+    };
+    let geo = |cx: &mut TestAppContext| {
+        let chips: Vec<[f32; 4]> =
+            (11..=13).map(|id| drawn(cx, w, format!("chip {id}")).unwrap_or_else(|| panic!("chip {id} drawn"))).collect();
+        (chips, drawn(cx, w, "dock-box".into()))
+    };
+    set(cx, rows("ls", 2., "running"));
+    let before = geo(cx);
+    let (k, cw, column) = view.read_with(cx, |v, _| {
+        let (k, cw) = crate::tray::grid(v.layout.column, &crate::theme::Metrics::at(16));
+        (k, cw, v.layout.column)
+    });
+    assert_eq!(k, 2, "two a line at 1280 with both panels open ({column})");
+    // In place order (the newest running first).
+    let mut placed = before.0.clone();
+    placed.sort_by(|p, q| (p[1], p[0]).partial_cmp(&(q[1], q[0])).expect("numbers"));
+    let [a, b, c] = [placed[0], placed[1], placed[2]];
+    assert!(a[2] == cw && b[2] == cw && c[2] == cw, "every chip the line's share: {:?}", before.0);
+    assert_eq!((a[1], b[0] - (a[0] + a[2])), (b[1], crate::tray::CHIP_GAP), "a line's two, 8 apart");
+    assert!(column - (b[0] + b[2] - a[0]) < 2., "they fill the column ({column}): {a:?} {b:?}");
+    assert!(c[1] > a[1] && c[0] == a[0], "the third starts the next line: {c:?}");
+    let same = |cx: &mut TestAppContext, what: &str| assert_eq!(geo(cx), before, "{what}");
+    set(cx, rows("cargo test -p relay --test refresh_race -- --nocapture and then some", 2., "running"));
+    same(cx, "a long step");
+    set(cx, rows("git status", 3599., "running"));
+    same(cx, "a clock");
+    let at = VisualTestContext::from_window(w, cx).debug_bounds("chip 11").expect("chip 11").center();
+    event(cx, w, PlatformInput::MouseMove(MouseMoveEvent { position: at, pressed_button: None, modifiers: Modifiers::default() }));
+    settle(cx, w, 8);
+    same(cx, "hovered (its ×)");
+    let who = view.read_with(cx, |v, _| {
+        let (call, name) = v.model.stats.subagents.ident(11).expect("sa_11 named");
+        crate::wtabs::Who::new(11, name.to_string(), call.map(|c| c.to_string().into()))
+    });
+    view.update(cx, |v, cx| v.press_cancel(crate::demo::SID, &who, crate::menu::How::Click(1), cx));
+    settle(cx, w, 8);
+    assert!(drawn(cx, w, "tray-confirm".into()).is_some(), "armed: CONFIRM");
+    same(cx, "armed");
+    // A panel in flight: the frozen column's share; landed, the new one's.
+    catch_up(cx, &view);
+    view.update(cx, |v, cx| v.toggle_panel(true, cx));
+    cx.run_until_parked();
+    let mut frames = 0;
+    while view.read_with(cx, |v, _| v.panel_fx.moving()) && frames < 400 {
+        assert_eq!(geo(cx).0.iter().map(|c| c[2]).collect::<Vec<_>>(), [cw; 3], "in flight");
+        fluid_frame(cx, w, &view);
+        frames += 1;
+    }
+    assert!(frames > 30, "it flew ({frames} frames)");
+    settle(cx, w, 8);
+    let now = view.read_with(cx, |v, _| crate::tray::grid(v.layout.column, &crate::theme::Metrics::at(16)).1);
+    let landed = geo(cx);
+    assert!(now > cw && landed.0.iter().all(|c| c[2] == now), "landed: the wider column's share ({now})");
+    set(cx, rows("git status", 3600., "failed"));
+    assert_eq!(geo(cx), landed, "the third failed");
+}

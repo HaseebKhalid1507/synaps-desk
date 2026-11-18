@@ -156,12 +156,15 @@ const TRAY_X: u64 = 0x7AF4 << 48;
 /// Between chips, and between their lines.
 pub(crate) const CHIP_GAP: f32 = 8.;
 
-/// A chip's step, at most, and its name. The demo's steps run 20–36
-/// characters (median 31: `reading e2e/checkout/cart.spec.ts` is 33): at
-/// 36 they read whole (polish.md §2.5 said 32) while every worker fits;
-/// a crowded tray cuts them shorter first ([`STEP_CAPS`]).
+/// A chip's step, at most (its box cuts it shorter, `…`), and its name.
 pub(crate) const STEP_CHARS: usize = 36;
-pub(crate) const NAME_CHARS: usize = 18;
+pub(crate) const NAME_CHARS: usize = 14;
+/// A chip's least width at the default text (it scales with it): a line
+/// of the column holds as many as are this wide, [`CHIP_GAP`] apart
+/// ([`grid`]). 260: two a line in the 624-px column of a 1280-px window
+/// with both panels open (and the 672-px capped column); one in a column
+/// under 528.
+pub(crate) const MIN_CHIP: f32 = 260.;
 /// A chip's clock slot: as wide as the widest it shows (`59m 59s`), so a
 /// tick never reflows the chips.
 const CLOCK_CHARS: usize = 7;
@@ -196,7 +199,7 @@ pub(crate) enum Slot {
     Ghost(usize),
 }
 
-/// How the chips flow over the composer this frame ([`chip_pack`]): the
+/// How the chips sit over the composer this frame ([`grid_pack`]): the
 /// slots drawn and the line each is on, the workers not drawn (`+N more`,
 /// on the last line) and how many lines.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -214,59 +217,16 @@ impl Chips {
     }
 }
 
-/// The parts' widths of a chip (mono at `m.meta`, every text box a whole
-/// pixel): its 1 px frame, padding 12 (the bar and 10) and 10, the
-/// glyph, its name, its step (cut at [`STEP_CHARS`]), its clock's slot
-/// and the cancel ×'s, 8 apart. Nothing in it changes with a tick. An
-/// armed cancel's `Cancel name? ··· C O N F I R M` (CONFIRM `confirm` px,
-/// as drawn) takes the step's, the clock's and the ×'s room. No wider than
-/// the line (`line` px): the step gives way. With the least it may shrink
-/// to in a line's rest: its step cut at [`STEP_LEAST`].
-pub(crate) fn chip_w(r: &TrayRow, armed: bool, line: f32, confirm: f32, cap: usize, m: &Metrics) -> (f32, f32) {
-    use crate::turns::text_w;
-    let cw = m.meta * 0.6;
-    let name = r.name.chars().count().min(NAME_CHARS);
-    let base = 2. + 12. + 10. + 8. + text_w(name, cw) + 10.;
-    if armed {
-        // `Cancel ` and `?`, the fuse (3 cells 4 apart, 2 after), CONFIRM,
-        // 6 apart.
-        let w = (base + 8. + text_w(name + 8, cw) + 6. + 22. + 6. + confirm).ceil();
-        return (w, w);
-    }
-    let fixed = base + if r.clocked() { 8. + text_w(CLOCK_CHARS, cw) } else { 0. } + if r.watchable { 8. + X_W } else { 0. };
-    let room = (line - fixed - 8.).max(text_w(8, cw));
-    let step = chip_step(r).chars().count().min(cap);
-    let w = fixed + 8. + text_w(step, cw).min(room);
-    let least = fixed + 8. + text_w(step.min(STEP_LEAST), cw).min(room);
-    (w.ceil(), least.ceil())
-}
-
-/// The least of a step a chip keeps when it shrinks into a line's rest.
-const STEP_LEAST: usize = 14;
-
-/// The step caps tried in turn: whole steps while every worker fits, then
-/// shorter ones before a worker goes into `+N more`.
-const STEP_CAPS: [usize; 3] = [STEP_CHARS, 24, 16];
-
-/// The step cap the chips are drawn at and the lines they take: the first
-/// of [`STEP_CAPS`] at which every chip fits the lines `lines(needed)`
-/// leaves (`widths(cap)`, `+N more` `more(n)` wide), else the shortest.
-pub(crate) fn fit_caps(
-    widths: impl Fn(usize) -> Vec<(f32, f32)>,
-    line: f32,
-    lines: impl Fn(usize) -> usize,
-    more: impl Fn(usize) -> f32,
-) -> (usize, usize) {
-    let mut pick = (STEP_CHARS, 0);
-    for cap in STEP_CAPS {
-        let ws = widths(cap);
-        let n = lines(chip_lines_needed(&ws, line, CHIP_GAP));
-        pick = (cap, n);
-        if chip_pack(&ws, line, CHIP_GAP, n, &more).1 == ws.len() {
-            break;
-        }
-    }
-    pick
+/// The chips' grid in a column `column` px wide (`lay.column`: while a
+/// panel flies, the frozen one): how many chips a line holds, and the
+/// width of every chip, the line's share. Set by the column alone: what a
+/// chip says (its step, clock, name, hover's ×, an armed cancel, its
+/// state) never moves a chip, and the dock changes height only when the
+/// workers need another line or one less.
+pub(crate) fn grid(column: f32, m: &Metrics) -> (usize, f32) {
+    let least = (MIN_CHIP * m.r).round();
+    let k = ((column + CHIP_GAP) / (least + CHIP_GAP)).floor().max(1.) as usize;
+    (k, ((column - (k - 1) as f32 * CHIP_GAP) / k as f32).floor())
 }
 
 /// A chip's step: what it does while it runs, else its state's word.
@@ -277,63 +237,26 @@ fn chip_step(r: &TrayRow) -> &str {
     }
 }
 
-/// `+N more`'s chip width.
-pub(crate) fn more_w(n: usize, m: &Metrics) -> f32 {
-    (2. + 10. + crate::turns::text_w(format!("+{n} more").chars().count(), m.meta * 0.6) + 10.).ceil()
+/// `+N more`'s width: room for `+99 more` whatever N is (it rolls inside).
+pub(crate) fn more_w(m: &Metrics) -> f32 {
+    (2. + 10. + crate::turns::text_w(8, m.meta * 0.6) + 10.).ceil()
 }
 
-/// The chips of `widths` (each whole, and the least it may shrink to: its
-/// step cut shorter) flowed left to right in lines `avail` px wide, `gap`
-/// apart: the line each is on and its width, as many as `lines` lines hold.
-/// A chip that does not fit whole in what is left of a line takes the rest
-/// of it if it can shrink that far, else starts the next line. All of
-/// them, or as many as fit with the `+N more` chip (`more(n)` wide) that
-/// ends the last line. A chip wider than a line has a line of its own.
-pub(crate) fn chip_pack(
-    widths: &[(f32, f32)],
-    avail: f32,
-    gap: f32,
-    lines: usize,
-    more: impl Fn(usize) -> f32,
-) -> (Vec<(usize, f32)>, usize) {
-    let flow = |ws: &mut dyn Iterator<Item = (f32, f32)>| {
-        let (mut line, mut x, mut out) = (0, 0., Vec::new());
-        for (w, least) in ws {
-            let mut w = w;
-            if x > 0. && x + gap + w > avail {
-                if x + gap + least <= avail {
-                    w = avail - x - gap;
-                } else {
-                    line += 1;
-                    x = 0.;
-                }
-            }
-            x += if x > 0. { gap + w } else { w };
-            out.push((line, w));
-        }
-        out
-    };
-    let all = flow(&mut widths.iter().copied());
-    if lines == 0 {
+/// `n` slots (chips and the ghosts of chips that left) in the grid, `k` a
+/// line, each `w` wide in `column` px, as many as `lines` lines hold: each
+/// one's line, and how many are drawn. All of them, else as many as fit
+/// with `+N more` (`more` px) ending the last line.
+pub(crate) fn grid_pack(n: usize, k: usize, w: f32, column: f32, lines: usize, more: f32) -> (Vec<usize>, usize) {
+    if lines == 0 || k == 0 {
         return (Vec::new(), 0);
     }
-    if all.last().is_none_or(|l| l.0 < lines) {
-        return (all, widths.len());
-    }
-    // As many as fit with `+N more` after them.
-    for k in (0..widths.len()).rev() {
-        let m = more(widths.len() - k);
-        let placed = flow(&mut widths[..k].iter().copied().chain(std::iter::once((m, m))));
-        if placed.last().is_some_and(|l| l.0 < lines) {
-            return (placed[..k].to_vec(), k);
-        }
-    }
-    (Vec::new(), 0)
-}
-
-/// The lines `widths` flow to, all of them, in `avail` px.
-pub(crate) fn chip_lines_needed(widths: &[(f32, f32)], avail: f32, gap: f32) -> usize {
-    chip_pack(widths, avail, gap, usize::MAX, |_| 0.).0.last().map_or(0, |l| l.0 + 1)
+    let fit = if n <= k * lines {
+        n
+    } else {
+        let beside = ((column - more) / (w + CHIP_GAP)).floor().max(0.) as usize;
+        k * (lines - 1) + beside.min(k)
+    };
+    ((0..fit).map(|i| i / k).collect(), fit)
 }
 
 impl AppView {
@@ -462,46 +385,28 @@ impl AppView {
             .collect()
     }
 
-    /// The chips over the composer this frame: their widths, the lines they
-    /// need in the column (`avail` px) and, once [`crate::fit::chip_lines`]
-    /// has said how many it has room for (`lines`), how they flow
-    /// ([`AppView::chips`]).
-    /// Fits the chips into the column ([`fit_caps`]); the lines used.
-    pub(crate) fn fit_chips(&mut self, line: f32, confirm: f32, m: &Metrics, lines: impl Fn(usize) -> usize) -> usize {
+    /// The chips over the composer this frame, in the column (`line` px):
+    /// the grid ([`grid`]), the lines its slots need, then as many as
+    /// [`crate::fit::chip_lines`] has room for (`lines`); the lines used.
+    pub(crate) fn fit_chips(&mut self, line: f32, m: &Metrics, lines: impl Fn(usize) -> usize) -> usize {
         let slots = self.tray_slots();
-        let (cap, n) = fit_caps(|cap| self.chip_widths(line, confirm, cap, m).1, line, lines, |k| more_w(k, m));
-        let (_, widths) = self.chip_widths(line, confirm, cap, m);
-        self.pack_chips(slots, &widths, line, n, m);
-        n
+        let (k, _) = grid(line, m);
+        let n = lines(slots.len().div_ceil(k));
+        self.pack_chips(slots, line, n, m);
+        self.chips.lines
     }
 
-    pub(crate) fn chip_widths(&self, line: f32, confirm: f32, cap: usize, m: &Metrics) -> (Vec<Slot>, Vec<(f32, f32)>) {
-        let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
-        let now = Instant::now();
-        let slots = self.tray_slots();
-        let widths = slots
-            .iter()
-            .map(|s| match *s {
-                Slot::Row(i) => {
-                    let r = &self.tray.rows[i];
-                    let armed = session.is_some_and(|s| self.model.cancels.armed(s, r.id, (r.call.as_deref(), &r.name), now));
-                    chip_w(r, armed, line, confirm, cap, m)
-                }
-                Slot::Ghost(g) => chip_w(&self.tray.ghosts[g].1, false, line, confirm, cap, m),
-            })
-            .collect();
-        (slots, widths)
-    }
-
-    pub(crate) fn pack_chips(&mut self, slots: Vec<Slot>, widths: &[(f32, f32)], avail: f32, lines: usize, m: &Metrics) {
-        let (on, k) = chip_pack(widths, avail, CHIP_GAP, lines, |n| more_w(n, m));
-        let placed: Vec<(Slot, usize, f32)> = slots.into_iter().zip(on).map(|(s, (l, w))| (s, l, w)).collect();
+    pub(crate) fn pack_chips(&mut self, slots: Vec<Slot>, column: f32, lines: usize, m: &Metrics) {
+        let (k, w) = grid(column, m);
+        let (on, fit) = grid_pack(slots.len(), k, w, column, lines, more_w(m));
+        let all = fit == slots.len();
+        let placed: Vec<(Slot, usize, f32)> = slots.into_iter().zip(on).map(|(s, l)| (s, l, w)).collect();
         let drawn = placed.iter().filter(|s| matches!(s.0, Slot::Row(_))).count();
         let more = self.tray.rows.len().saturating_sub(drawn);
-        let more_line = placed.last().map_or(0, |s| s.1);
-        let used = if k == widths.len() { placed.last().map_or(0, |s| s.1 + 1) } else { lines };
+        let used = if all { placed.last().map_or(0, |s| s.1 + 1) } else { lines };
+        let more_line = used.saturating_sub(1);
         // Only ghosts cut: no worker is left out, and nothing says so.
-        self.chips = Chips { slots: placed, more: if k < widths.len() { more } else { 0 }, more_line, lines: used };
+        self.chips = Chips { slots: placed, more: if all { 0 } else { more }, more_line, lines: used };
     }
 
     /// The workers menu (polish.md §2.5): `+N more`'s workers, each as its
@@ -643,13 +548,14 @@ impl AppView {
         let steer = fx.flash(fx.sent.get().filter(|s| s.1 && watched.is_some()).map(|s| s.0 + 2 * motion::STAGGER));
         let you_color = motion::mix(p.you_mark_t, motion::mix(p.you, p.ink, 0.35), steer);
         let mut lines: Vec<Vec<AnyElement>> = (0..chips.lines).map(|_| Vec::new()).collect();
-        // Each line's next chip's x: a chip whose x changed (one before it
-        // left, polish.md P13) slides there.
-        let mut xs = vec![0f32; chips.lines];
+        // Each line's next chip's cell: a chip whose cell changed (one
+        // before it left, polish.md P13) slides there, by cells (a new
+        // column's share moves no chip).
+        let mut cols = vec![0usize; chips.lines];
         for &(slot, line, w) in &chips.slots {
             let Some(at) = lines.get_mut(line) else { continue };
-            let x = xs[line];
-            xs[line] += w + CHIP_GAP;
+            let col = cols[line];
+            cols[line] += 1;
             match slot {
                 Slot::Ghost(g) => {
                     let Some(g) = self.tray.ghosts.get(g) else { continue };
@@ -673,7 +579,7 @@ impl AppView {
                     // one that came rises 8 px and lifts from 70 %, in
                     // turn (polish.md P13).
                     let off = fx.slide(TRAY | r.id, line as f32 * (row_h + CHIP_GAP));
-                    let dx = fx.slide(TRAY_X | r.id, x);
+                    let dx = fx.slide(TRAY_X | r.id, col as f32) * (w + CHIP_GAP);
                     let (travel, strength) = fx.arrival(fx.birth(TRAY | r.id));
                     let (bounds, id) = (self.chip_bounds.clone(), r.id);
                     at.push(
@@ -696,10 +602,12 @@ impl AppView {
             let rest: Vec<String> =
                 self.tray.rows.iter().skip(chips.drawn()).map(|r| format!("{}  {}", r.name, glyph::worker(r.live).2)).collect();
             let tip = SharedString::from(rest.join("\n"));
+            // As wide as `+99 more`, whatever it says: N rolls inside it.
             let more = h_flex()
                 .id("tray-more")
                 .debug_selector(|| "tray-more".into())
                 .flex_none()
+                .w(px(more_w(m)))
                 .h(px(row_h))
                 .px(px(10.))
                 .items_center()
@@ -783,7 +691,8 @@ impl AppView {
                 None,
                 false,
             ))
-            .child(div().flex_none().text_color(p.sub_name_t).child(SharedString::from(cut(&r.name, NAME_CHARS))))
+            // Armed, `Cancel name?` says the name.
+            .when(!armed, |d| d.child(div().flex_none().text_color(p.sub_name_t).child(SharedString::from(cut(&r.name, NAME_CHARS)))))
             .when_some(armed_el, |d, a| d.child(a))
             .when(!armed, |d| {
                 d.child(
@@ -795,20 +704,20 @@ impl AppView {
                         .text_color(step_color)
                         .child(SharedString::from(chip_step(r).to_string())),
                 )
-                // The clock's slot, as wide as it ever reads; the ×'s after
-                // it (drawn on hover, design.md §5; always on the watched one).
-                .when(r.clocked(), |d| {
-                    d.child(
-                        div()
-                            .flex_none()
-                            .w(px(crate::turns::text_w(CLOCK_CHARS, cw)))
-                            .flex()
-                            .justify_end()
-                            .text_color(p.sub_time_t)
-                            .children(clock),
-                    )
-                })
-                .when(r.watchable, |d| d.child(div().flex_none().w(px(X_W)).flex().justify_center().children(x)))
+                // The clock's slot, as wide as it ever reads, and the ×'s
+                // after it (drawn on hover, design.md §5; always on the
+                // watched one), each there whether it shows or not: the
+                // step's room is the same in every state.
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(crate::turns::text_w(CLOCK_CHARS, cw)))
+                        .flex()
+                        .justify_end()
+                        .text_color(p.sub_time_t)
+                        .children(clock.filter(|_| r.clocked())),
+                )
+                .child(div().flex_none().w(px(X_W)).flex().justify_center().children(x))
             })
             .child(bar)
             .children(self.render_menu_at_row(r.id, p, cx));
@@ -924,7 +833,7 @@ impl AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHIP_GAP, STEP_CHARS, TrayRow, chip_lines_needed, chip_pack, chip_w, cut, fit_caps, need};
+    use super::{TrayRow, cut, grid, grid_pack, need};
     use crate::glyph::{self, Glyph};
     use crate::subagents::{Live, Liveness, Status};
     use crate::theme::Metrics;
@@ -967,45 +876,30 @@ mod tests {
         assert_eq!(rows[0].id, 6, "a failed one watched is still a failure");
     }
 
-    /// Steps read whole while every worker fits; a crowded tray cuts them
-    /// shorter before a worker goes into `+N more`.
+    /// The grid: as many chips a line as are [`MIN_CHIP`] wide, each the
+    /// line's share; two in the 1280-px window's column with both panels
+    /// open (624) and in the capped column (672), one under 528.
     #[test]
-    fn a_crowded_tray_cuts_steps_before_hiding_workers() {
+    fn chips_are_the_columns_share() {
         let m = Metrics::at(16);
-        let rows: Vec<TrayRow> = (0..6).map(|_| TrayRow::of(live(Status::Running, "reading e2e/checkout/cart.spec.ts"), false)).collect();
-        let (rows, m) = (&rows, &m);
-        let at = |k: usize| move |cap| rows[..k].iter().map(|r| chip_w(r, false, m.column, 60., cap, m)).collect::<Vec<_>>();
-        let more = |_| 50.;
-        assert_eq!(fit_caps(at(2), m.column, |n| n.min(2), more).0, STEP_CHARS, "two read whole");
-        let (cap, n) = fit_caps(at(6), m.column, |n| n.min(2), more);
-        assert!(cap < STEP_CHARS && n <= 2, "six in two lines: shorter steps ({cap}, {n})");
-        let shown = |cap| chip_pack(&at(6)(cap), m.column, CHIP_GAP, 2, more).1;
-        let (cut, whole) = (shown(cap), shown(STEP_CHARS));
-        assert!(cut > whole, "more workers shown: {cut} > {whole}");
+        assert_eq!(grid(624., &m), (2, 308.));
+        assert_eq!(grid(672., &m), (2, 332.));
+        assert_eq!(grid(536., &m), (2, 264.));
+        assert_eq!(grid(527., &m), (1, 527.));
+        assert_eq!(grid(1200., &m), (4, 294.));
+        let (k, w) = grid(Metrics::at(20).column, &Metrics::at(20));
+        assert_eq!((k, w), (2, 416.), "the least scales with the text");
     }
 
-    /// Chips flow left to right in lines; past the lines they have, the
-    /// last line ends with `+N more` (N the chips not drawn); a chip wider
-    /// than a line has its own.
+    /// Chips fill lines of `k`; past the lines they have, the last line
+    /// ends with `+N more` after as many as fit beside it.
     #[test]
     fn chips_flow_in_lines_and_the_rest_is_more() {
-        let more = |_| 50.;
-        let whole = |ws: &[f32]| ws.iter().map(|&w| (w, w)).collect::<Vec<_>>();
-        let lines = |r: (Vec<(usize, f32)>, usize)| (r.0.into_iter().map(|l| l.0).collect::<Vec<_>>(), r.1);
-        assert_eq!(lines(chip_pack(&whole(&[100., 100., 100.]), 320., 8., 2, more)), (vec![0, 0, 0], 3), "one line holds all three");
-        assert_eq!(
-            lines(chip_pack(&whole(&[200., 200., 200.]), 320., 8., 2, more)),
-            (vec![0, 1], 2),
-            "two lines: the third is +1 more after the second"
-        );
-        assert_eq!(lines(chip_pack(&whole(&[100., 100., 100., 100.]), 320., 8., 1, more)), (vec![0, 0], 2), "one line: two and +2 more");
-        assert_eq!(lines(chip_pack(&whole(&[500., 100.]), 320., 8., 2, more)), (vec![0, 1], 2), "a wide one has its line");
-        // A chip that can shrink takes the line's rest; one that cannot
-        // starts the next.
-        assert_eq!(chip_pack(&[(200., 200.), (200., 100.)], 320., 8., 2, more), (vec![(0, 200.), (0, 112.)], 2));
-        assert_eq!(chip_pack(&[(200., 200.), (200., 150.)], 320., 8., 2, more), (vec![(0, 200.), (1, 200.)], 2));
-        assert_eq!(chip_lines_needed(&whole(&[200., 200., 200.]), 320., 8.), 3);
-        assert_eq!(chip_lines_needed(&[], 320., 8.), 0);
+        assert_eq!(grid_pack(3, 2, 308., 624., 2, 80.), (vec![0, 0, 1], 3));
+        assert_eq!(grid_pack(4, 2, 308., 624., 2, 80.), (vec![0, 0, 1, 1], 4));
+        assert_eq!(grid_pack(5, 2, 308., 624., 2, 80.), (vec![0, 0, 1], 3), "two lines: one beside +2 more");
+        assert_eq!(grid_pack(5, 1, 527., 527., 2, 80.), (vec![0], 1), "one a line: +4 more has the last");
+        assert_eq!(grid_pack(5, 2, 308., 624., 0, 80.), (vec![], 0));
         assert_eq!(cut("reading crates/relay/src/upstream.rs", 12), "reading cra…");
         assert_eq!(cut("short", 12), "short");
     }

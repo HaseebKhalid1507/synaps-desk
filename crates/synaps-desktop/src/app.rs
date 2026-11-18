@@ -6379,15 +6379,14 @@ impl Render for AppView {
         // The worker chips: the lines they need in the column, then how
         // many the room leaves. A chip fading out keeps its slot until its
         // fade is over.
-        let confirm = self.display_w(label::CONFIRM, fonts::size::D_S, window);
         // The 3-line rule counts the chips fading out too: 5 workers going
         // to 4 keep their lines until the fifth's fade is over, so no
         // `+1 more` blinks in for it (Shady #16 r4).
         let (form, height, workers) = (lay.form(), self.height, self.tray.rows.len() + self.tray.ghosts.len());
         self.tray_rows = if view.is_none() {
-            self.fit_chips(lay.column, confirm, &m, |needed| crate::fit::chip_lines(&m, form, height, card_shown, ex, workers, needed))
+            self.fit_chips(lay.column, &m, |needed| crate::fit::chip_lines(&m, form, height, card_shown, ex, workers, needed))
         } else {
-            self.pack_chips(Vec::new(), &[], lay.column, 0, &m);
+            self.pack_chips(Vec::new(), lay.column, 0, &m);
             0
         };
         // A keyboard menu over a row no longer drawn closes; a workers menu
