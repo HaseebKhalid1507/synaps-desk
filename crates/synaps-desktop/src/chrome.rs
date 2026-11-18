@@ -260,6 +260,9 @@ pub(crate) struct Flight {
     /// The width its content is laid out at: the open one (while it folds,
     /// the one it had).
     pub(crate) open: f32,
+    /// Where a width change started (its content is laid out at the wider
+    /// of this and the new width, so it is clipped, never short of the box).
+    pub(crate) start: f32,
     /// When it landed on its strip: the strip's glyphs lift in over `quick`.
     pub(crate) landed: Option<std::time::Instant>,
 }
@@ -280,6 +283,7 @@ impl PanelFx {
     pub(crate) fn fly(&mut self, rail: bool, response: f32, slide: bool) {
         let f = &mut self.sides[usize::from(!rail)];
         f.from = Some(f.shown);
+        f.start = f.shown;
         f.response = response;
         f.slide = slide;
     }
@@ -1036,6 +1040,7 @@ impl AppView {
             };
         }
         let cw = match side {
+            Side::Open(w) if !f.slide => w.max(f.start),
             Side::Open(w) => w,
             Side::Strip => f.open,
         };
@@ -1055,6 +1060,8 @@ impl AppView {
             .overflow_hidden()
             .bg(p.chrome)
             .child(div().absolute().top_0().bottom_0().left(px(x)).w(px(cw)).flex().child(content(cw)))
+            // The rail's border on its moving edge, over what it clips.
+            .when(rail, |d| d.child(div().absolute().top_0().bottom_0().right_0().w(px(1.)).bg(p.hair)))
             .into_any_element()
     }
 
