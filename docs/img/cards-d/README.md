@@ -111,3 +111,35 @@ folds at the list's end (f≈1404), and the last call's body opens and closes at
 | `r3-states-1280.png`, `r3-folded-1280.png`, `r3-outline-1280.png` | 1280×720 stills: the states run, folded, and the Outline Allow (`SYNAPS_DESK_ALLOW=outline`). |
 
 The body opening and closing at the end (S1) moves no band of the column ≥ 8 px in any frame.
+
+## Round 4 (Shady #23 r3 H2, H1, M2; design gate r3 N3, S3, S1, S5, N2)
+
+Lossless clips off the repo: `cardsd-evidence/r5/clips/f5-full.mkv` (1920×1080) and `l5-full.mkv`
+(1280×720), Full, 60 fps captures of a 144 Hz headless gamescope, each with the bench's marks
+(`*.png.log`, `FOLDS <what> <s>`). The bench's fold script now: the run unfolds at the end; a
+fold a third of the way down; an unfold there **with no scroll** (N2); at the end, a fold (N3);
+an unfold as the list is sent to its end, then a fold with the rows still under the view (N3);
+the last call's body opened and closed at the end (S1); a new turn's call streaming into the
+held room while the reader scrolls up 0.5 px a frame for 3 s, then stops (H2). Every fold here
+is a click (`toggle_run`); the turn-end fold (f≈776) is the only tail-following one.
+
+| Still / strip | What it shows |
+|---|---|
+| `r4-needs-you-1280-in-first-3s.png` | 1280, about 0.3 s after the prompt came: the rail row, the tab strip, the stub and the composer foot all draw the lattice plus (S3); no framed box anywhere |
+| `r4-needs-you-plus-8x-rail-tab-composer.png` | those glyphs at 8×: the breathing ones dim the centre dot |
+| `r4-needs-you-ping-f144-162-breath-f150-330.png` | top: the tab strip's ping, f144–162, one ring wave then the still plus; bottom: the composer foot breathing, every 10th frame f150–330 (its centre dot) |
+| `r4-N3-fold-end-header-holds-f1464-1516.png` | the fold at the end (every 4th frame): the header and all above it hold (block match: 0 px, f1460–1520); the card's edge rides up over its rows |
+| `r4-N3-fold-rows-under-view-f1735-1787.png` | unfolded as the list went to its end, folded with rows under the view: the header holds (0 px, f1730–1790) |
+| `r4-N2-unfold-stagger-no-scroll-f1284-1312.png` | the unfold mid-screen with no scroll (every 2nd frame): the rows arrive one after another under a still header |
+| `r4-S1-body-opens-shows-first-lines-f2034-2074.png` | the last call's body opened at the very bottom: the row holds while it opens under the view, then the list glides just far enough to show it (here 1 line, so ~9 px over f2056–2070) |
+| `r4-H2-slow-scroll-while-streaming-f2330-2500-2690-2840.png` | output streaming while the reader scrolls up 0.5 px a frame: the column only moves up (block match f2330–2840: 215 one-px steps, all one way, never toward the end), and after the scroll stops (f≈2690) nothing moves |
+
+S5, the 1280 turn-end fold with its header off screen (`l5-full` f782–840, block match on the
+column): 4, 28, 18, 32, 22, 11, 45, 11, 42, 19, 9, 36, 16, 7, 28, 12, 16, 10, 5, 17, 3, 14, … Still
+uneven. Why it's the capture and not the app: the fold's spring can't move faster than 1617 px/s
+(its response is `h / 700` for any room under 1050 px, and its peak speed is `h · 2π / (e · r)`),
+which is 27 px in 16.7 ms. A late app frame pauses the fold; it never skips ahead. So the 45, 42
+and 36 px steps mean those capture slots spanned 28 ms or more of app time, and the small steps
+next to them (11, 9, 7) were short slots: x11grab's grab times jitter on a loaded machine (load ≈ 5
+here). The app's own steps are bounded by the ui test (≤ 13 px a 144 Hz frame, ≤ 32 px across a
+50 ms hitch). Not proven frame by frame: the container's timestamps are synthetic.

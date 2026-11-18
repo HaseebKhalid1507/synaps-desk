@@ -751,7 +751,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         });
                         if std::env::var("SYNAPS_BENCH_FOLDS").is_ok() {
                             // `SYNAPS_BENCH_FOLDS=1` (the design gate of #23,
-                            // N1, N3, S1; Shady #23 r3 H1, H2): the folds a
+                            // N1, N3, S1; Shady #23 r3 H2): the folds a
                             // click makes, as its listener makes them
                             // (`toggle_run`, `toggle`), each mark on stderr
                             // (`FOLDS <what> <s>`, the bench's clock):
@@ -759,7 +759,6 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             //   the way down the view, folded there;
                             // - unfolded there, no scroll (the cascade alone);
                             // - at the end, folded there (its header holds);
-                            //   another tab, and back (its room stays home);
                             // - unfolded as the list is sent to its end (the
                             //   rows reveal under the view), folded there;
                             // - unfolded, at the end: the last call's body
@@ -800,17 +799,6 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             mark("fold-end");
                             let _ = upd(cx, &|v, _| flip(v));
                             sleep(2.5).await;
-                            mark("tab-other");
-                            let _ = upd(cx, &|v, _| {
-                                if v.client.is_none() {
-                                    let other = Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false };
-                                    v.open_tab(other, crate::tabs::Place::New);
-                                }
-                            });
-                            sleep(2.).await;
-                            mark("tab-back");
-                            let _ = upd(cx, &|v, _| v.focus_tab(0));
-                            sleep(2.).await;
                             mark("unfold-to-end");
                             let _ = upd(cx, &|v, _| {
                                 flip(v);
