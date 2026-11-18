@@ -1022,7 +1022,6 @@ pub(crate) struct Motion {
     /// Tests: the beat each layer paint with sites drew, in order.
     #[cfg(test)]
     pub(crate) painted: RefCell<Vec<u32>>,
-
 }
 
 /// A count or a line as last drawn ([`Motion::roll`]).
@@ -1553,7 +1552,11 @@ impl Motion {
         }
         (s.n, s.frame) = (n, frame);
         let curve = stream_curve();
-        s.born.retain(|(_, at)| now < *at || Spring::from_rest(1., FLICK_RESPONSE, now.saturating_duration_since(*at).as_secs_f32()) > 0.01 || now.saturating_duration_since(*at) < STREAM_FADE);
+        s.born.retain(|(_, at)| {
+            now < *at
+                || Spring::from_rest(1., FLICK_RESPONSE, now.saturating_duration_since(*at).as_secs_f32()) > 0.01
+                || now.saturating_duration_since(*at) < STREAM_FADE
+        });
         if s.born.is_empty() {
             return Vec::new();
         }

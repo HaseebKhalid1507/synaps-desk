@@ -2394,11 +2394,17 @@ fn well(row: &RowCache, failed: bool, id: u64, streamed: &[(usize, f32, f32)], p
             // never moves inside its block.
             let line = (19. * m.r).round();
             let lines = row.result.lines().enumerate().map(|(i, l)| {
-                let text = div().w_full().flex_shrink_0().child(SharedString::from(if l.is_empty() { " ".to_string() } else { l.to_string() }));
+                let text =
+                    div().w_full().flex_shrink_0().child(SharedString::from(if l.is_empty() { " ".to_string() } else { l.to_string() }));
                 match streamed.iter().find(|s| s.0 == i) {
-                    Some(&(_, clip, k)) => {
-                        div().w_full().flex().flex_col().overflow_hidden().h(px((line * clip).round())).child(motion::lift(text, k)).into_any_element()
-                    }
+                    Some(&(_, clip, k)) => div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .h(px((line * clip).round()))
+                        .child(motion::lift(text, k))
+                        .into_any_element(),
                     None => text.into_any_element(),
                 }
             });

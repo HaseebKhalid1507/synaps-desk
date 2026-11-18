@@ -723,7 +723,8 @@ impl AppView {
             let body = card_slot(self.render_card(&e.card, Some(&e.look), p, m, cx), m).into_any_element();
             let (shown, _) = e.shown(self.fx.now());
             self.fx.want_frame();
-            let g = crate::motion::Grow { key: d.id, shown, sink: e.sink.clone(), travel: 0., strength: e.strength(self.fx.now()), floor: 0. };
+            let g =
+                crate::motion::Grow { key: d.id, shown, sink: e.sink.clone(), travel: 0., strength: e.strength(self.fx.now()), floor: 0. };
             return crate::motion::grow_block(body, None, None, g);
         }
         let sid = self.model.active.as_ref().map(|a| a.session_id.as_str()).unwrap_or_default();
@@ -802,56 +803,54 @@ impl AppView {
                 .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(fg).child(text))
                 .children(key.map(|k| key_hint(k, fg, bg)))
         };
-        let allow_btn =
-            |id: &'static str, text: &'static str, key: Option<&'static str>, enabled: bool, charge: Option<u32>, down: bool| {
-                let style = allow_style();
-                let (bg, edge, fg) = style.colors(p, false, down);
-                let (hi, _, _) = style.colors(p, true, false);
-                let (press, press_edge, _) = style.colors(p, false, true);
-                let (bg, edge, fg) = if enabled || down { (bg, edge, fg) } else { (p.card_d, p.line, p.dim_k) };
-                // The arm's charge in the accent, filled or outlined (Shady
-                // #23 M5: the outline's rest fill is the card itself).
-                let lit = match style {
-                    crate::cards::AllowStyle::Fill => style.colors(p, false, false).0,
-                    crate::cards::AllowStyle::Outline => p.acc_line,
-                };
-                h_flex()
-                    .id(id)
-                    .relative()
-                    .when(down, |d| d.top(px(crate::motion::PRESS)))
-                    .flex_none()
-                    .h(px(crate::fit::button_h(m)))
-                    .px(px(14.))
-                    .gap(px(8.))
-                    .items_center()
-                    .rounded(px(5.))
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(edge)
-                    .bg(bg)
-                    .when(enabled, |d| {
-                        d.cursor_pointer()
-                            .hover(move |d| d.bg(hi).border_color(if style == crate::cards::AllowStyle::Fill { hi } else { edge }))
-                            .active(move |s| s.bg(press).border_color(press_edge).top(px(crate::motion::PRESS)))
-                    })
-                    // The arm's charge (motion.md §6.3): ten cells of the fill
-                    // lit left to right along the foot, as before.
-                    .children(charge.filter(|_| !enabled).map(|n| {
-                        h_flex()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .bottom_0()
-                            .h(px(3.))
-                            .gap(px(1.))
-                            .children((0..10).map(move |i| div().flex_1().h_full().when(i < n, |d| d.bg(lit))))
-                    }))
-                    .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(fg).child(text))
-                    .children(key.map(|k| key_hint(k, fg, bg)))
-                    .debug_selector(move || {
-                        if style == crate::cards::AllowStyle::Fill { "allow-fill".into() } else { "allow-outline".into() }
-                    })
+        type Key = Option<&'static str>;
+        let allow_btn = |id: &'static str, text: &'static str, key: Key, enabled: bool, charge: Option<u32>, down: bool| {
+            let style = allow_style();
+            let (bg, edge, fg) = style.colors(p, false, down);
+            let (hi, _, _) = style.colors(p, true, false);
+            let (press, press_edge, _) = style.colors(p, false, true);
+            let (bg, edge, fg) = if enabled || down { (bg, edge, fg) } else { (p.card_d, p.line, p.dim_k) };
+            // The arm's charge in the accent, filled or outlined (Shady
+            // #23 M5: the outline's rest fill is the card itself).
+            let lit = match style {
+                crate::cards::AllowStyle::Fill => style.colors(p, false, false).0,
+                crate::cards::AllowStyle::Outline => p.acc_line,
             };
+            h_flex()
+                .id(id)
+                .relative()
+                .when(down, |d| d.top(px(crate::motion::PRESS)))
+                .flex_none()
+                .h(px(crate::fit::button_h(m)))
+                .px(px(14.))
+                .gap(px(8.))
+                .items_center()
+                .rounded(px(5.))
+                .overflow_hidden()
+                .border_1()
+                .border_color(edge)
+                .bg(bg)
+                .when(enabled, |d| {
+                    d.cursor_pointer()
+                        .hover(move |d| d.bg(hi).border_color(if style == crate::cards::AllowStyle::Fill { hi } else { edge }))
+                        .active(move |s| s.bg(press).border_color(press_edge).top(px(crate::motion::PRESS)))
+                })
+                // The arm's charge (motion.md §6.3): ten cells of the fill
+                // lit left to right along the foot, as before.
+                .children(charge.filter(|_| !enabled).map(|n| {
+                    h_flex()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(3.))
+                        .gap(px(1.))
+                        .children((0..10).map(move |i| div().flex_1().h_full().when(i < n, |d| d.bg(lit))))
+                }))
+                .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(fg).child(text))
+                .children(key.map(|k| key_hint(k, fg, bg)))
+                .debug_selector(move || if style == crate::cards::AllowStyle::Fill { "allow-fill".into() } else { "allow-outline".into() })
+        };
         let actions = if detached {
             None
         } else if secret {
@@ -1235,13 +1234,12 @@ pub(crate) fn allow_style() -> crate::cards::AllowStyle {
     if let Some(s) = TEST_ALLOW.with(|c| c.get()) {
         return s;
     }
-    static ENV: std::sync::LazyLock<Option<crate::cards::AllowStyle>> = std::sync::LazyLock::new(|| {
-        match std::env::var("SYNAPS_DESK_ALLOW").ok().as_deref() {
+    static ENV: std::sync::LazyLock<Option<crate::cards::AllowStyle>> =
+        std::sync::LazyLock::new(|| match std::env::var("SYNAPS_DESK_ALLOW").ok().as_deref() {
             Some("outline") => Some(crate::cards::AllowStyle::Outline),
             Some("fill") => Some(crate::cards::AllowStyle::Fill),
             _ => None,
-        }
-    });
+        });
     ENV.unwrap_or(ALLOW_STYLE)
 }
 
