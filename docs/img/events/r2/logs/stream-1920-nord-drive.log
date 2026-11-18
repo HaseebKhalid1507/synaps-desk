@@ -1,0 +1,15 @@
+t0 1795007939.645753125
+0.000865936 still stream-open
+0.0870812 mousemove 960 985 click 1
+0.592384 type --delay 25 Write 40 numbered lines, one short sentence each, on how a lighthouse lens works. No tools, no preamble.
+3.39741 key Return
+5.61411 event high, while it streams
+6.12019 still stream-held-1
+7.81771 event medium, while it streams
+8.32398 still stream-held-2
+9.93097 still stream-held-3
+13.0282 still stream-held-4
+35.1303 still stream-after
+35.2258 event local_only (inject)
+bddd950c-bdff-4bc0-bd76-1327ba915593
+49.2457 still stream-local

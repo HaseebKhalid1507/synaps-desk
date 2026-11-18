@@ -6228,3 +6228,123 @@ fn scroll_tests_unchanged() {
         assert_eq!(fnv(&text(name)), main, "{name} changed");
     }
 }
+
+// ── engine events (BRIEF-events) ──────────────────────────────────────────
+
+/// A synthetic `External` frame (agent-engine `session/wire.rs`).
+fn external_frame(id: &str, text: &str, sev: &str, ask: bool) -> serde_json::Value {
+    serde_json::json!({"ev": "external", "event": {
+        "id": id, "timestamp": "2031-02-03T04:05:06Z",
+        "source": {"source_type": "agent-comms", "name": "agent-comms", "callback": null},
+        "channel": {"id": "comms", "name": "comms"},
+        "sender": {"id": "sid-0001", "name": "kestrel", "sender_type": "agent"},
+        "content": {"text": text, "content_type": "message", "severity": sev, "data": null},
+        "expects_response": ask, "reply_to": null}})
+}
+
+/// `raw` as the attached session's live frame, through the model.
+fn event_in(cx: &mut TestAppContext, view: &Entity<AppView>, raw: serde_json::Value) {
+    view.update(cx, |v, cx| {
+        let (seq, sid) = v.model.active.as_ref().map(|a| (a.attach_seq, a.session_id.clone())).expect("attached");
+        let event = synaps_client::protocol::decode_event(&raw).expect("decodes");
+        let ev = synaps_client::Event::session(seq, sid, 1, event, std::sync::Arc::new(raw)).with_ts("2031-02-03T04:05:07Z");
+        v.apply_batch(vec![ev], cx);
+        cx.notify();
+    });
+}
+
+fn kinds_of(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<synaps_client::transcript::ItemKind> {
+    view.read_with(cx, |v, _| v.model.shown().items().iter().map(|i| i.kind).collect())
+}
+
+/// Scrolled back, events landing (each severity, and one's steer into the
+/// turn) never move a row on screen and never resume following; each is
+/// one event row, never a user row.
+#[gpui_kit::test]
+fn an_event_never_moves_a_scrolled_up_view(cx: &mut TestAppContext) {
+    use synaps_client::transcript::ItemKind;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    start_stream(cx, &view);
+    settle(cx, w, 8);
+    for k in 0..30 {
+        stream_step(cx, &view, k);
+        fluid_frame(cx, w, &view);
+    }
+    view.update(cx, |v, _| v.list.scroll_by(gpui_kit::px(-260.)));
+    fluid_frame(cx, w, &view);
+    let users = kinds_of(cx, &view).iter().filter(|k| **k == ItemKind::User).count();
+    let (anchor, top) = view.read_with(cx, |v, _| {
+        let ix = v.list.logical_scroll_top().item_ix + 1;
+        (ix, v.list.bounds_for_item(ix).map(|b| b.top()))
+    });
+    assert!(top.is_some(), "the anchor row is on screen");
+    for (k, sev) in ["Low", "Medium", "High", "Critical"].into_iter().enumerate() {
+        let id = format!("ev-scroll-{k}");
+        event_in(cx, &view, external_frame(&id, "[comms] #3 ask from kestrel: still there?", sev, k % 2 == 0));
+        let form = format!(
+            "<event id=\"{id}\" type=\"message\" severity=\"{}\" source=\"agent-comms\" channel=\"comms\">[comms] #3 ask from kestrel: still there?</event>",
+            sev.to_lowercase()
+        );
+        event_in(
+            cx,
+            &view,
+            serde_json::json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": form}}),
+        );
+        for _ in 0..12 {
+            stream_step(cx, &view, 30 + k);
+            fluid_frame(cx, w, &view);
+            let (following, now) = view.read_with(cx, |v, _| (v.list.is_following_tail(), v.list.bounds_for_item(anchor).map(|b| b.top())));
+            assert!(!following, "{sev}: still scrolled back");
+            assert_eq!(now, top, "{sev}: the anchor row moved");
+        }
+    }
+    let kinds = kinds_of(cx, &view);
+    assert_eq!(kinds.iter().filter(|k| **k == ItemKind::Event).count(), 4, "one row per event");
+    assert_eq!(kinds.iter().filter(|k| **k == ItemKind::User).count(), users, "no user row");
+}
+
+/// An event row reads its source, sender, ASK and time; a long one folds
+/// to its first lines and opens on a click; and after it arrives the
+/// window goes idle (no frame, no timer but the rail's).
+#[gpui_kit::test]
+fn an_event_row_folds_and_goes_idle(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    let long = (1..=24).map(|i| format!("step {i} of the synthetic rollout")).collect::<Vec<_>>().join("\n");
+    event_in(cx, &view, external_frame("ev-fold", &format!("[comms] #12 ask from kestrel: {long}"), "High", true));
+    view.update(cx, |v, cx| {
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    let mut n = 0;
+    while motion_pending(cx, &view).0 && n < 400 {
+        fluid_frame(cx, w, &view);
+        n += 1;
+    }
+    settle(cx, w, 8);
+    let id = view.read_with(cx, |v, _| v.model.shown().items().last().map(|i| i.id)).unwrap();
+    for sel in ["event", "event-ask", "event-fold", "time"] {
+        assert!(drawn(cx, w, format!("{sel} {id}")).is_some(), "{sel} drawn");
+    }
+    let folded = drawn(cx, w, format!("event-text {id}")).unwrap();
+    let fold = drawn(cx, w, format!("event-fold {id}")).unwrap();
+    click_at(cx, w, gpui_kit::point(gpui_kit::px(fold[0] + 4.), gpui_kit::px(fold[1] + fold[3] / 2.)));
+    view.update(cx, |v, _| v.list.scroll_to_end());
+    settle(cx, w, 8);
+    let open_h = drawn(cx, w, format!("event-text {id}")).unwrap();
+    assert!(open_h[3] > folded[3] * 2., "opened: {open_h:?} vs {folded:?}");
+    assert!(view.read_with(cx, |v, _| v.toggled.contains(&id)));
+    let mut n = 0;
+    while motion_pending(cx, &view).0 && n < 400 {
+        fluid_frame(cx, w, &view);
+        n += 1;
+    }
+    assert!(settle(cx, w, 8) <= 2);
+    wait(cx, w, &view, crate::motion::GLOW.as_millis() as u64);
+    only_the_rail_spins(cx, w, &view, "after an event");
+}

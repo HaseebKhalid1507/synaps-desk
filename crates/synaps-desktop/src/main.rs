@@ -34,6 +34,7 @@ mod chrome;
 mod dash;
 mod demo;
 mod diag;
+mod events;
 mod favourites;
 mod files;
 mod fit;

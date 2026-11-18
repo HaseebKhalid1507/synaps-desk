@@ -1,0 +1,9 @@
+09:12:19 config sha before 9803b9f32386a39d96c9100699d06ad5c80afb4cdadc3abce4f4cf4ed0916b35; settings.json mtime 2026-11-18 09:00:46.749835656 -0500
+09:12:19 temp auth lines added: 2
+09:12:22 daemon pid 1561876
+09:13:02 main 20261118-141222-f223 side 20261118-141242-9950
+09:13:50 data done
+09:15:32 reload done
+09:15:45 config restored sha 9803b9f32386a39d96c9100699d06ad5c80afb4cdadc3abce4f4cf4ed0916b35 (before 9803b9f32386a39d96c9100699d06ad5c80afb4cdadc3abce4f4cf4ed0916b35), auth lines 0
+09:15:45 settings.json mtime 2026-11-18 09:13:15.954980176 -0500
+09:15:45 the setup daemon did not start: another desktopproto daemon (not this run's) held the lock; this run's two sessions were made on it and closed after; that daemon was left running
