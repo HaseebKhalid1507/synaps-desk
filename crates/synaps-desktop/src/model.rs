@@ -245,9 +245,12 @@ pub struct Named {
     pub pages: bool,
     /// The ask in flight, served by pages.
     page: Option<PageFetch>,
-    /// Connected, and no `Sessions` since: the first (the `Welcome`'s) is
-    /// not news to the first page asked on connecting.
-    welcome_sessions: bool,
+    /// The `(id, journal_id)` set of the last polled `Sessions` on this
+    /// connection (`None` until the first, the `Welcome`'s, which is not
+    /// news to the first page asked on connecting). Not `sessions`: an
+    /// attached swap writes its journal there at once, so the poll after a
+    /// `/clear` would agree with it and ask nothing.
+    polled: Option<HashSet<(String, String)>>,
     /// The named saved sessions (`named_only`, up to the wire's cap).
     pub saved: Vec<SavedSession>,
     /// The daemon has more named ones than that.
@@ -635,6 +638,20 @@ impl Model {
         if !self.saved_listing() {
             self.resolve_open(effects);
             self.prune_unread();
+        }
+    }
+
+    /// Pages: nothing pushes saved-list changes (no `session_watch`), so
+    /// any change in who is held since the last poll (a session ended,
+    /// resumed, compacted into a successor, swapped by `/clear`) asks for a
+    /// fresh first page, which replaces the list.
+    fn poll_held(&mut self, s: &[SessionMeta], effects: &mut Vec<Effect>) {
+        let now: HashSet<(String, String)> = s.iter().map(|s| (s.id.clone(), s.journal_id.clone())).collect();
+        let changed = self.named.pages && self.named.polled.as_ref().is_some_and(|p| *p != now);
+        self.named.polled = Some(now);
+        if changed {
+            self.named.named_stale = true;
+            self.refresh_saved(effects);
         }
     }
 
@@ -1459,6 +1476,7 @@ impl Model {
                 self.lists += 1;
                 self.sessions_listed = true;
                 sort_sessions(&mut s);
+                self.poll_held(&s, &mut effects);
                 // The poll of an idle daemon: nothing to rebuild or draw.
                 if s == self.sessions {
                     log::debug!(target: "synaps_desktop::sessions", "list {}: unchanged", self.lists);
@@ -1570,7 +1588,7 @@ impl Model {
                     // on local builds only) until it does not.
                     self.named.pages = features.iter().any(|f| f == FEATURE_SESSION_PAGE);
                     self.named.saved_supported = self.named.pages || features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
-                    self.named.welcome_sessions = true;
+                    self.named.polled = None;
                     self.named.named_stale = true;
                     if self.named.saved_supported {
                         self.refresh_saved(&mut effects);
@@ -1628,18 +1646,8 @@ impl Model {
                 self.tabs.listed(&s);
                 // A row leaving OPEN (closed, or evicted to history).
                 let left = self.sessions.iter().any(|o| !s.iter().any(|n| n.id == o.id));
-                // Pages: nothing pushes saved-list changes (no
-                // `session_watch`), so any change in who is held (a session
-                // ended, resumed, compacted into a successor) asks for a
-                // fresh first page, which replaces the list.
-                let held = |l: &[SessionMeta]| l.iter().map(|s| (s.id.clone(), s.journal_id.clone())).collect::<HashSet<_>>();
-                let changed = self.named.pages && held(&self.sessions) != held(&s);
-                let welcome = std::mem::take(&mut self.named.welcome_sessions);
                 self.sessions = s;
-                if changed && !welcome {
-                    self.named.named_stale = true;
-                    self.refresh_saved(&mut effects);
-                } else if left && !self.named.pages {
+                if left && !self.named.pages {
                     self.refresh_saved(&mut effects);
                 }
                 if !self.named.saved_supported {
