@@ -1979,6 +1979,44 @@ mod tests {
         assert_eq!(m.apply(Event::Sessions(metas(json!([s("y")])))), first(), "the poll that agrees still asks");
     }
 
+    /// Review F3: OLDER closed with find empty drops back to the newest
+    /// page for later refreshes; so does connecting, unless OLDER is open
+    /// or find has text.
+    #[test]
+    fn deep_ends_when_older_closes_and_on_connecting() {
+        use crate::model::Effect;
+        let rows = saved_rows(201, 60);
+        // A refresh's first page, full and cut: deep asks on; shallow lands
+        // (and, cut, asks for the named list).
+        fn deep_after(m: &mut Model, req: u64, rows: &[Value]) -> bool {
+            m.page_sent(req);
+            let fx = m.apply(page(req, json!(rows[..200]), Some(&rows[199])));
+            match fx.as_slice() {
+                [Effect::CatalogPage { before: Some(_), named_only: false, .. }] => true,
+                [Effect::CatalogPage { before: None, named_only: true, .. }] => false,
+                other => panic!("{other:?}"),
+            }
+        }
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        assert!(!deep_after(&mut m, 1, &rows));
+        m.deep_wanted(true);
+        m.want_deep();
+        assert!(m.named.deep);
+        m.deep_wanted(false);
+        assert!(!m.named.deep, "OLDER closed, find empty");
+        // Deep, then a reconnect with neither OLDER nor find: shallow.
+        m.want_deep();
+        m.apply(Event::Status(Status::Reconnecting { why: "x".into() }));
+        m.apply(connected(&["session_page"]));
+        assert!(!deep_after(&mut m, 2, &rows), "connecting drops deep");
+        // OLDER open across a reconnect: deep from the start.
+        m.deep_wanted(true);
+        m.apply(Event::Status(Status::Reconnecting { why: "x".into() }));
+        m.apply(connected(&["session_page"]));
+        assert!(deep_after(&mut m, 3, &rows), "OLDER open: the cap");
+    }
+
     /// A page reply after a reconnect, to a `req` asked on the old
     /// connection, is dropped: only the page asked since lands.
     #[test]
