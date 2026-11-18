@@ -7572,6 +7572,11 @@ fn favourites_fold_keeping_a_busy_one_leaves_no_gap(cx: &mut TestAppContext) {
     let body =
         view.read_with(cx, |v, _| v.rail.rail.items[head + 1..].iter().take_while(|i| matches!(i, crate::rail::Item::Row(_))).count());
     assert!(body >= 3, "three favourites under the head ({body})");
+    // The one it keeps, as drawn (its star: only a drawn row has one).
+    let key = view.read_with(cx, |v, _| crate::chrome::row_key(&v.rail.rail, &v.rail.rail.items[head + 2]).expect("a row"));
+    let star = format!("star {key}");
+    let star_y = |cx: &mut TestAppContext| drawn(cx, w, star.clone()).map(|b| b[1]);
+    let mut stars = vec![star_y(cx).expect("its star drawn")];
     catch_up(cx, &view);
     view.update(cx, |v, cx| v.toggle_favs_group(cx));
     cx.run_until_parked();
@@ -7594,10 +7599,13 @@ fn favourites_fold_keeping_a_busy_one_leaves_no_gap(cx: &mut TestAppContext) {
             let ky: f32 = g.items.iter().zip(&shown).take_while(|(i, _)| !i.0).map(|(_, s)| s).sum();
             kept_y.push(y + ky);
             ghosts += 1;
-        })
+        });
+        stars.push(star_y(cx).expect("the kept one drawn in every frame"));
     };
     check(cx);
     let frames = fly(cx, w, &view, 400, &mut check);
+    let most = stars.windows(2).fold(0f32, |m, p| m.max((p[1] - p[0]).abs()));
+    assert!(stars.windows(2).all(|p| p[1] <= p[0] + 1e-3) && most < 8., "the kept one rises as drawn, never jumps: {stars:?}");
     assert!(frames > 30 && ghosts > 30, "{frames} frames, {ghosts} with the body drawn");
     assert!(kept_y.windows(2).all(|p| p[1] <= p[0] + 1e-3), "the kept one only rises: {kept_y:?}");
     view.read_with(cx, |v, _| {

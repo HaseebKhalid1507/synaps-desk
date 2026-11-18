@@ -1445,10 +1445,13 @@ impl AppView {
             let at = place(f.start).map(|(t, h)| t + h).or_else(|| place(f.after).map(|(t, _)| t - g.kept()));
             let h = g.kept() + f.o;
             if let Some(y) = at.filter(|&y| y < view_h && y + h > 0.) {
+                // What goes takes only what it shows (laid out at it, drawn
+                // down to it): what stays rises with what follows.
                 let shown = g.shown(f.o);
-                let rows = v_flex()
-                    .w_full()
-                    .children(g.body.clone().zip(shown).map(|(ix, s)| crate::motion::clip_h(self.render_rail_item_in(&g.rail, ix, cx), s)));
+                let rows = v_flex().w_full().children(g.body.clone().zip(shown).zip(&g.items).map(|((ix, s), &(kept, _))| {
+                    let el = self.render_rail_item_in(&g.rail, ix, cx);
+                    if kept { el } else { div().w_full().flex_none().h(px(s)).child(crate::motion::clip_h(el, s)).into_any_element() }
+                }));
                 drawn.push((crate::motion::clip_h(rows.into_any_element(), h), y, y + h));
                 ghost_at = Some((y, h, g.body.len()));
             }
