@@ -88,6 +88,9 @@ struct Opts {
     /// With `pages`: every page reply is a `catalog_page` that does not
     /// decode (`sessions` not a list).
     malformed: bool,
+    /// With `pages`: before each page reply, a req-less `Error` that is not
+    /// the page's; a `before` of `"bad"` is answered `malformed frame`.
+    noise: bool,
 }
 
 /// The fake's saved sessions, newest first: five rows, the third named.
@@ -223,6 +226,15 @@ impl Fake {
                                     "message": "malformed frame: unknown variant `saved_sessions`"}),
                                 )
                                 .await;
+                            }
+                            Some("catalog_page") if opts.pages && opts.noise && f["before"] == "bad" => {
+                                write(&w, json!({"type": "error", "session_id": null, "message": "malformed frame: invalid type: string \"bad\""}))
+                                    .await;
+                            }
+                            Some("catalog_page") if opts.pages && opts.noise => {
+                                write(&w, json!({"type": "error", "session_id": null, "message": "config reload: theme file unreadable"}))
+                                    .await;
+                                write(&w, catalog_reply(&f)).await;
                             }
                             Some("catalog_page") if opts.pages && opts.malformed => {
                                 write(&w, json!({"type": "catalog_page", "req": f["req"], "sessions": "not a list"})).await;
@@ -1555,6 +1567,36 @@ async fn an_undecodable_page_fails_the_oldest_page() {
     .await;
     assert_eq!(got, req);
     assert!(reason.contains("did not decode"), "{reason}");
+    client.shutdown().unwrap();
+}
+
+/// Review F5: a req-less `Error` is charged to a page only if it is
+/// `malformed frame` (a `before` the daemon could not parse) or names
+/// `catalog_page`; any other leaves the page waiting for its reply.
+#[tokio::test]
+async fn a_reqless_error_fails_a_page_only_if_it_is_the_pages() {
+    let mut fake = Fake::start_with("pages-noise", Opts { pages: true, noise: true, ..Default::default() }).await;
+    let (client, events) = fake.client();
+    connected(&events).await;
+    let req = client.catalog_page(None, 50, false).unwrap();
+    fake.next_control().await;
+    let got = wait(&events, "the page or its failure", |e| match e {
+        Event::CatalogPage { req, .. } => Some(Ok(*req)),
+        Event::CatalogPageFailed { req, reason } => Some(Err((*req, reason.clone()))),
+        _ => None,
+    })
+    .await;
+    assert_eq!(got, Ok(req), "another error is not the page's");
+    let bad = synaps_client::CatalogCursor(json!("bad"));
+    let req = client.catalog_page(Some(bad), 50, false).unwrap();
+    fake.next_control().await;
+    let (got, reason) = wait(&events, "failed", |e| match e {
+        Event::CatalogPageFailed { req, reason } => Some((*req, reason.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(got, req);
+    assert!(reason.starts_with("malformed frame"), "{reason}");
     client.shutdown().unwrap();
 }
 

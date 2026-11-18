@@ -1293,18 +1293,24 @@ async fn control_loop(sh: Shared, mut ctl: mpsc::UnboundedReceiver<Ctl>, poll: O
                     }
                     // A control `Error` answers the oldest pending request:
                     // an older daemon's "malformed frame: unknown variant".
-                    // It carries no `req`: a page is its target only when it
-                    // names `catalog_page` or no in-order request waits.
+                    // It carries no `req`. A page answers with
+                    // `catalog_page{error}`; the only req-less error a page
+                    // can cause is a `before` the daemon could not parse
+                    // ("malformed frame"), so a page is its target only then
+                    // (no in-order request waiting) or when it names
+                    // `catalog_page`. Any other error leaves pages pending.
                     Ok(Some(DaemonFrame::Error { session_id: None, message })) if !pending.is_empty() => {
                         let unknown = message.contains("unknown variant");
-                        let page = message.contains("catalog_page") || pending.iter().all(|p| matches!(p, Pending::Catalog(_)));
+                        let in_order = pending.iter().any(|p| !matches!(p, Pending::Catalog(_)));
+                        let page = message.contains("catalog_page") || (message.starts_with("malformed frame") && !in_order);
                         let p = if page {
                             take_pending(&mut pending, |p| matches!(p, Pending::Catalog(_)))
                         } else {
                             take_pending(&mut pending, |p| !matches!(p, Pending::Catalog(_)))
-                        }
-                        .or_else(|| pending.pop_front());
+                        };
                         match p {
+                            // Not a reply to anything waiting (pages stay pending).
+                            None => {}
                             Some(Pending::Catalog(req)) => emit(events, Event::CatalogPageFailed { req, reason: message }),
                             Some(Pending::Rename(sid)) => {
                                 let r = if unknown { RenameRefusal::Unsupported } else { RenameRefusal::Failed };
