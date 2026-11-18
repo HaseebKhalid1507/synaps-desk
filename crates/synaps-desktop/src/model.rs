@@ -229,12 +229,30 @@ struct PageFetch {
     /// The page on its way, once sent: a reply with another `req` (asked on
     /// a connection since dropped, or by another fetch) is not this one's.
     req: Option<u64>,
+    /// Pages asked for, and the `before` of the last: the loop's own bound
+    /// (a daemon that kept sending `next` with no rows kept, or the same
+    /// `next`, would otherwise be asked forever).
+    pages: usize,
+    before: Option<CatalogCursor>,
 }
 
 impl PageFetch {
-    fn effect(&self, before: Option<CatalogCursor>) -> Effect {
+    fn new(named_only: bool, want: usize) -> Self {
+        PageFetch { named_only, want, rows: Vec::new(), rejected: 0, req: None, pages: 0, before: None }
+    }
+
+    fn ask(&mut self, before: Option<CatalogCursor>) -> Effect {
         let limit = (self.want - self.rows.len()).min(CATALOG_PAGE_MAX as usize) as u32;
+        self.req = None;
+        self.pages += 1;
+        self.before = before.clone();
         Effect::CatalogPage { before, limit, named_only: self.named_only }
+    }
+
+    /// Ask on from `next`? Not past the ask's rows, nor past `want / 200 +
+    /// 2` pages, nor from the cursor just sent.
+    fn more(&self, next: &CatalogCursor) -> bool {
+        self.rows.len() < self.want && self.pages < self.want / CATALOG_PAGE_MAX as usize + 2 && self.before.as_ref() != Some(next)
     }
 }
 
@@ -566,8 +584,8 @@ impl Model {
                     SavedAsk::Named => (true, SAVED_SESSIONS_MAX),
                     SavedAsk::Recent(limit) => (false, limit),
                 };
-                let f = PageFetch { named_only, want: want.max(1) as usize, rows: Vec::new(), rejected: 0, req: None };
-                effects.push(f.effect(None));
+                let mut f = PageFetch::new(named_only, want.max(1) as usize);
+                effects.push(f.ask(None));
                 n.page = Some(f);
                 return;
             }
@@ -701,10 +719,7 @@ impl Model {
         f.rows.extend(sessions.iter().filter(|s| s.is_saved()).map(SessionMeta::to_saved));
         f.rejected += rejected;
         match next {
-            Some(c) if f.rows.len() < f.want => {
-                f.req = None;
-                effects.push(f.effect(Some(c)));
-            }
+            Some(c) if f.more(&c) => effects.push(f.ask(Some(c))),
             next => {
                 let Some(mut f) = n.page.take() else { return };
                 let truncated = next.is_some() || f.rows.len() > f.want;
