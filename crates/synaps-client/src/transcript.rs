@@ -500,6 +500,19 @@ impl Transcript {
         end
     }
 
+    /// The engine dropped the events it held, with the conversation they
+    /// were for (a `/clear`, Shady #22 N10; a `/resume`, N10′): so their
+    /// rows, the held run at the end.
+    fn drop_held(&mut self) {
+        let run = self.live_end();
+        if run < self.items.len() {
+            self.items.truncate(run);
+            self.mark(run);
+        }
+        self.pending.clear();
+        self.stuck.clear();
+    }
+
     /// Every event not delivered yet is (a turn started, ended or was
     /// aborted: the engine has put them in the conversation), but those it
     /// kept ([`Transcript::stuck`]): their rows stay where they are, and
@@ -1233,14 +1246,7 @@ impl Transcript {
             }
             SessionEvent::Ended { reason } => self.notice(ItemKind::Notice, format!("session ended ({reason})")),
             SessionEvent::Cleared { session_id } => {
-                // The engine drops the events it held (Shady #22 N10).
-                let run = self.live_end();
-                if run < self.items.len() {
-                    self.items.truncate(run);
-                    self.mark(run);
-                }
-                self.pending.clear();
-                self.stuck.clear();
+                self.drop_held();
                 self.journal_id.clone_from(session_id);
                 // Clearing an empty conversation changes nothing: its digest
                 // matches, no replacement follows to consume the flag, and
@@ -1249,6 +1255,7 @@ impl Transcript {
                 self.notice(ItemKind::Notice, "conversation cleared");
             }
             SessionEvent::Resumed { new_id, clamp_notice, .. } => {
+                self.drop_held();
                 self.swapped = true;
                 self.journal_id.clone_from(new_id);
                 self.notice(ItemKind::Notice, format!("resumed {new_id}"));

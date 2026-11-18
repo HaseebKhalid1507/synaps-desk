@@ -16,8 +16,11 @@ Engine events (synaps-desk `feat/events`). Additive; one behaviour change for hi
   - Tests: `tests/events.rs` mid text stream, mid thinking then a tool round, held through a turn with mid-turn appends, a reset during the hold, `never_persist`, reused ids, re-attach and replacement, L1, L2; `events::tests` data lines, `local_only`, sender sanitising, `Debug`.
 - Round 3 (Shady #22 re-review):
   - `ExternalEvent::history` and `::shown` read the form with `from_payload` (no data hint): a text whose last line is a JSON `Data:` line reads as text plus that data everywhere, live and history alike (one identity). The 1000-character cut is text (no longer dropped). New `ExternalEvent::data_text` (`Data: {json}`, the line the agent reads).
-  - New `pending_events_len` on `ConversationDigest` and `ConversationSnapshot` (`serde(default)`; 0.11.1 sends it).
+  - New `pending_events_len` on `ConversationDigest` and `ConversationSnapshot` (`serde(default)`; sent since v0.10.0).
   - **Behaviour:** after a failed turn (a stream `error`, or a stream that ends with no end), a failed or cancelled compaction, or an attach with no turn running while the engine holds events, the held event rows stay held (the engine flushes them at the next turn's end) until their message lands, `steering_delivered`, or a digest with `pending_events_len == 0`. `Cleared` drops held event rows. An attach with no turn running delivers the rest (a `never_persist` row is placed). A history row matches a frame by form only during an attach's replay (outside one, a frame after a row with its form is another event). Held rows match their messages by exact form first, then by id (never a `never_persist` row).
+- Round 4 (Shady #22 round 3):
+  - `from_payload`: a last `Data:` line is data only if it is `serde_json::to_string` of the JSON it parses to, character for character, and at most 1000 characters; any other (a longer line, duplicate keys, other spacing, an escape such as `\u202e`) is a line of the text, as written. So `data_text` of a shown or history event is the line the agent reads, exactly. The body and the attribute values are read through the form's sanitiser (a no-op on an engine-written form).
+  - **Behaviour:** `Resumed` drops held event rows, as `Cleared` does.
 
 For synaps-avatar (nyx): nothing breaks (`ItemKind` and `SessionEvent` are `#[non_exhaustive]`); history events now come as `ItemKind::Event` rather than `Notice`.
 
