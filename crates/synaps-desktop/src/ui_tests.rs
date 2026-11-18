@@ -1388,7 +1388,22 @@ fn a_body_at_the_end_keeps_its_row_put(cx: &mut TestAppContext) {
             fluid_frame(cx, w, &view);
             ys.push(top(cx) - at);
         }
-        assert!(ys.iter().all(|d| d.abs() <= 0.5), "{}: its row's offsets {ys:?}", if open { "opening" } else { "closing" });
+        if open {
+            // Its row holds as it opens; landed under the view's bottom, the
+            // list glides just far enough to show its first three lines,
+            // the row still on screen (the design gate of #23 r3, S1).
+            let lines = view.read_with(cx, |_, cx| 3. * crate::theme::metrics(cx).body_line);
+            assert!(ys.windows(2).all(|p| p[1] <= p[0] + 0.5 && p[0] - p[1] <= 13.), "opening: held, or a glide up: {ys:?}");
+            assert!(ys.iter().all(|d| *d <= 0.5 && *d >= -(lines + 1.)), "opening: three lines at most: {ys:?}");
+            let (vt, vb) =
+                view.read_with(cx, |v, _| (f32::from(v.list.viewport_bounds().top()), f32::from(v.list.viewport_bounds().bottom())));
+            assert!(top(cx) >= vt, "opening: its row on screen");
+            let body = VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("well {id}"))).expect("its body");
+            assert!(f32::from(body.top()) < vb - 40., "opening: its first lines in sight ({body:?}, the view's bottom {vb})");
+        } else {
+            assert!(ys.iter().all(|d| d.abs() <= 0.5), "closing: its row's offsets {ys:?}");
+        }
+        assert_eq!(well(cx), open, "it toggled (Shady #23 r3 n3)");
     }
 }
 
@@ -1439,6 +1454,31 @@ fn fold_frames_hitched(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entit
         }
     }
     (step, gapped)
+}
+
+/// [`fold_frames`], and how far the list's last row's bottom moved (the
+/// end holds at a turn's end: Shady #23 r3 L9).
+fn fold_frames_end(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> (f32, usize, f32) {
+    let end =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.list.bounds_for_item(v.list.item_count() - 1).map(|b| f32::from(b.bottom())));
+    let mut last = row_tops(cx, view);
+    let (mut step, mut gapped, mut moved_end) = (0f32, 0, 0f32);
+    let e0 = end(cx);
+    for _ in 0..600 {
+        fluid_frame(cx, w, view);
+        let now = row_tops(cx, view);
+        step = now.iter().filter_map(|(k, y)| last.get(k).map(|y0| (y - y0).abs())).fold(step, f32::max);
+        last = now;
+        if let (Some(a), Some(b)) = (e0, end(cx)) {
+            moved_end = moved_end.max((b - a).abs());
+        }
+        if VisualTestContext::from_window(w, cx).debug_bounds("fold-gap").is_some() {
+            gapped += 1;
+        } else if gapped > 0 {
+            break;
+        }
+    }
+    (step, gapped, moved_end)
 }
 
 /// A turn of `n` finished calls at the list's end, then its end: the run
@@ -1527,10 +1567,11 @@ fn a_run_folds_on_a_spring_never_a_cut(cx: &mut TestAppContext) {
         });
         cx.run_until_parked();
         assert!(VisualTestContext::from_window(w, cx).debug_bounds("fold-gap").is_some(), "{n} calls: the room held, not cut");
-        let (step, gapped) = fold_frames(cx, w, &view);
+        let (step, gapped, end) = fold_frames_end(cx, w, &view);
         assert!(step <= 13., "{n} calls at the turn's end: a row moved {step} px in one frame");
         assert!(gapped >= 20, "{n} calls at the turn's end: {gapped} frames");
         assert!(!tops.is_empty());
+        assert!(end <= 0.5, "{n} calls at the turn's end: the end moved {end} px (Shady #23 r3 L9)");
         if n == 5 {
             // Clicked at the list's end: unfolded, then folded; its header
             // holds (the room past the end is held).
@@ -1583,6 +1624,29 @@ fn a_run_folds_on_a_spring_never_a_cut(cx: &mut TestAppContext) {
             assert_eq!(now, Some(at), "hitched: the header holds");
             assert!(step <= 32., "hitched: a row moved {step} px in one frame");
             assert!(gapped >= 20, "hitched: {gapped} frames");
+            // The design gate of #23 r3, N3: unfolded as the list is sent to
+            // its end (the bench's click), its rows reveal under the view
+            // (the unfold's hold). Folded there, the header holds too: the
+            // rows past the view's bottom go with the splice, not the room.
+            view.update(cx, |v, cx| {
+                v.toggle_run(last);
+                v.list.scroll_to_end();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            for _ in 0..240 {
+                fluid_frame(cx, w, &view);
+            }
+            let at = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top())).expect("its header");
+            let under = view.read_with(cx, |v, _| {
+                f32::from(v.list.max_offset_for_scrollbar().y) + f32::from(v.list.scroll_px_offset_for_scrollbar().y)
+            });
+            flip(cx);
+            let (step, gapped) = fold_frames(cx, w, &view);
+            let now = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top()));
+            assert_eq!(now, Some(at), "its rows under the view ({under} px): the header holds");
+            assert!(step <= 13., "rows under the view: a row moved {step} px in one frame");
+            assert!(gapped >= 10, "rows under the view: {gapped} frames");
         }
     }
     // Reduced and Off: a cut, the header where it was.
@@ -2204,21 +2268,265 @@ fn the_held_room_never_bobs_or_drops(cx: &mut TestAppContext) {
         }
     }
     assert!(held > 30, "the output grew into the room ({held} frames)");
-    // A scroll up within what is left (if any): on `sheet`, never a drop.
-    let left = view.read_with(cx, |v, _| v.tail_slack());
+    // The user's scroll up within what is left (if any): the room stays,
+    // in sight, as content (Shady #23 r3 H2): nothing moves but the scroll,
+    // never a drop and never a slide.
+    let left = view.read_with(cx, |v, _| if v.fold_slack.get().is_some() { v.tail_slack() } else { 0. });
     if left > 41. {
+        let at = top(cx);
         view.update(cx, |v, cx| {
+            v.scroller.touch();
             v.list.scroll_by(px(-40.));
             cx.notify();
         });
-        let mut y0 = top(cx);
+        fluid_frame(cx, w, &view);
+        let y0 = top(cx);
+        assert!((y0 - at - 40.).abs() <= 0.5, "the scroll moved the row 40 px: {at} -> {y0}");
         for _ in 0..200 {
             fluid_frame(cx, w, &view);
             let y = top(cx);
-            assert!((y - y0).abs() <= 17., "scrolled up: the row moved {} px in one frame", y - y0);
-            y0 = y;
+            assert!((y - y0).abs() <= 0.5, "scrolled up: the row moved {y0} -> {y}");
         }
     }
+}
+
+/// Shady #23 r3 H2, M1 and L4: only the user's scroll leaves the end, by
+/// however little a frame. With the room an answered card left held at the
+/// end, at 1× and 125 %:
+/// - output growing into it moves nothing (the row's total move, not a
+///   frame's, within a device pixel);
+/// - a touchpad's 0.5 px a frame up, while output grows, never sends the
+///   list back toward its end;
+/// - stopped there, output goes on and the reader stays where they are.
+#[gpui_kit::test]
+fn a_slow_scroll_leaves_the_end_and_nothing_brings_it_back(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseMoveEvent, ScrollDelta, ScrollEvent, ScrollSource, TouchPhase, point};
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    for scale in [1f32, 1.25] {
+        let (w, view, _events) = open(cx);
+        if scale != 1. {
+            VisualTestContext::from_window(w, cx).simulate_scale_factor_change(scale);
+        }
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| {
+            v.client = None;
+            v.model.transcript.set_busy(true);
+        });
+        settle(cx, w, 8);
+        let (tool, id) = view.read_with(cx, |v, _| {
+            let d = v.disp.iter().find(|d| d.kind == crate::turns::Kind::Prompt).expect("the demo's card");
+            let i = &v.model.transcript.items()[d.item];
+            (i.tool.as_ref().expect("the card's call").tool_id.clone(), i.id)
+        });
+        resolve_prompt(cx, &view);
+        wait(cx, w, &view, 1000);
+        assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "{scale}: the room it left, held");
+        let line = |cx: &mut TestAppContext, k: usize| {
+            view.update(cx, |v, cx| {
+                v.model.transcript.apply(&SessionEvent::Stream {
+                    event: StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: tool.clone(), delta: format!("line {k}\n") }),
+                });
+                v.sync_list();
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        let row = |cx: &mut TestAppContext| {
+            VisualTestContext::from_window(w, cx)
+                .debug_bounds(String::leak(format!("tool-row {id}")))
+                .map(|b| f32::from(b.top()))
+                .expect("the answered row")
+        };
+        let offset = |cx: &mut TestAppContext| view.read_with(cx, |v, _| -f32::from(v.list.scroll_px_offset_for_scrollbar().y));
+        let at = row(cx);
+        for k in 0..2 {
+            line(cx, k);
+            for f in 0..20 {
+                fluid_frame(cx, w, &view);
+                let y = row(cx);
+                assert!((y - at).abs() <= 0.85, "{scale}: line {k}, frame {f}: the row {at} -> {y}, no one scrolled");
+            }
+        }
+        assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "{scale}: still held");
+        let center = view.read_with(cx, |v, _| v.list.viewport_bounds().center());
+        event(cx, w, PlatformInput::MouseMove(MouseMoveEvent { position: center, pressed_button: None, modifiers: Modifiers::default() }));
+        let wheel = |cx: &mut TestAppContext| {
+            event(
+                cx,
+                w,
+                PlatformInput::Scroll(ScrollEvent {
+                    position: center,
+                    delta: ScrollDelta::Pixels(point(px(0.), px(0.5))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Moved,
+                    source: ScrollSource::Pointer,
+                }),
+            )
+        };
+        let (start, mut o0) = (offset(cx), offset(cx));
+        for f in 0..240 {
+            if f % 12 == 0 {
+                line(cx, 10 + f);
+            }
+            wheel(cx);
+            fluid_frame(cx, w, &view);
+            let o = offset(cx);
+            assert!(o <= o0 + 0.01, "{scale}: frame {f} of the scroll: the list went {o0} -> {o}, toward its end");
+            o0 = o;
+        }
+        assert!(start - o0 > 60., "{scale}: it scrolled up ({start} -> {o0})");
+        for f in 0..240 {
+            if f % 12 == 0 {
+                line(cx, 300 + f);
+            }
+            fluid_frame(cx, w, &view);
+            let o = offset(cx);
+            assert!(o <= o0 + 0.01, "{scale}: frame {f} after the scroll: the list went {o0} -> {o}, toward its end");
+            o0 = o;
+        }
+        let (o, max) = view
+            .read_with(cx, |v, _| (-f32::from(v.list.scroll_px_offset_for_scrollbar().y), f32::from(v.list.max_offset_for_scrollbar().y)));
+        assert!(max - o > crate::app::END_SLOP, "{scale}: never back at the end ({o} of {max})");
+        let still = offset(cx);
+        for _ in 0..30 {
+            fluid_frame(cx, w, &view);
+        }
+        assert!((offset(cx) - still).abs() <= 0.01, "{scale}: at rest, the reader stays put");
+    }
+}
+
+/// Shady #23 r3 H1: a fold's held room, a fold in flight and a body's hold
+/// are their list's. Fold the last run at the end of one tab (landed, then
+/// mid-fold) and go to another: none of it comes along, and the other
+/// tab's last row holds still.
+#[gpui_kit::test]
+fn a_held_room_stays_with_its_list(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    resolve_prompt(cx, &view);
+    open_idle_cpu(cx, &view, crate::tabs::Place::New);
+    settle(cx, w, 8);
+    let last = view.read_with(cx, |v, _| v.disp.iter().rev().find(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id));
+    let last = last.expect("the last run");
+    let flip = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| {
+            v.toggle_run(last);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let focus = |cx: &mut TestAppContext, ix: usize| {
+        view.update(cx, |v, cx| {
+            v.focus_tab(ix);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    for landed in [true, false] {
+        flip(cx);
+        for _ in 0..240 {
+            fluid_frame(cx, w, &view);
+        }
+        view.update(cx, |v, cx| {
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        for _ in 0..8 {
+            fluid_frame(cx, w, &view);
+        }
+        flip(cx);
+        if landed {
+            fold_frames(cx, w, &view);
+            assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "the fold's room, held at the end");
+        } else {
+            for _ in 0..4 {
+                fluid_frame(cx, w, &view);
+            }
+            assert!(view.read_with(cx, |v, _| !v.fold_gap.borrow().is_empty()), "folding");
+        }
+        focus(cx, 0);
+        assert!(
+            view.read_with(cx, |v, _| v.fold_slack.get().is_none() && v.fold_gap.borrow().is_empty() && v.body_hold.get().is_none()),
+            "landed {landed}: nothing of the other list's"
+        );
+        fluid_frame(cx, w, &view);
+        let end = |cx: &mut TestAppContext| {
+            view.read_with(cx, |v, _| v.list.bounds_for_item(v.list.item_count() - 1).map(|b| f32::from(b.bottom())).expect("its last row"))
+        };
+        let at = end(cx);
+        for f in 0..60 {
+            fluid_frame(cx, w, &view);
+            let mut vcx = VisualTestContext::from_window(w, cx);
+            assert!(
+                vcx.debug_bounds("fold-slack").is_none() && vcx.debug_bounds("fold-gap").is_none(),
+                "landed {landed}, frame {f}: a room"
+            );
+            let y = end(cx);
+            assert!((y - at).abs() <= 0.5, "landed {landed}, frame {f}: the last row {at} -> {y}");
+        }
+        focus(cx, 1);
+        settle(cx, w, 8);
+        if !landed {
+            break;
+        }
+        // Unfolded again for the fold in flight.
+    }
+}
+
+/// Shady #23 r3 M2: a second fold during a fold never cuts the first: each
+/// run's room closes on its own spring (no row moves more than the two
+/// springs' sum in a frame), and the first header holds.
+#[gpui_kit::test]
+fn two_folds_at_once_close_each_on_its_own(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1440., 1400.), crate::theme::Panels::default().text_size);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    settle(cx, w, 8);
+    let runs: Vec<u64> =
+        view.read_with(cx, |v, _| v.disp.iter().filter(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id).collect());
+    assert!(runs.len() >= 2, "two runs");
+    let (a, b) = (runs[runs.len() - 2], runs[runs.len() - 1]);
+    let flip = |cx: &mut TestAppContext, id: u64| {
+        view.update(cx, |v, cx| {
+            v.toggle_run(id);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    flip(cx, a);
+    flip(cx, b);
+    for _ in 0..240 {
+        fluid_frame(cx, w, &view);
+    }
+    view.update(cx, |v, cx| {
+        let ix = v.disp.iter().position(|d| d.id == a).expect("a's header");
+        v.list.scroll_to(gpui::ListOffset { item_ix: ix, offset_in_item: gpui_kit::px(0.) });
+        v.list.scroll_by(gpui_kit::px(-40.));
+        cx.notify();
+    });
+    for _ in 0..8 {
+        fluid_frame(cx, w, &view);
+    }
+    let header = |cx: &mut TestAppContext, id: u64| {
+        VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("run-summary {id}"))).map(|b| f32::from(b.top()))
+    };
+    let ya = header(cx, a).expect("a's header on screen");
+    let vb = view.read_with(cx, |v, _| f32::from(v.list.viewport_bounds().bottom()));
+    assert!(header(cx, b).is_some_and(|y| y < vb - 60.), "b's header on screen too");
+    flip(cx, a);
+    for _ in 0..3 {
+        fluid_frame(cx, w, &view);
+    }
+    flip(cx, b);
+    assert_eq!(view.read_with(cx, |v, _| v.fold_gap.borrow().len()), 2, "both rooms closing");
+    // Rows under both rooms move by the two springs' sum: a cut of the
+    // first's would be its room left, in one frame.
+    let (step, gapped) = fold_frames(cx, w, &view);
+    assert!(step <= 26., "two folds: a row moved {step} px in one frame");
+    assert!(gapped >= 20, "two folds: {gapped} frames");
+    assert_eq!(header(cx, a), Some(ya), "the first header holds");
 }
 
 /// Shady #23 r2b L1: at 125 % GPUI snaps rows to device pixels (0.8 px), so
@@ -2286,6 +2594,7 @@ fn the_end_and_the_held_room_at_125_percent(cx: &mut TestAppContext) {
             if view.read_with(cx, |v, _| v.fold_slack.get().is_some()) {
                 let y = top(cx);
                 assert!((y - y0).abs() <= 0.85, "125 %, line {k}: the answered row moved {y0} -> {y} in one frame (from {at})");
+                assert!((y - at).abs() <= 0.85, "125 %, line {k}: the answered row crept {at} -> {y}");
                 y0 = y;
             }
         }
@@ -2309,6 +2618,31 @@ fn needs_you_is_the_plus_and_pings_once(cx: &mut TestAppContext) {
     assert!(k.is_none(), "the prompt was there before: history never pings");
     settle(cx, w, 8);
     assert!(!motion_pending(cx, &view).0, "still: no frame");
+    // Shady #23 r3 L8: a prompt coming in while watched pings, the strip's
+    // attention and the tray's stub on the one instant, then holds still.
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert!(view.read_with(cx, |v, _| crate::glyph::needs_ping(&v.fx, false)).is_none());
+    raise(cx, &view, 41);
+    fluid_frame(cx, w, &view);
+    fluid_frame(cx, w, &view);
+    let k = view.read_with(cx, |v, _| crate::glyph::needs_ping(&v.fx, true));
+    assert!(k.is_some_and(|k| k > 0. && k < 1.), "a prompt in while watched: a ping ({k:?})");
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    let (strip, stub) = (vcx.debug_bounds("attention"), vcx.debug_bounds("needs-stub"));
+    // Both read the one instant (`needs_ping`'s key): together by construction.
+    assert!(strip.is_some() || stub.is_some(), "the strip's attention or the stub draws it");
+    assert!(motion_pending(cx, &view).0, "pinging: frames");
+    let mut frames = 0;
+    while view.read_with(cx, |v, _| crate::glyph::needs_ping(&v.fx, true)).is_some() {
+        fluid_frame(cx, w, &view);
+        frames += 1;
+        assert!(frames < 200, "the ping ends");
+    }
+    for f in 0..300 {
+        fluid_frame(cx, w, &view);
+        assert!(view.read_with(cx, |v, _| crate::glyph::needs_ping(&v.fx, true)).is_none(), "frame {f}: it pinged once");
+    }
 }
 
 /// Shady #23 r2 L1: the Outline Allow draws, charged in `acc_line`, and

@@ -362,35 +362,25 @@ pub(crate) fn spin(g: Glyph, beat: Option<u32>, mark: Hsla, ground: Hsla) -> Div
     crate::lattice::el(10., crate::lattice::Dots::of(pose), crate::lattice::code(pose), mark, ground)
 }
 
-/// `Needs`' inner cell in its box: x, y, side.
-pub(crate) const BREATH_CELL: (f32, f32, f32) = (3., 3., 4.);
-
-/// The breathing cell's colour `step` beats in: between `mark` and
-/// `mix(mark, ground, 0.6)`, 19 beats a cycle.
-pub(crate) fn breath_cell(step: u32, mark: Hsla, ground: Hsla) -> Hsla {
+/// `Needs` breathing `step` beats in (motion.md §6.3), in its lattice
+/// plus (the design gate of #23, S3; Shady #23 r3 L7): its centre dot
+/// between lit and 40 % of it (`mix(mark, ground, 0.6)`), 19 beats a cycle.
+pub(crate) fn breath_dots(step: u32) -> crate::lattice::Dots {
     let n = crate::motion::BREATH_BEATS;
     let f = 1. - ((2 * (step % n)) as f32 / n as f32 - 1.).abs();
-    crate::motion::mix(mark, ground, 0.6 * f)
+    let mut d = crate::lattice::Dots::of(crate::lattice::pose(crate::lattice::Pat::Needs, None));
+    d.a[4] *= 1. - 0.6 * f;
+    d
 }
 
-/// `Needs` breathing (motion.md §6.3): `step` beats since the prompt came,
-/// the inner cell between `mark` and `mix(mark, ground, 0.6)`, 19 beats a
-/// cycle, three cycles, then held at `mark`. `None`: still.
+/// `Needs` breathing: `step` beats since the prompt came, three cycles,
+/// then the still plus ([`breath_dots`]). `None`: still.
 pub(crate) fn breath(step: Option<u32>, mark: Hsla, ground: Hsla) -> AnyElement {
     let Some(s) = step.filter(|s| *s < crate::motion::BREATH_BEATS * crate::motion::BREATHS) else {
         return draw(Glyph::Needs, mark);
     };
-    breath_box(breath_cell(s, mark, ground), mark).into_any_element()
-}
-
-fn breath_box(cell: Hsla, mark: Hsla) -> Div {
-    let (x, y, w) = BREATH_CELL;
-    div()
-        .relative()
-        .flex_none()
-        .size(px(10.))
-        .child(div().absolute().inset_0().border_1().border_color(mark))
-        .child(div().absolute().left(px(x)).top(px(y)).size(px(w)).bg(cell))
+    let pose = crate::lattice::pose(crate::lattice::Pat::Needs, None);
+    crate::lattice::el(10., breath_dots(s), crate::lattice::code(pose), mark, ground).into_any_element()
 }
 
 /// A glyph whose beat the beat layer paints ([`crate::motion::Beat`]):
@@ -401,7 +391,10 @@ fn breath_box(cell: Hsla, mark: Hsla) -> Div {
 pub(crate) fn on_beat(beat: crate::motion::Beat, mark: Hsla, ground: Hsla, fx: &std::rc::Rc<crate::motion::Motion>) -> AnyElement {
     let el = match beat {
         crate::motion::Beat::Spin(g) => spin(g, None, mark, ground),
-        crate::motion::Beat::Breath(_) => breath_box(mark, mark),
+        crate::motion::Beat::Breath(_) => {
+            let pose = crate::lattice::pose(crate::lattice::Pat::Needs, None);
+            crate::lattice::el(10., crate::lattice::Dots::of(pose), crate::lattice::code(pose), mark, ground)
+        }
         crate::motion::Beat::Lattice(pat) => {
             let pose = crate::lattice::pose(pat, None);
             crate::lattice::el(LIFE, crate::lattice::Dots::of(pose), crate::lattice::code(pose), mark, ground)
