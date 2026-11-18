@@ -541,7 +541,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // `SYNAPS_BENCH_LIFE=N` (Q3 evidence, polish.md §3 Life): after
                 // N s, a scripted turn on the bench's session, the scene a
                 // capture records: a bash call runs (the spinner, its clock,
-                // the composer's sweep), workers spawn, run (their tool counts
+                // its orbit, the composer's), workers spawn, run (their tool counts
                 // and steps roll) and end (the check writes on), a call fails
                 // (the cross), the fan-out widens past the tray's lines (`+N
                 // more` rolls), a prompt comes (NEEDS YOU's count rolls), a
@@ -684,7 +684,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     sleep(2.0).await;
                     let _ = upd(cx, &|v, _| v.toggle_fav_session("20261117-090001-l001"));
                     sleep(1.5).await;
-                    // The prompt answered: RUNNING again (the composer's sweep).
+                    // The prompt answered: RUNNING again (the composer's orbit).
                     let _ = upd(cx, &|v, _| {
                         v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
                         v.sync_list();
@@ -710,9 +710,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         v.apply_batch(vec![Event::Sessions(metas)], cx);
                     });
                     sleep(2.0).await;
-                    // The turn ends from RUNNING, the sweep on screen: READY
+                    // The turn ends from RUNNING, the orbit on screen: READY
                     // hands the floor back (Handoff in down the bar, the
-                    // sweep's one last pass across the top, polish.md P3).
+                    // settle pass across the top, polish.md P3).
                     let _ = upd(cx, &|v, _| {
                         v.model.transcript.apply(&SessionEvent::Idle);
                         v.sync_list();
@@ -990,9 +990,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // (its `mem_end`): the cases after it are Q3's own.
                 out["mem_after_load_5x5"] = mem::sample();
                 // Q3 (polish.md §6 gate 4, the worst case): the same, and the
-                // shown session's turn runs: the composer sweeps (the one
-                // sweep left, P2) over the 25 spinners. Gate 3's prompt is
-                // answered first (NEEDS YOU outranks RUNNING: no sweep).
+                // shown session's turn runs: the composer's orbit (Cards D
+                // retired P2's sweep) over the 25 spinners. Gate 3's prompt is
+                // answered first (NEEDS YOU outranks RUNNING: no orbit).
                 let _ = upd(cx, &|v, _| {
                     let t = &mut v.model.transcript;
                     t.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
@@ -1015,7 +1015,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // tool every 1.5 s, staggered (one every 0.3 s): its tool
                 // count and step change (and roll). Then the same with the
                 // step held, only the count changing. Then the first again
-                // under Reduced (Shady #17 R3-M1): no sweep, no spinners, the
+                // under Reduced (Shady #17 R3-M1): no orbit, no spinners, the
                 // same data frames; Full minus it is what the motion costs.
                 let steps = ["reading src/relay.rs", "grep -n rotate src", "reading src/session.rs", "cargo check -p relay", "reading src/store.rs"];
                 let mut tools = [2u64; 5];

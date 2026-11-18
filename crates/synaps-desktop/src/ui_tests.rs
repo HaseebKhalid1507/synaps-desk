@@ -1784,6 +1784,7 @@ fn the_answered_card_collapses_in_its_row(cx: &mut TestAppContext) {
     assert!(view.read_with(cx, |v, _| v.disp.iter().all(|d| d.kind != crate::turns::Kind::Prompt)), "its row is gone");
     assert!(bounds(cx, &format!("receipt {row}")).is_some(), "the receipt stays");
 }
+
 /// Cards D (cards4/proposal.md §8 #9, build step 10): Allow by its key
 /// presses the button (drawn down, the accent's fill) through the fold's
 /// first 90 ms; the card folds in its row on `glide`, and its call's row
@@ -6105,7 +6106,7 @@ fn sticky_label_takes_no_click(cx: &mut TestAppContext) {
 }
 
 /// F8 (Shady #19 M2): at Full, the band hides the beat under it. Running
-/// rows scrolled under it keep their glyphs and sweeps on the beat layer
+/// rows scrolled under it keep their glyphs and orbits on the beat layer
 /// (painted after the app's whole frame, so over the band), but no site's
 /// clip meets the band: their beats show only below it.
 #[gpui_kit::test]
