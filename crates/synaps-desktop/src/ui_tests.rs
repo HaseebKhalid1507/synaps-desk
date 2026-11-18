@@ -2798,27 +2798,34 @@ fn a_count_rolls_in_its_digit_cells(cx: &mut TestAppContext) {
     assert!(VisualTestContext::from_window(w, cx).debug_bounds(format!("rolling-{k:x}").leak()).is_none(), "at rest: one text");
 }
 
-/// Q3 r4 (polish.md P5, gate 4 under a live fan-out): a spawn row's tool
-/// count and its live line change in place. The frame they change on draws
-/// them at rest, nothing rolls, and no frames follow for them (a roll was
-/// 30 Hz of app frames for ~200 ms); at most a clock's second.
+/// Q3 r4 (polish.md P5, gate 4 under a live fan-out; the design's final):
+/// a spawn row's tool count and its live step swap in one frame, at every
+/// level, with no roll and no fade. The frame they change on draws them,
+/// nothing rolls, no display frame is asked for, and no frames follow for
+/// them (a roll was 30 Hz of app frames for ~200 ms): at most a clock's
+/// second (none under Off, where the clocks hold).
 #[gpui_kit::test]
-fn a_spawn_rows_tool_count_changes_in_place(cx: &mut TestAppContext) {
+fn a_spawn_rows_count_and_step_swap_in_one_frame(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Full);
     life_worker(cx, w, &view);
-    let f0 = frames(cx, &view).0;
-    local(cx, &view, vec![worker_rows(2, "grep -n rotate src")]);
-    wait(cx, w, &view, 16);
-    let f1 = frames(cx, &view).0;
-    assert!(f1 > f0, "the change drew");
-    assert_eq!(view.read_with(cx, |v, _| v.fx.rolling_in(None)), Vec::<u64>::new(), "nothing rolls");
-    assert!(!motion_pending(cx, &view).0, "no display frame asked for");
-    for _ in 0..18 {
+    let levels = [crate::motion::Level::Full, crate::motion::Level::Reduced, crate::motion::Level::Off];
+    for (k, level) in levels.into_iter().enumerate() {
+        set_motion(cx, &view, level);
+        settle(cx, w, 8);
+        let f0 = frames(cx, &view).0;
+        local(cx, &view, vec![worker_rows(2 + k as u64, ["grep -n rotate src", "reading src/b.rs", "cargo check"][k])]);
         wait(cx, w, &view, 16);
+        let f1 = frames(cx, &view).0;
+        assert!(f1 > f0, "{level:?}: the change drew");
+        assert_eq!(view.read_with(cx, |v, _| v.fx.rolling_in(None)), Vec::<u64>::new(), "{level:?}: nothing rolls");
+        assert!(!motion_pending(cx, &view).0, "{level:?}: no display frame asked for");
+        for _ in 0..18 {
+            wait(cx, w, &view, 16);
+        }
+        let more = frames(cx, &view).0 - f1;
+        assert!(more <= 1, "{level:?}: no frames for it, at most a clock's second: {more}");
     }
-    let more = frames(cx, &view).0 - f1;
-    assert!(more <= 1, "no frames for it, at most a clock's second: {more}");
 }
 
 /// polish.md P5: clocks, cost, tokens and % never roll. A running worker's
@@ -2918,6 +2925,10 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
     }
     assert!(seg(cx).is_none(), "gone after sig");
     assert!(pass(cx).is_none(), "one pass, then everything stops");
+    // Nothing of it still animates (the design's final): no display frame,
+    // no sweep, and what is left on the layer is the rail's other sessions'
+    // spinners; with those at rest, nothing at all.
+    only_the_rail_spins(cx, w, &view, "after the pass (Full)");
     set_motion(cx, &view, crate::motion::Level::Reduced);
     busy(cx, true);
     assert!(sweep(cx).is_none(), "Reduced: the edge is unlit");

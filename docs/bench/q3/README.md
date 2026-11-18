@@ -1,5 +1,51 @@
 # Q3 Life: main vs Q3 (bella, headless gamescope)
 
+## Round 4 (`r4/`): worker rows swap in one frame; gate 4 as motion (Full − Reduced)
+
+The harness is round 3's: headless gamescope `-r 144`, 1920×1080, `--refresh-hz 144`, one run at a time, each after
+the 1-minute load average fell under 6. `r4/run.sh` ran Q3 and main alternately, three `--bench-motion` runs each.
+`r4/log` records the load and swap; swap stayed at about 7.9 GB and never grew during a run.
+
+- **Q3 r4:** `b7172f8`, release build sha256 `74198512…`. The head after it changes tests only, so its release build
+  is the same code.
+- **main:** `9121dba`, the same binary as round 3. Main has no sweep and no fan-out case, so its runs give only the
+  shared cases' baseline.
+
+`--bench-motion`, presents / app frames / CPU ms per s:
+
+| case | Q3 r4 #1 | Q3 r4 #2 | Q3 r4 #3 | main #1 | main #2 | main #3 |
+|---|---|---|---|---|---|---|
+| `idle_30s_prompt` | 0 / 0 / 2.22 | 0 / 0 / 2.49 | 0 / 0 / 2.12 | 0 / 0 / 2.31 | 0 / 0 / 2.02 | 0 / 0 / 2.09 |
+| `load_5x5_30s` | 240 / 30 / 20.55 | 240 / 30 / 21.52 | 240 / 30 / 19.76 | 240 / 30 / 18.46 | 240 / 30 / 18.65 | 240 / 30 / 18.31 |
+| `load_5x5_sweep_30s` | 900 / 30 / 49.78 | 900 / 30 / 50.19 | 900 / 30 / 48.5 | n/a | n/a | n/a |
+| `load_5x5_fanout_30s` | 974 / 111 / 60.5 | 964 / 116 / 59.49 | 960 / 112 / 60.73 | n/a | n/a | n/a |
+| `load_5x5_fanout_tools_30s` | 966 / 114 / 60.35 | 967 / 119 / 61.52 | 974 / 120 / 59.43 | n/a | n/a | n/a |
+| `load_5x5_fanout_reduced_30s` | 113 / 113 / 20.86 | 115 / 115 / 20.97 | 111 / 111 / 20.54 | n/a | n/a | n/a |
+
+- **Gate 3: pass.** `idle_30s_prompt` gives 0 presents and 0 app frames in all six runs, and the JSON shows
+  `prompt_pending: true` and `demoted_worker: true`.
+- **Gate 4, no sweep:** `load_5x5_30s` gives 8/s at 19.8–21.5 ms/s. Main: 18.3–18.6.
+- **Gate 4, the composer sweeping over the 5 × 5:** 30/s, all beat-layer paints (30 app frames, the clocks), at
+  48.5–50.2 ms/s (4.9–5.0 %). **Pass.**
+- **Gate 4, the live fan-out, motion only (R3-M1): pass.** The method is Full − Reduced in the same run, on the same
+  build and scene.
+  - `load_5x5_fanout_30s` (Full) and `load_5x5_fanout_reduced_30s` (Reduced) each get the same 100 tool calls in 30 s.
+
+  | run | Full | Reduced | **motion (Full − Reduced)** | Full app frames | Reduced app frames | Full presents − app frames |
+  |---|---|---|---|---|---|---|
+  | #1 | 60.50 | 20.86 | **39.64 ms/s (4.0 %)** | 111 | 113 | 863 (28.8/s) |
+  | #2 | 59.49 | 20.97 | **38.52 ms/s (3.9 %)** | 116 | 115 | 848 (28.3/s) |
+  | #3 | 60.73 | 20.54 | **40.19 ms/s (4.0 %)** | 112 | 111 | 848 (28.3/s) |
+
+  - **App frames:** Full has as many as Reduced, so every app frame is the data's (one per change) or a clock's. The
+    motion adds none, now that worker rows swap in one frame.
+  - **Motion presents:** the beat-layer paints, 28.3–28.8/s, which is ≤ 30/s.
+  - **The step held** (`load_5x5_fanout_tools_30s`): 59.4–61.5 ms/s Full, which minus the same run's Reduced is
+    38.9–40.6 ms/s.
+  - **Absolute Full:** 59.5–60.7 ms/s (6.0 %). The data's own share is about 21 ms/s (the Reduced run).
+  - **Before this round:** with worker-row rolls on the 30 Hz grid, the same scene cost 117.8–121.6 ms/s Full
+    (round 3).
+
 ## Round 3 (`r3/`): the merged tree, main `9121dba`
 
 The harness is round 2's:
@@ -41,7 +87,8 @@ at 17.1–18.9.
 47.9–50.1 ms/s (4.8–5.0 % of a core). App frames are 30 in 30 s, so the rest are beat-layer paints. The JSON shows
 `sweeps: 1`, `state: Running` and 18 sites.
 
-**Gate 4 with P5 rolls from a live fan-out (Shady R2-M1): FAIL, 11.8–12.2 % of a core.**
+**Gate 4 with P5 rolls from a live fan-out (Shady R2-M1): FAIL, 11.8–12.2 % of a core** (round 4 answers it: worker
+rows swap in one frame, and gate 4 counts the motion, Full − Reduced).
 - **The scene, `load_5x5_fanout_30s`:** the sweep scene, plus the shown session's five workers each calling a tool every
   1.5 s, staggered (one change every 0.3 s, 100 in 30 s). Each change moves a worker's tool count and its step, and
   both roll.
