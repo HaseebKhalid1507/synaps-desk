@@ -194,7 +194,10 @@ pub(crate) const RENAME_WAIT: Duration = Duration::from_secs(10);
 pub(crate) const YES_KEY: &str = if cfg!(target_os = "macos") { "⌘ENTER" } else { "CTRL+ENTER" };
 /// A folded side panel's strip.
 pub(crate) const STRIP: f32 = 32.;
-/// The dock's and the composer field's heights on their springs.
+/// The dock's and the composer field's heights on their springs. Q5's
+/// motion keys share `0x7AF*`: `0x7AF0` the panels' widths and
+/// `0x7AF3` a rail section's fold and FAVOURITES' chevron (chrome.rs),
+/// `0x7AF1` / `0x7AF2` these, `0x7AF4` a chip's cell (tray.rs).
 const DOCK_H: u64 = 0x7AF1 << 48;
 const COMPOSER_H: u64 = 0x7AF2 << 48;
 
@@ -4348,9 +4351,9 @@ impl AppView {
     }
 
     /// Fold or unfold a side panel (`rail`: the sessions rail, else the
-    /// right panel) as [`toggled`] says, at once (nothing animates); saved
-    /// [`SAVE_DELAY`] later. The list re-measures its rows for the new
-    /// width by itself.
+    /// right panel) as [`toggled`] says: its width flies on `sheet`
+    /// (fluid.md §3.8, [`crate::chrome::PanelFx`]); saved [`SAVE_DELAY`]
+    /// later. The column keeps its wrap until it lands.
     pub(crate) fn toggle_panel(&mut self, rail: bool, cx: &mut Context<Self>) {
         // A fold mid-drag commits the drag where it is first; the rest of
         // GPUI's drag then moves nothing (`drag_edge` needs `self.drag`).
@@ -6356,6 +6359,13 @@ impl Render for AppView {
         if (lay.hang, lay.tight) != (self.layout.hang, self.layout.tight) {
             self.list.remeasure();
             self.metrics_gen += 1;
+        }
+        // A new column re-wraps the rows: this frame's scrollbar reads the
+        // rows not yet measured at their estimates. One more frame draws it
+        // from their heights, at every level (a fold at Off draws one frame,
+        // and its bar would keep the estimate until the next change).
+        if lay.column != self.layout.column {
+            window.request_animation_frame();
         }
         // Short or not: the list's top edge moves by what the bars above it
         // gain or lose, and the rows keep their place on screen; after a
