@@ -3490,6 +3490,57 @@ fn a_failed_body_glides_to_its_output(cx: &mut TestAppContext) {
     assert!(step < f32::from(before - after) * 0.6, "no one-frame jump: {h:?}");
 }
 
+/// Shady #23 round 2 M1: what the user makes a call's body stays what
+/// they see while its default moves under it. Closed while its output
+/// streams, it stays closed when the call succeeds (its default goes from
+/// open to closed: a toggle against the old default must not open it).
+/// Closed and opened again, it stays open past its success.
+#[gpui_kit::test]
+fn a_call_the_user_closed_stays_closed_when_it_succeeds(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    for reopen in [false, true] {
+        let (w, view, _events) = open(cx);
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| v.client = None);
+        running_tools(cx, &view, 1);
+        let send = |cx: &mut TestAppContext, e: LlmEvent| {
+            view.update(cx, |v, cx| {
+                v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(e) });
+                v.sync_list();
+                v.list.scroll_to_end();
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        send(cx, LlmEvent::ToolStarted { tool_id: "ui-run-0".into() });
+        send(cx, LlmEvent::ToolResultDelta { tool_id: "ui-run-0".into(), delta: "compiling\nlinking\n".into() });
+        wait(cx, w, &view, 800);
+        let id = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| i.id)).expect("the call");
+        let b = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel));
+        assert!(b(cx, format!("well {id}")).is_some(), "{reopen}: its output streams open");
+        let toggle = |cx: &mut TestAppContext| {
+            view.update(cx, |v, cx| {
+                v.toggle(id);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            wait(cx, w, &view, 1000);
+        };
+        toggle(cx);
+        assert!(b(cx, format!("well {id}")).is_none(), "{reopen}: the user closed it");
+        if reopen {
+            toggle(cx);
+            assert!(b(cx, format!("well {id}")).is_some(), "opened again");
+        }
+        send(cx, LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "compiling\nlinking\nok".into() });
+        for k in 0..60 {
+            fluid_frame(cx, w, &view);
+            let shown = b(cx, format!("well {id}")).is_some();
+            assert_eq!(shown, reopen, "{reopen}: frame {k} after its success, as the user left it");
+        }
+    }
+}
+
 /// Finish gate #6 (live-full-allow f2841): a call drawn running never
 /// steps back to "Queued" when its queued status comes again.
 #[gpui_kit::test]

@@ -108,7 +108,7 @@ pub(crate) struct TabCache {
     disp: Vec<Disp>,
     summaries: Summaries,
     list: ListState,
-    toggled: HashSet<u64>,
+    toggled: Toggled,
     open_runs: HashSet<u64>,
     synced_busy: bool,
     files_gen: u64,
@@ -119,6 +119,49 @@ pub(crate) struct TabCache {
     pub(crate) watch: Watch,
 }
 
+/// What the user unfolded or folded: the rows they flipped from their
+/// default and, for a call, the open state they made it. A call's default
+/// changes under it (its output streams open, its success folds it): what
+/// they chose is what stays (Shady #23 round 2 M1), never flipped back by
+/// the default moving.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Toggled {
+    ids: HashSet<u64>,
+    chose: HashMap<u64, bool>,
+}
+
+impl Toggled {
+    pub(crate) fn contains(&self, id: &u64) -> bool {
+        self.ids.contains(id)
+    }
+
+    /// The open state the user made the call `id`, if they did.
+    pub(crate) fn chose(&self, id: u64) -> Option<bool> {
+        self.chose.get(&id).copied()
+    }
+
+    /// Flipped; `chose`: a call's, the state it is now.
+    fn flip(&mut self, id: u64, chose: Option<bool>) {
+        if !self.ids.remove(&id) {
+            self.ids.insert(id);
+        }
+        match chose {
+            Some(c) => self.chose.insert(id, c),
+            None => self.chose.remove(&id),
+        };
+    }
+
+    fn retain(&mut self, keep: impl Fn(&u64) -> bool) {
+        self.ids.retain(|id| keep(id));
+        self.chose.retain(|id, _| keep(id));
+    }
+
+    fn clear(&mut self) {
+        self.ids.clear();
+        self.chose.clear();
+    }
+}
+
 /// The list's state over one transcript: its rows, folds, measured heights
 /// and scroll position. The session's waits here while a worker's view is
 /// shown ([`AppView::sync_pane`]), so neither ever moves the other.
@@ -127,7 +170,7 @@ pub(crate) struct Pane {
     disp: Vec<Disp>,
     summaries: Summaries,
     list: ListState,
-    toggled: HashSet<u64>,
+    toggled: Toggled,
     open_runs: HashSet<u64>,
     synced_busy: bool,
     files_gen: u64,
@@ -1323,8 +1366,9 @@ pub struct AppView {
     pub(crate) disp: Vec<Disp>,
     pub(crate) summaries: Summaries,
     pub list: ListState,
-    /// Rows whose open/closed state the user flipped from its default.
-    pub(crate) toggled: HashSet<u64>,
+    /// Rows whose open/closed state the user flipped from its default, and
+    /// for a call the state they made it ([`Toggled`]).
+    pub(crate) toggled: Toggled,
     /// Runs the user unfolded (by their first item's id).
     open_runs: HashSet<u64>,
     /// The rows an unfold under Full is revealing: tail-follow is held
@@ -2132,7 +2176,7 @@ impl AppView {
             disp: Vec::new(),
             summaries: Summaries::default(),
             list,
-            toggled: HashSet::new(),
+            toggled: Toggled::default(),
             open_runs: HashSet::new(),
             unfold_hold: Vec::new(),
             synced_busy: false,
@@ -4968,13 +5012,20 @@ impl AppView {
                 || streaming
                 || (!matches!(status, Some(ToolStatus::Cancelled))
                     && row.preview.as_ref().is_some_and(|p| p.lines.len() <= 24 && !p.lines.is_empty())));
-        default ^ self.toggled.contains(&item.id)
+        self.toggled.chose(item.id).unwrap_or(default ^ self.toggled.contains(&item.id))
     }
 
     pub(crate) fn toggle(&mut self, id: u64) {
-        if !self.toggled.remove(&id) {
-            self.toggled.insert(id);
-        }
+        // A call: the state the user makes it, against the one it shows.
+        let chose = {
+            let items = self.model.shown().items();
+            items
+                .iter()
+                .position(|i| i.id == id)
+                .filter(|&ix| items[ix].kind == ItemKind::Tool)
+                .and_then(|ix| self.rows.get(ix).filter(|r| r.id == id).map(|r| !self.is_open(&items[ix], r)))
+        };
+        self.toggled.flip(id, chose);
         // A call's row, or a slash command's answer (a note).
         if let Some(ix) = self.disp.iter().position(|d| d.id == id && matches!(d.kind, Kind::Work | Kind::Note | Kind::Event)) {
             self.list.remeasure_items(ix..ix + 1);
