@@ -1680,7 +1680,7 @@ impl AppView {
         } else {
             target_el(&row.card, &row.arg, p)
         };
-        // The call a prompt waits on (the last one unfinished).
+        // The call a prompt waits on ([`waiting_call`]).
         let waiting = !think && self.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty();
         let fx = &self.fx;
         let shown = self.model.shown();
@@ -1704,6 +1704,12 @@ impl AppView {
         // Thinking done says nothing in the gutter: only its running mark.
         let status_glyph = (!think || state.0 == Glyph::Run).then_some(status_glyph);
         let running = state.0 == Glyph::Run && !think;
+        let receipt = self.row_receipt(call_id).filter(|_| !think);
+        let counts = row.counts.element(p);
+        // A gated call runs from its answer (the wait is the receipt's).
+        let ran = running.then(|| clock(fx, crate::authorize::run_start(row.started, receipt))).flatten();
+        let word = crate::authorize::status_beside(state.1, receipt.map(|r| r.answer)).filter(|_| !lay.tight && !think);
+        let before = counts.is_some() || row.card.facts.is_some() || ran.is_some() || word.is_some() || row.card.server.is_some();
         let meta = h_flex()
             .flex_none()
             .ml(px(geo.gap))
@@ -1712,16 +1718,14 @@ impl AppView {
             .text_px(m.meta)
             .whitespace_nowrap()
             // The ledger's committed counts: nothing unless the call succeeded.
-            .children(row.counts.element(p))
+            .children(counts)
             .children(row.card.facts.clone().map(|f| div().text_color(p.dim_t).child(f)))
-            .children(running.then(|| clock(fx, row.started)).flatten().map(|c| div().text_color(p.dim_t).child(c)))
-            .when_some(
-                crate::authorize::status_beside(state.1, self.row_receipt(call_id).map(|r| r.answer)).filter(|_| !lay.tight && !think),
-                |d, w| d.child(div().text_color(word_color).child(w)),
-            )
+            .children(ran.map(|c| div().text_color(p.dim_t).child(c)))
+            .when_some(word, |d, w| d.child(div().text_color(word_color).child(w)))
             .children(row.card.server.clone().map(|s| div().text_color(p.dim_t).child(s)))
-            // An answered prompt's receipt (polish.md §2.6).
-            .children((!think).then(|| self.receipt_el(call_id, p)).flatten());
+            // An answered prompt's receipt (polish.md §2.6): `3s running ·
+            // allowed 19:14`, then `allowed 19:14 · 15s`.
+            .children(receipt.and_then(|_| self.receipt_el(call_id, before, running, p)));
         let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
         let verb = if think {
             div().flex_none().w(px(geo.verb_w)).mr(px(geo.gap)).text_color(p.think).child("think").into_any_element()

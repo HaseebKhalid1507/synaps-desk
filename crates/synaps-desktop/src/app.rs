@@ -223,9 +223,19 @@ actions!(
         WorkerDown,
         WorkerTab,
         RenameSession,
-        ToggleFavourite
+        ToggleFavourite,
+        CardTab
     ]
 );
+
+/// A prompt as [`AppView::card_first`] knows it: its session, its id and
+/// its `raised_at`.
+pub(crate) type PromptAt = (String, u64, Option<String>);
+
+/// The key context while the card's keys are live and it offers Allow all:
+/// Tab and Shift+Tab go to its box and back ([`AppView::card_tab`]), ahead
+/// of the kit's focus cycling.
+const ALLOW_ALL_CTX: &str = "AllowAll";
 
 /// Ctrl+B folds the sessions rail, Ctrl+Alt+B the right panel; Ctrl+= /
 /// Ctrl+- / Ctrl+0 step the centre pane's text size; the tab keys
@@ -276,6 +286,8 @@ pub fn bind_keys(cx: &mut App) {
     for &k in crate::wtabs::tab_keys(mac) {
         keys.push(KeyBinding::new(k, WorkerTab, None));
     }
+    keys.push(KeyBinding::new("tab", CardTab, Some(ALLOW_ALL_CTX)));
+    keys.push(KeyBinding::new("shift-tab", CardTab, Some(ALLOW_ALL_CTX)));
     keys.push(KeyBinding::new(RENAME_KEY, RenameSession, None));
     keys.push(KeyBinding::new(fav_key(mac), ToggleFavourite, None));
     cx.bind_keys(keys);
@@ -1489,6 +1501,13 @@ pub struct AppView {
     /// The session this window last sent HALT to, and when: a prompt that
     /// resolves after it was cancelled here, not answered elsewhere.
     pub(crate) halted: Option<(String, Instant)>,
+    /// The card's Allow all box: Tab from the card's keys focuses it (a
+    /// click too); Space toggles it then only.
+    pub(crate) allow_all_focus: FocusHandle,
+    /// When each recent prompt was first shown here, by session, id and
+    /// `raised_at` (Shady N4: a tab's round trip builds its card anew, and
+    /// "how long you took" counts from the first showing).
+    pub(crate) card_first: Vec<(PromptAt, Instant)>,
     /// The list's view (top, bottom) as its last layout left it.
     pub(crate) list_box: Cell<(f32, f32)>,
     /// The card's row was on screen, buttons whole, at the frame's start.
@@ -1857,6 +1876,7 @@ impl AppView {
             settings_pane,
             usage_pane,
             focus,
+            allow_all_focus: cx.focus_handle().tab_stop(true),
             visible: window.is_visible(),
         };
         match (client, synthetic) {
@@ -2052,6 +2072,8 @@ impl AppView {
             card_keys: Cell::new(None),
             jump_card: None,
             halted: None,
+            allow_all_focus: i.allow_all_focus,
+            card_first: Vec::new(),
             list_box: Cell::new((0., 0.)),
             card_seen: Cell::new(false),
             #[cfg(test)]
@@ -3605,8 +3627,16 @@ impl AppView {
         } else if self.secret_input.read(cx).focus_handle(cx).is_focused(window) {
             Some(true)
         } else {
-            self.focus.is_focused(window).then_some(false)
+            (self.focus.is_focused(window) || self.allow_all_focus.is_focused(window)).then_some(false)
         }
+    }
+
+    /// Tab or Shift+Tab with the card's keys: to its Allow all box, or
+    /// from it back to the card.
+    fn card_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let to = if self.allow_all_focus.is_focused(window) { &self.focus } else { &self.allow_all_focus };
+        window.focus(to, cx);
+        cx.notify();
     }
 
     /// L3: keys that reach the window may be the rest of a secret: while a
@@ -3749,12 +3779,14 @@ impl AppView {
         });
         // The call it belongs to, by its tool-use id (Shady H2): the one it
         // sits under, or for its own line the call it waited in (else the
-        // last call before it). None: no receipt (nothing to hang it on).
+        // last call before it in its turn, never an earlier turn's). None:
+        // no receipt (nothing to hang it on), but it still collapses.
         let ix = items.iter().rposition(|i| i.id == after);
         let call = ix.and_then(|ix| {
             let gated = turns::waiting_call(items, Some(&c.pr)).and_then(|id| items.iter().rposition(|i| i.id == id));
             let at = if own { gated.filter(|&g| g <= ix).unwrap_or(ix) } else { ix };
-            items[..=at].iter().rev().find_map(|i| i.tool.as_ref()).map(|t| SharedString::from(t.tool_id.clone()))
+            let turn = items[..=at].iter().rposition(|i| i.kind == ItemKind::User).unwrap_or(0);
+            items[turn..=at].iter().rev().find_map(|i| i.tool.as_ref()).map(|t| SharedString::from(t.tool_id.clone()))
         });
         let mine = self.sent.take().filter(|s| s.key == c.key);
         let (answer, at, took) = match mine {
@@ -3762,11 +3794,13 @@ impl AppView {
             None => (self.resolved_by(&c, &sid), crate::authorize::hhmm_now(), None),
         };
         log::info!(target: "synaps_desktop::card", "card {:?}: resolved ({answer:?})", c.key);
-        let Some(call) = call else { return };
-        let receipts = self.receipts.entry(sid.clone()).or_default();
-        receipts.push(crate::authorize::Receipt { call, own, row: c.row, secret: c.secret, answer, at, took, landed: fx_now });
-        if receipts.len() > crate::authorize::RECEIPTS {
-            receipts.remove(0);
+        let line = call.is_some();
+        if let Some(call) = call {
+            let receipts = self.receipts.entry(sid.clone()).or_default();
+            receipts.push(crate::authorize::Receipt { call, own, row: c.row, secret: c.secret, answer, at, took, landed: fx_now });
+            if receipts.len() > crate::authorize::RECEIPTS {
+                receipts.remove(0);
+            }
         }
         let (top, bottom) = self.list_view();
         let on_screen = self.model.watch.focus().is_none()
@@ -3778,21 +3812,24 @@ impl AppView {
                 .and_then(|ix| self.list.bounds_for_item(ix))
                 .is_some_and(|b| f32::from(b.top()) < bottom && f32::from(b.bottom()) > top);
         if on_screen && self.fx.fluid() && !c.height.get().is_nan() {
-            let to = if own { crate::authorize::receipt_line(&theme::metrics(cx)) } else { 0. };
+            let to = if own && line { crate::authorize::receipt_line(&theme::metrics(cx)) } else { 0. };
             let look = self.card_look.borrow().clone();
             self.card_exit = Some(CardExit { card: c, look, at: fx_now, session: sid, after, to, sink: Rc::new(Cell::new(f32::NAN)) });
         }
     }
 
     /// What resolved a prompt this window did not answer (Shady M4): a HALT
-    /// from here since it was shown, or its turn already over (a cancel, a
-    /// revoke, a reload's drain), is `cancelled` (the tool saw no answer:
-    /// blocked); another client owning the input, `answered elsewhere`;
-    /// else `resolved`, saying nothing it does not know.
+    /// from here since it was shown, or its turn already over when it
+    /// resolved (a cancel, a revoke, a reload's drain), is `cancelled` (the
+    /// tool saw no answer: blocked); another client owning the input,
+    /// `answered elsewhere`; else `resolved`, saying nothing it does not
+    /// know. Whether the turn ran is read as the resolution came (Shady N3:
+    /// a window that drew nothing meanwhile sees the turn over by now).
     fn resolved_by(&self, c: &PromptCard, sid: &str) -> crate::authorize::Answer {
         use crate::authorize::Answer;
         let halted = self.halted.as_ref().is_some_and(|(s, at)| s == sid && *at >= c.shown);
-        if halted || !self.model.transcript.busy() || self.model.reload {
+        let ran = self.model.transcript.resolved_busy(c.key.1).unwrap_or_else(|| self.model.transcript.busy());
+        if halted || !ran || self.model.reload {
             return Answer::Cancelled;
         }
         match self.model.active.as_ref() {
@@ -3843,10 +3880,33 @@ impl AppView {
         }
         let new = PromptCard::sync(&mut self.card, &self.model, now, view);
         if was.map(|w| w.0) != self.card.as_ref().map(|c| c.key) {
+            // The box's focus was the card's that went (the next card's
+            // box is its own).
+            if self.allow_all_focus.is_focused(window) {
+                window.focus(&self.focus, cx);
+            }
             if was.is_some_and(|w| w.1) {
                 self.secret_left = Some(now);
             }
             self.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        if new
+            && let Some(c) = self.card.as_mut()
+            && let Some(a) = self.model.active.as_ref()
+        {
+            let k = (a.session_id.clone(), c.key.1, c.pr.raised_at.clone());
+            match self.card_first.iter().find(|f| f.0 == k) {
+                Some(f) => c.shown = f.1,
+                None => {
+                    if self.card_first.len() == 16 {
+                        self.card_first.remove(0);
+                    }
+                    self.card_first.push((k, c.shown));
+                }
+            }
+        }
+        if let Some(c) = self.card.as_mut() {
+            c.box_focus = self.allow_all_focus.is_focused(window);
         }
         if new && let Some(c) = &self.card {
             log::info!(target: "synaps_desktop::card", "card {:?}: shown", c.key);
@@ -5561,6 +5621,7 @@ struct Inputs {
     settings_pane: Entity<crate::views::ViewPane>,
     usage_pane: Entity<crate::views::ViewPane>,
     focus: FocusHandle,
+    allow_all_focus: FocusHandle,
     visible: bool,
 }
 
@@ -5986,9 +6047,12 @@ impl Render for AppView {
                     cx,
                 ))
         };
+        let card_tab = self.card_keys.get() == Some(false) && self.allow_all_offered();
         h_flex()
             .id("root")
             .track_focus(&self.focus)
+            .when(card_tab, |d| d.key_context(ALLOW_ALL_CTX))
+            .on_action(cx.listener(|this, _: &CardTab, window, cx| this.card_tab(window, cx)))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
             .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| match this.swallow_clicks {
@@ -6140,7 +6204,7 @@ impl Render for AppView {
                 let bare = !(m.control || m.alt || m.shift || m.platform || m.function);
                 if ev.keystroke.key == "space"
                     && bare
-                    && this.current_card().is_some_and(|c| c.box_focus)
+                    && this.allow_all_focus.is_focused(window)
                     && this.card_keys_live(window, cx) == Some(false)
                 {
                     // Space toggles Allow all only with its box focused: a new
