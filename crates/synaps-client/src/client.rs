@@ -540,16 +540,31 @@ pub enum Event {
         handle_id: String,
         result: Result<String, String>,
     },
-    /// Reply to [`Client::engine_command`] `name`: `Ok` with the daemon's
-    /// text (its `output` or `notice`), or `Err` with why not: the
-    /// daemon's error, a refusal (not this client's input), a command it
-    /// does not run, or this client's (not connected, the connection
-    /// dropped before it answered).
+    /// What became of [`Client::engine_command`] `name` ([`CommandReply`]).
     EngineReply {
         attach_seq: u64,
         name: String,
-        result: Result<String, String>,
+        reply: CommandReply,
     },
+}
+
+/// What became of a slash command ([`Event::EngineReply`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CommandReply {
+    /// Done: the daemon's text (`output`, `notice`), empty when it prints
+    /// nothing (`none`: `/compact` was asked; whether it started, the
+    /// session's log says).
+    Done(String),
+    /// Not run, and why: the daemon's error (a usage line, an unknown
+    /// worker), a command it does not run, a refusal (not this client's
+    /// input), not connected, or `/model x` answered with another model in
+    /// use (the daemon keeps the old one when it cannot switch).
+    NotRun(String),
+    /// Sent, and no answer this client can read: it may have run (the link
+    /// dropped, the session ended, a reply of a kind this client does not
+    /// know).
+    Unknown(String),
 }
 
 /// What a [`Client::watch_subagent`] got back.
@@ -1353,7 +1368,7 @@ async fn without_session<F: Future>(
                 Some(Command::EngineCommand { name, .. }) => emit(events, Event::EngineReply {
                     attach_seq,
                     name,
-                    result: Err("not connected to the session (attaching or reconnecting): not run".into()),
+                    reply: CommandReply::NotRun("not connected to the session (attaching or reconnecting)".into()),
                 }),
                 Some(c) => emit_error(events, Some(attach_seq), Error::Refused {
                     command: Some(c.name().into()),
@@ -1381,14 +1396,21 @@ const CANCELS_MAX: usize = 16;
 /// one queue keeps their order.
 enum Asked {
     Cancel(String),
-    Run(String),
+    /// Its name and argument.
+    Run(String, String),
 }
 
-/// `asked` answered.
-fn answer(events: &Events, attach_seq: u64, asked: Asked, result: Result<String, String>) {
+/// `asked` answered (a cancel: `Ok` done, else `Err` why).
+fn answer(events: &Events, attach_seq: u64, asked: Asked, reply: CommandReply) {
     match asked {
-        Asked::Cancel(handle_id) => emit(events, Event::WorkerCancel { attach_seq, handle_id, result }),
-        Asked::Run(name) => emit(events, Event::EngineReply { attach_seq, name, result }),
+        Asked::Cancel(handle_id) => {
+            let result = match reply {
+                CommandReply::Done(t) => Ok(t),
+                CommandReply::NotRun(why) | CommandReply::Unknown(why) => Err(why),
+            };
+            emit(events, Event::WorkerCancel { attach_seq, handle_id, result })
+        }
+        Asked::Run(name, _) => emit(events, Event::EngineReply { attach_seq, name, reply }),
     }
 }
 
@@ -1399,28 +1421,41 @@ fn is_worker_handle(h: &str) -> bool {
 }
 
 /// The engine commands still in flight as the connection or the
-/// attachment ends: each answered `Err(why)` (a cancel's adds where to
-/// look), never left without an answer.
+/// attachment ends: each answered (a cancel `Err(why)` with where to look,
+/// a slash command [`CommandReply::Unknown`]: it may have run), never left
+/// without an answer.
 fn unanswered(events: &Events, attach_seq: u64, cancels: &mut VecDeque<(u64, Asked)>, why: &str) {
     for (_, asked) in cancels.drain(..) {
-        let why = match asked {
-            Asked::Cancel(_) => format!("{why}: look at the worker's row"),
-            Asked::Run(_) => why.to_string(),
+        let reply = match asked {
+            Asked::Cancel(_) => CommandReply::NotRun(format!("{why}: look at the worker's row")),
+            Asked::Run(..) => CommandReply::Unknown(why.to_string()),
         };
-        answer(events, attach_seq, asked, Err(why));
+        answer(events, attach_seq, asked, reply);
     }
 }
 
-/// A slash command's `value`: `{"kind": "output" | "notice", "text": ...}`
-/// is done; `error` says why not; `unhandled`: the daemon does not run it.
-fn run_reply(name: &str, value: &Value) -> Result<String, String> {
+/// A slash command's `value` (agent-engine `engine_command_reply`, the same
+/// on v0.11 and v0.12): `output` and `notice` are done with their text,
+/// `none` done with none (`/compact`: its outcome comes as a session event),
+/// `error` not run and why, `unhandled` not a command the daemon runs. A
+/// `/model x` notice names the model in use after it: another is not a
+/// switch. Any other kind: unknown.
+fn run_reply(name: &str, arg: &str, value: &Value) -> CommandReply {
     let text = value.get("text").and_then(Value::as_str).unwrap_or("").to_string();
     match value.get("kind").and_then(Value::as_str) {
-        Some("output" | "notice" | "quit") => Ok(text),
-        Some("error") if !text.is_empty() => Err(text),
-        Some("unhandled") => Err(format!("the daemon does not run /{name}")),
-        Some(k) => Err(format!("the daemon answered `{k}`")),
-        None => Err("the daemon's answer did not say".into()),
+        Some("notice")
+            if name == "model"
+                && let Some(now) = value.get("model").and_then(Value::as_str)
+                && now != arg.trim() =>
+        {
+            CommandReply::NotRun(format!("not switched: the model is still {now}"))
+        }
+        Some("output" | "notice" | "quit" | "none") => CommandReply::Done(text),
+        Some("error") if !text.is_empty() => CommandReply::NotRun(text),
+        Some("error") => CommandReply::NotRun("the daemon refused it".into()),
+        Some("unhandled") => CommandReply::NotRun(format!("the daemon does not run /{name}")),
+        Some(k) => CommandReply::Unknown(format!("the daemon answered `{k}`, which this app does not read")),
+        None => CommandReply::Unknown("the daemon's answer did not say".into()),
     }
 }
 
@@ -1618,7 +1653,7 @@ async fn session_loop(
                             if cancels.len() == CANCELS_MAX
                                 && let Some((_, a)) = cancels.pop_front()
                             {
-                                answer(&events, attach_seq, a, Err("no answer from the daemon".into()));
+                                answer(&events, attach_seq, a, CommandReply::Unknown("no answer from the daemon".into()));
                             }
                             let arg = format!("cancel {handle_id}");
                             cancels.push_back((id, Asked::Cancel(handle_id)));
@@ -1634,9 +1669,9 @@ async fn session_loop(
                             if cancels.len() == CANCELS_MAX
                                 && let Some((_, a)) = cancels.pop_front()
                             {
-                                answer(&events, attach_seq, a, Err("no answer from the daemon".into()));
+                                answer(&events, attach_seq, a, CommandReply::Unknown("no answer from the daemon".into()));
                             }
-                            cancels.push_back((id, Asked::Run(name.clone())));
+                            cancels.push_back((id, Asked::Run(name.clone(), arg.clone())));
                             SessionCommand::EngineCommand { id, name, arg }
                         }
                         _ => continue,
@@ -1677,11 +1712,11 @@ async fn session_loop(
                         {
                             let (_, asked) = cancels.remove(k).expect("present");
                             let value = v.get("value").unwrap_or(&Value::Null);
-                            let result = match &asked {
-                                Asked::Cancel(_) => cancel_reply(value),
-                                Asked::Run(name) => run_reply(name, value),
+                            let reply = match &asked {
+                                Asked::Cancel(_) => cancel_reply(value).map_or_else(CommandReply::NotRun, CommandReply::Done),
+                                Asked::Run(name, arg) => run_reply(name, arg, value),
                             };
-                            answer(&events, attach_seq, asked, result);
+                            answer(&events, attach_seq, asked, reply);
                             continue;
                         }
                         if v.get("ev").and_then(Value::as_str) == Some("query_result") {
@@ -1726,7 +1761,7 @@ async fn session_loop(
                             // session's input): the oldest one in flight.
                             SessionEvent::Refused { client, command, reason } if *client == me && command == "engine_command" && !cancels.is_empty() => {
                                 let (_, asked) = cancels.pop_front().expect("not empty");
-                                answer(&events, attach_seq, asked, Err(format!("refused: {reason}")));
+                                answer(&events, attach_seq, asked, CommandReply::NotRun(format!("refused: {reason}")));
                             }
                             SessionEvent::Refused { client, command, reason } if *client == me => {
                                 emit_error(&events, Some(attach_seq), Error::Refused { command: Some(command.clone()), reason: reason.clone() });
@@ -1808,7 +1843,7 @@ async fn session_loop(
                 }
             }
         };
-        unanswered(&events, attach_seq, &mut cancels, "the session connection dropped before the daemon answered");
+        unanswered(&events, attach_seq, &mut cancels, "the link dropped before the daemon answered");
         let reload = why == RELOADING;
         emit(&events, Event::Reattaching { attach_seq, session_id: sid.clone(), reason: why });
         previous = Some(Previous { client: me, session_id: sid, was_owner: owner == Some(me), generation });

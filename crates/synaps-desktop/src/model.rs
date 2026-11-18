@@ -145,6 +145,13 @@ pub enum Effect {
     /// What the composer's note line says: of a worker (a cancel
     /// refused), or a slash command's answer.
     WorkerNote(String),
+    /// A slash command answered on the attachment on screen: the
+    /// composer's note says what became of it, and a draft that sent it
+    /// goes once it is done ([`synaps_client::CommandReply`]).
+    Command {
+        name: String,
+        reply: synaps_client::CommandReply,
+    },
 }
 
 /// A resume in flight (`Client::resume`).
@@ -311,7 +318,7 @@ pub struct Model {
     pub reattaching: bool,
     /// Sent, not yet confirmed by `TurnStarted` / `Steered`, oldest first:
     /// given back to the user on a refusal (the oldest) or a detach (all).
-    in_flight: VecDeque<String>,
+    pub(crate) in_flight: VecDeque<String>,
     /// The same for attachments a tab switch left (their last events still
     /// come, until their `Detached`): `(attach_seq, session, texts)`.
     left: Vec<(u64, String, VecDeque<String>)>,
@@ -1393,12 +1400,19 @@ impl Model {
                 return effects;
             }
             // A slash command answered (the palette's, the composer's): its
-            // first line, or why not, on the composer's note line; another
-            // attachment's (a switch since) says nothing here.
-            Event::EngineReply { attach_seq, name, result } => {
-                log::debug!(target: "synaps_desktop::send", "/{name}: {}", if result.is_ok() { "ok" } else { "not run" });
+            // whole answer at the transcript's end, as the TUI prints it
+            // (this client's row: never sent, not in the history), and a
+            // line of it on the composer's note; another attachment's (a
+            // switch since) says nothing here.
+            Event::EngineReply { attach_seq, name, reply } => {
+                log::debug!(target: "synaps_desktop::send", "/{name}: {reply:?}");
                 if self.active.as_ref().is_some_and(|a| a.attach_seq == attach_seq) {
-                    effects.push(Effect::WorkerNote(crate::palette::reply_note(&name, &result)));
+                    if let synaps_client::CommandReply::Done(text) = &reply
+                        && !text.trim().is_empty()
+                    {
+                        self.transcript.output(&name, text);
+                    }
+                    effects.push(Effect::Command { name, reply });
                     self.view_dirty = true;
                 }
                 return effects;

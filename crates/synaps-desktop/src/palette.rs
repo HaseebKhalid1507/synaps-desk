@@ -11,6 +11,8 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use synaps_client::CommandReply;
+
 use crate::app::{AppView, display, mono};
 use crate::fonts::TextPx as _;
 use crate::fonts::{self, label, size};
@@ -30,8 +32,9 @@ pub(crate) enum Mode {
 pub(crate) enum Group {
     Sessions,
     Workers,
-    History,
+    /// Before HISTORY: never under the shown rows' cap ([`SHOWN_MAX`]).
     Views,
+    History,
     Commands,
 }
 
@@ -41,7 +44,7 @@ impl Group {
             Group::Sessions => (label::SESSIONS, Some(fonts::JP_SESSIONS)),
             Group::Workers => (label::WORKERS, Some(fonts::JP_WORKERS)),
             Group::History => (label::HISTORY, Some(fonts::JP_HISTORY)),
-            Group::Views => (label::VIEWS, None),
+            Group::Views => (label::VIEWS, Some(fonts::JP_VIEWS)),
             Group::Commands => (label::COMMANDS, Some(fonts::JP_COMMANDS)),
         }
     }
@@ -101,11 +104,24 @@ pub(crate) struct Entry {
     pub rank: u32,
     /// It cannot act now: why (picked, the note says so).
     pub off: Option<SharedString>,
+    /// Its title is a machine name (a named session's handle, a session's
+    /// id): mono, as the rail and the tab draw it (C2).
+    pub mono: bool,
 }
 
 impl Entry {
     pub fn new(group: Group, act: Act, title: impl Into<SharedString>) -> Self {
-        Entry { group, act, title: title.into(), meta: SharedString::default(), key: None, lead: Lead::None, rank: 0, off: None }
+        Entry {
+            group,
+            act,
+            title: title.into(),
+            meta: SharedString::default(),
+            key: None,
+            lead: Lead::None,
+            rank: 0,
+            off: None,
+            mono: false,
+        }
     }
 }
 
@@ -132,14 +148,80 @@ pub(crate) fn engine_of(text: &str) -> Option<(&'static str, &str)> {
     ENGINE.iter().find(|e| e.0 == name).map(|e| (e.0, arg))
 }
 
-/// What the composer's note line says of a slash command's answer: its
-/// first line, or why not.
-pub(crate) fn reply_note(name: &str, result: &Result<String, String>) -> String {
+/// The whole of `text` as one valid invocation of an engine command: its
+/// name and the argument to send. Anything else is not a command: the
+/// composer sends it as a message, as it always has (`/model is this the
+/// wrong one?`, `/workers are stuck`, `/usr/bin`).
+pub(crate) fn invocation(text: &str) -> Option<(&'static str, String)> {
+    let rest = text.trim().strip_prefix('/')?;
+    let (name, arg) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(n, a)| (n, a.trim()));
+    let name = ENGINE.iter().find(|e| e.0 == name)?.0;
+    valid(name, arg)
+}
+
+/// `arg` as `name`'s grammar (the daemon's, agent-engine
+/// `engine/commands.rs`, the same on v0.11.1 and v0.12) has it: the
+/// argument to send (its words one space apart; `/compact`'s instructions
+/// as typed), or `None`. `/model` takes one model id; the rest their
+/// subcommands; `/compact` any instructions.
+pub(crate) fn valid(name: &str, arg: &str) -> Option<(&'static str, String)> {
+    let name = ENGINE.iter().find(|e| e.0 == name)?.0;
+    let w: Vec<&str> = arg.split_whitespace().collect();
+    let worker = |h: &str| h == "all" || h.strip_prefix("sa_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let count = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    let duration = |d: &str| d.strip_suffix(['s', 'm', 'h']).is_some_and(count);
+    let ok = match (name, w.as_slice()) {
+        ("compact", _) => return Some((name, arg.trim().to_string())),
+        ("model", [id]) => model_id(id),
+        ("context", [] | ["status" | "off" | "auto"]) | ("trace", [] | ["status" | "next"] | ["next", "content"]) => true,
+        ("context", ["auto", a, b]) => count(a) && count(b),
+        ("budget", [] | ["status"] | ["time", "off"]) => true,
+        ("budget", ["time", d]) => duration(d),
+        ("workers", [] | ["status"]) | ("confirms", [] | ["status" | "reset"]) => true,
+        ("workers", ["cancel" | "reconcile", h]) => worker(h),
+        _ => false,
+    };
+    ok.then(|| (name, w.join(" ")))
+}
+
+/// A model id as `/model` takes it: one token of letters, digits and
+/// `-._/:@`, with a digit, `-` or `/` in it (`openai/gpt-5.1`,
+/// `claude-opus-4-6`, `o3`), not a word of prose.
+fn model_id(id: &str) -> bool {
+    id.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || "-._/:@".contains(c))
+        && id.chars().any(|c| c.is_ascii_digit() || c == '-' || c == '/')
+}
+
+/// What a command takes, said when the palette's argument is not that.
+pub(crate) fn usage(name: &str) -> &'static str {
+    match name {
+        "model" => "usage: /model <provider/model-id>",
+        "context" => "usage: /context [status | off | auto | auto <pressure> <rollover>]",
+        "trace" => "usage: /trace [status | next | next content]",
+        "budget" => "usage: /budget [status | time <30m, 4h …> | time off]",
+        "workers" => "usage: /workers [status | cancel <sa_N|all> | reconcile <sa_N|all>]",
+        "confirms" => "usage: /confirms [status | reset]",
+        _ => "usage: /compact [instructions]",
+    }
+}
+
+/// What the composer's note line says of a slash command's answer: a line.
+/// The whole answer, more than a line, is in the transcript
+/// ([`synaps_client::Transcript::output`]).
+pub(crate) fn reply_note(name: &str, reply: &CommandReply) -> String {
     let first = |t: &str| t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string();
-    match result {
-        Ok(t) if first(t).is_empty() => format!("/{name}: done"),
-        Ok(t) => format!("/{name}: {}", first(t)),
-        Err(why) => format!("/{name} not run: {}", first(why)),
+    match reply {
+        // `/compact` answers nothing: whether it started, the log says.
+        CommandReply::Done(t) if first(t).is_empty() && name == "compact" => "/compact: asked (the log shows how it goes)".into(),
+        CommandReply::Done(t) if first(t).is_empty() => format!("/{name}: done"),
+        CommandReply::Done(t) => match t.trim().lines().count() {
+            1 => format!("/{name}: {}", first(t)),
+            n => format!("/{name}: {} (+{} lines in the transcript)", first(t), n - 1),
+        },
+        CommandReply::NotRun(why) => format!("/{name} not run: {}", first(why)),
+        CommandReply::Unknown(why) => format!("/{name}: unknown — {}", first(why)),
+        _ => format!("/{name}: answered"),
     }
 }
 
@@ -150,44 +232,67 @@ pub(crate) const SHOWN_MAX: usize = 120;
 /// How well `q` (lowercase, non-empty) matches `text`: a prefix best, then
 /// a word's start, then anywhere, then its letters in order (tighter,
 /// earlier runs score higher). `None`: no match.
+#[cfg(test)]
 pub(crate) fn score(q: &str, text: &str) -> Option<u32> {
-    let t = text.to_lowercase();
-    if t.starts_with(q) {
-        return Some(4000 - len_pen(&t));
+    hit(q, text).map(|h| h.0)
+}
+
+/// [`score`], and the characters of `text` it ranked on (indices of its
+/// chars, ascending): what the row lights up.
+pub(crate) fn hit(q: &str, text: &str) -> Option<(u32, Vec<usize>)> {
+    // One lowercase char per char of `text`: the indices are its own.
+    let t: Vec<char> = text.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect();
+    let q: Vec<char> = q.chars().collect();
+    let n = q.len();
+    let len_pen = (t.len() as u32 / 8).min(100);
+    let pen = |at: usize| (at as u32).min(200);
+    let word = |i: usize| i == 0 || !t[i - 1].is_alphanumeric();
+    let run = |i: usize| (i..i + n).collect::<Vec<_>>();
+    let found = || (0..(t.len() + 1).saturating_sub(n)).filter(|&i| t[i..i + n] == q[..]);
+    if n == 0 {
+        return None;
     }
-    if let Some(at) = t.match_indices(q).map(|(i, _)| i).find(|&i| starts_word(&t, i)) {
-        return Some(3000 - pen(at) - len_pen(&t));
+    if t.starts_with(&q) {
+        return Some((4000 - len_pen, run(0)));
     }
-    if let Some(at) = t.find(q) {
-        return Some(2000 - pen(at) - len_pen(&t));
+    if let Some(at) = found().find(|&i| word(i)) {
+        return Some((3000 - pen(at) - len_pen, run(at)));
+    }
+    if let Some(at) = found().next() {
+        return Some((2000 - pen(at) - len_pen, run(at)));
     }
     // Subsequence: each letter after the last, greedily; a letter at a
     // word's start or right after the last one scores.
     let mut s: i32 = 1000;
-    let mut chars = t.char_indices();
-    let mut last: Option<usize> = None;
-    for qc in q.chars() {
-        let (i, _) = chars.find(|&(_, c)| c == qc)?;
-        s += match last {
-            Some(l) if i == l + 1 => 8,
-            _ if starts_word(&t, i) => 6,
-            _ => -(i as i32 - last.map_or(0, |l| l as i32)).min(20),
+    let mut at = Vec::with_capacity(n);
+    let mut from = 0;
+    for &qc in &q {
+        let i = from + t[from..].iter().position(|&c| c == qc)?;
+        s += match at.last() {
+            Some(&l) if i == l + 1 => 8,
+            _ if word(i) => 6,
+            _ => -(i as i32 - at.last().map_or(0, |&l| l as i32)).min(20),
         };
-        last = Some(i);
+        at.push(i);
+        from = i + 1;
     }
-    Some(s.clamp(1, 1999) as u32)
+    Some((s.clamp(1, 1999) as u32, at))
 }
 
-fn pen(at: usize) -> u32 {
-    (at as u32).min(200)
-}
-
-fn len_pen(t: &str) -> u32 {
-    (t.len() as u32 / 8).min(100)
-}
-
-fn starts_word(t: &str, i: usize) -> bool {
-    i == 0 || t[..i].chars().next_back().is_some_and(|c| !c.is_alphanumeric())
+/// `text` with the chars at `at` (char indices) in `color`, the rest as
+/// they are (no fill: VS Code's quick open).
+pub(crate) fn marked(text: &SharedString, at: &[usize], color: Hsla) -> StyledText {
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for (k, (b, c)) in text.char_indices().enumerate() {
+        if at.binary_search(&k).is_ok() {
+            match ranges.last_mut() {
+                Some(r) if r.end == b => r.end = b + c.len_utf8(),
+                _ => ranges.push(b..b + c.len_utf8()),
+            }
+        }
+    }
+    let style = HighlightStyle { color: Some(color), ..Default::default() };
+    StyledText::new(text.clone()).with_highlights(ranges.into_iter().map(|r| (r, style)))
 }
 
 /// One line of the list: a group head, or a shown row.
@@ -212,6 +317,9 @@ pub(crate) struct Palette {
     pub commands: Vec<Entry>,
     /// The mode's rows the query keeps, best first (indices).
     pub shown: Vec<usize>,
+    /// The shown rows' matched chars (indices): in the title, or in the
+    /// meta when the row matched there ([`hit`]).
+    pub marks: Vec<(Vec<usize>, Vec<usize>)>,
     /// Index into `shown`.
     pub sel: usize,
     /// The query held an engine command and its argument (`model x`).
@@ -223,8 +331,18 @@ pub(crate) struct Palette {
 
 impl Palette {
     pub fn new(mode: Mode, goto: Vec<Entry>, commands: Vec<Entry>) -> Self {
-        let mut p =
-            Palette { mode, query: String::new(), raw: String::new(), goto, commands, shown: Vec::new(), sel: 0, arg: None, moved: false };
+        let mut p = Palette {
+            mode,
+            query: String::new(),
+            raw: String::new(),
+            goto,
+            commands,
+            shown: Vec::new(),
+            marks: Vec::new(),
+            sel: 0,
+            arg: None,
+            moved: false,
+        };
         p.filter();
         p
     }
@@ -284,24 +402,25 @@ impl Palette {
             self.arg = Some((name, arg.to_string()));
         }
         let entries = self.entries();
-        let mut hits: Vec<(usize, u32)> = entries
+        type Hit = (usize, u32, (Vec<usize>, Vec<usize>));
+        let mut hits: Vec<Hit> = entries
             .iter()
             .enumerate()
             .filter_map(|(i, e)| {
                 if q.is_empty() {
-                    return Some((i, 0));
+                    return Some((i, 0, Default::default()));
                 }
                 if let Some((name, _)) = self.arg
                     && e.act == Act::Engine(name)
                 {
-                    return Some((i, 5000));
+                    return Some((i, 5000, Default::default()));
                 }
-                let title = score(q, &e.title);
-                let meta = || score(q, &e.meta).filter(|&s| s >= 2000).map(|s| s - 1500);
-                title.or_else(meta).map(|s| (i, s))
+                let title = hit(q, &e.title).map(|(s, at)| (i, s, (at, Vec::new())));
+                let meta = || hit(q, &e.meta).filter(|h| h.0 >= 2000).map(|(s, at)| (i, s - 1500, (Vec::new(), at)));
+                title.or_else(meta)
             })
             .collect();
-        let best = |g: Group| hits.iter().filter(|(i, _)| entries[*i].group == g).map(|h| h.1).max().unwrap_or(0);
+        let best = |g: Group| hits.iter().filter(|h| entries[h.0].group == g).map(|h| h.1).max().unwrap_or(0);
         let mut groups: Vec<Group> = entries.iter().map(|e| e.group).collect();
         groups.sort();
         groups.dedup();
@@ -313,7 +432,8 @@ impl Palette {
             let (ea, eb) = (&entries[a.0], &entries[b.0]);
             place(ea.group).cmp(&place(eb.group)).then(b.1.cmp(&a.1)).then(ea.rank.cmp(&eb.rank)).then(a.0.cmp(&b.0))
         });
-        self.shown = hits.into_iter().map(|h| h.0).take(SHOWN_MAX).collect();
+        hits.truncate(SHOWN_MAX);
+        (self.shown, self.marks) = hits.into_iter().map(|h| (h.0, h.2)).unzip();
         self.sel = 0;
         self.moved = false;
     }
@@ -371,8 +491,11 @@ const PLACEHOLDER_COMMANDS: &str = "run a command, or /compact, /model provider/
 
 /// The palette's keys while it is open, on the root ahead of its query
 /// field's own bindings (capture phase): ↑/↓ and PageUp/PageDown move the
-/// selection, Enter picks, Tab flips the mode, Esc closes it. Closed, they
-/// go on to whatever has the focus.
+/// selection, Enter picks, Tab flips the mode, Esc closes it (an IME
+/// composition's Esc is the composition's). The app's keys under it do
+/// nothing (the tabs, the panels, the text size, F2, Ctrl+D, the workers'
+/// keys): only Ctrl+P / Ctrl+K and Ctrl+J (the card, which closes it) act.
+/// Closed, they go on to whatever has the focus.
 pub(crate) fn capture_keys(d: Stateful<Div>, cx: &Context<AppView>) -> Stateful<Div> {
     use gpui_kit::base::input::{Enter, Escape, IndentInline, MoveDown, MovePageDown, MovePageUp, MoveUp, OutdentInline};
     fn on<A: Action>(
@@ -393,7 +516,53 @@ pub(crate) fn capture_keys(d: Stateful<Div>, cx: &Context<AppView>) -> Stateful<
     let d = on(d, cx, |this, _: &MovePageDown, _, cx| this.palette_step(PAGE, false, cx));
     let d = on(d, cx, |this, _: &IndentInline, window, cx| this.palette_flip(window, cx));
     let d = on(d, cx, |this, _: &OutdentInline, window, cx| this.palette_flip(window, cx));
-    let d = on(d, cx, |this, _: &Escape, window, cx| this.close_palette(window, cx));
+    let d = d.capture_action(cx.listener(|this: &mut AppView, _: &Escape, window, cx| {
+        if this.palette.is_none()
+            || this.palette_input.update(cx, |s, cx| gpui_kit::EntityInputHandler::marked_text_range(s, window, cx)).is_some()
+        {
+            return;
+        }
+        cx.stop_propagation();
+        this.close_palette(window, cx);
+    }));
+    macro_rules! inert {
+        ($d:expr, $($a:ident),* $(,)?) => {
+            $d$(.capture_action(cx.listener(|this: &mut AppView, _: &crate::app::$a, _, cx| {
+                if this.palette.is_some() {
+                    cx.stop_propagation();
+                }
+            })))*
+        };
+    }
+    let d = inert!(
+        d,
+        ToggleRail,
+        ToggleRight,
+        TextBigger,
+        TextSmaller,
+        TextReset,
+        NewTab,
+        CloseTab,
+        ReopenTab,
+        NextTab,
+        PrevTab,
+        Tab1,
+        Tab2,
+        Tab3,
+        Tab4,
+        Tab5,
+        Tab6,
+        Tab7,
+        Tab8,
+        LastTab,
+        OpenSettings,
+        OpenUsage,
+        WorkerUp,
+        WorkerDown,
+        WorkerTab,
+        RenameSession,
+        ToggleFavourite,
+    );
     on(d, cx, |this, _: &Enter, window, cx| {
         // Its repeats go nowhere once it has closed (a held Enter on a
         // session would send the composer's draft): as a menu's pick.
@@ -525,11 +694,11 @@ impl AppView {
         // open tab's key as its trail.
         for (i, s) in m.sessions.iter().enumerate().filter(|(_, s)| s.lifecycle != "ending") {
             let st = m.state(s);
-            let title = match (s.name.as_deref().filter(|n| !n.is_empty()), s.title.as_deref().filter(|t| !t.is_empty())) {
-                (Some(n), _) => n.to_string(),
-                (None, Some(t)) => t.to_string(),
-                (None, None) if s.messages == 0 => "New session".into(),
-                (None, None) => s.id.clone(),
+            let (title, machine) = match (s.name.as_deref().filter(|n| !n.is_empty()), s.title.as_deref().filter(|t| !t.is_empty())) {
+                (Some(n), _) => (n.to_string(), true),
+                (None, Some(t)) => (t.to_string(), false),
+                (None, None) if s.messages == 0 => ("New session".into(), false),
+                (None, None) => (s.id.clone(), true),
             };
             let since = s.state_since.as_deref().or(Some(s.created_at.as_str()).filter(|c| !c.is_empty()));
             let mut meta: Vec<String> = Vec::new();
@@ -538,12 +707,10 @@ impl AppView {
             if s.cost_usd >= 0.005 {
                 meta.push(format!("${:.2}", s.cost_usd));
             }
-            let tab = m
-                .tabs
-                .iter()
-                .filter(|t| t.kind.attaches())
-                .position(|t| t.kind == crate::tabs::Kind::Session && t.session.as_deref() == Some(&s.id));
+            // Ctrl+N is the Nth tab of all (Settings and Usage too).
+            let tab = m.tabs.iter().position(|t| t.kind == crate::tabs::Kind::Session && t.session.as_deref() == Some(&s.id));
             let mut e = Entry::new(Group::Sessions, Act::Row(RowAction::Attach(s.id.clone())), title);
+            e.mono = machine;
             e.meta = meta.join(" · ").into();
             e.lead = Lead::Session(st);
             e.rank = state_rank(st) * 10_000 + i as u32;
@@ -574,7 +741,9 @@ impl AppView {
                 cwd: v.cwd.clone().filter(|c| !c.is_empty()),
                 by_name: false,
             };
+            let machine = name.is_some() || v.title.as_deref().is_none_or(str::is_empty);
             let mut e = Entry::new(Group::History, Act::Row(RowAction::Resume(req)), title);
+            e.mono = machine;
             e.meta = meta.join(" · ").into();
             e.lead = Lead::Session(m.saved_state(v));
             e.rank = i as u32;
@@ -589,6 +758,7 @@ impl AppView {
         }
         // COMMANDS: the app's actions, then the engine's.
         let attached = m.active.is_some();
+        let on_session = m.tabs.current().is_some_and(|t| t.kind == crate::tabs::Kind::Session && t.session.is_some());
         let level = crate::motion::Level::current(cx);
         let theme = cx.global::<crate::theme::Scheme>().choice.theme.clone();
         let apps: [AppRow; 15] = [
@@ -610,7 +780,13 @@ impl AppView {
                 "the authorize card".into(),
                 m.transcript.pending_prompts().is_empty().then_some("nothing is waiting on you"),
             ),
-            (AppAct::Favourite, "Favourite this session", k("Ctrl+D", "⌘D"), "".into(), (!attached).then_some("no session on screen")),
+            (
+                AppAct::Favourite,
+                "Favourite this session",
+                k("Ctrl+D", "⌘D"),
+                "".into(),
+                (!on_session).then_some("no session tab on screen"),
+            ),
             (
                 AppAct::Halt,
                 "HALT the running turn",
@@ -623,7 +799,7 @@ impl AppView {
                 "Detach (close tab)",
                 k("Ctrl+W", "⌘W"),
                 "the session keeps running".into(),
-                (!attached).then_some("no session on screen"),
+                (!on_session).then_some("no session tab on screen"),
             ),
         ];
         let mut commands = Vec::new();
@@ -639,7 +815,8 @@ impl AppView {
         for (i, (name, _, about)) in ENGINE.iter().enumerate() {
             let mut e = Entry::new(Group::Commands, Act::Engine(name), format!("/{name}"));
             e.meta = (*about).into();
-            e.key = Some("owner".into());
+            // Marked only where it says something: observing.
+            e.key = gate.is_some().then(|| "owner".into());
             e.rank = 100 + i as u32;
             e.off = gate.map(|why| format!("/{name} is the session owner's: {why}").into());
             commands.push(e);
@@ -665,7 +842,22 @@ impl AppView {
             cx.notify();
             return;
         }
-        let arg = p.arg.clone();
+        // Its argument, as the command takes it: else the palette stays, the
+        // note says what it takes.
+        let arg = match e.act {
+            Act::Engine(name) if e.off.is_none() => {
+                let arg = p.arg.clone().filter(|a| a.0 == name).map(|a| a.1).unwrap_or_default();
+                match valid(name, &arg) {
+                    Some((_, arg)) => arg,
+                    None => {
+                        self.watch_note = Some(usage(name).into());
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            _ => String::new(),
+        };
         self.close_palette(window, cx);
         if let Some(why) = e.off {
             self.watch_note = Some(why);
@@ -687,7 +879,6 @@ impl AppView {
             }
             Act::App(a) => self.app_act(a, window, cx),
             Act::Engine(name) => {
-                let arg = arg.filter(|a| a.0 == name).map(|a| a.1).unwrap_or_default();
                 self.run_command(name, arg);
             }
         }
@@ -741,7 +932,14 @@ impl AppView {
             AppAct::FoldAll => self.fold_all_runs(false, cx),
             AppAct::UnfoldAll => self.fold_all_runs(true, cx),
             AppAct::JumpWaiting => self.jump_to_card(window, cx),
-            AppAct::Favourite => self.fav_key_pressed(window, cx),
+            // A pick, not the raw chord: no typing guard (the composer
+            // has the focus back by now when the palette was opened there).
+            AppAct::Favourite => {
+                if let Some(id) = self.model.tabs.current().filter(|t| t.kind == crate::tabs::Kind::Session).and_then(|t| t.session.clone())
+                {
+                    self.toggle_fav_session(&id);
+                }
+            }
             AppAct::Halt => self.halt(),
             AppAct::Detach => self.tab_act(crate::app::TabKey::Close, cx),
         }
@@ -779,22 +977,48 @@ const PAL_SEL: u64 = 0x7AE8 << 48;
 const PAL_H: u64 = 0x7AE9 << 48;
 /// The list's tallest (then it scrolls).
 const LIST_MAX: f32 = 416.;
-/// The box's widest, and its top under the window's.
+/// A machine name's title: mono a step under the sans title's 14 (the
+/// query's size).
+const MONO_TITLE: f32 = 13.;
+/// The box's widest.
 pub(crate) const WIDTH: f32 = 640.;
-pub(crate) const TOP: f32 = 72.;
+/// Its top under the tab strip's bottom, and its least room above the
+/// composer's frame (a canvas sliver between two frames reads as a double
+/// rule).
+pub(crate) const UNDER_STRIP: f32 = 10.;
+pub(crate) const ABOVE_COMPOSER: f32 = 16.;
+/// Its top without a tab strip laid out yet (P16's figure).
+const TOP: f32 = 72.;
+/// The box's height but the list's: its head (12 + 28 + 8), the query
+/// (32 + 8), the rule, the foot and the frame.
+const CHROME_H: f32 = 48. + 40. + 1. + 8. + 2.;
 
 impl AppView {
     /// The palette on the overlay box over the centre pane (`left`,
-    /// `pane` wide), its top [`TOP`] under the window's: no scrim (the
-    /// frame is the house's elevation), no enter (opened by key).
-    pub(crate) fn render_palette(&self, left: f32, pane: f32, p: &Colors, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
+    /// `pane` wide), hung [`UNDER_STRIP`] under the tab strip as laid out
+    /// (never over a tab's name), ending [`ABOVE_COMPOSER`] or more above
+    /// `bottom` (the composer's frame): no scrim (the frame is the house's
+    /// elevation), no enter (opened by key).
+    pub(crate) fn render_palette(
+        &self,
+        left: f32,
+        pane: f32,
+        bottom: f32,
+        p: &Colors,
+        cx: &Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
         let pal = self.palette.as_ref()?;
         let fx = &self.fx;
         let w = WIDTH.min(pane - 48.).max(280.);
         let x = left + ((pane - w) / 2.).max(0.);
         let lines = pal.lines();
         let (ys, content) = line_y(&lines);
-        let max = LIST_MAX.min((self.height - TOP - 120.).max(ROW_H * 3.));
+        let strip = self.strip_at.get();
+        let top = if strip.y > px(0.) { f32::from(strip.y) + crate::tabstrip::TAB_H + UNDER_STRIP } else { TOP };
+        let bottom = if bottom > top { bottom } else { self.height };
+        let max = LIST_MAX.min((bottom - ABOVE_COMPOSER - top - CHROME_H).max(ROW_H * 3.));
+        #[cfg(test)]
+        self.palette_box.set((top, top + CHROME_H + max));
         let target = content.min(max);
         let snap = crate::motion::SNAP_RESPONSE;
         let (h, _) = fx.spring(PAL_H, None, target, snap);
@@ -815,6 +1039,14 @@ impl AppView {
         #[cfg(test)]
         self.palette_drawn.set((h, target, quad.unwrap_or(0.), sel_y.unwrap_or(0.)));
         let entries = pal.entries();
+        let mut counts: Vec<(Group, usize)> = Vec::new();
+        for &i in &pal.shown {
+            let g = entries[i].group;
+            match counts.iter_mut().find(|c| c.0 == g) {
+                Some(c) => c.1 += 1,
+                None => counts.push((g, 1)),
+            }
+        }
         let mut list = div().id("palette-list").relative().overflow_y_scroll().track_scroll(&self.palette_scroll).h(px(h)).w_full();
         // The quad first: under the rows it slides behind.
         if let Some(y) = quad {
@@ -841,10 +1073,14 @@ impl AppView {
                         .gap(px(10.))
                         .child(display(head, size::D_S, p.dim_k))
                         .when_some(jp, |d, jp| d.child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_k).child(jp)))
+                        // How many it holds: more than the box shows says so.
+                        .child(mono(counts.iter().find(|c| c.0 == g).map_or(0, |c| c.1).to_string(), size::META, p.dim_k))
                         .into_any_element()
                 }
                 Line::Row(k) => {
                     let e = &entries[pal.shown[k]];
+                    let none = (Vec::new(), Vec::new());
+                    let marks = pal.marks.get(k).unwrap_or(&none);
                     let bg = if k == pal.sel { p.card_hi } else { p.card };
                     let lead = match e.lead {
                         Lead::Session(st) => crate::glyph::session_live(st, crate::glyph::Ground::Card, bg, p, fx).into_any_element(),
@@ -877,12 +1113,22 @@ impl AppView {
                                         .max_w(px(w * 0.6))
                                         .overflow_hidden()
                                         .text_ellipsis()
-                                        .text_px(size::UI)
+                                        .when(e.mono, |d| d.font_family(fonts::MONO).text_px(MONO_TITLE))
+                                        .when(!e.mono, |d| d.text_px(size::UI))
                                         .text_color(title)
-                                        .child(e.title.clone()),
+                                        .child(marked(&e.title, &marks.0, p.you)),
                                 )
                                 .when(!e.meta.is_empty(), |d| {
-                                    d.child(mono(e.meta.clone(), size::META, p.dim_k).min_w_0().overflow_hidden().text_ellipsis())
+                                    d.child(
+                                        div()
+                                            .font_family(fonts::MONO)
+                                            .text_px(size::META)
+                                            .text_color(p.dim_k)
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .child(marked(&e.meta, &marks.1, p.you)),
+                                    )
                                 }),
                         )
                         .when_some(e.key.clone(), |d, k| d.child(mono(k, size::META, p.dim_k).flex_none()))
@@ -913,12 +1159,10 @@ impl AppView {
                 .cursor_pointer()
                 .when(on, |d| d.bg(p.card_hi).child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(p.you_bar)))
                 .child(display(text, size::D_S, if on { p.ink } else { p.dim_k }))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                // As its key: the placeholder and the scroll follow.
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     cx.stop_propagation();
-                    if let Some(pal) = this.palette.as_mut() {
-                        pal.set_mode(mode);
-                    }
-                    cx.notify();
+                    this.open_palette(mode, window, cx);
                 }))
         };
         let head = h_flex()
@@ -945,7 +1189,8 @@ impl AppView {
             .px(px(10.))
             .gap(px(10.))
             .items_center()
-            .border_1()
+            // The TUI's prompt line: the chevron, one `focus_k` underline.
+            .border_b_1()
             .border_color(p.focus_k)
             .child(crate::glyph::draw(crate::glyph::Glyph::Fold, p.you))
             .child(
@@ -967,14 +1212,19 @@ impl AppView {
             .child(input)
             .child(div().h(px(1.)).bg(p.frame))
             .child(list)
-            .child(div().h(px(8.)));
-        Some(deferred(anchored().position(point(px(x), px(TOP))).child(body)).with_priority(4))
+            .child(div().h(px(8.)))
+            // The house scrollbar, at rest too: the list goes on below.
+            .child(
+                crate::scrollbar::Bar::new(self.palette_scroll.clone(), &self.bars.palette).ground(crate::scrollbar::Ground::Card).always(),
+            );
+        Some(deferred(anchored().position(point(px(x), px(top))).child(body)).with_priority(4))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Act, AppAct, Entry, Group, Line, Mode, Palette, engine_of, reply_note, score};
+    use super::{Act, AppAct, Entry, Group, Line, Mode, Palette, engine_of, hit, invocation, reply_note, score};
+    use synaps_client::CommandReply::{Done, NotRun, Unknown};
 
     fn e(group: Group, title: &str, rank: u32) -> Entry {
         let mut e = Entry::new(group, Act::App(AppAct::Halt), title.to_string());
@@ -1062,7 +1312,87 @@ mod tests {
         p.set_query("model anthropic/x");
         assert_eq!(p.selected().map(|e| e.act.clone()), Some(Act::Engine("model")));
         assert_eq!(p.arg, Some(("model", "anthropic/x".to_string())));
-        assert_eq!(reply_note("context", &Ok("\n  ctx 12%\nmore".into())), "/context: ctx 12%");
-        assert_eq!(reply_note("compact", &Err("refused: observing".into())), "/compact not run: refused: observing");
+        assert_eq!(reply_note("context", &Done("\n  ctx 12%".into())), "/context: ctx 12%");
+        assert_eq!(reply_note("compact", &NotRun("refused: observing".into())), "/compact not run: refused: observing");
+    }
+
+    /// Shady #20 H1/M2/M4: what the note says of each answer. `/compact`'s
+    /// `none` is asked (its outcome is the log's), never "not run"; a
+    /// longer answer is its first line and how many more are in the
+    /// transcript; no answer is unknown, not "not run".
+    #[test]
+    fn reply_notes_say_what_happened() {
+        assert_eq!(reply_note("compact", &Done(String::new())), "/compact: asked (the log shows how it goes)");
+        assert_eq!(reply_note("confirms", &Done(String::new())), "/confirms: done");
+        let workers = "Workers (2):\n  sa_1  scout  running  0m\n  sa_2  wren  completed  3m";
+        assert_eq!(reply_note("workers", &Done(workers.into())), "/workers: Workers (2): (+2 lines in the transcript)");
+        assert_eq!(
+            reply_note("model", &NotRun("not switched: the model is still claude-opus-4-6".into())),
+            "/model not run: not switched: the model is still claude-opus-4-6"
+        );
+        assert_eq!(
+            reply_note("compact", &Unknown("the link dropped before the daemon answered".into())),
+            "/compact: unknown — the link dropped before the daemon answered"
+        );
+    }
+
+    /// Shady #20 H2: the composer's text is a command only when the whole
+    /// of it is one valid invocation (the daemon's grammar); prose that
+    /// starts with a command word is a message, as it always was.
+    #[test]
+    fn only_a_whole_valid_invocation_is_a_command() {
+        let yes = |t: &str, name: &str, arg: &str| assert_eq!(invocation(t), Some((name_of(name), arg.to_string())), "{t}");
+        fn name_of(n: &str) -> &'static str {
+            super::ENGINE.iter().find(|e| e.0 == n).expect("listed").0
+        }
+        for t in [
+            "/model is this the wrong one?",
+            "/model sonnet",
+            "/model",
+            "/workers are stuck",
+            "/workers cancel scout",
+            "/usr/bin",
+            "/etc/hosts is broken",
+            "/compactx",
+            "hello /compact",
+            "/context please",
+            "/context auto 1",
+            "/trace everything",
+            "/budget time forever",
+            "/budget time 30",
+            "/confirms yes",
+        ] {
+            assert_eq!(invocation(t), None, "{t}: a message");
+        }
+        yes("/compact", "compact", "");
+        yes("  /compact please keep the auth bits ", "compact", "please keep the auth bits");
+        yes("/model openai/gpt-5.1", "model", "openai/gpt-5.1");
+        yes("/model claude-opus-4-6", "model", "claude-opus-4-6");
+        yes("/model o3", "model", "o3");
+        yes("/workers", "workers", "");
+        yes("/workers   cancel  sa_3", "workers", "cancel sa_3");
+        yes("/workers reconcile all", "workers", "reconcile all");
+        yes("/context auto 120000 160000", "context", "auto 120000 160000");
+        yes("/context off", "context", "off");
+        yes("/trace next content", "trace", "next content");
+        yes("/budget time 30m", "budget", "time 30m");
+        yes("/budget time off", "budget", "time off");
+        yes("/confirms reset", "confirms", "reset");
+    }
+
+    /// Design gate #20 (4): `hit` returns the chars it ranked on, in the
+    /// text's own char indices (multibyte too), for every tier.
+    #[test]
+    fn hits_are_the_chars_ranked_on() {
+        assert_eq!(hit("led", "ledger-drift"), Some((4000 - 1, vec![0, 1, 2])));
+        assert_eq!(hit("drift", "ledger-drift").map(|h| h.1), Some(vec![7, 8, 9, 10, 11]), "a word's start");
+        assert_eq!(hit("dge", "ledger-drift").map(|h| h.1), Some(vec![2, 3, 4]), "anywhere");
+        assert_eq!(hit("ldr", "ledger-drift").map(|h| h.1), Some(vec![0, 2, 5]), "in order");
+        assert_eq!(hit("éa", "café au lait").map(|h| h.1), Some(vec![3, 5]), "chars, not bytes");
+        assert_eq!(hit("x", "ledger"), None);
+        assert_eq!(hit("f", "now full, next reduced").map(|h| h.1), Some(vec![4]));
+        for (q, t) in [("led", "ledger-drift"), ("ldr", "ledger-drift"), ("dge", "ledger-drift")] {
+            assert_eq!(score(q, t), hit(q, t).map(|h| h.0));
+        }
     }
 }
