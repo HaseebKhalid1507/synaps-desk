@@ -42,9 +42,10 @@ the turn after the running tool's result (`drain_steering`), as a `role=user` me
 history append carries it there.
 
 So the desk's row: the `External` frame starts it at once (a note, at the end of the transcript); a
-`SteeringDelivered` (or `Steered`) carrying the same id adds nothing; the history append that holds the
-message turns the note into that message's row, at the message's place (same row id, its live time and the
-frame-only fields kept). For an idle wake that is right above the turn's reply.
+`SteeringDelivered` carrying the same id adds nothing; the history append that holds the message turns the note
+into that message's row, at the message's place (same row id, its live time and the frame-only fields kept). For
+an idle wake that is right above the turn's reply. **Round 2** (Shady #22 H1): that held only for the windows
+above; an event that comes while the reply streams is now held last until delivered (below).
 
 ## Disclosure (spec §9.7)
 
@@ -59,9 +60,22 @@ whatever the class.
 
 What the desk does: it shows no more than the TUI, and less for a withheld class. `ExternalEvent::shown` applies the
 same gate as the agent's form: a withheld class's live row shows the same marker as its history row, and keeps no
-data; a class this client doesn't know is withheld (closed, as the gate fails). So a reload never shows less than
-the live row did, and the desk never displays a class's content that its own history would not. Tests:
+data; a class this client doesn't know is withheld (closed, as the gate fails). Tests:
 `events::tests::a_withheld_class_shows_its_marker_live_as_in_the_history`.
+
+**Round 2, `local_only` (Haseeb's call on Shady #22 M3):** that class is defined as "display locally only, never
+enters model context", so its live row shows its text (and data) with a quiet `not sent to the agent` mark. Its
+history row can only show what the agent's form kept, the marker `[content withheld: local_only (local_only)]`. So
+for this class a reload shows less than the live row did: the one mismatch between them, by design. Within the
+session the row keeps the live text after its message lands (the same row). Every other withheld class
+(`…_after_redaction`, `…_after_consent`, `persist_never_transmit`, unknown) shows the marker live too. Tests:
+`events::tests::a_withheld_class_…` (client), `events::tests::a_local_only_event_shows_live_marked_and_the_marker_after_a_reload`
+(desk); live: `r2/stills/stream-local.png` against `r2/stills/reload-1920x1080-nord.png` (`side-stream-reload.png`).
+
+**`never_persist` (Shady #22 N4):** the engine shows it and keeps it nowhere (`DisplayOnly`: not in the history,
+not in a buffer, not steered). Its live row is all there is: it stays a note, and a reload has none of it. A
+session not attached never learns of it, so it marks no rail row. Test:
+`a_never_persisted_event_keeps_its_live_row`.
 
 ## Stills and the clip
 
@@ -79,3 +93,42 @@ the live row did, and the desk never displays a class's content that its own his
   reloaded ones (right): the same rows. `side-midturn.png`: mid-turn, live then after the turn.
 - The tab mark: `ev-side` was not open as a tab in the run; a tab reads the same `Model::fact` as the rail
   (`tabstrip.rs`), covered by `model::tests::an_event_on_a_session_not_on_screen_marks_it_unread`.
+
+## Round 2: an event while the reply streams (Shady #22 H1)
+
+The same sandbox and scripts (`live.sh setup`, `stream`, `reload`, `teardown`), this branch's release build at
+`9e7ca7d`, sha256 `a52bf24c…7b0d45`. Config sha `c1b7ac41…320edd` before and after, 0 auth lines left
+(`r2/logs/live.log`). `settings.json`'s mtime was `08:16:13.638` before the first app run of this round (it had
+changed since round 1's `07:04:07` by something else on bella: no run of mine was going) and the same after.
+
+**The frame order** (`r2/logs/frames-stream.log`): a 40-line reply, two `synaps send`s while its text streams:
+
+```
+ 9.846 seq 58 stream/llm/response_start
+11.616   (20 thinking, 50 text deltas)
+11.616 seq 129 external id=7a6c16d0-… severity=High      ← mid-text
+13.820   (89 text deltas)
+13.820 seq 220 external id=7400ed73-… severity=Medium    ← mid-text
+18.942   (203 text deltas)
+18.947 seq 426 stream/agent/steering_delivered event-payload id=7a6c16d0-…   ← the round's text done, no tool
+18.947 seq 427 stream/agent/steering_delivered event-payload id=7400ed73-…
+18.947 seq 429 conversation messages_len=6               ← the reply, then the two events' messages
+19.503 seq 430 stream/llm/response_start                 ← a second round: the agent answers them
+```
+
+So the history has the whole reply, then the events, then the answer; round 1's desk had put each event row
+where its frame came, between two halves of the reply. Now the row is held last: the reply streams on above it
+(`r2/stills/stream-held-1.png`, `-2`, `-4`: one AGENT response, the events under it), the
+`steering_delivered`s leave it there, and the second round goes under it (`stream-after.png`). Relaunched on the
+session (the history form), the rows are the same, in the same order (`side-stream-reload.png`: live left,
+reload right; the only difference is the `local_only` row, above).
+
+`r2/events-stream-held.mp4`: 13 s from just after the prompt to the second round's answer, 800×1080 (the
+transcript column, cropped at x 530), 30 fps, lossless (libx264rgb qp 0, gbrp). Its frame md5 `eeb77fa4f792` is
+the same crop of the capture's mkv (kept off the repo, 66 s at 1920×1080). Drive log:
+`r2/logs/stream-1920-nord-drive.log`.
+
+What the history form can't say (documented in `ExternalEvent::from_payload`): a text whose last line is
+`Data: {…}` or `Data: […]` (valid JSON) on an event with no data reads, after a reload, as that data (the live
+row, which knows, keeps it as text). A `Data:` line anywhere else, or one that is not JSON nor the form's
+1000-character cut, is text in both.

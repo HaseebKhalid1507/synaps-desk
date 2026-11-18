@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Observe one daemon session's frames (an Observe attach, Digest history) and log their order:
 one line per frame, its arrival time, seq and kind, and for events their id and severity.
-Text deltas are counted, not printed. usage: frames.py <daemon socket> <session id> <seconds> <log>"""
+Deltas are counted by kind (text, thinking, ...), not printed. usage: frames.py <daemon socket> <session id> <seconds> <log>"""
 import json, socket, sys, time
 
 sock_path, sid, secs, out = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
@@ -14,10 +14,13 @@ send({"type": "hello", "protocol_version": 3, "cwd": "/tmp", "client_version": "
       "client": {"kind": "attach", "terminal": None, "instance": "evframes", "history": "digest", "tail_items": 0,
                  "capabilities": {"tool_queue": True, "owner_reason_input": True}, "name": "evframes"}})
 send({"type": "attach", "attach": "existing", "session_id": sid, "mode": "observe"})
-t0 = time.time(); s.settimeout(0.5); deltas = 0
+t0 = time.time(); s.settimeout(0.5); deltas = {}
 log = open(out, "a")
 def line(t, msg):
     log.write(f"{t - t0:8.3f} {msg}\n"); log.flush()
+def flush(now):
+    if deltas:
+        line(now, "  (" + ", ".join(f"{n} {k}" for k, n in deltas.items()) + " deltas)"); deltas.clear()
 buf = b""
 while time.time() - t0 < secs:
     try:
@@ -41,9 +44,8 @@ while time.time() - t0 < secs:
         if kind == "stream":
             st = ev.get("event", {}); sub = st.get("llm") or st.get("agent") or st.get("session")
             if sub in ("text", "thinking", "tool_use_delta", "tool_result_delta"):
-                deltas += 1; continue
-            if deltas:
-                line(now, f"  ({deltas} deltas)"); deltas = 0
+                deltas[sub] = deltas.get(sub, 0) + 1; continue
+            flush(now)
             extra = ""
             if sub == "steering_delivered":
                 m = st.get("message", "")
@@ -54,8 +56,7 @@ while time.time() - t0 < secs:
                 extra = f" {st.get('tool_name', '')} {st.get('tool_id', '')}"
             line(now, f"seq {seq} stream/{st.get('kind')}/{sub}{extra}")
             continue
-        if deltas:
-            line(now, f"  ({deltas} deltas)"); deltas = 0
+        flush(now)
         extra = ""
         if kind == "external":
             e = ev.get("event", {}); c = e.get("content", {})

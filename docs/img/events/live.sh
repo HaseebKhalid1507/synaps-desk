@@ -5,6 +5,9 @@
 #   record    the desk on ev-main, 1920 nord, lossless: events low/medium/high/critical, a channel,
 #             expects_response, mid-turn (a bash sleep) and idle, one to ev-side (the rail/tab mark)
 #   reload    the desk again on the same session (the history form): stills, 1920/1280 x nord/paper
+#   stream    round 2 (Shady #22 H1): the desk on ev-main, 1920 nord, lossless; two events sent while
+#             the model streams its reply (frames.py logs where they land among the deltas), then a
+#             local_only one; `reload` after it shows the history's rows
 #   teardown  daemon stopped, config restored (sha checked), settings.json mtime logged
 # Every app run: XDG_CONFIG_HOME absolute under ~/.cache (capture-linux.sh). Kills only its own PIDs.
 set -uo pipefail
@@ -49,7 +52,7 @@ order)
   sleep 30; tmux capture-pane -p -t evlive > live/tui-order-2.txt; tmux kill-session -t evlive
   wait $fp; say "frames logged: $(wc -l < live/frames.log) lines"
   ;;
-record|reload)
+record|reload|stream)
   sid=$(sid_of ev-main); side=$(sid_of ev-side); phase=$1
   run() { # run <name> <size> <theme> <secs> <keys fn>
     local n=$1 size=$2 theme=$3 secs=$4 fn=$5 out=raw/$1; rm -rf $out
@@ -93,6 +96,22 @@ record|reload)
     ev "low while scrolled up"; send "$sid" --severity low "Synthetic note: a scrolled-up view stays put."
     sleep 9; mark live-scrolled-after
   }
+  keys_stream() {
+    mark stream-open
+    k mousemove 960 985 click 1; sleep 0.4
+    k type --delay 25 "Write 40 numbered lines, one short sentence each, on how a lighthouse lens works. No tools, no preamble."
+    k key Return; sleep 2.2
+    ev "high, while it streams"; send "$sid" --severity high --channel alerts "Synthetic alert: disk on build-01 at 93%."
+    sleep 0.5; mark stream-held-1
+    sleep 1.6; ev "medium, while it streams"; send "$sid" --severity medium "Synthetic note: deploy 7.4.2 finished on web-03."
+    sleep 0.5; mark stream-held-2
+    sleep 1.5; mark stream-held-3
+    sleep 3; mark stream-held-4
+    sleep 22; mark stream-after
+    ev "local_only (inject)"
+    python3 $KIT/inject.py $RUN "$sid" '{"text": "Synthetic local note: one-time code 482913 (shown here, never sent to the agent).", "source": {"source_type": "cli", "name": "cli", "callback": null}, "content": {"text": "Synthetic local note: one-time code 482913 (shown here, never sent to the agent).", "content_type": "message", "severity": "Medium", "data": null, "disclosure": "local_only"}}' >> $dlog
+    sleep 14; mark stream-local
+  }
   keys_reload() {
     sleep 2; mark "reload-$1-$2"; k mousemove 640 300; k click 4 click 4 click 4; sleep 1; mark "reload-$1-$2-up"
     for _ in 1 2 3; do k click 4 click 4 click 4; sleep 0.3; done; sleep 1; mark "reload-$1-$2-up2"
@@ -100,6 +119,11 @@ record|reload)
   }
   if [ $phase = record ]; then
     run live-1920-nord 1920x1080 nord 150 keys_record
+  elif [ $phase = stream ]; then
+    sock=$(python3 -c "import json;print(json.load(open('$RUN/daemon-$P.json'))['socket'])")
+    python3 $KIT/frames.py "$sock" "$sid" 75 live/frames-stream.log & fp=$!; sleep 1
+    run stream-1920-nord 1920x1080 nord 66 keys_stream
+    wait $fp; say "stream frames logged: $(wc -l < live/frames-stream.log) lines"
   else
     run reload-1920-nord 1920x1080 nord 18 keys_reload
     run reload-1920-paper 1920x1080 paper 18 keys_reload
@@ -116,5 +140,5 @@ teardown)
   say "config restored sha $(sha256sum $cfg | cut -c1-64) (before $(cat live/config.sha0)), auth lines $(grep -c '^auth\.' $cfg)"
   say "settings.json mtime $(stat -c %y ~/.config/synaps-desktop/settings.json)"
   ;;
-*) echo "usage: live.sh setup|order|record|reload|teardown"; exit 2 ;;
+*) echo "usage: live.sh setup|order|record|reload|stream|teardown"; exit 2 ;;
 esac
