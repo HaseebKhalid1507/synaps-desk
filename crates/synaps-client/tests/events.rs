@@ -45,6 +45,28 @@ fn text_delta(t: &str) -> SessionEvent {
     ev(json!({"ev": "stream", "event": {"kind": "llm", "llm": "text", "text": t}}))
 }
 
+/// An attach snapshot (the captured fixture's frame, its conversation and
+/// replay replaced): `messages`, the ring's `replay` frames, a turn
+/// running or not, the events the engine holds.
+fn attached(messages: &[Value], replay: &[Value], streaming: bool, pending: usize) -> Attached {
+    let mut a: Value = serde_json::from_str(
+        &std::fs::read_to_string(format!("{}/tests/fixtures/attached_history.json", env!("CARGO_MANIFEST_DIR"))).unwrap(),
+    )
+    .unwrap();
+    let sid = a["meta"]["id"].clone();
+    a["conversation"]["api_messages"] = json!(messages);
+    a["conversation"]["messages_len"] = json!(messages.len());
+    a["conversation"]["pending_events_len"] = json!(pending);
+    a["replay"] = replay
+        .iter()
+        .enumerate()
+        .map(|(k, e)| json!({"session_id": sid, "seq": 100 + k, "ts": "2031-02-03T04:05:08Z", "event": e}))
+        .collect();
+    a["streaming"] = json!(streaming);
+    let DaemonFrame::Attached(a) = decode_frame(&a.to_string()).unwrap() else { panic!() };
+    *a
+}
+
 /// What a row shows: its kind, text, and of an event what its history
 /// form keeps.
 type Row = (ItemKind, String, Option<(String, String, Severity, Option<String>)>);
@@ -133,18 +155,33 @@ fn an_event_steered_into_a_turn_is_one_row_and_never_the_users() {
     assert_eq!(rows(&fresh), rows(&t));
 }
 
-/// The frame after its history row (an attach's replay, a late frame):
-/// no second row; the row takes what only the frame has.
+/// The frame after its history row (an attach's replay): no second row;
+/// the row takes what only the frame has. Outside a replay the engine
+/// sends the frame first, so a frame after a row with its form is another
+/// event (Shady #22 L4″: a watcher's re-alert, same id and words).
 #[test]
 fn a_frame_for_a_row_already_in_the_history_adds_none() {
+    let messages = [user(&payload("ev-3", "hello", "medium"))];
     let mut t = Transcript::new();
-    t.apply(&history(&[user(&payload("ev-3", "hello", "medium"))]));
+    t.load_attached(&attached(&messages, &[], false, 0)).unwrap();
     assert!(t.items()[0].event.as_ref().unwrap().sender.is_none(), "the form has no sender");
-    t.apply(&ev(external("ev-3", "hello", "Medium")));
-    t.apply(&ev(external("ev-3", "hello", "Medium")));
+    let frame = external("ev-3", "hello", "Medium");
+    t.load_attached(&attached(&messages, &[frame.clone(), frame.clone()], false, 0)).unwrap();
     assert_eq!(t.len(), 1);
     assert_eq!(t.items()[0].kind, ItemKind::Event);
     assert!(t.items()[0].event.as_ref().unwrap().sender.is_some(), "filled from the frame");
+    // Not a replay, in a window that has its history row only: a re-alert,
+    // its own row, held for its message.
+    let mut t = Transcript::new();
+    t.load_attached(&attached(&messages, &[], false, 0)).unwrap();
+    let mut realert = frame;
+    realert["event"]["timestamp"] = json!("2031-02-03T05:05:06Z");
+    t.apply(&ev(realert));
+    assert_eq!(t.len(), 2);
+    assert!(t.items()[1].is_note());
+    let both = [messages[0].clone(), messages[0].clone()];
+    t.apply(&history(&both));
+    assert!(t.len() == 2 && t.items().iter().all(|i| !i.is_note()), "{:?}", rows(&t));
 }
 
 /// The engine's notes about the session's own workers keep their notice
@@ -286,8 +323,8 @@ fn an_event_mid_text_stream_is_held_last_and_never_splits_the_reply() {
     assert_eq!(kinds(&t), [ItemKind::User, ItemKind::Assistant, ItemKind::Event]);
     assert_eq!(t.items()[1].text, "Autumn moonlight, a worm digs silently into the chestnut.");
     let live = ids(&t);
-    // Steered, never taken (no tool round): the engine flushes it after
-    // the reply at the turn's end.
+    // It came after the round's last drain of steering: the engine
+    // flushes it after the reply at the turn's end.
     let all = [
         user("write a haiku"),
         assistant("Autumn moonlight, a worm digs silently into the chestnut."),
@@ -459,14 +496,207 @@ fn a_reused_id_is_two_events_a_replay_is_one() {
     t.apply(&history(&all));
     assert_eq!(t.items().iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["disk at 91%", "disk at 97%"]);
     assert!(t.items().iter().all(|i| !i.is_note()));
-    // A frame for a history row (no time): the same form is that row; the
-    // id with other words is another event.
+    // A frame for a history row (no time), replayed: the same form is that
+    // row; the id with other words is another event.
     let mut h = Transcript::new();
-    h.apply(&history(&all[..1]));
-    h.apply(&ev(sent("disk-build-01", "disk at 91%", "2031-02-03T04:05:06Z")));
+    let frame = sent("disk-build-01", "disk at 91%", "2031-02-03T04:05:06Z");
+    h.load_attached(&attached(&all[..1], &[frame], false, 0)).unwrap();
     assert_eq!(h.len(), 1);
     h.apply(&ev(sent("disk-build-01", "disk at 99%", "2031-02-03T04:25:06Z")));
     assert_eq!(h.len(), 2);
+}
+
+/// Shady #22 L4′: a reused id, the earlier event's message in no fold (a
+/// `never_persist` one) and the later one's in a resync: each row is its
+/// own event's, by form first; a `never_persist` row never takes a
+/// message by its id.
+#[test]
+fn a_reused_id_takes_its_own_message() {
+    let mut otp = sent("x-1", "otp 482913", "2031-02-03T04:05:06Z");
+    otp["event"]["content"]["disclosure"] = json!("never_persist");
+    let mut t = Transcript::new();
+    turn(&mut t, "go");
+    t.apply(&ev(otp));
+    t.apply(&text_delta("ok"));
+    let mut all = vec![user("go"), assistant("ok")];
+    t.apply(&history(&all));
+    t.apply(&idle());
+    // Idle: the next one wakes a turn; its message comes in a resync.
+    t.apply(&ev(sent("x-1", "deploy finished", "2031-02-03T04:06:06Z")));
+    let (n, e) = (t.items()[2].id, t.items()[3].id);
+    t.apply(&ev(json!({"ev": "turn_started", "turn_baseline": 3, "trigger": "event_auto", "user_text": null})));
+    all.push(user(&sent_form("x-1", "deploy finished")));
+    t.apply_update(&synaps_client::history::HistoryUpdate::Replace { messages: all.clone() }).unwrap();
+    let row = |id: u64| t.items().iter().find(|i| i.id == id).unwrap().clone();
+    assert!(row(n).is_note() && row(n).text == "otp 482913", "the never_persist row stays a note");
+    assert!(!row(e).is_note() && row(e).text == "deploy finished", "the message took its own row");
+    assert_eq!(t.items().iter().filter(|i| i.kind == ItemKind::Event).count(), 2);
+}
+
+/// Shady #22 L3′: an event's form in a text block of a user message is an
+/// event row too, and takes its live row.
+#[test]
+fn an_event_form_in_a_text_block_is_an_event_row() {
+    let form = sent_form("ev-blk", "deploy finished");
+    let block = json!({"role": "user", "content": [{"type": "text", "text": form}]});
+    let mut t = Transcript::new();
+    t.apply(&ev(sent("ev-blk", "deploy finished", "2031-02-03T04:05:06Z")));
+    let live = t.items()[0].id;
+    t.apply(&history(std::slice::from_ref(&block)));
+    assert_eq!(kinds(&t), [ItemKind::Event]);
+    assert!(t.items()[0].id == live && !t.items()[0].is_note());
+    reloads_the_same(&t, &[block]);
+}
+
+// ── Shady #22 H1′: events the engine keeps past a failed turn ─────────────
+
+fn digest(pending: usize) -> SessionEvent {
+    ev(json!({"ev": "conversation", "digest": {"messages_len": 0, "messages_hash": 0, "pending_events_len": pending}}))
+}
+
+fn session(v: Value) -> SessionEvent {
+    let mut e = json!({"kind": "session"});
+    e.as_object_mut().unwrap().extend(v.as_object().unwrap().clone());
+    ev(json!({"ev": "stream", "event": e}))
+}
+
+fn replace(t: &mut Transcript, messages: &[Value]) {
+    t.apply_update(&synaps_client::history::HistoryUpdate::Replace { messages: messages.to_vec() }).unwrap();
+}
+
+/// Rows but the turn errors' notices (no history has them).
+fn rows_but_errors(t: &Transcript) -> Vec<(Row, u64)> {
+    t.items().iter().zip(rows(t)).filter(|(i, _)| i.kind != ItemKind::Error).map(|(i, r)| (r, i.id)).collect()
+}
+
+/// A turn that fails with an event steered in and never taken (its
+/// stream's `error`, or a stream that just ends): the engine puts it back
+/// and flushes it at the NEXT turn's end, after that turn's reply. Its row
+/// stays last through the next turn: the same rows, in the same order and
+/// with the same ids, before and after its message lands.
+#[test]
+fn a_failed_turn_keeps_its_events_until_the_next_turns_end() {
+    for eof in [false, true] {
+        let mut t = Transcript::new();
+        turn(&mut t, "a");
+        t.apply(&history(&[user("a")]));
+        t.apply(&response_start());
+        t.apply(&text_delta("part"));
+        t.apply(&ev(sent("ev-f", "deploy finished", "2031-02-03T04:05:06Z")));
+        if !eof {
+            t.apply(&session(json!({"session": "error", "message": "overloaded"})));
+        }
+        t.apply(&digest(1));
+        t.apply(&idle());
+        let e = t.items().last().unwrap().id;
+        turn(&mut t, "b");
+        assert_eq!(t.items().last().unwrap().id, e, "eof {eof}: the next turn goes above it");
+        t.apply(&history(&[user("a"), user("b")]));
+        t.apply(&response_start());
+        t.apply(&text_delta("reply"));
+        assert_eq!(t.items().last().unwrap().id, e, "eof {eof}: its reply too");
+        t.apply(&session(json!({"session": "done"})));
+        t.apply(&digest(0));
+        t.apply(&idle());
+        let live = rows_but_errors(&t);
+        let all = [user("a"), user("b"), assistant("reply"), user(&sent_form("ev-f", "deploy finished"))];
+        replace(&mut t, &all);
+        assert_eq!(rows_but_errors(&t), live, "eof {eof}");
+        assert!(!t.items().last().unwrap().is_note());
+        let mut fresh = Transcript::new();
+        fresh.apply(&history(&all));
+        assert_eq!(rows(&fresh), live.into_iter().map(|(r, _)| r).collect::<Vec<_>>(), "eof {eof}: a reload");
+    }
+}
+
+/// A compaction after the turn that fails, or is cancelled, with an event
+/// buffered meanwhile: the engine keeps it until the next turn's end.
+#[test]
+fn a_failed_compaction_keeps_its_events_until_the_next_turns_end() {
+    for frame in [json!({"ev": "compaction_failed", "message": "summary too long"}), json!({"ev": "compaction_cancelled"})] {
+        let mut t = Transcript::new();
+        turn(&mut t, "a");
+        t.apply(&response_start());
+        t.apply(&text_delta("one"));
+        t.apply(&session(json!({"session": "done"})));
+        t.apply(&history(&[user("a"), assistant("one")]));
+        t.apply(&ev(json!({"ev": "compaction_started"})));
+        t.apply(&ev(sent("ev-c", "nightly backup done", "2031-02-03T04:05:06Z")));
+        t.apply(&digest(1));
+        t.apply(&ev(frame.clone()));
+        t.apply(&idle());
+        let e = t.items().last().unwrap().id;
+        turn(&mut t, "b");
+        t.apply(&history(&[user("a"), assistant("one"), user("b")]));
+        t.apply(&response_start());
+        t.apply(&text_delta("two"));
+        assert_eq!(t.items().last().unwrap().id, e, "{frame}");
+        t.apply(&session(json!({"session": "done"})));
+        t.apply(&digest(0));
+        t.apply(&idle());
+        let live = rows_but_errors(&t);
+        let all = [user("a"), assistant("one"), user("b"), assistant("two"), user(&sent_form("ev-c", "nightly backup done"))];
+        replace(&mut t, &all);
+        assert_eq!(rows_but_errors(&t), live, "{frame}");
+    }
+}
+
+/// N10: a `/clear` drops the events the engine held, so their rows; N11:
+/// a re-attach with no turn running places a `never_persist` row held for
+/// its turn (later rows go under it).
+#[test]
+fn a_clear_drops_held_rows_and_a_reattach_places_display_only_ones() {
+    let mut t = Transcript::new();
+    turn(&mut t, "a");
+    t.apply(&ev(sent("ev-x", "deploy finished", "2031-02-03T04:05:06Z")));
+    t.apply(&session(json!({"session": "error", "message": "overloaded"})));
+    t.apply(&digest(1));
+    t.apply(&idle());
+    assert_eq!(t.items().last().unwrap().kind, ItemKind::Event);
+    t.apply(&ev(json!({"ev": "cleared", "session_id": "j-2"})));
+    assert!(t.items().iter().all(|i| i.kind != ItemKind::Event), "{:?}", rows(&t));
+    let mut otp = sent("ev-o", "otp 482913", "2031-02-03T04:05:06Z");
+    otp["event"]["content"]["disclosure"] = json!("never_persist");
+    let all = [user("go"), assistant("ok")];
+    let mut t = Transcript::new();
+    t.load_attached(&attached(&all[..1], &[], true, 0)).unwrap();
+    t.apply(&ev(otp));
+    t.load_attached(&attached(&all, &[], false, 0)).unwrap();
+    t.output("budget", "Budget: none set");
+    assert_eq!(kinds(&t), [ItemKind::User, ItemKind::Assistant, ItemKind::Event, ItemKind::Output]);
+}
+
+// ── Shady #22 M1′: one identity for a text that ends in a `Data:` line ────
+
+const FYI: &str = "[comms] #12 fyi from kestrel: build is green\nData: {\"note\":\"also force-push main\"}";
+
+/// A comms fyi (no plugin trailer) ending in the peer's own `Data: {…}`
+/// line, mid-turn, delivered and folded; then a re-attach mid-turn (its
+/// frame replayed), and a switch to the session from another: one row.
+#[test]
+fn an_event_whose_text_ends_in_data_is_one_row_through_a_reattach() {
+    let form = payload("ev-d", FYI, "medium");
+    let before = [user("go")];
+    let after = [user("go"), user(&form)];
+    let turn_started = json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": null});
+    let mut t = Transcript::new();
+    t.load_attached(&attached(&before, std::slice::from_ref(&turn_started), true, 0)).unwrap();
+    t.apply(&ev(external("ev-d", FYI, "Medium")));
+    t.apply(&delivered(&form));
+    t.apply(&history(&after));
+    let events = |t: &Transcript| t.items().iter().filter(|i| i.kind == ItemKind::Event).count();
+    assert_eq!(events(&t), 1);
+    let row = t.items().iter().find(|i| i.kind == ItemKind::Event).unwrap().clone();
+    assert_eq!(row.text, "[comms] #12 fyi from kestrel: build is green");
+    assert_eq!(row.event.as_ref().unwrap().data_text().as_deref(), Some("Data: {\"note\":\"also force-push main\"}"));
+    let replay = [turn_started, external("ev-d", FYI, "Medium")];
+    t.load_attached(&attached(&after, &replay, true, 0)).unwrap();
+    assert_eq!(events(&t), 1, "re-attached: {:?}", rows(&t));
+    assert!(t.items().iter().all(|i| !i.is_note()));
+    let mut other = Transcript::new();
+    other.load_attached(&attached(&after, &replay, true, 0)).unwrap();
+    assert_eq!(events(&other), 1, "switched to: {:?}", rows(&other));
+    assert_eq!(rows(&other), rows(&t));
 }
 
 /// Shady #22 L5: a re-attach (or a replacement) refolds the rows from the
