@@ -1407,6 +1407,88 @@ fn a_body_at_the_end_keeps_its_row_put(cx: &mut TestAppContext) {
     }
 }
 
+/// Shady #23 r4 M1: a body opened at the view's bottom, and the reader
+/// wheels up while it reveals: their scroll wins. When it lands, no glide
+/// to its first lines takes the list back down (the offset never grows
+/// after the wheel).
+#[gpui_kit::test]
+fn a_scroll_during_a_bodys_reveal_wins(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseMoveEvent, ScrollDelta, ScrollEvent, ScrollSource, TouchPhase, point};
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| {
+        v.client = None;
+        v.model.transcript.set_busy(true);
+    });
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    running_tools(cx, &view, 1);
+    view.update(cx, |v, cx| {
+        let out: String = (0..12).map(|k| format!("line {k}\n")).collect();
+        v.model
+            .transcript
+            .apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: out }) });
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    wait(cx, w, &view, 1000);
+    let id = view.read_with(cx, |v, _| v.model.transcript.items().iter().rev().find(|i| i.tool.is_some()).map(|i| i.id)).expect("the call");
+    let well = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("well {id}"))).is_some();
+    if well(cx) {
+        view.update(cx, |v, cx| {
+            v.toggle(id);
+            cx.notify();
+        });
+        wait(cx, w, &view, 1000);
+    }
+    assert!(!well(cx), "closed");
+    // No room held at the end: the call's row is the list's last, at the
+    // view's bottom, and its body opens under it.
+    view.update(cx, |v, cx| {
+        v.fold_slack.set(None);
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let offset = |cx: &mut TestAppContext| view.read_with(cx, |v, _| -f32::from(v.list.scroll_px_offset_for_scrollbar().y));
+    let center = view.read_with(cx, |v, _| v.list.viewport_bounds().center());
+    event(cx, w, PlatformInput::MouseMove(MouseMoveEvent { position: center, pressed_button: None, modifiers: Modifiers::default() }));
+    view.update(cx, |v, cx| {
+        v.toggle(id);
+        cx.notify();
+    });
+    for _ in 0..6 {
+        fluid_frame(cx, w, &view);
+    }
+    for _ in 0..2 {
+        event(
+            cx,
+            w,
+            PlatformInput::Scroll(ScrollEvent {
+                position: center,
+                delta: ScrollDelta::Pixels(point(px(0.), px(20.))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+                source: ScrollSource::Pointer,
+            }),
+        );
+        fluid_frame(cx, w, &view);
+    }
+    let mut o0 = offset(cx);
+    let mut os = vec![o0];
+    for f in 0..150 {
+        fluid_frame(cx, w, &view);
+        let o = offset(cx);
+        os.push(o);
+        assert!(o <= o0 + 0.01, "frame {f} after the wheel: the list went {o0} -> {o}, back down: {os:?}");
+        o0 = o;
+    }
+    assert!(well(cx), "it opened");
+    assert!(view.read_with(cx, |v, _| v.body_hold.get().is_none()), "no hold left");
+}
+
 /// Every row on screen, by identity: its top (the gate's "column").
 fn row_tops(cx: &mut TestAppContext, view: &Entity<AppView>) -> std::collections::HashMap<(u64, bool), f32> {
     view.read_with(cx, |v, _| {
@@ -2271,10 +2353,11 @@ fn the_held_room_never_bobs_or_drops(cx: &mut TestAppContext) {
     // The user's scroll up within what is left (if any): the room stays,
     // in sight, as content (Shady #23 r3 H2): nothing moves but the scroll,
     // never a drop and never a slide.
-    let left = view.read_with(cx, |v, _| if v.fold_slack.get().is_some() { v.tail_slack() } else { 0. });
+    let left = view.read_with(cx, |v, _| v.fold_slack.get().map_or(0., |s| s.last()));
     if left > 41. {
         let at = top(cx);
         view.update(cx, |v, cx| {
+            // In place of the wheel (its capture owner touches the scroller).
             v.scroller.touch();
             v.list.scroll_by(px(-40.));
             cx.notify();
@@ -2368,10 +2451,15 @@ fn a_slow_scroll_leaves_the_end_and_nothing_brings_it_back(cx: &mut TestAppConte
             if f % 12 == 0 {
                 line(cx, 10 + f);
             }
+            let y0 = row(cx);
             wheel(cx);
             fluid_frame(cx, w, &view);
             let o = offset(cx);
             assert!(o <= o0 + 0.01, "{scale}: frame {f} of the scroll: the list went {o0} -> {o}, toward its end");
+            // Its row moves by the wheel's step, no more, either way (Shady
+            // #23 r4 L3): a room dropped in sight clamps the list down by it.
+            let y = row(cx);
+            assert!((y - y0).abs() <= 0.81, "{scale}: frame {f} of the scroll: its row {y0} -> {y}");
             o0 = o;
         }
         assert!(start - o0 > 60., "{scale}: it scrolled up ({start} -> {o0})");
@@ -2392,6 +2480,126 @@ fn a_slow_scroll_leaves_the_end_and_nothing_brings_it_back(cx: &mut TestAppConte
             fluid_frame(cx, w, &view);
         }
         assert!((offset(cx) - still).abs() <= 0.01, "{scale}: at rest, the reader stays put");
+    }
+}
+
+/// Shady #23 r4 H1: the room an answered card left held at the list's end,
+/// and the view gets shorter under it: the composer grows two lines, a
+/// notice springs into the dock (as a worker's tray does), the window is
+/// made 120 px shorter; and, as a control, nothing. Held at its
+/// end, the list rises with it (a frame behind the view, no row more than a
+/// spring step a frame; a resize's at once), and once the output has used
+/// the room up it follows the tail: never stranded short of its end with
+/// the output streaming under the composer.
+#[gpui_kit::test]
+fn a_held_room_follows_when_the_view_gets_shorter(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    for case in ["none", "composer", "dock", "resize"] {
+        let (w, view, _events) = open(cx);
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| {
+            v.client = None;
+            v.model.transcript.set_busy(true);
+        });
+        settle(cx, w, 8);
+        let tool = view.read_with(cx, |v, _| {
+            let d = v.disp.iter().find(|d| d.kind == crate::turns::Kind::Prompt).expect("the demo's card");
+            v.model.transcript.items()[d.item].tool.as_ref().expect("the card's call").tool_id.clone()
+        });
+        resolve_prompt(cx, &view);
+        wait(cx, w, &view, 1000);
+        assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "{case}: the room it left, held");
+        let line = |cx: &mut TestAppContext, k: usize| {
+            view.update(cx, |v, cx| {
+                v.model.transcript.apply(&SessionEvent::Stream {
+                    event: StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: tool.clone(), delta: format!("line {k}\n") }),
+                });
+                v.sync_list();
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        // How far the list is short of its end (past its bottom padding),
+        // and its viewport's height.
+        let short = |cx: &mut TestAppContext| {
+            view.read_with(cx, |v, cx| {
+                let pad = (28. * crate::theme::metrics(cx).r).round();
+                f32::from(v.list.max_offset_for_scrollbar().y) + pad + f32::from(v.list.scroll_px_offset_for_scrollbar().y)
+            })
+        };
+        let vh = |cx: &mut TestAppContext| view.read_with(cx, |v, _| f32::from(v.list.viewport_bounds().size.height));
+        let vh0 = vh(cx);
+        match case {
+            "composer" => {
+                cx.update_window(w, |_, window, cx| {
+                    view.update(cx, |v, cx| v.composer.update(cx, |s, cx| s.set_value("one\ntwo\nthree", window, cx)))
+                })
+                .expect("the window");
+            }
+            "dock" => view.update(cx, |v, cx| {
+                // A notice in the dock, on its spring (as a worker's tray).
+                let words = "the connection to the daemon dropped and came back; the turn goes on where it was, and nothing was lost";
+                v.model.last_error = Some(format!("{words}; {words}; {words}"));
+                cx.notify();
+            }),
+            "resize" => VisualTestContext::from_window(w, cx).simulate_resize(size(px(1440.), px(780.))),
+            _ => {}
+        }
+        cx.run_until_parked();
+        let mut last = row_tops(cx, &view);
+        let (mut held, mut used, mut vh1) = (0, None, vh0);
+        // The largest move of a row in a frame: held; as it is used up;
+        // following after. And the view's own.
+        let (mut step, mut last_step, mut follow_step, mut view_step) = (0f32, 0f32, 0f32, 0f32);
+        for k in 0..80 {
+            line(cx, k);
+            for f in 0..12 {
+                let was_held = view.read_with(cx, |v, _| v.fold_slack.get().is_some());
+                fluid_frame(cx, w, &view);
+                let v = vh(cx);
+                let now = row_tops(cx, &view);
+                let is_held = view.read_with(cx, |v, _| v.fold_slack.get().is_some());
+                let big = now.iter().filter_map(|(r, y)| last.get(r).map(|y0| (y - y0).abs())).fold(0f32, f32::max);
+                // A resize is the window manager's, at once: its frame and
+                // the lift's after it.
+                match (was_held, is_held) {
+                    (true, true) if case != "resize" || k > 0 || f > 1 => {
+                        view_step = view_step.max((vh1 - v).abs());
+                        step = step.max(big);
+                    }
+                    (true, false) => last_step = big,
+                    (false, false) => follow_step = follow_step.max(big),
+                    _ => {}
+                }
+                vh1 = v;
+                last = now;
+                if is_held {
+                    held += 1;
+                } else if used.is_none() {
+                    used = Some(k);
+                }
+            }
+            // At rest after each line: at the end, held or following.
+            if k > 4 {
+                assert!(short(cx) <= crate::app::END_SLOP, "{case}: line {k}: {} px short of its end", short(cx));
+            }
+        }
+        let shrank = vh0 - vh(cx);
+        eprintln!(
+            "{case}: the view {shrank} px shorter; held {held} frames, used up at line {used:?}; steps: held {step}, the view {view_step}, used up {last_step}, following {follow_step}"
+        );
+        assert!(case == "none" || shrank >= 30., "{case}: the view got shorter ({vh0} -> {})", vh(cx));
+        assert!(held > 30 && used.is_some(), "{case}: the room held, then used up (held {held} frames, used {used:?})");
+        // Held, no row faster than a fold's spring, or than the view itself
+        // (the composer on `flick`: the rows rise with it, as following).
+        assert!(step <= 17f32.max(view_step) + 0.5, "{case}: held, a row moved {step} px in a frame (the view's own step {view_step})");
+        // Used up, what the line that took the rest grew past it is
+        // followed, as every line after it is (the stream's own step).
+        // Used up: what the line that took the rest grew past it is
+        // followed, as every line after it is (the stream's own step).
+        assert!(last_step <= follow_step.max(17.) + 0.5, "{case}: used up, a row moved {last_step} px (following, {follow_step})");
+        let (following, end) = view.read_with(cx, |v, _| (v.list.is_following_tail(), v.at_end()));
+        assert!(following && end == Some(true), "{case}: it follows the tail ({following}, {end:?})");
     }
 }
 
