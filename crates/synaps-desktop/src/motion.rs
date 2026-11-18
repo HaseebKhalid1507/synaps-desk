@@ -388,6 +388,10 @@ struct Reveal {
     from: f32,
     frame: u64,
     sink: Rc<Cell<f32>>,
+    /// What the body holds (its call's state): open and at rest, a change
+    /// of it glides the body's height from the one it had.
+    generation: u64,
+    resize: Option<(f32, Instant)>,
 }
 
 impl Reveal {
@@ -1512,18 +1516,44 @@ impl Motion {
     /// body seen for the first time (history, scrolled in, a switch) is at
     /// rest; Reduced, Off and low power: at once. `delay`: a turn that
     /// starts now waits this long (a success's streamed body folds @ +180).
-    pub(crate) fn reveal(&self, key: u64, open: bool, delay: Duration) -> (Option<f32>, Rc<Cell<f32>>) {
+    /// `generation`: what it holds (its call's state); open and at rest, a
+    /// change of it (a failure's output in place of the streamed lines)
+    /// glides its height from the one it had, never a jump.
+    pub(crate) fn reveal(&self, key: u64, open: bool, delay: Duration, generation: u64) -> (Option<f32>, Rc<Cell<f32>>) {
         let (frame, now) = (self.frame.get(), self.now());
         let fluid = self.fluid();
         let mut reveals = self.reveals.borrow_mut();
-        let r = reveals.entry(key).or_insert_with(|| Reveal { open, at: None, from: 0., frame, sink: Rc::new(Cell::new(f32::NAN)) });
+        let r = reveals.entry(key).or_insert_with(|| Reveal {
+            open,
+            at: None,
+            from: 0.,
+            frame,
+            sink: Rc::new(Cell::new(f32::NAN)),
+            generation,
+            resize: None,
+        });
         if r.frame + 1 < frame || !fluid {
-            (r.open, r.at) = (open, None);
+            (r.open, r.at, r.resize) = (open, None, None);
         } else if r.open != open {
             let (shown, _) = r.at(now);
-            (r.open, r.from, r.at) = (open, shown, Some(now + delay));
+            (r.open, r.from, r.at, r.resize) = (open, shown, Some(now + delay), None);
+        } else if r.generation != generation && open && r.at.is_none() && !r.sink.get().is_nan() {
+            r.resize = Some((r.sink.get(), now));
         }
-        r.frame = frame;
+        (r.frame, r.generation) = (frame, generation);
+        if let Some((from, at)) = r.resize {
+            // The height it had, gliding to the one it has (measured a
+            // frame late: the first frame holds the old).
+            let to = r.sink.get();
+            let x = Spring::from_rest(1., GLIDE_RESPONSE, now.saturating_duration_since(at).as_secs_f32());
+            let h = to + (from - to) * x;
+            if (h - to).abs() < FLUID_EPSILON || to <= 0. {
+                r.resize = None;
+            } else {
+                self.want_frame();
+                return (Some((h / to).max(0.)), r.sink.clone());
+            }
+        }
         let (shown, done) = r.at(now);
         if done {
             r.at = None;
