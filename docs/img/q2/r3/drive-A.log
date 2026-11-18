@@ -1,0 +1,34 @@
+0.00 Ctrl+T: a new sandbox session
+3.65 send: Use the bash tool to run exactly: echo q2-allow . Then reply ok.
+14.54 Esc
+15.95 located ALLOW 933,436 DENY 819,436 box 359,436
+16.36 hover DENY
+17.36 hover ALLOW
+18.37 press DENY (held, released off it)
+19.57 press ALLOW (held, released off it)
+21.29 Ctrl+Enter (ALLOW)
+27.82 send: Use the bash tool to run exactly: echo q2-deny . If it is denied, reply denied and do nothing else.
+39.01 Esc
+40.23 Esc
+46.25 Ctrl+T: a new sandbox session
+49.89 send: Use the bash tool to run exactly: echo q2-elsewhere . Then reply ok.
+53.33 TUI: synaps --attach 20261118-001436-ba5b --takeover (tmux q2tui)
+61.35 TUI pane saved: tui-card.txt
+61.35 TUI: y (allow)
+67.87 send: Use the bash tool to run exactly: echo q2-ctrlj . Then reply ok.
+78.77 wheel up 14
+82.14 Ctrl+J
+84.67 Ctrl+Enter (ALLOW)
+86.21 Ctrl+Enter (ALLOW)
+92.75 send: Use the bash tool to run exactly: echo q2-all . Then reply ok.
+103.64 Esc
+105.08 located ALLOW 933,508 DENY 819,508 box 359,508
+105.08 click Allow all
+106.99 Ctrl+Enter (ALLOW)
+114.03 Ctrl+T: a new sandbox session
+117.68 send: Use the bash tool to run exactly: sudo -k true . Then reply done.
+128.59 Esc
+129.81 Ctrl+Enter (ALLOW)
+134.85 Ctrl+Enter (ALLOW)
+135.88 Esc
+142.90 end

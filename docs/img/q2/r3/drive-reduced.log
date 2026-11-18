@@ -1,0 +1,8 @@
+0.00 Ctrl+T: a new sandbox session
+3.65 send: Use the bash tool to run exactly: echo q2-allow . Then reply ok.
+14.55 Esc
+15.77 Ctrl+Enter (ALLOW)
+22.30 send: Use the bash tool to run exactly: echo q2-deny . If it is denied, reply denied and do nothing else.
+33.65 Esc
+34.87 Esc
+40.89 end

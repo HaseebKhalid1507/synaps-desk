@@ -31,5 +31,8 @@ footer reads `offline: nothing to answer` and ALLOW is drawn disabled. The demo 
 input, so Allow all is offered. Scrolled away, the stub reads `NEEDS YOU · bash: cargo test … · ctrl j`.
 
 **Not in these stills.** The receipt and the collapse need an answer, and the offline demo cannot answer or
-raise a prompt. The tests cover them: `the_answered_card_collapses_in_its_row`, `a_receipt_says_who_answered`,
-`allow_all_is_the_input_owners`. They are not shown here. The PR body lists what is still open.
+raise a prompt. They are in `r3/`, live on the desktopproto sandbox: the receipts, the collapse at
+Full/Reduced/Off, the trace, hover/press, Allow all as owner and the non-owner card, `answered elsewhere`,
+Ctrl+J from the stub, and 860×640 / 640×420. The clips there are lossless and checked frame by frame. These
+stills (above) are from 4475cdf. The card has changed since then (the command's colour, Allow all in mono,
+the status line's own row), and `r3/offline-*.png` shows it at `1e640db`.
