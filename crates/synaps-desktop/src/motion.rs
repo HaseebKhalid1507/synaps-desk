@@ -174,6 +174,11 @@ pub(crate) mod ease {
     pub(crate) const IN: Easing = Easing::CubicBezier { x1: 0.7, y1: 0., x2: 0.84, y2: 0. };
     /// Cross-fades and the fold chevron's turn.
     pub(crate) const INOUT: Easing = Easing::CubicBezier { x1: 0.65, y1: 0., x2: 0.35, y2: 1. };
+    /// A mark's strokes writing on (polish.md P4): near linear, easing out
+    /// at the end: its time is spent on the path, so the stroke is seen.
+    pub(crate) const WRITE: Easing = Easing::CubicBezier { x1: 0.3, y1: 0.3, x2: 0.6, y2: 1. };
+    /// Light handed over evenly (a write-on's old glyph going out).
+    pub(crate) const LINEAR: Easing = Easing::CubicBezier { x1: 0., y1: 0., x2: 1., y2: 1. };
 }
 
 /// `snap`: a critically damped spring, response 220 ms, settled at 0.5 px.
@@ -831,6 +836,8 @@ pub(crate) struct Motion {
     /// The palette's ink, as of the frame (afterglows).
     ink: Cell<Hsla>,
     ambient: Cell<bool>,
+    /// The window's scale, as of the frame ([`Self::snap`]).
+    scale: Cell<f32>,
     /// Ambient as the level and power have it, held still or not
     /// ([`Self::words_beat`]).
     lively: Cell<bool>,
@@ -1089,7 +1096,13 @@ impl Element for Roll {
         None
     }
 
-    fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
         (self.new.request_layout(window, cx), ())
     }
 
@@ -1189,6 +1202,7 @@ impl Motion {
             level: Cell::new(Level::Full),
             ink: Cell::new(Hsla::default()),
             ambient: Cell::new(true),
+            scale: Cell::new(1.),
             lively: Cell::new(true),
             visible: Cell::new(true),
             now: Cell::new(epoch),
@@ -1701,11 +1715,23 @@ impl Motion {
         self.shot(since, delay, dur, &ease::OUT, Kind::Spatial)
     }
 
-    /// `write_on`: a glyph's drawn fraction (its strokes cut at it):
-    /// [`WRITE_DELAY`], then [`BASE`] (polish.md P4: the stroke is seen;
-    /// the cross's two strokes 100 ms each).
-    pub(crate) fn write_on(&self, since: Option<Instant>) -> f32 {
-        self.shot(since, WRITE_DELAY, BASE, &ease::OUT, Kind::Spatial)
+    /// `write_on` (polish.md P4, finish gate #17): a mark writing on over
+    /// the glyph it replaces, never an empty box. The old glyph's light
+    /// goes to the ground over 2 × [`WRITE_DELAY`], linearly; from
+    /// [`WRITE_DELAY`] the strokes draw over [`BASE`] on [`ease::WRITE`]
+    /// (the cross's two strokes 100 ms each), so the two overlap. The old
+    /// one's light (1 → 0) and the drawn fraction (0 → 1, its strokes cut
+    /// at it). Reduced and Off: at once.
+    pub(crate) fn write_on(&self, since: Option<Instant>) -> (f32, f32) {
+        let drawn = self.shot(since, WRITE_DELAY, BASE, &ease::WRITE, Kind::Spatial);
+        let old = 1. - self.shot(since, Duration::ZERO, WRITE_DELAY * 2, &ease::LINEAR, Kind::Spatial);
+        (old, drawn)
+    }
+
+    /// The frame a spinner showed at `at` (its beat then): what a write-on
+    /// takes over. `None` (its still) when ambient is off.
+    pub(crate) fn beat_at(&self, at: Instant) -> Option<u32> {
+        self.ambient.get().then(|| (at.saturating_duration_since(self.epoch).as_nanos() / BEAT.as_nanos()) as u32)
     }
 
     /// The 30 Hz tick a sweep is on (polish.md P2), its next asked for; `None`
@@ -1716,6 +1742,17 @@ impl Motion {
         }
         self.want_tick();
         Some((self.now().saturating_duration_since(self.epoch).as_nanos() / DECAY_TICK.as_nanos()) as u64)
+    }
+
+    pub(crate) fn set_scale(&self, scale: f32) {
+        self.scale.set(scale.max(0.5));
+    }
+
+    /// `v` logical px on the nearest device pixel (a moving 2 px quad stays
+    /// solid: no anti-aliased edge, which is alpha).
+    pub(crate) fn snap(&self, v: f32) -> f32 {
+        let s = self.scale.get();
+        (v * s).round() / s
     }
 
     /// The link is lost (motion.md §5.3, Shady #17 M1): the window is
@@ -1762,7 +1799,7 @@ impl Motion {
     /// is on that grid (tests: what a timer is armed for).
     #[cfg(test)]
     pub(crate) fn on_beats(&self, at: Instant, every: u32) -> bool {
-        at.saturating_duration_since(self.epoch).as_nanos() % (BEAT * every).as_nanos() == 0
+        at.saturating_duration_since(self.epoch).as_nanos().is_multiple_of((BEAT * every).as_nanos())
     }
 
     /// The rolls under way in the key space `space` (all: `None`) (tests).
@@ -2402,7 +2439,7 @@ mod tests {
         m.born(7, t0);
         assert_eq!(m.birth(7), None);
         assert_eq!(m.draw(Some(t0), Duration::ZERO, BASE), 1.);
-        assert_eq!(m.write_on(Some(t0)), 1.);
+        assert_eq!(m.write_on(Some(t0)), (0., 1.));
         assert_eq!(m.decay(Some(t0), HEAD_HOLD, GLOW), 0.);
         assert_eq!(m.beat(1), None);
         assert_eq!(m.change(Tag::Outcome, 1, 1, None), None);
@@ -2513,7 +2550,7 @@ mod tests {
         assert!(m.demand().0, "a bar mid-draw wants the next frame");
         m.begin_frame(Level::Full, false, t0 + ms(2000));
         assert_eq!(m.draw(Some(t0), stagger(9), BASE), 1.);
-        assert_eq!(m.write_on(Some(t0)), 1.);
+        assert_eq!(m.write_on(Some(t0)), (0., 1.));
         assert_eq!(m.decay(Some(t0), HEAD_HOLD, GLOW), 0.);
         assert_eq!(m.shot(Some(t0), ms(60), GLOW, &ease::OUT, Kind::Decay), 1.);
         assert_eq!(m.turn(3, true), 1.);
@@ -2835,20 +2872,32 @@ mod tests {
         assert_eq!(cells("reading a.rs", "grep b"), None, "no number: the whole line");
     }
 
-    /// P4: a write-on waits 40 ms, then draws over `base`.
+    /// P4 (finish gate #17): the old glyph's light goes out over 80 ms, the
+    /// strokes draw from 40 ms over `base`. No frame shows an empty box:
+    /// at every millisecond one of the two is lit. The stroke is seen: at
+    /// 60 fps, most of its frames are partial, and it is not mostly drawn
+    /// in its first 60 ms.
     #[test]
-    fn write_on_is_base_after_a_delay() {
+    fn a_write_on_never_shows_an_empty_box() {
         let t0 = Instant::now();
         let m = Motion::new(t0);
-        m.begin_frame(Level::Full, false, t0 + ms(30));
-        assert_eq!(m.write_on(Some(t0)), 0.);
-        m.begin_frame(Level::Full, false, t0 + ms(140));
-        let p = m.write_on(Some(t0));
-        assert!(p > 0. && p < 1.);
-        m.begin_frame(Level::Full, false, t0 + ms(240));
-        assert_eq!(m.write_on(Some(t0)), 1.);
+        let at = |t: f32| {
+            m.begin_frame(Level::Full, false, t0 + Duration::from_secs_f32(t / 1000.));
+            m.write_on(Some(t0))
+        };
+        assert_eq!(at(0.), (1., 0.), "the old glyph, lit; nothing drawn");
+        for t in 0..=260 {
+            let (old, drawn) = at(t as f32);
+            assert!(old > 0. || drawn > 0.1, "{t} ms: an empty box ({old}, {drawn})");
+        }
+        assert_eq!(at(30.).1, 0., "the strokes wait 40 ms");
+        assert!(at(60.).0 > 0., "the old glyph overlaps the first strokes");
+        assert!(at(100.).1 < 0.5, "60 ms into the stroke: under half drawn");
+        let partial = (0..16).filter(|k| (0.05..0.95).contains(&at(*k as f32 * 1000. / 60.).1)).count();
+        assert!(partial >= 8, "at 60 fps, {partial} partial frames");
+        assert_eq!(at(250.), (0., 1.), "over");
         m.begin_frame(Level::Reduced, false, t0 + ms(10));
-        assert_eq!(m.write_on(Some(t0)), 1., "Reduced: at once");
+        assert_eq!(m.write_on(Some(t0)), (0., 1.), "Reduced: at once");
     }
 
     #[test]

@@ -1362,6 +1362,9 @@ pub struct AppView {
     readout_left: Option<(u64, Instant)>,
     /// The rail's motion this frame ([`AppView::rail_motion`]).
     pub(crate) rail_fx: crate::chrome::RailFx,
+    /// A favourited row's star: when it was favourited, and when its row
+    /// landed (the hop's start, polish.md P6).
+    pub(crate) star_land: std::cell::RefCell<HashMap<u64, (Instant, Option<Instant>)>>,
     /// The side panels folded to strips and the open HISTORY buckets
     /// (saved with the accent).
     pub panels: theme::Panels,
@@ -2023,6 +2026,7 @@ impl AppView {
             readout_from: None,
             readout_left: None,
             rail_fx: Default::default(),
+            star_land: Default::default(),
             panels: theme::Panels::default(),
             panels_dirty: Default::default(),
             panels_writing: Default::default(),
@@ -5950,6 +5954,7 @@ impl Render for AppView {
         let low_power = self.fx.low_power(cx);
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
+        self.fx.set_scale(window.scale_factor());
         self.fx.rescope(self.motion_session(), self.motion_column());
         // A worker tab opened by the pointer: the tracer from it (§6.2),
         // from the source chip's bar (its left edge, at its centre) when the

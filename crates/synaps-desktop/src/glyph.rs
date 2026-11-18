@@ -488,12 +488,7 @@ pub(crate) fn change(from: Option<(Glyph, Hsla)>, to: Glyph, mark: Hsla, ground:
     if p >= 1. {
         return draw_on(to, mark, ground);
     }
-    let draws = match to {
-        Glyph::Ok | Glyph::Failed => true,
-        Glyph::Cancelled | Glyph::Limit | Glyph::Cancelling => from.is_none_or(|(g, _)| g != Glyph::Cancelling),
-        _ => false,
-    };
-    if draws && !fade {
+    if draws(from.map(|f| f.0), to) && !fade {
         return draw_at(to, p, mark);
     }
     let s = px(to.size().max(from.map_or(0., |(g, _)| g.size())));
@@ -506,6 +501,39 @@ pub(crate) fn change(from: Option<(Glyph, Hsla)>, to: Glyph, mark: Hsla, ground:
                 .map(|(g, c)| div().absolute().inset_0().child(draw_on(g, crate::motion::mix(c, ground, p), ground))),
         )
         .child(div().absolute().inset_0().child(draw_on(to, crate::motion::mix(ground, mark, p), ground)))
+        .into_any_element()
+}
+
+/// A change to `to` from `from` draws its strokes (or quads) on.
+fn draws(from: Option<Glyph>, to: Glyph) -> bool {
+    match to {
+        Glyph::Ok | Glyph::Failed => true,
+        Glyph::Cancelled | Glyph::Limit | Glyph::Cancelling => from != Some(Glyph::Cancelling),
+        _ => false,
+    }
+}
+
+/// [`change`] without the fade (polish.md P4, finish gate #17): to a mark
+/// that draws, its strokes write on (`p`) over the glyph it replaces, which
+/// goes to the ground meanwhile (`old`, 1 → 0; a spinner in the frame it
+/// showed then, `beat`). The box is never empty. Else [`change`]'s
+/// cross-fade, on `p`.
+pub(crate) fn change_over(from: Option<(Glyph, Option<u32>, Hsla)>, to: Glyph, mark: Hsla, ground: Hsla, old: f32, p: f32) -> AnyElement {
+    if !draws(from.map(|f| f.0), to) || (p >= 1. && old <= 0.) {
+        return change(from.map(|(g, _, c)| (g, c)), to, mark, ground, p, false);
+    }
+    let s = px(to.size().max(from.map_or(0., |(g, ..)| g.size())));
+    let centred = |el: AnyElement| div().absolute().inset_0().flex().items_center().justify_center().child(el);
+    div()
+        .relative()
+        .flex_none()
+        .size(s)
+        .debug_selector(move || format!("write-on {old:.2} {p:.2}"))
+        .children(from.filter(|(g, ..)| old > 0. && *g != to).map(|(g, beat, c)| {
+            let c = crate::motion::mix(ground, c, old);
+            centred(if g.spins() { spin(g, beat, c, ground).into_any_element() } else { draw(g, c) })
+        }))
+        .children((p > 0.).then(|| centred(draw_at(to, p, mark))))
         .into_any_element()
 }
 

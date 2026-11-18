@@ -2978,6 +2978,49 @@ fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
+/// polish.md P6 (finish gate #17): favouriting moves the row into
+/// FAVOURITES (its Flip); its star hops, and its sparks leave, only once the
+/// row has landed: never while it moves.
+#[gpui_kit::test]
+fn a_star_hops_once_its_row_has_landed(cx: &mut TestAppContext) {
+    use crate::rail::Item;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    // A live session's row, favourited (Ctrl+D's way: the pointer is not on
+    // the rail, which holds its order under it).
+    let key = view.update(cx, |v, cx| {
+        let rail = &v.rail.rail;
+        let id = crate::demo::IDLE_CPU;
+        let ix = v.model.sessions.iter().position(|s| s.id == id).expect("listed");
+        let key = rail
+            .items
+            .iter()
+            .find_map(|i| if let Item::Row(r) = i { (rail.rows[*r].live == Some(ix)).then_some(rail.rows[*r].key) } else { None })
+            .expect("its row");
+        v.toggle_fav_session(id);
+        cx.notify();
+        key
+    });
+    let (mut moving_frames, mut landed_at) = (0, None);
+    for k in 0..80 {
+        let (moving, landed) = view.read_with(cx, |v, _| {
+            (v.rail_fx.offsets.get(&key).is_some_and(|d| *d != 0.), v.star_land.borrow().get(&key).and_then(|e| e.1))
+        });
+        if moving {
+            moving_frames += 1;
+            assert!(landed.is_none(), "frame {k}: the star hops while its row moves");
+        }
+        if landed.is_some() && landed_at.is_none() {
+            landed_at = Some(k);
+        }
+        wait(cx, w, &view, 8);
+    }
+    let flips = view.read_with(cx, |v, _| format!("{:?} {:?}", v.rail_fx.flips, v.rail_fx.offsets));
+    assert!(moving_frames > 0, "the row slid into FAVOURITES: {flips}");
+    assert!(landed_at.is_some(), "then it landed, and the star hopped");
+}
+
 /// Favourites (desktop only): a HISTORY row's star is laid out before it
 /// is drawn (the row's text never moves when it shows), a click on it
 /// favourites the row without opening it (no resume, nothing sent), and
