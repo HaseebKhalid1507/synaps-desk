@@ -1473,10 +1473,12 @@ pub struct AppView {
     /// Diagnostics: render rows as plain text instead of markdown.
     pub plain_rows: bool,
     /// The synthetic transport feeds this window (`--offline`); it answers
-    /// `saved_sessions` itself, on this channel.
+    /// `catalog_page` itself, on this channel.
     pub(crate) synthetic: bool,
     pub(crate) synthetic_tx: Option<async_channel::Sender<Event>>,
     synthetic_seq: u64,
+    /// The last `catalog_page` req the synthetic transport answered.
+    synthetic_req: u64,
     /// `--session ID`: open it once the first session list lands.
     pub start_session: Option<String>,
     /// `--offline`: the session opened at start when no tab is restored.
@@ -2182,6 +2184,7 @@ impl AppView {
             synthetic: false,
             synthetic_tx: None,
             synthetic_seq: 0,
+            synthetic_req: 0,
             start_session: None,
             default_session: None,
             restore_tabs: None,
@@ -2416,15 +2419,36 @@ impl AppView {
                 }
             }
             Effect::ListSaved { named_only, limit } => {
-                let sent = match (&self.client, &self.synthetic_tx) {
-                    (Some(c), _) => c.saved_sessions(named_only, limit).map_err(|e| e.to_string()),
-                    // The synthetic transport answers as a daemon would.
-                    (None, Some(tx)) => tx.try_send(crate::demo::saved(named_only, limit)).map_err(|e| e.to_string()),
-                    (None, None) => Err("offline".into()),
+                let sent = match &self.client {
+                    Some(c) => c.saved_sessions(named_only, limit).map_err(|e| e.to_string()),
+                    // The synthetic transport serves pages (`offer_saved`).
+                    None => Err("offline".into()),
                 };
                 if let Err(e) = sent {
                     for fx in self.model.saved_failed(&e) {
                         self.effect(fx);
+                    }
+                }
+            }
+            Effect::CatalogPage { before, limit, named_only } => {
+                let sent = match (&self.client, &self.synthetic_tx) {
+                    (Some(c), _) => c.catalog_page(before, limit, named_only).map_err(|e| e.to_string()),
+                    // The synthetic transport answers as a daemon would.
+                    (None, Some(tx)) => {
+                        self.synthetic_req += 1;
+                        let req = self.synthetic_req;
+                        tx.try_send(crate::demo::catalog_page(req, before.as_ref(), limit, named_only))
+                            .map(|()| req)
+                            .map_err(|e| e.to_string())
+                    }
+                    (None, None) => Err("offline".into()),
+                };
+                match sent {
+                    Ok(req) => self.model.page_sent(req),
+                    Err(e) => {
+                        for fx in self.model.saved_failed(&e) {
+                            self.effect(fx);
+                        }
                     }
                 }
             }
