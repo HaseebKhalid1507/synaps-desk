@@ -1355,6 +1355,20 @@ impl AppView {
     }
 
     /// One display row: its gap, its label and the block.
+    /// A folding run's rows (N1), as they were drawn: the blocks inside its
+    /// card, which the room under its header draws round them.
+    pub(crate) fn fold_rows(&self, rows: &[Disp], cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let items = self.model.shown().items();
+        let (p, m, lay) = (theme::palette(cx), theme::metrics(cx), self.layout);
+        rows.iter()
+            .filter_map(|d| {
+                let (item, row) = (items.get(d.item)?, self.rows.get(d.item)?);
+                let block = self.render_work(item, row, d.id, &p, &m, lay, cx);
+                Some(div().w_full().pt(px(gap_of(d.gap, &m))).child(block).into_any_element())
+            })
+            .collect()
+    }
+
     pub(crate) fn render_disp(&self, ix: usize, cx: &mut Context<Self>) -> RowParts {
         let Some(&d) = self.disp.get(ix) else { return RowParts::empty() };
         let items = self.model.shown().items();
@@ -1430,6 +1444,9 @@ impl AppView {
         let card: Option<CardFrame> = match crate::cards::edges(&self.disp, ix) {
             _ if !crate::cards::in_card(&d) => None,
             (top, bottom) => {
+                // Folding (N1): its card goes on in the room under it.
+                let bottom =
+                    bottom && !self.fold_gap.borrow().as_ref().is_some_and(|g| g.is(d.id) && matches!(d.kind, Kind::Summary { .. }));
                 let (pal, geo) = (p, crate::cards::Geo::of(&m));
                 let id = d.id;
                 let click = matches!(d.kind, Kind::Summary { .. }).then(|| {

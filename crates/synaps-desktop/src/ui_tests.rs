@@ -1342,6 +1342,183 @@ fn a_folded_run(cx: &mut TestAppContext, view: &Entity<AppView>) -> u64 {
     })
 }
 
+/// Every row on screen, by identity: its top (the gate's "column").
+fn row_tops(cx: &mut TestAppContext, view: &Entity<AppView>) -> std::collections::HashMap<(u64, bool), f32> {
+    view.read_with(cx, |v, _| {
+        (0..v.list.item_count())
+            .filter_map(|ix| {
+                let d = v.disp.get(ix)?;
+                let b = v.list.bounds_for_item(ix)?;
+                let vb = v.list.viewport_bounds();
+                (b.bottom() > vb.top() && b.top() < vb.bottom())
+                    .then(|| ((d.id, matches!(d.kind, crate::turns::Kind::Summary { .. })), f32::from(b.top())))
+            })
+            .collect()
+    })
+}
+
+/// Frames until no fold room is left: the largest move of a row on screen
+/// in two frames running, and how many frames had the room.
+fn fold_frames(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> (f32, usize) {
+    let mut last = row_tops(cx, view);
+    let (mut step, mut gapped) = (0f32, 0);
+    for f in 0..600 {
+        fluid_frame(cx, w, view);
+        let now = row_tops(cx, view);
+        let moved: Vec<((u64, bool), f32, f32)> = now.iter().filter_map(|(k, y)| last.get(k).map(|y0| (*k, *y, y - y0))).collect();
+        let big = moved.iter().map(|m| m.2.abs()).fold(0f32, f32::max);
+        if big > 17. {
+            eprintln!("fold_frames: frame {f}: rows (key, top, moved) {moved:?}");
+        }
+        step = step.max(big);
+        last = now;
+        if VisualTestContext::from_window(w, cx).debug_bounds("fold-gap").is_some() {
+            gapped += 1;
+        } else if gapped > 0 {
+            break;
+        }
+    }
+    (step, gapped)
+}
+
+/// A turn of `n` finished calls at the list's end, then its end: the run
+/// folds itself.
+fn turn_of_calls(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, n: usize) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    view.update(cx, |v, _| v.model.transcript.set_busy(true));
+    running_tools(cx, view, n);
+    view.update(cx, |v, cx| {
+        for k in 0..n {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: format!("ui-run-{k}"), result: "ok".into() }),
+            });
+        }
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    for _ in 0..240 {
+        fluid_frame(cx, w, view);
+    }
+}
+
+/// The design gate of #23, N1: a run folds on a spring, never a cut. No
+/// row on screen moves more than about 40 px a 60 Hz frame (17 px a 144 Hz
+/// test frame), and the fold takes well over 15 60 Hz frames:
+/// - clicked mid-screen, its header holds (the list keeps its top row);
+/// - clicked at the list's end, its header holds too (the room is held);
+/// - at a turn's end, at the list's end, with its header on screen and with
+///   it far above the view (a long run): the end holds, what is above
+///   comes down.
+///
+/// Reduced and Off: a cut, the header still where it was.
+#[gpui_kit::test]
+fn a_run_folds_on_a_spring_never_a_cut(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    settle(cx, w, 8);
+    let run = a_folded_run(cx, &view);
+    let header = |cx: &mut TestAppContext| {
+        VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("run-summary {run}"))).map(|b| f32::from(b.top()))
+    };
+    let toggle = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| {
+            v.toggle_run(run);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let mid = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| {
+            let ix = v.disp.iter().position(|d| d.id == run).expect("its header");
+            v.list.scroll_to(gpui::ListOffset { item_ix: ix, offset_in_item: gpui_kit::px(0.) });
+            v.list.scroll_by(gpui_kit::px(-120.));
+            cx.notify();
+        });
+        for _ in 0..4 {
+            fluid_frame(cx, w, &view);
+        }
+    };
+    // Clicked mid-screen.
+    toggle(cx);
+    for _ in 0..200 {
+        fluid_frame(cx, w, &view);
+    }
+    mid(cx);
+    let at = header(cx).expect("its header, unfolded mid-screen");
+    toggle(cx);
+    assert_eq!(header(cx), Some(at), "the click: the header holds");
+    let (step, gapped) = fold_frames(cx, w, &view);
+    assert_eq!(header(cx), Some(at), "landed: the header where it was");
+    assert!(step <= 17., "mid-screen: a row moved {step} px in one frame");
+    assert!(gapped >= 36, "mid-screen: {gapped} 144 Hz frames");
+    // The turn's end at the list's end: its header on screen, then far
+    // above it.
+    for n in [5, 25] {
+        turn_of_calls(cx, w, &view, n);
+        let tops = row_tops(cx, &view);
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Idle);
+            v.sync_list();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(VisualTestContext::from_window(w, cx).debug_bounds("fold-gap").is_some(), "{n} calls: the room held, not cut");
+        let (step, gapped) = fold_frames(cx, w, &view);
+        assert!(step <= 17., "{n} calls at the turn's end: a row moved {step} px in one frame");
+        assert!(gapped >= 20, "{n} calls at the turn's end: {gapped} frames");
+        assert!(!tops.is_empty());
+        if n == 5 {
+            // Clicked at the list's end: unfolded, then folded; its header
+            // holds (the room past the end is held).
+            let last =
+                view.read_with(cx, |v, _| v.disp.iter().rev().find(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id));
+            let last = last.expect("the turn's run");
+            let flip = |cx: &mut TestAppContext| {
+                view.update(cx, |v, cx| {
+                    v.toggle_run(last);
+                    cx.notify();
+                });
+                cx.run_until_parked();
+            };
+            flip(cx);
+            for _ in 0..240 {
+                fluid_frame(cx, w, &view);
+            }
+            view.update(cx, |v, cx| {
+                v.list.scroll_to_end();
+                cx.notify();
+            });
+            for _ in 0..4 {
+                fluid_frame(cx, w, &view);
+            }
+            let sel = String::leak(format!("run-summary {last}"));
+            let at = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top())).expect("its header at the end");
+            flip(cx);
+            let (step, gapped) = fold_frames(cx, w, &view);
+            let now = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top()));
+            assert_eq!(now, Some(at), "clicked at the end: the header holds");
+            assert!(step <= 17., "clicked at the end: a row moved {step} px in one frame");
+            assert!(gapped >= 20, "clicked at the end: {gapped} frames");
+        }
+    }
+    // Reduced and Off: a cut, the header where it was.
+    for level in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
+        set_motion(cx, &view, level);
+        settle(cx, w, 4);
+        toggle(cx);
+        settle(cx, w, 4);
+        mid(cx);
+        let at = header(cx);
+        toggle(cx);
+        settle(cx, w, 2);
+        assert!(VisualTestContext::from_window(w, cx).debug_bounds("fold-gap").is_none(), "{level:?}: no room");
+        assert_eq!(header(cx), at, "{level:?}: the header where it was");
+    }
+}
+
 /// Off is the static app: whatever happens (a worker running, a send, a
 /// worker's view in and out, the card answered, a session switch, a fold
 /// and an unfold), motion asks for no frame and arms no timer: the guard is
@@ -1893,6 +2070,145 @@ fn allow_folds_the_card_into_its_row(cx: &mut TestAppContext) {
     assert!(at(cx, "card-exit".into()).is_none() && at(cx, "card".into()).is_none(), "folded away");
     assert!(view.read_with(cx, |v, _| v.card_exit.is_none()));
     assert!(at(cx, format!("receipt-word {row} allowed")).is_some(), "its call's row keeps the receipt");
+}
+
+/// Shady #23 r2 M3: the room an answered card left at the list's end holds
+/// the answered row still while its call's output grows into it (the
+/// list's top held: the room, read from the last layout, lags a frame, and
+/// that frame's surplus is under the content), and a scroll up within the
+/// room sends it on `sheet`: no frame moves the row by more than about
+/// 40 px a 60 Hz frame (17 px a 144 Hz test frame).
+#[gpui_kit::test]
+fn the_held_room_never_bobs_or_drops(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| {
+        v.client = None;
+        v.model.transcript.set_busy(true);
+    });
+    settle(cx, w, 8);
+    let (tool, id) = view.read_with(cx, |v, _| {
+        let d = v.disp.iter().find(|d| d.kind == crate::turns::Kind::Prompt).expect("the demo's card");
+        let i = &v.model.transcript.items()[d.item];
+        (i.tool.as_ref().expect("the card's call").tool_id.clone(), i.id)
+    });
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "the room it left, held");
+    let top = |cx: &mut TestAppContext| {
+        VisualTestContext::from_window(w, cx)
+            .debug_bounds(String::leak(format!("tool-row {id}")))
+            .map(|b| f32::from(b.top()))
+            .expect("the answered row")
+    };
+    let at = top(cx);
+    let mut held = 0;
+    for k in 0..6 {
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: tool.clone(), delta: format!("line {k}\n") }),
+            });
+            v.sync_list();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        for _ in 0..30 {
+            fluid_frame(cx, w, &view);
+            if view.read_with(cx, |v, _| v.fold_slack.get().is_some()) {
+                held += 1;
+                let y = top(cx);
+                assert!((y - at).abs() <= 0.5, "line {k}: the answered row at {y}, not {at}");
+            }
+        }
+    }
+    assert!(held > 30, "the output grew into the room ({held} frames)");
+    // A scroll up within what is left (if any): on `sheet`, never a drop.
+    let left = view.read_with(cx, |v, _| v.tail_slack());
+    if left > 41. {
+        view.update(cx, |v, cx| {
+            v.list.scroll_by(px(-40.));
+            cx.notify();
+        });
+        let mut y0 = top(cx);
+        for _ in 0..200 {
+            fluid_frame(cx, w, &view);
+            let y = top(cx);
+            assert!((y - y0).abs() <= 17., "scrolled up: the row moved {} px in one frame", y - y0);
+            y0 = y;
+        }
+    }
+}
+
+/// Shady #23 r2b L1: at 125 % GPUI snaps rows to device pixels (0.8 px), so
+/// the list's sums go fractional again. The probe: following a stream, the
+/// end is the bottom within a device pixel every frame; while an answered
+/// call's output grows into the room its card left, the answered row moves
+/// at most a device pixel in a frame: the offset's 0.8 px steps are not
+/// read as a scroll leaving the end, so the room never drops.
+#[gpui_kit::test]
+fn the_end_and_the_held_room_at_125_percent(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    VisualTestContext::from_window(w, cx).simulate_scale_factor_change(1.25);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    start_stream(cx, &view);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.list.scroll_to_end());
+    fluid_frame(cx, w, &view);
+    for k in 0..60 {
+        stream_step(cx, &view, k);
+        fluid_frame(cx, w, &view);
+        let (gap, pad) = view.read_with(cx, |v, cx| {
+            let n = v.list.item_count();
+            let pad = (28. * crate::theme::metrics(cx).r).round();
+            (v.list.bounds_for_item(n - 1).map(|b| f32::from(v.list.viewport_bounds().bottom() - b.bottom())), pad)
+        });
+        let gap = gap.expect("the last row");
+        assert!((gap - pad).abs() <= 0.85, "125 %, frame {k}: the end {gap} px over the bottom, not {pad}");
+    }
+    let (w, view, _events) = open(cx);
+    VisualTestContext::from_window(w, cx).simulate_scale_factor_change(1.25);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| {
+        v.client = None;
+        v.model.transcript.set_busy(true);
+    });
+    settle(cx, w, 8);
+    let (tool, id) = view.read_with(cx, |v, _| {
+        let d = v.disp.iter().find(|d| d.kind == crate::turns::Kind::Prompt).expect("the demo's card");
+        let i = &v.model.transcript.items()[d.item];
+        (i.tool.as_ref().expect("the card's call").tool_id.clone(), i.id)
+    });
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "125 %: the room it left, held");
+    let top = |cx: &mut TestAppContext| {
+        VisualTestContext::from_window(w, cx)
+            .debug_bounds(String::leak(format!("tool-row {id}")))
+            .map(|b| f32::from(b.top()))
+            .expect("the answered row")
+    };
+    let (at, mut y0) = (top(cx), top(cx));
+    for k in 0..6 {
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: tool.clone(), delta: format!("line {k}\n") }),
+            });
+            v.sync_list();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        for _ in 0..30 {
+            fluid_frame(cx, w, &view);
+            if view.read_with(cx, |v, _| v.fold_slack.get().is_some()) {
+                let y = top(cx);
+                assert!((y - y0).abs() <= 0.85, "125 %, line {k}: the answered row moved {y0} -> {y} in one frame (from {at})");
+                y0 = y;
+            }
+        }
+    }
 }
 
 /// The card's keys: the window's focus (a click on the card), a frame for
