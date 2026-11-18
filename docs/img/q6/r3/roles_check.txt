@@ -1,0 +1,143 @@
+20 themes from /home/haseeb/Projects/.worktrees/synaps-desktop-q6/crates/synaps-desktop/src/palettes.rs
+
+== Today (no accent)
+diff add wash vs canvas                      min  1.56  median  1.86  max  2.02
+diff del wash vs canvas                      min  1.36  median  1.64  max  1.82
+card vs canvas                               min  1.24  median  1.34  max  1.48
+  themes where a wash is louder than the card: 20 / 20
+edge (raw border) vs card                    min  1.02  median  1.15  max  1.86
+  hair (raw separator) under 1.14 on canvas or chrome: ['amber', 'blood', 'dracula', 'lavender', 'neon-rain', 'night-city', 'ocean', 'phosphor', 'rose-pine', 'solarized-dark']
+card vs tool_out                             min  1.00  median  1.02  max  1.13
+  raw accent under 3:1 on card (20 themes x 6 presets): 14 of 120
+  run == warn (raw): ['amber', 'blood', 'dracula', 'neon-rain', 'paper', 'phosphor', 'solarized-dark']
+  flush chrome (bg == message_bg): 12 / 20
+  light themes (canvas luminance > 0.4): ['paper']
+
+== Contract (all 140 theme x accent cases)
+hair vs canvas/chrome (floor 1.14)           min  1.14  median  1.16  max  1.80
+edge vs canvas/chrome/user (1.27)            min  1.27  median  1.30  max  1.88
+  themes whose edge is lifted: 14 / 20
+frame vs card/card_hi/tool_out (1.56)        min  1.56  median  1.58  max  1.62
+card_hi vs card                              min  1.14  median  1.15  max  1.15
+diff add wash vs tool_out (1.10)             min  1.10  median  1.11  max  1.11
+diff add wash vs canvas                      min  1.44  median  1.46  max  1.47
+diff del wash vs canvas                      min  1.44  median  1.45  max  1.47
+  themes where a wash is louder than the card by > 0.15: 1 / 20
+ink on add/del wash                          min  6.11  median  9.02  max 12.59
+ink on card_hi                               min  5.87  median  8.16  max 12.09
+run_k on card & card_hi (4.5)                min  4.52  median  6.24  max 11.53
+ok_k on card & card_hi (4.5)                 min  4.50  median  6.28  max  9.31
+dim_k on card & card_hi (4.5)                min  4.50  median  4.53  max  4.60
+prose_k on card & card_hi (4.5)              min  4.55  median  7.12  max 12.09
+run_mark_k on card & card_hi (3.0)           min  3.05  median  6.24  max 11.53
+err_mark_k on card & card_hi (3.0)           min  3.01  median  3.70  max  5.22
+rest_mark_k on card & card_hi (3.0)          min  3.00  median  3.03  max  3.07
+focus_k on card & card_hi (3.0)              min  3.00  median  5.58  max  9.83
+you_mark_t on tool & tool_out (3.0)          min  3.01  median  6.70  max 13.05
+chrome label on btn_hi (4.5)                 min  5.13  median  9.32  max 16.14
+chrome label on btn_fill today               min  4.50  median  8.56  max 17.15
+  ok: themes that change when canvas joins its grounds: none
+
+== Q1 cards (all 140 theme x accent cases): rows bare, hover fill, wells
+hover fill tool_out vs canvas (1.1)          min  1.31  median  1.32  max  1.33
+prose_t on canvas & hover fill (4.5)         min  4.53  median  8.81  max 13.89
+dim_t on canvas & hover fill (4.5)           min  4.51  median  4.54  max  4.61
+arg on canvas & hover fill (4.5)             min  4.50  median  4.55  max  7.78
+well vs canvas (1.1)                         min  1.10  median  1.11  max  1.44
+hair frame vs canvas (1.14)                  min  1.14  median  1.19  max  1.98
+add wash vs well (1.1)                       min  1.10  median  1.10  max  1.12
+del wash vs well (1.1)                       min  1.10  median  1.10  max  1.11
+ink on add/del wash (4.5)                    min  7.32  median 10.58  max 14.93
+ok_o sign on add wash (4.5)                  min  4.52  median  7.86  max 11.73
+err_o on del wash & well (4.5)               min  4.50  median  4.63  max  6.53
+res (well text) on well (4.5)                min  4.87  median 10.42  max 14.03
+dim_o (numbers, header) on well (4.5)        min  4.50  median  4.54  max  4.61
+  themes whose well stays on tool_out: ['paper']
+  (the text pairs above are floored on those grounds by construction: they fail only if lift saturates)
+
+  -- Q1 drawn pairs: each colour on the ground it is painted over (theme.rs q1_draws_every_pair_above_its_floor)
+well header rule hair_w on well (1.14)       min  1.14  median  1.37  max  1.39
+well frame hair_w on canvas (1.14)           min  1.15  median  1.53  max  1.98
+chip frame hair_t on tool/tool_out/canvas (1.14) min  1.14  median  1.16  max  1.51
+OPEN outline edge_t on canvas/hover fill (1.27) min  1.27  median  1.29  max  2.06
+OPEN hovered outline frame on hover fill (1.56) min  1.69  median  1.85  max  2.07
+OPEN hovered word prose_t on hover fill (4.5) min  4.53  median  8.81  max 13.89
+  -- what 75fc7d8 drew there (report; the reason for the roles above)
+  hair on well (header rule)                 min  1.00  median  1.05  max  1.38
+  hair on tool (chip frame)                  min  1.00  median  1.04  max  1.72
+  edge on tool_out (OPEN, hovered row)       min  1.07  median  1.10  max  2.06
+  themes with hair on well under 1.14: ['amber', 'blood', 'dracula', 'forest', 'gruvbox', 'lavender', 'neon-rain', 'night-city', 'nord', 'ocean', 'paper', 'phosphor', 'rose-pine']
+  well vs tool_out (a hovered row over its well; a frame between) min  1.00  median  1.19  max  1.54
+code_in (inline code) on its chip, the well (4.5) min  4.87  median 10.42  max 14.03
+inline code chip (well) vs canvas (1.1)      min  1.10  median  1.11  max  1.44
+inline code chip (well != code) vs the user bubble (1.1) min  1.13  median  1.13  max  1.13
+  chip = code surface vs the user bubble (main) min  1.00  median  1.00  max  1.29
+  paper inline chip #d7d9dd (lum 0.69), text #3e5f6b
+  Q1 floors: all pass
+
+== Q4 press (fluid.md §3.9) and drain (motion.md §5.3), all 140 cases
+press_ch vs its hover fill (1.05)            min  1.07  median  1.07  max  1.08
+press_ch vs its rest fill (1.05)             min  1.06  median  1.07  max  1.08
+texts on press_ch (4.5)                      min  4.80  median  4.85  max  4.91
+marks on press_ch (3.0)                      min  3.21  median  3.25  max  3.75
+press_k vs its hover fill (1.05)             min  1.06  median  1.07  max  1.08
+press_k vs its rest fill (1.05)              min  1.07  median  1.07  max  1.08
+texts on press_k (4.5)                       min  4.79  median  4.82  max  4.88
+marks on press_k (3.0)                       min  3.20  median  3.23  max  3.30
+btn_press vs its hover fill (1.05)           min  1.14  median  1.14  max  1.15
+btn_press vs its rest fill (1.05)            min  1.06  median  1.31  max  1.33
+texts on btn_press (4.5)                     min  5.88  median 10.26  max 17.40
+warn_press vs its hover fill (1.05)          min  1.10  median  1.14  max  1.15
+warn_press vs its rest fill (1.05)           min  1.12  median  1.25  max  1.33
+texts on warn_press (4.5)                    min  6.20  median 11.83  max 19.67
+  press stepped away from the ink (toward was blocked): 280 of 560
+  press == hover anywhere: 0
+drained run_k/ok_k on card & card_hi (4.47)  min  4.50  median  5.74  max  9.28
+drained marks on card & card_hi (2.97)       min  2.99  median  3.35  max  5.23
+drained you_mark_t on tool & tool_out (2.97) min  3.00  median  6.71  max 13.06
+chrome label on drained btn_fill/btn_hi/btn_press (4.47) min  4.48  median  8.41  max 14.63
+  Q4 floors: all pass
+
+== Q2 authorize card (polish.md §2.6; finish gate and review of #18), all 140 cases
+the command (well_fg) on its well (7.0)      min  7.05  median 11.93  max 16.57
+the command over the card's loudest other text (ratio) (1.0) min  1.00  median  1.29  max  1.97
+warn_mark frame and dashes on card (3.0)     min  3.50  median  8.39  max 13.25
+focus_k Allow all mark on card (3.0)         min  3.43  median  6.41  max 11.22
+you ($) on the well (4.5)                    min  4.50  median  8.82  max 17.15
+receipt "denied" (err) on the row: canvas, tool_out (4.5) min  4.50  median  4.55  max  6.05
+  (err_o there instead, for comparison: not used) min  3.22  median  4.67  max  6.05
+receipt words (dim_t) on the row (4.5)       min  4.51  median  4.54  max  4.61
+  Q2 floors: all pass
+
+== Q6 palette (review of #20 N5; re-gate of #20 item 4), all 140 cases
+thumb_k on card (1.14)                       min  2.25  median  2.60  max  2.68
+thumb_k on card_hi (the selected row) (1.14) min  1.96  median  2.26  max  2.32
+  (raw you on card_hi, for comparison: not used) min  1.01  median  5.60  max 11.26
+you_k (matched letters) on card (4.5)        min  5.15  median  6.43  max 12.89
+you_k (matched letters) on card_hi (4.5)     min  4.50  median  5.60  max 11.26
+  Q6 floors: all pass
+
+== nord (default theme), no accent
+  canvas       #07080a  vs canvas 1.00
+  chrome       #101216  vs canvas 1.07
+  raised       #1e2024  vs canvas 1.23
+  user         #16191e  vs canvas 1.14
+  tool         #191a1d  vs canvas 1.15
+  tool_out     #242629  vs canvas 1.32
+  card         #292b30  vs canvas 1.41
+  card_hi      #33353a  vs canvas 1.63
+  hair_now     #1c2028  vs canvas 1.23
+  hair         #1c2028  vs canvas 1.23
+  edge_now     #232832  vs canvas 1.36
+  edge         #292e38  vs canvas 1.47
+  frame        #4d525b  vs canvas 2.55
+  add_bg_now   #343f44  vs canvas 1.85
+  add_bg       #292e31  vs canvas 1.46
+  del_bg_now   #403135  vs canvas 1.63
+  del_bg       #332c2f  vs canvas 1.47
+  run_k        #a3be8c  vs canvas 9.83
+  ok_k         #88c0d0  vs canvas 10.02
+  focus_k      #81a1c1  vs canvas 7.44
+  you_mark_t   #81a1c1  vs canvas 7.44
+  btn_fill     #81a1c1  vs canvas 7.44
+  btn_hi       #8facc8  vs canvas 8.49

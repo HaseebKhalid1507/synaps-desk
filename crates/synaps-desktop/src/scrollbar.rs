@@ -57,6 +57,8 @@ pub(crate) enum Ground {
     Canvas,
     Chrome,
     User,
+    /// The card (the palette's list).
+    Card,
 }
 
 /// A scroll's geometry along the bar's axis (px): the track's length, the
@@ -481,6 +483,8 @@ pub(crate) struct Bars {
     /// The session's system prompt in Settings.
     pub prompt: Pane,
     pub usage: BarState,
+    /// The palette's list.
+    pub palette: BarState,
 }
 
 /// A bar over `scroll`.
@@ -490,12 +494,14 @@ pub(crate) struct Bar<S: Scrolled> {
     axis: Axis,
     ground: Ground,
     always: bool,
+    /// Shown with its surface, at once (no fade in): the palette's.
+    instant: bool,
     focus: Option<FocusHandle>,
 }
 
 impl<S: Scrolled> Bar<S> {
     pub(crate) fn new(scroll: S, state: &BarState) -> Self {
-        Bar { scroll, state: state.clone(), axis: Axis::Vertical, ground: Ground::Canvas, always: false, focus: None }
+        Bar { scroll, state: state.clone(), axis: Axis::Vertical, ground: Ground::Canvas, always: false, instant: false, focus: None }
     }
 
     pub(crate) fn ground(mut self, ground: Ground) -> Self {
@@ -506,6 +512,13 @@ impl<S: Scrolled> Bar<S> {
     /// Shown whenever there is something to scroll.
     pub(crate) fn always(mut self) -> Self {
         self.always = true;
+        self
+    }
+
+    /// Part of a surface that opens at once (the palette, P11's keyboard
+    /// open): drawn whole on its first frame, never fading in.
+    pub(crate) fn instant(mut self) -> Self {
+        self.instant = true;
         self
     }
 
@@ -624,7 +637,7 @@ impl<S: Scrolled> Bar<S> {
         if look.0 != st.was {
             st.was = look.0;
             let full = crate::motion::Level::current(cx) == crate::motion::Level::Full;
-            st.fade = full.then_some((look.0, now));
+            st.fade = (full && !(self.instant && look.0)).then_some((look.0, now));
         }
         let fade = fading(st.fade, now);
         if fade.is_none() {
@@ -654,7 +667,7 @@ impl<S: Scrolled> Bar<S> {
 impl<S: Scrolled> Frame<S> {
     fn paint(self, window: &mut Window, cx: &mut App) {
         let Frame { bar, geo, offset, thumb, lane, vp, pane, strip, thumb_hit, look, view, fade } = self;
-        let Bar { scroll, state, axis, ground, always, focus } = bar;
+        let Bar { scroll, state, axis, ground, always, focus, .. } = bar;
         let dragging = state.0.borrow().grab.is_some();
         // Hiding: the thumb as it was at rest, lerping to its ground.
         if let Some((false, k)) = fade {
@@ -663,6 +676,7 @@ impl<S: Scrolled> Frame<S> {
                 Ground::Canvas => (p.canvas, p.thumb),
                 Ground::Chrome => (p.chrome, p.thumb_ch),
                 Ground::User => (p.user, p.thumb_u),
+                Ground::Card => (p.card, p.thumb_k),
             };
             let rect = thumb_rect(axis, lane, thumb);
             window.with_content_mask(Some(ContentMask { bounds: vp }), |window| {
@@ -678,6 +692,7 @@ impl<S: Scrolled> Frame<S> {
                 Ground::Canvas => (p.thumb, p.dim, p.focus),
                 Ground::Chrome => (p.thumb_ch, p.dim_ch, p.focus_ch),
                 Ground::User => (p.thumb_u, p.dim_u, p.focus),
+                Ground::Card => (p.thumb_k, p.dim_k, p.focus_k),
             };
             let color = if dragging {
                 hot
@@ -694,6 +709,7 @@ impl<S: Scrolled> Frame<S> {
                         Ground::Canvas => p.canvas,
                         Ground::Chrome => p.chrome,
                         Ground::User => p.user,
+                        Ground::Card => p.card,
                     };
                     crate::motion::mix(base, color, k)
                 }

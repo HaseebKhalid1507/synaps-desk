@@ -5203,6 +5203,625 @@ fn tracer_lands_on_new_tab(cx: &mut TestAppContext) {
     assert!(view.read_with(cx, |v, _| v.tracer.is_none()), "Reduced: no tracer");
 }
 
+/// The palette's keys as this OS spells them (Ctrl+P / Ctrl+K, Cmd on macOS).
+fn palette_key(commands: bool) -> &'static str {
+    let (goto, cmds) = crate::app::palette_keys(cfg!(target_os = "macos"));
+    if commands { cmds } else { goto }
+}
+
+/// `text` typed into what has the focus, as the platform's text input.
+fn type_in(cx: &mut TestAppContext, w: AnyWindowHandle, text: &str) {
+    VisualTestContext::from_window(w, cx).simulate_input(text);
+    cx.run_until_parked();
+}
+
+fn palette_mode(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<crate::palette::Mode> {
+    view.read_with(cx, |v, _| v.palette.as_ref().map(|p| p.mode))
+}
+
+fn palette_focused(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> bool {
+    cx.update_window(w, |_, window, cx| view.read(cx).palette_input.read(cx).focus_handle(cx).is_focused(window)).expect("the window")
+}
+
+/// polish.md P16: Ctrl+P opens GO TO from the composer (its input binds
+/// neither key), the query focused and the card's keys off while it is
+/// open; Esc closes it and gives the composer its focus back. That Esc is
+/// the palette's: it arms no HALT and denies nothing.
+#[gpui_kit::test]
+fn palette_esc_restores_focus(cx: &mut TestAppContext) {
+    use crate::palette::Mode;
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(false));
+    assert_eq!(palette_mode(cx, &view), Some(Mode::GoTo));
+    assert!(palette_focused(cx, w, &view) && !composer_focused(cx, w, &view), "the query has the focus");
+    tap(cx, w, "escape");
+    assert_eq!(palette_mode(cx, &view), None, "Esc closes it");
+    assert!(composer_focused(cx, w, &view), "the focus is back in the composer");
+    assert!(view.read_with(cx, |v, _| v.halts == 0 && v.halt_armed.is_none()), "the palette's Esc arms no HALT");
+    // From the window's own focus (the card up): back there, and the card's
+    // keys are off while it is open.
+    let (w, view, _events) = open(cx);
+    card_keys(cx, w, &view);
+    tap(cx, w, palette_key(true));
+    assert_eq!(palette_mode(cx, &view), Some(Mode::Commands));
+    settle(cx, w, 4);
+    assert_eq!(view.read_with(cx, |v, _| v.card_keys.get()), None, "the card's keys are off under the palette");
+    tap(cx, w, "escape");
+    assert_eq!(palette_mode(cx, &view), None);
+    assert!(view.read_with(cx, |v, _| v.current_card().is_some()), "Esc closed the palette, not the card (no DENY)");
+    assert!(cx.update_window(w, |_, window, cx| view.read(cx).focus.is_focused(window)).expect("the window"), "the window's focus again");
+}
+
+/// polish.md P16: Tab belongs to the palette (never typed, never the kit's
+/// focus cycling, never the card's Allow all): it flips the mode; the other
+/// mode's key switches to it, its own key leaves it.
+#[gpui_kit::test]
+fn palette_tab_flips_mode(cx: &mut TestAppContext) {
+    use crate::palette::Mode;
+    let (w, view, _events) = open(cx);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(false));
+    tap(cx, w, "tab");
+    assert_eq!(palette_mode(cx, &view), Some(Mode::Commands), "Tab: commands");
+    tap(cx, w, "shift-tab");
+    assert_eq!(palette_mode(cx, &view), Some(Mode::GoTo), "Shift+Tab: back");
+    assert!(palette_focused(cx, w, &view), "the query keeps the focus");
+    assert_eq!(view.read_with(cx, |v, cx| v.palette_input.read(cx).value().to_string()), "", "no tab typed");
+    tap(cx, w, palette_key(true));
+    assert_eq!(palette_mode(cx, &view), Some(Mode::Commands), "Ctrl+K switches");
+    tap(cx, w, palette_key(true));
+    assert_eq!(palette_mode(cx, &view), Some(Mode::Commands), "and stays");
+    tap(cx, w, palette_key(false));
+    assert_eq!(palette_mode(cx, &view), Some(Mode::GoTo), "Ctrl+P switches back");
+    // ↓ then Enter picks; the palette closes.
+    let first = view.read_with(cx, |v, _| v.palette.as_ref().and_then(|p| p.selected().map(|e| e.group)));
+    assert_eq!(first, Some(crate::palette::Group::Sessions), "GO TO starts at the sessions");
+    tap(cx, w, "enter");
+    assert_eq!(palette_mode(cx, &view), None, "Enter picks and closes");
+}
+
+/// polish.md P16 / fluid.md §3.10: opened by key, the palette is whole in
+/// its first frame (its list's height and the selection quad at their
+/// targets); then the quad springs to a new row and the height to what the
+/// query leaves, on `snap`. Reduced and Off: at once.
+#[gpui_kit::test]
+fn palette_keyboard_open_is_instant(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(true));
+    let drawn = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.palette_drawn.get());
+    let (h, ht, q, qt) = drawn(cx);
+    assert!(ht > 0. && h == ht && q == qt, "whole in its first frame: {h} / {ht}, quad {q} / {qt}");
+    tap(cx, w, "down");
+    let (_, _, q, qt) = drawn(cx);
+    assert!(q != qt, "the quad springs to the next row: {q} → {qt}");
+    for _ in 0..60 {
+        wait(cx, w, &view, 7);
+    }
+    let (_, _, q, qt) = drawn(cx);
+    assert_eq!(q, qt, "and lands");
+    type_in(cx, w, "/model");
+    frame(cx, &view);
+    let (h, ht, _, _) = drawn(cx);
+    assert!(h != ht && ht < 100., "the height springs to what is left: {h} → {ht}");
+    for _ in 0..60 {
+        wait(cx, w, &view, 7);
+    }
+    let (h, ht, _, _) = drawn(cx);
+    assert_eq!(h, ht, "and settles");
+    for level in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
+        set_motion(cx, &view, level);
+        tap(cx, w, "escape");
+        tap(cx, w, palette_key(true));
+        tap(cx, w, "down");
+        let (h, ht, q, qt) = drawn(cx);
+        assert!(h == ht && q == qt, "{level:?}: at once");
+    }
+}
+
+/// polish.md P16: an engine command is the session owner's: observing,
+/// the palette marks it and picking it sends nothing, politely; driving,
+/// it goes out as the engine command, and the composer's `/compact` takes
+/// the same path (never sent as a message).
+#[gpui_kit::test]
+fn palette_engine_commands_are_the_owners(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    let mode = view.read_with(cx, |v, _| v.model.active.as_ref().unwrap().mode);
+    view.update(cx, |v, cx| {
+        v.model.active.as_mut().unwrap().mode = synaps_client::AttachMode::Observe;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(true));
+    type_in(cx, w, "/compact");
+    let sel = view.read_with(cx, |v, _| v.palette.as_ref().and_then(|p| p.selected().cloned())).expect("a row");
+    assert_eq!(sel.act, crate::palette::Act::Engine("compact"));
+    assert_eq!(sel.key.as_deref(), Some("owner"), "marked");
+    assert_eq!(sel.off.as_deref(), Some("/compact: this window observes"), "{:?}", sel.off);
+    tap(cx, w, "enter");
+    let note = view.read_with(cx, |v, _| v.watch_note.clone()).expect("a note");
+    assert_eq!(note.as_ref(), "/compact: this window observes", "refused politely");
+    // Driving: it goes out (the client takes it; its daemon is nowhere).
+    view.update(cx, |v, cx| {
+        v.model.active.as_mut().unwrap().mode = mode;
+        v.watch_note = None;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    // (The demo's turn over: mid-turn neither door runs a command.)
+    idle(cx, &view);
+    assert!(view.update(cx, |v, _| v.run_command("context", String::new())), "sent");
+    assert!(view.read_with(cx, |v, _| v.watch_note.clone()).is_some_and(|n| n.contains("/context: sent")));
+    // The composer's `/compact`: the same path, not a message.
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.composer.update(cx, |s, cx| {
+                s.set_value("/compact", window, cx);
+                s.focus(window, cx);
+            })
+        })
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    let sent_before = view.read_with(cx, |v, _| v.model.transcript.items().len());
+    tap(cx, w, "enter");
+    assert!(view.read_with(cx, |v, _| v.watch_note.clone()).is_some_and(|n| n.contains("/compact: sent")), "the engine's");
+    assert_eq!(view.read_with(cx, |v, _| v.model.transcript.items().len()), sent_before, "no message in the log");
+    assert_eq!(composer_text(cx, &view), "/compact", "kept until the daemon has run it");
+}
+
+/// The session's turn over (the demo's runs): no turn running.
+fn idle(cx: &mut TestAppContext, view: &Entity<AppView>) {
+    view.update(cx, |v, cx| {
+        v.model.transcript.set_busy(false);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(!view.read_with(cx, |v, _| v.model.transcript.busy()));
+}
+
+/// `text` in the composer, focused, then Enter.
+fn send_in_composer(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, text: &str) {
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.watch_note = None;
+            v.composer.update(cx, |s, cx| {
+                s.set_value(text, window, cx);
+                s.focus(window, cx);
+            })
+        })
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    tap(cx, w, "enter");
+}
+
+/// The daemon's answer to slash command `name` on the attachment on screen.
+fn reply(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str, reply: synaps_client::CommandReply) {
+    view.update(cx, |v, cx| {
+        let attach_seq = v.model.active.as_ref().expect("attached").attach_seq;
+        v.apply_batch(vec![synaps_client::Event::EngineReply { attach_seq, name: name.into(), reply }], cx);
+    });
+    cx.run_until_parked();
+}
+
+fn in_flight(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {
+    view.read_with(cx, |v, _| v.model.in_flight.iter().cloned().collect())
+}
+
+/// Shady #20 H2: the composer's text is an engine command only when the
+/// whole of it is a valid invocation; prose that starts with a command
+/// word goes as a message, exactly as before. A command's text stays in
+/// the composer until the daemon has run it (a `/model x` that left
+/// another model in use has not); a run one leaves.
+#[gpui_kit::test]
+fn the_composer_runs_only_whole_valid_commands(cx: &mut TestAppContext) {
+    use synaps_client::CommandReply::{Done, NotRun};
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    idle(cx, &view);
+    for prose in ["/model is this the wrong one?", "/workers are stuck", "/usr/bin"] {
+        send_in_composer(cx, w, &view, prose);
+        assert_eq!(in_flight(cx, &view).last().map(String::as_str), Some(prose), "{prose}: a message");
+        assert_eq!(composer_text(cx, &view), "", "{prose}: sent, as before");
+        assert!(view.read_with(cx, |v, _| v.watch_note.is_none()), "{prose}: no command's note");
+    }
+    let messages = in_flight(cx, &view).len();
+    // A valid one: the engine's, kept until it has run.
+    send_in_composer(cx, w, &view, "/compact");
+    assert_eq!(in_flight(cx, &view).len(), messages, "not a message");
+    assert!(view.read_with(cx, |v, _| v.watch_note.clone()).is_some_and(|n| n.contains("/compact: sent")));
+    assert_eq!(composer_text(cx, &view), "/compact");
+    reply(cx, &view, "compact", Done(String::new()));
+    assert!(view.read_with(cx, |v, _| v.watch_note.clone()).is_some_and(|n| n.contains("/compact: asked")), "none is asked");
+    frame(cx, &view);
+    assert_eq!(composer_text(cx, &view), "", "run: it leaves the composer");
+    // `/model x` the daemon did not switch to: not run, the text stays.
+    send_in_composer(cx, w, &view, "/model openai/gpt-5.1");
+    assert_eq!(in_flight(cx, &view).len(), messages);
+    reply(cx, &view, "model", NotRun("not switched: the model is still claude-opus-4-6".into()));
+    frame(cx, &view);
+    let note = view.read_with(cx, |v, _| v.watch_note.clone()).expect("a note");
+    assert!(note.contains("/model not run: not switched"), "{note}");
+    assert_eq!(composer_text(cx, &view), "/model openai/gpt-5.1", "not run: the text stays");
+    // Its whole answer is a row of the transcript's (this client's).
+    send_in_composer(cx, w, &view, "/workers");
+    let rows: String = (1..=12).map(|k| format!("\n  sa_{k}  scout  running  0m")).collect();
+    reply(cx, &view, "workers", Done(format!("Workers (12):{rows}")));
+    frame(cx, &view);
+    let last = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| (i.kind, i.text.clone(), i.is_note())));
+    let (kind, text, note) = last.expect("a row");
+    assert_eq!(kind, synaps_client::transcript::ItemKind::Output);
+    assert!(note && text.starts_with("/workers\nWorkers (12):") && text.ends_with("sa_12  scout  running  0m"), "{text}");
+    assert_eq!(in_flight(cx, &view).len(), messages, "never sent");
+    assert!(view.read_with(cx, |v, _| v.watch_note.clone()).is_some_and(|n| n.contains("/workers: 13 lines, in the transcript")));
+}
+
+/// Shady #20 H2: while a turn runs, prose that starts with a command word
+/// steers, as it always did; a valid command does what the TUI's does
+/// there: it is not run, nothing is sent, and the text stays.
+#[gpui_kit::test]
+fn mid_turn_a_command_is_not_run_and_prose_steers(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    start_stream(cx, &view);
+    assert!(view.read_with(cx, |v, _| v.model.transcript.busy()));
+    let before = in_flight(cx, &view).len();
+    for t in ["/compact please", "/workers"] {
+        send_in_composer(cx, w, &view, t);
+        assert_eq!(in_flight(cx, &view).len(), before, "{t}: nothing sent");
+        assert_eq!(composer_text(cx, &view), t, "{t}: the text stays");
+        let note = view.read_with(cx, |v, _| v.watch_note.clone()).expect("a note");
+        assert!(note.contains("not while a turn runs"), "{note}");
+    }
+    send_in_composer(cx, w, &view, "/workers are stuck, look");
+    assert_eq!(in_flight(cx, &view).last().map(String::as_str), Some("/workers are stuck, look"), "a steer");
+    assert_eq!(composer_text(cx, &view), "");
+}
+
+/// Shady #20 M1: "Favourite this session" picked in a palette opened over
+/// the composer (the focus goes back there first) favourites it.
+#[gpui_kit::test]
+fn palette_favourite_from_the_composer(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    let id = attached(cx, &view).expect("a session");
+    assert!(view.read_with(cx, |v, _| v.model.favs.position(&id).is_none()));
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(true));
+    type_in(cx, w, "favourite");
+    tap(cx, w, "enter");
+    assert_eq!(palette_mode(cx, &view), None, "picked");
+    assert!(composer_focused(cx, w, &view), "the focus is back in the composer");
+    assert!(view.read_with(cx, |v, _| v.model.favs.position(&id).is_some()), "and the session is a favourite");
+}
+
+/// Shady #20 M3: Fold all / Unfold all keep the row at the top (and how far
+/// into it) with the view between runs, not the first run that changed.
+#[gpui_kit::test]
+fn fold_all_keeps_the_top_row(cx: &mut TestAppContext) {
+    use crate::turns::Kind;
+    let (w, view, _events) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    settle(cx, w, 8);
+    view.update(cx, |v, cx| v.fold_all_runs(true, cx));
+    settle(cx, w, 8);
+    // The row after the first run's last: between it and the next.
+    let (ix, id) = view.read_with(cx, |v, _| {
+        let first = v.disp.iter().position(|d| matches!(d.kind, Kind::Summary { .. })).expect("a run");
+        let Kind::Summary { end, .. } = v.disp[first].kind else { unreachable!() };
+        let ix = v.disp.iter().position(|d| d.item >= end).expect("a row after it");
+        assert!(v.disp[ix + 1..].iter().any(|d| matches!(d.kind, Kind::Summary { .. })), "a run below it too");
+        (ix, v.disp[ix].id)
+    });
+    let top = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let t = v.list.logical_scroll_top();
+            (v.disp[t.item_ix].id, t.offset_in_item)
+        })
+    };
+    view.update(cx, |v, cx| {
+        v.list.pause_following_tail();
+        v.list.scroll_to(gpui_kit::ListOffset { item_ix: ix, offset_in_item: px(5.) });
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    assert_eq!(top(cx), (id, px(5.)));
+    assert!(!view.read_with(cx, |v, _| v.list.is_following_tail()));
+    for open in [false, true, false] {
+        view.update(cx, |v, cx| v.fold_all_runs(open, cx));
+        settle(cx, w, 8);
+        assert_eq!(top(cx), (id, px(5.)), "fold all ({open}): the same row at the top");
+    }
+}
+
+/// Design gate #20 (1): the box hangs under the tab strip (never over a
+/// tab's name) and ends 12 px or more above the composer's frame, at
+/// 1280×720 and 1920×1080.
+fn palette_fits(cx: &mut TestAppContext, (wd, ht): (f32, f32)) {
+    let (w, view, _events) = open_at(cx, (wd, ht), crate::theme::Panels::default().text_size);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(false));
+    frame(cx, &view);
+    let (top, bottom) = view.read_with(cx, |v, _| v.palette_box.get());
+    let strip = view.read_with(cx, |v, _| f32::from(v.strip_at.get().y)) + crate::tabstrip::TAB_H;
+    let composer = view.read_with(cx, |v, _| v.composer_top.get());
+    assert!(strip > crate::tabstrip::TAB_H && composer > top, "laid out: strip {strip}, composer {composer}");
+    assert!(top >= strip + 8., "{wd}: the box's top {top} under the strip's bottom {strip}");
+    assert!(bottom <= composer - 12., "{wd}: the box's bottom {bottom}, the composer's top {composer}");
+    // Design re-gate #20 (1): the demo's worker chips show over the
+    // composer: the box ends 12 px or more above them too.
+    let chips = view.read_with(cx, |v, _| v.chip_bounds.borrow().iter().map(|c| f32::from(c.1.origin.y)).reduce(f32::min));
+    let chips = chips.expect("the demo's chips show");
+    assert!(chips < composer, "the chips over the composer: {chips}, {composer}");
+    assert!(bottom <= chips - 12., "{wd}: the box's bottom {bottom}, the chips' top {chips}");
+}
+
+/// Design re-gate #20 (3): an answered command's note is quiet (`dim_u`),
+/// a refusal a warning; `/compact`'s "asked" note goes once the compaction
+/// it asked for has its notice in the transcript; and a note cut short has
+/// the house tooltip.
+#[gpui_kit::test]
+fn command_notes_are_quiet_and_never_stale(cx: &mut TestAppContext) {
+    use synaps_client::CommandReply::Done;
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    idle(cx, &view);
+    let color = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, cx| {
+            let p = crate::theme::palette(cx);
+            let n = v.watch_note.clone().expect("a note");
+            (v.note_color(&n, &p) == p.dim_u, v.note_color(&n, &p) == p.warn)
+        })
+    };
+    send_in_composer(cx, w, &view, "/compact");
+    assert_eq!(color(cx), (true, false), "sent: quiet");
+    reply(cx, &view, "compact", Done(String::new()));
+    assert_eq!(note(cx, &view), "/compact: asked · see the transcript");
+    assert_eq!(color(cx), (true, false), "answered: quiet");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("composer-note").is_some(), "drawn in the foot");
+    view.update(cx, |v, cx| {
+        let seq = v.model.active.as_ref().expect("attached").attach_seq;
+        let sid = v.model.active.as_ref().expect("attached").session_id.clone();
+        let ev = synaps_client::protocol::SessionEvent::CompactionApplied {
+            previous_session_id: sid.clone(),
+            session_id: sid.clone(),
+            msg_count: 2,
+        };
+        v.apply_batch(vec![synaps_client::Event::session(seq, sid, 1, ev, std::sync::Arc::new(serde_json::Value::Null))], cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(note(cx, &view), "", "the compaction's notice is in the transcript: the note is done");
+    // Refused (mid-turn): a warning.
+    start_stream(cx, &view);
+    send_in_composer(cx, w, &view, "/budget");
+    assert_eq!(color(cx), (false, true), "refused: a warning");
+}
+
+/// Design re-gate #20 (5), found in its clip: reopened after scrolling
+/// down, the list is at its top again, its first group's head in view (the
+/// quad is the list's first child: scrolled to, it hid the head).
+#[gpui_kit::test]
+fn palette_reopens_at_the_top(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(false));
+    for _ in 0..12 {
+        tap(cx, w, "down");
+    }
+    tap(cx, w, "pagedown");
+    settle(cx, w, 8);
+    let y = |cx: &mut TestAppContext| view.read_with(cx, |v, _| f32::from(v.palette_scroll.offset().y));
+    assert!(y(cx) < 0., "scrolled down");
+    tap(cx, w, "escape");
+    tap(cx, w, palette_key(false));
+    settle(cx, w, 8);
+    assert_eq!(y(cx), 0., "at the top: the head in view");
+    type_in(cx, w, "e");
+    settle(cx, w, 8);
+    assert_eq!(y(cx), 0., "a query: the top too");
+}
+
+/// Design re-gate #20 (2): a query that matches nothing shows "Nothing
+/// matches": the list is a row high, never 0.
+#[gpui_kit::test]
+fn palette_miss_shows_nothing_matches(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(true));
+    type_in(cx, w, "zzqxv");
+    for _ in 0..20 {
+        wait(cx, w, &view, 33);
+    }
+    let (h, target, _, _) = view.read_with(cx, |v, _| v.palette_drawn.get());
+    assert_eq!((h, target), (crate::palette::ROW_H, crate::palette::ROW_H), "a row high");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("palette-empty").is_some_and(|b| b.size.height > px(0.)), "drawn");
+}
+
+#[gpui_kit::test]
+fn palette_fits_at_1280(cx: &mut TestAppContext) {
+    palette_fits(cx, (1280., 720.));
+}
+
+#[gpui_kit::test]
+fn palette_fits_at_1920(cx: &mut TestAppContext) {
+    palette_fits(cx, (1920., 1080.));
+}
+
+/// Shady #20 L5: under the open palette the app's keys do nothing (the
+/// tabs, the panels); Ctrl+P / Ctrl+K still act.
+#[gpui_kit::test]
+fn app_keys_are_off_under_the_palette(cx: &mut TestAppContext) {
+    use crate::palette::Mode;
+    let (w, view, _events) = open(cx);
+    tap(cx, w, palette_key(false));
+    let tabs = |cx: &mut TestAppContext| view.read_with(cx, |v, _| (v.model.tabs.iter().count(), v.panels));
+    let before = tabs(cx);
+    let (rail, _) = crate::app::panel_keys(cfg!(target_os = "macos"));
+    let new_tab = if cfg!(target_os = "macos") { "cmd-t" } else { "ctrl-t" };
+    for k in [new_tab, rail] {
+        tap(cx, w, k);
+        assert_eq!(tabs(cx), before, "{k}: nothing under the palette");
+        assert_eq!(palette_mode(cx, &view), Some(Mode::GoTo), "{k}: it stays open");
+    }
+    tap(cx, w, palette_key(true));
+    assert_eq!(palette_mode(cx, &view), Some(Mode::Commands));
+    tap(cx, w, "escape");
+    tap(cx, w, rail);
+    assert_ne!(tabs(cx), before, "closed, the key acts");
+}
+
+/// The palette's selected row.
+fn palette_sel(cx: &mut TestAppContext, view: &Entity<AppView>) -> crate::palette::Entry {
+    view.read_with(cx, |v, _| v.palette.as_ref().and_then(|p| p.selected().cloned())).expect("a row")
+}
+
+fn note(cx: &mut TestAppContext, view: &Entity<AppView>) -> String {
+    view.read_with(cx, |v, _| v.watch_note.as_ref().map(|n| n.to_string())).unwrap_or_default()
+}
+
+/// Shady #20 N1: the palette's engine commands keep the composer's mid-turn
+/// rule (one rule, in `run_command`): while a turn runs their rows are dim
+/// and say why; picked, they are not run and say what the composer says.
+#[gpui_kit::test]
+fn mid_turn_the_palette_runs_no_command(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    start_stream(cx, &view);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(true));
+    type_in(cx, w, "/workers");
+    let sel = palette_sel(cx, &view);
+    assert_eq!(sel.act, crate::palette::Act::Engine("workers"));
+    assert_eq!(sel.meta.to_string(), "not while a turn runs", "the row says why");
+    assert_eq!(sel.off.as_deref(), Some(crate::palette::mid_turn("workers").as_str()), "dim");
+    tap(cx, w, "enter");
+    assert_eq!(palette_mode(cx, &view), None);
+    assert_eq!(note(cx, &view), crate::palette::mid_turn("workers"), "the composer's note");
+    assert!(!view.update(cx, |v, _| v.run_command("budget", String::new())), "the door itself: not run");
+    assert_eq!(note(cx, &view), crate::palette::mid_turn("budget"));
+    // The turn over: the rows as ever, and picked, it goes out.
+    idle(cx, &view);
+    tap(cx, w, palette_key(true));
+    type_in(cx, w, "/workers");
+    let sel = palette_sel(cx, &view);
+    assert_eq!((sel.off.as_deref(), sel.meta.to_string().as_str()), (None, "the session's workers"));
+    tap(cx, w, "enter");
+    assert!(note(cx, &view).contains("/workers: sent"), "{}", note(cx, &view));
+}
+
+/// Shady #20 N3: a command's own words its grammar does not take are a
+/// command mistyped, not chat for the model: its usage, the text kept,
+/// nothing sent. N2 (the TUI's escape): `//text` sends `/text` as a
+/// message (a steer mid-turn), never as a command.
+#[gpui_kit::test]
+fn a_mistyped_command_shows_its_usage_and_double_slash_sends_text(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    idle(cx, &view);
+    let before = in_flight(cx, &view).len();
+    for (t, name) in [
+        ("/model", "model"),
+        ("/model sonnet", "model"),
+        ("/workers cancel scout", "workers"),
+        ("/budget time 30", "budget"),
+        ("/context auto 1", "context"),
+        ("/trace next please", "trace"),
+        ("/confirms reset all", "confirms"),
+    ] {
+        send_in_composer(cx, w, &view, t);
+        assert_eq!(in_flight(cx, &view).len(), before, "{t}: nothing sent");
+        assert_eq!(composer_text(cx, &view), t, "{t}: the text stays");
+        assert_eq!(note(cx, &view), crate::palette::usage(name), "{t}");
+    }
+    send_in_composer(cx, w, &view, "//compact is broken, why?");
+    assert_eq!(in_flight(cx, &view).last().map(String::as_str), Some("/compact is broken, why?"), "a message");
+    assert_eq!(composer_text(cx, &view), "", "sent");
+    assert_eq!(note(cx, &view), "", "no command's note");
+    start_stream(cx, &view);
+    send_in_composer(cx, w, &view, "//workers");
+    assert_eq!(in_flight(cx, &view).last().map(String::as_str), Some("/workers"), "a steer");
+    assert_eq!(composer_text(cx, &view), "");
+}
+
+/// Shady #20 N8: a tab left while its slash command was out: the answer
+/// goes to an attachment no longer on screen, so the command's text leaves
+/// with it (as a sent message's does): shown again, the tab's draft does
+/// not hold a command already run. An edited one is a draft: kept.
+#[gpui_kit::test]
+fn a_tab_left_mid_command_drops_the_command_from_its_draft(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    idle(cx, &view);
+    send_in_composer(cx, w, &view, "/compact");
+    assert_eq!(composer_text(cx, &view), "/compact", "out: kept until it has run");
+    let client = view.update(cx, |v, _| v.client.take());
+    open_idle_cpu(cx, &view, crate::tabs::Place::New);
+    frame(cx, &view);
+    assert_eq!(composer_text(cx, &view), "", "the other tab's (empty) draft");
+    // There, a command out, then edited: a draft.
+    view.update(cx, |v, _| v.client = client);
+    send_in_composer(cx, w, &view, "/budget");
+    assert!(note(cx, &view).contains("/budget: sent"), "{}", note(cx, &view));
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.composer.update(cx, |s, cx| s.set_value("/budget status", window, cx))))
+        .expect("the window");
+    let back = |cx: &mut TestAppContext, ix: usize| {
+        view.update(cx, |v, cx| {
+            v.focus_tab(ix);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        frame(cx, &view);
+    };
+    back(cx, 0);
+    assert_eq!(composer_text(cx, &view), "", "its command left with its answer");
+    back(cx, 1);
+    assert_eq!(composer_text(cx, &view), "/budget status", "an edited draft stays");
+}
+
+/// Shady #20 N4: a command's answer is synaps's words, not the agent's: its
+/// row has its own label, and to the sticky labels it is a message of its
+/// own: while it is the top message, the label pinned is its own, never
+/// the agent's above it.
+#[gpui_kit::test]
+fn a_command_answer_pins_its_own_label(cx: &mut TestAppContext) {
+    use crate::turns::Who;
+    let (w, view, _events) = sticky_open(cx, (2200., 640.));
+    let body: String = (1..=6).map(|k| format!("\n  line {k}")).collect();
+    view.update(cx, |v, cx| {
+        v.model.transcript.output("budget", &format!("Budget:{body}"));
+        cx.notify();
+    });
+    start_stream(cx, &view);
+    for k in 0..80 {
+        stream_step(cx, &view, k);
+    }
+    idle(cx, &view);
+    settle(cx, w, 8);
+    let (out, id, agent) = view.read_with(cx, |v, _| {
+        let out = v.disp.iter().position(|d| d.who == Who::Synaps).expect("the answer's row, labelled");
+        let agent = (0..out).rev().find(|&i| v.disp[i].who == Who::Agent).expect("the agent's message above");
+        (out, v.disp[out].id, v.disp[agent].id)
+    });
+    let pad_y = view.read_with(cx, |_, cx| crate::theme::metrics(cx).pad_y);
+    scroll_list(cx, w, &view, out, 0.);
+    let (_, top) = viewport(cx, &view);
+    let slot = drawn(cx, w, format!("hang-label-{id}")).expect("its label in its slot");
+    let off = slot[1] - top - pad_y;
+    assert!(off > 0., "{slot:?}");
+    // Its label past the viewport's top (the agent's, pushed by it, gone).
+    scroll_list(cx, w, &view, out, off + pad_y + 2.);
+    let stuck = drawn(cx, w, format!("sticky {id}")).expect("its own label pinned");
+    assert!((stuck[1] - (top + pad_y)).abs() < 1e-3, "at the pin: {stuck:?}");
+    assert!(drawn(cx, w, format!("sticky {agent}")).is_none(), "never the agent's");
+}
+
 // ── sticky labels (polish.md P15) ─────────────────────────────────────
 
 /// The other demo session (three finished turns, its history) at `size`,

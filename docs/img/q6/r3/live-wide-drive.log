@@ -1,0 +1,25 @@
+t0 1794990296.470270750
+0.00208926 mousemove 960 985 click 1
+0.613569 type --delay 60 /budget
+1.34777 key Return
+3.36597 still wide-budget
+3.45877 type --delay 60 /workers
+4.25636 key Return
+6.27415 still wide-workers
+6.36125 mousemove 960 400
+6.36498 click 4
+6.97224 still wide-scroll-1
+7.05705 click 4
+7.66162 still wide-scroll-2
+7.74325 click 4
+8.34959 still wide-scroll-3
+8.44127 click 4
+9.05081 still wide-scroll-4
+9.13886 click 4
+9.74976 still wide-scroll-5
+9.83348 click 4
+10.4413 still wide-scroll-6
+10.5334 click 4
+11.1394 still wide-scroll-7
+11.2326 click 4
+11.8384 still wide-scroll-8

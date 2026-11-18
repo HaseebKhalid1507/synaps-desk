@@ -18,7 +18,7 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-JP_LABELS="セッション文脈トークン変更固定稼働履歴お気に入り"
+JP_LABELS="セッション文脈トークン変更固定稼働履歴お気に入りワーカーコマンド表示"
 LATIN="U+0020-007E,U+00A0-017F,U+0192,U+02C6-02DC,U+2000-206F,U+20AC,U+2122,U+2190-2193,U+2212,U+2713"
 # Tool output (`tree`, tables, progress bars) keeps its columns in the mono face.
 MONO="$LATIN,U+2500-259F"
