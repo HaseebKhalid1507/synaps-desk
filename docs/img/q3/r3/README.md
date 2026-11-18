@@ -1,7 +1,7 @@
 # Q3 Life, round 3: evidence on the merged tree
 
 > **Round 4 (`ef5f374`) changes one thing shown here:** a spawn row's tool count and its live step line no longer
-> roll; they change in place (gate 4 under a live fan-out, `docs/bench/q3/README.md` "Round 4"). The worker-row
+> roll; they swap in one frame, at every level (gate 4 under a live fan-out, `docs/bench/q3/README.md` "Round 4"). The worker-row
 > rolls in these clips, and the "plural swap" and "rolls step at 30 Hz" notes about them below, describe `699f1b2`.
 > The rarer counts (`+N more`, NEEDS YOU, the rail chips) still roll as recorded here. Everything else is unchanged.
 
