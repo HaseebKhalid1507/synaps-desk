@@ -1,10 +1,10 @@
 # Events in the desk: evidence
 
-Live on the **desktopproto sandbox** on bella (daemon 0.11.1, haiku-4-5), `live.sh` phases `setup`, `order`,
+Live on the **desktopproto sandbox** on the build machine (daemon 0.11.1, haiku-4-5), `live.sh` phases `setup`, `order`,
 `record`, `reload`, `teardown`. The sandbox config got the two model-credential lines for the run and was restored
 after: sha `c1b7ac41…320edd` before and after, 0 auth lines left (`logs/live.log`). Every app run's
-`XDG_CONFIG_HOME` was an absolute scratch folder under `~/.cache/events-live` (`scripts/capture-linux.sh`); bella's
-real `~/.config/synaps-desktop/settings.json` kept its mtime (`07:04:07.671`, before the first run) through every run.
+`XDG_CONFIG_HOME` was an absolute scratch folder under `~/.cache/events-live` (`scripts/capture-linux.sh`); the
+machine's real `~/.config/synaps-desktop/settings.json` kept its mtime (`07:04:07.671`, before the first run) through every run.
 Every event text, name and channel is synthetic. The scratch folder is gone.
 
 Binaries: this branch's release builds (`dbuild synaps-desktop-events build --release --locked`): `record` ran
@@ -63,7 +63,7 @@ same gate as the agent's form: a withheld class's live row shows the same marker
 data; a class this client doesn't know is withheld (closed, as the gate fails). Tests:
 `events::tests::a_withheld_class_shows_its_marker_live_as_in_the_history`.
 
-**Round 2, `local_only` (Haseeb's call on Shady #22 M3):** that class is defined as "display locally only, never
+**Round 2, `local_only` (the owner's call on Shady #22 M3):** that class is defined as "display locally only, never
 enters model context", so its live row shows its text (and data) with a quiet `not sent to the agent` mark. Its
 history row can only show what the agent's form kept, the marker `[content withheld: local_only (local_only)]`. So
 for this class a reload shows less than the live row did: the one mismatch between them, by design. Within the
@@ -79,8 +79,14 @@ session not attached never learns of it, so it marks no rail row. Test:
 
 ## Stills and the clip
 
-- `events-live-1920-nord.mp4`: the whole `record` run, 150 s at 30 fps, lossless (libx264rgb qp 0, gbrp; frame
-  md5 `ce9a02db17aa`, the same as the capture's mkv). Drive log with event times: `logs/live-1920-nord-drive.log`.
+The repo has small lossy previews only (H.264 crf 23, the transcript column cropped at x 530). The lossless clips
+and the captures they came from are kept off the repo, in the maintainer's `synaps-desktop/events-evidence/` folder,
+with `MANIFEST.md` (their sha256 and frame md5s, and the preview commands): this repo is public, and a merged blob
+stays in its history.
+
+- `events-live-preview.mp4` (921 KB; 560 px wide, 8 fps): the whole `record` run, 150 s. Its lossless original
+  (1920×1080, 30 fps, libx264rgb qp 0, gbrp) has frame md5 `ce9a02db17aa`, the same as the capture's mkv. Drive
+  log with event times: `logs/live-1920-nord-drive.log`.
 - `stills/live-*.png` (1920×1080, nord, live): `low` (send, quiet), `medium-channel` (`#deploys`), `ask` (a comms
   ask with `expects_response`: `COMMS kestrel #7 ask ASK`, the `↩ comms_send(…)` line gone), `high` (`#alerts`,
   warn), `critical` (`uptime-watch`, err, folded: `… 2 more lines · show all`), `midturn-running` /
@@ -99,7 +105,7 @@ session not attached never learns of it, so it marks no rail row. Test:
 The same sandbox and scripts (`live.sh setup`, `stream`, `reload`, `teardown`), this branch's release build at
 `9e7ca7d`, sha256 `a52bf24c…7b0d45`. Config sha `c1b7ac41…320edd` before and after, 0 auth lines left
 (`r2/logs/live.log`). `settings.json`'s mtime was `08:16:13.638` before the first app run of this round (it had
-changed since round 1's `07:04:07` by something else on bella: no run of mine was going) and the same after.
+changed since round 1's `07:04:07` by something else on the machine: no run of mine was going) and the same after.
 
 **The frame order** (`r2/logs/frames-stream.log`): a 40-line reply, two `synaps send`s while its text streams:
 
@@ -123,12 +129,34 @@ where its frame came, between two halves of the reply. Now the row is held last:
 session (the history form), the rows are the same, in the same order (`side-stream-reload.png`: live left,
 reload right; the only difference is the `local_only` row, above).
 
-`r2/events-stream-held.mp4`: 13 s from just after the prompt to the second round's answer, 800×1080 (the
-transcript column, cropped at x 530), 30 fps, lossless (libx264rgb qp 0, gbrp). Its frame md5 `eeb77fa4f792` is
-the same crop of the capture's mkv (kept off the repo, 66 s at 1920×1080). Drive log:
-`r2/logs/stream-1920-nord-drive.log`.
+`r2/events-stream-held-preview.mp4` (779 KB; 800×1080, 30 fps): 13 s from just after the prompt to the second
+round's answer, the transcript column. Its lossless original (off the repo, above) has frame md5 `eeb77fa4f792`,
+the same crop of the capture's mkv (66 s at 1920×1080). Drive log: `r2/logs/stream-1920-nord-drive.log`.
 
-What the history form can't say (documented in `ExternalEvent::from_payload`): a text whose last line is
-`Data: {…}` or `Data: […]` (valid JSON) on an event with no data reads, after a reload, as that data (the live
-row, which knows, keeps it as text). A `Data:` line anywhere else, or one that is not JSON nor the form's
-1000-character cut, is text in both.
+What the history form can't say: a text whose last line is `Data: {…}` or `Data: […]` (valid JSON) can't be told
+from the event's data, by the agent either. Round 2 kept it as text on the live row only, so a reload lost that
+line (Shady #22 M1′); round 3 reads it alike everywhere and shows it (below).
+
+## Round 3: the data line, shown (Shady #22 M1′)
+
+`ExternalEvent::history()` and `shown()` now read the agent's form with `from_payload`, the history fold's own
+parser: a text whose last line is a JSON `Data:` line reads as its text plus that data, live, folded and
+re-attached alike (one identity: no second row on a re-attach or a session switch). The desk draws an event's data
+as the agent reads it: a quiet mono `Data: {…}` line under the text, folded past 160 characters with the text. The
+form's 1000-character cut of a long data is no longer JSON, so it is a line of the text, as the agent reads it
+(it was dropped before).
+
+Live on the same sandbox (`live.sh setup`, `data`, `reload one`), this branch's release build at `623c33e`, sha256
+`0867a71e…742bb2`: a comms fyi (no plugin trailer) ending in the peer's own `Data: {…}` line, and a watcher event
+with real data (long: folded). `r3/stills/data-live-reload.png`: the two rows live (left) and after a relaunch on
+the session (right), the same text and the same data line; the fyi's row crops are pixel-identical. Drive log:
+`r3/logs/data-1920-nord-drive.log`.
+
+The run (`r3/logs/live.log`): another desktopproto daemon, not this run's, already held the sandbox's lock, so the
+setup's daemon did not start and the two sessions were made on it. Nothing else of it was touched: the two
+sessions were closed after (`synaps daemon close`), and that daemon was left running (`live.sh` now refuses to set
+up over a daemon it didn't start, and stops only its own). Its model calls failed for want of credentials (error
+notices under the events, not in any history: the relaunch has none, and the still is cropped to the rows). Config
+sha `9803b9f3…916b35` before and after (it had changed since round 2, not by this run), 0 auth lines left.
+`settings.json`'s mtime moved at `09:13:15` during the run: written by a desk on the real config (its tabs are
+another daemon's sessions only); this run's tabs went to its scratch config, as every run's.
