@@ -1552,6 +1552,25 @@ impl Motion {
     /// `generation`: what it holds (its call's state); open and at rest, a
     /// change of it (a failure's output in place of the streamed lines)
     /// glides its height from the one it had, never a jump.
+    /// The frame's number (counts up a frame at a time).
+    pub(crate) fn frame(&self) -> u64 {
+        self.frame.get()
+    }
+
+    /// A body opening or closing (the design gate of #23, S1): whether it
+    /// opens, how much of it is shown at `now`, its measured height, and
+    /// whether it has landed. None: no body measured.
+    pub(crate) fn body(&self, key: u64, now: Instant) -> Option<(bool, f32, f32, bool)> {
+        let reveals = self.reveals.borrow();
+        let r = reveals.get(&key)?;
+        let h = r.sink.get();
+        if h.is_nan() {
+            return None;
+        }
+        let (shown, done) = r.at(now);
+        Some((r.open, shown, h, done || r.at.is_none()))
+    }
+
     pub(crate) fn reveal(&self, key: u64, open: bool, delay: Duration, generation: u64) -> (Option<f32>, Rc<Cell<f32>>) {
         let (frame, now) = (self.frame.get(), self.now());
         let fluid = self.fluid();

@@ -1789,6 +1789,11 @@ pub struct AppView {
     /// An open run's header, as last laid out (a fold whose header is above
     /// the view keeps it just above the view's top: [`AppView::start_gap`]).
     pub(crate) summary_h: Cell<f32>,
+    /// A body closing that the user clicked (S1): its row's id, and the
+    /// content under the view when it began.
+    /// A body the user opened or closed (S1): its row's id, the content
+    /// under the view when it began, whether it opens, and the frame.
+    pub(crate) body_hold: Cell<Option<(u64, f32, bool, u64)>>,
     pub(crate) summary_est: Cell<f32>,
     /// Answered prompts' receipts, by session ([`crate::authorize::Receipt`]).
     pub(crate) receipts: HashMap<String, Vec<crate::authorize::Receipt>>,
@@ -2430,6 +2435,7 @@ impl AppView {
             fold_slack: Cell::new(None),
             fold_gap: RefCell::new(None),
             summary_h: Cell::new(0.),
+            body_hold: Cell::new(None),
             summary_est: Cell::new(41.),
             receipts: HashMap::new(),
             sent: None,
@@ -4067,10 +4073,37 @@ impl AppView {
         // A run folding with its header held (N1): what it closed past the
         // view's bottom is held at the end, in the frame (no lag), on the
         // clock its room closes on ([`AppView::fold_gap_now`]).
-        let folding = self.fold_gap.borrow().as_ref().map_or(0., |g| g.held(self.fx.clock()));
-        if folding > 0. || self.fold_gap.borrow().as_ref().is_some_and(|g| g.hold) {
+        let mut folding = self.fold_gap.borrow().as_ref().map_or(0., |g| g.held(self.fx.clock()));
+        // A body the user closed (S1), the same way: what closed past what
+        // was under the view is held; closed, it stays as the fold's room.
+        if let Some((id, below, opens, frame)) = self.body_hold.get() {
+            match self.fx.body(id, now) {
+                // Not drawn since the click: its reveal starts with the row.
+                _ if self.fx.frame() <= frame + 1 => {}
+                Some((o, shown, h, false)) if o == opens => {
+                    if !opens {
+                        folding += (h * (1. - shown) - below).max(0.).round();
+                    }
+                }
+                Some((o, _, h, true)) if o == opens && !opens => {
+                    self.body_hold.set(None);
+                    let held = (h - below).max(0.).round();
+                    if held >= 1. {
+                        let prev = self.fold_slack.get().map_or(0., |s| s.last);
+                        let given = prev + held;
+                        let content =
+                            f32::from(self.list.max_offset_for_scrollbar().y) + f32::from(self.list.viewport_bounds().size.height);
+                        let base = (content - given).round();
+                        self.fold_slack.set(Some(Slack { given, base, last: given, gone: None, held: true, top: None }));
+                    }
+                }
+                _ => self.body_hold.set(None),
+            }
+        }
+        if folding > 0. || self.body_hold.get().is_some() || self.fold_gap.borrow().as_ref().is_some_and(|g| g.hold) {
             self.list.pause_following_tail();
         }
+
         let Some(mut s) = self.fold_slack.get() else { return folding };
         // Left the end: a scroll moved the list's top (by more than 1.5 px:
         // a 125 % display snaps the offset to device pixels, 0.8 px steps,
@@ -5304,6 +5337,21 @@ impl AppView {
                 .filter(|&ix| items[ix].kind == ItemKind::Tool)
                 .and_then(|ix| self.rows.get(ix).filter(|r| r.id == id).map(|r| !self.is_open(&items[ix], r)))
         };
+        // The clicked row holds (the design gate of #23, S1; T4): the list
+        // keeps its top row, so a body opening at the list's end grows
+        // down, and one closing there has its room past what is under the
+        // view held at the end as it glides ([`AppView::tail_slack`]).
+        if self.fx.fluid() && self.disp.iter().any(|d| d.id == id && d.kind == Kind::Work) {
+            self.scroller.cancel();
+            if self.list.is_following_tail() {
+                let top = self.list.logical_scroll_top();
+                self.list.pause_following_tail();
+                self.list.scroll_to(top);
+            }
+            let max = f32::from(self.list.max_offset_for_scrollbar().y);
+            let at = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+            self.body_hold.set(Some((id, (max - at).max(0.), chose != Some(false), self.fx.frame())));
+        }
         self.toggled.flip(id, chose);
         // A call's row, or a slash command's answer (a note).
         if let Some(ix) = self.disp.iter().position(|d| d.id == id && matches!(d.kind, Kind::Work | Kind::Note | Kind::Event)) {
