@@ -619,6 +619,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     // done, failed, at its limit, denied, cancelled), held 5 s,
                     // then the live ones change (the quarter-turn), and the turn ends.
                     if std::env::var("SYNAPS_BENCH_STATES").is_ok() {
+                        let _ = upd(cx, &|v, _| v.slow_daemon = true);
                         let delta = |id: &str, text: &str| {
                             json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result_delta", "tool_id": id, "delta": text}})
                         };
