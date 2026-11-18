@@ -578,6 +578,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let result = |id: &str, text: &str| json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": id, "result": text}});
                     let _ = upd(cx, &|v, cx| {
                         v.model.set_local_session("bench");
+                        // Its session is this window's to drive: its turn's end
+                        // hands the floor back (Handoff in, the settle pass, P3).
+                        v.owner_here = true;
                         v.model.transcript.apply_history(&dated(synthetic::history(12, 3)));
                         let metas: Vec<SessionMeta> = [
                             ("bench", "Relay refresh race", true, 0),
@@ -612,19 +615,24 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     });
                     apply(cx, vec![call("b1", "bash", json!({"command": "cargo test -p relay --test refresh_race"}))]);
                     sleep(2.5).await;
+                    // Each worker's clock is its time since it spawned, as a
+                    // daemon's is (re-gate #17: never a clock going back).
+                    let age = |at: Instant| round(at.elapsed().as_secs_f64(), 1);
+                    let scout_at = Instant::now();
                     let mut evs = spawn(1, "scout", "Find every caller of TokenStore::rotate and say which hold the lock");
-                    evs.push(json!({"ev": "subagent_rows", "rows": [row(1, "scout", "running", 1, "reading crates/relay/src/upstream.rs", 0.5)]}));
+                    evs.push(json!({"ev": "subagent_rows", "rows": [row(1, "scout", "running", 1, "reading crates/relay/src/upstream.rs", 0.)]}));
                     apply(cx, evs);
                     sleep(2.0).await;
-                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": [row(1, "scout", "running", 2, "grep -n rotate crates/relay/src", 2.5)]})]);
+                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": [row(1, "scout", "running", 2, "grep -n rotate crates/relay/src", age(scout_at))]})]);
                     sleep(2.0).await;
                     let names = ["reviewer", "fixer", "tester", "docs"];
+                    let crew_at = Instant::now();
                     let mut evs = Vec::new();
                     for (k, name) in names.iter().enumerate() {
                         evs.extend(spawn(k as u64 + 2, name, "Review the retry path in Session for lost tokens"));
                     }
-                    let mut rows = vec![row(1, "scout", "running", 3, "reading crates/relay/src/session.rs", 4.5)];
-                    rows.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "running", 1, "reading src", 0.2)));
+                    let mut rows = vec![row(1, "scout", "running", 3, "reading crates/relay/src/session.rs", age(scout_at))];
+                    rows.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "running", 1, "reading src", 0.)));
                     evs.push(json!({"ev": "subagent_rows", "rows": rows}));
                     apply(cx, evs);
                     sleep(2.0).await;
@@ -634,30 +642,33 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     sleep(0.8).await;
                     apply(cx, vec![result("r1", "Tool execution failed: no such file")]);
                     sleep(1.5).await;
-                    let mut rows = vec![row(1, "scout", "completed", 4, "", 9.4)];
-                    rows.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "running", 2, "grep -n Stale src", 3.2)));
-                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": rows.clone()})]);
+                    let scout_done = age(scout_at);
+                    // Scout done; the four at their second tool, as of now.
+                    let crew = || {
+                        let mut rows = vec![row(1, "scout", "completed", 4, "", scout_done)];
+                        rows.extend(names.iter().enumerate().map(|(k, n)| row(k as u64 + 2, n, "running", 2, "grep -n Stale src", age(crew_at))));
+                        rows
+                    };
+                    apply(cx, vec![json!({"ev": "subagent_rows", "rows": crew()})]);
                     sleep(2.0).await;
                     // A wider fan-out (P5's `+N more`): seven more workers, more
                     // than the tray's chip lines hold, then one more (its count
                     // rolls).
-                    let fan = |n: u64, rows: &mut Vec<Value>, evs: &mut Vec<Value>| {
-                        for k in 6..6 + n {
-                            let name = format!("probe-{k}");
-                            evs.extend(spawn(k, &name, "Probe one shard of the token store for stale entries"));
-                            // The first seven have run 1.5 s by the eighth.
-                            let secs = if n > 7 && k < 13 { 1.8 } else { 0.3 };
-                            rows.push(row(k, &name, "running", 1, "reading shard", secs));
-                        }
-                    };
-                    let (mut wide, mut evs) = (rows.clone(), Vec::new());
-                    fan(7, &mut wide, &mut evs);
+                    let probe = |k: u64, secs: f64| row(k, &format!("probe-{k}"), "running", 1, "reading shard", secs);
+                    let probes_at = Instant::now();
+                    let (mut wide, mut evs) = (crew(), Vec::new());
+                    for k in 6..13 {
+                        evs.extend(spawn(k, &format!("probe-{k}"), "Probe one shard of the token store for stale entries"));
+                        wide.push(probe(k, 0.));
+                    }
                     evs.push(json!({"ev": "subagent_rows", "rows": wide}));
                     apply(cx, evs);
                     sleep(1.5).await;
-                    let (mut wide, mut evs) = (rows, Vec::new());
-                    fan(8, &mut wide, &mut evs);
-                    evs.drain(..14);
+                    // The eighth: its own spawn only (Shady N5).
+                    let mut wide = crew();
+                    wide.extend((6..13).map(|k| probe(k, age(probes_at))));
+                    wide.push(probe(13, 0.));
+                    let mut evs = spawn(13, "probe-13", "Probe one shard of the token store for stale entries");
                     evs.push(json!({"ev": "subagent_rows", "rows": wide}));
                     apply(cx, evs);
                     sleep(1.5).await;
@@ -910,6 +921,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // polish.md §6 gate 4: 5 sessions × 5 workers, 30 s. Five
                 // busy sessions in the rail, each with five workers; the
                 // shown one's five in its tray and transcript, running.
+                let load_at = Instant::now();
                 let _ = upd(cx, &|v, cx| {
                     let metas: Vec<SessionMeta> = (0..5)
                         .filter_map(|k| {
@@ -967,6 +979,38 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out["load_5x5_sweep_30s"]["state"] = json!(view.update(cx, |v, _| {
                     v.model.tabs.current().map(|t| format!("{:?}", v.tab_state(t))).unwrap_or_default()
                 }).unwrap_or_default());
+                // Shady #17 R2-M1 (gate 4 with P5 rolls from a live fan-out):
+                // the same, and the shown session's five workers each call a
+                // tool every 1.5 s, staggered (one every 0.3 s): its tool
+                // count and step change (and roll). Then the same with the
+                // step held, only the count changing.
+                let steps = ["reading src/relay.rs", "grep -n rotate src", "reading src/session.rs", "cargo check -p relay", "reading src/store.rs"];
+                let mut tools = [2u64; 5];
+                for (case, step_moves) in [("load_5x5_fanout_30s", true), ("load_5x5_fanout_tools_30s", false)] {
+                    let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                    let mut changes = 0u64;
+                    while t0.elapsed() < Duration::from_secs(30) {
+                        tools[changes as usize % 5] += 1;
+                        let secs = round(3.0 + load_at.elapsed().as_secs_f64(), 1);
+                        let rows: Vec<Value> = (0..5usize)
+                            .map(|j| {
+                                let step = if step_moves { steps[tools[j] as usize % steps.len()] } else { "reading src" };
+                                json!({"subagent_id": j as u64 + 2, "agent_name": format!("worker-{}", j + 2), "status": "running",
+                                    "cancel_requested": false, "elapsed_secs": secs, "finished_elapsed": null, "step": step, "tools": tools[j]})
+                            })
+                            .collect();
+                        let _ = upd(cx, &|v, cx| {
+                            v.apply_batch(local_raw(json!({"ev": "subagent_rows", "rows": rows.clone()})).into_iter().collect(), cx);
+                            v.sync_list();
+                        });
+                        changes += 1;
+                        sleep(0.3).await;
+                    }
+                    out[case] = stats(cx, t0, Instant::now(), c0, f0);
+                    out[case]["changes"] = json!(changes);
+                    out[case]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                    out[case]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
+                }
                 out["mem_end"] = mem::sample();
                 out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                 println!("{out}");

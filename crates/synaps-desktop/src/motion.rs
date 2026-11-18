@@ -1032,9 +1032,16 @@ pub(crate) fn rolled(fx: &Motion, key: u64, text: SharedString, up: bool, grow: 
     let cells = if grow { None } else { changed_cells(&old, &text) };
     let tagged = |sel: String, t: SharedString| div().debug_selector(move || sel).child(make(t)).into_any_element();
     let cut = |at: usize| make(SharedString::from(text[..at].to_string())).into_any_element();
+    // The words after the cells changed too (`1 tool` → `2 tools`): the old
+    // ones stay until the digits cross mid-roll (re-gate #17: never `1 tools`).
+    let words = cells.and_then(|(_, b)| {
+        let ob = old_cells_end(&old, &text, b)?;
+        (old[ob..] != text[b..]).then(|| (tagged(format!("rolled-words-{key:x}"), old.clone()), make(SharedString::from(old[..ob].to_string())).into_any_element()))
+    });
     Roll {
         left: cells.filter(|c| c.0 > 0).map(|_| make(text.clone()).into_any_element()),
         measure: cells.map(|(a, b)| ((a > 0).then(|| cut(a)), cut(b))),
+        words,
         rolling: tagged(format!("rolling-{key:x}"), text.clone()),
         old: tagged(format!("rolled-{key:x}"), old),
         new: make(text).into_any_element(),
@@ -1052,11 +1059,7 @@ pub(crate) fn rolled(fx: &Motion, key: u64, text: SharedString, up: bool, grow: 
 /// (the whole text rolls) when either has no number or what comes before
 /// it changed.
 pub(crate) fn changed_cells(old: &str, new: &str) -> Option<(usize, usize)> {
-    let number = |s: &str| {
-        let a = s.find(|c: char| c.is_ascii_digit())?;
-        Some((a, s[a..].find(|c: char| !c.is_ascii_digit()).map_or(s.len(), |n| a + n)))
-    };
-    let ((oa, ob), (na, nb)) = (number(old)?, number(new)?);
+    let ((oa, ob), (na, nb)) = (number_in(old)?, number_in(new)?);
     if old[..oa] != new[..na] {
         return None;
     }
@@ -1069,16 +1072,35 @@ pub(crate) fn changed_cells(old: &str, new: &str) -> Option<(usize, usize)> {
     Some((na + first, na + last + 1))
 }
 
+/// Where `old`'s changed cells end (a byte index of `old`), `new`'s
+/// ending at `b` ([`changed_cells`]): the same index when both numbers are
+/// as long (the prefix is the same), else the end of `old`'s number.
+fn old_cells_end(old: &str, new: &str, b: usize) -> Option<usize> {
+    let (oa, ob) = number_in(old)?;
+    let (na, nb) = number_in(new)?;
+    Some(if ob - oa == nb - na { b } else { ob })
+}
+
+/// The first number in `s`, as a byte range.
+fn number_in(s: &str) -> Option<(usize, usize)> {
+    let a = s.find(|c: char| c.is_ascii_digit())?;
+    Some((a, s[a..].find(|c: char| !c.is_ascii_digit()).map_or(s.len(), |n| a + n)))
+}
+
 /// [`rolled`]'s element. `new` is in the flow, laid out as at rest (so
 /// nothing beside it moves while it rolls); the rest are copies drawn over
 /// its box: `rolling` (the new text, `x` of a line from its place) and `old`
 /// (the one it left, a line on), clipped to its top and bottom; for a
 /// count, to its changed cells, `new` itself and `left` drawing the rest
 /// in place. `measure`: the texts before and through the cells (laid out
-/// only, for their x). Offsets in px, from the box's own height.
+/// only, for their x). `words`: the old text in place and the old text
+/// through its cells (for its x), drawn after the cells instead of `new`'s
+/// until the digits cross mid-roll, when the words after them changed.
+/// Offsets in px, from the box's own height.
 struct Roll {
     new: AnyElement,
     left: Option<AnyElement>,
+    words: Option<(AnyElement, AnyElement)>,
     rolling: AnyElement,
     old: AnyElement,
     measure: Option<(Option<AnyElement>, AnyElement)>,
@@ -1097,8 +1119,9 @@ impl IntoElement for Roll {
 
 impl Element for Roll {
     type RequestLayoutState = ();
-    /// The cells' x span (none: the whole line rolls).
-    type PrepaintState = Option<(Pixels, Pixels)>;
+    /// The cells' x span (none: the whole line rolls), and where the old
+    /// words start.
+    type PrepaintState = Option<(Pixels, Pixels, Pixels)>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -1126,7 +1149,7 @@ impl Element for Roll {
         _: &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(Pixels, Pixels)> {
+    ) -> Option<(Pixels, Pixels, Pixels)> {
         let fit = size(AvailableSpace::MinContent, AvailableSpace::MinContent);
         let wide = size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::MinContent);
         let cut = self.measure.as_mut().map(|(a, b)| {
@@ -1138,6 +1161,12 @@ impl Element for Roll {
         if let Some(left) = self.left.as_mut() {
             left.prepaint_as_root(bounds.origin, wide, window, cx);
         }
+        let mut ox1 = cut.map_or(px(0.), |c| c.1);
+        if let Some((words, through)) = self.words.as_mut() {
+            ox1 = ox1.max(bounds.left() + through.layout_as_root(fit, window, cx).width);
+            words.prepaint_as_root(bounds.origin, fit, window, cx);
+        }
+        let cut = cut.map(|(x0, x1)| (x0, x1, ox1));
         let h = bounds.size.height;
         self.rolling.prepaint_as_root(bounds.origin + point(px(0.), h * (self.dir * self.x)), wide, window, cx);
         let old_fit = if self.grow { wide } else { fit };
@@ -1151,15 +1180,21 @@ impl Element for Roll {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut (),
-        cut: &mut Option<(Pixels, Pixels)>,
+        cut: &mut Option<(Pixels, Pixels, Pixels)>,
         window: &mut Window,
         cx: &mut App,
     ) {
         let far = px(1.0e6);
         let band = |l: Pixels, r: Pixels| ContentMask { bounds: Bounds::from_corners(point(l, bounds.top()), point(r, bounds.bottom())) };
-        let (x0, x1) = cut.unwrap_or((bounds.left() - far, bounds.right() + far));
+        let (x0, x1, ox1) = cut.unwrap_or((bounds.left() - far, bounds.right() + far, bounds.right() + far));
         if cut.is_some() {
-            window.with_content_mask(Some(band(x1, bounds.right() + far)), |window| self.new.paint(window, cx));
+            // The words after the cells: the old ones until the digits
+            // cross mid-roll, then the new.
+            let crossed = self.x < 0.5;
+            match self.words.as_mut().filter(|_| !crossed) {
+                Some((words, _)) => window.with_content_mask(Some(band(ox1, bounds.right() + far)), |window| words.paint(window, cx)),
+                None => window.with_content_mask(Some(band(x1, bounds.right() + far)), |window| self.new.paint(window, cx)),
+            }
             if let Some(left) = self.left.as_mut() {
                 window.with_content_mask(Some(band(bounds.left() - far, x0)), |window| left.paint(window, cx));
             }
@@ -2891,6 +2926,10 @@ mod tests {
         assert_eq!(cells("9   NEED YOU", "10   NEED YOU"), Some((0, 2)));
         assert_eq!(cells("7", "7"), Some((0, 0)), "nothing rolls");
         assert_eq!(cells("reading a.rs", "grep b"), None, "no number: the whole line");
+        // Where the old words start (re-gate #17: `1 tools` never shows).
+        assert_eq!(super::old_cells_end("1 tool", "2 tools", 1), Some(1), "` tool` from 1");
+        assert_eq!(super::old_cells_end("9 tools", "10 tools", 2), Some(1), "a shorter number: its own end");
+        assert_eq!(super::old_cells_end("10 tools", "9 tools", 1), Some(2));
     }
 
     /// P4 (finish gate #17): the old glyph's light goes out over 80 ms, the

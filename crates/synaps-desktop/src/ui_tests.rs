@@ -2723,14 +2723,23 @@ fn transcript_counts_roll(cx: &mut TestAppContext) {
     }
     let k = rolling(cx, crate::motion::ROLL_TOOLS)[0];
     let d0 = apart(cx, k);
+    // `1 tool` → `2 tools`: the old word stays until the digits cross
+    // mid-roll, then the new one (re-gate #17: never `1 tools`).
+    let words = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
+    assert!(words(cx), "the first frames: `1 tool`, the digit leaving");
     for _ in 0..3 {
         wait(cx, w, &view, 16);
     }
     let d1 = apart(cx, k);
     assert!(d1 > 0. && (d1 - d0).abs() < 0.01, "a line apart all the way: {d0} {d1}");
+    let mut crossed = false;
     for _ in 0..40 {
         wait(cx, w, &view, 16);
+        let on = !rolling(cx, crate::motion::ROLL_TOOLS).is_empty();
+        crossed |= on && !words(cx);
+        assert!(!crossed || !words(cx), "the old word never comes back");
     }
+    assert!(crossed, "mid-roll: `2 tools`, the digit still arriving");
     assert!(rolling(cx, crate::motion::ROLL_TOOLS).is_empty() && rolling(cx, crate::motion::ROLL_STEP).is_empty(), "landed");
     assert!(VisualTestContext::from_window(w, cx).debug_bounds(format!("rolling-{k:x}").leak()).is_none(), "at rest: one text");
 }

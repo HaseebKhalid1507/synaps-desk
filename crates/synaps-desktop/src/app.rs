@@ -1280,6 +1280,10 @@ pub struct AppView {
     /// A favourited row's star: when it was favourited, and when its row
     /// landed (the hop's start, polish.md P6).
     pub(crate) star_land: std::cell::RefCell<HashMap<u64, (Instant, Option<Instant>)>>,
+    /// The bench's life scene (`SYNAPS_BENCH_LIFE`): its local session is
+    /// this window's to drive, as a user's own session is (its turn's end
+    /// hands the floor back: Handoff in and the settle pass, polish.md P3).
+    pub(crate) owner_here: bool,
     /// The side panels folded to strips and the open HISTORY buckets
     /// (saved with the accent).
     pub panels: theme::Panels,
@@ -1971,6 +1975,7 @@ impl AppView {
             readout_left: None,
             rail_fx: Default::default(),
             star_land: Default::default(),
+            owner_here: false,
             panels: theme::Panels::default(),
             panels_dirty: Default::default(),
             panels_writing: Default::default(),
@@ -3348,7 +3353,7 @@ impl AppView {
     /// A daemon is connected and this attachment may drive it (the
     /// synthetic transport never can).
     pub(crate) fn drives(&self) -> bool {
-        self.client.is_some() && self.model.can_send()
+        (self.client.is_some() || self.owner_here) && self.model.can_send()
     }
 
     /// The list's top edge moved by `shift` (the bars above it changed
