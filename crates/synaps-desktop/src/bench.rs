@@ -948,9 +948,11 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out["load_5x5_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
                 // Q3 (polish.md §6 gate 4, the worst case): the same, and the
                 // shown session's turn runs: the composer sweeps (the one
-                // sweep left, P2) over the 25 spinners.
+                // sweep left, P2) over the 25 spinners. Gate 3's prompt is
+                // answered first (NEEDS YOU outranks RUNNING: no sweep).
                 let _ = upd(cx, &|v, _| {
                     let t = &mut v.model.transcript;
+                    t.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
                     t.apply(&SessionEvent::TurnStarted { turn_baseline: 12, trigger: "user".into(), user_text: Some("Go on.".into()) });
                     t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                     v.sync_list();
@@ -962,6 +964,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out["load_5x5_sweep_30s"] = stats(cx, t0, Instant::now(), c0, f0);
                 out["load_5x5_sweep_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
                 out["load_5x5_sweep_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                out["load_5x5_sweep_30s"]["state"] = json!(view.update(cx, |v, _| {
+                    v.model.tabs.current().map(|t| format!("{:?}", v.tab_state(t))).unwrap_or_default()
+                }).unwrap_or_default());
                 out["mem_end"] = mem::sample();
                 out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                 println!("{out}");
