@@ -257,7 +257,10 @@ pub(crate) fn mean_height(disp: &[Disp], rows: &[RowCache], m: &Metrics, cpl: f3
             let lines = match d.kind {
                 Kind::User | Kind::Prose | Kind::Note => rows.get(d.item).map_or(1., |r| text_lines(&r.text, cpl)),
                 // Folded (its first lines) under its head line.
-                Kind::Event => rows.get(d.item).map_or(1., |r| text_lines(&r.text, cpl).min(crate::events::EVENT_LINES as f32) + 1.),
+                Kind::Event => rows.get(d.item).map_or(1., |r| {
+                    let data = r.event.as_ref().is_some_and(|e| e.data.is_some());
+                    text_lines(&r.text, cpl).min(crate::events::EVENT_LINES as f32) + 1. + f32::from(u8::from(data))
+                }),
                 _ => 1.,
             };
             gap_of(d.gap, m) + lines * m.body_line + 2. * m.pad_y
