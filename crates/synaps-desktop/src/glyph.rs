@@ -810,8 +810,18 @@ pub(crate) enum Life {
 }
 
 impl Life {
-    pub(crate) const ALL: [Life; 10] =
-        [Life::Queued, Life::Run, Life::Seen, Life::Done, Life::Failed, Life::Limit, Life::Wait, Life::Denied, Life::Cancelled, Life::Stream];
+    pub(crate) const ALL: [Life; 10] = [
+        Life::Queued,
+        Life::Run,
+        Life::Seen,
+        Life::Done,
+        Life::Failed,
+        Life::Limit,
+        Life::Wait,
+        Life::Denied,
+        Life::Cancelled,
+        Life::Stream,
+    ];
 
     /// Its index: what [`crate::motion::Motion::change`] remembers.
     pub(crate) fn code(self) -> u64 {
@@ -1101,7 +1111,7 @@ pub(crate) fn indicator(
     change: Option<(std::time::Instant, u64)>,
     wait: Option<std::time::Instant>,
 ) -> AnyElement {
-    use crate::lattice::{Dots, code, going_out, pose, turning, TURN};
+    use crate::lattice::{Dots, TURN, code, going_out, pose, turning};
     use crate::motion::{self, Kind as Mk, ease, mix};
     use std::time::Duration;
     let ink = life_ink(l, ground, p);
@@ -1110,7 +1120,9 @@ pub(crate) fn indicator(
     let full = fx.level() == motion::Level::Full;
     let since = at.map(|a| fx.now().saturating_duration_since(a));
     // What it turns from: the old pattern's pose as it was then, in its colour.
-    let old = from.and_then(|f| f.pat().map(|pat| (pose(pat, at.filter(|_| pat.ambient()).and_then(|a| fx.beat_at(a))), life_ink(f, ground, p).mark)));
+    let old = from.and_then(|f| {
+        f.pat().map(|pat| (pose(pat, at.filter(|_| pat.ambient()).and_then(|a| fx.beat_at(a))), life_ink(f, ground, p).mark))
+    });
     let boxed = || div().relative().flex_none().size(px(LIFE));
     let dots = |d: Dots, mark: Hsla| crate::lattice::el(LIFE, d, code(pose_of(&d)), mark, ground).absolute().top_0().left_0();
     let turn = fx.turn.get() && full;
@@ -1123,7 +1135,10 @@ pub(crate) fn indicator(
             let d = turning(old_pose, new, t).unwrap_or_else(Dots::none);
             // Its second pose is the new pattern's own (its colour), or the old turned on.
             let mark = if t >= TURN && new.is_some() { ink.mark } else { old_mark };
-            return boxed().debug_selector(move || format!("life-turn {}", t.as_millis() / TURN.as_millis())).child(dots(d, mark)).into_any_element();
+            return boxed()
+                .debug_selector(move || format!("life-turn {}", t.as_millis() / TURN.as_millis()))
+                .child(dots(d, mark))
+                .into_any_element();
         }
     }
     match l.pat() {
@@ -1194,7 +1209,13 @@ fn ping_wave(mut d: crate::lattice::Dots, k: f32) -> crate::lattice::Dots {
             _ => 2.,
         };
         let boost = (1. - (ring - f).abs()).max(0.);
-        let lit = if boost > 0.5 { 1. } else if boost > 0.2 { 0.45 } else { 0. };
+        let lit = if boost > 0.5 {
+            1.
+        } else if boost > 0.2 {
+            0.45
+        } else {
+            0.
+        };
         *a = a.max(lit);
     }
     d
@@ -1253,10 +1274,8 @@ mod tests {
                 assert!(pose(pat, Some(b)).iter().all(|&l| l > 0), "{g:?} at {b}: nine dots");
             }
             let still = pose(pat, None);
-            let lit: Vec<Part> = (0..9)
-                .filter(|&i| still[i] == 4)
-                .map(|i| Part::Fill([1., 4., 7.][i % 3], [1., 4., 7.][i / 3], 2., 2.))
-                .collect();
+            let lit: Vec<Part> =
+                (0..9).filter(|&i| still[i] == 4).map(|i| Part::Fill([1., 4., 7.][i % 3], [1., 4., 7.][i / 3], 2., 2.)).collect();
             assert_eq!(g.parts(), &lit[..], "{g:?}: its still pose");
         }
         assert_eq!(super::live_pat(Glyph::Run), Pat::Run);
