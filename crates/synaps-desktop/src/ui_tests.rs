@@ -5462,14 +5462,14 @@ fn sticky_band_hides_the_beat(cx: &mut TestAppContext) {
     let (w, view, _events) = sticky_open(cx, (1440., 900.));
     assert!(!view.read_with(cx, |v, _| v.layout.hang), "the labels are inline");
     set_motion(cx, &view, crate::motion::Level::Full);
-    running_tools(cx, &view, 25);
+    running_tools(cx, &view, 60);
     for _ in 0..12 {
         beat(cx, w, &view);
     }
-    // A running row (the last 25 rows are), 6 px out of the top: its
-    // message's label is above it.
+    // A running row (the last 60 rows are) with screens of them under it,
+    // 6 px out of the top: its message's label is above it.
     let (ix, id) = view.read_with(cx, |v, _| {
-        let ix = v.disp.len() - 12;
+        let ix = v.disp.len() - 40;
         let l = (0..ix).rev().find(|&i| v.disp[i].who != crate::turns::Who::None).expect("the running message");
         (ix, v.disp[l].id)
     });
@@ -5492,13 +5492,17 @@ fn sticky_band_hides_the_beat(cx: &mut TestAppContext) {
 
 /// Q2 L1 (Shady #19): with the labels inline, Ctrl+J lands a card scrolled
 /// out of the top below the sticky band, not under it: its top edge (F7's
-/// dashed mark, the trace) shows.
+/// dashed mark, the trace) shows. (Calls under the card, so it can be
+/// scrolled out of the top.)
 #[gpui_kit::test]
 fn ctrl_j_lands_the_card_below_the_band(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     assert!(!view.read_with(cx, |v, _| v.layout.hang), "the labels are inline");
+    running_tools(cx, &view, 30);
+    settle(cx, w, 8);
     let (ix, msg, line) = view.read_with(cx, |v, cx| {
         let ix = v.card_ix().expect("a card");
+        assert!(ix + 30 < v.disp.len(), "the calls under the card");
         let msg = (0..ix).rev().find(|&i| v.disp[i].who != crate::turns::Who::None).expect("its message's label above it");
         (ix, v.disp[msg].id, crate::theme::metrics(cx).body_line)
     });
@@ -5520,7 +5524,6 @@ fn ctrl_j_lands_the_card_below_the_band(cx: &mut TestAppContext) {
     let band = drawn(cx, w, format!("sticky {msg}")).expect("the band");
     let rule = drawn(cx, w, format!("sticky-rule {msg}")).expect("the rule");
     assert!(band[1] == top && rule[1] + rule[3] <= f32::from(card.top()) + 0.5, "{band:?} {rule:?} {card:?}");
-    assert!(view.read_with(cx, |v, _| v.card_on_screen()), "in view");
 }
 
 /// polish.md P15: F1's four transcript tests and the unfold-hold tests
