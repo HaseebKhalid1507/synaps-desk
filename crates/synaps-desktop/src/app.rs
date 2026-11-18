@@ -6103,6 +6103,10 @@ impl Render for AppView {
                         .relative()
                         .when_some(layer, |d, (x, y, k)| crate::motion::lift(d.left(px(x)).top(px(y)), k))
                         .child(list)
+                        // Right after the list's layout, reading it as it
+                        // paints: the top message's label pinned (P15).
+                        .child(crate::sticky::layer(cx.processor(|this, b: Bounds<Pixels>, _, cx| this.sticky_label(b, cx))))
+                        .children(crate::motion::probe(&self.fx, "sticky"))
                         .child(crate::scroll::owner(self.scroller.clone(), self.fx.clone()))
                         .children(unpainted)
                         .children(hint_frame)
@@ -6114,6 +6118,7 @@ impl Render for AppView {
                 .children(self.render_stub(&p, &m, cx))
                 .children(self.render_notice(&p, &m))
                 .children(self.render_tray(&p, &m, cx))
+                .children(crate::motion::probe(&self.fx, "composer"))
                 .child(self.render_composer(
                     &p,
                     &m,

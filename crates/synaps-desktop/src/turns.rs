@@ -529,13 +529,34 @@ pub(crate) fn diff(old: &[Disp], new: &[Disp]) -> Option<(std::ops::Range<usize>
     Some((head..old.len() - tail, new.len() - head - tail))
 }
 
-/// A labelled row's time (`crate::times`): local `HH:MM` in `m.meta` mono,
-/// `dim`; the date and seconds in its tooltip, made when that opens.
+/// A labelled row's label: its text, colour, and its top in the gutter
+/// under the row's gap (level with the row's first line).
+pub(crate) fn who_of(d: &Disp, p: &Palette, m: &Metrics) -> Option<(&'static str, Hsla, f32)> {
+    match d.who {
+        Who::None => None,
+        Who::You => Some((label::YOU, p.you, m.pad_y)),
+        Who::Agent => {
+            let row = match d.kind {
+                Kind::Prose => m.body_line,
+                Kind::Summary { .. } => m.summary,
+                _ => m.row,
+            };
+            Some((label::AGENT, p.agent, ((row - m.body_line) / 2.).max(0.)))
+        }
+    }
+}
+
+/// A labelled row's time as text: local `HH:MM` in `m.meta` mono, `dim`.
+fn time_text(t: &crate::times::Stamp, p: &Palette, m: &Metrics) -> Div {
+    mono(t.hhmm.clone(), m.meta, p.dim).line_height(px(m.mono_line))
+}
+
+/// A labelled row's time (`crate::times`): [`time_text`], the date and
+/// seconds in its tooltip, made when that opens.
 /// Static text: it never animates (a history row's least of all).
 fn time_slot(t: &crate::times::Stamp, id: u64, p: &Palette, m: &Metrics) -> Stateful<Div> {
     let at = t.clone();
-    mono(t.hhmm.clone(), m.meta, p.dim)
-        .line_height(px(m.mono_line))
+    time_text(t, p, m)
         .id(("time", id))
         .debug_selector(move || format!("time {id}"))
         .tooltip(move |window, cx| crate::overlay::tip(at.readout(), window, cx))
@@ -1369,18 +1390,7 @@ impl AppView {
             Kind::Day => day_line(d, &p, &m),
             Kind::Prompt => self.render_authorize(d, &p, &m, cx),
         };
-        let who = match d.who {
-            Who::None => None,
-            Who::You => Some((label::YOU, p.you, m.pad_y)),
-            Who::Agent => {
-                let row = match d.kind {
-                    Kind::Prose => m.body_line,
-                    Kind::Summary { .. } => m.summary,
-                    _ => m.row,
-                };
-                Some((label::AGENT, p.agent, ((row - m.body_line) / 2.).max(0.)))
-            }
-        };
+        let who = who_of(&d, &p, &m);
         let mut out = v_flex().w_full().pt(px(gap)).relative();
         let mut hang = None;
         if let Some((text, color, top)) = who {
@@ -1422,6 +1432,54 @@ impl AppView {
                 .debug_selector(|| "write-head".into())
         });
         RowParts { body: out.child(block), label: hang, head }
+    }
+
+    /// The top message's label pinned over the list (polish.md P15,
+    /// [`crate::sticky`]; the one above it too while it is pushed out),
+    /// built after the list's layout; `b` is the layer's box, the list's.
+    /// Hanging, a label and its time sit in the gutter at `pad_y`, as their
+    /// slot draws them, on the empty canvas; the canvas under them, from the
+    /// top, hides the original going out. Inline (F8), the label line sits
+    /// at the column's top on a `canvas` band one line tall, a 1 px `hair`
+    /// rule under it. Nothing in it takes a click or asks for a frame.
+    pub(crate) fn sticky_label(&self, b: Bounds<Pixels>, cx: &App) -> Option<AnyElement> {
+        let (p, m, lay) = (theme::palette(cx), theme::metrics(cx), self.layout);
+        let at = |i: usize| {
+            let (d, row) = (self.disp.get(i)?, self.list.bounds_for_item(i)?);
+            let top = if lay.hang { who_of(d, &p, &m).map_or(0., |w| w.2) } else { 0. };
+            Some(f32::from(row.top() - b.top()) + gap_of(d.gap, &m) + top)
+        };
+        let time = |i: usize| self.disp.get(i).and_then(|d| self.rows.get(d.item)).and_then(|r| r.time.as_ref());
+        let (pin, line) = if lay.hang { (m.pad_y, m.body_line) } else { (0., m.body_line + 1.) };
+        let h = |i: usize| line + if lay.hang && time(i).is_some() { m.mono_line } else { 0. };
+        let stuck = crate::sticky::place(&self.disp, self.list.logical_scroll_top().item_ix, at, pin, h);
+        let bottom = stuck.iter().flatten().map(|s| s.y + h(s.row)).reduce(f32::max)?;
+        // The slot's right edge, as the row's (`right(column + hang)`).
+        let gutter = px((lay.left - m.hang).max(0.));
+        let root = div()
+            .relative()
+            .w(b.size.width)
+            .h(b.size.height)
+            .when(lay.hang, |d| d.child(div().absolute().left_0().top_0().w(gutter).h(px(bottom)).bg(p.canvas)));
+        Some(
+            root.children(stuck.into_iter().flatten().filter_map(|s| {
+                let d = self.disp[s.row];
+                let (text, color, _) = who_of(&d, &p, &m)?;
+                let id = d.id;
+                let label = display(text, m.label, color).line_height(px(m.body_line));
+                let time = time(s.row).map(|t| time_text(t, &p, &m));
+                if lay.hang {
+                    let slot = v_flex().absolute().right(b.size.width - gutter).top(px(s.y)).items_end().child(label).children(time);
+                    return Some(slot.debug_selector(move || format!("sticky {id}")).into_any_element());
+                }
+                let band = || div().absolute().left(px(lay.left)).w(px(lay.column));
+                let line = h_flex().size_full().justify_between().items_center().child(label).children(time);
+                let rule = band().top(px(s.y + m.body_line)).h(px(1.)).bg(p.hair).debug_selector(move || format!("sticky-rule {id}"));
+                let band = band().top(px(s.y)).h(px(m.body_line)).bg(p.canvas).child(line).debug_selector(move || format!("sticky {id}"));
+                Some(div().child(band).child(rule).into_any_element())
+            }))
+            .into_any_element(),
+        )
     }
 }
 
