@@ -94,3 +94,20 @@ libx264rgb `qp=0` (High 4:4:4 Predictive, gbrp; checked in each header):
 ## Not covered
 
 - Chips stepping (build step 7) and the event row (step 6): not in this PR (#21 and #22 are open).
+
+## Round 3 (N1, S1, S3; `SYNAPS_BENCH_FOLDS=1`)
+
+Lossless clips off the repo: `cardsd-evidence/r4/clips/f3-{full,reduced,off}.mkv` (1920×1080) and
+`l3-{full,reduced,off}.mkv` (1280×720), 60 fps captures of a 144 Hz headless gamescope. The bench's
+fold script: the turn ends (auto-fold, f≈772), the run unfolds (f≈925), the header goes a third of the
+way down the view and the run folds by `toggle_run` (f≈1135), it unfolds with `scroll_to_end` (f≈1280),
+folds at the list's end (f≈1404), and the last call's body opens and closes at the end (f≈1675, f≈1795).
+
+| Still / strip | What it shows |
+|---|---|
+| `r3-fold-click-mid-f1140-1180.png` | a click fold mid-screen: f1140, 1150, 1160, 1180. The header holds; the block above it moves 0 px every frame f1140–1175 (`blockmove.py`). |
+| `r3-fold-turn-end-f772-796.png` | the auto-fold at the turn's end, every 4th frame: about 22 px a frame over about 22 frames, peak 44 px in one capture frame (f779, a capture slot spanning two intervals; its neighbours are about 22). |
+| `r3-unfold-stagger-f1280-1298.png` | an unfold from mid-screen, every 2nd frame: the rows arrive one after another. The column also scrolls, because the bench calls `scroll_to_end` in the same update (f1284's 84 px). |
+| `r3-states-1280.png`, `r3-folded-1280.png`, `r3-outline-1280.png` | 1280×720 stills: the states run, folded, and the Outline Allow (`SYNAPS_DESK_ALLOW=outline`). |
+
+The body opening and closing at the end (S1) moves no band of the column ≥ 8 px in any frame.

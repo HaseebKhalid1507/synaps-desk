@@ -1376,7 +1376,8 @@ fn a_body_at_the_end_keeps_its_row_put(cx: &mut TestAppContext) {
             .expect("its row")
     };
     let well = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("well {id}"))).is_some();
-    for open in [!well(cx), well(cx) == false] {
+    let first = !well(cx);
+    for open in [first, !first] {
         let at = top(cx);
         view.update(cx, |v, cx| {
             v.toggle(id);
@@ -2307,7 +2308,7 @@ fn needs_you_is_the_plus_and_pings_once(cx: &mut TestAppContext) {
     let k = view.read_with(cx, |v, _| crate::glyph::needs_ping(&v.fx, true));
     assert!(k.is_none(), "the prompt was there before: history never pings");
     settle(cx, w, 8);
-    assert_eq!(motion_pending(cx, &view).0, false, "still: no frame");
+    assert!(!motion_pending(cx, &view).0, "still: no frame");
 }
 
 /// Shady #23 r2 L1: the Outline Allow draws, charged in `acc_line`, and
