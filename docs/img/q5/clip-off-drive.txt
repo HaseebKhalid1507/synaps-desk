@@ -1,0 +1,19 @@
+t0 1794995406.304000480
+0.000920296 mousemove 640 300
+0.506562 key ctrl+b
+1.83646 key ctrl+b
+3.16824 key ctrl+alt+b
+4.51314 key ctrl+alt+b
+5.8611 mousemove 311 400
+6.06659 mousedown 1
+6.27365 mouseup 1
+7.47927 mousemove 640 625
+7.48334 click 1
+7.88847 type --delay 6 A draft that runs past the end of its first line and onto a second one, so the composer grows by a line upward
+9.59682 key ctrl+a BackSpace
+10.8408 mousemove 640 300
+13.3151 key ctrl+j
+14.9492 mousemove 150 500
+16.6893 mousemove 70 350
+17.2964 click 1
+18.7019 click 1
