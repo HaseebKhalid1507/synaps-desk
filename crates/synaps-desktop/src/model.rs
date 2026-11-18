@@ -596,11 +596,11 @@ impl Model {
     /// from its own transcript once a live source (an event, a row) has
     /// spoken of its workers since the attach: it runs ahead of the poll
     /// and needs no daemon support. Before that, and for the others, the
-    /// listing's `subagents_running` (0 from a daemon that does not send
-    /// it).
+    /// listing's count ([`SessionMeta::workers_running`]: `workers.running`
+    /// or `subagents_running`, 0 from a daemon that sends neither).
     pub fn workers(&self, s: &SessionMeta) -> usize {
         let own = &self.stats.subagents;
-        if self.is_active(&s.id) && own.heard() { own.running_count() } else { s.subagents_running }
+        if self.is_active(&s.id) && own.heard() { own.running_count() } else { s.workers_running() }
     }
 
     /// The attached session's workers running ([`Model::workers`]; not
@@ -1992,6 +1992,24 @@ mod tests {
         m.apply(Event::Sessions(busy));
         assert!(m.rail_gen > generation && m.view_dirty);
         assert_eq!(m.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["b", "a"], "a state change moves nothing");
+    }
+
+    /// A `dev` daemon (SynapsCLI #416) lists workers as `workers`, not
+    /// `subagents_running`: a session with workers running is still
+    /// WORKERS, never IDLE.
+    #[test]
+    fn workers_from_a_dev_daemon_are_not_idle() {
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(Event::Sessions(metas(json!([
+            {"id": "w", "lifecycle": "live", "busy": false, "workers": {"running": 2, "rows": [], "more": 0}},
+            {"id": "d", "lifecycle": "live", "busy": false, "workers": {"running": 0, "rows": [
+                {"handle_id": "sa_1", "subagent_id": 1, "agent_name": "scout", "status": "completed",
+                 "started_at": "2026-11-18T12:00:00Z", "finished_at": "2026-11-18T12:01:00Z"}]}},
+            {"id": "o", "lifecycle": "live", "busy": false}
+        ]))));
+        let meta = |m: &Model, id: &str| m.sessions.iter().find(|s| s.id == id).unwrap().clone();
+        assert_eq!(["w", "d", "o"].map(|id| m.state(&meta(&m, id))), [State::Workers, State::Idle, State::Idle]);
+        assert_eq!(m.workers(&meta(&m, "w")), 2);
     }
 
     /// A session whose workers run on after its turn is WORKERS, never

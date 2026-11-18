@@ -114,6 +114,35 @@ fn session_meta_counts_running_workers() {
     assert_eq!(w.sessions[0].subagents_running, 1);
 }
 
+/// `SessionMeta.workers` (SynapsCLI #416, which replaces #410's
+/// `subagents_running`): the count comes from either field. A `workers`
+/// value this client can't read leaves the session listed, with 0.
+#[test]
+fn session_meta_reads_workers_from_either_daemon() {
+    let row = r#"{"handle_id":"sa_1","subagent_id":1,"agent_name":"scout","status":"running","started_at":"2026-11-18T12:00:00Z","new_field":true}"#;
+    let list = format!(
+        r#"{{"type":"session_list","sessions":[
+            {{"id":"dev","workers":{{"running":3,"rows":[{row}],"more":2}}}},
+            {{"id":"local","subagents_running":2}},
+            {{"id":"done","workers":{{"rows":[{row}]}}}},
+            {{"id":"odd","workers":"three"}},
+            {{"id":"odd2","workers":{{"running":"three"}}}},
+            {{"id":"null","workers":null}},
+            {{"id":"old"}}
+        ]}}"#
+    );
+    let DaemonFrame::SessionList { sessions, rejected } = decode_frame(&list).unwrap() else { panic!() };
+    assert_eq!(rejected, 0, "no session is dropped for its workers");
+    assert_eq!(
+        sessions.iter().map(|s| (s.id.as_str(), s.workers_running())).collect::<Vec<_>>(),
+        [("dev", 3), ("local", 2), ("done", 0), ("odd", 0), ("odd2", 0), ("null", 0), ("old", 0)]
+    );
+    let mut welcome: serde_json::Value = serde_json::from_str(fixture("welcome.json").trim()).unwrap();
+    welcome["sessions"][0]["workers"] = serde_json::json!({"running": 1});
+    let DaemonFrame::Welcome(w) = decode_frame(&welcome.to_string()).unwrap() else { panic!() };
+    assert_eq!(w.sessions[0].workers_running(), 1);
+}
+
 /// The attach snapshot's `meta.continue_info` (a resume the daemon followed
 /// down a compaction chain, F24): decoded; `null` (a 0.11.1 capture),
 /// missing (an older daemon) and a shape this client doesn't read (a newer
