@@ -118,10 +118,10 @@ pub mod label {
     pub const STEER_WORKER: &str = "S T E E R   W O R K E R";
     pub const READ_ONLY: &str = "R E A D   O N L Y";
     pub const MAIN: &str = "M A I N";
-    pub const AUTHORIZATION: &str = "A U T H O R I Z A T I O N   R E Q U I R E D";
     pub const SECRET: &str = "S E C R E T   R E Q U E S T E D";
     pub const AUTHORIZE: &str = "A U T H O R I Z E";
     pub const DENY: &str = "D E N Y";
+    pub const ALLOW: &str = "A L L O W";
     pub const OPEN: &str = "O P E N";
     pub const SUBMIT: &str = "S U B M I T";
     pub const CANCEL: &str = "C A N C E L";
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn tracked_labels_are_tracked_caps() {
-        for l in [label::SESSIONS, label::AUTHORIZATION, label::NEEDS_YOU, label::CONTEXT] {
+        for l in [label::SESSIONS, label::AUTHORIZE, label::NEEDS_YOU, label::CONTEXT] {
             assert!(l.chars().all(|c| c == ' ' || c == '+' || c.is_ascii_uppercase()), "{l}");
             assert!(!l.contains("  ") || l.contains("   "), "{l}: word gaps are three spaces");
         }

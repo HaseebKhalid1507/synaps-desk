@@ -1634,16 +1634,20 @@ fn exiting_takes_no_click(cx: &mut TestAppContext) {
     assert!(view.read_with(&vcx, |v, _| v.model.watch.focus().is_none() && v.menu.is_none()), "the click opened nothing");
 }
 
-/// The answered card fades in its own slot (the dock keeps its height),
-/// drawn as it last was and taking no click; then the dock closes in one
-/// frame. Off: it closes at once, as today.
+/// The answered card collapses in its own row (P13): drawn as it last was
+/// at full strength, clipped from its height on `sheet`, taking no click;
+/// nothing above it moves, and the call's row says what happened. Then the
+/// row goes. Off: at once (below).
 #[gpui_kit::test]
-fn the_answered_card_fades_in_its_slot(cx: &mut TestAppContext) {
+fn the_answered_card_collapses_in_its_row(cx: &mut TestAppContext) {
     use std::time::Duration;
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Full);
     settle(cx, w, 8);
-    let bounds = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel);
+    let bounds = |cx: &mut TestAppContext, sel: &str| {
+        let sel: &'static str = Box::leak(sel.to_string().into_boxed_str());
+        VisualTestContext::from_window(w, cx).debug_bounds(sel)
+    };
     // A new prompt arrives while watched (the one there at open is history:
     // it doesn't breathe): its card traces and its glyph breathes.
     resolve_prompt(cx, &view);
@@ -1653,43 +1657,670 @@ fn the_answered_card_fades_in_its_slot(cx: &mut TestAppContext) {
             kind: serde_json::json!("confirm"),
             title: "Confirm tool call".into(),
             prompt: "Tool: bash\n\nAllow this tool call?".into(),
+            raised_at: None,
+            confirm_scope: None,
         };
         v.model.transcript.apply(&SessionEvent::Prompt { request });
         cx.notify();
     });
     cx.run_until_parked();
     settle(cx, w, 8);
-    let live = bounds(cx, "card").expect("the new card is up");
+    let live = bounds(cx, "card").expect("the new card is up, in the log");
+    let (call, row) = view.read_with(cx, |v, _| (v.waiting_on.expect("the call it gates"), v.current_card().unwrap().row));
+    let call_row = bounds(cx, &format!("tool-row {call}")).expect("its call's row");
+    assert!(live.top() >= call_row.bottom(), "the card's row is under its call's");
     let in_card = |cx: &mut TestAppContext, b: gpui_kit::Bounds<gpui_kit::Pixels>| {
         view.read_with(cx, |v, _| {
             v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Breath(_)) && b.contains(&s.origin)).count()
         })
     };
     assert_eq!(in_card(cx, live), 1, "the live card's glyph breathes on the beat layer");
-    // The live card takes a press (the control for the leaving one below).
+    // The live card takes a press (the control for the collapsing one below).
     click_at(cx, w, live.center());
     assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the live card took the press");
     resolve_prompt(cx, &view);
-    // Held mid-fade for the test.
+    // Held at the collapse's start for the test.
     view.update(cx, |v, cx| {
-        v.card_exit.as_mut().expect("answered on screen: it fades").at = v.fx.clock() + Duration::from_secs(60);
+        v.card_exit.as_mut().expect("answered on screen: it collapses").at = v.fx.clock() + Duration::from_secs(60);
         cx.notify();
     });
     cx.run_until_parked();
     assert!(bounds(cx, "card").is_none());
-    let ghost = bounds(cx, "card-exit").expect("the answered card, fading");
-    assert_eq!(ghost, live, "in its slot: nothing above or below it moved");
-    assert_eq!(in_card(cx, ghost), 0, "leaving, its glyph holds still: no breath over its cover");
+    let ghost = bounds(cx, "card-exit").expect("the answered card, collapsing");
+    assert_eq!(ghost, live, "in its row: nothing above it moved");
+    assert_eq!(bounds(cx, &format!("tool-row {call}")), Some(call_row), "its call's row holds still");
+    assert_eq!(in_card(cx, ghost), 0, "collapsing, its glyph holds still: no breath through the clip");
     click_at(cx, w, ghost.center());
-    assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the leaving card took no press (the one is the live card's)");
-    // Its time is up: the dock closes in one frame.
+    assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the collapsing card took no press (the one is the live card's)");
+    assert!(bounds(cx, &format!("receipt {row}")).is_some(), "the call's row says it was answered elsewhere");
+    // Halfway: clipped shorter. Following, the list's end holds (F1): the
+    // row's bottom stays where the card's slot ended.
     view.update(cx, |v, cx| {
-        v.card_exit.as_mut().unwrap().at = v.fx.clock() - Duration::from_secs(1);
+        v.card_exit.as_mut().unwrap().at = v.fx.clock() - Duration::from_millis(120);
         cx.notify();
     });
     cx.run_until_parked();
+    let clip = bounds(cx, &format!("grow-clip-{row}")).expect("its clip");
+    assert!(clip.size.height < live.size.height && clip.size.height > gpui_kit::px(1.), "{clip:?}");
+    let r = cx.update(|cx| crate::theme::metrics(cx).r);
+    assert!(view.read_with(cx, |v, _| v.list.is_following_tail()));
+    let end = live.bottom() + gpui_kit::px((12. * r).round());
+    assert!((clip.bottom() - end).abs() < gpui_kit::px(0.5), "the end holds: {clip:?} vs {end:?}");
+    // Landed: the row goes.
+    view.update(cx, |v, cx| {
+        v.card_exit.as_mut().unwrap().at = v.fx.clock() - Duration::from_secs(5);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
     assert!(view.read_with(cx, |v, _| v.card_exit.is_none()));
     assert!(bounds(cx, "card-exit").is_none() && bounds(cx, "card").is_none());
+    assert!(view.read_with(cx, |v, _| v.disp.iter().all(|d| d.kind != crate::turns::Kind::Prompt)), "its row is gone");
+    assert!(bounds(cx, &format!("receipt {row}")).is_some(), "the receipt stays");
+}
+
+/// The card's keys: the window's focus (a click on the card), a frame for
+/// them to go live, and their arm's wait (real time: [`crate::app::Arm`]).
+fn card_keys(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    cx.update_window(w, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |v, cx| window.focus(&v.focus, cx))
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    assert_eq!(view.read_with(cx, |v, _| v.card_keys.get()), Some(false), "the card has the keys");
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+}
+
+/// Q2 (polish.md §2.6): Allow all is the input owner's. Not the owner (the
+/// session's input shared, another client owning it): no box, Space does
+/// nothing, ALLOW sends `y`. The owner: the box; Space checks it only with
+/// the box focused (clicked), a new press, the keys armed (Shady M2), and
+/// every toggle re-arms the keys, so ALLOW right after it does nothing;
+/// once armed again ALLOW sends `"always"`. The header says what asked; a
+/// guard's well holds its command and the folder line its folder.
+#[gpui_kit::test]
+fn allow_all_is_the_input_owners(cx: &mut TestAppContext) {
+    use crate::authorize::Answer;
+    let (w, view, _events) = open(cx);
+    let has = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel).is_some();
+    assert!(has(cx, "card") && has(cx, "card-asked") && has(cx, "card-folder") && has(cx, "prompt-well"));
+    let set_owner = |cx: &mut TestAppContext, owner: u64| {
+        view.update(cx, |v, cx| {
+            v.model.active.as_mut().unwrap().owner = Some(owner);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let checked = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.current_card().is_some_and(|c| c.allow_all));
+    set_owner(cx, 99);
+    card_keys(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| v.drives()), "shared input: this window still answers");
+    assert!(!has(cx, "card-allow-all"), "not the owner: not offered");
+    tap(cx, w, "space");
+    assert!(!checked(cx), "Space checks nothing that isn't offered");
+    set_owner(cx, 2);
+    assert!(has(cx, "card-allow-all") && !has(cx, "card-allow-all-on"));
+    tap(cx, w, "space");
+    assert!(!checked(cx), "Space with the card's keys but not the box's focus: nothing");
+    // Tab from the card's keys: the box has the focus; Space toggles it and
+    // re-arms the keys. Shift+Tab: back to the card, where Space does not.
+    let box_focus = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.current_card().is_some_and(|c| c.box_focus));
+    tap(cx, w, "tab");
+    settle(cx, w, 4);
+    assert!(box_focus(cx), "Tab focuses the box");
+    assert_eq!(view.read_with(cx, |v, _| v.card_keys.get()), Some(false), "the card keeps its keys");
+    tap(cx, w, "space");
+    assert!(checked(cx), "Tab, then Space checks it");
+    tap(cx, w, if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" });
+    assert!(view.read_with(cx, |v, _| v.sent.is_none()), "the toggle re-armed the keys");
+    tap(cx, w, "shift-tab");
+    settle(cx, w, 4);
+    assert!(!box_focus(cx), "Shift+Tab: back to the card");
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    tap(cx, w, "space");
+    assert!(checked(cx), "Space off the box: unchanged");
+    tap(cx, w, "tab");
+    settle(cx, w, 4);
+    tap(cx, w, "space");
+    assert!(!checked(cx), "Tab, Space: unchecked");
+    tap(cx, w, "tab");
+    settle(cx, w, 4);
+    assert!(!box_focus(cx), "Tab on the box: back to the card");
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    // A frame with the box armed again (its click listener with it).
+    view.update(cx, |_, cx| cx.notify());
+    settle(cx, w, 4);
+    let at = VisualTestContext::from_window(w, cx).debug_bounds("card-allow-all").expect("the box").center();
+    click_at(cx, w, at);
+    settle(cx, w, 8);
+    assert!(checked(cx) && has(cx, "card-allow-all-on"), "a click checks it");
+    assert!(view.read_with(cx, |v, _| v.current_card().is_some_and(|c| c.box_focus)), "and focuses it");
+    let yes = if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" };
+    tap(cx, w, yes);
+    assert!(view.read_with(cx, |v, _| v.sent.is_none()), "the toggle re-armed the keys: ALLOW waits");
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    tap(cx, w, "space");
+    assert!(!checked(cx), "Space on the focused box unchecks it");
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    tap(cx, w, "space");
+    assert!(checked(cx), "and checks it");
+    // A held Space toggles nothing more (its repeats are not presses).
+    down(cx, w, "space", true);
+    up(cx, w, "space");
+    assert!(checked(cx), "held: unchanged");
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    tap(cx, w, yes);
+    assert_eq!(view.read_with(cx, |v, _| v.sent.as_ref().map(|s| s.answer)), Some(Answer::AllowedAll), "ALLOW sent \"always\"");
+    // How long you took counts from the card's first showing, not from
+    // the last toggle's re-arm (live: `allowed all · 1s` after 20 s).
+    let (took, shown) = view.read_with(cx, |v, _| (v.sent.as_ref().unwrap().took, v.current_card().unwrap().shown.elapsed()));
+    assert!(took + std::time::Duration::from_millis(250) >= shown && took >= 3 * crate::app::ARM, "took {took:?}, shown {shown:?} ago");
+    // Answered: Space no longer toggles it (the card can't be answered).
+    tap(cx, w, "space");
+    assert!(checked(cx), "answer sent: unchanged");
+    // Resolved: the receipt in the call's row; the card's state goes.
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    view.read_with(cx, |v, _| {
+        assert!(v.card.is_none() && v.card_exit.is_none() && v.sent.is_none(), "authorize_entity_dropped_on_answer");
+        let r = v.receipts.values().flatten().last().expect("a receipt");
+        let call =
+            v.model.transcript.items().iter().find(|i| Some(i.id) == v.waiting_on).and_then(|i| i.tool.as_ref()).map(|t| t.tool_id.clone());
+        assert_eq!((r.answer, r.own, Some(r.call.to_string())), (Answer::AllowedAll, false, call));
+    });
+}
+
+/// Q2: the card scrolled away, the NEEDS YOU stub stands in over the
+/// chips; Ctrl+J (from the composer too) brings the card back into view,
+/// the keys with it, and the stub goes.
+#[gpui_kit::test]
+fn ctrl_j_goes_to_the_card(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    let has = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel).is_some();
+    assert!(view.read_with(cx, |v, _| v.card_on_screen()) && !has(cx, "needs-stub"), "on screen: no stub");
+    view.update(cx, |v, cx| {
+        v.list.scroll_to(gpui_kit::ListOffset { item_ix: 0, offset_in_item: gpui_kit::px(0.) });
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    settle(cx, w, 8);
+    assert!(view.read_with(cx, |v, _| !v.card_on_screen()), "scrolled away");
+    assert!(has(cx, "needs-stub") && has(cx, "needs-stub-key"), "the stub says ctrl j");
+    focus_composer(cx, w, &view);
+    tap(cx, w, "ctrl-j");
+    // F1's glide, frame by frame.
+    for _ in 0..120 {
+        fluid_frame(cx, w, &view);
+    }
+    settle(cx, w, 8);
+    assert!(view.read_with(cx, |v, _| v.card_on_screen()), "back in view");
+    assert!(!has(cx, "needs-stub"), "the stub goes");
+    assert!(!view.read_with(cx, |v, cx| v.composer.read(cx).text().to_string().contains('\n')), "Ctrl+J typed nothing");
+}
+
+/// Q2: an answer from this window is its receipt (`denied` here); one this
+/// window did not send is `answered elsewhere`, with no wait.
+#[gpui_kit::test]
+fn a_receipt_says_who_answered(cx: &mut TestAppContext) {
+    use crate::authorize::Answer;
+    let (w, view, _events) = open(cx);
+    card_keys(cx, w, &view);
+    tap(cx, w, "escape");
+    assert_eq!(view.read_with(cx, |v, _| v.sent.as_ref().map(|s| s.answer)), Some(Answer::Denied), "Esc denies");
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    let call = view.read_with(cx, |v, _| {
+        let r = v.receipts.values().flatten().last().expect("a receipt");
+        assert_eq!(r.answer, Answer::Denied);
+        assert!(r.took.is_some());
+        let items = v.model.transcript.items();
+        items[crate::authorize::call_ix(items, &r.call).expect("its call")].id
+    });
+    let words = view.read_with(cx, |v, _| v.receipts.values().flatten().last().unwrap().words());
+    assert_eq!(words.0, "denied");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("tool-row {call}"))).is_some());
+    // Another prompt, resolved without this window answering.
+    view.update(cx, |v, cx| {
+        let request = synaps_client::protocol::PromptRequest {
+            id: 9,
+            kind: serde_json::json!("confirm"),
+            title: "Confirm tool call".into(),
+            prompt: "Tool: bash\n\nAllow this tool call?".into(),
+            raised_at: None,
+            confirm_scope: None,
+        };
+        v.model.transcript.apply(&SessionEvent::Prompt { request });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    view.read_with(cx, |v, _| {
+        let r = v.receipts.values().flatten().last().unwrap();
+        assert_eq!((r.answer, r.took), (Answer::Resolved, None), "this window owns the input: nothing says who");
+        assert!(r.words().0 == "resolved");
+    });
+    // Resolved while another client owns the input: answered elsewhere.
+    raise(cx, &view, 10);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.model.active.as_mut().unwrap().owner = Some(99));
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert_eq!(view.read_with(cx, |v, _| v.receipts.values().flatten().last().unwrap().answer), Answer::Elsewhere);
+    // Shady M4: HALT from here, then the daemon resolves the prompt (with
+    // no answer: the tool is blocked): cancelled, never answered elsewhere.
+    view.update(cx, |v, _| v.model.active.as_mut().unwrap().owner = Some(2));
+    raise(cx, &view, 11);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.halt());
+    assert!(view.read_with(cx, |v, _| v.halted.is_some()), "this window halted");
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert_eq!(view.read_with(cx, |v, _| v.receipts.values().flatten().last().unwrap().answer), Answer::Cancelled);
+    // The turn already over (another client's HALT, a revoke): cancelled too.
+    view.update(cx, |v, _| v.halted = None);
+    raise(cx, &view, 12);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.model.transcript.set_busy(false));
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert_eq!(view.read_with(cx, |v, _| v.receipts.values().flatten().last().unwrap().answer), Answer::Cancelled);
+    // Shady N3: answered elsewhere while the turn ran, the turn over before
+    // this window drew again: what it was when it resolved, not cancelled.
+    view.update(cx, |v, _| {
+        v.model.transcript.set_busy(true);
+        v.model.active.as_mut().unwrap().owner = Some(99);
+    });
+    raise(cx, &view, 13);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| {
+        v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 13 });
+        v.model.transcript.apply(&SessionEvent::Idle);
+    });
+    wait(cx, w, &view, 1000);
+    assert_eq!(view.read_with(cx, |v, _| v.receipts.values().flatten().last().unwrap().answer), Answer::Elsewhere);
+}
+
+/// Shady N2: a prompt with no call in its turn (a secret at the turn's
+/// start) gets no receipt from an earlier turn's call, and still collapses.
+#[gpui_kit::test]
+fn a_prompt_with_no_call_in_its_turn_still_collapses(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    resolve_prompt(cx, &view);
+    settle(cx, w, 8);
+    view.update(cx, |v, cx| {
+        v.model.transcript.apply(&SessionEvent::TurnStarted { turn_baseline: 0, trigger: String::new(), user_text: Some("hi".into()) });
+        let request = synaps_client::protocol::PromptRequest {
+            id: 21,
+            kind: serde_json::json!("secret"),
+            title: "Secret requested".into(),
+            prompt: "Password for sudo".into(),
+            raised_at: None,
+            confirm_scope: None,
+        };
+        v.model.transcript.apply(&SessionEvent::Prompt { request });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    let (row, before) =
+        view.read_with(cx, |v, _| (v.current_card().expect("the secret's card").row, v.receipts.values().flatten().count()));
+    resolve_prompt(cx, &view);
+    view.read_with(cx, |v, _| {
+        assert!(v.card_exit.as_ref().is_some_and(|e| e.card.row == row && e.to == 0.), "it collapses, to nothing");
+        assert_eq!(v.receipts.values().flatten().count(), before, "no receipt on an earlier turn's call");
+    });
+}
+
+/// The finish gate of #18 and Shady N1: a gated row's meta reads in order,
+/// each part apart: `3s running · allowed 19:14` while it runs (its clock
+/// from the answer, the wait left to the receipt), then `failed · allowed
+/// 19:14 · 15s`.
+#[gpui_kit::test]
+fn a_gated_rows_meta_reads_apart(cx: &mut TestAppContext) {
+    use crate::authorize::Answer;
+    let (w, view, _events) = open(cx);
+    // Shady N4: the card built anew for the same prompt (a tab's round
+    // trip) keeps its first showing: how long you took counts from there.
+    let first = view.read_with(cx, |v, _| v.current_card().unwrap().shown);
+    view.update(cx, |v, cx| {
+        v.card = None;
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    assert_eq!(view.read_with(cx, |v, _| v.current_card().map(|c| c.shown)), Some(first), "shown when first shown");
+    card_keys(cx, w, &view);
+    tap(cx, w, if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" });
+    assert_eq!(view.read_with(cx, |v, _| v.sent.as_ref().map(|s| s.answer)), Some(Answer::Allowed));
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    let (row, call, tool) = view.read_with(cx, |v, _| {
+        let r = v.receipts.values().flatten().last().expect("a receipt");
+        assert!(!r.own && r.took.is_some());
+        let items = v.model.transcript.items();
+        let it = &items[crate::authorize::call_ix(items, &r.call).expect("its call")];
+        (r.row, it.id, r.call.to_string())
+    });
+    let at = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel));
+    let parts = |cx: &mut TestAppContext| (at(cx, format!("receipt-sep {row}")), at(cx, format!("receipt {row}")));
+    let (sep, words) = parts(cx);
+    let (sep, words) = (sep.expect("a · before the receipt"), words.expect("the receipt"));
+    assert!(sep.right() <= words.left() && at(cx, format!("tool-row {call}")).is_some_and(|b| b.contains(&sep.center())));
+    // It fails: `failed · allowed 14:21 · 0s`, never `failed allowed`.
+    view.update(cx, |v, cx| {
+        let ev = serde_json::json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": tool, "result": "Unknown tool: shell_strat"}});
+        v.model.transcript.apply(&synaps_client::protocol::decode_event(&ev).expect("a result"));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let st = view.read_with(cx, |v, _| {
+        v.model.transcript.items().iter().find(|i| i.id == call).and_then(|i| i.tool.as_ref()).and_then(|t| t.status)
+    });
+    assert_eq!(st, Some(synaps_client::transcript::ToolStatus::Failed));
+    let (sep, words) = parts(cx);
+    assert!(sep.zip(words).is_some_and(|(s, r)| s.right() <= r.left()), "failed · allowed …");
+}
+
+/// The card up, offering Allow all (this window owns the input), its keys
+/// live and armed.
+fn allow_all_up(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    view.update(cx, |v, cx| {
+        v.model.active.as_mut().unwrap().owner = Some(2);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    card_keys(cx, w, view);
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("card-allow-all").is_some(), "Allow all offered");
+}
+
+fn box_focused(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> bool {
+    cx.update_window(w, |_, window, cx| view.read(cx).allow_all_focus.is_focused(window)).expect("the window")
+}
+
+/// Shady M1 of round 4: the Allow all box is no tab stop. Tab and Shift+Tab
+/// from the composer never reach it, so a space typed there never checks it.
+#[gpui_kit::test]
+fn the_composers_tab_never_reaches_allow_all(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    allow_all_up(cx, w, &view);
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.composer.update(cx, |s, cx| s.focus(window, cx)))).expect("the window");
+    settle(cx, w, 4);
+    assert!(composer_focused(cx, w, &view), "typing a steer");
+    for key in ["shift-tab", "tab", "tab", "shift-tab", "shift-tab"] {
+        tap(cx, w, key);
+        settle(cx, w, 4);
+        assert!(!box_focused(cx, w, &view), "{key} from the composer: never the box");
+        assert_ne!(view.read_with(cx, |v, _| v.card_keys.get()), Some(false), "{key}: the card's keys are not live");
+    }
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    tap(cx, w, "space");
+    settle(cx, w, 4);
+    assert!(view.read_with(cx, |v, _| v.current_card().is_some_and(|c| !c.allow_all)), "a typed space: still unchecked");
+}
+
+/// Shady L1 of round 4: with a card up, Tab in an open menu (a worker's, a
+/// session's, the workers menu) is the menu's, never a way to the box.
+#[gpui_kit::test]
+fn tab_in_a_menu_is_the_menus(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    allow_all_up(cx, w, &view);
+    // The open menu's selection, and how many of its items can act.
+    let sel = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            fn of<A>(m: &crate::menu::Menu<A>) -> (Option<usize>, usize) {
+                (m.sel, m.items.iter().filter(|i| i.enabled()).count())
+            }
+            v.menu.as_ref().map(|(m, _)| of(m)).or(v.smenu.as_ref().map(|(m, _)| of(m))).or(v.wmenu.as_ref().map(of)).expect("a menu")
+        })
+    };
+    let mut stepped = 0;
+    let mut after_tab = |cx: &mut TestAppContext, what: &str| {
+        let root = cx.update_window(w, |_, window, cx| view.read(cx).focus.is_focused(window)).expect("the window");
+        assert!(root, "{what}: the window has the focus");
+        assert_eq!(view.read_with(cx, |v, _| v.card_keys.get()), None, "{what}: the card's keys wait");
+        let (was, can) = sel(cx);
+        tap(cx, w, "tab");
+        settle(cx, w, 4);
+        assert!(!box_focused(cx, w, &view), "{what}: Tab is the menu's");
+        let (now, _) = sel(cx);
+        if can > 1 {
+            assert_ne!(now, was, "{what}: Tab stepped it");
+            stepped += 1;
+        }
+    };
+    let close = |cx: &mut TestAppContext| {
+        cx.update_window(w, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.close_menu();
+                window.focus(&v.focus, cx);
+                cx.notify();
+            })
+        })
+        .expect("the window");
+        settle(cx, w, 4);
+    };
+    // A worker's menu, from the keyboard over scout's tray row.
+    down(cx, w, "shift-f10", false);
+    up(cx, w, "shift-f10");
+    settle(cx, w, 4);
+    assert!(view.read_with(cx, |v, _| v.menu.is_some()), "Shift+F10: scout's menu");
+    after_tab(cx, "a worker's menu");
+    close(cx);
+    // A session's.
+    let key = view.read_with(cx, |v, _| v.rail.rail.rows.iter().find(|r| r.live.is_some()).map(|r| r.key)).expect("a live row");
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| v.open_session_menu(crate::app::SessionAt::Row(key), Default::default(), window, cx))
+    })
+    .expect("the window");
+    settle(cx, w, 4);
+    assert!(view.read_with(cx, |v, _| v.smenu.is_some()), "the session menu");
+    after_tab(cx, "a session's menu");
+    close(cx);
+    // The workers menu (`+N more` of a fan-out wider than its chips' lines).
+    let rows: Vec<serde_json::Value> = (1..=12u64)
+        .map(|n| {
+            serde_json::json!({"subagent_id": n, "agent_name": format!("worker-{n}"), "status": "running", "cancel_requested": false,
+                "elapsed_secs": 10.0 + n as f64, "finished_elapsed": null, "step": format!("reading src/part_{n}.rs"), "tools": n,
+                "handle_id": format!("sa_{n}")})
+        })
+        .collect();
+    let rows = synaps_client::protocol::decode_event(&serde_json::json!({"ev": "subagent_rows", "rows": rows})).expect("a rows event");
+    view.update(cx, |v, cx| {
+        v.model.stats.subagents.on_session(&rows);
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.open_workers_menu(Default::default(), window, cx))).expect("the window");
+    settle(cx, w, 4);
+    assert!(view.read_with(cx, |v, _| v.wmenu.as_ref().is_some_and(|m| m.items.len() > 1)), "the workers menu");
+    after_tab(cx, "the workers menu");
+    assert!(stepped > 0, "a menu with items to step to");
+}
+
+/// Shady L3 of round 4: an early Space on the box starts the wait again,
+/// like an early Ctrl+Enter or Esc ([`crate::app::Arm`]).
+#[gpui_kit::test]
+fn an_early_space_on_the_box_waits_again(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    allow_all_up(cx, w, &view);
+    let checked = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.current_card().is_some_and(|c| c.allow_all));
+    let arm = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.current_card().unwrap().arm);
+    tap(cx, w, "tab");
+    settle(cx, w, 4);
+    assert!(box_focused(cx, w, &view));
+    tap(cx, w, "space");
+    assert!(checked(cx), "armed: Space checks it (and re-arms)");
+    let toggled = arm(cx);
+    tap(cx, w, "space");
+    assert!(checked(cx), "too early: unchanged");
+    assert_ne!(arm(cx), toggled, "and the keys wait from this Space");
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    tap(cx, w, "space");
+    assert!(!checked(cx), "armed again: Space unchecks it");
+}
+
+/// Shady L4 of round 4: resolved while another client owns the input, its
+/// call then cancelled (a HALT from there): the row reads `cancelled`, once,
+/// never `cancelled · answered elsewhere`.
+#[gpui_kit::test]
+fn a_halt_from_elsewhere_reads_cancelled(cx: &mut TestAppContext) {
+    use crate::authorize::Answer;
+    let (w, view, _events) = open(cx);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.model.active.as_mut().unwrap().owner = Some(99));
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    let (row, call, tool) = view.read_with(cx, |v, _| {
+        let r = v.receipts.values().flatten().last().expect("a receipt");
+        assert_eq!(r.answer, Answer::Elsewhere);
+        let items = v.model.transcript.items();
+        let it = &items[crate::authorize::call_ix(items, &r.call).expect("its call")];
+        (r.row, it.id, r.call.to_string())
+    });
+    let has = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel)).is_some();
+    assert!(has(cx, format!("receipt-word {row} answered elsewhere")));
+    view.update(cx, |v, cx| {
+        let ev = serde_json::json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": tool, "result": "Canceled by user"}});
+        v.model.transcript.apply(&synaps_client::protocol::decode_event(&ev).expect("a result"));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let st = view.read_with(cx, |v, _| {
+        v.model.transcript.items().iter().find(|i| i.id == call).and_then(|i| i.tool.as_ref()).and_then(|t| t.status)
+    });
+    assert_eq!(st, Some(synaps_client::transcript::ToolStatus::Cancelled));
+    assert!(has(cx, format!("receipt-word {row} cancelled")), "the receipt says cancelled");
+    assert!(!has(cx, format!("receipt-word {row} answered elsewhere")), "not answered elsewhere");
+    assert!(!has(cx, format!("tool-word {call}")), "and the row's status word is not said twice");
+}
+
+/// A guard's confirm for the demo's waiting call, id `id`, raised now.
+fn raise(cx: &mut TestAppContext, view: &Entity<AppView>, id: u64) {
+    view.update(cx, |v, cx| {
+        let request = synaps_client::protocol::PromptRequest {
+            id,
+            kind: serde_json::json!("confirm"),
+            title: "Confirm tool call".into(),
+            prompt: "Tool: bash\n\nAllow this tool call?".into(),
+            raised_at: None,
+            confirm_scope: None,
+        };
+        v.model.transcript.apply(&SessionEvent::Prompt { request });
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+/// Shady M1: three calls from one response, all unfinished. The engine runs
+/// them in order, so the confirm is the first's: its card under the first,
+/// unless the prompt names another (its scope's tool, a guard's command).
+#[gpui_kit::test]
+fn the_card_goes_under_the_call_it_gates(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    // The demo's call done, three new ones from one response.
+    view.update(cx, |v, _| {
+        let id =
+            v.model.transcript.items().iter().find(|i| Some(i.id) == v.waiting_on).and_then(|i| i.tool.as_ref()).unwrap().tool_id.clone();
+        v.model
+            .transcript
+            .apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: id, result: "ok".into() }) });
+    });
+    running_tools(cx, &view, 3);
+    let id_of =
+        |v: &AppView, c: &str| v.model.transcript.items().iter().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == c)).map(|i| i.id);
+    view.read_with(cx, |v, _| {
+        let items = v.model.transcript.items();
+        assert_eq!(crate::turns::waiting_call(items, None), id_of(v, "ui-run-0"), "the first unfinished");
+        let named = serde_json::from_value::<synaps_client::protocol::PromptRequest>(serde_json::json!({
+            "id": 30, "kind": "confirm", "title": "Confirm tool call",
+            "prompt": "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n$ cargo test -p crate1\n\nAllow this tool call?",
+            "confirm_scope": {"extensions": ["guard"], "tool": "bash"}
+        }))
+        .unwrap();
+        assert_eq!(crate::turns::waiting_call(items, Some(&named)), id_of(v, "ui-run-1"), "the one its command names");
+        let other = serde_json::from_value::<synaps_client::protocol::PromptRequest>(serde_json::json!({
+            "id": 31, "kind": "confirm", "title": "Confirm tool call", "prompt": "Tool: edit",
+            "confirm_scope": {"extensions": ["lint"], "tool": "edit"}
+        }))
+        .unwrap();
+        assert_eq!(crate::turns::waiting_call(items, Some(&other)), id_of(v, "ui-run-0"), "none named: the first");
+    });
+    raise(cx, &view, 20);
+    settle(cx, w, 8);
+    view.read_with(cx, |v, _| {
+        let row = v.current_card().expect("a card").row;
+        let ix = v.disp.iter().position(|d| d.id == row).expect("its row");
+        let call = id_of(v, "ui-run-0").unwrap();
+        assert_eq!(v.disp[ix - 1].item, v.model.transcript.items().iter().position(|i| i.id == call).unwrap(), "under the first call");
+    });
+}
+
+/// Shady M6: a card placed above other rows that the list never drew is
+/// not on screen (only the last row's first frame counts as shown): the
+/// stub stays, and Esc does not deny a card nobody saw.
+#[gpui_kit::test]
+fn an_undrawn_card_above_other_rows_is_not_on_screen(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    running_tools(cx, &view, 40);
+    // The first call's confirm (the guard names it): its card far above the end.
+    view.update(cx, |v, cx| {
+        let request = serde_json::from_value::<synaps_client::protocol::PromptRequest>(serde_json::json!({
+            "id": 40, "kind": "confirm", "title": "Confirm tool call",
+            "prompt": "Extension: guard\nTool: bash\n\nMessage from guard:\nbash wants to run a command in ~/w:\n$ cargo test -p crate0\n\nAllow this tool call?",
+            "confirm_scope": {"extensions": ["guard"], "tool": "bash"}
+        }))
+        .unwrap();
+        v.model.transcript.apply(&SessionEvent::Prompt { request });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    view.read_with(cx, |v, _| {
+        let ix = v.card_ix().expect("its row");
+        assert!(ix + 1 < v.disp.len(), "rows under it");
+        assert!(v.current_card().unwrap().height.get().is_nan(), "never drawn");
+        assert!(!v.card_on_screen(), "not on screen");
+    });
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("needs-stub").is_some(), "the stub stands in");
+    cx.update_window(w, |_, window, cx| {
+        window.activate_window();
+        view.update(cx, |v, cx| window.focus(&v.focus, cx))
+    })
+    .unwrap();
+    settle(cx, w, 8);
+    std::thread::sleep(crate::app::ARM + std::time::Duration::from_millis(60));
+    tap(cx, w, "escape");
+    assert!(view.read_with(cx, |v, _| v.sent.is_none()), "Esc denies nothing unseen");
+}
+
+/// Shady M5: Ctrl+J is for the card it was pressed for. That card gone,
+/// the next one never takes the keys from the composer.
+#[gpui_kit::test]
+fn ctrl_j_is_for_one_card(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    view.update(cx, |v, cx| {
+        v.jump_card = v.model.card_key().map(|(e, id)| (e, id + 1000));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    assert!(view.read_with(cx, |v, _| v.jump_card.is_none()), "another card's jump is dropped");
+    view.update(cx, |v, _| v.jump_card = v.model.card_key());
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert!(view.read_with(cx, |v, _| v.jump_card.is_none()), "its card went: dropped");
+    focus_composer(cx, w, &view);
+    raise(cx, &view, 50);
+    settle(cx, w, 8);
+    assert!(composer_focused(cx, w, &view), "the next card leaves the composer its keys");
 }
 
 /// Motion Off: an answered card goes in the frame its answer lands.
@@ -2343,6 +2974,9 @@ fn anchor_row_never_moves(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn stream_reveal_never_trails_a_line(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
+    // The demo's prompt answered first: its card's row would follow the
+    // streaming row (polish.md §2.6), and this is about the last row.
+    resolve_prompt(cx, &view);
     set_motion(cx, &view, crate::motion::Level::Full);
     view.update(cx, |v, _| v.client = None);
     start_stream(cx, &view);
@@ -2462,6 +3096,9 @@ fn the_gutter_stays_drawn_while_a_row_grows(cx: &mut TestAppContext) {
     // Wide enough that the labels hang in the gutter.
     let (w, view, _events) = open_at(cx, (2200., 1000.), crate::theme::Panels::default().text_size);
     assert!(view.read_with(cx, |v, _| v.layout.hang), "the labels hang");
+    // The demo's prompt answered first: its card's row would follow the
+    // streaming row (polish.md §2.6), and this is about the last row.
+    resolve_prompt(cx, &view);
     set_motion(cx, &view, crate::motion::Level::Full);
     view.update(cx, |v, _| v.client = None);
     start_stream(cx, &view);
@@ -2493,6 +3130,11 @@ fn the_gutter_stays_drawn_while_a_row_grows(cx: &mut TestAppContext) {
 fn arrivals_off_screen_keep_their_height(cx: &mut TestAppContext) {
     use synaps_client::protocol::{LlmEvent, StreamEvent};
     let (w, view, _events) = open(cx);
+    // The demo's prompt answered first, its card's collapse landed: its row
+    // would follow the streaming row (polish.md §2.6), and this measures
+    // the rows that arrive.
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
     set_motion(cx, &view, crate::motion::Level::Full);
     view.update(cx, |v, _| v.client = None);
     start_stream(cx, &view);

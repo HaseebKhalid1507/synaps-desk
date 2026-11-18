@@ -56,6 +56,9 @@ pub const DEFAULT_TEXT: u8 = 16;
 pub const TEXT: f64 = 4.5;
 /// Glyphs, bars and state borders (WCAG 1.4.11).
 pub const MARK: f64 = 3.0;
+/// The authorize card's command on its well (polish.md §2.6, the finish
+/// gate of #18): at least this, and at least the card's other text.
+pub const CMD: f64 = 7.0;
 /// The user and code surfaces stand at least this far off the canvas.
 pub const SURFACE: f64 = 1.10;
 /// A step up a surface (`raised` off the chrome, `card_hi` off the card).
@@ -642,7 +645,6 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.ready = f.text("ready", t.status_ready, &[canvas, user]);
     r.cost = f.text("cost", t.cost_color, &[canvas]);
     r.err = f.text("err", t.error_color, &[canvas, tool, tool_out, user]);
-    r.well_fg = f.text("well_fg", t.code_fg, &[canvas]);
     r.dim_u = f.text("dim_u", t.muted, &[user]);
     r.agent_u = f.text("agent_u", t.claude_label, &[user]);
     r.head_u = f.text("head_u", t.heading_color, &[user]);
@@ -689,6 +691,11 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.dim_k = f.text("dim_k", t.muted, &k);
     r.warn_k = f.text("warn_k", t.warning_color, &k);
     r.err_k = f.text("err_k", t.error_color, &k);
+    // The authorize card's command (polish.md §2.6): its first read, so
+    // its loudest text, at least `CMD` on its well (the canvas) and as
+    // loud as any other text on the card is on the card.
+    let loud = [r.prose_k, r.dim_k, r.warn_k, r.err_k].iter().map(|&c| contrast(c, card)).fold(CMD, f64::max);
+    r.well_fg = f.at("well_fg", t.code_fg, ink, &[canvas], loud);
     r.run_k = f.text("run_k", t.status_streaming, &k);
     r.ok_k = f.text("ok_k", t.tool_result_ok, &k);
     r.run_mark_k = f.mark("run_mark_k", t.status_streaming, &k);
@@ -2098,6 +2105,25 @@ mod tests {
             report.push(format!("{name:<15} {lifted:>3} of {total} roles lifted, lowest ratio / floor {worst:.3}"));
         }
         println!("{}", report.join("\n"));
+    }
+
+    /// The authorize card's command is its first read (the finish gate of
+    /// #18): `CMD` on its well and over every other text on the card.
+    #[test]
+    fn the_command_is_the_cards_loudest_text() {
+        let mut accents: Vec<Option<u32>> = vec![None];
+        accents.extend(PRESETS.iter().map(|p| Some(p.1)));
+        for (name, raw) in palettes::THEMES {
+            for &accent in &accents {
+                let (r, _) = resolve(&raw, accent);
+                let cmd = contrast(r.well_fg, r.canvas);
+                assert!(cmd >= CMD - 1e-9, "{name} {accent:06x?}: the command is {cmd:.2} on its well");
+                for (role, c) in [("prose_k", r.prose_k), ("dim_k", r.dim_k), ("warn_k", r.warn_k), ("err_k", r.err_k)] {
+                    let other = contrast(c, r.card);
+                    assert!(cmd >= other - 1e-9, "{name} {accent:06x?}: the command {cmd:.2} under {role} {other:.2}");
+                }
+            }
+        }
     }
 
     /// Every role is in the `Check` log (so the floor test covers it), but
