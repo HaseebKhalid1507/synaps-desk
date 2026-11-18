@@ -2383,6 +2383,16 @@ impl AppView {
         if self.restore.is_none() && self.composer_owned() {
             return;
         }
+        // A tab left while its slash command was out: the answer goes to
+        // an attachment no longer on screen (never shown here), so the
+        // command's text leaves with it, as a sent message's does: the tab's
+        // draft is not left holding a command already run.
+        if !self.composer_owned()
+            && let Some((_, sent)) = self.cmd_draft.take()
+            && self.composer.read(cx).value().trim() == sent
+        {
+            self.composer.update(cx, |c, cx| c.set_value("", window, cx));
+        }
         let c = self.composer.read(cx);
         let (text, cursor) = (c.value(), c.cursor());
         let out = frame_composer(
@@ -3277,20 +3287,33 @@ impl AppView {
             });
             return false;
         }
-        // `/compact`, `/workers cancel sa_3` ...: the whole text one valid
-        // invocation of an engine command (anything else is a message, as
-        // it always was). The engine runs it (the palette's Commands take
-        // this path too); its text stays until the daemon has. While a turn
-        // runs, as the TUI: not run, nothing sent.
-        if let Some((name, arg)) = crate::palette::invocation(&text) {
-            if self.model.transcript.busy() {
-                self.watch_note = Some(format!("/{name} can't run while a turn runs: halt it first (Esc, Esc), or wait").into());
-                self.model.view_dirty = true;
-            } else if self.run_command(name, arg) {
-                self.cmd_draft = Some((name.to_string(), text));
+        // `//text`: `/text`, a message (the TUI's escape), never a command.
+        let escaped = text.trim_start().strip_prefix('/').filter(|r| r.starts_with('/')).map(str::to_string);
+        let text = match escaped {
+            Some(t) => t,
+            None => {
+                // `/compact`, `/workers cancel sa_3` ...: the whole text one
+                // valid invocation of an engine command. The engine runs it
+                // (the palette's Commands take this path too; while a turn
+                // runs, neither does, as the TUI); its text stays until the
+                // daemon has.
+                if let Some((name, arg)) = crate::palette::invocation(&text) {
+                    if self.run_command(name, arg) {
+                        self.cmd_draft = Some((name.to_string(), text));
+                    }
+                    return false;
+                }
+                // A command's own words its grammar does not take (a bare
+                // `/model`, `/budget time 30`): its usage, the text kept,
+                // nothing sent. Anything else is a message, as it always was.
+                if let Some(name) = crate::palette::near_miss(&text) {
+                    self.watch_note = Some(crate::palette::usage(name).into());
+                    self.model.view_dirty = true;
+                    return false;
+                }
+                text
             }
-            return false;
-        }
+        };
         // In a worker's view, Enter steers that worker (never the session).
         if let Some(target) = self.model.watch.steer_target() {
             let handle = match target {

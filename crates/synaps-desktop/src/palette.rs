@@ -131,7 +131,7 @@ impl Entry {
 /// waits for it).
 pub(crate) const ENGINE: [(&str, bool, &str); 7] = [
     ("compact", false, "summarise the conversation so far"),
-    ("model", true, "switch model: provider/model"),
+    ("model", true, "switch model (this session): provider/model"),
     ("context", false, "what the context holds"),
     ("trace", false, "the request trace"),
     ("budget", false, "the session's budget"),
@@ -157,6 +157,38 @@ pub(crate) fn invocation(text: &str) -> Option<(&'static str, String)> {
     let (name, arg) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(n, a)| (n, a.trim()));
     let name = ENGINE.iter().find(|e| e.0 == name)?.0;
     valid(name, arg)
+}
+
+/// Not one valid invocation but a command's own words: `/model` bare or
+/// with one word (`/model sonnet`: not an id it takes), or a subcommand
+/// of the command's that its grammar does not take
+/// (`/workers cancel scout`, `/budget time 30`, `/context auto 1`). A
+/// command mistyped, never prose: the composer shows its [`usage`] and
+/// keeps the text (`/workers are stuck` is prose: a message).
+pub(crate) fn near_miss(text: &str) -> Option<&'static str> {
+    let rest = text.trim().strip_prefix('/')?;
+    let (name, arg) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(n, a)| (n, a.trim()));
+    let name = ENGINE.iter().find(|e| e.0 == name)?.0;
+    let words: &[&str] = match name {
+        "context" => &["status", "off", "auto"],
+        "trace" => &["status", "next"],
+        "budget" => &["status", "time"],
+        "workers" => &["status", "cancel", "reconcile"],
+        "confirms" => &["status", "reset"],
+        _ => &[],
+    };
+    let miss = match arg.split_whitespace().next() {
+        _ if name == "model" => arg.split_whitespace().nth(1).is_none(),
+        None => false,
+        Some(w) => words.contains(&w.to_ascii_lowercase().as_str()),
+    };
+    (miss && valid(name, arg).is_none()).then_some(name)
+}
+
+/// What a command says while a turn runs (the TUI's rule, for the
+/// composer and the palette alike): it is not run.
+pub(crate) fn mid_turn(name: &str) -> String {
+    format!("/{name} can't run while a turn runs: halt it first (Esc, Esc), or wait")
 }
 
 /// `arg` as `name`'s grammar (the daemon's, agent-engine
@@ -213,7 +245,7 @@ pub(crate) fn reply_note(name: &str, reply: &CommandReply) -> String {
     let first = |t: &str| t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string();
     match reply {
         // `/compact` answers nothing: whether it started, the log says.
-        CommandReply::Done(t) if first(t).is_empty() && name == "compact" => "/compact: asked (the log shows how it goes)".into(),
+        CommandReply::Done(t) if first(t).is_empty() && name == "compact" => "/compact: asked, see the log".into(),
         CommandReply::Done(t) if first(t).is_empty() => format!("/{name}: done"),
         // More than a line: the transcript's row has it, just above (a
         // first line is often a header: never the note's last word).
@@ -663,7 +695,7 @@ impl AppView {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let m = &self.model;
-        (m.rail_gen, m.input_gate().is_ok(), m.transcript.pending_prompts().len(), self.halt_shown()).hash(&mut h);
+        (m.rail_gen, m.input_gate().is_ok(), m.transcript.pending_prompts().len(), self.halt_shown(), m.transcript.busy()).hash(&mut h);
         (m.tabs.len(), m.tabs.active(), m.active.as_ref().map(|a| &a.session_id)).hash(&mut h);
         for r in &self.tray.rows {
             (r.id, r.live as u8, &r.step, r.watchable).hash(&mut h);
@@ -816,14 +848,19 @@ impl AppView {
             e.off = off.map(SharedString::from);
             commands.push(e);
         }
-        let gate = m.input_gate().err();
+        let (gate, busy) = (m.input_gate().err(), m.transcript.busy());
         for (i, (name, _, about)) in ENGINE.iter().enumerate() {
             let mut e = Entry::new(Group::Commands, Act::Engine(name), format!("/{name}"));
-            e.meta = (*about).into();
+            // While a turn runs, why not instead of what (as the composer:
+            // not run).
+            e.meta = if busy && gate.is_none() { "not while a turn runs".into() } else { (*about).into() };
             // Marked only where it says something: observing.
             e.key = gate.is_some().then(|| "owner".into());
             e.rank = 100 + i as u32;
-            e.off = gate.map(|why| format!("/{name} is the session owner's: {why}").into());
+            e.off = match gate {
+                Some(why) => Some(format!("/{name} is the session owner's: {why}").into()),
+                None => busy.then(|| mid_turn(name).into()),
+            };
             commands.push(e);
         }
         (goto, commands)
@@ -893,10 +930,16 @@ impl AppView {
     /// Slash command `name` with `arg`, on the composer's path and the
     /// palette's: the engine runs it (`EngineCommand`, owner-only); where
     /// this window may not drive the session, the note says so politely
-    /// and nothing is sent. Its answer comes back as the composer's note.
+    /// and nothing is sent; while a turn runs, as the TUI, it is not run
+    /// (both doors: one rule). Its answer comes back as the composer's note.
     pub(crate) fn run_command(&mut self, name: &'static str, arg: String) -> bool {
         if let Err(why) = self.model.input_gate() {
             self.watch_note = Some(format!("/{name} is the session owner's: {why}").into());
+            self.model.view_dirty = true;
+            return false;
+        }
+        if self.model.transcript.busy() {
+            self.watch_note = Some(mid_turn(name).into());
             self.model.view_dirty = true;
             return false;
         }
@@ -1228,7 +1271,7 @@ impl AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::{Act, AppAct, Entry, Group, Line, Mode, Palette, engine_of, hit, invocation, reply_note, score};
+    use super::{Act, AppAct, Entry, Group, Line, Mode, Palette, engine_of, hit, invocation, near_miss, reply_note, score};
     use synaps_client::CommandReply::{Done, NotRun, Unknown};
 
     fn e(group: Group, title: &str, rank: u32) -> Entry {
@@ -1327,7 +1370,7 @@ mod tests {
     /// transcript; no answer is unknown, not "not run".
     #[test]
     fn reply_notes_say_what_happened() {
-        assert_eq!(reply_note("compact", &Done(String::new())), "/compact: asked (the log shows how it goes)");
+        assert_eq!(reply_note("compact", &Done(String::new())), "/compact: asked, see the log");
         assert_eq!(reply_note("confirms", &Done(String::new())), "/confirms: done");
         let workers = "Workers (2):\n  sa_1  scout  running  0m\n  sa_2  wren  completed  3m";
         assert_eq!(reply_note("workers", &Done(workers.into())), "/workers: 3 lines ↓");
@@ -1339,6 +1382,40 @@ mod tests {
             reply_note("compact", &Unknown("the link dropped before the daemon answered".into())),
             "/compact: unknown — the link dropped before the daemon answered"
         );
+    }
+
+    /// Shady #20 N3: a command's own words its grammar does not take are a
+    /// command mistyped (its usage, nothing sent); prose is not.
+    #[test]
+    fn a_command_mistyped_is_not_prose() {
+        for (t, name) in [
+            ("/model", "model"),
+            ("/model sonnet", "model"),
+            ("/workers cancel scout", "workers"),
+            ("/workers status now", "workers"),
+            ("/budget time 30", "budget"),
+            ("/budget Time forever", "budget"),
+            ("/context auto 1", "context"),
+            ("/trace next please", "trace"),
+            ("/confirms reset all", "confirms"),
+        ] {
+            assert_eq!(near_miss(t), Some(name), "{t}");
+        }
+        for t in [
+            "/model is this the wrong one?",
+            "/workers are stuck",
+            "/budget is too low",
+            "/context please",
+            "/trace everything",
+            "/confirms yes",
+            "/usr/bin",
+            "/compact",
+            "/workers",
+            "/model o3",
+            "hello /model",
+        ] {
+            assert_eq!(near_miss(t), None, "{t}");
+        }
     }
 
     /// Shady #20 H2: the composer's text is a command only when the whole

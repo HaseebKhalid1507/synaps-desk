@@ -292,6 +292,9 @@ pub(crate) enum Who {
     None,
     You,
     Agent,
+    /// A slash command's answer ([`ItemKind::Output`]): synaps's words,
+    /// not the model's (the TUI's system lines), a message of its own.
+    Synaps,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,7 +423,9 @@ pub(crate) fn build(
     subs: &Subagents,
 ) -> Vec<Disp> {
     let mut out = Vec::new();
-    let mut agent = from > 0 && items[from].kind != ItemKind::User;
+    let mut agent = from > 0
+        && items[from].kind != ItemKind::User
+        && items[..from].iter().rev().find(|x| !x.is_note() || x.kind == ItemKind::Output).is_none_or(|x| x.kind != ItemKind::Output);
     let mut i = from;
     let gap = |i: usize| if i == 0 { Gap::First } else { Gap::Part };
     let day = |i: usize| if items[i].is_note() { None } else { day(i) };
@@ -504,6 +509,13 @@ pub(crate) fn build(
                 }
                 i = end;
             }
+            // A command's answer: its own label; the agent's next words
+            // are labelled again.
+            ItemKind::Output => {
+                out.push(row(Kind::Note, gap(i), Who::Synaps));
+                agent = false;
+                i += 1;
+            }
             _ => {
                 out.push(row(Kind::Note, gap(i), Who::None));
                 i += 1;
@@ -542,6 +554,12 @@ pub(crate) fn who_of(d: &Disp, p: &Palette, m: &Metrics) -> Option<(&'static str
                 _ => m.row,
             };
             Some((label::AGENT, p.agent, ((row - m.body_line) / 2.).max(0.)))
+        }
+        // Level with the well's head line (its frame, padding, one mono
+        // line: [`AppView::render_output`]).
+        Who::Synaps => {
+            let head = 2. + 2. * (4. * m.r).round() + m.mono_line;
+            Some((label::SYNAPS, p.dim, ((head - m.body_line) / 2.).max(0.)))
         }
     }
 }
@@ -2062,8 +2080,15 @@ impl AppView {
     }
 }
 
-/// A slash command's answer shown folded at more lines than this.
+/// A slash command's answer shown folded to this many lines, when that
+/// hides at least two (the `… more` line is a line itself: a 9-line
+/// answer shows whole).
 pub(crate) const OUTPUT_LINES: usize = 8;
+
+/// Whether an answer of `n` lines is shown folded.
+pub(crate) fn output_folds(n: usize) -> bool {
+    n >= OUTPUT_LINES + 2
+}
 
 impl AppView {
     /// A slash command's answer ([`ItemKind::Output`], this client's row):
@@ -2077,7 +2102,7 @@ impl AppView {
         let id = item.id;
         let (name, body) = row.text.split_once('\n').unwrap_or((&row.text, ""));
         let lines: Vec<&str> = body.lines().collect();
-        let long = lines.len() > OUTPUT_LINES;
+        let long = output_folds(lines.len());
         let open = !long || self.toggled.contains(&id);
         let shown = if open { lines.len() } else { OUTPUT_LINES };
         let toggle = |d: Stateful<Div>, cx: &Context<Self>| {
@@ -2346,6 +2371,34 @@ mod tests {
                 Kind::Prompt => "prompt",
             })
             .collect()
+    }
+
+    /// Shady #20 N4: a command's answer is synaps's words, not the
+    /// agent's: its own label, and the agent's next words labelled again.
+    #[test]
+    fn a_command_answer_is_labelled_its_own() {
+        use synaps_client::protocol::{LlmEvent, StreamEvent};
+        let mut t = transcript(&[
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "one"}]}),
+        ]);
+        t.output("budget", "Budget: none set");
+        t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { text: "two".into() }) });
+        let rows = build(t.items(), 0, false, &HashSet::new(), &Subagents::default());
+        assert_eq!(kinds(&rows), ["user", "prose", "note", "prose"]);
+        assert_eq!(rows.iter().map(|d| d.who).collect::<Vec<_>>(), [Who::You, Who::Agent, Who::Synaps, Who::Agent]);
+        // Rebuilt from the row after it: the same.
+        let from = build(t.items(), 3, false, &HashSet::new(), &Subagents::default());
+        assert_eq!(from.iter().map(|d| d.who).collect::<Vec<_>>(), [Who::Agent]);
+    }
+
+    /// Shady #20 N6: folded only when that hides two lines or more (the
+    /// `… more` line is a line itself).
+    #[test]
+    fn an_answer_folds_only_where_it_saves_lines() {
+        assert!(!super::output_folds(8));
+        assert!(!super::output_folds(9), "9 lines: whole");
+        assert!(super::output_folds(10), "8 shown, 2 more");
     }
 
     #[test]
