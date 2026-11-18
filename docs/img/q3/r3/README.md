@@ -1,5 +1,10 @@
 # Q3 Life, round 3: evidence on the merged tree
 
+> **Round 4 (`ef5f374`) changes one thing shown here:** a spawn row's tool count and its live step line no longer
+> roll; they change in place (gate 4 under a live fan-out, `docs/bench/q3/README.md` "Round 4"). The worker-row
+> rolls in these clips, and the "plural swap" and "rolls step at 30 Hz" notes about them below, describe `699f1b2`.
+> The rarer counts (`+N more`, NEEDS YOU, the rail chips) still roll as recorded here. Everything else is unchanged.
+
 Round 3 merges main `9121dba` (Q2 Authorize, #18) and answers Shady's re-review and the design re-gate of
 `4c63a0c`. Recorded on bella with `scripts/capture-linux.sh` (headless gamescope at 144 Hz, x11grab,
 `MESA_VK_WSI_DEBUG=sw`), driven by `evidence3.sh` (here).

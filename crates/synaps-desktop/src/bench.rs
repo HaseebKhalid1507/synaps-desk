@@ -288,7 +288,7 @@ fn epoch_ms(at: Instant) -> f64 {
 /// The bench script. Runs on the UI thread between frames.
 pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx: &mut App) {
     // Hard stop: never leave a window up if anything hangs.
-    let limit = if opts.motion { 330 } else { 30 };
+    let limit = if opts.motion { 400 } else { 30 };
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(limit));
         eprintln!("bench: watchdog fired at {limit} s");
@@ -1014,10 +1014,19 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // the same, and the shown session's five workers each call a
                 // tool every 1.5 s, staggered (one every 0.3 s): its tool
                 // count and step change (and roll). Then the same with the
-                // step held, only the count changing.
+                // step held, only the count changing. Then the first again
+                // under Reduced (Shady #17 R3-M1): no sweep, no spinners, the
+                // same data frames; Full minus it is what the motion costs.
                 let steps = ["reading src/relay.rs", "grep -n rotate src", "reading src/session.rs", "cargo check -p relay", "reading src/store.rs"];
                 let mut tools = [2u64; 5];
-                for (case, step_moves) in [("load_5x5_fanout_30s", true), ("load_5x5_fanout_tools_30s", false)] {
+                let cases = [
+                    ("load_5x5_fanout_30s", true, crate::motion::Level::Full),
+                    ("load_5x5_fanout_tools_30s", false, crate::motion::Level::Full),
+                    ("load_5x5_fanout_reduced_30s", true, crate::motion::Level::Reduced),
+                ];
+                for (case, step_moves, lv) in cases {
+                    level(cx, lv);
+                    sleep(1.0).await;
                     let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
                     let mut changes = 0u64;
                     while t0.elapsed() < Duration::from_secs(30) {

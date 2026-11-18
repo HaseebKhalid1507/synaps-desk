@@ -853,6 +853,10 @@ pub(crate) struct Motion {
     /// The link was lost at this instant (as of the frame, R2-L1): every
     /// clock shows its count as of then and asks for no second.
     stale: Cell<Option<Instant>>,
+    /// Tests: what painted this frame, in order (the paint-order probe,
+    /// Shady #17 R3-M2: the settle pass over the composer's border).
+    #[cfg(test)]
+    pub(crate) paint_log: RefCell<Vec<&'static str>>,
     visible: Cell<bool>,
     now: Cell<Instant>,
     frame: Cell<u64>,
@@ -991,6 +995,8 @@ pub(crate) fn sweep(fx: &Rc<Motion>, mark: Hsla, ground: Hsla) -> AnyElement {
             match tick {
                 None => fx.site(Site { origin: b.origin, mask: window.content_mask(), mark, ground, beat: Beat::Sweep(w) }),
                 Some(t) => {
+                    #[cfg(test)]
+                    fx.painted("sweep");
                     for (x, bw, level) in sweep_bands(w, t) {
                         window
                             .paint_quad(fill(Bounds::new(b.origin + point(px(x), px(0.)), size(px(bw), px(1.))), mix(ground, mark, level)));
@@ -1002,17 +1008,24 @@ pub(crate) fn sweep(fx: &Rc<Motion>, mark: Hsla, ground: Hsla) -> AnyElement {
     .size_full();
     let el = div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "sweep".into()).child(line);
     // Drawn in the app's frame (no layer), it lies on its parent's border,
-    // which GPUI paints after the children: deferred, it paints over it.
+    // which GPUI paints after the children: deferred, it paints over it
+    // (not clipped by its ancestors: none clips the composer's edge).
     if tick.is_some() { deferred(el).into_any_element() } else { el.into_any_element() }
 }
 
 /// The settle pass (polish.md P3): the composer sweep's one last pass, its
 /// head at `p` (0..1) of the edge and the comet, in `mark` on `ground`;
 /// the app's frame draws it (Handoff in's own frames).
-pub(crate) fn pass(p: f32, mark: Hsla, ground: Hsla) -> AnyElement {
+pub(crate) fn pass(fx: &Rc<Motion>, p: f32, mark: Hsla, ground: Hsla) -> AnyElement {
+    #[cfg(test)]
+    let fx = fx.clone();
+    #[cfg(not(test))]
+    let _ = fx;
     let line = canvas(
         |_, _, _| {},
         move |b, _, window, _| {
+            #[cfg(test)]
+            fx.painted("settle-pass");
             let w = f32::from(b.size.width);
             // Its head one band in at 0 (the corner lit both ways on the
             // turn's last frame, as Handoff's 24 px light is), past the end
@@ -1025,7 +1038,9 @@ pub(crate) fn pass(p: f32, mark: Hsla, ground: Hsla) -> AnyElement {
     .size_full();
     // On the composer's top border, which GPUI paints after its children:
     // deferred, the pass paints over it (the comet is the beat layer's,
-    // painted over the frame), clipped as in place.
+    // painted over the frame). Deferred, it is not clipped by its
+    // ancestors (GPUI's `deferred` draws with no content mask): none clips
+    // the composer's edge (Shady #17 R3-L1).
     deferred(div().absolute().left_0().right_0().bottom_0().h(px(1.)).debug_selector(|| "settle-pass".into()).child(line))
         .into_any_element()
 }
@@ -1086,7 +1101,9 @@ pub(crate) fn changed_cells(old: &str, new: &str) -> Option<(usize, usize)> {
 
 /// Where `old`'s changed cells end (a byte index of `old`), `new`'s
 /// ending at `b` ([`changed_cells`]): the same index when both numbers are
-/// as long (the prefix is the same), else the end of `old`'s number.
+/// as long, else the end of `old`'s number. Only after `changed_cells`
+/// returned `Some`, which proved the text before the numbers the same (this
+/// doesn't check it).
 fn old_cells_end(old: &str, new: &str, b: usize) -> Option<usize> {
     let (oa, ob) = number_in(old)?;
     let (na, nb) = number_in(new)?;
@@ -1234,6 +1251,9 @@ pub(crate) const ROLL_CALLS: u64 = 0x7AD2 << 48;
 pub(crate) const ROLL_MORE: u64 = 0x7AD3 << 48;
 pub(crate) const ROLL_NEEDS: u64 = 0x7AD4 << 48;
 pub(crate) const ROLL_RAIL: u64 = 0x7AD5 << 48;
+/// Tests: a count with a plural (`AppView::roll_probe`).
+#[cfg(test)]
+pub(crate) const ROLL_PROBE: u64 = 0x7AD6 << 48;
 
 impl Default for Motion {
     fn default() -> Self {
@@ -1264,6 +1284,8 @@ impl Motion {
             scale: Cell::new(1.),
             lively: Cell::new(true),
             stale: Cell::new(None),
+            #[cfg(test)]
+            paint_log: Default::default(),
             visible: Cell::new(true),
             now: Cell::new(epoch),
             frame: Cell::new(0),
@@ -1558,6 +1580,8 @@ impl Motion {
         self.ambient.set(level == Level::Full && !low_power);
         self.lively.set(self.ambient.get());
         self.stale.set(None);
+        #[cfg(test)]
+        self.paint_log.borrow_mut().clear();
         self.now.set(now);
         let frame = self.frame.get() + 1;
         self.frame.set(frame);
@@ -1733,6 +1757,12 @@ impl Motion {
     /// up to a refresh: read late, a clock whose next second fell inside
     /// that lateness showed it already, asked for the one after (rounded
     /// up a whole second), and the second between was never drawn.
+    /// Tests: `what` painted now ([`Self::paint_log`]).
+    #[cfg(test)]
+    pub(crate) fn painted(&self, what: &'static str) {
+        self.paint_log.borrow_mut().push(what);
+    }
+
     /// The link lost (R2-L1), the instant of the loss: the clocks hold.
     pub(crate) fn clock_now(&self) -> Instant {
         let grid = (BEAT * 8).as_nanos();
@@ -2928,8 +2958,6 @@ mod tests {
         }
     }
 
-    /// P5: only the changed digit cells of a count roll; a count that
-    /// changes length rolls whole.
     /// Shady #17 R2-M1: a roll asks for the next tick of the shared 30 Hz
     /// grid, never a display frame: a live fan-out's rolls cost at most 30
     /// app frames a second, however many, on the sweep's own ticks.
@@ -2948,6 +2976,8 @@ mod tests {
         assert_eq!(at.duration_since(t0), DECAY_TICK, "the grid's next tick");
     }
 
+    /// P5: only the changed digit cells of a count roll; a count that
+    /// changes length rolls whole.
     #[test]
     fn roll_changed_digits_only() {
         use super::changed_cells as cells;

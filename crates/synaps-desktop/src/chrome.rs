@@ -541,6 +541,11 @@ impl AppView {
                         cx.notify();
                     }))
             });
+        #[cfg(test)]
+        let ticker = ticker.when_some(self.roll_probe, |d, n| {
+            let text = format!("{n} tool{}", if n == 1 { "" } else { "s" }).into();
+            d.child(crate::motion::roll_count(&self.fx, crate::motion::ROLL_PROBE, n, text, |t| mono(t, size::META, p.dim_ch).flex_none()))
+        });
         h_flex()
             .h(px(top_h(self.layout.short)))
             .flex_none()
