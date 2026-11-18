@@ -25,6 +25,10 @@ use crate::watch::{Candidate, Watch};
 /// [`SAVED_SESSIONS_MAX`] (the wire's cap) once OLDER opens or find is used.
 pub const SAVED_RECENT: u32 = 200;
 
+/// Failed page fetches asked again (one per `Sessions` poll) on one
+/// connection.
+pub const PAGE_RETRIES: u32 = 3;
+
 /// Most events the pump applies before it yields to the UI (a frame can run
 /// between batches; a backlog never becomes one unbounded `Vec`).
 pub const MAX_BATCH: usize = 1024;
@@ -251,6 +255,9 @@ pub struct Named {
     /// attached swap writes its journal there at once, so the poll after a
     /// `/clear` would agree with it and ask nothing.
     polled: Option<HashSet<(String, String)>>,
+    /// Failed page fetches asked again on a later poll, this connection
+    /// (at most [`PAGE_RETRIES`]).
+    retries: u32,
     /// The named saved sessions (`named_only`, up to the wire's cap).
     pub saved: Vec<SavedSession>,
     /// The daemon has more named ones than that.
@@ -663,6 +670,13 @@ impl Model {
         let changed = self.named.pages && self.named.polled.as_ref().is_some_and(|p| *p != now);
         self.named.polled = Some(now);
         if changed {
+            self.named.named_stale = true;
+            self.refresh_saved(effects);
+        } else if self.named.pages && self.named.saved_failed && !self.saved_listing() && self.named.retries < PAGE_RETRIES {
+            // A failed page is now a normal reply: ask again on the next
+            // poll, a few times (a session that ended meanwhile is in
+            // neither list until then).
+            self.named.retries += 1;
             self.named.named_stale = true;
             self.refresh_saved(effects);
         }
@@ -1602,6 +1616,7 @@ impl Model {
                     self.named.pages = features.iter().any(|f| f == FEATURE_SESSION_PAGE);
                     self.named.saved_supported = self.named.pages || features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
                     self.named.polled = None;
+                    self.named.retries = 0;
                     self.named.deep = self.named.deep_wanted;
                     self.named.named_stale = true;
                     if self.named.saved_supported {
