@@ -1384,6 +1384,10 @@ pub struct AppView {
     /// The synthetic transport feeds this window (`--offline`); it answers
     /// `saved_sessions` itself, on this channel.
     pub(crate) synthetic: bool,
+    /// The bench's slow daemon (`SYNAPS_BENCH_STATES`): with no client, an
+    /// answer is taken as sent, and the scene resolves it later (evidence of
+    /// the answer pressed while it waits for the daemon).
+    pub(crate) slow_daemon: bool,
     pub(crate) synthetic_tx: Option<async_channel::Sender<Event>>,
     synthetic_seq: u64,
     /// `--session ID`: open it once the first session list lands.
@@ -2086,6 +2090,7 @@ impl AppView {
             bench: None,
             plain_rows: false,
             synthetic: false,
+            slow_daemon: false,
             synthetic_tx: None,
             synthetic_seq: 0,
             start_session: None,
@@ -3769,10 +3774,10 @@ impl AppView {
     /// answered yet). A confirm takes `y` / `n` (the daemon's own spelling);
     /// a secret its text, or nothing to cancel.
     pub(crate) fn answer(&mut self, key: (u64, u64), value: Option<String>) -> bool {
-        let Some(c) = &self.client else {
+        if self.client.is_none() && !self.slow_daemon {
             self.model.last_error = Some("offline: there is no daemon to answer".into());
             return false;
-        };
+        }
         if self.card.as_ref().map(|c| c.key) != Some(key) || self.card_target() != Some(key.1) || !self.model.may_answer(key.1) {
             return false;
         }
@@ -3787,7 +3792,11 @@ impl AppView {
             None => ("cancel", Answer::Cancelled),
         };
         let took = self.card.as_ref().map_or(Duration::ZERO, |c| c.shown.elapsed());
-        match c.answer_on(connection, key.1, value) {
+        let sent = match &self.client {
+            Some(c) => c.answer_on(connection, key.1, value),
+            None => Ok(()),
+        };
+        match sent {
             Ok(()) => {
                 log::info!(target: "synaps_desktop::card", "card {key:?}: answered {what}");
                 self.model.answer_sent(key.1);
