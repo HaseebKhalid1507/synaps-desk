@@ -1,0 +1,13 @@
+22:43:24 q3r3-bench q3r3-motion-1 load 1.02 swap_mb 9243 -> 9225 gamescopes 0
+22:45:55 main6-bench main-motion-1 load 0.91 swap_mb 9225 -> 9098 gamescopes 0
+22:49:59 q3r3-bench q3r3-motion-2 load 1.29 swap_mb 9098 -> 9075 gamescopes 0
+22:52:30 main6-bench main-motion-2 load 0.82 swap_mb 9075 -> 9070 gamescopes 0
+22:56:34 q3r3-bench q3r3-motion-3 load 1.21 swap_mb 9070 -> 8888 gamescopes 0
+22:59:05 main6-bench main-motion-3 load 3.33 swap_mb 8888 -> 8474 gamescopes 0
+22:59:32 q3r3-bench q3r3-mem-1 load 2.78 swap_mb 8474 -> 8472 gamescopes 0
+22:59:59 main6-bench main-mem-1 load 2.70 swap_mb 8472 -> 8472 gamescopes 0
+23:00:26 q3r3-bench q3r3-mem-2 load 2.68 swap_mb 8472 -> 8471 gamescopes 0
+23:00:53 main6-bench main-mem-2 load 2.55 swap_mb 8471 -> 8471 gamescopes 0
+23:01:20 q3r3-bench q3r3-mem-3 load 1.85 swap_mb 8471 -> 8467 gamescopes 0
+23:01:47 main6-bench main-mem-3 load 1.53 swap_mb 8467 -> 8466 gamescopes 0
+BENCH6-DONE
