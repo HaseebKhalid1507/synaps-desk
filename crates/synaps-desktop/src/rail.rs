@@ -2017,6 +2017,38 @@ mod tests {
         assert!(deep_after(&mut m, 3, &rows), "OLDER open: the cap");
     }
 
+    /// Review F4: a failed page is asked again on the next poll, at most
+    /// three times a connection; a reconnect starts the count again.
+    #[test]
+    fn a_failed_page_is_retried_on_later_polls_three_times() {
+        use crate::model::Effect;
+        let first = || vec![Effect::CatalogPage { before: None, limit: 200, named_only: false }];
+        let a = json!([{"id": "a", "journal_id": "ja", "lifecycle": "live"}]);
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        m.page_sent(1);
+        m.apply(Event::Sessions(metas(a.clone())));
+        let mut req = 1;
+        let fail = |m: &mut Model, req: u64| {
+            m.apply(Event::CatalogPageFailed { req, reason: "busy".into() });
+            assert!(m.named.saved_failed);
+        };
+        for k in 0..3 {
+            fail(&mut m, req);
+            assert_eq!(m.apply(Event::Sessions(metas(a.clone()))), first(), "retry {k}");
+            req += 1;
+            m.page_sent(req);
+        }
+        fail(&mut m, req);
+        assert!(m.apply(Event::Sessions(metas(a.clone()))).is_empty(), "three a connection");
+        m.apply(Event::Status(Status::Reconnecting { why: "x".into() }));
+        assert_eq!(m.apply(connected(&["session_page"])), first());
+        m.page_sent(10);
+        m.apply(Event::Sessions(metas(a.clone())));
+        fail(&mut m, 10);
+        assert_eq!(m.apply(Event::Sessions(metas(a))), first(), "counted again after a reconnect");
+    }
+
     /// A page reply after a reconnect, to a `req` asked on the old
     /// connection, is dropped: only the page asked since lands.
     #[test]
