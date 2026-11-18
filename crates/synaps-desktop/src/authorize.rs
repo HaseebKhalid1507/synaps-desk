@@ -82,6 +82,9 @@ pub(crate) struct PromptCard {
     /// A secret prompt's.
     pub(crate) secret: bool,
     pub(crate) arm: Arm,
+    /// When this window first showed it: the receipt's "how long you
+    /// took" counts from here (the arm restarts on a toggle or a return).
+    pub(crate) shown: Instant,
     /// The prompt as it came (its title, its kind, its scope): what the
     /// card says while it collapses after the model has dropped it.
     pub(crate) pr: PromptRequest,
@@ -150,6 +153,7 @@ impl PromptCard {
             row: PROMPT_ID | ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             secret,
             arm: Arm::new(now),
+            shown: now,
             body: crate::app::well_body(&pr.prompt),
             gist: crate::chrome::prompt_gist(&pr.title, &pr.prompt).into(),
             guard: guard_shape(pr),
