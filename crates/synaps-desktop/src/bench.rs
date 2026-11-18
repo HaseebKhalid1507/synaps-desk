@@ -986,6 +986,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     json!(view.update(cx, |v, _| v.model.stats.subagents.running_count()).unwrap_or(0));
                 out["load_5x5_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
                 out["load_5x5_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                // Gate 5's sample after the 5 × 5, where main's run ends
+                // (its `mem_end`): the cases after it are Q3's own.
+                out["mem_after_load_5x5"] = mem::sample();
                 // Q3 (polish.md §6 gate 4, the worst case): the same, and the
                 // shown session's turn runs: the composer sweeps (the one
                 // sweep left, P2) over the 25 spinners. Gate 3's prompt is
