@@ -1788,6 +1788,9 @@ fn the_answered_card_collapses_in_its_row(cx: &mut TestAppContext) {
     assert!(bounds(cx, "card-exit").is_none() && bounds(cx, "card").is_none());
     assert!(view.read_with(cx, |v, _| v.disp.iter().all(|d| d.kind != crate::turns::Kind::Prompt)), "its row is gone");
     assert!(bounds(cx, &format!("receipt {row}")).is_some(), "the receipt stays");
+    // Landed, the column still holds: the room waits at the end (until
+    // rows that come use it), never a slide after the fold.
+    assert_eq!(bounds(cx, &format!("tool-row {call}")), Some(call_row), "its call's row holds after the fold");
 }
 
 /// Cards D (cards4/proposal.md §8 #9, build step 10): Allow by its key
@@ -3338,6 +3341,86 @@ fn a_failed_glyph_is_never_blank(cx: &mut TestAppContext) {
         assert!(changing > 10, "{turn}: it changed while watched ({changing} frames)");
         assert!(has(cx, "life-Failed"), "{turn}: the cross at rest");
     }
+}
+
+/// The finish gate of #23 (states-full f542): a streaming call that fails
+/// holds its body open, and its height glides from the streamed lines to
+/// the failure's, never a jump that moves the column in one frame.
+#[gpui_kit::test]
+fn a_failed_body_glides_to_its_output(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    running_tools(cx, &view, 1);
+    let send = |cx: &mut TestAppContext, e: LlmEvent| {
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(e) });
+            v.sync_list();
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let lines: String = (0..8).map(|k| format!("test t{k} ... ok\n")).collect();
+    send(cx, LlmEvent::ToolResultDelta { tool_id: "ui-run-0".into(), delta: lines });
+    wait(cx, w, &view, 1500);
+    let id = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| i.id)).expect("the call");
+    let b = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel));
+    let before = b(cx, format!("well {id}")).expect("streaming: open").size.height;
+    send(cx, LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "Tool execution failed: Command failed (exit 1):\nboom".into() });
+    let mut heights = Vec::new();
+    for _ in 0..60 {
+        fluid_frame(cx, w, &view);
+        heights.push(b(cx, format!("reveal {id}")).map(|r| f32::from(r.size.height)));
+    }
+    let after = b(cx, format!("well {id}")).expect("failed: still open").size.height;
+    assert!(after < before, "the failure's output is shorter: {after:?} < {before:?}");
+    let h: Vec<f32> = heights.into_iter().flatten().collect();
+    assert!(h.len() > 5, "it glided over frames: {h:?}");
+    let step = h.windows(2).map(|p| (p[0] - p[1]).abs()).fold(0f32, f32::max);
+    assert!(step < f32::from(before - after) * 0.6, "no one-frame jump: {h:?}");
+}
+
+/// Finish gate #6 (live-full-allow f2841): a call drawn running never
+/// steps back to "Queued" when its queued status comes again.
+#[gpui_kit::test]
+fn a_started_call_never_reads_queued_again(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    let id = || "ui-run-0".to_string();
+    let apply = |cx: &mut TestAppContext, evs: Vec<LlmEvent>| {
+        view.update(cx, |v, cx| {
+            for e in evs {
+                v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(e) });
+            }
+            v.sync_list();
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        fluid_frame(cx, w, &view);
+    };
+    let has = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel).is_some();
+    apply(
+        cx,
+        vec![
+            LlmEvent::ResponseStart,
+            LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id() },
+            LlmEvent::ToolUse { tool_name: "bash".into(), tool_id: id(), input: serde_json::json!({"command": "cargo build"}) },
+            LlmEvent::ToolQueued { tool_id: id() },
+        ],
+    );
+    assert!(has(cx, "life-Queued"), "queued before it starts");
+    apply(cx, vec![LlmEvent::ToolStarted { tool_id: id() }]);
+    wait(cx, w, &view, 400);
+    assert!(has(cx, "life-Run") && !has(cx, "life-Queued"), "running");
+    apply(cx, vec![LlmEvent::ToolQueued { tool_id: id() }]);
+    assert!(has(cx, "life-Run") && !has(cx, "life-Queued"), "never Queued again (no turn either)");
+    wait(cx, w, &view, 400);
+    assert!(has(cx, "life-Run") && !has(cx, "life-Queued"), "never Queued again");
 }
 
 /// Shady #17 M1 (motion.md §5.3): the link lost mid-turn, the window is

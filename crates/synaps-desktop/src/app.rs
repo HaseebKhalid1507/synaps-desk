@@ -874,6 +874,15 @@ pub(crate) fn session_items(f: MenuFor) -> Vec<crate::menu::Item<SessionAct>> {
 /// The close-tab key as the session menu shows it.
 const CLOSE_KEY: &str = if cfg!(target_os = "macos") { "⌘W" } else { "Ctrl+W" };
 
+/// The room a folded card gave up ([`AppView::fold_slack`]): how much it
+/// gave, the list's content without it when it landed, and what was drawn.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Slack {
+    given: f32,
+    base: f32,
+    last: f32,
+}
+
 /// The composer foot's parts (design.md §8.11), as the room allows: what
 /// drops first when the row is short of width. The glyph, MAIN, HALT and
 /// the primary button never drop.
@@ -1544,9 +1553,10 @@ pub struct AppView {
     /// The answered card collapsing in its row ([`CardExit`]).
     pub(crate) card_exit: Option<CardExit>,
     /// The room a folded card gave up, kept at the list's end as it folded
-    /// (the answered row holds still) and let go on `sheet` after it landed:
-    /// how much, and since when ([`AppView::tail_slack`]).
-    pub(crate) fold_slack: Cell<Option<(f32, Instant)>>,
+    /// (the answered row holds still) and after it landed, until rows that
+    /// grow in under it use it up or the list leaves its end
+    /// ([`AppView::tail_slack`]).
+    pub(crate) fold_slack: Cell<Option<Slack>>,
     /// Answered prompts' receipts, by session ([`crate::authorize::Receipt`]).
     pub(crate) receipts: HashMap<String, Vec<crate::authorize::Receipt>>,
     /// The answer this window sent to the card, until its prompt resolves.
@@ -3673,18 +3683,30 @@ impl AppView {
             self.fold_slack.set(None);
             return 0.;
         }
-        let now = self.fx.now();
         if let Some(e) = &self.card_exit {
-            return e.given(now);
+            return e.given(self.fx.now());
         }
-        let Some((from, at)) = self.fold_slack.get() else { return 0. };
-        let s = from * crate::motion::Spring::from_rest(1., crate::motion::SHEET_RESPONSE, now.saturating_duration_since(at).as_secs_f32());
-        if s < 0.5 {
+        let Some(mut s) = self.fold_slack.get() else { return 0. };
+        // Left the end (a scroll): it goes, out of sight (the list holds
+        // its top there).
+        if self.list.is_scrolled_to_end() == Some(false) {
             self.fold_slack.set(None);
             return 0.;
         }
-        self.fx.want_frame();
-        s
+        // Rows that grew in under it since it landed take its room: the
+        // column holds still until it is used up (the finish gate of #23,
+        // item 7: never a slide after the fold).
+        let over = f32::from(self.list.max_offset_for_scrollbar().y);
+        if over > 0. {
+            let content = over + f32::from(self.list.viewport_bounds().size.height) - s.last;
+            s.last = (s.given - (content - s.base).max(0.)).clamp(0., s.given);
+        }
+        if s.last < 0.5 {
+            self.fold_slack.set(None);
+            return 0.;
+        }
+        self.fold_slack.set(Some(s));
+        s.last
     }
 
     /// Row `ix` as it arrives or grows (fluid.md §3.3, §3.4): a row that
@@ -4127,7 +4149,11 @@ impl AppView {
             if landed || !here || other || !self.fx.fluid() || self.model.watch.focus().is_some() {
                 // Landed in place: the room it gave up goes on `sheet`.
                 let keep = landed && here && !other && self.fx.fluid();
-                self.fold_slack.set(keep.then(|| (e.given(fx_now), fx_now)).filter(|s| s.0 >= 0.5));
+                // What the list holds now, without it (its last layout drew
+                // the room at the fold's end).
+                let given = e.given(fx_now);
+                let content = f32::from(self.list.max_offset_for_scrollbar().y) + f32::from(self.list.viewport_bounds().size.height);
+                self.fold_slack.set((keep && given >= 0.5).then_some(Slack { given, base: content - given, last: given }));
                 self.card_exit = None;
             }
         }
@@ -4523,6 +4549,7 @@ impl AppView {
                         self.took.borrow_mut().clear();
                         self.ran.borrow_mut().clear();
                     }
+                    self.fold_slack.set(None);
                 }
                 sp.start
             }
@@ -6261,13 +6288,15 @@ impl Render for AppView {
         // No top padding: the sticky labels read rows' bounds, which leave
         // it out (`crate::sticky`).
         let (pad_t, pad_b) = (0., list_pad_b(&m));
+        // Read here: the list's own state is borrowed while it lays out.
+        let slack = self.tail_slack();
         let list = list(
             self.list.clone(),
-            cx.processor(|this, ix, _window, cx| {
+            cx.processor(move |this, ix, _window, cx| {
                 let row = this.render_disp(ix, cx);
                 let el = this.arrive(ix, row);
                 // The room an answered card gave up, under the last row.
-                match Some(this.tail_slack()).filter(|s| *s > 0. && ix + 1 == this.disp.len()) {
+                match Some(slack).filter(|s| *s > 0. && ix + 1 == this.disp.len()) {
                     Some(s) => div().w_full().child(el).child(div().h(px(s)).debug_selector(|| "fold-slack".into())).into_any_element(),
                     None => el,
                 }

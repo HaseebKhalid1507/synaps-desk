@@ -1990,7 +1990,7 @@ impl AppView {
         // folds as the call succeeds (@ +180, #5).
         let finished_now = change.is_some_and(|c| c.0 >= fx.now() && glyph::Life::was_live(c.1));
         let delay = if !open && finished_now { Duration::from_millis(180) } else { Duration::ZERO };
-        let (reveal, sink) = if has_body { fx.reveal(id, open, delay) } else { (None, Default::default()) };
+        let (reveal, sink) = if has_body { fx.reveal(id, open, delay, life.code()) } else { (None, Default::default()) };
         // Output streaming in (§8 #4): each new line grows and lifts.
         let streamed = if (open || reveal.is_some()) && !think && row.preview.is_none() && row.card.numbered.is_none() {
             fx.streamed(id, row.result.lines().count())
