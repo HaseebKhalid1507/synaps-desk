@@ -139,13 +139,15 @@ impl Glyph {
         match self {
             // The braille family (polish.md P1): each still frame's lit
             // dots (the unlit ones are drawn on their ground, [`spin`]).
-            Glyph::Run => &[Fill(2., 1., 2., 2.), Fill(6., 1., 2., 2.), Fill(6., 4., 2., 2.), Fill(6., 7., 2., 2.)],
-            Glyph::Workers => &[Fill(2., 1., 2., 2.), Fill(6., 7., 2., 2.)],
+            // The lattice's running still pose's lit face (indicators/proposal.md §6).
+            Glyph::Run => &[Fill(4., 1., 2., 2.), Fill(7., 1., 2., 2.), Fill(7., 4., 2., 2.)],
+            Glyph::Workers => &[Fill(4., 1., 2., 2.), Fill(7., 1., 2., 2.), Fill(7., 4., 2., 2.)],
             Glyph::Needs => &[Frame(0., 0., 10., 10.), Fill(3., 3., 4., 4.)],
             Glyph::Unread => &[Fill(3., 3., 4., 4.)],
             Glyph::Idle => &[Frame(1., 1., 8., 8.)],
             Glyph::Parked => &[Fill(1., 7., 8., 2.)],
-            Glyph::Opening => &[Fill(2., 1., 2., 2.)],
+            // The reconnect chase's still head.
+            Glyph::Opening => &[Fill(1., 1., 2., 2.)],
             Glyph::Locked => &[Frame(1., 1., 8., 8.), Fill(1., 4., 8., 2.)],
             Glyph::Gone => &[Fill(0., 0., 2., 2.), Fill(8., 0., 2., 2.), Fill(0., 8., 2., 2.), Fill(8., 8., 2., 2.)],
             Glyph::Cancelling => &[Fill(2., 1., 2., 8.), Fill(6., 1., 2., 8.)],
@@ -333,96 +335,28 @@ pub(crate) fn draw_at(g: Glyph, p: f32, color: Hsla) -> AnyElement {
     el.into_any_element()
 }
 
-/// The TUI's running mark (agent-tui `app.rs:399` `SPINNER_FRAMES`):
-/// a 3–4 dot snake round the six top dots of a braille cell.
-pub(crate) const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-/// Braille dots 1–6 in the 10 box (polish.md P1): columns at x 2 (dots
-/// 1 2 3) and 6 (4 5 6), rows at y 1, 4 and 7; each a 2 px square.
-pub(crate) const DOTS: [(f32, f32); 6] = [(2., 1.), (2., 4.), (2., 7.), (6., 1.), (6., 4.), (6., 7.)];
-pub(crate) const DOT: f32 = 2.;
-
-/// An unlit dot: `UNLIT` of the way from the ground to the mark, so the
-/// 2×3 silhouette always reads as one glyph, by shape.
-pub(crate) const UNLIT: f32 = 0.2;
-
-/// A braille character's dots 1–6 (bit n−1: dot n), as Unicode numbers them.
-pub(crate) const fn dots_of(c: char) -> u8 {
-    ((c as u32 - 0x2800) & 0x3f) as u8
-}
-
-/// The running snake, one frame a beat: [`SPINNER_FRAMES`] decoded.
-pub(crate) const RUN_FRAMES: [u8; 10] = {
-    let mut out = [0; 10];
-    let mut i = 0;
-    while i < 10 {
-        out[i] = dots_of(SPINNER_FRAMES[i]);
-        i += 1;
-    }
-    out
-};
-
-/// Workers running in an idle session: two opposite dots, {1,6} → {4,3} →
-/// {5,2}, one step every two beats.
-pub(crate) const WORKERS_FRAMES: [u8; 3] = [0b10_0001, 0b00_1100, 0b01_0010];
-
-/// Opening: one dot round the ring (1 → 4 → 5 → 6 → 3 → 2), one step
-/// every two beats: a dial.
-pub(crate) const OPENING_FRAMES: [u8; 6] = [0b00_0001, 0b00_1000, 0b01_0000, 0b10_0000, 0b00_0100, 0b00_0010];
-
-/// The still frame (Reduced, Off, low power, history): `Run` ⠹ (dots
-/// 1 4 5 6); `Workers` and `Opening` their first frames (two dots, one).
-pub(crate) const STILL: u8 = dots_of('⠹');
-
 impl Glyph {
-    /// One of the braille family (polish.md P1).
+    /// One of the live family (was the braille's, polish.md P1; now the
+    /// lattice's, indicators/proposal.md §6).
     pub(crate) fn spins(self) -> bool {
         matches!(self, Glyph::Run | Glyph::Workers | Glyph::Opening)
     }
+}
 
-    /// Beats a frame of its spin lasts: the snake 1, the two heads and the
-    /// dial 2.
-    pub(crate) fn spin_every(self) -> u32 {
-        if self == Glyph::Run { 1 } else { 2 }
+/// A live glyph's lattice pattern (indicators/proposal.md §8): `Run` and
+/// `Workers` run; `Opening` is on its way, the reconnect chase.
+pub(crate) fn live_pat(g: Glyph) -> crate::lattice::Pat {
+    match g {
+        Glyph::Opening => crate::lattice::Pat::Reconnect,
+        _ => crate::lattice::Pat::Run,
     }
 }
 
-/// A braille glyph's lit dots at `beat` (phase-locked app-wide: every
-/// running thing spins in step); `None`: its still frame.
-pub(crate) fn spin_dots(g: Glyph, beat: Option<u32>) -> u8 {
-    match (g, beat) {
-        (Glyph::Run, Some(b)) => RUN_FRAMES[(b % 10) as usize],
-        (Glyph::Run, None) => STILL,
-        (Glyph::Workers, b) => WORKERS_FRAMES[(b.unwrap_or(0) / 2 % 3) as usize],
-        (_, b) => OPENING_FRAMES[(b.unwrap_or(0) / 2 % 6) as usize],
-    }
-}
-
-/// Paints a braille frame (`dots` lit) in the box at `origin`: six quads,
-/// origins and sizes on device pixels (a 2 px dot stays one solid square at
-/// 1.25× or 1.5×). The app's frame and the beat layer paint the same.
-pub(crate) fn paint_dots(window: &mut Window, origin: Point<Pixels>, dots: u8, mark: Hsla, ground: Hsla) {
-    let s = window.scale_factor();
-    let snap = |v: f32| (v * s).round() / s;
-    let d = snap(DOT).max(1. / s);
-    let unlit = crate::motion::mix(ground, mark, UNLIT);
-    let (ox, oy) = (f32::from(origin.x), f32::from(origin.y));
-    for (i, &(x, y)) in DOTS.iter().enumerate() {
-        let c = if dots & (1 << i) != 0 { mark } else { unlit };
-        window.paint_quad(fill(Bounds::new(point(px(snap(ox + x)), px(snap(oy + y))), size(px(d), px(d))), c));
-    }
-}
-
-/// A braille glyph (polish.md P1) at `beat` (`None`: still), in `mark`
-/// on `ground`: its six dots, painted on device pixels.
+/// A live glyph's 10 px lattice at `beat` (phase-locked app-wide: every
+/// running thing steps together); `None`: its still pose.
 pub(crate) fn spin(g: Glyph, beat: Option<u32>, mark: Hsla, ground: Hsla) -> Div {
-    let dots = spin_dots(g, beat);
-    div()
-        .relative()
-        .flex_none()
-        .size(px(10.))
-        .debug_selector(move || format!("spin-{dots:02x}"))
-        .child(canvas(|_, _, _| {}, move |b, _, window, _| paint_dots(window, b.origin, dots, mark, ground)).absolute().inset_0())
+    let pose = crate::lattice::pose(live_pat(g), beat);
+    crate::lattice::el(10., crate::lattice::Dots::of(pose), crate::lattice::code(pose), mark, ground)
 }
 
 /// `Needs`' inner cell in its box: x, y, side.
@@ -465,7 +399,10 @@ pub(crate) fn on_beat(beat: crate::motion::Beat, mark: Hsla, ground: Hsla, fx: &
     let el = match beat {
         crate::motion::Beat::Spin(g) => spin(g, None, mark, ground),
         crate::motion::Beat::Breath(_) => breath_box(mark, mark),
-        crate::motion::Beat::Orbit => div(),
+        crate::motion::Beat::Lattice(pat) => {
+            let pose = crate::lattice::pose(pat, None);
+            crate::lattice::el(LIFE, crate::lattice::Dots::of(pose), crate::lattice::code(pose), mark, ground)
+        }
     };
     let fx = fx.clone();
     el.child(
@@ -724,7 +661,7 @@ pub(crate) fn spinning(fx: &std::rc::Rc<crate::motion::Motion>, g: Glyph, mark: 
     if fx.layered() {
         return on_beat(crate::motion::Beat::Spin(g), mark, ground, fx);
     }
-    spin(g, fx.beat(g.spin_every()), mark, ground).into_any_element()
+    spin(g, fx.lattice_beat(live_pat(g)), mark, ground).into_any_element()
 }
 
 impl Ground {
@@ -852,9 +789,9 @@ pub(crate) fn tally_bar<'a, T>(tally: &'a [T], n: impl Fn(&T) -> usize + 'a, h: 
 pub(crate) enum Life {
     /// A dotted ring, `dim`.
     Queued,
-    /// The orbit: an arc lapping a faint ring, `acc` ([`orbit`]).
-    Orbit,
-    /// Not attached: as last seen, the arc held still in `dim`.
+    /// Running: the lattice's running face, `acc` ([`crate::lattice`]).
+    Run,
+    /// Not attached: as last seen, the running still pose in `dim`.
     Seen,
     /// A tick, `dim` (lit `ok` as it lands live).
     Done,
@@ -868,11 +805,13 @@ pub(crate) enum Life {
     Denied,
     /// A dash on a 45 % `dim` ring.
     Cancelled,
+    /// Running, its output being written: the lattice's streaming pose.
+    Stream,
 }
 
 impl Life {
-    pub(crate) const ALL: [Life; 9] =
-        [Life::Queued, Life::Orbit, Life::Seen, Life::Done, Life::Failed, Life::Limit, Life::Wait, Life::Denied, Life::Cancelled];
+    pub(crate) const ALL: [Life; 10] =
+        [Life::Queued, Life::Run, Life::Seen, Life::Done, Life::Failed, Life::Limit, Life::Wait, Life::Denied, Life::Cancelled, Life::Stream];
 
     /// Its index: what [`crate::motion::Motion::change`] remembers.
     pub(crate) fn code(self) -> u64 {
@@ -883,6 +822,29 @@ impl Life {
         Life::ALL.get(c as usize).copied()
     }
 
+    /// Running or streaming: work going on.
+    pub(crate) fn live(self) -> bool {
+        matches!(self, Life::Run | Life::Stream)
+    }
+
+    /// A code that was [`Life::live`].
+    pub(crate) fn was_live(code: u64) -> bool {
+        Life::of_code(code).is_some_and(Life::live)
+    }
+
+    /// Its lattice pattern (the live and waiting states), or none (it
+    /// lands on a stroked mark).
+    pub(crate) fn pat(self) -> Option<crate::lattice::Pat> {
+        use crate::lattice::Pat;
+        Some(match self {
+            Life::Queued => Pat::Queued,
+            Life::Run | Life::Seen => Pat::Run,
+            Life::Stream => Pat::Stream,
+            Life::Wait => Pat::Needs,
+            _ => return None,
+        })
+    }
+
     /// Its mark's strokes (the part that writes on), and its ring.
     fn mark(self) -> Option<Mark> {
         Some(match self {
@@ -891,7 +853,7 @@ impl Life {
             Life::Denied => Mark::Slash,
             Life::Limit | Life::Cancelled => Mark::Dash,
             Life::Wait => Mark::Dot,
-            Life::Queued | Life::Orbit | Life::Seen => return None,
+            Life::Queued | Life::Run | Life::Seen | Life::Stream => return None,
         })
     }
 }
@@ -937,20 +899,21 @@ impl Mark {
     }
 }
 
-/// The sprite paths, built once: `life/ring.svg`, `life/dots.svg`, the
-/// arc at each whole percent of the turn (`life/arc~N.svg`, 1..=100), each
-/// mark at each cut (`life/tick~k.svg`, `k` 1..=CUTS), and the ping's ring
-/// at each half pixel of its radius (`life/ping~R.svg`, `R` 12..=22, in a
-/// 24 px box).
+/// The sprite paths, built once: `life/ring.svg`, each mark at each cut
+/// (`life/tick~k.svg`, `k` 1..=[`LIFE_CUTS`]), and the ping's ring at each
+/// half pixel of its radius (`life/ping~R.svg`, `R` 12..=22, in a 24 px
+/// box). The running state is the lattice's quads (no arc sprites).
 struct LifePaths {
-    arcs: Vec<SharedString>,
     marks: Vec<Vec<SharedString>>,
     pings: Vec<SharedString>,
 }
 
+/// A life mark's write-on in cuts (indicators/proposal.md §6, the
+/// write-on fix): 12 over `base` is one cut a frame at 60 Hz.
+pub(crate) const LIFE_CUTS: u32 = 12;
+
 static LIFE_PATHS: std::sync::LazyLock<LifePaths> = std::sync::LazyLock::new(|| LifePaths {
-    arcs: (1..=100).map(|n| SharedString::from(format!("life/arc~{n}.svg"))).collect(),
-    marks: Mark::ALL.iter().map(|m| (1..=CUTS).map(|k| SharedString::from(format!("{}~{k}.svg", m.stem()))).collect()).collect(),
+    marks: Mark::ALL.iter().map(|m| (1..=LIFE_CUTS).map(|k| SharedString::from(format!("{}~{k}.svg", m.stem()))).collect()).collect(),
     pings: (PING_FROM..=PING_TO).map(|r| SharedString::from(format!("life/ping~{r}.svg"))).collect(),
 });
 
@@ -960,17 +923,10 @@ const PING_TO: u32 = 22;
 const PING_BOX: f32 = 24.;
 
 const RING: &str = "life/ring.svg";
-const DOTTED: &str = "life/dots.svg";
-
-/// The arc `len` (turns) long: its sprite, at a whole percent (none under 1 %).
-fn arc_path(len: f32) -> Option<SharedString> {
-    let n = (len * 100.).round().clamp(0., 100.) as usize;
-    (n > 0).then(|| LIFE_PATHS.arcs[n - 1].clone())
-}
 
 fn mark_path(m: Mark, k: u32) -> Option<SharedString> {
     let i = Mark::ALL.iter().position(|x| *x == m)?;
-    (k > 0).then(|| LIFE_PATHS.marks[i][(k.min(CUTS) - 1) as usize].clone())
+    (k > 0).then(|| LIFE_PATHS.marks[i][(k.min(LIFE_CUTS) - 1) as usize].clone())
 }
 
 /// A life sprite's SVG, written from the table above.
@@ -981,28 +937,10 @@ fn life_svg(path: &str) -> Option<String> {
     let c = LIFE / 2.;
     let body = match path {
         RING => format!(r##"<circle cx="{c}" cy="{c}" r="{LIFE_R}" fill="none" stroke="#000" stroke-width="{w}"/>"##),
-        DOTTED => format!(
-            r##"<circle cx="{c}" cy="{c}" r="{LIFE_R}" fill="none" stroke="#000" stroke-width="{w}" stroke-dasharray="1.4 1.74"/>"##
-        ),
         _ => {
             let (stem, k) = path.strip_suffix(".svg")?.rsplit_once('~')?;
             let k: u32 = k.parse().ok()?;
             match stem {
-                "life/arc" if (1..=100).contains(&k) => {
-                    if k == 100 {
-                        format!(r##"<circle cx="{c}" cy="{c}" r="{LIFE_R}" fill="none" stroke="#000" stroke-width="{w}"/>"##)
-                    } else {
-                        let a = k as f32 / 100. * std::f32::consts::TAU;
-                        let (x, y) = (c + LIFE_R * a.sin(), c - LIFE_R * a.cos());
-                        let large = u8::from(k > 50);
-                        format!(
-                            r##"<path d="M{c} {} A{LIFE_R} {LIFE_R} 0 {large} 1 {:.3} {:.3}" fill="none" stroke="#000" stroke-width="{w}" stroke-linecap="round"/>"##,
-                            c - LIFE_R,
-                            x,
-                            y
-                        )
-                    }
-                }
                 "life/ping" if (PING_FROM..=PING_TO).contains(&k) => {
                     let c = PING_BOX / 2.;
                     return Some(format!(
@@ -1013,11 +951,11 @@ fn life_svg(path: &str) -> Option<String> {
                 }
                 _ => {
                     let m = Mark::ALL.into_iter().find(|m| m.stem() == stem)?;
-                    if !(1..=CUTS).contains(&k) {
+                    if !(1..=LIFE_CUTS).contains(&k) {
                         return None;
                     }
                     if m == Mark::Dot {
-                        format!(r##"<circle cx="{c}" cy="{c}" r="{}" fill="#000"/>"##, 2.5 * k as f32 / CUTS as f32)
+                        format!(r##"<circle cx="{c}" cy="{c}" r="{}" fill="#000"/>"##, 2.5 * k as f32 / LIFE_CUTS as f32)
                     } else {
                         format!(
                             r##"<path d="{}" fill="none" stroke="#000" stroke-width="{w}" stroke-linecap="round" stroke-linejoin="round"/>"##,
@@ -1031,11 +969,11 @@ fn life_svg(path: &str) -> Option<String> {
     Some(format!("{}{body}</svg>", head(s)))
 }
 
-/// Polylines drawn to `k / CUTS` of their whole length, in order: an SVG path.
+/// Polylines drawn to `k / LIFE_CUTS` of their whole length, in order: an SVG path.
 fn cut_lines(lines: &[&[(f32, f32)]], k: u32) -> String {
     let seg = |a: (f32, f32), b: (f32, f32)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
     let total: f32 = lines.iter().map(|pts| pts.windows(2).map(|w| seg(w[0], w[1])).sum::<f32>()).sum();
-    let mut left = total * k.min(CUTS) as f32 / CUTS as f32;
+    let mut left = total * k.min(LIFE_CUTS) as f32 / LIFE_CUTS as f32;
     let mut d = String::new();
     for pts in lines {
         if left <= 1e-4 {
@@ -1064,11 +1002,12 @@ fn sprite16(path: impl Into<SharedString>, color: Hsla) -> Svg {
 }
 
 /// What a life glyph is painted in (§4), on `ground` (the row's fill):
-/// its ring (none for queued, done and the orbit's own track) and its mark.
+/// its ring (the marks'), its mark (a lattice's dots), and the ground.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LifeInk {
     pub(crate) ring: Option<Hsla>,
     pub(crate) mark: Hsla,
+    pub(crate) ground: Hsla,
 }
 
 /// A life glyph's colours (§4): `dim`, `err` and `acc` on the card's ground.
@@ -1076,98 +1015,52 @@ pub(crate) fn life_ink(l: Life, ground: Hsla, p: &Palette) -> LifeInk {
     use crate::motion::mix;
     let (ring, mark) = match l {
         Life::Queued | Life::Seen => (None, p.dim_t),
-        Life::Orbit => (Some(mix(ground, p.dim_t, 0.28)), p.acc),
+        Life::Run | Life::Stream | Life::Wait => (None, p.acc),
         Life::Done => (None, p.dim_t),
         Life::Failed => (Some(mix(ground, p.err, 0.35)), p.err),
         Life::Limit => (Some(p.dim_t), p.dim_t),
-        Life::Wait => (Some(mix(ground, p.acc, 0.55)), p.acc),
         Life::Denied => (Some(p.err), p.err),
         Life::Cancelled => (Some(mix(ground, p.dim_t, 0.45)), p.dim_t),
     };
-    LifeInk { ring, mark }
+    LifeInk { ring, mark, ground }
 }
 
-/// A life glyph at rest (§4): its ring and its whole mark, or the dotted
-/// ring, or the arc held still ([`crate::motion::ORBIT_STILL`]).
+/// A life glyph at rest (§4): a pattern's still pose, or its ring and its
+/// whole mark.
 pub(crate) fn life(l: Life, ink: LifeInk) -> Div {
     life_at(l, ink, 1., 1.)
 }
 
 /// A life glyph with its ring at `ring` (0..1 of its colour, from the
 /// ground: the caller mixes) and its mark drawn to `p` (the write-on: 0..1
-/// of its strokes; the dot grows).
+/// of its strokes, cut at ⌊p · [`LIFE_CUTS`]⌋, indicators/proposal.md §6;
+/// the dot grows). A pattern: its still pose.
 pub(crate) fn life_at(l: Life, ink: LifeInk, ring: f32, p: f32) -> Div {
     let el = div().relative().flex_none().size(px(LIFE)).debug_selector(move || format!("life-{l:?}"));
-    match l {
-        Life::Queued => el.child(sprite16(DOTTED, ink.mark)),
-        Life::Orbit | Life::Seen => {
-            el.children(ink.ring.map(|c| sprite16(RING, c))).children(arc_path(crate::motion::ORBIT_STILL).map(|a| sprite16(a, ink.mark)))
+    match l.pat() {
+        Some(pat) => {
+            let pose = crate::lattice::pose(pat, None);
+            el.child(crate::lattice::el(LIFE, crate::lattice::Dots::of(pose), crate::lattice::code(pose), ink.mark, ink.ground))
         }
-        _ => {
-            let k = ((p * CUTS as f32).ceil() as u32).min(CUTS);
+        None => {
+            let k = ((p * LIFE_CUTS as f32).floor() as u32).min(LIFE_CUTS);
             el.children(ink.ring.filter(|_| ring > 0.).map(|c| sprite16(RING, c)))
                 .children(l.mark().and_then(|m| mark_path(m, k)).map(|m| sprite16(m, ink.mark)))
         }
     }
 }
 
-/// An arc `len` turns long, starting `start` turns from twelve o'clock: the
-/// arc's sprite turned (no path: a GPUI path costs a full-window MSAA pass).
-pub(crate) fn arc(start: f32, len: f32, color: Hsla) -> Option<Svg> {
-    Some(sprite16(arc_path(len)?, color).with_transformation(Transformation::rotate(radians(start * std::f32::consts::TAU))))
-}
-
-/// The ring closing over the arc, `p` (0..1) of the way from `len`: the
-/// success transition's first beat (§8 #5).
-pub(crate) fn closing(start: f32, len: f32, p: f32, color: Hsla) -> Option<Svg> {
-    arc(start * (1. - p), len + (1. - len) * p, color)
-}
-
-/// The running orbit (§4, §8 #2, #3): the faint track, and the arc lapping
-/// it on the 30 Hz grid. `grow`: the arc's growth from nothing as the call
-/// starts (0..1). With a beat layer and ambient on, the arc is the layer's
-/// (the frame draws the track and records the site); without one, the
-/// frame draws it (and asks for the next tick). Reduced, Off, low power:
-/// the still arc, no frames.
-pub(crate) fn orbit(fx: &std::rc::Rc<crate::motion::Motion>, ink: LifeInk, grow: f32) -> Div {
-    #[cfg(test)]
-    if fx.no_orbit.get() {
-        // Tests of the 8 Hz beat alone: the rail's spinner in its place.
-        return div().flex().flex_none().size(px(LIFE)).items_center().justify_center().child(spinning(fx, Glyph::Run, ink.mark, ink.mark));
+/// A live 16 px lattice (a card's running or streaming call, the
+/// composer's cell): the beat layer's (the frame draws its still pose and
+/// records the site), or without one the frame's, on its pose's beat.
+/// Reduced, Off, low power: the still pose, no frames.
+pub(crate) fn live16(fx: &std::rc::Rc<crate::motion::Motion>, pat: crate::lattice::Pat, mark: Hsla, ground: Hsla) -> AnyElement {
+    if pat.ambient() && fx.layered() {
+        return on_beat(crate::motion::Beat::Lattice(pat), mark, ground, fx);
     }
-    let el =
-        div().relative().flex_none().size(px(LIFE)).debug_selector(|| "life-Orbit".into()).children(ink.ring.map(|c| sprite16(RING, c)));
-    if grow >= 1. && fx.layered() {
-        let (fx, mark) = (fx.clone(), ink.mark);
-        return el.child(
-            canvas(
-                |_, _, _| {},
-                move |b, _, window, _| {
-                    fx.site(crate::motion::Site {
-                        origin: b.origin,
-                        mask: window.content_mask(),
-                        mark,
-                        ground: mark,
-                        beat: crate::motion::Beat::Orbit,
-                    })
-                },
-            )
-            .absolute()
-            .inset_0(),
-        );
-    }
-    let (start, len) = fx.orbit().unwrap_or((0., crate::motion::ORBIT_STILL));
-    el.children(arc(start, len * grow.clamp(0., 1.), ink.mark))
-}
-
-/// The beat layer's orbit (§9): the arc's sprite at `origin`, turned.
-pub(crate) fn paint_arc(window: &mut Window, cx: &App, origin: Point<Pixels>, (start, len): (f32, f32), color: Hsla) {
-    let Some(path) = arc_path(len) else { return };
-    let bounds = Bounds::new(origin, size(px(LIFE), px(LIFE)));
-    let s = window.scale_factor();
-    let c = bounds.center();
-    let m = TransformationMatrix::unit().translate(c.scale(s)).rotate(radians(start * std::f32::consts::TAU)).translate(c.scale(-s));
-    let _ = window.paint_svg(bounds, path, None, m, color, cx);
+    let beat = if pat.ambient() { fx.lattice_beat(pat) } else { None };
+    let pose = crate::lattice::pose(pat, beat);
+    crate::lattice::el(LIFE, crate::lattice::Dots::of(pose), crate::lattice::code(pose), mark, ground).into_any_element()
 }
 
 /// The ping (§8 #7, #8): a ring going out from the glyph's centre, `p`
@@ -1178,6 +1071,133 @@ pub(crate) fn ping(p: f32, color: Hsla, ground: Hsla) -> Svg {
     let path = LIFE_PATHS.pings[(r.clamp(PING_FROM, PING_TO) - PING_FROM) as usize].clone();
     let off = (LIFE - PING_BOX) / 2.;
     svg().path(path).absolute().left(px(off)).top(px(off)).size(px(PING_BOX)).text_color(crate::motion::mix(ground, color, 0.7 * (1. - p)))
+}
+
+/// The state indicator (cards4/proposal.md §4, §8; indicators/proposal.md
+/// §6, H2 · Turning lattice): **the one interface** card motion draws a
+/// call's or a worker's state through. A row, a spawn row and (later) a
+/// chip hand it the state, the ground and the change; how each state looks
+/// and moves lives here and in [`crate::lattice`] alone, so the family can
+/// be swapped without touching the cards.
+///
+/// The live and waiting states are lattice patterns (queued, running,
+/// streaming, needs you, as last seen); running and streaming step on the
+/// beat. A change while watched turns the grid a quarter
+/// ([`crate::motion::TURN_ON_CHANGE`], [`crate::motion::Motion::turn`]): onto a pattern, the old one turned
+/// +45° then the new from −45° (66 ms each), and needs you pings once;
+/// onto a mark (done, failed, denied, cancelled), the old one turned +45°,
+/// +90° at 74 %, then its dots go out diagonal by diagonal under the mark
+/// writing on over `base` (the done tick lit `ok`, quiet `dim` @ +400).
+/// The dots keep the old colour through the turn: `err` comes with the
+/// cross. Off the switch (H1): no turn, the old dots go out under the
+/// mark. `change`: when it changed while watched, and from what
+/// ([`Life::code`]); `wait`: when a prompt came to wait on it. History,
+/// Reduced and Off: at rest, no turn ([`crate::motion::Motion::shot`]).
+pub(crate) fn indicator(
+    fx: &std::rc::Rc<crate::motion::Motion>,
+    l: Life,
+    ground: Hsla,
+    p: &Palette,
+    change: Option<(std::time::Instant, u64)>,
+    wait: Option<std::time::Instant>,
+) -> AnyElement {
+    use crate::lattice::{Dots, code, going_out, pose, turning, TURN};
+    use crate::motion::{self, Kind as Mk, ease, mix};
+    use std::time::Duration;
+    let ink = life_ink(l, ground, p);
+    let from = change.and_then(|c| Life::of_code(c.1)).filter(|f| *f != l);
+    let at = change.map(|c| c.0).filter(|_| from.is_some());
+    let full = fx.level() == motion::Level::Full;
+    let since = at.map(|a| fx.now().saturating_duration_since(a));
+    // What it turns from: the old pattern's pose as it was then, in its colour.
+    let old = from.and_then(|f| f.pat().map(|pat| (pose(pat, at.filter(|_| pat.ambient()).and_then(|a| fx.beat_at(a))), life_ink(f, ground, p).mark)));
+    let boxed = || div().relative().flex_none().size(px(LIFE));
+    let dots = |d: Dots, mark: Hsla| crate::lattice::el(LIFE, d, code(pose_of(&d)), mark, ground).absolute().top_0().left_0();
+    let turn = fx.turn.get() && full;
+    if let (Some((old_pose, old_mark)), Some(t), true) = (old, since, turn)
+        && t < 2 * TURN
+    {
+        {
+            fx.want_frame();
+            let new = l.pat().map(|pat| pose(pat, fx.lattice_beat(pat).filter(|_| pat.ambient())));
+            let d = turning(old_pose, new, t).unwrap_or_else(Dots::none);
+            // Its second pose is the new pattern's own (its colour), or the old turned on.
+            let mark = if t >= TURN && new.is_some() { ink.mark } else { old_mark };
+            return boxed().debug_selector(move || format!("life-turn {}", t.as_millis() / TURN.as_millis())).child(dots(d, mark)).into_any_element();
+        }
+    }
+    match l.pat() {
+        Some(pat) => {
+            let el = match (pat, l) {
+                // Needs you: one ring wave out from the centre (§6), then still.
+                (crate::lattice::Pat::Needs, _) => {
+                    let base = Dots::of(pose(pat, None));
+                    let wave = fx.ping(wait, Duration::ZERO).map(|k| ping_wave(base, k));
+                    crate::lattice::el(LIFE, wave.unwrap_or(base), code(pose(pat, None)), ink.mark, ground).into_any_element()
+                }
+                (_, Life::Seen) => life(l, ink).into_any_element(),
+                _ => live16(fx, pat, ink.mark, ground),
+            };
+            div().relative().flex_none().size(px(LIFE)).debug_selector(move || format!("life-{l:?}")).child(el).into_any_element()
+        }
+        None => {
+            // Onto a mark: from a pattern while watched, the old dots go out
+            // under it as it writes on (after the turn, or at once in H1).
+            let Some((old_pose, old_mark)) = old else { return life(l, ink).into_any_element() };
+            let after = if turn { 2 * TURN } else { Duration::ZERO };
+            let lead = match (turn, l) {
+                (true, _) => 30,
+                (false, Life::Done) => 110,
+                (false, Life::Failed) => 40,
+                (false, _) => 60,
+            };
+            let shot = |delay: Duration, dur: Duration, e: &gpui_kit::base::motion::Easing, k: Mk| fx.shot(at, delay, dur, e, k);
+            let start = after + Duration::from_millis(lead);
+            let ring = shot(start, motion::QUICK, &ease::OUT, Mk::Fade);
+            let mark_p = shot(start, motion::BASE, &ease::LINEAR, Mk::Spatial);
+            let mark = match l {
+                Life::Done => mix(p.ok, p.dim_t, shot(Duration::from_millis(400), motion::GLOW, &ease::OUT, Mk::Decay)),
+                _ => ink.mark,
+            };
+            let ring_ink = ink.ring.map(|c| mix(ground, c, ring));
+            let out = since.and_then(|t| {
+                let t = t.checked_sub(after)?;
+                let pose = if turn { old_pose } else { crate::lattice::turn(old_pose, -2) };
+                going_out(pose, t, fx.level())
+            });
+            if out.is_some() {
+                fx.want_frame();
+            }
+            boxed()
+                .debug_selector(move || format!("life-settle {l:?}"))
+                .children(out.map(|d| dots(d, old_mark)))
+                .child(life_at(l, LifeInk { ring: ring_ink, mark, ground }, 1., mark_p).absolute().top_0().left_0())
+                .into_any_element()
+        }
+    }
+}
+
+/// A pose's code back from its dots (a selector only: lit or not).
+fn pose_of(d: &crate::lattice::Dots) -> crate::lattice::Pose {
+    d.a.map(|a| if a <= 0.004 { 0 } else { (1. + a * 3.).round() as u8 })
+}
+
+/// Needs you's one ping (indicators/proposal.md §2): a ring wave from the
+/// centre to the edges to the corners, `k` (0..1) of `sig`, lighting each
+/// as it passes.
+fn ping_wave(mut d: crate::lattice::Dots, k: f32) -> crate::lattice::Dots {
+    let f = k * 4.;
+    for (i, a) in d.a.iter_mut().enumerate() {
+        let ring = match i {
+            4 => 0.,
+            1 | 3 | 5 | 7 => 1.,
+            _ => 2.,
+        };
+        let boost = (1. - (ring - f).abs()).max(0.);
+        let lit = if boost > 0.5 { 1. } else if boost > 0.2 { 0.45 } else { 0. };
+        *a = a.max(lit);
+    }
+    d
 }
 
 /// A call's life glyph (§4) from its status: `waiting` on a prompt, `seen`
@@ -1192,7 +1212,7 @@ pub(crate) fn life_of_call(st: Option<ToolStatus>, waiting: bool, seen: bool) ->
         Some(ToolStatus::Queued) => Life::Queued,
         _ if waiting => Life::Wait,
         _ if seen => Life::Seen,
-        _ => Life::Orbit,
+        _ => Life::Run,
     }
 }
 
@@ -1200,8 +1220,8 @@ pub(crate) fn life_of_call(st: Option<ToolStatus>, waiting: bool, seen: bool) ->
 pub(crate) fn life_of_worker(l: Liveness) -> Life {
     match l {
         Liveness::Started => Life::Queued,
-        Liveness::Running => Life::Orbit,
-        Liveness::Cancelling => Life::Orbit,
+        Liveness::Running => Life::Run,
+        Liveness::Cancelling => Life::Run,
         Liveness::Done => Life::Done,
         Liveness::Failed => Life::Failed,
         Liveness::Cancelled => Life::Cancelled,
@@ -1217,63 +1237,31 @@ mod tests {
     use gpui_kit::AssetSource;
     use synaps_client::transcript::ToolStatus;
 
-    /// P1: the running frames are the TUI's `SPINNER_FRAMES` decoded, each
-    /// a 3–4 dot snake on the six top dots (the polish.md table, written
-    /// out here so the decode itself is checked); the two heads and the
-    /// dial keep their counts; one beat (or two) a frame, phase-locked.
+    /// The live family is the lattice (indicators/proposal.md §8; retires
+    /// `braille_frames_match_spinner_frames` and
+    /// `glyph_silhouette_is_six_dots`): nine 2×2 dots on whole pixels in
+    /// the 10 px box (columns and rows at 1, 4 and 7), every live glyph's
+    /// pose filling the grid at every beat, and its drawing table the still
+    /// pose's lit dots.
     #[test]
-    fn braille_frames_match_spinner_frames() {
-        let table: [&[u8]; 10] = [
-            &[1, 2, 4],
-            &[1, 4, 5],
-            &[1, 4, 5, 6],
-            &[4, 5, 6],
-            &[3, 4, 5, 6],
-            &[3, 5, 6],
-            &[2, 3, 6],
-            &[1, 2, 3, 6],
-            &[1, 2, 3],
-            &[1, 2, 3, 4],
-        ];
-        let bits = |d: &[u8]| d.iter().fold(0u8, |b, n| b | 1 << (n - 1));
-        for (i, lit) in table.iter().enumerate() {
-            assert_eq!(super::RUN_FRAMES[i], bits(lit), "frame {i} ({})", super::SPINNER_FRAMES[i]);
-            assert!((3..=4).contains(&super::RUN_FRAMES[i].count_ones()));
-        }
-        assert_eq!(super::STILL, bits(&[1, 4, 5, 6]), "⠹");
-        for b in 0..40u32 {
-            assert_eq!(super::spin_dots(Glyph::Run, Some(b)), super::RUN_FRAMES[(b % 10) as usize], "one frame a beat: a 1.25 s lap");
-            assert_eq!(super::spin_dots(Glyph::Workers, Some(b)).count_ones(), 2, "two heads");
-            assert_eq!(super::spin_dots(Glyph::Opening, Some(b)).count_ones(), 1, "a dial");
-            assert_eq!(super::spin_dots(Glyph::Workers, Some(b)), super::spin_dots(Glyph::Workers, Some(b / 2 * 2)), "every two beats");
-        }
-        // The heads are opposite (1–6, 4–3, 5–2) and the dial walks the ring.
-        assert_eq!(super::WORKERS_FRAMES, [bits(&[1, 6]), bits(&[4, 3]), bits(&[5, 2])]);
-        assert_eq!(super::OPENING_FRAMES, [1u8, 4, 5, 6, 3, 2].map(|n| 1u8 << (n - 1)));
-        // Still: the snake's ⠹, the heads' and the dial's first frames.
-        assert_eq!(super::spin_dots(Glyph::Run, None), super::STILL);
-        assert_eq!(super::spin_dots(Glyph::Workers, None), super::WORKERS_FRAMES[0]);
-        assert_eq!(super::spin_dots(Glyph::Opening, None), super::OPENING_FRAMES[0]);
-    }
-
-    /// P1: a braille glyph is six 2×2 dots in the box (columns x 2 and 6,
-    /// rows y 1, 4 and 7), its drawing table the still frame's lit ones.
-    #[test]
-    fn glyph_silhouette_is_six_dots() {
-        assert_eq!(super::DOTS.len(), 6);
-        for &(x, y) in &super::DOTS {
-            assert!([2., 6.].contains(&x) && [1., 4., 7.].contains(&y) && x + super::DOT <= 10. && y + super::DOT <= 10.);
-        }
+    fn lattice_frames_are_nine_device_pixel_dots() {
+        use crate::lattice::{Pat, pose};
         for g in [Glyph::Run, Glyph::Workers, Glyph::Opening] {
             assert!(g.spins());
-            let lit: Vec<Part> = super::DOTS
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| super::spin_dots(g, None) & (1 << i) != 0)
-                .map(|(_, &(x, y))| Part::Fill(x, y, super::DOT, super::DOT))
+            let pat = super::live_pat(g);
+            for b in 0..32 {
+                assert!(pose(pat, Some(b)).iter().all(|&l| l > 0), "{g:?} at {b}: nine dots");
+            }
+            let still = pose(pat, None);
+            let lit: Vec<Part> = (0..9)
+                .filter(|&i| still[i] == 4)
+                .map(|i| Part::Fill([1., 4., 7.][i % 3], [1., 4., 7.][i / 3], 2., 2.))
                 .collect();
-            assert_eq!(g.parts(), &lit[..], "{g:?}: its still frame");
+            assert_eq!(g.parts(), &lit[..], "{g:?}: its still pose");
         }
+        assert_eq!(super::live_pat(Glyph::Run), Pat::Run);
+        assert_eq!(super::live_pat(Glyph::Workers), Pat::Run);
+        assert_eq!(super::live_pat(Glyph::Opening), Pat::Reconnect);
         assert_eq!(Glyph::ALL.iter().filter(|g| g.spins()).count(), 3);
     }
 
@@ -1291,12 +1279,17 @@ mod tests {
     }
 
     /// The drawing table is injective (`GO` is `Fold` by design: one
-    /// chevron) and every part stays inside its box, strokes
-    /// with their half width.
+    /// chevron; `Workers` is `Run`'s lattice by design, indicators/proposal.md
+    /// §8: the session is busy either way) and every part stays inside its
+    /// box, strokes with their half width.
     #[test]
     fn every_glyph_is_unique_and_inside_its_box() {
         for (i, a) in Glyph::ALL.iter().enumerate() {
             for b in &Glyph::ALL[i + 1..] {
+                if (*a, *b) == (Glyph::Run, Glyph::Workers) || (*a, *b) == (Glyph::Workers, Glyph::Run) {
+                    assert_eq!(a.parts(), b.parts(), "one running lattice");
+                    continue;
+                }
                 assert_ne!(a.parts(), b.parts(), "{a:?} and {b:?} are drawn alike");
             }
             let (s, half) = (a.size(), a.stroke() / 2.);
@@ -1407,9 +1400,9 @@ mod tests {
             .collect();
         assert_eq!(
             lives,
-            [Life::Done, Life::Failed, Life::Denied, Life::Cancelled, Life::Limit, Life::Queued, Life::Wait, Life::Seen, Life::Orbit]
+            [Life::Done, Life::Failed, Life::Denied, Life::Cancelled, Life::Limit, Life::Queued, Life::Wait, Life::Seen, Life::Run]
         );
-        assert_eq!(life_of_worker(Liveness::Running), Life::Orbit);
+        assert_eq!(life_of_worker(Liveness::Running), Life::Run);
         assert_eq!(life_of_worker(Liveness::Done), Life::Done);
         assert_eq!(life_of_worker(Liveness::Failed), Life::Failed);
     }

@@ -122,40 +122,55 @@ pub(crate) fn verb(name: &str) -> SharedString {
         "ls" => "List",
         "web_fetch" | "fetch" => "Fetch",
         "subagent_start" | "subagent" => "Spawn",
+        "subagent_collect" => "Collect",
+        "todo_write" => "Todos",
+        "activate_tools" => "Activate",
         n if n.starts_with("ext__") => "Tool",
+        // Anything else: its first word (Shady #23 L6), so it fits the
+        // column: `subagent_steer` → "Steer", `load_skill` → "Load".
         n => {
             let n = n.strip_prefix("subagent_").unwrap_or(n);
-            let mut c = n.chars();
-            return c.next().map_or_else(SharedString::default, |f| {
-                let s: String = f.to_uppercase().chain(c.map(|c| if c == '_' { ' ' } else { c })).collect();
-                s.into()
-            });
+            let word = n.split(['_', '-', ' ']).find(|w| !w.is_empty()).unwrap_or(n);
+            let mut c = word.chars();
+            return c.next().map_or_else(SharedString::default, |f| f.to_uppercase().chain(c).collect::<String>().into());
         }
     };
     word.into()
 }
 
-/// A failed command's exit code, from its error text (§4: "Exit 101"):
-/// `exit 1`, `exit code 101`, `exit status: 2`, `exited with code 3`.
-pub(crate) fn exit_code(text: &str) -> Option<i64> {
-    let lower = text.to_ascii_lowercase();
-    for (at, _) in lower.match_indices("exit") {
-        let mut rest = lower[at + 4..].trim_start();
-        loop {
-            let before = rest;
-            for skip in ["ed", "with", "code", "status", ":", "(", "="] {
-                rest = rest.strip_prefix(skip).unwrap_or(rest).trim_start();
-            }
-            if rest == before {
-                break;
-            }
+/// How a failed shell command ended (§4), from the engine's own header,
+/// `Command failed (exit N):` on its result's first line, and for `bash`
+/// only (Shady #23 M7: no other tool's text, nor the output under it, is
+/// read for an exit). The engine says `exit -1` for a command a signal
+/// killed: "Killed".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Exit {
+    Code(i64),
+    Killed,
+}
+
+impl Exit {
+    pub(crate) fn of(tool: &str, result: &str) -> Option<Exit> {
+        if tool != "bash" {
+            return None;
         }
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(n) = digits.parse::<i64>() {
-            return Some(n);
+        const HEAD: &str = "command failed (exit ";
+        let first = result.lines().next()?;
+        let at = first.to_ascii_lowercase().find(HEAD)? + HEAD.len();
+        let rest = &first[at..];
+        let end = rest.find(')')?;
+        match rest[..end].trim().parse::<i64>().ok()? {
+            n if n < 0 => Some(Exit::Killed),
+            n => Some(Exit::Code(n)),
         }
     }
-    None
+
+    pub(crate) fn word(self) -> SharedString {
+        match self {
+            Exit::Code(n) => format!("Exit {n}").into(),
+            Exit::Killed => "Killed".into(),
+        }
+    }
 }
 
 /// A call's duration as its facts say it (§3): `0.4s`, `3.2s`, `12s`, `1m 23s`.
@@ -197,7 +212,7 @@ impl AllowStyle {
             }
             AllowStyle::Outline => {
                 let bg = if pressed {
-                    crate::motion::mix(p.card_d, p.acc, 0.18)
+                    p.out_press
                 } else if hovered {
                     p.acc_soft
                 } else {
@@ -211,7 +226,7 @@ impl AllowStyle {
 
 #[cfg(test)]
 mod tests {
-    use super::{AllowStyle, EDGE_BOTTOM, EDGE_TOP, edges, exit_code, mark_edges, took, verb};
+    use super::{AllowStyle, EDGE_BOTTOM, EDGE_TOP, Exit, edges, mark_edges, took, verb};
     use crate::turns::{Disp, Gap, Kind, Who};
     use std::time::Duration;
 
@@ -250,16 +265,27 @@ mod tests {
         assert_eq!(verb("grep").as_ref(), "Search");
         assert_eq!(verb("subagent_start").as_ref(), "Spawn");
         assert_eq!(verb("ext__github__search").as_ref(), "Tool");
-        assert_eq!(verb("todo_write").as_ref(), "Todo write");
+        assert_eq!(verb("todo_write").as_ref(), "Todos");
+        assert_eq!(verb("activate_tools").as_ref(), "Activate");
+        assert_eq!(verb("load_skill").as_ref(), "Load");
+        assert_eq!(verb("subagent_steer").as_ref(), "Steer");
     }
 
     #[test]
     fn a_failed_command_says_its_exit_code() {
-        assert_eq!(exit_code("Tool execution failed: Command failed (exit 1):\ncat: x"), Some(1));
-        assert_eq!(exit_code("error: process exited with code 101"), Some(101));
-        assert_eq!(exit_code("Exit code: 2"), Some(2));
-        assert_eq!(exit_code("exit status: 127"), Some(127));
-        assert_eq!(exit_code("no such file"), None);
+        let e = |tool, text| Exit::of(tool, text);
+        assert_eq!(e("bash", "Tool execution failed: Command failed (exit 1):\ncat: x"), Some(Exit::Code(1)));
+        assert_eq!(e("bash", "Command failed (exit 101):\nerror: test failed"), Some(Exit::Code(101)));
+        // A signal: the engine's -1, whatever the output under it says.
+        assert_eq!(e("bash", "Command failed (exit -1):\nrunner: (exit status: 101)\nexit 1"), Some(Exit::Killed));
+        // Only the engine's header, on the first line.
+        assert_eq!(e("bash", "warning: x\nCommand failed (exit 2):"), None);
+        assert_eq!(e("bash", "error: process exited with code 101"), None);
+        // Only a shell command: another tool's error that says "exit".
+        assert_eq!(e("ext__github__run", "Command failed (exit 3): the workflow"), None);
+        assert_eq!(e("web_fetch", "exit 3"), None);
+        assert_eq!(Exit::Code(2).word().as_ref(), "Exit 2");
+        assert_eq!(Exit::Killed.word().as_ref(), "Killed");
     }
 
     #[test]

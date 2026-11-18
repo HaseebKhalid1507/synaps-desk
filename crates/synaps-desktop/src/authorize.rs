@@ -227,10 +227,38 @@ impl CardExit {
         if from.is_nan() {
             return (None, true);
         }
-        let t = now.saturating_duration_since(self.at).as_secs_f32();
-        let x = crate::motion::Spring::from_rest(1., crate::motion::SHEET_RESPONSE, t);
+        // §8 #9: the height on `glide` from +40.
+        let t = now.saturating_duration_since(self.at + FOLD_DELAY).as_secs_f32();
+        let x = crate::motion::Spring::from_rest(1., crate::motion::GLIDE_RESPONSE, t);
         let h = self.to + (from - self.to).max(0.) * x;
         (Some(h), (h - self.to).abs() < 0.5)
+    }
+
+    /// Its strength as it folds (§8 #9): whole until +170, then its last
+    /// sliver goes out over `quick` × 0.75.
+    pub(crate) fn strength(&self, now: Instant) -> f32 {
+        // The fold asks for every frame already: no timer of its own.
+        let Some(t) = now.checked_duration_since(self.at + FOLD_FADE) else { return 1. };
+        let k = (t.as_secs_f32() / crate::motion::exit(crate::motion::QUICK).as_secs_f32()).min(1.);
+        1. - crate::motion::ease::IN.sample(k)
+    }
+}
+
+/// When the answered card starts to fold, and when its last sliver fades
+/// (cards4/proposal.md §8 #9: height `glide` @ +40, alpha `quick`×0.75 @ +170).
+pub(crate) const FOLD_DELAY: Duration = Duration::from_millis(40);
+pub(crate) const FOLD_FADE: Duration = Duration::from_millis(170);
+
+impl CardExit {
+    /// How far it has folded (0..), the room it gave up: the list keeps it
+    /// at its end while the card folds, so the answered row holds still
+    /// (the finish gate of #23, item 7).
+    pub(crate) fn given(&self, now: Instant) -> f32 {
+        let from = self.card.height.get();
+        match self.shown(now).0 {
+            Some(h) if !from.is_nan() => (from - h).max(0.),
+            _ => 0.,
+        }
     }
 }
 
@@ -652,8 +680,10 @@ impl AppView {
         let lift = crate::motion::LIFT + (1. - crate::motion::LIFT) * k;
         // Cards D (cards4/proposal.md §8 #9): an Allow's receipt is lit in
         // the accent as it lands and decays to `dim` (`glow` from +240); a
-        // Deny's stays `err`.
-        let lit = self.fx.decay(Some(r.landed + Duration::from_millis(240)), Duration::ZERO, crate::motion::GLOW);
+        // Deny's stays `err`. Nothing else lights (Shady #23 L9: attention
+        // follows the accent; a cancel, another client's answer, `dim`).
+        let lights = matches!(answer, Answer::Allowed | Answer::AllowedAll | Answer::Provided);
+        let lit = if lights { self.fx.decay(Some(r.landed + Duration::from_millis(240)), Duration::ZERO, crate::motion::GLOW) } else { 0. };
         let rest_color = crate::motion::mix(p.dim_t, p.acc, lit);
         let word_color = if answer == Answer::Denied { p.err } else { rest_color };
         let row = r.row;
@@ -693,7 +723,7 @@ impl AppView {
             let body = card_slot(self.render_card(&e.card, Some(&e.look), p, m, cx), m).into_any_element();
             let (shown, _) = e.shown(self.fx.now());
             self.fx.want_frame();
-            let g = crate::motion::Grow { key: d.id, shown, sink: e.sink.clone(), travel: 0., strength: 1. };
+            let g = crate::motion::Grow { key: d.id, shown, sink: e.sink.clone(), travel: 0., strength: e.strength(self.fx.now()), floor: 0. };
             return crate::motion::grow_block(body, None, None, g);
         }
         let sid = self.model.active.as_ref().map(|a| a.session_id.as_str()).unwrap_or_default();
@@ -737,12 +767,14 @@ impl AppView {
         // in a `line` edge), Allow the accent ([`ALLOW_STYLE`]), each with
         // its key at 72 %. Pressed (the collapse's first 90 ms, §8 #9): down
         // `PRESS`, Allow's fill 18 % toward the ink, Deny's `hover`.
-        let pressed = look.and_then(|_| self.card_exit.as_ref().filter(|e| e.card.row == c.row)).and_then(|e| {
-            (self.fx.on() && self.fx.now().saturating_duration_since(e.at) < crate::motion::exit(crate::motion::QUICK)).then(|| {
-                self.fx.want_at(e.at + crate::motion::exit(crate::motion::QUICK));
-                e.answer
-            })
-        });
+        // The answer's button stays pressed from the click (or its key) to
+        // the end of the fold (Shady #23 M1, the finish gate's item 9): down
+        // while it waits for the daemon (the footer says so), and as the
+        // card folds, never back to its rest or disabled look between.
+        let pressed = match look {
+            None => self.sent.as_ref().filter(|s| s.key == c.key).map(|s| s.answer),
+            Some(_) => self.card_exit.as_ref().filter(|e| e.card.row == c.row).map(|e| e.answer),
+        };
         let tight = self.layout.tight;
         let key_hint = |k: &'static str, color: Hsla, ground: Hsla| {
             div().flex_none().font_family(fonts::SANS).text_px(m.meta).text_color(crate::motion::mix(ground, color, 0.72)).child(k)
@@ -772,11 +804,17 @@ impl AppView {
         };
         let allow_btn =
             |id: &'static str, text: &'static str, key: Option<&'static str>, enabled: bool, charge: Option<u32>, down: bool| {
-                let (bg, edge, fg) = ALLOW_STYLE.colors(p, false, down);
-                let (hi, _, _) = ALLOW_STYLE.colors(p, true, false);
-                let (press, press_edge, _) = ALLOW_STYLE.colors(p, false, true);
+                let style = allow_style();
+                let (bg, edge, fg) = style.colors(p, false, down);
+                let (hi, _, _) = style.colors(p, true, false);
+                let (press, press_edge, _) = style.colors(p, false, true);
                 let (bg, edge, fg) = if enabled || down { (bg, edge, fg) } else { (p.card_d, p.line, p.dim_k) };
-                let lit = ALLOW_STYLE.colors(p, false, false).0;
+                // The arm's charge in the accent, filled or outlined (Shady
+                // #23 M5: the outline's rest fill is the card itself).
+                let lit = match style {
+                    crate::cards::AllowStyle::Fill => style.colors(p, false, false).0,
+                    crate::cards::AllowStyle::Outline => p.acc_line,
+                };
                 h_flex()
                     .id(id)
                     .relative()
@@ -793,7 +831,7 @@ impl AppView {
                     .bg(bg)
                     .when(enabled, |d| {
                         d.cursor_pointer()
-                            .hover(move |d| d.bg(hi).border_color(if ALLOW_STYLE == crate::cards::AllowStyle::Fill { hi } else { edge }))
+                            .hover(move |d| d.bg(hi).border_color(if style == crate::cards::AllowStyle::Fill { hi } else { edge }))
                             .active(move |s| s.bg(press).border_color(press_edge).top(px(crate::motion::PRESS)))
                     })
                     // The arm's charge (motion.md §6.3): ten cells of the fill
@@ -811,7 +849,7 @@ impl AppView {
                     .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(fg).child(text))
                     .children(key.map(|k| key_hint(k, fg, bg)))
                     .debug_selector(move || {
-                        if ALLOW_STYLE == crate::cards::AllowStyle::Fill { "allow-fill".into() } else { "allow-outline".into() }
+                        if style == crate::cards::AllowStyle::Fill { "allow-fill".into() } else { "allow-outline".into() }
                     })
             };
         let actions = if detached {
@@ -999,7 +1037,7 @@ impl AppView {
         let arrived = self.card_at.filter(|_| live);
         let flush = self.fx.decay(arrived.map(|a| a + 2 * crate::motion::STAGGER), Duration::ZERO, crate::motion::SIG);
         let ping = self.fx.ping(arrived, 2 * crate::motion::STAGGER);
-        let card_bg = crate::motion::mix(p.card_d, p.acc, 0.12 * flush);
+        let card_bg = crate::motion::mix(p.card_d, p.ask_flush, flush);
         let dot = div()
             .relative()
             .flex_none()
@@ -1180,8 +1218,32 @@ impl AppView {
 /// Allow's style (Haseeb, 08:07: "make fill vs outline trivially
 /// switchable"): the accent filled (the default, cards4/proposal.md §5),
 /// or `AllowStyle::Outline`, the accent's label in its `acc_line` edge on
-/// the card. Both paint and are tested (`cards::tests`).
+/// the card. Both paint and are tested (`cards::tests`, and the card under
+/// each in `ui_tests`). [`allow_style`] is what a frame draws: this, or
+/// `SYNAPS_DESK_ALLOW=outline` for a look at the other side (evidence).
 pub(crate) const ALLOW_STYLE: crate::cards::AllowStyle = crate::cards::AllowStyle::Fill;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's Allow style (none: [`ALLOW_STYLE`]).
+    pub(crate) static TEST_ALLOW: std::cell::Cell<Option<crate::cards::AllowStyle>> = const { std::cell::Cell::new(None) };
+}
+
+/// The Allow style this frame draws ([`ALLOW_STYLE`]).
+pub(crate) fn allow_style() -> crate::cards::AllowStyle {
+    #[cfg(test)]
+    if let Some(s) = TEST_ALLOW.with(|c| c.get()) {
+        return s;
+    }
+    static ENV: std::sync::LazyLock<Option<crate::cards::AllowStyle>> = std::sync::LazyLock::new(|| {
+        match std::env::var("SYNAPS_DESK_ALLOW").ok().as_deref() {
+            Some("outline") => Some(crate::cards::AllowStyle::Outline),
+            Some("fill") => Some(crate::cards::AllowStyle::Fill),
+            _ => None,
+        }
+    });
+    ENV.unwrap_or(ALLOW_STYLE)
+}
 
 /// Where the top edge's dashes start, `DASH` on and about `DASH_GAP` off,
 /// the gaps spread so the run starts and ends on a dash at both corners.

@@ -1539,6 +1539,10 @@ pub struct AppView {
     pub(crate) card_at: Option<Instant>,
     /// The answered card collapsing in its row ([`CardExit`]).
     pub(crate) card_exit: Option<CardExit>,
+    /// The room a folded card gave up, kept at the list's end as it folded
+    /// (the answered row holds still) and let go on `sheet` after it landed:
+    /// how much, and since when ([`AppView::tail_slack`]).
+    pub(crate) fold_slack: Cell<Option<(f32, Instant)>>,
     /// Answered prompts' receipts, by session ([`crate::authorize::Receipt`]).
     pub(crate) receipts: HashMap<String, Vec<crate::authorize::Receipt>>,
     /// The answer this window sent to the card, until its prompt resolves.
@@ -1571,6 +1575,10 @@ pub struct AppView {
     /// Cards D: how long each call that finished while watched took (its
     /// row's facts; a call from history has no measured duration), by item id.
     pub(crate) took: std::cell::RefCell<HashMap<u64, Duration>>,
+    /// Calls drawn running in this session (the finish gate of #23, item 6):
+    /// a call that has started never steps back to Queued (a `tool_queued`
+    /// after its `tool_use` put it running).
+    pub(crate) ran: std::cell::RefCell<HashSet<u64>>,
     /// The card was on screen last frame (not behind a worker's view,
     /// Settings or Usage): one coming back waits again ([`Arm`]).
     card_was_up: bool,
@@ -2161,6 +2169,7 @@ impl AppView {
             layer: None,
             card_at: None,
             card_exit: None,
+            fold_slack: Cell::new(None),
             receipts: HashMap::new(),
             sent: None,
             card_keys: Cell::new(None),
@@ -2174,6 +2183,7 @@ impl AppView {
             card_presses: 0,
             card_look: Default::default(),
             took: Default::default(),
+            ran: Default::default(),
             card_was_up: false,
             tray: crate::tray::TrayCache::default(),
             tray_due: None,
@@ -3648,6 +3658,30 @@ impl AppView {
         Some((dx * d, dy * d, strength))
     }
 
+    /// The room an answered card gave up as it folds (cards4/proposal.md
+    /// §8 #9, the finish gate of #23, item 7): the list keeps it at its
+    /// end, so its total height holds and the answered row stays where it
+    /// is while the card folds up into it (what is below rises with it);
+    /// once landed, it goes on `sheet`. Not fluid: none.
+    pub(crate) fn tail_slack(&self) -> f32 {
+        if !self.fx.fluid() {
+            self.fold_slack.set(None);
+            return 0.;
+        }
+        let now = self.fx.now();
+        if let Some(e) = &self.card_exit {
+            return e.given(now);
+        }
+        let Some((from, at)) = self.fold_slack.get() else { return 0. };
+        let s = from * crate::motion::Spring::from_rest(1., crate::motion::SHEET_RESPONSE, now.saturating_duration_since(at).as_secs_f32());
+        if s < 0.5 {
+            self.fold_slack.set(None);
+            return 0.;
+        }
+        self.fx.want_frame();
+        s
+    }
+
     /// Row `ix` as it arrives or grows (fluid.md §3.3, §3.4): a row that
     /// arrived while watched reveals its height, its content rising
     /// [`crate::motion::ARRIVE`] and lifting from 70 %; the streaming row's
@@ -3656,13 +3690,36 @@ impl AppView {
         let Some(d) = self.disp.get(ix) else { return row.whole() };
         let streaming = self.synced_busy && ix + 1 == self.disp.len() && d.kind == Kind::Prose;
         let key = d.motion_key();
-        match self.fx.grow(key, ix, self.fx.birth(key), streaming, self.body_line) {
+        // The authorize card arrives on `glide` (§8 #8), rising 4 px.
+        let response = if d.kind == Kind::Prompt { crate::motion::GLIDE_RESPONSE } else { crate::motion::SNAP_RESPONSE };
+        match self.fx.grow_on(key, ix, self.fx.birth(key), streaming, self.body_line, response) {
             // Your own message was readable a frame ago: it doesn't lift.
             Some(mut g) => {
                 if d.kind == Kind::User {
                     g.strength = 1.;
                 }
-                crate::motion::grow_block(row.body.into_any_element(), row.label, row.head, g)
+                if d.kind == Kind::Prompt {
+                    g.travel *= crate::motion::RISE / crate::motion::ARRIVE;
+                }
+                match row.card {
+                    // A card row (cards4/proposal.md §8 #1, #13; Shady #23
+                    // H2): its slice of the card is drawn round the clip, so
+                    // the card grows with it, edges whole on every frame;
+                    // inside, the row rises 4 px and fades in from 0 on its
+                    // opaque card.
+                    Some((block, frame)) => {
+                        g.travel *= crate::motion::RISE / crate::motion::ARRIVE;
+                        g.floor = 0.;
+                        g.strength = ((g.strength - crate::motion::LIFT) / (1. - crate::motion::LIFT)).clamp(0., 1.);
+                        let inner = crate::motion::grow_block(block, None, None, g);
+                        row.body
+                            .child(frame(inner))
+                            .children(row.label.map(|(l, top)| l.top(px(top))))
+                            .children(row.head)
+                            .into_any_element()
+                    }
+                    None => crate::motion::grow_block(row.body.into_any_element(), row.label, row.head, g),
+                }
             }
             None => row.whole(),
         }
@@ -4057,7 +4114,11 @@ impl AppView {
             let here = self.model.active.as_ref().is_some_and(|a| a.session_id == e.session && a.epoch == e.card.key.0);
             // Another prompt in its place ends it at once, as the dock's did.
             let other = self.model.card_key().is_some_and(|k| k != e.card.key);
-            if e.shown(fx_now).1 || !here || other || !self.fx.fluid() || self.model.watch.focus().is_some() {
+            let landed = e.shown(fx_now).1;
+            if landed || !here || other || !self.fx.fluid() || self.model.watch.focus().is_some() {
+                // Landed in place: the room it gave up goes on `sheet`.
+                let keep = landed && here && !other && self.fx.fluid();
+                self.fold_slack.set(keep.then(|| (e.given(fx_now), fx_now)).filter(|s| s.0 >= 0.5));
                 self.card_exit = None;
             }
         }
@@ -4451,6 +4512,7 @@ impl AppView {
                         self.toggled.clear();
                         self.open_runs.clear();
                         self.took.borrow_mut().clear();
+                        self.ran.borrow_mut().clear();
                     }
                 }
                 sp.start
@@ -4715,8 +4777,12 @@ impl AppView {
     pub(crate) fn is_open(&self, item: &Item, row: &RowCache) -> bool {
         let status = item.tool.as_ref().and_then(|t| t.status);
         let failed = matches!(status, Some(ToolStatus::Failed | ToolStatus::Denied));
+        // Cards D (cards4/proposal.md §8 #4, #5): a running call's output
+        // streams into its open body, which folds again as it succeeds.
+        let streaming = matches!(status, Some(ToolStatus::Running)) && item.tool.as_ref().is_some_and(|t| !t.result.is_empty());
         let default = item.kind == ItemKind::Tool
             && (failed
+                || streaming
                 || (!matches!(status, Some(ToolStatus::Cancelled))
                     && row.preview.as_ref().is_some_and(|p| p.lines.len() <= 24 && !p.lines.is_empty())));
         default ^ self.toggled.contains(&item.id)
@@ -5496,12 +5562,14 @@ impl AppView {
             foot_ch.filter(|(_, prev)| worker.is_none() && drives && word == Some(label::READY) && busy_glyph(*prev)).map(|(at, _)| at);
         let breath_at = foot_ch.filter(|_| g == Some(glyph::Glyph::Needs)).map(|c| c.0);
         let mut foot_glyph = g.map(|g| {
-            // Cards D (cards4/proposal.md build step 8): running, the state
-            // cell laps the cards' orbit (P2's sweep retired: one ambient
-            // per object, motion.md §6.1).
+            // Running, the state cell is the cards' 16 px lattice
+            // (indicators/proposal.md §8): streaming while the turn's last
+            // item is being written, else running (P2's sweep retired: one
+            // ambient per object, motion.md §6.1).
             let el = if g == glyph::Glyph::Run {
-                let ink = glyph::life_ink(glyph::Life::Orbit, p.user, p);
-                div().debug_selector(|| "foot-orbit".into()).child(glyph::orbit(fx, ink, 1.)).into_any_element()
+                let writing = self.model.shown().items().last().is_some_and(|i| i.streaming);
+                let pat = if writing { crate::lattice::Pat::Stream } else { crate::lattice::Pat::Run };
+                div().debug_selector(|| "foot-lattice".into()).child(glyph::live16(fx, pat, p.acc, p.user)).into_any_element()
             } else {
                 crate::turns::live_glyph(fx, g, mark, p.user, foot_ch, breath_at, true)
             };
@@ -6186,7 +6254,12 @@ impl Render for AppView {
             self.list.clone(),
             cx.processor(|this, ix, _window, cx| {
                 let row = this.render_disp(ix, cx);
-                this.arrive(ix, row)
+                let el = this.arrive(ix, row);
+                // The room an answered card gave up, under the last row.
+                match Some(this.tail_slack()).filter(|s| *s > 0. && ix + 1 == this.disp.len()) {
+                    Some(s) => div().w_full().child(el).child(div().h(px(s)).debug_selector(|| "fold-slack".into())).into_any_element(),
+                    None => el,
+                }
             }),
         )
         .size_full()

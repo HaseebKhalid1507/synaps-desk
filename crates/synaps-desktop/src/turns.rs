@@ -1415,24 +1415,29 @@ impl AppView {
             Kind::Prompt => self.render_authorize(d, &p, &m, cx),
         };
         // A run is one card (cards4/proposal.md §3): each of its rows draws
-        // its slice, the first and last its edges.
-        let block = match crate::cards::edges(&self.disp, ix) {
-            _ if !crate::cards::in_card(&d) => block,
+        // its slice, the first and last its edges. The slice (fill,
+        // hairline, caps) is drawn outside the row's reveal clip and lift
+        // (Shady #23 H2): a row that reveals grows the card, whose edges
+        // are whole on every frame.
+        let card: Option<CardFrame> = match crate::cards::edges(&self.disp, ix) {
+            _ if !crate::cards::in_card(&d) => None,
             (top, bottom) => {
-                let slab = crate::cards::slab(top, bottom, block, &p, crate::cards::Geo::of(&m));
-                if matches!(d.kind, Kind::Summary { .. }) {
-                    // Its card's edge and inset unfold it too.
-                    let id = d.id;
-                    slab.id(("run-card", id))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_run(id);
-                            cx.notify();
-                        }))
-                        .into_any_element()
-                } else {
-                    slab.into_any_element()
-                }
+                let (pal, geo) = (p, crate::cards::Geo::of(&m));
+                let id = d.id;
+                let click = matches!(d.kind, Kind::Summary { .. }).then(|| {
+                    cx.listener(move |this, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                        this.toggle_run(id);
+                        cx.notify();
+                    })
+                });
+                Some(Box::new(move |inner: AnyElement| {
+                    let slab = crate::cards::slab(top, bottom, inner, &pal, geo);
+                    match click {
+                        // Its card's edge and inset unfold it too.
+                        Some(f) => slab.id(("run-card", id)).cursor_pointer().on_click(f).into_any_element(),
+                        None => slab.into_any_element(),
+                    }
+                }))
             }
         };
         let who = who_of(&d, &p, &m);
@@ -1476,7 +1481,10 @@ impl AppView {
                 .bg(motion::mix(p.canvas, mark, k))
                 .debug_selector(|| "write-head".into())
         });
-        RowParts { body: out.child(block), label: hang, head }
+        match card {
+            Some(frame) => RowParts { body: out, label: hang, head, card: Some((block, frame)) },
+            None => RowParts { body: out.child(block), label: hang, head, card: None },
+        }
     }
 
     /// The top message's label pinned over the list (polish.md P15,
@@ -1549,16 +1557,27 @@ pub(crate) struct RowParts {
     pub(crate) body: Div,
     pub(crate) label: Option<(Div, f32)>,
     pub(crate) head: Option<Div>,
+    /// A card row's block and its card's slice around it (cards4/proposal.md
+    /// §3): a reveal clips and lifts the block inside the slice, never the
+    /// slice (Shady #23 H2).
+    pub(crate) card: Option<(AnyElement, CardFrame)>,
 }
+
+/// A card row's slice of its card, drawn round what the row shows.
+pub(crate) type CardFrame = Box<dyn FnOnce(AnyElement) -> AnyElement>;
 
 impl RowParts {
     fn empty() -> Self {
-        RowParts { body: div(), label: None, head: None }
+        RowParts { body: div(), label: None, head: None, card: None }
     }
 
     /// At rest: one element, as the row always was.
     pub(crate) fn whole(self) -> AnyElement {
-        self.body.children(self.label.map(|(l, top)| l.top(px(top)))).children(self.head).into_any_element()
+        self.body
+            .children(self.card.map(|(block, frame)| frame(block)))
+            .children(self.label.map(|(l, top)| l.top(px(top))))
+            .children(self.head)
+            .into_any_element()
     }
 }
 
@@ -1780,7 +1799,11 @@ impl AppView {
     #[allow(clippy::too_many_arguments)]
     fn render_work(&self, item: &Item, row: &RowCache, id: u64, p: &Palette, m: &Metrics, lay: Layout, cx: &Context<Self>) -> AnyElement {
         let think = item.kind == ItemKind::Thinking;
-        let st = status(item);
+        // Drawn running once, it never steps back to Queued.
+        let st = match status(item) {
+            Some(ToolStatus::Queued) if self.ran.borrow().contains(&id) => Some(ToolStatus::Running),
+            s => s,
+        };
         let geo = Geo::of(lay, m);
         let g = crate::cards::Geo::of(m);
         let call_id = item.tool.as_ref().map(|t| t.tool_id.as_str());
@@ -1823,47 +1846,51 @@ impl AppView {
             glyph::call(st, waiting, self.model.active.is_none())
         };
         let life = if think {
-            if running_think { glyph::Life::Orbit } else { glyph::Life::Done }
+            if running_think { glyph::Life::Run } else { glyph::Life::Done }
         } else {
             glyph::life_of_call(st, waiting, self.model.active.is_none())
         };
+        // Its output being written: the lattice's streaming pose.
+        let life = if life == glyph::Life::Run && !think && !row.result.is_empty() { glyph::Life::Stream } else { life };
+        if life.live() {
+            self.ran.borrow_mut().insert(id);
+        }
         let change = fx.change(Tag::Outcome, id, life.code(), None);
         let wait = fx.change(Tag::Waiting, id, u64::from(waiting), None).filter(|w| waiting && w.1 == 0).map(|w| w.0);
         // The row's wash (§1): the state colour mixed into the card, one
         // quad behind the row. A failure flushes at 18 % and calms to 7.5 %
         // (§8 #6); a wait at 16 % and holds at 6 % (#7). Off: at rest.
-        let you = p.acc;
         let wash = match life {
             glyph::Life::Failed => {
-                let k = fx.decay(change.filter(|c| c.1 == glyph::Life::Orbit.code()).map(|c| c.0), Duration::ZERO, motion::GLOW);
-                Some(motion::mix(p.card_d, p.err, theme::D_FAIL_REST + (theme::D_FAIL_PEAK - theme::D_FAIL_REST) * k))
+                let k = fx.decay(change.filter(|c| glyph::Life::was_live(c.1)).map(|c| c.0), Duration::ZERO, motion::GLOW);
+                Some(motion::mix(p.wash_fail, p.wash_fail_pk, k))
             }
             glyph::Life::Wait => {
                 let k = fx.decay(wait, Duration::ZERO, motion::SIG);
-                Some(motion::mix(p.card_d, you, theme::D_WAIT_REST + (theme::D_WAIT_PEAK - theme::D_WAIT_REST) * k))
+                Some(motion::mix(p.wash_wait, p.wash_wait_pk, k))
             }
             _ => None,
         };
         let ground = wash.unwrap_or(p.card_d);
-        let status_glyph = life_glyph(fx, life, ground, p, change, wait);
+        let status_glyph = glyph::indicator(fx, life, ground, p, change, wait);
         // Thinking done says nothing: only its running mark.
         let status_glyph = (!think || running_think).then_some(status_glyph);
-        let running = life == glyph::Life::Orbit && !think;
+        let running = life.live() && !think;
         let receipt = self.row_receipt(call_id).filter(|_| !think);
         // A gated call runs from its answer (the wait is the receipt's).
         let start = crate::authorize::run_start(row.started, receipt);
         let ran = running.then(|| clock(fx, start)).flatten();
         // Finished while watched: how long it took (§3; history has none).
         if let (Some((at, prev)), false, Some(s)) = (change, running, start)
-            && prev == glyph::Life::Orbit.code()
+            && glyph::Life::was_live(prev)
         {
             self.took.borrow_mut().entry(id).or_insert_with(|| at.saturating_duration_since(s));
         }
         let took = (!running && !think).then(|| self.took.borrow().get(&id).copied()).flatten();
         // The state word (§4): a failed command its exit code.
-        let exit = (st == Some(ToolStatus::Failed)).then(|| crate::cards::exit_code(&row.result)).flatten();
+        let exit = (st == Some(ToolStatus::Failed)).then(|| crate::cards::Exit::of(&row.name, &row.result)).flatten();
         let word: Option<SharedString> = match exit {
-            Some(n) => Some(format!("Exit {n}").into()),
+            Some(e) => Some(e.word()),
             None => crate::authorize::status_beside(state.1.filter(|w| *w != "stopped at output limit"), receipt.map(|r| r.answer_for(st)))
                 .map(SharedString::new_static),
         }
@@ -1891,7 +1918,7 @@ impl AppView {
         } else if let Some(t) = took {
             // The live clock rolls over into the final duration (§8 #5).
             let from = change
-                .filter(|c| c.1 == glyph::Life::Orbit.code())
+                .filter(|c| glyph::Life::was_live(c.1))
                 .zip(start)
                 .map(|((at, _), s)| (at, subagents::fmt_whole(at.saturating_duration_since(s).as_secs())));
             parts.push(clock_roll(fx, from, crate::cards::took(t), p, m));
@@ -1904,7 +1931,7 @@ impl AppView {
         let facts = crate::cards::facts(parts, p, m).children(receipt_el);
         // "Exit N" slides in from +6 as the cross writes on (§8 #6).
         let word_el = word.map(|w| {
-            let since = change.filter(|c| c.1 == glyph::Life::Orbit.code() || c.1 == glyph::Life::Queued.code()).map(|c| c.0);
+            let since = change.filter(|c| glyph::Life::was_live(c.1) || c.1 == glyph::Life::Queued.code()).map(|c| c.0);
             let k = fx.shot(since, Duration::ZERO, motion::QUICK, &ease::OUT, Mk::Fade);
             let x = (1. - fx.shot(since, Duration::ZERO, motion::FLICK, &ease::OUT, Mk::Spatial)) * 6.;
             div()
@@ -1912,6 +1939,7 @@ impl AppView {
                 .flex_none()
                 .relative()
                 .left(px(x))
+                .font_family(fonts::SANS)
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_px(m.meta)
                 .whitespace_nowrap()
@@ -1920,12 +1948,12 @@ impl AppView {
         });
         let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
         let verb_text = if think { SharedString::new_static("Think") } else { crate::cards::verb(&row.name) };
+        // The verb column (§3): 56 px, wider for a longer word; the verb is
+        // never cut, the target gives way (the finish gate of #23, item 11).
         let verb = div()
             .flex_none()
-            .w(px(g.verb))
-            .overflow_hidden()
+            .min_w(px(g.verb))
             .whitespace_nowrap()
-            .text_ellipsis()
             .font_family(fonts::SANS)
             .font_weight(FontWeight::SEMIBOLD)
             .text_px(m.label)
@@ -1957,7 +1985,19 @@ impl AppView {
                     cx.notify();
                 }))
             });
-        let body = open.then(|| {
+        // The body opens and closes under the row on `glide` (§8 #6, #12),
+        // the header still; a body opened only while its output streamed
+        // folds as the call succeeds (@ +180, #5).
+        let finished_now = change.is_some_and(|c| c.0 >= fx.now() && glyph::Life::was_live(c.1));
+        let delay = if !open && finished_now { Duration::from_millis(180) } else { Duration::ZERO };
+        let (reveal, sink) = if has_body { fx.reveal(id, open, delay) } else { (None, Default::default()) };
+        // Output streaming in (§8 #4): each new line grows and lifts.
+        let streamed = if (open || reveal.is_some()) && !think && row.preview.is_none() && row.card.numbered.is_none() {
+            fx.streamed(id, row.result.lines().count())
+        } else {
+            Vec::new()
+        };
+        let body = (open || reveal.is_some()).then(|| {
             if think {
                 // Prose, not code: no well, under the target.
                 div()
@@ -1972,9 +2012,10 @@ impl AppView {
                     .into_any_element()
             } else {
                 let failed = matches!(st, Some(ToolStatus::Failed | ToolStatus::Denied));
-                well(row, failed, id, geo, p, m).into_any_element()
+                well(row, failed, id, &streamed, p, m).into_any_element()
             }
         });
+        let body = body.map(|b| revealed(b, reveal, sink));
         v_flex()
             .relative()
             .w_full()
@@ -2026,7 +2067,7 @@ impl AppView {
         let d = crate::cards::Geo::of(m);
         let life = glyph::life_of_worker(live);
         let steady = glyph::life_of_worker(glyph::steady(live, v.demoted));
-        let status = life_glyph(fx, life, p.card_d, p, fx.change(Tag::BlockGlyph, key, steady.code(), None), None);
+        let status = glyph::indicator(fx, life, p.card_d, p, fx.change(Tag::BlockGlyph, key, steady.code(), None), None);
         // Its task: the call's argument after the worker's label.
         let task = row.arg.split_once(" · ").map_or_else(|| row.arg.clone(), |(_, t)| SharedString::from(tilde(t, true)));
         let target = h_flex()
@@ -2268,7 +2309,27 @@ impl AppView {
 /// file's own numbers right-aligned in a 30 px column; any other output as
 /// it came (a failure's in `err_o`). The cut says "N more lines" in Sans 12
 /// `dim`. The path and the range are the row's (its target and facts).
-fn well(row: &RowCache, failed: bool, id: u64, _geo: Geo, p: &Palette, m: &Metrics) -> Div {
+/// A body as it opens or closes ([`Motion::reveal`]): clipped to `shown`
+/// of its height (none: all of it), measured into `sink`.
+fn revealed(body: AnyElement, shown: Option<f32>, sink: std::rc::Rc<std::cell::Cell<f32>>) -> AnyElement {
+    let h = sink.get();
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        // Whole pixels: a fractional height would put every row under it
+        // off the pixel grid (and the following list's end off its bottom).
+        .when_some(shown, |d, k| d.overflow_hidden().h(px(if h.is_nan() { 0. } else { (h * k).round() })))
+        .child(div().w_full().flex_shrink_0().child(body))
+        .on_children_prepainted(move |b, _, _| {
+            if let Some(b) = b.first() {
+                sink.set(f32::from(b.size.height));
+            }
+        })
+        .into_any_element()
+}
+
+fn well(row: &RowCache, failed: bool, id: u64, streamed: &[(usize, f32, f32)], p: &Palette, m: &Metrics) -> Div {
     let g = crate::cards::Geo::of(m);
     let inset = (10. * m.r).round();
     let cw = m.mono * 0.6;
@@ -2326,6 +2387,30 @@ fn well(row: &RowCache, failed: bool, id: u64, _geo: Geo, p: &Palette, m: &Metri
             }
             let cut = row.card.more.clone().map(|t| SharedString::from(t.trim_start_matches("… ").to_string()));
             col.child(lines.children(cut.map(more_el)))
+        }
+        _ if !streamed.is_empty() => {
+            // Streaming (§8 #4): line by line, a new one's clip growing
+            // 0 → its line on `flick` and its text lifting from 70 %; text
+            // never moves inside its block.
+            let line = (19. * m.r).round();
+            let lines = row.result.lines().enumerate().map(|(i, l)| {
+                let text = div().w_full().flex_shrink_0().child(SharedString::from(if l.is_empty() { " ".to_string() } else { l.to_string() }));
+                match streamed.iter().find(|s| s.0 == i) {
+                    Some(&(_, clip, k)) => {
+                        div().w_full().flex().flex_col().overflow_hidden().h(px((line * clip).round())).child(motion::lift(text, k)).into_any_element()
+                    }
+                    None => text.into_any_element(),
+                }
+            });
+            col.child(
+                v_flex()
+                    .px(px(inset))
+                    .py(px(pad))
+                    .whitespace_normal()
+                    .text_color(if failed { p.err_o } else { p.res })
+                    .children(lines)
+                    .when(row.result_more > 0, |d| d.child(more(row.result_more))),
+            )
         }
         _ => col.child(
             v_flex()
@@ -2391,75 +2476,6 @@ pub(crate) fn live_glyph(
             }
             None => glyph::draw(g, mark),
         },
-    }
-}
-
-/// A call's life glyph as it is now (cards4/proposal.md §4, §8): the
-/// orbit laps while it runs (growing in from a queued or waiting start,
-/// #2); a success closes the arc into a ring that fades as the tick
-/// writes on, lit `ok`, then quiet `dim` (#5); a failure's cross writes on
-/// over its ring (#6); a wait pings once (#7); a denial's slash writes on
-/// (#10); a cancel's arc goes out as the dash comes (#11). `change`: when
-/// it changed while watched, and from what ([`glyph::Life::code`]);
-/// `wait`: when a prompt came to wait on it. History, Reduced and Off: at
-/// rest ([`Motion::shot`]).
-pub(crate) fn life_glyph(
-    fx: &std::rc::Rc<Motion>,
-    l: glyph::Life,
-    ground: Hsla,
-    p: &Palette,
-    change: Option<(Instant, u64)>,
-    wait: Option<Instant>,
-) -> AnyElement {
-    use glyph::Life as L;
-    let ink = glyph::life_ink(l, ground, p);
-    let from = change.and_then(|c| L::of_code(c.1));
-    let at = change.map(|c| c.0);
-    let shot = |delay: u64, dur: Duration, e: &gpui_kit::base::motion::Easing, k: Mk| fx.shot(at, Duration::from_millis(delay), dur, e, k);
-    let boxed = || div().relative().flex_none().size(px(glyph::LIFE));
-    match (l, from) {
-        (L::Orbit, from) => {
-            let grow =
-                if matches!(from, Some(L::Queued | L::Wait | L::Seen)) { shot(0, motion::FLICK, &ease::OUT, Mk::Spatial) } else { 1. };
-            glyph::orbit(fx, ink, grow).into_any_element()
-        }
-        (L::Done, Some(L::Orbit)) => {
-            let (start, len) = at.map_or((0., motion::ORBIT_STILL), |a| fx.orbit_then(a));
-            let close = shot(0, motion::FLICK, &ease::OUT, Mk::Spatial);
-            let gone = shot(140, motion::QUICK, &ease::IN, Mk::Fade);
-            let tick = shot(110, motion::BASE, &ease::WRITE, Mk::Spatial);
-            let calm = shot(400, motion::GLOW, &ease::OUT, Mk::Decay);
-            let mark = motion::mix(p.ok, p.dim_t, calm);
-            boxed()
-                .debug_selector(move || format!("life-close {close:.2} {tick:.2}"))
-                .children((gone < 1.).then(|| glyph::closing(start, len, close, motion::mix(p.acc, ground, gone))).flatten())
-                .child(glyph::life_at(L::Done, glyph::LifeInk { ring: None, mark }, 1., tick).absolute().top_0().left_0())
-                .into_any_element()
-        }
-        (L::Failed | L::Denied, Some(L::Orbit | L::Wait | L::Queued)) => {
-            // Its ring comes up as the mark writes on (the slash after the fold).
-            let delay = if l == L::Denied { 120 } else { 0 };
-            let ring = shot(delay, motion::QUICK, &ease::OUT, Mk::Fade);
-            let mark = shot(delay, motion::BASE, &ease::WRITE, Mk::Spatial);
-            let ink = glyph::LifeInk { ring: ink.ring.map(|c| motion::mix(ground, c, ring)), mark: ink.mark };
-            glyph::life_at(l, ink, ring, mark).into_any_element()
-        }
-        (L::Cancelled, Some(L::Orbit)) => {
-            let (start, len) = at.map_or((0., motion::ORBIT_STILL), |a| fx.orbit_then(a));
-            let out = shot(0, motion::QUICK, &ease::IN, Mk::Fade);
-            let come = shot(60, motion::QUICK, &ease::OUT, Mk::Fade);
-            let ink = glyph::LifeInk { ring: ink.ring.map(|c| motion::mix(ground, c, come)), mark: motion::mix(ground, ink.mark, come) };
-            boxed()
-                .children((out < 1.).then(|| glyph::arc(start, len, motion::mix(p.acc, ground, out))).flatten())
-                .child(glyph::life(l, ink).absolute().top_0().left_0())
-                .into_any_element()
-        }
-        (L::Wait, _) => {
-            // One ping out of the dot (§8 #7), then still until answered.
-            let ping = fx.ping(wait, Duration::ZERO);
-            glyph::life(l, ink).children(ping.map(|k| glyph::ping(k, p.acc, ground))).into_any_element()
-        }
-        _ => glyph::life(l, ink).into_any_element(),
     }
 }
 

@@ -1433,8 +1433,9 @@ fn idle_requests_no_frames(cx: &mut TestAppContext) {
 fn only_the_rail_spins(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, what: &str) {
     let (frame, timer) = motion_pending(cx, view);
     assert!(!frame, "{what}: a display frame");
-    let (sites, rail, orbits) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width, v.fx.orbit_count()));
-    assert_eq!(orbits, 0, "{what}: an orbit");
+    let (sites, rail) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width));
+    let cards = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Lattice(_))).count();
+    assert_eq!(cards, 0, "{what}: a card's or the composer's lattice");
     assert!(sites.iter().all(|s| matches!(s.beat, crate::motion::Beat::Spin(_)) && f32::from(s.origin.x) < rail), "{what}: {sites:?}");
     let at = timer.expect("the demo's rail runs: its spinners' beat");
     assert!(!sites.is_empty(), "{what}: a timer with nothing on the layer");
@@ -1759,8 +1760,10 @@ fn the_answered_card_collapses_in_its_row(cx: &mut TestAppContext) {
     click_at(cx, w, ghost.center());
     assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the collapsing card took no press (the one is the live card's)");
     assert!(bounds(cx, &format!("receipt {row}")).is_some(), "the call's row says it was answered elsewhere");
-    // Halfway: clipped shorter. Following, the list's end holds (F1): the
-    // row's bottom stays where the card's slot ended.
+    let slot = bounds(cx, &format!("grow-clip-{row}")).expect("its clip, whole");
+    // Halfway: clipped shorter. Following, the list's end holds (F1); the
+    // card folds up into its row, which holds still (the finish gate of
+    // #23, item 7): the room it gave up waits at the list's end.
     view.update(cx, |v, cx| {
         v.card_exit.as_mut().unwrap().at = v.fx.clock() - Duration::from_millis(120);
         cx.notify();
@@ -1771,7 +1774,9 @@ fn the_answered_card_collapses_in_its_row(cx: &mut TestAppContext) {
     let r = cx.update(|cx| crate::theme::metrics(cx).r);
     assert!(view.read_with(cx, |v, _| v.list.is_following_tail()));
     let end = live.bottom() + gpui_kit::px((12. * r).round());
-    assert!((clip.bottom() - end).abs() < gpui_kit::px(0.5), "the end holds: {clip:?} vs {end:?}");
+    assert!((clip.top() - slot.top()).abs() < gpui_kit::px(0.5), "the answered row holds: {clip:?} vs {slot:?}");
+    let slack = bounds(cx, "fold-slack").expect("the room it gave up, at the list's end");
+    assert!((slack.bottom() - end).abs() < gpui_kit::px(0.5), "the end holds: {slack:?} vs {end:?}");
     // Landed: the row goes.
     view.update(cx, |v, cx| {
         v.card_exit.as_mut().unwrap().at = v.fx.clock() - Duration::from_secs(5);
@@ -2646,8 +2651,6 @@ fn frames(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, u64) {
 fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (1440., 1800.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
-    // The beat alone (the orbit's 30 Hz: `orbit_requests_ticks_only_while_running`).
-    view.update(cx, |v, _| v.fx.no_orbit.set(true));
     running_tools(cx, &view, 25);
     // The arrivals draw in and settle.
     for _ in 0..12 {
@@ -2655,23 +2658,35 @@ fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     }
     assert!(!motion_pending(cx, &view).0, "settled: no display frames");
     let sites = view.read_with(cx, |v, _| v.fx.sites());
-    let scans = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count();
+    let scans = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_) | crate::motion::Beat::Lattice(_))).count();
     assert!(scans >= 25, "the running glyphs on screen are the layer's: {scans}");
     let (f0, l0) = frames(cx, &view);
     let p0 = view.read_with(cx, |v, _| v.fx.painted.borrow().len());
-    let mut layer_only = 0;
+    // The timers armed (each once, however many beats it waits): the
+    // lattices' pose changes (indicators/proposal.md §6: 4 a second) wake
+    // only the layer; only the clocks' second wakes the app.
+    let mut armed = Vec::new();
     for _ in 0..16 {
-        layer_only += usize::from(view.read_with(cx, |v, _| v.fx.wakes()) == Some(crate::motion::Wake::Beat));
+        let a = view.read_with(cx, |v, _| v.fx.pending().1.zip(v.fx.wakes()));
+        if let Some(a) = a.filter(|a| !armed.contains(a)) {
+            armed.push(a);
+        }
         beat(cx, w, &view);
     }
     let (f1, l1) = frames(cx, &view);
+    let layer_only = armed.iter().filter(|a| a.1 == crate::motion::Wake::Beat).count();
     // 2 s: the clocks' second twice (a third at most, as the edges fall).
-    assert!(layer_only >= 13, "the timer woke only the layer on {layer_only} of 16 beats");
+    assert!(armed.len() - layer_only <= 3 && layer_only >= 5, "the timer woke only the layer on {layer_only} of {} wakes", armed.len());
     // Every beat paints it, once (Shady N2: a beat painted twice is the
     // regression the layer exists to prevent): a beat is painted again
     // only by an app frame inside it.
     assert_painted_once(cx, &view, p0, l1 - l0, f1 - f0);
     assert!(f1 - f0 <= 3, "16 beats drew the app {} times: only the clocks' second may", f1 - f0);
+    // H2 (indicators/proposal.md §6): 25 running lattices stay within the
+    // beat's budget (a paint at most a beat, one for all of them), and the
+    // running calls' clocks still tick on the app's frame, each second.
+    assert!(l1 - l0 <= 16, "{} layer paints in 16 beats", l1 - l0);
+    assert!(f1 > f0, "the clocks' second drew the app");
     assert_eq!(view.read_with(cx, |v, _| v.fx.sites().len()), sites.len(), "the cached frame keeps its sites");
     // Off: the glyphs draw still in the app's frame; nothing for the layer.
     set_motion(cx, &view, crate::motion::Level::Off);
@@ -2938,7 +2953,7 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
     // Handoff light, from its corner.
     let pass = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("settle-pass");
     let sweep = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("sweep");
-    let orbit = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("foot-orbit");
+    let orbit = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("foot-lattice");
     assert!(seg(cx).is_none());
     assert!(orbit(cx).is_some() && sweep(cx).is_none() && pass(cx).is_none(), "running: the state cell's orbit, no sweep");
     busy(cx, false);
@@ -2968,7 +2983,7 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
     set_motion(cx, &view, crate::motion::Level::Reduced);
     busy(cx, true);
     assert!(sweep(cx).is_none(), "Reduced: the edge is unlit");
-    assert!(view.read_with(cx, |v, _| v.fx.orbit_count()) == 0, "Reduced: the orbit is still, off the layer");
+    assert!(view.read_with(cx, |v, _| v.fx.lattice_count()) == 0, "Reduced: the lattices are still, off the layer");
     busy(cx, false);
     assert!(pass(cx).is_none(), "Reduced: no pass (the bar's flash)");
     set_motion(cx, &view, crate::motion::Level::Off);
@@ -2982,18 +2997,16 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
 /// The other demo session (no worker, so no clock) with `n` calls running,
 /// their arrivals settled: what runs is only the beat.
 fn running_without_a_clock(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, n: usize) {
-    // The beat alone: the rows' orbits as the rail's spinner (Cards D).
-    view.update(cx, |v, _| {
-        v.client = None;
-        v.fx.no_orbit.set(true);
-    });
+    view.update(cx, |v, _| v.client = None);
     open_idle_cpu(cx, view, crate::tabs::Place::Current);
     set_motion(cx, view, crate::motion::Level::Full);
     running_tools(cx, view, n);
     for _ in 0..12 {
         beat(cx, w, view);
     }
-    let scans = view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count());
+    let scans = view.read_with(cx, |v, _| {
+        v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_) | crate::motion::Beat::Lattice(_))).count()
+    });
     assert!(scans >= n, "the running glyphs are the layer's: {scans}");
     assert!(view.read_with(cx, |v, _| v.tray.rows.is_empty()), "no worker: no clock");
 }
@@ -3025,7 +3038,9 @@ fn assert_painted_once(cx: &mut TestAppContext, view: &Entity<AppView>, p0: usiz
     assert!(painted.windows(2).all(|w| w[1] >= w[0]), "in order: {painted:?}");
     let twice = painted.windows(2).filter(|w| w[1] == w[0]).count() as u64;
     assert!(twice <= again, "{twice} beats painted twice ({again} app frames): {painted:?}");
-    assert!(painted.len() >= 12, "about a paint a beat: {painted:?}");
+    // The lattice (indicators/proposal.md §6) repaints where a pose
+    // changes: running, twice a 4-beat step.
+    assert!(painted.len() >= 7, "a paint a pose change: {painted:?}");
 }
 
 /// Shady N1: low power stops the beat (§7: no ambient). GPUI stores a
@@ -3063,33 +3078,41 @@ fn the_beat_in_the_frame_spins_without_the_layer(cx: &mut TestAppContext) {
     let (w, view, _events) = open_with(cx, (1440., 900.), crate::theme::Panels::default().text_size, false);
     running_without_a_clock_in_frame(cx, w, &view);
     let at = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.frame_beat());
-    let drawn = |cx: &mut TestAppContext, k: u32| {
-        let dots = crate::glyph::spin_dots(crate::glyph::Glyph::Run, Some(k));
-        VisualTestContext::from_window(w, cx).debug_bounds(format!("spin-{dots:02x}").leak()).is_some()
+    let drawn = |cx: &mut TestAppContext, k: Option<u32>| {
+        let pose = crate::lattice::pose(crate::lattice::Pat::Run, k);
+        VisualTestContext::from_window(w, cx).debug_bounds(format!("lattice-{:07x}", crate::lattice::code(pose)).leak()).is_some()
     };
     let (f0, k0) = (frames(cx, &view).0, at(cx));
-    assert!(drawn(cx, k0), "the frame of beat {k0} in the frame");
+    assert!(drawn(cx, Some(k0)), "the pose of beat {k0} in the frame");
     assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::App), "the timer wakes the app");
-    beat(cx, w, &view);
+    // The lattice's next pose change (indicators/proposal.md §6: at most
+    // a step's 4 beats away) is the app's frame.
+    for _ in 0..4 {
+        beat(cx, w, &view);
+        if frames(cx, &view).0 > f0 {
+            break;
+        }
+    }
     let (f1, k1) = (frames(cx, &view).0, at(cx));
-    assert!(f1 > f0 && k1 > k0, "the beat is the app's frame");
+    assert!(f1 > f0 && k1 > k0, "the pose change is the app's frame");
     assert!(view.read_with(cx, |v, _| v.fx.sites().is_empty()), "nothing on the layer");
-    assert!(drawn(cx, k1), "the frame of beat {k1}: the snake moved on");
+    assert!(drawn(cx, Some(k1)), "the pose of beat {k1}: the face moved on");
     // (Cards D retired the composer's sweep, which this checked painted
     // over the composer's border: the pass's order is
     // `handoff_in_travels_and_goes`'.)
-    // Off: still, the ⠹ frame.
+    // Off: still, the running still pose.
     set_motion(cx, &view, crate::motion::Level::Off);
-    assert!(VisualTestContext::from_window(w, cx).debug_bounds(format!("spin-{:02x}", crate::glyph::STILL).leak()).is_some());
+    assert!(drawn(cx, None));
     assert_eq!(motion_pending(cx, &view), (false, None));
 }
 
-/// Cards D (step 8, replacing P2's `a_sweep_ticks_only_while_drawn`): the
-/// composer's orbit on screen (its state cell while the turn runs) ticks
-/// the beat layer at 30 Hz, one timer; Reduced draws it still, and the
-/// timer goes back to the beat or nothing.
+/// Cards D (step 8, replacing P2's `a_sweep_ticks_only_while_drawn`), H2
+/// (indicators/proposal.md §8): the composer's state cell is the cards'
+/// lattice while the turn runs, on the beat layer, its one timer at the
+/// next pose change on the beat grid; Reduced draws it still, and the
+/// timer goes to a clock's second or nothing.
 #[gpui_kit::test]
-fn the_composers_orbit_ticks_only_while_drawn(cx: &mut TestAppContext) {
+fn the_composers_lattice_steps_only_while_drawn(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Full);
     // A session with no prompt waiting (the demo's NEEDS YOU stills the edge).
@@ -3103,20 +3126,72 @@ fn the_composers_orbit_ticks_only_while_drawn(cx: &mut TestAppContext) {
     for _ in 0..12 {
         beat(cx, w, &view);
     }
-    let orbits = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.orbit_count());
-    assert!(orbits(cx) >= 2, "the turn runs: the call's orbit and the composer's");
-    assert!(VisualTestContext::from_window(w, cx).debug_bounds("foot-orbit").is_some());
+    let cards = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Lattice(_))).count())
+    };
+    assert!(cards(cx) >= 2, "the turn runs: the call's lattice and the composer's");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("foot-lattice").is_some());
     let (frame, at) = motion_pending(cx, &view);
     let ahead = view.read_with(cx, |v, _| at.map(|t| t.saturating_duration_since(v.fx.clock())));
-    assert!(!frame && ahead.is_some_and(|d| d <= crate::motion::DECAY_TICK), "the next 30 Hz tick: {ahead:?}");
+    assert!(!frame && ahead.is_some_and(|d| d <= crate::motion::BEAT * crate::lattice::STEP_BEATS), "the next pose: {ahead:?}");
+    assert!(view.read_with(cx, |v, _| at.is_some_and(|t| v.fx.on_beats(t, 1))), "on the beat grid");
     assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::Beat), "the layer, not the app");
     set_motion(cx, &view, crate::motion::Level::Reduced);
-    assert_eq!(orbits(cx), 0, "Reduced: the orbits are still");
-    // Shady #17 M3: the 30 Hz tick went with it (a clock's second may stay).
+    assert_eq!(cards(cx), 0, "Reduced: the lattices are still");
     settle(cx, w, 4);
     let (frame, at) = motion_pending(cx, &view);
     assert!(!frame);
-    assert!(at.is_none_or(|t| view.read_with(cx, |v, _| v.fx.on_beats(t, 8))), "no 30 Hz tick: only a clock's second, or nothing");
+    assert!(at.is_none_or(|t| view.read_with(cx, |v, _| v.fx.on_beats(t, 8))), "only a clock's second, or nothing");
+}
+
+/// H2 (indicators/proposal.md §6, §8): a call finishing while watched
+/// turns its lattice a quarter (+45° from its running pose, then +90°),
+/// then its dots go out under the tick writing on; with the switch off
+/// (H1, the fallback) the tick writes on over the dots going out at once,
+/// no turn. Both land on the tick at rest.
+#[gpui_kit::test]
+fn a_finished_call_turns_its_lattice_or_not(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    for turn in [true, false] {
+        let (w, view, _events) = open(cx);
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| {
+            v.client = None;
+            v.fx.turn.set(turn);
+        });
+        running_tools(cx, &view, 1);
+        for _ in 0..4 {
+            beat(cx, w, &view);
+        }
+        let id = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| i.id)).expect("the call");
+        let has = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel)).is_some();
+        assert!(has(cx, format!("tool-status {id}")), "{turn}: its glyph");
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "ok".into() }),
+            });
+            v.sync_list();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let mut seen = Vec::new();
+        for _ in 0..40 {
+            fluid_frame(cx, w, &view);
+            for sel in ["life-turn 0", "life-turn 1", "life-settle Done"] {
+                if !seen.contains(&sel) && has(cx, sel.to_string()) {
+                    seen.push(sel);
+                }
+            }
+        }
+        if turn {
+            assert_eq!(seen, ["life-turn 0", "life-turn 1", "life-settle Done"], "H2: the turn, then the tick");
+        } else {
+            assert_eq!(seen, ["life-settle Done"], "H1: the tick at once, no turn");
+        }
+        // At rest: the tick, nothing asked for.
+        wait(cx, w, &view, 1000);
+        assert!(has(cx, "life-Done".to_string()), "{turn}: at rest");
+    }
 }
 
 /// Shady #17 M1 (motion.md §5.3): the link lost mid-turn, the window is
@@ -3151,7 +3226,7 @@ fn a_lost_link_stills_every_ambient(cx: &mut TestAppContext) {
         view.read_with(cx, |v, _| {
             let sites = v.fx.sites();
             (
-                sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Orbit)).count(),
+                sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Lattice(_))).count(),
                 sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count(),
             )
         })
@@ -3241,8 +3316,6 @@ fn running_without_a_clock_in_frame(cx: &mut TestAppContext, w: AnyWindowHandle,
 #[gpui_kit::test]
 fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
-    // The beat alone: the rows' orbits as the rail's spinner (Cards D).
-    view.update(cx, |v, _| v.fx.no_orbit.set(true));
     set_motion(cx, &view, crate::motion::Level::Full);
     for _ in 0..12 {
         beat(cx, w, &view);
@@ -3257,7 +3330,13 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
         settle(cx, w, 4);
         assert!(frames(cx, &view).0 > f0, "{what}: the app's view was not drawn");
     };
-    let sites = view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count());
+    // The rail's spinners and the cards' lattices (indicators/proposal.md §8).
+    let spins = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_) | crate::motion::Beat::Lattice(_))).count()
+        })
+    };
+    let sites = spins(cx);
     // As the pump hands it over (Shady N3): `apply_batch` notifies, not the test.
     drew(cx, "an event", &mut |cx| {
         use synaps_client::protocol::{LlmEvent, StreamEvent};
@@ -3287,10 +3366,7 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
             );
         });
     });
-    let spins = |cx: &mut TestAppContext| {
-        view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count())
-    };
-    assert_eq!(spins(cx), sites + 1, "the new call's glyph is on the layer");
+    assert!(spins(cx) > sites, "the new call's glyph is on the layer");
     let halt = VisualTestContext::from_window(w, cx).debug_bounds("halt").expect("HALT");
     drew(cx, "a hover", &mut |cx| {
         event(
@@ -6113,8 +6189,6 @@ fn sticky_label_takes_no_click(cx: &mut TestAppContext) {
 fn sticky_band_hides_the_beat(cx: &mut TestAppContext) {
     let (w, view, _events) = sticky_open(cx, (1440., 900.));
     assert!(!view.read_with(cx, |v, _| v.layout.hang), "the labels are inline");
-    // The beat alone: the rows' orbits as the rail's spinner (Cards D).
-    view.update(cx, |v, _| v.fx.no_orbit.set(true));
     set_motion(cx, &view, crate::motion::Level::Full);
     running_tools(cx, &view, 60);
     for _ in 0..12 {
@@ -6135,7 +6209,10 @@ fn sticky_band_hides_the_beat(cx: &mut TestAppContext) {
     let cover = Bounds::new(gpui_kit::point(px(band[0]), px(top)), size(px(band[2]), px(line + 1.)));
     assert_eq!(band[1], top, "{band:?}");
     let sites = view.read_with(cx, |v, _| v.fx.sites());
-    let under = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_)) && s.origin.y < cover.bottom()).count();
+    let under = sites
+        .iter()
+        .filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_) | crate::motion::Beat::Lattice(_)) && s.origin.y < cover.bottom())
+        .count();
     assert!(under >= 1, "a running glyph under the band: {sites:?}");
     for s in &sites {
         assert!(!s.mask.bounds.intersects(&cover), "a beat over the band: {s:?}, band {cover:?}");

@@ -92,6 +92,46 @@ pub const D_FAIL_PEAK: f32 = 0.18;
 pub const D_WAIT_REST: f32 = 0.06;
 pub const D_WAIT_PEAK: f32 = 0.16;
 pub const D_SOFT: f32 = 0.12;
+/// The authorize card's flush as it arrives (§8 #8) and the outlined
+/// Allow's pressed fill: of the accent off the card.
+pub const D_ASK_FLUSH: f32 = 0.12;
+pub const D_OUT_PRESS: f32 = 0.18;
+/// What each wash carries ([`d_washes`]): every text a failed row draws,
+/// a waiting row's, the authorize card's, the outlined Allow's label.
+pub fn d_wash_texts(r: &Roles) -> [Vec<u32>; 4] {
+    [
+        vec![r.prose_t, r.dim_t, r.arg, r.ok, r.err, r.ink],
+        vec![r.prose_t, r.dim_t, r.arg, r.acc],
+        vec![r.dim_t, r.ink, r.prose_t, r.prose],
+        vec![r.acc],
+    ]
+}
+
+/// Cards D's washes from the floored `err` and `acc` (Shady #23 M3): each
+/// the proposal's strength, or the strongest (in 0.5 % steps, down to its
+/// rest) where every text drawn on it stays ≥ [`TEXT`].
+pub fn d_washes(r: &Roles) -> [u32; 6] {
+    let [fail, wait, ask, out] = d_wash_texts(r);
+    // The strength each lands on: a peak goes no lower than its rest did.
+    let k = |from: f32, floor: f32, toward: u32, texts: &[u32]| {
+        let reads = |k: f32| texts.iter().all(|&c| contrast(c, mix(r.card_d, toward, f64::from(k))) >= TEXT);
+        let mut k = from;
+        while k > floor + 1e-6 && !reads(k) {
+            k = (k - 0.005).max(floor);
+        }
+        k
+    };
+    let (fail_rest, wait_rest) = (k(D_FAIL_REST, 0., r.err, &fail), k(D_WAIT_REST, 0., r.acc, &wait));
+    [
+        (r.err, fail_rest),
+        (r.err, k(D_FAIL_PEAK, fail_rest, r.err, &fail)),
+        (r.acc, wait_rest),
+        (r.acc, k(D_WAIT_PEAK, wait_rest, r.acc, &wait)),
+        (r.acc, k(D_ASK_FLUSH, 0., r.acc, &ask)),
+        (r.acc, k(D_OUT_PRESS, 0., r.acc, &out)),
+    ]
+    .map(|(toward, k)| mix(r.card_d, toward, f64::from(k)))
+}
 /// The Ask pill stands at least this off its card.
 pub const D_SOFT_OFF: f64 = 1.03;
 
@@ -487,6 +527,11 @@ roles! {
     // text on the Allow fill; `acc`, the accent floored as text on all of
     // them (the running clock, waiting, receipts).
     card_d, line, hover, well_d, acc_soft, acc_line, acc_ink, acc,
+    // The washes as painted (Shady #23 M3): a failed row's at rest and at
+    // its flush's peak, a waiting row's, the authorize card's flush, and
+    // the outlined Allow's pressed fill, from the floored `err` and `acc`,
+    // each as strong as the proposal's where every text on it reads.
+    wash_fail, wash_fail_pk, wash_wait, wash_wait_pk, ask_flush, out_press,
 }
 
 impl Palette {
@@ -900,6 +945,21 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.acc_line = f.at("acc_line", mix(card_d, you, 0.4), ink, &[card_d], D_ACC_LINE);
     r.acc_ink = if [r.btn_fill, r.btn_hi].iter().all(|&g| contrast(canvas, g) >= TEXT) { canvas } else { chrome };
     f.log.push(Check { role: "acc_ink", from: canvas, color: r.acc_ink, grounds: vec![r.btn_fill, r.btn_hi], floor: TEXT });
+    let washes = d_washes(&r);
+    [r.wash_fail, r.wash_fail_pk, r.wash_wait, r.wash_wait_pk, r.ask_flush, r.out_press] = washes;
+    // Grounds, not texts: each is logged with the texts it carries as its
+    // floor's grounds (every one ≥ TEXT on it, `d_washes`).
+    let texts = d_wash_texts(&r);
+    for (role, c, on) in [
+        ("wash_fail", r.wash_fail, 0),
+        ("wash_fail_pk", r.wash_fail_pk, 0),
+        ("wash_wait", r.wash_wait, 1),
+        ("wash_wait_pk", r.wash_wait_pk, 1),
+        ("ask_flush", r.ask_flush, 2),
+        ("out_press", r.out_press, 3),
+    ] {
+        f.log.push(Check { role, from: card_d, color: c, grounds: texts[on].clone(), floor: TEXT });
+    }
     (r, f.log)
 }
 
@@ -2090,17 +2150,31 @@ mod tests {
                 at(r.hover, &[r.card_d], D_CARD, "hover");
                 at(r.well_d, &[r.card_d], D_CARD, "well_d");
                 at(r.line, &[r.card_d, r.canvas, r.hover], D_LINE, "line");
-                let you = a.unwrap_or(raw.prompt_fg);
-                let fail = [r.card_d, r.hover, mix(r.card_d, raw.error_color, f64::from(D_FAIL_REST))];
-                for (what, c) in [("prose_t", r.prose_t), ("dim_t", r.dim_t), ("arg", r.arg), ("ok", r.ok), ("err", r.err), ("ink", r.ink)]
-                {
-                    at(c, &fail, TEXT, what);
+                // Every text on the grounds as painted (Shady #23 M3): the
+                // card, its hover, and each wash from the floored colours.
+                let [on_fail, on_wait, on_ask, on_out] = d_wash_texts(&r);
+                let named = |c: u32| format!("#{c:06x}");
+                for c in &on_fail {
+                    at(*c, &[r.card_d, r.hover, r.wash_fail, r.wash_fail_pk], TEXT, &format!("{} on the fail washes", named(*c)));
                 }
-                at(r.err, &[mix(r.card_d, raw.error_color, f64::from(D_FAIL_PEAK))], TEXT, "err on the flush");
+                for c in &on_wait {
+                    at(*c, &[r.card_d, r.wash_wait, r.wash_wait_pk], TEXT, &format!("{} on the wait washes", named(*c)));
+                }
+                for c in &on_ask {
+                    at(*c, &[r.ask_flush], TEXT, "on the authorize card's flush");
+                }
+                for c in &on_out {
+                    at(*c, &[r.out_press], TEXT, "the outlined Allow, pressed");
+                }
+                // Each is the proposal's own where that reads, never louder,
+                // and the flush's peak never under its rest.
+                assert_eq!(r.wash_fail, mix(r.card_d, r.err, f64::from(D_FAIL_REST)), "{name} {a:?}: the fail rest reads as specified");
+                assert!(contrast(r.wash_fail_pk, r.card_d) >= contrast(r.wash_fail, r.card_d) - 1e-9, "{name} {a:?}");
+                assert!(contrast(r.wash_fail_pk, r.card_d) <= contrast(mix(r.card_d, r.err, f64::from(D_FAIL_PEAK)), r.card_d) + 1e-9);
+                assert!(contrast(r.wash_wait_pk, r.card_d) >= contrast(r.wash_wait, r.card_d) - 1e-9, "{name} {a:?}");
                 at(r.res, &[r.well_d], TEXT, "res");
                 at(r.dim_o, &[r.well_d], TEXT, "dim_o");
-                let wait = [D_WAIT_REST, D_WAIT_PEAK].map(|t| mix(r.card_d, you, f64::from(t)));
-                at(r.acc, &[r.card_d, r.hover, r.acc_soft, wait[0], wait[1]], TEXT, "acc");
+                at(r.acc, &[r.card_d, r.hover, r.acc_soft, r.wash_wait, r.wash_wait_pk], TEXT, "acc");
                 at(r.acc_ink, &[r.btn_fill, r.btn_hi], TEXT, "acc_ink");
                 at(r.acc_line, &[r.card_d], D_ACC_LINE, "acc_line");
                 at(r.acc_soft, &[r.card_d], D_SOFT_OFF, "acc_soft");
@@ -2413,6 +2487,11 @@ mod tests {
             "acc_soft",
             "acc_line",
             "acc_ink",
+            // ... and its washes as painted (Shady #23 M3).
+            "wash_wait",
+            "wash_wait_pk",
+            "ask_flush",
+            "out_press",
         ];
         for (name, raw) in palettes::THEMES {
             let (a, base) = resolve(&raw, None);
