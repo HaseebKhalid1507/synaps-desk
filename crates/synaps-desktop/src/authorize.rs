@@ -892,14 +892,18 @@ impl AppView {
             .bottom(px(-1.))
         });
         // The dashes (F7): static quads along the top edge, inside the
-        // frame, once the trace is done.
-        let dashes = (trace >= 1.).then(|| {
+        // frame, laid behind the trace's top stroke as it passes (all at
+        // once they read as a second arrival, finish gate of #18).
+        let dashes = (trace > 0.).then(|| {
             canvas(
                 |_, _, _| {},
                 move |b, _, window, _| {
-                    let w = f32::from(b.size.width);
-                    for x in dash_xs(w) {
-                        window.paint_quad(fill(Bounds::new(point(b.origin.x + px(x), b.origin.y), size(px(DASH), px(DASH_H))), warn_mark));
+                    let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
+                    // The stroke's head, in this layer's x (the tracer is the
+                    // card's size and 1 px out on every side).
+                    let head = if trace >= 1. { f32::INFINITY } else { trace * (w + 2. + h + 2.) - 1. };
+                    for (x, dw) in dash_spans(w, head) {
+                        window.paint_quad(fill(Bounds::new(point(b.origin.x + px(x), b.origin.y), size(px(dw), px(DASH_H))), warn_mark));
                     }
                 },
             )
@@ -907,7 +911,7 @@ impl AppView {
             .top_0()
             .left_0()
             .right_0()
-            .h(px(DASH_H))
+            .bottom_0()
         });
         let head = if secret { label::SECRET } else { label::AUTHORIZE };
         let header = h_flex()
@@ -1062,6 +1066,12 @@ pub(crate) fn dash_xs(w: f32) -> Vec<f32> {
     (0..n).map(|i| (i as f32 * step).round()).collect()
 }
 
+/// The dashes the trace's top stroke has passed, its head at `head`: the
+/// whole ones, and the one under the head cut there.
+pub(crate) fn dash_spans(w: f32, head: f32) -> Vec<(f32, f32)> {
+    dash_xs(w).into_iter().map(|x| (x, (head - x).clamp(0., DASH))).filter(|&(_, dw)| dw > 0.).collect()
+}
+
 /// The card in its row: 8·r above it, 12·r below (polish.md §2.6), as
 /// padding, so the row's measure is all of it.
 fn card_slot(card: Stateful<Div>, m: &Metrics) -> Div {
@@ -1179,6 +1189,22 @@ mod tests {
             }
         }
         assert!(dash_xs(4.).is_empty());
+    }
+
+    /// The finish gate of #18: the dashes don't land all at once when the
+    /// trace closes; they follow its top stroke's head.
+    #[test]
+    fn the_dashes_follow_the_trace() {
+        use super::{DASH, dash_spans};
+        let w = 624.;
+        let all = dash_xs(w).len();
+        assert!(dash_spans(w, -1.).is_empty(), "nothing before the head moves");
+        let half = dash_spans(w, w / 2.);
+        assert!(half.len() > all / 2 - 2 && half.len() < all / 2 + 2, "half the edge: {} of {all}", half.len());
+        assert!(half.iter().all(|&(x, dw)| x + dw <= w / 2. + 0.01), "none past the head");
+        assert!(half[..half.len() - 1].iter().all(|&(_, dw)| dw == DASH), "the ones behind it whole");
+        assert_eq!(dash_spans(w, f32::INFINITY).len(), all);
+        assert!(dash_spans(w, f32::INFINITY).iter().all(|&(_, dw)| dw == DASH));
     }
 
     #[test]
