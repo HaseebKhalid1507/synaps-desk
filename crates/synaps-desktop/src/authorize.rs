@@ -764,6 +764,9 @@ impl AppView {
                 .border_color(p.line)
                 .bg(bg)
                 .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(p.hover)))
+                // Pressed under the pointer (fluid.md §3.9): state, in the
+                // frame it goes down, at every level.
+                .when(enabled, |d| d.active(|s| s.bg(p.hover).top(px(crate::motion::PRESS))))
                 .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(fg).child(text))
                 .children(key.map(|k| key_hint(k, fg, bg)))
         };
@@ -771,6 +774,7 @@ impl AppView {
             |id: &'static str, text: &'static str, key: Option<&'static str>, enabled: bool, charge: Option<u32>, down: bool| {
                 let (bg, edge, fg) = ALLOW_STYLE.colors(p, false, down);
                 let (hi, _, _) = ALLOW_STYLE.colors(p, true, false);
+                let (press, press_edge, _) = ALLOW_STYLE.colors(p, false, true);
                 let (bg, edge, fg) = if enabled || down { (bg, edge, fg) } else { (p.card_d, p.line, p.dim_k) };
                 let lit = ALLOW_STYLE.colors(p, false, false).0;
                 h_flex()
@@ -790,6 +794,7 @@ impl AppView {
                     .when(enabled, |d| {
                         d.cursor_pointer()
                             .hover(move |d| d.bg(hi).border_color(if ALLOW_STYLE == crate::cards::AllowStyle::Fill { hi } else { edge }))
+                            .active(move |s| s.bg(press).border_color(press_edge).top(px(crate::motion::PRESS)))
                     })
                     // The arm's charge (motion.md §6.3): ten cells of the fill
                     // lit left to right along the foot, as before.
