@@ -718,6 +718,13 @@ pub struct SessionMeta {
     /// it: 0.
     #[serde(default)]
     pub subagents_running: usize,
+    /// Background workers as a daemon with the `session_workers` feature
+    /// lists them (SynapsCLI #416, which replaces `subagents_running`).
+    /// Live in listings only, like `subagents_running`. Missing, `null`, or
+    /// a shape this client doesn't read: empty (the session stays listed).
+    /// Read the count with [`SessionMeta::workers_running`].
+    #[serde(default, deserialize_with = "lenient_workers")]
+    pub workers: SessionWorkers,
     /// How the daemon resolved the id this session was created from (a
     /// resume, `--continue`): set at create, so the `Attached` snapshot's
     /// meta carries it (the create-time copy). `None` for a new session and
@@ -765,6 +772,25 @@ fn lenient_continue_info<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Conti
     })
 }
 
+/// `SessionMeta.workers` (SynapsCLI #416): the count of workers running.
+/// The daemon also sends `rows` and `more`, which this client doesn't read
+/// yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct SessionWorkers {
+    /// Running and not stopping (a cancelled worker is not counted).
+    #[serde(default)]
+    pub running: usize,
+}
+
+/// `SessionMeta.workers`: an object this client can read, else empty.
+fn lenient_workers<'de, D: Deserializer<'de>>(d: D) -> Result<SessionWorkers, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        v @ Value::Object(_) => serde_json::from_value(v).unwrap_or_default(),
+        _ => SessionWorkers::default(),
+    })
+}
+
 /// `SessionMeta.roster`: missing or `null` is empty, a bad entry is dropped.
 fn lenient_roster<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<ClientInfo>, D::Error> {
     Ok(lenient(null_vec(d)?).0)
@@ -777,6 +803,13 @@ impl SessionMeta {
 
     pub fn is_parked(&self) -> bool {
         self.lifecycle == "parked"
+    }
+
+    /// Background workers running, from whichever field the daemon sends:
+    /// `workers.running` (SynapsCLI #416, on `dev`) or `subagents_running`
+    /// (#410, local builds only). 0 from a daemon that sends neither.
+    pub fn workers_running(&self) -> usize {
+        self.workers.running.max(self.subagents_running)
     }
 
     /// Whether `id` (a session or journal id) is this session.

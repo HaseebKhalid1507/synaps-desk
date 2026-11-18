@@ -2,6 +2,15 @@
 
 Commit hashes are this repository's (`synaps-desk`). PR numbers other than synaps-desk#N are those of the archived `synaps-desktop` repository this history was rewritten from.
 
+## Since 461a006
+
+Additive only: workers in session lists from a `dev` daemon (SynapsCLI #416, which replaces #410's `subagents_running`).
+
+- New `SessionMeta.workers: SessionWorkers` (`#[non_exhaustive]`, `running` only for now), read leniently: missing, `null` or a shape this client can't read is empty, and the session stays listed.
+- New `SessionMeta::workers_running()`: `workers.running` or `subagents_running`, whichever the daemon sends. The desktop now reads the count through it.
+- **Breaking** for code that builds `SessionMeta { .. }` without `..`: add `workers`.
+- Tests: `tests/fixtures.rs` `session_meta_reads_workers_from_either_daemon`.
+
 ## Since 9b0d263
 
 Engine events (synaps-desk `feat/events`). Additive; one behaviour change for history rows that are events.
