@@ -1409,9 +1409,19 @@ fn row_tops(cx: &mut TestAppContext, view: &Entity<AppView>) -> std::collections
 /// Frames until no fold room is left: the largest move of a row on screen
 /// in two frames running, and how many frames had the room.
 fn fold_frames(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> (f32, usize) {
+    fold_frames_hitched(cx, w, view, 0)
+}
+
+/// [`fold_frames`], every `hitch`th frame 50 ms late (0: none).
+fn fold_frames_hitched(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, hitch: usize) -> (f32, usize) {
     let mut last = row_tops(cx, view);
     let (mut step, mut gapped) = (0f32, 0);
     for f in 0..600 {
+        if hitch > 0 && f % hitch == hitch - 1 {
+            let late = std::time::Duration::from_millis(50) - std::time::Duration::from_micros(6944);
+            view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + late));
+            cx.executor().advance_clock(late);
+        }
         fluid_frame(cx, w, view);
         let now = row_tops(cx, view);
         let moved: Vec<((u64, bool), f32, f32)> = now.iter().filter_map(|(k, y)| last.get(k).map(|y0| (*k, *y, y - y0))).collect();
@@ -1452,7 +1462,7 @@ fn turn_of_calls(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppV
 }
 
 /// The design gate of #23, N1: a run folds on a spring, never a cut. No
-/// row on screen moves more than about 40 px a 60 Hz frame (17 px a 144 Hz
+/// row on screen moves more than about 40 px a 60 Hz frame (13 px a 144 Hz
 /// test frame), and the fold takes well over 15 60 Hz frames:
 /// - clicked mid-screen, its header holds (the list keeps its top row);
 /// - clicked at the list's end, its header holds too (the room is held);
@@ -1460,7 +1470,8 @@ fn turn_of_calls(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppV
 ///   it far above the view (a long run): the end holds, what is above
 ///   comes down.
 ///
-/// Reduced and Off: a cut, the header still where it was.
+/// Reduced and Off: a cut, the header still where it was. A late frame
+/// (50 ms) pauses the fold: its step is no bigger than a 60 Hz frame's.
 #[gpui_kit::test]
 fn a_run_folds_on_a_spring_never_a_cut(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
@@ -1501,7 +1512,7 @@ fn a_run_folds_on_a_spring_never_a_cut(cx: &mut TestAppContext) {
     assert_eq!(header(cx), Some(at), "the click: the header holds");
     let (step, gapped) = fold_frames(cx, w, &view);
     assert_eq!(header(cx), Some(at), "landed: the header where it was");
-    assert!(step <= 17., "mid-screen: a row moved {step} px in one frame");
+    assert!(step <= 13., "mid-screen: a row moved {step} px in one frame");
     assert!(gapped >= 36, "mid-screen: {gapped} 144 Hz frames");
     // The turn's end at the list's end: its header on screen, then far
     // above it.
@@ -1516,7 +1527,7 @@ fn a_run_folds_on_a_spring_never_a_cut(cx: &mut TestAppContext) {
         cx.run_until_parked();
         assert!(VisualTestContext::from_window(w, cx).debug_bounds("fold-gap").is_some(), "{n} calls: the room held, not cut");
         let (step, gapped) = fold_frames(cx, w, &view);
-        assert!(step <= 17., "{n} calls at the turn's end: a row moved {step} px in one frame");
+        assert!(step <= 13., "{n} calls at the turn's end: a row moved {step} px in one frame");
         assert!(gapped >= 20, "{n} calls at the turn's end: {gapped} frames");
         assert!(!tops.is_empty());
         if n == 5 {
@@ -1549,8 +1560,28 @@ fn a_run_folds_on_a_spring_never_a_cut(cx: &mut TestAppContext) {
             let (step, gapped) = fold_frames(cx, w, &view);
             let now = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top()));
             assert_eq!(now, Some(at), "clicked at the end: the header holds");
-            assert!(step <= 17., "clicked at the end: a row moved {step} px in one frame");
+            assert!(step <= 13., "clicked at the end: a row moved {step} px in one frame");
             assert!(gapped >= 20, "clicked at the end: {gapped} frames");
+            // Again, every 5th frame 50 ms late (a busy machine): the fold
+            // pauses through each, a step no bigger than a 60 Hz frame's.
+            flip(cx);
+            for _ in 0..240 {
+                fluid_frame(cx, w, &view);
+            }
+            view.update(cx, |v, cx| {
+                v.list.scroll_to_end();
+                cx.notify();
+            });
+            for _ in 0..4 {
+                fluid_frame(cx, w, &view);
+            }
+            let at = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top())).expect("its header at the end");
+            flip(cx);
+            let (step, gapped) = fold_frames_hitched(cx, w, &view, 5);
+            let now = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top()));
+            assert_eq!(now, Some(at), "hitched: the header holds");
+            assert!(step <= 32., "hitched: a row moved {step} px in one frame");
+            assert!(gapped >= 20, "hitched: {gapped} frames");
         }
     }
     // Reduced and Off: a cut, the header where it was.
