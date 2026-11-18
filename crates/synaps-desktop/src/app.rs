@@ -226,7 +226,9 @@ actions!(
         ToggleFavourite,
         CardTab,
         MenuTab,
-        MenuTabBack
+        MenuTabBack,
+        OpenGoTo,
+        OpenCommands
     ]
 );
 
@@ -300,7 +302,17 @@ pub fn bind_keys(cx: &mut App) {
     keys.push(KeyBinding::new("shift-tab", MenuTabBack, Some(MENU_CTX)));
     keys.push(KeyBinding::new(RENAME_KEY, RenameSession, None));
     keys.push(KeyBinding::new(fav_key(mac), ToggleFavourite, None));
+    let (goto, commands) = palette_keys(mac);
+    keys.push(KeyBinding::new(goto, OpenGoTo, None));
+    keys.push(KeyBinding::new(commands, OpenCommands, None));
     cx.bind_keys(keys);
+}
+
+/// The palette's keys (polish.md P16), as VS Code's: Ctrl+P goes to,
+/// Ctrl+K runs a command; Cmd on macOS. Bound at the root with no context,
+/// so the composer's input (which binds neither) never swallows them.
+pub(crate) const fn palette_keys(mac: bool) -> (&'static str, &'static str) {
+    if mac { ("cmd-p", "cmd-k") } else { ("ctrl-p", "ctrl-k") }
 }
 
 /// Favourites the session on screen, or unfavourites it (as a browser's
@@ -1561,6 +1573,19 @@ pub struct AppView {
     /// What had the focus when the menu opened (it takes the keys while
     /// open): given back once it closes, if nothing else took it.
     pub(crate) menu_focus_back: Option<FocusHandle>,
+    /// The palette, open (polish.md P16), its query field, what had the
+    /// focus when it opened (given back when it closes), the row its quad
+    /// was last drawn on, its list's scroll, and the lists it was built
+    /// from ([`AppView::refresh_palette`]).
+    pub(crate) palette: Option<crate::palette::Palette>,
+    pub(crate) palette_input: Entity<InputState>,
+    pub(crate) palette_back: Option<FocusHandle>,
+    pub(crate) palette_sel: Cell<Option<usize>>,
+    pub(crate) palette_scroll: ScrollHandle,
+    pub(crate) palette_gen: u64,
+    /// The palette's list height and quad as last drawn, and their targets.
+    #[cfg(test)]
+    pub(crate) palette_drawn: Cell<(f32, f32, f32, f32)>,
     pub(crate) cancel_tick: Option<Task<()>>,
     /// A session's menu (a right-click on its tab or rail row): Rename…,
     /// Close tab.
@@ -1727,6 +1752,7 @@ impl AppView {
             s
         });
         let find_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::chrome::FIND.0));
+        let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::palette::PLACEHOLDER));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
         let secret_input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("answer (hidden)"));
@@ -1749,6 +1775,16 @@ impl AppView {
                     cx.notify();
                 }
                 _ => {}
+            }),
+            // The palette filters as it is typed.
+            cx.subscribe_in(&palette_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
+                if let InputEvent::Change = ev
+                    && let Some(p) = this.palette.as_mut()
+                {
+                    p.set_query(&input.read(cx).value());
+                    this.palette_scroll.scroll_to_item(0);
+                    cx.notify();
+                }
             }),
             // Find filters as it is typed; Enter opens by exact name. The
             // typed name stays until the outcome is known: cleared on
@@ -1889,6 +1925,7 @@ impl AppView {
         let inputs = Inputs {
             composer,
             find_input,
+            palette_input,
             name_input,
             hex_input,
             secret_input,
@@ -2116,6 +2153,14 @@ impl AppView {
             placeholder_of: None,
             menu: None,
             menu_focus_back: None,
+            palette: None,
+            palette_input: i.palette_input,
+            palette_back: None,
+            palette_sel: Cell::new(None),
+            palette_scroll: ScrollHandle::new(),
+            palette_gen: 0,
+            #[cfg(test)]
+            palette_drawn: Cell::new((0., 0., 0., 0.)),
             cancel_tick: None,
             smenu: None,
             wmenu: None,
@@ -3200,6 +3245,13 @@ impl AppView {
             });
             return false;
         }
+        // `/compact`, `/context` ...: the engine runs it (the palette's
+        // Commands take this path too), never sent as a message.
+        if text.starts_with('/')
+            && let Some((name, arg)) = crate::palette::engine_of(&text)
+        {
+            return self.run_command(name, arg.to_string());
+        }
         // In a worker's view, Enter steers that worker (never the session).
         if let Some(target) = self.model.watch.steer_target() {
             let handle = match target {
@@ -3646,13 +3698,14 @@ impl AppView {
     /// The card's keys act: it is on screen in the active window with its
     /// buttons whole (a tiled window can be shorter than its minimum), no
     /// overlay is open (the theme picker, the gear's menu, a worker's, a
-    /// session's or the workers menu: Tab steps them), and nothing
+    /// session's or the workers menu: Tab steps them; the palette: Tab
+    /// flips its mode), and nothing
     /// typed in has the focus (the window's own), or a secret prompt's
     /// field does (`Some(true)`: Enter there submits). The composer, find
     /// and the other fields keep Enter and Esc.
     fn card_keys_live(&self, window: &Window, cx: &App) -> Option<bool> {
         let shown = self.card_on_screen();
-        let menu = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some();
+        let menu = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some() || self.palette.is_some();
         if !self.card_up() || !shown || self.picker_open || self.gear_menu || menu || !window.is_window_active() {
             None
         } else if self.secret_input.read(cx).focus_handle(cx).is_focused(window) {
@@ -4622,6 +4675,32 @@ impl AppView {
         }
     }
 
+    /// Every finished run folded, or unfolded (the palette's commands): at
+    /// once, no cascade (a bulk change is not a reveal). The list keeps its
+    /// top row, as one run's fold does; following the tail, it follows on.
+    pub(crate) fn fold_all_runs(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.sync_list();
+        let runs: Vec<u64> = self.disp.iter().filter(|d| matches!(d.kind, Kind::Summary { .. })).map(|d| d.id).collect();
+        let before = self.open_runs.len();
+        if open {
+            self.open_runs.extend(runs);
+        } else {
+            self.open_runs.clear();
+        }
+        if self.open_runs.len() == before && (open || before == 0) {
+            return;
+        }
+        self.scroller.cancel();
+        let following = self.list.is_following_tail();
+        if !following {
+            let top = self.list.logical_scroll_top();
+            self.list.scroll_to(top);
+        }
+        self.unfold_hold.clear();
+        self.rebuild_from(0);
+        cx.notify();
+    }
+
     /// An unfold's rows revealing ([`Self::unfold_hold`]): tail-follow
     /// stays paused, the clicked header where it was. Before the list's
     /// layout, each frame.
@@ -4778,7 +4857,7 @@ impl AppView {
 
     /// The favourite key: the session tab on screen. Not while typing (a
     /// TUI hand's Ctrl+D there is no toggle of the favourites).
-    fn fav_key_pressed(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn fav_key_pressed(&mut self, window: &Window, cx: &mut Context<Self>) {
         if self.typing(window, cx) {
             return;
         }
@@ -5681,6 +5760,7 @@ pub(crate) fn one_line(s: &str, max: usize) -> String {
 struct Inputs {
     composer: Entity<TextareaState>,
     find_input: Entity<InputState>,
+    palette_input: Entity<InputState>,
     name_input: Entity<InputState>,
     hex_input: Entity<InputState>,
     pub(crate) secret_input: Entity<InputState>,
@@ -5733,6 +5813,7 @@ impl Render for AppView {
             self.disarm_halt();
         }
         self.sync_composer(window, cx);
+        self.refresh_palette(window, cx);
         if std::mem::take(&mut self.model.named.opened) {
             self.find_input.update(cx, |s, cx| s.set_value("", window, cx));
             self.find.clear();
@@ -6131,6 +6212,9 @@ impl Render for AppView {
             .when(self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some(), |d| d.key_context(MENU_CTX))
             .on_action(cx.listener(|this, _: &MenuTab, _, cx| this.menu_tab(false, cx)))
             .on_action(cx.listener(|this, _: &MenuTabBack, _, cx| this.menu_tab(true, cx)))
+            .on_action(cx.listener(|this, _: &OpenGoTo, window, cx| this.open_palette(crate::palette::Mode::GoTo, window, cx)))
+            .on_action(cx.listener(|this, _: &OpenCommands, window, cx| this.open_palette(crate::palette::Mode::Commands, window, cx)))
+            .map(|d| crate::palette::capture_keys(d, cx))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
             .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| match this.swallow_clicks {
@@ -6158,6 +6242,9 @@ impl Render for AppView {
                     && !this.model.transcript.pending_prompts().is_empty()
                 {
                     cx.stop_propagation();
+                    if this.palette.is_some() {
+                        this.close_palette(window, cx);
+                    }
                     this.jump_to_card(window, cx);
                     return;
                 }
@@ -6397,6 +6484,7 @@ impl Render for AppView {
             .children(self.render_menu_at_point(&p, cx))
             .children(self.render_session_menu(&p, cx))
             .children(self.render_workers_menu(&p, cx))
+            .children(self.render_palette(crate::chrome::MARK + rail.width(), if view.is_some() { view_pane } else { pane }, &p, cx))
             .children(self.render_link(tear, &p, &theme::live_palette(cx)))
             .children(self.render_tracer(&p))
             // Painted last, after every row was rendered: what the frame's
@@ -6426,8 +6514,8 @@ mod tests {
     use super::{
         ARM, Arm, CENTRE_MIN, CardChord, CardKey, FavsJob, FoldKeys, Foot, FootIn, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY,
         above_list, authorize_ready, card_key, card_key_on, command_of, dragged, fav_key, fit_foot, held_back, hidden, input_of, left_cut,
-        lines_below, one_line, panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled, well_body,
-        worker_keys,
+        lines_below, one_line, palette_keys, panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled,
+        well_body, worker_keys,
     };
     use crate::theme::{Metrics, Panels};
     use crate::turns::Layout;
@@ -6754,8 +6842,13 @@ mod tests {
         }
         for mac in [false, true] {
             let (a, b) = panel_keys(mac);
-            // Ctrl+D / Cmd+D, the favourite key, with them.
-            let mut app: Vec<_> = [a, b, fav_key(mac)].into_iter().chain(text_keys(mac)).map(|k| (parse(k), None)).collect();
+            // Ctrl+D / Cmd+D, the favourite key, and the palette's
+            // Ctrl+P / Ctrl+K (Cmd on macOS) with them; Ctrl+J (the card) is
+            // read off the key itself, so no binding is it either.
+            let (goto, commands) = palette_keys(mac);
+            let mut app: Vec<_> =
+                [a, b, fav_key(mac), goto, commands].into_iter().chain(text_keys(mac)).map(|k| (parse(k), None)).collect();
+            assert!(!app.iter().any(|(k, _)| k.key == "j" && k.modifiers.control), "Ctrl+J is the card's");
             app.extend(tab_keys(mac).iter().map(|(k, what)| (parse(k), Some(*what))));
             for (i, (k, what)) in app.iter().enumerate() {
                 assert!(!input.contains(k), "{k:?} is an input key");

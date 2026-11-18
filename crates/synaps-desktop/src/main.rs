@@ -1,7 +1,7 @@
 //! Synaps Desktop (GPUI spike): a thin client for the Synaps daemon.
 //!
 //! ```text
-//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL|FILE] [--motion full|reduced|off]
+//! synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--palette goto|commands] [--size WxH] [--dash URL|FILE] [--motion full|reduced|off]
 //! synaps-desktop --bench [--profile P --prompt TEXT] [--refresh-hz HZ]
 //! synaps-desktop --bench-tabs [--bench-history FILE] [--refresh-hz HZ]
 //! synaps-desktop --bench-motion [--refresh-hz HZ]
@@ -44,6 +44,7 @@ mod model;
 mod motion;
 mod named;
 mod overlay;
+mod palette;
 mod palettes;
 mod rail;
 mod scroll;
@@ -94,6 +95,7 @@ fn main() {
     let mut theme_flag: Option<String> = None;
     let mut start_session: Option<String> = None;
     let mut open_picker = false;
+    let mut open_palette = None;
     let mut window_size: Option<(f32, f32)> = None;
     let mut dash_flag: Option<String> = None;
     let mut motion_flag: Option<String> = None;
@@ -132,6 +134,16 @@ fn main() {
             "--motion" => motion_flag = Some(value(&mut args, "--motion")),
             "--session" => start_session = Some(value(&mut args, "--session")),
             "--accent-picker" => open_picker = true,
+            "--palette" => {
+                open_palette = Some(match value(&mut args, "--palette").as_str() {
+                    "goto" => palette::Mode::GoTo,
+                    "commands" => palette::Mode::Commands,
+                    v => {
+                        eprintln!("--palette takes goto or commands: {v}");
+                        std::process::exit(2);
+                    }
+                })
+            }
             "--dash" => {
                 let v = value(&mut args, "--dash");
                 // A token on a command line is readable by every local user.
@@ -155,7 +167,7 @@ fn main() {
             "-h" | "--help" => {
                 let names: Vec<&str> = palettes::THEMES.iter().map(|t| t.0).collect();
                 println!(
-                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--size WxH] [--dash URL|FILE] [--motion full|reduced|off] [--bench [--prompt TEXT] [--refresh-hz HZ] | --bench-tabs [--bench-history FILE] | --bench-motion]\n\
+                    "synaps-desktop [--profile P | --socket PATH | --offline] [--session ID] [--theme NAME] [--accent #RRGGBB] [--accent-picker] [--palette goto|commands] [--size WxH] [--dash URL|FILE] [--motion full|reduced|off] [--bench [--prompt TEXT] [--refresh-hz HZ] | --bench-tabs [--bench-history FILE] | --bench-motion]\n\
                      theme: --theme, else ${}, else the picker's settings file ({}), else `theme =` in the Synaps config, else {}\n\
                      themes: {}\n\
                      accent (overrides the theme's \"you\" and focus colours): --accent, else ${}, else the settings file, else none",
@@ -293,6 +305,9 @@ fn main() {
                 v.restore_tabs = restore_tabs;
                 v.model.favs = favourites::Favourites::new(favs);
                 v.picker_open = open_picker;
+                if let Some(mode) = open_palette {
+                    v.open_palette(mode, window, cx);
+                }
                 v.panels = panels;
                 // OLDER left open: list up to the wire's cap from the start.
                 v.model.named.deep = panels.history_open & rail::Bucket::Older.bit() != 0;

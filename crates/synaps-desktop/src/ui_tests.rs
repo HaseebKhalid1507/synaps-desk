@@ -5198,3 +5198,173 @@ fn tracer_lands_on_new_tab(cx: &mut TestAppContext) {
     settle(cx, w, 4);
     assert!(view.read_with(cx, |v, _| v.tracer.is_none()), "Reduced: no tracer");
 }
+
+/// The palette's keys as this OS spells them (Ctrl+P / Ctrl+K, Cmd on macOS).
+fn palette_key(commands: bool) -> &'static str {
+    let (goto, cmds) = crate::app::palette_keys(cfg!(target_os = "macos"));
+    if commands { cmds } else { goto }
+}
+
+/// `text` typed into what has the focus, as the platform's text input.
+fn type_in(cx: &mut TestAppContext, w: AnyWindowHandle, text: &str) {
+    VisualTestContext::from_window(w, cx).simulate_input(text);
+    cx.run_until_parked();
+}
+
+fn palette_mode(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<crate::palette::Mode> {
+    view.read_with(cx, |v, _| v.palette.as_ref().map(|p| p.mode))
+}
+
+fn palette_focused(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> bool {
+    cx.update_window(w, |_, window, cx| view.read(cx).palette_input.read(cx).focus_handle(cx).is_focused(window)).expect("the window")
+}
+
+/// polish.md P16: Ctrl+P opens GO TO from the composer (its input binds
+/// neither key), the query focused and the card's keys off while it is
+/// open; Esc closes it and gives the composer its focus back. That Esc is
+/// the palette's: it arms no HALT and denies nothing.
+#[gpui_kit::test]
+fn palette_esc_restores_focus(cx: &mut TestAppContext) {
+    use crate::palette::Mode;
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(false));
+    assert_eq!(palette_mode(cx, &view), Some(Mode::GoTo));
+    assert!(palette_focused(cx, w, &view) && !composer_focused(cx, w, &view), "the query has the focus");
+    tap(cx, w, "escape");
+    assert_eq!(palette_mode(cx, &view), None, "Esc closes it");
+    assert!(composer_focused(cx, w, &view), "the focus is back in the composer");
+    assert!(view.read_with(cx, |v, _| v.halts == 0 && v.halt_armed.is_none()), "the palette's Esc arms no HALT");
+    // From the window's own focus (the card up): back there, and the card's
+    // keys are off while it is open.
+    let (w, view, _events) = open(cx);
+    card_keys(cx, w, &view);
+    tap(cx, w, palette_key(true));
+    assert_eq!(palette_mode(cx, &view), Some(Mode::Commands));
+    settle(cx, w, 4);
+    assert_eq!(view.read_with(cx, |v, _| v.card_keys.get()), None, "the card's keys are off under the palette");
+    tap(cx, w, "escape");
+    assert_eq!(palette_mode(cx, &view), None);
+    assert!(view.read_with(cx, |v, _| v.current_card().is_some()), "Esc closed the palette, not the card (no DENY)");
+    assert!(cx.update_window(w, |_, window, cx| view.read(cx).focus.is_focused(window)).expect("the window"), "the window's focus again");
+}
+
+/// polish.md P16: Tab belongs to the palette (never typed, never the kit's
+/// focus cycling, never the card's Allow all): it flips the mode; the other
+/// mode's key switches to it, its own key leaves it.
+#[gpui_kit::test]
+fn palette_tab_flips_mode(cx: &mut TestAppContext) {
+    use crate::palette::Mode;
+    let (w, view, _events) = open(cx);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(false));
+    tap(cx, w, "tab");
+    assert_eq!(palette_mode(cx, &view), Some(Mode::Commands), "Tab: commands");
+    tap(cx, w, "shift-tab");
+    assert_eq!(palette_mode(cx, &view), Some(Mode::GoTo), "Shift+Tab: back");
+    assert!(palette_focused(cx, w, &view), "the query keeps the focus");
+    assert_eq!(view.read_with(cx, |v, cx| v.palette_input.read(cx).value().to_string()), "", "no tab typed");
+    tap(cx, w, palette_key(true));
+    assert_eq!(palette_mode(cx, &view), Some(Mode::Commands), "Ctrl+K switches");
+    tap(cx, w, palette_key(true));
+    assert_eq!(palette_mode(cx, &view), Some(Mode::Commands), "and stays");
+    tap(cx, w, palette_key(false));
+    assert_eq!(palette_mode(cx, &view), Some(Mode::GoTo), "Ctrl+P switches back");
+    // ↓ then Enter picks; the palette closes.
+    let first = view.read_with(cx, |v, _| v.palette.as_ref().and_then(|p| p.selected().map(|e| e.group)));
+    assert_eq!(first, Some(crate::palette::Group::Sessions), "GO TO starts at the sessions");
+    tap(cx, w, "enter");
+    assert_eq!(palette_mode(cx, &view), None, "Enter picks and closes");
+}
+
+/// polish.md P16 / fluid.md §3.10: opened by key, the palette is whole in
+/// its first frame (its list's height and the selection quad at their
+/// targets); then the quad springs to a new row and the height to what the
+/// query leaves, on `snap`. Reduced and Off: at once.
+#[gpui_kit::test]
+fn palette_keyboard_open_is_instant(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(true));
+    let drawn = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.palette_drawn.get());
+    let (h, ht, q, qt) = drawn(cx);
+    assert!(ht > 0. && h == ht && q == qt, "whole in its first frame: {h} / {ht}, quad {q} / {qt}");
+    tap(cx, w, "down");
+    let (_, _, q, qt) = drawn(cx);
+    assert!(q != qt, "the quad springs to the next row: {q} → {qt}");
+    for _ in 0..60 {
+        wait(cx, w, &view, 7);
+    }
+    let (_, _, q, qt) = drawn(cx);
+    assert_eq!(q, qt, "and lands");
+    type_in(cx, w, "/model");
+    frame(cx, &view);
+    let (h, ht, _, _) = drawn(cx);
+    assert!(h != ht && ht < 100., "the height springs to what is left: {h} → {ht}");
+    for _ in 0..60 {
+        wait(cx, w, &view, 7);
+    }
+    let (h, ht, _, _) = drawn(cx);
+    assert_eq!(h, ht, "and settles");
+    for level in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
+        set_motion(cx, &view, level);
+        tap(cx, w, "escape");
+        tap(cx, w, palette_key(true));
+        tap(cx, w, "down");
+        let (h, ht, q, qt) = drawn(cx);
+        assert!(h == ht && q == qt, "{level:?}: at once");
+    }
+}
+
+/// polish.md P16: an engine command is the session owner's: observing,
+/// the palette marks it and picking it sends nothing, politely; driving,
+/// it goes out as the engine command, and the composer's `/compact` takes
+/// the same path (never sent as a message).
+#[gpui_kit::test]
+fn palette_engine_commands_are_the_owners(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    resolve_prompt(cx, &view);
+    let mode = view.read_with(cx, |v, _| v.model.active.as_ref().unwrap().mode);
+    view.update(cx, |v, cx| {
+        v.model.active.as_mut().unwrap().mode = synaps_client::AttachMode::Observe;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    focus_composer(cx, w, &view);
+    tap(cx, w, palette_key(true));
+    type_in(cx, w, "/compact");
+    let sel = view.read_with(cx, |v, _| v.palette.as_ref().and_then(|p| p.selected().cloned())).expect("a row");
+    assert_eq!(sel.act, crate::palette::Act::Engine("compact"));
+    assert_eq!(sel.key.as_deref(), Some("owner"), "marked");
+    assert!(sel.off.as_deref().is_some_and(|o| o.contains("owner's") && o.contains("observes")), "{:?}", sel.off);
+    tap(cx, w, "enter");
+    let note = view.read_with(cx, |v, _| v.watch_note.clone()).expect("a note");
+    assert!(note.contains("owner's"), "refused politely: {note}");
+    // Driving: it goes out (the client takes it; its daemon is nowhere).
+    view.update(cx, |v, cx| {
+        v.model.active.as_mut().unwrap().mode = mode;
+        v.watch_note = None;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(view.update(cx, |v, _| v.run_command("context", String::new())), "sent");
+    assert!(view.read_with(cx, |v, _| v.watch_note.clone()).is_some_and(|n| n.contains("/context: sent")));
+    // The composer's `/compact`: the same path, not a message.
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.composer.update(cx, |s, cx| {
+                s.set_value("/compact", window, cx);
+                s.focus(window, cx);
+            })
+        })
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    let sent_before = view.read_with(cx, |v, _| v.model.transcript.items().len());
+    tap(cx, w, "enter");
+    assert!(view.read_with(cx, |v, _| v.watch_note.clone()).is_some_and(|n| n.contains("/compact: sent")), "the engine's");
+    assert_eq!(view.read_with(cx, |v, _| v.model.transcript.items().len()), sent_before, "no message in the log");
+    assert_eq!(composer_text(cx, &view), "", "taken from the composer");
+}
