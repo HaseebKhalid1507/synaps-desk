@@ -1863,7 +1863,7 @@ impl AppView {
             .items_center()
             .text_px(m.meta)
             .whitespace_nowrap()
-            .when(!v.facts_bare.is_empty(), |d| d.child(spawn_facts(fx, key, &v.facts_bare, tick, p)))
+            .when(!v.facts_bare.is_empty(), |d| d.child(spawn_facts(fx, &v.facts_bare, tick, p)))
             .when(warn && !lay.tight, |d| d.child(div().text_color(word_color).child(word)));
         let button = who.clone().map(|who| {
             let who2 = who.clone();
@@ -1948,10 +1948,10 @@ impl AppView {
                         .text_px(m.meta)
                         .whitespace_nowrap()
                         .child(glyph::draw(Glyph::Elbow, p.dim_t))
-                        // A changed step rolls (polish.md P5).
-                        .child(motion::rolled(fx, motion::key(motion::ROLL_STEP, key), text, true, true, |t| {
-                            div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.sub_status_t).child(t)
-                        }))
+                        // A changed step swaps in place: under a live fan-out a
+                        // roll is an app frame at 30 Hz for every change
+                        // (polish.md P5, gate 4).
+                        .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(p.sub_status_t).child(text))
                         .into_any_element(),
                 )
             })
@@ -2078,26 +2078,11 @@ fn well(row: &RowCache, failed: bool, id: u64, geo: Geo, p: &Palette, m: &Metric
     }
 }
 
-/// A spawn row's facts (polish.md §2.4): running, its tool count rolls
-/// (P5) and its clock ticks (never rolls); ended, as reported.
-fn spawn_facts(
-    fx: &std::rc::Rc<Motion>,
-    key: u64,
-    facts: &SharedString,
-    tick: &Option<(SharedString, subagents::Tick)>,
-    p: &Palette,
-) -> AnyElement {
-    let text = |t: SharedString| div().text_color(p.dim_t).child(t);
-    let Some((head, _)) = tick.as_ref().filter(|(h, _)| fx.on() && !h.is_empty()) else {
-        return text(crate::tray::ticked(fx, facts, tick)).into_any_element();
-    };
-    let whole = crate::tray::ticked(fx, facts, tick);
-    let clock: SharedString = whole.strip_prefix(head.as_ref()).unwrap_or_default().to_string().into();
-    let n = head.split(|c: char| !c.is_ascii_digit()).find(|d| !d.is_empty()).and_then(|d| d.parse().ok()).unwrap_or(0);
-    h_flex()
-        .child(motion::roll_count(fx, motion::key(motion::ROLL_TOOLS, key), n, head.clone(), text))
-        .child(text(clock))
-        .into_any_element()
+/// A spawn row's facts (polish.md §2.4): running, its clock ticks; its
+/// tool count changes in place (P5: under a live fan-out a roll is an app
+/// frame at 30 Hz for every change, gate 4); ended, as reported.
+fn spawn_facts(fx: &std::rc::Rc<Motion>, facts: &SharedString, tick: &Option<(SharedString, subagents::Tick)>, p: &Palette) -> AnyElement {
+    div().text_color(p.dim_t).child(crate::tray::ticked(fx, facts, tick)).into_any_element()
 }
 
 /// A summary's chevron is keyed apart from its first row's own.

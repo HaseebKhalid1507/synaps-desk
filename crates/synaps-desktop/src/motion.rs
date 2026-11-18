@@ -1225,11 +1225,11 @@ pub(crate) fn roll_count(fx: &Motion, key: u64, n: usize, text: SharedString, ma
     rolled(fx, key, text, up, false, make)
 }
 
-/// What rolls (polish.md P5), each in its own key space: a worker's tool
-/// count and live line, a run's `N calls`, `+N more`, the NEEDS YOU count,
-/// the rail's chips. Never a clock, cost, tokens or a %.
-pub(crate) const ROLL_TOOLS: u64 = 0x7AD0 << 48;
-pub(crate) const ROLL_STEP: u64 = 0x7AD1 << 48;
+/// What rolls (polish.md P5), each in its own key space: a run's `N
+/// calls`, `+N more`, the NEEDS YOU count, the rail's chips. Never a clock,
+/// cost, tokens or a %; nor a worker's tool count or live line (gate 4: a
+/// roll is 30 Hz of app frames, and a live fan-out changes them every
+/// fraction of a second; they come back as beat-layer paint).
 pub(crate) const ROLL_CALLS: u64 = 0x7AD2 << 48;
 pub(crate) const ROLL_MORE: u64 = 0x7AD3 << 48;
 pub(crate) const ROLL_NEEDS: u64 = 0x7AD4 << 48;

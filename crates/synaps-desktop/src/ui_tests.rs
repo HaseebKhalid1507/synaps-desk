@@ -2696,53 +2696,79 @@ fn worker_rows(tools: u64, step: &str) -> serde_json::Value {
         "cancel_requested": false, "elapsed_secs": 2.0, "finished_elapsed": null, "step": step, "tools": tools}]})
 }
 
-/// polish.md P5 in the transcript (finish gate #17): a spawn row's tool
-/// count and its live line's step roll on the frame after they change (the
-/// new text and the old a line apart, in px, on screen), and land on the
-/// value. A clock never rolls (`clocks_never_roll`).
+/// polish.md P5: a count that still rolls (the top bar's NEEDS YOU, one
+/// more session waiting) rolls only its changed digit cells, on the frame
+/// after it changes: the new text and the old a line apart, in px, on
+/// screen, constant as they travel, then one text at rest. Its words are
+/// the same (`N   NEED YOU`): no old words are drawn (`rolled-words`).
 #[gpui_kit::test]
-fn transcript_counts_roll(cx: &mut TestAppContext) {
+fn a_count_rolls_in_its_digit_cells(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Full);
-    life_worker(cx, w, &view);
-    let rolling = |cx: &mut TestAppContext, space| view.read_with(cx, |v, _| v.fx.rolling_in(Some(space)));
-    assert!(rolling(cx, crate::motion::ROLL_TOOLS).is_empty(), "at rest");
-    local(cx, &view, vec![worker_rows(2, "grep -n rotate src")]);
+    settle(cx, w, 8);
+    let rolling = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.rolling_in(Some(crate::motion::ROLL_NEEDS)));
+    assert!(rolling(cx).is_empty(), "at rest");
+    view.update(cx, |v, cx| {
+        let id = v
+            .model
+            .sessions
+            .iter()
+            .find(|m| m.awaiting_input == 0 && m.lifecycle != "ending" && !v.model.is_active(&m.id))
+            .map(|m| m.id.clone())
+            .expect("a session not waiting");
+        if let Some(m) = v.model.sessions.iter_mut().find(|m| m.id == id) {
+            m.awaiting_input = 1;
+        }
+        v.model.rail_gen += 1;
+        cx.notify();
+    });
     wait(cx, w, &view, 16);
-    let apart = |cx: &mut TestAppContext, k: u64| {
+    let keys = rolling(cx);
+    assert_eq!(keys.len(), 1, "NEEDS YOU's count rolls");
+    let k = keys[0];
+    let apart = |cx: &mut TestAppContext| {
         let mut vcx = VisualTestContext::from_window(w, cx);
         let new = vcx.debug_bounds(format!("rolling-{k:x}").leak()).expect("the new text drawn");
         let old = vcx.debug_bounds(format!("rolled-{k:x}").leak()).expect("the old text drawn");
         f32::from(new.origin.y) - f32::from(old.origin.y)
     };
-    for space in [crate::motion::ROLL_TOOLS, crate::motion::ROLL_STEP] {
-        let keys = rolling(cx, space);
-        assert_eq!(keys.len(), 1, "{space:x}: `1 tool` → `2 tools` and the step roll");
-        let d = apart(cx, keys[0]);
-        assert!(d > 8., "{space:x}: a line apart, the new one coming up from below: {d}");
-    }
-    let k = rolling(cx, crate::motion::ROLL_TOOLS)[0];
-    let d0 = apart(cx, k);
-    // `1 tool` → `2 tools`: the old word stays until the digits cross
-    // mid-roll, then the new one (re-gate #17: never `1 tools`).
-    let words =
-        |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
-    assert!(words(cx), "the first frames: `1 tool`, the digit leaving");
+    let d0 = apart(cx);
+    assert!(d0 > 8., "a line apart, the new one coming up from below: {d0}");
+    let words = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
+    assert!(!words(cx), "the words are the same: drawn once, in place");
     for _ in 0..3 {
         wait(cx, w, &view, 16);
     }
-    let d1 = apart(cx, k);
+    let d1 = apart(cx);
     assert!(d1 > 0. && (d1 - d0).abs() < 0.01, "a line apart all the way: {d0} {d1}");
-    let mut crossed = false;
     for _ in 0..40 {
         wait(cx, w, &view, 16);
-        let on = !rolling(cx, crate::motion::ROLL_TOOLS).is_empty();
-        crossed |= on && !words(cx);
-        assert!(!crossed || !words(cx), "the old word never comes back");
     }
-    assert!(crossed, "mid-roll: `2 tools`, the digit still arriving");
-    assert!(rolling(cx, crate::motion::ROLL_TOOLS).is_empty() && rolling(cx, crate::motion::ROLL_STEP).is_empty(), "landed");
+    assert!(rolling(cx).is_empty(), "landed");
     assert!(VisualTestContext::from_window(w, cx).debug_bounds(format!("rolling-{k:x}").leak()).is_none(), "at rest: one text");
+}
+
+/// Q3 r4 (polish.md P5, gate 4 under a live fan-out): a spawn row's tool
+/// count and its live line change in place. The frame they change on draws
+/// them at rest, nothing rolls, and no frames follow for them (a roll was
+/// 30 Hz of app frames for ~200 ms); at most a clock's second.
+#[gpui_kit::test]
+fn a_spawn_rows_tool_count_changes_in_place(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    life_worker(cx, w, &view);
+    let f0 = frames(cx, &view).0;
+    local(cx, &view, vec![worker_rows(2, "grep -n rotate src")]);
+    wait(cx, w, &view, 16);
+    let f1 = frames(cx, &view).0;
+    assert!(f1 > f0, "the change drew");
+    assert_eq!(view.read_with(cx, |v, _| v.fx.rolling_in(None)), Vec::<u64>::new(), "nothing rolls");
+    assert!(!motion_pending(cx, &view).0, "no display frame asked for");
+    for _ in 0..18 {
+        wait(cx, w, &view, 16);
+    }
+    let more = frames(cx, &view).0 - f1;
+    assert!(more <= 1, "no frames for it, at most a clock's second: {more}");
 }
 
 /// polish.md P5: clocks, cost, tokens and % never roll. A running worker's
