@@ -71,6 +71,9 @@ pub(crate) struct CardLook {
     pub(crate) typed: bool,
     pub(crate) footer: Option<SharedString>,
     pub(crate) footer_warn: bool,
+    /// Allow all was offered: its line (a just-checked box too) stays
+    /// through the collapse.
+    pub(crate) offered: bool,
 }
 
 /// The prompt the card shows, kept while it is pending.
@@ -106,8 +109,8 @@ pub(crate) struct PromptCard {
     pub(crate) read: bool,
     /// Allow all is checked: ALLOW sends `"always"`.
     pub(crate) allow_all: bool,
-    /// The Allow all box was clicked: Space toggles it then only (Shady
-    /// M2; never from the card's keys alone).
+    /// The Allow all box has the focus (Tab from the card's keys, or a
+    /// click): Space toggles it then only (Shady M2). As this frame began.
     pub(crate) box_focus: bool,
     /// Its row's height as last drawn (what a collapse starts from).
     pub(crate) height: Rc<Cell<f32>>,
@@ -267,8 +270,25 @@ pub(crate) struct Receipt {
 impl Receipt {
     /// `allowed 14:21 · 7s`, `denied 14:22`, `answered elsewhere 14:21`;
     /// a secret's `provided 14:21`. The first word and the rest.
+    #[cfg(test)]
     pub(crate) fn words(&self) -> (&'static str, String) {
-        let word = match self.answer {
+        self.words_while(false)
+    }
+
+    /// [`Receipt::words`]; while its call runs (`running`), without the
+    /// wait: the row's clock beside it counts the run.
+    pub(crate) fn words_while(&self, running: bool) -> (&'static str, String) {
+        let took = self
+            .took
+            .filter(|_| !running && !matches!(self.answer, Answer::Elsewhere | Answer::Resolved))
+            .map(|d| format!(" · {}", took(d)))
+            .unwrap_or_default();
+        (Self::word(self.answer), format!(" {}{took}", self.at))
+    }
+
+    /// The receipt's first word for `a`.
+    pub(crate) const fn word(a: Answer) -> &'static str {
+        match a {
             Answer::Allowed => "allowed",
             Answer::AllowedAll => "allowed all",
             Answer::Denied => "denied",
@@ -276,14 +296,14 @@ impl Receipt {
             Answer::Cancelled => "cancelled",
             Answer::Elsewhere => "answered elsewhere",
             Answer::Resolved => "resolved",
-        };
-        let took = self
-            .took
-            .filter(|_| !matches!(self.answer, Answer::Elsewhere | Answer::Resolved))
-            .map(|d| format!(" · {}", took(d)))
-            .unwrap_or_default();
-        (word, format!(" {}{took}", self.at))
+        }
     }
+}
+
+/// When a call's run started, for its clock: a gated call's at its answer
+/// (the wait before it is the receipt's, not the run's).
+pub(crate) fn run_start(started: Option<Instant>, receipt: Option<&Receipt>) -> Option<Instant> {
+    started.max(receipt.map(|r| r.landed))
 }
 
 /// `7s`, `2m 05s`, `1h 03m`.
@@ -348,9 +368,10 @@ pub(crate) fn guard_shape(pr: &PromptRequest) -> Option<Guard> {
 }
 
 /// A call row's status word beside its receipt: none when the receipt
-/// already says it, so the meta never reads `denied denied 14:22`.
+/// already says it, so the meta never reads `denied denied 14:22` or
+/// `cancelled cancelled 19:20`.
 pub(crate) fn status_beside(word: Option<&'static str>, receipt: Option<Answer>) -> Option<&'static str> {
-    word.filter(|w| !(receipt == Some(Answer::Denied) && *w == "denied"))
+    word.filter(|w| receipt.is_none_or(|a| Receipt::word(a) != *w))
 }
 
 /// The header's right: `bash · guard · asked 14:21`, from the scope's tool
@@ -572,13 +593,25 @@ impl AppView {
         owner && self.current_card().is_some_and(|c| c.pr.allow_all().is_some())
     }
 
-    /// A call row's receipt (its meta's last part), lifting in over `QUICK`.
-    pub(crate) fn receipt_el(&self, call: Option<&str>, p: &Palette) -> Option<AnyElement> {
+    /// A call row's receipt (its meta's last part, after a ` · ` when
+    /// something comes before it), lifting in over `QUICK`. While its call
+    /// runs, without the wait (the clock beside it counts the run).
+    pub(crate) fn receipt_el(&self, call: Option<&str>, after: bool, running: bool, p: &Palette) -> Option<AnyElement> {
         if self.model.watch.focus().is_some() {
             return None;
         }
         let r = self.row_receipt(call)?;
-        Some(self.receipt_words(r, p).into_any_element())
+        let words = self.receipt_words(r, running, p);
+        let row = r.row;
+        // The meta's 8 px gap is the separator's first space.
+        Some(if after {
+            h_flex()
+                .child(div().debug_selector(move || format!("receipt-sep {row}")).text_color(p.dim_t).child("· "))
+                .child(words)
+                .into_any_element()
+        } else {
+            words.into_any_element()
+        })
     }
 
     /// The receipt the row of call `call` (its tool-use id) carries in its
@@ -589,8 +622,8 @@ impl AppView {
         self.receipts.get(sid)?.iter().rev().find(|r| !r.own && r.call == call)
     }
 
-    fn receipt_words(&self, r: &Receipt, p: &Palette) -> Div {
-        let (word, rest) = r.words();
+    fn receipt_words(&self, r: &Receipt, running: bool, p: &Palette) -> Div {
+        let (word, rest) = r.words_while(running);
         let k = self.fx.shot(Some(r.landed), Duration::ZERO, crate::motion::QUICK, &crate::motion::ease::OUT, crate::motion::Kind::Fade);
         let lift = crate::motion::LIFT + (1. - crate::motion::LIFT) * k;
         let word_color = if r.answer == Answer::Denied { p.err } else { p.dim_t };
@@ -609,7 +642,6 @@ impl AppView {
     /// A prompt row ([`Kind::Prompt`]): the live card, the answered card
     /// collapsing, or an own-row receipt line.
     pub(crate) fn render_authorize(&self, d: Disp, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> AnyElement {
-        let r = m.r;
         if let Some(c) = self.current_card().filter(|c| c.row == d.id) {
             let height = c.height.clone();
             return div()
@@ -640,8 +672,9 @@ impl AppView {
             .font_family(fonts::MONO)
             .whitespace_nowrap()
             .debug_selector(move || format!("receipt-row {}", d.id))
-            .child(div().pl(px((16. * r).round())).text_color(p.dim_t).child(format!("{kind} · ")))
-            .child(self.receipt_words(rc, p))
+            // On the call rows' verb column (the finish gate of #18).
+            .child(div().pl(px(crate::turns::Geo::of(self.layout, m).verb)).text_color(p.dim_t).child(format!("{kind} · ")))
+            .child(self.receipt_words(rc, false, p))
             .into_any_element()
     }
 
@@ -665,7 +698,7 @@ impl AppView {
         let key_hint = |k: &'static str| mono(k, m.meta, p.dim_k).flex_none();
         let typed = look.map_or_else(|| secret && !self.secret_input.read(cx).value().is_empty(), |l| l.typed);
         let key = live.then_some(c.key);
-        let offered = live && self.allow_all_offered();
+        let offered = look.map_or_else(|| self.allow_all_offered(), |l| l.offered);
         let allow_all = offered && c.allow_all;
         let actions =
             if detached {
@@ -803,7 +836,7 @@ impl AppView {
         };
         let footer_warn = look.map_or(more.is_some() && !sent, |l| l.footer_warn);
         if live {
-            *self.card_look.borrow_mut() = CardLook { can, ready, keys, in_field, typed, footer: footer.clone(), footer_warn };
+            *self.card_look.borrow_mut() = CardLook { can, ready, keys, in_field, typed, footer: footer.clone(), footer_warn, offered };
         }
         // The well: a guard's command alone, its `$` in `you`; else the
         // whole body, verbatim. Up to the form's most lines, the rest
@@ -946,13 +979,14 @@ impl AppView {
                 .flex_none()
                 .gap(px(8.))
                 .items_center()
+                .when(live, |d| d.track_focus(&self.allow_all_focus))
                 .when(live && can, |d| d.cursor_pointer())
                 .child(
                     div()
                         .flex_none()
                         .size(px(CHECK))
                         .border_1()
-                        // Focused (clicked): Space toggles it.
+                        // Focused (Tab, a click): Space toggles it.
                         .border_color(if check_focused { p.focus_k } else { p.dim_k })
                         .flex()
                         .items_center()
@@ -965,10 +999,8 @@ impl AppView {
                 .child(mono(text, m.meta, if allow_all { p.prose_k } else { p.dim_k }).whitespace_nowrap())
                 .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
                 .when(live && can, |d| {
-                    d.on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(c) = this.card.as_mut() {
-                            c.box_focus = true;
-                        }
+                    d.on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.allow_all_focus, cx);
                         this.toggle_allow_all(cx);
                     }))
                 })
@@ -1092,7 +1124,7 @@ pub(crate) fn receipt_line(m: &Metrics) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answer, PromptRow, Receipt, asked, call_ix, dash_xs, guard_shape, status_beside, took, with_prompts};
+    use super::{Answer, PromptRow, Receipt, asked, call_ix, dash_xs, guard_shape, run_start, status_beside, took, with_prompts};
     use crate::turns::{Disp, Gap, Kind, Who};
     use std::time::{Duration, Instant};
 
@@ -1265,12 +1297,20 @@ mod tests {
         };
         assert_eq!(words(r(Answer::Allowed, Some(Duration::from_secs(7)))), "allowed 14:21 · 7s");
         assert_eq!(words(r(Answer::Denied, None)), "denied 14:21");
+        let running = r(Answer::Allowed, Some(Duration::from_secs(15)));
+        let w = running.words_while(true);
+        assert_eq!(format!("{}{}", w.0, w.1), "allowed 14:21", "running: the clock counts, not the wait");
+        let t0 = running.landed - Duration::from_secs(15);
+        assert_eq!(run_start(Some(t0), Some(&running)), Some(running.landed), "a gated call runs from its answer");
+        assert_eq!(run_start(Some(t0), None), Some(t0));
         assert_eq!(words(r(Answer::Elsewhere, Some(Duration::from_secs(3)))), "answered elsewhere 14:21", "not ours: no wait");
         assert_eq!(words(r(Answer::Provided, None)), "provided 14:21");
         assert_eq!(words(r(Answer::Cancelled, Some(Duration::from_secs(4)))), "cancelled 14:21 · 4s");
         assert_eq!(words(r(Answer::Resolved, Some(Duration::from_secs(4)))), "resolved 14:21", "not ours: no wait");
         assert_eq!(status_beside(Some("denied"), Some(Answer::Denied)), None, "one denied, the receipt's");
         assert_eq!(status_beside(Some("denied"), None), Some("denied"));
+        assert_eq!(status_beside(Some("cancelled"), Some(Answer::Cancelled)), None, "a HALT under the card: one cancelled");
+        assert_eq!(status_beside(Some("cancelled"), Some(Answer::Elsewhere)), Some("cancelled"));
         assert_eq!(status_beside(Some("failed"), Some(Answer::Allowed)), Some("failed"));
         assert_eq!(status_beside(Some("waiting"), Some(Answer::Allowed)), Some("waiting"), "a secret still to come");
         assert_eq!((took(Duration::from_secs(125)), took(Duration::from_secs(3780))), ("2m 05s".into(), "1h 03m".into()));
