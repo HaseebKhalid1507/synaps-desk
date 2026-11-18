@@ -2,15 +2,28 @@
 
 Captured on bella with headless gamescope at 144 Hz (`scripts/capture-linux.sh`, with an absolute `XDG_CONFIG_HOME` under `~/.cache/q5r3`). Recorded with x11grab at 60 fps and re-encoded losslessly: libx264rgb, qp 0, gbrp, High 4:4:4 Predictive. Every clip's per-frame md5 equals the raw capture's (`clips.txt`).
 
+The repo is public and a merged blob stays in its history, so the lossless clips are kept off the repo, in the
+maintainer's `synaps-desktop/q5-evidence/` folder, at the same paths (`docs/img/q5/<path>.mp4` is
+`q5-evidence/img/q5/<path>.mp4`), with `MANIFEST.md`: each clip's sha256 and per-frame md5, and the preview commands.
+The `clips.txt` manifests are kept both here and there. The raw x11grab captures were deleted after each clip's frame
+md5 was checked against them. The PNGs here are reduced to a 256-colour palette (no dither) to keep them small; the
+full-colour originals are in `q5-evidence/` at the same paths. Every frame number in these READMEs is a frame of the
+lossless clip.
+
+Previews in the repo (`*-preview.mp4`): H.264 `-crf 23 -preset veryslow -tune animation`, yuv420p, made from the
+lossless clips at their full 1280×720 and 60 fps, every frame kept, so a frame number here is the same frame in the
+preview. Lossy: they show the motion, not exact pixels; the traces and the pixel claims below are from the lossless
+clips. Here: `r3-chips-preview.mp4` (the chips reorder). r3's other clips have no preview: r4's supersede them.
+
 The binary is the release build of `ff642fe`, the last code commit, sha256 `593553ad…046e15`. Later commits change docs only.
 
 bella's load average was about 10 the whole time (other builds were running), so the 60 fps capture's frame spacing is uneven: one captured frame can hold 1 to 4 of the app's 144 Hz frames. Motion per *captured* frame is therefore lumpy. The tests check per-frame motion on the test clock.
 
 | file | what | script |
 |---|---|---|
-| `r3-full.mp4`, `r3-reduced.mp4`, `r3-off.mp4` | 1280×720 nord, `--offline`, 1,320 frames. Three favourites (docs-sync, relay-refresh, which NEEDS YOU, and ci-cache). FAVOURITES folded and unfolded, then its head double-clicked (turned round mid-fold). The rail's edge dragged 21 px out and let go. The transcript wheeled up (the stub appears), then Ctrl+J. | `clip.sh` (drive times in `r3-clip-*-drive.txt`) |
-| `r3-full-1920x1080.mp4` | 1920×1080 Full: Ctrl+B ×2, Ctrl+Alt+B ×2 | `clip.sh full 1920x1080` |
-| `r3-chips.mp4` | the chips scene (`SYNAPS_BENCH_CHIPS=3`): steps change and clocks tick, then one worker ends done and one failed (the reorder) | `chipclip.sh` |
+| `r3-full.mp4`, `r3-reduced.mp4`, `r3-off.mp4` (off the repo) | 1280×720 nord, `--offline`, 1,320 frames. Three favourites (docs-sync, relay-refresh, which NEEDS YOU, and ci-cache). FAVOURITES folded and unfolded, then its head double-clicked (turned round mid-fold). The rail's edge dragged 21 px out and let go. The transcript wheeled up (the stub appears), then Ctrl+J. | `clip.sh` (drive times in `r3-clip-*-drive.txt`) |
+| `r3-full-1920x1080.mp4` (off the repo) | 1920×1080 Full: Ctrl+B ×2, Ctrl+Alt+B ×2 | `clip.sh full 1920x1080` |
+| `r3-chips.mp4` (off the repo; preview `r3-chips-preview.mp4`) | the chips scene (`SYNAPS_BENCH_CHIPS=3`): steps change and clocks tick, then one worker ends done and one failed (the reorder) | `chipclip.sh` |
 
 **The chip reorder (R2-H1, gate B).** `chips-trace.txt` (from `chips.py`, each chip's 1 px frame) and `sheets/chips-reorder-f383-404.png`.
 - When reviewer fails and trace-cart completes, trace-cart and scout swap cells.

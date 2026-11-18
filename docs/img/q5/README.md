@@ -12,6 +12,16 @@ Binaries (release, `dbuild … build --release --locked`):
   `bella:~/.local/bin/synaps-desktop-hybrid.q5`. The commits after it change tests and docs only: the PR head's
   release build is byte-identical (the same sha256).
 
+The repo is public and a merged blob stays in its history, so the lossless clips are kept off the repo, in the
+maintainer's `synaps-desktop/q5-evidence/` folder, at the same paths (`docs/img/q5/<path>.mp4` is
+`q5-evidence/img/q5/<path>.mp4`), with `MANIFEST.md`: each clip's sha256 and per-frame md5, and the preview commands.
+The `clips.txt` manifests are kept both here and there. The raw x11grab captures were deleted after each clip's frame
+md5 was checked against them. The PNGs here are reduced to a 256-colour palette (no dither) to keep them small; the
+full-colour originals are in `q5-evidence/` at the same paths. Every frame number in these READMEs is a frame of the
+lossless clip.
+
+r1's three clips have no preview here: r4's (`r4/`) supersede them.
+
 Every capture, clip and bench run here is of those two binaries, one after another (`all.sh`: nothing of ours
 overlapped a bench run).
 
@@ -39,7 +49,7 @@ and 8 at the composer foot's (351, 568 at 1280; 647, 928 at 1920): the beat's ph
 45, the glyphs Q6's README found. paper 1280's other 52 are the authorize card's clock: `asked 04:47` in main's
 frame, `04:48` in Q5's (the minute turned between the two runs).
 
-## Clips (lossless): `panels-full.mp4`, `panels-reduced.mp4`, `panels-off.mp4`
+## Clips (lossless, off the repo): `panels-full.mp4`, `panels-reduced.mp4`, `panels-off.mp4`
 
 1280×720 nord, 60 fps, 27 s each, the same drive at each level (`clip.sh`). Each is `libx264rgb -qp 0`, `gbrp`, High
 4:4:4 Predictive, 1620 frames, and its per-frame md5 equals its capture's (`clips.txt`).

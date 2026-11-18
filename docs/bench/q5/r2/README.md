@@ -10,6 +10,11 @@ way (`dbuild … build --release --locked`):
 The scene: 1,061 rows of transcript; Ctrl+B (fold), Ctrl+B (unfold), the same for the right panel, the draft set to
 three lines, then cleared. For each action: the 0.8 s from it, then the 1 s after it.
 
+The clips that go with these numbers are not here: the lossless clips (and `clips.txt` manifests) live off the
+repo, in the maintainer's `synaps-desktop/q5-evidence/` folder, at the same paths as under `docs/img/q5/` (see
+`docs/img/q5/README.md`; the `--bench-panels` scene filmed is `r2/r2-bench-panels.mp4`, previewed in the repo as
+`docs/img/q5/r2/r2-bench-panels-preview.mp4`). The raw JSON here is complete.
+
 **1280x720** (means of 3 runs; draw = the app's draw time per presented frame, ms; r1 = this PR's first round, `../`)
 
 | action | main presents | Q5 r2 presents (r1) | main draw p95 / max | Q5 r2 draw p95 / max | over budget (3 runs) main / Q5 r2 | main CPU ms | Q5 r2 CPU ms (r1) | the 1 s after: presents, app frames main / Q5 r2 |

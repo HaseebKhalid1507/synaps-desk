@@ -12,6 +12,11 @@ scratch folder under `~/.cache/q5` (an absolute `XDG_CONFIG_HOME`). bella's real
 kept its mtime (`1794981241`, 00:54:01) through every run. `log` has each run's load and the system's swap-ins during
 it (`pswpin`). Raw: `{main,q5}-panels-{size}-{1,2,3}.json`, `{main,q5}-motion-{1,2,3}.json`; tables: `table.py`.
 
+The clips that go with these numbers are not here: the lossless clips (and `clips.txt` manifests) live off the
+repo, in the maintainer's `synaps-desktop/q5-evidence/` folder, at the same paths as under `docs/img/q5/` (see
+`docs/img/q5/README.md`; the `--bench-panels` scene filmed is `r2/r2-bench-panels.mp4`, previewed in the repo as
+`docs/img/q5/r2/r2-bench-panels-preview.mp4`). The raw JSON here is complete.
+
 ## `--bench-panels`: a fold, an unfold, the composer growing (the brief's scene)
 
 A 400-turn synthetic transcript (1,061 rows) at its end, following. Six actions in turn: Ctrl+B (rail folds), Ctrl+B
