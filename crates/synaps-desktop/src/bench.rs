@@ -42,6 +42,10 @@ pub struct BenchOptions {
     /// 10 s idle, then a running tool's heartbeat (frames, phases, CPU per
     /// frame), then the same with Motion off.
     pub motion: bool,
+    /// `--bench-panels`: the side panels folded and unfolded and the
+    /// composer grown a line and back, over a long transcript (polish.md
+    /// P14): each one's frames, draw times and CPU, then what follows it.
+    pub panels: bool,
 }
 
 /// CPU time of every thread of this process so far (`/proc/self/task/*/schedstat`,
@@ -508,6 +512,67 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 let _ = cx.update(|_, cx| cx.quit());
                 return;
             }
+            if opts.panels {
+                // A 400-turn transcript at its end; each action, then its
+                // next 0.8 s (presents, draws, CPU, app frames) and the 1 s
+                // after it (nothing moves: 0).
+                let frames = |cx: &mut AsyncWindowContext| view.update(cx, |v, _| v.fx.frames()).unwrap_or(0);
+                let _ = upd(cx, &|v, _| {
+                    v.model.set_local_session("bench-panels");
+                    v.reset_transcript();
+                    v.model.transcript.apply_history(&turns(DRAG_TURNS, 13));
+                    v.sync_list();
+                    v.list.set_follow_mode(FollowMode::Tail);
+                    v.list.scroll_to_end();
+                });
+                sleep(1.5).await;
+                let long = "A draft that runs past the end of its first line and onto a second one, so the composer grows by \
+                            a line: the field's height and the transcript above it make room, then it shrinks back once cleared.";
+                for (name, act) in [
+                    ("rail_fold", 0u8),
+                    ("rail_unfold", 0),
+                    ("right_fold", 1),
+                    ("right_unfold", 1),
+                    ("composer_grow", 2),
+                    ("composer_shrink", 3),
+                ] {
+                    let (t0, c0, f0) = (Instant::now(), cpu_ns(), frames(cx));
+                    let _ = cx.update(|window, cx| {
+                        let _ = view.update(cx, |v, cx| {
+                            match act {
+                                0 => v.toggle_panel(true, cx),
+                                1 => v.toggle_panel(false, cx),
+                                2 => v.composer.update(cx, |s, cx| s.set_value(long, window, cx)),
+                                _ => v.composer.update(cx, |s, cx| s.set_value("", window, cx)),
+                            }
+                            cx.notify();
+                        });
+                    });
+                    sleep(0.8).await;
+                    let (t1, cpu, f1) = (Instant::now(), cpu_ns().saturating_sub(c0) as f64 / 1e6, frames(cx));
+                    sleep(1.0).await;
+                    let (t2, f2) = (Instant::now(), frames(cx));
+                    let mut s = view
+                        .update(cx, |v, _| {
+                            let b = v.bench.as_mut().unwrap();
+                            b.drain();
+                            let mut s = b.stats(t0, t1, refresh_fallback);
+                            s["presents_after"] = b.stats(t1, t2, refresh_fallback)["frames_presented"].clone();
+                            s
+                        })
+                        .unwrap_or(Value::Null);
+                    s["cpu_ms"] = json!(round(cpu, 2));
+                    s["app_frames"] = json!(f1 - f0);
+                    s["app_frames_after"] = json!(f2 - f1);
+                    out[name] = s;
+                }
+                out["rows"] = json!(view.update(cx, |v, _| v.model.transcript.len()).unwrap_or(0));
+                out["window_w"] = json!(view.update(cx, |v, _| v.width).unwrap_or(0.));
+                out["mem_end"] = mem::sample();
+                println!("{out}");
+                let _ = cx.update(|_, cx| cx.quit());
+                return;
+            }
             if opts.motion {
                 // The app's own frames and the beat layer's (a beat that
                 // repaints only the layer is not an app frame).
@@ -810,6 +875,103 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     });
                     sleep(3.0).await;
                     out["life_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
+                    println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
+                // `SYNAPS_BENCH_CHIPS=N` (Q5 r2 evidence, Haseeb's chips): N
+                // workers running over the composer; after 2 s their steps
+                // change one by one every 0.4 s (short, long, longer than the
+                // chip), their clocks tick; at 8.5 s the second is done and
+                // the third fails. Every chip's bounds after each change, in
+                // the JSON (`chips`): what a capture of it shows, that none
+                // moves. (No cancel arms here: the bench has no daemon to
+                // send one to; `a_chip_is_the_columns_share_whatever_it_says`
+                // arms one.)
+                if let Some(n) = std::env::var("SYNAPS_BENCH_CHIPS").ok().and_then(|s| s.parse::<u64>().ok()) {
+                    let ts = || chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                    let apply = |cx: &mut AsyncWindowContext, evs: Vec<Value>| {
+                        let ts = ts();
+                        let _ = upd(cx, &|v, cx| {
+                            v.apply_batch(evs.iter().cloned().filter_map(local_raw).map(|e| e.with_ts(ts.clone())).collect(), cx);
+                            v.sync_list();
+                        });
+                    };
+                    let names = ["scout", "trace-cart", "reviewer", "flake-statistics-collector", "bisect", "har-diff"];
+                    let steps = [
+                        "ls",
+                        "reading crates/relay/src/upstream.rs",
+                        "grep -rn \"waitForResponse\" e2e/",
+                        "git status",
+                        "cargo test -p relay --test refresh_race -- --nocapture",
+                        "reading src/session.rs",
+                    ];
+                    let born = Instant::now();
+                    let rows = |at: &[usize], status: &[&str]| -> Value {
+                        let rows: Vec<Value> = (0..n as usize)
+                            .map(|k| {
+                                let secs = round(born.elapsed().as_secs_f64() + 30. * k as f64, 1);
+                                let st = status.get(k).copied().unwrap_or("running");
+                                let done = (st != "running").then_some(secs);
+                                json!({"subagent_id": k + 1, "agent_name": names[k % names.len()], "status": st, "cancel_requested": false,
+                                    "elapsed_secs": secs, "finished_elapsed": done, "step": steps[at[k] % steps.len()], "tools": at[k] + 1,
+                                    "handle_id": format!("sa_{}", k + 1)})
+                            })
+                            .collect();
+                        json!({"ev": "subagent_rows", "rows": rows})
+                    };
+                    let _ = upd(cx, &|v, _| {
+                        v.model.set_local_session("bench-chips");
+                        v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
+                        v.sync_list();
+                        v.list.scroll_to_end();
+                    });
+                    let mut evs: Vec<Value> = (0..n as usize)
+                        .flat_map(|k| {
+                            let res = json!({"handle_id": format!("sa_{}", k + 1), "agent_name": names[k % names.len()], "status": "running"});
+                            [
+                                json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start",
+                                    "tool_id": format!("w{k}"), "input": {"agent": names[k % names.len()], "task": "Find the refresh race"}}}),
+                                json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": format!("w{k}"),
+                                    "result": res.to_string()}}),
+                            ]
+                        })
+                        .collect();
+                    let mut at: Vec<usize> = (0..n as usize).collect();
+                    evs.push(rows(&at, &[]));
+                    apply(cx, evs);
+                    let chips = |cx: &mut AsyncWindowContext| -> Value {
+                        view.update(cx, |v, _| {
+                            let mut b: Vec<(u64, [f32; 4])> = v
+                                .chip_bounds
+                                .borrow()
+                                .iter()
+                                .map(|(id, b)| (*id, [b.origin.x.into(), b.origin.y.into(), b.size.width.into(), b.size.height.into()]))
+                                .collect();
+                            b.sort_by_key(|c| c.0);
+                            json!(b)
+                        })
+                        .unwrap_or(Value::Null)
+                    };
+                    sleep(2.0).await;
+                    let mut log = vec![json!({"t": 2.0, "what": "spawned", "chips": chips(cx)})];
+                    let mut status: Vec<&str> = Vec::new();
+                    for i in 0..20usize {
+                        let k = i % n as usize;
+                        at[k] += 1;
+                        let what = if i == 16 && n >= 3 {
+                            status = vec!["running", "completed", "failed"];
+                            "done, failed".to_string()
+                        } else {
+                            format!("step {k}")
+                        };
+                        apply(cx, vec![rows(&at, &status)]);
+                        sleep(0.4).await;
+                        log.push(json!({"t": round(t_main.elapsed().as_secs_f64(), 2), "what": what, "chips": chips(cx)}));
+                    }
+                    sleep(2.0).await;
+                    out["chips"] = json!(log);
+                    out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                     println!("{out}");
                     let _ = cx.update(|_, cx| cx.quit());
                     return;

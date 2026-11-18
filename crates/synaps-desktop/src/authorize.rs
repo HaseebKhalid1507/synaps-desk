@@ -555,7 +555,7 @@ impl AppView {
     }
 
     /// Ctrl+J: the card's row into view (on F1's glide when it was drawn,
-    /// at once when not), from a worker's view back to the session first,
+    /// at Full; at once when not, and at Reduced and Off), from a worker's view back to the session first,
     /// and the keys to it (a secret's to its field).
     pub(crate) fn jump_to_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.transcript.pending_prompts().is_empty() {
@@ -578,8 +578,17 @@ impl AppView {
     pub(crate) fn reveal_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.card_ix() else { return };
         let (top, bottom) = self.list_view();
-        // Below the sticky band, when the labels are inline (polish.md F8).
+        // Below the sticky band, when the labels are inline (polish.md F8);
+        // above the dock as it will be once it lands (polish.md P13): the
+        // stub leaves now (it pointed here), its room is the view's.
         let top = top + self.sticky_inset(cx);
+        let leaves = if self.stub_shown() && self.model.watch.focus().is_none() {
+            self.stub_away = self.model.card_key();
+            crate::fit::STUB_GAP + crate::theme::metrics(cx).row
+        } else {
+            0.
+        };
+        let bottom = bottom - self.dock_growth() + leaves;
         match self.list.bounds_for_item(ix) {
             Some(b) => {
                 let (t, bt) = (f32::from(b.top()), f32::from(b.bottom()));
@@ -593,13 +602,25 @@ impl AppView {
                 };
                 if by.abs() > 0.5 {
                     self.list.pause_following_tail();
-                    let cut = self.scroller.jump(by, false, bottom - top, self.fx.clock());
+                    // Reduced and Off: a cut, in this frame (the stub goes
+                    // with it); there is no glide to play.
+                    let cut = if self.fx.level() == crate::motion::Level::Full {
+                        self.scroller.jump(by, false, bottom - top, self.fx.clock())
+                    } else {
+                        by
+                    };
                     if cut != 0. {
                         self.list.scroll_by(px(cut));
                     }
                 }
             }
-            None => self.list.scroll_to_reveal_item(ix),
+            None => {
+                self.list.scroll_to_reveal_item(ix);
+                // Drawn next frame: placed again then, the dock as it lands.
+                if self.dock_growth() > 0.5 {
+                    self.jump_card = self.model.card_key();
+                }
+            }
         }
         let secret = self.current_card().is_some_and(|c| c.secret);
         if secret {

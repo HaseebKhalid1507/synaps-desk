@@ -1093,7 +1093,7 @@ pub(crate) fn ping(p: f32, color: Hsla, ground: Hsla) -> Svg {
 /// The live and waiting states are lattice patterns (queued, running,
 /// streaming, needs you, as last seen); running and streaming step on the
 /// beat. A change while watched turns the grid a quarter
-/// ([`crate::motion::TURN_ON_CHANGE`], [`crate::motion::Motion::turn`]): onto a pattern, the old one turned
+/// ([`crate::motion::TURN_ON_CHANGE`], [`crate::motion::Motion::turn_on_change`]): onto a pattern, the old one turned
 /// +45° then the new from −45° (66 ms each), and needs you pings once;
 /// onto a mark (done, failed, denied, cancelled), the old one turned +45°,
 /// +90° at 74 %, then its dots go out diagonal by diagonal under the mark
@@ -1125,7 +1125,7 @@ pub(crate) fn indicator(
     });
     let boxed = || div().relative().flex_none().size(px(LIFE));
     let dots = |d: Dots, mark: Hsla| crate::lattice::el(LIFE, d, code(pose_of(&d)), mark, ground).absolute().top_0().left_0();
-    let turn = fx.turn.get() && full;
+    let turn = fx.turn_on_change.get() && full;
     if let (Some((old_pose, old_mark)), Some(t), true) = (old, since, turn)
         && t < 2 * TURN
     {
