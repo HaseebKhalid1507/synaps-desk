@@ -788,6 +788,108 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let _ = cx.update(|_, cx| cx.quit());
                     return;
                 }
+                // `SYNAPS_BENCH_CHIPS=N` (Q5 r2 evidence, Haseeb's chips): N
+                // workers running over the composer; after 2 s their steps
+                // change one by one every 0.4 s (short, long, longer than the
+                // chip), their clocks tick; at 5 s the first one's cancel
+                // arms (CONFIRM), at 8.5 s the second is done and the third
+                // fails. Every chip's bounds after each change, in the JSON
+                // (`chips`): what a capture of it shows, that none moves.
+                if let Some(n) = std::env::var("SYNAPS_BENCH_CHIPS").ok().and_then(|s| s.parse::<u64>().ok()) {
+                    let ts = || chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                    let apply = |cx: &mut AsyncWindowContext, evs: Vec<Value>| {
+                        let ts = ts();
+                        let _ = upd(cx, &|v, cx| {
+                            v.apply_batch(evs.iter().cloned().filter_map(local_raw).map(|e| e.with_ts(ts.clone())).collect(), cx);
+                            v.sync_list();
+                        });
+                    };
+                    let names = ["scout", "trace-cart", "reviewer", "flake-statistics-collector", "bisect", "har-diff"];
+                    let steps = [
+                        "ls",
+                        "reading crates/relay/src/upstream.rs",
+                        "grep -rn \"waitForResponse\" e2e/",
+                        "git status",
+                        "cargo test -p relay --test refresh_race -- --nocapture",
+                        "reading src/session.rs",
+                    ];
+                    let born = Instant::now();
+                    let rows = |at: &[usize], status: &[&str]| -> Value {
+                        let rows: Vec<Value> = (0..n as usize)
+                            .map(|k| {
+                                let secs = round(born.elapsed().as_secs_f64() + 30. * k as f64, 1);
+                                let st = status.get(k).copied().unwrap_or("running");
+                                let done = (st != "running").then_some(secs);
+                                json!({"subagent_id": k + 1, "agent_name": names[k % names.len()], "status": st, "cancel_requested": false,
+                                    "elapsed_secs": secs, "finished_elapsed": done, "step": steps[at[k] % steps.len()], "tools": at[k] + 1,
+                                    "handle_id": format!("sa_{}", k + 1)})
+                            })
+                            .collect();
+                        json!({"ev": "subagent_rows", "rows": rows})
+                    };
+                    let _ = upd(cx, &|v, _| {
+                        v.model.set_local_session("bench-chips");
+                        v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
+                        v.sync_list();
+                        v.list.scroll_to_end();
+                    });
+                    let mut evs: Vec<Value> = (0..n as usize)
+                        .flat_map(|k| {
+                            let res = json!({"handle_id": format!("sa_{}", k + 1), "agent_name": names[k % names.len()], "status": "running"});
+                            [
+                                json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start",
+                                    "tool_id": format!("w{k}"), "input": {"agent": names[k % names.len()], "task": "Find the refresh race"}}}),
+                                json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": format!("w{k}"),
+                                    "result": res.to_string()}}),
+                            ]
+                        })
+                        .collect();
+                    let mut at: Vec<usize> = (0..n as usize).collect();
+                    evs.push(rows(&at, &[]));
+                    apply(cx, evs);
+                    let chips = |cx: &mut AsyncWindowContext| -> Value {
+                        view.update(cx, |v, _| {
+                            let mut b: Vec<(u64, [f32; 4])> = v
+                                .chip_bounds
+                                .borrow()
+                                .iter()
+                                .map(|(id, b)| (*id, [b.origin.x.into(), b.origin.y.into(), b.size.width.into(), b.size.height.into()]))
+                                .collect();
+                            b.sort_by_key(|c| c.0);
+                            json!(b)
+                        })
+                        .unwrap_or(Value::Null)
+                    };
+                    sleep(2.0).await;
+                    let mut log = vec![json!({"t": 2.0, "what": "spawned", "chips": chips(cx)})];
+                    let mut status: Vec<&str> = Vec::new();
+                    for i in 0..20usize {
+                        let k = i % n as usize;
+                        at[k] += 1;
+                        let what = if i == 7 {
+                            // The first worker's cancel armed (CONFIRM).
+                            let _ = upd(cx, &|v, cx| {
+                                let who = crate::wtabs::Who::new(1, names[0].to_string(), None);
+                                v.press_cancel("bench-chips", &who, crate::menu::How::Click(1), cx);
+                            });
+                            "armed".to_string()
+                        } else if i == 16 && n >= 3 {
+                            status = vec!["running", "completed", "failed"];
+                            "done, failed".to_string()
+                        } else {
+                            format!("step {k}")
+                        };
+                        apply(cx, vec![rows(&at, &status)]);
+                        sleep(0.4).await;
+                        log.push(json!({"t": round(t_main.elapsed().as_secs_f64(), 2), "what": what, "chips": chips(cx)}));
+                    }
+                    sleep(2.0).await;
+                    out["chips"] = json!(log);
+                    out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
+                    println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
                 // `SYNAPS_BENCH_LINK=N`: only the link lost and back (motion.md
                 // §5.3), the scene a capture records, after N s: up 2 s, down
                 // 4 s (grace, tear, drain, held), up 3 s (Scan, restore). Every
