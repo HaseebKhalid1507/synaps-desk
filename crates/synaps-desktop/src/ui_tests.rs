@@ -2734,7 +2734,8 @@ fn a_count_rolls_in_its_digit_cells(cx: &mut TestAppContext) {
     };
     let d0 = apart(cx);
     assert!(d0 > 8., "a line apart, the new one coming up from below: {d0}");
-    let words = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
+    let words =
+        |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(format!("rolled-words-{k:x}").leak()).is_some();
     assert!(!words(cx), "the words are the same: drawn once, in place");
     for _ in 0..3 {
         wait(cx, w, &view, 16);
