@@ -1425,6 +1425,75 @@ fn idle_requests_no_frames(cx: &mut TestAppContext) {
     only_the_rail_spins(cx, w, &view, "settled");
 }
 
+/// Cards D × Q5 (#23 merged with #21): the rail's lattices and its fold
+/// never fight. Folding and unfolding the rail on `sheet` asks for the
+/// same display frames at the same widths whether its sessions run (their
+/// lattices on the beat layer, clipped with the flight's box) or rest: the
+/// beat adds no frame to the spring. Folded, the strip draws no lattice:
+/// nothing on the layer, no frame, no timer, though the sessions still run.
+/// Unfolded, their lattices are back on the beat.
+#[gpui_kit::test]
+fn the_rails_lattices_and_its_fold_never_fight(cx: &mut TestAppContext) {
+    use crate::motion::Beat;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    settle(cx, w, 8);
+    wait(cx, w, &view, crate::motion::GLOW.as_millis() as u64);
+    let spins = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, Beat::Spin(_))).count());
+    let busy = |cx: &mut TestAppContext, on: bool| {
+        view.update(cx, |v, cx| {
+            for (k, m) in v.model.sessions.iter_mut().enumerate() {
+                (m.busy, m.subagents_running) = (on && k < 3, 0);
+            }
+            v.model.rail_gen += 1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        settle(cx, w, 8);
+    };
+    // A fold or an unfold, frame by frame: whether a display frame was
+    // asked for before each, and the width it drew.
+    let fly = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        cx.run_until_parked();
+        let mut steps = Vec::new();
+        for _ in 0..400 {
+            let (shown, _, moving) = panel(cx, &view, true);
+            if !moving {
+                break;
+            }
+            steps.push((motion_pending(cx, &view).0, shown.round() as i32));
+            fluid_frame(cx, w, &view);
+        }
+        assert!(steps.len() > 10, "it flew: {steps:?}");
+        steps
+    };
+    busy(cx, true);
+    assert!(spins(cx) > 0, "the rail's running sessions: lattices on the layer");
+    let busy_fold = fly(cx);
+    settle(cx, w, 8);
+    assert_eq!(spins(cx), 0, "folded: the strip draws no lattice");
+    for _ in 0..4 {
+        wait(cx, w, &view, 500);
+    }
+    assert_eq!(motion_pending(cx, &view), (false, None), "folded, its sessions running: no frame, no timer");
+    let busy_unfold = fly(cx);
+    settle(cx, w, 8);
+    assert!(spins(cx) > 0, "unfolded: they're back");
+    let (_, timer) = motion_pending(cx, &view);
+    let at = timer.expect("on the beat");
+    assert!(view.read_with(cx, |v, _| v.fx.on_beats(at, 1)), "the timer is the beat's");
+    busy(cx, false);
+    assert_eq!(spins(cx), 0, "at rest");
+    let rest_fold = fly(cx);
+    settle(cx, w, 8);
+    let rest_unfold = fly(cx);
+    assert_eq!(busy_fold, rest_fold, "the fold: the same frames, running or not");
+    assert_eq!(busy_unfold, rest_unfold, "the unfold: the same frames, running or not");
+}
+
 /// Nothing runs in the column, the composer or the tray (Shady #17 M3,
 /// pinned): no display frame; no orbit; the only sites are the rail's
 /// running sessions' spinners (polish.md P1); and the only timer, if any,
