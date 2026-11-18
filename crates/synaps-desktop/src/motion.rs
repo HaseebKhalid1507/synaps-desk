@@ -1653,6 +1653,24 @@ impl Motion {
         self.sites.borrow_mut().push(site);
     }
 
+    /// An opaque strip painted over the list after its glyphs (the sticky
+    /// band, polish.md F8): the beat layer, painted after the whole frame,
+    /// paints nothing under it. Every site recorded so far whose clip meets
+    /// `cover` starts below it. The band spans the column from the view's
+    /// top, so trimming the top is exact: the clip's part it also drops,
+    /// in the gutters beside the band, holds no glyph. Sites recorded
+    /// outside the list (the rail, the tabs) never meet it.
+    pub(crate) fn cover_top(&self, cover: Bounds<Pixels>) {
+        for s in self.sites.borrow_mut().iter_mut() {
+            let m = &mut s.mask.bounds;
+            if m.intersects(&cover) {
+                let bottom = m.bottom();
+                m.origin.y = cover.bottom().min(bottom);
+                m.size.height = bottom - m.origin.y;
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn sites(&self) -> Vec<Site> {
         self.sites.borrow().clone()

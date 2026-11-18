@@ -6000,6 +6000,8 @@ impl Render for AppView {
         let (pad_l, pad_r) = lay.padding();
         // Nothing over the list but the tab strip: the first row's own gap
         // (20·r) is the transcript's top edge (design.md §8.14).
+        // No top padding: the sticky labels read rows' bounds, which leave
+        // it out (`crate::sticky`).
         let (pad_t, pad_b) = (0., list_pad_b(&m));
         let list = list(
             self.list.clone(),
@@ -6105,7 +6107,7 @@ impl Render for AppView {
                         .child(list)
                         // Right after the list's layout, reading it as it
                         // paints: the top message's label pinned (P15).
-                        .child(crate::sticky::layer(cx.processor(|this, b: Bounds<Pixels>, _, cx| this.sticky_label(b, cx))))
+                        .child(crate::sticky::layer(self.fx.clone(), cx.processor(|this, b: Bounds<Pixels>, _, cx| this.sticky_label(b, cx))))
                         .children(crate::motion::probe(&self.fx, "sticky"))
                         .child(crate::scroll::owner(self.scroller.clone(), self.fx.clone()))
                         .children(unpainted)

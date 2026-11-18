@@ -1441,8 +1441,9 @@ impl AppView {
     /// slot draws them, on the empty canvas; the canvas under them, from the
     /// top, hides the original going out. Inline (F8), the label line sits
     /// at the column's top on a `canvas` band one line tall, a 1 px `hair`
-    /// rule under it. Nothing in it takes a click or asks for a frame.
-    pub(crate) fn sticky_label(&self, b: Bounds<Pixels>, cx: &App) -> Option<AnyElement> {
+    /// rule under it; the band takes the pointer (not the wheel) and hides
+    /// the beat under it. Nothing in it asks for a frame.
+    pub(crate) fn sticky_label(&self, b: Bounds<Pixels>, cx: &App) -> Option<crate::sticky::Pinned> {
         let (p, m, lay) = (theme::palette(cx), theme::metrics(cx), self.layout);
         let at = |i: usize| {
             let (d, row) = (self.disp.get(i)?, self.list.bounds_for_item(i)?);
@@ -1450,7 +1451,7 @@ impl AppView {
             Some(f32::from(row.top() - b.top()) + gap_of(d.gap, &m) + top)
         };
         let time = |i: usize| self.disp.get(i).and_then(|d| self.rows.get(d.item)).and_then(|r| r.time.as_ref());
-        let (pin, line) = if lay.hang { (m.pad_y, m.body_line) } else { (0., m.body_line + 1.) };
+        let (pin, line) = if lay.hang { (m.pad_y, m.body_line) } else { (0., self.sticky_inset(cx)) };
         let h = |i: usize| line + if lay.hang && time(i).is_some() { m.mono_line } else { 0. };
         let stuck = crate::sticky::place(&self.disp, self.list.logical_scroll_top().item_ix, at, pin, h);
         let bottom = stuck.iter().flatten().map(|s| s.y + h(s.row)).reduce(f32::max)?;
@@ -1461,8 +1462,12 @@ impl AppView {
             .w(b.size.width)
             .h(b.size.height)
             .when(lay.hang, |d| d.child(div().absolute().left_0().top_0().w(gutter).h(px(bottom)).bg(p.canvas)));
-        Some(
-            root.children(stuck.into_iter().flatten().filter_map(|s| {
+        // Inline, the band (and its rule) across the column, from the top.
+        let cover = (!lay.hang).then(|| {
+            Bounds::from_corners(point(b.left() + px(lay.left), b.top()), point(b.left() + px(lay.left + lay.column), b.top() + px(bottom)))
+        });
+        let el = root
+            .children(stuck.into_iter().flatten().filter_map(|s| {
                 let d = self.disp[s.row];
                 let (text, color, _) = who_of(&d, &p, &m)?;
                 let id = d.id;
@@ -1472,14 +1477,21 @@ impl AppView {
                     let slot = v_flex().absolute().right(b.size.width - gutter).top(px(s.y)).items_end().child(label).children(time);
                     return Some(slot.debug_selector(move || format!("sticky {id}")).into_any_element());
                 }
-                let band = || div().absolute().left(px(lay.left)).w(px(lay.column));
+                // It hides live rows: nothing under it is clicked or hovered.
+                let band = || div().absolute().left(px(lay.left)).w(px(lay.column)).block_mouse_except_scroll();
                 let line = h_flex().size_full().justify_between().items_center().child(label).children(time);
                 let rule = band().top(px(s.y + m.body_line)).h(px(1.)).bg(p.hair).debug_selector(move || format!("sticky-rule {id}"));
                 let band = band().top(px(s.y)).h(px(m.body_line)).bg(p.canvas).child(line).debug_selector(move || format!("sticky {id}"));
                 Some(div().child(band).child(rule).into_any_element())
             }))
-            .into_any_element(),
-        )
+            .into_any_element();
+        Some(crate::sticky::Pinned { el, cover })
+    }
+
+    /// What the sticky band hides at the list's top when the labels are
+    /// inline (F8: one label line and its rule); hanging, nothing.
+    pub(crate) fn sticky_inset(&self, cx: &App) -> f32 {
+        if self.layout.hang { 0. } else { theme::metrics(cx).body_line + 1. }
     }
 }
 
