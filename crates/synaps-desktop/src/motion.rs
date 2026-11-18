@@ -1896,7 +1896,11 @@ impl Motion {
             r.since = None;
             return None;
         }
-        self.want_frame();
+        // On the shared 30 Hz grid, not the display's rate (Shady #17
+        // R2-M1): a roll is an app frame, and a live fan-out rolls a count
+        // every fraction of a second; N rolls share the ticks, and with the
+        // composer's sweep on screen they land on its frames.
+        self.want_tick();
         Some((r.prev.clone(), x, r.up))
     }
 
@@ -2914,6 +2918,24 @@ mod tests {
 
     /// P5: only the changed digit cells of a count roll; a count that
     /// changes length rolls whole.
+    /// Shady #17 R2-M1: a roll asks for the next tick of the shared 30 Hz
+    /// grid, never a display frame: a live fan-out's rolls cost at most 30
+    /// app frames a second, however many, on the sweep's own ticks.
+    #[test]
+    fn a_roll_steps_on_the_30hz_grid() {
+        let t0 = Instant::now();
+        let fx = Motion::new(t0);
+        fx.begin_frame(Level::Full, false, t0 + Duration::from_millis(5));
+        assert!(fx.roll(1, &"1 tool".into(), true).is_none(), "first drawn: at rest");
+        fx.demand();
+        fx.begin_frame(Level::Full, false, t0 + Duration::from_millis(12));
+        assert!(fx.roll(1, &"2 tools".into(), true).is_some(), "it changed while drawn: it rolls");
+        let (frame, at) = fx.demand();
+        assert!(!frame, "no display frame");
+        let at = at.expect("its next tick");
+        assert_eq!(at.duration_since(t0), DECAY_TICK, "the grid's next tick");
+    }
+
     #[test]
     fn roll_changed_digits_only() {
         use super::changed_cells as cells;
