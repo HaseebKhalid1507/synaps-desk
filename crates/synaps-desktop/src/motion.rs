@@ -1547,11 +1547,13 @@ impl Motion {
             let to = r.sink.get();
             let x = Spring::from_rest(1., GLIDE_RESPONSE, now.saturating_duration_since(at).as_secs_f32());
             let h = to + (from - to) * x;
-            if (h - to).abs() < FLUID_EPSILON || to <= 0. {
+            // Its first frame measures the new height (`to` is the old one
+            // until then): never done there.
+            if now > at && ((h - to).abs() < FLUID_EPSILON || to <= 0.) {
                 r.resize = None;
             } else {
                 self.want_frame();
-                return (Some((h / to).max(0.)), r.sink.clone());
+                return (Some(if to > 0. { (h / to).max(0.) } else { 1. }), r.sink.clone());
             }
         }
         let (shown, done) = r.at(now);
