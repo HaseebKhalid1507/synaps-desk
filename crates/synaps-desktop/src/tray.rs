@@ -1077,4 +1077,29 @@ mod tests {
         assert_eq!(crate::turns::clock(&fx, Some(base + ms(2))).as_deref(), Some("7s"), "as of 3 s: 7.998");
         assert_eq!(fx.demand(), (false, Some(t0 + ms(4000))));
     }
+
+    /// Shady #17 R2-L1 (motion.md §5.3): the link lost at 2.4 s, every
+    /// clock holds its count as of then, frame after frame, and asks for no
+    /// second; back, they count from the time again.
+    #[test]
+    fn a_lost_link_holds_the_clocks() {
+        use crate::motion::{Level, Motion};
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now() + Duration::from_secs(5);
+        let ms = Duration::from_millis;
+        let fx = Motion::new(t0);
+        let l = Live { tick: Some(crate::subagents::Tick::new(40., t0)), ..live(Status::Running, "bash") };
+        let r = TrayRow::of(l, false);
+        for at in [2500, 3000, 9000, 60_000] {
+            fx.begin_frame(Level::Full, false, t0 + ms(at));
+            fx.hold_still(Some(t0 + ms(2400)));
+            assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 42s", "held at {at} ms");
+            assert_eq!(super::chip_clock(&fx, &r).as_deref(), Some("42s"), "the chip, held at {at} ms");
+            assert_eq!(crate::turns::clock(&fx, Some(t0)).as_deref(), Some("2s"), "a call's, held at {at} ms");
+            assert_eq!(fx.demand(), (false, None), "no clock asks for a second at {at} ms");
+        }
+        fx.begin_frame(Level::Full, false, t0 + ms(61_000));
+        assert_eq!(super::ticked(&fx, &r.facts, &r.tick).as_ref(), "1 tool · 1m 41s", "back: the time again");
+        assert_eq!(fx.demand(), (false, Some(t0 + ms(62_000))));
+    }
 }

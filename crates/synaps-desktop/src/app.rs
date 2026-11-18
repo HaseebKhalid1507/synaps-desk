@@ -1215,7 +1215,7 @@ pub struct AppView {
     open_runs: HashSet<u64>,
     /// The rows an unfold under Full is revealing: tail-follow is held
     /// paused while they do ([`Self::hold_unfold`]).
-    unfold_hold: Vec<u64>,
+    pub(crate) unfold_hold: Vec<u64>,
     /// The transcript's `busy` at the last [`Self::sync_list`]: when it
     /// falls, the last run may fold.
     synced_busy: bool,
@@ -4600,6 +4600,10 @@ impl AppView {
         // A second unfold during a reveal adds its rows: the first run's
         // still grow (Shady #16 r4).
         if self.fx.fluid() {
+            // A fold took its rows away: their ids leave the hold with
+            // them (Shady #17 L3), not when their reveal would have ended.
+            let shown: HashSet<u64> = self.disp.iter().filter(|d| d.kind == Kind::Work).map(|d| d.id).collect();
+            self.unfold_hold.retain(|id| shown.contains(id));
             self.unfold_hold.extend(fresh);
         } else {
             self.unfold_hold.clear();
@@ -5790,7 +5794,7 @@ impl Render for AppView {
                 self.model.rail_gen += 1;
             }
             if self.link.lost {
-                self.fx.hold_still();
+                self.fx.hold_still(self.link.lost_at());
             }
         }
         let drain = self.link.drain(&self.fx);

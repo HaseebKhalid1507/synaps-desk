@@ -1603,6 +1603,41 @@ fn an_unfold_under_full_keeps_its_header_put(cx: &mut TestAppContext) {
     assert_eq!(header(cx, run), Some(at), "at rest");
 }
 
+/// A fold during its own unfold's reveal takes its rows out of the hold
+/// at once (Shady #17 L3): the hold never keeps ids no longer listed.
+#[gpui_kit::test]
+fn a_fold_drops_its_rows_from_the_unfold_hold(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    settle(cx, w, 8);
+    let run = view.read_with(cx, |v, _| {
+        v.disp
+            .iter()
+            .filter(|d| matches!(d.kind, crate::turns::Kind::Summary { open: false, .. }))
+            .map(|d| d.id)
+            .last()
+            .expect("a folded run")
+    });
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    let held = view.read_with(cx, |v, _| v.unfold_hold.len());
+    assert!(held > 0, "the unfold's rows are held while they reveal");
+    view.update(cx, |v, cx| {
+        v.toggle_run(run);
+        cx.notify();
+    });
+    let left = view.read_with(cx, |v, _| {
+        let shown: std::collections::HashSet<u64> = v.disp.iter().map(|d| d.id).collect();
+        v.unfold_hold.iter().filter(|id| !shown.contains(id)).count()
+    });
+    assert_eq!(left, 0, "folded: none of its rows stay held");
+    assert!(view.read_with(cx, |v, _| v.unfold_hold.is_empty()), "nothing else was held");
+}
+
 /// Words arrive readable (fluid.md law 3, §3.4): the one stream fade in
 /// the app is `motion::text_motion` (its words start at 70 %), given only
 /// to text streamed into a row (`turns.rs`); no view gets the kit's own
@@ -2988,8 +3023,53 @@ fn a_lost_link_stills_every_ambient(cx: &mut TestAppContext) {
     let (frame, at) = motion_pending(cx, &view);
     assert!(!frame, "no display frames while held");
     let at = at.expect("the dots step");
-    assert!(view.read_with(cx, |v, _| v.fx.on_beats(at, 4)), "only the dots' 2 Hz step (and the clocks' second), not the beat or 30 Hz");
+    assert!(view.read_with(cx, |v, _| v.fx.on_beats(at, 4)), "only the dots' 2 Hz step, not the beat or 30 Hz");
     assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::App), "the words' frame, no layer");
+}
+
+/// Shady #17 R2-L1 (motion.md §5.3): the link lost, a running worker's
+/// clocks hold their count as of the loss, frame after frame, while the
+/// connection words' dots step; back, they count again.
+#[gpui_kit::test]
+fn a_lost_link_holds_every_clock(cx: &mut TestAppContext) {
+    use crate::model::ConnState;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    life_worker(cx, w, &view);
+    let conn = |cx: &mut TestAppContext, c: ConnState| {
+        view.update(cx, |v, cx| {
+            v.synthetic = false;
+            v.model.conn = c;
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    conn(cx, ConnState::Connected("x".into()));
+    wait(cx, w, &view, 500);
+    // What the clocks show as of the last frame (the tray's and the chips'
+    // text, which the frame's state decides).
+    let shown = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            v.tray.rows.iter().filter(|r| r.tick.is_some()).map(|r| crate::tray::ticked(&v.fx, &r.facts, &r.tick).to_string()).collect::<Vec<_>>()
+        })
+    };
+    conn(cx, ConnState::Reconnecting);
+    wait_past(cx, w, &view, (crate::motion::LINK_GRACE + crate::motion::SLOW).as_millis() as u64);
+    wait(cx, w, &view, 600);
+    assert!(view.read_with(cx, |v, _| v.link.lost), "lost");
+    let held = shown(cx);
+    assert!(!held.is_empty(), "a running worker's clock");
+    let f0 = frames(cx, &view).0;
+    for _ in 0..30 {
+        wait(cx, w, &view, 100);
+        assert_eq!(shown(cx), held, "held through the outage");
+    }
+    assert!(frames(cx, &view).0 > f0, "the dots stepped (the app drew) meanwhile");
+    conn(cx, ConnState::Connected("x".into()));
+    for _ in 0..15 {
+        wait(cx, w, &view, 100);
+    }
+    assert_ne!(shown(cx), held, "back: the clocks count again");
 }
 
 /// [`running_without_a_clock`] without the layer: the sites stay empty.
