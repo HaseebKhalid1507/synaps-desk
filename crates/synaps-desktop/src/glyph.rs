@@ -142,7 +142,8 @@ impl Glyph {
             // The lattice's running still pose's lit face (indicators/proposal.md §6).
             Glyph::Run => &[Fill(4., 1., 2., 2.), Fill(7., 1., 2., 2.), Fill(7., 4., 2., 2.)],
             Glyph::Workers => &[Fill(4., 1., 2., 2.), Fill(7., 1., 2., 2.), Fill(7., 4., 2., 2.)],
-            Glyph::Needs => &[Frame(0., 0., 10., 10.), Fill(3., 3., 4., 4.)],
+            // The lattice plus's lit cells (the design gate of #23, S3, n3).
+            Glyph::Needs => &[Fill(4., 1., 2., 2.), Fill(1., 4., 2., 2.), Fill(4., 4., 2., 2.), Fill(7., 4., 2., 2.), Fill(4., 7., 2., 2.)],
             Glyph::Unread => &[Fill(3., 3., 4., 4.)],
             Glyph::Idle => &[Frame(1., 1., 8., 8.)],
             Glyph::Parked => &[Fill(1., 7., 8., 2.)],

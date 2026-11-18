@@ -610,11 +610,14 @@ impl AppView {
                         by
                     };
                     if cut != 0. {
+                        self.scroller.touch();
                         self.list.scroll_by(px(cut));
                     }
                 }
             }
             None => {
+                // The user's jump (Shady #23 r4 H1): it leaves the end.
+                self.scroller.touch();
                 self.list.scroll_to_reveal_item(ix);
                 // Drawn next frame: placed again then, the dock as it lands.
                 if self.dock_growth() > 0.5 {

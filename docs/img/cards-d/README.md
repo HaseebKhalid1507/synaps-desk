@@ -131,7 +131,7 @@ is a click (`toggle_run`); the turn-end fold (f≈776) is the only tail-followin
 | `r4-N3-fold-end-header-holds-f1464-1516.png` | the fold at the end (every 4th frame): the header and all above it hold (block match: 0 px, f1460–1520); the card's edge rides up over its rows |
 | `r4-N3-fold-rows-under-view-f1735-1787.png` | unfolded as the list went to its end, folded with rows under the view: the header holds (0 px, f1730–1790) |
 | `r4-N2-unfold-stagger-no-scroll-f1284-1312.png` | the unfold mid-screen with no scroll (every 2nd frame): the rows arrive one after another under a still header |
-| `r4-S1-body-opens-shows-first-lines-f2034-2074.png` | the last call's body opened at the very bottom: the row holds while it opens under the view, then the list glides just far enough to show it (here 1 line, so ~9 px over f2056–2070) |
+| `r4-S1-body-opens-shows-first-lines-f2034-2074.png` | the last call's body opened at the very bottom: the row holds while it opens under the view, then the list glides just far enough to show it: 39 px over f2056–2070 (the design gate's measure; r4's "~9 px" was wrong). In r4 the glide began 9 still frames (150 ms) after the reveal landed (f2046 → f2056); round 5 starts it as the reveal settles (85 % in) |
 | `r4-H2-slow-scroll-while-streaming-f2330-2500-2690-2840.png` | output streaming while the reader scrolls up 0.5 px a frame: the column only moves up (block match f2330–2840: 215 one-px steps, all one way, never toward the end), and after the scroll stops (f≈2690) nothing moves |
 
 S5, the 1280 turn-end fold with its header off screen (`l5-full` f782–840, block match on the

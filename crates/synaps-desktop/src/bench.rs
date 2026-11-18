@@ -738,6 +738,27 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
                             cx.notify();
                         });
+                        // `SYNAPS_BENCH_HELD=1` (Shady #23 r4 H1): the room the
+                        // card left held at the list's end, the composer
+                        // grows three lines (a steer), then output streams
+                        // until it has used the room up, and on (the list
+                        // follows). Marks on stderr: `HELD <what> <s>`.
+                        if std::env::var("SYNAPS_BENCH_HELD").is_ok() {
+                            let t0 = Instant::now();
+                            let mark = |what: &str| eprintln!("HELD {what} {:.3}", t0.elapsed().as_secs_f64());
+                            sleep(1.5).await;
+                            mark("composer");
+                            let _ = view.update_in(cx, |v, window, cx| {
+                                v.composer.update(cx, |s, cx| s.set_value("steer: and the relay too\nkeep the old token\nthen run it again", window, cx))
+                            });
+                            sleep(1.5).await;
+                            mark("stream");
+                            for k in 0..48 {
+                                apply(cx, vec![delta("s3", &format!("test held_{k} ... ok\n"))]);
+                                sleep(0.25).await;
+                            }
+                            mark("done");
+                        }
                         sleep(1.5).await;
                         apply(cx, vec![result("s3", "Tool execution failed: Command failed (exit 1):\ntest refresh_10 ... FAILED")]);
                         sleep(1.5).await;
