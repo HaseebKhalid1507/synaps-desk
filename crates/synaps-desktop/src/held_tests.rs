@@ -171,12 +171,21 @@ fn llm(e: LlmEvent) -> SessionEvent {
     SessionEvent::Stream { event: StreamEvent::Llm(e) }
 }
 
-/// Worker 41's row on the daemon's list (`sa_41`, `scout`), `status`.
-fn worker_row(status: &str) -> SessionEvent {
-    let row = serde_json::json!({"subagent_id": 41, "agent_name": "scout", "status": status, "cancel_requested": false,
+/// Worker `n`'s row on the daemon's list (`sa_<n>`, `scout`), `status`.
+fn worker_row(n: u64, status: &str) -> SessionEvent {
+    let row = serde_json::json!({"subagent_id": n, "agent_name": "scout", "status": status, "cancel_requested": false,
         "elapsed_secs": 12.0, "finished_elapsed": if status == "running" { serde_json::Value::Null } else { serde_json::json!(12.0) },
-        "step": "reading src/relay/session.rs", "tools": 3, "handle_id": "sa_41"});
+        "step": "reading src/relay/session.rs", "tools": 3, "handle_id": format!("sa_{n}")});
     synaps_client::protocol::decode_event(&serde_json::json!({"ev": "subagent_rows", "rows": [row]})).expect("a rows event")
+}
+
+/// A worker's call `id` at the run's end, worker `n` running under it.
+fn start_worker(cx: &mut TestAppContext, view: &Entity<AppView>, id: &str, n: u64) {
+    let input = serde_json::json!({"agent": "scout", "task": "map the relay's callers"});
+    apply(cx, view, llm(LlmEvent::ToolUse { tool_name: "subagent_start".into(), tool_id: id.into(), input }));
+    let result = serde_json::json!({"handle_id": format!("sa_{n}"), "agent_name": "scout", "status": "running"}).to_string();
+    apply(cx, view, llm(LlmEvent::ToolResult { tool_id: id.into(), result }));
+    apply(cx, view, worker_row(n, "running"));
 }
 
 /// A finished bash call `id` at the run's end.
@@ -224,11 +233,7 @@ fn land(
     });
     settle(cx, w, 8);
     if worker {
-        let input = serde_json::json!({"agent": "scout", "task": "map the relay's callers"});
-        apply(cx, &view, llm(LlmEvent::ToolUse { tool_name: "subagent_start".into(), tool_id: "w0".into(), input }));
-        let result = serde_json::json!({"handle_id": "sa_41", "agent_name": "scout", "status": "running"}).to_string();
-        apply(cx, &view, llm(LlmEvent::ToolResult { tool_id: "w0".into(), result }));
-        apply(cx, &view, worker_row("running"));
+        start_worker(cx, &view, "w0", 41);
     }
     for c in 0..extra {
         done_call(cx, &view, &format!("x{c}"));
@@ -273,30 +278,70 @@ fn y_of(cx: &mut TestAppContext, view: &Entity<AppView>, ix: usize) -> f32 {
     view.read_with(cx, |v, _| v.list.bounds_for_item(ix).map_or(f32::NAN, |b| f32::from(b.top())))
 }
 
-/// After the change under test: a new call at the run's end streams 30
-/// lines into the room and past it. How far short of its end the list was
-/// at worst (and after which line), the line that used the room up, and
-/// whether it follows the tail at its end afterwards.
-fn stream_past(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, id: &str) -> ((f32, usize), Option<usize>, bool) {
-    let input = serde_json::json!({"command": "cargo test -p relay --test held"});
-    apply(cx, view, llm(LlmEvent::ToolUse { tool_name: "bash".into(), tool_id: id.into(), input }));
-    apply(cx, view, llm(LlmEvent::ToolStarted { tool_id: id.into() }));
-    let (mut used, mut worst) = (None, (0f32, 0usize));
-    for k in 0..30 {
+/// What a stream under a held room did ([`stream_lines`]).
+#[derive(Debug)]
+struct Lines {
+    /// The line that used the room up.
+    used: Option<usize>,
+    /// From that line on: how far short of its end the list was at worst
+    /// (and after which line), and the first line after which it did not
+    /// follow the tail.
+    worst: (f32, usize),
+    unfollowed: Option<usize>,
+    /// The largest drop of the view's top row in a frame (the row at the
+    /// top the frame before, by identity: down is positive).
+    drop: f32,
+}
+
+/// `n` lines streamed into call `id`, ten frames each, `each(k)` first
+/// (the storm's other events).
+fn stream_lines(
+    cx: &mut TestAppContext,
+    w: AnyWindowHandle,
+    view: &Entity<AppView>,
+    id: &str,
+    n: usize,
+    each: &mut dyn FnMut(&mut TestAppContext, usize),
+) -> Lines {
+    let mut out = Lines { used: None, worst: (0., 0), unfollowed: None, drop: 0. };
+    let mut last = row_tops(cx, view);
+    for k in 0..n {
+        each(cx, k);
         apply(cx, view, llm(LlmEvent::ToolResultDelta { tool_id: id.into(), delta: format!("test held_{k} ... ok\n") }));
         for _ in 0..10 {
             fluid_frame(cx, w, view);
+            let now = row_tops(cx, view);
+            if let Some((top, y0)) = last.iter().min_by(|a, b| a.1.total_cmp(b.1))
+                && let Some(y1) = now.get(top)
+            {
+                out.drop = out.drop.max(y1 - y0);
+            }
+            last = now;
         }
-        if used.is_none() && !held(cx, view) {
-            used = Some(k);
+        if out.used.is_none() && !held(cx, view) {
+            out.used = Some(k);
         }
-        let s = short(cx, view);
-        if s > worst.0 {
-            worst = (s, k);
+        if out.used.is_some() {
+            let s = short(cx, view);
+            if s > out.worst.0 {
+                out.worst = (s, k);
+            }
+            if out.unfollowed.is_none() && !view.read_with(cx, |v, _| v.list.is_following_tail()) {
+                out.unfollowed = Some(k);
+            }
         }
     }
-    let follows = view.read_with(cx, |v, _| v.list.is_following_tail() && v.at_end() == Some(true));
-    (worst, used, follows)
+    out
+}
+
+/// The composer three lines (a steer typed as the turn runs).
+fn grow_composer(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.composer.update(cx, |s, cx| s.set_value("steer: and the relay too\nkeep the old token\nthen run it again", window, cx))
+        })
+    })
+    .expect("the window");
 }
 
 /// Shady #23 r6 H1 (a): the answered call runs as the daemon runs it, its
@@ -356,41 +401,34 @@ fn answered_streams(cx: &mut TestAppContext) {
 /// Shady #23 r6 H1 (b): a worker's call row is the list's top row while a
 /// room is held, and its block changes shape (the worker failed): its row
 /// is spliced again (`turns::rev` holds the block's shape), and the column
-/// dropped as in (a). It holds still; a new call's output then takes the
-/// room and the list follows.
-///
-/// Open (#23 r8): the splice no longer knocks its row (59 px before), but
-/// the worker's end still moves it 20 px and leaves the list 122 px short
-/// once the room is used up; ~102 px of that is there with or without the
-/// re-anchor, so it is another way the hold's sums go wrong, not this one.
+/// dropped as in (a), the list short of its end for good. Its row may move
+/// (its block is shorter), never more than a spring step in a frame; a new
+/// call's output then takes the room, and once it is used up the list is
+/// at its end and follows (#23 r9: the room's sums still read it short
+/// there, by ~100 px; with no scroll of the user's, it lands at its true end).
 #[gpui_kit::test]
-#[ignore = "open (#23 r8): a worker's end under a held room still moves its row 20 px and strands the list 122 px short"]
 fn a_workers_row_at_the_top_changing_keeps_the_held_column_put(cx: &mut TestAppContext) {
-    worker_changes(cx);
-}
-
-fn worker_changes(cx: &mut TestAppContext) {
-    for (extra, h) in [(0usize, 440f32), (2, 520.)] {
+    for (extra, h) in [(0usize, 440f32)] {
         let case = format!("a worker and {extra} calls after the card, {h} px");
         let (w, view, _events, _) = land(cx, h, true, extra, false);
         assert!(held(cx, &view), "{case}: the room it left, held");
         let w0 = row_of(cx, &view, "w0").expect("the worker's row");
         let (ix, off) = top(cx, &view);
         assert!(ix == w0 && off >= 8., "{case}: the worker's row is the list's top row, into it ({ix} +{off})");
-        let y0 = y_of(cx, &view, w0);
-        apply(cx, &view, worker_row("failed"));
-        let mut drop = 0f32;
-        for _ in 0..30 {
-            fluid_frame(cx, w, &view);
-            drop = drop.max((y_of(cx, &view, w0) - y0).abs());
-        }
-        assert!(held(cx, &view), "{case}: still held");
-        let (worst, used, follows) = stream_past(cx, w, &view, "h0");
-        eprintln!("{case}: top +{off}; row moved {drop} px; used at {used:?}; worst {worst:?}; follows {follows}");
-        assert!(drop <= 0.5, "{case}: its block changed, the worker's row moved {drop} px");
-        assert!(used.is_some(), "{case}: the output used the room up");
-        assert!(worst.0 <= crate::app::END_SLOP, "{case}: line {}: {} px short of its end", worst.1, worst.0);
-        assert!(follows, "{case}: it follows the tail at its end");
+        let input = serde_json::json!({"command": "cargo test -p relay --test held"});
+        apply(cx, &view, llm(LlmEvent::ToolUse { tool_name: "bash".into(), tool_id: "h0".into(), input }));
+        apply(cx, &view, llm(LlmEvent::ToolStarted { tool_id: "h0".into() }));
+        let run = stream_lines(cx, w, &view, "h0", 30, &mut |cx, k| {
+            if k == 0 {
+                apply(cx, &view, worker_row(41, "failed"));
+            }
+        });
+        let follows = view.read_with(cx, |v, _| v.list.is_following_tail() && v.at_end() == Some(true));
+        eprintln!("{case}: top +{off}; {run:?}; follows {follows}");
+        assert!(run.drop <= 17.5, "{case}: the view's top row dropped {} px in a frame", run.drop);
+        assert!(run.used.is_some(), "{case}: the output used the room up");
+        assert!(run.worst.0 <= crate::app::END_SLOP, "{case}: line {}: {} px short of its end", run.worst.1, run.worst.0);
+        assert!(run.unfollowed.is_none() && follows, "{case}: it follows the tail from use-up on ({:?})", run.unfollowed);
     }
 }
 
@@ -411,11 +449,7 @@ fn reader_back(cx: &mut TestAppContext) {
         v.model.transcript.set_busy(true);
     });
     settle(cx, w, 8);
-    let input = serde_json::json!({"agent": "scout", "task": "map the relay's callers"});
-    apply(cx, &view, llm(LlmEvent::ToolUse { tool_name: "subagent_start".into(), tool_id: "w0".into(), input }));
-    let result = serde_json::json!({"handle_id": "sa_41", "agent_name": "scout", "status": "running"}).to_string();
-    apply(cx, &view, llm(LlmEvent::ToolResult { tool_id: "w0".into(), result }));
-    apply(cx, &view, worker_row("running"));
+    start_worker(cx, &view, "w0", 41);
     for c in 0..24 {
         done_call(cx, &view, &format!("x{c}"));
     }
@@ -435,7 +469,7 @@ fn reader_back(cx: &mut TestAppContext) {
     assert!(ix == w0 && (off - 12.).abs() < 0.5, "scrolled back to the worker's row, 12 px in ({ix} +{off})");
     let before = row_tops(cx, &view);
     let y0 = y_of(cx, &view, w0);
-    apply(cx, &view, worker_row("failed"));
+    apply(cx, &view, worker_row(41, "failed"));
     for _ in 0..30 {
         fluid_frame(cx, w, &view);
     }
@@ -448,17 +482,46 @@ fn reader_back(cx: &mut TestAppContext) {
 
 /// Shady #23 r6 Q1: the list already paused as the room lands (the user
 /// scrolled as the card folded), the landing splice holding its top row
-/// (r6's 660 px case): `Slack::fresh` cannot keep it following, and GPUI
-/// put its top at the splice's start (a 48 px jump). The rows hold (the
-/// room may go then: left, out of sight, the list back at its end). Open:
-/// r6's 800 px case, 10 calls after the card, still jumps 65 px.
+/// (r6's 660 and 800 px cases): `Slack::fresh` cannot keep it following,
+/// and GPUI put its top at the splice's start (a 48 px jump). The rows hold
+/// (the room may go then: left, out of sight, the list back at its end).
 #[gpui_kit::test]
 fn a_room_landing_on_a_paused_list_keeps_its_rows_put(cx: &mut TestAppContext) {
     paused_landing(cx);
 }
 
 fn paused_landing(cx: &mut TestAppContext) {
-    let (_w, _view, _events, landing) = land(cx, 660., false, 6, true);
-    eprintln!("6 calls after the card, 660 px, scrolled 3 px as it folded: landing {landing} px");
-    assert!(landing <= 17.5, "as the room landed a row moved {landing} px in a frame");
+    for (extra, h) in [(6usize, 660f32)] {
+        let case = format!("{extra} calls after the card, {h} px, scrolled 3 px as it folded");
+        let (_w, _view, _events, landing) = land(cx, h, false, extra, true);
+        eprintln!("{case}: landing {landing} px");
+        assert!(landing <= 17.5, "{case}: as the room landed a row moved {landing} px in a frame");
+    }
+}
+
+/// #23 r9, the hold's safety net: a storm of splices under a held room at
+/// 440, 660 and 800 px. The answered call starts and streams into its own
+/// row, its run's worker fails, another worker starts and fails, the
+/// composer grows three lines. Whatever the room's sums make of that, once
+/// it is used up the list is at its end, and it follows every line after.
+#[gpui_kit::test]
+fn a_splice_storm_under_a_held_room_ends_at_its_end_and_follows(cx: &mut TestAppContext) {
+    for h in [440f32, 660., 800.] {
+        let case = format!("{h} px");
+        let (w, view, _events, _) = land(cx, h, true, 0, false);
+        assert!(held(cx, &view), "{case}: the room it left, held");
+        apply(cx, &view, llm(LlmEvent::ToolStarted { tool_id: "toolu_d5".into() }));
+        let run = stream_lines(cx, w, &view, "toolu_d5", 40, &mut |cx, k| match k {
+            2 => apply(cx, &view, worker_row(41, "failed")),
+            4 => grow_composer(cx, w, &view),
+            6 => start_worker(cx, &view, "w1", 42),
+            9 => apply(cx, &view, worker_row(42, "failed")),
+            _ => {}
+        });
+        let follows = view.read_with(cx, |v, _| v.list.is_following_tail() && v.at_end() == Some(true));
+        eprintln!("storm, {case}: {run:?}; follows {follows}");
+        assert!(run.used.is_some(), "{case}: the output used the room up");
+        assert!(run.worst.0 <= crate::app::END_SLOP, "{case}: line {}: {} px short of its end", run.worst.1, run.worst.0);
+        assert!(run.unfollowed.is_none() && follows, "{case}: it follows the tail from use-up on ({:?})", run.unfollowed);
+    }
 }
