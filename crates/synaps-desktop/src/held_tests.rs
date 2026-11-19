@@ -283,6 +283,8 @@ fn y_of(cx: &mut TestAppContext, view: &Entity<AppView>, ix: usize) -> f32 {
 struct Lines {
     /// The line that used the room up.
     used: Option<usize>,
+    /// Until then: how far short of its end the list was at worst.
+    held_worst: f32,
     /// From that line on: how far short of its end the list was at worst
     /// (and after which line), and the first line after which it did not
     /// follow the tail.
@@ -303,7 +305,7 @@ fn stream_lines(
     n: usize,
     each: &mut dyn FnMut(&mut TestAppContext, usize),
 ) -> Lines {
-    let mut out = Lines { used: None, worst: (0., 0), unfollowed: None, drop: 0. };
+    let mut out = Lines { used: None, held_worst: 0., worst: (0., 0), unfollowed: None, drop: 0. };
     let mut last = row_tops(cx, view);
     for k in 0..n {
         each(cx, k);
@@ -321,7 +323,9 @@ fn stream_lines(
         if out.used.is_none() && !held(cx, view) {
             out.used = Some(k);
         }
-        if out.used.is_some() {
+        if out.used.is_none() {
+            out.held_worst = out.held_worst.max(short(cx, view));
+        } else {
             let s = short(cx, view);
             if s > out.worst.0 {
                 out.worst = (s, k);
@@ -402,13 +406,16 @@ fn answered_streams(cx: &mut TestAppContext) {
 /// room is held, and its block changes shape (the worker failed): its row
 /// is spliced again (`turns::rev` holds the block's shape), and the column
 /// dropped as in (a), the list short of its end for good. Its row may move
-/// (its block is shorter), never more than a spring step in a frame; a new
-/// call's output then takes the room, and once it is used up the list is
-/// at its end and follows (#23 r9: the room's sums still read it short
-/// there, by ~100 px; with no scroll of the user's, it lands at its true end).
+/// (its block is shorter at the list's end): never more in a frame than
+/// that shrink moves a list with no room (main's: following, the end at
+/// the view's bottom; the sibling run), or a spring step. A new call's
+/// output then takes the room; the list is at its end after every line,
+/// held (the room's base follows the shrink down, #23 r9: 20 px short
+/// otherwise) or not, and follows once the room is used up.
 #[gpui_kit::test]
 fn a_workers_row_at_the_top_changing_keeps_the_held_column_put(cx: &mut TestAppContext) {
-    for (extra, h) in [(0usize, 440f32)] {
+    for (extra, h) in [(0usize, 440f32), (2, 520.)] {
+        let bare = shrink_with_no_room(cx, h, extra);
         let case = format!("a worker and {extra} calls after the card, {h} px");
         let (w, view, _events, _) = land(cx, h, true, extra, false);
         assert!(held(cx, &view), "{case}: the room it left, held");
@@ -424,12 +431,44 @@ fn a_workers_row_at_the_top_changing_keeps_the_held_column_put(cx: &mut TestAppC
             }
         });
         let follows = view.read_with(cx, |v, _| v.list.is_following_tail() && v.at_end() == Some(true));
-        eprintln!("{case}: top +{off}; {run:?}; follows {follows}");
-        assert!(run.drop <= 17.5, "{case}: the view's top row dropped {} px in a frame", run.drop);
+        eprintln!("{case}: top +{off}; {run:?}; follows {follows}; with no room the shrink dropped it {bare} px");
+        let bound = bare.max(17.5) + 0.5;
+        assert!(run.drop <= bound, "{case}: the view's top row dropped {} px in a frame (the shrink alone: {bare} px)", run.drop);
+        assert!(run.held_worst <= crate::app::END_SLOP, "{case}: {} px short of its end, the room held", run.held_worst);
         assert!(run.used.is_some(), "{case}: the output used the room up");
         assert!(run.worst.0 <= crate::app::END_SLOP, "{case}: line {}: {} px short of its end", run.worst.1, run.worst.0);
         assert!(run.unfollowed.is_none() && follows, "{case}: it follows the tail from use-up on ({:?})", run.unfollowed);
     }
+}
+
+/// (b)'s worker failing with no room held (the room let go, the list at
+/// its end, following: main's way): the largest drop of the view's top row
+/// in a frame, which is the worker's block getting shorter, alone.
+fn shrink_with_no_room(cx: &mut TestAppContext, h: f32, extra: usize) -> f32 {
+    let (w, view, _events, _) = land(cx, h, true, extra, false);
+    view.update(cx, |v, cx| {
+        v.fold_slack.set(None);
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    for _ in 0..30 {
+        fluid_frame(cx, w, &view);
+    }
+    assert!(view.read_with(cx, |v, _| v.list.is_following_tail() && v.fold_slack.get().is_none()), "no room, following");
+    let mut last = row_tops(cx, &view);
+    apply(cx, &view, worker_row(41, "failed"));
+    let mut drop = 0f32;
+    for _ in 0..30 {
+        fluid_frame(cx, w, &view);
+        let now = row_tops(cx, &view);
+        if let Some((top, y0)) = last.iter().min_by(|a, b| a.1.total_cmp(b.1))
+            && let Some(y1) = now.get(top)
+        {
+            drop = drop.max(y1 - y0);
+        }
+        last = now;
+    }
+    drop
 }
 
 /// Shady #23 r6 H1 (c), main's own: a reader scrolled back, a worker's row

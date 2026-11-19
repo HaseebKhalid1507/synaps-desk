@@ -4384,6 +4384,15 @@ impl AppView {
         let mut room = s.last;
         if max > 0. && s.gone.is_none() && s.fresh.is_none() {
             let content = max + f32::from(self.list.viewport_bounds().size.height) - s.last;
+            // Rows under the hold got shorter (a worker's block ended):
+            // the content it is held against follows them down, so rows
+            // growing in take the room from there and it is used up at
+            // the list's end, not that much short of it (#23 r9). Measured
+            // only (a row a splice left at 0 px is no shrink: M1); a
+            // click's own hold has its room.
+            if measured && content < s.base && folding == 0. && self.body_hold.get().is_none() {
+                s.base = content.round();
+            }
             room = s.given - (content - s.base).max(0.);
         }
         // How far from its end the list is once this frame's room is in
