@@ -40,6 +40,8 @@ mod files;
 mod fit;
 mod fonts;
 mod glyph;
+#[cfg(test)]
+mod held_tests;
 mod lattice;
 mod mem;
 mod menu;
