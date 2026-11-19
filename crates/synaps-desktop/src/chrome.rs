@@ -809,7 +809,12 @@ impl AppView {
             .gap(px(12.))
             .items_center()
             // The state grammar (design.md §4.1): NEEDS YOU's glyph, or at rest the idle one.
-            .child(if on { glyph::draw(glyph::Glyph::Needs, p.warn_mark_ch) } else { glyph::draw(glyph::Glyph::Idle, p.rest_mark) })
+            .child(if on {
+                glyph::needs(glyph::needs_ping(&self.fx, true), p.warn_mark_ch, p.chrome)
+            } else {
+                let _ = glyph::needs_ping(&self.fx, false);
+                glyph::draw(glyph::Glyph::Idle, p.rest_mark)
+            })
             // The count rolls (polish.md P5) and afterglows (motion.md
             // §6.6) when it changes; the words stay.
             // One text at rest, as before; rolling, only its changed cells.

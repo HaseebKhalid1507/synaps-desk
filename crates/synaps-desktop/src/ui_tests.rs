@@ -1342,6 +1342,410 @@ fn a_folded_run(cx: &mut TestAppContext, view: &Entity<AppView>) -> u64 {
     })
 }
 
+/// The design gate of #23, S1 (T4): a body opened or closed at the list's
+/// end leaves its clicked row where it is: opening, the list keeps its top
+/// row and the body grows down; closing, its room past what was under the
+/// view is held at the end as it glides.
+#[gpui_kit::test]
+fn a_body_at_the_end_keeps_its_row_put(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| {
+        v.client = None;
+        v.model.transcript.set_busy(true);
+    });
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    running_tools(cx, &view, 1);
+    view.update(cx, |v, cx| {
+        let out: String = (0..12).map(|k| format!("line {k}\n")).collect();
+        v.model
+            .transcript
+            .apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: out }) });
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    wait(cx, w, &view, 1000);
+    let id = view.read_with(cx, |v, _| v.model.transcript.items().iter().rev().find(|i| i.tool.is_some()).map(|i| i.id)).expect("the call");
+    let top = |cx: &mut TestAppContext| {
+        VisualTestContext::from_window(w, cx)
+            .debug_bounds(String::leak(format!("tool-row {id}")))
+            .map(|b| f32::from(b.top()))
+            .expect("its row")
+    };
+    let well = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("well {id}"))).is_some();
+    let first = !well(cx);
+    for open in [first, !first] {
+        let at = top(cx);
+        view.update(cx, |v, cx| {
+            v.toggle(id);
+            cx.notify();
+        });
+        let mut ys = vec![];
+        for _ in 0..150 {
+            fluid_frame(cx, w, &view);
+            ys.push(top(cx) - at);
+        }
+        if open {
+            // Its row holds as it opens; landed under the view's bottom, the
+            // list glides just far enough to show its first three lines,
+            // the row still on screen (the design gate of #23 r3, S1).
+            let lines = view.read_with(cx, |_, cx| 3. * crate::theme::metrics(cx).body_line);
+            assert!(ys.windows(2).all(|p| p[1] <= p[0] + 0.5 && p[0] - p[1] <= 13.), "opening: held, or a glide up: {ys:?}");
+            assert!(ys.iter().all(|d| *d <= 0.5 && *d >= -(lines + 1.)), "opening: three lines at most: {ys:?}");
+            let (vt, vb) =
+                view.read_with(cx, |v, _| (f32::from(v.list.viewport_bounds().top()), f32::from(v.list.viewport_bounds().bottom())));
+            assert!(top(cx) >= vt, "opening: its row on screen");
+            let body = VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("well {id}"))).expect("its body");
+            assert!(f32::from(body.top()) < vb - 40., "opening: its first lines in sight ({body:?}, the view's bottom {vb})");
+        } else {
+            assert!(ys.iter().all(|d| d.abs() <= 0.5), "closing: its row's offsets {ys:?}");
+        }
+        assert_eq!(well(cx), open, "it toggled (Shady #23 r3 n3)");
+    }
+}
+
+/// Shady #23 r4 M1: a body opened at the view's bottom, and the reader
+/// wheels up while it reveals: their scroll wins. When it lands, no glide
+/// to its first lines takes the list back down (the offset never grows
+/// after the wheel).
+#[gpui_kit::test]
+fn a_scroll_during_a_bodys_reveal_wins(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseMoveEvent, ScrollDelta, ScrollEvent, ScrollSource, TouchPhase, point};
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| {
+        v.client = None;
+        v.model.transcript.set_busy(true);
+    });
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    running_tools(cx, &view, 1);
+    view.update(cx, |v, cx| {
+        let out: String = (0..12).map(|k| format!("line {k}\n")).collect();
+        v.model
+            .transcript
+            .apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: out }) });
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    wait(cx, w, &view, 1000);
+    let id = view.read_with(cx, |v, _| v.model.transcript.items().iter().rev().find(|i| i.tool.is_some()).map(|i| i.id)).expect("the call");
+    let well = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("well {id}"))).is_some();
+    if well(cx) {
+        view.update(cx, |v, cx| {
+            v.toggle(id);
+            cx.notify();
+        });
+        wait(cx, w, &view, 1000);
+    }
+    assert!(!well(cx), "closed");
+    // No room held at the end: the call's row is the list's last, at the
+    // view's bottom, and its body opens under it.
+    view.update(cx, |v, cx| {
+        v.fold_slack.set(None);
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let offset = |cx: &mut TestAppContext| view.read_with(cx, |v, _| -f32::from(v.list.scroll_px_offset_for_scrollbar().y));
+    let center = view.read_with(cx, |v, _| v.list.viewport_bounds().center());
+    event(cx, w, PlatformInput::MouseMove(MouseMoveEvent { position: center, pressed_button: None, modifiers: Modifiers::default() }));
+    view.update(cx, |v, cx| {
+        v.toggle(id);
+        cx.notify();
+    });
+    for _ in 0..6 {
+        fluid_frame(cx, w, &view);
+    }
+    for _ in 0..2 {
+        event(
+            cx,
+            w,
+            PlatformInput::Scroll(ScrollEvent {
+                position: center,
+                delta: ScrollDelta::Pixels(point(px(0.), px(20.))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+                source: ScrollSource::Pointer,
+            }),
+        );
+        fluid_frame(cx, w, &view);
+    }
+    let mut o0 = offset(cx);
+    let mut os = vec![o0];
+    for f in 0..150 {
+        fluid_frame(cx, w, &view);
+        let o = offset(cx);
+        os.push(o);
+        assert!(o <= o0 + 0.01, "frame {f} after the wheel: the list went {o0} -> {o}, back down: {os:?}");
+        o0 = o;
+    }
+    assert!(well(cx), "it opened");
+    assert!(view.read_with(cx, |v, _| v.body_hold.get().is_none()), "no hold left");
+}
+
+/// Every row on screen, by identity: its top (the gate's "column").
+fn row_tops(cx: &mut TestAppContext, view: &Entity<AppView>) -> std::collections::HashMap<(u64, bool), f32> {
+    view.read_with(cx, |v, _| {
+        (0..v.list.item_count())
+            .filter_map(|ix| {
+                let d = v.disp.get(ix)?;
+                let b = v.list.bounds_for_item(ix)?;
+                let vb = v.list.viewport_bounds();
+                (b.bottom() > vb.top() && b.top() < vb.bottom())
+                    .then(|| ((d.id, matches!(d.kind, crate::turns::Kind::Summary { .. })), f32::from(b.top())))
+            })
+            .collect()
+    })
+}
+
+/// Frames until no fold room is left: the largest move of a row on screen
+/// in two frames running, and how many frames had the room.
+fn fold_frames(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> (f32, usize) {
+    fold_frames_hitched(cx, w, view, 0)
+}
+
+/// [`fold_frames`], every `hitch`th frame 50 ms late (0: none).
+fn fold_frames_hitched(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, hitch: usize) -> (f32, usize) {
+    let mut last = row_tops(cx, view);
+    let (mut step, mut gapped) = (0f32, 0);
+    for f in 0..600 {
+        if hitch > 0 && f % hitch == hitch - 1 {
+            let late = std::time::Duration::from_millis(50) - std::time::Duration::from_micros(6944);
+            view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + late));
+            cx.executor().advance_clock(late);
+        }
+        fluid_frame(cx, w, view);
+        let now = row_tops(cx, view);
+        let moved: Vec<((u64, bool), f32, f32)> = now.iter().filter_map(|(k, y)| last.get(k).map(|y0| (*k, *y, y - y0))).collect();
+        let big = moved.iter().map(|m| m.2.abs()).fold(0f32, f32::max);
+        if big > 17. {
+            eprintln!("fold_frames: frame {f}: rows (key, top, moved) {moved:?}");
+        }
+        step = step.max(big);
+        last = now;
+        if VisualTestContext::from_window(w, cx).debug_bounds("fold-gap").is_some() {
+            gapped += 1;
+        } else if gapped > 0 {
+            break;
+        }
+    }
+    (step, gapped)
+}
+
+/// [`fold_frames`], and how far the list's last row's bottom moved (the
+/// end holds at a turn's end: Shady #23 r3 L9).
+fn fold_frames_end(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> (f32, usize, f32) {
+    let end =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.list.bounds_for_item(v.list.item_count() - 1).map(|b| f32::from(b.bottom())));
+    let mut last = row_tops(cx, view);
+    let (mut step, mut gapped, mut moved_end) = (0f32, 0, 0f32);
+    let e0 = end(cx);
+    for _ in 0..600 {
+        fluid_frame(cx, w, view);
+        let now = row_tops(cx, view);
+        step = now.iter().filter_map(|(k, y)| last.get(k).map(|y0| (y - y0).abs())).fold(step, f32::max);
+        last = now;
+        if let (Some(a), Some(b)) = (e0, end(cx)) {
+            moved_end = moved_end.max((b - a).abs());
+        }
+        if VisualTestContext::from_window(w, cx).debug_bounds("fold-gap").is_some() {
+            gapped += 1;
+        } else if gapped > 0 {
+            break;
+        }
+    }
+    (step, gapped, moved_end)
+}
+
+/// A turn of `n` finished calls at the list's end, then its end: the run
+/// folds itself.
+fn turn_of_calls(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, n: usize) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    view.update(cx, |v, _| v.model.transcript.set_busy(true));
+    running_tools(cx, view, n);
+    view.update(cx, |v, cx| {
+        for k in 0..n {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: format!("ui-run-{k}"), result: "ok".into() }),
+            });
+        }
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    for _ in 0..240 {
+        fluid_frame(cx, w, view);
+    }
+}
+
+/// The design gate of #23, N1: a run folds on a spring, never a cut. No
+/// row on screen moves more than about 40 px a 60 Hz frame (13 px a 144 Hz
+/// test frame), and the fold takes well over 15 60 Hz frames:
+/// - clicked mid-screen, its header holds (the list keeps its top row);
+/// - clicked at the list's end, its header holds too (the room is held);
+/// - at a turn's end, at the list's end, with its header on screen and with
+///   it far above the view (a long run): the end holds, what is above
+///   comes down.
+///
+/// Reduced and Off: a cut, the header still where it was. A late frame
+/// (50 ms) pauses the fold: its step is no bigger than a 60 Hz frame's.
+#[gpui_kit::test]
+fn a_run_folds_on_a_spring_never_a_cut(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    settle(cx, w, 8);
+    let run = a_folded_run(cx, &view);
+    let header = |cx: &mut TestAppContext| {
+        VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("run-summary {run}"))).map(|b| f32::from(b.top()))
+    };
+    let toggle = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| {
+            v.toggle_run(run);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let mid = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| {
+            let ix = v.disp.iter().position(|d| d.id == run).expect("its header");
+            v.list.scroll_to(gpui::ListOffset { item_ix: ix, offset_in_item: gpui_kit::px(0.) });
+            v.list.scroll_by(gpui_kit::px(-120.));
+            cx.notify();
+        });
+        for _ in 0..4 {
+            fluid_frame(cx, w, &view);
+        }
+    };
+    // Clicked mid-screen.
+    toggle(cx);
+    for _ in 0..200 {
+        fluid_frame(cx, w, &view);
+    }
+    mid(cx);
+    let at = header(cx).expect("its header, unfolded mid-screen");
+    toggle(cx);
+    assert_eq!(header(cx), Some(at), "the click: the header holds");
+    let (step, gapped) = fold_frames(cx, w, &view);
+    assert_eq!(header(cx), Some(at), "landed: the header where it was");
+    assert!(step <= 13., "mid-screen: a row moved {step} px in one frame");
+    assert!(gapped >= 36, "mid-screen: {gapped} 144 Hz frames");
+    // The turn's end at the list's end: its header on screen, then far
+    // above it.
+    for n in [5, 25] {
+        turn_of_calls(cx, w, &view, n);
+        let tops = row_tops(cx, &view);
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Idle);
+            v.sync_list();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(VisualTestContext::from_window(w, cx).debug_bounds("fold-gap").is_some(), "{n} calls: the room held, not cut");
+        let (step, gapped, end) = fold_frames_end(cx, w, &view);
+        assert!(step <= 13., "{n} calls at the turn's end: a row moved {step} px in one frame");
+        assert!(gapped >= 20, "{n} calls at the turn's end: {gapped} frames");
+        assert!(!tops.is_empty());
+        assert!(end <= 0.5, "{n} calls at the turn's end: the end moved {end} px (Shady #23 r3 L9)");
+        if n == 5 {
+            // Clicked at the list's end: unfolded, then folded; its header
+            // holds (the room past the end is held).
+            let last =
+                view.read_with(cx, |v, _| v.disp.iter().rev().find(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id));
+            let last = last.expect("the turn's run");
+            let flip = |cx: &mut TestAppContext| {
+                view.update(cx, |v, cx| {
+                    v.toggle_run(last);
+                    cx.notify();
+                });
+                cx.run_until_parked();
+            };
+            flip(cx);
+            for _ in 0..240 {
+                fluid_frame(cx, w, &view);
+            }
+            view.update(cx, |v, cx| {
+                v.list.scroll_to_end();
+                cx.notify();
+            });
+            for _ in 0..4 {
+                fluid_frame(cx, w, &view);
+            }
+            let sel = String::leak(format!("run-summary {last}"));
+            let at = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top())).expect("its header at the end");
+            flip(cx);
+            let (step, gapped) = fold_frames(cx, w, &view);
+            let now = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top()));
+            assert_eq!(now, Some(at), "clicked at the end: the header holds");
+            assert!(step <= 13., "clicked at the end: a row moved {step} px in one frame");
+            assert!(gapped >= 20, "clicked at the end: {gapped} frames");
+            // Again, every 5th frame 50 ms late (a busy machine): the fold
+            // pauses through each, a step no bigger than a 60 Hz frame's.
+            flip(cx);
+            for _ in 0..240 {
+                fluid_frame(cx, w, &view);
+            }
+            view.update(cx, |v, cx| {
+                v.list.scroll_to_end();
+                cx.notify();
+            });
+            for _ in 0..4 {
+                fluid_frame(cx, w, &view);
+            }
+            let at = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top())).expect("its header at the end");
+            flip(cx);
+            let (step, gapped) = fold_frames_hitched(cx, w, &view, 5);
+            let now = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top()));
+            assert_eq!(now, Some(at), "hitched: the header holds");
+            assert!(step <= 32., "hitched: a row moved {step} px in one frame");
+            assert!(gapped >= 20, "hitched: {gapped} frames");
+            // The design gate of #23 r3, N3: unfolded as the list is sent to
+            // its end (the bench's click), its rows reveal under the view
+            // (the unfold's hold). Folded there, the header holds too: the
+            // rows past the view's bottom go with the splice, not the room.
+            view.update(cx, |v, cx| {
+                v.toggle_run(last);
+                v.list.scroll_to_end();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            for _ in 0..240 {
+                fluid_frame(cx, w, &view);
+            }
+            let at = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top())).expect("its header");
+            let under = view.read_with(cx, |v, _| {
+                f32::from(v.list.max_offset_for_scrollbar().y) + f32::from(v.list.scroll_px_offset_for_scrollbar().y)
+            });
+            flip(cx);
+            let (step, gapped) = fold_frames(cx, w, &view);
+            let now = VisualTestContext::from_window(w, cx).debug_bounds(sel).map(|b| f32::from(b.top()));
+            assert_eq!(now, Some(at), "its rows under the view ({under} px): the header holds");
+            assert!(step <= 13., "rows under the view: a row moved {step} px in one frame");
+            assert!(gapped >= 10, "rows under the view: {gapped} frames");
+        }
+    }
+    // Reduced and Off: a cut, the header where it was.
+    for level in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
+        set_motion(cx, &view, level);
+        settle(cx, w, 4);
+        toggle(cx);
+        settle(cx, w, 4);
+        mid(cx);
+        let at = header(cx);
+        toggle(cx);
+        settle(cx, w, 2);
+        assert!(VisualTestContext::from_window(w, cx).debug_bounds("fold-gap").is_none(), "{level:?}: no room");
+        assert_eq!(header(cx), at, "{level:?}: the header where it was");
+    }
+}
+
 /// Off is the static app: whatever happens (a worker running, a send, a
 /// worker's view in and out, the card answered, a session switch, a fold
 /// and an unfold), motion asks for no frame and arms no timer: the guard is
@@ -1425,16 +1829,87 @@ fn idle_requests_no_frames(cx: &mut TestAppContext) {
     only_the_rail_spins(cx, w, &view, "settled");
 }
 
+/// Cards D × Q5 (#23 merged with #21): the rail's lattices and its fold
+/// never fight. Folding and unfolding the rail on `sheet` asks for the
+/// same display frames at the same widths whether its sessions run (their
+/// lattices on the beat layer, clipped with the flight's box) or rest: the
+/// beat adds no frame to the spring. Folded, the strip draws no lattice:
+/// nothing on the layer, no frame, no timer, though the sessions still run.
+/// Unfolded, their lattices are back on the beat.
+#[gpui_kit::test]
+fn the_rails_lattices_and_its_fold_never_fight(cx: &mut TestAppContext) {
+    use crate::motion::Beat;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    settle(cx, w, 8);
+    wait(cx, w, &view, crate::motion::GLOW.as_millis() as u64);
+    let spins =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, Beat::Spin(_))).count());
+    let busy = |cx: &mut TestAppContext, on: bool| {
+        view.update(cx, |v, cx| {
+            for (k, m) in v.model.sessions.iter_mut().enumerate() {
+                (m.busy, m.subagents_running) = (on && k < 3, 0);
+            }
+            v.model.rail_gen += 1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        settle(cx, w, 8);
+    };
+    // A fold or an unfold, frame by frame: whether a display frame was
+    // asked for before each, and the width it drew.
+    let fly = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        cx.run_until_parked();
+        let mut steps = Vec::new();
+        for _ in 0..400 {
+            let (shown, _, moving) = panel(cx, &view, true);
+            if !moving {
+                break;
+            }
+            steps.push((motion_pending(cx, &view).0, shown.round() as i32));
+            fluid_frame(cx, w, &view);
+        }
+        assert!(steps.len() > 10, "it flew: {steps:?}");
+        steps
+    };
+    busy(cx, true);
+    assert!(spins(cx) > 0, "the rail's running sessions: lattices on the layer");
+    let busy_fold = fly(cx);
+    settle(cx, w, 8);
+    assert_eq!(spins(cx), 0, "folded: the strip draws no lattice");
+    for _ in 0..4 {
+        wait(cx, w, &view, 500);
+    }
+    assert_eq!(motion_pending(cx, &view), (false, None), "folded, its sessions running: no frame, no timer");
+    let busy_unfold = fly(cx);
+    settle(cx, w, 8);
+    assert!(spins(cx) > 0, "unfolded: they're back");
+    let (_, timer) = motion_pending(cx, &view);
+    let at = timer.expect("on the beat");
+    assert!(view.read_with(cx, |v, _| v.fx.on_beats(at, 1)), "the timer is the beat's");
+    busy(cx, false);
+    assert_eq!(spins(cx), 0, "at rest");
+    let rest_fold = fly(cx);
+    settle(cx, w, 8);
+    let rest_unfold = fly(cx);
+    assert_eq!(busy_fold, rest_fold, "the fold: the same frames, running or not");
+    assert_eq!(busy_unfold, rest_unfold, "the unfold: the same frames, running or not");
+}
+
 /// Nothing runs in the column, the composer or the tray (Shady #17 M3,
-/// pinned): no display frame; no sweep; the only sites are the rail's
+/// pinned): no display frame; no orbit; the only sites are the rail's
 /// running sessions' spinners (polish.md P1); and the only timer, if any,
 /// is theirs: the beat layer's, on the beat grid. Then, the rail's
 /// sessions at rest too, gate 3 exactly: no frame and no timer.
 fn only_the_rail_spins(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, what: &str) {
     let (frame, timer) = motion_pending(cx, view);
     assert!(!frame, "{what}: a display frame");
-    let (sites, rail, sweeps) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width, v.fx.sweep_count()));
-    assert_eq!(sweeps, 0, "{what}: a sweep");
+    let (sites, rail) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width));
+    let cards = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Lattice(_))).count();
+    assert_eq!(cards, 0, "{what}: a card's or the composer's lattice");
     assert!(sites.iter().all(|s| matches!(s.beat, crate::motion::Beat::Spin(_)) && f32::from(s.origin.x) < rail), "{what}: {sites:?}");
     let at = timer.expect("the demo's rail runs: its spinners' beat");
     assert!(!sites.is_empty(), "{what}: a timer with nothing on the layer");
@@ -1738,7 +2213,9 @@ fn the_answered_card_collapses_in_its_row(cx: &mut TestAppContext) {
             v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Breath(_)) && b.contains(&s.origin)).count()
         })
     };
-    assert_eq!(in_card(cx, live), 1, "the live card's glyph breathes on the beat layer");
+    // Cards D (cards4/proposal.md §8 #8, an intended change): the card asks
+    // once, its dot pings; nothing on it breathes.
+    assert_eq!(in_card(cx, live), 0, "the live card holds still on the beat layer");
     // The live card takes a press (the control for the collapsing one below).
     click_at(cx, w, live.center());
     assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the live card took the press");
@@ -1757,8 +2234,10 @@ fn the_answered_card_collapses_in_its_row(cx: &mut TestAppContext) {
     click_at(cx, w, ghost.center());
     assert_eq!(view.read_with(cx, |v, _| v.card_presses), 1, "the collapsing card took no press (the one is the live card's)");
     assert!(bounds(cx, &format!("receipt {row}")).is_some(), "the call's row says it was answered elsewhere");
-    // Halfway: clipped shorter. Following, the list's end holds (F1): the
-    // row's bottom stays where the card's slot ended.
+    let slot = bounds(cx, &format!("grow-clip-{row}")).expect("its clip, whole");
+    // Halfway: clipped shorter. Following, the list's end holds (F1); the
+    // card folds up into its row, which holds still (the finish gate of
+    // #23, item 7): the room it gave up waits at the list's end.
     view.update(cx, |v, cx| {
         v.card_exit.as_mut().unwrap().at = v.fx.clock() - Duration::from_millis(120);
         cx.notify();
@@ -1769,7 +2248,9 @@ fn the_answered_card_collapses_in_its_row(cx: &mut TestAppContext) {
     let r = cx.update(|cx| crate::theme::metrics(cx).r);
     assert!(view.read_with(cx, |v, _| v.list.is_following_tail()));
     let end = live.bottom() + gpui_kit::px((12. * r).round());
-    assert!((clip.bottom() - end).abs() < gpui_kit::px(0.5), "the end holds: {clip:?} vs {end:?}");
+    assert!((clip.top() - slot.top()).abs() < gpui_kit::px(0.5), "the answered row holds: {clip:?} vs {slot:?}");
+    let slack = bounds(cx, "fold-slack").expect("the room it gave up, at the list's end");
+    assert!((slack.bottom() - end).abs() < gpui_kit::px(0.5), "the end holds: {slack:?} vs {end:?}");
     // Landed: the row goes.
     view.update(cx, |v, cx| {
         v.card_exit.as_mut().unwrap().at = v.fx.clock() - Duration::from_secs(5);
@@ -1781,6 +2262,619 @@ fn the_answered_card_collapses_in_its_row(cx: &mut TestAppContext) {
     assert!(bounds(cx, "card-exit").is_none() && bounds(cx, "card").is_none());
     assert!(view.read_with(cx, |v, _| v.disp.iter().all(|d| d.kind != crate::turns::Kind::Prompt)), "its row is gone");
     assert!(bounds(cx, &format!("receipt {row}")).is_some(), "the receipt stays");
+    // Landed, the column still holds: the room waits at the end (until
+    // rows that come use it), never a slide after the fold.
+    assert_eq!(bounds(cx, &format!("tool-row {call}")), Some(call_row), "its call's row holds after the fold");
+}
+
+/// Cards D (cards4/proposal.md §8 #9, build step 10): Allow by its key
+/// presses the button (drawn down, the accent's fill) through the fold's
+/// first 90 ms; the card folds in its row on `glide`, and its call's row
+/// takes the receipt, `Allowed` lit in the accent, then quiet.
+#[gpui_kit::test]
+fn allow_folds_the_card_into_its_row(cx: &mut TestAppContext) {
+    use crate::authorize::Answer;
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let row = view.read_with(cx, |v, _| v.current_card().expect("the demo's card").row);
+    let at = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel));
+    assert!(at(cx, "allow-fill".into()).is_some(), "Allow is the accent's fill");
+    card_keys(cx, w, &view);
+    tap(cx, w, if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" });
+    assert_eq!(view.read_with(cx, |v, _| v.sent.as_ref().map(|s| s.answer)), Some(Answer::Allowed));
+    settle(cx, w, 2);
+    let live = at(cx, "card".into()).expect("the live card, its answer sent");
+    resolve_prompt(cx, &view);
+    // The fold's first frame: in its row, Allow drawn pressed.
+    assert_eq!(view.read_with(cx, |v, _| v.card_exit.as_ref().map(|e| e.answer)), Some(Answer::Allowed), "answered on screen: it folds");
+    let ghost = at(cx, "card-exit".into()).expect("the answered card, folding");
+    assert_eq!(ghost, live, "in its row");
+    let pressed = at(cx, "allow-fill".into()).expect("Allow, pressed");
+    assert!(ghost.contains(&pressed.center()), "the pressed Allow is the folding card's");
+    assert!(at(cx, format!("receipt-word {row} allowed")).is_some(), "the receipt lands as it folds");
+    wait(cx, w, &view, 1000);
+    assert!(at(cx, "card-exit".into()).is_none() && at(cx, "card".into()).is_none(), "folded away");
+    assert!(view.read_with(cx, |v, _| v.card_exit.is_none()));
+    assert!(at(cx, format!("receipt-word {row} allowed")).is_some(), "its call's row keeps the receipt");
+}
+
+/// Shady #23 r2 M3: the room an answered card left at the list's end holds
+/// the answered row still while its call's output grows into it (the
+/// list's top held: the room, read from the last layout, lags a frame, and
+/// that frame's surplus is under the content), and a scroll up within the
+/// room sends it on `sheet`: no frame moves the row by more than about
+/// 40 px a 60 Hz frame (17 px a 144 Hz test frame).
+#[gpui_kit::test]
+fn the_held_room_never_bobs_or_drops(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| {
+        v.client = None;
+        v.model.transcript.set_busy(true);
+    });
+    settle(cx, w, 8);
+    let (tool, id) = view.read_with(cx, |v, _| {
+        let d = v.disp.iter().find(|d| d.kind == crate::turns::Kind::Prompt).expect("the demo's card");
+        let i = &v.model.transcript.items()[d.item];
+        (i.tool.as_ref().expect("the card's call").tool_id.clone(), i.id)
+    });
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "the room it left, held");
+    let top = |cx: &mut TestAppContext| {
+        VisualTestContext::from_window(w, cx)
+            .debug_bounds(String::leak(format!("tool-row {id}")))
+            .map(|b| f32::from(b.top()))
+            .expect("the answered row")
+    };
+    let at = top(cx);
+    let mut held = 0;
+    for k in 0..6 {
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: tool.clone(), delta: format!("line {k}\n") }),
+            });
+            v.sync_list();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        for _ in 0..30 {
+            fluid_frame(cx, w, &view);
+            if view.read_with(cx, |v, _| v.fold_slack.get().is_some()) {
+                held += 1;
+                let y = top(cx);
+                assert!((y - at).abs() <= 0.5, "line {k}: the answered row at {y}, not {at}");
+            }
+        }
+    }
+    assert!(held > 30, "the output grew into the room ({held} frames)");
+    // The user's scroll up within what is left (if any): the room stays,
+    // in sight, as content (Shady #23 r3 H2): nothing moves but the scroll,
+    // never a drop and never a slide.
+    let left = view.read_with(cx, |v, _| v.fold_slack.get().map_or(0., |s| s.last()));
+    if left > 41. {
+        let at = top(cx);
+        view.update(cx, |v, cx| {
+            // In place of the wheel (its capture owner touches the scroller).
+            v.scroller.touch();
+            v.list.scroll_by(px(-40.));
+            cx.notify();
+        });
+        fluid_frame(cx, w, &view);
+        let y0 = top(cx);
+        assert!((y0 - at - 40.).abs() <= 0.5, "the scroll moved the row 40 px: {at} -> {y0}");
+        for _ in 0..200 {
+            fluid_frame(cx, w, &view);
+            let y = top(cx);
+            assert!((y - y0).abs() <= 0.5, "scrolled up: the row moved {y0} -> {y}");
+        }
+    }
+}
+
+/// Shady #23 r3 H2, M1 and L4: only the user's scroll leaves the end, by
+/// however little a frame. With the room an answered card left held at the
+/// end, at 1× and 125 %:
+/// - output growing into it moves nothing (the row's total move, not a
+///   frame's, within a device pixel);
+/// - a touchpad's 0.5 px a frame up, while output grows, never sends the
+///   list back toward its end;
+/// - stopped there, output goes on and the reader stays where they are.
+#[gpui_kit::test]
+fn a_slow_scroll_leaves_the_end_and_nothing_brings_it_back(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseMoveEvent, ScrollDelta, ScrollEvent, ScrollSource, TouchPhase, point};
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    for scale in [1f32, 1.25] {
+        let (w, view, _events) = open(cx);
+        if scale != 1. {
+            VisualTestContext::from_window(w, cx).simulate_scale_factor_change(scale);
+        }
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| {
+            v.client = None;
+            v.model.transcript.set_busy(true);
+        });
+        settle(cx, w, 8);
+        let (tool, id) = view.read_with(cx, |v, _| {
+            let d = v.disp.iter().find(|d| d.kind == crate::turns::Kind::Prompt).expect("the demo's card");
+            let i = &v.model.transcript.items()[d.item];
+            (i.tool.as_ref().expect("the card's call").tool_id.clone(), i.id)
+        });
+        resolve_prompt(cx, &view);
+        wait(cx, w, &view, 1000);
+        assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "{scale}: the room it left, held");
+        let line = |cx: &mut TestAppContext, k: usize| {
+            view.update(cx, |v, cx| {
+                v.model.transcript.apply(&SessionEvent::Stream {
+                    event: StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: tool.clone(), delta: format!("line {k}\n") }),
+                });
+                v.sync_list();
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        let row = |cx: &mut TestAppContext| {
+            VisualTestContext::from_window(w, cx)
+                .debug_bounds(String::leak(format!("tool-row {id}")))
+                .map(|b| f32::from(b.top()))
+                .expect("the answered row")
+        };
+        let offset = |cx: &mut TestAppContext| view.read_with(cx, |v, _| -f32::from(v.list.scroll_px_offset_for_scrollbar().y));
+        let at = row(cx);
+        for k in 0..2 {
+            line(cx, k);
+            for f in 0..20 {
+                fluid_frame(cx, w, &view);
+                let y = row(cx);
+                assert!((y - at).abs() <= 0.85, "{scale}: line {k}, frame {f}: the row {at} -> {y}, no one scrolled");
+            }
+        }
+        assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "{scale}: still held");
+        let center = view.read_with(cx, |v, _| v.list.viewport_bounds().center());
+        event(cx, w, PlatformInput::MouseMove(MouseMoveEvent { position: center, pressed_button: None, modifiers: Modifiers::default() }));
+        let wheel = |cx: &mut TestAppContext| {
+            event(
+                cx,
+                w,
+                PlatformInput::Scroll(ScrollEvent {
+                    position: center,
+                    delta: ScrollDelta::Pixels(point(px(0.), px(0.5))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Moved,
+                    source: ScrollSource::Pointer,
+                }),
+            )
+        };
+        let (start, mut o0) = (offset(cx), offset(cx));
+        for f in 0..240 {
+            if f % 12 == 0 {
+                line(cx, 10 + f);
+            }
+            let y0 = row(cx);
+            wheel(cx);
+            fluid_frame(cx, w, &view);
+            let o = offset(cx);
+            assert!(o <= o0 + 0.01, "{scale}: frame {f} of the scroll: the list went {o0} -> {o}, toward its end");
+            // Its row moves by the wheel's step, no more, either way (Shady
+            // #23 r4 L3): a room dropped in sight clamps the list down by it.
+            let y = row(cx);
+            assert!((y - y0).abs() <= 0.81, "{scale}: frame {f} of the scroll: its row {y0} -> {y}");
+            o0 = o;
+        }
+        assert!(start - o0 > 60., "{scale}: it scrolled up ({start} -> {o0})");
+        for f in 0..240 {
+            if f % 12 == 0 {
+                line(cx, 300 + f);
+            }
+            fluid_frame(cx, w, &view);
+            let o = offset(cx);
+            assert!(o <= o0 + 0.01, "{scale}: frame {f} after the scroll: the list went {o0} -> {o}, toward its end");
+            o0 = o;
+        }
+        let (o, max) = view
+            .read_with(cx, |v, _| (-f32::from(v.list.scroll_px_offset_for_scrollbar().y), f32::from(v.list.max_offset_for_scrollbar().y)));
+        assert!(max - o > crate::app::END_SLOP, "{scale}: never back at the end ({o} of {max})");
+        let still = offset(cx);
+        for _ in 0..30 {
+            fluid_frame(cx, w, &view);
+        }
+        assert!((offset(cx) - still).abs() <= 0.01, "{scale}: at rest, the reader stays put");
+    }
+}
+
+/// Shady #23 r4 H1: the room an answered card left held at the list's end,
+/// and the view gets shorter under it: the composer grows two lines, a
+/// notice springs into the dock (as a worker's tray does), the window is
+/// made 120 px shorter; and, as a control, nothing. Held at its
+/// end, the list rises with it (a frame behind the view, no row more than a
+/// spring step a frame; a resize's at once), and once the output has used
+/// the room up it follows the tail: never stranded short of its end with
+/// the output streaming under the composer.
+#[gpui_kit::test]
+fn a_held_room_follows_when_the_view_gets_shorter(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    for case in ["none", "composer", "dock", "resize"] {
+        let (w, view, _events) = open(cx);
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| {
+            v.client = None;
+            v.model.transcript.set_busy(true);
+        });
+        settle(cx, w, 8);
+        let tool = view.read_with(cx, |v, _| {
+            let d = v.disp.iter().find(|d| d.kind == crate::turns::Kind::Prompt).expect("the demo's card");
+            v.model.transcript.items()[d.item].tool.as_ref().expect("the card's call").tool_id.clone()
+        });
+        resolve_prompt(cx, &view);
+        wait(cx, w, &view, 1000);
+        assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "{case}: the room it left, held");
+        let line = |cx: &mut TestAppContext, k: usize| {
+            view.update(cx, |v, cx| {
+                v.model.transcript.apply(&SessionEvent::Stream {
+                    event: StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: tool.clone(), delta: format!("line {k}\n") }),
+                });
+                v.sync_list();
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        // How far the list is short of its end (past its bottom padding),
+        // and its viewport's height.
+        let short = |cx: &mut TestAppContext| {
+            view.read_with(cx, |v, cx| {
+                let pad = (28. * crate::theme::metrics(cx).r).round();
+                f32::from(v.list.max_offset_for_scrollbar().y) + pad + f32::from(v.list.scroll_px_offset_for_scrollbar().y)
+            })
+        };
+        let vh = |cx: &mut TestAppContext| view.read_with(cx, |v, _| f32::from(v.list.viewport_bounds().size.height));
+        let vh0 = vh(cx);
+        match case {
+            "composer" => {
+                cx.update_window(w, |_, window, cx| {
+                    view.update(cx, |v, cx| v.composer.update(cx, |s, cx| s.set_value("one\ntwo\nthree", window, cx)))
+                })
+                .expect("the window");
+            }
+            "dock" => view.update(cx, |v, cx| {
+                // A notice in the dock, on its spring (as a worker's tray).
+                let words = "the connection to the daemon dropped and came back; the turn goes on where it was, and nothing was lost";
+                v.model.last_error = Some(format!("{words}; {words}; {words}"));
+                cx.notify();
+            }),
+            "resize" => VisualTestContext::from_window(w, cx).simulate_resize(size(px(1440.), px(780.))),
+            _ => {}
+        }
+        cx.run_until_parked();
+        let mut last = row_tops(cx, &view);
+        let (mut held, mut used, mut vh1) = (0, None, vh0);
+        // The largest move of a row in a frame: held; as it is used up;
+        // following after. And the view's own.
+        let (mut step, mut last_step, mut follow_step, mut view_step) = (0f32, 0f32, 0f32, 0f32);
+        for k in 0..80 {
+            line(cx, k);
+            for f in 0..12 {
+                let was_held = view.read_with(cx, |v, _| v.fold_slack.get().is_some());
+                fluid_frame(cx, w, &view);
+                let v = vh(cx);
+                let now = row_tops(cx, &view);
+                let is_held = view.read_with(cx, |v, _| v.fold_slack.get().is_some());
+                let big = now.iter().filter_map(|(r, y)| last.get(r).map(|y0| (y - y0).abs())).fold(0f32, f32::max);
+                // A resize is the window manager's, at once: its frame and
+                // the lift's after it.
+                match (was_held, is_held) {
+                    (true, true) if case != "resize" || k > 0 || f > 1 => {
+                        view_step = view_step.max((vh1 - v).abs());
+                        step = step.max(big);
+                    }
+                    (true, false) => last_step = big,
+                    (false, false) => follow_step = follow_step.max(big),
+                    _ => {}
+                }
+                vh1 = v;
+                last = now;
+                if is_held {
+                    held += 1;
+                } else if used.is_none() {
+                    used = Some(k);
+                }
+            }
+            // At rest after each line: at the end, held or following.
+            if k > 4 {
+                assert!(short(cx) <= crate::app::END_SLOP, "{case}: line {k}: {} px short of its end", short(cx));
+            }
+        }
+        let shrank = vh0 - vh(cx);
+        eprintln!(
+            "{case}: the view {shrank} px shorter; held {held} frames, used up at line {used:?}; steps: held {step}, the view {view_step}, used up {last_step}, following {follow_step}"
+        );
+        assert!(case == "none" || shrank >= 30., "{case}: the view got shorter ({vh0} -> {})", vh(cx));
+        assert!(held > 30 && used.is_some(), "{case}: the room held, then used up (held {held} frames, used {used:?})");
+        // Held, no row faster than a fold's spring, or than the view itself
+        // (the composer on `flick`: the rows rise with it, as following).
+        assert!(step <= 17f32.max(view_step) + 0.5, "{case}: held, a row moved {step} px in a frame (the view's own step {view_step})");
+        // Used up, what the line that took the rest grew past it is
+        // followed, as every line after it is (the stream's own step).
+        // Used up: what the line that took the rest grew past it is
+        // followed, as every line after it is (the stream's own step).
+        assert!(last_step <= follow_step.max(17.) + 0.5, "{case}: used up, a row moved {last_step} px (following, {follow_step})");
+        let (following, end) = view.read_with(cx, |v, _| (v.list.is_following_tail(), v.at_end()));
+        assert!(following && end == Some(true), "{case}: it follows the tail ({following}, {end:?})");
+    }
+}
+
+/// Shady #23 r3 H1: a fold's held room, a fold in flight and a body's hold
+/// are their list's. Fold the last run at the end of one tab (landed, then
+/// mid-fold) and go to another: none of it comes along, and the other
+/// tab's last row holds still.
+#[gpui_kit::test]
+fn a_held_room_stays_with_its_list(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    resolve_prompt(cx, &view);
+    open_idle_cpu(cx, &view, crate::tabs::Place::New);
+    settle(cx, w, 8);
+    let last = view.read_with(cx, |v, _| v.disp.iter().rev().find(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id));
+    let last = last.expect("the last run");
+    let flip = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| {
+            v.toggle_run(last);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let focus = |cx: &mut TestAppContext, ix: usize| {
+        view.update(cx, |v, cx| {
+            v.focus_tab(ix);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    for landed in [true, false] {
+        flip(cx);
+        for _ in 0..240 {
+            fluid_frame(cx, w, &view);
+        }
+        view.update(cx, |v, cx| {
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        for _ in 0..8 {
+            fluid_frame(cx, w, &view);
+        }
+        flip(cx);
+        if landed {
+            fold_frames(cx, w, &view);
+            assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "the fold's room, held at the end");
+        } else {
+            for _ in 0..4 {
+                fluid_frame(cx, w, &view);
+            }
+            assert!(view.read_with(cx, |v, _| !v.fold_gap.borrow().is_empty()), "folding");
+        }
+        focus(cx, 0);
+        assert!(
+            view.read_with(cx, |v, _| v.fold_slack.get().is_none() && v.fold_gap.borrow().is_empty() && v.body_hold.get().is_none()),
+            "landed {landed}: nothing of the other list's"
+        );
+        fluid_frame(cx, w, &view);
+        let end = |cx: &mut TestAppContext| {
+            view.read_with(cx, |v, _| v.list.bounds_for_item(v.list.item_count() - 1).map(|b| f32::from(b.bottom())).expect("its last row"))
+        };
+        let at = end(cx);
+        for f in 0..60 {
+            fluid_frame(cx, w, &view);
+            let mut vcx = VisualTestContext::from_window(w, cx);
+            assert!(
+                vcx.debug_bounds("fold-slack").is_none() && vcx.debug_bounds("fold-gap").is_none(),
+                "landed {landed}, frame {f}: a room"
+            );
+            let y = end(cx);
+            assert!((y - at).abs() <= 0.5, "landed {landed}, frame {f}: the last row {at} -> {y}");
+        }
+        focus(cx, 1);
+        settle(cx, w, 8);
+        if !landed {
+            break;
+        }
+        // Unfolded again for the fold in flight.
+    }
+}
+
+/// Shady #23 r3 M2: a second fold during a fold never cuts the first: each
+/// run's room closes on its own spring (no row moves more than the two
+/// springs' sum in a frame), and the first header holds.
+#[gpui_kit::test]
+fn two_folds_at_once_close_each_on_its_own(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1440., 1400.), crate::theme::Panels::default().text_size);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    settle(cx, w, 8);
+    let runs: Vec<u64> =
+        view.read_with(cx, |v, _| v.disp.iter().filter(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id).collect());
+    assert!(runs.len() >= 2, "two runs");
+    let (a, b) = (runs[runs.len() - 2], runs[runs.len() - 1]);
+    let flip = |cx: &mut TestAppContext, id: u64| {
+        view.update(cx, |v, cx| {
+            v.toggle_run(id);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    flip(cx, a);
+    flip(cx, b);
+    for _ in 0..240 {
+        fluid_frame(cx, w, &view);
+    }
+    view.update(cx, |v, cx| {
+        let ix = v.disp.iter().position(|d| d.id == a).expect("a's header");
+        v.list.scroll_to(gpui::ListOffset { item_ix: ix, offset_in_item: gpui_kit::px(0.) });
+        v.list.scroll_by(gpui_kit::px(-40.));
+        cx.notify();
+    });
+    for _ in 0..8 {
+        fluid_frame(cx, w, &view);
+    }
+    let header = |cx: &mut TestAppContext, id: u64| {
+        VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("run-summary {id}"))).map(|b| f32::from(b.top()))
+    };
+    let ya = header(cx, a).expect("a's header on screen");
+    let vb = view.read_with(cx, |v, _| f32::from(v.list.viewport_bounds().bottom()));
+    assert!(header(cx, b).is_some_and(|y| y < vb - 60.), "b's header on screen too");
+    flip(cx, a);
+    for _ in 0..3 {
+        fluid_frame(cx, w, &view);
+    }
+    flip(cx, b);
+    assert_eq!(view.read_with(cx, |v, _| v.fold_gap.borrow().len()), 2, "both rooms closing");
+    // Rows under both rooms move by the two springs' sum: a cut of the
+    // first's would be its room left, in one frame.
+    let (step, gapped) = fold_frames(cx, w, &view);
+    assert!(step <= 26., "two folds: a row moved {step} px in one frame");
+    assert!(gapped >= 20, "two folds: {gapped} frames");
+    assert_eq!(header(cx, a), Some(ya), "the first header holds");
+}
+
+/// Shady #23 r2b L1: at 125 % GPUI snaps rows to device pixels (0.8 px), so
+/// the list's sums go fractional again. The probe: following a stream, the
+/// end is the bottom within a device pixel every frame; while an answered
+/// call's output grows into the room its card left, the answered row moves
+/// at most a device pixel in a frame: the offset's 0.8 px steps are not
+/// read as a scroll leaving the end, so the room never drops.
+#[gpui_kit::test]
+fn the_end_and_the_held_room_at_125_percent(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    VisualTestContext::from_window(w, cx).simulate_scale_factor_change(1.25);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    start_stream(cx, &view);
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.list.scroll_to_end());
+    fluid_frame(cx, w, &view);
+    for k in 0..60 {
+        stream_step(cx, &view, k);
+        fluid_frame(cx, w, &view);
+        let (gap, pad) = view.read_with(cx, |v, cx| {
+            let n = v.list.item_count();
+            let pad = (28. * crate::theme::metrics(cx).r).round();
+            (v.list.bounds_for_item(n - 1).map(|b| f32::from(v.list.viewport_bounds().bottom() - b.bottom())), pad)
+        });
+        let gap = gap.expect("the last row");
+        assert!((gap - pad).abs() <= 0.85, "125 %, frame {k}: the end {gap} px over the bottom, not {pad}");
+    }
+    let (w, view, _events) = open(cx);
+    VisualTestContext::from_window(w, cx).simulate_scale_factor_change(1.25);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| {
+        v.client = None;
+        v.model.transcript.set_busy(true);
+    });
+    settle(cx, w, 8);
+    let (tool, id) = view.read_with(cx, |v, _| {
+        let d = v.disp.iter().find(|d| d.kind == crate::turns::Kind::Prompt).expect("the demo's card");
+        let i = &v.model.transcript.items()[d.item];
+        (i.tool.as_ref().expect("the card's call").tool_id.clone(), i.id)
+    });
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert!(view.read_with(cx, |v, _| v.fold_slack.get().is_some()), "125 %: the room it left, held");
+    let top = |cx: &mut TestAppContext| {
+        VisualTestContext::from_window(w, cx)
+            .debug_bounds(String::leak(format!("tool-row {id}")))
+            .map(|b| f32::from(b.top()))
+            .expect("the answered row")
+    };
+    let (at, mut y0) = (top(cx), top(cx));
+    for k in 0..6 {
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: tool.clone(), delta: format!("line {k}\n") }),
+            });
+            v.sync_list();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        for _ in 0..30 {
+            fluid_frame(cx, w, &view);
+            if view.read_with(cx, |v, _| v.fold_slack.get().is_some()) {
+                let y = top(cx);
+                assert!((y - y0).abs() <= 0.85, "125 %, line {k}: the answered row moved {y0} -> {y} in one frame (from {at})");
+                assert!((y - at).abs() <= 0.85, "125 %, line {k}: the answered row crept {at} -> {y}");
+                y0 = y;
+            }
+        }
+    }
+}
+
+/// The design gate of #23, S3: Needs you is the lattice plus everywhere
+/// (the tab strip's attention, the tray's stub, the rail), as the call's;
+/// the strip's and the stub's ping once when the prompt comes in, then
+/// hold still (0 frames).
+#[gpui_kit::test]
+fn needs_you_is_the_plus_and_pings_once(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let plus = crate::lattice::code(crate::lattice::pose(crate::lattice::Pat::Needs, None));
+    let sel = String::leak(format!("lattice-{plus:07x}"));
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds(sel).is_some(), "a still plus");
+    assert!(view.read_with(cx, |v, _| !v.model.transcript.pending_prompts().is_empty()), "a prompt waits");
+    let k = view.read_with(cx, |v, _| crate::glyph::needs_ping(&v.fx, true));
+    assert!(k.is_none(), "the prompt was there before: history never pings");
+    settle(cx, w, 8);
+    assert!(!motion_pending(cx, &view).0, "still: no frame");
+    // Shady #23 r3 L8: a prompt coming in while watched pings, the strip's
+    // attention and the tray's stub on the one instant, then holds still.
+    resolve_prompt(cx, &view);
+    wait(cx, w, &view, 1000);
+    assert!(view.read_with(cx, |v, _| crate::glyph::needs_ping(&v.fx, false)).is_none());
+    raise(cx, &view, 41);
+    fluid_frame(cx, w, &view);
+    fluid_frame(cx, w, &view);
+    let k = view.read_with(cx, |v, _| crate::glyph::needs_ping(&v.fx, true));
+    assert!(k.is_some_and(|k| k > 0. && k < 1.), "a prompt in while watched: a ping ({k:?})");
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    let (strip, stub) = (vcx.debug_bounds("attention"), vcx.debug_bounds("needs-stub"));
+    // Both read the one instant (`needs_ping`'s key): together by construction.
+    assert!(strip.is_some() || stub.is_some(), "the strip's attention or the stub draws it");
+    assert!(motion_pending(cx, &view).0, "pinging: frames");
+    let mut frames = 0;
+    while view.read_with(cx, |v, _| crate::glyph::needs_ping(&v.fx, true)).is_some() {
+        fluid_frame(cx, w, &view);
+        frames += 1;
+        assert!(frames < 200, "the ping ends");
+    }
+    for f in 0..300 {
+        fluid_frame(cx, w, &view);
+        assert!(view.read_with(cx, |v, _| crate::glyph::needs_ping(&v.fx, true)).is_none(), "frame {f}: it pinged once");
+    }
+}
+
+/// Shady #23 r2 L1: the Outline Allow draws, charged in `acc_line`, and
+/// folds its card into its row like the fill (`TEST_ALLOW`).
+#[gpui_kit::test]
+fn the_outline_allow_draws_and_folds(cx: &mut TestAppContext) {
+    use crate::authorize::Answer;
+    crate::authorize::TEST_ALLOW.with(|c| c.set(Some(crate::cards::AllowStyle::Outline)));
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    settle(cx, w, 8);
+    let at = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel);
+    assert!(at(cx, "allow-outline").is_some() && at(cx, "allow-fill").is_none(), "the Outline Allow");
+    card_keys(cx, w, &view);
+    tap(cx, w, if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" });
+    assert_eq!(view.read_with(cx, |v, _| v.sent.as_ref().map(|s| s.answer)), Some(Answer::Allowed));
+    settle(cx, w, 2);
+    resolve_prompt(cx, &view);
+    assert!(at(cx, "card-exit").is_some(), "it folds");
+    let pressed = at(cx, "allow-outline").expect("Allow, pressed, outlined");
+    assert!(at(cx, "card-exit").expect("folding").contains(&pressed.center()));
+    wait(cx, w, &view, 1000);
+    assert!(at(cx, "card-exit").is_none() && at(cx, "card").is_none(), "folded away");
+    crate::authorize::TEST_ALLOW.with(|c| c.set(None));
 }
 
 /// The card's keys: the window's focus (a click on the card), a frame for
@@ -2555,13 +3649,13 @@ fn running_tools(cx: &mut TestAppContext, view: &Entity<AppView>, n: usize) {
     cx.run_until_parked();
 }
 
-/// Q1 cards (polish.md §2.1, F1): a tool row is bare on the canvas. Its
-/// box reaches into the gutter for its status glyph (the hover fill takes
-/// the glyph in) and stops where the AGENT label ends; its verb starts on
-/// the prose column. A failed call opens on its well, at the verb column
-/// to the column's end.
+/// Cards D (cards4/proposal.md §3, an intended change to Q1's bare row):
+/// a tool row sits in its run's card, the column wide less the card's
+/// hairline and 3 px inset, 34 px tall, its life glyph inside it; its
+/// AGENT label hangs left of the card. A failed call opens on its well at
+/// the verb column (36 px in), to the row's padding.
 #[gpui_kit::test]
-fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
+fn a_tool_row_sits_in_its_runs_card(cx: &mut TestAppContext) {
     use synaps_client::protocol::{LlmEvent, StreamEvent};
     let (w, view, _events) = open_at(cx, (2200., 1400.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
@@ -2583,7 +3677,7 @@ fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
         (id, v.layout, crate::theme::metrics(cx))
     });
     assert!(lay.hang, "2200 px: the labels hang");
-    let geo = crate::turns::Geo::of(lay, &m);
+    let g = crate::cards::Geo::of(&m);
     let bounds = |cx: &mut TestAppContext, what: &'static str| {
         view.update(cx, |_, cx| cx.notify());
         cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
@@ -2591,17 +3685,13 @@ fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
         VisualTestContext::from_window(w, cx).debug_bounds(what)
     };
     let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the running call's row");
-    assert_eq!(f32::from(row.size.width), lay.column + geo.out, "the column and {} of the gutter", geo.out);
-    assert_eq!(row.size.height, gpui_kit::px(m.row), "one row");
-    let column = f32::from(row.left()) + geo.out;
-    let status = bounds(cx, leak(format!("tool-status {id}"))).expect("the status glyph's column");
-    assert!(
-        f32::from(status.left()) >= f32::from(row.left()) && f32::from(status.right()) <= column,
-        "{status:?}: in the gutter, inside the row's box"
-    );
-    // Its AGENT label ends where the row's box starts.
+    assert_eq!(f32::from(row.size.width), lay.column - 2. - 2. * g.inset, "the column less the card's edge and inset");
+    assert_eq!(row.size.height, gpui_kit::px(g.row), "one row");
+    let status = bounds(cx, leak(format!("tool-status {id}"))).expect("the status glyph");
+    assert!(f32::from(status.left()) >= f32::from(row.left()) + g.pad - 0.5 && status.right() <= row.right(), "{status:?}: inside the row");
+    // Its AGENT label hangs left of the card.
     let label = bounds(cx, leak(format!("hang-label-{id}"))).expect("the call's AGENT label");
-    assert!(label.right() <= row.left(), "the hover fill stops at the label: {label:?} {row:?}");
+    assert!(label.right() <= row.left(), "the label hangs outside the card: {label:?} {row:?}");
     view.update(cx, |v, cx| {
         v.model.transcript.apply(&SessionEvent::Stream {
             event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "Tool execution failed: boom".into() }),
@@ -2618,10 +3708,10 @@ fn a_tool_row_is_bare_with_its_status_in_the_gutter(cx: &mut TestAppContext) {
     assert_eq!(failed, Some(synaps_client::transcript::ToolStatus::Failed));
     let well = bounds(cx, leak(format!("well {id}"))).expect("a failed call opens on its well");
     let row = bounds(cx, leak(format!("tool-row {id}"))).expect("the row");
-    assert_eq!(f32::from(well.left()), f32::from(row.left()) + geo.out + geo.verb, "the well at the verb column");
-    assert_eq!(well.right(), row.right(), "to the column's end");
+    assert_eq!(f32::from(well.left()), f32::from(row.left()) + g.indent, "the well at the verb column");
+    assert_eq!(f32::from(well.right()), f32::from(row.right()) - g.pad, "to the row's padding");
     let status = bounds(cx, leak(format!("tool-status {id}"))).expect("its failed glyph");
-    assert!(f32::from(status.right()) <= f32::from(row.left()) + geo.out, "still in the gutter");
+    assert!(status.right() <= row.right() && status.left() >= row.left(), "still in its row");
 }
 
 /// One beat goes by: the motion clock and the executor's move on together,
@@ -2653,8 +3743,6 @@ fn frames(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, u64) {
 fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (1440., 1800.), crate::theme::Panels::default().text_size);
     set_motion(cx, &view, crate::motion::Level::Full);
-    // The beat alone (the sweep's 30 Hz: `a_sweep_ticks_only_while_drawn`).
-    view.update(cx, |v, _| v.fx.no_sweep.set(true));
     running_tools(cx, &view, 25);
     // The arrivals draw in and settle.
     for _ in 0..12 {
@@ -2662,23 +3750,35 @@ fn beats_repaint_only_the_layer(cx: &mut TestAppContext) {
     }
     assert!(!motion_pending(cx, &view).0, "settled: no display frames");
     let sites = view.read_with(cx, |v, _| v.fx.sites());
-    let scans = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count();
+    let scans = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_) | crate::motion::Beat::Lattice(_))).count();
     assert!(scans >= 25, "the running glyphs on screen are the layer's: {scans}");
     let (f0, l0) = frames(cx, &view);
     let p0 = view.read_with(cx, |v, _| v.fx.painted.borrow().len());
-    let mut layer_only = 0;
+    // The timers armed (each once, however many beats it waits): the
+    // lattices' pose changes (indicators/proposal.md §6: 4 a second) wake
+    // only the layer; only the clocks' second wakes the app.
+    let mut armed = Vec::new();
     for _ in 0..16 {
-        layer_only += usize::from(view.read_with(cx, |v, _| v.fx.wakes()) == Some(crate::motion::Wake::Beat));
+        let a = view.read_with(cx, |v, _| v.fx.pending().1.zip(v.fx.wakes()));
+        if let Some(a) = a.filter(|a| !armed.contains(a)) {
+            armed.push(a);
+        }
         beat(cx, w, &view);
     }
     let (f1, l1) = frames(cx, &view);
+    let layer_only = armed.iter().filter(|a| a.1 == crate::motion::Wake::Beat).count();
     // 2 s: the clocks' second twice (a third at most, as the edges fall).
-    assert!(layer_only >= 13, "the timer woke only the layer on {layer_only} of 16 beats");
+    assert!(armed.len() - layer_only <= 3 && layer_only >= 5, "the timer woke only the layer on {layer_only} of {} wakes", armed.len());
     // Every beat paints it, once (Shady N2: a beat painted twice is the
     // regression the layer exists to prevent): a beat is painted again
     // only by an app frame inside it.
     assert_painted_once(cx, &view, p0, l1 - l0, f1 - f0);
     assert!(f1 - f0 <= 3, "16 beats drew the app {} times: only the clocks' second may", f1 - f0);
+    // H2 (indicators/proposal.md §6): 25 running lattices stay within the
+    // beat's budget (a paint at most a beat, one for all of them), and the
+    // running calls' clocks still tick on the app's frame, each second.
+    assert!(l1 - l0 <= 16, "{} layer paints in 16 beats", l1 - l0);
+    assert!(f1 > f0, "the clocks' second drew the app");
     assert_eq!(view.read_with(cx, |v, _| v.fx.sites().len()), sites.len(), "the cached frame keeps its sites");
     // Off: the glyphs draw still in the app's frame; nothing for the layer.
     set_motion(cx, &view, crate::motion::Level::Off);
@@ -2913,8 +4013,9 @@ fn life_worker(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVie
 /// in's light travels down the composer's bar and is gone after `sig`
 /// (its colour, decaying into the bar: `motion::handoff_in_decays_into_the_bar`);
 /// Off draws none. P3 (polish.md, settle_pass_once_per_turn_end): the
-/// composer's sweep makes one last pass from the same corner, once; none
-/// under Reduced or Off.
+/// composer's top edge makes one pass from the same corner, once; none
+/// under Reduced or Off. Cards D (an intended change): P2's sweep is
+/// retired; while the turn runs, the state cell laps the orbit.
 #[gpui_kit::test]
 fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
@@ -2939,17 +4040,19 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
         beat(cx, w, &view);
     }
     let seg = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("handoff-in");
-    // polish.md P2, P3: the composer's top edge sweeps while the turn runs,
-    // then makes one last pass with the Handoff light, from its corner.
+    // polish.md P3: the composer's state cell laps the orbit while the turn
+    // runs (no sweep: Cards D), then its top edge makes one pass with the
+    // Handoff light, from its corner.
     let pass = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("settle-pass");
     let sweep = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("sweep");
+    let orbit = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("foot-lattice");
     assert!(seg(cx).is_none());
-    assert!(sweep(cx).is_some() && pass(cx).is_none(), "running: the composer sweeps");
+    assert!(orbit(cx).is_some() && sweep(cx).is_none() && pass(cx).is_none(), "running: the state cell's orbit, no sweep");
     busy(cx, false);
     assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current().map(|t| v.tab_state(t))), Some(crate::rail::State::Idle), "READY");
     assert!(seg(cx).is_some(), "the turn ended here: the light travels down the bar");
     let (s, p) = (seg(cx).unwrap(), pass(cx).expect("settle_pass_once_per_turn_end: the pass with the light"));
-    assert!(sweep(cx).is_none(), "the sweep is over");
+    assert!(orbit(cx).is_none(), "the orbit is over");
     assert!((f32::from(p.origin.y) - f32::from(s.origin.y)).abs() <= 1., "from the same corner: {p:?} / {s:?}");
     // Shady #17 R3-M2: the pass lies on the composer's top border, which
     // GPUI paints after the composer's children: drawn among them, the
@@ -2966,12 +4069,13 @@ fn handoff_in_travels_and_goes(cx: &mut TestAppContext) {
     assert!(seg(cx).is_none(), "gone after sig");
     assert!(pass(cx).is_none(), "one pass, then everything stops");
     // Nothing of it still animates (the design's final): no display frame,
-    // no sweep, and what is left on the layer is the rail's other sessions'
+    // no orbit, and what is left on the layer is the rail's other sessions'
     // spinners; with those at rest, nothing at all.
     only_the_rail_spins(cx, w, &view, "after the pass (Full)");
     set_motion(cx, &view, crate::motion::Level::Reduced);
     busy(cx, true);
     assert!(sweep(cx).is_none(), "Reduced: the edge is unlit");
+    assert!(view.read_with(cx, |v, _| v.fx.lattice_count()) == 0, "Reduced: the lattices are still, off the layer");
     busy(cx, false);
     assert!(pass(cx).is_none(), "Reduced: no pass (the bar's flash)");
     set_motion(cx, &view, crate::motion::Level::Off);
@@ -2992,7 +4096,9 @@ fn running_without_a_clock(cx: &mut TestAppContext, w: AnyWindowHandle, view: &E
     for _ in 0..12 {
         beat(cx, w, view);
     }
-    let scans = view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count());
+    let scans = view.read_with(cx, |v, _| {
+        v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_) | crate::motion::Beat::Lattice(_))).count()
+    });
     assert!(scans >= n, "the running glyphs are the layer's: {scans}");
     assert!(view.read_with(cx, |v, _| v.tray.rows.is_empty()), "no worker: no clock");
 }
@@ -3024,7 +4130,9 @@ fn assert_painted_once(cx: &mut TestAppContext, view: &Entity<AppView>, p0: usiz
     assert!(painted.windows(2).all(|w| w[1] >= w[0]), "in order: {painted:?}");
     let twice = painted.windows(2).filter(|w| w[1] == w[0]).count() as u64;
     assert!(twice <= again, "{twice} beats painted twice ({again} app frames): {painted:?}");
-    assert!(painted.len() >= 12, "about a paint a beat: {painted:?}");
+    // The lattice (indicators/proposal.md §6) repaints where a pose
+    // changes: running, twice a 4-beat step.
+    assert!(painted.len() >= 7, "a paint a pose change: {painted:?}");
 }
 
 /// Shady N1: low power stops the beat (§7: no ambient). GPUI stores a
@@ -3062,39 +4170,41 @@ fn the_beat_in_the_frame_spins_without_the_layer(cx: &mut TestAppContext) {
     let (w, view, _events) = open_with(cx, (1440., 900.), crate::theme::Panels::default().text_size, false);
     running_without_a_clock_in_frame(cx, w, &view);
     let at = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.frame_beat());
-    let drawn = |cx: &mut TestAppContext, k: u32| {
-        let dots = crate::glyph::spin_dots(crate::glyph::Glyph::Run, Some(k));
-        VisualTestContext::from_window(w, cx).debug_bounds(format!("spin-{dots:02x}").leak()).is_some()
+    let drawn = |cx: &mut TestAppContext, k: Option<u32>| {
+        let pose = crate::lattice::pose(crate::lattice::Pat::Run, k);
+        VisualTestContext::from_window(w, cx).debug_bounds(format!("lattice-{:07x}", crate::lattice::code(pose)).leak()).is_some()
     };
     let (f0, k0) = (frames(cx, &view).0, at(cx));
-    assert!(drawn(cx, k0), "the frame of beat {k0} in the frame");
+    assert!(drawn(cx, Some(k0)), "the pose of beat {k0} in the frame");
     assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::App), "the timer wakes the app");
-    beat(cx, w, &view);
+    // The lattice's next pose change (indicators/proposal.md §6: at most
+    // a step's 4 beats away) is the app's frame.
+    for _ in 0..4 {
+        beat(cx, w, &view);
+        if frames(cx, &view).0 > f0 {
+            break;
+        }
+    }
     let (f1, k1) = (frames(cx, &view).0, at(cx));
-    assert!(f1 > f0 && k1 > k0, "the beat is the app's frame");
+    assert!(f1 > f0 && k1 > k0, "the pose change is the app's frame");
     assert!(view.read_with(cx, |v, _| v.fx.sites().is_empty()), "nothing on the layer");
-    assert!(drawn(cx, k1), "the frame of beat {k1}: the snake moved on");
-    // The composer's sweep in the app's frame (no layer) lies on its top
-    // border too: it paints over it, after the root's last child (R3-M2).
-    view.update(cx, |v, cx| {
-        v.model.transcript.set_busy(true);
-        cx.notify();
-    });
-    beat(cx, w, &view);
-    let order = painted(cx, &view);
-    assert!(painted_after(&order, "sweep", "end-frame"), "the sweep paints over the composer's border: {order:?}");
-    assert!(painted_after(&order, "composer", "sticky") && painted_after(&order, "sweep", "sticky"), "P15: under both: {order:?}");
-    // Off: still, the ⠹ frame.
+    assert!(drawn(cx, Some(k1)), "the pose of beat {k1}: the face moved on");
+    // (Cards D retired the composer's sweep, which this checked painted
+    // over the composer's border: the pass's order is
+    // `handoff_in_travels_and_goes`'.)
+    // Off: still, the running still pose.
     set_motion(cx, &view, crate::motion::Level::Off);
-    assert!(VisualTestContext::from_window(w, cx).debug_bounds(format!("spin-{:02x}", crate::glyph::STILL).leak()).is_some());
+    assert!(drawn(cx, None));
     assert_eq!(motion_pending(cx, &view), (false, None));
 }
 
-/// P2: a sweep on screen (the composer's top edge while the turn runs)
-/// ticks the beat layer at 30 Hz, one timer; Reduced draws none, and the
-/// timer goes back to the beat or nothing.
+/// Cards D (step 8, replacing P2's `a_sweep_ticks_only_while_drawn`), H2
+/// (indicators/proposal.md §8): the composer's state cell is the cards'
+/// lattice while the turn runs, on the beat layer, its one timer at the
+/// next pose change on the beat grid; Reduced draws it still, and the
+/// timer goes to a clock's second or nothing.
 #[gpui_kit::test]
-fn a_sweep_ticks_only_while_drawn(cx: &mut TestAppContext) {
+fn the_composers_lattice_steps_only_while_drawn(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx);
     set_motion(cx, &view, crate::motion::Level::Full);
     // A session with no prompt waiting (the demo's NEEDS YOU stills the edge).
@@ -3108,26 +4218,395 @@ fn a_sweep_ticks_only_while_drawn(cx: &mut TestAppContext) {
     for _ in 0..12 {
         beat(cx, w, &view);
     }
-    let sweeps = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fx.sweep_count());
-    assert!(sweeps(cx) >= 1, "the turn runs: the composer sweeps");
+    let cards = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Lattice(_))).count())
+    };
+    assert!(cards(cx) >= 2, "the turn runs: the call's lattice and the composer's");
+    assert!(VisualTestContext::from_window(w, cx).debug_bounds("foot-lattice").is_some());
     let (frame, at) = motion_pending(cx, &view);
     let ahead = view.read_with(cx, |v, _| at.map(|t| t.saturating_duration_since(v.fx.clock())));
-    assert!(!frame && ahead.is_some_and(|d| d <= crate::motion::DECAY_TICK), "the next 30 Hz tick: {ahead:?}");
+    assert!(!frame && ahead.is_some_and(|d| d <= crate::motion::BEAT * crate::lattice::STEP_BEATS), "the next pose: {ahead:?}");
+    assert!(view.read_with(cx, |v, _| at.is_some_and(|t| v.fx.on_beats(t, 1))), "on the beat grid");
     assert_eq!(view.read_with(cx, |v, _| v.fx.wakes()), Some(crate::motion::Wake::Beat), "the layer, not the app");
     set_motion(cx, &view, crate::motion::Level::Reduced);
-    assert_eq!(sweeps(cx), 0, "Reduced: the edge is unlit");
-    assert!(VisualTestContext::from_window(w, cx).debug_bounds("sweep").is_none());
-    // Shady #17 M3: the 30 Hz tick went with it (a clock's second may stay).
+    assert_eq!(cards(cx), 0, "Reduced: the lattices are still");
     settle(cx, w, 4);
     let (frame, at) = motion_pending(cx, &view);
     assert!(!frame);
-    assert!(at.is_none_or(|t| view.read_with(cx, |v, _| v.fx.on_beats(t, 8))), "no 30 Hz tick: only a clock's second, or nothing");
+    assert!(at.is_none_or(|t| view.read_with(cx, |v, _| v.fx.on_beats(t, 8))), "only a clock's second, or nothing");
+}
+
+/// H2 (indicators/proposal.md §6, §8): a call finishing while watched
+/// turns its lattice a quarter (+45° from its running pose, then +90°),
+/// then its dots go out under the tick writing on; with the switch off
+/// (H1, the fallback) the tick writes on over the dots going out at once,
+/// no turn. Both land on the tick at rest.
+#[gpui_kit::test]
+fn a_finished_call_turns_its_lattice_or_not(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    for turn in [true, false] {
+        let (w, view, _events) = open(cx);
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| {
+            v.client = None;
+            v.fx.turn_on_change.set(turn);
+        });
+        running_tools(cx, &view, 1);
+        for _ in 0..4 {
+            beat(cx, w, &view);
+        }
+        let id = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| i.id)).expect("the call");
+        let has = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel)).is_some();
+        assert!(has(cx, format!("tool-status {id}")), "{turn}: its glyph");
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "ok".into() }),
+            });
+            v.sync_list();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let mut seen = Vec::new();
+        for _ in 0..40 {
+            fluid_frame(cx, w, &view);
+            for sel in ["life-turn 0", "life-turn 1", "life-settle Done"] {
+                if !seen.contains(&sel) && has(cx, sel.to_string()) {
+                    seen.push(sel);
+                }
+            }
+        }
+        if turn {
+            assert_eq!(seen, ["life-turn 0", "life-turn 1", "life-settle Done"], "H2: the turn, then the tick");
+        } else {
+            assert_eq!(seen, ["life-settle Done"], "H1: the tick at once, no turn");
+        }
+        // At rest: the tick, nothing asked for.
+        wait(cx, w, &view, 1000);
+        assert!(has(cx, "life-Done".to_string()), "{turn}: at rest");
+    }
+}
+
+/// The finish gate of #23, item 1 (indicators/proposal.md §8): a call's
+/// body opens and closes under its row on `glide`: the frame after the
+/// toggle shows less than all of it, `glide` later all of it (or none).
+#[gpui_kit::test]
+fn a_call_body_reveals_on_glide(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    running_tools(cx, &view, 1);
+    view.update(cx, |v, cx| {
+        v.model.transcript.apply(&SessionEvent::Stream {
+            event: StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "line one\nline two\nline three".into() }),
+        });
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    wait(cx, w, &view, 1000);
+    let id = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| i.id)).expect("the call");
+    let b = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel));
+    assert!(b(cx, format!("reveal {id}")).is_none(), "a done call's body is closed");
+    let toggle = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| {
+            v.toggle(id);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    toggle(cx);
+    let mut first = None;
+    for _ in 0..3 {
+        fluid_frame(cx, w, &view);
+        if let Some(r) = b(cx, format!("reveal {id}")).filter(|r| r.size.height > gpui_kit::px(0.)) {
+            first.get_or_insert(r.size.height);
+        }
+    }
+    let well = b(cx, format!("well {id}")).expect("its well, laid out whole");
+    let first = first.expect("the body showing");
+    assert!(first < well.size.height, "opening: {first:?} of {:?}", well.size.height);
+    for _ in 0..80 {
+        fluid_frame(cx, w, &view);
+    }
+    let open = b(cx, format!("reveal {id}")).expect("open");
+    assert!(open.size.height >= well.size.height, "open: all of it ({open:?}, {well:?})");
+    toggle(cx);
+    fluid_frame(cx, w, &view);
+    fluid_frame(cx, w, &view);
+    let closing = b(cx, format!("reveal {id}")).expect("closing: still drawn");
+    assert!(closing.size.height < open.size.height && closing.size.height > gpui_kit::px(0.), "closing: {closing:?}");
+    for _ in 0..80 {
+        fluid_frame(cx, w, &view);
+    }
+    assert!(b(cx, format!("reveal {id}")).is_none(), "closed");
+    // Off: at once.
+    set_motion(cx, &view, crate::motion::Level::Off);
+    toggle(cx);
+    let at_once = b(cx, format!("reveal {id}")).expect("Off: open at once");
+    assert_eq!(at_once.size.height, open.size.height);
+}
+
+/// The finish gate of #23, item 2 (cards4/proposal.md §8 #4): a running
+/// call's output streams into its open body a line at a time, each new
+/// line's clip growing from nothing to its line on `flick`.
+#[gpui_kit::test]
+fn running_output_grows_a_line_at_a_time(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    running_tools(cx, &view, 1);
+    let delta = |cx: &mut TestAppContext, text: &str| {
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: "ui-run-0".into(), delta: text.into() }),
+            });
+            v.sync_list();
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    delta(cx, "running 3 tests\n");
+    wait(cx, w, &view, 600);
+    let id = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| i.id)).expect("the call");
+    let b = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel));
+    assert!(b(cx, format!("well {id}")).is_some(), "a running call with output opens on it");
+    let r = cx.update(|cx| crate::theme::metrics(cx).r);
+    let line = gpui_kit::px((19. * r).round());
+    delta(cx, "test a ... ok\n");
+    let mut heights = Vec::new();
+    for _ in 0..40 {
+        fluid_frame(cx, w, &view);
+        heights.push(b(cx, format!("stream-line {id} 1")).map(|l| l.size.height));
+    }
+    let grown: Vec<_> = heights.iter().flatten().collect();
+    assert!(!grown.is_empty(), "the new line grows in its clip");
+    assert!(*grown[0] < line, "it starts short of its line: {heights:?}");
+    assert!(grown.windows(2).all(|w| w[1] >= w[0]), "and only grows: {heights:?}");
+    assert!(heights.last().unwrap().is_none_or(|h| h == line), "then it is a plain line: {heights:?}");
+    // Off: the line is there at once, no clip.
+    set_motion(cx, &view, crate::motion::Level::Off);
+    delta(cx, "test b ... ok\n");
+    assert!(b(cx, format!("stream-line {id} 2")).is_none(), "Off: no growth");
+}
+
+/// The finish gate of #23, item 5 (indicators/proposal.md §8): a call that
+/// fails while watched never draws a blank glyph: through the turn (H2) or
+/// at once (H1), the old dots, the ring or the cross is on every frame.
+#[gpui_kit::test]
+fn a_failed_glyph_is_never_blank(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    for turn in [true, false] {
+        let (w, view, _events) = open(cx);
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| {
+            v.client = None;
+            v.fx.turn_on_change.set(turn);
+        });
+        running_tools(cx, &view, 1);
+        for _ in 0..4 {
+            beat(cx, w, &view);
+        }
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResult {
+                    tool_id: "ui-run-0".into(),
+                    result: "Tool execution failed: Command failed (exit 2):\nboom".into(),
+                }),
+            });
+            v.sync_list();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let has = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel).is_some();
+        let mut changing = 0;
+        for k in 0..60 {
+            fluid_frame(cx, w, &view);
+            assert!(!has(cx, "ink-0"), "{turn}: frame {k} draws nothing");
+            changing += usize::from(has(cx, "ink-1"));
+        }
+        assert!(changing > 10, "{turn}: it changed while watched ({changing} frames)");
+        assert!(has(cx, "life-Failed"), "{turn}: the cross at rest");
+    }
+}
+
+/// The finish gate of #23 (states-full f542): a streaming call that fails
+/// holds its body open, and its height glides from the streamed lines to
+/// the failure's, never a jump that moves the column in one frame.
+#[gpui_kit::test]
+fn a_failed_body_glides_to_its_output(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    running_tools(cx, &view, 1);
+    let send = |cx: &mut TestAppContext, e: LlmEvent| {
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(e) });
+            v.sync_list();
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let lines: String = (0..8).map(|k| format!("test t{k} ... ok\n")).collect();
+    send(cx, LlmEvent::ToolResultDelta { tool_id: "ui-run-0".into(), delta: lines });
+    wait(cx, w, &view, 1500);
+    let id = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| i.id)).expect("the call");
+    let b = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel));
+    let before = b(cx, format!("well {id}")).expect("streaming: open").size.height;
+    send(cx, LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "Tool execution failed: Command failed (exit 1):\nboom".into() });
+    let mut heights = Vec::new();
+    for _ in 0..60 {
+        fluid_frame(cx, w, &view);
+        heights.push(b(cx, format!("reveal {id}")).map(|r| f32::from(r.size.height)));
+    }
+    let after = b(cx, format!("well {id}")).expect("failed: still open").size.height;
+    assert!(after < before, "the failure's output is shorter: {after:?} < {before:?}");
+    let h: Vec<f32> = heights.into_iter().flatten().collect();
+    assert!(h.len() > 5, "it glided over frames: {h:?}");
+    assert!(h[0] >= f32::from(before) - 1., "its first frame holds the height it had: {h:?} ({before:?})");
+    let step = h.windows(2).map(|p| (p[0] - p[1]).abs()).fold(0f32, f32::max);
+    assert!(step < f32::from(before - after) * 0.6, "no one-frame jump: {h:?}");
+}
+
+/// Shady #23 round 2 M1: what the user makes a call's body stays what
+/// they see while its default moves under it. Closed while its output
+/// streams, it stays closed when the call succeeds (its default goes from
+/// open to closed: a toggle against the old default must not open it).
+/// Closed and opened again, it stays open past its success.
+#[gpui_kit::test]
+fn a_call_the_user_closed_stays_closed_when_it_succeeds(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    for reopen in [false, true] {
+        let (w, view, _events) = open(cx);
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| v.client = None);
+        running_tools(cx, &view, 1);
+        let send = |cx: &mut TestAppContext, e: LlmEvent| {
+            view.update(cx, |v, cx| {
+                v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(e) });
+                v.sync_list();
+                v.list.scroll_to_end();
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        send(cx, LlmEvent::ToolStarted { tool_id: "ui-run-0".into() });
+        send(cx, LlmEvent::ToolResultDelta { tool_id: "ui-run-0".into(), delta: "compiling\nlinking\n".into() });
+        wait(cx, w, &view, 800);
+        let id = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| i.id)).expect("the call");
+        let b = |cx: &mut TestAppContext, sel: String| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel));
+        assert!(b(cx, format!("well {id}")).is_some(), "{reopen}: its output streams open");
+        let toggle = |cx: &mut TestAppContext| {
+            view.update(cx, |v, cx| {
+                v.toggle(id);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            wait(cx, w, &view, 1000);
+        };
+        toggle(cx);
+        assert!(b(cx, format!("well {id}")).is_none(), "{reopen}: the user closed it");
+        if reopen {
+            toggle(cx);
+            assert!(b(cx, format!("well {id}")).is_some(), "opened again");
+        }
+        send(cx, LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "compiling\nlinking\nok".into() });
+        for k in 0..60 {
+            fluid_frame(cx, w, &view);
+            let shown = b(cx, format!("well {id}")).is_some();
+            assert_eq!(shown, reopen, "{reopen}: frame {k} after its success, as the user left it");
+        }
+    }
+}
+
+/// Shady #23 round 2 M2: the composer's state cell streams only while text
+/// arrives (prose being written, or a call's output coming in) and runs
+/// while a call runs without output, as the call's own row does. A call is
+/// `streaming` from its start to its result: that alone is not writing.
+#[gpui_kit::test]
+fn the_composer_streams_only_while_text_arrives(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    open_idle_cpu(cx, &view, crate::tabs::Place::Current);
+    running_tools(cx, &view, 1);
+    view.update(cx, |v, cx| {
+        v.model.transcript.set_busy(true);
+        cx.notify();
+    });
+    let send = |cx: &mut TestAppContext, e: LlmEvent| {
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(e) });
+            v.sync_list();
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        for _ in 0..4 {
+            beat(cx, w, &view);
+        }
+    };
+    let has = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel).is_some();
+    send(cx, LlmEvent::ToolStarted { tool_id: "ui-run-0".into() });
+    assert!(has(cx, "foot-Run") && !has(cx, "foot-Stream"), "a call running, no output: Run");
+    send(cx, LlmEvent::ToolResultDelta { tool_id: "ui-run-0".into(), delta: "running 3 tests\n".into() });
+    assert!(has(cx, "foot-Stream"), "its output coming in: Stream");
+    send(cx, LlmEvent::ToolResult { tool_id: "ui-run-0".into(), result: "ok".into() });
+    assert!(has(cx, "foot-Run") && !has(cx, "foot-Stream"), "the call done, the turn running: Run");
+    send(cx, LlmEvent::Text { text: "Here is what changed: ".into() });
+    assert!(has(cx, "foot-Stream"), "prose being written: Stream");
+}
+
+/// Finish gate #6 (live-full-allow f2841): a call drawn running never
+/// steps back to "Queued" when its queued status comes again.
+#[gpui_kit::test]
+fn a_started_call_never_reads_queued_again(cx: &mut TestAppContext) {
+    use synaps_client::protocol::{LlmEvent, StreamEvent};
+    let (w, view, _events) = open(cx);
+    set_motion(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, _| v.client = None);
+    let id = || "ui-run-0".to_string();
+    let apply = |cx: &mut TestAppContext, evs: Vec<LlmEvent>| {
+        view.update(cx, |v, cx| {
+            for e in evs {
+                v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(e) });
+            }
+            v.sync_list();
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        fluid_frame(cx, w, &view);
+    };
+    let has = |cx: &mut TestAppContext, sel: &'static str| VisualTestContext::from_window(w, cx).debug_bounds(sel).is_some();
+    apply(
+        cx,
+        vec![
+            LlmEvent::ResponseStart,
+            LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id() },
+            LlmEvent::ToolUse { tool_name: "bash".into(), tool_id: id(), input: serde_json::json!({"command": "cargo build"}) },
+            LlmEvent::ToolQueued { tool_id: id() },
+        ],
+    );
+    assert!(has(cx, "life-Queued"), "queued before it starts");
+    apply(cx, vec![LlmEvent::ToolStarted { tool_id: id() }]);
+    wait(cx, w, &view, 400);
+    assert!(has(cx, "life-Run") && !has(cx, "life-Queued"), "running");
+    apply(cx, vec![LlmEvent::ToolQueued { tool_id: id() }]);
+    assert!(has(cx, "life-Run") && !has(cx, "life-Queued"), "never Queued again (no turn either)");
+    wait(cx, w, &view, 400);
+    assert!(has(cx, "life-Run") && !has(cx, "life-Queued"), "never Queued again");
 }
 
 /// Shady #17 M1 (motion.md §5.3): the link lost mid-turn, the window is
 /// visibly stale and nothing in it is live. Past the grace and the drain,
-/// no sweep and no spinner is on the layer, and the one timer left is the
-/// connection words' dots (2 Hz): never the sweep's 30 Hz, never the beat.
+/// no orbit and no spinner is on the layer, and the one timer left is the
+/// connection words' dots (2 Hz): never the orbit's 30 Hz, never the beat.
 #[gpui_kit::test]
 fn a_lost_link_stills_every_ambient(cx: &mut TestAppContext) {
     use crate::model::ConnState;
@@ -3156,19 +4635,18 @@ fn a_lost_link_stills_every_ambient(cx: &mut TestAppContext) {
         view.read_with(cx, |v, _| {
             let sites = v.fx.sites();
             (
-                sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Sweep(_))).count(),
+                sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Lattice(_))).count(),
                 sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count(),
             )
         })
     };
-    let (sweeps, spins) = ambient(cx);
-    assert!(sweeps >= 1 && spins >= 1, "running: the composer sweeps, the spinners spin ({sweeps}, {spins})");
+    let (orbits, spins) = ambient(cx);
+    assert!(orbits >= 1 && spins >= 1, "running: the orbits lap, the spinners spin ({orbits}, {spins})");
     conn(cx, ConnState::Reconnecting);
     wait_past(cx, w, &view, (crate::motion::LINK_GRACE + crate::motion::SLOW).as_millis() as u64);
     wait(cx, w, &view, 600);
     assert!(view.read_with(cx, |v, _| v.link.lost), "lost");
-    assert_eq!(ambient(cx), (0, 0), "held: no sweep, no spinner");
-    assert!(VisualTestContext::from_window(w, cx).debug_bounds("sweep").is_none(), "the edge unlit");
+    assert_eq!(ambient(cx), (0, 0), "held: no orbit, no spinner");
     for _ in 0..8 {
         beat(cx, w, &view);
     }
@@ -3261,7 +4739,13 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
         settle(cx, w, 4);
         assert!(frames(cx, &view).0 > f0, "{what}: the app's view was not drawn");
     };
-    let sites = view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count());
+    // The rail's spinners and the cards' lattices (indicators/proposal.md §8).
+    let spins = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_) | crate::motion::Beat::Lattice(_))).count()
+        })
+    };
+    let sites = spins(cx);
     // As the pump hands it over (Shady N3): `apply_batch` notifies, not the test.
     drew(cx, "an event", &mut |cx| {
         use synaps_client::protocol::{LlmEvent, StreamEvent};
@@ -3291,10 +4775,28 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
             );
         });
     });
-    let spins = |cx: &mut TestAppContext| {
-        view.read_with(cx, |v, _| v.fx.sites().iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_))).count())
-    };
-    assert_eq!(spins(cx), sites + 1, "the new call's glyph is on the layer");
+    assert!(spins(cx) > sites, "the new call's glyph is on the layer");
+    // Exactly one, its row's (Shady #23 r2 L5): the call's lattice is on the
+    // layer once, and no site is drawn twice (whatever else the turn's start
+    // lit: the composer's cell, the rail's and the tab's).
+    let call = view.read_with(cx, |v, _| {
+        v.model.transcript.items().iter().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == "ui-batch-0")).map(|i| i.id)
+    });
+    let call = call.expect("the new call");
+    let row = VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("tool-row {call}"))).expect("its row");
+    let origins: Vec<(f32, f32)> = view.read_with(cx, |v, _| {
+        v.fx.sites()
+            .iter()
+            .filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_) | crate::motion::Beat::Lattice(_)))
+            .map(|s| (f32::from(s.origin.x), f32::from(s.origin.y)))
+            .collect()
+    });
+    let mut seen = origins.clone();
+    seen.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    seen.dedup();
+    assert_eq!(seen.len(), origins.len(), "no site twice: {origins:?}");
+    let mine = origins.iter().filter(|o| row.contains(&gpui_kit::point(px(o.0), px(o.1)))).count();
+    assert_eq!(mine, 1, "the new call's lattice, once: {origins:?} in {row:?}");
     let halt = VisualTestContext::from_window(w, cx).debug_bounds("halt").expect("HALT");
     drew(cx, "a hover", &mut |cx| {
         event(
@@ -3354,6 +4856,55 @@ fn fluid_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVie
     cx.run_until_parked();
 }
 
+/// Shady #23 r2 H1: the list's end is its bottom, exactly, whatever frames
+/// land mid-growth. Each frame rate puts different rows out of view in the
+/// middle of their growth, where the list keeps the height it last
+/// measured; the rows never drawn keep a hint, the mean of the rows above
+/// (a ninth: `.2222`). A fractional one put CI's end an f32 ulp off. At 24
+/// to 240 Hz: the end is the bottom every frame, every row drawn is whole,
+/// and so is the list's extent (the hints too).
+#[gpui_kit::test]
+fn the_lists_end_is_exact_at_any_frame_rate(cx: &mut TestAppContext) {
+    for hz in [24u64, 37, 60, 144, 240] {
+        let (w, view, _events) = open(cx);
+        set_motion(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| v.client = None);
+        start_stream(cx, &view);
+        settle(cx, w, 8);
+        let (extent, vh) =
+            view.read_with(cx, |v, _| (f32::from(v.list.max_offset_for_scrollbar().y), f32::from(v.list.viewport_bounds().size.height)));
+        assert_eq!((extent + vh).fract(), 0., "{hz} Hz: opened, the rows' sum ({extent} past {vh}; the rows above, hinted)");
+        view.update(cx, |v, _| v.list.scroll_to_end());
+        let dt = std::time::Duration::from_micros(1_000_000 / hz);
+        for k in 0..90 {
+            stream_step(cx, &view, k);
+            view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
+            cx.executor().advance_clock(dt);
+            view.update(cx, |_, cx| cx.notify());
+            cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+            cx.run_until_parked();
+            let (gap, pad, frac) = view.read_with(cx, |v, cx| {
+                let n = v.list.item_count();
+                let pad = (28. * crate::theme::metrics(cx).r).round();
+                let gap = v.list.bounds_for_item(n - 1).map(|b| f32::from(v.list.viewport_bounds().bottom() - b.bottom()));
+                let frac: Vec<(usize, f32)> = (0..n)
+                    .filter_map(|ix| v.list.bounds_for_item(ix).map(|b| (ix, f32::from(b.size.height))))
+                    .filter(|r| r.1.fract() != 0.)
+                    .collect();
+                (gap, pad, frac)
+            });
+            assert!(frac.is_empty(), "{hz} Hz, frame {k}: rows off the pixel grid {frac:?}");
+            assert_eq!(gap, Some(pad), "{hz} Hz, frame {k}: the end is the bottom");
+            // The rows not drawn too (their hints): the rows' sum is whole
+            // (the extent past a viewport that a dock's spring may hold
+            // mid-pixel).
+            let (extent, vh) = view
+                .read_with(cx, |v, _| (f32::from(v.list.max_offset_for_scrollbar().y), f32::from(v.list.viewport_bounds().size.height)));
+            assert_eq!((extent + vh).fract(), 0., "{hz} Hz, frame {k}: the rows' sum ({extent} past {vh})");
+        }
+    }
+}
+
 /// A turn starts streaming in the shown session.
 fn start_stream(cx: &mut TestAppContext, view: &Entity<AppView>) {
     use synaps_client::protocol::{LlmEvent, StreamEvent};
@@ -3396,6 +4947,48 @@ fn stream_step(cx: &mut TestAppContext, view: &Entity<AppView>, k: usize) {
         });
         cx.notify();
     });
+}
+
+/// Shady #23 round 2 H1 (CI run 44363749232): every transcript row rests
+/// on whole pixels, at every text size and at the tight width. The demo's
+/// authorize card was 157.5 px (its 15 px title's 1.5 line height): a half
+/// pixel in the list's sum put `follow_offset_is_end_every_frame`'s end
+/// an f32 ulp off its bottom on CI's runners (28.000061 for 28), while
+/// bella's content happened to sum exactly.
+#[gpui_kit::test]
+fn every_row_rests_on_whole_pixels(cx: &mut TestAppContext) {
+    for text in [13u8, 14, 15, 16, 17, 18, 20] {
+        for width in [1440f32, 1100.] {
+            let (w, view, _events) = open_at(cx, (width, 9000.), text);
+            set_motion(cx, &view, crate::motion::Level::Full);
+            view.update(cx, |v, _| v.client = None);
+            settle(cx, w, 8);
+            let (n, frac) = view.read_with(cx, |v, _| {
+                let n = v.list.item_count();
+                let frac: Vec<_> = (0..n)
+                    .filter_map(|ix| v.list.bounds_for_item(ix).map(|b| (ix, v.disp.get(ix).map(|d| d.kind), f32::from(b.size.height))))
+                    .filter(|r| r.2.fract() != 0.)
+                    .collect();
+                (n, frac)
+            });
+            assert!(n > 5, "the demo's rows");
+            assert!(frac.is_empty(), "text {text} at {width}: rows off the pixel grid {frac:?}");
+            let card = VisualTestContext::from_window(w, cx).debug_bounds("card").expect("the demo's card");
+            assert_eq!(f32::from(card.size.height).fract(), 0., "text {text} at {width}: the card {card:?}");
+            // A turn running: the card says so in its footer (the state
+            // `follow_offset_is_end_every_frame` starts from).
+            start_stream(cx, &view);
+            settle(cx, w, 8);
+            assert!(VisualTestContext::from_window(w, cx).debug_bounds("card-footer").is_some(), "text {text}: the card's footer");
+            let frac = view.read_with(cx, |v, _| {
+                (0..v.list.item_count())
+                    .filter_map(|ix| v.list.bounds_for_item(ix).map(|b| (ix, v.disp.get(ix).map(|d| d.kind), f32::from(b.size.height))))
+                    .filter(|r| r.2.fract() != 0.)
+                    .collect::<Vec<_>>()
+            });
+            assert!(frac.is_empty(), "text {text} at {width}, a turn running: rows off the pixel grid {frac:?}");
+        }
+    }
 }
 
 /// Invariant (a): while following, the end of content is the bottom of the
@@ -6110,7 +7703,7 @@ fn sticky_label_takes_no_click(cx: &mut TestAppContext) {
 }
 
 /// F8 (Shady #19 M2): at Full, the band hides the beat under it. Running
-/// rows scrolled under it keep their glyphs and sweeps on the beat layer
+/// rows scrolled under it keep their glyphs and orbits on the beat layer
 /// (painted after the app's whole frame, so over the band), but no site's
 /// clip meets the band: their beats show only below it.
 #[gpui_kit::test]
@@ -6137,7 +7730,10 @@ fn sticky_band_hides_the_beat(cx: &mut TestAppContext) {
     let cover = Bounds::new(gpui_kit::point(px(band[0]), px(top)), size(px(band[2]), px(line + 1.)));
     assert_eq!(band[1], top, "{band:?}");
     let sites = view.read_with(cx, |v, _| v.fx.sites());
-    let under = sites.iter().filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_)) && s.origin.y < cover.bottom()).count();
+    let under = sites
+        .iter()
+        .filter(|s| matches!(s.beat, crate::motion::Beat::Spin(_) | crate::motion::Beat::Lattice(_)) && s.origin.y < cover.bottom())
+        .count();
     assert!(under >= 1, "a running glyph under the band: {sites:?}");
     for s in &sites {
         assert!(!s.mask.bounds.intersects(&cover), "a beat over the band: {s:?}, band {cover:?}");
