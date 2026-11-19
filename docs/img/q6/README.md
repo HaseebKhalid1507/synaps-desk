@@ -1,5 +1,7 @@
 # Q6 palette: evidence
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q6), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 Recorded on bella with `scripts/capture-linux.sh` (a headless gamescope at 144 Hz, x11grab lossless,
 `MESA_VK_WSI_DEBUG=sw`), the `--offline` demo, settings `{"text_size": 16, "theme": <theme>}`. The binaries:
 

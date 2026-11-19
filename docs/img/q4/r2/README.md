@@ -1,5 +1,7 @@
 # Q4 r2: evidence for the review fixes (Shady H1–H4, M1–M8; finish gate 1–5)
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q4/r2), at the same paths. See [EVIDENCE.md](../../../EVIDENCE.md).
+
 Recorded on bella like r1: `scripts/capture-linux.sh` (headless gamescope at 144 Hz, 1920×1080,
 x11grab lossless at 30 fps, `MESA_VK_WSI_DEBUG=sw`), driven by xdotool, this branch's release build.
 Frame numbers are the clip's own (30 fps); `<clip>-drive.log` holds each step's wall time, and a

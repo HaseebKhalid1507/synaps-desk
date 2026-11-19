@@ -1,5 +1,7 @@
 # F1 fluid motion: live evidence
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/fluid1), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 All clips were recorded live against the **desktopproto sandbox** daemon on bella (`--profile desktopproto`, claude-haiku-4-5).
 - Capture: `scripts/capture-linux.sh` (headless gamescope at 144 Hz, `MESA_VK_WSI_DEBUG=sw`, lossless x11grab at 30 fps).
 - Input: `xdotool`.

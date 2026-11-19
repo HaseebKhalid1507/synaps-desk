@@ -1,5 +1,7 @@
 # Q2 Authorize: finish-gate evidence (polish.md §6)
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q2), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 **Binaries.** `main` is the installed `synaps-desktop-hybrid.q4` (built from 609cf04, whose tree is
 byte-identical to main 4f87411: `git diff 609cf04 4f87411` is empty), sha256 `61e724e6…`. `q2` is this
 PR's release build at 4475cdf, sha256 `11478689…`, installed as `bella:~/.local/bin/synaps-desktop-hybrid.q2`.

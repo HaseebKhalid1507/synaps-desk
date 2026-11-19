@@ -1,5 +1,7 @@
 # Q5 r4: evidence
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q5/r4), at the same paths. See [EVIDENCE.md](../../../EVIDENCE.md).
+
 Captured on bella with headless gamescope at 144 Hz (`scripts/capture-linux.sh`, with an absolute `XDG_CONFIG_HOME`
 under `~/.cache/q5r4`), `--offline`, nord, 1280×720. Recorded with x11grab at 60 fps and re-encoded losslessly:
 libx264rgb, qp 0, gbrp, High 4:4:4 Predictive. Every clip's per-frame md5 equals the raw capture's (`clips.txt`;

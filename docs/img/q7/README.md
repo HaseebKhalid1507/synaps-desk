@@ -1,5 +1,7 @@
 # Q7 Sticky: evidence
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q7), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 Recorded on bella from the `--offline` demo (headless gamescope at 144 Hz, x11grab, `MESA_VK_WSI_DEBUG=sw`), driven
 by `evidence.sh` (here). Binaries are release builds made through `dbuild` from the same tree:
 - **Q7:** `3e2093d`, sha256 `5f88fb61…` (installed as `bella:~/.local/bin/synaps-desktop-hybrid.q7`);

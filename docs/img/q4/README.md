@@ -1,5 +1,7 @@
 # Q4 chrome motion: evidence
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q4), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 Recorded on bella with `scripts/capture-linux.sh` (a headless gamescope at 144 Hz, 1920×1080, x11grab
 lossless at 30 fps, `MESA_VK_WSI_DEBUG=sw`), driven by xdotool. The binaries:
 

@@ -1,5 +1,7 @@
 # Q3 Life, round 3: evidence on the merged tree
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q3/r3), at the same paths. See [EVIDENCE.md](../../../EVIDENCE.md).
+
 > **Round 4 (`ef5f374`) changes one thing shown here:** a spawn row's tool count and its live step line no longer
 > roll; they swap in one frame, at every level (gate 4 under a live fan-out, `docs/bench/q3/README.md` "Round 4"). The worker-row
 > rolls in these clips, and the "plural swap" and "rolls step at 30 Hz" notes about them below, describe `699f1b2`.

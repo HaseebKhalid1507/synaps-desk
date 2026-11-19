@@ -1,5 +1,7 @@
 # Q3 Life, round 2: evidence
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q3/r2), at the same paths. See [EVIDENCE.md](../../../EVIDENCE.md).
+
 The design gate (`cohesion/finish-gate-pr17.md`) and Shady's review of #17 at `8580aab`, answered. Recorded on bella
 with `scripts/capture-linux.sh` (headless gamescope at 144 Hz, x11grab, `MESA_VK_WSI_DEBUG=sw`), driven by
 `evidence2.sh` (here). Binary: this branch at `63e5804`, release build sha256 `d73d8a4b…`. The head after it, `f9be0a6`, changes only the

@@ -1,5 +1,7 @@
 # Q2 r3: live on the desktopproto sandbox, the finish gate's states, lossless clips
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q2/r3), at the same paths. See [EVIDENCE.md](../../../EVIDENCE.md).
+
 ## Binaries
 
 | build | sha256 | what came from it |

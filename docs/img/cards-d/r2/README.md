@@ -1,5 +1,7 @@
 # Cards D round 2: evidence
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/cards-d/r2), at the same paths. See [EVIDENCE.md](../../../EVIDENCE.md).
+
 The finish gate's must-fix list (`cohesion/finish-gate-pr23.md`), Shady's review, and H2 "Turning lattice"
 (`indicators/proposal.md` §6). Every run: a headless gamescope on bella (1920×1080, 144 Hz,
 `MESA_VK_WSI_DEBUG=sw`), an absolute `XDG_CONFIG_HOME` under `~/.cache`, and either the `--offline` demo or the
