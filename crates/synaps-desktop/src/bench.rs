@@ -1004,7 +1004,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             .model
                             .sessions
                             .iter()
-                            .map(|m| SessionMeta { busy: false, subagents_running: 0, ..m.clone() })
+                            .map(|m| SessionMeta { busy: false, subagents_running: 0, workers: Default::default(), ..m.clone() })
                             .collect();
                         v.apply_batch(vec![Event::Sessions(metas)], cx);
                     });
