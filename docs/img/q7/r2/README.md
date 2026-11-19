@@ -1,5 +1,7 @@
 # Q7 r2 evidence (Shady #19 M1/M2, finish gate #19 must-fix 1)
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q7/r2), at the same paths. See [EVIDENCE.md](../../../EVIDENCE.md).
+
 Recorded on bella from the `--offline` demo (headless gamescope at 144 Hz, x11grab, `MESA_VK_WSI_DEBUG=sw`), nord, a fresh
 `settings.json` under an **absolute** `XDG_CONFIG_HOME` in `~/.cache/q7r2` for every run (the right pane open, as main's
 default, so 1280 is inline: F8's band). bella's real `~/.config/synaps-desktop/settings.json` was checked before and

@@ -1,5 +1,7 @@
 # Q6 r2: evidence
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q6/r2), at the same paths. See [EVIDENCE.md](../../../EVIDENCE.md).
+
 **Binary:** head `781122b`, which is r2 merged with main `2bbe974` (Q7). Release build, sha256 `c5b9469d…468965bdf8`,
 installed as `bella:~/.local/bin/synaps-desktop-hybrid.q6`. r1 is `ebf37ed` (`20f3017f…`).
 

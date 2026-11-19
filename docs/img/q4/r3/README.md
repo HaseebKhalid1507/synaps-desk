@@ -1,5 +1,7 @@
 # Q4 r3: evidence for round 3 (Shady R1–R4, the press decision, design re-gate 1–5)
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q4/r3), at the same paths. See [EVIDENCE.md](../../../EVIDENCE.md).
+
 > **Correction (r4).** The `.mp4` files here are **not lossless**. They were packed from the lossless
 > captures with `libx264 -crf 20 -preset slow -pix_fmt yuv444p`, which keeps a keyframe every 250 frames.
 > At CRF 20 a slow colour fade is mostly skipped until the next keyframe. In

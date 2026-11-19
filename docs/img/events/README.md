@@ -1,5 +1,7 @@
 # Events in the desk: evidence
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/events), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 Live on the **desktopproto sandbox** on the build machine (daemon 0.11.1, haiku-4-5), `live.sh` phases `setup`, `order`,
 `record`, `reload`, `teardown`. The sandbox config got the two model-credential lines for the run and was restored
 after: sha `c1b7ac41…320edd` before and after, 0 auth lines left (`logs/live.log`). Every app run's

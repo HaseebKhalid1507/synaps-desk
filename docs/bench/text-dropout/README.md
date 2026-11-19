@@ -1,5 +1,7 @@
 # The text dropout in captures: a capture artefact, not the app
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 On bella, an x11grab recording of the offline demo (`--offline`, headless gamescope, lossless at
 30 fps) loses the text of the diff block and of inline code (`Session`) for one frame (4 video
 frames at 8 redraws a second) every couple of seconds, then gets it back

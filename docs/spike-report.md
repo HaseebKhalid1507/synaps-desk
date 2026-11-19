@@ -1,5 +1,7 @@
 # Synaps Desktop: GPUI spike report
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img), at the same paths. See [EVIDENCE.md](EVIDENCE.md).
+
 Branch `spike/gpui`. Date 2026-11-13. Author: Spike (subagent), for Jawz / Haseeb.
 
 **Bottom line: GO.** GPUI held the display refresh rate in every scenario, with

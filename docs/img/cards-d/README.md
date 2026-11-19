@@ -1,5 +1,7 @@
 # Cards D: evidence (round 1, head 178939d)
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/cards-d), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 Round 2 (the finish gate, Shady's review, H2 "Turning lattice") is in [`r2/`](r2/README.md); where they
 differ, round 2 is current.
 

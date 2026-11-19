@@ -1,5 +1,7 @@
 # Message times: evidence
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/times), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 Captured headless on bella (gamescope, nord). The `demo-*` shots use the `--offline` demo, whose histories carry fixed
 local times, so they look the same on any machine. The `live-*` shots come from the desktopproto sandbox daemon
 (0.11.1, haiku). Bella's zone is America/New_York, so the times shown are EST and the wire times are UTC.

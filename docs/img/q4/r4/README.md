@@ -1,5 +1,7 @@
 # Q4 r4: the drain, from the shipped file
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q4/r4), at the same paths. See [EVIDENCE.md](../../../EVIDENCE.md).
+
 **Every number below was read from `live-loss-back.mp4`, the file in this folder.** Decode it with
 `ffmpeg -i live-loss-back.mp4 -f rawvideo -pix_fmt rgb24 -`. Frame numbers are the file's own (0–379).
 

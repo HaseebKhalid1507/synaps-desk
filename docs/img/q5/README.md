@@ -1,5 +1,7 @@
 # Q5 panels: evidence
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q5), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 Recorded on bella with `scripts/capture-linux.sh` (headless gamescope at 144 Hz, x11grab lossless,
 `MESA_VK_WSI_DEBUG=sw`), the `--offline` demo, settings `{"text_size": 16, "theme": <theme>}`. Every run's config is
 a scratch folder under `~/.cache/q5` (`capture-linux.sh`'s absolute `$out/config`). bella's real

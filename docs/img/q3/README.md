@@ -1,5 +1,7 @@
 # Q3 Life: evidence (round 1)
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img/q3), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 > **Round 2 supersedes the motion clips here:** `r2/README.md`. The per-row sweeps were cut, the transcript's counts
 > roll, the write-on never shows an empty box, and the star hops once its row has landed. This file is round 1's
 > evidence, corrected after the design gate (`cohesion/finish-gate-pr17.md`): the corrections are marked **r2 fix**.

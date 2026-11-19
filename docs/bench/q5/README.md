@@ -1,5 +1,7 @@
 # Q5 panels: bench
 
+> **Media:** the screenshots and clips named here are in the private repo [synaps-desk-evidence](https://github.com/HaseebKhalid1507/synaps-desk-evidence/tree/main/docs/img), at the same paths. See [EVIDENCE.md](../../EVIDENCE.md).
+
 bella, headless gamescope at 144 Hz, `--refresh-hz 144`, settings `{"text_size": 16, "theme": "nord"}`. Release builds
 made the same way (`dbuild … build --release --locked`):
 - **main** = `9b0d263`, sha256 `91e0c957…0c727`; for `--bench-panels` (Q5's new scene), **main-bench** = `9b0d263` with
