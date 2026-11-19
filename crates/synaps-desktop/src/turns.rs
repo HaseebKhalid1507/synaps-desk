@@ -1357,7 +1357,7 @@ impl AppView {
     /// A folding run's rows (N1), as they were drawn: the blocks inside its
     /// card, which the room under its header draws round them.
     pub(crate) fn fold_rows(&self, rows: &[Disp], cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let items = self.model.shown().items();
+        let items = self.model.lives[self.panes.cur.live].shown().items();
         let (p, m, lay) = (theme::palette(cx), theme::metrics(cx), self.panes.cur.layout);
         rows.iter()
             .filter_map(|d| {
@@ -1371,7 +1371,7 @@ impl AppView {
     /// One display row: its gap, its label and the block.
     pub(crate) fn render_disp(&self, ix: usize, cx: &mut Context<Self>) -> RowParts {
         let Some(&d) = self.panes.cur.disp.get(ix) else { return RowParts::empty() };
-        let items = self.model.shown().items();
+        let items = self.model.lives[self.panes.cur.live].shown().items();
         let (Some(item), Some(row)) = (items.get(d.item), self.panes.cur.rows.get(d.item)) else { return RowParts::empty() };
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
@@ -1834,7 +1834,7 @@ impl AppView {
         let call_id = item.tool.as_ref().map(|t| t.tool_id.as_str());
         let starts = item.tool.as_ref().filter(|t| subagents::starts_worker(&t.name));
         let worker = starts.and_then(|t| {
-            let subs = self.model.shown_subagents();
+            let subs = self.model.lives[self.panes.cur.live].shown_subagents();
             subs.view(&t.tool_id).map(|v| (v, subs.current(&t.tool_id)))
         });
         if let Some((v, current)) = worker {
@@ -1861,19 +1861,21 @@ impl AppView {
             target_el(&row.card, &row.arg, matches!(st, Some(ToolStatus::Cancelled | ToolStatus::Denied)), p)
         };
         // The call a prompt waits on ([`waiting_call`]).
-        let waiting = !think && self.panes.cur.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty();
+        let waiting = !think
+            && self.panes.cur.waiting_on == Some(item.id)
+            && !self.model.lives[self.panes.cur.live].shown().pending_prompts().is_empty();
         let fx = &self.fx;
-        let shown = self.model.shown();
+        let shown = self.model.lives[self.panes.cur.live].shown();
         let running_think = think && shown.busy() && shown.items().last().map(|i| i.id) == Some(id);
         let state = if think {
             if running_think { (Glyph::Run, None, Family::Run) } else { (Glyph::Ok, None, Family::Ok) }
         } else {
-            glyph::call(st, waiting, self.model.active.is_none())
+            glyph::call(st, waiting, self.model.lives[self.panes.cur.live].active.is_none())
         };
         let life = if think {
             if running_think { glyph::Life::Run } else { glyph::Life::Done }
         } else {
-            glyph::life_of_call(st, waiting, self.model.active.is_none())
+            glyph::life_of_call(st, waiting, self.model.lives[self.panes.cur.live].active.is_none())
         };
         // Its output being written: the lattice's streaming pose.
         let life = if life == glyph::Life::Run && !think && !row.result.is_empty() { glyph::Life::Stream } else { life };
@@ -2077,8 +2079,8 @@ impl AppView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let fx = &self.fx;
-        let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
-        let pending = session.zip(v.id).is_some_and(|(s, id)| self.model.cancels.pending_id(s, id));
+        let session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.as_str());
+        let pending = session.zip(v.id).is_some_and(|(s, id)| self.model.lives[self.panes.cur.live].cancels.pending_id(s, id));
         let live = subagents::Liveness::of(v.status, session.is_some(), true).cancelling(pending);
         let (g, _, word, family) = glyph::worker(live);
         let (word_color, mark) = glyph::ink(family, Ground::Run, p);
@@ -2086,7 +2088,7 @@ impl AppView {
         let running = matches!(live, subagents::Liveness::Running | subagents::Liveness::Cancelling);
         let (step, result) = if ended { (None, v.line.clone()) } else { (v.line.clone(), None) };
         // A background worker of the session on screen: it opens.
-        let open = v.id.filter(|_| v.watchable && current && self.model.watch.focus().is_none());
+        let open = v.id.filter(|_| v.watchable && current && self.model.lives[self.panes.cur.live].watch.focus().is_none());
         let who = open.map(|id| crate::wtabs::Who::new(id, v.name.clone(), v.call.clone()));
         let _ = (g, mark);
         let d = crate::cards::Geo::of(m);
@@ -2225,7 +2227,7 @@ impl AppView {
             .children(under);
         let Some(who) = who else {
             // Its handle names a later worker now: nothing of that one's here.
-            if let Some(id) = v.id.filter(|_| v.watchable && !current && self.model.watch.focus().is_none()) {
+            if let Some(id) = v.id.filter(|_| v.watchable && !current && self.model.lives[self.panes.cur.live].watch.focus().is_none()) {
                 let tip = SharedString::new_static("an earlier worker: a restarted daemon has given its handle to another one since");
                 return block
                     .id(("wblock-old", id as usize))

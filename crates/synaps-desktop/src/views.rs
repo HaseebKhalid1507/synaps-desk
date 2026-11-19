@@ -580,12 +580,12 @@ impl AppView {
         match kind {
             Kind::Settings => {
                 std::mem::discriminant(&self.model.conn).hash(&mut h);
-                self.model.active.as_ref().map(|a| &a.session_id).hash(&mut h);
+                self.model.lives[self.panes.cur.live].active.as_ref().map(|a| &a.session_id).hash(&mut h);
                 self.model.tabs.current().map(|t| (t.id, &t.label)).hash(&mut h);
-                (self.model.transcript.title(), self.model.active_name()).hash(&mut h);
+                (self.model.lives[self.panes.cur.live].transcript.title(), self.model.active_name(self.panes.cur.live)).hash(&mut h);
                 // The system prompt by its allocation, not its text (nit 7:
                 // never hashed whole each frame); a new view is a new one.
-                self.model
+                self.model.lives[self.panes.cur.live]
                     .stats
                     .view
                     .as_ref()

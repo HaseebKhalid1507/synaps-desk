@@ -62,6 +62,10 @@ impl PaneId {
 /// One editor group: the list on screen and everything drawn around it.
 pub struct Pane {
     pub(crate) id: PaneId,
+    /// The live store its session tab shows ([`crate::live`]): every read
+    /// of the session's transcript, numbers and workers, and every send,
+    /// goes through it (`model.lives[pane.live]`).
+    pub(crate) live: crate::live::LiveId,
 
     // The list over one transcript (architecture.md §1.1, §1.2: "C").
     /// Per transcript item: its strings ([`RowCache`]).

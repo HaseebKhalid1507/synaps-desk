@@ -15,11 +15,11 @@ use synaps_client::{
     RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, Status, Transcript, validate_session_name,
 };
 
+use crate::live::{LiveId, Lives};
 use crate::named::{ResumeRequest, RowAction, parse_rfc3339};
 use crate::rail::{Chip, State, is_parked};
 use crate::stats::Stats;
 use crate::tabs::{Place, Tabs};
-use crate::watch::{Candidate, Watch};
 
 /// HISTORY's newest unnamed sessions, asked for at startup; up to
 /// [`SAVED_SESSIONS_MAX`] (the wire's cap) once OLDER opens or find is used.
@@ -367,30 +367,14 @@ pub struct Model {
     /// reload grace (a storm of reloads).
     pub reload_seq: u64,
     pub sessions: Vec<SessionMeta>,
-    pub active: Option<Active>,
-    /// The attachment asked for last: events of any other are stale.
-    wanted: Option<u64>,
-    /// The session it asked for (`None`: a create or a resume, whose id
-    /// comes with `Attached`).
-    wanted_session: Option<String>,
-    /// Its state when it was asked for: under a chip that admitted it, its
-    /// row stays until the attach lands.
-    wanted_fact: Option<State>,
-    /// Prompts answered from here that the daemon has not resolved yet, as
-    /// `(epoch, prompt id)` ([`Active::epoch`]): prompt ids are per session
-    /// and start at 1 (again after a daemon restart), so an id alone would
-    /// carry over to the next attachment's prompt.
-    answered: HashSet<(u64, u64)>,
-    /// The last [`Active::epoch`] handed out.
+    /// The live stores ([`crate::live`]): each attachment's session, its
+    /// transcript, numbers, worker views and input in flight. Events go to
+    /// the one that asked for their `attach_seq`.
+    pub(crate) lives: Lives,
+    /// The last [`Active::epoch`] handed out (window-wide: `(epoch, prompt
+    /// id)` card keys never collide across stores).
     epoch: u64,
-    pub transcript: Transcript,
-    pub last_error: Option<String>,
-    /// The session connection is being re-made (reload).
-    pub reattaching: bool,
-    /// Sent, not yet confirmed by `TurnStarted` / `Steered`, oldest first:
-    /// given back to the user on a refusal (the oldest) or a detach (all).
-    pub(crate) in_flight: VecDeque<String>,
-    /// The same for attachments a tab switch left (their last events still
+    /// The input in flight ([`Live::in_flight`]) of attachments a tab switch left (their last events still
     /// come, until their `Detached`): `(attach_seq, session, texts)`.
     left: Vec<(u64, String, VecDeque<String>)>,
     pub named: Named,
@@ -403,9 +387,6 @@ pub struct Model {
     /// and how many have (the polls of an idle daemon included).
     pub sessions_listed: bool,
     pub lists: u64,
-    /// The attached session's numbers (the composer's foot, the right-hand
-    /// panel).
-    pub stats: Stats,
     /// Bumped whenever what the rail lists may have changed (anything but
     /// a session's own stream, and a session list equal to the last): the
     /// view rebuilds its rows only then.
@@ -426,11 +407,25 @@ pub struct Model {
     /// for its dash again).
     pub daemon: Option<Daemon>,
     pub daemon_gen: u64,
-    /// The attached session's worker views ([`crate::watch`]): with the
-    /// transcript, they go to the tab cache when its tab is left.
-    pub watch: Watch,
-    /// Worker cancels armed and on their way ([`crate::wtabs`]).
-    pub cancels: crate::wtabs::Cancels,
+}
+
+/// Tests only (split/architecture.md §6.6): `v.model.transcript`,
+/// `m.active`, `m.can_send()` ... read the one live store, so the
+/// protected tests compile unchanged. Production code never sees it: it
+/// names the store (`model.lives[pane.live]`).
+#[cfg(test)]
+impl std::ops::Deref for Model {
+    type Target = crate::live::Live;
+    fn deref(&self) -> &crate::live::Live {
+        &self.lives[LiveId::FIRST]
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for Model {
+    fn deref_mut(&mut self) -> &mut crate::live::Live {
+        &mut self.lives[LiveId::FIRST]
+    }
 }
 
 /// An empty transcript as the window keeps it: no notices for subagent
@@ -460,81 +455,21 @@ impl Model {
             reload: false,
             reload_seq: 0,
             sessions: Vec::new(),
-            active: None,
-            wanted: None,
-            wanted_session: None,
-            wanted_fact: None,
-            answered: HashSet::new(),
+            lives: Lives::default(),
             epoch: 0,
-            transcript: transcript(),
-            last_error: None,
-            reattaching: false,
-            in_flight: VecDeque::new(),
             left: Vec::new(),
             named: Named { daemon: "the daemon's machine".into(), ..Named::default() },
             favs: Default::default(),
             tabs: Tabs::default(),
             sessions_listed: false,
             lists: 0,
-            stats: Stats::default(),
             rail_gen: 0,
             unread: HashSet::new(),
             seen: HashMap::new(),
             view_dirty: false,
             daemon: None,
             daemon_gen: 0,
-            watch: Watch::default(),
-            cancels: Default::default(),
         }
-    }
-
-    /// The transcript the list shows: the focused worker's, else the
-    /// session's own.
-    pub fn shown(&self) -> &Transcript {
-        self.watch.focused().map_or(&self.transcript, |w| &w.transcript)
-    }
-
-    pub fn shown_mut(&mut self) -> &mut Transcript {
-        match self.watch.focused_mut() {
-            Some(w) => &mut w.transcript,
-            None => &mut self.transcript,
-        }
-    }
-
-    /// What the shown transcript's rows read: its file tools' diffs and the
-    /// workers under its calls.
-    pub fn shown_files(&self) -> &crate::files::Ledger {
-        self.watch.focused().map_or(&self.stats.files, |w| &w.files)
-    }
-
-    pub fn shown_subagents(&self) -> &crate::subagents::Subagents {
-        self.watch.focused().map_or(&self.stats.subagents, |w| &w.subagents)
-    }
-
-    pub fn shown_subagents_mut(&mut self) -> &mut crate::subagents::Subagents {
-        match self.watch.focused_mut() {
-            Some(w) => &mut w.subagents,
-            None => &mut self.stats.subagents,
-        }
-    }
-
-    /// The tray's running background workers, as [`Watch::step`] takes
-    /// them.
-    pub fn watchable(&self) -> Vec<Candidate> {
-        self.stats
-            .subagents
-            .live()
-            .into_iter()
-            // A worker only started (no live word yet) too: its view says
-            // if it is gone.
-            .filter(|l| l.watchable && !l.status.terminal())
-            .map(|l| Candidate::of(l.id, &l.name))
-            .collect()
-    }
-
-    /// The session's folder (a worker's diffs are shown relative to it).
-    pub fn cwd(&self) -> Option<&str> {
-        self.stats.cwd.as_deref()
     }
 
     /// Ask for the saved lists again (on connect, after a rename, a resume,
@@ -754,10 +689,9 @@ impl Model {
     /// attached one is read from its own transcript (answered prompts, a
     /// turn that just ended), which runs ahead of the 3-second poll.
     pub fn fact(&self, s: &SessionMeta) -> State {
-        let (needs, busy) = if self.is_active(&s.id) {
-            (!self.transcript.pending_prompts().is_empty(), self.transcript.busy())
-        } else {
-            (s.awaiting_input > 0, s.busy)
+        let (needs, busy) = match self.lives.on(&s.id) {
+            Some(l) => (!l.transcript.pending_prompts().is_empty(), l.transcript.busy()),
+            None => (s.awaiting_input > 0, s.busy),
         };
         if needs {
             State::NeedsYou
@@ -783,17 +717,19 @@ impl Model {
     /// listing's count ([`SessionMeta::workers_running`]: `workers.running`
     /// or `subagents_running`, 0 from a daemon that sends neither).
     pub fn workers(&self, s: &SessionMeta) -> usize {
-        let own = &self.stats.subagents;
-        if self.is_active(&s.id) && own.heard() { own.running_count() } else { s.workers_running() }
+        match self.lives.on(&s.id).map(|l| &l.stats.subagents) {
+            Some(own) if own.heard() => own.running_count(),
+            _ => s.workers_running(),
+        }
     }
 
-    /// The attached session's workers running ([`Model::workers`]; not
+    /// Store `live`'s session's workers running ([`Model::workers`]; not
     /// listed yet, a create: its transcript's). Nothing attached (a cached
     /// tab on its way back, a detach): none, never a count last seen.
-    pub fn active_workers(&self) -> usize {
-        match self.active_meta() {
+    pub fn active_workers(&self, live: LiveId) -> usize {
+        match self.active_meta(live) {
             Some(s) => self.workers(s),
-            None if self.active.is_some() => self.stats.subagents.running_count(),
+            None if self.lives[live].active.is_some() => self.lives[live].stats.subagents.running_count(),
             None => 0,
         }
     }
@@ -811,7 +747,8 @@ impl Model {
     /// Under a chip: its state; a row clicked under the chip stays where
     /// it was until its attach lands, whatever its state does meanwhile.
     pub fn chip_shows(&self, chip: Chip, s: &SessionMeta) -> bool {
-        chip.admits(self.fact(s)) || (self.opening(s) && self.is_wanted(&s.id) && self.wanted_fact.is_some_and(|f| chip.admits(f)))
+        chip.admits(self.fact(s))
+            || (self.opening(s) && self.lives.iter().any(|l| l.is_wanted(&s.id) && l.wanted_fact.is_some_and(|f| chip.admits(f))))
     }
 
     fn is_unread(&self, s: &SessionMeta) -> bool {
@@ -934,8 +871,9 @@ impl Model {
         }
     }
 
+    /// A live store is attached to this session.
     pub fn is_active(&self, session_id: &str) -> bool {
-        self.active.as_ref().is_some_and(|a| a.session_id == session_id)
+        self.lives.on(session_id).is_some()
     }
 
     /// Live sessions waiting on the user (a question, a secret, a tool-call
@@ -957,15 +895,15 @@ impl Model {
         self.ticker().map(|s| s.id.as_str()).filter(|id| !self.is_active(id))
     }
 
-    /// The active session's list entry.
-    pub fn active_meta(&self) -> Option<&SessionMeta> {
-        let a = self.active.as_ref()?;
+    /// Store `live`'s session's list entry.
+    pub fn active_meta(&self, live: LiveId) -> Option<&SessionMeta> {
+        let a = self.lives[live].active.as_ref()?;
         self.sessions.iter().find(|s| s.id == a.session_id)
     }
 
-    /// The active session's name, if it has one.
-    pub fn active_name(&self) -> Option<&str> {
-        let a = self.active.as_ref()?;
+    /// Store `live`'s session's name, if it has one.
+    pub fn active_name(&self, live: LiveId) -> Option<&str> {
+        let a = self.lives[live].active.as_ref()?;
         self.sessions.iter().find(|s| s.id == a.session_id)?.name.as_deref().filter(|n| !n.is_empty())
     }
 
@@ -1127,16 +1065,16 @@ impl Model {
     }
 
     /// `Effect::Attach` went out as `attach_seq`.
-    pub fn attaching(&mut self, attach_seq: u64, fallback: Option<ResumeRequest>, open: bool) {
+    pub fn attaching(&mut self, live: LiveId, attach_seq: u64, fallback: Option<ResumeRequest>, open: bool) {
         self.sent_open(attach_seq, open);
-        self.want(attach_seq);
+        self.want(live, attach_seq);
         self.named.attaching = fallback.map(|f| (attach_seq, f));
     }
 
     /// `Effect::Resume` went out as `attach_seq`.
-    pub fn resuming(&mut self, req: ResumeRequest, attach_seq: u64, open: bool) {
+    pub fn resuming(&mut self, live: LiveId, req: ResumeRequest, attach_seq: u64, open: bool) {
         self.sent_open(attach_seq, open);
-        self.want(attach_seq);
+        self.want(live, attach_seq);
         self.named.error = None;
         self.named.resuming = Some(Resuming { req, attach_seq });
     }
@@ -1159,15 +1097,15 @@ impl Model {
     /// a time; the name it already has closes the row. Asks for an unnamed
     /// session (`Expect::Unnamed`): a named one is refused with its name,
     /// and the user is offered to replace it.
-    pub fn rename_request(&mut self, typed: &str) -> Option<RenameRequest> {
+    pub fn rename_request(&mut self, live: LiveId, typed: &str) -> Option<RenameRequest> {
         if self.named.rename.is_some() {
             return None;
         }
         let name = typed.trim();
-        let same = self.active_name() == Some(name);
+        let same = self.active_name(live) == Some(name);
         let n = &mut self.named;
         n.replace = None;
-        let Some(a) = &self.active else {
+        let Some(a) = &self.lives[live].active else {
             n.rename_error = Some("Not attached to a session.".into());
             return None;
         };
@@ -1206,10 +1144,11 @@ impl Model {
     /// section (a resume, an Open by name, the naming row and its Replace
     /// offer) belonged to it and goes; a rename already sent still gets
     /// its answer.
-    pub fn want(&mut self, attach_seq: u64) {
-        self.wanted = Some(attach_seq);
-        self.wanted_session = None;
-        self.wanted_fact = None;
+    pub fn want(&mut self, live: LiveId, attach_seq: u64) {
+        let l = &mut self.lives[live];
+        l.wanted = Some(attach_seq);
+        l.wanted_session = None;
+        l.wanted_fact = None;
         self.rail_gen += 1;
         let n = &mut self.named;
         n.resuming.take_if(|r| r.attach_seq != attach_seq);
@@ -1221,20 +1160,17 @@ impl Model {
     }
 
     /// The attach just asked for (after [`Model::want`]) is of this session.
-    pub fn asked_for(&mut self, session_id: &str) {
-        self.wanted_session = Some(session_id.to_string());
-        self.wanted_fact = self.sessions.iter().find(|s| s.id == session_id).map(|s| self.fact(s));
+    pub fn asked_for(&mut self, live: LiveId, session_id: &str) {
+        let fact = self.sessions.iter().find(|s| s.id == session_id).map(|s| self.fact(s));
+        let l = &mut self.lives[live];
+        l.wanted_session = Some(session_id.to_string());
+        l.wanted_fact = fact;
     }
 
-    /// The last attach asked for this session (attached or on its way): a
-    /// click on it again has nothing to do.
+    /// The last attach a live store asked for is of this session (attached
+    /// or on its way): a click on it again has nothing to do.
     pub fn is_wanted(&self, session_id: &str) -> bool {
-        self.wanted_session.as_deref() == Some(session_id)
-    }
-
-    /// The session asked for last (attached, or on its way).
-    pub fn wanted_session(&self) -> Option<&str> {
-        self.wanted_session.as_deref()
+        self.lives.iter().any(|l| l.is_wanted(session_id))
     }
 
     /// The visible tab shows this session (the rail's marker).
@@ -1248,25 +1184,26 @@ impl Model {
     /// attachment carries over. Until the next session attaches nothing
     /// can be sent, answered or halted (`active` is `None`): no input, no
     /// card, no HALT can reach the session left or the one to come.
-    pub fn switch_out(&mut self) -> (Transcript, Stats) {
-        self.saw_active();
-        self.wanted = None;
-        self.wanted_session = None;
-        self.wanted_fact = None;
-        self.answered.clear();
+    pub fn switch_out(&mut self, live: LiveId) -> (Transcript, Stats) {
+        self.saw_active(live);
+        let l = &mut self.lives[live];
+        l.wanted = None;
+        l.wanted_session = None;
+        l.wanted_fact = None;
+        l.answered.clear();
         // Sent to the session left: its echo or refusal still comes, under
         // that attachment's seq; a refusal goes back to that tab's draft.
-        if let Some(a) = self.active.take()
-            && !self.in_flight.is_empty()
+        if let Some(a) = l.active.take()
+            && !l.in_flight.is_empty()
         {
             if self.left.len() == LEFT_MAX {
                 self.left.remove(0);
             }
-            self.left.push((a.attach_seq, a.session_id, std::mem::take(&mut self.in_flight)));
+            self.left.push((a.attach_seq, a.session_id, std::mem::take(&mut l.in_flight)));
         }
-        self.in_flight.clear();
-        self.reattaching = false;
-        self.last_error = None;
+        l.in_flight.clear();
+        l.reattaching = false;
+        l.last_error = None;
         let n = &mut self.named;
         n.naming = false;
         n.replace = None;
@@ -1278,25 +1215,29 @@ impl Model {
         self.rail_gen += 1;
         self.view_dirty = true;
         // Its worker views go with it (the view takes them); nothing polls.
-        self.watch.suspend();
-        (std::mem::take(&mut self.transcript), std::mem::take(&mut self.stats))
+        let l = &mut self.lives[live];
+        l.watch.suspend();
+        (std::mem::take(&mut l.transcript), std::mem::take(&mut l.stats))
     }
 
     /// The visible tab's session, as last seen (a cached tab) or nothing
     /// yet; its attach follows.
-    pub fn switch_in(&mut self, transcript: Transcript, stats: Stats) {
-        self.transcript = transcript;
-        self.stats = stats;
+    pub fn switch_in(&mut self, live: LiveId, transcript: Transcript, stats: Stats) {
+        let l = &mut self.lives[live];
+        l.transcript = transcript;
+        l.stats = stats;
         self.view_dirty = true;
     }
 
     /// The visible tab shows `session_id`, whose attach is deferred (a burst
     /// of tab switches attaches once): OPENING meanwhile, a click on it is
     /// a no-op.
-    pub fn showing(&mut self, session_id: &str) {
-        self.wanted = None;
-        self.wanted_session = Some(session_id.to_string());
-        self.wanted_fact = self.sessions.iter().find(|s| s.id == session_id).map(|s| self.fact(s));
+    pub fn showing(&mut self, live: LiveId, session_id: &str) {
+        let fact = self.sessions.iter().find(|s| s.id == session_id).map(|s| self.fact(s));
+        let l = &mut self.lives[live];
+        l.wanted = None;
+        l.wanted_session = Some(session_id.to_string());
+        l.wanted_fact = fact;
         self.rail_gen += 1;
     }
 
@@ -1312,12 +1253,14 @@ impl Model {
     }
 
     /// A local session (benches): its events carry [`LOCAL_SEQ`].
-    pub fn set_local_session(&mut self, session_id: &str) {
-        self.wanted = Some(LOCAL_SEQ);
-        self.wanted_session = Some(session_id.into());
+    pub fn local_session(&mut self, live: LiveId, session_id: &str) {
+        let l = &mut self.lives[live];
+        l.wanted = Some(LOCAL_SEQ);
+        l.wanted_session = Some(session_id.into());
         self.tabs.attached(session_id);
         self.epoch += 1;
-        self.active = Some(Active {
+        let l = &mut self.lives[live];
+        l.active = Some(Active {
             session_id: session_id.into(),
             attach_seq: LOCAL_SEQ,
             epoch: self.epoch,
@@ -1327,57 +1270,19 @@ impl Model {
             owner: None,
             input: ClientInput::Shared,
         });
-        self.stats = Stats::default();
+        l.stats = Stats::default();
     }
 
-    /// Attached, connected and allowed to drive, and no switch under way:
-    /// while another attachment is on its way (`wanted` is not the active
-    /// one), input, answers and HALT would reach that one, not the session
-    /// on screen (the connection thread routes them to its latest attach).
-    /// The attachment input goes to: the session on screen, attached and
-    /// the one asked for last (what [`Model::can_send`] checks). Every send
-    /// names its attachment (`client.on(seq)`, split panes §6.4).
-    pub fn attachment(&self) -> Option<u64> {
-        self.active.as_ref().map(|a| a.attach_seq).filter(|&s| self.wanted == Some(s))
-    }
-
-    /// The attachment asked for last (attached or on its way): where a
-    /// worker poll or a detach goes.
-    pub fn wanted(&self) -> Option<u64> {
-        self.wanted
-    }
-
-    pub fn can_send(&self) -> bool {
-        self.active.as_ref().is_some_and(|a| a.mode != AttachMode::Observe && self.wanted == Some(a.attach_seq)) && !self.reattaching
-    }
-
-    /// Whether this window may send the session on screen input (steer or
-    /// cancel its workers), else the reason that applies: the daemon's
-    /// rule (`exclusive`: the input owner only; `shared`: every client but
-    /// an observer), and no reconnect or switch under way.
-    pub fn input_gate(&self) -> Result<(), &'static str> {
-        let Some(a) = self.active.as_ref() else { return Err("not attached") };
-        if self.reattaching {
-            return Err("reconnecting to the session: try again in a moment");
-        }
-        if self.switching() {
-            return Err("switching sessions: try again in a moment");
-        }
-        if a.mode == AttachMode::Observe {
-            return Err("read-only: this window observes the session");
-        }
-        if !self.can_send() {
-            return Err("not connected to the session: try again in a moment");
-        }
-        if a.input == ClientInput::Exclusive && a.owner != Some(a.client) {
-            return Err("read-only here: another client owns this session's input");
-        }
-        Ok(())
+    /// [`Model::local_session`] in the one store (tests only, as the
+    /// protected tests call it).
+    #[cfg(test)]
+    pub fn set_local_session(&mut self, session_id: &str) {
+        self.local_session(LiveId::FIRST, session_id)
     }
 
     /// A worker tab of the session on screen shows `handle`.
-    pub fn holds_view(&self, handle: &str) -> bool {
-        let Some(s) = self.active.as_ref().map(|a| a.session_id.as_str()) else { return false };
+    pub fn holds_view(&self, live: LiveId, handle: &str) -> bool {
+        let Some(s) = self.lives[live].active.as_ref().map(|a| a.session_id.as_str()) else { return false };
         self.tabs.iter().any(|t| {
             t.kind == crate::tabs::Kind::Worker && t.session.as_deref() == Some(s) && t.worker.as_ref().is_some_and(|w| w.handle == handle)
         })
@@ -1385,8 +1290,8 @@ impl Model {
 
     /// The handles the session on screen's open worker tabs show: their
     /// views stay while the tabs do ([`Watch::hold`]).
-    pub fn held_views(&self) -> Vec<String> {
-        let Some(s) = self.active.as_ref().map(|a| a.session_id.as_str()) else { return Vec::new() };
+    pub fn held_views(&self, live: LiveId) -> Vec<String> {
+        let Some(s) = self.lives[live].active.as_ref().map(|a| a.session_id.as_str()) else { return Vec::new() };
         self.tabs
             .iter()
             .filter(|t| t.kind == crate::tabs::Kind::Worker && t.session.as_deref() == Some(s))
@@ -1394,72 +1299,21 @@ impl Model {
             .collect()
     }
 
-    /// A switch to another attachment is under way.
-    pub fn switching(&self) -> bool {
-        self.wanted.is_some() && self.wanted != self.active.as_ref().map(|a| a.attach_seq)
-    }
-
-    /// The prompt the authorization card shows, as `(epoch, prompt id)`:
-    /// the attached session's first pending one.
-    pub fn card_key(&self) -> Option<(u64, u64)> {
-        Some((self.active.as_ref()?.epoch, self.transcript.pending_prompts().first()?.id))
-    }
-
-    /// Prompt `id` of the session on screen may be answered now.
-    pub fn may_answer(&self, prompt_id: u64) -> bool {
-        self.can_send() && !self.prompt_answered(prompt_id) && self.transcript.pending_prompts().iter().any(|p| p.id == prompt_id)
-    }
-
-    /// An answer to prompt `id` of the session on screen went out.
-    pub fn prompt_answered(&self, prompt_id: u64) -> bool {
-        self.active.as_ref().is_some_and(|a| self.answered.contains(&(a.epoch, prompt_id)))
-    }
-
-    /// The answer to prompt `id` went to the daemon.
-    pub fn answer_sent(&mut self, prompt_id: u64) {
-        if let Some(a) = &self.active {
-            self.answered.insert((a.epoch, prompt_id));
-        }
-    }
-
-    /// `text` went to the daemon. A turn the user sent and then left
-    /// running is still news when it ends off screen (the reply is what
-    /// they are waiting for); one they watched to its end is in `seen`.
-    pub fn sent(&mut self, text: String) {
-        self.in_flight.push_back(text);
-    }
-
     /// The session on screen as the user sees it (its transcript): the
     /// baseline UNREAD compares the next poll with.
-    fn saw_active(&mut self) {
-        let Some(a) = &self.active else { return };
-        if self.transcript.session_id() != Some(a.session_id.as_str()) {
+    fn saw_active(&mut self, live: LiveId) {
+        let l = &self.lives[live];
+        let Some(a) = &l.active else { return };
+        if l.transcript.session_id() != Some(a.session_id.as_str()) {
             return;
         }
-        let now = (self.transcript.history_len(), self.transcript.busy());
+        let now = (l.transcript.history_len(), l.transcript.busy());
         match self.seen.get_mut(&a.session_id) {
             Some(e) => *e = now,
             None => {
                 self.seen.insert(a.session_id.clone(), now);
             }
         }
-    }
-
-    /// Worker `handle_id`'s view, just polled, tells the attached
-    /// session's list what its pages say: one state per worker, whichever
-    /// source heard it first ([`crate::subagents::Subagents::heard_page`]).
-    /// Only a view of the worker the handle names now (a cold-started
-    /// daemon numbers from 1 again: a stale view says nothing of the new
-    /// one), and not one gone (offline is not how it ended). Whether the
-    /// list changed.
-    pub fn heard_view(&mut self, handle_id: &str, word: &str) -> bool {
-        let Some(id) = handle_id.strip_prefix("sa_").and_then(|n| n.parse::<u64>().ok()) else { return false };
-        let Some(w) = self.watch.worker(handle_id).filter(|w| w.gone.is_none()) else { return false };
-        if self.stats.subagents.ident(id).is_some_and(|now| !crate::wtabs::same_worker(w.key(), now)) {
-            return false;
-        }
-        let Some(status) = crate::subagents::Status::word(word) else { return false };
-        self.stats.subagents.heard_page(id, status)
     }
 
     /// UNREAD marks of sessions in no list (closed, or past what is listed).
@@ -1471,30 +1325,12 @@ impl Model {
         self.unread.retain(|k| sessions.iter().any(|s| s.is(k)) || n.saved.iter().chain(&n.recent).any(|v| v.id == *k));
     }
 
-    fn current(&self, attach_seq: u64) -> bool {
-        self.wanted == Some(attach_seq)
-    }
-
-    /// A refusal: the oldest unconfirmed text was refused (the daemon
-    /// handles input in order, and earlier echoes confirmed the rest).
-    fn give_back_oldest(&mut self, effects: &mut Vec<Effect>) {
-        if let Some(t) = self.in_flight.pop_front() {
-            effects.push(Effect::Restore(t));
-        }
-    }
-
-    fn give_back_all(&mut self, effects: &mut Vec<Effect>) {
-        if !self.in_flight.is_empty() {
-            effects.push(Effect::Restore(Vec::from(std::mem::take(&mut self.in_flight)).join("\n")));
-        }
-    }
-
     /// An event of an attachment a tab switch left, while it still has
     /// input unconfirmed: an echo confirms it, a refusal gives the oldest
     /// back, the end gives back the rest (to that tab's draft). `None`:
     /// not one of those.
     fn left_event(&mut self, ev: &Event) -> Option<Vec<Effect>> {
-        let seq = ev.attach_seq().filter(|&s| !self.current(s))?;
+        let seq = ev.attach_seq().filter(|&s| self.lives.wanting(s).is_none())?;
         let i = self.left.iter().position(|l| l.0 == seq)?;
         let mut effects = Vec::new();
         let (_, session, texts) = &mut self.left[i];
@@ -1526,6 +1362,11 @@ impl Model {
         if let Some(effects) = self.left_event(&ev) {
             return effects;
         }
+        // The store that asked for this attachment. Every arm below that
+        // acts on a store checks `current(seq)` on it first, so an event of
+        // no store's attachment (a stale one) changes nothing; one that
+        // names no attachment acts on the one store there is.
+        let lid = ev.attach_seq().and_then(|s| self.lives.wanting(s)).unwrap_or_else(|| self.lives.sole());
         let mut effects = Vec::new();
         let ev = match ev {
             Event::Sessions(mut s) => {
@@ -1545,11 +1386,11 @@ impl Model {
             // shows (an idle worker's empty pages, 4 a second, draw
             // nothing), and nothing of the rail's.
             Event::SubagentWatch { attach_seq, handle_id, since, reply, .. } => {
-                if self.current(attach_seq) {
-                    let heard = self.watch.on_reply(&handle_id, since, reply, std::time::Instant::now());
+                if self.lives[lid].current(attach_seq) {
+                    let heard = self.lives[lid].watch.on_reply(&handle_id, since, reply, std::time::Instant::now());
                     // The page it took is a live source of the session's
                     // list too (a reply it dropped says nothing).
-                    let fed = heard.page.as_deref().is_some_and(|word| self.heard_view(&handle_id, word));
+                    let fed = heard.page.as_deref().is_some_and(|word| self.lives[lid].heard_view(&handle_id, word));
                     match heard.page.as_deref() {
                         Some(word) if fed => {
                             log::debug!(target: "synaps_desktop::workers", "{handle_id}@{since}: its page says {word}: the list takes it")
@@ -1567,31 +1408,31 @@ impl Model {
             }
             // A poll that could not go: again later (nothing shows it).
             Event::Error { error: Error::Refused { command: Some(c), .. }, .. } if c == "subagent_watch" => {
-                self.watch.poll_failed(std::time::Instant::now());
+                self.lives[lid].watch.poll_failed(std::time::Instant::now());
                 return effects;
             }
             Event::Error { error: Error::NotAttached { command: "subagent_watch" }, .. } => {
-                self.watch.poll_failed(std::time::Instant::now());
+                self.lives[lid].watch.poll_failed(std::time::Instant::now());
                 return effects;
             }
             Event::Error { error: Error::Decode(d), .. } if d.kind == "query_result:subagent_watch" => return effects,
             // A worker steer refused: its view says why and keeps the text
             // for the composer ([`Watch::take_unsent`]).
             Event::Error { attach_seq, error: Error::Refused { command: Some(c), reason } }
-                if c == "subagent_steer" && attach_seq.is_none_or(|s| self.current(s)) =>
+                if c == "subagent_steer" && attach_seq.is_none_or(|s| self.lives[lid].current(s)) =>
             {
-                self.view_dirty |= self.watch.steer_refused(&reason);
+                self.view_dirty |= self.lives[lid].watch.steer_refused(&reason);
                 return effects;
             }
             Event::Error { error: Error::NotAttached { command: "subagent_steer" }, .. } => {
-                self.view_dirty |= self.watch.steer_refused("not attached to the session");
+                self.view_dirty |= self.lives[lid].watch.steer_refused("not attached to the session");
                 return effects;
             }
             // A worker cancel answered: done, its rows will say so (it is
             // `cancelling` until then); not done, the composer's note says why.
             Event::WorkerCancel { attach_seq, handle_id, result } => {
                 log::debug!(target: "synaps_desktop::watch", "cancel {handle_id}: {result:?}");
-                if let Some(note) = self.cancels.answered(attach_seq, &handle_id, &result) {
+                if let Some(note) = self.lives[lid].cancels.answered(attach_seq, &handle_id, &result) {
                     effects.push(Effect::WorkerNote(note));
                     self.view_dirty = true;
                 }
@@ -1604,11 +1445,11 @@ impl Model {
             // switch since) says nothing here.
             Event::EngineReply { attach_seq, name, reply } => {
                 log::debug!(target: "synaps_desktop::send", "/{name}: {reply:?}");
-                if self.active.as_ref().is_some_and(|a| a.attach_seq == attach_seq) {
+                if self.lives[lid].active.as_ref().is_some_and(|a| a.attach_seq == attach_seq) {
                     if let synaps_client::CommandReply::Done(text) = &reply
                         && !text.trim().is_empty()
                     {
-                        self.transcript.output(&name, text);
+                        self.lives[lid].transcript.output(&name, text);
                     }
                     effects.push(Effect::Command { name, reply });
                     self.view_dirty = true;
@@ -1633,9 +1474,9 @@ impl Model {
                     self.daemon_gen += 1;
                     // Another daemon process: the worker on screen is read
                     // from 0, even before its session's attach comes back.
-                    let held = self.held_views();
-                    self.watch.hold(held);
-                    self.watch.daemon_changed(*pid, std::time::Instant::now());
+                    let held = self.held_views(lid);
+                    self.lives[lid].watch.hold(held);
+                    self.lives[lid].watch.daemon_changed(*pid, std::time::Instant::now());
                     self.named.daemon = match profile {
                         Some(p) => format!("the daemon's machine (profile {p})"),
                         None => "the daemon's machine".into(),
@@ -1674,7 +1515,7 @@ impl Model {
                 }
             }
             Event::Sessions(s) => {
-                self.saw_active();
+                self.saw_active(lid);
                 // UNREAD: off screen, a turn ended or messages came that the
                 // user has not seen (their own turns too, if they left them
                 // running). Not news: a session a TUI is attached to (it is
@@ -1751,7 +1592,7 @@ impl Model {
                     return effects;
                 }
                 let msg = crate::named::rename_message(&f, &asked);
-                if self.active.as_ref().is_some_and(|a| a.session_id == f.session_id) {
+                if self.lives[lid].active.as_ref().is_some_and(|a| a.session_id == f.session_id) {
                     // Shown in the naming row, opened again if it was closed.
                     let n = &mut self.named;
                     n.naming = true;
@@ -1766,10 +1607,10 @@ impl Model {
                     self.named.error = Some(format!("Naming a session '{asked}': {msg}"));
                 }
             }
-            Event::CwdFallback { attach_seq, missing, .. } if self.current(attach_seq) => {
+            Event::CwdFallback { attach_seq, missing, .. } if self.lives[lid].current(attach_seq) => {
                 self.named.notice = Some(format!("Folder {missing} is gone on {}; resumed in ~.", self.named.daemon));
             }
-            Event::Attached { attach_seq, attached, mode, .. } if self.current(attach_seq) => {
+            Event::Attached { attach_seq, attached, mode, .. } if self.lives[lid].current(attach_seq) => {
                 let resumed = self.named.resuming.take_if(|r| r.attach_seq == attach_seq);
                 if let Some(r) = &resumed {
                     // The daemon's resolver took a chain of that name, or
@@ -1828,7 +1669,7 @@ impl Model {
                     });
                 }
                 // The one on screen until now, as the user saw it.
-                self.saw_active();
+                self.saw_active(lid);
                 // Opened: read.
                 self.unread.remove(&attached.meta.id);
                 self.unread.remove(&attached.meta.journal_id);
@@ -1841,8 +1682,8 @@ impl Model {
                 self.epoch += 1;
                 // The session this attach was asked for (`asked_for`,
                 // `showing`), before it becomes the one that attached.
-                let asked = self.wanted_session.take();
-                self.active = Some(Active {
+                let asked = self.lives[lid].wanted_session.take();
+                self.lives[lid].active = Some(Active {
                     session_id: attached.meta.id.clone(),
                     attach_seq,
                     epoch: self.epoch,
@@ -1852,51 +1693,51 @@ impl Model {
                     owner: attached.input_owner,
                     input: attached.client_input,
                 });
-                self.wanted_session = Some(attached.meta.id.clone());
+                self.lives[lid].wanted_session = Some(attached.meta.id.clone());
                 // The visible tab holds what attached (a create or a resume
                 // names it here).
                 self.tabs.attached(&attached.meta.id);
                 // Whatever was answered belongs to the attachment before.
-                self.answered.clear();
-                self.reattaching = false;
-                self.last_error = None;
+                self.lives[lid].answered.clear();
+                self.lives[lid].reattaching = false;
+                self.lives[lid].last_error = None;
                 // Another session's worker views mean nothing here; the
                 // same session's (a reconnect, its tab back) watch again.
                 // So does the view of a tab whose cache missed: its
                 // transcript is new (no session yet), its view what the tab
                 // showed when it was left, for the session asked for. A
                 // follow to a new id (a resume's fallback) still resets.
-                if self.transcript.session_id().or(asked.as_deref()) != Some(attached.meta.id.as_str()) {
-                    self.watch = Watch::default();
+                if self.lives[lid].transcript.session_id().or(asked.as_deref()) != Some(attached.meta.id.as_str()) {
+                    self.lives[lid].watch = crate::watch::Watch::default();
                 }
-                let held = self.held_views();
-                self.watch.hold(held);
-                self.watch.on_reconnect(std::time::Instant::now(), self.daemon.as_ref().map(|d| d.pid));
-                if let Err(e) = self.transcript.load_attached(&attached) {
-                    self.last_error = Some(e.to_string());
+                let held = self.held_views(lid);
+                self.lives[lid].watch.hold(held);
+                self.lives[lid].watch.on_reconnect(std::time::Instant::now(), self.daemon.as_ref().map(|d| d.pid));
+                if let Err(e) = self.lives[lid].transcript.load_attached(&attached) {
+                    self.lives[lid].last_error = Some(e.to_string());
                 }
-                self.stats.on_attached(&attached);
+                self.lives[lid].stats.on_attached(&attached);
                 effects.push(Effect::ListSessions);
             }
-            Event::Reattaching { attach_seq, .. } if self.current(attach_seq) => self.reattaching = true,
-            Event::InputOwner { attach_seq, client, owner, .. } if self.current(attach_seq) => {
-                if let Some(a) = self.active.as_mut() {
+            Event::Reattaching { attach_seq, .. } if self.lives[lid].current(attach_seq) => self.lives[lid].reattaching = true,
+            Event::InputOwner { attach_seq, client, owner, .. } if self.lives[lid].current(attach_seq) => {
+                if let Some(a) = self.lives[lid].active.as_mut() {
                     (a.client, a.owner) = (client, owner);
                     self.view_dirty = true;
                 }
             }
-            Event::Session { attach_seq, ts, event, raw, .. } if self.current(attach_seq) => {
+            Event::Session { attach_seq, ts, event, raw, .. } if self.lives[lid].current(attach_seq) => {
                 // The engine's note of a worker steer in the main conversation.
                 if raw["ev"] == "external" && raw["event"]["content"]["content_type"] == "subagent_steer" {
-                    self.watch.steer_accepted(raw["event"]["content"]["data"]["handle_id"].as_str().unwrap_or(""));
+                    self.lives[lid].watch.steer_accepted(raw["event"]["content"]["data"]["handle_id"].as_str().unwrap_or(""));
                 }
-                self.stats.on_session(&event, &raw);
+                self.lives[lid].stats.on_session(&event, &raw);
                 // After a swap (a compaction, `/clear`, `/resume`): only a
                 // compaction's successor names its parent. The journal it
                 // holds now, at once (the listing is polled).
                 if let SessionEvent::Conversation { digest } = &event {
                     if let Some(id) = digest.header.get("id").and_then(serde_json::Value::as_str)
-                        && let Some(a) = self.active.as_ref().map(|a| a.session_id.clone())
+                        && let Some(a) = self.lives[lid].active.as_ref().map(|a| a.session_id.clone())
                     {
                         self.holds(&a, id);
                     }
@@ -1906,35 +1747,36 @@ impl Model {
                 }
                 match &event {
                     SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. } => {
-                        if let Some(i) = self.in_flight.iter().position(|s| s.trim() == t.trim()) {
-                            self.in_flight.remove(i);
+                        if let Some(i) = self.lives[lid].in_flight.iter().position(|s| s.trim() == t.trim()) {
+                            self.lives[lid].in_flight.remove(i);
                         }
                     }
                     _ => {}
                 }
-                self.transcript.apply_at(&event, &ts);
-                if !self.answered.is_empty() {
-                    let pending = self.transcript.pending_prompts();
-                    self.answered.retain(|(_, id)| pending.iter().any(|p| p.id == *id));
+                self.lives[lid].transcript.apply_at(&event, &ts);
+                let l = &mut self.lives[lid];
+                if !l.answered.is_empty() {
+                    let pending = l.transcript.pending_prompts();
+                    l.answered.retain(|(_, id)| pending.iter().any(|p| p.id == *id));
                 }
             }
-            Event::History { attach_seq, update, .. } if self.current(attach_seq) => {
-                if self.transcript.apply_update(&update).is_err() {
+            Event::History { attach_seq, update, .. } if self.lives[lid].current(attach_seq) => {
+                if self.lives[lid].transcript.apply_update(&update).is_err() {
                     effects.push(Effect::Resync(attach_seq));
                 } else {
-                    self.stats.on_history(&update);
+                    self.lives[lid].stats.on_history(&update);
                 }
             }
-            Event::Detached { attach_seq, reason, .. } if self.current(attach_seq) => {
-                self.saw_active();
-                self.active = None;
-                self.wanted_session = None;
-                self.answered.clear();
-                self.reattaching = false;
-                self.transcript.set_detached();
-                self.stats.on_detached();
-                self.watch.suspend();
-                self.give_back_all(&mut effects);
+            Event::Detached { attach_seq, reason, .. } if self.lives[lid].current(attach_seq) => {
+                self.saw_active(lid);
+                self.lives[lid].active = None;
+                self.lives[lid].wanted_session = None;
+                self.lives[lid].answered.clear();
+                self.lives[lid].reattaching = false;
+                self.lives[lid].transcript.set_detached();
+                self.lives[lid].stats.on_detached();
+                self.lives[lid].watch.suspend();
+                self.lives[lid].give_back_all(&mut effects);
                 let n = &mut self.named;
                 // A named live session that ended since the last list:
                 // resume its journal (an Open by name keeps waiting).
@@ -1971,7 +1813,7 @@ impl Model {
                     }
                     None => match opening {
                         Some(o) => n.error = Some(format!("Could not open '{}': {reason}", o.name)),
-                        None => self.last_error = Some(format!("detached: {reason}")),
+                        None => self.lives[lid].last_error = Some(format!("detached: {reason}")),
                     },
                 }
             }
@@ -1983,19 +1825,19 @@ impl Model {
                     self.open_by_resolver(&mut effects);
                 }
             }
-            Event::Error { attach_seq, error } if attach_seq.is_none_or(|s| self.current(s)) => {
+            Event::Error { attach_seq, error } if attach_seq.is_none_or(|s| self.lives[lid].current(s)) => {
                 // An answer the daemon may not have got (a refusal that names
                 // no command could be one): the card asks again. A repeat is
                 // harmless, the daemon takes the first answer per prompt.
                 let answer = matches!(&error, Error::Refused { command: Some(c), .. } if c == "answer")
                     || matches!(&error, Error::NotAttached { command: "answer" });
                 if answer || matches!(&error, Error::Refused { command: None, .. }) {
-                    self.answered.clear();
+                    self.lives[lid].answered.clear();
                 }
                 if refused_input(&error) {
-                    self.give_back_oldest(&mut effects);
+                    self.lives[lid].give_back_oldest(&mut effects);
                 }
-                self.last_error = Some(error.to_string());
+                self.lives[lid].last_error = Some(error.to_string());
             }
             _ => {}
         }
@@ -2051,7 +1893,7 @@ mod tests {
     }
 
     fn attach(m: &mut Model, seq: u64) {
-        m.want(seq);
+        m.want(LiveId::FIRST, seq);
         m.apply(Event::Attached { attach_seq: seq, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
     }
 
@@ -2101,7 +1943,7 @@ mod tests {
         };
         m.apply(Event::Attached { attach_seq: 1, attached: a.clone(), mode: AttachMode::Mirror, reconnect: true });
         assert_eq!(m.input_gate(), Ok(()));
-        m.want(2);
+        m.want(LiveId::FIRST, 2);
         m.apply(Event::Attached { attach_seq: 2, attached: a, mode: AttachMode::Observe, reconnect: false });
         assert_eq!(m.input_gate(), Err("read-only: this window observes the session"));
     }
@@ -2119,10 +1961,10 @@ mod tests {
         m.named.resuming = Some(Resuming { req: req("j"), attach_seq: 2 });
         m.named.attaching = Some((2, req("k")));
         m.named.opening = Some(opening(Some(2)));
-        let _ = m.switch_out();
+        let _ = m.switch_out(LiveId::FIRST);
         assert!(m.named.resuming.is_none() && m.named.attaching.is_none() && m.named.opening.is_none());
         m.named.opening = Some(opening(None));
-        let _ = m.switch_out();
+        let _ = m.switch_out(LiveId::FIRST);
         assert!(m.named.opening.is_some(), "not sent yet: still to open");
     }
 
@@ -2143,7 +1985,7 @@ mod tests {
         assert!(m.is_active("s"));
         assert_eq!(m.state(&m.sessions[0]), State::Idle);
         assert_eq!(m.attention().count(), 1);
-        assert_eq!(m.active_meta().map(|s| s.id.as_str()), Some("s"));
+        assert_eq!(m.active_meta(LiveId::FIRST).map(|s| s.id.as_str()), Some("s"));
         for (c, admitted) in [(Chip::NeedsYou, vec!["w"]), (Chip::Running, vec!["b"]), (Chip::Unread, vec![])] {
             let got: Vec<&str> = m.sessions.iter().filter(|s| m.chip_shows(c, s)).map(|s| s.id.as_str()).collect();
             assert_eq!(got, admitted, "{c:?}");
@@ -2316,13 +2158,13 @@ mod tests {
         m.apply(Event::Detached { attach_seq: 2, session_id: Some("s".into()), reason: "gone".into() });
         assert_eq!(m.watch.poll_due(), None);
         // Another session: its views are gone.
-        m.want(3);
+        m.want(LiveId::FIRST, 3);
         m.apply(Event::Attached { attach_seq: 3, attached: attached("other"), mode: AttachMode::Mirror, reconnect: false });
         assert_eq!((m.watch.focus(), m.watch.bytes()), (None, 0));
         // A tab left: what it hands out polls nothing.
         attach(&mut m, 4);
         m.watch.open(&Candidate::of(2, "sleeper"), None, t1);
-        let _ = m.switch_out();
+        let _ = m.switch_out(LiveId::FIRST);
         assert_eq!(m.watch.poll_due(), None, "a background tab polls nothing");
     }
 
@@ -2427,11 +2269,11 @@ mod tests {
             json!({"kind": "agent", "agent": "subagent_start", "subagent_id": 1, "agent_name": "digger", "task_preview": "dig"}),
         )));
         assert!(m.stats.subagents.running("o"));
-        assert_eq!((st(&m), m.active_workers()), (State::Running, 0));
+        assert_eq!((st(&m), m.active_workers(LiveId::FIRST)), (State::Running, 0));
         // HALT: the canceled result, the turn aborted.
         m.apply(ev(llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "o", "result": "Canceled by user"}))));
         m.apply(ev(json!({"ev": "aborted"})));
-        assert_eq!((st(&m), m.active_workers()), (State::Idle, 0), "not WORKERS");
+        assert_eq!((st(&m), m.active_workers(LiveId::FIRST)), (State::Idle, 0), "not WORKERS");
         assert_eq!(m.stats.subagents.view("o").and_then(|v| v.status), Some(crate::subagents::Status::Cancelled));
         // A background worker running on: WORKERS 1, from its own rows.
         let row = json!({"ev": "subagent_rows", "rows": [{"subagent_id": 2, "agent_name": "scout", "status": "running",
@@ -2441,16 +2283,16 @@ mod tests {
         m.apply(ev(llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "t",
             "result": json!({"handle_id": "sa_2", "agent_name": "scout", "status": "running"}).to_string()}))));
         m.apply(ev(row.clone()));
-        assert_eq!((st(&m), m.active_workers()), (State::Workers, 1));
+        assert_eq!((st(&m), m.active_workers(LiveId::FIRST)), (State::Workers, 1));
         // The tab left and shown again from the cache, its attach on the way.
-        let (t, s) = m.switch_out();
-        m.switch_in(t, s);
-        assert_eq!((m.stats.subagents.running_count(), m.active_workers()), (1, 0), "the cache's count is not shown");
+        let (t, s) = m.switch_out(LiveId::FIRST);
+        m.switch_in(LiveId::FIRST, t, s);
+        assert_eq!((m.stats.subagents.running_count(), m.active_workers(LiveId::FIRST)), (1, 0), "the cache's count is not shown");
         attach(&mut m, 2);
         m.apply(ev2(row));
-        assert_eq!(m.active_workers(), 1);
+        assert_eq!(m.active_workers(LiveId::FIRST), 1);
         m.apply(Event::Detached { attach_seq: 2, session_id: Some("s".into()), reason: "gone".into() });
-        assert_eq!(m.active_workers(), 0);
+        assert_eq!(m.active_workers(LiveId::FIRST), 0);
     }
 
     /// UNREAD is the client's: the poll saw a turn end, or messages rise,
@@ -2471,7 +2313,7 @@ mod tests {
         assert_eq!(st(&m, "s"), State::Idle, "on screen");
         let saved: SavedSession = serde_json::from_value(json!({"id": "j-u", "live": false})).unwrap();
         assert_eq!(m.saved_state(&saved), State::Unread);
-        m.want(2);
+        m.want(LiveId::FIRST, 2);
         let a = json!({"type": "attached", "client": 2, "meta": {"id": "u", "journal_id": "j-u"}, "conversation": {"api_messages": []}});
         let DaemonFrame::Attached(a) = decode_frame(&a.to_string()).unwrap() else { panic!() };
         m.apply(attached_ev(2, a));
@@ -2516,8 +2358,8 @@ mod tests {
         m.apply(Event::Sessions(three(true, true)));
         assert_eq!(under(&m, Chip::NeedsYou), ["x", "y"]);
         assert_eq!(m.open_row(&RowAction::Attach("x".into())).len(), 1);
-        m.attaching(4, None, false);
-        m.asked_for("x");
+        m.attaching(LiveId::FIRST, 4, None, false);
+        m.asked_for(LiveId::FIRST, "x");
         assert_eq!(m.state(&m.sessions[0]), State::Opening, "the glyph says so");
         assert_eq!(under(&m, Chip::NeedsYou), ["x", "y"], "x keeps its place");
         assert_eq!(m.attention().count(), 2, "the counts do not dip");
@@ -2527,8 +2369,8 @@ mod tests {
         // stays until the attach lands, then goes.
         assert_eq!(under(&m, Chip::Running), ["r"]);
         assert_eq!(m.open_row(&RowAction::Attach("r".into())).len(), 1);
-        m.attaching(5, None, false);
-        m.asked_for("r");
+        m.attaching(LiveId::FIRST, 5, None, false);
+        m.asked_for(LiveId::FIRST, "r");
         m.apply(Event::Sessions(three(true, false)));
         assert_eq!(under(&m, Chip::Running), ["r"], "on its way: stays");
         m.apply(attached_ev(5, attached("r")));
@@ -2547,8 +2389,8 @@ mod tests {
             let target = m.jump_target().unwrap().to_string();
             for fx in m.open_row(&RowAction::Attach(target)) {
                 if let Effect::Attach { session_id, .. } = &fx {
-                    m.attaching(4, None, false);
-                    m.asked_for(session_id);
+                    m.attaching(LiveId::FIRST, 4, None, false);
+                    m.asked_for(LiveId::FIRST, session_id);
                 }
                 sent.push(fx);
             }
@@ -2673,7 +2515,7 @@ mod tests {
         m.apply(session(1, turn(None)));
         m.apply(history(1, 0, 2));
         m.apply(session(1, SessionEvent::Idle));
-        m.want(2);
+        m.want(LiveId::FIRST, 2);
         m.apply(attached_ev(2, attached("b")));
         m.apply(Event::Sessions(list(false, 2, json!([]))));
         assert_eq!(st(&m), State::Idle, "seen on screen, left within the poll");
@@ -2686,7 +2528,7 @@ mod tests {
         m.apply(history(3, 0, 3));
         m.sent("do it".into());
         m.apply(session(3, turn(Some("do it"))));
-        m.want(4);
+        m.want(LiveId::FIRST, 4);
         m.apply(attached_ev(4, attached("b")));
         m.apply(Event::Sessions(list(true, 3, json!([]))));
         assert_eq!(st(&m), State::Running, "still running off screen");
@@ -2695,7 +2537,7 @@ mod tests {
         // Opened (read), then left again.
         attach(&mut m, 5);
         m.apply(history(5, 0, 7));
-        m.want(6);
+        m.want(LiveId::FIRST, 6);
         m.apply(attached_ev(6, attached("b")));
         m.apply(Event::Sessions(list(false, 7, json!([]))));
         assert_eq!(st(&m), State::Idle, "opened, read, left");
@@ -2717,9 +2559,9 @@ mod tests {
         let mut m = Model::new(ConnState::Connecting);
         m.apply(connected(&[]));
         m.apply(Event::Sessions(metas(json!([{"id": "l1", "name": "notes", "lifecycle": "live"}]))));
-        m.resuming(req("notes", "j-other", None), 3, false);
+        m.resuming(LiveId::FIRST, req("notes", "j-other", None), 3, false);
         assert_eq!(m.state(&m.sessions[0]), State::Idle);
-        m.resuming(ResumeRequest { by_name: true, ..req_("notes") }, 4, true);
+        m.resuming(LiveId::FIRST, ResumeRequest { by_name: true, ..req_("notes") }, 4, true);
         assert_eq!(m.state(&m.sessions[0]), State::Opening);
     }
 
@@ -2834,7 +2676,7 @@ mod tests {
         m.answer_sent(1);
         assert!(m.prompt_answered(1) && !m.may_answer(1), "sent once");
         // A switch: A's card is still on screen, nothing may answer it.
-        m.want(2);
+        m.want(LiveId::FIRST, 2);
         assert!(m.switching());
         assert!(!m.can_send() && !m.may_answer(1));
         // B lands with its own prompt #1: not "answered" (that was A's).
@@ -2876,20 +2718,20 @@ mod tests {
     #[test]
     fn asking_for_a_session_again_is_by_the_last_ask() {
         let mut m = Model::new(ConnState::Connected("x".into()));
-        m.want(1);
-        m.asked_for("a");
+        m.want(LiveId::FIRST, 1);
+        m.asked_for(LiveId::FIRST, "a");
         m.apply(Event::Attached { attach_seq: 1, attached: attached("a"), mode: AttachMode::Mirror, reconnect: false });
         assert!(m.is_wanted("a"));
         // Click B, then A again before B lands: A is asked for again.
-        m.want(2);
-        m.asked_for("b");
+        m.want(LiveId::FIRST, 2);
+        m.asked_for(LiveId::FIRST, "b");
         assert!(m.is_active("a") && !m.is_wanted("a"));
     }
 
     #[test]
     fn observers_and_reattaching_clients_cannot_send() {
         let mut m = Model::new(ConnState::Connecting);
-        m.want(3);
+        m.want(LiveId::FIRST, 3);
         m.apply(Event::Attached { attach_seq: 3, attached: attached("s"), mode: AttachMode::Observe, reconnect: false });
         assert!(!m.can_send());
         attach(&mut m, 4);
@@ -3114,7 +2956,7 @@ mod tests {
         assert_eq!(bebop.target, "j-bebop");
         let o = bebop.options();
         assert_eq!((o.cwd, o.fallback_cwd), (Cwd::Path("/home/u/Projects/bebop".into()), Some(Cwd::Home)));
-        m.resuming(bebop.clone(), 7, false);
+        m.resuming(LiveId::FIRST, bebop.clone(), 7, false);
         assert_eq!(state_of(&m, "bebop"), State::Opening);
         assert!(m.open_row(&row_action(&m, "bebop")).is_empty(), "L4: a double-click resumes once");
         m.apply(Event::CwdFallback { attach_seq: 7, missing: "/home/u/Projects/bebop".into(), cwd: None });
@@ -3124,12 +2966,12 @@ mod tests {
         assert!(list_saved(&fx), "the resumed session left the saved list");
         assert_eq!(m.active.as_ref().unwrap().session_id, "live-bebop");
 
-        m.resuming(req_("ghost"), 8, false);
+        m.resuming(LiveId::FIRST, req_("ghost"), 8, false);
         m.apply(detached(8, crate::named::NO_SUCH_GHOST));
         assert_eq!(m.named.error.as_deref(), Some("No session named 'ghost'."));
         assert!(m.named.resuming.is_none() && m.active.is_none() && m.last_error.is_none());
 
-        m.resuming(req("axel", "j-axel", None), 9, false);
+        m.resuming(LiveId::FIRST, req("axel", "j-axel", None), 9, false);
         m.apply(detached(9, crate::named::LOCKED_AXEL));
         assert!(m.named.error.as_deref().unwrap().contains("locked by another process"));
         // A plain detach is still a transcript error; an attach clears the
@@ -3151,9 +2993,9 @@ mod tests {
         let mut m = Model::new(ConnState::Connecting);
         m.apply(connected(&["saved_sessions"]));
         lists(&mut m, json!([{"id": "j-bebop", "name": "bebop", "live": false}]));
-        m.resuming(req("bebop", "j-bebop", None), 7, false);
+        m.resuming(LiveId::FIRST, req("bebop", "j-bebop", None), 7, false);
         assert_eq!(state_of(&m, "bebop"), State::Opening);
-        m.want(8);
+        m.want(LiveId::FIRST, 8);
         assert_eq!(state_of(&m, "bebop"), State::Saved);
         m.apply(detached(7, "replaced by another attach"));
         assert_eq!(state_of(&m, "bebop"), State::Saved);
@@ -3200,7 +3042,7 @@ mod tests {
 
         // The outcome: the input clears on `Attached`, not before.
         m.open_by_name("axel");
-        m.resuming(req("axel", "20261110-202033-e5f6", Some("/home/u/axel")), 5, true);
+        m.resuming(LiveId::FIRST, req("axel", "20261110-202033-e5f6", Some("/home/u/axel")), 5, true);
         assert!(!m.named.opened && m.named.opening.is_some());
         m.apply(attached_ev(5, attached_named("live-axel", Some("axel"))));
         assert!(m.named.opened && m.named.opening.is_none());
@@ -3222,7 +3064,7 @@ mod tests {
         let by_name = ResumeRequest { by_name: true, ..req_("fe") };
         assert_eq!(m.open_by_name("fe"), vec![Effect::Resume { req: by_name.clone(), open: true, place: Place::Current }]);
         assert_eq!((by_name.options().cwd, by_name.options().fallback_cwd), (Cwd::Home, None));
-        m.resuming(by_name.clone(), 3, true);
+        m.resuming(LiveId::FIRST, by_name.clone(), 3, true);
         let fx = m.apply(attached_ev(3, attached_named("20261110-202033-64fe", None)));
         assert_eq!(fx, [Effect::ListSessions], "stays attached");
         let notice = m.named.notice.as_deref().unwrap();
@@ -3231,14 +3073,14 @@ mod tests {
 
         let axel = ResumeRequest { by_name: true, ..req_("axel") };
         m.open_by_name("axel");
-        m.resuming(axel, 4, true);
+        m.resuming(LiveId::FIRST, axel, 4, true);
         m.apply(attached_ev(4, attached_named("s-axel", Some("axel"))));
         assert!(m.named.opened && m.named.error.is_none());
         assert!(m.named.notice.as_deref().unwrap().contains("runs in ~"));
         assert_eq!(m.active.as_ref().unwrap().session_id, "s-axel");
 
         m.open_by_name("ghost");
-        m.resuming(ResumeRequest { by_name: true, ..req_("ghost") }, 5, true);
+        m.resuming(LiveId::FIRST, ResumeRequest { by_name: true, ..req_("ghost") }, 5, true);
         m.apply(detached(5, crate::named::NO_SUCH_GHOST));
         assert_eq!(m.named.error.as_deref(), Some("No session named 'ghost'."));
         assert!(!m.named.opened, "the typed text stays");
@@ -3256,13 +3098,13 @@ mod tests {
         let fx = m.open_row(&row_action(&m, "axel"));
         let fallback = Some(req("axel", "j-axel", Some("/home/u/axel")));
         assert_eq!(fx, vec![Effect::Attach { session_id: "l3".into(), fallback: fallback.clone(), open: false, place: Place::Current }]);
-        m.attaching(4, fallback.clone(), false);
+        m.attaching(LiveId::FIRST, 4, fallback.clone(), false);
         // daemon/conn.rs: `DaemonFrame::Error { message: "unknown session" }`.
         let fx = m.apply(detached(4, "unknown session"));
         assert_eq!(fx, vec![Effect::Resume { req: fallback.clone().unwrap(), open: false, place: Place::Current }]);
         assert!(m.last_error.is_none());
         // Any other end is reported as before.
-        m.attaching(5, fallback, false);
+        m.attaching(LiveId::FIRST, 5, fallback, false);
         m.apply(detached(5, "daemon closed the connection"));
         assert_eq!(m.last_error.as_deref(), Some("detached: daemon closed the connection"));
     }
@@ -3276,8 +3118,8 @@ mod tests {
         m.apply(Event::Sessions(metas(json!([{"id": "l3", "name": "axel", "lifecycle": "live"}]))));
         let action = row_action(&m, "axel");
         assert_eq!(m.open_row(&action).len(), 1);
-        m.attaching(4, None, false);
-        m.asked_for("l3");
+        m.attaching(LiveId::FIRST, 4, None, false);
+        m.asked_for(LiveId::FIRST, "l3");
         assert_eq!(m.open_row(&action), vec![], "on its way");
         m.apply(attached_ev(4, attached("l3")));
         assert_eq!(m.open_row(&action), vec![], "on screen");
@@ -3322,20 +3164,20 @@ mod tests {
     fn naming_the_current_session() {
         use synaps_client::RenameFailure;
         let mut m = Model::new(ConnState::Connecting);
-        assert!(m.rename_request("axon").is_none());
+        assert!(m.rename_request(LiveId::FIRST, "axon").is_none());
         assert_eq!(m.named.rename_error.as_deref(), Some("Not attached to a session."));
         attach(&mut m, 1);
         m.apply(Event::Sessions(metas(json!([{"id": "s", "lifecycle": "live", "name": "kite"}, {"id": "t", "lifecycle": "live"}]))));
         m.toggle_naming();
-        assert!(m.rename_request("Bad Name").is_none());
+        assert!(m.rename_request(LiveId::FIRST, "Bad Name").is_none());
         assert!(m.named.rename_error.as_deref().unwrap().contains("lowercase"));
         assert!(m.named.rename.is_none(), "nothing pending after a local refusal");
-        assert!(m.rename_request("kite").is_none() && !m.named.naming, "its own name: nothing to do");
+        assert!(m.rename_request(LiveId::FIRST, "kite").is_none() && !m.named.naming, "its own name: nothing to do");
 
         m.toggle_naming();
-        let r = m.rename_request(" axon ").unwrap();
+        let r = m.rename_request(LiveId::FIRST, " axon ").unwrap();
         assert_eq!(r, RenameRequest { session_id: "s".into(), name: "axon".into(), expect: Expect::Unnamed });
-        assert!(m.rename_request("axon").is_none(), "one at a time");
+        assert!(m.rename_request(LiveId::FIRST, "axon").is_none(), "one at a time");
         let mut f = RenameFailure::new("s", RenameRefusal::Named, "named");
         f.current_name = Some("kite".into());
         m.apply(Event::RenameFailed(f));
@@ -3349,19 +3191,19 @@ mod tests {
         let fx = m.apply(Event::Renamed { session_id: "s".into(), name: Some("axon".into()), in_memory_only: false });
         assert!(fx.contains(&Effect::ListSessions));
         assert!(!m.named.naming && m.named.rename.is_none() && m.named.replace.is_none());
-        assert_eq!(m.active_name(), Some("axon"));
+        assert_eq!(m.active_name(LiveId::FIRST), Some("axon"));
         assert!(rows(&m).iter().any(|r| r.0 == "axon"), "the rail shows the name at once");
 
         // A double Save: "already named what you asked" is success.
         m.toggle_naming();
-        m.rename_request("zeta").unwrap();
+        m.rename_request(LiveId::FIRST, "zeta").unwrap();
         let mut f = RenameFailure::new("s", RenameRefusal::Named, "named");
         f.current_name = Some("zeta".into());
         m.apply(Event::RenameFailed(f));
         assert!(!m.named.naming && m.named.rename.is_none() && m.named.rename_error.is_none() && m.named.replace.is_none());
 
         m.toggle_naming();
-        m.rename_request("taken").unwrap();
+        m.rename_request(LiveId::FIRST, "taken").unwrap();
         let mut f = RenameFailure::new("s", RenameRefusal::Taken, "taken");
         f.taken_by = Some("20261028-045932-a1b2".into());
         m.apply(Event::RenameFailed(f));
@@ -3380,12 +3222,12 @@ mod tests {
         attach(&mut m, 1);
         m.apply(Event::Sessions(metas(json!([{"id": "s", "lifecycle": "live", "name": "kite"}, {"id": "t", "lifecycle": "live"}]))));
         m.toggle_naming();
-        m.rename_request("axon").unwrap();
+        m.rename_request(LiveId::FIRST, "axon").unwrap();
         let mut f = RenameFailure::new("s", RenameRefusal::Named, "named");
         f.current_name = Some("kite".into());
         m.apply(Event::RenameFailed(f));
         assert!(m.named.replace.is_some());
-        m.want(2);
+        m.want(LiveId::FIRST, 2);
         m.apply(attached_ev(2, attached("t")));
         assert!(!m.named.naming && m.named.replace.is_none() && m.named.rename_error.is_none());
         assert!(m.replace_request().is_none(), "no offer to take to t");
@@ -3393,8 +3235,8 @@ mod tests {
         // A late answer for s while t is shown.
         attach(&mut m, 3);
         m.toggle_naming();
-        m.rename_request("axon").unwrap();
-        m.want(4);
+        m.rename_request(LiveId::FIRST, "axon").unwrap();
+        m.want(LiveId::FIRST, 4);
         m.apply(attached_ev(4, attached("t")));
         m.apply(Event::RenameFailed(RenameFailure::new("s", RenameRefusal::Busy, "")));
         assert!(!m.named.naming);
@@ -3403,7 +3245,7 @@ mod tests {
         // The row was closed (Cancel) on the session the answer is for.
         attach(&mut m, 5);
         m.toggle_naming();
-        m.rename_request("axon").unwrap();
+        m.rename_request(LiveId::FIRST, "axon").unwrap();
         m.named.naming = false;
         m.apply(Event::RenameFailed(RenameFailure::new("s", RenameRefusal::Busy, "")));
         assert!(m.named.naming && m.named.rename_error.as_deref().unwrap().contains("busy"));
@@ -3665,8 +3507,8 @@ mod fake_daemon {
     /// The UI's attach (`AppView::attach`).
     fn ui_attach(m: &mut Model, client: &Client, sid: &str) {
         let seq = client.attach(sid, AttachMode::Mirror).unwrap();
-        m.want(seq);
-        m.asked_for(sid);
+        m.want(LiveId::FIRST, seq);
+        m.asked_for(LiveId::FIRST, sid);
     }
 
     /// The UI's AUTHORIZE (`AppView::answer`): only what the model allows goes out.
@@ -3714,9 +3556,9 @@ mod fake_daemon {
     /// session shown goes to the cache, the next one's cached state (or
     /// nothing) comes in, its attach goes out.
     fn ui_switch(m: &mut Model, client: &Client, sid: &str, cached: Option<(Transcript, Stats)>) -> (Transcript, Stats) {
-        let left = m.switch_out();
+        let left = m.switch_out(LiveId::FIRST);
         let (t, s) = cached.unwrap_or_default();
-        m.switch_in(t, s);
+        m.switch_in(LiveId::FIRST, t, s);
         ui_attach(m, client, sid);
         left
     }
@@ -3758,10 +3600,10 @@ mod fake_daemon {
             gate.key_down(at(t));
             assert!(m.tabs.step(1));
             let s = m.tabs.visible_session().unwrap().to_string();
-            let _ = m.switch_out();
-            m.switch_in(Transcript::new(), Stats::default());
+            let _ = m.switch_out(LiveId::FIRST);
+            m.switch_in(LiveId::FIRST, Transcript::new(), Stats::default());
             if gate.switch(at(t)) {
-                m.showing(&s);
+                m.showing(LiveId::FIRST, &s);
                 waiting = Some(s);
             } else {
                 ui_attach(&mut m, &client, &s);

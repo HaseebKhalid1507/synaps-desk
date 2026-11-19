@@ -706,9 +706,9 @@ impl AppView {
     fn palette_sig(&self, cx: &App) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        let m = &self.model;
-        (m.rail_gen, m.input_gate().is_ok(), m.transcript.pending_prompts().len(), self.halt_shown(), m.transcript.busy()).hash(&mut h);
-        (m.tabs.len(), m.tabs.active(), m.active.as_ref().map(|a| &a.session_id)).hash(&mut h);
+        let (m, l) = (&self.model, &self.model.lives[self.panes.cur.live]);
+        (m.rail_gen, l.input_gate().is_ok(), l.transcript.pending_prompts().len(), self.halt_shown(), l.transcript.busy()).hash(&mut h);
+        (m.tabs.len(), m.tabs.active(), l.active.as_ref().map(|a| &a.session_id)).hash(&mut h);
         for r in &self.tray.rows {
             (r.id, r.live as u8, &r.step, r.watchable).hash(&mut h);
         }
@@ -806,7 +806,8 @@ impl AppView {
             goto.push(e);
         }
         // COMMANDS: the app's actions, then the engine's.
-        let attached = m.active.is_some();
+        let l = &m.lives[self.panes.cur.live];
+        let attached = l.active.is_some();
         let on_session = m.tabs.current().is_some_and(|t| t.kind == crate::tabs::Kind::Session && t.session.is_some());
         let level = crate::motion::Level::current(cx);
         let theme = cx.global::<crate::theme::Scheme>().choice.theme.clone();
@@ -827,7 +828,7 @@ impl AppView {
                 "Jump to what is waiting",
                 k("Ctrl+J", "⌃J"),
                 "the authorize card".into(),
-                m.transcript.pending_prompts().is_empty().then_some("nothing is waiting on you"),
+                l.transcript.pending_prompts().is_empty().then_some("nothing is waiting on you"),
             ),
             (
                 AppAct::Favourite,
@@ -860,7 +861,7 @@ impl AppView {
             e.off = off.map(SharedString::from);
             commands.push(e);
         }
-        let (gate, busy) = (m.input_gate().err(), m.transcript.busy());
+        let (gate, busy) = (l.input_gate().err(), l.transcript.busy());
         for (i, (name, _, about)) in ENGINE.iter().enumerate() {
             let mut e = Entry::new(Group::Commands, Act::Engine(name), format!("/{name}"));
             // While a turn runs, why not instead of what (as the composer:
@@ -945,12 +946,12 @@ impl AppView {
     /// and nothing is sent; while a turn runs, as the TUI, it is not run
     /// (both doors: one rule). Its answer comes back as the composer's note.
     pub(crate) fn run_command(&mut self, name: &'static str, arg: String) -> bool {
-        if let Err(why) = self.model.input_gate() {
+        if let Err(why) = self.model.lives[self.panes.cur.live].input_gate() {
             self.panes.cur.watch_note = Some(not_here(name, why).into());
             self.model.view_dirty = true;
             return false;
         }
-        if self.model.transcript.busy() {
+        if self.model.lives[self.panes.cur.live].transcript.busy() {
             self.panes.cur.watch_note = Some(mid_turn(name).into());
             self.model.view_dirty = true;
             return false;
@@ -960,9 +961,9 @@ impl AppView {
             return false;
         };
         // `input_gate` passed: attached, and the one asked for last.
-        let Some(seq) = self.model.attachment() else { return false };
+        let Some(seq) = self.model.lives[self.panes.cur.live].attachment() else { return false };
         if c.on(seq).engine_command(name, arg).is_err() {
-            self.model.last_error = Some("the connection thread has stopped".into());
+            self.model.lives[self.panes.cur.live].last_error = Some("the connection thread has stopped".into());
             return false;
         }
         log::debug!(target: "synaps_desktop::send", "/{name}");

@@ -41,6 +41,7 @@ mod fit;
 mod fonts;
 mod glyph;
 mod lattice;
+mod live;
 mod mem;
 mod menu;
 mod model;

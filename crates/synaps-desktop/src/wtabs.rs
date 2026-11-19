@@ -455,7 +455,11 @@ impl Blocked {
 impl AppView {
     /// The session whose workers the tray and the blocks show.
     pub(crate) fn worker_session(&self) -> Option<String> {
-        self.model.active.as_ref().map(|a| a.session_id.clone()).or_else(|| self.model.tabs.current_session().map(str::to_string))
+        self.model.lives[self.panes.cur.live]
+            .active
+            .as_ref()
+            .map(|a| a.session_id.clone())
+            .or_else(|| self.model.tabs.current_session().map(str::to_string))
     }
 
     /// What the session calls itself (a worker tab's title, its parent).
@@ -475,7 +479,7 @@ impl AppView {
     /// the tab cache).
     fn subs_of(&self, session: &str) -> Option<&Subagents> {
         if self.model.is_active(session) {
-            return Some(&self.model.stats.subagents);
+            return Some(&self.model.lives[self.panes.cur.live].stats.subagents);
         }
         self.tab_cache.peek(session).map(|c| &c.stats.subagents)
     }
@@ -496,7 +500,7 @@ impl AppView {
         let Some(t) = self.model.tabs.current().filter(|t| t.kind == Kind::Worker) else { return false };
         let (Some(s), Some(w)) = (t.session.as_deref(), t.worker.as_ref()) else { return false };
         let id = w.id().filter(|_| self.model.is_active(s));
-        id.and_then(|id| self.model.stats.subagents.ident(id)).is_some_and(|now| !same_worker(w.who(), now))
+        id.and_then(|id| self.model.lives[self.panes.cur.live].stats.subagents.ident(id)).is_some_and(|now| !same_worker(w.who(), now))
     }
 
     /// The worker tab on screen holds a worker its handle no longer names:
@@ -506,9 +510,12 @@ impl AppView {
             return;
         }
         let Some(w) = self.model.tabs.current().and_then(|t| t.worker.clone()) else { return };
-        let now = w.id().and_then(|id| self.model.stats.subagents.ident(id)).map_or_else(String::new, |(_, n)| format!(" ({n})"));
+        let now = w
+            .id()
+            .and_then(|id| self.model.lives[self.panes.cur.live].stats.subagents.ident(id))
+            .map_or_else(String::new, |(_, n)| format!(" ({n})"));
         let why = || format!("{} is another worker now{now} (the daemon restarted): {} is gone", w.handle, w.name);
-        if self.model.watch.disown(&w.handle, why) {
+        if self.model.lives[self.panes.cur.live].watch.disown(&w.handle, why) {
             self.model.view_dirty = true;
         }
     }
@@ -530,7 +537,7 @@ impl AppView {
 
     /// The worker the attached session's workers know as `sa_{id}` now.
     fn who_now(&self, id: u64) -> Option<Who> {
-        let (call, name) = self.model.stats.subagents.ident(id)?;
+        let (call, name) = self.model.lives[self.panes.cur.live].stats.subagents.ident(id)?;
         Some(Who::new(id, name.to_string(), call.map(|c| c.to_string().into())))
     }
 
@@ -547,7 +554,7 @@ impl AppView {
         let attached = self.model.is_active(session);
         let shown = attached || self.panes.cur.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(session);
         let subs = match (shown, self.tab_cache.peek(session)) {
-            (true, _) => &self.model.stats.subagents,
+            (true, _) => &self.model.lives[self.panes.cur.live].stats.subagents,
             (false, Some(c)) => &c.stats.subagents,
             (false, None) => return None,
         };
@@ -562,7 +569,7 @@ impl AppView {
         // [`crate::model::Model::heard_view`]).
         let status = id.and_then(|id| subs.status(id));
         let live = Liveness::of(status, attached, !attached || now.is_some() || status.is_some());
-        Some(live.cancelling(self.model.cancels.pending(session, handle)))
+        Some(live.cancelling(self.model.lives[self.panes.cur.live].cancels.pending(session, handle)))
     }
 
     /// Whether this window may steer or cancel `session`'s workers, else
@@ -574,7 +581,7 @@ impl AppView {
         if !self.model.is_active(session) {
             return Err("its session is not attached in this window: show its tab first");
         }
-        self.model.input_gate()
+        self.model.lives[self.panes.cur.live].input_gate()
     }
 
     /// Why a cancel of `who` (`handle`) of `session` may not go now, if it
@@ -586,7 +593,7 @@ impl AppView {
             return Some(Blocked::Drive(why));
         }
         // The session is attached (`may_drive`): its workers are the model's.
-        let Some(now) = self.model.stats.subagents.ident(who.id) else { return Some(Blocked::Unknown) };
+        let Some(now) = self.model.lives[self.panes.cur.live].stats.subagents.ident(who.id) else { return Some(Blocked::Unknown) };
         if !same_worker(who.key(), now) {
             return Some(Blocked::Other);
         }
@@ -632,8 +639,10 @@ impl AppView {
     pub(crate) fn open_worker_tab(&mut self, who: &Who, cx: &mut Context<Self>) {
         let Some(session) = self.worker_session() else { return };
         let handle = who.handle();
-        if self.model.watch.focus() == Some(handle.as_str()) && !self.model.watch.in_tab() {
-            self.model.watch.focus_main();
+        if self.model.lives[self.panes.cur.live].watch.focus() == Some(handle.as_str())
+            && !self.model.lives[self.panes.cur.live].watch.in_tab()
+        {
+            self.model.lives[self.panes.cur.live].watch.focus_main();
         }
         let label = self.session_label(&session);
         let had = self.model.tabs.iter().map(|t| t.id).collect::<Vec<_>>();
@@ -652,9 +661,11 @@ impl AppView {
         if self.model.tabs.view().is_some() || self.model.tabs.current_worker().is_some() {
             return;
         }
-        let pick = match self.model.watch.focused() {
+        let pick = match self.model.lives[self.panes.cur.live].watch.focused() {
             Some(w) => self.who_now(w.subagent_id).or_else(|| Some(Who::new(w.subagent_id, w.name.clone(), None))),
-            None if self.model.active.is_some() => self.model.watchable().last().and_then(|c| self.who_now(c.subagent_id)),
+            None if self.model.lives[self.panes.cur.live].active.is_some() => {
+                self.model.lives[self.panes.cur.live].watchable().last().and_then(|c| self.who_now(c.subagent_id))
+            }
             None => None,
         };
         match pick {
@@ -680,7 +691,7 @@ impl AppView {
     pub(crate) fn menu_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let shown = self.tray_drawn();
         let rows = &self.tray.rows[..shown];
-        let watched = self.model.watch.focused().map(|w| w.subagent_id);
+        let watched = self.model.lives[self.panes.cur.live].watch.focused().map(|w| w.subagent_id);
         let row = watched.and_then(|id| rows.iter().find(|r| r.id == id)).or_else(|| rows.iter().rev().find(|r| r.watchable));
         let (Some(r), Some(session)) = (row.filter(|r| r.watchable), self.worker_session()) else {
             self.panes.cur.watch_note = Some("no worker here: the tray over the composer lists the session's workers".into());
@@ -708,8 +719,8 @@ impl AppView {
             },
             read_only: self.may_drive(&t.session).err(),
             other,
-            armed: self.model.cancels.armed(&t.session, t.who.id, t.who.key(), now),
-            pending: self.model.cancels.pending(&t.session, &handle),
+            armed: self.model.lives[self.panes.cur.live].cancels.armed(&t.session, t.who.id, t.who.key(), now),
+            pending: self.model.lives[self.panes.cur.live].cancels.pending(&t.session, &handle),
             result: info.as_ref().filter(|i| !i.result.is_empty()).map(|i| (i.whole, i.result.chars().count())),
             has_task: info.as_ref().is_some_and(|i| !i.task_full.is_empty()),
             tab: t.tab.is_some(),
@@ -730,7 +741,7 @@ impl AppView {
         self.gear_menu = false;
         // A cancel armed for another worker, or from the tray, waits no more.
         if !self.menu.as_ref().is_some_and(|(_, old)| old.who == t.who) {
-            self.model.cancels.disarm();
+            self.model.lives[self.panes.cur.live].cancels.disarm();
         }
         let items = items(&self.facts(&t, Instant::now()));
         let m = Menu::new(items, at, keyboard);
@@ -746,7 +757,7 @@ impl AppView {
         self.menu = None;
         self.smenu = None;
         self.wmenu = None;
-        if self.model.cancels.disarm() {
+        if self.model.lives[self.panes.cur.live].cancels.disarm() {
             self.cancel_tick = None;
         }
     }
@@ -861,15 +872,15 @@ impl AppView {
             }
             return;
         }
-        let pressed = self.model.cancels.press(session, who, how, now);
+        let pressed = self.model.lives[self.panes.cur.live].cancels.press(session, who, how, now);
         log::debug!(target: "synaps_desktop::watch", "cancel press {handle}: {how:?} -> {pressed:?}");
         match pressed {
             Press::Fire => {
-                let seq = self.model.active.as_ref().map(|a| a.attach_seq);
+                let seq = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.attach_seq);
                 match (&self.client, seq) {
                     (Some(c), Some(seq)) if c.on(seq).cancel_worker(handle.clone()).is_ok() => {
                         log::debug!(target: "synaps_desktop::watch", "cancel {handle} ({})", who.name);
-                        self.model.cancels.sent(session, &handle, seq, now);
+                        self.model.lives[self.panes.cur.live].cancels.sent(session, &handle, seq, now);
                     }
                     _ => self.panes.cur.watch_note = Some(format!("{handle} not cancelled: the connection thread has stopped").into()),
                 }
@@ -887,12 +898,12 @@ impl AppView {
 
     /// The armed cancel's end draws (once, when it runs out).
     fn arm_cancel_tick(&mut self, cx: &mut Context<Self>) {
-        let Some(until) = self.model.cancels.armed_until() else { return };
+        let Some(until) = self.model.lives[self.panes.cur.live].cancels.armed_until() else { return };
         self.cancel_tick = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(until.saturating_duration_since(Instant::now())).await;
             let _ = this.update(cx, |v, cx| {
                 v.cancel_tick = None;
-                if v.model.cancels.expire(Instant::now()) {
+                if v.model.lives[v.panes.cur.live].cancels.expire(Instant::now()) {
                     v.refresh_menu();
                     cx.notify();
                 }
@@ -941,7 +952,7 @@ impl AppView {
     /// chrome's, `err_mark_k` the card's), one going dark per second of [`CONFIRM`] on
     /// the clock; Reduced, all three until it runs out; Off, none.
     fn fuse(&self, p: &Palette) -> Option<Div> {
-        let until = self.model.cancels.armed_until()?;
+        let until = self.model.lives[self.panes.cur.live].cancels.armed_until()?;
         let lit = match self.fx.level() {
             crate::motion::Level::Off => return None,
             crate::motion::Level::Reduced => 3,
@@ -979,7 +990,7 @@ impl AppView {
         p: &Palette,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        let session = self.model.active.as_ref()?.session_id.as_str();
+        let session = self.model.lives[self.panes.cur.live].active.as_ref()?.session_id.as_str();
         if self.cancel_blocked(session, who, handle).is_some() {
             return None;
         }
@@ -1022,7 +1033,7 @@ impl AppView {
                 .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                     cx.stop_propagation();
                     // The tray lists the attached session's workers.
-                    let Some(session) = this.model.active.as_ref().map(|a| a.session_id.clone()) else { return };
+                    let Some(session) = this.model.lives[this.panes.cur.live].active.as_ref().map(|a| a.session_id.clone()) else { return };
                     this.press_cancel(&session, &who, How::Click(ev.click_count()), cx);
                 }))
                 .on_aux_click(|_, _, cx| cx.stop_propagation())
