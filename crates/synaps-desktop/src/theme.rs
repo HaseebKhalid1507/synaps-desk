@@ -73,6 +73,68 @@ pub const FRAME: f64 = 1.56;
 /// so its `card_hi` row and its `frame` both still read on it.
 pub const CARD: f64 = 1.32;
 
+/// Cards D (cards4/proposal.md §1): `card_d` at least this off the canvas
+/// (a surface step, read with its hairline), and so its hover and its
+/// well off it.
+pub const D_CARD: f64 = 1.06;
+/// The step `card_d` and its hover are drawn at, and the well's.
+pub const D_STEP: f64 = 1.08;
+pub const D_WELL: f64 = 1.07;
+/// The card's hairline on the card, the canvas and the hover.
+pub const D_LINE: f64 = 1.25;
+/// The authorize card's accent edge on the card.
+pub const D_ACC_LINE: f64 = 1.4;
+/// The washes (§1, §8): `motion::mix(state, card_d, t)`, one quad behind a
+/// row. A failed row rests at 7.5 % `err` from an 18 % flush; a waiting
+/// row at 6 % of the accent from 16 %; the Ask pill's fill is 12 %.
+pub const D_FAIL_REST: f32 = 0.075;
+pub const D_FAIL_PEAK: f32 = 0.18;
+pub const D_WAIT_REST: f32 = 0.06;
+pub const D_WAIT_PEAK: f32 = 0.16;
+pub const D_SOFT: f32 = 0.12;
+/// The authorize card's flush as it arrives (§8 #8) and the outlined
+/// Allow's pressed fill: of the accent off the card.
+pub const D_ASK_FLUSH: f32 = 0.12;
+pub const D_OUT_PRESS: f32 = 0.18;
+/// What each wash carries ([`d_washes`]): every text a failed row draws,
+/// a waiting row's, the authorize card's, the outlined Allow's label.
+pub fn d_wash_texts(r: &Roles) -> [Vec<u32>; 4] {
+    [
+        vec![r.prose_t, r.dim_t, r.arg, r.ok, r.err, r.ink],
+        vec![r.prose_t, r.dim_t, r.arg, r.acc],
+        vec![r.dim_t, r.ink, r.prose_t, r.prose],
+        vec![r.acc],
+    ]
+}
+
+/// Cards D's washes from the floored `err` and `acc` (Shady #23 M3): each
+/// the proposal's strength, or the strongest (in 0.5 % steps, down to its
+/// rest) where every text drawn on it stays ≥ [`TEXT`].
+pub fn d_washes(r: &Roles) -> [u32; 6] {
+    let [fail, wait, ask, out] = d_wash_texts(r);
+    // The strength each lands on: a peak goes no lower than its rest did.
+    let k = |from: f32, floor: f32, toward: u32, texts: &[u32]| {
+        let reads = |k: f32| texts.iter().all(|&c| contrast(c, mix(r.card_d, toward, f64::from(k))) >= TEXT);
+        let mut k = from;
+        while k > floor + 1e-6 && !reads(k) {
+            k = (k - 0.005).max(floor);
+        }
+        k
+    };
+    let (fail_rest, wait_rest) = (k(D_FAIL_REST, 0., r.err, &fail), k(D_WAIT_REST, 0., r.acc, &wait));
+    [
+        (r.err, fail_rest),
+        (r.err, k(D_FAIL_PEAK, fail_rest, r.err, &fail)),
+        (r.acc, wait_rest),
+        (r.acc, k(D_WAIT_PEAK, wait_rest, r.acc, &wait)),
+        (r.acc, k(D_ASK_FLUSH, 0., r.acc, &ask)),
+        (r.acc, k(D_OUT_PRESS, 0., r.acc, &out)),
+    ]
+    .map(|(toward, k)| mix(r.card_d, toward, f64::from(k)))
+}
+/// The Ask pill stands at least this off its card.
+pub const D_SOFT_OFF: f64 = 1.03;
+
 /// `#rrggbb` / `rrggbb` / `#rgb` / `rgb`, any case, surrounding space ignored.
 pub fn parse_hex(s: &str) -> Option<u32> {
     let s = s.trim();
@@ -457,6 +519,19 @@ roles! {
     // Usage's chart series on the canvas (3:1): hosts, roles, models by
     // rank, and the rest.
     s1, s2, s3, s4, s5, s_rest,
+    // Cards D (cards4/proposal.md §1): a run, an event, a chip and the
+    // authorize card are one soft card a surface step off the canvas
+    // (`card_d`; the proposal's `card`, a name the overlay card holds), in
+    // a 1 px `line`; a row's hover fill; a call's body (`well_d`, the
+    // proposal's `well`); the Ask pill, the authorize card's edge and the
+    // text on the Allow fill; `acc`, the accent floored as text on all of
+    // them (the running clock, waiting, receipts).
+    card_d, line, hover, well_d, acc_soft, acc_line, acc_ink, acc,
+    // The washes as painted (Shady #23 M3): a failed row's at rest and at
+    // its flush's peak, a waiting row's, the authorize card's flush, and
+    // the outlined Allow's pressed fill, from the floored `err` and `acc`,
+    // each as strong as the proposal's where every text on it reads.
+    wash_fail, wash_fail_pk, wash_wait, wash_wait_pk, ask_flush, out_press,
 }
 
 impl Palette {
@@ -593,13 +668,47 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     let ch = [chrome, raised];
     // A run's rows sit bare on the canvas (Q1 cards, F1), `tool_out` under
     // the hovered one; the worker chips are on `tool`.
-    let run_grounds = [canvas, tool, tool_out];
+    // Cards D (cards4/proposal.md §1): the card a surface step off the
+    // canvas (toward white on a light canvas, else toward the ink), its
+    // hover a step on toward the ink, its body's well a step back.
+    let rise = |g: u32, toward: u32, target: f64| {
+        (1..=200u8).map(|i| mix(g, toward, f64::from(i) * 0.005)).find(|&c| contrast(c, g) >= target).unwrap_or(toward)
+    };
+    let light = luminance(canvas) > 0.4;
+    let card_d = if light && contrast(0xffffff, canvas) >= D_CARD { rise(canvas, 0xffffff, D_STEP) } else { rise(canvas, ink, D_STEP) };
+    let hover = rise(card_d, ink, D_STEP);
+    let well_d = rise(card_d, if light { ink } else { 0x000000 }, D_WELL);
+    // A failed row's wash at rest and at its flush's peak (§8 #6), not
+    // roles: what is drawn on them is floored on them.
+    let (fail_rest, fail_peak) = (mix(card_d, t.error_color, f64::from(D_FAIL_REST)), mix(card_d, t.error_color, f64::from(D_FAIL_PEAK)));
+    let run_grounds = [canvas, tool, tool_out, card_d, hover, fail_rest];
     // `thinking_colors()`: `thinking_color` lifted toward the answer's colour.
     let think = |f: &mut Floors, role, g: &[u32]| {
         let c = lift(t.thinking_color, t.claude_text, g, TEXT);
         f.text(role, c, g)
     };
-    let mut r = Roles { chrome, canvas, user, code, tool, tool_out, card, card_hi, raised, add_bg, del_bg, well, ..Roles::default() };
+    let mut r = Roles {
+        chrome,
+        canvas,
+        user,
+        code,
+        tool,
+        tool_out,
+        card,
+        card_hi,
+        raised,
+        add_bg,
+        del_bg,
+        well,
+        card_d,
+        hover,
+        well_d,
+        ..Roles::default()
+    };
+    f.log.push(Check { role: "card_d", from: canvas, color: card_d, grounds: vec![canvas], floor: D_CARD });
+    f.log.push(Check { role: "hover", from: card_d, color: hover, grounds: vec![card_d], floor: D_CARD });
+    f.log.push(Check { role: "well_d", from: card_d, color: well_d, grounds: vec![card_d], floor: D_CARD });
+    r.line = f.at("line", t.separator, ink, &[card_d, canvas, hover], D_LINE);
     for (role, from, c) in [("add_bg", well, add_bg), ("del_bg", well, del_bg)] {
         f.log.push(Check { role, from, color: c, grounds: vec![well], floor: SURFACE });
     }
@@ -634,7 +743,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.hair_w = f.at("hair_w", t.separator, ink, &[well, canvas, tool_out], HAIR);
     r.hair_t = f.at("hair_t", t.separator, ink, &[tool, tool_out, canvas], HAIR);
     r.edge_t = f.at("edge_t", t.border, ink, &[canvas, tool_out], EDGE);
-    r.ink = f.text("ink", ink, &[canvas, user, tool_out, chrome, raised, add_bg, del_bg, card, card_hi]);
+    r.ink = f.text("ink", ink, &[canvas, user, tool_out, chrome, raised, add_bg, del_bg, card, card_hi, card_d, hover, well_d, fail_peak]);
     r.prose = f.text("prose", t.claude_text, &[canvas]);
     r.dim = f.text("dim", t.muted, &[canvas]);
     r.you = f.text("you", you, &[canvas]);
@@ -646,7 +755,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.run = f.text("run", t.status_streaming, &[canvas, tool, tool_out, user]);
     r.ready = f.text("ready", t.status_ready, &[canvas, user]);
     r.cost = f.text("cost", t.cost_color, &[canvas]);
-    r.err = f.text("err", t.error_color, &[canvas, tool, tool_out, user]);
+    r.err = f.text("err", t.error_color, &[canvas, tool, tool_out, user, card_d, hover, fail_rest, fail_peak]);
     r.dim_u = f.text("dim_u", t.muted, &[user]);
     r.agent_u = f.text("agent_u", t.claude_label, &[user]);
     r.head_u = f.text("head_u", t.heading_color, &[user]);
@@ -667,7 +776,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.dim_t = f.text("dim_t", t.muted, &run_grounds);
     r.think = think(&mut f, "think", &run_grounds);
     r.arg = f.text("arg", t.tool_param, &run_grounds);
-    r.ok = f.text("ok", t.tool_result_ok, &[canvas, tool, tool_out]);
+    r.ok = f.text("ok", t.tool_result_ok, &[canvas, tool, tool_out, card_d, hover]);
     // `draw.rs` `tool_accent()`: an unset `tool_*` derives from the palette.
     r.t_bash = f.text("t_bash", or(t.tool_bash, t.tool_result_ok), &run_grounds);
     r.t_read = f.text("t_read", or(t.tool_read, t.claude_label), &run_grounds);
@@ -685,13 +794,13 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.sub_rule = f.mark("sub_rule", t.subagent_border, &run_grounds);
     // An opened call's well (polish.md §2.3): its text is the code's on
     // `code`, the result's on `tool_out`.
-    r.res = f.text("res", if well == code { t.code_fg } else { t.tool_result_color }, &[well]);
-    r.dim_o = f.text("dim_o", t.muted, &[well]);
+    r.res = f.text("res", if well == code { t.code_fg } else { t.tool_result_color }, &[well, well_d]);
+    r.dim_o = f.text("dim_o", t.muted, &[well, well_d]);
     // Unpainted since Q1 cards (an opened thought is `think` on the
     // canvas); kept for the roles that list it.
     r.think_o = think(&mut f, "think_o", &[tool_out]);
     r.ok_o = f.text("ok_o", t.tool_result_ok, &[add_bg]);
-    r.err_o = f.text("err_o", t.error_color, &[del_bg, well]);
+    r.err_o = f.text("err_o", t.error_color, &[del_bg, well, well_d]);
     r.prose_k = f.text("prose_k", t.claude_text, &k);
     r.dim_k = f.text("dim_k", t.muted, &k);
     r.warn_k = f.text("warn_k", t.warning_color, &k);
@@ -717,7 +826,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.focus = f.mark("focus", focus, &[canvas, chrome]);
     r.tb2 = f.mark("tb2", t.table_border_color, &[canvas]);
     // A filled button's label is `bg`: the fill is lifted until it reads.
-    let btn = f.mark("btn_fill", you, &[user, card]);
+    let btn = f.mark("btn_fill", you, &[user, card, card_d]);
     r.btn_fill = f.at("btn_fill", btn, ink, &[chrome], TEXT);
     let warn = f.mark("warn_fill", t.warning_color, &[user, card]);
     r.warn_fill = f.at("warn_fill", warn, ink, &[chrome], TEXT);
@@ -819,6 +928,38 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     }
     [r.s1, r.s2, r.s3, r.s4, r.s5] = [series[0], series[1], series[2], series[3], series[4]];
     r.s_rest = f.mark("s_rest", t.muted, &[canvas]);
+    // The accent's D roles (cards4/proposal.md §1): the Ask pill's fill,
+    // the authorize card's and a watched chip's edge, the Allow fill's
+    // text, and `acc` floored as text on every ground it is drawn on (the
+    // card, its hover, the pill, the waiting row's wash at rest and peak).
+    let soft = mix(card_d, you, f64::from(D_SOFT));
+    // An accent as dark as the card steps the pill toward the ink instead.
+    r.acc_soft = if contrast(soft, card_d) >= D_SOFT_OFF {
+        soft
+    } else {
+        Some(rise(card_d, you, D_SOFT_OFF)).filter(|&c| contrast(c, card_d) >= D_SOFT_OFF).unwrap_or_else(|| rise(card_d, ink, D_SOFT_OFF))
+    };
+    let (wait_rest, wait_peak) = (mix(card_d, you, f64::from(D_WAIT_REST)), mix(card_d, you, f64::from(D_WAIT_PEAK)));
+    r.acc = f.text("acc", you, &[card_d, hover, r.acc_soft, wait_rest, wait_peak]);
+    f.log.push(Check { role: "acc_soft", from: you, color: r.acc_soft, grounds: vec![card_d], floor: D_SOFT_OFF });
+    r.acc_line = f.at("acc_line", mix(card_d, you, 0.4), ink, &[card_d], D_ACC_LINE);
+    r.acc_ink = if [r.btn_fill, r.btn_hi].iter().all(|&g| contrast(canvas, g) >= TEXT) { canvas } else { chrome };
+    f.log.push(Check { role: "acc_ink", from: canvas, color: r.acc_ink, grounds: vec![r.btn_fill, r.btn_hi], floor: TEXT });
+    let washes = d_washes(&r);
+    [r.wash_fail, r.wash_fail_pk, r.wash_wait, r.wash_wait_pk, r.ask_flush, r.out_press] = washes;
+    // Grounds, not texts: each is logged with the texts it carries as its
+    // floor's grounds (every one ≥ TEXT on it, `d_washes`).
+    let texts = d_wash_texts(&r);
+    for (role, c, on) in [
+        ("wash_fail", r.wash_fail, 0),
+        ("wash_fail_pk", r.wash_fail_pk, 0),
+        ("wash_wait", r.wash_wait, 1),
+        ("wash_wait_pk", r.wash_wait_pk, 1),
+        ("ask_flush", r.ask_flush, 2),
+        ("out_press", r.out_press, 3),
+    ] {
+        f.log.push(Check { role, from: card_d, color: c, grounds: texts[on].clone(), floor: TEXT });
+    }
     (r, f.log)
 }
 
@@ -1040,7 +1181,8 @@ const UNDRAINED: &[&str] = &[
     // Q1's (PR #16) ground and rules (a well greys while the code beside
     // it doesn't): `grounds_and_rules_never_drain` fails on any new one
     // missing here.
-    "well", "hair_w", "hair_t", "edge_t",
+    "well", "hair_w", "hair_t", "edge_t", // Cards D's grounds and rules.
+    "card_d", "line", "hover", "well_d",
 ];
 
 /// `c` mixed `t` toward the grey of its own relative luminance, in linear
@@ -1988,6 +2130,59 @@ mod tests {
         assert_eq!((r.add_bg, r.del_bg, r.you_mark_t), (0x1c2023, 0x261e20, 0x81a1c1));
     }
 
+    /// Cards D's roles (cards4/proposal.md §1) meet their floors in every
+    /// theme and accent preset: the card a surface step off the canvas, its
+    /// hover and well off it, its hairline on all three; every text a row
+    /// draws on the card, its hover and the fail wash (at rest and at the
+    /// flush's 18 % peak, "Exit N"); `acc` on the card, the Ask pill and
+    /// the waiting wash; the Allow fill on the card and its text on it.
+    #[test]
+    fn cards_d_roles_meet_their_floors() {
+        for (name, raw) in palettes::THEMES {
+            for a in std::iter::once(None).chain(PRESETS.iter().map(|p| Some(p.1))) {
+                let (r, _) = resolve(&raw, a);
+                let at = |c: u32, g: &[u32], f: f64, what: &str| {
+                    for &g in g {
+                        assert!(contrast(c, g) >= f - 1e-9, "{name} {a:?}: {what} #{c:06x} on #{g:06x} is {:.3} < {f}", contrast(c, g));
+                    }
+                };
+                at(r.card_d, &[r.canvas], D_CARD, "card_d");
+                at(r.hover, &[r.card_d], D_CARD, "hover");
+                at(r.well_d, &[r.card_d], D_CARD, "well_d");
+                at(r.line, &[r.card_d, r.canvas, r.hover], D_LINE, "line");
+                // Every text on the grounds as painted (Shady #23 M3): the
+                // card, its hover, and each wash from the floored colours.
+                let [on_fail, on_wait, on_ask, on_out] = d_wash_texts(&r);
+                let named = |c: u32| format!("#{c:06x}");
+                for c in &on_fail {
+                    at(*c, &[r.card_d, r.hover, r.wash_fail, r.wash_fail_pk], TEXT, &format!("{} on the fail washes", named(*c)));
+                }
+                for c in &on_wait {
+                    at(*c, &[r.card_d, r.wash_wait, r.wash_wait_pk], TEXT, &format!("{} on the wait washes", named(*c)));
+                }
+                for c in &on_ask {
+                    at(*c, &[r.ask_flush], TEXT, "on the authorize card's flush");
+                }
+                for c in &on_out {
+                    at(*c, &[r.out_press], TEXT, "the outlined Allow, pressed");
+                }
+                // Each is the proposal's own where that reads, never louder,
+                // and the flush's peak never under its rest.
+                assert_eq!(r.wash_fail, mix(r.card_d, r.err, f64::from(D_FAIL_REST)), "{name} {a:?}: the fail rest reads as specified");
+                assert!(contrast(r.wash_fail_pk, r.card_d) >= contrast(r.wash_fail, r.card_d) - 1e-9, "{name} {a:?}");
+                assert!(contrast(r.wash_fail_pk, r.card_d) <= contrast(mix(r.card_d, r.err, f64::from(D_FAIL_PEAK)), r.card_d) + 1e-9);
+                assert!(contrast(r.wash_wait_pk, r.card_d) >= contrast(r.wash_wait, r.card_d) - 1e-9, "{name} {a:?}");
+                at(r.res, &[r.well_d], TEXT, "res");
+                at(r.dim_o, &[r.well_d], TEXT, "dim_o");
+                at(r.acc, &[r.card_d, r.hover, r.acc_soft, r.wash_wait, r.wash_wait_pk], TEXT, "acc");
+                at(r.acc_ink, &[r.btn_fill, r.btn_hi], TEXT, "acc_ink");
+                at(r.acc_line, &[r.card_d], D_ACC_LINE, "acc_line");
+                at(r.acc_soft, &[r.card_d], D_SOFT_OFF, "acc_soft");
+                at(r.btn_fill, &[r.card_d], MARK, "the Allow fill");
+            }
+        }
+    }
+
     /// The diff washes stand 1.10:1 off the well's ground (audit E2: they
     /// were up to 2.02:1 off the canvas against the card's 1.24–1.48), and
     /// off the canvas at most 0.15 louder than the card, but in
@@ -2287,6 +2482,16 @@ mod tests {
             "press_ch",
             "press_k",
             "btn_press",
+            // Cards D: the accent's own roles (cards4/proposal.md §1).
+            "acc",
+            "acc_soft",
+            "acc_line",
+            "acc_ink",
+            // ... and its washes as painted (Shady #23 M3).
+            "wash_wait",
+            "wash_wait_pk",
+            "ask_flush",
+            "out_press",
         ];
         for (name, raw) in palettes::THEMES {
             let (a, base) = resolve(&raw, None);

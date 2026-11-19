@@ -15,7 +15,7 @@
 //! - Inline (F8, narrow panes): the band hides live rows, so it takes the
 //!   pointer but not the wheel (nothing hidden under it can be clicked or
 //!   hovered; the wheel still scrolls the list), and it hides the beat
-//!   layer's spinners and sweeps under it ([`crate::motion::Motion::cover_top`]).
+//!   layer's spinners and orbits under it ([`crate::motion::Motion::cover_top`]).
 //!
 //! What it assumes of the list:
 //! - No top padding: GPUI's `bounds_for_item` leaves `padding.top` out while

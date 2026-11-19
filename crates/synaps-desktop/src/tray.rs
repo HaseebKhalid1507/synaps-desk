@@ -25,7 +25,7 @@ use gpui_kit::*;
 use crate::app::{AppView, WORKER_KEY, column, display, mono};
 use crate::fonts::TextPx as _;
 use crate::fonts::{self, label};
-use crate::glyph::{self, Glyph, Ground};
+use crate::glyph::{self, Ground};
 use crate::menu::At;
 use crate::motion::{self, Tag};
 use crate::subagents::{Live, Liveness, Status, fmt_secs};
@@ -815,7 +815,7 @@ impl AppView {
             .border_color(p.warn_mark)
             .cursor_pointer()
             .hover(|d| d.bg(p.card_hi))
-            .child(glyph::lead(Some(glyph::draw(Glyph::Needs, mark)), m))
+            .child(glyph::lead(Some(glyph::needs(glyph::needs_ping(&self.fx, true), mark, p.card)), m))
             .child(display(label::NEEDS_YOU, m.meta, word).flex_none())
             .child(
                 div()
