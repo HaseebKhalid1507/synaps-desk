@@ -1023,6 +1023,12 @@ pub(crate) struct Slack {
     left: bool,
     /// The list it is in ([`AppView::list_gen`]).
     list: u64,
+    /// The user's own scroll since it was held, any (the wheel, a finger,
+    /// their coast, a jump, the bar; `left` takes one past END_SLOP).
+    /// Until there is one, the room used up lands the list at its true end,
+    /// whatever `rest` reads: a splice the hold's sums missed can leave it
+    /// short, never stranded there (#23 r9).
+    input: bool,
     /// The list's viewport height at its last frame: a view that got
     /// shorter under it (the composer, the dock, a resize) lifts the list
     /// by as much while it is held at the end (Shady #23 r4 H1).
@@ -4098,6 +4104,7 @@ impl AppView {
             held: true,
             left,
             list: self.list_gen,
+            input: prev.is_some_and(|s| s.input),
             vh: if left { view } else { vh },
             fresh: None,
         }));
@@ -4332,6 +4339,7 @@ impl AppView {
             self.fold_slack.set(None);
             return folding;
         }
+        s.input |= touched;
         let max = f32::from(self.list.max_offset_for_scrollbar().y);
         let at = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
         // The view got shorter under it (the composer growing, the dock's
@@ -4413,11 +4421,14 @@ impl AppView {
             self.fold_slack.set(None);
             // Used up by rows growing in under it, the list's top held:
             // it follows the tail again (GPUI resumes only at the exact
-            // end, and the last frame's growth may be past it), if it is
+            // end, and the last frame's growth may be past it). With no
+            // scroll of the user's since it was held, at its true end,
+            // however short of it the list reads (`rest` is a hint: a
+            // splice the sums missed, #23 r9); after one, only if it is
             // still at its end: never back there from where a scroll took
             // it, nor while a click holds its row (a body opening, a fold).
             let clicked = self.body_hold.get().is_some() || self.fold_gap.borrow().iter().any(|g| g.hold);
-            if s.gone.is_none() && !s.left && !clicked && rest <= END_SLOP {
+            if s.gone.is_none() && !s.left && !clicked && (!s.input || rest <= END_SLOP) {
                 self.list.scroll_to_end();
             }
             return folding;
@@ -4886,6 +4897,7 @@ impl AppView {
                     held: false,
                     left: false,
                     list: self.list_gen,
+                    input: false,
                     vh: f32::from(self.list.viewport_bounds().size.height),
                     fresh: Some(self.fx.frame()),
                 }));
