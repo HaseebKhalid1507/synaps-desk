@@ -1,5 +1,5 @@
-//! Cards D (cards4/proposal.md §1–§4): a run of tool calls is one soft
-//! card on `card_d` in a 1 px `line` hairline, square (Haseeb, #23 r7); each call is
+//! Cards D (cards4/proposal.md §1–§4): a run of tool calls is one
+//! square card (Haseeb, #23 r7) on `card_d` in a 1 px `line` hairline; each call is
 //! one quiet 34 px row inside it (a life glyph, the verb in Sans, the
 //! target in mono, the facts right in small grey Sans, a state word, the
 //! chevron); its body sits in a `well_d` lined up under the verb. The list

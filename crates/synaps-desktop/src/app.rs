@@ -5542,6 +5542,20 @@ impl AppView {
         self.list.reset(0);
     }
 
+    /// Whether the list lays out from its top row next frame: not following
+    /// the tail, or held, paused before its layout (a room at its end, a
+    /// body or a fold the user clicked, an unfold's rows: [`Self::tail_slack`],
+    /// [`Self::hold_unfold`]). Held at its end, GPUI re-arms following after
+    /// each layout (`ListState::is_following_tail` is true between frames),
+    /// and the next frame's hold pauses it again.
+    fn holds_top(&self) -> bool {
+        !self.list.is_following_tail()
+            || self.fold_slack.get().is_some_and(|s| s.list == self.list_gen && s.gone.is_none() && !s.left && s.fresh.is_none())
+            || self.body_hold.get().is_some()
+            || self.fold_gap.borrow().iter().any(|g| g.hold)
+            || !self.unfold_hold.is_empty()
+    }
+
     /// Display rows from item `start` (a turn's start) on.
     /// Returns a run that folded here (its summary went from open to
     /// closed), as it was on screen: [`AppView::start_gap`].
@@ -5574,8 +5588,24 @@ impl AppView {
                     && old.iter().any(|o| o.id == n.id && matches!(o.kind, Kind::Summary { open: true, .. } | Kind::Work))
             });
             folded = closed.map(|c| self.folded(c.id, at + range.start, at + range.end, fresh));
-            self.list.splice(at + range.start..at + range.end, count);
-            self.disp.splice(at + range.start..at + range.end, new[range.start..range.start + count].iter().copied());
+            // The list's top row in the splice, the list holding its top (a
+            // reader scrolled back, a room held at its end): GPUI puts its
+            // top at the splice's start, offset 0 (`ListState::splice`), and
+            // the column drops by however far into that row the view was,
+            // short of its end for good (Shady #23 r6 H1). The same row,
+            // found again, keeps its offset, as `fold_all_runs` keeps its
+            // own. A fold places the list itself ([`Self::start_gap`]).
+            let spliced = at + range.start..at + range.end;
+            let top = self.list.logical_scroll_top();
+            let kept = (folded.is_none() && self.holds_top() && spliced.contains(&top.item_ix))
+                .then(|| (self.disp[top.item_ix].id, std::mem::discriminant(&self.disp[top.item_ix].kind)));
+            self.list.splice(spliced.clone(), count);
+            self.disp.splice(spliced, new[range.start..range.start + count].iter().copied());
+            if let Some((id, kind)) = kept
+                && let Some(ix) = self.disp.iter().position(|d| d.id == id && std::mem::discriminant(&d.kind) == kind)
+            {
+                self.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: top.offset_in_item });
+            }
         }
         // A full build per sync: bounded, so long sessions stay usable in dev builds.
         debug_assert!(

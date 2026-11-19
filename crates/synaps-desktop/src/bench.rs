@@ -744,13 +744,18 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         // the run's end streams until it has used the room
                         // up, and on (the list follows; #23 r6's h5 film).
                         // `SYNAPS_BENCH_HELD=still`: the composer stays.
+                        // `SYNAPS_BENCH_HELD=own` (Shady #23 r6 H1 (a)): the
+                        // composer stays, and the run's own running call
+                        // (`s3`) streams on instead, each line splicing its
+                        // row (the list's top row in a short window).
                         // Marks on stderr: `HELD <what> <s>`.
                         if std::env::var("SYNAPS_BENCH_HELD").is_ok() {
                             let t0 = Instant::now();
                             let mark = |what: &str| eprintln!("HELD {what} {:.3}", t0.elapsed().as_secs_f64());
                             sleep(1.5).await;
                             mark("composer");
-                            let grow = std::env::var("SYNAPS_BENCH_HELD").is_ok_and(|v| v != "still");
+                            let how = std::env::var("SYNAPS_BENCH_HELD").unwrap_or_default();
+                            let grow = how != "still" && how != "own";
                             let _ = view.update_in(cx, |v, window, cx| {
                                 if !grow {
                                     return;
@@ -759,12 +764,21 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             });
                             sleep(1.5).await;
                             mark("stream");
-                            // A new call at the run's end: its output grows
-                            // into the room, then past it.
-                            apply(cx, vec![call("h0", "bash", cmd("cargo test -p relay --test held")), started("h0")]);
+                            let _ = upd(cx, &|v, _| {
+                                let t = v.list.logical_scroll_top();
+                                let id = v.model.shown().items().iter().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == "s3")).map(|i| i.id);
+                                let s3 = v.disp.iter().position(|d| Some(d.id) == id && d.kind == crate::turns::Kind::Work);
+                                eprintln!("HELD top {} +{:.0}, s3's row {s3:?}", t.item_ix, f32::from(t.offset_in_item));
+                            });
+                            // A new call at the run's end (or `s3`): its
+                            // output grows into the room, then past it.
+                            let into = if how == "own" { "s3" } else { "h0" };
+                            if into == "h0" {
+                                apply(cx, vec![call("h0", "bash", cmd("cargo test -p relay --test held")), started("h0")]);
+                            }
                             for k in 0..48 {
                                 sleep(0.25).await;
-                                apply(cx, vec![delta("h0", &format!("test held_{k} ... ok\n"))]);
+                                apply(cx, vec![delta(into, &format!("test held_{k} ... ok\n"))]);
                             }
                             mark("done");
                         }
