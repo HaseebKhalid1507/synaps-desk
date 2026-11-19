@@ -1,5 +1,5 @@
 //! Cards D (cards4/proposal.md §1–§4): a run of tool calls is one soft
-//! card on `card_d` in a 1 px `line` hairline, 6 px corners; each call is
+//! card on `card_d` in a 1 px `line` hairline, square (Haseeb, #23 r7); each call is
 //! one quiet 34 px row inside it (a life glyph, the verb in Sans, the
 //! target in mono, the facts right in small grey Sans, a state word, the
 //! chevron); its body sits in a `well_d` lined up under the verb. The list
@@ -30,15 +30,34 @@ pub(crate) struct Geo {
     /// A body's indent from the row's edge: the verb column.
     pub indent: f32,
     pub chevron: f32,
+    /// The corners of a card (a run's, the authorize card): square, as
+    /// every radius here (Haseeb, #23 r7). Buttons, the checkbox, dots and
+    /// the lattice keep their own.
     pub radius: f32,
+    /// A row's inside a card (its hover's wash).
     pub row_radius: f32,
+    /// A well's: a call's body (its diff, its output), the authorize
+    /// card's command box.
+    pub well_radius: f32,
 }
 
 impl Geo {
     pub(crate) fn of(m: &Metrics) -> Self {
         let px = |v: f32| (v * m.r).round();
         let (pad, gap, glyph) = (px(10.), px(10.), crate::glyph::LIFE);
-        Geo { inset: 3., row: px(34.), pad, gap, glyph, verb: px(56.), indent: pad + glyph + gap, chevron: 10., radius: 6., row_radius: 4. }
+        Geo {
+            inset: 3.,
+            row: px(34.),
+            pad,
+            gap,
+            glyph,
+            verb: px(56.),
+            indent: pad + glyph + gap,
+            chevron: 10.,
+            radius: 0.,
+            row_radius: 0.,
+            well_radius: 0.,
+        }
     }
 }
 
