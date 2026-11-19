@@ -740,22 +740,31 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         });
                         // `SYNAPS_BENCH_HELD=1` (Shady #23 r4 H1): the room the
                         // card left held at the list's end, the composer
-                        // grows three lines (a steer), then output streams
-                        // until it has used the room up, and on (the list
-                        // follows). Marks on stderr: `HELD <what> <s>`.
+                        // grows three lines (a steer), then a new call at
+                        // the run's end streams until it has used the room
+                        // up, and on (the list follows; #23 r6's h5 film).
+                        // `SYNAPS_BENCH_HELD=still`: the composer stays.
+                        // Marks on stderr: `HELD <what> <s>`.
                         if std::env::var("SYNAPS_BENCH_HELD").is_ok() {
                             let t0 = Instant::now();
                             let mark = |what: &str| eprintln!("HELD {what} {:.3}", t0.elapsed().as_secs_f64());
                             sleep(1.5).await;
                             mark("composer");
+                            let grow = std::env::var("SYNAPS_BENCH_HELD").is_ok_and(|v| v != "still");
                             let _ = view.update_in(cx, |v, window, cx| {
+                                if !grow {
+                                    return;
+                                }
                                 v.composer.update(cx, |s, cx| s.set_value("steer: and the relay too\nkeep the old token\nthen run it again", window, cx))
                             });
                             sleep(1.5).await;
                             mark("stream");
+                            // A new call at the run's end: its output grows
+                            // into the room, then past it.
+                            apply(cx, vec![call("h0", "bash", cmd("cargo test -p relay --test held")), started("h0")]);
                             for k in 0..48 {
-                                apply(cx, vec![delta("s3", &format!("test held_{k} ... ok\n"))]);
                                 sleep(0.25).await;
+                                apply(cx, vec![delta("h0", &format!("test held_{k} ... ok\n"))]);
                             }
                             mark("done");
                         }

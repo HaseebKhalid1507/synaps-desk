@@ -1027,6 +1027,20 @@ pub(crate) struct Slack {
     /// shorter under it (the composer, the dock, a resize) lifts the list
     /// by as much while it is held at the end (Shady #23 r4 H1).
     vh: f32,
+    /// An answered card's room, from the frame it landed until a layout
+    /// has measured the list without the card's row (#23 r6). The row
+    /// goes in that frame's splice, and GPUI moves a top row inside a
+    /// splice to the splice's start, offset 0 (`ListState::splice_focusable`):
+    /// following, its layout never reads that (it lays out from the end);
+    /// paused, it is the view, up to the card's height off where it was,
+    /// short of its end for good. And the content the room was measured
+    /// against still had the card's row. So the list goes on following
+    /// meanwhile (the room under its last row: where the view's bottom
+    /// was), and right after that frame's layout ([`land_card_room`]) the
+    /// room's base is read and the hold begins: before it, the list's sums
+    /// have neither the card's row nor, at the list's end, the room the row
+    /// drew under it. Its number: the frame it landed in.
+    fresh: Option<u64>,
 }
 
 impl Slack {
@@ -1237,6 +1251,24 @@ pub(crate) fn held_back(hold: &Cell<bool>, pending: bool, following: bool) -> bo
         hold.set(false);
     }
     pause
+}
+
+/// An answered card's room, laid out in the frame it landed in (the list
+/// following, from its end, the room under its last row: [`Slack::fresh`]):
+/// the content it is held against is the list's now, without it, and the
+/// list holds its top row from this layout on (the anchor GPUI's splice of
+/// the card's row may have moved is not read: a layout from the end set a
+/// new one).
+fn land_card_room(list: &ListState, slack: &Cell<Option<Slack>>) {
+    let Some(mut s) = slack.get().filter(|s| s.fresh.is_some()) else { return };
+    let view = f32::from(list.viewport_bounds().size.height);
+    s.base = (f32::from(list.max_offset_for_scrollbar().y) + view - s.last).round();
+    s.vh = view;
+    s.fresh = None;
+    slack.set(Some(s));
+    if s.gone.is_none() && !s.left {
+        list.pause_following_tail();
+    }
 }
 
 /// The transcript list's bottom padding: its end sits this far over the
@@ -1831,7 +1863,7 @@ pub struct AppView {
     /// (the answered row holds still) and after it landed, until rows that
     /// grow in under it use it up, the list leaves its end, or the turn
     /// ends (then on `sheet`, with its run's fold) ([`AppView::tail_slack`]).
-    pub(crate) fold_slack: Cell<Option<Slack>>,
+    pub(crate) fold_slack: Rc<Cell<Option<Slack>>>,
     /// The runs folding while watched: each one's rows' room under its
     /// summary, each on its own spring ([`FoldGap`], [`AppView::fold_gap_now`];
     /// a second fold never cuts the first: Shady #23 r3 M2).
@@ -2484,7 +2516,7 @@ impl AppView {
             layer: None,
             card_at: None,
             card_exit: None,
-            fold_slack: Cell::new(None),
+            fold_slack: Rc::new(Cell::new(None)),
             fold_gap: RefCell::new(Vec::new()),
             list_gen: 0,
             metrics_last: Cell::new(None),
@@ -4067,6 +4099,7 @@ impl AppView {
             left,
             list: self.list_gen,
             vh: if left { view } else { vh },
+            fresh: None,
         }));
     }
 
@@ -4314,7 +4347,18 @@ impl AppView {
         let vh = f32::from(self.list.viewport_bounds().size.height);
         let end = self.list_end();
         let measured = self.list.is_scrolled_to_end().is_some() || max <= 0.;
-        let lift = if !measured || s.left || s.vh <= 0. { 0. } else { (s.vh - vh).min(end - at).max(0.) };
+        // A card's room that has just landed ([`Slack::fresh`]): following,
+        // the list keeps its end at the view's bottom, a view that changed
+        // too, and the hold begins after its layout ([`land_card_room`]).
+        // A frame that drew no list (another pane): its first measured one.
+        if s.fresh.is_some_and(|f| self.fx.frame() > f) && measured {
+            s.base = (max + vh - s.last).round();
+            s.fresh = None;
+        } else if s.fresh.is_some() && touched {
+            // A scroll as it landed: the room's, once it is measured.
+            self.touch_kept.set(true);
+        }
+        let lift = if !measured || s.left || s.vh <= 0. || s.fresh.is_some() { 0. } else { (s.vh - vh).min(end - at).max(0.) };
         if measured {
             s.vh = vh;
         }
@@ -4330,7 +4374,7 @@ impl AppView {
         // under the content, out of sight; following the tail it moved the
         // column by each frame's growth.
         let mut room = s.last;
-        if max > 0. && s.gone.is_none() {
+        if max > 0. && s.gone.is_none() && s.fresh.is_none() {
             let content = max + f32::from(self.list.viewport_bounds().size.height) - s.last;
             room = s.given - (content - s.base).max(0.);
         }
@@ -4344,7 +4388,7 @@ impl AppView {
         // frame (M3 (b)), and never a slide under the reader either; rows
         // growing in still take it. Out of sight (all of it under the
         // view's bottom): it goes. Back at the end: held again.
-        if s.gone.is_none() && !s.left && touched && rest > END_SLOP {
+        if s.gone.is_none() && !s.left && s.fresh.is_none() && touched && rest > END_SLOP {
             s.left = true;
         } else if s.left && rest <= END_SLOP {
             s.left = false;
@@ -4378,7 +4422,7 @@ impl AppView {
             }
             return folding;
         }
-        if s.gone.is_none() && !s.left {
+        if s.gone.is_none() && !s.left && s.fresh.is_none() {
             self.list.pause_following_tail();
         }
         self.fold_slack.set(Some(s));
@@ -4843,6 +4887,7 @@ impl AppView {
                     left: false,
                     list: self.list_gen,
                     vh: f32::from(self.list.viewport_bounds().size.height),
+                    fresh: Some(self.fx.frame()),
                 }));
                 self.card_exit = None;
             }
@@ -7266,6 +7311,12 @@ impl Render for AppView {
         // provisional (GPUI re-arms following only on a real one), so the
         // hold lasts until GPUI re-arms or a layout has nothing pending
         // ([`held_back`]).
+        // After the list's layout: an answered card's room that landed this
+        // frame begins its hold ([`land_card_room`]).
+        let landing = self.fold_slack.get().is_some_and(|s| s.fresh.is_some()).then(|| {
+            let (l, slack) = (self.list.clone(), self.fold_slack.clone());
+            canvas(move |_, _, _| land_card_room(&l, &slack), |_, _, _, _| {}).absolute().size_0()
+        });
         let hold_back = self.hold_back.get().then(|| {
             let (held, hold, texts) = (self.list.clone(), self.hold_back.clone(), self.texts.clone());
             canvas(
@@ -7325,6 +7376,7 @@ impl Render for AppView {
                         .child(crate::scroll::owner(self.scroller.clone(), self.fx.clone()))
                         .children(unpainted)
                         .children(hint_frame)
+                        .children(landing)
                         .children(hold_back)
                         .child(transcript_bar),
                 )
