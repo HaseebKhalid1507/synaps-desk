@@ -2327,7 +2327,7 @@ impl AppView {
 }
 
 /// An opened call's body (cards4/proposal.md §3): under its row on
-/// `well_d`, radius 4, no frame, indented to the verb column (36 px from
+/// `well_d`, square ([`crate::cards::Geo::well_radius`]), no frame, indented to the verb column (36 px from
 /// the row's edge), to the card's inner edge. An edit's lines full width on
 /// their washes, the sign hanging in an 18 px column; a read's with the
 /// file's own numbers right-aligned in a 30 px column; any other output as
@@ -2372,7 +2372,7 @@ fn well(row: &RowCache, failed: bool, id: u64, streamed: &[(usize, f32, f32)], p
         .mr(px(g.pad))
         .mt(px(1.))
         .mb(px((8. * m.r).round()))
-        .rounded(px(4.))
+        .rounded(px(g.well_radius))
         .overflow_hidden()
         .bg(p.well_d)
         .text_color(p.res)

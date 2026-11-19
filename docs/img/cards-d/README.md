@@ -133,6 +133,9 @@ is a click (`toggle_run`); the turn-end fold (f≈776) is the only tail-followin
 | `r4-N2-unfold-stagger-no-scroll-f1284-1312.png` | the unfold mid-screen with no scroll (every 2nd frame): the rows arrive one after another under a still header |
 | `r4-S1-body-opens-shows-first-lines-f2034-2074.png` | the last call's body opened at the very bottom: the row holds while it opens under the view, then the list glides just far enough to show it: 39 px over f2056–2070 (the design gate's measure; r4's "~9 px" was wrong). In r4 the glide began 9 still frames (150 ms) after the reveal landed (f2046 → f2056); round 5 starts it as the reveal settles (85 % in) |
 | `r4-H2-slow-scroll-while-streaming-f2330-2500-2690-2840.png` | output streaming while the reader scrolls up 0.5 px a frame: the column only moves up (block match f2330–2840: 215 one-px steps, all one way, never toward the end), and after the scroll stops (f≈2690) nothing moves |
+| `r7-square-run-diff-1920.png` | round 7 (Haseeb): square tool cards. `--offline` at 1920, scrolled up: the run card, its rows and the diff wells, every corner 0 px |
+| `r7-square-approval-1920.png` | the approval card and its command box, square; Deny, Allow and the checkbox keep theirs (5 px, 3 px) |
+| `r7-square-1280.png` | the same at 1280 |
 
 S5, the 1280 turn-end fold with its header off screen (`l5-full` f782–840, block match on the
 column): 4, 28, 18, 32, 22, 11, 45, 11, 42, 19, 9, 36, 16, 7, 28, 12, 16, 10, 5, 17, 3, 14, … Still
