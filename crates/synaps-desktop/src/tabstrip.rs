@@ -260,9 +260,9 @@ impl AppView {
     /// changes (an arrow click scrolls without changing it).
     pub(crate) fn render_tabs(&mut self, pane: f32, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let key = (self.model.rail_gen, self.model.tabs.generation);
-        if self.tab_labels.key != key || self.tab_labels.labels.len() != self.model.tabs.len() {
+        if self.panes.cur.tab_labels.key != key || self.panes.cur.tab_labels.labels.len() != self.model.tabs.len() {
             let labels = self.model.tabs.iter().map(|t| self.tab_label(t)).collect();
-            self.tab_labels = Labels { key, labels, arrows: std::mem::take(&mut self.tab_labels.arrows) };
+            self.panes.cur.tab_labels = Labels { key, labels, arrows: std::mem::take(&mut self.panes.cur.tab_labels.arrows) };
         }
         let tabs = &self.model.tabs;
         let n = tabs.len();
@@ -273,35 +273,35 @@ impl AppView {
         // A resize or a panel drag that changes how many tabs fit brings
         // the visible one back in; arrow scrolls change neither.
         let fit = fits(n, room);
-        let follow = visible != self.tab_follow || fit != self.tab_room;
-        let lay = strip(n, active, room, self.tab_first, follow);
-        self.tab_first = lay.first;
-        self.tab_follow = visible;
-        self.tab_room = fit;
+        let follow = visible != self.panes.cur.tab_follow || fit != self.panes.cur.tab_room;
+        let lay = strip(n, active, room, self.panes.cur.tab_first, follow);
+        self.panes.cur.tab_first = lay.first;
+        self.panes.cur.tab_follow = visible;
+        self.panes.cur.tab_room = fit;
         // Opens and closes (fluid.md §3.5): a tab not there last frame
         // springs its width from 0; one gone leaves a ghost springing to 0.
         let snap = crate::motion::SNAP_RESPONSE;
         let ids: Vec<u64> = tabs.iter().map(|t| t.id).collect();
         let full = self.fx.level() == crate::motion::Level::Full;
-        let fresh: Vec<u64> = match &self.tab_fx.ids {
+        let fresh: Vec<u64> = match &self.panes.cur.tab_fx.ids {
             Some(last) if full => ids.iter().filter(|id| !last.contains(id)).copied().collect(),
             _ => Vec::new(),
         };
-        if full && self.tab_fx.ids.is_some() {
-            for (k, (id, w, label, named)) in self.tab_fx.drawn.iter().enumerate() {
-                if !ids.contains(id) && !self.tab_fx.ghosts.iter().any(|g| g.id == *id) {
-                    let after = k.checked_sub(1).map(|j| self.tab_fx.drawn[j].0);
-                    self.fx.spring_jump(crate::motion::key(CLOSE_W, *id), *w, 0., snap);
-                    self.tab_fx.ghosts.push(Ghost { id: *id, after, width: *w, label: label.clone(), named: *named, shown: *w });
+        if full && self.panes.cur.tab_fx.ids.is_some() {
+            for (k, (id, w, label, named)) in self.panes.cur.tab_fx.drawn.iter().enumerate() {
+                if !ids.contains(id) && !self.panes.cur.tab_fx.ghosts.iter().any(|g| g.id == *id) {
+                    let after = k.checked_sub(1).map(|j| self.panes.cur.tab_fx.drawn[j].0);
+                    self.fx.spring_jump(self.panes.cur.id.salt(crate::motion::key(CLOSE_W, *id)), *w, 0., snap);
+                    self.panes.cur.tab_fx.ghosts.push(Ghost { id: *id, after, width: *w, label: label.clone(), named: *named, shown: *w });
                 }
             }
         } else {
-            self.tab_fx.ghosts.clear();
+            self.panes.cur.tab_fx.ghosts.clear();
         }
-        self.tab_fx.ids = Some(ids);
+        self.panes.cur.tab_fx.ids = Some(ids);
         let fx = &self.fx;
-        self.tab_fx.ghosts.retain_mut(|g| {
-            let (w, moving) = fx.spring(crate::motion::key(CLOSE_W, g.id), Some(g.width), 0., snap);
+        self.panes.cur.tab_fx.ghosts.retain_mut(|g| {
+            let (w, moving) = fx.spring(self.panes.cur.id.salt(crate::motion::key(CLOSE_W, g.id)), Some(g.width), 0., snap);
             g.shown = w;
             moving && w >= 0.5
         });
@@ -310,7 +310,7 @@ impl AppView {
             Tab(usize, f32, bool),
             Ghost(usize),
         }
-        let ghosts = &self.tab_fx.ghosts;
+        let ghosts = &self.panes.cur.tab_fx.ghosts;
         let mut slots = Vec::with_capacity(lay.shown + ghosts.len());
         let mut placed = vec![false; ghosts.len()];
         let mut ghosts_after = |after: Option<u64>, slots: &mut Vec<Slot>| {
@@ -326,7 +326,7 @@ impl AppView {
             // A new tab's width springs from 0; after that (settled) a new
             // width is taken at once (a resize, a neighbour opening: fluid
             // §3.8 `follow`), as for every tab from launch.
-            let key = crate::motion::key(OPEN_W, t.id);
+            let key = self.panes.cur.id.salt(crate::motion::key(OPEN_W, t.id));
             let (w, opening) = if fresh.contains(&t.id) {
                 fx.spring(key, Some(0.), lay.width, snap)
             } else if fx.spring_at(key).is_some() {
@@ -362,14 +362,15 @@ impl AppView {
         // The indicator is the selected tab's (its attach may still be on
         // its way: the strip shows it selected at once).
         let selected = active.and_then(|i| tabs.iter().nth(i)).map(|t| t.id);
-        let moved = full && selected.is_some() && self.tab_fx.shown.is_some() && selected != self.tab_fx.shown;
+        let moved = full && selected.is_some() && self.panes.cur.tab_fx.shown.is_some() && selected != self.panes.cur.tab_fx.shown;
         let mut quads = None;
         if let (Some((x, w)), Some((tx, tw))) = (goal, target) {
-            if moved && let (Some(x0), Some(w0)) = (fx.spring_at(IND_X), fx.spring_at(IND_W)) {
-                fx.spring_jump(IND_X, x0, x, snap);
-                fx.spring_jump(IND_W, w0, w, snap);
+            let (ind_x, ind_w) = (self.panes.cur.id.salt(IND_X), self.panes.cur.id.salt(IND_W));
+            if moved && let (Some(x0), Some(w0)) = (fx.spring_at(ind_x), fx.spring_at(ind_w)) {
+                fx.spring_jump(ind_x, x0, x, snap);
+                fx.spring_jump(ind_w, w0, w, snap);
             }
-            let ((qx, mx), (qw, mw)) = (fx.spring_held(IND_X, x, snap), fx.spring_held(IND_W, w, snap));
+            let ((qx, mx), (qw, mw)) = (fx.spring_held(ind_x, x, snap), fx.spring_held(ind_w, w, snap));
             // Drawn as the quad while it moves, or while its tab is still
             // on its way to the slot under it.
             if mx || mw || (full && ((tx - x).abs() >= 0.5 || (tw - w).abs() >= 0.5)) {
@@ -380,7 +381,7 @@ impl AppView {
         // it lands, the tab's bar draws left to right over `quick` (the
         // undrawn part covered in the tab's own fill).
         let mut cover = None;
-        if let Some(tr) = self.tracer.as_mut() {
+        if let Some(tr) = self.panes.cur.tracer.as_mut() {
             let mut x = if lay.overflow { ARROW_W } else { 0. };
             let mut at = None;
             for slot in &slots {
@@ -394,11 +395,11 @@ impl AppView {
                     Slot::Ghost(k) => x += ghosts[k].shown,
                 }
             }
-            let origin = self.strip_at.get();
+            let origin = self.panes.cur.strip_at.get();
             tr.to = at.map(|(x, _)| point(origin.x + px(x), origin.y));
             let k = fx.draw(Some(tr.at), crate::motion::BASE, crate::motion::QUICK);
             if at.is_none() || k >= 1. {
-                self.tracer = None;
+                self.panes.cur.tracer = None;
             } else if let Some((x, w)) = at {
                 cover = Some(div().absolute().top_0().left(px(x + w * k)).w(px(w * (1. - k))).h(px(2.)).bg(p.raised));
             }
@@ -415,7 +416,7 @@ impl AppView {
             };
             let Some(t) = tabs.iter().nth(ix) else { continue };
             let st = self.tab_state(t);
-            let (label, named) = self.tab_labels.labels.get(ix).cloned().unwrap_or_default();
+            let (label, named) = self.panes.cur.tab_labels.labels.get(ix).cloned().unwrap_or_default();
             // A worker of a session not attached here: as last seen (as
             // nothing, if this window holds nothing of its session).
             let worker = match (&t.worker, t.session.as_deref()) {
@@ -445,13 +446,13 @@ impl AppView {
                 .bg(p.raised)
                 .when(!needs, |d| d.child(div().absolute().top_0().left_0().right(px(1.)).h(px(2.)).bg(p.you_bar)))
         });
-        self.tab_fx.drawn = drawn;
-        self.tab_fx.shown = selected;
+        self.panes.cur.tab_fx.drawn = drawn;
+        self.panes.cur.tab_fx.shown = selected;
         let (before, after) = (lay.first, n - lay.first - lay.shown);
-        if lay.overflow && self.tab_labels.arrows.0 != (before, after) {
-            self.tab_labels.arrows = ((before, after), (format!("‹ {before}").into(), format!("{after} ›").into()));
+        if lay.overflow && self.panes.cur.tab_labels.arrows.0 != (before, after) {
+            self.panes.cur.tab_labels.arrows = ((before, after), (format!("‹ {before}").into(), format!("{after} ›").into()));
         }
-        let (left, right) = self.tab_labels.arrows.1.clone();
+        let (left, right) = self.panes.cur.tab_labels.arrows.1.clone();
         let arrow = |id: &'static str, text: SharedString, on: bool| {
             h_flex()
                 .id(id)
@@ -472,7 +473,7 @@ impl AppView {
             .overflow_hidden()
             .bg(p.chrome)
             .child({
-                let at = self.strip_at.clone();
+                let at = self.panes.cur.strip_at.clone();
                 canvas(move |b, _, _| at.set(b.origin), |_, _, _, _| {}).absolute().inset_0()
             })
             .children(quads)
@@ -480,7 +481,7 @@ impl AppView {
             .border_color(p.hair)
             .when(lay.overflow, |d| {
                 d.child(arrow("tabs-left", left, before > 0).border_r_1().border_color(p.hair).on_click(cx.listener(|this, _, _, cx| {
-                    this.tab_first = this.tab_first.saturating_sub(1);
+                    this.panes.cur.tab_first = this.panes.cur.tab_first.saturating_sub(1);
                     cx.notify();
                 })))
             })
@@ -488,7 +489,7 @@ impl AppView {
             .children(cover)
             .when(lay.overflow, |d| {
                 d.child(arrow("tabs-right", right, after > 0).on_click(cx.listener(|this, _, _, cx| {
-                    this.tab_first += 1;
+                    this.panes.cur.tab_first += 1;
                     cx.notify();
                 })))
             })
@@ -548,7 +549,12 @@ impl AppView {
         let fx = &self.fx;
         // The label eases to `ink` over `quick` as its tab is shown, and
         // back over `hover_out` (fluid.md §3.5).
-        let k = fx.ease_to(crate::motion::key(LABEL, id), if on { 1. } else { 0. }, crate::motion::QUICK, crate::motion::HOVER_OUT);
+        let k = fx.ease_to(
+            self.panes.cur.id.salt(crate::motion::key(LABEL, id)),
+            if on { 1. } else { 0. },
+            crate::motion::QUICK,
+            crate::motion::HOVER_OUT,
+        );
         let title_color = crate::motion::mix(title_of(false), title_of(true), k);
         // NEEDS YOU first: a worker tab's session's prompt too. Its bar
         // draws left to right over `base` (motion.md §6.3).
@@ -562,7 +568,7 @@ impl AppView {
         };
         // Hover and press (fluid.md §3.9): the fill on over `hover_in`, off
         // over `hover_out`; held, `press_ch` and the content 1 px down.
-        let touch = crate::motion::key(TOUCH, id);
+        let touch = self.panes.cur.id.salt(crate::motion::key(TOUCH, id));
         let (fill, dy) = fx.fill(touch, p.chrome, (on && lit).then_some(p.raised), p.raised, p.press_ch);
         // The selected tab while the indicator's quads are up (it slides in
         // under them on a close, re-gate 2): no fill of its own, so it never

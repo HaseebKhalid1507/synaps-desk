@@ -904,7 +904,7 @@ impl AppView {
                 match valid(name, &arg) {
                     Some((_, arg)) => arg,
                     None => {
-                        self.watch_note = Some(usage(name).into());
+                        self.panes.cur.watch_note = Some(usage(name).into());
                         cx.notify();
                         return;
                     }
@@ -914,7 +914,7 @@ impl AppView {
         };
         self.close_palette(window, cx);
         if let Some(why) = e.off {
-            self.watch_note = Some(why);
+            self.panes.cur.watch_note = Some(why);
             cx.notify();
             return;
         }
@@ -946,17 +946,17 @@ impl AppView {
     /// (both doors: one rule). Its answer comes back as the composer's note.
     pub(crate) fn run_command(&mut self, name: &'static str, arg: String) -> bool {
         if let Err(why) = self.model.input_gate() {
-            self.watch_note = Some(not_here(name, why).into());
+            self.panes.cur.watch_note = Some(not_here(name, why).into());
             self.model.view_dirty = true;
             return false;
         }
         if self.model.transcript.busy() {
-            self.watch_note = Some(mid_turn(name).into());
+            self.panes.cur.watch_note = Some(mid_turn(name).into());
             self.model.view_dirty = true;
             return false;
         }
         let Some(c) = &self.client else {
-            self.watch_note = Some(format!("offline: /{name} not run").into());
+            self.panes.cur.watch_note = Some(format!("offline: /{name} not run").into());
             return false;
         };
         if c.engine_command(name, arg).is_err() {
@@ -964,8 +964,8 @@ impl AppView {
             return false;
         }
         log::debug!(target: "synaps_desktop::send", "/{name}");
-        self.watch_note = Some(format!("/{name}: sent, waiting for the daemon").into());
-        self.quiet_note = self.watch_note.clone();
+        self.panes.cur.watch_note = Some(format!("/{name}: sent, waiting for the daemon").into());
+        self.panes.cur.quiet_note = self.panes.cur.watch_note.clone();
         self.model.view_dirty = true;
         true
     }
@@ -1074,7 +1074,7 @@ impl AppView {
         let x = left + ((pane - w) / 2.).max(0.);
         let lines = pal.lines();
         let (ys, content) = line_y(&lines);
-        let strip = self.strip_at.get();
+        let strip = self.panes.cur.strip_at.get();
         let top = if strip.y > px(0.) { f32::from(strip.y) + crate::tabstrip::TAB_H + UNDER_STRIP } else { TOP };
         let bottom = if bottom > top { bottom } else { self.height };
         let max = LIST_MAX.min((bottom - ABOVE_COMPOSER - top - CHROME_H).max(ROW_H * 3.));

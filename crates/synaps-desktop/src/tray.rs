@@ -543,7 +543,7 @@ impl AppView {
         if chips.lines == 0 {
             return None;
         }
-        let lay = self.layout;
+        let lay = self.panes.cur.layout;
         let cramped = lay.form() == crate::fit::Form::Cramped;
         let watched = self.model.watch.focused().map(|w| w.subagent_id);
         let row_h = crate::fit::tray_row(m);
@@ -554,7 +554,8 @@ impl AppView {
         // after the composer's when you steer it (Handoff out).
         let watch_at = fx.change(Tag::Watched, 0, watched.unwrap_or(0), None).filter(|_| watched.is_some()).map(|c| c.0);
         let you_drawn = fx.draw(watch_at, std::time::Duration::ZERO, motion::QUICK);
-        let steer = fx.flash(fx.sent.get().filter(|s| s.1 && watched.is_some()).map(|s| s.0 + 2 * motion::STAGGER));
+        let steer =
+            fx.flash(fx.col(self.panes.cur.id).sent().get().filter(|s| s.1 && watched.is_some()).map(|s| s.0 + 2 * motion::STAGGER));
         let you_color = motion::mix(p.you_mark_t, motion::mix(p.you, p.ink, 0.35), steer);
         let mut lines: Vec<Vec<AnyElement>> = (0..chips.lines).map(|_| Vec::new()).collect();
         // Each line's next chip's cell: a chip whose cell changed (one
@@ -590,7 +591,7 @@ impl AppView {
                     // moves none. One that came rises 8 px and lifts from
                     // 70 %, in turn (polish.md P13).
                     let off = fx.slide(TRAY | r.id, line as f32 * (row_h + CHIP_GAP));
-                    let dx = fx.cell_slide(TRAY_X | r.id, col as u64, col as f32 * (w + CHIP_GAP));
+                    let dx = fx.cell_slide(self.panes.cur.id.salt(TRAY_X | r.id), col as u64, col as f32 * (w + CHIP_GAP));
                     let (travel, strength) = fx.arrival(fx.birth(TRAY | r.id));
                     let (bounds, id) = (self.chip_bounds.clone(), r.id);
                     at.push(
@@ -793,7 +794,7 @@ impl AppView {
         if !self.stub_shown() {
             return None;
         }
-        let lay = self.layout;
+        let lay = self.panes.cur.layout;
         // What waits: the card's gist (made once), as the top bar says it.
         let gist = self
             .current_card()
@@ -845,7 +846,7 @@ impl AppView {
         self.model.tabs.view().is_none()
             && !self.model.transcript.pending_prompts().is_empty()
             && (self.model.watch.focus().is_some() || !self.card_on_screen())
-            && (self.stub_away.is_none() || self.stub_away != self.model.card_key())
+            && (self.panes.cur.stub_away.is_none() || self.panes.cur.stub_away != self.model.card_key())
     }
 }
 

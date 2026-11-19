@@ -685,7 +685,7 @@ impl AppView {
     /// along the straight line from where the tab was opened to its top
     /// edge, 24 px of it behind, 2 px in `you_bar`, over everything.
     pub(crate) fn render_tracer(&self, p: &Palette) -> Option<impl IntoElement + use<>> {
-        let tr = self.tracer?;
+        let tr = self.panes.cur.tracer?;
         let to = tr.to?;
         let t = self.fx.shot(
             Some(tr.at),
@@ -846,7 +846,7 @@ impl AppView {
             d.child(crate::motion::roll_count(&self.fx, crate::motion::ROLL_PROBE, n, text, |t| mono(t, size::META, p.dim_ch).flex_none()))
         });
         h_flex()
-            .h(px(top_h(self.layout.short)))
+            .h(px(top_h(self.panes.cur.layout.short)))
             .flex_none()
             .pl(px(22.))
             .pr(px(24.))
@@ -1110,7 +1110,7 @@ impl AppView {
                 .debug_selector(move || id.into())
                 .group(group)
                 .absolute()
-                .top(px(top_h(self.layout.short)))
+                .top(px(top_h(self.panes.cur.layout.short)))
                 .bottom_0()
                 .left(px(left))
                 .w(px(EDGE))
@@ -2490,7 +2490,7 @@ impl AppView {
             );
         }
         let lifted = accent.is_some_and(|a| a != scheme.roles.you_bar || a != scheme.roles.focus);
-        let (top, bottom) = (top_h(self.layout.short), 140.);
+        let (top, bottom) = (top_h(self.panes.cur.layout.short), 140.);
         // Over the open right panel, at least two columns of names wide,
         // when that stays clear of the tab strip's `+` (it ends at the
         // column's right edge); else above the composer, under the tab
@@ -2498,12 +2498,12 @@ impl AppView {
         // The panel as drawn (it may be flying).
         let w = self.panel_fx.sides[1].shown;
         let place = match right {
-            Side::Open(_) if w.max(PICKER_MIN) - w + 8. <= self.layout.right => PickerAt::Top(w.max(PICKER_MIN)),
+            Side::Open(_) if w.max(PICKER_MIN) - w + 8. <= self.panes.cur.layout.right => PickerAt::Top(w.max(PICKER_MIN)),
             _ => PickerAt::Bottom(w + 24.),
         };
         let max_h = match place {
             PickerAt::Top(_) => self.height - top - 16.,
-            PickerAt::Bottom(_) => self.height - bottom - top - if self.layout.short { TABS_CLEAR_SHORT } else { TABS_CLEAR },
+            PickerAt::Bottom(_) => self.height - bottom - top - if self.panes.cur.layout.short { TABS_CLEAR_SHORT } else { TABS_CLEAR },
         };
         let body = v_flex()
             .flex_none()

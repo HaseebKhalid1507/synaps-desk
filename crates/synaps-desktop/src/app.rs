@@ -24,6 +24,7 @@ use crate::fonts::{self, label};
 use crate::glyph::{self, Ground};
 use crate::model::{CONFIRM_NO, CONFIRM_YES, ConnState, Effect, Model, RenameRequest};
 use crate::named::{ResumeRequest, RowAction, home_short};
+use crate::pane::{Pane, PaneId, Panes};
 use crate::rail::{Bucket, Chip};
 use crate::stats::Stats;
 use crate::subagents::Liveness;
@@ -113,7 +114,7 @@ pub(crate) struct TabCache {
     synced_busy: bool,
     files_gen: u64,
     waiting_on: Option<u64>,
-    /// The text metrics its heights were measured with ([`AppView::metrics_gen`]).
+    /// The text metrics its heights were measured with ([`Pane::metrics_gen`]).
     metrics_gen: u64,
     /// Its worker views (the one focused comes back focused).
     pub(crate) watch: Watch,
@@ -164,8 +165,8 @@ impl Toggled {
 
 /// The list's state over one transcript: its rows, folds, measured heights
 /// and scroll position. The session's waits here while a worker's view is
-/// shown ([`AppView::sync_pane`]), so neither ever moves the other.
-pub(crate) struct Pane {
+/// shown ([`AppView::sync_column`]), so neither ever moves the other.
+pub(crate) struct Column {
     rows: Vec<RowCache>,
     disp: Vec<Disp>,
     summaries: Summaries,
@@ -1003,7 +1004,7 @@ pub(crate) fn session_items(f: MenuFor) -> Vec<crate::menu::Item<SessionAct>> {
 /// The close-tab key as the session menu shows it.
 const CLOSE_KEY: &str = if cfg!(target_os = "macos") { "⌘W" } else { "Ctrl+W" };
 
-/// The room a folded card gave up ([`AppView::fold_slack`]): how much it
+/// The room a folded card gave up ([`Pane::fold_slack`]): how much it
 /// gave, the list's content without it when it landed, what was drawn,
 /// and once the turn ended, its going.
 #[derive(Clone, Copy, Debug)]
@@ -1021,7 +1022,7 @@ pub(crate) struct Slack {
     /// as content (rows growing in still take it, nothing moves), until
     /// it is out of sight, used up, or the list is back at its end.
     left: bool,
-    /// The list it is in ([`AppView::list_gen`]).
+    /// The list it is in ([`Pane::list_gen`]).
     list: u64,
     /// The user's own scroll since it was held, any (the wheel, a finger,
     /// their coast, a jump, the bar; `left` takes one past END_SLOP).
@@ -1061,7 +1062,7 @@ impl Slack {
 
 /// A body the user opened or closed (S1): its row's id, the content under
 /// the view when it began, whether it opens, the frame, and the list
-/// ([`AppView::list_gen`]).
+/// ([`Pane::list_gen`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BodyHold {
     id: u64,
@@ -1119,7 +1120,7 @@ pub(crate) struct Folded {
 #[derive(Clone, Debug)]
 pub(crate) struct FoldGap {
     id: u64,
-    /// The list it is in ([`AppView::list_gen`]): every transcript numbers
+    /// The list it is in ([`Pane::list_gen`]): every transcript numbers
     /// its items from 1 (Shady #23 r3 H1).
     list: u64,
     rows: Rc<[Disp]>,
@@ -1357,7 +1358,7 @@ impl Arm {
     }
 }
 
-pub(crate) use crate::authorize::{CardExit, CardLook, PromptCard};
+pub(crate) use crate::authorize::{CardExit, PromptCard};
 
 /// A well's hidden height: what is still below its view (`overflow`) and
 /// what of it is under the window's bottom.
@@ -1528,46 +1529,12 @@ pub struct AppView {
     /// Connection, sessions, attachment and transcript. Events are applied
     /// to it as they arrive (the pump), never queued for `render`.
     pub model: Model,
-    /// Per transcript item: its strings ([`RowCache`]).
-    pub(crate) rows: Vec<RowCache>,
-    /// The virtual list's rows ([`turns::build`]): turns, runs, folds.
-    pub(crate) disp: Vec<Disp>,
-    pub(crate) summaries: Summaries,
-    pub list: ListState,
-    /// Rows whose open/closed state the user flipped from its default, and
-    /// for a call the state they made it ([`Toggled`]).
-    pub(crate) toggled: Toggled,
-    /// Runs the user unfolded (by their first item's id).
-    open_runs: HashSet<u64>,
-    /// The rows an unfold under Full is revealing: tail-follow is held
-    /// paused while they do ([`Self::hold_unfold`]).
-    pub(crate) unfold_hold: Vec<u64>,
-    /// The transcript's `busy` at the last [`Self::sync_list`]: when it
-    /// falls, the last run may fold.
-    synced_busy: bool,
-    /// The files ledger's generation the rows' counts are from.
-    files_gen: u64,
-    /// The subagents' shape generation the rows were built at.
-    subs_gen: u64,
-    /// The session the rows are of.
-    rows_session: Option<String>,
-    /// The last call still unfinished: the one a prompt waits on.
-    pub(crate) waiting_on: Option<u64>,
-    /// The centre pane's column at the last frame.
-    pub(crate) layout: Layout,
-    /// What a rise of the list's top edge could not scroll (the list was
-    /// nearer its start), and where the list was then ([`AppView::keep_rows`]).
-    scroll_carry: Option<(f32, ListOffset)>,
-    /// The list's view grew while it was scrolled back: after this
-    /// frame's layout it must not have started following the tail.
-    hold_back: Rc<Cell<bool>>,
-    /// The markdown rows' text views, and whose parse is pending ([`turns::TextRows`]).
-    pub(crate) texts: Rc<RefCell<turns::Views>>,
+    /// The window's panes ([`crate::pane`]; split panes step 1: exactly
+    /// one): the list, its scroll and held rooms, the composer, the tab
+    /// strip's and the card's state, all that was here per view.
+    pub(crate) panes: Panes,
     /// Every pane's scrollbar ([`crate::scrollbar`]).
     pub(crate) bars: crate::scrollbar::Bars,
-    pub(crate) composer: Entity<TextareaState>,
-    /// The rows the composer's text grows to ([`crate::fit::composer_rows`]).
-    pub(crate) composer_rows: usize,
     /// The top bar's words, measured at the first frame.
     pub(crate) top_words: Option<crate::fit::TopWords>,
     /// The find field shows its placeholder's first word only (a rail too
@@ -1577,9 +1544,8 @@ pub struct AppView {
     /// session…" (the naming row's) inputs.
     pub(crate) find_input: Entity<InputState>,
     name_input: Entity<InputState>,
-    /// The accent picker's custom colour and a secret prompt's answer.
+    /// The accent picker's custom colour.
     pub(crate) hex_input: Entity<InputState>,
-    pub(crate) secret_input: Entity<InputState>,
     /// The find text, trimmed and lowercased.
     pub(crate) find: String,
     /// The count chip filtering the rail.
@@ -1653,48 +1619,13 @@ pub struct AppView {
     pub theme_profile: Option<String>,
     /// What following the config shows now (read when the picker opens).
     pub(crate) config_theme: SharedString,
-    /// The authorization card's prompt (see [`PromptCard`]).
-    pub(crate) card: Option<PromptCard>,
-    /// Its keys were live at the last frame ([`AppView::card_keys_live`]):
-    /// when they come back, they wait again ([`Arm`]).
-    keys_live: bool,
-    /// Enter and Esc, down and up ([`CardChord`]), and whether the last
-    /// of them to go down was a new press.
-    chord: CardChord,
-    chord_press: bool,
-    /// A secret card went away (answered elsewhere, re-delivered, another
-    /// tab) at this time, or a key reached the window since, within
-    /// [`ARM`] of the last: what is still being typed was meant for it,
-    /// so `/` does not open find ([`AppView::text_keys_blocked`]).
-    secret_left: Option<Instant>,
-    /// The naming row was open at the last layout ([`AppView::keep_rows`]
-    /// counts it as that layout had it).
-    layout_naming: bool,
     /// The running dot's step, and the 2 Hz timer while a turn runs.
     pub(crate) rail: crate::chrome::RailCache,
     pub(crate) focus: FocusHandle,
-    /// Refused input to put back in the composer (needs a `Window`: done
-    /// at the next frame).
-    restore: Option<String>,
-    /// A slash command the composer sent (its name, its text): the text
-    /// stays in the composer until the daemon has run it.
-    cmd_draft: Option<(String, String)>,
-    /// That text, run: out of the composer if it still holds it.
-    cmd_clear: Option<String>,
-    /// The note last set by a command that went out or was answered: shown
-    /// quiet (`dim`), not as a warning, while it is the note on screen.
-    pub(crate) quiet_note: Option<SharedString>,
     /// Each tab's composer draft by session (kept when its tab is left,
     /// put back when it is shown again), and the tab whose draft the
     /// composer holds.
     drafts: Drafts,
-    composer_of: Option<(u64, Option<String>)>,
-    /// Said in the composer's hint until the next send or switch (a draft
-    /// came back with a send the daemon did not take).
-    draft_note: Option<&'static str>,
-    /// Bumped when the text metrics change every row's height (a cached
-    /// tab's list is re-measured when it comes back).
-    metrics_gen: u64,
     pub bench: Option<BenchState>,
     /// Diagnostics: render rows as plain text instead of markdown.
     pub plain_rows: bool,
@@ -1739,26 +1670,11 @@ pub struct AppView {
     lists_seen: u64,
     /// The background tabs' sessions as last seen ([`TAB_CACHE`]).
     pub(crate) tab_cache: Lru<String, TabCache>,
-    /// The tab (and its session) the model and the list hold now.
-    pub(crate) shown_tab: Option<(u64, Option<String>)>,
-    /// A switch's attach waiting for the gate, and its timer.
-    attach_wait: Option<(String, Option<ResumeRequest>, bool)>,
-    attach_due: Option<Task<()>>,
-    gate: crate::tabs::AttachGate,
     /// Tells Ctrl+T / Ctrl+W / Ctrl+Shift+T presses from their repeats.
     tab_keys: FoldKeys,
     /// A once-per-press key whose action came and whose key-down has not
     /// yet ([`OnceKey`]).
     once: Option<OnceKey>,
-    /// The tab strip's first shown tab when they overflow, and the tab it
-    /// last kept in view.
-    pub(crate) tab_first: usize,
-    pub(crate) tab_follow: Option<u64>,
-    /// How many tabs the strip had room for at the last frame.
-    pub(crate) tab_room: usize,
-    pub(crate) tab_labels: crate::tabstrip::Labels,
-    /// What the strip's motion remembers ([`crate::tabstrip::TabFx`]).
-    pub(crate) tab_fx: crate::tabstrip::TabFx,
     /// The synthetic daemon's attach replies.
     pub(crate) attach_source: Option<AttachSource>,
     /// Settings and Usage ([`crate::views`]): their state, the dash channel
@@ -1808,41 +1724,11 @@ pub struct AppView {
     pub(crate) composer_bar: std::cell::Cell<Option<Hsla>>,
     #[cfg(test)]
     pub(crate) scan_line: Option<Hsla>,
-    /// A worker tab opened this frame (its id), the tracer to it, and where
-    /// the tab strip was painted last.
-    pub(crate) tracer_open: Option<u64>,
-    pub(crate) tracer: Option<crate::motion::Tracer>,
-    pub(crate) strip_at: std::rc::Rc<std::cell::Cell<Point<Pixels>>>,
-    /// The composer's frame's top as last laid out (the palette ends
-    /// above it).
-    pub(crate) composer_top: std::rc::Rc<std::cell::Cell<f32>>,
-    /// The top of what is drawn over the composer (the stub, a notice, the
-    /// worker chips) as last laid out; `INFINITY` while none is.
-    pub(crate) over_composer: std::rc::Rc<std::cell::Cell<f32>>,
-    /// The dock's (stub, notice, chips) and the composer's field's heights
-    /// as last laid out: their boxes spring to them (polish.md P13, P14).
-    pub(crate) dock_h: std::rc::Rc<std::cell::Cell<f32>>,
-    pub(crate) composer_h: std::rc::Rc<std::cell::Cell<f32>>,
-    /// The session and column they were measured in: another's is not a
-    /// change (it is drawn at its height at once).
-    dock_scope: u64,
     /// Each worker chip's bounds as last laid out (the tracer starts from
     /// the source chip's bar).
     pub(crate) chip_bounds: Rc<RefCell<ChipBounds>>,
     view_seen: Option<(u64, theme::Choice)>,
     pub(crate) window_active: bool,
-    /// The session's list while a worker's view is shown, and the worker
-    /// whose rows the list holds (`None`: the session's).
-    main_pane: Option<Pane>,
-    /// The worker's view the list holds and its generation
-    /// ([`crate::watch::Watch::focus_key`]).
-    pane_of: Option<(String, u64)>,
-    /// Worker tabs' lists (rows, folds, heights, scroll) while another
-    /// thread of their session is on screen, by view and generation: back
-    /// as they were left, while the tab is open.
-    worker_panes: Vec<((String, u64), Pane)>,
-    /// The next sync builds every row again (a worker's view came on).
-    full_rebuild: bool,
     /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
     watch_poll: Option<(Instant, Task<()>)>,
     /// Frames drawn for the window are shown (GPUI's visibility: mapped and
@@ -1851,78 +1737,20 @@ pub struct AppView {
     /// The window's motion (motion.md): the frame's clock, what animates,
     /// the one timer.
     pub(crate) fx: Rc<crate::motion::Motion>,
-    /// The transcript's own scrolling (fluid.md §3.2).
-    pub(crate) scroller: crate::scroll::Scroller,
-    /// The column on screen (the session its rows are, the worker view)
-    /// and its tab's id, and when it last changed; the tab's place then and
-    /// whether it was a worker's view; the layer it arrives as: since, and
-    /// from where (fluid.md §3.1, §3.6).
-    column_key: (Option<String>, u64, Option<u64>),
-    column_at: Option<Instant>,
-    column_ix: Option<usize>,
-    column_worker: bool,
-    /// The transcript's body line this frame (`theme::metrics`), for the rows.
-    body_line: f32,
-    pub(crate) layer: Option<(Instant, f32, f32)>,
-    /// The prompt on the card came while watched, at this instant: its frame
-    /// traces, its glyph breathes (motion.md §6.3).
-    pub(crate) card_at: Option<Instant>,
-    /// The answered card collapsing in its row ([`CardExit`]).
-    pub(crate) card_exit: Option<CardExit>,
-    /// The room a folded card gave up, kept at the list's end as it folded
-    /// (the answered row holds still) and after it landed, until rows that
-    /// grow in under it use it up, the list leaves its end, or the turn
-    /// ends (then on `sheet`, with its run's fold) ([`AppView::tail_slack`]).
-    pub(crate) fold_slack: Rc<Cell<Option<Slack>>>,
-    /// The runs folding while watched: each one's rows' room under its
-    /// summary, each on its own spring ([`FoldGap`], [`AppView::fold_gap_now`];
-    /// a second fold never cuts the first: Shady #23 r3 M2).
-    pub(crate) fold_gap: RefCell<Vec<FoldGap>>,
-    /// The list on screen, numbered: a new one with every [`AppView::list_out`]
-    /// (a tab, a worker's view). The held rooms are keyed by it.
-    pub(crate) list_gen: u64,
-    /// The metrics the last frame drew with (a fold's header height:
-    /// [`AppView::start_gap`]).
-    pub(crate) metrics_last: Cell<Option<Metrics>>,
-    /// A body the user opened or closed (S1) ([`BodyHold`]).
-    pub(crate) body_hold: Cell<Option<BodyHold>>,
-    /// The user's scroll while an answered card folds: the room it leaves
-    /// is told of it as it lands ([`AppView::tail_slack`]).
-    touch_kept: Cell<bool>,
     /// Answered prompts' receipts, by session ([`crate::authorize::Receipt`]).
     pub(crate) receipts: HashMap<String, Vec<crate::authorize::Receipt>>,
     /// The answer this window sent to the card, until its prompt resolves.
     pub(crate) sent: Option<crate::authorize::Sent>,
-    /// This frame's [`AppView::card_keys_live`] (the card's row reads it).
-    pub(crate) card_keys: Cell<Option<bool>>,
-    /// Ctrl+J from a worker's view or a pane: reveal this card (its
-    /// [`Model::card_key`]) once its row is built; dropped when that card
-    /// goes (Shady M5: a later card never takes the keys from the composer).
-    pub(crate) jump_card: Option<(u64, u64)>,
-    /// Ctrl+J went to this card (its [`Model::card_key`]): its NEEDS YOU
-    /// stub leaves at once, not once the card is on screen, so the jump
-    /// aims at the view as it will be and the card moves one way. Cleared
-    /// once the card is on screen (scrolled away again, the stub returns).
-    pub(crate) stub_away: Option<(u64, u64)>,
     /// The session this window last sent HALT to, and when: a prompt that
     /// resolves after it was cancelled here, not answered elsewhere.
     pub(crate) halted: Option<(String, Instant)>,
-    /// The card's Allow all box: Tab from the card's keys focuses it (a
-    /// click too); Space toggles it then only.
-    pub(crate) allow_all_focus: FocusHandle,
     /// When each recent prompt was first shown here, by session, id and
     /// `raised_at` (Shady N4: a tab's round trip builds its card anew, and
     /// "how long you took" counts from the first showing).
     pub(crate) card_first: Vec<(PromptAt, Instant)>,
-    /// The list's view (top, bottom) as its last layout left it.
-    pub(crate) list_box: Cell<(f32, f32)>,
-    /// The card's row was on screen, buttons whole, at the frame's start.
-    pub(crate) card_seen: Cell<bool>,
     /// Presses the live card took (tests: a leaving card takes none).
     #[cfg(test)]
     pub(crate) card_presses: u32,
-    /// What the card's last frame showed ([`CardLook`]).
-    pub(crate) card_look: std::cell::RefCell<CardLook>,
     /// Cards D: how long each call that finished while watched took (its
     /// row's facts; a call from history has no measured duration), by item id.
     pub(crate) took: std::cell::RefCell<HashMap<u64, Duration>>,
@@ -1930,9 +1758,6 @@ pub struct AppView {
     /// a call that has started never steps back to Queued (a `tool_queued`
     /// after its `tool_use` put it running).
     pub(crate) ran: std::cell::RefCell<HashSet<u64>>,
-    /// The card was on screen last frame (not behind a worker's view,
-    /// Settings or Usage): one coming back waits again ([`Arm`]).
-    card_was_up: bool,
     /// The tray's rows as last built, and the timer that drops a finished
     /// worker's ([`crate::watch::FLASH`]).
     pub(crate) tray: crate::tray::TrayCache,
@@ -1941,12 +1766,6 @@ pub struct AppView {
     /// how the chips flow in them.
     pub(crate) tray_rows: usize,
     pub(crate) chips: crate::tray::Chips,
-    /// Said in the composer's hint until the next key that moves or sends:
-    /// why a worker key went nowhere, or why a steer was not sent.
-    pub(crate) watch_note: Option<SharedString>,
-    /// The worker whose name and state the composer's placeholder has
-    /// (`None`: the session's placeholder).
-    placeholder_of: Option<(String, String, bool)>,
     /// A worker's context menu and the worker it is for ([`crate::wtabs`]),
     /// and the timer that ends an armed cancel's wait.
     pub(crate) menu: Option<(crate::menu::Menu<crate::wtabs::Act>, crate::wtabs::Target)>,
@@ -1979,20 +1798,6 @@ pub struct AppView {
     /// naming row opens once it is attached, if that is soon and nothing
     /// else was shown meanwhile ([`RENAME_WAIT`]); else it is forgotten.
     pub(crate) rename_pending: Option<(String, Instant)>,
-    /// HALT armed by a first Esc in the composer ([`ARM`]): a second
-    /// halts. Its label is `err` while armed; the timer ends the arm, as
-    /// does anything else shown (another tab, session or view).
-    pub(crate) halt_armed: Option<Instant>,
-    halt_tick: Option<Task<()>>,
-    /// Where HALT was armed ([`AppView::halt_place`]).
-    halt_where: Option<(Option<u64>, Option<String>, bool)>,
-    /// The Esc on its way had an IME composition to end: the composition's,
-    /// not HALT's. Read before the kit's `Escape` ends it (the root's
-    /// action capture runs first).
-    esc_composing: bool,
-    /// The composer's placeholder was set for a cramped window (its key
-    /// hints dropped: the field is short).
-    placeholder_cramped: bool,
     /// An item was picked from the keyboard: that key's repeats, once the
     /// menu is gone, are not the next thing's ([`AppView::menu_keydown`]).
     /// The root's capture listener stops them, but GPUI runs a focused
@@ -2153,8 +1958,8 @@ impl AppView {
                     log::debug!(target: "synaps_desktop::send", "enter: a held repeat of a menu pick's key, nothing sent");
                 }
                 // Typing: what a worker key or a refused steer said is old.
-                InputEvent::Change if this.watch_note.is_some() => {
-                    this.watch_note = None;
+                InputEvent::Change if this.panes.cur.watch_note.is_some() => {
+                    this.panes.cur.watch_note = None;
                     cx.notify();
                 }
                 _ => {}
@@ -2260,7 +2065,7 @@ impl AppView {
             if window.is_window_active() {
                 this.restart_card_keys(cx);
             } else {
-                this.keys_live = false;
+                this.panes.cur.keys_live = false;
             }
             cx.notify();
         }));
@@ -2358,31 +2163,98 @@ impl AppView {
         Self {
             client,
             model: Model::new(conn),
-            rows: Vec::new(),
-            disp: Vec::new(),
-            summaries: Summaries::default(),
-            list,
-            toggled: Toggled::default(),
-            open_runs: HashSet::new(),
-            unfold_hold: Vec::new(),
-            synced_busy: false,
-            files_gen: 0,
-            subs_gen: 0,
-            rows_session: None,
-            waiting_on: None,
-            layout: Layout::of(800., 800., &Metrics::at(theme::DEFAULT_TEXT), Default::default()),
-            scroll_carry: None,
-            hold_back: Rc::new(Cell::new(false)),
-            texts,
+            panes: Panes::one(Pane {
+                id: PaneId::FIRST,
+                rows: Vec::new(),
+                disp: Vec::new(),
+                summaries: Summaries::default(),
+                list,
+                toggled: Toggled::default(),
+                open_runs: HashSet::new(),
+                unfold_hold: Vec::new(),
+                synced_busy: false,
+                files_gen: 0,
+                subs_gen: 0,
+                rows_session: None,
+                waiting_on: None,
+                scroll_carry: None,
+                hold_back: Rc::new(Cell::new(false)),
+                texts,
+                scroller: crate::scroll::Scroller::default(),
+                list_box: Cell::new((0., 0.)),
+                list_gen: 0,
+                fold_slack: Rc::new(Cell::new(None)),
+                fold_gap: RefCell::new(Vec::new()),
+                body_hold: Cell::new(None),
+                touch_kept: Cell::new(false),
+                metrics_gen: 0,
+                layout: Layout::of(800., 800., &Metrics::at(theme::DEFAULT_TEXT), Default::default()),
+                layout_naming: false,
+                metrics_last: Cell::new(None),
+                body_line: 0.,
+                column_key: (None, 0, None),
+                column_at: None,
+                column_ix: None,
+                column_worker: false,
+                layer: None,
+                dock_h: std::rc::Rc::new(std::cell::Cell::new(f32::NAN)),
+                composer_h: std::rc::Rc::new(std::cell::Cell::new(f32::NAN)),
+                dock_scope: 0,
+                over_composer: std::rc::Rc::new(std::cell::Cell::new(f32::INFINITY)),
+                composer_top: Default::default(),
+                composer: i.composer,
+                composer_rows: crate::fit::COMPOSER_ROWS,
+                placeholder_of: None,
+                placeholder_cramped: false,
+                restore: None,
+                cmd_draft: None,
+                cmd_clear: None,
+                quiet_note: None,
+                draft_note: None,
+                watch_note: None,
+                composer_of: None,
+                halt_armed: None,
+                halt_tick: None,
+                halt_where: None,
+                esc_composing: false,
+                secret_input: i.secret_input,
+                shown_tab: None,
+                attach_wait: None,
+                attach_due: None,
+                gate: Default::default(),
+                tab_first: 0,
+                tab_follow: None,
+                tab_room: 0,
+                tab_labels: Default::default(),
+                tab_fx: Default::default(),
+                strip_at: Default::default(),
+                main_column: None,
+                column_of: None,
+                worker_columns: Vec::new(),
+                full_rebuild: false,
+                card: None,
+                keys_live: false,
+                chord: CardChord::default(),
+                chord_press: false,
+                secret_left: None,
+                card_keys: Cell::new(None),
+                card_was_up: false,
+                card_seen: Cell::new(false),
+                card_look: Default::default(),
+                card_exit: None,
+                card_at: None,
+                jump_card: None,
+                stub_away: None,
+                allow_all_focus: i.allow_all_focus,
+                tracer_open: None,
+                tracer: None,
+            }),
             bars: Default::default(),
-            composer: i.composer,
-            composer_rows: crate::fit::COMPOSER_ROWS,
             top_words: None,
             find_short: false,
             find_input: i.find_input,
             name_input: i.name_input,
             hex_input: i.hex_input,
-            secret_input: i.secret_input,
             find: String::new(),
             chip: None,
             expanded: 0,
@@ -2421,22 +2293,9 @@ impl AppView {
             theme_follows_config: true,
             theme_profile: None,
             config_theme: SharedString::default(),
-            card: None,
-            keys_live: false,
-            chord: CardChord::default(),
-            chord_press: false,
-            secret_left: None,
-            layout_naming: false,
             rail: Default::default(),
             focus: i.focus,
-            restore: None,
-            cmd_draft: None,
-            cmd_clear: None,
-            quiet_note: None,
             drafts: Default::default(),
-            composer_of: None,
-            draft_note: None,
-            metrics_gen: 0,
             bench: None,
             plain_rows: false,
             synthetic: false,
@@ -2459,17 +2318,8 @@ impl AppView {
             tabs_save: None,
             lists_seen: 0,
             tab_cache: Lru::new(TAB_CACHE, TAB_CACHE_BYTES),
-            shown_tab: None,
-            attach_wait: None,
-            attach_due: None,
-            gate: Default::default(),
             tab_keys: FoldKeys::default(),
             once: None,
-            tab_first: 0,
-            tab_follow: None,
-            tab_room: 0,
-            tab_labels: Default::default(),
-            tab_fx: Default::default(),
             attach_source: None,
             settings: Default::default(),
             usage: crate::usage_view::UsageUi::new(None, Default::default()),
@@ -2501,61 +2351,24 @@ impl AppView {
             composer_bar: Default::default(),
             #[cfg(test)]
             scan_line: None,
-            tracer_open: None,
-            tracer: None,
-            strip_at: Default::default(),
-            composer_top: Default::default(),
-            over_composer: std::rc::Rc::new(std::cell::Cell::new(f32::INFINITY)),
-            dock_h: std::rc::Rc::new(std::cell::Cell::new(f32::NAN)),
-            composer_h: std::rc::Rc::new(std::cell::Cell::new(f32::NAN)),
-            dock_scope: 0,
             chip_bounds: Default::default(),
             view_seen: None,
             window_active: true,
-            main_pane: None,
-            pane_of: None,
-            worker_panes: Vec::new(),
-            full_rebuild: false,
             watch_poll: None,
             visible: i.visible,
             fx: Rc::default(),
-            scroller: crate::scroll::Scroller::default(),
-            column_key: (None, 0, None),
-            column_at: None,
-            column_ix: None,
-            column_worker: false,
-            body_line: 0.,
-            layer: None,
-            card_at: None,
-            card_exit: None,
-            fold_slack: Rc::new(Cell::new(None)),
-            fold_gap: RefCell::new(Vec::new()),
-            list_gen: 0,
-            metrics_last: Cell::new(None),
-            body_hold: Cell::new(None),
-            touch_kept: Cell::new(false),
             receipts: HashMap::new(),
             sent: None,
-            card_keys: Cell::new(None),
-            jump_card: None,
-            stub_away: None,
             halted: None,
-            allow_all_focus: i.allow_all_focus,
             card_first: Vec::new(),
-            list_box: Cell::new((0., 0.)),
-            card_seen: Cell::new(false),
             #[cfg(test)]
             card_presses: 0,
-            card_look: Default::default(),
             took: Default::default(),
             ran: Default::default(),
-            card_was_up: false,
             tray: crate::tray::TrayCache::default(),
             tray_due: None,
             tray_rows: 0,
             chips: Default::default(),
-            watch_note: None,
-            placeholder_of: None,
             menu: None,
             menu_focus_back: None,
             palette: None,
@@ -2572,11 +2385,6 @@ impl AppView {
             smenu: None,
             wmenu: None,
             rename_pending: None,
-            halt_armed: None,
-            halt_tick: None,
-            halt_where: None,
-            esc_composing: false,
-            placeholder_cramped: false,
             menu_picked: false,
             swallow_clicks: None,
             widths: RefCell::default(),
@@ -2640,9 +2448,9 @@ impl AppView {
                         | synaps_client::protocol::SessionEvent::CompactionCancelled
                 )
                 && self.model.active.as_ref().is_some_and(|a| a.attach_seq == *attach_seq)
-                && self.watch_note.as_ref().is_some_and(|n| n.starts_with("/compact:"))
+                && self.panes.cur.watch_note.as_ref().is_some_and(|n| n.starts_with("/compact:"))
             {
-                self.watch_note = None;
+                self.panes.cur.watch_note = None;
                 self.model.view_dirty = true;
             }
             for fx in self.model.apply(ev) {
@@ -2669,7 +2477,7 @@ impl AppView {
     pub(crate) fn effect(&mut self, fx: Effect) {
         match fx {
             Effect::Restore(text) => {
-                self.restore = Some(match self.restore.take() {
+                self.panes.cur.restore = Some(match self.panes.cur.restore.take() {
                     Some(prev) => format!("{prev}\n{text}"),
                     None => text,
                 })
@@ -2721,14 +2529,15 @@ impl AppView {
             }
             Effect::Attach { session_id, fallback, open, place } => self.open_tab(Open::Attach { session_id, fallback, open }, place),
             Effect::Resume { req, open, place } => self.open_tab(Open::Resume { req, open }, place),
-            Effect::WorkerNote(note) => self.watch_note = Some(note.into()),
+            Effect::WorkerNote(note) => self.panes.cur.watch_note = Some(note.into()),
             Effect::Command { name, reply } => {
-                self.watch_note = Some(crate::palette::reply_note(&name, &reply).into());
-                self.quiet_note = self.watch_note.clone().filter(|_| matches!(reply, synaps_client::CommandReply::Done(_)));
-                if let Some((_, text)) = self.cmd_draft.take_if(|d| d.0 == name)
+                self.panes.cur.watch_note = Some(crate::palette::reply_note(&name, &reply).into());
+                self.panes.cur.quiet_note =
+                    self.panes.cur.watch_note.clone().filter(|_| matches!(reply, synaps_client::CommandReply::Done(_)));
+                if let Some((_, text)) = self.panes.cur.cmd_draft.take_if(|d| d.0 == name)
                     && matches!(reply, synaps_client::CommandReply::Done(_))
                 {
-                    self.cmd_clear = Some(text);
+                    self.panes.cur.cmd_clear = Some(text);
                 }
             }
         }
@@ -2740,9 +2549,9 @@ impl AppView {
     fn unsent(&mut self, session: String, text: String) {
         // Its tab followed the session to a new id: that tab's.
         let session = self.model.tabs.followed(&session).map_or(session, str::to_string);
-        if self.composer_of.as_ref().is_some_and(|(_, s)| s.as_deref() == Some(session.as_str())) {
+        if self.panes.cur.composer_of.as_ref().is_some_and(|(_, s)| s.as_deref() == Some(session.as_str())) {
             self.effect(Effect::Restore(text));
-            self.draft_note = Some(UNSENT_NOTE);
+            self.panes.cur.draft_note = Some(UNSENT_NOTE);
             self.model.view_dirty = true;
         } else if self.model.tabs.knows(&session) {
             self.drafts.give_back(session, text, UNSENT_NOTE);
@@ -2761,8 +2570,10 @@ impl AppView {
         // Over a worker's view the composer steers it (compared, not
         // allocated, each frame).
         let worker = self.model.watch.focused().map(|w| (w.handle_id.as_str(), w.state(), w.tabbed));
-        let cramped = self.layout.cramped;
-        if worker != self.placeholder_of.as_ref().map(|(h, s, t)| (h.as_str(), s.as_str(), *t)) || cramped != self.placeholder_cramped {
+        let cramped = self.panes.cur.layout.cramped;
+        if worker != self.panes.cur.placeholder_of.as_ref().map(|(h, s, t)| (h.as_str(), s.as_str(), *t))
+            || cramped != self.panes.cur.placeholder_cramped
+        {
             let text = match self.model.watch.focused() {
                 Some(w) if w.read_only() && w.tabbed => format!("{} is {}: nothing to steer", w.name, w.state()),
                 Some(w) if w.read_only() => format!("{} is {}: nothing to steer  (Esc: back to the session)", w.name, w.state()),
@@ -2772,9 +2583,9 @@ impl AppView {
             // Cramped, the field is short: its key hints go, so it is not
             // cut off against the glyph.
             let text: SharedString = if cramped { text.split("  (").next().unwrap_or_default().to_string().into() } else { text.into() };
-            self.placeholder_of = worker.map(|(h, s, t)| (h.to_string(), s.to_string(), t));
-            self.placeholder_cramped = cramped;
-            self.composer.update(cx, |c, cx| c.set_placeholder(text, window, cx));
+            self.panes.cur.placeholder_of = worker.map(|(h, s, t)| (h.to_string(), s.to_string(), t));
+            self.panes.cur.placeholder_cramped = cramped;
+            self.panes.cur.composer.update(cx, |c, cx| c.set_placeholder(text, window, cx));
         }
         // Worker tabs that followed their session: their drafts with them.
         for (from, to) in self.model.tabs.take_rekeys() {
@@ -2786,7 +2597,7 @@ impl AppView {
         if self.composer_owned() {
             if let Some((text, note)) = self.model.watch.take_unsent() {
                 self.effect(Effect::Restore(text));
-                self.watch_note = Some(note.into());
+                self.panes.cur.watch_note = Some(note.into());
             }
         } else if self.model.watch.has_unsent() {
             cx.notify();
@@ -2794,21 +2605,21 @@ impl AppView {
         // The visible tab went into the one holding its session: the
         // composer's text is that tab's now (the follow rule keeps it).
         if let Some((from, into)) = self.model.tabs.take_merged()
-            && let Some(o) = self.composer_of.as_mut().filter(|o| o.0 == from)
+            && let Some(o) = self.panes.cur.composer_of.as_mut().filter(|o| o.0 == from)
         {
             o.0 = into;
         }
         // A slash command the daemon ran: its text leaves the composer,
         // if the composer still holds it (the tab's, unedited).
-        if let Some(text) = self.cmd_clear.take()
+        if let Some(text) = self.panes.cur.cmd_clear.take()
             && self.composer_owned()
-            && self.composer.read(cx).value().trim() == text
+            && self.panes.cur.composer.read(cx).value().trim() == text
         {
-            self.composer.update(cx, |c, cx| c.set_value("", window, cx));
+            self.panes.cur.composer.update(cx, |c, cx| c.set_value("", window, cx));
         }
         // A view on screen leaves the session tab behind it current: the
         // composer stays that tab's.
-        if self.restore.is_none() && self.composer_owned() {
+        if self.panes.cur.restore.is_none() && self.composer_owned() {
             return;
         }
         // A tab left while its slash command was out: the answer goes to
@@ -2816,23 +2627,23 @@ impl AppView {
         // command's text leaves with it, as a sent message's does: the tab's
         // draft is not left holding a command already run.
         if !self.composer_owned()
-            && let Some((_, sent)) = self.cmd_draft.take()
-            && self.composer.read(cx).value().trim() == sent
+            && let Some((_, sent)) = self.panes.cur.cmd_draft.take()
+            && self.panes.cur.composer.read(cx).value().trim() == sent
         {
-            self.composer.update(cx, |c, cx| c.set_value("", window, cx));
+            self.panes.cur.composer.update(cx, |c, cx| c.set_value("", window, cx));
         }
-        let c = self.composer.read(cx);
+        let c = self.panes.cur.composer.read(cx);
         let (text, cursor) = (c.value(), c.cursor());
         let out = frame_composer(
             &mut self.drafts,
-            &mut self.composer_of,
+            &mut self.panes.cur.composer_of,
             &self.model.tabs,
-            self.restore.take(),
-            (&mut self.draft_note, &mut self.watch_note),
+            self.panes.cur.restore.take(),
+            (&mut self.panes.cur.draft_note, &mut self.panes.cur.watch_note),
             (text.as_ref(), cursor),
         );
         if let Some((text, cursor)) = out {
-            self.composer.update(cx, |c, cx| {
+            self.panes.cur.composer.update(cx, |c, cx| {
                 c.set_value(text, window, cx);
                 if let Some(at) = cursor {
                     c.set_selected_range(at..at, cx);
@@ -3137,9 +2948,9 @@ impl AppView {
         // Another tab on screen (not the same one named or re-attached),
         // or the one on screen opened again (a rail row, an open by name):
         // its view starts from its hand-off, never from an event batch.
-        let shown = hint.is_some() || self.shown_tab.as_ref().map(|v| v.0) != vis.as_ref().map(|v| v.0);
+        let shown = hint.is_some() || self.panes.cur.shown_tab.as_ref().map(|v| v.0) != vis.as_ref().map(|v| v.0);
         // A session tab left keeps the worker its view showed in place.
-        if let Some((id, _)) = self.shown_tab
+        if let Some((id, _)) = self.panes.cur.shown_tab
             && vis.as_ref().map(|v| v.0) != Some(id)
         {
             let inplace = self.model.watch.focused().filter(|w| !w.tabbed).map(|w| (w.handle_id.clone(), w.name.clone()));
@@ -3151,7 +2962,7 @@ impl AppView {
         {
             // What a cache held of it is older than what attached.
             let _ = self.tab_cache.take(s);
-            self.shown_tab = vis;
+            self.panes.cur.shown_tab = vis;
             // Another tab of the same session (its worker's, or back to
             // it): the same attachment, another view.
             self.tab_watch(shown);
@@ -3162,14 +2973,14 @@ impl AppView {
             }
             return;
         }
-        if vis == self.shown_tab && hint.is_none() {
+        if vis == self.panes.cur.shown_tab && hint.is_none() {
             return;
         }
-        if vis != self.shown_tab {
+        if vis != self.panes.cur.shown_tab {
             self.stash();
             self.load(vis.as_ref().and_then(|v| v.1.clone()));
         }
-        self.shown_tab = vis.clone();
+        self.panes.cur.shown_tab = vis.clone();
         self.tab_watch(shown);
         match vis {
             Some((_, Some(s))) => self.attach_tab(s, hint),
@@ -3243,30 +3054,30 @@ impl AppView {
         self.list_out();
         let key = self.model.transcript.session_id().map(str::to_string);
         let (transcript, stats) = self.model.switch_out();
-        self.card = None;
-        self.attach_wait = None;
-        self.attach_due = None;
+        self.panes.cur.card = None;
+        self.panes.cur.attach_wait = None;
+        self.panes.cur.attach_due = None;
         let fresh = ListState::new(0, ListAlignment::Top, px(600.));
         fresh.set_follow_mode(FollowMode::Tail);
-        turns::readiness(&fresh, &self.texts);
+        turns::readiness(&fresh, &self.panes.cur.texts);
         // What a rise left owed is the old list's.
-        self.scroll_carry = None;
+        self.panes.cur.scroll_carry = None;
         let cache = TabCache {
             transcript,
             stats,
-            rows: std::mem::take(&mut self.rows),
-            disp: std::mem::take(&mut self.disp),
-            summaries: std::mem::take(&mut self.summaries),
-            list: std::mem::replace(&mut self.list, fresh),
-            toggled: std::mem::take(&mut self.toggled),
-            open_runs: std::mem::take(&mut self.open_runs),
-            synced_busy: std::mem::take(&mut self.synced_busy),
-            files_gen: std::mem::take(&mut self.files_gen),
-            waiting_on: self.waiting_on.take(),
-            metrics_gen: self.metrics_gen,
+            rows: std::mem::take(&mut self.panes.cur.rows),
+            disp: std::mem::take(&mut self.panes.cur.disp),
+            summaries: std::mem::take(&mut self.panes.cur.summaries),
+            list: std::mem::replace(&mut self.panes.cur.list, fresh),
+            toggled: std::mem::take(&mut self.panes.cur.toggled),
+            open_runs: std::mem::take(&mut self.panes.cur.open_runs),
+            synced_busy: std::mem::take(&mut self.panes.cur.synced_busy),
+            files_gen: std::mem::take(&mut self.panes.cur.files_gen),
+            waiting_on: self.panes.cur.waiting_on.take(),
+            metrics_gen: self.panes.cur.metrics_gen,
             watch,
         };
-        self.rows_session = None;
+        self.panes.cur.rows_session = None;
         if let Some(k) = key {
             let tabs = &self.model.tabs;
             let bytes = cache.bytes();
@@ -3282,19 +3093,19 @@ impl AppView {
         match session.as_ref().and_then(|s| self.tab_cache.take(s)) {
             Some(c) => {
                 self.model.switch_in(c.transcript, c.stats);
-                self.rows = c.rows;
-                self.disp = c.disp;
-                self.summaries = c.summaries;
-                self.list = c.list;
-                self.scroll_carry = None;
-                self.toggled = c.toggled;
-                self.open_runs = c.open_runs;
-                self.synced_busy = c.synced_busy;
-                self.files_gen = c.files_gen;
-                self.waiting_on = c.waiting_on;
-                if c.metrics_gen != self.metrics_gen {
+                self.panes.cur.rows = c.rows;
+                self.panes.cur.disp = c.disp;
+                self.panes.cur.summaries = c.summaries;
+                self.panes.cur.list = c.list;
+                self.panes.cur.scroll_carry = None;
+                self.panes.cur.toggled = c.toggled;
+                self.panes.cur.open_runs = c.open_runs;
+                self.panes.cur.synced_busy = c.synced_busy;
+                self.panes.cur.files_gen = c.files_gen;
+                self.panes.cur.waiting_on = c.waiting_on;
+                if c.metrics_gen != self.panes.cur.metrics_gen {
                     // The text size changed while it was in the background.
-                    self.list.remeasure();
+                    self.panes.cur.list.remeasure();
                 }
                 // Polled again once its attach lands (`Watch::on_reconnect`).
                 self.model.watch = c.watch;
@@ -3304,7 +3115,7 @@ impl AppView {
                 self.model.watch = Watch::default();
             }
         }
-        self.rows_session = session;
+        self.panes.cur.rows_session = session;
     }
 
     /// Attach the visible tab's session, or wait (shown OPENING) as the
@@ -3312,13 +3123,13 @@ impl AppView {
     /// after the last ([`crate::tabs::AttachGate`]).
     fn attach_tab(&mut self, session: String, hint: Option<(Option<ResumeRequest>, bool)>) {
         let (fallback, open) = hint.unwrap_or_else(|| (self.model.tab_fallback(&session), false));
-        self.attach_wait = None;
+        self.panes.cur.attach_wait = None;
         let restoring = self.model.tabs.current().is_some_and(|t| self.model.tabs.restoring(t.id));
-        if restoring || (self.client.is_some() && self.gate.switch(Instant::now())) {
+        if restoring || (self.client.is_some() && self.panes.cur.gate.switch(Instant::now())) {
             self.model.showing(&session);
             // A restored tab attaches once a list has its session (`start_tabs`).
             if !restoring {
-                self.attach_wait = Some((session, fallback, open));
+                self.panes.cur.attach_wait = Some((session, fallback, open));
             }
             return;
         }
@@ -3339,12 +3150,12 @@ impl AppView {
 
     /// The waiting attach's timer, (re)set for when the gate is due.
     fn arm_attach(&mut self, cx: &mut Context<Self>) {
-        if self.attach_wait.is_none() {
-            self.attach_due = None;
+        if self.panes.cur.attach_wait.is_none() {
+            self.panes.cur.attach_due = None;
             return;
         }
-        let at = self.gate.due();
-        self.attach_due = Some(cx.spawn(async move |this, cx| {
+        let at = self.panes.cur.gate.due();
+        self.panes.cur.attach_due = Some(cx.spawn(async move |this, cx| {
             if let Some(left) = at.map(|t| t.saturating_duration_since(Instant::now())).filter(|d| !d.is_zero()) {
                 cx.background_executor().timer(left).await;
             }
@@ -3355,11 +3166,11 @@ impl AppView {
     /// The deferred attach, if the gate is ready (else its timer again) and
     /// its tab is still the visible one.
     fn attach_waited(&mut self, cx: &mut Context<Self>) {
-        self.attach_due = None;
-        if !self.gate.ready(Instant::now()) {
+        self.panes.cur.attach_due = None;
+        if !self.panes.cur.gate.ready(Instant::now()) {
             return self.arm_attach(cx);
         }
-        if let Some((s, fallback, open)) = self.attach_wait.take()
+        if let Some((s, fallback, open)) = self.panes.cur.attach_wait.take()
             && self.model.tabs.current_session() == Some(s.as_str())
             && self.model.active.is_none()
         {
@@ -3371,15 +3182,15 @@ impl AppView {
     /// A tab key, or Ctrl / Cmd, went up: a waiting attach is due
     /// [`crate::tabs::AttachGate::GAP`] from now.
     fn tab_key_up(&mut self, cx: &mut Context<Self>) {
-        self.gate.key_up(Instant::now());
-        if self.attach_wait.is_some() {
+        self.panes.cur.gate.key_up(Instant::now());
+        if self.panes.cur.attach_wait.is_some() {
             self.arm_attach(cx);
         }
     }
 
     /// The last tab closed: nothing attached (the session keeps running).
     fn detach_all(&mut self) {
-        self.attach_wait = None;
+        self.panes.cur.attach_wait = None;
         if let Some(c) = &self.client {
             let _ = c.detach();
         }
@@ -3418,7 +3229,7 @@ impl AppView {
                 self.tabs_written = self.tabs_saved;
             }
             let vis = self.model.tabs.current().map(|t| (t.id, t.session.clone()));
-            if vis != self.shown_tab {
+            if vis != self.panes.cur.shown_tab {
                 // A tab followed its session to a new id, or closed.
                 self.model.rail_gen += 1;
                 self.model.view_dirty = true;
@@ -3487,7 +3298,7 @@ impl AppView {
     /// never on its auto-repeats (a held Ctrl+T is not a burst of new
     /// sessions): their key-down decides ([`OnceKey`]).
     pub(crate) fn tab_key(&mut self, key: TabKey, cx: &mut Context<Self>) {
-        self.gate.key_down(Instant::now());
+        self.panes.cur.gate.key_down(Instant::now());
         if matches!(key, TabKey::New | TabKey::Close | TabKey::Reopen) {
             self.once = Some(OnceKey::Tab(key));
             cx.propagate();
@@ -3691,7 +3502,7 @@ impl AppView {
     /// session tab, never a view on screen): the one guard of `submit()`
     /// and `sync_composer()`.
     fn composer_owned(&self) -> bool {
-        Drafts::composer_owned(self.composer_of.as_ref(), &self.model.tabs)
+        Drafts::composer_owned(self.panes.cur.composer_of.as_ref(), &self.model.tabs)
     }
 
     /// Send the composer's text. `false` keeps it in the composer.
@@ -3731,7 +3542,7 @@ impl AppView {
                 // daemon has.
                 if let Some((name, arg)) = crate::palette::invocation(&text) {
                     if self.run_command(name, arg) {
-                        self.cmd_draft = Some((name.to_string(), text));
+                        self.panes.cur.cmd_draft = Some((name.to_string(), text));
                     }
                     return false;
                 }
@@ -3739,7 +3550,7 @@ impl AppView {
                 // `/model`, `/budget time 30`): its usage, the text kept,
                 // nothing sent. Anything else is a message, as it always was.
                 if let Some(name) = crate::palette::near_miss(&text) {
-                    self.watch_note = Some(crate::palette::usage(name).into());
+                    self.panes.cur.watch_note = Some(crate::palette::usage(name).into());
                     self.model.view_dirty = true;
                     return false;
                 }
@@ -3751,7 +3562,7 @@ impl AppView {
             let handle = match target {
                 Ok(h) => h,
                 Err(why) => {
-                    self.watch_note = Some(why.into());
+                    self.panes.cur.watch_note = Some(why.into());
                     self.model.view_dirty = true;
                     return false;
                 }
@@ -3762,9 +3573,9 @@ impl AppView {
             }
             log::debug!(target: "synaps_desktop::send", "steer {handle} ({} chars)", text.chars().count());
             self.model.watch.steer_sent(&handle, &text);
-            self.watch_note = None;
+            self.panes.cur.watch_note = None;
             // Handoff out: the composer's bar, then the watched row's.
-            self.fx.sent.set(Some((self.fx.clock(), true)));
+            self.fx.col(self.panes.cur.id).sent().set(Some((self.fx.clock(), true)));
             return true;
         }
         let busy = self.model.transcript.busy();
@@ -3775,11 +3586,11 @@ impl AppView {
         }
         log::debug!(target: "synaps_desktop::send", "{} ({} chars)", if busy { "steer" } else { "submit" }, text.chars().count());
         self.model.sent(text);
-        self.draft_note = None;
-        self.watch_note = None;
+        self.panes.cur.draft_note = None;
+        self.panes.cur.watch_note = None;
         // Handoff out: the composer's bar, then the new block's (a steer
         // lands in no block: the composer's alone).
-        self.fx.sent.set(Some((self.fx.clock(), busy)));
+        self.fx.col(self.panes.cur.id).sent().set(Some((self.fx.clock(), busy)));
         true
     }
 
@@ -3791,7 +3602,7 @@ impl AppView {
         }
         // A worker tab shows its one worker: its session's tab walks them.
         if self.model.tabs.current_worker().is_some() {
-            self.watch_note = Some(format!("this tab shows one worker: its session's tab walks them ({WORKER_KEY})").into());
+            self.panes.cur.watch_note = Some(format!("this tab shows one worker: its session's tab walks them ({WORKER_KEY})").into());
             cx.notify();
             return;
         }
@@ -3799,7 +3610,7 @@ impl AppView {
         let cwd = self.model.cwd().map(str::to_string);
         let moved = self.model.watch.step(step, &running, cwd.as_deref(), Instant::now());
         log::debug!(target: "synaps_desktop::watch", "key {step:?}: {moved:?}");
-        self.watch_note = match moved {
+        self.panes.cur.watch_note = match moved {
             Moved::Worker(_) => {
                 self.watch_opened();
                 None
@@ -3814,7 +3625,7 @@ impl AppView {
 
     /// A worker's view came on: without a daemon it says nothing comes.
     pub(crate) fn watch_opened(&mut self) {
-        self.watch_note = None;
+        self.panes.cur.watch_note = None;
         if self.client.is_none() {
             self.model.watch.no_daemon("offline: there is no daemon to read this worker's thread from");
         }
@@ -3840,7 +3651,7 @@ impl AppView {
         } else {
             self.model.watch.focus_main();
         }
-        self.watch_note = None;
+        self.panes.cur.watch_note = None;
         cx.notify();
     }
 
@@ -3922,26 +3733,26 @@ impl AppView {
     /// layout, still scrolled back.
     fn keep_rows(&mut self, shift: f32, grew: bool) {
         // Between short and cramped the bars stay: what is owed stays owed.
-        let carry = if shift != 0. { self.scroll_carry.take() } else { None };
-        if self.list.is_following_tail() {
+        let carry = if shift != 0. { self.panes.cur.scroll_carry.take() } else { None };
+        if self.panes.cur.list.is_following_tail() {
             return;
         }
-        self.hold_back.set(grew);
+        self.panes.cur.hold_back.set(grew);
         let (mut by, mut left) = (shift, 0.);
         if shift > 0.
             && let Some((owed, at)) = carry
-            && at == self.list.logical_scroll_top()
+            && at == self.panes.cur.list.logical_scroll_top()
         {
             by -= owed;
         } else if shift < 0. {
-            let offset = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+            let offset = -f32::from(self.panes.cur.list.scroll_px_offset_for_scrollbar().y);
             left = (-shift - offset).max(0.);
         }
         if by != 0. {
-            self.list.scroll_by(px(by));
+            self.panes.cur.list.scroll_by(px(by));
         }
         if left > 0. {
-            self.scroll_carry = Some((left, self.list.logical_scroll_top()));
+            self.panes.cur.scroll_carry = Some((left, self.panes.cur.list.logical_scroll_top()));
         }
     }
 
@@ -3950,24 +3761,24 @@ impl AppView {
     /// last frame. `pad_b`: the list's bottom padding (its end is past it;
     /// its top padding is 0, [`Self::render`]).
     fn scroll_frame(&mut self, pad_b: f32) {
-        if !self.scroller.active() {
+        if !self.panes.cur.scroller.active() {
             return;
         }
-        if self.list.is_scrollbar_dragging() || self.fx.level() != crate::motion::Level::Full {
-            return self.scroller.cancel();
+        if self.panes.cur.list.is_scrollbar_dragging() || self.fx.level() != crate::motion::Level::Full {
+            return self.panes.cur.scroller.cancel();
         }
         let room = crate::scroll::Room {
-            offset: -f32::from(self.list.scroll_px_offset_for_scrollbar().y),
-            max: f32::from(self.list.max_offset_for_scrollbar().y) + pad_b,
-            end_known: self.list.is_scrolled_to_end().is_some(),
+            offset: -f32::from(self.panes.cur.list.scroll_px_offset_for_scrollbar().y),
+            max: f32::from(self.panes.cur.list.max_offset_for_scrollbar().y) + pad_b,
+            end_known: self.panes.cur.list.is_scrolled_to_end().is_some(),
         };
-        let step = self.scroller.frame(self.fx.now(), room);
+        let step = self.panes.cur.scroller.frame(self.fx.now(), room);
         if step.follow {
-            self.list.scroll_to_end();
+            self.panes.cur.list.scroll_to_end();
         } else if step.by != 0. {
-            self.list.scroll_by(px(step.by));
+            self.panes.cur.list.scroll_by(px(step.by));
         }
-        if self.scroller.active() {
+        if self.panes.cur.scroller.active() {
             self.fx.want_frame();
         }
     }
@@ -3992,18 +3803,18 @@ impl AppView {
     /// Settings and Usage draw in their own pane: no layer. Full only.
     fn column_layer(&mut self) {
         let tabs = &self.model.tabs;
-        let key = (self.rows_session.clone(), self.motion_column(), tabs.visible().map(|t| t.id));
-        if key == self.column_key {
+        let key = (self.panes.cur.rows_session.clone(), self.motion_column(), tabs.visible().map(|t| t.id));
+        if key == self.panes.cur.column_key {
             return;
         }
         let (worker, view) = (self.model.watch.focus().is_some(), tabs.view().is_some());
         // Nothing to draw yet (an attach in flight, nothing kept for it):
         // the column it lands on is the change.
-        if !worker && !view && self.disp.is_empty() && self.model.active.is_none() {
+        if !worker && !view && self.panes.cur.disp.is_empty() && self.model.active.is_none() {
             return;
         }
         let now = self.fx.now();
-        let rapid = self.column_at.is_some_and(|t| now.saturating_duration_since(t) < crate::motion::RAPID);
+        let rapid = self.panes.cur.column_at.is_some_and(|t| now.saturating_duration_since(t) < crate::motion::RAPID);
         // A session's row in the rail (its place, top to bottom).
         let rail = &self.rail.rail;
         let row_of = |s: &Option<String>| {
@@ -4014,34 +3825,35 @@ impl AppView {
             })
         };
         let ix = tabs.active();
-        let (dx, dy) = match (self.column_key.2, key.2) {
+        let (dx, dy) = match (self.panes.cur.column_key.2, key.2) {
             (Some(a), Some(b)) if a != b && !worker => {
-                let from = tabs.iter().position(|t| t.id == a).or(self.column_ix);
+                let from = tabs.iter().position(|t| t.id == a).or(self.panes.cur.column_ix);
                 let left = matches!((ix, from), (Some(n), Some(o)) if n < o);
                 (if left { -1. } else { 1. }, 0.)
             }
-            _ if self.column_worker && !worker => (0., -1.),
-            (a, b) if a == b && !worker && self.column_key.0.is_some() && self.column_key.0 != key.0 => {
-                match (row_of(&self.column_key.0), row_of(&key.0)) {
+            _ if self.panes.cur.column_worker && !worker => (0., -1.),
+            (a, b) if a == b && !worker && self.panes.cur.column_key.0.is_some() && self.panes.cur.column_key.0 != key.0 => {
+                match (row_of(&self.panes.cur.column_key.0), row_of(&key.0)) {
                     (Some(o), Some(n)) if n < o => (0., -1.),
                     _ => (0., 1.),
                 }
             }
             _ => (0., 1.),
         };
-        (self.column_key, self.column_ix, self.column_worker, self.column_at) = (key, ix, worker, Some(now));
-        self.layer = (self.fx.fluid() && !rapid && !view).then_some((now, dx, dy));
+        (self.panes.cur.column_key, self.panes.cur.column_ix, self.panes.cur.column_worker, self.panes.cur.column_at) =
+            (key, ix, worker, Some(now));
+        self.panes.cur.layer = (self.fx.fluid() && !rapid && !view).then_some((now, dx, dy));
     }
 
     /// The column's layer this frame: its offset and strength, or none.
     fn layer_now(&mut self) -> Option<(f32, f32, f32)> {
-        let (at, dx, dy) = self.layer?;
+        let (at, dx, dy) = self.panes.cur.layer?;
         let t = self.fx.now().saturating_duration_since(at).as_secs_f32();
         let d = crate::motion::Spring::from_rest(crate::motion::SHIFT, crate::motion::GLIDE_RESPONSE, t);
         let q = (t / crate::motion::QUICK.as_secs_f32()).min(1.);
         let strength = crate::motion::LIFT + (1. - crate::motion::LIFT) * crate::motion::ease::OUT.sample(q);
         if d < 0.5 && q >= 1. || !self.fx.fluid() {
-            self.layer = None;
+            self.panes.cur.layer = None;
             return None;
         }
         self.fx.want_frame();
@@ -4053,7 +3865,7 @@ impl AppView {
     /// end stays there ([`Slack`], held). None at Reduced and Off, or in
     /// another list.
     pub(crate) fn fold_gap_now(&self) -> Vec<(FoldGap, f32)> {
-        let gaps = std::mem::take(&mut *self.fold_gap.borrow_mut());
+        let gaps = std::mem::take(&mut *self.panes.cur.fold_gap.borrow_mut());
         if !self.fx.fluid() {
             return Vec::new();
         }
@@ -4062,7 +3874,8 @@ impl AppView {
         // spring steps by its frame's time only.
         let now = self.fx.clock();
         let here = |g: &FoldGap| {
-            g.list == self.list_gen && self.disp.iter().any(|d| d.id == g.id && matches!(d.kind, Kind::Summary { open: false, .. }))
+            g.list == self.panes.cur.list_gen
+                && self.panes.cur.disp.iter().any(|d| d.id == g.id && matches!(d.kind, Kind::Summary { open: false, .. }))
         };
         // A late frame (a hitch, a busy machine) pauses the folds past a
         // 60 Hz frame's time, their held room's spring with them: the
@@ -4082,11 +3895,11 @@ impl AppView {
             })
             .collect();
         if late > Duration::ZERO
-            && let Some(mut s) = self.fold_slack.get()
+            && let Some(mut s) = self.panes.cur.fold_slack.get()
             && let Some((l, t, r)) = s.gone
         {
             s.gone = Some((l, t + late, r));
-            self.fold_slack.set(Some(s));
+            self.panes.cur.fold_slack.set(Some(s));
         }
         let mut out = Vec::new();
         for g in gaps {
@@ -4097,7 +3910,7 @@ impl AppView {
                 self.land(g.held(now), g.vh);
             }
         }
-        *self.fold_gap.borrow_mut() = out.iter().map(|(g, _)| g.clone()).collect();
+        *self.panes.cur.fold_gap.borrow_mut() = out.iter().map(|(g, _)| g.clone()).collect();
         if !out.is_empty() {
             self.fx.want_frame();
         }
@@ -4115,25 +3928,25 @@ impl AppView {
         if held < 1. {
             return;
         }
-        let max = f32::from(self.list.max_offset_for_scrollbar().y);
-        let at = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
-        let prev = self.fold_slack.get().filter(|s| s.list == self.list_gen);
+        let max = f32::from(self.panes.cur.list.max_offset_for_scrollbar().y);
+        let at = -f32::from(self.panes.cur.list.scroll_px_offset_for_scrollbar().y);
+        let prev = self.panes.cur.fold_slack.get().filter(|s| s.list == self.panes.cur.list_gen);
         let given = prev.map_or(0., |s| s.last) + held;
-        let view = f32::from(self.list.viewport_bounds().size.height);
+        let view = f32::from(self.panes.cur.list.viewport_bounds().size.height);
         let content = max + view;
         let vh = prev.map_or(vh, |s| s.vh);
-        let left = self.list.is_scrolled_to_end().is_some() && self.list_end() - at - (vh - view).max(0.) > END_SLOP;
+        let left = self.panes.cur.list.is_scrolled_to_end().is_some() && self.list_end() - at - (vh - view).max(0.) > END_SLOP;
         if left && max - at >= given {
             return;
         }
-        self.fold_slack.set(Some(Slack {
+        self.panes.cur.fold_slack.set(Some(Slack {
             given,
             base: (content - given).round(),
             last: given,
             gone: None,
             held: true,
             left,
-            list: self.list_gen,
+            list: self.panes.cur.list_gen,
             input: prev.is_some_and(|s| s.input),
             vh: if left { view } else { vh },
             fresh: None,
@@ -4146,15 +3959,15 @@ impl AppView {
     /// dead (the design gate of #23 r3, S1; Shady #23 r3 L10). `drawn`: how
     /// much of its `h` is in so far (it starts as the reveal settles).
     fn show_body(&self, id: u64, h: f32, drawn: f32) {
-        let Some(ix) = self.disp.iter().position(|d| d.id == id && d.kind == Kind::Work) else { return };
-        let (Some(b), Some(m)) = (self.list.bounds_for_item(ix), self.metrics_last.get()) else { return };
-        let view = self.list.viewport_bounds();
+        let Some(ix) = self.panes.cur.disp.iter().position(|d| d.id == id && d.kind == Kind::Work) else { return };
+        let (Some(b), Some(m)) = (self.panes.cur.list.bounds_for_item(ix), self.panes.cur.metrics_last.get()) else { return };
+        let view = self.panes.cur.list.viewport_bounds();
         let (top, bottom) = (f32::from(view.top()), f32::from(view.bottom()) - list_pad_b(&m));
         let shown = bottom - (f32::from(b.bottom()) - drawn);
-        let need = (3. * self.body_line).min(h) - shown.max(0.);
+        let need = (3. * self.panes.cur.body_line).min(h) - shown.max(0.);
         let by = need.min(f32::from(b.top()) - top).round();
         if by >= 1. {
-            self.scroller.jump(by, false, f32::from(view.size.height), self.fx.clock());
+            self.panes.cur.scroller.jump(by, false, f32::from(view.size.height), self.fx.clock());
             self.fx.want_frame();
         }
     }
@@ -4163,8 +3976,8 @@ impl AppView {
     /// heights to device pixels: Shady #23 r2b L1). None: not known.
     #[cfg(test)]
     pub(crate) fn at_end(&self) -> Option<bool> {
-        self.list.is_scrolled_to_end()?;
-        let at = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+        self.panes.cur.list.is_scrolled_to_end()?;
+        let at = -f32::from(self.panes.cur.list.scroll_px_offset_for_scrollbar().y);
         Some(self.list_end() - at <= END_SLOP)
     }
 
@@ -4174,32 +3987,35 @@ impl AppView {
     /// the end held a list up to the padding (28 px) short of it "at its
     /// end" (Shady #23 r4 H1, found by its test).
     fn list_end(&self) -> f32 {
-        let pad = self.metrics_last.get().map_or(0., |m| list_pad_b(&m));
-        f32::from(self.list.max_offset_for_scrollbar().y) + pad
+        let pad = self.panes.cur.metrics_last.get().map_or(0., |m| list_pad_b(&m));
+        f32::from(self.panes.cur.list.max_offset_for_scrollbar().y) + pad
     }
 
     /// What of a run about to fold is on screen ([`Folded`]): before the
-    /// list's splice (`lo..hi` of [`AppView::disp`]; `fresh`, what comes).
+    /// list's splice (`lo..hi` of [`Pane::disp`]; `fresh`, what comes).
     fn folded(&self, id: u64, lo: usize, hi: usize, fresh: &[Disp]) -> Folded {
         let kept = |d: &Disp| fresh.iter().any(|n| n.id == d.id && std::mem::discriminant(&n.kind) == std::mem::discriminant(&d.kind));
-        let l = &self.list;
+        let l = &self.panes.cur.list;
         let view = l.viewport_bounds();
         let top = l.logical_scroll_top();
-        let gone: Vec<usize> = (lo..hi).filter(|&ix| self.disp[ix].kind == Kind::Work && !kept(&self.disp[ix])).collect();
+        let gone: Vec<usize> =
+            (lo..hi).filter(|&ix| self.panes.cur.disp[ix].kind == Kind::Work && !kept(&self.panes.cur.disp[ix])).collect();
         let ys = |ix: usize| l.bounds_for_item(ix).map(|b| (f32::from(b.top()), f32::from(b.bottom())));
-        let header = (lo..hi).find(|&ix| self.disp[ix].id == id && matches!(self.disp[ix].kind, Kind::Summary { .. })).and_then(ys);
+        let header = (lo..hi)
+            .find(|&ix| self.panes.cur.disp[ix].id == id && matches!(self.panes.cur.disp[ix].kind, Kind::Summary { .. }))
+            .and_then(ys);
         let last = gone.last().copied();
         let max = f32::from(l.max_offset_for_scrollbar().y);
         let at = -f32::from(l.scroll_px_offset_for_scrollbar().y);
         Folded {
             id,
-            rows: gone.iter().filter_map(|&ix| ys(ix).map(|(t, b)| (self.disp[ix], t, b - t))).collect(),
+            rows: gone.iter().filter_map(|&ix| ys(ix).map(|(t, b)| (self.panes.cur.disp[ix], t, b - t))).collect(),
             first: gone.first().copied().and_then(ys).map(|y| y.0),
             header,
             end: last.and_then(ys).map(|y| y.1),
             above: last.is_some_and(|ix| ix < top.item_ix),
             top,
-            top_row: self.disp.get(top.item_ix).map(|d| (d.id, matches!(d.kind, Kind::Summary { .. }))),
+            top_row: self.panes.cur.disp.get(top.item_ix).map(|d| (d.id, matches!(d.kind, Kind::Summary { .. }))),
             view: (f32::from(view.top()), f32::from(view.bottom())),
             following: l.is_following_tail(),
             below: (max - at).max(0.),
@@ -4215,10 +4031,10 @@ impl AppView {
     fn start_gap(&mut self, folded: Option<Folded>) {
         let Some(f) = folded else { return };
         let fluid = self.fx.fluid();
-        let summary = self.disp.iter().position(|d| d.id == f.id && matches!(d.kind, Kind::Summary { .. }));
+        let summary = self.panes.cur.disp.iter().position(|d| d.id == f.id && matches!(d.kind, Kind::Summary { .. }));
         // The summary's height as it folds (no bottom edge: its room goes
         // on under it): the gap above it, its card's top edge, its row.
-        let head = match (summary.and_then(|ix| self.disp.get(ix)), self.metrics_last.get()) {
+        let head = match (summary.and_then(|ix| self.panes.cur.disp.get(ix)), self.panes.cur.metrics_last.get()) {
             (Some(d), Some(m)) => {
                 let g = crate::cards::Geo::of(&m);
                 turns::gap_of(d.gap, &m) + g.inset + 1. + g.row
@@ -4239,14 +4055,14 @@ impl AppView {
         if !f.following
             && let Some((id, sum)) = f.top_row
         {
-            let same = self.disp.iter().position(|d| d.id == id && matches!(d.kind, Kind::Summary { .. }) == sum);
+            let same = self.panes.cur.disp.iter().position(|d| d.id == id && matches!(d.kind, Kind::Summary { .. }) == sum);
             let to = match (same, summary) {
                 (Some(ix), _) => Some(ListOffset { item_ix: ix, offset_in_item: f.top.offset_in_item }),
                 (None, Some(ix)) => Some(ListOffset { item_ix: ix, offset_in_item: px(if fluid { off } else { 0. }) }),
                 (None, None) => None,
             };
             if let Some(to) = to {
-                self.list.scroll_to(to);
+                self.panes.cur.list.scroll_to(to);
             }
         }
         if !fluid || f.above {
@@ -4266,16 +4082,16 @@ impl AppView {
         let rows: Vec<(Disp, f32, f32)> = f.rows.into_iter().filter(|r| r.1 + r.2 > gap_top && r.1 < f.view.1).collect();
         let inner = rows.first().map_or(0., |r| (r.1 - gap_top).min(0.));
         let now = self.fx.clock();
-        let slack = if f.following { self.fold_slack.get().map_or(0., |s| s.last) } else { 0. };
+        let slack = if f.following { self.panes.cur.fold_slack.get().map_or(0., |s| s.last) } else { 0. };
         let response = FoldGap::response(from + slack);
         if f.following
-            && let Some(mut s) = self.fold_slack.get()
+            && let Some(mut s) = self.panes.cur.fold_slack.get()
         {
             s.gone = Some((s.last, now, response));
-            self.fold_slack.set(Some(s));
+            self.panes.cur.fold_slack.set(Some(s));
         }
         let rows: Rc<[Disp]> = rows.into_iter().map(|r| r.0).collect();
-        let mut gaps = self.fold_gap.borrow_mut();
+        let mut gaps = self.panes.cur.fold_gap.borrow_mut();
         gaps.retain(|g| !g.is(f.id));
         // Folds in flight share what is under the view (Shady #23 r3 M2):
         // one already holding keeps its count; one that isn't yet takes
@@ -4289,7 +4105,7 @@ impl AppView {
         let vh = f.view.1 - f.view.0;
         gaps.push(FoldGap {
             id: f.id,
-            list: self.list_gen,
+            list: self.panes.cur.list_gen,
             rows,
             inner,
             from,
@@ -4314,16 +4130,16 @@ impl AppView {
         // The user's own scroll since the last frame (the wheel, a finger,
         // their glide or coast, a jump, the bar): nothing else leaves the
         // end (Shady #23 r3 H2, M1).
-        let touched = self.scroller.touched() | self.list.is_scrollbar_dragging() | self.touch_kept.take();
+        let touched = self.panes.cur.scroller.touched() | self.panes.cur.list.is_scrollbar_dragging() | self.panes.cur.touch_kept.take();
         if !self.fx.fluid() {
-            self.fold_slack.set(None);
-            self.body_hold.set(None);
+            self.panes.cur.fold_slack.set(None);
+            self.panes.cur.body_hold.set(None);
             return 0.;
         }
-        if let Some(e) = &self.card_exit {
+        if let Some(e) = &self.panes.cur.card_exit {
             // A scroll while the card folds is the room's it leaves (Shady
             // #23 r4, the rest of r3 L2): kept until it lands.
-            self.touch_kept.set(touched);
+            self.panes.cur.touch_kept.set(touched);
             return e.given(self.fx.now());
         }
         let now = self.fx.now();
@@ -4331,21 +4147,21 @@ impl AppView {
         // The runs folding with their header held (N1): what each closed
         // past what was under the view is held at the end, in the frame
         // (no lag), on the clock its room closes on ([`AppView::fold_gap_now`]).
-        let mut folding: f32 = self.fold_gap.borrow().iter().map(|g| g.held(clock)).sum();
+        let mut folding: f32 = self.panes.cur.fold_gap.borrow().iter().map(|g| g.held(clock)).sum();
         // A body the user closed (S1), the same way: what closed past what
         // was under the view is held; closed, it stays as the fold's room.
-        if let Some(BodyHold { id, below, opens, frame, list, vh }) = self.body_hold.get() {
+        if let Some(BodyHold { id, below, opens, frame, list, vh }) = self.panes.cur.body_hold.get() {
             match self.fx.body(id, now) {
-                _ if list != self.list_gen => self.body_hold.set(None),
+                _ if list != self.panes.cur.list_gen => self.panes.cur.body_hold.set(None),
                 // The user scrolled while it opened: their scroll wins, no
                 // glide to its lines when it lands (Shady #23 r4 M1).
-                _ if opens && touched => self.body_hold.set(None),
+                _ if opens && touched => self.panes.cur.body_hold.set(None),
                 // Not drawn since the click: its reveal starts with the row.
                 _ if self.fx.frame() <= frame + 1 => {}
                 // Opening, settling: the glide to its lines starts now, the
                 // two one motion (the design gate of #23 r4, n1).
                 Some((true, shown, h, landed)) if opens && (landed || shown >= BODY_GLIDE_AT) => {
-                    self.body_hold.set(None);
+                    self.panes.cur.body_hold.set(None);
                     self.show_body(id, h, if landed { h } else { h * shown });
                 }
                 Some((o, shown, h, false)) if o == opens => {
@@ -4354,24 +4170,24 @@ impl AppView {
                     }
                 }
                 Some((o, _, h, true)) if o == opens && !opens => {
-                    self.body_hold.set(None);
+                    self.panes.cur.body_hold.set(None);
                     self.land((h - below).max(0.).round(), vh);
                 }
-                _ => self.body_hold.set(None),
+                _ => self.panes.cur.body_hold.set(None),
             }
         }
-        if folding > 0. || self.body_hold.get().is_some() || self.fold_gap.borrow().iter().any(|g| g.hold) {
-            self.list.pause_following_tail();
+        if folding > 0. || self.panes.cur.body_hold.get().is_some() || self.panes.cur.fold_gap.borrow().iter().any(|g| g.hold) {
+            self.panes.cur.list.pause_following_tail();
         }
 
-        let Some(mut s) = self.fold_slack.get() else { return folding };
-        if s.list != self.list_gen {
-            self.fold_slack.set(None);
+        let Some(mut s) = self.panes.cur.fold_slack.get() else { return folding };
+        if s.list != self.panes.cur.list_gen {
+            self.panes.cur.fold_slack.set(None);
             return folding;
         }
         s.input |= touched;
-        let max = f32::from(self.list.max_offset_for_scrollbar().y);
-        let at = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+        let max = f32::from(self.panes.cur.list.max_offset_for_scrollbar().y);
+        let at = -f32::from(self.panes.cur.list.scroll_px_offset_for_scrollbar().y);
         // The view got shorter under it (the composer growing, the dock's
         // tray springing in, a notice, a resize): held at the end, the list
         // rises by as much, its bottom kept the way `keep_rows` keeps its
@@ -4382,9 +4198,9 @@ impl AppView {
         // Rows not measured yet (a resize that changes the form remeasures
         // them): the list's extent is a guess this frame, and the view's
         // change waits for the next.
-        let vh = f32::from(self.list.viewport_bounds().size.height);
+        let vh = f32::from(self.panes.cur.list.viewport_bounds().size.height);
         let end = self.list_end();
-        let measured = self.list.is_scrolled_to_end().is_some() || max <= 0.;
+        let measured = self.panes.cur.list.is_scrolled_to_end().is_some() || max <= 0.;
         // A card's room that has just landed ([`Slack::fresh`]): following,
         // the list keeps its end at the view's bottom, a view that changed
         // too, and the hold begins after its layout ([`land_card_room`]).
@@ -4394,14 +4210,14 @@ impl AppView {
             s.fresh = None;
         } else if s.fresh.is_some() && touched {
             // A scroll as it landed: the room's, once it is measured.
-            self.touch_kept.set(true);
+            self.panes.cur.touch_kept.set(true);
         }
         let lift = if !measured || s.left || s.vh <= 0. || s.fresh.is_some() { 0. } else { (s.vh - vh).min(end - at).max(0.) };
         if measured {
             s.vh = vh;
         }
         if lift > 0. {
-            self.list.scroll_by(px(lift));
+            self.panes.cur.list.scroll_by(px(lift));
         }
         let at = at + lift;
         // Rows that grew in under it since it landed take its room: the
@@ -4413,14 +4229,14 @@ impl AppView {
         // column by each frame's growth.
         let mut room = s.last;
         if max > 0. && s.gone.is_none() && s.fresh.is_none() {
-            let content = max + f32::from(self.list.viewport_bounds().size.height) - s.last;
+            let content = max + f32::from(self.panes.cur.list.viewport_bounds().size.height) - s.last;
             // Rows under the hold got shorter (a worker's block ended):
             // the content it is held against follows them down, so rows
             // growing in take the room from there and it is used up at
             // the list's end, not that much short of it (#23 r9). Measured
             // only (a row a splice left at 0 px is no shrink: M1); a
             // click's own hold has its room.
-            if measured && content < s.base && folding == 0. && self.body_hold.get().is_none() {
+            if measured && content < s.base && folding == 0. && self.panes.cur.body_hold.get().is_none() {
                 s.base = content.round();
             }
             room = s.given - (content - s.base).max(0.);
@@ -4441,7 +4257,7 @@ impl AppView {
             s.left = false;
         }
         if s.left && max - at >= s.last {
-            self.fold_slack.set(None);
+            self.panes.cur.fold_slack.set(None);
             return folding;
         }
         if s.gone.is_none() {
@@ -4449,7 +4265,7 @@ impl AppView {
         }
         // The turn ended (its run folds, the column moves anyway): what is
         // left goes on `sheet` with it. A fold the user made stays.
-        if !self.synced_busy && !s.held && s.gone.is_none() {
+        if !self.panes.cur.synced_busy && !s.held && s.gone.is_none() {
             s.gone = Some((s.last, clock, crate::motion::SHEET_RESPONSE));
         }
         if let Some((from, at, response)) = s.gone {
@@ -4457,7 +4273,7 @@ impl AppView {
             self.fx.want_frame();
         }
         if s.last < 1. {
-            self.fold_slack.set(None);
+            self.panes.cur.fold_slack.set(None);
             // Used up by rows growing in under it, the list's top held:
             // it follows the tail again (GPUI resumes only at the exact
             // end, and the last frame's growth may be past it). With no
@@ -4466,16 +4282,16 @@ impl AppView {
             // splice the sums missed, #23 r9); after one, only if it is
             // still at its end: never back there from where a scroll took
             // it, nor while a click holds its row (a body opening, a fold).
-            let clicked = self.body_hold.get().is_some() || self.fold_gap.borrow().iter().any(|g| g.hold);
+            let clicked = self.panes.cur.body_hold.get().is_some() || self.panes.cur.fold_gap.borrow().iter().any(|g| g.hold);
             if s.gone.is_none() && !s.left && !clicked && (!s.input || rest <= END_SLOP) {
-                self.list.scroll_to_end();
+                self.panes.cur.list.scroll_to_end();
             }
             return folding;
         }
         if s.gone.is_none() && !s.left && s.fresh.is_none() {
-            self.list.pause_following_tail();
+            self.panes.cur.list.pause_following_tail();
         }
-        self.fold_slack.set(Some(s));
+        self.panes.cur.fold_slack.set(Some(s));
         s.last + folding
     }
 
@@ -4484,12 +4300,12 @@ impl AppView {
     /// [`crate::motion::ARRIVE`] and lifting from 70 %; the streaming row's
     /// new lines glide in. History, Reduced and Off: the row as is.
     fn arrive(&self, ix: usize, row: turns::RowParts) -> AnyElement {
-        let Some(d) = self.disp.get(ix) else { return row.whole() };
-        let streaming = self.synced_busy && ix + 1 == self.disp.len() && d.kind == Kind::Prose;
+        let Some(d) = self.panes.cur.disp.get(ix) else { return row.whole() };
+        let streaming = self.panes.cur.synced_busy && ix + 1 == self.panes.cur.disp.len() && d.kind == Kind::Prose;
         let key = d.motion_key();
         // The authorize card arrives on `glide` (§8 #8), rising 4 px.
         let response = if d.kind == Kind::Prompt { crate::motion::GLIDE_RESPONSE } else { crate::motion::SNAP_RESPONSE };
-        match self.fx.grow_on(key, ix, self.fx.birth(key), streaming, self.body_line, response) {
+        match self.fx.grow_on(key, ix, self.fx.birth(key), streaming, self.panes.cur.body_line, response) {
             // Your own message was readable a frame ago: it doesn't lift.
             Some(mut g) => {
                 if d.kind == Kind::User {
@@ -4532,15 +4348,15 @@ impl AppView {
     /// would follow). Once hinted every row has a height, and this is a few
     /// lookups a frame.
     fn hint_rows(&self, m: &Metrics) {
-        let (l, n) = (&self.list, self.disp.len());
+        let (l, n) = (&self.panes.cur.list, self.panes.cur.disp.len());
         if !wants_hint(l, n) {
             return;
         }
         // The rows not drawn are above the view (rows below it are drawn
         // or keep 0 px): their mean, not the drawn tail's.
         let top = l.logical_scroll_top().item_ix.min(n);
-        let above = if top > 0 { &self.disp[..top] } else { &self.disp[..] };
-        let h = turns::mean_height(above, &self.rows, m, turns::cpl(self.layout.column, m));
+        let above = if top > 0 { &self.panes.cur.disp[..top] } else { &self.panes.cur.disp[..] };
+        let h = turns::mean_height(above, &self.panes.cur.rows, m, turns::cpl(self.panes.cur.layout.column, m));
         if h > 0. {
             // A builder, on a clone: `ListState` is shared, so the hint lands
             // on the list itself. Whole pixels (Shady #23 r2 H1): a mean is a
@@ -4553,13 +4369,13 @@ impl AppView {
 
     /// The card, if it shows the attached session's first pending prompt.
     pub(crate) fn current_card(&self) -> Option<&PromptCard> {
-        self.card.as_ref().filter(|c| self.model.card_key() == Some(c.key))
+        self.panes.cur.card.as_ref().filter(|c| self.model.card_key() == Some(c.key))
     }
 
     /// The prompt the card shows, if it is still the attached session's and
     /// armed: what a click or Enter on the card answers.
     fn card_target(&self) -> Option<u64> {
-        let c = self.card.as_ref().filter(|c| c.armed())?;
+        let c = self.panes.cur.card.as_ref().filter(|c| c.armed())?;
         (self.model.card_key() == Some(c.key)).then_some(c.key.1)
     }
 
@@ -4573,7 +4389,7 @@ impl AppView {
             self.model.last_error = Some("offline: there is no daemon to answer".into());
             return false;
         }
-        if self.card.as_ref().map(|c| c.key) != Some(key) || self.card_target() != Some(key.1) || !self.model.may_answer(key.1) {
+        if self.panes.cur.card.as_ref().map(|c| c.key) != Some(key) || self.card_target() != Some(key.1) || !self.model.may_answer(key.1) {
             return false;
         }
         let connection = self.model.active.as_ref().map_or(0, |a| a.connection);
@@ -4586,7 +4402,7 @@ impl AppView {
             Some(_) => ("a secret", Answer::Provided),
             None => ("cancel", Answer::Cancelled),
         };
-        let took = self.card.as_ref().map_or(Duration::ZERO, |c| c.shown.elapsed());
+        let took = self.panes.cur.card.as_ref().map_or(Duration::ZERO, |c| c.shown.elapsed());
         let sent = match &self.client {
             Some(c) => c.answer_on(connection, key.1, value),
             None => Ok(()),
@@ -4608,13 +4424,13 @@ impl AppView {
     /// What the composer says of its text instead of its hint: a worker
     /// key's or a refused steer's note, else the draft's.
     fn composer_note(&self) -> Option<SharedString> {
-        self.watch_note.clone().or_else(|| self.draft_note.map(SharedString::from))
+        self.panes.cur.watch_note.clone().or_else(|| self.panes.cur.draft_note.map(SharedString::from))
     }
 
     /// A note's colour: a command that went out or was answered, quiet
     /// (`dim_u`); anything else (refused, not run, a warning) `warn`.
     pub(crate) fn note_color(&self, note: &SharedString, p: &Palette) -> Hsla {
-        if self.quiet_note.as_ref() == Some(note) { p.dim_u } else { p.warn }
+        if self.panes.cur.quiet_note.as_ref() == Some(note) { p.dim_u } else { p.warn }
     }
 
     /// What the centre column draws besides the bars, the card and the
@@ -4625,7 +4441,7 @@ impl AppView {
             naming: n.naming && self.model.active.is_some(),
             naming_notes: u8::from(n.rename_error.is_some()) + u8::from(self.replace_offer().is_some()),
             error: self.model.last_error.is_some(),
-            note: self.watch_note.is_some() || self.draft_note.is_some(),
+            note: self.panes.cur.watch_note.is_some() || self.panes.cur.draft_note.is_some(),
             stub: self.stub_shown(),
             tray: self.tray_rows as u8,
         }
@@ -4669,17 +4485,17 @@ impl AppView {
         let menu = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some() || self.palette.is_some();
         if !self.card_up() || !shown || self.picker_open || self.gear_menu || menu || !window.is_window_active() {
             None
-        } else if self.secret_input.read(cx).focus_handle(cx).is_focused(window) {
+        } else if self.panes.cur.secret_input.read(cx).focus_handle(cx).is_focused(window) {
             Some(true)
         } else {
-            (self.focus.is_focused(window) || self.allow_all_focus.is_focused(window)).then_some(false)
+            (self.focus.is_focused(window) || self.panes.cur.allow_all_focus.is_focused(window)).then_some(false)
         }
     }
 
     /// Tab or Shift+Tab with the card's keys: to its Allow all box, or
     /// from it back to the card.
     fn card_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let to = if self.allow_all_focus.is_focused(window) { &self.focus } else { &self.allow_all_focus };
+        let to = if self.panes.cur.allow_all_focus.is_focused(window) { &self.focus } else { &self.panes.cur.allow_all_focus };
         window.focus(to, cx);
         cx.notify();
     }
@@ -4704,8 +4520,8 @@ impl AppView {
     /// typed in a secret.
     fn text_keys_blocked(&mut self, now: Instant) -> bool {
         let up = self.card_up() && self.current_card().is_some_and(|c| c.secret);
-        self.secret_left = still_typing(self.secret_left, now);
-        up || self.secret_left.is_some()
+        self.panes.cur.secret_left = still_typing(self.panes.cur.secret_left, now);
+        up || self.panes.cur.secret_left.is_some()
     }
 
     /// Repaint the card when its arm runs out (its buttons, and the keys
@@ -4719,7 +4535,7 @@ impl AppView {
 
     /// The card's keys went live: they wait [`ARM`] from now.
     fn restart_card_keys(&mut self, cx: &mut Context<Self>) {
-        if let Some(c) = self.card.as_mut() {
+        if let Some(c) = self.panes.cur.card.as_mut() {
             log::info!(target: "synaps_desktop::card", "card {:?}: keys live, waiting", c.key);
             c.arm.restart(Instant::now());
             c._arm = Some(Self::arm_repaint(cx));
@@ -4730,9 +4546,9 @@ impl AppView {
     /// it may answer ([`Arm::key`]: a new press, armed). Keys that were not
     /// live at the last frame went live with it, so it waits too.
     fn card_key_armed(&mut self, cx: &mut Context<Self>) -> bool {
-        let press = self.chord_press;
-        let fresh = !std::mem::replace(&mut self.keys_live, true);
-        let Some(c) = self.card.as_mut() else { return false };
+        let press = self.panes.cur.chord_press;
+        let fresh = !std::mem::replace(&mut self.panes.cur.keys_live, true);
+        let Some(c) = self.panes.cur.card.as_mut() else { return false };
         let now = Instant::now();
         if fresh {
             c.arm.restart(now);
@@ -4762,7 +4578,7 @@ impl AppView {
         let Some((c, secret)) = self.card_answerable() else { return };
         let key = c.key;
         if secret {
-            self.secret_input.update(cx, |s, cx| s.focus(window, cx));
+            self.panes.cur.secret_input.update(cx, |s, cx| s.focus(window, cx));
         } else {
             self.authorize(key);
         }
@@ -4801,10 +4617,11 @@ impl AppView {
 
     /// AUTHORIZE: only once the whole body has been on screen.
     pub(crate) fn authorize(&mut self, key: (u64, u64)) {
-        let ready = self.card.as_ref().is_some_and(|c| c.key == key && authorize_ready(c.armed(), c.below(self.list_view()), c.read));
+        let ready =
+            self.panes.cur.card.as_ref().is_some_and(|c| c.key == key && authorize_ready(c.armed(), c.below(self.list_view()), c.read));
         if ready {
             // Allow all, checked (and still offered: this client owns the input).
-            let all = self.allow_all_offered() && self.card.as_ref().is_some_and(|c| c.allow_all);
+            let all = self.allow_all_offered() && self.panes.cur.card.as_ref().is_some_and(|c| c.allow_all);
             let value = if all { synaps_client::protocol::CONFIRM_ANSWER_ALLOW_ALL } else { CONFIRM_YES };
             self.answer(key, Some(value.into()));
         }
@@ -4814,10 +4631,10 @@ impl AppView {
     /// card shows ([`secret_answer`]: never an empty one); the field is
     /// cleared only when it went out.
     pub(crate) fn answer_secret(&mut self, submit: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(key) = self.card.as_ref().map(|c| c.key) else { return };
-        let Some(value) = secret_answer(submit, &self.secret_input.read(cx).value()) else { return };
+        let Some(key) = self.panes.cur.card.as_ref().map(|c| c.key) else { return };
+        let Some(value) = secret_answer(submit, &self.panes.cur.secret_input.read(cx).value()) else { return };
         if self.answer(key, value) {
-            self.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
+            self.panes.cur.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
         }
         cx.notify();
     }
@@ -4826,7 +4643,7 @@ impl AppView {
     /// answered elsewhere) and, with its row on screen under Full, its
     /// collapse ([`CardExit`]).
     fn resolve_card(&mut self, fx_now: Instant, cx: &App) {
-        let Some(c) = self.card.take() else { return };
+        let Some(c) = self.panes.cur.card.take() else { return };
         let Some(sid) = self.model.active.as_ref().map(|a| a.session_id.clone()) else { return };
         let items = self.model.transcript.items();
         let Some(last) = items.last().map(|i| i.id) else { return };
@@ -4863,15 +4680,17 @@ impl AppView {
         let on_screen = self.model.watch.focus().is_none()
             && self.model.tabs.view().is_none()
             && self
+                .panes
+                .cur
                 .disp
                 .iter()
                 .rposition(|d| d.kind == Kind::Prompt && d.id == c.row)
-                .and_then(|ix| self.list.bounds_for_item(ix))
+                .and_then(|ix| self.panes.cur.list.bounds_for_item(ix))
                 .is_some_and(|b| f32::from(b.top()) < bottom && f32::from(b.bottom()) > top);
         if on_screen && self.fx.fluid() && !c.height.get().is_nan() {
             let to = if own && line { crate::authorize::receipt_line(&theme::metrics(cx)) } else { 0. };
-            let look = self.card_look.borrow().clone();
-            self.card_exit =
+            let look = self.panes.cur.card_look.borrow().clone();
+            self.panes.cur.card_exit =
                 Some(CardExit { card: c, look, at: fx_now, session: sid, after, to, sink: Rc::new(Cell::new(f32::NAN)), answer });
         }
     }
@@ -4910,11 +4729,11 @@ impl AppView {
     fn sync_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = self.list_view();
         let now = Instant::now();
-        let was = self.card.as_ref().map(|c| (c.key, c.secret));
+        let was = self.panes.cur.card.as_ref().map(|c| (c.key, c.secret));
         // The collapse lands; a switch, a reconnect or motion turned down
         // ends it at once.
         let fx_now = self.fx.now();
-        if let Some(e) = &self.card_exit {
+        if let Some(e) = &self.panes.cur.card_exit {
             let here = self.model.active.as_ref().is_some_and(|a| a.session_id == e.session && a.epoch == e.card.key.0);
             // Another prompt in its place ends it at once, as the dock's did.
             let other = self.model.card_key().is_some_and(|k| k != e.card.key);
@@ -4925,28 +4744,29 @@ impl AppView {
                 // What the list holds now, without it (its last layout drew
                 // the room at the fold's end).
                 let given = e.given(fx_now);
-                let content = f32::from(self.list.max_offset_for_scrollbar().y) + f32::from(self.list.viewport_bounds().size.height);
+                let content = f32::from(self.panes.cur.list.max_offset_for_scrollbar().y)
+                    + f32::from(self.panes.cur.list.viewport_bounds().size.height);
                 // Whole pixels where it is made (Shady #23 r2b n2).
                 let given = given.round();
-                self.fold_slack.set((keep && given >= 1.).then_some(Slack {
+                self.panes.cur.fold_slack.set((keep && given >= 1.).then_some(Slack {
                     given,
                     base: (content - given).round(),
                     last: given,
                     gone: None,
                     held: false,
                     left: false,
-                    list: self.list_gen,
+                    list: self.panes.cur.list_gen,
                     // A reader scrolled back as it resolved (the card in
                     // view, answered elsewhere: their scroll came before
                     // the hold): theirs, as a scroll in the hold would be,
                     // so its use-up never takes them to the end (Shady #23
                     // final H1). Read before the landing frame keeps the
                     // list following ([`Slack::fresh`]).
-                    input: !self.list.is_following_tail(),
-                    vh: f32::from(self.list.viewport_bounds().size.height),
+                    input: !self.panes.cur.list.is_following_tail(),
+                    vh: f32::from(self.panes.cur.list.viewport_bounds().size.height),
                     fresh: Some(self.fx.frame()),
                 }));
-                self.card_exit = None;
+                self.panes.cur.card_exit = None;
             }
         }
         // A refused (or lost) answer: forgotten, the card asks again.
@@ -4956,6 +4776,8 @@ impl AppView {
         // Its prompt resolved in its attachment (answered here or elsewhere):
         // its receipt, and (on screen, Full) its row collapses.
         let resolved = self
+            .panes
+            .cur
             .card
             .as_ref()
             .zip(self.model.active.as_ref())
@@ -4963,20 +4785,20 @@ impl AppView {
         if resolved {
             self.resolve_card(fx_now, cx);
         }
-        let new = PromptCard::sync(&mut self.card, &self.model, now, view);
-        if was.map(|w| w.0) != self.card.as_ref().map(|c| c.key) {
+        let new = PromptCard::sync(&mut self.panes.cur.card, &self.model, now, view);
+        if was.map(|w| w.0) != self.panes.cur.card.as_ref().map(|c| c.key) {
             // The box's focus was the card's that went (the next card's
             // box is its own).
-            if self.allow_all_focus.is_focused(window) {
+            if self.panes.cur.allow_all_focus.is_focused(window) {
                 window.focus(&self.focus, cx);
             }
             if was.is_some_and(|w| w.1) {
-                self.secret_left = Some(now);
+                self.panes.cur.secret_left = Some(now);
             }
-            self.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
+            self.panes.cur.secret_input.update(cx, |s, cx| s.set_value("", window, cx));
         }
         if new
-            && let Some(c) = self.card.as_mut()
+            && let Some(c) = self.panes.cur.card.as_mut()
             && let Some(a) = self.model.active.as_ref()
         {
             let k = (a.session_id.clone(), c.key.1, c.pr.raised_at.clone());
@@ -4990,16 +4812,16 @@ impl AppView {
                 }
             }
         }
-        if let Some(c) = self.card.as_mut() {
-            c.box_focus = self.allow_all_focus.is_focused(window);
+        if let Some(c) = self.panes.cur.card.as_mut() {
+            c.box_focus = self.panes.cur.allow_all_focus.is_focused(window);
         }
-        if new && let Some(c) = &self.card {
+        if new && let Some(c) = &self.panes.cur.card {
             log::info!(target: "synaps_desktop::card", "card {:?}: shown", c.key);
-            if window.focused(cx).is_none() || self.secret_input.read(cx).focus_handle(cx).is_focused(window) {
+            if window.focused(cx).is_none() || self.panes.cur.secret_input.read(cx).focus_handle(cx).is_focused(window) {
                 window.focus(&self.focus, cx);
             }
             let task = Self::arm_repaint(cx);
-            if let Some(c) = self.card.as_mut() {
+            if let Some(c) = self.panes.cur.card.as_mut() {
                 c._arm = Some(task);
             }
         }
@@ -5007,20 +4829,20 @@ impl AppView {
         // its buttons and keys wait again, as a new card's do. Nothing
         // that was not drawn counts as seen.
         let up = self.card_up();
-        if up && !self.card_was_up && !new {
-            if let Some(c) = self.card.as_mut() {
+        if up && !self.panes.cur.card_was_up && !new {
+            if let Some(c) = self.panes.cur.card.as_mut() {
                 log::info!(target: "synaps_desktop::card", "card {:?}: back on screen, waiting", c.key);
                 c.arm = Arm::new(now);
                 c._arm = Some(Self::arm_repaint(cx));
             }
-            self.keys_live = false;
+            self.panes.cur.keys_live = false;
         }
-        self.card_was_up = up;
+        self.panes.cur.card_was_up = up;
         let live = self.card_keys_live(window, cx).is_some();
-        if live && !self.keys_live {
+        if live && !self.panes.cur.keys_live {
             self.restart_card_keys(cx);
         }
-        self.keys_live = live;
+        self.panes.cur.keys_live = live;
     }
 
     /// Open the picker with the focus on this view, so Esc reaches the
@@ -5123,8 +4945,8 @@ impl AppView {
     /// the metrics, and one re-measure of the list.
     pub(crate) fn show_text_size(&mut self, next: u8, cx: &mut App) {
         theme::update(cx, |c| c.text = next);
-        self.list.remeasure();
-        self.metrics_gen += 1;
+        self.panes.cur.list.remeasure();
+        self.panes.cur.metrics_gen += 1;
     }
 
     pub(crate) fn apply_custom_accent(&mut self, cx: &mut Context<Self>) {
@@ -5168,8 +4990,8 @@ impl AppView {
     /// Every row's height changes with the text size: re-measured now (a
     /// cached tab's when it comes back).
     pub(crate) fn text_metrics_changed(&mut self) {
-        self.list.remeasure();
-        self.metrics_gen += 1;
+        self.panes.cur.list.remeasure();
+        self.panes.cur.metrics_gen += 1;
     }
 
     pub(crate) fn set_panels_pub(&mut self, p: theme::Panels, cx: &mut Context<Self>) {
@@ -5301,17 +5123,17 @@ impl AppView {
     /// holding it ([`turns::build`]); only rows that differ are spliced
     /// (and so re-measured). A turn that ends can fold its last run.
     pub fn sync_list(&mut self) {
-        let pane_before = self.pane_of.clone();
-        let session_before = self.rows_session.clone();
-        self.sync_pane();
+        let pane_before = self.panes.cur.column_of.clone();
+        let session_before = self.panes.cur.rows_session.clone();
+        self.sync_column();
         let busy = self.model.shown().busy();
         let mut splice = self.model.shown_mut().take_splice();
         // A splice that adds items (a delta to the last one adds no row).
         let live_splice = splice.as_ref().is_some_and(|sp| sp.start > 0 && sp.new_len > sp.old_len && sp.new_len <= sp.old_len + 16)
-            && !self.full_rebuild;
-        if std::mem::take(&mut self.full_rebuild) {
+            && !self.panes.cur.full_rebuild;
+        if std::mem::take(&mut self.panes.cur.full_rebuild) {
             let n = self.model.shown().len();
-            splice = Some(synaps_client::transcript::Splice { start: 0, old_len: self.rows.len(), new_len: n });
+            splice = Some(synaps_client::transcript::Splice { start: 0, old_len: self.panes.cur.rows.len(), new_len: n });
         }
         let items = self.model.shown().items();
         let from = match &splice {
@@ -5319,18 +5141,18 @@ impl AppView {
                 // The oldest rows dropped (a worker's bound): the list drops
                 // theirs and keeps every other row, its height and the
                 // scroll on it; the rest syncs as any change does.
-                let trimmed = if sp.start == 0 { front_trimmed(&self.rows, items) } else { 0 };
+                let trimmed = if sp.start == 0 { front_trimmed(&self.panes.cur.rows, items) } else { 0 };
                 if trimmed > 0 {
-                    let k = self.disp.partition_point(|d| d.item < trimmed);
-                    self.list.splice(0..k, 0);
-                    self.disp.drain(..k);
-                    self.disp.iter_mut().for_each(|d| d.shift(trimmed));
-                    self.rows.drain(..trimmed);
+                    let k = self.panes.cur.disp.partition_point(|d| d.item < trimmed);
+                    self.panes.cur.list.splice(0..k, 0);
+                    self.panes.cur.disp.drain(..k);
+                    self.panes.cur.disp.iter_mut().for_each(|d| d.shift(trimmed));
+                    self.panes.cur.rows.drain(..trimmed);
                     // The cut runs' summaries and folds go with them.
                     if let Some(first) = items.first().map(|i| i.id) {
-                        self.summaries.retain_from(first);
-                        self.toggled.retain(|id| *id >= first);
-                        self.open_runs.retain(|id| *id >= first);
+                        self.panes.cur.summaries.retain_from(first);
+                        self.panes.cur.toggled.retain(|id| *id >= first);
+                        self.panes.cur.open_runs.retain(|id| *id >= first);
                     }
                 }
                 if trimmed > 0 || items.len() - sp.start > REUSE_ROWS {
@@ -5338,64 +5160,64 @@ impl AppView {
                     // rows whose item kept its id and rev keep their strings,
                     // so a cached tab's re-attach rebuilds only what changed.
                     let mut old: HashMap<(u64, u64), RowCache> =
-                        self.rows.drain(sp.start.min(self.rows.len())..).map(|r| ((r.id, r.rev), r)).collect();
+                        self.panes.cur.rows.drain(sp.start.min(self.panes.cur.rows.len())..).map(|r| ((r.id, r.rev), r)).collect();
                     for item in &items[sp.start..] {
                         let mut r = old
                             .remove(&(item.id, item.rev))
                             .unwrap_or_else(|| row_cache(item, self.model.shown_files(), self.model.shown_subagents()));
                         r.retime(item);
-                        self.rows.push(r);
+                        self.panes.cur.rows.push(r);
                     }
                 } else {
-                    self.rows.truncate(sp.start);
+                    self.panes.cur.rows.truncate(sp.start);
                     for item in &items[sp.start..] {
-                        self.rows.push(row_cache(item, self.model.shown_files(), self.model.shown_subagents()));
+                        self.panes.cur.rows.push(row_cache(item, self.model.shown_files(), self.model.shown_subagents()));
                     }
                 }
-                debug_assert!(self.rows.iter().zip(items).all(|(r, i)| r.id == i.id && r.rev == i.rev && r.at == i.at));
+                debug_assert!(self.panes.cur.rows.iter().zip(items).all(|(r, i)| r.id == i.id && r.rev == i.rev && r.at == i.at));
                 if sp.start == 0 {
                     // Another session: what was unfolded there means nothing here.
                     let session = self.model.active.as_ref().map(|a| a.session_id.clone());
-                    if session != self.rows_session {
-                        self.rows_session = session;
-                        self.summaries.clear();
-                        self.toggled.clear();
-                        self.open_runs.clear();
+                    if session != self.panes.cur.rows_session {
+                        self.panes.cur.rows_session = session;
+                        self.panes.cur.summaries.clear();
+                        self.panes.cur.toggled.clear();
+                        self.panes.cur.open_runs.clear();
                         self.took.borrow_mut().clear();
                         self.ran.borrow_mut().clear();
                     }
-                    self.fold_slack.set(None);
+                    self.panes.cur.fold_slack.set(None);
                 }
                 sp.start
             }
-            None if busy != self.synced_busy => items.len(),
+            None if busy != self.panes.cur.synced_busy => items.len(),
             // A prompt's row came, went or changed (it rebuilds from its turn).
-            None if crate::authorize::built(&self.disp) != self.prompt_rows() => items.len(),
+            None if crate::authorize::built(&self.panes.cur.disp) != self.prompt_rows() => items.len(),
             None => {
                 self.sync_counts();
                 return self.sync_subagents();
             }
         };
-        self.waiting_on = turns::waiting_call(items, self.model.shown().pending_prompts().first());
+        self.panes.cur.waiting_on = turns::waiting_call(items, self.model.shown().pending_prompts().first());
         let start = turns::turn_start(items, from);
-        self.synced_busy = busy;
+        self.panes.cur.synced_busy = busy;
         // Rows that arrive while watched (a tail splice of a few items, not
         // an attach, a history load or another session's list) draw in:
         // a burst staggered 30 ms each (motion.md §6.1).
-        let live = self.fx.on() && live_splice && self.pane_of == pane_before && self.rows_session == session_before;
+        let live = self.fx.on() && live_splice && self.panes.cur.column_of == pane_before && self.panes.cur.rows_session == session_before;
         let before: HashSet<u64> =
-            if live { self.disp.iter().skip_while(|d| d.item < start).map(|d| d.id).collect() } else { HashSet::new() };
+            if live { self.panes.cur.disp.iter().skip_while(|d| d.item < start).map(|d| d.id).collect() } else { HashSet::new() };
         let folded = self.rebuild_from(start);
         // The turn's end folds its run on screen: its rows' room goes on a
         // spring, never a cut (the design gate of #23, N1).
-        if self.pane_of == pane_before && self.rows_session == session_before {
+        if self.panes.cur.column_of == pane_before && self.panes.cur.rows_session == session_before {
             self.start_gap(folded);
         }
         if live {
             // The motion clock's time (in tests, the executor's), as every
             // reveal reads it.
             let now = self.fx.clock();
-            let fresh = self.disp.iter().skip_while(|d| d.item < start).filter(|d| !before.contains(&d.id));
+            let fresh = self.panes.cur.disp.iter().skip_while(|d| d.item < start).filter(|d| !before.contains(&d.id));
             for (k, d) in fresh.enumerate() {
                 self.fx.born(d.motion_key(), now + crate::motion::stagger(k));
             }
@@ -5406,61 +5228,61 @@ impl AppView {
 
     /// The list holds the rows of the transcript on screen: when a worker's
     /// view comes on, the session's list (rows, folds, heights, scroll)
-    /// waits in [`AppView::main_pane`] and a fresh one is built for the
+    /// waits in [`Pane::main_column`] and a fresh one is built for the
     /// worker; when it goes, the worker's is dropped and the session's
     /// comes back exactly as it was left.
-    fn sync_pane(&mut self) {
+    fn sync_column(&mut self) {
         let want = self.model.watch.focus_key();
-        if want == self.pane_of.as_ref().map(|(h, g)| (h.as_str(), *g)) {
+        if want == self.panes.cur.column_of.as_ref().map(|(h, g)| (h.as_str(), *g)) {
             return;
         }
         let want = want.map(|(h, g)| (h.to_string(), g));
-        let left = self.take_pane();
-        match self.pane_of.take() {
-            None => self.main_pane = Some(left),
+        let left = self.take_column();
+        match self.panes.cur.column_of.take() {
+            None => self.panes.cur.main_column = Some(left),
             // A worker tab's: kept for when it is shown again.
             Some(k) if self.model.holds_view(&k.0) => {
-                self.worker_panes.retain(|(w, _)| *w != k);
-                self.worker_panes.push((k, left));
+                self.panes.cur.worker_columns.retain(|(w, _)| *w != k);
+                self.panes.cur.worker_columns.push((k, left));
             }
             Some(_) => {}
         }
         self.drop_released_panes();
-        match (&want, self.main_pane.take()) {
+        match (&want, self.panes.cur.main_column.take()) {
             (None, Some(main)) => {
-                let stale = main.metrics_gen != self.metrics_gen;
-                self.put_pane(main);
+                let stale = main.metrics_gen != self.panes.cur.metrics_gen;
+                self.put_column(main);
                 if stale {
-                    self.list.remeasure();
+                    self.panes.cur.list.remeasure();
                 }
             }
             // Never: the session's list is always kept. Built again.
-            (None, None) => self.full_rebuild = true,
+            (None, None) => self.panes.cur.full_rebuild = true,
             (Some(k), main) => {
-                self.main_pane = main;
-                match self.worker_panes.iter().position(|(w, _)| w == k) {
+                self.panes.cur.main_column = main;
+                match self.panes.cur.worker_columns.iter().position(|(w, _)| w == k) {
                     Some(i) => {
-                        let (_, pane) = self.worker_panes.swap_remove(i);
-                        let stale = pane.metrics_gen != self.metrics_gen;
-                        self.put_pane(pane);
+                        let (_, pane) = self.panes.cur.worker_columns.swap_remove(i);
+                        let stale = pane.metrics_gen != self.panes.cur.metrics_gen;
+                        self.put_column(pane);
                         if stale {
-                            self.list.remeasure();
+                            self.panes.cur.list.remeasure();
                         }
                     }
                     None => {
-                        self.rows_session = self.model.active.as_ref().map(|a| a.session_id.clone());
-                        self.full_rebuild = true;
+                        self.panes.cur.rows_session = self.model.active.as_ref().map(|a| a.session_id.clone());
+                        self.panes.cur.full_rebuild = true;
                     }
                 }
             }
         }
-        self.pane_of = want;
+        self.panes.cur.column_of = want;
     }
 
     /// Worker tabs' lists stay only while their tab is open and their view
     /// is the same one ([`crate::watch::Watch::hold`]).
     pub(crate) fn drop_released_panes(&mut self) {
-        let (model, panes) = (&self.model, &mut self.worker_panes);
+        let (model, panes) = (&self.model, &mut self.panes.cur.worker_columns);
         panes.retain(|((h, g), _)| model.holds_view(h) && model.watch.generation_of(h) == Some(*g));
     }
 
@@ -5469,8 +5291,9 @@ impl AppView {
     /// theirs, nor theirs streamed on).
     #[cfg(test)]
     pub(crate) fn text_views(&self) -> (usize, usize) {
-        let texts = self.texts.borrow();
-        let stale = texts.kept().filter(|&(id, t)| !self.rows.iter().any(|r| r.id == id && r.text.starts_with(t.as_str()))).count();
+        let texts = self.panes.cur.texts.borrow();
+        let stale =
+            texts.kept().filter(|&(id, t)| !self.panes.cur.rows.iter().any(|r| r.id == id && r.text.starts_with(t.as_str()))).count();
         (texts.kept().count(), stale)
     }
 
@@ -5480,59 +5303,59 @@ impl AppView {
     /// go (the next list numbers its items from 1 too).
     fn list_out(&mut self) {
         // Its scroller's moves are relative: none carries to the next list.
-        self.scroller.cancel();
+        self.panes.cur.scroller.cancel();
         self.bars.transcript.release();
-        self.list.scrollbar_drag_ended();
-        self.hold_back.set(false);
+        self.panes.cur.list.scrollbar_drag_ended();
+        self.panes.cur.hold_back.set(false);
         // An unfold's hold was this list's rows, and so were the rooms a
         // fold or a closed body hold, and the folds in flight (Shady #23 r3
         // H1): the next list numbers its items from 1 too.
-        self.unfold_hold.clear();
-        self.fold_slack.set(None);
-        self.fold_gap.borrow_mut().clear();
-        self.body_hold.set(None);
-        self.touch_kept.set(false);
-        self.list_gen += 1;
-        self.texts.borrow_mut().clear();
+        self.panes.cur.unfold_hold.clear();
+        self.panes.cur.fold_slack.set(None);
+        self.panes.cur.fold_gap.borrow_mut().clear();
+        self.panes.cur.body_hold.set(None);
+        self.panes.cur.touch_kept.set(false);
+        self.panes.cur.list_gen += 1;
+        self.panes.cur.texts.borrow_mut().clear();
     }
 
     /// The list's state, handed out; a fresh, empty list in its place.
-    fn take_pane(&mut self) -> Pane {
+    fn take_column(&mut self) -> Column {
         self.list_out();
         let fresh = ListState::new(0, ListAlignment::Top, px(600.));
         fresh.set_follow_mode(FollowMode::Tail);
-        turns::readiness(&fresh, &self.texts);
-        Pane {
-            rows: std::mem::take(&mut self.rows),
-            disp: std::mem::take(&mut self.disp),
-            summaries: std::mem::take(&mut self.summaries),
-            list: std::mem::replace(&mut self.list, fresh),
-            toggled: std::mem::take(&mut self.toggled),
-            open_runs: std::mem::take(&mut self.open_runs),
-            synced_busy: std::mem::take(&mut self.synced_busy),
-            files_gen: std::mem::take(&mut self.files_gen),
-            subs_gen: std::mem::take(&mut self.subs_gen),
-            waiting_on: self.waiting_on.take(),
-            rows_session: self.rows_session.take(),
-            scroll_carry: self.scroll_carry.take(),
-            metrics_gen: self.metrics_gen,
+        turns::readiness(&fresh, &self.panes.cur.texts);
+        Column {
+            rows: std::mem::take(&mut self.panes.cur.rows),
+            disp: std::mem::take(&mut self.panes.cur.disp),
+            summaries: std::mem::take(&mut self.panes.cur.summaries),
+            list: std::mem::replace(&mut self.panes.cur.list, fresh),
+            toggled: std::mem::take(&mut self.panes.cur.toggled),
+            open_runs: std::mem::take(&mut self.panes.cur.open_runs),
+            synced_busy: std::mem::take(&mut self.panes.cur.synced_busy),
+            files_gen: std::mem::take(&mut self.panes.cur.files_gen),
+            subs_gen: std::mem::take(&mut self.panes.cur.subs_gen),
+            waiting_on: self.panes.cur.waiting_on.take(),
+            rows_session: self.panes.cur.rows_session.take(),
+            scroll_carry: self.panes.cur.scroll_carry.take(),
+            metrics_gen: self.panes.cur.metrics_gen,
         }
     }
 
-    fn put_pane(&mut self, p: Pane) {
+    fn put_column(&mut self, p: Column) {
         self.list_out();
-        self.rows = p.rows;
-        self.disp = p.disp;
-        self.summaries = p.summaries;
-        self.list = p.list;
-        self.toggled = p.toggled;
-        self.open_runs = p.open_runs;
-        self.synced_busy = p.synced_busy;
-        self.files_gen = p.files_gen;
-        self.subs_gen = p.subs_gen;
-        self.waiting_on = p.waiting_on;
-        self.rows_session = p.rows_session;
-        self.scroll_carry = p.scroll_carry;
+        self.panes.cur.rows = p.rows;
+        self.panes.cur.disp = p.disp;
+        self.panes.cur.summaries = p.summaries;
+        self.panes.cur.list = p.list;
+        self.panes.cur.toggled = p.toggled;
+        self.panes.cur.open_runs = p.open_runs;
+        self.panes.cur.synced_busy = p.synced_busy;
+        self.panes.cur.files_gen = p.files_gen;
+        self.panes.cur.subs_gen = p.subs_gen;
+        self.panes.cur.waiting_on = p.waiting_on;
+        self.panes.cur.rows_session = p.rows_session;
+        self.panes.cur.scroll_carry = p.scroll_carry;
     }
 
     /// A subagent's block changed shape (a line came, its state changed)
@@ -5543,10 +5366,10 @@ impl AppView {
     /// reads it when drawn.
     fn sync_subagents(&mut self) {
         let subs = self.model.shown_subagents_mut();
-        if subs.shape_generation() == self.subs_gen {
+        if subs.shape_generation() == self.panes.cur.subs_gen {
             return;
         }
-        self.subs_gen = subs.shape_generation();
+        self.panes.cur.subs_gen = subs.shape_generation();
         let changed = subs.take_reshaped().filter(|c| !c.is_empty());
         let items = self.model.shown().items();
         let k = items.iter().position(|i| {
@@ -5565,13 +5388,13 @@ impl AppView {
     /// file tools' counts, and the summaries that sum them, follow it.
     fn sync_counts(&mut self) {
         let ledger = self.model.shown_files();
-        if ledger.generation() == self.files_gen {
+        if ledger.generation() == self.panes.cur.files_gen {
             return;
         }
-        self.files_gen = ledger.generation();
+        self.panes.cur.files_gen = ledger.generation();
         let items = self.model.shown().items();
         let mut changed = false;
-        for (row, item) in self.rows.iter_mut().zip(items) {
+        for (row, item) in self.panes.cur.rows.iter_mut().zip(items) {
             let Some(t) = item.tool.as_ref().filter(|t| files::is_file_tool(&t.name)) else { continue };
             let d = ledger.delta(&t.tool_id);
             if d != row.delta {
@@ -5581,8 +5404,8 @@ impl AppView {
             }
         }
         if changed {
-            self.summaries.clear();
-            self.summaries.update(&self.disp, items, &self.rows);
+            self.panes.cur.summaries.clear();
+            self.panes.cur.summaries.update(&self.panes.cur.disp, items, &self.panes.cur.rows);
         }
     }
 
@@ -5590,13 +5413,13 @@ impl AppView {
     /// row, height or fold of the old one survives.
     pub(crate) fn reset_transcript(&mut self) {
         self.model.transcript = crate::model::transcript();
-        self.rows.clear();
-        self.disp.clear();
-        self.summaries.clear();
-        self.toggled.clear();
-        self.open_runs.clear();
+        self.panes.cur.rows.clear();
+        self.panes.cur.disp.clear();
+        self.panes.cur.summaries.clear();
+        self.panes.cur.toggled.clear();
+        self.panes.cur.open_runs.clear();
         self.list_out();
-        self.list.reset(0);
+        self.panes.cur.list.reset(0);
     }
 
     /// Whether the list lays out from its top row next frame: not following
@@ -5606,11 +5429,16 @@ impl AppView {
     /// each layout (`ListState::is_following_tail` is true between frames),
     /// and the next frame's hold pauses it again.
     fn holds_top(&self) -> bool {
-        !self.list.is_following_tail()
-            || self.fold_slack.get().is_some_and(|s| s.list == self.list_gen && s.gone.is_none() && !s.left && s.fresh.is_none())
-            || self.body_hold.get().is_some()
-            || self.fold_gap.borrow().iter().any(|g| g.hold)
-            || !self.unfold_hold.is_empty()
+        !self.panes.cur.list.is_following_tail()
+            || self
+                .panes
+                .cur
+                .fold_slack
+                .get()
+                .is_some_and(|s| s.list == self.panes.cur.list_gen && s.gone.is_none() && !s.left && s.fresh.is_none())
+            || self.panes.cur.body_hold.get().is_some()
+            || self.panes.cur.fold_gap.borrow().iter().any(|g| g.hold)
+            || !self.panes.cur.unfold_hold.is_empty()
     }
 
     /// Display rows from item `start` (a turn's start) on.
@@ -5622,21 +5450,21 @@ impl AppView {
         let prompts = self.prompt_rows();
         let start = {
             let items = self.model.shown().items();
-            let old = crate::authorize::built(&self.disp);
+            let old = crate::authorize::built(&self.panes.cur.disp);
             let changed = old.iter().filter(|r| !prompts.contains(r)).chain(prompts.iter().filter(|r| !old.contains(r)));
             changed.map(|r| turns::turn_start(items, r.after + 1)).fold(start, usize::min)
         };
         let shown = self.model.shown();
         let items = shown.items();
-        let rows = &self.rows;
+        let rows = &self.panes.cur.rows;
         let day = |i: usize| rows.get(i).and_then(|r| r.time.as_ref()).map(crate::times::Stamp::day);
-        let new = turns::build(items, &day, start, shown.busy(), &self.open_runs, self.model.shown_subagents());
+        let new = turns::build(items, &day, start, shown.busy(), &self.panes.cur.open_runs, self.model.shown_subagents());
         let new = crate::cards::mark_edges(crate::authorize::with_prompts(new, &prompts, start));
-        self.summaries.update(&new, items, &self.rows);
-        let at = self.disp.partition_point(|d| d.item < start);
+        self.panes.cur.summaries.update(&new, items, &self.panes.cur.rows);
+        let at = self.panes.cur.disp.partition_point(|d| d.item < start);
         let mut folded = None;
-        if let Some((range, count)) = turns::diff(&self.disp[at..], &new) {
-            let (old, fresh) = (&self.disp[at + range.start..at + range.end], &new[range.start..range.start + count]);
+        if let Some((range, count)) = turns::diff(&self.panes.cur.disp[at..], &new) {
+            let (old, fresh) = (&self.panes.cur.disp[at + range.start..at + range.end], &new[range.start..range.start + count]);
             // Folded: an open summary closed (a click), or a live turn's
             // rows (no summary yet: its first row has its id) closed under
             // a new one (the turn's end).
@@ -5657,13 +5485,21 @@ impl AppView {
             // what was left of the rows that went, as they close up. A fold
             // places the list itself ([`Self::start_gap`]).
             let spliced = at + range.start..at + range.end;
-            let top = self.list.logical_scroll_top();
+            let top = self.panes.cur.list.logical_scroll_top();
             let row = |d: &Disp| (d.id, std::mem::discriminant(&d.kind));
-            let kept: Option<Vec<_>> = (folded.is_none() && self.holds_top() && spliced.contains(&top.item_ix))
-                .then(|| self.disp.get(top.item_ix..=spliced.end.min(self.disp.len() - 1)).unwrap_or_default().iter().map(row).collect());
-            self.list.splice(spliced.clone(), count);
-            self.disp.splice(spliced, new[range.start..range.start + count].iter().copied());
-            let find = |r: &(u64, std::mem::Discriminant<Kind>)| self.disp.iter().position(|d| row(d) == *r);
+            let kept: Option<Vec<_>> = (folded.is_none() && self.holds_top() && spliced.contains(&top.item_ix)).then(|| {
+                self.panes
+                    .cur
+                    .disp
+                    .get(top.item_ix..=spliced.end.min(self.panes.cur.disp.len() - 1))
+                    .unwrap_or_default()
+                    .iter()
+                    .map(row)
+                    .collect()
+            });
+            self.panes.cur.list.splice(spliced.clone(), count);
+            self.panes.cur.disp.splice(spliced, new[range.start..range.start + count].iter().copied());
+            let find = |r: &(u64, std::mem::Discriminant<Kind>)| self.panes.cur.disp.iter().position(|d| row(d) == *r);
             if let Some(rows) = kept
                 && let Some((was, rest)) = rows.split_first()
             {
@@ -5672,16 +5508,16 @@ impl AppView {
                     None => rest.iter().find_map(find).map(|ix| ListOffset { item_ix: ix, offset_in_item: px(0.) }),
                 };
                 if let Some(to) = to {
-                    self.list.scroll_to(to);
+                    self.panes.cur.list.scroll_to(to);
                 }
             }
         }
         // A full build per sync: bounded, so long sessions stay usable in dev builds.
         debug_assert!(
             items.len() > 2_000
-                || self.disp
+                || self.panes.cur.disp
                     == crate::cards::mark_edges(crate::authorize::with_prompts(
-                        turns::build(items, &day, 0, shown.busy(), &self.open_runs, self.model.shown_subagents()),
+                        turns::build(items, &day, 0, shown.busy(), &self.panes.cur.open_runs, self.model.shown_subagents()),
                         &prompts,
                         0
                     ))
@@ -5703,7 +5539,7 @@ impl AppView {
                 || streaming
                 || (!matches!(status, Some(ToolStatus::Cancelled))
                     && row.preview.as_ref().is_some_and(|p| p.lines.len() <= 24 && !p.lines.is_empty())));
-        self.toggled.chose(item.id).unwrap_or(default ^ self.toggled.contains(&item.id))
+        self.panes.cur.toggled.chose(item.id).unwrap_or(default ^ self.panes.cur.toggled.contains(&item.id))
     }
 
     pub(crate) fn toggle(&mut self, id: u64) {
@@ -5714,34 +5550,34 @@ impl AppView {
                 .iter()
                 .position(|i| i.id == id)
                 .filter(|&ix| items[ix].kind == ItemKind::Tool)
-                .and_then(|ix| self.rows.get(ix).filter(|r| r.id == id).map(|r| !self.is_open(&items[ix], r)))
+                .and_then(|ix| self.panes.cur.rows.get(ix).filter(|r| r.id == id).map(|r| !self.is_open(&items[ix], r)))
         };
         // The clicked row holds (the design gate of #23, S1; T4): the list
         // keeps its top row, so a body opening at the list's end grows
         // down, and one closing there has its room past what is under the
         // view held at the end as it glides ([`AppView::tail_slack`]).
-        if self.fx.fluid() && self.disp.iter().any(|d| d.id == id && d.kind == Kind::Work) {
-            self.scroller.cancel();
-            if self.list.is_following_tail() {
-                let top = self.list.logical_scroll_top();
-                self.list.pause_following_tail();
-                self.list.scroll_to(top);
+        if self.fx.fluid() && self.panes.cur.disp.iter().any(|d| d.id == id && d.kind == Kind::Work) {
+            self.panes.cur.scroller.cancel();
+            if self.panes.cur.list.is_following_tail() {
+                let top = self.panes.cur.list.logical_scroll_top();
+                self.panes.cur.list.pause_following_tail();
+                self.panes.cur.list.scroll_to(top);
             }
-            let max = f32::from(self.list.max_offset_for_scrollbar().y);
-            let at = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
-            self.body_hold.set(Some(BodyHold {
+            let max = f32::from(self.panes.cur.list.max_offset_for_scrollbar().y);
+            let at = -f32::from(self.panes.cur.list.scroll_px_offset_for_scrollbar().y);
+            self.panes.cur.body_hold.set(Some(BodyHold {
                 id,
                 below: (max - at).max(0.),
                 opens: chose != Some(false),
                 frame: self.fx.frame(),
-                list: self.list_gen,
-                vh: f32::from(self.list.viewport_bounds().size.height),
+                list: self.panes.cur.list_gen,
+                vh: f32::from(self.panes.cur.list.viewport_bounds().size.height),
             }));
         }
-        self.toggled.flip(id, chose);
+        self.panes.cur.toggled.flip(id, chose);
         // A call's row, or a slash command's answer (a note).
-        if let Some(ix) = self.disp.iter().position(|d| d.id == id && matches!(d.kind, Kind::Work | Kind::Note | Kind::Event)) {
-            self.list.remeasure_items(ix..ix + 1);
+        if let Some(ix) = self.panes.cur.disp.iter().position(|d| d.id == id && matches!(d.kind, Kind::Work | Kind::Note | Kind::Event)) {
+            self.panes.cur.list.remeasure_items(ix..ix + 1);
         }
     }
 
@@ -5751,20 +5587,20 @@ impl AppView {
         // Events may have landed since the last frame: the rows catch up
         // first, so the rebuild below never runs ahead of them.
         self.sync_list();
-        if !self.open_runs.remove(&id) {
-            self.open_runs.insert(id);
+        if !self.panes.cur.open_runs.remove(&id) {
+            self.panes.cur.open_runs.insert(id);
             // Unfolded mid-fold: its room goes with the fold.
-            self.fold_gap.borrow_mut().retain(|g| !g.is(id));
+            self.panes.cur.fold_gap.borrow_mut().retain(|g| !g.is(id));
         }
         // The clicked header stays put (motion.md §6.1): the list keeps its
         // top row and offset, tail-follow paused (it resumes at the end).
-        self.scroller.cancel();
-        if self.list.is_following_tail() {
-            let top = self.list.logical_scroll_top();
-            self.list.pause_following_tail();
-            self.list.scroll_to(top);
+        self.panes.cur.scroller.cancel();
+        if self.panes.cur.list.is_following_tail() {
+            let top = self.panes.cur.list.logical_scroll_top();
+            self.panes.cur.list.pause_following_tail();
+            self.panes.cur.list.scroll_to(top);
         }
-        let before: HashSet<u64> = self.disp.iter().filter(|d| d.kind == Kind::Work).map(|d| d.id).collect();
+        let before: HashSet<u64> = self.panes.cur.disp.iter().filter(|d| d.kind == Kind::Work).map(|d| d.id).collect();
         let items = self.model.shown().items();
         if let Some(start) = items.iter().position(|i| i.id == id).map(|ix| turns::turn_start(items, ix + 1)) {
             // Folded: its rows' room goes on a spring under the header,
@@ -5775,8 +5611,9 @@ impl AppView {
         // The cascade: the rows the unfold brought draw their bars from the
         // header down; a fold draws the tally's segments.
         let now = self.fx.clock();
-        self.fx.fold.set(Some((id, now)));
-        let fresh: Vec<u64> = self.disp.iter().filter(|d| d.kind == Kind::Work && !before.contains(&d.id)).map(|d| d.id).collect();
+        self.fx.col(self.panes.cur.id).fold().set(Some((id, now)));
+        let fresh: Vec<u64> =
+            self.panes.cur.disp.iter().filter(|d| d.kind == Kind::Work && !before.contains(&d.id)).map(|d| d.id).collect();
         for (k, id) in fresh.iter().enumerate() {
             self.fx.born(*id, now + crate::motion::stagger(k));
         }
@@ -5788,11 +5625,11 @@ impl AppView {
         if self.fx.fluid() {
             // A fold took its rows away: their ids leave the hold with
             // them (Shady #17 L3), not when their reveal would have ended.
-            let shown: HashSet<u64> = self.disp.iter().filter(|d| d.kind == Kind::Work).map(|d| d.id).collect();
-            self.unfold_hold.retain(|id| shown.contains(id));
-            self.unfold_hold.extend(fresh);
+            let shown: HashSet<u64> = self.panes.cur.disp.iter().filter(|d| d.kind == Kind::Work).map(|d| d.id).collect();
+            self.panes.cur.unfold_hold.retain(|id| shown.contains(id));
+            self.panes.cur.unfold_hold.extend(fresh);
         } else {
-            self.unfold_hold.clear();
+            self.panes.cur.unfold_hold.clear();
         }
     }
 
@@ -5801,38 +5638,40 @@ impl AppView {
     /// top row, as one run's fold does; following the tail, it follows on.
     pub(crate) fn fold_all_runs(&mut self, open: bool, cx: &mut Context<Self>) {
         self.sync_list();
-        let runs: Vec<u64> = self.disp.iter().filter(|d| matches!(d.kind, Kind::Summary { .. })).map(|d| d.id).collect();
-        let before = self.open_runs.len();
+        let runs: Vec<u64> = self.panes.cur.disp.iter().filter(|d| matches!(d.kind, Kind::Summary { .. })).map(|d| d.id).collect();
+        let before = self.panes.cur.open_runs.len();
         if open {
-            self.open_runs.extend(runs);
+            self.panes.cur.open_runs.extend(runs);
         } else {
-            self.open_runs.clear();
+            self.panes.cur.open_runs.clear();
         }
-        if self.open_runs.len() == before && (open || before == 0) {
+        if self.panes.cur.open_runs.len() == before && (open || before == 0) {
             return;
         }
-        self.scroller.cancel();
+        self.panes.cur.scroller.cancel();
         // The row at the top before (and how far into it), found again
         // after: itself, or the run's summary that folded it away (at its
         // top). One splice from the first changed row to the last would
         // put the list's top at the first run that changed.
-        let following = self.list.is_following_tail();
-        let top = self.list.logical_scroll_top();
-        let was = self.disp.get(top.item_ix).copied();
-        self.unfold_hold.clear();
+        let following = self.panes.cur.list.is_following_tail();
+        let top = self.panes.cur.list.logical_scroll_top();
+        let was = self.panes.cur.disp.get(top.item_ix).copied();
+        self.panes.cur.unfold_hold.clear();
         self.rebuild_from(0);
         if !following && let Some(was) = was {
             let summary = |d: &Disp| matches!(d.kind, Kind::Summary { .. });
-            let same = self.disp.iter().position(|d| d.id == was.id && summary(d) == summary(&was));
-            let into =
-                || self.disp.iter().position(|d| matches!(d.kind, Kind::Summary { end, .. } if d.item <= was.item && was.item < end));
+            let same = self.panes.cur.disp.iter().position(|d| d.id == was.id && summary(d) == summary(&was));
+            let into = || {
+                self.panes.cur.disp.iter().position(|d| matches!(d.kind, Kind::Summary { end, .. } if d.item <= was.item && was.item < end))
+            };
             let to = match same {
                 Some(ix) => ListOffset { item_ix: ix, offset_in_item: top.offset_in_item },
-                None => {
-                    ListOffset { item_ix: into().unwrap_or(top.item_ix.min(self.disp.len().saturating_sub(1))), offset_in_item: px(0.) }
-                }
+                None => ListOffset {
+                    item_ix: into().unwrap_or(top.item_ix.min(self.panes.cur.disp.len().saturating_sub(1))),
+                    offset_in_item: px(0.),
+                },
             };
-            self.list.scroll_to(to);
+            self.panes.cur.list.scroll_to(to);
         }
         cx.notify();
     }
@@ -5844,9 +5683,9 @@ impl AppView {
         // Rows that have finished leave first: a hold with none left
         // pauses nothing (Shady #16 r4).
         let fx = &self.fx;
-        self.unfold_hold.retain(|&id| fx.revealing(id));
-        if !self.unfold_hold.is_empty() && self.list.is_following_tail() {
-            self.list.pause_following_tail();
+        self.panes.cur.unfold_hold.retain(|&id| fx.revealing(id));
+        if !self.panes.cur.unfold_hold.is_empty() && self.panes.cur.list.is_following_tail() {
+            self.panes.cur.list.pause_following_tail();
         }
     }
 
@@ -5985,10 +5824,17 @@ impl AppView {
     /// A text field has the keyboard (the composer, find, a name, a colour,
     /// a secret, Settings' fields): keys are its text, not the app's.
     fn typing(&self, window: &Window, cx: &App) -> bool {
-        self.composer.read(cx).focus_handle(cx).is_focused(window)
-            || [&self.find_input, &self.name_input, &self.hex_input, &self.secret_input, &self.settings_find, &self.settings_input]
-                .iter()
-                .any(|i| i.read(cx).focus_handle(cx).is_focused(window))
+        self.panes.cur.composer.read(cx).focus_handle(cx).is_focused(window)
+            || [
+                &self.find_input,
+                &self.name_input,
+                &self.hex_input,
+                &self.panes.cur.secret_input,
+                &self.settings_find,
+                &self.settings_input,
+            ]
+            .iter()
+            .any(|i| i.read(cx).focus_handle(cx).is_focused(window))
     }
 
     /// The favourite key: the session tab on screen. Not while typing (a
@@ -6151,15 +5997,15 @@ impl AppView {
 
     /// HALT is armed for what is on screen now.
     fn halt_here(&self) -> bool {
-        self.halt_where.as_ref().map(|(t, s, w)| (*t, s.as_deref(), *w)) == Some(self.halt_place())
+        self.panes.cur.halt_where.as_ref().map(|(t, s, w)| (*t, s.as_deref(), *w)) == Some(self.halt_place())
     }
 
     /// The arm ends: another tab, session or view is on screen (a second
     /// Esc there never halts the turn the first was for), or it was used.
     pub(crate) fn disarm_halt(&mut self) {
-        self.halt_armed = None;
-        self.halt_tick = None;
-        self.halt_where = None;
+        self.panes.cur.halt_armed = None;
+        self.panes.cur.halt_tick = None;
+        self.panes.cur.halt_where = None;
     }
 
     /// HALT: the session's turn stops (the app's one abort).
@@ -6187,20 +6033,20 @@ impl AppView {
             self.disarm_halt();
             return false;
         }
-        if self.halt_armed.is_some_and(|at| now.saturating_duration_since(at) < ARM) && self.halt_here() {
+        if self.panes.cur.halt_armed.is_some_and(|at| now.saturating_duration_since(at) < ARM) && self.halt_here() {
             self.halt();
         } else {
-            self.halt_armed = Some(now);
-            self.halt_where = Some({
+            self.panes.cur.halt_armed = Some(now);
+            self.panes.cur.halt_where = Some({
                 let (t, s, w) = self.halt_place();
                 (t, s.map(str::to_string), w)
             });
-            self.halt_tick = Some(cx.spawn(async move |this, cx| {
+            self.panes.cur.halt_tick = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(ARM).await;
                 let _ = this.update(cx, |v, cx| {
-                    v.halt_tick = None;
-                    v.halt_where = None;
-                    if v.halt_armed.take().is_some() {
+                    v.panes.cur.halt_tick = None;
+                    v.panes.cur.halt_where = None;
+                    if v.panes.cur.halt_armed.take().is_some() {
                         cx.notify();
                     }
                 });
@@ -6244,7 +6090,7 @@ impl AppView {
     /// row: the error shortened, REPLACE.
     fn render_naming(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
         let pending = self.model.named.rename.is_some();
-        let form = self.layout.form();
+        let form = self.panes.cur.layout.form();
         let cramped = form == crate::fit::Form::Cramped;
         let offer = self.replace_offer().map(|r| format!("Replace '{}' with '{}'?", r.current, r.asked));
         let replace = || {
@@ -6305,7 +6151,7 @@ impl AppView {
                 );
             }
         }
-        div().bg(p.canvas).border_b_1().border_color(p.hair).child(column(self.layout, row))
+        div().bg(p.canvas).border_b_1().border_color(p.hair).child(column(self.panes.cur.layout, row))
     }
 
     /// The notice line under the card: the last error and, cramped, the
@@ -6313,7 +6159,7 @@ impl AppView {
     /// one line, the rest in its tooltip ([`crate::fit::Extras`] counts it
     /// so).
     fn render_notice(&self, p: &Palette, m: &Metrics) -> Option<impl IntoElement> {
-        let lay = self.layout;
+        let lay = self.panes.cur.layout;
         let note = self.composer_note().filter(|_| lay.form() == crate::fit::Form::Cramped);
         let (text, color): (SharedString, Hsla) = match (self.model.last_error.clone(), note) {
             (Some(e), Some(n)) => (format!("{e} · {n}").into(), p.err),
@@ -6322,7 +6168,7 @@ impl AppView {
             (None, None) => return None,
         };
         let line = mono(text.clone(), m.meta, color).pt(px(crate::fit::NOTICE_TOP)).line_height(px(crate::fit::notice_line(m)));
-        let line = if self.current_card().is_some() || self.card_exit.is_some() {
+        let line = if self.current_card().is_some() || self.panes.cur.card_exit.is_some() {
             line.id("notice")
                 .min_w_0()
                 .overflow_hidden()
@@ -6348,8 +6194,8 @@ impl AppView {
     /// How much the dock has still to grow on its spring: the list's view
     /// ends this much higher once it lands (a reveal aims there).
     pub(crate) fn dock_growth(&self) -> f32 {
-        let natural = self.dock_h.get();
-        match self.fx.spring_at(DOCK_H) {
+        let natural = self.panes.cur.dock_h.get();
+        match self.fx.spring_at(self.panes.cur.id.salt(DOCK_H)) {
             Some(shown) if natural.is_finite() => (natural - shown).max(0.),
             _ => 0.,
         }
@@ -6367,18 +6213,19 @@ impl AppView {
         // spawned) grows from it, never in one frame (S4), whatever came
         // before (a launch, a switch, a resize draw a dock at its height).
         if parts.is_empty() {
-            self.dock_h.set(0.);
+            self.panes.cur.dock_h.set(0.);
         }
-        let natural = self.dock_h.get();
-        let shown = (full && natural.is_finite()).then(|| self.fx.spring(DOCK_H, None, natural, crate::motion::SHEET_RESPONSE).0);
+        let natural = self.panes.cur.dock_h.get();
+        let shown = (full && natural.is_finite())
+            .then(|| self.fx.spring(self.panes.cur.id.salt(DOCK_H), None, natural, crate::motion::SHEET_RESPONSE).0);
         if parts.is_empty() && shown.is_none_or(|h| h < 0.5) {
             return None;
         }
-        let content = measured(v_flex().w_full().debug_selector(|| "dock".into()).children(parts), &self.dock_h, full);
+        let content = measured(v_flex().w_full().debug_selector(|| "dock".into()).children(parts), &self.panes.cur.dock_h, full);
         Some(match shown {
             Some(h) => {
                 // The stub's row starts `STUB_GAP` under the content's top.
-                let lay = self.layout;
+                let lay = self.panes.cur.layout;
                 let edge = stub.filter(|_| natural - h > crate::fit::STUB_GAP && h >= 1.).map(|c| {
                     div()
                         .debug_selector(|| "dock-edge".into())
@@ -6397,7 +6244,7 @@ impl AppView {
     }
 
     fn render_composer(&self, p: &Palette, m: &Metrics, to_card: bool, window: &Window, cx: &Context<Self>) -> impl IntoElement {
-        let lay = self.layout;
+        let lay = self.panes.cur.layout;
         let dims = crate::fit::Composer::of(m, lay.form());
         let busy = self.model.transcript.busy();
         // Over a worker's view the composer steers it, or takes nothing
@@ -6519,14 +6366,14 @@ impl AppView {
                 })
             })
             .on_click(cx.listener(|this, _, window, cx| {
-                let text = this.composer.read(cx).value().trim().to_string();
+                let text = this.panes.cur.composer.read(cx).value().trim().to_string();
                 if !text.is_empty() && this.submit(text) {
-                    this.composer.update(cx, |s, cx| s.set_value("", window, cx));
+                    this.panes.cur.composer.update(cx, |s, cx| s.set_value("", window, cx));
                 }
                 cx.notify();
             }));
         let halt_el = halt.then(|| {
-            let armed = self.halt_armed.is_some();
+            let armed = self.panes.cur.halt_armed.is_some();
             let tip = if worker.is_some() { "Halt the session's turn" } else { "Halt this turn (Esc, Esc)" };
             display(label::HALT, m.label, if armed { p.err } else { p.dim_u })
                 .id("halt")
@@ -6590,7 +6437,7 @@ impl AppView {
         });
         let mut glyph_el = || foot_glyph.take();
         let lit = crate::motion::mix(p.you, p.ink, 0.35);
-        let out = fx.flash(fx.sent.get().map(|(at, _)| at));
+        let out = fx.flash(fx.col(self.panes.cur.id).sent().get().map(|(at, _)| at));
         let (bar_flash, segment) = match crate::motion::Level::current(cx) {
             crate::motion::Level::Full => (out, fx.draw(handoff_in, Duration::ZERO, crate::motion::SIG)),
             _ => (out.max(fx.flash(handoff_in)), 1.),
@@ -6619,7 +6466,7 @@ impl AppView {
         // field's text by its own `input_px` whatever its appearance, so the
         // field reaches that far past the composer's padding on each side.
         let field = div().mx(px(-kit_input_px())).child(
-            Textarea::new(&self.composer)
+            Textarea::new(&self.panes.cur.composer)
                 .appearance(false)
                 .disabled(!drives)
                 .text_px(m.body)
@@ -6629,9 +6476,10 @@ impl AppView {
         // A line more or less: its box springs there on `flick`, growing
         // upward (the caret's line stays put; fluid.md §3.8).
         let full = self.fx.level() == crate::motion::Level::Full;
-        let natural = self.composer_h.get();
-        let field = measured(field, &self.composer_h, full);
-        let field = match (full && natural.is_finite()).then(|| self.fx.spring(COMPOSER_H, None, natural, crate::motion::FLICK_RESPONSE).0)
+        let natural = self.panes.cur.composer_h.get();
+        let field = measured(field, &self.panes.cur.composer_h, full);
+        let field = match (full && natural.is_finite())
+            .then(|| self.fx.spring(self.panes.cur.id.salt(COMPOSER_H), None, natural, crate::motion::FLICK_RESPONSE).0)
         {
             Some(h) => sprung(field, h, "composer-box", None),
             None => field.into_any_element(),
@@ -6649,9 +6497,9 @@ impl AppView {
             let short = primary == label::STEER_WORKER && room - rest(main, primary_w) < 120.;
             let send = if short {
                 fbtn("send", label::STEER, can_send, Fill::Btn, p, m).on_click(cx.listener(|this, _, window, cx| {
-                    let text = this.composer.read(cx).value().trim().to_string();
+                    let text = this.panes.cur.composer.read(cx).value().trim().to_string();
                     if !text.is_empty() && this.submit(text) {
-                        this.composer.update(cx, |s, cx| s.set_value("", window, cx));
+                        this.panes.cur.composer.update(cx, |s, cx| s.set_value("", window, cx));
                     }
                     cx.notify();
                 }))
@@ -6755,7 +6603,7 @@ impl AppView {
                 .border_1()
                 .border_color(p.edge)
                 .child({
-                    let at = self.composer_top.clone();
+                    let at = self.panes.cur.composer_top.clone();
                     canvas(move |b, _, _| at.set(f32::from(b.origin.y)), |_, _, _, _| {}).absolute().inset_0()
                 })
                 // The user's bar over the left border.
@@ -6979,14 +6827,14 @@ impl Render for AppView {
         // Another session, or a worker's view in or out: its dock and draft
         // are drawn at their heights (a switch replays nothing).
         let scope = self.motion_session() ^ self.motion_column().rotate_left(17);
-        if std::mem::replace(&mut self.dock_scope, scope) != scope {
-            self.dock_h.set(f32::NAN);
-            self.composer_h.set(f32::NAN);
+        if std::mem::replace(&mut self.panes.cur.dock_scope, scope) != scope {
+            self.panes.cur.dock_h.set(f32::NAN);
+            self.panes.cur.composer_h.set(f32::NAN);
         }
         // A worker tab opened by the pointer: the tracer from it (§6.2),
         // from the source chip's bar (its left edge, at its centre) when the
         // click, or the menu picked from, was on a chip.
-        if let Some(tab) = self.tracer_open.take()
+        if let Some(tab) = self.panes.cur.tracer_open.take()
             && self.fx.level() == crate::motion::Level::Full
             && !window.last_input_was_keyboard()
         {
@@ -6996,7 +6844,7 @@ impl Render for AppView {
                 _ => mouse,
             };
             let chip = self.chip_bounds.borrow().iter().find(|(_, b)| b.contains(&src)).map(|(_, b)| point(b.left(), b.center().y));
-            self.tracer = Some(crate::motion::Tracer { tab, from: chip.unwrap_or(mouse), at: self.fx.now(), to: None });
+            self.panes.cur.tracer = Some(crate::motion::Tracer { tab, from: chip.unwrap_or(mouse), at: self.fx.now(), to: None });
         }
         self.chip_bounds.borrow_mut().clear();
         if self.menu.is_none()
@@ -7007,7 +6855,7 @@ impl Render for AppView {
         {
             window.focus(&h, cx);
         }
-        if self.halt_armed.is_some() && !self.halt_here() {
+        if self.panes.cur.halt_armed.is_some() && !self.halt_here() {
             self.disarm_halt();
         }
         self.sync_composer(window, cx);
@@ -7021,21 +6869,21 @@ impl Render for AppView {
         self.sync_card(window, cx);
         self.sync_list();
         self.read_card_on_screen();
-        if self.stub_away.is_some() && (self.card_on_screen() || self.stub_away != self.model.card_key()) {
-            self.stub_away = None;
+        if self.panes.cur.stub_away.is_some() && (self.card_on_screen() || self.panes.cur.stub_away != self.model.card_key()) {
+            self.panes.cur.stub_away = None;
         }
-        self.card_keys.set(self.card_keys_live(window, cx));
+        self.panes.cur.card_keys.set(self.card_keys_live(window, cx));
         // Ctrl+J from a worker's view: the card once its row is built (that
         // card only: another, or none, drops it).
-        if self.jump_card.is_some() && self.jump_card != self.model.card_key() {
-            self.jump_card = None;
+        if self.panes.cur.jump_card.is_some() && self.panes.cur.jump_card != self.model.card_key() {
+            self.panes.cur.jump_card = None;
         }
-        if self.jump_card.is_some_and(|k| self.current_card().is_some_and(|c| c.key == k))
+        if self.panes.cur.jump_card.is_some_and(|k| self.current_card().is_some_and(|c| c.key == k))
             && self.model.watch.focus().is_none()
             && self.model.tabs.view().is_none()
             && self.card_ix().is_some()
         {
-            self.jump_card = None;
+            self.panes.cur.jump_card = None;
             self.reveal_card(window, cx);
         }
         // Seen every frame while attached, shown or not: a card that comes
@@ -7044,7 +6892,7 @@ impl Render for AppView {
         // scope, [`AppView::motion_session`]). Keyed by the prompt's id, not
         // the attach: the same prompt is the same card.
         let prompt_key = self.model.transcript.pending_prompts().first().map_or(0, |pr| pr.id ^ (1 << 63));
-        self.card_at = self
+        self.panes.cur.card_at = self
             .model
             .active
             .as_ref()
@@ -7059,7 +6907,7 @@ impl Render for AppView {
         self.rail_motion();
         self.overlay_exits();
         if let Some(b) = self.bench.as_mut() {
-            b.on_render(&self.list, window);
+            b.on_render(&self.panes.cur.list, window);
         }
         // Settings hidden: what it showed is forgotten, so a value changed
         // meanwhile (Ctrl+=, the top bar's THEME) is history when it opens
@@ -7131,7 +6979,7 @@ impl Render for AppView {
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
         self.fx.set_ink(p.ink);
-        self.body_line = m.body_line;
+        self.panes.cur.body_line = m.body_line;
         self.scroll_frame(list_pad_b(&m));
         self.column_layer();
         // Settings or Usage came on screen (or one closed): after this
@@ -7174,15 +7022,15 @@ impl Render for AppView {
         // L5: the card's read gate and AUTHORIZE are drawn from the last
         // frame's bounds: after a resize, one more frame draws them from
         // this one's.
-        if height != self.height && self.card.is_some() {
+        if height != self.height && self.panes.cur.card.is_some() {
             window.request_animation_frame();
         }
         // A window resize is the window manager's (fluid.md §3.8, `follow`):
         // the dock and the draft take the heights it gives them at once, as
         // after a switch.
         if (width, height) != (self.width, self.height) {
-            self.dock_h.set(f32::NAN);
-            self.composer_h.set(f32::NAN);
+            self.panes.cur.dock_h.set(f32::NAN);
+            self.panes.cur.composer_h.set(f32::NAN);
         }
         self.width = width;
         self.height = height;
@@ -7204,14 +7052,14 @@ impl Render for AppView {
         // would forget its heights as at a fractional width.
         let s = window.scale_factor();
         let dp = |v: f32| (v * s).round();
-        let pane_of = |less: &[f32]| ((dp(self.width) - less.iter().map(|&v| dp(v)).sum::<f32>()) / s).max(0.);
-        let pane = pane_of(&[crate::chrome::MARK, rail_w, right_w]);
-        let pane_to = pane_of(&[crate::chrome::MARK, rail.width(), right.width()]);
+        let column_of = |less: &[f32]| ((dp(self.width) - less.iter().map(|&v| dp(v)).sum::<f32>()) / s).max(0.);
+        let pane = column_of(&[crate::chrome::MARK, rail_w, right_w]);
+        let pane_to = column_of(&[crate::chrome::MARK, rail.width(), right.width()]);
         self.panel_fx.freeze = self.panel_fx.moving().then(|| self.panel_fx.freeze.unwrap_or(pane).min(pane).min(pane_to));
         let wrap = self.panel_fx.freeze.unwrap_or(pane);
         // A view is not a session: no right panel (it describes one); the
         // pane takes its width. The session's column keeps its layout.
-        let view_pane = pane_of(&[crate::chrome::MARK, rail_w]);
+        let view_pane = column_of(&[crate::chrome::MARK, rail_w]);
         // Its height under the full top bar, whatever bar is drawn.
         if self.top_words.is_none() {
             let words = crate::chrome::top_words(window);
@@ -7237,16 +7085,16 @@ impl Render for AppView {
         // The form from what decides it (not the stub or the tray).
         let ex = crate::fit::Extras { stub: false, tray: 0, ..self.extras() };
         let lay = Layout::of_in(pane, wrap, self.height - crate::chrome::TOP, &m, ex);
-        if (lay.hang, lay.tight) != (self.layout.hang, self.layout.tight) {
-            self.list.remeasure();
-            self.metrics_gen += 1;
+        if (lay.hang, lay.tight) != (self.panes.cur.layout.hang, self.panes.cur.layout.tight) {
+            self.panes.cur.list.remeasure();
+            self.panes.cur.metrics_gen += 1;
         }
         // A new column re-wraps the rows: this frame's scrollbar would read
         // the rows not yet measured at their estimates (it is held as it
         // was, `Bar::still`). One more frame draws it from their heights,
         // at every level (a fold at Off draws one frame, and its bar would
         // keep the estimate until the next change).
-        let rewrap = lay.column != self.layout.column;
+        let rewrap = lay.column != self.panes.cur.layout.column;
         if rewrap {
             window.request_animation_frame();
         }
@@ -7257,12 +7105,12 @@ impl Render for AppView {
         // as each layout had it: it can open or close in the frame its room
         // flips the form. Under Settings or Usage too: the session's list
         // is back where it was when its tab is.
-        if lay.form() != self.layout.form() {
-            let shift = above_list(lay, ex.naming) - above_list(self.layout, self.layout_naming);
-            self.keep_rows(shift, (lay.form() as u8) > (self.layout.form() as u8));
+        if lay.form() != self.panes.cur.layout.form() {
+            let shift = above_list(lay, ex.naming) - above_list(self.panes.cur.layout, self.panes.cur.layout_naming);
+            self.keep_rows(shift, (lay.form() as u8) > (self.panes.cur.layout.form() as u8));
         }
-        self.layout = lay;
-        self.layout_naming = ex.naming;
+        self.panes.cur.layout = lay;
+        self.panes.cur.layout_naming = ex.naming;
         // The tray takes what is left over the card's least well and a
         // one-line composer; the composer grows only into room the card's
         // smallest form and the tray leave.
@@ -7291,9 +7139,9 @@ impl Render for AppView {
         }
         let ex = crate::fit::Extras { tray: self.tray_rows as u8, ..ex };
         let rows = crate::fit::composer_rows(&m, lay.form(), self.height, card_shown, ex);
-        if rows != self.composer_rows {
-            self.composer_rows = rows;
-            self.composer.update(cx, |s, cx| s.set_auto_grow(1, rows, cx));
+        if rows != self.panes.cur.composer_rows {
+            self.panes.cur.composer_rows = rows;
+            self.panes.cur.composer.update(cx, |s, cx| s.set_auto_grow(1, rows, cx));
         }
         let tabs = self.render_tabs(if view.is_some() { view_pane } else { pane }, &p, cx);
         self.schedule_tabs_save(cx);
@@ -7302,10 +7150,10 @@ impl Render for AppView {
         // or Usage, nothing. Whether its list is scrolled back (its oldest
         // rows stay while they may be read).
         if self.model.watch.focus().is_some() {
-            self.model.watch.scrolled_back = !self.list.is_following_tail();
+            self.model.watch.scrolled_back = !self.panes.cur.list.is_following_tail();
         }
         self.arm_watch_poll(cx);
-        if self.attach_wait.is_some() && self.attach_due.is_none() {
+        if self.panes.cur.attach_wait.is_some() && self.panes.cur.attach_due.is_none() {
             self.arm_attach(cx);
         }
         let (pad_l, pad_r) = lay.padding();
@@ -7318,16 +7166,17 @@ impl Render for AppView {
         let gaps = self.fold_gap_now();
         let slack = self.tail_slack();
         let geo = crate::cards::Geo::of(&m);
-        self.metrics_last.set(Some(m));
+        self.panes.cur.metrics_last.set(Some(m));
         let list = list(
-            self.list.clone(),
+            self.panes.cur.list.clone(),
             cx.processor(move |this, ix, _window, cx| {
                 let row = this.render_disp(ix, cx);
                 let mut el = this.arrive(ix, row);
                 // A folding run's room, under its summary (N1): its card goes
                 // on, its bottom edge riding up over the rows it had.
-                if let Some((g, h)) =
-                    gaps.iter().find(|g| this.disp.get(ix).is_some_and(|d| d.id == g.0.id && matches!(d.kind, Kind::Summary { .. })))
+                if let Some((g, h)) = gaps
+                    .iter()
+                    .find(|g| this.panes.cur.disp.get(ix).is_some_and(|d| d.id == g.0.id && matches!(d.kind, Kind::Summary { .. })))
                 {
                     let rows = this.fold_rows(&g.rows, cx);
                     let inner = div().w_full().h(px(*h)).overflow_hidden().child(v_flex().w_full().mt(px(g.inner)).children(rows));
@@ -7337,7 +7186,7 @@ impl Render for AppView {
                     el = div().w_full().child(el).child(room).into_any_element();
                 }
                 // The room an answered card gave up, under the last row.
-                match Some(slack).filter(|s| *s > 0. && ix + 1 == this.disp.len()) {
+                match Some(slack).filter(|s| *s > 0. && ix + 1 == this.panes.cur.disp.len()) {
                     // Whole pixels: the slack is a row's height too.
                     Some(s) => {
                         div().w_full().child(el).child(div().h(px(s.round())).debug_selector(|| "fold-slack".into())).into_any_element()
@@ -7351,15 +7200,15 @@ impl Render for AppView {
         .pr(px(pad_r))
         .pt(px(pad_t))
         .pb(px(pad_b));
-        self.texts.borrow_mut().frame(lay.column, &m);
+        self.panes.cur.texts.borrow_mut().frame(lay.column, &m);
         self.hint_rows(&m);
         self.hold_unfold();
         // After the list's layout: rows it has no height for get their hint
         // in the next frame's [`AppView::hint_rows`], so one is drawn (once:
         // hinted, every row has a height). Else, a load's last frame left the
         // thumb its unhinted length until something else drew.
-        let hint_frame = self.list.is_scrolled_to_end().is_none().then(|| {
-            let (l, n) = (self.list.clone(), self.disp.len());
+        let hint_frame = self.panes.cur.list.is_scrolled_to_end().is_none().then(|| {
+            let (l, n) = (self.panes.cur.list.clone(), self.panes.cur.disp.len());
             canvas(
                 move |_, window, _| {
                     if wants_hint(&l, n) {
@@ -7376,7 +7225,7 @@ impl Render for AppView {
         // height. They come back at their own, measured again next frame
         // (Shady M1): the scrollbar, the end and a wheel to it stay true.
         let unpainted = self.fx.fluid().then(|| {
-            let (l, fx) = (self.list.clone(), self.fx.clone());
+            let (l, fx) = (self.panes.cur.list.clone(), self.fx.clone());
             canvas(
                 move |_, window, _| {
                     let rows = fx.unpainted();
@@ -7394,13 +7243,13 @@ impl Render for AppView {
         });
         // Over the list's right padding, after its layout (and the hold-back's).
         let layer = self.layer_now();
-        let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.scroller.clone(), self.fx.clone()));
+        let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.panes.cur.scroller.clone(), self.fx.clone()));
         // Held while an edge is dragged and as it springs to a detent after,
         // and in the frame a new column re-wraps the rows (on their
         // estimates): the next frame draws it from their heights (the
         // gate's S3 and S6, and the landing's frame).
         self.springback &= self.panel_fx.moving();
-        let transcript_bar = crate::scrollbar::rows_gliding(&self.list, pad_t + pad_b, &self.bars.transcript, glide)
+        let transcript_bar = crate::scrollbar::rows_gliding(&self.panes.cur.list, pad_t + pad_b, &self.bars.transcript, glide)
             .always()
             .still(self.drag.is_some() || self.springback || rewrap);
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
@@ -7412,12 +7261,12 @@ impl Render for AppView {
         // ([`held_back`]).
         // After the list's layout: an answered card's room that landed this
         // frame begins its hold ([`land_card_room`]).
-        let landing = self.fold_slack.get().is_some_and(|s| s.fresh.is_some()).then(|| {
-            let (l, slack) = (self.list.clone(), self.fold_slack.clone());
+        let landing = self.panes.cur.fold_slack.get().is_some_and(|s| s.fresh.is_some()).then(|| {
+            let (l, slack) = (self.panes.cur.list.clone(), self.panes.cur.fold_slack.clone());
             canvas(move |_, _, _| land_card_room(&l, &slack), |_, _, _, _| {}).absolute().size_0()
         });
-        let hold_back = self.hold_back.get().then(|| {
-            let (held, hold, texts) = (self.list.clone(), self.hold_back.clone(), self.texts.clone());
+        let hold_back = self.panes.cur.hold_back.get().then(|| {
+            let (held, hold, texts) = (self.panes.cur.list.clone(), self.panes.cur.hold_back.clone(), self.panes.cur.texts.clone());
             canvas(
                 move |_, window, _| {
                     if held_back(&hold, texts.borrow().pending(), held.is_following_tail()) {
@@ -7444,9 +7293,9 @@ impl Render for AppView {
         let notice = session.then(|| self.render_notice(&p, &m).map(IntoElement::into_any_element)).flatten();
         let tray = session.then(|| self.render_tray(&p, &m, cx).map(IntoElement::into_any_element)).flatten();
         let dock = session.then(|| self.dock([stub, notice, tray].into_iter().flatten().collect(), lead)).flatten();
-        let over = dock.is_some().then(|| self.over_composer.clone());
+        let over = dock.is_some().then(|| self.panes.cur.over_composer.clone());
         if over.is_none() {
-            self.over_composer.set(f32::INFINITY);
+            self.panes.cur.over_composer.set(f32::INFINITY);
         }
         let main = if let Some(v) = shown_view {
             v_flex().flex_1().h_full().min_w_0().bg(p.canvas).child(tabs).child(div().flex_1().min_h_0().child(v))
@@ -7472,7 +7321,7 @@ impl Render for AppView {
                             cx.processor(|this, b: Bounds<Pixels>, _, cx| this.sticky_label(b, cx)),
                         ))
                         .children(crate::motion::probe(&self.fx, "sticky"))
-                        .child(crate::scroll::owner(self.scroller.clone(), self.fx.clone()))
+                        .child(crate::scroll::owner(self.panes.cur.scroller.clone(), self.fx.clone()))
                         .children(unpainted)
                         .children(hint_frame)
                         .children(landing)
@@ -7489,12 +7338,12 @@ impl Render for AppView {
                 .child(self.render_composer(
                     &p,
                     &m,
-                    self.card_up() && self.composer.read(cx).focus_handle(cx).is_focused(window),
+                    self.card_up() && self.panes.cur.composer.read(cx).focus_handle(cx).is_focused(window),
                     window,
                     cx,
                 ))
         };
-        let card_tab = self.card_keys.get() == Some(false) && self.allow_all_offered();
+        let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
         h_flex()
             .id("root")
             .track_focus(&self.focus)
@@ -7517,14 +7366,14 @@ impl Render for AppView {
             // listener) ends an IME composition: whether there was one is
             // read here first, for HALT's Esc below.
             .capture_action(cx.listener(|this, _: &gpui_kit::base::input::Escape, window, cx| {
-                this.esc_composing = this.composer.read(cx).focus_handle(cx).is_focused(window)
-                    && this.composer.update(cx, |s, cx| gpui_kit::EntityInputHandler::marked_text_range(s, window, cx)).is_some();
+                this.panes.cur.esc_composing = this.panes.cur.composer.read(cx).focus_handle(cx).is_focused(window)
+                    && this.panes.cur.composer.update(cx, |s, cx| gpui_kit::EntityInputHandler::marked_text_range(s, window, cx)).is_some();
             }))
             // Esc closes the picker, wherever the focus is; in find it clears
             // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
-                this.chord_press = this.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
+                this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
                 // Ctrl+J: to the card, wherever the focus is (polish.md §2.6).
                 let m = &ev.keystroke.modifiers;
                 if ev.keystroke.key == "j"
@@ -7543,7 +7392,10 @@ impl Render for AppView {
                 // go nowhere (a held Enter on Steer… would send the draft).
                 // A focused input's Enter binding has run already: its
                 // `PressEnter` checks the flag ([`AppView::enter_is_the_picks`]).
-                if std::mem::take(&mut this.menu_picked) && matches!(ev.keystroke.key.as_str(), "enter" | "space") && !this.chord_press {
+                if std::mem::take(&mut this.menu_picked)
+                    && matches!(ev.keystroke.key.as_str(), "enter" | "space")
+                    && !this.panes.cur.chord_press
+                {
                     this.menu_picked = true;
                     cx.stop_propagation();
                     return;
@@ -7561,15 +7413,15 @@ impl Render for AppView {
                     return this.once_key(k, ev.is_held, cx);
                 }
                 // A worker's context menu takes the keys while it is open.
-                if this.menu.is_some() && this.menu_keydown(&ev.keystroke, this.chord_press, window, cx) {
+                if this.menu.is_some() && this.menu_keydown(&ev.keystroke, this.panes.cur.chord_press, window, cx) {
                     cx.stop_propagation();
                     return;
                 }
-                if this.smenu.is_some() && this.session_menu_keydown(&ev.keystroke, this.chord_press, window, cx) {
+                if this.smenu.is_some() && this.session_menu_keydown(&ev.keystroke, this.panes.cur.chord_press, window, cx) {
                     cx.stop_propagation();
                     return;
                 }
-                if this.wmenu.is_some() && this.workers_menu_keydown(&ev.keystroke, this.chord_press, window, cx) {
+                if this.wmenu.is_some() && this.workers_menu_keydown(&ev.keystroke, this.panes.cur.chord_press, window, cx) {
                     cx.stop_propagation();
                     return;
                 }
@@ -7579,7 +7431,7 @@ impl Render for AppView {
                 if crate::wtabs::is_menu_key(&ev.keystroke)
                     && this.model.tabs.view().is_none()
                     && !this.picker_open
-                    && (this.focus.is_focused(window) || this.composer.read(cx).focus_handle(cx).is_focused(window))
+                    && (this.focus.is_focused(window) || this.panes.cur.composer.read(cx).focus_handle(cx).is_focused(window))
                 {
                     cx.stop_propagation();
                     this.menu_key(window, cx);
@@ -7612,8 +7464,8 @@ impl Render for AppView {
                 {
                     // A worker's view: back to the session (a held Esc once).
                     cx.stop_propagation();
-                    log::debug!(target: "synaps_desktop::watch", "esc (new press: {})", this.chord_press);
-                    if this.chord_press {
+                    log::debug!(target: "synaps_desktop::watch", "esc (new press: {})", this.panes.cur.chord_press);
+                    if this.panes.cur.chord_press {
                         this.leave_worker(true, cx);
                     }
                 } else if ev.keystroke.key == "escape" && this.card_up() {
@@ -7623,7 +7475,7 @@ impl Render for AppView {
                         if this.card_key_armed(cx) {
                             this.card_escape(window, cx);
                         }
-                    } else if this.composer.read(cx).focus_handle(cx).is_focused(window) {
+                    } else if this.panes.cur.composer.read(cx).focus_handle(cx).is_focused(window) {
                         // Out of the composer: the card's keys act, after
                         // their wait (a second Esc right after is not a DENY).
                         cx.stop_propagation();
@@ -7632,17 +7484,17 @@ impl Render for AppView {
                         cx.notify();
                     }
                 } else if ev.keystroke.key == "escape"
-                    && this.chord_press
+                    && this.panes.cur.chord_press
                     && !{
                         let m = &ev.keystroke.modifiers;
                         m.control || m.alt || m.shift || m.platform
                     }
                     && this.model.watch.focus().is_none()
                     && this.model.tabs.view().is_none()
-                    && this.composer.read(cx).focus_handle(cx).is_focused(window)
+                    && this.panes.cur.composer.read(cx).focus_handle(cx).is_focused(window)
                     // An IME composition's Esc is the IME's (seen before
                     // the kit's `Escape` ended it).
-                    && !std::mem::take(&mut this.esc_composing)
+                    && !std::mem::take(&mut this.panes.cur.esc_composing)
                     && this.halt_escape(Instant::now(), cx)
                 {
                     // Esc, Esc in the composer (no card up, the session's
@@ -7660,7 +7512,7 @@ impl Render for AppView {
                 let bare = !(m.control || m.alt || m.shift || m.platform || m.function);
                 if ev.keystroke.key == "space"
                     && bare
-                    && this.allow_all_focus.is_focused(window)
+                    && this.panes.cur.allow_all_focus.is_focused(window)
                     && this.card_keys_live(window, cx) == Some(false)
                 {
                     // Space toggles Allow all only with its box focused: a new
@@ -7722,7 +7574,7 @@ impl Render for AppView {
             .map(|d| tab_actions(d, cx))
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
                 let k = &ev.keystroke.key;
-                this.chord.up(k, Instant::now());
+                this.panes.cur.chord.up(k, Instant::now());
                 if k.eq_ignore_ascii_case("b") {
                     this.fold_keys.release(Instant::now());
                 } else if k.eq_ignore_ascii_case("t") || k.eq_ignore_ascii_case("w") {
@@ -7771,7 +7623,7 @@ impl Render for AppView {
                 crate::chrome::MARK + rail_w,
                 if view.is_some() { view_pane } else { pane },
                 // Over a view there is no composer: the window's end.
-                if view.is_some() { self.height } else { self.composer_top.get().min(self.over_composer.get()) },
+                if view.is_some() { self.height } else { self.panes.cur.composer_top.get().min(self.panes.cur.over_composer.get()) },
                 &p,
                 cx,
             ))

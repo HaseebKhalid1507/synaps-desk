@@ -1323,8 +1323,8 @@ impl AppView {
     /// the height it holds while the view's parse is pending (0 once landed).
     fn markdown(&self, ix: usize, id: u64, text: &SharedString, m: &Metrics, cx: &mut Context<Self>) -> (TextView, Pixels) {
         let now = Instant::now();
-        let keep = self.texts.borrow_mut().take(id, text);
-        let kept = self.texts.borrow().view(id).map(|(v, _)| v.clone());
+        let keep = self.panes.cur.texts.borrow_mut().take(id, text);
+        let kept = self.panes.cur.texts.borrow().view(id).map(|(v, _)| v.clone());
         let view = match (keep, kept) {
             (Keep::Same, Some(v)) => v,
             (Keep::Append, Some(v)) => {
@@ -1344,11 +1344,11 @@ impl AppView {
                 // history never animates.
                 let v = cx.new(|cx| TextViewState::markdown(text, cx));
                 let redraw = cx.observe(&v, |_, _, cx| cx.notify());
-                self.texts.borrow_mut().put(id, text.clone(), (v.clone(), redraw), now);
+                self.panes.cur.texts.borrow_mut().put(id, text.clone(), (v.clone(), redraw), now);
                 v
             }
         };
-        let mut rows = self.texts.borrow_mut();
+        let mut rows = self.panes.cur.texts.borrow_mut();
         let wait = rows.wait(ix, id, now, |(v, _)| !v.read(cx).rendered_text().source().is_empty());
         let h = if wait { text_lines(text, rows.cpl) * m.body_line } else { 0. };
         (TextView::new(&view), px(h))
@@ -1358,10 +1358,10 @@ impl AppView {
     /// card, which the room under its header draws round them.
     pub(crate) fn fold_rows(&self, rows: &[Disp], cx: &mut Context<Self>) -> Vec<AnyElement> {
         let items = self.model.shown().items();
-        let (p, m, lay) = (theme::palette(cx), theme::metrics(cx), self.layout);
+        let (p, m, lay) = (theme::palette(cx), theme::metrics(cx), self.panes.cur.layout);
         rows.iter()
             .filter_map(|d| {
-                let (item, row) = (items.get(d.item)?, self.rows.get(d.item)?);
+                let (item, row) = (items.get(d.item)?, self.panes.cur.rows.get(d.item)?);
                 let block = self.render_work(item, row, d.id, &p, &m, lay, cx);
                 Some(div().w_full().pt(px(gap_of(d.gap, &m))).child(block).into_any_element())
             })
@@ -1370,12 +1370,12 @@ impl AppView {
 
     /// One display row: its gap, its label and the block.
     pub(crate) fn render_disp(&self, ix: usize, cx: &mut Context<Self>) -> RowParts {
-        let Some(&d) = self.disp.get(ix) else { return RowParts::empty() };
+        let Some(&d) = self.panes.cur.disp.get(ix) else { return RowParts::empty() };
         let items = self.model.shown().items();
-        let (Some(item), Some(row)) = (items.get(d.item), self.rows.get(d.item)) else { return RowParts::empty() };
+        let (Some(item), Some(row)) = (items.get(d.item), self.panes.cur.rows.get(d.item)) else { return RowParts::empty() };
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
-        let lay = self.layout;
+        let lay = self.panes.cur.layout;
         let gap = gap_of(d.gap, &m);
         // Its markdown in its kept view, as tall as its text while the
         // view's parse is pending ([`TextRows`]).
@@ -1394,7 +1394,7 @@ impl AppView {
                 // (motion.md §5.2).
                 let fx = &self.fx;
                 let born = fx.birth(item.id);
-                let lit = match (born, fx.sent.get()) {
+                let lit = match (born, fx.col(self.panes.cur.id).sent().get()) {
                     (Some(b), Some((at, false))) if b.saturating_duration_since(at) < Duration::from_secs(2) => {
                         fx.flash(Some(at + 2 * motion::STAGGER))
                     }
@@ -1441,11 +1441,12 @@ impl AppView {
         // hairline, caps) is drawn outside the row's reveal clip and lift
         // (Shady #23 H2): a row that reveals grows the card, whose edges
         // are whole on every frame.
-        let card: Option<CardFrame> = match crate::cards::edges(&self.disp, ix) {
+        let card: Option<CardFrame> = match crate::cards::edges(&self.panes.cur.disp, ix) {
             _ if !crate::cards::in_card(&d) => None,
             (top, bottom) => {
                 // Folding (N1): its card goes on in the room under it.
-                let bottom = bottom && !self.fold_gap.borrow().iter().any(|g| g.is(d.id) && matches!(d.kind, Kind::Summary { .. }));
+                let bottom =
+                    bottom && !self.panes.cur.fold_gap.borrow().iter().any(|g| g.is(d.id) && matches!(d.kind, Kind::Summary { .. }));
                 let (pal, geo) = (p, crate::cards::Geo::of(&m));
                 let id = d.id;
                 let click = matches!(d.kind, Kind::Summary { .. }).then(|| {
@@ -1521,16 +1522,16 @@ impl AppView {
     /// rule under it; the band takes the pointer (not the wheel) and hides
     /// the beat under it. Nothing in it asks for a frame.
     pub(crate) fn sticky_label(&self, b: Bounds<Pixels>, cx: &App) -> Option<crate::sticky::Pinned> {
-        let (p, m, lay) = (theme::palette(cx), theme::metrics(cx), self.layout);
+        let (p, m, lay) = (theme::palette(cx), theme::metrics(cx), self.panes.cur.layout);
         let at = |i: usize| {
-            let (d, row) = (self.disp.get(i)?, self.list.bounds_for_item(i)?);
+            let (d, row) = (self.panes.cur.disp.get(i)?, self.panes.cur.list.bounds_for_item(i)?);
             let top = if lay.hang { who_of(d, &p, &m).map_or(0., |w| w.2) } else { 0. };
             Some(f32::from(row.top() - b.top()) + gap_of(d.gap, &m) + top)
         };
-        let time = |i: usize| self.disp.get(i).and_then(|d| self.rows.get(d.item)).and_then(|r| r.time.as_ref());
+        let time = |i: usize| self.panes.cur.disp.get(i).and_then(|d| self.panes.cur.rows.get(d.item)).and_then(|r| r.time.as_ref());
         let (pin, line) = if lay.hang { (m.pad_y, m.body_line) } else { (0., self.sticky_inset(cx)) };
         let h = |i: usize| line + if lay.hang && time(i).is_some() { m.mono_line } else { 0. };
-        let stuck = crate::sticky::place(&self.disp, self.list.logical_scroll_top().item_ix, at, pin, h);
+        let stuck = crate::sticky::place(&self.panes.cur.disp, self.panes.cur.list.logical_scroll_top().item_ix, at, pin, h);
         let bottom = stuck.iter().flatten().map(|s| s.y + h(s.row)).reduce(f32::max)?;
         // The slot's right edge, as the row's (`right(column + hang)`).
         let gutter = px((lay.left - m.hang).max(0.));
@@ -1545,7 +1546,7 @@ impl AppView {
         });
         let el = root
             .children(stuck.into_iter().flatten().filter_map(|s| {
-                let d = self.disp[s.row];
+                let d = self.panes.cur.disp[s.row];
                 let (text, color, _) = who_of(&d, &p, &m)?;
                 let id = d.id;
                 let label = display(text, m.label, color).line_height(px(m.body_line));
@@ -1568,7 +1569,7 @@ impl AppView {
     /// What the sticky band hides at the list's top when the labels are
     /// inline (F8: one label line and its rule); hanging, nothing.
     pub(crate) fn sticky_inset(&self, cx: &App) -> f32 {
-        if self.layout.hang { 0. } else { theme::metrics(cx).body_line + 1. }
+        if self.panes.cur.layout.hang { 0. } else { theme::metrics(cx).body_line + 1. }
     }
 }
 
@@ -1681,8 +1682,8 @@ impl AppView {
     /// 1 px `line` rule under it parts it from the rows.
     fn render_summary(&self, d: Disp, open: bool, p: &Palette, m: &Metrics, cx: &Context<Self>) -> AnyElement {
         let id = d.id;
-        let Some(s) = self.summaries.get(id) else { return div().into_any_element() };
-        let lay = self.layout;
+        let Some(s) = self.panes.cur.summaries.get(id) else { return div().into_any_element() };
+        let lay = self.panes.cur.layout;
         let g = crate::cards::Geo::of(m);
         let tight = lay.tight;
         // The tally names what fits (Sans 12, measured without layout at a
@@ -1860,7 +1861,7 @@ impl AppView {
             target_el(&row.card, &row.arg, matches!(st, Some(ToolStatus::Cancelled | ToolStatus::Denied)), p)
         };
         // The call a prompt waits on ([`waiting_call`]).
-        let waiting = !think && self.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty();
+        let waiting = !think && self.panes.cur.waiting_on == Some(item.id) && !self.model.shown().pending_prompts().is_empty();
         let fx = &self.fx;
         let shown = self.model.shown();
         let running_think = think && shown.busy() && shown.items().last().map(|i| i.id) == Some(id);
@@ -2271,7 +2272,7 @@ impl AppView {
         let (name, body) = row.text.split_once('\n').unwrap_or((&row.text, ""));
         let lines: Vec<&str> = body.lines().collect();
         let long = output_folds(lines.len());
-        let open = !long || self.toggled.contains(&id);
+        let open = !long || self.panes.cur.toggled.contains(&id);
         let shown = if open { lines.len() } else { OUTPUT_LINES };
         let toggle = |d: Stateful<Div>, cx: &Context<Self>| {
             d.cursor_pointer().hover(|d| d.bg(p.tool_out)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
