@@ -784,9 +784,12 @@ fn catalog_pages_decode() {
 fn catalog_page_requests_encode_as_the_daemon_expects() {
     let first = encode_frame(&ClientFrame::CatalogPage { req: 7, before: None, limit: 50, named_only: false }).unwrap();
     assert_eq!(first, "{\"type\":\"catalog_page\",\"req\":7,\"limit\":50}\n");
-    let before = Some(CatalogCursor(serde_json::json!({"updated_at": "2026-11-12T04:00:00Z", "id": "20261110-202033-64fb"})));
+    let before = Some(CatalogCursor(serde_json::json!({"id": "20261110-202033-64fb", "updated_at": "2026-11-12T04:00:00Z"})));
     let later = encode_frame(&ClientFrame::CatalogPage { req: 7, before, limit: 50, named_only: false }).unwrap();
-    // The cursor is opaque JSON, relayed as a value: its keys in serde_json's order.
+    // The cursor is opaque JSON, relayed as a value. Its keys are given here
+    // in sorted order, so the bytes are the same with serde_json's
+    // `preserve_order` on (as `test --workspace` builds it: gpui's
+    // http client turns it on) or off (`test -p synaps-client`).
     assert_eq!(
         later,
         "{\"type\":\"catalog_page\",\"req\":7,\"before\":{\"id\":\"20261110-202033-64fb\",\"updated_at\":\"2026-11-12T04:00:00Z\"},\"limit\":50}\n"
