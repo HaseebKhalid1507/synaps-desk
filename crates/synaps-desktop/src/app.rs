@@ -1027,7 +1027,9 @@ pub(crate) struct Slack {
     /// their coast, a jump, the bar; `left` takes one past END_SLOP).
     /// Until there is one, the room used up lands the list at its true end,
     /// whatever `rest` reads: a splice the hold's sums missed can leave it
-    /// short, never stranded there (#23 r9).
+    /// short, never stranded there (#23 r9). A card's starts with it when
+    /// the list was not following as it landed: a reader scrolled back
+    /// before the hold began (Shady #23 final H1).
     input: bool,
     /// The list's viewport height at its last frame: a view that got
     /// shorter under it (the composer, the dock, a resize) lifts the list
@@ -4906,7 +4908,13 @@ impl AppView {
                     held: false,
                     left: false,
                     list: self.list_gen,
-                    input: false,
+                    // A reader scrolled back as it resolved (the card in
+                    // view, answered elsewhere: their scroll came before
+                    // the hold): theirs, as a scroll in the hold would be,
+                    // so its use-up never takes them to the end (Shady #23
+                    // final H1). Read before the landing frame keeps the
+                    // list following ([`Slack::fresh`]).
+                    input: !self.list.is_following_tail(),
                     vh: f32::from(self.list.viewport_bounds().size.height),
                     fresh: Some(self.fx.frame()),
                 }));

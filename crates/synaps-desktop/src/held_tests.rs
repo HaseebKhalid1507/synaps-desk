@@ -567,3 +567,94 @@ fn a_splice_storm_under_a_held_room_ends_at_its_end_and_follows(cx: &mut TestApp
         assert!(run.unfollowed.is_none() && follows, "{case}: it follows the tail from use-up on ({:?})", run.unfollowed);
     }
 }
+
+/// Shady #23 final H1: a reader scrolled back `back` px from the end, the
+/// card still in view, reads on; the card is answered elsewhere (no scroll
+/// during its fold: theirs came before the hold existed). Its room lands
+/// held, and a new call's output uses it up. r9's net took the room used
+/// up with no scroll of the user's since the hold began to the list's
+/// true end: the reader thrown to the end, the column following the
+/// stream. Their top row never moves, and the list stays where they left
+/// it, not following.
+#[gpui_kit::test]
+fn a_reader_scrolled_back_as_the_card_resolves_is_never_taken_to_the_end(cx: &mut TestAppContext) {
+    for (extra, h, back) in [(6usize, 660f32, 200f32), (10, 800., 200.)] {
+        let case = format!("{extra} calls after the card, {h} px, {back} px back");
+        let (w, view, _events) = open_h(cx, h);
+        motion_level(cx, &view, crate::motion::Level::Full);
+        view.update(cx, |v, _| {
+            v.client = None;
+            v.model.transcript.set_busy(true);
+        });
+        settle(cx, w, 8);
+        for c in 0..extra {
+            done_call(cx, &view, &format!("x{c}"));
+        }
+        for _ in 0..60 {
+            fluid_frame(cx, w, &view);
+        }
+        assert!(view.read_with(cx, |v, _| v.list.is_following_tail()), "{case}: following before the scroll");
+        view.update(cx, |v, cx| {
+            // In place of the wheel (its capture owner touches the scroller).
+            v.scroller.touch();
+            v.list.scroll_by(gpui_kit::px(-back));
+            cx.notify();
+        });
+        for _ in 0..30 {
+            fluid_frame(cx, w, &view);
+        }
+        let away = short(cx, &view);
+        assert!((away - back).abs() <= 1., "{case}: scrolled back {away} px");
+        let tops = row_tops(cx, &view);
+        let (reader, y0) = tops.iter().min_by(|a, b| a.1.total_cmp(b.1)).map(|(r, y)| (*r, *y)).expect("a row on screen");
+        let ids: Vec<u64> = view.read_with(cx, |v, _| v.model.transcript.pending_prompts().iter().map(|p| p.id).collect());
+        assert!(!ids.is_empty(), "{case}: the demo's card");
+        let card = view.read_with(cx, |v, _| v.disp.iter().position(|d| d.kind == crate::turns::Kind::Prompt).expect("the card's row"));
+        let shown = view.read_with(cx, |v, _| {
+            let vb = v.list.viewport_bounds();
+            v.list.bounds_for_item(card).is_some_and(|b| b.top() < vb.bottom() && b.bottom() > vb.top())
+        });
+        assert!(shown, "{case}: the card in view");
+        view.update(cx, |v, cx| {
+            for prompt_id in ids {
+                v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id });
+            }
+            cx.notify();
+        });
+        let mut moved = 0f32;
+        let track = |cx: &mut TestAppContext, moved: &mut f32| {
+            let y = row_tops(cx, &view).get(&reader).copied().unwrap_or(f32::INFINITY);
+            *moved = moved.max((y - y0).abs());
+        };
+        let mut was_held = false;
+        for _ in 0..120 {
+            fluid_frame(cx, w, &view);
+            was_held |= held(cx, &view);
+            track(cx, &mut moved);
+        }
+        assert!(was_held && held(cx, &view), "{case}: the room it left, held");
+        let input = serde_json::json!({"command": "cargo test -p relay --test held"});
+        apply(cx, &view, llm(LlmEvent::ToolUse { tool_name: "bash".into(), tool_id: "h0".into(), input }));
+        apply(cx, &view, llm(LlmEvent::ToolStarted { tool_id: "h0".into() }));
+        let (mut used, mut followed) = (None, None);
+        for k in 0..30 {
+            apply(cx, &view, llm(LlmEvent::ToolResultDelta { tool_id: "h0".into(), delta: format!("test held_{k} ... ok\n") }));
+            for _ in 0..10 {
+                fluid_frame(cx, w, &view);
+                track(cx, &mut moved);
+                if followed.is_none() && view.read_with(cx, |v, _| v.list.is_following_tail()) {
+                    followed = Some(k);
+                }
+            }
+            if used.is_none() && !held(cx, &view) {
+                used = Some(k);
+            }
+        }
+        let left = short(cx, &view);
+        eprintln!("{case}: used up at {used:?}; the reader's top row moved {moved} px; following at {followed:?}; {left} px back");
+        assert!(used.is_some(), "{case}: the output used the room up");
+        assert!(moved <= 0.5, "{case}: the reader's top row moved {moved} px (following at line {followed:?})");
+        assert!(followed.is_none(), "{case}: taken to the end at line {followed:?}");
+        assert!(left >= back, "{case}: {left} px from its end, the reader {back} px back");
+    }
+}
