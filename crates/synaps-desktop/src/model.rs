@@ -3949,13 +3949,18 @@ mod fake_daemon {
         // A's prompt answered: B's is still waiting, unanswered.
         assert!(m.lives[la].prompt_answered(1) && !m.lives[lb].prompt_answered(1));
         assert!(m.lives[lb].may_answer(1));
+        // What each connection got, of input and answers (not its queries).
+        let input = |c: &mut Conn| -> Vec<Value> {
+            let kinds = ["answer", "submit", "steer", "cancel"];
+            c.cmds(Duration::from_millis(400)).into_iter().filter(|f| kinds.contains(&f["cmd"].as_str().unwrap_or(""))).collect()
+        };
         assert_eq!(
-            a.cmds(Duration::from_millis(400)),
+            input(&mut a),
             vec![json!({"cmd": "answer", "prompt_id": 1, "value": "y"}), json!({"cmd": "submit", "text": "to A", "attachments": []})],
             "A's connection: A's Allow and A's message only"
         );
         assert_eq!(
-            b.cmds(Duration::from_millis(400)),
+            input(&mut b),
             vec![json!({"cmd": "cancel"}), json!({"cmd": "steer", "text": "to B"})],
             "B's connection: B's HALT and B's steer only"
         );
