@@ -1735,7 +1735,9 @@ async fn two_attachments_route_every_command_by_seq() {
     // B's prompt, answered through A: refused, sent nowhere.
     client.on(a).answer_on(conn_b, 7, Some("y".into())).unwrap();
     let why = wait(&events, "a cross-session answer refused", |e| match e {
-        Event::Error { attach_seq, error: Error::Refused { command: Some(c), reason } } if c == "answer" => Some((*attach_seq, reason.clone())),
+        Event::Error { attach_seq, error: Error::Refused { command: Some(c), reason } } if c == "answer" => {
+            Some((*attach_seq, reason.clone()))
+        }
         _ => None,
     })
     .await;

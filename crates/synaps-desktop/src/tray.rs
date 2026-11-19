@@ -635,9 +635,13 @@ impl AppView {
                 .cursor_pointer()
                 .hover(|d| d.bg(p.tool_out))
                 // It rolls as workers come and go (polish.md P5).
-                .child(motion::roll_count(&self.fx, motion::ROLL_MORE, chips.more, format!("+{} more", chips.more).into(), |t| {
-                    mono(t, m.meta, p.dim_t)
-                }))
+                .child(motion::roll_count(
+                    self.fx.col(self.panes.cur.id),
+                    motion::ROLL_MORE,
+                    chips.more,
+                    format!("+{} more", chips.more).into(),
+                    |t| mono(t, m.meta, p.dim_t),
+                ))
                 // Its menu open: the menu says it (no tooltip over it).
                 .when(self.wmenu.is_none(), |d| d.tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)))
                 .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| this.open_workers_menu(ev.position(), window, cx)));

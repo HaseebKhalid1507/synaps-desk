@@ -14,7 +14,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use synaps_client::transcript::{Item, ItemKind, ToolStatus};
+use synaps_client::transcript::{Item, ItemKind, Splice, ToolStatus};
 use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError, Transcript};
 
 use crate::bench::BenchState;
@@ -180,6 +180,8 @@ pub(crate) struct Column {
     rows_session: Option<String>,
     scroll_carry: Option<(f32, ListOffset)>,
     metrics_gen: u64,
+    /// Its transcript's changes it has not synced ([`Pane::pending`]).
+    pending: Option<Splice>,
 }
 
 impl TabCache {
@@ -1788,7 +1790,6 @@ pub struct AppView {
     /// The palette box's top, its tallest bottom, its left and width as last drawn.
     #[cfg(test)]
     pub(crate) palette_box: Cell<(f32, f32, f32, f32)>,
-    pub(crate) cancel_tick: Option<Task<()>>,
     /// A session's menu (a right-click on its tab or rail row): Rename…,
     /// Close tab.
     pub(crate) smenu: Option<(crate::menu::Menu<SessionAct>, SessionTarget)>,
@@ -1946,24 +1947,25 @@ impl AppView {
         let secret_input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("answer (hidden)"));
         let settings_find = cx.new(|cx| InputState::new(window, cx).placeholder("find a setting"));
         let settings_input = cx.new(|cx| InputState::new(window, cx));
+        // The composer's own: it goes with its pane (Shady #30 L4).
+        let composer_sub = cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| match ev {
+            InputEvent::PressEnter { shift: false, .. } if !this.enter_is_the_picks() => {
+                let text = input.read(cx).value().trim().to_string();
+                if !text.is_empty() && this.submit(text) {
+                    input.update(cx, |s, cx| s.set_value("", window, cx));
+                }
+            }
+            InputEvent::PressEnter { shift: false, .. } => {
+                log::debug!(target: "synaps_desktop::send", "enter: a held repeat of a menu pick's key, nothing sent");
+            }
+            // Typing: what a worker key or a refused steer said is old.
+            InputEvent::Change if this.panes.cur.watch_note.is_some() => {
+                this.panes.cur.watch_note = None;
+                cx.notify();
+            }
+            _ => {}
+        });
         let mut subs = vec![
-            cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { shift: false, .. } if !this.enter_is_the_picks() => {
-                    let text = input.read(cx).value().trim().to_string();
-                    if !text.is_empty() && this.submit(text) {
-                        input.update(cx, |s, cx| s.set_value("", window, cx));
-                    }
-                }
-                InputEvent::PressEnter { shift: false, .. } => {
-                    log::debug!(target: "synaps_desktop::send", "enter: a held repeat of a menu pick's key, nothing sent");
-                }
-                // Typing: what a worker key or a refused steer said is old.
-                InputEvent::Change if this.panes.cur.watch_note.is_some() => {
-                    this.panes.cur.watch_note = None;
-                    cx.notify();
-                }
-                _ => {}
-            }),
             // The palette filters as it is typed.
             cx.subscribe_in(&palette_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
                 if let InputEvent::Change = ev
@@ -2113,6 +2115,7 @@ impl AppView {
         let usage_pane = cx.new(|_| crate::views::ViewPane::new(me, crate::tabs::Kind::Usage));
         let inputs = Inputs {
             composer,
+            composer_sub,
             find_input,
             palette_input,
             name_input,
@@ -2231,6 +2234,7 @@ impl AppView {
                 strip_at: Default::default(),
                 main_column: None,
                 column_of: None,
+                pending: None,
                 worker_columns: Vec::new(),
                 full_rebuild: false,
                 card: None,
@@ -2249,6 +2253,8 @@ impl AppView {
                 allow_all_focus: i.allow_all_focus,
                 tracer_open: None,
                 tracer: None,
+                cancel_tick: None,
+                _subs: vec![i.composer_sub],
             }),
             bars: Default::default(),
             top_words: None,
@@ -2382,7 +2388,6 @@ impl AppView {
             palette_drawn: Cell::new((0., 0., 0., 0.)),
             #[cfg(test)]
             palette_box: Cell::new((0., 0., 0., 0.)),
-            cancel_tick: None,
             smenu: None,
             wmenu: None,
             rename_pending: None,
@@ -2435,7 +2440,7 @@ impl AppView {
                     self.close_menu();
                     self.model.view_dirty = true;
                 } else if self.model.lives[self.panes.cur.live].cancels.disarm() {
-                    self.cancel_tick = None;
+                    self.panes.cur.cancel_tick = None;
                     self.model.view_dirty = true;
                 }
             }
@@ -2477,11 +2482,15 @@ impl AppView {
 
     pub(crate) fn effect(&mut self, fx: Effect) {
         match fx {
-            Effect::Restore(text) => {
-                self.panes.cur.restore = Some(match self.panes.cur.restore.take() {
-                    Some(prev) => format!("{prev}\n{text}"),
-                    None => text,
-                })
+            // To the composer of the pane that sent it; a pane closed since
+            // gets nothing (its text was its draft's).
+            Effect::Restore(pane, text) => {
+                if let Some(p) = self.panes.get_mut(pane) {
+                    p.restore = Some(match p.restore.take() {
+                        Some(prev) => format!("{prev}\n{text}"),
+                        None => text,
+                    })
+                }
             }
             Effect::Unsent { session, text } => self.unsent(session, text),
             Effect::ListSessions => {
@@ -2551,7 +2560,7 @@ impl AppView {
         // Its tab followed the session to a new id: that tab's.
         let session = self.model.tabs.followed(&session).map_or(session, str::to_string);
         if self.panes.cur.composer_of.as_ref().is_some_and(|(_, s)| s.as_deref() == Some(session.as_str())) {
-            self.effect(Effect::Restore(text));
+            self.effect(Effect::Restore(self.panes.cur.id, text));
             self.panes.cur.draft_note = Some(UNSENT_NOTE);
             self.model.view_dirty = true;
         } else if self.model.tabs.knows(&session) {
@@ -2597,7 +2606,7 @@ impl AppView {
         // it would go to the tab left).
         if self.composer_owned() {
             if let Some((text, note)) = self.model.lives[self.panes.cur.live].watch.take_unsent() {
-                self.effect(Effect::Restore(text));
+                self.effect(Effect::Restore(self.panes.cur.id, text));
                 self.panes.cur.watch_note = Some(note.into());
             }
         } else if self.model.lives[self.panes.cur.live].watch.has_unsent() {
@@ -3093,6 +3102,8 @@ impl AppView {
     /// until its attach lands.
     fn load(&mut self, session: Option<String>) {
         self.list_out();
+        // The last transcript's changes were synced as it left (`stash`).
+        self.panes.cur.pending = None;
         self.disarm_halt();
         match session.as_ref().and_then(|s| self.tab_cache.take(s)) {
             Some(c) => {
@@ -3590,7 +3601,7 @@ impl AppView {
             return false;
         }
         log::debug!(target: "synaps_desktop::send", "{} ({} chars)", if busy { "steer" } else { "submit" }, text.chars().count());
-        self.model.lives[self.panes.cur.live].sent(text);
+        self.model.lives[self.panes.cur.live].sent(self.panes.cur.id, text);
         self.panes.cur.draft_note = None;
         self.panes.cur.watch_note = None;
         // Handoff out: the composer's bar, then the new block's (a steer
@@ -4966,8 +4977,7 @@ impl AppView {
     /// the metrics, and one re-measure of the list.
     pub(crate) fn show_text_size(&mut self, next: u8, cx: &mut App) {
         theme::update(cx, |c| c.text = next);
-        self.panes.cur.list.remeasure();
-        self.panes.cur.metrics_gen += 1;
+        self.text_metrics_changed();
     }
 
     pub(crate) fn apply_custom_accent(&mut self, cx: &mut Context<Self>) {
@@ -5011,8 +5021,12 @@ impl AppView {
     /// Every row's height changes with the text size: re-measured now (a
     /// cached tab's when it comes back).
     pub(crate) fn text_metrics_changed(&mut self) {
-        self.panes.cur.list.remeasure();
-        self.panes.cur.metrics_gen += 1;
+        // Every pane's, alike (Shady #30 M3).
+        let g = self.panes.next_gen();
+        for pane in self.panes.iter_mut() {
+            pane.list.remeasure();
+            pane.metrics_gen = g;
+        }
     }
 
     pub(crate) fn set_panels_pub(&mut self, p: theme::Panels, cx: &mut Context<Self>) {
@@ -5147,14 +5161,15 @@ impl AppView {
         let pane_before = self.panes.cur.column_of.clone();
         let session_before = self.panes.cur.rows_session.clone();
         self.sync_column();
+        self.fan_out();
         let busy = self.model.lives[self.panes.cur.live].shown().busy();
-        let mut splice = self.model.lives[self.panes.cur.live].shown_mut().take_splice();
+        let mut splice = self.panes.cur.pending.take();
         // A splice that adds items (a delta to the last one adds no row).
         let live_splice = splice.as_ref().is_some_and(|sp| sp.start > 0 && sp.new_len > sp.old_len && sp.new_len <= sp.old_len + 16)
             && !self.panes.cur.full_rebuild;
         if std::mem::take(&mut self.panes.cur.full_rebuild) {
             let n = self.model.lives[self.panes.cur.live].shown().len();
-            splice = Some(synaps_client::transcript::Splice { start: 0, old_len: self.panes.cur.rows.len(), new_len: n });
+            splice = Some(Splice { start: 0, old_len: self.panes.cur.rows.len(), new_len: n });
         }
         let items = self.model.lives[self.panes.cur.live].shown().items();
         let from = match &splice {
@@ -5344,7 +5359,7 @@ impl AppView {
         self.panes.cur.fold_gap.borrow_mut().clear();
         self.panes.cur.body_hold.set(None);
         self.panes.cur.touch_kept.set(false);
-        self.panes.cur.list_gen += 1;
+        self.panes.cur.list_gen = self.panes.next_gen();
         self.panes.cur.texts.borrow_mut().clear();
     }
 
@@ -5368,6 +5383,7 @@ impl AppView {
             rows_session: self.panes.cur.rows_session.take(),
             scroll_carry: self.panes.cur.scroll_carry.take(),
             metrics_gen: self.panes.cur.metrics_gen,
+            pending: self.panes.cur.pending.take(),
         }
     }
 
@@ -5385,6 +5401,40 @@ impl AppView {
         self.panes.cur.waiting_on = p.waiting_on;
         self.panes.cur.rows_session = p.rows_session;
         self.panes.cur.scroll_carry = p.scroll_carry;
+        self.panes.cur.pending = p.pending;
+    }
+
+    /// Each transcript's changes since the last frame, to the list showing
+    /// it (split/architecture.md §3.2): `take_splice` reads once, so the
+    /// store's splice is taken here and merged into the pending changes of
+    /// the pane's list if it shows that transcript, else of the list parked
+    /// for it (the session's under a worker's view; a worker tab's). One no
+    /// list holds stays in its transcript, as before.
+    fn fan_out(&mut self) {
+        let pane = &mut self.panes.cur;
+        let live = &mut self.model.lives[pane.live];
+        let main = match &pane.column_of {
+            None => Some(&mut pane.pending),
+            Some(_) => pane.main_column.as_mut().map(|c| &mut c.pending),
+        };
+        if let Some(slot) = main
+            && let Some(sp) = live.transcript.take_splice()
+        {
+            crate::live::pend(slot, sp);
+        }
+        if pane.column_of.is_some()
+            && let Some(w) = live.watch.focused_mut()
+            && let Some(sp) = w.transcript.take_splice()
+        {
+            crate::live::pend(&mut pane.pending, sp);
+        }
+        for ((h, g), col) in &mut pane.worker_columns {
+            if let Some(w) = live.watch.worker_mut(h).filter(|w| w.generation == *g)
+                && let Some(sp) = w.transcript.take_splice()
+            {
+                crate::live::pend(&mut col.pending, sp);
+            }
+        }
     }
 
     /// A subagent's block changed shape (a line came, its state changed)
@@ -6852,6 +6902,8 @@ pub(crate) fn one_line(s: &str, max: usize) -> String {
 
 struct Inputs {
     composer: Entity<TextareaState>,
+    /// The composer's subscription: the pane's ([`Pane::_subs`]).
+    composer_sub: Subscription,
     find_input: Entity<InputState>,
     palette_input: Entity<InputState>,
     name_input: Entity<InputState>,
@@ -6877,7 +6929,11 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
-        self.fx.rescope(self.motion_session(), self.motion_column());
+        let (session, column) = (self.motion_session(), self.motion_column());
+        self.fx.col(self.panes.cur.id).rescope(session, column);
+        // The chrome's motion is rescoped with the session on screen, as it
+        // was in pane 0's column (no change with one pane; Shady #30 M2).
+        self.fx.chrome().rescope(session, column);
         // Another session, or a worker's view in or out: its dock and draft
         // are drawn at their heights (a switch replays nothing).
         let scope = self.motion_session() ^ self.motion_column().rotate_left(17);
@@ -7142,7 +7198,7 @@ impl Render for AppView {
         let lay = Layout::of_in(pane, wrap, self.height - crate::chrome::TOP, &m, ex);
         if (lay.hang, lay.tight) != (self.panes.cur.layout.hang, self.panes.cur.layout.tight) {
             self.panes.cur.list.remeasure();
-            self.panes.cur.metrics_gen += 1;
+            self.panes.cur.metrics_gen = self.panes.next_gen();
         }
         // A new column re-wraps the rows: this frame's scrollbar would read
         // the rows not yet measured at their estimates (it is held as it

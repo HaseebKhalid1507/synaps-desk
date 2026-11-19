@@ -821,7 +821,7 @@ impl AppView {
             .child({
                 let c = self.fx.glow(GLOW | 0xFFFF, n as u64, if on { p.warn_ch } else { p.dim_ch });
                 let text = format!("{n}   {}", label::NEED_YOU).into();
-                crate::motion::roll_count(&self.fx, crate::motion::ROLL_NEEDS, n, text, |t| display(t, size::D_S, c).flex_none())
+                crate::motion::roll_count(self.fx.chrome(), crate::motion::ROLL_NEEDS, n, text, |t| display(t, size::D_S, c).flex_none())
             })
             .when_some(first.filter(|_| fit.label > 0.), |d, s| d.child(cut(mono(s.label(), size::META, p.ink), fit.label)))
             .when_some(what.filter(|_| fit.gist > 0.), |d, w| d.child(cut(mono(w, size::META, p.dim_ch), fit.gist)))
@@ -843,7 +843,9 @@ impl AppView {
         #[cfg(test)]
         let ticker = ticker.when_some(self.roll_probe, |d, n| {
             let text = format!("{n} tool{}", if n == 1 { "" } else { "s" }).into();
-            d.child(crate::motion::roll_count(&self.fx, crate::motion::ROLL_PROBE, n, text, |t| mono(t, size::META, p.dim_ch).flex_none()))
+            d.child(crate::motion::roll_count(self.fx.chrome(), crate::motion::ROLL_PROBE, n, text, |t| {
+                mono(t, size::META, p.dim_ch).flex_none()
+            }))
         });
         h_flex()
             .h(px(top_h(self.panes.cur.layout.short)))
@@ -1396,7 +1398,9 @@ impl AppView {
                             Chip::Unread => p.unread_ch,
                         };
                         let key = crate::motion::key(crate::motion::ROLL_RAIL, c as u64);
-                        crate::motion::roll_count(&self.fx, key, count, chip_count(count).into(), move |t| mono(t, size::META, color))
+                        crate::motion::roll_count(self.fx.chrome(), key, count, chip_count(count).into(), move |t| {
+                            mono(t, size::META, color)
+                        })
                     })
                     .tooltip(move |window, cx| crate::overlay::tip(tip, window, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1635,7 +1639,9 @@ impl AppView {
                         self.lit(d, crate::motion::key(RAIL_TOUCH, crate::app::tkey("favs-head", 0)), (p.chrome, p.raised, p.press_ch), cx)
                     })
                     // It turns as the section folds (fluid.md §3.7).
-                    .child(div().absolute().left(px(7.)).top(px(19.)).child(glyph::turn(self.fx.turn(FAVS_TURN, *open), p.rest_mark)))
+                    .child(
+                        div().absolute().left(px(7.)).top(px(19.)).child(glyph::turn(self.fx.chrome().turn(FAVS_TURN, *open), p.rest_mark)),
+                    )
                     .child(display(label::FAVOURITES, size::D_S, p.dim_ch))
                     .child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_ch).child(fonts::JP_FAVOURITES))
                     .child(div().flex_1())
@@ -1764,7 +1770,7 @@ impl AppView {
         let lit = !(self.rail_fx.moving && self.rail_fx.sel == Some(key));
         // NEEDS YOU's bar draws top to bottom over `base` (motion.md §6.3).
         let needs = st == State::NeedsYou;
-        let since = fx.change(crate::motion::Tag::RowNeeds, key, needs as u64, None).filter(|_| needs).map(|c| c.0);
+        let since = self.fx.chrome().change(crate::motion::Tag::RowNeeds, key, needs as u64, None).filter(|_| needs).map(|c| c.0);
         let bar = if needs {
             Some((p.warn_mark_ch, fx.draw(since, std::time::Duration::ZERO, crate::motion::BASE)))
         } else if shown && lit {
@@ -2030,7 +2036,7 @@ impl AppView {
         // moves the row into FAVOURITES, and the acknowledgement lands on a
         // still row. On device pixels, hop and sparks (Shady #17).
         let fx = &self.fx;
-        let since = fx.change(crate::motion::Tag::Star, key, u64::from(fav), None).filter(|c| fav && c.1 == 0).map(|c| c.0);
+        let since = self.fx.chrome().change(crate::motion::Tag::Star, key, u64::from(fav), None).filter(|c| fav && c.1 == 0).map(|c| c.0);
         let since = match since {
             Some(at) => self.star_landed(key, at),
             None => {

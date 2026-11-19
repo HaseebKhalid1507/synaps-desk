@@ -105,7 +105,8 @@ pub struct Pane {
     pub(crate) scroller: crate::scroll::Scroller,
     /// The list's view (top, bottom) as its last layout left it.
     pub(crate) list_box: Cell<(f32, f32)>,
-    /// The list on screen, numbered: a new one with every [`AppView::list_out`]
+    /// The list on screen, numbered from the window's count
+    /// ([`Panes::next_gen`]): a new one with every [`AppView::list_out`]
     /// (a tab, a worker's view). The held rooms are keyed by it.
     pub(crate) list_gen: u64,
     /// The room a folded card gave up, kept at the list's end as it folded
@@ -122,8 +123,10 @@ pub struct Pane {
     /// The user's scroll while an answered card folds: the room it leaves
     /// is told of it as it lands ([`AppView::tail_slack`]).
     pub(crate) touch_kept: Cell<bool>,
-    /// Bumped when the text metrics change every row's height (a cached
-    /// tab's list is re-measured when it comes back).
+    /// The text metrics its list was measured with, from the window's
+    /// count ([`Panes::next_gen`]): new when the text size changes every
+    /// pane's row heights, or this pane's layout form changes; a cached
+    /// tab's list is re-measured when it comes back unless it matches.
     pub(crate) metrics_gen: u64,
 
     // The pane's view around its list (architecture.md §1.1-§1.3: "P").
@@ -221,6 +224,12 @@ pub struct Pane {
     /// The worker's view the list holds and its generation
     /// ([`crate::watch::Watch::focus_key`]).
     pub(crate) column_of: Option<(String, u64)>,
+    /// The changes to the transcript the list shows that it has not
+    /// synced yet (split/architecture.md §3.2): the store's splice is taken
+    /// once a frame and handed to every list showing that transcript
+    /// ([`AppView::fan_out`]); a parked list keeps its own in its
+    /// [`Column`].
+    pub(crate) pending: Option<synaps_client::transcript::Splice>,
     /// Worker tabs' lists (rows, folds, heights, scroll) while another
     /// thread of their session is on screen, by view and generation: back
     /// as they were left, while the tab is open.
@@ -271,17 +280,47 @@ pub struct Pane {
     /// the tab strip was painted last.
     pub(crate) tracer_open: Option<u64>,
     pub(crate) tracer: Option<crate::motion::Tracer>,
+    /// The tray's armed worker cancel running out: one redraw then
+    /// (`AppView::arm_cancel_tick`; Shady #30 L4). The cancels themselves
+    /// are the session's ([`crate::live::Live::cancels`]).
+    pub(crate) cancel_tick: Option<Task<()>>,
+    /// Its composer's subscription (Enter sends, typing clears a note):
+    /// it lives and goes with the pane (Shady #30 L4).
+    pub(crate) _subs: Vec<Subscription>,
 }
 
 /// The window's panes. Step 1: exactly one, `cur`.
 pub(crate) struct Panes {
     /// The pane on screen (the focused one: the only one).
     pub(crate) cur: Pane,
+    /// The last generation handed out ([`Panes::next_gen`]).
+    gens: u64,
 }
 
 impl Panes {
     pub(crate) fn one(pane: Pane) -> Self {
-        Panes { cur: pane }
+        Panes { cur: pane, gens: 0 }
+    }
+
+    /// A window-wide generation (split/architecture.md §6.1 rule 2, §1.1;
+    /// Shady #30 M3): a list's number ([`Pane::list_gen`]: a held room
+    /// carried into another list can never match there) and the text
+    /// metrics' ([`Pane::metrics_gen`]: a tab cached by one pane is
+    /// re-measured in another unless they were measured alike). Never
+    /// handed out twice.
+    pub(crate) fn next_gen(&mut self) -> u64 {
+        self.gens += 1;
+        self.gens
+    }
+
+    /// Every open pane (step 2: the one).
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Pane> {
+        std::iter::once(&mut self.cur)
+    }
+
+    /// Pane `id`, if it is open (what an effect addressed to a pane finds).
+    pub(crate) fn get_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
+        (self.cur.id == id).then_some(&mut self.cur)
     }
 }
 

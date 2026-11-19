@@ -13,11 +13,13 @@
 
 use std::collections::{HashSet, VecDeque};
 
+use synaps_client::transcript::Splice;
 use synaps_client::{AttachMode, ClientInput, Transcript};
 
 #[cfg(doc)]
 use crate::model::Model;
 use crate::model::{Active, Effect};
+use crate::pane::PaneId;
 use crate::rail::State;
 use crate::stats::Stats;
 use crate::watch::{Candidate, Watch};
@@ -53,8 +55,9 @@ pub struct Live {
     /// The session connection is being re-made (reload).
     pub reattaching: bool,
     /// Sent, not yet confirmed by `TurnStarted` / `Steered`, oldest first:
-    /// given back to the user on a refusal (the oldest) or a detach (all).
-    pub(crate) in_flight: VecDeque<String>,
+    /// given back to the user on a refusal (the oldest) or a detach (all),
+    /// in the composer of the pane that sent it.
+    pub(crate) in_flight: InFlight,
     /// The attached session's numbers (the composer's foot, the right-hand
     /// panel).
     pub stats: Stats,
@@ -76,7 +79,7 @@ impl Default for Live {
             transcript: crate::model::transcript(),
             last_error: None,
             reattaching: false,
-            in_flight: VecDeque::new(),
+            in_flight: InFlight::default(),
             stats: Stats::default(),
             watch: Watch::default(),
             cancels: Default::default(),
@@ -99,13 +102,6 @@ impl Live {
     /// session's own.
     pub fn shown(&self) -> &Transcript {
         self.watch.focused().map_or(&self.transcript, |w| &w.transcript)
-    }
-
-    pub fn shown_mut(&mut self) -> &mut Transcript {
-        match self.watch.focused_mut() {
-            Some(w) => &mut w.transcript,
-            None => &mut self.transcript,
-        }
     }
 
     /// What the shown transcript's rows read: its file tools' diffs and the
@@ -225,8 +221,8 @@ impl Live {
     /// `text` went to the daemon. A turn the user sent and then left
     /// running is still news when it ends off screen (the reply is what
     /// they are waiting for); one they watched to its end is in `seen`.
-    pub fn sent(&mut self, text: String) {
-        self.in_flight.push_back(text);
+    pub fn sent(&mut self, pane: PaneId, text: String) {
+        self.in_flight.push_back(pane, text);
     }
 
     /// Worker `handle_id`'s view, just polled, tells the attached
@@ -253,15 +249,76 @@ impl Live {
     /// A refusal: the oldest unconfirmed text was refused (the daemon
     /// handles input in order, and earlier echoes confirmed the rest).
     pub(crate) fn give_back_oldest(&mut self, effects: &mut Vec<Effect>) {
-        if let Some(t) = self.in_flight.pop_front() {
-            effects.push(Effect::Restore(t));
+        if let Some((pane, t)) = self.in_flight.pop_front() {
+            effects.push(Effect::Restore(pane, t));
         }
     }
 
     pub(crate) fn give_back_all(&mut self, effects: &mut Vec<Effect>) {
-        if !self.in_flight.is_empty() {
-            effects.push(Effect::Restore(Vec::from(std::mem::take(&mut self.in_flight)).join("\n")));
+        // One text per pane, in the order sent: each to its own composer.
+        let all = self.in_flight.take();
+        let mut panes: Vec<PaneId> = Vec::new();
+        for (p, _) in &all {
+            if !panes.contains(p) {
+                panes.push(*p);
+            }
         }
+        for p in panes {
+            let texts: Vec<&str> = all.iter().filter(|(q, _)| *q == p).map(|(_, t)| t.as_str()).collect();
+            effects.push(Effect::Restore(p, texts.join("\n")));
+        }
+    }
+}
+
+/// Add splice `sp` to the changes `pending` a list has not synced yet:
+/// one splice that rebuilds what both would (split/architecture.md §3.2).
+/// `sp` was taken after `pending`'s (its `old_len` is `pending`'s
+/// `new_len`): from the first index either changed, the old length
+/// before both, the new length after both.
+pub(crate) fn pend(pending: &mut Option<Splice>, sp: Splice) {
+    *pending = Some(match pending.take() {
+        None => sp,
+        Some(p) => {
+            debug_assert_eq!(p.new_len, sp.old_len, "splices taken out of order");
+            Splice { start: p.start.min(sp.start), old_len: p.old_len, new_len: sp.new_len }
+        }
+    });
+}
+
+/// Input sent and not yet confirmed, oldest first, each with the pane
+/// that sent it (split/architecture.md §6.5): a refusal or a detach gives
+/// it back to that pane's composer, never another's.
+#[derive(Default, Debug)]
+pub(crate) struct InFlight(VecDeque<(PaneId, String)>);
+
+impl InFlight {
+    /// The texts, oldest first.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().map(|(_, t)| t)
+    }
+
+    pub(crate) fn push_back(&mut self, pane: PaneId, text: String) {
+        self.0.push_back((pane, text));
+    }
+
+    pub(crate) fn pop_front(&mut self) -> Option<(PaneId, String)> {
+        self.0.pop_front()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The daemon echoed `text`: the oldest send of it is confirmed.
+    pub(crate) fn confirm(&mut self, text: &str) {
+        if let Some(i) = self.0.iter().position(|(_, s)| s.trim() == text.trim()) {
+            self.0.remove(i);
+        }
+    }
+
+    /// Everything, oldest first; none left.
+    pub(crate) fn take(&mut self) -> Vec<(PaneId, String)> {
+        std::mem::take(&mut self.0).into()
     }
 }
 
@@ -293,12 +350,18 @@ impl Lives {
         self.slots.iter().map(|(_, l)| l)
     }
 
-    /// The one store, for what no attachment names (an error of the
-    /// control connection, a seq-less refusal). Step 2 has exactly one;
-    /// step 3 must decide where such events go, so this says so loudly.
-    pub(crate) fn sole(&self) -> LiveId {
-        debug_assert_eq!(self.slots.len(), 1, "an event that names no attachment, with more than one live store");
-        self.slots[0].0
+    /// Every store's id, oldest first.
+    pub(crate) fn ids(&self) -> Vec<LiveId> {
+        self.slots.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// A second store, as step 3's multi-live activation will make one
+    /// (tests: two sessions attached at once).
+    #[cfg(test)]
+    pub(crate) fn add(&mut self) -> LiveId {
+        let id = LiveId(self.slots.iter().map(|(i, _)| i.0).max().unwrap_or(0) + 1);
+        self.slots.push((id, Live::default()));
+        id
     }
 }
 
@@ -312,5 +375,125 @@ impl std::ops::Index<LiveId> for Lives {
 impl std::ops::IndexMut<LiveId> for Lives {
     fn index_mut(&mut self, id: LiveId) -> &mut Live {
         &mut self.slots.iter_mut().find(|(i, _)| *i == id).expect("a live store that exists").1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A transcript's splice contract (`Transcript::take_splice`): the
+    /// first changed index (clamped to what was clean), the old length and
+    /// the new one.
+    struct Doc {
+        items: Vec<u32>,
+        dirty_from: Option<usize>,
+        clean_len: usize,
+    }
+
+    impl Doc {
+        fn touch(&mut self, ix: usize) {
+            self.dirty_from = Some(self.dirty_from.map_or(ix, |d| d.min(ix)));
+        }
+        fn take_splice(&mut self) -> Option<Splice> {
+            let start = self.dirty_from.take()?;
+            let s = Splice { start: start.min(self.clean_len), old_len: self.clean_len, new_len: self.items.len() };
+            self.clean_len = self.items.len();
+            Some(s)
+        }
+    }
+
+    fn apply(list: &mut Vec<u32>, items: &[u32], sp: &Splice) {
+        assert_eq!(list.len(), sp.old_len, "a list is at its splice's old length");
+        list.truncate(sp.start);
+        list.extend_from_slice(&items[sp.start..sp.new_len]);
+    }
+
+    /// The merged splice rebuilds a list exactly as taking each one would
+    /// (split/architecture.md §7 step 2): a list that syncs every frame
+    /// and one parked for many frames (its splices merged with `pend`)
+    /// end up the same as the transcript, through appends, edits in the
+    /// middle, a trimmed front and a whole replace.
+    #[test]
+    fn a_merged_splice_rebuilds_what_each_would() {
+        let mut seed = 0x5eed_u64;
+        let mut rnd = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _round in 0..200 {
+            let mut doc = Doc { items: Vec::new(), dirty_from: None, clean_len: 0 };
+            let (mut every, mut parked, mut pending) = (Vec::new(), Vec::new(), None);
+            for step in 0..60u32 {
+                match rnd(6) {
+                    0 | 1 => {
+                        doc.items.push(step);
+                        doc.touch(doc.items.len() - 1);
+                    }
+                    2 if !doc.items.is_empty() => {
+                        let i = rnd(doc.items.len() as u64) as usize;
+                        doc.items[i] = 1000 + step;
+                        doc.touch(i);
+                    }
+                    3 if !doc.items.is_empty() => {
+                        let k = rnd(doc.items.len() as u64) as usize;
+                        doc.items.truncate(k);
+                        doc.touch(k);
+                    }
+                    4 => {
+                        doc.items = (0..rnd(8) as u32).map(|i| 5000 + step * 10 + i).collect();
+                        doc.touch(0);
+                    }
+                    _ => {}
+                }
+                if rnd(3) == 0
+                    && let Some(sp) = doc.take_splice()
+                {
+                    apply(&mut every, &doc.items, &sp);
+                    pend(&mut pending, sp);
+                }
+                // The parked list comes back: as `sync_list`, the store's
+                // splice is fanned out first, then its pending applied.
+                if rnd(7) == 0 {
+                    if let Some(sp) = doc.take_splice() {
+                        apply(&mut every, &doc.items, &sp);
+                        pend(&mut pending, sp);
+                    }
+                    if let Some(sp) = pending.take() {
+                        apply(&mut parked, &doc.items, &sp);
+                    }
+                }
+            }
+            if let Some(sp) = doc.take_splice() {
+                apply(&mut every, &doc.items, &sp);
+                pend(&mut pending, sp);
+            }
+            if let Some(sp) = pending.take() {
+                apply(&mut parked, &doc.items, &sp);
+            }
+            assert_eq!(every, doc.items);
+            assert_eq!(parked, doc.items);
+        }
+    }
+
+    /// Input from two panes on one session: a refusal gives the oldest
+    /// back to the pane that sent it; a detach gives each pane its own
+    /// texts, in order, never the other's.
+    #[test]
+    fn input_in_flight_goes_back_to_the_pane_that_sent_it() {
+        let (a, b) = (PaneId::FIRST, PaneId::nth(1));
+        let mut l = Live::default();
+        l.sent(b, "from b".into());
+        l.sent(a, "one from a".into());
+        l.sent(a, "two from a".into());
+        l.sent(b, "again b".into());
+        let mut fx = Vec::new();
+        l.give_back_oldest(&mut fx);
+        assert_eq!(fx, vec![Effect::Restore(b, "from b".into())]);
+        l.in_flight.confirm("two from a");
+        let mut fx = Vec::new();
+        l.give_back_all(&mut fx);
+        assert_eq!(fx, vec![Effect::Restore(a, "one from a".into()), Effect::Restore(b, "again b".into())]);
+        assert!(l.in_flight.is_empty());
     }
 }

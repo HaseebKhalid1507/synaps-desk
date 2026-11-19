@@ -17,6 +17,7 @@ use synaps_client::{
 
 use crate::live::{LiveId, Lives};
 use crate::named::{ResumeRequest, RowAction, parse_rfc3339};
+use crate::pane::PaneId;
 use crate::rail::{Chip, State, is_parked};
 use crate::stats::Stats;
 use crate::tabs::{Place, Tabs};
@@ -115,8 +116,9 @@ pub struct Active {
 /// What the view must do after an event (it owns the client and composer).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
-    /// Input the daemon refused (or never got): put it back in the composer.
-    Restore(String),
+    /// Input the daemon refused (or never got): put it back in the composer
+    /// of the pane that sent it.
+    Restore(PaneId, String),
     /// Input sent to `session` before its tab was left, refused (or never
     /// confirmed) since: back into that tab's draft, which says so.
     Unsent {
@@ -1199,9 +1201,9 @@ impl Model {
             if self.left.len() == LEFT_MAX {
                 self.left.remove(0);
             }
-            self.left.push((a.attach_seq, a.session_id, std::mem::take(&mut l.in_flight)));
+            self.left.push((a.attach_seq, a.session_id, l.in_flight.take().into_iter().map(|(_, t)| t).collect()));
         }
-        l.in_flight.clear();
+        l.in_flight.take();
         l.reattaching = false;
         l.last_error = None;
         let n = &mut self.named;
@@ -1364,9 +1366,10 @@ impl Model {
         }
         // The store that asked for this attachment. Every arm below that
         // acts on a store checks `current(seq)` on it first, so an event of
-        // no store's attachment (a stale one) changes nothing; one that
-        // names no attachment acts on the one store there is.
-        let lid = ev.attach_seq().and_then(|s| self.lives.wanting(s)).unwrap_or_else(|| self.lives.sole());
+        // no store's attachment (a stale one) changes nothing. One that
+        // names no attachment (a control connection's error) acts on the
+        // first store: step 2 has only that one; step 3 routes those.
+        let lid = ev.attach_seq().and_then(|s| self.lives.wanting(s)).unwrap_or(LiveId::FIRST);
         let mut effects = Vec::new();
         let ev = match ev {
             Event::Sessions(mut s) => {
@@ -1474,9 +1477,11 @@ impl Model {
                     self.daemon_gen += 1;
                     // Another daemon process: the worker on screen is read
                     // from 0, even before its session's attach comes back.
-                    let held = self.held_views(lid);
-                    self.lives[lid].watch.hold(held);
-                    self.lives[lid].watch.daemon_changed(*pid, std::time::Instant::now());
+                    for l in self.lives.ids() {
+                        let held = self.held_views(l);
+                        self.lives[l].watch.hold(held);
+                        self.lives[l].watch.daemon_changed(*pid, std::time::Instant::now());
+                    }
                     self.named.daemon = match profile {
                         Some(p) => format!("the daemon's machine (profile {p})"),
                         None => "the daemon's machine".into(),
@@ -1747,9 +1752,7 @@ impl Model {
                 }
                 match &event {
                     SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. } => {
-                        if let Some(i) = self.lives[lid].in_flight.iter().position(|s| s.trim() == t.trim()) {
-                            self.lives[lid].in_flight.remove(i);
-                        }
+                        self.lives[lid].in_flight.confirm(t);
                     }
                     _ => {}
                 }
@@ -2526,7 +2529,7 @@ mod tests {
         // The user's own turn, left running: its end is news.
         attach(&mut m, 3);
         m.apply(history(3, 0, 3));
-        m.sent("do it".into());
+        m.sent(PaneId::FIRST, "do it".into());
         m.apply(session(3, turn(Some("do it"))));
         m.want(LiveId::FIRST, 4);
         m.apply(attached_ev(4, attached("b")));
@@ -2604,20 +2607,23 @@ mod tests {
     fn refused_input_is_given_back() {
         let mut m = Model::new(ConnState::Connecting);
         attach(&mut m, 1);
-        m.sent("hello there".into());
+        m.sent(PaneId::FIRST, "hello there".into());
         let refused = Error::Refused { command: Some("submit".into()), reason: "input owned by #1".into() };
-        assert_eq!(m.apply(Event::Error { attach_seq: Some(1), error: refused }), vec![Effect::Restore("hello there".into())]);
+        assert_eq!(
+            m.apply(Event::Error { attach_seq: Some(1), error: refused }),
+            vec![Effect::Restore(PaneId::FIRST, "hello there".into())]
+        );
         assert!(m.last_error.as_deref().unwrap().contains("input owned by #1"));
         // Accepted: TurnStarted echoes it; a later refusal of something else
         // gives nothing back.
-        m.sent("second".into());
+        m.sent(PaneId::FIRST, "second".into());
         m.apply(session(1, SessionEvent::TurnStarted { turn_baseline: 0, trigger: "user".into(), user_text: Some("second".into()) }));
         let cancel = Error::Refused { command: Some("cancel".into()), reason: "no".into() };
         assert!(m.apply(Event::Error { attach_seq: Some(1), error: cancel }).is_empty());
         // A reload-drain refusal (`Error` frame, command unknown) gives back.
-        m.sent("third".into());
+        m.sent(PaneId::FIRST, "third".into());
         let drain = Error::Refused { command: None, reason: "daemon reloading; retry in a moment".into() };
-        assert_eq!(m.apply(Event::Error { attach_seq: Some(1), error: drain }), vec![Effect::Restore("third".into())]);
+        assert_eq!(m.apply(Event::Error { attach_seq: Some(1), error: drain }), vec![Effect::Restore(PaneId::FIRST, "third".into())]);
     }
 
     /// N5: two sends before the first echo: the echo confirms the one it
@@ -2628,14 +2634,14 @@ mod tests {
         let mut m = Model::new(ConnState::Connecting);
         attach(&mut m, 1);
         for t in ["one", "two", "three"] {
-            m.sent(t.into());
+            m.sent(PaneId::FIRST, t.into());
         }
         m.apply(session(1, SessionEvent::Steered { text: " two\n".into(), delivered: true }));
         let refused = Error::Refused { command: Some("submit".into()), reason: "busy".into() };
-        assert_eq!(m.apply(Event::Error { attach_seq: Some(1), error: refused }), vec![Effect::Restore("one".into())]);
-        m.sent("four".into());
+        assert_eq!(m.apply(Event::Error { attach_seq: Some(1), error: refused }), vec![Effect::Restore(PaneId::FIRST, "one".into())]);
+        m.sent(PaneId::FIRST, "four".into());
         let fx = m.apply(Event::Detached { attach_seq: 1, session_id: None, reason: "gone".into() });
-        assert_eq!(fx, vec![Effect::Restore("three\nfour".into())]);
+        assert_eq!(fx, vec![Effect::Restore(PaneId::FIRST, "three\nfour".into())]);
     }
 
     /// H3: `Detached` leaves no active session (the composer is disabled)
@@ -2649,9 +2655,9 @@ mod tests {
         assert!(m.can_send(), "a stale Detached must not end the new attachment");
         m.apply(session(2, SessionEvent::TurnStarted { turn_baseline: 0, trigger: "user".into(), user_text: None }));
         assert!(m.transcript.busy());
-        m.sent("lost?".into());
+        m.sent(PaneId::FIRST, "lost?".into());
         let fx = m.apply(Event::Detached { attach_seq: 2, session_id: Some("s".into()), reason: "session ended".into() });
-        assert_eq!(fx, vec![Effect::Restore("lost?".into())]);
+        assert_eq!(fx, vec![Effect::Restore(PaneId::FIRST, "lost?".into())]);
         assert!(m.active.is_none() && !m.can_send());
         assert!(!m.transcript.busy());
         // Stale events of the old attachment change nothing.
@@ -3635,13 +3641,13 @@ mod fake_daemon {
         a.send(attached_with_prompt(A, 1));
         pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
         client.on(m.attachment().unwrap()).submit("steer A this way").unwrap();
-        m.sent("steer A this way".into());
+        m.sent(PaneId::FIRST, "steer A this way".into());
         m.tabs.open(B, "b", Place::New);
         let _ = ui_switch(&mut m, &client, B, None);
         a.event(A, 5, json!({"ev": "refused", "client": 2, "command": "submit", "reason": "input is owned by client #1"}));
         let seen = effects(&mut m, &events, 1, |e| matches!(e, Effect::Unsent { .. }));
         assert!(seen.contains(&Effect::Unsent { session: A.into(), text: "steer A this way".into() }), "{seen:?}");
-        assert!(!seen.iter().any(|e| matches!(e, Effect::Restore(_))), "nothing for B's composer: {seen:?}");
+        assert!(!seen.iter().any(|e| matches!(e, Effect::Restore(..))), "nothing for B's composer: {seen:?}");
         let _b = attaches.recv_timeout(T).unwrap();
     }
 
@@ -3657,11 +3663,11 @@ mod fake_daemon {
         pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
         for t in ["one", "two"] {
             client.on(m.attachment().unwrap()).submit(t).unwrap();
-            m.sent(t.into());
+            m.sent(PaneId::FIRST, t.into());
         }
         // "one" is echoed (taken), "two" is not.
         a.event(A, 5, json!({"ev": "turn_started", "user_text": "one"}));
-        pump(&mut m, &events, "the echo", |m| m.in_flight.len() == 1);
+        pump(&mut m, &events, "the echo", |m| m.in_flight.iter().count() == 1);
         m.tabs.open(B, "b", Place::New);
         let _ = ui_switch(&mut m, &client, B, None);
         drop(a);
@@ -3898,5 +3904,68 @@ mod fake_daemon {
             }
             client.shutdown().unwrap();
         }
+    }
+
+    /// Split panes step 2 (architecture §6.4, the highest product risk):
+    /// two sessions attached at once, each in its own store, the client
+    /// holding both attachments. What the desktop sends for a store (an
+    /// Allow, HALT, a steer, a message) goes out on that store's
+    /// attachment only (`client.on(store.attachment())`, the only way the
+    /// desktop may send: `clippy.toml`), never to the other session. The
+    /// same prompt id in both is two cards: card keys are window-wide. A
+    /// refusal on B gives B's text back to the pane that sent it, never
+    /// to A's composer or A's in-flight input.
+    #[test]
+    fn two_stores_answer_halt_steer_and_send_only_their_own_session() {
+        use crate::pane::PaneId;
+        let (client, events, attaches, mut m) = connect("two-stores");
+        let (la, lb) = (LiveId::FIRST, m.lives.add());
+        let (pa, pb) = (PaneId::FIRST, PaneId::nth(1));
+        // A, as a tab switch attaches it; B alongside (step 3's second pane).
+        let sa = client.attach(A, AttachMode::Mirror).unwrap();
+        m.want(la, sa);
+        m.asked_for(la, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        let sb = client.attach_more(B, AttachMode::Mirror).unwrap();
+        m.want(lb, sb);
+        m.asked_for(lb, B);
+        let mut b = attaches.recv_timeout(T).unwrap();
+        b.send(attached_with_prompt(B, 1));
+        pump(&mut m, &events, "both attached", |m| m.lives[la].may_answer(1) && m.lives[lb].may_answer(1));
+        assert!(m.lives[la].is_active(A) && m.lives[lb].is_active(B), "each store has its own session");
+        assert_ne!(m.lives[la].card_key(), m.lives[lb].card_key(), "prompt #1 in each: two cards, two keys");
+        let seq = |m: &Model, l: LiveId| m.lives[l].attachment().expect("attached");
+        // Allow on A's card (on A's connection), HALT B, a message to A, a
+        // steer to B: as `AppView::answer`, `halt` and `submit` send them.
+        let conn_a = m.lives[la].active.as_ref().unwrap().connection;
+        client.on(seq(&m, la)).answer_on(conn_a, 1, Some(CONFIRM_YES.into())).unwrap();
+        m.lives[la].answer_sent(1);
+        client.on(seq(&m, lb)).abort().unwrap();
+        client.on(seq(&m, la)).submit("to A").unwrap();
+        m.lives[la].sent(pa, "to A".into());
+        client.on(seq(&m, lb)).steer("to B").unwrap();
+        m.lives[lb].sent(pb, "to B".into());
+        // A's prompt answered: B's is still waiting, unanswered.
+        assert!(m.lives[la].prompt_answered(1) && !m.lives[lb].prompt_answered(1));
+        assert!(m.lives[lb].may_answer(1));
+        assert_eq!(
+            a.cmds(Duration::from_millis(400)),
+            vec![json!({"cmd": "answer", "prompt_id": 1, "value": "y"}), json!({"cmd": "submit", "text": "to A", "attachments": []})],
+            "A's connection: A's Allow and A's message only"
+        );
+        assert_eq!(
+            b.cmds(Duration::from_millis(400)),
+            vec![json!({"cmd": "cancel"}), json!({"cmd": "steer", "text": "to B"})],
+            "B's connection: B's HALT and B's steer only"
+        );
+        // B refuses its steer: back to the pane that sent it.
+        b.event(B, 5, json!({"ev": "refused", "client": 2, "command": "steer", "reason": "input is owned by client #1"}));
+        let seen = effects(&mut m, &events, 1, |e| matches!(e, Effect::Restore(..)));
+        let restored: Vec<_> = seen.iter().filter(|e| matches!(e, Effect::Restore(..))).collect();
+        assert_eq!(restored, vec![&Effect::Restore(pb, "to B".into())], "{seen:?}");
+        assert_eq!(m.lives[la].in_flight.iter().collect::<Vec<_>>(), vec!["to A"], "A's message is still A's, in flight");
+        assert!(m.lives[lb].in_flight.is_empty());
+        client.shutdown().unwrap();
     }
 }

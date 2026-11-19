@@ -758,7 +758,7 @@ impl AppView {
         self.smenu = None;
         self.wmenu = None;
         if self.model.lives[self.panes.cur.live].cancels.disarm() {
-            self.cancel_tick = None;
+            self.panes.cur.cancel_tick = None;
         }
     }
 
@@ -885,7 +885,7 @@ impl AppView {
                     _ => self.panes.cur.watch_note = Some(format!("{handle} not cancelled: the connection thread has stopped").into()),
                 }
                 self.close_menu();
-                self.cancel_tick = None;
+                self.panes.cur.cancel_tick = None;
             }
             Press::Armed => {
                 self.arm_cancel_tick(cx);
@@ -899,10 +899,10 @@ impl AppView {
     /// The armed cancel's end draws (once, when it runs out).
     fn arm_cancel_tick(&mut self, cx: &mut Context<Self>) {
         let Some(until) = self.model.lives[self.panes.cur.live].cancels.armed_until() else { return };
-        self.cancel_tick = Some(cx.spawn(async move |this, cx| {
+        self.panes.cur.cancel_tick = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(until.saturating_duration_since(Instant::now())).await;
             let _ = this.update(cx, |v, cx| {
-                v.cancel_tick = None;
+                v.panes.cur.cancel_tick = None;
                 if v.model.lives[v.panes.cur.live].cancels.expire(Instant::now()) {
                     v.refresh_menu();
                     cx.notify();

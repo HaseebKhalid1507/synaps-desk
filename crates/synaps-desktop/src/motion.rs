@@ -1037,6 +1037,10 @@ pub(crate) struct Motion {
     /// Each pane's column's motion ([`ColumnFx`]): split panes step 1 has
     /// one pane; the old methods ([`Motion::born`]...) are its delegates.
     cols: [ColumnFx; crate::pane::PANES_MAX],
+    /// The window chrome's (the rail, the top bar): its needs and star
+    /// tags, the favourites chevron, the chip and NEEDS counts' rolls
+    /// (Shady #30 M2). No pane's; [`Motion::chrome`].
+    chrome: ColumnFx,
 }
 
 /// A count or a line as last drawn ([`Motion::roll`]).
@@ -1105,7 +1109,7 @@ pub(crate) fn pass(fx: &Rc<Motion>, p: f32, mark: Hsla, ground: Hsla) -> AnyElem
 /// number): its words, and everything beside it, stay where they are at
 /// rest, laid out by the same element. `grow`: a live line, which rolls
 /// whole at its row's width.
-pub(crate) fn rolled(fx: &Motion, key: u64, text: SharedString, up: bool, grow: bool, make: impl Fn(SharedString) -> Div) -> AnyElement {
+pub(crate) fn rolled(fx: PaneFx<'_>, key: u64, text: SharedString, up: bool, grow: bool, make: impl Fn(SharedString) -> Div) -> AnyElement {
     let Some((old, x, up)) = fx.roll(key, &text, up) else { return make(text).into_any_element() };
     let cells = if grow { None } else { changed_cells(&old, &text) };
     let tagged = |sel: String, t: SharedString| div().debug_selector(move || sel).child(make(t)).into_any_element();
@@ -1289,7 +1293,7 @@ impl Element for Roll {
 }
 
 /// [`rolled`] for a count: up when it grew.
-pub(crate) fn roll_count(fx: &Motion, key: u64, n: usize, text: SharedString, make: impl Fn(SharedString) -> Div) -> AnyElement {
+pub(crate) fn roll_count(fx: PaneFx<'_>, key: u64, n: usize, text: SharedString, make: impl Fn(SharedString) -> Div) -> AnyElement {
     let up = fx.roll_was(key).is_none_or(|was| n as u64 >= was);
     fx.roll_saw(key, n as u64);
     rolled(fx, key, text, up, false, make)
@@ -1332,6 +1336,7 @@ impl Motion {
     pub(crate) fn new(epoch: Instant) -> Self {
         Motion {
             cols: std::array::from_fn(|_| ColumnFx::default()),
+            chrome: ColumnFx::default(),
             level: Cell::new(Level::Full),
             ink: Cell::new(Hsla::default()),
             ambient: Cell::new(true),
@@ -1515,7 +1520,7 @@ impl Motion {
         self.cells.borrow_mut().retain(|_, c| alive(c.1));
         self.hovers.borrow_mut().retain(|_, h| alive(h.1));
         self.glows.borrow_mut().retain(|_, s| alive(s.frame));
-        for col in &self.cols {
+        for col in self.cols.iter().chain([&self.chrome]) {
             col.prune(frame, now);
         }
     }
@@ -2429,6 +2434,15 @@ impl Motion {
         PaneFx { fx: self, col: &self.cols[pane.index()] }
     }
 
+    /// The window chrome's motion (the rail, the top bar: Shady #30 M2):
+    /// its own column, which no pane's switch clears. It is rescoped with
+    /// the session on screen, as it was when it was pane 0's (one pane:
+    /// nothing changes); whether it should keep its memory across a
+    /// switch is step 3's call.
+    pub(crate) fn chrome(&self) -> PaneFx<'_> {
+        PaneFx { fx: self, col: &self.chrome }
+    }
+
     /// [`PaneFx::rescope`] in the first pane's column.
     pub(crate) fn rescope(&self, session: u64, column: u64) {
         self.col(crate::pane::PaneId::FIRST).rescope(session, column)
@@ -2477,10 +2491,13 @@ impl Motion {
         self.col(crate::pane::PaneId::FIRST).grow_of(key)
     }
 
-    /// [`PaneFx::rolling_in`] in the first pane's column.
+    /// [`PaneFx::rolling_in`] in the first pane's column and the chrome's
+    /// (tests: what rolls in the window).
     #[cfg(test)]
     pub(crate) fn rolling_in(&self, space: Option<u64>) -> Vec<u64> {
-        self.col(crate::pane::PaneId::FIRST).rolling_in(space)
+        let mut v = self.col(crate::pane::PaneId::FIRST).rolling_in(space);
+        v.extend(self.chrome().rolling_in(space));
+        v
     }
 
     /// [`PaneFx::roll`] in the first pane's column.
@@ -2518,16 +2535,20 @@ impl Motion {
         self.col(crate::pane::PaneId::FIRST).turn(key, open)
     }
 
-    /// [`PaneFx::fresh`] in the first pane's column.
+    /// [`PaneFx::fresh`] in the first pane's column and the chrome's.
     #[cfg(test)]
     pub(crate) fn fresh(&self) -> Vec<(Tag, u64)> {
-        self.col(crate::pane::PaneId::FIRST).fresh()
+        let mut v = self.col(crate::pane::PaneId::FIRST).fresh();
+        v.extend(self.chrome().fresh());
+        v
     }
 
-    /// [`PaneFx::changed_since`] in the first pane's column.
+    /// [`PaneFx::changed_since`] in the first pane's column and the chrome's.
     #[cfg(test)]
     pub(crate) fn changed_since(&self, t: Instant) -> Vec<(Tag, u64)> {
-        self.col(crate::pane::PaneId::FIRST).changed_since(t)
+        let mut v = self.col(crate::pane::PaneId::FIRST).changed_since(t);
+        v.extend(self.chrome().changed_since(t));
+        v
     }
 }
 

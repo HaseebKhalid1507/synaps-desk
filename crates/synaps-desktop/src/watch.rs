@@ -505,6 +505,10 @@ impl Watch {
         self.workers.get(handle_id)
     }
 
+    pub fn worker_mut(&mut self, handle_id: &str) -> Option<&mut Worker> {
+        self.workers.get_mut(handle_id)
+    }
+
     /// What it keeps, roughly (bytes).
     pub fn bytes(&self) -> usize {
         self.workers.values().map(Worker::bytes).sum()

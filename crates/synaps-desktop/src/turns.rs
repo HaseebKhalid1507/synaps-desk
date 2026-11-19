@@ -1776,7 +1776,7 @@ impl AppView {
             .child(glyph::life(life, glyph::life_ink(life, p.card_d, p)))
             .child(
                 // `N tool calls` rolls while the run grows (polish.md P5).
-                motion::roll_count(fx, motion::key(motion::ROLL_CALLS, id), s.tools, calls.into(), |t| {
+                motion::roll_count(self.fx.col(self.panes.cur.id), motion::key(motion::ROLL_CALLS, id), s.tools, calls.into(), |t| {
                     div()
                         .flex_none()
                         .font_family(fonts::SANS)
