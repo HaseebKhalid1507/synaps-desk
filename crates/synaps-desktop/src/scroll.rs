@@ -152,6 +152,10 @@ struct Inner {
     coasts: bool,
     coast: Option<Coast>,
     last: Option<Instant>,
+    /// The user moved the list (a wheel or a finger over it, its glide or
+    /// coast, a jump) since [`Scroller::touched`] last asked: what tells a
+    /// scroll from rows changing height (Shady #23 r3 H2, M1).
+    touched: bool,
 }
 
 /// The transcript's scroller: shared by the wheel's listener and the frame.
@@ -188,7 +192,18 @@ impl Scroller {
     /// A jump, a drag, a page, another list: everything in flight stops.
     pub(crate) fn cancel(&self) {
         let mut s = self.0.borrow_mut();
-        *s = Inner { coasts: s.coasts, ..Inner::default() };
+        *s = Inner { coasts: s.coasts, touched: s.touched, ..Inner::default() };
+    }
+
+    /// The user's input reached the list (any scroll over it: one the list
+    /// takes itself too, a touchscreen's or below Full).
+    pub(crate) fn touch(&self) {
+        self.0.borrow_mut().touched = true;
+    }
+
+    /// Whether the user moved the list since the last ask (and forget it).
+    pub(crate) fn touched(&self) -> bool {
+        std::mem::take(&mut self.0.borrow_mut().touched)
     }
 
     /// A wheel event over the list, at `now`: whether it was taken
@@ -275,6 +290,7 @@ impl Scroller {
     pub(crate) fn jump(&self, by: f32, page: bool, view: f32, now: Instant) -> f32 {
         self.cancel();
         let mut s = self.0.borrow_mut();
+        s.touched = true;
         let cut = if by.abs() > PRE_CUT * view { by - by.signum() * view } else { 0. };
         s.glide.x = -(by - cut);
         s.response = if page { SNAP_RESPONSE } else { GLIDE_RESPONSE };
@@ -328,13 +344,14 @@ impl Scroller {
                 step.by = (room.max - 2. - room.offset).max(0.);
             }
         }
+        s.touched |= step.by != 0. || step.follow;
         step
     }
 }
 
 impl Inner {
     fn stop(&mut self) {
-        *self = Inner { phased: self.phased, coasts: self.coasts, ..Inner::default() };
+        *self = Inner { phased: self.phased, coasts: self.coasts, touched: self.touched, ..Inner::default() };
     }
 
     /// The gesture's speed (px/ms) from its last three packets, if it may
@@ -418,10 +435,11 @@ pub(crate) fn owner(scroller: Scroller, fx: Rc<Motion>) -> impl IntoElement {
         move |_, hitbox, window, _| {
             let view = window.current_view();
             window.on_mouse_event(move |ev: &ScrollEvent, phase, window, cx| {
-                if phase != DispatchPhase::Capture
-                    || !hitbox.should_handle_scroll(window)
-                    || crate::motion::Level::current(cx) != crate::motion::Level::Full
-                {
+                if phase != DispatchPhase::Capture || !hitbox.should_handle_scroll(window) {
+                    return;
+                }
+                scroller.touch();
+                if crate::motion::Level::current(cx) != crate::motion::Level::Full {
                     return;
                 }
                 if scroller.wheel(ev, fx.clock()) {
