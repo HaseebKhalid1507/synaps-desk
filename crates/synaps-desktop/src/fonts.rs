@@ -125,12 +125,9 @@ pub mod label {
     pub const STEER_WORKER: &str = "S T E E R   W O R K E R";
     pub const READ_ONLY: &str = "R E A D   O N L Y";
     pub const MAIN: &str = "M A I N";
-    pub const SECRET: &str = "S E C R E T   R E Q U E S T E D";
+    // Q2's, kept while its tests stand: Cards D's card speaks Sans (C2).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const AUTHORIZE: &str = "A U T H O R I Z E";
-    pub const DENY: &str = "D E N Y";
-    pub const ALLOW: &str = "A L L O W";
-    pub const OPEN: &str = "O P E N";
-    pub const SUBMIT: &str = "S U B M I T";
     pub const CANCEL: &str = "C A N C E L";
     pub const ACCENT: &str = "A C C E N T";
     pub const CUSTOM: &str = "C U S T O M";

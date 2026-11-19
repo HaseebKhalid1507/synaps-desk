@@ -606,7 +606,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // `SYNAPS_BENCH_LIFE=N` (Q3 evidence, polish.md §3 Life): after
                 // N s, a scripted turn on the bench's session, the scene a
                 // capture records: a bash call runs (the spinner, its clock,
-                // the composer's sweep), workers spawn, run (their tool counts
+                // its orbit, the composer's), workers spawn, run (their tool counts
                 // and steps roll) and end (the check writes on), a call fails
                 // (the cross), the fan-out widens past the tray's lines (`+N
                 // more` rolls), a prompt comes (NEEDS YOU's count rolls), a
@@ -678,6 +678,252 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         v.sync_list();
                         v.list.scroll_to_end();
                     });
+                    // `SYNAPS_BENCH_STATES=1` (H2 evidence, indicators/proposal.md
+                    // §6): instead, one run with a call in each of the
+                    // indicator's states (waiting, queued, running, streaming,
+                    // done, failed, at its limit, denied, cancelled), held 5 s,
+                    // then the live ones change (the quarter-turn), and the turn ends.
+                    if std::env::var("SYNAPS_BENCH_STATES").is_ok() {
+                        let _ = upd(cx, &|v, _| v.slow_daemon = true);
+                        let delta = |id: &str, text: &str| {
+                            json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result_delta", "tool_id": id, "delta": text}})
+                        };
+                        let queued = |id: &str| json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_queued", "tool_id": id}});
+                        let started = |id: &str| json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_started", "tool_id": id}});
+                        let cmd = |c: &str| json!({"command": c});
+                        apply(
+                            cx,
+                            vec![
+                                call("w0", "bash", cmd("rm -rf target/tmp")),
+                                call("q1", "bash", cmd("cargo build -p relay")),
+                                queued("q1"),
+                                call("r2", "bash", cmd("cargo test -p relay --test refresh_race")),
+                                call("s3", "bash", cmd("cargo test -p session")),
+                                delta("s3", "running 6 tests\n"),
+                                call("d4", "read", json!({"path": "crates/relay/src/session.rs"})),
+                                result("d4", "1  use std::sync::Arc;\n2  use tokio::sync::Mutex;"),
+                                call("f5", "bash", cmd("cargo clippy -p relay")),
+                                result("f5", "Tool execution failed: Command failed (exit 101):\nerror: unused variable `token`"),
+                                call("l6", "bash", cmd("cat logs/relay.log")),
+                                result("l6", "relay up\nrelay up\n[output truncated at 30000 bytes]"),
+                                call("x7", "edit", json!({"path": "crates/relay/src/upstream.rs"})),
+                                result("x7", "Tool call denied: guard"),
+                                call("c8", "bash", cmd("cargo bench -p relay")),
+                                result("c8", "Canceled by user"),
+                                call("k9", "bash", cmd("cargo run -p relay -- --watch")),
+                            ],
+                        );
+                        let _ = upd(cx, &|v, _| {
+                            if let Ok(request) = serde_json::from_value(json!({
+                                "id": 7, "kind": "confirm", "title": "Run a command?", "prompt": "Tool: bash\nInput that will run:\n$ rm -rf target/tmp"
+                            })) {
+                                v.model.transcript.apply(&SessionEvent::Prompt { request });
+                            }
+                            v.sync_list();
+                            v.list.scroll_to_end();
+                        });
+                        for k in 0..10 {
+                            sleep(0.5).await;
+                            apply(cx, vec![delta("s3", &format!("test refresh_{k} ... ok\n"))]);
+                        }
+                        // The live ones change: queued starts, running ends,
+                        // one is cancelled, streaming fails, the prompt is answered.
+                        apply(
+                            cx,
+                            vec![started("q1"), result("r2", "running 4 tests\ntest result: ok. 4 passed; 0 failed"), result("k9", "Canceled by user")],
+                        );
+                        let _ = upd(cx, &|v, cx| {
+                            // Not `sync_list` here: the frame resolves the card
+                            // first (it folds into its row), as a daemon's event.
+                            v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
+                            cx.notify();
+                        });
+                        // `SYNAPS_BENCH_HELD=1` (Shady #23 r4 H1): the room the
+                        // card left held at the list's end, the composer
+                        // grows three lines (a steer), then a new call at
+                        // the run's end streams until it has used the room
+                        // up, and on (the list follows; #23 r6's h5 film).
+                        // `SYNAPS_BENCH_HELD=still`: the composer stays.
+                        // `SYNAPS_BENCH_HELD=own` (Shady #23 r6 H1 (a)): the
+                        // composer stays, and the run's own running call
+                        // (`s3`) streams on instead, each line splicing its
+                        // row (the list's top row in a short window).
+                        // Marks on stderr: `HELD <what> <s>`.
+                        if std::env::var("SYNAPS_BENCH_HELD").is_ok() {
+                            let t0 = Instant::now();
+                            let mark = |what: &str| eprintln!("HELD {what} {:.3}", t0.elapsed().as_secs_f64());
+                            sleep(1.5).await;
+                            mark("composer");
+                            let how = std::env::var("SYNAPS_BENCH_HELD").unwrap_or_default();
+                            let grow = how != "still" && how != "own";
+                            let _ = view.update_in(cx, |v, window, cx| {
+                                if !grow {
+                                    return;
+                                }
+                                v.composer.update(cx, |s, cx| s.set_value("steer: and the relay too\nkeep the old token\nthen run it again", window, cx))
+                            });
+                            sleep(1.5).await;
+                            mark("stream");
+                            let _ = upd(cx, &|v, _| {
+                                let t = v.list.logical_scroll_top();
+                                let id = v.model.shown().items().iter().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == "s3")).map(|i| i.id);
+                                let s3 = v.disp.iter().position(|d| Some(d.id) == id && d.kind == crate::turns::Kind::Work);
+                                eprintln!("HELD top {} +{:.0}, s3's row {s3:?}", t.item_ix, f32::from(t.offset_in_item));
+                            });
+                            // A new call at the run's end (or `s3`): its
+                            // output grows into the room, then past it.
+                            let into = if how == "own" { "s3" } else { "h0" };
+                            if into == "h0" {
+                                apply(cx, vec![call("h0", "bash", cmd("cargo test -p relay --test held")), started("h0")]);
+                            }
+                            for k in 0..48 {
+                                sleep(0.25).await;
+                                apply(cx, vec![delta(into, &format!("test held_{k} ... ok\n"))]);
+                            }
+                            mark("done");
+                        }
+                        sleep(1.5).await;
+                        apply(cx, vec![result("s3", "Tool execution failed: Command failed (exit 1):\ntest refresh_10 ... FAILED")]);
+                        sleep(1.5).await;
+                        apply(cx, vec![result("q1", "Finished `dev` profile"), result("w0", "")]);
+                        sleep(2.5).await;
+                        // The turn ends: the run folds. Then 9.5 s for a
+                        // capture's clicks (the run unfolds, a call opens).
+                        let _ = upd(cx, &|v, _| {
+                            v.model.transcript.apply(&SessionEvent::Idle);
+                            v.sync_list();
+                        });
+                        if std::env::var("SYNAPS_BENCH_FOLDS").is_ok() {
+                            // `SYNAPS_BENCH_FOLDS=1` (the design gate of #23,
+                            // N1, N3, S1; Shady #23 r3 H2): the folds a
+                            // click makes, as its listener makes them
+                            // (`toggle_run`, `toggle`), each mark on stderr
+                            // (`FOLDS <what> <s>`, the bench's clock):
+                            // - unfolded at the end; its header a third of
+                            //   the way down the view, folded there;
+                            // - unfolded there, no scroll (the cascade alone);
+                            // - at the end, folded there (its header holds);
+                            // - unfolded as the list is sent to its end (the
+                            //   rows reveal under the view), folded there;
+                            // - unfolded, at the end: the last call's body
+                            //   opened (the list shows its first lines) and
+                            //   closed;
+                            // - a new turn's call streams into the held room
+                            //   while the reader scrolls up 0.5 px a frame
+                            //   (a touchpad) for 3 s, and after.
+                            let t0 = Instant::now();
+                            let mark = |what: &str| eprintln!("FOLDS {what} {:.3}", t0.elapsed().as_secs_f64());
+                            let run = |v: &AppView| v.disp.iter().rev().find(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id);
+                            let last = |v: &AppView| v.disp.iter().rev().find(|d| d.kind == crate::turns::Kind::Work).map(|d| d.id);
+                            let flip = |v: &mut AppView| {
+                                if let Some(id) = run(v) {
+                                    v.toggle_run(id);
+                                }
+                            };
+                            sleep(2.5).await;
+                            mark("unfold-end");
+                            let _ = upd(cx, &|v, _| flip(v));
+                            sleep(2.).await;
+                            let _ = upd(cx, &|v, _| {
+                                if let Some(ix) = run(v).and_then(|id| v.disp.iter().position(|d| d.id == id)) {
+                                    let third = f32::from(v.list.viewport_bounds().size.height) / 3.;
+                                    v.list.scroll_to(gpui::ListOffset { item_ix: ix, offset_in_item: gpui::px(0.) });
+                                    v.list.scroll_by(gpui::px(-third));
+                                }
+                            });
+                            sleep(1.5).await;
+                            mark("fold-mid");
+                            let _ = upd(cx, &|v, _| flip(v));
+                            sleep(2.5).await;
+                            mark("unfold-mid");
+                            let _ = upd(cx, &|v, _| flip(v));
+                            sleep(2.).await;
+                            let _ = upd(cx, &|v, _| v.list.scroll_to_end());
+                            sleep(1.).await;
+                            mark("fold-end");
+                            let _ = upd(cx, &|v, _| flip(v));
+                            sleep(2.5).await;
+                            mark("unfold-to-end");
+                            let _ = upd(cx, &|v, _| {
+                                flip(v);
+                                v.list.scroll_to_end();
+                            });
+                            sleep(2.).await;
+                            mark("fold-rows-under");
+                            let _ = upd(cx, &|v, _| flip(v));
+                            sleep(2.5).await;
+                            mark("unfold-for-body");
+                            let _ = upd(cx, &|v, _| flip(v));
+                            sleep(1.5).await;
+                            let _ = upd(cx, &|v, _| v.list.scroll_to_end());
+                            sleep(1.).await;
+                            mark("body-open");
+                            let _ = upd(cx, &|v, _| {
+                                if let Some(id) = last(v) {
+                                    v.toggle(id);
+                                }
+                            });
+                            sleep(2.).await;
+                            mark("body-close");
+                            let _ = upd(cx, &|v, _| {
+                                if let Some(id) = last(v) {
+                                    v.toggle(id);
+                                }
+                            });
+                            sleep(2.).await;
+                            mark("turn-stream");
+                            let _ = upd(cx, &|v, _| {
+                                let t = &mut v.model.transcript;
+                                t.apply(&SessionEvent::TurnStarted {
+                                    turn_baseline: 14,
+                                    trigger: "user".into(),
+                                    user_text: Some("Tail the log.".into()),
+                                });
+                                t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                                v.sync_list();
+                            });
+                            apply(cx, vec![call("z9", "bash", cmd("tail -f logs/relay.log")), started("z9")]);
+                            sleep(1.).await;
+                            mark("slow-scroll");
+                            for k in 0..430 {
+                                let _ = upd(cx, &|v, _| {
+                                    v.scroller.touch();
+                                    v.list.scroll_by(gpui::px(-0.5));
+                                });
+                                if k % 40 == 0 {
+                                    apply(cx, vec![delta("z9", &format!("relay: refresh {k} ok\n"))]);
+                                }
+                                sleep(0.007).await;
+                            }
+                            mark("scroll-stopped");
+                            for k in 0..8 {
+                                apply(cx, vec![delta("z9", &format!("relay: refresh {} ok\n", 500 + k))]);
+                                sleep(0.3).await;
+                            }
+                            mark("done");
+                            println!("{out}");
+                            let _ = cx.update(|_, cx| cx.quit());
+                            return;
+                        } else {
+                            sleep(9.5).await;
+                        }
+                        // A new turn, detached with its call still running:
+                        // as last seen.
+                        let _ = upd(cx, &|v, _| {
+                            let t = &mut v.model.transcript;
+                            t.apply(&SessionEvent::TurnStarted { turn_baseline: 14, trigger: "user".into(), user_text: Some("Tail the log.".into()) });
+                            t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                            v.sync_list();
+                            v.list.scroll_to_end();
+                        });
+                        apply(cx, vec![call("z9", "bash", cmd("tail -f logs/relay.log"))]);
+                        sleep(1.5).await;
+                        let _ = upd(cx, &|v, _| v.model.active = None);
+                        sleep(2.5).await;
+                        println!("{out}");
+                        let _ = cx.update(|_, cx| cx.quit());
+                        return;
+                    }
                     apply(cx, vec![call("b1", "bash", json!({"command": "cargo test -p relay --test refresh_race"}))]);
                     sleep(2.5).await;
                     // Each worker's clock is its time since it spawned, as a
@@ -749,10 +995,12 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     sleep(2.0).await;
                     let _ = upd(cx, &|v, _| v.toggle_fav_session("20261117-090001-l001"));
                     sleep(1.5).await;
-                    // The prompt answered: RUNNING again (the composer's sweep).
-                    let _ = upd(cx, &|v, _| {
+                    // The prompt answered: RUNNING again (the composer's orbit).
+                    let _ = upd(cx, &|v, cx| {
+                        // Not `sync_list` here: the frame resolves the card
+                        // first (it folds into its row), as a daemon's event.
                         v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
-                        v.sync_list();
+                        cx.notify();
                     });
                     sleep(1.5).await;
                     // Every worker done (their checks write on).
@@ -775,9 +1023,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         v.apply_batch(vec![Event::Sessions(metas)], cx);
                     });
                     sleep(2.0).await;
-                    // The turn ends from RUNNING, the sweep on screen: READY
+                    // The turn ends from RUNNING, the orbit on screen: READY
                     // hands the floor back (Handoff in down the bar, the
-                    // sweep's one last pass across the top, polish.md P3).
+                    // settle pass across the top, polish.md P3).
                     let _ = upd(cx, &|v, _| {
                         v.model.transcript.apply(&SessionEvent::Idle);
                         v.sync_list();
@@ -1147,14 +1395,14 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out["load_5x5_30s"]["workers_running"] =
                     json!(view.update(cx, |v, _| v.model.stats.subagents.running_count()).unwrap_or(0));
                 out["load_5x5_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
-                out["load_5x5_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                out["load_5x5_30s"]["indicators"] = json!(view.update(cx, |v, _| v.fx.lattice_count()).unwrap_or(0));
                 // Gate 5's sample after the 5 × 5, where main's run ends
                 // (its `mem_end`): the cases after it are Q3's own.
                 out["mem_after_load_5x5"] = mem::sample();
                 // Q3 (polish.md §6 gate 4, the worst case): the same, and the
-                // shown session's turn runs: the composer sweeps (the one
-                // sweep left, P2) over the 25 spinners. Gate 3's prompt is
-                // answered first (NEEDS YOU outranks RUNNING: no sweep).
+                // shown session's turn runs: the composer's orbit (Cards D
+                // retired P2's sweep) over the 25 spinners. Gate 3's prompt is
+                // answered first (NEEDS YOU outranks RUNNING: no orbit).
                 let _ = upd(cx, &|v, _| {
                     let t = &mut v.model.transcript;
                     t.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
@@ -1168,7 +1416,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 sleep(30.0).await;
                 out["load_5x5_sweep_30s"] = stats(cx, t0, Instant::now(), c0, f0);
                 out["load_5x5_sweep_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
-                out["load_5x5_sweep_30s"]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                out["load_5x5_sweep_30s"]["indicators"] = json!(view.update(cx, |v, _| v.fx.lattice_count()).unwrap_or(0));
                 out["load_5x5_sweep_30s"]["state"] = json!(view.update(cx, |v, _| {
                     v.model.tabs.current().map(|t| format!("{:?}", v.tab_state(t))).unwrap_or_default()
                 }).unwrap_or_default());
@@ -1177,7 +1425,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // tool every 1.5 s, staggered (one every 0.3 s): its tool
                 // count and step change (and roll). Then the same with the
                 // step held, only the count changing. Then the first again
-                // under Reduced (Shady #17 R3-M1): no sweep, no spinners, the
+                // under Reduced (Shady #17 R3-M1): no orbit, no spinners, the
                 // same data frames; Full minus it is what the motion costs.
                 let steps = ["reading src/relay.rs", "grep -n rotate src", "reading src/session.rs", "cargo check -p relay", "reading src/store.rs"];
                 let mut tools = [2u64; 5];
@@ -1210,7 +1458,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     }
                     out[case] = stats(cx, t0, Instant::now(), c0, f0);
                     out[case]["changes"] = json!(changes);
-                    out[case]["sweeps"] = json!(view.update(cx, |v, _| v.fx.sweep_count()).unwrap_or(0));
+                    out[case]["indicators"] = json!(view.update(cx, |v, _| v.fx.lattice_count()).unwrap_or(0));
                     out[case]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
                 }
                 out["mem_end"] = mem::sample();
