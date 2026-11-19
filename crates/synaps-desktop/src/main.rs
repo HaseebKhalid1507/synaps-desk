@@ -40,8 +40,6 @@ mod files;
 mod fit;
 mod fonts;
 mod glyph;
-#[cfg(test)]
-mod held_tests;
 mod lattice;
 mod mem;
 mod menu;
@@ -64,6 +62,8 @@ mod style_tests;
 mod subagents;
 mod tabs;
 mod tabstrip;
+#[cfg(test)]
+mod test_kit;
 mod theme;
 mod times;
 mod tray;
