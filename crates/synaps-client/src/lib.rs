@@ -57,7 +57,12 @@
 //! // The saved sessions on disk, only from a daemon whose `Welcome.features`
 //! // lists `saved_sessions` (`Status::Connected { features }`); otherwise
 //! // `Err(RequestError::Unsupported)` and nothing is sent.
-//! if client.supports(FEATURE_SAVED_SESSIONS) {
+//! // A daemon that lists `session_page` serves them as pages of saved
+//! // `SessionMeta` rows (`lifecycle: "saved"`): ask again with the reply's
+//! // `next` as `before` until it is `None`.
+//! if client.supports(FEATURE_SESSION_PAGE) {
+//!     let _req = client.catalog_page(None, 50, false)?;  // -> Event::CatalogPage / CatalogPageFailed { req, .. }
+//! } else if client.supports(FEATURE_SAVED_SESSIONS) {
 //!     client.saved_sessions(true, 200)?;  // -> Event::SavedSessions / SavedSessionsFailed
 //! }
 //! // Resume one by its exact journal id (every v3 daemon: a create with
@@ -106,8 +111,8 @@ pub use client::{
 pub use conn::{Endpoint, Identity, Incompatible, InvalidName};
 pub use history::HistoryUpdate;
 pub use protocol::{
-    AttachMode, Attached, ClientInput, ClientKind, ContinueInfo, FEATURE_SAVED_SESSIONS, HistoryMode, InvalidSessionName, MISSING_CWD,
-    Rejected, RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, WatchEvent, WatchPage,
-    validate_session_name,
+    AttachMode, Attached, CATALOG_PAGE_MAX, CatalogCursor, ClientInput, ClientKind, ContinueInfo, FEATURE_SAVED_SESSIONS,
+    FEATURE_SESSION_PAGE, HistoryMode, InvalidSessionName, MISSING_CWD, Rejected, RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX,
+    SavedSession, SessionEvent, SessionMeta, WatchEvent, WatchPage, validate_session_name,
 };
 pub use transcript::{Transcript, TranscriptError};

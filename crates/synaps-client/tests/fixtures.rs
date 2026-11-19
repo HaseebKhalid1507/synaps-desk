@@ -735,6 +735,69 @@ fn saved_session_lists_decode() {
     assert!(matches!(decode_frame(r#"{"type":"saved_session_list","truncated":"no"}"#).unwrap(), DaemonFrame::Malformed { .. }));
 }
 
+/// Saved pages (`catalog_page`, SynapsCLI watch-sessions PR 4): the
+/// reply and the error reply exactly as PR 4's `wire.rs` test pins them, a
+/// bare reply, and a page whose bad rows are skipped and counted while the
+/// rest of the page is kept.
+#[test]
+fn catalog_pages_decode() {
+    let frames: Vec<DaemonFrame> = fixture("catalog_page.ndjson").lines().map(|l| decode_frame(l).unwrap()).collect();
+    let DaemonFrame::CatalogPage { req: 7, sessions, next, rejected: 0, error: None } = &frames[0] else { panic!("{:?}", frames[0]) };
+    assert_eq!(sessions.len(), 1);
+    let axel = &sessions[0];
+    assert!(axel.is_saved() && !axel.is_parked());
+    assert_eq!((axel.name.as_deref(), axel.messages, axel.updated_at.as_deref()), (Some("axel"), 40, Some("2026-11-12T04:00:00Z")));
+    assert_eq!(next, &Some(CatalogCursor(serde_json::json!({"updated_at": "2026-11-12T04:00:00Z", "id": "20261110-202033-64fb"}))));
+    let v = axel.to_saved();
+    assert_eq!(
+        (v.id.as_str(), v.name.as_deref(), v.title.as_deref()),
+        ("20261110-202033-64fb", Some("axel"), Some("wire the desktop app"))
+    );
+    assert_eq!((v.cwd.as_deref(), v.message_count, v.live), (Some("/home/u/Projects/x"), Some(40), false));
+    assert_eq!((v.model.as_deref(), v.updated_at.as_deref()), (Some("claude-opus-4-6"), Some("2026-11-12T04:00:00Z")));
+
+    assert!(
+        matches!(&frames[1], DaemonFrame::CatalogPage { req: 3, sessions, next: None, error: Some(e), .. } if sessions.is_empty() && e == "busy")
+    );
+    assert!(
+        matches!(&frames[2], DaemonFrame::CatalogPage { req: 9, sessions, next: None, rejected: 0, error: None } if sessions.is_empty())
+    );
+
+    let DaemonFrame::CatalogPage { req: 8, sessions, next: None, rejected, error: None } = &frames[3] else { panic!("{:?}", frames[3]) };
+    assert_eq!(*rejected, 3, "a number id, a string, a row without an id");
+    assert_eq!(sessions.len(), 1, "the page is kept");
+    assert_eq!(sessions[0].to_saved().title, None, "an empty title is no title");
+    // A held row is not saved.
+    let held: SessionMeta = serde_json::from_value(serde_json::json!({"id": "a", "lifecycle": "parked"})).unwrap();
+    assert!(!held.is_saved() && held.updated_at.is_none());
+    assert!(matches!(decode_frame(r#"{"type":"catalog_page","req":"x"}"#).unwrap(), DaemonFrame::Malformed { .. }));
+
+    // Review F2: a `next` of another shape is still a cursor, sent back as is.
+    let DaemonFrame::CatalogPage { req: 11, next: Some(c), error: None, .. } = &frames[4] else { panic!("{:?}", frames[4]) };
+    assert_eq!(c.0, "v2:opaque-cursor/2026-11-12");
+    let again = encode_frame(&ClientFrame::CatalogPage { req: 12, before: Some(c.clone()), limit: 50, named_only: false }).unwrap();
+    assert_eq!(again, "{\"type\":\"catalog_page\",\"req\":12,\"before\":\"v2:opaque-cursor/2026-11-12\",\"limit\":50}\n");
+}
+
+/// `CatalogPage` requests, byte for byte as PR 4's `wire.rs` pins them.
+#[test]
+fn catalog_page_requests_encode_as_the_daemon_expects() {
+    let first = encode_frame(&ClientFrame::CatalogPage { req: 7, before: None, limit: 50, named_only: false }).unwrap();
+    assert_eq!(first, "{\"type\":\"catalog_page\",\"req\":7,\"limit\":50}\n");
+    let before = Some(CatalogCursor(serde_json::json!({"id": "20261110-202033-64fb", "updated_at": "2026-11-12T04:00:00Z"})));
+    let later = encode_frame(&ClientFrame::CatalogPage { req: 7, before, limit: 50, named_only: false }).unwrap();
+    // The cursor is opaque JSON, relayed as a value. Its keys are given here
+    // in sorted order, so the bytes are the same with serde_json's
+    // `preserve_order` on (as `test --workspace` builds it: gpui's
+    // http client turns it on) or off (`test -p synaps-client`).
+    assert_eq!(
+        later,
+        "{\"type\":\"catalog_page\",\"req\":7,\"before\":{\"id\":\"20261110-202033-64fb\",\"updated_at\":\"2026-11-12T04:00:00Z\"},\"limit\":50}\n"
+    );
+    let named = encode_frame(&ClientFrame::CatalogPage { req: 1, before: None, limit: 200, named_only: true }).unwrap();
+    assert_eq!(named, "{\"type\":\"catalog_page\",\"req\":1,\"limit\":200,\"named_only\":true}\n");
+}
+
 /// `Renamed` / `RenameFailed` (`wire.rs`): every refusal, `taken_by`,
 /// `current_name`, and a reason from a newer daemon (`Failed`).
 #[test]

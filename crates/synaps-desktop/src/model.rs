@@ -11,8 +11,8 @@ use std::task::{Context, Poll};
 
 use synaps_client::protocol::SessionMeta;
 use synaps_client::{
-    AttachMode, ClientInput, Error, Event, Expect, FEATURE_SAVED_SESSIONS, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent,
-    Status, Transcript, validate_session_name,
+    AttachMode, CATALOG_PAGE_MAX, CatalogCursor, ClientInput, Error, Event, Expect, FEATURE_SAVED_SESSIONS, FEATURE_SESSION_PAGE,
+    RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, Status, Transcript, validate_session_name,
 };
 
 use crate::named::{ResumeRequest, RowAction, parse_rfc3339};
@@ -24,6 +24,10 @@ use crate::watch::{Candidate, Watch};
 /// HISTORY's newest unnamed sessions, asked for at startup; up to
 /// [`SAVED_SESSIONS_MAX`] (the wire's cap) once OLDER opens or find is used.
 pub const SAVED_RECENT: u32 = 200;
+
+/// Failed page fetches asked again (one per `Sessions` poll) on one
+/// connection.
+pub const PAGE_RETRIES: u32 = 3;
 
 /// Most events the pump applies before it yields to the UI (a frame can run
 /// between batches; a backlog never becomes one unbounded `Vec`).
@@ -127,6 +131,14 @@ pub enum Effect {
         named_only: bool,
         limit: u32,
     },
+    /// `Client::catalog_page(before, limit, named_only)`, then
+    /// [`Model::page_sent`] with its `req`; if it cannot be sent, tell
+    /// [`Model::saved_failed`].
+    CatalogPage {
+        before: Option<CatalogCursor>,
+        limit: u32,
+        named_only: bool,
+    },
     /// Attach to a live session, then [`Model::attaching`]. `fallback`: a
     /// named session's journal, resumed if it ended meanwhile. `open`: an
     /// Open by name. `place`: the tab it opens in (its own if it has one).
@@ -204,12 +216,66 @@ pub enum SavedAsk {
     Recent(u32),
 }
 
+/// A [`SavedAsk`] served by `catalog_page` (a daemon with
+/// `session_page`): pages of saved rows, collected until the ask's limit or
+/// the end, then landed as a `saved_sessions` reply would be.
+#[derive(Debug)]
+struct PageFetch {
+    named_only: bool,
+    /// The ask's limit: past it, the list is `truncated`.
+    want: usize,
+    rows: Vec<SavedSession>,
+    rejected: usize,
+    /// The page on its way, once sent: a reply with another `req` (asked on
+    /// a connection since dropped, or by another fetch) is not this one's.
+    req: Option<u64>,
+    /// Pages asked for, and the `before` of the last: the loop's own bound
+    /// (a daemon that kept sending `next` with no rows kept, or the same
+    /// `next`, would otherwise be asked forever).
+    pages: usize,
+    before: Option<CatalogCursor>,
+}
+
+impl PageFetch {
+    fn new(named_only: bool, want: usize) -> Self {
+        PageFetch { named_only, want, rows: Vec::new(), rejected: 0, req: None, pages: 0, before: None }
+    }
+
+    fn ask(&mut self, before: Option<CatalogCursor>) -> Effect {
+        let limit = (self.want - self.rows.len()).min(CATALOG_PAGE_MAX as usize) as u32;
+        self.req = None;
+        self.pages += 1;
+        self.before = before.clone();
+        Effect::CatalogPage { before, limit, named_only: self.named_only }
+    }
+
+    /// Ask on from `next`? Not past the ask's rows, nor past `want / 200 +
+    /// 2` pages, nor from the cursor just sent.
+    fn more(&self, next: &CatalogCursor) -> bool {
+        self.rows.len() < self.want && self.pages < self.want / CATALOG_PAGE_MAX as usize + 2 && self.before.as_ref() != Some(next)
+    }
+}
+
 /// What the rail knows of saved sessions, and the names and resumes.
 #[derive(Debug, Default)]
 pub struct Named {
-    /// The daemon lists `saved_sessions` (else: no HISTORY; a name is
-    /// resolved by the daemon).
+    /// The daemon lists `session_page` or `saved_sessions` (else: no
+    /// HISTORY; a name is resolved by the daemon).
     pub saved_supported: bool,
+    /// The daemon lists `session_page`: the saved lists are read from
+    /// `catalog_page` (else `saved_sessions`).
+    pub pages: bool,
+    /// The ask in flight, served by pages.
+    page: Option<PageFetch>,
+    /// The `(id, journal_id)` set of the last polled `Sessions` on this
+    /// connection (`None` until the first, the `Welcome`'s, which is not
+    /// news to the first page asked on connecting). Not `sessions`: an
+    /// attached swap writes its journal there at once, so the poll after a
+    /// `/clear` would agree with it and ask nothing.
+    polled: Option<HashSet<(String, String)>>,
+    /// Failed page fetches asked again on a later poll, this connection
+    /// (at most [`PAGE_RETRIES`]).
+    retries: u32,
     /// The named saved sessions (`named_only`, up to the wire's cap).
     pub saved: Vec<SavedSession>,
     /// The daemon has more named ones than that.
@@ -220,8 +286,12 @@ pub struct Named {
     pub recent_truncated: bool,
     /// The newest list has landed at least once (HISTORY can be drawn).
     pub recent_loaded: bool,
-    /// The cap has been asked for (OLDER opened, or find used).
+    /// The cap has been asked for (OLDER opened, or find used); dropped
+    /// when neither is so any more, and on connecting (set again from
+    /// [`Named::deep_wanted`]), so refreshes go back to the newest page.
     pub deep: bool,
+    /// OLDER is open or find has text: the cap is what is wanted.
+    pub deep_wanted: bool,
     /// The named list must be asked for too if the newest list is cut:
     /// not listed on this connection yet, a rename, an Open by name.
     named_stale: bool,
@@ -509,6 +579,16 @@ impl Model {
             n.saved_in_flight = Some(ask);
             n.asks += 1;
             n.asked = n.asks;
+            if n.pages {
+                let (named_only, want) = match ask {
+                    SavedAsk::Named => (true, SAVED_SESSIONS_MAX),
+                    SavedAsk::Recent(limit) => (false, limit),
+                };
+                let mut f = PageFetch::new(named_only, want.max(1) as usize);
+                effects.push(f.ask(None));
+                n.page = Some(f);
+                return;
+            }
             effects.push(match ask {
                 SavedAsk::Named => Effect::ListSaved { named_only: true, limit: SAVED_SESSIONS_MAX },
                 SavedAsk::Recent(limit) => Effect::ListSaved { named_only: false, limit },
@@ -530,9 +610,19 @@ impl Model {
         effects
     }
 
-    /// `--offline`: the synthetic transport answers `saved_sessions` itself.
+    /// OLDER is open or find has text (`wanted`), or neither is any more:
+    /// then later refreshes ask for the newest page only.
+    pub fn deep_wanted(&mut self, wanted: bool) {
+        self.named.deep_wanted = wanted;
+        if !wanted {
+            self.named.deep = false;
+        }
+    }
+
+    /// `--offline`: the synthetic transport answers `catalog_page` itself.
     pub fn offer_saved(&mut self) -> Vec<Effect> {
         self.named.saved_supported = true;
+        self.named.pages = true;
         self.named.named_stale = true;
         let mut effects = Vec::new();
         self.refresh_saved(&mut effects);
@@ -547,8 +637,101 @@ impl Model {
         effects
     }
 
+    /// A saved list landed (a `saved_sessions` reply, or a page fetch's
+    /// rows): it answers the ask in flight.
+    fn saved_landed(&mut self, sessions: Vec<SavedSession>, truncated: bool, rejected: usize, effects: &mut Vec<Effect>) {
+        let n = &mut self.named;
+        let asked = n.saved_in_flight.take();
+        n.saved_note = (rejected > 0).then(|| format!("{rejected} saved sessions could not be read (skipped)."));
+        if asked.is_some() {
+            n.saved_failed = false;
+        }
+        match asked {
+            Some(SavedAsk::Named) => {
+                n.named_listed = n.asked;
+                n.saved = sessions;
+                n.saved_truncated = truncated;
+                n.named_stale = false;
+            }
+            Some(SavedAsk::Recent(_)) => {
+                n.recent_listed = n.asked;
+                n.recent = sessions;
+                n.recent_truncated = truncated;
+                n.recent_loaded = true;
+                if !truncated {
+                    // Every saved session, the named ones too.
+                    n.saved.clear();
+                    n.saved_truncated = false;
+                    n.named_stale = false;
+                } else if n.named_stale && !n.saved_queue.contains(&SavedAsk::Named) {
+                    n.saved_queue.push_back(SavedAsk::Named);
+                }
+            }
+            // Asked on a connection since dropped.
+            None => {}
+        }
+        self.pump_saved(effects);
+        // The refresh is done: an Open by name waiting for it, and
+        // UNREAD marks of sessions in no list.
+        if !self.saved_listing() {
+            self.resolve_open(effects);
+            self.prune_unread();
+        }
+    }
+
+    /// Pages: nothing pushes saved-list changes (no `session_watch`), so
+    /// any change in who is held since the last poll (a session ended,
+    /// resumed, compacted into a successor, swapped by `/clear`) asks for a
+    /// fresh first page, which replaces the list.
+    fn poll_held(&mut self, s: &[SessionMeta], effects: &mut Vec<Effect>) {
+        let now: HashSet<(String, String)> = s.iter().map(|s| (s.id.clone(), s.journal_id.clone())).collect();
+        let changed = self.named.pages && self.named.polled.as_ref().is_some_and(|p| *p != now);
+        self.named.polled = Some(now);
+        if changed {
+            self.named.named_stale = true;
+            self.refresh_saved(effects);
+        } else if self.named.pages && self.named.saved_failed && !self.saved_listing() && self.named.retries < PAGE_RETRIES {
+            // A failed page is now a normal reply: ask again on the next
+            // poll, a few times (a session that ended meanwhile is in
+            // neither list until then).
+            self.named.retries += 1;
+            self.named.named_stale = true;
+            self.refresh_saved(effects);
+        }
+    }
+
+    /// The `Effect::CatalogPage` just handled went out as `req`.
+    pub fn page_sent(&mut self, req: u64) {
+        if let Some(f) = &mut self.named.page {
+            f.req = Some(req);
+        }
+    }
+
+    /// A page of saved rows: collect it, then ask for the next or land the
+    /// list. A reply that is not the page on its way is dropped.
+    fn on_page(&mut self, req: u64, sessions: Vec<SessionMeta>, next: Option<CatalogCursor>, rejected: usize, effects: &mut Vec<Effect>) {
+        let n = &mut self.named;
+        let Some(f) = n.page.as_mut().filter(|f| f.req == Some(req)) else {
+            log::debug!(target: "synaps_desktop::saved", "catalog page {req}: not the one on its way (dropped)");
+            return;
+        };
+        // Held sessions come from `Sessions`; a page never lists them.
+        f.rows.extend(sessions.iter().filter(|s| s.is_saved()).map(SessionMeta::to_saved));
+        f.rejected += rejected;
+        match next {
+            Some(c) if f.more(&c) => effects.push(f.ask(Some(c))),
+            next => {
+                let Some(mut f) = n.page.take() else { return };
+                let truncated = next.is_some() || f.rows.len() > f.want;
+                f.rows.truncate(f.want);
+                self.saved_landed(f.rows, truncated, f.rejected, effects);
+            }
+        }
+    }
+
     fn on_saved_failed(&mut self, reason: &str, effects: &mut Vec<Effect>) {
         let n = &mut self.named;
+        n.page = None;
         n.saved_in_flight = None;
         n.saved_queue.clear();
         n.saved_note = Some(format!("Saved sessions unavailable: {reason}"));
@@ -1335,6 +1518,7 @@ impl Model {
                 self.lists += 1;
                 self.sessions_listed = true;
                 sort_sessions(&mut s);
+                self.poll_held(&s, &mut effects);
                 // The poll of an idle daemon: nothing to rebuild or draw.
                 if s == self.sessions {
                     log::debug!(target: "synaps_desktop::sessions", "list {}: unchanged", self.lists);
@@ -1429,6 +1613,7 @@ impl Model {
                 // A reply in flight died with the old connection.
                 self.named.saved_in_flight = None;
                 self.named.saved_queue.clear();
+                self.named.page = None;
                 if let Status::Connected { features, profile, daemon_version, pid, .. } = &s {
                     self.daemon = Some(Daemon { version: daemon_version.clone(), profile: profile.clone(), pid: *pid });
                     self.daemon_gen += 1;
@@ -1441,7 +1626,13 @@ impl Model {
                         Some(p) => format!("the daemon's machine (profile {p})"),
                         None => "the daemon's machine".into(),
                     };
-                    self.named.saved_supported = features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
+                    // Pages when the daemon has them; `saved_sessions` (#408,
+                    // on local builds only) until it does not.
+                    self.named.pages = features.iter().any(|f| f == FEATURE_SESSION_PAGE);
+                    self.named.saved_supported = self.named.pages || features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
+                    self.named.polled = None;
+                    self.named.retries = 0;
+                    self.named.deep = self.named.deep_wanted;
                     self.named.named_stale = true;
                     if self.named.saved_supported {
                         self.refresh_saved(&mut effects);
@@ -1500,7 +1691,7 @@ impl Model {
                 // A row leaving OPEN (closed, or evicted to history).
                 let left = self.sessions.iter().any(|o| !s.iter().any(|n| n.id == o.id));
                 self.sessions = s;
-                if left {
+                if left && !self.named.pages {
                     self.refresh_saved(&mut effects);
                 }
                 if !self.named.saved_supported {
@@ -1508,42 +1699,15 @@ impl Model {
                 }
             }
             Event::SavedSessions { sessions, truncated, rejected } => {
-                let n = &mut self.named;
-                let asked = n.saved_in_flight.take();
-                n.saved_note = (rejected > 0).then(|| format!("{rejected} saved sessions could not be read (skipped)."));
-                if asked.is_some() {
-                    n.saved_failed = false;
+                // A page fetch waits for pages, not for this.
+                if self.named.page.is_none() {
+                    self.saved_landed(sessions, truncated, rejected, &mut effects);
                 }
-                match asked {
-                    Some(SavedAsk::Named) => {
-                        n.named_listed = n.asked;
-                        n.saved = sessions;
-                        n.saved_truncated = truncated;
-                        n.named_stale = false;
-                    }
-                    Some(SavedAsk::Recent(_)) => {
-                        n.recent_listed = n.asked;
-                        n.recent = sessions;
-                        n.recent_truncated = truncated;
-                        n.recent_loaded = true;
-                        if !truncated {
-                            // Every saved session, the named ones too.
-                            n.saved.clear();
-                            n.saved_truncated = false;
-                            n.named_stale = false;
-                        } else if n.named_stale && !n.saved_queue.contains(&SavedAsk::Named) {
-                            n.saved_queue.push_back(SavedAsk::Named);
-                        }
-                    }
-                    // Asked on a connection since dropped.
-                    None => {}
-                }
-                self.pump_saved(&mut effects);
-                // The refresh is done: an Open by name waiting for it, and
-                // UNREAD marks of sessions in no list.
-                if !self.saved_listing() {
-                    self.resolve_open(&mut effects);
-                    self.prune_unread();
+            }
+            Event::CatalogPage { req, sessions, next, rejected } => self.on_page(req, sessions, next, rejected, &mut effects),
+            Event::CatalogPageFailed { req, reason } => {
+                if self.named.page.as_ref().is_some_and(|f| f.req == Some(req)) {
+                    self.on_saved_failed(&reason, &mut effects);
                 }
             }
             Event::SavedSessionsFailed { reason } => self.on_saved_failed(&reason, &mut effects),
@@ -1828,6 +1992,8 @@ impl Model {
     fn clear_saved(&mut self) {
         let n = &mut self.named;
         n.saved_supported = false;
+        n.pages = false;
+        n.page = None;
         n.saved_in_flight = None;
         n.saved_queue.clear();
         n.saved.clear();

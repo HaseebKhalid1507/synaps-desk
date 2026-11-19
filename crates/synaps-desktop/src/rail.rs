@@ -1787,6 +1787,332 @@ mod tests {
         assert_eq!(rows("ffff"), ["empty Nothing matches"]);
     }
 
+    /// A `catalog_page` reply as the client decodes it: saved rows
+    /// (`SessionMeta`, `lifecycle: saved`), and `next` if any.
+    fn page(req: u64, rows: Value, next: Option<&Value>) -> Event {
+        let frame = json!({"type": "catalog_page", "req": req, "sessions": rows, "next": next.map(|r| json!({"updated_at": r["updated_at"], "id": r["id"]}))});
+        match synaps_client::protocol::decode_frame(&frame.to_string()).unwrap() {
+            synaps_client::protocol::DaemonFrame::CatalogPage { req, sessions, next, rejected, .. } => {
+                Event::CatalogPage { req, sessions, next, rejected }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `n` unnamed saved rows, a minute apart from `from` seconds ago.
+    fn saved_rows(n: usize, from: i64) -> Vec<Value> {
+        (0..n)
+            .map(|k| {
+                json!({"id": format!("20261101-0000{k:03}-s{k:03}"), "title": format!("saved {k}"), "lifecycle": "saved",
+                            "updated_at": at(from + 60 * k as i64)})
+            })
+            .collect()
+    }
+
+    fn history_titles(m: &Model) -> Vec<String> {
+        history(m).iter().filter_map(|(_, v, _)| v.title.clone().or_else(|| v.name.clone())).collect()
+    }
+
+    /// With `session_page` HISTORY comes from catalog pages (not
+    /// `saved_sessions`, though the daemon lists that too); with only
+    /// `saved_sessions` from that, as before; with neither there is none.
+    #[test]
+    fn history_comes_from_pages_when_the_daemon_has_them() {
+        let mut m = Model::new(ConnState::Connecting);
+        let fx = m.apply(connected(&["saved_sessions", "session_page"]));
+        assert_eq!(fx, [crate::model::Effect::CatalogPage { before: None, limit: 200, named_only: false }]);
+        m.page_sent(4);
+        // A `saved_sessions` reply is not what this fetch waits for.
+        m.apply(Event::SavedSessions {
+            sessions: saved(json!([{"id": "x", "title": "legacy", "live": false}])),
+            truncated: false,
+            rejected: 0,
+        });
+        assert!(!m.named.recent_loaded);
+        let rows = json!([
+            {"id": "c1", "journal_id": "j1", "title": "first", "lifecycle": "saved", "updated_at": at(60), "cwd": "/w", "messages": 3},
+            {"id": "c2", "title": "held", "lifecycle": "parked", "updated_at": at(70)},
+            {"id": "c3", "name": "kite", "lifecycle": "saved", "updated_at": at(80)},
+            {"id": 9, "lifecycle": "saved"},
+        ]);
+        let fx = m.apply(page(4, rows, None));
+        assert!(fx.is_empty(), "the end: no more pages, no named list: {fx:?}");
+        assert!(m.named.recent_loaded && !m.named.recent_truncated);
+        assert_eq!(history_titles(&m), ["first", "kite"], "a held row is not history; the bad row is skipped");
+        assert_eq!(m.named.recent[0].id, "j1", "a row is its journal");
+        assert_eq!(m.named.saved_note.as_deref(), Some("1 saved sessions could not be read (skipped)."));
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
+        assert_eq!(shape(&rail)[..3], ["[Open 0]", "empty No open sessions", "[History 2]"]);
+
+        // Only `saved_sessions`: asked as before.
+        let mut m = Model::new(ConnState::Connecting);
+        let fx = m.apply(connected(&["saved_sessions"]));
+        assert_eq!(fx, [crate::model::Effect::ListSaved { named_only: false, limit: 200 }]);
+        m.apply(Event::SavedSessions {
+            sessions: saved(json!([{"id": "x", "title": "legacy", "live": false, "updated_at": at(60)}])),
+            truncated: false,
+            rejected: 0,
+        });
+        assert_eq!(history_titles(&m), ["legacy"]);
+        // A page reply to a daemon without pages: nobody asked.
+        m.apply(page(1, json!(saved_rows(1, 60)), None));
+        assert_eq!(history_titles(&m), ["legacy"]);
+
+        // Neither: nothing asked, nothing listed.
+        let mut m = Model::new(ConnState::Connecting);
+        assert!(m.apply(connected(&["owned_sessions"])).is_empty());
+        m.apply(page(1, json!(saved_rows(1, 60)), None));
+        assert!(history(&m).is_empty());
+        let rail = build(&m, &View::default(), NOW);
+        assert_eq!(shape(&rail), ["[Open 0]", "empty No open sessions", "[History —]", "note This daemon does not"]);
+    }
+
+    /// A named session older than the first page still shows: the cut page
+    /// asks for the named ones (`named_only`), paged to the end.
+    #[test]
+    fn a_named_session_older_than_the_first_page_shows() {
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        m.page_sent(1);
+        let recent = saved_rows(200, 60);
+        let fx = m.apply(page(1, json!(recent), recent.last()));
+        assert_eq!(fx, [crate::model::Effect::CatalogPage { before: None, limit: 200, named_only: true }], "cut: the named ones");
+        assert!(m.named.recent_truncated);
+        m.page_sent(2);
+        let old =
+            json!({"id": "j-old", "name": "bebop", "title": "Bebop: audio routing", "lifecycle": "saved", "updated_at": at(90 * 86_400)});
+        m.apply(page(2, json!([old]), None));
+        assert!(!m.saved_listing());
+        assert!(history_titles(&m).contains(&"Bebop: audio routing".to_string()));
+        let rail = build(&m, &view(Bucket::DEFAULT_OPEN | Bucket::Older.bit()), NOW);
+        assert_eq!(shape(&rail)[2..5], ["[History 201+]", "- Named 1", "  bebop"], "in NAMED, by its name");
+
+        // OLDER opened: the newest 1,000, five pages of 200 on the cursor.
+        let fx = m.want_deep();
+        assert_eq!(fx, [crate::model::Effect::CatalogPage { before: None, limit: 200, named_only: false }]);
+        let all = saved_rows(1000, 60);
+        let mut fx = fx;
+        for (k, chunk) in all.chunks(200).enumerate() {
+            assert!(matches!(fx.as_slice(), [crate::model::Effect::CatalogPage { limit: 200, named_only: false, .. }]), "{fx:?}");
+            let crate::model::Effect::CatalogPage { before, .. } = &fx[0] else { unreachable!() };
+            assert_eq!(
+                before.as_ref().map(|c| c.0["id"].as_str().unwrap().to_string()),
+                (k > 0).then(|| all[k * 200 - 1]["id"].as_str().unwrap().to_string())
+            );
+            m.page_sent(10 + k as u64);
+            fx = m.apply(page(10 + k as u64, json!(chunk), all.get(k * 200 + 199)));
+        }
+        assert!(fx.is_empty() || matches!(fx.as_slice(), [crate::model::Effect::CatalogPage { named_only: true, .. }]), "{fx:?}");
+        assert_eq!(m.named.recent.len(), 1000);
+        assert!(m.named.recent_truncated, "the last page had a next");
+    }
+
+    /// Review F2: no `session_watch`, so nothing pushes saved changes. A
+    /// `Sessions` whose `(id, journal_id)` set changed asks for a fresh
+    /// first page (so does every reconnect), and its result replaces the
+    /// list: an older page's rows are never kept.
+    #[test]
+    fn a_change_in_the_held_set_asks_for_a_fresh_first_page() {
+        use crate::model::Effect;
+        let first = || vec![Effect::CatalogPage { before: None, limit: 200, named_only: false }];
+        let mut m = Model::new(ConnState::Connecting);
+        assert_eq!(m.apply(connected(&["session_page"])), first(), "connecting asks");
+        m.page_sent(1);
+        let a = json!({"id": "a", "journal_id": "ja", "lifecycle": "live"});
+        assert!(m.apply(Event::Sessions(metas(json!([a])))).is_empty(), "the Welcome's list is what that page saw");
+        m.apply(page(1, json!([{"id": "old", "title": "ended before", "lifecycle": "saved", "updated_at": at(60)}]), None));
+        assert_eq!(history_titles(&m), ["ended before"]);
+        assert!(m.apply(Event::Sessions(metas(json!([a])))).is_empty(), "the same set: nothing asked");
+        let busy = json!({"id": "a", "journal_id": "ja", "lifecycle": "live", "busy": true, "messages": 9});
+        assert!(m.apply(Event::Sessions(metas(json!([busy])))).is_empty(), "other fields are not the set");
+        // A compaction: same id, a new journal.
+        let compacted = json!({"id": "a", "journal_id": "ja2", "lifecycle": "live"});
+        assert_eq!(m.apply(Event::Sessions(metas(json!([compacted])))), first());
+        m.page_sent(2);
+        // While that page loads, `a` ends: another fresh page, after it.
+        assert!(m.apply(Event::Sessions(metas(json!([])))).is_empty(), "one at a time");
+        let fx = m.apply(page(2, json!([{"id": "ja", "title": "the predecessor", "lifecycle": "saved", "updated_at": at(30)}]), None));
+        assert_eq!(history_titles(&m), ["the predecessor"], "replaced, not merged");
+        assert_eq!(fx, first(), "the queued fresh page goes out");
+        m.page_sent(3);
+        m.apply(page(3, json!([{"id": "ja2", "title": "a, ended", "lifecycle": "saved", "updated_at": at(5)}]), None));
+        assert_eq!(history_titles(&m), ["a, ended"]);
+        // A new session held: the set changed again.
+        let b = json!({"id": "b", "journal_id": "jb", "lifecycle": "live"});
+        assert_eq!(m.apply(Event::Sessions(metas(json!([b])))), first());
+        // Every reconnect asks, whatever the set.
+        m.apply(Event::Status(Status::Reconnecting { why: "x".into() }));
+        assert_eq!(m.apply(connected(&["session_page"])), first());
+        // `saved_sessions` only: as before, a row leaving OPEN asks, a new one does not.
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["saved_sessions"]));
+        m.apply(Event::SavedSessions { sessions: Vec::new(), truncated: false, rejected: 0 });
+        m.apply(Event::Sessions(metas(json!([a]))));
+        assert!(m.apply(Event::Sessions(metas(json!([a, b])))).is_empty());
+        assert!(matches!(m.apply(Event::Sessions(metas(json!([b])))).as_slice(), [Effect::ListSaved { named_only: false, .. }]));
+    }
+
+    /// Review F1: `/clear` (or `/resume`) in the attached session. Its
+    /// `Conversation` writes the new journal into the session list at once;
+    /// the poll that then agrees is still a change from the last poll, so
+    /// the conversation just left is asked for.
+    #[test]
+    fn a_swap_in_the_attached_session_asks_on_the_poll_that_agrees() {
+        use crate::model::Effect;
+        let first = || vec![Effect::CatalogPage { before: None, limit: 200, named_only: false }];
+        let s = |journal: &str| json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "t", "journal_id": journal});
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        m.page_sent(1);
+        m.apply(Event::Sessions(metas(json!([s("c1")]))));
+        m.apply(page(1, json!([]), None));
+        m.want(5);
+        m.apply(Event::Attached {
+            attach_seq: 5,
+            attached: attached_frame(s("c1"), None),
+            mode: synaps_client::AttachMode::Mirror,
+            reconnect: false,
+        });
+        assert!(!m.saved_listing() && m.named.recent_loaded);
+        assert!(m.apply(swapped(5, "y", None)).is_empty());
+        assert_eq!(m.sessions[0].journal_id, "y", "held at once");
+        assert_eq!(m.apply(Event::Sessions(metas(json!([s("y")])))), first(), "the poll that agrees still asks");
+    }
+
+    /// Review F3: OLDER closed with find empty drops back to the newest
+    /// page for later refreshes; so does connecting, unless OLDER is open
+    /// or find has text.
+    #[test]
+    fn deep_ends_when_older_closes_and_on_connecting() {
+        use crate::model::Effect;
+        let rows = saved_rows(201, 60);
+        // A refresh's first page, full and cut: deep asks on; shallow lands
+        // (and, cut, asks for the named list).
+        fn deep_after(m: &mut Model, req: u64, rows: &[Value]) -> bool {
+            m.page_sent(req);
+            let fx = m.apply(page(req, json!(rows[..200]), Some(&rows[199])));
+            match fx.as_slice() {
+                [Effect::CatalogPage { before: Some(_), named_only: false, .. }] => true,
+                [Effect::CatalogPage { before: None, named_only: true, .. }] => false,
+                other => panic!("{other:?}"),
+            }
+        }
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        assert!(!deep_after(&mut m, 1, &rows));
+        m.deep_wanted(true);
+        m.want_deep();
+        assert!(m.named.deep);
+        m.deep_wanted(false);
+        assert!(!m.named.deep, "OLDER closed, find empty");
+        // Deep, then a reconnect with neither OLDER nor find: shallow.
+        m.want_deep();
+        m.apply(Event::Status(Status::Reconnecting { why: "x".into() }));
+        m.apply(connected(&["session_page"]));
+        assert!(!deep_after(&mut m, 2, &rows), "connecting drops deep");
+        // OLDER open across a reconnect: deep from the start.
+        m.deep_wanted(true);
+        m.apply(Event::Status(Status::Reconnecting { why: "x".into() }));
+        m.apply(connected(&["session_page"]));
+        assert!(deep_after(&mut m, 3, &rows), "OLDER open: the cap");
+    }
+
+    /// Review F4: a failed page is asked again on the next poll, at most
+    /// three times a connection; a reconnect starts the count again.
+    #[test]
+    fn a_failed_page_is_retried_on_later_polls_three_times() {
+        use crate::model::Effect;
+        let first = || vec![Effect::CatalogPage { before: None, limit: 200, named_only: false }];
+        let a = json!([{"id": "a", "journal_id": "ja", "lifecycle": "live"}]);
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        m.page_sent(1);
+        m.apply(Event::Sessions(metas(a.clone())));
+        let mut req = 1;
+        let fail = |m: &mut Model, req: u64| {
+            m.apply(Event::CatalogPageFailed { req, reason: "busy".into() });
+            assert!(m.named.saved_failed);
+        };
+        for k in 0..3 {
+            fail(&mut m, req);
+            assert_eq!(m.apply(Event::Sessions(metas(a.clone()))), first(), "retry {k}");
+            req += 1;
+            m.page_sent(req);
+        }
+        fail(&mut m, req);
+        assert!(m.apply(Event::Sessions(metas(a.clone()))).is_empty(), "three a connection");
+        m.apply(Event::Status(Status::Reconnecting { why: "x".into() }));
+        assert_eq!(m.apply(connected(&["session_page"])), first());
+        m.page_sent(10);
+        m.apply(Event::Sessions(metas(a.clone())));
+        fail(&mut m, 10);
+        assert_eq!(m.apply(Event::Sessions(metas(a))), first(), "counted again after a reconnect");
+    }
+
+    /// Review F6: the page loop's own bound. A daemon that sends `next`
+    /// with no rows kept is asked `want / 200 + 2` pages, then the list
+    /// lands cut; one that sends back the `before` it was given, once.
+    #[test]
+    fn the_page_loop_ends_on_its_own() {
+        use crate::model::Effect;
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        let held = json!([{"id": "h", "lifecycle": "live", "updated_at": at(5)}]);
+        let mut asked = 1;
+        let mut req = 1;
+        loop {
+            m.page_sent(req);
+            let fx = m.apply(page(req, held.clone(), Some(&json!({"updated_at": at(req as i64), "id": format!("c{req}")}))));
+            req += 1;
+            match fx.as_slice() {
+                [Effect::CatalogPage { named_only: false, before: Some(_), .. }] => asked += 1,
+                _ => break,
+            }
+            assert!(asked < 10, "asked forever");
+        }
+        assert_eq!(asked, 200 / 200 + 2);
+        assert!(m.named.recent_loaded && m.named.recent_truncated);
+        // The same cursor back: one page, then it lands.
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        m.want_deep();
+        m.page_sent(1);
+        let rows = saved_rows(3, 60);
+        let fx = m.apply(page(1, json!(rows), Some(&rows[2])));
+        assert!(matches!(fx.as_slice(), [Effect::CatalogPage { before: Some(_), .. }]), "{fx:?}");
+        m.page_sent(2);
+        m.apply(page(2, json!([]), Some(&rows[2])));
+        assert!(m.named.recent_loaded && m.named.recent_truncated, "landed, cut");
+        assert_eq!(m.named.recent.len(), 3);
+    }
+
+    /// A page reply after a reconnect, to a `req` asked on the old
+    /// connection, is dropped: only the page asked since lands.
+    #[test]
+    fn a_stale_page_after_a_reconnect_is_ignored() {
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&["session_page"]));
+        m.page_sent(1);
+        m.apply(Event::Status(Status::Reconnecting { why: "daemon closed the connection".into() }));
+        let fx = m.apply(connected(&["session_page"]));
+        assert_eq!(fx, [crate::model::Effect::CatalogPage { before: None, limit: 200, named_only: false }]);
+        m.page_sent(2);
+        let stale = json!([{"id": "old", "title": "stale", "lifecycle": "saved", "updated_at": at(60)}]);
+        assert!(m.apply(page(1, stale, None)).is_empty());
+        assert!(!m.named.recent_loaded && m.saved_listing(), "still waiting for req 2");
+        // A failure for the old req is not this fetch's either.
+        m.apply(Event::CatalogPageFailed { req: 1, reason: "the connection dropped".into() });
+        assert!(!m.named.saved_failed && m.saved_listing());
+        m.apply(page(2, json!([{"id": "new", "title": "fresh", "lifecycle": "saved", "updated_at": at(60)}]), None));
+        assert_eq!(history_titles(&m), ["fresh"]);
+        // A failed page fails the listing, as a failed `saved_sessions` does.
+        m.refresh_saved_for_test();
+        m.page_sent(3);
+        m.apply(Event::CatalogPageFailed { req: 3, reason: "busy".into() });
+        assert!(m.named.saved_failed && !m.saved_listing());
+        assert_eq!(history_titles(&m), ["fresh"], "what was listed stays");
+    }
+
     /// Without `saved_sessions` HISTORY is a header and a note that says
     /// why and what still works; not connected, nothing.
     #[test]

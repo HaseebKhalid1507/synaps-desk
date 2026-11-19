@@ -322,6 +322,7 @@ fn main() {
                 v.panels = panels;
                 // OLDER left open: list up to the wire's cap from the start.
                 v.model.named.deep = panels.history_open & rail::Bucket::Older.bit() != 0;
+                v.model.named.deep_wanted = v.model.named.deep;
                 v.accent_source = accent_source;
                 v.theme_source = theme_source;
                 v.theme_follows_config = follows_config;
