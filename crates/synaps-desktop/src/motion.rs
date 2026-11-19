@@ -985,10 +985,6 @@ pub(crate) struct Motion {
     display: Cell<bool>,
     /// The earliest timed change (a 30 Hz tick, a beat, a second).
     next: Cell<Option<Instant>>,
-    seen: RefCell<HashMap<(Tag, u64), Seen>>,
-    births: RefCell<HashMap<u64, Instant>>,
-    slides: RefCell<HashMap<u64, Slide>>,
-    turns: RefCell<HashMap<u64, (Tween, u64)>>,
     /// Chrome on springs (the tab indicator, the rail's selection, a
     /// segment's bar, the readout's y): the window's, never rescoped.
     springs: RefCell<HashMap<u64, Sprung>>,
@@ -1002,22 +998,9 @@ pub(crate) struct Motion {
     /// The control held down (or pressed from the keyboard): its key, and
     /// when it was let go ([`Motion::pressed`]).
     press: Cell<Option<(u64, Option<Instant>)>>,
-    /// Counts and lines as last drawn, rolling ([`Motion::roll`]).
-    rolls: RefCell<HashMap<u64, Rolling>>,
-    /// The count each rolling count last showed (its direction).
-    roll_n: RefCell<HashMap<u64, u64>>,
     /// Numbers as last drawn, for their afterglow ([`Motion::glow`]):
     /// the window's, so a switch's new values glow (fluid.md §3.6).
     glows: RefCell<HashMap<u64, Seen>>,
-    /// Rows revealing or growing ([`Motion::grow`]).
-    grows: RefCell<HashMap<u64, Growing>>,
-    /// Bodies opening and closing under their rows ([`Motion::reveal`]).
-    reveals: RefCell<HashMap<u64, Reveal>>,
-    /// Lines streaming into a body ([`Motion::streamed`]).
-    streams: RefCell<HashMap<u64, Streamed>>,
-    /// Rows born that will not reveal: first drawn off screen, in the
-    /// list's overdraw ([`Motion::unpainted`]).
-    quiet: RefCell<std::collections::HashSet<u64>>,
     /// The one timer.
     timer: RefCell<Option<Task<()>>>,
     /// The instant it is armed for, and whom it wakes (cleared as it fires).
@@ -1035,13 +1018,6 @@ pub(crate) struct Motion {
     pub(crate) layer_paints: Cell<u64>,
     /// Timers armed so far (tests: one per change of deadline).
     pub(crate) arms: Cell<u64>,
-    /// Handoff out: you sent (`false`) or steered a worker (`true`).
-    pub(crate) sent: Cell<Option<(Instant, bool)>>,
-    /// A fold or unfold: the clicked run's id, when (the cascade's origin).
-    pub(crate) fold: Cell<Option<(u64, Instant)>>,
-    /// Whose state is remembered: the session's (id and attach) and the
-    /// column's (the session's thread or a worker's view) ([`Motion::rescope`]).
-    scope: Cell<(u64, u64)>,
     /// Tests move the clock with the executor's ([`Motion::clock`]): the
     /// clock's offset from the wall clock, in signed nanoseconds.
     #[cfg(test)]
@@ -1058,6 +1034,9 @@ pub(crate) struct Motion {
     /// Tests: the beat each layer paint with sites drew, in order.
     #[cfg(test)]
     pub(crate) painted: RefCell<Vec<u32>>,
+    /// Each pane's column's motion ([`ColumnFx`]): split panes step 1 has
+    /// one pane; the old methods ([`Motion::born`]...) are its delegates.
+    cols: [ColumnFx; crate::pane::PANES_MAX],
 }
 
 /// A count or a line as last drawn ([`Motion::roll`]).
@@ -1352,6 +1331,7 @@ pub(crate) fn next_tick(now: Instant) -> Instant {
 impl Motion {
     pub(crate) fn new(epoch: Instant) -> Self {
         Motion {
+            cols: std::array::from_fn(|_| ColumnFx::default()),
             level: Cell::new(Level::Full),
             ink: Cell::new(Hsla::default()),
             ambient: Cell::new(true),
@@ -1367,10 +1347,6 @@ impl Motion {
             epoch,
             display: Cell::new(false),
             next: Cell::new(None),
-            seen: RefCell::default(),
-            births: RefCell::default(),
-            slides: RefCell::default(),
-            turns: RefCell::default(),
             springs: RefCell::default(),
             cells: RefCell::default(),
             hovers: RefCell::default(),
@@ -1378,12 +1354,6 @@ impl Motion {
             pane_wants: Cell::new(false),
             press: Cell::new(None),
             glows: RefCell::default(),
-            rolls: RefCell::default(),
-            roll_n: RefCell::default(),
-            grows: RefCell::default(),
-            reveals: RefCell::default(),
-            streams: RefCell::default(),
-            quiet: RefCell::default(),
             timer: RefCell::default(),
             armed: Rc::default(),
             woke: Rc::default(),
@@ -1392,9 +1362,6 @@ impl Motion {
             beat_next: Cell::new(None),
             layer_paints: Cell::new(0),
             arms: Cell::new(0),
-            sent: Cell::new(None),
-            fold: Cell::new(None),
-            scope: Cell::new((0, 0)),
             #[cfg(test)]
             skew: Rc::default(),
             #[cfg(test)]
@@ -1405,35 +1372,6 @@ impl Motion {
             #[cfg(test)]
             painted: RefCell::default(),
         }
-    }
-
-    /// Who is on screen this frame: `session` (its id and attach) and
-    /// `column` (its thread or a worker's view). What was remembered under
-    /// another is forgotten, so nothing compares one's ids with another's:
-    /// a switch, a reconnect, a worker's view in or out come up at rest
-    /// (motion.md §8). The tray, the foot and the card are the session's;
-    /// the transcript's tags, turns and births are the column's.
-    pub(crate) fn rescope(&self, session: u64, column: u64) {
-        let (s0, c0) = self.scope.get();
-        if s0 == session && c0 == column {
-            return;
-        }
-        self.scope.set((session, column));
-        if s0 != session {
-            self.seen.borrow_mut().clear();
-            self.slides.borrow_mut().clear();
-            self.sent.set(None);
-        } else {
-            self.seen.borrow_mut().retain(|k, _| !k.0.column());
-        }
-        self.turns.borrow_mut().clear();
-        self.rolls.borrow_mut().clear();
-        self.grows.borrow_mut().clear();
-        self.reveals.borrow_mut().clear();
-        self.streams.borrow_mut().clear();
-        self.quiet.borrow_mut().clear();
-        self.births.borrow_mut().clear();
-        self.fold.set(None);
     }
 
     /// Fluid motion the agent causes plays (fluid.md §5): Full, and not in
@@ -1462,236 +1400,9 @@ impl Motion {
         self.grow_on(key, ix, born, streaming, line, SNAP_RESPONSE)
     }
 
-    /// [`Motion::grow`], an arrival's height revealing on `response`'s
-    /// spring (the authorize card's on `glide`, cards4/proposal.md §8 #8).
-    pub(crate) fn grow_on(&self, key: u64, ix: usize, born: Option<Instant>, streaming: bool, line: f32, response: f32) -> Option<Grow> {
-        if !self.fluid() {
-            return None;
-        }
-        let (frame, now) = (self.frame.get(), self.now());
-        let mut grows = self.grows.borrow_mut();
-        let fresh = born.is_some_and(|b| now.saturating_duration_since(b) < QUICK) && !self.quiet.borrow().contains(&key);
-        let g = match grows.get_mut(&key) {
-            Some(g) if g.frame + 1 >= frame => g,
-            _ if fresh || streaming => {
-                let g = Growing {
-                    ix,
-                    shown: f32::NAN,
-                    spring: Spring::default(),
-                    arriving: fresh,
-                    born: born.filter(|_| fresh),
-                    at: now,
-                    frame,
-                    sink: Rc::new(Cell::new(f32::NAN)),
-                };
-                grows.insert(key, g);
-                grows.get_mut(&key)?
-            }
-            _ => return None,
-        };
-        let dt = now.saturating_duration_since(g.at).as_secs_f32().min(0.05);
-        (g.at, g.frame, g.ix) = (now, frame, ix);
-        let natural = g.sink.get();
-        let since = g.born.map_or(1., |b| now.checked_duration_since(b).map_or(0., |d| d.as_secs_f32()));
-        let (travel, strength) = if g.arriving {
-            let q = (since / QUICK.as_secs_f32()).clamp(0., 1.);
-            (Spring::from_rest(ARRIVE, FLICK_RESPONSE, since), LIFT + (1. - LIFT) * ease::OUT.sample(q))
-        } else {
-            (0., 1.)
-        };
-        let content_moves = g.arriving && (travel >= FLUID_EPSILON || strength < 1.);
-        if natural.is_nan() {
-            // Not measured yet: an arrival is 0 px tall; a streaming row its own height.
-            self.want_frame();
-            return Some(Grow { key, shown: g.arriving.then_some(0.), sink: g.sink.clone(), travel, strength, floor: LIFT });
-        }
-        if g.shown.is_nan() {
-            g.shown = if g.arriving { 0. } else { natural };
-        }
-        if g.born.is_none_or(|b| b <= now) {
-            if natural < g.shown {
-                (g.shown, g.spring) = (natural, Spring::default());
-            } else {
-                let response = if g.arriving { response } else { FLICK_RESPONSE };
-                g.spring.x = g.shown - natural;
-                g.spring.step(response, dt);
-                if streaming && !g.arriving {
-                    // The newest line is never more than a line away (an
-                    // arrival reveals all of itself on `snap` first).
-                    g.spring.x = g.spring.x.max(-line);
-                }
-                g.shown = natural + g.spring.x;
-                if g.spring.settled(response) {
-                    (g.shown, g.spring) = (natural, Spring::default());
-                }
-            }
-        }
-        // Arrived: its content at rest, and (unless it streams on) all of it
-        // shown. A streaming arrival's new lines then glide, a line short at most.
-        if g.arriving && !content_moves && (streaming || g.shown == natural) {
-            g.arriving = false;
-        }
-        if g.shown == natural && !content_moves {
-            if !streaming {
-                grows.remove(&key);
-                return None;
-            }
-        } else {
-            self.want_frame();
-        }
-        Some(Grow { key, shown: Some(g.shown), sink: g.sink.clone(), travel, strength, floor: LIFT })
-    }
-
     /// The frame's number (counts up a frame at a time).
     pub(crate) fn frame(&self) -> u64 {
         self.frame.get()
-    }
-
-    /// A body opening or closing (the design gate of #23, S1): whether it
-    /// opens, how much of it is shown at `now`, its measured height, and
-    /// whether it has landed. None: no body measured.
-    pub(crate) fn body(&self, key: u64, now: Instant) -> Option<(bool, f32, f32, bool)> {
-        let reveals = self.reveals.borrow();
-        let r = reveals.get(&key)?;
-        let h = r.sink.get();
-        if h.is_nan() {
-            return None;
-        }
-        let (shown, done) = r.at(now);
-        Some((r.open, shown, h, done || r.at.is_none()))
-    }
-
-    /// A body under its row as it opens or closes (cards4/proposal.md §8
-    /// #6, #12): the fraction of its height shown (the header never moves:
-    /// the clip is the body's), on `glide`, and the cell its height is
-    /// measured into. `None`: at rest (open: all of it; closed: none). A
-    /// body seen for the first time (history, scrolled in, a switch) is at
-    /// rest; Reduced, Off and low power: at once. `delay`: a turn that
-    /// starts now waits this long (a success's streamed body folds @ +180).
-    /// `generation`: what it holds (its call's state); open and at rest, a
-    /// change of it (a failure's output in place of the streamed lines)
-    /// glides its height from the one it had, never a jump.
-    pub(crate) fn reveal(&self, key: u64, open: bool, delay: Duration, generation: u64) -> (Option<f32>, Rc<Cell<f32>>) {
-        let (frame, now) = (self.frame.get(), self.now());
-        let fluid = self.fluid();
-        let mut reveals = self.reveals.borrow_mut();
-        let r = reveals.entry(key).or_insert_with(|| Reveal {
-            open,
-            at: None,
-            from: 0.,
-            frame,
-            sink: Rc::new(Cell::new(f32::NAN)),
-            generation,
-            resize: None,
-        });
-        if r.frame + 1 < frame || !fluid {
-            (r.open, r.at, r.resize) = (open, None, None);
-        } else if r.open != open {
-            let (shown, _) = r.at(now);
-            (r.open, r.from, r.at, r.resize) = (open, shown, Some(now + delay), None);
-        } else if r.generation != generation && open && r.at.is_none() && !r.sink.get().is_nan() {
-            r.resize = Some((r.sink.get(), now));
-        }
-        (r.frame, r.generation) = (frame, generation);
-        if let Some((from, at)) = r.resize {
-            // The height it had, gliding to the one it has (measured a
-            // frame late: the first frame holds the old).
-            let to = r.sink.get();
-            let x = Spring::from_rest(1., GLIDE_RESPONSE, now.saturating_duration_since(at).as_secs_f32());
-            let h = to + (from - to) * x;
-            // Its first frame measures the new height (`to` is the old one
-            // until then): never done there.
-            if now > at && ((h - to).abs() < FLUID_EPSILON || to <= 0.) {
-                r.resize = None;
-            } else {
-                self.want_frame();
-                return (Some(if to > 0. { (h / to).max(0.) } else { 1. }), r.sink.clone());
-            }
-        }
-        let (shown, done) = r.at(now);
-        if done {
-            r.at = None;
-            return (None, r.sink.clone());
-        }
-        self.want_frame();
-        (Some(shown.clamp(0., 1.)), r.sink.clone())
-    }
-
-    /// Lines streaming into a body (cards4/proposal.md §8 #4): of the `n`
-    /// it holds now, those that came while watched, as `(line, clip,
-    /// strength)`: each line's clip 0 → 1 of its height on `flick`, its
-    /// text from 70 % on [`STREAM_FADE`] ([`stream_curve`]), in arrival
-    /// order, lines that came in one frame [`STREAM_STAGGER`] apart. Empty
-    /// at rest: history, a body seen for the first time, Reduced, Off.
-    pub(crate) fn streamed(&self, key: u64, n: usize) -> Vec<(usize, f32, f32)> {
-        let (frame, now) = (self.frame.get(), self.now());
-        let fluid = self.fluid();
-        let mut streams = self.streams.borrow_mut();
-        let s = streams.entry(key).or_insert_with(|| Streamed { n, frame, born: Vec::new() });
-        if s.frame + 1 < frame || !fluid || n < s.n {
-            s.born.clear();
-        } else if n > s.n {
-            let first = s.born.last().map_or(now, |b| b.1.max(now));
-            s.born.extend((s.n..n).enumerate().map(|(k, i)| (i, first + STREAM_STAGGER * k.min(12) as u32)));
-        }
-        (s.n, s.frame) = (n, frame);
-        let curve = stream_curve();
-        s.born.retain(|(_, at)| {
-            now < *at
-                || Spring::from_rest(1., FLICK_RESPONSE, now.saturating_duration_since(*at).as_secs_f32()) > 0.01
-                || now.saturating_duration_since(*at) < STREAM_FADE
-        });
-        if s.born.is_empty() {
-            return Vec::new();
-        }
-        self.want_frame();
-        s.born
-            .iter()
-            .map(|&(i, at)| {
-                let t = now.checked_duration_since(at).map_or(-1., |d| d.as_secs_f32());
-                if t < 0. {
-                    return (i, 0., LIFT);
-                }
-                let clip = 1. - Spring::from_rest(1., FLICK_RESPONSE, t);
-                (i, clip, curve.sample((t / STREAM_FADE.as_secs_f32()).min(1.)))
-            })
-            .collect()
-    }
-
-    /// After the list's layout: arrivals it drew this frame but did not
-    /// paint (laid out in its overdraw, off screen) have no measure, and
-    /// GPUI keeps the 0 px they were drawn at. They don't reveal: they come
-    /// back at their height, and their rows (returned) are measured again.
-    pub(crate) fn unpainted(&self) -> Vec<usize> {
-        let frame = self.frame.get();
-        let mut out = Vec::new();
-        self.grows.borrow_mut().retain(|key, g| {
-            let off = g.frame == frame && g.arriving && g.sink.get().is_nan();
-            if off {
-                self.quiet.borrow_mut().insert(*key);
-                out.push(g.ix);
-            }
-            !off
-        });
-        out
-    }
-
-    /// Rows revealing or growing now (tests).
-    #[cfg(test)]
-    pub(crate) fn growing(&self) -> usize {
-        self.grows.borrow().len()
-    }
-
-    /// Row `key` is revealing as it arrives (tests).
-    #[cfg(test)]
-    pub(crate) fn arriving(&self, key: u64) -> bool {
-        self.grows.borrow().get(&key).is_some_and(|g| g.arriving)
-    }
-
-    /// Row `key`'s drawn and measured heights (tests).
-    #[cfg(test)]
-    pub(crate) fn grow_of(&self, key: u64) -> Option<(f32, f32)> {
-        self.grows.borrow().get(&key).map(|g| (g.shown, g.sink.get()))
     }
 
     pub(crate) fn level(&self) -> Level {
@@ -1800,23 +1511,13 @@ impl Motion {
         self.next.set(None);
         self.sites.borrow_mut().clear();
         let alive = |f: u64| f + 1 >= frame;
-        self.seen.borrow_mut().retain(|_, s| alive(s.frame));
-        self.slides.borrow_mut().retain(|_, s| alive(s.frame));
-        self.turns.borrow_mut().retain(|_, t| alive(t.1));
         self.springs.borrow_mut().retain(|_, s| alive(s.frame));
         self.cells.borrow_mut().retain(|_, c| alive(c.1));
         self.hovers.borrow_mut().retain(|_, h| alive(h.1));
         self.glows.borrow_mut().retain(|_, s| alive(s.frame));
-        self.rolls.borrow_mut().retain(|_, r| alive(r.frame));
-        {
-            let rolls = self.rolls.borrow();
-            self.roll_n.borrow_mut().retain(|k, _| rolls.contains_key(k));
+        for col in &self.cols {
+            col.prune(frame, now);
         }
-        self.grows.borrow_mut().retain(|_, g| alive(g.frame));
-        let cut = BASE + STAGGER_CAP + SIG;
-        self.births.borrow_mut().retain(|_, at| now.saturating_duration_since(*at) < cut);
-        let births = self.births.borrow();
-        self.quiet.borrow_mut().retain(|k| births.contains_key(k));
     }
 
     /// The window is shown or hidden: hidden, the timer stops (visible
@@ -2164,50 +1865,14 @@ impl Motion {
         at.saturating_duration_since(self.epoch).as_nanos().is_multiple_of((BEAT * every).as_nanos())
     }
 
-    /// The rolls under way in the key space `space` (all: `None`) (tests).
-    #[cfg(test)]
-    pub(crate) fn rolling_in(&self, space: Option<u64>) -> Vec<u64> {
-        let rolls = self.rolls.borrow();
-        rolls.iter().filter(|(k, r)| space.is_none_or(|s| *k & (0xFFFF << 48) == s) && r.since.is_some()).map(|(k, _)| *k).collect()
-    }
-
-    /// The count `key` showed last ([`roll_count`]).
+    /// [`PaneFx::roll_was`] in the first pane's column.
     pub(crate) fn roll_was(&self, key: u64) -> Option<u64> {
-        self.roll_n.borrow().get(&key).copied()
+        self.col(crate::pane::PaneId::FIRST).roll_was(key)
     }
 
+    /// [`PaneFx::roll_saw`] in the first pane's column.
     pub(crate) fn roll_saw(&self, key: u64, n: u64) {
-        self.roll_n.borrow_mut().insert(key, n);
-    }
-
-    /// `text` of `key` this frame (polish.md P5), rolling if it changed while
-    /// drawn at Full: the text it left, how far it still travels (1 → 0 of
-    /// its line, on `snap`: no overshoot) and which way (`up`: the new one
-    /// comes in from below). First drawn, not drawn last frame (history, a
-    /// switch), Reduced or Off: at rest.
-    pub(crate) fn roll(&self, key: u64, text: &SharedString, up: bool) -> Option<(SharedString, f32, bool)> {
-        let (frame, now) = (self.frame.get(), self.now());
-        let mut rolls = self.rolls.borrow_mut();
-        let r = rolls.entry(key).or_insert_with(|| Rolling { value: text.clone(), prev: text.clone(), since: None, up, frame });
-        if r.value != *text {
-            let watched = r.frame + 1 >= frame && self.level.get() == Level::Full;
-            r.prev = std::mem::replace(&mut r.value, text.clone());
-            r.since = watched.then_some(now);
-            r.up = up;
-        }
-        r.frame = frame;
-        let since = r.since?;
-        let x = Spring::from_rest(1., SNAP_RESPONSE, now.saturating_duration_since(since).as_secs_f32());
-        if x < ROLL_EPSILON {
-            r.since = None;
-            return None;
-        }
-        // On the shared 30 Hz grid, not the display's rate (Shady #17
-        // R2-M1): a roll is an app frame, and a live fan-out rolls a count
-        // every fraction of a second; N rolls share the ticks, and with the
-        // composer's sweep on screen they land on its frames.
-        self.want_tick();
-        Some((r.prev.clone(), x, r.up))
+        self.col(crate::pane::PaneId::FIRST).roll_saw(key, n)
     }
 
     /// `decay`: light switched on at `since` going off: 1 (lit) → 0, held
@@ -2249,17 +1914,6 @@ impl Motion {
 
     // ── what elements remember ────────────────────────────────────────
 
-    /// Item `id` arrived while watched (`at`: a burst's staggered start).
-    pub(crate) fn born(&self, id: u64, at: Instant) {
-        if self.on() {
-            self.births.borrow_mut().insert(id, at);
-        }
-    }
-
-    pub(crate) fn birth(&self, id: u64) -> Option<Instant> {
-        self.births.borrow().get(&id).copied()
-    }
-
     /// Something small arriving in a row (a worker chip, polish.md P13),
     /// `born` then (staggered: maybe still to come): its content's travel
     /// from below ([`ARRIVE`] → 0 on `flick`) and its strength ([`LIFT`] →
@@ -2278,64 +1932,6 @@ impl Motion {
         }
         self.want_frame();
         (travel, strength)
-    }
-
-    /// Row `key` is revealing: growing, or born too lately to have begun.
-    pub(crate) fn revealing(&self, key: u64) -> bool {
-        self.grows.borrow().contains_key(&key) || self.birth(key).is_some_and(|b| self.now().saturating_duration_since(b) < QUICK)
-    }
-
-    /// `value` of `(tag, key)` this frame: when it last changed while
-    /// watched, and what it was before. A value seen for the first time, or
-    /// not drawn last frame (scrolled back in, a session switch), is at
-    /// rest: history never animates. `born`: it arrived just now, from nothing.
-    pub(crate) fn change(&self, tag: Tag, key: u64, value: u64, born: Option<Instant>) -> Option<(Instant, u64)> {
-        let frame = self.frame.get();
-        let mut seen = self.seen.borrow_mut();
-        let s = seen.entry((tag, key)).or_insert(Seen { value, prev: u64::MAX, since: born, frame });
-        if s.value != value {
-            if s.frame + 1 >= frame && self.on() {
-                (s.prev, s.since) = (s.value, Some(self.now()));
-            } else {
-                (s.prev, s.since) = (value, None);
-            }
-            s.value = value;
-        }
-        s.frame = frame;
-        s.since.map(|t| (t, s.prev))
-    }
-
-    /// A row at `y` (its place in its list, keyed `key`): its paint offset.
-    pub(crate) fn slide(&self, key: u64, y: f32) -> f32 {
-        let (frame, now) = (self.frame.get(), self.now());
-        let mut slides = self.slides.borrow_mut();
-        let s = slides.entry(key).or_insert(Slide { target: y, x0: 0., v0: 0., at: now, frame });
-        if s.frame + 1 < frame || self.level.get() != Level::Full {
-            *s = Slide { target: y, x0: 0., v0: 0., at: now, frame };
-        }
-        s.retarget(y, now);
-        s.frame = frame;
-        if s.settled(now) {
-            return 0.;
-        }
-        self.want_frame();
-        s.state(now).0
-    }
-
-    /// A chevron's turn (0 closed … 1 open), from its angle now.
-    pub(crate) fn turn(&self, key: u64, open: bool) -> f32 {
-        let (frame, now, to) = (self.frame.get(), self.now(), if open { 1. } else { 0. });
-        let mut turns = self.turns.borrow_mut();
-        let t = turns.entry(key).or_insert((Tween::rest(to, now), frame));
-        if t.1 + 1 < frame || self.level.get() != Level::Full {
-            t.0 = Tween::rest(to, now);
-        }
-        t.0.retarget(to, now, QUICK, &ease::INOUT);
-        t.1 = frame;
-        if t.0.running(now) {
-            self.want_frame();
-        }
-        t.0.sample(now, &ease::INOUT)
     }
 
     // ── chrome (fluid.md §3.5–3.10, motion.md PR 5) ───────────────────
@@ -2804,27 +2400,10 @@ impl Motion {
         *self.timer.borrow_mut() = Some(task);
     }
 
-    /// One-shots that started on this frame (tests: a switch starts none).
-    /// The watched bar's draw is the one a view opening here plays.
-    #[cfg(test)]
-    pub(crate) fn fresh(&self) -> Vec<(Tag, u64)> {
-        let now = self.now.get();
-        let mut v: Vec<(Tag, u64)> =
-            self.seen.borrow().iter().filter(|(k, s)| k.0 != Tag::Watched && s.since == Some(now)).map(|(k, _)| *k).collect();
-        v.extend(self.births.borrow().iter().filter(|(_, at)| **at >= now).map(|(id, _)| (Tag::Stream, *id)));
-        v
-    }
-
     /// The beat the last frame drew (tests).
     #[cfg(test)]
     pub(crate) fn frame_beat(&self) -> u32 {
         (self.now.get().saturating_duration_since(self.epoch).as_nanos() / BEAT.as_nanos()) as u32
-    }
-
-    /// Every keyed value that changed (animating) after `t` (tests).
-    #[cfg(test)]
-    pub(crate) fn changed_since(&self, t: Instant) -> Vec<(Tag, u64)> {
-        self.seen.borrow().iter().filter(|(_, s)| s.since.is_some_and(|at| at > t)).map(|(k, _)| *k).collect()
     }
 
     /// What the last frame asked for: a frame, a timer at, nothing (tests).
@@ -2843,6 +2422,590 @@ impl Motion {
     pub(crate) fn demand(&self) -> (bool, Option<Instant>) {
         self.in_frame.set(false);
         (self.display.get(), self.next.get())
+    }
+
+    /// Pane `pane`'s motion ([`PaneFx`]): its column's maps over this window's clock.
+    pub(crate) fn col(&self, pane: crate::pane::PaneId) -> PaneFx<'_> {
+        PaneFx { fx: self, col: &self.cols[pane.index()] }
+    }
+
+    /// [`PaneFx::rescope`] in the first pane's column.
+    pub(crate) fn rescope(&self, session: u64, column: u64) {
+        self.col(crate::pane::PaneId::FIRST).rescope(session, column)
+    }
+
+    /// [`PaneFx::grow_on`] in the first pane's column.
+    pub(crate) fn grow_on(&self, key: u64, ix: usize, born: Option<Instant>, streaming: bool, line: f32, response: f32) -> Option<Grow> {
+        self.col(crate::pane::PaneId::FIRST).grow_on(key, ix, born, streaming, line, response)
+    }
+
+    /// [`PaneFx::body`] in the first pane's column.
+    pub(crate) fn body(&self, key: u64, now: Instant) -> Option<(bool, f32, f32, bool)> {
+        self.col(crate::pane::PaneId::FIRST).body(key, now)
+    }
+
+    /// [`PaneFx::reveal`] in the first pane's column.
+    pub(crate) fn reveal(&self, key: u64, open: bool, delay: Duration, generation: u64) -> (Option<f32>, Rc<Cell<f32>>) {
+        self.col(crate::pane::PaneId::FIRST).reveal(key, open, delay, generation)
+    }
+
+    /// [`PaneFx::streamed`] in the first pane's column.
+    pub(crate) fn streamed(&self, key: u64, n: usize) -> Vec<(usize, f32, f32)> {
+        self.col(crate::pane::PaneId::FIRST).streamed(key, n)
+    }
+
+    /// [`PaneFx::unpainted`] in the first pane's column.
+    pub(crate) fn unpainted(&self) -> Vec<usize> {
+        self.col(crate::pane::PaneId::FIRST).unpainted()
+    }
+
+    /// [`PaneFx::growing`] in the first pane's column.
+    #[cfg(test)]
+    pub(crate) fn growing(&self) -> usize {
+        self.col(crate::pane::PaneId::FIRST).growing()
+    }
+
+    /// [`PaneFx::arriving`] in the first pane's column.
+    #[cfg(test)]
+    pub(crate) fn arriving(&self, key: u64) -> bool {
+        self.col(crate::pane::PaneId::FIRST).arriving(key)
+    }
+
+    /// [`PaneFx::grow_of`] in the first pane's column.
+    #[cfg(test)]
+    pub(crate) fn grow_of(&self, key: u64) -> Option<(f32, f32)> {
+        self.col(crate::pane::PaneId::FIRST).grow_of(key)
+    }
+
+    /// [`PaneFx::rolling_in`] in the first pane's column.
+    #[cfg(test)]
+    pub(crate) fn rolling_in(&self, space: Option<u64>) -> Vec<u64> {
+        self.col(crate::pane::PaneId::FIRST).rolling_in(space)
+    }
+
+    /// [`PaneFx::roll`] in the first pane's column.
+    pub(crate) fn roll(&self, key: u64, text: &SharedString, up: bool) -> Option<(SharedString, f32, bool)> {
+        self.col(crate::pane::PaneId::FIRST).roll(key, text, up)
+    }
+
+    /// [`PaneFx::born`] in the first pane's column.
+    pub(crate) fn born(&self, id: u64, at: Instant) {
+        self.col(crate::pane::PaneId::FIRST).born(id, at)
+    }
+
+    /// [`PaneFx::birth`] in the first pane's column.
+    pub(crate) fn birth(&self, id: u64) -> Option<Instant> {
+        self.col(crate::pane::PaneId::FIRST).birth(id)
+    }
+
+    /// [`PaneFx::revealing`] in the first pane's column.
+    pub(crate) fn revealing(&self, key: u64) -> bool {
+        self.col(crate::pane::PaneId::FIRST).revealing(key)
+    }
+
+    /// [`PaneFx::change`] in the first pane's column.
+    pub(crate) fn change(&self, tag: Tag, key: u64, value: u64, born: Option<Instant>) -> Option<(Instant, u64)> {
+        self.col(crate::pane::PaneId::FIRST).change(tag, key, value, born)
+    }
+
+    /// [`PaneFx::slide`] in the first pane's column.
+    pub(crate) fn slide(&self, key: u64, y: f32) -> f32 {
+        self.col(crate::pane::PaneId::FIRST).slide(key, y)
+    }
+
+    /// [`PaneFx::turn`] in the first pane's column.
+    pub(crate) fn turn(&self, key: u64, open: bool) -> f32 {
+        self.col(crate::pane::PaneId::FIRST).turn(key, open)
+    }
+
+    /// [`PaneFx::fresh`] in the first pane's column.
+    #[cfg(test)]
+    pub(crate) fn fresh(&self) -> Vec<(Tag, u64)> {
+        self.col(crate::pane::PaneId::FIRST).fresh()
+    }
+
+    /// [`PaneFx::changed_since`] in the first pane's column.
+    #[cfg(test)]
+    pub(crate) fn changed_since(&self, t: Instant) -> Vec<(Tag, u64)> {
+        self.col(crate::pane::PaneId::FIRST).changed_since(t)
+    }
+}
+
+/// One pane's column's motion (split panes step 1, split/architecture.md
+/// §6.2): everything [`PaneFx::rescope`] forgets when the session or the
+/// column on screen changes, keyed by item ids that every transcript
+/// numbers from 1. Two panes never share one.
+#[derive(Default)]
+pub(crate) struct ColumnFx {
+    /// Whose state is remembered: the session's (id and attach) and the
+    /// column's (the session's thread or a worker's view) ([`Motion::rescope`]).
+    scope: Cell<(u64, u64)>,
+    seen: RefCell<HashMap<(Tag, u64), Seen>>,
+    births: RefCell<HashMap<u64, Instant>>,
+    slides: RefCell<HashMap<u64, Slide>>,
+    turns: RefCell<HashMap<u64, (Tween, u64)>>,
+    /// Counts and lines as last drawn, rolling ([`Motion::roll`]).
+    rolls: RefCell<HashMap<u64, Rolling>>,
+    /// The count each rolling count last showed (its direction).
+    roll_n: RefCell<HashMap<u64, u64>>,
+    /// Rows revealing or growing ([`Motion::grow`]).
+    grows: RefCell<HashMap<u64, Growing>>,
+    /// Bodies opening and closing under their rows ([`Motion::reveal`]).
+    reveals: RefCell<HashMap<u64, Reveal>>,
+    /// Lines streaming into a body ([`Motion::streamed`]).
+    streams: RefCell<HashMap<u64, Streamed>>,
+    /// Rows born that will not reveal: first drawn off screen, in the
+    /// list's overdraw ([`Motion::unpainted`]).
+    quiet: RefCell<std::collections::HashSet<u64>>,
+    /// Handoff out: you sent (`false`) or steered a worker (`true`).
+    pub(crate) sent: Cell<Option<(Instant, bool)>>,
+    /// A fold or unfold: the clicked run's id, when (the cascade's origin).
+    pub(crate) fold: Cell<Option<(u64, Instant)>>,
+}
+
+impl ColumnFx {
+    /// [`Motion::begin_frame`] for this column: what the last frame did not
+    /// draw goes; births go once their cascade could have shown them.
+    fn prune(&self, frame: u64, now: Instant) {
+        let alive = |f: u64| f + 1 >= frame;
+        self.seen.borrow_mut().retain(|_, s| alive(s.frame));
+        self.slides.borrow_mut().retain(|_, s| alive(s.frame));
+        self.turns.borrow_mut().retain(|_, t| alive(t.1));
+        self.rolls.borrow_mut().retain(|_, r| alive(r.frame));
+        {
+            let rolls = self.rolls.borrow();
+            self.roll_n.borrow_mut().retain(|k, _| rolls.contains_key(k));
+        }
+        self.grows.borrow_mut().retain(|_, g| alive(g.frame));
+        let cut = BASE + STAGGER_CAP + SIG;
+        self.births.borrow_mut().retain(|_, at| now.saturating_duration_since(*at) < cut);
+        let births = self.births.borrow();
+        self.quiet.borrow_mut().retain(|k| births.contains_key(k));
+    }
+}
+
+/// A pane's motion: the window's [`Motion`] (its clock, springs, hovers,
+/// timer and beat, by `Deref`) with that pane's [`ColumnFx`].
+#[derive(Clone, Copy)]
+pub(crate) struct PaneFx<'a> {
+    fx: &'a Motion,
+    col: &'a ColumnFx,
+}
+
+impl std::ops::Deref for PaneFx<'_> {
+    type Target = Motion;
+    fn deref(&self) -> &Motion {
+        self.fx
+    }
+}
+
+impl PaneFx<'_> {
+    /// Handoff out: you sent (`false`) or steered a worker (`true`), and when.
+    pub(crate) fn sent(&self) -> &Cell<Option<(Instant, bool)>> {
+        &self.col.sent
+    }
+
+    /// A fold or unfold: the clicked run's id, when (the cascade's origin).
+    pub(crate) fn fold(&self) -> &Cell<Option<(u64, Instant)>> {
+        &self.col.fold
+    }
+
+    /// The count `key` showed last ([`roll_count`]).
+    pub(crate) fn roll_was(&self, key: u64) -> Option<u64> {
+        self.col.roll_n.borrow().get(&key).copied()
+    }
+
+    pub(crate) fn roll_saw(&self, key: u64, n: u64) {
+        self.col.roll_n.borrow_mut().insert(key, n);
+    }
+
+    /// Who is on screen this frame: `session` (its id and attach) and
+    /// `column` (its thread or a worker's view). What was remembered under
+    /// another is forgotten, so nothing compares one's ids with another's:
+    /// a switch, a reconnect, a worker's view in or out come up at rest
+    /// (motion.md §8). The tray, the foot and the card are the session's;
+    /// the transcript's tags, turns and births are the column's.
+    pub(crate) fn rescope(&self, session: u64, column: u64) {
+        let (s0, c0) = self.col.scope.get();
+        if s0 == session && c0 == column {
+            return;
+        }
+        self.col.scope.set((session, column));
+        if s0 != session {
+            self.col.seen.borrow_mut().clear();
+            self.col.slides.borrow_mut().clear();
+            self.col.sent.set(None);
+        } else {
+            self.col.seen.borrow_mut().retain(|k, _| !k.0.column());
+        }
+        self.col.turns.borrow_mut().clear();
+        self.col.rolls.borrow_mut().clear();
+        self.col.grows.borrow_mut().clear();
+        self.col.reveals.borrow_mut().clear();
+        self.col.streams.borrow_mut().clear();
+        self.col.quiet.borrow_mut().clear();
+        self.col.births.borrow_mut().clear();
+        self.col.fold.set(None);
+    }
+
+    /// [`Motion::grow`], an arrival's height revealing on `response`'s
+    /// spring (the authorize card's on `glide`, cards4/proposal.md §8 #8).
+    pub(crate) fn grow_on(&self, key: u64, ix: usize, born: Option<Instant>, streaming: bool, line: f32, response: f32) -> Option<Grow> {
+        if !self.fluid() {
+            return None;
+        }
+        let (frame, now) = (self.frame.get(), self.now());
+        let mut grows = self.col.grows.borrow_mut();
+        let fresh = born.is_some_and(|b| now.saturating_duration_since(b) < QUICK) && !self.col.quiet.borrow().contains(&key);
+        let g = match grows.get_mut(&key) {
+            Some(g) if g.frame + 1 >= frame => g,
+            _ if fresh || streaming => {
+                let g = Growing {
+                    ix,
+                    shown: f32::NAN,
+                    spring: Spring::default(),
+                    arriving: fresh,
+                    born: born.filter(|_| fresh),
+                    at: now,
+                    frame,
+                    sink: Rc::new(Cell::new(f32::NAN)),
+                };
+                grows.insert(key, g);
+                grows.get_mut(&key)?
+            }
+            _ => return None,
+        };
+        let dt = now.saturating_duration_since(g.at).as_secs_f32().min(0.05);
+        (g.at, g.frame, g.ix) = (now, frame, ix);
+        let natural = g.sink.get();
+        let since = g.born.map_or(1., |b| now.checked_duration_since(b).map_or(0., |d| d.as_secs_f32()));
+        let (travel, strength) = if g.arriving {
+            let q = (since / QUICK.as_secs_f32()).clamp(0., 1.);
+            (Spring::from_rest(ARRIVE, FLICK_RESPONSE, since), LIFT + (1. - LIFT) * ease::OUT.sample(q))
+        } else {
+            (0., 1.)
+        };
+        let content_moves = g.arriving && (travel >= FLUID_EPSILON || strength < 1.);
+        if natural.is_nan() {
+            // Not measured yet: an arrival is 0 px tall; a streaming row its own height.
+            self.want_frame();
+            return Some(Grow { key, shown: g.arriving.then_some(0.), sink: g.sink.clone(), travel, strength, floor: LIFT });
+        }
+        if g.shown.is_nan() {
+            g.shown = if g.arriving { 0. } else { natural };
+        }
+        if g.born.is_none_or(|b| b <= now) {
+            if natural < g.shown {
+                (g.shown, g.spring) = (natural, Spring::default());
+            } else {
+                let response = if g.arriving { response } else { FLICK_RESPONSE };
+                g.spring.x = g.shown - natural;
+                g.spring.step(response, dt);
+                if streaming && !g.arriving {
+                    // The newest line is never more than a line away (an
+                    // arrival reveals all of itself on `snap` first).
+                    g.spring.x = g.spring.x.max(-line);
+                }
+                g.shown = natural + g.spring.x;
+                if g.spring.settled(response) {
+                    (g.shown, g.spring) = (natural, Spring::default());
+                }
+            }
+        }
+        // Arrived: its content at rest, and (unless it streams on) all of it
+        // shown. A streaming arrival's new lines then glide, a line short at most.
+        if g.arriving && !content_moves && (streaming || g.shown == natural) {
+            g.arriving = false;
+        }
+        if g.shown == natural && !content_moves {
+            if !streaming {
+                grows.remove(&key);
+                return None;
+            }
+        } else {
+            self.want_frame();
+        }
+        Some(Grow { key, shown: Some(g.shown), sink: g.sink.clone(), travel, strength, floor: LIFT })
+    }
+
+    /// A body opening or closing (the design gate of #23, S1): whether it
+    /// opens, how much of it is shown at `now`, its measured height, and
+    /// whether it has landed. None: no body measured.
+    pub(crate) fn body(&self, key: u64, now: Instant) -> Option<(bool, f32, f32, bool)> {
+        let reveals = self.col.reveals.borrow();
+        let r = reveals.get(&key)?;
+        let h = r.sink.get();
+        if h.is_nan() {
+            return None;
+        }
+        let (shown, done) = r.at(now);
+        Some((r.open, shown, h, done || r.at.is_none()))
+    }
+
+    /// A body under its row as it opens or closes (cards4/proposal.md §8
+    /// #6, #12): the fraction of its height shown (the header never moves:
+    /// the clip is the body's), on `glide`, and the cell its height is
+    /// measured into. `None`: at rest (open: all of it; closed: none). A
+    /// body seen for the first time (history, scrolled in, a switch) is at
+    /// rest; Reduced, Off and low power: at once. `delay`: a turn that
+    /// starts now waits this long (a success's streamed body folds @ +180).
+    /// `generation`: what it holds (its call's state); open and at rest, a
+    /// change of it (a failure's output in place of the streamed lines)
+    /// glides its height from the one it had, never a jump.
+    pub(crate) fn reveal(&self, key: u64, open: bool, delay: Duration, generation: u64) -> (Option<f32>, Rc<Cell<f32>>) {
+        let (frame, now) = (self.frame.get(), self.now());
+        let fluid = self.fluid();
+        let mut reveals = self.col.reveals.borrow_mut();
+        let r = reveals.entry(key).or_insert_with(|| Reveal {
+            open,
+            at: None,
+            from: 0.,
+            frame,
+            sink: Rc::new(Cell::new(f32::NAN)),
+            generation,
+            resize: None,
+        });
+        if r.frame + 1 < frame || !fluid {
+            (r.open, r.at, r.resize) = (open, None, None);
+        } else if r.open != open {
+            let (shown, _) = r.at(now);
+            (r.open, r.from, r.at, r.resize) = (open, shown, Some(now + delay), None);
+        } else if r.generation != generation && open && r.at.is_none() && !r.sink.get().is_nan() {
+            r.resize = Some((r.sink.get(), now));
+        }
+        (r.frame, r.generation) = (frame, generation);
+        if let Some((from, at)) = r.resize {
+            // The height it had, gliding to the one it has (measured a
+            // frame late: the first frame holds the old).
+            let to = r.sink.get();
+            let x = Spring::from_rest(1., GLIDE_RESPONSE, now.saturating_duration_since(at).as_secs_f32());
+            let h = to + (from - to) * x;
+            // Its first frame measures the new height (`to` is the old one
+            // until then): never done there.
+            if now > at && ((h - to).abs() < FLUID_EPSILON || to <= 0.) {
+                r.resize = None;
+            } else {
+                self.want_frame();
+                return (Some(if to > 0. { (h / to).max(0.) } else { 1. }), r.sink.clone());
+            }
+        }
+        let (shown, done) = r.at(now);
+        if done {
+            r.at = None;
+            return (None, r.sink.clone());
+        }
+        self.want_frame();
+        (Some(shown.clamp(0., 1.)), r.sink.clone())
+    }
+
+    /// Lines streaming into a body (cards4/proposal.md §8 #4): of the `n`
+    /// it holds now, those that came while watched, as `(line, clip,
+    /// strength)`: each line's clip 0 → 1 of its height on `flick`, its
+    /// text from 70 % on [`STREAM_FADE`] ([`stream_curve`]), in arrival
+    /// order, lines that came in one frame [`STREAM_STAGGER`] apart. Empty
+    /// at rest: history, a body seen for the first time, Reduced, Off.
+    pub(crate) fn streamed(&self, key: u64, n: usize) -> Vec<(usize, f32, f32)> {
+        let (frame, now) = (self.frame.get(), self.now());
+        let fluid = self.fluid();
+        let mut streams = self.col.streams.borrow_mut();
+        let s = streams.entry(key).or_insert_with(|| Streamed { n, frame, born: Vec::new() });
+        if s.frame + 1 < frame || !fluid || n < s.n {
+            s.born.clear();
+        } else if n > s.n {
+            let first = s.born.last().map_or(now, |b| b.1.max(now));
+            s.born.extend((s.n..n).enumerate().map(|(k, i)| (i, first + STREAM_STAGGER * k.min(12) as u32)));
+        }
+        (s.n, s.frame) = (n, frame);
+        let curve = stream_curve();
+        s.born.retain(|(_, at)| {
+            now < *at
+                || Spring::from_rest(1., FLICK_RESPONSE, now.saturating_duration_since(*at).as_secs_f32()) > 0.01
+                || now.saturating_duration_since(*at) < STREAM_FADE
+        });
+        if s.born.is_empty() {
+            return Vec::new();
+        }
+        self.want_frame();
+        s.born
+            .iter()
+            .map(|&(i, at)| {
+                let t = now.checked_duration_since(at).map_or(-1., |d| d.as_secs_f32());
+                if t < 0. {
+                    return (i, 0., LIFT);
+                }
+                let clip = 1. - Spring::from_rest(1., FLICK_RESPONSE, t);
+                (i, clip, curve.sample((t / STREAM_FADE.as_secs_f32()).min(1.)))
+            })
+            .collect()
+    }
+
+    /// After the list's layout: arrivals it drew this frame but did not
+    /// paint (laid out in its overdraw, off screen) have no measure, and
+    /// GPUI keeps the 0 px they were drawn at. They don't reveal: they come
+    /// back at their height, and their rows (returned) are measured again.
+    pub(crate) fn unpainted(&self) -> Vec<usize> {
+        let frame = self.frame.get();
+        let mut out = Vec::new();
+        self.col.grows.borrow_mut().retain(|key, g| {
+            let off = g.frame == frame && g.arriving && g.sink.get().is_nan();
+            if off {
+                self.col.quiet.borrow_mut().insert(*key);
+                out.push(g.ix);
+            }
+            !off
+        });
+        out
+    }
+
+    /// Rows revealing or growing now (tests).
+    #[cfg(test)]
+    pub(crate) fn growing(&self) -> usize {
+        self.col.grows.borrow().len()
+    }
+
+    /// Row `key` is revealing as it arrives (tests).
+    #[cfg(test)]
+    pub(crate) fn arriving(&self, key: u64) -> bool {
+        self.col.grows.borrow().get(&key).is_some_and(|g| g.arriving)
+    }
+
+    /// Row `key`'s drawn and measured heights (tests).
+    #[cfg(test)]
+    pub(crate) fn grow_of(&self, key: u64) -> Option<(f32, f32)> {
+        self.col.grows.borrow().get(&key).map(|g| (g.shown, g.sink.get()))
+    }
+
+    /// The rolls under way in the key space `space` (all: `None`) (tests).
+    #[cfg(test)]
+    pub(crate) fn rolling_in(&self, space: Option<u64>) -> Vec<u64> {
+        let rolls = self.col.rolls.borrow();
+        rolls.iter().filter(|(k, r)| space.is_none_or(|s| *k & (0xFFFF << 48) == s) && r.since.is_some()).map(|(k, _)| *k).collect()
+    }
+
+    /// `text` of `key` this frame (polish.md P5), rolling if it changed while
+    /// drawn at Full: the text it left, how far it still travels (1 → 0 of
+    /// its line, on `snap`: no overshoot) and which way (`up`: the new one
+    /// comes in from below). First drawn, not drawn last frame (history, a
+    /// switch), Reduced or Off: at rest.
+    pub(crate) fn roll(&self, key: u64, text: &SharedString, up: bool) -> Option<(SharedString, f32, bool)> {
+        let (frame, now) = (self.frame.get(), self.now());
+        let mut rolls = self.col.rolls.borrow_mut();
+        let r = rolls.entry(key).or_insert_with(|| Rolling { value: text.clone(), prev: text.clone(), since: None, up, frame });
+        if r.value != *text {
+            let watched = r.frame + 1 >= frame && self.level.get() == Level::Full;
+            r.prev = std::mem::replace(&mut r.value, text.clone());
+            r.since = watched.then_some(now);
+            r.up = up;
+        }
+        r.frame = frame;
+        let since = r.since?;
+        let x = Spring::from_rest(1., SNAP_RESPONSE, now.saturating_duration_since(since).as_secs_f32());
+        if x < ROLL_EPSILON {
+            r.since = None;
+            return None;
+        }
+        // On the shared 30 Hz grid, not the display's rate (Shady #17
+        // R2-M1): a roll is an app frame, and a live fan-out rolls a count
+        // every fraction of a second; N rolls share the ticks, and with the
+        // composer's sweep on screen they land on its frames.
+        self.want_tick();
+        Some((r.prev.clone(), x, r.up))
+    }
+
+    /// Item `id` arrived while watched (`at`: a burst's staggered start).
+    pub(crate) fn born(&self, id: u64, at: Instant) {
+        if self.on() {
+            self.col.births.borrow_mut().insert(id, at);
+        }
+    }
+
+    pub(crate) fn birth(&self, id: u64) -> Option<Instant> {
+        self.col.births.borrow().get(&id).copied()
+    }
+
+    /// Row `key` is revealing: growing, or born too lately to have begun.
+    pub(crate) fn revealing(&self, key: u64) -> bool {
+        self.col.grows.borrow().contains_key(&key) || self.birth(key).is_some_and(|b| self.now().saturating_duration_since(b) < QUICK)
+    }
+
+    /// `value` of `(tag, key)` this frame: when it last changed while
+    /// watched, and what it was before. A value seen for the first time, or
+    /// not drawn last frame (scrolled back in, a session switch), is at
+    /// rest: history never animates. `born`: it arrived just now, from nothing.
+    pub(crate) fn change(&self, tag: Tag, key: u64, value: u64, born: Option<Instant>) -> Option<(Instant, u64)> {
+        let frame = self.frame.get();
+        let mut seen = self.col.seen.borrow_mut();
+        let s = seen.entry((tag, key)).or_insert(Seen { value, prev: u64::MAX, since: born, frame });
+        if s.value != value {
+            if s.frame + 1 >= frame && self.on() {
+                (s.prev, s.since) = (s.value, Some(self.now()));
+            } else {
+                (s.prev, s.since) = (value, None);
+            }
+            s.value = value;
+        }
+        s.frame = frame;
+        s.since.map(|t| (t, s.prev))
+    }
+
+    /// A row at `y` (its place in its list, keyed `key`): its paint offset.
+    pub(crate) fn slide(&self, key: u64, y: f32) -> f32 {
+        let (frame, now) = (self.frame.get(), self.now());
+        let mut slides = self.col.slides.borrow_mut();
+        let s = slides.entry(key).or_insert(Slide { target: y, x0: 0., v0: 0., at: now, frame });
+        if s.frame + 1 < frame || self.level.get() != Level::Full {
+            *s = Slide { target: y, x0: 0., v0: 0., at: now, frame };
+        }
+        s.retarget(y, now);
+        s.frame = frame;
+        if s.settled(now) {
+            return 0.;
+        }
+        self.want_frame();
+        s.state(now).0
+    }
+
+    /// A chevron's turn (0 closed … 1 open), from its angle now.
+    pub(crate) fn turn(&self, key: u64, open: bool) -> f32 {
+        let (frame, now, to) = (self.frame.get(), self.now(), if open { 1. } else { 0. });
+        let mut turns = self.col.turns.borrow_mut();
+        let t = turns.entry(key).or_insert((Tween::rest(to, now), frame));
+        if t.1 + 1 < frame || self.level.get() != Level::Full {
+            t.0 = Tween::rest(to, now);
+        }
+        t.0.retarget(to, now, QUICK, &ease::INOUT);
+        t.1 = frame;
+        if t.0.running(now) {
+            self.want_frame();
+        }
+        t.0.sample(now, &ease::INOUT)
+    }
+
+    /// One-shots that started on this frame (tests: a switch starts none).
+    /// The watched bar's draw is the one a view opening here plays.
+    #[cfg(test)]
+    pub(crate) fn fresh(&self) -> Vec<(Tag, u64)> {
+        let now = self.now.get();
+        let mut v: Vec<(Tag, u64)> =
+            self.col.seen.borrow().iter().filter(|(k, s)| k.0 != Tag::Watched && s.since == Some(now)).map(|(k, _)| *k).collect();
+        v.extend(self.col.births.borrow().iter().filter(|(_, at)| **at >= now).map(|(id, _)| (Tag::Stream, *id)));
+        v
+    }
+
+    /// Every keyed value that changed (animating) after `t` (tests).
+    #[cfg(test)]
+    pub(crate) fn changed_since(&self, t: Instant) -> Vec<(Tag, u64)> {
+        self.col.seen.borrow().iter().filter(|(_, s)| s.since.is_some_and(|at| at > t)).map(|(k, _)| *k).collect()
+    }
+}
+
+/// Tests read the first column's `sent` and `fold` as they read the
+/// window's before (`v.fx.sent`): the protected tests stay byte-identical.
+#[cfg(test)]
+impl std::ops::Deref for Motion {
+    type Target = ColumnFx;
+    fn deref(&self) -> &ColumnFx {
+        &self.cols[0]
     }
 }
 
@@ -3689,5 +3852,79 @@ mod tests {
         m.glow_k(3, 10);
         m.begin_frame(Level::Off, false, t0 + ms(10));
         assert_eq!(m.glow_k(3, 11), 0., "Off: never");
+    }
+}
+
+/// Split panes step 1: each pane's column keeps its own motion
+/// ([`ColumnFx`]), and the old [`Motion`] methods are the first pane's.
+#[cfg(test)]
+mod column_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{Level, Motion, Tag};
+    use crate::pane::PaneId;
+
+    fn frame(fx: &Motion, at: Instant) {
+        fx.begin_frame(Level::Full, false, at);
+    }
+
+    /// Two panes' transcripts both number their items from 1: item 7 is
+    /// born, opens its body and changes in one column, never in the other.
+    #[test]
+    fn two_columns_keep_their_own_births_reveals_and_changes() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(16);
+        let fx = Motion::new(t0);
+        frame(&fx, t0);
+        let (a, b) = (fx.col(PaneId::FIRST), fx.col(PaneId::nth(1)));
+        a.born(7, t0);
+        assert_eq!((a.birth(7), b.birth(7)), (Some(t0), None), "born in a only");
+        for c in [a, b] {
+            c.reveal(7, false, Duration::ZERO, 0).1.set(100.);
+            assert_eq!(c.change(Tag::Card, 7, 1, None), None);
+        }
+        frame(&fx, t1);
+        a.reveal(7, true, Duration::ZERO, 0);
+        b.reveal(7, false, Duration::ZERO, 0);
+        let (open_a, _, _, done_a) = a.body(7, t1).expect("a's body is measured");
+        let (open_b, _, _, done_b) = b.body(7, t1).expect("b's body is measured");
+        assert!(open_a && !done_a, "a's body opens");
+        assert!(!open_b && done_b, "b's stays shut, at rest");
+        assert!(a.change(Tag::Card, 7, 2, None).is_some(), "a's value changed");
+        assert_eq!(b.change(Tag::Card, 7, 1, None), None, "b's did not");
+    }
+
+    /// A pane switching its session forgets its own column's motion only.
+    #[test]
+    fn a_rescope_in_one_column_leaves_the_other() {
+        let t0 = Instant::now();
+        let fx = Motion::new(t0);
+        frame(&fx, t0);
+        let (a, b) = (fx.col(PaneId::FIRST), fx.col(PaneId::nth(1)));
+        a.rescope(1, 1);
+        b.rescope(2, 2);
+        for c in [a, b] {
+            c.born(7, t0);
+            c.sent().set(Some((t0, false)));
+            c.fold().set(Some((7, t0)));
+        }
+        b.rescope(3, 3);
+        assert_eq!(a.birth(7), Some(t0), "a kept its births");
+        assert!(a.sent().get().is_some() && a.fold().get().is_some(), "a kept its handoff and fold");
+        assert_eq!(b.birth(7), None, "b forgot its births");
+        assert!(b.sent().get().is_none() && b.fold().get().is_none(), "b forgot its handoff and fold");
+    }
+
+    /// The window's methods are the first pane's column, unchanged.
+    #[test]
+    fn the_window_methods_are_the_first_column() {
+        let t0 = Instant::now();
+        let fx = Motion::new(t0);
+        frame(&fx, t0);
+        fx.born(9, t0);
+        assert_eq!(fx.col(PaneId::FIRST).birth(9), Some(t0));
+        assert_eq!(fx.col(PaneId::nth(1)).birth(9), None);
+        fx.rescope(5, 5);
+        assert_eq!(fx.col(PaneId::FIRST).birth(9), None, "the delegate rescoped the first column");
     }
 }

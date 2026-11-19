@@ -49,6 +49,7 @@ mod named;
 mod overlay;
 mod palette;
 mod palettes;
+mod pane;
 mod rail;
 mod scroll;
 mod scrollbar;

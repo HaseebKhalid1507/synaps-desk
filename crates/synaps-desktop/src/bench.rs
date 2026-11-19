@@ -522,8 +522,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     v.reset_transcript();
                     v.model.transcript.apply_history(&turns(DRAG_TURNS, 13));
                     v.sync_list();
-                    v.list.set_follow_mode(FollowMode::Tail);
-                    v.list.scroll_to_end();
+                    v.panes.cur.list.set_follow_mode(FollowMode::Tail);
+                    v.panes.cur.list.scroll_to_end();
                 });
                 sleep(1.5).await;
                 let long = "A draft that runs past the end of its first line and onto a second one, so the composer grows by \
@@ -542,8 +542,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             match act {
                                 0 => v.toggle_panel(true, cx),
                                 1 => v.toggle_panel(false, cx),
-                                2 => v.composer.update(cx, |s, cx| s.set_value(long, window, cx)),
-                                _ => v.composer.update(cx, |s, cx| s.set_value("", window, cx)),
+                                2 => v.panes.cur.composer.update(cx, |s, cx| s.set_value(long, window, cx)),
+                                _ => v.panes.cur.composer.update(cx, |s, cx| s.set_value("", window, cx)),
                             }
                             cx.notify();
                         });
@@ -663,8 +663,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         .collect();
                         v.apply_batch(vec![Event::Sessions(metas)], cx);
                         v.sync_list();
-                        v.list.set_follow_mode(FollowMode::Tail);
-                        v.list.scroll_to_end();
+                        v.panes.cur.list.set_follow_mode(FollowMode::Tail);
+                        v.panes.cur.list.scroll_to_end();
                     });
                     sleep(after).await;
                     let _ = upd(cx, &|v, _| {
@@ -676,7 +676,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         });
                         t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                         v.sync_list();
-                        v.list.scroll_to_end();
+                        v.panes.cur.list.scroll_to_end();
                     });
                     // `SYNAPS_BENCH_STATES=1` (H2 evidence, indicators/proposal.md
                     // §6): instead, one run with a call in each of the
@@ -720,7 +720,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                                 v.model.transcript.apply(&SessionEvent::Prompt { request });
                             }
                             v.sync_list();
-                            v.list.scroll_to_end();
+                            v.panes.cur.list.scroll_to_end();
                         });
                         for k in 0..10 {
                             sleep(0.5).await;
@@ -760,14 +760,14 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                                 if !grow {
                                     return;
                                 }
-                                v.composer.update(cx, |s, cx| s.set_value("steer: and the relay too\nkeep the old token\nthen run it again", window, cx))
+                                v.panes.cur.composer.update(cx, |s, cx| s.set_value("steer: and the relay too\nkeep the old token\nthen run it again", window, cx))
                             });
                             sleep(1.5).await;
                             mark("stream");
                             let _ = upd(cx, &|v, _| {
-                                let t = v.list.logical_scroll_top();
+                                let t = v.panes.cur.list.logical_scroll_top();
                                 let id = v.model.shown().items().iter().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == "s3")).map(|i| i.id);
-                                let s3 = v.disp.iter().position(|d| Some(d.id) == id && d.kind == crate::turns::Kind::Work);
+                                let s3 = v.panes.cur.disp.iter().position(|d| Some(d.id) == id && d.kind == crate::turns::Kind::Work);
                                 eprintln!("HELD top {} +{:.0}, s3's row {s3:?}", t.item_ix, f32::from(t.offset_in_item));
                             });
                             // A new call at the run's end (or `s3`): its
@@ -813,8 +813,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             //   (a touchpad) for 3 s, and after.
                             let t0 = Instant::now();
                             let mark = |what: &str| eprintln!("FOLDS {what} {:.3}", t0.elapsed().as_secs_f64());
-                            let run = |v: &AppView| v.disp.iter().rev().find(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id);
-                            let last = |v: &AppView| v.disp.iter().rev().find(|d| d.kind == crate::turns::Kind::Work).map(|d| d.id);
+                            let run = |v: &AppView| v.panes.cur.disp.iter().rev().find(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id);
+                            let last = |v: &AppView| v.panes.cur.disp.iter().rev().find(|d| d.kind == crate::turns::Kind::Work).map(|d| d.id);
                             let flip = |v: &mut AppView| {
                                 if let Some(id) = run(v) {
                                     v.toggle_run(id);
@@ -825,10 +825,10 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             let _ = upd(cx, &|v, _| flip(v));
                             sleep(2.).await;
                             let _ = upd(cx, &|v, _| {
-                                if let Some(ix) = run(v).and_then(|id| v.disp.iter().position(|d| d.id == id)) {
-                                    let third = f32::from(v.list.viewport_bounds().size.height) / 3.;
-                                    v.list.scroll_to(gpui::ListOffset { item_ix: ix, offset_in_item: gpui::px(0.) });
-                                    v.list.scroll_by(gpui::px(-third));
+                                if let Some(ix) = run(v).and_then(|id| v.panes.cur.disp.iter().position(|d| d.id == id)) {
+                                    let third = f32::from(v.panes.cur.list.viewport_bounds().size.height) / 3.;
+                                    v.panes.cur.list.scroll_to(gpui::ListOffset { item_ix: ix, offset_in_item: gpui::px(0.) });
+                                    v.panes.cur.list.scroll_by(gpui::px(-third));
                                 }
                             });
                             sleep(1.5).await;
@@ -838,7 +838,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             mark("unfold-mid");
                             let _ = upd(cx, &|v, _| flip(v));
                             sleep(2.).await;
-                            let _ = upd(cx, &|v, _| v.list.scroll_to_end());
+                            let _ = upd(cx, &|v, _| v.panes.cur.list.scroll_to_end());
                             sleep(1.).await;
                             mark("fold-end");
                             let _ = upd(cx, &|v, _| flip(v));
@@ -846,7 +846,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             mark("unfold-to-end");
                             let _ = upd(cx, &|v, _| {
                                 flip(v);
-                                v.list.scroll_to_end();
+                                v.panes.cur.list.scroll_to_end();
                             });
                             sleep(2.).await;
                             mark("fold-rows-under");
@@ -855,7 +855,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             mark("unfold-for-body");
                             let _ = upd(cx, &|v, _| flip(v));
                             sleep(1.5).await;
-                            let _ = upd(cx, &|v, _| v.list.scroll_to_end());
+                            let _ = upd(cx, &|v, _| v.panes.cur.list.scroll_to_end());
                             sleep(1.).await;
                             mark("body-open");
                             let _ = upd(cx, &|v, _| {
@@ -887,8 +887,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             mark("slow-scroll");
                             for k in 0..430 {
                                 let _ = upd(cx, &|v, _| {
-                                    v.scroller.touch();
-                                    v.list.scroll_by(gpui::px(-0.5));
+                                    v.panes.cur.scroller.touch();
+                                    v.panes.cur.list.scroll_by(gpui::px(-0.5));
                                 });
                                 if k % 40 == 0 {
                                     apply(cx, vec![delta("z9", &format!("relay: refresh {k} ok\n"))]);
@@ -914,7 +914,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             t.apply(&SessionEvent::TurnStarted { turn_baseline: 14, trigger: "user".into(), user_text: Some("Tail the log.".into()) });
                             t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                             v.sync_list();
-                            v.list.scroll_to_end();
+                            v.panes.cur.list.scroll_to_end();
                         });
                         apply(cx, vec![call("z9", "bash", cmd("tail -f logs/relay.log"))]);
                         sleep(1.5).await;
@@ -1081,7 +1081,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         v.model.set_local_session("bench-chips");
                         v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
                         v.sync_list();
-                        v.list.scroll_to_end();
+                        v.panes.cur.list.scroll_to_end();
                     });
                     let mut evs: Vec<Value> = (0..n as usize)
                         .flat_map(|k| {
@@ -1150,7 +1150,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         v.model.set_local_session("bench-link");
                         v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
                         v.sync_list();
-                        v.list.scroll_to_end();
+                        v.panes.cur.list.scroll_to_end();
                     });
                     let _ = upd(cx, &conn(true));
                     sleep(2.0).await;
@@ -1179,7 +1179,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     if idle.is_some() {
                         v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
                         v.sync_list();
-                        v.list.scroll_to_end();
+                        v.panes.cur.list.scroll_to_end();
                     }
                 });
                 sleep(1.0).await;
@@ -1191,8 +1191,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     v.model.set_local_session("bench-motion");
                     v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
                     v.sync_list();
-                    v.list.set_follow_mode(FollowMode::Tail);
-                    v.list.scroll_to_end();
+                    v.panes.cur.list.set_follow_mode(FollowMode::Tail);
+                    v.panes.cur.list.scroll_to_end();
                     let t = &mut v.model.transcript;
                     t.apply(&SessionEvent::TurnStarted {
                         turn_baseline: 40,
@@ -1211,7 +1211,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         }),
                     });
                     v.sync_list();
-                    v.list.scroll_to_end();
+                    v.panes.cur.list.scroll_to_end();
                 });
                 sleep(1.0).await;
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
@@ -1234,7 +1234,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         });
                     }
                     v.sync_list();
-                    v.list.scroll_to_end();
+                    v.panes.cur.list.scroll_to_end();
                 });
                 sleep(1.0).await;
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
@@ -1386,7 +1386,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     evs.push(json!({"ev": "subagent_rows", "rows": rows}));
                     v.apply_batch(evs.into_iter().filter_map(local_raw).collect(), cx);
                     v.sync_list();
-                    v.list.scroll_to_end();
+                    v.panes.cur.list.scroll_to_end();
                 });
                 sleep(2.0).await;
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
@@ -1409,7 +1409,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     t.apply(&SessionEvent::TurnStarted { turn_baseline: 12, trigger: "user".into(), user_text: Some("Go on.".into()) });
                     t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                     v.sync_list();
-                    v.list.scroll_to_end();
+                    v.panes.cur.list.scroll_to_end();
                 });
                 sleep(2.0).await;
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
@@ -1485,8 +1485,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     v.model.set_local_session("diag");
                     v.model.transcript.apply_history(&dated(synthetic::history(opts.history_messages, 11)));
                     v.sync_list();
-                    v.list.set_follow_mode(FollowMode::Normal);
-                    v.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
+                    v.panes.cur.list.set_follow_mode(FollowMode::Normal);
+                    v.panes.cur.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
                 });
                 sleep(0.4).await;
                 let t0 = Instant::now();
@@ -1504,7 +1504,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 }
                 let _ = upd(cx, &|v, _| {
                     v.plain_rows = false;
-                    v.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
+                    v.panes.cur.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
                     v.bench.as_mut().unwrap().scroll = Some((Instant::now(), opts.scroll_px_per_s));
                 });
                 let t0 = Instant::now();
@@ -1519,8 +1519,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
                         v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                         v.sync_list();
-                        v.list.set_follow_mode(FollowMode::Tail);
-                        v.list.scroll_to_end();
+                        v.panes.cur.list.set_follow_mode(FollowMode::Tail);
+                        v.panes.cur.list.scroll_to_end();
                     });
                     let n = 500usize;
                     let deltas = synthetic::deltas(n * 9, seed);
@@ -1560,8 +1560,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 });
                 v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                 v.sync_list();
-                v.list.set_follow_mode(FollowMode::Tail);
-                v.list.scroll_to_end();
+                v.panes.cur.list.set_follow_mode(FollowMode::Tail);
+                v.panes.cur.list.scroll_to_end();
                 v.bench.as_mut().unwrap().animate = true;
             });
             sleep(0.3).await;
@@ -1610,8 +1610,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 v.reset_transcript();
                 v.model.transcript.apply_history(&dated(synthetic::history(opts.history_messages, 11)));
                 v.sync_list();
-                v.list.set_follow_mode(FollowMode::Normal);
-                v.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
+                v.panes.cur.list.set_follow_mode(FollowMode::Normal);
+                v.panes.cur.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
                 v.bench.as_mut().unwrap().animate = true;
             });
             sleep(0.6).await;
@@ -1631,7 +1631,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     s["rows"] = json!(v.model.transcript.len());
                     s["messages"] = json!(opts.history_messages);
                     s["px_per_s"] = json!(speed);
-                    s["reached_row"] = json!(v.list.logical_scroll_top().item_ix);
+                    s["reached_row"] = json!(v.panes.cur.list.logical_scroll_top().item_ix);
                     s
                 })
                 .unwrap_or(Value::Null);
@@ -1643,7 +1643,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             //     notch (3 lines) every 25 ms for 2.5 s, through the
             //     window's own input path, first under Full (the scroller's
             //     glide), then Reduced (GPUI's own wheel: the build before F1).
-            let center = view.update(cx, |v, _| v.list.viewport_bounds().center()).unwrap_or_default();
+            let center = view.update(cx, |v, _| v.panes.cur.list.viewport_bounds().center()).unwrap_or_default();
             for (name, level) in [("spin_full", crate::motion::Level::Full), ("spin_reduced", crate::motion::Level::Reduced)] {
                 let _ = cx.update(|_, cx| {
                     cx.set_global(crate::motion::Setting { level: Some(level), lock: None });
@@ -1652,7 +1652,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 let _ = upd(cx, &|v, _| v.bench.as_mut().unwrap().animate = false);
                 sleep(0.3).await;
                 let t0 = Instant::now();
-                let start = view.update(cx, |v, _| -f32::from(v.list.scroll_px_offset_for_scrollbar().y)).unwrap_or(0.);
+                let start = view.update(cx, |v, _| -f32::from(v.panes.cur.list.scroll_px_offset_for_scrollbar().y)).unwrap_or(0.);
                 for _ in 0..100 {
                     let _ = cx.update(|window, cx| {
                         window.dispatch_event(
@@ -1683,7 +1683,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         let b = v.bench.as_mut().unwrap();
                         b.drain();
                         let mut s = b.stats(t0, t1, refresh_fallback);
-                        s["travel_px"] = json!(round((-f32::from(v.list.scroll_px_offset_for_scrollbar().y) - start) as f64, 1));
+                        s["travel_px"] = json!(round((-f32::from(v.panes.cur.list.scroll_px_offset_for_scrollbar().y) - start) as f64, 1));
                         s
                     })
                     .unwrap_or(Value::Null);
@@ -1701,8 +1701,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 v.reset_transcript();
                 v.model.transcript.apply_history(&turns(DRAG_TURNS, 13));
                 v.sync_list();
-                v.list.set_follow_mode(FollowMode::Tail);
-                v.list.scroll_to_end();
+                v.panes.cur.list.set_follow_mode(FollowMode::Tail);
+                v.panes.cur.list.scroll_to_end();
             });
             sleep(0.4).await;
             for (name, rail) in [("drag_rail", true), ("drag_right", false)] {

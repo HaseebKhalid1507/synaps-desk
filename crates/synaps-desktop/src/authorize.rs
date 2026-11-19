@@ -484,7 +484,7 @@ impl AppView {
             return out;
         }
         // The collapsing card's row becomes its receipt line when it lands.
-        let exit = self.card_exit.as_ref().filter(|e| e.session == sid);
+        let exit = self.panes.cur.card_exit.as_ref().filter(|e| e.session == sid);
         for r in self.receipts.get(sid).into_iter().flatten().filter(|r| r.own && exit.is_none_or(|e| e.card.row != r.row)) {
             // Its call gone (compacted away): no line, never a wrong one.
             if let Some(after) = call_ix(items, &r.call) {
@@ -498,7 +498,7 @@ impl AppView {
         }
         if let Some(c) = self.current_card() {
             // The call it gates, or the last item.
-            let call = self.waiting_on.filter(|_| !c.secret).and_then(|id| index_of(items, id));
+            let call = self.panes.cur.waiting_on.filter(|_| !c.secret).and_then(|id| index_of(items, id));
             let after = call.unwrap_or(items.len() - 1);
             c.after.set(Some((items[after].id, call.is_none())));
             out.push(PromptRow { after, id: c.row, rev: 0 });
@@ -510,7 +510,7 @@ impl AppView {
     /// The card's row in the list, if built.
     pub(crate) fn card_ix(&self) -> Option<usize> {
         let row = self.current_card()?.row;
-        self.disp.iter().rposition(|d| d.kind == Kind::Prompt && d.id == row)
+        self.panes.cur.disp.iter().rposition(|d| d.kind == Kind::Prompt && d.id == row)
     }
 
     /// The list's view, top and bottom in the window (the window when it
@@ -518,39 +518,39 @@ impl AppView {
     /// Read from the last layout as a frame begins ([`AppView::read_list_view`]):
     /// a row drawing inside the list's layout may not ask the list.
     pub(crate) fn list_view(&self) -> (f32, f32) {
-        self.list_box.get()
+        self.panes.cur.list_box.get()
     }
 
     /// The list's view as its last layout left it (as a frame begins).
     pub(crate) fn read_list_view(&self) {
-        let b = self.list.viewport_bounds();
+        let b = self.panes.cur.list.viewport_bounds();
         let v = if b.size.height <= px(0.) { (0., self.height) } else { (f32::from(b.top()), f32::from(b.bottom())) };
-        self.list_box.set(v);
+        self.panes.cur.list_box.set(v);
     }
 
     /// The card can be answered from the screen: its row is in the list's
     /// view with its buttons whole (as the frame began: [`AppView::read_card_on_screen`]).
     pub(crate) fn card_on_screen(&self) -> bool {
-        self.card_seen.get()
+        self.panes.cur.card_seen.get()
     }
 
     /// [`AppView::card_on_screen`] from the list's last layout, as a frame
     /// begins (a row drawing inside the list's layout may not ask the list).
     pub(crate) fn read_card_on_screen(&self) {
-        self.card_seen.set(self.card_on_screen_now());
+        self.panes.cur.card_seen.set(self.card_on_screen_now());
     }
 
     fn card_on_screen_now(&self) -> bool {
         let Some(c) = self.current_card() else { return false };
         let (top, bottom) = self.list_view();
         let Some(ix) = self.card_ix() else { return false };
-        match self.list.bounds_for_item(ix) {
+        match self.panes.cur.list.bounds_for_item(ix) {
             Some(b) => f32::from(b.top()) < bottom && f32::from(b.bottom()) > top && c.buttons_shown(top, bottom),
             // Not drawn yet: the frame that draws a new card at the end,
             // where the list follows, counts it shown, as its buttons do.
             // Only as the last row (Shady M6): one placed above others is
             // virtualised away, unseen.
-            None => c.height.get().is_nan() && self.list.is_following_tail() && ix + 1 == self.disp.len(),
+            None => c.height.get().is_nan() && self.panes.cur.list.is_following_tail() && ix + 1 == self.panes.cur.disp.len(),
         }
     }
 
@@ -566,7 +566,7 @@ impl AppView {
         }
         if self.model.watch.focus().is_some() {
             self.open_parent_card(cx);
-            self.jump_card = self.model.card_key();
+            self.panes.cur.jump_card = self.model.card_key();
             cx.notify();
             return;
         }
@@ -574,7 +574,7 @@ impl AppView {
     }
 
     /// The card's row in view and the keys to it (after a frame has built
-    /// it, [`AppView::jump_card`]).
+    /// it, [`Pane::jump_card`]).
     pub(crate) fn reveal_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.card_ix() else { return };
         let (top, bottom) = self.list_view();
@@ -583,13 +583,13 @@ impl AppView {
         // stub leaves now (it pointed here), its room is the view's.
         let top = top + self.sticky_inset(cx);
         let leaves = if self.stub_shown() && self.model.watch.focus().is_none() {
-            self.stub_away = self.model.card_key();
+            self.panes.cur.stub_away = self.model.card_key();
             crate::fit::STUB_GAP + crate::theme::metrics(cx).row
         } else {
             0.
         };
         let bottom = bottom - self.dock_growth() + leaves;
-        match self.list.bounds_for_item(ix) {
+        match self.panes.cur.list.bounds_for_item(ix) {
             Some(b) => {
                 let (t, bt) = (f32::from(b.top()), f32::from(b.bottom()));
                 // Its bottom to the view's (its top if it is taller).
@@ -601,33 +601,33 @@ impl AppView {
                     0.
                 };
                 if by.abs() > 0.5 {
-                    self.list.pause_following_tail();
+                    self.panes.cur.list.pause_following_tail();
                     // Reduced and Off: a cut, in this frame (the stub goes
                     // with it); there is no glide to play.
                     let cut = if self.fx.level() == crate::motion::Level::Full {
-                        self.scroller.jump(by, false, bottom - top, self.fx.clock())
+                        self.panes.cur.scroller.jump(by, false, bottom - top, self.fx.clock())
                     } else {
                         by
                     };
                     if cut != 0. {
-                        self.scroller.touch();
-                        self.list.scroll_by(px(cut));
+                        self.panes.cur.scroller.touch();
+                        self.panes.cur.list.scroll_by(px(cut));
                     }
                 }
             }
             None => {
                 // The user's jump (Shady #23 r4 H1): it leaves the end.
-                self.scroller.touch();
-                self.list.scroll_to_reveal_item(ix);
+                self.panes.cur.scroller.touch();
+                self.panes.cur.list.scroll_to_reveal_item(ix);
                 // Drawn next frame: placed again then, the dock as it lands.
                 if self.dock_growth() > 0.5 {
-                    self.jump_card = self.model.card_key();
+                    self.panes.cur.jump_card = self.model.card_key();
                 }
             }
         }
         let secret = self.current_card().is_some_and(|c| c.secret);
         if secret {
-            self.secret_input.update(cx, |s, cx| s.focus(window, cx));
+            self.panes.cur.secret_input.update(cx, |s, cx| s.focus(window, cx));
         } else {
             window.focus(&self.focus, cx);
         }
@@ -640,8 +640,8 @@ impl AppView {
     /// motion).
     pub(crate) fn toggle_allow_all(&mut self, cx: &mut Context<Self>) {
         let offered = self.allow_all_offered();
-        let may = self.card_answerable().is_some() && self.card.as_ref().is_some_and(|c| !self.model.prompt_answered(c.key.1));
-        if let Some(c) = self.card.as_mut().filter(|_| offered && may) {
+        let may = self.card_answerable().is_some() && self.panes.cur.card.as_ref().is_some_and(|c| !self.model.prompt_answered(c.key.1));
+        if let Some(c) = self.panes.cur.card.as_mut().filter(|_| offered && may) {
             c.allow_all = !c.allow_all;
             c.arm = Arm::new(Instant::now());
             c._arm = Some(Self::arm_repaint(cx));
@@ -743,7 +743,7 @@ impl AppView {
                 })
                 .into_any_element();
         }
-        if let Some(e) = self.card_exit.as_ref().filter(|e| e.card.row == d.id) {
+        if let Some(e) = self.panes.cur.card_exit.as_ref().filter(|e| e.card.row == d.id) {
             let body = card_slot(self.render_card(&e.card, Some(&e.look), p, m, cx), m).into_any_element();
             let (shown, _) = e.shown(self.fx.now());
             self.fx.want_frame();
@@ -763,7 +763,7 @@ impl AppView {
             .whitespace_nowrap()
             .debug_selector(move || format!("receipt-row {}", d.id))
             // On the call rows' verb column (the finish gate of #18).
-            .child(div().pl(px(crate::turns::Geo::of(self.layout, m).verb)).text_color(p.dim_t).child(format!("{kind} · ")))
+            .child(div().pl(px(crate::turns::Geo::of(self.panes.cur.layout, m).verb)).text_color(p.dim_t).child(format!("{kind} · ")))
             .child(self.receipt_words(rc, rc.answer, false, p))
             .into_any_element()
     }
@@ -777,14 +777,14 @@ impl AppView {
         let secret = c.secret;
         let sent = live && self.model.prompt_answered(pr.id);
         let armed = live && c.armed();
-        let keys_state = if live { self.card_keys.get() } else { None };
+        let keys_state = if live { self.panes.cur.card_keys.get() } else { None };
         let can = look.map_or_else(|| self.drives() && self.model.may_answer(pr.id) && armed, |l| l.can);
         let below = c.below(self.list_view());
         let ready = look.map_or_else(|| authorize_ready(c.armed(), below, c.read), |l| l.ready);
         let detached = self.model.active.is_none();
         let in_field = look.map_or(keys_state == Some(true), |l| l.in_field);
         let keys = look.map_or_else(|| keys_state.is_some() && can && c.keys_armed(), |l| l.keys);
-        let typed = look.map_or_else(|| secret && !self.secret_input.read(cx).value().is_empty(), |l| l.typed);
+        let typed = look.map_or_else(|| secret && !self.panes.cur.secret_input.read(cx).value().is_empty(), |l| l.typed);
         let key = live.then_some(c.key);
         let offered = look.map_or_else(|| self.allow_all_offered(), |l| l.offered);
         let allow_all = offered && c.allow_all;
@@ -798,9 +798,9 @@ impl AppView {
         // card folds, never back to its rest or disabled look between.
         let pressed = match look {
             None => self.sent.as_ref().filter(|s| s.key == c.key).map(|s| s.answer),
-            Some(_) => self.card_exit.as_ref().filter(|e| e.card.row == c.row).map(|e| e.answer),
+            Some(_) => self.panes.cur.card_exit.as_ref().filter(|e| e.card.row == c.row).map(|e| e.answer),
         };
-        let tight = self.layout.tight;
+        let tight = self.panes.cur.layout.tight;
         let key_hint = |k: &'static str, color: Hsla, ground: Hsla| {
             div().flex_none().font_family(fonts::SANS).text_px(m.meta).text_color(crate::motion::mix(ground, color, 0.72)).child(k)
         };
@@ -892,7 +892,7 @@ impl AppView {
                             .items_center()
                             .child(
                                 div().flex_1().min_w_0().max_w(px((260. * r).round())).child(
-                                    gpui_kit::component::input::Input::new(&self.secret_input)
+                                    gpui_kit::component::input::Input::new(&self.panes.cur.secret_input)
                                         .disabled(!can)
                                         .text_px(m.mono)
                                         .border_color(p.line),
@@ -1000,7 +1000,8 @@ impl AppView {
         };
         let footer_warn = look.map_or(more.is_some() && !sent, |l| l.footer_warn);
         if live {
-            *self.card_look.borrow_mut() = CardLook { can, ready, keys, in_field, typed, footer: footer.clone(), footer_warn, offered };
+            *self.panes.cur.card_look.borrow_mut() =
+                CardLook { can, ready, keys, in_field, typed, footer: footer.clone(), footer_warn, offered };
         }
         // The command strip (§5): a guard's command alone, `$` in `dim`;
         // else the whole body, verbatim. Up to the form's most lines, the
@@ -1008,14 +1009,14 @@ impl AppView {
         // As many whole lines as the window has room for beside the
         // composer (fit.rs: from 3, fewer if the text has fewer, to the
         // form's most), so the whole card fits the list's view.
-        let form = self.layout.form();
+        let form = self.panes.cur.layout.form();
         let shown_lines = match &c.guard {
             Some(g) => g.command.lines().count().max(1) as f32,
             None => c.body.lines().count().max(1) as f32,
         };
         let ex = self.extras();
         let floor = crate::fit::well_floor(m, form, shown_lines.clamp(1., crate::fit::WELL_MIN), ex);
-        let rows = self.composer.read(cx).text().lines_len().clamp(1, self.composer_rows.max(1));
+        let rows = self.panes.cur.composer.read(cx).text().lines_len().clamp(1, self.panes.cur.composer_rows.max(1));
         // A soft-wrapped line takes more than its one: the most is the
         // window's room, the least the text's own lines (they scroll).
         let lines = crate::fit::well_lines(m, form, self.height, rows, floor, ex);
@@ -1058,7 +1059,7 @@ impl AppView {
         // The card asks once (§8 #8): its flush, 12 % of the accent off the
         // card, and its header dot's one ping, from +60 over `sig`; then
         // still until answered. Collapsing, as its last frame.
-        let arrived = self.card_at.filter(|_| live);
+        let arrived = self.panes.cur.card_at.filter(|_| live);
         let flush = self.fx.decay(arrived.map(|a| a + 2 * crate::motion::STAGGER), Duration::ZERO, crate::motion::SIG);
         let ping = self.fx.ping(arrived, 2 * crate::motion::STAGGER);
         let card_bg = crate::motion::mix(p.card_d, p.ask_flush, flush);
@@ -1101,7 +1102,7 @@ impl AppView {
                     .child(title),
             )
             .child(div().flex_1())
-            .children(c.asked.clone().filter(|_| !self.layout.tight).map(|a| {
+            .children(c.asked.clone().filter(|_| !self.panes.cur.layout.tight).map(|a| {
                 div()
                     .min_w_0()
                     .overflow_hidden()
@@ -1137,7 +1138,7 @@ impl AppView {
                 .flex_none()
                 .gap(px(8.))
                 .items_center()
-                .when(live, |d| d.track_focus(&self.allow_all_focus))
+                .when(live, |d| d.track_focus(&self.panes.cur.allow_all_focus))
                 .when(live && can, |d| d.cursor_pointer())
                 .child(
                     div()
@@ -1166,7 +1167,7 @@ impl AppView {
                 .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
                 .when(live && can, |d| {
                     d.on_click(cx.listener(|this, _, window, cx| {
-                        window.focus(&this.allow_all_focus, cx);
+                        window.focus(&this.panes.cur.allow_all_focus, cx);
                         this.toggle_allow_all(cx);
                     }))
                 })

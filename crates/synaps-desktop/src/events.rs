@@ -248,7 +248,7 @@ impl AppView {
         if let Some(t) = time {
             head = head.child(crate::turns::time_slot(t, id, p, m));
         }
-        let open = !v.folds() || self.toggled.contains(&id);
+        let open = !v.folds() || self.panes.cur.toggled.contains(&id);
         let (text, more) = if open { (v.body.clone(), 0) } else { v.folded() };
         let data = if open { v.data.clone() } else { v.folded_data() };
         let data = data.map(|d| {

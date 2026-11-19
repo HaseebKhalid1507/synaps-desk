@@ -545,7 +545,7 @@ impl AppView {
     /// the composer foot: nothing allocated.
     pub(crate) fn worker_state(&self, session: &str, handle: &str, expect: Option<(Option<&str>, &str)>) -> Option<Liveness> {
         let attached = self.model.is_active(session);
-        let shown = attached || self.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(session);
+        let shown = attached || self.panes.cur.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(session);
         let subs = match (shown, self.tab_cache.peek(session)) {
             (true, _) => &self.model.stats.subagents,
             (false, Some(c)) => &c.stats.subagents,
@@ -641,7 +641,7 @@ impl AppView {
             self.model.rail_gen += 1;
             self.reconcile(None);
             // The tracer only to a tab this opened (focusing one is not).
-            self.tracer_open = self.model.tabs.current().map(|t| t.id).filter(|id| !had.contains(id));
+            self.panes.cur.tracer_open = self.model.tabs.current().map(|t| t.id).filter(|id| !had.contains(id));
         }
         cx.notify();
     }
@@ -660,7 +660,7 @@ impl AppView {
         match pick {
             Some(who) => self.open_worker_tab(&who, cx),
             None => {
-                self.watch_note = Some("no running workers to open in a tab".into());
+                self.panes.cur.watch_note = Some("no running workers to open in a tab".into());
                 cx.notify();
             }
         }
@@ -683,7 +683,7 @@ impl AppView {
         let watched = self.model.watch.focused().map(|w| w.subagent_id);
         let row = watched.and_then(|id| rows.iter().find(|r| r.id == id)).or_else(|| rows.iter().rev().find(|r| r.watchable));
         let (Some(r), Some(session)) = (row.filter(|r| r.watchable), self.worker_session()) else {
-            self.watch_note = Some("no worker here: the tray over the composer lists the session's workers".into());
+            self.panes.cur.watch_note = Some("no worker here: the tray over the composer lists the session's workers".into());
             cx.notify();
             return;
         };
@@ -809,7 +809,7 @@ impl AppView {
         self.close_menu();
         // Its handle names another worker now: nothing of that one's.
         if act != Act::CopyHandle && !(act == Act::Open && t.tab.is_some()) && self.facts(&t, Instant::now()).other {
-            self.watch_note = Some(other_why(&t.who.handle(), &t.who.name).into());
+            self.panes.cur.watch_note = Some(other_why(&t.who.handle(), &t.who.name).into());
             cx.notify();
             return;
         }
@@ -827,7 +827,7 @@ impl AppView {
                     None => self.watch_worker(&t.who, cx),
                 }
                 if act == Act::Steer {
-                    self.composer.update(cx, |s, cx| s.focus(window, cx));
+                    self.panes.cur.composer.update(cx, |s, cx| s.focus(window, cx));
                 }
             }
             Act::OpenTab => self.open_worker_tab(&t.who, cx),
@@ -856,7 +856,7 @@ impl AppView {
         if let Some(b) = self.cancel_blocked(session, who, &handle) {
             if how.is_press() {
                 self.close_menu();
-                self.watch_note = Some(b.say(who).into());
+                self.panes.cur.watch_note = Some(b.say(who).into());
                 cx.notify();
             }
             return;
@@ -871,7 +871,7 @@ impl AppView {
                         log::debug!(target: "synaps_desktop::watch", "cancel {handle} ({})", who.name);
                         self.model.cancels.sent(session, &handle, seq, now);
                     }
-                    _ => self.watch_note = Some(format!("{handle} not cancelled: the connection thread has stopped").into()),
+                    _ => self.panes.cur.watch_note = Some(format!("{handle} not cancelled: the connection thread has stopped").into()),
                 }
                 self.close_menu();
                 self.cancel_tick = None;
