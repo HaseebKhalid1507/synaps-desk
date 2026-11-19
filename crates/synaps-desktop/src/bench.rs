@@ -68,6 +68,8 @@ pub struct BenchState {
     pub drag: Option<(Instant, bool)>,
     pub animate: bool,
     pub submit_at: Option<Instant>,
+    /// The real-daemon bench's own attachment (its prompt goes there).
+    pub attach_seq: Option<u64>,
     turn_seen: bool,
     pub first_text_at: Option<Instant>,
     pub idle_at: Option<Instant>,
@@ -86,6 +88,7 @@ impl BenchState {
             drag: None,
             animate: false,
             submit_at: None,
+            attach_seq: None,
             turn_seen: false,
             first_text_at: None,
             idle_at: None,
@@ -1739,6 +1742,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let seq = v.client.as_ref().unwrap().create(synaps_client::CreateOptions::new());
                     if let Ok(seq) = seq {
                         v.model.want(seq);
+                        v.bench.as_mut().unwrap().attach_seq = Some(seq);
                     }
                 });
                 let mut attached = None;
@@ -1756,7 +1760,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let p = prompt.clone();
                     let _ = upd(cx, &move |v, _| {
                         v.bench.as_mut().unwrap().submit_at = Some(submit);
-                        let _ = v.client.as_ref().unwrap().submit(p.clone());
+                        if let Some(seq) = v.bench.as_ref().unwrap().attach_seq {
+                            let _ = v.client.as_ref().unwrap().on(seq).submit(p.clone());
+                        }
                     });
                     let budget = 28.0 - t_main.elapsed().as_secs_f64();
                     let until = Instant::now() + Duration::from_secs_f64(budget.max(1.0));

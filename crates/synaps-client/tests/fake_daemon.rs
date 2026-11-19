@@ -1675,3 +1675,175 @@ async fn an_attach_cancels_the_pages_outstanding_on_its_connection() {
     drop(c);
     assert_eq!(server.await.unwrap(), ["catalog_page", "catalog_page", "attach"]);
 }
+
+/// `Attached` for session `sid` (the fixture's, with its id swapped).
+fn attached_to(client: u64, sid: &str) -> Value {
+    let mut a = attached_frame(client);
+    a["meta"]["id"] = json!(sid);
+    a
+}
+
+/// The next `cmd` frame on `conn`, with the session it names.
+async fn next_cmd(conn: &mut Conn) -> (String, Value) {
+    loop {
+        let f = conn.recv().await.expect("eof waiting for a cmd");
+        if f["type"] == "cmd" {
+            return (f["session_id"].as_str().unwrap_or_default().to_string(), f["cmd"].clone());
+        }
+    }
+}
+
+/// The attachment of the next `Attached`, and its connection.
+async fn attached_seq(events: &async_channel::Receiver<Event>) -> (u64, u64) {
+    wait(events, "attached", |e| match e {
+        Event::Attached { attach_seq, attached, .. } => Some((*attach_seq, attached.connection)),
+        _ => None,
+    })
+    .await
+}
+
+/// Split panes step 2 (architecture §3.3): two sessions attached at once,
+/// each on its own connection. Every command addressed with `on(seq)`
+/// reaches that attachment's daemon connection and session only: a
+/// submit, a steer, an abort and an answer for A never reach B, and the
+/// other way round. An answer aimed at B's connection but addressed to A
+/// is refused and sent nowhere. Detaching A leaves B; A's commands are
+/// then `NotAttached` with A's seq, and B never sees them. A plain
+/// `attach` still replaces every attachment.
+#[tokio::test]
+async fn two_attachments_route_every_command_by_seq() {
+    let mut fake = Fake::start("multi").await;
+    let (client, events) = fake.client();
+    let a = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut ca = fake.next_attach().await;
+    ca.send(attached_to(2, SID)).await;
+    let (sa, conn_a) = attached_seq(&events).await;
+    let b = client.attach_more(SID2, AttachMode::Mirror).unwrap();
+    assert!(b > a);
+    let mut cb = fake.next_attach().await;
+    assert!(cb.attach.to_string().contains(SID2), "B's attach is for B's session: {}", cb.attach);
+    cb.send(attached_to(5, SID2)).await;
+    let (sb, conn_b) = attached_seq(&events).await;
+    assert_eq!((sa, sb), (a, b));
+    assert_ne!(conn_a, conn_b, "one connection each");
+
+    client.on(b).submit("to B").unwrap();
+    client.on(a).submit("to A").unwrap();
+    client.on(a).steer("steer A").unwrap();
+    client.on(b).abort().unwrap();
+    client.on(b).answer_on(conn_b, 7, Some("y".into())).unwrap();
+    // B's prompt, answered through A: refused, sent nowhere.
+    client.on(a).answer_on(conn_b, 7, Some("y".into())).unwrap();
+    let why = wait(&events, "a cross-session answer refused", |e| match e {
+        Event::Error { attach_seq, error: Error::Refused { command: Some(c), reason } } if c == "answer" => Some((*attach_seq, reason.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(why.0, Some(a), "{why:?}");
+    client.on(a).answer_on(conn_a, 3, Some("n".into())).unwrap();
+
+    assert_eq!(next_cmd(&mut ca).await, (SID.to_string(), json!({"cmd": "submit", "text": "to A", "attachments": []})));
+    assert_eq!(next_cmd(&mut ca).await, (SID.to_string(), json!({"cmd": "steer", "text": "steer A"})));
+    assert_eq!(next_cmd(&mut ca).await, (SID.to_string(), json!({"cmd": "answer", "prompt_id": 3, "value": "n"})));
+    assert_eq!(next_cmd(&mut cb).await, (SID2.to_string(), json!({"cmd": "submit", "text": "to B", "attachments": []})));
+    assert_eq!(next_cmd(&mut cb).await, (SID2.to_string(), json!({"cmd": "cancel"})));
+    assert_eq!(next_cmd(&mut cb).await, (SID2.to_string(), json!({"cmd": "answer", "prompt_id": 7, "value": "y"})));
+
+    // A leaves; B stays.
+    client.on(a).detach().unwrap();
+    assert_eq!(next_cmd(&mut ca).await, (SID.to_string(), json!({"cmd": "detach", "client": 2})));
+    let gone = wait(&events, "A detached", |e| match e {
+        Event::Detached { attach_seq, reason, .. } => Some((*attach_seq, reason.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(gone, (a, "detached".to_string()));
+    client.on(a).submit("A is gone").unwrap();
+    let err = wait(&events, "A not attached", |e| match e {
+        Event::Error { attach_seq, error: e @ Error::NotAttached { .. } } => Some((*attach_seq, e.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(err, (Some(a), Error::NotAttached { command: "submit" }));
+    client.on(b).submit("still B").unwrap();
+    assert_eq!(next_cmd(&mut cb).await, (SID2.to_string(), json!({"cmd": "submit", "text": "still B", "attachments": []})));
+
+    // A plain attach replaces every attachment (B included).
+    let c = client.attach(SID, AttachMode::Mirror).unwrap();
+    assert_eq!(next_cmd(&mut cb).await, (SID2.to_string(), json!({"cmd": "detach", "client": 5})));
+    let replaced = wait(&events, "B replaced", |e| match e {
+        Event::Detached { attach_seq, reason, .. } if *attach_seq == b => Some(reason.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(replaced, "replaced by another attach");
+    let cc = fake.next_attach().await;
+    cc.send(attached_to(9, SID)).await;
+    assert_eq!(attached_seq(&events).await.0, c);
+    client.shutdown().unwrap();
+}
+
+/// One attachment ending by itself (its session ended) leaves the other
+/// attached and addressable; commands to the ended one are `NotAttached`
+/// with its seq and reach nobody.
+#[tokio::test]
+async fn one_attachment_ending_leaves_the_other() {
+    let mut fake = Fake::start("multi-end").await;
+    let (client, events) = fake.client();
+    let a = client.attach(SID, AttachMode::Mirror).unwrap();
+    let ca = fake.next_attach().await;
+    ca.send(attached_to(2, SID)).await;
+    attached_seq(&events).await;
+    let b = client.attach_more(SID2, AttachMode::Mirror).unwrap();
+    let mut cb = fake.next_attach().await;
+    cb.send(attached_to(3, SID2)).await;
+    attached_seq(&events).await;
+    ca.event(30, json!({"ev": "ended", "reason": "client_quit"})).await;
+    let ended = wait(&events, "A ended", |e| match e {
+        Event::Detached { attach_seq, reason, .. } => Some((*attach_seq, reason.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(ended, (a, "session ended".to_string()));
+    client.on(a).steer("to the ended one").unwrap();
+    let err = wait(&events, "not attached", |e| match e {
+        Event::Error { attach_seq, error: e @ Error::NotAttached { .. } } => Some((*attach_seq, e.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(err, (Some(a), Error::NotAttached { command: "steer" }));
+    client.on(b).steer("to B").unwrap();
+    assert_eq!(next_cmd(&mut cb).await, (SID2.to_string(), json!({"cmd": "steer", "text": "to B"})));
+    client.shutdown().unwrap();
+    assert_eq!(next_cmd(&mut cb).await, (SID2.to_string(), json!({"cmd": "detach", "client": 3})));
+}
+
+/// Past `ATTACH_MAX` attachments an `attach_more` is refused (its own
+/// `Detached`, no connection made); the ones attached stay.
+#[tokio::test]
+async fn attach_more_past_the_cap_is_refused() {
+    let mut fake = Fake::start("multi-cap").await;
+    let (client, events) = fake.client();
+    let mut conns = Vec::new();
+    let mut seqs = Vec::new();
+    for i in 0..synaps_client::ATTACH_MAX as u64 {
+        seqs.push(client.attach_more(SID, AttachMode::Mirror).unwrap());
+        let c = fake.next_attach().await;
+        c.send(attached_to(10 + i, SID)).await;
+        attached_seq(&events).await;
+        conns.push(c);
+    }
+    let over = client.attach_more(SID2, AttachMode::Mirror).unwrap();
+    let why = wait(&events, "refused", |e| match e {
+        Event::Detached { attach_seq, reason, session_id } => Some((*attach_seq, reason.clone(), session_id.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(why.0, over);
+    assert!(why.1.starts_with("refused"), "{why:?}");
+    assert_eq!(why.2, None);
+    // The first is still there.
+    client.on(seqs[0]).submit("first").unwrap();
+    assert_eq!(next_cmd(&mut conns[0]).await, (SID.to_string(), json!({"cmd": "submit", "text": "first", "attachments": []})));
+    client.shutdown().unwrap();
+}

@@ -867,7 +867,7 @@ impl AppView {
             Press::Fire => {
                 let seq = self.model.active.as_ref().map(|a| a.attach_seq);
                 match (&self.client, seq) {
-                    (Some(c), Some(seq)) if c.cancel_worker(handle.clone()).is_ok() => {
+                    (Some(c), Some(seq)) if c.on(seq).cancel_worker(handle.clone()).is_ok() => {
                         log::debug!(target: "synaps_desktop::watch", "cancel {handle} ({})", who.name);
                         self.model.cancels.sent(session, &handle, seq, now);
                     }

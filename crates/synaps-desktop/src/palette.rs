@@ -959,7 +959,9 @@ impl AppView {
             self.panes.cur.watch_note = Some(format!("offline: /{name} not run").into());
             return false;
         };
-        if c.engine_command(name, arg).is_err() {
+        // `input_gate` passed: attached, and the one asked for last.
+        let Some(seq) = self.model.attachment() else { return false };
+        if c.on(seq).engine_command(name, arg).is_err() {
             self.model.last_error = Some("the connection thread has stopped".into());
             return false;
         }

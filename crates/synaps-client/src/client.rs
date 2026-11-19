@@ -223,6 +223,19 @@ pub enum Command {
         mode: AttachMode,
     },
     Create(CreateOptions),
+    /// Attach to a live session as well as the ones attached already, on
+    /// its own connection (the daemon holds one session per connection).
+    /// See [`Client::attach_more`].
+    AttachMore {
+        session_id: String,
+        mode: AttachMode,
+    },
+    /// Create (or resume) a session as well as the ones attached already.
+    /// See [`Client::create_more`].
+    CreateMore(CreateOptions),
+    /// Leave the one attachment with this `attach_seq` (`Detach` + `Bye`);
+    /// the others stay. See [`SessionRef::detach`].
+    DetachSeq(u64),
     Submit {
         text: String,
     },
@@ -297,8 +310,9 @@ impl Command {
     pub fn name(&self) -> &'static str {
         match self {
             Command::RefreshSessions => "sessions",
-            Command::Attach { .. } => "attach",
-            Command::Create(_) => "create",
+            Command::Attach { .. } | Command::AttachMore { .. } => "attach",
+            Command::Create(_) | Command::CreateMore(_) => "create",
+            Command::DetachSeq(_) => "detach",
             Command::Submit { .. } => "submit",
             Command::Steer { .. } => "steer",
             Command::Cancel => "cancel",
@@ -323,6 +337,11 @@ impl std::fmt::Debug for Command {
         match self {
             Command::Attach { session_id, mode } => f.debug_struct("Attach").field("session_id", session_id).field("mode", mode).finish(),
             Command::Create(o) => f.debug_tuple("Create").field(o).finish(),
+            Command::AttachMore { session_id, mode } => {
+                f.debug_struct("AttachMore").field("session_id", session_id).field("mode", mode).finish()
+            }
+            Command::CreateMore(o) => f.debug_tuple("CreateMore").field(o).finish(),
+            Command::DetachSeq(seq) => f.debug_tuple("DetachSeq").field(seq).finish(),
             Command::Submit { .. } => f.debug_struct("Submit").field("text", &format_args!("<redacted>")).finish(),
             Command::Steer { .. } => f.debug_struct("Steer").field("text", &format_args!("<redacted>")).finish(),
             Command::Answer { prompt_id, .. } => {
@@ -755,11 +774,25 @@ impl Client {
 
     fn post(&self, cmd: Command) -> Result<u64, ClientClosed> {
         let mut seq = self.seq.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(cmd, Command::Attach { .. } | Command::Create(_)) {
+        if matches!(cmd, Command::Attach { .. } | Command::Create(_) | Command::AttachMore { .. } | Command::CreateMore(_)) {
             *seq += 1;
         }
         self.tx.send(Msg { cmd, attach_seq: *seq }).map_err(|_| ClientClosed)?;
         Ok(*seq)
+    }
+
+    /// Queue a session command for attachment `attach_seq` only: if that
+    /// one is gone (detached, replaced, ended), it is answered
+    /// `Error::NotAttached` with that seq, never sent to another session.
+    fn post_to(&self, attach_seq: u64, cmd: Command) -> Result<(), ClientClosed> {
+        self.tx.send(Msg { cmd, attach_seq }).map_err(|_| ClientClosed)
+    }
+
+    /// The session commands of attachment `attach_seq` (what
+    /// [`Client::attach`], [`Client::attach_more`] ... returned): each goes
+    /// to that attachment's own connection, or nowhere.
+    pub fn on(&self, attach_seq: u64) -> SessionRef<'_> {
+        SessionRef { client: self, attach_seq }
     }
 
     /// Queue a command. `Err` only when the thread is gone; what the daemon
@@ -782,6 +815,25 @@ impl Client {
     /// Create a session and attach to it. Returns the `attach_seq`.
     pub fn create(&self, options: CreateOptions) -> Result<u64, ClientClosed> {
         self.post(Command::Create(options))
+    }
+
+    /// Attach to a live session **as well as** the ones attached already
+    /// (not replacing them), on a connection of its own: the daemon holds
+    /// one session per connection. Returns its `attach_seq`; address its
+    /// commands with [`Client::on`]. Past [`ATTACH_MAX`] attachments it is
+    /// refused: `Event::Detached` for that seq.
+    pub fn attach_more(&self, session_id: impl Into<String>, mode: AttachMode) -> Result<u64, ClientClosed> {
+        self.post(Command::AttachMore { session_id: session_id.into(), mode })
+    }
+
+    /// [`Client::create`], as well as the attachments there are.
+    pub fn create_more(&self, options: CreateOptions) -> Result<u64, ClientClosed> {
+        self.post(Command::CreateMore(options))
+    }
+
+    /// [`Client::resume`], as well as the attachments there are.
+    pub fn resume_more(&self, id_or_name: impl Into<String>, options: CreateOptions) -> Result<u64, ClientClosed> {
+        self.create_more(options.resume(id_or_name))
     }
 
     /// Resume a saved session by journal id or name (`Attach::Create` with
@@ -873,11 +925,13 @@ impl Client {
         Ok(self.send(Command::Rename { session_id: session_id.into(), name: name.map(str::to_string), expect })?)
     }
 
+    /// Send a message to the newest attachment (the one a tab switch made;
+    /// with more than one, address it: [`Client::on`]).
     pub fn submit(&self, text: impl Into<String>) -> Result<(), ClientClosed> {
         self.send(Command::Submit { text: text.into() })
     }
 
-    /// Text typed while a turn runs (`Steer`).
+    /// Text typed while a turn runs (`Steer`), to the newest attachment.
     pub fn steer(&self, text: impl Into<String>) -> Result<(), ClientClosed> {
         self.send(Command::Steer { text: text.into() })
     }
@@ -945,7 +999,8 @@ impl Client {
         self.send(Command::EngineCommand { name: name.into(), arg: arg.into() })
     }
 
-    /// Leave the session cleanly (`Detach` + `Bye`); its turn keeps running.
+    /// Leave every attached session cleanly (`Detach` + `Bye`); their turns
+    /// keep running. One only: [`SessionRef::detach`].
     pub fn detach(&self) -> Result<(), ClientClosed> {
         self.send(Command::Detach)
     }
@@ -953,6 +1008,89 @@ impl Client {
     /// Detach, say `Bye` on both connections and stop the thread.
     pub fn shutdown(&self) -> Result<(), ClientClosed> {
         self.send(Command::Shutdown)
+    }
+}
+
+/// The maximum attachments one client holds: four panes' sessions, and
+/// one more being replaced. [`Client::attach_more`] past it is refused.
+pub const ATTACH_MAX: usize = 5;
+
+/// One attachment's session commands ([`Client::on`]). Each is queued for
+/// that attachment's own connection only: if it has gone (detached,
+/// replaced, ended), the command is answered `Error::NotAttached` with
+/// its `attach_seq` and goes nowhere, never to another session.
+#[derive(Clone, Copy)]
+pub struct SessionRef<'a> {
+    client: &'a Client,
+    attach_seq: u64,
+}
+
+impl SessionRef<'_> {
+    /// The attachment these commands go to.
+    pub fn attach_seq(&self) -> u64 {
+        self.attach_seq
+    }
+
+    fn send(&self, cmd: Command) -> Result<(), ClientClosed> {
+        self.client.post_to(self.attach_seq, cmd)
+    }
+
+    /// Send a message ([`Client::submit`], on this attachment).
+    pub fn submit(&self, text: impl Into<String>) -> Result<(), ClientClosed> {
+        self.send(Command::Submit { text: text.into() })
+    }
+
+    /// Text typed while a turn runs ([`Client::steer`]).
+    pub fn steer(&self, text: impl Into<String>) -> Result<(), ClientClosed> {
+        self.send(Command::Steer { text: text.into() })
+    }
+
+    /// Abort the running turn ([`Client::abort`]).
+    pub fn abort(&self) -> Result<(), ClientClosed> {
+        self.send(Command::Cancel)
+    }
+
+    /// Answer a prompt on whatever connection this attachment has up
+    /// ([`Client::answer`]). Prefer [`SessionRef::answer_on`].
+    pub fn answer(&self, prompt_id: u64, value: Option<String>) -> Result<(), ClientClosed> {
+        self.send(Command::Answer { prompt_id, value })
+    }
+
+    /// Answer a prompt that came on `connection` of this attachment
+    /// ([`Client::answer_on`]).
+    pub fn answer_on(&self, connection: u64, prompt_id: u64, value: Option<String>) -> Result<(), ClientClosed> {
+        self.send(Command::AnswerOn { connection, prompt_id, value })
+    }
+
+    /// Re-fetch the whole history ([`Client::resync`]).
+    pub fn resync(&self) -> Result<(), ClientClosed> {
+        self.send(Command::Resync)
+    }
+
+    /// One page of a worker's watch journal ([`Client::watch_subagent`]).
+    pub fn watch_subagent(&self, handle_id: impl Into<String>, since: u64) -> Result<(), ClientClosed> {
+        self.send(Command::SubagentWatch { handle_id: handle_id.into(), since })
+    }
+
+    /// Steer a running worker ([`Client::steer_subagent`]).
+    pub fn steer_subagent(&self, handle_id: impl Into<String>, text: impl Into<String>) -> Result<(), ClientClosed> {
+        self.send(Command::SubagentSteer { handle_id: handle_id.into(), text: text.into() })
+    }
+
+    /// Cancel one running worker ([`Client::cancel_worker`]).
+    pub fn cancel_worker(&self, handle_id: impl Into<String>) -> Result<(), ClientClosed> {
+        self.send(Command::CancelWorker { handle_id: handle_id.into() })
+    }
+
+    /// Run a slash command ([`Client::engine_command`]).
+    pub fn engine_command(&self, name: impl Into<String>, arg: impl Into<String>) -> Result<(), ClientClosed> {
+        self.send(Command::EngineCommand { name: name.into(), arg: arg.into() })
+    }
+
+    /// Leave this attachment only (`Detach` + `Bye`); the others stay. Its
+    /// `Event::Detached` says "detached". Gone already: nothing.
+    pub fn detach(&self) -> Result<(), ClientClosed> {
+        self.send(Command::DetachSeq(self.attach_seq))
     }
 }
 
@@ -1049,7 +1187,9 @@ async fn run(options: ClientOptions, mut rx: mpsc::UnboundedReceiver<Msg>, event
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let control = tokio::spawn(control_loop(sh.clone(), ctl_rx, options.poll_sessions, features));
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(u64, Exit)>();
-    let mut session: Option<SessionTask> = None;
+    // Oldest first. `Attach`/`Create` replace them all (one attachment, as
+    // a tab switch has it); `AttachMore`/`CreateMore` add one.
+    let mut sessions: Vec<SessionTask> = Vec::new();
     loop {
         tokio::select! {
             msg = rx.recv() => {
@@ -1067,13 +1207,26 @@ async fn run(options: ClientOptions, mut rx: mpsc::UnboundedReceiver<Msg>, event
                     Command::Rename { session_id, name, expect } => {
                         let _ = ctl_tx.send(Ctl::Rename { session_id, name, expect });
                     }
-                    Command::Attach { .. } | Command::Create(_) => {
-                        if let Some(old) = session.take() {
-                            stop(old, "replaced by another attach", &sh.events).await;
+                    Command::Attach { .. } | Command::Create(_) | Command::AttachMore { .. } | Command::CreateMore(_) => {
+                        let more = matches!(cmd, Command::AttachMore { .. } | Command::CreateMore(_));
+                        if !more {
+                            for old in std::mem::take(&mut sessions) {
+                                stop(old, "replaced by another attach", &sh.events).await;
+                            }
+                        } else if sessions.len() >= ATTACH_MAX {
+                            emit(
+                                &sh.events,
+                                Event::Detached {
+                                    attach_seq,
+                                    session_id: None,
+                                    reason: format!("refused: {ATTACH_MAX} sessions are attached already"),
+                                },
+                            );
+                            continue;
                         }
                         let (target, mode) = match cmd {
-                            Command::Attach { session_id, mode } => (Target::Existing(session_id), mode),
-                            Command::Create(o) => {
+                            Command::Attach { session_id, mode } | Command::AttachMore { session_id, mode } => (Target::Existing(session_id), mode),
+                            Command::Create(o) | Command::CreateMore(o) => {
                                 let mode = o.mode;
                                 (Target::Create(o), mode)
                             }
@@ -1086,19 +1239,28 @@ async fn run(options: ClientOptions, mut rx: mpsc::UnboundedReceiver<Msg>, event
                             let _ = done.send((attach_seq, exit.clone()));
                             exit
                         });
-                        session = Some(SessionTask { attach_seq, tx: stx, task });
+                        sessions.push(SessionTask { attach_seq, tx: stx, task });
                     }
                     Command::Detach => {
-                        if let Some(old) = session.take() {
+                        for old in std::mem::take(&mut sessions) {
                             stop(old, "detached", &sh.events).await;
                         }
                     }
+                    // Gone already (it ended, or was replaced): nothing to do.
+                    Command::DetachSeq(seq) => {
+                        if let Some(i) = sessions.iter().position(|s| s.attach_seq == seq) {
+                            stop(sessions.remove(i), "detached", &sh.events).await;
+                        }
+                    }
                     Command::Shutdown => break,
+                    // A session command goes to the attachment it names
+                    // (`Msg::attach_seq`), never to another one.
                     other => {
                         let name = other.name();
-                        match &session {
+                        match sessions.iter().find(|s| s.attach_seq == attach_seq) {
                             Some(s) if s.tx.send(other).is_ok() => {}
-                            _ => emit_error(&sh.events, None, Error::NotAttached { command: name }),
+                            // Never attached at all: no attachment to name.
+                            _ => emit_error(&sh.events, (attach_seq != 0).then_some(attach_seq), Error::NotAttached { command: name }),
                         }
                     }
                 }
@@ -1106,14 +1268,14 @@ async fn run(options: ClientOptions, mut rx: mpsc::UnboundedReceiver<Msg>, event
             Some((attach_seq, exit)) = done_rx.recv() => {
                 // A session task ended by itself; a stale one (already
                 // stopped and reported) is ignored.
-                if session.as_ref().is_some_and(|s| s.attach_seq == attach_seq) {
-                    session = None;
+                if let Some(i) = sessions.iter().position(|s| s.attach_seq == attach_seq) {
+                    sessions.remove(i);
                     emit(&sh.events, Event::Detached { attach_seq, session_id: exit.session_id, reason: exit.reason });
                 }
             }
         }
     }
-    if let Some(old) = session.take() {
+    for old in std::mem::take(&mut sessions) {
         stop(old, "client shut down", &sh.events).await;
     }
     let _ = ctl_tx.send(Ctl::Shutdown);

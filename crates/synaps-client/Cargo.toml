@@ -7,6 +7,12 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+# `clippy.toml` bans the unaddressed session commands (`Client::submit` ...)
+# for the desktop, which must name the attachment (`Client::on`); the
+# client's own API and tests keep them.
+[lints.clippy]
+disallowed_methods = "allow"
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

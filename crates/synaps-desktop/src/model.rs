@@ -124,7 +124,8 @@ pub enum Effect {
         text: String,
     },
     ListSessions,
-    Resync,
+    /// The history of this attachment no longer applies: fetch it whole.
+    Resync(u64),
     /// `Client::saved_sessions(named_only, limit)`; if it cannot be sent,
     /// tell [`Model::saved_failed`].
     ListSaved {
@@ -1333,6 +1334,19 @@ impl Model {
     /// while another attachment is on its way (`wanted` is not the active
     /// one), input, answers and HALT would reach that one, not the session
     /// on screen (the connection thread routes them to its latest attach).
+    /// The attachment input goes to: the session on screen, attached and
+    /// the one asked for last (what [`Model::can_send`] checks). Every send
+    /// names its attachment (`client.on(seq)`, split panes §6.4).
+    pub fn attachment(&self) -> Option<u64> {
+        self.active.as_ref().map(|a| a.attach_seq).filter(|&s| self.wanted == Some(s))
+    }
+
+    /// The attachment asked for last (attached or on its way): where a
+    /// worker poll or a detach goes.
+    pub fn wanted(&self) -> Option<u64> {
+        self.wanted
+    }
+
     pub fn can_send(&self) -> bool {
         self.active.as_ref().is_some_and(|a| a.mode != AttachMode::Observe && self.wanted == Some(a.attach_seq)) && !self.reattaching
     }
@@ -1906,7 +1920,7 @@ impl Model {
             }
             Event::History { attach_seq, update, .. } if self.current(attach_seq) => {
                 if self.transcript.apply_update(&update).is_err() {
-                    effects.push(Effect::Resync);
+                    effects.push(Effect::Resync(attach_seq));
                 } else {
                     self.stats.on_history(&update);
                 }
@@ -3660,7 +3674,7 @@ mod fake_daemon {
         if !m.may_answer(prompt_id) {
             return false;
         }
-        client.answer(prompt_id, Some(CONFIRM_YES.into())).unwrap();
+        client.on(m.attachment().unwrap()).answer(prompt_id, Some(CONFIRM_YES.into())).unwrap();
         m.answer_sent(prompt_id);
         true
     }
@@ -3778,7 +3792,7 @@ mod fake_daemon {
         let mut a = attaches.recv_timeout(T).unwrap();
         a.send(attached_with_prompt(A, 1));
         pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
-        client.submit("steer A this way").unwrap();
+        client.on(m.attachment().unwrap()).submit("steer A this way").unwrap();
         m.sent("steer A this way".into());
         m.tabs.open(B, "b", Place::New);
         let _ = ui_switch(&mut m, &client, B, None);
@@ -3800,7 +3814,7 @@ mod fake_daemon {
         a.send(attached_with_prompt(A, 1));
         pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
         for t in ["one", "two"] {
-            client.submit(t).unwrap();
+            client.on(m.attachment().unwrap()).submit(t).unwrap();
             m.sent(t.into());
         }
         // "one" is echoed (taken), "two" is not.
@@ -3950,7 +3964,7 @@ mod fake_daemon {
         // AUTHORIZE on the old card as the client thread re-attaches, before
         // the UI has seen it (`AppView::answer` sends on the card's
         // connection): refused, during the reconnect or after it, never sent.
-        client.answer_on(stale, 1, Some(CONFIRM_YES.into())).unwrap();
+        client.on(m.attachment().unwrap()).answer_on(stale, 1, Some(CONFIRM_YES.into())).unwrap();
         pump(&mut m, &events, "A reattached", |m| !m.reattaching && m.may_answer(1));
         assert_eq!(m.active.as_ref().unwrap().attach_seq, seq, "a reconnect keeps the attach_seq");
         assert_ne!(m.active.as_ref().unwrap().connection, stale, "a new connection");
@@ -3959,7 +3973,7 @@ mod fake_daemon {
         assert!(c.body.contains("rm -rf ~/work") && !c.body.contains("README"), "the new text: {}", c.body);
         assert!(!c.armed(), "unarmed");
         // The new card's own answer goes out.
-        client.answer_on(m.active.as_ref().unwrap().connection, 1, Some("n".into())).unwrap();
+        client.on(m.attachment().unwrap()).answer_on(m.active.as_ref().unwrap().connection, 1, Some("n".into())).unwrap();
         client.shutdown().unwrap();
         let answers: Vec<Value> = a.cmds(Duration::from_millis(500)).into_iter().filter(|c| c["cmd"] == "answer").collect();
         assert_eq!(answers, vec![json!({"cmd": "answer", "prompt_id": 1, "value": "n"})], "only the new connection's answer");

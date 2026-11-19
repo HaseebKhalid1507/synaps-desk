@@ -2488,9 +2488,9 @@ impl AppView {
                     let _ = c.list_sessions();
                 }
             }
-            Effect::Resync => {
+            Effect::Resync(seq) => {
                 if let Some(c) = &self.client {
-                    let _ = c.resync();
+                    let _ = c.on(seq).resync();
                 }
             }
             Effect::ListSaved { named_only, limit } => {
@@ -3191,8 +3191,8 @@ impl AppView {
     /// The last tab closed: nothing attached (the session keeps running).
     fn detach_all(&mut self) {
         self.panes.cur.attach_wait = None;
-        if let Some(c) = &self.client {
-            let _ = c.detach();
+        if let (Some(c), Some(seq)) = (&self.client, self.model.wanted()) {
+            let _ = c.on(seq).detach();
         }
     }
 
@@ -3520,7 +3520,7 @@ impl AppView {
             self.model.view_dirty = true;
             return false;
         }
-        if !self.model.can_send() {
+        let Some(seq) = self.model.attachment().filter(|_| self.model.can_send()) else {
             self.model.last_error = Some(if self.model.switching() {
                 "switching sessions: not sent".into()
             } else if self.model.active.is_some() {
@@ -3529,7 +3529,7 @@ impl AppView {
                 "not attached to a session".into()
             });
             return false;
-        }
+        };
         // `//text`: `/text`, a message (the TUI's escape), never a command.
         let escaped = text.trim_start().strip_prefix('/').filter(|r| r.starts_with('/')).map(str::to_string);
         let text = match escaped {
@@ -3567,7 +3567,7 @@ impl AppView {
                     return false;
                 }
             };
-            if c.steer_subagent(handle.clone(), text.clone()).is_err() {
+            if c.on(seq).steer_subagent(handle.clone(), text.clone()).is_err() {
                 self.model.last_error = Some("the connection thread has stopped".into());
                 return false;
             }
@@ -3579,7 +3579,7 @@ impl AppView {
             return true;
         }
         let busy = self.model.transcript.busy();
-        let sent = if busy { c.steer(text.clone()) } else { c.submit(text.clone()) };
+        let sent = if busy { c.on(seq).steer(text.clone()) } else { c.on(seq).submit(text.clone()) };
         if sent.is_err() {
             self.model.last_error = Some("the connection thread has stopped".into());
             return false;
@@ -3687,7 +3687,8 @@ impl AppView {
             cx.notify();
         } else if let Some((handle, since)) = self.model.watch.take_poll(now) {
             log::debug!(target: "synaps_desktop::watch", "watch {handle} since {since}");
-            if !self.client.as_ref().is_some_and(|c| c.watch_subagent(handle, since).is_ok()) {
+            let seq = self.model.wanted();
+            if !self.client.as_ref().zip(seq).is_some_and(|(c, seq)| c.on(seq).watch_subagent(handle, since).is_ok()) {
                 self.model.watch.poll_failed(now);
             }
         }
@@ -4403,9 +4404,12 @@ impl AppView {
             None => ("cancel", Answer::Cancelled),
         };
         let took = self.panes.cur.card.as_ref().map_or(Duration::ZERO, |c| c.shown.elapsed());
-        let sent = match &self.client {
-            Some(c) => c.answer_on(connection, key.1, value),
-            None => Ok(()),
+        // On the attachment the card's prompt came on (`card_key` holds it
+        // to the one on screen), never another session's.
+        let sent = match (&self.client, self.model.attachment()) {
+            (Some(c), Some(seq)) => c.on(seq).answer_on(connection, key.1, value),
+            (Some(_), None) => return false,
+            (None, _) => Ok(()),
         };
         match sent {
             Ok(()) => {
@@ -6012,9 +6016,9 @@ impl AppView {
     pub(crate) fn halt(&mut self) {
         self.disarm_halt();
         if let Some(c) = &self.client
-            && self.model.can_send()
+            && let Some(seq) = self.model.attachment().filter(|_| self.model.can_send())
         {
-            let _ = c.abort();
+            let _ = c.on(seq).abort();
             self.halted = self.model.active.as_ref().map(|a| (a.session_id.clone(), Instant::now()));
             #[cfg(test)]
             {
