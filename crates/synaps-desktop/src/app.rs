@@ -5612,20 +5612,32 @@ impl AppView {
             // The list's top row in the splice, the list holding its top (a
             // reader scrolled back, a room held at its end): GPUI puts its
             // top at the splice's start, offset 0 (`ListState::splice`), and
-            // the column drops by however far into that row the view was,
-            // short of its end for good (Shady #23 r6 H1). The same row,
-            // found again, keeps its offset, as `fold_all_runs` keeps its
-            // own. A fold places the list itself ([`Self::start_gap`]).
+            // the column drops by however far into that row the view was
+            // and every row of the splice above it, short of its end for
+            // good (Shady #23 r6 H1). The same row, found again, keeps its
+            // offset, as `fold_all_runs` keeps its own. Gone (the card's
+            // row as its room lands, the list paused: #23 r9), the first
+            // row after it still there comes to the view's top: it rises by
+            // what was left of the rows that went, as they close up. A fold
+            // places the list itself ([`Self::start_gap`]).
             let spliced = at + range.start..at + range.end;
             let top = self.list.logical_scroll_top();
-            let kept = (folded.is_none() && self.holds_top() && spliced.contains(&top.item_ix))
-                .then(|| (self.disp[top.item_ix].id, std::mem::discriminant(&self.disp[top.item_ix].kind)));
+            let row = |d: &Disp| (d.id, std::mem::discriminant(&d.kind));
+            let kept: Option<Vec<_>> = (folded.is_none() && self.holds_top() && spliced.contains(&top.item_ix))
+                .then(|| self.disp.get(top.item_ix..=spliced.end.min(self.disp.len() - 1)).unwrap_or_default().iter().map(row).collect());
             self.list.splice(spliced.clone(), count);
             self.disp.splice(spliced, new[range.start..range.start + count].iter().copied());
-            if let Some((id, kind)) = kept
-                && let Some(ix) = self.disp.iter().position(|d| d.id == id && std::mem::discriminant(&d.kind) == kind)
+            let find = |r: &(u64, std::mem::Discriminant<Kind>)| self.disp.iter().position(|d| row(d) == *r);
+            if let Some(rows) = kept
+                && let Some((was, rest)) = rows.split_first()
             {
-                self.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: top.offset_in_item });
+                let to = match find(was) {
+                    Some(ix) => Some(ListOffset { item_ix: ix, offset_in_item: top.offset_in_item }),
+                    None => rest.iter().find_map(find).map(|ix| ListOffset { item_ix: ix, offset_in_item: px(0.) }),
+                };
+                if let Some(to) = to {
+                    self.list.scroll_to(to);
+                }
             }
         }
         // A full build per sync: bounded, so long sessions stay usable in dev builds.

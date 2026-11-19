@@ -522,15 +522,18 @@ fn reader_back(cx: &mut TestAppContext) {
 /// Shady #23 r6 Q1: the list already paused as the room lands (the user
 /// scrolled as the card folded), the landing splice holding its top row
 /// (r6's 660 and 800 px cases): `Slack::fresh` cannot keep it following,
-/// and GPUI put its top at the splice's start (a 48 px jump). The rows hold
-/// (the room may go then: left, out of sight, the list back at its end).
+/// and GPUI put its top at the splice's start (48 and 65 px jumps). At
+/// 800 px the splice takes the top row itself (the card's): the first row
+/// after it rises to the view's top, by what was left of the card. No row
+/// moves more than a spring step in a frame (the room may go then: left,
+/// out of sight, the list back at its end).
 #[gpui_kit::test]
 fn a_room_landing_on_a_paused_list_keeps_its_rows_put(cx: &mut TestAppContext) {
     paused_landing(cx);
 }
 
 fn paused_landing(cx: &mut TestAppContext) {
-    for (extra, h) in [(6usize, 660f32)] {
+    for (extra, h) in [(6usize, 660f32), (10, 800.)] {
         let case = format!("{extra} calls after the card, {h} px, scrolled 3 px as it folded");
         let (_w, _view, _events, landing) = land(cx, h, false, extra, true);
         eprintln!("{case}: landing {landing} px");
