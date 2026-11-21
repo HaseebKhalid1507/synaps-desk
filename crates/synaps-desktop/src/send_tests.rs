@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 
+use gpui_kit::component::input::InputEvent;
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Entity, Modifiers, MouseMoveEvent, PlatformInput, ScrollDelta, ScrollEvent, ScrollSource,
     TestAppContext, TouchPhase, VisualTestContext, point, px,
@@ -326,12 +327,16 @@ fn a_send_as_a_reply_grows_into_a_held_room_keeps_it(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let mut grew = None;
     for k in 0..240 {
+        // The frame a chunk of the reply comes in: drawn once, the frame
+        // it asks for next not yet (the key comes between the two).
+        let dt = std::time::Duration::from_micros(6944);
+        view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
+        cx.executor().advance_clock(dt);
         view.update(cx, |v, cx| {
             let text = format!("word{k} and a little more of the reply, ");
             v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { text }) });
             cx.notify();
         });
-        fluid_frame(cx, w, &view);
         let left = view.read_with(cx, |v, _| v.fold_slack.get().map_or(0., |s| s.last()));
         let (gap, _) = from_end(cx, &view);
         assert!(left > gap + 20., "frame {k}: the room ({left} of {room}) still held as the reply grows in ({gap})");
@@ -339,9 +344,14 @@ fn a_send_as_a_reply_grows_into_a_held_room_keeps_it(cx: &mut TestAppContext) {
             grew = Some(gap);
             break;
         }
+        cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+        cx.run_until_parked();
     }
     let grew = grew.expect("a frame the reply grew more than 2 px into the room");
-    VisualTestContext::from_window(w, cx).simulate_keystrokes("enter");
+    // The composer's Enter as the input emits it. A key through the
+    // harness would draw the window first (the frame the next vsync
+    // draws), and the send land there, at the end.
+    view.update(cx, |v, cx| v.composer.update(cx, |_, cx| cx.emit(InputEvent::PressEnter { secondary: false, shift: false })));
     cx.run_until_parked();
     assert!(view.read_with(cx, |v, _| v.submits.len()) >= 1, "it went to submit");
     let mut last = row_tops(cx, &view);
