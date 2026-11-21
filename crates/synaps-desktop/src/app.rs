@@ -7671,6 +7671,16 @@ impl AppView {
                 self.display_w(l, m.label, window);
             }
         }
+        // A new column re-wraps the rows: GPUI drops every row's height at
+        // the new width and measures the ones it draws.
+        let rewrap = lay.column != self.panes.cur.layout.column;
+        // A wider one (a flight's landing at Full: a narrowing re-wraps at
+        // its start) only makes them shorter: a room held at the end is not
+        // read again against that frame's sums, half of them unmeasured
+        // (#47). A narrower one in the landing frame (a one-frame toggle)
+        // reads it again as before; none is held there (`tail_slack`: not
+        // fluid, none).
+        let widens = lay.column > self.panes.cur.layout.column;
         if landed || lay.tight != self.panes.cur.layout.tight {
             self.panes.cur.list.remeasure();
             self.panes.cur.metrics_gen = self.panes.next_gen();
@@ -7679,18 +7689,15 @@ impl AppView {
             // rows' new heights are not rows growing in under it (else the
             // remeasure's sums used it up, and the column fell by it as the
             // flight landed).
-            if let Some(mut s) = self.panes.cur.fold_slack.get().filter(|s| s.gone.is_none() && s.fresh.is_none()) {
+            if let Some(mut s) = self.panes.cur.fold_slack.get().filter(|s| s.gone.is_none() && s.fresh.is_none() && !widens) {
                 s.fresh = Some(self.fx.frame());
                 self.panes.cur.fold_slack.set(Some(s));
             }
         }
-        // A new column re-wraps the rows: GPUI drops every row's height at
-        // the new width and measures the ones it draws. This frame's bar
-        // reads the rest at the hint the next frame gives them (`rehint`,
-        // below, which only reads; #46: the thumbs land with the panes, not
-        // a frame after). One more frame, at every level, gives it
-        // ([`AppView::hint_rows`]).
-        let rewrap = lay.column != self.panes.cur.layout.column;
+        // A re-wrap: this frame's bar reads the rows GPUI didn't draw at
+        // the hint the next frame gives them (`rehint`, below, which only
+        // reads; #46: the thumbs land with the panes, not a frame after).
+        // One more frame, at every level, gives it ([`AppView::hint_rows`]).
         if rewrap {
             window.request_animation_frame();
         }

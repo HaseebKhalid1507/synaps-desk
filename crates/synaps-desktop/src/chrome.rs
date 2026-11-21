@@ -372,7 +372,12 @@ pub(crate) struct Flight {
     /// width, slides under the window's side; else (a width change) it is
     /// clipped at the inner edge.
     pub(crate) slide: bool,
-    /// The width drawn this frame, and whether it moves.
+    /// The width drawn this frame, and whether it moves: until it is
+    /// drawn at its target. Its spring settles under a pixel after that,
+    /// in frames that draw the same width; the panel has landed, and the
+    /// layout with it (the column re-wraps, the labels and the thumbs
+    /// land) in the last frame anything moves (#47: on the spring's own
+    /// stop, 6 or 7 frames later at 144 Hz, the panes still).
     pub(crate) shown: f32,
     pub(crate) moving: bool,
     /// The width its content is laid out at: the open one (while it folds,
@@ -1189,8 +1194,16 @@ impl AppView {
             if dragged == Some(i) {
                 self.fx.spring_jump(PANEL_W[i], to, to, f.response);
             }
+            let asked = self.fx.asks();
             let (w, moving) = self.fx.spring_px(PANEL_W[i], to, f.response);
-            (f.shown, f.moving) = (w, moving);
+            // Drawn at its target: landed, its spring at rest (no frame
+            // and no timer for the settling it would draw nothing of).
+            let landed = moving && w == self.fx.snap(to);
+            if landed {
+                self.fx.spring_jump(PANEL_W[i], to, to, f.response);
+                self.fx.ask_back(asked);
+            }
+            (f.shown, f.moving) = (w, moving && !landed);
             if let Side::Open(ow) = side {
                 f.open = ow;
             }

@@ -583,12 +583,12 @@ fn the_pinned_label_goes_to_the_gutter_with_the_panel(cx: &mut TestAppContext) {
 /// The finish gate of #33, F1: a panel's flight ends on the layout it
 /// lands at. Closing the right panel at the end, three frames after it
 /// looked still, the panel stepped its last pixel as it landed and the
-/// column with it (1 px right); closing the rail, the tab (1 px left). The
-/// last frame that moves draws the landed widths, so the frame it lands in
-/// draws the same: the pane, the column, the rows and the tab all 0 px from
-/// it, and every frame after. Both panels, closing and opening, at Full
-/// (with frames between) and Reduced (one frame), as the clips have it:
-/// 1920 px, text 17, the rail at 480 and the right panel at 520, where the
+/// column with it (1 px right); closing the rail, the tab (1 px left). It
+/// lands in the frame it draws the landed widths, the last that moves
+/// (#47: not a still frame of the spring's settling later): every frame
+/// after draws the pane, the column, the rows and the tab 0 px from it.
+/// Both panels, closing and opening, at Full (with frames between) and
+/// Reduced (one frame), as the clips have it: 1920 px, text 17, the rail at 480 and the right panel at 520, where the
 /// column is at its cap at both ends (under it, a widening flight's column
 /// widens as it lands, by design: `a_held_room_holds_as_the_wrap_lands`).
 #[gpui_kit::test]
@@ -657,9 +657,11 @@ fn a_panel_flight_ends_on_the_layout_it_lands_at(cx: &mut TestAppContext) {
                 let end = &frames[landed].1;
                 if level == Level::Full {
                     assert!(landed > 30, "{case}: it flew ({landed} frames)");
-                    let off = apart(&frames[landed - 1].1, end);
-                    if !off.is_empty() {
-                        fails.push(format!("{case}: the last frame that moves is not the landed layout (it lands at {landed}): {off:?}"));
+                    // #47: it lands in the frame it reaches the landed
+                    // layout, the last that moves: the frame before it is
+                    // still on its way (no still frame before the landing).
+                    if apart(&frames[landed - 1].1, end).is_empty() {
+                        fails.push(format!("{case}: the frame before the landing ({landed}) already drew the landed layout"));
                     }
                 } else {
                     assert_eq!(landed, 0, "{case}: in one frame");
@@ -716,11 +718,11 @@ fn a_pixel_spring_draws_its_landed_width_before_it_lands() {
 
 /// Shady's L1 on #33 round 3: under the column's cap (a pane of 560 px up
 /// to the cap's width) a flight that widens the pane across the hang lands
-/// the labels (the list measured again, a held room read again) on the
-/// last frame that moves, and lets the narrowest wrap go a frame later, as
-/// it lands (fluid.md §3.8; the protected
+/// the labels (the list measured again) and lets the narrowest wrap go in
+/// the one frame, the last that moves (fluid.md §3.8; the protected
 /// `column_rewraps_at_most_once_per_panel_motion` puts the widening rewrap
-/// in that frame). The rewrap only widens the column, so the rows only get
+/// in that frame; #50: a held room is not read again against a widening
+/// re-wrap's sums). The rewrap only widens the column, so the rows only get
 /// shorter: a room held at the end is not used up by it. 1100 px, the rail
 /// at 400 (a pane of 668 px, the column 620) closing: the column widens
 /// as it lands, and the room stays held and the list at its end in every
@@ -784,14 +786,80 @@ fn a_held_room_holds_as_the_wrap_lands(cx: &mut TestAppContext) {
     }
 }
 
+/// #50 round 2 (Shady's L1): a one-frame narrowing has no held room to
+/// read. At Reduced the rail's unfold is one frame: the pane narrows across
+/// the hang, the column re-wraps narrower (the rows get taller) and the
+/// labels land, all in it. A room is only held while motion is fluid
+/// ([`AppView::tail_slack`]: not fluid, none): one held at Full, as the
+/// card folds, goes with the level, so the re-wrap gate (only a widening
+/// re-wrap leaves a held room as it is) never meets one here. The list
+/// stays at its end in that frame and after. 1100 px, the rail at 400,
+/// folded, opening.
+#[gpui_kit::test]
+fn a_one_frame_narrowing_holds_no_room_and_stays_at_the_end(cx: &mut TestAppContext) {
+    let (w, view) = open_one(cx, true);
+    view.update(cx, |v, cx| {
+        v.panels.rail_width = Some(400);
+        v.panels.rail_collapsed = true;
+        v.client = None;
+        v.model.transcript.set_busy(true);
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    wait(cx, w, &view, 3000);
+    let ids: Vec<u64> = view.read_with(cx, |v, _| v.model.transcript.pending_prompts().iter().map(|p| p.id).collect());
+    assert!(!ids.is_empty(), "the demo's card");
+    view.update(cx, |v, cx| {
+        for prompt_id in ids {
+            v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id });
+        }
+        cx.notify();
+    });
+    for _ in 0..120 {
+        fluid_frame(cx, w, &view);
+    }
+    let held = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fold_slack.get().map(|s| s.last()));
+    assert!(held(cx).is_some(), "a room held at the end, at Full");
+    motion_level(cx, &view, Level::Reduced);
+    fluid_frame(cx, w, &view);
+    assert_eq!(held(cx), None, "Reduced: no room held");
+    let column = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.layout.column);
+    let c0 = column(cx);
+    assert!(pane(cx, &view).1, "folded, hanging");
+    let short = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, cx| {
+            let pad = crate::app::list_pad_b(&crate::theme::metrics(cx));
+            f32::from(v.list.max_offset_for_scrollbar().y) + pad + f32::from(v.list.scroll_px_offset_for_scrollbar().y)
+        })
+    };
+    assert!(short(cx) <= 1., "at its end ({})", short(cx));
+    view.update(cx, |v, cx| v.toggle_panel(true, cx));
+    cx.run_until_parked();
+    let mut n = 0;
+    let frames = fly(cx, w, &view, |cx| {
+        n += 1;
+        let (room, gap) = (held(cx), short(cx));
+        assert!(room.is_none() && gap <= 1., "frame {n}: no room ({room:?}), at its end ({gap})");
+    });
+    assert!(frames <= 3, "one frame, and its settling ({frames})");
+    assert!(!pane(cx, &view).1, "landed not hanging");
+    assert!(column(cx) < c0, "the column narrowed ({c0} -> {})", column(cx));
+    for n in frames + 1..frames + 9 {
+        fluid_frame(cx, w, &view);
+        let (room, gap) = (held(cx), short(cx));
+        assert!(room.is_none() && gap <= 1., "frame {n}: no room ({room:?}), at its end ({gap})");
+    }
+}
+
 /// #35: a folded panel's strip lands with its panel. Its glyphs cut in as
 /// the rail landed, then lifted in over `quick`, a few frames after the
 /// panel looked still (the gate on #33 r3: f206–f213 after the rail's last
 /// move at f203; the right panel's strip after its own). What is painted
 /// over the strip (the quads GPUI hands the renderer, clipped to their
 /// masks, from the last opaque one that covers it) is, on every frame from
-/// the last one that moves on, that frame's; at Reduced, from the panel's
-/// one frame on. At Full the strip comes in during the flight (its
+/// the one it lands in on, that frame's (#47: the frame it arrives at its
+/// width; the one before still lifts the strip in); at Reduced, from the
+/// panel's one frame on. At Full the strip comes in during the flight (its
 /// strength, the hairline's alpha, rises through it), and opening it goes
 /// out over the first frames, not at once. No frame at rest. Both panels,
 /// 1920 px, text 17, the rail at 480, the right panel at 520.
@@ -918,14 +986,10 @@ fn a_folded_strip_lands_with_its_panel(cx: &mut TestAppContext) {
                     let apart = |a: &[String], b: &[String]| -> (Vec<String>, Vec<String>) {
                         (a.iter().filter(|q| !b.contains(q)).cloned().collect(), b.iter().filter(|q| !a.contains(q)).cloned().collect())
                     };
-                    if landed > 0 {
-                        let last = over(&frames[landed - 1].1.1, region);
-                        if last != end {
-                            fails.push(format!(
-                                "{case}: the landing frame ({landed}) paints the strip apart from the last that moves: {:?}",
-                                apart(&last, &end)
-                            ));
-                        }
+                    // #47: the landing frame is the last that moves, the
+                    // strip whole in it; the frame before still lifts it in.
+                    if landed > 0 && over(&frames[landed - 1].1.1, region) == end {
+                        fails.push(format!("{case}: the frame before the landing ({landed}) already painted the landed strip"));
                     }
                     if let Some(n) = (landed + 1..frames.len()).find(|&n| over(&frames[n].1.1, region) != end) {
                         fails.push(format!(
