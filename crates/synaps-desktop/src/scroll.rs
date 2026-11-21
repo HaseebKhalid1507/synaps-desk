@@ -156,6 +156,9 @@ struct Inner {
     /// coast, a jump) since [`Scroller::touched`] last asked: what tells a
     /// scroll from rows changing height (Shady #23 r3 H2, M1).
     touched: bool,
+    /// The glide goes to the list's end as each frame finds it
+    /// ([`Scroller::to_end`]); anything else that moves it ends that.
+    end: bool,
 }
 
 /// The transcript's scroller: shared by the wheel's listener and the frame.
@@ -231,6 +234,8 @@ impl Scroller {
         if dy == 0. && !in_gesture {
             return true;
         }
+        // The user's own move: no longer to the end.
+        s.end = false;
         // The list's offset grows by −delta.y.
         let by = -dy;
         if lines.is_some_and(is_wheel_step) && !touching {
@@ -298,11 +303,28 @@ impl Scroller {
         cut
     }
 
+    /// A send (Haseeb, 2026-11-21): [`Scroller::jump`] the `by` px to the
+    /// list's end, its target the end as each frame finds it (the message
+    /// and its reply landing meanwhile move it), following it there.
+    pub(crate) fn to_end(&self, by: f32, view: f32, now: Instant) -> f32 {
+        let cut = self.jump(by, false, view, now);
+        self.0.borrow_mut().end = true;
+        cut
+    }
+
     /// The frame at `now`: how far to move the list, inside `room`.
     pub(crate) fn frame(&self, now: Instant, room: Room) -> Step {
         let mut s = self.0.borrow_mut();
         let dt = s.last.map_or(0., |t| now.saturating_duration_since(t).as_secs_f32()).min(0.05);
         s.last = Some(now);
+        if s.end {
+            if room.end_known && room.max - room.offset <= 1. {
+                s.stop();
+                s.touched = true;
+                return Step { by: (room.max - room.offset).max(0.), follow: true };
+            }
+            s.glide.x = (room.offset - room.max).min(0.);
+        }
         let mut by = 0.;
         if s.glide != Spring::default() {
             let before = s.glide.x;

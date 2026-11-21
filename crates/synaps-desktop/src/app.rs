@@ -3576,6 +3576,7 @@ impl AppView {
             self.panes.cur.watch_note = None;
             // Handoff out: the composer's bar, then the watched row's.
             self.fx.col(self.panes.cur.id).sent().set(Some((self.fx.clock(), true)));
+            self.return_to_end();
             return true;
         }
         let busy = self.model.transcript.busy();
@@ -3591,7 +3592,46 @@ impl AppView {
         // Handoff out: the composer's bar, then the new block's (a steer
         // lands in no block: the composer's alone).
         self.fx.col(self.panes.cur.id).sent().set(Some((self.fx.clock(), busy)));
+        self.return_to_end();
         true
+    }
+
+    /// A message sent (a submit, a steer, a worker's steer from its view)
+    /// takes the list back to its end, following (Haseeb, 2026-11-21: "if
+    /// I'm scrolled up and I send a message, it should bring me back
+    /// down"), where it lands. The user's own return: a room held at the
+    /// end is no longer left, and goes on `sheet` (as at a turn's end); a
+    /// body's or a fold's hold ends, and the hold-back. At Full it glides
+    /// ([`crate::scroll::Scroller::to_end`]: from one view short of the end
+    /// when farther); Reduced and Off, a cut.
+    fn return_to_end(&mut self) {
+        let pane = &self.panes.cur;
+        if let Some(mut s) = pane.fold_slack.get().filter(|s| s.list == pane.list_gen) {
+            s.left = false;
+            if s.gone.is_none() {
+                s.gone = Some((s.last, self.fx.clock(), crate::motion::SHEET_RESPONSE));
+            }
+            pane.fold_slack.set(Some(s));
+        }
+        pane.body_hold.set(None);
+        for g in pane.fold_gap.borrow_mut().iter_mut() {
+            g.hold = false;
+        }
+        pane.hold_back.set(false);
+        let at = -f32::from(pane.list.scroll_px_offset_for_scrollbar().y);
+        let by = self.list_end() - at;
+        if self.fx.level() != crate::motion::Level::Full || by <= 0.5 {
+            pane.scroller.cancel();
+            pane.list.scroll_to_end();
+            return;
+        }
+        let view = f32::from(pane.list.viewport_bounds().size.height);
+        let cut = pane.scroller.to_end(by, view, self.fx.clock());
+        pane.list.pause_following_tail();
+        if cut != 0. {
+            pane.list.scroll_by(px(cut));
+        }
+        self.fx.want_frame();
     }
 
     /// Ctrl/Alt+↑ / ↓: walk the workers' views ([`crate::watch`]). Not
