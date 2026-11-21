@@ -12,6 +12,8 @@ use crate::app::AppView;
 
 #[path = "held_tests.rs"]
 mod held_tests;
+#[path = "send_tests.rs"]
+mod send_tests;
 
 /// The `--offline` demo's window, `size` px at text step `text`, a client
 /// whose daemon is nowhere ([`open_with`], the beat on the layer).
