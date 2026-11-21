@@ -1639,7 +1639,7 @@ pub struct AppView {
     /// the answer pressed while it waits for the daemon).
     pub(crate) slow_daemon: bool,
     pub(crate) synthetic_tx: Option<async_channel::Sender<Event>>,
-    synthetic_seq: u64,
+    pub(crate) synthetic_seq: u64,
     /// The last `catalog_page` req the synthetic transport answered.
     synthetic_req: u64,
     /// `--session ID`: open it once the first session list lands.

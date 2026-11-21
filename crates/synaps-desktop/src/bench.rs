@@ -32,7 +32,7 @@ pub struct BenchOptions {
     pub diag: bool,
     /// `--bench-tabs`: only the tab measurements ([`TAB_SESSIONS`] sessions
     /// of [`DRAG_TURNS`] turns: RSS with 1, 4 and 8 tabs, switch times
-    /// cached and not).
+    /// cached and not, then RSS with 1 to [`LIVES`] stores attached at once).
     pub tabs: bool,
     /// `--bench-history FILE`: the tab bench's sessions all have this
     /// history (a saved session's `api_messages`: a real one, with its
@@ -243,6 +243,8 @@ const DRAG_PX_PER_S: f32 = 400.;
 const DRAG_TURNS: usize = 400;
 /// The tab bench's sessions.
 const TAB_SESSIONS: usize = 8;
+/// `--bench-tabs`' `mem_lives`: stores attached at once, up to this many.
+const LIVES: usize = 3;
 /// Its tab switches, cached and not (each half).
 const TAB_SWITCHES: usize = 8;
 
@@ -509,6 +511,43 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     "uncached": keys.iter().map(|k| (k.to_string(), summary(true, k))).collect::<serde_json::Map<_, _>>(),
                     "runs": runs,
                 });
+                // Split panes step 2: what one more attachment held at once
+                // costs. The tab's store stays as it is; stores 2 and 3 (step
+                // 3's other panes') each attach a session of their own, of
+                // the same turns, as the synthetic daemon would answer it.
+                let mut mem_lives = json!({});
+                let sample = |cx: &mut AsyncWindowContext| {
+                    let mut m = mem::sample();
+                    m["trimmed_rss_kb"] = mem::trimmed_rss_kb();
+                    let rows: Vec<usize> = view.update(cx, |v, _| v.model.lives.iter().map(|l| l.transcript.len()).collect()).unwrap_or_default();
+                    m["stores_rows"] = json!(rows);
+                    m
+                };
+                sleep(0.5).await;
+                mem_lives["lives_1"] = sample(cx);
+                for n in 2..=LIVES {
+                    let sid = format!("20261114-0901{n:02}-l{n:03}");
+                    let Some(ev) = ({
+                        let sid = sid.clone();
+                        view.update(cx, move |v, _| {
+                            let live = v.model.lives.add();
+                            v.synthetic_seq += 1;
+                            let seq = v.synthetic_seq;
+                            v.model.attaching(live, seq, None, false);
+                            v.model.asked_for(live, &sid);
+                            attached_event(&sid, seq, &turns(DRAG_TURNS, 60 + n as u64))
+                        })
+                        .ok()
+                        .flatten()
+                    }) else {
+                        break;
+                    };
+                    let _ = tx.try_send(ev);
+                    let _ = wait_attached(cx, &sid).await;
+                    sleep(0.5).await;
+                    mem_lives[format!("lives_{n}")] = sample(cx);
+                }
+                out["mem_lives"] = mem_lives;
                 out["mem_end"] = mem::sample();
                 out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                 println!("{out}");

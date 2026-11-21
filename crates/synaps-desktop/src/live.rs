@@ -357,8 +357,7 @@ impl Lives {
     }
 
     /// A second store, as step 3's multi-live activation will make one
-    /// (tests: two sessions attached at once).
-    #[cfg(test)]
+    /// (tests: two sessions attached at once; `--bench-tabs`' `mem_lives`).
     pub(crate) fn add(&mut self) -> LiveId {
         let id = LiveId(self.slots.iter().map(|(i, _)| i.0).max().unwrap_or(0) + 1);
         self.slots.push((id, Live::default()));
