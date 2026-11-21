@@ -308,6 +308,9 @@ pub struct Pane {
     pub(crate) foot: Cell<f32>,
     /// Its spring in motion.
     pub(crate) foot_moving: Cell<bool>,
+    /// Its composer's inset above its box as last drawn, as `foot`.
+    pub(crate) top: Cell<f32>,
+    pub(crate) top_moving: Cell<bool>,
 }
 
 /// Why the keys are to follow the focus mark at the next frame
@@ -486,6 +489,8 @@ impl Pane {
             land: Cell::new(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }),
             foot: Cell::new(f32::NAN),
             foot_moving: Cell::new(false),
+            top: Cell::new(f32::NAN),
+            top_moving: Cell::new(false),
         }
     }
 }

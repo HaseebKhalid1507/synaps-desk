@@ -2170,7 +2170,9 @@ fn rewraps_by_its_last_move(
 
 /// Finish gate #42 F3: on a stacked split and its close the top pane's
 /// composer moves only with the line (up as it splits, down as it
-/// closes), never a frame against it, and is still after it lands.
+/// closes), never a frame against it, and is still after it lands; and
+/// the rows over it with it (its inset above changes with its form: a
+/// close's first frame lifted them 4 px).
 #[gpui_kit::test]
 fn a_stacked_split_and_close_move_the_composer_only_with_the_line(cx: &mut TestAppContext) {
     let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-foot", None);
@@ -2178,7 +2180,10 @@ fn a_stacked_split_and_close_move_the_composer_only_with_the_line(cx: &mut TestA
     VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(1080.)));
     frame(cx, window);
     let top = view.read_with(cx, |v, _| v.panes.cur.id);
-    let y = |cx: &mut TestAppContext| drawn(cx, window, format!("composer-frame {}", top.index())).expect("the top pane's composer")[1];
+    let y = |cx: &mut TestAppContext| {
+        let list = drawn(cx, window, format!("pane-list {}", top.index())).expect("the top pane's list");
+        (drawn(cx, window, format!("composer-frame {}", top.index())).expect("the top pane's composer")[1], list[1] + list[3])
+    };
     for (k, what) in [("ctrl-shift-\\", "split down"), ("ctrl-w", "close down")] {
         let mut ys = vec![y(cx)];
         key(cx, window, k);
@@ -2191,8 +2196,12 @@ fn a_stacked_split_and_close_move_the_composer_only_with_the_line(cx: &mut TestA
             ys.push(y(cx));
         }
         let up = what == "split down";
-        assert!(ys.windows(2).all(|w| if up { w[1] <= w[0] } else { w[1] >= w[0] }), "{what}: only with the line: {ys:?}");
-        assert!(if up { ys[ys.len() - 1] < ys[0] } else { ys[ys.len() - 1] > ys[0] }, "{what}: it moved: {ys:?}");
+        for (part, ys) in
+            [("the composer", ys.iter().map(|y| y.0).collect::<Vec<_>>()), ("the rows over it", ys.iter().map(|y| y.1).collect())]
+        {
+            assert!(ys.windows(2).all(|w| if up { w[1] <= w[0] } else { w[1] >= w[0] }), "{what}: {part} only with the line: {ys:?}");
+            assert!(if up { ys[ys.len() - 1] < ys[0] } else { ys[ys.len() - 1] > ys[0] }, "{what}: {part} moved: {ys:?}");
+        }
     }
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
