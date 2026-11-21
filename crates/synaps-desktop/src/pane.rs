@@ -310,9 +310,13 @@ pub(crate) enum KeysTo {
     /// A pane key (Alt+N, F6, a split): to the focused pane, unless
     /// something in it has them already.
     Pane,
-    /// The mark moved without the keyboard (a click, a rail click, a find,
-    /// an Open, a view opened again): only out of another pane's inputs.
+    /// A click in the pane: only out of another pane's inputs (whatever
+    /// the click focused, or left with nothing, stands).
     Follow,
+    /// The mark moved from outside the panes (a rail click, a find, an
+    /// Open, a view opened again): also from the root or nowhere (a click
+    /// outside left the composer), never from a window input.
+    Quiet,
     /// The pane that had the focus closed: also when its inputs, gone,
     /// left the keys nowhere.
     Closed,
@@ -624,7 +628,7 @@ impl crate::app::AppView {
         if self.panes.focused == id && self.panes.cur.id == id {
             return;
         }
-        if !self.focus_quiet(id) {
+        if !self.mark_pane(id) {
             return;
         }
         self.ask_keys(how);
@@ -637,6 +641,7 @@ impl crate::app::AppView {
         self.keys_to = Some(match (self.keys_to, how) {
             (Some(KeysTo::Pane), _) | (_, KeysTo::Pane) => KeysTo::Pane,
             (Some(KeysTo::Closed), _) | (_, KeysTo::Closed) => KeysTo::Closed,
+            (Some(KeysTo::Quiet), _) | (_, KeysTo::Quiet) => KeysTo::Quiet,
             _ => KeysTo::Follow,
         });
     }
@@ -703,6 +708,7 @@ impl crate::app::AppView {
             (_, KeysAt::Focused) => false,
             (_, KeysAt::Other) => true,
             (KeysTo::Pane, _) => true,
+            (KeysTo::Quiet, KeysAt::Root | KeysAt::Nowhere) => true,
             (KeysTo::Closed, KeysAt::Nowhere) => true,
             _ => false,
         };
@@ -716,10 +722,23 @@ impl crate::app::AppView {
         }
     }
 
-    /// [`AppView::focus_pane`] without the keyboard (a rail click, a find,
-    /// an Open, a view opened again): the pane is the focused one, its
-    /// card's keys wait again, and the keys follow if another pane has them.
+    /// [`AppView::focus_pane`] from outside the panes (a rail click, a
+    /// find, an Open, a view opened again): the pane is the focused one,
+    /// its card's keys wait again, and the keys go to it unless a window
+    /// input (find, the palette) has them ([`KeysTo::Quiet`]).
     pub(crate) fn focus_quiet(&mut self, id: PaneId) -> bool {
+        let moved = self.panes.focused != id;
+        if !self.mark_pane(id) {
+            return false;
+        }
+        if moved {
+            self.ask_keys(KeysTo::Quiet);
+        }
+        true
+    }
+
+    /// The focus mark on pane `id` (entered): its card's keys wait again.
+    fn mark_pane(&mut self, id: PaneId) -> bool {
         if !self.enter_pane(id) {
             return false;
         }
@@ -727,7 +746,6 @@ impl crate::app::AppView {
             self.close_menu();
             // Its card's keys wait again, with their repaint (Shady #36 n7).
             self.keys_rearm = true;
-            self.ask_keys(KeysTo::Follow);
             self.model.rail_gen += 1;
             self.model.view_dirty = true;
         }

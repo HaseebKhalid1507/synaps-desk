@@ -933,8 +933,10 @@ impl Model {
         self.named.error = None;
         self.named.notice = None;
         match action {
-            // Already the one on screen (or on its way): nothing to do.
-            RowAction::Attach(id) if self.is_wanted(id) => Vec::new(),
+            // Already the one on screen here (or on its way): nothing to do.
+            // Another pane's (split panes): its attach effect focuses that
+            // pane (`AppView::focus_session`; Shady #36 M1).
+            RowAction::Attach(id) if self.lives[self.lives.shown()].is_wanted(id) => Vec::new(),
             RowAction::Attach(id) => vec![Effect::Attach { session_id: id.clone(), fallback: self.journal_of(id), open: false, place }],
             RowAction::Resume(req) if self.named.resuming.as_ref().is_some_and(|r| r.req.target == req.target) => Vec::new(),
             RowAction::Resume(req) => vec![Effect::Resume { req: req.clone(), open: false, place }],

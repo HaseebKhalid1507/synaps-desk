@@ -702,6 +702,12 @@ fn keys_in(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppVi
     .expect("the window")
 }
 
+/// A click outside the panes and their inputs (the right panel's foot),
+/// as a rail click's mouse-down is: a focused composer lets go of the keys.
+fn click_outside(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    click_at(cx, window, gpui_kit::point(px(1180.), px(760.)));
+}
+
 /// The messages (`submit`) among a connection's next commands.
 fn submits(c: &mut Conn) -> usize {
     names(c).iter().filter(|n| *n == "submit").count()
@@ -816,10 +822,16 @@ fn typing_after_a_focus_change_goes_to_the_marked_pane(cx: &mut TestAppContext) 
     let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
     let _ = (names(&mut a), names(&mut b));
     assert!(keys_in(cx, window, &view, pb, false), "B's composer has the keys");
-    // A rail click on A: the effect its row gives (`Model::open_row_in`;
-    // a find's Enter gives the same).
+    // A rail click on A's row: its mouse-down outside the panes (the
+    // composer lets go of the keys, as on screen), then `AppView::rail_click`
+    // with the row's action (a find's Enter takes the same way,
+    // `Model::find_enter_in`).
+    click_outside(cx, window);
+    assert!(!keys_in(cx, window, &view, pb, false), "the click outside took the keys from B's composer");
     view.update(cx, |v, cx| {
-        v.effect(crate::model::Effect::Attach { session_id: A.into(), fallback: None, open: false, place: crate::tabs::Place::Current });
+        for fx in v.model.open_row_in(&crate::named::RowAction::Attach(A.into()), crate::tabs::Place::Current) {
+            v.effect(fx);
+        }
         cx.notify();
     });
     frame(cx, window);
@@ -830,6 +842,7 @@ fn typing_after_a_focus_change_goes_to_the_marked_pane(cx: &mut TestAppContext) 
     key(cx, window, "alt-2");
     type_enter(cx, window, "on B");
     assert_eq!((submits(&mut a), submits(&mut b)), (0, 1), "after Alt+2: on B's session");
+    click_outside(cx, window);
     view.update(cx, |v, cx| {
         v.effect(crate::model::Effect::Attach { session_id: A.into(), fallback: None, open: true, place: crate::tabs::Place::Current });
         cx.notify();
