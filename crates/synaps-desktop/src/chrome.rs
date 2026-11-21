@@ -381,8 +381,23 @@ pub(crate) struct Flight {
     /// Where a width change started (its content is laid out at the wider
     /// of this and the new width, so it is clipped, never short of the box).
     pub(crate) start: f32,
-    /// When it landed on its strip: the strip's glyphs lift in over `quick`.
-    pub(crate) landed: Option<std::time::Instant>,
+}
+
+/// A folded panel's strip in flight (#35: its glyphs cut in as the rail
+/// landed, then lifted in over `quick`, after everything else had stopped):
+/// it comes in over the panel's last strip-width of travel, and goes out
+/// over its first, as a crossfade of the panel's edge into the strip on the
+/// panel's own spring. Linear in the width drawn ([`Motion::spring_px`],
+/// whole device pixels), so it eases as the panel does, changes only in a
+/// frame the width does (no frame of its own), and is whole as the panel
+/// is the strip's width: the last frame that moves. It brings its own
+/// opaque ground, the one it lands on (`chrome`), so it may start from 0
+/// ([`crate::motion::lift_from`]). Reduced and Off: the panel lands in one
+/// frame, and the strip with it.
+///
+/// [`Motion::spring_px`]: crate::motion::Motion::spring_px
+pub(crate) fn strip_strength(shown: f32) -> f32 {
+    (1. - (shown - STRIP) / STRIP).clamp(0., 1.)
 }
 
 /// Both side panels' flights, and the column's wrap width while they fly.
@@ -1154,7 +1169,6 @@ impl AppView {
     /// changes at all (`list.rs` prepaint), and its scrollbar with them.
     pub(crate) fn panel_frame(&mut self, rail: Side, right: Side) -> (f32, f32) {
         let dragged = self.drag.filter(|g| g.moved).map(|g| usize::from(!g.rail));
-        let now = self.fx.now();
         for (i, side) in [rail, right].into_iter().enumerate() {
             let f = &mut self.panel_fx.sides[i];
             let to = side.width();
@@ -1169,17 +1183,11 @@ impl AppView {
             if dragged == Some(i) {
                 self.fx.spring_jump(PANEL_W[i], to, to, f.response);
             }
-            let was = f.moving;
             let (w, moving) = self.fx.spring_px(PANEL_W[i], to, f.response);
             (f.shown, f.moving) = (w, moving);
             if let Side::Open(ow) = side {
                 f.open = ow;
             }
-            f.landed = match side {
-                Side::Strip if was && !moving => Some(now),
-                Side::Strip => f.landed.filter(|_| !moving),
-                Side::Open(_) => None,
-            };
         }
         (self.panel_fx.sides[0].shown, self.panel_fx.sides[1].shown)
     }
@@ -1188,7 +1196,8 @@ impl AppView {
     /// flight it is its open content at full width in a box as wide as the
     /// spring says, clipped, never squeezed: a fold or an unfold slides it
     /// under the window's side, a width change clips it at the inner edge.
-    /// Landed on its strip, the strip's glyphs lift in over `quick`.
+    /// Its strip comes and goes with it ([`strip_strength`]): whole on the
+    /// last frame that moves, unchanged once it has landed (#35).
     pub(crate) fn render_side(&self, rail: bool, side: Side, p: &Palette, cx: &Context<Self>) -> AnyElement {
         let f = self.panel_fx.sides[usize::from(!rail)];
         let content = |w: f32| -> AnyElement {
@@ -1202,26 +1211,13 @@ impl AppView {
                     .into_any_element()
             }
         };
+        let strip = || -> AnyElement {
+            if rail { self.render_rail_strip(p, cx).into_any_element() } else { self.render_right_strip(p, cx).into_any_element() }
+        };
         if !f.moving {
             return match side {
                 Side::Open(w) => content(w),
-                Side::Strip => {
-                    let k = crate::motion::LIFT
-                        + (1. - crate::motion::LIFT)
-                            * self.fx.shot(
-                                f.landed,
-                                std::time::Duration::ZERO,
-                                crate::motion::QUICK,
-                                &crate::motion::ease::OUT,
-                                crate::motion::Kind::Fade,
-                            );
-                    let strip = if rail {
-                        self.render_rail_strip(p, cx).into_any_element()
-                    } else {
-                        self.render_right_strip(p, cx).into_any_element()
-                    };
-                    crate::motion::lift(div().h_full().flex_none().child(strip), k).into_any_element()
-                }
+                Side::Strip => strip(),
             };
         }
         let cw = match side {
@@ -1247,6 +1243,23 @@ impl AppView {
             .child(div().absolute().top_0().bottom_0().left(px(x)).w(px(cw)).flex().child(content(cw)))
             // The rail's border on its moving edge, over what it clips.
             .when(rail, |d| d.child(div().absolute().top_0().bottom_0().right_0().w(px(1.)).bg(p.hair)))
+            // Its strip, on the window's side, on the ground it lands on.
+            .map(|d| match strip_strength(f.shown) {
+                k if k > 0. => d.child(crate::motion::lift_from(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .when(rail, |d| d.left_0())
+                        .when(!rail, |d| d.right_0())
+                        .w(px(STRIP))
+                        .bg(p.chrome)
+                        .child(strip()),
+                    k,
+                    0.,
+                )),
+                _ => d,
+            })
             .into_any_element()
     }
 
