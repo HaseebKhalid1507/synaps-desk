@@ -252,6 +252,9 @@ const COMPOSER_H: u64 = 0x7AF2 << 48;
 /// The split panes' layout in flight (split.md §10): one spring, its
 /// travel in px ([`crate::split::Flight`]).
 const PANE_FLIGHT: u64 = 0x7AF5 << 48;
+/// Each pane's composer inset from its foot, on `sheet` (+ the pane's
+/// index).
+const FOOT_INSET: u64 = 0x7AF6 << 48;
 
 /// `el`, whose laid-out height goes to `sink`: when it changes under
 /// [`crate::motion::Level::Full`], one more frame, so its box springs to
@@ -6836,7 +6839,32 @@ impl AppView {
     /// window's form's (finish gate #36 M3); its top, rows and card well
     /// stay the pane's own. By its landed rectangle: a split's or a close's
     /// flight never moves it.
+    /// The composer's inset from its pane's foot as drawn: the landed
+    /// one ([`AppView::foot_inset`]), a change of it on `sheet` with the
+    /// layout's flight (a pane that leaves the window's foot or comes to
+    /// it rides the line, no first-frame hop: finish gate #42 F3). At
+    /// Reduced and Off, at once.
     pub(crate) fn foot_bottom(&self, m: &Metrics) -> f32 {
+        let to = self.foot_inset(m);
+        let key = FOOT_INSET + self.panes.cur.id.index() as u64;
+        let was = self.panes.cur.foot.replace(to);
+        if was != to && !was.is_nan() && self.panes.flight.is_some() {
+            let from = if self.panes.cur.foot_moving.get() { self.fx.spring_at(key).unwrap_or(was) } else { was };
+            self.fx.spring_jump(key, from, to, crate::motion::SHEET_RESPONSE);
+            self.panes.cur.foot_moving.set(true);
+        }
+        // Only while it moves: at rest nothing asks the spring (or a frame).
+        if !self.panes.cur.foot_moving.get() {
+            return to;
+        }
+        let (at, moving) = self.fx.spring_px(key, to, crate::motion::SHEET_RESPONSE);
+        self.panes.cur.foot_moving.set(moving);
+        at
+    }
+
+    /// The composer's landed inset from its pane's foot: the window's
+    /// form's at the window's foot, else its pane's own.
+    pub(crate) fn foot_inset(&self, m: &Metrics) -> f32 {
         let foot = {
             let (r, (_, h)) = (self.panes.cur.land.get(), self.centre.get());
             self.panes.split() && (r.y + r.h - h).abs() < 0.5
@@ -7537,7 +7565,7 @@ impl AppView {
         // bar, and a Short pane's are 12 px less), less what a foot pane's
         // composer insets more than its form's (the window's, M3).
         let height = if self.panes.split() {
-            let extra = (self.foot_bottom(&m) - crate::fit::Composer::of(&m, lay.form()).bottom).max(0.);
+            let extra = (self.foot_inset(&m) - crate::fit::Composer::of(&m, lay.form()).bottom).max(0.);
             g.win_h - crate::chrome::TOP + crate::chrome::top_h(lay.short) - extra
         } else {
             g.win_h
@@ -7972,9 +8000,9 @@ impl AppView {
             }
             // From rest where it is drawn (a flight taking over another's
             // starts again from there).
-            self.fx.spring_jump(PANE_FLIGHT, 0., f.travel, f.response());
+            self.fx.spring_jump(PANE_FLIGHT, 0., f.travel, crate::motion::SHEET_RESPONSE);
         }
-        let (d, moving) = self.fx.spring_px(PANE_FLIGHT, f.travel, f.response());
+        let (d, moving) = self.fx.spring_px(PANE_FLIGHT, f.travel, crate::motion::SHEET_RESPONSE);
         if !moving {
             self.panes.flight = None;
             return self.panes.tree.clone();
@@ -8383,6 +8411,10 @@ impl Render for AppView {
             let at = |w: f32| self.panes.tree.rects(area(w));
             let (rects_to, rects_wrap) = (at(pane_to), at(wrap));
             let (grow, ghosts) = self.panes.flight.as_ref().map_or((Vec::new(), Vec::new()), |f| (f.grow.clone(), f.ghosts.clone()));
+            // The tree itself drawn (the pixel landing, before the spring
+            // rests): each column at its landed wrap in this frame, the
+            // last that moves, never after it (finish gate #42 F1).
+            let landed = drawn == self.panes.tree;
             let mut mains = Vec::new();
             for (id, r) in &rects {
                 if ghosts.contains(id) {
@@ -8411,7 +8443,7 @@ impl Render for AppView {
                 let win_h = if self.panes.split() { l.h + crate::chrome::TOP } else { self.height };
                 let g = PaneFrame {
                     pane,
-                    wrap: of(&rects_wrap).min(pane).min(narrowest.filter(|_| !grows).unwrap_or(f32::INFINITY)),
+                    wrap: of(&rects_wrap).min(pane).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY)),
                     pane_to: of(&rects_to),
                     view_pane: pane,
                     win_h,

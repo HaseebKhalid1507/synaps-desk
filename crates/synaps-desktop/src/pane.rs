@@ -302,6 +302,12 @@ pub struct Pane {
     /// `rect`): its form, its fit and its foot are the landed pane's, so
     /// none of them change in the middle of a split or a close.
     pub(crate) land: Cell<crate::split::Rect>,
+    /// Its composer's landed inset from its foot as last drawn (NaN: not
+    /// drawn yet); a change in a layout's flight springs (finish gate #42
+    /// F3).
+    pub(crate) foot: Cell<f32>,
+    /// Its spring in motion.
+    pub(crate) foot_moving: Cell<bool>,
 }
 
 /// Why the keys are to follow the focus mark at the next frame
@@ -478,6 +484,8 @@ impl Pane {
             parked: Default::default(),
             rect: Cell::new(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }),
             land: Cell::new(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }),
+            foot: Cell::new(f32::NAN),
+            foot_moving: Cell::new(false),
         }
     }
 }

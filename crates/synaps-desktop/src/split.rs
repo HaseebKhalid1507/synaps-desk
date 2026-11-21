@@ -73,26 +73,7 @@ impl Flight {
     pub(crate) fn new(from: Node, to: Node, grow: Vec<PaneId>, ghosts: Vec<PaneId>) -> Self {
         Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new() }
     }
-
-    /// Its spring's response (split.md §10, A1: a layout lands in ≤ 450
-    /// ms): `sheet`'s, stiffer for a travel `sheet` would land later
-    /// (critically damped from rest, `travel` px are within a pixel when
-    /// `(1 + ωt)·e^(−ωt) = 1/travel`; ω for t = [`PANE_LANDS`]).
-    pub(crate) fn response(&self) -> f32 {
-        let d = self.travel.max(2.);
-        // (1 + u)·e^(−u) = 1/d, for u = ωt: Newton from above.
-        let mut u = 2. * d.ln() + 2.;
-        for _ in 0..12 {
-            let f = (1. + u).ln() - u + d.ln();
-            u -= f / (1. / (1. + u) - 1.);
-        }
-        crate::motion::SHEET_RESPONSE.min(std::f32::consts::TAU * PANE_LANDS / u)
-    }
 }
-
-/// The longest a layout's flight takes to land (split.md §10, A1's 450
-/// ms, less a 60 Hz frame for the frame that draws it).
-pub(crate) const PANE_LANDS: f32 = 0.43;
 
 /// A divider held down (split.md §4): which one, and how far past its
 /// rule the pointer went down, along its axis (the divider found again in
@@ -807,25 +788,6 @@ mod tests {
         // A split beside a closing pane, on both ends of a flight: the same shape.
         let (a, b) = (to.split_as(p(0), Side::Down, p(3)).unwrap(), t.split_as(p(0), Side::Down, p(3)).unwrap());
         assert!(a.same_shape(&b));
-    }
-
-    /// A1 (split.md §10): a flight of any travel lands within 450 ms on
-    /// its response; a short one is `sheet`'s own.
-    #[test]
-    fn a_flight_lands_within_450_ms_at_any_travel() {
-        let w = |r: f32| std::f32::consts::TAU / r;
-        for d in [12f32, 120., 335., 640., 1200., 2400., 3800.] {
-            let mut f = Flight::new(Node::Leaf(p(0)), Node::Leaf(p(0)), Vec::new(), Vec::new());
-            f.travel = d;
-            let r = f.response();
-            let t = PANE_LANDS + 0.002;
-            let x = d * (1. + w(r) * t) * (-w(r) * t).exp();
-            assert!(x < 1., "{d} px: {x} px out at {t} s (response {r})");
-            assert!(r <= crate::motion::SHEET_RESPONSE + 1e-6);
-        }
-        let mut f = Flight::new(Node::Leaf(p(0)), Node::Leaf(p(0)), Vec::new(), Vec::new());
-        f.travel = 40.;
-        assert_eq!(f.response(), crate::motion::SHEET_RESPONSE, "a short travel: `sheet`'s");
     }
 
     /// Reading order: top to bottom, then left to right (split.md §1).
