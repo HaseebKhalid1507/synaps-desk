@@ -491,7 +491,7 @@ fn a_held_room_holds_through_a_flight(cx: &mut TestAppContext) {
         last = (tops, k, held);
     });
     assert!(frames > 30, "it flew ({frames})");
-    assert_eq!(pane(cx, &view).1, true, "landed hanging");
+    assert!(pane(cx, &view).1, "landed hanging");
     let held = view.read_with(cx, |v, _| v.fold_slack.get().map(|s| s.last()));
     let gap = short(cx);
     assert!(held.is_some_and(|h| gap <= 3. + room - h), "still held ({held:?} of {room}), at its end ({gap})");
