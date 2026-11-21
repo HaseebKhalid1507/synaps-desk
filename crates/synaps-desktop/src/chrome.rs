@@ -385,9 +385,10 @@ pub(crate) struct Flight {
 
 /// A folded panel's strip in flight (#35: its glyphs cut in as the rail
 /// landed, then lifted in over `quick`, after everything else had stopped):
-/// it comes in over the panel's last strip-width of travel, and goes out
-/// over its first, as a crossfade of the panel's edge into the strip on the
-/// panel's own spring. Linear in the width drawn ([`Motion::spring_px`],
+/// on the panel's inner edge (#39 L1: one edge, its glyphs beside the
+/// panel's, not over them), it comes in over the panel's last strip-width
+/// of travel, and goes out over its first, as a crossfade of the panel's
+/// edge into the strip on the panel's own spring. Linear in the width drawn ([`Motion::spring_px`],
 /// whole device pixels), so it eases as the panel does, changes only in a
 /// frame the width does (no frame of its own), and is whole as the panel
 /// is the strip's width: the last frame that moves. It brings its own
@@ -1219,10 +1220,13 @@ impl AppView {
         let strip = || -> AnyElement {
             if rail { self.render_rail_strip(p, cx).into_any_element() } else { self.render_right_strip(p, cx).into_any_element() }
         };
+        let id = if rail { "rail-flight" } else { "right-flight" };
         if !f.moving {
             return match side {
                 Side::Open(w) => content(w),
-                Side::Strip => strip(),
+                // Under the flight's id, as in flight: a press in the fold's
+                // tail let go after the landing is still a click (#39 n2).
+                Side::Strip => div().id(id).h_full().flex_none().child(strip()).into_any_element(),
             };
         }
         let cw = match side {
@@ -1237,7 +1241,7 @@ impl AppView {
             _ => 0.,
         };
         div()
-            .id(if rail { "rail-flight" } else { "right-flight" })
+            .id(id)
             .debug_selector(move || format!("{}-flight", if rail { "rail" } else { "right" }))
             .relative()
             .w(px(f.shown))
@@ -1248,17 +1252,20 @@ impl AppView {
             .child(div().absolute().top_0().bottom_0().left(px(x)).w(px(cw)).flex().child(content(cw)))
             // The rail's border on its moving edge, over what it clips.
             .when(rail, |d| d.child(div().absolute().top_0().bottom_0().right_0().w(px(1.)).bg(p.hair)))
-            // Its strip, on the window's side, on the ground it lands on.
+            // Its strip on the panel's inner edge, the one edge there is
+            // (#39 L1), on the ground it lands on. A click on it is its own,
+            // never what it covers (n2).
             .map(|d| match strip_strength(f.shown) {
                 k if k > 0. => d.child(crate::motion::lift_from(
                     div()
                         .absolute()
                         .top_0()
                         .bottom_0()
-                        .when(rail, |d| d.left_0())
-                        .when(!rail, |d| d.right_0())
+                        .when(rail, |d| d.right_0())
+                        .when(!rail, |d| d.left_0())
                         .w(px(STRIP))
                         .bg(p.chrome)
+                        .occlude()
                         .child(strip()),
                     k,
                     0.,

@@ -3,7 +3,9 @@
 # `crates/synaps-desktop/Cargo.toml` `[lints]`; CI runs clippy):
 # - text sizes: `fonts::TextPx::text_px` (never under 12 px);
 # - opacity: a chart's data (`chart.rs`), and an arrival's lift from 70 %
-#   (`motion::lift`, cohesion/fluid.md law 3), never a state;
+#   (`motion::lift`, cohesion/fluid.md law 3), never a state; a folded
+#   panel's strip crossfades in from 0 with its panel's width, on its own
+#   ground (`motion::lift_from`, `chrome::strip_strength`, fluid.md §3.8);
 # - tooltips: `overlay.rs` (the one overlay box);
 # - session commands: `Client::on(seq)`, which names the attachment (split
 #   panes §6.4: an Allow, a HALT or a message never lands in another

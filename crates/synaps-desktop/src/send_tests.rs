@@ -505,3 +505,101 @@ fn a_bar_drag_during_the_return_wins(cx: &mut TestAppContext) {
     let by = shift("a bar drag up", &a, &b);
     assert!((by - 200.).abs() <= 1.5, "five moves of 40 px up ({by})");
 }
+
+/// `k` pressed and let go in window `w`, as the platform sends them.
+fn key(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
+    let keystroke = gpui_kit::Keystroke::parse_with_os(k, cx.update(|cx| cx.platform_info().os)).expect("a keystroke");
+    let down = gpui_kit::KeyDownEvent { keystroke: keystroke.clone(), is_held: false, prefer_character_input: false };
+    put(cx, w, PlatformInput::KeyDown(down));
+    put(cx, w, PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke }));
+    // Ctrl+T, Ctrl+W and Ctrl+Shift+T count presses together: one let go
+    // and the next pressed within `FoldKeys::PAIR` is a repeat.
+    std::thread::sleep(std::time::Duration::from_millis(40));
+}
+
+/// A message typed and sent with Enter (its key let go too), as a hand
+/// sends it: it went out.
+fn send_typed(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, text: &str) {
+    let sent = view.read_with(cx, |v, _| v.submits.len());
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.composer.update(cx, |s, cx| s.focus(window, cx)))).expect("the window");
+    cx.run_until_parked();
+    VisualTestContext::from_window(w, cx).simulate_input(text);
+    cx.run_until_parked();
+    key(cx, w, "enter");
+    assert_eq!(view.read_with(cx, |v, _| v.submits.len()), sent + 1, "{text}: sent");
+}
+
+fn tabs(cx: &mut TestAppContext, view: &Entity<AppView>) -> (usize, Option<usize>) {
+    view.read_with(cx, |v, _| (v.model.tabs.len(), v.model.tabs.active()))
+}
+
+/// #38: right after a message goes out, the window's keys act as at any
+/// other time: Ctrl+K and Ctrl+P open the palette, Ctrl+Tab goes to the
+/// next tab (a worker's, here), Ctrl+W closes the one on screen.
+#[gpui_kit::test]
+fn the_window_keys_act_right_after_a_send(cx: &mut TestAppContext) {
+    let (w, view) = open(cx, Level::Full, false);
+    for (k, mode) in [("ctrl-k", crate::palette::Mode::Commands), ("ctrl-p", crate::palette::Mode::GoTo)] {
+        send_typed(cx, w, &view, &format!("then {k}"));
+        key(cx, w, k);
+        assert_eq!(view.read_with(cx, |v, _| v.palette.as_ref().map(|p| p.mode)), Some(mode), "{k} after a send: the palette");
+        key(cx, w, "escape");
+        assert!(view.read_with(cx, |v, _| v.palette.is_none()), "Esc closed it");
+    }
+    // A worker's tab beside the session's, the session's on screen.
+    view.update(cx, |v, cx| {
+        let session = v.model.tabs.current().and_then(|t| t.session.clone()).expect("the demo's session");
+        assert!(v.model.tabs.open_worker_as(&session, "sa_9", "ghost", None, &session));
+        v.reconcile(None);
+        assert!(v.model.tabs.focus(0));
+        v.reconcile(None);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(tabs(cx, &view), (2, Some(0)));
+    send_typed(cx, w, &view, "then ctrl-tab");
+    key(cx, w, "ctrl-tab");
+    assert_eq!(tabs(cx, &view), (2, Some(1)), "Ctrl+Tab after a send: the next tab");
+    key(cx, w, "ctrl-tab");
+    assert_eq!(tabs(cx, &view), (2, Some(0)), "the session's tab again");
+    send_typed(cx, w, &view, "then ctrl-w");
+    key(cx, w, "ctrl-w");
+    assert_eq!(tabs(cx, &view).0, 1, "Ctrl+W after a send: the session's tab closed");
+    assert!(view.read_with(cx, |v, _| v.model.tabs.current_worker().is_some()), "the worker's is left");
+}
+
+/// #38: Ctrl+T right after a send opens a tab.
+#[gpui_kit::test]
+fn ctrl_t_acts_right_after_a_send(cx: &mut TestAppContext) {
+    let (w, view) = open(cx, Level::Full, false);
+    send_typed(cx, w, &view, "then ctrl-t");
+    key(cx, w, "ctrl-t");
+    assert_eq!(tabs(cx, &view), (2, Some(1)), "Ctrl+T after a send: a new tab, on screen");
+}
+
+/// #38, what the probe that found it saw: a window per case in one app.
+/// Each window's view puts app-wide fallbacks for the keys it may not get
+/// (`cx.on_action`): the first window's took the second's Ctrl+W and acted
+/// on its own view, and the key never came to the window it was pressed
+/// in. A fallback acts for the window dispatching only: in the second
+/// window, after a send, Ctrl+W, Ctrl+T, Ctrl+Shift+T and Ctrl+B act there,
+/// and the first is as it was.
+#[gpui_kit::test]
+fn a_second_windows_keys_are_its_own(cx: &mut TestAppContext) {
+    let (first, one) = open(cx, Level::Off, false);
+    let (w, view) = open(cx, Level::Off, false);
+    let rail = |cx: &mut TestAppContext, view: &Entity<AppView>| view.read_with(cx, |v, _| v.panels.rail_collapsed);
+    let (one_tabs, one_rail) = (tabs(cx, &one), rail(cx, &one));
+    send_typed(cx, w, &view, "in the second window");
+    key(cx, w, "ctrl-w");
+    assert_eq!(tabs(cx, &view).0, 0, "Ctrl+W after a send closed the second window's tab");
+    key(cx, w, "ctrl-shift-t");
+    assert_eq!(tabs(cx, &view).0, 1, "Ctrl+Shift+T reopened it");
+    key(cx, w, "ctrl-t");
+    assert_eq!(tabs(cx, &view).0, 2, "Ctrl+T: a tab in the second window");
+    let was = rail(cx, &view);
+    key(cx, w, "ctrl-b");
+    assert_eq!(rail(cx, &view), !was, "Ctrl+B folded the second window's rail");
+    assert_eq!((tabs(cx, &one), rail(cx, &one)), (one_tabs, one_rail), "the first window as it was");
+    let _ = first;
+}

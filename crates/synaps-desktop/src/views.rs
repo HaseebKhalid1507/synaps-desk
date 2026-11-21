@@ -1173,12 +1173,18 @@ impl AppView {
 
 /// The actions' fallbacks when the view does not have the focus (as the
 /// tab keys': [`crate::app`]).
-pub(crate) fn view_fallbacks(view: WeakEntity<AppView>, cx: &mut App) {
+pub(crate) fn view_fallbacks(view: WeakEntity<AppView>, window: AnyWindowHandle, cx: &mut App) {
     let v = view.clone();
     cx.on_action(move |_: &OpenSettings, cx| {
+        if !crate::app::dispatching(window, cx) {
+            return cx.propagate();
+        }
         let _ = v.update(cx, |v, cx| v.open_view(Kind::Settings, cx));
     });
     cx.on_action(move |_: &OpenUsage, cx| {
+        if !crate::app::dispatching(window, cx) {
+            return cx.propagate();
+        }
         let _ = view.update(cx, |v, cx| v.open_view(Kind::Usage, cx));
     });
 }

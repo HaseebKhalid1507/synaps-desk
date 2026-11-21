@@ -302,6 +302,12 @@ pub struct Pane {
     /// `rect`): its form, its fit and its foot are the landed pane's, so
     /// none of them change in the middle of a split or a close.
     pub(crate) land: Cell<crate::split::Rect>,
+    /// Its composer's landed inset from its foot as last drawn (NaN: not
+    /// drawn yet); a change in a layout's flight springs (finish gate #42
+    /// F3).
+    pub(crate) foot: Cell<f32>,
+    /// Its spring in motion.
+    pub(crate) foot_moving: Cell<bool>,
 }
 
 /// Why the keys are to follow the focus mark at the next frame
@@ -478,9 +484,16 @@ impl Pane {
             parked: Default::default(),
             rect: Cell::new(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }),
             land: Cell::new(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }),
+            foot: Cell::new(f32::NAN),
+            foot_moving: Cell::new(false),
         }
     }
 }
+
+/// Where a new flight starts ([`Panes::flight_ends`]): the layout as
+/// drawn, where the flight in the air goes, its growing and closing panes
+/// and its wraps.
+type FlightEnds = (crate::split::Node, crate::split::Node, Vec<PaneId>, Vec<PaneId>, Vec<(PaneId, f32)>);
 
 /// The window's panes (split panes step 3: up to [`PANES_MAX`], on
 /// [`Panes::tree`]).
@@ -507,6 +520,9 @@ pub(crate) struct Panes {
     /// The window is too narrow (or short) for the split (split.md §5):
     /// the focused pane fills the centre, the tree kept as it is.
     pub(crate) folded: bool,
+    /// The layout as last drawn (a flight's step, else the tree): where
+    /// the next flight starts (Shady #42 M1).
+    pub(crate) drawn: crate::split::Node,
     /// The last generation handed out ([`Panes::next_gen`]).
     gens: u64,
 }
@@ -514,16 +530,70 @@ pub(crate) struct Panes {
 impl Panes {
     pub(crate) fn one(pane: Pane) -> Self {
         let id = pane.id;
-        Panes {
-            cur: pane,
-            rest: Vec::new(),
-            focused: id,
-            tree: crate::split::Node::Leaf(id),
-            flight: None,
-            grab: None,
-            folded: false,
-            gens: 0,
+        let tree = crate::split::Node::Leaf(id);
+        Panes { cur: pane, rest: Vec::new(), focused: id, drawn: tree.clone(), tree, flight: None, grab: None, folded: false, gens: 0 }
+    }
+
+    /// Where a new flight starts (split.md §10, Shady #42 M1): the layout
+    /// as drawn, and where the flight in the air goes (its closing panes in
+    /// it at 0), with its growing and closing panes and its wraps; at rest,
+    /// the tree.
+    fn flight_ends(&self) -> FlightEnds {
+        use crate::split::Node;
+        match &self.flight {
+            Some(f) if self.drawn.same_shape(&f.to) => (self.drawn.clone(), f.to.clone(), f.grow.clone(), f.ghosts.clone(), f.wrap.clone()),
+            _ => {
+                let drawn: Node = if self.drawn.same_shape(&self.tree) { self.drawn.clone() } else { self.tree.clone() };
+                (drawn, self.tree.clone(), Vec::new(), Vec::new(), Vec::new())
+            }
         }
+    }
+
+    /// A split's flight to `tree` (split.md §10): `new` grows beside `at`
+    /// from the split line, every other pane from where it is drawn (a
+    /// pane still growing or closing carries on).
+    pub(crate) fn fly_split(&mut self, tree: &crate::split::Node, at: PaneId, side: crate::split::Side, new: PaneId) {
+        use crate::split::Flight;
+        let (mut drawn, mut to, mut grow, mut ghosts, wrap) = self.flight_ends();
+        // A closing pane's id handed out again (all four in use): its
+        // ground goes at once.
+        if ghosts.contains(&new) {
+            ghosts.retain(|g| *g != new);
+            grow.retain(|g| *g != new);
+            if let (Some(d), Some(t)) = (drawn.remove(new), to.remove(new)) {
+                (drawn, to) = (d, t);
+            }
+        }
+        let flight = match (drawn.split_as(at, side, new), to.split_as(at, side, new)) {
+            (Some(from), Some(to)) if from.same_shape(&to) => {
+                grow.push(new);
+                Flight { from: from.grown_from(new), to, grow, ghosts, travel: 0., wrap }
+            }
+            _ => Flight::new(tree.grown_from(new), tree.clone(), vec![new], Vec::new()),
+        };
+        self.drawn = flight.from.clone();
+        self.flight = Some(flight);
+    }
+
+    /// A close's flight (split.md §8, §10): `id`'s share to 0, the panes
+    /// beside it taking it, every pane from where it is drawn.
+    pub(crate) fn fly_close(&mut self, id: PaneId) {
+        let (drawn, to, mut grow, mut ghosts, wrap) = self.flight_ends();
+        grow.retain(|g| *g != id);
+        ghosts.push(id);
+        let to = to.zeroed(id);
+        self.drawn = drawn.clone();
+        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., wrap });
+    }
+
+    /// The layout's flight to `to` (split.md §10: an equalise, a detent),
+    /// from where it is drawn.
+    pub(crate) fn fly_to(&mut self, to: crate::split::Node) {
+        let (drawn, _, _, ghosts, wrap) = self.flight_ends();
+        let from = if ghosts.is_empty() && drawn.same_shape(&to) { drawn } else { self.tree.clone() };
+        self.tree = to.clone();
+        self.drawn = from.clone();
+        self.flight = Some(crate::split::Flight { from, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., wrap });
     }
 
     /// More than one pane open (on screen, or folded).
@@ -545,7 +615,10 @@ impl Panes {
     /// ids index the motion columns; a closed pane's column is reset when
     /// its id is handed out again).
     pub(crate) fn free_id(&self) -> Option<PaneId> {
-        (0..PANES_MAX as u8).map(PaneId::of).find(|id| self.get(*id).is_none())
+        // One still closing on screen last (its ground would go at once).
+        let closing = |id: &PaneId| self.flight.as_ref().is_some_and(|f| f.ghosts.contains(id));
+        let free = || (0..PANES_MAX as u8).map(PaneId::of).filter(|id| self.get(*id).is_none());
+        free().find(|id| !closing(id)).or_else(|| free().next())
     }
 
     /// Every open pane's id, in tree order.
@@ -869,11 +942,11 @@ impl crate::app::AppView {
         let next = match new {
             None => Err(Refused::Most),
             Some(new) => match side {
-                None => self.panes.tree.split_right(at, new, area).map(|(t, _)| t),
-                Some(s) => self.panes.tree.split(at, s, new, area),
+                None => self.panes.tree.split_right(at, new, area),
+                Some(s) => self.panes.tree.split(at, s, new, area).map(|t| (t, s)),
             },
         };
-        let (tree, new) = match (next, new) {
+        let ((tree, side), new) = match (next, new) {
             (Ok(t), Some(n)) => (t, n),
             (Err(r), _) => {
                 self.split_refused(r.note(), cx);
@@ -901,9 +974,12 @@ impl crate::app::AppView {
         pane.list_gen = self.panes.next_gen();
         pane.metrics_gen = self.panes.cur.metrics_gen;
         pane.full_rebuild = true;
-        // Its share grows from the split line on `sheet` (split.md §10).
-        self.panes.flight = Some(crate::split::Flight::new(tree.grown_from(new), tree.clone(), Some(new), None));
+        // Its share grows from the split line on `sheet` (split.md §10),
+        // the panes from where they are drawn. A divider held goes with
+        // the layout it was found in (Shady #42 M2).
+        self.panes.fly_split(&tree, at, side, new);
         self.panes.tree = tree;
+        self.panes.grab = None;
         self.panes.rest.push(pane);
         self.focus_pane(new, KeysTo::Pane, cx);
         if let Some((s, label)) = session {
@@ -1042,7 +1118,7 @@ impl crate::app::AppView {
             self.model.tabs.focus(ix);
         }
         let to = was.solo(me);
-        let mut flight = crate::split::Flight::new(was, to, None, None);
+        let mut flight = crate::split::Flight::new(was, to, Vec::new(), Vec::new());
         flight.ghosts = others;
         self.panes.flight = Some(flight);
         self.model.rail_gen += 1;
@@ -1159,8 +1235,11 @@ impl crate::app::AppView {
         let live = self.panes.cur.live;
         // Its share springs to 0 on `sheet`, the panes beside it taking the
         // space (split.md §8, §10).
-        let was = std::mem::replace(&mut self.panes.tree, tree);
-        self.panes.flight = Some(crate::split::Flight::new(was.clone(), was.zeroed(id), None, Some(id)));
+        // From where every pane is drawn (Shady #42 M1); a divider held
+        // goes with the layout it was found in (M2).
+        self.panes.fly_close(id);
+        self.panes.tree = tree;
+        self.panes.grab = None;
         // Focus moves only off the pane that had it (Shady #36 L3b: a close
         // an event made never takes it from the pane in use), and the keys
         // with it, from the inputs that went (L3a).
@@ -1271,9 +1350,14 @@ async fn film3b(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowCont
         release: bool,
     ) {
         let _ = view.update(cx, |v, _| {
-            let (w, h) = v.centre.get();
+            let ((w, h), (ox, oy)) = (v.centre.get(), v.centre_at.get());
             let d = v.panes.tree.dividers(crate::split::Rect { x: 0., y: 0., w, h }).into_iter().find(|d| d.axis == axis);
-            v.panes.grab = d.map(|divider| crate::split::Grab { divider, from: 0., moved: false });
+            // A pointer at 0 on its rule: the moves are px from it.
+            let off = |d: &crate::split::Divider| match d.axis {
+                Axis::Row => -ox - d.rect.x - d.at,
+                Axis::Column => -oy - d.rect.y - d.at,
+            };
+            v.panes.grab = d.map(|divider| crate::split::Grab { off: off(&divider), divider, moved: false });
         });
         let n = (secs * 60.).round().max(1.) as usize;
         for k in 1..=n {
