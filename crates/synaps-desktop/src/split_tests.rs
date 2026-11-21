@@ -3489,6 +3489,181 @@ fn a_panel_flight_over_a_layout_flight_rewraps_each_pane_at_most_twice(cx: &mut 
     }
 }
 
+/// #46 (the gate's N1, pr-44 round 4 f802): the scrollbar thumbs land
+/// with the panes. Each pane's thumb, as painted frame by frame, takes
+/// its new length in the frame its pane lands (the frame its column
+/// re-wraps in), never a frame after: from its pane's last move on, every
+/// frame paints it where the landing did. Equalise (Full, Reduced), a
+/// split, a close, and the rail's fold over a split.
+#[gpui_kit::test]
+fn the_thumbs_land_with_the_panes(cx: &mut TestAppContext) {
+    use crate::palette::AppAct;
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    level(cx, crate::motion::Level::Full);
+    let moving = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panel_fx.moving() || v.panes.flight.is_some());
+    let fly = |cx: &mut TestAppContext| {
+        let mut n = 0;
+        while n < 3 || moving(cx) {
+            frame_144(cx, window, &view);
+            n += 1;
+            assert!(n < 400, "never landed");
+        }
+        for _ in 0..8 {
+            frame_144(cx, window, &view);
+        }
+    };
+    // Every pane's bar (each keeps its own as panes swap: `Parked::bar`).
+    let bars = |cx: &mut TestAppContext| -> Vec<crate::scrollbar::BarState> {
+        view.read_with(cx, |v, _| {
+            let mut b = vec![v.bars.transcript.clone()];
+            b.extend(
+                v.panes.ids().into_iter().filter(|id| *id != v.panes.cur.id).filter_map(|id| v.panes.get(id).map(|p| p.parked.bar.clone())),
+            );
+            b
+        })
+    };
+    // Each bar's frames since `drain`, one at rest first; its pane lands
+    // in the last frame its rectangle or its column changed.
+    let drain = |cx: &mut TestAppContext, bars: &[crate::scrollbar::BarState]| {
+        bars.iter().for_each(|b| drop(b.thumbs()));
+        frame_144(cx, window, &view);
+    };
+    let mut fails = Vec::new();
+    let mut check = |case: &str, bars: &[crate::scrollbar::BarState]| {
+        let mut changed = false;
+        for (k, bar) in bars.iter().enumerate() {
+            let log = bar.thumbs();
+            let near = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.01);
+            let moved = |i: usize| !near(log[i].0, log[i - 1].0) || log[i].1 != log[i - 1].1;
+            let Some(last) = (1..log.len()).rev().find(|&i| moved(i)) else { continue };
+            let same = |a: Option<[f32; 4]>, b: Option<[f32; 4]>| match (a, b) {
+                (Some(a), Some(b)) => near(a, b),
+                (a, b) => a.is_none() && b.is_none(),
+            };
+            let rect = (1..log.len()).rev().find(|&i| !near(log[i].0, log[i - 1].0)).unwrap_or(0);
+            let col = (1..log.len()).rev().find(|&i| log[i].1 != log[i - 1].1).unwrap_or(0);
+            eprintln!("{case}: bar {k}: {} frames, its rectangle last moved at {rect}, its column at {col}", log.len());
+            changed |= !same(log[0].2, log[last].2);
+            if let Some(i) = (last + 1..log.len()).find(|&i| !same(log[i].2, log[last].2)) {
+                fails.push(format!(
+                    "{case}: bar {k}'s pane landed at frame {last} of {} (column {}), its thumb {:?}; frame {i} paints it at {:?}",
+                    log.len(),
+                    log[last].1,
+                    log[last].2,
+                    log[i].2
+                ));
+            }
+        }
+        if !changed {
+            fails.push(format!("{case}: no thumb changed (nothing to read)"));
+        }
+    };
+    // A split.
+    let one = bars(cx);
+    drain(cx, &one);
+    key(cx, window, "ctrl-\\");
+    fly(cx);
+    let two = bars(cx);
+    assert_eq!(two.len(), 2, "two panes");
+    check("a split", &two);
+    // Equalise from 30/70, at Full and at Reduced.
+    for l in [crate::motion::Level::Full, crate::motion::Level::Reduced] {
+        level(cx, crate::motion::Level::Full);
+        view.update(cx, |v, cx| {
+            if let crate::split::Node::Split { ratios, .. } = &mut v.panes.tree {
+                ratios[0] = 0.3;
+                ratios[1] = 0.7;
+            }
+            cx.notify();
+        });
+        fly(cx);
+        level(cx, l);
+        let b = bars(cx);
+        drain(cx, &b);
+        cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(AppAct::Equalise, w, cx))).unwrap();
+        fly(cx);
+        check(&format!("Equalise at {l:?}"), &b);
+    }
+    level(cx, crate::motion::Level::Full);
+    // The rail's fold (every pane widens), and back.
+    for case in ["the rail's fold", "the rail's unfold"] {
+        let b = bars(cx);
+        drain(cx, &b);
+        view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        cx.run_until_parked();
+        fly(cx);
+        check(case, &b);
+    }
+    // A close (the pane left widens), a split, a close: at Reduced, then Full.
+    for (case, l) in
+        [("a close", crate::motion::Level::Reduced), ("a split", crate::motion::Level::Reduced), ("a close", crate::motion::Level::Full)]
+    {
+        level(cx, l);
+        let b = bars(cx);
+        drain(cx, &b);
+        if case == "a split" {
+            key(cx, window, "ctrl-\\");
+        } else {
+            cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(AppAct::ClosePane, w, cx))).unwrap();
+        }
+        fly(cx);
+        let b = if case == "a split" { bars(cx) } else { b };
+        check(&format!("{case} at {l:?}"), &b);
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// #47 L1 (Shady): a divider held and dragged holds each pane's transcript
+/// thumb where the frame before the press painted it, as a panel's edge
+/// does (the gate's S3): every frame of the drag re-wraps the rows of a
+/// pane under the column's cap. Let go, the thumbs paint from the rows.
+#[gpui_kit::test]
+fn a_divider_drag_holds_the_thumbs(cx: &mut TestAppContext) {
+    use gpui_kit::point;
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    level(cx, crate::motion::Level::Full);
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    let ids = view.read_with(cx, |v, _| v.reading_order());
+    let bars: Vec<crate::scrollbar::BarState> = view.read_with(cx, |v, _| {
+        ids.iter()
+            .map(
+                |id| if *id == v.panes.cur.id { v.bars.transcript.clone() } else { v.panes.get(*id).expect("the pane").parked.bar.clone() },
+            )
+            .collect()
+    });
+    let columns = |cx: &mut TestAppContext| -> Vec<f32> {
+        view.read_with(cx, |v, _| ids.iter().map(|id| v.panes.get(*id).expect("the pane").layout.column).collect())
+    };
+    frame(cx, window);
+    let before: Vec<(f32, f32, bool)> = bars.iter().map(|b| *b.paints().last().expect("painted")).collect();
+    let col0 = columns(cx);
+    let grab = drawn(cx, window, "divider-grab 0".into()).expect("the divider's handle");
+    let (x, y) = (grab[0] + 3., grab[1] + grab[3] / 2.);
+    mouse(cx, window, point(px(x), px(y)), "down", 1);
+    let mut cols = Vec::new();
+    for dx in [-4., -12., -24., -40., -60., -80.] {
+        mouse(cx, window, point(px(x + dx), px(y)), "move", 1);
+        frame(cx, window);
+        cols.push(columns(cx));
+    }
+    assert!(view.read_with(cx, |v, _| v.panes.grab.as_ref().is_some_and(|g| g.moved)), "dragging");
+    assert!(cols.iter().any(|c| *c != col0), "the drag re-wrapped a pane's rows: {col0:?} {cols:?}");
+    for (k, bar) in bars.iter().enumerate() {
+        let paints = bar.paints();
+        let b = before[k];
+        let off: Vec<_> = paints.iter().filter(|p| !p.2 || (p.0 - b.0).abs() >= 0.5 || (p.1 - b.1).abs() >= 0.5).collect();
+        assert!(!paints.is_empty() && off.is_empty(), "pane {k}: held as before the press {b:?} through the drag: {off:?}");
+    }
+    mouse(cx, window, point(px(x - 80.), px(y)), "up", 1);
+    land(cx, window, &view);
+    frame(cx, window);
+    for (k, bar) in bars.iter().enumerate() {
+        let end = *bar.paints().last().expect("painted");
+        assert!(!end.2, "pane {k}: let go, from the rows: {end:?}");
+    }
+}
+
 /// Design gate F5 (#44 r3): after Join lands, the pane kept's worker chips
 /// take their landed grid in the landing frame (one a line in a quarter of
 /// the centre, two in the whole): no chip slides after the panes stop.

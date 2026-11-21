@@ -1222,10 +1222,11 @@ impl AppView {
         };
         let id = if rail { "rail-flight" } else { "right-flight" };
         if !f.moving {
+            // Under the flight's id, as in flight: a press in the fold's
+            // tail (#39 n2), or on a row in the unfold's (Shady #41 L1),
+            // let go after the landing is still a click.
             return match side {
-                Side::Open(w) => content(w),
-                // Under the flight's id, as in flight: a press in the fold's
-                // tail let go after the landing is still a click (#39 n2).
+                Side::Open(w) => div().id(id).h_full().flex_none().flex().child(content(w)).into_any_element(),
                 Side::Strip => div().id(id).h_full().flex_none().child(strip()).into_any_element(),
             };
         }

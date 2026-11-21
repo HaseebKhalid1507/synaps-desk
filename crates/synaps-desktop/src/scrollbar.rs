@@ -249,6 +249,11 @@ pub(crate) trait Scrolled: Clone + 'static {
     }
 }
 
+#[cfg(all(test, unix))]
+fn rect4(b: Bounds<Pixels>) -> [f32; 4] {
+    [f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.size.width), f32::from(b.size.height)]
+}
+
 fn neg(p: Point<Pixels>) -> Point<Pixels> {
     point(-p.x, -p.y)
 }
@@ -292,6 +297,16 @@ pub(crate) struct Rows {
     /// The transcript's scroller (Full): a page glides on `snap`, and a
     /// drag or a jump stops whatever it was doing first.
     glide: Option<(crate::scroll::Scroller, Rc<crate::motion::Motion>)>,
+    /// Added to its length and its offset (px): the rows the next frame
+    /// hints, read in the frame a new width dropped their heights
+    /// ([`Bar::ahead`]).
+    ahead: Option<Rc<std::cell::Cell<(f32, f32)>>>,
+}
+
+impl Rows {
+    fn ahead(&self) -> (f32, f32) {
+        self.ahead.as_ref().map_or((0., 0.), |a| a.get())
+    }
 }
 
 impl Scrolled for Rows {
@@ -301,10 +316,10 @@ impl Scrolled for Rows {
     fn content(&self) -> Size<Pixels> {
         let vp = self.list.viewport_bounds().size;
         let max = f32::from(self.list.max_offset_for_scrollbar().y);
-        size(vp.width, px(list_content(f32::from(vp.height), max, self.pad)))
+        size(vp.width, px(list_content(f32::from(vp.height), max + self.ahead().0, self.pad)))
     }
     fn offset(&self) -> Point<Pixels> {
-        neg(self.list.scroll_px_offset_for_scrollbar())
+        neg(self.list.scroll_px_offset_for_scrollbar()) + point(px(0.), px(self.ahead().1))
     }
     /// GPUI's own scrollbar entry: a drag away from the end stops
     /// tail-following, one to the end re-arms it (the wheel's rule).
@@ -363,6 +378,14 @@ impl BarState {
         std::mem::take(&mut self.0.borrow_mut().paints)
     }
 
+    /// Tests: every frame since the last call, as prepainted: the pane's
+    /// viewport, the bar's tag ([`Bar::tag`]) and the thumb's rect as
+    /// painted (`None`: none painted).
+    #[cfg(all(test, unix))]
+    pub(crate) fn thumbs(&self) -> Vec<([f32; 4], f32, Option<[f32; 4]>)> {
+        std::mem::take(&mut self.0.borrow_mut().thumbs)
+    }
+
     /// Its target goes (another list takes its place): a drag ends on it,
     /// and nothing of where its thumb was carries over.
     pub(crate) fn release(&self) {
@@ -393,6 +416,8 @@ struct Inner {
     painted: Option<(f32, f32)>,
     #[cfg(test)]
     paints: Vec<(f32, f32, bool)>,
+    #[cfg(all(test, unix))]
+    thumbs: Vec<([f32; 4], f32, Option<[f32; 4]>)>,
     /// Shown until then, after a scroll; its timer is armed.
     until: Option<Instant>,
     timer: bool,
@@ -527,6 +552,8 @@ pub(crate) struct Bar<S: Scrolled> {
     /// Held where it was last drawn from settled rows ([`Bar::still`]).
     still: bool,
     focus: Option<FocusHandle>,
+    #[cfg(all(test, unix))]
+    tag: f32,
 }
 
 impl<S: Scrolled> Bar<S> {
@@ -540,7 +567,16 @@ impl<S: Scrolled> Bar<S> {
             instant: false,
             still: false,
             focus: None,
+            #[cfg(all(test, unix))]
+            tag: 0.,
         }
+    }
+
+    /// Tests: noted with each frame in its log ([`BarState::thumbs`]).
+    #[cfg(all(test, unix))]
+    pub(crate) fn tag(mut self, tag: f32) -> Self {
+        self.tag = tag;
+        self
     }
 
     /// While `on` (a side panel's edge dragged: every new width re-wraps
@@ -590,7 +626,16 @@ pub(crate) fn rows_gliding(
     state: &BarState,
     glide: Option<(crate::scroll::Scroller, Rc<crate::motion::Motion>)>,
 ) -> Bar<Rows> {
-    Bar::new(Rows { list: list.clone(), pad, glide }, state)
+    Bar::new(Rows { list: list.clone(), pad, glide, ahead: None }, state)
+}
+
+impl Bar<Rows> {
+    /// Its rows' length and offset as the next frame will have them: plus
+    /// `ahead` (px), read after the list's layout in this one.
+    pub(crate) fn ahead(mut self, ahead: Rc<std::cell::Cell<(f32, f32)>>) -> Self {
+        self.scroll.ahead = Some(ahead);
+        self
+    }
 }
 
 /// The composer's bar, in place of the kit's (its editor calls this each
@@ -659,6 +704,8 @@ impl<S: Scrolled> Bar<S> {
             let end = st.end();
             (st.warp, st.dropped) = (None, None);
             if !geo.overflows() {
+                #[cfg(all(test, unix))]
+                st.thumbs.push((rect4(vp), self.tag, None));
                 // No hitbox, no listener.
                 (st.over, st.on_bar, st.last) = (false, false, Some(at));
                 drop(st);
@@ -716,6 +763,8 @@ impl<S: Scrolled> Bar<S> {
         };
         let pane = window.insert_hitbox(vp, HitboxBehavior::Normal);
         let drawn = lane(axis, vp, if look.1 { WIDE } else { THIN });
+        #[cfg(all(test, unix))]
+        st.thumbs.push((rect4(vp), self.tag, look.0.then(|| rect4(thumb_rect(axis, drawn, thumb)))));
         drop(st);
         Some(Frame { bar: self, geo, offset, thumb, lane: drawn, vp, pane, strip: strip_hit, thumb_hit, look, view, fade })
     }
