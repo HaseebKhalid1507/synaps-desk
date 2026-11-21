@@ -321,17 +321,19 @@ fn scroll_over(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVie
     );
 }
 
+/// Every row on screen, by identity: its top ([`row_tops`]).
+type Tops = HashMap<(u64, bool), f32>;
+
+/// The reader's input in frame `f` (whether there is more).
+type Input<'a> = &'a mut dyn FnMut(&mut TestAppContext, AnyWindowHandle, &Entity<AppView>, usize) -> bool;
+
 /// Sent from 900 px up at Full (a glide of its own, no cut), the echo at
 /// frame 1; at frame 2 (and on while it returns true) `input(cx, frame)`
 /// is the reader's scroll up. From then on no row on screen moves up (the
 /// list never goes on toward the end), and it rests where they left it:
 /// not following, the scroller still, nothing moving for 60 frames after.
 /// The rows' tops as the input began and at rest.
-fn reader_wins(
-    cx: &mut TestAppContext,
-    what: &str,
-    input: &mut dyn FnMut(&mut TestAppContext, AnyWindowHandle, &Entity<AppView>, usize) -> bool,
-) -> (HashMap<(u64, bool), f32>, HashMap<(u64, bool), f32>) {
+fn reader_wins(cx: &mut TestAppContext, what: &str, input: Input<'_>) -> (Tops, Tops) {
     let (w, view) = open(cx, Level::Full, false);
     scroll_back(cx, w, &view, 900.);
     view.read_with(cx, |v, _| v.fx.set_clock(v.fx.tick()));
@@ -372,7 +374,7 @@ fn reader_wins(
 }
 
 /// How far the rows on screen at both moved from `a` to `b` (each the same).
-fn shift(what: &str, a: &HashMap<(u64, bool), f32>, b: &HashMap<(u64, bool), f32>) -> f32 {
+fn shift(what: &str, a: &Tops, b: &Tops) -> f32 {
     let d: Vec<f32> = b.iter().filter_map(|(r, y)| a.get(r).map(|y0| y - y0)).collect();
     assert!(!d.is_empty(), "{what}: rows in both");
     let (lo, hi) = d.iter().fold((f32::MAX, f32::MIN), |(l, h), x| (l.min(*x), h.max(*x)));
