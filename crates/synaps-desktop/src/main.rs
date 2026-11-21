@@ -23,6 +23,12 @@
 
 // serde_json's `json!` in the synthetic transport and its tests nests deep.
 #![recursion_limit = "256"]
+// The view-level split tests (`split_tests`) need a unix socket, so they only
+// build on unix. Test-only helpers whose one caller is there are dead code in
+// a Windows test build, and `-D warnings` failed CI on windows-latest for
+// each new one (#32 `enter`, #36 `parked`, #47 `thumbs`). Linux clippy, where
+// every test module builds, stays the authority on dead code.
+#![cfg_attr(all(test, not(unix)), allow(dead_code))]
 
 mod app;
 mod authorize;
