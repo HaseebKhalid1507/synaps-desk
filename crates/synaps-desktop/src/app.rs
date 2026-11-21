@@ -1035,7 +1035,9 @@ fn fold_fallback<A: Action>(rail: bool, view: WeakEntity<AppView>, window: AnyWi
 /// with a second window in its app). GPUI lends a window out for its
 /// dispatch: until that is over, updating it fails. A closed window's
 /// update fails too: it is not dispatching, and its fallbacks pass every
-/// key on (Shady #40 n1: they swallowed the live window's).
+/// key on (Shady #40 n1: they swallowed the live window's). GPUI keeps a
+/// closed window's fallbacks registered (`on_action` has no unsubscribe):
+/// this is what makes them inert.
 pub(crate) fn dispatching(window: AnyWindowHandle, cx: &mut App) -> bool {
     cx.windows().contains(&window) && window.update(cx, |_, _, _| ()).is_err()
 }
@@ -7679,11 +7681,11 @@ impl AppView {
             }
         }
         // A new column re-wraps the rows: GPUI drops every row's height at
-        // the new width and measures the ones it draws. The rest get their
-        // hint right after its layout (`rehint`, below), so this frame's
-        // scrollbar reads the rows as the next frame would (#46: the thumbs
-        // land with the panes, not a frame after). One more frame anyway,
-        // at every level, which changes nothing.
+        // the new width and measures the ones it draws. This frame's bar
+        // reads the rest at the hint the next frame gives them (`rehint`,
+        // below, which only reads; #46: the thumbs land with the panes, not
+        // a frame after). One more frame, at every level, gives it
+        // ([`AppView::hint_rows`]).
         let rewrap = lay.column != self.panes.cur.layout.column;
         if rewrap {
             window.request_animation_frame();
@@ -7772,10 +7774,12 @@ impl AppView {
         let geo = crate::cards::Geo::of(&m);
         self.panes.cur.metrics_last.set(Some(m));
         let id = self.panes.cur.id;
-        // The rows the list draws this frame, on one that re-wraps them
-        // (`rehint`, below).
-        let drawn: Rc<RefCell<Vec<usize>>> = Rc::default();
-        let seen = rewrap.then(|| drawn.clone());
+        // The bar held (S3, S6, a divider: below), or the rows the list
+        // draws this frame, on one that re-wraps them (`rehint`, below).
+        self.springback &= self.panel_fx.moving();
+        let held = self.drag.is_some() || self.springback || self.panes.grab.is_some();
+        let drawn: Option<Rc<RefCell<Vec<usize>>>> = (rewrap && !held).then(Rc::default);
+        let seen = drawn.clone();
         let list = list(
             self.panes.cur.list.clone(),
             cx.processor(move |this, ix, _window, cx| {
@@ -7835,29 +7839,31 @@ impl AppView {
         let layer = self.layer_now();
         let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.panes.cur.scroller.clone(), self.fx.clone()));
         // Held while an edge is dragged and as it springs to a detent after
-        // (the gate's S3 and S6).
-        self.springback &= self.panel_fx.moving();
-        let transcript_bar = crate::scrollbar::rows_gliding(&self.panes.cur.list, pad_t + pad_b, &self.bars.transcript, glide)
-            .always()
-            .still(self.drag.is_some() || self.springback);
+        // (the gate's S3 and S6), and while a divider is held (#47 L1: as a
+        // panel's edge; every frame of its drag re-wraps the rows).
+        let transcript_bar =
+            crate::scrollbar::rows_gliding(&self.panes.cur.list, pad_t + pad_b, &self.bars.transcript, glide).always().still(held);
         // The frame a new column re-wraps the rows, after the list's layout
         // and before its bar: the bar reads the rows as the next frame's
         // [`AppView::hint_rows`] will have them, so the thumb takes the
         // re-wrapped rows' length in the frame they re-wrap (#46).
-        let ahead = Rc::new(Cell::new((0., 0.)));
-        let transcript_bar = if rewrap { transcript_bar.ahead(ahead.clone()) } else { transcript_bar };
-        let rehint = rewrap.then(|| {
-            let (v, ahead) = (cx.weak_entity(), ahead.clone());
-            canvas(
-                move |_, _, cx| {
-                    let add = v.update(cx, |this, _| this.in_drawn(id, |this| this.hint_ahead(&m, &drawn.borrow())));
-                    ahead.set(add.ok().flatten().unwrap_or((0., 0.)));
-                },
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .size_0()
-        });
+        let (transcript_bar, rehint) = match drawn {
+            Some(drawn) => {
+                let (v, ahead) = (cx.weak_entity(), Rc::new(Cell::new((0., 0.))));
+                let a = ahead.clone();
+                let rehint = canvas(
+                    move |_, _, cx| {
+                        let add = v.update(cx, |this, _| this.in_drawn(id, |this| this.hint_ahead(&m, &drawn.borrow())));
+                        a.set(add.ok().flatten().unwrap_or((0., 0.)));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_0();
+                (transcript_bar.ahead(ahead), Some(rehint))
+            }
+            None => (transcript_bar, None),
+        };
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
         // the end of a scrolled-back list set it following; it stops 2 px
         // short of the end instead, still scrolled back. Built only on the
@@ -7872,7 +7878,7 @@ impl AppView {
             canvas(move |_, _, _| land_card_room(&l, &slack), |_, _, _, _| {}).absolute().size_0()
         });
         // Tests: each frame of its log notes the column.
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         let transcript_bar = transcript_bar.tag(lay.column);
         let hold_back = self.panes.cur.hold_back.get().then(|| {
             let (held, hold, texts) = (self.panes.cur.list.clone(), self.panes.cur.hold_back.clone(), self.panes.cur.texts.clone());

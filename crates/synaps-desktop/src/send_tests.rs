@@ -601,9 +601,20 @@ fn a_second_windows_keys_are_its_own(cx: &mut TestAppContext) {
     key(cx, w, "ctrl-b");
     assert_eq!(rail(cx, &view), !was, "Ctrl+B folded the second window's rail");
     assert_eq!((tabs(cx, &one), rail(cx, &one)), (one_tabs, one_rail), "the first window as it was");
-    // Shady #40 L2: and the first window's keys are its own (the second
-    // window's fallbacks run first, being newer: before #40 they took the
-    // first window's keys too).
+    let _ = first;
+}
+
+/// Shady #40 L2: in an app with two windows, the first window's keys are
+/// its own too. The second window's fallbacks run first (being newer):
+/// before #40 they took the first window's keys. After a send in the
+/// first window, Ctrl+T, Ctrl+W and Ctrl+B act there, and the second is as
+/// it was.
+#[gpui_kit::test]
+fn the_first_windows_keys_are_its_own(cx: &mut TestAppContext) {
+    let (first, one) = open(cx, Level::Off, false);
+    let (_w, view) = open(cx, Level::Off, false);
+    let rail = |cx: &mut TestAppContext, view: &Entity<AppView>| view.read_with(cx, |v, _| v.panels.rail_collapsed);
+    let (one_tabs, one_rail) = (tabs(cx, &one), rail(cx, &one));
     let (two_tabs, two_rail) = (tabs(cx, &view), rail(cx, &view));
     send_typed(cx, first, &one, "in the first window");
     key(cx, first, "ctrl-t");

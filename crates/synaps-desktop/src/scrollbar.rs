@@ -249,7 +249,7 @@ pub(crate) trait Scrolled: Clone + 'static {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn rect4(b: Bounds<Pixels>) -> [f32; 4] {
     [f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.size.width), f32::from(b.size.height)]
 }
@@ -381,7 +381,7 @@ impl BarState {
     /// Tests: every frame since the last call, as prepainted: the pane's
     /// viewport, the bar's tag ([`Bar::tag`]) and the thumb's rect as
     /// painted (`None`: none painted).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn thumbs(&self) -> Vec<([f32; 4], f32, Option<[f32; 4]>)> {
         std::mem::take(&mut self.0.borrow_mut().thumbs)
     }
@@ -416,7 +416,7 @@ struct Inner {
     painted: Option<(f32, f32)>,
     #[cfg(test)]
     paints: Vec<(f32, f32, bool)>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     thumbs: Vec<([f32; 4], f32, Option<[f32; 4]>)>,
     /// Shown until then, after a scroll; its timer is armed.
     until: Option<Instant>,
@@ -552,7 +552,7 @@ pub(crate) struct Bar<S: Scrolled> {
     /// Held where it was last drawn from settled rows ([`Bar::still`]).
     still: bool,
     focus: Option<FocusHandle>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     tag: f32,
 }
 
@@ -567,13 +567,13 @@ impl<S: Scrolled> Bar<S> {
             instant: false,
             still: false,
             focus: None,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             tag: 0.,
         }
     }
 
     /// Tests: noted with each frame in its log ([`BarState::thumbs`]).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn tag(mut self, tag: f32) -> Self {
         self.tag = tag;
         self
@@ -704,7 +704,7 @@ impl<S: Scrolled> Bar<S> {
             let end = st.end();
             (st.warp, st.dropped) = (None, None);
             if !geo.overflows() {
-                #[cfg(test)]
+                #[cfg(all(test, unix))]
                 st.thumbs.push((rect4(vp), self.tag, None));
                 // No hitbox, no listener.
                 (st.over, st.on_bar, st.last) = (false, false, Some(at));
@@ -763,7 +763,7 @@ impl<S: Scrolled> Bar<S> {
         };
         let pane = window.insert_hitbox(vp, HitboxBehavior::Normal);
         let drawn = lane(axis, vp, if look.1 { WIDE } else { THIN });
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         st.thumbs.push((rect4(vp), self.tag, look.0.then(|| rect4(thumb_rect(axis, drawn, thumb)))));
         drop(st);
         Some(Frame { bar: self, geo, offset, thumb, lane: drawn, vp, pane, strip: strip_hit, thumb_hit, look, view, fade })

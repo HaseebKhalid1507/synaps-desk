@@ -9331,8 +9331,8 @@ fn the_thumb_holds_while_an_edge_is_dragged(cx: &mut TestAppContext) {
 /// painted: an edge dragged out and let go near its detent springs back
 /// with the transcript's thumb where it was through the whole gesture; a
 /// rail fold's landing re-wraps the column, and that frame paints the
-/// thumb as the one before it did (the rows are on their estimates), the
-/// next from the rows.
+/// thumb from the rows (their hints read ahead: #46, finish gate N1), held
+/// in no frame.
 #[gpui_kit::test]
 fn the_thumb_holds_through_a_springback_and_a_landing_rewrap(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (1280., 720.), crate::theme::Panels::default().text_size);
@@ -9363,41 +9363,27 @@ fn the_thumb_holds_through_a_springback_and_a_landing_rewrap(cx: &mut TestAppCon
     settle(cx, w, 8);
     assert!((panel(cx, &view, true).0 - w0).abs() < 0.5, "back at its detent");
     // The rail folds: the column widens when it lands (nothing else holds
-    // the thumb in this flight). The frame that re-wraps paints it from the
-    // rows (their hints given after the list's layout), shorter; no frame
-    // after it moves it (#46: it lands with the column, not a frame late).
+    // the thumb in this flight). The frame that re-wraps paints it from
+    // the rows (#46): no frame holds it.
     let column = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.layout.column);
     let col0 = column(cx);
     let bars = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.bars.transcript.paints());
-    let mut cols = Vec::new();
     bars(cx);
     catch_up(cx, &view);
     view.update(cx, |v, cx| v.toggle_panel(true, cx));
     cx.run_until_parked();
-    fly(cx, w, &view, 400, |cx| {
-        let c = column(cx);
-        cols.push((c, bars(cx)));
-    });
+    fly(cx, w, &view, 400, |_| {});
     settle(cx, w, 8);
+    let paints = bars(cx);
     assert!(column(cx) > col0 + 10., "a wider column ({col0} → {})", column(cx));
-    let at = cols.iter().position(|(c, _)| *c > col0 + 10.).expect("the column re-wrapped");
-    let landing = cols[at].1.last().copied().expect("the re-wrap's frame painted");
-    let before = cols[..at].iter().rev().find_map(|(_, p)| p.last().copied()).expect("a frame before it");
-    assert!(cols.iter().flat_map(|(_, p)| p).all(|p| !p.2), "nothing held in a fold: {cols:?}");
-    assert!(landing.0 < before.0 - 10., "the re-wrap's frame paints the wider column's rows, shorter ({before:?} {landing:?})");
-    for (n, (_, p)) in cols[at..].iter().enumerate() {
-        for q in p {
-            assert!(
-                (q.0 - landing.0).abs() < 0.5 && (q.1 - landing.1).abs() < 0.5,
-                "frame {n} after the re-wrap moved it: {landing:?} {q:?}"
-            );
-        }
+    let held: Vec<usize> = (1..paints.len()).filter(|&i| paints[i].2).collect();
+    assert!(held.is_empty() && paints.len() > 30, "no frame held, the landing's either: {paints:?}");
+    for i in held {
+        let (a, b) = (paints[i - 1], paints[i]);
+        assert!((a.0 - b.0).abs() < 0.5 && (a.1 - b.1).abs() < 0.5, "held as the frame before painted it: {a:?} {b:?}");
     }
-    let rest = bars(cx);
-    assert!(
-        rest.iter().all(|q| (q.0 - landing.0).abs() < 0.5 && (q.1 - landing.1).abs() < 0.5),
-        "at rest, as it landed: {landing:?} {rest:?}"
-    );
+    let (end, last) = (paints.last().copied().expect("painted"), paints[0]);
+    assert!(!end.2 && end.0 < last.0 - 10., "then from the rows: a wider column is shorter ({last:?} {end:?})");
 }
 
 /// Shady N2 (PR #21): a panel turned round mid-flight (its fold key

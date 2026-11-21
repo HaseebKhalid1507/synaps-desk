@@ -1082,17 +1082,33 @@ fn a_click_in_the_folds_tail_is_the_strips(cx: &mut TestAppContext) {
         }
         settle(cx, w, 8);
     }
-    // Shady #41 L1: a row pressed as the rail finishes opening, let go
-    // after it lands, is a click on the row (the open panel is under the
-    // flight's id too): its session opens. Folded first, at rest.
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// Shady #41 L1: a rail row pressed as the rail finishes opening, let go
+/// after it lands, is a click on the row (the open panel is under the
+/// flight's id landed too, as the folded strip is): its session opens in
+/// the tab on screen.
+#[gpui_kit::test]
+fn a_row_pressed_as_the_rail_opens_is_a_click(cx: &mut TestAppContext) {
+    use gpui_kit::{AppContext as _, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput, point};
+    let (w, view, _events) = open_at(cx, (1920., 1080.), 17);
+    view.update(cx, |v, cx| {
+        (v.panels.rail_width, v.panels.right_width) = (Some(480), Some(520));
+        cx.notify();
+    });
+    wait(cx, w, &view, 3000);
+    motion_level(cx, &view, Level::Full);
+    settle(cx, w, 8);
+    let moving = |cx: &mut TestAppContext| view.read_with(cx, |v, _| (v.panel_fx.sides[0].moving, v.panel_fx.sides[0].shown));
     let current = view.read_with(cx, |v, _| v.model.tabs.current().and_then(|t| t.session.clone()));
-    let row = view.read_with(cx, |v, _| {
+    let picked = view.read_with(cx, |v, _| {
         v.rail.rail.rows.iter().find_map(|r| match &r.action {
-            crate::named::RowAction::Attach(s) if Some(s) != current.as_ref() => Some(r.key),
+            crate::named::RowAction::Attach(s) if Some(s) != current.as_ref() => Some((r.key, s.clone())),
             _ => None,
         })
     });
-    let row = row.expect("a rail row of a session not on screen");
+    let (row, session) = picked.expect("a rail row of a session not on screen");
     let y = bounds(cx, w, format!("star {row}")).map(|b| b[1] + b[3] / 2.).expect("its row drawn");
     let at = point(px(200.), px(y));
     let mouse = |cx: &mut TestAppContext, down: bool| {
@@ -1105,7 +1121,8 @@ fn a_click_in_the_folds_tail_is_the_strips(cx: &mut TestAppContext) {
         cx.update_window(w, |_, window, cx| window.dispatch_event(ev, cx)).expect("the window");
         cx.run_until_parked();
     };
-    let open = view.read_with(cx, |v, _| v.panel_fx.sides[0].shown);
+    // Folded first, at rest.
+    let open = moving(cx).1;
     view.update(cx, |v, cx| v.toggle_panel(true, cx));
     cx.run_until_parked();
     for _ in 0..400 {
@@ -1116,7 +1133,6 @@ fn a_click_in_the_folds_tail_is_the_strips(cx: &mut TestAppContext) {
     }
     settle(cx, w, 8);
     assert!(view.read_with(cx, |v, _| v.panels.rail_collapsed), "folded");
-    let before = what(cx);
     view.update(cx, |v, cx| v.toggle_panel(true, cx));
     cx.run_until_parked();
     // Into the unfold's tail: within 3 px of open, still on its way.
@@ -1132,8 +1148,6 @@ fn a_click_in_the_folds_tail_is_the_strips(cx: &mut TestAppContext) {
     }
     fluid_frame(cx, w, &view);
     mouse(cx, false);
-    if what(cx) == before {
-        fails.push(format!("pressed on a row in the unfold's tail, let go landed: the click was dropped ({before:?})"));
-    }
-    assert!(fails.is_empty(), "{fails:#?}");
+    let now = view.read_with(cx, |v, _| v.model.tabs.current().and_then(|t| t.session.clone()));
+    assert_eq!(now.as_deref(), Some(session.as_str()), "pressed in the unfold's tail, let go landed: the row's session opens");
 }

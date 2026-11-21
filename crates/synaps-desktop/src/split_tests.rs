@@ -3568,6 +3568,57 @@ fn the_thumbs_land_with_the_panes(cx: &mut TestAppContext) {
     assert!(fails.is_empty(), "{fails:#?}");
 }
 
+/// #47 L1 (Shady): a divider held and dragged holds each pane's transcript
+/// thumb where the frame before the press painted it, as a panel's edge
+/// does (the gate's S3): every frame of the drag re-wraps the rows of a
+/// pane under the column's cap. Let go, the thumbs paint from the rows.
+#[gpui_kit::test]
+fn a_divider_drag_holds_the_thumbs(cx: &mut TestAppContext) {
+    use gpui_kit::point;
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    level(cx, crate::motion::Level::Full);
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    let ids = view.read_with(cx, |v, _| v.reading_order());
+    let bars: Vec<crate::scrollbar::BarState> = view.read_with(cx, |v, _| {
+        ids.iter()
+            .map(
+                |id| if *id == v.panes.cur.id { v.bars.transcript.clone() } else { v.panes.get(*id).expect("the pane").parked.bar.clone() },
+            )
+            .collect()
+    });
+    let columns = |cx: &mut TestAppContext| -> Vec<f32> {
+        view.read_with(cx, |v, _| ids.iter().map(|id| v.panes.get(*id).expect("the pane").layout.column).collect())
+    };
+    frame(cx, window);
+    let before: Vec<(f32, f32, bool)> = bars.iter().map(|b| *b.paints().last().expect("painted")).collect();
+    let col0 = columns(cx);
+    let grab = drawn(cx, window, "divider-grab 0".into()).expect("the divider's handle");
+    let (x, y) = (grab[0] + 3., grab[1] + grab[3] / 2.);
+    mouse(cx, window, point(px(x), px(y)), "down", 1);
+    let mut cols = Vec::new();
+    for dx in [-4., -12., -24., -40., -60., -80.] {
+        mouse(cx, window, point(px(x + dx), px(y)), "move", 1);
+        frame(cx, window);
+        cols.push(columns(cx));
+    }
+    assert!(view.read_with(cx, |v, _| v.panes.grab.as_ref().is_some_and(|g| g.moved)), "dragging");
+    assert!(cols.iter().any(|c| *c != col0), "the drag re-wrapped a pane's rows: {col0:?} {cols:?}");
+    for (k, bar) in bars.iter().enumerate() {
+        let paints = bar.paints();
+        let b = before[k];
+        let off: Vec<_> = paints.iter().filter(|p| !p.2 || (p.0 - b.0).abs() >= 0.5 || (p.1 - b.1).abs() >= 0.5).collect();
+        assert!(!paints.is_empty() && off.is_empty(), "pane {k}: held as before the press {b:?} through the drag: {off:?}");
+    }
+    mouse(cx, window, point(px(x - 80.), px(y)), "up", 1);
+    land(cx, window, &view);
+    frame(cx, window);
+    for (k, bar) in bars.iter().enumerate() {
+        let end = *bar.paints().last().expect("painted");
+        assert!(!end.2, "pane {k}: let go, from the rows: {end:?}");
+    }
+}
+
 /// Design gate F5 (#44 r3): after Join lands, the pane kept's worker chips
 /// take their landed grid in the landing frame (one a line in a quarter of
 /// the centre, two in the whole): no chip slides after the panes stop.
