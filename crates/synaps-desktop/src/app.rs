@@ -7774,8 +7774,11 @@ impl AppView {
             self.arm_attach(cx);
         }
         // Rows held while the pane's split flies in (`Pane::hold_rows`):
-        // from the frame it has landed.
-        let hold = self.panes.cur.hold_rows && self.panes.flight.as_ref().is_some_and(|f| f.grow.contains(&self.panes.cur.id));
+        // they come in the frame that draws the landed layout, the last that
+        // moves (#50: nothing changes after it), never a settling frame.
+        let hold = self.panes.cur.hold_rows
+            && self.panes.drawn != self.panes.tree
+            && self.panes.flight.as_ref().is_some_and(|f| f.grow.contains(&self.panes.cur.id));
         self.panes.cur.hold_rows = hold;
         let (pad_l, pad_r) = lay.padding();
         // Nothing over the list but the tab strip: the first row's own gap

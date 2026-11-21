@@ -253,7 +253,7 @@ pub struct Pane {
     /// row dropped on an edge opens a session no pane has drawn, and its
     /// rows' first layout (text no frame has shaped) would cut the
     /// opening of the `sheet` flight; it flies in with its tab strip and
-    /// composer, its rows from the frame after it lands.
+    /// composer, its rows in the frame that draws it landed.
     pub(crate) hold_rows: bool,
     /// The authorization card's prompt (see [`PromptCard`]).
     pub(crate) card: Option<PromptCard>,
