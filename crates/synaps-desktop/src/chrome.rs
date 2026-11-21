@@ -2222,19 +2222,26 @@ impl AppView {
                 p,
                 cx,
             )))
-            // Whose numbers (split.md §6, A12): the focused pane's, its
-            // cell lit, and its session's title.
+            // Whose numbers (split.md §6, A12): the session behind them (the
+            // focused pane's store, on a worker or Settings tab too), its
+            // title, and the cells of the panes that show it (Shady #44 L6).
             .when(self.panes.split(), |d| {
-                let me = self.panes.focused;
-                let title = self.model.tabs.current().map(|t| t.label.clone()).unwrap_or_default();
+                let (title, lit) = self.numbers_session();
                 d.child(
                     h_flex()
                         .mt(px(6.))
                         .gap(px(8.))
                         .items_center()
                         .debug_selector(|| "right-pane-map".into())
-                        .child(self.pane_map(13., 9., move |id| id == me, false, p, cx))
-                        .child(mono(title, 12., p.prose).min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis()),
+                        .child(self.pane_map(13., 9., move |id| lit.contains(&id), false, p, cx))
+                        .child(
+                            mono(title, 12., p.prose)
+                                .debug_selector(|| "right-pane-title".into())
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis(),
+                        ),
                 )
             })
             .child(

@@ -2801,9 +2801,13 @@ fn a_held_move_key_moves_the_tab_once(cx: &mut TestAppContext) {
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2, "its repeat moved nothing: {:?}", pane_tabs(cx, &view));
 }
 
-/// Shady #44 L4: Ctrl+J to another pane's card, then its answer key
-/// before the next frame: the card's keys wait their arm (they were live
-/// in that pane long before, unfocused).
+/// Shady #44 L4, L13: Ctrl+J to another pane's card, then its answer
+/// key before the next frame: the card's keys wait their arm (they were
+/// live in that pane long before, unfocused). As in use: the keys at the
+/// window's root (the focused pane shows Settings), A's card shown and
+/// its keys live two seconds ago (its arm's instants set: the wait is
+/// driven by them, not by the wall clock), and Ctrl+J and Ctrl+Enter in
+/// one update (no frame between them).
 #[gpui_kit::test]
 fn a_card_key_right_after_a_ctrl_j_waits_its_arm(cx: &mut TestAppContext) {
     let (window, view, _client, mut a, attaches, events) = on_a(cx, "panes-ctrl-j-batch", Some(1));
@@ -2816,27 +2820,182 @@ fn a_card_key_right_after_a_ctrl_j_waits_its_arm(cx: &mut TestAppContext) {
     let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
     b.send(attached(B, None));
     feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
-    let pa = view.read_with(cx, |v, _| v.panes.rest[0].id);
-    let _ = (names(&mut a), names(&mut b));
-    // A second on: A's card long armed, in its unfocused pane.
-    for _ in 0..8 {
-        cx.executor().advance_clock(Duration::from_millis(150));
+    let _ = names(&mut b);
+    view.update(cx, |v, cx| {
+        v.model.tabs.open_view(crate::tabs::Kind::Settings);
+        v.reconcile(None);
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.activate_window();
+        view.update(cx, |v, cx| w.focus(&v.focus, cx))
+    })
+    .unwrap();
+    for _ in 0..3 {
         frame(cx, window);
     }
+    let _ = names(&mut a);
+    let pa = view.read_with(cx, |v, _| v.panes.rest[0].id);
+    assert!(view.read_with(cx, |v, _| v.panes.rest[0].keys_live), "A's card's keys live in its pane (the keys at the root)");
+    let long_ago = std::time::Instant::now() - Duration::from_secs(2);
+    view.update(cx, |v, _| v.panes.rest[0].card.as_mut().expect("A's card").arm = crate::app::Arm::new(long_ago));
+    assert!(view.read_with(cx, |v, _| v.panes.rest[0].card.as_ref().is_some_and(|c| c.keys_armed())), "armed long ago");
     let keystroke = gpui_kit::Keystroke::parse_with_os("ctrl-j", cx.update(|cx| cx.platform_info().os)).expect("a keystroke");
     let down = gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent { keystroke, is_held: false, prefer_character_input: false });
-    cx.update_window(window, |_, w, cx| {
-        w.dispatch_event(down, cx);
-    })
-    .expect("the window");
-    cx.run_until_parked();
-    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), pa, "Ctrl+J went to A's pane");
-    // Ctrl+Enter, a new press, before any frame.
-    let acts = view.update(cx, |v, cx| {
-        v.panes.cur.chord_press = true;
-        v.card_key_armed(cx)
-    });
+    let (focused, live, acts) = cx
+        .update_window(window, |_, w, cx| {
+            w.dispatch_event(down, cx);
+            view.update(cx, |v, cx| {
+                let live = v.panes.cur.keys_live;
+                // Ctrl+Enter, a new press, before any frame.
+                v.panes.cur.chord_press = true;
+                (v.panes.focused, live, v.card_key_armed(cx))
+            })
+        })
+        .expect("the window");
+    assert_eq!(focused, pa, "Ctrl+J went to A's pane");
+    assert!(!live, "its keys are not live until its next frame");
     assert!(!acts, "the card's keys wait their arm");
+}
+
+/// Shady #44 L9: Open to the side on a row whose session is a tab of
+/// the focused pane (behind) shows that tab here: no split, no copy of
+/// the tab on screen.
+#[gpui_kit::test]
+fn open_to_the_side_on_a_tab_of_this_pane_shows_it_here(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    view.update(cx, |v, cx| {
+        v.open_tab(
+            crate::app::Open::Attach { session_id: crate::demo::FLAKY.into(), fallback: None, open: false },
+            crate::tabs::Place::New,
+        );
+        cx.notify();
+    });
+    frame(cx, window);
+    frame(cx, window);
+    let action = crate::named::RowAction::Attach(crate::demo::IDLE_CPU.into());
+    cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.open_to_side(&action, w, cx))).unwrap();
+    frame(cx, window);
+    frame(cx, window);
+    let tabs = pane_tabs(cx, &view);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "nothing split: {tabs:?}");
+    let shown = view.read_with(cx, |v, _| v.model.tabs.visible().and_then(|t| t.session.clone()));
+    assert_eq!(shown.as_deref(), Some(crate::demo::IDLE_CPU), "its tab shown here");
+    assert_eq!(tabs.iter().flatten().filter(|s| *s == crate::demo::FLAKY).count(), 1, "no copy: {tabs:?}");
+}
+
+/// Shady #44 L10: Join carries a background worker tab's draft under its
+/// own key (`session#sa_N`), not its session's.
+#[gpui_kit::test]
+fn join_carries_a_background_worker_tabs_draft(cx: &mut TestAppContext) {
+    use crate::palette::AppAct;
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    let k = view.update(cx, |v, cx| {
+        let s = v.model.tabs.visible().and_then(|t| t.session.clone()).expect("its session");
+        let ix = v.model.tabs.active().expect("its tab");
+        v.model.tabs.open_worker(&s, "sa_9", "scout", "scout");
+        let k = v.model.tabs.iter().find(|t| t.worker.is_some()).and_then(|t| t.draft_key()).expect("a worker tab").to_string();
+        v.model.tabs.focus(ix);
+        v.reconcile(None);
+        v.drafts.put(&k, crate::tabs::Draft { text: "for the scout".into(), cursor: 0, note: None });
+        cx.notify();
+        k
+    });
+    frame(cx, window);
+    let left = view.read_with(cx, |v, _| v.reading_order()[0]);
+    view.update(cx, |v, cx| v.focus_pane(left, crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(AppAct::JoinPanes, w, cx))).unwrap();
+    land(cx, window, &view);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "joined");
+    let kept = view.update(cx, |v, _| v.drafts.take(&k).map(|d| d.text));
+    assert_eq!(kept.as_deref(), Some("for the scout"), "the worker tab's draft came with it, under {k}");
+}
+
+/// Shady #44 L11: a send from a pane Join closes (on the store the pane
+/// that stays shows too), refused after the Join: the text comes back to
+/// the pane that stays, never dropped with the closed pane.
+#[gpui_kit::test]
+fn a_refused_send_from_a_pane_join_closed_comes_back(cx: &mut TestAppContext) {
+    use crate::palette::AppAct;
+    let (window, view, client, mut a, _attaches, events) = on_a(cx, "panes-unsent-join", None);
+    key(cx, window, "ctrl-\\");
+    let (p0, p1) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    let text = "from the second pane";
+    frame(cx, window);
+    type_enter(cx, window, text);
+    assert_eq!(submits(&mut a), 1, "one message sent on A");
+    view.update(cx, |v, cx| v.focus_pane(p0, crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(AppAct::JoinPanes, w, cx))).unwrap();
+    land(cx, window, &view);
+    assert_eq!(view.read_with(cx, |v, _| (v.panes.len(), v.panes.focused)), (1, p0), "joined into the first pane");
+    a.send(json!({"type": "event", "session_id": A, "seq": 1, "ts": "t",
+        "event": {"ev": "refused", "client": 2, "command": "submit", "reason": "busy"}}));
+    feed(cx, window, &view, &events, "the refusal", |v| v.model.lives[v.panes.cur.live].in_flight.is_empty());
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    let first = view.read_with(cx, |v, cx| (v.panes.cur.restore.clone(), v.panes.cur.composer.read(cx).value().to_string()));
+    assert!(first.1 == text || first.0.as_deref() == Some(text), "back in the pane that stays: {first:?} (the second was {p1:?})");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #44 L12: a tab still being created in a pane Join closes stays
+/// with its pane (its create is its store's, detached as the pane goes):
+/// the pane that stays has no tab nothing would ever fill, and no store
+/// is left behind.
+#[gpui_kit::test]
+fn join_leaves_a_tab_still_being_created_with_its_pane(cx: &mut TestAppContext) {
+    use crate::palette::AppAct;
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-join-pending", None);
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Create, crate::tabs::Place::New);
+        cx.notify();
+    });
+    frame(cx, window);
+    assert!(view.read_with(cx, |v, _| v.model.tabs.visible().is_some_and(|t| t.pending())), "a tab being created on the right");
+    let left = view.read_with(cx, |v, _| v.reading_order()[0]);
+    view.update(cx, |v, cx| v.focus_pane(left, crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(AppAct::JoinPanes, w, cx))).unwrap();
+    land(cx, window, &view);
+    frame(cx, window);
+    let (n, pending, stores) =
+        view.read_with(cx, |v, _| (v.panes.len(), v.model.tabs.iter().filter(|t| t.pending()).count(), v.model.lives.ids().len()));
+    assert_eq!((n, pending), (1, 0), "joined, no tab nothing will fill");
+    assert_eq!(stores, 1, "no store left behind");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #44 L6: the right panel's header names the session behind its
+/// numbers and lights the panes that show it: on a Settings tab in the
+/// focused pane, that pane's session (not an empty title, not this pane).
+#[gpui_kit::test]
+fn the_right_panels_header_names_the_session_behind_its_numbers(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    let (left, right) = view.read_with(cx, |v, _| (v.reading_order()[0], v.reading_order()[1]));
+    let label = view.read_with(cx, |v, _| v.model.tabs.visible().map(|t| t.label.clone()).expect("its tab"));
+    assert_eq!(view.read_with(cx, |v, _| v.numbers_session()), (label.clone(), vec![right, left]), "both panes show it");
+    view.update(cx, |v, cx| {
+        v.model.tabs.open_view(crate::tabs::Kind::Settings);
+        v.reconcile(None);
+        cx.notify();
+    });
+    frame(cx, window);
+    assert_eq!(
+        view.read_with(cx, |v, _| v.numbers_session()),
+        (label, vec![left]),
+        "Settings here: the session's title, the pane that shows it"
+    );
 }
 
 /// Finish gate #44 F4: the pane map's unlit cells read on the rail's

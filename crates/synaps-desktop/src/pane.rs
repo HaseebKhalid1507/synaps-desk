@@ -1134,6 +1134,20 @@ impl crate::app::AppView {
         if !self.split_on() {
             return run(self, Place::Current);
         }
+        // A tab of this pane: shown here (Shady #44 L9: the split came
+        // first, a copy of the tab on screen beside it).
+        let own = match action {
+            crate::named::RowAction::Attach(s) => {
+                self.model.tabs.iter().position(|t| t.session.as_deref() == Some(s.as_str()) && t.kind == crate::tabs::Kind::Session)
+            }
+            _ => None,
+        };
+        if let Some(ix) = own {
+            self.focus_tab(ix);
+            self.focus_composer(cx);
+            cx.notify();
+            return;
+        }
         // On screen, or a tab of another pane: that pane focused (a click
         // never makes a copy), before any split (Shady #44 M1: the split
         // came first and stayed, an empty copy of this pane's session).
@@ -1221,9 +1235,16 @@ impl crate::app::AppView {
         let mut carried = Vec::new();
         for &id in &others {
             let tabs = self.in_pane(id, |v| {
-                let drafts: Vec<_> = v.model.tabs.iter().filter_map(|t| Some((t.id, t.session.clone()?))).collect();
+                // Each under the key it is kept under: a worker tab's is
+                // `session#sa_N` (Shady #44 L10).
+                let drafts: Vec<_> = v.model.tabs.iter().filter_map(|t| Some((t.id, t.draft_key()?.to_string()))).collect();
                 let drafts: Vec<_> = drafts.into_iter().filter_map(|(tab, s)| v.take_draft(tab, &s, cx)).collect();
-                (v.model.tabs.take_all(), drafts)
+                // A tab still being created stays with its pane: its create
+                // is its store's, and goes (detached) as the pane closes;
+                // carried, it was a tab nothing would ever fill (Shady #44
+                // L12).
+                let tabs = v.model.tabs.take_all().into_iter().filter(|t| !t.pending()).collect::<Vec<_>>();
+                (tabs, drafts)
             });
             carried.extend(tabs);
         }
@@ -1466,6 +1487,15 @@ impl crate::app::AppView {
         let mut out: Vec<PaneId> = shows(&self.panes.cur, &self.model.tabs).then_some(self.panes.cur.id).into_iter().collect();
         out.extend(self.panes.rest.iter().filter(|p| shows(p, &p.parked.tabs)).map(|p| p.id));
         out
+    }
+
+    /// The right panel's header (split.md §6): the title of the session
+    /// behind its numbers (the focused pane's store, on a worker or
+    /// Settings tab too) and the panes that show it (Shady #44 L6).
+    pub(crate) fn numbers_session(&self) -> (String, Vec<PaneId>) {
+        let Some(s) = self.model.lives[self.panes.cur.live].transcript.session_id() else { return (String::new(), Vec::new()) };
+        let title = self.model.sessions.iter().find(|r| r.id == s).map_or_else(|| s.to_string(), |r| r.label());
+        (title, self.panes_showing(s))
     }
 
     /// The pane showing session `s` on its visible tab, if any.
