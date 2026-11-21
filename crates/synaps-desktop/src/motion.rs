@@ -1578,6 +1578,11 @@ impl Motion {
         self.sites.borrow().clone()
     }
 
+    /// The beat layer's sites, as text (the bench: what beats).
+    pub(crate) fn sites_text(&self) -> Vec<String> {
+        self.sites.borrow().iter().map(|s| format!("{:?}@({:.0},{:.0})", s.beat, f32::from(s.origin.x), f32::from(s.origin.y))).collect()
+    }
+
     /// Glyphs the beat layer paints (the bench).
     pub(crate) fn site_count(&self) -> usize {
         self.sites.borrow().len()

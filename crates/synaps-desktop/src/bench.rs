@@ -1253,7 +1253,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out[format!("idle_{}s", idle.unwrap_or(10))] = stats(cx, t0, Instant::now(), c0, f0);
                 // A tool runs: its glyph scans on the beat (8 Hz), the foot's too.
                 let _ = upd(cx, &|v, _| {
-                    v.model.local_session(v.panes.cur.live, "bench-motion");
+                    v.bench_session("bench-motion");
                     v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(40, 3)));
                     v.sync_list();
                     v.panes.cur.list.set_follow_mode(FollowMode::Tail);
@@ -1327,7 +1327,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // three breaths, and a demoted worker (a re-attach's
                 // "started", drawn still until a live source says again).
                 let _ = upd(cx, &|v, cx| {
-                    v.model.local_session(v.panes.cur.live, "bench");
+                    v.bench_session("bench");
                     let res = json!({"handle_id": "sa_1", "agent_name": "scout", "status": "running"}).to_string();
                     let worker = [
                         json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start", "tool_id": "w1",
@@ -1351,6 +1351,10 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out["idle_30s_prompt"] = stats(cx, t0, Instant::now(), c0, f0);
                 out["idle_30s_prompt"]["demoted_worker"] =
                     json!(view.update(cx, |v, _| v.model.lives[v.panes.cur.live].stats.subagents.demoted(1)).unwrap_or(false));
+                out["idle_30s_prompt"]["sites"] = json!(view.update(cx, |v, _| v.fx.sites_text()).unwrap_or_default());
+                out["idle_30s_prompt"]["pane_rects"] = json!(view
+                    .update(cx, |v, _| v.panes.iter().map(|p| format!("{:?}", p.rect.get())).collect::<Vec<_>>())
+                    .unwrap_or_default());
                 out["idle_30s_prompt"]["prompt_pending"] =
                     json!(view.update(cx, |v, _| !v.model.lives[v.panes.cur.live].transcript.pending_prompts().is_empty()).unwrap_or(false));
                 // The link down with the prompt and the demoted worker still up:

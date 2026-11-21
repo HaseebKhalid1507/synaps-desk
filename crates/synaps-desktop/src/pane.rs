@@ -841,6 +841,23 @@ impl crate::app::AppView {
     }
 }
 
+impl crate::app::AppView {
+    /// The bench's scene moves to the synthetic session `name`
+    /// ([`crate::model::Model::local_session`]), with every pane on its
+    /// store (`SYNAPS_BENCH_PANES`): their tabs follow, as an attach's do.
+    pub(crate) fn bench_session(&mut self, name: &str) {
+        let live = self.panes.cur.live;
+        self.model.local_session(live, name);
+        let others: Vec<PaneId> = self.panes.rest.iter().filter(|p| p.live == live).map(|p| p.id).collect();
+        for id in others {
+            self.in_pane(id, |v| {
+                v.model.tabs.attached(name);
+                v.reconcile(None);
+            });
+        }
+    }
+}
+
 /// The splits that make `n` panes (split.md §4): 2 side by side, 3
 /// across, 4 as 2×2. Each: the pane to focus first (reading order), and
 /// the side (`None`: right, or down if narrow).
