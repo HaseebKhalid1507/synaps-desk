@@ -1397,3 +1397,147 @@ fn the_pane_focus_keys_need_two_panes() {
     assert!(has(true, false, "Panes") && !has(true, false, "PaneFocus"), "one pane: the split keys only");
     assert!(has(true, true, "Panes") && has(true, true, "PaneFocus"), "two panes: both");
 }
+
+// ── Round 3: the design gate (cohesion/finish-gate-pr36.md) ─────────────
+
+/// A selector's bounds as drawn: left, top, width, height.
+fn drawn(cx: &mut TestAppContext, window: AnyWindowHandle, sel: String) -> Option<[f32; 4]> {
+    let b = VisualTestContext::from_window(window, cx).debug_bounds(sel.leak())?;
+    Some([f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.size.width), f32::from(b.size.height)])
+}
+
+/// The finish gate's M1 and M3, at 1280×800: two panes across, the right
+/// one split down (the left full height, full form; the two on the right
+/// under the short height). Focus moves by Alt+N and F6 to each pane in
+/// turn, and the split itself: the top bar stays 52 px, every pane keeps
+/// its place and size, and the panes reach the window's foot (M1: a short
+/// pane focused made the bar 40 px and moved the whole window 12 px). The
+/// left and bottom-right composers, side by side on the foot, end on one
+/// line (M3: each pane's own form put them 10 px apart).
+#[gpui_kit::test]
+fn focus_never_moves_the_window_and_the_foot_composers_share_a_line(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-gate-m1", None);
+    let bar = |cx: &mut TestAppContext| drawn(cx, window, "top-bar".into()).expect("the top bar")[3];
+    assert_eq!(bar(cx), crate::chrome::TOP, "one pane: the full bar");
+    key(cx, window, "ctrl-\\");
+    key(cx, window, "ctrl-shift-\\");
+    frame(cx, window);
+    let ids: Vec<crate::pane::PaneId> = view.read_with(cx, |v, _| v.panes.ids());
+    assert_eq!(ids.len(), 3, "three panes");
+    let short = view.read_with(cx, |v, _| v.panes.cur.layout.short);
+    assert!(short, "the focused pane (bottom right) is under the short height");
+    let place = |cx: &mut TestAppContext| -> Vec<[f32; 4]> {
+        ids.iter().map(|id| drawn(cx, window, format!("pane {}", id.index())).expect("the pane drawn")).collect()
+    };
+    let at_rest = place(cx);
+    assert_eq!(bar(cx), crate::chrome::TOP, "the split: the bar stays 52 px");
+    for (i, p) in at_rest.iter().enumerate() {
+        assert!(p[1] >= crate::chrome::TOP - 0.5, "pane {i} under the bar: {p:?}");
+    }
+    let foot = at_rest.iter().map(|p| p[1] + p[3]).fold(0f32, f32::max);
+    assert!((foot - 800.).abs() < 0.5, "the panes reach the window's foot: {at_rest:?}");
+    for k in ["alt-1", "alt-2", "alt-3", "f6", "f6", "shift-f6"] {
+        key(cx, window, k);
+        frame(cx, window);
+        assert_eq!(bar(cx), crate::chrome::TOP, "{k}: the bar stays 52 px");
+        assert_eq!(place(cx), at_rest, "{k}: no pane moves");
+    }
+    // M3: the left pane and the bottom-right one, both on the foot.
+    let (left, bottom_right) = {
+        let on_foot: Vec<usize> = (0..3).filter(|&i| (at_rest[i][1] + at_rest[i][3] - 800.).abs() < 0.5).collect();
+        assert_eq!(on_foot.len(), 2, "two panes on the foot: {at_rest:?}");
+        let (a, b) = (on_foot[0], on_foot[1]);
+        if at_rest[a][0] < at_rest[b][0] { (ids[a], ids[b]) } else { (ids[b], ids[a]) }
+    };
+    let forms = view.read_with(cx, |v, _| [left, bottom_right].map(|id| v.panes.get(id).expect("the pane").layout.short));
+    assert_eq!(forms, [false, true], "the left pane full, the bottom-right short");
+    let ends = [left, bottom_right]
+        .map(|id| drawn(cx, window, format!("composer-frame {}", id.index())).map(|b| b[1] + b[3]).expect("its composer"));
+    assert!((ends[0] - ends[1]).abs() < 0.5, "the foot's composers end on one line: {ends:?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// The finish gate's M2: the divider between panes side by side is the
+/// 1 px `hair` down their whole height (it drew nothing, and the seam was
+/// the chrome showing through); the one between stacked panes across
+/// their width.
+#[gpui_kit::test]
+fn the_dividers_are_drawn_across_their_panes(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-gate-m2", None);
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    let row = drawn(cx, window, "pane-divider Row".into()).expect("the vertical divider");
+    let pane = drawn(cx, window, "pane 0".into()).expect("the first pane");
+    assert_eq!((row[2], row[3]), (crate::split::DIVIDER, pane[3]), "1 px wide, the panes' height: {row:?} / {pane:?}");
+    assert_eq!((row[0], row[1]), (pane[0] + pane[2], pane[1]), "between the panes, from their top: {row:?} / {pane:?}");
+    key(cx, window, "ctrl-shift-\\");
+    frame(cx, window);
+    let column = drawn(cx, window, "pane-divider Column".into()).expect("the horizontal divider");
+    let right = view.read_with(cx, |v, _| v.panes.cur.id);
+    let low = drawn(cx, window, format!("pane {}", right.index())).expect("the new pane");
+    assert_eq!((column[2], column[3]), (low[2], crate::split::DIVIDER), "across the stacked panes: {column:?} / {low:?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// The finish gate's M4: an unfocused pane's active tab title is
+/// `prose_ch` in every state (running, unread, NEEDS YOU, workers ...),
+/// as an idle one's; the focused pane's is `ink`. So the same session in
+/// two panes, NEEDS YOU, has two different strips. A tab not shown keeps
+/// its state's colour either way.
+#[gpui_kit::test]
+fn an_unfocused_panes_tab_title_dims_in_every_state(cx: &mut TestAppContext) {
+    use crate::rail::State;
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        let (theme, raw, _, _) = crate::theme::resolve_theme(None, None, None, None, None);
+        crate::theme::apply(crate::theme::Choice { theme, raw, accent: None, text: 16 }, cx);
+        let p = crate::theme::palette(cx);
+        let states = [
+            State::Opening,
+            State::NeedsYou,
+            State::Running,
+            State::Workers,
+            State::Locked,
+            State::Unread,
+            State::Idle,
+            State::Parked,
+            State::Saved,
+        ];
+        for st in states {
+            for plain in [false, true] {
+                let shown = |unfocused| crate::tabstrip::tab_title(st, plain, unfocused, 1., &p);
+                assert_eq!(shown(false), p.ink, "{st:?} (plain {plain}): the focused pane's title is ink");
+                assert_eq!(shown(true), p.prose_ch, "{st:?} (plain {plain}): the unfocused pane's title is prose_ch");
+                let hidden = |unfocused| crate::tabstrip::tab_title(st, plain, unfocused, 0., &p);
+                assert_eq!(hidden(true), hidden(false), "{st:?} (plain {plain}): a tab not shown is the same in either pane");
+            }
+        }
+    });
+}
+
+/// The finish gate's S1: a note (a refusal) in the foot is read whole:
+/// model · effort, the word and the name drop before it does. In a 271 px
+/// row (a 335 px pane's), "no room to split this pane" fits.
+#[test]
+fn a_note_in_the_foot_keeps_its_hint_whole() {
+    let cell = 7.8f32;
+    let hint = ("no room to split this pane".chars().count() as f32 * cell).ceil();
+    let i = crate::app::FootIn {
+        room: 271.,
+        lead: 20.,
+        word: 48.,
+        name: 0.,
+        model: 72.,
+        effort: 40.,
+        hint,
+        halt: 0.,
+        primary: 60.,
+        tight: true,
+    };
+    let plain = crate::app::fit_foot(&i);
+    assert!(!plain.hint, "as a hint it goes first: {plain:?}");
+    let note = crate::app::fit_foot_with(&i, true);
+    assert!(note.hint && !note.model && !note.effort, "as a note it stays, model · effort gone: {note:?}");
+}

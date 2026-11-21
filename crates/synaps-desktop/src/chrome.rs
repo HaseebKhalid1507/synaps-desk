@@ -852,7 +852,8 @@ impl AppView {
             }))
         });
         h_flex()
-            .h(px(top_h(self.panes.cur.layout.short)))
+            .debug_selector(|| "top-bar".into())
+            .h(px(top_h(self.top_short)))
             .flex_none()
             .pl(px(22.))
             .pr(px(24.))
@@ -1116,7 +1117,7 @@ impl AppView {
                 .debug_selector(move || id.into())
                 .group(group)
                 .absolute()
-                .top(px(top_h(self.panes.cur.layout.short)))
+                .top(px(top_h(self.top_short)))
                 .bottom_0()
                 .left(px(left))
                 .w(px(EDGE))
@@ -2504,7 +2505,7 @@ impl AppView {
             );
         }
         let lifted = accent.is_some_and(|a| a != scheme.roles.you_bar || a != scheme.roles.focus);
-        let (top, bottom) = (top_h(self.panes.cur.layout.short), 140.);
+        let (top, bottom) = (top_h(self.top_short), 140.);
         // Over the open right panel, at least two columns of names wide,
         // when that stays clear of the tab strip's `+` (it ends at the
         // column's right edge); else above the composer, under the tab

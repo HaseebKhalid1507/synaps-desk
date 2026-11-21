@@ -1329,7 +1329,45 @@ const FOOT_HINT_MIN: f32 = 60.;
 /// pane), the name and handle. The glyph, MAIN, HALT and the primary never
 /// drop. The effort is said after the model (`model · effort`): it goes
 /// with it.
+#[cfg(test)]
 pub(crate) fn fit_foot(i: &FootIn) -> Foot {
+    fit_foot_with(i, false)
+}
+
+/// [`fit_foot`]; a hint that is a note (`note`: a refusal, a command's
+/// reply) is read whole: model · effort, the word and the name drop
+/// before it, and it ellipsizes only once they are gone (finish gate #36
+/// S1: "no room to sp…" in the narrow pane it was about).
+pub(crate) fn fit_foot_with(i: &FootIn, note: bool) -> Foot {
+    if note && i.hint > 0. {
+        let mut f = Foot { hint: true, effort: i.effort > 0., model: i.model > 0., word: i.word > 0. && !i.tight, name: i.name > 0. };
+        let width = |f: &Foot| {
+            let mut w = i.lead + FOOT_BUTTON + i.primary + FOOT_PART + i.hint;
+            if i.halt > 0. {
+                w += i.halt + FOOT_BUTTON;
+            }
+            if f.name {
+                w += i.name;
+            }
+            if f.word {
+                w += i.word + if f.name { 12. } else { 0. };
+            }
+            if f.model {
+                w += FOOT_PART + i.model + if f.effort { i.effort } else { 0. };
+            }
+            w
+        };
+        type Drop = fn(&mut Foot);
+        let order: [Drop; 4] = [|f| f.effort = false, |f| f.model = false, |f| f.word = false, |f| f.name = false];
+        for drop in order {
+            if width(&f) <= i.room {
+                break;
+            }
+            drop(&mut f);
+        }
+        f.effort &= f.model;
+        return f;
+    }
     let mut f = Foot { hint: i.hint > 0., effort: i.effort > 0., model: i.model > 0., word: i.word > 0. && !i.tight, name: i.name > 0. };
     let width = |f: &Foot| {
         let mut w = i.lead + FOOT_BUTTON + i.primary;
@@ -1806,6 +1844,10 @@ pub struct AppView {
     pub(crate) app_settings: crate::settings_view::AppSettings,
     /// The centre's size as last laid out: what a split has to fit in.
     pub(crate) centre: Cell<(f32, f32)>,
+    /// The top bar's form, the window's (its height under the full bar):
+    /// never a pane's, so focus never moves the window (finish gate #36
+    /// M1). With one pane it is that pane's `Layout::short`.
+    pub(crate) top_short: bool,
     /// A refused split's note running out ([`AppView::split_pane`]).
     pub(crate) split_note: Option<Task<()>>,
     /// `SYNAPS_DESK_PANES` ([`crate::pane::pane_script`]), until it runs.
@@ -2403,6 +2445,7 @@ impl AppView {
             dash: Default::default(),
             app_settings: Default::default(),
             centre: Cell::new((0., 0.)),
+            top_short: false,
             split_note: None,
             pane_script: std::env::var("SYNAPS_DESK_PANES").ok(),
             keys_to: None,
@@ -6733,6 +6776,20 @@ impl AppView {
     fn render_composer(&self, p: &Palette, m: &Metrics, to_card: bool, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let lay = self.panes.cur.layout;
         let dims = crate::fit::Composer::of(m, lay.form());
+        // Split, the panes along the window's foot end their composers on
+        // one line: the bottom inset is the window's form's (finish gate
+        // #36 M3); its top, rows and card well stay the pane's own.
+        let foot = {
+            let (r, (_, h)) = (self.panes.cur.rect.get(), self.centre.get());
+            self.panes.split() && (r.y + r.h - h).abs() < 0.5
+        };
+        let bottom = if foot {
+            let form = if self.top_short { crate::fit::Form::Short } else { crate::fit::Form::Full };
+            crate::fit::Composer::of(m, form).bottom
+        } else {
+            dims.bottom
+        };
+        let pane_ix = self.panes.cur.id.index();
         let busy = self.model.lives[self.panes.cur.live].transcript.busy();
         // Over a worker's view the composer steers it, or takes nothing
         // once it has finished.
@@ -6836,18 +6893,22 @@ impl AppView {
         let word_w = word.map_or(0., |w| display_w(w, m.meta) + tally.map_or(0., |n| 8. + mono_w(&count(n))));
         let name_w = worker.map_or(0., |w| (mono_w(&w.name).min(24. * cell)) + 8. + mono_w(&w.handle_id));
         let lead_w = if worker.is_some() { main_w + 8. + cell + 8. + m.lead } else { m.lead };
-        let fit = fit_foot(&FootIn {
-            room: lay.column - 2. * m.pad_x,
-            lead: lead_w,
-            word: word_w,
-            name: name_w,
-            model: if lay.tight { 0. } else { model.as_deref().map_or(0., mono_w) },
-            effort: if lay.tight { 0. } else { effort.as_deref().map_or(0., |e| 8. + cell + 8. + mono_w(e)) },
-            hint: hint.as_ref().map_or(0., |(h, _)| mono_w(h)),
-            halt: halt_w,
-            primary: primary_w,
-            tight: lay.tight,
-        });
+        let note = self.composer_note().is_some();
+        let fit = fit_foot_with(
+            &FootIn {
+                room: lay.column - 2. * m.pad_x,
+                lead: lead_w,
+                word: word_w,
+                name: name_w,
+                model: if lay.tight { 0. } else { model.as_deref().map_or(0., mono_w) },
+                effort: if lay.tight { 0. } else { effort.as_deref().map_or(0., |e| 8. + cell + 8. + mono_w(e)) },
+                hint: hint.as_ref().map_or(0., |(h, _)| mono_w(h)),
+                halt: halt_w,
+                primary: primary_w,
+                tight: lay.tight,
+            },
+            note,
+        );
         let send = fbtn("send", primary, can_send, Fill::Btn, p, m)
             .when(worker.is_none(), |d| {
                 d.tooltip(move |window, cx| {
@@ -7085,6 +7146,7 @@ impl AppView {
         column(
             lay,
             v_flex()
+                .debug_selector(move || format!("composer-frame {pane_ix}"))
                 // The frame sits inside the inset (design.md §1.1).
                 .px(px(m.pad_x - 1.))
                 .pt(px(dims.pad_top))
@@ -7135,7 +7197,7 @@ impl AppView {
         )
         .flex_none()
         .pt(px(dims.top))
-        .pb(px(dims.bottom))
+        .pb(px(bottom))
     }
 }
 
@@ -7386,7 +7448,11 @@ impl AppView {
         // flips the form. Under Settings or Usage too: the session's list
         // is back where it was when its tab is.
         if lay.form() != self.panes.cur.layout.form() {
-            let shift = above_list(lay, ex.naming) - above_list(self.panes.cur.layout, self.panes.cur.layout_naming);
+            // Split, the top bar is the window's (M1): a pane's own form
+            // moves its naming row only.
+            let split = self.panes.split();
+            let above = |l: Layout, naming: bool| above_list(l, naming) - if split { crate::chrome::top_h(l.short) } else { 0. };
+            let shift = above(lay, ex.naming) - above(self.panes.cur.layout, self.panes.cur.layout_naming);
             self.keep_rows(shift, (lay.form() as u8) > (self.panes.cur.layout.form() as u8));
         }
         self.panes.cur.layout = lay;
@@ -7768,23 +7834,41 @@ impl AppView {
                     .into_any_element()
             }
             Node::Split { axis, kids, .. } => {
+                // Its box: its panes' (finish gate #36 M2: a row with no
+                // height left its divider none, and the seam showed the
+                // chrome). Every divider is the 1 px `hair` across it.
+                let (w, h) = span(node, rects);
+                let ax = *axis;
                 let mut els = Vec::new();
                 for (i, k) in kids.iter().enumerate() {
                     if i > 0 {
-                        els.push(match axis {
-                            Axis::Row => div().flex_none().w(px(DIVIDER)).h_full().bg(p.hair).into_any_element(),
-                            Axis::Column => div().flex_none().h(px(DIVIDER)).w_full().bg(p.hair).into_any_element(),
-                        });
+                        els.push(
+                            match axis {
+                                Axis::Row => div().flex_none().w(px(DIVIDER)).h(px(h)).bg(p.hair),
+                                Axis::Column => div().flex_none().h(px(DIVIDER)).w(px(w)).bg(p.hair),
+                            }
+                            .debug_selector(move || format!("pane-divider {ax:?}"))
+                            .into_any_element(),
+                        );
                     }
                     els.push(self.lay_panes(k, rects, mains, p, cx));
                 }
                 match axis {
-                    Axis::Row => h_flex().flex_none().children(els).into_any_element(),
-                    Axis::Column => v_flex().flex_none().children(els).into_any_element(),
+                    Axis::Row => h_flex().flex_none().items_start().w(px(w)).h(px(h)).children(els).into_any_element(),
+                    Axis::Column => v_flex().flex_none().w(px(w)).h(px(h)).children(els).into_any_element(),
                 }
             }
         }
     }
+}
+
+/// A split's box: the rectangle round its panes' (`rects`).
+fn span(node: &crate::split::Node, rects: &[(PaneId, crate::split::Rect)]) -> (f32, f32) {
+    let ids = node.leaves();
+    let mine = rects.iter().filter(|(i, _)| ids.contains(i)).map(|(_, r)| *r);
+    let (x0, y0, x1, y1) =
+        mine.fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |(a, b, c, d), r| (a.min(r.x), b.min(r.y), c.max(r.x + r.w), d.max(r.y + r.h)));
+    ((x1 - x0).max(0.), (y1 - y0).max(0.))
 }
 
 impl Render for AppView {
@@ -7895,6 +7979,7 @@ impl Render for AppView {
         }
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
+        self.top_short = self.height - crate::chrome::TOP < crate::fit::short_below(&m);
         self.fx.set_ink(p.ink);
         // Settings or Usage came on screen (or one closed): after this
         // frame, never inside it, what it shows is asked for if stale.
@@ -8001,7 +8086,8 @@ impl Render for AppView {
         // The centre, split (split.md §4): each pane in its rectangle, a
         // 1 px rule between; with one pane, all of it, as before.
         let centre = if view.is_some() && !self.panes.split() { view_pane } else { pane };
-        let centre_h = self.height - crate::chrome::TOP;
+        // Under the bar drawn (M1: the panes reach the window's foot).
+        let centre_h = self.height - crate::chrome::top_h(self.top_short);
         self.centre.set((centre, centre_h));
         let main = if self.panes.split() {
             let rects = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });

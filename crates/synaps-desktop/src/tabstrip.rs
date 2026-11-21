@@ -536,19 +536,6 @@ impl AppView {
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
         let view = !kind.attaches();
-        let title_of = |on: bool| match st {
-            _ if view || kind == Kind::Worker => {
-                if on {
-                    p.ink
-                } else {
-                    p.prose_ch
-                }
-            }
-            State::NeedsYou | State::Running | State::Workers | State::Unread => p.ink,
-            _ if on => p.ink,
-            State::Parked | State::Locked | State::Saved => p.dim_ch,
-            _ => p.prose_ch,
-        };
         let fx = &self.fx;
         // The label eases to `ink` over `quick` as its tab is shown, and
         // back over `hover_out` (fluid.md §3.5).
@@ -561,7 +548,7 @@ impl AppView {
         // Split panes (split.md §6): an unfocused pane's active tab keeps
         // its raised ground; its title is the tab default and it has no bar.
         let unfocused = self.panes.split() && self.panes.cur.id != self.panes.focused;
-        let title_color = crate::motion::mix(title_of(false), title_of(!unfocused), k);
+        let title_color = tab_title(st, view || kind == Kind::Worker, unfocused, k, p);
         // NEEDS YOU first: a worker tab's session's prompt too. Its bar
         // draws left to right over `base` (motion.md §6.3).
         let needs = st == State::NeedsYou;
@@ -731,6 +718,29 @@ impl AppView {
 
 fn new_tip() -> &'static str {
     if cfg!(target_os = "macos") { "New session in a new tab (Cmd+T)" } else { "New session in a new tab (Ctrl+T)" }
+}
+
+/// A tab's title colour: shown by `k` (0 not shown, 1 shown, between as
+/// it eases). A view's or a worker's tab is `ink` shown, else `prose_ch`;
+/// a session's says its state when not shown (`ink` while it runs, needs
+/// you or is unread). Shown in an unfocused pane (split panes, `unfocused`)
+/// it is `prose_ch` whatever its state (finish gate #36 M4: the glyph and
+/// the NEEDS YOU bar say the state, the title says which pane has focus).
+pub(crate) fn tab_title(st: State, plain: bool, unfocused: bool, k: f32, p: &Palette) -> Hsla {
+    let title_of = |on: bool| match st {
+        _ if plain => {
+            if on {
+                p.ink
+            } else {
+                p.prose_ch
+            }
+        }
+        State::NeedsYou | State::Running | State::Workers | State::Unread => p.ink,
+        _ if on => p.ink,
+        State::Parked | State::Locked | State::Saved => p.dim_ch,
+        _ => p.prose_ch,
+    };
+    crate::motion::mix(title_of(false), if unfocused { p.prose_ch } else { title_of(true) }, k)
 }
 
 #[cfg(test)]
