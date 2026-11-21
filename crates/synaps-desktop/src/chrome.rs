@@ -851,7 +851,7 @@ impl AppView {
                 mono(t, size::META, p.dim_ch).flex_none()
             }))
         });
-        h_flex()
+        self.probe(h_flex(), "top-bar")
             .debug_selector(|| "top-bar".into())
             .h(px(top_h(self.top_short)))
             .flex_none()

@@ -1678,6 +1678,10 @@ impl FavsJob {
 /// Each worker chip's bounds (its worker's id) as last laid out.
 pub(crate) type ChipBounds = Vec<(u64, Bounds<Pixels>)>;
 
+/// Tests: a box [`AppView::probe`] laid out, under its name.
+#[cfg(test)]
+pub(crate) type Probed = (&'static str, [f32; 4]);
+
 pub struct AppView {
     pub client: Option<Client>,
     /// Connection, sessions, attachment and transcript. Events are applied
@@ -1734,6 +1738,9 @@ pub struct AppView {
     /// counts do (the word swap's UI test: no count left rolling has one).
     #[cfg(test)]
     pub(crate) roll_probe: Option<usize>,
+    /// Tests: the boxes [`AppView::probe`] laid out, frame by frame.
+    #[cfg(test)]
+    pub(crate) chrome_log: std::rc::Rc<RefCell<Vec<Probed>>>,
     /// The side panels folded to strips and the open HISTORY buckets
     /// (saved with the accent).
     pub panels: theme::Panels,
@@ -2393,6 +2400,8 @@ impl AppView {
             owner_here: false,
             #[cfg(test)]
             roll_probe: None,
+            #[cfg(test)]
+            chrome_log: Default::default(),
             panels: theme::Panels::default(),
             panels_dirty: Default::default(),
             panels_writing: Default::default(),
@@ -4838,6 +4847,26 @@ impl AppView {
 
     /// What the composer says of its text instead of its hint: a worker
     /// key's or a refused steer's note, else the draft's.
+    /// `el` as it is; under test, its laid-out box goes to
+    /// [`Self::chrome_log`] as `name` each frame (finish gate #36 R1: what
+    /// a launch's first frame, or a resize's, drew).
+    pub(crate) fn probe<E: ParentElement>(&self, el: E, name: &'static str) -> E {
+        #[cfg(test)]
+        {
+            let log = self.chrome_log.clone();
+            let at = move |b: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                let [x, y, w, h] = [b.origin.x, b.origin.y, b.size.width, b.size.height].map(f32::from);
+                log.borrow_mut().push((name, [x, y, w, h]));
+            };
+            el.child(canvas(at, |_, _, _, _| {}).absolute().inset_0())
+        }
+        #[cfg(not(test))]
+        {
+            let _ = name;
+            el
+        }
+    }
+
     fn composer_note(&self) -> Option<SharedString> {
         self.panes.cur.watch_note.clone().or_else(|| self.panes.cur.draft_note.map(SharedString::from))
     }
@@ -7820,7 +7849,7 @@ impl AppView {
                 let r = rects.iter().find(|(i, _)| i == id).map_or(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }, |(_, r)| *r);
                 let el = mains.iter().position(|(i, _)| i == id).map(|i| mains.remove(i).1);
                 let id = *id;
-                h_flex()
+                self.probe(h_flex(), "pane")
                     .flex_none()
                     .w(px(r.w))
                     .h(px(r.h))
@@ -7979,7 +8008,6 @@ impl Render for AppView {
         }
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
-        self.top_short = self.height - crate::chrome::TOP < crate::fit::short_below(&m);
         self.fx.set_ink(p.ink);
         // Settings or Usage came on screen (or one closed): after this
         // frame, never inside it, what it shows is asked for if stale.
@@ -8035,6 +8063,11 @@ impl Render for AppView {
         }
         self.width = width;
         self.height = height;
+        // The bar's form from this frame's height, never the last frame's
+        // (finish gate #36 R1: a launch drew its first frame at height 0,
+        // the short bar, then jumped 12 px; a resize across the threshold
+        // drew the old bar).
+        self.top_short = self.height - crate::chrome::TOP < crate::fit::short_below(&m);
         let (rail, right) = sides(self.width, self.panels, crate::chrome::MARK);
         if let Side::Open(w) = rail {
             self.rail_width = w;
@@ -8400,9 +8433,7 @@ impl Render for AppView {
             .text_px(13.)
             .child(
                 v_flex().flex_1().h_full().min_w_0().child(self.render_top(&p, rail, cx)).child(
-                    h_flex()
-                        .flex_1()
-                        .min_h_0()
+                    self.probe(h_flex().flex_1().min_h_0(), "body")
                         .child(self.render_side(true, rail, &p, cx))
                         .child(main)
                         .when(view.is_none() || self.panes.split(), |d| d.child(self.render_side(false, right, &p, cx))),

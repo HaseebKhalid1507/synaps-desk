@@ -1458,6 +1458,88 @@ fn focus_never_moves_the_window_and_the_foot_composers_share_a_line(cx: &mut Tes
     let _ = client.shutdown();
 }
 
+/// What [`AppView::probe`] logged since the last read, as `name`: one box
+/// a frame, in order.
+fn probed(cx: &mut TestAppContext, view: &Entity<AppView>) -> impl Fn(&str) -> Vec<[f32; 4]> + use<> {
+    let log = view.read_with(cx, |v, _| v.chrome_log.take());
+    move |name| log.iter().filter(|(n, _)| *n == name).map(|(_, b)| *b).collect()
+}
+
+/// The bar's 1 px rule along its foot: [`AppView::probe`] reads the box
+/// inside it.
+const BAR_RULE: f32 = 1.;
+
+/// Whether the bar is the short one at a window `h` tall (text 16).
+fn short_at(h: f32) -> bool {
+    h - crate::chrome::TOP < crate::fit::short_below(&crate::theme::Metrics::at(16))
+}
+
+/// The finish gate's R1, one pane (the flag off, main's path): a launch's
+/// first frame draws the bar for its window, 52 px at 1080 (it read the
+/// height 0 the view starts with: the short 40 px bar, and the next frame
+/// moved everything under it 12 px). Nothing in the chrome moves after.
+#[gpui_kit::test]
+fn a_launch_draws_the_windows_bar_on_its_first_frame(cx: &mut TestAppContext) {
+    assert!(!short_at(1080.));
+    let (window, view) = open_sized(cx, 1920., 1080.);
+    frame(cx, window);
+    let of = probed(cx, &view);
+    let (bar, body) = (of("top-bar"), of("body"));
+    assert!(!bar.is_empty() && bar.len() == body.len(), "frames drawn: {bar:?} / {body:?}");
+    assert_eq!(bar[0], [0., 0., 1920., crate::chrome::TOP - BAR_RULE], "the first frame: the full bar at 1080: {bar:?}");
+    assert_eq!(body[0][1..], [crate::chrome::TOP, body[0][2], 1080. - crate::chrome::TOP], "the first frame: the rest under it: {body:?}");
+    assert!(bar.iter().all(|b| *b == bar[0]), "the bar never moves: {bar:?}");
+    assert!(body.iter().all(|b| *b == body[0]), "nothing under it moves: {body:?}");
+}
+
+/// The finish gate's R1, one pane: a resize across the bar's threshold
+/// (700 px at text 16) draws the new bar on its own frame (it drew the
+/// old one, from the last frame's height, until something else drew),
+/// down and back up; the frames after it are the same.
+#[gpui_kit::test]
+fn a_resize_across_the_threshold_draws_the_new_bar_on_its_frame(cx: &mut TestAppContext) {
+    let (window, view) = open_sized(cx, 1280., 800.);
+    frame(cx, window);
+    let _ = probed(cx, &view);
+    for h in [600., 800., 640., 1080.] {
+        let bar_h = if short_at(h) { crate::chrome::top_h(true) } else { crate::chrome::TOP };
+        VisualTestContext::from_window(window, cx).simulate_resize(size(px(1280.), px(h)));
+        let of = probed(cx, &view);
+        let (bar, body) = (of("top-bar"), of("body"));
+        assert!(!bar.is_empty(), "{h}: the resize drew a frame");
+        assert_eq!(bar[0][3], bar_h - BAR_RULE, "{h}: the resize's own frame draws its bar: {bar:?}");
+        assert_eq!([body[0][1], body[0][1] + body[0][3]], [bar_h, h], "{h}: the rest under it, to the foot: {body:?}");
+        frame(cx, window);
+        let of = probed(cx, &view);
+        assert!(of("top-bar").iter().all(|b| *b == bar[0]), "{h}: the bar stays: {:?}", of("top-bar"));
+        assert!(of("body").iter().all(|b| *b == body[0]), "{h}: nothing under it moves: {:?}", of("body"));
+    }
+    assert!(short_at(600.) && !short_at(800.) && short_at(640.) && !short_at(1080.), "every step crosses the threshold");
+}
+
+/// The finish gate's R1, split: two panes across, the resize's own frame
+/// draws the window's bar and lays both panes under it to the foot.
+#[gpui_kit::test]
+fn a_resize_across_the_threshold_lays_split_panes_under_the_new_bar(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-gate-r1", None);
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    let _ = probed(cx, &view);
+    for h in [600., 800.] {
+        let bar_h = if short_at(h) { crate::chrome::top_h(true) } else { crate::chrome::TOP };
+        VisualTestContext::from_window(window, cx).simulate_resize(size(px(1280.), px(h)));
+        let of = probed(cx, &view);
+        let (bar, panes) = (of("top-bar"), of("pane"));
+        assert!(!bar.is_empty() && panes.len() >= 2, "{h}: the resize drew a frame: {bar:?} / {panes:?}");
+        assert_eq!(bar[0][3], bar_h - BAR_RULE, "{h}: the resize's own frame draws its bar: {bar:?}");
+        for p in &panes[..2] {
+            assert_eq!([p[1], p[1] + p[3]], [bar_h, h], "{h}: each pane under the bar, to the foot: {panes:?}");
+        }
+    }
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
 /// The finish gate's M2: the divider between panes side by side is the
 /// 1 px `hair` down their whole height (it drew nothing, and the seam was
 /// the chrome showing through); the one between stacked panes across
