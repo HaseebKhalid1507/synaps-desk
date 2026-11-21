@@ -1225,12 +1225,35 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     }
                 });
                 sleep(1.0).await;
+                // `SYNAPS_BENCH_PANES=N` (split panes on): N panes on it
+                // (split.md §4's shapes), settled, then their memory.
+                if let Some(n) = std::env::var("SYNAPS_BENCH_PANES").ok().and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 1) {
+                    // The keys stay on the window's root, as the 1-pane scene
+                    // has them: a split gives them to the new pane's composer
+                    // (at its next frame), whose caret blinks (2 Hz, as main's
+                    // does when focused). `SYNAPS_BENCH_PANES_CARET=1`: it does.
+                    let caret = std::env::var("SYNAPS_BENCH_PANES_CARET").as_deref() == Ok("1");
+                    for step in crate::pane::shape(n) {
+                        let _ = view.update_in(cx, |v, w, cx| {
+                            if let Some(i) = step.0 {
+                                v.focus_nth(i, w, cx);
+                            }
+                            v.split_pane(step.1, w, cx);
+                            v.composer_focus &= caret;
+                            cx.notify();
+                        });
+                        sleep(0.4).await;
+                    }
+                    sleep(1.5).await;
+                    out["panes"] = json!(view.update(cx, |v, _| v.panes.len()).unwrap_or(0));
+                    out["mem_panes"] = mem::sample();
+                }
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
                 sleep(idle.unwrap_or(10) as f64).await;
                 out[format!("idle_{}s", idle.unwrap_or(10))] = stats(cx, t0, Instant::now(), c0, f0);
                 // A tool runs: its glyph scans on the beat (8 Hz), the foot's too.
                 let _ = upd(cx, &|v, _| {
-                    v.model.local_session(v.panes.cur.live, "bench-motion");
+                    v.bench_session("bench-motion");
                     v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(40, 3)));
                     v.sync_list();
                     v.panes.cur.list.set_follow_mode(FollowMode::Tail);
@@ -1304,7 +1327,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // three breaths, and a demoted worker (a re-attach's
                 // "started", drawn still until a live source says again).
                 let _ = upd(cx, &|v, cx| {
-                    v.model.local_session(v.panes.cur.live, "bench");
+                    v.bench_session("bench");
                     let res = json!({"handle_id": "sa_1", "agent_name": "scout", "status": "running"}).to_string();
                     let worker = [
                         json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start", "tool_id": "w1",
@@ -1328,6 +1351,10 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out["idle_30s_prompt"] = stats(cx, t0, Instant::now(), c0, f0);
                 out["idle_30s_prompt"]["demoted_worker"] =
                     json!(view.update(cx, |v, _| v.model.lives[v.panes.cur.live].stats.subagents.demoted(1)).unwrap_or(false));
+                out["idle_30s_prompt"]["sites"] = json!(view.update(cx, |v, _| v.fx.sites_text()).unwrap_or_default());
+                out["idle_30s_prompt"]["pane_rects"] = json!(view
+                    .update(cx, |v, _| v.panes.iter().map(|p| format!("{:?}", p.rect.get())).collect::<Vec<_>>())
+                    .unwrap_or_default());
                 out["idle_30s_prompt"]["prompt_pending"] =
                     json!(view.update(cx, |v, _| !v.model.lives[v.panes.cur.live].transcript.pending_prompts().is_empty()).unwrap_or(false));
                 // The link down with the prompt and the demoted worker still up:

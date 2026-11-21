@@ -334,7 +334,7 @@ impl AppView {
         if self.fx.on() && session.is_some() && session == self.tray.session {
             let fresh = rows.iter().filter(|r| !self.tray.rows.iter().any(|o| o.id == r.id));
             for (k, r) in fresh.enumerate() {
-                self.fx.born(TRAY | r.id, fx_now + motion::stagger(k));
+                self.fx.col(self.panes.cur.id).born(TRAY | r.id, fx_now + motion::stagger(k));
             }
             for (slot, r) in self.tray.rows.iter().enumerate() {
                 if !rows.iter().any(|n| n.id == r.id) {
@@ -553,7 +553,8 @@ impl AppView {
         let fx = &self.fx;
         // The watched chip's bar draws when its view opens here, and lights
         // after the composer's when you steer it (Handoff out).
-        let watch_at = fx.change(Tag::Watched, 0, watched.unwrap_or(0), None).filter(|_| watched.is_some()).map(|c| c.0);
+        let watch_at =
+            fx.col(self.panes.cur.id).change(Tag::Watched, 0, watched.unwrap_or(0), None).filter(|_| watched.is_some()).map(|c| c.0);
         let you_drawn = fx.draw(watch_at, std::time::Duration::ZERO, motion::QUICK);
         let steer =
             fx.flash(fx.col(self.panes.cur.id).sent().get().filter(|s| s.1 && watched.is_some()).map(|s| s.0 + 2 * motion::STAGGER));
@@ -585,16 +586,19 @@ impl AppView {
                     let bar = if is_watched {
                         glyph::bar_at(you_color, you_drawn)
                     } else {
-                        glyph::bar_at(p.sub_rule, fx.draw(fx.birth(TRAY | r.id), std::time::Duration::ZERO, motion::QUICK))
+                        glyph::bar_at(
+                            p.sub_rule,
+                            fx.draw(fx.col(self.panes.cur.id).birth(TRAY | r.id), std::time::Duration::ZERO, motion::QUICK),
+                        )
                     };
                     // A chip whose cell changed slides there from where it
                     // was drawn, x and y on `snap` from one instant (a
                     // diagonal), in px to the end; a new share of the column
                     // moves none. One that came rises 8 px and lifts from
                     // 70 %, in turn (polish.md P13).
-                    let off = fx.slide(TRAY | r.id, line as f32 * (row_h + CHIP_GAP));
+                    let off = fx.col(self.panes.cur.id).slide(TRAY | r.id, line as f32 * (row_h + CHIP_GAP));
                     let dx = fx.cell_slide(self.panes.cur.id.salt(TRAY_X | r.id), col as u64, col as f32 * (w + CHIP_GAP));
-                    let (travel, strength) = fx.arrival(fx.birth(TRAY | r.id));
+                    let (travel, strength) = fx.arrival(fx.col(self.panes.cur.id).birth(TRAY | r.id));
                     let (bounds, id) = (self.chip_bounds.clone(), r.id);
                     at.push(
                         div()
@@ -712,7 +716,12 @@ impl AppView {
                 g,
                 mark,
                 p.canvas,
-                self.fx.change(Tag::TrayGlyph, r.id, crate::turns::glyph_code(glyph::worker(glyph::steady(r.live, r.demoted)).0), None),
+                self.fx.col(self.panes.cur.id).change(
+                    Tag::TrayGlyph,
+                    r.id,
+                    crate::turns::glyph_code(glyph::worker(glyph::steady(r.live, r.demoted)).0),
+                    None,
+                ),
                 None,
                 false,
             ))

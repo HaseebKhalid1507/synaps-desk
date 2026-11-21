@@ -227,6 +227,12 @@ pub struct Tabs {
 }
 
 impl Tabs {
+    /// No tabs, numbering its tabs after `base` (split panes: a pane's
+    /// tab ids never meet another pane's, in element ids and drafts).
+    pub fn numbered_from(base: u64) -> Self {
+        Tabs { next_id: base, ..Default::default() }
+    }
+
     /// The worker tabs' draft keys changed since the last call ([`Tabs::rekeys`]).
     pub fn take_rekeys(&mut self) -> Vec<(String, String)> {
         std::mem::take(&mut self.rekeys)

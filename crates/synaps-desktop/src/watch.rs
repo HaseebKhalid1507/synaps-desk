@@ -445,6 +445,14 @@ struct Pending {
     since: u64,
 }
 
+/// What a pane shows of its session's workers ([`Watch::park`]).
+#[derive(Debug, Default)]
+pub struct ViewFocus {
+    focus: Option<String>,
+    scrolled_back: bool,
+    esc_guard: Option<Instant>,
+}
+
 /// A session's worker views and the watch bookkeeping (one per tab: it
 /// goes to the tab cache with the transcript).
 #[derive(Debug, Default)]
@@ -592,6 +600,22 @@ impl Watch {
     }
 
     /// Back to the session's thread (its list is exactly as it was left).
+    /// The view on screen, taken out (split panes, #31: a pane's own
+    /// worker focus): its handle, its scroll-back and its Esc guard. The
+    /// poll in flight stays (its reply is matched by handle); only the
+    /// view put back polls.
+    pub fn park(&mut self) -> ViewFocus {
+        ViewFocus { focus: self.focus.take(), scrolled_back: std::mem::take(&mut self.scrolled_back), esc_guard: self.esc_guard.take() }
+    }
+
+    /// A pane's view put back ([`Watch::park`]), if its worker is still
+    /// held here; else the session's thread.
+    pub fn unpark(&mut self, v: ViewFocus) {
+        self.focus = v.focus.filter(|h| self.workers.contains_key(h));
+        self.scrolled_back = v.scrolled_back && self.focus.is_some();
+        self.esc_guard = v.esc_guard;
+    }
+
     pub fn focus_main(&mut self) {
         self.focus = None;
         self.next_poll = None;

@@ -57,6 +57,7 @@ mod scrollbar;
 mod settings;
 mod settings_view;
 mod shell;
+mod split;
 #[cfg(all(test, unix))]
 mod split_tests;
 mod stats;
