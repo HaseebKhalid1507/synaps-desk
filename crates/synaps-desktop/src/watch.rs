@@ -642,7 +642,7 @@ impl Watch {
     }
 
     /// The views other panes on this store have parked ([`Watch::park`]).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn parked(&self) -> &[String] {
         &self.parked
     }
