@@ -4129,6 +4129,9 @@ fn a_drag_to_a_fifth_pane_is_refused_with_the_note(cx: &mut TestAppContext) {
         (target, Some(crate::dnd::Zone::Center), Some("4 panes is the most")),
         "the edge is the centre"
     );
+    // Its reason on the preview while it shows (finish gate #48 S1).
+    frame(cx, window);
+    assert!(drawn(cx, window, "drop-label-note".into()).is_some(), "the preview's label says why, during the drag");
     mouse_m(cx, window, to, "up", gpui_kit::Modifiers::default());
     frame(cx, window);
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "no 5th pane");

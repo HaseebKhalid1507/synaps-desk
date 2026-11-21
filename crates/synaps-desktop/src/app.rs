@@ -7766,6 +7766,10 @@ impl AppView {
         if self.panes.cur.attach_wait.is_some() && self.panes.cur.attach_due.is_none() {
             self.arm_attach(cx);
         }
+        // Rows held while the pane's split flies in (`Pane::hold_rows`):
+        // from the frame it has landed.
+        let hold = self.panes.cur.hold_rows && self.panes.flight.as_ref().is_some_and(|f| f.grow.contains(&self.panes.cur.id));
+        self.panes.cur.hold_rows = hold;
         let (pad_l, pad_r) = lay.padding();
         // Nothing over the list but the tab strip: the first row's own gap
         // (20·r) is the transcript's top edge (design.md §8.14).
@@ -7939,7 +7943,7 @@ impl AppView {
                         .min_h_0()
                         .relative()
                         .when_some(layer, |d, (x, y, k)| crate::motion::lift(d.left(px(x)).top(px(y)), k))
-                        .child(list)
+                        .children((!hold).then_some(list))
                         // Right after the list's layout, reading it as it
                         // paints: the top message's label pinned (P15).
                         .child(crate::sticky::layer(
@@ -8282,6 +8286,9 @@ impl AppView {
             self.fx.spring_jump(PANE_FLIGHT, 0., f.travel, crate::motion::SHEET_RESPONSE);
         }
         let (d, moving) = self.fx.spring_px(PANE_FLIGHT, f.travel, crate::motion::SHEET_RESPONSE);
+        if let Some(t0) = crate::pane::FILM_LOG.get() {
+            eprintln!("FLIGHT {:.4} {d:.1} of {:.1}", self.fx.now().saturating_duration_since(*t0).as_secs_f64(), f.travel);
+        }
         if !moving {
             self.panes.flight = None;
             return self.panes.tree.clone();

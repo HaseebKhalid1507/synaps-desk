@@ -249,6 +249,12 @@ pub struct Pane {
     pub(crate) worker_columns: Vec<((String, u64), Column)>,
     /// The next sync builds every row again (a worker's view came on).
     pub(crate) full_rebuild: bool,
+    /// Its rows wait for its split to land (finish gate #48 F2): a rail
+    /// row dropped on an edge opens a session no pane has drawn, and its
+    /// rows' first layout (text no frame has shaped) would cut the
+    /// opening of the `sheet` flight; it flies in with its tab strip and
+    /// composer, its rows from the frame after it lands.
+    pub(crate) hold_rows: bool,
     /// The authorization card's prompt (see [`PromptCard`]).
     pub(crate) card: Option<PromptCard>,
     /// Its keys were live at the last frame ([`AppView::card_keys_live`]):
@@ -481,6 +487,7 @@ impl Pane {
             pending: None,
             worker_columns: Vec::new(),
             full_rebuild: false,
+            hold_rows: false,
             card: None,
             keys_live: false,
             chord: CardChord::default(),
@@ -1676,6 +1683,10 @@ async fn film3b(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowCont
 }
 
 /// [`pane_script`]'s `film3b2` scene (split.md §2, §5, §7, §8, §9).
+/// The film logs each split or close flight frame (`FLIGHT`): its travel
+/// drawn, for the per-frame evidence beside the capture.
+pub(crate) static FILM_LOG: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 /// Step 4's film (`SYNAPS_DESK_PANES=film4`): drags by real pointer
 /// input through GPUI (`Window::dispatch_event`, as the platform's events
 /// come). A second tab dragged over its pane's left, right, bottom bands
@@ -1683,7 +1694,35 @@ async fn film3b(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowCont
 /// the new pane's tab over the first pane's top band and Esc (nothing
 /// drops); then onto its centre (it moves back, its pane closes); then a
 /// rail row to the bottom (a split down that opens it).
-async fn film4(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, t0: Instant) {
+async fn film4(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, t0: Instant, four: bool) {
+    // Every frame's timing, on the marks' clock, at the end (`FRAME`).
+    gpui_kit::profiler::set_trace_enabled(true);
+    let mut frames = gpui_kit::profiler::FrameTimingCollector::new();
+    let _ = FILM_LOG.set(t0);
+    film4_scene(view, cx, ex, t0, four).await;
+    for f in frames.collect_unseen() {
+        let at = |i: Instant| i.checked_duration_since(t0).map_or(-1., |d| d.as_secs_f64());
+        match f {
+            gpui_kit::profiler::FrameEvent::Draw(d) => eprintln!(
+                "FRAME draw {:.4} {:.2} layout {:.2} prepaint {:.2} paint {:.2}",
+                at(d.draw_start),
+                d.draw_duration().as_secs_f64() * 1e3,
+                d.phases.request_layout.as_secs_f64() * 1e3,
+                d.phases.prepaint.as_secs_f64() * 1e3,
+                d.phases.paint.as_secs_f64() * 1e3
+            ),
+            gpui_kit::profiler::FrameEvent::Present(p) => eprintln!("FRAME present {:.4}", at(p.present_end)),
+        }
+    }
+}
+
+async fn film4_scene(
+    view: &WeakEntity<crate::app::AppView>,
+    cx: &mut AsyncWindowContext,
+    ex: &BackgroundExecutor,
+    t0: Instant,
+    four: bool,
+) {
     use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Point, point};
     let mark = |what: &str| eprintln!("PANES {what} {:.3}", t0.elapsed().as_secs_f64());
     let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
@@ -1760,6 +1799,51 @@ async fn film4(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowConte
         cx.notify();
     });
     sleep(1.2).await;
+    // `film4b`: four panes, the tab over another pane's right edge (a 5th
+    // is refused: OPEN HERE, and why, on the preview), dropped there.
+    if four {
+        for step in shape(4) {
+            let _ = view.update_in(cx, |v, w, cx| {
+                if let Some(i) = step.0 {
+                    v.focus_nth(i, cx);
+                }
+                v.split_pane(step.1, w, cx);
+                cx.notify();
+            });
+            sleep(0.5).await;
+        }
+        let _ = view.update(cx, |v, cx| {
+            v.focus_pane(first, KeysTo::Pane, cx);
+            cx.notify();
+        });
+        sleep(1.0).await;
+        let other = view.update(cx, |v, _| v.reading_order().into_iter().find(|&i| i != first)).ok().flatten().unwrap_or(first);
+        mark("drag-four");
+        let from = tab(cx, first, 1);
+        input(cx, PlatformInput::MouseMove(MouseMoveEvent { position: from, pressed_button: None, modifiers: m }));
+        input(
+            cx,
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: from,
+                modifiers: m,
+                click_count: 1,
+                first_mouse: false,
+            }),
+        );
+        let start = point(from.x + px(10.), from.y + px(8.));
+        input(cx, held(start));
+        sleep(0.1).await;
+        let edge = body(cx, Some(other), 0.95, 0.5);
+        path(cx, ex, &input, start, edge, 0.5).await;
+        mark("refused-edge");
+        sleep(1.5).await;
+        mark("drop-four");
+        input(cx, PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position: edge, modifiers: m, click_count: 1 }));
+        sleep(3.0).await;
+        mark("done");
+        return;
+    }
     // A tab over the bands, then dropped on the right.
     mark("drag-tab");
     let from = tab(cx, first, 1);
@@ -1988,9 +2072,9 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
                 film3b2(&view, cx, &ex, t0).await;
                 return;
             }
-            if how == "film4" {
+            if how == "film4" || how == "film4b" {
                 sleep(5.0).await;
-                film4(&view, cx, &ex, t0).await;
+                film4(&view, cx, &ex, t0, how == "film4b").await;
                 return;
             }
             // Three across (the panels yield to their strips), then the

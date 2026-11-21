@@ -5,6 +5,7 @@
 //! a limit would refuse becomes centre, and a drop that would do nothing
 //! shows nothing: the preview is always what the drop does.
 
+use gpui_kit::component::h_flex;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Context, DragMoveEvent, Hsla, SharedString, Window, div, px};
 
@@ -19,8 +20,18 @@ use crate::tabstrip::TabDrag;
 pub(crate) const BAND: f32 = 0.25;
 /// The preview's inset inside the pane (split.md §3).
 pub(crate) const INSET: f32 = 4.;
-/// Under this width the preview has no label (split.md §3).
-pub(crate) const LABEL_MIN: f32 = 120.;
+/// Under this width the preview has no label (split.md §3): its spaced
+/// caps and their backing need it.
+pub(crate) const LABEL_MIN: f32 = 160.;
+/// Under this width the label says no refusal's reason.
+pub(crate) const NOTE_MIN: f32 = 380.;
+/// The label's height (12 px caps, 3 px padding, its line) and its gap
+/// to the preview's edge (finish gate #48 F1).
+const LABEL_H: f32 = 24.;
+const LABEL_GAP: f32 = 14.;
+/// The drag chip's reach above and below the pointer: the label is never
+/// put there.
+const CHIP_REACH: f32 = 40.;
 
 /// Where in a pane's body a drop lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +110,9 @@ pub(crate) struct Dnd {
     /// Why the last drop was the centre (its edge refused), for the
     /// focused composer's status line after the drop's frame.
     pub(crate) note: Option<&'static str>,
+    /// The pointer's y in the centre, as of the last move (the label
+    /// keeps off it).
+    pub(crate) pointer_y: f32,
 }
 
 impl Dnd {
@@ -279,6 +293,9 @@ impl AppView {
         };
         let (x, y) = (f32::from(ev.position.x) - x0, f32::from(ev.position.y) - y0);
         let inside = x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+        if inside {
+            self.dnd.pointer_y = y;
+        }
         let hint = if inside {
             let raw = zone(r, x, y);
             let (zone, note) = self.drop_zone(pane, raw, &carry, copy);
@@ -388,6 +405,8 @@ impl AppView {
                         if self.split_at(pane, Some(side), None, window, cx).is_none() {
                             return;
                         }
+                        // Its rows wait for the split to land (F2).
+                        self.panes.cur.hold_rows = self.panes.flight.is_some();
                         Place::Current
                     }
                 };
@@ -635,10 +654,36 @@ impl AppView {
             v[i] = self.fx.spring_px(k, end, SNAP_RESPONSE).0;
         }
         self.dnd.drawn = Some((key, target));
-        let label = if key.1 == Zone::Center { "OPEN HERE" } else { "NEW PANE" };
+        let label = if key.1 == Zone::Center { "O P E N   H E R E" } else { "N E W   P A N E" };
+        // Why an edge asked for is the centre, on the preview as it shows
+        // (finish gate #48 S1): the composer says it again after the drop.
+        let note = self.dnd.hint.and_then(|h| h.note).filter(|_| shown.is_some() && v[2] > NOTE_MIN);
         // A see-through quad over the panes (split.md §3: the accent at
         // 16 %, its line at 70 %), at `a` of that as it fades.
         let see = |k: f32| Hsla { a: p.acc.a * k * a, ..p.acc };
+        let faded = |c: Hsla| Hsla { a: c.a * a, ..c };
+        // Its label on its own square backing (finish gate #48 F1: legible
+        // over code and prose), near the top edge, or near the bottom when
+        // the pointer (and the chip with it) is there.
+        let top = LABEL_GAP;
+        let py = self.dnd.pointer_y - v[1];
+        let clear = |y: f32| py < y - CHIP_REACH || py > y + LABEL_H + CHIP_REACH;
+        let ly = if clear(top) { top } else { (v[3] - LABEL_GAP - LABEL_H).max(top) };
+        let chip = h_flex()
+            .h(px(LABEL_H))
+            .px(px(8.))
+            .gap(px(8.))
+            .items_center()
+            .bg(faded(p.canvas))
+            .border_1()
+            .border_color(see(0.70))
+            .child(crate::app::display(label, crate::fonts::size::D_S, faded(p.you)))
+            .when_some(note, |d, n| {
+                d.child(crate::app::display("·", crate::fonts::size::D_S, faded(p.dim))).child(
+                    crate::app::display(n.to_uppercase(), crate::fonts::size::D_S, faded(p.dim))
+                        .debug_selector(|| "drop-label-note".into()),
+                )
+            });
         Some(
             div()
                 .debug_selector(|| "drop-preview".into())
@@ -647,13 +692,22 @@ impl AppView {
                 .top(px(y0 + v[1]))
                 .w(px(v[2]))
                 .h(px(v[3]))
-                .flex()
-                .items_center()
-                .justify_center()
+                .overflow_hidden()
                 .bg(see(0.16))
                 .border_1()
                 .border_color(see(0.70))
-                .when(v[2] > LABEL_MIN, |d| d.child(crate::app::display(label, 12., see(1.))))
+                .when(v[2] > LABEL_MIN, |d| {
+                    d.child(
+                        h_flex()
+                            .debug_selector(|| "drop-label".into())
+                            .absolute()
+                            .left_0()
+                            .w_full()
+                            .top(px(ly))
+                            .justify_center()
+                            .child(chip),
+                    )
+                })
                 .into_any_element(),
         )
     }
