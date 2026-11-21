@@ -213,15 +213,24 @@ impl Scroller {
     /// (vertical, and not a touchscreen, which GPUI coasts itself). A
     /// sideways packet inside a gesture is the same finger (a diagonal
     /// swipe): taken, its sideways part dropped; outside one, it is not ours.
+    ///
+    /// Any of it with a vertical part, whatever its source (a touchscreen's
+    /// too), ends a chase to the end ([`Scroller::to_end`]) and drops its
+    /// glide where the list is: the reader's move starts from there, and
+    /// nothing carries them on (Shady #34 H1, H2).
     pub(crate) fn wheel(&self, ev: &ScrollEvent, now: Instant) -> bool {
-        if ev.source == ScrollSource::Touch {
-            return false;
-        }
         let (dx, dy, lines) = match ev.delta {
             ScrollDelta::Lines(p) => (p.x * LINE_PX, p.y * LINE_PX, Some(p.y)),
             ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y), None),
         };
         let mut s = self.0.borrow_mut();
+        if dy != 0. && std::mem::take(&mut s.end) {
+            s.glide = Spring::default();
+            s.last = Some(now);
+        }
+        if ev.source == ScrollSource::Touch {
+            return false;
+        }
         // A finger on the pad: packets in, or a coast it may have started.
         let touching = !s.packets.is_empty() || s.coast.is_some_and(|c| now.saturating_duration_since(c.from) <= TAKE_BACK);
         let in_gesture = touching || s.coast.is_some();
@@ -234,8 +243,6 @@ impl Scroller {
         if dy == 0. && !in_gesture {
             return true;
         }
-        // The user's own move: no longer to the end.
-        s.end = false;
         // The list's offset grows by −delta.y.
         let by = -dy;
         if lines.is_some_and(is_wheel_step) && !touching {
@@ -305,7 +312,8 @@ impl Scroller {
 
     /// A send (Haseeb, 2026-11-21): [`Scroller::jump`] the `by` px to the
     /// list's end, its target the end as each frame finds it (the message
-    /// and its reply landing meanwhile move it), following it there.
+    /// and its reply landing meanwhile move it), following it there. The
+    /// user's scroll ends it ([`Scroller::wheel`], a drag: [`Scroller::cancel`]).
     pub(crate) fn to_end(&self, by: f32, view: f32, now: Instant) -> f32 {
         let cut = self.jump(by, false, view, now);
         self.0.borrow_mut().end = true;

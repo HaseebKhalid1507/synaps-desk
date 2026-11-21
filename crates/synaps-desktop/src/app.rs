@@ -1282,7 +1282,7 @@ fn land_card_room(list: &ListState, slack: &Cell<Option<Slack>>) {
 
 /// The transcript list's bottom padding: its end sits this far over the
 /// composer (the scroller's end is past it).
-fn list_pad_b(m: &Metrics) -> f32 {
+pub(crate) fn list_pad_b(m: &Metrics) -> f32 {
     (28. * m.r).round()
 }
 
@@ -3599,14 +3599,35 @@ impl AppView {
     /// A message sent (a submit, a steer, a worker's steer from its view)
     /// takes the list back to its end, following (Haseeb, 2026-11-21: "if
     /// I'm scrolled up and I send a message, it should bring me back
-    /// down"), where it lands. The user's own return: a room held at the
-    /// end is no longer left, and goes on `sheet` (as at a turn's end); a
-    /// body's or a fold's hold ends, and the hold-back. At Full it glides
-    /// ([`crate::scroll::Scroller::to_end`]: from one view short of the end
-    /// when farther); Reduced and Off, a cut.
+    /// down"), where it lands. Away from the end, the user's own return: a
+    /// room held at the end is no longer left, and goes on `sheet` (as at a
+    /// turn's end); a body's or a fold's hold ends, and the hold-back. At
+    /// Full it glides ([`crate::scroll::Scroller::to_end`]: from one view
+    /// short of the end when farther; the reader's scroll ends it); Reduced
+    /// and Off, a cut. At the end, the holds there stay: the message grows
+    /// into the room they keep, nothing slides (#23's finish gate, item 7;
+    /// Shady #34 M1), and once it is used up the list follows (no scroll of
+    /// the user's counts since).
     fn return_to_end(&mut self) {
         let pane = &self.panes.cur;
-        if let Some(mut s) = pane.fold_slack.get().filter(|s| s.list == pane.list_gen) {
+        let at = -f32::from(pane.list.scroll_px_offset_for_scrollbar().y);
+        let by = self.list_end() - at;
+        let slack = pane.fold_slack.get().filter(|s| s.list == pane.list_gen);
+        pane.hold_back.set(false);
+        if by <= END_SLOP && !slack.is_some_and(|s| s.left) {
+            let mut holds = pane.body_hold.get().is_some() || pane.fold_gap.borrow().iter().any(|g| g.hold);
+            if let Some(mut s) = slack {
+                s.input = false;
+                holds |= s.gone.is_none();
+                pane.fold_slack.set(Some(s));
+            }
+            pane.scroller.cancel();
+            if !holds {
+                pane.list.scroll_to_end();
+            }
+            return;
+        }
+        if let Some(mut s) = slack {
             s.left = false;
             if s.gone.is_none() {
                 s.gone = Some((s.last, self.fx.clock(), crate::motion::SHEET_RESPONSE));
@@ -3617,9 +3638,6 @@ impl AppView {
         for g in pane.fold_gap.borrow_mut().iter_mut() {
             g.hold = false;
         }
-        pane.hold_back.set(false);
-        let at = -f32::from(pane.list.scroll_px_offset_for_scrollbar().y);
-        let by = self.list_end() - at;
         if self.fx.level() != crate::motion::Level::Full || by <= 0.5 {
             pane.scroller.cancel();
             pane.list.scroll_to_end();
