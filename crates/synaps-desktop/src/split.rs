@@ -56,8 +56,9 @@ pub(crate) struct Flight {
     /// A split's new pane: laid out at its landed size from the first
     /// frame, its share clipping it (it slides in with the split line).
     pub grow: Option<PaneId>,
-    /// The pane a close took: its share, its ground only, closing.
-    pub ghost: Option<PaneId>,
+    /// The panes a close took (Join all panes: every other one): each
+    /// share its ground only, closing.
+    pub ghosts: Vec<PaneId>,
     /// Its spring's length; 0 until its first frame measures it.
     pub travel: f32,
     /// Each pane's narrowest box so far: its column keeps that wrap until
@@ -68,7 +69,7 @@ pub(crate) struct Flight {
 
 impl Flight {
     pub(crate) fn new(from: Node, to: Node, grow: Option<PaneId>, ghost: Option<PaneId>) -> Self {
-        Flight { from, to, grow, ghost, travel: 0., wrap: Vec::new() }
+        Flight { from, to, grow, ghosts: ghost.into_iter().collect(), travel: 0., wrap: Vec::new() }
     }
 }
 
@@ -294,6 +295,13 @@ impl Node {
         }
     }
 
+    /// The smallest centre this tree fits in with every pane at least
+    /// `w` × `h` (its most panes across and down, the rules between).
+    pub(crate) fn min_size(&self, w: f32, h: f32) -> (f32, f32) {
+        let (across, down) = self.extent();
+        (across as f32 * w + (across - 1) as f32 * DIVIDER, down as f32 * h + (down - 1) as f32 * DIVIDER)
+    }
+
     /// Every divider (split.md §4): its split's path from the root (kid
     /// indices), the kid it follows, the split's axis and rectangle, and
     /// where it is (px from the split's start along its axis).
@@ -401,6 +409,15 @@ impl Node {
         }
     }
 
+    /// The palette's Equalise pane sizes: every split's kids equal.
+    pub(crate) fn equalise_all(&mut self) {
+        if let Node::Split { kids, ratios, .. } = self {
+            let n = kids.len() as f32;
+            ratios.iter_mut().for_each(|r| *r = 1. / n);
+            kids.iter_mut().for_each(Node::equalise_all);
+        }
+    }
+
     /// The kid indices from the root down to leaf `id`.
     fn path_of(&self, id: PaneId) -> Option<Vec<usize>> {
         let mut path = Vec::new();
@@ -420,6 +437,22 @@ impl Node {
             if j < ratios.len() {
                 ratios[j] += ratios[i];
                 ratios[i] = 0.;
+            }
+        }
+        n
+    }
+
+    /// Where Join all panes' flight lands (split.md §8): the same tree,
+    /// every split on the way to `id` giving it all of its length.
+    pub(crate) fn solo(&self, id: PaneId) -> Node {
+        let mut n = self.clone();
+        if let Some(path) = self.path_of(id) {
+            for k in 0..path.len() {
+                if let Some(Node::Split { ratios, .. }) = n.at_mut(&path[..k]) {
+                    for (j, r) in ratios.iter_mut().enumerate() {
+                        *r = if j == path[k] { 1. } else { 0. };
+                    }
+                }
             }
         }
         n
@@ -678,6 +711,24 @@ mod tests {
         let rt = across.zeroed(p(1)).rects(area());
         let rg = across.remove(p(1)).unwrap().rects(area());
         assert!((at(&rt, p(0)).w - at(&rg, p(0)).w).abs() <= 1. && (at(&rt, p(2)).w - at(&rg, p(2)).w).abs() <= 1., "{rt:?} / {rg:?}");
+    }
+
+    /// Join all panes' landing (split.md §8): the pane kept has the whole
+    /// area, every other one 0 (a split of two closing as one goes too).
+    #[test]
+    fn solo_gives_one_pane_everything() {
+        let t = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), A).unwrap();
+        let t = t.split(p(1), Side::Down, p(2), A).unwrap();
+        for keep in [p(0), p(1), p(2)] {
+            let r = t.solo(keep).rects(area());
+            for (id, b) in &r {
+                if *id == keep {
+                    assert!(b.w + 2. * DIVIDER >= area().w - 1. && b.h + DIVIDER >= area().h - 1., "{keep:?} keeps it all: {r:?}");
+                } else {
+                    assert!(b.w * b.h < 1. + area().h + area().w, "{id:?} at 0: {r:?}");
+                }
+            }
+        }
     }
 
     /// Reading order: top to bottom, then left to right (split.md §1).

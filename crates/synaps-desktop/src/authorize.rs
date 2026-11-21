@@ -558,8 +558,15 @@ impl AppView {
     /// Ctrl+J: the card's row into view (on F1's glide when it was drawn,
     /// at Full; at once when not, and at Reduced and Off), from a worker's view back to the session first,
     /// and the keys to it (a secret's to its field).
+    /// Split (split.md §7, A14): nothing waits in the focused pane, the
+    /// first pane in reading order whose visible session waits is focused
+    /// and its card shown.
     pub(crate) fn jump_to_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.lives[self.panes.cur.live].transcript.pending_prompts().is_empty() {
+            if let Some(id) = self.waiting_pane() {
+                self.focus_pane(id, crate::pane::KeysTo::Follow, cx);
+                self.reveal_card(window, cx);
+            }
             return;
         }
         if self.model.tabs.view().is_some() {

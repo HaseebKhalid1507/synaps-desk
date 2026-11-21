@@ -36,6 +36,9 @@ pub(crate) const TAB_MIN: f32 = 132.;
 pub(crate) const TAB_MAX: f32 = 236.;
 /// The `+` (new session) and each overflow arrow.
 const PLUS_W: f32 = 38.;
+/// A folded split's end of the strip (split.md §5): the 26 × 18 pane map
+/// and "pane N of M · F6" in 12 px mono, 10 px in from each side.
+const FOLD_W: f32 = 172.;
 const ARROW_W: f32 = 46.;
 /// Tabs this wide show the state's word beside the title (C O M P L E T E D
 /// is 79.7 px at 12).
@@ -270,7 +273,15 @@ impl AppView {
         let active = tabs.active();
         let visible = tabs.visible().map(|t| t.id);
         let new = self.client.is_some();
-        let room = pane - if new { PLUS_W } else { 0. };
+        // Folded (split.md §5): the strip ends in the pane map and "pane N
+        // of M · F6".
+        let fold = self.panes.folded.then(|| {
+            let order = self.reading_order();
+            let me = self.panes.cur.id;
+            let n = order.iter().position(|id| *id == me).map_or(1, |i| i + 1);
+            (me, format!("pane {n} of {} · F6", order.len()))
+        });
+        let room = pane - if new { PLUS_W } else { 0. } - if fold.is_some() { FOLD_W } else { 0. };
         // A resize or a panel drag that changes how many tabs fit brings
         // the visible one back in; arrow scrolls change neither.
         let fit = fits(n, room);
@@ -497,6 +508,21 @@ impl AppView {
                 })))
             })
             .child(div().flex_1())
+            .when_some(fold, |d, (me, text)| {
+                d.child(
+                    h_flex()
+                        .flex_none()
+                        .w(px(FOLD_W))
+                        .h_full()
+                        .px(px(10.))
+                        .gap(px(8.))
+                        .items_center()
+                        .justify_end()
+                        .debug_selector(|| "fold-map".into())
+                        .child(self.pane_map(26., 18., move |id| id == me, true, p, cx))
+                        .child(mono(text, 12., p.prose).flex_none().whitespace_nowrap()),
+                )
+            })
             .when(new, |d| {
                 d.child(
                     h_flex()

@@ -334,7 +334,9 @@ actions!(
         FocusPane3,
         FocusPane4,
         FocusNextPane,
-        FocusPrevPane
+        FocusPrevPane,
+        MoveTabNextPane,
+        MoveTabPrevPane
     ]
 );
 
@@ -342,8 +344,9 @@ actions!(
 /// pane is narrow), Ctrl+Shift+\ down (spelled both ways, as AppKit may
 /// report the shifted key as `|`); Alt+1–4 focus pane N in reading order
 /// (Ctrl+1–4 on macOS, whose Cmd+1–8 are the tab keys); F6 / Shift+F6
-/// the next / previous pane. Cmd on macOS for the splits.
-pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 9] {
+/// the next / previous pane; Ctrl+Alt+→ / ← move the active tab to the
+/// next / previous pane. Cmd on macOS for the splits and the moves.
+pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 11] {
     use PaneKey::*;
     if mac {
         [
@@ -356,6 +359,8 @@ pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 9] {
             ("ctrl-4", Nth(3)),
             ("f6", Next),
             ("shift-f6", Prev),
+            ("cmd-alt-right", MoveNext),
+            ("cmd-alt-left", MovePrev),
         ]
     } else {
         [
@@ -368,6 +373,8 @@ pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 9] {
             ("alt-4", Nth(3)),
             ("f6", Next),
             ("shift-f6", Prev),
+            ("ctrl-alt-right", MoveNext),
+            ("ctrl-alt-left", MovePrev),
         ]
     }
 }
@@ -380,6 +387,8 @@ pub(crate) enum PaneKey {
     Nth(usize),
     Next,
     Prev,
+    MoveNext,
+    MovePrev,
 }
 
 /// A prompt as [`AppView::card_first`] knows it: its session, its id and
@@ -484,7 +493,12 @@ pub fn bind_keys(cx: &mut App) {
     // Only with split panes on (the root's `PANES_CTX`): off, these keys
     // are main's, never swallowed (Shady #36 L1).
     for &(k, a) in &pane_keys(mac) {
-        let c = Some(if matches!(a, PaneKey::Split | PaneKey::SplitDown) { PANES_CTX } else { PANE_FOCUS_CTX });
+        // A move works with one pane too (it splits one off).
+        let c = Some(if matches!(a, PaneKey::Split | PaneKey::SplitDown | PaneKey::MoveNext | PaneKey::MovePrev) {
+            PANES_CTX
+        } else {
+            PANE_FOCUS_CTX
+        });
         keys.push(match a {
             PaneKey::Split => KeyBinding::new(k, SplitRight, c),
             PaneKey::SplitDown => KeyBinding::new(k, SplitDown, c),
@@ -494,6 +508,8 @@ pub fn bind_keys(cx: &mut App) {
             PaneKey::Nth(_) => KeyBinding::new(k, FocusPane4, c),
             PaneKey::Next => KeyBinding::new(k, FocusNextPane, c),
             PaneKey::Prev => KeyBinding::new(k, FocusPrevPane, c),
+            PaneKey::MoveNext => KeyBinding::new(k, MoveTabNextPane, c),
+            PaneKey::MovePrev => KeyBinding::new(k, MoveTabPrevPane, c),
         });
     }
     cx.bind_keys(keys);
@@ -6824,7 +6840,7 @@ impl AppView {
     pub(crate) fn foot_bottom(&self, m: &Metrics) -> f32 {
         let foot = {
             let (r, (_, h)) = (self.panes.cur.land.get(), self.centre.get());
-            self.panes.split() && (r.y + r.h - h).abs() < 0.5
+            self.panes.shown_split() && (r.y + r.h - h).abs() < 0.5
         };
         let form =
             if foot { if self.top_short { crate::fit::Form::Short } else { crate::fit::Form::Full } } else { self.panes.cur.layout.form() };
@@ -7498,7 +7514,7 @@ impl AppView {
         if lay.form() != self.panes.cur.layout.form() {
             // Split, the top bar is the window's (M1): a pane's own form
             // moves its naming row only.
-            let split = self.panes.split();
+            let split = self.panes.shown_split();
             let above = |l: Layout, naming: bool| above_list(l, naming) - if split { crate::chrome::top_h(l.short) } else { 0. };
             let shift = above(lay, ex.naming) - above(self.panes.cur.layout, self.panes.cur.layout_naming);
             self.keep_rows(shift, (lay.form() as u8) > (self.panes.cur.layout.form() as u8));
@@ -7521,7 +7537,7 @@ impl AppView {
         // own height under its own form's bars (`win_h` counts the full
         // bar, and a Short pane's are 12 px less), less what a foot pane's
         // composer insets more than its form's (the window's, M3).
-        let height = if self.panes.split() {
+        let height = if self.panes.shown_split() {
             let extra = (self.foot_bottom(&m) - crate::fit::Composer::of(&m, lay.form()).bottom).max(0.);
             g.win_h - crate::chrome::TOP + crate::chrome::top_h(lay.short) - extra
         } else {
@@ -7880,7 +7896,7 @@ impl AppView {
                 let id = *id;
                 // A closing pane's share (split.md §8): an empty pane's
                 // ground, its strip and the canvas, going to 0.
-                if self.panes.flight.as_ref().is_some_and(|f| f.ghost == Some(id)) {
+                if self.panes.flight.as_ref().is_some_and(|f| f.ghosts.contains(&id)) {
                     return div()
                         .flex_none()
                         .w(px(r.w))
@@ -7934,6 +7950,66 @@ impl AppView {
 }
 
 impl AppView {
+    /// The side panels with split panes in the window (split.md §5): the
+    /// right panel yields to its strip while the split would put a pane
+    /// under 480 px (`CENTRE_MIN` per pane: the session wins; by the
+    /// tree's shape, as the mock's, so a divider's drag never folds it),
+    /// then the rail while a pane would be under its 320 × 240 minimum.
+    /// When the minimums still can't be met, the split folds (no pane is
+    /// ever drawn under its minimum; its ratios are kept), and the panels
+    /// are as one pane's. Sets [`Panes::folded`].
+    fn pane_sides(&mut self, rail: Side, right: Side) -> (Side, Side) {
+        use crate::split::{PANE_MIN_H, PANE_MIN_W, Rect};
+        self.panes.folded = false;
+        if !self.panes.split() {
+            return (rail, right);
+        }
+        let h = self.height - crate::chrome::top_h(self.top_short);
+        let tree = &self.panes.tree;
+        let (wide, _) = tree.min_size(CENTRE_MIN, PANE_MIN_H);
+        let centre = |l: Side, r: Side| self.width - crate::chrome::MARK - l.width() - r.width();
+        // Every pane at its minimum in a centre `w` wide, as laid out.
+        let fits = |w: f32| tree.rects(Rect { x: 0., y: 0., w, h }).iter().all(|(_, r)| r.w + 0.5 >= PANE_MIN_W && r.h + 0.5 >= PANE_MIN_H);
+        let right = if centre(rail, right) + 0.5 >= wide { right } else { Side::Strip };
+        for (l, r) in [(rail, right), (Side::Strip, right)] {
+            if fits(centre(l, r)) {
+                return (l, r);
+            }
+        }
+        self.panes.folded = true;
+        (rail, right)
+    }
+
+    /// The pane map (split.md §4, §6): the layout's tree in `w` × `h`, a
+    /// cell per pane 1 px apart, `prose` where `lit`, else `edge`; with
+    /// `click`, a cell focuses its pane.
+    pub(crate) fn pane_map(&self, w: f32, h: f32, lit: impl Fn(PaneId) -> bool, click: bool, p: &Palette, cx: &Context<Self>) -> Div {
+        let cells = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h });
+        div().relative().flex_none().w(px(w)).h(px(h)).children(cells.into_iter().map(|(id, r)| {
+            let cell = div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w.max(1.))).h(px(r.h.max(1.))).bg(if lit(id) {
+                p.prose
+            } else {
+                p.edge
+            });
+            if click {
+                cell.id(("pane-map", id.index()))
+                    .debug_selector(move || format!("pane-map {}", id.index()))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.focus_pane(id, crate::pane::KeysTo::Pane, cx);
+                            this.focus_composer(cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element()
+            } else {
+                cell.into_any_element()
+            }
+        }))
+    }
+
     /// The layout as drawn this frame in `area` (split.md §10): the tree at
     /// rest; in a flight, its step on `sheet`, on whole pixels. The step
     /// is `from` to `to` by the spring's travel; within a pixel of its end
@@ -7961,7 +8037,7 @@ impl AppView {
 
     /// The layout changes to `to` on `sheet` from where it is drawn
     /// (split.md §10: a double-click's equalise, a release's detent).
-    fn fly_layout(&mut self, to: crate::split::Node, cx: &mut Context<Self>) {
+    pub(crate) fn fly_layout(&mut self, to: crate::split::Node, cx: &mut Context<Self>) {
         if to == self.panes.tree {
             return;
         }
@@ -8253,6 +8329,7 @@ impl Render for AppView {
         // drew the old bar).
         self.top_short = self.height - crate::chrome::TOP < crate::fit::short_below(&m);
         let (rail, right) = sides(self.width, self.panels, crate::chrome::MARK);
+        let (rail, right) = self.pane_sides(rail, right);
         if let Side::Open(w) = rail {
             self.rail_width = w;
         }
@@ -8306,8 +8383,13 @@ impl Render for AppView {
         // Under the bar drawn (M1: the panes reach the window's foot).
         let centre_h = self.height - crate::chrome::top_h(self.top_short);
         self.centre.set((centre, centre_h));
-        // A close's flight down to one pane is drawn split until it lands.
-        let main = if self.panes.split() || self.panes.flight.is_some() {
+        // A close's flight down to one pane is drawn split until it lands;
+        // folded, the focused pane is drawn as one (split.md §5).
+        if self.panes.folded {
+            self.panes.flight = None;
+            self.panes.grab = None;
+        }
+        let main = if self.panes.shown_split() || (self.panes.flight.is_some() && !self.panes.folded) {
             let area = |w: f32| crate::split::Rect { x: 0., y: 0., w, h: centre_h };
             // The layout as drawn this frame: the tree, or its flight's
             // step (split.md §10).
@@ -8324,10 +8406,10 @@ impl Render for AppView {
             // measured the list again).
             let at = |w: f32| self.panes.tree.rects(area(w));
             let (rects_to, rects_wrap) = (at(pane_to), at(wrap));
-            let (grow, ghost) = self.panes.flight.as_ref().map_or((None, None), |f| (f.grow, f.ghost));
+            let (grow, ghosts) = self.panes.flight.as_ref().map_or((None, Vec::new()), |f| (f.grow, f.ghosts.clone()));
             let mut mains = Vec::new();
             for (id, r) in &rects {
-                if ghost == Some(*id) {
+                if ghosts.contains(id) {
                     continue;
                 }
                 let of = |rs: &[(PaneId, crate::split::Rect)]| rs.iter().find(|(i, _)| i == id).map_or(r.w, |(_, t)| t.w);
@@ -8411,6 +8493,8 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &FocusPane4, _, cx| this.focus_nth(3, cx)))
             .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| this.focus_step(false, cx)))
             .on_action(cx.listener(|this, _: &FocusPrevPane, _, cx| this.focus_step(true, cx)))
+            .on_action(cx.listener(|this, _: &MoveTabNextPane, window, cx| this.move_tab_pane(false, window, cx)))
+            .on_action(cx.listener(|this, _: &MoveTabPrevPane, window, cx| this.move_tab_pane(true, window, cx)))
             .map(|d| crate::palette::capture_keys(d, cx))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
@@ -8431,12 +8515,13 @@ impl Render for AppView {
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
                 this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
-                // Ctrl+J: to the card, wherever the focus is (polish.md §2.6).
+                // Ctrl+J: to the card, wherever the focus is (polish.md §2.6),
+                // or another pane's (split.md §7).
                 let m = &ev.keystroke.modifiers;
                 if ev.keystroke.key == "j"
                     && m.control
                     && !(m.alt || m.shift || m.platform || m.function)
-                    && !this.model.lives[this.panes.cur.live].transcript.pending_prompts().is_empty()
+                    && (!this.model.lives[this.panes.cur.live].transcript.pending_prompts().is_empty() || this.waiting_pane().is_some())
                 {
                     cx.stop_propagation();
                     if this.palette.is_some() {

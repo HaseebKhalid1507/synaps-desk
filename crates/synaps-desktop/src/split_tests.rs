@@ -652,10 +652,12 @@ fn type_enter(cx: &mut TestAppContext, window: AnyWindowHandle, text: &str) {
     key(cx, window, "enter");
 }
 
-/// A mouse-down and up at `position`.
+/// The pointer moved to `position` (as a real one always is before its
+/// click), then a mouse-down and up there.
 fn click_at(cx: &mut TestAppContext, window: AnyWindowHandle, position: Point<Pixels>) {
-    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
     let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_event(MouseMoveEvent { position, pressed_button: None, modifiers: Modifiers::default() });
     vcx.simulate_event(MouseDownEvent {
         button: MouseButton::Left,
         position,
@@ -791,8 +793,10 @@ fn attached_secret(sid: &str, id: u64) -> Value {
 fn a_click_on_the_other_panes_secret_field_keeps_the_keys(cx: &mut TestAppContext) {
     let (window, view, client, mut a, _attaches, events) = on_a_as(cx, "panes-secret", attached_secret(A, 1));
     key(cx, window, "ctrl-\\");
+    // Both armed: the first pane's card waits again when its list is laid
+    // out anew under the split (its column, as the right panel yields).
     feed(cx, window, &view, &events, "the card up in both panes, armed", |v| {
-        v.panes.cur.card.as_ref().is_some_and(|c| c.armed()) && v.panes.rest[0].card.is_some()
+        v.panes.cur.card.as_ref().is_some_and(|c| c.armed()) && v.panes.rest[0].card.as_ref().is_some_and(|c| c.armed())
     });
     let (p0, p1) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
     assert!(keys_in(cx, window, &view, p1, false), "the new pane's composer has the keys");
@@ -1870,12 +1874,19 @@ fn a_short_foot_pane_fits_its_composer_to_the_room_it_has(cx: &mut TestAppContex
     key(cx, window, "ctrl-shift-\\");
     land(cx, window, &view);
     let low = view.read_with(cx, |v, _| v.panes.cur.id);
+    // The naming row open and an error on the notice line: what is over
+    // the composer takes enough that the rows are short of their most in
+    // panes at their minimum height and above.
+    view.update(cx, |v, cx| {
+        v.model.named.naming = true;
+        let live = v.panes.cur.live;
+        v.model.lives[live].last_error = Some("the daemon said no".into());
+        cx.notify();
+    });
     let m = crate::theme::Metrics::at(16);
     let mut checked = 0;
     let mut seen = Vec::new();
-    // Down to panes under their minimum (a window shrunk after the split;
-    // its fold is 3b-2's): the composer reaches its most rows above that.
-    for h in (400..560).step_by(2) {
+    for h in (524..760).step_by(2) {
         VisualTestContext::from_window(window, cx).simulate_resize(size(px(1280.), px(h as f32)));
         frame(cx, window);
         let got = view.update(cx, |v, _| {
@@ -1890,6 +1901,7 @@ fn a_short_foot_pane_fits_its_composer_to_the_room_it_has(cx: &mut TestAppContex
             })
         });
         let (rows, want, was, form) = got.expect("the low pane");
+        assert!(!view.read_with(cx, |v, _| v.panes.folded), "{h}: two panes at their minimum height fit");
         seen.push((h, form, rows, want, was));
         assert_eq!(rows, want, "{h}: {form:?}: the rows its room has");
         if want != was {
@@ -1899,4 +1911,427 @@ fn a_short_foot_pane_fits_its_composer_to_the_room_it_has(cx: &mut TestAppContex
     assert!(checked > 0, "a height where the room differs by a row: {seen:?}");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
+}
+
+// ── 3b-2: narrow windows, the pane map, moving tabs ─────────────────────
+
+/// A demo window `w` × `h` with split panes on and IDLE_CPU's history on
+/// screen (its rows drawn).
+fn demo_split(cx: &mut TestAppContext, w: f32, h: f32) -> (AnyWindowHandle, Entity<AppView>) {
+    let (window, view) = open_sized(cx, w, h);
+    view.update(cx, |v, cx| {
+        v.app_settings.split = true;
+        let other = crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false };
+        v.open_tab(other, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    frame(cx, window);
+    (window, view)
+}
+
+fn resize(cx: &mut TestAppContext, window: AnyWindowHandle, w: f32, h: f32) {
+    VisualTestContext::from_window(window, cx).simulate_resize(size(px(w), px(h)));
+    frame(cx, window);
+    frame(cx, window);
+}
+
+/// split.md §5, §6, A12, A13, A16: with two panes the right panel's header
+/// and the rail row of a session on screen show the pane map (none with
+/// one pane). In a narrow window the right panel yields to its strip
+/// first, then the rail, while every pane keeps its minimum; past that the
+/// split folds: the focused pane fills the centre, its strip ends in the
+/// pane map, F6 and a click on a map cell switch panes, no divider is
+/// drawn, and widening brings back the identical layout.
+#[gpui_kit::test]
+fn a_narrow_window_yields_the_panels_then_folds_and_widening_restores_it(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    let shown = |cx: &mut TestAppContext| view.read_with(cx, |v, _| (v.panel_fx.sides[0].shown, v.panel_fx.sides[1].shown));
+    let strip = crate::app::STRIP;
+    assert!(
+        drawn(cx, window, "right-pane-map".into()).is_none() && drawn(cx, window, "rail-pane-map".into()).is_none(),
+        "one pane: no map"
+    );
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    assert!(drawn(cx, window, "right-pane-map".into()).is_some(), "two panes: the right panel's header has the map");
+    assert!(drawn(cx, window, "rail-pane-map".into()).is_some(), "the rail row of the session on screen has it");
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    let ids = view.read_with(cx, |v, _| v.panes.ids());
+    assert_eq!(ids.len(), 3, "three across");
+    // Equal thirds (a double-click's).
+    view.update(cx, |v, cx| {
+        v.panes.tree.equalise(&[]);
+        cx.notify();
+    });
+    frame(cx, window);
+    let tree = view.read_with(cx, |v, _| v.panes.tree.clone());
+    // 1920: the right panel at its strip, the rail open, every pane ≥ 480.
+    let (rail, right) = shown(cx);
+    assert!(rail > strip && right == strip, "1920: the right panel yields first: {rail} / {right}");
+    let wide: Vec<[f32; 4]> = ids.iter().map(|id| pane_box(cx, window, *id)).collect();
+    assert!(wide.iter().all(|b| b[2] >= 480.), "1920: every pane at least 480: {wide:?}");
+    // 1280: the rail yields too; every pane at least its minimum.
+    resize(cx, window, 1280., 800.);
+    assert_eq!(shown(cx), (strip, strip), "1280: both panels at their strips");
+    assert!(ids.iter().all(|id| pane_box(cx, window, *id)[2] >= crate::split::PANE_MIN_W), "1280: every pane at least 320");
+    assert!(!view.read_with(cx, |v, _| v.panes.folded));
+    // 960: folded. One pane drawn, its strip ends in the map.
+    resize(cx, window, 960., 700.);
+    assert!(view.read_with(cx, |v, _| v.panes.folded), "960: folded");
+    assert!(ids.iter().all(|id| drawn(cx, window, format!("pane {}", id.index())).is_none()), "960: one pane, drawn as one");
+    assert!(drawn(cx, window, "divider-grab 0".into()).is_none(), "no divider while folded");
+    let map = drawn(cx, window, "fold-map".into()).expect("the folded strip's map");
+    assert!(map[1] >= crate::chrome::top_h(true) - 1. && map[3] <= crate::tabstrip::TAB_H, "in the tab strip: {map:?}");
+    let focused = view.read_with(cx, |v, _| v.panes.focused);
+    key(cx, window, "f6");
+    let next = view.read_with(cx, |v, _| v.panes.focused);
+    assert_ne!(next, focused, "F6 moves through the folded panes");
+    let cell = drawn(cx, window, format!("pane-map {}", focused.index())).expect("its cell");
+    click_at(cx, window, gpui_kit::point(px(cell[0] + cell[2] / 2.), px(cell[1] + cell[3] / 2.)));
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), focused, "a click on a cell focuses its pane");
+    // Wide again: the same tree, the same boxes.
+    resize(cx, window, 1920., 1080.);
+    assert!(!view.read_with(cx, |v, _| v.panes.folded));
+    assert_eq!(view.read_with(cx, |v, _| v.panes.tree.clone()), tree, "the tree untouched");
+    let back: Vec<[f32; 4]> = ids.iter().map(|id| pane_box(cx, window, *id)).collect();
+    assert_eq!(back, wide, "the identical layout");
+}
+
+/// The session of each pane's tabs, in reading order.
+fn pane_tabs(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<Vec<String>> {
+    view.read_with(cx, |v, _| {
+        v.reading_order()
+            .into_iter()
+            .map(|id| {
+                let tabs = if id == v.panes.cur.id { &v.model.tabs } else { &v.panes.get(id).expect("the pane").parked.tabs };
+                tabs.iter().map(|t| t.session.clone().unwrap_or_default()).collect()
+            })
+            .collect()
+    })
+}
+
+/// split.md §9: Ctrl+Alt+→ with one pane and two tabs splits the active
+/// tab off into a new pane on the right, focused; Ctrl+Alt+← moves it
+/// back, and the pane it leaves (its only tab) closes.
+#[gpui_kit::test]
+fn ctrl_alt_arrows_move_the_active_tab_across_panes(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    view.update(cx, |v, cx| {
+        let other = crate::app::Open::Attach { session_id: crate::demo::FLAKY.into(), fallback: None, open: false };
+        v.open_tab(other, crate::tabs::Place::New);
+        cx.notify();
+    });
+    frame(cx, window);
+    let one = pane_tabs(cx, &view);
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].len(), 2, "one pane, two tabs: {one:?}");
+    let active = view.read_with(cx, |v, _| v.model.tabs.current_session().map(str::to_string)).expect("a session");
+    key(cx, window, "ctrl-alt-right");
+    frame(cx, window);
+    let two = pane_tabs(cx, &view);
+    assert_eq!(two.len(), 2, "split off: {two:?}");
+    assert_eq!(two[1], std::slice::from_ref(&active), "the tab in the new pane");
+    assert!(!two[0].contains(&active), "and gone from the first: {two:?}");
+    let new = view.read_with(cx, |v, _| v.reading_order()[1]);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), new, "focused with it");
+    key(cx, window, "ctrl-alt-left");
+    frame(cx, window);
+    let back = pane_tabs(cx, &view);
+    assert_eq!(back.len(), 1, "its pane closed with its only tab: {back:?}");
+    assert_eq!(back[0].len(), 2, "both tabs in the first pane: {back:?}");
+    assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current_session().map(str::to_string)), Some(active), "the moved tab shown");
+}
+
+/// split.md §7 (A14): with nothing waiting in the focused pane, Ctrl+J
+/// focuses the first pane in reading order whose session waits, and its
+/// card's keys go with it after their wait (never answered by the press).
+/// The palette's "Jump to what is waiting" is offered then too.
+#[gpui_kit::test]
+fn ctrl_j_with_nothing_waiting_here_focuses_the_pane_that_waits(cx: &mut TestAppContext) {
+    let (window, view, _client, mut a, attaches, events) = on_a(cx, "panes-ctrl-j", Some(1));
+    feed(cx, window, &view, &events, "A's card up", |v| v.panes.cur.card.is_some());
+    key(cx, window, "ctrl-\\");
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    b.send(attached(B, None));
+    feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
+    let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    let _ = (names(&mut a), names(&mut b));
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), pb, "B's pane focused, nothing waiting in it");
+    let offered = view.read_with(cx, |v, cx| {
+        let (_, cmds) = v.palette_entries(cx);
+        cmds.iter().find(|e| matches!(e.act, crate::palette::Act::App(crate::palette::AppAct::JumpWaiting))).map(|e| e.off.is_none())
+    });
+    assert_eq!(offered, Some(true), "the palette offers the jump: A's pane waits");
+    key(cx, window, "ctrl-j");
+    frame(cx, window);
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), pa, "Ctrl+J focused A's pane, where the card waits");
+    assert!(root_has_keys(cx, window, &view), "the card's keys (the window's root) have the focus");
+    // The press that jumped answers nothing: the card waits its arm.
+    view.update(cx, |v, _| v.in_pane(pa, |v| assert!(!v.panes.cur.card.as_ref().expect("A's card").keys_armed(), "its keys wait again")));
+    assert!(!names(&mut a).iter().any(|n| n == "answer"), "nothing answered");
+    // Again, with the card's pane focused: Ctrl+J stays (its own card).
+    key(cx, window, "ctrl-j");
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), pa, "a second Ctrl+J keeps A's pane");
+}
+
+/// split.md §7: a card arriving in an unfocused pane fires the family's
+/// cues there: its tab's needs bar and its composer foot's glyph turn in
+/// that pane's own column (none in the focused pane's), and the card's
+/// keys stay unarmed while its pane is not focused. (The rail's row is
+/// the window's, by `Model::fact` over every pane's store; this daemon
+/// lists no sessions.)
+#[gpui_kit::test]
+fn a_card_in_an_unfocused_pane_fires_its_cues_there(cx: &mut TestAppContext) {
+    let (window, view, _client, mut a, attaches, events) = on_a(cx, "panes-needs", None);
+    key(cx, window, "ctrl-\\");
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    b.send(attached(B, None));
+    feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
+    let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    let _ = (names(&mut a), names(&mut b));
+    frame(cx, window);
+    let t0 = view.read_with(cx, |v, _| v.fx.clock());
+    view.read_with(cx, |v, _| v.fx.set_clock(t0 + Duration::from_millis(16)));
+    a.send(json!({"type": "event", "session_id": A, "seq": 1, "ts": "t",
+        "event": {"ev": "prompt", "request": {"id": 7, "kind": "confirm", "title": "Confirm tool call", "prompt": "Allow this tool call?"}}}));
+    feed(cx, window, &view, &events, "A's prompt in", |v| {
+        v.model.lives.iter().any(|l| l.is_active(A) && !l.transcript.pending_prompts().is_empty())
+    });
+    frame(cx, window);
+    frame(cx, window);
+    let (in_a, in_b) = view.read_with(cx, |v, _| (v.fx.col(pa).changed_since(t0), v.fx.col(pb).changed_since(t0)));
+    let has = |v: &[(crate::motion::Tag, u64)], t: crate::motion::Tag| v.iter().any(|(k, _)| *k == t);
+    assert!(has(&in_a, crate::motion::Tag::TabNeeds), "A's tab's needs bar draws in A's pane: {in_a:?}");
+    assert!(has(&in_a, crate::motion::Tag::Foot), "A's composer foot's glyph turns in A's pane: {in_a:?}");
+    assert!(!has(&in_b, crate::motion::Tag::TabNeeds) && !has(&in_b, crate::motion::Tag::Foot), "nothing in B's pane: {in_b:?}");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), pb, "the focus stays on B's pane");
+    let armed = view.update(cx, |v, _| v.in_pane(pa, |v| v.panes.cur.card.as_ref().map(|c| c.keys_armed())));
+    assert_ne!(armed, Some(Some(true)), "A's card's keys are not armed while its pane is not focused");
+}
+
+/// split.md §2, §8 (A19): with split panes on, the palette lists every pane
+/// action with its key and greys what can't run, with why ("one pane",
+/// "4 panes is the most"). Equalise pane sizes evens every split (on
+/// `sheet`, as a double-click), Join all panes puts the other panes' session tabs into the
+/// focused one (once each) and closes them, and Close pane closes the
+/// focused pane's tabs and the pane.
+#[gpui_kit::test]
+fn the_palette_lists_the_pane_actions_and_runs_them(cx: &mut TestAppContext) {
+    use crate::palette::{Act, AppAct};
+    let (window, view, _client, mut a, attaches, events) = on_a(cx, "panes-palette", None);
+    let entries = |cx: &mut TestAppContext| -> Vec<(AppAct, String, Option<String>, Option<String>)> {
+        view.read_with(cx, |v, cx| {
+            let (_, cmds) = v.palette_entries(cx);
+            cmds.iter()
+                .filter_map(|e| match e.act {
+                    Act::App(a) => {
+                        Some((a, e.title.to_string(), e.key.as_ref().map(|k| k.to_string()), e.off.as_ref().map(|o| o.to_string())))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+    };
+    let find = |es: &[(AppAct, String, Option<String>, Option<String>)], a: AppAct| es.iter().find(|e| e.0 == a).cloned().expect("listed");
+    let one = entries(cx);
+    let titles: Vec<&str> = one.iter().map(|e| e.1.as_str()).collect();
+    for t in [
+        "Split right",
+        "Split down",
+        "Focus pane 1",
+        "Focus pane 4",
+        "Focus next pane",
+        "Focus previous pane",
+        "Move tab to the next pane",
+        "Move tab to the previous pane",
+        "Equalise pane sizes",
+        "Close pane",
+        "Join all panes",
+        "Jump to what is waiting",
+        "Settings",
+    ] {
+        assert!(titles.contains(&t) || t == "Settings", "the palette lists {t}: {titles:?}");
+    }
+    assert_eq!(find(&one, AppAct::SplitRight).2.as_deref(), Some("Ctrl+\\"), "Split right shows its key");
+    assert_eq!(find(&one, AppAct::FocusNextPane).2.as_deref(), Some("F6"), "F6");
+    assert_eq!(find(&one, AppAct::SplitRight).3, None, "one pane: it splits");
+    for act in [AppAct::FocusNextPane, AppAct::Equalise, AppAct::ClosePane, AppAct::JoinPanes] {
+        assert_eq!(find(&one, act).3.as_deref(), Some("one pane"), "{act:?} with one pane");
+    }
+    let act = |cx: &mut TestAppContext, a: AppAct| {
+        cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(a, w, cx))).unwrap();
+        frame(cx, window);
+    };
+    // Three panes: A, a second A (Ctrl+\'s), and B beside it.
+    act(cx, AppAct::SplitRight);
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::New);
+        cx.notify();
+    });
+    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    b.send(attached(B, None));
+    feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
+    act(cx, AppAct::SplitDown);
+    let _ = (names(&mut a), names(&mut b));
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 3, "three panes");
+    let three = entries(cx);
+    assert_eq!(find(&three, AppAct::Equalise).3, None, "split: Equalise runs");
+    assert_eq!(find(&three, AppAct::FocusPane(3)).3.as_deref(), Some("no such pane"), "a fourth pane isn't there");
+    // Uneven, then Equalise: every split even on its flight's landing.
+    view.update(cx, |v, cx| {
+        if let crate::split::Node::Split { ratios, .. } = &mut v.panes.tree {
+            ratios[0] = 0.7;
+            ratios[1] = 0.3;
+        }
+        cx.notify();
+    });
+    frame(cx, window);
+    act(cx, AppAct::Equalise);
+    let even = |n: &crate::split::Node| -> bool {
+        fn all(n: &crate::split::Node) -> bool {
+            match n {
+                crate::split::Node::Leaf(_) => true,
+                crate::split::Node::Split { kids, ratios, .. } => {
+                    ratios.iter().all(|r| (r - 1. / ratios.len() as f32).abs() < 1e-4) && kids.iter().all(all)
+                }
+            }
+        }
+        all(n)
+    };
+    assert!(view.read_with(cx, |v, _| even(&v.panes.tree)), "every split even");
+    // Four panes: Split is greyed with why.
+    act(cx, AppAct::SplitDown);
+    let four = entries(cx);
+    if view.read_with(cx, |v, _| v.panes.len()) == 4 {
+        assert_eq!(find(&four, AppAct::SplitRight).3.as_deref(), Some("4 panes is the most"), "four panes");
+    }
+    // Join: every session tab in the focused pane, once each; one pane.
+    // One flight for all the closing panes (each its ghost), landing on
+    // the pane kept with all of it.
+    let kept = view.read_with(cx, |v, _| v.panes.focused);
+    let others: Vec<crate::pane::PaneId> = view.read_with(cx, |v, _| v.panes.ids().into_iter().filter(|id| *id != kept).collect());
+    level(cx, crate::motion::Level::Full);
+    cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(AppAct::JoinPanes, w, cx))).unwrap();
+    let flight = view.read_with(cx, |v, _| v.panes.flight.as_ref().map(|f| (f.ghosts.clone(), f.to.clone())));
+    let (mut ghosts, to) = flight.expect("Join flies");
+    ghosts.sort_by_key(|id| id.index());
+    assert_eq!(ghosts, others, "every other pane closing in the one flight");
+    assert_eq!(
+        to.rects(crate::split::Rect { x: 0., y: 0., w: 900., h: 700. }).iter().filter(|(_, r)| r.w * r.h > 1. + 900. + 700.).count(),
+        1,
+        "it lands on one pane"
+    );
+    // The kept pane only grows, frame by frame, and nothing moves after.
+    let mut widths = Vec::new();
+    let mut frames = 0;
+    while view.read_with(cx, |v, _| v.panes.flight.is_some()) {
+        frame_144(cx, window, &view);
+        frames += 1;
+        assert!(frames < 200, "Join never landed");
+        if view.read_with(cx, |v, _| v.panes.flight.is_some()) {
+            widths.push(pane_box(cx, window, kept)[2]);
+        }
+    }
+    assert!(widths.len() > 10 && widths.windows(2).all(|w| w[1] >= w[0]), "the kept pane widens on `sheet`: {widths:?}");
+    let bar = |cx: &mut TestAppContext| drawn(cx, window, "composer-bar".into()).expect("the composer");
+    let landed = bar(cx);
+    for _ in 0..10 {
+        frame_144(cx, window, &view);
+        assert_eq!(bar(cx), landed, "nothing moves after Join lands");
+    }
+    level(cx, crate::motion::Level::Reduced);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "Join leaves one pane");
+    let sessions: Vec<String> = view.read_with(cx, |v, _| v.model.tabs.iter().filter_map(|t| t.session.clone()).collect());
+    let mut uniq = sessions.clone();
+    uniq.dedup();
+    assert!(sessions.contains(&A.to_string()) && sessions.contains(&B.to_string()), "A and B both in the pane: {sessions:?}");
+    assert_eq!(
+        sessions.len(),
+        {
+            let mut s = sessions.clone();
+            s.sort();
+            s.dedup();
+            s.len()
+        },
+        "each once: {sessions:?}"
+    );
+    // Close pane: split again, close the new pane from the palette.
+    act(cx, AppAct::SplitRight);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2, "split again");
+    act(cx, AppAct::ClosePane);
+    for _ in 0..40 {
+        frame(cx, window);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "Close pane closed it");
+    assert!(view.read_with(cx, |v, _| !v.model.tabs.is_empty()), "the other pane's tabs stay");
+}
+
+/// split.md §2 (A6): Open to the side (Alt+click on a rail row) opens in
+/// the pane to the right of the focused one; with none, in a new pane on
+/// the right; and with no room for one, in the next pane in reading order.
+/// A session already on screen focuses its pane, as a click does (§0: a
+/// click never makes a second copy).
+#[gpui_kit::test]
+fn open_to_the_side_follows_its_order(cx: &mut TestAppContext) {
+    const C: &str = "20261121-030000-cccc";
+    const D: &str = "20261121-040000-dddd";
+    let (window, view, _client, mut a, attaches, events) = on_a(cx, "panes-side", None);
+    let side = |cx: &mut TestAppContext, s: &str| {
+        let action = crate::named::RowAction::Attach(s.into());
+        cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.open_to_side(&action, w, cx))).unwrap();
+        frame(cx, window);
+    };
+    let attach = |cx: &mut TestAppContext, s: &'static str| {
+        let mut c = attaches.recv_timeout(T).expect("an attach at the daemon");
+        c.send(attached(s, None));
+        feed(cx, window, &view, &events, "attached", |v| v.model.lives.iter().any(|l| l.is_active(s)));
+        let _ = names(&mut c);
+        c
+    };
+    let visible = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.model.tabs.visible().and_then(|t| t.session.clone()));
+    // One pane: a new pane on the right, B in it, focused.
+    side(cx, B);
+    let _b = attach(cx, B);
+    let _ = names(&mut a);
+    let (n, focused, order) = view.read_with(cx, |v, _| (v.panes.len(), v.panes.focused, v.reading_order()));
+    assert_eq!(n, 2, "one pane: a new pane");
+    assert_eq!(order.last(), Some(&focused), "on the right, focused");
+    assert_eq!(visible(cx).as_deref(), Some(B), "B in it");
+    // The left pane focused: C into its right neighbour, no new pane.
+    view.update(cx, |v, cx| v.focus_pane(order[0], crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    side(cx, C);
+    let _c = attach(cx, C);
+    let (n, focused) = view.read_with(cx, |v, _| (v.panes.len(), v.panes.focused));
+    assert_eq!((n, focused), (2, order[1]), "into the right neighbour");
+    let tabs = view.read_with(cx, |v, _| v.model.tabs.iter().filter_map(|t| t.session.clone()).collect::<Vec<_>>());
+    assert_eq!(tabs, [B.to_string(), C.to_string()], "a new tab there, B's kept");
+    assert_eq!(visible(cx).as_deref(), Some(C), "C shown");
+    // A, on screen in the left pane: its pane is focused, no copy.
+    side(cx, A);
+    assert_eq!(view.read_with(cx, |v, _| (v.panes.len(), v.panes.focused)), (2, order[0]), "A's pane focused");
+    // The right pane focused in a window with no room for a third column:
+    // D in the next pane in reading order (round to the left one).
+    resize(cx, window, 1000., 800.);
+    view.update(cx, |v, cx| v.focus_pane(order[1], crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    let refusal = view.read_with(cx, |v, _| v.split_refusal(Some(crate::split::Side::Right)));
+    assert!(refusal.is_some(), "no room for a third column at 1000");
+    side(cx, D);
+    let _d = attach(cx, D);
+    let (n, focused) = view.read_with(cx, |v, _| (v.panes.len(), v.panes.focused));
+    assert_eq!((n, focused), (2, order[0]), "the next pane in reading order");
+    assert_eq!(visible(cx).as_deref(), Some(D), "D there");
 }
