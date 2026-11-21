@@ -793,8 +793,8 @@ fn attached_secret(sid: &str, id: u64) -> Value {
 fn a_click_on_the_other_panes_secret_field_keeps_the_keys(cx: &mut TestAppContext) {
     let (window, view, client, mut a, _attaches, events) = on_a_as(cx, "panes-secret", attached_secret(A, 1));
     key(cx, window, "ctrl-\\");
-    // Both armed: the first pane's card waits again when its list is laid
-    // out anew under the split (its column, as the right panel yields).
+    // Both armed: the new pane's card is new and waits its own 500 ms (the
+    // first pane's keeps its arm: `a_split_or_a_yield_leaves_…`).
     feed(cx, window, &view, &events, "the card up in both panes, armed", |v| {
         v.panes.cur.card.as_ref().is_some_and(|c| c.armed()) && v.panes.rest[0].card.as_ref().is_some_and(|c| c.armed())
     });
@@ -812,6 +812,49 @@ fn a_click_on_the_other_panes_secret_field_keeps_the_keys(cx: &mut TestAppContex
     assert!(!sent.iter().any(|c| c == "submit"), "the secret never went out as a message: {sent:?}");
     assert!(view.read_with(cx, |v, cx| v.panes.cur.composer.read(cx).value().is_empty()), "nothing typed into the composer");
     assert_eq!(sent, ["answer"], "the secret went as the prompt's answer");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #44 L8: a split never re-arms the other pane's card, nor does a
+/// yield of a side panel under the split. On screen in the first pane, its
+/// arm stays the one it was shown with through Ctrl+\ as it comes, a
+/// second split once armed, and the window narrowing until the right panel
+/// and the rail yield and widening back: its list is laid out anew in each
+/// new column, and nothing takes it off screen.
+#[gpui_kit::test]
+fn a_split_or_a_yield_leaves_the_other_panes_card_armed(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, events) = on_a_as(cx, "panes-l8", attached_secret(A, 1));
+    feed(cx, window, &view, &events, "the card up", |v| v.panes.cur.card.is_some());
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    let card = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.panes.get(p0).and_then(|p| p.card.as_ref()).map(|c| (c.key, c.arm.shown_at(), c.armed())))
+    };
+    let before = card(cx).expect("the card");
+    let mut yields = std::collections::BTreeSet::new();
+    let mut check = |cx: &mut TestAppContext, what: &str, armed: bool| {
+        for f in 0..40 {
+            frame(cx, window);
+            std::thread::sleep(Duration::from_millis(2));
+            let now = card(cx).expect("the first pane's card");
+            assert_eq!((now.0, now.1), (before.0, before.1), "{what}, frame {f}: the first pane's card waits again");
+            assert!(!armed || now.2, "{what}, frame {f}: armed");
+            let y = view.read_with(cx, |v, _| (v.pane_yield, v.panes.folded));
+            assert!(!y.1, "{what}: never folded (that hides the first pane)");
+            yields.insert(y.0);
+        }
+    };
+    key(cx, window, "ctrl-\\");
+    check(cx, "split as it comes", false);
+    feed(cx, window, &view, &events, "armed", |v| v.panes.get(p0).and_then(|p| p.card.as_ref()).is_some_and(|c| c.armed()));
+    key(cx, window, "ctrl-\\");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 3, "split again");
+    check(cx, "split once armed", true);
+    for w in [1180., 1040., 980., 1280.] {
+        VisualTestContext::from_window(window, cx).simulate_resize(size(px(w), px(800.)));
+        check(cx, &format!("the window {w} wide"), true);
+    }
+    assert!(yields.len() >= 2, "a side panel yielded and came back: {yields:?}");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }

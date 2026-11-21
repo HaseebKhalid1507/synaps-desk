@@ -1901,7 +1901,7 @@ pub struct AppView {
     move_keys: FoldKeys,
     /// The panels the split yielded (rail, right) and its fold, as last
     /// judged ([`AppView::pane_sides`]).
-    pane_yield: Option<(bool, bool, bool)>,
+    pub(crate) pane_yield: Option<(bool, bool, bool)>,
     /// A once-per-press key whose action came and whose key-down has not
     /// yet ([`OnceKey`]).
     once: Option<OnceKey>,
