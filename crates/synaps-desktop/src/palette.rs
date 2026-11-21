@@ -27,7 +27,7 @@ pub(crate) enum Mode {
     Commands,
 }
 
-/// A group head (C3's sub-labels where the font has them).
+/// A group head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Group {
     Sessions,
@@ -39,13 +39,13 @@ pub(crate) enum Group {
 }
 
 impl Group {
-    fn head(self) -> (&'static str, Option<&'static str>) {
+    fn head(self) -> &'static str {
         match self {
-            Group::Sessions => (label::SESSIONS, Some(fonts::JP_SESSIONS)),
-            Group::Workers => (label::WORKERS, Some(fonts::JP_WORKERS)),
-            Group::History => (label::HISTORY, Some(fonts::JP_HISTORY)),
-            Group::Views => (label::VIEWS, Some(fonts::JP_VIEWS)),
-            Group::Commands => (label::COMMANDS, Some(fonts::JP_COMMANDS)),
+            Group::Sessions => label::SESSIONS,
+            Group::Workers => label::WORKERS,
+            Group::History => label::HISTORY,
+            Group::Views => label::VIEWS,
+            Group::Commands => label::COMMANDS,
         }
     }
 }
@@ -1129,15 +1129,13 @@ impl AppView {
         for line in &lines {
             list = list.child(match *line {
                 Line::Head(g) => {
-                    let (head, jp) = g.head();
                     h_flex()
                         .h(px(HEAD_H))
                         .px(px(16.))
                         .pt(px(6.))
                         .items_center()
                         .gap(px(10.))
-                        .child(display(head, size::D_S, p.dim_k))
-                        .when_some(jp, |d, jp| d.child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_k).child(jp)))
+                        .child(display(g.head(), size::D_S, p.dim_k))
                         // How many it holds: more than the box shows says so.
                         .child(mono(counts.iter().find(|c| c.0 == g).map_or(0, |c| c.1).to_string(), size::META, p.dim_k))
                         .into_any_element()

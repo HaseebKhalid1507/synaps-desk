@@ -2108,13 +2108,9 @@ pub(crate) fn mono(text: impl Into<SharedString>, size: f32, color: Hsla) -> Div
     div().font_family(fonts::MONO).text_px(size).text_color(color).whitespace_nowrap().child(text.into())
 }
 
-/// A section header: display caps plus the Japanese sub-label.
-pub(crate) fn section(title: &'static str, jp: &'static str, p: &Palette) -> Div {
-    h_flex()
-        .items_baseline()
-        .gap(px(10.))
-        .child(display(title, fonts::size::D_S, p.header))
-        .child(div().font_family(fonts::JP).text_px(fonts::size::JP).text_color(p.dim_ch).child(jp))
+/// A section header: display caps.
+pub(crate) fn section(title: &'static str, p: &Palette) -> Div {
+    display(title, fonts::size::D_S, p.header)
 }
 
 impl AppView {

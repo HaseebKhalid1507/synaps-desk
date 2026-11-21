@@ -23,7 +23,7 @@ use crate::tabs::Place;
 use crate::theme::{self, Palette};
 
 /// Left inset of the layout before the rail. The mark strip that used to
-/// sit here (connection disc over 荒坂) is gone; the disc is in the top bar.
+/// sit here is gone; the connection disc is in the top bar.
 pub(crate) const MARK: f32 = 0.;
 /// Context-gauge segments (the folded panel's upright gauge: `STRIP_SEGMENTS`).
 const SEGMENTS: usize = 48;
@@ -1464,7 +1464,7 @@ impl AppView {
                     .px(px(22.))
                     .pt(px(24.))
                     .items_baseline()
-                    .child(section(label::SESSIONS, fonts::JP_SESSIONS, p))
+                    .child(section(label::SESSIONS, p))
                     .child(div().flex_1())
                     .when(self.client.is_some(), |d| {
                         d.child(tbtn("new", label::NEW, p.dim_ch, p.ink).on_click(cx.listener(|this, _, _, cx| {
@@ -1668,7 +1668,6 @@ impl AppView {
                         div().absolute().left(px(7.)).top(px(19.)).child(glyph::turn(self.fx.chrome().turn(FAVS_TURN, *open), p.rest_mark)),
                     )
                     .child(display(label::FAVOURITES, size::D_S, p.dim_ch))
-                    .child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_ch).child(fonts::JP_FAVOURITES))
                     .child(div().flex_1())
                     .child(mono(count, size::META, p.dim_ch))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_favs_group(cx)))
@@ -1683,7 +1682,6 @@ impl AppView {
                 .gap(px(9.))
                 .when(ix > 0, |d| d.border_t_1().border_color(p.hair))
                 .child(display(group.label(), size::D_S, p.dim_ch))
-                .child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_ch).child(group.jp()))
                 .child(div().flex_1())
                 .child(mono(count, size::META, p.dim_ch))
                 .into_any_element(),
@@ -2197,7 +2195,7 @@ impl AppView {
             .pb(px(26.))
             .border_b_1()
             .border_color(p.hair)
-            .child(h_flex().items_center().child(section(label::CONTEXT, fonts::JP_CONTEXT, p)).child(div().flex_1()).child(fold(
+            .child(h_flex().items_center().child(section(label::CONTEXT, p)).child(div().flex_1()).child(fold(
                 "right-fold",
                 "›",
                 "Hide context, tokens and files",
@@ -2244,7 +2242,7 @@ impl AppView {
             .pb(px(26.))
             .border_b_1()
             .border_color(p.hair)
-            .child(section(label::TOKENS, fonts::JP_TOKENS, p))
+            .child(section(label::TOKENS, p))
             .child(
                 h_flex()
                     .mt(px(20.))
@@ -2280,16 +2278,13 @@ impl AppView {
             .px(px(24.))
             .pt(px(24.))
             .pb(px(26.))
-            .child(h_flex().items_end().child(section(label::FILES, fonts::JP_FILES, p)).child(div().flex_1()).when(
-                added + removed > 0,
-                |d| {
-                    d.child(h_flex().gap(px(8.)).child(mono(format!("{approx}+{added}"), size::META, p.ok_ch)).child(mono(
-                        format!("−{removed}"),
-                        size::META,
-                        p.err_ch,
-                    )))
-                },
-            ))
+            .child(h_flex().items_end().child(section(label::FILES, p)).child(div().flex_1()).when(added + removed > 0, |d| {
+                d.child(h_flex().gap(px(8.)).child(mono(format!("{approx}+{added}"), size::META, p.ok_ch)).child(mono(
+                    format!("−{removed}"),
+                    size::META,
+                    p.err_ch,
+                )))
+            }))
             // The session's folder (design.md §8.18): the paths under it are
             // relative to it. Cut from the left, so its leaf stays.
             .when_some(self.session_cwd(((width - 48.) / (12. * 0.6)).floor() as usize), |d, (cwd, whole)| {
