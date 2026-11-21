@@ -2215,6 +2215,7 @@ impl AppView {
                 metrics_gen: 0,
                 layout: Layout::of(800., 800., &Metrics::at(theme::DEFAULT_TEXT), Default::default()),
                 layout_naming: false,
+                hang_fx: Default::default(),
                 metrics_last: Cell::new(None),
                 body_line: 0.,
                 column_key: (None, 0, None),
@@ -7294,9 +7295,26 @@ impl Render for AppView {
         // The form from what decides it (not the stub or the tray).
         let ex = crate::fit::Extras { stub: false, tray: 0, ..self.extras() };
         let lay = Layout::of_in(pane, wrap, self.height - crate::chrome::TOP, &m, ex);
-        if (lay.hang, lay.tight) != (self.panes.cur.layout.hang, self.panes.cur.layout.tight) {
+        // The labels hang as the flight's end will, and move with it.
+        let (lay, landed) = self.panes.cur.hang_fx.frame(lay, pane, pane_to, self.panel_fx.moving(), &m);
+        if lay.hang_k > 0. && lay.hang_k < 1. {
+            // On their way, the labels are placed by their widths.
+            for l in [fonts::label::YOU, fonts::label::AGENT, fonts::label::SYNAPS] {
+                self.display_w(l, m.label, window);
+            }
+        }
+        if landed || lay.tight != self.panes.cur.layout.tight {
             self.panes.cur.list.remeasure();
             self.panes.cur.metrics_gen = self.panes.next_gen();
+            // A room held at the end is read again against the list as
+            // measured again, as a card's that lands ([`Slack::fresh`]): the
+            // rows' new heights are not rows growing in under it (else the
+            // remeasure's sums used it up, and the column fell by it as the
+            // flight landed).
+            if let Some(mut s) = self.panes.cur.fold_slack.get().filter(|s| s.gone.is_none() && s.fresh.is_none()) {
+                s.fresh = Some(self.fx.frame());
+                self.panes.cur.fold_slack.set(Some(s));
+            }
         }
         // A new column re-wraps the rows: this frame's scrollbar would read
         // the rows not yet measured at their estimates (it is held as it
