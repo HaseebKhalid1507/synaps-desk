@@ -1624,6 +1624,20 @@ impl Motion {
         self.pane_wants.replace(false)
     }
 
+    /// What this frame has asked for so far (a frame, a timer), to take
+    /// back what a step asked after it ([`Motion::ask_back`]).
+    pub(crate) fn asks(&self) -> (bool, bool, Option<Instant>) {
+        (self.display.get(), self.pane_wants.get(), self.next.get())
+    }
+
+    /// The asks as [`Motion::asks`] read them: a spring landed by its
+    /// caller asks for no frame and no timer of its own.
+    pub(crate) fn ask_back(&self, (display, pane, next): (bool, bool, Option<Instant>)) {
+        self.display.set(display);
+        self.pane_wants.set(pane);
+        self.next.set(next);
+    }
+
     /// A change due at `at` (a timer, unless a frame comes first).
     pub(crate) fn want_at(&self, at: Instant) {
         if self.on() && self.next.get().is_none_or(|n| at < n) {

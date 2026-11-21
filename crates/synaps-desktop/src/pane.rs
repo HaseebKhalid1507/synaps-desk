@@ -1732,6 +1732,8 @@ pub(crate) fn shape(n: usize) -> Vec<(Option<usize>, Option<crate::split::Side>)
 /// (its pane closes) and on (a pane splits off), Open to the side, the
 /// palette's Equalise, then Join all panes. `three[:fold=<w>x<h>]`: three
 /// panes across (the panels yield), then the window narrowed to fold.
+/// `filmarrive` (#47's landing): the rail folds and unfolds in one pane,
+/// then a split, and it folds and unfolds again.
 pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, window: &mut Window, cx: &mut App) {
     use crate::app::AppView;
     use crate::split::Side;
@@ -1759,6 +1761,23 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
             if how == "film3b2" {
                 sleep(5.0).await;
                 film3b2(&view, cx, &ex, t0).await;
+                return;
+            }
+            if how == "filmarrive" {
+                sleep(5.0).await;
+                for panes in ["1p", "2p"] {
+                    if panes == "2p" {
+                        mark("split");
+                        act(cx, &|v, w, cx| v.split_pane(None, w, cx));
+                        sleep(2.0).await;
+                    }
+                    for what in ["fold", "unfold"] {
+                        mark(&format!("{panes}-rail-{what}"));
+                        act(cx, &|v, _, cx| v.toggle_panel(true, cx));
+                        sleep(1.5).await;
+                    }
+                }
+                mark("done");
                 return;
             }
             // Three across (the panels yield to their strips), then the

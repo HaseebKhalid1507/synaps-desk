@@ -1833,7 +1833,9 @@ fn idle_requests_no_frames(cx: &mut TestAppContext) {
 /// never fight. Folding and unfolding the rail on `sheet` asks for the
 /// same display frames at the same widths whether its sessions run (their
 /// lattices on the beat layer, clipped with the flight's box) or rest: the
-/// beat adds no frame to the spring. Folded, the strip draws no lattice:
+/// beat adds no frame to the spring (#47: the panel lands in the frame it
+/// arrives at its width; running, the unfold can arrive a frame sooner,
+/// never later). Folded, the strip draws no lattice:
 /// nothing on the layer, no frame, no timer, though the sessions still run.
 /// Unfolded, their lattices are back on the beat.
 #[gpui_kit::test]
@@ -1892,11 +1894,24 @@ fn the_rails_lattices_and_its_fold_never_fight(cx: &mut TestAppContext) {
     assert!(view.read_with(cx, |v, _| v.fx.on_beats(at, 1)), "the timer is the beat's");
     busy(cx, false);
     assert_eq!(spins(cx), 0, "at rest");
+    // #47: the unfold landed in a frame stamped with a wake ahead of the
+    // test's clock, and `settle` doesn't move the clock; the late landing's
+    // settling frames moved it past. At rest a while: the fold starts on the
+    // clock, as the running one did.
+    wait(cx, w, &view, 500);
     let rest_fold = fly(cx);
     settle(cx, w, 8);
     let rest_unfold = fly(cx);
     assert_eq!(busy_fold, rest_fold, "the fold: the same frames, running or not");
-    assert_eq!(busy_unfold, rest_unfold, "the unfold: the same frames, running or not");
+    // #47: the panel lands in the frame it arrives at its width. Running, a
+    // beat's wake can fall on the spring's (one wake, the later one:
+    // `Motion::arm`), and the frame it draws is stamped with it
+    // (`Motion::tick`): the unfold can arrive a frame sooner. The beat adds
+    // no frame: running, the same frames as at rest, up to the arrival.
+    assert!(
+        rest_unfold.starts_with(&busy_unfold) && rest_unfold.len() - busy_unfold.len() <= 1,
+        "the unfold: the same frames, running or not (none added): {busy_unfold:?} {rest_unfold:?}"
+    );
 }
 
 /// Nothing runs in the column, the composer or the tray (Shady #17 M3,
