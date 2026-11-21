@@ -1216,8 +1216,9 @@ pub(crate) fn needs(k: Option<f32>, mark: Hsla, ground: Hsla) -> AnyElement {
 
 /// The window's Needs you's ping (S3): the tab strip's attention and the
 /// tray's stub ping once, together, when a prompt comes in while watched.
+/// One record for both, the window chrome's ([`crate::motion::Motion::chrome`]).
 pub(crate) fn needs_ping(fx: &crate::motion::Motion, on: bool) -> Option<f32> {
-    let since = fx.change(crate::motion::Tag::Waiting, u64::MAX, u64::from(on), None).filter(|w| on && w.1 == 0).map(|w| w.0);
+    let since = fx.chrome().change(crate::motion::Tag::Waiting, u64::MAX, u64::from(on), None).filter(|w| on && w.1 == 0).map(|w| w.0);
     fx.ping(since, std::time::Duration::ZERO)
 }
 

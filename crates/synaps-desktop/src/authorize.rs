@@ -32,7 +32,8 @@ use synaps_client::transcript::{Item, ToolStatus};
 use crate::app::{ARM, AppView, Arm, authorize_ready, hidden, lines_below, mono};
 use crate::fonts;
 use crate::fonts::TextPx as _;
-use crate::model::{CONFIRM_NO, Model};
+use crate::live::Live;
+use crate::model::CONFIRM_NO;
 use crate::theme::{Metrics, Palette};
 use crate::turns::{Disp, Kind};
 
@@ -120,13 +121,13 @@ pub(crate) struct PromptCard {
 }
 
 impl PromptCard {
-    /// Keep `card` with the prompt on top of `m` ([`Model::card_key`]): the
+    /// Keep `card` with the prompt on top of `m` ([`Live::card_key`]): the
     /// same key keeps its arm and read state; a new prompt, the same id in
     /// another attachment or after a reconnect (a restarted daemon numbers
     /// its prompts from 1 again) starts over, unarmed and unread, at `now`.
     /// True when the card is new. `view`: what is on screen of the list,
     /// top and bottom (the window before it is laid out).
-    pub(crate) fn sync(card: &mut Option<PromptCard>, m: &Model, now: Instant, view: (f32, f32)) -> bool {
+    pub(crate) fn sync(card: &mut Option<PromptCard>, m: &Live, now: Instant, view: (f32, f32)) -> bool {
         match (m.card_key(), card.as_mut()) {
             (Some(k), Some(c)) if c.key == k => {
                 if c.below(view).is_some_and(|b| b <= 1.) {
@@ -475,11 +476,11 @@ impl AppView {
     /// worker's view.
     pub(crate) fn prompt_rows(&self) -> Vec<PromptRow> {
         let mut out = Vec::new();
-        if self.model.watch.focus().is_some() {
+        if self.model.lives[self.panes.cur.live].watch.focus().is_some() {
             return out;
         }
-        let Some(sid) = self.model.active.as_ref().map(|a| a.session_id.as_str()) else { return out };
-        let items = self.model.shown().items();
+        let Some(sid) = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.as_str()) else { return out };
+        let items = self.model.lives[self.panes.cur.live].shown().items();
         if items.is_empty() {
             return out;
         }
@@ -558,15 +559,15 @@ impl AppView {
     /// at Full; at once when not, and at Reduced and Off), from a worker's view back to the session first,
     /// and the keys to it (a secret's to its field).
     pub(crate) fn jump_to_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.model.transcript.pending_prompts().is_empty() {
+        if self.model.lives[self.panes.cur.live].transcript.pending_prompts().is_empty() {
             return;
         }
         if self.model.tabs.view().is_some() {
             return;
         }
-        if self.model.watch.focus().is_some() {
+        if self.model.lives[self.panes.cur.live].watch.focus().is_some() {
             self.open_parent_card(cx);
-            self.panes.cur.jump_card = self.model.card_key();
+            self.panes.cur.jump_card = self.model.lives[self.panes.cur.live].card_key();
             cx.notify();
             return;
         }
@@ -582,8 +583,8 @@ impl AppView {
         // above the dock as it will be once it lands (polish.md P13): the
         // stub leaves now (it pointed here), its room is the view's.
         let top = top + self.sticky_inset(cx);
-        let leaves = if self.stub_shown() && self.model.watch.focus().is_none() {
-            self.panes.cur.stub_away = self.model.card_key();
+        let leaves = if self.stub_shown() && self.model.lives[self.panes.cur.live].watch.focus().is_none() {
+            self.panes.cur.stub_away = self.model.lives[self.panes.cur.live].card_key();
             crate::fit::STUB_GAP + crate::theme::metrics(cx).row
         } else {
             0.
@@ -621,7 +622,7 @@ impl AppView {
                 self.panes.cur.list.scroll_to_reveal_item(ix);
                 // Drawn next frame: placed again then, the dock as it lands.
                 if self.dock_growth() > 0.5 {
-                    self.panes.cur.jump_card = self.model.card_key();
+                    self.panes.cur.jump_card = self.model.lives[self.panes.cur.live].card_key();
                 }
             }
         }
@@ -640,7 +641,8 @@ impl AppView {
     /// motion).
     pub(crate) fn toggle_allow_all(&mut self, cx: &mut Context<Self>) {
         let offered = self.allow_all_offered();
-        let may = self.card_answerable().is_some() && self.panes.cur.card.as_ref().is_some_and(|c| !self.model.prompt_answered(c.key.1));
+        let may = self.card_answerable().is_some()
+            && self.panes.cur.card.as_ref().is_some_and(|c| !self.model.lives[self.panes.cur.live].prompt_answered(c.key.1));
         if let Some(c) = self.panes.cur.card.as_mut().filter(|_| offered && may) {
             c.allow_all = !c.allow_all;
             c.arm = Arm::new(Instant::now());
@@ -654,7 +656,7 @@ impl AppView {
     /// and this client owns the session's input (the daemon refuses
     /// `"always"` from anyone else: `actor.rs confirm_answer_refusal`).
     pub(crate) fn allow_all_offered(&self) -> bool {
-        let owner = self.model.active.as_ref().is_some_and(|a| a.owner == Some(a.client));
+        let owner = self.model.lives[self.panes.cur.live].active.as_ref().is_some_and(|a| a.owner == Some(a.client));
         owner && self.current_card().is_some_and(|c| c.pr.allow_all().is_some())
     }
 
@@ -669,7 +671,7 @@ impl AppView {
         running: bool,
         p: &Palette,
     ) -> Option<AnyElement> {
-        if self.model.watch.focus().is_some() {
+        if self.model.lives[self.panes.cur.live].watch.focus().is_some() {
             return None;
         }
         let r = self.row_receipt(call)?;
@@ -693,7 +695,7 @@ impl AppView {
     /// meta, if any.
     pub(crate) fn row_receipt(&self, call: Option<&str>) -> Option<&Receipt> {
         let call = call?;
-        let sid = self.model.active.as_ref()?.session_id.as_str();
+        let sid = self.model.lives[self.panes.cur.live].active.as_ref()?.session_id.as_str();
         self.receipts.get(sid)?.iter().rev().find(|r| !r.own && r.call == call)
     }
 
@@ -751,7 +753,7 @@ impl AppView {
                 crate::motion::Grow { key: d.id, shown, sink: e.sink.clone(), travel: 0., strength: e.strength(self.fx.now()), floor: 0. };
             return crate::motion::grow_block(body, None, None, g);
         }
-        let sid = self.model.active.as_ref().map(|a| a.session_id.as_str()).unwrap_or_default();
+        let sid = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.as_str()).unwrap_or_default();
         let Some(rc) = self.receipts.get(sid).and_then(|v| v.iter().find(|x| x.row == d.id)) else { return div().into_any_element() };
         let kind = if rc.secret { "secret" } else { "confirm" };
         h_flex()
@@ -775,13 +777,13 @@ impl AppView {
         let live = look.is_none();
         let pr = &c.pr;
         let secret = c.secret;
-        let sent = live && self.model.prompt_answered(pr.id);
+        let sent = live && self.model.lives[self.panes.cur.live].prompt_answered(pr.id);
         let armed = live && c.armed();
         let keys_state = if live { self.panes.cur.card_keys.get() } else { None };
-        let can = look.map_or_else(|| self.drives() && self.model.may_answer(pr.id) && armed, |l| l.can);
+        let can = look.map_or_else(|| self.drives() && self.model.lives[self.panes.cur.live].may_answer(pr.id) && armed, |l| l.can);
         let below = c.below(self.list_view());
         let ready = look.map_or_else(|| authorize_ready(c.armed(), below, c.read), |l| l.ready);
-        let detached = self.model.active.is_none();
+        let detached = self.model.lives[self.panes.cur.live].active.is_none();
         let in_field = look.map_or(keys_state == Some(true), |l| l.in_field);
         let keys = look.map_or_else(|| keys_state.is_some() && can && c.keys_armed(), |l| l.keys);
         let typed = look.map_or_else(|| secret && !self.panes.cur.secret_input.read(cx).value().is_empty(), |l| l.typed);
@@ -924,7 +926,7 @@ impl AppView {
             // A held read gate keeps them dark.
             let charge = Some(c)
                 .filter(|c| {
-                    let may = self.drives() && self.model.may_answer(pr.id);
+                    let may = self.drives() && self.model.lives[self.panes.cur.live].may_answer(pr.id);
                     live && may && !yes && self.fx.level() == crate::motion::Level::Full && !(below.is_some_and(|b| b > 1.) && !c.read)
                 })
                 .map(|c| {
@@ -971,7 +973,7 @@ impl AppView {
             )
         };
         let more = below.filter(|&b| b > 1.).map(|b| lines_below(b, m.code_line)).filter(|_| !c.read);
-        let prompts = self.model.transcript.pending_prompts();
+        let prompts = self.model.lives[self.panes.cur.live].transcript.pending_prompts();
         let footer: Option<SharedString> = if let Some(l) = look {
             l.footer.clone()
         } else if detached && self.opening() {
@@ -980,7 +982,7 @@ impl AppView {
             Some("detached: cannot answer".into())
         } else if sent {
             Some("answer sent, waiting for the daemon".into())
-        } else if self.model.switching() {
+        } else if self.model.lives[self.panes.cur.live].switching() {
             Some("switching sessions…".into())
         } else if !self.drives() {
             Some(if self.client.is_none() { "offline: nothing to answer" } else { "read-only here" }.into())

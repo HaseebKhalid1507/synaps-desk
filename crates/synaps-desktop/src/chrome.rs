@@ -727,7 +727,7 @@ impl AppView {
         let jump_to = self.model.jump_target().map(str::to_string);
         let what: Option<SharedString> = first.map(|s| {
             if self.model.is_active(&s.id)
-                && let Some(pr) = self.model.transcript.pending_prompts().first()
+                && let Some(pr) = self.model.lives[self.panes.cur.live].transcript.pending_prompts().first()
             {
                 // Built once per prompt, with the card (`sync_card` ran first).
                 self.current_card().map(|c| c.gist.clone()).unwrap_or_else(|| prompt_gist(&pr.title, &pr.prompt).into())
@@ -747,7 +747,7 @@ impl AppView {
             // handover, not a disconnect. The words say so, a session
             // attached or not.
             _ if self.model.reload => (dots("reloading"), p.dim_ch),
-            _ if self.model.reattaching => (dots("reattaching"), p.dim_ch),
+            _ if self.model.lives[self.panes.cur.live].reattaching => (dots("reattaching"), p.dim_ch),
             ConnState::Connected(v) => {
                 let words: SharedString = format!("connected · {v}").into();
                 self.conn_held.set(words.chars().count());
@@ -765,7 +765,7 @@ impl AppView {
         // centred between, never moves (re-gate r3, Shady #15 M1). Cut, the
         // whole of them is the cell's tooltip.
         let held = self.conn_held.get();
-        let hold = held > 0 && (self.model.reattaching || !matches!(self.model.conn, ConnState::Connected(_)));
+        let hold = held > 0 && (self.model.lives[self.panes.cur.live].reattaching || !matches!(self.model.conn, ConnState::Connected(_)));
         let whole: Option<SharedString> = (hold && conn.chars().count() > held).then(|| match &self.model.conn {
             ConnState::Off(e) | ConnState::Incompatible(e) => e.clone().into(),
             _ => conn.clone(),
@@ -773,7 +773,7 @@ impl AppView {
         let conn: SharedString = if hold { hold_width(&conn, held).into() } else { conn };
         // As in the mock: subagents running, here the attached session's,
         // as its blocks and its rail row say (they change together).
-        let subagents = self.model.active_workers();
+        let subagents = self.model.active_workers(self.panes.cur.live);
         let what = what.filter(|w| !w.is_empty());
         let input = crate::fit::TopIn {
             width: self.width,
@@ -821,7 +821,7 @@ impl AppView {
             .child({
                 let c = self.fx.glow(GLOW | 0xFFFF, n as u64, if on { p.warn_ch } else { p.dim_ch });
                 let text = format!("{n}   {}", label::NEED_YOU).into();
-                crate::motion::roll_count(&self.fx, crate::motion::ROLL_NEEDS, n, text, |t| display(t, size::D_S, c).flex_none())
+                crate::motion::roll_count(self.fx.chrome(), crate::motion::ROLL_NEEDS, n, text, |t| display(t, size::D_S, c).flex_none())
             })
             .when_some(first.filter(|_| fit.label > 0.), |d, s| d.child(cut(mono(s.label(), size::META, p.ink), fit.label)))
             .when_some(what.filter(|_| fit.gist > 0.), |d, w| d.child(cut(mono(w, size::META, p.dim_ch), fit.gist)))
@@ -843,7 +843,9 @@ impl AppView {
         #[cfg(test)]
         let ticker = ticker.when_some(self.roll_probe, |d, n| {
             let text = format!("{n} tool{}", if n == 1 { "" } else { "s" }).into();
-            d.child(crate::motion::roll_count(&self.fx, crate::motion::ROLL_PROBE, n, text, |t| mono(t, size::META, p.dim_ch).flex_none()))
+            d.child(crate::motion::roll_count(self.fx.chrome(), crate::motion::ROLL_PROBE, n, text, |t| {
+                mono(t, size::META, p.dim_ch).flex_none()
+            }))
         });
         h_flex()
             .h(px(top_h(self.panes.cur.layout.short)))
@@ -1295,11 +1297,11 @@ impl AppView {
         // L2: detached, the last numbers seen are in the dim roles, as the
         // open panel's are; so are a cached tab's while its attach is on
         // its way.
-        let detached = self.model.stats.detached && self.model.active.is_none();
+        let detached = self.model.lives[self.panes.cur.live].stats.detached && self.model.lives[self.panes.cur.live].active.is_none();
         let dim = detached || self.opening();
         let faded = p.faded();
         let q = if dim { &faded } else { p };
-        let ratio = self.model.stats.context_ratio();
+        let ratio = self.model.lives[self.panes.cur.live].stats.context_ratio();
         let bar = self.gauge_bar(METER | 8, ratio, q);
         let filled = ratio.map(|r| ((r * STRIP_SEGMENTS as f64).round() as usize).min(STRIP_SEGMENTS)).unwrap_or(0);
         let mut gauge = v_flex().w(px(6.)).gap(px(2.));
@@ -1396,7 +1398,9 @@ impl AppView {
                             Chip::Unread => p.unread_ch,
                         };
                         let key = crate::motion::key(crate::motion::ROLL_RAIL, c as u64);
-                        crate::motion::roll_count(&self.fx, key, count, chip_count(count).into(), move |t| mono(t, size::META, color))
+                        crate::motion::roll_count(self.fx.chrome(), key, count, chip_count(count).into(), move |t| {
+                            mono(t, size::META, color)
+                        })
                     })
                     .tooltip(move |window, cx| crate::overlay::tip(tip, window, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1635,7 +1639,9 @@ impl AppView {
                         self.lit(d, crate::motion::key(RAIL_TOUCH, crate::app::tkey("favs-head", 0)), (p.chrome, p.raised, p.press_ch), cx)
                     })
                     // It turns as the section folds (fluid.md §3.7).
-                    .child(div().absolute().left(px(7.)).top(px(19.)).child(glyph::turn(self.fx.turn(FAVS_TURN, *open), p.rest_mark)))
+                    .child(
+                        div().absolute().left(px(7.)).top(px(19.)).child(glyph::turn(self.fx.chrome().turn(FAVS_TURN, *open), p.rest_mark)),
+                    )
                     .child(display(label::FAVOURITES, size::D_S, p.dim_ch))
                     .child(div().font_family(fonts::JP).text_px(size::JP).text_color(p.dim_ch).child(fonts::JP_FAVOURITES))
                     .child(div().flex_1())
@@ -1741,8 +1747,12 @@ impl AppView {
         let in_tab = !shown && meta.is_some_and(|s| self.model.tabs.holds(&s.id));
         // The attached session's cost as the panel shows it (its digests
         // run ahead of the 3 s poll), else the poll's.
-        let cost = meta.map(|s| if on { self.model.stats.cost.unwrap_or(s.cost_usd) } else { s.cost_usd }).filter(|c| *c > 0.0);
-        let waiting = meta.map(|s| if on { self.model.transcript.pending_prompts().len() } else { s.awaiting_input }).unwrap_or(0);
+        let cost = meta
+            .map(|s| if on { self.model.lives[self.panes.cur.live].stats.cost.unwrap_or(s.cost_usd) } else { s.cost_usd })
+            .filter(|c| *c > 0.0);
+        let waiting = meta
+            .map(|s| if on { self.model.lives[self.panes.cur.live].transcript.pending_prompts().len() } else { s.awaiting_input })
+            .unwrap_or(0);
         let workers = if st == State::Workers { meta.map_or(0, |s| self.model.workers(s)) } else { 0 };
         let gone = row.gone && meta.is_none();
         let title_color = match st {
@@ -1760,7 +1770,7 @@ impl AppView {
         let lit = !(self.rail_fx.moving && self.rail_fx.sel == Some(key));
         // NEEDS YOU's bar draws top to bottom over `base` (motion.md §6.3).
         let needs = st == State::NeedsYou;
-        let since = fx.change(crate::motion::Tag::RowNeeds, key, needs as u64, None).filter(|_| needs).map(|c| c.0);
+        let since = self.fx.chrome().change(crate::motion::Tag::RowNeeds, key, needs as u64, None).filter(|_| needs).map(|c| c.0);
         let bar = if needs {
             Some((p.warn_mark_ch, fx.draw(since, std::time::Duration::ZERO, crate::motion::BASE)))
         } else if shown && lit {
@@ -2026,7 +2036,7 @@ impl AppView {
         // moves the row into FAVOURITES, and the acknowledgement lands on a
         // still row. On device pixels, hop and sparks (Shady #17).
         let fx = &self.fx;
-        let since = fx.change(crate::motion::Tag::Star, key, u64::from(fav), None).filter(|c| fav && c.1 == 0).map(|c| c.0);
+        let since = self.fx.chrome().change(crate::motion::Tag::Star, key, u64::from(fav), None).filter(|c| fav && c.1 == 0).map(|c| c.0);
         let since = match since {
             Some(at) => self.star_landed(key, at),
             None => {
@@ -2131,11 +2141,11 @@ impl AppView {
     }
 
     pub(crate) fn render_right(&self, width: f32, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
-        let s = &self.model.stats;
+        let s = &self.model.lives[self.panes.cur.live].stats;
         // Detached: the last numbers seen, in the dim roles and labelled,
         // not live. A cached tab whose attach is on its way: the same, as
         // last seen.
-        let detached = s.detached && self.model.active.is_none();
+        let detached = s.detached && self.model.lives[self.panes.cur.live].active.is_none();
         let cached = !detached && self.opening();
         let (frame, faded) = (p, p.faded());
         let p = if detached || cached { &faded } else { p };
@@ -2270,7 +2280,7 @@ impl AppView {
             // Over a worker's view: still the session's thread's, not the
             // worker's on screen.
             .child(
-                match self.model.watch.focused() {
+                match self.model.lives[self.panes.cur.live].watch.focused() {
                     Some(w) => mono(w.files_note.clone(), 12., p.dim_ch),
                     None => mono("as the model asked: tool inputs, not the disk", 12., p.dim_ch),
                 }
@@ -2618,7 +2628,7 @@ mod tests {
         else {
             panic!()
         };
-        m.want(1);
+        m.want(crate::live::LiveId::FIRST, 1);
         m.apply(Event::Attached { attach_seq: 1, attached, mode: synaps_client::AttachMode::Mirror, reconnect: false });
         m.sync_favs();
         let view = rail::View { favs_closed: true, ..Default::default() };

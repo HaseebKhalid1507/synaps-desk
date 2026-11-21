@@ -267,7 +267,7 @@ impl AppView {
     /// The tray's rows, rebuilt if a worker changed; the timer that drops
     /// a finished worker's row at the end of its flash.
     pub(crate) fn sync_tray(&mut self, cx: &mut Context<Self>) {
-        let attached = self.model.active.is_some();
+        let attached = self.model.lives[self.panes.cur.live].active.is_some();
         let now = Instant::now();
         // Arrivals and fades on the motion clock, as every motion reads it
         // (tests: the test's own).
@@ -278,38 +278,39 @@ impl AppView {
         let on = self.fx.on();
         self.tray.ghosts.retain(|g| on && fx_now.saturating_duration_since(g.2) < gone);
         // Cancels the rows now say are cancelling (or ended) are done.
-        if let Some(s) = self.model.active.as_ref().map(|a| a.session_id.as_str()) {
-            let subs = &self.model.stats.subagents;
+        let l = &mut self.model.lives[self.panes.cur.live];
+        if let Some(s) = l.active.as_ref().map(|a| a.session_id.as_str()) {
+            let subs = &l.stats.subagents;
             let said = |h: &str| {
                 let id = h.strip_prefix("sa_").and_then(|n| n.parse().ok());
                 id.and_then(|id| subs.status(id)).is_some_and(|st| st == Status::Cancelling || st.terminal())
             };
-            self.model.cancels.settle(s, said, now);
+            l.cancels.settle(s, said, now);
         }
         let key = (
-            self.model.stats.subagents.revision(),
-            self.model.watch.focused().map(|w| w.subagent_id),
+            self.model.lives[self.panes.cur.live].stats.subagents.revision(),
+            self.model.lives[self.panes.cur.live].watch.focused().map(|w| w.subagent_id),
             attached,
-            self.model.cancels.generation,
+            self.model.lives[self.panes.cur.live].cancels.generation,
             // A worker tab closed: its view and list go now.
             self.model.tabs.generation,
         );
         if self.tray.key == Some(key) && self.tray.until.is_none_or(|u| fx_now < u) {
             return;
         }
-        let live = if attached { self.model.stats.subagents.live() } else { Vec::new() };
+        let live = if attached { self.model.lives[self.panes.cur.live].stats.subagents.live() } else { Vec::new() };
         // A view nobody looks at (on screen, or held by a worker tab) whose
         // worker ended goes (and leaves the walk), as do the views of the
         // worker tabs past the most recently shown few, and their lists.
-        let held = self.model.held_views();
-        self.model.watch.hold(held);
+        let held = self.model.held_views(self.panes.cur.live);
+        self.model.lives[self.panes.cur.live].watch.hold(held);
         // A finished worker's flash on the motion clock too (tests: the
         // test's own, never a slow runner's wall time).
-        self.model.watch.prune(fx_now, &live);
+        self.model.lives[self.panes.cur.live].watch.prune(fx_now, &live);
         self.drop_released_panes();
-        let (rows, until) = self.model.watch.tray(live, fx_now);
-        let cancels = &self.model.cancels;
-        let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
+        let (rows, until) = self.model.lives[self.panes.cur.live].watch.tray(live, fx_now);
+        let cancels = &self.model.lives[self.panes.cur.live].cancels;
+        let session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.as_str());
         let pending = |id: u64| session.is_some_and(|s| cancels.pending(s, &format!("sa_{id}")));
         let mut rows: Vec<TrayRow> = rows
             .into_iter()
@@ -318,7 +319,7 @@ impl AppView {
                 TrayRow::of(l, p)
             })
             .collect();
-        let watched = self.model.watch.focused().map(|w| w.subagent_id);
+        let watched = self.model.lives[self.panes.cur.live].watch.focused().map(|w| w.subagent_id);
         // The watched one goes up only if it would be folded into `+N
         // more`: a chip clicked where it is drawn stays under the pointer
         // (Shady #16 r4).
@@ -328,7 +329,7 @@ impl AppView {
             rows.sort_by_key(|r| need(r, watched));
         }
         // Rows that came while watched draw in (staggered); rows that left fade out.
-        let session = self.model.active.as_ref().map(|a| a.session_id.clone());
+        let session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone());
         let mut ghosts = std::mem::take(&mut self.tray.ghosts);
         if self.fx.on() && session.is_some() && session == self.tray.session {
             let fresh = rows.iter().filter(|r| !self.tray.rows.iter().any(|o| o.id == r.id));
@@ -366,9 +367,9 @@ impl AppView {
 
     /// Open `who`'s view in place (a tray row's click).
     pub(crate) fn watch_worker(&mut self, who: &Who, cx: &mut Context<Self>) {
-        let cwd = self.model.cwd().map(str::to_string);
+        let cwd = self.model.lives[self.panes.cur.live].cwd().map(str::to_string);
         let c = Candidate::of(who.id, &who.name).with_call(who.call.as_deref());
-        self.model.watch.open(&c, cwd.as_deref(), Instant::now());
+        self.model.lives[self.panes.cur.live].watch.open(&c, cwd.as_deref(), Instant::now());
         self.watch_opened();
         cx.notify();
     }
@@ -545,10 +546,10 @@ impl AppView {
         }
         let lay = self.panes.cur.layout;
         let cramped = lay.form() == crate::fit::Form::Cramped;
-        let watched = self.model.watch.focused().map(|w| w.subagent_id);
+        let watched = self.model.lives[self.panes.cur.live].watch.focused().map(|w| w.subagent_id);
         let row_h = crate::fit::tray_row(m);
         let now = Instant::now();
-        let session = self.model.active.as_ref().map(|a| a.session_id.as_str());
+        let session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.as_str());
         let fx = &self.fx;
         // The watched chip's bar draws when its view opens here, and lights
         // after the composer's when you steer it (Handoff out).
@@ -576,7 +577,8 @@ impl AppView {
                 }
                 Slot::Row(i) => {
                     let Some(r) = self.tray.rows.get(i) else { continue };
-                    let armed = session.is_some_and(|s| self.model.cancels.armed(s, r.id, (r.call.as_deref(), &r.name), now));
+                    let armed = session
+                        .is_some_and(|s| self.model.lives[self.panes.cur.live].cancels.armed(s, r.id, (r.call.as_deref(), &r.name), now));
                     let is_watched = watched == Some(r.id);
                     // Its bar: yours when watched, else the workers' rule,
                     // drawn top down when it came.
@@ -633,9 +635,13 @@ impl AppView {
                 .cursor_pointer()
                 .hover(|d| d.bg(p.tool_out))
                 // It rolls as workers come and go (polish.md P5).
-                .child(motion::roll_count(&self.fx, motion::ROLL_MORE, chips.more, format!("+{} more", chips.more).into(), |t| {
-                    mono(t, m.meta, p.dim_t)
-                }))
+                .child(motion::roll_count(
+                    self.fx.col(self.panes.cur.id),
+                    motion::ROLL_MORE,
+                    chips.more,
+                    format!("+{} more", chips.more).into(),
+                    |t| mono(t, m.meta, p.dim_t),
+                ))
                 // Its menu open: the menu says it (no tooltip over it).
                 .when(self.wmenu.is_none(), |d| d.tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)))
                 .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| this.open_workers_menu(ev.position(), window, cx)));
@@ -796,10 +802,13 @@ impl AppView {
         }
         let lay = self.panes.cur.layout;
         // What waits: the card's gist (made once), as the top bar says it.
-        let gist = self
-            .current_card()
-            .map(|c| c.gist.clone())
-            .or_else(|| self.model.transcript.pending_prompts().first().map(|q| crate::chrome::prompt_gist(&q.title, &q.prompt).into()));
+        let gist = self.current_card().map(|c| c.gist.clone()).or_else(|| {
+            self.model.lives[self.panes.cur.live]
+                .transcript
+                .pending_prompts()
+                .first()
+                .map(|q| crate::chrome::prompt_gist(&q.title, &q.prompt).into())
+        });
         let (word, mark) = glyph::ink(glyph::Family::Warn, Ground::Card, p);
         let row = h_flex()
             .id("needs-stub")
@@ -844,9 +853,9 @@ impl AppView {
     /// worker's view is, or its row is scrolled away.
     pub(crate) fn stub_shown(&self) -> bool {
         self.model.tabs.view().is_none()
-            && !self.model.transcript.pending_prompts().is_empty()
-            && (self.model.watch.focus().is_some() || !self.card_on_screen())
-            && (self.panes.cur.stub_away.is_none() || self.panes.cur.stub_away != self.model.card_key())
+            && !self.model.lives[self.panes.cur.live].transcript.pending_prompts().is_empty()
+            && (self.model.lives[self.panes.cur.live].watch.focus().is_some() || !self.card_on_screen())
+            && (self.panes.cur.stub_away.is_none() || self.panes.cur.stub_away != self.model.lives[self.panes.cur.live].card_key())
     }
 }
 

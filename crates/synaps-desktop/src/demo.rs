@@ -657,8 +657,8 @@ mod tests {
     #[test]
     fn the_demo_goes_through_the_model() {
         let mut m = Model::new(ConnState::Off("offline".into()));
-        m.attaching(1, None, false);
-        m.asked_for(SID);
+        m.attaching(crate::live::LiveId::FIRST, 1, None, false);
+        m.asked_for(crate::live::LiveId::FIRST, SID);
         for ev in events().into_iter().chain(attach(SID, 1)) {
             m.apply(ev);
         }
@@ -696,8 +696,8 @@ mod tests {
         for (k, s) in sessions(now, true).iter().enumerate() {
             let mut m = Model::new(ConnState::Off("offline".into()));
             let seq = k as u64 + 1;
-            m.attaching(seq, None, false);
-            m.asked_for(&s.id);
+            m.attaching(crate::live::LiveId::FIRST, seq, None, false);
+            m.asked_for(crate::live::LiveId::FIRST, &s.id);
             let evs = attach(&s.id, seq);
             assert!(!evs.is_empty(), "{} not answered", s.id);
             for ev in evs {
@@ -712,8 +712,8 @@ mod tests {
         // failed call, each with an edit, the last with ten tools; the
         // rail's count is its history's.
         let mut m = Model::new(ConnState::Off("offline".into()));
-        m.attaching(1, None, false);
-        m.asked_for(IDLE_CPU);
+        m.attaching(crate::live::LiveId::FIRST, 1, None, false);
+        m.asked_for(crate::live::LiveId::FIRST, IDLE_CPU);
         for ev in attach(IDLE_CPU, 1) {
             m.apply(ev);
         }

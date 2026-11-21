@@ -14,7 +14,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use synaps_client::transcript::{Item, ItemKind, ToolStatus};
+use synaps_client::transcript::{Item, ItemKind, Splice, ToolStatus};
 use synaps_client::{AttachMode, Client, CreateOptions, Cwd, Event, RequestError, Transcript};
 
 use crate::bench::BenchState;
@@ -180,6 +180,8 @@ pub(crate) struct Column {
     rows_session: Option<String>,
     scroll_carry: Option<(f32, ListOffset)>,
     metrics_gen: u64,
+    /// Its transcript's changes it has not synced ([`Pane::pending`]).
+    pending: Option<Splice>,
 }
 
 impl TabCache {
@@ -1637,7 +1639,7 @@ pub struct AppView {
     /// the answer pressed while it waits for the daemon).
     pub(crate) slow_daemon: bool,
     pub(crate) synthetic_tx: Option<async_channel::Sender<Event>>,
-    synthetic_seq: u64,
+    pub(crate) synthetic_seq: u64,
     /// The last `catalog_page` req the synthetic transport answered.
     synthetic_req: u64,
     /// `--session ID`: open it once the first session list lands.
@@ -1788,7 +1790,6 @@ pub struct AppView {
     /// The palette box's top, its tallest bottom, its left and width as last drawn.
     #[cfg(test)]
     pub(crate) palette_box: Cell<(f32, f32, f32, f32)>,
-    pub(crate) cancel_tick: Option<Task<()>>,
     /// A session's menu (a right-click on its tab or rail row): Rename…,
     /// Close tab.
     pub(crate) smenu: Option<(crate::menu::Menu<SessionAct>, SessionTarget)>,
@@ -1946,24 +1947,25 @@ impl AppView {
         let secret_input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("answer (hidden)"));
         let settings_find = cx.new(|cx| InputState::new(window, cx).placeholder("find a setting"));
         let settings_input = cx.new(|cx| InputState::new(window, cx));
+        // The composer's own: it goes with its pane (Shady #30 L4).
+        let composer_sub = cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| match ev {
+            InputEvent::PressEnter { shift: false, .. } if !this.enter_is_the_picks() => {
+                let text = input.read(cx).value().trim().to_string();
+                if !text.is_empty() && this.submit(text) {
+                    input.update(cx, |s, cx| s.set_value("", window, cx));
+                }
+            }
+            InputEvent::PressEnter { shift: false, .. } => {
+                log::debug!(target: "synaps_desktop::send", "enter: a held repeat of a menu pick's key, nothing sent");
+            }
+            // Typing: what a worker key or a refused steer said is old.
+            InputEvent::Change if this.panes.cur.watch_note.is_some() => {
+                this.panes.cur.watch_note = None;
+                cx.notify();
+            }
+            _ => {}
+        });
         let mut subs = vec![
-            cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { shift: false, .. } if !this.enter_is_the_picks() => {
-                    let text = input.read(cx).value().trim().to_string();
-                    if !text.is_empty() && this.submit(text) {
-                        input.update(cx, |s, cx| s.set_value("", window, cx));
-                    }
-                }
-                InputEvent::PressEnter { shift: false, .. } => {
-                    log::debug!(target: "synaps_desktop::send", "enter: a held repeat of a menu pick's key, nothing sent");
-                }
-                // Typing: what a worker key or a refused steer said is old.
-                InputEvent::Change if this.panes.cur.watch_note.is_some() => {
-                    this.panes.cur.watch_note = None;
-                    cx.notify();
-                }
-                _ => {}
-            }),
             // The palette filters as it is typed.
             cx.subscribe_in(&palette_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
                 if let InputEvent::Change = ev
@@ -2010,7 +2012,7 @@ impl AppView {
                     && !this.enter_is_the_picks()
                 {
                     let typed = input.read(cx).value().to_string();
-                    let req = this.model.rename_request(&typed);
+                    let req = this.model.rename_request(this.panes.cur.live, &typed);
                     this.rename(req);
                     cx.notify();
                 }
@@ -2113,6 +2115,7 @@ impl AppView {
         let usage_pane = cx.new(|_| crate::views::ViewPane::new(me, crate::tabs::Kind::Usage));
         let inputs = Inputs {
             composer,
+            composer_sub,
             find_input,
             palette_input,
             name_input,
@@ -2165,6 +2168,7 @@ impl AppView {
             model: Model::new(conn),
             panes: Panes::one(Pane {
                 id: PaneId::FIRST,
+                live: crate::live::LiveId::FIRST,
                 rows: Vec::new(),
                 disp: Vec::new(),
                 summaries: Summaries::default(),
@@ -2231,6 +2235,7 @@ impl AppView {
                 strip_at: Default::default(),
                 main_column: None,
                 column_of: None,
+                pending: None,
                 worker_columns: Vec::new(),
                 full_rebuild: false,
                 card: None,
@@ -2249,6 +2254,8 @@ impl AppView {
                 allow_all_focus: i.allow_all_focus,
                 tracer_open: None,
                 tracer: None,
+                cancel_tick: None,
+                _subs: vec![i.composer_sub],
             }),
             bars: Default::default(),
             top_words: None,
@@ -2382,7 +2389,6 @@ impl AppView {
             palette_drawn: Cell::new((0., 0., 0., 0.)),
             #[cfg(test)]
             palette_box: Cell::new((0., 0., 0., 0.)),
-            cancel_tick: None,
             smenu: None,
             wmenu: None,
             rename_pending: None,
@@ -2434,8 +2440,8 @@ impl AppView {
                 if self.menu.is_some() || self.wmenu.is_some() {
                     self.close_menu();
                     self.model.view_dirty = true;
-                } else if self.model.cancels.disarm() {
-                    self.cancel_tick = None;
+                } else if self.model.lives[self.panes.cur.live].cancels.disarm() {
+                    self.panes.cur.cancel_tick = None;
                     self.model.view_dirty = true;
                 }
             }
@@ -2448,7 +2454,7 @@ impl AppView {
                         | synaps_client::protocol::SessionEvent::CompactionFailed { .. }
                         | synaps_client::protocol::SessionEvent::CompactionCancelled
                 )
-                && self.model.active.as_ref().is_some_and(|a| a.attach_seq == *attach_seq)
+                && self.model.lives[self.panes.cur.live].active.as_ref().is_some_and(|a| a.attach_seq == *attach_seq)
                 && self.panes.cur.watch_note.as_ref().is_some_and(|n| n.starts_with("/compact:"))
             {
                 self.panes.cur.watch_note = None;
@@ -2477,11 +2483,15 @@ impl AppView {
 
     pub(crate) fn effect(&mut self, fx: Effect) {
         match fx {
-            Effect::Restore(text) => {
-                self.panes.cur.restore = Some(match self.panes.cur.restore.take() {
-                    Some(prev) => format!("{prev}\n{text}"),
-                    None => text,
-                })
+            // To the composer of the pane that sent it; a pane closed since
+            // gets nothing (its text was its draft's).
+            Effect::Restore(pane, text) => {
+                if let Some(p) = self.panes.get_mut(pane) {
+                    p.restore = Some(match p.restore.take() {
+                        Some(prev) => format!("{prev}\n{text}"),
+                        None => text,
+                    })
+                }
             }
             Effect::Unsent { session, text } => self.unsent(session, text),
             Effect::ListSessions => {
@@ -2489,9 +2499,9 @@ impl AppView {
                     let _ = c.list_sessions();
                 }
             }
-            Effect::Resync => {
+            Effect::Resync(seq) => {
                 if let Some(c) = &self.client {
-                    let _ = c.resync();
+                    let _ = c.on(seq).resync();
                 }
             }
             Effect::ListSaved { named_only, limit } => {
@@ -2551,7 +2561,7 @@ impl AppView {
         // Its tab followed the session to a new id: that tab's.
         let session = self.model.tabs.followed(&session).map_or(session, str::to_string);
         if self.panes.cur.composer_of.as_ref().is_some_and(|(_, s)| s.as_deref() == Some(session.as_str())) {
-            self.effect(Effect::Restore(text));
+            self.effect(Effect::Restore(self.panes.cur.id, text));
             self.panes.cur.draft_note = Some(UNSENT_NOTE);
             self.model.view_dirty = true;
         } else if self.model.tabs.knows(&session) {
@@ -2570,12 +2580,12 @@ impl AppView {
     fn sync_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Over a worker's view the composer steers it (compared, not
         // allocated, each frame).
-        let worker = self.model.watch.focused().map(|w| (w.handle_id.as_str(), w.state(), w.tabbed));
+        let worker = self.model.lives[self.panes.cur.live].watch.focused().map(|w| (w.handle_id.as_str(), w.state(), w.tabbed));
         let cramped = self.panes.cur.layout.cramped;
         if worker != self.panes.cur.placeholder_of.as_ref().map(|(h, s, t)| (h.as_str(), s.as_str(), *t))
             || cramped != self.panes.cur.placeholder_cramped
         {
-            let text = match self.model.watch.focused() {
+            let text = match self.model.lives[self.panes.cur.live].watch.focused() {
                 Some(w) if w.read_only() && w.tabbed => format!("{} is {}: nothing to steer", w.name, w.state()),
                 Some(w) if w.read_only() => format!("{} is {}: nothing to steer  (Esc: back to the session)", w.name, w.state()),
                 Some(w) => format!("Steer {}: it reads this at its next step  (Enter sends)", w.name),
@@ -2596,11 +2606,11 @@ impl AppView {
         // and the composer is that tab's (never in the frame of a switch:
         // it would go to the tab left).
         if self.composer_owned() {
-            if let Some((text, note)) = self.model.watch.take_unsent() {
-                self.effect(Effect::Restore(text));
+            if let Some((text, note)) = self.model.lives[self.panes.cur.live].watch.take_unsent() {
+                self.effect(Effect::Restore(self.panes.cur.id, text));
                 self.panes.cur.watch_note = Some(note.into());
             }
-        } else if self.model.watch.has_unsent() {
+        } else if self.model.lives[self.panes.cur.live].watch.has_unsent() {
             cx.notify();
         }
         // The visible tab went into the one holding its session: the
@@ -2660,7 +2670,7 @@ impl AppView {
             if self.synthetic {
                 // Never answered: the row stays OPENING.
                 self.synthetic_seq += 1;
-                self.model.resuming(req, self.synthetic_seq, open);
+                self.model.resuming(self.panes.cur.live, req, self.synthetic_seq, open);
             } else {
                 self.model.named.error = Some("offline".into());
             }
@@ -2668,7 +2678,7 @@ impl AppView {
         };
         match c.resume(req.target.clone(), req.options()) {
             Ok(seq) => {
-                self.model.resuming(req, seq, open);
+                self.model.resuming(self.panes.cur.live, req, seq, open);
             }
             Err(e) => self.model.named.error = Some(e.to_string()),
         }
@@ -2679,8 +2689,8 @@ impl AppView {
     pub(crate) fn synthetic_attach(&mut self, session_id: &str, fallback: Option<ResumeRequest>, open: bool) {
         self.synthetic_seq += 1;
         let seq = self.synthetic_seq;
-        self.model.attaching(seq, fallback, open);
-        self.model.asked_for(session_id);
+        self.model.attaching(self.panes.cur.live, seq, fallback, open);
+        self.model.asked_for(self.panes.cur.live, session_id);
         if let (Some(src), Some(tx)) = (&self.attach_source, &self.synthetic_tx) {
             for e in src(session_id, seq) {
                 let _ = tx.try_send(e);
@@ -2900,7 +2910,7 @@ impl AppView {
     fn create_now(&mut self) {
         // Tools run in the user's home, not wherever the launcher started us.
         if let Some(seq) = self.client.as_ref().and_then(|c| c.create(CreateOptions::new().cwd(Cwd::Home)).ok()) {
-            self.model.want(seq);
+            self.model.want(self.panes.cur.live, seq);
         }
     }
 
@@ -2954,12 +2964,13 @@ impl AppView {
         if let Some((id, _)) = self.panes.cur.shown_tab
             && vis.as_ref().map(|v| v.0) != Some(id)
         {
-            let inplace = self.model.watch.focused().filter(|w| !w.tabbed).map(|w| (w.handle_id.clone(), w.name.clone()));
+            let inplace =
+                self.model.lives[self.panes.cur.live].watch.focused().filter(|w| !w.tabbed).map(|w| (w.handle_id.clone(), w.name.clone()));
             self.model.tabs.set_watching(id, inplace);
             self.close_menu();
         }
         if let Some((_, Some(s))) = &vis
-            && self.model.wanted_session() == Some(s.as_str())
+            && self.model.lives[self.panes.cur.live].wanted_session() == Some(s.as_str())
         {
             // What a cache held of it is older than what attached.
             let _ = self.tab_cache.take(s);
@@ -3017,27 +3028,29 @@ impl AppView {
                 // A worker tab whose handle names another worker now: its
                 // view is gone, never that worker's.
                 let reused = tab && self.tab_worker_reused();
-                if self.model.watch.focus() == Some(handle.as_str())
-                    && self.model.watch.in_tab() == tab
-                    && (reused || self.model.watch.focused_is(&c))
+                if self.model.lives[self.panes.cur.live].watch.focus() == Some(handle.as_str())
+                    && self.model.lives[self.panes.cur.live].watch.in_tab() == tab
+                    && (reused || self.model.lives[self.panes.cur.live].watch.focused_is(&c))
                 {
                     if reused {
                         self.disown_reused();
                     }
                     return;
                 }
-                let cwd = self.model.cwd().map(str::to_string);
+                let cwd = self.model.lives[self.panes.cur.live].cwd().map(str::to_string);
                 if tab {
-                    self.model.watch.open_tab(&c, cwd.as_deref(), Instant::now());
+                    self.model.lives[self.panes.cur.live].watch.open_tab(&c, cwd.as_deref(), Instant::now());
                 } else {
-                    self.model.watch.open(&c, cwd.as_deref(), Instant::now());
+                    self.model.lives[self.panes.cur.live].watch.open(&c, cwd.as_deref(), Instant::now());
                 }
                 self.watch_opened();
                 if reused {
                     self.disown_reused();
                 }
             }
-            None if self.model.watch.focus().is_some() => self.model.watch.focus_main(),
+            None if self.model.lives[self.panes.cur.live].watch.focus().is_some() => {
+                self.model.lives[self.panes.cur.live].watch.focus_main()
+            }
             None => {}
         }
     }
@@ -3048,13 +3061,13 @@ impl AppView {
     fn stash(&mut self) {
         // Its worker views go with it; the session's own list comes back
         // first (a worker's view is built again when the tab is shown).
-        let mut watch = std::mem::take(&mut self.model.watch);
+        let mut watch = std::mem::take(&mut self.model.lives[self.panes.cur.live].watch);
         watch.suspend();
         // The rows first: the transcript may have run ahead of the last frame.
         self.sync_list();
         self.list_out();
-        let key = self.model.transcript.session_id().map(str::to_string);
-        let (transcript, stats) = self.model.switch_out();
+        let key = self.model.lives[self.panes.cur.live].transcript.session_id().map(str::to_string);
+        let (transcript, stats) = self.model.switch_out(self.panes.cur.live);
         self.panes.cur.card = None;
         self.panes.cur.attach_wait = None;
         self.panes.cur.attach_due = None;
@@ -3090,10 +3103,12 @@ impl AppView {
     /// until its attach lands.
     fn load(&mut self, session: Option<String>) {
         self.list_out();
+        // The last transcript's changes were synced as it left (`stash`).
+        self.panes.cur.pending = None;
         self.disarm_halt();
         match session.as_ref().and_then(|s| self.tab_cache.take(s)) {
             Some(c) => {
-                self.model.switch_in(c.transcript, c.stats);
+                self.model.switch_in(self.panes.cur.live, c.transcript, c.stats);
                 self.panes.cur.rows = c.rows;
                 self.panes.cur.disp = c.disp;
                 self.panes.cur.summaries = c.summaries;
@@ -3109,11 +3124,11 @@ impl AppView {
                     self.panes.cur.list.remeasure();
                 }
                 // Polled again once its attach lands (`Watch::on_reconnect`).
-                self.model.watch = c.watch;
+                self.model.lives[self.panes.cur.live].watch = c.watch;
             }
             None => {
-                self.model.switch_in(crate::model::transcript(), Stats::default());
-                self.model.watch = Watch::default();
+                self.model.switch_in(self.panes.cur.live, crate::model::transcript(), Stats::default());
+                self.model.lives[self.panes.cur.live].watch = Watch::default();
             }
         }
         self.panes.cur.rows_session = session;
@@ -3127,7 +3142,7 @@ impl AppView {
         self.panes.cur.attach_wait = None;
         let restoring = self.model.tabs.current().is_some_and(|t| self.model.tabs.restoring(t.id));
         if restoring || (self.client.is_some() && self.panes.cur.gate.switch(Instant::now())) {
-            self.model.showing(&session);
+            self.model.showing(self.panes.cur.live, &session);
             // A restored tab attaches once a list has its session (`start_tabs`).
             if !restoring {
                 self.panes.cur.attach_wait = Some((session, fallback, open));
@@ -3139,13 +3154,13 @@ impl AppView {
 
     fn attach_now(&mut self, session: String, fallback: Option<ResumeRequest>, open: bool) {
         if let Some(seq) = self.client.as_ref().and_then(|c| c.attach(session.clone(), AttachMode::Mirror).ok()) {
-            self.model.attaching(seq, fallback, open);
-            self.model.asked_for(&session);
+            self.model.attaching(self.panes.cur.live, seq, fallback, open);
+            self.model.asked_for(self.panes.cur.live, &session);
         } else if self.synthetic_tx.is_some() {
             self.synthetic_attach(&session, fallback, open);
         } else {
             // No daemon: shown, never attached.
-            self.model.showing(&session);
+            self.model.showing(self.panes.cur.live, &session);
         }
     }
 
@@ -3173,7 +3188,7 @@ impl AppView {
         }
         if let Some((s, fallback, open)) = self.panes.cur.attach_wait.take()
             && self.model.tabs.current_session() == Some(s.as_str())
-            && self.model.active.is_none()
+            && self.model.lives[self.panes.cur.live].active.is_none()
         {
             self.attach_now(s, fallback, open);
             cx.notify();
@@ -3190,10 +3205,13 @@ impl AppView {
     }
 
     /// The last tab closed: nothing attached (the session keeps running).
+    /// What its store holds open goes, not what it wants: the switch out
+    /// of the tab (`stash`) cleared that first (Shady #32 H1).
     fn detach_all(&mut self) {
         self.panes.cur.attach_wait = None;
-        if let Some(c) = &self.client {
-            let _ = c.detach();
+        let held = self.model.lives[self.panes.cur.live].release();
+        if let (Some(c), Some(seq)) = (&self.client, held) {
+            let _ = c.on(seq).detach();
         }
     }
 
@@ -3506,31 +3524,39 @@ impl AppView {
         Drafts::composer_owned(self.panes.cur.composer_of.as_ref(), &self.model.tabs)
     }
 
+    /// The composer's Enter with `text` in it, as its subscription sends it
+    /// (the view-level tests, `split_tests`, which need a unix socket).
+    #[cfg(all(test, unix))]
+    pub(crate) fn enter(&mut self, text: String) -> bool {
+        self.submit(text)
+    }
+
     /// Send the composer's text. `false` keeps it in the composer.
     fn submit(&mut self, text: String) -> bool {
         #[cfg(test)]
-        self.submits.push((text.clone(), self.model.watch.focus().is_some()));
+        self.submits.push((text.clone(), self.model.lives[self.panes.cur.live].watch.focus().is_some()));
         let Some(c) = &self.client else {
-            self.model.last_error = Some("offline".into());
+            self.model.lives[self.panes.cur.live].last_error = Some("offline".into());
             return false;
         };
         // The composer's text is the visible tab's only once the frame after
         // a switch has swapped the drafts: never sent to another session.
         if !self.composer_owned() {
-            self.model.last_error = Some("switching tabs: not sent".into());
+            self.model.lives[self.panes.cur.live].last_error = Some("switching tabs: not sent".into());
             self.model.view_dirty = true;
             return false;
         }
-        if !self.model.can_send() {
-            self.model.last_error = Some(if self.model.switching() {
+        let Some(seq) = self.model.lives[self.panes.cur.live].attachment().filter(|_| self.model.lives[self.panes.cur.live].can_send())
+        else {
+            self.model.lives[self.panes.cur.live].last_error = Some(if self.model.lives[self.panes.cur.live].switching() {
                 "switching sessions: not sent".into()
-            } else if self.model.active.is_some() {
+            } else if self.model.lives[self.panes.cur.live].active.is_some() {
                 "this session is read-only here (observing or reconnecting)".into()
             } else {
                 "not attached to a session".into()
             });
             return false;
-        }
+        };
         // `//text`: `/text`, a message (the TUI's escape), never a command.
         let escaped = text.trim_start().strip_prefix('/').filter(|r| r.starts_with('/')).map(str::to_string);
         let text = match escaped {
@@ -3559,7 +3585,7 @@ impl AppView {
             }
         };
         // In a worker's view, Enter steers that worker (never the session).
-        if let Some(target) = self.model.watch.steer_target() {
+        if let Some(target) = self.model.lives[self.panes.cur.live].watch.steer_target() {
             let handle = match target {
                 Ok(h) => h,
                 Err(why) => {
@@ -3568,25 +3594,25 @@ impl AppView {
                     return false;
                 }
             };
-            if c.steer_subagent(handle.clone(), text.clone()).is_err() {
-                self.model.last_error = Some("the connection thread has stopped".into());
+            if c.on(seq).steer_subagent(handle.clone(), text.clone()).is_err() {
+                self.model.lives[self.panes.cur.live].last_error = Some("the connection thread has stopped".into());
                 return false;
             }
             log::debug!(target: "synaps_desktop::send", "steer {handle} ({} chars)", text.chars().count());
-            self.model.watch.steer_sent(&handle, &text);
+            self.model.lives[self.panes.cur.live].watch.steer_sent(&handle, &text);
             self.panes.cur.watch_note = None;
             // Handoff out: the composer's bar, then the watched row's.
             self.fx.col(self.panes.cur.id).sent().set(Some((self.fx.clock(), true)));
             return true;
         }
-        let busy = self.model.transcript.busy();
-        let sent = if busy { c.steer(text.clone()) } else { c.submit(text.clone()) };
+        let busy = self.model.lives[self.panes.cur.live].transcript.busy();
+        let sent = if busy { c.on(seq).steer(text.clone()) } else { c.on(seq).submit(text.clone()) };
         if sent.is_err() {
-            self.model.last_error = Some("the connection thread has stopped".into());
+            self.model.lives[self.panes.cur.live].last_error = Some("the connection thread has stopped".into());
             return false;
         }
         log::debug!(target: "synaps_desktop::send", "{} ({} chars)", if busy { "steer" } else { "submit" }, text.chars().count());
-        self.model.sent(text);
+        self.model.lives[self.panes.cur.live].sent(self.panes.cur.id, text);
         self.panes.cur.draft_note = None;
         self.panes.cur.watch_note = None;
         // Handoff out: the composer's bar, then the new block's (a steer
@@ -3607,9 +3633,13 @@ impl AppView {
             cx.notify();
             return;
         }
-        let running = if self.model.active.is_some() { self.model.watchable() } else { Vec::new() };
-        let cwd = self.model.cwd().map(str::to_string);
-        let moved = self.model.watch.step(step, &running, cwd.as_deref(), Instant::now());
+        let running = if self.model.lives[self.panes.cur.live].active.is_some() {
+            self.model.lives[self.panes.cur.live].watchable()
+        } else {
+            Vec::new()
+        };
+        let cwd = self.model.lives[self.panes.cur.live].cwd().map(str::to_string);
+        let moved = self.model.lives[self.panes.cur.live].watch.step(step, &running, cwd.as_deref(), Instant::now());
         log::debug!(target: "synaps_desktop::watch", "key {step:?}: {moved:?}");
         self.panes.cur.watch_note = match moved {
             Moved::Worker(_) => {
@@ -3618,7 +3648,7 @@ impl AppView {
             }
             Moved::Main => None,
             Moved::Oldest => Some(format!("the oldest worker: {WORKER_KEY} or Esc goes back").into()),
-            Moved::No if self.model.watch.candidates(&running).is_empty() => Some("no workers to watch".into()),
+            Moved::No if self.model.lives[self.panes.cur.live].watch.candidates(&running).is_empty() => Some("no workers to watch".into()),
             Moved::No => Some(format!("on the session's thread: {WORKER_KEY} watches its workers").into()),
         };
         cx.notify();
@@ -3628,7 +3658,7 @@ impl AppView {
     pub(crate) fn watch_opened(&mut self) {
         self.panes.cur.watch_note = None;
         if self.client.is_none() {
-            self.model.watch.no_daemon("offline: there is no daemon to read this worker's thread from");
+            self.model.lives[self.panes.cur.live].watch.no_daemon("offline: there is no daemon to read this worker's thread from");
         }
     }
 
@@ -3648,9 +3678,9 @@ impl AppView {
             return;
         }
         if esc {
-            self.model.watch.leave_on_esc(Instant::now());
+            self.model.lives[self.panes.cur.live].watch.leave_on_esc(Instant::now());
         } else {
-            self.model.watch.focus_main();
+            self.model.lives[self.panes.cur.live].watch.focus_main();
         }
         self.panes.cur.watch_note = None;
         cx.notify();
@@ -3662,7 +3692,7 @@ impl AppView {
     /// window that shows nothing (minimized, covered) asks for nothing
     /// after the poll on its way.
     fn arm_watch_poll(&mut self, cx: &mut Context<Self>) {
-        let due = self.model.watch.poll_due().filter(|_| self.visible && self.model.tabs.view().is_none());
+        let due = self.model.lives[self.panes.cur.live].watch.poll_due().filter(|_| self.visible && self.model.tabs.view().is_none());
         let Some(due) = due else {
             self.watch_poll = None;
             return;
@@ -3684,12 +3714,13 @@ impl AppView {
         self.watch_poll = None;
         let now = Instant::now();
         if self.client.is_none() {
-            self.model.watch.no_daemon("offline: there is no daemon to read this worker's thread from");
+            self.model.lives[self.panes.cur.live].watch.no_daemon("offline: there is no daemon to read this worker's thread from");
             cx.notify();
-        } else if let Some((handle, since)) = self.model.watch.take_poll(now) {
+        } else if let Some((handle, since)) = self.model.lives[self.panes.cur.live].watch.take_poll(now) {
             log::debug!(target: "synaps_desktop::watch", "watch {handle} since {since}");
-            if !self.client.as_ref().is_some_and(|c| c.watch_subagent(handle, since).is_ok()) {
-                self.model.watch.poll_failed(now);
+            let seq = self.model.lives[self.panes.cur.live].wanted();
+            if !self.client.as_ref().zip(seq).is_some_and(|(c, seq)| c.on(seq).watch_subagent(handle, since).is_ok()) {
+                self.model.lives[self.panes.cur.live].watch.poll_failed(now);
             }
         }
         // The timeout's (or the retry's) timer; the reply arms the next.
@@ -3711,14 +3742,16 @@ impl AppView {
     /// nothing yet) while its attach is on its way: nothing on screen is
     /// live.
     pub(crate) fn opening(&self) -> bool {
-        self.model.active.is_none() && self.model.tabs.current_session().is_some() && !self.model.stats.detached
+        self.model.lives[self.panes.cur.live].active.is_none()
+            && self.model.tabs.current_session().is_some()
+            && !self.model.lives[self.panes.cur.live].stats.detached
     }
 
     /// A daemon is connected and this attachment may drive it (the
     /// synthetic transport never can), or the bench's life scene says its
     /// local session is this window's ([`Self::owner_here`]).
     pub(crate) fn drives(&self) -> bool {
-        (self.client.is_some() || self.owner_here) && self.model.can_send()
+        (self.client.is_some() || self.owner_here) && self.model.lives[self.panes.cur.live].can_send()
     }
 
     /// The list's top edge moved by `shift` (the bars above it changed
@@ -3808,10 +3841,10 @@ impl AppView {
         if key == self.panes.cur.column_key {
             return;
         }
-        let (worker, view) = (self.model.watch.focus().is_some(), tabs.view().is_some());
+        let (worker, view) = (self.model.lives[self.panes.cur.live].watch.focus().is_some(), tabs.view().is_some());
         // Nothing to draw yet (an attach in flight, nothing kept for it):
         // the column it lands on is the change.
-        if !worker && !view && self.panes.cur.disp.is_empty() && self.model.active.is_none() {
+        if !worker && !view && self.panes.cur.disp.is_empty() && self.model.lives[self.panes.cur.live].active.is_none() {
             return;
         }
         let now = self.fx.now();
@@ -4370,14 +4403,14 @@ impl AppView {
 
     /// The card, if it shows the attached session's first pending prompt.
     pub(crate) fn current_card(&self) -> Option<&PromptCard> {
-        self.panes.cur.card.as_ref().filter(|c| self.model.card_key() == Some(c.key))
+        self.panes.cur.card.as_ref().filter(|c| self.model.lives[self.panes.cur.live].card_key() == Some(c.key))
     }
 
     /// The prompt the card shows, if it is still the attached session's and
     /// armed: what a click or Enter on the card answers.
     fn card_target(&self) -> Option<u64> {
         let c = self.panes.cur.card.as_ref().filter(|c| c.armed())?;
-        (self.model.card_key() == Some(c.key)).then_some(c.key.1)
+        (self.model.lives[self.panes.cur.live].card_key() == Some(c.key)).then_some(c.key.1)
     }
 
     /// Answer the card's prompt (`Client::answer_on` the connection it came
@@ -4387,13 +4420,16 @@ impl AppView {
     /// a secret its text, or nothing to cancel.
     pub(crate) fn answer(&mut self, key: (u64, u64), value: Option<String>) -> bool {
         if self.client.is_none() && !self.slow_daemon {
-            self.model.last_error = Some("offline: there is no daemon to answer".into());
+            self.model.lives[self.panes.cur.live].last_error = Some("offline: there is no daemon to answer".into());
             return false;
         }
-        if self.panes.cur.card.as_ref().map(|c| c.key) != Some(key) || self.card_target() != Some(key.1) || !self.model.may_answer(key.1) {
+        if self.panes.cur.card.as_ref().map(|c| c.key) != Some(key)
+            || self.card_target() != Some(key.1)
+            || !self.model.lives[self.panes.cur.live].may_answer(key.1)
+        {
             return false;
         }
-        let connection = self.model.active.as_ref().map_or(0, |a| a.connection);
+        let connection = self.model.lives[self.panes.cur.live].active.as_ref().map_or(0, |a| a.connection);
         // `SYNAPS_DESKTOP_LOG=info`: what went, never a secret's text.
         use crate::authorize::Answer;
         let (what, answer) = match &value {
@@ -4404,19 +4440,22 @@ impl AppView {
             None => ("cancel", Answer::Cancelled),
         };
         let took = self.panes.cur.card.as_ref().map_or(Duration::ZERO, |c| c.shown.elapsed());
-        let sent = match &self.client {
-            Some(c) => c.answer_on(connection, key.1, value),
-            None => Ok(()),
+        // On the attachment the card's prompt came on (`card_key` holds it
+        // to the one on screen), never another session's.
+        let sent = match (&self.client, self.model.lives[self.panes.cur.live].attachment()) {
+            (Some(c), Some(seq)) => c.on(seq).answer_on(connection, key.1, value),
+            (Some(_), None) => return false,
+            (None, _) => Ok(()),
         };
         match sent {
             Ok(()) => {
                 log::info!(target: "synaps_desktop::card", "card {key:?}: answered {what}");
-                self.model.answer_sent(key.1);
+                self.model.lives[self.panes.cur.live].answer_sent(key.1);
                 self.sent = Some(crate::authorize::Sent { key, answer, at: crate::authorize::hhmm_now(), took });
                 true
             }
             Err(_) => {
-                self.model.last_error = Some("the connection thread has stopped".into());
+                self.model.lives[self.panes.cur.live].last_error = Some("the connection thread has stopped".into());
                 false
             }
         }
@@ -4439,9 +4478,9 @@ impl AppView {
     pub(crate) fn extras(&self) -> crate::fit::Extras {
         let n = &self.model.named;
         crate::fit::Extras {
-            naming: n.naming && self.model.active.is_some(),
+            naming: n.naming && self.model.lives[self.panes.cur.live].active.is_some(),
             naming_notes: u8::from(n.rename_error.is_some()) + u8::from(self.replace_offer().is_some()),
-            error: self.model.last_error.is_some(),
+            error: self.model.lives[self.panes.cur.live].last_error.is_some(),
             note: self.panes.cur.watch_note.is_some() || self.panes.cur.draft_note.is_some(),
             stub: self.stub_shown(),
             tray: self.tray_rows as u8,
@@ -4453,7 +4492,7 @@ impl AppView {
     fn motion_session(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.model.active.as_ref().map(|a| (&a.session_id, a.epoch)).hash(&mut h);
+        self.model.lives[self.panes.cur.live].active.as_ref().map(|a| (&a.session_id, a.epoch)).hash(&mut h);
         h.finish()
     }
 
@@ -4462,7 +4501,7 @@ impl AppView {
     fn motion_column(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (self.model.watch.focus(), self.model.watch.in_tab()).hash(&mut h);
+        (self.model.lives[self.panes.cur.live].watch.focus(), self.model.lives[self.panes.cur.live].watch.in_tab()).hash(&mut h);
         h.finish()
     }
 
@@ -4470,7 +4509,7 @@ impl AppView {
     /// Not over a worker's view: the card is the session's, and Esc there
     /// goes back to it.
     fn card_up(&self) -> bool {
-        self.model.tabs.view().is_none() && self.model.watch.focus().is_none() && self.current_card().is_some()
+        self.model.tabs.view().is_none() && self.model.lives[self.panes.cur.live].watch.focus().is_none() && self.current_card().is_some()
     }
 
     /// The card's keys act: it is on screen in the active window with its
@@ -4567,8 +4606,8 @@ impl AppView {
     /// buttons: driving, not yet answered, armed).
     pub(crate) fn card_answerable(&self) -> Option<(&PromptCard, bool)> {
         let c = self.current_card()?;
-        let pr = self.model.transcript.pending_prompts().first()?;
-        (self.drives() && self.model.may_answer(pr.id) && c.armed()).then_some((c, pr.is_secret()))
+        let pr = self.model.lives[self.panes.cur.live].transcript.pending_prompts().first()?;
+        (self.drives() && self.model.lives[self.panes.cur.live].may_answer(pr.id) && c.armed()).then_some((c, pr.is_secret()))
     }
 
     /// Ctrl/Cmd+Enter with the card's keys live and armed. A confirm:
@@ -4603,7 +4642,7 @@ impl AppView {
     /// Esc with the card's keys live: DENY, or a secret's CANCEL.
     fn card_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The second of two quick Escs that left a worker's view.
-        if self.model.watch.esc_guarded(Instant::now()) {
+        if self.model.lives[self.panes.cur.live].watch.esc_guarded(Instant::now()) {
             return;
         }
         let Some((c, secret)) = self.card_answerable() else { return };
@@ -4645,8 +4684,8 @@ impl AppView {
     /// collapse ([`CardExit`]).
     fn resolve_card(&mut self, fx_now: Instant, cx: &App) {
         let Some(c) = self.panes.cur.card.take() else { return };
-        let Some(sid) = self.model.active.as_ref().map(|a| a.session_id.clone()) else { return };
-        let items = self.model.transcript.items();
+        let Some(sid) = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone()) else { return };
+        let items = self.model.lives[self.panes.cur.live].transcript.items();
         let Some(last) = items.last().map(|i| i.id) else { return };
         let (after, own) = c.after.get().unwrap_or_else(|| match turns::waiting_call(items, Some(&c.pr)).filter(|_| !c.secret) {
             Some(call) => (call, false),
@@ -4678,7 +4717,7 @@ impl AppView {
             }
         }
         let (top, bottom) = self.list_view();
-        let on_screen = self.model.watch.focus().is_none()
+        let on_screen = self.model.lives[self.panes.cur.live].watch.focus().is_none()
             && self.model.tabs.view().is_none()
             && self
                 .panes
@@ -4706,11 +4745,14 @@ impl AppView {
     fn resolved_by(&self, c: &PromptCard, sid: &str) -> crate::authorize::Answer {
         use crate::authorize::Answer;
         let halted = self.halted.as_ref().is_some_and(|(s, at)| s == sid && *at >= c.shown);
-        let ran = self.model.transcript.resolved_busy(c.key.1).unwrap_or_else(|| self.model.transcript.busy());
+        let ran = self.model.lives[self.panes.cur.live]
+            .transcript
+            .resolved_busy(c.key.1)
+            .unwrap_or_else(|| self.model.lives[self.panes.cur.live].transcript.busy());
         if halted || !ran || self.model.reload {
             return Answer::Cancelled;
         }
-        match self.model.active.as_ref() {
+        match self.model.lives[self.panes.cur.live].active.as_ref() {
             Some(a) if a.owner.is_some() && a.owner != Some(a.client) => Answer::Elsewhere,
             _ => Answer::Resolved,
         }
@@ -4735,11 +4777,12 @@ impl AppView {
         // ends it at once.
         let fx_now = self.fx.now();
         if let Some(e) = &self.panes.cur.card_exit {
-            let here = self.model.active.as_ref().is_some_and(|a| a.session_id == e.session && a.epoch == e.card.key.0);
+            let here =
+                self.model.lives[self.panes.cur.live].active.as_ref().is_some_and(|a| a.session_id == e.session && a.epoch == e.card.key.0);
             // Another prompt in its place ends it at once, as the dock's did.
-            let other = self.model.card_key().is_some_and(|k| k != e.card.key);
+            let other = self.model.lives[self.panes.cur.live].card_key().is_some_and(|k| k != e.card.key);
             let landed = e.shown(fx_now).1;
-            if landed || !here || other || !self.fx.fluid() || self.model.watch.focus().is_some() {
+            if landed || !here || other || !self.fx.fluid() || self.model.lives[self.panes.cur.live].watch.focus().is_some() {
                 // Landed in place: the room it gave up goes on `sheet`.
                 let keep = landed && here && !other && self.fx.fluid();
                 // What the list holds now, without it (its last layout drew
@@ -4771,22 +4814,21 @@ impl AppView {
             }
         }
         // A refused (or lost) answer: forgotten, the card asks again.
-        if self.sent.as_ref().is_some_and(|s| self.model.card_key() == Some(s.key) && !self.model.prompt_answered(s.key.1)) {
+        if self.sent.as_ref().is_some_and(|s| {
+            self.model.lives[self.panes.cur.live].card_key() == Some(s.key)
+                && !self.model.lives[self.panes.cur.live].prompt_answered(s.key.1)
+        }) {
             self.sent = None;
         }
         // Its prompt resolved in its attachment (answered here or elsewhere):
         // its receipt, and (on screen, Full) its row collapses.
-        let resolved = self
-            .panes
-            .cur
-            .card
-            .as_ref()
-            .zip(self.model.active.as_ref())
-            .is_some_and(|(c, a)| c.key.0 == a.epoch && !self.model.transcript.pending_prompts().iter().any(|p| p.id == c.key.1));
+        let resolved = self.panes.cur.card.as_ref().zip(self.model.lives[self.panes.cur.live].active.as_ref()).is_some_and(|(c, a)| {
+            c.key.0 == a.epoch && !self.model.lives[self.panes.cur.live].transcript.pending_prompts().iter().any(|p| p.id == c.key.1)
+        });
         if resolved {
             self.resolve_card(fx_now, cx);
         }
-        let new = PromptCard::sync(&mut self.panes.cur.card, &self.model, now, view);
+        let new = PromptCard::sync(&mut self.panes.cur.card, &self.model.lives[self.panes.cur.live], now, view);
         if was.map(|w| w.0) != self.panes.cur.card.as_ref().map(|c| c.key) {
             // The box's focus was the card's that went (the next card's
             // box is its own).
@@ -4800,7 +4842,7 @@ impl AppView {
         }
         if new
             && let Some(c) = self.panes.cur.card.as_mut()
-            && let Some(a) = self.model.active.as_ref()
+            && let Some(a) = self.model.lives[self.panes.cur.live].active.as_ref()
         {
             let k = (a.session_id.clone(), c.key.1, c.pr.raised_at.clone());
             match self.card_first.iter().find(|f| f.0 == k) {
@@ -4946,8 +4988,7 @@ impl AppView {
     /// the metrics, and one re-measure of the list.
     pub(crate) fn show_text_size(&mut self, next: u8, cx: &mut App) {
         theme::update(cx, |c| c.text = next);
-        self.panes.cur.list.remeasure();
-        self.panes.cur.metrics_gen += 1;
+        self.text_metrics_changed();
     }
 
     pub(crate) fn apply_custom_accent(&mut self, cx: &mut Context<Self>) {
@@ -4991,8 +5032,12 @@ impl AppView {
     /// Every row's height changes with the text size: re-measured now (a
     /// cached tab's when it comes back).
     pub(crate) fn text_metrics_changed(&mut self) {
-        self.panes.cur.list.remeasure();
-        self.panes.cur.metrics_gen += 1;
+        // Every pane's, alike (Shady #30 M3).
+        let g = self.panes.next_gen();
+        for pane in self.panes.iter_mut() {
+            pane.list.remeasure();
+            pane.metrics_gen = g;
+        }
     }
 
     pub(crate) fn set_panels_pub(&mut self, p: theme::Panels, cx: &mut Context<Self>) {
@@ -5097,7 +5142,7 @@ impl AppView {
                 v.panels_writing = theme::PanelKeys::default();
                 if let Err(e) = saved {
                     v.panels_dirty = v.panels_dirty.or(keys);
-                    v.model.last_error = Some(format!("panel layout not saved: {e}"));
+                    v.model.lives[v.panes.cur.live].last_error = Some(format!("panel layout not saved: {e}"));
                     cx.notify();
                 }
             });
@@ -5127,16 +5172,17 @@ impl AppView {
         let pane_before = self.panes.cur.column_of.clone();
         let session_before = self.panes.cur.rows_session.clone();
         self.sync_column();
-        let busy = self.model.shown().busy();
-        let mut splice = self.model.shown_mut().take_splice();
+        self.fan_out();
+        let busy = self.model.lives[self.panes.cur.live].shown().busy();
+        let mut splice = self.panes.cur.pending.take();
         // A splice that adds items (a delta to the last one adds no row).
         let live_splice = splice.as_ref().is_some_and(|sp| sp.start > 0 && sp.new_len > sp.old_len && sp.new_len <= sp.old_len + 16)
             && !self.panes.cur.full_rebuild;
         if std::mem::take(&mut self.panes.cur.full_rebuild) {
-            let n = self.model.shown().len();
-            splice = Some(synaps_client::transcript::Splice { start: 0, old_len: self.panes.cur.rows.len(), new_len: n });
+            let n = self.model.lives[self.panes.cur.live].shown().len();
+            splice = Some(Splice { start: 0, old_len: self.panes.cur.rows.len(), new_len: n });
         }
-        let items = self.model.shown().items();
+        let items = self.model.lives[self.panes.cur.live].shown().items();
         let from = match &splice {
             Some(sp) => {
                 // The oldest rows dropped (a worker's bound): the list drops
@@ -5163,22 +5209,30 @@ impl AppView {
                     let mut old: HashMap<(u64, u64), RowCache> =
                         self.panes.cur.rows.drain(sp.start.min(self.panes.cur.rows.len())..).map(|r| ((r.id, r.rev), r)).collect();
                     for item in &items[sp.start..] {
-                        let mut r = old
-                            .remove(&(item.id, item.rev))
-                            .unwrap_or_else(|| row_cache(item, self.model.shown_files(), self.model.shown_subagents()));
+                        let mut r = old.remove(&(item.id, item.rev)).unwrap_or_else(|| {
+                            row_cache(
+                                item,
+                                self.model.lives[self.panes.cur.live].shown_files(),
+                                self.model.lives[self.panes.cur.live].shown_subagents(),
+                            )
+                        });
                         r.retime(item);
                         self.panes.cur.rows.push(r);
                     }
                 } else {
                     self.panes.cur.rows.truncate(sp.start);
                     for item in &items[sp.start..] {
-                        self.panes.cur.rows.push(row_cache(item, self.model.shown_files(), self.model.shown_subagents()));
+                        self.panes.cur.rows.push(row_cache(
+                            item,
+                            self.model.lives[self.panes.cur.live].shown_files(),
+                            self.model.lives[self.panes.cur.live].shown_subagents(),
+                        ));
                     }
                 }
                 debug_assert!(self.panes.cur.rows.iter().zip(items).all(|(r, i)| r.id == i.id && r.rev == i.rev && r.at == i.at));
                 if sp.start == 0 {
                     // Another session: what was unfolded there means nothing here.
-                    let session = self.model.active.as_ref().map(|a| a.session_id.clone());
+                    let session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone());
                     if session != self.panes.cur.rows_session {
                         self.panes.cur.rows_session = session;
                         self.panes.cur.summaries.clear();
@@ -5199,7 +5253,7 @@ impl AppView {
                 return self.sync_subagents();
             }
         };
-        self.panes.cur.waiting_on = turns::waiting_call(items, self.model.shown().pending_prompts().first());
+        self.panes.cur.waiting_on = turns::waiting_call(items, self.model.lives[self.panes.cur.live].shown().pending_prompts().first());
         let start = turns::turn_start(items, from);
         self.panes.cur.synced_busy = busy;
         // Rows that arrive while watched (a tail splice of a few items, not
@@ -5233,7 +5287,7 @@ impl AppView {
     /// worker; when it goes, the worker's is dropped and the session's
     /// comes back exactly as it was left.
     fn sync_column(&mut self) {
-        let want = self.model.watch.focus_key();
+        let want = self.model.lives[self.panes.cur.live].watch.focus_key();
         if want == self.panes.cur.column_of.as_ref().map(|(h, g)| (h.as_str(), *g)) {
             return;
         }
@@ -5242,7 +5296,7 @@ impl AppView {
         match self.panes.cur.column_of.take() {
             None => self.panes.cur.main_column = Some(left),
             // A worker tab's: kept for when it is shown again.
-            Some(k) if self.model.holds_view(&k.0) => {
+            Some(k) if self.model.holds_view(self.panes.cur.live, &k.0) => {
                 self.panes.cur.worker_columns.retain(|(w, _)| *w != k);
                 self.panes.cur.worker_columns.push((k, left));
             }
@@ -5271,7 +5325,7 @@ impl AppView {
                         }
                     }
                     None => {
-                        self.panes.cur.rows_session = self.model.active.as_ref().map(|a| a.session_id.clone());
+                        self.panes.cur.rows_session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone());
                         self.panes.cur.full_rebuild = true;
                     }
                 }
@@ -5283,8 +5337,8 @@ impl AppView {
     /// Worker tabs' lists stay only while their tab is open and their view
     /// is the same one ([`crate::watch::Watch::hold`]).
     pub(crate) fn drop_released_panes(&mut self) {
-        let (model, panes) = (&self.model, &mut self.panes.cur.worker_columns);
-        panes.retain(|((h, g), _)| model.holds_view(h) && model.watch.generation_of(h) == Some(*g));
+        let (model, live, panes) = (&self.model, self.panes.cur.live, &mut self.panes.cur.worker_columns);
+        panes.retain(|((h, g), _)| model.holds_view(live, h) && model.lives[live].watch.generation_of(h) == Some(*g));
     }
 
     /// The kept text views ([`turns::TextRows`]), and how many of them are
@@ -5316,7 +5370,7 @@ impl AppView {
         self.panes.cur.fold_gap.borrow_mut().clear();
         self.panes.cur.body_hold.set(None);
         self.panes.cur.touch_kept.set(false);
-        self.panes.cur.list_gen += 1;
+        self.panes.cur.list_gen = self.panes.next_gen();
         self.panes.cur.texts.borrow_mut().clear();
     }
 
@@ -5340,6 +5394,7 @@ impl AppView {
             rows_session: self.panes.cur.rows_session.take(),
             scroll_carry: self.panes.cur.scroll_carry.take(),
             metrics_gen: self.panes.cur.metrics_gen,
+            pending: self.panes.cur.pending.take(),
         }
     }
 
@@ -5357,6 +5412,40 @@ impl AppView {
         self.panes.cur.waiting_on = p.waiting_on;
         self.panes.cur.rows_session = p.rows_session;
         self.panes.cur.scroll_carry = p.scroll_carry;
+        self.panes.cur.pending = p.pending;
+    }
+
+    /// Each transcript's changes since the last frame, to the list showing
+    /// it (split/architecture.md §3.2): `take_splice` reads once, so the
+    /// store's splice is taken here and merged into the pending changes of
+    /// the pane's list if it shows that transcript, else of the list parked
+    /// for it (the session's under a worker's view; a worker tab's). One no
+    /// list holds stays in its transcript, as before.
+    fn fan_out(&mut self) {
+        let pane = &mut self.panes.cur;
+        let live = &mut self.model.lives[pane.live];
+        let main = match &pane.column_of {
+            None => Some(&mut pane.pending),
+            Some(_) => pane.main_column.as_mut().map(|c| &mut c.pending),
+        };
+        if let Some(slot) = main
+            && let Some(sp) = live.transcript.take_splice()
+        {
+            crate::live::pend(slot, sp);
+        }
+        if pane.column_of.is_some()
+            && let Some(w) = live.watch.focused_mut()
+            && let Some(sp) = w.transcript.take_splice()
+        {
+            crate::live::pend(&mut pane.pending, sp);
+        }
+        for ((h, g), col) in &mut pane.worker_columns {
+            if let Some(w) = live.watch.worker_mut(h).filter(|w| w.generation == *g)
+                && let Some(sp) = w.transcript.take_splice()
+            {
+                crate::live::pend(&mut col.pending, sp);
+            }
+        }
     }
 
     /// A subagent's block changed shape (a line came, its state changed)
@@ -5366,13 +5455,13 @@ impl AppView {
     /// run's fold follow. Its text alone changing needs nothing: the row
     /// reads it when drawn.
     fn sync_subagents(&mut self) {
-        let subs = self.model.shown_subagents_mut();
+        let subs = self.model.lives[self.panes.cur.live].shown_subagents_mut();
         if subs.shape_generation() == self.panes.cur.subs_gen {
             return;
         }
         self.panes.cur.subs_gen = subs.shape_generation();
         let changed = subs.take_reshaped().filter(|c| !c.is_empty());
-        let items = self.model.shown().items();
+        let items = self.model.lives[self.panes.cur.live].shown().items();
         let k = items.iter().position(|i| {
             i.tool.as_ref().is_some_and(|t| match &changed {
                 Some(c) => c.contains(&t.tool_id),
@@ -5388,12 +5477,12 @@ impl AppView {
     /// result comes with the history, not with the item's status): the
     /// file tools' counts, and the summaries that sum them, follow it.
     fn sync_counts(&mut self) {
-        let ledger = self.model.shown_files();
+        let ledger = self.model.lives[self.panes.cur.live].shown_files();
         if ledger.generation() == self.panes.cur.files_gen {
             return;
         }
         self.panes.cur.files_gen = ledger.generation();
-        let items = self.model.shown().items();
+        let items = self.model.lives[self.panes.cur.live].shown().items();
         let mut changed = false;
         for (row, item) in self.panes.cur.rows.iter_mut().zip(items) {
             let Some(t) = item.tool.as_ref().filter(|t| files::is_file_tool(&t.name)) else { continue };
@@ -5413,7 +5502,7 @@ impl AppView {
     /// Start the list over on a new transcript (the bench's scenarios): no
     /// row, height or fold of the old one survives.
     pub(crate) fn reset_transcript(&mut self) {
-        self.model.transcript = crate::model::transcript();
+        self.model.lives[self.panes.cur.live].transcript = crate::model::transcript();
         self.panes.cur.rows.clear();
         self.panes.cur.disp.clear();
         self.panes.cur.summaries.clear();
@@ -5450,16 +5539,23 @@ impl AppView {
         // that changed before `start` rebuilds from its own turn.
         let prompts = self.prompt_rows();
         let start = {
-            let items = self.model.shown().items();
+            let items = self.model.lives[self.panes.cur.live].shown().items();
             let old = crate::authorize::built(&self.panes.cur.disp);
             let changed = old.iter().filter(|r| !prompts.contains(r)).chain(prompts.iter().filter(|r| !old.contains(r)));
             changed.map(|r| turns::turn_start(items, r.after + 1)).fold(start, usize::min)
         };
-        let shown = self.model.shown();
+        let shown = self.model.lives[self.panes.cur.live].shown();
         let items = shown.items();
         let rows = &self.panes.cur.rows;
         let day = |i: usize| rows.get(i).and_then(|r| r.time.as_ref()).map(crate::times::Stamp::day);
-        let new = turns::build(items, &day, start, shown.busy(), &self.panes.cur.open_runs, self.model.shown_subagents());
+        let new = turns::build(
+            items,
+            &day,
+            start,
+            shown.busy(),
+            &self.panes.cur.open_runs,
+            self.model.lives[self.panes.cur.live].shown_subagents(),
+        );
         let new = crate::cards::mark_edges(crate::authorize::with_prompts(new, &prompts, start));
         self.panes.cur.summaries.update(&new, items, &self.panes.cur.rows);
         let at = self.panes.cur.disp.partition_point(|d| d.item < start);
@@ -5518,7 +5614,14 @@ impl AppView {
             items.len() > 2_000
                 || self.panes.cur.disp
                     == crate::cards::mark_edges(crate::authorize::with_prompts(
-                        turns::build(items, &day, 0, shown.busy(), &self.panes.cur.open_runs, self.model.shown_subagents()),
+                        turns::build(
+                            items,
+                            &day,
+                            0,
+                            shown.busy(),
+                            &self.panes.cur.open_runs,
+                            self.model.lives[self.panes.cur.live].shown_subagents()
+                        ),
                         &prompts,
                         0
                     ))
@@ -5546,7 +5649,7 @@ impl AppView {
     pub(crate) fn toggle(&mut self, id: u64) {
         // A call: the state the user makes it, against the one it shows.
         let chose = {
-            let items = self.model.shown().items();
+            let items = self.model.lives[self.panes.cur.live].shown().items();
             items
                 .iter()
                 .position(|i| i.id == id)
@@ -5602,7 +5705,7 @@ impl AppView {
             self.panes.cur.list.scroll_to(top);
         }
         let before: HashSet<u64> = self.panes.cur.disp.iter().filter(|d| d.kind == Kind::Work).map(|d| d.id).collect();
-        let items = self.model.shown().items();
+        let items = self.model.lives[self.panes.cur.live].shown().items();
         if let Some(start) = items.iter().position(|i| i.id == id).map(|ix| turns::turn_start(items, ix + 1)) {
             // Folded: its rows' room goes on a spring under the header,
             // which holds (N1).
@@ -5693,11 +5796,18 @@ impl AppView {
     /// What the daemon said of the session on screen, each part if known:
     /// detached, model, effort, folder.
     fn session_src(&self) -> (bool, Option<&str>, Option<&str>, Option<&str>) {
-        let view = self.model.stats.view.as_ref();
-        let model = view.map(|v| v.model.as_str()).filter(|m| !m.is_empty()).or(self.model.active_meta().map(|s| s.model.as_str()));
+        let view = self.model.lives[self.panes.cur.live].stats.view.as_ref();
+        let model = view
+            .map(|v| v.model.as_str())
+            .filter(|m| !m.is_empty())
+            .or(self.model.active_meta(self.panes.cur.live).map(|s| s.model.as_str()));
         let effort = view.map(|v| v.effort.as_str()).filter(|e| !e.is_empty());
-        let cwd = self.model.stats.cwd.as_deref().or(self.model.active_meta().and_then(|s| s.cwd.as_deref()));
-        (self.model.active.is_none() && self.model.stats.detached, model, effort, cwd)
+        let cwd = self.model.lives[self.panes.cur.live]
+            .stats
+            .cwd
+            .as_deref()
+            .or(self.model.active_meta(self.panes.cur.live).and_then(|s| s.cwd.as_deref()));
+        (self.model.lives[self.panes.cur.live].active.is_none() && self.model.lives[self.panes.cur.live].stats.detached, model, effort, cwd)
     }
 
     /// The session on screen's line ([`SessionMeta`]), set. Built when it
@@ -5705,8 +5815,8 @@ impl AppView {
     pub(crate) fn session_meta(&self) -> SessionMeta {
         let (detached, model, effort, cwd) = self.session_src();
         SessionMeta {
-            title: self.model.transcript.title().map(|t| t.to_string().into()),
-            name: self.model.active_name().map(|n| n.to_string().into()),
+            title: self.model.lives[self.panes.cur.live].transcript.title().map(|t| t.to_string().into()),
+            name: self.model.active_name(self.panes.cur.live).map(|n| n.to_string().into()),
             model: model.map(|m| crate::named::short_model(m).into()),
             effort: effort.map(|e| e.to_string().into()),
             cwd: cwd.map(|c| home_short(c).into()),
@@ -5753,7 +5863,7 @@ impl AppView {
         }
         self.model.toggle_naming();
         if self.model.named.naming {
-            let current = self.model.active_name().unwrap_or_default().to_string();
+            let current = self.model.active_name(self.panes.cur.live).unwrap_or_default().to_string();
             self.name_input.update(cx, |s, cx| {
                 s.set_value(current, window, cx);
                 s.focus(window, cx);
@@ -5969,7 +6079,8 @@ impl AppView {
     /// its tray row's (tools · elapsed) when that row is this worker's,
     /// else its view's own.
     pub(crate) fn watched_state(&self, w: &crate::watch::Worker) -> (Liveness, SharedString) {
-        let session = self.model.active.as_ref().map(|a| a.session_id.as_str()).or(self.model.tabs.current_session());
+        let session =
+            self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.as_str()).or(self.model.tabs.current_session());
         let live = session
             .and_then(|s| self.worker_state(s, &w.handle_id, Some(w.key())))
             // Its session in no list here: what its own pages said.
@@ -5983,7 +6094,7 @@ impl AppView {
     /// HALT is drawn: this window drives the session's running turn (in a
     /// worker's view too).
     pub(crate) fn halt_shown(&self) -> bool {
-        self.model.transcript.busy() && self.drives()
+        self.model.lives[self.panes.cur.live].transcript.busy() && self.drives()
     }
 
     /// What is on screen, as far as HALT's arm goes: the visible tab, the
@@ -5991,8 +6102,8 @@ impl AppView {
     fn halt_place(&self) -> (Option<u64>, Option<&str>, bool) {
         (
             self.model.tabs.visible().map(|t| t.id),
-            self.model.active.as_ref().map(|a| a.session_id.as_str()),
-            self.model.watch.focus().is_some(),
+            self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.as_str()),
+            self.model.lives[self.panes.cur.live].watch.focus().is_some(),
         )
     }
 
@@ -6013,10 +6124,11 @@ impl AppView {
     pub(crate) fn halt(&mut self) {
         self.disarm_halt();
         if let Some(c) = &self.client
-            && self.model.can_send()
+            && let Some(seq) =
+                self.model.lives[self.panes.cur.live].attachment().filter(|_| self.model.lives[self.panes.cur.live].can_send())
         {
-            let _ = c.abort();
-            self.halted = self.model.active.as_ref().map(|a| (a.session_id.clone(), Instant::now()));
+            let _ = c.on(seq).abort();
+            self.halted = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| (a.session_id.clone(), Instant::now()));
             #[cfg(test)]
             {
                 self.halts += 1;
@@ -6030,7 +6142,7 @@ impl AppView {
     fn halt_escape(&mut self, now: Instant, cx: &mut Context<Self>) -> bool {
         // The second of two quick Escs that left a worker's view is not the
         // session's.
-        if !self.halt_shown() || self.model.watch.esc_guarded(now) {
+        if !self.halt_shown() || self.model.lives[self.panes.cur.live].watch.esc_guarded(now) {
             self.disarm_halt();
             return false;
         }
@@ -6121,7 +6233,7 @@ impl AppView {
                 .child(tbtn("name-save", if pending { "S A V I N G" } else { label::SAVE }, p.prose, p.ink).on_click(cx.listener(
                     |this, _, _, cx| {
                         let typed = this.name_input.read(cx).value().to_string();
-                        let req = this.model.rename_request(&typed);
+                        let req = this.model.rename_request(this.panes.cur.live, &typed);
                         this.rename(req);
                         cx.notify();
                     },
@@ -6162,7 +6274,7 @@ impl AppView {
     fn render_notice(&self, p: &Palette, m: &Metrics) -> Option<impl IntoElement> {
         let lay = self.panes.cur.layout;
         let note = self.composer_note().filter(|_| lay.form() == crate::fit::Form::Cramped);
-        let (text, color): (SharedString, Hsla) = match (self.model.last_error.clone(), note) {
+        let (text, color): (SharedString, Hsla) = match (self.model.lives[self.panes.cur.live].last_error.clone(), note) {
             (Some(e), Some(n)) => (format!("{e} · {n}").into(), p.err),
             (Some(e), None) => (e.into(), p.err),
             (None, Some(n)) => (n.clone(), self.note_color(&n, p)),
@@ -6247,10 +6359,10 @@ impl AppView {
     fn render_composer(&self, p: &Palette, m: &Metrics, to_card: bool, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let lay = self.panes.cur.layout;
         let dims = crate::fit::Composer::of(m, lay.form());
-        let busy = self.model.transcript.busy();
+        let busy = self.model.lives[self.panes.cur.live].transcript.busy();
         // Over a worker's view the composer steers it, or takes nothing
         // once it has finished.
-        let worker = self.model.watch.focused();
+        let worker = self.model.lives[self.panes.cur.live].watch.focused();
         // Its state and facts, read once (one source for the whole row).
         let watched = worker.map(|w| self.watched_state(w));
         let drives = self.drives();
@@ -6268,7 +6380,7 @@ impl AppView {
             Some(("offline: no daemon to send to".into(), p.dim_u))
         } else if self.client.is_none() {
             Some(("offline: synthetic transport, nothing is sent".into(), p.dim_u))
-        } else if self.model.switching() {
+        } else if self.model.lives[self.panes.cur.live].switching() {
             Some(("switching sessions…".into(), p.dim_u))
         } else if !drives && self.opening() {
             Some(("opening…".into(), p.dim_u))
@@ -6317,8 +6429,10 @@ impl AppView {
                 let st = self.model.tabs.current().map_or(crate::rail::State::Saved, |t| self.tab_state(t));
                 let (g, word, family) = glyph::foot(st);
                 let tally = match st {
-                    crate::rail::State::Workers => Some(self.model.active_workers()),
-                    crate::rail::State::NeedsYou => Some(self.model.transcript.pending_prompts().len()).filter(|n| *n > 1),
+                    crate::rail::State::Workers => Some(self.model.active_workers(self.panes.cur.live)),
+                    crate::rail::State::NeedsYou => {
+                        Some(self.model.lives[self.panes.cur.live].transcript.pending_prompts().len()).filter(|n| *n > 1)
+                    }
                     _ => None,
                 };
                 // READY only where this window can send.
@@ -6327,7 +6441,7 @@ impl AppView {
             }
             Some((live, _)) => {
                 let (g, word, _, family) = glyph::worker(*live);
-                let demoted = worker.is_some_and(|w| self.model.stats.subagents.demoted(w.subagent_id));
+                let demoted = worker.is_some_and(|w| self.model.lives[self.panes.cur.live].stats.subagents.demoted(w.subagent_id));
                 steady = Some(glyph::worker(glyph::steady(*live, demoted)).0);
                 (Some(g), Some(word), family, None)
             }
@@ -6422,7 +6536,7 @@ impl AppView {
             // not writing (Shady #23 round 2 M2). P2's sweep retired: one
             // ambient per object, motion.md §6.1.
             let el = if g == glyph::Glyph::Run {
-                let writing = self.model.shown().items().last().is_some_and(|i| match &i.tool {
+                let writing = self.model.lives[self.panes.cur.live].shown().items().last().is_some_and(|i| match &i.tool {
                     Some(t) => i.streaming && !t.result.is_empty(),
                     None => i.streaming,
                 });
@@ -6799,6 +6913,8 @@ pub(crate) fn one_line(s: &str, max: usize) -> String {
 
 struct Inputs {
     composer: Entity<TextareaState>,
+    /// The composer's subscription: the pane's ([`Pane::_subs`]).
+    composer_sub: Subscription,
     find_input: Entity<InputState>,
     palette_input: Entity<InputState>,
     name_input: Entity<InputState>,
@@ -6824,7 +6940,12 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
-        self.fx.rescope(self.motion_session(), self.motion_column());
+        let (session, column) = (self.motion_session(), self.motion_column());
+        self.fx.col(self.panes.cur.id).rescope(session, column);
+        // The chrome's motion is rescoped with the session on screen, as it
+        // was in pane 0's column: it clears on a switch as on main (Shady
+        // #30 M2; "never clear" is a deliberate non-change, #31).
+        self.fx.chrome().rescope(session, column);
         // Another session, or a worker's view in or out: its dock and draft
         // are drawn at their heights (a switch replays nothing).
         let scope = self.motion_session() ^ self.motion_column().rotate_left(17);
@@ -6870,17 +6991,19 @@ impl Render for AppView {
         self.sync_card(window, cx);
         self.sync_list();
         self.read_card_on_screen();
-        if self.panes.cur.stub_away.is_some() && (self.card_on_screen() || self.panes.cur.stub_away != self.model.card_key()) {
+        if self.panes.cur.stub_away.is_some()
+            && (self.card_on_screen() || self.panes.cur.stub_away != self.model.lives[self.panes.cur.live].card_key())
+        {
             self.panes.cur.stub_away = None;
         }
         self.panes.cur.card_keys.set(self.card_keys_live(window, cx));
         // Ctrl+J from a worker's view: the card once its row is built (that
         // card only: another, or none, drops it).
-        if self.panes.cur.jump_card.is_some() && self.panes.cur.jump_card != self.model.card_key() {
+        if self.panes.cur.jump_card.is_some() && self.panes.cur.jump_card != self.model.lives[self.panes.cur.live].card_key() {
             self.panes.cur.jump_card = None;
         }
         if self.panes.cur.jump_card.is_some_and(|k| self.current_card().is_some_and(|c| c.key == k))
-            && self.model.watch.focus().is_none()
+            && self.model.lives[self.panes.cur.live].watch.focus().is_none()
             && self.model.tabs.view().is_none()
             && self.card_ix().is_some()
         {
@@ -6892,9 +7015,8 @@ impl Render for AppView {
         // session's, or one a reconnect brings again, is history (the
         // scope, [`AppView::motion_session`]). Keyed by the prompt's id, not
         // the attach: the same prompt is the same card.
-        let prompt_key = self.model.transcript.pending_prompts().first().map_or(0, |pr| pr.id ^ (1 << 63));
-        self.panes.cur.card_at = self
-            .model
+        let prompt_key = self.model.lives[self.panes.cur.live].transcript.pending_prompts().first().map_or(0, |pr| pr.id ^ (1 << 63));
+        self.panes.cur.card_at = self.model.lives[self.panes.cur.live]
             .active
             .as_ref()
             .and_then(|_| self.fx.change(crate::motion::Tag::Card, 0, prompt_key, None))
@@ -7096,7 +7218,7 @@ impl Render for AppView {
         }
         if landed || lay.tight != self.panes.cur.layout.tight {
             self.panes.cur.list.remeasure();
-            self.panes.cur.metrics_gen += 1;
+            self.panes.cur.metrics_gen = self.panes.next_gen();
             // A room held at the end is read again against the list as
             // measured again, as a card's that lands ([`Slack::fresh`]): the
             // rows' new heights are not rows growing in under it (else the
@@ -7167,8 +7289,8 @@ impl Render for AppView {
         // A worker's view on screen asks for its next page; under Settings
         // or Usage, nothing. Whether its list is scrolled back (its oldest
         // rows stay while they may be read).
-        if self.model.watch.focus().is_some() {
-            self.model.watch.scrolled_back = !self.panes.cur.list.is_following_tail();
+        if self.model.lives[self.panes.cur.live].watch.focus().is_some() {
+            self.model.lives[self.panes.cur.live].watch.scrolled_back = !self.panes.cur.list.is_following_tail();
         }
         self.arm_watch_poll(cx);
         if self.panes.cur.attach_wait.is_some() && self.panes.cur.attach_due.is_none() {
@@ -7324,7 +7446,9 @@ impl Render for AppView {
                 .min_w_0()
                 .bg(p.canvas)
                 .child(tabs)
-                .when(self.model.named.naming && self.model.active.is_some(), |d| d.child(self.render_naming(&p, cx)))
+                .when(self.model.named.naming && self.model.lives[self.panes.cur.live].active.is_some(), |d| {
+                    d.child(self.render_naming(&p, cx))
+                })
                 .child(
                     div()
                         .flex_1()
@@ -7397,7 +7521,7 @@ impl Render for AppView {
                 if ev.keystroke.key == "j"
                     && m.control
                     && !(m.alt || m.shift || m.platform || m.function)
-                    && !this.model.transcript.pending_prompts().is_empty()
+                    && !this.model.lives[this.panes.cur.live].transcript.pending_prompts().is_empty()
                 {
                     cx.stop_propagation();
                     if this.palette.is_some() {
@@ -7476,8 +7600,8 @@ impl Render for AppView {
                     cx.stop_propagation();
                     cx.notify();
                 } else if ev.keystroke.key == "escape"
-                    && this.model.watch.focus().is_some()
-                    && !this.model.watch.in_tab()
+                    && this.model.lives[this.panes.cur.live].watch.focus().is_some()
+                    && !this.model.lives[this.panes.cur.live].watch.in_tab()
                     && this.model.tabs.view().is_none()
                 {
                     // A worker's view: back to the session (a held Esc once).
@@ -7507,7 +7631,7 @@ impl Render for AppView {
                         let m = &ev.keystroke.modifiers;
                         m.control || m.alt || m.shift || m.platform
                     }
-                    && this.model.watch.focus().is_none()
+                    && this.model.lives[this.panes.cur.live].watch.focus().is_none()
                     && this.model.tabs.view().is_none()
                     && this.panes.cur.composer.read(cx).focus_handle(cx).is_focused(window)
                     // An IME composition's Esc is the IME's (seen before

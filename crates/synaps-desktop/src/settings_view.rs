@@ -1133,7 +1133,7 @@ impl AppView {
 
     /// The session rows' current value, from its `RuntimeView`.
     fn session_value(&self, key: &str) -> String {
-        let Some(v) = self.model.stats.view.as_ref() else { return crate::usage::NONE.into() };
+        let Some(v) = self.model.lives[self.panes.cur.live].stats.view.as_ref() else { return crate::usage::NONE.into() };
         let n = |x: Option<u64>, unit: &str| {
             x.map(|x| if unit.is_empty() { x.to_string() } else { format!("{x} {unit}") }).unwrap_or_else(|| crate::usage::NONE.into())
         };
@@ -1152,7 +1152,7 @@ impl AppView {
     }
 
     fn group_session(&self, p: &Palette, cx: &ViewCx, writable: bool, find: &str) -> (SharedString, Vec<AnyElement>) {
-        let target = self.model.tabs.current().filter(|_| self.model.active.is_some());
+        let target = self.model.tabs.current().filter(|_| self.model.lives[self.panes.cur.live].active.is_some());
         let Some(tab) = target else {
             let rows = if settings::matches(find, "open a session to change these", "", "") {
                 vec![sans("Open a session to see these.", 13., 20., p.dim).py(px(12.)).into_any_element()]
@@ -1161,12 +1161,16 @@ impl AppView {
             };
             return ("no session open".into(), rows);
         };
-        let title = [self.model.transcript.title(), self.model.active_name(), Some(tab.label.as_str())]
-            .into_iter()
-            .flatten()
-            .find(|t| !t.trim().is_empty())
-            .unwrap_or("New session")
-            .to_string();
+        let title = [
+            self.model.lives[self.panes.cur.live].transcript.title(),
+            self.model.active_name(self.panes.cur.live),
+            Some(tab.label.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|t| !t.trim().is_empty())
+        .unwrap_or("New session")
+        .to_string();
         let line =
             format!("“{}” · live values · read-only here until this client can change a running session", crate::app::one_line(&title, 60));
         let mut rows = Vec::new();
@@ -1203,7 +1207,7 @@ impl AppView {
             });
         }
         if settings::matches(find, "System prompt", "system_prompt", "system prompt") {
-            let prompt = self.model.stats.view.as_ref().and_then(|v| v.system_prompt.clone());
+            let prompt = self.model.lives[self.panes.cur.live].stats.view.as_ref().and_then(|v| v.system_prompt.clone());
             let well = match prompt {
                 Some(text) => v_flex()
                     .child(
@@ -1232,7 +1236,11 @@ impl AppView {
                 key: "system_prompt",
                 help: "This session's system prompt (/prompt in the TUI). Applying and reloading from disk wait for the client's Set.",
                 control: Self::locked(
-                    if self.model.stats.view.as_ref().is_some_and(|v| v.system_prompt.is_some()) { "custom" } else { "default" },
+                    if self.model.lives[self.panes.cur.live].stats.view.as_ref().is_some_and(|v| v.system_prompt.is_some()) {
+                        "custom"
+                    } else {
+                        "default"
+                    },
                     p,
                 ),
                 tag: None,
@@ -1279,7 +1287,7 @@ impl AppView {
         };
         // The session rows' defaults show under them while a session is
         // open and the dash has them; else here.
-        let session_open = self.model.tabs.current().is_some() && self.model.active.is_some();
+        let session_open = self.model.tabs.current().is_some() && self.model.lives[self.panes.cur.live].active.is_some();
         let under_session = |key: &str| session_open && self.shown_config().is_some_and(|c| c.exposes(key));
         let writable = gate.is_ok();
         let mut out = Vec::new();
