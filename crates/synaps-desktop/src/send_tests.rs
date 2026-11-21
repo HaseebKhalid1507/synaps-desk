@@ -603,3 +603,95 @@ fn a_second_windows_keys_are_its_own(cx: &mut TestAppContext) {
     assert_eq!((tabs(cx, &one), rail(cx, &one)), (one_tabs, one_rail), "the first window as it was");
     let _ = first;
 }
+
+/// Shady #40 L2: in an app with two windows, the first window's keys are
+/// its own too. The second window's fallbacks run first (being newer):
+/// before #40 they took the first window's keys. After a send in the
+/// first window, Ctrl+T, Ctrl+W and Ctrl+B act there, and the second is as
+/// it was.
+#[gpui_kit::test]
+fn the_first_windows_keys_are_its_own(cx: &mut TestAppContext) {
+    let (first, one) = open(cx, Level::Off, false);
+    let (_w, view) = open(cx, Level::Off, false);
+    let rail = |cx: &mut TestAppContext, view: &Entity<AppView>| view.read_with(cx, |v, _| v.panels.rail_collapsed);
+    let (one_tabs, one_rail) = (tabs(cx, &one), rail(cx, &one));
+    let (two_tabs, two_rail) = (tabs(cx, &view), rail(cx, &view));
+    send_typed(cx, first, &one, "in the first window");
+    key(cx, first, "ctrl-t");
+    assert_eq!(tabs(cx, &one).0, one_tabs.0 + 1, "Ctrl+T after a send: a tab in the first window");
+    key(cx, first, "ctrl-w");
+    assert_eq!(tabs(cx, &one).0, one_tabs.0, "Ctrl+W closed it");
+    key(cx, first, "ctrl-b");
+    assert_eq!(rail(cx, &one), !one_rail, "Ctrl+B folded the first window's rail");
+    assert_eq!((tabs(cx, &view), rail(cx, &view)), (two_tabs, two_rail), "the second window as it was");
+}
+
+/// `action` in window `w` with the focus outside its view (on a handle in
+/// no element: an input that left the tree, app.rs M1), as GPUI dispatches
+/// it then: from the window's root, above the view, so only the app-wide
+/// fallbacks hear it (`Window::dispatch_action`, the way the keymap's
+/// replay goes too). A key would draw first, and the view would take the
+/// focus back before it.
+fn act_outside(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, action: Box<dyn gpui_kit::Action>) {
+    let what = action.name();
+    let outside = cx
+        .update_window(w, |_, window, cx| {
+            let away = cx.focus_handle();
+            window.focus(&away, cx);
+            let outside = !view.read(cx).focus.contains_focused(window, cx);
+            window.dispatch_action(action, cx);
+            outside
+        })
+        .expect("the window");
+    assert!(outside, "{what}: the focus outside the view");
+    cx.run_until_parked();
+    // Ctrl+T and Ctrl+W count presses together (`FoldKeys::PAIR`).
+    std::thread::sleep(std::time::Duration::from_millis(40));
+}
+
+/// Whether the view's own focus handle has the focus.
+fn view_focused(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> bool {
+    cx.update_window(w, |_, window, cx| view.read(cx).focus.is_focused(window)).expect("the window")
+}
+
+/// Shady #40 L1: with one window and the focus outside the view, Ctrl+B
+/// and the tab keys still act (the app-wide fallbacks, which rest on GPUI
+/// lending the window out for its dispatch: `app::dispatching`), and the
+/// view gets the focus back each time.
+#[gpui_kit::test]
+fn the_fallbacks_act_with_the_focus_outside_the_view(cx: &mut TestAppContext) {
+    let (w, view) = open(cx, Level::Off, false);
+    let rail = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panels.rail_collapsed);
+    let was = rail(cx);
+    act_outside(cx, w, &view, Box::new(crate::app::ToggleRail));
+    assert_eq!(rail(cx), !was, "Ctrl+B folded the rail");
+    assert!(view_focused(cx, w, &view), "Ctrl+B: the view has the focus back");
+    let n = tabs(cx, &view).0;
+    act_outside(cx, w, &view, Box::new(crate::app::NewTab));
+    assert_eq!(tabs(cx, &view).0, n + 1, "Ctrl+T: a new tab");
+    assert!(view_focused(cx, w, &view), "Ctrl+T: the view has the focus back");
+    act_outside(cx, w, &view, Box::new(crate::app::CloseTab));
+    assert_eq!(tabs(cx, &view).0, n, "Ctrl+W closed it");
+    act_outside(cx, w, &view, Box::new(crate::app::ToggleRail));
+    assert_eq!(rail(cx), was, "Ctrl+B again: the rail as it was");
+    assert!(view_focused(cx, w, &view), "the view has the focus back");
+}
+
+/// Shady #40 n1: a closed window's fallbacks take no keys. A second
+/// window opened, then closed: its fallbacks (the newer, run first) ate
+/// the first window's Ctrl+B and Ctrl+T when its focus was outside its view.
+#[gpui_kit::test]
+fn a_closed_windows_fallbacks_take_no_keys(cx: &mut TestAppContext) {
+    let (w, view) = open(cx, Level::Off, false);
+    let (gone, _) = open(cx, Level::Off, false);
+    cx.update_window(gone, |_, window, _| window.remove_window()).expect("the second window");
+    cx.run_until_parked();
+    assert!(!cx.update(|cx| cx.windows().contains(&gone)), "the second window closed");
+    let rail = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panels.rail_collapsed);
+    let was = rail(cx);
+    act_outside(cx, w, &view, Box::new(crate::app::ToggleRail));
+    assert_eq!(rail(cx), !was, "Ctrl+B folded the first window's rail");
+    let n = tabs(cx, &view).0;
+    act_outside(cx, w, &view, Box::new(crate::app::NewTab));
+    assert_eq!(tabs(cx, &view).0, n + 1, "Ctrl+T: a tab in the first window");
+}

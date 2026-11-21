@@ -9331,8 +9331,8 @@ fn the_thumb_holds_while_an_edge_is_dragged(cx: &mut TestAppContext) {
 /// painted: an edge dragged out and let go near its detent springs back
 /// with the transcript's thumb where it was through the whole gesture; a
 /// rail fold's landing re-wraps the column, and that frame paints the
-/// thumb as the one before it did (the rows are on their estimates), the
-/// next from the rows.
+/// thumb from the rows (their hints read ahead: #46, finish gate N1), held
+/// in no frame.
 #[gpui_kit::test]
 fn the_thumb_holds_through_a_springback_and_a_landing_rewrap(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (1280., 720.), crate::theme::Panels::default().text_size);
@@ -9363,8 +9363,8 @@ fn the_thumb_holds_through_a_springback_and_a_landing_rewrap(cx: &mut TestAppCon
     settle(cx, w, 8);
     assert!((panel(cx, &view, true).0 - w0).abs() < 0.5, "back at its detent");
     // The rail folds: the column widens when it lands (nothing else holds
-    // the thumb in this flight). The frame that re-wraps paints it as the
-    // one before did; the next, from the rows.
+    // the thumb in this flight). The frame that re-wraps paints it from
+    // the rows (#46): no frame holds it.
     let column = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.layout.column);
     let col0 = column(cx);
     let bars = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.bars.transcript.paints());
@@ -9377,7 +9377,7 @@ fn the_thumb_holds_through_a_springback_and_a_landing_rewrap(cx: &mut TestAppCon
     let paints = bars(cx);
     assert!(column(cx) > col0 + 10., "a wider column ({col0} → {})", column(cx));
     let held: Vec<usize> = (1..paints.len()).filter(|&i| paints[i].2).collect();
-    assert!(!held.is_empty() && paints.len() > 30, "the landing's frame held: {paints:?}");
+    assert!(held.is_empty() && paints.len() > 30, "no frame held, the landing's either: {paints:?}");
     for i in held {
         let (a, b) = (paints[i - 1], paints[i]);
         assert!((a.0 - b.0).abs() < 0.5 && (a.1 - b.1).abs() < 0.5, "held as the frame before painted it: {a:?} {b:?}");
