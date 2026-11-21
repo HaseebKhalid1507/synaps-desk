@@ -444,7 +444,9 @@ impl AppView {
                 .w(px(qw))
                 .h_full()
                 .bg(p.raised)
-                .when(!needs, |d| d.child(div().absolute().top_0().left_0().right(px(1.)).h(px(2.)).bg(p.you_bar)))
+                .when(!needs && !(self.panes.split() && self.panes.cur.id != self.panes.focused), |d| {
+                    d.child(div().absolute().top_0().left_0().right(px(1.)).h(px(2.)).bg(p.you_bar))
+                })
         });
         self.panes.cur.tab_fx.drawn = drawn;
         self.panes.cur.tab_fx.shown = selected;
@@ -555,16 +557,19 @@ impl AppView {
             crate::motion::QUICK,
             crate::motion::HOVER_OUT,
         );
-        let title_color = crate::motion::mix(title_of(false), title_of(true), k);
+        // Split panes (split.md §6): an unfocused pane's active tab keeps
+        // its raised ground; its title is the tab default and it has no bar.
+        let unfocused = self.panes.split() && self.panes.cur.id != self.panes.focused;
+        let title_color = crate::motion::mix(title_of(false), title_of(!unfocused), k);
         // NEEDS YOU first: a worker tab's session's prompt too. Its bar
         // draws left to right over `base` (motion.md §6.3).
         let needs = st == State::NeedsYou;
         let bar = if needs {
-            let since = fx.change(crate::motion::Tag::TabNeeds, id, 1, None).map(|c| c.0);
+            let since = fx.col(self.panes.cur.id).change(crate::motion::Tag::TabNeeds, id, 1, None).map(|c| c.0);
             Some((p.warn_mark_ch, fx.draw(since, std::time::Duration::ZERO, crate::motion::BASE)))
         } else {
-            fx.change(crate::motion::Tag::TabNeeds, id, 0, None);
-            (on && lit).then_some((p.you_bar, 1.))
+            fx.col(self.panes.cur.id).change(crate::motion::Tag::TabNeeds, id, 0, None);
+            (on && lit && !unfocused).then_some((p.you_bar, 1.))
         };
         // Hover and press (fluid.md §3.9): the fill on over `hover_in`, off
         // over `hover_out`; held, `press_ch` and the content 1 px down.

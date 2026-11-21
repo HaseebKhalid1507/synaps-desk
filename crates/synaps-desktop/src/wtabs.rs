@@ -899,14 +899,17 @@ impl AppView {
     /// The armed cancel's end draws (once, when it runs out).
     fn arm_cancel_tick(&mut self, cx: &mut Context<Self>) {
         let Some(until) = self.model.lives[self.panes.cur.live].cancels.armed_until() else { return };
+        let id = self.panes.cur.id;
         self.panes.cur.cancel_tick = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(until.saturating_duration_since(Instant::now())).await;
             let _ = this.update(cx, |v, cx| {
-                v.panes.cur.cancel_tick = None;
-                if v.model.lives[v.panes.cur.live].cancels.expire(Instant::now()) {
-                    v.refresh_menu();
-                    cx.notify();
-                }
+                v.in_pane(id, |v| {
+                    v.panes.cur.cancel_tick = None;
+                    if v.model.lives[v.panes.cur.live].cancels.expire(Instant::now()) {
+                        v.refresh_menu();
+                        cx.notify();
+                    }
+                })
             });
         }));
     }

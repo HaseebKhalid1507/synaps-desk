@@ -548,6 +548,12 @@ impl AppView {
     /// Open (or focus) Settings or Usage, at the end of the tab strip.
     pub(crate) fn open_view(&mut self, kind: Kind, cx: &mut Context<Self>) {
         self.gear_menu = false;
+        // Split panes: one of each per window (split.md §0, its cached pane
+        // is drawn in one place); opened again, the pane that holds it is
+        // focused.
+        if let Some(id) = self.panes.rest.iter().find(|p| p.parked.tabs.iter().any(|t| t.kind == kind)).map(|p| p.id) {
+            self.focus_quiet(id);
+        }
         if self.model.tabs.open_view(kind) {
             self.model.rail_gen += 1;
             self.reconcile(None);

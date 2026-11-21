@@ -358,6 +358,26 @@ impl Lives {
         self.shown
     }
 
+    /// The pane acted on shows `id` now (split panes step 3: the store
+    /// whose attach its tab strip follows is that pane's).
+    pub(crate) fn show(&mut self, id: LiveId) {
+        self.shown = id;
+    }
+
+    /// A store no pane shows any more goes (its attachment detached by the
+    /// caller). The first store stays for the window's life.
+    pub(crate) fn remove(&mut self, id: LiveId) {
+        if id != LiveId::FIRST {
+            self.slots.retain(|(i, _)| *i != id);
+        }
+    }
+
+    /// The store whose session is `session_id` (attached, or asked for
+    /// last), other than `but`: a pane switching to it shares it.
+    pub(crate) fn of_session(&self, session_id: &str, but: LiveId) -> Option<LiveId> {
+        self.slots.iter().find(|(i, l)| *i != but && (l.is_active(session_id) || l.is_wanted(session_id))).map(|(i, _)| *i)
+    }
+
     /// The store whose attachment is `attach_seq` (the one it asked for
     /// last): where that attachment's events go.
     pub(crate) fn wanting(&self, attach_seq: u64) -> Option<LiveId> {
