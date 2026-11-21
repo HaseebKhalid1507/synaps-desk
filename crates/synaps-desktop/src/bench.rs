@@ -1440,7 +1440,19 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             (x0, y0, w, h)
                         })
                         .unwrap_or_default();
-                    let row = point(rail.left() + px(60.), rail.top() + px(20.));
+                    // A session's row (a section's label has no drag).
+                    let row = view
+                        .update(cx, |v, _| {
+                            let rail = &v.rail.rail;
+                            rail.items.iter().enumerate().find_map(|(ix, it)| {
+                                crate::chrome::row_key(rail, it)?;
+                                let b = v.rail_list.bounds_for_item(ix)?;
+                                Some(point(b.left() + px(60.), b.top() + px(12.)))
+                            })
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or(point(rail.left() + px(60.), rail.top() + px(60.)));
                     let input = |cx: &mut AsyncWindowContext, ev: PlatformInput| {
                         let _ = cx.update(|window, cx| {
                             window.dispatch_event(ev, cx);
@@ -1452,6 +1464,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     input(cx, PlatformInput::MouseDown(MouseDownEvent { button: MouseButton::Left, position: row, modifiers: none, click_count: 1, first_mouse: false }));
                     input(cx, PlatformInput::MouseMove(MouseMoveEvent { position: point(row.x + px(12.), row.y + px(4.)), pressed_button: held, modifiers: none }));
                     sleep(0.3).await;
+                    let dragging = view.update(cx, |v, _| v.dnd.on.is_some()).unwrap_or(false);
                     let moves = 180;
                     let mut at = row;
                     let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
@@ -1466,6 +1479,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     sleep(0.3).await;
                     out["drag_dnd"] = stats(cx, t0, Instant::now(), c0, f0);
                     out["drag_dnd"]["moves"] = json!(moves);
+                    // The drag was ours all along (its targets up).
+                    out["drag_dnd"]["ours"] = json!(dragging);
                     let n = view.update(cx, |v, _| v.panes.len()).unwrap_or(0);
                     out["drag_dnd"]["panes"] = json!(n);
                     let esc = Keystroke::parse("escape").expect("a key");
