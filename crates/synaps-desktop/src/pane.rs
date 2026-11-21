@@ -298,6 +298,10 @@ pub struct Pane {
     pub(crate) parked: Parked,
     /// Its rectangle in the centre, as last laid out (split panes).
     pub(crate) rect: Cell<crate::split::Rect>,
+    /// Its rectangle as the layout's flight lands (split.md §10; at rest,
+    /// `rect`): its form, its fit and its foot are the landed pane's, so
+    /// none of them change in the middle of a split or a close.
+    pub(crate) land: Cell<crate::split::Rect>,
 }
 
 /// Why the keys are to follow the focus mark at the next frame
@@ -473,6 +477,7 @@ impl Pane {
             _subs: subs,
             parked: Default::default(),
             rect: Cell::new(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }),
+            land: Cell::new(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }),
         }
     }
 }
@@ -495,6 +500,10 @@ pub(crate) struct Panes {
     pub(crate) focused: PaneId,
     /// The layout ([`crate::split::Node`]).
     pub(crate) tree: crate::split::Node,
+    /// The layout's change in flight, on `sheet` (split.md §10).
+    pub(crate) flight: Option<crate::split::Flight>,
+    /// A divider held down, or dragged (split.md §4).
+    pub(crate) grab: Option<crate::split::Grab>,
     /// The last generation handed out ([`Panes::next_gen`]).
     gens: u64,
 }
@@ -502,7 +511,7 @@ pub(crate) struct Panes {
 impl Panes {
     pub(crate) fn one(pane: Pane) -> Self {
         let id = pane.id;
-        Panes { cur: pane, rest: Vec::new(), focused: id, tree: crate::split::Node::Leaf(id), gens: 0 }
+        Panes { cur: pane, rest: Vec::new(), focused: id, tree: crate::split::Node::Leaf(id), flight: None, grab: None, gens: 0 }
     }
 
     /// More than one pane on screen.
@@ -875,6 +884,8 @@ impl crate::app::AppView {
         pane.list_gen = self.panes.next_gen();
         pane.metrics_gen = self.panes.cur.metrics_gen;
         pane.full_rebuild = true;
+        // Its share grows from the split line on `sheet` (split.md §10).
+        self.panes.flight = Some(crate::split::Flight::new(tree.grown_from(new), tree.clone(), Some(new), None));
         self.panes.tree = tree;
         self.panes.rest.push(pane);
         self.focus_pane(new, KeysTo::Pane, cx);
@@ -942,7 +953,10 @@ impl crate::app::AppView {
         let id = self.panes.cur.id;
         let (Some(to), Some(tree)) = (self.panes.tree.neighbour(id), self.panes.tree.remove(id)) else { return };
         let live = self.panes.cur.live;
-        self.panes.tree = tree;
+        // Its share springs to 0 on `sheet`, the panes beside it taking the
+        // space (split.md §8, §10).
+        let was = std::mem::replace(&mut self.panes.tree, tree);
+        self.panes.flight = Some(crate::split::Flight::new(was.clone(), was.zeroed(id), None, Some(id)));
         // Focus moves only off the pane that had it (Shady #36 L3b: a close
         // an event made never takes it from the pane in use), and the keys
         // with it, from the inputs that went (L3a).
@@ -1005,6 +1019,104 @@ impl crate::app::AppView {
     }
 }
 
+/// [`pane_script`]'s `film3b` scene.
+async fn film3b(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, t0: Instant) {
+    use crate::split::{Axis, Side};
+    let mark = |what: &str| eprintln!("PANES {what} {:.3}", t0.elapsed().as_secs_f64());
+    let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
+    let act = |cx: &mut AsyncWindowContext, f: &mut dyn FnMut(&mut crate::app::AppView, &mut Window, &mut Context<crate::app::AppView>)| {
+        let _ = view.update_in(cx, |v, window, cx| {
+            f(v, window, cx);
+            cx.notify();
+        });
+    };
+    // A divider on `axis` held, moved `by` px over `secs` (60 moves a
+    // second, as a pointer's), let go if `release`.
+    async fn drag(
+        view: &WeakEntity<crate::app::AppView>,
+        cx: &mut AsyncWindowContext,
+        ex: &BackgroundExecutor,
+        axis: Axis,
+        by: f32,
+        secs: f64,
+        release: bool,
+    ) {
+        let _ = view.update(cx, |v, _| {
+            let (w, h) = v.centre.get();
+            let d = v.panes.tree.dividers(crate::split::Rect { x: 0., y: 0., w, h }).into_iter().find(|d| d.axis == axis);
+            v.panes.grab = d.map(|divider| crate::split::Grab { divider, from: 0., moved: false });
+        });
+        let n = (secs * 60.).round().max(1.) as usize;
+        for k in 1..=n {
+            ex.timer(std::time::Duration::from_secs_f64(1. / 60.)).await;
+            let at = by * k as f32 / n as f32;
+            let _ = view.update(cx, |v, cx| v.drag_divider(point(px(at), px(at)), cx));
+        }
+        if release {
+            let _ = view.update(cx, |v, cx| v.release_divider(cx));
+        }
+    }
+    mark("split");
+    act(cx, &mut |v, w, cx| v.split_pane(None, w, cx));
+    sleep(1.6).await;
+    mark("split-down");
+    act(cx, &mut |v, w, cx| v.split_pane(Some(Side::Down), w, cx));
+    sleep(1.6).await;
+    mark("drag-left");
+    drag(view, cx, ex, Axis::Row, -240., 1.0, true).await;
+    sleep(0.8).await;
+    // Back to 6 px short of equal, let go: it lands on equal.
+    mark("drag-detent");
+    let back = view.update(cx, |v, _| {
+        let (w, h) = v.centre.get();
+        let r = v.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h });
+        let left = r.iter().map(|(_, r)| r.w).fold(f32::MAX, f32::min);
+        ((w - crate::split::DIVIDER) / 2.).floor() - 6. - left
+    });
+    drag(view, cx, ex, Axis::Row, back.unwrap_or(0.), 0.8, true).await;
+    sleep(1.2).await;
+    mark("drag-down-to-min");
+    drag(view, cx, ex, Axis::Column, 600., 0.8, true).await;
+    sleep(0.6).await;
+    mark("drag-right-to-min");
+    drag(view, cx, ex, Axis::Row, 900., 1.0, true).await;
+    sleep(0.4).await;
+    mark("min-320x240");
+    sleep(1.4).await;
+    mark("double-click-equalise");
+    act(cx, &mut |v, _, cx| {
+        let (w, h) = v.centre.get();
+        let d = v.panes.tree.dividers(crate::split::Rect { x: 0., y: 0., w, h });
+        if let Some(d) = d.iter().find(|d| d.axis == Axis::Column) {
+            v.click_divider(&d.path.clone(), 2, cx);
+        }
+    });
+    sleep(1.2).await;
+    act(cx, &mut |v, _, cx| {
+        let (w, h) = v.centre.get();
+        let d = v.panes.tree.dividers(crate::split::Rect { x: 0., y: 0., w, h });
+        if let Some(d) = d.iter().find(|d| d.axis == Axis::Row) {
+            v.click_divider(&d.path.clone(), 2, cx);
+        }
+    });
+    sleep(1.6).await;
+    for _ in 0..2 {
+        mark("close");
+        act(cx, &mut |v, _, _| {
+            let last = v.reading_order().last().copied();
+            if let Some(id) = last {
+                v.in_pane(id, |v| {
+                    if let Some(ix) = v.model.tabs.active() {
+                        v.close_tab(ix);
+                    }
+                });
+            }
+        });
+        sleep(1.6).await;
+    }
+    mark("done");
+}
+
 /// The splits that make `n` panes (split.md §4): 2 side by side, 3
 /// across, 4 as 2×2. Each: the pane to focus first (reading order), and
 /// the side (`None`: right, or down if narrow).
@@ -1023,7 +1135,11 @@ pub(crate) fn shape(n: usize) -> Vec<(Option<usize>, Option<crate::split::Side>)
 /// side; 3: three across; 4: 2×2), or the film's scene, each step marked
 /// on stderr (`PANES <what> <s>`): split right, the right pane opens
 /// another session, split down, focus by F6, Shift+F6 and Alt+1, a draft
-/// per pane, then the panes close one by one (each collapses).
+/// per pane, then the panes close one by one (each collapses). `film3b`
+/// (split.md §4, §10): split right and down (each grows), the dividers
+/// dragged as a pointer would (1:1, 60 moves a second), to their
+/// minimums (the bottom right pane at 320 × 240), let go near equal (the
+/// detent), a double-click (equalise), then the two closes.
 pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, window: &mut Window, cx: &mut App) {
     use crate::app::AppView;
     use crate::split::Side;
@@ -1042,7 +1158,12 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
             let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
             // The film's first split once its recording has begun
             // (`scripts/capture-linux.sh` starts 3.5 s after the window).
-            let film = how == "film";
+            let film = how.starts_with("film");
+            if how == "film3b" {
+                sleep(5.0).await;
+                film3b(&view, cx, &ex, t0).await;
+                return;
+            }
             sleep(if film { 5.0 } else { 1.5 }).await;
             if let Ok(n) = how.parse::<usize>() {
                 for (at, side) in shape(n) {

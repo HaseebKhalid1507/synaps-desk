@@ -245,9 +245,13 @@ pub(crate) const STRIP: f32 = 32.;
 /// The dock's and the composer field's heights on their springs. Q5's
 /// motion keys share `0x7AF*`: `0x7AF0` the panels' widths and
 /// `0x7AF3` a rail section's fold and FAVOURITES' chevron (chrome.rs),
-/// `0x7AF1` / `0x7AF2` these, `0x7AF4` a chip's cell (tray.rs).
+/// `0x7AF1` / `0x7AF2` these, `0x7AF4` a chip's cell (tray.rs), `0x7AF5`
+/// the split panes' layout flight ([`PANE_FLIGHT`]).
 const DOCK_H: u64 = 0x7AF1 << 48;
 const COMPOSER_H: u64 = 0x7AF2 << 48;
+/// The split panes' layout in flight (split.md §10): one spring, its
+/// travel in px ([`crate::split::Flight`]).
+const PANE_FLIGHT: u64 = 0x7AF5 << 48;
 
 /// `el`, whose laid-out height goes to `sink`: when it changes under
 /// [`crate::motion::Level::Full`], one more frame, so its box springs to
@@ -670,6 +674,16 @@ pub(crate) struct EdgeGrab {
 pub(crate) struct EdgeDrag;
 
 impl Render for EdgeDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// GPUI's drag value for a divider between split panes (split.md §4).
+#[derive(Clone, Copy)]
+pub(crate) struct PaneDrag;
+
+impl Render for PaneDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         Empty
     }
@@ -6802,22 +6816,25 @@ impl AppView {
         })
     }
 
+    /// The pane acted on's composer's bottom inset. Split, the panes along
+    /// the window's foot end their composers on one line: the inset is the
+    /// window's form's (finish gate #36 M3); its top, rows and card well
+    /// stay the pane's own. By its landed rectangle: a split's or a close's
+    /// flight never moves it.
+    pub(crate) fn foot_bottom(&self, m: &Metrics) -> f32 {
+        let foot = {
+            let (r, (_, h)) = (self.panes.cur.land.get(), self.centre.get());
+            self.panes.split() && (r.y + r.h - h).abs() < 0.5
+        };
+        let form =
+            if foot { if self.top_short { crate::fit::Form::Short } else { crate::fit::Form::Full } } else { self.panes.cur.layout.form() };
+        crate::fit::Composer::of(m, form).bottom
+    }
+
     fn render_composer(&self, p: &Palette, m: &Metrics, to_card: bool, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let lay = self.panes.cur.layout;
         let dims = crate::fit::Composer::of(m, lay.form());
-        // Split, the panes along the window's foot end their composers on
-        // one line: the bottom inset is the window's form's (finish gate
-        // #36 M3); its top, rows and card well stay the pane's own.
-        let foot = {
-            let (r, (_, h)) = (self.panes.cur.rect.get(), self.centre.get());
-            self.panes.split() && (r.y + r.h - h).abs() < 0.5
-        };
-        let bottom = if foot {
-            let form = if self.top_short { crate::fit::Form::Short } else { crate::fit::Form::Full };
-            crate::fit::Composer::of(m, form).bottom
-        } else {
-            dims.bottom
-        };
+        let bottom = self.foot_bottom(m);
         let pane_ix = self.panes.cur.id.index();
         let busy = self.model.lives[self.panes.cur.live].transcript.busy();
         // Over a worker's view the composer steers it, or takes nothing
@@ -7440,7 +7457,9 @@ impl AppView {
         let lay = Layout::of_in(pane, wrap, g.win_h - crate::chrome::TOP, &m, ex);
         // The labels hang as the flight's end will, and move with it: this
         // pane's, by its own width (each pane has its `HangFx`).
-        let (lay, landed) = self.panes.cur.hang_fx.frame(lay, pane, pane_to, self.panel_fx.moving(), &m);
+        // A split's or a close's flight is a flight too (split.md §10).
+        let flying = self.panel_fx.moving() || self.panes.flight.is_some();
+        let (lay, landed) = self.panes.cur.hang_fx.frame(lay, pane, pane_to, flying, &m);
         if lay.hang_k > 0. && lay.hang_k < 1. {
             // On their way, the labels are placed by their widths.
             for l in [fonts::label::YOU, fonts::label::AGENT, fonts::label::SYNAPS] {
@@ -7498,7 +7517,17 @@ impl AppView {
         // The 3-line rule counts the chips fading out too: 5 workers going
         // to 4 keep their lines until the fifth's fade is over, so no
         // `+1 more` blinks in for it (Shady #16 r4).
-        let (form, height, workers) = (lay.form(), g.win_h, self.tray.rows.len() + self.tray.ghosts.len());
+        // The room the fit shares out (Shady #36 L-e, L-f): a split pane's
+        // own height under its own form's bars (`win_h` counts the full
+        // bar, and a Short pane's are 12 px less), less what a foot pane's
+        // composer insets more than its form's (the window's, M3).
+        let height = if self.panes.split() {
+            let extra = (self.foot_bottom(&m) - crate::fit::Composer::of(&m, lay.form()).bottom).max(0.);
+            g.win_h - crate::chrome::TOP + crate::chrome::top_h(lay.short) - extra
+        } else {
+            g.win_h
+        };
+        let (form, workers) = (lay.form(), self.tray.rows.len() + self.tray.ghosts.len());
         self.tray_rows = if view.is_none() {
             self.fit_chips(lay.column, &m, |needed| crate::fit::chip_lines(&m, form, height, card_shown, ex, workers, needed))
         } else {
@@ -7513,7 +7542,7 @@ impl AppView {
             window.request_animation_frame();
         }
         let ex = crate::fit::Extras { tray: self.tray_rows as u8, ..ex };
-        let rows = crate::fit::composer_rows(&m, lay.form(), g.win_h, card_shown, ex);
+        let rows = crate::fit::composer_rows(&m, lay.form(), height, card_shown, ex);
         if rows != self.panes.cur.composer_rows {
             self.panes.cur.composer_rows = rows;
             self.panes.cur.composer.update(cx, |s, cx| s.set_auto_grow(1, rows, cx));
@@ -7849,6 +7878,19 @@ impl AppView {
                 let r = rects.iter().find(|(i, _)| i == id).map_or(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }, |(_, r)| *r);
                 let el = mains.iter().position(|(i, _)| i == id).map(|i| mains.remove(i).1);
                 let id = *id;
+                // A closing pane's share (split.md §8): an empty pane's
+                // ground, its strip and the canvas, going to 0.
+                if self.panes.flight.as_ref().is_some_and(|f| f.ghost == Some(id)) {
+                    return div()
+                        .flex_none()
+                        .w(px(r.w))
+                        .h(px(r.h))
+                        .overflow_hidden()
+                        .bg(p.canvas)
+                        .debug_selector(move || format!("pane-closing {}", id.index()))
+                        .child(div().h(px(crate::tabstrip::TAB_H)).w_full().bg(p.chrome).border_b_1().border_color(p.hair))
+                        .into_any_element();
+                }
                 self.probe(h_flex(), "pane")
                     .flex_none()
                     .w(px(r.w))
@@ -7887,6 +7929,148 @@ impl AppView {
                     Axis::Column => v_flex().flex_none().w(px(w)).h(px(h)).children(els).into_any_element(),
                 }
             }
+        }
+    }
+}
+
+impl AppView {
+    /// The layout as drawn this frame in `area` (split.md §10): the tree at
+    /// rest; in a flight, its step on `sheet`, on whole pixels. The step
+    /// is `from` to `to` by the spring's travel; within a pixel of its end
+    /// it is the tree itself, so the last frame that moves draws the landed
+    /// layout and nothing moves after it. Reduced and Off: the tree, at
+    /// once ([`crate::motion::Motion::spring_jump`] starts nothing).
+    pub(crate) fn pane_flight_frame(&mut self, area: crate::split::Rect) -> crate::split::Node {
+        let Some(f) = self.panes.flight.as_mut() else { return self.panes.tree.clone() };
+        if f.travel == 0. {
+            f.travel = f.to.travel_from(&f.from, area);
+            if f.travel < 1. {
+                self.panes.flight = None;
+                return self.panes.tree.clone();
+            }
+            self.fx.spring_jump(PANE_FLIGHT, 0., f.travel, crate::motion::SHEET_RESPONSE);
+        }
+        let (d, moving) = self.fx.spring_px(PANE_FLIGHT, f.travel, crate::motion::SHEET_RESPONSE);
+        if !moving {
+            self.panes.flight = None;
+            return self.panes.tree.clone();
+        }
+        let t = if (f.travel - d).abs() < 1. { 1. } else { (d / f.travel).clamp(0., 1.) };
+        if t >= 1. { self.panes.tree.clone() } else { f.to.lerp_from(&f.from, t) }
+    }
+
+    /// The layout changes to `to` on `sheet` from where it is drawn
+    /// (split.md §10: a double-click's equalise, a release's detent).
+    fn fly_layout(&mut self, to: crate::split::Node, cx: &mut Context<Self>) {
+        if to == self.panes.tree {
+            return;
+        }
+        let from = std::mem::replace(&mut self.panes.tree, to.clone());
+        self.panes.flight = Some(crate::split::Flight::new(from, to, None, None));
+        cx.notify();
+    }
+
+    /// Each divider's grab (split.md §4): the 1 px rule in a 6 px handle,
+    /// `edge` on hover and `dim_ch` while dragged, the resize cursor, as
+    /// the side panels' edges are (`render_edge`). Over the panes, in the
+    /// centre's own pixels.
+    fn divider_handles(&self, tree: &crate::split::Node, area: crate::split::Rect, p: &Palette, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        use crate::split::Axis;
+        const GRAB: f32 = 6.;
+        const LINE: f32 = 2.;
+        let held = self.panes.grab.as_ref().filter(|g| g.moved).map(|g| (g.divider.path.clone(), g.divider.i));
+        let (edge, dim) = (p.edge, p.dim_ch);
+        tree.dividers(area)
+            .into_iter()
+            .enumerate()
+            .map(|(n, d)| {
+                let row = d.axis == Axis::Row;
+                let at = if row { d.rect.x + d.at } else { d.rect.y + d.at };
+                let dragged = held.as_ref() == Some(&(d.path.clone(), d.i));
+                let group: SharedString = format!("divider-grab-{n}").into();
+                let line = div()
+                    .absolute()
+                    .map(|l| if row { l.top_0().bottom_0().left(px(LINE)).w(px(1.)) } else { l.left_0().right_0().top(px(LINE)).h(px(1.)) })
+                    .when(dragged, |l| l.bg(dim))
+                    .when(!dragged, |l| l.group_hover(group.clone(), |s| s.bg(edge)));
+                let path = d.path.clone();
+                div()
+                    .id(("divider-grab", n))
+                    .debug_selector(move || format!("divider-grab {n}"))
+                    .group(group.clone())
+                    .absolute()
+                    .map(|e| {
+                        if row {
+                            e.left(px(at - LINE)).top(px(d.rect.y)).w(px(GRAB)).h(px(d.rect.h))
+                        } else {
+                            e.top(px(at - LINE)).left(px(d.rect.x)).h(px(GRAB)).w(px(d.rect.w))
+                        }
+                    })
+                    .cursor(if row { CursorStyle::ResizeLeftRight } else { CursorStyle::ResizeUpDown })
+                    // The wheel still scrolls the pane under it.
+                    .block_mouse_except_scroll()
+                    .child(line)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            let from = if row { ev.position.x } else { ev.position.y };
+                            this.panes.grab = Some(crate::split::Grab { divider: d.clone(), from: from.into(), moved: false });
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_drag(PaneDrag, |d, _, _, cx| cx.new(|_| *d))
+                    // Let go over a handle (it blocks the root's drop).
+                    .on_drop(cx.listener(|this, _: &PaneDrag, _, cx| this.release_divider(cx)))
+                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| this.click_divider(&path, ev.click_count(), cx)))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// The pointer at `at` (window px) in a divider's drag: the divider
+    /// follows it 1:1 and stops at the two panes' minimums beside it
+    /// (split.md §4, A10). Each move sets the tree; the frame lays it out
+    /// once (a move between frames measures nothing).
+    pub(crate) fn drag_divider(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(g) = self.panes.grab.as_mut() else { return };
+        g.moved = true;
+        let pos = f32::from(if g.divider.axis == crate::split::Axis::Row { at.x } else { at.y });
+        let to = g.divider.at + (pos - g.from);
+        let mut tree = self.panes.tree.clone();
+        tree.drag(&g.divider, to);
+        if tree != self.panes.tree {
+            self.panes.tree = tree;
+            self.panes.flight = None;
+            cx.notify();
+        }
+    }
+
+    /// A divider's drag let go (split.md §4): within 8 px of equal with the
+    /// pane beside it, it lands on equal, on `sheet`.
+    pub(crate) fn release_divider(&mut self, cx: &mut Context<Self>) {
+        let Some(g) = self.panes.grab.take() else { return };
+        if !g.moved {
+            return;
+        }
+        let mut to = self.panes.tree.clone();
+        to.detent(&g.divider);
+        self.fly_layout(to, cx);
+        cx.notify();
+    }
+
+    /// A click on a divider: a double-click equalises its split, on
+    /// `sheet` (split.md §4).
+    pub(crate) fn click_divider(&mut self, path: &[usize], count: usize, cx: &mut Context<Self>) {
+        // A drag let go over its own handle: its release, not a click.
+        if self.panes.grab.as_ref().is_some_and(|g| g.moved) {
+            self.release_divider(cx);
+            return;
+        }
+        self.panes.grab = None;
+        if count >= 2 {
+            let mut to = self.panes.tree.clone();
+            to.equalise(path);
+            self.fly_layout(to, cx);
         }
     }
 }
@@ -8122,8 +8306,14 @@ impl Render for AppView {
         // Under the bar drawn (M1: the panes reach the window's foot).
         let centre_h = self.height - crate::chrome::top_h(self.top_short);
         self.centre.set((centre, centre_h));
-        let main = if self.panes.split() {
-            let rects = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
+        // A close's flight down to one pane is drawn split until it lands.
+        let main = if self.panes.split() || self.panes.flight.is_some() {
+            let area = |w: f32| crate::split::Rect { x: 0., y: 0., w, h: centre_h };
+            // The layout as drawn this frame: the tree, or its flight's
+            // step (split.md §10).
+            let drawn = self.pane_flight_frame(area(centre));
+            let rects = drawn.rects(area(centre));
+            let land = self.panes.tree.rects(area(centre));
             // Each pane's width as the panels' flight lands, and the width
             // its column wraps at while they fly: its rectangle in the
             // centre at `pane_to`, and at the flight's narrowest (`wrap`).
@@ -8132,31 +8322,59 @@ impl Render for AppView {
             // centre's, `r.w * wrap / pane` went a pixel either way as its
             // rounded width and the centre's fraction moved, and each step
             // measured the list again).
-            let at = |w: f32| self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h: centre_h });
+            let at = |w: f32| self.panes.tree.rects(area(w));
             let (rects_to, rects_wrap) = (at(pane_to), at(wrap));
+            let (grow, ghost) = self.panes.flight.as_ref().map_or((None, None), |f| (f.grow, f.ghost));
             let mut mains = Vec::new();
             for (id, r) in &rects {
+                if ghost == Some(*id) {
+                    continue;
+                }
                 let of = |rs: &[(PaneId, crate::split::Rect)]| rs.iter().find(|(i, _)| i == id).map_or(r.w, |(_, t)| t.w);
+                let l = land.iter().find(|(i, _)| i == id).map_or(*r, |(_, l)| *l);
+                // In the layout's flight: a split's new pane is laid out
+                // at its landed size, its share clipping it; every other
+                // pane's column keeps the narrowest box of the flight (it
+                // rewraps once), and its form and fit are the landed ones.
+                let grows = grow == Some(*id);
+                let narrowest = self.panes.flight.as_mut().map(|f| match f.wrap.iter_mut().find(|(i, _)| i == id) {
+                    Some((_, w)) => {
+                        *w = w.min(r.w).min(l.w);
+                        *w
+                    }
+                    None => {
+                        f.wrap.push((*id, r.w.min(l.w)));
+                        r.w.min(l.w)
+                    }
+                });
+                let pane = if grows { l.w } else { r.w };
+                // One pane left (a close's flight to it): its height read
+                // as one pane's is (under the full bar), as it lands.
+                let win_h = if self.panes.split() { l.h + crate::chrome::TOP } else { self.height };
                 let g = PaneFrame {
-                    pane: r.w,
-                    wrap: of(&rects_wrap).min(r.w),
+                    pane,
+                    wrap: of(&rects_wrap).min(pane).min(narrowest.filter(|_| !grows).unwrap_or(f32::INFINITY)),
                     pane_to: of(&rects_to),
-                    view_pane: r.w,
-                    win_h: r.h + crate::chrome::TOP,
+                    view_pane: pane,
+                    win_h,
                     p,
                     m,
                 };
                 if let Some(el) = self.in_pane(*id, |v| {
                     v.panes.cur.rect.set(*r);
+                    v.panes.cur.land.set(l);
                     v.pane_main(g, window, cx)
                 }) {
+                    let el = if grows { div().flex_none().w(px(l.w)).h(px(l.h)).child(el) } else { el };
                     mains.push((*id, el));
                 }
             }
-            div().flex_1().h_full().min_w_0().child(self.lay_panes(&self.panes.tree.clone(), &rects, &mut mains, &p, cx))
+            let handles = if self.panes.flight.is_none() { self.divider_handles(&drawn, area(centre), &p, cx) } else { Vec::new() };
+            div().flex_1().h_full().min_w_0().relative().child(self.lay_panes(&drawn, &rects, &mut mains, &p, cx)).children(handles)
         } else {
             let g = PaneFrame { pane, wrap, pane_to, view_pane, win_h: self.height, p, m };
             self.panes.cur.rect.set(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
+            self.panes.cur.land.set(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
             self.pane_main(g, window, cx)
         };
         self.schedule_tabs_save(cx);
@@ -8166,6 +8384,11 @@ impl Render for AppView {
         h_flex()
             .id("root")
             .track_focus(&self.focus)
+            // A divider dragged: its resize cursor wherever the pointer
+            // goes, as it stays on the handle (split.md §4).
+            .when_some(self.panes.grab.as_ref().filter(|g| g.moved).map(|g| g.divider.axis), |d, axis| {
+                d.cursor(if axis == crate::split::Axis::Row { CursorStyle::ResizeLeftRight } else { CursorStyle::ResizeUpDown })
+            })
             .when_some(
                 root_context(
                     card_tab,
@@ -8393,6 +8616,16 @@ impl Render for AppView {
                 }
             }))
             .on_drop(cx.listener(|this, _: &EdgeDrag, _, cx| this.end_drag(cx)))
+            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<PaneDrag>, window, cx| {
+                if ev.event.pressed_button == Some(MouseButton::Left) {
+                    this.drag_divider(ev.event.position, cx);
+                } else {
+                    // The release went elsewhere: as an edge's drag.
+                    cx.stop_active_drag(window);
+                    this.release_divider(cx);
+                }
+            }))
+            .on_drop(cx.listener(|this, _: &PaneDrag, _, cx| this.release_divider(cx)))
             .on_action(cx.listener(|this, _: &ToggleRail, _, cx| this.fold_key(true, cx)))
             .on_action(cx.listener(|this, _: &ToggleRight, _, cx| this.fold_key(false, cx)))
             .on_action(cx.listener(|this, _: &TextBigger, _, cx| this.step_text(Some(1), cx)))

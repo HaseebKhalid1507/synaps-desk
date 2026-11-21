@@ -30,6 +30,57 @@ pub(crate) enum Side {
     Down,
 }
 
+/// Released within this many px of equal, a divider lands on equal
+/// (split.md §4).
+pub(crate) const DETENT: f32 = 8.;
+
+/// A divider (split.md §4), as [`Node::dividers`] finds it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Divider {
+    pub path: Vec<usize>,
+    pub i: usize,
+    pub axis: Axis,
+    pub rect: Rect,
+    pub at: f32,
+}
+
+/// A layout change on `sheet` (split.md §10): a split, a close, a
+/// double-click's equalise or a release's detent. The tree is drawn from
+/// `from` to `to` (the same shape: a split's new pane and a close's pane
+/// are in both) by one spring `travel` px long, the most any edge moves;
+/// what lands is the tree itself.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Flight {
+    pub from: Node,
+    pub to: Node,
+    /// A split's new pane: laid out at its landed size from the first
+    /// frame, its share clipping it (it slides in with the split line).
+    pub grow: Option<PaneId>,
+    /// The pane a close took: its share, its ground only, closing.
+    pub ghost: Option<PaneId>,
+    /// Its spring's length; 0 until its first frame measures it.
+    pub travel: f32,
+    /// Each pane's narrowest box so far: its column keeps that wrap until
+    /// the flight lands (the panels' `PanelFx.freeze` rule: it rewraps
+    /// once, at the start as it narrows, at the end as it widens).
+    pub wrap: Vec<(PaneId, f32)>,
+}
+
+impl Flight {
+    pub(crate) fn new(from: Node, to: Node, grow: Option<PaneId>, ghost: Option<PaneId>) -> Self {
+        Flight { from, to, grow, ghost, travel: 0., wrap: Vec::new() }
+    }
+}
+
+/// A divider held down (split.md §4): which one, where the pointer went
+/// down along its axis, and where the divider was then.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Grab {
+    pub divider: Divider,
+    pub from: f32,
+    pub moved: bool,
+}
+
 /// Why a split did not happen (the composer's status line says it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refused {
@@ -223,28 +274,208 @@ impl Node {
     fn place(&self, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
         match self {
             Node::Leaf(id) => out.push((*id, area)),
-            Node::Split { axis, kids, ratios } => {
-                let len = match axis {
-                    Axis::Row => area.w,
-                    Axis::Column => area.h,
-                };
-                let room = (len - DIVIDER * (kids.len() - 1) as f32).max(0.);
-                let mut at = 0f32;
-                let mut acc = 0f32;
-                for (i, (kid, r)) in kids.iter().zip(ratios).enumerate() {
-                    acc += r;
-                    let end = if i + 1 == kids.len() { room } else { (room * acc).round() };
-                    let size = (end - at).max(0.);
-                    let off = at + DIVIDER * i as f32;
-                    let sub = match axis {
-                        Axis::Row => Rect { x: area.x + off, y: area.y, w: size, h: area.h },
-                        Axis::Column => Rect { x: area.x, y: area.y + off, w: area.w, h: size },
-                    };
+            Node::Split { kids, .. } => {
+                let mut subs = Vec::new();
+                self.kid_rects(area, &mut subs);
+                for (kid, sub) in kids.iter().zip(subs) {
                     kid.place(sub, out);
-                    at = end;
                 }
             }
         }
+    }
+
+    /// The smallest this subtree gets along `axis`: its panes' minimums
+    /// and the rules between them.
+    fn min_along(&self, axis: Axis) -> f32 {
+        let (across, down) = self.extent();
+        match axis {
+            Axis::Row => across as f32 * PANE_MIN_W + (across - 1) as f32 * DIVIDER,
+            Axis::Column => down as f32 * PANE_MIN_H + (down - 1) as f32 * DIVIDER,
+        }
+    }
+
+    /// Every divider (split.md §4): its split's path from the root (kid
+    /// indices), the kid it follows, the split's axis and rectangle, and
+    /// where it is (px from the split's start along its axis).
+    pub(crate) fn dividers(&self, area: Rect) -> Vec<Divider> {
+        let mut out = Vec::new();
+        self.find_dividers(area, &mut Vec::new(), &mut out);
+        out
+    }
+
+    fn find_dividers(&self, area: Rect, path: &mut Vec<usize>, out: &mut Vec<Divider>) {
+        let Node::Split { axis, kids, .. } = self else { return };
+        let mut rects = Vec::new();
+        self.kid_rects(area, &mut rects);
+        for (i, r) in rects.iter().enumerate() {
+            if i + 1 < rects.len() {
+                let at = match axis {
+                    Axis::Row => r.x + r.w - area.x,
+                    Axis::Column => r.y + r.h - area.y,
+                };
+                out.push(Divider { path: path.clone(), i, axis: *axis, rect: area, at });
+            }
+            path.push(i);
+            kids[i].find_dividers(*r, path, out);
+            path.pop();
+        }
+    }
+
+    /// Each kid's rectangle in `area` (as [`Node::rects`] lays them).
+    fn kid_rects(&self, area: Rect, out: &mut Vec<Rect>) {
+        let Node::Split { axis, kids, ratios } = self else { return };
+        let len = match axis {
+            Axis::Row => area.w,
+            Axis::Column => area.h,
+        };
+        let room = (len - DIVIDER * (kids.len() - 1) as f32).max(0.);
+        let (mut at, mut acc) = (0f32, 0f32);
+        for (i, r) in ratios.iter().enumerate() {
+            acc += r;
+            let end = if i + 1 == kids.len() { room } else { (room * acc).round() };
+            let off = at + DIVIDER * i as f32;
+            out.push(match axis {
+                Axis::Row => Rect { x: area.x + off, y: area.y, w: (end - at).max(0.), h: area.h },
+                Axis::Column => Rect { x: area.x, y: area.y + off, w: area.w, h: (end - at).max(0.) },
+            });
+            at = end;
+        }
+    }
+
+    fn at_mut(&mut self, path: &[usize]) -> Option<&mut Node> {
+        match path.split_first() {
+            None => Some(self),
+            Some((i, rest)) => match self {
+                Node::Split { kids, .. } => kids.get_mut(*i)?.at_mut(rest),
+                Node::Leaf(_) => None,
+            },
+        }
+    }
+
+    /// Divider `d` dragged to `at` px from its split's start (split.md
+    /// §4, A10): 1:1, the two kids beside it keeping their minimums (it
+    /// stops there; it never pushes a third).
+    pub(crate) fn drag(&mut self, d: &Divider, at: f32) {
+        let len = match d.axis {
+            Axis::Row => d.rect.w,
+            Axis::Column => d.rect.h,
+        };
+        let Some(Node::Split { kids, ratios, axis }) = self.at_mut(&d.path) else { return };
+        let i = d.i;
+        if i + 1 >= kids.len() {
+            return;
+        }
+        let room = (len - DIVIDER * (kids.len() - 1) as f32).max(1.);
+        let a: f32 = ratios[..i].iter().sum();
+        let b = a + ratios[i] + ratios[i + 1];
+        let (lo, hi) = (a + kids[i].min_along(*axis) / room, b - kids[i + 1].min_along(*axis) / room);
+        if lo > hi {
+            return;
+        }
+        let c = ((at - DIVIDER * i as f32) / room).clamp(lo, hi);
+        ratios[i] = c - a;
+        ratios[i + 1] = b - c;
+    }
+
+    /// A drag let go (split.md §4): within [`DETENT`] px of the two kids
+    /// beside it being equal, they are.
+    pub(crate) fn detent(&mut self, d: &Divider) {
+        let len = match d.axis {
+            Axis::Row => d.rect.w,
+            Axis::Column => d.rect.h,
+        };
+        let Some(Node::Split { kids, ratios, .. }) = self.at_mut(&d.path) else { return };
+        let room = (len - DIVIDER * (kids.len() - 1) as f32).max(1.);
+        let (r0, r1) = (ratios[d.i], ratios[d.i + 1]);
+        if ((r0 - r1).abs() * room / 2.) <= DETENT {
+            let m = (r0 + r1) / 2.;
+            (ratios[d.i], ratios[d.i + 1]) = (m, m);
+        }
+    }
+
+    /// A double-click on a divider (split.md §4): its split's kids equal.
+    pub(crate) fn equalise(&mut self, path: &[usize]) {
+        if let Some(Node::Split { kids, ratios, .. }) = self.at_mut(path) {
+            let n = kids.len() as f32;
+            ratios.iter_mut().for_each(|r| *r = 1. / n);
+        }
+    }
+
+    /// The kid indices from the root down to leaf `id`.
+    fn path_of(&self, id: PaneId) -> Option<Vec<usize>> {
+        let mut path = Vec::new();
+        self.path_to(id, &mut path).then(|| path.iter().map(|(_, i)| *i).collect())
+    }
+
+    /// Where a split's flight starts (split.md §10): `id` (the new pane)
+    /// at a share of 0, its share back with the pane before it in its
+    /// split (the one it split off), so it grows from the split line.
+    pub(crate) fn grown_from(&self, id: PaneId) -> Node {
+        let mut n = self.clone();
+        if let Some(path) = self.path_of(id)
+            && let Some((&i, parent)) = path.split_last()
+            && let Some(Node::Split { ratios, .. }) = n.at_mut(parent)
+        {
+            let j = if i > 0 { i - 1 } else { i + 1 };
+            if j < ratios.len() {
+                ratios[j] += ratios[i];
+                ratios[i] = 0.;
+            }
+        }
+        n
+    }
+
+    /// Where a close's flight lands (split.md §8): `id` (the pane closing)
+    /// at a share of 0, the kids beside it in its split scaled up to take
+    /// it, as [`Node::remove`] shares it out.
+    pub(crate) fn zeroed(&self, id: PaneId) -> Node {
+        let mut n = self.clone();
+        if let Some(path) = self.path_of(id)
+            && let Some((&i, parent)) = path.split_last()
+            && let Some(Node::Split { ratios, .. }) = n.at_mut(parent)
+        {
+            let rest = 1. - ratios[i];
+            if rest > 0. {
+                for (j, r) in ratios.iter_mut().enumerate() {
+                    *r = if j == i { 0. } else { *r / rest };
+                }
+            }
+        }
+        n
+    }
+
+    /// Each split's ratios `t` of the way from `from`'s to this tree's
+    /// (`t` 1: this tree itself). Not the same shape: this tree.
+    pub(crate) fn lerp_from(&self, from: &Node, t: f32) -> Node {
+        if t >= 1. {
+            return self.clone();
+        }
+        match (self, from) {
+            (Node::Leaf(a), Node::Leaf(b)) if a == b => self.clone(),
+            (Node::Split { axis, kids, ratios }, Node::Split { axis: a2, kids: k2, ratios: r2 })
+                if axis == a2 && kids.len() == k2.len() =>
+            {
+                let kids = kids.iter().zip(k2).map(|(k, f)| k.lerp_from(f, t)).collect();
+                let ratios = ratios.iter().zip(r2).map(|(to, fr)| fr + (to - fr) * t).collect();
+                Node::Split { axis: *axis, kids, ratios }
+            }
+            _ => self.clone(),
+        }
+    }
+
+    /// How far a flight from `from` to this tree moves anything in `area`
+    /// (the most any pane's edge travels, px): its spring's length.
+    pub(crate) fn travel_from(&self, from: &Node, area: Rect) -> f32 {
+        let (a, b) = (from.rects(area), self.rects(area));
+        let mut most = 0f32;
+        for (id, r) in &b {
+            if let Some((_, f)) = a.iter().find(|(i, _)| i == id) {
+                for d in [r.x - f.x, r.y - f.y, r.x + r.w - f.x - f.w, r.y + r.h - f.y - f.h] {
+                    most = most.max(d.abs());
+                }
+            }
+        }
+        most
     }
 
     /// The panes in reading order (split.md §1): top to bottom, then left
@@ -369,6 +600,84 @@ mod tests {
         assert_eq!(t2, Node::Split { axis: Axis::Row, kids: vec![Node::Leaf(p(0)), Node::Leaf(p(1))], ratios: vec![0.5, 0.5] });
         assert_eq!(t2.remove(p(0)).unwrap(), Node::Leaf(p(1)));
         assert_eq!(Node::Leaf(p(0)).remove(p(0)), None, "the last pane");
+    }
+
+    /// A divider follows the pointer 1:1, stops at the minimums of the two
+    /// panes beside it, lands on equal within 8 px, and a double-click
+    /// equalises its split (split.md §4, A10).
+    #[test]
+    fn a_divider_drags_stops_at_the_minimum_and_lands_on_equal() {
+        let t = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), A).unwrap();
+        let mut t = t.split(p(1), Side::Right, p(2), A).unwrap();
+        let d = t.dividers(area());
+        assert_eq!(d.len(), 2);
+        let first = d[0].clone();
+        let r = t.rects(area());
+        assert_eq!(first.at, r[0].1.w, "right after the first pane");
+        t.drag(&first, 600.);
+        let r = t.rects(area());
+        assert_eq!(r[0].1.w, 600., "1:1");
+        assert_eq!(r[1].1.x, 601.);
+        // Past the second pane's minimum: it stops there.
+        t.drag(&first, 1200.);
+        let r = t.rects(area());
+        assert!((r[1].1.w - PANE_MIN_W).abs() <= 1., "the next pane at its minimum: {r:?}");
+        assert!(r[2].1.w >= PANE_MIN_W, "never pushes a third");
+        t.drag(&first, 10.);
+        assert!((t.rects(area())[0].1.w - PANE_MIN_W).abs() <= 1.);
+        // Let go 6 px from equal with the pane beside it: equal.
+        let d = t.dividers(area())[0].clone();
+        let pair = t.rects(area())[0].1.w + t.rects(area())[1].1.w;
+        t.drag(&d, (pair / 2.).round() + 6.);
+        t.detent(&d);
+        let r = t.rects(area());
+        assert!((r[0].1.w - r[1].1.w).abs() <= 1., "on equal: {r:?}");
+        t.drag(&d, 200. + PANE_MIN_W);
+        t.equalise(&d.path);
+        let r = t.rects(area());
+        assert!(r.windows(2).all(|w| (w[0].1.w - w[1].1.w).abs() <= 1.), "equalised: {r:?}");
+        // A nested split's divider: stacked, its own path.
+        let t2 = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), A).unwrap().split(p(1), Side::Down, p(2), A).unwrap();
+        let d2 = t2.dividers(area());
+        assert_eq!(d2.len(), 2);
+        assert_eq!((d2[1].path.clone(), d2[1].axis), (vec![1], Axis::Column));
+    }
+
+    /// A split's flight starts with the new pane at 0 beside the pane it
+    /// split off (the rest where they were) and lands on the tree; a
+    /// close's lands with the pane at 0 and its share with the kids beside
+    /// it, as `remove` gives it them; each step is on whole pixels (split.md
+    /// §10).
+    #[test]
+    fn a_flight_grows_from_the_split_line_and_a_close_lands_as_remove() {
+        let two = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), A).unwrap();
+        let three = two.split(p(1), Side::Down, p(2), A).unwrap();
+        let from = three.grown_from(p(2));
+        let (r0, r1) = (two.rects(area()), from.rects(area()));
+        let at = |rs: &[(PaneId, Rect)], id| rs.iter().find(|(i, _)| *i == id).unwrap().1;
+        assert_eq!(at(&r1, p(0)), at(&r0, p(0)), "the left pane holds still");
+        assert_eq!(at(&r1, p(2)).h, 0., "the new pane from 0");
+        assert_eq!(at(&r1, p(1)).h, at(&r0, p(1)).h - DIVIDER, "the pane it split off keeps its share, less the rule");
+        assert_eq!(at(&r1, p(2)).y, at(&r1, p(1)).y + at(&r1, p(1)).h + DIVIDER, "at the split line");
+        assert_eq!(three.lerp_from(&from, 0.).rects(area()), r1);
+        assert_eq!(three.lerp_from(&from, 1.), three, "lands on the tree");
+        for k in 0..=20 {
+            let r = three.lerp_from(&from, k as f32 / 20.).rects(area());
+            assert!(r.iter().all(|(_, r)| [r.x, r.y, r.w, r.h].iter().all(|v| v.fract() == 0.)), "whole pixels at {k}: {r:?}");
+        }
+        assert_eq!(three.travel_from(&from, area()), at(&three.rects(area()), p(2)).h, "its travel: the new pane's height");
+        // A close: the pane at 0, its share to the one beside it.
+        let to = three.zeroed(p(2));
+        let gone = three.remove(p(2)).unwrap();
+        let (rt, rg) = (to.rects(area()), gone.rects(area()));
+        assert_eq!(at(&rt, p(2)).h, 0.);
+        assert_eq!(at(&rt, p(0)), at(&rg, p(0)));
+        assert_eq!(at(&rt, p(1)).h + DIVIDER, at(&rg, p(1)).h, "all but the rule the landed tree drops");
+        // Three across, the middle one closing: both sides take it, as remove shares it.
+        let across = two.split(p(1), Side::Right, p(2), A).unwrap();
+        let rt = across.zeroed(p(1)).rects(area());
+        let rg = across.remove(p(1)).unwrap().rects(area());
+        assert!((at(&rt, p(0)).w - at(&rg, p(0)).w).abs() <= 1. && (at(&rt, p(2)).w - at(&rg, p(2)).w).abs() <= 1., "{rt:?} / {rg:?}");
     }
 
     /// Reading order: top to bottom, then left to right (split.md §1).
