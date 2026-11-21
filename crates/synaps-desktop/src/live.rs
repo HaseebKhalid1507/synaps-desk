@@ -327,15 +327,24 @@ impl InFlight {
 /// one, [`LiveId::FIRST`], for the window's life.
 pub struct Lives {
     slots: Vec<(LiveId, Live)>,
+    /// The store the visible tab is shown from (the focused pane's): the
+    /// one whose attach the tab strip follows (`Tabs::attached`). Step 2:
+    /// [`LiveId::FIRST`], always; step 3's focus moves it.
+    shown: LiveId,
 }
 
 impl Default for Lives {
     fn default() -> Self {
-        Lives { slots: vec![(LiveId::FIRST, Live::default())] }
+        Lives { slots: vec![(LiveId::FIRST, Live::default())], shown: LiveId::FIRST }
     }
 }
 
 impl Lives {
+    /// The store the visible tab is shown from ([`Lives::shown`]'s field).
+    pub(crate) fn shown(&self) -> LiveId {
+        self.shown
+    }
+
     /// The store whose attachment is `attach_seq` (the one it asked for
     /// last): where that attachment's events go.
     pub(crate) fn wanting(&self, attach_seq: u64) -> Option<LiveId> {

@@ -1700,8 +1700,13 @@ impl Model {
                 });
                 self.lives[lid].wanted_session = Some(attached.meta.id.clone());
                 // The visible tab holds what attached (a create or a resume
-                // names it here).
-                self.tabs.attached(&attached.meta.id);
+                // names it here): its own store's attach only. Another
+                // store's (step 3's other pane) leaves the tab strip be, or
+                // the visible tab would be taken to that session and its
+                // own transcript stashed.
+                if lid == self.lives.shown() {
+                    self.tabs.attached(&attached.meta.id);
+                }
                 // Whatever was answered belongs to the attachment before.
                 self.lives[lid].answered.clear();
                 self.lives[lid].reattaching = false;
@@ -2169,6 +2174,29 @@ mod tests {
         m.watch.open(&Candidate::of(2, "sleeper"), None, t1);
         let _ = m.switch_out(LiveId::FIRST);
         assert_eq!(m.watch.poll_due(), None, "a background tab polls nothing");
+    }
+
+    /// Split panes step 2: a second store's attach (step 3's other pane)
+    /// leaves the visible tab on its own session; only the shown store's
+    /// attach repoints it (a create or a resume naming the session).
+    #[test]
+    fn another_stores_attach_leaves_the_visible_tab() {
+        let mut m = Model::new(ConnState::Connecting);
+        m.tabs.open("a", "a", crate::tabs::Place::Current);
+        m.want(LiveId::FIRST, 1);
+        m.asked_for(LiveId::FIRST, "a");
+        m.apply(Event::Attached { attach_seq: 1, attached: attached("a"), mode: AttachMode::Mirror, reconnect: false });
+        assert_eq!(m.tabs.visible_session(), Some("a"));
+        let b = m.lives.add();
+        m.want(b, 2);
+        m.asked_for(b, "b");
+        m.apply(Event::Attached { attach_seq: 2, attached: attached("b"), mode: AttachMode::Mirror, reconnect: false });
+        assert!(m.lives[b].is_active("b") && m.lives[LiveId::FIRST].is_active("a"), "both attached");
+        assert_eq!(m.tabs.visible_session(), Some("a"), "the visible tab is still the shown store's session");
+        // The shown store's own attach to another id (a resume) still moves it.
+        m.want(LiveId::FIRST, 3);
+        m.apply(Event::Attached { attach_seq: 3, attached: attached("a2"), mode: AttachMode::Mirror, reconnect: false });
+        assert_eq!(m.tabs.visible_session(), Some("a2"));
     }
 
     /// Shady M1/M2: a worker's pages reach the session's list through the
