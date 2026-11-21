@@ -135,6 +135,8 @@ pub struct Pane {
     /// The naming row was open at the last layout ([`AppView::keep_rows`]
     /// counts it as that layout had it).
     pub(crate) layout_naming: bool,
+    /// The labels' move between inline and the gutter ([`crate::turns::HangFx`]).
+    pub(crate) hang_fx: crate::turns::HangFx,
     /// The metrics the last frame drew with (a fold's header height:
     /// [`AppView::start_gap`]).
     pub(crate) metrics_last: Cell<Option<Metrics>>,
