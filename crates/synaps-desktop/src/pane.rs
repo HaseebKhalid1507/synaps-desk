@@ -57,6 +57,13 @@ impl PaneId {
         PaneId(i)
     }
 
+    /// A closing pane's share once its id is handed out again (Shady #42
+    /// r2-L1): past every open pane's, in the layout only (its ground; it
+    /// has no column).
+    pub(crate) const fn ghost(k: u8) -> Self {
+        PaneId(PANES_MAX as u8 + k)
+    }
+
     /// Its slot in per-pane arrays ([`crate::motion::Motion::col`]).
     pub(crate) const fn index(self) -> usize {
         self.0 as usize
@@ -298,6 +305,27 @@ pub struct Pane {
     pub(crate) parked: Parked,
     /// Its rectangle in the centre, as last laid out (split panes).
     pub(crate) rect: Cell<crate::split::Rect>,
+    /// Its rectangle as the layout's flight lands (split.md §10; at rest,
+    /// `rect`): its form, its fit and its foot are the landed pane's, so
+    /// none of them change in the middle of a split or a close.
+    pub(crate) land: Cell<crate::split::Rect>,
+    /// Its composer's landed inset from its foot as last drawn (NaN: not
+    /// drawn yet); a change in a layout's flight springs (finish gate #42
+    /// F3).
+    pub(crate) foot: Cell<f32>,
+    /// Its spring in motion.
+    pub(crate) foot_moving: Cell<bool>,
+    /// Its composer's inset above its box as last drawn, as `foot`.
+    pub(crate) top: Cell<f32>,
+    pub(crate) top_moving: Cell<bool>,
+    /// Closing (finish gate #42 F2): the box it is laid out in as its
+    /// share closes (its landed rectangle as the close began). It is drawn
+    /// there, its share clipping it, until the flight lands; nothing else
+    /// reaches it ([`Panes::closing`]).
+    pub(crate) closing: Option<crate::split::Rect>,
+    /// The session its rows are of, on a store only it showed: to the tab
+    /// cache as it goes ([`crate::app::AppView::cache_closed`]).
+    pub(crate) closing_key: Option<String>,
 }
 
 /// Why the keys are to follow the focus mark at the next frame
@@ -473,9 +501,21 @@ impl Pane {
             _subs: subs,
             parked: Default::default(),
             rect: Cell::new(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }),
+            land: Cell::new(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }),
+            foot: Cell::new(f32::NAN),
+            foot_moving: Cell::new(false),
+            top: Cell::new(f32::NAN),
+            top_moving: Cell::new(false),
+            closing: None,
+            closing_key: None,
         }
     }
 }
+
+/// Where a new flight starts ([`Panes::flight_ends`]): the layout as
+/// drawn, where the flight in the air goes, its growing and closing panes
+/// and its wraps.
+type FlightEnds = (crate::split::Node, crate::split::Node, Vec<PaneId>, Vec<PaneId>, Vec<(PaneId, f32)>);
 
 /// The window's panes (split panes step 3: up to [`PANES_MAX`], on
 /// [`Panes::tree`]).
@@ -491,10 +531,22 @@ pub(crate) struct Panes {
     pub(crate) cur: Pane,
     /// The others, in no order.
     pub(crate) rest: Vec<Pane>,
+    /// The panes closing on screen (finish gate #42 F2): out of the tree,
+    /// drawn as their shares close ([`crate::app::AppView::in_drawn`]),
+    /// never acted on ([`crate::app::AppView::in_pane`] finds open panes
+    /// only: no key, event, timer or send reaches them).
+    pub(crate) closing: Vec<Pane>,
     /// The focused pane: where keys, typing and the right panel go.
     pub(crate) focused: PaneId,
     /// The layout ([`crate::split::Node`]).
     pub(crate) tree: crate::split::Node,
+    /// The layout's change in flight, on `sheet` (split.md §10).
+    pub(crate) flight: Option<crate::split::Flight>,
+    /// A divider held down, or dragged (split.md §4).
+    pub(crate) grab: Option<crate::split::Grab>,
+    /// The layout as last drawn (a flight's step, else the tree): where
+    /// the next flight starts (Shady #42 M1).
+    pub(crate) drawn: crate::split::Node,
     /// The last generation handed out ([`Panes::next_gen`]).
     gens: u64,
 }
@@ -502,12 +554,87 @@ pub(crate) struct Panes {
 impl Panes {
     pub(crate) fn one(pane: Pane) -> Self {
         let id = pane.id;
-        Panes { cur: pane, rest: Vec::new(), focused: id, tree: crate::split::Node::Leaf(id), gens: 0 }
+        let tree = crate::split::Node::Leaf(id);
+        Panes {
+            cur: pane,
+            rest: Vec::new(),
+            closing: Vec::new(),
+            focused: id,
+            drawn: tree.clone(),
+            tree,
+            flight: None,
+            grab: None,
+            gens: 0,
+        }
     }
 
-    /// More than one pane on screen.
+    /// Where a new flight starts (split.md §10, Shady #42 M1): the layout
+    /// as drawn, and where the flight in the air goes (its closing panes in
+    /// it at 0), with its growing and closing panes and its wraps; at rest,
+    /// the tree.
+    fn flight_ends(&self) -> FlightEnds {
+        use crate::split::Node;
+        match &self.flight {
+            Some(f) if self.drawn.same_shape(&f.to) => (self.drawn.clone(), f.to.clone(), f.grow.clone(), f.ghosts.clone(), f.wrap.clone()),
+            _ => {
+                let drawn: Node = if self.drawn.same_shape(&self.tree) { self.drawn.clone() } else { self.tree.clone() };
+                (drawn, self.tree.clone(), Vec::new(), Vec::new(), Vec::new())
+            }
+        }
+    }
+
+    /// A split's flight to `tree` (split.md §10): `new` grows beside `at`
+    /// from the split line, every other pane from where it is drawn (a
+    /// pane still growing or closing carries on).
+    pub(crate) fn fly_split(&mut self, tree: &crate::split::Node, at: PaneId, side: crate::split::Side, new: PaneId) {
+        use crate::split::Flight;
+        let (mut drawn, mut to, mut grow, mut ghosts, mut wrap) = self.flight_ends();
+        // A closing pane's id handed out again (all four in use): its share
+        // keeps closing under a ghost's id, its ground only (its content
+        // goes: [`crate::app::AppView::reap_closing`]), and no pane moves
+        // for it (Shady #42 r2-L1).
+        if ghosts.contains(&new) {
+            let ghost = (0u8..).map(PaneId::ghost).find(|g| !ghosts.contains(g)).unwrap_or(PaneId::ghost(0));
+            ghosts.iter_mut().filter(|g| **g == new).for_each(|g| *g = ghost);
+            grow.retain(|g| *g != new);
+            wrap.retain(|(g, _)| *g != new);
+            (drawn, to) = (drawn.renamed(new, ghost), to.renamed(new, ghost));
+        }
+        let flight = match (drawn.split_as(at, side, new), to.split_as(at, side, new)) {
+            (Some(from), Some(to)) if from.same_shape(&to) => {
+                grow.push(new);
+                Flight { from: from.grown_from(new), to, grow, ghosts, travel: 0., wrap }
+            }
+            _ => Flight::new(tree.grown_from(new), tree.clone(), vec![new], Vec::new()),
+        };
+        self.drawn = flight.from.clone();
+        self.flight = Some(flight);
+    }
+
+    /// A close's flight (split.md §8, §10): `id`'s share to 0, the panes
+    /// beside it taking it, every pane from where it is drawn.
+    pub(crate) fn fly_close(&mut self, id: PaneId) {
+        let (drawn, to, mut grow, mut ghosts, wrap) = self.flight_ends();
+        grow.retain(|g| *g != id);
+        ghosts.push(id);
+        let to = to.zeroed(id);
+        self.drawn = drawn.clone();
+        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., wrap });
+    }
+
+    /// The layout's flight to `to` (split.md §10: an equalise, a detent),
+    /// from where it is drawn.
+    pub(crate) fn fly_to(&mut self, to: crate::split::Node) {
+        let (drawn, _, _, ghosts, wrap) = self.flight_ends();
+        let from = if ghosts.is_empty() && drawn.same_shape(&to) { drawn } else { self.tree.clone() };
+        self.tree = to.clone();
+        self.drawn = from.clone();
+        self.flight = Some(crate::split::Flight { from, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., wrap });
+    }
+
+    /// More than one pane on screen (a closing one drawn: it was).
     pub(crate) fn split(&self) -> bool {
-        !self.rest.is_empty()
+        !self.rest.is_empty() || self.cur.closing.is_some()
     }
 
     /// How many panes are open.
@@ -519,7 +646,11 @@ impl Panes {
     /// ids index the motion columns; a closed pane's column is reset when
     /// its id is handed out again).
     pub(crate) fn free_id(&self) -> Option<PaneId> {
-        (0..PANES_MAX as u8).map(PaneId::of).find(|id| self.get(*id).is_none())
+        // One still closing on screen last (its content goes at once; its
+        // share closes on as a ghost's ground: [`Panes::fly_split`]).
+        let closing = |id: &PaneId| self.flight.as_ref().is_some_and(|f| f.ghosts.contains(id));
+        let free = || (0..PANES_MAX as u8).map(PaneId::of).filter(|id| self.get(*id).is_none());
+        free().find(|id| !closing(id)).or_else(|| free().next())
     }
 
     /// Every open pane's id, in tree order.
@@ -535,9 +666,10 @@ impl Panes {
         std::iter::once(&self.cur).chain(self.rest.iter())
     }
 
-    /// The panes showing live store `live`.
+    /// The panes showing live store `live`, a closing one drawing from it
+    /// too (it stays until that pane goes).
     pub(crate) fn showing(&self, live: crate::live::LiveId) -> usize {
-        self.iter().filter(|p| p.live == live).count()
+        self.iter().chain(&self.closing).filter(|p| p.live == live).count()
     }
 
     /// A window-wide generation (split/architecture.md §6.1 rule 2, §1.1;
@@ -556,10 +688,25 @@ impl Panes {
         std::iter::once(&mut self.cur).chain(self.rest.iter_mut())
     }
 
+    /// The pane at `at`.
+    fn at(&mut self, at: Slot) -> &mut Pane {
+        match at {
+            Slot::Rest(i) => &mut self.rest[i],
+            Slot::Closing(k) => &mut self.closing[k],
+        }
+    }
+
     /// Pane `id`, if it is open (what an effect addressed to a pane finds).
     pub(crate) fn get_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
         if self.cur.id == id { Some(&mut self.cur) } else { self.rest.iter_mut().find(|p| p.id == id) }
     }
+}
+
+/// Where a pane not acted on is kept: open, or closing.
+#[derive(Clone, Copy)]
+enum Slot {
+    Rest(usize),
+    Closing(usize),
 }
 
 /// Split panes, step 3: the panes as the view acts on them.
@@ -572,12 +719,60 @@ impl crate::app::AppView {
             return true;
         }
         let Some(i) = self.panes.rest.iter().position(|p| p.id == id) else { return false };
-        let mut q = std::mem::take(&mut self.panes.rest[i].parked);
+        self.swap_pane(Slot::Rest(i));
+        true
+    }
+
+    /// `f` acting on pane `id` as it is drawn: an open pane (as
+    /// [`AppView::in_pane`]), else one closing (finish gate #42 F2: its
+    /// list and rows as they were). `None`: neither.
+    pub(crate) fn in_drawn<R>(&mut self, id: PaneId, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        if self.panes.get(id).is_some() {
+            return self.in_pane(id, f);
+        }
+        let k = self.panes.closing.iter().position(|p| p.id == id)?;
+        self.swap_pane(Slot::Closing(k));
+        let r = f(self);
+        self.swap_pane(Slot::Closing(k));
+        Some(r)
+    }
+
+    /// The closing panes whose share is closed (their flight landed, or
+    /// their id is an open pane's now: Shady #42 r2-L1) go: their rows to
+    /// the tab cache, their worker view and their store with them (what a
+    /// close did at once before finish gate #42 F2).
+    pub(crate) fn reap_closing(&mut self) {
+        loop {
+            let flying = |p: &Pane| self.panes.get(p.id).is_none() && self.panes.flight.as_ref().is_some_and(|f| f.ghosts.contains(&p.id));
+            let Some(k) = self.panes.closing.iter().position(|p| !flying(p)) else { break };
+            self.swap_pane(Slot::Closing(k));
+            self.cache_closed();
+            self.swap_pane(Slot::Closing(k));
+            let mut gone = self.panes.closing.remove(k);
+            // Its worker view, parked as it left, is no longer kept for it.
+            let view = std::mem::take(&mut gone.parked.view);
+            self.model.lives[gone.live].watch.drop_parked(view);
+            if self.panes.get(gone.id).is_none() {
+                self.fx.col(gone.id).reset();
+            }
+            let live = gone.live;
+            drop(gone);
+            self.release_live(live);
+            self.model.rail_gen += 1;
+            self.model.view_dirty = true;
+        }
+    }
+
+    /// Swap the pane at `at` into [`Panes::cur`], with its tabs, drafts,
+    /// tray and transcript bar, and show its store; the pane acted on so
+    /// far takes its place, parked.
+    fn swap_pane(&mut self, at: Slot) {
+        let mut q = std::mem::take(&mut self.panes.at(at).parked);
         // The worker views: the pane leaving takes its own out of its
         // store, then the one coming puts its own in.
         let leaving = self.model.lives[self.panes.cur.live].watch.park();
         let coming = std::mem::replace(&mut q.view, leaving);
-        let live = self.panes.rest[i].live;
+        let live = self.panes.at(at).live;
         self.model.lives[live].watch.unpark(coming);
         std::mem::swap(&mut self.model.tabs, &mut q.tabs);
         std::mem::swap(&mut self.bars.transcript, &mut q.bar);
@@ -591,10 +786,13 @@ impl crate::app::AppView {
         std::mem::swap(&mut self.took, &mut q.took);
         std::mem::swap(&mut self.ran, &mut q.ran);
         // `q` holds the pane acted on so far: parked with it.
-        std::mem::swap(&mut self.panes.cur, &mut self.panes.rest[i]);
-        self.panes.rest[i].parked = q;
+        let panes = &mut self.panes;
+        match at {
+            Slot::Rest(i) => std::mem::swap(&mut panes.cur, &mut panes.rest[i]),
+            Slot::Closing(k) => std::mem::swap(&mut panes.cur, &mut panes.closing[k]),
+        }
+        self.panes.at(at).parked = q;
         self.model.lives.show(self.panes.cur.live);
-        true
     }
 
     /// `f` acting on pane `id` (drawn, or an event, timer or effect
@@ -843,11 +1041,11 @@ impl crate::app::AppView {
         let next = match new {
             None => Err(Refused::Most),
             Some(new) => match side {
-                None => self.panes.tree.split_right(at, new, area).map(|(t, _)| t),
-                Some(s) => self.panes.tree.split(at, s, new, area),
+                None => self.panes.tree.split_right(at, new, area),
+                Some(s) => self.panes.tree.split(at, s, new, area).map(|t| (t, s)),
             },
         };
-        let (tree, new) = match (next, new) {
+        let ((tree, side), new) = match (next, new) {
             (Ok(t), Some(n)) => (t, n),
             (Err(r), _) => {
                 self.split_refused(r.note(), cx);
@@ -875,7 +1073,12 @@ impl crate::app::AppView {
         pane.list_gen = self.panes.next_gen();
         pane.metrics_gen = self.panes.cur.metrics_gen;
         pane.full_rebuild = true;
+        // Its share grows from the split line on `sheet` (split.md §10),
+        // the panes from where they are drawn. A divider held goes with
+        // the layout it was found in (Shady #42 M2).
+        self.panes.fly_split(&tree, at, side, new);
         self.panes.tree = tree;
+        self.panes.grab = None;
         self.panes.rest.push(pane);
         self.focus_pane(new, KeysTo::Pane, cx);
         if let Some((s, label)) = session {
@@ -941,8 +1144,19 @@ impl crate::app::AppView {
     pub(crate) fn close_pane(&mut self) {
         let id = self.panes.cur.id;
         let (Some(to), Some(tree)) = (self.panes.tree.neighbour(id), self.panes.tree.remove(id)) else { return };
-        let live = self.panes.cur.live;
+        // It leaves its store at once (its session let go, its attachment
+        // detached, as before), its rows kept to draw as its share closes
+        // (finish gate #42 F2): laid out where it was, its share clipping
+        // it, the split's grow reversed.
+        self.leave_for_close();
+        self.panes.cur.closing = Some(self.panes.cur.land.get());
+        // Its share springs to 0 on `sheet`, the panes beside it taking the
+        // space (split.md §8, §10).
+        // From where every pane is drawn (Shady #42 M1); a divider held
+        // goes with the layout it was found in (M2).
+        self.panes.fly_close(id);
         self.panes.tree = tree;
+        self.panes.grab = None;
         // Focus moves only off the pane that had it (Shady #36 L3b: a close
         // an event made never takes it from the pane in use), and the keys
         // with it, from the inputs that went (L3a).
@@ -951,19 +1165,14 @@ impl crate::app::AppView {
             self.keys_rearm = true;
             self.ask_keys(KeysTo::Closed);
         }
-        // What it sent still unconfirmed went to another pane on its store
-        // as it left the store (`AppView::repoint`, Shady #36 r2 L-c).
         let next = self.panes.focused;
         self.enter_pane(next);
         if let Some(i) = self.panes.rest.iter().position(|p| p.id == id) {
-            // Its worker view, parked as it left, is no longer kept for it.
-            let mut gone = self.panes.rest.remove(i);
-            let view = std::mem::take(&mut gone.parked.view);
-            self.model.lives[gone.live].watch.drop_parked(view);
-            drop(gone);
+            // Out of reach from here; it goes as its flight lands
+            // ([`AppView::reap_closing`]: at Reduced and Off, the next frame).
+            let gone = self.panes.rest.remove(i);
+            self.panes.closing.push(gone);
         }
-        self.fx.col(id).reset();
-        self.release_live(live);
         self.model.rail_gen += 1;
         self.model.view_dirty = true;
     }
@@ -1005,6 +1214,109 @@ impl crate::app::AppView {
     }
 }
 
+/// [`pane_script`]'s `film3b` scene.
+async fn film3b(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, t0: Instant) {
+    use crate::split::{Axis, Side};
+    let mark = |what: &str| eprintln!("PANES {what} {:.3}", t0.elapsed().as_secs_f64());
+    let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
+    let act = |cx: &mut AsyncWindowContext, f: &mut dyn FnMut(&mut crate::app::AppView, &mut Window, &mut Context<crate::app::AppView>)| {
+        let _ = view.update_in(cx, |v, window, cx| {
+            f(v, window, cx);
+            cx.notify();
+        });
+    };
+    // A divider on `axis` held, moved `by` px over `secs` (60 moves a
+    // second, as a pointer's), let go if `release`.
+    async fn drag(
+        view: &WeakEntity<crate::app::AppView>,
+        cx: &mut AsyncWindowContext,
+        ex: &BackgroundExecutor,
+        axis: Axis,
+        by: f32,
+        secs: f64,
+        release: bool,
+    ) {
+        let _ = view.update(cx, |v, _| {
+            let ((w, h), (ox, oy)) = (v.centre.get(), v.centre_at.get());
+            let d = v.panes.tree.dividers(crate::split::Rect { x: 0., y: 0., w, h }).into_iter().find(|d| d.axis == axis);
+            // A pointer at 0 on its rule: the moves are px from it.
+            let off = |d: &crate::split::Divider| match d.axis {
+                Axis::Row => -ox - d.rect.x - d.at,
+                Axis::Column => -oy - d.rect.y - d.at,
+            };
+            v.panes.grab = d.map(|divider| crate::split::Grab { off: off(&divider), divider, moved: false });
+        });
+        let n = (secs * 60.).round().max(1.) as usize;
+        for k in 1..=n {
+            ex.timer(std::time::Duration::from_secs_f64(1. / 60.)).await;
+            let at = by * k as f32 / n as f32;
+            let _ = view.update(cx, |v, cx| v.drag_divider(point(px(at), px(at)), cx));
+        }
+        if release {
+            let _ = view.update(cx, |v, cx| v.release_divider(cx));
+        }
+    }
+    mark("split");
+    act(cx, &mut |v, w, cx| v.split_pane(None, w, cx));
+    sleep(1.6).await;
+    mark("split-down");
+    act(cx, &mut |v, w, cx| v.split_pane(Some(Side::Down), w, cx));
+    sleep(1.6).await;
+    mark("drag-left");
+    drag(view, cx, ex, Axis::Row, -240., 1.0, true).await;
+    sleep(0.8).await;
+    // Back to 6 px short of equal, let go: it lands on equal.
+    mark("drag-detent");
+    let back = view.update(cx, |v, _| {
+        let (w, h) = v.centre.get();
+        let r = v.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h });
+        let left = r.iter().map(|(_, r)| r.w).fold(f32::MAX, f32::min);
+        ((w - crate::split::DIVIDER) / 2.).floor() - 6. - left
+    });
+    drag(view, cx, ex, Axis::Row, back.unwrap_or(0.), 0.8, true).await;
+    sleep(1.2).await;
+    mark("drag-down-to-min");
+    drag(view, cx, ex, Axis::Column, 600., 0.8, true).await;
+    sleep(0.6).await;
+    mark("drag-right-to-min");
+    drag(view, cx, ex, Axis::Row, 900., 1.0, true).await;
+    sleep(0.4).await;
+    mark("min-320x240");
+    sleep(1.4).await;
+    mark("double-click-equalise");
+    act(cx, &mut |v, _, cx| {
+        let (w, h) = v.centre.get();
+        let d = v.panes.tree.dividers(crate::split::Rect { x: 0., y: 0., w, h });
+        if let Some(d) = d.iter().find(|d| d.axis == Axis::Column) {
+            v.click_divider(&d.path.clone(), 2, cx);
+        }
+    });
+    sleep(1.2).await;
+    act(cx, &mut |v, _, cx| {
+        let (w, h) = v.centre.get();
+        let d = v.panes.tree.dividers(crate::split::Rect { x: 0., y: 0., w, h });
+        if let Some(d) = d.iter().find(|d| d.axis == Axis::Row) {
+            v.click_divider(&d.path.clone(), 2, cx);
+        }
+    });
+    sleep(1.6).await;
+    for _ in 0..2 {
+        mark("close");
+        act(cx, &mut |v, _, _| {
+            let last = v.reading_order().last().copied();
+            if let Some(id) = last {
+                v.in_pane(id, |v| {
+                    if let Some(ix) = v.model.tabs.active() {
+                        v.close_tab(ix);
+                    }
+                });
+            }
+        });
+        sleep(1.6).await;
+    }
+    mark("done");
+}
+
 /// The splits that make `n` panes (split.md §4): 2 side by side, 3
 /// across, 4 as 2×2. Each: the pane to focus first (reading order), and
 /// the side (`None`: right, or down if narrow).
@@ -1023,7 +1335,11 @@ pub(crate) fn shape(n: usize) -> Vec<(Option<usize>, Option<crate::split::Side>)
 /// side; 3: three across; 4: 2×2), or the film's scene, each step marked
 /// on stderr (`PANES <what> <s>`): split right, the right pane opens
 /// another session, split down, focus by F6, Shift+F6 and Alt+1, a draft
-/// per pane, then the panes close one by one (each collapses).
+/// per pane, then the panes close one by one (each collapses). `film3b`
+/// (split.md §4, §10): split right and down (each grows), the dividers
+/// dragged as a pointer would (1:1, 60 moves a second), to their
+/// minimums (the bottom right pane at 320 × 240), let go near equal (the
+/// detent), a double-click (equalise), then the two closes.
 pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, window: &mut Window, cx: &mut App) {
     use crate::app::AppView;
     use crate::split::Side;
@@ -1042,7 +1358,12 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
             let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
             // The film's first split once its recording has begun
             // (`scripts/capture-linux.sh` starts 3.5 s after the window).
-            let film = how == "film";
+            let film = how.starts_with("film");
+            if how == "film3b" {
+                sleep(5.0).await;
+                film3b(&view, cx, &ex, t0).await;
+                return;
+            }
             sleep(if film { 5.0 } else { 1.5 }).await;
             if let Ok(n) = how.parse::<usize>() {
                 for (at, side) in shape(n) {
