@@ -9027,6 +9027,8 @@ impl Render for AppView {
                 if !(ev.modifiers.control || ev.modifiers.platform) {
                     this.tab_key_up(cx);
                 }
+                // Mid-drag, Ctrl (Alt) changes the drop: its preview too.
+                this.drag_modifiers(ev.modifiers, cx);
             }))
             .relative()
             .size_full()

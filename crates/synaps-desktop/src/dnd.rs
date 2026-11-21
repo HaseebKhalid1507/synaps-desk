@@ -124,7 +124,9 @@ pub(crate) struct RailDrag {
 
 impl RailDrag {
     /// Its drag's constructor: ours (the panes' drop targets come up for
-    /// it), and its chip.
+    /// it), and its chip. It updates the view: pointer input must never be
+    /// dispatched from inside an `AppView` update (a double lease, as the
+    /// film's was before `3fe2291`: Shady #48 n6).
     pub(crate) fn start(
         me: gpui_kit::WeakEntity<AppView>,
     ) -> impl Fn(&RailDrag, gpui_kit::Point<gpui_kit::Pixels>, &mut Window, &mut gpui_kit::App) -> gpui_kit::Entity<RailDrag> + 'static
@@ -175,6 +177,9 @@ const PREVIEW_A: u64 = (0x7AF8 << 48) | 0xF;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Hint {
     pub(crate) pane: PaneId,
+    /// The zone under the pointer, before [`AppView::drop_zone`]: a change
+    /// of Ctrl (Alt) asks that again (Shady #48 L2).
+    pub(crate) raw: Zone,
     pub(crate) zone: Option<Zone>,
     pub(crate) rect: Rect,
     pub(crate) note: Option<&'static str>,
@@ -183,7 +188,9 @@ pub(crate) struct Hint {
 impl AppView {
     /// Each open pane's body (its rectangle under its tab strip) in the
     /// centre: one, the whole centre, when not shown split (one pane, or
-    /// folded: split.md §5).
+    /// folded: split.md §5). The landed tree's: during a split's or a
+    /// close's flight (about 300 ms) a drag previews against where the
+    /// panes land, not where they are drawn (Shady #48 n5).
     fn drop_bodies(&self) -> Vec<(PaneId, Rect)> {
         let (w, h) = self.centre.get();
         let all = Rect { x: 0., y: 0., w, h };
@@ -273,8 +280,9 @@ impl AppView {
         let (x, y) = (f32::from(ev.position.x) - x0, f32::from(ev.position.y) - y0);
         let inside = x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
         let hint = if inside {
-            let (zone, note) = self.drop_zone(pane, zone(r, x, y), &carry, copy);
-            Some(Hint { pane, zone, rect: r, note })
+            let raw = zone(r, x, y);
+            let (zone, note) = self.drop_zone(pane, raw, &carry, copy);
+            Some(Hint { pane, raw, zone, rect: r, note })
         } else if self.dnd.hint.is_some_and(|h| h.pane == pane) {
             None
         } else {
@@ -287,31 +295,75 @@ impl AppView {
         }
     }
 
-    /// Esc while a drag of ours is up (split.md §3): it ends, nothing drops.
+    /// Esc while a drag of ours is up (split.md §3): it ends, nothing
+    /// drops, and the focused pane's composer has the keys again (the
+    /// press on the tab took them: Shady #48 n3).
     pub(crate) fn cancel_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.dnd.on.is_none() {
             return false;
         }
         cx.stop_active_drag(window);
         self.dnd.end();
+        self.focus_composer(cx);
         cx.notify();
         true
     }
 
-    /// The drag let go over a pane's body: the drop its hint says.
-    fn drop_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(carry), Some(hint)) = (self.dnd.on.take(), self.dnd.hint.take()) else {
-            self.dnd.end();
+    /// Ctrl (Alt) pressed or let go mid-drag: the drop under the pointer
+    /// asked again (a copy may split where a move does nothing), so the
+    /// preview stays what the drop does (Shady #48 L2).
+    pub(crate) fn drag_modifiers(&mut self, m: gpui_kit::Modifiers, cx: &mut Context<Self>) {
+        let (Some(carry), Some(h)) = (self.dnd.on.clone(), self.dnd.hint) else { return };
+        let copy = m.control || m.alt;
+        let (zone, note) = self.drop_zone(h.pane, h.raw, &carry, copy);
+        let hint = Some(Hint { zone, note, ..h });
+        if hint != self.dnd.hint || copy != self.dnd.copy {
+            self.dnd.hint = hint;
+            self.dnd.copy = copy;
+            cx.notify();
+        }
+    }
+
+    /// The button let go with a drag of ours up (the root's mouse-up, in
+    /// the capture phase: before any target's, and with no hover test).
+    /// The drop is asked again where it was let go, with the modifiers
+    /// held then (Shady #48 L2–L4):
+    /// - a key typed mid-drag leaves GPUI hovering nothing until the
+    ///   pointer moves (`Window::last_input_was_keyboard`), so a target's
+    ///   own `on_drop` never hears a release that did not move;
+    /// - a key mid-drag (F6, Ctrl+\, Ctrl+W) may have changed the panes
+    ///   since the last move: the hint's pane may be gone.
+    ///
+    /// Over a pane's tab strip, the strip's own drop (before a tab) takes
+    /// it when GPUI hovers; when it does not, the drop goes to that pane's
+    /// centre. Anywhere else, nothing drops.
+    pub(crate) fn release_drag(&mut self, at: gpui_kit::Point<gpui_kit::Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(carry) = self.dnd.on.clone() else { return };
+        let (x0, y0) = self.centre_at.get();
+        let (x, y) = (f32::from(at.x) - x0, f32::from(at.y) - y0);
+        let inside = |r: &Rect| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+        let strip = crate::tabstrip::TAB_H;
+        let bodies = self.drop_bodies();
+        let at = if let Some(&(pane, r)) = bodies.iter().find(|(_, r)| inside(r)) {
+            (pane, zone(r, x, y))
+        } else if let Some(&(pane, _)) = bodies.iter().find(|(_, r)| inside(&Rect { y: r.y - strip, h: strip, ..*r }))
+            && window.last_input_was_keyboard()
+        {
+            (pane, Zone::Center)
+        } else {
             return;
         };
-        let copy = std::mem::take(&mut self.dnd.copy);
+        let copy = window.modifiers().control || window.modifiers().alt;
+        let (zone, note) = self.drop_zone(at.0, at.1, &carry, copy);
         self.dnd.end();
-        if let Some(zone) = hint.zone {
-            self.drop_into(hint.pane, zone, carry, copy, window, cx);
+        match zone {
+            Some(zone) => self.drop_into(at.0, zone, carry, copy, window, cx),
+            // A drop that does nothing: the keys back to the composer.
+            None => self.focus_composer(cx),
         }
         // Said once the drop's frame has given the composer its tab (a new
         // tab's composer drops the old one's note).
-        self.dnd.note = hint.note;
+        self.dnd.note = note;
         cx.notify();
     }
 
@@ -321,6 +373,10 @@ impl AppView {
     /// pane is focused, with the keys.
     pub(crate) fn drop_into(&mut self, pane: PaneId, zone: Zone, carry: Carry, copy: bool, window: &mut Window, cx: &mut Context<Self>) {
         use crate::tabs::Place;
+        // A pane gone since (Shady #48 L4): nothing drops, nothing moves.
+        if self.panes.get(pane).is_none() {
+            return;
+        }
         match (carry, zone.side()) {
             (Carry::Row { action }, side) => {
                 let place = match side {
@@ -394,7 +450,9 @@ impl AppView {
     /// stays there too.
     pub(crate) fn move_tab_to(&mut self, tab: u64, from: PaneId, to: PaneId, before: Option<u64>, copy: bool, cx: &mut Context<Self>) {
         use crate::tabs::{Kind, Place};
-        if from == to {
+        // Into a pane that is gone, nothing moves (Shady #48 L4: the
+        // tab would be opened, and taken, in its own pane).
+        if from == to || self.panes.get(to).is_none() {
             return;
         }
         let Some((session, label)) = self
@@ -410,6 +468,9 @@ impl AppView {
             return;
         };
         self.focus_pane(to, KeysTo::Pane, cx);
+        if self.panes.cur.id != to {
+            return;
+        }
         let draft = if copy { None } else { self.in_pane(from, |v| v.take_draft(tab, &session, cx)).flatten() };
         self.model.tabs.open(&session, &label, Place::New);
         if let Some(b) = before.and_then(|b| self.model.tabs.iter().position(|t| t.id == b))
@@ -430,22 +491,24 @@ impl AppView {
         cx.notify();
     }
 
+    /// The pane whose strip has tab `onto`.
+    fn pane_of_tab(&self, onto: u64) -> Option<PaneId> {
+        let has = |p: &crate::pane::Pane| {
+            if p.id == self.panes.cur.id {
+                self.model.tabs.iter().any(|t| t.id == onto)
+            } else {
+                p.parked.tabs.iter().any(|t| t.id == onto)
+            }
+        };
+        self.panes.iter().find(|p| has(p)).map(|p| p.id)
+    }
+
     /// A tab dropped on tab `onto` (its strip's mark: split.md §2): in its
     /// own strip, today's move; from another pane's, a move (or a copy)
     /// into this one, before it.
     pub(crate) fn drop_on_tab(&mut self, d: &crate::tabstrip::TabDrag, onto: u64, window: &mut Window, cx: &mut Context<Self>) {
         let copy = window.modifiers().control || window.modifiers().alt;
-        let to = self
-            .panes
-            .iter()
-            .find(|p| {
-                if p.id == self.panes.cur.id {
-                    self.model.tabs.iter().any(|t| t.id == onto)
-                } else {
-                    p.parked.tabs.iter().any(|t| t.id == onto)
-                }
-            })
-            .map(|p| p.id);
+        let to = self.pane_of_tab(onto);
         self.dnd.end();
         match to {
             Some(to) if to != d.from && self.split_on() && d.session.is_some() => self.move_tab_to(d.id, d.from, to, Some(onto), copy, cx),
@@ -460,17 +523,7 @@ impl AppView {
     /// A rail row dropped on a tab: it opens in that tab's pane (the
     /// centre's drop).
     pub(crate) fn drop_row_on_tab(&mut self, d: &RailDrag, onto: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let to = self
-            .panes
-            .iter()
-            .find(|p| {
-                if p.id == self.panes.cur.id {
-                    self.model.tabs.iter().any(|t| t.id == onto)
-                } else {
-                    p.parked.tabs.iter().any(|t| t.id == onto)
-                }
-            })
-            .map(|p| p.id);
+        let to = self.pane_of_tab(onto);
         self.dnd.end();
         if let Some(to) = to.filter(|_| self.split_on()) {
             self.drop_into(to, Zone::Center, Carry::Row { action: d.action.clone() }, false, window, cx);
@@ -481,6 +534,10 @@ impl AppView {
     /// A drag's start (its constructor): what it carries, the readout
     /// hover off (split/architecture.md §4.4).
     pub(crate) fn drag_started(&mut self, carry: Carry, cx: &mut Context<Self>) {
+        // Split off, a tab's drag only reorders its strip (Shady #48 n1).
+        if !self.split_on() {
+            return;
+        }
         if matches!(carry, Carry::Row { .. })
             && let Some(k) = self.hover
         {
@@ -523,11 +580,27 @@ impl AppView {
                             let carry = Carry::Row { action: ev.drag(cx).action.clone() };
                             this.drag_over(id, carry, ev.bounds, &ev.event, window, cx);
                         }))
-                        .on_drop(cx.listener(|this, _: &TabDrag, window, cx| this.drop_here(window, cx)))
-                        .on_drop(cx.listener(|this, _: &RailDrag, window, cx| this.drop_here(window, cx)))
                         .into_any_element(),
                 );
             }
+            // The drop itself: the window's mouse-up, in the capture phase
+            // and with no hover test ([`AppView::release_drag`]).
+            let me = cx.weak_entity();
+            out.push(
+                gpui_kit::canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        window.on_mouse_event(move |ev: &gpui_kit::MouseUpEvent, phase, window, cx| {
+                            if phase == gpui_kit::DispatchPhase::Capture && ev.button == gpui_kit::MouseButton::Left {
+                                let _ = me.update(cx, |v, cx| v.release_drag(ev.position, window, cx));
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_0()
+                .into_any_element(),
+            );
         }
         out.extend(self.render_preview(p, x0, y0));
         out

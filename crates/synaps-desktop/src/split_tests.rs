@@ -821,7 +821,9 @@ fn a_click_on_the_other_panes_secret_field_keeps_the_keys(cx: &mut TestAppContex
 /// arm stays the one it was shown with through Ctrl+\ as it comes, a
 /// second split once armed, and the window narrowing until the right panel
 /// and the rail yield and widening back: its list is laid out anew in each
-/// new column, and nothing takes it off screen.
+/// new column, and nothing takes it off screen. It watches the buttons'
+/// arm (`Arm::shown_at`, `armed`), not `Arm::keys`: the keys' own wait
+/// when the focus comes back to a card is intended (Shady #48 n7).
 #[gpui_kit::test]
 fn a_split_or_a_yield_leaves_the_other_panes_card_armed(cx: &mut TestAppContext) {
     let (window, view, client, _a, _attaches, events) = on_a_as(cx, "panes-l8", attached_secret(A, 1));
@@ -3772,6 +3774,150 @@ fn a_tab_dragged_to_another_panes_centre_moves_and_ctrl_copies(cx: &mut TestAppC
     assert_eq!(tabs_of(cx, &view, p1), [A, B], "copied in");
     assert_eq!(tabs_of(cx, &view, p0), [A, B], "and kept");
     assert_eq!(view.read_with(cx, |v, _| v.panes.focused), p1);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// The dnd round 2 tests' start: two panes, `p0` with A and `p1`
+/// (focused) with A and B; the window, its view, the client, A's and B's
+/// connections, and the panes.
+fn two_panes(
+    cx: &mut TestAppContext,
+    name: &str,
+) -> (AnyWindowHandle, Entity<AppView>, Client, Kept, crate::pane::PaneId, crate::pane::PaneId) {
+    let (window, view, client, a, attaches, events) = on_a(cx, name, None);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    key(cx, window, "ctrl-\\");
+    let p1 = view.read_with(cx, |v, _| v.panes.focused);
+    let b = open_b(cx, window, &view, &attaches, &events);
+    assert_eq!(tabs_of(cx, &view, p1), [A, B]);
+    assert_eq!(tabs_of(cx, &view, p0), [A]);
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    (window, view, client, (a, b, attaches, events), p0, p1)
+}
+
+/// What a test keeps alive and never reads: A's and B's connections, the
+/// daemon's attaches, the client's events.
+type Kept = (Conn, Conn, mpsc::Receiver<Conn>, async_channel::Receiver<Event>);
+
+/// Shady #48 L2: Ctrl pressed after the last move (stop, press, let go)
+/// is what the drop reads, and the preview follows it as it changes: a
+/// pane's own last tab to its edge is nothing as a move, a new pane as a
+/// copy; a tab let go on another pane's centre with Ctrl pressed only
+/// after it stopped is a copy.
+#[gpui_kit::test]
+fn ctrl_pressed_after_the_last_move_copies_and_the_preview_follows(cx: &mut TestAppContext) {
+    let (window, view, client, _conns, p0, p1) = two_panes(cx, "dnd-ctrl-late");
+    // Wide enough for a half pane to split again (its minimum).
+    VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(1080.)));
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    let none = gpui_kit::Modifiers::default();
+    let ctrl = gpui_kit::Modifiers { control: true, ..Default::default() };
+    let hint = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.dnd.hint.map(|h| (h.pane, h.zone)));
+    // p0's own last tab over its right edge: nothing, until Ctrl.
+    let tab = tab_id(cx, &view, p0, A);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p0, 0.92, 0.5);
+    drag_to(cx, window, from, to, none, false);
+    assert_eq!(hint(cx), Some((p0, None)), "a move of its last tab to its own edge: nothing");
+    VisualTestContext::from_window(window, cx).simulate_modifiers_change(ctrl);
+    frame(cx, window);
+    assert!(view.read_with(cx, |v, _| v.dnd.copy), "Ctrl heard mid-drag");
+    assert_eq!(hint(cx), Some((p0, Some(crate::dnd::Zone::Right))), "Ctrl pressed with the pointer still: a copy, a new pane");
+    assert!(drawn(cx, window, "drop-preview".into()).is_some(), "and its preview drawn");
+    VisualTestContext::from_window(window, cx).simulate_modifiers_change(none);
+    frame(cx, window);
+    assert_eq!(hint(cx), Some((p0, None)), "let go of: nothing again");
+    key(cx, window, "escape");
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2);
+    // B from p1 to p0's centre, still; Ctrl pressed, then let go there.
+    let tab = tab_id(cx, &view, p1, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p0, 0.5, 0.5);
+    drag_to(cx, window, from, to, none, false);
+    assert_eq!(hint(cx), Some((p0, Some(crate::dnd::Zone::Center))));
+    VisualTestContext::from_window(window, cx).simulate_modifiers_change(ctrl);
+    frame(cx, window);
+    mouse_m(cx, window, to, "up", ctrl);
+    frame(cx, window);
+    frame(cx, window);
+    assert_eq!(tabs_of(cx, &view, p0), [A, B], "copied in");
+    assert_eq!(tabs_of(cx, &view, p1), [A, B], "and kept: Ctrl was held at the drop");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #48 L3: a key typed mid-drag leaves GPUI hovering nothing until
+/// the pointer moves; let go without moving, the drop still lands where
+/// it was let go: on a pane's body, its zone; on its tab strip, that
+/// pane's centre.
+#[gpui_kit::test]
+fn a_key_typed_mid_drag_then_a_release_that_never_moved_still_drops(cx: &mut TestAppContext) {
+    let (window, view, client, _conns, p0, p1) = two_panes(cx, "dnd-typed");
+    let none = gpui_kit::Modifiers::default();
+    let tab = tab_id(cx, &view, p1, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p0, 0.5, 0.5);
+    drag_to(cx, window, from, to, none, false);
+    VisualTestContext::from_window(window, cx).simulate_input("x");
+    frame(cx, window);
+    mouse_m(cx, window, to, "up", none);
+    frame(cx, window);
+    frame(cx, window);
+    assert_eq!(tabs_of(cx, &view, p0), [A, B], "dropped on p0's centre: moved in");
+    assert_eq!(tabs_of(cx, &view, p1), [A], "and out");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), p0, "the drop's pane focused");
+    // Back onto p1's tab strip (its A tab), a key typed, let go there.
+    let tab = tab_id(cx, &view, p0, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let onto = tab_id(cx, &view, p1, A);
+    let to = mid(cx, window, format!("tab {onto}"));
+    drag_to(cx, window, from, to, none, false);
+    VisualTestContext::from_window(window, cx).simulate_input("y");
+    frame(cx, window);
+    mouse_m(cx, window, to, "up", none);
+    frame(cx, window);
+    frame(cx, window);
+    assert_eq!(tabs_of(cx, &view, p1), [A, B], "let go on p1's strip: into p1");
+    assert_eq!(tabs_of(cx, &view, p0), [A]);
+    view.read_with(cx, |v, cx| {
+        for id in [p0, p1] {
+            assert_eq!(v.panes.get(id).unwrap().composer.read(cx).value().to_string(), "", "typed mid-drag lands in no composer");
+        }
+    });
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #48 L4: the pane under the drop closed after the last move (a
+/// key mid-drag can close it). The drop is asked again where it is let
+/// go: on the dragged tab's own pane, that is nothing, and the tab stays
+/// where it was; never opened and taken in its own pane, gone with no
+/// reopen entry.
+#[gpui_kit::test]
+fn a_drop_on_a_pane_closed_since_the_last_move_leaves_the_tab(cx: &mut TestAppContext) {
+    let (window, view, client, _conns, p0, p1) = two_panes(cx, "dnd-closed");
+    let none = gpui_kit::Modifiers::default();
+    let tab = tab_id(cx, &view, p1, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p0, 0.5, 0.5);
+    drag_to(cx, window, from, to, none, false);
+    assert_eq!(view.read_with(cx, |v, _| v.dnd.hint.map(|h| (h.pane, h.zone))), Some((p0, Some(crate::dnd::Zone::Center))));
+    view.update(cx, |v, _| v.in_pane(p0, |v| v.close_pane()));
+    for _ in 0..40 {
+        frame(cx, window);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "p0 closed mid-drag");
+    mouse_m(cx, window, to, "up", none);
+    frame(cx, window);
+    frame(cx, window);
+    assert_eq!(tabs_of(cx, &view, p1), [A, B], "B stays in its own pane");
+    assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current_session().map(str::to_string)), Some(B.to_string()), "shown there");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }

@@ -739,14 +739,24 @@ impl AppView {
             }))
             .on_drag(drag, move |d, _, _, cx| {
                 // Ours (split/architecture.md §4): the panes' drop targets
-                // come up for it.
+                // come up for it. It updates the view, so pointer input is
+                // never dispatched from inside an `AppView` update (a double
+                // lease: `3fe2291`, Shady #48 n6).
                 let carry = crate::dnd::Carry::Tab { tab: d.id, from: d.from, session: d.session.clone() };
                 let _ = me_drag.update(cx, |v, cx| v.drag_started(carry, cx));
                 cx.new(|_| d.clone())
             })
             // From another pane's strip: it goes in before this one.
             .drag_over::<TabDrag>(move |s, d, _, _| match d.ix.cmp(&ix) {
-                _ if d.from != here => s.border_l_2().border_color(mark),
+                // Only a session's tab drops in another pane's strip (Shady
+                // #48 n2): a view's or a worker's shows no mark there.
+                _ if d.from != here => {
+                    if d.session.is_some() {
+                        s.border_l_2().border_color(mark)
+                    } else {
+                        s
+                    }
+                }
                 std::cmp::Ordering::Less => s.border_r_2().border_color(mark),
                 std::cmp::Ordering::Greater => s.border_l_2().border_color(mark),
                 std::cmp::Ordering::Equal => s,
