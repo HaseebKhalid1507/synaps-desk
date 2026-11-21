@@ -46,18 +46,21 @@ pub(crate) struct Divider {
 
 /// A layout change on `sheet` (split.md §10): a split, a close, a
 /// double-click's equalise or a release's detent. The tree is drawn from
-/// `from` to `to` (the same shape: a split's new pane and a close's pane
-/// are in both) by one spring `travel` px long, the most any edge moves;
-/// what lands is the tree itself.
+/// `from` to `to` (the same shape: a split's new pane and a closing pane
+/// are in both, a closing one at a share of 0 in `to`) by one spring
+/// `travel` px long, the most any edge moves; what lands is the tree
+/// itself. A change made mid-flight starts from the tree as drawn, the
+/// panes still closing kept closing (Shady #42 M1).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Flight {
     pub from: Node,
     pub to: Node,
-    /// A split's new pane: laid out at its landed size from the first
-    /// frame, its share clipping it (it slides in with the split line).
-    pub grow: Option<PaneId>,
-    /// The pane a close took: its share, its ground only, closing.
-    pub ghost: Option<PaneId>,
+    /// The splits' new panes: each laid out at its landed size from its
+    /// first frame, its share clipping it (it slides in with the split
+    /// line).
+    pub grow: Vec<PaneId>,
+    /// The panes closes took: each share its ground only, closing.
+    pub ghosts: Vec<PaneId>,
     /// Its spring's length; 0 until its first frame measures it.
     pub travel: f32,
     /// Each pane's narrowest box so far: its column keeps that wrap until
@@ -67,17 +70,38 @@ pub(crate) struct Flight {
 }
 
 impl Flight {
-    pub(crate) fn new(from: Node, to: Node, grow: Option<PaneId>, ghost: Option<PaneId>) -> Self {
-        Flight { from, to, grow, ghost, travel: 0., wrap: Vec::new() }
+    pub(crate) fn new(from: Node, to: Node, grow: Vec<PaneId>, ghosts: Vec<PaneId>) -> Self {
+        Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new() }
+    }
+
+    /// Its spring's response (split.md §10, A1: a layout lands in ≤ 450
+    /// ms): `sheet`'s, stiffer for a travel `sheet` would land later
+    /// (critically damped from rest, `travel` px are within a pixel when
+    /// `(1 + ωt)·e^(−ωt) = 1/travel`; ω for t = [`PANE_LANDS`]).
+    pub(crate) fn response(&self) -> f32 {
+        let d = self.travel.max(2.);
+        // (1 + u)·e^(−u) = 1/d, for u = ωt: Newton from above.
+        let mut u = 2. * d.ln() + 2.;
+        for _ in 0..12 {
+            let f = (1. + u).ln() - u + d.ln();
+            u -= f / (1. / (1. + u) - 1.);
+        }
+        crate::motion::SHEET_RESPONSE.min(std::f32::consts::TAU * PANE_LANDS / u)
     }
 }
 
-/// A divider held down (split.md §4): which one, where the pointer went
-/// down along its axis, and where the divider was then.
+/// The longest a layout's flight takes to land (split.md §10, A1's 450
+/// ms, less a 60 Hz frame for the frame that draws it).
+pub(crate) const PANE_LANDS: f32 = 0.43;
+
+/// A divider held down (split.md §4): which one, and how far past its
+/// rule the pointer went down, along its axis (the divider found again in
+/// the tree each move: a resize, a panel or a close moved it; Shady #42
+/// L1, M2).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Grab {
     pub divider: Divider,
-    pub from: f32,
+    pub off: f32,
     pub moved: bool,
 }
 
@@ -284,14 +308,40 @@ impl Node {
         }
     }
 
-    /// The smallest this subtree gets along `axis`: its panes' minimums
-    /// and the rules between them.
-    fn min_along(&self, axis: Axis) -> f32 {
-        let (across, down) = self.extent();
-        match axis {
-            Axis::Row => across as f32 * PANE_MIN_W + (across - 1) as f32 * DIVIDER,
-            Axis::Column => down as f32 * PANE_MIN_H + (down - 1) as f32 * DIVIDER,
+    /// The smallest this subtree gets along `axis`, on a whole pixel: its
+    /// panes' minimums and the rules between them, each kid of a split on
+    /// `axis` at its share (a drag scales a kid's own split, so the kid
+    /// with the least room for its share sets it; Shady #42 M3).
+    pub(crate) fn min_along(&self, axis: Axis) -> f32 {
+        match self {
+            Node::Leaf(_) => match axis {
+                Axis::Row => PANE_MIN_W,
+                Axis::Column => PANE_MIN_H,
+            },
+            Node::Split { axis: a, kids, ratios } if *a == axis => {
+                let room = kids.iter().zip(ratios).filter(|(_, r)| **r > 0.).map(|(k, r)| k.min_along(axis) / r).fold(0f32, f32::max);
+                (room - 1e-3).ceil() + DIVIDER * (kids.len() - 1) as f32
+            }
+            Node::Split { kids, .. } => kids.iter().map(|k| k.min_along(axis)).fold(0f32, f32::max),
         }
+    }
+
+    /// The same panes in the same splits (ratios aside): a flight can go
+    /// from one to the other.
+    pub(crate) fn same_shape(&self, other: &Node) -> bool {
+        match (self, other) {
+            (Node::Leaf(a), Node::Leaf(b)) => a == b,
+            (Node::Split { axis, kids, .. }, Node::Split { axis: a2, kids: k2, .. }) => {
+                axis == a2 && kids.len() == k2.len() && kids.iter().zip(k2).all(|(a, b)| a.same_shape(b))
+            }
+            _ => false,
+        }
+    }
+
+    /// The tree with `new` beside `at` on `side` (as a split makes it),
+    /// with no checks: a flight's ends.
+    pub(crate) fn split_as(&self, at: PaneId, side: Side, new: PaneId) -> Option<Node> {
+        self.with_split(at, side, new)
     }
 
     /// Every divider (split.md §4): its split's path from the root (kid
@@ -368,11 +418,13 @@ impl Node {
         let room = (len - DIVIDER * (kids.len() - 1) as f32).max(1.);
         let a: f32 = ratios[..i].iter().sum();
         let b = a + ratios[i] + ratios[i + 1];
-        let (lo, hi) = (a + kids[i].min_along(*axis) / room, b - kids[i + 1].min_along(*axis) / room);
+        // In px, on whole pixels (as `kid_rects` rounds the edges): a pane
+        // stopped at its minimum is 320, not 319 (Shady #42 n1).
+        let (lo, hi) = ((room * a + kids[i].min_along(*axis) - 1e-3).ceil(), (room * b - kids[i + 1].min_along(*axis) + 1e-3).floor());
         if lo > hi {
             return;
         }
-        let c = ((at - DIVIDER * i as f32) / room).clamp(lo, hi);
+        let c = (at - DIVIDER * i as f32).clamp(lo, hi) / room;
         ratios[i] = c - a;
         ratios[i + 1] = b - c;
     }
@@ -385,6 +437,10 @@ impl Node {
             Axis::Column => d.rect.h,
         };
         let Some(Node::Split { kids, ratios, .. }) = self.at_mut(&d.path) else { return };
+        // A divider gone (its split lost a kid): nothing (Shady #42 M2).
+        if d.i + 1 >= ratios.len() {
+            return;
+        }
         let room = (len - DIVIDER * (kids.len() - 1) as f32).max(1.);
         let (r0, r1) = (ratios[d.i], ratios[d.i + 1]);
         if ((r0 - r1).abs() * room / 2.) <= DETENT {
@@ -427,17 +483,20 @@ impl Node {
 
     /// Where a close's flight lands (split.md §8): `id` (the pane closing)
     /// at a share of 0, the kids beside it in its split scaled up to take
-    /// it, as [`Node::remove`] shares it out.
+    /// it, as [`Node::remove`] shares it out. Its split's other kids all
+    /// closing too (at 0): that split goes to 0 in its own, and so on up.
     pub(crate) fn zeroed(&self, id: PaneId) -> Node {
         let mut n = self.clone();
-        if let Some(path) = self.path_of(id)
-            && let Some((&i, parent)) = path.split_last()
-            && let Some(Node::Split { ratios, .. }) = n.at_mut(parent)
-        {
-            let rest = 1. - ratios[i];
-            if rest > 0. {
-                for (j, r) in ratios.iter_mut().enumerate() {
-                    *r = if j == i { 0. } else { *r / rest };
+        let Some(path) = self.path_of(id) else { return n };
+        for k in (0..path.len()).rev() {
+            let i = path[k];
+            if let Some(Node::Split { ratios, .. }) = n.at_mut(&path[..k]) {
+                let rest = 1. - ratios[i];
+                if rest > 1e-6 {
+                    for (j, r) in ratios.iter_mut().enumerate() {
+                        *r = if j == i { 0. } else { *r / rest };
+                    }
+                    break;
                 }
             }
         }
@@ -678,6 +737,95 @@ mod tests {
         let rt = across.zeroed(p(1)).rects(area());
         let rg = across.remove(p(1)).unwrap().rects(area());
         assert!((at(&rt, p(0)).w - at(&rg, p(0)).w).abs() <= 1. && (at(&rt, p(2)).w - at(&rg, p(2)).w).abs() <= 1., "{rt:?} / {rg:?}");
+    }
+
+    /// Shady #42 M3: `[A A′ / B | C]`, A′ dragged to its minimum, then
+    /// the root's divider dragged as far as it goes: every pane keeps 320
+    /// (a kid's minimum is its own split's at its shares, not its count's);
+    /// and the stacked twin keeps 240.
+    #[test]
+    fn a_nested_split_keeps_every_panes_minimum() {
+        let area = Rect { x: 0., y: 0., w: 1920., h: 1080. };
+        let a = (1920., 1080.);
+        let t = Node::Leaf(p(0)).split(p(0), Side::Right, p(2), a).unwrap();
+        let t = t.split(p(0), Side::Down, p(1), a).unwrap();
+        let mut t = t.split(p(0), Side::Right, p(3), a).unwrap();
+        let ds = t.dividers(area);
+        let inner = ds.iter().find(|d| d.path.len() == 2).expect("A | A′").clone();
+        t.drag(&inner, 2000.);
+        let at = |t: &Node, id| t.rects(area).into_iter().find(|(i, _)| *i == id).unwrap().1;
+        assert_eq!(at(&t, p(3)).w, PANE_MIN_W, "A′ at its minimum");
+        let root = t.dividers(area).into_iter().find(|d| d.path.is_empty()).expect("the root's");
+        t.drag(&root, 0.);
+        let r = t.rects(area);
+        assert!(r.iter().all(|(_, r)| r.w >= PANE_MIN_W), "every pane keeps 320: {r:?}");
+        assert_eq!(at(&t, p(3)).w, PANE_MIN_W, "A′ stops it: {r:?}");
+        // Stacked: `[A / A′ | B] / C` (three down is past `DOWN_MAX`
+        // today, so laid out by hand: the minimum holds all the same).
+        let t = Node::Leaf(p(0)).split(p(0), Side::Down, p(2), a).unwrap();
+        let t = t.split(p(0), Side::Right, p(1), a).unwrap();
+        let mut t = t.split_as(p(0), Side::Down, p(3)).unwrap();
+        let inner = t.dividers(area).into_iter().find(|d| d.path.len() == 2).expect("A / A′");
+        t.drag(&inner, 2000.);
+        assert_eq!(at(&t, p(3)).h, PANE_MIN_H, "A′ at its minimum");
+        let root = t.dividers(area).into_iter().find(|d| d.path.is_empty()).expect("the root's");
+        t.drag(&root, 0.);
+        let r = t.rects(area);
+        assert!(r.iter().all(|(_, r)| r.h >= PANE_MIN_H), "every pane keeps 240: {r:?}");
+    }
+
+    /// Shady #42 M2: a divider whose split lost a kid (a pane closed under
+    /// the drag) lets go of nothing: no panic, the tree as it was.
+    #[test]
+    fn a_detent_on_a_divider_gone_does_nothing() {
+        let three = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), A).unwrap().split(p(1), Side::Right, p(2), A).unwrap();
+        let d = three.dividers(area()).into_iter().find(|d| d.i == 1).expect("the second divider");
+        let mut two = three.remove(p(2)).unwrap();
+        let was = two.clone();
+        two.detent(&d);
+        two.drag(&d, 300.);
+        assert_eq!(two, was);
+    }
+
+    /// Shady #42 M1: a flight's end with a pane still closing in it (at 0)
+    /// lays the others out as the tree without it does, to the rule; a
+    /// pane whose split's others are all closing takes its split to 0.
+    #[test]
+    fn a_closing_pane_at_0_lays_out_as_the_tree_without_it() {
+        let t = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), A).unwrap().split(p(1), Side::Down, p(2), A).unwrap();
+        let to = t.zeroed(p(2));
+        let gone = t.remove(p(2)).unwrap();
+        let at = |rs: &[(PaneId, Rect)], id| rs.iter().find(|(i, _)| *i == id).unwrap().1;
+        let (rt, rg) = (to.rects(area()), gone.rects(area()));
+        assert!((at(&rt, p(1)).h - at(&rg, p(1)).h).abs() <= DIVIDER);
+        // Then p(1) closes too: its column (p(2) at 0 in it) goes to 0.
+        let to2 = to.zeroed(p(1));
+        let r = to2.rects(area());
+        assert_eq!((at(&r, p(1)).w, at(&r, p(2)).w), (0., 0.), "{r:?}");
+        assert!((at(&r, p(0)).w - (A.0 - DIVIDER)).abs() <= 0.5, "{r:?}");
+        assert!(to2.same_shape(&t) && !to2.same_shape(&gone));
+        // A split beside a closing pane, on both ends of a flight: the same shape.
+        let (a, b) = (to.split_as(p(0), Side::Down, p(3)).unwrap(), t.split_as(p(0), Side::Down, p(3)).unwrap());
+        assert!(a.same_shape(&b));
+    }
+
+    /// A1 (split.md §10): a flight of any travel lands within 450 ms on
+    /// its response; a short one is `sheet`'s own.
+    #[test]
+    fn a_flight_lands_within_450_ms_at_any_travel() {
+        let w = |r: f32| std::f32::consts::TAU / r;
+        for d in [12f32, 120., 335., 640., 1200., 2400., 3800.] {
+            let mut f = Flight::new(Node::Leaf(p(0)), Node::Leaf(p(0)), Vec::new(), Vec::new());
+            f.travel = d;
+            let r = f.response();
+            let t = PANE_LANDS + 0.002;
+            let x = d * (1. + w(r) * t) * (-w(r) * t).exp();
+            assert!(x < 1., "{d} px: {x} px out at {t} s (response {r})");
+            assert!(r <= crate::motion::SHEET_RESPONSE + 1e-6);
+        }
+        let mut f = Flight::new(Node::Leaf(p(0)), Node::Leaf(p(0)), Vec::new(), Vec::new());
+        f.travel = 40.;
+        assert_eq!(f.response(), crate::motion::SHEET_RESPONSE, "a short travel: `sheet`'s");
     }
 
     /// Reading order: top to bottom, then left to right (split.md §1).

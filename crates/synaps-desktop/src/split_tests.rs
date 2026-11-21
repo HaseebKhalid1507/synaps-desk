@@ -1778,7 +1778,7 @@ fn a_split_grows_on_sheet_and_its_last_moving_frame_is_the_landed_layout(cx: &mu
     assert_eq!(steps[0].1[0], steps[0].0[0] + steps[0].0[2] + crate::split::DIVIDER, "beside the pane it split off");
     let lands = steps.iter().position(|s| *s == landed).expect("landed");
     eprintln!("SPLIT-LANDS frame {lands} ({:.0} ms), settles frame {frames}, travel {} px", lands as f32 * 6.944, landed.1[2]);
-    assert!(lands as f32 * 6.944 <= 520., "lands in about 0.5 s: frame {lands}");
+    assert!(lands as f32 * 6.944 <= 450., "lands in ≤ 450 ms (A1): frame {lands}");
     for w in steps.windows(2) {
         assert!(w[1].1[2] >= w[0].1[2] && w[1].0[2] <= w[0].0[2], "the new pane only grows, its neighbour only yields: {w:?}");
     }
@@ -1830,10 +1830,15 @@ fn a_close_collapses_on_sheet_and_lands_as_one_pane(cx: &mut TestAppContext) {
     let mut steps = vec![(drawn(cx, window, ghost.clone()).expect("its share, closing"), pane_box(cx, window, left), bar(cx))];
     assert!(steps[0].0[2] > r0[2] / 2., "it starts near where it was: {:?} / {r0:?}", steps[0].0);
     let mut frames = 0;
+    let column = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panes.get(left).expect("the pane left").layout.column);
+    let mut columns = vec![column(cx)];
     while view.read_with(cx, |v, _| v.panes.flight.is_some()) {
         frame_144(cx, window, &view);
         frames += 1;
         assert!(frames < 200, "the close never landed");
+        if columns.last() != Some(&column(cx)) {
+            columns.push(column(cx));
+        }
         // Landed: one pane, drawn as main draws it (no pane boxes).
         let flying = view.read_with(cx, |v, _| v.panes.flight.is_some());
         let g = drawn(cx, window, ghost.clone()).filter(|_| flying);
@@ -1847,10 +1852,11 @@ fn a_close_collapses_on_sheet_and_lands_as_one_pane(cx: &mut TestAppContext) {
     let (w, _) = view.read_with(cx, |v, _| v.centre.get());
     let lands = steps.iter().position(|s| s.1[2] >= w).expect("landed");
     eprintln!("CLOSE-LANDS frame {lands} ({:.0} ms), settles frame {frames}", lands as f32 * 6.944);
-    assert!(lands as f32 * 6.944 <= 520., "lands in about 0.5 s: frame {lands}");
+    assert!(lands as f32 * 6.944 <= 450., "lands in ≤ 450 ms (A1): frame {lands}");
     assert_eq!(steps[steps.len() - 2].1[2], w, "the last frame that moves: the one pane across the centre");
-    // (Its column kept the narrow wrap through the flight and rewraps
-    // once, as it lands: the panels' rule, `PanelFx.freeze`.)
+    // Its column kept the narrow wrap through the flight and rewraps
+    // once, as it lands: the panels' rule, `PanelFx.freeze` (Shady #42 L4).
+    assert!(columns.len() <= 2, "one rewrap: {columns:?}");
     for _ in 0..20 {
         frame_144(cx, window, &view);
         assert_eq!(bar(cx), landed, "nothing moves after it lands");
@@ -1897,6 +1903,195 @@ fn a_short_foot_pane_fits_its_composer_to_the_room_it_has(cx: &mut TestAppContex
         }
     }
     assert!(checked > 0, "a height where the room differs by a row: {seen:?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Every pane's box as this frame drew it, a closing pane's ground under
+/// its own name (a pane that starts closing is the same pane moving).
+fn boxes(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>) -> Vec<(u8, [f32; 4])> {
+    let (ids, ghosts) = view.read_with(cx, |v, _| (v.panes.ids(), v.panes.flight.as_ref().map_or(Vec::new(), |f| f.ghosts.clone())));
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(b) = drawn(cx, window, format!("pane {}", id.index())) {
+            out.push((id.index() as u8, b));
+        }
+    }
+    for g in ghosts {
+        if let Some(b) = drawn(cx, window, format!("pane-closing {}", g.index())) {
+            out.push((g.index() as u8, b));
+        }
+    }
+    out
+}
+
+/// The most any edge of a pane on both frames moved between them.
+fn most_moved(a: &[(u8, [f32; 4])], b: &[(u8, [f32; 4])]) -> f32 {
+    let mut most = 0f32;
+    for (id, x) in a {
+        if let Some((_, y)) = b.iter().find(|(i, _)| i == id) {
+            for d in [y[0] - x[0], y[1] - x[1], y[0] + y[2] - x[0] - x[2], y[1] + y[3] - x[1] - x[3]] {
+                most = most.max(d.abs());
+            }
+        }
+    }
+    most
+}
+
+/// Shady #42 M1, L4: a second split or close mid-flight starts from where
+/// the panes are drawn. Ctrl+\ twice, close then close, a split reversed
+/// by its close, and a close then a split, each 10 frames into the first
+/// flight: no frame moves any edge by more than one frame of its flight's
+/// spring (its fastest step from rest, and a pixel's rounding), across the
+/// handover and after it, and each lands.
+#[gpui_kit::test]
+fn a_second_split_or_close_mid_flight_starts_from_where_the_panes_are_drawn(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-handover", None);
+    level(cx, crate::motion::Level::Full);
+    VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(1080.)));
+    frame(cx, window);
+    // One frame of a flight's spring at its fastest, from rest: travel·ω/e
+    // a second, at 144 Hz; and a pixel for the rounding of each end.
+    let step = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            v.panes.flight.as_ref().map(|f| f.travel * std::f32::consts::TAU / f.response() / std::f32::consts::E / 144. + 2.)
+        })
+    };
+    let run = |cx: &mut TestAppContext, first: &str, then: &str, what: &str, panes: usize| {
+        key(cx, window, first);
+        let mut was = boxes(cx, window, &view);
+        let mut bound = step(cx).unwrap_or(0.);
+        for _ in 0..10 {
+            frame_144(cx, window, &view);
+            bound = bound.max(step(cx).unwrap_or(0.));
+            let now = boxes(cx, window, &view);
+            assert!(most_moved(&was, &now) <= bound, "{what}: the first flight steps {} > {bound}", most_moved(&was, &now));
+            was = now;
+        }
+        assert!(view.read_with(cx, |v, _| v.panes.flight.is_some()), "{what}: still in the air");
+        let before = step(cx).unwrap_or(0.);
+        key(cx, window, then);
+        let now = boxes(cx, window, &view);
+        let handover = most_moved(&was, &now);
+        let bound = before.max(step(cx).unwrap_or(0.));
+        eprintln!("HANDOVER {what}: {handover} px (bound {bound:.1})");
+        assert!(
+            handover <= bound,
+            "{what}: the handover moved an edge {handover} px in one frame (one frame's spring: {bound:.1}): {was:?} / {now:?}"
+        );
+        was = now;
+        let mut frames = 0;
+        let mut bound = bound;
+        while view.read_with(cx, |v, _| v.panes.flight.is_some()) {
+            frame_144(cx, window, &view);
+            frames += 1;
+            assert!(frames < 200, "{what}: never landed");
+            bound = bound.max(step(cx).unwrap_or(0.));
+            let now = boxes(cx, window, &view);
+            assert!(
+                most_moved(&was, &now) <= bound,
+                "{what}: frame {frames} steps {} > {bound:.1}: {was:?} / {now:?}",
+                most_moved(&was, &now)
+            );
+            was = now;
+        }
+        assert_eq!(view.read_with(cx, |v, _| v.panes.len()), panes, "{what}: the panes left");
+    };
+    run(cx, "ctrl-\\", "ctrl-\\", "Ctrl+\\ twice", 3);
+    run(cx, "ctrl-w", "ctrl-w", "close, then close", 1);
+    run(cx, "ctrl-\\", "ctrl-w", "a split, then its close", 1);
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    run(cx, "ctrl-w", "ctrl-\\", "a close, then a split", 2);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #42 M2: a pane that closes while a divider is held takes the
+/// grab with it: moves after it move nothing, and the release (its split
+/// one kid short) neither panics nor moves a divider.
+#[gpui_kit::test]
+fn a_pane_closed_under_a_held_divider_ends_the_drag(cx: &mut TestAppContext) {
+    use gpui_kit::point;
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-grab-close", None);
+    level(cx, crate::motion::Level::Full);
+    VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(1080.)));
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    let three = view.read_with(
+        cx,
+        |v, _| matches!(&v.panes.tree, crate::split::Node::Split { axis: crate::split::Axis::Row, kids, .. } if kids.len() == 3),
+    );
+    assert!(three, "three across");
+    let grab = drawn(cx, window, "divider-grab 1".into()).expect("the second divider's handle");
+    let (x, y) = (grab[0] + 3., grab[1] + grab[3] / 2.);
+    mouse(cx, window, point(px(x), px(y)), "down", 1);
+    for dx in [1., 4., 20., 40.] {
+        mouse(cx, window, point(px(x + dx), px(y)), "move", 1);
+    }
+    frame(cx, window);
+    assert!(view.read_with(cx, |v, _| v.panes.grab.as_ref().is_some_and(|g| g.moved)), "dragging");
+    // The right pane (focused, the last split) closes under the drag.
+    key(cx, window, "ctrl-w");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2);
+    assert!(view.read_with(cx, |v, _| v.panes.grab.is_none()), "the grab went with the layout it was found in");
+    land(cx, window, &view);
+    let ids = view.read_with(cx, |v, _| v.panes.ids());
+    let landed: Vec<_> = ids.iter().map(|id| pane_box(cx, window, *id)).collect();
+    mouse(cx, window, point(px(x + 200.), px(y)), "move", 1);
+    frame(cx, window);
+    mouse(cx, window, point(px(x + 200.), px(y)), "up", 1);
+    frame(cx, window);
+    assert!(view.read_with(cx, |v, _| v.panes.flight.is_none()), "no detent");
+    let after: Vec<_> = ids.iter().map(|id| pane_box(cx, window, *id)).collect();
+    assert_eq!(after, landed, "nothing moved after the close");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #42 L4: a stacked divider stops at the 240 px minimum on either
+/// side; a release outside the window (a move with no button held) ends
+/// the drag where it was, and a move after it drags nothing.
+#[gpui_kit::test]
+fn a_stacked_divider_stops_at_240_and_a_release_outside_the_window_ends_it(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseMoveEvent, point};
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-down-drag", None);
+    level(cx, crate::motion::Level::Full);
+    VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(1080.)));
+    key(cx, window, "ctrl-shift-\\");
+    land(cx, window, &view);
+    let ids = view.read_with(cx, |v, _| v.panes.ids());
+    let (top, bottom) = (ids[0], ids[1]);
+    let grab = drawn(cx, window, "divider-grab 0".into()).expect("the divider's handle");
+    assert_eq!(grab[3], 6., "a 6 px handle across: {grab:?}");
+    let t0 = pane_box(cx, window, top);
+    let (x, y0) = (grab[0] + grab[2] / 2., grab[1] + 3.);
+    // The pointer at the top pane's height `h`.
+    let at = |h: f32| point(px(x), px(y0 + h - t0[3]));
+    mouse(cx, window, at(t0[3]), "down", 1);
+    for dy in [1., 4., 30., 2000.] {
+        mouse(cx, window, at(t0[3] + dy), "move", 1);
+    }
+    frame(cx, window);
+    assert_eq!(pane_box(cx, window, bottom)[3], crate::split::PANE_MIN_H, "stops at the bottom pane's minimum");
+    mouse(cx, window, at(-2000.), "move", 1);
+    frame(cx, window);
+    assert_eq!(pane_box(cx, window, top)[3], crate::split::PANE_MIN_H, "stops at the top pane's minimum");
+    mouse(cx, window, at(t0[3] + 100.), "move", 1);
+    frame(cx, window);
+    assert_eq!(pane_box(cx, window, top)[3], t0[3] + 100.);
+    // Let go outside the window: the next move comes with no button held.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_event(MouseMoveEvent { position: point(px(x), px(1300.)), pressed_button: None, modifiers: Modifiers::default() });
+    vcx.run_until_parked();
+    frame(cx, window);
+    assert!(view.read_with(cx, |v, _| v.panes.grab.is_none() && v.panes.flight.is_none()), "ended, no detent 100 px off");
+    assert_eq!(pane_box(cx, window, top)[3], t0[3] + 100., "where it was let go");
+    mouse(cx, window, at(t0[3] + 300.), "move", 1);
+    frame(cx, window);
+    assert_eq!(pane_box(cx, window, top)[3], t0[3] + 100., "a move after it drags nothing");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
