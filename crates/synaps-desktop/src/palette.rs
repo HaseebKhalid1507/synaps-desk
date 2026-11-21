@@ -1032,7 +1032,8 @@ impl AppView {
             AppAct::MoveTabPrev => self.move_tab_pane(true, window, cx),
             AppAct::Equalise => {
                 let mut to = self.panes.tree.clone();
-                to.equalise_all();
+                let (w, h) = self.centre.get();
+                to.equalise_all(crate::split::Rect { x: 0., y: 0., w, h });
                 self.fly_layout(to, cx);
             }
             AppAct::ClosePane => self.close_pane_tabs(),

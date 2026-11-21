@@ -109,7 +109,7 @@ fn known_cost(cost: f64, tokens: Option<Tokens>) -> Option<f64> {
     (cost > 0.0 || tokens.is_some()).then_some(cost)
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Stats {
     /// The session these are of (`Attached.meta.id`).
     pub session: Option<String>,

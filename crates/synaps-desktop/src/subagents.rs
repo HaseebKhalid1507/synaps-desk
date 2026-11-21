@@ -692,7 +692,7 @@ fn completion(body: &str) -> Option<Completion> {
 }
 
 /// The workers of the attached session, by the call that started each.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Subagents {
     calls: HashMap<String, Call>,
     /// Calls in the order they came (a live start goes to the oldest that

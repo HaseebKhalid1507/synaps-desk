@@ -607,7 +607,7 @@ impl Panes {
         let flight = match (drawn.split_as(at, side, new), to.split_as(at, side, new)) {
             (Some(from), Some(to)) if from.same_shape(&to) => {
                 grow.push(new);
-                Flight { from: from.grown_from(new), to, grow, ghosts, travel: 0., wrap }
+                Flight { from: from.grown_from(new), to, grow, ghosts, travel: 0., wrap, wrap_at: None }
             }
             _ => Flight::new(tree.grown_from(new), tree.clone(), vec![new], Vec::new()),
         };
@@ -623,17 +623,28 @@ impl Panes {
         ghosts.push(id);
         let to = to.zeroed(id);
         self.drawn = drawn.clone();
-        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., wrap });
+        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None });
     }
 
     /// The layout's flight to `to` (split.md §10: an equalise, a detent),
-    /// from where it is drawn.
-    pub(crate) fn fly_to(&mut self, to: crate::split::Node) {
-        let (drawn, _, _, ghosts, wrap) = self.flight_ends();
-        let from = if ghosts.is_empty() && drawn.same_shape(&to) { drawn } else { self.tree.clone() };
-        self.tree = to.clone();
-        self.drawn = from.clone();
-        self.flight = Some(crate::split::Flight { from, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., wrap });
+    /// from where it is drawn, in `area`: a pane still growing carries on
+    /// growing, and one still closing carries on closing, its share to 0
+    /// as every other pane goes where `to` puts it (Shady #42 r2-L2: an
+    /// Equalise mid-close snapped the closing share away).
+    pub(crate) fn fly_to(&mut self, to: crate::split::Node, area: crate::split::Rect) {
+        use crate::split::Flight;
+        let (drawn, end, grow, ghosts, wrap) = self.flight_ends();
+        let was = std::mem::replace(&mut self.tree, to.clone());
+        let flight = if !ghosts.is_empty() && drawn.same_shape(&end) {
+            let to = end.fitted(&to.rects(area), &ghosts);
+            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None }
+        } else if ghosts.is_empty() && drawn.same_shape(&to) {
+            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None }
+        } else {
+            Flight { from: was, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., wrap, wrap_at: None }
+        };
+        self.drawn = flight.from.clone();
+        self.flight = Some(flight);
     }
 
     /// More than one pane open (on screen, or folded; a closing one
@@ -680,6 +691,13 @@ impl Panes {
     /// too (it stays until that pane goes).
     pub(crate) fn showing(&self, live: crate::live::LiveId) -> usize {
         self.iter().chain(&self.closing).filter(|p| p.live == live).count()
+    }
+
+    /// The open panes showing live store `live`: whether a store is shared
+    /// with a pane that stays (Shady #44 L15, #42 r3-L1: a closing pane
+    /// never counts; it draws from a store of its own).
+    pub(crate) fn showing_open(&self, live: crate::live::LiveId) -> usize {
+        self.iter().filter(|p| p.live == live).count()
     }
 
     /// A window-wide generation (split/architecture.md §6.1 rule 2, §1.1;
@@ -1134,6 +1152,18 @@ impl crate::app::AppView {
         if !self.split_on() {
             return run(self, Place::Current);
         }
+        // On screen in a pane: that pane focused (Shady #44 L14: before
+        // this pane's own tabs, so a session to the side is gone to, not
+        // shown here too; on this pane itself, nothing).
+        if let crate::named::RowAction::Attach(s) = action
+            && self.panes.split()
+            && self.pane_showing(s).is_some()
+        {
+            self.focus_session(s);
+            self.focus_composer(cx);
+            cx.notify();
+            return;
+        }
         // A tab of this pane: shown here (Shady #44 L9: the split came
         // first, a copy of the tab on screen beside it).
         let own = match action {
@@ -1148,12 +1178,12 @@ impl crate::app::AppView {
             cx.notify();
             return;
         }
-        // On screen, or a tab of another pane: that pane focused (a click
-        // never makes a copy), before any split (Shady #44 M1: the split
-        // came first and stayed, an empty copy of this pane's session).
+        // A tab of another pane: that pane focused (a click never makes a
+        // copy), before any split (Shady #44 M1: the split came first and
+        // stayed, an empty copy of this pane's session).
         if let crate::named::RowAction::Attach(s) = action
             && self.panes.split()
-            && (self.pane_showing(s).is_some() || self.panes.rest.iter().any(|p| p.parked.tabs.find(s).is_some()))
+            && self.panes.rest.iter().any(|p| p.parked.tabs.find(s).is_some())
         {
             self.focus_session(s);
             self.focus_composer(cx);

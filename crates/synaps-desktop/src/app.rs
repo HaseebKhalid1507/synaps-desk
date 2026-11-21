@@ -3274,7 +3274,7 @@ impl AppView {
             self.panes.cur.rows_session = target;
             return false;
         }
-        let shared = self.panes.showing(live) > 1;
+        let shared = self.panes.showing_open(live) > 1;
         let elsewhere = target.as_deref().and_then(|s| self.model.lives.of_session(s, live));
         if shared {
             // What it sent still unconfirmed is another pane's on the store
@@ -3413,20 +3413,37 @@ impl AppView {
 
     /// The pane acted on, closing (its last tab closed, or Join), leaves
     /// its store as a switch away leaves it ([`AppView::repoint`]), at
-    /// once: a store another pane shows stays (what it sent still
-    /// unconfirmed goes to that pane); one only it showed lets its session
-    /// go ([`Model::switch_out`]: no input, card or HALT reaches it) and
+    /// once: a store another open pane shows stays (what it sent still
+    /// unconfirmed goes to that pane), and the closing pane draws from a
+    /// copy of its own; one no open pane shows lets its session go
+    /// ([`Model::switch_out`]: no input, card or HALT reaches it) and
     /// detaches. The transcript stays in that store, for the rows drawn as
     /// its share closes (finish gate #42 F2); no attach is waited for.
     pub(crate) fn leave_for_close(&mut self) {
         let live = self.panes.cur.live;
         self.panes.cur.attach_wait = None;
         self.panes.cur.attach_due = None;
-        if self.panes.showing(live) > 1 {
-            let me = self.panes.cur.id;
-            if let Some(other) = self.panes.iter().find(|p| p.id != me && p.live == live).map(|p| p.id) {
-                self.model.lives[live].in_flight.rehome(me, other);
-            }
+        // Shared with a pane that stays (a closing one sharing it never
+        // counts: Shady #44 L15, Join closing two panes on one store lost
+        // their sends).
+        let me = self.panes.cur.id;
+        let other = self.panes.iter().find(|p| p.id != me && p.live == live).map(|p| p.id);
+        if let Some(other) = other {
+            self.model.lives[live].in_flight.rehome(me, other);
+            // Its rows from a store of its own, a copy of what they show
+            // (Shady #42 r3-L1: the pane that stays can switch the shared
+            // store to another session within the flight, which blanked
+            // them or drew another session's items under them). Nothing is
+            // attached to it: no event, input or card reaches it.
+            self.sync_list();
+            let l = &self.model.lives[live];
+            let mut stats = l.stats.clone();
+            (stats.files, stats.subagents) = (l.shown_files().clone(), l.shown_subagents().clone());
+            let transcript = l.shown().clone();
+            let own = self.fresh_live();
+            let c = &mut self.model.lives[own];
+            (c.transcript, c.stats) = (transcript, stats);
+            self.panes.cur.live = own;
             return;
         }
         // The rows first: the transcript may have run ahead of the last frame.
@@ -8215,7 +8232,8 @@ impl AppView {
         if to == self.panes.tree {
             return;
         }
-        self.panes.fly_to(to);
+        let (w, h) = self.centre.get();
+        self.panes.fly_to(to, crate::split::Rect { x: 0., y: 0., w, h });
         cx.notify();
     }
 
@@ -8623,6 +8641,11 @@ impl Render for AppView {
             // last that moves, never after it (finish gate #42 F1).
             let landed = drawn == self.panes.tree;
             let mut mains = Vec::new();
+            // Each pane's wrap in the flight, from its ends at the panels'
+            // narrowest centre (Shady #42 L2).
+            if let Some(f) = self.panes.flight.as_mut() {
+                f.set_wraps(area(wrap));
+            }
             // Where each closing share goes (its rectangle at 0).
             let to_rects = self.panes.flight.as_ref().filter(|_| !ghosts.is_empty()).map(|f| f.to.rects(area(centre))).unwrap_or_default();
             for (id, r) in &rects {
@@ -8651,11 +8674,8 @@ impl Render for AppView {
                 // pane's column keeps the narrowest box of the flight (it
                 // rewraps once), and its form and fit are the landed ones.
                 let grows = grow.contains(id);
-                let narrowest = self.panes.flight.as_mut().map(|f| match f.wrap.iter_mut().find(|(i, _)| i == id) {
-                    Some((_, w)) => {
-                        *w = w.min(r.w).min(l.w);
-                        *w
-                    }
+                let narrowest = self.panes.flight.as_mut().map(|f| match f.wrap.iter().find(|(i, _)| i == id) {
+                    Some((_, w)) => *w,
                     None => {
                         f.wrap.push((*id, r.w.min(l.w)));
                         r.w.min(l.w)
@@ -8667,7 +8687,9 @@ impl Render for AppView {
                 let win_h = if self.panes.split() { l.h + crate::chrome::TOP } else { self.height };
                 let g = PaneFrame {
                     pane,
-                    wrap: of(&rects_wrap).min(pane).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY)),
+                    // Its narrowest of the flight, set at its start, not this
+                    // frame's box (it would rewrap as that moved).
+                    wrap: of(&rects_wrap).min(narrowest.filter(|_| !grows && !landed).unwrap_or(pane)),
                     pane_to: of(&rects_to),
                     view_pane: pane,
                     win_h,
