@@ -587,8 +587,8 @@ fn the_pinned_label_goes_to_the_gutter_with_the_panel(cx: &mut TestAppContext) {
 /// lands in the frame it draws the landed widths, the last that moves
 /// (#47: not a still frame of the spring's settling later): every frame
 /// after draws the pane, the column, the rows and the tab 0 px from it.
-/// Both panels, closing and opening, at Full (with frames between) and Reduced (one frame), as the clips have it:
-/// 1920 px, text 17, the rail at 480 and the right panel at 520, where the
+/// Both panels, closing and opening, at Full (with frames between) and
+/// Reduced (one frame), as the clips have it: 1920 px, text 17, the rail at 480 and the right panel at 520, where the
 /// column is at its cap at both ends (under it, a widening flight's column
 /// widens as it lands, by design: `a_held_room_holds_as_the_wrap_lands`).
 #[gpui_kit::test]
@@ -718,11 +718,11 @@ fn a_pixel_spring_draws_its_landed_width_before_it_lands() {
 
 /// Shady's L1 on #33 round 3: under the column's cap (a pane of 560 px up
 /// to the cap's width) a flight that widens the pane across the hang lands
-/// the labels (the list measured again, a held room read again) on the
-/// last frame that moves, and lets the narrowest wrap go a frame later, as
-/// it lands (fluid.md §3.8; the protected
+/// the labels (the list measured again) and lets the narrowest wrap go in
+/// the one frame, the last that moves (fluid.md §3.8; the protected
 /// `column_rewraps_at_most_once_per_panel_motion` puts the widening rewrap
-/// in that frame). The rewrap only widens the column, so the rows only get
+/// in that frame; #50: a held room is not read again against a widening
+/// re-wrap's sums). The rewrap only widens the column, so the rows only get
 /// shorter: a room held at the end is not used up by it. 1100 px, the rail
 /// at 400 (a pane of 668 px, the column 620) closing: the column widens
 /// as it lands, and the room stays held and the list at its end in every
@@ -783,6 +783,71 @@ fn a_held_room_holds_as_the_wrap_lands(cx: &mut TestAppContext) {
     for n in frames + 1..frames + 9 {
         fluid_frame(cx, w, &view);
         check(cx, n);
+    }
+}
+
+/// #50 round 2 (Shady's L1): a one-frame narrowing has no held room to
+/// read. At Reduced the rail's unfold is one frame: the pane narrows across
+/// the hang, the column re-wraps narrower (the rows get taller) and the
+/// labels land, all in it. A room is only held while motion is fluid
+/// ([`AppView::tail_slack`]: not fluid, none): one held at Full, as the
+/// card folds, goes with the level, so the re-wrap gate (only a widening
+/// re-wrap leaves a held room as it is) never meets one here. The list
+/// stays at its end in that frame and after. 1100 px, the rail at 400,
+/// folded, opening.
+#[gpui_kit::test]
+fn a_one_frame_narrowing_holds_no_room_and_stays_at_the_end(cx: &mut TestAppContext) {
+    let (w, view) = open_one(cx, true);
+    view.update(cx, |v, cx| {
+        v.panels.rail_width = Some(400);
+        v.panels.rail_collapsed = true;
+        v.client = None;
+        v.model.transcript.set_busy(true);
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    wait(cx, w, &view, 3000);
+    let ids: Vec<u64> = view.read_with(cx, |v, _| v.model.transcript.pending_prompts().iter().map(|p| p.id).collect());
+    assert!(!ids.is_empty(), "the demo's card");
+    view.update(cx, |v, cx| {
+        for prompt_id in ids {
+            v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id });
+        }
+        cx.notify();
+    });
+    for _ in 0..120 {
+        fluid_frame(cx, w, &view);
+    }
+    let held = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fold_slack.get().map(|s| s.last()));
+    assert!(held(cx).is_some(), "a room held at the end, at Full");
+    motion_level(cx, &view, Level::Reduced);
+    fluid_frame(cx, w, &view);
+    assert_eq!(held(cx), None, "Reduced: no room held");
+    let column = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.layout.column);
+    let c0 = column(cx);
+    assert!(pane(cx, &view).1, "folded, hanging");
+    let short = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, cx| {
+            let pad = crate::app::list_pad_b(&crate::theme::metrics(cx));
+            f32::from(v.list.max_offset_for_scrollbar().y) + pad + f32::from(v.list.scroll_px_offset_for_scrollbar().y)
+        })
+    };
+    assert!(short(cx) <= 1., "at its end ({})", short(cx));
+    view.update(cx, |v, cx| v.toggle_panel(true, cx));
+    cx.run_until_parked();
+    let mut n = 0;
+    let frames = fly(cx, w, &view, |cx| {
+        n += 1;
+        let (room, gap) = (held(cx), short(cx));
+        assert!(room.is_none() && gap <= 1., "frame {n}: no room ({room:?}), at its end ({gap})");
+    });
+    assert!(frames <= 3, "one frame, and its settling ({frames})");
+    assert!(!pane(cx, &view).1, "landed not hanging");
+    assert!(column(cx) < c0, "the column narrowed ({c0} -> {})", column(cx));
+    for n in frames + 1..frames + 9 {
+        fluid_frame(cx, w, &view);
+        let (room, gap) = (held(cx), short(cx));
+        assert!(room.is_none() && gap <= 1., "frame {n}: no room ({room:?}), at its end ({gap})");
     }
 }
 

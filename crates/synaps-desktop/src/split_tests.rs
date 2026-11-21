@@ -3626,7 +3626,7 @@ fn a_divider_drag_holds_the_thumbs(cx: &mut TestAppContext) {
 /// spring stops. Frame by frame through the rail's and the right panel's
 /// fold and unfold, in one pane and in two: from the last frame a panel's
 /// edge or a pane's moves, no row, no column (the labels' hang and left)
-/// and no thumb changes. On `f4addde` the folds' columns re-wrapped 6 or 7
+/// and no thumb changes. On `d8dc3a0` the folds' columns re-wrapped 6 or 7
 /// frames (at 144 Hz) after the panes stopped.
 #[gpui_kit::test]
 fn nothing_moves_after_the_panels_and_panes_stop(cx: &mut TestAppContext) {
@@ -3659,11 +3659,15 @@ fn nothing_moves_after_the_panels_and_panes_stop(cx: &mut TestAppContext) {
                     })
                     .collect()
             });
+        // The thumbs painted (else the thumb check is vacuous: one not
+        // painted is NaN on both sides).
+        let thumbed = std::cell::Cell::new(0usize);
         // A frame: the edges (the panels as drawn, each pane's list's box),
         // and what is drawn in the panes (each one's column, its left and
         // the labels' hang, its first rows' boxes, its thumb).
         let snap = |cx: &mut TestAppContext| -> (Vec<f32>, Vec<f32>) {
             let thumbs: Vec<Option<[f32; 4]>> = bars.iter().map(|b| b.thumbs().last().and_then(|t| t.2)).collect();
+            thumbed.set(thumbed.get() + thumbs.iter().flatten().count());
             view.read_with(cx, |v, _| {
                 let mut edges = vec![v.panel_fx.sides[0].shown, v.panel_fx.sides[1].shown];
                 let mut drawn = Vec::new();
@@ -3709,6 +3713,7 @@ fn nothing_moves_after_the_panels_and_panes_stop(cx: &mut TestAppContext) {
                     rest = if busy { 0 } else { rest + 1 };
                     assert!(seen.len() < 500, "{case}: never landed");
                 }
+                assert!(thumbed.replace(0) > 0, "{case}: no thumb painted");
                 let last = (1..seen.len()).rev().find(|&i| !same(&seen[i].0, &seen[i - 1].0)).unwrap_or(0);
                 if last == 0 {
                     fails.push(format!("{case}: nothing moved"));
