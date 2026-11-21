@@ -302,14 +302,12 @@ impl AppView {
         // A view nobody looks at (on screen, or held by a worker tab) whose
         // worker ended goes (and leaves the walk), as do the views of the
         // worker tabs past the most recently shown few, and their lists.
-        // Every pane's on this store (Shady #36 M2): the other panes' views,
-        // parked, and their worker tabs' views.
+        // Every pane's on this store (Shady #36 M2): the other panes' views
+        // (parked, `Watch::park` keeps them) and their worker tabs' views.
         let live_id = self.panes.cur.live;
         let mut held = self.model.held_views(live_id);
         let session = self.model.lives[live_id].active.as_ref().map(|a| a.session_id.clone());
-        let mut parked = Vec::new();
         for p in self.panes.rest.iter().filter(|p| p.live == live_id) {
-            parked.extend(p.parked.view.handle().map(str::to_string));
             held.extend(
                 p.parked
                     .tabs
@@ -318,7 +316,6 @@ impl AppView {
                     .filter_map(|t| t.worker.as_ref().map(|w| w.handle.clone())),
             );
         }
-        self.model.lives[live_id].watch.keep_parked(parked);
         self.model.lives[live_id].watch.hold(held);
         // A finished worker's flash on the motion clock too (tests: the
         // test's own, never a slow runner's wall time).

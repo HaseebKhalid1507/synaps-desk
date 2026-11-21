@@ -300,11 +300,6 @@ pub struct Pane {
     pub(crate) rect: Cell<crate::split::Rect>,
 }
 
-/// A pane's state the window holds for the pane acted on (in `Model` and
-/// `AppView`, where steps 1 and 2 left it and the protected tests read
-/// it): the others keep theirs here, swapped in with the pane
-/// ([`crate::app::AppView::enter_pane`]), so every read and write of it
-/// is that pane's.
 /// Why the keys are to follow the focus mark at the next frame
 /// ([`crate::app::AppView::apply_keys`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,6 +334,11 @@ enum KeysAt {
     Nowhere,
 }
 
+/// A pane's state the window holds for the pane acted on (in `Model` and
+/// `AppView`, where steps 1 and 2 left it and the protected tests read
+/// it): the others keep theirs here, swapped in with the pane
+/// ([`crate::app::AppView::enter_pane`]), so every read and write of it
+/// is that pane's.
 #[derive(Default)]
 pub(crate) struct Parked {
     /// Its tabs (`Model::tabs`).
@@ -659,13 +659,24 @@ impl crate::app::AppView {
         cx.notify();
     }
 
+    /// The pane whose input `h` is (its composer, secret field or Allow
+    /// all box), if one's.
+    pub(crate) fn input_pane(&self, h: &FocusHandle, cx: &App) -> Option<PaneId> {
+        self.panes
+            .iter()
+            .find(|p| {
+                p.composer.read(cx).focus_handle(cx) == *h || p.secret_input.read(cx).focus_handle(cx) == *h || p.allow_all_focus == *h
+            })
+            .map(|p| p.id)
+    }
+
     /// Who has the keys now, as the focus mark sees it.
     fn keys_at(&self, window: &Window, cx: &App) -> KeysAt {
         let focused = self.panes.focused;
-        // A view's fields (Settings' find, a value or a colour being
-        // edited) are the pane's that shows that view.
-        let view_field =
-            [&self.settings_find, &self.settings_input, &self.hex_input].iter().any(|f| f.read(cx).focus_handle(cx).is_focused(window));
+        // A view's fields (Settings' find, a value being edited) are the
+        // pane's that shows that view; the theme picker's colour is the
+        // window's (an overlay: Shady #36 r2 n10).
+        let view_field = [&self.settings_find, &self.settings_input].iter().any(|f| f.read(cx).focus_handle(cx).is_focused(window));
         for p in self.panes.iter() {
             let tabs = if p.id == self.panes.cur.id { &self.model.tabs } else { &p.parked.tabs };
             let has = p.composer.read(cx).focus_handle(cx).is_focused(window)
@@ -689,7 +700,11 @@ impl crate::app::AppView {
                     KeysAt::Root
                 }
             }
-            Some(f) if [&self.find_input, &self.palette_input, &self.name_input].iter().any(|i| i.read(cx).focus_handle(cx) == f) => {
+            Some(f)
+                if [&self.find_input, &self.palette_input, &self.name_input, &self.hex_input]
+                    .iter()
+                    .any(|i| i.read(cx).focus_handle(cx) == f) =>
+            {
                 KeysAt::Window
             }
             Some(_) if view_field => KeysAt::Window,
@@ -936,15 +951,16 @@ impl crate::app::AppView {
             self.keys_rearm = true;
             self.ask_keys(KeysTo::Closed);
         }
-        // What it sent still unconfirmed goes back to a pane on its store
-        // (Shady #36 L5).
-        if let Some(other) = self.panes.iter().find(|p| p.id != id && p.live == live).map(|p| p.id) {
-            self.model.lives[live].in_flight.rehome(id, other);
-        }
+        // What it sent still unconfirmed went to another pane on its store
+        // as it left the store (`AppView::repoint`, Shady #36 r2 L-c).
         let next = self.panes.focused;
         self.enter_pane(next);
         if let Some(i) = self.panes.rest.iter().position(|p| p.id == id) {
-            drop(self.panes.rest.remove(i));
+            // Its worker view, parked as it left, is no longer kept for it.
+            let mut gone = self.panes.rest.remove(i);
+            let view = std::mem::take(&mut gone.parked.view);
+            self.model.lives[gone.live].watch.drop_parked(view);
+            drop(gone);
         }
         self.fx.col(id).reset();
         self.release_live(live);

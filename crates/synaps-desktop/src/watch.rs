@@ -453,13 +453,6 @@ pub struct ViewFocus {
     esc_guard: Option<Instant>,
 }
 
-impl ViewFocus {
-    /// The worker it views, if one.
-    pub fn handle(&self) -> Option<&str> {
-        self.focus.as_deref()
-    }
-}
-
 /// A session's worker views and the watch bookkeeping (one per tab: it
 /// goes to the tab cache with the transcript).
 #[derive(Debug, Default)]
@@ -495,7 +488,11 @@ pub struct Watch {
     /// Views put on screen so far (each view's [`Worker::shown`]).
     shown: u64,
     /// The views other panes on this store have on screen, parked
-    /// ([`Watch::park`]): kept as the focused one is (Shady #36 M2).
+    /// ([`Watch::park`]): kept as the focused one is (Shady #36 M2). Exact
+    /// at every moment (r2 L-b: a snapshot taken at a frame missed the
+    /// view of the pane that took it, and a reconnect between frames
+    /// dropped that view): `park` adds, `unpark` and `drop_parked` take
+    /// away, one each (two panes can park one worker's view).
     parked: Vec<String>,
 }
 
@@ -614,21 +611,40 @@ impl Watch {
     /// poll in flight stays (its reply is matched by handle); only the
     /// view put back polls.
     pub fn park(&mut self) -> ViewFocus {
-        ViewFocus { focus: self.focus.take(), scrolled_back: std::mem::take(&mut self.scrolled_back), esc_guard: self.esc_guard.take() }
+        let v = ViewFocus {
+            focus: self.focus.take(),
+            scrolled_back: std::mem::take(&mut self.scrolled_back),
+            esc_guard: self.esc_guard.take(),
+        };
+        self.parked.extend(v.focus.clone());
+        v
     }
 
     /// A pane's view put back ([`Watch::park`]), if its worker is still
     /// held here; else the session's thread.
     pub fn unpark(&mut self, v: ViewFocus) {
+        self.forget_parked(v.focus.as_deref());
         self.focus = v.focus.filter(|h| self.workers.contains_key(h));
         self.scrolled_back = v.scrolled_back && self.focus.is_some();
         self.esc_guard = v.esc_guard;
     }
 
-    /// The views other panes on this store have parked: they stay, finished
-    /// or not, as the focused one does ([`Watch::prune`], [`Watch::hold`]).
-    pub fn keep_parked(&mut self, handles: Vec<String>) {
-        self.parked = handles;
+    /// A parked view that will not come back (its pane closed): no longer
+    /// kept for it.
+    pub fn drop_parked(&mut self, v: ViewFocus) {
+        self.forget_parked(v.focus.as_deref());
+    }
+
+    fn forget_parked(&mut self, handle: Option<&str>) {
+        if let Some(i) = handle.and_then(|h| self.parked.iter().position(|p| p == h)) {
+            self.parked.remove(i);
+        }
+    }
+
+    /// The views other panes on this store have parked ([`Watch::park`]).
+    #[cfg(test)]
+    pub fn parked(&self) -> &[String] {
+        &self.parked
     }
 
     /// Back to the session's thread (its list is exactly as it was left).

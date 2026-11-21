@@ -330,7 +330,8 @@ impl InFlight {
         }
     }
 
-    /// Pane `from` closed: what it sent is pane `to`'s (Shady #36 L5).
+    /// Pane `from` left the store (closed, or on another session now):
+    /// what it sent is pane `to`'s (Shady #36 L5, r2 L-c).
     pub(crate) fn rehome(&mut self, from: PaneId, to: PaneId) {
         for (p, _) in self.0.iter_mut().filter(|(p, _)| *p == from) {
             *p = to;

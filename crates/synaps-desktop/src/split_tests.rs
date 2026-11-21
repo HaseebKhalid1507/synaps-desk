@@ -14,6 +14,7 @@ use gpui_kit::{
     WindowOptions, px, size,
 };
 use serde_json::{Value, json};
+use synaps_client::protocol::{LlmEvent, SessionEvent, StreamEvent};
 use synaps_client::{Client, ClientOptions, Endpoint, Event, Identity};
 
 use crate::app::AppView;
@@ -106,6 +107,11 @@ fn until(events: &async_channel::Receiver<Event>, what: &str, done: impl Fn(&Eve
 /// The `--offline` demo's window at 1280×800, text step 16 (`ui_tests`'
 /// `open_at` without its client: the test gives it one).
 fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<AppView>) {
+    open_sized(cx, 1280., 800.)
+}
+
+/// [`open`] at `w`×`h`.
+fn open_sized(cx: &mut TestAppContext, w: f32, h: f32) -> (AnyWindowHandle, Entity<AppView>) {
     let wv = cx.update(|cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
@@ -113,7 +119,7 @@ fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<AppView>) {
         let (theme, raw, _, _) = crate::theme::resolve_theme(None, None, None, None, None);
         crate::theme::apply(crate::theme::Choice { theme, raw, accent: None, text: 16 }, cx);
         crate::app::bind_keys(cx);
-        let bounds = Bounds { origin: Default::default(), size: size(px(1280.), px(800.)) };
+        let bounds = Bounds { origin: Default::default(), size: size(px(w), px(h)) };
         let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
         crate::beat::open_window(options, cx, true, |window, cx| {
             cx.new(|cx| {
@@ -994,4 +1000,400 @@ fn a_pane_an_event_closes_leaves_the_focus(cx: &mut TestAppContext) {
     assert!(keys_in(cx, window, &view, focused, false), "and the keys");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
+}
+
+// ── Round 3 (Shady #36 r2): #33's label hang, per pane ──────────────────
+
+/// One 144 Hz frame on the test's clock, drawn (`test_kit`'s
+/// `fluid_frame`).
+fn frame_144(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>) {
+    let dt = Duration::from_micros(6944);
+    view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
+    cx.executor().advance_clock(dt);
+    view.update(cx, |_, cx| cx.notify());
+    cx.update_window(window, |_, w, cx| w.simulate_next_frame(cx)).expect("the window");
+    cx.run_until_parked();
+}
+
+/// A label as one frame drew it: its pane's width, its left from the
+/// pane's edge and top from its row's, and the pane's column.
+type Placed = (f32, (f32, f32), f32);
+
+/// A labelled row whole in pane `id`'s view and in no other pane's (a
+/// debug selector names the last pane drawn: this row's `label N` is this
+/// pane's), not its top row (its label may be pinned).
+fn own_label(view: &Entity<AppView>, cx: &mut TestAppContext, id: crate::pane::PaneId) -> u64 {
+    view.read_with(cx, |v, _| {
+        let pane = v.panes.get(id).expect("the pane");
+        let (vb, top) = (pane.list.viewport_bounds(), pane.list.logical_scroll_top().item_ix);
+        let drawn_elsewhere = |ix: usize| {
+            v.panes.ids().into_iter().filter(|&o| o != id).any(|o| {
+                let other = v.panes.get(o).expect("the pane");
+                other.list.bounds_for_item(ix).is_some_and(|b| {
+                    let ovb = other.list.viewport_bounds();
+                    b.bottom() > ovb.top() - px(400.) && b.top() < ovb.bottom() + px(400.)
+                })
+            })
+        };
+        (top + 1..pane.disp.len())
+            .find(|&ix| {
+                pane.disp[ix].who != crate::turns::Who::None
+                    && pane.list.bounds_for_item(ix).is_some_and(|b| b.top() > vb.top() + px(60.) && b.bottom() < vb.bottom() - px(60.))
+                    && !drawn_elsewhere(ix)
+            })
+            .map(|ix| pane.disp[ix].id)
+            .unwrap_or_else(|| {
+                let seen: Vec<_> = v
+                    .panes
+                    .ids()
+                    .into_iter()
+                    .map(|o| {
+                        let p = v.panes.get(o).expect("the pane");
+                        let drawn: Vec<usize> = (0..p.disp.len()).filter(|&ix| p.list.bounds_for_item(ix).is_some()).collect();
+                        (o, p.disp.len(), p.list.logical_scroll_top(), p.list.viewport_bounds(), drawn)
+                    })
+                    .collect();
+                panic!("a labelled row of pane {id:?}'s own: {seen:?}")
+            })
+    })
+}
+
+/// #33 in split panes (Shady #36 r2, the blocker): each pane's labels hang
+/// by its own width. Two panes side by side, the left wider; the rail's
+/// flight takes the left across the hang width (872 px at this step) and
+/// leaves the right under it. Every frame of the flight, both ways: the
+/// left's hang is its flight's end's from the start and its labels glide
+/// (`hang_k` between 0 and 1, the label moving no more than its pane's
+/// step); the right's stays inline (`hang_k` 0), its rows are never
+/// measured again, and its label moves no more than its own pane's step.
+/// Landed, each pane's layout is a fresh one's at its width. One window-
+/// wide hang (or the window's `pane_to` for every pane) hangs the right
+/// pane's labels as well.
+#[gpui_kit::test]
+fn each_panes_labels_hang_by_its_own_width_in_a_panel_flight(cx: &mut TestAppContext) {
+    let (window, view) = open_sized(cx, 1700., 900.);
+    cx.update(|cx| {
+        cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Full), lock: None });
+        crate::motion::Level::apply(cx);
+    });
+    view.update(cx, |v, cx| {
+        v.app_settings.split = true;
+        v.panels.rail_collapsed = false;
+        v.panels.right_collapsed = true;
+        // Short turns after the demo's: a label every few lines, a list
+        // long enough for the two panes to show apart.
+        for n in 0..30 {
+            let t = &mut v.model.transcript;
+            let user_text = Some(format!("Question {n}: where does the refresh race start?"));
+            t.apply(&SessionEvent::TurnStarted { turn_baseline: 12 + 2 * n, trigger: "user".into(), user_text });
+            let text = format!("Answer {n}: in the relay's token cache, two lines down from the lock.");
+            t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { text }) });
+            t.apply(&SessionEvent::Idle);
+        }
+        v.sync_list();
+        cx.notify();
+    });
+    let settle = |cx: &mut TestAppContext, view: &Entity<AppView>| {
+        for _ in 0..600 {
+            if !view.read_with(cx, |v, _| v.fx.pending().0 || v.panel_fx.moving()) {
+                break;
+            }
+            frame_144(cx, window, view);
+        }
+    };
+    settle(cx, &view);
+    key(cx, window, "ctrl-\\");
+    let (left, right) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    // The left pane's share: the hang width between the centre with the
+    // rail open and with it closed.
+    let (m, rail_open, rail_shut) = view.read_with(cx, |v, cx| {
+        let m = crate::theme::metrics(cx);
+        let [rail, right] = [0, 1].map(|i| v.panel_fx.sides[i].shown);
+        (m, v.width - crate::chrome::MARK - rail - right, v.width - crate::chrome::MARK - right)
+    });
+    let hang_w = (672. + 200.) * m.r;
+    let share = hang_w / ((rail_open + rail_shut) / 2. - crate::split::DIVIDER);
+    view.update(cx, |v, cx| {
+        v.panes.tree = crate::split::Node::Split {
+            axis: crate::split::Axis::Row,
+            kids: vec![crate::split::Node::Leaf(left), crate::split::Node::Leaf(right)],
+            ratios: vec![share, 1. - share],
+        };
+        cx.notify();
+    });
+    settle(cx, &view);
+    // The two apart: the left on the first short turns, the right at the end.
+    view.update(cx, |v, cx| {
+        v.in_pane(left, |v| v.panes.cur.list.scroll_to(gpui_kit::ListOffset { item_ix: 16, offset_in_item: px(0.) }));
+        v.in_pane(right, |v| v.panes.cur.list.scroll_to_end());
+        cx.notify();
+    });
+    settle(cx, &view);
+    for _ in 0..4 {
+        frame(cx, window);
+    }
+    let width = |cx: &mut TestAppContext, id| view.read_with(cx, |v, _| v.panes.get(id).expect("the pane").rect.get().w);
+    let lay = |cx: &mut TestAppContext, id| view.read_with(cx, |v, _| v.panes.get(id).expect("the pane").layout);
+    let measured = |cx: &mut TestAppContext, id| view.read_with(cx, |v, _| v.panes.get(id).expect("the pane").metrics_gen);
+    let label = |cx: &mut TestAppContext, id: u64| {
+        VisualTestContext::from_window(window, cx)
+            .debug_bounds(format!("label {id}").leak())
+            .map(|b| (f32::from(b.origin.x), f32::from(b.origin.y)))
+    };
+    // Its pane's left edge as drawn (the rail's flight moves the centre).
+    let pane_x = |cx: &mut TestAppContext, pane: crate::pane::PaneId| {
+        let b = VisualTestContext::from_window(window, cx).debug_bounds(format!("pane {}", pane.index()).leak()).expect("the pane drawn");
+        f32::from(b.origin.x)
+    };
+    let row_top = |cx: &mut TestAppContext, pane, id: u64| {
+        view.read_with(cx, |v, _| {
+            let p = v.panes.get(pane).expect("the pane");
+            let ix = p.disp.iter().position(|d| d.id == id).expect("the row");
+            p.list.bounds_for_item(ix).map(|b| f32::from(b.top())).expect("the row drawn")
+        })
+    };
+    // The setup: the left crosses the hang width in the flight, the right
+    // does not.
+    let (l0, r0) = (width(cx, left), width(cx, right));
+    assert!(l0 < hang_w && r0 < hang_w, "the rail open: both panes inline ({l0}, {r0} < {hang_w})");
+    assert!(!lay(cx, left).hang && !lay(cx, right).hang && lay(cx, left).hang_k == 0. && lay(cx, right).hang_k == 0.);
+    for close in [true, false] {
+        let ids = [(left, own_label(&view, cx, left)), (right, own_label(&view, cx, right))];
+        let rects = view.read_with(cx, |v, _| ids.map(|(p, _)| v.panes.get(p).expect("the pane").rect.get()));
+        // Each label on its pane and its row: its left from the pane's
+        // edge, its top from its row's; and its pane's width.
+        let place = |cx: &mut TestAppContext, p: crate::pane::PaneId, id: u64| {
+            let at = label(cx, id).expect("the label in every frame");
+            (width(cx, p), (at.0 - pane_x(cx, p), at.1 - row_top(cx, p, id)), lay(cx, p).column)
+        };
+        let mut track: Vec<Vec<Placed>> = Vec::new();
+        for (i, (p, id)) in ids.iter().enumerate() {
+            let at = label(cx, *id).unwrap_or_else(|| panic!("close {close}: pane {i}'s label {id} drawn"));
+            let x = pane_x(cx, *p);
+            assert!(at.0 >= x && at.0 < x + rects[i].w, "close {close}: label {id} {at:?} in its pane at {x}, {:?}", rects[i]);
+            track.push(vec![place(cx, *p, *id)]);
+        }
+        let right_gen = measured(cx, right);
+        let tight = lay(cx, right).tight;
+        view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        cx.run_until_parked();
+        let (mut between, mut frames) = (0, 0);
+        while view.read_with(cx, |v, _| v.fx.pending().0 || v.panel_fx.moving()) && frames < 600 {
+            frame_144(cx, window, &view);
+            frames += 1;
+            let (ll, rl) = (lay(cx, left), lay(cx, right));
+            assert_eq!(ll.hang, close, "close {close}, frame {frames}: the left pane's hang is its flight's end's from the start");
+            assert!(!rl.hang && rl.hang_k == 0., "close {close}, frame {frames}: the right pane stays inline ({rl:?})");
+            if ll.hang_k > 0. && ll.hang_k < 1. {
+                between += 1;
+            }
+            for (i, (p, id)) in ids.iter().enumerate() {
+                let now = place(cx, *p, *id);
+                track[i].push(now);
+            }
+        }
+        assert!(frames < 600, "close {close}: the flight lands");
+        // No label jumps: in a frame, on its pane and its row, it moves its
+        // way's share of the pane's step (up to `turns::lead`'s 3.52 times
+        // the line's rate mid-way), the column's own move (half the step)
+        // and a pixel's rounding either way. Each by its own pane. The
+        // column keeps the flight's narrowest wrap until it lands, then
+        // takes the pane's (fluid.md §3.8, main's cut): that one frame
+        // moves the column, not the labels on it.
+        for (i, frames) in track.iter().enumerate() {
+            let rewraps = frames.windows(2).filter(|f| f[0].2 != f[1].2).count();
+            assert!(
+                rewraps <= 1,
+                "close {close}: pane {i}'s column rewraps once, as it lands ({rewraps}): {:?}",
+                frames.iter().map(|f| (f.0, f.2)).collect::<Vec<_>>()
+            );
+            let (first, end) = (frames[0], frames[frames.len() - 1]);
+            let column = |f: &Placed| (f.0 - f.2) / 2.;
+            let way = ((end.1.0 - column(&end)) - (first.1.0 - column(&first))).hypot(end.1.1 - first.1.1);
+            let delta = (end.0 - first.0).abs().max(1.);
+            for (n, pair) in frames.windows(2).enumerate() {
+                let ((w0, (x0, y0), c0), (w1, (x1, y1), c1)) = (pair[0], pair[1]);
+                if c0 != c1 {
+                    continue;
+                }
+                let step = (w1 - w0).abs();
+                let moved = (x1 - x0).hypot(y1 - y0);
+                let bound = 3.6 * way * step / delta + step + std::f32::consts::SQRT_2 + 1e-3;
+                assert!(
+                    moved <= bound,
+                    "close {close}, frame {}: pane {i}'s label moved {moved} px in a frame its pane moved {step} (way {way}, its pane {delta}, bound {bound}): {:?}",
+                    n + 1,
+                    &frames[n.saturating_sub(4)..(n + 4).min(frames.len())]
+                );
+            }
+        }
+        assert!(between >= 3, "close {close}: the left pane's labels glide ({between} frames between)");
+        let (l1, r1) = (width(cx, left), width(cx, right));
+        assert_eq!(close, l1 >= hang_w, "close {close}: the left pane crossed ({l0} -> {l1})");
+        assert!(r1 < hang_w, "close {close}: the right pane stays under the hang width ({r1})");
+        let (ll, rl) = (lay(cx, left), lay(cx, right));
+        assert_eq!((ll.hang, ll.hang_k), (close, if close { 1. } else { 0. }), "close {close}: the left landed a fresh layout's");
+        assert_eq!((rl.hang, rl.hang_k), (false, 0.), "close {close}: the right landed inline");
+        if rl.tight == tight {
+            assert_eq!(measured(cx, right), right_gen, "close {close}: the right pane's rows are not measured again for the left's hang");
+        }
+    }
+}
+
+// ── Round 3 (Shady #36 r2): L-b, L-c, L-d, n9 ───────────────────────────
+
+/// Shady #36 r2 L-b (M2's reconnect half): two panes on A, a worker's view
+/// in the second; the first focused, so the second's view is parked. Each
+/// frame syncs both panes' trays (the last from the second pane, whose
+/// view is the store's focus then: a snapshot taken there missed it). A
+/// reconnect between frames keeps the parked view: the second pane is
+/// still on its worker, not flipped to the thread.
+#[gpui_kit::test]
+fn a_reconnect_keeps_the_unfocused_panes_worker_view(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-reconnect", None);
+    key(cx, window, "ctrl-\\");
+    let p1 = view.read_with(cx, |v, _| v.panes.cur.id);
+    view.update(cx, |v, cx| {
+        let live = v.panes.cur.live;
+        v.model.lives[live].watch.open(&crate::watch::Candidate::of(2, "sleeper"), None, std::time::Instant::now());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    key(cx, window, "alt-1");
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    view.read_with(cx, |v, _| {
+        let w = &v.model.lives[v.panes.cur.live].watch;
+        assert_eq!((w.focus(), w.parked()), (None, &["sa_2".to_string()][..]), "the first pane on the thread, the second's view parked");
+    });
+    // A's attachment comes back (the daemon reloaded): `Attached`, a
+    // reconnect, between frames.
+    let seq = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].active.as_ref().expect("attached").attach_seq);
+    let again = match synaps_client::protocol::decode_frame(&attached(A, None).to_string()).expect("a frame") {
+        synaps_client::protocol::DaemonFrame::Attached(a) => a,
+        other => panic!("{other:?}"),
+    };
+    view.update(cx, |v, cx| {
+        let ev = Event::Attached { attach_seq: seq, attached: again, mode: synaps_client::AttachMode::Mirror, reconnect: true };
+        v.apply_batch(vec![ev], cx);
+    });
+    key(cx, window, "alt-2");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.focused, p1);
+        assert_eq!(v.model.lives[v.panes.cur.live].watch.focus(), Some("sa_2"), "the second pane's view kept over the reconnect");
+    });
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #36 r2 L-c (L5's close half): two panes on A; the second sends
+/// a message (typed, Enter), and before the daemon confirms it the second
+/// pane leaves A: its tab switched to B, or its pane closed (its last tab
+/// closed: `close_tab`, where Ctrl+W ends; Ctrl+W right after a send does
+/// not close a tab, split panes off too, so the key is not this test's).
+/// The daemon refuses the message: it comes back to the first
+/// pane's composer, the one still on A. Never the second's on B, never
+/// dropped with the closed pane.
+#[gpui_kit::test]
+fn a_refused_message_from_a_pane_that_left_goes_back_to_the_pane_on_its_session(cx: &mut TestAppContext) {
+    for close in [false, true] {
+        let name = if close { "panes-unsent-close" } else { "panes-unsent-switch" };
+        let (window, view, client, mut a, attaches, events) = on_a(cx, name, None);
+        key(cx, window, "ctrl-\\");
+        let (p0, p1) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+        let text = "from the second pane";
+        frame(cx, window);
+        assert!(keys_in(cx, window, &view, p1, false), "close {close}: the second pane's composer has the keys");
+        type_enter(cx, window, text);
+        assert_eq!(submits(&mut a), 1, "close {close}: one message sent on A");
+        view.read_with(cx, |v, _| {
+            let sent: Vec<_> = v.model.lives[v.panes.cur.live].in_flight.iter().cloned().collect();
+            assert_eq!((v.panes.cur.id, sent), (p1, vec![text.to_string()]), "close {close}: in flight from the second pane");
+        });
+        if close {
+            view.update(cx, |v, cx| {
+                let ix = v.model.tabs.active().expect("its tab");
+                v.close_tab(ix);
+                cx.notify();
+            });
+            frame(cx, window);
+            assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "close {close}: the second pane closed");
+        } else {
+            view.update(cx, |v, cx| {
+                v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
+                cx.notify();
+            });
+            let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+            b.send(attached(B, None));
+            feed(cx, window, &view, &events, "B attached in the second pane", |v| {
+                v.panes.get(p1).is_some_and(|p| v.model.lives[p.live].is_active(B))
+            });
+        }
+        a.send(json!({"type": "event", "session_id": A, "seq": 1, "ts": "t",
+            "event": {"ev": "refused", "client": 2, "command": "submit", "reason": "busy"}}));
+        feed(cx, window, &view, &events, "the refusal", |v| v.panes.get(p0).is_some_and(|p| v.model.lives[p.live].in_flight.is_empty()));
+        for _ in 0..3 {
+            frame(cx, window);
+        }
+        let value = |cx: &mut TestAppContext, id| {
+            view.read_with(cx, |v, cx| v.panes.get(id).map(|p| (p.restore.clone(), p.composer.read(cx).value().to_string())))
+        };
+        let first = value(cx, p0).expect("the first pane");
+        assert!(first.1 == text || first.0.as_deref() == Some(text), "close {close}: back in the first pane's composer, on A: {first:?}");
+        if let Some(second) = value(cx, p1) {
+            assert!(second.0.is_none() && second.1.is_empty(), "close {close}: nothing in the second pane's, on B: {second:?}");
+        }
+        view.update(cx, |v, _| v.client = None);
+        let _ = client.shutdown();
+    }
+}
+
+/// Shady #36 r2 L-d: a menu opened in the first pane (its composer had the
+/// keys) saves them to give back. A click on the second pane's body (not
+/// an input: nothing there takes the keys) closes the menu and marks the
+/// second pane. The menu's restore no longer pulls the mark back: the
+/// second pane stays marked, and the first pane's composer does not get
+/// the keys.
+#[gpui_kit::test]
+fn a_click_in_another_pane_closes_the_menu_and_keeps_the_mark(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-menu-back", None);
+    key(cx, window, "ctrl-\\");
+    let (p0, p1) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    key(cx, window, "alt-1");
+    frame(cx, window);
+    assert!(keys_in(cx, window, &view, p0, false), "the first pane's composer has the keys");
+    let tab = view.read_with(cx, |v, _| v.model.tabs.iter().next().expect("a tab").id);
+    cx.update_window(window, |_, w, cx| {
+        view.update(cx, |v, cx| v.open_session_menu(crate::app::SessionAt::Tab(tab), gpui_kit::point(px(400.), px(120.)), w, cx))
+    })
+    .expect("the window");
+    frame(cx, window);
+    assert!(view.read_with(cx, |v, _| v.smenu.is_some()), "the session menu open");
+    assert!(root_has_keys(cx, window, &view), "the menu took the keys");
+    // The second pane's body: its list, under its tab strip.
+    let at = {
+        let b = VisualTestContext::from_window(window, cx).debug_bounds(format!("pane {}", p1.index()).leak()).expect("the second pane");
+        gpui_kit::point(b.center().x, b.origin.y + px(160.))
+    };
+    click_at(cx, window, at);
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    assert!(view.read_with(cx, |v, _| v.smenu.is_none()), "the click closed the menu");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), p1, "the second pane stays marked");
+    assert!(!keys_in(cx, window, &view, p0, false), "the first pane's composer did not get the keys back");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #36 r2 n9: with split panes on and one pane, the pane focus keys
+/// (Alt+N, F6, Shift+F6) are not bound (main's window); the split keys
+/// are. Two panes bind both; split panes off, neither.
+#[test]
+fn the_pane_focus_keys_need_two_panes() {
+    let has = |split_on, split, ctx: &str| crate::app::root_context(false, false, split_on, split).is_some_and(|c| c.contains(ctx));
+    assert!(!has(false, false, "Panes") && !has(false, false, "PaneFocus"), "split panes off: none");
+    assert!(has(true, false, "Panes") && !has(true, false, "PaneFocus"), "one pane: the split keys only");
+    assert!(has(true, true, "Panes") && has(true, true, "PaneFocus"), "two panes: both");
 }

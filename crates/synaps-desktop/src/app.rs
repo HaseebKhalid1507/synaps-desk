@@ -396,19 +396,25 @@ const MENU_CTX: &str = "Menu";
 /// The root's key context with split panes on: the pane keys
 /// ([`pane_keys`]) are bound in it only.
 const PANES_CTX: &str = "Panes";
+/// The keys that move the focus between panes: only with two or more
+/// (Shady #36 r2 n9: one pane is main's window, Alt+1 included).
+const PANE_FOCUS_CTX: &str = "PaneFocus";
 
 /// The root's key context: a menu's (it outranks the card's Allow all
-/// box, as it always has), else the box's, and the panes' with split
-/// panes on.
-fn root_context(card_tab: bool, menu: bool, panes: bool) -> Option<KeyContext> {
+/// box, as it always has), else the box's, the panes' with split panes on
+/// (`split_on`), and their focus keys' with two or more (`split`).
+pub(crate) fn root_context(card_tab: bool, menu: bool, split_on: bool, split: bool) -> Option<KeyContext> {
     let mut c = KeyContext::default();
     if menu {
         c.add(MENU_CTX);
     } else if card_tab {
         c.add(ALLOW_ALL_CTX);
     }
-    if panes {
+    if split_on {
         c.add(PANES_CTX);
+        if split {
+            c.add(PANE_FOCUS_CTX);
+        }
     }
     (!c.is_empty()).then_some(c)
 }
@@ -474,7 +480,7 @@ pub fn bind_keys(cx: &mut App) {
     // Only with split panes on (the root's `PANES_CTX`): off, these keys
     // are main's, never swallowed (Shady #36 L1).
     for &(k, a) in &pane_keys(mac) {
-        let c = Some(PANES_CTX);
+        let c = Some(if matches!(a, PaneKey::Split | PaneKey::SplitDown) { PANES_CTX } else { PANE_FOCUS_CTX });
         keys.push(match a {
             PaneKey::Split => KeyBinding::new(k, SplitRight, c),
             PaneKey::SplitDown => KeyBinding::new(k, SplitDown, c),
@@ -3146,6 +3152,14 @@ impl AppView {
         let shared = self.panes.showing(live) > 1;
         let elsewhere = target.as_deref().and_then(|s| self.model.lives.of_session(s, live));
         if shared {
+            // What it sent still unconfirmed is another pane's on the store
+            // now (Shady #36 L5, r2 L-c): a refusal gives it back there,
+            // never to this pane on another session, nor (its close comes
+            // through here) to no pane.
+            let me = self.panes.cur.id;
+            if let Some(other) = self.panes.iter().find(|p| p.id != me && p.live == live).map(|p| p.id) {
+                self.model.lives[live].in_flight.rehome(me, other);
+            }
             self.drop_list();
         } else {
             self.stash();
@@ -5505,6 +5519,9 @@ impl AppView {
         if stray {
             log::warn!(target: "synaps_desktop::list", "a splice past the list's end ({splice:?}, {n} items): rebuilt");
         }
+        // Tests fail on it (Shady #36 r2 L-a: the rebuild would hide a
+        // routing slip from them); a release build still rebuilds.
+        debug_assert!(!stray, "a splice past the list's end: {splice:?}, {n} items, {} rows", self.panes.cur.rows.len());
         if std::mem::take(&mut self.panes.cur.full_rebuild) || stray {
             splice = Some(Splice { start: 0, old_len: self.panes.cur.rows.len(), new_len: n });
         }
@@ -7656,6 +7673,11 @@ impl AppView {
             && self.wmenu.is_none()
             && let Some(h) = self.menu_focus_back.take()
             && self.focus.is_focused(window)
+            // Never into another pane's input (Shady #36 r2 L-d): a click
+            // in pane B closed A's menu and marked B; giving A's composer
+            // back pulled the mark back to A (a secret field: the keys in
+            // A's, B marked). The keys follow the mark (`apply_keys`).
+            && self.input_pane(&h, cx).is_none_or(|p| p == self.panes.focused)
         {
             window.focus(&h, cx);
         }
@@ -7983,17 +8005,23 @@ impl Render for AppView {
         self.centre.set((centre, centre_h));
         let main = if self.panes.split() {
             let rects = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
-            // Each pane's width as the panels' flight lands: its rectangle
-            // in the centre then (the tree's own rounding, so a landed pane
-            // reads the width it is drawn at).
-            let rects_to = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w: pane_to, h: centre_h });
+            // Each pane's width as the panels' flight lands, and the width
+            // its column wraps at while they fly: its rectangle in the
+            // centre at `pane_to`, and at the flight's narrowest (`wrap`).
+            // The tree's own rounding: a landed pane reads the width it is
+            // drawn at, and a flying one's wrap holds still (scaled by the
+            // centre's, `r.w * wrap / pane` went a pixel either way as its
+            // rounded width and the centre's fraction moved, and each step
+            // measured the list again).
+            let at = |w: f32| self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h: centre_h });
+            let (rects_to, rects_wrap) = (at(pane_to), at(wrap));
             let mut mains = Vec::new();
             for (id, r) in &rects {
-                let to = rects_to.iter().find(|(i, _)| i == id).map_or(r.w, |(_, t)| t.w);
+                let of = |rs: &[(PaneId, crate::split::Rect)]| rs.iter().find(|(i, _)| i == id).map_or(r.w, |(_, t)| t.w);
                 let g = PaneFrame {
                     pane: r.w,
-                    wrap: (r.w * wrap / pane.max(1.)).min(r.w),
-                    pane_to: to,
+                    wrap: of(&rects_wrap).min(r.w),
+                    pane_to: of(&rects_to),
                     view_pane: r.w,
                     win_h: r.h + crate::chrome::TOP,
                     p,
@@ -8020,7 +8048,12 @@ impl Render for AppView {
             .id("root")
             .track_focus(&self.focus)
             .when_some(
-                root_context(card_tab, self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some(), self.split_on()),
+                root_context(
+                    card_tab,
+                    self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some(),
+                    self.split_on(),
+                    self.panes.split(),
+                ),
                 |d, c| d.key_context(c),
             )
             .on_action(cx.listener(|this, _: &CardTab, window, cx| this.card_tab(window, cx)))

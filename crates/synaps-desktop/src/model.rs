@@ -3824,6 +3824,38 @@ mod fake_daemon {
         let _b = attaches.recv_timeout(T).unwrap();
     }
 
+    /// Shady #36 r2 n11: the same sends, and A's attachment, left, ends
+    /// (`Detached`): what is left goes back one text per pane that sent
+    /// it, in the order sent (the refusal arm above gives one at a time).
+    #[test]
+    fn unsent_input_left_behind_comes_back_one_text_per_pane() {
+        let (client, events, attaches, mut m) = connect("unsent4");
+        m.tabs.open(A, "a", Place::Current);
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
+        let seq = m.attachment().unwrap();
+        let (p0, p1) = (PaneId::FIRST, PaneId::nth(1));
+        for (p, t) in [(p0, "one"), (p1, "two"), (p0, "three")] {
+            client.on(seq).submit(t).unwrap();
+            m.sent(p, t.into());
+        }
+        m.tabs.open(B, "b", Place::New);
+        let _ = ui_switch(&mut m, &client, B, None);
+        let fx = m.apply(Event::Detached { attach_seq: seq, session_id: Some(A.into()), reason: "gone".into() });
+        assert_eq!(
+            fx,
+            vec![
+                Effect::Unsent { pane: p0, session: A.into(), text: "one\nthree".into() },
+                Effect::Unsent { pane: p1, session: A.into(), text: "two".into() }
+            ]
+        );
+        assert!(m.left.is_empty(), "nothing left to follow");
+        drop(a);
+        let _b = attaches.recv_timeout(T).unwrap();
+    }
+
     /// Tabs: A (its prompt #1 on screen) in one tab, B (its own prompt #1,
     /// streaming) in another. However the tabs switch, an answer, a steer
     /// or a HALT can only reach the visible tab's session once it has
