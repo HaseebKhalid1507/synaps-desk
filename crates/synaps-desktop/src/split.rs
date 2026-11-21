@@ -23,11 +23,26 @@ pub(crate) enum Axis {
     Column,
 }
 
-/// Where a new pane goes beside another.
+/// Where a new pane goes beside another (a drop on an edge: any of the
+/// four, split.md §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
     Right,
     Down,
+    Left,
+    Up,
+}
+
+impl Side {
+    /// The axis its split runs on, and whether the new pane comes first.
+    const fn axis(self) -> (Axis, bool) {
+        match self {
+            Side::Right => (Axis::Row, false),
+            Side::Left => (Axis::Row, true),
+            Side::Down => (Axis::Column, false),
+            Side::Up => (Axis::Column, true),
+        }
+    }
 }
 
 /// Released within this many px of equal, a divider lands on equal
@@ -224,12 +239,12 @@ impl Node {
     /// The tree with `new` beside `at` on `side`, `at`'s share halved
     /// between them; `None` if `at` is not in it.
     fn with_split(&self, at: PaneId, side: Side, new: PaneId) -> Option<Node> {
-        let axis = match side {
-            Side::Right => Axis::Row,
-            Side::Down => Axis::Column,
-        };
+        let (axis, first) = side.axis();
         match self {
-            Node::Leaf(id) if *id == at => Some(Node::Split { axis, kids: vec![Node::Leaf(at), Node::Leaf(new)], ratios: vec![0.5, 0.5] }),
+            Node::Leaf(id) if *id == at => {
+                let kids = if first { vec![Node::Leaf(new), Node::Leaf(at)] } else { vec![Node::Leaf(at), Node::Leaf(new)] };
+                Some(Node::Split { axis, kids, ratios: vec![0.5, 0.5] })
+            }
             Node::Leaf(_) => None,
             Node::Split { axis: a, kids, ratios } => {
                 // Beside a leaf of this split, on its axis: one more kid.
@@ -239,8 +254,9 @@ impl Node {
                     let (mut kids, mut ratios) = (kids.clone(), ratios.clone());
                     let half = ratios[i] / 2.;
                     ratios[i] = half;
-                    kids.insert(i + 1, Node::Leaf(new));
-                    ratios.insert(i + 1, half);
+                    let j = if first { i } else { i + 1 };
+                    kids.insert(j, Node::Leaf(new));
+                    ratios.insert(j, half);
                     return Some(Node::Split { axis: *a, kids, ratios });
                 }
                 let (i, kid) = kids.iter().enumerate().find_map(|(i, k)| k.with_split(at, side, new).map(|k| (i, k)))?;
@@ -551,15 +567,18 @@ impl Node {
     }
 
     /// Where a split's flight starts (split.md §10): `id` (the new pane)
-    /// at a share of 0, its share back with the pane before it in its
-    /// split (the one it split off), so it grows from the split line.
-    pub(crate) fn grown_from(&self, id: PaneId) -> Node {
+    /// at a share of 0, its share back with pane `at`, the one it split
+    /// off, when that is beside it (a split left or up puts it before
+    /// `at`), else with the pane before it in its split, so it grows from
+    /// the split line.
+    pub(crate) fn grown_beside(&self, id: PaneId, at: Option<PaneId>) -> Node {
         let mut n = self.clone();
         if let Some(path) = self.path_of(id)
             && let Some((&i, parent)) = path.split_last()
-            && let Some(Node::Split { ratios, .. }) = n.at_mut(parent)
+            && let Some(Node::Split { kids, ratios, .. }) = n.at_mut(parent)
         {
-            let j = if i > 0 { i - 1 } else { i + 1 };
+            let beside = at.and_then(|a| [i.wrapping_sub(1), i + 1].into_iter().find(|&j| kids.get(j) == Some(&Node::Leaf(a))));
+            let j = beside.unwrap_or(if i > 0 { i - 1 } else { i + 1 });
             if j < ratios.len() {
                 ratios[j] += ratios[i];
                 ratios[i] = 0.;
@@ -843,7 +862,7 @@ mod tests {
     fn a_flight_grows_from_the_split_line_and_a_close_lands_as_remove() {
         let two = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), A).unwrap();
         let three = two.split(p(1), Side::Down, p(2), A).unwrap();
-        let from = three.grown_from(p(2));
+        let from = three.grown_beside(p(2), None);
         let (r0, r1) = (two.rects(area()), from.rects(area()));
         let at = |rs: &[(PaneId, Rect)], id| rs.iter().find(|(i, _)| *i == id).unwrap().1;
         assert_eq!(at(&r1, p(0)), at(&r0, p(0)), "the left pane holds still");
@@ -999,5 +1018,37 @@ mod tests {
         let t = t.split(p(0), Side::Down, p(2), A).unwrap();
         let t = t.split(p(1), Side::Down, p(3), A).unwrap();
         assert_eq!(t.reading_order(area()), vec![p(0), p(1), p(2), p(3)]);
+    }
+
+    /// Step 4's drops on a left or a top edge: the new pane before the one
+    /// it splits (beside it in its split on that axis, else the two in a
+    /// new split), its share from that pane, and grown from 0 there.
+    #[test]
+    fn a_split_left_or_up_puts_the_new_pane_first() {
+        let two = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), A).unwrap();
+        let three = two.split(p(1), Side::Left, p(2), A).unwrap();
+        assert_eq!(
+            three,
+            Node::Split {
+                axis: Axis::Row,
+                kids: vec![Node::Leaf(p(0)), Node::Leaf(p(2)), Node::Leaf(p(1))],
+                ratios: vec![0.5, 0.25, 0.25]
+            }
+        );
+        let grown = three.grown_beside(p(2), Some(p(1)));
+        assert_eq!(
+            grown,
+            Node::Split { axis: Axis::Row, kids: vec![Node::Leaf(p(0)), Node::Leaf(p(2)), Node::Leaf(p(1))], ratios: vec![0.5, 0., 0.5] },
+            "from the pane it split"
+        );
+        assert_eq!(
+            three.grown_beside(p(2), None),
+            Node::Split { axis: Axis::Row, kids: vec![Node::Leaf(p(0)), Node::Leaf(p(2)), Node::Leaf(p(1))], ratios: vec![0.75, 0., 0.25] }
+        );
+        let up = two.split(p(0), Side::Up, p(2), A).unwrap();
+        let col = Node::Split { axis: Axis::Column, kids: vec![Node::Leaf(p(2)), Node::Leaf(p(0))], ratios: vec![0.5, 0.5] };
+        assert_eq!(up, Node::Split { axis: Axis::Row, kids: vec![col, Node::Leaf(p(1))], ratios: vec![0.5, 0.5] });
+        assert_eq!(up.reading_order(area()), vec![p(2), p(1), p(0)]);
+        assert_eq!(Node::Leaf(p(0)).split(p(0), Side::Left, p(1), (640., 1000.)), Err(Refused::Room), "the minimums hold on the left too");
     }
 }

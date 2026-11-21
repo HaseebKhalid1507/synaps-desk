@@ -1856,6 +1856,7 @@ impl AppView {
         });
         let el = div()
             .id(("rail-row", key as usize))
+            .debug_selector(move || format!("rail-row {key}"))
             .group("rail-row")
             .relative()
             .top(px(flip))
@@ -1941,6 +1942,10 @@ impl AppView {
                 cx.notify();
             }))
             .map(|d| AppView::pressable(d, touch, cx))
+            // Dragged onto a pane (split panes step 4): it opens there. A
+            // click still opens here (GPUI drops the click once a drag
+            // starts, past 2 px).
+            .when(self.split_on(), |d| d.on_drag(self.rail_drag(row, p), crate::dnd::RailDrag::start(cx.weak_entity())))
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 // Alt+click: Open to the side (split.md §2).
                 match this.rail.rail.rows.iter().find(|r| r.key == key).map(|r| r.action.clone()) {
@@ -2019,6 +2024,10 @@ impl AppView {
                 cx.notify();
             }))
             .map(|d| AppView::pressable(d, touch, cx))
+            // Dragged onto a pane (split panes step 4): it opens there. A
+            // click still opens here (GPUI drops the click once a drag
+            // starts, past 2 px).
+            .when(self.split_on(), |d| d.on_drag(self.rail_drag(row, p), crate::dnd::RailDrag::start(cx.weak_entity())))
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 // Alt+click: Open to the side (split.md §2).
                 match this.rail.rail.rows.iter().find(|r| r.key == key).map(|r| r.action.clone()) {

@@ -152,6 +152,11 @@ pub(crate) struct TabDrag {
     pub id: u64,
     /// Where it was when the drag began (which side a drop marks).
     pub ix: usize,
+    /// The pane it is a tab of (split panes step 4: a drop in another pane
+    /// moves it there).
+    pub from: crate::pane::PaneId,
+    /// Its session (none: a view's or a worker's tab, which only reorders).
+    pub session: Option<String>,
     label: SharedString,
     bg: Hsla,
     fg: Hsla,
@@ -611,7 +616,9 @@ impl AppView {
         // its glyph stays, its title gets the room.
         let word = word.filter(|_| width >= WORD_MIN && !view && !on);
         let (word_color, mark_color) = glyph::ink(family, Ground::Chrome, p);
-        let drag = TabDrag { id, ix, label: label.clone(), bg: p.raised, fg: p.ink, edge: p.edge };
+        let here = self.panes.cur.id;
+        let session = self.model.tabs.iter().nth(ix).filter(|t| t.kind == Kind::Session).and_then(|t| t.session.clone());
+        let drag = TabDrag { id, ix, from: here, session, label: label.clone(), bg: p.raised, fg: p.ink, edge: p.edge };
         let mark = p.focus_ch;
         let name = match (kind, worker) {
             _ if view => "view",
@@ -621,6 +628,7 @@ impl AppView {
         };
         let waits = if needs && worker.is_some() { " · its session needs you" } else { "" };
         let (tip, me) = (label.clone(), cx.weak_entity());
+        let me_drag = me.clone();
         let menu_open = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some();
         let close = h_flex()
             .id(("tab-x", id as usize))
@@ -729,16 +737,23 @@ impl AppView {
                     this.open_session_menu(crate::app::SessionAt::Tab(id), ev.position(), window, cx);
                 }
             }))
-            .on_drag(drag, |d, _, _, cx| cx.new(|_| d.clone()))
+            .on_drag(drag, move |d, _, _, cx| {
+                // Ours (split/architecture.md §4): the panes' drop targets
+                // come up for it.
+                let carry = crate::dnd::Carry::Tab { tab: d.id, from: d.from, session: d.session.clone() };
+                let _ = me_drag.update(cx, |v, cx| v.drag_started(carry, cx));
+                cx.new(|_| d.clone())
+            })
+            // From another pane's strip: it goes in before this one.
             .drag_over::<TabDrag>(move |s, d, _, _| match d.ix.cmp(&ix) {
+                _ if d.from != here => s.border_l_2().border_color(mark),
                 std::cmp::Ordering::Less => s.border_r_2().border_color(mark),
                 std::cmp::Ordering::Greater => s.border_l_2().border_color(mark),
                 std::cmp::Ordering::Equal => s,
             })
-            .on_drop(cx.listener(move |this, d: &TabDrag, _, cx| {
-                this.move_tab(d.id, id);
-                cx.notify();
-            }))
+            .drag_over::<crate::dnd::RailDrag>(move |s, _, _, _| s.border_l_2().border_color(mark))
+            .on_drop(cx.listener(move |this, d: &TabDrag, window, cx| this.drop_on_tab(d, id, window, cx)))
+            .on_drop(cx.listener(move |this, d: &crate::dnd::RailDrag, window, cx| this.drop_row_on_tab(d, id, window, cx)))
     }
 }
 

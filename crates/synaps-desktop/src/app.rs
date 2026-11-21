@@ -1776,7 +1776,7 @@ pub struct AppView {
     pub(crate) rail_width: f32,
     /// The rail row under the pointer, the one whose readout is open, and
     /// the 400 ms wait in between.
-    hover: Option<u64>,
+    pub(crate) hover: Option<u64>,
     pub(crate) readout: Option<u64>,
     readout_wait: Option<Task<()>>,
     /// When the readout came (its enter; none: it followed another, fluid.md
@@ -1902,6 +1902,8 @@ pub struct AppView {
     /// The panels the split yielded (rail, right) and its fold, as last
     /// judged ([`AppView::pane_sides`]).
     pub(crate) pane_yield: Option<(bool, bool, bool)>,
+    /// Drag and drop (split panes step 4, [`crate::dnd`]).
+    pub(crate) dnd: crate::dnd::Dnd,
     /// A once-per-press key whose action came and whose key-down has not
     /// yet ([`OnceKey`]).
     once: Option<OnceKey>,
@@ -2514,6 +2516,7 @@ impl AppView {
             tab_keys: FoldKeys::default(),
             move_keys: FoldKeys::default(),
             pane_yield: None,
+            dnd: Default::default(),
             once: None,
             attach_source: None,
             settings: Default::default(),
@@ -3049,8 +3052,9 @@ impl AppView {
     /// [`READOUT_DELAY`] at rest, and closes when it leaves.
     pub(crate) fn hover_row(&mut self, key: u64, hovered: bool, cx: &mut Context<Self>) {
         if hovered {
-            // A drag of the rail's edge passing over it is not a rest.
-            if self.hover == Some(key) || self.drag.is_some_and(|g| g.moved) {
+            // A drag of the rail's edge passing over it is not a rest, nor
+            // is a drag of a row or a tab (split/architecture.md §4.4).
+            if self.hover == Some(key) || self.drag.is_some_and(|g| g.moved) || self.dnd.on.is_some() {
                 return;
             }
             self.hover = Some(key);
@@ -8417,6 +8421,11 @@ impl Render for AppView {
         for id in self.panes.ids().into_iter().filter(|i| *i != focused) {
             self.in_pane(id, |v| v.pane_sync(window, cx));
         }
+        // A drop whose edge was refused (a 5th pane): why, on the focused
+        // composer, once its tab is the composer's.
+        if let Some(why) = self.dnd.note.take() {
+            self.split_refused(why, cx);
+        }
         // A reorder waits while a rail row is held (motion.md §6.4): a row
         // never moves away from a click. Its release draws.
         self.refresh_rail();
@@ -8722,6 +8731,8 @@ impl Render for AppView {
         self.schedule_favs_save(cx);
         self.arm_watch_poll(cx);
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
+        let drop_layer = self.render_drop_layer(&p, cx);
+        let main = main.debug_selector(|| "pane-centre".into());
         h_flex()
             .id("root")
             .track_focus(&self.focus)
@@ -8779,6 +8790,12 @@ impl Render for AppView {
             // Esc closes the picker, wherever the focus is; in find it clears
             // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                // Esc while a tab or a row is dragged: the drag ends, and
+                // nothing drops (split.md §3); nothing else hears it.
+                if ev.keystroke.key == "escape" && this.cancel_drag(window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
                 this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
                 // Ctrl+J: to the card, wherever the focus is (polish.md §2.6),
@@ -9027,6 +9044,8 @@ impl Render for AppView {
             )
             .children(self.render_edge(true, rail, rail_w, &p, cx))
             .children((view.is_none() || self.panes.split()).then(|| self.render_edge(false, right, right_w, &p, cx)).flatten())
+            // Drag and drop's targets and preview (split panes step 4).
+            .children(drop_layer)
             .when(self.picker_open, |d| {
                 d.child(deferred(self.render_picker(&p, if view.is_some() { Side::Open(0.) } else { right }, cx)).with_priority(1))
                     .child(deferred(self.bars.picker.bar(crate::scrollbar::Ground::Chrome)).with_priority(1))

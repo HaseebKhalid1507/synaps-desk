@@ -915,7 +915,7 @@ impl Model {
     }
 
     /// A live session's journal, to resume if it ended since the last list.
-    fn journal_of(&self, session_id: &str) -> Option<ResumeRequest> {
+    pub(crate) fn journal_of(&self, session_id: &str) -> Option<ResumeRequest> {
         let s = self.sessions.iter().find(|s| s.id == session_id)?;
         let name = s.name.clone().filter(|n| !n.is_empty())?;
         let target = if s.journal_id.is_empty() { s.id.clone() } else { s.journal_id.clone() };
@@ -1178,7 +1178,13 @@ impl Model {
     /// panes, Shady #44 n11: a Join, a close or a move in one pane left the
     /// other pane's by-name open in flight forgotten).
     fn attaches_of_others(&self, live: LiveId) -> Vec<u64> {
-        self.lives.ids().into_iter().filter(|&id| id != live).flat_map(|id| [self.lives[id].wanted, self.lives[id].held]).flatten().collect()
+        self.lives
+            .ids()
+            .into_iter()
+            .filter(|&id| id != live)
+            .flat_map(|id| [self.lives[id].wanted, self.lives[id].held])
+            .flatten()
+            .collect()
     }
 
     /// The attach just asked for (after [`Model::want`]) is of this session.
@@ -2035,7 +2041,10 @@ mod tests {
         assert_eq!(m.named.attaching.as_ref().map(|a| a.0), Some(2), "the other pane's fallback attach");
         assert_eq!(m.named.opening.as_ref().and_then(|o| o.attach_seq), Some(2), "the other pane's Open by name");
         m.want(LiveId::FIRST, 3);
-        assert!(m.named.resuming.is_some() && m.named.attaching.is_some() && m.named.opening.is_some(), "a new attach in this pane leaves them");
+        assert!(
+            m.named.resuming.is_some() && m.named.attaching.is_some() && m.named.opening.is_some(),
+            "a new attach in this pane leaves them"
+        );
         let _ = m.switch_out(other);
         assert!(m.named.resuming.is_none() && m.named.attaching.is_none() && m.named.opening.is_none(), "its own pane's leave drops them");
     }
