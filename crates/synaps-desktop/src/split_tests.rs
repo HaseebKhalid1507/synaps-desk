@@ -3587,6 +3587,22 @@ fn in_body(cx: &mut TestAppContext, window: AnyWindowHandle, id: crate::pane::Pa
     gpui_kit::point(px(b[0] + fx * b[2]), px(b[1] + strip + fy * (b[3] - strip)))
 }
 
+/// The next attach at the daemon. A switch soon after the last one waits
+/// for the attach gate ([`crate::tabs::AttachGate`]): its timer runs on
+/// the test's clock, so frames are drawn and the clock moved meanwhile.
+fn next_attach(cx: &mut TestAppContext, window: AnyWindowHandle, attaches: &mpsc::Receiver<Conn>, what: &str) -> Conn {
+    let deadline = Instant::now() + T;
+    loop {
+        if let Ok(c) = attaches.try_recv() {
+            return c;
+        }
+        assert!(Instant::now() < deadline, "{what}: timed out");
+        cx.executor().advance_clock(Duration::from_millis(50));
+        frame(cx, window);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// B opened as a new tab of the focused pane, attached.
 fn open_b(
     cx: &mut TestAppContext,
@@ -3599,7 +3615,7 @@ fn open_b(
         v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::New);
         cx.notify();
     });
-    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    let mut b = next_attach(cx, window, attaches, "B's attach at the daemon");
     b.send(attached(B, None));
     feed(cx, window, view, events, "B attached", |v| v.model.lives[v.panes.cur.live].is_active(B));
     b
@@ -3683,7 +3699,7 @@ fn a_rail_row_dragged_to_the_bottom_splits_and_opens(cx: &mut TestAppContext) {
     assert!(drawn(cx, window, "drop-preview".into()).is_some(), "the preview");
     mouse_m(cx, window, to, "up", gpui_kit::Modifiers::default());
     frame(cx, window);
-    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    let mut b = next_attach(cx, window, &attaches, "B's attach at the daemon");
     b.send(attached(B, None));
     let new = view.read_with(cx, |v, _| v.panes.focused);
     feed(cx, window, &view, &events, "B attached in the new pane", |v| {
@@ -3860,7 +3876,7 @@ fn a_click_on_a_rail_row_still_opens(cx: &mut TestAppContext) {
     assert!(view.read_with(cx, |v, cx| v.dnd.on.is_none() && !cx.has_active_drag()), "no drag under the threshold");
     mouse_m(cx, window, gpui_kit::point(at.x + px(1.), at.y), "up", none);
     frame(cx, window);
-    let _b = attaches.recv_timeout(T).expect("B's attach: the click opened it");
+    let _b = next_attach(cx, window, &attaches, "B's attach: the click opened it");
     assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current_session().map(str::to_string)), Some(B.to_string()));
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1);
     view.update(cx, |v, _| v.client = None);
