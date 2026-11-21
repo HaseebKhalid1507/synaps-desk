@@ -1,9 +1,8 @@
 //! Embedded fonts (OFL, subset with pyftsubset: `assets/fonts/subset.sh`) and
 //! the UI's fixed labels. Rajdhani → "Hybrid Display" (wide-tracked caps),
 //! IBM Plex Sans → "Hybrid Sans" (text), IBM Plex Mono → "Hybrid Mono"
-//! (code), and IBM Plex Sans JP cut down to ONLY the glyphs of
-//! the sub-labels below (`JP_LABELS`) → "Hybrid Labels JP". Anything else (CJK in a transcript)
-//! falls back to the system's fonts.
+//! (code). Anything else (CJK in a transcript) falls back to the system's
+//! fonts.
 //!
 //! GPUI has no letter-spacing: display labels are tracked with spaces
 //! (Rajdhani's space is 0.24 em, the mock's tracking is 0.2–0.3 em) and
@@ -16,7 +15,6 @@ use gpui_kit::{App, Styled, px};
 pub const DISPLAY: &str = "Hybrid Display";
 pub const SANS: &str = "Hybrid Sans";
 pub const MONO: &str = "Hybrid Mono";
-pub const JP: &str = "Hybrid Labels JP";
 
 /// The chrome's type scale (design.md §1.2), in px: nothing under 12. The
 /// column's sizes scale with the text step ([`crate::theme::Metrics`]);
@@ -52,16 +50,13 @@ pub mod size {
     pub const TITLE: f32 = 13.;
     /// Mono: counts, handles, ages, costs, key hints, notes.
     pub const META: f32 = 12.;
-    /// The Japanese sub-labels.
-    pub const JP: f32 = 12.;
 }
 
-const FILES: [&[u8]; 5] = [
+const FILES: [&[u8]; 4] = [
     include_bytes!("../assets/fonts/HybridDisplay-SemiBold.ttf"),
     include_bytes!("../assets/fonts/HybridSans-Regular.ttf"),
     include_bytes!("../assets/fonts/HybridSans-SemiBold.ttf"),
     include_bytes!("../assets/fonts/HybridMono-Regular.ttf"),
-    include_bytes!("../assets/fonts/HybridLabelsJP-Regular.ttf"),
 ];
 
 /// Register the embedded faces (borrowed: the bytes stay in the binary).
@@ -70,25 +65,6 @@ pub fn register(cx: &mut App) {
         eprintln!("synaps-desktop: embedded fonts not loaded: {e}");
     }
 }
-
-/// Every Japanese sub-label. `subset.sh` keeps exactly these glyphs.
-#[cfg(test)]
-const JP_LABELS: &[&str] =
-    &[JP_SESSIONS, JP_CONTEXT, JP_TOKENS, JP_FILES, JP_FAVOURITES, JP_PINNED, JP_OPEN, JP_HISTORY, JP_WORKERS, JP_COMMANDS, JP_VIEWS];
-pub const JP_SESSIONS: &str = "セッション";
-/// The rail's groups: FAVOURITES, PINNED, OPEN, HISTORY.
-pub const JP_FAVOURITES: &str = "お気に入り";
-pub const JP_PINNED: &str = "固定";
-pub const JP_OPEN: &str = "稼働";
-pub const JP_HISTORY: &str = "履歴";
-pub const JP_CONTEXT: &str = "文脈";
-pub const JP_TOKENS: &str = "トークン";
-pub const JP_FILES: &str = "変更";
-/// The palette's WORKERS and COMMANDS heads (polish.md P16).
-pub const JP_WORKERS: &str = "ワーカー";
-pub const JP_COMMANDS: &str = "コマンド";
-/// The palette's VIEWS head (Settings, Usage).
-pub const JP_VIEWS: &str = "表示";
 
 /// Tracked display labels.
 pub mod label {
@@ -221,30 +197,8 @@ mod tests {
     }
 
     #[test]
-    fn every_jp_label_glyph_is_embedded_and_nothing_more() {
-        let jp = FILES[4];
-        let mut wanted: Vec<char> = JP_LABELS.iter().flat_map(|l| l.chars()).collect();
-        wanted.sort();
-        wanted.dedup();
-        for c in &wanted {
-            assert!(has_glyph(jp, *c as u32), "{c} missing from the JP subset");
-        }
-        // Not a CJK font: a few KB, and a common kanji it has no label for is absent.
-        assert!(jp.len() < 16 * 1024, "{} bytes", jp.len());
-        assert!(!has_glyph(jp, '日' as u32));
-        assert!(!has_glyph(jp, 'A' as u32));
-        // subset.sh's list is the same set.
-        let script = include_str!("../assets/fonts/subset.sh");
-        let line = script.lines().find(|l| l.starts_with("JP_LABELS=")).expect("JP_LABELS in subset.sh");
-        let mut listed: Vec<char> = line.trim_start_matches("JP_LABELS=").trim_matches('"').chars().collect();
-        listed.sort();
-        listed.dedup();
-        assert_eq!(listed, wanted);
-    }
-
-    #[test]
     fn latin_faces_cover_the_ui_glyphs() {
-        for (i, font) in FILES[..4].iter().enumerate() {
+        for (i, font) in FILES.iter().enumerate() {
             for c in ('!'..='~').chain(['·', '…', '—', '–', '€', '’', '“', '”']) {
                 assert!(has_glyph(font, c as u32), "face {i}: {c}");
             }
