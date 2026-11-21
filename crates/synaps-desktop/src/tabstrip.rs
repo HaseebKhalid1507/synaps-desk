@@ -239,12 +239,12 @@ impl AppView {
             return self.model.state(m);
         }
         if self.model.is_active(s) {
-            let tr = &self.model.transcript;
+            let tr = &self.model.lives[self.panes.cur.live].transcript;
             if !tr.pending_prompts().is_empty() {
                 State::NeedsYou
             } else if tr.busy() {
                 State::Running
-            } else if self.model.active_workers() > 0 {
+            } else if self.model.active_workers(self.panes.cur.live) > 0 {
                 State::Workers
             } else {
                 State::Idle

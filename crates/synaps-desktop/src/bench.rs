@@ -32,7 +32,7 @@ pub struct BenchOptions {
     pub diag: bool,
     /// `--bench-tabs`: only the tab measurements ([`TAB_SESSIONS`] sessions
     /// of [`DRAG_TURNS`] turns: RSS with 1, 4 and 8 tabs, switch times
-    /// cached and not).
+    /// cached and not, then RSS with 1 to [`LIVES`] stores attached at once).
     pub tabs: bool,
     /// `--bench-history FILE`: the tab bench's sessions all have this
     /// history (a saved session's `api_messages`: a real one, with its
@@ -68,6 +68,8 @@ pub struct BenchState {
     pub drag: Option<(Instant, bool)>,
     pub animate: bool,
     pub submit_at: Option<Instant>,
+    /// The real-daemon bench's own attachment (its prompt goes there).
+    pub attach_seq: Option<u64>,
     turn_seen: bool,
     pub first_text_at: Option<Instant>,
     pub idle_at: Option<Instant>,
@@ -86,6 +88,7 @@ impl BenchState {
             drag: None,
             animate: false,
             submit_at: None,
+            attach_seq: None,
             turn_seen: false,
             first_text_at: None,
             idle_at: None,
@@ -240,6 +243,8 @@ const DRAG_PX_PER_S: f32 = 400.;
 const DRAG_TURNS: usize = 400;
 /// The tab bench's sessions.
 const TAB_SESSIONS: usize = 8;
+/// `--bench-tabs`' `mem_lives`: stores attached at once, up to this many.
+const LIVES: usize = 3;
 /// Its tab switches, cached and not (each half).
 const TAB_SWITCHES: usize = 8;
 
@@ -445,7 +450,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     }
                 }
                 out["mem_tabs"] = mem_tabs;
-                let rows = view.update(cx, |v, _| v.model.transcript.len()).unwrap_or(0);
+                let rows = view.update(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.len()).unwrap_or(0);
                 // Switch between the first two tabs; the second half drops the
                 // target's cache first (a tab that fell out of it).
                 let mut runs: Vec<Value> = Vec::new();
@@ -467,7 +472,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let switched = Instant::now();
                     // What the switch put on screen before any attach: the
                     // cached rows, or none.
-                    let rows_at_switch = view.update(cx, |v, _| v.model.transcript.len()).unwrap_or(0);
+                    let rows_at_switch = view.update(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.len()).unwrap_or(0);
                     let shown = wait_frame(cx, t0).await;
                     wait_attached(cx, &id).await;
                     let at = view.update(cx, |v, _| v.bench.as_ref().unwrap().last_attached).ok().flatten().filter(|a| *a >= t0);
@@ -506,6 +511,43 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     "uncached": keys.iter().map(|k| (k.to_string(), summary(true, k))).collect::<serde_json::Map<_, _>>(),
                     "runs": runs,
                 });
+                // Split panes step 2: what one more attachment held at once
+                // costs. The tab's store stays as it is; stores 2 and 3 (step
+                // 3's other panes') each attach a session of their own, of
+                // the same turns, as the synthetic daemon would answer it.
+                let mut mem_lives = json!({});
+                let sample = |cx: &mut AsyncWindowContext| {
+                    let mut m = mem::sample();
+                    m["trimmed_rss_kb"] = mem::trimmed_rss_kb();
+                    let rows: Vec<usize> = view.update(cx, |v, _| v.model.lives.iter().map(|l| l.transcript.len()).collect()).unwrap_or_default();
+                    m["stores_rows"] = json!(rows);
+                    m
+                };
+                sleep(0.5).await;
+                mem_lives["lives_1"] = sample(cx);
+                for n in 2..=LIVES {
+                    let sid = format!("20261114-0901{n:02}-l{n:03}");
+                    let Some(ev) = ({
+                        let sid = sid.clone();
+                        view.update(cx, move |v, _| {
+                            let live = v.model.lives.add();
+                            v.synthetic_seq += 1;
+                            let seq = v.synthetic_seq;
+                            v.model.attaching(live, seq, None, false);
+                            v.model.asked_for(live, &sid);
+                            attached_event(&sid, seq, &turns(DRAG_TURNS, 60 + n as u64))
+                        })
+                        .ok()
+                        .flatten()
+                    }) else {
+                        break;
+                    };
+                    let _ = tx.try_send(ev);
+                    let _ = wait_attached(cx, &sid).await;
+                    sleep(0.5).await;
+                    mem_lives[format!("lives_{n}")] = sample(cx);
+                }
+                out["mem_lives"] = mem_lives;
                 out["mem_end"] = mem::sample();
                 out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                 println!("{out}");
@@ -518,9 +560,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // after it (nothing moves: 0).
                 let frames = |cx: &mut AsyncWindowContext| view.update(cx, |v, _| v.fx.frames()).unwrap_or(0);
                 let _ = upd(cx, &|v, _| {
-                    v.model.set_local_session("bench-panels");
+                    v.model.local_session(v.panes.cur.live, "bench-panels");
                     v.reset_transcript();
-                    v.model.transcript.apply_history(&turns(DRAG_TURNS, 13));
+                    v.model.lives[v.panes.cur.live].transcript.apply_history(&turns(DRAG_TURNS, 13));
                     v.sync_list();
                     v.panes.cur.list.set_follow_mode(FollowMode::Tail);
                     v.panes.cur.list.scroll_to_end();
@@ -566,7 +608,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     s["app_frames_after"] = json!(f2 - f1);
                     out[name] = s;
                 }
-                out["rows"] = json!(view.update(cx, |v, _| v.model.transcript.len()).unwrap_or(0));
+                out["rows"] = json!(view.update(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.len()).unwrap_or(0));
                 out["window_w"] = json!(view.update(cx, |v, _| v.width).unwrap_or(0.));
                 out["mem_end"] = mem::sample();
                 println!("{out}");
@@ -642,11 +684,11 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     };
                     let result = |id: &str, text: &str| json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": id, "result": text}});
                     let _ = upd(cx, &|v, cx| {
-                        v.model.set_local_session("bench");
+                        v.model.local_session(v.panes.cur.live, "bench");
                         // Its session is this window's to drive: its turn's end
                         // hands the floor back (Handoff in, the settle pass, P3).
                         v.owner_here = true;
-                        v.model.transcript.apply_history(&dated(synthetic::history(12, 3)));
+                        v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(12, 3)));
                         let metas: Vec<SessionMeta> = [
                             ("bench", "Relay refresh race", true, 0),
                             ("20261117-090001-l001", "Flaky e2e", true, 0),
@@ -668,7 +710,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     });
                     sleep(after).await;
                     let _ = upd(cx, &|v, _| {
-                        let t = &mut v.model.transcript;
+                        let t = &mut v.model.lives[v.panes.cur.live].transcript;
                         t.apply(&SessionEvent::TurnStarted {
                             turn_baseline: 12,
                             trigger: "user".into(),
@@ -717,7 +759,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             if let Ok(request) = serde_json::from_value(json!({
                                 "id": 7, "kind": "confirm", "title": "Run a command?", "prompt": "Tool: bash\nInput that will run:\n$ rm -rf target/tmp"
                             })) {
-                                v.model.transcript.apply(&SessionEvent::Prompt { request });
+                                v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::Prompt { request });
                             }
                             v.sync_list();
                             v.panes.cur.list.scroll_to_end();
@@ -735,7 +777,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         let _ = upd(cx, &|v, cx| {
                             // Not `sync_list` here: the frame resolves the card
                             // first (it folds into its row), as a daemon's event.
-                            v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
+                            v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
                             cx.notify();
                         });
                         // `SYNAPS_BENCH_HELD=1` (Shady #23 r4 H1): the room the
@@ -766,7 +808,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             mark("stream");
                             let _ = upd(cx, &|v, _| {
                                 let t = v.panes.cur.list.logical_scroll_top();
-                                let id = v.model.shown().items().iter().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == "s3")).map(|i| i.id);
+                                let id = v.model.lives[v.panes.cur.live].shown().items().iter().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == "s3")).map(|i| i.id);
                                 let s3 = v.panes.cur.disp.iter().position(|d| Some(d.id) == id && d.kind == crate::turns::Kind::Work);
                                 eprintln!("HELD top {} +{:.0}, s3's row {s3:?}", t.item_ix, f32::from(t.offset_in_item));
                             });
@@ -790,7 +832,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         // The turn ends: the run folds. Then 9.5 s for a
                         // capture's clicks (the run unfolds, a call opens).
                         let _ = upd(cx, &|v, _| {
-                            v.model.transcript.apply(&SessionEvent::Idle);
+                            v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::Idle);
                             v.sync_list();
                         });
                         if std::env::var("SYNAPS_BENCH_FOLDS").is_ok() {
@@ -873,7 +915,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             sleep(2.).await;
                             mark("turn-stream");
                             let _ = upd(cx, &|v, _| {
-                                let t = &mut v.model.transcript;
+                                let t = &mut v.model.lives[v.panes.cur.live].transcript;
                                 t.apply(&SessionEvent::TurnStarted {
                                     turn_baseline: 14,
                                     trigger: "user".into(),
@@ -910,7 +952,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         // A new turn, detached with its call still running:
                         // as last seen.
                         let _ = upd(cx, &|v, _| {
-                            let t = &mut v.model.transcript;
+                            let t = &mut v.model.lives[v.panes.cur.live].transcript;
                             t.apply(&SessionEvent::TurnStarted { turn_baseline: 14, trigger: "user".into(), user_text: Some("Tail the log.".into()) });
                             t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                             v.sync_list();
@@ -918,7 +960,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         });
                         apply(cx, vec![call("z9", "bash", cmd("tail -f logs/relay.log"))]);
                         sleep(1.5).await;
-                        let _ = upd(cx, &|v, _| v.model.active = None);
+                        let _ = upd(cx, &|v, _| v.model.lives[v.panes.cur.live].active = None);
                         sleep(2.5).await;
                         println!("{out}");
                         let _ = cx.update(|_, cx| cx.quit());
@@ -988,7 +1030,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         if let Ok(request) = serde_json::from_value(json!({
                             "id": 7, "kind": "confirm", "title": "Run a command?", "prompt": "Tool: bash\nInput that will run:\n$ cargo test"
                         })) {
-                            v.model.transcript.apply(&SessionEvent::Prompt { request });
+                            v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::Prompt { request });
                         }
                         v.sync_list();
                     });
@@ -999,7 +1041,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let _ = upd(cx, &|v, cx| {
                         // Not `sync_list` here: the frame resolves the card
                         // first (it folds into its row), as a daemon's event.
-                        v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
+                        v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
                         cx.notify();
                     });
                     sleep(1.5).await;
@@ -1027,7 +1069,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     // hands the floor back (Handoff in down the bar, the
                     // settle pass across the top, polish.md P3).
                     let _ = upd(cx, &|v, _| {
-                        v.model.transcript.apply(&SessionEvent::Idle);
+                        v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::Idle);
                         v.sync_list();
                     });
                     sleep(3.0).await;
@@ -1078,8 +1120,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         json!({"ev": "subagent_rows", "rows": rows})
                     };
                     let _ = upd(cx, &|v, _| {
-                        v.model.set_local_session("bench-chips");
-                        v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
+                        v.model.local_session(v.panes.cur.live, "bench-chips");
+                        v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(40, 3)));
                         v.sync_list();
                         v.panes.cur.list.scroll_to_end();
                     });
@@ -1147,8 +1189,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         }
                     };
                     let _ = upd(cx, &|v, _| {
-                        v.model.set_local_session("bench-link");
-                        v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
+                        v.model.local_session(v.panes.cur.live, "bench-link");
+                        v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(40, 3)));
                         v.sync_list();
                         v.panes.cur.list.scroll_to_end();
                     });
@@ -1175,9 +1217,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // gate's idle with the transcript's rows drawn).
                 let idle = std::env::var("SYNAPS_BENCH_IDLE_SECS").ok().and_then(|s| s.parse::<u64>().ok());
                 let _ = upd(cx, &|v, _| {
-                    v.model.set_local_session("bench-motion-idle");
+                    v.model.local_session(v.panes.cur.live, "bench-motion-idle");
                     if idle.is_some() {
-                        v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
+                        v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(40, 3)));
                         v.sync_list();
                         v.panes.cur.list.scroll_to_end();
                     }
@@ -1188,12 +1230,12 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out[format!("idle_{}s", idle.unwrap_or(10))] = stats(cx, t0, Instant::now(), c0, f0);
                 // A tool runs: its glyph scans on the beat (8 Hz), the foot's too.
                 let _ = upd(cx, &|v, _| {
-                    v.model.set_local_session("bench-motion");
-                    v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
+                    v.model.local_session(v.panes.cur.live, "bench-motion");
+                    v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(40, 3)));
                     v.sync_list();
                     v.panes.cur.list.set_follow_mode(FollowMode::Tail);
                     v.panes.cur.list.scroll_to_end();
-                    let t = &mut v.model.transcript;
+                    let t = &mut v.model.lives[v.panes.cur.live].transcript;
                     t.apply(&SessionEvent::TurnStarted {
                         turn_baseline: 40,
                         trigger: "user".into(),
@@ -1219,7 +1261,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 out["beat"] = stats(cx, t0, Instant::now(), c0, f0);
                 // 24 more: 25 glyphs scan on the one beat.
                 let _ = upd(cx, &|v, _| {
-                    let t = &mut v.model.transcript;
+                    let t = &mut v.model.lives[v.panes.cur.live].transcript;
                     for k in 0..24 {
                         let id = format!("bench-run-{k}");
                         t.apply(&SessionEvent::Stream {
@@ -1251,7 +1293,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // fresh transcript, motion Full again, nothing running.
                 level(cx, crate::motion::Level::Full);
                 let _ = upd(cx, &|v, _| {
-                    v.model.transcript = synaps_client::transcript::Transcript::new();
+                    v.model.lives[v.panes.cur.live].transcript = synaps_client::transcript::Transcript::new();
                     v.sync_list();
                 });
                 sleep(0.5).await;
@@ -1262,7 +1304,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // three breaths, and a demoted worker (a re-attach's
                 // "started", drawn still until a live source says again).
                 let _ = upd(cx, &|v, cx| {
-                    v.model.set_local_session("bench");
+                    v.model.local_session(v.panes.cur.live, "bench");
                     let res = json!({"handle_id": "sa_1", "agent_name": "scout", "status": "running"}).to_string();
                     let worker = [
                         json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "subagent_start", "tool_id": "w1",
@@ -1272,11 +1314,11 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             "cancel_requested": false, "elapsed_secs": 3.0, "finished_elapsed": null, "step": "ls", "tools": 1}]}),
                     ];
                     v.apply_batch(worker.into_iter().filter_map(local_raw).collect(), cx);
-                    v.model.stats.subagents.reattached();
+                    v.model.lives[v.panes.cur.live].stats.subagents.reattached();
                     if let Ok(request) = serde_json::from_value(json!({
                         "id": 7, "kind": "confirm", "title": "Run a command?", "prompt": "Tool: bash\nInput that will run:\n$ cargo test"
                     })) {
-                        v.model.transcript.apply(&SessionEvent::Prompt { request });
+                        v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::Prompt { request });
                     }
                     v.sync_list();
                 });
@@ -1285,9 +1327,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 sleep(30.0).await;
                 out["idle_30s_prompt"] = stats(cx, t0, Instant::now(), c0, f0);
                 out["idle_30s_prompt"]["demoted_worker"] =
-                    json!(view.update(cx, |v, _| v.model.stats.subagents.demoted(1)).unwrap_or(false));
+                    json!(view.update(cx, |v, _| v.model.lives[v.panes.cur.live].stats.subagents.demoted(1)).unwrap_or(false));
                 out["idle_30s_prompt"]["prompt_pending"] =
-                    json!(view.update(cx, |v, _| !v.model.transcript.pending_prompts().is_empty()).unwrap_or(false));
+                    json!(view.update(cx, |v, _| !v.model.lives[v.panes.cur.live].transcript.pending_prompts().is_empty()).unwrap_or(false));
                 // The link down with the prompt and the demoted worker still up:
                 // past its grace and its drain, held (only the connection
                 // word's dots step, on the beat at 2 Hz).
@@ -1393,7 +1435,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 sleep(30.0).await;
                 out["load_5x5_30s"] = stats(cx, t0, Instant::now(), c0, f0);
                 out["load_5x5_30s"]["workers_running"] =
-                    json!(view.update(cx, |v, _| v.model.stats.subagents.running_count()).unwrap_or(0));
+                    json!(view.update(cx, |v, _| v.model.lives[v.panes.cur.live].stats.subagents.running_count()).unwrap_or(0));
                 out["load_5x5_30s"]["sites"] = json!(view.update(cx, |v, _| v.fx.site_count()).unwrap_or(0));
                 out["load_5x5_30s"]["indicators"] = json!(view.update(cx, |v, _| v.fx.lattice_count()).unwrap_or(0));
                 // Gate 5's sample after the 5 × 5, where main's run ends
@@ -1404,7 +1446,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // retired P2's sweep) over the 25 spinners. Gate 3's prompt is
                 // answered first (NEEDS YOU outranks RUNNING: no orbit).
                 let _ = upd(cx, &|v, _| {
-                    let t = &mut v.model.transcript;
+                    let t = &mut v.model.lives[v.panes.cur.live].transcript;
                     t.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
                     t.apply(&SessionEvent::TurnStarted { turn_baseline: 12, trigger: "user".into(), user_text: Some("Go on.".into()) });
                     t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
@@ -1482,8 +1524,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 sleep(1.0).await;
                 out["static_empty"] = stats(cx, t0, Instant::now());
                 let _ = upd(cx, &|v, _| {
-                    v.model.set_local_session("diag");
-                    v.model.transcript.apply_history(&dated(synthetic::history(opts.history_messages, 11)));
+                    v.model.local_session(v.panes.cur.live, "diag");
+                    v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(opts.history_messages, 11)));
                     v.sync_list();
                     v.panes.cur.list.set_follow_mode(FollowMode::Normal);
                     v.panes.cur.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
@@ -1514,10 +1556,10 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 for (name, plain, seed) in [("stream_plain", true, 21u64), ("stream_markdown", false, 22)] {
                     let _ = upd(cx, &move |v, _| {
                         v.plain_rows = plain;
-                        v.model.set_local_session("diag-stream");
+                        v.model.local_session(v.panes.cur.live, "diag-stream");
                         v.reset_transcript();
-                        v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
-                        v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                        v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(40, 3)));
+                        v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                         v.sync_list();
                         v.panes.cur.list.set_follow_mode(FollowMode::Tail);
                         v.panes.cur.list.scroll_to_end();
@@ -1551,14 +1593,14 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
 
             // 2. Streaming markdown at ~200 deltas/s into a short transcript.
             let _ = upd(cx, &|v, _| {
-                v.model.set_local_session("bench-stream");
-                v.model.transcript.apply_history(&dated(synthetic::history(40, 3)));
-                v.model.transcript.apply(&SessionEvent::TurnStarted {
+                v.model.local_session(v.panes.cur.live, "bench-stream");
+                v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(40, 3)));
+                v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::TurnStarted {
                     turn_baseline: 40,
                     trigger: "user".into(),
                     user_text: Some("Explain the frame pipeline, with code.".into()),
                 });
-                v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+                v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                 v.sync_list();
                 v.panes.cur.list.set_follow_mode(FollowMode::Tail);
                 v.panes.cur.list.scroll_to_end();
@@ -1597,7 +1639,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     s["deltas_sent"] = json!(n);
                     s["deltas_per_s"] = json!(round(n as f64 / fed.as_secs_f64().max(1e-3), 1));
                     s["deltas_received"] = json!(b.received_deltas);
-                    s["streamed_chars"] = json!(v.model.transcript.items().last().map(|i| i.text.len()));
+                    s["streamed_chars"] = json!(v.model.lives[v.panes.cur.live].transcript.items().last().map(|i| i.text.len()));
                     s
                 })
                 .unwrap_or(Value::Null);
@@ -1606,9 +1648,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
 
             // 3. A 2,000-message transcript with code blocks, scrolled top → down.
             let _ = upd(cx, &|v, _| {
-                v.model.set_local_session("bench-long");
+                v.model.local_session(v.panes.cur.live, "bench-long");
                 v.reset_transcript();
-                v.model.transcript.apply_history(&dated(synthetic::history(opts.history_messages, 11)));
+                v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(opts.history_messages, 11)));
                 v.sync_list();
                 v.panes.cur.list.set_follow_mode(FollowMode::Normal);
                 v.panes.cur.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
@@ -1628,7 +1670,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     b.animate = false;
                     b.drain();
                     let mut s = b.stats(t0, t1, refresh_fallback);
-                    s["rows"] = json!(v.model.transcript.len());
+                    s["rows"] = json!(v.model.lives[v.panes.cur.live].transcript.len());
                     s["messages"] = json!(opts.history_messages);
                     s["px_per_s"] = json!(speed);
                     s["reached_row"] = json!(v.panes.cur.list.logical_scroll_top().item_ix);
@@ -1697,9 +1739,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
             //    dragged across their limits (every frame a new centre
             //    width: the visible rows re-wrap).
             let _ = upd(cx, &|v, _| {
-                v.model.set_local_session("bench-drag");
+                v.model.local_session(v.panes.cur.live, "bench-drag");
                 v.reset_transcript();
-                v.model.transcript.apply_history(&turns(DRAG_TURNS, 13));
+                v.model.lives[v.panes.cur.live].transcript.apply_history(&turns(DRAG_TURNS, 13));
                 v.sync_list();
                 v.panes.cur.list.set_follow_mode(FollowMode::Tail);
                 v.panes.cur.list.scroll_to_end();
@@ -1721,7 +1763,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         b.animate = false;
                         b.drain();
                         let mut s = b.stats(t0, t1, refresh_fallback);
-                        s["rows"] = json!(v.model.transcript.len());
+                        s["rows"] = json!(v.model.lives[v.panes.cur.live].transcript.len());
                         s["turns"] = json!(DRAG_TURNS);
                         s["px_per_s"] = json!(DRAG_PX_PER_S);
                         s["window_w"] = json!(v.width);
@@ -1738,7 +1780,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 let _ = upd(cx, &|v, _| {
                     let seq = v.client.as_ref().unwrap().create(synaps_client::CreateOptions::new());
                     if let Ok(seq) = seq {
-                        v.model.want(seq);
+                        v.model.want(v.panes.cur.live, seq);
+                        v.bench.as_mut().unwrap().attach_seq = Some(seq);
                     }
                 });
                 let mut attached = None;
@@ -1756,7 +1799,9 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let p = prompt.clone();
                     let _ = upd(cx, &move |v, _| {
                         v.bench.as_mut().unwrap().submit_at = Some(submit);
-                        let _ = v.client.as_ref().unwrap().submit(p.clone());
+                        if let Some(seq) = v.bench.as_ref().unwrap().attach_seq {
+                            let _ = v.client.as_ref().unwrap().on(seq).submit(p.clone());
+                        }
                     });
                     let budget = 28.0 - t_main.elapsed().as_secs_f64();
                     let until = Instant::now() + Duration::from_secs_f64(budget.max(1.0));
@@ -1778,7 +1823,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                                 "ttft_ms": b.first_text_at.map(|t| round(ms(t.duration_since(submit)), 1)),
                                 "ttft_painted_ms": painted.map(|t| round(ms(t.duration_since(submit)), 1)),
                                 "turn_ms": b.idle_at.map(|t| round(ms(t.duration_since(submit)), 1)),
-                                "rows": v.model.transcript.len(),
+                                "rows": v.model.lives[v.panes.cur.live].transcript.len(),
                             })
                         })
                         .unwrap_or(Value::Null);

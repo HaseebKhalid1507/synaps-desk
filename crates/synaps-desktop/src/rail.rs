@@ -871,7 +871,7 @@ pub fn readout_live(m: &Model, s: &SessionMeta, now: i64) -> Readout {
     let (value, aside) = match st {
         State::Opening => ("opening".to_string(), "attach sent, waiting for the daemon".to_string()),
         State::NeedsYou => {
-            let n = if m.is_active(&s.id) { m.transcript.pending_prompts().len() } else { s.awaiting_input };
+            let n = m.lives.on(&s.id).map_or(s.awaiting_input, |l| l.transcript.pending_prompts().len());
             let turn = if age.is_empty() { String::new() } else { format!(" · turn began {age} ago") };
             ("needs you".into(), format!("{}{turn}", plural(n.max(1), "prompt", "prompts")))
         }
@@ -907,7 +907,7 @@ pub fn readout_live(m: &Model, s: &SessionMeta, now: i64) -> Readout {
     if let Some(c) = s.cwd.as_deref().filter(|c| !c.is_empty()) {
         lines.push((label::R_CWD, home_short(c), String::new()));
     }
-    let cost = if m.is_active(&s.id) { m.stats.cost.unwrap_or(s.cost_usd) } else { s.cost_usd };
+    let cost = m.lives.on(&s.id).map_or(s.cost_usd, |l| l.stats.cost.unwrap_or(s.cost_usd));
     lines.push((label::R_SIZE, format!("{} · ${cost:.2}", plural(s.messages, "msg", "msg")), String::new()));
     let names: Vec<String> = s.roster.iter().map(|c| if c.name.is_empty() { c.kind.clone() } else { c.name.clone() }).collect();
     let clients = s.clients.max(s.roster.len());
@@ -1264,19 +1264,19 @@ mod tests {
         let mut m = fav_scene();
         let deep =
             || ResumeRequest { label: "Deep history".into(), target: "j-deep".into(), cwd: Some("/home/u/deep".into()), by_name: false };
-        m.resuming(deep(), 40, false);
+        m.resuming(crate::live::LiveId::FIRST, deep(), 40, false);
         let rail = build(&m, &view(Bucket::DEFAULT_OPEN), NOW);
         assert_eq!(rail.rows.iter().find(|r| &*r.title == "Deep history").unwrap().state, State::Opening);
         m.apply(Event::Detached { attach_seq: 40, session_id: None, reason: crate::named::LOCKED_AXEL.into() });
         assert!(!m.favs.list[2].is_gone(), "locked is not gone");
         // H1: the daemon down (its socket gone, a tunnel down): the client's
         // own ENOENT is not gone, and the real reason is what is said.
-        m.resuming(deep(), 39, false);
+        m.resuming(crate::live::LiveId::FIRST, deep(), 39, false);
         let down = "attach gave up: connect /home/u/.synaps-cli/run/daemon.sock: No such file or directory (os error 2)";
         m.apply(Event::Detached { attach_seq: 39, session_id: None, reason: down.into() });
         assert!(!m.favs.list[2].is_gone(), "a stopped daemon is not gone");
         assert!(m.named.error.as_deref().unwrap().contains("No such file or directory"), "{:?}", m.named.error);
-        m.resuming(deep(), 41, false);
+        m.resuming(crate::live::LiveId::FIRST, deep(), 41, false);
         let missing = "create session: Tool execution failed: Failed to load session 'j-deep': no session matching 'j-deep'";
         m.apply(Event::Detached { attach_seq: 41, session_id: None, reason: missing.into() });
         assert!(m.favs.list[2].is_gone());
@@ -1302,7 +1302,7 @@ mod tests {
     fn gone_survives_the_cached_listing() {
         let mut m = fav_scene();
         let t3 = ResumeRequest { label: "today 3".into(), target: "t3".into(), cwd: Some("/home/u/t".into()), by_name: false };
-        m.resuming(t3, 50, false);
+        m.resuming(crate::live::LiveId::FIRST, t3, 50, false);
         let missing = "create session: Tool execution failed: Failed to load session 't3': no session matching 't3'";
         let fx = m.apply(Event::Detached { attach_seq: 50, session_id: None, reason: missing.into() });
         assert!(
@@ -1381,7 +1381,7 @@ mod tests {
         let mut m = model(json!([s("c1", "live")]), json!([]), json!([]), false);
         m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
         once(&mut m, "favourited");
-        m.want(5);
+        m.want(crate::live::LiveId::FIRST, 5);
         m.apply(Event::Attached {
             attach_seq: 5,
             attached: attached_frame(s("c1", "live"), None),
@@ -1427,7 +1427,7 @@ mod tests {
         m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
         let jb = m.named.recent[0].clone();
         m.favs.toggle(Source::Saved(&jb), 2);
-        m.want(6);
+        m.want(crate::live::LiveId::FIRST, 6);
         m.apply(Event::Attached {
             attach_seq: 6,
             attached: attached_frame(a.clone(), None),
@@ -1460,7 +1460,7 @@ mod tests {
         let (rows, n) = count(&mut m, "Long talk");
         assert_eq!(n, 2, "the favourite (c1) and c2 in OPEN: {rows:?}");
         // Attached from its OPEN row: the header names c1.
-        m.want(7);
+        m.want(crate::live::LiveId::FIRST, 7);
         m.apply(Event::Attached {
             attach_seq: 7,
             attached: attached_frame(c("c2"), Some("c1")),
@@ -1472,7 +1472,12 @@ mod tests {
         // Cleared elsewhere, then the favourite's resume: the daemon hands
         // back the live session (it matches by live id), holding y.
         m.apply(Event::Sessions(metas(json!([{"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "", "journal_id": "y"}]))));
-        m.resuming(ResumeRequest { label: "Long talk".into(), target: "c2".into(), cwd: None, by_name: false }, 8, false);
+        m.resuming(
+            crate::live::LiveId::FIRST,
+            ResumeRequest { label: "Long talk".into(), target: "c2".into(), cwd: None, by_name: false },
+            8,
+            false,
+        );
         // The attach's meta names the journal the session started with (as
         // 0.11.1 sends it after a swap); its header, the one it holds.
         let mut a = attached_frame(json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "", "journal_id": "c2"}), None);
@@ -1492,7 +1497,12 @@ mod tests {
     #[test]
     fn two_unseen_compactions_are_one_row_once_the_favourite_is_resumed() {
         let resume = |m: &mut Model, seq: u64, holds: &str| {
-            m.resuming(ResumeRequest { label: "Long talk".into(), target: "c1".into(), cwd: None, by_name: false }, seq, false);
+            m.resuming(
+                crate::live::LiveId::FIRST,
+                ResumeRequest { label: "Long talk".into(), target: "c1".into(), cwd: None, by_name: false },
+                seq,
+                false,
+            );
             let mut meta = json!({"id": "c3", "lifecycle": "live", "created_at": at(5), "title": "Long talk", "journal_id": "c3"});
             meta["continue_info"] = json!({"session_id": "c3", "resolved_via": "compacted", "query": "c1",
                 "compaction_notice": "followed 2 compactions"});
@@ -1566,7 +1576,7 @@ mod tests {
         let c = |journal: &str| json!({"id": "c1", "lifecycle": "live", "created_at": at(50), "title": "Long talk", "journal_id": journal});
         let mut m = model(json!([c("c1")]), json!([]), json!([]), false);
         m.favs.toggle(Source::Live(&m.sessions[0].clone()), 1);
-        m.want(5);
+        m.want(crate::live::LiveId::FIRST, 5);
         m.apply(Event::Attached {
             attach_seq: 5,
             attached: attached_frame(c("c1"), None),
@@ -1583,7 +1593,7 @@ mod tests {
         assert_eq!(m.favs.list.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["c1", "y"]);
         // Attached again: its meta names the journal it started with, its
         // header the one it holds.
-        m.want(6);
+        m.want(crate::live::LiveId::FIRST, 6);
         let mut a = attached_frame(c("c1"), None);
         a.conversation.header["id"] = json!("y2");
         m.apply(Event::Attached { attach_seq: 6, attached: a, mode: synaps_client::AttachMode::Mirror, reconnect: false });
@@ -1601,7 +1611,12 @@ mod tests {
         let mut m = model(json!([]), named.clone(), recent.clone(), true);
         let jn = m.named.saved[0].clone();
         m.favs.toggle(Source::Saved(&jn), 1);
-        m.resuming(ResumeRequest { label: "notes".into(), target: "jn".into(), cwd: None, by_name: false }, 9, false);
+        m.resuming(
+            crate::live::LiveId::FIRST,
+            ResumeRequest { label: "notes".into(), target: "jn".into(), cwd: None, by_name: false },
+            9,
+            false,
+        );
         let missing = "create session: Tool execution failed: Failed to load session 'jn': no session matching 'jn'";
         m.apply(Event::Detached { attach_seq: 9, session_id: None, reason: missing.into() });
         assert!(m.favs.list[0].is_gone());
@@ -1610,7 +1625,12 @@ mod tests {
         m.sync_favs();
         assert!(m.favs.list[0].is_gone(), "the named list it is in is from before the verdict");
         // R7: clicked again, the same refusal says gone again.
-        m.resuming(ResumeRequest { label: "notes".into(), target: "jn".into(), cwd: None, by_name: false }, 10, false);
+        m.resuming(
+            crate::live::LiveId::FIRST,
+            ResumeRequest { label: "notes".into(), target: "jn".into(), cwd: None, by_name: false },
+            10,
+            false,
+        );
         m.apply(Event::Detached { attach_seq: 10, session_id: None, reason: missing.into() });
         assert!(m.named.error.as_deref().unwrap_or("").starts_with("'notes' is gone"), "{:?}", m.named.error);
         // A named list asked for after the verdict has it: there.
@@ -1645,8 +1665,8 @@ mod tests {
             got,
             [State::Running, State::Workers, State::Parked, State::Parked, State::Idle, State::Locked, State::Running, State::NeedsYou]
         );
-        m.want(3);
-        m.asked_for("a");
+        m.want(crate::live::LiveId::FIRST, 3);
+        m.asked_for(crate::live::LiveId::FIRST, "a");
         assert_eq!(m.state(&m.sessions[7]), State::Opening, "an attach on its way beats everything");
         for s in [State::Opening, State::NeedsYou, State::Running, State::Workers, State::Locked, State::Unread] {
             assert!(s.word().is_some(), "{s:?}");
@@ -1966,7 +1986,7 @@ mod tests {
         m.page_sent(1);
         m.apply(Event::Sessions(metas(json!([s("c1")]))));
         m.apply(page(1, json!([]), None));
-        m.want(5);
+        m.want(crate::live::LiveId::FIRST, 5);
         m.apply(Event::Attached {
             attach_seq: 5,
             attached: attached_frame(s("c1"), None),

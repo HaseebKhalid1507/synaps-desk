@@ -4,7 +4,10 @@
 # - text sizes: `fonts::TextPx::text_px` (never under 12 px);
 # - opacity: a chart's data (`chart.rs`), and an arrival's lift from 70 %
 #   (`motion::lift`, cohesion/fluid.md law 3), never a state;
-# - tooltips: `overlay.rs` (the one overlay box).
+# - tooltips: `overlay.rs` (the one overlay box);
+# - session commands: `Client::on(seq)`, which names the attachment (split
+#   panes §6.4: an Allow, a HALT or a message never lands in another
+#   session). `synaps-client` itself allows them (its own tests).
 disallowed-methods = [
     { path = "gpui::Styled::text_size", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
     { path = "gpui::Styled::text_xs", reason = "text sizes go through `fonts::TextPx::text_px` (12 px floor, design.md §1.2)" },
@@ -26,4 +29,16 @@ disallowed-methods = [
     { path = "gpui_component::Colorize::opacity", reason = "no state is drawn with opacity (design.md §5): only a chart's data fades, in chart.rs" },
     { path = "gpui_component::tooltip::Tooltip::new", reason = "every tooltip is the one overlay box: `overlay::tip` (design.md §8.9)" },
     { path = "gpui_component::tooltip::Tooltip::element", reason = "every tooltip is the one overlay box: `overlay::element` (design.md §8.9)" },
+    { path = "synaps_client::client::Client::submit", reason = "name the attachment: `client.on(seq).submit(..)` (split panes §6.4: never another session's)" },
+    { path = "synaps_client::client::Client::steer", reason = "name the attachment: `client.on(seq).steer(..)` (split panes §6.4: never another session's)" },
+    { path = "synaps_client::client::Client::abort", reason = "name the attachment: `client.on(seq).abort(..)` (split panes §6.4: never another session's)" },
+    { path = "synaps_client::client::Client::answer", reason = "name the attachment: `client.on(seq).answer(..)` (split panes §6.4: never another session's)" },
+    { path = "synaps_client::client::Client::answer_on", reason = "name the attachment: `client.on(seq).answer_on(..)` (split panes §6.4: never another session's)" },
+    { path = "synaps_client::client::Client::resync", reason = "name the attachment: `client.on(seq).resync(..)` (split panes §6.4: never another session's)" },
+    { path = "synaps_client::client::Client::watch_subagent", reason = "name the attachment: `client.on(seq).watch_subagent(..)` (split panes §6.4: never another session's)" },
+    { path = "synaps_client::client::Client::steer_subagent", reason = "name the attachment: `client.on(seq).steer_subagent(..)` (split panes §6.4: never another session's)" },
+    { path = "synaps_client::client::Client::cancel_worker", reason = "name the attachment: `client.on(seq).cancel_worker(..)` (split panes §6.4: never another session's)" },
+    { path = "synaps_client::client::Client::engine_command", reason = "name the attachment: `client.on(seq).engine_command(..)` (split panes §6.4: never another session's)" },
+    { path = "synaps_client::client::Client::detach", reason = "name the attachment: `client.on(seq).detach(..)` (split panes §6.4: never another session's)" },
+    { path = "synaps_client::client::Client::send", reason = "session commands go through `client.on(seq)`, which names the attachment (split panes §6.4)" },
 ]
