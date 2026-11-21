@@ -307,6 +307,17 @@ impl Node {
         }
     }
 
+    /// The same tree with leaf `from` named `to` (a closing pane's share
+    /// once its id is handed out again: Shady #42 r2-L1).
+    pub(crate) fn renamed(&self, from: PaneId, to: PaneId) -> Node {
+        match self {
+            Node::Leaf(id) => Node::Leaf(if *id == from { to } else { *id }),
+            Node::Split { axis, kids, ratios } => {
+                Node::Split { axis: *axis, kids: kids.iter().map(|k| k.renamed(from, to)).collect(), ratios: ratios.clone() }
+            }
+        }
+    }
+
     /// The same panes in the same splits (ratios aside): a flight can go
     /// from one to the other.
     pub(crate) fn same_shape(&self, other: &Node) -> bool {

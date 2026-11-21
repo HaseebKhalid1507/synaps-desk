@@ -2206,3 +2206,125 @@ fn a_stacked_split_and_close_move_the_composer_only_with_the_line(cx: &mut TestA
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
+
+/// Finish gate #42 F2: a close is the split's mirror. From the close's
+/// first frame the closing pane's list and rows are drawn (laid out at
+/// its size, its share clipping them) and ride the line out, frame by
+/// frame; the frame the layout lands draws none of it, nothing moves
+/// after, and the pane, its list and its store are gone. At Reduced the
+/// close is one frame.
+#[gpui_kit::test]
+fn a_closing_pane_slides_out_with_its_rows(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-slide", None);
+    level(cx, crate::motion::Level::Full);
+    VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(1080.)));
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    let right = view.read_with(cx, |v, _| v.panes.focused);
+    // Its list as it is (the same list draws it as it closes), and where
+    // its first row on screen is.
+    let (list, n) = view.read_with(cx, |v, _| (v.panes.cur.list.clone(), v.panes.cur.disp.len()));
+    assert!(n > 0, "rows in the right pane");
+    let row = move || (0..n).find_map(|ix| list.bounds_for_item(ix)).map(|b| f32::from(b.origin.x));
+    let edge0 = pane_box(cx, window, right)[0];
+    let off = row().expect("a row on screen") - edge0;
+    let list_off = drawn(cx, window, format!("pane-list {}", right.index())).expect("its list")[0] - edge0;
+    key(cx, window, "ctrl-w");
+    let share = format!("pane-closing {}", right.index());
+    let mut seen = Vec::new();
+    while view.read_with(cx, |v, _| v.panes.flight.is_some()) {
+        let f = seen.len();
+        let g = drawn(cx, window, share.clone());
+        if let Some(g) = g.filter(|g| g[2] >= 1.) {
+            let l = drawn(cx, window, format!("pane-list {}", right.index()));
+            let l = l.unwrap_or_else(|| panic!("frame {f}: its list drawn as it closes (share {g:?})"));
+            let x = row().unwrap_or(f32::NAN);
+            assert_eq!(l[0] - g[0], list_off, "frame {f}: its list rides the line: share {g:?}, list {l:?}");
+            assert_eq!(x - g[0], off, "frame {f}: its rows ride the line: share {g:?}, a row at {x}");
+            seen.push(g[0]);
+        }
+        frame_144(cx, window, &view);
+        assert!(seen.len() < 200, "never landed");
+    }
+    assert!(
+        seen.len() > 10 && seen.windows(2).all(|w| w[1] >= w[0]) && seen[seen.len() - 1] > seen[0],
+        "it slid out with the line: {seen:?}"
+    );
+    // Landed: none of it drawn, and nothing after.
+    assert!(drawn(cx, window, share.clone()).is_none() && drawn(cx, window, format!("pane-list {}", right.index())).is_none());
+    let rest = boxes(cx, window, &view);
+    for _ in 0..10 {
+        frame_144(cx, window, &view);
+        assert_eq!(boxes(cx, window, &view), rest, "nothing moves after the landing");
+    }
+    assert!(
+        view.read_with(cx, |v, _| v.panes.closing.is_empty() && v.model.lives.ids().len() == 1),
+        "the pane and any store of its own gone"
+    );
+    // At Reduced: one frame, none of it drawn.
+    level(cx, crate::motion::Level::Reduced);
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    let right = view.read_with(cx, |v, _| v.panes.focused);
+    key(cx, window, "ctrl-w");
+    assert!(drawn(cx, window, format!("pane-list {}", right.index())).is_none(), "Reduced: the close is one frame");
+    assert!(view.read_with(cx, |v, _| v.panes.flight.is_none() && v.panes.closing.is_empty()));
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #42 r2-L1: four panes, one closes, and a split within its flight
+/// is handed the closing pane's id (the only one free): no pane jumps
+/// (its share keeps closing, a ghost's ground), and every frame steps by
+/// at most one frame's spring.
+#[gpui_kit::test]
+fn a_split_that_takes_a_closing_panes_id_moves_no_pane_at_once(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-reuse", None);
+    level(cx, crate::motion::Level::Full);
+    VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(1080.)));
+    frame(cx, window);
+    for k in ["ctrl-\\", "ctrl-shift-\\", "alt-1", "ctrl-shift-\\"] {
+        key(cx, window, k);
+        land(cx, window, &view);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "four panes");
+    let closing = view.read_with(cx, |v, _| v.panes.focused);
+    key(cx, window, "ctrl-w");
+    for _ in 0..3 {
+        frame_144(cx, window, &view);
+    }
+    let step = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            v.panes
+                .flight
+                .as_ref()
+                .map_or(0., |f| f.travel * std::f32::consts::TAU / crate::motion::SHEET_RESPONSE / std::f32::consts::E / 144. + 2.)
+        })
+    };
+    let mut bound = step(cx);
+    let open = |b: Vec<(u8, [f32; 4])>| b.into_iter().filter(|(i, _)| *i != closing.index() as u8).collect::<Vec<_>>();
+    let mut was = open(boxes(cx, window, &view));
+    key(cx, window, "ctrl-\\");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "the split took the id");
+    assert!(view.read_with(cx, |v, _| v.panes.get(closing).is_some()), "the closing pane's id is the new pane's");
+    let mut frames = 0;
+    loop {
+        bound = bound.max(step(cx));
+        let now = open(boxes(cx, window, &view));
+        assert!(
+            most_moved(&was, &now) <= bound,
+            "frame {frames}: a pane moved {} px (one frame's spring: {bound:.1}): {was:?} / {now:?}",
+            most_moved(&was, &now)
+        );
+        was = now;
+        if view.read_with(cx, |v, _| v.panes.flight.is_none()) {
+            break;
+        }
+        frame_144(cx, window, &view);
+        frames += 1;
+        assert!(frames < 200, "never landed");
+    }
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
