@@ -54,6 +54,10 @@ pub(crate) struct AppSettings {
     pub dash_url: Option<String>,
     pub usage_range: Range,
     pub usage_host: Option<String>,
+    /// Split panes (`panes.split`, split panes step 3): off by default,
+    /// so the window is one pane, as before. `SYNAPS_DESK_SPLIT=1` turns
+    /// it on for a run.
+    pub split: bool,
 }
 
 impl AppSettings {
@@ -64,6 +68,7 @@ impl AppSettings {
             dash_url: get("dash_url"),
             usage_range: get("usage_range").and_then(|r| Range::parse(&r)).unwrap_or_default(),
             usage_host: get("usage_host").filter(|h| h != "all"),
+            split: path.is_some_and(|p| theme::load_flag(p, "panes.split")) || std::env::var("SYNAPS_DESK_SPLIT").is_ok_and(|v| v == "1"),
         }
     }
 }

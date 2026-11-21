@@ -330,6 +330,14 @@ impl InFlight {
         }
     }
 
+    /// Pane `from` left the store (closed, or on another session now):
+    /// what it sent is pane `to`'s (Shady #36 L5, r2 L-c).
+    pub(crate) fn rehome(&mut self, from: PaneId, to: PaneId) {
+        for (p, _) in self.0.iter_mut().filter(|(p, _)| *p == from) {
+            *p = to;
+        }
+    }
+
     /// Everything, oldest first; none left.
     pub(crate) fn take(&mut self) -> Vec<(PaneId, String)> {
         std::mem::take(&mut self.0).into()
@@ -344,11 +352,14 @@ pub struct Lives {
     /// one whose attach the tab strip follows (`Tabs::attached`). Step 2:
     /// [`LiveId::FIRST`], always; step 3's focus moves it.
     shown: LiveId,
+    /// The last id handed out: ids are never reused (#31 L4), so an id
+    /// kept past its store's release can never name another store.
+    last: u16,
 }
 
 impl Default for Lives {
     fn default() -> Self {
-        Lives { slots: vec![(LiveId::FIRST, Live::default())], shown: LiveId::FIRST }
+        Lives { slots: vec![(LiveId::FIRST, Live::default())], shown: LiveId::FIRST, last: LiveId::FIRST.0 }
     }
 }
 
@@ -356,6 +367,26 @@ impl Lives {
     /// The store the visible tab is shown from ([`Lives::shown`]'s field).
     pub(crate) fn shown(&self) -> LiveId {
         self.shown
+    }
+
+    /// The pane acted on shows `id` now (split panes step 3: the store
+    /// whose attach its tab strip follows is that pane's).
+    pub(crate) fn show(&mut self, id: LiveId) {
+        self.shown = id;
+    }
+
+    /// A store no pane shows any more goes (its attachment detached by the
+    /// caller). The first store stays for the window's life.
+    pub(crate) fn remove(&mut self, id: LiveId) {
+        if id != LiveId::FIRST {
+            self.slots.retain(|(i, _)| *i != id);
+        }
+    }
+
+    /// The store whose session is `session_id` (attached, or asked for
+    /// last), other than `but`: a pane switching to it shares it.
+    pub(crate) fn of_session(&self, session_id: &str, but: LiveId) -> Option<LiveId> {
+        self.slots.iter().find(|(i, l)| *i != but && (l.is_active(session_id) || l.is_wanted(session_id))).map(|(i, _)| *i)
     }
 
     /// The store whose attachment is `attach_seq` (the one it asked for
@@ -381,12 +412,16 @@ impl Lives {
     /// A second store, as step 3's multi-live activation will make one
     /// (tests: two sessions attached at once; `--bench-tabs`' `mem_lives`).
     pub(crate) fn add(&mut self) -> LiveId {
-        let id = LiveId(self.slots.iter().map(|(i, _)| i.0).max().unwrap_or(0) + 1);
+        self.last += 1;
+        let id = LiveId(self.last);
         self.slots.push((id, Live::default()));
         id
     }
 }
 
+/// A store that exists: a pane's (a pane's store is released only after
+/// its last pane goes; only panes keep a `LiveId`). Ids are never reused,
+/// so a slip panics here rather than reach another session's store.
 impl std::ops::Index<LiveId> for Lives {
     type Output = Live;
     fn index(&self, id: LiveId) -> &Live {
@@ -496,6 +531,17 @@ mod tests {
             assert_eq!(every, doc.items);
             assert_eq!(parked, doc.items);
         }
+    }
+
+    /// #31 L4: a released store's id is never handed out again.
+    #[test]
+    fn a_released_stores_id_is_never_reused() {
+        let mut l = Lives::default();
+        let a = l.add();
+        l.remove(a);
+        let b = l.add();
+        assert_ne!(a, b, "a new id");
+        assert_eq!(l.ids(), [LiveId::FIRST, b]);
     }
 
     /// Input from two panes on one session: a refusal gives the oldest

@@ -302,8 +302,21 @@ impl AppView {
         // A view nobody looks at (on screen, or held by a worker tab) whose
         // worker ended goes (and leaves the walk), as do the views of the
         // worker tabs past the most recently shown few, and their lists.
-        let held = self.model.held_views(self.panes.cur.live);
-        self.model.lives[self.panes.cur.live].watch.hold(held);
+        // Every pane's on this store (Shady #36 M2): the other panes' views
+        // (parked, `Watch::park` keeps them) and their worker tabs' views.
+        let live_id = self.panes.cur.live;
+        let mut held = self.model.held_views(live_id);
+        let session = self.model.lives[live_id].active.as_ref().map(|a| a.session_id.clone());
+        for p in self.panes.rest.iter().filter(|p| p.live == live_id) {
+            held.extend(
+                p.parked
+                    .tabs
+                    .iter()
+                    .filter(|t| t.kind == crate::tabs::Kind::Worker && t.session.is_some() && t.session == session)
+                    .filter_map(|t| t.worker.as_ref().map(|w| w.handle.clone())),
+            );
+        }
+        self.model.lives[live_id].watch.hold(held);
         // A finished worker's flash on the motion clock too (tests: the
         // test's own, never a slow runner's wall time).
         self.model.lives[self.panes.cur.live].watch.prune(fx_now, &live);
@@ -334,7 +347,7 @@ impl AppView {
         if self.fx.on() && session.is_some() && session == self.tray.session {
             let fresh = rows.iter().filter(|r| !self.tray.rows.iter().any(|o| o.id == r.id));
             for (k, r) in fresh.enumerate() {
-                self.fx.born(TRAY | r.id, fx_now + motion::stagger(k));
+                self.fx.col(self.panes.cur.id).born(TRAY | r.id, fx_now + motion::stagger(k));
             }
             for (slot, r) in self.tray.rows.iter().enumerate() {
                 if !rows.iter().any(|n| n.id == r.id) {
@@ -351,10 +364,13 @@ impl AppView {
         self.close_orphan_menu();
         match until {
             Some(u) if self.tray_due.as_ref().map(|d| d.0) != Some(u) => {
+                // The pane's own (Shady #36 L4): another pane's tray never
+                // replaces it.
+                let id = self.panes.cur.id;
                 let task = cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(u.saturating_duration_since(fx_now)).await;
                     let _ = this.update(cx, |v, cx| {
-                        v.tray_due = None;
+                        v.in_pane(id, |v| v.tray_due = None);
                         cx.notify();
                     });
                 });
@@ -553,7 +569,8 @@ impl AppView {
         let fx = &self.fx;
         // The watched chip's bar draws when its view opens here, and lights
         // after the composer's when you steer it (Handoff out).
-        let watch_at = fx.change(Tag::Watched, 0, watched.unwrap_or(0), None).filter(|_| watched.is_some()).map(|c| c.0);
+        let watch_at =
+            fx.col(self.panes.cur.id).change(Tag::Watched, 0, watched.unwrap_or(0), None).filter(|_| watched.is_some()).map(|c| c.0);
         let you_drawn = fx.draw(watch_at, std::time::Duration::ZERO, motion::QUICK);
         let steer =
             fx.flash(fx.col(self.panes.cur.id).sent().get().filter(|s| s.1 && watched.is_some()).map(|s| s.0 + 2 * motion::STAGGER));
@@ -585,16 +602,19 @@ impl AppView {
                     let bar = if is_watched {
                         glyph::bar_at(you_color, you_drawn)
                     } else {
-                        glyph::bar_at(p.sub_rule, fx.draw(fx.birth(TRAY | r.id), std::time::Duration::ZERO, motion::QUICK))
+                        glyph::bar_at(
+                            p.sub_rule,
+                            fx.draw(fx.col(self.panes.cur.id).birth(TRAY | r.id), std::time::Duration::ZERO, motion::QUICK),
+                        )
                     };
                     // A chip whose cell changed slides there from where it
                     // was drawn, x and y on `snap` from one instant (a
                     // diagonal), in px to the end; a new share of the column
                     // moves none. One that came rises 8 px and lifts from
                     // 70 %, in turn (polish.md P13).
-                    let off = fx.slide(TRAY | r.id, line as f32 * (row_h + CHIP_GAP));
+                    let off = fx.col(self.panes.cur.id).slide(TRAY | r.id, line as f32 * (row_h + CHIP_GAP));
                     let dx = fx.cell_slide(self.panes.cur.id.salt(TRAY_X | r.id), col as u64, col as f32 * (w + CHIP_GAP));
-                    let (travel, strength) = fx.arrival(fx.birth(TRAY | r.id));
+                    let (travel, strength) = fx.arrival(fx.col(self.panes.cur.id).birth(TRAY | r.id));
                     let (bounds, id) = (self.chip_bounds.clone(), r.id);
                     at.push(
                         div()
@@ -712,7 +732,12 @@ impl AppView {
                 g,
                 mark,
                 p.canvas,
-                self.fx.change(Tag::TrayGlyph, r.id, crate::turns::glyph_code(glyph::worker(glyph::steady(r.live, r.demoted)).0), None),
+                self.fx.col(self.panes.cur.id).change(
+                    Tag::TrayGlyph,
+                    r.id,
+                    crate::turns::glyph_code(glyph::worker(glyph::steady(r.live, r.demoted)).0),
+                    None,
+                ),
                 None,
                 false,
             ))

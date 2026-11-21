@@ -113,6 +113,9 @@ pub struct Active {
     pub input: ClientInput,
 }
 
+/// An attachment a tab switch left, with its input in flight ([`Model::left`]).
+type Left = (u64, String, VecDeque<(PaneId, String)>);
+
 /// What the view must do after an event (it owns the client and composer).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
@@ -122,6 +125,8 @@ pub enum Effect {
     /// Input sent to `session` before its tab was left, refused (or never
     /// confirmed) since: back into that tab's draft, which says so.
     Unsent {
+        /// The pane that sent it.
+        pane: PaneId,
         session: String,
         text: String,
     },
@@ -377,8 +382,8 @@ pub struct Model {
     /// id)` card keys never collide across stores).
     epoch: u64,
     /// The input in flight ([`Live::in_flight`]) of attachments a tab switch left (their last events still
-    /// come, until their `Detached`): `(attach_seq, session, texts)`.
-    left: Vec<(u64, String, VecDeque<String>)>,
+    /// come, until their `Detached`): `(attach_seq, session, texts)`, each text with the pane that sent it.
+    left: Vec<Left>,
     pub named: Named,
     /// The favourite sessions (desktop only, per daemon): the rail's
     /// FAVOURITES. Never sent to the daemon.
@@ -928,8 +933,10 @@ impl Model {
         self.named.error = None;
         self.named.notice = None;
         match action {
-            // Already the one on screen (or on its way): nothing to do.
-            RowAction::Attach(id) if self.is_wanted(id) => Vec::new(),
+            // Already the one on screen here (or on its way): nothing to do.
+            // Another pane's (split panes): its attach effect focuses that
+            // pane (`AppView::focus_session`; Shady #36 M1).
+            RowAction::Attach(id) if self.lives[self.lives.shown()].is_wanted(id) => Vec::new(),
             RowAction::Attach(id) => vec![Effect::Attach { session_id: id.clone(), fallback: self.journal_of(id), open: false, place }],
             RowAction::Resume(req) if self.named.resuming.as_ref().is_some_and(|r| r.req.target == req.target) => Vec::new(),
             RowAction::Resume(req) => vec![Effect::Resume { req: req.clone(), open: false, place }],
@@ -1203,7 +1210,7 @@ impl Model {
             if self.left.len() == LEFT_MAX {
                 self.left.remove(0);
             }
-            self.left.push((a.attach_seq, a.session_id, l.in_flight.take().into_iter().map(|(_, t)| t).collect()));
+            self.left.push((a.attach_seq, a.session_id, l.in_flight.take().into_iter().collect()));
         }
         l.in_flight.take();
         l.reattaching = false;
@@ -1338,12 +1345,12 @@ impl Model {
         let i = self.left.iter().position(|l| l.0 == seq)?;
         let mut effects = Vec::new();
         let (_, session, texts) = &mut self.left[i];
-        let mut give = |t: String| effects.push(Effect::Unsent { session: session.clone(), text: t });
+        let mut give = |(pane, t): (PaneId, String)| effects.push(Effect::Unsent { pane, session: session.clone(), text: t });
         match ev {
             Event::Session {
                 event: SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. }, ..
             } => {
-                if let Some(k) = texts.iter().position(|s| s.trim() == t.trim()) {
+                if let Some(k) = texts.iter().position(|(_, s)| s.trim() == t.trim()) {
                     texts.remove(k);
                 }
             }
@@ -1352,7 +1359,19 @@ impl Model {
                     give(t);
                 }
             }
-            Event::Detached { .. } if !texts.is_empty() => give(Vec::from(std::mem::take(texts)).join("\n")),
+            // The rest, one text for each pane that sent some.
+            Event::Detached { .. } if !texts.is_empty() => {
+                let mut by: Vec<(PaneId, Vec<String>)> = Vec::new();
+                for (p, t) in std::mem::take(texts) {
+                    match by.iter_mut().find(|(q, _)| *q == p) {
+                        Some((_, ts)) => ts.push(t),
+                        None => by.push((p, vec![t])),
+                    }
+                }
+                for (p, ts) in by {
+                    give((p, ts.join("\n")));
+                }
+            }
             _ => {}
         }
         if self.left[i].2.is_empty() || matches!(ev, Event::Detached { .. }) {
@@ -3740,7 +3759,7 @@ mod fake_daemon {
         let _ = ui_switch(&mut m, &client, B, None);
         a.event(A, 5, json!({"ev": "refused", "client": 2, "command": "submit", "reason": "input is owned by client #1"}));
         let seen = effects(&mut m, &events, 1, |e| matches!(e, Effect::Unsent { .. }));
-        assert!(seen.contains(&Effect::Unsent { session: A.into(), text: "steer A this way".into() }), "{seen:?}");
+        assert!(seen.contains(&Effect::Unsent { pane: PaneId::FIRST, session: A.into(), text: "steer A this way".into() }), "{seen:?}");
         assert!(!seen.iter().any(|e| matches!(e, Effect::Restore(..))), "nothing for B's composer: {seen:?}");
         let _b = attaches.recv_timeout(T).unwrap();
     }
@@ -3768,9 +3787,72 @@ mod fake_daemon {
         let seen = effects(&mut m, &events, 1, |e| matches!(e, Effect::Unsent { .. }));
         assert_eq!(
             seen.iter().filter(|e| matches!(e, Effect::Unsent { .. })).collect::<Vec<_>>(),
-            vec![&Effect::Unsent { session: A.into(), text: "two".into() }]
+            vec![&Effect::Unsent { pane: PaneId::FIRST, session: A.into(), text: "two".into() }]
         );
         assert!(m.left.is_empty(), "nothing left to follow");
+        let _b = attaches.recv_timeout(T).unwrap();
+    }
+
+    /// Shady #36 L5: sends from two panes on A, unconfirmed when its
+    /// attachment, left, ends: each goes back to the pane that sent it
+    /// (`Effect::Unsent` names it), never the pane in use.
+    #[test]
+    fn unsent_input_left_behind_keeps_the_pane_that_sent_it() {
+        let (client, events, attaches, mut m) = connect("unsent3");
+        m.tabs.open(A, "a", Place::Current);
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
+        let (p0, p1) = (PaneId::FIRST, PaneId::nth(1));
+        for (p, t) in [(p0, "one"), (p1, "two"), (p0, "three")] {
+            client.on(m.attachment().unwrap()).submit(t).unwrap();
+            m.sent(p, t.into());
+        }
+        m.tabs.open(B, "b", Place::New);
+        let _ = ui_switch(&mut m, &client, B, None);
+        drop(a);
+        let seen = effects(&mut m, &events, 1, |e| matches!(e, Effect::Unsent { .. }));
+        assert_eq!(
+            seen.iter().filter(|e| matches!(e, Effect::Unsent { .. })).collect::<Vec<_>>(),
+            vec![
+                &Effect::Unsent { pane: p0, session: A.into(), text: "one".into() },
+                &Effect::Unsent { pane: p1, session: A.into(), text: "two".into() },
+                &Effect::Unsent { pane: p0, session: A.into(), text: "three".into() }
+            ]
+        );
+        let _b = attaches.recv_timeout(T).unwrap();
+    }
+
+    /// Shady #36 r2 n11: the same sends, and A's attachment, left, ends
+    /// (`Detached`): what is left goes back one text per pane that sent
+    /// it, in the order sent (the refusal arm above gives one at a time).
+    #[test]
+    fn unsent_input_left_behind_comes_back_one_text_per_pane() {
+        let (client, events, attaches, mut m) = connect("unsent4");
+        m.tabs.open(A, "a", Place::Current);
+        ui_attach(&mut m, &client, A);
+        let mut a = attaches.recv_timeout(T).unwrap();
+        a.send(attached_with_prompt(A, 1));
+        pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
+        let seq = m.attachment().unwrap();
+        let (p0, p1) = (PaneId::FIRST, PaneId::nth(1));
+        for (p, t) in [(p0, "one"), (p1, "two"), (p0, "three")] {
+            client.on(seq).submit(t).unwrap();
+            m.sent(p, t.into());
+        }
+        m.tabs.open(B, "b", Place::New);
+        let _ = ui_switch(&mut m, &client, B, None);
+        let fx = m.apply(Event::Detached { attach_seq: seq, session_id: Some(A.into()), reason: "gone".into() });
+        assert_eq!(
+            fx,
+            vec![
+                Effect::Unsent { pane: p0, session: A.into(), text: "one\nthree".into() },
+                Effect::Unsent { pane: p1, session: A.into(), text: "two".into() }
+            ]
+        );
+        assert!(m.left.is_empty(), "nothing left to follow");
+        drop(a);
         let _b = attaches.recv_timeout(T).unwrap();
     }
 

@@ -322,9 +322,61 @@ actions!(
         MenuTab,
         MenuTabBack,
         OpenGoTo,
-        OpenCommands
+        OpenCommands,
+        SplitRight,
+        SplitDown,
+        FocusPane1,
+        FocusPane2,
+        FocusPane3,
+        FocusPane4,
+        FocusNextPane,
+        FocusPrevPane
     ]
 );
+
+/// The split panes' keys (split.md §9): Ctrl+\ splits right (down if the
+/// pane is narrow), Ctrl+Shift+\ down (spelled both ways, as AppKit may
+/// report the shifted key as `|`); Alt+1–4 focus pane N in reading order
+/// (Ctrl+1–4 on macOS, whose Cmd+1–8 are the tab keys); F6 / Shift+F6
+/// the next / previous pane. Cmd on macOS for the splits.
+pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 9] {
+    use PaneKey::*;
+    if mac {
+        [
+            ("cmd-\\", Split),
+            ("cmd-shift-\\", SplitDown),
+            ("cmd-|", SplitDown),
+            ("ctrl-1", Nth(0)),
+            ("ctrl-2", Nth(1)),
+            ("ctrl-3", Nth(2)),
+            ("ctrl-4", Nth(3)),
+            ("f6", Next),
+            ("shift-f6", Prev),
+        ]
+    } else {
+        [
+            ("ctrl-\\", Split),
+            ("ctrl-shift-\\", SplitDown),
+            ("ctrl-|", SplitDown),
+            ("alt-1", Nth(0)),
+            ("alt-2", Nth(1)),
+            ("alt-3", Nth(2)),
+            ("alt-4", Nth(3)),
+            ("f6", Next),
+            ("shift-f6", Prev),
+        ]
+    }
+}
+
+/// What a pane key does ([`pane_keys`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaneKey {
+    Split,
+    SplitDown,
+    Nth(usize),
+    Next,
+    Prev,
+}
 
 /// A prompt as [`AppView::card_first`] knows it: its session, its id and
 /// its `raised_at`.
@@ -340,6 +392,32 @@ const ALLOW_ALL_CTX: &str = "AllowAll";
 /// kit's focus cycling (a binding, which runs before the menus' key
 /// listener).
 const MENU_CTX: &str = "Menu";
+
+/// The root's key context with split panes on: the pane keys
+/// ([`pane_keys`]) are bound in it only.
+const PANES_CTX: &str = "Panes";
+/// The keys that move the focus between panes: only with two or more
+/// (Shady #36 r2 n9: one pane is main's window, Alt+1 included).
+const PANE_FOCUS_CTX: &str = "PaneFocus";
+
+/// The root's key context: a menu's (it outranks the card's Allow all
+/// box, as it always has), else the box's, the panes' with split panes on
+/// (`split_on`), and their focus keys' with two or more (`split`).
+pub(crate) fn root_context(card_tab: bool, menu: bool, split_on: bool, split: bool) -> Option<KeyContext> {
+    let mut c = KeyContext::default();
+    if menu {
+        c.add(MENU_CTX);
+    } else if card_tab {
+        c.add(ALLOW_ALL_CTX);
+    }
+    if split_on {
+        c.add(PANES_CTX);
+        if split {
+            c.add(PANE_FOCUS_CTX);
+        }
+    }
+    (!c.is_empty()).then_some(c)
+}
 
 /// Ctrl+B folds the sessions rail, Ctrl+Alt+B the right panel; Ctrl+= /
 /// Ctrl+- / Ctrl+0 step the centre pane's text size; the tab keys
@@ -399,6 +477,21 @@ pub fn bind_keys(cx: &mut App) {
     let (goto, commands) = palette_keys(mac);
     keys.push(KeyBinding::new(goto, OpenGoTo, None));
     keys.push(KeyBinding::new(commands, OpenCommands, None));
+    // Only with split panes on (the root's `PANES_CTX`): off, these keys
+    // are main's, never swallowed (Shady #36 L1).
+    for &(k, a) in &pane_keys(mac) {
+        let c = Some(if matches!(a, PaneKey::Split | PaneKey::SplitDown) { PANES_CTX } else { PANE_FOCUS_CTX });
+        keys.push(match a {
+            PaneKey::Split => KeyBinding::new(k, SplitRight, c),
+            PaneKey::SplitDown => KeyBinding::new(k, SplitDown, c),
+            PaneKey::Nth(0) => KeyBinding::new(k, FocusPane1, c),
+            PaneKey::Nth(1) => KeyBinding::new(k, FocusPane2, c),
+            PaneKey::Nth(2) => KeyBinding::new(k, FocusPane3, c),
+            PaneKey::Nth(_) => KeyBinding::new(k, FocusPane4, c),
+            PaneKey::Next => KeyBinding::new(k, FocusNextPane, c),
+            PaneKey::Prev => KeyBinding::new(k, FocusPrevPane, c),
+        });
+    }
     cx.bind_keys(keys);
 }
 
@@ -1236,7 +1329,45 @@ const FOOT_HINT_MIN: f32 = 60.;
 /// pane), the name and handle. The glyph, MAIN, HALT and the primary never
 /// drop. The effort is said after the model (`model · effort`): it goes
 /// with it.
+#[cfg(test)]
 pub(crate) fn fit_foot(i: &FootIn) -> Foot {
+    fit_foot_with(i, false)
+}
+
+/// [`fit_foot`]; a hint that is a note (`note`: a refusal, a command's
+/// reply) is read whole: model · effort, the word and the name drop
+/// before it, and it ellipsizes only once they are gone (finish gate #36
+/// S1: "no room to sp…" in the narrow pane it was about).
+pub(crate) fn fit_foot_with(i: &FootIn, note: bool) -> Foot {
+    if note && i.hint > 0. {
+        let mut f = Foot { hint: true, effort: i.effort > 0., model: i.model > 0., word: i.word > 0. && !i.tight, name: i.name > 0. };
+        let width = |f: &Foot| {
+            let mut w = i.lead + FOOT_BUTTON + i.primary + FOOT_PART + i.hint;
+            if i.halt > 0. {
+                w += i.halt + FOOT_BUTTON;
+            }
+            if f.name {
+                w += i.name;
+            }
+            if f.word {
+                w += i.word + if f.name { 12. } else { 0. };
+            }
+            if f.model {
+                w += FOOT_PART + i.model + if f.effort { i.effort } else { 0. };
+            }
+            w
+        };
+        type Drop = fn(&mut Foot);
+        let order: [Drop; 4] = [|f| f.effort = false, |f| f.model = false, |f| f.word = false, |f| f.name = false];
+        for drop in order {
+            if width(&f) <= i.room {
+                break;
+            }
+            drop(&mut f);
+        }
+        f.effort &= f.model;
+        return f;
+    }
     let mut f = Foot { hint: i.hint > 0., effort: i.effort > 0., model: i.model > 0., word: i.word > 0. && !i.tight, name: i.name > 0. };
     let width = |f: &Foot| {
         let mut w = i.lead + FOOT_BUTTON + i.primary;
@@ -1547,6 +1678,10 @@ impl FavsJob {
 /// Each worker chip's bounds (its worker's id) as last laid out.
 pub(crate) type ChipBounds = Vec<(u64, Bounds<Pixels>)>;
 
+/// Tests: a box [`AppView::probe`] laid out, under its name.
+#[cfg(test)]
+pub(crate) type Probed = (&'static str, [f32; 4]);
+
 pub struct AppView {
     pub client: Option<Client>,
     /// Connection, sessions, attachment and transcript. Events are applied
@@ -1566,7 +1701,7 @@ pub struct AppView {
     /// The rail's find (`/`; Enter opens by exact name) and "Name this
     /// session…" (the naming row's) inputs.
     pub(crate) find_input: Entity<InputState>,
-    name_input: Entity<InputState>,
+    pub(crate) name_input: Entity<InputState>,
     /// The accent picker's custom colour.
     pub(crate) hex_input: Entity<InputState>,
     /// The find text, trimmed and lowercased.
@@ -1603,6 +1738,9 @@ pub struct AppView {
     /// counts do (the word swap's UI test: no count left rolling has one).
     #[cfg(test)]
     pub(crate) roll_probe: Option<usize>,
+    /// Tests: the boxes [`AppView::probe`] laid out, frame by frame.
+    #[cfg(test)]
+    pub(crate) chrome_log: std::rc::Rc<RefCell<Vec<Probed>>>,
     /// The side panels folded to strips and the open HISTORY buckets
     /// (saved with the accent).
     pub panels: theme::Panels,
@@ -1648,7 +1786,7 @@ pub struct AppView {
     /// Each tab's composer draft by session (kept when its tab is left,
     /// put back when it is shown again), and the tab whose draft the
     /// composer holds.
-    drafts: Drafts,
+    pub(crate) drafts: Drafts,
     pub bench: Option<BenchState>,
     /// Diagnostics: render rows as plain text instead of markdown.
     pub plain_rows: bool,
@@ -1676,6 +1814,9 @@ pub struct AppView {
     /// The tabs generation handed to a save, the one written (or meant to
     /// stay unwritten), and the delayed save.
     tabs_saved: u64,
+    /// The pane whose tabs that was ([`AppView::saved_tabs`]): another
+    /// first pane's are saved whatever their generation (Shady #36 L7).
+    tabs_saved_pane: PaneId,
     tabs_written: u64,
     tabs_save: Option<Task<()>>,
     /// The same for the favourites (saved under `tabs_key` too), and the
@@ -1708,6 +1849,22 @@ pub struct AppView {
     pub(crate) usage: crate::usage_view::UsageUi,
     pub(crate) dash: crate::views::DashUi,
     pub(crate) app_settings: crate::settings_view::AppSettings,
+    /// The centre's size as last laid out: what a split has to fit in.
+    pub(crate) centre: Cell<(f32, f32)>,
+    /// The top bar's form, the window's (its height under the full bar):
+    /// never a pane's, so focus never moves the window (finish gate #36
+    /// M1). With one pane it is that pane's `Layout::short`.
+    pub(crate) top_short: bool,
+    /// A refused split's note running out ([`AppView::split_pane`]).
+    pub(crate) split_note: Option<Task<()>>,
+    /// `SYNAPS_DESK_PANES` ([`crate::pane::pane_script`]), until it runs.
+    pane_script: Option<String>,
+    /// The keys follow the focus mark at the next frame, as asked
+    /// ([`AppView::ask_keys`], [`AppView::apply_keys`]).
+    pub(crate) keys_to: Option<crate::pane::KeysTo>,
+    /// The focused pane's card's keys wait again from the next frame, with
+    /// their repaint ([`AppView::restart_card_keys`]).
+    pub(crate) keys_rearm: bool,
     pub(crate) settings_find: Entity<InputState>,
     pub(crate) settings_input: Entity<InputState>,
     pub(crate) gear_menu: bool,
@@ -1950,42 +2107,78 @@ pub(crate) fn section(title: &'static str, jp: &'static str, p: &Palette) -> Div
 }
 
 impl AppView {
+    /// A pane's composer, its secret answer's field and its Allow all box
+    /// focus, with their subscriptions: each acts on pane `id`, whichever
+    /// pane is focused (split panes §6.4), and keyboard focus entering
+    /// one focuses its pane (split.md §6).
+    pub(crate) fn pane_inputs(
+        id: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<TextareaState>, Entity<InputState>, FocusHandle, Vec<Subscription>) {
+        let composer = cx.new(|cx| {
+            let mut s = TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder(COMPOSER_PLACEHOLDER);
+            s.set_scrollbar_renderer(Some(crate::scrollbar::editor()));
+            s
+        });
+        let secret_input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("answer (hidden)"));
+        // The composer's own: it goes with its pane (Shady #30 L4), and acts
+        // on that pane, whichever is focused (split panes §6.4).
+        let composer_sub = cx.subscribe_in(&composer, window, move |this: &mut Self, input, ev: &InputEvent, window, cx| {
+            this.in_pane(id, |this| match ev {
+                InputEvent::PressEnter { shift: false, .. } if !this.enter_is_the_picks() => {
+                    let text = input.read(cx).value().trim().to_string();
+                    if !text.is_empty() && this.submit(text) {
+                        input.update(cx, |s, cx| s.set_value("", window, cx));
+                    }
+                }
+                InputEvent::PressEnter { shift: false, .. } => {
+                    log::debug!(target: "synaps_desktop::send", "enter: a held repeat of a menu pick's key, nothing sent");
+                }
+                // Typing: what a worker key or a refused steer said is old.
+                InputEvent::Change if this.panes.cur.watch_note.is_some() => {
+                    this.panes.cur.watch_note = None;
+                    cx.notify();
+                }
+                _ => {}
+            })
+            .unwrap_or_default()
+        });
+        // Enter (or Ctrl/Cmd+Enter) submits what was typed, never
+        // nothing; typing lights SUBMIT.
+        let secret_sub = cx.subscribe_in(&secret_input, window, move |this: &mut Self, _input, ev: &InputEvent, window, cx| {
+            this.in_pane(id, |this| match ev {
+                InputEvent::PressEnter { .. } if !this.enter_is_the_picks() => this.answer_secret(true, window, cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            })
+            .unwrap_or_default()
+        });
+        let typed = composer.read(cx).focus_handle(cx);
+        let focus_in = cx.on_focus_in(&typed, window, move |this: &mut Self, _, cx| {
+            if this.panes.split() && this.panes.focused != id {
+                this.focus_pane(id, crate::pane::KeysTo::Follow, cx);
+            }
+        });
+        // Not a tab stop (Shady M1 of round 4): the kit's own Tab order
+        // would reach it from the composer. Only the card's Tab and a
+        // click focus it.
+        (composer, secret_input, cx.focus_handle(), vec![composer_sub, secret_sub, focus_in])
+    }
+
     pub fn new(
         client: Option<(Client, async_channel::Receiver<Event>)>,
         synthetic: Option<Vec<Event>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer = cx.new(|cx| {
-            let mut s = TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder(COMPOSER_PLACEHOLDER);
-            s.set_scrollbar_renderer(Some(crate::scrollbar::editor()));
-            s
-        });
+        let (composer, secret_input, allow_all_focus, pane_subs) = Self::pane_inputs(PaneId::FIRST, window, cx);
         let find_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::chrome::FIND.0));
         let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::palette::PLACEHOLDER));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
-        let secret_input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("answer (hidden)"));
         let settings_find = cx.new(|cx| InputState::new(window, cx).placeholder("find a setting"));
         let settings_input = cx.new(|cx| InputState::new(window, cx));
-        // The composer's own: it goes with its pane (Shady #30 L4).
-        let composer_sub = cx.subscribe_in(&composer, window, |this: &mut Self, input, ev: &InputEvent, window, cx| match ev {
-            InputEvent::PressEnter { shift: false, .. } if !this.enter_is_the_picks() => {
-                let text = input.read(cx).value().trim().to_string();
-                if !text.is_empty() && this.submit(text) {
-                    input.update(cx, |s, cx| s.set_value("", window, cx));
-                }
-            }
-            InputEvent::PressEnter { shift: false, .. } => {
-                log::debug!(target: "synaps_desktop::send", "enter: a held repeat of a menu pick's key, nothing sent");
-            }
-            // Typing: what a worker key or a refused steer said is old.
-            InputEvent::Change if this.panes.cur.watch_note.is_some() => {
-                this.panes.cur.watch_note = None;
-                cx.notify();
-            }
-            _ => {}
-        });
         let mut subs = vec![
             // The palette filters as it is typed.
             cx.subscribe_in(&palette_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
@@ -2044,13 +2237,6 @@ impl AppView {
                 {
                     this.apply_custom_accent(cx);
                 }
-            }),
-            // Enter (or Ctrl/Cmd+Enter) submits what was typed, never
-            // nothing; typing lights SUBMIT.
-            cx.subscribe_in(&secret_input, window, |this: &mut Self, _input, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { .. } if !this.enter_is_the_picks() => this.answer_secret(true, window, cx),
-                InputEvent::Change => cx.notify(),
-                _ => {}
             }),
             cx.subscribe_in(&settings_find, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
                 if let InputEvent::Change = ev {
@@ -2136,7 +2322,7 @@ impl AppView {
         let usage_pane = cx.new(|_| crate::views::ViewPane::new(me, crate::tabs::Kind::Usage));
         let inputs = Inputs {
             composer,
-            composer_sub,
+            pane_subs,
             find_input,
             palette_input,
             name_input,
@@ -2147,10 +2333,7 @@ impl AppView {
             settings_pane,
             usage_pane,
             focus,
-            // Not a tab stop (Shady M1 of round 4): the kit's own Tab order
-            // would reach it from the composer. Only the card's Tab and a
-            // click focus it.
-            allow_all_focus: cx.focus_handle(),
+            allow_all_focus,
             visible: window.is_visible(),
         };
         match (client, synthetic) {
@@ -2180,104 +2363,17 @@ impl AppView {
     }
 
     fn blank(i: Inputs, client: Option<Client>, conn: ConnState, subs: Vec<Subscription>) -> Self {
-        let list = ListState::new(0, ListAlignment::Top, px(600.));
-        list.set_follow_mode(FollowMode::Tail);
-        let texts = Rc::default();
-        turns::readiness(&list, &texts);
         Self {
             client,
             model: Model::new(conn),
-            panes: Panes::one(Pane {
-                id: PaneId::FIRST,
-                live: crate::live::LiveId::FIRST,
-                rows: Vec::new(),
-                disp: Vec::new(),
-                summaries: Summaries::default(),
-                list,
-                toggled: Toggled::default(),
-                open_runs: HashSet::new(),
-                unfold_hold: Vec::new(),
-                synced_busy: false,
-                files_gen: 0,
-                subs_gen: 0,
-                rows_session: None,
-                waiting_on: None,
-                scroll_carry: None,
-                hold_back: Rc::new(Cell::new(false)),
-                texts,
-                scroller: crate::scroll::Scroller::default(),
-                list_box: Cell::new((0., 0.)),
-                list_gen: 0,
-                fold_slack: Rc::new(Cell::new(None)),
-                fold_gap: RefCell::new(Vec::new()),
-                body_hold: Cell::new(None),
-                touch_kept: Cell::new(false),
-                metrics_gen: 0,
-                layout: Layout::of(800., 800., &Metrics::at(theme::DEFAULT_TEXT), Default::default()),
-                layout_naming: false,
-                hang_fx: Default::default(),
-                metrics_last: Cell::new(None),
-                body_line: 0.,
-                column_key: (None, 0, None),
-                column_at: None,
-                column_ix: None,
-                column_worker: false,
-                layer: None,
-                dock_h: std::rc::Rc::new(std::cell::Cell::new(f32::NAN)),
-                composer_h: std::rc::Rc::new(std::cell::Cell::new(f32::NAN)),
-                dock_scope: 0,
-                over_composer: std::rc::Rc::new(std::cell::Cell::new(f32::INFINITY)),
-                composer_top: Default::default(),
-                composer: i.composer,
-                composer_rows: crate::fit::COMPOSER_ROWS,
-                placeholder_of: None,
-                placeholder_cramped: false,
-                restore: None,
-                cmd_draft: None,
-                cmd_clear: None,
-                quiet_note: None,
-                draft_note: None,
-                watch_note: None,
-                composer_of: None,
-                halt_armed: None,
-                halt_tick: None,
-                halt_where: None,
-                esc_composing: false,
-                secret_input: i.secret_input,
-                shown_tab: None,
-                attach_wait: None,
-                attach_due: None,
-                gate: Default::default(),
-                tab_first: 0,
-                tab_follow: None,
-                tab_room: 0,
-                tab_labels: Default::default(),
-                tab_fx: Default::default(),
-                strip_at: Default::default(),
-                main_column: None,
-                column_of: None,
-                pending: None,
-                worker_columns: Vec::new(),
-                full_rebuild: false,
-                card: None,
-                keys_live: false,
-                chord: CardChord::default(),
-                chord_press: false,
-                secret_left: None,
-                card_keys: Cell::new(None),
-                card_was_up: false,
-                card_seen: Cell::new(false),
-                card_look: Default::default(),
-                card_exit: None,
-                card_at: None,
-                jump_card: None,
-                stub_away: None,
-                allow_all_focus: i.allow_all_focus,
-                tracer_open: None,
-                tracer: None,
-                cancel_tick: None,
-                _subs: vec![i.composer_sub],
-            }),
+            panes: Panes::one(Pane::fresh(
+                PaneId::FIRST,
+                crate::live::LiveId::FIRST,
+                i.composer,
+                i.secret_input,
+                i.allow_all_focus,
+                i.pane_subs,
+            )),
             bars: Default::default(),
             top_words: None,
             find_short: false,
@@ -2304,6 +2400,8 @@ impl AppView {
             owner_here: false,
             #[cfg(test)]
             roll_probe: None,
+            #[cfg(test)]
+            chrome_log: Default::default(),
             panels: theme::Panels::default(),
             panels_dirty: Default::default(),
             panels_writing: Default::default(),
@@ -2337,6 +2435,7 @@ impl AppView {
             restore_tabs: None,
             tabs_key: None,
             tabs_saved: 0,
+            tabs_saved_pane: PaneId::FIRST,
             favs_saved: 0,
             favs_written: 0,
             favs_save: None,
@@ -2354,6 +2453,12 @@ impl AppView {
             usage: crate::usage_view::UsageUi::new(None, Default::default()),
             dash: Default::default(),
             app_settings: Default::default(),
+            centre: Cell::new((0., 0.)),
+            top_short: false,
+            split_note: None,
+            pane_script: std::env::var("SYNAPS_DESK_PANES").ok(),
+            keys_to: None,
+            keys_rearm: false,
             settings_find: i.settings_find,
             settings_input: i.settings_input,
             gear_menu: false,
@@ -2454,11 +2559,48 @@ impl AppView {
     pub(crate) fn apply_batch(&mut self, batch: Vec<Event>, cx: &mut Context<Self>) {
         self.model.view_dirty = false;
         for ev in batch {
+            // Split panes: an attachment's event acts in a pane showing its
+            // store (the focused one if it does): its tab strip follows its
+            // attach, its composer gets its text back, its card its prompt.
+            let pane = ev.attach_seq().and_then(|s| self.model.lives.wanting(s)).and_then(|l| self.pane_of_live(l));
+            match pane {
+                Some(id) if id != self.panes.cur.id => {
+                    self.in_pane(id, |v| v.apply_event(ev));
+                }
+                _ => self.apply_event(ev),
+            }
+        }
+        self.start_tabs();
+        // An attach may have named or merged a pane's visible tab.
+        for id in self.panes.ids() {
+            self.in_pane(id, |v| v.reconcile(None));
+        }
+        // The worker tab on screen: its handle may name another
+        // worker now.
+        self.disown_reused();
+        // A Welcome: the daemon's place and dash are looked for.
+        self.dash_on_welcome(cx);
+        // A worker's page came: its next poll, drawn or not.
+        self.arm_watch_poll(cx);
+        // An idle daemon's poll changes nothing: no frame, unless
+        // the rail's ages have a new minute to show.
+        if self.model.view_dirty || self.rail.minute() != crate::chrome::now_secs() / 60 {
+            cx.notify();
+        }
+    }
+
+    /// One event, in the pane acted on ([`AppView::apply_batch`]).
+    fn apply_event(&mut self, ev: Event) {
+        {
             // A worker's menu, the workers menu, or a cancel armed
             // from the tray, means nothing across a reconnect (a
             // restarted daemon numbers its workers anew).
             if matches!(ev, Event::Attached { .. } | Event::Reattaching { .. }) {
-                if self.menu.is_some() || self.wmenu.is_some() {
+                // The menus are the focused pane's: another pane's attach
+                // leaves them (Shady #36 L2, #31 M4.1); a reconnect renumbers
+                // every store's workers.
+                let mine = self.panes.cur.id == self.panes.focused || matches!(ev, Event::Reattaching { .. });
+                if mine && (self.menu.is_some() || self.wmenu.is_some()) {
                     self.close_menu();
                     self.model.view_dirty = true;
                 } else if self.model.lives[self.panes.cur.live].cancels.disarm() {
@@ -2485,21 +2627,6 @@ impl AppView {
                 self.effect(fx);
             }
         }
-        self.start_tabs();
-        // An attach may have named or merged the visible tab.
-        self.reconcile(None);
-        // The worker tab on screen: its handle may name another
-        // worker now.
-        self.disown_reused();
-        // A Welcome: the daemon's place and dash are looked for.
-        self.dash_on_welcome(cx);
-        // A worker's page came: its next poll, drawn or not.
-        self.arm_watch_poll(cx);
-        // An idle daemon's poll changes nothing: no frame, unless
-        // the rail's ages have a new minute to show.
-        if self.model.view_dirty || self.rail.minute() != crate::chrome::now_secs() / 60 {
-            cx.notify();
-        }
     }
 
     pub(crate) fn effect(&mut self, fx: Effect) {
@@ -2514,7 +2641,13 @@ impl AppView {
                     })
                 }
             }
-            Effect::Unsent { session, text } => self.unsent(session, text),
+            // In the pane that sent it (Shady #36 L5); closed since, one
+            // showing its session, else the focused one (its drafts or the
+            // notice).
+            Effect::Unsent { pane, session, text } => {
+                let to = if self.panes.get(pane).is_some() { pane } else { self.pane_showing(&session).unwrap_or(self.panes.focused) };
+                self.in_pane(to, |v| v.unsent(session, text));
+            }
             Effect::ListSessions => {
                 if let Some(c) = &self.client {
                     let _ = c.list_sessions();
@@ -2559,7 +2692,11 @@ impl AppView {
                     }
                 }
             }
-            Effect::Attach { session_id, fallback, open, place } => self.open_tab(Open::Attach { session_id, fallback, open }, place),
+            Effect::Attach { session_id, fallback, open, place } => {
+                if !self.focus_session(&session_id) {
+                    self.open_tab(Open::Attach { session_id, fallback, open }, place);
+                }
+            }
             Effect::Resume { req, open, place } => self.open_tab(Open::Resume { req, open }, place),
             Effect::WorkerNote(note) => self.panes.cur.watch_note = Some(note.into()),
             Effect::Command { name, reply } => {
@@ -2697,7 +2834,14 @@ impl AppView {
             }
             return;
         };
-        match c.resume(req.target.clone(), req.options()) {
+        let sent = if self.many_lives() {
+            self.detach_held();
+            self.client.as_ref().map(|c| c.resume_more(req.target.clone(), req.options()))
+        } else {
+            Some(c.resume(req.target.clone(), req.options()))
+        };
+        let Some(sent) = sent else { return };
+        match sent {
             Ok(seq) => {
                 self.model.resuming(self.panes.cur.live, req, seq, open);
             }
@@ -2930,7 +3074,14 @@ impl AppView {
 
     fn create_now(&mut self) {
         // Tools run in the user's home, not wherever the launcher started us.
-        if let Some(seq) = self.client.as_ref().and_then(|c| c.create(CreateOptions::new().cwd(Cwd::Home)).ok()) {
+        let more = self.many_lives();
+        if more {
+            self.detach_held();
+        }
+        let create = |c: &Client| {
+            if more { c.create_more(CreateOptions::new().cwd(Cwd::Home)) } else { c.create(CreateOptions::new().cwd(Cwd::Home)) }
+        };
+        if let Some(seq) = self.client.as_ref().and_then(|c| create(c).ok()) {
             self.model.want(self.panes.cur.live, seq);
         }
     }
@@ -3009,18 +3160,113 @@ impl AppView {
         if vis == self.panes.cur.shown_tab && hint.is_none() {
             return;
         }
+        let mut attach = true;
         if vis != self.panes.cur.shown_tab {
-            self.stash();
-            self.load(vis.as_ref().and_then(|v| v.1.clone()));
+            if self.panes.split() {
+                attach = self.repoint(vis.as_ref().and_then(|v| v.1.clone()));
+            } else {
+                self.stash();
+                self.load(vis.as_ref().and_then(|v| v.1.clone()));
+            }
         }
         self.panes.cur.shown_tab = vis.clone();
         self.tab_watch(shown);
         match vis {
-            Some((_, Some(s))) => self.attach_tab(s, hint),
+            Some((_, Some(s))) if attach => self.attach_tab(s, hint),
+            // Another pane's store has it: shown from there.
+            Some((_, Some(_))) => {}
             // A create or a resume: the caller sends it.
             Some((_, None)) => {}
+            // A pane's last tab closed: the pane closes (split.md §8).
+            None if self.panes.split() => self.close_pane(),
             None => self.detach_all(),
         }
+    }
+
+    /// Split panes: the pane acted on leaves the store it shows for the one
+    /// of `target` (its visible tab's session; `None`: a create, a resume or
+    /// no tab). A store another pane shows stays as it is (only this pane's
+    /// list goes); one no other pane shows goes to the tab cache, as a
+    /// switch away does with one pane. A session another pane's store has
+    /// is shown from that store: one attachment, two lists (split.md §1).
+    /// Whether its attach is still to go.
+    fn repoint(&mut self, target: Option<String>) -> bool {
+        let live = self.panes.cur.live;
+        // Its own store has it already (a split's new pane on the store it
+        // shares): its list is built from there, nothing to attach.
+        if let Some(s) = target.as_deref()
+            && (self.model.lives[live].is_active(s) || self.model.lives[live].is_wanted(s))
+        {
+            self.panes.cur.full_rebuild = true;
+            self.panes.cur.rows_session = target;
+            return false;
+        }
+        let shared = self.panes.showing(live) > 1;
+        let elsewhere = target.as_deref().and_then(|s| self.model.lives.of_session(s, live));
+        if shared {
+            // What it sent still unconfirmed is another pane's on the store
+            // now (Shady #36 L5, r2 L-c): a refusal gives it back there,
+            // never to this pane on another session, nor (its close comes
+            // through here) to no pane.
+            let me = self.panes.cur.id;
+            if let Some(other) = self.panes.iter().find(|p| p.id != me && p.live == live).map(|p| p.id) {
+                self.model.lives[live].in_flight.rehome(me, other);
+            }
+            self.drop_list();
+        } else {
+            self.stash();
+        }
+        match elsewhere {
+            Some(l) => {
+                self.panes.cur.live = l;
+                self.model.lives.show(l);
+                if !shared {
+                    self.release_live(live);
+                }
+                self.list_out();
+                self.panes.cur.pending = None;
+                self.panes.cur.full_rebuild = true;
+                self.panes.cur.rows_session = target;
+                false
+            }
+            None => {
+                if shared {
+                    let l = self.fresh_live();
+                    self.panes.cur.live = l;
+                    self.model.lives.show(l);
+                }
+                self.load(target);
+                true
+            }
+        }
+    }
+
+    /// The pane's list over a store another pane shows goes (that store
+    /// and its transcript stay); a fresh, empty list in its place.
+    fn drop_list(&mut self) {
+        self.list_out();
+        self.panes.cur.card = None;
+        self.panes.cur.attach_wait = None;
+        self.panes.cur.attach_due = None;
+        let fresh = ListState::new(0, ListAlignment::Top, px(600.));
+        fresh.set_follow_mode(FollowMode::Tail);
+        turns::readiness(&fresh, &self.panes.cur.texts);
+        let pane = &mut self.panes.cur;
+        pane.scroll_carry = None;
+        pane.list = fresh;
+        pane.rows.clear();
+        pane.disp.clear();
+        pane.summaries = Default::default();
+        pane.toggled = Default::default();
+        pane.open_runs.clear();
+        pane.synced_busy = false;
+        pane.files_gen = 0;
+        pane.waiting_on = None;
+        pane.rows_session = None;
+        pane.pending = None;
+        pane.main_column = None;
+        pane.column_of = None;
+        pane.worker_columns.clear();
     }
 
     /// The current tab's worker view. A worker tab: its worker, checked
@@ -3173,8 +3419,30 @@ impl AppView {
         self.attach_now(session, fallback, open);
     }
 
+    /// More than one store may hold an attachment (split panes): an attach
+    /// goes beside the others (`*_more`), never replacing every one
+    /// (`Client::attach` would end the other panes' sessions, #31 M3).
+    fn many_lives(&self) -> bool {
+        self.panes.split() || self.model.lives.ids().len() > 1
+    }
+
+    /// Before the pane's store asks for another attachment beside the
+    /// others: the one it holds goes (#31, Shady #32 r2's step-3 trap).
+    fn detach_held(&mut self) {
+        if let (Some(c), Some(seq)) = (&self.client, self.model.lives[self.panes.cur.live].held.take()) {
+            let _ = c.on(seq).detach();
+        }
+    }
+
     fn attach_now(&mut self, session: String, fallback: Option<ResumeRequest>, open: bool) {
-        if let Some(seq) = self.client.as_ref().and_then(|c| c.attach(session.clone(), AttachMode::Mirror).ok()) {
+        let more = self.many_lives();
+        if more && self.client.is_some() {
+            self.detach_held();
+        }
+        let attach = |c: &Client| {
+            if more { c.attach_more(session.clone(), AttachMode::Mirror) } else { c.attach(session.clone(), AttachMode::Mirror) }
+        };
+        if let Some(seq) = self.client.as_ref().and_then(|c| attach(c).ok()) {
             self.model.attaching(self.panes.cur.live, seq, fallback, open);
             self.model.asked_for(self.panes.cur.live, &session);
         } else if self.synthetic_tx.is_some() {
@@ -3191,12 +3459,12 @@ impl AppView {
             self.panes.cur.attach_due = None;
             return;
         }
-        let at = self.panes.cur.gate.due();
+        let (at, id) = (self.panes.cur.gate.due(), self.panes.cur.id);
         self.panes.cur.attach_due = Some(cx.spawn(async move |this, cx| {
             if let Some(left) = at.map(|t| t.saturating_duration_since(Instant::now())).filter(|d| !d.is_zero()) {
                 cx.background_executor().timer(left).await;
             }
-            let _ = this.update(cx, |v, cx| v.attach_waited(cx));
+            let _ = this.update(cx, |v, cx| v.in_pane(id, |v| v.attach_waited(cx)));
         }));
     }
 
@@ -3393,15 +3661,31 @@ impl AppView {
 
     /// The tabs changed since the last save: saved [`SAVE_DELAY`] later, off
     /// the UI thread (a burst of changes is one write).
+    /// The tabs the settings file keeps: the first pane's (split panes
+    /// step 3; a layout and every pane's tabs are step 5's).
+    pub(crate) fn saved_tabs(&self) -> &crate::tabs::Tabs {
+        let first = self.panes.ids().first().copied().unwrap_or(self.panes.cur.id);
+        match self.panes.rest.iter().find(|p| p.id == first) {
+            Some(p) => &p.parked.tabs,
+            None => &self.model.tabs,
+        }
+    }
+
     fn schedule_tabs_save(&mut self, cx: &mut Context<Self>) {
-        if self.tabs_key.is_none() || self.bench.is_some() || self.model.tabs.generation == self.tabs_saved {
+        let first = self.panes.ids().first().copied().unwrap_or(self.panes.cur.id);
+        if self.tabs_key.is_none()
+            || self.bench.is_some()
+            || (first, self.saved_tabs().generation) == (self.tabs_saved_pane, self.tabs_saved)
+        {
             return;
         }
-        self.tabs_saved = self.model.tabs.generation;
+        self.tabs_saved = self.saved_tabs().generation;
+        self.tabs_saved_pane = first;
         self.tabs_save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_DELAY).await;
-            let job =
-                this.update(cx, |v, _| (theme::settings_path(), v.tabs_key.clone(), v.model.tabs.saved(), v.model.tabs.generation)).ok();
+            let job = this
+                .update(cx, |v, _| (theme::settings_path(), v.tabs_key.clone(), v.saved_tabs().saved(), v.saved_tabs().generation))
+                .ok();
             let Some((Some(path), Some(key), saved, generation)) = job else { return };
             let done = cx.background_spawn(async move { theme::save_tabs(&path, &key, &saved) }).await;
             let _ = this.update(cx, |v, cx| match done {
@@ -3527,12 +3811,12 @@ impl AppView {
     /// the app quits), whether or not a frame scheduled the save.
     fn flush_tabs(&mut self) {
         self.tabs_save = None;
-        if self.tabs_key.is_none() || self.bench.is_some() || self.model.tabs.generation == self.tabs_written {
+        if self.tabs_key.is_none() || self.bench.is_some() || self.saved_tabs().generation == self.tabs_written {
             return;
         }
         if let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref()) {
-            match theme::save_tabs(&path, key, &self.model.tabs.saved()) {
-                Ok(()) => self.tabs_written = self.model.tabs.generation,
+            match theme::save_tabs(&path, key, &self.saved_tabs().saved()) {
+                Ok(()) => self.tabs_written = self.saved_tabs().generation,
                 Err(e) => eprintln!("synaps-desktop: tabs not saved: {e}"),
             }
         }
@@ -4273,7 +4557,7 @@ impl AppView {
         // A body the user closed (S1), the same way: what closed past what
         // was under the view is held; closed, it stays as the fold's room.
         if let Some(BodyHold { id, below, opens, frame, list, vh }) = self.panes.cur.body_hold.get() {
-            match self.fx.body(id, now) {
+            match self.fx.col(self.panes.cur.id).body(id, now) {
                 _ if list != self.panes.cur.list_gen => self.panes.cur.body_hold.set(None),
                 // The user scrolled while it opened: their scroll wins, no
                 // glide to its lines when it lands (Shady #23 r4 M1).
@@ -4426,7 +4710,14 @@ impl AppView {
         let key = d.motion_key();
         // The authorize card arrives on `glide` (§8 #8), rising 4 px.
         let response = if d.kind == Kind::Prompt { crate::motion::GLIDE_RESPONSE } else { crate::motion::SNAP_RESPONSE };
-        match self.fx.grow_on(key, ix, self.fx.birth(key), streaming, self.panes.cur.body_line, response) {
+        match self.fx.col(self.panes.cur.id).grow_on(
+            key,
+            ix,
+            self.fx.col(self.panes.cur.id).birth(key),
+            streaming,
+            self.panes.cur.body_line,
+            response,
+        ) {
             // Your own message was readable a frame ago: it doesn't lift.
             Some(mut g) => {
                 if d.kind == Kind::User {
@@ -4539,6 +4830,12 @@ impl AppView {
                 log::info!(target: "synaps_desktop::card", "card {key:?}: answered {what}");
                 self.model.lives[self.panes.cur.live].answer_sent(key.1);
                 self.sent = Some(crate::authorize::Sent { key, answer, at: crate::authorize::hhmm_now(), took });
+                // The same session's card in another pane: this window's
+                // answer there too, never "answered elsewhere" (Shady #36 n5).
+                let live = self.panes.cur.live;
+                for p in self.panes.rest.iter_mut().filter(|p| p.live == live) {
+                    p.parked.sent = self.sent.clone();
+                }
                 true
             }
             Err(_) => {
@@ -4550,6 +4847,26 @@ impl AppView {
 
     /// What the composer says of its text instead of its hint: a worker
     /// key's or a refused steer's note, else the draft's.
+    /// `el` as it is; under test, its laid-out box goes to
+    /// [`Self::chrome_log`] as `name` each frame (finish gate #36 R1: what
+    /// a launch's first frame, or a resize's, drew).
+    pub(crate) fn probe<E: ParentElement>(&self, el: E, name: &'static str) -> E {
+        #[cfg(test)]
+        {
+            let log = self.chrome_log.clone();
+            let at = move |b: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                let [x, y, w, h] = [b.origin.x, b.origin.y, b.size.width, b.size.height].map(f32::from);
+                log.borrow_mut().push((name, [x, y, w, h]));
+            };
+            el.child(canvas(at, |_, _, _, _| {}).absolute().inset_0())
+        }
+        #[cfg(not(test))]
+        {
+            let _ = name;
+            el
+        }
+    }
+
     fn composer_note(&self) -> Option<SharedString> {
         self.panes.cur.watch_note.clone().or_else(|| self.panes.cur.draft_note.map(SharedString::from))
     }
@@ -4565,7 +4882,7 @@ impl AppView {
     pub(crate) fn extras(&self) -> crate::fit::Extras {
         let n = &self.model.named;
         crate::fit::Extras {
-            naming: n.naming && self.model.lives[self.panes.cur.live].active.is_some(),
+            naming: n.naming && self.panes.cur.id == self.panes.focused && self.model.lives[self.panes.cur.live].active.is_some(),
             naming_notes: u8::from(n.rename_error.is_some()) + u8::from(self.replace_offer().is_some()),
             error: self.model.lives[self.panes.cur.live].last_error.is_some(),
             note: self.panes.cur.watch_note.is_some() || self.panes.cur.draft_note.is_some(),
@@ -4661,7 +4978,7 @@ impl AppView {
     }
 
     /// The card's keys went live: they wait [`ARM`] from now.
-    fn restart_card_keys(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn restart_card_keys(&mut self, cx: &mut Context<Self>) {
         if let Some(c) = self.panes.cur.card.as_mut() {
             log::info!(target: "synaps_desktop::card", "card {:?}: keys live, waiting", c.key);
             c.arm.restart(Instant::now());
@@ -5119,9 +5436,11 @@ impl AppView {
     /// Every row's height changes with the text size: re-measured now (a
     /// cached tab's when it comes back).
     pub(crate) fn text_metrics_changed(&mut self) {
-        // Every pane's, alike (Shady #30 M3).
-        let g = self.panes.next_gen();
-        for pane in self.panes.iter_mut() {
+        // A fresh one per pane (#31 L1): panes in different forms never
+        // share one, so a tab cached by one is re-measured in another.
+        let n = self.panes.len();
+        let gens: Vec<u64> = (0..n).map(|_| self.panes.next_gen()).collect();
+        for (pane, g) in self.panes.iter_mut().zip(gens) {
             pane.list.remeasure();
             pane.metrics_gen = g;
         }
@@ -5265,8 +5584,17 @@ impl AppView {
         // A splice that adds items (a delta to the last one adds no row).
         let live_splice = splice.as_ref().is_some_and(|sp| sp.start > 0 && sp.new_len > sp.old_len && sp.new_len <= sp.old_len + 16)
             && !self.panes.cur.full_rebuild;
-        if std::mem::take(&mut self.panes.cur.full_rebuild) {
-            let n = self.model.lives[self.panes.cur.live].shown().len();
+        let n = self.model.lives[self.panes.cur.live].shown().len();
+        // A splice from past the transcript's end is not this list's (never,
+        // since Shady #36 H1): built again rather than read out of range.
+        let stray = splice.as_ref().is_some_and(|sp| sp.start > n || sp.start > self.panes.cur.rows.len());
+        if stray {
+            log::warn!(target: "synaps_desktop::list", "a splice past the list's end ({splice:?}, {n} items): rebuilt");
+        }
+        // Tests fail on it (Shady #36 r2 L-a: the rebuild would hide a
+        // routing slip from them); a release build still rebuilds.
+        debug_assert!(!stray, "a splice past the list's end: {splice:?}, {n} items, {} rows", self.panes.cur.rows.len());
+        if std::mem::take(&mut self.panes.cur.full_rebuild) || stray {
             splice = Some(Splice { start: 0, old_len: self.panes.cur.rows.len(), new_len: n });
         }
         let items = self.model.lives[self.panes.cur.live].shown().items();
@@ -5361,7 +5689,7 @@ impl AppView {
             let now = self.fx.clock();
             let fresh = self.panes.cur.disp.iter().skip_while(|d| d.item < start).filter(|d| !before.contains(&d.id));
             for (k, d) in fresh.enumerate() {
-                self.fx.born(d.motion_key(), now + crate::motion::stagger(k));
+                self.fx.col(self.panes.cur.id).born(d.motion_key(), now + crate::motion::stagger(k));
             }
         }
         self.sync_counts();
@@ -5509,28 +5837,49 @@ impl AppView {
     /// for it (the session's under a worker's view; a worker tab's). One no
     /// list holds stays in its transcript, as before.
     fn fan_out(&mut self) {
-        let pane = &mut self.panes.cur;
-        let live = &mut self.model.lives[pane.live];
-        let main = match &pane.column_of {
-            None => Some(&mut pane.pending),
-            Some(_) => pane.main_column.as_mut().map(|c| &mut c.pending),
-        };
-        if let Some(slot) = main
-            && let Some(sp) = live.transcript.take_splice()
-        {
-            crate::live::pend(slot, sp);
+        // Split panes: a store two panes show has one splice a frame; each
+        // pane's list takes its own copy (split/architecture.md §3.2).
+        let mut lives: Vec<crate::live::LiveId> = Vec::new();
+        for p in self.panes.iter() {
+            if !lives.contains(&p.live) {
+                lives.push(p.live);
+            }
         }
-        if pane.column_of.is_some()
-            && let Some(w) = live.watch.focused_mut()
-            && let Some(sp) = w.transcript.take_splice()
-        {
-            crate::live::pend(&mut pane.pending, sp);
-        }
-        for ((h, g), col) in &mut pane.worker_columns {
-            if let Some(w) = live.watch.worker_mut(h).filter(|w| w.generation == *g)
-                && let Some(sp) = w.transcript.take_splice()
-            {
-                crate::live::pend(&mut col.pending, sp);
+        for l in lives {
+            let live = &mut self.model.lives[l];
+            // One no list holds stays in its transcript, as before.
+            let held = self.panes.iter().any(|p| p.live == l && (p.column_of.is_none() || p.main_column.is_some()));
+            let main = if held { live.transcript.take_splice() } else { None };
+            // Each worker's list takes its own worker's splice, by view and
+            // generation (Shady #36 H1): two panes on one store can show two
+            // workers, and the store's focus is only the acting pane's.
+            let mut parked: Vec<(String, u64, Option<Splice>)> = Vec::new();
+            for p in self.panes.iter().filter(|p| p.live == l) {
+                for (h, g) in p.column_of.iter().chain(p.worker_columns.iter().map(|(k, _)| k)) {
+                    if !parked.iter().any(|(ph, pg, _)| ph == h && pg == g) {
+                        let sp = live.watch.worker_mut(h).filter(|w| w.generation == *g).and_then(|w| w.transcript.take_splice());
+                        parked.push((h.clone(), *g, sp));
+                    }
+                }
+            }
+            for pane in self.panes.iter_mut().filter(|p| p.live == l) {
+                let slot = match &pane.column_of {
+                    None => Some(&mut pane.pending),
+                    Some(_) => pane.main_column.as_mut().map(|c| &mut c.pending),
+                };
+                if let (Some(slot), Some(sp)) = (slot, main.clone()) {
+                    crate::live::pend(slot, sp);
+                }
+                if let Some((h, g)) = &pane.column_of
+                    && let Some((_, _, Some(sp))) = parked.iter().find(|(ph, pg, _)| ph == h && pg == g)
+                {
+                    crate::live::pend(&mut pane.pending, sp.clone());
+                }
+                for ((h, g), col) in &mut pane.worker_columns {
+                    if let Some((_, _, Some(sp))) = parked.iter().find(|(ph, pg, _)| ph == h && pg == g) {
+                        crate::live::pend(&mut col.pending, sp.clone());
+                    }
+                }
             }
         }
     }
@@ -5806,7 +6155,7 @@ impl AppView {
         let fresh: Vec<u64> =
             self.panes.cur.disp.iter().filter(|d| d.kind == Kind::Work && !before.contains(&d.id)).map(|d| d.id).collect();
         for (k, id) in fresh.iter().enumerate() {
-            self.fx.born(*id, now + crate::motion::stagger(k));
+            self.fx.col(self.panes.cur.id).born(*id, now + crate::motion::stagger(k));
         }
         // They reveal from 0 px (Full), so the list is still at its end the
         // frame after: GPUI's tail-follow would resume there and carry the
@@ -5874,7 +6223,7 @@ impl AppView {
         // Rows that have finished leave first: a hold with none left
         // pauses nothing (Shady #16 r4).
         let fx = &self.fx;
-        self.panes.cur.unfold_hold.retain(|&id| fx.revealing(id));
+        self.panes.cur.unfold_hold.retain(|&id| fx.col(self.panes.cur.id).revealing(id));
         if !self.panes.cur.unfold_hold.is_empty() && self.panes.cur.list.is_following_tail() {
             self.panes.cur.list.pause_following_tail();
         }
@@ -5917,7 +6266,9 @@ impl AppView {
     pub(crate) fn tab_meta(&self, id: u64) -> Option<SessionMeta> {
         let t = self.model.tabs.iter().find(|t| t.id == id)?;
         let session = t.session.as_deref()?;
-        if self.model.is_active(session) {
+        // The pane's own store's session (#31 M2: another pane's store is
+        // not this pane's `session_meta`).
+        if self.model.lives[self.panes.cur.live].is_active(session) {
             return Some(self.session_meta());
         }
         let m = self.model.sessions.iter().find(|m| m.id == session)?;
@@ -5944,7 +6295,12 @@ impl AppView {
     /// the naming row of the session on screen opens (or closes).
     pub(crate) fn rename_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let on_screen = self.model.tabs.view().is_none()
-            && self.model.tabs.current().and_then(|t| t.session.as_deref()).is_some_and(|s| self.model.is_active(s));
+            && self
+                .model
+                .tabs
+                .current()
+                .and_then(|t| t.session.as_deref())
+                .is_some_and(|s| self.model.lives[self.panes.cur.live].is_active(s));
         if !on_screen {
             return;
         }
@@ -5971,7 +6327,7 @@ impl AppView {
             self.rename_pending = None;
             return;
         }
-        if !self.model.is_active(s) {
+        if !self.model.lives[self.panes.cur.live].is_active(s) {
             return;
         }
         self.rename_pending = None;
@@ -6241,14 +6597,17 @@ impl AppView {
                 let (t, s, w) = self.halt_place();
                 (t, s.map(str::to_string), w)
             });
+            let id = self.panes.cur.id;
             self.panes.cur.halt_tick = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(ARM).await;
                 let _ = this.update(cx, |v, cx| {
-                    v.panes.cur.halt_tick = None;
-                    v.panes.cur.halt_where = None;
-                    if v.panes.cur.halt_armed.take().is_some() {
-                        cx.notify();
-                    }
+                    v.in_pane(id, |v| {
+                        v.panes.cur.halt_tick = None;
+                        v.panes.cur.halt_where = None;
+                        if v.panes.cur.halt_armed.take().is_some() {
+                            cx.notify();
+                        }
+                    })
                 });
             }));
         }
@@ -6279,7 +6638,7 @@ impl AppView {
     /// The naming row's REPLACE offer: only for the session it was made
     /// for (a switch drops it).
     fn replace_offer(&self) -> Option<&crate::model::Replace> {
-        self.model.named.replace.as_ref().filter(|r| self.model.is_active(&r.session_id))
+        self.model.named.replace.as_ref().filter(|r| self.model.lives[self.panes.cur.live].is_active(&r.session_id))
     }
 
     /// The naming row, under the tab strip (F2, the session menu's Rename…,
@@ -6446,6 +6805,20 @@ impl AppView {
     fn render_composer(&self, p: &Palette, m: &Metrics, to_card: bool, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let lay = self.panes.cur.layout;
         let dims = crate::fit::Composer::of(m, lay.form());
+        // Split, the panes along the window's foot end their composers on
+        // one line: the bottom inset is the window's form's (finish gate
+        // #36 M3); its top, rows and card well stay the pane's own.
+        let foot = {
+            let (r, (_, h)) = (self.panes.cur.rect.get(), self.centre.get());
+            self.panes.split() && (r.y + r.h - h).abs() < 0.5
+        };
+        let bottom = if foot {
+            let form = if self.top_short { crate::fit::Form::Short } else { crate::fit::Form::Full };
+            crate::fit::Composer::of(m, form).bottom
+        } else {
+            dims.bottom
+        };
+        let pane_ix = self.panes.cur.id.index();
         let busy = self.model.lives[self.panes.cur.live].transcript.busy();
         // Over a worker's view the composer steers it, or takes nothing
         // once it has finished.
@@ -6549,18 +6922,22 @@ impl AppView {
         let word_w = word.map_or(0., |w| display_w(w, m.meta) + tally.map_or(0., |n| 8. + mono_w(&count(n))));
         let name_w = worker.map_or(0., |w| (mono_w(&w.name).min(24. * cell)) + 8. + mono_w(&w.handle_id));
         let lead_w = if worker.is_some() { main_w + 8. + cell + 8. + m.lead } else { m.lead };
-        let fit = fit_foot(&FootIn {
-            room: lay.column - 2. * m.pad_x,
-            lead: lead_w,
-            word: word_w,
-            name: name_w,
-            model: if lay.tight { 0. } else { model.as_deref().map_or(0., mono_w) },
-            effort: if lay.tight { 0. } else { effort.as_deref().map_or(0., |e| 8. + cell + 8. + mono_w(e)) },
-            hint: hint.as_ref().map_or(0., |(h, _)| mono_w(h)),
-            halt: halt_w,
-            primary: primary_w,
-            tight: lay.tight,
-        });
+        let note = self.composer_note().is_some();
+        let fit = fit_foot_with(
+            &FootIn {
+                room: lay.column - 2. * m.pad_x,
+                lead: lead_w,
+                word: word_w,
+                name: name_w,
+                model: if lay.tight { 0. } else { model.as_deref().map_or(0., mono_w) },
+                effort: if lay.tight { 0. } else { effort.as_deref().map_or(0., |e| 8. + cell + 8. + mono_w(e)) },
+                hint: hint.as_ref().map_or(0., |(h, _)| mono_w(h)),
+                halt: halt_w,
+                primary: primary_w,
+                tight: lay.tight,
+            },
+            note,
+        );
         let send = fbtn("send", primary, can_send, Fill::Btn, p, m)
             .when(worker.is_none(), |d| {
                 d.tooltip(move |window, cx| {
@@ -6605,7 +6982,9 @@ impl AppView {
         let fx = &self.fx;
         // The scope is the session's ([`AppView::motion_session`]).
         let foot_key = worker.map_or(0, |w| (1 << 62) | w.subagent_id);
-        let foot_ch = steady.or(g).and_then(|g| fx.change(crate::motion::Tag::Foot, foot_key, crate::turns::glyph_code(g), None));
+        let foot_ch = steady
+            .or(g)
+            .and_then(|g| fx.col(self.panes.cur.id).change(crate::motion::Tag::Foot, foot_key, crate::turns::glyph_code(g), None));
         let busy_glyph = |c: u64| {
             [glyph::Glyph::Run, glyph::Glyph::Workers, glyph::Glyph::Needs, glyph::Glyph::Cancelling]
                 .iter()
@@ -6796,6 +7175,7 @@ impl AppView {
         column(
             lay,
             v_flex()
+                .debug_selector(move || format!("composer-frame {pane_ix}"))
                 // The frame sits inside the inset (design.md §1.1).
                 .px(px(m.pad_x - 1.))
                 .pt(px(dims.pad_top))
@@ -6808,10 +7188,20 @@ impl AppView {
                     let at = self.panes.cur.composer_top.clone();
                     canvas(move |b, _, _| at.set(f32::from(b.origin.y)), |_, _, _, _| {}).absolute().inset_0()
                 })
-                // The user's bar over the left border.
-                .child(
-                    div().debug_selector(|| "composer-bar".into()).absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(2.)).bg(bar),
-                )
+                // The user's bar over the left border: the focused pane's
+                // composer only (split.md §6: one is lit).
+                .when(!self.panes.split() || self.panes.cur.id == self.panes.focused, |d| {
+                    d.child(
+                        div()
+                            .debug_selector(|| "composer-bar".into())
+                            .absolute()
+                            .left(px(-1.))
+                            .top(px(-1.))
+                            .bottom(px(-1.))
+                            .w(px(2.))
+                            .bg(bar),
+                    )
+                })
                 .children(top_edge.map(|e| div().absolute().left(px(-1.)).right(px(-1.)).top(px(-1.)).h(px(1.)).child(e)))
                 // Handoff in: a 24 px light travels down it.
                 .when(segment < 1., |d| {
@@ -6836,7 +7226,7 @@ impl AppView {
         )
         .flex_none()
         .pt(px(dims.top))
-        .pb(px(dims.bottom))
+        .pb(px(bottom))
     }
 }
 
@@ -7000,8 +7390,8 @@ pub(crate) fn one_line(s: &str, max: usize) -> String {
 
 struct Inputs {
     composer: Entity<TextareaState>,
-    /// The composer's subscription: the pane's ([`Pane::_subs`]).
-    composer_sub: Subscription,
+    /// The composer's subscriptions: the pane's ([`Pane::_subs`]).
+    pane_subs: Vec<Subscription>,
     find_input: Entity<InputState>,
     palette_input: Entity<InputState>,
     name_input: Entity<InputState>,
@@ -7016,23 +7406,340 @@ struct Inputs {
     visible: bool,
 }
 
-impl Render for AppView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        crate::diag::mark("first_render");
-        // Every frame drawn (`SYNAPS_DESKTOP_LOG=debug`): what an idle
-        // window costs is countable.
-        log::debug!(target: "synaps_desktop::frame", "frame");
-        // The frame's clock and level: every animated element samples them.
-        let low_power = self.fx.low_power(cx);
-        self.fx.set_visible(self.visible);
-        self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
-        self.fx.set_scale(window.scale_factor());
+/// A pane's rectangle and the frame's look ([`AppView::pane_main`]).
+#[derive(Clone, Copy)]
+struct PaneFrame {
+    /// Its width, and the width its column wraps at (a panel's flight
+    /// keeps the narrowest, `PanelFx.freeze`).
+    pane: f32,
+    wrap: f32,
+    /// Its width as the panels' flight will land (#33's labels hang as it
+    /// will): its rectangle in the centre the flight ends at.
+    pane_to: f32,
+    /// Its width while a view (Settings, Usage) shows in it.
+    view_pane: f32,
+    /// The window's height as the pane's layout reads it: its own, under
+    /// the top bar.
+    win_h: f32,
+    p: Palette,
+    m: Metrics,
+}
+
+impl AppView {
+    /// One pane's frame (split panes step 3): its layout in its rectangle,
+    /// its tab strip, list, dock and composer, as the pane acted on
+    /// ([`AppView::in_pane`]); with one pane, the whole centre.
+    fn pane_main(&mut self, g: PaneFrame, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let PaneFrame { pane, wrap, pane_to, view_pane, p, m, .. } = g;
+        let view = self.model.tabs.view();
+        self.panes.cur.body_line = m.body_line;
+        self.scroll_frame(list_pad_b(&m));
+        self.column_layer();
+        // The form from what decides it (not the stub or the tray).
+        let ex = crate::fit::Extras { stub: false, tray: 0, ..self.extras() };
+        let lay = Layout::of_in(pane, wrap, g.win_h - crate::chrome::TOP, &m, ex);
+        // The labels hang as the flight's end will, and move with it: this
+        // pane's, by its own width (each pane has its `HangFx`).
+        let (lay, landed) = self.panes.cur.hang_fx.frame(lay, pane, pane_to, self.panel_fx.moving(), &m);
+        if lay.hang_k > 0. && lay.hang_k < 1. {
+            // On their way, the labels are placed by their widths.
+            for l in [fonts::label::YOU, fonts::label::AGENT, fonts::label::SYNAPS] {
+                self.display_w(l, m.label, window);
+            }
+        }
+        if landed || lay.tight != self.panes.cur.layout.tight {
+            self.panes.cur.list.remeasure();
+            self.panes.cur.metrics_gen = self.panes.next_gen();
+            // A room held at the end is read again against the list as
+            // measured again, as a card's that lands ([`Slack::fresh`]): the
+            // rows' new heights are not rows growing in under it (else the
+            // remeasure's sums used it up, and the column fell by it as the
+            // flight landed).
+            if let Some(mut s) = self.panes.cur.fold_slack.get().filter(|s| s.gone.is_none() && s.fresh.is_none()) {
+                s.fresh = Some(self.fx.frame());
+                self.panes.cur.fold_slack.set(Some(s));
+            }
+        }
+        // A new column re-wraps the rows: this frame's scrollbar would read
+        // the rows not yet measured at their estimates (it is held as it
+        // was, `Bar::still`). One more frame draws it from their heights,
+        // at every level (a fold at Off draws one frame, and its bar would
+        // keep the estimate until the next change).
+        let rewrap = lay.column != self.panes.cur.layout.column;
+        if rewrap {
+            window.request_animation_frame();
+        }
+        // Short or not: the list's top edge moves by what the bars above it
+        // gain or lose, and the rows keep their place on screen; after a
+        // remeasure too (a maximize crosses the hang width and the short
+        // height at once: the two scrolls compose). The naming row counts
+        // as each layout had it: it can open or close in the frame its room
+        // flips the form. Under Settings or Usage too: the session's list
+        // is back where it was when its tab is.
+        if lay.form() != self.panes.cur.layout.form() {
+            // Split, the top bar is the window's (M1): a pane's own form
+            // moves its naming row only.
+            let split = self.panes.split();
+            let above = |l: Layout, naming: bool| above_list(l, naming) - if split { crate::chrome::top_h(l.short) } else { 0. };
+            let shift = above(lay, ex.naming) - above(self.panes.cur.layout, self.panes.cur.layout_naming);
+            self.keep_rows(shift, (lay.form() as u8) > (self.panes.cur.layout.form() as u8));
+        }
+        self.panes.cur.layout = lay;
+        self.panes.cur.layout_naming = ex.naming;
+        // The tray takes what is left over the card's least well and a
+        // one-line composer; the composer grows only into room the card's
+        // smallest form and the tray leave.
+        // The card is in the log (polish.md §2.6): the dock holds none.
+        let card_shown = false;
+        let ex = crate::fit::Extras { stub: self.stub_shown(), ..ex };
+        // The worker chips: the lines they need in the column, then how
+        // many the room leaves. A chip fading out keeps its slot until its
+        // fade is over.
+        // The 3-line rule counts the chips fading out too: 5 workers going
+        // to 4 keep their lines until the fifth's fade is over, so no
+        // `+1 more` blinks in for it (Shady #16 r4).
+        let (form, height, workers) = (lay.form(), g.win_h, self.tray.rows.len() + self.tray.ghosts.len());
+        self.tray_rows = if view.is_none() {
+            self.fit_chips(lay.column, &m, |needed| crate::fit::chip_lines(&m, form, height, card_shown, ex, workers, needed))
+        } else {
+            self.pack_chips(Vec::new(), lay.column, 0, &m);
+            0
+        };
+        // A keyboard menu over a row no longer drawn closes; a workers menu
+        // left empty leaves. Either way the next frame gives focus back.
+        let menus = (self.menu.is_some(), self.wmenu.is_some());
+        self.close_orphan_menu();
+        if menus != (self.menu.is_some(), self.wmenu.is_some()) {
+            window.request_animation_frame();
+        }
+        let ex = crate::fit::Extras { tray: self.tray_rows as u8, ..ex };
+        let rows = crate::fit::composer_rows(&m, lay.form(), g.win_h, card_shown, ex);
+        if rows != self.panes.cur.composer_rows {
+            self.panes.cur.composer_rows = rows;
+            self.panes.cur.composer.update(cx, |s, cx| s.set_auto_grow(1, rows, cx));
+        }
+        let tabs = self.render_tabs(if view.is_some() { view_pane } else { pane }, &p, cx);
+        // A worker's view on screen asks for its next page; under Settings
+        // or Usage, nothing. Whether its list is scrolled back (its oldest
+        // rows stay while they may be read).
+        if self.model.lives[self.panes.cur.live].watch.focus().is_some() {
+            self.model.lives[self.panes.cur.live].watch.scrolled_back = !self.panes.cur.list.is_following_tail();
+        }
+        if self.panes.cur.attach_wait.is_some() && self.panes.cur.attach_due.is_none() {
+            self.arm_attach(cx);
+        }
+        let (pad_l, pad_r) = lay.padding();
+        // Nothing over the list but the tab strip: the first row's own gap
+        // (20·r) is the transcript's top edge (design.md §8.14).
+        // No top padding: the sticky labels read rows' bounds, which leave
+        // it out (`crate::sticky`).
+        let (pad_t, pad_b) = (0., list_pad_b(&m));
+        // Read here: the list's own state is borrowed while it lays out.
+        let gaps = self.fold_gap_now();
+        let slack = self.tail_slack();
+        let geo = crate::cards::Geo::of(&m);
+        self.panes.cur.metrics_last.set(Some(m));
+        let id = self.panes.cur.id;
+        let list = list(
+            self.panes.cur.list.clone(),
+            cx.processor(move |this, ix, _window, cx| {
+                this.in_pane(id, |this| this.pane_row(ix, &gaps, slack, geo, cx)).unwrap_or_else(|| div().into_any_element())
+            }),
+        )
+        .size_full()
+        .pl(px(pad_l))
+        .pr(px(pad_r))
+        .pt(px(pad_t))
+        .pb(px(pad_b));
+        self.panes.cur.texts.borrow_mut().frame(lay.column, &m);
+        self.hint_rows(&m);
+        self.hold_unfold();
+        // After the list's layout: rows it has no height for get their hint
+        // in the next frame's [`AppView::hint_rows`], so one is drawn (once:
+        // hinted, every row has a height). Else, a load's last frame left the
+        // thumb its unhinted length until something else drew.
+        let hint_frame = self.panes.cur.list.is_scrolled_to_end().is_none().then(|| {
+            let (l, n) = (self.panes.cur.list.clone(), self.panes.cur.disp.len());
+            canvas(
+                move |_, window, _| {
+                    if wants_hint(&l, n) {
+                        window.request_animation_frame();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0()
+        });
+        // After the list's layout: arrivals it laid out in its overdraw (off
+        // screen, never painted) were drawn 0 px tall, and GPUI keeps that
+        // height. They come back at their own, measured again next frame
+        // (Shady M1): the scrollbar, the end and a wheel to it stay true.
+        let unpainted = self.fx.fluid().then(|| {
+            let (l, fx, id) = (self.panes.cur.list.clone(), self.fx.clone(), self.panes.cur.id);
+            canvas(
+                move |_, window, _| {
+                    let rows = fx.col(id).unpainted();
+                    for ix in &rows {
+                        l.remeasure_items(*ix..*ix + 1);
+                    }
+                    if !rows.is_empty() {
+                        window.request_animation_frame();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0()
+        });
+        // Over the list's right padding, after its layout (and the hold-back's).
+        let layer = self.layer_now();
+        let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.panes.cur.scroller.clone(), self.fx.clone()));
+        // Held while an edge is dragged and as it springs to a detent after,
+        // and in the frame a new column re-wraps the rows (on their
+        // estimates): the next frame draws it from their heights (the
+        // gate's S3 and S6, and the landing's frame).
+        self.springback &= self.panel_fx.moving();
+        let transcript_bar = crate::scrollbar::rows_gliding(&self.panes.cur.list, pad_t + pad_b, &self.bars.transcript, glide)
+            .always()
+            .still(self.drag.is_some() || self.springback || rewrap);
+        // After the list's layout ([`AppView::keep_rows`]): a view grown to
+        // the end of a scrolled-back list set it following; it stops 2 px
+        // short of the end instead, still scrolled back. Built only on the
+        // frames that need it; a layout with a reply's parse pending may be
+        // provisional (GPUI re-arms following only on a real one), so the
+        // hold lasts until GPUI re-arms or a layout has nothing pending
+        // ([`held_back`]).
+        // After the list's layout: an answered card's room that landed this
+        // frame begins its hold ([`land_card_room`]).
+        let landing = self.panes.cur.fold_slack.get().is_some_and(|s| s.fresh.is_some()).then(|| {
+            let (l, slack) = (self.panes.cur.list.clone(), self.panes.cur.fold_slack.clone());
+            canvas(move |_, _, _| land_card_room(&l, &slack), |_, _, _, _| {}).absolute().size_0()
+        });
+        let hold_back = self.panes.cur.hold_back.get().then(|| {
+            let (held, hold, texts) = (self.panes.cur.list.clone(), self.panes.cur.hold_back.clone(), self.panes.cur.texts.clone());
+            canvas(
+                move |_, window, _| {
+                    if held_back(&hold, texts.borrow().pending(), held.is_following_tail()) {
+                        held.pause_following_tail();
+                        held.scroll_by(px(-2.));
+                        window.request_animation_frame();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0()
+        });
+        // A view draws in its own cached pane: this frame (a session
+        // streaming behind it) reuses its last paint.
+        let shown_view = view.filter(|k| *k != crate::tabs::Kind::Session).map(|k| {
+            self.view_width = view_pane;
+            AnyView::from(self.pane(k).clone()).cached(StyleRefinement::default().size_full())
+        });
+        let session = shown_view.is_none();
+        // As elements now (they borrow nothing after this).
+        let stub = session.then(|| self.render_stub(&p, &m, cx).map(IntoElement::into_any_element)).flatten();
+        let lead = stub.is_some().then_some(p.warn_mark);
+        let notice = session.then(|| self.render_notice(&p, &m).map(IntoElement::into_any_element)).flatten();
+        let tray = session.then(|| self.render_tray(&p, &m, cx).map(IntoElement::into_any_element)).flatten();
+        let dock = session.then(|| self.dock([stub, notice, tray].into_iter().flatten().collect(), lead)).flatten();
+        let over = dock.is_some().then(|| self.panes.cur.over_composer.clone());
+        if over.is_none() {
+            self.panes.cur.over_composer.set(f32::INFINITY);
+        }
+        if let Some(v) = shown_view {
+            v_flex().flex_1().h_full().min_w_0().bg(p.canvas).child(tabs).child(div().flex_1().min_h_0().child(v))
+        } else {
+            v_flex()
+                .flex_1()
+                .h_full()
+                .min_w_0()
+                .bg(p.canvas)
+                .child(tabs)
+                // The naming row is the focused pane's (one name field).
+                .when(
+                    self.model.named.naming
+                        && self.panes.cur.id == self.panes.focused
+                        && self.model.lives[self.panes.cur.live].active.is_some(),
+                    |d| d.child(self.render_naming(&p, cx)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .relative()
+                        .when_some(layer, |d, (x, y, k)| crate::motion::lift(d.left(px(x)).top(px(y)), k))
+                        .child(list)
+                        // Right after the list's layout, reading it as it
+                        // paints: the top message's label pinned (P15).
+                        .child(crate::sticky::layer(
+                            self.fx.clone(),
+                            cx.processor(move |this, b: Bounds<Pixels>, _, cx| {
+                                this.in_pane(id, |this| this.sticky_label(b, cx)).unwrap_or_default()
+                            }),
+                        ))
+                        .children(crate::motion::probe(&self.fx, "sticky"))
+                        .child(crate::scroll::owner(self.panes.cur.scroller.clone(), self.fx.clone()))
+                        .children(unpainted)
+                        .children(hint_frame)
+                        .children(landing)
+                        .children(hold_back)
+                        .child(transcript_bar),
+                )
+                // The top of what is drawn over the composer (the stub, a
+                // notice, the chips), as laid out: the palette ends above it.
+                .when_some(over, |d, at| d.child(canvas(move |b, _, _| at.set(f32::from(b.origin.y)), |_, _, _, _| {}).w_full().h(px(0.))))
+                // The card off screen (scrolled away, or a worker's view):
+                // NEEDS YOU, folded, over the chips.
+                .children(dock)
+                .children(crate::motion::probe(&self.fx, "composer"))
+                .child(self.render_composer(
+                    &p,
+                    &m,
+                    self.card_up() && self.panes.cur.composer.read(cx).focus_handle(cx).is_focused(window),
+                    window,
+                    cx,
+                ))
+        }
+    }
+
+    /// Row `ix` of the pane acted on's list, with a folding run's room under
+    /// its summary and the room an answered card gave up under the last.
+    fn pane_row(&mut self, ix: usize, gaps: &[(FoldGap, f32)], slack: f32, geo: crate::cards::Geo, cx: &mut Context<Self>) -> AnyElement {
+        let this = self;
+        let row = this.render_disp(ix, cx);
+        let mut el = this.arrive(ix, row);
+        // A folding run's room, under its summary (N1): its card goes
+        // on, its bottom edge riding up over the rows it had.
+        if let Some((g, h)) =
+            gaps.iter().find(|g| this.panes.cur.disp.get(ix).is_some_and(|d| d.id == g.0.id && matches!(d.kind, Kind::Summary { .. })))
+        {
+            let rows = this.fold_rows(&g.rows, cx);
+            let inner = div().w_full().h(px(*h)).overflow_hidden().child(v_flex().w_full().mt(px(g.inner)).children(rows));
+            let p = theme::palette(cx);
+            let room = crate::cards::slab(false, true, inner, &p, geo).h(px(*h + geo.inset + 1.)).debug_selector(|| "fold-gap".into());
+            el = div().w_full().child(el).child(room).into_any_element();
+        }
+        // The room an answered card gave up, under the last row.
+        match Some(slack).filter(|s| *s > 0. && ix + 1 == this.panes.cur.disp.len()) {
+            // Whole pixels: the slack is a row's height too.
+            Some(s) => div().w_full().child(el).child(div().h(px(s.round())).debug_selector(|| "fold-slack".into())).into_any_element(),
+            None => el,
+        }
+    }
+
+    /// One pane's state brought to this frame (split panes step 3), before
+    /// the window's: its motion scope, composer, card, list and tray.
+    fn pane_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (session, column) = (self.motion_session(), self.motion_column());
         self.fx.col(self.panes.cur.id).rescope(session, column);
         // The chrome's motion is rescoped with the session on screen, as it
         // was in pane 0's column: it clears on a switch as on main (Shady
         // #30 M2; "never clear" is a deliberate non-change, #31).
-        self.fx.chrome().rescope(session, column);
+        if self.panes.cur.id == self.panes.focused {
+            self.fx.chrome().rescope(session, column);
+        }
         // Another session, or a worker's view in or out: its dock and draft
         // are drawn at their heights (a switch replays nothing).
         let scope = self.motion_session() ^ self.motion_column().rotate_left(17);
@@ -7061,6 +7768,11 @@ impl Render for AppView {
             && self.wmenu.is_none()
             && let Some(h) = self.menu_focus_back.take()
             && self.focus.is_focused(window)
+            // Never into another pane's input (Shady #36 r2 L-d): a click
+            // in pane B closed A's menu and marked B; giving A's composer
+            // back pulled the mark back to A (a secret field: the keys in
+            // A's, B marked). The keys follow the mark (`apply_keys`).
+            && self.input_pane(&h, cx).is_none_or(|p| p == self.panes.focused)
         {
             window.focus(&h, cx);
         }
@@ -7068,10 +7780,13 @@ impl Render for AppView {
             self.disarm_halt();
         }
         self.sync_composer(window, cx);
-        self.refresh_palette(window, cx);
-        if std::mem::take(&mut self.model.named.opened) {
-            self.find_input.update(cx, |s, cx| s.set_value("", window, cx));
-            self.find.clear();
+        let focused = self.panes.cur.id == self.panes.focused;
+        if focused {
+            self.refresh_palette(window, cx);
+            if std::mem::take(&mut self.model.named.opened) {
+                self.find_input.update(cx, |s, cx| s.set_value("", window, cx));
+                self.find.clear();
+            }
         }
         // The card first: its row in the list is its state's.
         self.read_list_view();
@@ -7083,7 +7798,9 @@ impl Render for AppView {
         {
             self.panes.cur.stub_away = None;
         }
-        self.panes.cur.card_keys.set(self.card_keys_live(window, cx));
+        // An unfocused pane's card is click-only (split.md §7): its keys
+        // are never live, whatever has the window's focus.
+        self.panes.cur.card_keys.set(if focused { self.card_keys_live(window, cx) } else { None });
         // Ctrl+J from a worker's view: the card once its row is built (that
         // card only: another, or none, drops it).
         if self.panes.cur.jump_card.is_some() && self.panes.cur.jump_card != self.model.lives[self.panes.cur.live].card_key() {
@@ -7106,11 +7823,114 @@ impl Render for AppView {
         self.panes.cur.card_at = self.model.lives[self.panes.cur.live]
             .active
             .as_ref()
-            .and_then(|_| self.fx.change(crate::motion::Tag::Card, 0, prompt_key, None))
+            .and_then(|_| self.fx.col(self.panes.cur.id).change(crate::motion::Tag::Card, 0, prompt_key, None))
             .filter(|_| prompt_key != 0)
             .map(|(at, _)| at);
         self.sync_tray(cx);
-        self.rename_when_shown(window, cx);
+        if focused {
+            self.rename_when_shown(window, cx);
+        }
+    }
+
+    /// The split centre (split.md §4): the tree's panes in their
+    /// rectangles, a 1 px `hair` rule between kids. A mouse-down anywhere
+    /// in a pane focuses it, first (a capture: the click still acts).
+    fn lay_panes(
+        &self,
+        node: &crate::split::Node,
+        rects: &[(PaneId, crate::split::Rect)],
+        mains: &mut Vec<(PaneId, Div)>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::split::{Axis, DIVIDER, Node};
+        match node {
+            Node::Leaf(id) => {
+                let r = rects.iter().find(|(i, _)| i == id).map_or(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }, |(_, r)| *r);
+                let el = mains.iter().position(|(i, _)| i == id).map(|i| mains.remove(i).1);
+                let id = *id;
+                self.probe(h_flex(), "pane")
+                    .flex_none()
+                    .w(px(r.w))
+                    .h(px(r.h))
+                    .overflow_hidden()
+                    .debug_selector(move || format!("pane {}", id.index()))
+                    // A click's own target keeps the keys (Shady #36 H2).
+                    .capture_any_mouse_down(
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| this.focus_pane(id, crate::pane::KeysTo::Follow, cx)),
+                    )
+                    .children(el)
+                    .into_any_element()
+            }
+            Node::Split { axis, kids, .. } => {
+                // Its box: its panes' (finish gate #36 M2: a row with no
+                // height left its divider none, and the seam showed the
+                // chrome). Every divider is the 1 px `hair` across it.
+                let (w, h) = span(node, rects);
+                let ax = *axis;
+                let mut els = Vec::new();
+                for (i, k) in kids.iter().enumerate() {
+                    if i > 0 {
+                        els.push(
+                            match axis {
+                                Axis::Row => div().flex_none().w(px(DIVIDER)).h(px(h)).bg(p.hair),
+                                Axis::Column => div().flex_none().h(px(DIVIDER)).w(px(w)).bg(p.hair),
+                            }
+                            .debug_selector(move || format!("pane-divider {ax:?}"))
+                            .into_any_element(),
+                        );
+                    }
+                    els.push(self.lay_panes(k, rects, mains, p, cx));
+                }
+                match axis {
+                    Axis::Row => h_flex().flex_none().items_start().w(px(w)).h(px(h)).children(els).into_any_element(),
+                    Axis::Column => v_flex().flex_none().w(px(w)).h(px(h)).children(els).into_any_element(),
+                }
+            }
+        }
+    }
+}
+
+/// A split's box: the rectangle round its panes' (`rects`).
+fn span(node: &crate::split::Node, rects: &[(PaneId, crate::split::Rect)]) -> (f32, f32) {
+    let ids = node.leaves();
+    let mine = rects.iter().filter(|(i, _)| ids.contains(i)).map(|(_, r)| *r);
+    let (x0, y0, x1, y1) =
+        mine.fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |(a, b, c, d), r| (a.min(r.x), b.min(r.y), c.max(r.x + r.w), d.max(r.y + r.h)));
+    ((x1 - x0).max(0.), (y1 - y0).max(0.))
+}
+
+impl Render for AppView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::diag::mark("first_render");
+        // Every frame drawn (`SYNAPS_DESKTOP_LOG=debug`): what an idle
+        // window costs is countable.
+        log::debug!(target: "synaps_desktop::frame", "frame");
+        // The frame's clock and level: every animated element samples them.
+        let low_power = self.fx.low_power(cx);
+        self.fx.set_visible(self.visible);
+        self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
+        self.fx.set_scale(window.scale_factor());
+        self.apply_keys(window, cx);
+        if std::mem::take(&mut self.keys_rearm) {
+            let focused = self.panes.focused;
+            self.in_pane(focused, |v| v.restart_card_keys(cx));
+        }
+        if self.pane_script.is_some()
+            && self.split_on()
+            && self.model.lives[self.panes.cur.live].active.is_some()
+            && let Some(how) = self.pane_script.take()
+        {
+            let me = cx.entity();
+            crate::pane::pane_script(&me, how, window, cx);
+        }
+        // Every pane's state first: the focused one's, then the others'
+        // (each as the pane acted on).
+        self.pane_sync(window, cx);
+        let focused = self.panes.focused;
+        for id in self.panes.ids().into_iter().filter(|i| *i != focused) {
+            self.in_pane(id, |v| v.pane_sync(window, cx));
+        }
         // A reorder waits while a rail row is held (motion.md §6.4): a row
         // never moves away from a click. Its release draws.
         self.refresh_rail();
@@ -7189,9 +8009,6 @@ impl Render for AppView {
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
         self.fx.set_ink(p.ink);
-        self.panes.cur.body_line = m.body_line;
-        self.scroll_frame(list_pad_b(&m));
-        self.column_layer();
         // Settings or Usage came on screen (or one closed): after this
         // frame, never inside it, what it shows is asked for if stale.
         let view = self.model.tabs.view();
@@ -7232,18 +8049,25 @@ impl Render for AppView {
         // L5: the card's read gate and AUTHORIZE are drawn from the last
         // frame's bounds: after a resize, one more frame draws them from
         // this one's.
-        if height != self.height && self.panes.cur.card.is_some() {
+        if height != self.height && self.panes.iter().any(|p| p.card.is_some()) {
             window.request_animation_frame();
         }
         // A window resize is the window manager's (fluid.md §3.8, `follow`):
         // the dock and the draft take the heights it gives them at once, as
         // after a switch.
         if (width, height) != (self.width, self.height) {
-            self.panes.cur.dock_h.set(f32::NAN);
-            self.panes.cur.composer_h.set(f32::NAN);
+            for pane in self.panes.iter() {
+                pane.dock_h.set(f32::NAN);
+                pane.composer_h.set(f32::NAN);
+            }
         }
         self.width = width;
         self.height = height;
+        // The bar's form from this frame's height, never the last frame's
+        // (finish gate #36 R1: a launch drew its first frame at height 0,
+        // the short bar, then jumped 12 px; a resize across the threshold
+        // drew the old bar).
+        self.top_short = self.height - crate::chrome::TOP < crate::fit::short_below(&m);
         let (rail, right) = sides(self.width, self.panels, crate::chrome::MARK);
         if let Side::Open(w) = rail {
             self.rail_width = w;
@@ -7292,297 +8116,78 @@ impl Render for AppView {
                 self.find_input.update(cx, |s, cx| s.set_placeholder(text, window, cx));
             }
         }
-        // The form from what decides it (not the stub or the tray).
-        let ex = crate::fit::Extras { stub: false, tray: 0, ..self.extras() };
-        let lay = Layout::of_in(pane, wrap, self.height - crate::chrome::TOP, &m, ex);
-        // The labels hang as the flight's end will, and move with it.
-        let (lay, landed) = self.panes.cur.hang_fx.frame(lay, pane, pane_to, self.panel_fx.moving(), &m);
-        if lay.hang_k > 0. && lay.hang_k < 1. {
-            // On their way, the labels are placed by their widths.
-            for l in [fonts::label::YOU, fonts::label::AGENT, fonts::label::SYNAPS] {
-                self.display_w(l, m.label, window);
+        // The centre, split (split.md §4): each pane in its rectangle, a
+        // 1 px rule between; with one pane, all of it, as before.
+        let centre = if view.is_some() && !self.panes.split() { view_pane } else { pane };
+        // Under the bar drawn (M1: the panes reach the window's foot).
+        let centre_h = self.height - crate::chrome::top_h(self.top_short);
+        self.centre.set((centre, centre_h));
+        let main = if self.panes.split() {
+            let rects = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
+            // Each pane's width as the panels' flight lands, and the width
+            // its column wraps at while they fly: its rectangle in the
+            // centre at `pane_to`, and at the flight's narrowest (`wrap`).
+            // The tree's own rounding: a landed pane reads the width it is
+            // drawn at, and a flying one's wrap holds still (scaled by the
+            // centre's, `r.w * wrap / pane` went a pixel either way as its
+            // rounded width and the centre's fraction moved, and each step
+            // measured the list again).
+            let at = |w: f32| self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h: centre_h });
+            let (rects_to, rects_wrap) = (at(pane_to), at(wrap));
+            let mut mains = Vec::new();
+            for (id, r) in &rects {
+                let of = |rs: &[(PaneId, crate::split::Rect)]| rs.iter().find(|(i, _)| i == id).map_or(r.w, |(_, t)| t.w);
+                let g = PaneFrame {
+                    pane: r.w,
+                    wrap: of(&rects_wrap).min(r.w),
+                    pane_to: of(&rects_to),
+                    view_pane: r.w,
+                    win_h: r.h + crate::chrome::TOP,
+                    p,
+                    m,
+                };
+                if let Some(el) = self.in_pane(*id, |v| {
+                    v.panes.cur.rect.set(*r);
+                    v.pane_main(g, window, cx)
+                }) {
+                    mains.push((*id, el));
+                }
             }
-        }
-        if landed || lay.tight != self.panes.cur.layout.tight {
-            self.panes.cur.list.remeasure();
-            self.panes.cur.metrics_gen = self.panes.next_gen();
-            // A room held at the end is read again against the list as
-            // measured again, as a card's that lands ([`Slack::fresh`]): the
-            // rows' new heights are not rows growing in under it (else the
-            // remeasure's sums used it up, and the column fell by it as the
-            // flight landed).
-            if let Some(mut s) = self.panes.cur.fold_slack.get().filter(|s| s.gone.is_none() && s.fresh.is_none()) {
-                s.fresh = Some(self.fx.frame());
-                self.panes.cur.fold_slack.set(Some(s));
-            }
-        }
-        // A new column re-wraps the rows: this frame's scrollbar would read
-        // the rows not yet measured at their estimates (it is held as it
-        // was, `Bar::still`). One more frame draws it from their heights,
-        // at every level (a fold at Off draws one frame, and its bar would
-        // keep the estimate until the next change).
-        let rewrap = lay.column != self.panes.cur.layout.column;
-        if rewrap {
-            window.request_animation_frame();
-        }
-        // Short or not: the list's top edge moves by what the bars above it
-        // gain or lose, and the rows keep their place on screen; after a
-        // remeasure too (a maximize crosses the hang width and the short
-        // height at once: the two scrolls compose). The naming row counts
-        // as each layout had it: it can open or close in the frame its room
-        // flips the form. Under Settings or Usage too: the session's list
-        // is back where it was when its tab is.
-        if lay.form() != self.panes.cur.layout.form() {
-            let shift = above_list(lay, ex.naming) - above_list(self.panes.cur.layout, self.panes.cur.layout_naming);
-            self.keep_rows(shift, (lay.form() as u8) > (self.panes.cur.layout.form() as u8));
-        }
-        self.panes.cur.layout = lay;
-        self.panes.cur.layout_naming = ex.naming;
-        // The tray takes what is left over the card's least well and a
-        // one-line composer; the composer grows only into room the card's
-        // smallest form and the tray leave.
-        // The card is in the log (polish.md §2.6): the dock holds none.
-        let card_shown = false;
-        let ex = crate::fit::Extras { stub: self.stub_shown(), ..ex };
-        // The worker chips: the lines they need in the column, then how
-        // many the room leaves. A chip fading out keeps its slot until its
-        // fade is over.
-        // The 3-line rule counts the chips fading out too: 5 workers going
-        // to 4 keep their lines until the fifth's fade is over, so no
-        // `+1 more` blinks in for it (Shady #16 r4).
-        let (form, height, workers) = (lay.form(), self.height, self.tray.rows.len() + self.tray.ghosts.len());
-        self.tray_rows = if view.is_none() {
-            self.fit_chips(lay.column, &m, |needed| crate::fit::chip_lines(&m, form, height, card_shown, ex, workers, needed))
+            div().flex_1().h_full().min_w_0().child(self.lay_panes(&self.panes.tree.clone(), &rects, &mut mains, &p, cx))
         } else {
-            self.pack_chips(Vec::new(), lay.column, 0, &m);
-            0
+            let g = PaneFrame { pane, wrap, pane_to, view_pane, win_h: self.height, p, m };
+            self.panes.cur.rect.set(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
+            self.pane_main(g, window, cx)
         };
-        // A keyboard menu over a row no longer drawn closes; a workers menu
-        // left empty leaves. Either way the next frame gives focus back.
-        let menus = (self.menu.is_some(), self.wmenu.is_some());
-        self.close_orphan_menu();
-        if menus != (self.menu.is_some(), self.wmenu.is_some()) {
-            window.request_animation_frame();
-        }
-        let ex = crate::fit::Extras { tray: self.tray_rows as u8, ..ex };
-        let rows = crate::fit::composer_rows(&m, lay.form(), self.height, card_shown, ex);
-        if rows != self.panes.cur.composer_rows {
-            self.panes.cur.composer_rows = rows;
-            self.panes.cur.composer.update(cx, |s, cx| s.set_auto_grow(1, rows, cx));
-        }
-        let tabs = self.render_tabs(if view.is_some() { view_pane } else { pane }, &p, cx);
         self.schedule_tabs_save(cx);
         self.schedule_favs_save(cx);
-        // A worker's view on screen asks for its next page; under Settings
-        // or Usage, nothing. Whether its list is scrolled back (its oldest
-        // rows stay while they may be read).
-        if self.model.lives[self.panes.cur.live].watch.focus().is_some() {
-            self.model.lives[self.panes.cur.live].watch.scrolled_back = !self.panes.cur.list.is_following_tail();
-        }
         self.arm_watch_poll(cx);
-        if self.panes.cur.attach_wait.is_some() && self.panes.cur.attach_due.is_none() {
-            self.arm_attach(cx);
-        }
-        let (pad_l, pad_r) = lay.padding();
-        // Nothing over the list but the tab strip: the first row's own gap
-        // (20·r) is the transcript's top edge (design.md §8.14).
-        // No top padding: the sticky labels read rows' bounds, which leave
-        // it out (`crate::sticky`).
-        let (pad_t, pad_b) = (0., list_pad_b(&m));
-        // Read here: the list's own state is borrowed while it lays out.
-        let gaps = self.fold_gap_now();
-        let slack = self.tail_slack();
-        let geo = crate::cards::Geo::of(&m);
-        self.panes.cur.metrics_last.set(Some(m));
-        let list = list(
-            self.panes.cur.list.clone(),
-            cx.processor(move |this, ix, _window, cx| {
-                let row = this.render_disp(ix, cx);
-                let mut el = this.arrive(ix, row);
-                // A folding run's room, under its summary (N1): its card goes
-                // on, its bottom edge riding up over the rows it had.
-                if let Some((g, h)) = gaps
-                    .iter()
-                    .find(|g| this.panes.cur.disp.get(ix).is_some_and(|d| d.id == g.0.id && matches!(d.kind, Kind::Summary { .. })))
-                {
-                    let rows = this.fold_rows(&g.rows, cx);
-                    let inner = div().w_full().h(px(*h)).overflow_hidden().child(v_flex().w_full().mt(px(g.inner)).children(rows));
-                    let p = theme::palette(cx);
-                    let room =
-                        crate::cards::slab(false, true, inner, &p, geo).h(px(*h + geo.inset + 1.)).debug_selector(|| "fold-gap".into());
-                    el = div().w_full().child(el).child(room).into_any_element();
-                }
-                // The room an answered card gave up, under the last row.
-                match Some(slack).filter(|s| *s > 0. && ix + 1 == this.panes.cur.disp.len()) {
-                    // Whole pixels: the slack is a row's height too.
-                    Some(s) => {
-                        div().w_full().child(el).child(div().h(px(s.round())).debug_selector(|| "fold-slack".into())).into_any_element()
-                    }
-                    None => el,
-                }
-            }),
-        )
-        .size_full()
-        .pl(px(pad_l))
-        .pr(px(pad_r))
-        .pt(px(pad_t))
-        .pb(px(pad_b));
-        self.panes.cur.texts.borrow_mut().frame(lay.column, &m);
-        self.hint_rows(&m);
-        self.hold_unfold();
-        // After the list's layout: rows it has no height for get their hint
-        // in the next frame's [`AppView::hint_rows`], so one is drawn (once:
-        // hinted, every row has a height). Else, a load's last frame left the
-        // thumb its unhinted length until something else drew.
-        let hint_frame = self.panes.cur.list.is_scrolled_to_end().is_none().then(|| {
-            let (l, n) = (self.panes.cur.list.clone(), self.panes.cur.disp.len());
-            canvas(
-                move |_, window, _| {
-                    if wants_hint(&l, n) {
-                        window.request_animation_frame();
-                    }
-                },
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .size_0()
-        });
-        // After the list's layout: arrivals it laid out in its overdraw (off
-        // screen, never painted) were drawn 0 px tall, and GPUI keeps that
-        // height. They come back at their own, measured again next frame
-        // (Shady M1): the scrollbar, the end and a wheel to it stay true.
-        let unpainted = self.fx.fluid().then(|| {
-            let (l, fx) = (self.panes.cur.list.clone(), self.fx.clone());
-            canvas(
-                move |_, window, _| {
-                    let rows = fx.unpainted();
-                    for ix in &rows {
-                        l.remeasure_items(*ix..*ix + 1);
-                    }
-                    if !rows.is_empty() {
-                        window.request_animation_frame();
-                    }
-                },
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .size_0()
-        });
-        // Over the list's right padding, after its layout (and the hold-back's).
-        let layer = self.layer_now();
-        let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.panes.cur.scroller.clone(), self.fx.clone()));
-        // Held while an edge is dragged and as it springs to a detent after,
-        // and in the frame a new column re-wraps the rows (on their
-        // estimates): the next frame draws it from their heights (the
-        // gate's S3 and S6, and the landing's frame).
-        self.springback &= self.panel_fx.moving();
-        let transcript_bar = crate::scrollbar::rows_gliding(&self.panes.cur.list, pad_t + pad_b, &self.bars.transcript, glide)
-            .always()
-            .still(self.drag.is_some() || self.springback || rewrap);
-        // After the list's layout ([`AppView::keep_rows`]): a view grown to
-        // the end of a scrolled-back list set it following; it stops 2 px
-        // short of the end instead, still scrolled back. Built only on the
-        // frames that need it; a layout with a reply's parse pending may be
-        // provisional (GPUI re-arms following only on a real one), so the
-        // hold lasts until GPUI re-arms or a layout has nothing pending
-        // ([`held_back`]).
-        // After the list's layout: an answered card's room that landed this
-        // frame begins its hold ([`land_card_room`]).
-        let landing = self.panes.cur.fold_slack.get().is_some_and(|s| s.fresh.is_some()).then(|| {
-            let (l, slack) = (self.panes.cur.list.clone(), self.panes.cur.fold_slack.clone());
-            canvas(move |_, _, _| land_card_room(&l, &slack), |_, _, _, _| {}).absolute().size_0()
-        });
-        let hold_back = self.panes.cur.hold_back.get().then(|| {
-            let (held, hold, texts) = (self.panes.cur.list.clone(), self.panes.cur.hold_back.clone(), self.panes.cur.texts.clone());
-            canvas(
-                move |_, window, _| {
-                    if held_back(&hold, texts.borrow().pending(), held.is_following_tail()) {
-                        held.pause_following_tail();
-                        held.scroll_by(px(-2.));
-                        window.request_animation_frame();
-                    }
-                },
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .size_0()
-        });
-        // A view draws in its own cached pane: this frame (a session
-        // streaming behind it) reuses its last paint.
-        let shown_view = view.filter(|k| *k != crate::tabs::Kind::Session).map(|k| {
-            self.view_width = view_pane;
-            AnyView::from(self.pane(k).clone()).cached(StyleRefinement::default().size_full())
-        });
-        let session = shown_view.is_none();
-        // As elements now (they borrow nothing after this).
-        let stub = session.then(|| self.render_stub(&p, &m, cx).map(IntoElement::into_any_element)).flatten();
-        let lead = stub.is_some().then_some(p.warn_mark);
-        let notice = session.then(|| self.render_notice(&p, &m).map(IntoElement::into_any_element)).flatten();
-        let tray = session.then(|| self.render_tray(&p, &m, cx).map(IntoElement::into_any_element)).flatten();
-        let dock = session.then(|| self.dock([stub, notice, tray].into_iter().flatten().collect(), lead)).flatten();
-        let over = dock.is_some().then(|| self.panes.cur.over_composer.clone());
-        if over.is_none() {
-            self.panes.cur.over_composer.set(f32::INFINITY);
-        }
-        let main = if let Some(v) = shown_view {
-            v_flex().flex_1().h_full().min_w_0().bg(p.canvas).child(tabs).child(div().flex_1().min_h_0().child(v))
-        } else {
-            v_flex()
-                .flex_1()
-                .h_full()
-                .min_w_0()
-                .bg(p.canvas)
-                .child(tabs)
-                .when(self.model.named.naming && self.model.lives[self.panes.cur.live].active.is_some(), |d| {
-                    d.child(self.render_naming(&p, cx))
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .relative()
-                        .when_some(layer, |d, (x, y, k)| crate::motion::lift(d.left(px(x)).top(px(y)), k))
-                        .child(list)
-                        // Right after the list's layout, reading it as it
-                        // paints: the top message's label pinned (P15).
-                        .child(crate::sticky::layer(
-                            self.fx.clone(),
-                            cx.processor(|this, b: Bounds<Pixels>, _, cx| this.sticky_label(b, cx)),
-                        ))
-                        .children(crate::motion::probe(&self.fx, "sticky"))
-                        .child(crate::scroll::owner(self.panes.cur.scroller.clone(), self.fx.clone()))
-                        .children(unpainted)
-                        .children(hint_frame)
-                        .children(landing)
-                        .children(hold_back)
-                        .child(transcript_bar),
-                )
-                // The top of what is drawn over the composer (the stub, a
-                // notice, the chips), as laid out: the palette ends above it.
-                .when_some(over, |d, at| d.child(canvas(move |b, _, _| at.set(f32::from(b.origin.y)), |_, _, _, _| {}).w_full().h(px(0.))))
-                // The card off screen (scrolled away, or a worker's view):
-                // NEEDS YOU, folded, over the chips.
-                .children(dock)
-                .children(crate::motion::probe(&self.fx, "composer"))
-                .child(self.render_composer(
-                    &p,
-                    &m,
-                    self.card_up() && self.panes.cur.composer.read(cx).focus_handle(cx).is_focused(window),
-                    window,
-                    cx,
-                ))
-        };
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
         h_flex()
             .id("root")
             .track_focus(&self.focus)
-            .when(card_tab, |d| d.key_context(ALLOW_ALL_CTX))
+            .when_some(
+                root_context(
+                    card_tab,
+                    self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some(),
+                    self.split_on(),
+                    self.panes.split(),
+                ),
+                |d, c| d.key_context(c),
+            )
             .on_action(cx.listener(|this, _: &CardTab, window, cx| this.card_tab(window, cx)))
-            .when(self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some(), |d| d.key_context(MENU_CTX))
             .on_action(cx.listener(|this, _: &MenuTab, _, cx| this.menu_tab(false, cx)))
             .on_action(cx.listener(|this, _: &MenuTabBack, _, cx| this.menu_tab(true, cx)))
             .on_action(cx.listener(|this, _: &OpenGoTo, window, cx| this.open_palette(crate::palette::Mode::GoTo, window, cx)))
             .on_action(cx.listener(|this, _: &OpenCommands, window, cx| this.open_palette(crate::palette::Mode::Commands, window, cx)))
+            .on_action(cx.listener(|this, _: &SplitRight, window, cx| this.split_pane(None, window, cx)))
+            .on_action(cx.listener(|this, _: &SplitDown, window, cx| this.split_pane(Some(crate::split::Side::Down), window, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane1, _, cx| this.focus_nth(0, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane2, _, cx| this.focus_nth(1, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane3, _, cx| this.focus_nth(2, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane4, _, cx| this.focus_nth(3, cx)))
+            .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| this.focus_step(false, cx)))
+            .on_action(cx.listener(|this, _: &FocusPrevPane, _, cx| this.focus_step(true, cx)))
             .map(|d| crate::palette::capture_keys(d, cx))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
@@ -7828,16 +8433,14 @@ impl Render for AppView {
             .text_px(13.)
             .child(
                 v_flex().flex_1().h_full().min_w_0().child(self.render_top(&p, rail, cx)).child(
-                    h_flex()
-                        .flex_1()
-                        .min_h_0()
+                    self.probe(h_flex().flex_1().min_h_0(), "body")
                         .child(self.render_side(true, rail, &p, cx))
                         .child(main)
-                        .when(view.is_none(), |d| d.child(self.render_side(false, right, &p, cx))),
+                        .when(view.is_none() || self.panes.split(), |d| d.child(self.render_side(false, right, &p, cx))),
                 ),
             )
             .children(self.render_edge(true, rail, rail_w, &p, cx))
-            .children(view.is_none().then(|| self.render_edge(false, right, right_w, &p, cx)).flatten())
+            .children((view.is_none() || self.panes.split()).then(|| self.render_edge(false, right, right_w, &p, cx)).flatten())
             .when(self.picker_open, |d| {
                 d.child(deferred(self.render_picker(&p, if view.is_some() { Side::Open(0.) } else { right }, cx)).with_priority(1))
                     .child(deferred(self.bars.picker.bar(crate::scrollbar::Ground::Chrome)).with_priority(1))
@@ -7849,8 +8452,14 @@ impl Render for AppView {
             .children(self.render_session_menu(&p, cx))
             .children(self.render_workers_menu(&p, cx))
             .children(self.render_palette(
-                crate::chrome::MARK + rail_w,
-                if view.is_some() { view_pane } else { pane },
+                crate::chrome::MARK + rail_w + self.panes.cur.rect.get().x,
+                if self.panes.split() {
+                    self.panes.cur.rect.get().w
+                } else if view.is_some() {
+                    view_pane
+                } else {
+                    pane
+                },
                 // Over a view there is no composer: the window's end.
                 if view.is_some() { self.height } else { self.panes.cur.composer_top.get().min(self.panes.cur.over_composer.get()) },
                 &p,
@@ -7883,10 +8492,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ARM, Arm, CENTRE_MIN, CardChord, CardKey, FavsJob, FoldKeys, Foot, FootIn, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY,
+        ARM, Arm, CENTRE_MIN, CardChord, CardKey, FavsJob, FoldKeys, Foot, FootIn, PaneKey, RENAME_KEY, SessionMeta, Side, TabKey, YES_KEY,
         above_list, authorize_ready, card_key, card_key_on, command_of, dragged, fav_key, fit_foot, held_back, hidden, input_of, left_cut,
-        lines_below, one_line, palette_keys, panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys, toggled,
-        well_body, worker_keys,
+        lines_below, one_line, palette_keys, pane_keys, panel_keys, secret_answer, side_widths, sides, still_typing, tab_keys, text_keys,
+        toggled, well_body, worker_keys,
     };
     use crate::theme::{Metrics, Panels};
     use crate::turns::Layout;
@@ -8253,6 +8862,31 @@ mod tests {
             for k in &views {
                 assert_eq!(card_key_on(k, mac), None, "{k:?}");
             }
+        }
+        // The split panes' keys (split.md §9): none an input's, an app,
+        // tab, worker, view or palette key, or a card key; each once.
+        for mac in [false, true] {
+            let (a, b) = panel_keys(mac);
+            let (s, u, alt) = crate::views::view_keys(mac, !mac);
+            let (goto, commands) = palette_keys(mac);
+            let mut taken: Vec<_> = [a, b, RENAME_KEY, fav_key(mac), goto, commands]
+                .into_iter()
+                .chain(text_keys(mac))
+                .chain(tab_keys(mac).iter().map(|(k, _)| *k))
+                .chain(worker_keys(mac).iter().map(|(k, _)| *k))
+                .chain(crate::wtabs::tab_keys(mac).iter().copied())
+                .map(parse)
+                .collect();
+            taken.extend([Some(s), Some(u), alt].into_iter().flatten().map(parse));
+            let keys = pane_keys(mac);
+            for (i, (k, _)) in keys.iter().enumerate() {
+                let k = parse(k);
+                assert!(!input.contains(&k) && !taken.contains(&k), "{k:?} is taken");
+                assert!(!keys[..i].iter().any(|(o, _)| parse(o) == k), "{k:?} bound twice");
+                assert_eq!(card_key_on(&k, mac), None, "{k:?}");
+            }
+            let nth: Vec<usize> = keys.iter().filter_map(|&(_, w)| if let PaneKey::Nth(n) = w { Some(n) } else { None }).collect();
+            assert_eq!(nth, (0..4).collect::<Vec<_>>());
         }
         for mac in [false, true] {
             let card = |k: &'static str| card_key_on(&parse_any(k), mac);

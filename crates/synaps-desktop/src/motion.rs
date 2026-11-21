@@ -1400,7 +1400,7 @@ impl Motion {
     ///
     /// Settled, a row that no longer streams is unwrapped (none): a row is
     /// wrapped only while it moves or streams. `ix`: its row in the list.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn grow(&self, key: u64, ix: usize, born: Option<Instant>, streaming: bool, line: f32) -> Option<Grow> {
         self.grow_on(key, ix, born, streaming, line, SNAP_RESPONSE)
     }
@@ -1576,6 +1576,11 @@ impl Motion {
     #[cfg(test)]
     pub(crate) fn sites(&self) -> Vec<Site> {
         self.sites.borrow().clone()
+    }
+
+    /// The beat layer's sites, as text (the bench: what beats).
+    pub(crate) fn sites_text(&self) -> Vec<String> {
+        self.sites.borrow().iter().map(|s| format!("{:?}@({:.0},{:.0})", s.beat, f32::from(s.origin.x), f32::from(s.origin.y))).collect()
     }
 
     /// Glyphs the beat layer paints (the bench).
@@ -2450,27 +2455,16 @@ impl Motion {
         self.col(crate::pane::PaneId::FIRST).rescope(session, column)
     }
 
-    /// [`PaneFx::grow_on`] in the first pane's column.
+    /// [`PaneFx::grow_on`] in the first pane's column (tests: what the
+    /// protected tests read; production code names its pane, Shady #30 M1).
+    #[cfg(test)]
     pub(crate) fn grow_on(&self, key: u64, ix: usize, born: Option<Instant>, streaming: bool, line: f32, response: f32) -> Option<Grow> {
         self.col(crate::pane::PaneId::FIRST).grow_on(key, ix, born, streaming, line, response)
     }
 
-    /// [`PaneFx::body`] in the first pane's column.
-    pub(crate) fn body(&self, key: u64, now: Instant) -> Option<(bool, f32, f32, bool)> {
-        self.col(crate::pane::PaneId::FIRST).body(key, now)
-    }
-
-    /// [`PaneFx::reveal`] in the first pane's column.
-    pub(crate) fn reveal(&self, key: u64, open: bool, delay: Duration, generation: u64) -> (Option<f32>, Rc<Cell<f32>>) {
-        self.col(crate::pane::PaneId::FIRST).reveal(key, open, delay, generation)
-    }
-
-    /// [`PaneFx::streamed`] in the first pane's column.
-    pub(crate) fn streamed(&self, key: u64, n: usize) -> Vec<(usize, f32, f32)> {
-        self.col(crate::pane::PaneId::FIRST).streamed(key, n)
-    }
-
-    /// [`PaneFx::unpainted`] in the first pane's column.
+    /// [`PaneFx::unpainted`] in the first pane's column (tests: what the
+    /// protected tests read; production code names its pane, Shady #30 M1).
+    #[cfg(test)]
     pub(crate) fn unpainted(&self) -> Vec<usize> {
         self.col(crate::pane::PaneId::FIRST).unpainted()
     }
@@ -2508,32 +2502,37 @@ impl Motion {
         self.col(crate::pane::PaneId::FIRST).roll(key, text, up)
     }
 
-    /// [`PaneFx::born`] in the first pane's column.
+    /// [`PaneFx::born`] in the first pane's column (tests: what the
+    /// protected tests read; production code names its pane, Shady #30 M1).
+    #[cfg(test)]
     pub(crate) fn born(&self, id: u64, at: Instant) {
         self.col(crate::pane::PaneId::FIRST).born(id, at)
     }
 
-    /// [`PaneFx::birth`] in the first pane's column.
+    /// [`PaneFx::birth`] in the first pane's column (tests: what the
+    /// protected tests read; production code names its pane, Shady #30 M1).
+    #[cfg(test)]
     pub(crate) fn birth(&self, id: u64) -> Option<Instant> {
         self.col(crate::pane::PaneId::FIRST).birth(id)
     }
 
-    /// [`PaneFx::revealing`] in the first pane's column.
-    pub(crate) fn revealing(&self, key: u64) -> bool {
-        self.col(crate::pane::PaneId::FIRST).revealing(key)
-    }
-
-    /// [`PaneFx::change`] in the first pane's column.
+    /// [`PaneFx::change`] in the first pane's column (tests: what the
+    /// protected tests read; production code names its pane, Shady #30 M1).
+    #[cfg(test)]
     pub(crate) fn change(&self, tag: Tag, key: u64, value: u64, born: Option<Instant>) -> Option<(Instant, u64)> {
         self.col(crate::pane::PaneId::FIRST).change(tag, key, value, born)
     }
 
-    /// [`PaneFx::slide`] in the first pane's column.
+    /// [`PaneFx::slide`] in the first pane's column (tests: what the
+    /// protected tests read; production code names its pane, Shady #30 M1).
+    #[cfg(test)]
     pub(crate) fn slide(&self, key: u64, y: f32) -> f32 {
         self.col(crate::pane::PaneId::FIRST).slide(key, y)
     }
 
-    /// [`PaneFx::turn`] in the first pane's column.
+    /// [`PaneFx::turn`] in the first pane's column (tests: what the
+    /// protected tests read; production code names its pane, Shady #30 M1).
+    #[cfg(test)]
     pub(crate) fn turn(&self, key: u64, open: bool) -> f32 {
         self.col(crate::pane::PaneId::FIRST).turn(key, open)
     }
@@ -2670,6 +2669,14 @@ impl PaneFx<'_> {
         self.col.quiet.borrow_mut().clear();
         self.col.births.borrow_mut().clear();
         self.col.fold.set(None);
+    }
+
+    /// Everything this column remembers, gone (its pane closed, and its id
+    /// is handed to a new one: Shady #30 L1).
+    pub(crate) fn reset(&self) {
+        let (s, c) = self.col.scope.get();
+        self.rescope(!s, c);
+        self.col.roll_n.borrow_mut().clear();
     }
 
     /// [`Motion::grow`], an arrival's height revealing on `response`'s

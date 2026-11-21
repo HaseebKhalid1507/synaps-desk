@@ -238,13 +238,14 @@ impl AppView {
         if let Some(m) = self.model.sessions.iter().find(|m| m.id == s) {
             return self.model.state(m);
         }
-        if self.model.is_active(s) {
-            let tr = &self.model.lives[self.panes.cur.live].transcript;
+        // Its own store's (another pane's, maybe; #31 M2).
+        if let Some(live) = self.model.lives.ids().into_iter().find(|l| self.model.lives[*l].is_active(s)) {
+            let tr = &self.model.lives[live].transcript;
             if !tr.pending_prompts().is_empty() {
                 State::NeedsYou
             } else if tr.busy() {
                 State::Running
-            } else if self.model.active_workers(self.panes.cur.live) > 0 {
+            } else if self.model.active_workers(live) > 0 {
                 State::Workers
             } else {
                 State::Idle
@@ -444,7 +445,9 @@ impl AppView {
                 .w(px(qw))
                 .h_full()
                 .bg(p.raised)
-                .when(!needs, |d| d.child(div().absolute().top_0().left_0().right(px(1.)).h(px(2.)).bg(p.you_bar)))
+                .when(!needs && !(self.panes.split() && self.panes.cur.id != self.panes.focused), |d| {
+                    d.child(div().absolute().top_0().left_0().right(px(1.)).h(px(2.)).bg(p.you_bar))
+                })
         });
         self.panes.cur.tab_fx.drawn = drawn;
         self.panes.cur.tab_fx.shown = selected;
@@ -533,19 +536,6 @@ impl AppView {
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
         let view = !kind.attaches();
-        let title_of = |on: bool| match st {
-            _ if view || kind == Kind::Worker => {
-                if on {
-                    p.ink
-                } else {
-                    p.prose_ch
-                }
-            }
-            State::NeedsYou | State::Running | State::Workers | State::Unread => p.ink,
-            _ if on => p.ink,
-            State::Parked | State::Locked | State::Saved => p.dim_ch,
-            _ => p.prose_ch,
-        };
         let fx = &self.fx;
         // The label eases to `ink` over `quick` as its tab is shown, and
         // back over `hover_out` (fluid.md §3.5).
@@ -555,16 +545,19 @@ impl AppView {
             crate::motion::QUICK,
             crate::motion::HOVER_OUT,
         );
-        let title_color = crate::motion::mix(title_of(false), title_of(true), k);
+        // Split panes (split.md §6): an unfocused pane's active tab keeps
+        // its raised ground; its title is the tab default and it has no bar.
+        let unfocused = self.panes.split() && self.panes.cur.id != self.panes.focused;
+        let title_color = tab_title(st, view || kind == Kind::Worker, unfocused, k, p);
         // NEEDS YOU first: a worker tab's session's prompt too. Its bar
         // draws left to right over `base` (motion.md §6.3).
         let needs = st == State::NeedsYou;
         let bar = if needs {
-            let since = fx.change(crate::motion::Tag::TabNeeds, id, 1, None).map(|c| c.0);
+            let since = fx.col(self.panes.cur.id).change(crate::motion::Tag::TabNeeds, id, 1, None).map(|c| c.0);
             Some((p.warn_mark_ch, fx.draw(since, std::time::Duration::ZERO, crate::motion::BASE)))
         } else {
-            fx.change(crate::motion::Tag::TabNeeds, id, 0, None);
-            (on && lit).then_some((p.you_bar, 1.))
+            fx.col(self.panes.cur.id).change(crate::motion::Tag::TabNeeds, id, 0, None);
+            (on && lit && !unfocused).then_some((p.you_bar, 1.))
         };
         // Hover and press (fluid.md §3.9): the fill on over `hover_in`, off
         // over `hover_out`; held, `press_ch` and the content 1 px down.
@@ -725,6 +718,29 @@ impl AppView {
 
 fn new_tip() -> &'static str {
     if cfg!(target_os = "macos") { "New session in a new tab (Cmd+T)" } else { "New session in a new tab (Ctrl+T)" }
+}
+
+/// A tab's title colour: shown by `k` (0 not shown, 1 shown, between as
+/// it eases). A view's or a worker's tab is `ink` shown, else `prose_ch`;
+/// a session's says its state when not shown (`ink` while it runs, needs
+/// you or is unread). Shown in an unfocused pane (split panes, `unfocused`)
+/// it is `prose_ch` whatever its state (finish gate #36 M4: the glyph and
+/// the NEEDS YOU bar say the state, the title says which pane has focus).
+pub(crate) fn tab_title(st: State, plain: bool, unfocused: bool, k: f32, p: &Palette) -> Hsla {
+    let title_of = |on: bool| match st {
+        _ if plain => {
+            if on {
+                p.ink
+            } else {
+                p.prose_ch
+            }
+        }
+        State::NeedsYou | State::Running | State::Workers | State::Unread => p.ink,
+        _ if on => p.ink,
+        State::Parked | State::Locked | State::Saved => p.dim_ch,
+        _ => p.prose_ch,
+    };
+    crate::motion::mix(title_of(false), if unfocused { p.prose_ch } else { title_of(true) }, k)
 }
 
 #[cfg(test)]

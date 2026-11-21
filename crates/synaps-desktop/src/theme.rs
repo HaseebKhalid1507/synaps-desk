@@ -1528,6 +1528,12 @@ pub fn load_str(path: &Path, key: &str) -> Option<String> {
     load_settings(path)?.get(key)?.as_str().map(str::to_string).filter(|v| !v.is_empty())
 }
 
+/// A flag the app reads under `key` (`panes.split`); missing or not a
+/// bool: off.
+pub fn load_flag(path: &Path, key: &str) -> bool {
+    load_settings(path).and_then(|v| v.get(key)?.as_bool()).unwrap_or(false)
+}
+
 /// The theme the picker saved, as written ([`resolve_theme`] checks it).
 pub fn load_theme(path: &Path) -> Option<String> {
     load_settings(path)?.get("theme")?.as_str().map(str::to_string)

@@ -1527,7 +1527,7 @@ impl AppView {
                 // the block arrives, and the target of a send's Handoff
                 // (motion.md §5.2).
                 let fx = &self.fx;
-                let born = fx.birth(item.id);
+                let born = fx.col(self.panes.cur.id).birth(item.id);
                 let lit = match (born, fx.col(self.panes.cur.id).sent().get()) {
                     (Some(b), Some((at, false))) if b.saturating_duration_since(at) < Duration::from_secs(2) => {
                         fx.flash(Some(at + 2 * motion::STAGGER))
@@ -1643,7 +1643,14 @@ impl AppView {
         let head = (!matches!(d.kind, Kind::Day | Kind::Prompt)
             && d.item + 1 == items.len()
             && matches!(item.kind, ItemKind::Assistant | ItemKind::Thinking))
-        .then(|| self.fx.change(Tag::Stream, item.id, item.text.len() as u64, self.fx.birth(item.id)))
+        .then(|| {
+            self.fx.col(self.panes.cur.id).change(
+                Tag::Stream,
+                item.id,
+                item.text.len() as u64,
+                self.fx.col(self.panes.cur.id).birth(item.id),
+            )
+        })
         .flatten()
         .map(|(at, _)| self.fx.decay(Some(at), motion::HEAD_HOLD, motion::GLOW))
         .filter(|k| *k > 0.)
@@ -1992,7 +1999,7 @@ impl AppView {
                     .flex()
                     .items_center()
                     .justify_end()
-                    .child(glyph::turn(fx.turn(id | RUN_KEY, open), p.dim_t)),
+                    .child(glyph::turn(fx.col(self.panes.cur.id).turn(id | RUN_KEY, open), p.dim_t)),
             )
             .when_some(row_tip, |d, tip| d.tooltip(tip));
         let _ = cx;
@@ -2039,7 +2046,7 @@ impl AppView {
         }
         if starts.is_some() {
             // No worker yet: when it comes, its spawn row's bar draws.
-            self.fx.change(Tag::Block, id, 0, self.fx.birth(id));
+            self.fx.col(self.panes.cur.id).change(Tag::Block, id, 0, self.fx.col(self.panes.cur.id).birth(id));
         }
         let has_body = if think { !row.text.is_empty() } else { row.preview.is_some() || !row.result.is_empty() };
         let open = has_body && self.is_open(item, row);
@@ -2079,8 +2086,9 @@ impl AppView {
         if life.live() {
             self.ran.borrow_mut().insert(id);
         }
-        let change = fx.change(Tag::Outcome, id, life.code(), None);
-        let wait = fx.change(Tag::Waiting, id, u64::from(waiting), None).filter(|w| waiting && w.1 == 0).map(|w| w.0);
+        let change = fx.col(self.panes.cur.id).change(Tag::Outcome, id, life.code(), None);
+        let wait =
+            fx.col(self.panes.cur.id).change(Tag::Waiting, id, u64::from(waiting), None).filter(|w| waiting && w.1 == 0).map(|w| w.0);
         // The row's wash (§1): the state colour mixed into the card, one
         // quad behind the row. A failure flushes at 18 % and calms to 7.5 %
         // (§8 #6); a wait at 16 % and holds at 6 % (#7). Off: at rest.
@@ -2170,7 +2178,7 @@ impl AppView {
                 .text_color(motion::mix(ground, word_color, k))
                 .child(w)
         });
-        let fold = has_body.then(|| glyph::turn(fx.turn(id, open), p.dim_t));
+        let fold = has_body.then(|| glyph::turn(fx.col(self.panes.cur.id).turn(id, open), p.dim_t));
         let verb_text = if think { SharedString::new_static("Think") } else { crate::cards::verb(&row.name) };
         // The verb column (§3): 56 px, wider for a longer word; the verb is
         // never cut, the target gives way (the finish gate of #23, item 11).
@@ -2214,10 +2222,11 @@ impl AppView {
         // folds as the call succeeds (@ +180, #5).
         let finished_now = change.is_some_and(|c| c.0 >= fx.now() && glyph::Life::was_live(c.1));
         let delay = if !open && finished_now { Duration::from_millis(180) } else { Duration::ZERO };
-        let (reveal, sink) = if has_body { fx.reveal(id, open, delay, life.code()) } else { (None, Default::default()) };
+        let (reveal, sink) =
+            if has_body { fx.col(self.panes.cur.id).reveal(id, open, delay, life.code()) } else { (None, Default::default()) };
         // Output streaming in (§8 #4): each new line grows and lifts.
         let streamed = if (open || reveal.is_some()) && !think && row.preview.is_none() && row.card.numbered.is_none() {
-            fx.streamed(id, row.result.lines().count())
+            fx.col(self.panes.cur.id).streamed(id, row.result.lines().count())
         } else {
             Vec::new()
         };
@@ -2291,7 +2300,8 @@ impl AppView {
         let d = crate::cards::Geo::of(m);
         let life = glyph::life_of_worker(live);
         let steady = glyph::life_of_worker(glyph::steady(live, v.demoted));
-        let status = glyph::indicator(fx, life, p.card_d, p, fx.change(Tag::BlockGlyph, key, steady.code(), None), None);
+        let status =
+            glyph::indicator(fx, life, p.card_d, p, fx.col(self.panes.cur.id).change(Tag::BlockGlyph, key, steady.code(), None), None);
         // Its task: the call's argument after the worker's label.
         let task = row.arg.split_once(" · ").map_or_else(|| row.arg.clone(), |(_, t)| SharedString::from(tilde(t, true)));
         let target = h_flex()
@@ -2380,7 +2390,7 @@ impl AppView {
             .child(div().flex_none().w(px(d.chevron)));
         // The worker came under the call while watched (its call was drawn
         // without it: `render_work`): its bar draws.
-        let came = fx.change(Tag::Block, key, 1, fx.birth(key)).map(|(at, _)| at);
+        let came = fx.col(self.panes.cur.id).change(Tag::Block, key, 1, fx.col(self.panes.cur.id).birth(key)).map(|(at, _)| at);
         // Under the target (§3): no bar in a card (C5).
         let _ = came;
         let line = |child: AnyElement| div().relative().ml(px(d.indent + d.verb + d.gap)).mr(px(d.pad)).mt(px(-6.)).mb(px(8.)).child(child);
