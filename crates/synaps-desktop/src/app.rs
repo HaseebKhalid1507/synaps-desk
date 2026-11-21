@@ -8173,7 +8173,8 @@ impl AppView {
         self.panes.grab = None;
         if count >= 2 {
             let mut to = self.panes.tree.clone();
-            to.equalise(path);
+            let (w, h) = self.centre.get();
+            to.equalise(path, crate::split::Rect { x: 0., y: 0., w, h });
             self.fly_layout(to, cx);
         }
     }
