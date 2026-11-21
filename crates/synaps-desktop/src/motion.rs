@@ -1983,7 +1983,11 @@ impl Motion {
     /// width (the finish gate of #33, F1: rounded to the nearest pixel, it
     /// drew its last pixel short until it settled, and the pane, the column
     /// and the tab took that pixel in the landing frame, after the panel had
-    /// looked still for a few frames). Its value, and whether it moves.
+    /// looked still for a few frames). The pixel is a logical one: at 2x or
+    /// 3x the last one goes as one step of 2 or 3 device pixels. A stall
+    /// that skips the tail (from over a pixel out to settled) still lands
+    /// the last pixel in the landing frame; that is the stall, not this.
+    /// Its value, and whether it moves.
     pub(crate) fn spring_px(&self, key: u64, target: f32, response: f32) -> (f32, bool) {
         let asked = (self.display.get(), self.pane_wants.get());
         let (v, moving) = self.spring_held(key, target, response);
@@ -3156,9 +3160,8 @@ mod tests {
     /// frame is asked for only when the width drawn will have changed by
     /// then, else a timer for the instant it does. Driven as the app is (the
     /// next 144 Hz frame, or the timer), a 280-px `sheet` fold draws each
-    /// width once (the landing frame apart: the last frame that moves draws
-    /// the landed width, the finish gate of #33, F1) and lands as the spring
-    /// does: ~52 frames where drawing every frame of it takes ~71.
+    /// width once (the landing frame apart) and lands as the spring does:
+    /// ~52 frames where drawing every frame of it takes ~71.
     #[test]
     fn a_pixel_spring_draws_each_width_once() {
         let t0 = Instant::now();
@@ -3183,7 +3186,6 @@ mod tests {
         }
         let ms = t.duration_since(t0).as_millis();
         assert_eq!(drawn.last(), Some(&0.), "landed");
-        assert_eq!(drawn[drawn.len() - 2], 0., "the last frame that moves draws the landed width: {drawn:?}");
         assert!((470..=520).contains(&ms), "as long as the spring: {ms} ms");
         let same = drawn.windows(2).filter(|p| p[0] == p[1]).count();
         assert!(same <= 1, "each width drawn once: {drawn:?}");

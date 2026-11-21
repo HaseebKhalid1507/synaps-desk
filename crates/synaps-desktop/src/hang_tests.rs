@@ -588,7 +588,9 @@ fn the_pinned_label_goes_to_the_gutter_with_the_panel(cx: &mut TestAppContext) {
 /// draws the same: the pane, the column, the rows and the tab all 0 px from
 /// it, and every frame after. Both panels, closing and opening, at Full
 /// (with frames between) and Reduced (one frame), as the clips have it:
-/// 1920 px, text 17, the rail at 480 and the right panel at 520.
+/// 1920 px, text 17, the rail at 480 and the right panel at 520, where the
+/// column is at its cap at both ends (under it, a widening flight's column
+/// widens as it lands, by design: `a_held_room_holds_as_the_wrap_lands`).
 #[gpui_kit::test]
 fn a_panel_flight_ends_on_the_layout_it_lands_at(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (1920., 1080.), 17);
@@ -673,4 +675,111 @@ fn a_panel_flight_ends_on_the_layout_it_lands_at(cx: &mut TestAppContext) {
         }
     }
     assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// F1 at the unit: a side panel's width on whole pixels
+/// ([`crate::motion::Motion::spring_px`]), driven as the app drives it (the
+/// next 144 Hz frame, or the timer it asks for), draws the landed width on
+/// the last frame that moves, at 1x and 2x: the landing frame draws what
+/// that one drew. A 280-px `sheet` fold, as `motion`'s
+/// `a_pixel_spring_draws_each_width_once`.
+#[test]
+fn a_pixel_spring_draws_its_landed_width_before_it_lands() {
+    use crate::motion::{Motion, SHEET_RESPONSE};
+    use std::time::{Duration, Instant};
+    for scale in [1., 2.] {
+        let t0 = Instant::now();
+        let m = Motion::new(t0);
+        m.set_scale(scale);
+        m.begin_frame(Level::Full, false, t0);
+        m.spring_jump(9, 280., 0., SHEET_RESPONSE);
+        let (mut t, mut drawn) = (t0, Vec::new());
+        for _ in 0..200 {
+            m.begin_frame(Level::Full, false, t);
+            let (v, moving) = m.spring_px(9, 0., SHEET_RESPONSE);
+            drawn.push((v, moving));
+            if !moving {
+                break;
+            }
+            t = match m.demand() {
+                (true, _) => t + Duration::from_micros(6944),
+                (false, Some(at)) => at,
+                (false, None) => panic!("{scale}x: moving, and nothing asked for"),
+            };
+        }
+        let n = drawn.len();
+        assert!(n > 30 && drawn[n - 1] == (0., false), "{scale}x: it flew and landed: {drawn:?}");
+        assert_eq!(drawn[n - 2], (0., true), "{scale}x: the last frame that moves draws the landed width: {drawn:?}");
+        assert!(drawn[..n - 2].iter().all(|&(v, _)| v > 0.), "{scale}x: and only that one: {drawn:?}");
+    }
+}
+
+/// Shady's L1 on #33 round 3: under the column's cap (a pane of 560 px up
+/// to the cap's width) a flight that widens the pane across the hang lands
+/// the labels (the list measured again, a held room read again) on the
+/// last frame that moves, and lets the narrowest wrap go a frame later, as
+/// it lands (fluid.md §3.8; the protected
+/// `column_rewraps_at_most_once_per_panel_motion` puts the widening rewrap
+/// in that frame). The rewrap only widens the column, so the rows only get
+/// shorter: a room held at the end is not used up by it. 1100 px, the rail
+/// at 400 (a pane of 668 px, the column 620) closing: the column widens
+/// as it lands, and the room stays held and the list at its end in every
+/// frame, landed and after.
+#[gpui_kit::test]
+fn a_held_room_holds_as_the_wrap_lands(cx: &mut TestAppContext) {
+    let (w, view) = open_one(cx, true);
+    view.update(cx, |v, cx| {
+        v.panels.rail_width = Some(400);
+        v.client = None;
+        v.model.transcript.set_busy(true);
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    for _ in 0..60 {
+        fluid_frame(cx, w, &view);
+    }
+    let ids: Vec<u64> = view.read_with(cx, |v, _| v.model.transcript.pending_prompts().iter().map(|p| p.id).collect());
+    assert!(!ids.is_empty(), "the demo's card");
+    view.update(cx, |v, cx| {
+        for prompt_id in ids {
+            v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id });
+        }
+        cx.notify();
+    });
+    for _ in 0..120 {
+        fluid_frame(cx, w, &view);
+    }
+    let room = view.read_with(cx, |v, _| v.fold_slack.get().map(|s| s.last())).expect("a room held at the end");
+    let column = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.layout.column);
+    let c0 = column(cx);
+    let short = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, cx| {
+            let pad = crate::app::list_pad_b(&crate::theme::metrics(cx));
+            f32::from(v.list.max_offset_for_scrollbar().y) + pad + f32::from(v.list.scroll_px_offset_for_scrollbar().y)
+        })
+    };
+    assert!(short(cx) <= 1., "at its end ({room} px held)");
+    let line = view.read_with(cx, |_, cx| {
+        let m = crate::theme::metrics(cx);
+        m.body_line.max(m.mono_line) + (2. * m.r).round()
+    });
+    let check = |cx: &mut TestAppContext, n: usize| {
+        let held = view.read_with(cx, |v, _| v.fold_slack.get().map(|s| s.last()));
+        let (gap, taken) = (short(cx), room - held.unwrap_or(0.));
+        assert!(held.is_some() && gap <= 3. + taken && taken <= line, "frame {n}: held ({held:?} of {room}) at its end ({gap})");
+    };
+    view.update(cx, |v, cx| v.toggle_panel(true, cx));
+    cx.run_until_parked();
+    let mut n = 0;
+    let frames = fly(cx, w, &view, |cx| {
+        n += 1;
+        check(cx, n);
+    });
+    assert!(frames > 30, "it flew ({frames})");
+    assert!(pane(cx, &view).1, "landed hanging");
+    assert!(column(cx) > c0, "the column widened as it landed ({c0} -> {})", column(cx));
+    for n in frames + 1..frames + 9 {
+        fluid_frame(cx, w, &view);
+        check(cx, n);
+    }
 }
