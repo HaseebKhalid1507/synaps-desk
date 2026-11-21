@@ -3204,9 +3204,12 @@ impl AppView {
     }
 
     /// The last tab closed: nothing attached (the session keeps running).
+    /// What its store holds open goes, not what it wants: the switch out
+    /// of the tab (`stash`) cleared that first (Shady #32 H1).
     fn detach_all(&mut self) {
         self.panes.cur.attach_wait = None;
-        if let (Some(c), Some(seq)) = (&self.client, self.model.lives[self.panes.cur.live].wanted()) {
+        let held = self.model.lives[self.panes.cur.live].release();
+        if let (Some(c), Some(seq)) = (&self.client, held) {
             let _ = c.on(seq).detach();
         }
     }
@@ -3518,6 +3521,13 @@ impl AppView {
     /// and `sync_composer()`.
     fn composer_owned(&self) -> bool {
         Drafts::composer_owned(self.panes.cur.composer_of.as_ref(), &self.model.tabs)
+    }
+
+    /// The composer's Enter with `text` in it, as its subscription sends it
+    /// (the view-level tests, `split_tests`).
+    #[cfg(test)]
+    pub(crate) fn enter(&mut self, text: String) -> bool {
+        self.submit(text)
     }
 
     /// Send the composer's text. `false` keeps it in the composer.

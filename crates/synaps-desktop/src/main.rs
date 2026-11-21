@@ -57,6 +57,8 @@ mod scrollbar;
 mod settings;
 mod settings_view;
 mod shell;
+#[cfg(all(test, unix))]
+mod split_tests;
 mod stats;
 mod sticky;
 #[cfg(test)]

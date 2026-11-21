@@ -1149,6 +1149,8 @@ impl Model {
     pub fn want(&mut self, live: LiveId, attach_seq: u64) {
         let l = &mut self.lives[live];
         l.wanted = Some(attach_seq);
+        // `Client::attach`/`create`/`resume` replaced what it held.
+        l.held = Some(attach_seq);
         l.wanted_session = None;
         l.wanted_fact = None;
         self.rail_gen += 1;
@@ -1364,12 +1366,19 @@ impl Model {
         if let Some(effects) = self.left_event(&ev) {
             return effects;
         }
-        // The store that asked for this attachment. Every arm below that
-        // acts on a store checks `current(seq)` on it first, so an event of
-        // no store's attachment (a stale one) changes nothing. One that
-        // names no attachment (a control connection's error) acts on the
-        // first store: step 2 has only that one; step 3 routes those.
-        let lid = ev.attach_seq().and_then(|s| self.lives.wanting(s)).unwrap_or(LiveId::FIRST);
+        // The store that asked for this attachment. An event of no store's
+        // attachment (one left, replaced or ended) is owed only what
+        // `left_event` did with it: it reaches no store, draws nothing
+        // (Shady #32 M1; split/architecture.md §3.3). One that names no
+        // attachment (a control connection's) acts on the store the
+        // visible tab shows: step 2 has only that one; step 3 routes those.
+        let lid = match ev.attach_seq() {
+            Some(seq) => match self.lives.wanting(seq) {
+                Some(lid) => lid,
+                None => return Vec::new(),
+            },
+            None => self.lives.shown(),
+        };
         let mut effects = Vec::new();
         let ev = match ev {
             Event::Sessions(mut s) => {
@@ -2174,6 +2183,63 @@ mod tests {
         m.watch.open(&Candidate::of(2, "sleeper"), None, t1);
         let _ = m.switch_out(LiveId::FIRST);
         assert_eq!(m.watch.poll_due(), None, "a background tab polls nothing");
+    }
+
+    /// Shady #32 H1: what a store holds open outlives the switch out of its
+    /// tab, and a switch whose attach the tab keys hold back (`showing`):
+    /// the last tab's close detaches it, once. The next attach replaces it.
+    #[test]
+    fn a_store_holds_its_attachment_until_the_last_tab_closes() {
+        let mut m = Model::new(ConnState::Connecting);
+        attach(&mut m, 1);
+        let _ = m.switch_out(LiveId::FIRST);
+        m.switch_in(LiveId::FIRST, Transcript::new(), Stats::default());
+        m.showing(LiveId::FIRST, "b");
+        assert_eq!(m.lives[LiveId::FIRST].wanted(), None, "nothing wanted while B waits");
+        assert_eq!(m.lives[LiveId::FIRST].release(), Some(1), "A's, still open on the client");
+        assert_eq!(m.lives[LiveId::FIRST].release(), None, "once");
+        attach(&mut m, 2);
+        attach(&mut m, 3);
+        assert_eq!(m.lives[LiveId::FIRST].release(), Some(3), "an attach replaced the one before");
+    }
+
+    /// Shady #32 M1: after a tab switch, the attachment left still answers
+    /// (a `NotAttached` now names its seq, a refused worker poll or steer):
+    /// none of it reaches the store the switch went to. Its worker steer
+    /// is not given back as refused, its poll in flight is not failed,
+    /// nothing is drawn; that attachment's own refusal still is one.
+    #[test]
+    fn a_left_attachments_errors_reach_no_store() {
+        use crate::watch::Candidate;
+        let mut m = Model::new(ConnState::Connecting);
+        attach(&mut m, 1);
+        let _ = m.switch_out(LiveId::FIRST);
+        m.switch_in(LiveId::FIRST, Transcript::new(), Stats::default());
+        attach(&mut m, 2);
+        let t0 = std::time::Instant::now();
+        m.watch.open(&Candidate::of(2, "sleeper"), None, t0);
+        assert_eq!(m.watch.take_poll(t0), Some(("sa_2".into(), 0)), "a poll in flight");
+        m.watch.steer_sent("sa_2", "stop after the next step");
+        let due = m.watch.poll_due();
+        m.view_dirty = false;
+        let generation = m.rail_gen;
+        let error = |seq: u64, error: Error| Event::Error { attach_seq: Some(seq), error };
+        for e in [
+            Error::NotAttached { command: "subagent_steer" },
+            Error::NotAttached { command: "subagent_watch" },
+            Error::Refused { command: Some("subagent_steer".into()), reason: "no".into() },
+            Error::Refused { command: Some("subagent_watch".into()), reason: "no".into() },
+        ] {
+            let what = e.to_string();
+            assert!(m.apply(error(1, e)).is_empty(), "{what}");
+            assert_eq!(m.watch.take_unsent(), None, "{what}: no steer of this session given back");
+            assert_eq!(m.watch.poll_due(), due, "{what}: the poll in flight is not failed");
+            assert!(!m.view_dirty && m.rail_gen == generation, "{what}: nothing drawn");
+        }
+        assert_eq!(m.lives[LiveId::FIRST].last_error, None);
+        // The attachment on screen's own: its steer comes back.
+        m.apply(error(2, Error::NotAttached { command: "subagent_steer" }));
+        assert_eq!(m.watch.take_unsent().map(|u| u.0).as_deref(), Some("stop after the next step"));
     }
 
     /// Split panes step 2: a second store's attach (step 3's other pane)

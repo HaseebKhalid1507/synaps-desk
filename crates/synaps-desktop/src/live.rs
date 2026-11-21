@@ -39,6 +39,11 @@ pub struct Live {
     pub active: Option<Active>,
     /// The attachment asked for last: events of any other are stale.
     pub(crate) wanted: Option<u64>,
+    /// The attachment this store holds open on the client: the one asked
+    /// for last, kept through a switch (`switch_out` and `showing` clear
+    /// `wanted`, the client keeps it) until the next attach replaces it or
+    /// the last tab's close detaches it ([`Live::release`], Shady #32 H1).
+    pub(crate) held: Option<u64>,
     /// The session it asked for (`None`: a create or a resume, whose id
     /// comes with `Attached`).
     pub(crate) wanted_session: Option<String>,
@@ -73,6 +78,7 @@ impl Default for Live {
         Live {
             active: None,
             wanted: None,
+            held: None,
             wanted_session: None,
             wanted_fact: None,
             answered: HashSet::new(),
@@ -240,6 +246,13 @@ impl Live {
         }
         let Some(status) = crate::subagents::Status::word(word) else { return false };
         self.stats.subagents.heard_page(id, status)
+    }
+
+    /// Its pane shows nothing now (the last tab closed): the attachment
+    /// to detach, once. Not [`Live::wanted`]: the switch out of the tab
+    /// closed cleared that, and the attachment is still open.
+    pub(crate) fn release(&mut self) -> Option<u64> {
+        self.held.take()
     }
 
     pub(crate) fn current(&self, attach_seq: u64) -> bool {
