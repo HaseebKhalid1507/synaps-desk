@@ -113,9 +113,42 @@ pub(crate) struct Dnd {
     /// The pointer's y in the centre, as of the last move (the label
     /// keeps off it).
     pub(crate) pointer_y: f32,
+    /// The preview's strength: from, to, since ([`Dnd::strength`]).
+    pub(crate) fade: (f32, f32, Option<std::time::Instant>),
 }
 
 impl Dnd {
+    /// The preview's strength at `now`, going to `to` over
+    /// [`crate::motion::QUICK`] (Off: at once): in on `ease::OUT`, out on
+    /// `ease::IN`, motion.md §4.2's exit (finish gate #48 F2: an `OUT` exit
+    /// is spent in its first two frames, and a drop's fade-out was not
+    /// seen). Running, it asks the next frame.
+    pub(crate) fn strength(&mut self, to: f32, now: std::time::Instant, fx: &crate::motion::Motion) -> f32 {
+        use crate::motion::{Level, QUICK, ease};
+        let (from, end, at) = self.fade;
+        let sample = |at: Option<std::time::Instant>| {
+            let Some(at) = at else { return end };
+            let k = (now.saturating_duration_since(at).as_secs_f32() / QUICK.as_secs_f32()).min(1.);
+            let curve = if end > from { ease::OUT } else { ease::IN };
+            from + (end - from) * curve.sample(k)
+        };
+        let a = sample(at);
+        if fx.level() == Level::Off {
+            self.fade = (to, to, None);
+            return to;
+        }
+        if to != end {
+            self.fade = (a, to, Some(now));
+            return a;
+        }
+        if a != end {
+            fx.want_frame();
+        } else {
+            self.fade.2 = None;
+        }
+        a
+    }
+
     /// The drag ended (dropped, cancelled, or released outside): no hint;
     /// the preview fades where it was.
     pub(crate) fn end(&mut self) {
@@ -181,9 +214,8 @@ impl Render for RailDrag {
 }
 
 /// The preview's motion keys (`0x7AF8`: the Q5 family, app.rs): its
-/// rectangle's four sides on `snap`, and its strength.
+/// rectangle's four sides on `snap` (its strength: [`Dnd::fade`]).
 const PREVIEW_R: u64 = 0x7AF8 << 48;
-const PREVIEW_A: u64 = (0x7AF8 << 48) | 0xF;
 
 /// The drop a pane would take now: the zone it lands in (none: the drop
 /// would do nothing, so nothing is shown), the pane body's rectangle in
@@ -632,12 +664,12 @@ impl AppView {
     /// 120 ms (Reduced: at most that; Off: at once). At rest it asks no
     /// frame.
     fn render_preview(&mut self, p: &crate::theme::Palette, x0: f32, y0: f32) -> Option<AnyElement> {
-        use crate::motion::{QUICK, SNAP_RESPONSE};
+        use crate::motion::SNAP_RESPONSE;
         if self.dnd.on.is_none() && self.dnd.drawn.is_none() {
             return None;
         }
         let shown = self.dnd.hint.and_then(|h| h.zone.map(|z| ((h.pane, z), preview(h.rect, z))));
-        let a = self.fx.ease_to(PREVIEW_A, if shown.is_some() { 1. } else { 0. }, QUICK, QUICK);
+        let a = self.dnd.strength(if shown.is_some() { 1. } else { 0. }, self.fx.now(), &self.fx);
         let (key, target) = shown.or(self.dnd.drawn)?;
         if shown.is_none() && a <= 0. {
             self.dnd.drawn = None;
