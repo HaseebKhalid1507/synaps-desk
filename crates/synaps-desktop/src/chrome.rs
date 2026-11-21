@@ -726,11 +726,15 @@ impl AppView {
         let first = self.model.ticker();
         let jump_to = self.model.jump_target().map(str::to_string);
         let what: Option<SharedString> = first.map(|s| {
-            if self.model.is_active(&s.id)
-                && let Some(pr) = self.model.lives[self.panes.cur.live].transcript.pending_prompts().first()
+            // The prompt of the store that holds that session (Shady #36 L6:
+            // never this pane's for another pane's session).
+            let store = self.model.lives.ids().into_iter().find(|l| self.model.lives[*l].is_active(&s.id));
+            if let Some(l) = store
+                && let Some(pr) = self.model.lives[l].transcript.pending_prompts().first()
             {
                 // Built once per prompt, with the card (`sync_card` ran first).
-                self.current_card().map(|c| c.gist.clone()).unwrap_or_else(|| prompt_gist(&pr.title, &pr.prompt).into())
+                let card = self.current_card().filter(|_| l == self.panes.cur.live).map(|c| c.gist.clone());
+                card.unwrap_or_else(|| prompt_gist(&pr.title, &pr.prompt).into())
             } else {
                 s.title.clone().filter(|t| !t.is_empty() && s.name.is_some()).unwrap_or_default().into()
             }

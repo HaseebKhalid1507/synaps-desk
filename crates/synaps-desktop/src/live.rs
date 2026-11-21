@@ -330,6 +330,13 @@ impl InFlight {
         }
     }
 
+    /// Pane `from` closed: what it sent is pane `to`'s (Shady #36 L5).
+    pub(crate) fn rehome(&mut self, from: PaneId, to: PaneId) {
+        for (p, _) in self.0.iter_mut().filter(|(p, _)| *p == from) {
+            *p = to;
+        }
+    }
+
     /// Everything, oldest first; none left.
     pub(crate) fn take(&mut self) -> Vec<(PaneId, String)> {
         std::mem::take(&mut self.0).into()
@@ -525,9 +532,6 @@ mod tests {
         }
     }
 
-    /// Input from two panes on one session: a refusal gives the oldest
-    /// back to the pane that sent it; a detach gives each pane its own
-    /// texts, in order, never the other's.
     /// #31 L4: a released store's id is never handed out again.
     #[test]
     fn a_released_stores_id_is_never_reused() {
@@ -539,6 +543,9 @@ mod tests {
         assert_eq!(l.ids(), [LiveId::FIRST, b]);
     }
 
+    /// Input from two panes on one session: a refusal gives the oldest
+    /// back to the pane that sent it; a detach gives each pane its own
+    /// texts, in order, never the other's.
     #[test]
     fn input_in_flight_goes_back_to_the_pane_that_sent_it() {
         let (a, b) = (PaneId::FIRST, PaneId::nth(1));

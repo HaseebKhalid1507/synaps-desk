@@ -303,6 +303,36 @@ pub struct Pane {
 /// it): the others keep theirs here, swapped in with the pane
 /// ([`crate::app::AppView::enter_pane`]), so every read and write of it
 /// is that pane's.
+/// Why the keys are to follow the focus mark at the next frame
+/// ([`crate::app::AppView::apply_keys`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeysTo {
+    /// A pane key (Alt+N, F6, a split): to the focused pane, unless
+    /// something in it has them already.
+    Pane,
+    /// The mark moved without the keyboard (a click, a rail click, a find,
+    /// an Open, a view opened again): only out of another pane's inputs.
+    Follow,
+    /// The pane that had the focus closed: also when its inputs, gone,
+    /// left the keys nowhere.
+    Closed,
+}
+
+/// Who has the keys, as the focus mark sees it ([`KeysTo`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeysAt {
+    /// The focused pane's composer, secret field, Allow all box or (a
+    /// view) its surface.
+    Focused,
+    /// Another pane's.
+    Other,
+    /// The window's root (a card's keys).
+    Root,
+    /// A window-wide input: find, the palette, the naming row.
+    Window,
+    Nowhere,
+}
+
 #[derive(Default)]
 pub(crate) struct Parked {
     /// Its tabs (`Model::tabs`).
@@ -317,6 +347,8 @@ pub(crate) struct Parked {
     pub(crate) tray: crate::tray::TrayCache,
     pub(crate) tray_rows: usize,
     pub(crate) chips: crate::tray::Chips,
+    /// Its tray's ghost-end timer (Shady #36 L4: each pane's own).
+    pub(crate) tray_due: Option<(std::time::Instant, gpui_kit::Task<()>)>,
     /// Its card's receipt and its HALT's (#31 L2), and its runs' timings
     /// by item id (every transcript numbers from 1).
     pub(crate) sent: Option<crate::authorize::Sent>,
@@ -545,6 +577,7 @@ impl crate::app::AppView {
         std::mem::swap(&mut self.drafts, &mut q.drafts);
         std::mem::swap(&mut self.tray, &mut q.tray);
         std::mem::swap(&mut self.tray_rows, &mut q.tray_rows);
+        std::mem::swap(&mut self.tray_due, &mut q.tray_due);
         std::mem::swap(&mut self.chips, &mut q.chips);
         std::mem::swap(&mut self.sent, &mut q.sent);
         std::mem::swap(&mut self.halted, &mut q.halted);
@@ -584,60 +617,117 @@ impl crate::app::AppView {
     /// Focus pane `id` (a mouse-down in it, keyboard focus entering it,
     /// Alt+N, F6, a split): keys, typing and the right panel go to it. Its
     /// card's keys wait [`crate::app::ARM`] again, so a key meant for one
-    /// pane never answers another's card (split.md §7).
-    pub(crate) fn focus_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+    /// pane never answers another's card (split.md §7). The keys follow at
+    /// the next frame, as `how` says ([`AppView::apply_keys`]): a click's
+    /// own target always keeps them.
+    pub(crate) fn focus_pane(&mut self, id: PaneId, how: KeysTo, cx: &mut Context<Self>) {
         if self.panes.focused == id && self.panes.cur.id == id {
             return;
         }
         if !self.focus_quiet(id) {
             return;
         }
-        self.restart_card_keys(cx);
-        // Typing follows (one composer is lit): out of another pane's
-        // composer into this one's; the root keeps the keys it has.
-        let elsewhere = self.panes.rest.iter().any(|p| {
-            p.composer.read(cx).focus_handle(cx).is_focused(window) || p.secret_input.read(cx).focus_handle(cx).is_focused(window)
-        });
-        if elsewhere || self.composer_focus {
-            self.focus_composer(cx);
-        }
+        self.ask_keys(how);
         cx.notify();
+    }
+
+    /// The keys go to the focused pane at the next frame, as `how` says
+    /// ([`AppView::apply_keys`]); a pane key's ask outranks a follow's.
+    pub(crate) fn ask_keys(&mut self, how: KeysTo) {
+        self.keys_to = Some(match (self.keys_to, how) {
+            (Some(KeysTo::Pane), _) | (_, KeysTo::Pane) => KeysTo::Pane,
+            (Some(KeysTo::Closed), _) | (_, KeysTo::Closed) => KeysTo::Closed,
+            _ => KeysTo::Follow,
+        });
     }
 
     /// The focused pane's composer takes the keys at the next frame
-    /// ([`AppView::apply_composer_focus`]), never now: a composer focused
-    /// and left before a frame is drawn never hears its blur (GPUI sends
-    /// focus events from what each frame drew), so its caret would blink,
-    /// a frame every 500 ms, for the window's life.
+    /// ([`AppView::apply_keys`], as a pane key asks), never now: a
+    /// composer focused and left before a frame is drawn never hears its
+    /// blur (GPUI sends focus events from what each frame drew), so its
+    /// caret would blink, a frame every 500 ms, for the window's life.
     pub(crate) fn focus_composer(&mut self, cx: &mut Context<Self>) {
-        self.composer_focus = true;
+        self.ask_keys(KeysTo::Pane);
         cx.notify();
     }
 
-    /// At the top of a frame: the composer [`AppView::focus_composer`]
-    /// asked for, the focused pane's (its session's; a view draws none).
-    pub(crate) fn apply_composer_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !std::mem::take(&mut self.composer_focus) {
-            return;
-        }
+    /// Who has the keys now, as the focus mark sees it.
+    fn keys_at(&self, window: &Window, cx: &App) -> KeysAt {
         let focused = self.panes.focused;
-        let composer = self.in_pane(focused, |v| v.model.tabs.view().is_none().then(|| v.panes.cur.composer.clone())).flatten();
-        if let Some(c) = composer {
-            c.update(cx, |s, cx| s.focus(window, cx));
+        // A view's fields (Settings' find, a value or a colour being
+        // edited) are the pane's that shows that view.
+        let view_field =
+            [&self.settings_find, &self.settings_input, &self.hex_input].iter().any(|f| f.read(cx).focus_handle(cx).is_focused(window));
+        for p in self.panes.iter() {
+            let tabs = if p.id == self.panes.cur.id { &self.model.tabs } else { &p.parked.tabs };
+            let has = p.composer.read(cx).focus_handle(cx).is_focused(window)
+                || p.secret_input.read(cx).focus_handle(cx).is_focused(window)
+                || p.allow_all_focus.is_focused(window)
+                || (view_field && tabs.view() == Some(crate::tabs::Kind::Settings));
+            if has {
+                return if p.id == focused { KeysAt::Focused } else { KeysAt::Other };
+            }
+        }
+        let shows_view = self.panes.get(focused).is_some_and(|p| {
+            let tabs = if p.id == self.panes.cur.id { &self.model.tabs } else { &p.parked.tabs };
+            tabs.view().is_some()
+        });
+        match window.focused(cx) {
+            // The root under a view is its surface (its keys' fallbacks).
+            Some(f) if f == self.focus => {
+                if shows_view {
+                    KeysAt::Focused
+                } else {
+                    KeysAt::Root
+                }
+            }
+            Some(f) if [&self.find_input, &self.palette_input, &self.name_input].iter().any(|i| i.read(cx).focus_handle(cx) == f) => {
+                KeysAt::Window
+            }
+            Some(_) if view_field => KeysAt::Window,
+            // Nothing, or an input gone with its pane.
+            _ => KeysAt::Nowhere,
         }
     }
 
-    /// [`AppView::focus_pane`] without the keyboard (a rail click, an
-    /// event): the pane is the focused one, its card's keys wait again.
+    /// At the top of a frame: the keys follow the focus mark, as
+    /// [`AppView::ask_keys`] asked (one source of truth, Shady #36 M1),
+    /// to the focused pane's composer, or the root if it shows a view.
+    /// Whatever the focused pane has focused itself keeps them (a click's
+    /// own target: its secret field, its Allow all box; Shady #36 H2), as
+    /// does anything outside the panes unless a pane key asked.
+    pub(crate) fn apply_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(how) = self.keys_to.take() else { return };
+        let at = self.keys_at(window, cx);
+        let go = match (how, at) {
+            (_, KeysAt::Focused) => false,
+            (_, KeysAt::Other) => true,
+            (KeysTo::Pane, _) => true,
+            (KeysTo::Closed, KeysAt::Nowhere) => true,
+            _ => false,
+        };
+        if !go {
+            return;
+        }
+        let focused = self.panes.focused;
+        match self.in_pane(focused, |v| v.model.tabs.view().is_none().then(|| v.panes.cur.composer.clone())).flatten() {
+            Some(c) => c.update(cx, |s, cx| s.focus(window, cx)),
+            None => window.focus(&self.focus, cx),
+        }
+    }
+
+    /// [`AppView::focus_pane`] without the keyboard (a rail click, a find,
+    /// an Open, a view opened again): the pane is the focused one, its
+    /// card's keys wait again, and the keys follow if another pane has them.
     pub(crate) fn focus_quiet(&mut self, id: PaneId) -> bool {
         if !self.enter_pane(id) {
             return false;
         }
         if std::mem::replace(&mut self.panes.focused, id) != id {
             self.close_menu();
-            if let Some(c) = self.panes.cur.card.as_mut() {
-                c.arm.restart(std::time::Instant::now());
-            }
+            // Its card's keys wait again, with their repaint (Shady #36 n7).
+            self.keys_rearm = true;
+            self.ask_keys(KeysTo::Follow);
             self.model.rail_gen += 1;
             self.model.view_dirty = true;
         }
@@ -677,20 +767,27 @@ impl crate::app::AppView {
 
     /// Alt+N: pane `n` (0-based) in reading order; F6 / Shift+F6: the
     /// next or previous one, round.
-    pub(crate) fn focus_nth(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_nth(&mut self, n: usize, cx: &mut Context<Self>) {
+        // One pane (or split panes off): not a key (Shady #36 L1).
+        if !self.split_on() || !self.panes.split() {
+            return;
+        }
         if let Some(&id) = self.reading_order().get(n) {
-            self.focus_pane(id, window, cx);
+            self.focus_pane(id, KeysTo::Pane, cx);
             self.focus_composer(cx);
         }
     }
 
-    pub(crate) fn focus_step(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_step(&mut self, back: bool, cx: &mut Context<Self>) {
+        if !self.split_on() {
+            return;
+        }
         let order = self.reading_order();
         let Some(i) = order.iter().position(|p| *p == self.panes.focused) else { return };
         let n = order.len();
         let j = if back { (i + n - 1) % n } else { (i + 1) % n };
         if j != i {
-            self.focus_nth(j, window, cx);
+            self.focus_nth(j, cx);
         }
     }
 
@@ -744,7 +841,7 @@ impl crate::app::AppView {
         pane.full_rebuild = true;
         self.panes.tree = tree;
         self.panes.rest.push(pane);
-        self.focus_pane(new, window, cx);
+        self.focus_pane(new, KeysTo::Pane, cx);
         if let Some((s, label)) = session {
             self.model.tabs.open(&s, &label, crate::tabs::Place::New);
             self.model.rail_gen += 1;
@@ -810,8 +907,21 @@ impl crate::app::AppView {
         let (Some(to), Some(tree)) = (self.panes.tree.neighbour(id), self.panes.tree.remove(id)) else { return };
         let live = self.panes.cur.live;
         self.panes.tree = tree;
-        self.panes.focused = to;
-        self.enter_pane(to);
+        // Focus moves only off the pane that had it (Shady #36 L3b: a close
+        // an event made never takes it from the pane in use), and the keys
+        // with it, from the inputs that went (L3a).
+        if self.panes.focused == id {
+            self.panes.focused = to;
+            self.keys_rearm = true;
+            self.ask_keys(KeysTo::Closed);
+        }
+        // What it sent still unconfirmed goes back to a pane on its store
+        // (Shady #36 L5).
+        if let Some(other) = self.panes.iter().find(|p| p.id != id && p.live == live).map(|p| p.id) {
+            self.model.lives[live].in_flight.rehome(id, other);
+        }
+        let next = self.panes.focused;
+        self.enter_pane(next);
         if let Some(i) = self.panes.rest.iter().position(|p| p.id == id) {
             drop(self.panes.rest.remove(i));
         }
@@ -901,7 +1011,7 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
                 for (at, side) in shape(n) {
                     act(cx, &|v, w, cx| {
                         if let Some(i) = at {
-                            v.focus_nth(i, w, cx);
+                            v.focus_nth(i, cx);
                         }
                         v.split_pane(side, w, cx);
                     });
@@ -929,25 +1039,25 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
             sleep(2.0).await;
             for what in ["f6", "f6", "shift-f6", "alt-1"] {
                 mark(what);
-                act(cx, &|v, w, cx| match what {
-                    "f6" => v.focus_step(false, w, cx),
-                    "shift-f6" => v.focus_step(true, w, cx),
-                    _ => v.focus_nth(0, w, cx),
+                act(cx, &|v, _, cx| match what {
+                    "f6" => v.focus_step(false, cx),
+                    "shift-f6" => v.focus_step(true, cx),
+                    _ => v.focus_nth(0, cx),
                 });
                 sleep(1.2).await;
             }
             mark("drafts");
             for (i, text) in [(1usize, "a draft in the right pane"), (0, "and one in the left")] {
                 act(cx, &|v, w, cx| {
-                    v.focus_nth(i, w, cx);
+                    v.focus_nth(i, cx);
                     v.panes.cur.composer.update(cx, |s, cx| s.set_value(text, w, cx));
                 });
                 sleep(1.2).await;
             }
             for _ in 0..2 {
                 mark("close");
-                act(cx, &|v, w, cx| {
-                    v.focus_nth(1, w, cx);
+                act(cx, &|v, _, cx| {
+                    v.focus_nth(1, cx);
                     if let Some(ix) = v.model.tabs.active() {
                         v.close_tab(ix);
                     }

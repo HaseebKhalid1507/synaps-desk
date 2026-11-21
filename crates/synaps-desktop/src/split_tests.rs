@@ -9,7 +9,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::{AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{
+    AnyWindowHandle, AppContext as _, Bounds, Entity, Focusable as _, Pixels, Point, TestAppContext, VisualTestContext, WindowBounds,
+    WindowOptions, px, size,
+};
 use serde_json::{Value, json};
 use synaps_client::{Client, ClientOptions, Endpoint, Event, Identity};
 
@@ -136,7 +139,13 @@ fn attached(sid: &str, prompt: Option<u64>) -> Value {
         .collect();
     json!({"type": "attached", "client": 2, "input_owner": 2, "client_input": "shared",
         "meta": {"id": sid, "model": "m", "lifecycle": "live"},
-        "conversation": {"api_messages": [], "messages_len": 0}, "pending_prompts": prompts})
+        "conversation": conversation(), "pending_prompts": prompts})
+}
+
+/// A short conversation (a list with rows: a prompt's card is drawn as one).
+fn conversation() -> Value {
+    let messages = synaps_client::synthetic::history(4, 7);
+    json!({"api_messages": messages, "messages_len": messages.len()})
 }
 
 /// The client's events into the view, as its pump hands them
@@ -288,23 +297,6 @@ fn key(cx: &mut TestAppContext, window: AnyWindowHandle, k: &str) {
     cx.run_until_parked();
 }
 
-/// A mouse-down and up at the centre of pane `i` (its `pane i` bounds).
-fn click_pane(cx: &mut TestAppContext, window: AnyWindowHandle, i: usize) {
-    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, VisualTestContext};
-    let mut vcx = VisualTestContext::from_window(window, cx);
-    let b = vcx.debug_bounds(format!("pane {i}").leak()).expect("the pane drawn");
-    let position = b.center();
-    vcx.simulate_event(MouseDownEvent {
-        button: MouseButton::Left,
-        position,
-        modifiers: Modifiers::default(),
-        click_count: 1,
-        first_mouse: false,
-    });
-    vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 });
-    vcx.run_until_parked();
-}
-
 fn names(c: &mut Conn) -> Vec<String> {
     c.cmds(Duration::from_millis(400)).iter().filter_map(|c| c["cmd"].as_str().map(str::to_string)).collect()
 }
@@ -318,6 +310,16 @@ fn on_a(
     name: &str,
     prompt: Option<u64>,
 ) -> (AnyWindowHandle, Entity<AppView>, Client, Conn, mpsc::Receiver<Conn>, async_channel::Receiver<Event>) {
+    on_a_as(cx, name, attached(A, prompt))
+}
+
+/// [`on_a`] with A's `Attached` as given (a secret prompt up, say).
+#[allow(clippy::type_complexity)]
+fn on_a_as(
+    cx: &mut TestAppContext,
+    name: &str,
+    attached_a: Value,
+) -> (AnyWindowHandle, Entity<AppView>, Client, Conn, mpsc::Receiver<Conn>, async_channel::Receiver<Event>) {
     let (window, view) = open(cx);
     let (path, attaches) = start(name);
     let (client, events) = Client::spawn(ClientOptions::new(Endpoint::Socket(path), Identity::desktop())).expect("a client thread");
@@ -330,7 +332,7 @@ fn on_a(
         cx.notify();
     });
     let mut a = attaches.recv_timeout(T).expect("A's attach at the daemon");
-    a.send(attached(A, prompt));
+    a.send(attached_a);
     feed(cx, window, &view, &events, "A attached", |v| v.model.lives[v.panes.cur.live].is_active(A));
     (window, view, client, a, attaches, events)
 }
@@ -375,11 +377,14 @@ fn ctrl_backslash_splits_beside_and_the_last_tab_closes_the_pane(cx: &mut TestAp
 }
 
 /// split/architecture.md §6.4 (the highest product risk), through the
-/// view with two panes on two sessions, each with its prompt #1 up: the
-/// Allow, HALT and message go out on the focused pane's own attachment,
-/// never the other's, in both directions; focus moves by Alt+1 and by a
-/// click in the pane. B's attach goes beside A's (A's connection gets no
-/// detach), and the pane on B closing detaches B only.
+/// window's input (Shady #36 M3: keys and clicks, never the methods) with
+/// two panes on two sessions, each with its prompt #1 up: a message typed
+/// and sent with Enter, a click on Allow and Esc Esc (HALT) go out on the
+/// focused pane's own attachment, never the other's, in both directions.
+/// A click on the unfocused pane's Allow focuses it and answers at once
+/// (split.md §7), and typing follows it there; Alt+1 moves the focus and
+/// the keys. B's attach goes beside A's (A's connection gets no detach),
+/// and the pane on B closing detaches B only.
 #[gpui_kit::test]
 fn input_goes_only_to_the_focused_panes_own_attachment(cx: &mut TestAppContext) {
     let (window, view, client, mut a, attaches, events) = on_a(cx, "panes-two", Some(1));
@@ -409,27 +414,50 @@ fn input_goes_only_to_the_focused_panes_own_attachment(cx: &mut TestAppContext) 
         assert_eq!(v.may_drive(B), Ok(()));
         assert_eq!(v.may_drive(A), Err("its session is in another pane: focus that pane first"));
     });
-    let act = |cx: &mut TestAppContext, what: &str| {
-        view.update(cx, |v, _| {
-            let key = v.panes.cur.card.as_ref().map(|c| c.key).expect("the focused pane's card");
-            assert!(v.answer(key, Some(crate::model::CONFIRM_YES.into())), "{what}: Allow went");
-            v.halt();
-            assert!(v.enter(format!("hello {what}")), "{what}: the message went");
-        })
-    };
-    act(cx, "B");
-    assert_eq!(names(&mut b), ["answer", "cancel", "submit"], "on B's attachment");
+    // B's pane has the keys (the split's composer): a message, Enter.
+    assert!(keys_in(cx, window, &view, pb, false), "the new pane's composer has the keys");
+    type_enter(cx, window, "hello B");
+    assert_eq!(names(&mut b), ["submit"], "the message on B's attachment");
     assert!(names(&mut a).is_empty(), "nothing on A's");
-    // Alt+1: the first pane in reading order.
-    key(cx, window, "alt-1");
-    view.read_with(cx, |v, _| assert_eq!((v.panes.focused, v.panes.cur.id), (pa, pa), "Alt+1 focused the first pane"));
-    feed(cx, window, &view, &events, "A's card armed again", |v| v.panes.cur.card.as_ref().is_some_and(|c| c.armed()));
-    act(cx, "A");
-    assert_eq!(names(&mut a), ["answer", "cancel", "submit"], "on A's attachment");
+    // A click on A's Allow, in the unfocused pane: it focuses that pane and
+    // answers A's prompt, at once.
+    let allow = in_pane_at(cx, window, "allow-fill", pa);
+    click_at(cx, window, allow);
+    frame(cx, window);
+    view.read_with(cx, |v, _| assert_eq!((v.panes.focused, v.panes.cur.id), (pa, pa), "the click focused the first pane"));
+    assert_eq!(names(&mut a), ["answer"], "Allow on A's attachment");
     assert!(names(&mut b).is_empty(), "nothing on B's");
-    // A click in the second pane focuses it (a capture: whatever it hit).
-    click_pane(cx, window, 1);
-    view.read_with(cx, |v, _| assert_eq!(v.panes.focused, pb, "the click focused the second pane"));
+    // The click gave A's card the keys (the root: its own target, never
+    // overridden), so B's composer has none.
+    assert!(root_has_keys(cx, window, &view), "the card the click hit has the keys");
+    assert!(!keys_in(cx, window, &view, pb, false), "B's composer gave up the keys");
+    // A click in A's composer, then a message: A's session.
+    let at = composer_at(cx, window, pa);
+    click_at(cx, window, at);
+    frame(cx, window);
+    assert!(keys_in(cx, window, &view, pa, false), "A's composer has the keys after a click in it");
+    type_enter(cx, window, "hello A");
+    assert_eq!(names(&mut a), ["submit"], "the message on A's attachment");
+    assert!(names(&mut b).is_empty(), "nothing on B's");
+    // Esc Esc in A's composer, A's turn running and its card answered: HALT.
+    a.send(json!({"type": "event", "session_id": A, "seq": 1, "ts": "t", "event": {"ev": "prompt_resolved", "prompt_id": 1}}));
+    a.send(json!({"type": "event", "session_id": A, "seq": 2, "ts": "t", "event": {"ev": "turn_started", "turn_baseline": 0, "trigger": "user"}}));
+    feed(cx, window, &view, &events, "A's card gone, its turn running", |v| v.panes.cur.card.is_none() && v.halt_shown());
+    // (A key let go and pressed again within `FoldKeys::PAIR` is a repeat.)
+    key(cx, window, "escape");
+    std::thread::sleep(Duration::from_millis(40));
+    key(cx, window, "escape");
+    assert_eq!(names(&mut a), ["cancel"], "HALT on A's attachment");
+    assert!(names(&mut b).is_empty(), "nothing on B's");
+    // Alt+2: the second pane, its keys; B's Allow by a click there.
+    key(cx, window, "alt-2");
+    view.read_with(cx, |v, _| assert_eq!((v.panes.focused, v.panes.cur.id), (pb, pb), "Alt+2 focused the second pane"));
+    assert!(keys_in(cx, window, &view, pb, false), "B's composer has the keys after Alt+2");
+    type_enter(cx, window, "hello again B");
+    let allow = in_pane_at(cx, window, "allow-fill", pb);
+    click_at(cx, window, allow);
+    assert_eq!(names(&mut b), ["submit", "answer"], "the message and Allow on B's attachment");
+    assert!(names(&mut a).is_empty(), "nothing on A's");
     // Its last tab closed: the pane goes, B is detached, A is not.
     key(cx, window, "ctrl-w");
     view.read_with(cx, |v, _| {
@@ -461,11 +489,14 @@ fn the_same_session_in_two_panes_answers_once(cx: &mut TestAppContext) {
     view.read_with(cx, |v, _| assert_eq!(v.panes.focused, p0, "F6: the next pane, round"));
     key(cx, window, "shift-f6");
     view.read_with(cx, |v, _| assert_eq!(v.panes.focused, p1, "Shift+F6: back"));
-    feed(cx, window, &view, &events, "armed again", |v| v.panes.cur.card.as_ref().is_some_and(|c| c.armed()));
-    view.update(cx, |v, _| {
-        let key = v.panes.cur.card.as_ref().map(|c| c.key).expect("the card");
-        assert!(v.answer(key, Some(crate::model::CONFIRM_YES.into())));
-    });
+    // A click on the other pane's Allow (Shady #36 M3: the input, not the
+    // method): that pane focused, one answer, on the one attachment.
+    let allow = in_pane_at(cx, window, "allow-fill", p0);
+    click_at(cx, window, allow);
+    frame(cx, window);
+    view.read_with(cx, |v, _| assert_eq!(v.panes.focused, p0, "the click focused the pane it hit"));
+    let allow = in_pane_at(cx, window, "allow-fill", p1);
+    click_at(cx, window, allow);
     assert_eq!(names(&mut a), ["answer"], "one answer, on the one attachment");
     a.send(json!({"type": "event", "session_id": A, "seq": 1, "ts": "t", "event": {"ev": "prompt_resolved", "prompt_id": 1}}));
     feed(cx, window, &view, &events, "the answer landed in both panes", |v| {
@@ -500,7 +531,7 @@ fn four_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
     // first pane's composer to the new one's without a frame between.
     let _ = cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.focus_nth(0, window, cx);
+            v.focus_nth(0, cx);
             v.split_pane(Some(crate::split::Side::Down), window, cx);
         })
     });
@@ -590,6 +621,364 @@ fn two_panes_on_one_session_keep_their_own_worker_view(cx: &mut TestAppContext) 
         assert_eq!(v.panes.focused, p1);
         assert_eq!(v.model.lives[v.panes.cur.live].watch.focus(), Some("sa_2"), "the second pane's view kept");
     });
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+// ── Round 2 (Shady #36): input-level ────────────────────────────────────
+
+/// A frame drawn (its top runs what was deferred to it: the keys' move).
+fn frame(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    cx.run_until_parked();
+    let _ = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx));
+    cx.run_until_parked();
+}
+
+/// `text` typed into what has the keys, as the platform's text input,
+/// then Enter.
+fn type_enter(cx: &mut TestAppContext, window: AnyWindowHandle, text: &str) {
+    VisualTestContext::from_window(window, cx).simulate_input(text);
+    frame(cx, window);
+    key(cx, window, "enter");
+}
+
+/// A mouse-down and up at `position`.
+fn click_at(cx: &mut TestAppContext, window: AnyWindowHandle, position: Point<Pixels>) {
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 });
+    vcx.run_until_parked();
+}
+
+/// The centre of `sel`, a part of the card, as pane `id` draws it. A
+/// debug selector names the last pane drawn; with split panes each card
+/// is named by its pane (`card N`), so the part's place in that card is
+/// moved to pane `id`'s card (both cards are laid out alike).
+fn in_pane_at(cx: &mut TestAppContext, window: AnyWindowHandle, sel: &'static str, id: crate::pane::PaneId) -> Point<Pixels> {
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Allow is drawn filled or outlined (the theme's style).
+    let alt = if sel == "allow-fill" { "allow-outline" } else { sel };
+    let b = vcx.debug_bounds(sel).or_else(|| vcx.debug_bounds(alt)).unwrap_or_else(|| panic!("{sel} drawn"));
+    let from =
+        (0..4).find(|j| vcx.debug_bounds(format!("pane {j}").leak()).is_some_and(|p| p.contains(&b.center()))).expect("drawn in a pane");
+    let card =
+        |vcx: &mut VisualTestContext, j: usize| vcx.debug_bounds(format!("card {j}").leak()).unwrap_or_else(|| panic!("pane {j}'s card"));
+    let (c_from, c_to) = (card(&mut vcx, from), card(&mut vcx, id.index()));
+    b.center() - c_from.origin + c_to.origin
+}
+
+/// A point in pane `id`'s composer: the focused pane's is found by its
+/// lit bar, and every pane's composer sits alike at its pane's foot.
+fn composer_at(cx: &mut TestAppContext, window: AnyWindowHandle, id: crate::pane::PaneId) -> Point<Pixels> {
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    let bar = vcx.debug_bounds("composer-bar").expect("the focused composer's bar");
+    let at = gpui_kit::point(bar.origin.x + px(80.), bar.center().y);
+    let from =
+        (0..4).filter_map(|j| vcx.debug_bounds(format!("pane {j}").leak())).find(|p| p.contains(&bar.center())).expect("drawn in a pane");
+    let to = vcx.debug_bounds(format!("pane {}", id.index()).leak()).expect("the pane drawn");
+    at - from.origin + to.origin
+}
+
+/// Whether the window's root has the keys (a card's keys).
+fn root_has_keys(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>) -> bool {
+    cx.update_window(window, |_, w, cx| view.read(cx).focus.is_focused(w)).expect("the window")
+}
+
+/// Whether pane `id`'s composer (`secret`: its card's secret field) has
+/// the keys.
+fn keys_in(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>, id: crate::pane::PaneId, secret: bool) -> bool {
+    cx.update_window(window, |_, w, cx| {
+        let p = view.read(cx).panes.get(id).expect("the pane");
+        let h = if secret { p.secret_input.read(cx).focus_handle(cx) } else { p.composer.read(cx).focus_handle(cx) };
+        h.is_focused(w)
+    })
+    .expect("the window")
+}
+
+/// The messages (`submit`) among a connection's next commands.
+fn submits(c: &mut Conn) -> usize {
+    names(c).iter().filter(|n| *n == "submit").count()
+}
+
+/// Shady #36 H1: one session in two panes, each on its own worker, of
+/// different lengths. A page into the focused pane's (longer) worker is
+/// that pane's list's only: never pended into the other pane's list,
+/// whose start it overran (a panic in `sync_list`).
+#[gpui_kit::test]
+fn two_panes_on_one_session_each_on_its_own_worker(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-two-workers", None);
+    key(cx, window, "ctrl-\\");
+    let (p0, p1) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    let open = |cx: &mut TestAppContext, id: u64, n: usize| {
+        view.update(cx, |v, cx| {
+            let live = v.panes.cur.live;
+            let watch = &mut v.model.lives[live].watch;
+            watch.open(&crate::watch::Candidate::of(id, "w"), None, Instant::now());
+            let w = watch.worker_mut(&format!("sa_{id}")).expect("its view");
+            w.transcript.apply_history(&synaps_client::synthetic::history(n, id));
+            cx.notify();
+        });
+        frame(cx, window);
+    };
+    // The second pane on a short worker, the first on a long one.
+    open(cx, 3, 2);
+    key(cx, window, "alt-1");
+    open(cx, 2, 40);
+    // Pages into the long one.
+    for i in 0..3 {
+        view.update(cx, |v, cx| {
+            let live = v.panes.cur.live;
+            let ev: synaps_client::protocol::SessionEvent =
+                serde_json::from_value(json!({"ev": "system_notice", "text": format!("page {i}")})).expect("an event");
+            v.model.lives[live].watch.worker_mut("sa_2").expect("the long view").transcript.apply(&ev);
+            cx.notify();
+        });
+        frame(cx, window);
+    }
+    let len = |v: &AppView, h: &str| v.model.lives[v.panes.cur.live].watch.worker(h).map_or(0, |w| w.transcript.items().len());
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.cur.id, p0);
+        assert!(len(v, "sa_2") > len(v, "sa_3") + 10, "the long worker is longer: {} / {}", len(v, "sa_2"), len(v, "sa_3"));
+        assert_eq!(v.panes.cur.rows.len(), len(v, "sa_2"), "the first pane's list is its worker's");
+        assert_eq!(v.panes.rest[0].rows.len(), len(v, "sa_3"), "the second pane's list is its own worker's");
+    });
+    key(cx, window, "alt-2");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.cur.id, p1);
+        assert_eq!(v.model.lives[v.panes.cur.live].watch.focus(), Some("sa_3"), "the second pane's view kept");
+        assert_eq!(v.panes.cur.rows.len(), len(v, "sa_3"), "its list its worker's");
+    });
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// `Attached` for `sid` with secret prompt #`id` up.
+fn attached_secret(sid: &str, id: u64) -> Value {
+    json!({"type": "attached", "client": 2, "input_owner": 2, "client_input": "shared",
+        "meta": {"id": sid, "model": "m", "lifecycle": "live"},
+        "conversation": conversation(),
+        "pending_prompts": [{"id": id, "kind": "secret", "title": "Password", "prompt": "The vault's password"}]})
+}
+
+/// Shady #36 H2: the keys in one pane's composer, a click on the other
+/// pane's secret field. The click's own focus stands: the field keeps the
+/// keys after the next frame (no deferred move into that pane's plain
+/// composer), and what is typed there is the answer, never a message.
+#[gpui_kit::test]
+fn a_click_on_the_other_panes_secret_field_keeps_the_keys(cx: &mut TestAppContext) {
+    let (window, view, client, mut a, _attaches, events) = on_a_as(cx, "panes-secret", attached_secret(A, 1));
+    key(cx, window, "ctrl-\\");
+    feed(cx, window, &view, &events, "the card up in both panes, armed", |v| {
+        v.panes.cur.card.as_ref().is_some_and(|c| c.armed()) && v.panes.rest[0].card.is_some()
+    });
+    let (p0, p1) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    assert!(keys_in(cx, window, &view, p1, false), "the new pane's composer has the keys");
+    let field = in_pane_at(cx, window, "card-secret", p0);
+    click_at(cx, window, field);
+    frame(cx, window);
+    frame(cx, window);
+    view.read_with(cx, |v, _| assert_eq!(v.panes.focused, p0, "the click focused the first pane"));
+    assert!(keys_in(cx, window, &view, p0, true), "the secret field the click focused keeps the keys");
+    assert!(!keys_in(cx, window, &view, p0, false), "never its plain composer");
+    type_enter(cx, window, "hunter2");
+    let sent = names(&mut a);
+    assert!(!sent.iter().any(|c| c == "submit"), "the secret never went out as a message: {sent:?}");
+    assert!(view.read_with(cx, |v, cx| v.panes.cur.composer.read(cx).value().is_empty()), "nothing typed into the composer");
+    assert_eq!(sent, ["answer"], "the secret went as the prompt's answer");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #36 M1: the focus mark and the keys never come apart. With the
+/// keys in the second pane's composer (on B), each way of focusing
+/// another pane without a click (a rail click or a find, an Open, the
+/// Settings key reopening Settings where another pane holds it, Alt+N
+/// onto a pane showing Settings) moves the keys too: what is typed then
+/// goes to the marked pane's session, or (Settings) to no session.
+#[gpui_kit::test]
+fn typing_after_a_focus_change_goes_to_the_marked_pane(cx: &mut TestAppContext) {
+    let (window, view, client, mut a, attaches, events) = on_a(cx, "panes-marked", None);
+    key(cx, window, "ctrl-\\");
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    b.send(attached(B, None));
+    feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
+    let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    let _ = (names(&mut a), names(&mut b));
+    assert!(keys_in(cx, window, &view, pb, false), "B's composer has the keys");
+    // A rail click on A: the effect its row gives (`Model::open_row_in`;
+    // a find's Enter gives the same).
+    view.update(cx, |v, cx| {
+        v.effect(crate::model::Effect::Attach { session_id: A.into(), fallback: None, open: false, place: crate::tabs::Place::Current });
+        cx.notify();
+    });
+    frame(cx, window);
+    view.read_with(cx, |v, _| assert_eq!(v.panes.focused, pa, "the rail click focused A's pane"));
+    type_enter(cx, window, "after the rail click");
+    assert_eq!((submits(&mut a), submits(&mut b)), (1, 0), "after a rail click: on A's session");
+    // Back to B by Alt+2, then an Open of A.
+    key(cx, window, "alt-2");
+    type_enter(cx, window, "on B");
+    assert_eq!((submits(&mut a), submits(&mut b)), (0, 1), "after Alt+2: on B's session");
+    view.update(cx, |v, cx| {
+        v.effect(crate::model::Effect::Attach { session_id: A.into(), fallback: None, open: true, place: crate::tabs::Place::Current });
+        cx.notify();
+    });
+    frame(cx, window);
+    view.read_with(cx, |v, _| assert_eq!(v.panes.focused, pa, "the Open focused A's pane"));
+    type_enter(cx, window, "after the open");
+    assert_eq!((submits(&mut a), submits(&mut b)), (1, 0), "after an Open: on A's session");
+    // Settings in the second pane; from the first, its key again.
+    let settings = crate::views::view_keys(cfg!(target_os = "macos"), cfg!(target_os = "linux")).0;
+    key(cx, window, "alt-2");
+    key(cx, window, settings);
+    view.read_with(cx, |v, _| assert!(v.model.tabs.view().is_some(), "Settings in the second pane"));
+    key(cx, window, "alt-1");
+    type_enter(cx, window, "on A");
+    assert_eq!((submits(&mut a), submits(&mut b)), (1, 0), "after Alt+1: on A's session");
+    key(cx, window, settings);
+    frame(cx, window);
+    view.read_with(cx, |v, _| assert_eq!(v.panes.focused, pb, "the Settings key focused the pane holding Settings"));
+    assert!(!keys_in(cx, window, &view, pa, false), "A's composer gave up the keys");
+    type_enter(cx, window, "into Settings");
+    assert_eq!((submits(&mut a), submits(&mut b)), (0, 0), "with Settings marked: no session's");
+    // Alt+1, then Alt+2 onto the pane showing Settings.
+    key(cx, window, "alt-1");
+    key(cx, window, "alt-2");
+    assert!(!keys_in(cx, window, &view, pa, false), "Alt+2 onto Settings: A's composer gave up the keys");
+    type_enter(cx, window, "into Settings again");
+    assert_eq!((submits(&mut a), submits(&mut b)), (0, 0), "Alt+N onto Settings: no session's");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #36 M2: a worker's view in the unfocused pane stays when that
+/// worker ends, as the focused pane's does (its final output is what the
+/// pane is watching for).
+#[gpui_kit::test]
+fn an_unfocused_panes_worker_view_stays_when_its_worker_ends(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-worker-ends", None);
+    key(cx, window, "ctrl-\\");
+    view.update(cx, |v, cx| {
+        let live = v.panes.cur.live;
+        v.model.lives[live].watch.open(&crate::watch::Candidate::of(2, "sleeper"), None, Instant::now());
+        cx.notify();
+    });
+    frame(cx, window);
+    key(cx, window, "alt-1");
+    // It ends; the first pane's tray syncs (and prunes what nobody watches).
+    view.update(cx, |v, cx| {
+        let live = v.panes.cur.live;
+        v.model.lives[live].watch.worker_mut("sa_2").expect("its view").finished_at = Some(Instant::now());
+        v.tray.key = None;
+        cx.notify();
+    });
+    frame(cx, window);
+    frame(cx, window);
+    key(cx, window, "alt-2");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.model.lives[v.panes.cur.live].watch.focus(), Some("sa_2"), "the second pane's view of the ended worker stayed");
+        assert!(v.panes.cur.column_of.is_some(), "its list still the worker's");
+    });
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #36 L1: with split panes off, the pane keys are not keys at all
+/// (main's window): Alt+1 (Ctrl+1 on macOS) in the palette's field leaves
+/// the keys there.
+#[gpui_kit::test]
+fn with_split_panes_off_alt_1_is_not_a_pane_key(cx: &mut TestAppContext) {
+    let (window, view) = open(cx);
+    assert!(!view.read_with(cx, |v, _| v.split_on()), "split panes off");
+    key(cx, window, crate::app::palette_keys(cfg!(target_os = "macos")).1);
+    frame(cx, window);
+    let in_palette = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| view.read(cx).palette_input.read(cx).focus_handle(cx).is_focused(w)).unwrap()
+    };
+    assert!(in_palette(cx), "the palette's field has the keys");
+    let nth = if cfg!(target_os = "macos") { "ctrl-1" } else { "alt-1" };
+    key(cx, window, nth);
+    frame(cx, window);
+    assert!(in_palette(cx), "{nth} with split panes off: the palette's field keeps the keys");
+}
+
+/// Shady #36 L2 (#31 M4.1): another pane's store attaching leaves the
+/// focused pane's open menu open.
+#[gpui_kit::test]
+fn another_panes_attach_leaves_the_open_menu(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, events) = on_a(cx, "panes-menu", None);
+    key(cx, window, "ctrl-\\");
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    key(cx, window, "alt-1");
+    view.update(cx, |v, cx| {
+        // A worker's menu, opened with the mouse (it stays until closed).
+        let at = crate::menu::At::Point(gpui_kit::point(px(200.), px(200.)));
+        let target = crate::wtabs::Target { session: A.into(), who: crate::wtabs::Who::new(2, "w", None), tab: None };
+        v.menu = Some((crate::menu::Menu::new(vec![crate::menu::Item::new(crate::wtabs::Act::Open, "Open")], at, false), target));
+        cx.notify();
+    });
+    frame(cx, window);
+    assert!(view.read_with(cx, |v, _| v.menu.is_some()), "the menu open");
+    b.send(attached(B, None));
+    feed(cx, window, &view, &events, "B attached in the other pane", |v| v.panes.rest.iter().any(|p| v.model.lives[p.live].is_active(B)));
+    assert!(view.read_with(cx, |v, _| v.menu.is_some()), "the first pane's menu stayed open");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #36 L3a: Ctrl+W closes the pane whose composer had the keys:
+/// the pane focused after it has them (never nothing, where `/` opens
+/// find).
+#[gpui_kit::test]
+fn closing_the_focused_pane_gives_the_keys_to_the_next(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-close-keys", None);
+    key(cx, window, "ctrl-\\");
+    let (p0, p1) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    assert!(keys_in(cx, window, &view, p1, false), "the new pane's composer has the keys");
+    key(cx, window, "ctrl-w");
+    frame(cx, window);
+    view.read_with(cx, |v, _| assert_eq!((v.panes.len(), v.panes.focused), (1, p0)));
+    assert!(keys_in(cx, window, &view, p0, false), "the pane left has the keys");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #36 L3b: a pane closed by an event (its last tab's session went,
+/// while the other pane is in use) leaves the focus and the keys where
+/// they are.
+#[gpui_kit::test]
+fn a_pane_an_event_closes_leaves_the_focus(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-close-quiet", None);
+    key(cx, window, "ctrl-\\");
+    key(cx, window, "ctrl-\\");
+    let (first, focused) = view.read_with(cx, |v, _| (v.reading_order()[0], v.panes.focused));
+    assert_ne!(first, focused, "a pane other than the focused one");
+    assert!(keys_in(cx, window, &view, focused, false), "the focused pane's composer has the keys");
+    view.update(cx, |v, cx| {
+        v.in_pane(first, |v| v.close_pane());
+        cx.notify();
+    });
+    frame(cx, window);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.len(), 2);
+        assert_eq!((v.panes.focused, v.panes.cur.id), (focused, focused), "the focus stayed");
+    });
+    assert!(keys_in(cx, window, &view, focused, false), "and the keys");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }

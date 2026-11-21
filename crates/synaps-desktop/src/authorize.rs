@@ -893,7 +893,7 @@ impl AppView {
                             .gap(px(8.))
                             .items_center()
                             .child(
-                                div().flex_1().min_w_0().max_w(px((260. * r).round())).child(
+                                div().flex_1().min_w_0().max_w(px((260. * r).round())).debug_selector(|| "card-secret".into()).child(
                                     gpui_kit::component::input::Input::new(&self.panes.cur.secret_input)
                                         .disabled(!can)
                                         .text_px(m.mono)
@@ -1203,9 +1203,16 @@ impl AppView {
             .track_scroll(&c.actions)
             .child(h_flex().flex_1().min_w_0().gap(px(16.)).items_center().children(folder).children(check))
             .children(actions.map(|a| a.flex_none().justify_end()));
+        // With split panes, each pane's card is named by its pane (tests).
+        let pane = self.panes.split().then(|| self.panes.cur.id.index());
         v_flex()
             .id("prompt-card")
-            .debug_selector(move || if live { "card".into() } else { "card-exit".into() })
+            .debug_selector(move || match (live, pane) {
+                (true, None) => "card".into(),
+                (true, Some(i)) => format!("card {i}"),
+                (false, None) => "card-exit".into(),
+                (false, Some(i)) => format!("card-exit {i}"),
+            })
             .w_full()
             .relative()
             .rounded(px(crate::cards::Geo::of(m).radius))

@@ -453,6 +453,13 @@ pub struct ViewFocus {
     esc_guard: Option<Instant>,
 }
 
+impl ViewFocus {
+    /// The worker it views, if one.
+    pub fn handle(&self) -> Option<&str> {
+        self.focus.as_deref()
+    }
+}
+
 /// A session's worker views and the watch bookkeeping (one per tab: it
 /// goes to the tab cache with the transcript).
 #[derive(Debug, Default)]
@@ -487,6 +494,9 @@ pub struct Watch {
     held: Vec<String>,
     /// Views put on screen so far (each view's [`Worker::shown`]).
     shown: u64,
+    /// The views other panes on this store have on screen, parked
+    /// ([`Watch::park`]): kept as the focused one is (Shady #36 M2).
+    parked: Vec<String>,
 }
 
 impl Watch {
@@ -599,7 +609,6 @@ impl Watch {
         self.scrolled_back = false;
     }
 
-    /// Back to the session's thread (its list is exactly as it was left).
     /// The view on screen, taken out (split panes, #31: a pane's own
     /// worker focus): its handle, its scroll-back and its Esc guard. The
     /// poll in flight stays (its reply is matched by handle); only the
@@ -616,6 +625,13 @@ impl Watch {
         self.esc_guard = v.esc_guard;
     }
 
+    /// The views other panes on this store have parked: they stay, finished
+    /// or not, as the focused one does ([`Watch::prune`], [`Watch::hold`]).
+    pub fn keep_parked(&mut self, handles: Vec<String>) {
+        self.parked = handles;
+    }
+
+    /// Back to the session's thread (its list is exactly as it was left).
     pub fn focus_main(&mut self) {
         self.focus = None;
         self.next_poll = None;
@@ -673,13 +689,15 @@ impl Watch {
         let released = handles.split_off(handles.len().min(HELD_VIEWS));
         self.held = handles;
         if released.iter().any(|h| self.workers.contains_key(h)) {
-            let focus = self.focus.clone();
-            self.retain(|id, w| focus.as_deref() == Some(id) || w.unsent.is_some() || !released.iter().any(|h| h == id));
+            let (focus, parked) = (self.focus.clone(), self.parked.clone());
+            self.retain(|id, w| {
+                focus.as_deref() == Some(id) || parked.iter().any(|p| p == id) || w.unsent.is_some() || !released.iter().any(|h| h == id)
+            });
         }
     }
 
     fn kept(&self, id: &str) -> bool {
-        self.focus.as_deref() == Some(id) || self.held.iter().any(|h| h == id)
+        self.focus.as_deref() == Some(id) || self.held.iter().any(|h| h == id) || self.parked.iter().any(|h| h == id)
     }
 
     /// Worker `handle_id`'s handle names another worker now (its tab's
@@ -853,7 +871,8 @@ impl Watch {
         self.pending = None;
         self.steers.clear();
         let (focus, held) = (self.focus.clone(), std::mem::take(&mut self.held));
-        self.retain(|id, _| focus.as_deref() == Some(id) || held.iter().any(|h| h == id));
+        let parked = self.parked.clone();
+        self.retain(|id, _| focus.as_deref() == Some(id) || held.iter().any(|h| h == id) || parked.iter().any(|h| h == id));
         self.held = held;
         for w in self.workers.values_mut() {
             w.steerable = false;

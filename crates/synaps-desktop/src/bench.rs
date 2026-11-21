@@ -1236,10 +1236,12 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     for step in crate::pane::shape(n) {
                         let _ = view.update_in(cx, |v, w, cx| {
                             if let Some(i) = step.0 {
-                                v.focus_nth(i, w, cx);
+                                v.focus_nth(i, cx);
                             }
                             v.split_pane(step.1, w, cx);
-                            v.composer_focus &= caret;
+                            if !caret {
+                                v.keys_to = None;
+                            }
                             cx.notify();
                         });
                         sleep(0.4).await;

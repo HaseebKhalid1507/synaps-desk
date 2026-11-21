@@ -393,6 +393,26 @@ const ALLOW_ALL_CTX: &str = "AllowAll";
 /// listener).
 const MENU_CTX: &str = "Menu";
 
+/// The root's key context with split panes on: the pane keys
+/// ([`pane_keys`]) are bound in it only.
+const PANES_CTX: &str = "Panes";
+
+/// The root's key context: a menu's (it outranks the card's Allow all
+/// box, as it always has), else the box's, and the panes' with split
+/// panes on.
+fn root_context(card_tab: bool, menu: bool, panes: bool) -> Option<KeyContext> {
+    let mut c = KeyContext::default();
+    if menu {
+        c.add(MENU_CTX);
+    } else if card_tab {
+        c.add(ALLOW_ALL_CTX);
+    }
+    if panes {
+        c.add(PANES_CTX);
+    }
+    (!c.is_empty()).then_some(c)
+}
+
 /// Ctrl+B folds the sessions rail, Ctrl+Alt+B the right panel; Ctrl+= /
 /// Ctrl+- / Ctrl+0 step the centre pane's text size; the tab keys
 /// ([`tab_keys`]). Cmd on macOS. The composer and inputs bind none of them.
@@ -451,16 +471,19 @@ pub fn bind_keys(cx: &mut App) {
     let (goto, commands) = palette_keys(mac);
     keys.push(KeyBinding::new(goto, OpenGoTo, None));
     keys.push(KeyBinding::new(commands, OpenCommands, None));
+    // Only with split panes on (the root's `PANES_CTX`): off, these keys
+    // are main's, never swallowed (Shady #36 L1).
     for &(k, a) in &pane_keys(mac) {
+        let c = Some(PANES_CTX);
         keys.push(match a {
-            PaneKey::Split => KeyBinding::new(k, SplitRight, None),
-            PaneKey::SplitDown => KeyBinding::new(k, SplitDown, None),
-            PaneKey::Nth(0) => KeyBinding::new(k, FocusPane1, None),
-            PaneKey::Nth(1) => KeyBinding::new(k, FocusPane2, None),
-            PaneKey::Nth(2) => KeyBinding::new(k, FocusPane3, None),
-            PaneKey::Nth(_) => KeyBinding::new(k, FocusPane4, None),
-            PaneKey::Next => KeyBinding::new(k, FocusNextPane, None),
-            PaneKey::Prev => KeyBinding::new(k, FocusPrevPane, None),
+            PaneKey::Split => KeyBinding::new(k, SplitRight, c),
+            PaneKey::SplitDown => KeyBinding::new(k, SplitDown, c),
+            PaneKey::Nth(0) => KeyBinding::new(k, FocusPane1, c),
+            PaneKey::Nth(1) => KeyBinding::new(k, FocusPane2, c),
+            PaneKey::Nth(2) => KeyBinding::new(k, FocusPane3, c),
+            PaneKey::Nth(_) => KeyBinding::new(k, FocusPane4, c),
+            PaneKey::Next => KeyBinding::new(k, FocusNextPane, c),
+            PaneKey::Prev => KeyBinding::new(k, FocusPrevPane, c),
         });
     }
     cx.bind_keys(keys);
@@ -1630,7 +1653,7 @@ pub struct AppView {
     /// The rail's find (`/`; Enter opens by exact name) and "Name this
     /// session…" (the naming row's) inputs.
     pub(crate) find_input: Entity<InputState>,
-    name_input: Entity<InputState>,
+    pub(crate) name_input: Entity<InputState>,
     /// The accent picker's custom colour.
     pub(crate) hex_input: Entity<InputState>,
     /// The find text, trimmed and lowercased.
@@ -1740,6 +1763,9 @@ pub struct AppView {
     /// The tabs generation handed to a save, the one written (or meant to
     /// stay unwritten), and the delayed save.
     tabs_saved: u64,
+    /// The pane whose tabs that was ([`AppView::saved_tabs`]): another
+    /// first pane's are saved whatever their generation (Shady #36 L7).
+    tabs_saved_pane: PaneId,
     tabs_written: u64,
     tabs_save: Option<Task<()>>,
     /// The same for the favourites (saved under `tabs_key` too), and the
@@ -1778,9 +1804,12 @@ pub struct AppView {
     pub(crate) split_note: Option<Task<()>>,
     /// `SYNAPS_DESK_PANES` ([`crate::pane::pane_script`]), until it runs.
     pane_script: Option<String>,
-    /// The focused pane's composer takes the keys at the next frame
-    /// ([`AppView::focus_composer`]).
-    pub(crate) composer_focus: bool,
+    /// The keys follow the focus mark at the next frame, as asked
+    /// ([`AppView::ask_keys`], [`AppView::apply_keys`]).
+    pub(crate) keys_to: Option<crate::pane::KeysTo>,
+    /// The focused pane's card's keys wait again from the next frame, with
+    /// their repaint ([`AppView::restart_card_keys`]).
+    pub(crate) keys_rearm: bool,
     pub(crate) settings_find: Entity<InputState>,
     pub(crate) settings_input: Entity<InputState>,
     pub(crate) gear_menu: bool,
@@ -2071,9 +2100,9 @@ impl AppView {
             .unwrap_or_default()
         });
         let typed = composer.read(cx).focus_handle(cx);
-        let focus_in = cx.on_focus_in(&typed, window, move |this: &mut Self, window, cx| {
+        let focus_in = cx.on_focus_in(&typed, window, move |this: &mut Self, _, cx| {
             if this.panes.split() && this.panes.focused != id {
-                this.focus_pane(id, window, cx);
+                this.focus_pane(id, crate::pane::KeysTo::Follow, cx);
             }
         });
         // Not a tab stop (Shady M1 of round 4): the kit's own Tab order
@@ -2349,6 +2378,7 @@ impl AppView {
             restore_tabs: None,
             tabs_key: None,
             tabs_saved: 0,
+            tabs_saved_pane: PaneId::FIRST,
             favs_saved: 0,
             favs_written: 0,
             favs_save: None,
@@ -2369,7 +2399,8 @@ impl AppView {
             centre: Cell::new((0., 0.)),
             split_note: None,
             pane_script: std::env::var("SYNAPS_DESK_PANES").ok(),
-            composer_focus: false,
+            keys_to: None,
+            keys_rearm: false,
             settings_find: i.settings_find,
             settings_input: i.settings_input,
             gear_menu: false,
@@ -2507,7 +2538,11 @@ impl AppView {
             // from the tray, means nothing across a reconnect (a
             // restarted daemon numbers its workers anew).
             if matches!(ev, Event::Attached { .. } | Event::Reattaching { .. }) {
-                if self.menu.is_some() || self.wmenu.is_some() {
+                // The menus are the focused pane's: another pane's attach
+                // leaves them (Shady #36 L2, #31 M4.1); a reconnect renumbers
+                // every store's workers.
+                let mine = self.panes.cur.id == self.panes.focused || matches!(ev, Event::Reattaching { .. });
+                if mine && (self.menu.is_some() || self.wmenu.is_some()) {
                     self.close_menu();
                     self.model.view_dirty = true;
                 } else if self.model.lives[self.panes.cur.live].cancels.disarm() {
@@ -2548,7 +2583,13 @@ impl AppView {
                     })
                 }
             }
-            Effect::Unsent { session, text } => self.unsent(session, text),
+            // In the pane that sent it (Shady #36 L5); closed since, one
+            // showing its session, else the focused one (its drafts or the
+            // notice).
+            Effect::Unsent { pane, session, text } => {
+                let to = if self.panes.get(pane).is_some() { pane } else { self.pane_showing(&session).unwrap_or(self.panes.focused) };
+                self.in_pane(to, |v| v.unsent(session, text));
+            }
             Effect::ListSessions => {
                 if let Some(c) = &self.client {
                     let _ = c.list_sessions();
@@ -3565,10 +3606,15 @@ impl AppView {
     }
 
     fn schedule_tabs_save(&mut self, cx: &mut Context<Self>) {
-        if self.tabs_key.is_none() || self.bench.is_some() || self.saved_tabs().generation == self.tabs_saved {
+        let first = self.panes.ids().first().copied().unwrap_or(self.panes.cur.id);
+        if self.tabs_key.is_none()
+            || self.bench.is_some()
+            || (first, self.saved_tabs().generation) == (self.tabs_saved_pane, self.tabs_saved)
+        {
             return;
         }
         self.tabs_saved = self.saved_tabs().generation;
+        self.tabs_saved_pane = first;
         self.tabs_save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_DELAY).await;
             let job = this
@@ -4718,6 +4764,12 @@ impl AppView {
                 log::info!(target: "synaps_desktop::card", "card {key:?}: answered {what}");
                 self.model.lives[self.panes.cur.live].answer_sent(key.1);
                 self.sent = Some(crate::authorize::Sent { key, answer, at: crate::authorize::hhmm_now(), took });
+                // The same session's card in another pane: this window's
+                // answer there too, never "answered elsewhere" (Shady #36 n5).
+                let live = self.panes.cur.live;
+                for p in self.panes.rest.iter_mut().filter(|p| p.live == live) {
+                    p.parked.sent = self.sent.clone();
+                }
                 true
             }
             Err(_) => {
@@ -5446,8 +5498,14 @@ impl AppView {
         // A splice that adds items (a delta to the last one adds no row).
         let live_splice = splice.as_ref().is_some_and(|sp| sp.start > 0 && sp.new_len > sp.old_len && sp.new_len <= sp.old_len + 16)
             && !self.panes.cur.full_rebuild;
-        if std::mem::take(&mut self.panes.cur.full_rebuild) {
-            let n = self.model.lives[self.panes.cur.live].shown().len();
+        let n = self.model.lives[self.panes.cur.live].shown().len();
+        // A splice from past the transcript's end is not this list's (never,
+        // since Shady #36 H1): built again rather than read out of range.
+        let stray = splice.as_ref().is_some_and(|sp| sp.start > n || sp.start > self.panes.cur.rows.len());
+        if stray {
+            log::warn!(target: "synaps_desktop::list", "a splice past the list's end ({splice:?}, {n} items): rebuilt");
+        }
+        if std::mem::take(&mut self.panes.cur.full_rebuild) || stray {
             splice = Some(Splice { start: 0, old_len: self.panes.cur.rows.len(), new_len: n });
         }
         let items = self.model.lives[self.panes.cur.live].shown().items();
@@ -5703,11 +5761,12 @@ impl AppView {
             // One no list holds stays in its transcript, as before.
             let held = self.panes.iter().any(|p| p.live == l && (p.column_of.is_none() || p.main_column.is_some()));
             let main = if held { live.transcript.take_splice() } else { None };
-            let viewing = self.panes.iter().any(|p| p.live == l && p.column_of.is_some());
-            let worker = if viewing { live.watch.focused_mut().and_then(|w| w.transcript.take_splice()) } else { None };
+            // Each worker's list takes its own worker's splice, by view and
+            // generation (Shady #36 H1): two panes on one store can show two
+            // workers, and the store's focus is only the acting pane's.
             let mut parked: Vec<(String, u64, Option<Splice>)> = Vec::new();
-            for p in self.panes.iter() {
-                for ((h, g), _) in p.worker_columns.iter().filter(|_| p.live == l) {
+            for p in self.panes.iter().filter(|p| p.live == l) {
+                for (h, g) in p.column_of.iter().chain(p.worker_columns.iter().map(|(k, _)| k)) {
                     if !parked.iter().any(|(ph, pg, _)| ph == h && pg == g) {
                         let sp = live.watch.worker_mut(h).filter(|w| w.generation == *g).and_then(|w| w.transcript.take_splice());
                         parked.push((h.clone(), *g, sp));
@@ -5722,10 +5781,10 @@ impl AppView {
                 if let (Some(slot), Some(sp)) = (slot, main.clone()) {
                     crate::live::pend(slot, sp);
                 }
-                if pane.column_of.is_some()
-                    && let Some(sp) = worker.clone()
+                if let Some((h, g)) = &pane.column_of
+                    && let Some((_, _, Some(sp))) = parked.iter().find(|(ph, pg, _)| ph == h && pg == g)
                 {
-                    crate::live::pend(&mut pane.pending, sp);
+                    crate::live::pend(&mut pane.pending, sp.clone());
                 }
                 for ((h, g), col) in &mut pane.worker_columns {
                     if let Some((_, _, Some(sp))) = parked.iter().find(|(ph, pg, _)| ph == h && pg == g) {
@@ -6490,7 +6549,7 @@ impl AppView {
     /// The naming row's REPLACE offer: only for the session it was made
     /// for (a switch drops it).
     fn replace_offer(&self) -> Option<&crate::model::Replace> {
-        self.model.named.replace.as_ref().filter(|r| self.model.is_active(&r.session_id))
+        self.model.named.replace.as_ref().filter(|r| self.model.lives[self.panes.cur.live].is_active(&r.session_id))
     }
 
     /// The naming row, under the tab strip (F2, the session menu's Rename…,
@@ -7658,7 +7717,10 @@ impl AppView {
                     .h(px(r.h))
                     .overflow_hidden()
                     .debug_selector(move || format!("pane {}", id.index()))
-                    .capture_any_mouse_down(cx.listener(move |this, _: &MouseDownEvent, window, cx| this.focus_pane(id, window, cx)))
+                    // A click's own target keeps the keys (Shady #36 H2).
+                    .capture_any_mouse_down(
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| this.focus_pane(id, crate::pane::KeysTo::Follow, cx)),
+                    )
                     .children(el)
                     .into_any_element()
             }
@@ -7693,7 +7755,11 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
-        self.apply_composer_focus(window, cx);
+        self.apply_keys(window, cx);
+        if std::mem::take(&mut self.keys_rearm) {
+            let focused = self.panes.focused;
+            self.in_pane(focused, |v| v.restart_card_keys(cx));
+        }
         if self.pane_script.is_some()
             && self.split_on()
             && self.model.lives[self.panes.cur.live].active.is_some()
@@ -7926,21 +7992,23 @@ impl Render for AppView {
         h_flex()
             .id("root")
             .track_focus(&self.focus)
-            .when(card_tab, |d| d.key_context(ALLOW_ALL_CTX))
+            .when_some(
+                root_context(card_tab, self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some(), self.split_on()),
+                |d, c| d.key_context(c),
+            )
             .on_action(cx.listener(|this, _: &CardTab, window, cx| this.card_tab(window, cx)))
-            .when(self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some(), |d| d.key_context(MENU_CTX))
             .on_action(cx.listener(|this, _: &MenuTab, _, cx| this.menu_tab(false, cx)))
             .on_action(cx.listener(|this, _: &MenuTabBack, _, cx| this.menu_tab(true, cx)))
             .on_action(cx.listener(|this, _: &OpenGoTo, window, cx| this.open_palette(crate::palette::Mode::GoTo, window, cx)))
             .on_action(cx.listener(|this, _: &OpenCommands, window, cx| this.open_palette(crate::palette::Mode::Commands, window, cx)))
             .on_action(cx.listener(|this, _: &SplitRight, window, cx| this.split_pane(None, window, cx)))
             .on_action(cx.listener(|this, _: &SplitDown, window, cx| this.split_pane(Some(crate::split::Side::Down), window, cx)))
-            .on_action(cx.listener(|this, _: &FocusPane1, window, cx| this.focus_nth(0, window, cx)))
-            .on_action(cx.listener(|this, _: &FocusPane2, window, cx| this.focus_nth(1, window, cx)))
-            .on_action(cx.listener(|this, _: &FocusPane3, window, cx| this.focus_nth(2, window, cx)))
-            .on_action(cx.listener(|this, _: &FocusPane4, window, cx| this.focus_nth(3, window, cx)))
-            .on_action(cx.listener(|this, _: &FocusNextPane, window, cx| this.focus_step(false, window, cx)))
-            .on_action(cx.listener(|this, _: &FocusPrevPane, window, cx| this.focus_step(true, window, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane1, _, cx| this.focus_nth(0, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane2, _, cx| this.focus_nth(1, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane3, _, cx| this.focus_nth(2, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane4, _, cx| this.focus_nth(3, cx)))
+            .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| this.focus_step(false, cx)))
+            .on_action(cx.listener(|this, _: &FocusPrevPane, _, cx| this.focus_step(true, cx)))
             .map(|d| crate::palette::capture_keys(d, cx))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
