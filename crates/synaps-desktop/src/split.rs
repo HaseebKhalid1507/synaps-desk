@@ -255,19 +255,43 @@ impl Node {
         r.into_iter().map(|(id, _)| id).collect()
     }
 
-    /// Where focus goes when `id` closes (split.md §8): the pane before it
-    /// in its split (left or up), else the one after it.
+    /// Where focus goes when `id` closes (split.md §8): its left/up
+    /// neighbour (the pane before it in the nearest split where it is not
+    /// first); the top-left pane's is the one after it.
     pub(crate) fn neighbour(&self, id: PaneId) -> Option<PaneId> {
+        let mut path = Vec::new();
+        if !self.path_to(id, &mut path) {
+            return None;
+        }
+        // The nearest split above it where it is not first: the pane just
+        // before it there (left or up).
+        for (node, i) in path.iter().rev() {
+            if let Node::Split { kids, .. } = node
+                && *i > 0
+            {
+                return kids[*i - 1].leaves().last().copied();
+            }
+        }
+        // The top-left pane: the one after it.
+        match path.last()? {
+            (Node::Split { kids, .. }, i) => kids.get(i + 1)?.leaves().first().copied(),
+            _ => None,
+        }
+    }
+
+    /// The splits from the root down to `id`, each with the kid taken.
+    fn path_to<'a>(&'a self, id: PaneId, out: &mut Vec<(&'a Node, usize)>) -> bool {
         match self {
-            Node::Leaf(_) => None,
+            Node::Leaf(l) => *l == id,
             Node::Split { kids, .. } => {
-                if let Some(i) = kids.iter().position(|k| *k == Node::Leaf(id)) {
-                    let k = if i > 0 { &kids[i - 1] } else { kids.get(i + 1)? };
-                    // The nearest pane of that kid: its last if before, its first if after.
-                    let leaves = k.leaves();
-                    return if i > 0 { leaves.last().copied() } else { leaves.first().copied() };
+                for (i, k) in kids.iter().enumerate() {
+                    out.push((self, i));
+                    if k.path_to(id, out) {
+                        return true;
+                    }
+                    out.pop();
                 }
-                kids.iter().find_map(|k| k.neighbour(id))
+                false
             }
         }
     }
@@ -339,8 +363,8 @@ mod tests {
         let t = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), A).unwrap();
         let t = t.split(p(1), Side::Down, p(2), A).unwrap();
         assert_eq!(t.neighbour(p(2)), Some(p(1)), "up");
-        assert_eq!(t.neighbour(p(1)), Some(p(2)), "the first of its split: the one after");
-        assert_eq!(t.neighbour(p(0)), Some(p(1)));
+        assert_eq!(t.neighbour(p(1)), Some(p(0)), "first in its column: the pane to its left");
+        assert_eq!(t.neighbour(p(0)), Some(p(1)), "the top-left pane: the one after it");
         let t2 = t.remove(p(2)).unwrap();
         assert_eq!(t2, Node::Split { axis: Axis::Row, kids: vec![Node::Leaf(p(0)), Node::Leaf(p(1))], ratios: vec![0.5, 0.5] });
         assert_eq!(t2.remove(p(0)).unwrap(), Node::Leaf(p(1)));

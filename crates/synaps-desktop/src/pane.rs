@@ -598,10 +598,33 @@ impl crate::app::AppView {
         let elsewhere = self.panes.rest.iter().any(|p| {
             p.composer.read(cx).focus_handle(cx).is_focused(window) || p.secret_input.read(cx).focus_handle(cx).is_focused(window)
         });
-        if elsewhere {
-            self.panes.cur.composer.update(cx, |s, cx| s.focus(window, cx));
+        if elsewhere || self.composer_focus {
+            self.focus_composer(cx);
         }
         cx.notify();
+    }
+
+    /// The focused pane's composer takes the keys at the next frame
+    /// ([`AppView::apply_composer_focus`]), never now: a composer focused
+    /// and left before a frame is drawn never hears its blur (GPUI sends
+    /// focus events from what each frame drew), so its caret would blink,
+    /// a frame every 500 ms, for the window's life.
+    pub(crate) fn focus_composer(&mut self, cx: &mut Context<Self>) {
+        self.composer_focus = true;
+        cx.notify();
+    }
+
+    /// At the top of a frame: the composer [`AppView::focus_composer`]
+    /// asked for, the focused pane's (its session's; a view draws none).
+    pub(crate) fn apply_composer_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.composer_focus) {
+            return;
+        }
+        let focused = self.panes.focused;
+        let composer = self.in_pane(focused, |v| v.model.tabs.view().is_none().then(|| v.panes.cur.composer.clone())).flatten();
+        if let Some(c) = composer {
+            c.update(cx, |s, cx| s.focus(window, cx));
+        }
     }
 
     /// [`AppView::focus_pane`] without the keyboard (a rail click, an
@@ -657,7 +680,7 @@ impl crate::app::AppView {
     pub(crate) fn focus_nth(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(&id) = self.reading_order().get(n) {
             self.focus_pane(id, window, cx);
-            self.panes.cur.composer.update(cx, |s, cx| s.focus(window, cx));
+            self.focus_composer(cx);
         }
     }
 
@@ -727,8 +750,7 @@ impl crate::app::AppView {
             self.model.rail_gen += 1;
             self.reconcile(None);
         }
-        self.panes.cur.composer.update(cx, |s, cx| s.focus(window, cx));
-        cx.notify();
+        self.focus_composer(cx);
     }
 
     /// A split refused: the reason on the focused composer's status line

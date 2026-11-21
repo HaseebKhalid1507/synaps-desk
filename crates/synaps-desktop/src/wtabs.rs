@@ -889,7 +889,8 @@ impl AppView {
         log::debug!(target: "synaps_desktop::watch", "cancel press {handle}: {how:?} -> {pressed:?}");
         match pressed {
             Press::Fire => {
-                let seq = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.attach_seq);
+                // The pane's own attachment, as every other send (#31 M2).
+                let seq = self.model.lives[self.panes.cur.live].attachment();
                 match (&self.client, seq) {
                     (Some(c), Some(seq)) if c.on(seq).cancel_worker(handle.clone()).is_ok() => {
                         log::debug!(target: "synaps_desktop::watch", "cancel {handle} ({})", who.name);

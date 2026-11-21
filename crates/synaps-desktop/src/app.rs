@@ -1778,6 +1778,9 @@ pub struct AppView {
     pub(crate) split_note: Option<Task<()>>,
     /// `SYNAPS_DESK_PANES` ([`crate::pane::pane_script`]), until it runs.
     pane_script: Option<String>,
+    /// The focused pane's composer takes the keys at the next frame
+    /// ([`AppView::focus_composer`]).
+    pub(crate) composer_focus: bool,
     pub(crate) settings_find: Entity<InputState>,
     pub(crate) settings_input: Entity<InputState>,
     pub(crate) gear_menu: bool,
@@ -2366,6 +2369,7 @@ impl AppView {
             centre: Cell::new((0., 0.)),
             split_note: None,
             pane_script: std::env::var("SYNAPS_DESK_PANES").ok(),
+            composer_focus: false,
             settings_find: i.settings_find,
             settings_input: i.settings_input,
             gear_menu: false,
@@ -7689,6 +7693,7 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
+        self.apply_composer_focus(window, cx);
         if self.pane_script.is_some()
             && self.split_on()
             && self.model.lives[self.panes.cur.live].active.is_some()

@@ -480,6 +480,8 @@ fn the_same_session_in_two_panes_answers_once(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn four_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
     let (window, view) = open(cx);
+    // Active, as a window in use is: GPUI tells an input its blur only then.
+    let _ = cx.update_window(window, |_, window, _| window.activate_window());
     cx.update(|cx| {
         cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Full), lock: None });
         crate::motion::Level::apply(cx);
@@ -494,8 +496,14 @@ fn four_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
     let _ = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx));
     key(cx, window, "ctrl-\\");
     key(cx, window, "ctrl-shift-\\");
-    key(cx, window, "alt-1");
-    key(cx, window, "ctrl-shift-\\");
+    // Alt+1 and a split before a frame is drawn: the focus goes through the
+    // first pane's composer to the new one's without a frame between.
+    let _ = cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.focus_nth(0, window, cx);
+            v.split_pane(Some(crate::split::Side::Down), window, cx);
+        })
+    });
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "2×2 at 1280×800");
     // A fifth is refused, with the reason on the composer's line.
     key(cx, window, "ctrl-\\");
@@ -503,6 +511,10 @@ fn four_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
         assert_eq!(v.panes.len(), 4);
         assert_eq!(v.panes.cur.watch_note.as_deref(), Some("4 panes is the most"));
     });
+    // The keys on the window's root, as at launch: a focused composer's
+    // caret blinks (a frame every 500 ms, as on main), a left one's never
+    // does, however fast the focus went through the panes' composers.
+    let _ = cx.update_window(window, |_, window, cx| view.update(cx, |v, cx| window.focus(&v.focus, cx)));
     for _ in 0..240 {
         let dt = Duration::from_micros(6944);
         view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
@@ -515,6 +527,26 @@ fn four_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
     }
     let (frame, _) = view.read_with(cx, |v, _| v.fx.pending());
     assert!(!frame, "four panes at rest: a display frame");
+    // Nothing wakes on a timer: 2 s at rest, no render (a composer left
+    // with its caret blinking would draw every 500 ms). The root's focus
+    // drawn first: the blur repaints the caret away, the scrollbars'
+    // linger runs out (`scrollbar::LINGER`, then their fade).
+    for _ in 0..60 {
+        let dt = Duration::from_millis(50);
+        view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
+        cx.executor().advance_clock(dt);
+        let _ = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+    }
+    let f0 = view.read_with(cx, |v, _| v.fx.frames());
+    for i in 0..40 {
+        let dt = Duration::from_millis(50);
+        view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
+        cx.executor().advance_clock(dt);
+        let _ = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.fx.frames()), f0, "at rest, {} ms on: a render", (i + 1) * 50);
+    }
     let (sites, rail) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width));
     assert!(sites.iter().all(|s| matches!(s.beat, crate::motion::Beat::Spin(_)) && f32::from(s.origin.x) < rail), "{sites:?}");
     // Each pane drew its own column, every one IDLE_CPU's list.

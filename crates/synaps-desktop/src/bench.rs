@@ -1228,12 +1228,18 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // `SYNAPS_BENCH_PANES=N` (split panes on): N panes on it
                 // (split.md §4's shapes), settled, then their memory.
                 if let Some(n) = std::env::var("SYNAPS_BENCH_PANES").ok().and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 1) {
+                    // The keys stay on the window's root, as the 1-pane scene
+                    // has them: a split gives them to the new pane's composer
+                    // (at its next frame), whose caret blinks (2 Hz, as main's
+                    // does when focused). `SYNAPS_BENCH_PANES_CARET=1`: it does.
+                    let caret = std::env::var("SYNAPS_BENCH_PANES_CARET").as_deref() == Ok("1");
                     for step in crate::pane::shape(n) {
                         let _ = view.update_in(cx, |v, w, cx| {
                             if let Some(i) = step.0 {
                                 v.focus_nth(i, w, cx);
                             }
                             v.split_pane(step.1, w, cx);
+                            v.composer_focus &= caret;
                             cx.notify();
                         });
                         sleep(0.4).await;
