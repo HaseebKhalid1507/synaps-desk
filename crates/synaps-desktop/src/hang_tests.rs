@@ -843,13 +843,15 @@ fn a_folded_strip_lands_with_its_panel(cx: &mut TestAppContext) {
         })
         .expect("the window")
     };
-    // A strip's own quad: STRIP wide, on the window's edge, its hairline
-    // on its inner side.
-    let is_strip = |rail: bool, s: f32, q: &Quad| {
+    // A strip's own quad: STRIP wide, its hairline on its inner side, in
+    // its panel's box (`shown` wide on the window's side): landed, on the
+    // window's edge; in flight, on the panel's inner edge (#39 L1).
+    let is_strip = |rail: bool, s: f32, shown: f32, q: &Quad| {
         let (full, e) = (q.0, q.5);
+        let edge = if rail { shown.max(crate::app::STRIP) * s } else { (1920. - shown.max(crate::app::STRIP)) * s };
         (full[2] - full[0] - crate::app::STRIP * s).abs() < 0.01
             && full[3] - full[1] > 400. * s
-            && if rail { full[0].abs() < 0.01 && e[1] > 0. } else { (full[2] - 1920. * s).abs() < 0.01 && e[3] > 0. }
+            && if rail { (full[2] - edge).abs() < 0.01 && e[1] > 0. } else { (full[0] - edge).abs() < 0.01 && e[3] > 0. }
     };
     // What is painted over `at`: the ground (the last opaque quad over all
     // of it), then every quad after it there.
@@ -863,6 +865,11 @@ fn a_folded_strip_lands_with_its_panel(cx: &mut TestAppContext) {
         let mut out = vec![format!("ground {:?}", qs[ground].3)];
         out.extend(qs[ground + 1..].iter().filter_map(|q| clip(q.1, at).map(|c| format!("{c:?} {}", q.2))));
         out
+    };
+    // The strip's strength in a frame: its hairline's alpha against the
+    // landed strip's (0: no strip).
+    let strength = |frame: &(f32, Vec<Quad>), shown: f32, rail: bool, alpha: f32| -> f32 {
+        frame.1.iter().find(|q| is_strip(rail, frame.0, shown, q)).map_or(0., |q| q.4.a / alpha)
     };
     let mut fails = Vec::new();
     let mut at: [Option<(Rect, f32)>; 2] = [None, None];
@@ -893,17 +900,17 @@ fn a_folded_strip_lands_with_its_panel(cx: &mut TestAppContext) {
                 }
                 if close {
                     let (s, qs) = &frames[landed].1;
-                    let strip = qs.iter().find(|q| is_strip(rail, *s, q)).unwrap_or_else(|| panic!("{case}: its strip"));
+                    let strip = qs.iter().find(|q| is_strip(rail, *s, frames[landed].2, q)).unwrap_or_else(|| panic!("{case}: its strip"));
                     at[i] = Some((strip.1, strip.4.a));
                 }
                 let (region, alpha) = at[i].expect("folded first");
                 // The strip's strength, frame by frame: its hairline's alpha.
-                let k: Vec<f32> = frames
-                    .iter()
-                    .map(|f| {
-                        f.1.1.iter().find(|q| is_strip(rail, f.1.0, q) && clip(q.1, region) == Some(region)).map_or(0., |q| q.4.a / alpha)
-                    })
-                    .collect();
+                let k: Vec<f32> = frames.iter().map(|f| strength(&f.1, f.2, rail, alpha)).collect();
+                // L2: it follows the width drawn, frame by frame.
+                let off = |(n, k): &(usize, &f32)| (**k - crate::chrome::strip_strength(frames[*n].2)).abs() >= 0.02;
+                if let Some((n, k)) = k.iter().enumerate().find(off) {
+                    fails.push(format!("{case}: frame {n} draws the strip at {k} for a width of {}", frames[n].2));
+                }
                 if close {
                     // The landing frame against the last that moves (at Full),
                     // then every frame after it against the landing frame.
@@ -944,6 +951,136 @@ fn a_folded_strip_lands_with_its_panel(cx: &mut TestAppContext) {
                 }
             }
         }
+    }
+    // L2: a flight turned round mid-way, in the fold's tail (the strip
+    // coming in goes out again) and in the unfold's head (going out, it
+    // comes back): the strip follows the width on every frame, and the
+    // panel lands where it was.
+    motion_level(cx, &view, Level::Full);
+    settle(cx, w, 8);
+    for rail in [true, false] {
+        let i = usize::from(!rail);
+        let alpha = at[i].expect("folded before").1;
+        for (case, folded, turn) in [("tail", false, 48.), ("head", true, 40.)] {
+            let case = format!("{} turned in the {case}", if rail { "rail" } else { "right" });
+            let collapsed =
+                |cx: &mut TestAppContext| view.read_with(cx, |v, _| if rail { v.panels.rail_collapsed } else { v.panels.right_collapsed });
+            if collapsed(cx) != folded {
+                view.update(cx, |v, cx| v.toggle_panel(rail, cx));
+                cx.run_until_parked();
+                for _ in 0..400 {
+                    fluid_frame(cx, w, &view);
+                    if !view.read_with(cx, |v, _| v.panel_fx.sides[i].moving) {
+                        break;
+                    }
+                }
+                settle(cx, w, 8);
+            }
+            view.update(cx, |v, cx| v.toggle_panel(rail, cx));
+            cx.run_until_parked();
+            let (mut turned, mut rest, mut n, mut seen) = (false, 0, 0, Vec::new());
+            while n < 400 && rest < 8 {
+                fluid_frame(cx, w, &view);
+                n += 1;
+                let (moving, shown) = view.read_with(cx, |v, _| (v.panel_fx.sides[i].moving, v.panel_fx.sides[i].shown));
+                let k = strength(&quads(cx), shown, rail, alpha);
+                seen.push((shown, (k * 100.).round()));
+                if (k - crate::chrome::strip_strength(shown)).abs() >= 0.02 {
+                    fails.push(format!("{case}: frame {n} draws the strip at {k} for a width of {shown}"));
+                }
+                // Turned round once it is `turn` px wide on its way.
+                if !turned && moving && (if folded { shown >= turn } else { shown <= turn }) {
+                    turned = true;
+                    view.update(cx, |v, cx| v.toggle_panel(rail, cx));
+                    cx.run_until_parked();
+                }
+                rest = if moving || view.read_with(cx, |v, _| v.fx.pending().0) { 0 } else { rest + 1 };
+            }
+            let shown = view.read_with(cx, |v, _| v.panel_fx.sides[i].shown);
+            if !turned || (shown <= crate::app::STRIP) != folded || collapsed(cx) != folded {
+                fails.push(format!("{case}: turned {turned}, landed at {shown} (width, strength %: {seen:?})"));
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// #39 n2: a click on a folding rail's strip in the fold's tail is the
+/// strip's (the rail opens again), never the row it covers (no session
+/// opened, no favourite); and a press there let go after the rail lands
+/// is still a click (its element is the same one, in flight and landed).
+#[gpui_kit::test]
+fn a_click_in_the_folds_tail_is_the_strips(cx: &mut TestAppContext) {
+    use gpui_kit::{AppContext as _, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput, point};
+    let (w, view, _events) = open_at(cx, (1920., 1080.), 17);
+    view.update(cx, |v, cx| {
+        (v.panels.rail_width, v.panels.right_width) = (Some(480), Some(520));
+        cx.notify();
+    });
+    wait(cx, w, &view, 3000);
+    motion_level(cx, &view, Level::Full);
+    settle(cx, w, 8);
+    // A rail row's middle: in the tail, the row is under the strip there.
+    let keys: Vec<u64> = view.read_with(cx, |v, _| v.rail.rail.rows.iter().map(|r| r.key).collect());
+    let y = keys.iter().find_map(|k| bounds(cx, w, format!("star {k}"))).map(|b| b[1] + b[3] / 2.).expect("a rail row drawn");
+    let at = point(px(16.), px(y));
+    // What a click on a row would change: the tabs, the favourites.
+    let what = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let tabs: Vec<_> = v.model.tabs.iter().map(|t| (t.id, t.session.clone())).collect();
+            (tabs, v.model.tabs.active(), v.model.favs.generation)
+        })
+    };
+    let mouse = |cx: &mut TestAppContext, down: bool| {
+        let (button, modifiers) = (MouseButton::Left, Modifiers::default());
+        let ev = if down {
+            PlatformInput::MouseDown(MouseDownEvent { button, position: at, modifiers, click_count: 1, first_mouse: false })
+        } else {
+            PlatformInput::MouseUp(MouseUpEvent { button, position: at, modifiers, click_count: 1 })
+        };
+        cx.update_window(w, |_, window, cx| window.dispatch_event(ev, cx)).expect("the window");
+        cx.run_until_parked();
+    };
+    let moving = |cx: &mut TestAppContext| view.read_with(cx, |v, _| (v.panel_fx.sides[0].moving, v.panel_fx.sides[0].shown));
+    let mut fails = Vec::new();
+    for straddle in [false, true] {
+        let case = if straddle { "pressed in the tail, let go landed" } else { "a click in the tail" };
+        let before = what(cx);
+        view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        cx.run_until_parked();
+        // Into the tail: the strip half there or more.
+        let mut n = 0;
+        while !matches!(moving(cx), (true, s) if s <= 1.5 * crate::app::STRIP) {
+            fluid_frame(cx, w, &view);
+            n += 1;
+            assert!(n < 400, "{case}: the rail reaches its tail");
+        }
+        mouse(cx, true);
+        if straddle {
+            while moving(cx).0 {
+                fluid_frame(cx, w, &view);
+            }
+            fluid_frame(cx, w, &view);
+            assert!(view.read_with(cx, |v, _| v.panels.rail_collapsed), "{case}: landed folded");
+        }
+        mouse(cx, false);
+        if view.read_with(cx, |v, _| v.panels.rail_collapsed) {
+            fails.push(format!("{case}: the strip did not take it (the rail stays folded)"));
+        }
+        if what(cx) != before {
+            fails.push(format!("{case}: a row under the strip took it: {before:?} -> {:?}", what(cx)));
+        }
+        // Open again, at rest, for the next.
+        if view.read_with(cx, |v, _| v.panels.rail_collapsed) {
+            view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        }
+        for _ in 0..400 {
+            fluid_frame(cx, w, &view);
+            if !moving(cx).0 {
+                break;
+            }
+        }
+        settle(cx, w, 8);
     }
     assert!(fails.is_empty(), "{fails:#?}");
 }

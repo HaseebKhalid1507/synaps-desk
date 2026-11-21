@@ -308,7 +308,10 @@ pub(crate) fn lift<E: Styled>(el: E, strength: f32) -> E {
 
 /// [`lift`] from `floor`: [`LIFT`], or below it only for content on its own
 /// opaque card (a card row's, cards4/proposal.md §8 #1, #13: the card's
-/// slice is drawn at full strength round it).
+/// slice is drawn at full strength round it), or for a folded panel's strip
+/// in flight: from 0, on its own opaque ground, a crossfade tied to the
+/// panel's width ([`crate::chrome::strip_strength`], fluid.md §3.8), not an
+/// arrival. Raised to [`LIFT`], it would pop in at 64 px.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn lift_from<E: Styled>(el: E, strength: f32, floor: f32) -> E {
     if strength >= 1. { el } else { el.opacity(strength.max(floor.clamp(0., LIFT))) }
