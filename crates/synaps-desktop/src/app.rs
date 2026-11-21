@@ -1282,7 +1282,7 @@ fn land_card_room(list: &ListState, slack: &Cell<Option<Slack>>) {
 
 /// The transcript list's bottom padding: its end sits this far over the
 /// composer (the scroller's end is past it).
-fn list_pad_b(m: &Metrics) -> f32 {
+pub(crate) fn list_pad_b(m: &Metrics) -> f32 {
     (28. * m.r).round()
 }
 
@@ -7097,6 +7097,15 @@ impl Render for AppView {
         if landed || lay.tight != self.panes.cur.layout.tight {
             self.panes.cur.list.remeasure();
             self.panes.cur.metrics_gen += 1;
+            // A room held at the end is read again against the list as
+            // measured again, as a card's that lands ([`Slack::fresh`]): the
+            // rows' new heights are not rows growing in under it (else the
+            // remeasure's sums used it up, and the column fell by it as the
+            // flight landed).
+            if let Some(mut s) = self.panes.cur.fold_slack.get().filter(|s| s.gone.is_none() && s.fresh.is_none()) {
+                s.fresh = Some(self.fx.frame());
+                self.panes.cur.fold_slack.set(Some(s));
+            }
         }
         // A new column re-wraps the rows: this frame's scrollbar would read
         // the rows not yet measured at their estimates (it is held as it

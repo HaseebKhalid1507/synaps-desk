@@ -595,11 +595,16 @@ const TIME_GLIDES: bool = false;
 /// their row (`k` 0: the label at its left, the time at its right end) and
 /// the gutter (`k` 1: both right-aligned `m.hang` left of the column, the
 /// time under the label, the label `top` down), in a slot at the row's gap,
-/// the column wide. Each moves in a line from one place to the other, on
-/// whole pixels; the time by its right edge (no width measured).
+/// the column wide, on whole pixels; the time by its right edge (no width
+/// measured). The label's sideways move leads and its drop follows (x on
+/// a quartic ease-out of `k`, y on `k²`; back, the same curve rises first
+/// and then moves over): on a straight line its corner crossed its row's
+/// card as the line's room closed under it (the finish gate of #33, S1);
+/// a quadratic or cubic lead still grazes it at the text sizes.
 #[allow(clippy::too_many_arguments)]
 fn moving_label(label: Div, lw: f32, time: Option<&crate::times::Stamp>, top: f32, k: f32, column: f32, p: &Palette, m: &Metrics) -> Div {
     let lerp = |a: f32, b: f32| (a + (b - a) * k).round();
+    let (kx, ky) = (1. - (1. - k).powi(4), k * k);
     // By the right edge, `r` px left of the column's.
     let at = |r: f32, y: f32, el: Div| div().absolute().right(px(r)).top(px(y)).whitespace_nowrap().child(el);
     // The time's two places: the line's right end, centred on it; under
@@ -620,7 +625,7 @@ fn moving_label(label: Div, lw: f32, time: Option<&crate::times::Stamp>, top: f3
                 .into_any_element()
         }
     });
-    let label = div().absolute().left(px(lerp(0., -m.hang - lw))).top(px(lerp(0., top))).whitespace_nowrap().child(label);
+    let label = div().absolute().left(px((-(m.hang + lw) * kx).round())).top(px((top * ky).round())).whitespace_nowrap().child(label);
     div().absolute().left_0().w(px(column)).child(label).children(time)
 }
 
@@ -1375,13 +1380,17 @@ pub(crate) fn hangs(pane: f32, m: &Metrics) -> bool {
 /// column is the flight's narrowest, fluid.md §3.8): only the label line's
 /// room closes or opens, and the label and its time travel. No flight (a
 /// window resize, a drag, Reduced, Off): a cut. The rows off screen are
-/// measured again once, when it lands.
+/// measured again once, when it lands (either side: one turned back to
+/// where it began has rows laid out on the way too).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HangFx {
     /// What is drawn this frame.
     pub(crate) k: f32,
     /// The hang the rows were last all measured at.
     measured: bool,
+    /// Rows were laid out between the two since (a flight turned back to
+    /// its start side lands measured again too: Shady #33 L1).
+    between: bool,
     /// Its flight: `k` as it began, the pane then, the pane it flies to,
     /// and the hang there.
     from: Option<(f32, f32, f32, bool)>,
@@ -1391,7 +1400,7 @@ pub(crate) struct HangFx {
 impl HangFx {
     /// This frame's: `lay` with its hang the flight's end's (`pane_to`) and
     /// `hang_k` as drawn; and whether the rows must be measured again (it
-    /// landed on the other side).
+    /// landed on the other side, or back where it began from on the way).
     pub(crate) fn frame(&mut self, lay: Layout, pane: f32, pane_to: f32, flying: bool, m: &Metrics) -> (Layout, bool) {
         let hang = hangs(pane_to, m);
         let to = if hang { 1. } else { 0. };
@@ -1408,9 +1417,11 @@ impl HangFx {
         } else {
             (self.k, self.from) = (to, None);
         }
-        let landed = (self.k == 0. || self.k == 1.) && (self.k == 1.) != self.measured;
+        let at_rest = self.k == 0. || self.k == 1.;
+        self.between |= !at_rest;
+        let landed = at_rest && ((self.k == 1.) != self.measured || self.between);
         if landed {
-            self.measured = self.k == 1.;
+            (self.measured, self.between) = (self.k == 1., false);
         }
         (Layout { hang, hang_k: self.k, ..lay }, landed)
     }
@@ -1506,7 +1517,9 @@ impl AppView {
                     _ => 0.,
                 };
                 let bar = motion::mix(p.you_mark, motion::mix(p.you, p.ink, 0.35), lit);
+                let id = d.id;
                 div()
+                    .debug_selector(move || format!("user-block {id}"))
                     .relative()
                     .w_full()
                     .bg(p.user)
@@ -1561,7 +1574,7 @@ impl AppView {
                     })
                 });
                 Some(Box::new(move |inner: AnyElement| {
-                    let slab = crate::cards::slab(top, bottom, inner, &pal, geo);
+                    let slab = crate::cards::slab(top, bottom, inner, &pal, geo).debug_selector(move || format!("card-slice {id}"));
                     match click {
                         // Its card's edge and inset unfold it too.
                         Some(f) => slab.id(("run-card", id)).cursor_pointer().on_click(f).into_any_element(),
@@ -1652,17 +1665,28 @@ impl AppView {
         let (p, m, lay) = (theme::palette(cx), theme::metrics(cx), self.panes.cur.layout);
         let k = lay.hang_k;
         // Placed as hanging, on their way to the gutter; inline, as inline.
-        let kh = if lay.hang { k } else { 0. };
-        let at = |i: usize| {
-            let (d, row) = (self.panes.cur.disp.get(i)?, self.panes.cur.list.bounds_for_item(i)?);
-            let top = kh * who_of(d, &p, &m).map_or(0., |w| w.2);
-            Some(f32::from(row.top() - b.top()) + gap_of(d.gap, &m) + top)
-        };
+        // A flight back inline that has not moved yet (its first frame, the
+        // pane where it was) is drawn as it was: in the gutter, at its `pad_y`
+        // (the finish gate of #33, M1: placed at the inline pin it hopped up
+        // a frame).
+        let kh = if lay.hang || k >= 1. { k } else { 0. };
         let time = |i: usize| self.panes.cur.disp.get(i).and_then(|d| self.panes.cur.rows.get(d.item)).and_then(|r| r.time.as_ref());
-        let (pin, line) = (kh * m.pad_y, m.body_line + (1. - kh));
-        let h = |i: usize| line + if time(i).is_some() { kh * m.mono_line } else { 0. };
-        let stuck = crate::sticky::place(&self.panes.cur.disp, self.panes.cur.list.logical_scroll_top().item_ix, at, pin, h);
-        let bottom = stuck.iter().flatten().map(|s| s.y + h(s.row)).reduce(f32::max)?;
+        // Where the labels pin at `kh` (0 inline, 1 hanging), and how tall.
+        let h = |kh: f32, i: usize| m.body_line + (1. - kh) + if time(i).is_some() { kh * m.mono_line } else { 0. };
+        let place = |kh: f32| {
+            let at = |i: usize| {
+                let (d, row) = (self.panes.cur.disp.get(i)?, self.panes.cur.list.bounds_for_item(i)?);
+                let top = kh * who_of(d, &p, &m).map_or(0., |w| w.2);
+                Some(f32::from(row.top() - b.top()) + gap_of(d.gap, &m) + top)
+            };
+            crate::sticky::place(&self.panes.cur.disp, self.panes.cur.list.logical_scroll_top().item_ix, at, kh * m.pad_y, |i| h(kh, i))
+        };
+        let stuck = place(kh);
+        // On the way, the label (and its time) is where it pins at the `k`
+        // drawn, either way: from the gutter's place to the line's, the
+        // band the layout's (the finish gate of #33, M1).
+        let glide = if k > 0. && k < 1. { place(k) } else { stuck };
+        let bottom = stuck.iter().flatten().map(|s| s.y + h(kh, s.row)).reduce(f32::max)?;
         // The slot's right edge, as the row's (`right(column + hang)`).
         let gutter = px((lay.left - m.hang).max(0.));
         let root = div()
@@ -1685,7 +1709,7 @@ impl AppView {
                 let d = self.panes.cur.disp[s.row];
                 let (text, color, _) = who_of(&d, &p, &m)?;
                 let id = d.id;
-                let label = display(text, m.label, color).line_height(px(m.body_line));
+                let label = display(text, m.label, color).line_height(px(m.body_line)).debug_selector(move || format!("sticky-label {id}"));
                 let time = time(s.row).map(|t| time_text(t, &p, &m));
                 if k >= 1. {
                     let slot = v_flex().absolute().right(b.size.width - gutter).top(px(s.y)).items_end().child(label).children(time);
@@ -1696,15 +1720,13 @@ impl AppView {
                 if k > 0. {
                     let stamp = self.panes.cur.rows.get(d.item).and_then(|r| r.time.as_ref());
                     let lw = self.widths.borrow().get(&(text, m.label.to_bits())).copied().unwrap_or(0.);
-                    // Inline at the end, the band at the top and the label
-                    // coming down to it from the gutter's `pad_y`.
-                    let down = if lay.hang { 0. } else { m.pad_y };
+                    let y = glide.iter().flatten().find(|g| g.row == s.row).map_or(s.y, |g| g.y);
                     let slot = div()
                         .absolute()
                         .left(px(lay.left))
-                        .top(px(s.y))
+                        .top(px(y))
                         .w(px(lay.column))
-                        .child(moving_label(label, lw, stamp, down, k, lay.column, &p, &m));
+                        .child(moving_label(label, lw, stamp, 0., k, lay.column, &p, &m));
                     let rule = band().top(px(s.y + band_h)).h(px(1.)).bg(motion::mix(p.canvas, p.hair, 1. - kh));
                     let band = band().top(px(s.y)).h(px(band_h)).bg(p.canvas).debug_selector(move || format!("sticky {id}"));
                     return Some(div().child(band).child(rule).child(slot).into_any_element());
@@ -1721,7 +1743,10 @@ impl AppView {
     /// What the sticky band hides at the list's top when the labels are
     /// inline (F8: one label line and its rule); hanging, nothing.
     pub(crate) fn sticky_inset(&self, cx: &App) -> f32 {
-        (1. - self.panes.cur.layout.hang_k) * (theme::metrics(cx).body_line + 1.)
+        // The band's own `kh`: coming back inline it is whole once it moves.
+        let lay = self.panes.cur.layout;
+        let kh = if lay.hang || lay.hang_k >= 1. { lay.hang_k } else { 0. };
+        (1. - kh) * (theme::metrics(cx).body_line + 1.)
     }
 }
 
