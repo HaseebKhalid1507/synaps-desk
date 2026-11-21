@@ -186,14 +186,6 @@ impl Group {
             Group::History => label::HISTORY,
         }
     }
-
-    pub fn jp(self) -> &'static str {
-        match self {
-            Group::Pinned => crate::fonts::JP_PINNED,
-            Group::Open => crate::fonts::JP_OPEN,
-            Group::History => crate::fonts::JP_HISTORY,
-        }
-    }
 }
 
 /// Where a saved row's entry is in the model (valid until the lists change,
