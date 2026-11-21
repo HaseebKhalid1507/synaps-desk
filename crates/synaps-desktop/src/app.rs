@@ -3524,8 +3524,8 @@ impl AppView {
     }
 
     /// The composer's Enter with `text` in it, as its subscription sends it
-    /// (the view-level tests, `split_tests`).
-    #[cfg(test)]
+    /// (the view-level tests, `split_tests`, which need a unix socket).
+    #[cfg(all(test, unix))]
     pub(crate) fn enter(&mut self, text: String) -> bool {
         self.submit(text)
     }
