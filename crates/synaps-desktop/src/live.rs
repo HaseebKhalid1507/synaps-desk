@@ -344,11 +344,14 @@ pub struct Lives {
     /// one whose attach the tab strip follows (`Tabs::attached`). Step 2:
     /// [`LiveId::FIRST`], always; step 3's focus moves it.
     shown: LiveId,
+    /// The last id handed out: ids are never reused (#31 L4), so an id
+    /// kept past its store's release can never name another store.
+    last: u16,
 }
 
 impl Default for Lives {
     fn default() -> Self {
-        Lives { slots: vec![(LiveId::FIRST, Live::default())], shown: LiveId::FIRST }
+        Lives { slots: vec![(LiveId::FIRST, Live::default())], shown: LiveId::FIRST, last: LiveId::FIRST.0 }
     }
 }
 
@@ -401,12 +404,16 @@ impl Lives {
     /// A second store, as step 3's multi-live activation will make one
     /// (tests: two sessions attached at once; `--bench-tabs`' `mem_lives`).
     pub(crate) fn add(&mut self) -> LiveId {
-        let id = LiveId(self.slots.iter().map(|(i, _)| i.0).max().unwrap_or(0) + 1);
+        self.last += 1;
+        let id = LiveId(self.last);
         self.slots.push((id, Live::default()));
         id
     }
 }
 
+/// A store that exists: a pane's (a pane's store is released only after
+/// its last pane goes; only panes keep a `LiveId`). Ids are never reused,
+/// so a slip panics here rather than reach another session's store.
 impl std::ops::Index<LiveId> for Lives {
     type Output = Live;
     fn index(&self, id: LiveId) -> &Live {
@@ -521,6 +528,17 @@ mod tests {
     /// Input from two panes on one session: a refusal gives the oldest
     /// back to the pane that sent it; a detach gives each pane its own
     /// texts, in order, never the other's.
+    /// #31 L4: a released store's id is never handed out again.
+    #[test]
+    fn a_released_stores_id_is_never_reused() {
+        let mut l = Lives::default();
+        let a = l.add();
+        l.remove(a);
+        let b = l.add();
+        assert_ne!(a, b, "a new id");
+        assert_eq!(l.ids(), [LiveId::FIRST, b]);
+    }
+
     #[test]
     fn input_in_flight_goes_back_to_the_pane_that_sent_it() {
         let (a, b) = (PaneId::FIRST, PaneId::nth(1));

@@ -478,8 +478,9 @@ impl AppView {
     /// The workers of `session` as this window knows them (attached, or in
     /// the tab cache).
     fn subs_of(&self, session: &str) -> Option<&Subagents> {
-        if self.model.is_active(session) {
-            return Some(&self.model.lives[self.panes.cur.live].stats.subagents);
+        // Its own store's (another pane's, maybe), never the pane's (#31 M2).
+        if let Some(l) = self.model.lives.on(session) {
+            return Some(&l.stats.subagents);
         }
         self.tab_cache.peek(session).map(|c| &c.stats.subagents)
     }
@@ -499,8 +500,9 @@ impl AppView {
     pub(crate) fn tab_worker_reused(&self) -> bool {
         let Some(t) = self.model.tabs.current().filter(|t| t.kind == Kind::Worker) else { return false };
         let (Some(s), Some(w)) = (t.session.as_deref(), t.worker.as_ref()) else { return false };
-        let id = w.id().filter(|_| self.model.is_active(s));
-        id.and_then(|id| self.model.lives[self.panes.cur.live].stats.subagents.ident(id)).is_some_and(|now| !same_worker(w.who(), now))
+        let live = self.model.lives.on(s);
+        let id = w.id().filter(|_| live.is_some());
+        id.and_then(|id| live?.stats.subagents.ident(id)).is_some_and(|now| !same_worker(w.who(), now))
     }
 
     /// The worker tab on screen holds a worker its handle no longer names:
@@ -551,12 +553,15 @@ impl AppView {
     /// attached, not cached). Read per frame for a worker tab's mark and
     /// the composer foot: nothing allocated.
     pub(crate) fn worker_state(&self, session: &str, handle: &str, expect: Option<(Option<&str>, &str)>) -> Option<Liveness> {
-        let attached = self.model.is_active(session);
-        let shown = attached || self.panes.cur.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(session);
-        let subs = match (shown, self.tab_cache.peek(session)) {
-            (true, _) => &self.model.lives[self.panes.cur.live].stats.subagents,
-            (false, Some(c)) => &c.stats.subagents,
-            (false, None) => return None,
+        // The session's own store (#31 M2), else the pane's while its tab
+        // shows it (attaching), else the cache.
+        let own = self.model.lives.on(session);
+        let shown = own.is_some() || self.panes.cur.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(session);
+        let subs = match (own, shown, self.tab_cache.peek(session)) {
+            (Some(l), _, _) => &l.stats.subagents,
+            (None, true, _) => &self.model.lives[self.panes.cur.live].stats.subagents,
+            (None, false, Some(c)) => &c.stats.subagents,
+            (None, false, None) => return None,
         };
         let id = handle.strip_prefix("sa_").and_then(|n| n.parse().ok());
         let now = id.and_then(|id| subs.ident(id));
@@ -568,8 +573,10 @@ impl AppView {
         // One source: the session's list (its views' pages feed it,
         // [`crate::model::Model::heard_view`]).
         let status = id.and_then(|id| subs.status(id));
+        let attached = own.is_some();
         let live = Liveness::of(status, attached, !attached || now.is_some() || status.is_some());
-        Some(live.cancelling(self.model.lives[self.panes.cur.live].cancels.pending(session, handle)))
+        let cancels = own.map_or(&self.model.lives[self.panes.cur.live].cancels, |l| &l.cancels);
+        Some(live.cancelling(cancels.pending(session, handle)))
     }
 
     /// Whether this window may steer or cancel `session`'s workers, else
@@ -578,7 +585,13 @@ impl AppView {
         if self.client.is_none() {
             return Err("offline: no daemon to send to");
         }
-        if !self.model.is_active(session) {
+        // The pane's own store, never "attached somewhere" (#31 M2): a
+        // cancel goes out on this pane's attachment, so it must be its
+        // session's.
+        if !self.model.lives[self.panes.cur.live].is_active(session) {
+            if self.model.is_active(session) {
+                return Err("its session is in another pane: focus that pane first");
+            }
             return Err("its session is not attached in this window: show its tab first");
         }
         self.model.lives[self.panes.cur.live].input_gate()

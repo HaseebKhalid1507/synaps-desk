@@ -403,6 +403,12 @@ fn input_goes_only_to_the_focused_panes_own_attachment(cx: &mut TestAppContext) 
         (pa, v.panes.cur.id)
     });
     assert!(names(&mut a).is_empty(), "A's attachment untouched by B's attach");
+    // #31 M2: a worker cancel (a tray row, a menu) for A's session from the
+    // pane on B is refused: it would go out on B's attachment.
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.may_drive(B), Ok(()));
+        assert_eq!(v.may_drive(A), Err("its session is in another pane: focus that pane first"));
+    });
     let act = |cx: &mut TestAppContext, what: &str| {
         view.update(cx, |v, _| {
             let key = v.panes.cur.card.as_ref().map(|c| c.key).expect("the focused pane's card");
@@ -519,4 +525,39 @@ fn four_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
         let lives: std::collections::HashSet<_> = v.panes.iter().map(|p| p.live).collect();
         assert_eq!(lives.len(), 1, "one store for the one session");
     });
+}
+
+/// #31 (per-pane worker focus): two panes on one session keep their own
+/// worker view. A worker opened in one is not the other's, whose Enter
+/// messages the session (never steers that worker); back in the first,
+/// its view is as it was.
+#[gpui_kit::test]
+fn two_panes_on_one_session_keep_their_own_worker_view(cx: &mut TestAppContext) {
+    let (window, view, client, mut a, _attaches, _events) = on_a(cx, "panes-views", None);
+    key(cx, window, "ctrl-\\");
+    let (p0, p1) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    view.update(cx, |v, cx| {
+        let live = v.panes.cur.live;
+        v.model.lives[live].watch.open(&crate::watch::Candidate::of(2, "sleeper"), None, std::time::Instant::now());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert_eq!(v.model.lives[v.panes.cur.live].watch.focus(), Some("sa_2"), "the second pane on the worker"));
+    key(cx, window, "alt-1");
+    view.update(cx, |v, _| {
+        assert_eq!(v.panes.focused, p0);
+        assert_eq!(v.model.lives[v.panes.cur.live].watch.focus(), None, "the first pane on the thread");
+        assert!(v.enter("to the session".into()));
+        assert_eq!(v.submits.last(), Some(&("to the session".to_string(), false)), "a message, not a steer");
+    });
+    // (The worker's view polls it: `query`.)
+    let sent: Vec<String> = names(&mut a).into_iter().filter(|c| c != "query").collect();
+    assert_eq!(sent, ["submit"], "a message on the session, no steer");
+    key(cx, window, "alt-2");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.focused, p1);
+        assert_eq!(v.model.lives[v.panes.cur.live].watch.focus(), Some("sa_2"), "the second pane's view kept");
+    });
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
 }

@@ -323,6 +323,10 @@ pub(crate) struct Parked {
     pub(crate) halted: Option<(String, Instant)>,
     pub(crate) took: RefCell<std::collections::HashMap<u64, std::time::Duration>>,
     pub(crate) ran: RefCell<HashSet<u64>>,
+    /// Its worker view (#31: per-pane worker focus): the store's `Watch`
+    /// holds the pane acted on's; two panes on one session each keep
+    /// their own (a worker in one, the thread in the other).
+    pub(crate) view: crate::watch::ViewFocus,
 }
 
 impl Pane {
@@ -467,7 +471,7 @@ impl Panes {
         !self.rest.is_empty()
     }
 
-    #[cfg(test)]
+    /// How many panes are open.
     pub(crate) fn len(&self) -> usize {
         1 + self.rest.len()
     }
@@ -530,6 +534,12 @@ impl crate::app::AppView {
         }
         let Some(i) = self.panes.rest.iter().position(|p| p.id == id) else { return false };
         let mut q = std::mem::take(&mut self.panes.rest[i].parked);
+        // The worker views: the pane leaving takes its own out of its
+        // store, then the one coming puts its own in.
+        let leaving = self.model.lives[self.panes.cur.live].watch.park();
+        let coming = std::mem::replace(&mut q.view, leaving);
+        let live = self.panes.rest[i].live;
+        self.model.lives[live].watch.unpark(coming);
         std::mem::swap(&mut self.model.tabs, &mut q.tabs);
         std::mem::swap(&mut self.bars.transcript, &mut q.bar);
         std::mem::swap(&mut self.drafts, &mut q.drafts);
@@ -815,6 +825,19 @@ impl crate::app::AppView {
 /// on stderr (`PANES <what> <s>`): split right, the right pane opens
 /// another session, split down, focus by F6, Shift+F6 and Alt+1, a draft
 /// per pane, then the panes close one by one (each collapses).
+/// The splits that make `n` panes (split.md §4): 2 side by side, 3
+/// across, 4 as 2×2. Each: the pane to focus first (reading order), and
+/// the side (`None`: right, or down if narrow).
+pub(crate) fn shape(n: usize) -> Vec<(Option<usize>, Option<crate::split::Side>)> {
+    use crate::split::Side;
+    match n {
+        0 | 1 => vec![],
+        2 => vec![(None, None)],
+        3 => vec![(None, None), (None, None)],
+        _ => vec![(None, None), (None, Some(Side::Down)), (Some(0), Some(Side::Down))],
+    }
+}
+
 pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, window: &mut Window, cx: &mut App) {
     use crate::app::AppView;
     use crate::split::Side;
@@ -833,18 +856,14 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
             let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
             sleep(1.5).await;
             if let Ok(n) = how.parse::<usize>() {
-                let steps: &[Option<Side>] = match n {
-                    2 => &[None],
-                    3 => &[None, None],
-                    _ => &[None, Some(Side::Down)],
-                };
-                for s in steps {
-                    act(cx, &|v, w, cx| v.split_pane(*s, w, cx));
+                for (at, side) in shape(n) {
+                    act(cx, &|v, w, cx| {
+                        if let Some(i) = at {
+                            v.focus_nth(i, w, cx);
+                        }
+                        v.split_pane(side, w, cx);
+                    });
                     sleep(0.3).await;
-                }
-                if n >= 4 {
-                    act(cx, &|v, w, cx| v.focus_nth(0, w, cx));
-                    act(cx, &|v, w, cx| v.split_pane(Some(Side::Down), w, cx));
                 }
                 mark("panes");
                 return;

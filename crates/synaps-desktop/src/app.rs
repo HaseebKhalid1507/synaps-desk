@@ -4740,7 +4740,7 @@ impl AppView {
     pub(crate) fn extras(&self) -> crate::fit::Extras {
         let n = &self.model.named;
         crate::fit::Extras {
-            naming: n.naming && self.model.lives[self.panes.cur.live].active.is_some(),
+            naming: n.naming && self.panes.cur.id == self.panes.focused && self.model.lives[self.panes.cur.live].active.is_some(),
             naming_notes: u8::from(n.rename_error.is_some()) + u8::from(self.replace_offer().is_some()),
             error: self.model.lives[self.panes.cur.live].last_error.is_some(),
             note: self.panes.cur.watch_note.is_some() || self.panes.cur.draft_note.is_some(),
@@ -5294,9 +5294,11 @@ impl AppView {
     /// Every row's height changes with the text size: re-measured now (a
     /// cached tab's when it comes back).
     pub(crate) fn text_metrics_changed(&mut self) {
-        // Every pane's, alike (Shady #30 M3).
-        let g = self.panes.next_gen();
-        for pane in self.panes.iter_mut() {
+        // A fresh one per pane (#31 L1): panes in different forms never
+        // share one, so a tab cached by one is re-measured in another.
+        let n = self.panes.len();
+        let gens: Vec<u64> = (0..n).map(|_| self.panes.next_gen()).collect();
+        for (pane, g) in self.panes.iter_mut().zip(gens) {
             pane.list.remeasure();
             pane.metrics_gen = g;
         }
@@ -6112,7 +6114,9 @@ impl AppView {
     pub(crate) fn tab_meta(&self, id: u64) -> Option<SessionMeta> {
         let t = self.model.tabs.iter().find(|t| t.id == id)?;
         let session = t.session.as_deref()?;
-        if self.model.is_active(session) {
+        // The pane's own store's session (#31 M2: another pane's store is
+        // not this pane's `session_meta`).
+        if self.model.lives[self.panes.cur.live].is_active(session) {
             return Some(self.session_meta());
         }
         let m = self.model.sessions.iter().find(|m| m.id == session)?;
@@ -6139,7 +6143,12 @@ impl AppView {
     /// the naming row of the session on screen opens (or closes).
     pub(crate) fn rename_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let on_screen = self.model.tabs.view().is_none()
-            && self.model.tabs.current().and_then(|t| t.session.as_deref()).is_some_and(|s| self.model.is_active(s));
+            && self
+                .model
+                .tabs
+                .current()
+                .and_then(|t| t.session.as_deref())
+                .is_some_and(|s| self.model.lives[self.panes.cur.live].is_active(s));
         if !on_screen {
             return;
         }
@@ -6166,7 +6175,7 @@ impl AppView {
             self.rename_pending = None;
             return;
         }
-        if !self.model.is_active(s) {
+        if !self.model.lives[self.panes.cur.live].is_active(s) {
             return;
         }
         self.rename_pending = None;
@@ -7452,9 +7461,13 @@ impl AppView {
                 .min_w_0()
                 .bg(p.canvas)
                 .child(tabs)
-                .when(self.model.named.naming && self.model.lives[self.panes.cur.live].active.is_some(), |d| {
-                    d.child(self.render_naming(&p, cx))
-                })
+                // The naming row is the focused pane's (one name field).
+                .when(
+                    self.model.named.naming
+                        && self.panes.cur.id == self.panes.focused
+                        && self.model.lives[self.panes.cur.live].active.is_some(),
+                    |d| d.child(self.render_naming(&p, cx)),
+                )
                 .child(
                     div()
                         .flex_1()

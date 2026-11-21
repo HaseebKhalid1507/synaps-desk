@@ -238,13 +238,14 @@ impl AppView {
         if let Some(m) = self.model.sessions.iter().find(|m| m.id == s) {
             return self.model.state(m);
         }
-        if self.model.is_active(s) {
-            let tr = &self.model.lives[self.panes.cur.live].transcript;
+        // Its own store's (another pane's, maybe; #31 M2).
+        if let Some(live) = self.model.lives.ids().into_iter().find(|l| self.model.lives[*l].is_active(s)) {
+            let tr = &self.model.lives[live].transcript;
             if !tr.pending_prompts().is_empty() {
                 State::NeedsYou
             } else if tr.busy() {
                 State::Running
-            } else if self.model.active_workers(self.panes.cur.live) > 0 {
+            } else if self.model.active_workers(live) > 0 {
                 State::Workers
             } else {
                 State::Idle

@@ -1225,6 +1225,23 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     }
                 });
                 sleep(1.0).await;
+                // `SYNAPS_BENCH_PANES=N` (split panes on): N panes on it
+                // (split.md §4's shapes), settled, then their memory.
+                if let Some(n) = std::env::var("SYNAPS_BENCH_PANES").ok().and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 1) {
+                    for step in crate::pane::shape(n) {
+                        let _ = view.update_in(cx, |v, w, cx| {
+                            if let Some(i) = step.0 {
+                                v.focus_nth(i, w, cx);
+                            }
+                            v.split_pane(step.1, w, cx);
+                            cx.notify();
+                        });
+                        sleep(0.4).await;
+                    }
+                    sleep(1.5).await;
+                    out["panes"] = json!(view.update(cx, |v, _| v.panes.len()).unwrap_or(0));
+                    out["mem_panes"] = mem::sample();
+                }
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
                 sleep(idle.unwrap_or(10) as f64).await;
                 out[format!("idle_{}s", idle.unwrap_or(10))] = stats(cx, t0, Instant::now(), c0, f0);
