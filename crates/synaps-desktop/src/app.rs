@@ -1058,6 +1058,27 @@ impl Slack {
     pub(crate) fn last(&self) -> f32 {
         self.last
     }
+
+    /// What is left of it with the rows that grew in under it since it was
+    /// held (#23's finish gate, item 7): the list's content without it (its
+    /// scrollbar's `max` over a view `vh`, less what it drew) past its
+    /// `base` is taken from what it was given. Going, or not landed yet:
+    /// what it drew.
+    fn room(&self, max: f32, vh: f32) -> f32 {
+        if max <= 0. || self.gone.is_some() || self.fresh.is_some() {
+            return self.last;
+        }
+        self.given - (max + vh - self.last - self.base).max(0.)
+    }
+
+    /// How far from its end a list `by` px short of it is once this
+    /// frame's room is in: the room read from the last layout lags the
+    /// growth a frame (M3 (a)), so the rows that grew in that layout are in
+    /// `by` and come off the room. The held room's one rule for its end
+    /// ([`AppView::tail_slack`], a send: Shady #34 M1r).
+    fn rest(&self, by: f32, max: f32, vh: f32) -> f32 {
+        by - (self.last - self.room(max, vh))
+    }
 }
 
 /// A body the user opened or closed (S1): its row's id, the content under
@@ -3607,14 +3628,23 @@ impl AppView {
     /// and Off, a cut. At the end, the holds there stay: the message grows
     /// into the room they keep, nothing slides (#23's finish gate, item 7;
     /// Shady #34 M1), and once it is used up the list follows (no scroll of
-    /// the user's counts since).
+    /// the user's counts since). At the end with a room held is the room's
+    /// own rule ([`Slack::rest`]): rows growing into it (a reply streaming
+    /// after an approval or a fold) read the list a frame's growth short of
+    /// its end, and a steer then would put the room on `sheet` and slide
+    /// the column (Shady #34 M1r). Rows not all measured (GPUI counts one
+    /// as 0 px, so the end reads short): away, as `at_end` has it (L1r).
     fn return_to_end(&mut self) {
         let pane = &self.panes.cur;
         let at = -f32::from(pane.list.scroll_px_offset_for_scrollbar().y);
         let by = self.list_end() - at;
+        let max = f32::from(pane.list.max_offset_for_scrollbar().y);
+        let vh = f32::from(pane.list.viewport_bounds().size.height);
+        let measured = pane.list.is_scrolled_to_end().is_some() || max <= 0.;
         let slack = pane.fold_slack.get().filter(|s| s.list == pane.list_gen);
+        let rest = slack.map_or(by, |s| s.rest(by, max, vh));
         pane.hold_back.set(false);
-        if by <= END_SLOP && !slack.is_some_and(|s| s.left) {
+        if measured && rest <= END_SLOP && !slack.is_some_and(|s| s.left) {
             let mut holds = pane.body_hold.get().is_some() || pane.fold_gap.borrow().iter().any(|g| g.hold);
             if let Some(mut s) = slack {
                 s.input = false;
@@ -4285,9 +4315,8 @@ impl AppView {
         // growth a frame, and with the top held that frame's surplus is
         // under the content, out of sight; following the tail it moved the
         // column by each frame's growth.
-        let mut room = s.last;
         if max > 0. && s.gone.is_none() && s.fresh.is_none() {
-            let content = max + f32::from(self.panes.cur.list.viewport_bounds().size.height) - s.last;
+            let content = max + vh - s.last;
             // Rows under the hold got shorter (a worker's block ended):
             // the content it is held against follows them down, so rows
             // growing in take the room from there and it is used up at
@@ -4297,11 +4326,11 @@ impl AppView {
             if measured && content < s.base && folding == 0. && self.panes.cur.body_hold.get().is_none() {
                 s.base = content.round();
             }
-            room = s.given - (content - s.base).max(0.);
         }
+        let room = s.room(max, vh);
         // How far from its end the list is once this frame's room is in
         // (the last layout's growth, past the room, is in `end - at`).
-        let rest = (end - at) - (s.last - room);
+        let rest = s.rest(end - at, max, vh);
         // Left the end: the user scrolled it more than END_SLOP from there
         // (by however little a frame: a touchpad, a slow drag; Shady #23 r3
         // H2). A row changing height above the view or under it moves

@@ -4,8 +4,9 @@
 //! at the end; a command that adds nothing to the transcript leaves the
 //! list where it is. The reader wins: a wheel, a touchscreen or the bar
 //! during the glide leaves the list where they put it (Shady #34 H1, H2),
-//! and a send at the end keeps the room held there (M1). The daemon's echo
-//! of the message is applied by hand (there is none).
+//! and a send at the end keeps the room held there (M1), rows growing into
+//! it too (M1r). The daemon's echo of the message is applied by hand
+//! (there is none).
 //!
 //! The helpers are `ui_tests`' own, from [`super`] (`test_kit`).
 
@@ -296,6 +297,70 @@ fn a_send_at_the_end_keeps_its_held_room(cx: &mut TestAppContext) {
         let held = view.read_with(cx, |v, _| v.fold_slack.get().is_some());
         assert!(gap <= 1. && (held || following), "frame {f}: at the end ({gap}), following once used up ({held}, {following})");
     }
+    let (row, (top, bottom)) = message_row(cx, &view, text);
+    let (t, b) = row.expect("the steer's row drawn");
+    assert!(t >= top && b <= bottom + 0.5, "the steer's row in view ({t}..{b} in {top}..{bottom})");
+}
+
+/// A send while the reply streams into a room held at the end (Shady #34
+/// M1r: a steer after an approval or a fold). In a frame its rows grew
+/// more than 2 px the list reads that far short of its end (the room takes
+/// it the frame after): the send there still keeps the room held, and
+/// nothing slides: the view's top row holds every frame, and the list
+/// rests at its end, following once the room is used up.
+#[gpui_kit::test]
+fn a_send_as_a_reply_grows_into_a_held_room_keeps_it(cx: &mut TestAppContext) {
+    let (w, view, room) = held_room(cx);
+    view.read_with(cx, |v, _| v.fx.set_clock(v.fx.tick()));
+    // Typed first: Enter alone in the frame the reply grew.
+    let text = "steer: and the docs";
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.composer.update(cx, |s, cx| {
+                s.set_value(text.to_string(), window, cx);
+                s.focus(window, cx);
+            })
+        })
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    let mut grew = None;
+    for k in 0..240 {
+        view.update(cx, |v, cx| {
+            let text = format!("word{k} and a little more of the reply, ");
+            v.model.transcript.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::Text { text }) });
+            cx.notify();
+        });
+        fluid_frame(cx, w, &view);
+        let left = view.read_with(cx, |v, _| v.fold_slack.get().map_or(0., |s| s.last()));
+        let (gap, _) = from_end(cx, &view);
+        assert!(left > gap + 20., "frame {k}: the room ({left} of {room}) still held as the reply grows in ({gap})");
+        if gap > 2. {
+            grew = Some(gap);
+            break;
+        }
+    }
+    let grew = grew.expect("a frame the reply grew more than 2 px into the room");
+    VisualTestContext::from_window(w, cx).simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| v.submits.len()) >= 1, "it went to submit");
+    let mut last = row_tops(cx, &view);
+    for f in 0..120 {
+        if f == 2 {
+            echo(cx, &view, text, true);
+        }
+        fluid_frame(cx, w, &view);
+        let now = row_tops(cx, &view);
+        if let Some((top, y0)) = last.iter().min_by(|a, b| a.1.total_cmp(b.1))
+            && let Some(y1) = now.get(top)
+        {
+            assert!((y1 - y0).abs() <= 0.5, "frame {f}: the top row moved ({y0} -> {y1}; sent {grew} px short, the room {room})");
+        }
+        last = now;
+    }
+    let (gap, following) = from_end(cx, &view);
+    let held = view.read_with(cx, |v, _| v.fold_slack.get().is_some());
+    assert!(gap <= 1. && (held || following), "at the end ({gap}), following once used up ({held}, {following})");
     let (row, (top, bottom)) = message_row(cx, &view, text);
     let (t, b) = row.expect("the steer's row drawn");
     assert!(t >= top && b <= bottom + 0.5, "the steer's row in view ({t}..{b} in {top}..{bottom})");
