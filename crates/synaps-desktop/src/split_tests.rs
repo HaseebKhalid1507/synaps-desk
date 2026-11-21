@@ -3619,6 +3619,118 @@ fn a_divider_drag_holds_the_thumbs(cx: &mut TestAppContext) {
     }
 }
 
+/// Haseeb's rule, for the side panels' flights (#47): nothing moves after
+/// the panels and the panes stop. A panel's spring settles under a pixel
+/// for a while after its drawn width reaches its target; the column, the
+/// labels and the thumbs land in the frame the width does, not when the
+/// spring stops. Frame by frame through the rail's and the right panel's
+/// fold and unfold, in one pane and in two: from the last frame a panel's
+/// edge or a pane's moves, no row, no column (the labels' hang and left)
+/// and no thumb changes. On `f4addde` the folds' columns re-wrapped 6 or 7
+/// frames (at 144 Hz) after the panes stopped.
+#[gpui_kit::test]
+fn nothing_moves_after_the_panels_and_panes_stop(cx: &mut TestAppContext) {
+    let mut fails = Vec::new();
+    for panes in [1, 2] {
+        // One pane at 1280 (at 1920 its column is at its cap either side of
+        // a fold, and nothing re-wraps); two at 1920.
+        let (window, view) = if panes == 1 { open_sized(cx, 1280., 800.) } else { demo_split(cx, 1920., 1080.) };
+        if panes == 2 {
+            key(cx, window, "ctrl-\\");
+            frame(cx, window);
+        }
+        view.update(cx, |v, cx| {
+            (v.panels.rail_collapsed, v.panels.right_collapsed) = (false, false);
+            cx.notify();
+        });
+        frame(cx, window);
+        level(cx, crate::motion::Level::Full);
+        let ids = view.read_with(cx, |v, _| v.reading_order());
+        assert_eq!(ids.len(), panes, "{panes} pane(s)");
+        let bars: Vec<crate::scrollbar::BarState> =
+            view.read_with(cx, |v, _| {
+                ids.iter()
+                    .map(|id| {
+                        if *id == v.panes.cur.id {
+                            v.bars.transcript.clone()
+                        } else {
+                            v.panes.get(*id).expect("the pane").parked.bar.clone()
+                        }
+                    })
+                    .collect()
+            });
+        // A frame: the edges (the panels as drawn, each pane's list's box),
+        // and what is drawn in the panes (each one's column, its left and
+        // the labels' hang, its first rows' boxes, its thumb).
+        let snap = |cx: &mut TestAppContext| -> (Vec<f32>, Vec<f32>) {
+            let thumbs: Vec<Option<[f32; 4]>> = bars.iter().map(|b| b.thumbs().last().and_then(|t| t.2)).collect();
+            view.read_with(cx, |v, _| {
+                let mut edges = vec![v.panel_fx.sides[0].shown, v.panel_fx.sides[1].shown];
+                let mut drawn = Vec::new();
+                for (k, id) in ids.iter().enumerate() {
+                    let pane = v.panes.get(*id).expect("the pane");
+                    let b = pane.list.viewport_bounds();
+                    edges.extend([f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.size.width), f32::from(b.size.height)]);
+                    drawn.extend([pane.layout.column, pane.layout.left, pane.layout.hang_k]);
+                    let top = pane.list.logical_scroll_top().item_ix;
+                    for ix in top..(top + 10).min(pane.list.item_count()) {
+                        match pane.list.bounds_for_item(ix) {
+                            Some(r) => drawn.extend([
+                                f32::from(r.origin.x),
+                                f32::from(r.origin.y),
+                                f32::from(r.size.width),
+                                f32::from(r.size.height),
+                            ]),
+                            None => drawn.extend([f32::NAN; 4]),
+                        }
+                    }
+                    drawn.extend(thumbs[k].unwrap_or([f32::NAN; 4]));
+                }
+                (edges, drawn)
+            })
+        };
+        let same =
+            |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.01 || (a.is_nan() && b.is_nan()));
+        for rail in [true, false] {
+            for fold in [true, false] {
+                let case = format!(
+                    "{panes} pane(s), the {} {}",
+                    if rail { "rail" } else { "right panel" },
+                    if fold { "folds" } else { "unfolds" }
+                );
+                let mut seen = vec![snap(cx)];
+                view.update(cx, |v, cx| v.toggle_panel(rail, cx));
+                cx.run_until_parked();
+                let mut rest = 0;
+                while rest < 10 {
+                    frame_144(cx, window, &view);
+                    seen.push(snap(cx));
+                    let busy = view.read_with(cx, |v, _| v.panel_fx.moving() || v.panes.flight.is_some() || v.fx.pending().0);
+                    rest = if busy { 0 } else { rest + 1 };
+                    assert!(seen.len() < 500, "{case}: never landed");
+                }
+                let last = (1..seen.len()).rev().find(|&i| !same(&seen[i].0, &seen[i - 1].0)).unwrap_or(0);
+                if last == 0 {
+                    fails.push(format!("{case}: nothing moved"));
+                    continue;
+                }
+                if let Some(i) = (last + 1..seen.len()).find(|&i| !same(&seen[i].1, &seen[last].1)) {
+                    let what: Vec<usize> = (0..seen[i].1.len().min(seen[last].1.len()))
+                        .filter(|&k| !same(&seen[i].1[k..k + 1], &seen[last].1[k..k + 1]))
+                        .collect();
+                    fails.push(format!(
+                        "{case}: the edges stop at frame {last} of {}; frame {i} draws the panes apart (values {what:?}: {:?} -> {:?})",
+                        seen.len(),
+                        what.iter().map(|&k| seen[last].1[k]).collect::<Vec<_>>(),
+                        what.iter().map(|&k| seen[i].1[k]).collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
 /// Design gate F5 (#44 r3): after Join lands, the pane kept's worker chips
 /// take their landed grid in the landing frame (one a line in a quarter of
 /// the centre, two in the whole): no chip slides after the panes stop.

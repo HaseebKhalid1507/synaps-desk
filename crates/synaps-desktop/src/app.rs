@@ -7667,6 +7667,10 @@ impl AppView {
                 self.display_w(l, m.label, window);
             }
         }
+        // A new column re-wraps every row as it lands (GPUI measures them
+        // all again at the new width): a room held at the end is not read
+        // again against that frame's sums, half of them unmeasured (#47).
+        let rewraps = lay.column != self.panes.cur.layout.column;
         if landed || lay.tight != self.panes.cur.layout.tight {
             self.panes.cur.list.remeasure();
             self.panes.cur.metrics_gen = self.panes.next_gen();
@@ -7675,7 +7679,7 @@ impl AppView {
             // rows' new heights are not rows growing in under it (else the
             // remeasure's sums used it up, and the column fell by it as the
             // flight landed).
-            if let Some(mut s) = self.panes.cur.fold_slack.get().filter(|s| s.gone.is_none() && s.fresh.is_none()) {
+            if let Some(mut s) = self.panes.cur.fold_slack.get().filter(|s| s.gone.is_none() && s.fresh.is_none() && !rewraps) {
                 s.fresh = Some(self.fx.frame());
                 self.panes.cur.fold_slack.set(Some(s));
             }

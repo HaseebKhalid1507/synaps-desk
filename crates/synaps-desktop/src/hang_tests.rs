@@ -583,11 +583,11 @@ fn the_pinned_label_goes_to_the_gutter_with_the_panel(cx: &mut TestAppContext) {
 /// The finish gate of #33, F1: a panel's flight ends on the layout it
 /// lands at. Closing the right panel at the end, three frames after it
 /// looked still, the panel stepped its last pixel as it landed and the
-/// column with it (1 px right); closing the rail, the tab (1 px left). The
-/// last frame that moves draws the landed widths, so the frame it lands in
-/// draws the same: the pane, the column, the rows and the tab all 0 px from
-/// it, and every frame after. Both panels, closing and opening, at Full
-/// (with frames between) and Reduced (one frame), as the clips have it:
+/// column with it (1 px right); closing the rail, the tab (1 px left). It
+/// lands in the frame it draws the landed widths, the last that moves
+/// (#47: not a still frame of the spring's settling later): every frame
+/// after draws the pane, the column, the rows and the tab 0 px from it.
+/// Both panels, closing and opening, at Full (with frames between) and Reduced (one frame), as the clips have it:
 /// 1920 px, text 17, the rail at 480 and the right panel at 520, where the
 /// column is at its cap at both ends (under it, a widening flight's column
 /// widens as it lands, by design: `a_held_room_holds_as_the_wrap_lands`).
@@ -657,9 +657,11 @@ fn a_panel_flight_ends_on_the_layout_it_lands_at(cx: &mut TestAppContext) {
                 let end = &frames[landed].1;
                 if level == Level::Full {
                     assert!(landed > 30, "{case}: it flew ({landed} frames)");
-                    let off = apart(&frames[landed - 1].1, end);
-                    if !off.is_empty() {
-                        fails.push(format!("{case}: the last frame that moves is not the landed layout (it lands at {landed}): {off:?}"));
+                    // #47: it lands in the frame it reaches the landed
+                    // layout, the last that moves: the frame before it is
+                    // still on its way (no still frame before the landing).
+                    if apart(&frames[landed - 1].1, end).is_empty() {
+                        fails.push(format!("{case}: the frame before the landing ({landed}) already drew the landed layout"));
                     }
                 } else {
                     assert_eq!(landed, 0, "{case}: in one frame");
@@ -790,8 +792,9 @@ fn a_held_room_holds_as_the_wrap_lands(cx: &mut TestAppContext) {
 /// move at f203; the right panel's strip after its own). What is painted
 /// over the strip (the quads GPUI hands the renderer, clipped to their
 /// masks, from the last opaque one that covers it) is, on every frame from
-/// the last one that moves on, that frame's; at Reduced, from the panel's
-/// one frame on. At Full the strip comes in during the flight (its
+/// the one it lands in on, that frame's (#47: the frame it arrives at its
+/// width; the one before still lifts the strip in); at Reduced, from the
+/// panel's one frame on. At Full the strip comes in during the flight (its
 /// strength, the hairline's alpha, rises through it), and opening it goes
 /// out over the first frames, not at once. No frame at rest. Both panels,
 /// 1920 px, text 17, the rail at 480, the right panel at 520.
@@ -918,14 +921,10 @@ fn a_folded_strip_lands_with_its_panel(cx: &mut TestAppContext) {
                     let apart = |a: &[String], b: &[String]| -> (Vec<String>, Vec<String>) {
                         (a.iter().filter(|q| !b.contains(q)).cloned().collect(), b.iter().filter(|q| !a.contains(q)).cloned().collect())
                     };
-                    if landed > 0 {
-                        let last = over(&frames[landed - 1].1.1, region);
-                        if last != end {
-                            fails.push(format!(
-                                "{case}: the landing frame ({landed}) paints the strip apart from the last that moves: {:?}",
-                                apart(&last, &end)
-                            ));
-                        }
+                    // #47: the landing frame is the last that moves, the
+                    // strip whole in it; the frame before still lifts it in.
+                    if landed > 0 && over(&frames[landed - 1].1.1, region) == end {
+                        fails.push(format!("{case}: the frame before the landing ({landed}) already painted the landed strip"));
                     }
                     if let Some(n) = (landed + 1..frames.len()).find(|&n| over(&frames[n].1.1, region) != end) {
                         fails.push(format!(
