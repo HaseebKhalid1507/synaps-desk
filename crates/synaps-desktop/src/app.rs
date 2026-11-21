@@ -3235,7 +3235,12 @@ impl AppView {
         let mut attach = true;
         if vis != self.panes.cur.shown_tab {
             if self.panes.split() {
-                attach = self.repoint(vis.as_ref().and_then(|v| v.1.clone()));
+                // Its last tab closed: the pane closes, and leaves its store
+                // there with its rows kept to draw ([`AppView::close_pane`],
+                // finish gate #42 F2).
+                if vis.is_some() {
+                    attach = self.repoint(vis.as_ref().and_then(|v| v.1.clone()));
+                }
             } else {
                 self.stash();
                 self.load(vis.as_ref().and_then(|v| v.1.clone()));
@@ -3407,6 +3412,58 @@ impl AppView {
         self.list_out();
         let key = self.model.lives[self.panes.cur.live].transcript.session_id().map(str::to_string);
         let (transcript, stats) = self.model.switch_out(self.panes.cur.live);
+        self.cache_list(key, transcript, stats, watch);
+    }
+
+    /// The pane acted on, closing (its last tab closed, or Join), leaves
+    /// its store as a switch away leaves it ([`AppView::repoint`]), at
+    /// once: a store another pane shows stays (what it sent still
+    /// unconfirmed goes to that pane); one only it showed lets its session
+    /// go ([`Model::switch_out`]: no input, card or HALT reaches it) and
+    /// detaches. The transcript stays in that store, for the rows drawn as
+    /// its share closes (finish gate #42 F2); no attach is waited for.
+    pub(crate) fn leave_for_close(&mut self) {
+        let live = self.panes.cur.live;
+        self.panes.cur.attach_wait = None;
+        self.panes.cur.attach_due = None;
+        if self.panes.showing(live) > 1 {
+            let me = self.panes.cur.id;
+            if let Some(other) = self.panes.iter().find(|p| p.id != me && p.live == live).map(|p| p.id) {
+                self.model.lives[live].in_flight.rehome(me, other);
+            }
+            return;
+        }
+        // The rows first: the transcript may have run ahead of the last frame.
+        self.sync_list();
+        self.panes.cur.closing_key = self.model.lives[live].transcript.session_id().map(str::to_string);
+        let (transcript, stats) = self.model.switch_out(live);
+        self.model.switch_in(live, transcript, stats);
+        if let (Some(c), Some(seq)) = (&self.client, self.model.lives[live].release()) {
+            let _ = c.on(seq).detach();
+        }
+    }
+
+    /// A closed pane's rows, kept to draw as it closed (finish gate #42
+    /// F2), to the tab cache as its close would have stashed them
+    /// (Ctrl+Shift+T opens its tab again at once), unless its session is
+    /// on a store again (opened meanwhile: what it kept is older). The
+    /// pane acted on is the one closing.
+    pub(crate) fn cache_closed(&mut self) {
+        let live = self.panes.cur.live;
+        let Some(key) = self.panes.cur.closing_key.take() else { return };
+        if self.model.lives.of_session(&key, live).is_some() {
+            return;
+        }
+        self.list_out();
+        let l = &mut self.model.lives[live];
+        let (transcript, stats, watch) = (std::mem::take(&mut l.transcript), std::mem::take(&mut l.stats), std::mem::take(&mut l.watch));
+        self.cache_list(Some(key), transcript, stats, watch);
+    }
+
+    /// The pane's list and rows of `transcript` to the tab cache under
+    /// `key` (with `stats` and its worker views, `watch`); a fresh, empty
+    /// list in their place.
+    fn cache_list(&mut self, key: Option<String>, transcript: Transcript, stats: Stats, watch: Watch) {
         self.panes.cur.card = None;
         self.panes.cur.attach_wait = None;
         self.panes.cur.attach_due = None;
@@ -7639,10 +7696,13 @@ impl AppView {
         };
         // A keyboard menu over a row no longer drawn closes; a workers menu
         // left empty leaves. Either way the next frame gives focus back.
-        let menus = (self.menu.is_some(), self.wmenu.is_some());
-        self.close_orphan_menu();
-        if menus != (self.menu.is_some(), self.wmenu.is_some()) {
-            window.request_animation_frame();
+        // (Not a closing pane's: no menu is its.)
+        if self.panes.cur.closing.is_none() {
+            let menus = (self.menu.is_some(), self.wmenu.is_some());
+            self.close_orphan_menu();
+            if menus != (self.menu.is_some(), self.wmenu.is_some()) {
+                window.request_animation_frame();
+            }
         }
         let ex = crate::fit::Extras { tray: self.tray_rows as u8, ..ex };
         let rows = crate::fit::composer_rows(&m, lay.form(), height, card_shown, ex);
@@ -7675,7 +7735,7 @@ impl AppView {
         let list = list(
             self.panes.cur.list.clone(),
             cx.processor(move |this, ix, _window, cx| {
-                this.in_pane(id, |this| this.pane_row(ix, &gaps, slack, geo, cx)).unwrap_or_else(|| div().into_any_element())
+                this.in_drawn(id, |this| this.pane_row(ix, &gaps, slack, geo, cx)).unwrap_or_else(|| div().into_any_element())
             }),
         )
         .size_full()
@@ -7809,7 +7869,7 @@ impl AppView {
                         .child(crate::sticky::layer(
                             self.fx.clone(),
                             cx.processor(move |this, b: Bounds<Pixels>, _, cx| {
-                                this.in_pane(id, |this| this.sticky_label(b, cx)).unwrap_or_default()
+                                this.in_drawn(id, |this| this.sticky_label(b, cx)).unwrap_or_default()
                             }),
                         ))
                         .children(crate::motion::probe(&self.fx, "sticky"))
@@ -7982,18 +8042,26 @@ impl AppView {
                 let r = rects.iter().find(|(i, _)| i == id).map_or(crate::split::Rect { x: 0., y: 0., w: 0., h: 0. }, |(_, r)| *r);
                 let el = mains.iter().position(|(i, _)| i == id).map(|i| mains.remove(i).1);
                 let id = *id;
-                // A closing pane's share (split.md §8): an empty pane's
-                // ground, its strip and the canvas, going to 0.
+                // A closing pane's share (split.md §8), going to 0: its own
+                // content as it was (finish gate #42 F2), out of reach (no
+                // pointer gets to it); without it (a ghost: its id is an
+                // open pane's now), an empty pane's ground.
                 if self.panes.flight.as_ref().is_some_and(|f| f.ghosts.contains(&id)) {
-                    return div()
+                    let share = div()
                         .flex_none()
                         .w(px(r.w))
                         .h(px(r.h))
                         .overflow_hidden()
                         .bg(p.canvas)
-                        .debug_selector(move || format!("pane-closing {}", id.index()))
-                        .child(div().h(px(crate::tabstrip::TAB_H)).w_full().bg(p.chrome).border_b_1().border_color(p.hair))
-                        .into_any_element();
+                        .debug_selector(move || format!("pane-closing {}", id.index()));
+                    return match el {
+                        Some(el) => {
+                            share.relative().child(el).child(div().absolute().top_0().left_0().size_full().occlude()).into_any_element()
+                        }
+                        None => share
+                            .child(div().h(px(crate::tabstrip::TAB_H)).w_full().bg(p.chrome).border_b_1().border_color(p.hair))
+                            .into_any_element(),
+                    };
                 }
                 self.probe(h_flex(), "pane")
                     .flex_none()
@@ -8288,7 +8356,8 @@ impl AppView {
         self.panes.grab = None;
         if count >= 2 {
             let mut to = self.panes.tree.clone();
-            to.equalise(path);
+            let (w, h) = self.centre.get();
+            to.equalise(path, crate::split::Rect { x: 0., y: 0., w, h });
             self.fly_layout(to, cx);
         }
     }
@@ -8538,6 +8607,8 @@ impl Render for AppView {
             // The layout as drawn this frame: the tree, or its flight's
             // step (split.md §10).
             let drawn = self.pane_flight_frame(area(centre));
+            // The panes whose close has landed go (finish gate #42 F2).
+            self.reap_closing();
             let rects = drawn.rects(area(centre));
             let land = self.panes.tree.rects(area(centre));
             // Each pane's width as the panels' flight lands, and the width
@@ -8556,8 +8627,25 @@ impl Render for AppView {
             // last that moves, never after it (finish gate #42 F1).
             let landed = drawn == self.panes.tree;
             let mut mains = Vec::new();
+            // Where each closing share goes (its rectangle at 0).
+            let to_rects = self.panes.flight.as_ref().filter(|_| !ghosts.is_empty()).map(|f| f.to.rects(area(centre))).unwrap_or_default();
             for (id, r) in &rects {
                 if ghosts.contains(id) {
+                    // A closing pane (finish gate #42 F2): laid out where it
+                    // was, its share clipping it, the split's grow reversed:
+                    // its content slides out with the line (its edge on the
+                    // line rides it; the far one is clipped).
+                    if let Some(c) = self.panes.closing.iter().find(|p| p.id == *id).and_then(|p| p.closing)
+                        && self.panes.get(*id).is_none()
+                    {
+                        let g = PaneFrame { pane: c.w, wrap: c.w, pane_to: c.w, view_pane: c.w, win_h: c.h + crate::chrome::TOP, p, m };
+                        if let Some(el) = self.in_drawn(*id, |v| v.pane_main(g, window, cx)) {
+                            let t = to_rects.iter().find(|(i, _)| i == id).map_or(*r, |(_, t)| *t);
+                            let dx = if (t.x - r.x).abs() < 0.5 { r.w - c.w } else { 0. };
+                            let dy = if (t.y - r.y).abs() < 0.5 { r.h - c.h } else { 0. };
+                            mains.push((*id, div().absolute().left(px(dx)).top(px(dy)).w(px(c.w)).h(px(c.h)).child(el)));
+                        }
+                    }
                     continue;
                 }
                 let of = |rs: &[(PaneId, crate::split::Rect)]| rs.iter().find(|(i, _)| i == id).map_or(r.w, |(_, t)| t.w);
@@ -8605,6 +8693,8 @@ impl Render for AppView {
             let handles = if still { self.divider_handles(&drawn, area(centre), &p, cx) } else { Vec::new() };
             div().flex_1().h_full().min_w_0().relative().child(self.lay_panes(&drawn, &rects, &mut mains, &p, cx)).children(handles)
         } else {
+            // The last close's pane goes, if a frame of it is left.
+            self.reap_closing();
             let g = PaneFrame { pane, wrap, pane_to, view_pane, win_h: self.height, p, m };
             self.panes.cur.rect.set(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
             self.panes.cur.land.set(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
