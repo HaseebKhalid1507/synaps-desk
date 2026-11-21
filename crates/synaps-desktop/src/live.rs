@@ -292,7 +292,8 @@ pub(crate) fn pend(pending: &mut Option<Splice>, sp: Splice) {
 pub(crate) struct InFlight(VecDeque<(PaneId, String)>);
 
 impl InFlight {
-    /// The texts, oldest first.
+    /// The texts, oldest first (tests).
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &String> {
         self.0.iter().map(|(_, t)| t)
     }

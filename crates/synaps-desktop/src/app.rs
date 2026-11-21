@@ -6932,7 +6932,8 @@ impl Render for AppView {
         let (session, column) = (self.motion_session(), self.motion_column());
         self.fx.col(self.panes.cur.id).rescope(session, column);
         // The chrome's motion is rescoped with the session on screen, as it
-        // was in pane 0's column (no change with one pane; Shady #30 M2).
+        // was in pane 0's column: it clears on a switch as on main (Shady
+        // #30 M2; "never clear" is a deliberate non-change, #31).
         self.fx.chrome().rescope(session, column);
         // Another session, or a worker's view in or out: its dock and draft
         // are drawn at their heights (a switch replays nothing).

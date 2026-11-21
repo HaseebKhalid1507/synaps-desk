@@ -1870,16 +1870,6 @@ impl Motion {
         at.saturating_duration_since(self.epoch).as_nanos().is_multiple_of((BEAT * every).as_nanos())
     }
 
-    /// [`PaneFx::roll_was`] in the first pane's column.
-    pub(crate) fn roll_was(&self, key: u64) -> Option<u64> {
-        self.col(crate::pane::PaneId::FIRST).roll_was(key)
-    }
-
-    /// [`PaneFx::roll_saw`] in the first pane's column.
-    pub(crate) fn roll_saw(&self, key: u64, n: u64) {
-        self.col(crate::pane::PaneId::FIRST).roll_saw(key, n)
-    }
-
     /// `decay`: light switched on at `since` going off: 1 (lit) → 0, held
     /// lit for `hold` first.
     pub(crate) fn decay(&self, since: Option<Instant>, hold: Duration, dur: Duration) -> f32 {
@@ -2435,15 +2425,16 @@ impl Motion {
     }
 
     /// The window chrome's motion (the rail, the top bar: Shady #30 M2):
-    /// its own column, which no pane's switch clears. It is rescoped with
-    /// the session on screen, as it was when it was pane 0's (one pane:
-    /// nothing changes); whether it should keep its memory across a
-    /// switch is step 3's call.
+    /// its own column, no pane's. It is rescoped with the session on
+    /// screen, so it clears on a tab switch exactly as it did as pane 0's
+    /// (main's behaviour, kept by decision for #31; a chrome that never
+    /// clears would let a rail ping or star play across a switch).
     pub(crate) fn chrome(&self) -> PaneFx<'_> {
         PaneFx { fx: self, col: &self.chrome }
     }
 
-    /// [`PaneFx::rescope`] in the first pane's column.
+    /// [`PaneFx::rescope`] in the first pane's column (tests).
+    #[cfg(test)]
     pub(crate) fn rescope(&self, session: u64, column: u64) {
         self.col(crate::pane::PaneId::FIRST).rescope(session, column)
     }
@@ -2500,7 +2491,8 @@ impl Motion {
         v
     }
 
-    /// [`PaneFx::roll`] in the first pane's column.
+    /// [`PaneFx::roll`] in the first pane's column (tests).
+    #[cfg(test)]
     pub(crate) fn roll(&self, key: u64, text: &SharedString, up: bool) -> Option<(SharedString, f32, bool)> {
         self.col(crate::pane::PaneId::FIRST).roll(key, text, up)
     }
