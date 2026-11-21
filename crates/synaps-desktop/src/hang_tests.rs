@@ -92,9 +92,9 @@ fn labelled(cx: &mut TestAppContext, view: &Entity<AppView>) -> u64 {
 }
 
 /// How far a label may move in a frame, in the pane's steps (and a pixel's
-/// rounding either way): its sideways move leads the pane's (a quartic
-/// ease-out, the finish gate of #33, S1), at most four times the line's
-/// rate at the start, the line here under a panel's width over the label's
+/// rounding either way): its sideways move leads the pane's (the finish
+/// gate of #33, S1: `turns::lead`), up to about three and a half times the
+/// line's rate mid-way, the line here under a panel's width over the label's
 /// way. Never a move on a still pane.
 const LEAD: f32 = 2.;
 

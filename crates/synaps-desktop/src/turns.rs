@@ -591,20 +591,38 @@ fn inline_line(m: &Metrics) -> f32 {
 /// the text.
 const TIME_GLIDES: bool = false;
 
+/// Where a label's sideways move is done ([`moving_label`]): its corner is
+/// clear of its row's card (by 3 px or more at every text step) before the
+/// card's top, rising as the line's room closes, reaches its capitals.
+const LEAD_BY: f32 = 0.4;
+
+/// The label's sideways share at `k` ([`moving_label`]): a cubic from 0
+/// (leaving at the line's rate, `k`'s own) to 1 at [`LEAD_BY`] (landing
+/// flat), 1 after.
+fn lead(k: f32) -> f32 {
+    if k >= LEAD_BY {
+        return 1.;
+    }
+    let t = k / LEAD_BY;
+    LEAD_BY * (t * t * t - 2. * t * t + t) + 3. * t * t - 2. * t * t * t
+}
+
 /// A label (`lw` px wide) and its time on their way between the line over
 /// their row (`k` 0: the label at its left, the time at its right end) and
 /// the gutter (`k` 1: both right-aligned `m.hang` left of the column, the
 /// time under the label, the label `top` down), in a slot at the row's gap,
 /// the column wide, on whole pixels; the time by its right edge (no width
-/// measured). The label's sideways move leads and its drop follows (x on
-/// a quartic ease-out of `k`, y on `k²`; back, the same curve rises first
-/// and then moves over): on a straight line its corner crossed its row's
-/// card as the line's room closed under it (the finish gate of #33, S1);
-/// a quadratic or cubic lead still grazes it at the text sizes.
+/// measured). The label's sideways move leads and its drop follows (back,
+/// the same curve rises first and then moves over): on a straight line its
+/// corner crossed its row's card as the line's room closed under it (the
+/// finish gate of #33, S1). y on `k²`; x all the way by `k` = [`LEAD_BY`],
+/// on a cubic that leaves at the line's rate and lands flat: a lead that
+/// starts steeper (an ease-out) nearly cancels the column's own move on a
+/// panel's slow tail, and the label shimmers a pixel back and forth there.
 #[allow(clippy::too_many_arguments)]
 fn moving_label(label: Div, lw: f32, time: Option<&crate::times::Stamp>, top: f32, k: f32, column: f32, p: &Palette, m: &Metrics) -> Div {
     let lerp = |a: f32, b: f32| (a + (b - a) * k).round();
-    let (kx, ky) = (1. - (1. - k).powi(4), k * k);
+    let (kx, ky) = (lead(k), k * k);
     // By the right edge, `r` px left of the column's.
     let at = |r: f32, y: f32, el: Div| div().absolute().right(px(r)).top(px(y)).whitespace_nowrap().child(el);
     // The time's two places: the line's right end, centred on it; under
