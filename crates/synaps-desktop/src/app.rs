@@ -7305,6 +7305,9 @@ struct PaneFrame {
     /// keeps the narrowest, `PanelFx.freeze`).
     pane: f32,
     wrap: f32,
+    /// Its width as the panels' flight will land (#33's labels hang as it
+    /// will): its rectangle in the centre the flight ends at.
+    pane_to: f32,
     /// Its width while a view (Settings, Usage) shows in it.
     view_pane: f32,
     /// The window's height as the pane's layout reads it: its own, under
@@ -7319,7 +7322,7 @@ impl AppView {
     /// its tab strip, list, dock and composer, as the pane acted on
     /// ([`AppView::in_pane`]); with one pane, the whole centre.
     fn pane_main(&mut self, g: PaneFrame, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let PaneFrame { pane, wrap, view_pane, p, m, .. } = g;
+        let PaneFrame { pane, wrap, pane_to, view_pane, p, m, .. } = g;
         let view = self.model.tabs.view();
         self.panes.cur.body_line = m.body_line;
         self.scroll_frame(list_pad_b(&m));
@@ -7327,9 +7330,27 @@ impl AppView {
         // The form from what decides it (not the stub or the tray).
         let ex = crate::fit::Extras { stub: false, tray: 0, ..self.extras() };
         let lay = Layout::of_in(pane, wrap, g.win_h - crate::chrome::TOP, &m, ex);
-        if (lay.hang, lay.tight) != (self.panes.cur.layout.hang, self.panes.cur.layout.tight) {
+        // The labels hang as the flight's end will, and move with it: this
+        // pane's, by its own width (each pane has its `HangFx`).
+        let (lay, landed) = self.panes.cur.hang_fx.frame(lay, pane, pane_to, self.panel_fx.moving(), &m);
+        if lay.hang_k > 0. && lay.hang_k < 1. {
+            // On their way, the labels are placed by their widths.
+            for l in [fonts::label::YOU, fonts::label::AGENT, fonts::label::SYNAPS] {
+                self.display_w(l, m.label, window);
+            }
+        }
+        if landed || lay.tight != self.panes.cur.layout.tight {
             self.panes.cur.list.remeasure();
             self.panes.cur.metrics_gen = self.panes.next_gen();
+            // A room held at the end is read again against the list as
+            // measured again, as a card's that lands ([`Slack::fresh`]): the
+            // rows' new heights are not rows growing in under it (else the
+            // remeasure's sums used it up, and the column fell by it as the
+            // flight landed).
+            if let Some(mut s) = self.panes.cur.fold_slack.get().filter(|s| s.gone.is_none() && s.fresh.is_none()) {
+                s.fresh = Some(self.fx.frame());
+                self.panes.cur.fold_slack.set(Some(s));
+            }
         }
         // A new column re-wraps the rows: this frame's scrollbar would read
         // the rows not yet measured at their estimates (it is held as it
@@ -7962,11 +7983,17 @@ impl Render for AppView {
         self.centre.set((centre, centre_h));
         let main = if self.panes.split() {
             let rects = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
+            // Each pane's width as the panels' flight lands: its rectangle
+            // in the centre then (the tree's own rounding, so a landed pane
+            // reads the width it is drawn at).
+            let rects_to = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w: pane_to, h: centre_h });
             let mut mains = Vec::new();
             for (id, r) in &rects {
+                let to = rects_to.iter().find(|(i, _)| i == id).map_or(r.w, |(_, t)| t.w);
                 let g = PaneFrame {
                     pane: r.w,
                     wrap: (r.w * wrap / pane.max(1.)).min(r.w),
+                    pane_to: to,
                     view_pane: r.w,
                     win_h: r.h + crate::chrome::TOP,
                     p,
@@ -7981,7 +8008,7 @@ impl Render for AppView {
             }
             div().flex_1().h_full().min_w_0().child(self.lay_panes(&self.panes.tree.clone(), &rects, &mut mains, &p, cx))
         } else {
-            let g = PaneFrame { pane, wrap, view_pane, win_h: self.height, p, m };
+            let g = PaneFrame { pane, wrap, pane_to, view_pane, win_h: self.height, p, m };
             self.panes.cur.rect.set(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
             self.pane_main(g, window, cx)
         };

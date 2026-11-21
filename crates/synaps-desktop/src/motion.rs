@@ -1982,11 +1982,22 @@ impl Motion {
     /// next frame is asked for only when the snapped value will have
     /// changed by then, else a timer for the instant it does (or the spring
     /// settles): the slow tail moves under a pixel a frame, and no frame
-    /// draws what the last one drew. Its value, and whether it moves.
+    /// draws what the last one drew. Under a pixel from the target it is
+    /// drawn at the target, as it lands: it settles under half of one
+    /// ([`FLUID_EPSILON`]), so the last frame that moves draws the landed
+    /// width (the finish gate of #33, F1: rounded to the nearest pixel, it
+    /// drew its last pixel short until it settled, and the pane, the column
+    /// and the tab took that pixel in the landing frame, after the panel had
+    /// looked still for a few frames). The pixel is a logical one: at 2x or
+    /// 3x the last one goes as one step of 2 or 3 device pixels. A stall
+    /// that skips the tail (from over a pixel out to settled) still lands
+    /// the last pixel in the landing frame; that is the stall, not this.
+    /// Its value, and whether it moves.
     pub(crate) fn spring_px(&self, key: u64, target: f32, response: f32) -> (f32, bool) {
         let asked = (self.display.get(), self.pane_wants.get());
         let (v, moving) = self.spring_held(key, target, response);
-        let shown = self.snap(v);
+        let drawn = |v: f32| if (v - target).abs() < 1. { self.snap(target) } else { self.snap(v) };
+        let shown = drawn(v);
         if !moving {
             return (shown, false);
         }
@@ -1996,7 +2007,7 @@ impl Motion {
         let Some(s) = self.springs.borrow().get(&key).copied() else { return (shown, true) };
         let next = (1..=1000u64)
             .map(|k| now + Duration::from_millis(k))
-            .find(|&t| s.settled(t) || self.snap(s.target + s.state(t).0) != shown)
+            .find(|&t| s.settled(t) || drawn(s.target + s.state(t).0) != shown)
             .unwrap_or(now + Duration::from_secs(1));
         if next <= now + PX_FRAME {
             self.want_frame();
