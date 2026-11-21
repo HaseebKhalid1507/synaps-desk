@@ -1687,8 +1687,10 @@ async fn film4(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowConte
     use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Point, point};
     let mark = |what: &str| eprintln!("PANES {what} {:.3}", t0.elapsed().as_secs_f64());
     let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
+    // Through the window, as the platform's come: never inside the view's
+    // own update (its listeners update it).
     let input = |cx: &mut AsyncWindowContext, ev: PlatformInput| {
-        let _ = view.update_in(cx, |_, window, cx| {
+        let _ = cx.update(|window, cx| {
             window.dispatch_event(ev, cx);
         });
     };
@@ -1808,9 +1810,16 @@ async fn film4(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowConte
     path(cx, ex, &input, start, top, 0.4).await;
     sleep(0.9).await;
     mark("esc");
-    let _ = view.update_in(cx, |v, window, cx| {
-        v.cancel_drag(window, cx);
-    });
+    for ev in [
+        PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
+            keystroke: gpui_kit::Keystroke::parse("escape").expect("a key"),
+            is_held: false,
+            prefer_character_input: false,
+        }),
+        PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke: gpui_kit::Keystroke::parse("escape").expect("a key") }),
+    ] {
+        input(cx, ev);
+    }
     input(cx, PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position: top, modifiers: m, click_count: 1 }));
     sleep(1.2).await;
     // Again, onto its centre: it moves back, its pane closes.
