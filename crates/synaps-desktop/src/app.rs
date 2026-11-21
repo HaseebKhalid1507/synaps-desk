@@ -975,8 +975,9 @@ impl OnceKey {
 /// where the focus was, not to the view.
 fn fold_fallback<A: Action>(rail: bool, view: WeakEntity<AppView>, window: AnyWindowHandle, focus: FocusHandle, cx: &mut App) {
     cx.on_action(move |_: &A, cx| {
-        // The view had it: its key-down decides ([`OnceKey`]).
-        if view.read_with(cx, |v, _| v.once.is_some()).unwrap_or(false) {
+        // The view had it: its key-down decides ([`OnceKey`]). Or it is
+        // another window's key.
+        if !dispatching(window, cx) || view.read_with(cx, |v, _| v.once.is_some()).unwrap_or(false) {
             cx.propagate();
             return;
         }
@@ -989,6 +990,16 @@ fn fold_fallback<A: Action>(rail: bool, view: WeakEntity<AppView>, window: AnyWi
             let _ = window.update(cx, |_, window, cx| window.focus(&focus, cx));
         });
     });
+}
+
+/// Whether `window` is the one whose key this is (#38). The fallbacks are
+/// app-wide, one set per window's view: another window's key reaches them
+/// too, and one acting for it would act on its own view and end the
+/// dispatch, so the key never got to the window it was pressed in (a test
+/// with a second window in its app). GPUI lends a window out for its
+/// dispatch: until that is over, updating it fails.
+pub(crate) fn dispatching(window: AnyWindowHandle, cx: &mut App) -> bool {
+    window.update(cx, |_, _, _| ()).is_err()
 }
 
 /// The tab keys' actions on the window's root (the composer, find and
@@ -1012,7 +1023,7 @@ fn tab_actions(d: Stateful<Div>, cx: &mut Context<AppView>) -> Stateful<Div> {
 /// input): as [`fold_fallback`], it acts and hands the view its focus back.
 fn tab_fallback<A: Action>(key: TabKey, view: WeakEntity<AppView>, window: AnyWindowHandle, focus: FocusHandle, cx: &mut App) {
     cx.on_action(move |_: &A, cx| {
-        if view.read_with(cx, |v, _| v.once.is_some()).unwrap_or(false) {
+        if !dispatching(window, cx) || view.read_with(cx, |v, _| v.once.is_some()).unwrap_or(false) {
             cx.propagate();
             return;
         }
@@ -2333,7 +2344,7 @@ impl AppView {
         subs.push(cx.observe_window_activation(window, |this, window, cx| this.window_activated(window.is_window_active(), cx)));
         // A worker's view polls only while the window shows.
         subs.push(cx.observe_window_visibility(window, |this, v, _, cx| this.visibility_changed(v.is_visible(), cx)));
-        crate::views::view_fallbacks(cx.weak_entity(), cx);
+        crate::views::view_fallbacks(cx.weak_entity(), window.window_handle(), cx);
         let me = cx.weak_entity();
         let settings_pane = cx.new(|_| crate::views::ViewPane::new(me.clone(), crate::tabs::Kind::Settings));
         let usage_pane = cx.new(|_| crate::views::ViewPane::new(me, crate::tabs::Kind::Usage));
