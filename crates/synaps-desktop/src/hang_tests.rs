@@ -1082,5 +1082,58 @@ fn a_click_in_the_folds_tail_is_the_strips(cx: &mut TestAppContext) {
         }
         settle(cx, w, 8);
     }
+    // Shady #41 L1: a row pressed as the rail finishes opening, let go
+    // after it lands, is a click on the row (the open panel is under the
+    // flight's id too): its session opens. Folded first, at rest.
+    let current = view.read_with(cx, |v, _| v.model.tabs.current().and_then(|t| t.session.clone()));
+    let row = view.read_with(cx, |v, _| {
+        v.rail.rail.rows.iter().find_map(|r| match &r.action {
+            crate::named::RowAction::Attach(s) if Some(s) != current.as_ref() => Some(r.key),
+            _ => None,
+        })
+    });
+    let row = row.expect("a rail row of a session not on screen");
+    let y = bounds(cx, w, format!("star {row}")).map(|b| b[1] + b[3] / 2.).expect("its row drawn");
+    let at = point(px(200.), px(y));
+    let mouse = |cx: &mut TestAppContext, down: bool| {
+        let (button, modifiers) = (MouseButton::Left, Modifiers::default());
+        let ev = if down {
+            PlatformInput::MouseDown(MouseDownEvent { button, position: at, modifiers, click_count: 1, first_mouse: false })
+        } else {
+            PlatformInput::MouseUp(MouseUpEvent { button, position: at, modifiers, click_count: 1 })
+        };
+        cx.update_window(w, |_, window, cx| window.dispatch_event(ev, cx)).expect("the window");
+        cx.run_until_parked();
+    };
+    let open = view.read_with(cx, |v, _| v.panel_fx.sides[0].shown);
+    view.update(cx, |v, cx| v.toggle_panel(true, cx));
+    cx.run_until_parked();
+    for _ in 0..400 {
+        fluid_frame(cx, w, &view);
+        if !moving(cx).0 {
+            break;
+        }
+    }
+    settle(cx, w, 8);
+    assert!(view.read_with(cx, |v, _| v.panels.rail_collapsed), "folded");
+    let before = what(cx);
+    view.update(cx, |v, cx| v.toggle_panel(true, cx));
+    cx.run_until_parked();
+    // Into the unfold's tail: within 3 px of open, still on its way.
+    let mut n = 0;
+    while !matches!(moving(cx), (true, s) if s >= open - 3.) {
+        fluid_frame(cx, w, &view);
+        n += 1;
+        assert!(n < 400 && (n < 3 || moving(cx).0), "the unfold's tail caught in flight ({:?})", moving(cx));
+    }
+    mouse(cx, true);
+    while moving(cx).0 {
+        fluid_frame(cx, w, &view);
+    }
+    fluid_frame(cx, w, &view);
+    mouse(cx, false);
+    if what(cx) == before {
+        fails.push(format!("pressed on a row in the unfold's tail, let go landed: the click was dropped ({before:?})"));
+    }
     assert!(fails.is_empty(), "{fails:#?}");
 }

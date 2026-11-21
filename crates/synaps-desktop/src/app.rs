@@ -1033,9 +1033,11 @@ fn fold_fallback<A: Action>(rail: bool, view: WeakEntity<AppView>, window: AnyWi
 /// too, and one acting for it would act on its own view and end the
 /// dispatch, so the key never got to the window it was pressed in (a test
 /// with a second window in its app). GPUI lends a window out for its
-/// dispatch: until that is over, updating it fails.
+/// dispatch: until that is over, updating it fails. A closed window's
+/// update fails too: it is not dispatching, and its fallbacks pass every
+/// key on (Shady #40 n1: they swallowed the live window's).
 pub(crate) fn dispatching(window: AnyWindowHandle, cx: &mut App) -> bool {
-    window.update(cx, |_, _, _| ()).is_err()
+    cx.windows().contains(&window) && window.update(cx, |_, _, _| ()).is_err()
 }
 
 /// The tab keys' actions on the window's root (the composer, find and
@@ -4907,23 +4909,47 @@ impl AppView {
     /// would follow). Once hinted every row has a height, and this is a few
     /// lookups a frame.
     fn hint_rows(&self, m: &Metrics) {
+        if let Some(h) = self.row_hint(m) {
+            // A builder, on a clone: `ListState` is shared, so the hint lands
+            // on the list itself.
+            let _ = self.panes.cur.list.clone().with_uniform_item_height(px(h));
+        }
+    }
+
+    /// The hint [`AppView::hint_rows`] gives now, if it gives one.
+    fn row_hint(&self, m: &Metrics) -> Option<f32> {
         let (l, n) = (&self.panes.cur.list, self.panes.cur.disp.len());
         if !wants_hint(l, n) {
-            return;
+            return None;
         }
         // The rows not drawn are above the view (rows below it are drawn
         // or keep 0 px): their mean, not the drawn tail's.
         let top = l.logical_scroll_top().item_ix.min(n);
         let above = if top > 0 { &self.panes.cur.disp[..top] } else { &self.panes.cur.disp[..] };
         let h = turns::mean_height(above, &self.panes.cur.rows, m, turns::cpl(self.panes.cur.layout.column, m));
-        if h > 0. {
-            // A builder, on a clone: `ListState` is shared, so the hint lands
-            // on the list itself. Whole pixels (Shady #23 r2 H1): a mean is a
-            // ninth or a seventh, and a hint stays in the list's sums until
-            // its row is drawn, putting every position under it, and the
-            // following list's end, an f32 ulp off (28.000061 on CI).
-            let _ = l.clone().with_uniform_item_height(px(h.round().max(1.)));
-        }
+        // Whole pixels (Shady #23 r2 H1): a mean is a ninth or a seventh,
+        // and a hint stays in the list's sums until its row is drawn,
+        // putting every position under it, and the following list's end,
+        // an f32 ulp off (28.000061 on CI).
+        (h > 0.).then(|| h.round().max(1.))
+    }
+
+    /// After the layout of a frame whose new column re-wrapped the rows:
+    /// what the next frame's [`AppView::hint_rows`] adds to the list's
+    /// length and to its offset (above the view). GPUI dropped every row's
+    /// height at the new width and measured the ones it drew (`drawn`); the
+    /// rest get the hint. Read, never set: set now, the drawn rows would
+    /// lose their bounds until the next layout (the card's place reads them).
+    fn hint_ahead(&self, m: &Metrics, drawn: &[usize]) -> (f32, f32) {
+        let Some(h) = self.row_hint(m) else { return (0., 0.) };
+        let l = &self.panes.cur.list;
+        let (n, top) = (l.item_count(), l.logical_scroll_top().item_ix);
+        let mut d = drawn.to_vec();
+        d.sort_unstable();
+        d.dedup();
+        let all = n - d.iter().filter(|&&i| i < n).count();
+        let above = top.min(n) - d.iter().filter(|&&i| i < top.min(n)).count();
+        (all as f32 * h, above as f32 * h)
     }
 
     /// The card, if it shows the attached session's first pending prompt.
@@ -7652,11 +7678,12 @@ impl AppView {
                 self.panes.cur.fold_slack.set(Some(s));
             }
         }
-        // A new column re-wraps the rows: this frame's scrollbar would read
-        // the rows not yet measured at their estimates (it is held as it
-        // was, `Bar::still`). One more frame draws it from their heights,
-        // at every level (a fold at Off draws one frame, and its bar would
-        // keep the estimate until the next change).
+        // A new column re-wraps the rows: GPUI drops every row's height at
+        // the new width and measures the ones it draws. The rest get their
+        // hint right after its layout (`rehint`, below), so this frame's
+        // scrollbar reads the rows as the next frame would (#46: the thumbs
+        // land with the panes, not a frame after). One more frame anyway,
+        // at every level, which changes nothing.
         let rewrap = lay.column != self.panes.cur.layout.column;
         if rewrap {
             window.request_animation_frame();
@@ -7745,9 +7772,16 @@ impl AppView {
         let geo = crate::cards::Geo::of(&m);
         self.panes.cur.metrics_last.set(Some(m));
         let id = self.panes.cur.id;
+        // The rows the list draws this frame, on one that re-wraps them
+        // (`rehint`, below).
+        let drawn: Rc<RefCell<Vec<usize>>> = Rc::default();
+        let seen = rewrap.then(|| drawn.clone());
         let list = list(
             self.panes.cur.list.clone(),
             cx.processor(move |this, ix, _window, cx| {
+                if let Some(seen) = &seen {
+                    seen.borrow_mut().push(ix);
+                }
                 this.in_drawn(id, |this| this.pane_row(ix, &gaps, slack, geo, cx)).unwrap_or_else(|| div().into_any_element())
             }),
         )
@@ -7800,14 +7834,30 @@ impl AppView {
         // Over the list's right padding, after its layout (and the hold-back's).
         let layer = self.layer_now();
         let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.panes.cur.scroller.clone(), self.fx.clone()));
-        // Held while an edge is dragged and as it springs to a detent after,
-        // and in the frame a new column re-wraps the rows (on their
-        // estimates): the next frame draws it from their heights (the
-        // gate's S3 and S6, and the landing's frame).
+        // Held while an edge is dragged and as it springs to a detent after
+        // (the gate's S3 and S6).
         self.springback &= self.panel_fx.moving();
         let transcript_bar = crate::scrollbar::rows_gliding(&self.panes.cur.list, pad_t + pad_b, &self.bars.transcript, glide)
             .always()
-            .still(self.drag.is_some() || self.springback || rewrap);
+            .still(self.drag.is_some() || self.springback);
+        // The frame a new column re-wraps the rows, after the list's layout
+        // and before its bar: the bar reads the rows as the next frame's
+        // [`AppView::hint_rows`] will have them, so the thumb takes the
+        // re-wrapped rows' length in the frame they re-wrap (#46).
+        let ahead = Rc::new(Cell::new((0., 0.)));
+        let transcript_bar = if rewrap { transcript_bar.ahead(ahead.clone()) } else { transcript_bar };
+        let rehint = rewrap.then(|| {
+            let (v, ahead) = (cx.weak_entity(), ahead.clone());
+            canvas(
+                move |_, _, cx| {
+                    let add = v.update(cx, |this, _| this.in_drawn(id, |this| this.hint_ahead(&m, &drawn.borrow())));
+                    ahead.set(add.ok().flatten().unwrap_or((0., 0.)));
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0()
+        });
         // After the list's layout ([`AppView::keep_rows`]): a view grown to
         // the end of a scrolled-back list set it following; it stops 2 px
         // short of the end instead, still scrolled back. Built only on the
@@ -7821,6 +7871,9 @@ impl AppView {
             let (l, slack) = (self.panes.cur.list.clone(), self.panes.cur.fold_slack.clone());
             canvas(move |_, _, _| land_card_room(&l, &slack), |_, _, _, _| {}).absolute().size_0()
         });
+        // Tests: each frame of its log notes the column.
+        #[cfg(test)]
+        let transcript_bar = transcript_bar.tag(lay.column);
         let hold_back = self.panes.cur.hold_back.get().then(|| {
             let (held, hold, texts) = (self.panes.cur.list.clone(), self.panes.cur.hold_back.clone(), self.panes.cur.texts.clone());
             canvas(
@@ -7891,6 +7944,7 @@ impl AppView {
                         .children(hint_frame)
                         .children(landing)
                         .children(hold_back)
+                        .children(rehint)
                         .child(transcript_bar),
                 )
                 // The top of what is drawn over the composer (the stub, a
