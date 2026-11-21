@@ -579,3 +579,98 @@ fn the_pinned_label_goes_to_the_gutter_with_the_panel(cx: &mut TestAppContext) {
     assert!(slot[0] + slot[2] <= x + left + 1e-3 && (slot[1] - (top + pad_y)).abs() < 1e-3, "in the gutter at pad_y: {slot:?} {x} {left}");
     assert!(settle(cx, w, 8) <= 1, "no frame at rest");
 }
+
+/// The finish gate of #33, F1: a panel's flight ends on the layout it
+/// lands at. Closing the right panel at the end, three frames after it
+/// looked still, the panel stepped its last pixel as it landed and the
+/// column with it (1 px right); closing the rail, the tab (1 px left). The
+/// last frame that moves draws the landed widths, so the frame it lands in
+/// draws the same: the pane, the column, the rows and the tab all 0 px from
+/// it, and every frame after. Both panels, closing and opening, at Full
+/// (with frames between) and Reduced (one frame), as the clips have it:
+/// 1920 px, text 17, the rail at 480 and the right panel at 520.
+#[gpui_kit::test]
+fn a_panel_flight_ends_on_the_layout_it_lands_at(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1920., 1080.), 17);
+    view.update(cx, |v, cx| {
+        (v.panels.rail_width, v.panels.right_width) = (Some(480), Some(520));
+        cx.notify();
+    });
+    wait(cx, w, &view, 3000);
+    let tab = view.read_with(cx, |v, _| v.model.tabs.iter().next().map(|t| t.id).expect("a tab"));
+    // As drawn: the panels, the pane (the list's viewport), the column's
+    // left, the rows on screen, their labels and times, the tab.
+    let drawn = |cx: &mut TestAppContext| -> (bool, Vec<(String, [f32; 4])>) {
+        let (moving, mut at, ids) = view.read_with(cx, |v, _| {
+            let vb = v.list.viewport_bounds();
+            let f = |b: gpui_kit::Bounds<gpui_kit::Pixels>| {
+                [f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.size.width), f32::from(b.size.height)]
+            };
+            let mut at = vec![
+                ("panels".to_string(), [v.panel_fx.sides[0].shown, v.panel_fx.sides[1].shown, v.layout.left, v.layout.column]),
+                ("pane".to_string(), f(vb)),
+            ];
+            let mut ids = Vec::new();
+            for ix in 0..v.list.item_count() {
+                if let Some(b) = v.list.bounds_for_item(ix).filter(|b| b.bottom() > vb.top() && b.top() < vb.bottom()) {
+                    let id = v.disp[ix].id;
+                    at.push((format!("row {id}"), f(b)));
+                    ids.push(id);
+                }
+            }
+            (v.panel_fx.moving(), at, ids)
+        });
+        for sel in ids.iter().flat_map(|id| [format!("label {id}"), format!("time {id}")]).chain([format!("tab {tab}")]) {
+            if let Some(b) = bounds(cx, w, sel.clone()) {
+                at.push((sel, b));
+            }
+        }
+        (moving, at)
+    };
+    // What differs, if anything.
+    let apart = |a: &[(String, [f32; 4])], b: &[(String, [f32; 4])]| -> Vec<String> {
+        let mut out: Vec<String> =
+            a.iter().zip(b).filter(|(x, y)| x != y).map(|(x, y)| format!("{} {:?} -> {} {:?}", x.0, x.1, y.0, y.1)).collect();
+        if a.len() != b.len() {
+            out.push(format!("{} drawn -> {}", a.len(), b.len()));
+        }
+        out
+    };
+    let mut fails = Vec::new();
+    for level in [Level::Full, Level::Reduced] {
+        motion_level(cx, &view, level);
+        settle(cx, w, 8);
+        for rail in [true, false] {
+            for close in [true, false] {
+                let case = format!("{level:?} {} {}", if rail { "rail" } else { "right" }, if close { "close" } else { "open" });
+                view.update(cx, |v, cx| v.toggle_panel(rail, cx));
+                cx.run_until_parked();
+                let mut frames = vec![drawn(cx)];
+                fly(cx, w, &view, |cx| frames.push(drawn(cx)));
+                for _ in 0..8 {
+                    fluid_frame(cx, w, &view);
+                    frames.push(drawn(cx));
+                }
+                let landed = frames.iter().position(|f| !f.0).unwrap_or_else(|| panic!("{case}: it lands"));
+                let end = &frames[landed].1;
+                if level == Level::Full {
+                    assert!(landed > 30, "{case}: it flew ({landed} frames)");
+                    let off = apart(&frames[landed - 1].1, end);
+                    if !off.is_empty() {
+                        fails.push(format!("{case}: the last frame that moves is not the landed layout (it lands at {landed}): {off:?}"));
+                    }
+                } else {
+                    assert_eq!(landed, 0, "{case}: in one frame");
+                }
+                for (n, f) in frames.iter().enumerate().skip(landed + 1) {
+                    let off = apart(end, &f.1);
+                    if !off.is_empty() {
+                        fails.push(format!("{case}: frame {n}, after it landed at {landed}: {off:?}"));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
