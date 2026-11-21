@@ -255,6 +255,9 @@ const PANE_FLIGHT: u64 = 0x7AF5 << 48;
 /// Each pane's composer inset from its foot, on `sheet` (+ the pane's
 /// index).
 const FOOT_INSET: u64 = 0x7AF6 << 48;
+/// Each pane's composer inset above its box, on `sheet` (+ the pane's
+/// index).
+const TOP_INSET: u64 = 0x7AF7 << 48;
 
 /// `el`, whose laid-out height goes to `sink`: when it changes under
 /// [`crate::motion::Level::Full`], one more frame, so its box springs to
@@ -6887,20 +6890,35 @@ impl AppView {
     /// it rides the line, no first-frame hop: finish gate #42 F3). At
     /// Reduced and Off, at once.
     pub(crate) fn foot_bottom(&self, m: &Metrics) -> f32 {
-        let to = self.foot_inset(m);
-        let key = FOOT_INSET + self.panes.cur.id.index() as u64;
-        let was = self.panes.cur.foot.replace(to);
+        let pane = &self.panes.cur;
+        self.inset_drawn(FOOT_INSET, &pane.foot, &pane.foot_moving, self.foot_inset(m))
+    }
+
+    /// The composer's inset above its box as drawn: its form's (a pane
+    /// that a split shortens or a close lengthens changes form), on
+    /// `sheet` with the layout's flight as [`AppView::foot_bottom`]: the
+    /// rows over it ride the line, no first-frame hop.
+    fn top_drawn(&self, top: f32) -> f32 {
+        let pane = &self.panes.cur;
+        self.inset_drawn(TOP_INSET, &pane.top, &pane.top_moving, top)
+    }
+
+    /// An inset `to`, last drawn as `drawn`: a change in a layout's
+    /// flight springs on `sheet` from where it was; else at once.
+    fn inset_drawn(&self, base: u64, drawn: &Cell<f32>, moving: &Cell<bool>, to: f32) -> f32 {
+        let key = base + self.panes.cur.id.index() as u64;
+        let was = drawn.replace(to);
         if was != to && !was.is_nan() && self.panes.flight.is_some() {
-            let from = if self.panes.cur.foot_moving.get() { self.fx.spring_at(key).unwrap_or(was) } else { was };
+            let from = if moving.get() { self.fx.spring_at(key).unwrap_or(was) } else { was };
             self.fx.spring_jump(key, from, to, crate::motion::SHEET_RESPONSE);
-            self.panes.cur.foot_moving.set(true);
+            moving.set(true);
         }
         // Only while it moves: at rest nothing asks the spring (or a frame).
-        if !self.panes.cur.foot_moving.get() {
+        if !moving.get() {
             return to;
         }
-        let (at, moving) = self.fx.spring_px(key, to, crate::motion::SHEET_RESPONSE);
-        self.panes.cur.foot_moving.set(moving);
+        let (at, still_moving) = self.fx.spring_px(key, to, crate::motion::SHEET_RESPONSE);
+        moving.set(still_moving);
         at
     }
 
@@ -7327,7 +7345,7 @@ impl AppView {
                 .child(inner),
         )
         .flex_none()
-        .pt(px(dims.top))
+        .pt(px(self.top_drawn(dims.top)))
         .pb(px(bottom))
     }
 }
@@ -7780,6 +7798,7 @@ impl AppView {
                 )
                 .child(
                     div()
+                        .debug_selector(move || format!("pane-list {}", id.index()))
                         .flex_1()
                         .min_h_0()
                         .relative()
