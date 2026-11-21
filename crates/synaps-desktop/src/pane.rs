@@ -861,8 +861,11 @@ impl crate::app::AppView {
         }
         if std::mem::replace(&mut self.panes.focused, id) != id {
             self.close_menu();
-            // Its card's keys wait again, with their repaint (Shady #36 n7).
+            // Its card's keys wait again, with their repaint (Shady #36 n7),
+            // a key before the next frame too: not live until that frame
+            // says so (Shady #44 L4).
             self.keys_rearm = true;
+            self.panes.cur.keys_live = false;
             self.model.rail_gen += 1;
             self.model.view_dirty = true;
         }
@@ -1022,6 +1025,18 @@ impl crate::app::AppView {
         if !self.split_on() {
             return run(self, Place::Current);
         }
+        // On screen, or a tab of another pane: that pane focused (a click
+        // never makes a copy), before any split (Shady #44 M1: the split
+        // came first and stayed, an empty copy of this pane's session).
+        if let crate::named::RowAction::Attach(s) = action
+            && self.panes.split()
+            && (self.pane_showing(s).is_some() || self.panes.rest.iter().any(|p| p.parked.tabs.find(s).is_some()))
+        {
+            self.focus_session(s);
+            self.focus_composer(cx);
+            cx.notify();
+            return;
+        }
         let me = self.panes.focused;
         let (w, h) = self.centre.get();
         let rects = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h });
@@ -1063,68 +1078,96 @@ impl crate::app::AppView {
         }
         let id = self.panes.focused;
         self.in_pane(id, |v| {
-            for _ in 0..v.model.tabs.len() {
-                if v.model.tabs.is_empty() || !v.panes.ids().contains(&id) {
+            // The tabs behind first, the visible one last: no tab is shown
+            // (attached) on the way out (Shady #44 L2), and Ctrl+Shift+T
+            // brings the visible one back first.
+            let shown = v.model.tabs.visible().map(|t| t.id);
+            let mut order: Vec<u64> = v.model.tabs.iter().map(|t| t.id).filter(|t| Some(*t) != shown).collect();
+            order.reverse();
+            order.extend(shown);
+            for tab in order {
+                if !v.panes.ids().contains(&id) {
                     break;
                 }
-                v.close_tab(v.model.tabs.len() - 1);
+                let ix = v.model.tabs.iter().position(|t| t.id == tab);
+                if let Some(ix) = ix {
+                    v.close_tab(ix);
+                }
             }
         });
     }
 
-    /// The palette's Join all panes (split.md §8): every other pane's
-    /// session tabs into the focused pane, in reading order, once each;
-    /// the other panes close.
+    /// The palette's Join all panes (split.md §8): every tab of every
+    /// other pane into the focused one, in reading order, as it was (its
+    /// kind, its worker view, its draft; one of each session: Shady #44
+    /// M2, M3, L1); the other panes close, their reopen stacks with this
+    /// one's, in the one flight their closes make from where they are
+    /// drawn.
     pub(crate) fn join_panes(&mut self, cx: &mut Context<Self>) {
         if !self.panes.split() {
             return;
         }
         let me = self.panes.focused;
         let others: Vec<PaneId> = self.reading_order().into_iter().filter(|id| *id != me).collect();
-        // One flight for all of them (each close's own would start from
-        // the tree before it, a jump): every other share to 0 on `sheet`.
-        let was = self.panes.tree.clone();
-        let mut add = Vec::new();
-        for id in &others {
-            let tabs = self
-                .in_pane(*id, |v| {
-                    v.model
-                        .tabs
-                        .iter()
-                        .filter(|t| t.kind == crate::tabs::Kind::Session)
-                        .filter_map(|t| Some((t.session.clone()?, t.label.clone())))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            add.extend(tabs);
-        }
-        let mine: Vec<String> = self.model.tabs.iter().filter_map(|t| t.session.clone()).collect();
-        let mut seen = mine;
-        let add: Vec<_> = add.into_iter().filter(|(s, _)| (!seen.contains(s)).then(|| seen.push(s.clone())).is_some()).collect();
+        let mut carried = Vec::new();
         for &id in &others {
-            self.focus_pane(id, KeysTo::Pane, cx);
-            self.close_pane_tabs();
+            let tabs = self.in_pane(id, |v| {
+                let drafts: Vec<_> = v.model.tabs.iter().filter_map(|t| Some((t.id, t.session.clone()?))).collect();
+                let drafts: Vec<_> = drafts.into_iter().filter_map(|(tab, s)| v.take_draft(tab, &s, cx)).collect();
+                (v.model.tabs.take_all(), drafts)
+            });
+            carried.extend(tabs);
         }
-        self.focus_pane(me, KeysTo::Pane, cx);
-        // After its own tabs, its visible one still on screen.
         let visible = self.model.tabs.visible().map(|t| t.id);
-        if let Some(last) = self.model.tabs.len().checked_sub(1) {
-            self.model.tabs.focus(last);
-        }
-        for (s, label) in &add {
-            self.model.tabs.open(s, label, crate::tabs::Place::New);
+        for (tabs, drafts) in carried {
+            for t in tabs {
+                self.model.tabs.adopt(t);
+            }
+            for (s, d) in drafts {
+                self.give_draft(&s, d);
+            }
         }
         if let Some(ix) = visible.and_then(|id| self.model.tabs.iter().position(|t| t.id == id)) {
             self.model.tabs.focus(ix);
         }
-        let to = was.solo(me);
-        let mut flight = crate::split::Flight::new(was, to, Vec::new(), Vec::new());
-        flight.ghosts = others;
-        self.panes.flight = Some(flight);
         self.model.rail_gen += 1;
         self.reconcile(None);
+        for &id in &others {
+            self.in_pane(id, |v| v.close_pane());
+        }
+        self.focus_pane(me, KeysTo::Pane, cx);
         self.focus_composer(cx);
         cx.notify();
+    }
+
+    /// The draft of tab `tab` (draft key `key`) out of the pane acted on
+    /// (Shady #44 M2): the composer's text if it types for that tab (it
+    /// leaves with it: the composer types for no tab until its next frame
+    /// shows another's), else the one kept for it.
+    fn take_draft(&mut self, tab: u64, key: &str, cx: &Context<Self>) -> Option<(String, crate::tabs::Draft)> {
+        if let Some((_, owner)) = self.panes.cur.composer_of.clone().filter(|(i, _)| *i == tab) {
+            let c = self.panes.cur.composer.read(cx);
+            let d = crate::tabs::Draft { text: c.value().to_string(), cursor: c.cursor(), note: self.panes.cur.draft_note };
+            self.panes.cur.composer_of = None;
+            return (!d.text.trim().is_empty()).then(|| (owner.unwrap_or_else(|| key.to_string()), d));
+        }
+        self.drafts.take(key).map(|d| (key.to_string(), d))
+    }
+
+    /// A draft that came with its tab (Shady #44 M2) into the pane acted
+    /// on: ahead of what its composer holds if that types for the same
+    /// session already, else kept for the tab until it is shown.
+    fn give_draft(&mut self, key: &str, d: crate::tabs::Draft) {
+        let shown = self.panes.cur.composer_of.as_ref().is_some_and(|(_, k)| k.as_deref() == Some(key))
+            && self.model.tabs.composer_tab().is_some_and(|(_, k)| k == Some(key));
+        if shown {
+            self.panes.cur.restore = Some(match self.panes.cur.restore.take() {
+                Some(r) => format!("{r}\n{}", d.text),
+                None => d.text,
+            });
+        } else {
+            self.drafts.put(key, d);
+        }
     }
 
     /// Ctrl+Alt+→ / ← (split.md §9): the focused pane's active session tab
@@ -1150,26 +1193,40 @@ impl crate::app::AppView {
         let order = self.reading_order();
         let Some(i) = order.iter().position(|p| *p == source) else { return };
         let target = if back { i.checked_sub(1).map(|j| order[j]) } else { order.get(i + 1).copied() };
-        let close = |v: &mut Self| {
+        // Out of the source with no reopen entry (it is on screen next
+        // door: Shady #44 M3); with its last tab the pane closes.
+        let take = |v: &mut Self| {
             let ix = v.model.tabs.iter().position(|t| t.id == tab);
-            if let Some(ix) = ix {
-                v.close_tab(ix);
+            if let Some(ix) = ix
+                && v.model.tabs.take(ix).is_some()
+            {
+                v.model.rail_gen += 1;
+                v.reconcile(None);
             }
         };
         match target {
             Some(to) => {
                 self.focus_pane(to, KeysTo::Pane, cx);
+                // Its draft with it (Shady #44 M2).
+                let draft = self.in_pane(source, |v| v.take_draft(tab, &session, cx)).flatten();
                 self.model.tabs.open(&session, &label, crate::tabs::Place::New);
+                if let Some((k, d)) = draft {
+                    self.give_draft(&k, d);
+                }
                 self.model.rail_gen += 1;
                 self.reconcile(None);
-                self.in_pane(source, close);
+                self.in_pane(source, take);
                 self.focus_composer(cx);
             }
             None if !back && self.model.tabs.len() > 1 => {
                 let before = self.panes.len();
                 self.split_pane(None, window, cx);
                 if self.panes.len() > before {
-                    self.in_pane(source, close);
+                    let draft = self.in_pane(source, |v| v.take_draft(tab, &session, cx)).flatten();
+                    if let Some((k, d)) = draft {
+                        self.give_draft(&k, d);
+                    }
+                    self.in_pane(source, take);
                 }
             }
             None => {}
@@ -1257,6 +1314,9 @@ impl crate::app::AppView {
             let mut gone = self.panes.rest.remove(i);
             let view = std::mem::take(&mut gone.parked.view);
             self.model.lives[gone.live].watch.drop_parked(view);
+            // What it closed (and any tab still in it) the pane that stays
+            // reopens: Ctrl+Shift+T (Shady #44 M3).
+            self.model.tabs.adopt_closed(&mut gone.parked.tabs);
             drop(gone);
         }
         self.fx.col(id).reset();

@@ -659,6 +659,64 @@ impl Tabs {
         true
     }
 
+    /// Tab `ix` out with no reopen entry: it moves to another pane
+    /// (Ctrl+Shift+T here would bring back a copy of a tab on screen next
+    /// door; Shady #44 M3).
+    pub fn take(&mut self, ix: usize) -> Option<Tab> {
+        if ix >= self.tabs.len() {
+            return None;
+        }
+        let t = self.remove(ix);
+        self.restoring.retain(|&r| r != t.id);
+        self.changed();
+        self.settle_restore();
+        Some(t)
+    }
+
+    /// Every tab out, in order: Join all panes takes them into another
+    /// pane (split.md §8).
+    pub fn take_all(&mut self) -> Vec<Tab> {
+        self.active = None;
+        self.restoring.clear();
+        self.changed();
+        std::mem::take(&mut self.tabs)
+    }
+
+    /// Another pane's tab as it was (its kind, its worker view; Join all
+    /// panes, Shady #44 M3): at the end, unless the same one is open here
+    /// (a session's tab, a worker's, the one Settings or Usage).
+    pub fn adopt(&mut self, t: Tab) -> bool {
+        let open = match t.kind {
+            Kind::Session => t.session.as_deref().and_then(|s| self.find(s)),
+            Kind::Worker => match (&t.worker, t.session.as_deref()) {
+                (Some(w), Some(s)) => self.find_worker(s, &w.handle),
+                _ => None,
+            },
+            k => self.tabs.iter().position(|x| x.kind == k),
+        };
+        if open.is_some() {
+            return false;
+        }
+        self.tabs.push(t);
+        if self.active.is_none() {
+            self.active = Some(self.tabs.len() - 1);
+        }
+        self.changed();
+        true
+    }
+
+    /// The reopen stack of a pane that closed (split.md §8), on this one's:
+    /// Ctrl+Shift+T here brings its tabs back, newest first (Shady #44 M3).
+    pub fn adopt_closed(&mut self, from: &mut Tabs) {
+        for (ix, t) in std::mem::take(&mut from.closed) {
+            self.push_closed(ix, t);
+        }
+        for t in from.take_all() {
+            let at = self.tabs.len();
+            self.push_closed(at, t);
+        }
+    }
+
     /// Ctrl+Shift+T: the last closed tab, where it was (a session open
     /// again since is focused instead).
     pub fn reopen(&mut self) -> bool {
@@ -1028,6 +1086,29 @@ impl Drafts {
             d.text = format!("{text}\n{}", d.text);
         }
         d.note = Some(note);
+    }
+
+    /// Session (draft key) `s`'s kept draft, out: its tab moves to another
+    /// pane (Shady #44 M2).
+    pub fn take(&mut self, s: &str) -> Option<Draft> {
+        self.map.remove(s)
+    }
+
+    /// A draft that came with its tab from another pane: after one already
+    /// kept here.
+    pub fn put(&mut self, s: &str, d: Draft) {
+        if d.text.trim().is_empty() {
+            return;
+        }
+        match self.map.remove(s) {
+            Some(had) if !had.text.trim().is_empty() => {
+                let cursor = had.text.len() + 1 + d.cursor;
+                self.map.insert(s.to_string(), Draft { text: format!("{}\n{}", had.text, d.text), cursor, note: had.note.or(d.note) });
+            }
+            _ => {
+                self.map.insert(s.to_string(), d);
+            }
+        }
     }
 
     /// A worker tab's draft key changed with its session ([`Tabs::take_rekeys`]):

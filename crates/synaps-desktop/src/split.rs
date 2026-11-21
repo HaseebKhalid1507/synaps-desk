@@ -307,6 +307,13 @@ impl Node {
         }
     }
 
+    /// The smallest centre this tree fits in with every pane at least
+    /// `w` × `h` (its most panes across and down, the rules between).
+    pub(crate) fn min_size(&self, w: f32, h: f32) -> (f32, f32) {
+        let (across, down) = self.extent();
+        (across as f32 * w + (across - 1) as f32 * DIVIDER, down as f32 * h + (down - 1) as f32 * DIVIDER)
+    }
+
     /// The same panes in the same splits (ratios aside): a flight can go
     /// from one to the other.
     pub(crate) fn same_shape(&self, other: &Node) -> bool {
@@ -317,13 +324,6 @@ impl Node {
             }
             _ => false,
         }
-    }
-
-    /// The smallest centre this tree fits in with every pane at least
-    /// `w` × `h` (its most panes across and down, the rules between).
-    pub(crate) fn min_size(&self, w: f32, h: f32) -> (f32, f32) {
-        let (across, down) = self.extent();
-        (across as f32 * w + (across - 1) as f32 * DIVIDER, down as f32 * h + (down - 1) as f32 * DIVIDER)
     }
 
     /// The tree with `new` beside `at` on `side` (as a split makes it),
@@ -473,22 +473,6 @@ impl Node {
             if j < ratios.len() {
                 ratios[j] += ratios[i];
                 ratios[i] = 0.;
-            }
-        }
-        n
-    }
-
-    /// Where Join all panes' flight lands (split.md §8): the same tree,
-    /// every split on the way to `id` giving it all of its length.
-    pub(crate) fn solo(&self, id: PaneId) -> Node {
-        let mut n = self.clone();
-        if let Some(path) = self.path_of(id) {
-            for k in 0..path.len() {
-                if let Some(Node::Split { ratios, .. }) = n.at_mut(&path[..k]) {
-                    for (j, r) in ratios.iter_mut().enumerate() {
-                        *r = if j == path[k] { 1. } else { 0. };
-                    }
-                }
             }
         }
         n
@@ -750,24 +734,6 @@ mod tests {
         let rt = across.zeroed(p(1)).rects(area());
         let rg = across.remove(p(1)).unwrap().rects(area());
         assert!((at(&rt, p(0)).w - at(&rg, p(0)).w).abs() <= 1. && (at(&rt, p(2)).w - at(&rg, p(2)).w).abs() <= 1., "{rt:?} / {rg:?}");
-    }
-
-    /// Join all panes' landing (split.md §8): the pane kept has the whole
-    /// area, every other one 0 (a split of two closing as one goes too).
-    #[test]
-    fn solo_gives_one_pane_everything() {
-        let t = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), A).unwrap();
-        let t = t.split(p(1), Side::Down, p(2), A).unwrap();
-        for keep in [p(0), p(1), p(2)] {
-            let r = t.solo(keep).rects(area());
-            for (id, b) in &r {
-                if *id == keep {
-                    assert!(b.w + 2. * DIVIDER >= area().w - 1. && b.h + DIVIDER >= area().h - 1., "{keep:?} keeps it all: {r:?}");
-                } else {
-                    assert!(b.w * b.h < 1. + area().h + area().w, "{id:?} at 0: {r:?}");
-                }
-            }
-        }
     }
 
     /// Shady #42 M3: `[A A′ / B | C]`, A′ dragged to its minimum, then

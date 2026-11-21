@@ -962,6 +962,15 @@ impl CardChord {
     }
 }
 
+/// A pane map's cell (split.md §4, §6): `prose` where its pane is lit,
+/// else `rest_mark`, the chrome's mark at rest, which reads on the chrome,
+/// a raised (selected or hovered) row and a pressed one in every theme
+/// (finish gate #44 F4: `edge` was 1.2:1 on the selected row, and the map
+/// lost its shape).
+pub(crate) fn map_cell(p: &Palette, lit: bool) -> Hsla {
+    if lit { p.prose } else { p.rest_mark }
+}
+
 /// A key whose auto-repeats must not act: a held Ctrl+T (Cmd+T) is one new
 /// tab, not a burst of daemon sessions; a held Ctrl+W closes one tab. GPUI
 /// says whether a key-down is a repeat (`is_held`) only to key listeners,
@@ -973,6 +982,9 @@ pub(crate) enum OnceKey {
     Fold(bool),
     /// New, Close, Reopen.
     Tab(TabKey),
+    /// Ctrl+Alt+← (`true`) / → (Shady #44 L3: a held one walked the tab
+    /// through every pane, closing and splitting them).
+    MovePane(bool),
 }
 
 impl OnceKey {
@@ -982,6 +994,8 @@ impl OnceKey {
             OnceKey::Fold(_) => "b",
             OnceKey::Tab(TabKey::Close) => "w",
             OnceKey::Tab(_) => "t",
+            OnceKey::MovePane(true) => "left",
+            OnceKey::MovePane(false) => "right",
         }
     }
 }
@@ -1880,6 +1894,11 @@ pub struct AppView {
     pub(crate) tab_cache: Lru<String, TabCache>,
     /// Tells Ctrl+T / Ctrl+W / Ctrl+Shift+T presses from their repeats.
     tab_keys: FoldKeys,
+    /// Ctrl+Alt+← / →'s presses ([`OnceKey::MovePane`]).
+    move_keys: FoldKeys,
+    /// The panels the split yielded (rail, right) and its fold, as last
+    /// judged ([`AppView::pane_sides`]).
+    pane_yield: Option<(bool, bool, bool)>,
     /// A once-per-press key whose action came and whose key-down has not
     /// yet ([`OnceKey`]).
     once: Option<OnceKey>,
@@ -2494,6 +2513,8 @@ impl AppView {
             lists_seen: 0,
             tab_cache: Lru::new(TAB_CACHE, TAB_CACHE_BYTES),
             tab_keys: FoldKeys::default(),
+            move_keys: FoldKeys::default(),
+            pane_yield: None,
             once: None,
             attach_source: None,
             settings: Default::default(),
@@ -3665,9 +3686,14 @@ impl AppView {
 
     /// A once-per-press key's key-down, after its action: a press acts, a
     /// repeat does not.
-    fn once_key(&mut self, k: OnceKey, held: bool, cx: &mut Context<Self>) {
+    fn once_key(&mut self, k: OnceKey, held: bool, window: &mut Window, cx: &mut Context<Self>) {
         let now = Instant::now();
         match k {
+            OnceKey::MovePane(back) => {
+                if self.move_keys.press(now, held) {
+                    self.move_tab_pane(back, window, cx);
+                }
+            }
             OnceKey::Fold(rail) => {
                 if self.fold_keys.press(now, held) {
                     self.toggle_panel(rail, cx);
@@ -5037,7 +5063,7 @@ impl AppView {
     /// A Ctrl+Enter or Esc reached the card (its keys are live): true if
     /// it may answer ([`Arm::key`]: a new press, armed). Keys that were not
     /// live at the last frame went live with it, so it waits too.
-    fn card_key_armed(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn card_key_armed(&mut self, cx: &mut Context<Self>) -> bool {
         let press = self.panes.cur.chord_press;
         let fresh = !std::mem::replace(&mut self.panes.cur.keys_live, true);
         let Some(c) = self.panes.cur.card.as_mut() else { return false };
@@ -8002,11 +8028,28 @@ impl AppView {
     /// ever drawn under its minimum; its ratios are kept), and the panels
     /// are as one pane's. Sets [`Panes::folded`].
     fn pane_sides(&mut self, rail: Side, right: Side) -> (Side, Side) {
-        use crate::split::{PANE_MIN_H, PANE_MIN_W, Rect};
         self.panes.folded = false;
         if !self.panes.split() {
+            self.pane_yield = None;
             return (rail, right);
         }
+        // Held while a divider is dragged (Shady #44 L5: the rail is judged
+        // by the ratios, and opening it mid-drag rescaled every pane under
+        // the pointer).
+        if self.panes.grab.as_ref().is_some_and(|g| g.moved)
+            && let Some((l, r, folded)) = self.pane_yield
+        {
+            self.panes.folded = folded;
+            return (if l { Side::Strip } else { rail }, if r { Side::Strip } else { right });
+        }
+        let (l, r) = self.pane_yields(rail, right);
+        self.pane_yield = Some((l == Side::Strip && rail != Side::Strip, r == Side::Strip && right != Side::Strip, self.panes.folded));
+        (l, r)
+    }
+
+    /// [`AppView::pane_sides`], judged now.
+    fn pane_yields(&mut self, rail: Side, right: Side) -> (Side, Side) {
+        use crate::split::{PANE_MIN_H, PANE_MIN_W, Rect};
         let h = self.height - crate::chrome::top_h(self.top_short);
         let tree = &self.panes.tree;
         let (wide, _) = tree.min_size(CENTRE_MIN, PANE_MIN_H);
@@ -8024,16 +8067,12 @@ impl AppView {
     }
 
     /// The pane map (split.md §4, §6): the layout's tree in `w` × `h`, a
-    /// cell per pane 1 px apart, `prose` where `lit`, else `edge`; with
-    /// `click`, a cell focuses its pane.
+    /// cell per pane 1 px apart ([`map_cell`]); with `click`, a cell focuses
+    /// its pane.
     pub(crate) fn pane_map(&self, w: f32, h: f32, lit: impl Fn(PaneId) -> bool, click: bool, p: &Palette, cx: &Context<Self>) -> Div {
         let cells = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h });
         div().relative().flex_none().w(px(w)).h(px(h)).children(cells.into_iter().map(|(id, r)| {
-            let cell = div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w.max(1.))).h(px(r.h.max(1.))).bg(if lit(id) {
-                p.prose
-            } else {
-                p.edge
-            });
+            let cell = div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w.max(1.))).h(px(r.h.max(1.))).bg(map_cell(p, lit(id)));
             if click {
                 cell.id(("pane-map", id.index()))
                     .debug_selector(move || format!("pane-map {}", id.index()))
@@ -8586,8 +8625,15 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &FocusPane4, _, cx| this.focus_nth(3, cx)))
             .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| this.focus_step(false, cx)))
             .on_action(cx.listener(|this, _: &FocusPrevPane, _, cx| this.focus_step(true, cx)))
-            .on_action(cx.listener(|this, _: &MoveTabNextPane, window, cx| this.move_tab_pane(false, window, cx)))
-            .on_action(cx.listener(|this, _: &MoveTabPrevPane, window, cx| this.move_tab_pane(true, window, cx)))
+            // Once a press: the key-down decides ([`OnceKey`]).
+            .on_action(cx.listener(|this, _: &MoveTabNextPane, _, cx| {
+                this.once = Some(OnceKey::MovePane(false));
+                cx.propagate();
+            }))
+            .on_action(cx.listener(|this, _: &MoveTabPrevPane, _, cx| {
+                this.once = Some(OnceKey::MovePane(true));
+                cx.propagate();
+            }))
             .map(|d| crate::palette::capture_keys(d, cx))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
@@ -8645,7 +8691,7 @@ impl Render for AppView {
                     && k_is(k)
                 {
                     cx.stop_propagation();
-                    return this.once_key(k, ev.is_held, cx);
+                    return this.once_key(k, ev.is_held, window, cx);
                 }
                 // A worker's context menu takes the keys while it is open.
                 if this.menu.is_some() && this.menu_keydown(&ev.keystroke, this.panes.cur.chord_press, window, cx) {
@@ -8824,6 +8870,8 @@ impl Render for AppView {
                     this.fold_keys.release(Instant::now());
                 } else if k.eq_ignore_ascii_case("t") || k.eq_ignore_ascii_case("w") {
                     this.tab_keys.release(Instant::now());
+                } else if k == "left" || k == "right" {
+                    this.move_keys.release(Instant::now());
                 }
                 if is_tab_key(k) {
                     this.tab_key_up(cx);
