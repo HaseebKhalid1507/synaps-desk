@@ -819,12 +819,6 @@ impl crate::app::AppView {
     }
 }
 
-/// `SYNAPS_DESK_PANES=<n>|film` (benches and evidence, with split panes
-/// on): once the first session is attached, `n` panes on it (2: side by
-/// side; 3: three across; 4: 2×2), or the film's scene, each step marked
-/// on stderr (`PANES <what> <s>`): split right, the right pane opens
-/// another session, split down, focus by F6, Shift+F6 and Alt+1, a draft
-/// per pane, then the panes close one by one (each collapses).
 /// The splits that make `n` panes (split.md §4): 2 side by side, 3
 /// across, 4 as 2×2. Each: the pane to focus first (reading order), and
 /// the side (`None`: right, or down if narrow).
@@ -838,6 +832,12 @@ pub(crate) fn shape(n: usize) -> Vec<(Option<usize>, Option<crate::split::Side>)
     }
 }
 
+/// `SYNAPS_DESK_PANES=<n>|film` (benches and evidence, with split panes
+/// on): once the first session is attached, `n` panes on it (2: side by
+/// side; 3: three across; 4: 2×2), or the film's scene, each step marked
+/// on stderr (`PANES <what> <s>`): split right, the right pane opens
+/// another session, split down, focus by F6, Shift+F6 and Alt+1, a draft
+/// per pane, then the panes close one by one (each collapses).
 pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, window: &mut Window, cx: &mut App) {
     use crate::app::AppView;
     use crate::split::Side;
@@ -854,7 +854,10 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
                 });
             };
             let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
-            sleep(1.5).await;
+            // The film's first split once its recording has begun
+            // (`scripts/capture-linux.sh` starts 3.5 s after the window).
+            let film = how == "film";
+            sleep(if film { 5.0 } else { 1.5 }).await;
             if let Ok(n) = how.parse::<usize>() {
                 for (at, side) in shape(n) {
                     act(cx, &|v, w, cx| {
