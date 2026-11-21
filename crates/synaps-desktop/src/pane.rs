@@ -544,6 +544,9 @@ pub(crate) struct Panes {
     pub(crate) flight: Option<crate::split::Flight>,
     /// A divider held down, or dragged (split.md §4).
     pub(crate) grab: Option<crate::split::Grab>,
+    /// The window is too narrow (or short) for the split (split.md §5):
+    /// the focused pane fills the centre, the tree kept as it is.
+    pub(crate) folded: bool,
     /// The layout as last drawn (a flight's step, else the tree): where
     /// the next flight starts (Shady #42 M1).
     pub(crate) drawn: crate::split::Node,
@@ -564,6 +567,7 @@ impl Panes {
             tree,
             flight: None,
             grab: None,
+            folded: false,
             gens: 0,
         }
     }
@@ -603,7 +607,7 @@ impl Panes {
         let flight = match (drawn.split_as(at, side, new), to.split_as(at, side, new)) {
             (Some(from), Some(to)) if from.same_shape(&to) => {
                 grow.push(new);
-                Flight { from: from.grown_from(new), to, grow, ghosts, travel: 0., wrap }
+                Flight { from: from.grown_from(new), to, grow, ghosts, travel: 0., wrap, wrap_at: None }
             }
             _ => Flight::new(tree.grown_from(new), tree.clone(), vec![new], Vec::new()),
         };
@@ -619,22 +623,39 @@ impl Panes {
         ghosts.push(id);
         let to = to.zeroed(id);
         self.drawn = drawn.clone();
-        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., wrap });
+        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None });
     }
 
     /// The layout's flight to `to` (split.md §10: an equalise, a detent),
-    /// from where it is drawn.
-    pub(crate) fn fly_to(&mut self, to: crate::split::Node) {
-        let (drawn, _, _, ghosts, wrap) = self.flight_ends();
-        let from = if ghosts.is_empty() && drawn.same_shape(&to) { drawn } else { self.tree.clone() };
-        self.tree = to.clone();
-        self.drawn = from.clone();
-        self.flight = Some(crate::split::Flight { from, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., wrap });
+    /// from where it is drawn, in `area`: a pane still growing carries on
+    /// growing, and one still closing carries on closing, its share to 0
+    /// as every other pane goes where `to` puts it (Shady #42 r2-L2: an
+    /// Equalise mid-close snapped the closing share away).
+    pub(crate) fn fly_to(&mut self, to: crate::split::Node, area: crate::split::Rect) {
+        use crate::split::Flight;
+        let (drawn, end, grow, ghosts, wrap) = self.flight_ends();
+        let was = std::mem::replace(&mut self.tree, to.clone());
+        let flight = if !ghosts.is_empty() && drawn.same_shape(&end) {
+            let to = end.fitted(&to.rects(area), &ghosts);
+            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None }
+        } else if ghosts.is_empty() && drawn.same_shape(&to) {
+            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None }
+        } else {
+            Flight { from: was, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., wrap, wrap_at: None }
+        };
+        self.drawn = flight.from.clone();
+        self.flight = Some(flight);
     }
 
-    /// More than one pane on screen (a closing one drawn: it was).
+    /// More than one pane open (on screen, or folded; a closing one
+    /// drawn: it was).
     pub(crate) fn split(&self) -> bool {
         !self.rest.is_empty() || self.cur.closing.is_some()
+    }
+
+    /// More than one pane on screen: split and not folded (split.md §5).
+    pub(crate) fn shown_split(&self) -> bool {
+        self.split() && !self.folded
     }
 
     /// How many panes are open.
@@ -670,6 +691,13 @@ impl Panes {
     /// too (it stays until that pane goes).
     pub(crate) fn showing(&self, live: crate::live::LiveId) -> usize {
         self.iter().chain(&self.closing).filter(|p| p.live == live).count()
+    }
+
+    /// The open panes showing live store `live`: whether a store is shared
+    /// with a pane that stays (Shady #44 L15, #42 r3-L1: a closing pane
+    /// never counts; it draws from a store of its own).
+    pub(crate) fn showing_open(&self, live: crate::live::LiveId) -> usize {
+        self.iter().filter(|p| p.live == live).count()
     }
 
     /// A window-wide generation (split/architecture.md §6.1 rule 2, §1.1;
@@ -960,8 +988,11 @@ impl crate::app::AppView {
         }
         if std::mem::replace(&mut self.panes.focused, id) != id {
             self.close_menu();
-            // Its card's keys wait again, with their repaint (Shady #36 n7).
+            // Its card's keys wait again, with their repaint (Shady #36 n7),
+            // a key before the next frame too: not live until that frame
+            // says so (Shady #44 L4).
             self.keys_rearm = true;
+            self.panes.cur.keys_live = false;
             self.model.rail_gen += 1;
             self.model.view_dirty = true;
         }
@@ -1089,6 +1120,280 @@ impl crate::app::AppView {
         self.focus_composer(cx);
     }
 
+    /// Why a split of the focused pane (`side` as [`Self::split_pane`]'s)
+    /// can't happen now, if it can't (the palette greys it).
+    pub(crate) fn split_refusal(&self, side: Option<crate::split::Side>) -> Option<&'static str> {
+        use crate::split::Refused;
+        let Some(new) = self.panes.free_id() else { return Some(Refused::Most.note()) };
+        let (at, area) = (self.panes.focused, self.centre.get());
+        let r = match side {
+            None => self.panes.tree.split_right(at, new, area).map(|_| ()),
+            Some(s) => self.panes.tree.split(at, s, new, area).map(|_| ()),
+        };
+        match r {
+            Ok(()) => None,
+            Err(Refused::Most) => Some(Refused::Most.note()),
+            Err(Refused::Room) => Some("no room at this window size"),
+        }
+    }
+
+    /// Alt+click on a rail row (split.md §2, A6): Open to the side. In the
+    /// pane to the right of the focused one (a new tab there); none, a new
+    /// pane on the right; no room for one, the next pane in reading order;
+    /// one pane and no room, the focused pane. It never fails and never
+    /// asks. With split panes off, a plain click's.
+    pub(crate) fn open_to_side(&mut self, action: &crate::named::RowAction, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::tabs::Place;
+        let run = |v: &mut Self, place: Place| {
+            for fx in v.model.open_row_in(action, place) {
+                v.effect(fx);
+            }
+        };
+        if !self.split_on() {
+            return run(self, Place::Current);
+        }
+        // On screen in a pane: that pane focused (Shady #44 L14: before
+        // this pane's own tabs, so a session to the side is gone to, not
+        // shown here too; on this pane itself, nothing).
+        if let crate::named::RowAction::Attach(s) = action
+            && self.panes.split()
+            && self.pane_showing(s).is_some()
+        {
+            self.focus_session(s);
+            self.focus_composer(cx);
+            cx.notify();
+            return;
+        }
+        // A tab of this pane: shown here (Shady #44 L9: the split came
+        // first, a copy of the tab on screen beside it).
+        let own = match action {
+            crate::named::RowAction::Attach(s) => {
+                self.model.tabs.iter().position(|t| t.session.as_deref() == Some(s.as_str()) && t.kind == crate::tabs::Kind::Session)
+            }
+            _ => None,
+        };
+        if let Some(ix) = own {
+            self.focus_tab(ix);
+            self.focus_composer(cx);
+            cx.notify();
+            return;
+        }
+        // A tab of another pane: that pane focused (a click never makes a
+        // copy), before any split (Shady #44 M1: the split came first and
+        // stayed, an empty copy of this pane's session).
+        if let crate::named::RowAction::Attach(s) = action
+            && self.panes.split()
+            && self.panes.rest.iter().any(|p| p.parked.tabs.find(s).is_some())
+        {
+            self.focus_session(s);
+            self.focus_composer(cx);
+            cx.notify();
+            return;
+        }
+        let me = self.panes.focused;
+        let (w, h) = self.centre.get();
+        let rects = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h });
+        let right = rects.iter().find(|(id, _)| *id == me).and_then(|(_, f)| {
+            rects
+                .iter()
+                .filter(|(id, r)| *id != me && r.x >= f.x + f.w && r.y < f.y + f.h && r.y + r.h > f.y)
+                .min_by(|a, b| (a.1.x, a.1.y).partial_cmp(&(b.1.x, b.1.y)).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, _)| *id)
+        });
+        // No right neighbour: a new pane there if it fits, else the next.
+        let target = right.or_else(|| {
+            self.split_refusal(Some(crate::split::Side::Right))?;
+            let order = self.reading_order();
+            let i = order.iter().position(|id| *id == me)?;
+            order.get((i + 1) % order.len()).copied().filter(|id| *id != me)
+        });
+        match target {
+            Some(id) => {
+                self.focus_pane(id, KeysTo::Pane, cx);
+                run(self, Place::New);
+            }
+            None if self.split_refusal(Some(crate::split::Side::Right)).is_none() => {
+                // Its new tab of this pane's session becomes the row's.
+                self.split_pane(Some(crate::split::Side::Right), window, cx);
+                run(self, Place::Current);
+            }
+            None => run(self, Place::New),
+        }
+        self.focus_composer(cx);
+        cx.notify();
+    }
+
+    /// The palette's Close pane (split.md §8): the focused pane's tabs
+    /// close (Ctrl+Shift+T reopens them), and with its last the pane.
+    pub(crate) fn close_pane_tabs(&mut self) {
+        if !self.panes.split() {
+            return;
+        }
+        let id = self.panes.focused;
+        self.in_pane(id, |v| {
+            // The tabs behind first, the visible one last: no tab is shown
+            // (attached) on the way out (Shady #44 L2), and Ctrl+Shift+T
+            // brings the visible one back first.
+            let shown = v.model.tabs.visible().map(|t| t.id);
+            let mut order: Vec<u64> = v.model.tabs.iter().map(|t| t.id).filter(|t| Some(*t) != shown).collect();
+            order.reverse();
+            order.extend(shown);
+            for tab in order {
+                if !v.panes.ids().contains(&id) {
+                    break;
+                }
+                let ix = v.model.tabs.iter().position(|t| t.id == tab);
+                if let Some(ix) = ix {
+                    v.close_tab(ix);
+                }
+            }
+        });
+    }
+
+    /// The palette's Join all panes (split.md §8): every tab of every
+    /// other pane into the focused one, in reading order, as it was (its
+    /// kind, its worker view, its draft; one of each session: Shady #44
+    /// M2, M3, L1); the other panes close, their reopen stacks with this
+    /// one's, in the one flight their closes make from where they are
+    /// drawn.
+    pub(crate) fn join_panes(&mut self, cx: &mut Context<Self>) {
+        if !self.panes.split() {
+            return;
+        }
+        let me = self.panes.focused;
+        let others: Vec<PaneId> = self.reading_order().into_iter().filter(|id| *id != me).collect();
+        let mut carried = Vec::new();
+        for &id in &others {
+            let tabs = self.in_pane(id, |v| {
+                // Each under the key it is kept under: a worker tab's is
+                // `session#sa_N` (Shady #44 L10).
+                let drafts: Vec<_> = v.model.tabs.iter().filter_map(|t| Some((t.id, t.draft_key()?.to_string()))).collect();
+                let drafts: Vec<_> = drafts.into_iter().filter_map(|(tab, s)| v.take_draft(tab, &s, cx)).collect();
+                // A tab still being created stays with its pane: its create
+                // is its store's, and goes (detached) as the pane closes;
+                // carried, it was a tab nothing would ever fill (Shady #44
+                // L12).
+                let tabs = v.model.tabs.take_all().into_iter().filter(|t| !t.pending()).collect::<Vec<_>>();
+                (tabs, drafts)
+            });
+            carried.extend(tabs);
+        }
+        let visible = self.model.tabs.visible().map(|t| t.id);
+        for (tabs, drafts) in carried {
+            for t in tabs {
+                self.model.tabs.adopt(t);
+            }
+            for (s, d) in drafts {
+                self.give_draft(&s, d);
+            }
+        }
+        if let Some(ix) = visible.and_then(|id| self.model.tabs.iter().position(|t| t.id == id)) {
+            self.model.tabs.focus(ix);
+        }
+        self.model.rail_gen += 1;
+        self.reconcile(None);
+        for &id in &others {
+            self.in_pane(id, |v| v.close_pane());
+        }
+        self.focus_pane(me, KeysTo::Pane, cx);
+        self.focus_composer(cx);
+        cx.notify();
+    }
+
+    /// The draft of tab `tab` (draft key `key`) out of the pane acted on
+    /// (Shady #44 M2): the composer's text if it types for that tab (it
+    /// leaves with it: the composer types for no tab until its next frame
+    /// shows another's), else the one kept for it.
+    fn take_draft(&mut self, tab: u64, key: &str, cx: &Context<Self>) -> Option<(String, crate::tabs::Draft)> {
+        if let Some((_, owner)) = self.panes.cur.composer_of.clone().filter(|(i, _)| *i == tab) {
+            let c = self.panes.cur.composer.read(cx);
+            let d = crate::tabs::Draft { text: c.value().to_string(), cursor: c.cursor(), note: self.panes.cur.draft_note };
+            self.panes.cur.composer_of = None;
+            return (!d.text.trim().is_empty()).then(|| (owner.unwrap_or_else(|| key.to_string()), d));
+        }
+        self.drafts.take(key).map(|d| (key.to_string(), d))
+    }
+
+    /// A draft that came with its tab (Shady #44 M2) into the pane acted
+    /// on: ahead of what its composer holds if that types for the same
+    /// session already, else kept for the tab until it is shown.
+    fn give_draft(&mut self, key: &str, d: crate::tabs::Draft) {
+        let shown = self.panes.cur.composer_of.as_ref().is_some_and(|(_, k)| k.as_deref() == Some(key))
+            && self.model.tabs.composer_tab().is_some_and(|(_, k)| k == Some(key));
+        if shown {
+            self.panes.cur.restore = Some(match self.panes.cur.restore.take() {
+                Some(r) => format!("{r}\n{}", d.text),
+                None => d.text,
+            });
+        } else {
+            self.drafts.put(key, d);
+        }
+    }
+
+    /// Ctrl+Alt+→ / ← (split.md §9): the focused pane's active session tab
+    /// to the next / previous pane in reading order, focused there. At the
+    /// end of the order a pane with more than one tab splits one off with
+    /// it (Ctrl+\'s rules); a pane's only tab moves and its pane closes.
+    pub(crate) fn move_tab_pane(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.split_on() {
+            return;
+        }
+        let Some(ix) = self.model.tabs.active() else { return };
+        let Some((tab, session, label)) = self
+            .model
+            .tabs
+            .iter()
+            .nth(ix)
+            .filter(|t| t.kind == crate::tabs::Kind::Session)
+            .and_then(|t| Some((t.id, t.session.clone()?, t.label.clone())))
+        else {
+            return;
+        };
+        let source = self.panes.focused;
+        let order = self.reading_order();
+        let Some(i) = order.iter().position(|p| *p == source) else { return };
+        let target = if back { i.checked_sub(1).map(|j| order[j]) } else { order.get(i + 1).copied() };
+        // Out of the source with no reopen entry (it is on screen next
+        // door: Shady #44 M3); with its last tab the pane closes.
+        let take = |v: &mut Self| {
+            let ix = v.model.tabs.iter().position(|t| t.id == tab);
+            if let Some(ix) = ix
+                && v.model.tabs.take(ix).is_some()
+            {
+                v.model.rail_gen += 1;
+                v.reconcile(None);
+            }
+        };
+        match target {
+            Some(to) => {
+                self.focus_pane(to, KeysTo::Pane, cx);
+                // Its draft with it (Shady #44 M2).
+                let draft = self.in_pane(source, |v| v.take_draft(tab, &session, cx)).flatten();
+                self.model.tabs.open(&session, &label, crate::tabs::Place::New);
+                if let Some((k, d)) = draft {
+                    self.give_draft(&k, d);
+                }
+                self.model.rail_gen += 1;
+                self.reconcile(None);
+                self.in_pane(source, take);
+                self.focus_composer(cx);
+            }
+            None if !back && self.model.tabs.len() > 1 => {
+                let before = self.panes.len();
+                self.split_pane(None, window, cx);
+                if self.panes.len() > before {
+                    let draft = self.in_pane(source, |v| v.take_draft(tab, &session, cx)).flatten();
+                    if let Some((k, d)) = draft {
+                        self.give_draft(&k, d);
+                    }
+                    self.in_pane(source, take);
+                }
+            }
+            None => {}
+        }
+        cx.notify();
+    }
+
     /// A split refused: the reason on the focused composer's status line
     /// for 2.4 s (split.md §2), no toast.
     fn split_refused(&mut self, why: &'static str, cx: &mut Context<Self>) {
@@ -1168,9 +1473,12 @@ impl crate::app::AppView {
         let next = self.panes.focused;
         self.enter_pane(next);
         if let Some(i) = self.panes.rest.iter().position(|p| p.id == id) {
+            // What it closed (and any tab still in it) the pane that stays
+            // reopens: Ctrl+Shift+T (Shady #44 M3).
+            let mut gone = self.panes.rest.remove(i);
+            self.model.tabs.adopt_closed(&mut gone.parked.tabs);
             // Out of reach from here; it goes as its flight lands
             // ([`AppView::reap_closing`]: at Reduced and Off, the next frame).
-            let gone = self.panes.rest.remove(i);
             self.panes.closing.push(gone);
         }
         self.model.rail_gen += 1;
@@ -1184,6 +1492,40 @@ impl crate::app::AppView {
             return Some(self.panes.focused);
         }
         self.panes.iter().find(|p| p.live == live).map(|p| p.id)
+    }
+
+    /// Split: the first pane in reading order, not the focused one, whose
+    /// visible session has a card waiting (Ctrl+J, split.md §7).
+    pub(crate) fn waiting_pane(&self) -> Option<PaneId> {
+        if !self.panes.split() {
+            return None;
+        }
+        let me = self.panes.focused;
+        self.reading_order().into_iter().filter(|id| *id != me).find(|id| {
+            self.panes.get(*id).is_some_and(|p| {
+                let tabs = if p.id == self.panes.cur.id { &self.model.tabs } else { &p.parked.tabs };
+                tabs.view().is_none() && !self.model.lives[p.live].transcript.pending_prompts().is_empty()
+            })
+        })
+    }
+
+    /// Every pane showing session `s` on its visible tab (the pane map's
+    /// lit cells, split.md §6).
+    pub(crate) fn panes_showing(&self, s: &str) -> Vec<PaneId> {
+        let shows =
+            |p: &Pane, tabs: &crate::tabs::Tabs| p.shown_tab.as_ref().and_then(|t| t.1.as_deref()) == Some(s) && tabs.view().is_none();
+        let mut out: Vec<PaneId> = shows(&self.panes.cur, &self.model.tabs).then_some(self.panes.cur.id).into_iter().collect();
+        out.extend(self.panes.rest.iter().filter(|p| shows(p, &p.parked.tabs)).map(|p| p.id));
+        out
+    }
+
+    /// The right panel's header (split.md §6): the title of the session
+    /// behind its numbers (the focused pane's store, on a worker or
+    /// Settings tab too) and the panes that show it (Shady #44 L6).
+    pub(crate) fn numbers_session(&self) -> (String, Vec<PaneId>) {
+        let Some(s) = self.model.lives[self.panes.cur.live].transcript.session_id() else { return (String::new(), Vec::new()) };
+        let title = self.model.sessions.iter().find(|r| r.id == s).map_or_else(|| s.to_string(), |r| r.label());
+        (title, self.panes_showing(s))
     }
 
     /// The pane showing session `s` on its visible tab, if any.
@@ -1317,6 +1659,52 @@ async fn film3b(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowCont
     mark("done");
 }
 
+/// [`pane_script`]'s `film3b2` scene (split.md §2, §5, §7, §8, §9).
+async fn film3b2(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, t0: Instant) {
+    let mark = |what: &str| eprintln!("PANES {what} {:.3}", t0.elapsed().as_secs_f64());
+    let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
+    let act = |cx: &mut AsyncWindowContext, f: &mut dyn FnMut(&mut crate::app::AppView, &mut Window, &mut Context<crate::app::AppView>)| {
+        let _ = view.update_in(cx, |v, window, cx| {
+            f(v, window, cx);
+            cx.notify();
+        });
+    };
+    use crate::palette::AppAct;
+    mark("split");
+    act(cx, &mut |v, w, cx| v.split_pane(None, w, cx));
+    sleep(1.6).await;
+    mark("open-idle");
+    act(cx, &mut |v, _, _| {
+        v.open_tab(
+            crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false },
+            crate::tabs::Place::Current,
+        )
+    });
+    sleep(1.8).await;
+    mark("ctrl-j");
+    act(cx, &mut |v, w, cx| v.jump_to_card(w, cx));
+    sleep(1.8).await;
+    mark("f6");
+    act(cx, &mut |v, _, cx| v.focus_step(false, cx));
+    sleep(0.6).await;
+    mark("move-prev");
+    act(cx, &mut |v, w, cx| v.move_tab_pane(true, w, cx));
+    sleep(1.8).await;
+    mark("move-next");
+    act(cx, &mut |v, w, cx| v.move_tab_pane(false, w, cx));
+    sleep(1.8).await;
+    mark("open-to-side");
+    act(cx, &mut |v, w, cx| v.open_to_side(&crate::named::RowAction::Attach(crate::demo::FLAKY.into()), w, cx));
+    sleep(2.0).await;
+    mark("equalise");
+    act(cx, &mut |v, w, cx| v.app_act(AppAct::Equalise, w, cx));
+    sleep(1.6).await;
+    mark("join");
+    act(cx, &mut |v, w, cx| v.app_act(AppAct::JoinPanes, w, cx));
+    sleep(2.0).await;
+    mark("done");
+}
+
 /// The splits that make `n` panes (split.md §4): 2 side by side, 3
 /// across, 4 as 2×2. Each: the pane to focus first (reading order), and
 /// the side (`None`: right, or down if narrow).
@@ -1339,7 +1727,11 @@ pub(crate) fn shape(n: usize) -> Vec<(Option<usize>, Option<crate::split::Side>)
 /// (split.md §4, §10): split right and down (each grows), the dividers
 /// dragged as a pointer would (1:1, 60 moves a second), to their
 /// minimums (the bottom right pane at 320 × 240), let go near equal (the
-/// detent), a double-click (equalise), then the two closes.
+/// detent), a double-click (equalise), then the two closes. `film3b2`
+/// (3b-2): a split, Ctrl+J into the pane that waits, a tab moved back
+/// (its pane closes) and on (a pane splits off), Open to the side, the
+/// palette's Equalise, then Join all panes. `three[:fold=<w>x<h>]`: three
+/// panes across (the panels yield), then the window narrowed to fold.
 pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, window: &mut Window, cx: &mut App) {
     use crate::app::AppView;
     use crate::split::Side;
@@ -1362,6 +1754,42 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
             if how == "film3b" {
                 sleep(5.0).await;
                 film3b(&view, cx, &ex, t0).await;
+                return;
+            }
+            if how == "film3b2" {
+                sleep(5.0).await;
+                film3b2(&view, cx, &ex, t0).await;
+                return;
+            }
+            // Three across (the panels yield to their strips), then the
+            // window to `fold=<w>x<h>` if given (the split folds there).
+            if let Some(to) = how.strip_prefix("three") {
+                sleep(5.0).await;
+                let fold = to
+                    .strip_prefix(":fold=")
+                    .and_then(|s| s.split_once('x'))
+                    .and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?)));
+                if fold.is_some() {
+                    act(cx, &|_, window, _| window.resize(size(px(1280.), px(800.))));
+                    sleep(1.0).await;
+                }
+                act(cx, &|v, w, cx| v.split_pane(None, w, cx));
+                sleep(0.8).await;
+                act(cx, &|v, _, _| {
+                    v.open_tab(
+                        crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false },
+                        crate::tabs::Place::Current,
+                    )
+                });
+                sleep(0.8).await;
+                act(cx, &|v, w, cx| v.split_pane(None, w, cx));
+                sleep(1.2).await;
+                mark("three");
+                if let Some((w, h)) = fold {
+                    act(cx, &|_, window, _| window.resize(size(px(w), px(h))));
+                    sleep(1.5).await;
+                    mark("folded");
+                }
                 return;
             }
             sleep(if film { 5.0 } else { 1.5 }).await;

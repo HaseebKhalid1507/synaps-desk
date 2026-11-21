@@ -1888,6 +1888,15 @@ impl AppView {
                                         .text_color(title_color)
                                         .child(SharedString::from(&row.title)),
                                 )
+                                // Where it is on screen (split.md §6, A13):
+                                // the pane map, its panes lit.
+                                .children(meta.filter(|_| self.panes.split()).and_then(|s| {
+                                    let on = self.panes_showing(&s.id);
+                                    (!on.is_empty()).then(|| {
+                                        self.pane_map(13., 9., move |id| on.contains(&id), false, p, cx)
+                                            .debug_selector(|| "rail-pane-map".into())
+                                    })
+                                }))
                                 // The daemon pins it too (it is not in PINNED).
                                 .when(row.pinned, |d| {
                                     d.child(
@@ -1932,8 +1941,12 @@ impl AppView {
                 cx.notify();
             }))
             .map(|d| AppView::pressable(d, touch, cx))
-            .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                this.rail_click(key, crate::tabstrip::click_place(ev, cx));
+            .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                // Alt+click: Open to the side (split.md §2).
+                match this.rail.rail.rows.iter().find(|r| r.key == key).map(|r| r.action.clone()) {
+                    Some(action) if ev.modifiers().alt && this.split_on() => this.open_to_side(&action, window, cx),
+                    _ => this.rail_click(key, crate::tabstrip::click_place(ev, cx)),
+                }
                 cx.notify();
             }))
             .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
@@ -2006,8 +2019,12 @@ impl AppView {
                 cx.notify();
             }))
             .map(|d| AppView::pressable(d, touch, cx))
-            .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                this.rail_click(key, crate::tabstrip::click_place(ev, cx));
+            .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                // Alt+click: Open to the side (split.md §2).
+                match this.rail.rail.rows.iter().find(|r| r.key == key).map(|r| r.action.clone()) {
+                    Some(action) if ev.modifiers().alt && this.split_on() => this.open_to_side(&action, window, cx),
+                    _ => this.rail_click(key, crate::tabstrip::click_place(ev, cx)),
+                }
                 cx.notify();
             }))
             .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
@@ -2203,6 +2220,28 @@ impl AppView {
                 p,
                 cx,
             )))
+            // Whose numbers (split.md §6, A12): the session behind them (the
+            // focused pane's store, on a worker or Settings tab too), its
+            // title, and the cells of the panes that show it (Shady #44 L6).
+            .when(self.panes.split(), |d| {
+                let (title, lit) = self.numbers_session();
+                d.child(
+                    h_flex()
+                        .mt(px(6.))
+                        .gap(px(8.))
+                        .items_center()
+                        .debug_selector(|| "right-pane-map".into())
+                        .child(self.pane_map(13., 9., move |id| lit.contains(&id), false, p, cx))
+                        .child(
+                            mono(title, 12., p.prose)
+                                .debug_selector(|| "right-pane-title".into())
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis(),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .mt(px(20.))

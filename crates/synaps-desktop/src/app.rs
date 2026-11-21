@@ -340,7 +340,9 @@ actions!(
         FocusPane3,
         FocusPane4,
         FocusNextPane,
-        FocusPrevPane
+        FocusPrevPane,
+        MoveTabNextPane,
+        MoveTabPrevPane
     ]
 );
 
@@ -348,8 +350,9 @@ actions!(
 /// pane is narrow), Ctrl+Shift+\ down (spelled both ways, as AppKit may
 /// report the shifted key as `|`); Alt+1–4 focus pane N in reading order
 /// (Ctrl+1–4 on macOS, whose Cmd+1–8 are the tab keys); F6 / Shift+F6
-/// the next / previous pane. Cmd on macOS for the splits.
-pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 9] {
+/// the next / previous pane; Ctrl+Alt+→ / ← move the active tab to the
+/// next / previous pane. Cmd on macOS for the splits and the moves.
+pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 11] {
     use PaneKey::*;
     if mac {
         [
@@ -362,6 +365,8 @@ pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 9] {
             ("ctrl-4", Nth(3)),
             ("f6", Next),
             ("shift-f6", Prev),
+            ("cmd-alt-right", MoveNext),
+            ("cmd-alt-left", MovePrev),
         ]
     } else {
         [
@@ -374,6 +379,8 @@ pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 9] {
             ("alt-4", Nth(3)),
             ("f6", Next),
             ("shift-f6", Prev),
+            ("ctrl-alt-right", MoveNext),
+            ("ctrl-alt-left", MovePrev),
         ]
     }
 }
@@ -386,6 +393,8 @@ pub(crate) enum PaneKey {
     Nth(usize),
     Next,
     Prev,
+    MoveNext,
+    MovePrev,
 }
 
 /// A prompt as [`AppView::card_first`] knows it: its session, its id and
@@ -490,7 +499,12 @@ pub fn bind_keys(cx: &mut App) {
     // Only with split panes on (the root's `PANES_CTX`): off, these keys
     // are main's, never swallowed (Shady #36 L1).
     for &(k, a) in &pane_keys(mac) {
-        let c = Some(if matches!(a, PaneKey::Split | PaneKey::SplitDown) { PANES_CTX } else { PANE_FOCUS_CTX });
+        // A move works with one pane too (it splits one off).
+        let c = Some(if matches!(a, PaneKey::Split | PaneKey::SplitDown | PaneKey::MoveNext | PaneKey::MovePrev) {
+            PANES_CTX
+        } else {
+            PANE_FOCUS_CTX
+        });
         keys.push(match a {
             PaneKey::Split => KeyBinding::new(k, SplitRight, c),
             PaneKey::SplitDown => KeyBinding::new(k, SplitDown, c),
@@ -500,6 +514,8 @@ pub fn bind_keys(cx: &mut App) {
             PaneKey::Nth(_) => KeyBinding::new(k, FocusPane4, c),
             PaneKey::Next => KeyBinding::new(k, FocusNextPane, c),
             PaneKey::Prev => KeyBinding::new(k, FocusPrevPane, c),
+            PaneKey::MoveNext => KeyBinding::new(k, MoveTabNextPane, c),
+            PaneKey::MovePrev => KeyBinding::new(k, MoveTabPrevPane, c),
         });
     }
     cx.bind_keys(keys);
@@ -949,6 +965,15 @@ impl CardChord {
     }
 }
 
+/// A pane map's cell (split.md §4, §6): `prose` where its pane is lit,
+/// else `rest_mark`, the chrome's mark at rest, which reads on the chrome,
+/// a raised (selected or hovered) row and a pressed one in every theme
+/// (finish gate #44 F4: `edge` was 1.2:1 on the selected row, and the map
+/// lost its shape).
+pub(crate) fn map_cell(p: &Palette, lit: bool) -> Hsla {
+    if lit { p.prose } else { p.rest_mark }
+}
+
 /// A key whose auto-repeats must not act: a held Ctrl+T (Cmd+T) is one new
 /// tab, not a burst of daemon sessions; a held Ctrl+W closes one tab. GPUI
 /// says whether a key-down is a repeat (`is_held`) only to key listeners,
@@ -960,6 +985,9 @@ pub(crate) enum OnceKey {
     Fold(bool),
     /// New, Close, Reopen.
     Tab(TabKey),
+    /// Ctrl+Alt+← (`true`) / → (Shady #44 L3: a held one walked the tab
+    /// through every pane, closing and splitting them).
+    MovePane(bool),
 }
 
 impl OnceKey {
@@ -969,6 +997,8 @@ impl OnceKey {
             OnceKey::Fold(_) => "b",
             OnceKey::Tab(TabKey::Close) => "w",
             OnceKey::Tab(_) => "t",
+            OnceKey::MovePane(true) => "left",
+            OnceKey::MovePane(false) => "right",
         }
     }
 }
@@ -1867,6 +1897,11 @@ pub struct AppView {
     pub(crate) tab_cache: Lru<String, TabCache>,
     /// Tells Ctrl+T / Ctrl+W / Ctrl+Shift+T presses from their repeats.
     tab_keys: FoldKeys,
+    /// Ctrl+Alt+← / →'s presses ([`OnceKey::MovePane`]).
+    move_keys: FoldKeys,
+    /// The panels the split yielded (rail, right) and its fold, as last
+    /// judged ([`AppView::pane_sides`]).
+    pane_yield: Option<(bool, bool, bool)>,
     /// A once-per-press key whose action came and whose key-down has not
     /// yet ([`OnceKey`]).
     once: Option<OnceKey>,
@@ -2477,6 +2512,8 @@ impl AppView {
             lists_seen: 0,
             tab_cache: Lru::new(TAB_CACHE, TAB_CACHE_BYTES),
             tab_keys: FoldKeys::default(),
+            move_keys: FoldKeys::default(),
+            pane_yield: None,
             once: None,
             attach_source: None,
             settings: Default::default(),
@@ -3237,7 +3274,7 @@ impl AppView {
             self.panes.cur.rows_session = target;
             return false;
         }
-        let shared = self.panes.showing(live) > 1;
+        let shared = self.panes.showing_open(live) > 1;
         let elsewhere = target.as_deref().and_then(|s| self.model.lives.of_session(s, live));
         if shared {
             // What it sent still unconfirmed is another pane's on the store
@@ -3376,20 +3413,37 @@ impl AppView {
 
     /// The pane acted on, closing (its last tab closed, or Join), leaves
     /// its store as a switch away leaves it ([`AppView::repoint`]), at
-    /// once: a store another pane shows stays (what it sent still
-    /// unconfirmed goes to that pane); one only it showed lets its session
-    /// go ([`Model::switch_out`]: no input, card or HALT reaches it) and
+    /// once: a store another open pane shows stays (what it sent still
+    /// unconfirmed goes to that pane), and the closing pane draws from a
+    /// copy of its own; one no open pane shows lets its session go
+    /// ([`Model::switch_out`]: no input, card or HALT reaches it) and
     /// detaches. The transcript stays in that store, for the rows drawn as
     /// its share closes (finish gate #42 F2); no attach is waited for.
     pub(crate) fn leave_for_close(&mut self) {
         let live = self.panes.cur.live;
         self.panes.cur.attach_wait = None;
         self.panes.cur.attach_due = None;
-        if self.panes.showing(live) > 1 {
-            let me = self.panes.cur.id;
-            if let Some(other) = self.panes.iter().find(|p| p.id != me && p.live == live).map(|p| p.id) {
-                self.model.lives[live].in_flight.rehome(me, other);
-            }
+        // Shared with a pane that stays (a closing one sharing it never
+        // counts: Shady #44 L15, Join closing two panes on one store lost
+        // their sends).
+        let me = self.panes.cur.id;
+        let other = self.panes.iter().find(|p| p.id != me && p.live == live).map(|p| p.id);
+        if let Some(other) = other {
+            self.model.lives[live].in_flight.rehome(me, other);
+            // Its rows from a store of its own, a copy of what they show
+            // (Shady #42 r3-L1: the pane that stays can switch the shared
+            // store to another session within the flight, which blanked
+            // them or drew another session's items under them). Nothing is
+            // attached to it: no event, input or card reaches it.
+            self.sync_list();
+            let l = &self.model.lives[live];
+            let mut stats = l.stats.clone();
+            (stats.files, stats.subagents) = (l.shown_files().clone(), l.shown_subagents().clone());
+            let transcript = l.shown().clone();
+            let own = self.fresh_live();
+            let c = &mut self.model.lives[own];
+            (c.transcript, c.stats) = (transcript, stats);
+            self.panes.cur.live = own;
             return;
         }
         // The rows first: the transcript may have run ahead of the last frame.
@@ -3705,9 +3759,14 @@ impl AppView {
 
     /// A once-per-press key's key-down, after its action: a press acts, a
     /// repeat does not.
-    fn once_key(&mut self, k: OnceKey, held: bool, cx: &mut Context<Self>) {
+    fn once_key(&mut self, k: OnceKey, held: bool, window: &mut Window, cx: &mut Context<Self>) {
         let now = Instant::now();
         match k {
+            OnceKey::MovePane(back) => {
+                if self.move_keys.press(now, held) {
+                    self.move_tab_pane(back, window, cx);
+                }
+            }
             OnceKey::Fold(rail) => {
                 if self.fold_keys.press(now, held) {
                     self.toggle_panel(rail, cx);
@@ -5077,7 +5136,7 @@ impl AppView {
     /// A Ctrl+Enter or Esc reached the card (its keys are live): true if
     /// it may answer ([`Arm::key`]: a new press, armed). Keys that were not
     /// live at the last frame went live with it, so it waits too.
-    fn card_key_armed(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn card_key_armed(&mut self, cx: &mut Context<Self>) -> bool {
         let press = self.panes.cur.chord_press;
         let fresh = !std::mem::replace(&mut self.panes.cur.keys_live, true);
         let Some(c) = self.panes.cur.card.as_mut() else { return false };
@@ -6938,7 +6997,7 @@ impl AppView {
     pub(crate) fn foot_inset(&self, m: &Metrics) -> f32 {
         let foot = {
             let (r, (_, h)) = (self.panes.cur.land.get(), self.centre.get());
-            self.panes.split() && (r.y + r.h - h).abs() < 0.5
+            self.panes.shown_split() && (r.y + r.h - h).abs() < 0.5
         };
         let form =
             if foot { if self.top_short { crate::fit::Form::Short } else { crate::fit::Form::Full } } else { self.panes.cur.layout.form() };
@@ -7612,7 +7671,7 @@ impl AppView {
         if lay.form() != self.panes.cur.layout.form() {
             // Split, the top bar is the window's (M1): a pane's own form
             // moves its naming row only.
-            let split = self.panes.split();
+            let split = self.panes.shown_split();
             let above = |l: Layout, naming: bool| above_list(l, naming) - if split { crate::chrome::top_h(l.short) } else { 0. };
             let shift = above(lay, ex.naming) - above(self.panes.cur.layout, self.panes.cur.layout_naming);
             self.keep_rows(shift, (lay.form() as u8) > (self.panes.cur.layout.form() as u8));
@@ -7635,7 +7694,7 @@ impl AppView {
         // own height under its own form's bars (`win_h` counts the full
         // bar, and a Short pane's are 12 px less), less what a foot pane's
         // composer insets more than its form's (the window's, M3).
-        let height = if self.panes.split() {
+        let height = if self.panes.shown_split() {
             let extra = (self.foot_inset(&m) - crate::fit::Composer::of(&m, lay.form()).bottom).max(0.);
             g.win_h - crate::chrome::TOP + crate::chrome::top_h(lay.short) - extra
         } else {
@@ -8060,6 +8119,79 @@ impl AppView {
 }
 
 impl AppView {
+    /// The side panels with split panes in the window (split.md §5): the
+    /// right panel yields to its strip while the split would put a pane
+    /// under 480 px (`CENTRE_MIN` per pane: the session wins; by the
+    /// tree's shape, as the mock's, so a divider's drag never folds it),
+    /// then the rail while a pane would be under its 320 × 240 minimum.
+    /// When the minimums still can't be met, the split folds (no pane is
+    /// ever drawn under its minimum; its ratios are kept), and the panels
+    /// are as one pane's. Sets [`Panes::folded`].
+    fn pane_sides(&mut self, rail: Side, right: Side) -> (Side, Side) {
+        self.panes.folded = false;
+        if !self.panes.split() {
+            self.pane_yield = None;
+            return (rail, right);
+        }
+        // Held while a divider is dragged (Shady #44 L5: the rail is judged
+        // by the ratios, and opening it mid-drag rescaled every pane under
+        // the pointer).
+        if self.panes.grab.as_ref().is_some_and(|g| g.moved)
+            && let Some((l, r, folded)) = self.pane_yield
+        {
+            self.panes.folded = folded;
+            return (if l { Side::Strip } else { rail }, if r { Side::Strip } else { right });
+        }
+        let (l, r) = self.pane_yields(rail, right);
+        self.pane_yield = Some((l == Side::Strip && rail != Side::Strip, r == Side::Strip && right != Side::Strip, self.panes.folded));
+        (l, r)
+    }
+
+    /// [`AppView::pane_sides`], judged now.
+    fn pane_yields(&mut self, rail: Side, right: Side) -> (Side, Side) {
+        use crate::split::{PANE_MIN_H, PANE_MIN_W, Rect};
+        let h = self.height - crate::chrome::top_h(self.top_short);
+        let tree = &self.panes.tree;
+        let (wide, _) = tree.min_size(CENTRE_MIN, PANE_MIN_H);
+        let centre = |l: Side, r: Side| self.width - crate::chrome::MARK - l.width() - r.width();
+        // Every pane at its minimum in a centre `w` wide, as laid out.
+        let fits = |w: f32| tree.rects(Rect { x: 0., y: 0., w, h }).iter().all(|(_, r)| r.w + 0.5 >= PANE_MIN_W && r.h + 0.5 >= PANE_MIN_H);
+        let right = if centre(rail, right) + 0.5 >= wide { right } else { Side::Strip };
+        for (l, r) in [(rail, right), (Side::Strip, right)] {
+            if fits(centre(l, r)) {
+                return (l, r);
+            }
+        }
+        self.panes.folded = true;
+        (rail, right)
+    }
+
+    /// The pane map (split.md §4, §6): the layout's tree in `w` × `h`, a
+    /// cell per pane 1 px apart ([`map_cell`]); with `click`, a cell focuses
+    /// its pane.
+    pub(crate) fn pane_map(&self, w: f32, h: f32, lit: impl Fn(PaneId) -> bool, click: bool, p: &Palette, cx: &Context<Self>) -> Div {
+        let cells = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h });
+        div().relative().flex_none().w(px(w)).h(px(h)).children(cells.into_iter().map(|(id, r)| {
+            let cell = div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w.max(1.))).h(px(r.h.max(1.))).bg(map_cell(p, lit(id)));
+            if click {
+                cell.id(("pane-map", id.index()))
+                    .debug_selector(move || format!("pane-map {}", id.index()))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.focus_pane(id, crate::pane::KeysTo::Pane, cx);
+                            this.focus_composer(cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element()
+            } else {
+                cell.into_any_element()
+            }
+        }))
+    }
+
     /// The layout as drawn this frame in `area` (split.md §10): the tree at
     /// rest; in a flight, its step on `sheet`, on whole pixels. The step
     /// is `from` to `to` by the spring's travel; within a pixel of its end
@@ -8096,11 +8228,12 @@ impl AppView {
 
     /// The layout changes to `to` on `sheet` from where it is drawn
     /// (split.md §10: a double-click's equalise, a release's detent).
-    fn fly_layout(&mut self, to: crate::split::Node, cx: &mut Context<Self>) {
+    pub(crate) fn fly_layout(&mut self, to: crate::split::Node, cx: &mut Context<Self>) {
         if to == self.panes.tree {
             return;
         }
-        self.panes.fly_to(to);
+        let (w, h) = self.centre.get();
+        self.panes.fly_to(to, crate::split::Rect { x: 0., y: 0., w, h });
         cx.notify();
     }
 
@@ -8422,6 +8555,7 @@ impl Render for AppView {
         // drew the old bar).
         self.top_short = self.height - crate::chrome::TOP < crate::fit::short_below(&m);
         let (rail, right) = sides(self.width, self.panels, crate::chrome::MARK);
+        let (rail, right) = self.pane_sides(rail, right);
         if let Side::Open(w) = rail {
             self.rail_width = w;
         }
@@ -8476,8 +8610,13 @@ impl Render for AppView {
         let centre_h = self.height - crate::chrome::top_h(self.top_short);
         self.centre.set((centre, centre_h));
         self.centre_at.set((crate::chrome::MARK + rail_w, crate::chrome::top_h(self.top_short)));
-        // A close's flight down to one pane is drawn split until it lands.
-        let main = if self.panes.split() || self.panes.flight.is_some() {
+        // A close's flight down to one pane is drawn split until it lands;
+        // folded, the focused pane is drawn as one (split.md §5).
+        if self.panes.folded {
+            self.panes.flight = None;
+            self.panes.grab = None;
+        }
+        let main = if self.panes.shown_split() || (self.panes.flight.is_some() && !self.panes.folded) {
             let area = |w: f32| crate::split::Rect { x: 0., y: 0., w, h: centre_h };
             // The layout as drawn this frame: the tree, or its flight's
             // step (split.md §10).
@@ -8502,6 +8641,11 @@ impl Render for AppView {
             // last that moves, never after it (finish gate #42 F1).
             let landed = drawn == self.panes.tree;
             let mut mains = Vec::new();
+            // Each pane's wrap in the flight, from its ends at the panels'
+            // narrowest centre (Shady #42 L2).
+            if let Some(f) = self.panes.flight.as_mut() {
+                f.set_wraps(area(wrap));
+            }
             // Where each closing share goes (its rectangle at 0).
             let to_rects = self.panes.flight.as_ref().filter(|_| !ghosts.is_empty()).map(|f| f.to.rects(area(centre))).unwrap_or_default();
             for (id, r) in &rects {
@@ -8530,11 +8674,8 @@ impl Render for AppView {
                 // pane's column keeps the narrowest box of the flight (it
                 // rewraps once), and its form and fit are the landed ones.
                 let grows = grow.contains(id);
-                let narrowest = self.panes.flight.as_mut().map(|f| match f.wrap.iter_mut().find(|(i, _)| i == id) {
-                    Some((_, w)) => {
-                        *w = w.min(r.w).min(l.w);
-                        *w
-                    }
+                let narrowest = self.panes.flight.as_mut().map(|f| match f.wrap.iter().find(|(i, _)| i == id) {
+                    Some((_, w)) => *w,
                     None => {
                         f.wrap.push((*id, r.w.min(l.w)));
                         r.w.min(l.w)
@@ -8546,7 +8687,9 @@ impl Render for AppView {
                 let win_h = if self.panes.split() { l.h + crate::chrome::TOP } else { self.height };
                 let g = PaneFrame {
                     pane,
-                    wrap: of(&rects_wrap).min(pane).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY)),
+                    // Its narrowest of the flight, set at its start, not this
+                    // frame's box (it would rewrap as that moved).
+                    wrap: of(&rects_wrap).min(narrowest.filter(|_| !grows && !landed).unwrap_or(pane)),
                     pane_to: of(&rects_to),
                     view_pane: pane,
                     win_h,
@@ -8609,6 +8752,15 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &FocusPane4, _, cx| this.focus_nth(3, cx)))
             .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| this.focus_step(false, cx)))
             .on_action(cx.listener(|this, _: &FocusPrevPane, _, cx| this.focus_step(true, cx)))
+            // Once a press: the key-down decides ([`OnceKey`]).
+            .on_action(cx.listener(|this, _: &MoveTabNextPane, _, cx| {
+                this.once = Some(OnceKey::MovePane(false));
+                cx.propagate();
+            }))
+            .on_action(cx.listener(|this, _: &MoveTabPrevPane, _, cx| {
+                this.once = Some(OnceKey::MovePane(true));
+                cx.propagate();
+            }))
             .map(|d| crate::palette::capture_keys(d, cx))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
@@ -8629,12 +8781,13 @@ impl Render for AppView {
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
                 this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
-                // Ctrl+J: to the card, wherever the focus is (polish.md §2.6).
+                // Ctrl+J: to the card, wherever the focus is (polish.md §2.6),
+                // or another pane's (split.md §7).
                 let m = &ev.keystroke.modifiers;
                 if ev.keystroke.key == "j"
                     && m.control
                     && !(m.alt || m.shift || m.platform || m.function)
-                    && !this.model.lives[this.panes.cur.live].transcript.pending_prompts().is_empty()
+                    && (!this.model.lives[this.panes.cur.live].transcript.pending_prompts().is_empty() || this.waiting_pane().is_some())
                 {
                     cx.stop_propagation();
                     if this.palette.is_some() {
@@ -8665,7 +8818,7 @@ impl Render for AppView {
                     && k_is(k)
                 {
                     cx.stop_propagation();
-                    return this.once_key(k, ev.is_held, cx);
+                    return this.once_key(k, ev.is_held, window, cx);
                 }
                 // A worker's context menu takes the keys while it is open.
                 if this.menu.is_some() && this.menu_keydown(&ev.keystroke, this.panes.cur.chord_press, window, cx) {
@@ -8844,6 +8997,8 @@ impl Render for AppView {
                     this.fold_keys.release(Instant::now());
                 } else if k.eq_ignore_ascii_case("t") || k.eq_ignore_ascii_case("w") {
                     this.tab_keys.release(Instant::now());
+                } else if k == "left" || k == "right" {
+                    this.move_keys.release(Instant::now());
                 }
                 if is_tab_key(k) {
                     this.tab_key_up(cx);

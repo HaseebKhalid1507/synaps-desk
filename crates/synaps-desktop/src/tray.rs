@@ -208,6 +208,9 @@ pub(crate) struct Chips {
     pub(crate) more: usize,
     pub(crate) more_line: usize,
     pub(crate) lines: usize,
+    /// How many chips a line holds ([`grid`]): the grid a chip's cell is
+    /// in.
+    pub(crate) per: usize,
 }
 
 impl Chips {
@@ -432,7 +435,7 @@ impl AppView {
         let used = if all { placed.last().map_or(0, |s| s.1 + 1) } else { lines };
         let more_line = used.saturating_sub(1);
         // Only ghosts cut: no worker is left out, and nothing says so.
-        self.chips = Chips { slots: placed, more: if all { 0 } else { more }, more_line, lines: used };
+        self.chips = Chips { slots: placed, more: if all { 0 } else { more }, more_line, lines: used, per: k };
     }
 
     /// The workers menu (polish.md §2.5): `+N more`'s workers, each as its
@@ -612,8 +615,14 @@ impl AppView {
                     // diagonal), in px to the end; a new share of the column
                     // moves none. One that came rises 8 px and lifts from
                     // 70 %, in turn (polish.md P13).
-                    let off = fx.col(self.panes.cur.id).slide(TRAY | r.id, line as f32 * (row_h + CHIP_GAP));
-                    let dx = fx.cell_slide(self.panes.cur.id.salt(TRAY_X | r.id), col as u64, col as f32 * (w + CHIP_GAP));
+                    // In a new grid (the column took another count of chips
+                    // a line: a layout or panel flight landed), a chip is in
+                    // its cell at once, from the frame that lands it (design
+                    // gate #44 F5: after Join one slid 17 frames on,
+                    // across another): each grid keys its own slides.
+                    let grid = (chips.per as u64) << 32;
+                    let off = fx.col(self.panes.cur.id).slide(TRAY | grid | r.id, line as f32 * (row_h + CHIP_GAP));
+                    let dx = fx.cell_slide(self.panes.cur.id.salt(TRAY_X | grid | r.id), col as u64, col as f32 * (w + CHIP_GAP));
                     let (travel, strength) = fx.arrival(fx.col(self.panes.cur.id).birth(TRAY | r.id));
                     let (bounds, id) = (self.chip_bounds.clone(), r.id);
                     at.push(

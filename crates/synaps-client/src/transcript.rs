@@ -317,7 +317,7 @@ impl std::error::Error for TranscriptError {}
 /// Ids (and revs) of rows about to be rebuilt, for reuse by kind.
 type Reuse = VecDeque<(ItemKind, u64, u64)>;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Transcript {
     items: Vec<Item>,
     next_id: u64,

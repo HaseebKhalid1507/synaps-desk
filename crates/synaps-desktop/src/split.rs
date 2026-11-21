@@ -63,15 +63,48 @@ pub(crate) struct Flight {
     pub ghosts: Vec<PaneId>,
     /// Its spring's length; 0 until its first frame measures it.
     pub travel: f32,
-    /// Each pane's narrowest box so far: its column keeps that wrap until
-    /// the flight lands (the panels' `PanelFx.freeze` rule: it rewraps
-    /// once, at the start as it narrows, at the end as it widens).
+    /// Each pane's narrowest box in the flight: its column keeps that wrap
+    /// until the flight lands (the panels' `PanelFx.freeze` rule: it
+    /// rewraps once, at the start as it narrows, at the end as it widens).
     pub wrap: Vec<(PaneId, f32)>,
+    /// The centre's width `wrap` was set at, from the flight's ends
+    /// (Shady #42 L2: set once, not the narrowest drawn so far, which crept
+    /// frame by frame under a panel's flight); `None`: not yet (the wraps
+    /// a flight carries on from are kept where narrower).
+    pub wrap_at: Option<f32>,
 }
 
 impl Flight {
     pub(crate) fn new(from: Node, to: Node, grow: Vec<PaneId>, ghosts: Vec<PaneId>) -> Self {
-        Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new() }
+        Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new(), wrap_at: None }
+    }
+
+    /// Each pane's wrap (its narrowest width on the way), set from the
+    /// flight's ends laid out in `area` (the centre at the panels'
+    /// narrowest): a pane's width is a product of ratios lerped linearly,
+    /// least at an end (Shady #42 L2). Again only when `area`'s width
+    /// changes (a panel's flight starts or lands, a resize). A growing or
+    /// closing pane keeps its landed or last box, as before.
+    pub(crate) fn set_wraps(&mut self, area: Rect) {
+        if self.wrap_at == Some(area.w) {
+            return;
+        }
+        let carried = self.wrap_at.is_none();
+        let ends = [self.from.rects(area), self.to.rects(area)];
+        for id in self.to.leaves() {
+            if self.grow.contains(&id) || self.ghosts.contains(&id) {
+                continue;
+            }
+            let w = ends.iter().filter_map(|rs| rs.iter().find(|(i, _)| *i == id).map(|(_, r)| r.w)).fold(f32::INFINITY, f32::min);
+            if !w.is_finite() {
+                continue;
+            }
+            match self.wrap.iter_mut().find(|(i, _)| *i == id) {
+                Some((_, old)) => *old = if carried { old.min(w) } else { w },
+                None => self.wrap.push((id, w)),
+            }
+        }
+        self.wrap_at = Some(area.w);
     }
 }
 
@@ -307,6 +340,13 @@ impl Node {
         }
     }
 
+    /// The smallest centre this tree fits in with every pane at least
+    /// `w` × `h` (its most panes across and down, the rules between).
+    pub(crate) fn min_size(&self, w: f32, h: f32) -> (f32, f32) {
+        let (across, down) = self.extent();
+        (across as f32 * w + (across - 1) as f32 * DIVIDER, down as f32 * h + (down - 1) as f32 * DIVIDER)
+    }
+
     /// The same tree with leaf `from` named `to` (a closing pane's share
     /// once its id is handed out again: Shady #42 r2-L1).
     pub(crate) fn renamed(&self, from: PaneId, to: PaneId) -> Node {
@@ -316,6 +356,37 @@ impl Node {
                 Node::Split { axis: *axis, kids: kids.iter().map(|k| k.renamed(from, to)).collect(), ratios: ratios.clone() }
             }
         }
+    }
+
+    /// This tree's shape with each split's ratios where `rects` puts its
+    /// panes (their extent along its axis), `ghosts` (closing) at 0: a
+    /// flight's end with its closing panes in it (Shady #42 r2-L2).
+    pub(crate) fn fitted(&self, rects: &[(PaneId, Rect)], ghosts: &[PaneId]) -> Node {
+        match self {
+            Node::Leaf(_) => self.clone(),
+            Node::Split { axis, kids, ratios } => {
+                let ext: Vec<f32> = kids.iter().map(|k| k.span_of(rects, ghosts, *axis)).collect();
+                let sum: f32 = ext.iter().sum();
+                let ratios = if sum > 0. { ext.iter().map(|e| e / sum).collect() } else { ratios.clone() };
+                Node::Split { axis: *axis, kids: kids.iter().map(|k| k.fitted(rects, ghosts)).collect(), ratios }
+            }
+        }
+    }
+
+    /// The span of this node's panes (`ghosts` aside) in `rects` along
+    /// `axis`; 0 with none.
+    fn span_of(&self, rects: &[(PaneId, Rect)], ghosts: &[PaneId], axis: Axis) -> f32 {
+        let (lo, hi) = self
+            .leaves()
+            .into_iter()
+            .filter(|id| !ghosts.contains(id))
+            .filter_map(|id| rects.iter().find(|(i, _)| *i == id).map(|(_, r)| *r))
+            .map(|r| match axis {
+                Axis::Row => (r.x, r.x + r.w),
+                Axis::Column => (r.y, r.y + r.h),
+            })
+            .fold((f32::MAX, f32::MIN), |(a, b), (l, h)| (a.min(l), b.max(h)));
+        (hi - lo).max(0.)
     }
 
     /// The same panes in the same splits (ratios aside): a flight can go
@@ -454,6 +525,22 @@ impl Node {
         let room = (len - DIVIDER * (kids.len() - 1) as f32).max(1.);
         if let Some(even) = even_shares(kids, *axis, room) {
             *ratios = even;
+        }
+    }
+
+    /// The palette's Equalise pane sizes: every split's kids equal as far
+    /// as each keeps its minimum in `area` ([`Node::equalise`]), the
+    /// outermost split first (Shady #44 M1: 1/n each folded a nested split
+    /// at 1280, a pane under its minimum).
+    pub(crate) fn equalise_all(&mut self, area: Rect) {
+        let mut paths: Vec<Vec<usize>> = self.dividers(area).into_iter().map(|d| d.path).collect();
+        paths.sort();
+        paths.dedup();
+        paths.sort_by_key(Vec::len);
+        // Each from the dividers as laid out now: a nested split's box
+        // follows its parent's new share.
+        for path in paths {
+            self.equalise(&path, area);
         }
     }
 

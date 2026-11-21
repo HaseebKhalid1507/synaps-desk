@@ -185,7 +185,7 @@ pub struct CallDelta {
     pub written: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Ledger {
     files: Vec<FileStat>,
     index: HashMap<String, usize>,

@@ -50,6 +50,10 @@ impl Group {
     }
 }
 
+/// An app action's palette row: its act, title, key, meta and, when it
+/// can't run, why.
+type AppEntry = (AppAct, &'static str, Option<SharedString>, SharedString, Option<&'static str>);
+
 /// What the app does when picked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AppAct {
@@ -68,6 +72,17 @@ pub(crate) enum AppAct {
     Favourite,
     Halt,
     Detach,
+    /// Split panes (split.md §2: the palette's pane actions).
+    SplitRight,
+    SplitDown,
+    FocusPane(usize),
+    FocusNextPane,
+    FocusPrevPane,
+    MoveTabNext,
+    MoveTabPrev,
+    Equalise,
+    ClosePane,
+    JoinPanes,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -734,7 +749,7 @@ impl AppView {
     }
 
     /// Both modes' rows.
-    fn palette_entries(&self, cx: &App) -> (Vec<Entry>, Vec<Entry>) {
+    pub(crate) fn palette_entries(&self, cx: &App) -> (Vec<Entry>, Vec<Entry>) {
         let mac = cfg!(target_os = "macos");
         let m = &self.model;
         let now = crate::chrome::now_secs();
@@ -828,7 +843,7 @@ impl AppView {
                 "Jump to what is waiting",
                 k("Ctrl+J", "⌃J"),
                 "the authorize card".into(),
-                l.transcript.pending_prompts().is_empty().then_some("nothing is waiting on you"),
+                (l.transcript.pending_prompts().is_empty() && self.waiting_pane().is_none()).then_some("nothing is waiting on you"),
             ),
             (
                 AppAct::Favourite,
@@ -852,6 +867,8 @@ impl AppView {
                 (!on_session).then_some("no session tab on screen"),
             ),
         ];
+        let mut apps = Vec::from(apps);
+        apps.extend(self.pane_entries(mac));
         let mut commands = Vec::new();
         for (i, (act, title, key, meta, off)) in apps.into_iter().enumerate() {
             let mut e = Entry::new(Group::Commands, Act::App(act), title);
@@ -973,7 +990,7 @@ impl AppView {
         true
     }
 
-    fn app_act(&mut self, a: AppAct, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn app_act(&mut self, a: AppAct, window: &mut Window, cx: &mut Context<Self>) {
         match a {
             AppAct::NewSession => self.tab_act(crate::app::TabKey::New, cx),
             AppAct::ToggleRail => self.toggle_panel(true, cx),
@@ -1006,7 +1023,72 @@ impl AppView {
             }
             AppAct::Halt => self.halt(),
             AppAct::Detach => self.tab_act(crate::app::TabKey::Close, cx),
+            AppAct::SplitRight => self.split_pane(None, window, cx),
+            AppAct::SplitDown => self.split_pane(Some(crate::split::Side::Down), window, cx),
+            AppAct::FocusPane(n) => self.focus_nth(n, cx),
+            AppAct::FocusNextPane => self.focus_step(false, cx),
+            AppAct::FocusPrevPane => self.focus_step(true, cx),
+            AppAct::MoveTabNext => self.move_tab_pane(false, window, cx),
+            AppAct::MoveTabPrev => self.move_tab_pane(true, window, cx),
+            AppAct::Equalise => {
+                let mut to = self.panes.tree.clone();
+                let (w, h) = self.centre.get();
+                to.equalise_all(crate::split::Rect { x: 0., y: 0., w, h });
+                self.fly_layout(to, cx);
+            }
+            AppAct::ClosePane => self.close_pane_tabs(),
+            AppAct::JoinPanes => self.join_panes(cx),
         }
+    }
+
+    /// The palette's pane actions (split.md §2, A19), with split panes on:
+    /// each with its key and, when it can't run, why.
+    fn pane_entries(&self, mac: bool) -> Vec<AppEntry> {
+        if !self.split_on() {
+            return Vec::new();
+        }
+        let k = |linux: &'static str, macos: &'static str| -> Option<SharedString> { Some(if mac { macos } else { linux }.into()) };
+        let one = (!self.panes.split()).then_some("one pane");
+        let n = self.panes.len();
+        let order = self.reading_order();
+        let at = order.iter().position(|id| *id == self.panes.focused).unwrap_or(0);
+        let session_tab = self
+            .model
+            .tabs
+            .active()
+            .and_then(|ix| self.model.tabs.iter().nth(ix))
+            .is_some_and(|t| t.kind == crate::tabs::Kind::Session && t.session.is_some());
+        let mv = |back: bool| -> Option<&'static str> {
+            if !session_tab {
+                Some("no session tab on screen")
+            } else if back && at == 0 {
+                Some("the first pane")
+            } else if !back && at + 1 >= n && (self.model.tabs.len() < 2 || self.split_refusal(None).is_some()) {
+                Some(self.split_refusal(None).unwrap_or("one tab in the last pane"))
+            } else {
+                None
+            }
+        };
+        let mut v = vec![
+            (AppAct::SplitRight, "Split right", k("Ctrl+\\", "⌘\\"), "".into(), self.split_refusal(None)),
+            (AppAct::SplitDown, "Split down", k("Ctrl+Shift+\\", "⌘⇧\\"), "".into(), self.split_refusal(Some(crate::split::Side::Down))),
+        ];
+        for i in 0..crate::pane::PANES_MAX {
+            const TITLES: [&str; 4] = ["Focus pane 1", "Focus pane 2", "Focus pane 3", "Focus pane 4"];
+            const KEYS: [(&str, &str); 4] = [("Alt+1", "⌃1"), ("Alt+2", "⌃2"), ("Alt+3", "⌃3"), ("Alt+4", "⌃4")];
+            let off = one.or((i >= n).then_some("no such pane")).or((order.get(i) == Some(&self.panes.focused)).then_some("focused"));
+            v.push((AppAct::FocusPane(i), TITLES[i], k(KEYS[i].0, KEYS[i].1), "".into(), off));
+        }
+        v.extend([
+            (AppAct::FocusNextPane, "Focus next pane", k("F6", "F6"), "".into(), one),
+            (AppAct::FocusPrevPane, "Focus previous pane", k("Shift+F6", "⇧F6"), "".into(), one),
+            (AppAct::MoveTabNext, "Move tab to the next pane", k("Ctrl+Alt+→", "⌘⌥→"), "".into(), mv(false)),
+            (AppAct::MoveTabPrev, "Move tab to the previous pane", k("Ctrl+Alt+←", "⌘⌥←"), "".into(), mv(true)),
+            (AppAct::Equalise, "Equalise pane sizes", None, "".into(), one),
+            (AppAct::ClosePane, "Close pane", None, "closes its tabs; Ctrl+Shift+T reopens them".into(), one),
+            (AppAct::JoinPanes, "Join all panes", None, "every tab into this pane".into(), one),
+        ]);
+        v
     }
 }
 
