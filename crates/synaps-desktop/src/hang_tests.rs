@@ -783,3 +783,167 @@ fn a_held_room_holds_as_the_wrap_lands(cx: &mut TestAppContext) {
         check(cx, n);
     }
 }
+
+/// #35: a folded panel's strip lands with its panel. Its glyphs cut in as
+/// the rail landed, then lifted in over `quick`, a few frames after the
+/// panel looked still (the gate on #33 r3: f206–f213 after the rail's last
+/// move at f203; the right panel's strip after its own). What is painted
+/// over the strip (the quads GPUI hands the renderer, clipped to their
+/// masks, from the last opaque one that covers it) is, on every frame from
+/// the last one that moves on, that frame's; at Reduced, from the panel's
+/// one frame on. At Full the strip comes in during the flight (its
+/// strength, the hairline's alpha, rises through it), and opening it goes
+/// out over the first frames, not at once. No frame at rest. Both panels,
+/// 1920 px, text 17, the rail at 480, the right panel at 520.
+#[gpui_kit::test]
+fn a_folded_strip_lands_with_its_panel(cx: &mut TestAppContext) {
+    use gpui_kit::AppContext as _;
+    let (w, view, _events) = open_at(cx, (1920., 1080.), 17);
+    view.update(cx, |v, cx| {
+        (v.panels.rail_width, v.panels.right_width) = (Some(480), Some(520));
+        cx.notify();
+    });
+    wait(cx, w, &view, 3000);
+    type Rect = [f32; 4];
+    // A quad: its rect, as drawn (clipped to its mask), its look (all of
+    // it), its fill, its border's colour and widths, and whether it is round.
+    type Quad = (Rect, Rect, String, Option<gpui_kit::Hsla>, gpui_kit::Hsla, [f32; 4], bool);
+    let clip = |a: Rect, b: Rect| -> Option<Rect> {
+        let (l, t, r, bm) = (a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3]));
+        (r > l && bm > t).then_some([l, t, r, bm])
+    };
+    // This frame's quads: their rect as drawn (clipped), and what they paint.
+    let quads = |cx: &mut TestAppContext| -> (f32, Vec<Quad>) {
+        cx.update_window(w, |_, window, _| {
+            let s = window.scale_factor();
+            let r = |b: gpui_kit::Bounds<gpui_kit::ScaledPixels>| {
+                [b.origin.x.0, b.origin.y.0, b.origin.x.0 + b.size.width.0, b.origin.y.0 + b.size.height.0]
+            };
+            let qs = window
+                .painted_quads()
+                .iter()
+                .filter_map(|q| {
+                    let at = clip(r(q.bounds), r(q.content_mask.bounds))?;
+                    let e = q.border_widths;
+                    let c = q.corner_radii;
+                    let round = c.top_left.0 + c.top_right.0 + c.bottom_left.0 + c.bottom_right.0 > 0.;
+                    let look = format!("{:?} {:?} {:?} {:?}", q.background.as_solid(), q.border_color, e, c);
+                    Some((
+                        r(q.bounds),
+                        at,
+                        look,
+                        q.background.as_solid(),
+                        q.border_color,
+                        [e.top.0, e.right.0, e.bottom.0, e.left.0],
+                        round,
+                    ))
+                })
+                .collect();
+            (s, qs)
+        })
+        .expect("the window")
+    };
+    // A strip's own quad: STRIP wide, on the window's edge, its hairline
+    // on its inner side.
+    let is_strip = |rail: bool, s: f32, q: &Quad| {
+        let (full, e) = (q.0, q.5);
+        (full[2] - full[0] - crate::app::STRIP * s).abs() < 0.01
+            && full[3] - full[1] > 400. * s
+            && if rail { full[0].abs() < 0.01 && e[1] > 0. } else { (full[2] - 1920. * s).abs() < 0.01 && e[3] > 0. }
+    };
+    // What is painted over `at`: the ground (the last opaque quad over all
+    // of it), then every quad after it there.
+    let over = |qs: &[Quad], at: Rect| -> Vec<String> {
+        let ground = qs
+            .iter()
+            .rposition(|q| {
+                !q.6 && q.3.is_some_and(|c| c.a >= 0.999) && q.1[0] <= at[0] && q.1[1] <= at[1] && q.1[2] >= at[2] && q.1[3] >= at[3]
+            })
+            .expect("a ground");
+        let mut out = vec![format!("ground {:?}", qs[ground].3)];
+        out.extend(qs[ground + 1..].iter().filter_map(|q| clip(q.1, at).map(|c| format!("{c:?} {}", q.2))));
+        out
+    };
+    let mut fails = Vec::new();
+    let mut at: [Option<(Rect, f32)>; 2] = [None, None];
+    for level in [Level::Full, Level::Reduced] {
+        motion_level(cx, &view, level);
+        settle(cx, w, 8);
+        for close in [true, false] {
+            for rail in [true, false] {
+                let case = format!("{level:?} {} {}", if rail { "rail" } else { "right" }, if close { "fold" } else { "unfold" });
+                let i = usize::from(!rail);
+                view.update(cx, |v, cx| v.toggle_panel(rail, cx));
+                cx.run_until_parked();
+                // Each frame: moving, the quads.
+                let mut frames = Vec::new();
+                let mut rest = 0;
+                while frames.len() < 400 && rest < 8 {
+                    fluid_frame(cx, w, &view);
+                    let (moving, shown) = view.read_with(cx, |v, _| (v.panel_fx.sides[i].moving, v.panel_fx.sides[i].shown));
+                    let still = !moving && !view.read_with(cx, |v, _| v.fx.pending().0);
+                    rest = if still { rest + 1 } else { 0 };
+                    frames.push((moving, quads(cx), shown));
+                }
+                let landed = frames.iter().position(|f| !f.0).unwrap_or_else(|| panic!("{case}: it lands"));
+                if level == Level::Full {
+                    assert!(landed > 30, "{case}: it flew ({landed} frames)");
+                } else {
+                    assert_eq!(landed, 0, "{case}: in one frame");
+                }
+                if close {
+                    let (s, qs) = &frames[landed].1;
+                    let strip = qs.iter().find(|q| is_strip(rail, *s, q)).unwrap_or_else(|| panic!("{case}: its strip"));
+                    at[i] = Some((strip.1, strip.4.a));
+                }
+                let (region, alpha) = at[i].expect("folded first");
+                // The strip's strength, frame by frame: its hairline's alpha.
+                let k: Vec<f32> = frames
+                    .iter()
+                    .map(|f| {
+                        f.1.1.iter().find(|q| is_strip(rail, f.1.0, q) && clip(q.1, region) == Some(region)).map_or(0., |q| q.4.a / alpha)
+                    })
+                    .collect();
+                if close {
+                    // The landing frame against the last that moves (at Full),
+                    // then every frame after it against the landing frame.
+                    let end = over(&frames[landed].1.1, region);
+                    let apart = |a: &[String], b: &[String]| -> (Vec<String>, Vec<String>) {
+                        (a.iter().filter(|q| !b.contains(q)).cloned().collect(), b.iter().filter(|q| !a.contains(q)).cloned().collect())
+                    };
+                    if landed > 0 {
+                        let last = over(&frames[landed - 1].1.1, region);
+                        if last != end {
+                            fails.push(format!(
+                                "{case}: the landing frame ({landed}) paints the strip apart from the last that moves: {:?}",
+                                apart(&last, &end)
+                            ));
+                        }
+                    }
+                    if let Some(n) = (landed + 1..frames.len()).find(|&n| over(&frames[n].1.1, region) != end) {
+                        fails.push(format!(
+                            "{case}: frame {n} paints the strip apart from the landing frame ({landed}): {:?}",
+                            apart(&end, &over(&frames[n].1.1, region))
+                        ));
+                    }
+                }
+                if level == Level::Full {
+                    let partial = k[..landed].iter().filter(|&&k| k > 0. && k < 0.999).count();
+                    let steady = k[..landed].windows(2).all(|p| if close { p[1] >= p[0] - 1e-4 } else { p[1] <= p[0] + 1e-4 });
+                    if partial < 2 || !steady || (!close && k[0] < 0.5) {
+                        let seen: Vec<(usize, f32, f32)> =
+                            k[..landed].iter().enumerate().filter(|p| *p.1 > 0.).map(|(n, &k)| (n, frames[n].2, k)).collect();
+                        fails.push(format!(
+                            "{case}: the strip {} with the panel (frame, width, strength; landed at {landed}): {seen:?}",
+                            if close { "comes in" } else { "goes out" }
+                        ));
+                    }
+                }
+                if settle(cx, w, 8) > 1 {
+                    fails.push(format!("{case}: frames at rest"));
+                }
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
