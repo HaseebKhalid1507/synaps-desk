@@ -32,6 +32,7 @@
 
 mod app;
 mod authorize;
+mod agent_surface;
 mod beat;
 mod bench;
 mod cards;
@@ -102,6 +103,7 @@ fn main() {
     let mut profile: Option<String> = None;
     let mut socket: Option<PathBuf> = None;
     let mut offline = false;
+    let mut surface_file = None;
     let mut bench = false;
     let mut diag_mode = false;
     let mut bench_tabs = false;
@@ -132,6 +134,7 @@ fn main() {
             "--profile" => profile = Some(value(&mut args, "--profile")),
             "--socket" => socket = Some(PathBuf::from(value(&mut args, "--socket"))),
             "--offline" => offline = true,
+            "--agent-surface" => surface_file = Some(value(&mut args, "--agent-surface")),
             "--bench" => bench = true,
             "--diag" => {
                 bench = true;
@@ -207,6 +210,26 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+    if let Some(path) = surface_file {
+        // A bounded local fixture: never connect to the daemon in preview mode.
+        use std::io::Read;
+        let surface = (|| -> Result<_, String> {
+            let mut bytes = Vec::new();
+            std::fs::File::open(path).map_err(|e| e.to_string())?
+                .take(65537).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            agent_surface::Surface::parse(&bytes)
+        })().unwrap_or_else(|e| {
+            eprintln!("agent surface: {e}");
+            std::process::exit(2);
+        });
+        gpui_kit::application().run(move |cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+                cx.new(|_| agent_surface::Preview(surface))
+            }).expect("open preview");
+        });
+        return;
     }
     if bench {
         gpui_kit::profiler::set_trace_enabled(true);
