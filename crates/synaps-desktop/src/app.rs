@@ -8764,8 +8764,12 @@ impl Render for AppView {
         let pane_to = column_of(&[crate::chrome::MARK, rail.width(), right.width()]);
         self.panel_fx.freeze = self.panel_fx.moving().then(|| self.panel_fx.freeze.unwrap_or(pane).min(pane).min(pane_to));
         // At Reduced and Off the panel is there at once, the layout too.
+        // Over a view the layout is drawn without the right panel (below:
+        // `view_pane`), so it has nothing to ride: it flies on its own
+        // spring (Shady #54 M1).
         if with_panes
             && self.panel_fx.moving()
+            && !(view.is_some() && !self.panes.split())
             && let Some(f) = self.panes.flight.as_mut()
         {
             f.ride = Some(crate::split::Ride { from: pane, to: pane_to, landed: None });

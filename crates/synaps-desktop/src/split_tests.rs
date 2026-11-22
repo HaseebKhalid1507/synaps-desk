@@ -3901,6 +3901,81 @@ fn a_yielding_panel_flies_with_the_move_that_made_it(cx: &mut TestAppContext) {
     assert!(fails.is_empty(), "{fails:#?}");
 }
 
+/// The panels as a test wants them: the rail open or folded, both widths.
+fn panels_at(cx: &mut TestAppContext, view: &Entity<AppView>, rail_open: bool, rail: u16, right: u16) {
+    view.update(cx, |v, cx| {
+        v.panels.rail_collapsed = !rail_open;
+        v.panels.right_collapsed = false;
+        v.panels.rail_width = Some(rail);
+        v.panels.right_width = Some(right);
+        cx.notify();
+    });
+}
+
+/// Pane `id`'s width in the layout as the last frame drew it.
+fn drawn_w(cx: &mut TestAppContext, view: &Entity<AppView>, id: crate::pane::PaneId) -> f32 {
+    view.read_with(cx, |v, _| {
+        let (w, h) = v.centre.get();
+        v.panes.drawn.rects(crate::split::Rect { x: 0., y: 0., w, h }).iter().find(|(i, _)| *i == id).map_or(0., |(_, r)| r.w)
+    })
+}
+
+/// Shady #54 M1: with Settings on screen in the pane that stays, a close
+/// is drawn without the right panel (a view has none), so the layout has
+/// nothing to ride: the closing share goes on the layout's own spring,
+/// frame by frame, not frozen for the hidden panel's flight and then gone
+/// in one frame.
+#[gpui_kit::test]
+fn a_close_beside_a_view_flies_on_its_own_spring(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    panels_at(cx, &view, true, 480, 520);
+    frame(cx, window);
+    level(cx, crate::motion::Level::Full);
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    let (kept, gone) = (order[0], order[1]);
+    view.update(cx, |v, cx| {
+        v.focus_pane(kept, crate::pane::KeysTo::Pane, cx);
+        v.model.tabs.open_view(crate::tabs::Kind::Settings);
+        v.reconcile(None);
+        cx.notify();
+    });
+    for _ in 0..60 {
+        frame_144(cx, window, &view);
+    }
+    assert!(view.read_with(cx, |v, _| v.model.tabs.view().is_some()), "Settings on screen in the pane that stays");
+    let right_was = view.read_with(cx, |v, _| v.panel_fx.sides[1].shown);
+    view.update(cx, |v, cx| {
+        v.in_pane(gone, |v| v.close_pane());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    // From the close's first frame (the centre loses the right panel's
+    // strip in it: a view has none, as on main).
+    frame_144(cx, window, &view);
+    let mut widths = vec![drawn_w(cx, &view, kept)];
+    let mut rest = 0;
+    while rest < 10 {
+        frame_144(cx, window, &view);
+        widths.push(drawn_w(cx, &view, kept));
+        let busy = view.read_with(cx, |v, _| v.panel_fx.moving() || v.panes.flight.is_some() || v.fx.pending().0);
+        rest = if busy { 0 } else { rest + 1 };
+        assert!(widths.len() < 500, "never landed");
+    }
+    assert!((view.read_with(cx, |v, _| v.panel_fx.sides[1].shown) - right_was).abs() > 100., "the right panel comes back from its strip");
+    let travel = widths[widths.len() - 1] - widths[0];
+    let top = std::f32::consts::TAU / crate::motion::SHEET_RESPONSE * 0.006944 / std::f32::consts::E;
+    let step = widths.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0., f32::max);
+    let moving = widths.windows(2).filter(|w| (w[1] - w[0]).abs() > 0.5).count();
+    assert!(travel > 100., "the kept pane takes the closing share: {widths:?}");
+    assert!(
+        step <= travel * top * 1.25 + 2. && moving >= 10,
+        "the kept pane steps at most its spring's top step ({:.1} px), in {moving} frames: {step} px; {widths:?}",
+        travel * top
+    );
+}
+
 /// Design gate F5 (#44 r3): after Join lands, the pane kept's worker chips
 /// take their landed grid in the landing frame (one a line in a quarter of
 /// the centre, two in the whole): no chip slides after the panes stop.
