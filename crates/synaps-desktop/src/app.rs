@@ -5107,9 +5107,13 @@ impl AppView {
     /// The session tab is on screen and its card shows the first prompt.
     /// Not over a worker's view: the card is the session's, and Esc there
     /// goes back to it. Not while its pane's rows are held (Shady #48 r2
-    /// L1): its buttons and keys arm from the frame its row first draws.
+    /// L1) or its split's share clips it (#53 R3-L1): its buttons and keys
+    /// arm from the frame they are first drawn whole. Not in a pane the
+    /// fold hides (#53 R3-L2): it waits again when widening shows it.
     fn card_up(&self) -> bool {
         !self.panes.cur.hold_rows
+            && !self.panes.cur.clipped
+            && (!self.panes.folded || self.panes.cur.id == self.panes.focused)
             && self.model.tabs.view().is_none()
             && self.model.lives[self.panes.cur.live].watch.focus().is_none()
             && self.current_card().is_some()
@@ -7800,25 +7804,40 @@ impl AppView {
         // lands: nothing changes after the last frame that moves (#50).
         let (drawn_at, land_at) = (self.panes.cur.rect.get(), self.panes.cur.land.get());
         let left = (land_at.w - drawn_at.w).abs() + (land_at.h - drawn_at.h).abs();
-        let hold = self.panes.cur.hold_rows
-            && left > crate::pane::HOLD_UNTIL
-            && self.panes.flight.as_ref().is_some_and(|f| f.grow.contains(&self.panes.cur.id));
+        // A new pane laid out at its landed size in a share still more
+        // than that short of it: its card's buttons may be cut off (#53
+        // R3-L1). Within it they are whole: the share clips at most
+        // `HOLD_UNTIL` px off its far side, inside the column's padding and
+        // the card's own, or the composer under it.
+        let clipped = left > crate::pane::HOLD_UNTIL && self.panes.flight.as_ref().is_some_and(|f| f.grow.contains(&self.panes.cur.id));
+        let hold = self.panes.cur.hold_rows && clipped;
         let released = self.panes.cur.hold_rows && !hold;
         if released {
-            // The rows come in: they lift on `quick` (finish gate #48 r2
-            // N2), and the card's buttons and keys wait from this frame, the
-            // first that draws its row (Shady #48 r2 L1), not from the
-            // next frame's sync, a click's width later.
+            // The rows come in: they lift on `quick` (finish gate #48 r2 N2).
             self.panes.cur.rows_in = self.fx.fluid().then(|| self.fx.now());
+        }
+        if clipped {
+            // The card's buttons and keys wait from each frame that clips them.
             if let Some(c) = self.panes.cur.card.as_mut() {
                 c.arm = Arm::new(Instant::now());
-                c._arm = Some(Self::arm_repaint(cx));
             }
             self.panes.cur.keys_live = false;
         }
         self.panes.cur.hold_rows = hold;
-        if released {
-            self.panes.cur.card_was_up = self.card_up();
+        self.panes.cur.clipped = clipped;
+        // On screen now, not at this frame's sync: its buttons drawn whole
+        // (#53 R3-L1; Shady #48 r2 L1: its row's first frame), or a pane the
+        // fold hid shown (#53 R3-L2: the fold is judged after the sync).
+        // They and the keys wait from this frame, not from the next sync's,
+        // a click's width later.
+        if !self.panes.cur.card_was_up && self.card_up() {
+            if let Some(c) = self.panes.cur.card.as_mut() {
+                log::info!(target: "synaps_desktop::card", "card {:?}: drawn whole, waiting", c.key);
+                c.arm = Arm::new(Instant::now());
+                c._arm = Some(Self::arm_repaint(cx));
+            }
+            self.panes.cur.keys_live = false;
+            self.panes.cur.card_was_up = true;
         }
         let (pad_l, pad_r) = lay.padding();
         // Nothing over the list but the tab strip: the first row's own gap
@@ -8190,6 +8209,7 @@ impl AppView {
                 // open pane's now), an empty pane's ground.
                 if self.panes.flight.as_ref().is_some_and(|f| f.ghosts.contains(&id)) {
                     let share = div()
+                        .id(("pane-closing", id.index()))
                         .flex_none()
                         .w(px(r.w))
                         .h(px(r.h))
@@ -8205,7 +8225,12 @@ impl AppView {
                             .into_any_element(),
                     };
                 }
+                // Its own id: what is laid out in it is its own (two panes
+                // on one session draw the same card, and its buttons by one
+                // id shared GPUI's state: a click on the later pane's Allow
+                // was dropped by the other's).
                 self.probe(h_flex(), "pane")
+                    .id(("pane", id.index()))
                     .flex_none()
                     .w(px(r.w))
                     .h(px(r.h))

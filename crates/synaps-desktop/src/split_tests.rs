@@ -4536,3 +4536,221 @@ fn a_dropped_rows_pane_holds_its_rows_lifts_them_in_its_tail_and_arms_its_card_f
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
+
+/// A click by real input at `at` with `m` held.
+fn click_m(cx: &mut TestAppContext, window: AnyWindowHandle, at: Point<Pixels>, m: gpui_kit::Modifiers) {
+    mouse_m(cx, window, at, "hover", m);
+    mouse_m(cx, window, at, "down", m);
+    mouse_m(cx, window, at, "up", m);
+}
+
+/// Whether `inner` lies whole in `outer` (boxes as [`drawn`] gives them).
+fn inside(inner: [f32; 4], outer: [f32; 4]) -> bool {
+    inner[0] >= outer[0] - 0.5
+        && inner[1] >= outer[1] - 0.5
+        && inner[0] + inner[2] <= outer[0] + outer[2] + 0.5
+        && inner[1] + inner[3] <= outer[1] + outer[3] + 0.5
+}
+
+/// #53 R3-L1, the rest of a growing pane's flight at Full, frame by frame
+/// at 144 Hz, its card up (its arm, if counted from the pane's first
+/// frame, run out in the real time slept before): the card's buttons as
+/// drawn against the pane's share. A click on Allow while it shows but the
+/// buttons are cut off, and on the first frame they are whole a click and
+/// a Ctrl+Enter (the root has the keys after the click), answer nothing;
+/// the arm counts from that frame. Then, 600 ms on, Allow answers. What
+/// failed, by `what`.
+fn arm_from_whole(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    view: &Entity<AppView>,
+    new: crate::pane::PaneId,
+    conn: &mut Conn,
+    what: &str,
+) -> Vec<String> {
+    let mut fails = Vec::new();
+    std::thread::sleep(Duration::from_millis(600));
+    let card_at =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panes.get(new).and_then(|p| p.card.as_ref().map(|c| c.arm.shown_at())));
+    let allow = |b: [f32; 4]| gpui_kit::point(px(b[0] + b[2] - 24.), px(b[1] + b[3] / 2.));
+    let (mut whole_at, mut cut_clicked, mut rest, mut i) = (None, false, 0, 0);
+    while rest < 12 {
+        let before = Instant::now();
+        frame_144(cx, window, view);
+        let share = drawn(cx, window, format!("pane {}", new.index()));
+        let buttons = drawn(cx, window, format!("card-buttons {}", new.index()));
+        let flight = view.read_with(cx, |v, _| v.panes.flight.is_some());
+        if let (Some(share), Some(b)) = (share, buttons)
+            && whole_at.is_none()
+        {
+            let at = allow(b);
+            let (x, y) = (f32::from(at.x), f32::from(at.y));
+            let shows = x > share[0] && x < share[0] + share[2] && y > share[1] && y < share[1] + share[3];
+            if inside(b, share) {
+                whole_at = Some(i);
+                let arm = card_at(cx).expect("the card");
+                if arm < before {
+                    fails.push(format!("{what}: frame {i}, its buttons' first whole: the arm counts from {:?} before it", before - arm));
+                }
+                click_at(cx, window, at);
+                let said = names(conn);
+                if !said.is_empty() {
+                    fails.push(format!("{what}: a click on Allow on its buttons' first whole frame ({i}): {said:?}"));
+                }
+                key(cx, window, "ctrl-enter");
+                let said = names(conn);
+                if !said.is_empty() {
+                    fails.push(format!("{what}: a Ctrl+Enter on its buttons' first whole frame ({i}): {said:?}"));
+                }
+            } else if shows && !cut_clicked {
+                cut_clicked = true;
+                click_at(cx, window, at);
+                let said = names(conn);
+                if !said.is_empty() {
+                    fails.push(format!("{what}: a click on Allow at frame {i}, its buttons cut off ({b:?} in {share:?}): {said:?}"));
+                }
+            }
+        }
+        rest = if flight || i < 3 { 0 } else { rest + 1 };
+        i += 1;
+        assert!(i < 400, "{what}: never landed");
+    }
+    if whole_at.is_none() {
+        fails.push(format!("{what}: its buttons never drawn whole"));
+        return fails;
+    }
+    std::thread::sleep(Duration::from_millis(600));
+    cx.executor().advance_clock(Duration::from_millis(600));
+    frame(cx, window);
+    match drawn(cx, window, format!("card-buttons {}", new.index())) {
+        Some(b) => {
+            click_at(cx, window, allow(b));
+            let said = names(conn);
+            if said != ["answer"] {
+                fails.push(format!("{what}: armed, a click on Allow: {said:?}"));
+            }
+        }
+        None => fails.push(format!("{what}: no card left to answer")),
+    }
+    fails
+}
+
+/// #53 R3-L1: a card in a pane that grows in arms from the first frame its
+/// buttons are drawn whole, never while its share cuts them off, on every
+/// path that grows a pane, by real input: a tab dragged to an edge, Ctrl+\,
+/// Open to the side (Alt+click on a rail row), a rail row dropped on an
+/// edge (here the bottom: its card cut off from below).
+#[gpui_kit::test]
+fn a_growing_panes_card_arms_from_the_first_frame_its_buttons_are_whole(cx: &mut TestAppContext) {
+    let none = gpui_kit::Modifiers::default();
+    let mut fails = Vec::new();
+    // A tab dragged to the right edge: B, its prompt up, into a new pane.
+    {
+        let (window, view, client, _a, attaches, events) = on_a(cx, "arm-tab", None);
+        view.update(cx, |v, cx| {
+            v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::New);
+            cx.notify();
+        });
+        let mut b = next_attach(cx, window, &attaches, "B's attach at the daemon");
+        b.send(attached(B, Some(1)));
+        feed(cx, window, &view, &events, "B's card", |v| v.model.lives[v.panes.cur.live].is_active(B) && v.panes.cur.card.is_some());
+        let _ = names(&mut b);
+        level(cx, crate::motion::Level::Full);
+        let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+        let tab = tab_id(cx, &view, p0, B);
+        let from = mid(cx, window, format!("tab {tab}"));
+        let to = in_body(cx, window, p0, 0.92, 0.5);
+        drag_to(cx, window, from, to, none, false);
+        mouse_m(cx, window, to, "up", none);
+        let new = view.read_with(cx, |v, _| v.panes.focused);
+        assert_ne!(new, p0, "a new pane");
+        frame_144(cx, window, &view);
+        fails.extend(arm_from_whole(cx, window, &view, new, &mut b, "a tab to the right edge"));
+        view.update(cx, |v, _| v.client = None);
+        let _ = client.shutdown();
+    }
+    // Ctrl+\ with A's prompt up: a second pane on A, its card too.
+    {
+        let (window, view, client, mut a, _attaches, events) = on_a(cx, "arm-split", Some(1));
+        feed(cx, window, &view, &events, "A's card", |v| v.panes.cur.card.is_some());
+        let _ = names(&mut a);
+        level(cx, crate::motion::Level::Full);
+        let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+        key(cx, window, "ctrl-\\");
+        let new = view.read_with(cx, |v, _| v.panes.focused);
+        assert_ne!(new, p0, "a new pane");
+        fails.extend(arm_from_whole(cx, window, &view, new, &mut a, "Ctrl+\\"));
+        view.update(cx, |v, _| v.client = None);
+        let _ = client.shutdown();
+    }
+    // Open to the side, and a rail row dropped on the bottom edge: B's row,
+    // B attaching with its prompt up early in the flight (held there).
+    for side in [true, false] {
+        let what = if side { "Open to the side" } else { "a rail row to the bottom edge" };
+        let (window, view, client, _a, attaches, events) = on_a(cx, if side { "arm-side" } else { "arm-row" }, None);
+        level(cx, crate::motion::Level::Full);
+        let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+        let key_b = view.read_with(cx, |v, _| {
+            v.rail.rail.rows.iter().find(|r| r.action == crate::named::RowAction::Attach(B.into())).map(|r| r.key).expect("B's row")
+        });
+        let row = mid(cx, window, format!("rail-row {key_b}"));
+        if side {
+            click_m(cx, window, row, gpui_kit::Modifiers { alt: true, ..Default::default() });
+        } else {
+            let to = in_body(cx, window, p0, 0.5, 0.97);
+            drag_to(cx, window, row, to, none, false);
+            mouse_m(cx, window, to, "up", none);
+        }
+        let new = view.read_with(cx, |v, _| v.panes.focused);
+        assert_ne!(new, p0, "{what}: a new pane");
+        frame_144(cx, window, &view);
+        let mut b = next_attach(cx, window, &attaches, "B's attach at the daemon");
+        b.send(attached(B, Some(1)));
+        feed(cx, window, &view, &events, "B's card in the new pane", |v| v.panes.get(new).is_some_and(|p| p.card.is_some()));
+        assert!(view.read_with(cx, |v, _| v.panes.flight.is_some()), "{what}: still in flight");
+        let _ = names(&mut b);
+        fails.extend(arm_from_whole(cx, window, &view, new, &mut b, what));
+        view.update(cx, |v, _| v.client = None);
+        let _ = client.shutdown();
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// #53 R3-L2: a card in a pane the fold hides waits again when widening
+/// shows it: a click on its Allow on the first frame it is drawn again
+/// answers nothing (it had been up for longer than its arm); 600 ms on,
+/// one answers.
+#[gpui_kit::test]
+fn widening_back_from_a_fold_rearms_the_card_it_shows(cx: &mut TestAppContext) {
+    let (window, view, client, mut a, _attaches, events) = on_a(cx, "arm-fold", Some(1));
+    feed(cx, window, &view, &events, "A's card", |v| v.panes.cur.card.is_some());
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    key(cx, window, "ctrl-\\");
+    let p1 = view.read_with(cx, |v, _| v.panes.focused);
+    assert_ne!(p1, p0);
+    // Armed in both panes, then the first one hidden by the fold.
+    std::thread::sleep(Duration::from_millis(600));
+    frame(cx, window);
+    let _ = names(&mut a);
+    resize(cx, window, 700., 800.);
+    assert!(view.read_with(cx, |v, _| v.panes.folded && v.panes.focused == p1), "folded on the second pane");
+    assert!(drawn(cx, window, format!("pane {}", p0.index())).is_none(), "the first pane not drawn");
+    std::thread::sleep(Duration::from_millis(600));
+    frame(cx, window);
+    // Widened: its first frame shows the first pane's card, armed or not.
+    VisualTestContext::from_window(window, cx).simulate_resize(size(px(1280.), px(800.)));
+    frame(cx, window);
+    assert!(!view.read_with(cx, |v, _| v.panes.folded), "unfolded");
+    let b = drawn(cx, window, format!("card-buttons {}", p0.index())).expect("the first pane's buttons drawn");
+    let allow = gpui_kit::point(px(b[0] + b[2] - 24.), px(b[1] + b[3] / 2.));
+    click_at(cx, window, allow);
+    assert_eq!(names(&mut a), Vec::<String>::new(), "a click on its first frame back answers nothing");
+    // Its arm runs out (real time; its repaint on the test's clock).
+    std::thread::sleep(Duration::from_millis(600));
+    cx.executor().advance_clock(Duration::from_millis(600));
+    frame(cx, window);
+    click_at(cx, window, allow);
+    assert_eq!(names(&mut a), ["answer"], "armed, the click answers");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
