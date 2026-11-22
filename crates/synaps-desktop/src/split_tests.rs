@@ -793,8 +793,8 @@ fn attached_secret(sid: &str, id: u64) -> Value {
 fn a_click_on_the_other_panes_secret_field_keeps_the_keys(cx: &mut TestAppContext) {
     let (window, view, client, mut a, _attaches, events) = on_a_as(cx, "panes-secret", attached_secret(A, 1));
     key(cx, window, "ctrl-\\");
-    // Both armed: the first pane's card waits again when its list is laid
-    // out anew under the split (its column, as the right panel yields).
+    // Both armed: the new pane's card is new and waits its own 500 ms (the
+    // first pane's keeps its arm: `a_split_or_a_yield_leaves_…`).
     feed(cx, window, &view, &events, "the card up in both panes, armed", |v| {
         v.panes.cur.card.as_ref().is_some_and(|c| c.armed()) && v.panes.rest[0].card.as_ref().is_some_and(|c| c.armed())
     });
@@ -812,6 +812,51 @@ fn a_click_on_the_other_panes_secret_field_keeps_the_keys(cx: &mut TestAppContex
     assert!(!sent.iter().any(|c| c == "submit"), "the secret never went out as a message: {sent:?}");
     assert!(view.read_with(cx, |v, cx| v.panes.cur.composer.read(cx).value().is_empty()), "nothing typed into the composer");
     assert_eq!(sent, ["answer"], "the secret went as the prompt's answer");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #44 L8: a split never re-arms the other pane's card, nor does a
+/// yield of a side panel under the split. On screen in the first pane, its
+/// arm stays the one it was shown with through Ctrl+\ as it comes, a
+/// second split once armed, and the window narrowing until the right panel
+/// and the rail yield and widening back: its list is laid out anew in each
+/// new column, and nothing takes it off screen. It watches the buttons'
+/// arm (`Arm::shown_at`, `armed`), not `Arm::keys`: the keys' own wait
+/// when the focus comes back to a card is intended (Shady #48 n7).
+#[gpui_kit::test]
+fn a_split_or_a_yield_leaves_the_other_panes_card_armed(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, events) = on_a_as(cx, "panes-l8", attached_secret(A, 1));
+    feed(cx, window, &view, &events, "the card up", |v| v.panes.cur.card.is_some());
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    let card = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.panes.get(p0).and_then(|p| p.card.as_ref()).map(|c| (c.key, c.arm.shown_at(), c.armed())))
+    };
+    let before = card(cx).expect("the card");
+    let mut yields = std::collections::BTreeSet::new();
+    let mut check = |cx: &mut TestAppContext, what: &str, armed: bool| {
+        for f in 0..40 {
+            frame(cx, window);
+            std::thread::sleep(Duration::from_millis(2));
+            let now = card(cx).expect("the first pane's card");
+            assert_eq!((now.0, now.1), (before.0, before.1), "{what}, frame {f}: the first pane's card waits again");
+            assert!(!armed || now.2, "{what}, frame {f}: armed");
+            let y = view.read_with(cx, |v, _| (v.pane_yield, v.panes.folded));
+            assert!(!y.1, "{what}: never folded (that hides the first pane)");
+            yields.insert(y.0);
+        }
+    };
+    key(cx, window, "ctrl-\\");
+    check(cx, "split as it comes", false);
+    feed(cx, window, &view, &events, "armed", |v| v.panes.get(p0).and_then(|p| p.card.as_ref()).is_some_and(|c| c.armed()));
+    key(cx, window, "ctrl-\\");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 3, "split again");
+    check(cx, "split once armed", true);
+    for w in [1180., 1040., 980., 1280.] {
+        VisualTestContext::from_window(window, cx).simulate_resize(size(px(w), px(800.)));
+        check(cx, &format!("the window {w} wide"), true);
+    }
+    assert!(yields.len() >= 2, "a side panel yielded and came back: {yields:?}");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
@@ -3780,4 +3825,714 @@ fn the_chips_take_their_landed_grid_as_join_lands(cx: &mut TestAppContext) {
         frame_144(cx, window, &view);
         assert_eq!(chips(cx), landed, "frame {f} after the landing: no chip moves");
     }
+}
+
+// ── Step 4: drag and drop (split/architecture.md §4, split.md §2–§3) ──
+
+/// The mouse at `at`, as [`mouse`], with `m` held.
+fn mouse_m(cx: &mut TestAppContext, window: AnyWindowHandle, at: Point<Pixels>, how: &str, m: gpui_kit::Modifiers) {
+    use gpui_kit::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    match how {
+        "down" => {
+            vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: at, modifiers: m, click_count: 1, first_mouse: false })
+        }
+        "up" => vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: at, modifiers: m, click_count: 1 }),
+        "hover" => vcx.simulate_event(MouseMoveEvent { position: at, pressed_button: None, modifiers: m }),
+        _ => vcx.simulate_event(MouseMoveEvent { position: at, pressed_button: Some(MouseButton::Left), modifiers: m }),
+    }
+    vcx.run_until_parked();
+}
+
+/// The middle of what `sel` names, as drawn.
+fn mid(cx: &mut TestAppContext, window: AnyWindowHandle, sel: String) -> Point<Pixels> {
+    let b = drawn(cx, window, sel.clone()).unwrap_or_else(|| panic!("{sel} drawn"));
+    gpui_kit::point(px(b[0] + b[2] / 2.), px(b[1] + b[3] / 2.))
+}
+
+/// A drag by real mouse input from `from` (pressed there, past GPUI's
+/// 2 px threshold) to `to`, frames drawn between; let go there (`drop`)
+/// with `m` held, or left held.
+fn drag_to(cx: &mut TestAppContext, window: AnyWindowHandle, from: Point<Pixels>, to: Point<Pixels>, m: gpui_kit::Modifiers, drop: bool) {
+    let none = gpui_kit::Modifiers::default();
+    mouse_m(cx, window, from, "hover", none);
+    mouse_m(cx, window, from, "down", none);
+    mouse_m(cx, window, gpui_kit::point(from.x + px(8.), from.y + px(6.)), "move", none);
+    frame(cx, window);
+    let half = gpui_kit::point((from.x + to.x) / 2., (from.y + to.y) / 2.);
+    mouse_m(cx, window, half, "move", none);
+    frame(cx, window);
+    mouse_m(cx, window, to, "move", m);
+    frame(cx, window);
+    if drop {
+        mouse_m(cx, window, to, "up", m);
+        frame(cx, window);
+    }
+}
+
+/// A point in pane `id`'s body at `(fx, fy)` of it (under its tab strip).
+fn in_body(cx: &mut TestAppContext, window: AnyWindowHandle, id: crate::pane::PaneId, fx: f32, fy: f32) -> Point<Pixels> {
+    let b = match drawn(cx, window, format!("pane {}", id.index())) {
+        Some(b) => b,
+        // One pane: the centre.
+        None => drawn(cx, window, "pane-centre".into()).expect("the centre drawn"),
+    };
+    let strip = crate::tabstrip::TAB_H;
+    gpui_kit::point(px(b[0] + fx * b[2]), px(b[1] + strip + fy * (b[3] - strip)))
+}
+
+/// The next attach at the daemon. A switch soon after the last one waits
+/// for the attach gate ([`crate::tabs::AttachGate`]): its timer runs on
+/// the test's clock, so frames are drawn and the clock moved meanwhile.
+fn next_attach(cx: &mut TestAppContext, window: AnyWindowHandle, attaches: &mpsc::Receiver<Conn>, what: &str) -> Conn {
+    let deadline = Instant::now() + T;
+    loop {
+        if let Ok(c) = attaches.try_recv() {
+            return c;
+        }
+        assert!(Instant::now() < deadline, "{what}: timed out");
+        cx.executor().advance_clock(Duration::from_millis(50));
+        frame(cx, window);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// B opened as a new tab of the focused pane, attached.
+fn open_b(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    view: &Entity<AppView>,
+    attaches: &mpsc::Receiver<Conn>,
+    events: &async_channel::Receiver<Event>,
+) -> Conn {
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::New);
+        cx.notify();
+    });
+    let mut b = next_attach(cx, window, attaches, "B's attach at the daemon");
+    b.send(attached(B, None));
+    feed(cx, window, view, events, "B attached", |v| v.model.lives[v.panes.cur.live].is_active(B));
+    b
+}
+
+/// Pane `id`'s tabs' sessions, in order.
+fn tabs_of(cx: &mut TestAppContext, view: &Entity<AppView>, id: crate::pane::PaneId) -> Vec<String> {
+    view.read_with(cx, |v, _| {
+        let p = v.panes.get(id).expect("the pane");
+        let tabs = if p.id == v.panes.cur.id { &v.model.tabs } else { &p.parked.tabs };
+        tabs.iter().filter_map(|t| t.session.clone()).collect()
+    })
+}
+
+/// The tab id of `session` in pane `id`.
+fn tab_id(cx: &mut TestAppContext, view: &Entity<AppView>, id: crate::pane::PaneId, session: &str) -> u64 {
+    view.read_with(cx, |v, _| {
+        let p = v.panes.get(id).expect("the pane");
+        let tabs = if p.id == v.panes.cur.id { &v.model.tabs } else { &p.parked.tabs };
+        tabs.iter().find(|t| t.session.as_deref() == Some(session)).map(|t| t.id).expect("its tab")
+    })
+}
+
+/// split.md §2, A3: a tab dragged to a pane's right edge by real mouse
+/// input splits it there and moves into the new pane (focused, keys
+/// there); the preview showed NEW PANE over the right half while over
+/// the band; what is typed after goes to the new pane's composer, never
+/// the pane it left.
+#[gpui_kit::test]
+fn a_tab_dragged_to_the_right_edge_splits_and_moves(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, events) = on_a(cx, "dnd-right", None);
+    let _b = open_b(cx, window, &view, &attaches, &events);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    assert_eq!(tabs_of(cx, &view, p0), [A, B]);
+    let tab = tab_id(cx, &view, p0, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p0, 0.92, 0.5);
+    drag_to(cx, window, from, to, gpui_kit::Modifiers::default(), false);
+    let hint = view.read_with(cx, |v, _| v.dnd.hint);
+    assert_eq!(hint.map(|h| (h.pane, h.zone)), Some((p0, Some(crate::dnd::Zone::Right))), "over the right band");
+    let pv = drawn(cx, window, "drop-preview".into()).expect("the preview");
+    let pb = drawn(cx, window, "pane-centre".into()).expect("the centre");
+    assert!(pv[0] > pb[0] + pb[2] / 2. - 1. && pv[0] < pb[0] + pb[2] / 2. + 8., "the right half: {pv:?} in {pb:?}");
+    mouse_m(cx, window, to, "up", gpui_kit::Modifiers::default());
+    frame(cx, window);
+    let (n, focused) = view.read_with(cx, |v, _| (v.panes.len(), v.panes.focused));
+    assert_eq!(n, 2, "split");
+    assert_ne!(focused, p0, "the new pane focused");
+    assert_eq!(tabs_of(cx, &view, focused), [B], "the tab in the new pane");
+    assert_eq!(tabs_of(cx, &view, p0), [A], "and out of the one it left");
+    let rects = tree_rects(cx, &view);
+    let (r0, r1) = (rects.iter().find(|r| r.0 == p0).unwrap().1, rects.iter().find(|r| r.0 == focused).unwrap().1);
+    assert!(r1.x > r0.x, "on the right: {rects:?}");
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    VisualTestContext::from_window(window, cx).simulate_input("to b");
+    frame(cx, window);
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.panes.get(focused).unwrap().composer.read(cx).value().to_string(), "to b", "typed into the new pane");
+        assert_eq!(v.panes.get(p0).unwrap().composer.read(cx).value().to_string(), "", "nothing in the pane it left");
+    });
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// split.md §2, A4: a rail row dragged to a pane's bottom band splits it
+/// down and opens the row's session in the new pane; nothing moves (the
+/// first pane keeps its tab).
+#[gpui_kit::test]
+fn a_rail_row_dragged_to_the_bottom_splits_and_opens(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, events) = on_a(cx, "dnd-rail", None);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    let key = view.read_with(cx, |v, _| {
+        v.rail.rail.rows.iter().find(|r| r.action == crate::named::RowAction::Attach(B.into())).map(|r| r.key).expect("B's row")
+    });
+    let from = mid(cx, window, format!("rail-row {key}"));
+    let to = in_body(cx, window, p0, 0.5, 0.95);
+    drag_to(cx, window, from, to, gpui_kit::Modifiers::default(), false);
+    assert_eq!(view.read_with(cx, |v, _| v.dnd.hint.map(|h| (h.pane, h.zone))), Some((p0, Some(crate::dnd::Zone::Bottom))));
+    assert!(drawn(cx, window, "drop-preview".into()).is_some(), "the preview");
+    mouse_m(cx, window, to, "up", gpui_kit::Modifiers::default());
+    frame(cx, window);
+    let mut b = next_attach(cx, window, &attaches, "B's attach at the daemon");
+    b.send(attached(B, None));
+    let new = view.read_with(cx, |v, _| v.panes.focused);
+    feed(cx, window, &view, &events, "B attached in the new pane", |v| {
+        v.panes.focused == new && v.model.lives[v.panes.cur.live].is_active(B)
+    });
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2);
+    assert_ne!(new, p0);
+    assert_eq!(tabs_of(cx, &view, new), [B], "opened in the new pane");
+    assert_eq!(tabs_of(cx, &view, p0), [A], "nothing moved");
+    let rects = tree_rects(cx, &view);
+    let (r0, r1) = (rects.iter().find(|r| r.0 == p0).unwrap().1, rects.iter().find(|r| r.0 == new).unwrap().1);
+    assert!(r1.y > r0.y && (r1.x - r0.x).abs() < 0.5, "below: {rects:?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// split.md §2–§3, A3, A9: a tab dragged to another pane's centre moves
+/// there (its pane keeps its other tab); held Ctrl at the drop, it copies
+/// (it stays where it was too). The pane the drag started in has the
+/// keys during the drag (its mouse-down focused it), the drop's pane
+/// after: typing never lands in another.
+#[gpui_kit::test]
+fn a_tab_dragged_to_another_panes_centre_moves_and_ctrl_copies(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, events) = on_a(cx, "dnd-centre", None);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    key(cx, window, "ctrl-\\");
+    let p1 = view.read_with(cx, |v, _| v.panes.focused);
+    let _b = open_b(cx, window, &view, &attaches, &events);
+    assert_eq!(tabs_of(cx, &view, p1), [A, B]);
+    // Focus in p0 first: the drag's mouse-down moves it to p1.
+    view.update(cx, |v, cx| v.focus_pane(p0, crate::pane::KeysTo::Pane, cx));
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    let tab = tab_id(cx, &view, p1, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p0, 0.5, 0.5);
+    drag_to(cx, window, from, to, gpui_kit::Modifiers::default(), false);
+    assert_eq!(view.read_with(cx, |v, _| v.dnd.hint.map(|h| (h.pane, h.zone))), Some((p0, Some(crate::dnd::Zone::Center))));
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), p1, "the pane the drag started in is focused");
+    // The press on the tab left no pane's input the keys (a click outside
+    // a field): typed during the drag lands in no composer.
+    assert!(!keys_in(cx, window, &view, p0, false) && !keys_in(cx, window, &view, p1, false), "no composer has the keys mid-drag");
+    VisualTestContext::from_window(window, cx).simulate_input("mid");
+    frame(cx, window);
+    // GPUI hovers nothing after a key until the pointer moves (its
+    // `last_input_was_keyboard`): a pixel's move, as a hand makes.
+    mouse_m(cx, window, gpui_kit::point(to.x + px(1.), to.y), "move", gpui_kit::Modifiers::default());
+    frame(cx, window);
+    mouse_m(cx, window, gpui_kit::point(to.x + px(1.), to.y), "up", gpui_kit::Modifiers::default());
+    frame(cx, window);
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), p0, "the drop's pane focused");
+    assert_eq!(tabs_of(cx, &view, p0), [A, B], "moved in");
+    assert_eq!(tabs_of(cx, &view, p1), [A], "and out");
+    assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current_session().map(str::to_string)), Some(B.to_string()), "shown there");
+    VisualTestContext::from_window(window, cx).simulate_input("after");
+    frame(cx, window);
+    view.read_with(cx, |v, cx| {
+        let text = |id| v.panes.get(id).unwrap().composer.read(cx).value().to_string();
+        assert_eq!(text(p0), "after", "typed after the drop: the drop's pane, and nothing from mid-drag");
+        assert_eq!(text(p1), "", "nothing in the pane it left");
+    });
+    // Ctrl held at the drop: a copy.
+    let tab = tab_id(cx, &view, p0, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p1, 0.5, 0.5);
+    let ctrl = gpui_kit::Modifiers { control: true, ..Default::default() };
+    drag_to(cx, window, from, to, ctrl, true);
+    assert_eq!(tabs_of(cx, &view, p1), [A, B], "copied in");
+    assert_eq!(tabs_of(cx, &view, p0), [A, B], "and kept");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), p1);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// The dnd round 2 tests' start: two panes, `p0` with A and `p1`
+/// (focused) with A and B; the window, its view, the client, A's and B's
+/// connections, and the panes.
+fn two_panes(
+    cx: &mut TestAppContext,
+    name: &str,
+) -> (AnyWindowHandle, Entity<AppView>, Client, Kept, crate::pane::PaneId, crate::pane::PaneId) {
+    let (window, view, client, a, attaches, events) = on_a(cx, name, None);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    key(cx, window, "ctrl-\\");
+    let p1 = view.read_with(cx, |v, _| v.panes.focused);
+    let b = open_b(cx, window, &view, &attaches, &events);
+    assert_eq!(tabs_of(cx, &view, p1), [A, B]);
+    assert_eq!(tabs_of(cx, &view, p0), [A]);
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    (window, view, client, (a, b, attaches, events), p0, p1)
+}
+
+/// What a test keeps alive and never reads: A's and B's connections, the
+/// daemon's attaches, the client's events.
+type Kept = (Conn, Conn, mpsc::Receiver<Conn>, async_channel::Receiver<Event>);
+
+/// Shady #48 L2: Ctrl pressed after the last move (stop, press, let go)
+/// is what the drop reads, and the preview follows it as it changes: a
+/// pane's own last tab to its edge is nothing as a move, a new pane as a
+/// copy; a tab let go on another pane's centre with Ctrl pressed only
+/// after it stopped is a copy.
+#[gpui_kit::test]
+fn ctrl_pressed_after_the_last_move_copies_and_the_preview_follows(cx: &mut TestAppContext) {
+    let (window, view, client, _conns, p0, p1) = two_panes(cx, "dnd-ctrl-late");
+    // Wide enough for a half pane to split again (its minimum).
+    VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(1080.)));
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    let none = gpui_kit::Modifiers::default();
+    let ctrl = gpui_kit::Modifiers { control: true, ..Default::default() };
+    let hint = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.dnd.hint.map(|h| (h.pane, h.zone)));
+    // p0's own last tab over its right edge: nothing, until Ctrl.
+    let tab = tab_id(cx, &view, p0, A);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p0, 0.92, 0.5);
+    drag_to(cx, window, from, to, none, false);
+    assert_eq!(hint(cx), Some((p0, None)), "a move of its last tab to its own edge: nothing");
+    VisualTestContext::from_window(window, cx).simulate_modifiers_change(ctrl);
+    frame(cx, window);
+    assert!(view.read_with(cx, |v, _| v.dnd.copy), "Ctrl heard mid-drag");
+    assert_eq!(hint(cx), Some((p0, Some(crate::dnd::Zone::Right))), "Ctrl pressed with the pointer still: a copy, a new pane");
+    assert!(drawn(cx, window, "drop-preview".into()).is_some(), "and its preview drawn");
+    VisualTestContext::from_window(window, cx).simulate_modifiers_change(none);
+    frame(cx, window);
+    assert_eq!(hint(cx), Some((p0, None)), "let go of: nothing again");
+    key(cx, window, "escape");
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2);
+    // B from p1 to p0's centre, still; Ctrl pressed, then let go there.
+    let tab = tab_id(cx, &view, p1, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p0, 0.5, 0.5);
+    drag_to(cx, window, from, to, none, false);
+    assert_eq!(hint(cx), Some((p0, Some(crate::dnd::Zone::Center))));
+    VisualTestContext::from_window(window, cx).simulate_modifiers_change(ctrl);
+    frame(cx, window);
+    mouse_m(cx, window, to, "up", ctrl);
+    frame(cx, window);
+    frame(cx, window);
+    assert_eq!(tabs_of(cx, &view, p0), [A, B], "copied in");
+    assert_eq!(tabs_of(cx, &view, p1), [A, B], "and kept: Ctrl was held at the drop");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #48 L3: a key typed mid-drag leaves GPUI hovering nothing until
+/// the pointer moves; let go without moving, the drop still lands where
+/// it was let go: on a pane's body, its zone; on its tab strip, that
+/// pane's centre.
+#[gpui_kit::test]
+fn a_key_typed_mid_drag_then_a_release_that_never_moved_still_drops(cx: &mut TestAppContext) {
+    let (window, view, client, _conns, p0, p1) = two_panes(cx, "dnd-typed");
+    let none = gpui_kit::Modifiers::default();
+    let tab = tab_id(cx, &view, p1, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p0, 0.5, 0.5);
+    drag_to(cx, window, from, to, none, false);
+    VisualTestContext::from_window(window, cx).simulate_input("x");
+    frame(cx, window);
+    mouse_m(cx, window, to, "up", none);
+    frame(cx, window);
+    frame(cx, window);
+    assert_eq!(tabs_of(cx, &view, p0), [A, B], "dropped on p0's centre: moved in");
+    assert_eq!(tabs_of(cx, &view, p1), [A], "and out");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), p0, "the drop's pane focused");
+    // Back onto p1's tab strip (its A tab), a key typed, let go there.
+    let tab = tab_id(cx, &view, p0, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let onto = tab_id(cx, &view, p1, A);
+    let to = mid(cx, window, format!("tab {onto}"));
+    drag_to(cx, window, from, to, none, false);
+    VisualTestContext::from_window(window, cx).simulate_input("y");
+    frame(cx, window);
+    mouse_m(cx, window, to, "up", none);
+    frame(cx, window);
+    frame(cx, window);
+    assert_eq!(tabs_of(cx, &view, p1), [A, B], "let go on p1's strip: into p1");
+    assert_eq!(tabs_of(cx, &view, p0), [A]);
+    view.read_with(cx, |v, cx| {
+        for id in [p0, p1] {
+            assert_eq!(v.panes.get(id).unwrap().composer.read(cx).value().to_string(), "", "typed mid-drag lands in no composer");
+        }
+    });
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #48 L4: the pane under the drop closed after the last move (a
+/// key mid-drag can close it). The drop is asked again where it is let
+/// go: on the dragged tab's own pane, that is nothing, and the tab stays
+/// where it was; never opened and taken in its own pane, gone with no
+/// reopen entry.
+#[gpui_kit::test]
+fn a_drop_on_a_pane_closed_since_the_last_move_leaves_the_tab(cx: &mut TestAppContext) {
+    let (window, view, client, _conns, p0, p1) = two_panes(cx, "dnd-closed");
+    let none = gpui_kit::Modifiers::default();
+    let tab = tab_id(cx, &view, p1, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p0, 0.5, 0.5);
+    drag_to(cx, window, from, to, none, false);
+    assert_eq!(view.read_with(cx, |v, _| v.dnd.hint.map(|h| (h.pane, h.zone))), Some((p0, Some(crate::dnd::Zone::Center))));
+    view.update(cx, |v, _| v.in_pane(p0, |v| v.close_pane()));
+    for _ in 0..40 {
+        frame(cx, window);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "p0 closed mid-drag");
+    mouse_m(cx, window, to, "up", none);
+    frame(cx, window);
+    frame(cx, window);
+    assert_eq!(tabs_of(cx, &view, p1), [A, B], "B stays in its own pane");
+    assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current_session().map(str::to_string)), Some(B.to_string()), "shown there");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// The brief's 5th pane: with 4 panes, a tab dragged to another pane's
+/// edge never makes a 5th. The preview shows the centre (the drop that
+/// will happen), the tab moves there, and the focused composer says
+/// "4 panes is the most", as Ctrl+\ does.
+#[gpui_kit::test]
+fn a_drag_to_a_fifth_pane_is_refused_with_the_note(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, events) = on_a(cx, "dnd-fifth", None);
+    VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(1080.)));
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    key(cx, window, "ctrl-|");
+    let p0 = view.read_with(cx, |v, _| v.reading_order()[0]);
+    view.update(cx, |v, cx| v.focus_pane(p0, crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    key(cx, window, "ctrl-|");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "four panes");
+    for _ in 0..80 {
+        frame(cx, window);
+    }
+    let src = view.read_with(cx, |v, _| v.panes.focused);
+    let _b = open_b(cx, window, &view, &attaches, &events);
+    let target = view.read_with(cx, |v, _| v.reading_order().into_iter().find(|&id| id != src).expect("another pane"));
+    let tab = tab_id(cx, &view, src, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, target, 0.97, 0.5);
+    drag_to(cx, window, from, to, gpui_kit::Modifiers::default(), false);
+    let hint = view.read_with(cx, |v, _| v.dnd.hint).expect("a hint");
+    assert_eq!(
+        (hint.pane, hint.zone, hint.note),
+        (target, Some(crate::dnd::Zone::Center), Some("4 panes is the most")),
+        "the edge is the centre"
+    );
+    // Its reason on the preview while it shows (finish gate #48 S1).
+    frame(cx, window);
+    assert!(drawn(cx, window, "drop-label-note".into()).is_some(), "the preview's label says why, during the drag");
+    mouse_m(cx, window, to, "up", gpui_kit::Modifiers::default());
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "no 5th pane");
+    assert!(tabs_of(cx, &view, target).contains(&B.to_string()), "moved to that pane's centre");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.cur.watch_note.as_deref().map(str::to_string)), Some("4 panes is the most".into()));
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// split.md §3: a drag released outside the window (the button let go
+/// there: the next move in comes with none) drops nothing and leaves no
+/// hint, target or preview; Esc mid-drag does the same, and the release
+/// after it drops nothing.
+#[gpui_kit::test]
+fn a_drag_released_outside_or_cancelled_leaves_nothing(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, events) = on_a(cx, "dnd-outside", None);
+    let _b = open_b(cx, window, &view, &attaches, &events);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    let tab = tab_id(cx, &view, p0, B);
+    let from = mid(cx, window, format!("tab {tab}"));
+    let to = in_body(cx, window, p0, 0.95, 0.5);
+    drag_to(cx, window, from, to, gpui_kit::Modifiers::default(), false);
+    assert!(view.read_with(cx, |v, _| v.dnd.hint.is_some()));
+    // Let go outside: the next move comes with no button.
+    let at = in_body(cx, window, p0, 0.5, 0.5);
+    mouse_m(cx, window, at, "hover", gpui_kit::Modifiers::default());
+    for _ in 0..30 {
+        frame(cx, window);
+    }
+    view.read_with(cx, |v, cx| {
+        assert!(v.dnd.on.is_none() && v.dnd.hint.is_none() && v.dnd.drawn.is_none(), "nothing of the drag left");
+        assert!(!cx.has_active_drag(), "GPUI's drag ended");
+        assert_eq!(v.panes.len(), 1, "nothing dropped");
+    });
+    assert!(drawn(cx, window, "drop-target 0".into()).is_none() && drawn(cx, window, "drop-preview".into()).is_none());
+    assert_eq!(tabs_of(cx, &view, p0), [A, B]);
+    // Esc mid-drag.
+    drag_to(cx, window, from, to, gpui_kit::Modifiers::default(), false);
+    assert!(view.read_with(cx, |v, _| v.dnd.hint.is_some()));
+    key(cx, window, "escape");
+    assert!(view.read_with(cx, |v, cx| v.dnd.on.is_none() && v.dnd.hint.is_none() && !cx.has_active_drag()), "Esc ended it");
+    mouse_m(cx, window, to, "up", gpui_kit::Modifiers::default());
+    for _ in 0..30 {
+        frame(cx, window);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "nothing dropped");
+    assert_eq!(tabs_of(cx, &view, p0), [A, B]);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// split/architecture.md §4.4: a click on a rail row still opens it (a
+/// press and a release with a pixel's wobble, under GPUI's drag
+/// threshold): no drag, no targets.
+#[gpui_kit::test]
+fn a_click_on_a_rail_row_still_opens(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, _events) = on_a(cx, "dnd-click", None);
+    let key = view.read_with(cx, |v, _| {
+        v.rail.rail.rows.iter().find(|r| r.action == crate::named::RowAction::Attach(B.into())).map(|r| r.key).expect("B's row")
+    });
+    let at = mid(cx, window, format!("rail-row {key}"));
+    let none = gpui_kit::Modifiers::default();
+    mouse_m(cx, window, at, "hover", none);
+    mouse_m(cx, window, at, "down", none);
+    mouse_m(cx, window, gpui_kit::point(at.x + px(1.), at.y), "move", none);
+    assert!(view.read_with(cx, |v, cx| v.dnd.on.is_none() && !cx.has_active_drag()), "no drag under the threshold");
+    mouse_m(cx, window, gpui_kit::point(at.x + px(1.), at.y), "up", none);
+    frame(cx, window);
+    let _b = next_attach(cx, window, &attaches, "B's attach: the click opened it");
+    assert_eq!(view.read_with(cx, |v, _| v.model.tabs.current_session().map(str::to_string)), Some(B.to_string()));
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// split.md §10: the preview glides between zones on `snap` at Full (in
+/// between frames drawn), then holds still and asks no frame; at Reduced
+/// and Off it jumps (the next frame is the new zone's).
+#[gpui_kit::test]
+fn the_drop_preview_glides_at_full_and_jumps_at_reduced_and_off(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, events) = on_a(cx, "dnd-preview", None);
+    let _b = open_b(cx, window, &view, &attaches, &events);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    let tab = tab_id(cx, &view, p0, B);
+    for lv in [crate::motion::Level::Full, crate::motion::Level::Reduced, crate::motion::Level::Off] {
+        level(cx, lv);
+        let from = mid(cx, window, format!("tab {tab}"));
+        let at = in_body(cx, window, p0, 0.05, 0.5);
+        drag_to(cx, window, from, at, gpui_kit::Modifiers::default(), false);
+        for _ in 0..80 {
+            frame_144(cx, window, &view);
+        }
+        let left = drawn(cx, window, "drop-preview".into()).expect("the left half");
+        let at = in_body(cx, window, p0, 0.95, 0.5);
+        mouse_m(cx, window, at, "move", gpui_kit::Modifiers::default());
+        let mut xs = Vec::new();
+        for _ in 0..80 {
+            frame_144(cx, window, &view);
+            xs.push(drawn(cx, window, "drop-preview".into()).expect("the preview")[0]);
+        }
+        let end = *xs.last().unwrap();
+        assert!(end > left[0] + 100., "{lv:?}: on the right half: {xs:?}");
+        let between = xs.iter().filter(|&&x| x > left[0] + 1. && x < end - 1.).count();
+        match lv {
+            crate::motion::Level::Full => assert!(between >= 3, "Full: it glides: {xs:?}"),
+            _ => assert_eq!(between, 0, "{lv:?}: it jumps: {xs:?}"),
+        }
+        let still = xs.iter().position(|&x| x == end).unwrap();
+        assert!(xs[still..].iter().all(|&x| x == end), "{lv:?}: nothing moves once it lands: {xs:?}");
+        assert!(!view.read_with(cx, |v, _| v.fx.pending().0), "{lv:?}: at rest, no frame asked");
+        key(cx, window, "escape");
+        let at = in_body(cx, window, p0, 0.5, 0.5);
+        mouse_m(cx, window, at, "up", gpui_kit::Modifiers::default());
+        for _ in 0..80 {
+            frame_144(cx, window, &view);
+        }
+        assert!(drawn(cx, window, "drop-preview".into()).is_none(), "{lv:?}: gone");
+    }
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #48 r2 L1 and L2, finish gate #48 r2 N1 and N2: a rail row
+/// dropped on an edge at Full, frame by frame at 144 Hz, its session's
+/// prompt up as it attaches early in the flight.
+/// While more than [`crate::pane::HOLD_UNTIL`] px are left the new pane
+/// draws nothing from its rows: no row, no sticky label, no thumb. Its
+/// rows come in before it lands at 70 % and lift to full on `quick`,
+/// done before the last frame that moves; nothing (rows, column, thumb,
+/// strength) changes after it. The card's buttons arm from the frame its
+/// row first draws: a real click on Allow then is refused, though the
+/// drop was over 500 ms before; one after the arm answers.
+#[gpui_kit::test]
+fn a_dropped_rows_pane_holds_its_rows_lifts_them_in_its_tail_and_arms_its_card_from_their_first_frame(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, events) = on_a(cx, "dnd-hold", None);
+    level(cx, crate::motion::Level::Full);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    let key = view.read_with(cx, |v, _| {
+        v.rail.rail.rows.iter().find(|r| r.action == crate::named::RowAction::Attach(B.into())).map(|r| r.key).expect("B's row")
+    });
+    let from = mid(cx, window, format!("rail-row {key}"));
+    let to = in_body(cx, window, p0, 0.97, 0.5);
+    drag_to(cx, window, from, to, gpui_kit::Modifiers::default(), false);
+    assert_eq!(view.read_with(cx, |v, _| v.dnd.hint.map(|h| (h.pane, h.zone))), Some((p0, Some(crate::dnd::Zone::Right))));
+    mouse_m(cx, window, to, "up", gpui_kit::Modifiers::default());
+    let new = view.read_with(cx, |v, _| v.panes.focused);
+    assert_ne!(new, p0, "a new pane");
+    // Its first frame, then B attaches with its prompt up, the flight
+    // held there (its clock moves only in `frame_144`).
+    frame_144(cx, window, &view);
+    let mut b = next_attach(cx, window, &attaches, "B's attach at the daemon");
+    b.send(attached(B, Some(1)));
+    feed(cx, window, &view, &events, "B's card in the new pane", |v| v.panes.get(new).is_some_and(|p| p.card.is_some()));
+    assert!(view.read_with(cx, |v, _| v.panes.get(new).is_some_and(|p| p.hold_rows)), "its rows still held");
+    let _ = names(&mut b);
+    // Past the arm the card's first frame would have started (real time).
+    std::thread::sleep(Duration::from_millis(600));
+    // A frame: how far from landing, held, its rows' boxes, sticky layers
+    // painted (the first pane's is one), its column, its rows' strength.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Snap {
+        left: f32,
+        rect: [f32; 4],
+        held: bool,
+        rows: Vec<[f32; 4]>,
+        sticky: usize,
+        column: f32,
+        k: f32,
+        flight: bool,
+        thumb: Option<[f32; 4]>,
+    }
+    let snap = |cx: &mut TestAppContext, thumb: Option<[f32; 4]>| -> Snap {
+        view.read_with(cx, |v, _| {
+            let p = v.panes.get(new).expect("the new pane");
+            let (r, l) = (p.rect.get(), p.land.get());
+            let top = p.list.logical_scroll_top().item_ix;
+            let rows = (top..(top + 10).min(p.list.item_count()))
+                .filter_map(|ix| p.list.bounds_for_item(ix))
+                .map(|b| [b.origin.x, b.origin.y, b.size.width, b.size.height].map(f32::from))
+                .collect();
+            Snap {
+                left: (l.w - r.w).abs() + (l.h - r.h).abs(),
+                rect: [r.x, r.y, r.w, r.h],
+                held: p.hold_rows,
+                rows,
+                sticky: v.fx.paint_log.borrow().iter().filter(|w| **w == "sticky").count(),
+                column: p.layout.column,
+                k: p.drawn_k.get(),
+                flight: v.panes.flight.is_some(),
+                thumb,
+            }
+        })
+    };
+    let bar = view
+        .read_with(cx, |v, _| if v.panes.cur.id == new { v.bars.transcript.clone() } else { v.panes.get(new).unwrap().parked.bar.clone() });
+    drop(bar.thumbs());
+    let card_at =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panes.get(new).and_then(|p| p.card.as_ref().map(|c| c.arm.shown_at())));
+    let mut seen: Vec<Snap> = Vec::new();
+    let mut fails = Vec::new();
+    let (mut first, mut rest) = (None, 0);
+    while rest < 12 {
+        let before = Instant::now();
+        frame_144(cx, window, &view);
+        let thumb = bar.thumbs().last().and_then(|t| t.2);
+        let s = snap(cx, thumb);
+        let i = seen.len();
+        if first.is_none() && !s.rows.is_empty() {
+            first = Some(i);
+            let at = card_at(cx).expect("the card");
+            if at < before {
+                fails.push(format!("frame {i}: the card's arm counts from {:?} before the frame its row first draws", before - at));
+            }
+            // Allow, clicked by real input right after that frame: refused
+            // (it arms 500 ms from there).
+            let allow = in_pane_at(cx, window, "allow-fill", new);
+            click_at(cx, window, allow);
+            let said = names(&mut b);
+            if !said.is_empty() {
+                fails.push(format!("a click right after the card's first frame: {said:?}"));
+            }
+        }
+        rest = if s.flight || i < 3 { 0 } else { rest + 1 };
+        seen.push(s);
+        assert!(seen.len() < 400, "never landed");
+    }
+    let first = first.expect("the rows came in");
+    let last = (1..seen.len()).rev().find(|&i| seen[i].rect != seen[i - 1].rect).expect("the pane moved");
+    eprintln!(
+        "rows in at frame {first}, last move at {last} of {}: {:?}",
+        seen.len(),
+        seen.iter()
+            .map(|s| (s.left.round(), s.held, s.rows.len(), s.sticky, (s.k * 1000.).round() / 1000., s.thumb.is_some()))
+            .collect::<Vec<_>>()
+    );
+    for (i, s) in seen.iter().enumerate() {
+        if s.left > crate::pane::HOLD_UNTIL && (!s.held || !s.rows.is_empty() || s.sticky != 1 || s.thumb.is_some()) {
+            fails.push(format!(
+                "frame {i}, {} px left: held {}, rows {}, sticky layers {} (the first pane's is 1), thumb {:?}",
+                s.left,
+                s.held,
+                s.rows.len(),
+                s.sticky,
+                s.thumb
+            ));
+        }
+        if !s.held && s.sticky != 2 {
+            fails.push(format!("frame {i}: rows in, {} sticky layers (want 2)", s.sticky));
+        }
+    }
+    let f = &seen[first];
+    if f.left > crate::pane::HOLD_UNTIL || f.held || first >= last {
+        fails.push(format!("the rows came in at frame {first} ({} px left), the pane last moved at {last}", f.left));
+    }
+    if (f.k - crate::motion::LIFT).abs() > 1e-3 {
+        fails.push(format!("the rows came in at {} (want {})", f.k, crate::motion::LIFT));
+    }
+    // The lift: rising every frame to full, full before the last that moves.
+    let full = (first..seen.len()).find(|&i| seen[i].k >= 1.).expect("the lift ends");
+    let ks: Vec<f32> = seen[first..=full].iter().map(|s| s.k).collect();
+    if ks.windows(2).any(|w| w[1] <= w[0]) || full >= last || seen[full..].iter().any(|s| s.k < 1.) {
+        fails.push(format!("the lift {ks:?} over frames {first}..={full}; the pane last moved at {last}"));
+    }
+    if !seen[first..last].iter().any(|s| s.thumb.is_some()) {
+        fails.push(format!("no thumb painted before the last frame that moves ({last})"));
+    }
+    for (i, s) in seen.iter().enumerate().skip(last + 1) {
+        let l = &seen[last];
+        if s.rows != l.rows || s.column != l.column || s.k != l.k || s.thumb.is_some_and(|t| Some(t) != l.thumb) {
+            fails.push(format!("frame {i} after the last that moves ({last}): {s:?} vs {l:?}"));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{fails:#?}\n{:#?}",
+        seen.iter().map(|s| (s.left, s.held, s.rows.len(), s.sticky, s.k, s.thumb.is_some())).collect::<Vec<_>>()
+    );
+    // The arm run out: Allow answers, once.
+    std::thread::sleep(Duration::from_millis(600));
+    frame(cx, window);
+    let allow = in_pane_at(cx, window, "allow-fill", new);
+    click_at(cx, window, allow);
+    assert_eq!(names(&mut b), ["answer"], "armed, the click answers");
+    drop(attaches);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
 }

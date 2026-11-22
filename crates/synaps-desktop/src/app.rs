@@ -1780,7 +1780,7 @@ pub struct AppView {
     pub(crate) rail_width: f32,
     /// The rail row under the pointer, the one whose readout is open, and
     /// the 400 ms wait in between.
-    hover: Option<u64>,
+    pub(crate) hover: Option<u64>,
     pub(crate) readout: Option<u64>,
     readout_wait: Option<Task<()>>,
     /// When the readout came (its enter; none: it followed another, fluid.md
@@ -1905,7 +1905,9 @@ pub struct AppView {
     move_keys: FoldKeys,
     /// The panels the split yielded (rail, right) and its fold, as last
     /// judged ([`AppView::pane_sides`]).
-    pane_yield: Option<(bool, bool, bool)>,
+    pub(crate) pane_yield: Option<(bool, bool, bool)>,
+    /// Drag and drop (split panes step 4, [`crate::dnd`]).
+    pub(crate) dnd: crate::dnd::Dnd,
     /// A once-per-press key whose action came and whose key-down has not
     /// yet ([`OnceKey`]).
     once: Option<OnceKey>,
@@ -2518,6 +2520,7 @@ impl AppView {
             tab_keys: FoldKeys::default(),
             move_keys: FoldKeys::default(),
             pane_yield: None,
+            dnd: Default::default(),
             once: None,
             attach_source: None,
             settings: Default::default(),
@@ -3053,8 +3056,9 @@ impl AppView {
     /// [`READOUT_DELAY`] at rest, and closes when it leaves.
     pub(crate) fn hover_row(&mut self, key: u64, hovered: bool, cx: &mut Context<Self>) {
         if hovered {
-            // A drag of the rail's edge passing over it is not a rest.
-            if self.hover == Some(key) || self.drag.is_some_and(|g| g.moved) {
+            // A drag of the rail's edge passing over it is not a rest, nor
+            // is a drag of a row or a tab (split/architecture.md §4.4).
+            if self.hover == Some(key) || self.drag.is_some_and(|g| g.moved) || self.dnd.on.is_some() {
                 return;
             }
             self.hover = Some(key);
@@ -4402,6 +4406,22 @@ impl AppView {
         self.panes.cur.layer = (self.fx.fluid() && !rapid && !view).then_some((now, dx, dy));
     }
 
+    /// The held rows' arrival this frame (finish gate #48 r2 N2): their
+    /// strength, 70 → 100 % on `quick` (fluid.md §3.6) from the frame they
+    /// come in, 16 px from landing, where the `sheet` spring has 200 ms
+    /// or more left: it ends before the flight's last moving frame. Ended
+    /// at once if the flight has (nothing changes after it, #50).
+    fn rows_lift(&mut self) -> Option<f32> {
+        let at = self.panes.cur.rows_in?;
+        let q = (self.fx.now().saturating_duration_since(at).as_secs_f32() / crate::motion::QUICK.as_secs_f32()).min(1.);
+        if q >= 1. || !self.fx.fluid() || self.panes.flight.is_none() {
+            self.panes.cur.rows_in = None;
+            return None;
+        }
+        self.fx.want_frame();
+        Some(crate::motion::LIFT + (1. - crate::motion::LIFT) * crate::motion::ease::OUT.sample(q))
+    }
+
     /// The column's layer this frame: its offset and strength, or none.
     fn layer_now(&mut self) -> Option<(f32, f32, f32)> {
         let (at, dx, dy) = self.panes.cur.layer?;
@@ -5086,9 +5106,13 @@ impl AppView {
 
     /// The session tab is on screen and its card shows the first prompt.
     /// Not over a worker's view: the card is the session's, and Esc there
-    /// goes back to it.
+    /// goes back to it. Not while its pane's rows are held (Shady #48 r2
+    /// L1): its buttons and keys arm from the frame its row first draws.
     fn card_up(&self) -> bool {
-        self.model.tabs.view().is_none() && self.model.lives[self.panes.cur.live].watch.focus().is_none() && self.current_card().is_some()
+        !self.panes.cur.hold_rows
+            && self.model.tabs.view().is_none()
+            && self.model.lives[self.panes.cur.live].watch.focus().is_none()
+            && self.current_card().is_some()
     }
 
     /// The card's keys act: it is on screen in the active window with its
@@ -7769,6 +7793,33 @@ impl AppView {
         if self.panes.cur.attach_wait.is_some() && self.panes.cur.attach_due.is_none() {
             self.arm_attach(cx);
         }
+        // Rows held while the pane's split flies in (`Pane::hold_rows`):
+        // they come in its last [`crate::pane::HOLD_UNTIL`] px, where the
+        // `sheet` spring moves a pixel or two a frame, so their first layout
+        // and the frame after it (the scrollbar's hint) are drawn before it
+        // lands: nothing changes after the last frame that moves (#50).
+        let (drawn_at, land_at) = (self.panes.cur.rect.get(), self.panes.cur.land.get());
+        let left = (land_at.w - drawn_at.w).abs() + (land_at.h - drawn_at.h).abs();
+        let hold = self.panes.cur.hold_rows
+            && left > crate::pane::HOLD_UNTIL
+            && self.panes.flight.as_ref().is_some_and(|f| f.grow.contains(&self.panes.cur.id));
+        let released = self.panes.cur.hold_rows && !hold;
+        if released {
+            // The rows come in: they lift on `quick` (finish gate #48 r2
+            // N2), and the card's buttons and keys wait from this frame, the
+            // first that draws its row (Shady #48 r2 L1), not from the
+            // next frame's sync, a click's width later.
+            self.panes.cur.rows_in = self.fx.fluid().then(|| self.fx.now());
+            if let Some(c) = self.panes.cur.card.as_mut() {
+                c.arm = Arm::new(Instant::now());
+                c._arm = Some(Self::arm_repaint(cx));
+            }
+            self.panes.cur.keys_live = false;
+        }
+        self.panes.cur.hold_rows = hold;
+        if released {
+            self.panes.cur.card_was_up = self.card_up();
+        }
         let (pad_l, pad_r) = lay.padding();
         // Nothing over the list but the tab strip: the first row's own gap
         // (20·r) is the transcript's top edge (design.md §8.14).
@@ -7843,7 +7894,13 @@ impl AppView {
             .size_0()
         });
         // Over the list's right padding, after its layout (and the hold-back's).
-        let layer = self.layer_now();
+        let layer = match (self.layer_now(), self.rows_lift()) {
+            (Some((x, y, k)), Some(r)) => Some((x, y, k.min(r))),
+            (None, Some(r)) => Some((0., 0., r)),
+            (layer, None) => layer,
+        };
+        #[cfg(test)]
+        self.panes.cur.drawn_k.set(layer.map_or(1., |l| l.2));
         let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.panes.cur.scroller.clone(), self.fx.clone()));
         // Held while an edge is dragged and as it springs to a detent after
         // (the gate's S3 and S6), and while a divider is held (#47 L1: as a
@@ -7942,23 +7999,28 @@ impl AppView {
                         .min_h_0()
                         .relative()
                         .when_some(layer, |d, (x, y, k)| crate::motion::lift(d.left(px(x)).top(px(y)), k))
-                        .child(list)
+                        // Held (a dropped row's flight), nothing drawn
+                        // from the rows (finish gate #48 r2 N1): no list,
+                        // no sticky label (its row and time unlaid), no bar.
+                        .children((!hold).then_some(list))
                         // Right after the list's layout, reading it as it
                         // paints: the top message's label pinned (P15).
-                        .child(crate::sticky::layer(
-                            self.fx.clone(),
-                            cx.processor(move |this, b: Bounds<Pixels>, _, cx| {
-                                this.in_drawn(id, |this| this.sticky_label(b, cx)).unwrap_or_default()
-                            }),
-                        ))
-                        .children(crate::motion::probe(&self.fx, "sticky"))
+                        .children((!hold).then(|| {
+                            crate::sticky::layer(
+                                self.fx.clone(),
+                                cx.processor(move |this, b: Bounds<Pixels>, _, cx| {
+                                    this.in_drawn(id, |this| this.sticky_label(b, cx)).unwrap_or_default()
+                                }),
+                            )
+                        }))
+                        .children((!hold).then(|| crate::motion::probe(&self.fx, "sticky")).flatten())
                         .child(crate::scroll::owner(self.panes.cur.scroller.clone(), self.fx.clone()))
-                        .children(unpainted)
-                        .children(hint_frame)
+                        .children(unpainted.filter(|_| !hold))
+                        .children(hint_frame.filter(|_| !hold))
                         .children(landing)
-                        .children(hold_back)
-                        .children(rehint)
-                        .child(transcript_bar),
+                        .children(hold_back.filter(|_| !hold))
+                        .children(rehint.filter(|_| !hold))
+                        .children((!hold).then_some(transcript_bar)),
                 )
                 // The top of what is drawn over the composer (the stub, a
                 // notice, the chips), as laid out: the palette ends above it.
@@ -8285,6 +8347,9 @@ impl AppView {
             self.fx.spring_jump(PANE_FLIGHT, 0., f.travel, crate::motion::SHEET_RESPONSE);
         }
         let (d, moving) = self.fx.spring_px(PANE_FLIGHT, f.travel, crate::motion::SHEET_RESPONSE);
+        if let Some(t0) = crate::pane::FILM_LOG.get() {
+            eprintln!("FLIGHT {:.4} {d:.1} of {:.1}", self.fx.now().saturating_duration_since(*t0).as_secs_f64(), f.travel);
+        }
         if !moving {
             self.panes.flight = None;
             return self.panes.tree.clone();
@@ -8483,6 +8548,11 @@ impl Render for AppView {
         let focused = self.panes.focused;
         for id in self.panes.ids().into_iter().filter(|i| *i != focused) {
             self.in_pane(id, |v| v.pane_sync(window, cx));
+        }
+        // A drop whose edge was refused (a 5th pane): why, on the focused
+        // composer, once its tab is the composer's.
+        if let Some(why) = self.dnd.note.take() {
+            self.split_refused(why, cx);
         }
         // A reorder waits while a rail row is held (motion.md §6.4): a row
         // never moves away from a click. Its release draws.
@@ -8789,6 +8859,8 @@ impl Render for AppView {
         self.schedule_favs_save(cx);
         self.arm_watch_poll(cx);
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
+        let drop_layer = self.render_drop_layer(&p, cx);
+        let main = main.debug_selector(|| "pane-centre".into());
         h_flex()
             .id("root")
             .track_focus(&self.focus)
@@ -8846,6 +8918,12 @@ impl Render for AppView {
             // Esc closes the picker, wherever the focus is; in find it clears
             // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                // Esc while a tab or a row is dragged: the drag ends, and
+                // nothing drops (split.md §3); nothing else hears it.
+                if ev.keystroke.key == "escape" && this.cancel_drag(window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
                 this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
                 // Ctrl+J: to the card, wherever the focus is (polish.md §2.6),
@@ -9077,6 +9155,8 @@ impl Render for AppView {
                 if !(ev.modifiers.control || ev.modifiers.platform) {
                     this.tab_key_up(cx);
                 }
+                // Mid-drag, Ctrl (Alt) changes the drop: its preview too.
+                this.drag_modifiers(ev.modifiers, cx);
             }))
             .relative()
             .size_full()
@@ -9094,6 +9174,8 @@ impl Render for AppView {
             )
             .children(self.render_edge(true, rail, rail_w, &p, cx))
             .children((view.is_none() || self.panes.split()).then(|| self.render_edge(false, right, right_w, &p, cx)).flatten())
+            // Drag and drop's targets and preview (split panes step 4).
+            .children(drop_layer)
             .when(self.picker_open, |d| {
                 d.child(deferred(self.render_picker(&p, if view.is_some() { Side::Open(0.) } else { right }, cx)).with_priority(1))
                     .child(deferred(self.bars.picker.bar(crate::scrollbar::Ground::Chrome)).with_priority(1))

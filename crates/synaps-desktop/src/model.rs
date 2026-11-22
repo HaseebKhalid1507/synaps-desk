@@ -915,7 +915,7 @@ impl Model {
     }
 
     /// A live session's journal, to resume if it ended since the last list.
-    fn journal_of(&self, session_id: &str) -> Option<ResumeRequest> {
+    pub(crate) fn journal_of(&self, session_id: &str) -> Option<ResumeRequest> {
         let s = self.sessions.iter().find(|s| s.id == session_id)?;
         let name = s.name.clone().filter(|n| !n.is_empty())?;
         let target = if s.journal_id.is_empty() { s.id.clone() } else { s.journal_id.clone() };
@@ -1073,19 +1073,29 @@ impl Model {
         effects.push(Effect::Resume { req, open: true, place });
     }
 
-    /// `Effect::Attach` went out as `attach_seq`.
+    /// `Effect::Attach` went out as `attach_seq`. Its fallback takes the
+    /// slot unless another store's attach in flight holds it (split panes,
+    /// Shady #48 L1: that pane's journal fallback stays; the slot is one,
+    /// so this attach then goes without one).
     pub fn attaching(&mut self, live: LiveId, attach_seq: u64, fallback: Option<ResumeRequest>, open: bool) {
         self.sent_open(attach_seq, open);
         self.want(live, attach_seq);
-        self.named.attaching = fallback.map(|f| (attach_seq, f));
+        let theirs = self.attaches_of_others(live);
+        if self.named.attaching.as_ref().is_none_or(|(s, _)| !theirs.contains(s)) {
+            self.named.attaching = fallback.map(|f| (attach_seq, f));
+        }
     }
 
-    /// `Effect::Resume` went out as `attach_seq`.
+    /// `Effect::Resume` went out as `attach_seq`: as [`Model::attaching`],
+    /// another store's resume in flight keeps the slot.
     pub fn resuming(&mut self, live: LiveId, req: ResumeRequest, attach_seq: u64, open: bool) {
         self.sent_open(attach_seq, open);
         self.want(live, attach_seq);
-        self.named.error = None;
-        self.named.resuming = Some(Resuming { req, attach_seq });
+        let theirs = self.attaches_of_others(live);
+        if self.named.resuming.as_ref().is_none_or(|r| !theirs.contains(&r.attach_seq)) {
+            self.named.error = None;
+            self.named.resuming = Some(Resuming { req, attach_seq });
+        }
     }
 
     fn sent_open(&mut self, attach_seq: u64, open: bool) {
@@ -1161,13 +1171,30 @@ impl Model {
         l.wanted_session = None;
         l.wanted_fact = None;
         self.rail_gen += 1;
+        // Another store's attach in flight is that pane's (Shady #44 n11).
+        let theirs = self.attaches_of_others(live);
         let n = &mut self.named;
-        n.resuming.take_if(|r| r.attach_seq != attach_seq);
-        n.attaching.take_if(|(s, _)| *s != attach_seq);
-        n.opening.take_if(|o| o.attach_seq != Some(attach_seq));
+        n.resuming.take_if(|r| r.attach_seq != attach_seq && !theirs.contains(&r.attach_seq));
+        n.attaching.take_if(|(s, _)| *s != attach_seq && !theirs.contains(s));
+        n.opening.take_if(|o| o.attach_seq != Some(attach_seq) && !o.attach_seq.is_some_and(|s| theirs.contains(&s)));
         n.naming = false;
         n.replace = None;
         n.rename_error = None;
+    }
+
+    /// The attachments the stores other than `live` asked for or hold: a
+    /// resume, a fallback attach or an Open by name sent as one of those is
+    /// that store's pane's, and nothing `live` does cancels it (split
+    /// panes, Shady #44 n11: a Join, a close or a move in one pane left the
+    /// other pane's by-name open in flight forgotten).
+    fn attaches_of_others(&self, live: LiveId) -> Vec<u64> {
+        self.lives
+            .ids()
+            .into_iter()
+            .filter(|&id| id != live)
+            .flat_map(|id| [self.lives[id].wanted, self.lives[id].held])
+            .flatten()
+            .collect()
     }
 
     /// The attach just asked for (after [`Model::want`]) is of this session.
@@ -1197,6 +1224,7 @@ impl Model {
     /// card, no HALT can reach the session left or the one to come.
     pub fn switch_out(&mut self, live: LiveId) -> (Transcript, Stats) {
         self.saw_active(live);
+        let theirs = self.attaches_of_others(live);
         let l = &mut self.lives[live];
         l.wanted = None;
         l.wanted_session = None;
@@ -1219,10 +1247,11 @@ impl Model {
         n.naming = false;
         n.replace = None;
         n.rename_error = None;
-        // A resume or an attach in flight was the attachment left's.
-        n.resuming = None;
-        n.attaching = None;
-        n.opening.take_if(|o| o.attach_seq.is_some());
+        // A resume or an attach in flight was the attachment left's, unless
+        // another store's (another pane's) asked for it.
+        n.resuming.take_if(|r| !theirs.contains(&r.attach_seq));
+        n.attaching.take_if(|(s, _)| !theirs.contains(s));
+        n.opening.take_if(|o| o.attach_seq.is_some_and(|s| !theirs.contains(&s)));
         self.rail_gen += 1;
         self.view_dirty = true;
         // Its worker views go with it (the view takes them); nothing polls.
@@ -2002,6 +2031,37 @@ mod tests {
         m.named.opening = Some(opening(None));
         let _ = m.switch_out(LiveId::FIRST);
         assert!(m.named.opening.is_some(), "not sent yet: still to open");
+    }
+
+    /// Shady #44 n11: a store leaving its session (a Join, a pane's close, a
+    /// tab moved out) drops only its own attachment's resume, fallback
+    /// attach and Open by name: another pane's, in flight, stays; and a new
+    /// attach asked in one pane leaves the other pane's alone too.
+    #[test]
+    fn leaving_a_tab_keeps_another_panes_open_by_name_in_flight() {
+        let req = |t: &str| ResumeRequest { label: t.into(), target: t.into(), cwd: None, by_name: true };
+        let mut m = Model::new(ConnState::Connecting);
+        attach(&mut m, 1);
+        let other = m.lives.add();
+        m.named.opening = Some(Opening { name: "notes".into(), attach_seq: None, asked_saved: true, place: Place::Current });
+        m.resuming(other, req("notes"), 2, true);
+        m.named.attaching = Some((2, req("notes")));
+        let _ = m.switch_out(LiveId::FIRST);
+        assert_eq!(m.named.resuming.as_ref().map(|r| r.attach_seq), Some(2), "the other pane's resume");
+        assert_eq!(m.named.attaching.as_ref().map(|a| a.0), Some(2), "the other pane's fallback attach");
+        assert_eq!(m.named.opening.as_ref().and_then(|o| o.attach_seq), Some(2), "the other pane's Open by name");
+        // Through the attach path every pane's attach takes (Shady #48 L1).
+        m.attaching(LiveId::FIRST, 3, None, false);
+        assert_eq!(m.named.attaching.as_ref().map(|a| a.0), Some(2), "a plain attach in this pane leaves the other's fallback");
+        m.attaching(LiveId::FIRST, 4, Some(req("todo")), false);
+        assert_eq!(m.named.attaching.as_ref().map(|a| a.0), Some(2), "and so does one with its own fallback");
+        m.resuming(LiveId::FIRST, req("todo"), 5, false);
+        assert!(
+            m.named.resuming.as_ref().is_some_and(|r| r.attach_seq == 2) && m.named.opening.is_some(),
+            "a resume in this pane leaves the other's resume and Open by name"
+        );
+        let _ = m.switch_out(other);
+        assert!(m.named.resuming.is_none() && m.named.attaching.is_none() && m.named.opening.is_none(), "its own pane's leave drops them");
     }
 
     #[test]

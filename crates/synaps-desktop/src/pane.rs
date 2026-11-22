@@ -70,6 +70,10 @@ impl PaneId {
     }
 }
 
+/// A dropped row's new pane gets its rows this far (px) from landing
+/// ([`Pane::hold_rows`]).
+pub(crate) const HOLD_UNTIL: f32 = 16.;
+
 /// One editor group: the list on screen and everything drawn around it.
 pub struct Pane {
     pub(crate) id: PaneId,
@@ -249,6 +253,20 @@ pub struct Pane {
     pub(crate) worker_columns: Vec<((String, u64), Column)>,
     /// The next sync builds every row again (a worker's view came on).
     pub(crate) full_rebuild: bool,
+    /// Its rows wait for its split to land (finish gate #48 F2): a rail
+    /// row dropped on an edge opens a session no pane has drawn, and its
+    /// rows' first layout (text no frame has shaped) would cut the
+    /// opening of the `sheet` flight; it flies in with its tab strip and
+    /// composer, its rows in its last [`HOLD_UNTIL`] px. Nothing drawn
+    /// from its rows shows meanwhile (the sticky label, the bar), and its
+    /// card is not on screen (Shady #48 r2 L1: it arms from its first frame).
+    pub(crate) hold_rows: bool,
+    /// When its held rows came in: they lift 70 → 100 % on `quick`
+    /// (fluid.md §3.6; finish gate #48 r2 N2), inside the flight's tail.
+    pub(crate) rows_in: Option<Instant>,
+    /// Tests: the strength its rows' column was drawn at, last frame.
+    #[cfg(test)]
+    pub(crate) drawn_k: std::cell::Cell<f32>,
     /// The authorization card's prompt (see [`PromptCard`]).
     pub(crate) card: Option<PromptCard>,
     /// Its keys were live at the last frame ([`AppView::card_keys_live`]):
@@ -481,6 +499,10 @@ impl Pane {
             pending: None,
             worker_columns: Vec::new(),
             full_rebuild: false,
+            hold_rows: false,
+            rows_in: None,
+            #[cfg(test)]
+            drawn_k: std::cell::Cell::new(1.),
             card: None,
             keys_live: false,
             chord: CardChord::default(),
@@ -607,9 +629,9 @@ impl Panes {
         let flight = match (drawn.split_as(at, side, new), to.split_as(at, side, new)) {
             (Some(from), Some(to)) if from.same_shape(&to) => {
                 grow.push(new);
-                Flight { from: from.grown_from(new), to, grow, ghosts, travel: 0., wrap, wrap_at: None }
+                Flight { from: from.grown_beside(new, Some(at)), to, grow, ghosts, travel: 0., wrap, wrap_at: None }
             }
-            _ => Flight::new(tree.grown_from(new), tree.clone(), vec![new], Vec::new()),
+            _ => Flight::new(tree.grown_beside(new, Some(at)), tree.clone(), vec![new], Vec::new()),
         };
         self.drawn = flight.from.clone();
         self.flight = Some(flight);
@@ -1062,11 +1084,28 @@ impl crate::app::AppView {
     /// store: one attachment), focused, an empty composer, following the
     /// tail. Refused with the reason on the composer's status line.
     pub(crate) fn split_pane(&mut self, side: Option<crate::split::Side>, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::split::Refused;
         if !self.split_on() {
             return;
         }
-        let at = self.panes.focused;
+        // The focused pane's current session tab (a view's too: the
+        // session tab behind it), on its store; none: an empty pane.
+        let session = self.model.tabs.current().and_then(|t| Some((t.session.clone()?, t.label.clone())));
+        self.split_at(self.panes.focused, side, session, window, cx);
+    }
+
+    /// Split pane `at` (`side`: none, right or else down, as Ctrl+\), the
+    /// new pane focused with a tab of `session` (none: today's empty
+    /// pane); refused, the reason on the focused composer's status line.
+    /// The new pane, if it split.
+    pub(crate) fn split_at(
+        &mut self,
+        at: PaneId,
+        side: Option<crate::split::Side>,
+        session: Option<(String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<PaneId> {
+        use crate::split::Refused;
         let new = self.panes.free_id();
         let area = self.centre.get();
         let next = match new {
@@ -1080,20 +1119,18 @@ impl crate::app::AppView {
             (Ok(t), Some(n)) => (t, n),
             (Err(r), _) => {
                 self.split_refused(r.note(), cx);
-                return;
+                return None;
             }
             (Ok(_), None) => {
                 self.split_refused(Refused::Most.note(), cx);
-                return;
+                return None;
             }
         };
-        // The focused pane's current session tab (a view's too: the
-        // session tab behind it), on its store; none: an empty pane.
-        let session = self.model.tabs.current().and_then(|t| Some((t.session.clone()?, t.label.clone())));
-        let live = match &session {
-            Some((s, _)) if self.model.lives[self.panes.cur.live].is_active(s) || self.model.lives[self.panes.cur.live].is_wanted(s) => {
-                self.panes.cur.live
-            }
+        // On `at`'s store if it has the session (one attachment, two
+        // lists), else a fresh one (its reconcile shows the session from a
+        // store another pane has it on: `repoint`).
+        let live = match (&session, self.panes.get(at).map(|p| p.live)) {
+            (Some((s, _)), Some(l)) if self.model.lives[l].is_active(s) || self.model.lives[l].is_wanted(s) => l,
             _ => self.fresh_live(),
         };
         let (composer, secret, allow_all, subs) = Self::pane_inputs(new, window, cx);
@@ -1118,6 +1155,7 @@ impl crate::app::AppView {
             self.reconcile(None);
         }
         self.focus_composer(cx);
+        Some(new)
     }
 
     /// Why a split of the focused pane (`side` as [`Self::split_pane`]'s)
@@ -1304,7 +1342,7 @@ impl crate::app::AppView {
     /// (Shady #44 M2): the composer's text if it types for that tab (it
     /// leaves with it: the composer types for no tab until its next frame
     /// shows another's), else the one kept for it.
-    fn take_draft(&mut self, tab: u64, key: &str, cx: &Context<Self>) -> Option<(String, crate::tabs::Draft)> {
+    pub(crate) fn take_draft(&mut self, tab: u64, key: &str, cx: &Context<Self>) -> Option<(String, crate::tabs::Draft)> {
         if let Some((_, owner)) = self.panes.cur.composer_of.clone().filter(|(i, _)| *i == tab) {
             let c = self.panes.cur.composer.read(cx);
             let d = crate::tabs::Draft { text: c.value().to_string(), cursor: c.cursor(), note: self.panes.cur.draft_note };
@@ -1317,7 +1355,7 @@ impl crate::app::AppView {
     /// A draft that came with its tab (Shady #44 M2) into the pane acted
     /// on: ahead of what its composer holds if that types for the same
     /// session already, else kept for the tab until it is shown.
-    fn give_draft(&mut self, key: &str, d: crate::tabs::Draft) {
+    pub(crate) fn give_draft(&mut self, key: &str, d: crate::tabs::Draft) {
         let shown = self.panes.cur.composer_of.as_ref().is_some_and(|(_, k)| k.as_deref() == Some(key))
             && self.model.tabs.composer_tab().is_some_and(|(_, k)| k == Some(key));
         if shown {
@@ -1396,7 +1434,7 @@ impl crate::app::AppView {
 
     /// A split refused: the reason on the focused composer's status line
     /// for 2.4 s (split.md §2), no toast.
-    fn split_refused(&mut self, why: &'static str, cx: &mut Context<Self>) {
+    pub(crate) fn split_refused(&mut self, why: &'static str, cx: &mut Context<Self>) {
         let id = self.panes.cur.id;
         self.panes.cur.watch_note = Some(why.into());
         self.panes.cur.halt_tick = None;
@@ -1659,6 +1697,294 @@ async fn film3b(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowCont
     mark("done");
 }
 
+/// The film logs each split or close flight frame (`FLIGHT`): its travel
+/// drawn, for the per-frame evidence beside the capture.
+pub(crate) static FILM_LOG: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Step 4's film (`SYNAPS_DESK_PANES=film4`): drags by real pointer
+/// input through GPUI (`Window::dispatch_event`, as the platform's events
+/// come). A second tab dragged over its pane's left, right, bottom bands
+/// and centre (the preview gliding), dropped on the right (a split); then
+/// the new pane's tab over the first pane's top band and Esc (nothing
+/// drops); then onto its centre (it moves back, its pane closes); then a
+/// rail row to the bottom (a split down that opens it).
+async fn film4(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, t0: Instant, four: bool) {
+    // Every frame's timing, on the marks' clock, at the end (`FRAME`).
+    gpui_kit::profiler::set_trace_enabled(true);
+    let mut frames = gpui_kit::profiler::FrameTimingCollector::new();
+    let _ = FILM_LOG.set(t0);
+    film4_scene(view, cx, ex, t0, four).await;
+    for f in frames.collect_unseen() {
+        let at = |i: Instant| i.checked_duration_since(t0).map_or(-1., |d| d.as_secs_f64());
+        match f {
+            gpui_kit::profiler::FrameEvent::Draw(d) => eprintln!(
+                "FRAME draw {:.4} {:.2} layout {:.2} prepaint {:.2} paint {:.2}",
+                at(d.draw_start),
+                d.draw_duration().as_secs_f64() * 1e3,
+                d.phases.request_layout.as_secs_f64() * 1e3,
+                d.phases.prepaint.as_secs_f64() * 1e3,
+                d.phases.paint.as_secs_f64() * 1e3
+            ),
+            gpui_kit::profiler::FrameEvent::Present(p) => eprintln!("FRAME present {:.4}", at(p.present_end)),
+        }
+    }
+}
+
+async fn film4_scene(
+    view: &WeakEntity<crate::app::AppView>,
+    cx: &mut AsyncWindowContext,
+    ex: &BackgroundExecutor,
+    t0: Instant,
+    four: bool,
+) {
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Point, point};
+    let mark = |what: &str| eprintln!("PANES {what} {:.3}", t0.elapsed().as_secs_f64());
+    let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
+    // Through the window, as the platform's come: never inside the view's
+    // own update (its listeners update it).
+    let input = |cx: &mut AsyncWindowContext, ev: PlatformInput| {
+        let _ = cx.update(|window, cx| {
+            window.dispatch_event(ev, cx);
+        });
+    };
+    let m = Modifiers::default();
+    let held = |at: Point<gpui_kit::Pixels>| {
+        PlatformInput::MouseMove(MouseMoveEvent { position: at, pressed_button: Some(MouseButton::Left), modifiers: m })
+    };
+    // A glide of the pointer from `a` to `b` over `s` seconds at 60 Hz.
+    async fn path(
+        cx: &mut AsyncWindowContext,
+        ex: &BackgroundExecutor,
+        input: &dyn Fn(&mut AsyncWindowContext, PlatformInput),
+        a: Point<gpui_kit::Pixels>,
+        b: Point<gpui_kit::Pixels>,
+        s: f64,
+    ) {
+        let n = ((s * 60.) as usize).max(1);
+        for i in 1..=n {
+            let k = 1. - (1. - i as f32 / n as f32).powi(3);
+            let at = point(a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k);
+            input(
+                cx,
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: at,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                }),
+            );
+            ex.timer(std::time::Duration::from_millis(16)).await;
+        }
+    }
+    // Pane `id`'s body at (fx, fy) of it, in the window's px.
+    let body = |cx: &mut AsyncWindowContext, id: Option<PaneId>, fx: f32, fy: f32| -> Point<gpui_kit::Pixels> {
+        view.update(cx, |v, _| {
+            let (w, h) = v.centre.get();
+            let (x0, y0) = v.centre_at.get();
+            let all = crate::split::Rect { x: 0., y: 0., w, h };
+            let id = id.unwrap_or(v.panes.focused);
+            let r = if v.panes.shown_split() {
+                v.panes.tree.rects(all).into_iter().find(|(i, _)| *i == id).map_or(all, |(_, r)| r)
+            } else {
+                all
+            };
+            let strip = crate::tabstrip::TAB_H;
+            point(px(x0 + r.x + fx * r.w), px(y0 + r.y + strip + fy * (r.h - strip)))
+        })
+        .unwrap_or_default()
+    };
+    // Tab `ix` of pane `id`'s strip (each tab at most `TAB_MAX` wide).
+    let tab = |cx: &mut AsyncWindowContext, id: PaneId, ix: usize| -> Point<gpui_kit::Pixels> {
+        view.update(cx, |v, _| {
+            let at = v.panes.get(id).map(|p| p.strip_at.get()).unwrap_or_default();
+            let w = v.panes.get(id).map_or(0., |p| p.rect.get().w);
+            let n = if id == v.panes.cur.id { v.model.tabs.len() } else { v.panes.get(id).map_or(1, |p| p.parked.tabs.len()) };
+            let tw = (w / n.max(1) as f32).min(crate::tabstrip::TAB_MAX).floor();
+            point(at.x + px(tw * (ix as f32 + 0.5)), at.y + px(crate::tabstrip::TAB_H / 2.))
+        })
+        .unwrap_or_default()
+    };
+    let first = view.update(cx, |v, _| v.panes.focused).unwrap_or(PaneId::FIRST);
+    mark("open-idle");
+    let _ = view.update(cx, |v, cx| {
+        v.open_tab(
+            crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false },
+            crate::tabs::Place::New,
+        );
+        cx.notify();
+    });
+    sleep(1.2).await;
+    // `film4b`: four panes, the tab over another pane's right edge (a 5th
+    // is refused: OPEN HERE, and why, on the preview), dropped there.
+    if four {
+        for step in shape(4) {
+            let _ = view.update_in(cx, |v, w, cx| {
+                if let Some(i) = step.0 {
+                    v.focus_nth(i, cx);
+                }
+                v.split_pane(step.1, w, cx);
+                cx.notify();
+            });
+            sleep(0.5).await;
+        }
+        let _ = view.update(cx, |v, cx| {
+            v.focus_pane(first, KeysTo::Pane, cx);
+            cx.notify();
+        });
+        sleep(1.0).await;
+        let other = view.update(cx, |v, _| v.reading_order().into_iter().find(|&i| i != first)).ok().flatten().unwrap_or(first);
+        mark("drag-four");
+        let from = tab(cx, first, 1);
+        input(cx, PlatformInput::MouseMove(MouseMoveEvent { position: from, pressed_button: None, modifiers: m }));
+        input(
+            cx,
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: from,
+                modifiers: m,
+                click_count: 1,
+                first_mouse: false,
+            }),
+        );
+        let start = point(from.x + px(10.), from.y + px(8.));
+        input(cx, held(start));
+        sleep(0.1).await;
+        let edge = body(cx, Some(other), 0.95, 0.5);
+        path(cx, ex, &input, start, edge, 0.5).await;
+        mark("refused-edge");
+        sleep(1.5).await;
+        mark("drop-four");
+        input(cx, PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position: edge, modifiers: m, click_count: 1 }));
+        sleep(3.0).await;
+        mark("done");
+        return;
+    }
+    // A tab over the bands, then dropped on the right.
+    mark("drag-tab");
+    let from = tab(cx, first, 1);
+    input(cx, PlatformInput::MouseMove(MouseMoveEvent { position: from, pressed_button: None, modifiers: m }));
+    input(
+        cx,
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: from,
+            modifiers: m,
+            click_count: 1,
+            first_mouse: false,
+        }),
+    );
+    let start = point(from.x + px(10.), from.y + px(8.));
+    input(cx, held(start));
+    sleep(0.1).await;
+    let mut at = start;
+    for (fx, fy, name) in [(0.08, 0.5, "left"), (0.92, 0.5, "right"), (0.5, 0.93, "bottom"), (0.5, 0.5, "centre"), (0.92, 0.45, "right")] {
+        let to = body(cx, Some(first), fx, fy);
+        path(cx, ex, &input, at, to, 0.35).await;
+        at = to;
+        mark(name);
+        sleep(0.9).await;
+    }
+    mark("drop-right");
+    input(cx, PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position: at, modifiers: m, click_count: 1 }));
+    sleep(1.8).await;
+    // The new pane's tab over the first pane's top band, then Esc.
+    let new = view.update(cx, |v, _| v.panes.focused).unwrap_or(first);
+    mark("drag-back");
+    let from = tab(cx, new, 0);
+    input(cx, PlatformInput::MouseMove(MouseMoveEvent { position: from, pressed_button: None, modifiers: m }));
+    input(
+        cx,
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: from,
+            modifiers: m,
+            click_count: 1,
+            first_mouse: false,
+        }),
+    );
+    let start = point(from.x - px(10.), from.y + px(8.));
+    input(cx, held(start));
+    sleep(0.1).await;
+    let top = body(cx, Some(first), 0.5, 0.08);
+    path(cx, ex, &input, start, top, 0.4).await;
+    sleep(0.9).await;
+    mark("esc");
+    for ev in [
+        PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
+            keystroke: gpui_kit::Keystroke::parse("escape").expect("a key"),
+            is_held: false,
+            prefer_character_input: false,
+        }),
+        PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke: gpui_kit::Keystroke::parse("escape").expect("a key") }),
+    ] {
+        input(cx, ev);
+    }
+    input(cx, PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position: top, modifiers: m, click_count: 1 }));
+    sleep(1.2).await;
+    // Again, onto its centre: it moves back, its pane closes.
+    mark("drag-centre");
+    let from = tab(cx, new, 0);
+    input(cx, PlatformInput::MouseMove(MouseMoveEvent { position: from, pressed_button: None, modifiers: m }));
+    input(
+        cx,
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: from,
+            modifiers: m,
+            click_count: 1,
+            first_mouse: false,
+        }),
+    );
+    let start = point(from.x - px(10.), from.y + px(8.));
+    input(cx, held(start));
+    sleep(0.1).await;
+    let mid = body(cx, Some(first), 0.5, 0.5);
+    path(cx, ex, &input, start, mid, 0.45).await;
+    sleep(0.9).await;
+    mark("drop-centre");
+    input(cx, PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position: mid, modifiers: m, click_count: 1 }));
+    sleep(1.8).await;
+    // A rail row (the first other session's) to the bottom: a split down.
+    let row = view
+        .update(cx, |v, _| {
+            let shown = v.model.tabs.current_session().map(str::to_string);
+            let rail = &v.rail.rail;
+            rail.items.iter().enumerate().find_map(|(ix, it)| {
+                let key = crate::chrome::row_key(rail, it)?;
+                let r = rail.rows.iter().find(|r| r.key == key)?;
+                let other = !matches!(&r.action, crate::named::RowAction::Attach(s) if Some(s) == shown.as_ref());
+                let b = v.rail_list.bounds_for_item(ix)?;
+                other.then_some((b.left(), b.top()))
+            })
+        })
+        .ok()
+        .flatten();
+    if let Some((x, y)) = row {
+        mark("drag-row");
+        let from = point(x + px(120.), y + px(20.));
+        input(cx, PlatformInput::MouseMove(MouseMoveEvent { position: from, pressed_button: None, modifiers: m }));
+        input(
+            cx,
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: from,
+                modifiers: m,
+                click_count: 1,
+                first_mouse: false,
+            }),
+        );
+        let start = point(from.x + px(10.), from.y + px(6.));
+        input(cx, held(start));
+        sleep(0.1).await;
+        let low = body(cx, Some(first), 0.5, 0.9);
+        path(cx, ex, &input, start, low, 0.5).await;
+        sleep(0.9).await;
+        mark("drop-row");
+        input(cx, PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position: low, modifiers: m, click_count: 1 }));
+    }
+    sleep(2.0).await;
+    mark("done");
+}
+
 /// [`pane_script`]'s `film3b2` scene (split.md §2, §5, §7, §8, §9).
 async fn film3b2(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, t0: Instant) {
     let mark = |what: &str| eprintln!("PANES {what} {:.3}", t0.elapsed().as_secs_f64());
@@ -1761,6 +2087,11 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
             if how == "film3b2" {
                 sleep(5.0).await;
                 film3b2(&view, cx, &ex, t0).await;
+                return;
+            }
+            if how == "film4" || how == "film4b" {
+                sleep(5.0).await;
+                film4(&view, cx, &ex, t0, how == "film4b").await;
                 return;
             }
             if how == "filmarrive" {
