@@ -4033,6 +4033,48 @@ fn a_ride_whose_ends_move_hands_the_layout_back(cx: &mut TestAppContext) {
     assert!(fails.is_empty(), "{fails:#?}");
 }
 
+/// Shady #54 L1: at 125 % a panel that a layout rides lands in the frame
+/// it is drawn at its target, as at 100 %, with a target off the device
+/// grid (the right panel at 481, snapped 480.8), and nothing moves after.
+#[gpui_kit::test]
+fn a_ride_lands_on_arrival_at_a_fractional_scale(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    VisualTestContext::from_window(window, cx).simulate_scale_factor_change(1.25);
+    panels_at(cx, &view, true, 480, 481);
+    frame(cx, window);
+    level(cx, crate::motion::Level::Full);
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    for _ in 0..60 {
+        frame_144(cx, window, &view);
+    }
+    let target = view.read_with(cx, |v, _| v.fx.snap(481.));
+    assert!((target - 481.).abs() > 0.01, "481 is off the device grid at 125 %: {target}");
+    let last = view.read_with(cx, |v, _| *v.reading_order().last().expect("a pane"));
+    view.update(cx, |v, cx| {
+        v.in_pane(last, |v| v.close_pane());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let mut seen = Vec::new();
+    let mut rest = 0;
+    while rest < 10 {
+        frame_144(cx, window, &view);
+        let s = view.read_with(cx, |v, _| (v.panel_fx.sides[1].shown, v.panel_fx.moving(), v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some())));
+        seen.push(s);
+        rest = if s.1 || s.2 || view.read_with(cx, |v, _| v.fx.pending().0) { 0 } else { rest + 1 };
+        assert!(seen.len() < 500, "never landed");
+    }
+    assert!(seen.iter().any(|s| s.2), "the close rides the right panel: {seen:?}");
+    // Drawn at its target (within half a pixel, as rounded) only once it
+    // has landed, and it stays where it landed.
+    let late: Vec<usize> = (0..seen.len()).filter(|&k| (seen[k].0 - target).abs() < 0.5 && seen[k].1).collect();
+    let first_rest = seen.iter().position(|s| !s.1).expect("it rests");
+    let after: Vec<f32> = seen[first_rest..].iter().map(|s| s.0).filter(|w| (w - seen[first_rest].0).abs() > 0.001).collect();
+    assert!(late.is_empty() && after.is_empty(), "lands in the frame it arrives: still moving at its target in frames {late:?}, moves after {after:?}; {seen:?}");
+}
+
 /// Design gate F5 (#44 r3): after Join lands, the pane kept's worker chips
 /// take their landed grid in the landing frame (one a line in a quarter of
 /// the centre, two in the whole): no chip slides after the panes stop.
