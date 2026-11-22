@@ -629,7 +629,7 @@ impl Panes {
         let flight = match (drawn.split_as(at, side, new), to.split_as(at, side, new)) {
             (Some(from), Some(to)) if from.same_shape(&to) => {
                 grow.push(new);
-                Flight { from: from.grown_beside(new, Some(at)), to, grow, ghosts, travel: 0., wrap, wrap_at: None }
+                Flight { from: from.grown_beside(new, Some(at)), to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None }
             }
             _ => Flight::new(tree.grown_beside(new, Some(at)), tree.clone(), vec![new], Vec::new()),
         };
@@ -645,7 +645,7 @@ impl Panes {
         ghosts.push(id);
         let to = to.zeroed(id);
         self.drawn = drawn.clone();
-        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None });
+        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None });
     }
 
     /// The layout's flight to `to` (split.md §10: an equalise, a detent),
@@ -659,11 +659,11 @@ impl Panes {
         let was = std::mem::replace(&mut self.tree, to.clone());
         let flight = if !ghosts.is_empty() && drawn.same_shape(&end) {
             let to = end.fitted(&to.rects(area), &ghosts);
-            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None }
+            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None }
         } else if ghosts.is_empty() && drawn.same_shape(&to) {
-            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None }
+            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None }
         } else {
-            Flight { from: was, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., wrap, wrap_at: None }
+            Flight { from: was, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., wrap, wrap_at: None, ride: None }
         };
         self.drawn = flight.from.clone();
         self.flight = Some(flight);

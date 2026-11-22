@@ -1196,6 +1196,8 @@ impl AppView {
             }
             let asked = self.fx.asks();
             let (w, moving) = self.fx.spring_px(PANEL_W[i], to, f.response);
+            // A layout riding it (#51): on whole pixels, as its panes are.
+            let w = if self.panes.flight.as_ref().is_some_and(|f| f.ride.is_some()) { w.round() } else { w };
             // Drawn at its target: landed, its spring at rest (no frame
             // and no timer for the settling it would draw nothing of).
             let landed = moving && w == self.fx.snap(to);

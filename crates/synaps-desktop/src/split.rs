@@ -86,12 +86,29 @@ pub(crate) struct Flight {
     /// (Shady #42 L2: set once, not the narrowest drawn so far, which crept
     /// frame by frame under a panel's flight); `None`: not yet (the wraps
     /// a flight carries on from are kept where narrower).
-    pub wrap_at: Option<f32>,
+    pub wrap_at: Option<(f32, f32)>,
+    /// A panel yielding on this flight (#51): the layout rides its spring.
+    pub ride: Option<Ride>,
+}
+
+/// A layout riding a yielding panel's spring (#51): its step is how far
+/// the centre has gone from where they start to where they land (each
+/// pane's width moving linearly between its ends, [`Node::lerp_px_from`]),
+/// and it lands with the panel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Ride {
+    /// The centre's width where they start, and where they land.
+    pub from: f32,
+    pub to: f32,
+    /// The frame it first drew the landed layout: the flight is over the
+    /// frame after (as a layout's own flight, which lands a frame or more
+    /// before its spring rests).
+    pub landed: Option<std::time::Instant>,
 }
 
 impl Flight {
     pub(crate) fn new(from: Node, to: Node, grow: Vec<PaneId>, ghosts: Vec<PaneId>) -> Self {
-        Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new(), wrap_at: None }
+        Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new(), wrap_at: None, ride: None }
     }
 
     /// Each pane's wrap (its narrowest width on the way), set from the
@@ -101,11 +118,20 @@ impl Flight {
     /// changes (a panel's flight starts or lands, a resize). A growing or
     /// closing pane keeps its landed or last box, as before.
     pub(crate) fn set_wraps(&mut self, area: Rect) {
-        if self.wrap_at == Some(area.w) {
+        self.set_wraps_at(area, area);
+    }
+
+    /// [`Flight::set_wraps`] from its ends each in its own centre: `from`
+    /// where the flight starts, `to` where it lands. A panel yielding on
+    /// this flight (#51) moves on its spring from its start, so the centre
+    /// and the ratios move together: a pane's width, the product of a
+    /// share and the centre moving the other way, is still least at an end.
+    pub(crate) fn set_wraps_at(&mut self, from: Rect, to: Rect) {
+        if self.wrap_at == Some((from.w, to.w)) {
             return;
         }
         let carried = self.wrap_at.is_none();
-        let ends = [self.from.rects(area), self.to.rects(area)];
+        let ends = [self.from.rects(from), self.to.rects(to)];
         for id in self.to.leaves() {
             if self.grow.contains(&id) || self.ghosts.contains(&id) {
                 continue;
@@ -119,7 +145,7 @@ impl Flight {
                 None => self.wrap.push((id, w)),
             }
         }
-        self.wrap_at = Some(area.w);
+        self.wrap_at = Some((from.w, to.w));
     }
 }
 
@@ -622,6 +648,49 @@ impl Node {
             {
                 let kids = kids.iter().zip(k2).map(|(k, f)| k.lerp_from(f, t)).collect();
                 let ratios = ratios.iter().zip(r2).map(|(to, fr)| fr + (to - fr) * t).collect();
+                Node::Split { axis: *axis, kids, ratios }
+            }
+            _ => self.clone(),
+        }
+    }
+
+    /// The layout's step at `t` with the centre moving under it (#51):
+    /// `from` laid out in `a` and this tree in `b`, every edge between
+    /// panes at its place there lerped in pixels and on a whole one, as
+    /// shares of the room each split is drawn in (`now`, `t` of the way
+    /// from `a` to `b`). Each pane's edges move linearly between their
+    /// ends, as the panel's does: a pane's width never goes past either.
+    pub(crate) fn lerp_px_from(&self, from: &Node, t: f32, a: Rect, b: Rect, now: Rect) -> Node {
+        if t >= 1. {
+            return self.clone();
+        }
+        match (self, from) {
+            (Node::Leaf(x), Node::Leaf(y)) if x == y => self.clone(),
+            (Node::Split { axis, kids, .. }, Node::Split { axis: a2, kids: k2, .. }) if axis == a2 && kids.len() == k2.len() => {
+                let (mut fa, mut tb) = (Vec::new(), Vec::new());
+                from.kid_rects(a, &mut fa);
+                self.kid_rects(b, &mut tb);
+                // A kid's far edge, from the split's start.
+                let row = *axis == Axis::Row;
+                let end = |r: &Rect| if row { r.x + r.w } else { r.y + r.h };
+                let (start, len) = if row { (now.x, now.w) } else { (now.y, now.h) };
+                let room = (len - DIVIDER * (kids.len() - 1) as f32).max(0.);
+                let mut at = 0f32;
+                let mut ratios = Vec::with_capacity(kids.len());
+                for i in 0..kids.len() {
+                    let e = if i + 1 == kids.len() {
+                        room
+                    } else {
+                        let (f, to) = (end(&fa[i]), end(&tb[i]));
+                        ((f + (to - f) * t).round() - start - DIVIDER * i as f32).clamp(at, room)
+                    };
+                    ratios.push(if room > 0. { (e - at) / room } else { 1. / kids.len() as f32 });
+                    at = e;
+                }
+                let step = Node::Split { axis: *axis, kids: kids.clone(), ratios: ratios.clone() };
+                let mut nk = Vec::new();
+                step.kid_rects(now, &mut nk);
+                let kids = kids.iter().enumerate().map(|(i, k)| k.lerp_px_from(&k2[i], t, fa[i], tb[i], nk[i])).collect();
                 Node::Split { axis: *axis, kids, ratios }
             }
             _ => self.clone(),
