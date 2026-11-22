@@ -4754,3 +4754,176 @@ fn widening_back_from_a_fold_rearms_the_card_it_shows(cx: &mut TestAppContext) {
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
+
+/// A session no list has: a saved tab of it never comes back.
+const GONE: &str = "20261121-050000-gone";
+
+/// The view with split panes on, on the fake daemon, nothing open, `layout`
+/// (or else `tabs`) to restore as a launch reads them (before its first
+/// frame); that frame drawn. The window, the view, the client, the
+/// daemon's attaches and the client's events.
+#[allow(clippy::type_complexity)]
+fn launch_with(
+    cx: &mut TestAppContext,
+    name: &str,
+    layout: Option<crate::theme::Layout>,
+    tabs: Option<crate::tabs::Saved>,
+) -> (AnyWindowHandle, Entity<AppView>, Client, mpsc::Receiver<Conn>, async_channel::Receiver<Event>) {
+    let (window, view) = open(cx);
+    let (path, attaches) = start(name);
+    let (client, events) = Client::spawn(ClientOptions::new(Endpoint::Socket(path), Identity::desktop())).expect("a client thread");
+    until(&events, "connected", |e| matches!(e, Event::Status(synaps_client::Status::Connected { .. })));
+    view.update(cx, |v, cx| {
+        v.app_settings.split = true;
+        v.client = Some(client.clone());
+        // Nothing open, as a launch on a daemon (not the demo's tab).
+        v.model.tabs = crate::tabs::Tabs::default();
+        v.reconcile(None);
+        v.restore_layout = layout;
+        v.restore_tabs = tabs;
+        cx.notify();
+    });
+    frame(cx, window);
+    (window, view, client, attaches, events)
+}
+
+/// A session list with `ids` live, into the view as the pump hands it.
+fn list(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>, ids: &[&str]) {
+    let metas: Vec<synaps_client::protocol::SessionMeta> =
+        ids.iter().map(|id| serde_json::from_value(json!({"id": id, "model": "m", "lifecycle": "live"})).expect("a session")).collect();
+    view.update(cx, |v, cx| v.apply_batch(vec![Event::Sessions(metas)], cx));
+    frame(cx, window);
+}
+
+fn saved(sessions: &[&str]) -> crate::tabs::Saved {
+    crate::tabs::Saved { sessions: sessions.iter().map(|s| s.to_string()).collect(), active: Some(0), ..Default::default() }
+}
+
+fn two_across(a: &[&str], b: &[&str], focused: usize) -> crate::theme::Layout {
+    crate::theme::Layout {
+        focused,
+        tree: crate::theme::LayoutNode::Split {
+            axis: crate::split::Axis::Row,
+            ratios: vec![0.3, 0.7],
+            kids: vec![crate::theme::LayoutNode::Pane(0), crate::theme::LayoutNode::Pane(1)],
+        },
+        panes: vec![saved(a), saved(b)],
+    }
+}
+
+/// Split panes step 5 (split/architecture.md §5, split.md §11): a saved
+/// layout of two panes, the focused one's session gone. The launch's first
+/// frame draws both panes where they were (no flight: #36 R1), focused as
+/// saved; their tabs wait OPENING from the first list, and the gone one's
+/// pane stays until the [`crate::tabs::RESTORE_LISTS`]th list, when its
+/// tab closes and the pane collapses, said in one notice, once; the focus
+/// goes to the pane left, its session attached.
+#[gpui_kit::test]
+fn a_restored_pane_whose_session_is_gone_collapses_after_the_lists_with_one_notice(cx: &mut TestAppContext) {
+    let (window, view, client, attaches, _events) = launch_with(cx, "persist-gone", Some(two_across(&[A], &[GONE], 1)), None);
+    let (ids, focused, flight, drawn_is_tree) =
+        view.read_with(cx, |v, _| (v.panes.ids(), v.panes.focused, v.panes.flight.is_some(), v.panes.drawn == v.panes.tree));
+    assert_eq!(ids.len(), 2, "two panes on the first frame");
+    assert!(!flight && drawn_is_tree, "drawn as the layout, no flight");
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    assert_eq!(focused, order[1], "focused as saved");
+    let (b0, b1) = (pane_box(cx, window, order[0]), pane_box(cx, window, order[1]));
+    assert!(b0[2] >= crate::split::PANE_MIN_W && b1[2] > b0[2], "their shares as saved, at least the minimum: {b0:?} {b1:?}");
+    for n in 1..=crate::tabs::RESTORE_LISTS {
+        list(cx, window, &view, &[A, B]);
+        let (len, notice) = view.read_with(cx, |v, _| (v.panes.len(), v.model.named.notice.clone()));
+        if n < crate::tabs::RESTORE_LISTS {
+            assert_eq!(len, 2, "list {n}: the pane still waits");
+            assert_eq!(tabs_of(cx, &view, order[1]), [GONE], "list {n}: its tab OPENING");
+            assert_eq!(notice, None, "list {n}: nothing said yet");
+        } else {
+            assert_eq!(len, 1, "list {n}: collapsed");
+            assert_eq!(notice.as_deref(), Some("1 saved tab closed: its session is no longer open (Ctrl+Shift+T reopens it)."));
+        }
+    }
+    view.update(cx, |v, _| v.model.named.notice = None);
+    list(cx, window, &view, &[A, B]);
+    assert_eq!(view.read_with(cx, |v, _| v.model.named.notice.clone()), None, "said once");
+    let (focused, tabs) =
+        view.read_with(cx, |v, _| (v.panes.focused, v.model.tabs.iter().filter_map(|t| t.session.clone()).collect::<Vec<_>>()));
+    assert_eq!((focused, tabs), (order[0], vec![A.to_string()]), "the pane left, focused");
+    let a = next_attach(cx, window, &attaches, "A's attach");
+    drop(a);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Split panes step 5 (architecture §5 ¶4): the same session saved in two
+/// panes restores as a tab in each on one store: one attachment.
+#[gpui_kit::test]
+fn the_same_session_in_two_restored_panes_is_on_one_live(cx: &mut TestAppContext) {
+    let (window, view, client, attaches, events) = launch_with(cx, "persist-twins", Some(two_across(&[A], &[A], 0)), None);
+    list(cx, window, &view, &[A, B]);
+    let mut a = next_attach(cx, window, &attaches, "A's attach");
+    a.send(attached(A, None));
+    feed(cx, window, &view, &events, "A attached", |v| v.model.lives.iter().any(|l| l.is_active(A)));
+    for _ in 0..10 {
+        cx.executor().advance_clock(Duration::from_millis(100));
+        frame(cx, window);
+    }
+    assert!(attaches.recv_timeout(Duration::from_millis(300)).is_err(), "no second attachment");
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    for id in &order {
+        assert_eq!(tabs_of(cx, &view, *id), [A], "a tab of A in each pane");
+    }
+    let lives: Vec<_> = view.read_with(cx, |v, _| order.iter().map(|id| v.panes.get(*id).unwrap().live).collect());
+    assert_eq!(lives[0], lives[1], "one store");
+    drop(a);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Split panes step 5 (architecture §5 ¶2): a first launch after the
+/// upgrade, the file with only `tabs.<key>`: one pane with every tab.
+#[gpui_kit::test]
+fn a_first_launch_with_only_the_tabs_gives_one_pane(cx: &mut TestAppContext) {
+    let (window, view, client, _attaches, _events) = launch_with(cx, "persist-first", None, Some(saved(&[A, B])));
+    list(cx, window, &view, &[A, B]);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "one pane");
+    let tabs = view.read_with(cx, |v, _| v.model.tabs.iter().filter_map(|t| t.session.clone()).collect::<Vec<_>>());
+    assert_eq!(tabs, [A, B], "every tab");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Split panes step 5 (architecture §5 ¶3): the layout is saved
+/// [`crate::app::SAVE_DELAY`] after a split (the generation moves), with
+/// `tabs.<key>` its union; a focus change is saved too; a change left
+/// unsaved is written by the quit's flush, and a launch on that file
+/// restores it.
+#[gpui_kit::test]
+fn the_layout_is_saved_after_a_change_and_on_quit(cx: &mut TestAppContext) {
+    let (window, view, client, mut a, _attaches, _events) = on_a(cx, "persist-save", None);
+    let k = format!("test:persist-save-{}", std::process::id());
+    let path = crate::theme::settings_path().expect("the tests' settings file");
+    view.update(cx, |v, _| v.tabs_key = Some(k.clone()));
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    let wait_save = |cx: &mut TestAppContext| {
+        cx.executor().advance_clock(crate::app::SAVE_DELAY + Duration::from_millis(50));
+        frame(cx, window);
+        cx.run_until_parked();
+    };
+    wait_save(cx);
+    let l = crate::theme::load_layout(&path, &k).expect("the layout saved");
+    assert_eq!(l.panes.len(), 2, "two panes");
+    assert_eq!(l.focused, 1, "the new one focused");
+    assert_eq!(crate::theme::load_tabs(&path, &k).map(|t| t.sessions), Some(vec![A.to_string()]), "the union");
+    key(cx, window, "f6");
+    wait_save(cx);
+    assert_eq!(crate::theme::load_layout(&path, &k).map(|l| l.focused), Some(0), "a focus change saved");
+    // Unsaved at quit: the flush writes it.
+    key(cx, window, "f6");
+    view.update(cx, |v, _| v.flush_tabs());
+    assert_eq!(crate::theme::load_layout(&path, &k).map(|l| l.focused), Some(1), "flushed on quit");
+    let _ = names(&mut a);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+    let (layout, tabs) = crate::theme::load_restore(&path, &k);
+    assert!(layout.is_some() && tabs.is_some(), "a launch reads it back");
+}
