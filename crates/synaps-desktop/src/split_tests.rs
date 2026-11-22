@@ -4023,7 +4023,10 @@ fn a_ride_whose_ends_move_hands_the_layout_back(cx: &mut TestAppContext) {
         cx.run_until_parked();
         frame_144(cx, window, &view);
         let new = view.read_with(cx, |v, _| v.panes.ids().into_iter().find(|i| !before.contains(i))).expect("a new pane");
-        assert!(view.read_with(cx, |v, _| v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some())), "{case}: the split rides the right panel");
+        assert!(
+            view.read_with(cx, |v, _| v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some())),
+            "{case}: the split rides the right panel"
+        );
         let mut widths = vec![drawn_w(cx, &view, new)];
         let mut rest = 0;
         for k in 1.. {
@@ -4088,7 +4091,9 @@ fn a_ride_lands_on_arrival_at_a_fractional_scale(cx: &mut TestAppContext) {
     let mut rest = 0;
     while rest < 10 {
         frame_144(cx, window, &view);
-        let s = view.read_with(cx, |v, _| (v.panel_fx.sides[1].shown, v.panel_fx.moving(), v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some())));
+        let s = view.read_with(cx, |v, _| {
+            (v.panel_fx.sides[1].shown, v.panel_fx.moving(), v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some()))
+        });
         seen.push(s);
         rest = if s.1 || s.2 || view.read_with(cx, |v, _| v.fx.pending().0) { 0 } else { rest + 1 };
         assert!(seen.len() < 500, "never landed");
@@ -4099,7 +4104,10 @@ fn a_ride_lands_on_arrival_at_a_fractional_scale(cx: &mut TestAppContext) {
     let late: Vec<usize> = (0..seen.len()).filter(|&k| (seen[k].0 - target).abs() < 0.5 && seen[k].1).collect();
     let first_rest = seen.iter().position(|s| !s.1).expect("it rests");
     let after: Vec<f32> = seen[first_rest..].iter().map(|s| s.0).filter(|w| (w - seen[first_rest].0).abs() > 0.001).collect();
-    assert!(late.is_empty() && after.is_empty(), "lands in the frame it arrives: still moving at its target in frames {late:?}, moves after {after:?}; {seen:?}");
+    assert!(
+        late.is_empty() && after.is_empty(),
+        "lands in the frame it arrives: still moving at its target in frames {late:?}, moves after {after:?}; {seen:?}"
+    );
 }
 
 /// Design gate F5 (#44 r3): after Join lands, the pane kept's worker chips
