@@ -8283,7 +8283,9 @@ impl AppView {
     /// manager's) and anything else not in flight stay a cut, as the
     /// panels' own widths do then. `was`: the yields of the frame before.
     /// Whether it flies on the layout's flight alone (the layout then
-    /// rides it: [`crate::split::Flight::ride`]).
+    /// rides it: [`crate::split::Flight::ride`]). A panel already flying
+    /// (Ctrl+B, then Ctrl+\ inside its flight) rides nothing: the layout
+    /// flies on its own spring over the moving centre, as before #51.
     fn yield_on_flight(&mut self, was: Option<(bool, bool, bool)>, resized: bool) -> bool {
         let panels = self.panel_fx.sides.iter().any(|f| f.from.is_some() || f.moving);
         if resized || !(panels || self.panes.flight.is_some()) {
@@ -8368,7 +8370,8 @@ impl AppView {
                 return self.panes.tree.clone();
             }
             // From rest where it is drawn (a flight taking over another's
-            // starts again from there). Riding a panel: at rest, landed.
+            // starts again from there). Riding a panel: parked at rest,
+            // landed; read only if the ride is handed back (Shady #54 M2).
             let from = if f.ride.is_some() { f.travel } else { 0. };
             self.fx.spring_jump(PANE_FLIGHT, from, f.travel, crate::motion::SHEET_RESPONSE);
         }
@@ -8846,7 +8849,7 @@ impl Render for AppView {
             let at = |w: f32| self.panes.tree.rects(area(w));
             let (rects_to, rects_wrap) = (at(pane_to), at(wrap));
             // A panel yielding on the layout's flight (#51): its own ends.
-            let with_panes = self.panes.flight.as_ref().and_then(|f| f.ride).map(|r| r.from);
+            let ride_from = self.panes.flight.as_ref().and_then(|f| f.ride).map(|r| r.from);
             let (grow, ghosts) = self.panes.flight.as_ref().map_or((Vec::new(), Vec::new()), |f| (f.grow.clone(), f.ghosts.clone()));
             // The tree itself drawn (the pixel landing, before the spring
             // rests): each column at its landed wrap in this frame, the
@@ -8856,7 +8859,7 @@ impl Render for AppView {
             // Each pane's wrap in the flight, from its ends at the panels'
             // narrowest centre (Shady #42 L2).
             if let Some(f) = self.panes.flight.as_mut() {
-                match with_panes {
+                match ride_from {
                     Some(from) => f.set_wraps_at(area(from), area(pane_to)),
                     None => f.set_wraps(area(wrap)),
                 }
@@ -8896,7 +8899,7 @@ impl Render for AppView {
                         r.w.min(l.w)
                     }
                 });
-                let pane = match (grows, with_panes) {
+                let pane = match (grows, ride_from) {
                     (true, Some(_)) => of(&rects_to),
                     (true, None) => l.w,
                     _ => r.w,
@@ -8910,7 +8913,7 @@ impl Render for AppView {
                     // frame's box (it would rewrap as that moved). With a
                     // panel yielding on it, its narrower end (#51): it
                     // moves linearly between them.
-                    wrap: match with_panes {
+                    wrap: match ride_from {
                         Some(_) => of(&rects_to).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY)),
                         None => of(&rects_wrap).min(narrowest.filter(|_| !grows && !landed).unwrap_or(pane)),
                     },

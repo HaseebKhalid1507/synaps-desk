@@ -3838,12 +3838,14 @@ fn a_yielding_panel_flies_with_the_move_that_made_it(cx: &mut TestAppContext) {
     let same =
         |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.01 || (a.is_nan() && b.is_nan()));
     let edges = |s: &Snap| -> Vec<f32> { s.0.iter().copied().chain(s.1.iter().flat_map(|(_, b, _)| *b)).collect() };
-    // A sheet spring's top step at 144 Hz, as a share of its travel.
-    let top = std::f32::consts::TAU / crate::motion::SHEET_RESPONSE * 0.006944 / std::f32::consts::E;
     let mut fails = Vec::new();
     let mut yields = 0;
     for case in ["the split", "the rail folds", "the rail unfolds", "the close"] {
         let mut seen = vec![snap(cx)];
+        // Each frame's own instant, what its springs sampled: the test's
+        // clock, or a timer's due instant when it woke the frame a hair
+        // ahead of it (`Motion::tick`).
+        let mut at = vec![view.read_with(cx, |v, _| v.fx.frame_now())];
         let right_was = view.read_with(cx, |v, _| v.panel_fx.sides[1].shown);
         match case {
             "the split" => key(cx, window, "ctrl-\\"),
@@ -3859,6 +3861,7 @@ fn a_yielding_panel_flies_with_the_move_that_made_it(cx: &mut TestAppContext) {
         while rest < 10 {
             frame_144(cx, window, &view);
             seen.push(snap(cx));
+            at.push(view.read_with(cx, |v, _| v.fx.frame_now()));
             let busy = view.read_with(cx, |v, _| v.panel_fx.moving() || v.panes.flight.is_some() || v.fx.pending().0);
             rest = if busy { 0 } else { rest + 1 };
             assert!(seen.len() < 500, "{case}: never landed");
@@ -3867,19 +3870,43 @@ fn a_yielding_panel_flies_with_the_move_that_made_it(cx: &mut TestAppContext) {
         if (seen[n - 1].0[1] - right_was).abs() > 100. {
             yields += 1;
         }
-        // No cut: each panel steps at most its spring's top step a frame
-        // (twice it: the harness can stamp a frame late by up to a frame
-        // under load, #52; a cut is the whole travel, 20 times it).
+        // No cut and no doubled step: each panel steps at most its
+        // spring's top speed over that frame's time (a sheet spring from
+        // rest: travel · ω / e per second), and a pixel for the rounding.
+        // A cut is the whole travel, 20 times it; a step taken twice, 2.
+        let speed = std::f32::consts::TAU / crate::motion::SHEET_RESPONSE / std::f32::consts::E;
         for i in 0..2 {
             let travel = (seen[n - 1].0[i] - seen[0].0[i]).abs();
-            let step = (1..n).map(|k| (seen[k].0[i] - seen[k - 1].0[i]).abs()).fold(0., f32::max);
-            if step > travel * top * 2. + 1. {
-                fails.push(format!(
-                    "{case}: the {} steps {step} px in a frame (travel {travel}, its spring's top step {:.1})",
-                    ["rail", "right panel"][i],
-                    travel * top
-                ));
+            for k in 1..n {
+                let (step, dt) = ((seen[k].0[i] - seen[k - 1].0[i]).abs(), (at[k] - at[k - 1]).as_secs_f32());
+                if step > travel * speed * dt + 1. {
+                    fails.push(format!(
+                        "{case}: the {} steps {step} px in frame {k} (travel {travel}, its spring's top step over {:.2} ms {:.1})",
+                        ["rail", "right panel"][i],
+                        dt * 1e3,
+                        travel * speed * dt
+                    ));
+                }
             }
+        }
+        // Riding a panel, each pane only grows or only narrows (a split's
+        // new pane grows, the pane beside it yields), and no pane moves
+        // after the panels have stopped (Shady #54 L2). A pane's edge
+        // that travels less than the panel's can stop a frame or two
+        // before it (the same step, rounded).
+        let rides = matches!(case, "the split" | "the close");
+        for id in seen[n - 1].1.iter().map(|p| p.0).filter(|_| rides) {
+            let ws: Vec<f32> = seen.iter().filter_map(|s| s.1.iter().find(|p| p.0 == id).map(|p| p.1[2])).collect();
+            let (up, down) = ws.windows(2).fold((false, false), |(u, d), w| (u || w[1] > w[0] + 0.5, d || w[1] < w[0] - 0.5));
+            if up && down {
+                fails.push(format!("{case}: pane {} both grows and narrows: {ws:?}", id.index()));
+            }
+        }
+        let moved = |k: usize, f: &dyn Fn(&Snap) -> Vec<f32>| !same(&f(&seen[k]), &f(&seen[k - 1]));
+        let panels_last = (1..n).rev().find(|&k| moved(k, &|s| s.0.to_vec())).unwrap_or(0);
+        let panes_last = (1..n).rev().find(|&k| moved(k, &|s| s.1.iter().flat_map(|(_, b, _)| *b).collect())).unwrap_or(0);
+        if panes_last > panels_last && panels_last > 0 {
+            fails.push(format!("{case}: the panels stop at frame {panels_last}, the panes at {panes_last}"));
         }
         // Each pane's column re-wraps at most once a flight.
         for id in seen[n - 1].1.iter().map(|p| p.0) {
