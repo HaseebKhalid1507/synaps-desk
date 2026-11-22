@@ -1765,6 +1765,28 @@ impl LayoutNode {
         }
     }
 
+    /// This node with only the panes `at` gives a new index (Shady #55 L2):
+    /// a split left one kid is that kid, the others share its ratios.
+    fn kept(&self, at: &impl Fn(usize) -> Option<usize>) -> Option<LayoutNode> {
+        match self {
+            LayoutNode::Pane(i) => at(*i).map(LayoutNode::Pane),
+            LayoutNode::Split { axis, ratios, kids } => {
+                let (mut k2, mut r2) = (Vec::new(), Vec::new());
+                for (k, r) in kids.iter().zip(ratios) {
+                    if let Some(k) = k.kept(at) {
+                        k2.push(k);
+                        r2.push(*r);
+                    }
+                }
+                if k2.len() < 2 {
+                    return k2.pop();
+                }
+                let sum: f32 = r2.iter().sum();
+                Some(LayoutNode::Split { axis: *axis, ratios: r2.iter().map(|r| r / sum).collect(), kids: k2 })
+            }
+        }
+    }
+
     fn to_json(&self) -> serde_json::Value {
         match self {
             LayoutNode::Pane(i) => serde_json::json!({"pane": i}),
@@ -1798,6 +1820,28 @@ impl LayoutNode {
 }
 
 impl Layout {
+    /// The layout without its panes that have no session tabs (Shady #55
+    /// L2): an empty pane split off, or one that showed only a view (views
+    /// are not saved), would show on the first frame and close on the
+    /// first list. Their shares go to the panes beside them; a focused one
+    /// gives the focus to the pane before it (its left/up neighbour), else
+    /// the first. All of them empty: the first pane alone.
+    pub fn without_empty_panes(self) -> Layout {
+        let mut keep: Vec<bool> = self.panes.iter().map(|p| !p.sessions.is_empty()).collect();
+        if !keep.contains(&true) {
+            keep = (0..self.panes.len()).map(|i| i == 0).collect();
+        }
+        if !keep.contains(&false) {
+            return self;
+        }
+        let new: Vec<Option<usize>> = keep.iter().scan(0, |n, k| Some(k.then(|| std::mem::replace(n, *n + 1)))).collect();
+        let at = |i: usize| new.get(i).copied().flatten();
+        let focused = (0..=self.focused.min(new.len() - 1)).rev().find_map(at).or_else(|| new.iter().find_map(|n| *n)).unwrap_or(0);
+        let tree = self.tree.kept(&at).unwrap_or(LayoutNode::Pane(0));
+        let panes = self.panes.into_iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| p).collect();
+        Layout { focused, tree, panes }
+    }
+
     /// What `tabs.<key>` keeps beside it (architecture §5): every pane's
     /// session tabs, in pane order, a session once; the focused pane's
     /// visible tab visible. An older build reopens them all, in one strip.
@@ -1856,14 +1900,19 @@ fn saved_of(t: &serde_json::Value) -> Option<crate::tabs::Saved> {
     Some(crate::tabs::Saved { sessions, journals, labels, active })
 }
 
-/// The split layout saved under `key` (`layout.<key>`, v1), if it is
-/// whole (architecture §5): another version, a tree that does not parse
-/// ([`LayoutNode`]), more than [`crate::pane::PANES_MAX`] panes or more
-/// across or down than the caps, a pane no leaf names or one named twice,
-/// a pane that is not a tab list: none, and the tabs are read instead
-/// ([`load_restore`]). Never panics.
+/// The tests' read of the layout saved under `key` ([`layout_of`]).
+#[cfg(test)]
 pub fn load_layout(path: &Path, key: &str) -> Option<Layout> {
-    let v = load_settings(path)?;
+    layout_of(&load_settings(path)?, key)
+}
+
+/// The split layout saved under `key` (`layout.<key>`, v1) in settings
+/// `v`, if it is whole (architecture §5): another version, a tree that
+/// does not parse ([`LayoutNode`]), more than [`crate::pane::PANES_MAX`]
+/// panes or more across or down than the caps, a pane no leaf names or
+/// one named twice, a pane that is not a tab list: none, and the tabs are
+/// read instead ([`load_restore`]). Never panics.
+fn layout_of(v: &serde_json::Value, key: &str) -> Option<Layout> {
     let l = v.get("layout")?.get(key)?;
     if l.get("v")?.as_u64()? != 1 {
         return None;
@@ -1898,12 +1947,17 @@ pub fn save_layout(path: &Path, key: &str, layout: &Layout) -> std::io::Result<(
     })
 }
 
-/// What a launch restores under `key`: the layout when it is whole and
-/// `tabs.<key>` is still its union (an older build since, writing only the
-/// tabs, leaves it stale: its tabs win, as one pane); else the tabs alone.
-pub fn load_restore(path: &Path, key: &str) -> (Option<Layout>, Option<crate::tabs::Saved>) {
-    let tabs = load_tabs(path, key);
-    let layout = load_layout(path, key).filter(|l| tabs.as_ref().is_none_or(|t| t.sessions == l.union().sessions));
+/// What a launch restores under `key`, from one read of the file (Shady
+/// #55 n3): the layout when split panes are on (`split`, or `panes.split`
+/// in the file; off, `layout.<key>` is never read: n2), it is whole and
+/// `tabs.<key>` is still exactly its union (an older build since, writing
+/// only the tabs, a rename or a tab switch as much as other sessions,
+/// leaves it stale: its tabs win, as one pane: L1); else the tabs alone.
+pub fn load_restore(path: &Path, key: &str, split: bool) -> (Option<Layout>, Option<crate::tabs::Saved>) {
+    let Some(v) = load_settings(path) else { return (None, None) };
+    let tabs = v.get("tabs").and_then(|t| t.get(key)).and_then(saved_of);
+    let split = split || v.get("panes.split").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let layout = split.then(|| layout_of(&v, key)).flatten().filter(|l| tabs.as_ref().is_none_or(|t| *t == l.union()));
     (layout, tabs)
 }
 
@@ -3100,18 +3154,82 @@ mod tests {
         assert_eq!(union.active, Some(3), "the focused pane's visible tab");
         assert_eq!(load_tabs(&path, "socket:/b").map(|t| t.sessions), Some(s(&["t1"])), "other daemons kept");
         assert_eq!(load_accent(&path).as_deref(), Some("#2d7bff"), "other keys kept");
-        assert_eq!(load_restore(&path, "socket:/a"), (Some(layout.clone()), Some(union.clone())));
+        assert_eq!(load_restore(&path, "socket:/a", true), (Some(layout.clone()), Some(union.clone())));
+        // Split panes off (Shady #55 n2): the layout is not read.
+        assert_eq!(load_restore(&path, "socket:/a", false), (None, Some(union.clone())), "flag off: the tabs alone");
+        // An older build's rename, or its tab switch, the sessions the same
+        // (Shady #55 L1): its tabs, not the stale layout.
+        let renamed = Saved { labels: s(&["Relay v2", "", "", ""]), ..union.clone() };
+        save_tabs(&path, "socket:/a", &renamed).unwrap();
+        assert_eq!(load_restore(&path, "socket:/a", true), (None, Some(renamed)), "a rename since");
+        let switched = Saved { active: Some(0), ..union.clone() };
+        save_tabs(&path, "socket:/a", &switched).unwrap();
+        assert_eq!(load_restore(&path, "socket:/a", true), (None, Some(switched)), "a tab switch since");
         // An older build since: its tabs, not the stale layout.
         let older = Saved { sessions: s(&["s1", "s5"]), active: Some(1), ..Saved::default() };
         save_tabs(&path, "socket:/a", &older).unwrap();
-        assert_eq!(load_restore(&path, "socket:/a"), (None, Some(older)));
+        assert_eq!(load_restore(&path, "socket:/a", true), (None, Some(older)));
         // A layout with no tabs beside it (written by hand): the layout.
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let mut v2 = v.clone();
         v2["tabs"].as_object_mut().unwrap().remove("socket:/a");
         std::fs::write(&path, v2.to_string()).unwrap();
-        assert_eq!(load_restore(&path, "socket:/a").0, Some(layout));
+        assert_eq!(load_restore(&path, "socket:/a", true).0, Some(layout));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shady #55 L2: a saved pane with no session tabs is left out; its
+    /// share goes to the panes beside it, its focus to the pane before it;
+    /// a split left one kid is that kid; none left, the first pane.
+    #[test]
+    fn a_layout_without_its_empty_panes() {
+        use crate::split::Axis;
+        use crate::tabs::Saved;
+        let s = |v: &[&str]| Saved { sessions: v.iter().map(|s| s.to_string()).collect(), active: Some(0), ..Saved::default() };
+        let col = |a: usize, b: usize| LayoutNode::Split {
+            axis: Axis::Column,
+            ratios: vec![0.6, 0.4],
+            kids: vec![LayoutNode::Pane(a), LayoutNode::Pane(b)],
+        };
+        let three = |panes: Vec<Saved>, focused: usize| Layout {
+            focused,
+            tree: LayoutNode::Split {
+                axis: Axis::Row,
+                ratios: vec![0.25, 0.25, 0.5],
+                kids: vec![LayoutNode::Pane(0), col(1, 2), LayoutNode::Pane(3)],
+            },
+            panes,
+        };
+        // Pane 2 empty and focused: its column is pane 1 alone, the focus pane 1's.
+        let l = three(vec![s(&["a"]), s(&["b"]), s(&[]), s(&["c"])], 2).without_empty_panes();
+        assert_eq!(
+            l,
+            Layout {
+                focused: 1,
+                tree: LayoutNode::Split {
+                    axis: Axis::Row,
+                    ratios: vec![0.25, 0.25, 0.5],
+                    kids: vec![LayoutNode::Pane(0), LayoutNode::Pane(1), LayoutNode::Pane(2)]
+                },
+                panes: vec![s(&["a"]), s(&["b"]), s(&["c"])],
+            }
+        );
+        // Pane 0 empty and focused: the shares re-summed, the focus the first left.
+        let l = three(vec![s(&[]), s(&["b"]), s(&["c"]), s(&["d"])], 0).without_empty_panes();
+        assert_eq!(l.focused, 0);
+        assert_eq!(
+            l.tree,
+            LayoutNode::Split { axis: Axis::Row, ratios: vec![0.25 / 0.75, 0.5 / 0.75], kids: vec![col(0, 1), LayoutNode::Pane(2)] }
+        );
+        // One left: one pane (the restore's one-pane path); none: the first.
+        let two = |a: &[&str], b: &[&str]| Layout {
+            focused: 1,
+            tree: LayoutNode::Split { axis: Axis::Row, ratios: vec![0.5, 0.5], kids: vec![LayoutNode::Pane(0), LayoutNode::Pane(1)] },
+            panes: vec![s(a), s(b)],
+        };
+        assert_eq!(two(&["a"], &[]).without_empty_panes(), Layout { focused: 0, tree: LayoutNode::Pane(0), panes: vec![s(&["a"])] });
+        assert_eq!(two(&[], &[]).without_empty_panes(), Layout { focused: 0, tree: LayoutNode::Pane(0), panes: vec![s(&[])] });
+        assert_eq!(two(&["a"], &["b"]).without_empty_panes(), two(&["a"], &["b"]), "none empty: as it was");
     }
 
     /// split/architecture.md §5: a layout that is not whole is none, and a
@@ -3187,7 +3305,7 @@ mod tests {
             let file = format!(r#"{{"tabs": {{"k": {{"sessions": ["s1"], "active": 0}}}}, "layout": {{"k": {layout}}}}}"#);
             std::fs::write(&path, file).unwrap();
             assert_eq!(load_layout(&path, "k"), None, "{what}");
-            let (l, tabs) = load_restore(&path, "k");
+            let (l, tabs) = load_restore(&path, "k", true);
             assert!(l.is_none(), "{what}");
             assert_eq!(tabs.map(|t| t.sessions), Some(vec!["s1".to_string()]), "{what}: the tabs, as one pane");
         }

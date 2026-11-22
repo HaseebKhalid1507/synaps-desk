@@ -490,6 +490,22 @@ impl Node {
         }
     }
 
+    /// Its shape into `h`: the axes, each kid, each ratio's bits, each leaf
+    /// (a cheap key for [`crate::app::AppView`]'s layout generation).
+    pub(crate) fn hash_shape(&self, h: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        match self {
+            Node::Leaf(id) => (0u8, id).hash(h),
+            Node::Split { axis, kids, ratios } => {
+                (1u8, *axis == Axis::Row, kids.len()).hash(h);
+                for (k, r) in kids.iter().zip(ratios) {
+                    r.to_bits().hash(h);
+                    k.hash_shape(h);
+                }
+            }
+        }
+    }
+
     /// This tree as the settings file keeps it (split/architecture.md §5):
     /// each pane by its index in `order`.
     pub(crate) fn to_saved(&self, order: &[PaneId]) -> crate::theme::LayoutNode {

@@ -4853,6 +4853,28 @@ fn a_restored_pane_whose_session_is_gone_collapses_after_the_lists_with_one_noti
     let _ = client.shutdown();
 }
 
+/// Split panes step 5 (Shady #55 L2; #36 R1): a saved pane with no
+/// session tabs (an empty pane split off, or one that showed only a view)
+/// is left out before the first frame, so frame 1 is the final layout: one
+/// pane here, focused, with the other pane's tab; no flight then, nor when
+/// the first lists come.
+#[gpui_kit::test]
+fn a_saved_pane_with_no_session_tabs_is_left_out_before_the_first_frame(cx: &mut TestAppContext) {
+    let (window, view, client, attaches, _events) = launch_with(cx, "persist-empty", Some(two_across(&[A], &[], 1)), Some(saved(&[A])));
+    let first = |cx: &mut TestAppContext| view.read_with(cx, |v, _| (v.panes.len(), v.panes.flight.is_some()));
+    assert_eq!(first(cx), (1, false), "frame 1: one pane, no flight");
+    for n in 1..=crate::tabs::RESTORE_LISTS {
+        list(cx, window, &view, &[A, B]);
+        assert_eq!(first(cx), (1, false), "list {n}: still one pane, no flight");
+    }
+    let tabs = view.read_with(cx, |v, _| v.model.tabs.iter().filter_map(|t| t.session.clone()).collect::<Vec<_>>());
+    assert_eq!(tabs, [A], "the saved pane's tab");
+    let a = next_attach(cx, window, &attaches, "A's attach");
+    drop(a);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
 /// Split panes step 5 (architecture §5 ¶4): the same session saved in two
 /// panes restores as a tab in each on one store: one attachment.
 #[gpui_kit::test]
@@ -4914,7 +4936,15 @@ fn the_layout_is_saved_after_a_change_and_on_quit(cx: &mut TestAppContext) {
     assert_eq!(l.panes.len(), 2, "two panes");
     assert_eq!(l.focused, 1, "the new one focused");
     assert_eq!(crate::theme::load_tabs(&path, &k).map(|t| t.sessions), Some(vec![A.to_string()]), "the union");
+    // Nothing changed: the frames hash no layout (Shady #55 L4).
+    view.update(cx, |v, _| v.layout_hashes.set(0));
+    for _ in 0..10 {
+        view.update(cx, |_, cx| cx.notify());
+        frame(cx, window);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.layout_hashes.get()), 0, "idle frames: the key alone");
     key(cx, window, "f6");
+    assert!(view.read_with(cx, |v, _| v.layout_hashes.get()) > 0, "a focus change: hashed again");
     wait_save(cx);
     assert_eq!(crate::theme::load_layout(&path, &k).map(|l| l.focused), Some(0), "a focus change saved");
     // Unsaved at quit: the flush writes it.
@@ -4924,6 +4954,6 @@ fn the_layout_is_saved_after_a_change_and_on_quit(cx: &mut TestAppContext) {
     let _ = names(&mut a);
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
-    let (layout, tabs) = crate::theme::load_restore(&path, &k);
+    let (layout, tabs) = crate::theme::load_restore(&path, &k, true);
     assert!(layout.is_some() && tabs.is_some(), "a launch reads it back");
 }

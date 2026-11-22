@@ -1887,6 +1887,11 @@ pub struct AppView {
     /// The layout's generation ([`Self::layout_gen`]) handed to a save,
     /// and the one written (or meant to stay unwritten); 0: none yet.
     layout_saved: u64,
+    /// [`Self::layout_gen`]'s last key and what it gave (Shady #55 L4).
+    layout_hash: std::cell::Cell<(u64, u64)>,
+    /// How many times [`Self::layout_gen`] hashed the whole layout.
+    #[cfg(test)]
+    pub(crate) layout_hashes: std::cell::Cell<u32>,
     layout_written: u64,
     /// Where the tabs are saved in the settings file (per daemon); `None`:
     /// not saved (bench).
@@ -2524,6 +2529,9 @@ impl AppView {
             restored: Vec::new(),
             layout_clamp: false,
             layout_saved: 0,
+            layout_hash: Default::default(),
+            #[cfg(test)]
+            layout_hashes: Default::default(),
             layout_written: 0,
             tabs_key: None,
             tabs_saved: 0,
@@ -3807,7 +3815,14 @@ impl AppView {
     /// as it is first laid out ([`Self::pane_yields`]). One pane: its tabs
     /// are `tabs.<key>`'s. Split panes off: the tabs alone, as before.
     fn restore_layout_now(&mut self, layout: theme::Layout, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.split_on() || layout.panes.len() < 2 || self.panes.split() {
+        // Split panes off: no layout (Shady #55 n2), the tabs as they are.
+        if !self.split_on() {
+            return;
+        }
+        // Its panes with no session tabs left out now, so this frame is the
+        // final layout (Shady #55 L2): no pane shows to close on the list.
+        let layout = layout.without_empty_panes();
+        if layout.panes.len() < 2 || self.panes.split() {
             if self.restore_tabs.is_none() {
                 self.restore_tabs = Some(layout.union());
             }
@@ -3857,12 +3872,31 @@ impl AppView {
 
     /// The layout's generation: it changes with what [`Self::layout_now`]
     /// would write (a split, a close, a divider let go, a focus change,
-    /// any pane's tabs). Never 0.
+    /// any pane's tabs), and is the same again when a change is undone.
+    /// Never 0. Each frame asks (Shady #55 L4): a cheap key first (the
+    /// tree, the focus, each pane and its tabs' generation), the whole
+    /// layout hashed again only when the key moved.
     fn layout_gen(&self) -> u64 {
         use std::hash::{Hash, Hasher};
+        let mut k = std::collections::hash_map::DefaultHasher::new();
+        self.panes.tree.hash_shape(&mut k);
+        self.panes.focused.hash(&mut k);
+        (self.panes.cur.id, self.panes.cur.list_gen, self.model.tabs.generation).hash(&mut k);
+        for p in &self.panes.rest {
+            (p.id, p.list_gen, p.parked.tabs.generation).hash(&mut k);
+        }
+        let key = k.finish();
+        let (was, hash) = self.layout_hash.get();
+        if was == key && hash != 0 {
+            return hash;
+        }
         let mut h = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", self.layout_now()).hash(&mut h);
-        h.finish().max(1)
+        let hash = h.finish().max(1);
+        self.layout_hash.set((key, hash));
+        #[cfg(test)]
+        self.layout_hashes.set(self.layout_hashes.get() + 1);
+        hash
     }
 
     /// Restored tabs closed (their sessions never came back): said once,
