@@ -70,6 +70,10 @@ impl PaneId {
     }
 }
 
+/// A dropped row's new pane gets its rows this far (px) from landing
+/// ([`Pane::hold_rows`]).
+pub(crate) const HOLD_UNTIL: f32 = 16.;
+
 /// One editor group: the list on screen and everything drawn around it.
 pub struct Pane {
     pub(crate) id: PaneId,
@@ -253,8 +257,16 @@ pub struct Pane {
     /// row dropped on an edge opens a session no pane has drawn, and its
     /// rows' first layout (text no frame has shaped) would cut the
     /// opening of the `sheet` flight; it flies in with its tab strip and
-    /// composer, its rows in its last [`HOLD_UNTIL`] px.
+    /// composer, its rows in its last [`HOLD_UNTIL`] px. Nothing drawn
+    /// from its rows shows meanwhile (the sticky label, the bar), and its
+    /// card is not on screen (Shady #48 r2 L1: it arms from its first frame).
     pub(crate) hold_rows: bool,
+    /// When its held rows came in: they lift 70 → 100 % on `quick`
+    /// (fluid.md §3.6; finish gate #48 r2 N2), inside the flight's tail.
+    pub(crate) rows_in: Option<Instant>,
+    /// Tests: the strength its rows' column was drawn at, last frame.
+    #[cfg(test)]
+    pub(crate) drawn_k: std::cell::Cell<f32>,
     /// The authorization card's prompt (see [`PromptCard`]).
     pub(crate) card: Option<PromptCard>,
     /// Its keys were live at the last frame ([`AppView::card_keys_live`]):
@@ -488,6 +500,9 @@ impl Pane {
             worker_columns: Vec::new(),
             full_rebuild: false,
             hold_rows: false,
+            rows_in: None,
+            #[cfg(test)]
+            drawn_k: std::cell::Cell::new(1.),
             card: None,
             keys_live: false,
             chord: CardChord::default(),
@@ -1682,11 +1697,6 @@ async fn film3b(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowCont
     mark("done");
 }
 
-/// [`pane_script`]'s `film3b2` scene (split.md §2, §5, §7, §8, §9).
-/// A dropped row's new pane gets its rows this far (px) from landing
-/// ([`Pane::hold_rows`]).
-pub(crate) const HOLD_UNTIL: f32 = 16.;
-
 /// The film logs each split or close flight frame (`FLIGHT`): its travel
 /// drawn, for the per-frame evidence beside the capture.
 pub(crate) static FILM_LOG: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -1975,6 +1985,7 @@ async fn film4_scene(
     mark("done");
 }
 
+/// [`pane_script`]'s `film3b2` scene (split.md §2, §5, §7, §8, §9).
 async fn film3b2(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, t0: Instant) {
     let mark = |what: &str| eprintln!("PANES {what} {:.3}", t0.elapsed().as_secs_f64());
     let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));

@@ -4370,3 +4370,169 @@ fn the_drop_preview_glides_at_full_and_jumps_at_reduced_and_off(cx: &mut TestApp
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
+
+/// Shady #48 r2 L1 and L2, finish gate #48 r2 N1 and N2: a rail row
+/// dropped on an edge at Full, frame by frame at 144 Hz, its session's
+/// prompt up as it attaches early in the flight.
+/// While more than [`crate::pane::HOLD_UNTIL`] px are left the new pane
+/// draws nothing from its rows: no row, no sticky label, no thumb. Its
+/// rows come in before it lands at 70 % and lift to full on `quick`,
+/// done before the last frame that moves; nothing (rows, column, thumb,
+/// strength) changes after it. The card's buttons arm from the frame its
+/// row first draws: a real click on Allow then is refused, though the
+/// drop was over 500 ms before; one after the arm answers.
+#[gpui_kit::test]
+fn a_dropped_rows_pane_holds_its_rows_lifts_them_in_its_tail_and_arms_its_card_from_their_first_frame(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, events) = on_a(cx, "dnd-hold", None);
+    level(cx, crate::motion::Level::Full);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    let key = view.read_with(cx, |v, _| {
+        v.rail.rail.rows.iter().find(|r| r.action == crate::named::RowAction::Attach(B.into())).map(|r| r.key).expect("B's row")
+    });
+    let from = mid(cx, window, format!("rail-row {key}"));
+    let to = in_body(cx, window, p0, 0.97, 0.5);
+    drag_to(cx, window, from, to, gpui_kit::Modifiers::default(), false);
+    assert_eq!(view.read_with(cx, |v, _| v.dnd.hint.map(|h| (h.pane, h.zone))), Some((p0, Some(crate::dnd::Zone::Right))));
+    mouse_m(cx, window, to, "up", gpui_kit::Modifiers::default());
+    let new = view.read_with(cx, |v, _| v.panes.focused);
+    assert_ne!(new, p0, "a new pane");
+    // Its first frame, then B attaches with its prompt up, the flight
+    // held there (its clock moves only in `frame_144`).
+    frame_144(cx, window, &view);
+    let mut b = next_attach(cx, window, &attaches, "B's attach at the daemon");
+    b.send(attached(B, Some(1)));
+    feed(cx, window, &view, &events, "B's card in the new pane", |v| v.panes.get(new).is_some_and(|p| p.card.is_some()));
+    assert!(view.read_with(cx, |v, _| v.panes.get(new).is_some_and(|p| p.hold_rows)), "its rows still held");
+    let _ = names(&mut b);
+    // Past the arm the card's first frame would have started (real time).
+    std::thread::sleep(Duration::from_millis(600));
+    // A frame: how far from landing, held, its rows' boxes, sticky layers
+    // painted (the first pane's is one), its column, its rows' strength.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Snap {
+        left: f32,
+        rect: [f32; 4],
+        held: bool,
+        rows: Vec<[f32; 4]>,
+        sticky: usize,
+        column: f32,
+        k: f32,
+        flight: bool,
+        thumb: Option<[f32; 4]>,
+    }
+    let snap = |cx: &mut TestAppContext, thumb: Option<[f32; 4]>| -> Snap {
+        view.read_with(cx, |v, _| {
+            let p = v.panes.get(new).expect("the new pane");
+            let (r, l) = (p.rect.get(), p.land.get());
+            let top = p.list.logical_scroll_top().item_ix;
+            let rows = (top..(top + 10).min(p.list.item_count()))
+                .filter_map(|ix| p.list.bounds_for_item(ix))
+                .map(|b| [b.origin.x, b.origin.y, b.size.width, b.size.height].map(f32::from))
+                .collect();
+            Snap {
+                left: (l.w - r.w).abs() + (l.h - r.h).abs(),
+                rect: [r.x, r.y, r.w, r.h],
+                held: p.hold_rows,
+                rows,
+                sticky: v.fx.paint_log.borrow().iter().filter(|w| **w == "sticky").count(),
+                column: p.layout.column,
+                k: p.drawn_k.get(),
+                flight: v.panes.flight.is_some(),
+                thumb,
+            }
+        })
+    };
+    let bar = view
+        .read_with(cx, |v, _| if v.panes.cur.id == new { v.bars.transcript.clone() } else { v.panes.get(new).unwrap().parked.bar.clone() });
+    drop(bar.thumbs());
+    let card_at =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panes.get(new).and_then(|p| p.card.as_ref().map(|c| c.arm.shown_at())));
+    let mut seen: Vec<Snap> = Vec::new();
+    let mut fails = Vec::new();
+    let (mut first, mut rest) = (None, 0);
+    while rest < 12 {
+        let before = Instant::now();
+        frame_144(cx, window, &view);
+        let thumb = bar.thumbs().last().and_then(|t| t.2);
+        let s = snap(cx, thumb);
+        let i = seen.len();
+        if first.is_none() && !s.rows.is_empty() {
+            first = Some(i);
+            let at = card_at(cx).expect("the card");
+            if at < before {
+                fails.push(format!("frame {i}: the card's arm counts from {:?} before the frame its row first draws", before - at));
+            }
+            // Allow, clicked by real input right after that frame: refused
+            // (it arms 500 ms from there).
+            let allow = in_pane_at(cx, window, "allow-fill", new);
+            click_at(cx, window, allow);
+            let said = names(&mut b);
+            if !said.is_empty() {
+                fails.push(format!("a click right after the card's first frame: {said:?}"));
+            }
+        }
+        rest = if s.flight || i < 3 { 0 } else { rest + 1 };
+        seen.push(s);
+        assert!(seen.len() < 400, "never landed");
+    }
+    let first = first.expect("the rows came in");
+    let last = (1..seen.len()).rev().find(|&i| seen[i].rect != seen[i - 1].rect).expect("the pane moved");
+    eprintln!(
+        "rows in at frame {first}, last move at {last} of {}: {:?}",
+        seen.len(),
+        seen.iter()
+            .map(|s| (s.left.round(), s.held, s.rows.len(), s.sticky, (s.k * 1000.).round() / 1000., s.thumb.is_some()))
+            .collect::<Vec<_>>()
+    );
+    for (i, s) in seen.iter().enumerate() {
+        if s.left > crate::pane::HOLD_UNTIL && (!s.held || !s.rows.is_empty() || s.sticky != 1 || s.thumb.is_some()) {
+            fails.push(format!(
+                "frame {i}, {} px left: held {}, rows {}, sticky layers {} (the first pane's is 1), thumb {:?}",
+                s.left,
+                s.held,
+                s.rows.len(),
+                s.sticky,
+                s.thumb
+            ));
+        }
+        if !s.held && s.sticky != 2 {
+            fails.push(format!("frame {i}: rows in, {} sticky layers (want 2)", s.sticky));
+        }
+    }
+    let f = &seen[first];
+    if f.left > crate::pane::HOLD_UNTIL || f.held || first >= last {
+        fails.push(format!("the rows came in at frame {first} ({} px left), the pane last moved at {last}", f.left));
+    }
+    if (f.k - crate::motion::LIFT).abs() > 1e-3 {
+        fails.push(format!("the rows came in at {} (want {})", f.k, crate::motion::LIFT));
+    }
+    // The lift: rising every frame to full, full before the last that moves.
+    let full = (first..seen.len()).find(|&i| seen[i].k >= 1.).expect("the lift ends");
+    let ks: Vec<f32> = seen[first..=full].iter().map(|s| s.k).collect();
+    if ks.windows(2).any(|w| w[1] <= w[0]) || full >= last || seen[full..].iter().any(|s| s.k < 1.) {
+        fails.push(format!("the lift {ks:?} over frames {first}..={full}; the pane last moved at {last}"));
+    }
+    if !seen[first..last].iter().any(|s| s.thumb.is_some()) {
+        fails.push(format!("no thumb painted before the last frame that moves ({last})"));
+    }
+    for (i, s) in seen.iter().enumerate().skip(last + 1) {
+        let l = &seen[last];
+        if s.rows != l.rows || s.column != l.column || s.k != l.k || s.thumb.is_some_and(|t| Some(t) != l.thumb) {
+            fails.push(format!("frame {i} after the last that moves ({last}): {s:?} vs {l:?}"));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{fails:#?}\n{:#?}",
+        seen.iter().map(|s| (s.left, s.held, s.rows.len(), s.sticky, s.k, s.thumb.is_some())).collect::<Vec<_>>()
+    );
+    // The arm run out: Allow answers, once.
+    std::thread::sleep(Duration::from_millis(600));
+    frame(cx, window);
+    let allow = in_pane_at(cx, window, "allow-fill", new);
+    click_at(cx, window, allow);
+    assert_eq!(names(&mut b), ["answer"], "armed, the click answers");
+    drop(attaches);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}

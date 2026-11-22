@@ -4406,6 +4406,22 @@ impl AppView {
         self.panes.cur.layer = (self.fx.fluid() && !rapid && !view).then_some((now, dx, dy));
     }
 
+    /// The held rows' arrival this frame (finish gate #48 r2 N2): their
+    /// strength, 70 → 100 % on `quick` (fluid.md §3.6) from the frame they
+    /// come in, 16 px from landing, where the `sheet` spring has 200 ms
+    /// or more left: it ends before the flight's last moving frame. Ended
+    /// at once if the flight has (nothing changes after it, #50).
+    fn rows_lift(&mut self) -> Option<f32> {
+        let at = self.panes.cur.rows_in?;
+        let q = (self.fx.now().saturating_duration_since(at).as_secs_f32() / crate::motion::QUICK.as_secs_f32()).min(1.);
+        if q >= 1. || !self.fx.fluid() || self.panes.flight.is_none() {
+            self.panes.cur.rows_in = None;
+            return None;
+        }
+        self.fx.want_frame();
+        Some(crate::motion::LIFT + (1. - crate::motion::LIFT) * crate::motion::ease::OUT.sample(q))
+    }
+
     /// The column's layer this frame: its offset and strength, or none.
     fn layer_now(&mut self) -> Option<(f32, f32, f32)> {
         let (at, dx, dy) = self.panes.cur.layer?;
@@ -5090,9 +5106,13 @@ impl AppView {
 
     /// The session tab is on screen and its card shows the first prompt.
     /// Not over a worker's view: the card is the session's, and Esc there
-    /// goes back to it.
+    /// goes back to it. Not while its pane's rows are held (Shady #48 r2
+    /// L1): its buttons and keys arm from the frame its row first draws.
     fn card_up(&self) -> bool {
-        self.model.tabs.view().is_none() && self.model.lives[self.panes.cur.live].watch.focus().is_none() && self.current_card().is_some()
+        !self.panes.cur.hold_rows
+            && self.model.tabs.view().is_none()
+            && self.model.lives[self.panes.cur.live].watch.focus().is_none()
+            && self.current_card().is_some()
     }
 
     /// The card's keys act: it is on screen in the active window with its
@@ -7783,7 +7803,23 @@ impl AppView {
         let hold = self.panes.cur.hold_rows
             && left > crate::pane::HOLD_UNTIL
             && self.panes.flight.as_ref().is_some_and(|f| f.grow.contains(&self.panes.cur.id));
+        let released = self.panes.cur.hold_rows && !hold;
+        if released {
+            // The rows come in: they lift on `quick` (finish gate #48 r2
+            // N2), and the card's buttons and keys wait from this frame, the
+            // first that draws its row (Shady #48 r2 L1), not from the
+            // next frame's sync, a click's width later.
+            self.panes.cur.rows_in = self.fx.fluid().then(|| self.fx.now());
+            if let Some(c) = self.panes.cur.card.as_mut() {
+                c.arm = Arm::new(Instant::now());
+                c._arm = Some(Self::arm_repaint(cx));
+            }
+            self.panes.cur.keys_live = false;
+        }
         self.panes.cur.hold_rows = hold;
+        if released {
+            self.panes.cur.card_was_up = self.card_up();
+        }
         let (pad_l, pad_r) = lay.padding();
         // Nothing over the list but the tab strip: the first row's own gap
         // (20·r) is the transcript's top edge (design.md §8.14).
@@ -7858,7 +7894,13 @@ impl AppView {
             .size_0()
         });
         // Over the list's right padding, after its layout (and the hold-back's).
-        let layer = self.layer_now();
+        let layer = match (self.layer_now(), self.rows_lift()) {
+            (Some((x, y, k)), Some(r)) => Some((x, y, k.min(r))),
+            (None, Some(r)) => Some((0., 0., r)),
+            (layer, None) => layer,
+        };
+        #[cfg(test)]
+        self.panes.cur.drawn_k.set(layer.map_or(1., |l| l.2));
         let glide = (self.fx.level() == crate::motion::Level::Full).then(|| (self.panes.cur.scroller.clone(), self.fx.clone()));
         // Held while an edge is dragged and as it springs to a detent after
         // (the gate's S3 and S6), and while a divider is held (#47 L1: as a
@@ -7957,23 +7999,28 @@ impl AppView {
                         .min_h_0()
                         .relative()
                         .when_some(layer, |d, (x, y, k)| crate::motion::lift(d.left(px(x)).top(px(y)), k))
+                        // Held (a dropped row's flight), nothing drawn
+                        // from the rows (finish gate #48 r2 N1): no list,
+                        // no sticky label (its row and time unlaid), no bar.
                         .children((!hold).then_some(list))
                         // Right after the list's layout, reading it as it
                         // paints: the top message's label pinned (P15).
-                        .child(crate::sticky::layer(
-                            self.fx.clone(),
-                            cx.processor(move |this, b: Bounds<Pixels>, _, cx| {
-                                this.in_drawn(id, |this| this.sticky_label(b, cx)).unwrap_or_default()
-                            }),
-                        ))
-                        .children(crate::motion::probe(&self.fx, "sticky"))
+                        .children((!hold).then(|| {
+                            crate::sticky::layer(
+                                self.fx.clone(),
+                                cx.processor(move |this, b: Bounds<Pixels>, _, cx| {
+                                    this.in_drawn(id, |this| this.sticky_label(b, cx)).unwrap_or_default()
+                                }),
+                            )
+                        }))
+                        .children((!hold).then(|| crate::motion::probe(&self.fx, "sticky")).flatten())
                         .child(crate::scroll::owner(self.panes.cur.scroller.clone(), self.fx.clone()))
-                        .children(unpainted)
-                        .children(hint_frame)
+                        .children(unpainted.filter(|_| !hold))
+                        .children(hint_frame.filter(|_| !hold))
                         .children(landing)
-                        .children(hold_back)
-                        .children(rehint)
-                        .child(transcript_bar),
+                        .children(hold_back.filter(|_| !hold))
+                        .children(rehint.filter(|_| !hold))
+                        .children((!hold).then_some(transcript_bar)),
                 )
                 // The top of what is drawn over the composer (the stub, a
                 // notice, the chips), as laid out: the palette ends above it.
