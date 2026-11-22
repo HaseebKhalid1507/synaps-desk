@@ -19,3 +19,19 @@ integration. UI SDK's DOM adapters cannot render GPUI; the planned native bridge
 borrows its state/action model, not its npm packages.
 
 Protocol reference: https://a2ui.org/specification/v1.0-a2ui/
+
+## Native semantic action bridge contract
+
+`--agent-action-check docs/agent-ui/action.json` exercises a local, non-executing
+snapshot/authorization round trip. The host supplies the action allowlist and
+validates action arguments. Each accepted action consumes its revision before
+any future dispatch, rejecting repeat invocations. Session, surface and revision
+must all match; snapshots expose only capability names, not arbitrary app state.
+Requests are limited to 8 KiB. The fixture accepts only selection feedback.
+
+This is a bridge **foundation**, not UI SDK compatibility or a live endpoint.
+The CLI check has fresh state on each launch and executes nothing; it is not a
+persistent anti-replay service. Before production, the desk must own bridge
+lifetime, invalidate generations on reconnect, and wire both human and agent
+interactions to one handler. Never expose permission approvals. Transport,
+editable controls and state synchronization remain follow-up work.
