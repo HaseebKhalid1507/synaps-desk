@@ -253,7 +253,7 @@ pub struct Pane {
     /// row dropped on an edge opens a session no pane has drawn, and its
     /// rows' first layout (text no frame has shaped) would cut the
     /// opening of the `sheet` flight; it flies in with its tab strip and
-    /// composer, its rows in the frame that draws it landed.
+    /// composer, its rows in its last [`HOLD_UNTIL`] px.
     pub(crate) hold_rows: bool,
     /// The authorization card's prompt (see [`PromptCard`]).
     pub(crate) card: Option<PromptCard>,
@@ -1683,6 +1683,10 @@ async fn film3b(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowCont
 }
 
 /// [`pane_script`]'s `film3b2` scene (split.md §2, §5, §7, §8, §9).
+/// A dropped row's new pane gets its rows this far (px) from landing
+/// ([`Pane::hold_rows`]).
+pub(crate) const HOLD_UNTIL: f32 = 16.;
+
 /// The film logs each split or close flight frame (`FLIGHT`): its travel
 /// drawn, for the per-frame evidence beside the capture.
 pub(crate) static FILM_LOG: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();

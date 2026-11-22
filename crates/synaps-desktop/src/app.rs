@@ -7774,10 +7774,14 @@ impl AppView {
             self.arm_attach(cx);
         }
         // Rows held while the pane's split flies in (`Pane::hold_rows`):
-        // they come in the frame that draws the landed layout, the last that
-        // moves (#50: nothing changes after it), never a settling frame.
+        // they come in its last [`crate::pane::HOLD_UNTIL`] px, where the
+        // `sheet` spring moves a pixel or two a frame, so their first layout
+        // and the frame after it (the scrollbar's hint) are drawn before it
+        // lands: nothing changes after the last frame that moves (#50).
+        let (drawn_at, land_at) = (self.panes.cur.rect.get(), self.panes.cur.land.get());
+        let left = (land_at.w - drawn_at.w).abs() + (land_at.h - drawn_at.h).abs();
         let hold = self.panes.cur.hold_rows
-            && self.panes.drawn != self.panes.tree
+            && left > crate::pane::HOLD_UNTIL
             && self.panes.flight.as_ref().is_some_and(|f| f.grow.contains(&self.panes.cur.id));
         self.panes.cur.hold_rows = hold;
         let (pad_l, pad_r) = lay.padding();
