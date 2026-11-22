@@ -8774,6 +8774,19 @@ impl Render for AppView {
         {
             f.ride = Some(crate::split::Ride { from: pane, to: pane_to, landed: None });
         }
+        // Its ends moved under it (a fold or unfold, an edge drag, a width
+        // reset, a resize): the layout flies on from where it is drawn on
+        // its own spring, from rest, as on main (Shady #54 M2). Its wraps
+        // carry on, the narrower kept (`wrap_at`: none yet).
+        if let Some(f) = self.panes.flight.as_mut()
+            && let Some(r) = f.ride.filter(|r| r.landed.is_none())
+            && (resized || (r.to - pane_to).abs() >= 0.5)
+        {
+            f.from = self.panes.drawn.clone();
+            f.ride = None;
+            f.travel = 0.;
+            f.wrap_at = None;
+        }
         let wrap = self.panel_fx.freeze.unwrap_or(pane);
         // A view is not a session: no right panel (it describes one); the
         // pane takes its width. The session's column keeps its layout.

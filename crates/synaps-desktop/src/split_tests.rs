@@ -3976,6 +3976,63 @@ fn a_close_beside_a_view_flies_on_its_own_spring(cx: &mut TestAppContext) {
     );
 }
 
+/// Shady #54 M2: a ride whose ends move under it (the rail folds or
+/// unfolds, the window is resized) hands the layout back to its own
+/// spring from where it is drawn: the new pane doesn't stall and then
+/// jump the rest of the way as the panel lands. No frame steps it more
+/// than a tenth of its landed width (but the resize's own), and it lands.
+#[gpui_kit::test]
+fn a_ride_whose_ends_move_hands_the_layout_back(cx: &mut TestAppContext) {
+    let mut fails = Vec::new();
+    for case in ["the rail unfolds", "the rail folds", "a resize"] {
+        let (w, rail_open) = if case == "the rail unfolds" { (1400., false) } else { (1920., true) };
+        let (window, view) = demo_split(cx, w, 1080.);
+        panels_at(cx, &view, rail_open, 480, 520);
+        frame(cx, window);
+        level(cx, crate::motion::Level::Full);
+        frame(cx, window);
+        let before = view.read_with(cx, |v, _| v.panes.ids());
+        key(cx, window, "ctrl-\\");
+        cx.run_until_parked();
+        frame_144(cx, window, &view);
+        let new = view.read_with(cx, |v, _| v.panes.ids().into_iter().find(|i| !before.contains(i))).expect("a new pane");
+        assert!(view.read_with(cx, |v, _| v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some())), "{case}: the split rides the right panel");
+        let mut widths = vec![drawn_w(cx, &view, new)];
+        let mut rest = 0;
+        for k in 1.. {
+            if k == 15 {
+                match case {
+                    "a resize" => VisualTestContext::from_window(window, cx).simulate_resize(size(px(1700.), px(1080.))),
+                    _ => view.update(cx, |v, cx| v.toggle_panel(true, cx)),
+                }
+                cx.run_until_parked();
+            }
+            frame_144(cx, window, &view);
+            widths.push(drawn_w(cx, &view, new));
+            let busy = view.read_with(cx, |v, _| v.panel_fx.moving() || v.panes.flight.is_some() || v.fx.pending().0);
+            rest = if busy || k <= 15 { 0 } else { rest + 1 };
+            if rest == 10 || k == 500 {
+                break;
+            }
+        }
+        let landed = widths[widths.len() - 1];
+        // The resize's own frame scales the layout with the window (a cut:
+        // the window manager's, as on main).
+        let step = widths
+            .windows(2)
+            .enumerate()
+            .filter(|(i, _)| !(case == "a resize" && *i == 14))
+            .map(|(_, w)| (w[1] - w[0]).abs())
+            .fold(0., f32::max);
+        if rest < 10 {
+            fails.push(format!("{case}: never landed"));
+        } else if step > landed * 0.1 {
+            fails.push(format!("{case}: the new pane steps {step} px in a frame (landed {landed}): {widths:?}"));
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
 /// Design gate F5 (#44 r3): after Join lands, the pane kept's worker chips
 /// take their landed grid in the landing frame (one a line in a quarter of
 /// the centre, two in the whole): no chip slides after the panes stop.
