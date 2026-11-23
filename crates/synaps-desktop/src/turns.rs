@@ -4,7 +4,7 @@
 //! the tool surface; a finished run of 4 or more tool calls folds to one
 //! summary row. `YOU` and `AGENT` hang in the margin, once per turn.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
@@ -2568,7 +2568,7 @@ fn revealed(body: AnyElement, shown: Option<f32>, sink: std::rc::Rc<std::cell::C
         })
 }
 
-fn well(row: &RowCache, failed: bool, id: u64, streamed: &[(usize, f32, f32)], p: &Palette, m: &Metrics) -> Div {
+fn well(row: &RowCache, failed: bool, id: u64, streamed: &[(usize, f32, f32, Rc<Cell<f32>>)], p: &Palette, m: &Metrics) -> Div {
     let g = crate::cards::Geo::of(m);
     let inset = (10. * m.r).round();
     let cw = m.mono * 0.6;
@@ -2630,21 +2630,32 @@ fn well(row: &RowCache, failed: bool, id: u64, streamed: &[(usize, f32, f32)], p
         _ if !streamed.is_empty() => {
             // Streaming (§8 #4): line by line, a new one's clip growing
             // 0 → its line on `flick` and its text lifting from 70 %; text
-            // never moves inside its block.
+            // never moves inside its block. A line that wraps grows to all
+            // of it, as laid out a frame ago (one line's height until then):
+            // it never pops to its wraps when it retires (#26 L6).
             let line = (19. * m.r).round();
             let lines = row.result.lines().enumerate().map(|(i, l)| {
                 let text =
                     div().w_full().flex_shrink_0().child(SharedString::from(if l.is_empty() { " ".to_string() } else { l.to_string() }));
                 match streamed.iter().find(|s| s.0 == i) {
-                    Some(&(_, clip, k)) => div()
-                        .debug_selector(move || format!("stream-line {id} {i}"))
-                        .w_full()
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .h(px((line * clip).round()))
-                        .child(motion::lift(text, k))
-                        .into_any_element(),
+                    Some((_, clip, k, sink)) => {
+                        let (h, sink) = (sink.get(), sink.clone());
+                        let h = if h.is_nan() { line } else { h };
+                        div()
+                            .debug_selector(move || format!("stream-line {id} {i}"))
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .h(px((h * clip).round()))
+                            .child(motion::lift(text, *k))
+                            .on_children_prepainted(move |b, _, _| {
+                                if let Some(b) = b.first() {
+                                    sink.set(f32::from(b.size.height));
+                                }
+                            })
+                            .into_any_element()
+                    }
                     None => text.into_any_element(),
                 }
             });
