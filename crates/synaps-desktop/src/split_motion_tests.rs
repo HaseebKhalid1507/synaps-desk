@@ -1,10 +1,10 @@
 //! #62's split-pane motion tests (fix/split-motion-tails), through the
 //! view (`AppView`) against a client on a real socket: the divider on the
-//! window's pixels, a takeover's carry, a ride past its start. Moved out
-//! of `split_tests.rs`, which is protected and stays as on main (Shady
-//! #62 r3 R3-2); its helpers these tests use are copied here as they are
-//! there, the waits' deadline [`T`] a backstop (#74: a slow runner never
-//! fails for it).
+//! window's pixels, a takeover's carry, a ride past its start, a panels'
+//! flight's wraps, the drop targets. Moved out of `split_tests.rs`, which
+//! is protected and stays as on main (Shady #62 r3 R3-2); its helpers
+//! these tests use are copied here as they are there, the waits'
+//! deadline [`T`] a backstop (#74: a slow runner never fails for it).
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
@@ -713,6 +713,120 @@ fn a_split_down_mid_ride_rides_on(cx: &mut TestAppContext) {
     // ... the ride's: at the speed the centre moves, as before.
     assert!((after - slope).abs() <= 0.02, "the split down's slope {after} vs the ride's {slope}");
     assert!(all[k].1 <= last.1, "the split down's own frame still goes left: {} after {}", all[k].1, last.1);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+// ── #62 round 4 (Shady #62 r3: R3-1, R3-3) ──────────────────────────────
+
+/// Shady #62 r3 R3-1: a panels' flight from a fractional origin rewraps
+/// each pane once. At 1280 px, 125 %, rail 247 and right 240, two equal
+/// panes: the right panel yields to them. The rail folds and the right
+/// panel comes back on its tie: the centre only widens (1000.8 at 279.2
+/// to 1008 at 32), so each column keeps its wrap from the frame before
+/// until the panels land, and rewraps there, once. The frozen centre was
+/// laid out at the landing's origin, where the same width is a fraction
+/// wider a pane (the panes are rounded on the window's pixels): pane 0
+/// went 467 → 468 at the start and → 472 as they landed. Then the rail
+/// unfolds (the centre narrows): one rewrap, in the flight's first frame.
+/// Every draw (#61's hook), from the frame before each flight.
+#[gpui_kit::test]
+fn a_panels_flight_from_a_fractional_origin_rewraps_each_pane_once(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "wrap-origin", (1280., 1080.));
+    VisualTestContext::from_window(window, cx).simulate_scale_factor_change(1.25);
+    view.update(cx, |v, cx| {
+        let mut p = v.panels;
+        (p.rail_width, p.right_width) = (Some(247), Some(240));
+        v.panels = p;
+        cx.notify();
+    });
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    for _ in 0..10 {
+        frame(cx, window);
+    }
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    assert_eq!(order.len(), 2, "two panes");
+    assert_eq!(view.read_with(cx, |v, _| v.pane_yield.map(|y| y.1)), Some(true), "the right panel yielded to them");
+    level(cx, crate::motion::Level::Full);
+    let ids = order.clone();
+    let seen = draws(cx, &view, move |v: &AppView| {
+        let cols: Vec<f32> = ids.iter().map(|id| v.panes.get(*id).map_or(f32::NAN, |p| p.layout.column)).collect();
+        (v.panel_fx.moving(), cols)
+    });
+    let mut fails = Vec::new();
+    for (motion, widens) in [("fold", true), ("unfold", false)] {
+        // The frame before the flight, drawn.
+        frame_144(cx, window, &view);
+        let at = seen.borrow().len() - 1;
+        view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        let mut rest = 0;
+        for _ in 0..400 {
+            frame_144(cx, window, &view);
+            let moving = view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving());
+            rest = if moving { 0 } else { rest + 1 };
+            if rest >= 5 {
+                break;
+            }
+        }
+        let got: Vec<(bool, Vec<f32>)> = seen.borrow()[at..].to_vec();
+        assert!(got.iter().any(|d| d.0), "{motion}: the panels flew");
+        for (i, id) in order.iter().enumerate() {
+            let path: Vec<(bool, f32)> = got.iter().map(|(moving, cols)| (*moving, cols[i])).collect();
+            let (before, landed) = (path[0].1, path[path.len() - 1].1);
+            eprintln!("WRAP {motion}, pane {i} ({id:?}): {path:?}");
+            let mut columns: Vec<f32> = path.iter().map(|p| p.1).collect();
+            columns.dedup();
+            if columns.len() > 2 {
+                fails.push(format!("{motion}: pane {i}'s column rewrapped more than once: {columns:?}"));
+            }
+            if landed != before && (landed > before) != widens {
+                fails.push(format!("{motion}: pane {i}'s column went {before} -> {landed}"));
+            }
+            // Widening, the column from the frame before while they fly;
+            // narrowing, the landed one from the flight's first frame.
+            let held = if widens { before } else { landed };
+            if let Some(&(_, c)) = path.iter().find(|&&(moving, c)| moving && c != held) {
+                fails.push(format!("{motion}: pane {i}'s column {c} in the flight (the frame before {before}, landed {landed})"));
+            }
+        }
+    }
+    view.update(cx, |v, _| v.on_draw = None);
+    assert!(fails.is_empty(), "{fails:#?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #62 r3 R3-3: the drop targets are the panes as drawn, on the
+/// window's pixels. At rest at 1280 px, 125 %, rail 221 (drawn 220.8) and
+/// the right panel yielded, two equal panes: each pane's drop body has its
+/// drawn box's left and width (rounded from the centre's own edge, the
+/// first pane's ended at 733.8 in the window, drawn at 734).
+#[gpui_kit::test]
+fn the_drop_targets_are_the_panes_as_drawn_at_a_fractional_origin(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "drop-origin", (1280., 1080.));
+    VisualTestContext::from_window(window, cx).simulate_scale_factor_change(1.25);
+    view.update(cx, |v, cx| {
+        let mut p = v.panels;
+        (p.rail_width, p.right_width) = (Some(221), Some(240));
+        v.panels = p;
+        cx.notify();
+    });
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    for _ in 0..10 {
+        frame(cx, window);
+    }
+    let (bodies, (origin, rects)) = view.read_with(cx, |v, _| (v.drop_bodies(), v.rects_drawn.borrow().clone()));
+    assert_eq!(rects.len(), 2, "two panes drawn");
+    assert!(origin.0.fract().abs() > 0.01, "the centre at a fractional left: {origin:?}");
+    for (id, r) in &rects {
+        let b = bodies.iter().find(|(i, _)| i == id).map(|(_, b)| *b).expect("a drop body for each pane");
+        assert!(
+            (b.x - r.x).abs() < 0.01 && (b.w - r.w).abs() < 0.01,
+            "pane {id:?}: its drop body {b:?}, drawn {r:?} (the centre at {origin:?})"
+        );
+    }
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }

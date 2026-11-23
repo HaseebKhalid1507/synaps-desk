@@ -9185,16 +9185,8 @@ impl AppView {
         // frame the panel is drawn at its target (#50, #52).
         if let Some(r) = f.ride {
             if self.panel_fx.moving() {
-                // Under 0 while a panel turned back carries on its way first
-                // (a split's close mid-flight: [`crate::pane::Carry::Ride`]),
-                // as far as it goes: an early close's way back is a few px
-                // and the panel's overshoot several times that (Shady #62
-                // M1: held at −1, the divider stood while the panel moved).
-                // Each edge stays between its neighbours
-                // ([`crate::split::Node::lerp_px_from`]).
-                let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).min(1.) };
-                let at = |w: f32| crate::split::Rect { w, ..area };
-                return f.to.lerp_px_from(&f.from, t, at(r.from), at(r.to), area);
+                // FAIL-FIRST PROBE: 3ec30e4's clamp, through ride_frame.
+                return f.ride_frame(r, area);
             }
             self.panes.flight = None;
             return self.panes.tree.clone();

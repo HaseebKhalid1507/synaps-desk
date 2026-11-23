@@ -237,7 +237,7 @@ impl AppView {
     /// folded: split.md §5). The landed tree's: during a split's or a
     /// close's flight (about 300 ms) a drag previews against where the
     /// panes land, not where they are drawn (Shady #48 n5).
-    fn drop_bodies(&self) -> Vec<(PaneId, Rect)> {
+    pub(crate) fn drop_bodies(&self) -> Vec<(PaneId, Rect)> {
         let (w, h) = self.centre.get();
         let all = Rect { x: 0., y: 0., w, h };
         let rects = if self.panes.shown_split() { self.panes.tree.rects(all) } else { vec![(self.panes.focused, all)] };
