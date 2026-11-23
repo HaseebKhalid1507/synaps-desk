@@ -26,7 +26,7 @@ use gpui_kit::component::input::RopeExt as _;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use synaps_client::protocol::PromptRequest;
+use synaps_client::protocol::{PromptOutcome, PromptRequest};
 use synaps_client::transcript::{Item, ToolStatus};
 
 use crate::app::{ARM, AppView, Arm, authorize_ready, hidden, lines_below, mono};
@@ -294,6 +294,10 @@ pub(crate) struct Receipt {
     pub(crate) took: Option<Duration>,
     /// When it landed: the receipt lifts in over `QUICK`.
     pub(crate) landed: Instant,
+    /// What the daemon applied (`PromptResolved.outcome`, SynapsCLI #430),
+    /// read as the prompt resolved here. It decides the receipt; `None` (a
+    /// daemon before #430) leaves it to the call's end ([`applied`]).
+    pub(crate) outcome: Option<PromptOutcome>,
 }
 
 impl Receipt {
@@ -323,7 +327,12 @@ impl Receipt {
     /// `denied` (another client's Deny came first, the prompt timed out) or
     /// `cancelled` (a HALT crossed it), never `allowed`. Read when drawn,
     /// from the call as it is: no race.
+    /// A daemon that says what it applied (#430) is taken at its word
+    /// ([`Receipt::reported`]); the call's end is read only without it.
     pub(crate) fn answer_for(&self, call: Option<ToolStatus>, end: &str) -> Answer {
+        if let Some(a) = self.reported() {
+            return a;
+        }
         match self.answer {
             Answer::Elsewhere | Answer::Resolved if call == Some(ToolStatus::Cancelled) => Answer::Cancelled,
             Answer::Allowed | Answer::AllowedAll | Answer::Provided if applied(call, end) == Some(false) => {
@@ -347,8 +356,44 @@ impl Receipt {
     }
 }
 
+impl Receipt {
+    /// The answer the daemon's outcome gives this receipt (SynapsCLI #430).
+    /// A cancel, or no answer by the deadline, is `cancelled` whoever was
+    /// asked: the call never passed its gate. An answer sent from here says
+    /// what applied instead of what was sent (another client's came first):
+    /// `allowed` (`allowed all` if that was ours), `denied` (a secret's
+    /// dismissal: `cancelled`), `provided`. Another client's answer keeps
+    /// `answered elsewhere`/`resolved` (it names no answer). `None`: no
+    /// outcome, or one this build does not know: the call decides.
+    pub(crate) fn reported(&self) -> Option<Answer> {
+        use PromptOutcome as O;
+        let ours = matches!(self.answer, Answer::Allowed | Answer::AllowedAll | Answer::Denied | Answer::Provided);
+        match self.outcome? {
+            O::Cancelled | O::TimedOut => Some(Answer::Cancelled),
+            O::Unknown => None,
+            _ if !ours => None,
+            O::Allowed if self.answer == Answer::AllowedAll => Some(Answer::AllowedAll),
+            O::Allowed => Some(Answer::Allowed),
+            O::Denied if self.secret => Some(Answer::Cancelled),
+            O::Denied => Some(Answer::Denied),
+            O::Answered => Some(Answer::Provided),
+        }
+    }
+
+    /// Whether a yes was applied, which lights the receipt: the daemon's
+    /// word when it gave one (lit as it lands), else once the call shows
+    /// it ran ([`applied`]).
+    pub(crate) fn applied_yes(&self, call: Option<ToolStatus>, end: &str) -> bool {
+        match self.outcome.filter(|o| *o != PromptOutcome::Unknown) {
+            Some(o) => matches!(o, PromptOutcome::Allowed | PromptOutcome::Answered),
+            None => applied(call, end) == Some(true),
+        }
+    }
+}
+
 /// Whether the daemon applied a yes to the prompt that gated `call`, as
-/// far as the call shows (#25): `PromptResolved` does not say which answer
+/// far as the call shows (#25), for a daemon that does not say (before
+/// SynapsCLI #430): `PromptResolved` does not say which answer
 /// it took, and this window's is sent and not acknowledged (another
 /// client's Deny, a HALT or the prompt's timeout can cross it). Past its
 /// gate a call runs: its output streams, or it ends on its own (done,
@@ -716,7 +761,7 @@ impl AppView {
         }
         let r = self.row_receipt(call)?;
         let end = self.call_end(&r.call);
-        let words = self.receipt_words(r, r.answer_for(status, end), applied(status, end) == Some(true), running, p);
+        let words = self.receipt_words(r, r.answer_for(status, end), r.applied_yes(status, end), running, p);
         let row = r.row;
         // The meta's 8 px gap is the separator's first space.
         // Cards D: the facts' dot before it (cards4/proposal.md §3).
@@ -758,8 +803,9 @@ impl AppView {
         // the accent as it lands and decays to `dim` (`glow` from +240); a
         // Deny's stays `err`. Nothing else lights (Shady #23 L9: attention
         // follows the accent; a cancel, another client's answer, `dim`).
-        // Only once its call shows the daemon applied it (#25): until then
-        // `dim`, and if it never does, it is not an Allow.
+        // Only once the daemon applied it: as it lands when the daemon says
+        // so (SynapsCLI #430), else once its call shows it (#25); until
+        // then `dim`, and if it never does, it is not an Allow.
         let lights = applied && matches!(answer, Answer::Allowed | Answer::AllowedAll | Answer::Provided);
         let lit = if lights { self.fx.decay(Some(r.landed + Duration::from_millis(240)), Duration::ZERO, crate::motion::GLOW) } else { 0. };
         #[cfg(test)]
@@ -823,7 +869,7 @@ impl AppView {
             .debug_selector(move || format!("receipt-row {}", d.id))
             // On the call rows' verb column (the finish gate of #18).
             .child(div().pl(px(crate::turns::Geo::of(self.panes.cur.layout, m).verb)).text_color(p.dim_t).child(format!("{kind} · ")))
-            .child(self.receipt_words(rc, rc.answer_for(status, end), applied(status, end) == Some(true), false, p))
+            .child(self.receipt_words(rc, rc.answer_for(status, end), rc.applied_yes(status, end), false, p))
             .into_any_element()
     }
 
@@ -1554,6 +1600,55 @@ mod tests {
         assert_eq!(asked(&pr(serde_json::json!({"id": 1}))), None, "nothing known: nothing said");
     }
 
+    /// SynapsCLI #430: the daemon's outcome decides the receipt, whatever
+    /// the call's end would say; without one (an older daemon, or one this
+    /// build does not know) the call decides, as for #25.
+    #[test]
+    fn a_reported_outcome_decides_the_receipt() {
+        use PromptOutcome as O;
+        let r = |answer, secret, outcome| Receipt {
+            call: "toolu_1".into(),
+            own: false,
+            row: 1,
+            secret,
+            answer,
+            at: "14:21".into(),
+            took: None,
+            landed: Instant::now(),
+            outcome,
+        };
+        let (cancelled, denied, running) = (Some(ToolStatus::Cancelled), Some(ToolStatus::Denied), Some(ToolStatus::Running));
+        let gate = "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this";
+        // An Allow from here, and what the daemon applied.
+        let ours = |o| r(Answer::Allowed, false, Some(o));
+        assert_eq!(ours(O::Allowed).answer_for(cancelled, "Canceled by user"), Answer::Allowed, "a HALT after a silent run: still allowed");
+        assert!(ours(O::Allowed).applied_yes(running, ""), "lit as it lands, before the call says a word");
+        assert_eq!(ours(O::Denied).answer_for(running, ""), Answer::Denied, "another client's Deny, known before the call ends");
+        assert!(!ours(O::Denied).applied_yes(running, "running 6 tests\n"));
+        assert_eq!(ours(O::Cancelled).answer_for(denied, gate), Answer::Cancelled, "a cancel at the gate reads as a denial in the call");
+        assert_eq!(ours(O::TimedOut).answer_for(denied, gate), Answer::Cancelled);
+        assert!(!ours(O::Cancelled).applied_yes(denied, gate));
+        assert_eq!(r(Answer::AllowedAll, false, Some(O::Allowed)).answer_for(running, ""), Answer::AllowedAll);
+        assert_eq!(r(Answer::Denied, false, Some(O::Allowed)).answer_for(running, ""), Answer::Allowed, "ours was not the one applied");
+        // A secret.
+        assert_eq!(r(Answer::Provided, true, Some(O::Answered)).answer_for(cancelled, "Canceled by user"), Answer::Provided);
+        assert_eq!(r(Answer::Provided, true, Some(O::Denied)).answer_for(running, ""), Answer::Cancelled, "dismissed elsewhere first");
+        assert!(r(Answer::Provided, true, Some(O::Answered)).applied_yes(running, ""));
+        // Not answered from here: a cancel says so; an answer stays elsewhere's.
+        assert_eq!(r(Answer::Elsewhere, false, Some(O::Cancelled)).answer_for(running, ""), Answer::Cancelled);
+        assert_eq!(r(Answer::Elsewhere, false, Some(O::Allowed)).answer_for(running, ""), Answer::Elsewhere);
+        assert_eq!(r(Answer::Resolved, false, Some(O::Denied)).answer_for(denied, gate), Answer::Resolved);
+        // No word, or one this build does not know: the call decides (#25).
+        for outcome in [None, Some(O::Unknown)] {
+            let fallback = r(Answer::Allowed, false, outcome);
+            assert_eq!(fallback.answer_for(denied, gate), Answer::Denied, "{outcome:?}");
+            assert_eq!(fallback.answer_for(cancelled, "Canceled by user"), Answer::Cancelled, "{outcome:?}");
+            assert_eq!(fallback.answer_for(running, ""), Answer::Allowed, "{outcome:?}: not known yet");
+            assert!(!fallback.applied_yes(running, ""), "{outcome:?}: unlit until the call runs");
+            assert!(fallback.applied_yes(running, "running 6 tests\n"), "{outcome:?}");
+        }
+    }
+
     #[test]
     fn a_receipt_says_what_and_when() {
         let r = |answer, took| Receipt {
@@ -1565,6 +1660,7 @@ mod tests {
             at: "14:21".into(),
             took,
             landed: Instant::now(),
+            outcome: None,
         };
         let words = |r: Receipt| {
             let (w, rest) = r.words();

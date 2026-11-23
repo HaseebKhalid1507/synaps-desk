@@ -1220,6 +1220,30 @@ pub struct ConversationDigest {
     pub pending_events_len: usize,
 }
 
+/// What the daemon applied when a prompt resolved (`PromptResolved.outcome`,
+/// SynapsCLI #430).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOutcome {
+    /// A Confirm answered yes (or Allow all, where its gate takes it): the
+    /// gate opened.
+    Allowed,
+    /// A Confirm answered anything else, or a Secret answered with nothing:
+    /// the gate stayed shut.
+    Denied,
+    /// A Secret's value, handed to its call.
+    Answered,
+    /// No answer was applied: the turn or session ended while it waited, or
+    /// the waiting call was gone. The call never passed its gate.
+    Cancelled,
+    /// Nobody was attached by the abandonment deadline: the daemon answered
+    /// for them, fail-closed.
+    TimedOut,
+    /// One this build does not know (a newer daemon's): as if none came.
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptRequest {
     pub id: u64,
@@ -1406,8 +1430,12 @@ pub enum SessionEvent {
     Prompt {
         request: PromptRequest,
     },
+    /// `outcome`: what the daemon applied (SynapsCLI #430). `None` from a
+    /// daemon before it.
     PromptResolved {
         prompt_id: u64,
+        #[serde(default)]
+        outcome: Option<PromptOutcome>,
     },
     Idle,
     Steered {

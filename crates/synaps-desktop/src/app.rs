@@ -5631,7 +5631,10 @@ impl AppView {
         let line = call.is_some();
         if let Some(call) = call {
             let receipts = self.receipts.entry(sid.clone()).or_default();
-            receipts.push(crate::authorize::Receipt { call, own, row: c.row, secret: c.secret, answer, at, took, landed: fx_now });
+            // What the daemon applied (SynapsCLI #430): the transcript took
+            // the `PromptResolved` that resolved this card.
+            let outcome = self.model.lives[self.panes.cur.live].transcript.resolved_outcome(c.key.1);
+            receipts.push(crate::authorize::Receipt { call, own, row: c.row, secret: c.secret, answer, at, took, landed: fx_now, outcome });
             if receipts.len() > crate::authorize::RECEIPTS {
                 receipts.remove(0);
             }

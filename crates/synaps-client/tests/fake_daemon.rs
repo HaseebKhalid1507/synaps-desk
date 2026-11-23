@@ -1124,7 +1124,7 @@ async fn prompts_are_answered_on_the_wire() {
     assert_eq!(conn.recv_cmd().await, json!({"cmd": "answer", "prompt_id": 8, "value": null}));
     conn.event(31, json!({"ev": "prompt_resolved", "prompt_id": 7})).await;
     wait(&events, "resolved", |e| {
-        matches!(e, Event::Session { event: synaps_client::SessionEvent::PromptResolved { prompt_id: 7 }, .. }).then_some(())
+        matches!(e, Event::Session { event: synaps_client::SessionEvent::PromptResolved { prompt_id: 7, outcome: None }, .. }).then_some(())
     })
     .await;
     client.shutdown().unwrap();

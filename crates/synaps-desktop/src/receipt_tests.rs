@@ -1,7 +1,9 @@
 //! #25: an authorize receipt says what the daemon applied, not what this
-//! window sent. `PromptResolved` does not say which answer the daemon took,
-//! and an Allow from here can be crossed (another client's Deny, a HALT,
-//! the prompt's timeout): the call says ([`crate::authorize::applied`]).
+//! window sent. An Allow from here can be crossed (another client's Deny, a
+//! HALT, the prompt's timeout). A daemon with SynapsCLI #430 says what it
+//! applied (`PromptResolved.outcome`) and the receipt takes its word; an
+//! older one does not say, and the call does
+//! ([`crate::authorize::applied`]): both paths are here.
 //! The window is `ui_tests`' (`--offline`'s demo, a client whose daemon is
 //! nowhere), its helpers as there (that file is protected).
 
@@ -9,7 +11,7 @@ use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, px, size,
 };
-use synaps_client::protocol::SessionEvent;
+use synaps_client::protocol::{PromptOutcome, SessionEvent};
 
 use crate::app::AppView;
 use crate::motion::Level;
@@ -95,6 +97,17 @@ fn allow_then(
     level: Level,
     end: impl FnOnce(&mut TestAppContext, &Entity<AppView>, &str),
 ) -> (Vec<(u64, &'static str, bool)>, u64, AnyWindowHandle) {
+    allow_resolved_then(cx, level, None, end)
+}
+
+/// [`allow_then`], the prompt resolved with `outcome` (SynapsCLI #430;
+/// `None`: a daemon before it).
+fn allow_resolved_then(
+    cx: &mut TestAppContext,
+    level: Level,
+    outcome: Option<PromptOutcome>,
+    end: impl FnOnce(&mut TestAppContext, &Entity<AppView>, &str),
+) -> (Vec<(u64, &'static str, bool)>, u64, AnyWindowHandle) {
     let (w, view, _events) = open(cx);
     motion_level(cx, &view, level);
     settle(cx, w, 8);
@@ -104,7 +117,7 @@ fn allow_then(
     crate::authorize::RECEIPT_LIT.with(|l| l.borrow_mut().clear());
     assert!(view.update(cx, |v, _| v.answer(key, Some(crate::model::CONFIRM_YES.into()))), "sent");
     view.update(cx, |v, cx| {
-        v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: key.1 });
+        v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: key.1, outcome });
         cx.notify();
     });
     cx.run_until_parked();
@@ -198,6 +211,65 @@ fn an_applied_allow_lights_when_its_call_runs_and_stays_allowed(cx: &mut TestApp
         assert_eq!(seen.iter().any(|s| s.2), level == Level::Full, "{level:?}: lit once it ran (Full only): {seen:?}");
         assert!(seen.iter().all(|s| s.1 == "allowed"), "{level:?}: {seen:?}");
         assert!(drawn(cx, w, format!("receipt-word {row} allowed")), "{level:?}");
+        cx.update_window(w, |_, w, _| w.remove_window()).expect("the window");
+        cx.run_until_parked();
+    }
+}
+
+// ── SynapsCLI #430: the daemon says what it applied ─────────────────────
+
+/// The daemon applied another client's Deny over this window's Allow: the
+/// receipt says `denied` from its landing, while the call has said nothing
+/// (without the outcome it could say only `allowed`, unlit, until the call
+/// ended), and never lights, at Full and Off.
+#[gpui_kit::test]
+fn a_reported_deny_reads_denied_from_the_landing(cx: &mut TestAppContext) {
+    for level in [Level::Full, Level::Off] {
+        let (seen, row, w) = allow_resolved_then(cx, level, Some(PromptOutcome::Denied), |_, _, _| {});
+        assert!(!seen.is_empty(), "{level:?}: the receipt was drawn");
+        assert!(seen.iter().all(|s| s.1 == "denied" && !s.2), "{level:?}: denied in every frame, unlit: {seen:?}");
+        assert!(drawn(cx, w, format!("receipt-word {row} denied")), "{level:?}");
+        cx.update_window(w, |_, w, _| w.remove_window()).expect("the window");
+        cx.run_until_parked();
+    }
+}
+
+/// The daemon applied this window's Allow: lit as it lands at Full (no
+/// wait for the call to say something), and still `allowed` when a HALT
+/// stops the call after it ran silently, though the engine's bare
+/// `Canceled by user` alone would read as a cancel at the gate. At Off,
+/// `allowed`, never lit.
+#[gpui_kit::test]
+fn a_reported_allow_lights_as_it_lands_and_outlives_a_halt(cx: &mut TestAppContext) {
+    for level in [Level::Full, Level::Off] {
+        let (seen, row, w) = allow_resolved_then(cx, level, Some(PromptOutcome::Allowed), |cx, view, call| {
+            result(cx, view, call, "Canceled by user");
+        });
+        assert!(seen.iter().all(|s| s.1 == "allowed"), "{level:?}: {seen:?}");
+        if level == Level::Full {
+            assert!(seen.first().is_some_and(|s| s.2), "Full: lit from the landing: {seen:?}");
+        } else {
+            assert!(seen.iter().all(|s| !s.2), "Off: never lit: {seen:?}");
+        }
+        assert!(drawn(cx, w, format!("receipt-word {row} allowed")), "{level:?}");
+        assert!(!drawn(cx, w, format!("receipt-word {row} cancelled")), "{level:?}");
+        cx.update_window(w, |_, w, _| w.remove_window()).expect("the window");
+        cx.run_until_parked();
+    }
+}
+
+/// The daemon resolved the prompt as cancelled (a HALT reached it first),
+/// and the gate's `None` reads as a denial in the call's result: the
+/// receipt says `cancelled`, not `denied`, never lit, at Full and Off.
+#[gpui_kit::test]
+fn a_reported_cancel_reads_cancelled_though_the_call_reads_denied(cx: &mut TestAppContext) {
+    for level in [Level::Full, Level::Off] {
+        let (seen, row, w) = allow_resolved_then(cx, level, Some(PromptOutcome::Cancelled), |cx, view, call| {
+            result(cx, view, call, "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this command");
+        });
+        assert!(seen.iter().all(|s| s.1 == "cancelled" && !s.2), "{level:?}: {seen:?}");
+        assert!(drawn(cx, w, format!("receipt-word {row} cancelled")), "{level:?}");
+        assert!(!drawn(cx, w, format!("receipt-word {row} denied")), "{level:?}");
         cx.update_window(w, |_, w, _| w.remove_window()).expect("the window");
         cx.run_until_parked();
     }

@@ -338,8 +338,9 @@ pub struct Transcript {
     title: Option<String>,
     pending_prompts: Vec<PromptRequest>,
     /// The last prompts resolved, each with whether a turn ran as it did
-    /// ([`Transcript::resolved_busy`]).
-    resolved: VecDeque<(u64, bool)>,
+    /// ([`Transcript::resolved_busy`]) and what the daemon applied
+    /// ([`Transcript::resolved_outcome`]).
+    resolved: VecDeque<(u64, bool, Option<crate::protocol::PromptOutcome>)>,
     subagents: Vec<Value>,
     cost_usd: f64,
     /// The conversation was swapped (clear, resume, compaction): the next
@@ -411,6 +412,18 @@ impl Transcript {
     /// among the last few resolved here.
     pub fn resolved_busy(&self, id: u64) -> Option<bool> {
         self.resolved.iter().rev().find(|r| r.0 == id).map(|r| r.1)
+    }
+
+    /// What the daemon applied when prompt `id` resolved (SynapsCLI #430).
+    /// `None`: a daemon that does not say, an outcome this build does not
+    /// know, or not among the last few resolved here.
+    pub fn resolved_outcome(&self, id: u64) -> Option<crate::protocol::PromptOutcome> {
+        self.resolved
+            .iter()
+            .rev()
+            .find(|r| r.0 == id)
+            .and_then(|r| r.2)
+            .filter(|o| *o != crate::protocol::PromptOutcome::Unknown)
     }
 
     pub fn subagents(&self) -> &[Value] {
@@ -1226,12 +1239,12 @@ impl Transcript {
                 self.settle();
             }
             SessionEvent::Prompt { request } => self.pending_prompts.push(request.clone()),
-            SessionEvent::PromptResolved { prompt_id } => {
+            SessionEvent::PromptResolved { prompt_id, outcome } => {
                 self.pending_prompts.retain(|p| p.id != *prompt_id);
                 if self.resolved.len() == 16 {
                     self.resolved.pop_front();
                 }
-                self.resolved.push_back((*prompt_id, self.busy));
+                self.resolved.push_back((*prompt_id, self.busy, *outcome));
             }
             SessionEvent::External { event } => self.live_event(event),
             // The input owner's own steer, whatever it looks like: events
@@ -1670,9 +1683,25 @@ mod outcome_tests {
     fn a_resolved_prompt_remembers_whether_a_turn_ran() {
         let mut t = Transcript::new();
         t.apply(&SessionEvent::TurnStarted { turn_baseline: 0, trigger: String::new(), user_text: None });
-        t.apply(&SessionEvent::PromptResolved { prompt_id: 3 });
+        t.apply(&SessionEvent::PromptResolved { prompt_id: 3, outcome: None });
         t.apply(&SessionEvent::Idle);
-        t.apply(&SessionEvent::PromptResolved { prompt_id: 4 });
+        t.apply(&SessionEvent::PromptResolved { prompt_id: 4, outcome: None });
         assert_eq!((t.resolved_busy(3), t.resolved_busy(4), t.resolved_busy(5)), (Some(true), Some(false), None));
+    }
+
+    /// SynapsCLI #430: a prompt remembers what the daemon applied, decoded
+    /// from the wire; an older daemon's (no `outcome`) and one this build
+    /// does not know read as nothing said.
+    #[test]
+    fn a_resolved_prompt_remembers_what_the_daemon_applied() {
+        use crate::protocol::{PromptOutcome, decode_event};
+        let mut t = Transcript::new();
+        for (id, outcome) in [(1, "allowed"), (2, "denied"), (3, "answered"), (4, "cancelled"), (5, "timed_out"), (6, "vetoed")] {
+            t.apply(&decode_event(&serde_json::json!({"ev": "prompt_resolved", "prompt_id": id, "outcome": outcome})).unwrap());
+        }
+        t.apply(&decode_event(&serde_json::json!({"ev": "prompt_resolved", "prompt_id": 7})).unwrap());
+        let got: Vec<_> = (1..=8).map(|id| t.resolved_outcome(id)).collect();
+        use PromptOutcome::*;
+        assert_eq!(got, [Some(Allowed), Some(Denied), Some(Answered), Some(Cancelled), Some(TimedOut), None, None, None]);
     }
 }
