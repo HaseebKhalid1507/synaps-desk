@@ -6,6 +6,7 @@
 //! synaps-desktop --bench-tabs [--bench-history FILE] [--refresh-hz HZ]
 //! synaps-desktop --bench-motion [--refresh-hz HZ]
 //! synaps-desktop --agent-surface FILE [--theme NAME] [--accent #RRGGBB] [--size WxH] [--motion full|reduced|off]
+//! synaps-desktop --agent-action-check FILE
 //! ```
 //! `--bench` connects to a daemon only when `--profile` or `--socket` is
 //! given (never the default daemon), runs the synthetic scenarios, prints
@@ -31,6 +32,7 @@
 // every test module builds, stays the authority on dead code.
 #![cfg_attr(all(test, not(unix)), allow(dead_code))]
 
+mod agent_bridge;
 mod agent_surface;
 mod app;
 mod authorize;
@@ -105,6 +107,7 @@ fn main() {
     let mut socket: Option<PathBuf> = None;
     let mut offline = false;
     let mut surface_file = None;
+    let mut bridge_file = None;
     let mut bench = false;
     let mut diag_mode = false;
     let mut bench_tabs = false;
@@ -135,6 +138,7 @@ fn main() {
             "--profile" => profile = Some(value(&mut args, "--profile")),
             "--socket" => socket = Some(PathBuf::from(value(&mut args, "--socket"))),
             "--offline" => offline = true,
+            "--agent-action-check" => bridge_file = Some(value(&mut args, "--agent-action-check")),
             "--agent-surface" => surface_file = Some(value(&mut args, "--agent-surface")),
             "--bench" => bench = true,
             "--diag" => {
@@ -211,6 +215,15 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+    // `--agent-action-check`: the bridge's local round trip, printed; no
+    // window, no daemon, nothing executed.
+    if let Some(path) = bridge_file {
+        if let Err(e) = agent_bridge::check(&path) {
+            eprintln!("agent action: {e}");
+            std::process::exit(2);
+        }
+        return;
     }
     if bench {
         gpui_kit::profiler::set_trace_enabled(true);
