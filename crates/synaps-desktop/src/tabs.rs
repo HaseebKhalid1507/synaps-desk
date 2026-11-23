@@ -846,20 +846,31 @@ impl Tabs {
     /// Keep each listed tab's label, journal and folder (a tab whose
     /// session ends still shows its name and can resume it).
     pub fn listed(&mut self, sessions: &[SessionMeta]) {
+        let mut saved = false;
         for t in &mut self.tabs {
             let Some(s) = t.session.as_deref().and_then(|id| sessions.iter().find(|s| s.id == id)) else { continue };
+            // What the file keeps changed (Shady #55 r2 n7): a daemon-side
+            // rename, a journal, saved with the next save. Not a restored
+            // tab's still waiting for its list: its first list is the
+            // launch's, and a launch writes nothing of its own.
+            let keeps = t.kind == Kind::Session && !self.restoring.contains(&t.id);
             let label = s.name.as_deref().filter(|n| !n.is_empty()).or(s.title.as_deref().filter(|t| !t.is_empty())).unwrap_or(&s.id);
             if t.label != label {
                 t.label = label.to_string();
+                saved |= keeps;
             }
             let journal = Some(if s.journal_id.is_empty() { &s.id } else { &s.journal_id });
             if t.journal.as_ref() != journal {
                 t.journal = journal.cloned();
+                saved |= keeps;
             }
             let cwd = s.cwd.as_ref().filter(|c| !c.is_empty());
             if t.cwd.as_ref() != cwd {
                 t.cwd = cwd.cloned();
             }
+        }
+        if saved {
+            self.changed();
         }
     }
 
@@ -1676,6 +1687,35 @@ mod tests {
 
     fn meta(id: &str, journal: &str) -> SessionMeta {
         serde_json::from_value(serde_json::json!({"id": id, "journal_id": journal, "lifecycle": "live"})).unwrap()
+    }
+
+    /// Shady #55 r2 n7: a label or journal the daemon changes is saved
+    /// (the generation moves); a restored tab's first list, still waiting
+    /// for it, is the launch's own and saves nothing.
+    #[test]
+    fn a_daemon_rename_moves_the_generation_a_restores_first_list_does_not() {
+        let named = |id: &str, name: &str| -> SessionMeta {
+            serde_json::from_value(serde_json::json!({"id": id, "journal_id": "", "lifecycle": "live", "name": name})).unwrap()
+        };
+        let mut t = Tabs::default();
+        t.open("a", "a", Place::New);
+        t.listed(&[meta("a", "")]);
+        let g = t.generation;
+        t.listed(&[meta("a", "")]);
+        assert_eq!(t.generation, g, "nothing changed");
+        t.listed(&[named("a", "Relay")]);
+        assert!(t.generation > g, "a rename");
+        let g = t.generation;
+        t.listed(&[meta("a", "ja")]);
+        assert!(t.generation > g, "a journal");
+        let mut r = Tabs::restore(&Saved { sessions: vec!["a".into()], active: Some(0), ..Saved::default() });
+        let g = r.generation;
+        r.listed(&[named("a", "Relay")]);
+        assert_eq!(r.generation, g, "restoring: the launch's list");
+        assert!(r.confirm(&[named("a", "Relay")]));
+        let g = r.generation;
+        r.listed(&[named("a", "Relay v2")]);
+        assert!(r.generation > g, "confirmed, then renamed");
     }
 
     #[test]
