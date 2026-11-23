@@ -405,8 +405,9 @@ fn attr(value: &str) -> String {
         .collect()
 }
 
-/// Unicode default-ignorable code points, as `format.rs` lists them.
-fn is_invisible(c: char) -> bool {
+/// Unicode default-ignorable code points, as `format.rs` lists them. Agent
+/// cards drop the same set (`surface::sanitize`, minus ZWJ and ZWNJ).
+pub(crate) fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'

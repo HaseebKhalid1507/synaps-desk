@@ -94,6 +94,9 @@
 //!   reconnect, history drift resync)
 //! - [`history`]: the digest-checked history mirror ([`HistoryUpdate`])
 //! - [`transcript`]: history + live events folded into display rows
+//! - [`surface`]: agent cards' model (agent-ui D1: inert, this client
+//!   declares no catalog): the card types, `ui_sanitize`, validation and
+//!   the history fold by host marks
 //! - [`synthetic`]: deterministic load for benches
 
 pub mod client;
@@ -103,6 +106,7 @@ pub mod events;
 pub mod history;
 pub mod ipc;
 pub mod protocol;
+pub mod surface;
 pub mod synthetic;
 pub mod transcript;
 
