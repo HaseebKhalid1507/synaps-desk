@@ -1580,6 +1580,11 @@ fn ride_velocity(len: f32, r: crate::split::Ride, centre: f32) -> f32 {
     if (r.to - r.from).abs() < 0.5 { 0. } else { len * centre / (r.to - r.from) }
 }
 
+/// Tests: the centre's top-left in the window and each pane's rectangle in
+/// it, as a frame drew them ([`AppView::rects_drawn`]).
+#[cfg(test)]
+pub(crate) type RectsDrawn = ((f32, f32), Vec<(crate::pane::PaneId, crate::split::Rect)>);
+
 /// Tests: what [`AppView::on_draw`] calls each frame drawn.
 #[cfg(test)]
 pub(crate) type OnDraw = Rc<dyn Fn(&AppView)>;
@@ -1941,7 +1946,7 @@ pub struct AppView {
     /// rectangle in it, as the last frame drew them (Shady #62 M2: a
     /// divider's place on screen, each draw).
     #[cfg(test)]
-    pub(crate) rects_drawn: RefCell<((f32, f32), Vec<(crate::pane::PaneId, crate::split::Rect)>)>,
+    pub(crate) rects_drawn: RefCell<RectsDrawn>,
     /// The side panels folded to strips and the open HISTORY buckets
     /// (saved with the accent).
     pub panels: theme::Panels,

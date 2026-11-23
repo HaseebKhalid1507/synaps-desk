@@ -6119,9 +6119,12 @@ fn divider_drawn(v: &AppView) -> (Instant, Option<f32>) {
     (v.fx.now(), rects.first().map(|(_, r)| o.0 + r.x + r.w))
 }
 
+/// Each draw's instant and its first divider's x ([`divider_drawn`]).
+type DividerDraws = Rc<RefCell<Vec<(Instant, Option<f32>)>>>;
+
 /// Each draw's divider from `at` on, one per frame instant (a step can
 /// draw twice at one instant: #60 L1), the frames with none dropped.
-fn divider_path(seen: &Rc<RefCell<Vec<(Instant, Option<f32>)>>>, at: usize) -> Vec<(Instant, f32)> {
+fn divider_path(seen: &DividerDraws, at: usize) -> Vec<(Instant, f32)> {
     let mut out: Vec<(Instant, f32)> = Vec::new();
     for &(t, x) in &seen.borrow()[at..] {
         let Some(x) = x else { continue };
@@ -7009,7 +7012,8 @@ fn a_split_down_mid_ride_rides_on(cx: &mut TestAppContext) {
         let w = v.rects_drawn.borrow().1.iter().map(|(_, r)| r.x + r.w).fold(0., f32::max);
         (t, x, w)
     });
-    let path = |seen: &Rc<RefCell<Vec<(Instant, Option<f32>, f32)>>>| {
+    type Draws = Rc<RefCell<Vec<(Instant, Option<f32>, f32)>>>;
+    let path = |seen: &Draws| {
         let mut out: Vec<(Instant, f32, f32)> = Vec::new();
         for &(t, x, w) in seen.borrow().iter() {
             let Some(x) = x else { continue };
