@@ -199,10 +199,10 @@ pub(crate) fn json_len_within(v: &impl serde::Serialize, cap: usize) -> Option<u
 /// alone; in the desktop's build (`serde_json/preserve_order`, turned on by
 /// gpui) it keeps insertion order. Every "first unknown key" refusal goes
 /// through here, so every build names the engine's key.
-pub(crate) fn first_key<'a>(
-    obj: &'a serde_json::Map<String, serde_json::Value>,
+pub(crate) fn first_key(
+    obj: &serde_json::Map<String, serde_json::Value>,
     pick: impl Fn(&str, &serde_json::Value) -> bool,
-) -> Option<&'a String> {
+) -> Option<&String> {
     obj.iter().filter(|(k, v)| pick(k, v)).map(|(k, _)| k).min()
 }
 
