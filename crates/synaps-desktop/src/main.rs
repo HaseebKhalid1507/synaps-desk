@@ -5,6 +5,7 @@
 //! synaps-desktop --bench [--profile P --prompt TEXT] [--refresh-hz HZ]
 //! synaps-desktop --bench-tabs [--bench-history FILE] [--refresh-hz HZ]
 //! synaps-desktop --bench-motion [--refresh-hz HZ]
+//! synaps-desktop --agent-surface FILE [--theme NAME] [--accent #RRGGBB] [--size WxH] [--motion full|reduced|off]
 //! ```
 //! `--bench` connects to a daemon only when `--profile` or `--socket` is
 //! given (never the default daemon), runs the synthetic scenarios, prints
@@ -30,6 +31,7 @@
 // every test module builds, stays the authority on dead code.
 #![cfg_attr(all(test, not(unix)), allow(dead_code))]
 
+mod agent_surface;
 mod app;
 mod authorize;
 mod beat;
@@ -104,6 +106,7 @@ fn main() {
     let mut profile: Option<String> = None;
     let mut socket: Option<PathBuf> = None;
     let mut offline = false;
+    let mut surface_file = None;
     let mut bench = false;
     let mut diag_mode = false;
     let mut bench_tabs = false;
@@ -134,6 +137,7 @@ fn main() {
             "--profile" => profile = Some(value(&mut args, "--profile")),
             "--socket" => socket = Some(PathBuf::from(value(&mut args, "--socket"))),
             "--offline" => offline = true,
+            "--agent-surface" => surface_file = Some(value(&mut args, "--agent-surface")),
             "--bench" => bench = true,
             "--diag" => {
                 bench = true;
@@ -242,6 +246,21 @@ fn main() {
         eprintln!("synaps-desktop: {w}");
     }
     let choice = theme::Choice { theme: theme_name, raw, accent, text: panels.text_size };
+    // `--agent-surface`: a bounded local fixture, read only, on the desk's
+    // theme, fonts and text size (the settings and the config above are
+    // only read). Never the daemon, never a settings write.
+    if let Some(path) = surface_file {
+        let surface = agent_surface::Surface::read(&path).unwrap_or_else(|e| {
+            eprintln!("agent surface: {e}");
+            std::process::exit(2);
+        });
+        gpui_kit::application().with_assets(glyph::Sprites).run(move |cx| {
+            let options = window_options(window_size, false, cx);
+            agent_surface::launch(surface, motion_setting, choice, options, cx);
+            cx.activate(true);
+        });
+        return;
+    }
     // The synthetic transport, only for an interactive `--offline` window.
     let synthetic = (offline && !bench).then(demo::events);
     // In bench mode only an explicitly named daemon is ever contacted.
@@ -299,31 +318,9 @@ fn main() {
     // The assets: the stroked glyphs' sprites (`glyph::Sprites`).
     gpui_kit::application().with_assets(glyph::Sprites).run(move |cx| {
         diag::mark("app_run_callback");
-        gpui_kit::init(cx);
-        diag::mark("kit_init_done");
-        // After the kit read the OS's reduced-motion preference: a pinned
-        // level wins over it (the kit's own motion follows ours).
-        cx.set_global(motion_setting);
-        motion::Level::apply(cx);
-        Theme::change(ThemeMode::Dark, None, cx);
-        fonts::register(cx);
-        theme::apply(choice, cx);
+        house(motion_setting, choice, cx);
         app::bind_keys(cx);
-        let (w, h) = window_size.unwrap_or((1360., 860.));
-        let size = size(px(w), px(h));
-        let mut options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size, cx))),
-            titlebar: Some(TitlebarOptions { title: Some("Synaps".into()), ..Default::default() }),
-            app_id: Some("synaps-desktop".into()),
-            window_min_size: Some(gpui_kit::size(px(640.), px(420.))),
-            ..Default::default()
-        };
-        // A dialog-type window floats in tiling WMs (i3) instead of
-        // re-tiling the user's workspace: benches and screenshot runs.
-        #[cfg(target_os = "linux")]
-        if bench || std::env::var_os("SYNAPS_DESKTOP_FLOAT").is_some() {
-            options.kind = WindowKind::Dialog;
-        }
+        let mut options = window_options(window_size, bench, cx);
         if bench {
             // Measure the renderer, not the background throttles.
             options.inactive_frame_interval = None;
@@ -384,6 +381,39 @@ fn main() {
         }
         cx.activate(true);
     });
+}
+
+/// The house look on a new app, the desk's window and the `--agent-surface`
+/// preview alike: the kit, the motion level, the kit's dark theme, the
+/// embedded fonts, and the palette at its text size.
+fn house(motion: motion::Setting, choice: theme::Choice, cx: &mut App) {
+    gpui_kit::init(cx);
+    diag::mark("kit_init_done");
+    // After the kit read the OS's reduced-motion preference: a pinned
+    // level wins over it (the kit's own motion follows ours).
+    cx.set_global(motion);
+    motion::Level::apply(cx);
+    Theme::change(ThemeMode::Dark, None, cx);
+    fonts::register(cx);
+    theme::apply(choice, cx);
+}
+
+/// The window: `size` (else 1360×860), centred, as the app the desk is
+/// (its app id, its title, its minimum).
+fn window_options(window_size: Option<(f32, f32)>, bench: bool, cx: &mut App) -> WindowOptions {
+    let (w, h) = window_size.unwrap_or((1360., 860.));
+    let size = size(px(w), px(h));
+    // A dialog-type window floats in tiling WMs (i3) instead of
+    // re-tiling the user's workspace: benches and screenshot runs.
+    let float = cfg!(target_os = "linux") && (bench || std::env::var_os("SYNAPS_DESKTOP_FLOAT").is_some());
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size, cx))),
+        titlebar: Some(TitlebarOptions { title: Some("Synaps".into()), ..Default::default() }),
+        app_id: Some("synaps-desktop".into()),
+        window_min_size: Some(gpui_kit::size(px(640.), px(420.))),
+        kind: if float { WindowKind::Dialog } else { WindowKind::Normal },
+        ..Default::default()
+    }
 }
 
 /// A daemon's socket path as one key, however it was reached: absolute,
