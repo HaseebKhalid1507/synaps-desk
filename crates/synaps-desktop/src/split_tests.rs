@@ -3374,7 +3374,7 @@ fn join_closing_two_panes_on_one_store_keeps_their_unsent_text(cx: &mut TestAppC
         "event": {"ev": "refused", "client": 2, "command": "submit", "reason": "busy"}}));
     let stop = crate::test_waits::Backstop::start();
     let back = loop {
-        let batch: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let batch = crate::test_waits::batch(&events);
         if !batch.is_empty() {
             view.update(cx, |v, cx| v.apply_batch(batch, cx));
         }
@@ -6405,7 +6405,7 @@ fn a_delayed_layout_write_that_finished_as_the_quit_came_is_written_over(cx: &mu
             let writer = std::thread::spawn(move || {
                 SaveJob::write(&slot, SaveKind::Layout, g1, || {
                     holding_tx.send(()).expect("the test");
-                    go_rx.recv().expect("the test");
+                    crate::test_waits::recv(&go_rx).expect("the test");
                     // The flush is waiting for the lock by now.
                     std::thread::sleep(Duration::from_millis(150));
                     crate::theme::save_layout(&p, &key1, &l1)

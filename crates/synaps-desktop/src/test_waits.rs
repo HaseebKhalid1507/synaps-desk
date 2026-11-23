@@ -9,9 +9,14 @@
 //! A channel closed under a wait (its client or daemon gone) fails at
 //! once. A wait whose event never comes on a live channel fails at its
 //! [`Backstop`]: generous wall time ([`BACKSTOP`], or
-//! `SYNAPS_TEST_WAIT_SECS`) that a slow run that is right never reaches,
-//! and that turns a hang into a failure that names the wait and what it
-//! last saw (Shady #74 P1).
+//! `SYNAPS_TEST_WAIT_SECS`), checked on every look whether the channel
+//! is quiet or keeps bringing other events (Shady #74 r2 R2-1), that
+//! turns a hang into a failure that names the wait and what it last saw
+//! (Shady #74 P1). It is set far past what a slow run has needed, not
+//! proven out of a slow run's reach: a run slower still can raise it.
+//! Events are taken in batches of at most [`crate::model::MAX_BATCH`],
+//! as the app's pump takes them, so a channel that never empties still
+//! lets each look draw, check and give up.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -32,7 +37,7 @@ const POLL: Duration = Duration::from_millis(5);
 
 /// A wait's wall-clock backstop: 30 times the 10 s deadline these waits
 /// had, which a loaded ubuntu runner went past once. Not a success
-/// deadline: only a wait that would otherwise hang reaches it.
+/// deadline: a wait that gets its event returns as it comes.
 pub(crate) const BACKSTOP: Duration = Duration::from_secs(300);
 
 /// The backstop for a wait starting now: `SYNAPS_TEST_WAIT_SECS` (whole
@@ -73,25 +78,38 @@ pub(crate) fn until<T: std::fmt::Debug>(events: &async_channel::Receiver<T>, wha
     until_within(events, what, done, budget());
 }
 
+/// [`until`] on `budget`. The event that matches returns first; every
+/// other look, an event that doesn't match as much as a quiet channel,
+/// checks the backstop (Shady #74 r2 R2-1: a stream of other events
+/// went past it).
 fn until_within<T: std::fmt::Debug>(events: &async_channel::Receiver<T>, what: &str, done: impl Fn(&T) -> bool, budget: Duration) {
     let stop = Backstop::of(budget);
     let (mut seen, mut last) = (0_usize, None::<String>);
     loop {
-        match events.try_recv() {
+        let quiet = match events.try_recv() {
             Ok(ev) => {
                 if done(&ev) {
                     return;
                 }
                 seen += 1;
                 last = Some(format!("{ev:?}"));
+                false
             }
             Err(async_channel::TryRecvError::Closed) => panic!("the client closed before {what}"),
-            Err(async_channel::TryRecvError::Empty) => {
-                stop.check(what, || format!("{seen} other events, the last {last:?}"));
-                std::thread::sleep(POLL);
-            }
+            Err(async_channel::TryRecvError::Empty) => true,
+        };
+        stop.check(what, || format!("{seen} other events, the last {last:?}"));
+        if quiet {
+            std::thread::sleep(POLL);
         }
     }
+}
+
+/// What has come on `events`, up to [`crate::model::MAX_BATCH`] (the
+/// app's pump's batch): a look that ends though the channel never
+/// empties (Shady #74 r2 R2-1).
+pub(crate) fn batch<T>(events: &async_channel::Receiver<T>) -> Vec<T> {
+    std::iter::from_fn(|| events.try_recv().ok()).take(crate::model::MAX_BATCH).collect()
 }
 
 /// The client's events into the view as its pump hands them
@@ -107,10 +125,10 @@ pub(crate) fn feed(
     let stop = Backstop::start();
     let (mut frames, mut applied) = (0_u64, 0_usize);
     loop {
-        let batch: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
-        if !batch.is_empty() {
-            applied += batch.len();
-            view.update(cx, |v, cx| v.apply_batch(batch, cx));
+        let got = batch(events);
+        if !got.is_empty() {
+            applied += got.len();
+            view.update(cx, |v, cx| v.apply_batch(got, cx));
         }
         frame(cx, window);
         frames += 1;
@@ -207,7 +225,8 @@ fn frame(cx: &mut TestAppContext, window: AnyWindowHandle) {
 
 /// The backstop itself, on short budgets (Shady #74 P1): a closed channel
 /// fails at once, a live one that never brings the event fails named at
-/// its budget, and a wait that gets its event returns.
+/// its budget, quiet or busy with other events (r2 R2-1), and a wait that
+/// gets its event returns.
 #[cfg(test)]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -240,6 +259,60 @@ mod tests {
         let (said, took) = failure(|| until_within(&rx, "two", |n| *n == 2, budget));
         assert!(said.starts_with("two: still waiting after 60ms, 1 other events, the last Some(\"1\")"), "{said}");
         assert!(took >= budget, "not before its budget: {took:?}");
+        drop(tx);
+    }
+
+    /// Shady #74 r2 R2-1: an event that doesn't match checks the backstop
+    /// too. On a spent budget the wait fails on the first, a `1`, and
+    /// leaves the `2` it would have matched next in the channel (the wait
+    /// that checked only a quiet channel returned on it).
+    #[test]
+    fn until_checks_its_backstop_on_an_event_that_does_not_match() {
+        let (tx, rx) = async_channel::unbounded::<u32>();
+        tx.send_blocking(1).and_then(|()| tx.send_blocking(2)).expect("open");
+        let (said, _) = failure(|| until_within(&rx, "two", |n| *n == 2, Duration::ZERO));
+        assert!(said.starts_with("two: still waiting after 0ns, 1 other events, the last Some(\"1\")"), "{said}");
+        assert_eq!(rx.try_recv().ok(), Some(2), "the match not reached");
+        drop(tx);
+    }
+
+    /// Shady #74 r2 R2-1: a channel that never goes quiet. Each event
+    /// that doesn't match puts another behind it, so the channel never
+    /// empties; the wait fails at its 60 ms budget all the same, with the
+    /// channel still full. The stream turns to the match after 10 s, so
+    /// a wait that never checks under traffic returns then and fails
+    /// here rather than hanging.
+    #[test]
+    fn until_fails_at_its_backstop_under_endless_other_events() {
+        let (tx, rx) = async_channel::unbounded::<u32>();
+        tx.send_blocking(0).expect("open");
+        let (at, budget) = (Instant::now(), Duration::from_millis(60));
+        let more = |n: &u32| {
+            let next = if at.elapsed() < Duration::from_secs(10) { 0 } else { 2 };
+            tx.send_blocking(next).expect("open");
+            *n == 2
+        };
+        let (said, took) = failure(|| until_within(&rx, "two", more, budget));
+        assert!(said.starts_with("two: still waiting after 60ms, "), "{said}");
+        assert!(said.contains(" other events, the last Some(\"0\")"), "{said}");
+        assert!(took >= budget, "not before its budget: {took:?}");
+        assert!(took < Duration::from_secs(10), "at its budget, under traffic: {took:?}");
+        assert!(!rx.is_empty(), "the channel never went quiet");
+        drop(tx);
+    }
+
+    /// Shady #74 r2 R2-1: a look takes at most the pump's batch, so
+    /// `feed`'s frame, its check and its backstop come round though the
+    /// channel never empties.
+    #[test]
+    fn a_batch_takes_at_most_the_pumps_batch() {
+        use crate::model::MAX_BATCH;
+        let (tx, rx) = async_channel::unbounded::<usize>();
+        for n in 0..2 * MAX_BATCH + 5 {
+            tx.send_blocking(n).expect("open");
+        }
+        let looks: Vec<(usize, Option<usize>)> = (0..4).map(|_| batch(&rx)).map(|b| (b.len(), b.first().copied())).collect();
+        assert_eq!(looks, vec![(MAX_BATCH, Some(0)), (MAX_BATCH, Some(MAX_BATCH)), (5, Some(2 * MAX_BATCH)), (0, None)]);
         drop(tx);
     }
 
