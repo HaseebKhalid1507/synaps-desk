@@ -139,6 +139,21 @@ pub fn d_washes(r: &Roles) -> [u32; 6] {
 /// The Ask pill stands at least this off its card.
 pub const D_SOFT_OFF: f64 = 1.03;
 
+/// A worker's fill (`card_agent`, Haseeb: a worker, not a tool, at a
+/// glance): `card_d` turned this far (OKLab) toward the worker's hue at
+/// `card_d`'s own luminance, so it reads as another material, never a step
+/// or a state; as little as [`D_AGENT_MIN`] where the gamut is short. Its
+/// hover (`hover_agent`) is `hover` turned the same way.
+pub const D_AGENT: f64 = 0.03;
+pub const D_AGENT_MIN: f64 = 0.02;
+/// The worker's hue keeps this far (degrees) off the accent's and the
+/// error colour's: a worker never reads as a waiting row or a failed one.
+pub const AGENT_CLEAR: f64 = 40.;
+/// The worker's hue: the theme's `subagent_name`, else violet, else teal.
+const AGENT_HUES: [f64; 2] = [305., 200.];
+/// Under this chroma (OKLab) a colour has no hue to take or to keep off.
+const HUE_CHROMA: f64 = 0.04;
+
 /// `#rrggbb` / `rrggbb` / `#rgb` / `rgb`, any case, surrounding space ignored.
 pub fn parse_hex(s: &str) -> Option<u32> {
     let s = s.trim();
@@ -271,6 +286,135 @@ fn step_upto(ground: u32, toward: u32, target: f64, steps: u8) -> u32 {
         }
     }
     out
+}
+
+// ── a worker's fill (OKLab) ──────────────────────────────────────────────
+
+fn lin8(v: u8) -> f64 {
+    let v = f64::from(v) / 255.0;
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
+fn cbrt(x: f64) -> f64 {
+    x.abs().powf(1.0 / 3.0).copysign(x)
+}
+
+/// `c` in OKLab (L, a, b).
+pub fn oklab(c: u32) -> [f64; 3] {
+    let [r, g, b] = channels(c).map(lin8);
+    let l = cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+    let m = cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+    let s = cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+    [
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    ]
+}
+
+/// OKLab to linear sRGB (unclamped).
+fn from_oklab(l: f64, a: f64, b: f64) -> [f64; 3] {
+    let (x, y, z) =
+        (l + 0.3963377774 * a + 0.2158037573 * b, l - 0.1055613458 * a - 0.0638541728 * b, l - 0.0894841775 * a - 1.2914855480 * b);
+    let (x, y, z) = (x * x * x, y * y * y, z * z * z);
+    [
+        4.0767416621 * x - 3.3077115913 * y + 0.2309699292 * z,
+        -1.2684380046 * x + 2.6097574011 * y - 0.3413193965 * z,
+        -0.0041960863 * x - 0.7034186147 * y + 1.7076147010 * z,
+    ]
+}
+
+/// Linear sRGB in 8 bits; `None` out of gamut.
+fn srgb8(c: [f64; 3]) -> Option<u32> {
+    if c.iter().any(|v| !(-1e-6..=1.0 + 1e-6).contains(v)) {
+        return None;
+    }
+    let enc = |v: f64| {
+        let v = v.clamp(0., 1.);
+        let e = if v <= 0.0031308 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+        (e * 255.0 + 0.5).floor() as u32
+    };
+    Some((enc(c[0]) << 16) | (enc(c[1]) << 8) | enc(c[2]))
+}
+
+/// How far apart two colours are (OKLab ΔE).
+#[cfg(test)]
+pub fn ok_distance(x: u32, y: u32) -> f64 {
+    let (p, q) = (oklab(x), oklab(y));
+    ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
+}
+
+/// `c`'s hue (degrees, OKLab) and chroma.
+pub fn hue(c: u32) -> (f64, f64) {
+    let [_, a, b] = oklab(c);
+    (b.atan2(a).to_degrees().rem_euclid(360.), a.hypot(b))
+}
+
+/// How far apart two hues are (degrees, 0..=180).
+pub fn hue_apart(x: f64, y: f64) -> f64 {
+    let d = (x - y).abs() % 360.;
+    d.min(360. - d)
+}
+
+/// `ground` turned `k` (OKLab) toward hue `h` at its own luminance: in 8
+/// bits, the nearest that lies between `ground`'s luminance and `other`'s
+/// (so whatever reads on both reads on it). `None` out of gamut.
+fn tint(ground: u32, other: u32, h: f64, k: f64) -> Option<u32> {
+    let [_, a0, b0] = oklab(ground);
+    let (a, b) = (a0 + k * h.to_radians().cos(), b0 + k * h.to_radians().sin());
+    let (y, y_other) = (luminance(ground), luminance(other));
+    let (lo, hi) = (y.min(y_other), y.max(y_other));
+    let lum_at = |l: f64| {
+        let [r, g, b] = from_oklab(l, a, b);
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    };
+    let (mut x0, mut x1) = (0.0f64, 1.0f64);
+    for _ in 0..50 {
+        let m = (x0 + x1) / 2.;
+        if lum_at(m) < y {
+            x0 = m;
+        } else {
+            x1 = m;
+        }
+    }
+    let (mut l, step) = (x1, if y_other > y { 0.0005 } else { -0.0005 });
+    for _ in 0..100 {
+        let c = srgb8(from_oklab(l, a, b))?;
+        if (lo..=hi).contains(&luminance(c)) {
+            return Some(c);
+        }
+        l += step;
+    }
+    None
+}
+
+/// [`tint`] by [`D_AGENT`], or as much less (to [`D_AGENT_MIN`]) as the
+/// gamut allows.
+fn agent_tint(ground: u32, other: u32, h: f64) -> Option<u32> {
+    (0..=10u8).map(|i| D_AGENT - f64::from(i) * 0.001).take_while(|&k| k >= D_AGENT_MIN - 1e-9).find_map(|k| tint(ground, other, h, k))
+}
+
+/// A worker's fill and its hover (Haseeb: a worker, not a tool): `card_d`
+/// and `hover` turned toward the worker's hue, `sub` (the theme's
+/// `subagent_name`) or else violet, else teal: the first [`AGENT_CLEAR`]
+/// off the accent's hue and the error colour's (a worker is never a
+/// waiting row nor a failed one), each at its own luminance. Where none
+/// is clear, the first that is in gamut; where none is, the card's own.
+pub fn agent(card_d: u32, hover: u32, sub: u32, you: u32, err: u32) -> (u32, u32) {
+    let taken: Vec<f64> = [you, err].iter().map(|&c| hue(c)).filter(|h| h.1 >= HUE_CHROMA).map(|h| h.0).collect();
+    let own = Some(hue(sub)).filter(|h| h.1 >= HUE_CHROMA).map(|h| h.0);
+    let hues: Vec<f64> = own.into_iter().chain(AGENT_HUES).collect();
+    for clear in [true, false] {
+        for &h in &hues {
+            if clear && taken.iter().any(|&t| hue_apart(h, t) < AGENT_CLEAR) {
+                continue;
+            }
+            if let (Some(fill), Some(hi)) = (agent_tint(card_d, hover, h), agent_tint(hover, card_d, h)) {
+                return (fill, hi);
+            }
+        }
+    }
+    (card_d, hover)
 }
 
 // ── which theme ───────────────────────────────────────────────────────────
@@ -531,6 +675,10 @@ roles! {
     // text on the Allow fill; `acc`, the accent floored as text on all of
     // them (the running clock, waiting, receipts).
     card_d, line, hover, well_d, acc_soft, acc_line, acc_ink, acc,
+    // A worker's fill (a spawn row, a worker chip) and its hover: the card
+    // and its hover turned toward the worker's hue (Haseeb: a worker, not
+    // a tool, at a glance).
+    card_agent, hover_agent,
     // The washes as painted (Shady #23 M3): a failed row's at rest and at
     // its flush's peak, a waiting row's, the authorize card's flush, and
     // the outlined Allow's pressed fill, from the floored `err` and `acc`,
@@ -686,7 +834,11 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     // A failed row's wash at rest and at its flush's peak (§8 #6), not
     // roles: what is drawn on them is floored on them.
     let (fail_rest, fail_peak) = (mix(card_d, t.error_color, f64::from(D_FAIL_REST)), mix(card_d, t.error_color, f64::from(D_FAIL_PEAK)));
-    let run_grounds = [canvas, tool, tool_out, card_d, hover, fail_rest];
+    // A worker's fill and its hover (Haseeb: a worker, not a tool): the
+    // card and its hover turned toward the worker's hue, each at its own
+    // luminance, so what reads on the card and its hover reads on them.
+    let (card_agent, hover_agent) = agent(card_d, hover, t.subagent_name, you, t.error_color);
+    let run_grounds = [canvas, tool, tool_out, card_d, hover, fail_rest, card_agent, hover_agent];
     // `thinking_colors()`: `thinking_color` lifted toward the answer's colour.
     let think = |f: &mut Floors, role, g: &[u32]| {
         let c = lift(t.thinking_color, t.claude_text, g, TEXT);
@@ -708,12 +860,16 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
         card_d,
         hover,
         well_d,
+        card_agent,
+        hover_agent,
         ..Roles::default()
     };
     f.log.push(Check { role: "card_d", from: canvas, color: card_d, grounds: vec![canvas], floor: D_FILL });
     f.log.push(Check { role: "hover", from: card_d, color: hover, grounds: vec![card_d], floor: D_CARD });
     f.log.push(Check { role: "well_d", from: card_d, color: well_d, grounds: vec![card_d], floor: D_CARD });
-    r.line = f.at("line", t.separator, ink, &[card_d, canvas, hover], D_LINE);
+    f.log.push(Check { role: "card_agent", from: card_d, color: card_agent, grounds: vec![canvas], floor: D_FILL });
+    f.log.push(Check { role: "hover_agent", from: card_agent, color: hover_agent, grounds: vec![card_agent], floor: D_CARD });
+    r.line = f.at("line", t.separator, ink, &[card_d, canvas, hover, card_agent, hover_agent], D_LINE);
     for (role, from, c) in [("add_bg", well, add_bg), ("del_bg", well, del_bg)] {
         f.log.push(Check { role, from, color: c, grounds: vec![well], floor: SURFACE });
     }
@@ -760,7 +916,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.run = f.text("run", t.status_streaming, &[canvas, tool, tool_out, user]);
     r.ready = f.text("ready", t.status_ready, &[canvas, user]);
     r.cost = f.text("cost", t.cost_color, &[canvas]);
-    r.err = f.text("err", t.error_color, &[canvas, tool, tool_out, user, card_d, hover, fail_rest, fail_peak]);
+    r.err = f.text("err", t.error_color, &[canvas, tool, tool_out, user, card_d, hover, fail_rest, fail_peak, card_agent, hover_agent]);
     r.dim_u = f.text("dim_u", t.muted, &[user]);
     r.agent_u = f.text("agent_u", t.claude_label, &[user]);
     r.head_u = f.text("head_u", t.heading_color, &[user]);
@@ -781,7 +937,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     r.dim_t = f.text("dim_t", t.muted, &run_grounds);
     r.think = think(&mut f, "think", &run_grounds);
     r.arg = f.text("arg", t.tool_param, &run_grounds);
-    r.ok = f.text("ok", t.tool_result_ok, &[canvas, tool, tool_out, card_d, hover]);
+    r.ok = f.text("ok", t.tool_result_ok, &[canvas, tool, tool_out, card_d, hover, card_agent, hover_agent]);
     // `draw.rs` `tool_accent()`: an unset `tool_*` derives from the palette.
     r.t_bash = f.text("t_bash", or(t.tool_bash, t.tool_result_ok), &run_grounds);
     r.t_read = f.text("t_read", or(t.tool_read, t.claude_label), &run_grounds);
@@ -945,7 +1101,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
         Some(rise(card_d, you, D_SOFT_OFF)).filter(|&c| contrast(c, card_d) >= D_SOFT_OFF).unwrap_or_else(|| rise(card_d, ink, D_SOFT_OFF))
     };
     let (wait_rest, wait_peak) = (mix(card_d, you, f64::from(D_WAIT_REST)), mix(card_d, you, f64::from(D_WAIT_PEAK)));
-    r.acc = f.text("acc", you, &[card_d, hover, r.acc_soft, wait_rest, wait_peak]);
+    r.acc = f.text("acc", you, &[card_d, hover, r.acc_soft, wait_rest, wait_peak, card_agent, hover_agent]);
     f.log.push(Check { role: "acc_soft", from: you, color: r.acc_soft, grounds: vec![card_d], floor: D_SOFT_OFF });
     r.acc_line = f.at("acc_line", mix(card_d, you, 0.4), ink, &[card_d], D_ACC_LINE);
     r.acc_ink = if [r.btn_fill, r.btn_hi].iter().all(|&g| contrast(canvas, g) >= TEXT) { canvas } else { chrome };
@@ -1181,13 +1337,41 @@ pub fn luminance_hsla(c: Hsla) -> f32 {
 /// What a drain leaves: the grounds (and what is a ground: fills, rules,
 /// thumbs), and the ink and prose the words are in.
 const UNDRAINED: &[&str] = &[
-    "chrome", "canvas", "user", "code", "tool", "tool_out", "card", "card_hi", "raised", "hair", "edge", "frame", "add_bg", "del_bg",
-    "thumb", "thumb_ch", "thumb_u", "thumb_k", "press_ch", "press_k", "ink", "prose",
+    "chrome",
+    "canvas",
+    "user",
+    "code",
+    "tool",
+    "tool_out",
+    "card",
+    "card_hi",
+    "raised",
+    "hair",
+    "edge",
+    "frame",
+    "add_bg",
+    "del_bg",
+    "thumb",
+    "thumb_ch",
+    "thumb_u",
+    "thumb_k",
+    "press_ch",
+    "press_k",
+    "ink",
+    "prose",
     // Q1's (PR #16) ground and rules (a well greys while the code beside
     // it doesn't): `grounds_and_rules_never_drain` fails on any new one
     // missing here.
-    "well", "hair_w", "hair_t", "edge_t", // Cards D's grounds and rules.
-    "card_d", "line", "hover", "well_d",
+    "well",
+    "hair_w",
+    "hair_t",
+    "edge_t", // Cards D's grounds and rules.
+    "card_d",
+    "line",
+    "hover",
+    "well_d", // A worker's fill and its hover.
+    "card_agent",
+    "hover_agent",
 ];
 
 /// `c` mixed `t` toward the grey of its own relative luminance, in linear
@@ -2406,6 +2590,71 @@ mod tests {
         assert!(contrast(0xffffff, paper.canvas) < D_FILL && luminance(paper.card_d) < luminance(paper.canvas));
     }
 
+    /// A worker reads as a worker, not a tool (Haseeb): its fill is the
+    /// card turned [`D_AGENT`] (OKLab) toward the worker's hue at the card's
+    /// own luminance (between the card's and its hover's: a material, not a
+    /// step), its hover the card's hover turned the same way, in every theme
+    /// and accent preset; never a waiting or a failed row's wash as painted;
+    /// every text and mark a spawn row or a worker chip draws reads on
+    /// both. Each theme's pair without an accent, as the PR's table gives it.
+    #[test]
+    fn a_worker_reads_as_a_worker() {
+        let fills = [
+            ("default", 0x17172e, 0x1e1e36),
+            ("night-city", 0x1b152b, 0x221d34),
+            ("neon-rain", 0x1b1128, 0x231831),
+            ("amber", 0x1d131c, 0x251a23),
+            ("phosphor", 0x0e1719, 0x10201e),
+            ("solarized-dark", 0x063753, 0x0f3c58),
+            ("blood", 0x1c0e1d, 0x261625),
+            ("ocean", 0x151329, 0x1c1a31),
+            ("rose-pine", 0x1f152a, 0x261b32),
+            ("nord", 0x191324, 0x211b2c),
+            ("dracula", 0x061b23, 0x0d2229),
+            ("monokai", 0x0c2623, 0x152c2a),
+            ("gruvbox", 0x2e2634, 0x342b39),
+            ("catppuccin", 0x082331, 0x102939),
+            ("tokyo-night", 0x201931, 0x271f39),
+            ("sunset", 0x24111f, 0x2e1724),
+            ("ice", 0x031728, 0x081f31),
+            ("forest", 0x16181b, 0x1c2020),
+            ("lavender", 0x081927, 0x10202f),
+            ("paper", 0xe7ebfe, 0xdee2fb),
+        ];
+        assert_eq!(fills.len(), palettes::THEMES.len());
+        let between = |c: u32, x: u32, y: u32| (luminance(x).min(luminance(y))..=luminance(x).max(luminance(y))).contains(&luminance(c));
+        for ((name, raw), (want_name, fill, hi)) in palettes::THEMES.iter().zip(fills) {
+            assert_eq!(*name, want_name);
+            let (r, _) = resolve(raw, None);
+            assert_eq!((r.card_agent, r.hover_agent), (fill, hi), "{name}: #{:06x} #{:06x}", r.card_agent, r.hover_agent);
+            for a in std::iter::once(None).chain(PRESETS.iter().map(|p| Some(p.1))) {
+                let (r, _) = resolve(raw, a);
+                for (what, c, card, other) in
+                    [("card_agent", r.card_agent, r.card_d, r.hover), ("hover_agent", r.hover_agent, r.hover, r.card_d)]
+                {
+                    let off = ok_distance(c, card);
+                    assert!((D_AGENT_MIN - 1e-9..=D_AGENT + 0.005).contains(&off), "{name} {a:?}: {what} #{c:06x} ΔE {off:.4}");
+                    assert!(between(c, card, other), "{name} {a:?}: {what} #{c:06x} at its card's luminance");
+                }
+                assert!(contrast(r.card_agent, r.canvas) >= D_FILL - 1e-9, "{name} {a:?}: off the canvas");
+                assert!(contrast(r.hover_agent, r.card_agent) >= D_CARD - 1e-9, "{name} {a:?}: its hover");
+                for w in [r.wash_wait, r.wash_wait_pk, r.wash_fail, r.wash_fail_pk] {
+                    let d = ok_distance(r.card_agent, w);
+                    assert!(d >= D_AGENT_MIN, "{name} {a:?}: #{:06x} reads as the wash #{w:06x} (ΔE {d:.4})", r.card_agent);
+                }
+                for g in [r.card_agent, r.hover_agent] {
+                    for c in [r.prose_t, r.dim_t, r.sub_name_t, r.sub_status_t, r.sub_time_t, r.err, r.ok, r.acc, r.warn, r.run, r.ink] {
+                        assert!(contrast(c, g) >= TEXT - 1e-9, "{name} {a:?}: #{c:06x} on #{g:06x} is {:.2}", contrast(c, g));
+                    }
+                    for c in [r.sub_rule, r.you_mark_t, r.run_mark, r.warn_mark] {
+                        assert!(contrast(c, g) >= MARK - 1e-9, "{name} {a:?}: mark #{c:06x} on #{g:06x} is {:.2}", contrast(c, g));
+                    }
+                    assert!(contrast(r.line, g) >= D_LINE - 1e-9, "{name} {a:?}: the Open button's edge");
+                }
+            }
+        }
+    }
+
     /// Cards D's roles (cards4/proposal.md §1) meet their floors in every
     /// theme and accent preset: the card a surface step off the canvas, its
     /// hover and well off it, `line` on all three; every text a row
@@ -2768,6 +3017,9 @@ mod tests {
             "wash_wait_pk",
             "ask_flush",
             "out_press",
+            // A worker's hue keeps off the accent's.
+            "card_agent",
+            "hover_agent",
         ];
         for (name, raw) in palettes::THEMES {
             let (a, base) = resolve(&raw, None);

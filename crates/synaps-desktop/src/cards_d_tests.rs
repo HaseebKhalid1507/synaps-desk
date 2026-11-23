@@ -1,7 +1,8 @@
 //! Cards D's follow-ups (#26, from #23's reviews): the late-frame rule at
 //! a slow display's pace, a card's bottom edge as a call
 //! is appended, a streamed line that wraps, two folds at once, and the room
-//! a fold at the end holds.
+//! a fold at the end holds; and square everywhere: no box or button in the
+//! window paints a rounded corner.
 //!
 //! The helpers are `ui_tests`' own, from [`super`] (`test_kit`); the few
 //! here are this file's.
@@ -598,4 +599,85 @@ fn a_tall_wrapped_line_retires_without_a_step(cx: &mut TestAppContext) {
         before.0
     );
     assert!(frames.windows(2).all(|p| p[1].1 >= p[0].1), "it only grows: {frames:?}");
+}
+
+/// Square everywhere (Haseeb: the run cards' square corners are the app's
+/// vibe): no box or button paints a rounded corner, only true circles (a
+/// status disc, the authorize card's dot, a fact's separator dot) are
+/// round. Read off the painted quads of the `--offline` demo at 1920 ×
+/// 1080: its transcript's end (the authorize card's buttons and checkbox,
+/// a run's cards, the composer and its pickers, the worker chips, the tab
+/// strip, the rail and the right panel), its start (the spawn rows and
+/// their Open), a worker's menu, the command palette and Settings.
+#[gpui_kit::test]
+fn every_box_and_button_is_square(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1920., 1080.), crate::theme::Panels::default().text_size);
+    settle(cx, w, 8);
+    // Each painted quad with a corner radius that is not a circle's.
+    let rounded = |cx: &mut TestAppContext| -> Vec<String> {
+        cx.update_window(w, |_, window, _| {
+            window
+                .painted_quads()
+                .iter()
+                .filter_map(|q| {
+                    let c = q.corner_radii;
+                    let r = [c.top_left.0, c.top_right.0, c.bottom_right.0, c.bottom_left.0];
+                    let (wd, ht) = (q.bounds.size.width.0, q.bounds.size.height.0);
+                    let circle = (wd - ht).abs() <= 0.5 && r.iter().all(|&r| r >= wd / 2. - 0.5);
+                    (r.iter().any(|&r| r > 0.01) && !circle)
+                        .then(|| format!("{:?} radii {r:?} fill {:?}", q.bounds, q.background.as_solid()))
+                })
+                .collect()
+        })
+        .expect("the window")
+    };
+    let card = |cx: &mut TestAppContext| VisualTestContext::from_window(w, cx).debug_bounds("card").is_some();
+    let square = |cx: &mut TestAppContext, what: &str| {
+        let bad = rounded(cx);
+        assert!(bad.is_empty(), "{what}: rounded corners:\n{}", bad.join("\n"));
+    };
+    assert!(card(cx), "the authorize card is drawn");
+    square(cx, "the transcript's end");
+    // The spawn rows (and their Open), at the transcript's start.
+    view.update(cx, |v, cx| {
+        v.list.scroll_to(gpui::ListOffset { item_ix: 0, offset_in_item: px(0.) });
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let works: Vec<u64> = view.read_with(cx, |v, _| v.disp.iter().filter(|d| matches!(d.kind, Kind::Work)).map(|d| d.id).collect());
+    let spawns = works
+        .iter()
+        .filter(|id| VisualTestContext::from_window(w, cx).debug_bounds(String::leak(format!("spawn-row {id}"))).is_some())
+        .count();
+    assert!(spawns > 0, "a spawn row is drawn");
+    square(cx, "the transcript's start");
+    // A worker's menu.
+    let who = view.read_with(cx, |v, _| {
+        let (call, name) = v.model.stats.subagents.ident(1).expect("sa_1 named");
+        crate::wtabs::Who::new(1, name.to_string(), call.map(|c| c.to_string().into()))
+    });
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            let t = crate::wtabs::Target { session: crate::demo::SID.into(), who, tab: None };
+            v.open_menu(t, crate::menu::At::Point(gpui_kit::point(px(700.), px(500.))), false, window, cx);
+        })
+    })
+    .expect("the window");
+    settle(cx, w, 4);
+    assert!(view.read_with(cx, |v, _| v.menu.is_some()), "a worker's menu is open");
+    square(cx, "a worker's menu");
+    view.update(cx, |v, cx| {
+        v.close_menu();
+        cx.notify();
+    });
+    // The command palette.
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.open_palette(crate::palette::Mode::Commands, window, cx)))
+        .expect("the window");
+    settle(cx, w, 4);
+    assert!(view.read_with(cx, |v, _| v.palette.is_some()), "the palette is open");
+    square(cx, "the command palette");
+    // Settings.
+    view.update(cx, |v, cx| v.open_view(crate::tabs::Kind::Settings, cx));
+    settle(cx, w, 8);
+    square(cx, "Settings");
 }

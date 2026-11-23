@@ -660,20 +660,20 @@ impl AppView {
                 .flex_none()
                 .w(px(more_w(m)))
                 .h(px(row_h))
-                .px(px(10.))
-                .items_center()
-                .border_1()
-                .border_color(p.hair_t)
+                // The worker's fill, no frame: its room is padding, in a
+                // layer of its own (a chip's, above).
+                .px(px(crate::cards::frame_room(self.scale)))
+                .bg(p.card_agent)
                 .cursor_pointer()
-                .hover(|d| d.bg(p.tool_out))
+                .hover(|d| d.bg(p.hover_agent))
                 // It rolls as workers come and go (polish.md P5).
-                .child(motion::roll_count(
+                .child(h_flex().flex_1().min_w_0().h_full().px(px(10.)).items_center().child(motion::roll_count(
                     self.fx.col(self.panes.cur.id),
                     motion::ROLL_MORE,
                     chips.more,
                     format!("+{} more", chips.more).into(),
                     |t| mono(t, m.meta, p.dim_t),
-                ))
+                )))
                 // Its menu open: the menu says it (no tooltip over it).
                 .when(self.wmenu.is_none(), |d| d.tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)))
                 .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| this.open_workers_menu(ev.position(), window, cx)));
@@ -692,8 +692,9 @@ impl AppView {
         ))
     }
 
-    /// A worker's chip (polish.md §2.5, made lighter at the finish gate):
-    /// no fill, a 1 px `hair_t` frame on the canvas, `bar` on its left edge; its state glyph, name, step
+    /// A worker's chip (polish.md §2.5): square, on the worker's fill
+    /// (`card_agent`: a worker, not a tool, Haseeb), no frame, `bar` on its
+    /// left edge; its state glyph, name, step
     /// (or its state's word once it ended; an armed cancel's `Cancel …?`
     /// and CONFIRM), its clock (ticking while it runs) and the cancel ×.
     #[allow(clippy::too_many_arguments)]
@@ -728,59 +729,71 @@ impl AppView {
             .h(px(h))
             .w(px(w))
             .relative()
-            .pl(px(12.))
-            .pr(px(10.))
-            .gap(px(8.))
-            .items_center()
             .overflow_hidden()
             .whitespace_nowrap()
             .text_px(m.meta)
-            // No fill: a 1 px frame and its bar on the canvas (the watched
-            // one's bar is yours); hovered, the rows' quiet fill.
-            .border_1()
-            .border_color(p.hair_t)
-            .child(crate::turns::live_glyph(
-                &self.fx,
-                g,
-                mark,
-                p.canvas,
-                self.fx.col(self.panes.cur.id).change(
-                    Tag::TrayGlyph,
-                    r.id,
-                    crate::turns::glyph_code(glyph::worker(glyph::steady(r.live, r.demoted)).0),
-                    None,
-                ),
-                None,
-                false,
-            ))
-            // Armed, `Cancel name?` says the name.
-            .when(!armed, |d| d.child(div().flex_none().text_color(p.sub_name_t).child(SharedString::from(cut(&r.name, NAME_CHARS)))))
-            .when_some(armed_el, |d, a| d.child(a))
-            .when(!armed, |d| {
-                d.child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .text_color(step_color)
-                        .child(SharedString::from(chip_step(r).to_string())),
-                )
-                // The clock's slot, as wide as it ever reads, and the ×'s
-                // after it (drawn on hover, design.md §5; always on the
-                // watched one), each there whether it shows or not: the
-                // step's room is the same in every state.
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(crate::turns::text_w(CLOCK_CHARS, cw)))
-                        .flex()
-                        .justify_end()
-                        .text_color(p.sub_time_t)
-                        .children(clock.filter(|_| r.clocked())),
-                )
-                .child(div().flex_none().w(px(X_W)).flex().justify_center().children(x))
-            })
+            // The worker's fill, no frame, and its bar (the watched one's
+            // is yours); hovered, its hover. The frame's room is padding,
+            // in a layer of its own as the frame was laid out apart from
+            // the padding in it (Shady #71 P2, P3): nothing in the chip
+            // moved when the frame went, at any scale.
+            .bg(p.card_agent)
+            .px(px(crate::cards::frame_room(self.scale)))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .pl(px(12.))
+                    .pr(px(10.))
+                    .gap(px(8.))
+                    .items_center()
+                    .overflow_hidden()
+                    .child(crate::turns::live_glyph(
+                        &self.fx,
+                        g,
+                        mark,
+                        p.card_agent,
+                        self.fx.col(self.panes.cur.id).change(
+                            Tag::TrayGlyph,
+                            r.id,
+                            crate::turns::glyph_code(glyph::worker(glyph::steady(r.live, r.demoted)).0),
+                            None,
+                        ),
+                        None,
+                        false,
+                    ))
+                    // Armed, `Cancel name?` says the name.
+                    .when(!armed, |d| {
+                        d.child(div().flex_none().text_color(p.sub_name_t).child(SharedString::from(cut(&r.name, NAME_CHARS))))
+                    })
+                    .when_some(armed_el, |d, a| d.child(a))
+                    .when(!armed, |d| {
+                        d.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_color(step_color)
+                                .child(SharedString::from(chip_step(r).to_string())),
+                        )
+                        // The clock's slot, as wide as it ever reads, and the ×'s
+                        // after it (drawn on hover, design.md §5; always on the
+                        // watched one), each there whether it shows or not: the
+                        // step's room is the same in every state.
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(crate::turns::text_w(CLOCK_CHARS, cw)))
+                                .flex()
+                                .justify_end()
+                                .text_color(p.sub_time_t)
+                                .children(clock.filter(|_| r.clocked())),
+                        )
+                        .child(div().flex_none().w(px(X_W)).flex().justify_center().children(x))
+                    }),
+            )
             .child(bar)
             .children(self.render_menu_at_row(r.id, p, cx));
         if !r.watchable {
@@ -791,7 +804,7 @@ impl AppView {
         // No card over an open menu.
         row.when(self.menu.is_none(), |d| d.tooltip(crate::wtabs::card_tip(cx.weak_entity(), who.clone(), r.tip.clone())))
             .cursor_pointer()
-            .hover(|d| d.bg(p.tool_out))
+            .hover(|d| d.bg(p.hover_agent))
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who, false, ev, window, cx)))
             .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who2, false, ev, window, cx)))
             .into_any_element()
@@ -799,7 +812,7 @@ impl AppView {
 
     /// A chip that left, fading (`fade` 1 → 0) in its slot: what it said,
     /// with no id, listener or hitbox (motion.md §8: an exit takes no click).
-    /// Its frame, text and marks fade into the canvas it sits on, as colour
+    /// Its fill, text and marks fade into the canvas it sits on, as colour
     /// mixes (what opacity would paint there; no translucent text,
     /// design.md §5).
     fn tray_ghost(&self, r: &TrayRow, fade: f32, w: f32, h: f32, p: &Palette, m: &Metrics) -> AnyElement {
@@ -812,18 +825,32 @@ impl AppView {
             .h(px(h))
             .w(px(w))
             .relative()
-            .pl(px(12.))
-            .pr(px(10.))
-            .gap(px(8.))
-            .items_center()
             .overflow_hidden()
             .whitespace_nowrap()
             .text_px(m.meta)
-            .border_1()
-            .border_color(f(p.hair_t))
-            .child(glyph::draw_on(g, f(mark), p.canvas))
-            .child(div().flex_none().text_color(f(p.sub_name_t)).child(SharedString::from(cut(&r.name, NAME_CHARS))))
-            .child(div().flex_1().min_w_0().overflow_hidden().text_color(f(word_color)).child(SharedString::from(chip_step(r).to_string())))
+            .bg(f(p.card_agent))
+            .px(px(crate::cards::frame_room(self.scale)))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .pl(px(12.))
+                    .pr(px(10.))
+                    .gap(px(8.))
+                    .items_center()
+                    .overflow_hidden()
+                    .child(glyph::draw_on(g, f(mark), f(p.card_agent)))
+                    .child(div().flex_none().text_color(f(p.sub_name_t)).child(SharedString::from(cut(&r.name, NAME_CHARS))))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_color(f(word_color))
+                            .child(SharedString::from(chip_step(r).to_string())),
+                    ),
+            )
             .child(glyph::bar(f(p.sub_rule)))
             .into_any_element()
     }

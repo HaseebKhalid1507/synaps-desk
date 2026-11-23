@@ -1972,7 +1972,6 @@ impl AppView {
             .px(px(g.pad))
             .gap(px(g.gap))
             .items_center()
-            .rounded(px(g.row_radius))
             .font_family(fonts::MONO)
             .text_px(m.mono)
             .cursor_pointer()
@@ -2197,7 +2196,6 @@ impl AppView {
             .px(px(g.pad))
             .gap(px(g.gap))
             .items_center()
-            .rounded(px(g.row_radius))
             .when_some(wash, |d, w| d.bg(w))
             .when(has_body && wash.is_none(), |d| d.cursor_pointer().hover(|d| d.bg(p.hover)))
             .when(has_body && wash.is_some(), |d| d.cursor_pointer())
@@ -2256,7 +2254,9 @@ impl AppView {
             .into_any_element()
     }
 
-    /// A worker's spawn row (polish.md §2.4): one row, the worker's state
+    /// A worker's spawn row (polish.md §2.4): one row on the worker's own
+    /// fill (`card_agent`, square: a worker, not a tool, Haseeb) inside its
+    /// run's card, the worker's state
     /// in the gutter (not the call's), `spawn`, its name and task, its facts
     /// (the clock ticks while it runs here: [`crate::tray::ticked`]) and
     /// OPEN ↗; under it while it runs its step (↳, `sub_status_t`), once
@@ -2296,8 +2296,9 @@ impl AppView {
         let d = crate::cards::Geo::of(m);
         let life = glyph::life_of_worker(live);
         let steady = glyph::life_of_worker(glyph::steady(live, v.demoted));
+        // On the worker's own fill (`card_agent`): a worker, not a tool.
         let status =
-            glyph::indicator(fx, life, p.card_d, p, fx.col(self.panes.cur.id).change(Tag::BlockGlyph, key, steady.code(), None), None);
+            glyph::indicator(fx, life, p.card_agent, p, fx.col(self.panes.cur.id).change(Tag::BlockGlyph, key, steady.code(), None), None);
         // Its task: the call's argument after the worker's label.
         let task = row.arg.split_once(" · ").map_or_else(|| row.arg.clone(), |(_, t)| SharedString::from(tilde(t, true)));
         let target = h_flex()
@@ -2345,11 +2346,10 @@ impl AppView {
                 .gap(px(6.))
                 .items_center()
                 .group("wopen")
-                .rounded(px(4.))
                 .border_1()
                 .border_color(p.line)
-                .bg(p.card_d)
-                .hover(|d| d.bg(p.hover))
+                .bg(p.card_agent)
+                .hover(|d| d.bg(p.hover_agent))
                 // Hovered, it lights: its outline to `frame`, its word and
                 // arrow to `prose_t` (both floored on the hovered row).
                 .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.meta).text_color(p.prose_t).child("Open"))
@@ -2420,9 +2420,10 @@ impl AppView {
             })
         };
         // The whole of it is the hover's: its box reaches into the gutter.
+        // On the worker's fill, square, inside its run's card.
         let block = v_flex()
             .relative()
-            .rounded(px(d.row_radius))
+            .bg(p.card_agent)
             .font_family(fonts::MONO)
             .text_px(m.mono)
             .line_height(px(m.mono_line))
@@ -2446,7 +2447,7 @@ impl AppView {
             .id(("wblock", id as usize))
             .group("wblock")
             .cursor_pointer()
-            .hover(|d| d.bg(p.hover))
+            .hover(|d| d.bg(p.hover_agent))
             .when(self.menu.is_none(), |d| d.tooltip(crate::wtabs::card_tip(cx.weak_entity(), who.clone(), tip)))
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who, true, ev, window, cx)))
             .on_aux_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.worker_click(&who2, true, ev, window, cx)))
@@ -2533,7 +2534,7 @@ impl AppView {
 }
 
 /// An opened call's body (cards4/proposal.md §3): under its row on
-/// `well_d`, square ([`crate::cards::Geo::well_radius`]), no frame, indented to the verb column (36 px from
+/// `well_d`, square, no frame, indented to the verb column (36 px from
 /// the row's edge), to the card's inner edge. An edit's lines full width on
 /// their washes, the sign hanging in an 18 px column; a read's with the
 /// file's own numbers right-aligned in a 30 px column; any other output as
@@ -2578,7 +2579,6 @@ fn well(row: &RowCache, failed: bool, id: u64, streamed: &[(usize, f32, f32, Rc<
         .mr(px(g.pad))
         .mt(px(1.))
         .mb(px((8. * m.r).round()))
-        .rounded(px(g.well_radius))
         .overflow_hidden()
         .bg(p.well_d)
         .text_color(p.res)

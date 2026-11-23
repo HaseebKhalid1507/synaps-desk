@@ -965,7 +965,6 @@ impl AppView {
                 .px(px(12.))
                 .gap(px(8.))
                 .items_center()
-                .rounded(px(5.))
                 .border_1()
                 .border_color(p.line)
                 .bg(bg)
@@ -998,7 +997,6 @@ impl AppView {
                 .px(px(14.))
                 .gap(px(8.))
                 .items_center()
-                .rounded(px(5.))
                 .overflow_hidden()
                 .border_1()
                 .border_color(edge)
@@ -1292,16 +1290,13 @@ impl AppView {
                     div()
                         .flex_none()
                         .size(px(CHECK))
-                        .rounded(px(3.))
                         .border_1()
                         // Focused (Tab, a click): Space toggles it.
                         .border_color(if check_focused { p.focus_k } else { p.dim_t })
                         .flex()
                         .items_center()
                         .justify_center()
-                        .when(allow_all, |d| {
-                            d.child(div().size(px(CHECK_IN)).rounded(px(1.)).bg(p.acc).debug_selector(|| "card-allow-all-on".into()))
-                        }),
+                        .when(allow_all, |d| d.child(div().size(px(CHECK_IN)).bg(p.acc).debug_selector(|| "card-allow-all-on".into()))),
                 )
                 .child(
                     div()
@@ -1366,7 +1361,6 @@ impl AppView {
             })
             .w_full()
             .relative()
-            .rounded(px(crate::cards::Geo::of(m).radius))
             .border_1()
             .border_color(p.acc_line)
             .bg(card_bg)
@@ -1395,17 +1389,7 @@ impl AppView {
                 // A press on the bar gives a confirm card the keys, as one on the card does.
                 let bar = crate::scrollbar::Bar::new(c.scroll.clone(), &c.bar);
                 let bar = if secret || !live { bar } else { bar.focus(self.focus.clone()) };
-                d.child(
-                    div()
-                        .mt(px((10. * r).round()))
-                        .relative()
-                        .rounded(px(crate::cards::Geo::of(m).well_radius))
-                        .overflow_hidden()
-                        .border_1()
-                        .border_color(p.line)
-                        .child(well)
-                        .child(bar),
-                )
+                d.child(div().mt(px((10. * r).round())).relative().overflow_hidden().border_1().border_color(p.line).child(well).child(bar))
             })
             .children(status)
             .child(line)
