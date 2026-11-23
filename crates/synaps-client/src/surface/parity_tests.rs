@@ -248,19 +248,40 @@ fn raw_fixtures() {
     }
 }
 
+/// Scalar values assigned after the corpus's Unicode (16.0.0) whose full
+/// case fold is not their lowercase, with the version that assigned them:
+/// `casefold.json` can't list them. `fold_key` folds them as a toolchain
+/// that knows them says (`CaseFolding.txt`); one that doesn't leaves them,
+/// as the engine's does (its CI is Rust 1.95; the desk pins 1.100,
+/// Unicode 18). Unicode 18's whole list: emulating `fold_key` on its UCD
+/// matches its full folding at every scalar value.
+const FOLDS_AFTER_THE_CORPUS: &[(u32, &str, (u8, u8, u8))] = &[
+    // LATIN SMALL LIGATURE LONG S WITH DESCENDER S: `1DF95; F; 0073 0073`,
+    // as U+00DF (its uppercase is `SS`).
+    (0x1DF95, "ss", (18, 0, 0)),
+];
+
 /// The label comparison key is Unicode full case folding (Shady #439 M3),
-/// pinned for every scalar value against Python's `str.casefold`.
+/// pinned for every scalar value against Python's `str.casefold`, plus
+/// [`FOLDS_AFTER_THE_CORPUS`] on a toolchain newer than the corpus.
 #[test]
 fn casefold_fixture() {
     let f = read("casefold.json");
     let table = f["differs_from_lowercase"].as_object().unwrap();
     assert!(table.len() > 200);
+    assert_eq!(f["unicode"], "16.0.0", "FOLDS_AFTER_THE_CORPUS is relative to the corpus's Unicode");
     let (major, minor, update) = char::UNICODE_VERSION;
+    let newer = |c: char| {
+        FOLDS_AFTER_THE_CORPUS
+            .iter()
+            .find(|(cp, _, since)| *cp == c as u32 && char::UNICODE_VERSION >= *since)
+            .map(|(_, f, _)| f.to_string())
+    };
     let mut wrong = Vec::new();
     for c in (0..=0x10FFFFu32).filter_map(char::from_u32) {
         let expected = match table.get(&format!("U+{:04X}", c as u32)) {
             Some(v) => v.as_str().unwrap().to_string(),
-            None => c.to_lowercase().collect(),
+            None => newer(c).unwrap_or_else(|| c.to_lowercase().collect()),
         };
         if fold_key(&c.to_string()) != expected {
             wrong.push(format!("U+{:04X}", c as u32));
