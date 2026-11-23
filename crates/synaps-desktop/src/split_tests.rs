@@ -1069,11 +1069,21 @@ fn a_pane_an_event_closes_leaves_the_focus(cx: &mut TestAppContext) {
 // ── Round 3 (Shady #36 r2): #33's label hang, per pane ──────────────────
 
 /// One 144 Hz frame on the test's clock, drawn (`test_kit`'s
-/// `fluid_frame`).
+/// `fluid_frame`). Timer by timer, the clock at each one's deadline (#52:
+/// `ui_tests`' `fluid_frame`).
 fn frame_144(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>) {
     let dt = Duration::from_micros(6944);
-    view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
-    cx.executor().advance_clock(dt);
+    let (t0, at) = (cx.executor().now(), view.read_with(cx, |v, _| v.fx.clock()));
+    let _end = cx.executor().timer(dt);
+    loop {
+        cx.dispatcher.advance_clock_to_next_timer();
+        let t = cx.executor().now() - t0;
+        view.read_with(cx, |v, _| v.fx.set_clock(at + t));
+        cx.run_until_parked();
+        if t >= dt {
+            break;
+        }
+    }
     view.update(cx, |_, cx| cx.notify());
     cx.update_window(window, |_, w, cx| w.simulate_next_frame(cx)).expect("the window");
     cx.run_until_parked();
@@ -1874,7 +1884,10 @@ fn a_split_grows_on_sheet_and_its_last_moving_frame_is_the_landed_layout(cx: &mu
         assert!(w[1].1[2] >= w[0].1[2] && w[1].0[2] <= w[0].0[2], "the new pane only grows, its neighbour only yields: {w:?}");
     }
     assert!(steps.iter().all(|(a, b)| a.iter().chain(b).all(|v| v.fract() == 0.)), "whole pixels");
-    assert_eq!(steps[steps.len() - 2], landed, "the last frame that moves draws the landed layout");
+    // #52: it lands in the frame it draws the landed layout, the last that
+    // moves: the frame before it is still on its way (no still frame
+    // before the landing).
+    assert_ne!(steps[steps.len() - 2], landed, "the frame before the landing already drew the landed layout");
     let tree = view.read_with(cx, |v, _| {
         let (w, h) = v.centre.get();
         v.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h })
@@ -1947,7 +1960,9 @@ fn a_close_collapses_on_sheet_and_lands_as_one_pane(cx: &mut TestAppContext) {
     let lands = steps.iter().position(|s| s.1[2] >= w).expect("landed");
     eprintln!("CLOSE-LANDS frame {lands} ({:.0} ms), settles frame {frames}", lands as f32 * 6.944);
     assert!(lands <= sheet_lands(travel), "lands on `sheet`: frame {lands}, the spring's {}", sheet_lands(travel));
-    assert_eq!(steps[steps.len() - 2].1[2], w, "the last frame that moves: the one pane across the centre");
+    // #52: it lands in the frame the one pane is across the centre, the
+    // last that moves: the frame before it is still on its way.
+    assert!(steps[steps.len() - 2].1[2] < w, "the frame before the landing already drew the one pane across the centre");
     // Its column kept the narrow wrap through the flight and rewraps
     // once, as it lands: the panels' rule, `PanelFx.freeze` (Shady #42 L4).
     assert!(columns.len() <= 2, "one rewrap: {columns:?}");
@@ -4009,6 +4024,9 @@ fn a_close_beside_a_view_flies_on_its_own_spring(cx: &mut TestAppContext) {
     let step = widths.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0., f32::max);
     let moving = widths.windows(2).filter(|w| (w[1] - w[0]).abs() > 0.5).count();
     assert!(travel > 100., "the kept pane takes the closing share: {widths:?}");
+    // From its first frames (Shady #54 n6: not a freeze, then a fast
+    // flight that keeps under the step).
+    assert!(widths[..4].windows(2).any(|w| w[1] - w[0] > 0.5), "the kept pane widens within the first 3 frames: {widths:?}");
     assert!(
         step <= travel * top * 1.25 + 2. && moving >= 10,
         "the kept pane steps at most its spring's top step ({:.1} px), in {moving} frames: {step} px; {widths:?}",
@@ -4067,6 +4085,12 @@ fn a_ride_whose_ends_move_hands_the_layout_back(cx: &mut TestAppContext) {
             .filter(|(i, _)| !(case == "a resize" && *i == 14))
             .map(|(_, w)| (w[1] - w[0]).abs())
             .fold(0., f32::max);
+        // A tenth of the landed width a frame: about 2.2x the `sheet`
+        // spring's top step (4.46 % of its travel a frame at 144 Hz), room
+        // for main's double drive after the handback (the ratios lerped over
+        // a centre still moving: up to near 2x). It catches a stall's jump
+        // (292-357 px on `eae7eda`), not a handback that restarts from a
+        // little off where the layout was drawn (Shady #54 n5).
         if rest < 10 {
             fails.push(format!("{case}: never landed"));
         } else if step > landed * 0.1 {
@@ -4120,6 +4144,204 @@ fn a_ride_lands_on_arrival_at_a_fractional_scale(cx: &mut TestAppContext) {
     assert!(
         late.is_empty() && after.is_empty(),
         "lands in the frame it arrives: still moving at its target in frames {late:?}, moves after {after:?}; {seen:?}"
+    );
+}
+
+/// #52: a layout's flight lands in the frame it draws the landed layout,
+/// as the side panels do (#50), not when its spring settles 6 or 7 frames
+/// (144 Hz) later. In that frame the flight is over, a closing pane goes
+/// and the dividers take their handles (none in any frame before it);
+/// nothing asks for a frame or an app timer after it (the beat's apart:
+/// the demo's sessions run). A composer's inset that flies with it stops
+/// in the frame its composer is drawn where it lands. A split and a close
+/// on the layout's own spring and riding the right panel (#51), a split
+/// down (the top pane's composer leaves the window's foot: its inset
+/// flies), and a 2-pane rail fold. On `3f92c1d` the handles came 6-7
+/// frames after the panes stopped (one, riding), the settling woke the
+/// app, and the inset moved on 6-7 frames after its composer stopped.
+#[gpui_kit::test]
+fn a_layouts_flight_lands_with_its_handles_and_nothing_wakes_after(cx: &mut TestAppContext) {
+    use crate::motion::Wake;
+    let mut fails = Vec::new();
+    for case in ["a split", "a split riding", "a close", "a close riding", "a split down", "the rail folds, two panes"] {
+        let riding = case.ends_with("riding");
+        let (window, view) = demo_split(cx, 1920., 1080.);
+        panels_at(cx, &view, riding || case.starts_with("the rail"), 480, 520);
+        frame(cx, window);
+        level(cx, crate::motion::Level::Full);
+        frame(cx, window);
+        if case.starts_with("a close") || case.starts_with("the rail") {
+            key(cx, window, "ctrl-\\");
+            land(cx, window, &view);
+            for _ in 0..60 {
+                frame_144(cx, window, &view);
+            }
+        }
+        match case {
+            "a split" | "a split riding" => key(cx, window, "ctrl-\\"),
+            "a split down" => key(cx, window, "ctrl-shift-\\"),
+            "the rail folds, two panes" => view.update(cx, |v, cx| v.toggle_panel(true, cx)),
+            _ => view.update(cx, |v, cx| {
+                let last = *v.reading_order().last().expect("a pane");
+                v.in_pane(last, |v| v.close_pane());
+                cx.notify();
+            }),
+        }
+        cx.run_until_parked();
+        // A frame: the panels' edges and every pane's box as drawn (a
+        // closing share too); then what waits for the landing.
+        let ids = view.read_with(cx, |v, _| v.panes.ids());
+        // Each pane's composer as drawn, from its pane's foot (its inset)
+        // and its height (the inset above it), and whether its insets move.
+        let composers = |cx: &mut TestAppContext| -> Vec<(f32, f32, bool)> {
+            ids.iter()
+                .map(|id| {
+                    let pane = drawn(cx, window, format!("pane {}", id.index())).unwrap_or([0.; 4]);
+                    let c = drawn(cx, window, format!("composer-frame {}", id.index())).unwrap_or([0.; 4]);
+                    let moving = view.read_with(cx, |v, _| v.panes.get(*id).is_some_and(|p| p.foot_moving.get() || p.top_moving.get()));
+                    (pane[1] + pane[3] - c[1] - c[3], c[3], moving)
+                })
+                .collect()
+        };
+        let mut insets = vec![composers(cx)];
+        let shot = |cx: &mut TestAppContext| {
+            let handles = drawn(cx, window, "divider-grab 0".into()).is_some();
+            view.read_with(cx, |v, _| {
+                let (w, h) = v.centre.get();
+                let mut edges = vec![v.panel_fx.sides[0].shown, v.panel_fx.sides[1].shown];
+                for (_, r) in v.panes.drawn.rects(crate::split::Rect { x: 0., y: 0., w, h }) {
+                    edges.extend([r.x, r.y, r.w, r.h]);
+                }
+                let insets = v.panes.ids().iter().filter_map(|id| v.panes.get(*id)).any(|p| p.foot_moving.get() || p.top_moving.get());
+                let (frame, timer) = v.fx.pending();
+                let woke = frame || (timer.is_some() && v.fx.wakes() == Some(Wake::App));
+                let ride = v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some());
+                (edges, handles, v.panes.flight.is_some(), !v.panes.closing.is_empty(), insets, woke, ride)
+            })
+        };
+        let mut seen = vec![shot(cx)];
+        let mut rest = 0;
+        while rest < 10 {
+            frame_144(cx, window, &view);
+            seen.push(shot(cx));
+            insets.push(composers(cx));
+            let busy = view.read_with(cx, |v, _| v.panel_fx.moving() || v.panes.flight.is_some() || v.fx.pending().0);
+            rest = if busy { 0 } else { rest + 1 };
+            assert!(seen.len() < 500, "{case}: never landed");
+        }
+        let same = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.01);
+        let last = (1..seen.len()).rev().find(|&i| !same(&seen[i].0, &seen[i - 1].0)).unwrap_or(0);
+        if last < 10 {
+            fails.push(format!("{case}: it didn't fly ({last} frames)"));
+            continue;
+        }
+        if seen.iter().any(|s| s.6) != (riding || case.starts_with("the rail")) && case != "the rail folds, two panes" {
+            fails.push(format!("{case}: rides {}", seen.iter().any(|s| s.6)));
+        }
+        // An inset that flew stops moving in the frame its composer is
+        // drawn where it lands, not as its spring settles after.
+        for k in 0..ids.len() {
+            if !insets.iter().any(|f| f[k].2) {
+                continue;
+            }
+            let at = |i: usize| (insets[i][k].0, insets[i][k].1);
+            let arrives = (1..insets.len()).rev().find(|&i| at(i) != at(i - 1)).unwrap_or(0);
+            let late: Vec<usize> = (arrives..insets.len()).filter(|&i| insets[i][k].2).collect();
+            if !late.is_empty() {
+                fails.push(format!(
+                    "{case}: pane {k}'s composer is drawn where it lands at frame {arrives}, its inset moves on in {late:?}"
+                ));
+            }
+        }
+        if case == "a split down" && !insets.iter().any(|f| f.iter().any(|c| c.2)) {
+            fails.push(format!("{case}: no inset flew"));
+        }
+        let panes = view.read_with(cx, |v, _| v.panes.len());
+        let (_, handles, flying, closing, insets, woke, _) = seen[last].clone();
+        let early: Vec<usize> = (1..last).filter(|&k| seen[k].1).collect();
+        if flying || closing || insets || handles != (panes > 1) || woke || !early.is_empty() {
+            fails.push(format!(
+                "{case}: in the frame it lands ({last} of {}): in flight {flying}, a closing pane {closing}, an inset moving {insets}, \
+                 handles {handles} (panes {panes}; before it in {early:?}), a frame or an app timer asked for {woke}; the handles come at {:?}",
+                seen.len(),
+                seen.iter().position(|s| s.1)
+            ));
+        }
+        if seen[last + 1..].iter().any(|s| s.5) {
+            fails.push(format!("{case}: woke after the landing (frame {last})"));
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// Shady #54 L3: Settings opened in the pane a close leaves while the
+/// close rides the right panel: from then the layout is drawn without the
+/// right panel (a view has none, as M1), so it flies on from where it is
+/// drawn on its own spring. The closing share goes on closing frame by
+/// frame, never back to where it started (on `3f92c1d` it jumped back to
+/// its full share, held, then went in one frame).
+#[gpui_kit::test]
+fn a_view_opened_mid_close_hands_the_layout_back(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    panels_at(cx, &view, true, 480, 520);
+    frame(cx, window);
+    level(cx, crate::motion::Level::Full);
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    for _ in 0..60 {
+        frame_144(cx, window, &view);
+    }
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    let (kept, gone) = (order[0], order[1]);
+    view.update(cx, |v, cx| {
+        v.focus_pane(kept, crate::pane::KeysTo::Pane, cx);
+        v.in_pane(gone, |v| v.close_pane());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let share = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let (w, h) = v.centre.get();
+            v.panes.drawn.rects(crate::split::Rect { x: 0., y: 0., w, h }).iter().find(|(i, _)| *i == gone).map_or(0., |(_, r)| r.w / w)
+        })
+    };
+    let mut shares = vec![share(cx)];
+    let mut rest = 0;
+    for k in 1.. {
+        if k == 10 {
+            assert!(
+                view.read_with(cx, |v, _| v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some())),
+                "the close rides the right panel"
+            );
+            view.update(cx, |v, cx| {
+                v.model.tabs.open_view(crate::tabs::Kind::Settings);
+                v.reconcile(None);
+                cx.notify();
+            });
+            cx.run_until_parked();
+        }
+        frame_144(cx, window, &view);
+        shares.push(share(cx));
+        let busy = view.read_with(cx, |v, _| v.panel_fx.moving() || v.panes.flight.is_some() || v.fx.pending().0);
+        rest = if busy || k <= 10 { 0 } else { rest + 1 };
+        if rest == 10 || k == 500 {
+            break;
+        }
+    }
+    assert!(view.read_with(cx, |v, _| v.model.tabs.view().is_some()), "Settings on screen in the pane that stays");
+    assert!(rest == 10 && shares[shares.len() - 1] == 0., "it lands closed: {shares:?}");
+    // A share's step a frame: at most its spring's top step (`sheet` from
+    // rest, 4.46 % of the travel a frame at 144 Hz) of the share it
+    // started at, with room for whole pixels.
+    let top = std::f32::consts::TAU / crate::motion::SHEET_RESPONSE * 0.006944 / std::f32::consts::E;
+    let back: Vec<usize> = (1..shares.len()).filter(|&k| shares[k] > shares[k - 1] + 0.002).collect();
+    let step = shares.windows(2).map(|w| w[0] - w[1]).fold(0., f32::max);
+    let moving = shares[10..].windows(2).filter(|w| w[0] - w[1] > 0.0005).count();
+    assert!(
+        back.is_empty() && step <= shares[0] * top * 1.25 + 0.002 && moving >= 10,
+        "the closing share only closes, on its spring ({:.4} a frame), from the view on in {moving} frames: back in {back:?}, \
+         steps {step:.4}; {shares:?}",
+        shares[0] * top
     );
 }
 
