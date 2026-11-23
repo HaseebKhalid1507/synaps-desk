@@ -375,8 +375,9 @@ pub struct Transcript {
     /// its own history row ([`same_event`]).
     replaying: bool,
     /// The message folded last was a compaction summary
-    /// ([`is_compaction_summary`]): the next, if the acknowledgement the
-    /// daemon writes after it, is not drawn either.
+    /// ([`is_compaction_summary`]): the next, if it is the acknowledgement
+    /// the daemon writes after one ([`COMPACTION_ACKS`]), is not drawn
+    /// either.
     after_summary: bool,
 }
 
@@ -989,15 +990,17 @@ impl Transcript {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
         let content = m.get("content").unwrap_or(&Value::Null);
         // A compaction's two messages (#14), drawn as nothing, as the TUI
-        // and the daemon's display projection do: the summary, and the
-        // acknowledgement right after it (the projection draws no
-        // string-content assistant message; this one only).
+        // and the daemon's display projection do: the summary, and right
+        // after it the daemon's acknowledgement, word for word (Shady
+        // C63-1: not whatever the assistant said next; the projection draws
+        // no string-content assistant message, this client draws all but
+        // this one).
         let after_summary = std::mem::take(&mut self.after_summary);
         if is_compaction_summary(m) {
             self.after_summary = true;
             return;
         }
-        if after_summary && role == "assistant" && content.is_string() {
+        if after_summary && role == "assistant" && content.as_str().is_some_and(|s| COMPACTION_ACKS.contains(&s)) {
             return;
         }
         match (role, content) {
@@ -1416,9 +1419,14 @@ fn steered_event(text: &str) -> Option<ExternalEvent> {
     ExternalEvent::is_payload(text).then(|| ExternalEvent::from_payload(text)).flatten()
 }
 
-/// Whether a history message's text (its content, or a text block of it)
-/// from `role` is an event's agent form: the one test the fold and
-/// [`Transcript::hold_events`] share. One that does not parse is a notice.
+/// The assistant message the daemon writes right after a compaction
+/// summary (SynapsCLI `agent-core` `core/compaction.rs`
+/// `compaction_context_messages`), and the one it wrote before T30.
+pub const COMPACTION_ACKS: [&str; 2] = [
+    "I've loaded the conversation summary. Ready to continue.",
+    "I've loaded the conversation summary and system prompt. Ready to continue.",
+];
+
 /// A compaction summary in a history (#14): a message whose content is a
 /// string holding `<context-summary>`, any role. The daemon's own rule
 /// (SynapsCLI dev `agent-engine` `session/display.rs` `items_of`, and
@@ -1427,11 +1435,20 @@ fn steered_event(text: &str) -> Option<ExternalEvent> {
 /// before this point was compacted into the following summary:\n\n
 /// <context-summary>…"), with no structural marker; older daemons wrote it
 /// at the start. Not a block's text (the daemon's rule reads only string
-/// content).
+/// content). Parity holds for plain messages: the daemon reads
+/// `user_content(msg)`, which turns a hooked one-text-block body back into
+/// a string first; this reads the raw content only. Shared with the
+/// daemon, and known: a plain string message that only quotes the tag (a
+/// user asking about it, an assistant naming it) is not drawn either; the
+/// message after it is, unless it is one of [`COMPACTION_ACKS`]. A
+/// structural marker upstream would end that.
 pub fn is_compaction_summary(m: &Value) -> bool {
     m.get("content").and_then(Value::as_str).is_some_and(|s| s.contains("<context-summary>"))
 }
 
+/// Whether a history message's text (its content, or a text block of it)
+/// from `role` is an event's agent form: the one test the fold and
+/// [`Transcript::hold_events`] share. One that does not parse is a notice.
 fn is_event_form(role: &str, text: &str) -> bool {
     role == "user" && ExternalEvent::is_payload(text)
 }

@@ -1052,6 +1052,8 @@ fn a_compaction_summary_is_drawn_as_nothing() {
     assert_eq!(drawn(&t)[1..], after[..], "split across appends: {:?}", texts(&t));
     // A `MessageHistory` while a turn runs, and a digest-less replay.
     let mut t = Transcript::new();
+    t.apply(&SessionEvent::TurnStarted { turn_baseline: 0, trigger: "user".into(), user_text: None });
+    assert!(t.busy(), "a turn runs");
     t.apply(&SessionEvent::Stream { event: StreamEvent::Session(SessionStreamEvent::MessageHistory { messages: compacted.clone() }) });
     assert_eq!(drawn(&t), after, "a MessageHistory");
     let mut t = Transcript::new();
@@ -1075,4 +1077,37 @@ fn a_compaction_summary_is_drawn_as_nothing() {
     assert_eq!(texts(&t), [(ItemKind::Assistant, ACK.to_string()), (ItemKind::User, "what is <context-summary>?".to_string())]);
     assert!(synaps_client::transcript::is_compaction_summary(&compacted[0]));
     assert!(!synaps_client::transcript::is_compaction_summary(&compacted[1]));
+    // Shady C63-1: after a summary only the daemon's acknowledgement, word
+    // for word, goes (today's, and the one before T30); an assistant's
+    // other words right after it are a row, and so is the acknowledgement
+    // after something else came between.
+    const OLD_ACK: &str = "I've loaded the conversation summary and system prompt. Ready to continue.";
+    let fold = |messages: &[serde_json::Value]| {
+        let mut t = Transcript::new();
+        t.apply_history(messages);
+        texts(&t).into_iter().filter(|(k, _)| *k != ItemKind::Notice).collect::<Vec<_>>()
+    };
+    let summary = json!({"role": "user", "content": SUMMARY});
+    let said = |s: &str| json!({"role": "assistant", "content": s});
+    assert_eq!(fold(&[summary.clone(), said(OLD_ACK)]), []);
+    assert_eq!(fold(&[summary.clone(), said("Here is the actual answer")]), [(ItemKind::Assistant, "Here is the actual answer".to_string())]);
+    assert_eq!(
+        fold(&[summary.clone(), json!({"role": "user", "content": "go on"}), said(ACK)]),
+        [(ItemKind::User, "go on".to_string()), (ItemKind::Assistant, ACK.to_string())]
+    );
+    // A whole-history fold starts afresh: a history that ended on a summary
+    // hides nothing of the next one.
+    let mut t = Transcript::new();
+    t.apply_update(&HistoryUpdate::Replace { messages: vec![summary.clone()] }).unwrap();
+    t.apply_update(&HistoryUpdate::Replace { messages: vec![said(ACK)] }).unwrap();
+    assert_eq!(texts(&t), [(ItemKind::Assistant, ACK.to_string())], "a replace resets it");
+    // Known, and the daemon's too (its rule is a substring of a string
+    // message): a plain string message that quotes the tag is not drawn,
+    // whoever wrote it. The reply after it is (it is no acknowledgement).
+    // In a block, a user's words are theirs (above).
+    assert_eq!(
+        fold(&[json!({"role": "user", "content": "Please explain <context-summary>"}), said("It wraps a summary.")]),
+        [(ItemKind::Assistant, "It wraps a summary.".to_string())]
+    );
+    assert_eq!(fold(&[said("The tag is <context-summary>.")]), []);
 }
