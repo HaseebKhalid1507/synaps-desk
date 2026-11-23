@@ -780,6 +780,20 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
                             cx.notify();
                         });
+                        // `SYNAPS_BENCH_STATES=denied|halted` (#25): what the
+                        // daemon applied was not this window's answer: another
+                        // client's Deny came first (the gated call is blocked
+                        // at its gate), or a HALT crossed it (cancelled before
+                        // it ran). Answer Allow before the resolve to see it.
+                        let crossed = match std::env::var("SYNAPS_BENCH_STATES").as_deref() {
+                            Ok("denied") => Some("Tool call blocked by extension: Tool call confirmation denied: guard wants to check rm -rf"),
+                            Ok("halted") => Some("Canceled by user"),
+                            _ => None,
+                        };
+                        if let Some(text) = crossed {
+                            sleep(0.1).await;
+                            apply(cx, vec![result("w0", text)]);
+                        }
                         // `SYNAPS_BENCH_HELD=1` (Shady #23 r4 H1): the room the
                         // card left held at the list's end, the composer
                         // grows three lines (a steer), then a new call at
@@ -1206,6 +1220,88 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     out["link_back_3s"] = stats(cx, t0, Instant::now(), c0, f0);
                     out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                     println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
+                // `SYNAPS_BENCH_WARM=S`: only the right panel's cache countdown
+                // (`crate::warm`), 10 s at rest each: a session whose cache
+                // expires in S s with the panel open (one frame a second under
+                // ten minutes), the same with the panel folded (none), one
+                // expiring in 52 minutes (one a minute), and none known.
+                if let Some(secs) = std::env::var("SYNAPS_BENCH_WARM").ok().and_then(|s| s.parse::<u64>().ok()) {
+                    let warm = |secs: Option<u64>| {
+                        move |v: &mut AppView, _: &mut Context<AppView>| {
+                            v.model.lives[v.panes.cur.live].stats.warm = secs.map(|s| {
+                                let st = json!({"keepwarm": {"mode": "auto"}, "cache": {"ttl": "5m", "expires_in_secs": s}});
+                                crate::warm::Warm::from_status(&st, crate::warm::Moment::now())
+                            });
+                        }
+                    };
+                    let fold = |folded: bool| {
+                        move |v: &mut AppView, cx: &mut Context<AppView>| {
+                            let mut p = v.panels;
+                            p.right_collapsed = folded;
+                            v.set_panels_pub(p, cx);
+                        }
+                    };
+                    let _ = upd(cx, &|v, _| v.model.local_session(v.panes.cur.live, "bench-warm"));
+                    let _ = upd(cx, &warm(Some(secs)));
+                    sleep(1.5).await;
+                    for (name, step) in [
+                        ("warm_open_10s", None),
+                        ("warm_folded_10s", Some(fold(true))),
+                        ("warm_reopened_10s", Some(fold(false))),
+                    ] {
+                        if let Some(step) = step {
+                            let _ = upd(cx, &step);
+                            sleep(1.5).await;
+                        }
+                        let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                        sleep(10.0).await;
+                        out[name] = stats(cx, t0, Instant::now(), c0, f0);
+                    }
+                    for (name, secs) in [("warm_52m_open_10s", Some(3125)), ("no_warm_open_10s", None)] {
+                        let _ = upd(cx, &warm(secs));
+                        sleep(1.5).await;
+                        let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                        sleep(10.0).await;
+                        out[name] = stats(cx, t0, Instant::now(), c0, f0);
+                    }
+                    out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
+                    println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
+                // `SYNAPS_BENCH_WARM_STATES=S`: the right panel's cache section
+                // in each state it shows, S s apiece, each announced on stdout
+                // (`warm-state <name>`) for a still: under a minute, at zero,
+                // unknown (`—`: a status without `cache`), an older daemon's
+                // (no section), a downgraded 1h.
+                if let Some(hold) = std::env::var("SYNAPS_BENCH_WARM_STATES").ok().and_then(|s| s.parse::<f64>().ok()) {
+                    let _ = upd(cx, &|v, _| v.model.local_session(v.panes.cur.live, "bench-warm"));
+                    let kw = json!({"mode": "off", "session_pings": 0, "session_keepwarm_usd": 0.0});
+                    let states = [
+                        ("under-a-minute", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw, "cache": {"ttl": "5m", "expires_in_secs": 42}}))),
+                        ("cold", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw, "cache": {"ttl": "5m", "expires_in_secs": 0}}))),
+                        ("unknown", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw}))),
+                        ("older-daemon", None),
+                        (
+                            "downgraded",
+                            Some(json!({"cache_ttl": {"setting": "1h"}, "pinned": true,
+                                "keepwarm": {"mode": "auto", "session_pings": 3, "session_keepwarm_usd": 0.0123, "period": {"next_ping_in_secs": 240}},
+                                "cache": {"ttl": "5m", "expires_in_secs": 268, "downgraded": true}})),
+                        ),
+                    ];
+                    for (name, st) in states {
+                        let set = move |v: &mut AppView, _: &mut Context<AppView>| {
+                            v.model.lives[v.panes.cur.live].stats.warm =
+                                st.as_ref().map(|s| crate::warm::Warm::from_status(s, crate::warm::Moment::now()));
+                        };
+                        let _ = upd(cx, &set);
+                        sleep(0.8).await;
+                        println!("warm-state {name}");
+                        sleep(hold).await;
+                    }
                     let _ = cx.update(|_, cx| cx.quit());
                     return;
                 }

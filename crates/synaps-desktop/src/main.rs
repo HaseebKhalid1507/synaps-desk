@@ -62,6 +62,8 @@ mod palette;
 mod palettes;
 mod pane;
 mod rail;
+#[cfg(test)]
+mod receipt_tests;
 mod scroll;
 mod scrollbar;
 mod settings;
@@ -88,6 +90,7 @@ mod ui_tests;
 mod usage;
 mod usage_view;
 mod views;
+mod warm;
 mod watch;
 mod wtabs;
 

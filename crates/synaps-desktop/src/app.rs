@@ -1968,6 +1968,9 @@ pub struct AppView {
     fold_keys: FoldKeys,
     /// The window's width at the last frame (what a fold acts on).
     pub(crate) width: f32,
+    /// Its scale at the last frame, unclamped (a card's edge holds a device
+    /// pixel at any: `cards::slab`).
+    pub(crate) scale: f32,
     /// Its height (the picker fits under it).
     pub(crate) height: f32,
     pub picker_open: bool,
@@ -2151,6 +2154,9 @@ pub struct AppView {
     pub(crate) window_active: bool,
     /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
     watch_poll: Option<(Instant, Task<()>)>,
+    /// The right panel's cache countdown: its next redraw (or status ask),
+    /// armed only while the panel shows a countdown ([`crate::warm`]).
+    warm_tick: Option<(Instant, Task<()>)>,
     /// Frames drawn for the window are shown (GPUI's visibility: mapped and
     /// not wholly covered, not minimized). Nothing polls while it is not.
     visible: bool,
@@ -2682,6 +2688,7 @@ impl AppView {
             panel_fx: crate::chrome::PanelFx::default(),
             fold_keys: FoldKeys::default(),
             width: 0.,
+            scale: 1.,
             height: 0.,
             picker_open: false,
             picker_note: None,
@@ -2774,6 +2781,7 @@ impl AppView {
             view_seen: None,
             window_active: true,
             watch_poll: None,
+            warm_tick: None,
             visible: i.visible,
             fx: Rc::default(),
             receipts: HashMap::new(),
@@ -2997,6 +3005,11 @@ impl AppView {
             }
             Effect::Setting { attach_seq, setting, reply } => self.choice_answered(attach_seq, &setting, reply),
             Effect::Options { attach_seq, reply } => self.choice_options(attach_seq, reply),
+            Effect::Status(seq) => {
+                if let Some(c) = &self.client {
+                    let _ = c.on(seq).status();
+                }
+            }
         }
     }
 
@@ -4725,6 +4738,58 @@ impl AppView {
         self.watch_poll = Some((due, task));
     }
 
+    /// The right panel's countdown redraws when what it says changes (each
+    /// second under ten minutes, each minute above), and the status is asked
+    /// again a little after a keep-warm ping is due: only while the panel
+    /// shows (`shown`) in a visible window. Cold, or nothing counting:
+    /// nothing armed (an idle window draws no frame for it).
+    fn arm_warm_tick(&mut self, shown: bool, cx: &mut Context<Self>) {
+        let now = crate::warm::Moment::now();
+        let warm = self.model.lives[self.panes.cur.live].stats.warm.as_ref().filter(|_| shown && self.visible);
+        let seq = self.model.lives[self.panes.cur.live].attachment();
+        let refresh = warm.and_then(|w| w.refresh_at(now)).filter(|_| seq.is_some() && self.client.is_some());
+        // Woken from a sleep: read again at once (the callback rebases).
+        let slept = warm.is_some_and(|w| w.slept(now)).then_some(now.mono);
+        let due = [warm.and_then(|w| w.next_change(now)), refresh, slept].into_iter().flatten().min();
+        let Some(due) = due else {
+            self.warm_tick = None;
+            return;
+        };
+        if self.warm_tick.as_ref().is_some_and(|(at, _)| *at == due) {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let left = due.saturating_duration_since(Instant::now());
+            if !left.is_zero() {
+                cx.background_executor().timer(left).await;
+            }
+            let _ = this.update(cx, |v, cx| {
+                v.warm_tick = None;
+                // The machine slept since the answer: what it said is aged
+                // by the sleep, and asked again.
+                let now = crate::warm::Moment::now();
+                let slept = v.model.lives[v.panes.cur.live].stats.warm.as_mut().is_some_and(|w| {
+                    let slept = w.slept(now);
+                    if slept {
+                        w.rebase(now);
+                    }
+                    slept
+                });
+                // A due ping moved the cache's anchor: ask once.
+                if (slept || refresh.is_some_and(|r| now.mono >= r))
+                    && let (Some(c), Some(seq)) = (&v.client, seq)
+                {
+                    let _ = c.on(seq).status();
+                    if let Some(w) = v.model.lives[v.panes.cur.live].stats.warm.as_mut() {
+                        w.next_ping = None;
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.warm_tick = Some((due, task));
+    }
+
     fn watch_poll_now(&mut self, cx: &mut Context<Self>) {
         self.watch_poll = None;
         let now = Instant::now();
@@ -4746,6 +4811,10 @@ impl AppView {
     fn visibility_changed(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible;
         self.arm_watch_poll(cx);
+        // Hidden: the cache countdown's timer goes now, not at its wake.
+        if !visible {
+            self.warm_tick = None;
+        }
         // Hidden, the heartbeat stops; shown again, the next frame re-arms it.
         self.fx.set_visible(visible);
         if visible {
@@ -5103,7 +5172,7 @@ impl AppView {
         let head = match (summary.and_then(|ix| self.panes.cur.disp.get(ix)), self.panes.cur.metrics_last.get()) {
             (Some(d), Some(m)) => {
                 let g = crate::cards::Geo::of(&m);
-                turns::gap_of(d.gap, &m) + g.inset + 1. + g.row
+                turns::gap_of(d.gap, &m) + g.edge + g.inset + g.row
             }
             _ => 41.,
         };
@@ -5823,6 +5892,7 @@ impl AppView {
             items[turn..=at].iter().rev().find_map(|i| i.tool.as_ref()).map(|t| SharedString::from(t.tool_id.clone()))
         });
         let mine = self.sent.take().filter(|s| s.key == c.key);
+        let sent = mine.is_some();
         let (answer, at, took) = match mine {
             Some(s) => (s.answer, s.at, Some(s.took)),
             None => (self.resolved_by(&c, &sid), crate::authorize::hhmm_now(), None),
@@ -5831,7 +5901,21 @@ impl AppView {
         let line = call.is_some();
         if let Some(call) = call {
             let receipts = self.receipts.entry(sid.clone()).or_default();
-            receipts.push(crate::authorize::Receipt { call, own, row: c.row, secret: c.secret, answer, at, took, landed: fx_now });
+            // What the daemon applied (SynapsCLI #437): the transcript took
+            // the `PromptResolved` that resolved this card.
+            let outcome = self.model.lives[self.panes.cur.live].transcript.resolved_outcome(c.key.1);
+            receipts.push(crate::authorize::Receipt {
+                call,
+                own,
+                row: c.row,
+                secret: c.secret,
+                answer,
+                sent,
+                at,
+                took,
+                landed: fx_now,
+                outcome,
+            });
             if receipts.len() > crate::authorize::RECEIPTS {
                 receipts.remove(0);
             }
@@ -8691,7 +8775,9 @@ impl AppView {
             let rows = this.fold_rows(&g.rows, cx);
             let inner = div().w_full().h(px(*h)).overflow_hidden().child(v_flex().w_full().mt(px(g.inner)).children(rows));
             let p = theme::palette(cx);
-            let room = crate::cards::slab(false, true, inner, &p, geo).h(px(*h + geo.inset + 1.)).debug_selector(|| "fold-gap".into());
+            let room = crate::cards::slab(false, true, inner, &p, geo, this.scale)
+                .h(px(*h + geo.edge + geo.inset))
+                .debug_selector(|| "fold-gap".into());
             el = div().w_full().child(el).child(room).into_any_element();
         }
         // The room an answered card gave up, under the last row.
@@ -9301,6 +9387,7 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
+        self.scale = window.scale_factor();
         if let Some(layout) = self.restore_layout.take() {
             self.restore_layout_now(layout, window, cx);
         }
@@ -9721,6 +9808,7 @@ impl Render for AppView {
         self.schedule_tabs_save(cx);
         self.schedule_favs_save(cx);
         self.arm_watch_poll(cx);
+        self.arm_warm_tick(matches!(right, Side::Open(_)) && (view.is_none() || self.panes.split()), cx);
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
         let drop_layer = self.render_drop_layer(&p, cx);
         h_flex()

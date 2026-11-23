@@ -2443,6 +2443,51 @@ impl AppView {
                     .child(div().flex_1().child(kv(label::CACHE_HIT, hit.clone(), true, glow(7, &hit, p.ink), p)))
                     .child(div().flex_1().child(kv(label::COST, cost.clone(), true, glow(8, &cost, p.cost_ch), p))),
             );
+        // The prompt cache's countdown and keep-warm (`crate::warm`): once
+        // the session's status has come.
+        let cache = s.warm.as_ref().map(|w| {
+            let now = crate::warm::Moment::now();
+            let left = w.left(now);
+            let (exp, exp_c) = match left {
+                Some(d) if d.is_zero() => ("cold".to_string(), p.dim_ch),
+                Some(d) if d.as_secs() < 60 => (crate::warm::clock(d), p.warn_ch),
+                Some(d) => (crate::warm::clock(d), p.ink),
+                None if w.knows_expiry => ("cold".to_string(), p.dim_ch),
+                None => ("—".to_string(), p.dim_ch),
+            };
+            let ping = w.ping_in(now).map_or_else(|| "—".to_string(), crate::warm::clock);
+            let spent = format!("${:.4}", w.spent);
+            v_flex()
+                .debug_selector(|| "right-cache".into())
+                .px(px(24.))
+                .pt(px(24.))
+                .pb(px(26.))
+                .border_b_1()
+                .border_color(p.hair)
+                .child(section(label::PROMPT_CACHE, p))
+                .child(h_flex().mt(px(20.)).child(div().flex_1().child(kv(label::EXPIRES, exp, true, exp_c, p))).child({
+                    let ttl = div().flex_1().child(kv(label::TTL, crate::warm::ttl_line(w).unwrap_or_else(|| "—".into()), false, p.ink, p));
+                    match crate::warm::ttl_tip(w) {
+                        Some(tip) => ttl
+                            .id("right-cache-ttl")
+                            .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
+                            .into_any_element(),
+                        None => ttl.into_any_element(),
+                    }
+                }))
+                .child(
+                    h_flex()
+                        .mt(px(22.))
+                        .child(div().flex_1().child(kv(label::KEEP_WARM, crate::warm::mode_line(w), false, p.ink, p)))
+                        .child(div().flex_1().child(kv(label::PINGS, w.pings.to_string(), false, p.ink, p))),
+                )
+                .child(
+                    h_flex()
+                        .mt(px(22.))
+                        .child(div().flex_1().child(kv(label::SPENT, spent, false, p.cost_ch, p)))
+                        .child(div().flex_1().child(kv(label::NEXT_PING, ping, false, p.ink, p))),
+                )
+        });
         let ledger = &s.files;
         let (added, removed) = ledger.totals();
         // An estimate is never shown as an exact count (`files::changed_lines`).
@@ -2598,6 +2643,7 @@ impl AppView {
             })
             .child(context)
             .child(tokens)
+            .children(cache)
             .child(files)
     }
 
