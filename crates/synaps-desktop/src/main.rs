@@ -59,6 +59,8 @@ mod palette;
 mod palettes;
 mod pane;
 mod rail;
+#[cfg(test)]
+mod receipt_tests;
 mod scroll;
 mod scrollbar;
 mod settings;

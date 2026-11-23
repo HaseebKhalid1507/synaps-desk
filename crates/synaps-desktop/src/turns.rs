@@ -2123,8 +2123,11 @@ impl AppView {
         let exit = (st == Some(ToolStatus::Failed)).then(|| crate::cards::Exit::of(&row.name, &row.result)).flatten();
         let word: Option<SharedString> = match exit {
             Some(e) => Some(e.word()),
-            None => crate::authorize::status_beside(state.1.filter(|w| *w != "stopped at output limit"), receipt.map(|r| r.answer_for(st)))
-                .map(SharedString::new_static),
+            None => {
+                let end = item.tool.as_ref().map_or("", crate::authorize::result_end);
+                crate::authorize::status_beside(state.1.filter(|w| *w != "stopped at output limit"), receipt.map(|r| r.answer_for(st, end)))
+                    .map(SharedString::new_static)
+            }
         }
         .filter(|_| !think && !(lay.tight && receipt.is_some()));
         let limit = st == Some(ToolStatus::Unknown);
