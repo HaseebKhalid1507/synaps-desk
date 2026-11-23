@@ -294,9 +294,9 @@ pub(crate) struct Receipt {
     pub(crate) took: Option<Duration>,
     /// When it landed: the receipt lifts in over `QUICK`.
     pub(crate) landed: Instant,
-    /// What the daemon applied (`PromptResolved.outcome`, SynapsCLI #430),
+    /// What the daemon applied (`PromptResolved.outcome`, SynapsCLI #437),
     /// read as the prompt resolved here. It decides the receipt; `None` (a
-    /// daemon before #430) leaves it to the call's end ([`applied`]).
+    /// daemon before SynapsCLI #437) leaves it to the call's end ([`applied`]).
     pub(crate) outcome: Option<PromptOutcome>,
 }
 
@@ -322,7 +322,7 @@ impl Receipt {
     /// What it says once its call's end is known (Shady L4): resolved with
     /// no answer from here, and the call cancelled, it was a cancel (a HALT
     /// from another client resolves the prompt while the turn still runs).
-    /// A daemon that says what it applied (SynapsCLI #430) is taken at its
+    /// A daemon that says what it applied (SynapsCLI #437) is taken at its
     /// word ([`Receipt::reported`]). Without it, a yes from here whose call
     /// shows it was held at its gate (#25: `applied`, [`applied`]) is
     /// `denied` (another client's Deny came first, the prompt timed out) or
@@ -358,7 +358,7 @@ impl Receipt {
 }
 
 impl Receipt {
-    /// The answer the daemon's outcome gives this receipt (SynapsCLI #430).
+    /// The answer the daemon's outcome gives this receipt (SynapsCLI #437).
     /// A cancel, or no answer by the deadline, is `cancelled` whoever was
     /// asked: the call never passed its gate. An answer sent from here says
     /// what applied instead of what was sent (another client's came first):
@@ -394,7 +394,7 @@ impl Receipt {
 
 /// Whether a yes to the prompt that gated `call` got it past its gate, as
 /// far as the call shows (#25): the fallback for a daemon that doesn't say
-/// what it applied (before SynapsCLI #430). An inference, not an
+/// what it applied (before SynapsCLI #437). An inference, not an
 /// acknowledgement: such a daemon resolves the prompt with no answer in it, and this window's answer is sent, not acknowledged
 /// (another client's Deny, a HALT or the prompt's timeout can cross it).
 ///
@@ -814,7 +814,7 @@ impl AppView {
         // Deny's stays `err`. Nothing else lights (Shady #23 L9: attention
         // follows the accent; a cancel, another client's answer, `dim`).
         // Only once the daemon applied it: as it lands when the daemon says
-        // so (SynapsCLI #430), else once its call shows it (#25); until
+        // so (SynapsCLI #437), else once its call shows it (#25); until
         // then `dim`, and if it never does, it is not an Allow.
         let lights = applied && matches!(answer, Answer::Allowed | Answer::AllowedAll | Answer::Provided);
         let lit = if lights { self.fx.decay(Some(r.landed + Duration::from_millis(240)), Duration::ZERO, crate::motion::GLOW) } else { 0. };
@@ -1610,7 +1610,7 @@ mod tests {
         assert_eq!(asked(&pr(serde_json::json!({"id": 1}))), None, "nothing known: nothing said");
     }
 
-    /// SynapsCLI #430: the daemon's outcome decides the receipt, whatever
+    /// SynapsCLI #437: the daemon's outcome decides the receipt, whatever
     /// the call's end would say; without one (an older daemon, or one this
     /// build does not know) the call decides, as for #25.
     #[test]

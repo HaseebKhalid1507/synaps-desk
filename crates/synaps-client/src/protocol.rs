@@ -1225,7 +1225,7 @@ pub struct ConversationDigest {
 }
 
 /// What the daemon applied when a prompt resolved (`PromptResolved.outcome`,
-/// SynapsCLI #430).
+/// SynapsCLI #437).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptOutcome {
@@ -1434,7 +1434,7 @@ pub enum SessionEvent {
     Prompt {
         request: PromptRequest,
     },
-    /// `outcome`: what the daemon applied (SynapsCLI #430). `None` from a
+    /// `outcome`: what the daemon applied (SynapsCLI #437). `None` from a
     /// daemon before it.
     PromptResolved {
         prompt_id: u64,

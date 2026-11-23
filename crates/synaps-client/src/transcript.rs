@@ -472,7 +472,7 @@ impl Transcript {
         self.resolved.iter().rev().find(|r| r.0 == id).map(|r| r.1)
     }
 
-    /// What the daemon applied when prompt `id` resolved (SynapsCLI #430).
+    /// What the daemon applied when prompt `id` resolved (SynapsCLI #437).
     /// `None`: a daemon that does not say, an outcome this build does not
     /// know, or not among the last few resolved here.
     pub fn resolved_outcome(&self, id: u64) -> Option<crate::protocol::PromptOutcome> {
@@ -1879,7 +1879,7 @@ mod outcome_tests {
         assert_eq!((t.resolved_busy(3), t.resolved_busy(4), t.resolved_busy(5)), (Some(true), Some(false), None));
     }
 
-    /// SynapsCLI #430: a prompt remembers what the daemon applied, decoded
+    /// SynapsCLI #437: a prompt remembers what the daemon applied, decoded
     /// from the wire; an older daemon's (no `outcome`) and one this build
     /// does not know read as nothing said.
     #[test]

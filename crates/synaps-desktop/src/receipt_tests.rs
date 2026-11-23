@@ -1,6 +1,6 @@
 //! #25: an authorize receipt says what the daemon applied, not what this
 //! window sent. An Allow from here can be crossed (another client's Deny, a
-//! HALT, the prompt's timeout). A daemon with SynapsCLI #430 says what it
+//! HALT, the prompt's timeout). A daemon with SynapsCLI #437 says what it
 //! applied (`PromptResolved.outcome`) and the receipt takes its word; an
 //! older one does not say, and the call does ([`crate::authorize::applied`]),
 //! as an inference from the engine's own result forms, never from what a
@@ -102,7 +102,7 @@ fn allow_then(
     allow_resolved_then(cx, level, None, end)
 }
 
-/// [`allow_then`], the prompt resolved with `outcome` (SynapsCLI #430;
+/// [`allow_then`], the prompt resolved with `outcome` (SynapsCLI #437;
 /// `None`: a daemon before it).
 fn allow_resolved_then(
     cx: &mut TestAppContext,
@@ -251,7 +251,7 @@ fn an_allow_whose_call_streamed_is_not_taken_back(cx: &mut TestAppContext) {
     }
 }
 
-// ── SynapsCLI #430: the daemon says what it applied ─────────────────────
+// ── SynapsCLI #437: the daemon says what it applied ─────────────────────
 
 /// The daemon applied another client's Deny over this window's Allow: the
 /// receipt says `denied` from its landing, while the call has said nothing
