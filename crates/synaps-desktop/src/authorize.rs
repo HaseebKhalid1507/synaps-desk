@@ -337,7 +337,11 @@ impl Receipt {
         match self.answer {
             Answer::Elsewhere | Answer::Resolved if call == Some(ToolStatus::Cancelled) => Answer::Cancelled,
             Answer::Allowed | Answer::AllowedAll | Answer::Provided if applied == Some(false) => {
-                if call == Some(ToolStatus::Denied) { Answer::Denied } else { Answer::Cancelled }
+                if call == Some(ToolStatus::Denied) {
+                    Answer::Denied
+                } else {
+                    Answer::Cancelled
+                }
             }
             a => a,
         }

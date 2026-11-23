@@ -219,7 +219,11 @@ fn an_applied_allow_lights_when_its_call_runs_and_stays_allowed(cx: &mut TestApp
 }
 
 fn delta(cx: &mut TestAppContext, view: &Entity<AppView>, call: &str, text: &str) {
-    stream(cx, view, serde_json::json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result_delta", "tool_id": call, "delta": text}}));
+    stream(
+        cx,
+        view,
+        serde_json::json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result_delta", "tool_id": call, "delta": text}}),
+    );
 }
 
 /// Shady C64-1: the call streamed (past its gate), then a HALT's live
