@@ -294,7 +294,9 @@ fn divider_path(seen: &DividerDraws, at: usize) -> Vec<(Instant, f32)> {
 /// #62 M2): at 1500 px, 2×, 480/240, the panes rounded from the centre's
 /// own edge put the divider at 971.5 then 971 (rail 476.5 → 477, the first
 /// pane 495 → 494); they are rounded on the window's pixels now
-/// ([`crate::split::Node::rects_in`]).
+/// ([`crate::split::Node::rects_in`]). Each flight starts from a frame
+/// at rest and lands ([`landing`]) where the same fold or unfold at Off
+/// draws the divider (Shady #62 r6 R6-2).
 #[gpui_kit::test]
 fn the_divider_moves_one_way_through_a_two_panel_settle(cx: &mut TestAppContext) {
     let mut fails = Vec::new();
@@ -331,20 +333,25 @@ fn the_divider_moves_one_way_through_a_two_panel_settle(cx: &mut TestAppContext)
         frame(cx, window);
         assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2, "{what}: two panes");
         level(cx, crate::motion::Level::Full);
-        let seen = draws(cx, &view, divider_drawn);
+        // Each draw's divider and whether a flight was under way.
+        let seen = draws(cx, &view, |v: &AppView| (divider_drawn(v), flying(v)));
+        let path = |at: usize| -> Vec<(Instant, f32)> {
+            let from: DividerDraws = Rc::new(RefCell::new(seen.borrow()[at..].iter().map(|d| d.0).collect()));
+            divider_path(&from, 0)
+        };
+        let mut landed = Vec::new();
         for motion in ["fold", "unfold"] {
-            let at = seen.borrow().len();
-            view.update(cx, |v, cx| v.toggle_panel(true, cx));
-            let mut rest = 0;
-            for _ in 0..400 {
-                frame_144(cx, window, &view);
-                let moving = view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving());
-                rest = if moving { 0 } else { rest + 1 };
-                if rest >= 5 {
-                    break;
-                }
+            // The frame before the flight, drawn at rest (Shady #62 r6 R6-2).
+            frame_144(cx, window, &view);
+            let before = seen.borrow().len() - 1;
+            if seen.borrow()[before].1 {
+                fails.push(format!("{what}, {motion}: the frame before was still moving"));
             }
-            let xs: Vec<f32> = divider_path(&seen, at).into_iter().map(|(_, x)| x).collect();
+            view.update(cx, |v, cx| v.toggle_panel(true, cx));
+            let steps = settle(cx, window, &view, &seen, |d| d.1);
+            let steps: Vec<usize> = steps.iter().map(|s| s - before).collect();
+            fails.extend(landing(&format!("{what}, {motion}"), &seen.borrow()[before..], &steps, |d| d.1));
+            let xs: Vec<f32> = path(before + 1).into_iter().map(|(_, x)| x).collect();
             assert!(xs.len() > 10 && xs[0] != xs[xs.len() - 1], "{what}, {motion}: the divider moved: {xs:?}");
             let dir = (xs[xs.len() - 1] - xs[0]).signum();
             for (i, d) in xs.windows(2).enumerate() {
@@ -352,12 +359,27 @@ fn the_divider_moves_one_way_through_a_two_panel_settle(cx: &mut TestAppContext)
                     fails.push(format!("{what}, {motion}, draw {}: the divider went back, {} -> {}", i + 1, d[0], d[1]));
                 }
             }
+            landed.push(xs[xs.len() - 1]);
         }
         // What the hook read is what was drawn: the rule's place, within
         // the device pixel GPUI snaps it to.
-        let last = divider_path(&seen, 0).last().map(|p| p.1).expect("a divider drawn");
+        let last = path(0).last().map(|p| p.1).expect("a divider drawn");
         let rule = drawn(cx, window, "pane-divider Row".into()).map(|b| b[0]).expect("the rule drawn");
         assert!((rule - last).abs() <= 1. / s + 0.01, "{what}: the rule at {rule}, the hook read {last}");
+        // Where each landed is where it rests (Shady #62 r6 R6-2): the same
+        // fold and unfold at Off, the panels and the panes there at once.
+        level(cx, crate::motion::Level::Off);
+        for (motion, x) in ["fold", "unfold"].into_iter().zip(landed) {
+            view.update(cx, |v, cx| v.toggle_panel(true, cx));
+            for _ in 0..3 {
+                frame_144(cx, window, &view);
+            }
+            let at_rest = path(0).last().map(|p| p.1).expect("a divider drawn");
+            eprintln!("SETTLE {what}, {motion}: landed at {x}, at rest (Off) {at_rest}");
+            if (at_rest - x).abs() > 0.01 {
+                fails.push(format!("{what}, {motion}: the divider landed at {x}, at rest it is at {at_rest}"));
+            }
+        }
         view.update(cx, |v, _| v.on_draw = None);
         view.update(cx, |v, _| v.client = None);
         let _ = client.shutdown();
@@ -713,7 +735,9 @@ fn a_split_down_mid_ride_rides_on(cx: &mut TestAppContext) {
 /// wider a pane (the panes are rounded on the window's pixels): pane 0
 /// went 467 → 468 at the start and → 472 as they landed. Then the rail
 /// unfolds (the centre narrows): one rewrap, in the flight's first frame.
-/// Every draw (#61's hook), from the frame before each flight.
+/// Every draw (#61's hook), from the frame before each flight, at rest;
+/// each lands ([`landing`]) on the columns the same fold or unfold draws
+/// at Off (Shady #62 r6 R6-2).
 #[gpui_kit::test]
 fn a_panels_flight_from_a_fractional_origin_rewraps_each_pane_once(cx: &mut TestAppContext) {
     let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "wrap-origin", (1280., 1080.));
@@ -734,29 +758,30 @@ fn a_panels_flight_from_a_fractional_origin_rewraps_each_pane_once(cx: &mut Test
     assert_eq!(view.read_with(cx, |v, _| v.pane_yield.map(|y| y.1)), Some(true), "the right panel yielded to them");
     level(cx, crate::motion::Level::Full);
     let ids = order.clone();
+    // Each draw: whether the panels fly, each pane's column, whether a
+    // flight (theirs or the layout's) was under way.
     let seen = draws(cx, &view, move |v: &AppView| {
         let cols: Vec<f32> = ids.iter().map(|id| v.panes.get(*id).map_or(f32::NAN, |p| p.layout.column)).collect();
-        (v.panel_fx.moving(), cols)
+        (v.panel_fx.moving(), cols, flying(v))
     });
     let mut fails = Vec::new();
+    let mut landed = Vec::new();
     for (motion, widens) in [("fold", true), ("unfold", false)] {
-        // The frame before the flight, drawn.
+        // The frame before the flight, drawn at rest (Shady #62 r6 R6-2).
         frame_144(cx, window, &view);
         let at = seen.borrow().len() - 1;
         view.update(cx, |v, cx| v.toggle_panel(true, cx));
-        let mut rest = 0;
-        for _ in 0..400 {
-            frame_144(cx, window, &view);
-            let moving = view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving());
-            rest = if moving { 0 } else { rest + 1 };
-            if rest >= 5 {
-                break;
-            }
+        let steps = settle(cx, window, &view, &seen, |d| d.2);
+        let got: Vec<(bool, Vec<f32>, bool)> = seen.borrow()[at..].to_vec();
+        if got[0].2 {
+            fails.push(format!("{motion}: the frame before the flight was still moving"));
         }
-        let got: Vec<(bool, Vec<f32>)> = seen.borrow()[at..].to_vec();
+        let steps: Vec<usize> = steps.iter().map(|s| s - at).collect();
+        fails.extend(landing(motion, &got, &steps, |d| d.2));
         assert!(got.iter().any(|d| d.0), "{motion}: the panels flew");
+        landed.push(got[got.len() - 1].1.clone());
         for (i, id) in order.iter().enumerate() {
-            let path: Vec<(bool, f32)> = got.iter().map(|(moving, cols)| (*moving, cols[i])).collect();
+            let path: Vec<(bool, f32)> = got.iter().map(|(moving, cols, _)| (*moving, cols[i])).collect();
             let (before, landed) = (path[0].1, path[path.len() - 1].1);
             eprintln!("WRAP {motion}, pane {i} ({id:?}): {path:?}");
             let mut columns: Vec<f32> = path.iter().map(|p| p.1).collect();
@@ -773,6 +798,20 @@ fn a_panels_flight_from_a_fractional_origin_rewraps_each_pane_once(cx: &mut Test
             if let Some(&(_, c)) = path.iter().find(|&&(moving, c)| moving && c != held) {
                 fails.push(format!("{motion}: pane {i}'s column {c} in the flight (the frame before {before}, landed {landed})"));
             }
+        }
+    }
+    // Where each landed is where it rests (Shady #62 r6 R6-2): the same
+    // fold and unfold at Off, the panels and the panes there at once.
+    level(cx, crate::motion::Level::Off);
+    for (motion, cols) in ["fold", "unfold"].into_iter().zip(landed) {
+        view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        for _ in 0..3 {
+            frame_144(cx, window, &view);
+        }
+        let at_rest = seen.borrow().last().map(|d| d.1.clone()).expect("a draw");
+        eprintln!("WRAP {motion}: landed on {cols:?}, at rest (Off) {at_rest:?}");
+        if at_rest != cols {
+            fails.push(format!("{motion}: the columns landed on {cols:?}, at rest they are {at_rest:?}"));
         }
     }
     view.update(cx, |v, _| v.on_draw = None);
@@ -870,15 +909,66 @@ impl<P> Draw<P> {
     }
 }
 
-/// The 144 Hz frames a row's last flight has to land in, and the resting
-/// frames after it that count as landed.
+/// The 144 Hz steps a flight has to land in, and the quiet steps after
+/// it ([`quiet_steps`]) that count as landed.
 const CAP: usize = 400;
 const RESTING: usize = 5;
+
+/// Whether `v` has a flight under way: the layout's or a panel's.
+fn flying(v: &AppView) -> bool {
+    v.panes.flight.is_some() || v.panel_fx.moving()
+}
+
+/// The 144 Hz steps after an action, up to [`CAP`], until the last
+/// [`RESTING`] are quiet ([`quiet_steps`]) and the view rests: each
+/// step's first draw in `seen` (`moving`: a draw's flight).
+fn settle<T>(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    view: &Entity<AppView>,
+    seen: &Rc<RefCell<Vec<T>>>,
+    moving: impl Fn(&T) -> bool,
+) -> Vec<usize> {
+    let mut steps = Vec::new();
+    for _ in 0..CAP {
+        steps.push(seen.borrow().len());
+        frame_144(cx, window, view);
+        if quiet_steps(&seen.borrow(), &steps, &moving) >= RESTING && !view.read_with(cx, |v, _| flying(v)) {
+            break;
+        }
+    }
+    steps
+}
+
+/// How many steps in a row end `draws` quiet (Shady #62 r6 R6-1): each
+/// drew, and every draw it drew was at rest. A step can draw twice (#60
+/// L1); one that drew a moving frame and then a resting one is not
+/// quiet, and one that drew nothing shows nothing. `steps[i]`: step
+/// `i`'s first draw; the last step runs to the end.
+fn quiet_steps<T>(draws: &[T], steps: &[usize], moving: impl Fn(&T) -> bool) -> usize {
+    let end = |i: usize| steps.get(i + 1).copied().unwrap_or(draws.len());
+    (0..steps.len()).rev().take_while(|&i| steps[i] < end(i) && !draws[steps[i]..end(i)].iter().any(&moving)).count()
+}
+
+/// A flight's landing, judged on its draws (Shady #62 r5 R5-2, r6 R6-1,
+/// R6-2): [`RESTING`] quiet steps at the end, within [`CAP`]; else it
+/// never landed, named with `what` and its last draw.
+fn landing<T: std::fmt::Debug>(what: &str, draws: &[T], steps: &[usize], moving: impl Fn(&T) -> bool) -> Option<String> {
+    let quiet = quiet_steps(draws, steps, &moving);
+    (quiet < RESTING).then(|| {
+        format!(
+            "{what}: never landed: {quiet} quiet steps of {RESTING} at the end of {} (cap {CAP}); the last draw {:?}",
+            steps.len(),
+            draws.last()
+        )
+    })
+}
 
 /// A row's verdict on its draws (Shady #62 r5 R5-2, R5-3): what fails,
 /// each named with `row`. `starts[i]` is the last draw before phase `i`'s
 /// action, with the columns it comes in with; the phase runs to the next
-/// one's or to the row's end, on `rest` resting frames.
+/// one's or to the row's end. `steps`: the first draw of each step after
+/// the last action ([`settle`]).
 /// - The draw before the first action is at rest, and each phase flies
 ///   after its action (not before it: a flight that never landed is the
 ///   last row's).
@@ -887,8 +977,9 @@ const RESTING: usize = 5;
 ///   action that changes nothing fails).
 /// - In each phase, each pane in it from its first draw to its last
 ///   rewraps at most once.
-/// - The row lands: [`RESTING`] frames at rest within [`CAP`].
-fn judge<P: PartialEq + std::fmt::Debug>(row: &str, draws: &[Draw<P>], starts: &[usize], rest: usize) -> Vec<String> {
+/// - The row lands ([`landing`]): [`RESTING`] quiet steps at its end,
+///   every draw in them at rest, within [`CAP`].
+fn judge<P: PartialEq + std::fmt::Debug>(row: &str, draws: &[Draw<P>], starts: &[usize], steps: &[usize]) -> Vec<String> {
     let mut fails = Vec::new();
     let Some(&first) = starts.first() else { return vec![format!("{row}: no action")] };
     if draws[first].moving() {
@@ -919,13 +1010,7 @@ fn judge<P: PartialEq + std::fmt::Debug>(row: &str, draws: &[Draw<P>], starts: &
             }
         }
     }
-    let last = &draws[draws.len() - 1];
-    if rest < RESTING || last.moving() {
-        fails.push(format!(
-            "{row}: never landed: {rest} resting frames of {RESTING} within {CAP}; the last draw's flight {:?}, panels moving {}, columns {:?}",
-            last.flight, last.panels, last.cols
-        ));
-    }
+    fails.extend(landing(row, draws, steps, Draw::moving));
     fails
 }
 
@@ -933,74 +1018,124 @@ fn judge<P: PartialEq + std::fmt::Debug>(row: &str, draws: &[Draw<P>], starts: &
 /// flight frozen mid-way with its column still, a takeover rewrapping
 /// twice in one phase (0 + 2, 2 + 0) though once in each flight on
 /// average, an action that changes nothing taken for a takeover, a row
-/// that starts mid-flight. Each fails; a row that rewraps once a phase
-/// and lands holds.
+/// that starts mid-flight. And its landing, step by step (r6 R6-1,
+/// R6-2): five steps that each draw a moving frame and then a resting
+/// one, steps that draw nothing, a panels' flight with its column still,
+/// and one that rewraps once and stalls, never at rest. Each fails; a
+/// row that rewraps once a phase and lands on quiet steps holds, a step
+/// that draws twice at rest included.
 #[test]
 fn the_tables_verdict_fails_each_loophole() {
     let d = |flight: Option<&str>, panels: bool, c: f32| Draw { flight: flight.map(str::to_owned), panels, cols: vec![(0_u8, c)] };
     let rest = |c: f32| d(None, false, c);
     let fly = |t: &str, c: f32| d(Some(t), false, c);
-    let frozen: Vec<Draw<u8>> = std::iter::once(rest(672.)).chain(std::iter::repeat_n(fly("a", 445.), CAP)).collect();
-    // Each: its draws, its phases' starts, its resting frames, and the
-    // failures it must give, in order (none: it holds).
-    type Case = (&'static str, Vec<Draw<u8>>, Vec<usize>, usize, Vec<&'static str>);
+    let panel = |c: f32| d(None, true, c);
+    // A row: its draws to its last action, then its steps, each step's
+    // draws; as `judge` takes them.
+    let row = |before: Vec<Draw<u8>>, steps: Vec<Vec<Draw<u8>>>| {
+        let (mut draws, mut at) = (before, Vec::new());
+        for s in steps {
+            at.push(draws.len());
+            draws.extend(s);
+        }
+        (draws, at)
+    };
+    let one = |draws: Vec<Draw<u8>>| draws.into_iter().map(|d| vec![d]).collect::<Vec<_>>();
+    let still = |c: f32, n: usize| vec![vec![rest(c)]; n];
+    // Each: its row, its phases' starts, and the failures it must give,
+    // in order (none: it holds).
+    type Case = (&'static str, (Vec<Draw<u8>>, Vec<usize>), Vec<usize>, Vec<&'static str>);
     let cases: Vec<Case> = vec![
-        ("one rewrap, landed", vec![rest(672.), fly("a", 445.), fly("a", 445.), rest(445.)], vec![0], RESTING, vec![]),
         (
-            "a takeover, one rewrap a phase",
-            vec![rest(672.), fly("a", 445.), fly("a", 445.), fly("b", 445.), fly("b", 589.), rest(589.)],
-            vec![0, 2],
-            RESTING,
+            "one rewrap, landed",
+            row(vec![rest(672.)], [one(vec![fly("a", 445.), fly("a", 445.)]), still(445., RESTING)].concat()),
+            vec![0],
             vec![],
         ),
-        ("a panel's flight", vec![rest(672.), d(None, true, 520.), rest(520.)], vec![0], RESTING, vec![]),
-        ("frozen mid-flight, its column still", frozen, vec![0], 0, vec!["never landed"]),
         (
-            "at rest, short of five frames",
-            vec![rest(672.), fly("a", 445.), fly("a", 445.), rest(445.)],
+            "a takeover, one rewrap a phase",
+            row(
+                vec![rest(672.), fly("a", 445.), fly("a", 445.)],
+                [one(vec![fly("b", 445.), fly("b", 589.)]), still(589., RESTING)].concat(),
+            ),
+            vec![0, 2],
+            vec![],
+        ),
+        ("a panel's flight", row(vec![rest(672.)], [one(vec![panel(520.)]), still(520., RESTING)].concat()), vec![0], vec![]),
+        (
+            "landed on quiet steps that each draw twice",
+            row(vec![rest(672.)], [vec![vec![fly("a", 445.), fly("a", 445.)]], vec![vec![rest(445.), rest(445.)]; RESTING]].concat()),
             vec![0],
-            RESTING - 1,
+            vec![],
+        ),
+        ("frozen mid-flight, its column still", row(vec![rest(672.)], one(vec![fly("a", 445.); CAP])), vec![0], vec!["never landed"]),
+        (
+            "at rest, short of five steps",
+            row(vec![rest(672.)], [one(vec![fly("a", 445.), fly("a", 445.)]), still(445., RESTING - 1)].concat()),
+            vec![0],
+            vec!["never landed"],
+        ),
+        (
+            "five steps, each a moving draw then a resting one",
+            row(vec![rest(672.)], vec![vec![fly("a", 445.), rest(445.)]; RESTING]),
+            vec![0],
+            vec!["never landed"],
+        ),
+        (
+            "five steps, one of them drawn",
+            row(vec![rest(672.)], [one(vec![fly("a", 445.), rest(445.)]), vec![vec![]; RESTING - 1]].concat()),
+            vec![0],
+            vec!["never landed"],
+        ),
+        (
+            "a panels' flight, its column still, never at rest",
+            row(vec![rest(672.)], one(vec![panel(672.); CAP])),
+            vec![0],
+            vec!["never landed"],
+        ),
+        (
+            "a panels' flight that rewraps once and stalls, never at rest",
+            row(vec![rest(672.)], one(vec![panel(600.); CAP])),
+            vec![0],
             vec!["never landed"],
         ),
         (
             "a takeover, 2 + 0",
-            vec![rest(672.), fly("a", 600.), fly("a", 445.), fly("b", 445.), rest(445.)],
+            row(vec![rest(672.), fly("a", 600.), fly("a", 445.)], [one(vec![fly("b", 445.)]), still(445., RESTING)].concat()),
             vec![0, 2],
-            RESTING,
             vec!["phase 0: pane 0's column rewrapped 2 times"],
         ),
         (
             "a takeover, 0 + 2",
-            vec![rest(672.), fly("a", 672.), fly("a", 672.), fly("b", 600.), fly("b", 589.), rest(589.)],
+            row(
+                vec![rest(672.), fly("a", 672.), fly("a", 672.)],
+                [one(vec![fly("b", 600.), fly("b", 589.)]), still(589., RESTING)].concat(),
+            ),
             vec![0, 2],
-            RESTING,
             vec!["phase 1: pane 0's column rewrapped 2 times"],
         ),
         (
             "a second action that changes nothing",
-            vec![rest(672.), fly("a", 445.), fly("a", 445.), fly("a", 445.), rest(589.)],
+            row(vec![rest(672.), fly("a", 445.), fly("a", 445.)], [one(vec![fly("a", 445.)]), still(589., RESTING)].concat()),
             vec![0, 2],
-            RESTING,
             vec!["started no flight of its own"],
         ),
         (
             "a takeover of a flight that has landed",
-            vec![rest(672.), fly("a", 445.), rest(445.), fly("b", 589.), rest(589.)],
+            row(vec![rest(672.), fly("a", 445.), rest(445.)], [one(vec![fly("b", 589.)]), still(589., RESTING)].concat()),
             vec![0, 2],
-            RESTING,
             vec!["no flight under way to take over"],
         ),
         (
             "a row that starts mid-flight, its own action doing nothing",
-            vec![fly("a", 445.), rest(445.), rest(445.)],
+            row(vec![fly("a", 445.)], still(445., RESTING)),
             vec![0],
-            RESTING,
             vec!["still moving", "nothing flew after its action"],
         ),
     ];
     let mut wrong = Vec::new();
-    for (name, draws, starts, rested, want) in &cases {
-        let got = judge(name, draws, starts, *rested);
+    for (name, (draws, steps), starts, want) in &cases {
+        let got = judge(name, draws, starts, steps);
         if got.len() != want.len() || !got.iter().zip(want).all(|(g, w)| g.contains(w)) {
             wrong.push(format!("{name}: wanted {want:?}, got {got:?}"));
         }
@@ -1087,19 +1222,12 @@ fn every_flight_rewraps_each_pane_at_most_once(cx: &mut TestAppContext) {
                 starts.push(seen.borrow().len() - 1);
                 take_step(cx, window, &view, step);
             }
-            let mut rest = 0;
-            for _ in 0..CAP {
-                frame_144(cx, window, &view);
-                let moving = view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving());
-                rest = if moving { 0 } else { rest + 1 };
-                if rest >= RESTING {
-                    break;
-                }
-            }
+            let steps = settle(cx, window, &view, &seen, Draw::moving);
             let at = starts[0];
-            let starts: Vec<usize> = starts.iter().map(|s| s - at).collect();
+            let (starts, steps): (Vec<usize>, Vec<usize>) =
+                (starts.iter().map(|s| s - at).collect(), steps.iter().map(|s| s - at).collect());
             let got: Vec<Draw<crate::pane::PaneId>> = seen.borrow()[at..].to_vec();
-            let row_fails = judge(&row, &got, &starts, rest);
+            let row_fails = judge(&row, &got, &starts, &steps);
             let (rail_now, panes, equalised, rail_folded) = view.read_with(cx, |v, _| {
                 let (w, h) = v.centre.get();
                 let mut even = v.panes.tree.clone();
