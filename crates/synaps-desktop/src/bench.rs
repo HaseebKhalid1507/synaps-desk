@@ -780,6 +780,20 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
                             cx.notify();
                         });
+                        // `SYNAPS_BENCH_STATES=denied|halted` (#25): what the
+                        // daemon applied was not this window's answer: another
+                        // client's Deny came first (the gated call is blocked
+                        // at its gate), or a HALT crossed it (cancelled before
+                        // it ran). Answer Allow before the resolve to see it.
+                        let crossed = match std::env::var("SYNAPS_BENCH_STATES").as_deref() {
+                            Ok("denied") => Some("Tool call blocked by extension: Tool call confirmation denied: guard wants to check rm -rf"),
+                            Ok("halted") => Some("Canceled by user"),
+                            _ => None,
+                        };
+                        if let Some(text) = crossed {
+                            sleep(0.1).await;
+                            apply(cx, vec![result("w0", text)]);
+                        }
                         // `SYNAPS_BENCH_HELD=1` (Shady #23 r4 H1): the room the
                         // card left held at the list's end, the composer
                         // grows three lines (a steer), then a new call at

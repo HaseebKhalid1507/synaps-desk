@@ -160,13 +160,70 @@ const CANCEL_PHRASES: [&str; 5] = [
     "Canceled (session driver revoked)",
 ];
 
+/// What a gated call's result says, in the engine's own words, about its
+/// gate (synaps-desk #25): its whole result checked against the forms the
+/// daemon writes, never a phrase searched for in what a tool printed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateNote {
+    /// Held at the gate: `Tool call blocked by extension: Tool call
+    /// confirmation denied: …` (agent-engine `runtime/mod.rs`, wrapped by
+    /// `runtime/stream.rs`), or the activation gate's refusal.
+    Denied,
+    /// Cancelled with nothing after the phrase (`Canceled by user`): a call
+    /// held at its gate gets that, and so does one that ran silently with
+    /// no side effects; it says nothing either way.
+    BareCancel,
+    /// Cancelled after it started: the partial-output note (`…\n\n[Canceled
+    /// by user before the tool finished; the output above is partial.…]`)
+    /// or `Canceled by user. It had already started and may have partially
+    /// applied its effects.` (`canceled_tool_result_content`).
+    StartedCancel,
+}
+
+/// The side-effect warning `canceled_tool_result_content` appends.
+const STARTED: &str = " It had already started and may have partially applied its effects.";
+/// The deny `resolve_before_tool_call_result` returns, as the stream wraps it.
+const CONFIRM_DENIED: &str = "Tool call blocked by extension: Tool call confirmation denied: ";
+
+/// [`GateNote`] of a result (`tail`: its end when [`preview`] cut it, as
+/// [`ToolCall::tail`]). `None`: none of the daemon's forms, tool output
+/// included. A tool whose whole output is byte for byte one of these forms
+/// reads as it; only the daemon saying what it applied can tell them apart.
+pub fn gate_note(result: &str, tail: &str) -> Option<GateNote> {
+    // The confirm's deny ends with its extension's reason (any text); the
+    // activation refusal is one fixed text, matched whole (Shady #64 r2,
+    // C64-2): a prefix of it, or it followed by more, is output.
+    if result.starts_with(CONFIRM_DENIED) || result.strip_prefix(ACTIVATION_DENIED) == Some(ACTIVATION_REFUSED_WHOLE) {
+        return Some(GateNote::Denied);
+    }
+    if CANCEL_PHRASES.contains(&result) {
+        return Some(GateNote::BareCancel);
+    }
+    if CANCEL_PHRASES.iter().any(|p| result.strip_prefix(p).and_then(|r| r.strip_prefix('.')) == Some(STARTED)) {
+        return Some(GateNote::StartedCancel);
+    }
+    let end = if tail.is_empty() { result } else { tail };
+    let last = end.trim_end().rsplit('\n').next().unwrap_or("");
+    let note = |p: &str| {
+        last.strip_prefix('[')
+            .and_then(|l| l.strip_prefix(p))
+            .and_then(|l| l.strip_prefix(" before the tool finished; the output above is partial."))
+            .is_some_and(|l| l == "]" || l.strip_suffix(']') == Some(STARTED))
+    };
+    CANCEL_PHRASES.iter().any(|p| note(p)).then_some(GateNote::StartedCancel)
+}
+
 /// `activation_denied` (agent-engine `tools/discovery.rs`) as a tool error:
 /// every `HostActivationError`, refusals and batch failures alike.
 const ACTIVATION_DENIED: &str = "Tool execution failed: tool activation denied:";
 /// The one `HostActivationError` that is a refusal, `ConfirmationRequired`
 /// (`tools/activation.rs`): the user denied the prompt, the policy is
-/// `deny`, or nothing could show a prompt.
-const ACTIVATION_REFUSED: &str = "tool activation requires host confirmation authority";
+/// `deny`, or nothing could show a prompt. Its whole text after
+/// [`ACTIVATION_DENIED`] (wrapped by `activation_denied` and
+/// `RuntimeError::Tool`, SynapsCLI `dev`), matched whole (Shady #64 r2,
+/// C64-2): a prefix of it, or it followed by more, is a failure's text.
+const ACTIVATION_REFUSED_WHOLE: &str =
+    " tool activation requires host confirmation authority; model-initiated activation was not confirmed";
 
 /// The last line of a `bash` result whose output passed the daemon's limit
 /// (agent-engine `tools/bash.rs`): `[output truncated at 262144]` (v0.11)
@@ -194,7 +251,7 @@ pub fn tool_outcome(result: &str, is_error: bool) -> ToolOutcome {
     // are failures.
     const DENIED: [&str; 2] = ["Tool call blocked by extension", "Tool call denied:"];
     if let Some(why) = result.strip_prefix(ACTIVATION_DENIED) {
-        return if why.trim_start().starts_with(ACTIVATION_REFUSED) { ToolOutcome::Denied } else { ToolOutcome::Failed };
+        return if why == ACTIVATION_REFUSED_WHOLE { ToolOutcome::Denied } else { ToolOutcome::Failed };
     }
     if DENIED.iter().any(|p| result.starts_with(p)) {
         return ToolOutcome::Denied;
@@ -317,6 +374,10 @@ impl std::error::Error for TranscriptError {}
 /// Ids (and revs) of rows about to be rebuilt, for reuse by kind.
 type Reuse = VecDeque<(ItemKind, u64, u64)>;
 
+/// How many calls [`Transcript::past_gate`] holds before it lets go of
+/// those no longer in the transcript (it never lets go of one that is).
+pub const PAST_GATE_KEPT: usize = 256;
+
 #[derive(Clone, Debug, Default)]
 pub struct Transcript {
     items: Vec<Item>,
@@ -340,6 +401,15 @@ pub struct Transcript {
     /// The last prompts resolved, each with whether a turn ran as it did
     /// ([`Transcript::resolved_busy`]).
     resolved: VecDeque<(u64, bool)>,
+    /// The calls that showed they got past their gate
+    /// ([`Transcript::past_gate`]), and the size past which those no longer
+    /// in the transcript are let go.
+    past_gate: std::collections::HashSet<String>,
+    past_gate_cap: usize,
+    /// Rows are being rebuilt (an attach with its replay, a history append
+    /// or replace): some calls are out of `items` for now, so
+    /// [`Transcript::past_gate`] lets go of none until it is done.
+    rebuilding: bool,
     subagents: Vec<Value>,
     cost_usd: f64,
     /// The conversation was swapped (clear, resume, compaction): the next
@@ -416,6 +486,65 @@ impl Transcript {
     /// among the last few resolved here.
     pub fn resolved_busy(&self, id: u64) -> Option<bool> {
         self.resolved.iter().rev().find(|r| r.0 == id).map(|r| r.1)
+    }
+
+    /// Whether call `tool_id` showed it got past its gate: output streamed
+    /// from it, or a result said it ran (done, failed, stopped at its
+    /// limit) or that a cancel found it started ([`GateNote::StartedCancel`]).
+    /// Kept once seen: a later bare cancel (the live result of a HALT is the
+    /// bare phrase even after output, the history's says it started), a
+    /// settle or a refold does not take it back (synaps-desk #64, C64-1).
+    /// `ToolStarted` is not evidence: the daemon sends it before the gate.
+    /// Kept as long as the call is in the transcript, however many calls
+    /// come after it, and across a re-attach to the same session (Shady
+    /// #64 r2, C64-1): a receipt reads it for as long as its call is there.
+    pub fn past_gate(&self, tool_id: &str) -> bool {
+        self.past_gate.contains(tool_id)
+    }
+
+    fn note_past_gate(&mut self, tool_id: &str) {
+        if tool_id.is_empty() || !self.past_gate.insert(tool_id.to_string()) {
+            return;
+        }
+        if !self.rebuilding {
+            self.prune_past_gate();
+        }
+    }
+
+    /// Past its size, let go of the calls no longer in the transcript (a
+    /// bounded worker's dropped rows, another session's): only theirs. Never
+    /// halfway through a rebuild (Shady #64 r3, C64-1), when a call still
+    /// to be refolded is out of `items`.
+    fn prune_past_gate(&mut self) {
+        if self.past_gate.len() > self.past_gate_cap.max(PAST_GATE_KEPT) {
+            let held: std::collections::HashSet<&str> =
+                self.items.iter().filter_map(|i| i.tool.as_ref()).map(|t| t.tool_id.as_str()).collect();
+            let mut kept = std::mem::take(&mut self.past_gate);
+            kept.retain(|id| held.contains(id.as_str()));
+            self.past_gate = kept;
+            self.past_gate_cap = 2 * self.past_gate.len();
+        }
+    }
+
+    /// Run `f`, a rebuild of the rows: [`Transcript::past_gate`] lets go
+    /// of nothing until the outermost one is done.
+    fn rebuild<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = std::mem::replace(&mut self.rebuilding, true);
+        let r = f(self);
+        self.rebuilding = outer;
+        if !outer {
+            self.prune_past_gate();
+        }
+        r
+    }
+
+    /// A result for `tool_id`: evidence it got past its gate, if it is.
+    fn note_result(&mut self, tool_id: &str, result: &str, outcome: ToolOutcome) {
+        let ran = matches!(outcome, ToolOutcome::Ok | ToolOutcome::Failed | ToolOutcome::Unknown)
+            || gate_note(result, "") == Some(GateNote::StartedCancel);
+        if ran {
+            self.note_past_gate(tool_id);
+        }
     }
 
     pub fn subagents(&self) -> &[Value] {
@@ -663,6 +792,8 @@ impl Transcript {
         let no_subagent_notices = self.no_subagent_notices;
         let pending = if same { std::mem::take(&mut self.pending) } else { Vec::new() };
         let stuck = if same { std::mem::take(&mut self.stuck) } else { Vec::new() };
+        // Which calls ran: the same session's calls still are what they were.
+        let (past_gate, past_gate_cap) = if same { (std::mem::take(&mut self.past_gate), self.past_gate_cap) } else { Default::default() };
         *self = Transcript {
             next_id,
             clean_len,
@@ -670,6 +801,9 @@ impl Transcript {
             no_subagent_notices,
             pending,
             stuck,
+            past_gate,
+            past_gate_cap,
+            rebuilding: true,
             engine_pending: a.conversation.pending_events_len,
             session_id: Some(a.meta.id.clone()),
             journal_id: journal,
@@ -702,6 +836,9 @@ impl Transcript {
             self.settle();
         }
         self.keep_revs(carry);
+        // The rows, the history's and the replay's, are all back.
+        self.rebuilding = false;
+        self.prune_past_gate();
         Ok(())
     }
 
@@ -712,9 +849,9 @@ impl Transcript {
                 if *base_len != self.history_len {
                     return Err(TranscriptError::OutOfSync { have: self.history_len, base_len: *base_len });
                 }
-                self.append_history(messages);
+                self.rebuild(|t| t.append_history(messages));
             }
-            HistoryUpdate::Replace { messages } => self.replace_history(messages),
+            HistoryUpdate::Replace { messages } => self.rebuild(|t| t.replace_history(messages)),
         }
         Ok(())
     }
@@ -723,12 +860,14 @@ impl Transcript {
     /// replays): longer or equal is taken as an append, shorter as a
     /// replacement. Clients get [`HistoryUpdate`]s instead, which tell.
     pub fn apply_history(&mut self, messages: &[Value]) {
-        if messages.len() >= self.history_len {
-            let start = self.history_len;
-            self.append_history(&messages[start..]);
-        } else {
-            self.replace_history(messages);
-        }
+        self.rebuild(|t| {
+            if messages.len() >= t.history_len {
+                let start = t.history_len;
+                t.append_history(&messages[start..]);
+            } else {
+                t.replace_history(messages);
+            }
+        });
     }
 
     /// Fold `messages` after the history folded so far. Live rows since
@@ -1058,8 +1197,10 @@ impl Transcript {
                             let is_error = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                             let result = result_text(b.get("content").unwrap_or(&Value::Null));
                             if let Some(&ix) = self.tools.get(id) {
+                                let outcome = tool_outcome(&result, is_error);
+                                self.note_result(id, &result, outcome);
                                 if let Some(t) = self.items[ix].tool.as_mut() {
-                                    t.status = Some(tool_outcome(&result, is_error).status());
+                                    t.status = Some(outcome.status());
                                     t.result = preview(&result);
                                     t.tail = tail(&result);
                                 }
@@ -1363,6 +1504,9 @@ impl Transcript {
                     }
                 }
                 LlmEvent::ToolResultDelta { tool_id, delta } => {
+                    if !delta.is_empty() && self.tool_mut(tool_id).is_some() {
+                        self.note_past_gate(tool_id);
+                    }
                     if let Some(ix) = self.tool_mut(tool_id) {
                         if let Some(t) = self.items[ix].tool.as_mut()
                             && t.result.len() < PREVIEW_MAX
@@ -1374,10 +1518,12 @@ impl Transcript {
                 }
                 LlmEvent::ToolResult { tool_id, result } => {
                     if let Some(ix) = self.tool_mut(tool_id) {
+                        let outcome = tool_outcome(result, false);
+                        self.note_result(tool_id, result, outcome);
                         if let Some(t) = self.items[ix].tool.as_mut() {
                             t.result = preview(result);
                             t.tail = tail(result);
-                            t.status = Some(tool_outcome(result, false).status());
+                            t.status = Some(outcome.status());
                         }
                         self.items[ix].streaming = false;
                         self.touch(ix);
@@ -1572,6 +1718,12 @@ mod outcome_tests {
                 "Tool execution failed: tool activation denied: tool activation requires host confirmation authority; model-initiated activation was not confirmed",
                 Denied,
             ),
+            // Not that text whole (Shady #64 r2 C64-2): a failure's.
+            ("Tool execution failed: tool activation denied: tool activation requires host confirmation authority", Failed),
+            (
+                "Tool execution failed: tool activation denied: tool activation requires host confirmation authority — example from a manual",
+                Failed,
+            ),
             (
                 "Tool execution failed: tool activation denied: unknown tool id 'x:y'; nothing was activated. activate_tools needs exact ids (namespace:name) as search_tools returns them: search for the tool instead of guessing its id.",
                 Failed,
@@ -1680,6 +1832,205 @@ mod outcome_tests {
             "result": "Tool call blocked by extension: Tool call confirmation denied: guard"}})));
         let last = t.items().iter().rev().find_map(|i| i.tool.as_ref()).unwrap();
         assert_eq!((last.tool_id.as_str(), last.status), ("e", Some(ToolStatus::Denied)));
+    }
+
+    /// synaps-desk #64 (Shady C64-2): the gate's forms are read from a
+    /// whole result, never searched for in output.
+    #[test]
+    fn gate_notes_are_the_engines_whole_forms() {
+        let gate = "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this";
+        let activation = "Tool execution failed: tool activation denied: tool activation requires host confirmation authority; \
+                          model-initiated activation was not confirmed";
+        let activation_cut = "Tool execution failed: tool activation denied: tool activation requires host confirmation authority";
+        let started = "Canceled (session stopped by the host). It had already started and may have partially applied its effects.";
+        let partial = "a\nb\n\n[Canceled by user before the tool finished; the output above is partial.]";
+        let partial_fx = "a\n\n[Canceled by user before the tool finished; the output above is partial. It had already started and may have \
+                          partially applied its effects.]";
+        use GateNote::*;
+        for (r, want) in [
+            (gate, Some(Denied)),
+            (activation, Some(Denied)),
+            ("Canceled by user", Some(BareCancel)),
+            ("Canceled (session driver revoked)", Some(BareCancel)),
+            (started, Some(StartedCancel)),
+            (partial, Some(StartedCancel)),
+            (partial_fx, Some(StartedCancel)),
+            // Output that quotes them, or a near miss, is output.
+            (&format!("log:\n{gate}"), None),
+            ("Canceled by user\n", None),
+            ("Canceled by user. It had already started", None),
+            ("a\n[Canceled by user before the tool finished; the output above is partial.] trailing", None),
+            ("Tool call blocked by extension: policy says no", None),
+            ("Tool call denied: x", None),
+            ("ok", None),
+            // The activation refusal, whole only: shortened, followed by
+            // more, or spaced otherwise, it is output (Shady #64 r2 C64-2).
+            (activation_cut, None),
+            (&format!("{activation} — example from a manual, not a denial"), None),
+            (&format!("{activation}\n"), None),
+            (&activation.replacen("denied: tool", "denied:  tool", 1), None),
+            ("Tool execution failed: tool activation denied: tool activation requires host confirmation authority — example", None),
+        ] {
+            assert_eq!(gate_note(r, ""), want, "{r:?}");
+        }
+        // A cut result: its tail holds the note.
+        assert_eq!(gate_note("a…", "\n[Canceled by user before the tool finished; the output above is partial.]"), Some(StartedCancel));
+    }
+
+    /// synaps-desk #64 (Shady C64-1): a call that showed it got past its
+    /// gate stays so. Output streams, then a HALT's live result is the
+    /// bare phrase (the daemon's history has the started note): kept. Output,
+    /// then the turn ends with no result (a settle): kept. A bare cancel
+    /// with nothing before it: not evidence. `ToolStarted`: not evidence.
+    #[test]
+    fn a_call_that_got_past_its_gate_stays_past_it() {
+        let ev = |v: Value| crate::protocol::decode_event(&v).unwrap();
+        let llm = |v: Value| ev(json!({"ev": "stream", "event": v}));
+        let start = |t: &mut Transcript, id: &str| {
+            t.apply(&llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "bash", "tool_id": id, "input": {}})));
+            t.apply(&llm(json!({"kind": "llm", "llm": "tool_started", "tool_id": id})));
+        };
+        let delta = |id: &str| llm(json!({"kind": "llm", "llm": "tool_result_delta", "tool_id": id, "delta": "working…\n"}));
+        let result = |id: &str, r: &str| llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": id, "result": r}));
+        let mut t = Transcript::new();
+        t.apply(&SessionEvent::TurnStarted { turn_baseline: 0, trigger: String::new(), user_text: None });
+        // Delta, bare cancel, then the history's started form.
+        start(&mut t, "a");
+        assert!(!t.past_gate("a"), "ToolStarted comes before the gate");
+        t.apply(&delta("a"));
+        assert!(t.past_gate("a"));
+        t.apply(&result("a", "Canceled by user"));
+        assert!(t.past_gate("a"), "the bare cancel overwrote the output, not the evidence");
+        // A bare cancel with nothing before it.
+        start(&mut t, "b");
+        t.apply(&result("b", "Canceled by user"));
+        assert!(!t.past_gate("b"));
+        // Delta, then the turn ends with no result.
+        start(&mut t, "c");
+        t.apply(&delta("c"));
+        t.apply(&SessionEvent::Idle);
+        let c = t.items().iter().find_map(|i| i.tool.as_ref().filter(|t| t.tool_id == "c")).unwrap();
+        assert_eq!(c.status, Some(ToolStatus::Cancelled), "settled");
+        assert!(t.past_gate("c"));
+        // The history refold (the started note for `a`, the bare phrase for `b`).
+        let call = |id: &str| json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "bash", "input": {}}]});
+        let res = |id: &str, r: &str| json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": r}]});
+        t.apply_history(&[
+            json!({"role": "user", "content": "go"}),
+            call("a"),
+            res("a", "working…\n\n[Canceled by user before the tool finished; the output above is partial.]"),
+            call("b"),
+            res("b", "Canceled by user"),
+            call("c"),
+            res("c", "working…\n\n[Canceled by user before the tool finished; the output above is partial.]"),
+        ]);
+        assert!(t.past_gate("a") && t.past_gate("c") && !t.past_gate("b"));
+        // A fresh transcript reading only the history learns it from the note.
+        let mut h = Transcript::new();
+        h.apply_history(&[call("a"), res("a", "working…\n\n[Canceled by user before the tool finished; the output above is partial.]")]);
+        assert!(h.past_gate("a"));
+        // A result that ran is evidence too; a deny is not.
+        start(&mut t, "d");
+        t.apply(&result("d", "done"));
+        start(&mut t, "e");
+        t.apply(&result("e", "Tool call blocked by extension: Tool call confirmation denied: guard"));
+        assert!(t.past_gate("d") && !t.past_gate("e"));
+    }
+
+    /// Shady #64 r2 C64-1: a call's evidence that it ran lives as long as
+    /// the call: 300 ordinary calls after it don't push it out (a receipt
+    /// still on screen reads it), nor does a re-attach to the same session.
+    /// Another session's calls are not kept.
+    #[test]
+    fn evidence_a_call_ran_lives_as_long_as_the_call() {
+        let ev = |v: Value| crate::protocol::decode_event(&v).unwrap();
+        let llm = |v: Value| ev(json!({"ev": "stream", "event": v}));
+        let call = |t: &mut Transcript, id: &str| {
+            t.apply(&llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "bash", "tool_id": id, "input": {}})));
+            t.apply(&llm(json!({"kind": "llm", "llm": "tool_started", "tool_id": id})));
+        };
+        let attach = |id: &str| {
+            let a = json!({"type": "attached", "client": 2, "meta": {"id": id}, "conversation": {"api_messages": []}, "input_owner": 2});
+            let crate::protocol::DaemonFrame::Attached(a) = crate::protocol::decode_frame(&a.to_string()).unwrap() else { panic!() };
+            a
+        };
+        let mut t = Transcript::new();
+        t.load_attached(&attach("s")).unwrap();
+        t.apply(&SessionEvent::TurnStarted { turn_baseline: 0, trigger: String::new(), user_text: None });
+        call(&mut t, "a");
+        t.apply(&llm(json!({"kind": "llm", "llm": "tool_result_delta", "tool_id": "a", "delta": "removed 3 files\n"})));
+        t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "a", "result": "Canceled by user"})));
+        for k in 0..300 {
+            let id = format!("o{k}");
+            call(&mut t, &id);
+            t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": id, "result": "ok"})));
+        }
+        assert!(t.past_gate("a"), "300 calls later, `a` still ran");
+        assert!(t.past_gate("o0") && t.past_gate("o299"));
+        t.load_attached(&attach("s")).unwrap();
+        assert!(t.past_gate("a"), "a re-attach to the same session keeps it");
+        t.load_attached(&attach("other")).unwrap();
+        assert!(!t.past_gate("a"), "another session's calls are not this one's");
+    }
+
+    /// Shady #64 r3 C64-1: a rebuild that crosses the size watermark lets
+    /// go of nothing until its rows are all back. 256 calls ran, `a` among
+    /// them, known only from its output (its result is the bare cancel, so
+    /// the history can't tell again). A rebuild whose first call `b` is new
+    /// and ran (the 257th) keeps `a`; a call the rebuild left out (`o0`)
+    /// goes once it is done. A history replace, an append and a re-attach
+    /// to the same session. On `7e35605`, `a` was let go at `b`.
+    #[test]
+    fn a_rebuild_past_the_watermark_keeps_a_later_calls_evidence() {
+        let ev = |v: Value| crate::protocol::decode_event(&v).unwrap();
+        let llm = |v: Value| ev(json!({"ev": "stream", "event": v}));
+        let attach = |history: Vec<Value>| {
+            let a =
+                json!({"type": "attached", "client": 2, "meta": {"id": "s"}, "conversation": {"api_messages": history}, "input_owner": 2});
+            let crate::protocol::DaemonFrame::Attached(a) = crate::protocol::decode_frame(&a.to_string()).unwrap() else { panic!() };
+            a
+        };
+        let others: Vec<String> = (0..PAST_GATE_KEPT - 1).map(|k| format!("o{k}")).collect();
+        let ran = || {
+            let mut t = Transcript::new();
+            t.load_attached(&attach(Vec::new())).unwrap();
+            t.apply(&SessionEvent::TurnStarted { turn_baseline: 0, trigger: String::new(), user_text: None });
+            for id in std::iter::once("a").chain(others.iter().map(String::as_str)) {
+                t.apply(&llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "bash", "tool_id": id, "input": {}})));
+                t.apply(&llm(json!({"kind": "llm", "llm": "tool_started", "tool_id": id})));
+                if id == "a" {
+                    t.apply(&llm(json!({"kind": "llm", "llm": "tool_result_delta", "tool_id": "a", "delta": "removed 3 files\n"})));
+                    t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "a", "result": "Canceled by user"})));
+                } else {
+                    t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": id, "result": "ok"})));
+                }
+            }
+            t.apply(&SessionEvent::Idle);
+            assert!(t.past_gate("a") && t.past_gate("o0"));
+            t
+        };
+        let call = |id: &str| json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "bash", "input": {}}]});
+        let res = |id: &str, r: &str| json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": r}]});
+        let mut history =
+            vec![json!({"role": "user", "content": "go"}), call("b"), res("b", "ok"), call("a"), res("a", "Canceled by user")];
+        for id in &others[1..] {
+            history.push(call(id));
+            history.push(res(id, "ok"));
+        }
+        let (mut replace, mut append, mut attached) = (ran(), ran(), ran());
+        replace.apply_update(&HistoryUpdate::Replace { messages: history.clone() }).unwrap();
+        append.apply_update(&HistoryUpdate::Append { base_len: 0, messages: history.clone() }).unwrap();
+        attached.load_attached(&attach(history)).unwrap();
+        // Per rebuild: a's row is there, a still ran, b and o1 ran, o0 (no
+        // longer there) went once the rebuild was done.
+        let got: Vec<_> = [("replace", &replace), ("append", &append), ("re-attach", &attached)]
+            .into_iter()
+            .map(|(how, t)| {
+                let row = t.items().iter().any(|i| i.tool.as_ref().is_some_and(|c| c.tool_id == "a"));
+                (how, row, t.past_gate("a"), t.past_gate("b") && t.past_gate("o1"), t.past_gate("o0"))
+            })
+            .collect();
+        assert!(got.iter().all(|&(_, row, a, others, o0)| row && a && others && !o0), "{got:?}");
     }
 
     /// Subagent notices are on by default; off, they stay off across an
