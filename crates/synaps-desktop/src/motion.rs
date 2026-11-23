@@ -2132,11 +2132,12 @@ impl Motion {
         self.springs.borrow_mut().insert(key, Sprung { target, x0: at - target, v0: velocity, at: since, frame, response });
     }
 
-    /// Chrome position `key`'s velocity now (px/s), while it moves on a
-    /// spring.
-    pub(crate) fn spring_velocity(&self, key: u64) -> Option<f32> {
-        let now = self.now();
-        self.springs.borrow().get(&key).filter(|s| !s.settled(now)).map(|s| s.state(now).1)
+    /// Chrome position `key`'s velocity at `at` (px/s), while it moves on a
+    /// spring then: a spring taking over from a frame drawn before `now`
+    /// starts with the position and the velocity of that frame (Shady #62
+    /// M3).
+    pub(crate) fn spring_velocity_at(&self, key: u64, at: Instant) -> Option<f32> {
+        self.springs.borrow().get(&key).filter(|s| !s.settled(at)).map(|s| s.state(at).1)
     }
 
     /// Where chrome position `key` was drawn last, if it is on a spring.

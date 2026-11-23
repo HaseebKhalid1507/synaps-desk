@@ -568,10 +568,14 @@ pub(crate) enum Carry {
     /// It flew on its own spring (its ends, its travel): the new one
     /// starts at that velocity ([`crate::split::Flight::carried`]).
     Spring(crate::split::Node, crate::split::Node, f32),
-    /// It rode a yielding panel (#51), which turns back with its own
-    /// velocity ([`crate::chrome::PanelFx::fly`]): the new one rides it on
-    /// from the width the layout was last drawn at.
-    Ride,
+    /// It rode a yielding panel (#51): the new one rides on from the width
+    /// the layout was last drawn at, on that panel turned back with its
+    /// own velocity ([`crate::chrome::PanelFx::fly`]: a close), or on the
+    /// same flights (no yield changed: a split down, Equalise; Shady #62
+    /// M4). One that can't ride (a yield changed as another panel flies)
+    /// starts at the velocity the ride had: its ends, its travel, the
+    /// centre's widths it rode between (`app.rs` `ride_velocity`).
+    Ride(crate::split::Node, crate::split::Node, f32, crate::split::Ride),
 }
 
 pub(crate) struct Panes {
@@ -639,7 +643,7 @@ impl Panes {
         if let Some(f) = self.flight.as_ref().filter(|f| f.travel > 0.) {
             self.carry = Some(match f.ride {
                 None => Carry::Spring(f.from.clone(), f.to.clone(), f.travel),
-                Some(_) => Carry::Ride,
+                Some(r) => Carry::Ride(f.from.clone(), f.to.clone(), f.travel, r),
             });
         }
     }

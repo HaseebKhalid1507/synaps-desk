@@ -410,6 +410,9 @@ pub(crate) struct Tie {
     /// causing one.
     pub(crate) from: f32,
     pub(crate) by_from: f32,
+    /// Its width's change per pixel of the causing panel's, as last drawn
+    /// (its velocity is the causing panel's times this: Shady #62 M4).
+    pub(crate) rate: f32,
 }
 
 /// A folded panel's strip in flight (#35: its glyphs cut in as the rail
@@ -465,8 +468,22 @@ impl PanelFx {
     /// its progress from here ([`Tie`]).
     pub(crate) fn tie(&mut self, i: usize, by: usize) {
         let by_from = self.sides[by].shown;
-        self.sides[i].tie = Some(Tie { by, from: self.sides[i].shown, by_from });
+        self.sides[i].tie = Some(Tie { by, from: self.sides[i].shown, by_from, rate: 0. });
     }
+}
+
+/// How fast the centre's width changes at `at` (px/s): each panel on its
+/// spring then, a tied one at its cause's times its rate ([`Tie`]). What a
+/// layout riding them moves at (Shady #62 M4). Off the panels' flights and
+/// their springs, so a caller holding the layout's flight can read it.
+pub(crate) fn centre_velocity(fx: &crate::motion::Motion, panels: &PanelFx, at: std::time::Instant) -> f32 {
+    let sides = panels.sides;
+    let own = |i: usize| if sides[i].moving { fx.spring_velocity_at(PANEL_W[i], at).unwrap_or(0.) } else { 0. };
+    let v = |i: usize| match sides[i].tie {
+        Some(t) => t.rate * own(t.by),
+        None => own(i),
+    };
+    -(v(0) + v(1))
 }
 
 /// A shown value's hash, for its afterglow ([`crate::motion::Motion::glow`]).
@@ -1299,8 +1316,11 @@ impl AppView {
         }
         let k = (by.shown - t.by_from) / (by_side.width() - t.by_from);
         let (lo, hi) = (t.from.min(to).min(STRIP), t.from.max(to).max(f.open));
-        f.shown = self.fx.snap((t.from + (to - t.from) * k).clamp(lo, hi));
+        let at = t.from + (to - t.from) * k;
+        f.shown = self.fx.snap(at.clamp(lo, hi));
         f.moving = true;
+        let rate = if at > lo && at < hi { (to - t.from) / (by_side.width() - t.by_from) } else { 0. };
+        f.tie = Some(Tie { rate, ..t });
     }
 
     /// A side panel (`rail`, else the right one) as drawn this frame. In

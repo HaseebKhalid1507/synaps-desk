@@ -251,7 +251,7 @@ const DOCK_H: u64 = 0x7AF1 << 48;
 const COMPOSER_H: u64 = 0x7AF2 << 48;
 /// The split panes' layout in flight (split.md §10): one spring, its
 /// travel in px ([`crate::split::Flight`]).
-const PANE_FLIGHT: u64 = 0x7AF5 << 48;
+pub(crate) const PANE_FLIGHT: u64 = 0x7AF5 << 48;
 /// Each pane's composer inset from its foot, on `sheet` (+ the pane's
 /// index).
 const FOOT_INSET: u64 = 0x7AF6 << 48;
@@ -1572,6 +1572,14 @@ pub(crate) fn above_list(lay: Layout, naming: bool) -> f32 {
     crate::chrome::top_h(lay.short) + naming
 }
 
+/// A ride's velocity as a flight's (px/s of its travel `len`): the layout
+/// went `(w - from) / (to - from)` of its way as the centre went to `w`
+/// ([`AppView::pane_flight_step`]), so as fast as the centre moves
+/// (`centre` px/s) over the centre's way `r` (Shady #62 M4).
+fn ride_velocity(len: f32, r: crate::split::Ride, centre: f32) -> f32 {
+    if (r.to - r.from).abs() < 0.5 { 0. } else { len * centre / (r.to - r.from) }
+}
+
 /// Tests: what [`AppView::on_draw`] calls each frame drawn.
 #[cfg(test)]
 pub(crate) type OnDraw = Rc<dyn Fn(&AppView)>;
@@ -1929,6 +1937,11 @@ pub struct AppView {
     /// Tests: the dividers' handles were drawn this frame.
     #[cfg(test)]
     pub(crate) handles_drawn: Cell<bool>,
+    /// Tests: the centre's top-left in the window and each pane's
+    /// rectangle in it, as the last frame drew them (Shady #62 M2: a
+    /// divider's place on screen, each draw).
+    #[cfg(test)]
+    pub(crate) rects_drawn: RefCell<((f32, f32), Vec<(crate::pane::PaneId, crate::split::Rect)>)>,
     /// The side panels folded to strips and the open HISTORY buckets
     /// (saved with the accent).
     pub panels: theme::Panels,
@@ -2653,6 +2666,8 @@ impl AppView {
             on_draw: None,
             #[cfg(test)]
             handles_drawn: Cell::new(false),
+            #[cfg(test)]
+            rects_drawn: Default::default(),
             panels: theme::Panels::default(),
             panels_dirty: Default::default(),
             panels_writing: Default::default(),
@@ -8922,10 +8937,14 @@ impl AppView {
         }
         let of = |y: Option<(bool, bool, bool)>| y.map_or([false; 2], |(l, r, _)| [l, r]);
         let (was, now) = (of(was), of(self.pane_yield));
-        // Taking over a flight that rode a yielding panel (a split's close
-        // mid-flight): that panel turns back with its velocity, and the
-        // layout rides it on, if no other panel flies.
-        let rode = matches!(self.panes.carry, Some(crate::pane::Carry::Ride));
+        // Taking over a flight that rode a yielding panel: a split's close
+        // mid-flight turns that panel back with its velocity, and the
+        // layout rides it on, if no other panel flies. A takeover that
+        // changes no yield (a split down, Equalise: Shady #62 M4) rides on
+        // the same flights it rode, from where it was drawn (below:
+        // `Carry::Ride`): the ride is linear in the centre's width, so an
+        // edge both layouts share goes on along the same line.
+        let rode = matches!(self.panes.carry, Some(crate::pane::Carry::Ride(..)));
         let others = (0..2).any(|i| was[i] == now[i] && (self.panel_fx.sides[i].from.is_some() || self.panel_fx.sides[i].moving));
         // On the spring of the panel whose flight made it, if one did
         // (Shady #54 n2: a drag let go onto a detent flies on `snap`; a
@@ -8947,7 +8966,7 @@ impl AppView {
                 }
             }
         }
-        flew && (!panels || (rode && !others))
+        (flew && (!panels || (rode && !others))) || (!flew && rode && panels)
     }
 
     /// [`AppView::pane_sides`], judged now.
@@ -9047,19 +9066,28 @@ impl AppView {
             // at rest, landed; read only if the ride is handed back (Shady
             // #54 M2).
             let from = if f.ride.is_some() { f.travel } else { 0. };
+            // Carried, it starts from `drawn` as of the frame that drew it
+            // (a frame of the old flight's time is not held: the 1920 film
+            // drew the layout twice, 14 ms, at the turn), at the velocity
+            // the old one had then: position, velocity and instant of one
+            // frame (Shady #62 M3: the velocity read now, a frame on, was
+            // planted at the frame before).
+            let now = self.fx.now();
+            let at = self.panes.drawn_at.filter(|t| now.saturating_duration_since(*t) < Duration::from_millis(100)).unwrap_or(now);
             let v = match carry {
                 Some(crate::pane::Carry::Spring(a, b, len)) if f.ride.is_none() => {
-                    self.fx.spring_velocity(PANE_FLIGHT).map_or(0., |v| f.carried(&(a, b, len), v, area))
+                    self.fx.spring_velocity_at(PANE_FLIGHT, at).map_or(0., |v| f.carried(&(a, b, len), v, area))
+                }
+                // A ride it can't carry on (a yield changed as another panel
+                // flies, or over a view): at the ride's velocity, projected
+                // (Shady #62 M4).
+                Some(crate::pane::Carry::Ride(a, b, len, r)) if f.ride.is_none() => {
+                    let v = ride_velocity(len, r, crate::chrome::centre_velocity(&self.fx, &self.panel_fx, at));
+                    if v == 0. { 0. } else { f.carried(&(a, b, len), v, area) }
                 }
                 _ => 0.,
             };
-            // Carried, it starts from `drawn` as of the frame that drew it
-            // (a frame of the old flight's time is not held: the 2560 film
-            // drew the layout twice, 14 ms, at the turn).
-            let now = self.fx.now();
-            let since =
-                if v != 0. { self.panes.drawn_at.filter(|t| now.saturating_duration_since(*t) < Duration::from_millis(100)) } else { None };
-            self.fx.spring_jump_moving(PANE_FLIGHT, from, f.travel, v, crate::motion::SHEET_RESPONSE, since.unwrap_or(now));
+            self.fx.spring_jump_moving(PANE_FLIGHT, from, f.travel, v, crate::motion::SHEET_RESPONSE, if v != 0. { at } else { now });
         }
         // A panel yielding on it (#51): the layout rides the panel's
         // spring, by how far the centre has gone, and lands with it, in the
@@ -9067,8 +9095,13 @@ impl AppView {
         if let Some(r) = f.ride {
             if self.panel_fx.moving() {
                 // Under 0 while a panel turned back carries on its way first
-                // (a split's close mid-flight: [`crate::pane::Carry::Ride`]).
-                let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).clamp(-1., 1.) };
+                // (a split's close mid-flight: [`crate::pane::Carry::Ride`]),
+                // as far as it goes: an early close's way back is a few px
+                // and the panel's overshoot several times that (Shady #62
+                // M1: held at −1, the divider stood while the panel moved).
+                // Each edge stays between its neighbours
+                // ([`crate::split::Node::lerp_px_from`]).
+                let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).min(1.) };
                 let at = |w: f32| crate::split::Rect { w, ..area };
                 return f.to.lerp_px_from(&f.from, t, at(r.from), at(r.to), area);
             }
@@ -9114,7 +9147,7 @@ impl AppView {
         let held = self.panes.grab.as_ref().filter(|g| g.moved).map(|g| (g.divider.path.clone(), g.divider.i));
         let (edge, dim) = (p.edge, p.dim_ch);
         let origin = self.centre_at.get();
-        tree.dividers(area)
+        tree.dividers_in(area, origin)
             .into_iter()
             .enumerate()
             .map(|(n, d)| {
@@ -9202,7 +9235,7 @@ impl AppView {
         let found = self
             .panes
             .tree
-            .dividers(crate::split::Rect { x: 0., y: 0., w, h })
+            .dividers_in(crate::split::Rect { x: 0., y: 0., w, h }, self.centre_at.get())
             .into_iter()
             .find(|d| (&d.path, d.i, d.axis) == (&g.divider.path, g.divider.i, g.divider.axis) && d.rect.w > 0. && d.rect.h > 0.);
         if found.is_none() {
@@ -9467,7 +9500,7 @@ impl Render for AppView {
             // Riding on (`Carry::Ride`): from the width its `from` was drawn
             // at, the last frame's, so this frame carries on as that ride
             // would have.
-            let rode = matches!(self.panes.carry, Some(crate::pane::Carry::Ride));
+            let rode = matches!(self.panes.carry, Some(crate::pane::Carry::Ride(..)));
             let from = if rode { self.centre.get().0 } else { pane };
             f.ride = Some(crate::split::Ride { from, to: pane_to });
         }
@@ -9528,13 +9561,21 @@ impl Render for AppView {
         }
         let main = if self.panes.shown_split() || (self.panes.flight.is_some() && !self.panes.folded) {
             let area = |w: f32| crate::split::Rect { x: 0., y: 0., w, h: centre_h };
+            // On the window's pixels (Shady #62 M2: [`crate::split::Node::rects_in`]):
+            // the centre's top-left as drawn now, and as the panels land
+            // (where a landed pane's width and a flight's wraps are read).
+            let origin = self.centre_at.get();
+            let origin_to = (crate::chrome::MARK + dp(rail.width()) / s, origin.1);
+            let placed = |w: f32, o: (f32, f32)| crate::split::Rect { x: o.0, y: o.1, w, h: centre_h };
             // The layout as drawn this frame: the tree, or its flight's
             // step (split.md §10).
-            let drawn = self.pane_flight_frame(area(centre));
+            let drawn = self.pane_flight_frame(placed(centre, origin));
             // The panes whose close has landed go (finish gate #42 F2).
             self.reap_closing();
-            let rects = drawn.rects(area(centre));
-            let land = self.panes.tree.rects(area(centre));
+            let rects = drawn.rects_in(area(centre), origin);
+            #[cfg(test)]
+            self.rects_drawn.replace((origin, rects.clone()));
+            let land = self.panes.tree.rects_in(area(centre), origin);
             // Each pane's width as the panels' flight lands, and the width
             // its column wraps at while they fly: its rectangle in the
             // centre at `pane_to`, and at the flight's narrowest (`wrap`).
@@ -9543,7 +9584,7 @@ impl Render for AppView {
             // centre's, `r.w * wrap / pane` went a pixel either way as its
             // rounded width and the centre's fraction moved, and each step
             // measured the list again).
-            let at = |w: f32| self.panes.tree.rects(area(w));
+            let at = |w: f32| self.panes.tree.rects_in(area(w), origin_to);
             let (rects_to, rects_wrap) = (at(pane_to), at(wrap));
             // A panel yielding on the layout's flight (#51): its own ends.
             let ride_from = self.panes.flight.as_ref().and_then(|f| f.ride).map(|r| r.from);
@@ -9557,12 +9598,13 @@ impl Render for AppView {
             // narrowest centre (Shady #42 L2).
             if let Some(f) = self.panes.flight.as_mut() {
                 match ride_from {
-                    Some(from) => f.set_wraps_at(area(from), area(pane_to)),
-                    None => f.set_wraps(area(wrap)),
+                    Some(from) => f.set_wraps_at(placed(from, origin_to), placed(pane_to, origin_to)),
+                    None => f.set_wraps(placed(wrap, origin_to)),
                 }
             }
             // Where each closing share goes (its rectangle at 0).
-            let to_rects = self.panes.flight.as_ref().filter(|_| !ghosts.is_empty()).map(|f| f.to.rects(area(centre))).unwrap_or_default();
+            let to_rects =
+                self.panes.flight.as_ref().filter(|_| !ghosts.is_empty()).map(|f| f.to.rects_in(area(centre), origin)).unwrap_or_default();
             for (id, r) in &rects {
                 if ghosts.contains(id) {
                     // A closing pane (finish gate #42 F2): laid out where it
@@ -9652,6 +9694,8 @@ impl Render for AppView {
         } else {
             #[cfg(test)]
             self.handles_drawn.set(false);
+            #[cfg(test)]
+            self.rects_drawn.replace(((0., 0.), Vec::new()));
             // The last close's pane goes, if a frame of it is left.
             self.reap_closing();
             let g = PaneFrame { pane, wrap, pane_to, view_pane, win_h: self.height, p, m };

@@ -6110,66 +6110,112 @@ fn on_a_at(
     (window, view, client, a, attaches, events)
 }
 
+/// The first vertical divider's x in the window, and the frame's instant,
+/// as a frame drew it (`AppView::rects_drawn`: the centre's left and the
+/// first pane's box; its right edge is the rule's left).
+fn divider_drawn(v: &AppView) -> (Instant, Option<f32>) {
+    let drawn = v.rects_drawn.borrow();
+    let (o, rects) = &*drawn;
+    (v.fx.now(), rects.first().map(|(_, r)| o.0 + r.x + r.w))
+}
+
+/// Each draw's divider from `at` on, one per frame instant (a step can
+/// draw twice at one instant: #60 L1), the frames with none dropped.
+fn divider_path(seen: &Rc<RefCell<Vec<(Instant, Option<f32>)>>>, at: usize) -> Vec<(Instant, f32)> {
+    let mut out: Vec<(Instant, f32)> = Vec::new();
+    for &(t, x) in &seen.borrow()[at..] {
+        let Some(x) = x else { continue };
+        match out.last_mut() {
+            Some(last) if last.0 == t => last.1 = x,
+            _ => out.push((t, x)),
+        }
+    }
+    out
+}
+
 /// The divider's wobble on the 2-panel settle (#59's note, #54's
-/// neighbour): two panes at 1920, the rail wide and the right panel
-/// yielded to them. The rail folds and the right panel comes back, then
-/// the rail unfolds and the right panel yields again: both panels fly, the
-/// layout rides neither (the panes are the tree in the centre each frame).
-/// Frame by frame at 144 Hz the divider's x on screen moves one way only.
+/// neighbour): two panes, the rail wide and the right panel yielded to
+/// them. The rail folds and the right panel comes back, then the rail
+/// unfolds and the right panel yields again: both panels fly, the layout
+/// rides neither (the panes are the tree in the centre each frame). Draw
+/// by draw (#61's hook) the divider's x in the window moves one way only.
 /// On two springs of their own the panels stepped their half-pixels on
 /// alternate frames in the tail, so the centre's width (1920 − MARK − both)
 /// went 1407.5 / 1408 / 1407.5 and the divider back half a pixel, four
 /// times; the yielding panel is now drawn off the causing panel's progress
-/// ([`crate::chrome::Tie`]), so their edges step together.
+/// ([`crate::chrome::Tie`]). And at other widths, scales and shares (Shady
+/// #62 M2): at 1500 px, 2×, 480/240, the panes rounded from the centre's
+/// own edge put the divider at 971.5 then 971 (rail 476.5 → 477, the first
+/// pane 495 → 494); they are rounded on the window's pixels now
+/// ([`crate::split::Node::rects_in`]).
 #[gpui_kit::test]
 fn the_divider_moves_one_way_through_a_two_panel_settle(cx: &mut TestAppContext) {
-    let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "settle", (1920., 1080.));
-    view.update(cx, |v, cx| {
-        let mut p = v.panels;
-        (p.rail_width, p.right_width) = (Some(crate::theme::RAIL_WIDTHS.1), Some(crate::theme::RIGHT_WIDTHS.1));
-        v.panels = p;
-        cx.notify();
-    });
-    frame(cx, window);
-    key(cx, window, "ctrl-\\");
-    for _ in 0..10 {
-        frame(cx, window);
-    }
-    assert_eq!(
-        view.read_with(cx, |v, _| (v.panes.len(), v.pane_yield.map(|y| y.1))),
-        (2, Some(true)),
-        "two panes, the right panel yielded"
-    );
-    level(cx, crate::motion::Level::Full);
     let mut fails = Vec::new();
-    for (what, yields) in [("fold", false), ("unfold", true)] {
-        view.update(cx, |v, cx| v.toggle_panel(true, cx));
-        let (mut xs, mut rest, mut both) = (Vec::new(), 0, false);
-        for _ in 0..400 {
-            frame_144(cx, window, &view);
-            xs.extend(drawn(cx, window, "pane-divider Row".into()).map(|b| b[0]));
-            let (moving, sides) = view.read_with(cx, |v, _| {
-                (v.panes.flight.is_some() || v.panel_fx.moving(), v.panel_fx.sides.iter().filter(|f| f.moving).count())
-            });
-            both |= sides == 2;
-            rest = if moving { 0 } else { rest + 1 };
-            if rest >= 5 {
-                break;
+    // The window, its scale, the panels' widths, the first pane's share.
+    let cases = [
+        (1920., 2., 480, 520, 0.5),
+        (1500., 2., 480, 240, 0.5),
+        (1500., 1.25, 400, 300, 0.5),
+        (1700., 1.5, 480, 240, 0.38),
+        (1920., 2., 300, 520, 0.62),
+    ];
+    for (n, (w, s, rail, right, share)) in cases.into_iter().enumerate() {
+        let what = format!("{w} px at {s}×, rail {rail}, right {right}, share {share}");
+        let (window, view, client, _a, _attaches, _events) = on_a_at(cx, &format!("settle-{n}"), (w, 1080.));
+        VisualTestContext::from_window(window, cx).simulate_scale_factor_change(s);
+        view.update(cx, |v, cx| {
+            let mut p = v.panels;
+            (p.rail_width, p.right_width) = (Some(rail), Some(right));
+            v.panels = p;
+            cx.notify();
+        });
+        frame(cx, window);
+        key(cx, window, "ctrl-\\");
+        for _ in 0..10 {
+            frame(cx, window);
+        }
+        view.update(cx, |v, cx| {
+            if let crate::split::Node::Split { ratios, .. } = &mut v.panes.tree {
+                *ratios = vec![share, 1. - share];
+            }
+            v.panes.drawn = v.panes.tree.clone();
+            cx.notify();
+        });
+        frame(cx, window);
+        assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2, "{what}: two panes");
+        level(cx, crate::motion::Level::Full);
+        let seen = draws(cx, &view, divider_drawn);
+        for motion in ["fold", "unfold"] {
+            let at = seen.borrow().len();
+            view.update(cx, |v, cx| v.toggle_panel(true, cx));
+            let mut rest = 0;
+            for _ in 0..400 {
+                frame_144(cx, window, &view);
+                let moving = view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving());
+                rest = if moving { 0 } else { rest + 1 };
+                if rest >= 5 {
+                    break;
+                }
+            }
+            let xs: Vec<f32> = divider_path(&seen, at).into_iter().map(|(_, x)| x).collect();
+            assert!(xs.len() > 10 && xs[0] != xs[xs.len() - 1], "{what}, {motion}: the divider moved: {xs:?}");
+            let dir = (xs[xs.len() - 1] - xs[0]).signum();
+            for (i, d) in xs.windows(2).enumerate() {
+                if (d[1] - d[0]) * dir < -0.01 {
+                    fails.push(format!("{what}, {motion}, draw {}: the divider went back, {} -> {}", i + 1, d[0], d[1]));
+                }
             }
         }
-        assert!(both, "{what}: both panels flew");
-        assert_eq!(view.read_with(cx, |v, _| v.pane_yield.map(|y| y.1)), Some(yields), "{what}: the right panel's yield");
-        let dir = (xs[xs.len() - 1] - xs[0]).signum();
-        eprintln!("SETTLE {what}: {} frames, {:?}", xs.len(), xs);
-        for (i, w) in xs.windows(2).enumerate() {
-            if (w[1] - w[0]) * dir < -0.01 {
-                fails.push(format!("{what}, frame {}: the divider went back, {} -> {}", i + 1, w[0], w[1]));
-            }
-        }
+        // What the hook read is what was drawn: the rule's place, within
+        // the device pixel GPUI snaps it to.
+        let last = divider_path(&seen, 0).last().map(|p| p.1).expect("a divider drawn");
+        let rule = drawn(cx, window, "pane-divider Row".into()).map(|b| b[0]).expect("the rule drawn");
+        assert!((rule - last).abs() <= 1. / s + 0.01, "{what}: the rule at {rule}, the hook read {last}");
+        view.update(cx, |v, _| v.on_draw = None);
+        view.update(cx, |v, _| v.client = None);
+        let _ = client.shutdown();
     }
     assert!(fails.is_empty(), "{fails:#?}");
-    view.update(cx, |v, _| v.client = None);
-    let _ = client.shutdown();
 }
 
 /// A layout flight taken over mid-flight turns with its velocity (the
@@ -6180,10 +6226,12 @@ fn the_divider_moves_one_way_through_a_two_panel_settle(cx: &mut TestAppContext)
 /// left at speed; Ctrl+W comes between two frames, as a hand's does, and
 /// the close's own frame still moves it left at least half as fast (from
 /// rest it turned at once: the close started a spring of its own at 0;
-/// and the 2560 film's close drew the layout as the frame before, 0 px, a
-/// 14 ms hold: the carried spring started at the close's frame, not at
-/// the frame that drew where it starts), then turns once and goes right
-/// to the end, one pane left. Off: the close lands in its frame, as before.
+/// and the film's close (1920, the right panel folded: nothing yields)
+/// drew the layout as the frame before, 0 px, a 14 ms hold: the carried
+/// spring started at the close's frame, not at the frame that drew where
+/// it starts), then turns once and goes right to the end, one pane left.
+/// Every draw is read (#61's hook). Off: the close lands in its frame, as
+/// before.
 #[gpui_kit::test]
 fn a_close_mid_split_turns_with_the_splits_velocity(cx: &mut TestAppContext) {
     let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "panes-carry", (2560., 1080.));
@@ -6200,31 +6248,29 @@ fn a_close_mid_split_turns_with_the_splits_velocity(cx: &mut TestAppContext) {
         for _ in 0..3 {
             frame(cx, window);
         }
+        // Every draw (#61's hook: Shady #62 r1, a step can draw twice).
+        let seen = draws(cx, &view, divider_drawn);
         key(cx, window, "ctrl-\\");
-        let mut xs = Vec::new();
         for _ in 0..10 {
             frame_144(cx, window, &view);
-            xs.extend(drawn(cx, window, "pane-divider Row".into()).map(|b| b[0]));
         }
         let (flying, yielded) = view.read_with(cx, |v, _| (v.panes.flight.is_some(), v.pane_yield.is_some_and(|y| y.1)));
         assert!(flying, "{what}: the split still in the air");
         assert_eq!(yielded, yields, "{what}: the right panel's yield");
-        let k = xs.len();
+        let k = divider_path(&seen, 0).len();
         // Ctrl+W between two frames, as a hand's comes: its frame is the
-        // next one (a frame on), and is recorded.
+        // next one (a frame on), the first drawn after it.
         let at = view.read_with(cx, |v, _| v.fx.clock());
         view.read_with(cx, |v, _| v.fx.set_clock(at + Duration::from_micros(6944)));
         key(cx, window, "ctrl-w");
-        xs.extend(drawn(cx, window, "pane-divider Row".into()).map(|b| b[0]));
         let mut frames = 0;
         while view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving()) {
             frame_144(cx, window, &view);
             frames += 1;
             assert!(frames < 300, "{what}: the close never landed");
-            if let Some(b) = drawn(cx, window, "pane-divider Row".into()) {
-                xs.push(b[0]);
-            }
         }
+        view.update(cx, |v, _| v.on_draw = None);
+        let xs: Vec<f32> = divider_path(&seen, 0).into_iter().map(|(_, x)| x).collect();
         eprintln!("CARRY {what}: {k} frames of the split, then the close: {xs:?}");
         assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "{what}: one pane left");
         let steps: Vec<f32> = xs.windows(2).map(|w| w[1] - w[0]).collect();
@@ -6778,4 +6824,260 @@ fn frame_144_matches_fluid_frame() {
     assert_eq!(spelt(body(ours, "frame_144")), fluid, "frame_144 drifted from ui_tests' fluid_frame");
     let notify = "    view.update(cx, |_, cx| cx.notify());\n";
     assert_eq!(spelt(body(ours, "asked_frame")), fluid.replacen(notify, "", 1), "asked_frame drifted from fluid_frame");
+}
+
+// ── #62 round 3 (Shady #62 r1: M1, M3, M4, draw by draw) ────────────────
+
+/// One frame `dt` after the last on the test's clock, drawn: [`frame_144`]
+/// at any rate (60 Hz; a late frame).
+fn frame_dt(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>, dt: Duration) {
+    let (t0, at) = (cx.executor().now(), view.read_with(cx, |v, _| v.fx.clock()));
+    let _end = cx.executor().timer(dt);
+    loop {
+        cx.dispatcher.advance_clock_to_next_timer();
+        let t = cx.executor().now() - t0;
+        view.read_with(cx, |v, _| v.fx.set_clock(at + t));
+        cx.run_until_parked();
+        if t >= dt {
+            break;
+        }
+    }
+    view.update(cx, |_, cx| cx.notify());
+    cx.update_window(window, |_, w, cx| w.simulate_next_frame(cx)).expect("the window");
+    cx.run_until_parked();
+}
+
+/// The panels at their widest (480 / 520), the layout's moves at Full.
+fn wide_panels(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>) {
+    view.update(cx, |v, cx| {
+        let mut p = v.panels;
+        (p.rail_width, p.right_width) = (Some(crate::theme::RAIL_WIDTHS.1), Some(crate::theme::RIGHT_WIDTHS.1));
+        v.panels = p;
+        cx.notify();
+    });
+    frame(cx, window);
+    level(cx, crate::motion::Level::Full);
+}
+
+/// Shady #62 M1: a close 1, 2 or 3 frames into a split the right panel
+/// yields to (Ctrl+\ at 1920; the layout riding it, #51). The panel
+/// turns back with its velocity a few px past where it was, and the
+/// layout rides it on: draw by draw, the divider moves while the panel
+/// does (the ride's progress held at −1 kept it still: the panel 12, then
+/// 22 px on), and it turns once. A new pane on the left, and an overshoot
+/// many times the way back: `split::tests::a_ride_past_its_start_keeps_every_pane_in_its_room`.
+#[gpui_kit::test]
+fn an_early_close_mid_ride_moves_with_its_panel(cx: &mut TestAppContext) {
+    let mut fails = Vec::new();
+    for k in 1..=3 {
+        let what = format!("a split closed {k} frame(s) in");
+        let (window, view, client, _a, _attaches, _events) = on_a_at(cx, &format!("early-{k}"), (1920., 1080.));
+        wide_panels(cx, window, &view);
+        let seen = draws(cx, &view, |v| {
+            let (t, x) = divider_drawn(v);
+            (t, x, v.panel_fx.sides[1].shown)
+        });
+        key(cx, window, "ctrl-\\");
+        for _ in 0..k {
+            frame_144(cx, window, &view);
+        }
+        let rides = view.read_with(cx, |v, _| v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some()));
+        assert!(rides, "{what}: the layout rides the right panel");
+        let at = view.read_with(cx, |v, _| v.fx.clock());
+        view.read_with(cx, |v, _| v.fx.set_clock(at + Duration::from_micros(6944)));
+        key(cx, window, "ctrl-w");
+        let mut frames = 0;
+        while view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving()) {
+            frame_144(cx, window, &view);
+            frames += 1;
+            assert!(frames < 300, "{what}: the close never landed");
+        }
+        view.update(cx, |v, _| v.on_draw = None);
+        assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "{what}: one pane left");
+        // Frame by frame (one per instant): the divider, the panel.
+        let mut path: Vec<(Instant, f32, f32)> = Vec::new();
+        for &(t, x, p) in seen.borrow().iter() {
+            let Some(x) = x else { continue };
+            match path.last_mut() {
+                Some(l) if l.0 == t => (l.1, l.2) = (x, p),
+                _ => path.push((t, x, p)),
+            }
+        }
+        // The ride moves the divider in proportion to the panel (its
+        // ratio over the split's frames): held while the panel went
+        // far enough to move it 1.5 px or more, it stood still.
+        let k1 = (k + 1).min(path.len() - 1);
+        let ratio = ((path[k1].1 - path[0].1) / (path[k1].2 - path[0].2)).abs();
+        let mut i = 0;
+        while i + 1 < path.len() {
+            let mut j = i;
+            while j + 1 < path.len() && path[j + 1].1 == path[i].1 {
+                j += 1;
+            }
+            let swept = path[i..=j].windows(2).map(|w| (w[1].2 - w[0].2).abs()).sum::<f32>();
+            if j > i && swept * ratio >= 1.5 {
+                fails.push(format!(
+                    "{what}: the divider held at {} for {} frames while the panel moved {swept} px (ratio {ratio:.2})",
+                    path[i].1,
+                    j - i
+                ));
+                break;
+            }
+            i = j + 1;
+        }
+        let steps: Vec<f32> = path.windows(2).map(|w| w[1].1 - w[0].1).filter(|d| *d != 0.).collect();
+        let turns = steps.windows(2).filter(|w| w[0].signum() != w[1].signum()).count();
+        if turns != 1 {
+            fails.push(format!("{what}: the divider turned {turns} times: {steps:?}"));
+        }
+        eprintln!("EARLY {what}: {:?}", path.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>());
+        view.update(cx, |v, _| v.client = None);
+        let _ = client.shutdown();
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// Shady #62 M3: a flight taken over starts from one frame, the last one
+/// drawn: its position, its velocity and its instant. Ctrl+\ at 2560
+/// (nothing yields: the split on its own spring), 10 frames at 144 Hz, 5
+/// at 60 Hz, or 10 at 144 Hz and then 33 ms of nothing; then Ctrl+W. The close's
+/// spring starts at that frame's instant with the split's velocity there,
+/// carried (`Flight::carried`), not with its velocity a frame (or a wait)
+/// later, planted a frame back.
+#[gpui_kit::test]
+fn a_takeover_starts_from_its_last_frames_position_velocity_and_instant(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "panes-m3", (2560., 1080.));
+    wide_panels(cx, window, &view);
+    let mut fails = Vec::new();
+    for (what, dt, n, wait) in [("144 Hz", 6944, 10, 0), ("60 Hz", 16_667, 5, 0), ("144 Hz, then 33 ms", 6944, 10, 33_000)] {
+        let dt = Duration::from_micros(dt);
+        key(cx, window, "ctrl-\\");
+        for _ in 0..n {
+            frame_dt(cx, window, &view, dt);
+        }
+        let (drawn_at, v_old, old) = view.read_with(cx, |v, _| {
+            let f = v.panes.flight.as_ref().expect("the split in the air");
+            assert!(f.ride.is_none(), "{what}: on its own spring");
+            let at = v.panes.drawn_at.expect("drawn");
+            let v_old = v.fx.spring_velocity_at(crate::app::PANE_FLIGHT, at).expect("moving");
+            (at, v_old, (f.from.clone(), f.to.clone(), f.travel))
+        });
+        let t = view.read_with(cx, |v, _| v.fx.clock());
+        view.read_with(cx, |v, _| v.fx.set_clock(t + Duration::from_micros(wait) + dt / 2));
+        key(cx, window, "ctrl-w");
+        frame_dt(cx, window, &view, dt);
+        let (v_new, want) = view.read_with(cx, |v, _| {
+            let f = v.panes.flight.as_ref().expect("the close in the air");
+            let (o, (w, h)) = (v.centre_at.get(), v.centre.get());
+            let area = crate::split::Rect { x: o.0, y: o.1, w, h };
+            (v.fx.spring_velocity_at(crate::app::PANE_FLIGHT, drawn_at), f.carried(&old, v_old, area))
+        });
+        eprintln!("M3 {what}: the split at {v_old} px/s; the close starts at {v_new:?}, carried {want}");
+        match v_new {
+            Some(v) if want.abs() > 1. && (v - want).abs() <= 1e-3 * want.abs() => {}
+            _ => fails.push(format!("{what}: the close's spring at the last frame's instant {v_new:?}, carried from it {want}")),
+        }
+        let mut frames = 0;
+        while view.read_with(cx, |v, _| v.panes.flight.is_some()) {
+            frame_144(cx, window, &view);
+            frames += 1;
+            assert!(frames < 300, "{what}: never landed");
+        }
+        assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "{what}: one pane again");
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #62 M4: a takeover mid-ride that changes no yield rides on.
+/// Ctrl+\ at 1920 (the right panel yields to it, the layout rides the
+/// panel), 10 frames in Ctrl+Shift+\ in the new pane: no yield changes,
+/// and the split down rides the same flight on from where it was drawn
+/// (it flew on its own spring from rest: the divider stopped while the
+/// panel went on). Draw by draw (#61's hook) the vertical divider stays on
+/// the ride's line, its x by the centre's width as drawn, to the end:
+/// position and velocity go on as they were.
+#[gpui_kit::test]
+fn a_split_down_mid_ride_rides_on(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "panes-m4", (1920., 1080.));
+    wide_panels(cx, window, &view);
+    // Each draw: its instant, the vertical divider's x in the window and
+    // the centre's width (where the panes end).
+    let seen = draws(cx, &view, |v| {
+        let (t, x) = divider_drawn(v);
+        let w = v.rects_drawn.borrow().1.iter().map(|(_, r)| r.x + r.w).fold(0., f32::max);
+        (t, x, w)
+    });
+    let path = |seen: &Rc<RefCell<Vec<(Instant, Option<f32>, f32)>>>| {
+        let mut out: Vec<(Instant, f32, f32)> = Vec::new();
+        for &(t, x, w) in seen.borrow().iter() {
+            let Some(x) = x else { continue };
+            match out.last_mut() {
+                Some(l) if l.0 == t => (l.1, l.2) = (x, w),
+                _ => out.push((t, x, w)),
+            }
+        }
+        out
+    };
+    key(cx, window, "ctrl-\\");
+    for _ in 0..10 {
+        frame_144(cx, window, &view);
+    }
+    let riding = view.read_with(cx, |v, _| v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some()));
+    assert!(riding, "the split rides the right panel");
+    let before = path(&seen);
+    let k = before.len();
+    assert!(k >= 5, "the split drawn: {before:?}");
+    let t = view.read_with(cx, |v, _| v.fx.clock());
+    view.read_with(cx, |v, _| v.fx.set_clock(t + Duration::from_micros(3472)));
+    key(cx, window, "ctrl-shift-\\");
+    frame_144(cx, window, &view);
+    let (rides, yields) = view.read_with(cx, |v, _| {
+        let f = v.panes.flight.as_ref().expect("the split down in the air");
+        (f.ride.is_some(), v.pane_yield.map(|y| (y.0, y.1)))
+    });
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 3, "three panes");
+    assert_eq!(yields, Some((false, true)), "the right panel still yielded, the rail not");
+    assert!(rides, "the split down rides on: no yield changed and the panel still flies");
+    let mut frames = 0;
+    while view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving()) {
+        frame_144(cx, window, &view);
+        frames += 1;
+        assert!(frames < 300, "never landed");
+    }
+    view.update(cx, |v, _| v.on_draw = None);
+    let all = path(&seen);
+    eprintln!("M4 (x, w): {:?}", all.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>());
+    // The ride's slope (x by the centre's width), from its first draw
+    // that moved to its last before the takeover.
+    let first = before.iter().find(|p| (p.2 - before[0].2).abs() >= 1.).expect("the centre widening");
+    let last = before[k - 1];
+    assert!(last.2 - first.2 >= 20., "the ride well under way: {first:?} .. {last:?}");
+    let slope = (last.1 - first.1) / (last.2 - first.2);
+    assert!(slope < -0.2, "the vertical divider going left as the centre widens: {slope}");
+    // Where it lands: the tree's, in the centre as drawn last.
+    let end = *all.last().expect("drawn");
+    let tree_x = view.read_with(cx, |v, _| {
+        let (o, (w, h)) = (v.centre_at.get(), v.centre.get());
+        let r = v.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h })[0].1;
+        o.0 + r.x + r.w
+    });
+    assert!((end.1 - tree_x).abs() <= 1., "it lands at the tree's: {} vs {tree_x}", end.1);
+    assert!(end.2 - last.2 >= 20., "the panel still had a way to go: {last:?} .. {end:?}");
+    // From the takeover to the end, on one line (x by the width) ...
+    let after = (end.1 - last.1) / (end.2 - last.2);
+    let mut fails = Vec::new();
+    for p in &all[k..] {
+        let want = last.1 + after * (p.2 - last.2);
+        if (p.1 - want).abs() > 1.5 {
+            fails.push(format!("x {} at w {} (the line: {want:.1})", p.1, p.2));
+        }
+    }
+    assert!(fails.is_empty(), "after the takeover the divider leaves its line: {fails:?}");
+    // ... the ride's: at the speed the centre moves, as before.
+    assert!((after - slope).abs() <= 0.02, "the split down's slope {after} vs the ride's {slope}");
+    assert!(all[k].1 <= last.1, "the split down's own frame still goes left: {} after {}", all[k].1, last.1);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
 }
