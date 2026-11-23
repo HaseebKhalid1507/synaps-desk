@@ -2,8 +2,10 @@
 //! window sent. An Allow from here can be crossed (another client's Deny, a
 //! HALT, the prompt's timeout). A daemon with SynapsCLI #430 says what it
 //! applied (`PromptResolved.outcome`) and the receipt takes its word; an
-//! older one does not say, and the call does
-//! ([`crate::authorize::applied`]): both paths are here.
+//! older one does not say, and the call does ([`crate::authorize::applied`]),
+//! as an inference from the engine's own result forms, never from what a
+//! tool printed, and what it showed once it is not taken back. Both paths
+//! are here.
 //! The window is `ui_tests`' (`--offline`'s demo, a client whose daemon is
 //! nowhere), its helpers as there (that file is protected).
 
@@ -211,6 +213,39 @@ fn an_applied_allow_lights_when_its_call_runs_and_stays_allowed(cx: &mut TestApp
         assert_eq!(seen.iter().any(|s| s.2), level == Level::Full, "{level:?}: lit once it ran (Full only): {seen:?}");
         assert!(seen.iter().all(|s| s.1 == "allowed"), "{level:?}: {seen:?}");
         assert!(drawn(cx, w, format!("receipt-word {row} allowed")), "{level:?}");
+        cx.update_window(w, |_, w, _| w.remove_window()).expect("the window");
+        cx.run_until_parked();
+    }
+}
+
+fn delta(cx: &mut TestAppContext, view: &Entity<AppView>, call: &str, text: &str) {
+    stream(cx, view, serde_json::json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result_delta", "tool_id": call, "delta": text}}));
+}
+
+/// Shady C64-1: the call streamed (past its gate), then a HALT's live
+/// result, the bare `Canceled by user`, replaced its output; or the turn
+/// ended with no result (a settle). The Allow applied and it stays
+/// `allowed` (lit at Full once it streamed), never `cancelled`. On
+/// `cc4430d` the bare cancel turned it `cancelled`.
+#[gpui_kit::test]
+fn an_allow_whose_call_streamed_is_not_taken_back(cx: &mut TestAppContext) {
+    for (level, how) in [(Level::Full, "bare cancel"), (Level::Full, "settle"), (Level::Off, "bare cancel")] {
+        let (seen, row, w) = allow_then(cx, level, |cx, view, call| {
+            delta(cx, view, call, "removed 3 files\n");
+            if how == "bare cancel" {
+                result(cx, view, call, "Canceled by user");
+            } else {
+                view.update(cx, |v, cx| {
+                    v.model.transcript.apply(&SessionEvent::Idle);
+                    cx.notify();
+                });
+                cx.run_until_parked();
+            }
+        });
+        assert!(seen.iter().all(|s| s.1 == "allowed"), "{level:?} {how}: {seen:?}");
+        assert_eq!(seen.iter().any(|s| s.2), level == Level::Full, "{level:?} {how}: lit once it streamed (Full only): {seen:?}");
+        assert!(drawn(cx, w, format!("receipt-word {row} allowed")), "{level:?} {how}");
+        assert!(!drawn(cx, w, format!("receipt-word {row} cancelled")), "{level:?} {how}");
         cx.update_window(w, |_, w, _| w.remove_window()).expect("the window");
         cx.run_until_parked();
     }

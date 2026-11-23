@@ -27,7 +27,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use synaps_client::protocol::{PromptOutcome, PromptRequest};
-use synaps_client::transcript::{Item, ToolStatus};
+use synaps_client::transcript::{GateNote, Item, ToolCall, ToolStatus, gate_note};
 
 use crate::app::{ARM, AppView, Arm, authorize_ready, hidden, lines_below, mono};
 use crate::fonts;
@@ -322,20 +322,21 @@ impl Receipt {
     /// What it says once its call's end is known (Shady L4): resolved with
     /// no answer from here, and the call cancelled, it was a cancel (a HALT
     /// from another client resolves the prompt while the turn still runs).
-    /// A yes from here says what the daemon applied (#25): its call blocked
-    /// at the gate (`end` is the end of its result, [`result_end`]) is
+    /// A daemon that says what it applied (SynapsCLI #430) is taken at its
+    /// word ([`Receipt::reported`]). Without it, a yes from here whose call
+    /// shows it was held at its gate (#25: `applied`, [`applied`]) is
     /// `denied` (another client's Deny came first, the prompt timed out) or
-    /// `cancelled` (a HALT crossed it), never `allowed`. Read when drawn,
-    /// from the call as it is: no race.
-    /// A daemon that says what it applied (#430) is taken at its word
-    /// ([`Receipt::reported`]); the call's end is read only without it.
-    pub(crate) fn answer_for(&self, call: Option<ToolStatus>, end: &str) -> Answer {
+    /// `cancelled` (a HALT crossed it, or one ran silently: the call can't
+    /// say which), not `allowed`. That is an inference from the call, not
+    /// the daemon's word: the answer sent stays in [`Receipt::answer`].
+    /// Read when drawn: no race.
+    pub(crate) fn answer_for(&self, call: Option<ToolStatus>, applied: Option<bool>) -> Answer {
         if let Some(a) = self.reported() {
             return a;
         }
         match self.answer {
             Answer::Elsewhere | Answer::Resolved if call == Some(ToolStatus::Cancelled) => Answer::Cancelled,
-            Answer::Allowed | Answer::AllowedAll | Answer::Provided if applied(call, end) == Some(false) => {
+            Answer::Allowed | Answer::AllowedAll | Answer::Provided if applied == Some(false) => {
                 if call == Some(ToolStatus::Denied) { Answer::Denied } else { Answer::Cancelled }
             }
             a => a,
@@ -382,40 +383,49 @@ impl Receipt {
 
     /// Whether a yes was applied, which lights the receipt: the daemon's
     /// word when it gave one (lit as it lands), else once the call shows
-    /// it ran ([`applied`]).
-    pub(crate) fn applied_yes(&self, call: Option<ToolStatus>, end: &str) -> bool {
+    /// it got past its gate (`applied`: [`applied`]).
+    pub(crate) fn applied_yes(&self, applied: Option<bool>) -> bool {
         match self.outcome.filter(|o| *o != PromptOutcome::Unknown) {
             Some(o) => matches!(o, PromptOutcome::Allowed | PromptOutcome::Answered),
-            None => applied(call, end) == Some(true),
+            None => applied == Some(true),
         }
     }
 }
 
-/// Whether the daemon applied a yes to the prompt that gated `call`, as
-/// far as the call shows (#25), for a daemon that does not say (before
-/// SynapsCLI #430): `PromptResolved` does not say which answer
-/// it took, and this window's is sent and not acknowledged (another
-/// client's Deny, a HALT or the prompt's timeout can cross it). Past its
-/// gate a call runs: its output streams, or it ends on its own (done,
-/// failed, stopped at its limit), or a cancel says it had started (the
-/// engine's `before the tool finished`, `It had already started`). Held
-/// at the gate it ends denied (`Tool call confirmation denied`), or
-/// cancelled with nothing run. `None`: not known yet (running, silent).
-/// `end`: [`result_end`].
-pub(crate) fn applied(call: Option<ToolStatus>, end: &str) -> Option<bool> {
-    match call? {
-        ToolStatus::Done | ToolStatus::Failed | ToolStatus::Unknown => Some(true),
-        ToolStatus::Denied => Some(false),
-        ToolStatus::Cancelled => Some(end.contains("before the tool finished") || end.contains("It had already started")),
-        // Queued, running, streaming (the status is `non_exhaustive`).
-        _ => (!end.is_empty()).then_some(true),
+/// Whether a yes to the prompt that gated `call` got it past its gate, as
+/// far as the call shows (#25): the fallback for a daemon that doesn't say
+/// what it applied (before SynapsCLI #430). An inference, not an
+/// acknowledgement: such a daemon resolves the prompt with no answer in it, and this window's answer is sent, not acknowledged
+/// (another client's Deny, a HALT or the prompt's timeout can cross it).
+///
+/// `Some(true)`: it got past (`past`: [`Transcript::past_gate`], output
+/// streamed or a result said it ran, kept once seen so a later bare cancel
+/// or a settle doesn't take it back, Shady C64-1), or it ended on its own
+/// (done, failed, stopped at its limit). `Some(false)`: its whole result is
+/// one of the engine's own forms for a call held at its gate
+/// ([`gate_note`]: the confirm's deny, a bare cancel), or the turn ended
+/// before it reported and nothing streamed. A bare cancel is also what a
+/// call that ran silently gets: it reads `cancelled`, unlit, not proven
+/// either way. `None`: not known (queued, running, silent; any other
+/// result). Tool output is never searched for a phrase (Shady C64-2); a
+/// tool whose whole output is byte for byte a gate form reads as one.
+///
+/// [`Transcript::past_gate`]: synaps_client::Transcript::past_gate
+pub(crate) fn applied(call: Option<&ToolCall>, past: bool) -> Option<bool> {
+    if past {
+        return Some(true);
     }
-}
-
-/// The end of a call's result as the transcript holds it: its tail when
-/// the preview cut it (where the engine's notes are), else the result.
-pub(crate) fn result_end(t: &synaps_client::transcript::ToolCall) -> &str {
-    if t.tail.is_empty() { &t.result } else { &t.tail }
+    let t = call?;
+    match t.status? {
+        ToolStatus::Done | ToolStatus::Failed | ToolStatus::Unknown => Some(true),
+        s @ (ToolStatus::Denied | ToolStatus::Cancelled) => match gate_note(&t.result, &t.tail) {
+            Some(GateNote::Denied | GateNote::BareCancel) => Some(false),
+            Some(GateNote::StartedCancel) => Some(true),
+            None => (s == ToolStatus::Cancelled && t.result.is_empty()).then_some(false),
+        },
+        // Queued, running, streaming (the status is `non_exhaustive`).
+        _ => None,
+    }
 }
 
 /// When a call's run started, for its clock: a gated call's at its answer
@@ -760,8 +770,8 @@ impl AppView {
             return None;
         }
         let r = self.row_receipt(call)?;
-        let end = self.call_end(&r.call);
-        let words = self.receipt_words(r, r.answer_for(status, end), r.applied_yes(status, end), running, p);
+        let applied = self.call_applied(&r.call);
+        let words = self.receipt_words(r, r.answer_for(status, applied), r.applied_yes(applied), running, p);
         let row = r.row;
         // The meta's 8 px gap is the separator's first space.
         // Cards D: the facts' dot before it (cards4/proposal.md §3).
@@ -785,11 +795,11 @@ impl AppView {
         self.receipts.get(sid)?.iter().rev().find(|r| !r.own && r.call == call)
     }
 
-    /// The end of call `call`'s result ([`result_end`]); empty if it is not
-    /// in the transcript.
-    fn call_end(&self, call: &str) -> &str {
-        let items = self.model.lives[self.panes.cur.live].transcript.items();
-        call_ix(items, call).and_then(|i| items[i].tool.as_ref()).map_or("", result_end)
+    /// [`applied`] for call `call` (its tool-use id), from the transcript.
+    pub(crate) fn call_applied(&self, call: &str) -> Option<bool> {
+        let t = &self.model.lives[self.panes.cur.live].transcript;
+        let items = t.items();
+        applied(call_ix(items, call).and_then(|i| items[i].tool.as_ref()), t.past_gate(call))
     }
 
     /// The receipt's words; `applied`: its call shows the daemon applied
@@ -858,7 +868,7 @@ impl AppView {
         let kind = if rc.secret { "secret" } else { "confirm" };
         let items = self.model.lives[self.panes.cur.live].transcript.items();
         let status = call_ix(items, &rc.call).and_then(|i| items[i].tool.as_ref()).and_then(|t| t.status);
-        let end = self.call_end(&rc.call);
+        let applied = self.call_applied(&rc.call);
         h_flex()
             .w_full()
             .h(px(receipt_line(m)))
@@ -869,7 +879,7 @@ impl AppView {
             .debug_selector(move || format!("receipt-row {}", d.id))
             // On the call rows' verb column (the finish gate of #18).
             .child(div().pl(px(crate::turns::Geo::of(self.panes.cur.layout, m).verb)).text_color(p.dim_t).child(format!("{kind} · ")))
-            .child(self.receipt_words(rc, rc.answer_for(status, end), rc.applied_yes(status, end), false, p))
+            .child(self.receipt_words(rc, rc.answer_for(status, applied), rc.applied_yes(applied), false, p))
             .into_any_element()
     }
 
@@ -1618,34 +1628,36 @@ mod tests {
             outcome,
         };
         let (cancelled, denied, running) = (Some(ToolStatus::Cancelled), Some(ToolStatus::Denied), Some(ToolStatus::Running));
-        let gate = "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this";
+        // What the call shows ([`applied`]): held at its gate, past it, not known.
+        let (held, past, unknown) = (Some(false), Some(true), None);
         // An Allow from here, and what the daemon applied.
         let ours = |o| r(Answer::Allowed, false, Some(o));
-        assert_eq!(ours(O::Allowed).answer_for(cancelled, "Canceled by user"), Answer::Allowed, "a HALT after a silent run: still allowed");
-        assert!(ours(O::Allowed).applied_yes(running, ""), "lit as it lands, before the call says a word");
-        assert_eq!(ours(O::Denied).answer_for(running, ""), Answer::Denied, "another client's Deny, known before the call ends");
-        assert!(!ours(O::Denied).applied_yes(running, "running 6 tests\n"));
-        assert_eq!(ours(O::Cancelled).answer_for(denied, gate), Answer::Cancelled, "a cancel at the gate reads as a denial in the call");
-        assert_eq!(ours(O::TimedOut).answer_for(denied, gate), Answer::Cancelled);
-        assert!(!ours(O::Cancelled).applied_yes(denied, gate));
-        assert_eq!(r(Answer::AllowedAll, false, Some(O::Allowed)).answer_for(running, ""), Answer::AllowedAll);
-        assert_eq!(r(Answer::Denied, false, Some(O::Allowed)).answer_for(running, ""), Answer::Allowed, "ours was not the one applied");
+        assert_eq!(ours(O::Allowed).answer_for(cancelled, held), Answer::Allowed, "a HALT after a silent run: still allowed");
+        assert!(ours(O::Allowed).applied_yes(unknown), "lit as it lands, before the call says a word");
+        assert_eq!(ours(O::Denied).answer_for(running, unknown), Answer::Denied, "another client's Deny, known before the call ends");
+        assert!(!ours(O::Denied).applied_yes(past));
+        assert_eq!(ours(O::Cancelled).answer_for(denied, held), Answer::Cancelled, "a cancel at the gate reads as a denial in the call");
+        assert_eq!(ours(O::TimedOut).answer_for(denied, held), Answer::Cancelled);
+        assert!(!ours(O::Cancelled).applied_yes(held));
+        assert_eq!(r(Answer::AllowedAll, false, Some(O::Allowed)).answer_for(running, unknown), Answer::AllowedAll);
+        assert_eq!(r(Answer::Denied, false, Some(O::Allowed)).answer_for(running, unknown), Answer::Allowed, "ours was not the one applied");
         // A secret.
-        assert_eq!(r(Answer::Provided, true, Some(O::Answered)).answer_for(cancelled, "Canceled by user"), Answer::Provided);
-        assert_eq!(r(Answer::Provided, true, Some(O::Denied)).answer_for(running, ""), Answer::Cancelled, "dismissed elsewhere first");
-        assert!(r(Answer::Provided, true, Some(O::Answered)).applied_yes(running, ""));
+        assert_eq!(r(Answer::Provided, true, Some(O::Answered)).answer_for(cancelled, held), Answer::Provided);
+        assert_eq!(r(Answer::Provided, true, Some(O::Denied)).answer_for(running, unknown), Answer::Cancelled, "dismissed elsewhere first");
+        assert!(r(Answer::Provided, true, Some(O::Answered)).applied_yes(unknown));
         // Not answered from here: a cancel says so; an answer stays elsewhere's.
-        assert_eq!(r(Answer::Elsewhere, false, Some(O::Cancelled)).answer_for(running, ""), Answer::Cancelled);
-        assert_eq!(r(Answer::Elsewhere, false, Some(O::Allowed)).answer_for(running, ""), Answer::Elsewhere);
-        assert_eq!(r(Answer::Resolved, false, Some(O::Denied)).answer_for(denied, gate), Answer::Resolved);
+        assert_eq!(r(Answer::Elsewhere, false, Some(O::Cancelled)).answer_for(running, unknown), Answer::Cancelled);
+        assert_eq!(r(Answer::Elsewhere, false, Some(O::Allowed)).answer_for(running, unknown), Answer::Elsewhere);
+        assert_eq!(r(Answer::Resolved, false, Some(O::Denied)).answer_for(denied, held), Answer::Resolved);
         // No word, or one this build does not know: the call decides (#25).
         for outcome in [None, Some(O::Unknown)] {
             let fallback = r(Answer::Allowed, false, outcome);
-            assert_eq!(fallback.answer_for(denied, gate), Answer::Denied, "{outcome:?}");
-            assert_eq!(fallback.answer_for(cancelled, "Canceled by user"), Answer::Cancelled, "{outcome:?}");
-            assert_eq!(fallback.answer_for(running, ""), Answer::Allowed, "{outcome:?}: not known yet");
-            assert!(!fallback.applied_yes(running, ""), "{outcome:?}: unlit until the call runs");
-            assert!(fallback.applied_yes(running, "running 6 tests\n"), "{outcome:?}");
+            assert_eq!(fallback.answer_for(denied, held), Answer::Denied, "{outcome:?}");
+            assert_eq!(fallback.answer_for(cancelled, held), Answer::Cancelled, "{outcome:?}");
+            assert_eq!(fallback.answer_for(cancelled, past), Answer::Allowed, "{outcome:?}: it ran (C64-1)");
+            assert_eq!(fallback.answer_for(running, unknown), Answer::Allowed, "{outcome:?}: not known yet");
+            assert!(!fallback.applied_yes(unknown), "{outcome:?}: unlit until the call runs");
+            assert!(fallback.applied_yes(past), "{outcome:?}");
         }
     }
 
@@ -1683,40 +1695,51 @@ mod tests {
         assert_eq!(status_beside(Some("cancelled"), Some(Answer::Cancelled)), None, "a HALT under the card: one cancelled");
         assert_eq!(status_beside(Some("cancelled"), Some(Answer::Elsewhere)), Some("cancelled"));
         // Shady L4: not ours, and its call cancelled: a cancel, said once.
-        use synaps_client::transcript::ToolStatus;
+        use synaps_client::transcript::{ToolCall, ToolStatus};
         let cancelled = Some(ToolStatus::Cancelled);
-        assert_eq!(r(Answer::Elsewhere, None).answer_for(cancelled, ""), Answer::Cancelled, "a HALT from another client");
-        assert_eq!(r(Answer::Resolved, None).answer_for(cancelled, ""), Answer::Cancelled);
-        assert_eq!(r(Answer::Elsewhere, None).answer_for(Some(ToolStatus::Done), "ok"), Answer::Elsewhere);
-        assert_eq!(r(Answer::Elsewhere, None).answer_for(None, ""), Answer::Elsewhere, "still running");
-        // #25: a yes from here says what the daemon applied. Ran, then
-        // cancelled (it had started, or streamed before it), ours stays ours.
+        assert_eq!(r(Answer::Elsewhere, None).answer_for(cancelled, None), Answer::Cancelled, "a HALT from another client");
+        assert_eq!(r(Answer::Resolved, None).answer_for(cancelled, Some(false)), Answer::Cancelled);
+        assert_eq!(r(Answer::Elsewhere, None).answer_for(Some(ToolStatus::Done), Some(true)), Answer::Elsewhere);
+        assert_eq!(r(Answer::Elsewhere, None).answer_for(None, None), Answer::Elsewhere, "still running");
+        // #25: a yes from here whose call shows it was held at its gate
+        // says so; one that got past, or isn't known yet, stays ours.
+        for a in [Answer::Allowed, Answer::AllowedAll, Answer::Provided] {
+            assert_eq!(r(a, None).answer_for(Some(ToolStatus::Denied), Some(false)), Answer::Denied);
+            assert_eq!(r(a, None).answer_for(cancelled, Some(false)), Answer::Cancelled);
+            assert_eq!(r(a, None).answer_for(cancelled, Some(true)), a, "it ran: a cancel after it doesn't demote it");
+            assert_eq!(r(a, None).answer_for(Some(ToolStatus::Running), None), a, "not known yet: what was sent");
+        }
+        assert_eq!(r(Answer::Denied, None).answer_for(Some(ToolStatus::Denied), Some(false)), Answer::Denied);
+        assert_eq!(r(Answer::Denied, None).answer_for(cancelled, Some(false)), Answer::Denied, "a no stays a no");
+        assert_eq!(status_beside(Some("cancelled"), Some(r(Answer::Elsewhere, None).answer_for(cancelled, None))), None);
+        // [`applied`]: the engine's whole forms only, and what the call showed
+        // before (`past`) is never taken back.
+        let call = |status, result: &str| ToolCall { status: Some(status), result: result.into(), ..Default::default() };
+        let gate = "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this";
         let started = "Canceled by user. It had already started and may have partially applied its effects.";
         let partial = "running 6 tests\n\n[Canceled by user before the tool finished; the output above is partial.]";
-        for end in [started, partial] {
-            assert_eq!(r(Answer::Allowed, None).answer_for(cancelled, end), Answer::Allowed, "ours stays ours: {end}");
-            assert_eq!(applied(cancelled, end), Some(true));
+        use ToolStatus::*;
+        for (c, past, want, why) in [
+            (call(Denied, gate), false, Some(false), "held at the gate"),
+            (call(Cancelled, "Canceled by user"), false, Some(false), "a bare cancel, nothing streamed"),
+            (call(Cancelled, ""), false, Some(false), "the turn ended before it reported, nothing streamed"),
+            (call(Cancelled, started), false, Some(true), "the engine says it had started"),
+            (call(Cancelled, partial), false, Some(true), "its partial output, the engine's note under it"),
+            (call(Cancelled, "Canceled by user"), true, Some(true), "C64-1: it streamed before the HALT's bare cancel"),
+            (call(Cancelled, "running 6 tests\n"), true, Some(true), "C64-1: settled after its output, no result"),
+            (call(Denied, gate), true, Some(true), "C64-2: printed the gate's words after streaming"),
+            (call(Running, ""), false, None, "silent: not known"),
+            (call(Done, "ok"), false, Some(true), "ended on its own"),
+            (call(Failed, "Tool execution failed: Command failed (exit 1):"), false, Some(true), "ended on its own"),
+            // C64-2: a deny quoted inside output, or another block, is not the gate's.
+            (call(Done, &format!("log:\n{gate}\n")), false, Some(true), "quoted mid-output"),
+            (call(Denied, "Tool call blocked by extension: policy says no"), false, None, "another extension's block"),
+            (call(Cancelled, "Canceled by user\nthen more"), false, None, "not the bare phrase"),
+        ] {
+            assert_eq!(applied(Some(&c), past), want, "{why}: {c:?}");
         }
-        // Held at the gate: a HALT crossed it (cancelled, nothing run), or the
-        // daemon took a Deny (another client's, the prompt's timeout).
-        let denied = Some(ToolStatus::Denied);
-        let gate = "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this";
-        for a in [Answer::Allowed, Answer::AllowedAll] {
-            assert_eq!(r(a, None).answer_for(cancelled, "Canceled by user"), Answer::Cancelled);
-            assert_eq!(r(a, None).answer_for(cancelled, ""), Answer::Cancelled, "the turn ended before the call reported");
-            assert_eq!(r(a, None).answer_for(denied, gate), Answer::Denied);
-            assert_eq!(r(a, None).answer_for(Some(ToolStatus::Running), ""), a, "not known yet: what was sent");
-            assert_eq!(r(a, None).answer_for(Some(ToolStatus::Done), "ok"), a);
-        }
-        assert_eq!(r(Answer::Provided, None).answer_for(cancelled, "Canceled by user"), Answer::Cancelled);
-        assert_eq!(r(Answer::Denied, None).answer_for(denied, gate), Answer::Denied);
-        assert_eq!(r(Answer::Denied, None).answer_for(cancelled, ""), Answer::Denied, "a no stays a no");
-        assert_eq!(applied(Some(ToolStatus::Running), ""), None, "silent: not known");
-        assert_eq!(applied(Some(ToolStatus::Running), "running 6 tests\n"), Some(true), "its output streams: past the gate");
-        assert_eq!(applied(Some(ToolStatus::Failed), "Tool execution failed: Command failed (exit 1):"), Some(true));
-        assert_eq!(applied(denied, gate), Some(false));
-        assert_eq!(applied(None, ""), None);
-        assert_eq!(status_beside(Some("cancelled"), Some(r(Answer::Elsewhere, None).answer_for(cancelled, ""))), None);
+        assert_eq!(applied(None, false), None);
+        assert_eq!(applied(None, true), Some(true));
         assert_eq!(status_beside(Some("failed"), Some(Answer::Allowed)), Some("failed"));
         assert_eq!(status_beside(Some("waiting"), Some(Answer::Allowed)), Some("waiting"), "a secret still to come");
         assert_eq!((took(Duration::from_secs(125)), took(Duration::from_secs(3780))), ("2m 05s".into(), "1h 03m".into()));
