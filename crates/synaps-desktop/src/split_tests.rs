@@ -6663,11 +6663,15 @@ fn the_key_scenarios_hold_at_one_and_at_two_panes(cx: &mut TestAppContext) {
             })
         };
         let before = (count(cx, focused), other.map(|o| count(cx, o)));
+        std::thread::sleep(Duration::from_millis(60));
         key(cx, window, "ctrl-t");
         let now = (count(cx, focused), other.map(|o| count(cx, o)));
         if now != (before.0 + 1, before.1) {
             fails.push(format!("{panes} pane(s): Ctrl+T, the tabs (focused, other): {before:?} → {now:?}"));
         }
+        // A hand's pause: Ctrl+W within `FoldKeys::PAIR` (30 ms) of Ctrl+T's
+        // key-up is its repeat (the tab keys share one gate).
+        std::thread::sleep(Duration::from_millis(60));
         key(cx, window, "ctrl-w");
         let now = (count(cx, focused), other.map(|o| count(cx, o)), view.read_with(cx, |v, _| v.panes.len()));
         if now != (before.0, before.1, panes) {
