@@ -72,6 +72,9 @@ pub(crate) enum AppAct {
     Favourite,
     Halt,
     Detach,
+    /// The composer foot's pickers ([`crate::choice`]).
+    ChangeModel,
+    ChangeThinking,
     /// Split panes (split.md §2: the palette's pane actions).
     SplitRight,
     SplitDown,
@@ -826,7 +829,7 @@ impl AppView {
         let on_session = m.tabs.current().is_some_and(|t| t.kind == crate::tabs::Kind::Session && t.session.is_some());
         let level = crate::motion::Level::current(cx);
         let theme = cx.global::<crate::theme::Scheme>().choice.theme.clone();
-        let apps: [AppRow; 15] = [
+        let apps: [AppRow; 17] = [
             (AppAct::NewSession, "New session", k("Ctrl+T", "⌘T"), "in a new tab".into(), None),
             (AppAct::ToggleRail, "Toggle sessions rail", k("Ctrl+B", "⌘B"), "".into(), None),
             (AppAct::ToggleRight, "Toggle right panel", k("Ctrl+Alt+B", "⌘⌥B"), "".into(), None),
@@ -867,6 +870,8 @@ impl AppView {
                 "the session keeps running".into(),
                 (!on_session).then_some("no session tab on screen"),
             ),
+            (AppAct::ChangeModel, "Change model…", None, "this session only".into(), (!attached).then_some("no session on screen")),
+            (AppAct::ChangeThinking, "Change thinking…", None, "this session only".into(), (!attached).then_some("no session on screen")),
         ];
         let mut apps = Vec::from(apps);
         apps.extend(self.pane_entries(mac));
@@ -1024,6 +1029,8 @@ impl AppView {
             }
             AppAct::Halt => self.halt(),
             AppAct::Detach => self.tab_act(crate::app::TabKey::Close, cx),
+            AppAct::ChangeModel => self.open_choice(crate::choice::Kind::Model, None, window, cx),
+            AppAct::ChangeThinking => self.open_choice(crate::choice::Kind::Thinking, None, window, cx),
             AppAct::SplitRight => self.split_pane(None, window, cx),
             AppAct::SplitDown => self.split_pane(Some(crate::split::Side::Down), window, cx),
             AppAct::FocusPane(n) => self.focus_nth(n, cx),
