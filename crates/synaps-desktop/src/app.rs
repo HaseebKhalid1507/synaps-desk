@@ -1789,6 +1789,39 @@ impl FavsJob {
     }
 }
 
+/// The tabs' (or the layout's) delayed write, shared by the window and its
+/// background job (Shady #59 L1): the job writes holding the lock, and
+/// not at all once the window's last flush has closed it; that flush takes
+/// the lock (waiting out a write under way) and writes the latest, last.
+/// Without it a delayed write already under way at quit could land its
+/// older tabs after the flush's (#55 n6), whatever order the quit and
+/// release callbacks ran in.
+#[derive(Default)]
+pub(crate) struct SaveJob {
+    /// The window's last flush has run: a job not begun writes nothing.
+    closed: bool,
+    /// Tests: the generation the last job read (its write is next).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) taken: u64,
+    /// Tests: the writes this window made (Shady #59 L5: "no write" seen,
+    /// not inferred from the file's contents).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) writes: u32,
+}
+
+impl SaveJob {
+    /// `write` unless the window's last flush came first; whether it wrote.
+    fn write(slot: &std::sync::Mutex<SaveJob>, write: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<bool> {
+        let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if job.closed {
+            return Ok(false);
+        }
+        write()?;
+        job.writes += 1;
+        Ok(true)
+    }
+}
+
 /// Each worker chip's bounds (its worker's id) as last laid out.
 pub(crate) type ChipBounds = Vec<(u64, Bounds<Pixels>)>;
 
@@ -1955,6 +1988,8 @@ pub struct AppView {
     tabs_saved_pane: PaneId,
     tabs_written: u64,
     tabs_save: Option<Task<()>>,
+    /// The delayed tabs/layout write's slot ([`SaveJob`]).
+    pub(crate) save_job: Arc<std::sync::Mutex<SaveJob>>,
     /// The same for the favourites (saved under `tabs_key` too), and the
     /// rail generation their snapshots were last brought up to.
     favs_saved: u64,
@@ -2595,6 +2630,7 @@ impl AppView {
             favs_synced: None,
             tabs_written: 0,
             tabs_save: None,
+            save_job: Arc::default(),
             lists_seen: 0,
             tab_cache: Lru::new(TAB_CACHE, TAB_CACHE_BYTES),
             tab_keys: FoldKeys::default(),
@@ -4095,12 +4131,20 @@ impl AppView {
         self.tabs_save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_DELAY).await;
             let job = this
-                .update(cx, |v, _| (theme::settings_path(), v.tabs_key.clone(), v.saved_tabs().saved(), v.saved_tabs().generation))
+                .update(cx, |v, _| {
+                    let generation = v.saved_tabs().generation;
+                    v.save_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).taken = generation;
+                    (theme::settings_path(), v.tabs_key.clone(), v.saved_tabs().saved(), generation, v.save_job.clone())
+                })
                 .ok();
-            let Some((Some(path), Some(key), saved, generation)) = job else { return };
-            let done = cx.background_spawn(async move { theme::save_tabs(&path, &key, &saved) }).await;
+            let Some((Some(path), Some(key), saved, generation, slot)) = job else { return };
+            let done = cx.background_spawn(async move { SaveJob::write(&slot, || theme::save_tabs(&path, &key, &saved)) }).await;
             let _ = this.update(cx, |v, cx| match done {
-                Ok(()) => v.tabs_written = v.tabs_written.max(generation),
+                Ok(wrote) => {
+                    if wrote {
+                        v.tabs_written = v.tabs_written.max(generation);
+                    }
+                }
                 Err(e) => {
                     // Its own line: a switch or an attach does not wipe it.
                     v.model.named.notice = Some(format!("Tabs not saved: {e}"));
@@ -4244,11 +4288,21 @@ impl AppView {
         self.layout_saved = generation;
         self.tabs_save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_DELAY).await;
-            let job = this.update(cx, |v, _| (theme::settings_path(), v.tabs_key.clone(), v.layout_now(), v.layout_gen())).ok();
-            let Some((Some(path), Some(key), layout, generation)) = job else { return };
-            let done = cx.background_spawn(async move { theme::save_layout(&path, &key, &layout) }).await;
+            let job = this
+                .update(cx, |v, _| {
+                    let generation = v.layout_gen();
+                    v.save_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).taken = generation;
+                    (theme::settings_path(), v.tabs_key.clone(), v.layout_now(), generation, v.save_job.clone())
+                })
+                .ok();
+            let Some((Some(path), Some(key), layout, generation, slot)) = job else { return };
+            let done = cx.background_spawn(async move { SaveJob::write(&slot, || theme::save_layout(&path, &key, &layout)) }).await;
             let _ = this.update(cx, |v, cx| match done {
-                Ok(()) => v.layout_written = generation,
+                Ok(wrote) => {
+                    if wrote {
+                        v.layout_written = generation;
+                    }
+                }
                 Err(e) => {
                     v.model.named.notice = Some(format!("Tabs not saved: {e}"));
                     cx.notify();
@@ -4261,20 +4315,20 @@ impl AppView {
     /// the app quits), whether or not a frame scheduled the save; with
     /// split panes, the layout and its union.
     pub(crate) fn flush_tabs(&mut self) {
+        // The delayed write's slot closed, waiting out a write under way:
+        // none lands after this one ([`SaveJob`]; Shady #59 L1, #55 n6).
+        // Held while this writes.
+        let slot = self.save_job.clone();
+        let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        job.closed = true;
         if self.split_on() {
             self.tabs_save = None;
             let pending = self.restore_tabs.is_some() || self.restore_layout.is_some() || !self.restore_panes.is_empty();
             if self.tabs_key.is_none() || self.bench.is_some() || pending || self.layout_gen() == self.layout_written {
                 return;
             }
-            // A delayed save's background write already under way is not
-            // stopped (dropping its task leaves the job): it may take the
-            // writer after this one and land the older layout last (Shady
-            // #55 n6; `save_tabs` had the same race). Its completion then
-            // sets `layout_written` back to its own generation, so the
-            // second flush at quit (`on_app_quit` after `on_release`) writes
-            // this one again, last. Keep the two flushes.
             if let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref()) {
+                job.writes += 1;
                 match theme::save_layout(&path, key, &self.layout_now()) {
                     Ok(()) => self.layout_written = self.layout_gen(),
                     Err(e) => eprintln!("synaps-desktop: tabs not saved: {e}"),
@@ -4287,6 +4341,7 @@ impl AppView {
             return;
         }
         if let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref()) {
+            job.writes += 1;
             match theme::save_tabs(&path, key, &self.saved_tabs().saved()) {
                 Ok(()) => self.tabs_written = self.saved_tabs().generation,
                 Err(e) => eprintln!("synaps-desktop: tabs not saved: {e}"),
@@ -6954,7 +7009,6 @@ impl AppView {
             Some(key) => self.rail.rail.rows.iter().find(|r| r.key == key).map(|r| r.fav.is_some()),
             None => self.model.sessions.iter().find(|m| m.id == session).map(|m| self.model.fav_of(m).is_some()),
         };
-        let for_ = MenuFor { tab: tab.is_some(), live: !session.is_empty(), fav };
         self.close_menu();
         // The row's readout is not drawn under its menu.
         self.readout = None;
@@ -6966,11 +7020,23 @@ impl AppView {
         }
         window.focus(&self.focus, cx);
         self.gear_menu = false;
-        // Split panes on: the pane items first (split.md §2).
+        let target = SessionTarget { session, tab, row };
+        let items = self.session_menu_items(&target, fav);
+        let menu = crate::menu::Menu::new(items, crate::menu::At::Point(pt), false).born(self.fx.clock());
+        self.smenu = Some((menu, target));
+        cx.notify();
+    }
+
+    /// A session menu's items as things are now. Split panes on: the pane
+    /// items first (split.md §2); a tab's menu has all five, a rail row's
+    /// only Open to the side, whether or not its session has a tab here
+    /// (Shady #59 L2: a row's menu had Split, Move to new pane and Close
+    /// pane, which closed the pane's other tabs). Then today's three.
+    fn session_menu_items(&self, t: &SessionTarget, fav: Option<bool>) -> Vec<crate::menu::Item<SessionAct>> {
         let mut items = Vec::new();
         if self.split_on() {
-            let side = self.side_action(&session, row).is_none().then_some("open it first");
-            let tab = tab.map(|_| PaneItemsOff {
+            let side = self.side_action(&t.session, t.row).is_none().then_some("open it first");
+            let tab = t.tab.filter(|_| t.row.is_none()).map(|_| PaneItemsOff {
                 right: self.split_refusal(None),
                 down: self.split_refusal(Some(crate::split::Side::Down)),
                 new_pane: if self.model.tabs.len() < 2 { Some("its pane's only tab") } else { self.split_refusal(None) },
@@ -6978,10 +7044,28 @@ impl AppView {
             });
             items = pane_items(side, tab);
         }
-        items.extend(session_items(for_));
-        let menu = crate::menu::Menu::new(items, crate::menu::At::Point(pt), false).born(self.fx.clock());
-        self.smenu = Some((menu, SessionTarget { session, tab, row }));
-        cx.notify();
+        items.extend(session_items(MenuFor { tab: t.tab.is_some(), live: !t.session.is_empty(), fav }));
+        items
+    }
+
+    /// The open session menu's refusals as things are now (Shady #59 L4:
+    /// they were the menu's opening's, so a resize left Split greyed with
+    /// room for it, or offered with none): each frame it is open, after the
+    /// centre is measured. A selected item that can no longer act gives
+    /// way to the next that can.
+    fn refresh_session_menu(&mut self) {
+        let Some((m, t)) = self.smenu.as_ref() else { return };
+        let pane = |a: SessionAct| {
+            matches!(a, SessionAct::OpenSide | SessionAct::SplitRight | SessionAct::SplitDown | SessionAct::MoveToNewPane | SessionAct::ClosePane)
+        };
+        let now = self.session_menu_items(t, None);
+        if now.len() != m.items.len() || now.iter().zip(&m.items).any(|(a, b)| a.act != b.act) {
+            return;
+        }
+        let why = now.into_iter().zip(&m.items).map(|(n, it)| if pane(n.act) { n.why_not } else { it.why_not.clone() }).collect();
+        if let Some((m, _)) = self.smenu.as_mut() {
+            m.reasons(why);
+        }
     }
 
     /// An item of the session menu picked, `how`.
@@ -9244,6 +9328,7 @@ impl Render for AppView {
         // Under the bar drawn (M1: the panes reach the window's foot).
         let centre_h = self.height - crate::chrome::top_h(self.top_short);
         self.centre.set((centre, centre_h));
+        self.refresh_session_menu();
         self.centre_at.set((crate::chrome::MARK + rail_w, crate::chrome::top_h(self.top_short)));
         // A close's flight down to one pane is drawn split until it lands;
         // folded, the focused pane is drawn as one (split.md §5).

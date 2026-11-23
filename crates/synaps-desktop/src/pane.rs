@@ -1172,7 +1172,8 @@ impl crate::app::AppView {
     }
 
     /// Why a split of the focused pane (`side` as [`Self::split_pane`]'s)
-    /// can't happen now, if it can't (the palette greys it).
+    /// can't happen now, if it can't (the palette and the pane menu grey
+    /// it), in Ctrl+\'s words on the composer ([`crate::split::Refused`]).
     pub(crate) fn split_refusal(&self, side: Option<crate::split::Side>) -> Option<&'static str> {
         use crate::split::Refused;
         let Some(new) = self.panes.free_id() else { return Some(Refused::Most.note()) };
@@ -1181,11 +1182,9 @@ impl crate::app::AppView {
             None => self.panes.tree.split_right(at, new, area).map(|_| ()),
             Some(s) => self.panes.tree.split(at, s, new, area).map(|_| ()),
         };
-        match r {
-            Ok(()) => None,
-            Err(Refused::Most) => Some(Refused::Most.note()),
-            Err(Refused::Room) => Some("no room at this window size"),
-        }
+        // The composer's own words (design gate #59 M1): the cap named,
+        // or no room for this pane, never the window blamed.
+        r.err().map(Refused::note)
     }
 
     /// Alt+click on a rail row (split.md §2, A6): Open to the side. In the
