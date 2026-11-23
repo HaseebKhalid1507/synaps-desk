@@ -54,9 +54,11 @@ pub(crate) struct AppSettings {
     pub dash_url: Option<String>,
     pub usage_range: Range,
     pub usage_host: Option<String>,
-    /// Split panes (`panes.split`, split panes step 3): off by default,
-    /// so the window is one pane, as before. `SYNAPS_DESK_SPLIT=1` turns
-    /// it on for a run.
+    /// Split panes (`panes.split`): on by default since split panes step
+    /// 6; `"panes.split": false` in the file turns them off, and
+    /// `SYNAPS_DESK_SPLIT=0` (or `=1`) for a run. Off, the window is one
+    /// pane, as before them. (The tests' views start off, `Default`, or
+    /// on with the `split-on-tests` feature: Shady #59 M1.)
     pub split: bool,
 }
 
@@ -68,14 +70,19 @@ impl AppSettings {
             dash_url: get("dash_url"),
             usage_range: get("usage_range").and_then(|r| Range::parse(&r)).unwrap_or_default(),
             usage_host: get("usage_host").filter(|h| h != "all"),
-            split: path.is_some_and(|p| theme::load_flag(p, "panes.split")) || split_env(),
+            split: split_env().unwrap_or_else(|| path.is_none_or(theme::load_split)),
         }
     }
 }
 
-/// `SYNAPS_DESK_SPLIT=1`: split panes on for this run.
-pub fn split_env() -> bool {
-    std::env::var("SYNAPS_DESK_SPLIT").is_ok_and(|v| v == "1")
+/// `SYNAPS_DESK_SPLIT=1` or `=0`: split panes on or off for this run,
+/// whatever the file says; unset (or anything else): the file's.
+pub fn split_env() -> Option<bool> {
+    match std::env::var("SYNAPS_DESK_SPLIT").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    }
 }
 
 /// What the shared edit field is editing.

@@ -2810,7 +2810,9 @@ impl AppView {
             settings: Default::default(),
             usage: crate::usage_view::UsageUi::new(None, Default::default()),
             dash: Default::default(),
-            app_settings: Default::default(),
+            // Split panes off until `AppSettings::load` (main.rs), and in the
+            // tests; on in the tests' split-on lane (`split-on-tests`).
+            app_settings: crate::settings_view::AppSettings { split: cfg!(all(test, feature = "split-on-tests")), ..Default::default() },
             centre: Cell::new((0., 0.)),
             centre_at: Cell::new((0., 0.)),
             wrap_centre: None,
