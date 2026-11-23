@@ -475,7 +475,14 @@ impl Freeze {
 
     /// The narrowest centre's width (one pane: its column's wrap).
     pub(crate) fn width(&self) -> f32 {
-        self.start.0.min(self.narrowest.0)
+        self.narrower().0
+    }
+
+    /// The narrower of its centres, with its own origin (a layout flying
+    /// on its own spring under the panels' flight wraps its trees there:
+    /// Shady #62 r4 R4-1).
+    pub(crate) fn narrower(&self) -> (f32, f32) {
+        if self.narrowest.0 < self.start.0 { self.narrowest } else { self.start }
     }
 }
 

@@ -82,11 +82,13 @@ pub(crate) struct Flight {
     /// until the flight lands (the panels' `PanelFx.freeze` rule: it
     /// rewraps once, at the start as it narrows, at the end as it widens).
     pub wrap: Vec<(PaneId, f32)>,
-    /// The centre's width `wrap` was set at, from the flight's ends
-    /// (Shady #42 L2: set once, not the narrowest drawn so far, which crept
-    /// frame by frame under a panel's flight); `None`: not yet (the wraps
-    /// a flight carries on from are kept where narrower).
-    pub wrap_at: Option<(f32, f32)>,
+    /// The centres `wrap` was set at, the flight's start's and its
+    /// landing's, each with its origin in the window (Shady #42 L2: set
+    /// once, not the narrowest drawn so far, which crept frame by frame
+    /// under a panel's flight; #62 r4 R4-1: the same width at another
+    /// origin is another layout); `None`: not yet (the wraps a flight
+    /// carries on from are kept where narrower).
+    pub wrap_at: Option<(Rect, Rect)>,
     /// A panel yielding on this flight (#51): the layout rides its spring.
     pub ride: Option<Ride>,
 }
@@ -100,6 +102,11 @@ pub(crate) struct Ride {
     /// The centre's width where they start, and where they land.
     pub from: f32,
     pub to: f32,
+    /// The centre's left edge in the window where they start: the
+    /// starting tree's boxes there are its columns' (Shady #62 r4 R4-1:
+    /// read at the landing's edge, a pane 378 wide was 377.8, and its
+    /// column went 346 → 345 → 427).
+    pub from_x: f32,
 }
 
 impl Flight {
@@ -158,12 +165,14 @@ impl Flight {
     }
 
     /// [`Flight::set_wraps`] from its ends each in its own centre: `from`
-    /// where the flight starts, `to` where it lands. A panel yielding on
-    /// this flight (#51) moves on its spring from its start, so the centre
-    /// and the ratios move together: a pane's width, the product of a
-    /// share and the centre moving the other way, is still least at an end.
+    /// where the flight starts, `to` where it lands, each at its own
+    /// origin in the window (`x`, `y`: the panes are rounded on the
+    /// window's pixels, [`Node::rects_in`]). A panel yielding on this
+    /// flight (#51) moves on its spring from its start, so the centre and
+    /// the ratios move together: a pane's width, the product of a share
+    /// and the centre moving the other way, is still least at an end.
     pub(crate) fn set_wraps_at(&mut self, from: Rect, to: Rect) {
-        if self.wrap_at == Some((from.w, to.w)) {
+        if self.wrap_at == Some((from, to)) {
             return;
         }
         let carried = self.wrap_at.is_none();
@@ -181,7 +190,7 @@ impl Flight {
                 None => self.wrap.push((id, w)),
             }
         }
-        self.wrap_at = Some((from.w, to.w));
+        self.wrap_at = Some((from, to));
     }
 }
 
@@ -1441,7 +1450,7 @@ mod tests {
                 let from = 930.;
                 let drawn = Node::Split { axis: Axis::Row, kids: kids.clone(), ratios: shares(d / (from - DIVIDER)) };
                 let flight = Flight::new(drawn, to.clone(), Vec::new(), vec![p(1)]);
-                let ride = Ride { from, to: from - back };
+                let ride = Ride { from, to: from - back, from_x: 0. };
                 let mut last: Option<f32> = None;
                 for n in 0..=57 {
                     let w = from + 7. * n as f32;

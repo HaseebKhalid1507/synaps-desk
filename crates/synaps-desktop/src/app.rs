@@ -9687,9 +9687,11 @@ impl Render for AppView {
             // Riding on (`Carry::Ride`): from the width its `from` was drawn
             // at, the last frame's, so this frame carries on as that ride
             // would have.
+            // Each with its left edge (Shady #62 r4 R4-1): the last
+            // frame's, riding on; this frame's, from rest.
             let rode = matches!(self.panes.carry, Some(crate::pane::Carry::Ride(..)));
-            let from = if rode { self.centre.get().0 } else { pane };
-            f.ride = Some(crate::split::Ride { from, to: pane_to });
+            let (from, from_x) = if rode { (self.centre.get().0, self.centre_at.get().0) } else { (pane, at_now) };
+            f.ride = Some(crate::split::Ride { from, to: pane_to, from_x });
         }
         // Its ends moved under it (a fold or unfold, an edge drag, a width
         // reset, a resize), or a view came on screen in the pane a close
@@ -9783,19 +9785,28 @@ impl Render for AppView {
             let wraps = self.panel_fx.freeze.map_or([(pane, origin_to.0); 2], |f| [f.start, f.narrowest]);
             let (rects_to, rects_wrap) = (at(pane_to), wraps.map(|(w, x)| self.panes.tree.rects_in(area(w), (x, origin.1))));
             // A panel yielding on the layout's flight (#51): its own ends.
-            let ride_from = self.panes.flight.as_ref().and_then(|f| f.ride).map(|r| r.from);
+            let ride = self.panes.flight.as_ref().and_then(|f| f.ride);
+            let ride_from = ride.map(|r| r.from);
             let (grow, ghosts) = self.panes.flight.as_ref().map_or((Vec::new(), Vec::new()), |f| (f.grow.clone(), f.ghosts.clone()));
             // The tree itself drawn (the pixel landing, before the spring
             // rests): each column at its landed wrap in this frame, the
             // last that moves, never after it (finish gate #42 F1).
             let landed = drawn == self.panes.tree;
             let mut mains = Vec::new();
-            // Each pane's wrap in the flight, from its ends at the panels'
-            // narrowest centre (Shady #42 L2).
+            // Each pane's wrap in the flight, from its ends (Shady #42 L2),
+            // each tree in a centre at that centre's own origin (Shady #62
+            // r4 R4-1: at the landing's, a ride's starting pane of 378 was
+            // 377.8, and its column went 346 → 345 → 427). Riding: the
+            // start where the ride starts, the end where it lands. On its
+            // own spring: both at the panels' narrowest centre, at rest
+            // this frame's.
             if let Some(f) = self.panes.flight.as_mut() {
-                match ride_from {
-                    Some(from) => f.set_wraps_at(placed(from, origin_to), placed(pane_to, origin_to)),
-                    None => f.set_wraps(placed(wrap, origin_to)),
+                match ride {
+                    Some(r) => f.set_wraps_at(placed(r.from, (r.from_x, origin.1)), placed(pane_to, origin_to)),
+                    None => {
+                        let (w, x) = self.panel_fx.freeze.map_or((pane, origin_to.0), |z| z.narrower());
+                        f.set_wraps(placed(w, (x, origin.1)));
+                    }
                 }
             }
             // Where each closing share goes (its rectangle at 0).

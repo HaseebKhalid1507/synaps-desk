@@ -830,3 +830,150 @@ fn the_drop_targets_are_the_panes_as_drawn_at_a_fractional_origin(cx: &mut TestA
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
+
+// ── #62 round 5 (Shady #62 r4: R4-1) ────────────────────────────────────
+
+/// A row of [`every_flight_rewraps_each_pane_at_most_once`]: what starts
+/// its flight.
+#[derive(Clone, Copy, Debug)]
+enum Step {
+    /// Ctrl-\ on the focused pane.
+    Split,
+    Equalise,
+    /// The rightmost pane closes.
+    CloseLast,
+    /// The rail folds or unfolds.
+    Rail,
+    /// A split, taken over six frames in by an equalise: two flights.
+    SplitThenEqualise,
+}
+
+fn equalise(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>) {
+    cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(crate::palette::AppAct::Equalise, w, cx))).expect("the window");
+}
+
+fn take_step(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>, step: Step) {
+    match step {
+        Step::Split => key(cx, window, "ctrl-\\"),
+        Step::Equalise => equalise(cx, window, view),
+        Step::CloseLast => view.update(cx, |v, cx| {
+            let last = *v.reading_order().last().expect("a pane");
+            v.in_pane(last, |v| v.close_pane());
+            cx.notify();
+        }),
+        Step::Rail => view.update(cx, |v, cx| v.toggle_panel(true, cx)),
+        Step::SplitThenEqualise => {
+            key(cx, window, "ctrl-\\");
+            for _ in 0..6 {
+                frame_144(cx, window, view);
+            }
+            equalise(cx, window, view);
+        }
+    }
+}
+
+/// Shady #62 r4 R4-1: every flight, the panels', the layout's or both at
+/// once, rewraps each pane's column at most once. Each flight lays its
+/// starting tree out in its own starting centre, at that centre's left
+/// edge: the panes are rounded on the window's pixels, so the same width
+/// at another edge is another layout. A layout riding a yielding panel's
+/// return read its start at the landing's edge: at 1200 px, 125 %, rail
+/// 247 and right 240, three equal panes (both panels yielded to strips),
+/// the rightmost closing brings the rail back, and pane 0, 378 wide, was
+/// read 377.8: its column went 346 → 345 → 427. A table, at 100, 125 and
+/// 150 %: in a window 2400 px wide, a split to two and to three, an
+/// equalise, a close to two, and a split to three taken over by an
+/// equalise (two flights: two rewraps at most), which leaves three equal
+/// panes; then at 1200 and at 1500 px (a resize: a cut), a close to two
+/// (at 1200 px, 125 %: the rail's return), the rail's fold and unfold, a
+/// split (down, where a column has no room) and a close. Every draw
+/// (#61's hook) from the frame before each flight to its rest, each pane
+/// drawn in both.
+#[gpui_kit::test]
+fn every_flight_rewraps_each_pane_at_most_once(cx: &mut TestAppContext) {
+    use Step::*;
+    let wide = [
+        (Split, "split to 2", 1),
+        (Split, "split to 3", 1),
+        (Equalise, "equalise", 1),
+        (CloseLast, "close to 2", 1),
+        (SplitThenEqualise, "split to 3 taken over by an equalise", 2),
+    ];
+    let steps = [
+        (CloseLast, "close to 2", 1),
+        (Rail, "fold", 1),
+        (Rail, "unfold", 1),
+        (Split, "split to 3", 1),
+        (CloseLast, "close to 2 again", 1),
+    ];
+    let mut fails = Vec::new();
+    for (n, (w, s)) in [(1200., 1.25), (1200., 1.), (1200., 1.5), (1500., 1.), (1500., 1.25), (1500., 1.5)].into_iter().enumerate() {
+        let (window, view, client, _a, _attaches, _events) = on_a_at(cx, &format!("wraps-{n}"), (2400., 1080.));
+        VisualTestContext::from_window(window, cx).simulate_scale_factor_change(s);
+        view.update(cx, |v, cx| {
+            let mut p = v.panels;
+            (p.rail_width, p.right_width) = (Some(247), Some(240));
+            v.panels = p;
+            cx.notify();
+        });
+        frame(cx, window);
+        level(cx, crate::motion::Level::Full);
+        let seen = draws(cx, &view, |v: &AppView| {
+            let cols: Vec<(crate::pane::PaneId, f32)> =
+                v.reading_order().iter().filter_map(|id| v.panes.get(*id).map(|p| (*id, p.layout.column))).collect();
+            (v.panes.flight.is_some() || v.panel_fx.moving(), cols)
+        });
+        for (k, (step, name, flights)) in wide.into_iter().chain(steps).enumerate() {
+            if k == wide.len() {
+                assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 3, "{w} px, {s}: three panes");
+                VisualTestContext::from_window(window, cx).simulate_resize(size(px(w), px(1080.)));
+                for _ in 0..10 {
+                    frame(cx, window);
+                }
+            }
+            let row = format!("{} px, {}%, {name}", if k < wide.len() { 2400. } else { w }, s * 100.);
+            // The frame before the flight, drawn.
+            frame_144(cx, window, &view);
+            let at = seen.borrow().len() - 1;
+            let rail_was = view.read_with(cx, |v, _| v.pane_yield.is_some_and(|y| y.0));
+            take_step(cx, window, &view, step);
+            let mut rest = 0;
+            for _ in 0..400 {
+                frame_144(cx, window, &view);
+                let moving = view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving());
+                rest = if moving { 0 } else { rest + 1 };
+                if rest >= 5 {
+                    break;
+                }
+            }
+            let rail_now = view.read_with(cx, |v, _| v.pane_yield.is_some_and(|y| y.0));
+            let got: Vec<(bool, Vec<(crate::pane::PaneId, f32)>)> = seen.borrow()[at..].to_vec();
+            eprintln!("WRAPS {row}: flew {}, the rail yielded {rail_was} -> {rail_now}", got.iter().any(|d| d.0));
+            if !got.iter().any(|d| d.0) {
+                fails.push(format!("{row}: nothing flew"));
+            }
+            if n == 0 && k == wide.len() && !(rail_was && !rail_now) {
+                fails.push(format!("{row}: the rail comes back from its strip (yielded {rail_was} -> {rail_now})"));
+            }
+            let (first, last) = (&got[0].1, &got[got.len() - 1].1);
+            for (id, _) in first.iter().filter(|(id, _)| last.iter().any(|(l, _)| l == id)) {
+                let path: Vec<f32> = got.iter().filter_map(|(_, cols)| cols.iter().find(|(i, _)| i == id).map(|c| c.1)).collect();
+                let mut columns = path.clone();
+                columns.dedup();
+                eprintln!("WRAPS {row}, pane {id:?}: {columns:?} over {} draws", path.len());
+                if columns.len() > flights + 1 {
+                    fails.push(format!(
+                        "{row}: pane {id:?}'s column rewrapped {} times in {flights} flight(s): {columns:?}",
+                        columns.len() - 1
+                    ));
+                }
+            }
+        }
+        view.update(cx, |v, _| {
+            v.on_draw = None;
+            v.client = None;
+        });
+        let _ = client.shutdown();
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
