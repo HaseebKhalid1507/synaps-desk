@@ -5640,10 +5640,13 @@ fn the_divider_moves_one_way_through_a_two_panel_settle(cx: &mut TestAppContext)
 /// into its flight Ctrl+W on the new pane: at 2560 (nothing yields: the
 /// split on its own spring) and at 1920 (the right panel yields to it and
 /// the split rides it; the close turns it back). The divider was moving
-/// left at speed; the frame after the close it still moves left at least
-/// half as fast (from rest it turned at once: the close started a spring
-/// of its own at 0), then turns once and goes right to the end, one pane
-/// left. Off: the close lands in its frame, as before.
+/// left at speed; Ctrl+W comes between two frames, as a hand's does, and
+/// the close's own frame still moves it left at least half as fast (from
+/// rest it turned at once: the close started a spring of its own at 0;
+/// and the 2560 film's close drew the layout as the frame before, 0 px, a
+/// 14 ms hold: the carried spring started at the close's frame, not at
+/// the frame that drew where it starts), then turns once and goes right
+/// to the end, one pane left. Off: the close lands in its frame, as before.
 #[gpui_kit::test]
 fn a_close_mid_split_turns_with_the_splits_velocity(cx: &mut TestAppContext) {
     let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "panes-carry", (2560., 1080.));
@@ -5670,7 +5673,12 @@ fn a_close_mid_split_turns_with_the_splits_velocity(cx: &mut TestAppContext) {
         assert!(flying, "{what}: the split still in the air");
         assert_eq!(yielded, yields, "{what}: the right panel's yield");
         let k = xs.len();
+        // Ctrl+W between two frames, as a hand's comes: its frame is the
+        // next one (a frame on), and is recorded.
+        let at = view.read_with(cx, |v, _| v.fx.clock());
+        view.read_with(cx, |v, _| v.fx.set_clock(at + Duration::from_micros(6944)));
         key(cx, window, "ctrl-w");
+        xs.extend(drawn(cx, window, "pane-divider Row".into()).map(|b| b[0]));
         let mut frames = 0;
         while view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving()) {
             frame_144(cx, window, &view);
@@ -5686,7 +5694,7 @@ fn a_close_mid_split_turns_with_the_splits_velocity(cx: &mut TestAppContext) {
         let (before, after) = (steps[k - 2], steps[k - 1]);
         assert!(before < -4., "{what}: the split's divider moving left at speed: {before} px a frame");
         if !(after < 0. && after <= before * 0.5) {
-            fails.push(format!("{what}: the frame after the close moved {after} px after {before} (at least half as fast, still left)"));
+            fails.push(format!("{what}: the close's own frame moved {after} px after {before} (at least half as fast, still left)"));
         }
         // One turn: left while it carries on, then right to the end.
         match steps[k - 1..].iter().position(|&s| s > 0.) {

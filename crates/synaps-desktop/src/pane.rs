@@ -596,6 +596,10 @@ pub(crate) struct Panes {
     /// The layout as last drawn (a flight's step, else the tree): where
     /// the next flight starts (Shady #42 M1).
     pub(crate) drawn: crate::split::Node,
+    /// The frame a flight was last drawn in (its instant), while one flies:
+    /// a flight that takes it over starts from `drawn` as of then, so the
+    /// frame that makes it moves on, not draws `drawn` again.
+    pub(crate) drawn_at: Option<std::time::Instant>,
     /// The last generation handed out ([`Panes::next_gen`]).
     gens: u64,
 }
@@ -610,6 +614,7 @@ impl Panes {
             closing: Vec::new(),
             focused: id,
             drawn: tree.clone(),
+            drawn_at: None,
             tree,
             flight: None,
             carry: None,

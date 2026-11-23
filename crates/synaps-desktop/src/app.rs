@@ -8739,8 +8739,9 @@ impl AppView {
     /// ([`crate::motion::Motion::spring_jump`] starts nothing).
     pub(crate) fn pane_flight_frame(&mut self, area: crate::split::Rect) -> crate::split::Node {
         let drawn = self.pane_flight_step(area);
-        // Where the next flight starts (Shady #42 M1).
+        // Where the next flight starts (Shady #42 M1), and when.
         self.panes.drawn = drawn.clone();
+        self.panes.drawn_at = self.panes.flight.is_some().then(|| self.fx.now());
         drawn
     }
 
@@ -8766,7 +8767,13 @@ impl AppView {
                 }
                 _ => 0.,
             };
-            self.fx.spring_jump_moving(PANE_FLIGHT, from, f.travel, v, crate::motion::SHEET_RESPONSE);
+            // Carried, it starts from `drawn` as of the frame that drew it
+            // (a frame of the old flight's time is not held: the 2560 film
+            // drew the layout twice, 14 ms, at the turn).
+            let now = self.fx.now();
+            let since =
+                if v != 0. { self.panes.drawn_at.filter(|t| now.saturating_duration_since(*t) < Duration::from_millis(100)) } else { None };
+            self.fx.spring_jump_moving(PANE_FLIGHT, from, f.travel, v, crate::motion::SHEET_RESPONSE, since.unwrap_or(now));
         }
         // A panel yielding on it (#51): the layout rides the panel's
         // spring, by how far the centre has gone, and lands with it, in the
