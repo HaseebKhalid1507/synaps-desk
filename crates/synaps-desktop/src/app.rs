@@ -2112,6 +2112,8 @@ pub struct AppView {
     pub(crate) smenu: Option<(crate::menu::Menu<SessionAct>, SessionTarget)>,
     /// The workers menu (`+N more`'s): its items' acts are worker ids.
     pub(crate) wmenu: Option<crate::menu::Menu<u64>>,
+    /// The composer foot's model and thinking pickers ([`crate::choice`]).
+    pub(crate) choice: crate::choice::Choices,
     /// A rename asked for a session not on screen yet (and when): its
     /// naming row opens once it is attached, if that is soon and nothing
     /// else was shown meanwhile ([`RENAME_WAIT`]); else it is forgotten.
@@ -2696,6 +2698,7 @@ impl AppView {
             palette_box: Cell::new((0., 0., 0., 0.)),
             smenu: None,
             wmenu: None,
+            choice: Default::default(),
             rename_pending: None,
             menu_picked: false,
             swallow_clicks: None,
@@ -2779,7 +2782,7 @@ impl AppView {
                 // leaves them (Shady #36 L2, #31 M4.1); a reconnect renumbers
                 // every store's workers.
                 let mine = self.panes.cur.id == self.panes.focused || matches!(ev, Event::Reattaching { .. });
-                if mine && (self.menu.is_some() || self.wmenu.is_some()) {
+                if mine && (self.menu.is_some() || self.wmenu.is_some() || self.choice.menu.is_some()) {
                     self.close_menu();
                     self.model.view_dirty = true;
                 } else if self.model.lives[self.panes.cur.live].cancels.disarm() {
@@ -2888,6 +2891,8 @@ impl AppView {
                     self.panes.cur.cmd_clear = Some(text);
                 }
             }
+            Effect::Setting { attach_seq, setting, reply } => self.choice_answered(attach_seq, &setting, reply),
+            Effect::Options { attach_seq, reply } => self.choice_options(attach_seq, reply),
         }
     }
 
@@ -3101,6 +3106,7 @@ impl AppView {
         if self.wmenu_leaving.as_ref().is_some_and(|(_, at)| self.fx.leave(*at).is_none()) {
             self.wmenu_leaving = None;
         }
+        self.choice.exits(now, &self.fx);
         if self.gear_menu != self.gear_was {
             self.gear_was = self.gear_menu;
             if self.gear_menu {
@@ -5521,7 +5527,8 @@ impl AppView {
     /// and the other fields keep Enter and Esc.
     fn card_keys_live(&self, window: &Window, cx: &App) -> Option<bool> {
         let shown = self.card_on_screen();
-        let menu = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some() || self.palette.is_some();
+        let menu =
+            self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some() || self.choice.menu.is_some() || self.palette.is_some();
         if !self.card_up() || !shown || self.picker_open || self.gear_menu || menu || !window.is_window_active() {
             None
         } else if self.panes.cur.secret_input.read(cx).focus_handle(cx).is_focused(window) {
@@ -5547,6 +5554,8 @@ impl AppView {
             m.key("tab", back, true);
         } else if let Some(m) = self.wmenu.as_mut() {
             m.key("tab", back, true);
+        } else {
+            self.choice_tab(back);
         }
         cx.notify();
     }
@@ -7550,6 +7559,7 @@ impl AppView {
         };
         let (word_color, mark) = glyph::ink(family, Ground::User, p);
         let turn_runs = watched.is_none() && g == Some(glyph::Glyph::Run);
+        let pick_labels = watched.is_none();
         // Model · effort, or the worker's facts.
         let (model, effort): (Option<SharedString>, Option<SharedString>) = match watched {
             Some((_, f)) => ((!f.is_empty()).then_some(f), None),
@@ -7773,16 +7783,28 @@ impl AppView {
                     .child(display(w, m.meta, word_color))
                     .when_some(tally, |d, n| d.child(mono(count(n), m.meta, word_color)))
             });
+            // The session's model and thinking open their pickers
+            // ([`crate::choice`]); a worker's facts do not.
+            let (pick, pane, at) = (pick_labels, self.panes.cur.id, &self.choice.at);
             let meta = model.filter(|_| fit.model).map(|t| {
+                use crate::choice::{Kind, label};
                 h_flex()
                     .flex_shrink(1.)
                     .min_w_0()
                     .ml(px(16.))
                     .gap(px(8.))
                     .overflow_hidden()
-                    .child(mono(t, m.meta, p.dim_u).min_w_0().overflow_hidden().text_ellipsis())
+                    .child(label(mono(t, m.meta, p.dim_u).min_w_0().overflow_hidden().text_ellipsis(), Kind::Model, pick, pane, at, p, cx))
                     .when_some(effort.filter(|_| fit.effort), |d, e| {
-                        d.child(mono("·", m.meta, p.dim_u).flex_none()).child(mono(e, m.meta, p.dim_u).flex_none())
+                        d.child(mono("·", m.meta, p.dim_u).flex_none()).child(label(
+                            mono(e, m.meta, p.dim_u).flex_none(),
+                            Kind::Thinking,
+                            pick,
+                            pane,
+                            at,
+                            p,
+                            cx,
+                        ))
                     })
             });
             // Cut short, its tooltip has it whole.
@@ -8532,6 +8554,7 @@ impl AppView {
         if self.menu.is_none()
             && self.smenu.is_none()
             && self.wmenu.is_none()
+            && self.choice.menu.is_none()
             && let Some(h) = self.menu_focus_back.take()
             && self.focus.is_focused(window)
             // Never into another pane's input (Shady #36 r2 L-d): a click
@@ -9426,7 +9449,7 @@ impl Render for AppView {
             .when_some(
                 root_context(
                     card_tab,
-                    self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some(),
+                    self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some() || self.choice.menu.is_some(),
                     self.split_on(),
                     self.panes.split(),
                 ),
@@ -9529,6 +9552,10 @@ impl Render for AppView {
                     return;
                 }
                 if this.wmenu.is_some() && this.workers_menu_keydown(&ev.keystroke, this.panes.cur.chord_press, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.choice.menu.is_some() && this.choice_keydown(&ev.keystroke, this.panes.cur.chord_press, window, cx) {
                     cx.stop_propagation();
                     return;
                 }
@@ -9740,6 +9767,7 @@ impl Render for AppView {
             .children(self.render_menu_at_point(&p, cx))
             .children(self.render_session_menu(&p, cx))
             .children(self.render_workers_menu(&p, cx))
+            .children(self.render_choice_menu(&p, cx))
             .children(self.render_palette(
                 crate::chrome::MARK + rail_w + self.panes.cur.rect.get().x,
                 if self.panes.split() {

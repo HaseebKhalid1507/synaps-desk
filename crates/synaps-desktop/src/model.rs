@@ -172,6 +172,17 @@ pub enum Effect {
         name: String,
         reply: synaps_client::CommandReply,
     },
+    /// A model or thinking pick answered ([`crate::choice`]).
+    Setting {
+        attach_seq: u64,
+        setting: String,
+        reply: Result<Option<String>, String>,
+    },
+    /// The daemon's model and thinking choices for an attachment.
+    Options {
+        attach_seq: u64,
+        reply: Result<synaps_client::ModelOptions, String>,
+    },
 }
 
 /// A resume in flight (`Client::resume`).
@@ -1514,6 +1525,18 @@ impl Model {
                     effects.push(Effect::Command { name, reply });
                     self.view_dirty = true;
                 }
+                return effects;
+            }
+            // A pick answered, the choices listed: the picker's
+            // ([`crate::choice`]); the label follows `setting_changed`.
+            Event::SettingReply { attach_seq, setting, reply } => {
+                log::debug!(target: "synaps_desktop::send", "set {setting}: {reply:?}");
+                effects.push(Effect::Setting { attach_seq, setting, reply });
+                self.view_dirty = true;
+                return effects;
+            }
+            Event::ModelOptions { attach_seq, reply } => {
+                effects.push(Effect::Options { attach_seq, reply });
                 return effects;
             }
             ev => ev,

@@ -2991,8 +2991,9 @@ mod tests {
 
     /// Day lines (`crate::times::Days`): one where the local date changes
     /// between dated rows; none before the first dated row (it sets the
-    /// day), none for a legacy row. A session resumed the next day and a
-    /// compaction summary dated later get theirs. The line takes the gap of
+    /// day), none for a legacy row. A session resumed the next day and the
+    /// first row after a compaction dated later get theirs (its summary and
+    /// acknowledgement are no rows: #14). The line takes the gap of
     /// the row under it, which sits a part below; a rebuild from any turn
     /// agrees with a full build. In zones west and east of UTC: a local day
     /// spans two UTC dates (no line), and a local midnight can fall inside
@@ -3025,18 +3026,19 @@ mod tests {
             let t = transcript(&m);
             assert!(t.items()[..2].iter().all(|i| i.at.is_none()), "legacy rows have no time");
             let rows = build_in(&tz, t.items(), 0, false, &HashSet::new(), &Subagents::default());
-            // The summary is drawn as YOU and AGENT rows today (the client
-            // finds a summary only at the start of a message: issue #14).
-            assert_eq!(
-                kinds(&rows),
-                ["user", "prose", "user", "prose", "day", "user", "prose", "day", "user", "prose", "user", "prose"],
-                "{tz}"
-            );
+            // The summary and its acknowledgement are no rows (#14, the
+            // daemon's rule: `synaps_client::transcript::is_compaction_summary`).
+            assert_eq!(kinds(&rows), ["user", "prose", "user", "prose", "day", "user", "prose", "day", "user", "prose"], "{tz}");
+            assert_eq!(t.items()[6].text, "after the compaction", "{tz}");
             let (day, under) = (rows[4], rows[5]);
             assert_eq!((day.item, day.id, day.who), (under.item, under.id | DAY_ID, Who::None));
             assert_eq!((day.gap, under.gap), (Gap::Turn, Gap::Part), "the line takes the turn's gap");
             assert_eq!(day.rev, day_number(chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap()), "{tz}");
-            assert_eq!((rows[7].item, rows[7].gap, rows[8].gap), (rows[8].item, Gap::Turn, Gap::Part), "over the summary, its turn's gap");
+            assert_eq!(
+                (rows[7].item, rows[7].gap, rows[8].gap),
+                (rows[8].item, Gap::Turn, Gap::Part),
+                "after the compaction, its turn's gap"
+            );
             for k in 0..t.len() {
                 let from = rows.partition_point(|d| d.item < turn_start(t.items(), k));
                 let part = build_in(&tz, t.items(), turn_start(t.items(), k), false, &HashSet::new(), &Subagents::default());
