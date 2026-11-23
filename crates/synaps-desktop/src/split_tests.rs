@@ -5953,3 +5953,66 @@ fn reduced_and_off_land_splits_closes_and_equalise_in_one_frame_with_nothing_arm
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
+
+/// The divider's wobble on the 2-panel settle (not fixed: PR #59): two
+/// panes at 1920, the rail wide and the right panel yielded to them. The
+/// rail folds and the right panel comes back (both fly; no layout flight,
+/// no ride: the panes are the tree in the centre each frame), then the
+/// rail unfolds and the right panel yields again. Frame by frame at 144 Hz
+/// the divider's x on screen should move one way only. It goes back half a
+/// pixel four times in the unfold's tail (frames 59-66 at `cf28780`): the
+/// two panels step their half-pixels on alternate frames, so the centre's
+/// width (1920 - MARK - both) alternates 1407.5 / 1408, and pane 0 (the
+/// tree's 0.5 of it) 703 / 704. The fix: the yielding panel drawn off the
+/// causing panel's progress, so their edges step together (`PanelFx`).
+#[gpui_kit::test]
+#[ignore = "the 2-panel settle's wobble, not fixed yet: see the doc comment"]
+fn the_divider_moves_one_way_through_a_two_panel_settle(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_in(cx, "settle", attached(A, None), (1920., 1080.));
+    view.update(cx, |v, cx| {
+        let mut p = v.panels;
+        (p.rail_width, p.right_width) = (Some(crate::theme::RAIL_WIDTHS.1), Some(crate::theme::RIGHT_WIDTHS.1));
+        v.panels = p;
+        cx.notify();
+    });
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    for _ in 0..10 {
+        frame(cx, window);
+    }
+    assert_eq!(
+        view.read_with(cx, |v, _| (v.panes.len(), v.pane_yield.map(|y| y.1))),
+        (2, Some(true)),
+        "two panes, the right panel yielded"
+    );
+    level(cx, crate::motion::Level::Full);
+    let mut fails = Vec::new();
+    for (what, yields) in [("fold", false), ("unfold", true)] {
+        view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        let (mut xs, mut rest, mut both) = (Vec::new(), 0, false);
+        for _ in 0..400 {
+            frame_144(cx, window, &view);
+            xs.extend(drawn(cx, window, "pane-divider Row".into()).map(|b| b[0]));
+            let (moving, sides) = view.read_with(cx, |v, _| {
+                (v.panes.flight.is_some() || v.panel_fx.moving(), v.panel_fx.sides.iter().filter(|f| f.moving).count())
+            });
+            both |= sides == 2;
+            rest = if moving { 0 } else { rest + 1 };
+            if rest >= 5 {
+                break;
+            }
+        }
+        assert!(both, "{what}: both panels flew");
+        assert_eq!(view.read_with(cx, |v, _| v.pane_yield.map(|y| y.1)), Some(yields), "{what}: the right panel's yield");
+        let dir = (xs[xs.len() - 1] - xs[0]).signum();
+        eprintln!("SETTLE {what}: {} frames, {:?}", xs.len(), xs);
+        for (i, w) in xs.windows(2).enumerate() {
+            if (w[1] - w[0]) * dir < -0.01 {
+                fails.push(format!("{what}, frame {}: the divider went back, {} -> {}", i + 1, w[0], w[1]));
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
