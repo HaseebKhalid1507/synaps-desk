@@ -6,6 +6,8 @@
 //! The helpers are `ui_tests`' own, from [`super`] (`test_kit`); the few
 //! here are this file's.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Modifiers, MouseMoveEvent, Point, TestAppContext, VisualTestContext, px};
@@ -88,10 +90,13 @@ fn frame_every(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVie
 }
 
 /// One 144 Hz frame of the clock, its timers firing, and a frame drawn
-/// only if the window asked for one: whether it drew. Nothing forces a
-/// draw, so what it counts is demand.
-fn idle_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> bool {
+/// only if the window asked for one: the app's frames drawn in it (its
+/// renders, `fx.frames()`), and the animation frames it had queued.
+/// Nothing forces a draw, so what it counts is demand. A timer's
+/// `cx.notify` draws a frame with none queued: it counts (Shady #73 R2-M1).
+fn idle_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> (u64, usize) {
     let dt = Duration::from_micros(6944);
+    let f0 = view.read_with(cx, |v, _| v.fx.frames());
     let (t0, at) = (cx.executor().now(), view.read_with(cx, |v, _| v.fx.clock()));
     let _end = cx.executor().timer(dt);
     loop {
@@ -105,7 +110,51 @@ fn idle_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView
     }
     let ran = cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
     cx.run_until_parked();
-    ran > 0
+    (view.read_with(cx, |v, _| v.fx.frames()) - f0, ran)
+}
+
+/// The window at rest: the focus off the composer (its caret blinks a
+/// frame every 500 ms), a second idle, then a second more with no frame
+/// drawn and none queued.
+fn at_rest(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| window.focus(&v.focus, cx))).expect("the window");
+    cx.run_until_parked();
+    for _ in 0..144 {
+        idle_frame(cx, w, view);
+    }
+    for i in 0..144 {
+        assert_eq!(idle_frame(cx, w, view), (0, 0), "at rest, frame {i}: drawn, queued");
+    }
+}
+
+/// Each frame the app draws from now on, at its paint ([`AppView::on_draw`]):
+/// whether its pane holds a fold's room, and whether it asked for the next
+/// frame.
+fn paints(cx: &mut TestAppContext, view: &Entity<AppView>) -> Rc<RefCell<Vec<(bool, bool)>>> {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let l = log.clone();
+    view.update(cx, |v, _| {
+        v.on_draw = Some(Rc::new(move |v: &AppView| l.borrow_mut().push((v.fold_slack.get().is_some(), v.fx.pending().0))))
+    });
+    log
+}
+
+/// Shady #73 R2-M1: [`idle_frame`] counts the frames drawn, not only the
+/// animation frames queued: a timer's `cx.notify` on a window at rest draws
+/// one with none queued, and it is seen.
+#[gpui_kit::test]
+fn an_idle_frame_sees_a_timer_s_draw(cx: &mut TestAppContext) {
+    let (w, view, _events) = idle_cpu(cx, 900.);
+    at_rest(cx, w, &view);
+    view.update(cx, |_, cx| {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(3)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    });
+    let (drawn, ran) = idle_frame(cx, w, &view);
+    assert!(drawn >= 1 && ran == 0, "a timer's draw: {drawn} drawn, {ran} queued");
 }
 
 /// L5: a frame is late past half again the display's pace, not past a
@@ -391,9 +440,12 @@ fn a_held_fold_room_goes_when_the_pointer_leaves_its_header(cx: &mut TestAppCont
 
 /// Shady #73 M1: a held room asks for nothing once it is gone (nothing
 /// after a landing, #58). Released on its timer with the pointer away, its
-/// sheet lands and the window draws no frame after that; used up by rows
-/// growing in before its deadline, no release timer wakes it later. Only
-/// the clock and its timers move: no frame is forced.
+/// sheet lands, the frame that draws it gone asks for no other, and the
+/// window draws no frame after that; used up by rows growing in before its
+/// deadline, no release timer wakes it later. Only the clock and its
+/// timers move: no frame is forced, and every frame drawn counts (R2-M1:
+/// a timer's draw too, not only an animation frame queued). Once a frame
+/// draws the room gone, none draws it back.
 #[gpui_kit::test]
 fn a_held_room_asks_for_nothing_once_it_is_gone(cx: &mut TestAppContext) {
     let mut seen = Vec::new();
@@ -408,6 +460,7 @@ fn a_held_room_asks_for_nothing_once_it_is_gone(cx: &mut TestAppContext) {
             modifiers: Modifiers::default(),
         });
         vcx.run_until_parked();
+        at_rest(cx, w, &view);
         flip(cx, &view, last);
         for _ in 0..240 {
             fluid_frame(cx, w, &view);
@@ -443,6 +496,7 @@ fn a_held_room_asks_for_nothing_once_it_is_gone(cx: &mut TestAppContext) {
         }
         // Idle until the room is gone, then for two seconds more: the draws
         // after it are what its release left behind.
+        let drawn = paints(cx, &view);
         let mut n = 0;
         while held(cx).is_some() {
             idle_frame(cx, w, &view);
@@ -452,9 +506,18 @@ fn a_held_room_asks_for_nothing_once_it_is_gone(cx: &mut TestAppContext) {
         let gone_at = view.read_with(cx, |v, _| v.fx.clock());
         let mut late = Vec::new();
         for _ in 0..288 {
-            if idle_frame(cx, w, &view) {
+            if idle_frame(cx, w, &view).0 > 0 {
                 late.push(view.read_with(cx, |v, _| v.fx.clock()).saturating_duration_since(gone_at).as_millis());
             }
+        }
+        view.update(cx, |v, _| v.on_draw = None);
+        // (Used up, the rows' growth may take it in a frame of their own.)
+        let drawn = drawn.take();
+        let went = drawn.iter().position(|(room, _)| !room);
+        assert!(used_up || went.is_some(), "released: no frame drew the room gone ({drawn:?})");
+        if let Some(went) = went {
+            assert!(drawn[went..].iter().all(|(room, _)| !room), "used up {used_up}: the room drawn back after it went ({drawn:?})");
+            assert!(used_up || !drawn[went].1, "released: the frame that drew the room gone asked for another ({drawn:?})");
         }
         seen.push((used_up, late));
     }
