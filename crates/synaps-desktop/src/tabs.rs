@@ -896,7 +896,19 @@ impl Tabs {
     /// The saved tabs, each waiting for a session list to show its session
     /// ([`Tabs::confirm`]); a session saved twice opens once.
     pub fn restore(saved: &Saved) -> Tabs {
-        let mut t = Tabs::default();
+        Self::restore_numbered(saved, 0)
+    }
+
+    /// [`Tabs::restore`] into this pane's (empty) tabs: numbered on from
+    /// theirs, so no tab has another pane's id (split panes step 5).
+    pub fn restore_here(&mut self, saved: &Saved) {
+        let generation = self.generation;
+        *self = Self::restore_numbered(saved, self.next_id);
+        self.generation = generation + 1;
+    }
+
+    fn restore_numbered(saved: &Saved, base: u64) -> Tabs {
+        let mut t = Tabs::numbered_from(base);
         let mut active = None;
         for (i, s) in saved.sessions.iter().enumerate() {
             if !t.is_open(s) {
