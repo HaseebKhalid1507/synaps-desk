@@ -97,10 +97,19 @@ impl RuntimeInfo {
     }
 }
 
-/// The same model, with or without a `provider/` prefix.
+/// The same model, with or without a `provider/` prefix. For telling a
+/// side call's usage from the session's, never for the cache.
 fn same_model(a: &str, b: &str) -> bool {
     let bare = |m: &str| m.rsplit_once('/').map_or(m, |(_, m)| m).to_string();
     a == b || bare(a) == bare(b)
+}
+
+/// The same prompt cache: the same provider-qualified model. Providers
+/// don't share a cache, so `bedrock/m` is not `anthropic/m`. The one alias
+/// is the default provider's: `anthropic/m` is `m` (SynapsCLI `models.rs`).
+fn same_cache_model(a: &str, b: &str) -> bool {
+    let id = |m: &str| m.strip_prefix("anthropic/").unwrap_or(m).to_owned();
+    id(a) == id(b)
 }
 
 /// The cost unless it is the serde default of a daemon that sent neither
@@ -128,6 +137,9 @@ pub struct Stats {
     pub subagents: Subagents,
     /// The attachment ended: these are the last numbers seen, not live.
     pub detached: bool,
+    /// Its prompt cache and keep-warm, as its last `Status` said
+    /// ([`crate::warm`]); kept across a re-attach of the same session.
+    pub warm: Option<crate::warm::Warm>,
 }
 
 impl Stats {
@@ -146,6 +158,7 @@ impl Stats {
         }
         subagents.reset(&a.conversation.api_messages, same);
         let tokens = Tokens::conversation(&a.conversation.tokens, &a.conversation.keepwarm_tokens);
+        let warm = if same { self.warm.take() } else { None };
         *self = Stats {
             session: Some(a.meta.id.clone()),
             view: RuntimeInfo::from_value(&a.view),
@@ -156,6 +169,7 @@ impl Stats {
             files,
             subagents,
             detached: false,
+            warm,
         };
         self.subagents.replaying(true);
         for env in &a.replay {
@@ -187,8 +201,12 @@ impl Stats {
     }
 
     /// A live event; `raw` is the wire event (fields the mirror drops).
-    pub fn on_session(&mut self, ev: &SessionEvent, raw: &Value) {
+    /// `true`: the session's prompt cache is not what it was (the history
+    /// was replaced, or the model changed): the countdown stops, and the
+    /// daemon is asked again.
+    pub fn on_session(&mut self, ev: &SessionEvent, raw: &Value) -> bool {
         self.subagents.on_session(ev);
+        let mut new_cache = false;
         match ev {
             SessionEvent::Conversation { digest } => {
                 // `keepwarm_tokens` is not on the decoded digest: from the wire event.
@@ -221,14 +239,24 @@ impl Stats {
                     }
                 }
             }
-            SessionEvent::Cleared { .. } | SessionEvent::Resumed { .. } | SessionEvent::CompactionApplied { .. } => self.context = None,
+            SessionEvent::Cleared { .. } | SessionEvent::Resumed { .. } | SessionEvent::CompactionApplied { .. } => {
+                self.context = None;
+                new_cache = true;
+            }
             _ if raw["ev"] == "setting_changed" => {
                 if let Some(v) = RuntimeInfo::from_value(&raw["applied"]["view"]) {
+                    // Only an effective change of model: a refused or
+                    // same-model `Set`, or a thinking change, keeps it.
+                    new_cache = self.view.as_ref().is_some_and(|o| !same_cache_model(&o.model, &v.model));
                     self.view = Some(v);
                 }
             }
             _ => {}
         }
+        if new_cache && let Some(w) = self.warm.as_mut() {
+            w.invalidate();
+        }
+        new_cache
     }
 
     /// Context use, 0..=1, when both the prompt size and the window are known.

@@ -309,6 +309,9 @@ pub enum Command {
     /// `SessionQuery::ModelOptions` → `Event::ModelOptions`. See
     /// [`SessionRef::model_options`].
     ModelOptions,
+    /// `SessionQuery::Status` → `Event::SessionStatus`. See
+    /// [`SessionRef::status`].
+    Status,
 }
 
 impl Command {
@@ -334,6 +337,7 @@ impl Command {
             Command::CancelWorker { .. } | Command::EngineCommand { .. } => "engine_command",
             Command::Set(_) => "set",
             Command::ModelOptions => "model_options",
+            Command::Status => "query",
         }
     }
 }
@@ -385,6 +389,7 @@ impl std::fmt::Debug for Command {
             Command::Set(setting) => f.debug_tuple("Set").field(setting).finish(),
             other => f.write_str(match other {
                 Command::ModelOptions => "ModelOptions",
+                Command::Status => "Status",
                 Command::RefreshSessions => "RefreshSessions",
                 Command::Cancel => "Cancel",
                 Command::Resync => "Resync",
@@ -508,6 +513,9 @@ pub enum Event {
         /// ([`crate::transcript::Transcript::apply_at`]).
         ts: String,
         event: SessionEvent,
+        /// What the event says beyond its typed form (an outcome, …),
+        /// decoded from `raw` with it.
+        meta: crate::protocol::EventMeta,
         raw: Arc<Value>,
     },
     /// The history changed (`Full` mode).
@@ -626,6 +634,13 @@ pub enum Event {
         attach_seq: u64,
         reply: Result<ModelOptions, String>,
     },
+    /// The answer to [`SessionRef::status`]: the session's `Status` value
+    /// (`model`, `cost`, `keepwarm`, `pinned`, `cache_ttl`, and from newer
+    /// daemons `cache`), as the daemon sent it.
+    SessionStatus {
+        attach_seq: u64,
+        value: Value,
+    },
 }
 
 /// What became of a slash command ([`Event::EngineReply`]).
@@ -665,7 +680,8 @@ pub enum WatchReply {
 impl Event {
     /// An [`Event::Session`] sent at no known time (`ts` empty).
     pub fn session(attach_seq: u64, session_id: impl Into<String>, seq: u64, event: SessionEvent, raw: Arc<Value>) -> Self {
-        Event::Session { attach_seq, session_id: session_id.into(), seq, ts: String::new(), event, raw }
+        let meta = crate::protocol::EventMeta::of(&raw);
+        Event::Session { attach_seq, session_id: session_id.into(), seq, ts: String::new(), event, meta, raw }
     }
 
     /// This [`Event::Session`] sent at `ts` (its envelope's, RFC 3339). Any
@@ -691,6 +707,7 @@ impl Event {
             | Event::EngineReply { attach_seq, .. }
             | Event::SettingReply { attach_seq, .. }
             | Event::ModelOptions { attach_seq, .. }
+            | Event::SessionStatus { attach_seq, .. }
             | Event::Detached { attach_seq, .. } => Some(*attach_seq),
             Event::Error { attach_seq, .. } => *attach_seq,
             Event::Status(_)
@@ -1132,6 +1149,16 @@ impl SessionRef<'_> {
     /// `Err` here too).
     pub fn model_options(&self) -> Result<(), ClientClosed> {
         self.send(Command::ModelOptions)
+    }
+
+    /// The session's status (`SessionQuery::Status{cache: true}`: cost,
+    /// keep-warm, the cache's TTL and when the cache expires) →
+    /// `Event::SessionStatus`, answered to this client only. Ask only a
+    /// daemon whose `Welcome.features` lists [`crate::protocol::FEATURE_CACHE_EXPIRY`] (an
+    /// older one does not take the opt-in). Read-only, any attach mode. Not
+    /// connected: nothing comes back (ask again on the next attach).
+    pub fn status(&self) -> Result<(), ClientClosed> {
+        self.send(Command::Status)
     }
 
     /// Leave this attachment only (`Detach` + `Bye`); the others stay. Its
@@ -1684,7 +1711,7 @@ async fn without_session<F: Future>(
             out = &mut fut => return Some(out),
             cmd = cmds.recv() => match cmd {
                 None | Some(Command::Detach) | Some(Command::Shutdown) => return None,
-                Some(Command::Resync) | Some(Command::RefreshSessions) => {}
+                Some(Command::Resync) | Some(Command::RefreshSessions) | Some(Command::Status) => {}
                 Some(Command::CancelWorker { handle_id }) => emit(events, Event::WorkerCancel {
                     attach_seq,
                     handle_id,
@@ -1930,6 +1957,8 @@ async fn session_loop(
         // carries no id: it is the oldest's). `ModelOptions` queries: ids.
         let mut sets: VecDeque<(u64, &'static str)> = VecDeque::new();
         let mut options: VecDeque<u64> = VecDeque::new();
+        // `Status` queries in flight (ids).
+        let mut statuses: VecDeque<u64> = VecDeque::new();
         let query = |sid: &str| ClientFrame::Cmd {
             session_id: sid.to_string(),
             cmd: SessionCommand::Query { id: query_id, query: SessionQuery::Messages },
@@ -2030,7 +2059,7 @@ async fn session_loop(
                         Command::Set(setting) => {
                             let id = loop {
                                 let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
-                                if id != query_id && !sets.iter().any(|s| s.0 == id) && !options.contains(&id) {
+                                if id != query_id && !sets.iter().any(|s| s.0 == id) && !options.contains(&id) && !statuses.contains(&id) {
                                     break id;
                                 }
                             };
@@ -2045,7 +2074,7 @@ async fn session_loop(
                         Command::ModelOptions => {
                             let id = loop {
                                 let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
-                                if id != query_id && !sets.iter().any(|s| s.0 == id) && !options.contains(&id) {
+                                if id != query_id && !sets.iter().any(|s| s.0 == id) && !options.contains(&id) && !statuses.contains(&id) {
                                     break id;
                                 }
                             };
@@ -2054,6 +2083,21 @@ async fn session_loop(
                             }
                             options.push_back(id);
                             SessionCommand::Query { id, query: SessionQuery::ModelOptions }
+                        }
+                        Command::Status => {
+                            let id = loop {
+                                let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
+                                if id != query_id && !statuses.contains(&id) && !options.contains(&id) && !sets.iter().any(|s| s.0 == id) && !cancels.iter().any(|c| c.0 == id) {
+                                    break id;
+                                }
+                            };
+                            if statuses.len() == WATCHES_MAX {
+                                statuses.pop_front();
+                            }
+                            statuses.push_back(id);
+                            // The app asks only a daemon that lists
+                            // `cache_expiry` (`FEATURE_CACHE_EXPIRY`).
+                            SessionCommand::Query { id, query: SessionQuery::Status { cache: true } }
                         }
                         _ => continue,
                     };
@@ -2126,6 +2170,14 @@ async fn session_loop(
                                 _ => Err(message.unwrap_or_else(|| "not applied".into())),
                             };
                             emit(&events, Event::SettingReply { attach_seq, setting, reply });
+                        }
+                        if v.get("ev").and_then(Value::as_str) == Some("query_result")
+                            && let Some(k) = v.get("id").and_then(Value::as_u64).and_then(|q| statuses.iter().position(|o| *o == q))
+                        {
+                            statuses.remove(k);
+                            let value = v.get_mut("value").map(Value::take).unwrap_or_default();
+                            emit(&events, Event::SessionStatus { attach_seq, value });
+                            continue;
                         }
                         if v.get("ev").and_then(Value::as_str) == Some("query_result") {
                             // Only our own resync is ours. Another client's
@@ -2200,7 +2252,8 @@ async fn session_loop(
                             _ => {}
                         }
                         let ended = matches!(event, SessionEvent::Ended { .. });
-                        emit(&events, Event::Session { attach_seq, session_id: esid, seq, ts, event, raw });
+                        let meta = crate::protocol::EventMeta::of(&raw);
+                        emit(&events, Event::Session { attach_seq, session_id: esid, seq, ts, event, meta, raw });
                         if ended {
                             unanswered(&events, attach_seq, &mut cancels, "the session ended before the daemon answered");
                             unset(&events, attach_seq, &mut sets, &mut options, "the session ended before the daemon answered");
