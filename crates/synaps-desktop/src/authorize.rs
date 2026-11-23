@@ -154,7 +154,7 @@ impl PromptCard {
             key,
             row: PROMPT_ID | ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             secret,
-            arm: Arm::new(now),
+            arm: Arm::new(crate::app::arm_at(now)),
             shown: now,
             body: crate::app::well_body(&pr.prompt),
             gist: crate::chrome::prompt_gist(&pr.title, &pr.prompt).into(),
@@ -174,11 +174,11 @@ impl PromptCard {
     }
 
     pub(crate) fn armed(&self) -> bool {
-        self.arm.armed(Instant::now())
+        self.arm.armed(crate::app::arm_now())
     }
 
     pub(crate) fn keys_armed(&self) -> bool {
-        self.arm.keys_armed(Instant::now())
+        self.arm.keys_armed(crate::app::arm_now())
     }
 
     /// What of the well is out of sight with the list's view `top..view`,
@@ -669,7 +669,7 @@ impl AppView {
             && self.panes.cur.card.as_ref().is_some_and(|c| !self.model.lives[self.panes.cur.live].prompt_answered(c.key.1));
         if let Some(c) = self.panes.cur.card.as_mut().filter(|_| offered && may) {
             c.allow_all = !c.allow_all;
-            c.arm = Arm::new(Instant::now());
+            c.arm = Arm::new(crate::app::arm_now());
             c._arm = Some(Self::arm_repaint(cx));
             log::info!(target: "synaps_desktop::card", "card {:?}: allow all {}", c.key, if c.allow_all { "on" } else { "off" });
             cx.notify();
