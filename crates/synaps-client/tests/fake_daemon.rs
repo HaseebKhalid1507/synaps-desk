@@ -1183,12 +1183,12 @@ async fn answers_for_an_earlier_connection_are_never_sent() {
     assert_eq!(again.recv_cmd().await, json!({"cmd": "detach", "client": 3}));
 }
 
-/// An agent card's action as D3 will commit it.
-fn card_action() -> synaps_client::protocol::SurfaceAction {
+/// An agent card's action as D3 will commit it, under `action_id`.
+fn card_action(action_id: &str) -> synaps_client::protocol::SurfaceAction {
     synaps_client::protocol::SurfaceAction {
         surface_id: "s_3f2a91c0d4e2a871".into(),
         contract: "c1:dd88bb46e6b36d702d326c325b6b5c61".into(),
-        action_id: "5b0c".repeat(8),
+        action_id: action_id.into(),
         expect_rev: 0,
         epoch: 4,
         verb: synaps_client::surface::Verb::Answer,
@@ -1196,11 +1196,15 @@ fn card_action() -> synaps_client::protocol::SurfaceAction {
     }
 }
 
-/// The action's frame, as the daemon reads it (§2.4).
-fn card_action_cmd() -> Value {
+/// That action's frame, as the daemon reads it (§2.4).
+fn card_action_cmd(action_id: &str) -> Value {
     json!({"cmd": "surface_action", "surface_id": "s_3f2a91c0d4e2a871", "contract": "c1:dd88bb46e6b36d702d326c325b6b5c61",
-           "action_id": "5b0c".repeat(8), "expect_rev": 0, "epoch": 4, "verb": "answer", "values": {"choice": "Leave it"}})
+           "action_id": action_id, "expect_rev": 0, "epoch": 4, "verb": "answer", "values": {"choice": "Leave it"}})
 }
+
+/// Two commits' ids: the old card's and the new connection's.
+const OLD_ID: &str = "9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e";
+const NEW_ID: &str = "5b0c5b0c5b0c5b0c5b0c5b0c5b0c5b0c";
 
 fn card_action_refused(e: &Event) -> Option<String> {
     match e {
@@ -1225,7 +1229,7 @@ async fn a_card_action_is_never_written_to_a_daemon_without_the_feature() {
         _ => None,
     })
     .await;
-    client.surface_action_on(connection, card_action()).unwrap();
+    client.surface_action_on(connection, card_action(NEW_ID)).unwrap();
     let why = wait(&events, "refused", card_action_refused).await;
     assert!(why.contains("agent_surfaces"), "{why}");
     client.answer_on(connection, 1, Some("y".into())).unwrap();
@@ -1251,8 +1255,8 @@ async fn a_card_action_is_written_only_on_its_cards_connection() {
         _ => None,
     })
     .await;
-    client.surface_action_on(first, card_action()).unwrap();
-    assert_eq!(conn.recv_cmd().await, card_action_cmd());
+    client.surface_action_on(first, card_action(OLD_ID)).unwrap();
+    assert_eq!(conn.recv_cmd().await, card_action_cmd(OLD_ID));
     drop(conn);
     wait(&events, "reattaching", |e| matches!(e, Event::Reattaching { attach_seq, .. } if *attach_seq == seq).then_some(())).await;
     let mut again = fake.next_attach().await;
@@ -1263,11 +1267,11 @@ async fn a_card_action_is_written_only_on_its_cards_connection() {
     })
     .await;
     assert!(second > first, "{first} then {second}");
-    client.surface_action_on(first, card_action()).unwrap();
+    client.surface_action_on(first, card_action(OLD_ID)).unwrap();
     let why = wait(&events, "refused after the reconnect", card_action_refused).await;
     assert!(why.contains("earlier connection"), "{why}");
-    client.surface_action_on(second, card_action()).unwrap();
-    assert_eq!(again.recv_cmd().await, card_action_cmd(), "the old card's action never reached it");
+    client.surface_action_on(second, card_action(NEW_ID)).unwrap();
+    assert_eq!(again.recv_cmd().await, card_action_cmd(NEW_ID), "the old card's action never reached it");
     client.shutdown().unwrap();
     assert_eq!(again.recv_cmd().await, json!({"cmd": "detach", "client": 3}));
 }
