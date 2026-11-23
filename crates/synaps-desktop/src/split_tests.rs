@@ -2,9 +2,11 @@
 //! real socket: a fake daemon (std threads) that hands each attach to the
 //! test, as `model::fake_daemon`'s.
 
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -568,11 +570,7 @@ fn four_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
     // does, however fast the focus went through the panes' composers.
     let _ = cx.update_window(window, |_, window, cx| view.update(cx, |v, cx| window.focus(&v.focus, cx)));
     for _ in 0..240 {
-        let dt = Duration::from_micros(6944);
-        view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
-        cx.executor().advance_clock(dt);
-        let ran = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
-        cx.run_until_parked();
+        let ran = idle_step(cx, window, &view, Duration::from_micros(6944));
         if ran == 0 && !view.read_with(cx, |v, _| v.fx.pending().0) {
             break;
         }
@@ -584,19 +582,11 @@ fn four_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
     // drawn first: the blur repaints the caret away, the scrollbars'
     // linger runs out (`scrollbar::LINGER`, then their fade).
     for _ in 0..60 {
-        let dt = Duration::from_millis(50);
-        view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
-        cx.executor().advance_clock(dt);
-        let _ = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx));
-        cx.run_until_parked();
+        idle_step(cx, window, &view, Duration::from_millis(50));
     }
     let f0 = view.read_with(cx, |v, _| v.fx.frames());
     for i in 0..40 {
-        let dt = Duration::from_millis(50);
-        view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
-        cx.executor().advance_clock(dt);
-        let _ = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx));
-        cx.run_until_parked();
+        idle_step(cx, window, &view, Duration::from_millis(50));
         assert_eq!(view.read_with(cx, |v, _| v.fx.frames()), f0, "at rest, {} ms on: a render", (i + 1) * 50);
     }
     let (sites, rail) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width));
@@ -1087,6 +1077,56 @@ fn frame_144(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<App
     view.update(cx, |_, cx| cx.notify());
     cx.update_window(window, |_, w, cx| w.simulate_next_frame(cx)).expect("the window");
     cx.run_until_parked();
+}
+
+/// One 144 Hz frame on the test's clock, as [`frame_144`], drawn only if
+/// the app asked for one (a frame, or a timer that came due): a frame
+/// drawn is one the app drew.
+fn asked_frame(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>) {
+    let dt = Duration::from_micros(6944);
+    let (t0, at) = (cx.executor().now(), view.read_with(cx, |v, _| v.fx.clock()));
+    let _end = cx.executor().timer(dt);
+    loop {
+        cx.dispatcher.advance_clock_to_next_timer();
+        let t = cx.executor().now() - t0;
+        view.read_with(cx, |v, _| v.fx.set_clock(at + t));
+        cx.run_until_parked();
+        if t >= dt {
+            break;
+        }
+    }
+    cx.update_window(window, |_, w, cx| w.simulate_next_frame(cx)).expect("the window");
+    cx.run_until_parked();
+}
+
+/// `dt` on the test's clock, timer by timer with the motion clock at each
+/// deadline (as [`frame_144`]; Shady #58 n2), then the frame the app asked
+/// for, if it asked: how many frame callbacks ran.
+fn idle_step(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>, dt: Duration) -> usize {
+    let (t0, at) = (cx.executor().now(), view.read_with(cx, |v, _| v.fx.clock()));
+    let _end = cx.executor().timer(dt);
+    loop {
+        cx.dispatcher.advance_clock_to_next_timer();
+        let t = cx.executor().now() - t0;
+        view.read_with(cx, |v, _| v.fx.set_clock(at + t));
+        cx.run_until_parked();
+        if t >= dt {
+            break;
+        }
+    }
+    let ran = cx.update_window(window, |_, w, cx| w.simulate_next_frame(cx)).expect("the window");
+    cx.run_until_parked();
+    ran
+}
+
+/// From now on, `shot` of the view at each frame drawn, in order (#60
+/// L1: a [`frame_144`] can draw two frames, a motion timer's and its own,
+/// so a step's view after it is not every frame's).
+fn draws<T: 'static>(cx: &mut TestAppContext, view: &Entity<AppView>, shot: impl Fn(&AppView) -> T + 'static) -> Rc<RefCell<Vec<T>>> {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let l = log.clone();
+    view.update(cx, |v, _| v.on_draw = Some(Rc::new(move |v: &AppView| l.borrow_mut().push(shot(v)))));
+    log
 }
 
 /// A label as one frame drew it: its pane's width, its left from the
@@ -4182,6 +4222,21 @@ fn a_layouts_flight_lands_with_its_handles_and_nothing_wakes_after(cx: &mut Test
                 frame_144(cx, window, &view);
             }
         }
+        // A frame: the panels' edges and every pane's box as drawn (a
+        // closing share too); then what waits for the landing. Each frame
+        // drawn, from the move's (#60 L1: a step can draw two).
+        let seen = draws(cx, &view, |v| {
+            let (w, h) = v.centre.get();
+            let mut edges = vec![v.panel_fx.sides[0].shown, v.panel_fx.sides[1].shown];
+            for (_, r) in v.panes.drawn.rects(crate::split::Rect { x: 0., y: 0., w, h }) {
+                edges.extend([r.x, r.y, r.w, r.h]);
+            }
+            let insets = v.panes.ids().iter().filter_map(|id| v.panes.get(*id)).any(|p| p.foot_moving.get() || p.top_moving.get());
+            let (frame, timer) = v.fx.pending();
+            let woke = frame || (timer.is_some() && v.fx.wakes() == Some(Wake::App));
+            let ride = v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some());
+            (edges, v.handles_drawn.get(), v.panes.flight.is_some(), !v.panes.closing.is_empty(), insets, woke, ride)
+        });
         match case {
             "a split" | "a split riding" => key(cx, window, "ctrl-\\"),
             "a split down" => key(cx, window, "ctrl-shift-\\"),
@@ -4193,8 +4248,6 @@ fn a_layouts_flight_lands_with_its_handles_and_nothing_wakes_after(cx: &mut Test
             }),
         }
         cx.run_until_parked();
-        // A frame: the panels' edges and every pane's box as drawn (a
-        // closing share too); then what waits for the landing.
         let ids = view.read_with(cx, |v, _| v.panes.ids());
         // Each pane's composer as drawn, from its pane's foot (its inset)
         // and its height (the inset above it), and whether its insets move.
@@ -4209,31 +4262,16 @@ fn a_layouts_flight_lands_with_its_handles_and_nothing_wakes_after(cx: &mut Test
                 .collect()
         };
         let mut insets = vec![composers(cx)];
-        let shot = |cx: &mut TestAppContext| {
-            let handles = drawn(cx, window, "divider-grab 0".into()).is_some();
-            view.read_with(cx, |v, _| {
-                let (w, h) = v.centre.get();
-                let mut edges = vec![v.panel_fx.sides[0].shown, v.panel_fx.sides[1].shown];
-                for (_, r) in v.panes.drawn.rects(crate::split::Rect { x: 0., y: 0., w, h }) {
-                    edges.extend([r.x, r.y, r.w, r.h]);
-                }
-                let insets = v.panes.ids().iter().filter_map(|id| v.panes.get(*id)).any(|p| p.foot_moving.get() || p.top_moving.get());
-                let (frame, timer) = v.fx.pending();
-                let woke = frame || (timer.is_some() && v.fx.wakes() == Some(Wake::App));
-                let ride = v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some());
-                (edges, handles, v.panes.flight.is_some(), !v.panes.closing.is_empty(), insets, woke, ride)
-            })
-        };
-        let mut seen = vec![shot(cx)];
         let mut rest = 0;
         while rest < 10 {
             frame_144(cx, window, &view);
-            seen.push(shot(cx));
             insets.push(composers(cx));
             let busy = view.read_with(cx, |v, _| v.panel_fx.moving() || v.panes.flight.is_some() || v.fx.pending().0);
             rest = if busy { 0 } else { rest + 1 };
-            assert!(seen.len() < 500, "{case}: never landed");
+            assert!(insets.len() < 500, "{case}: never landed");
         }
+        view.update(cx, |v, _| v.on_draw = None);
+        let seen = seen.take();
         let same = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.01);
         let last = (1..seen.len()).rev().find(|&i| !same(&seen[i].0, &seen[i - 1].0)).unwrap_or(0);
         if last < 10 {
@@ -6278,4 +6316,164 @@ fn a_quiet_collapse_is_not_written_back(cx: &mut TestAppContext) {
     while attaches.try_recv().is_ok() {}
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
+}
+
+/// #60 L2 (and #50 L4): nothing is drawn after a move lands, at Full and
+/// at Off: a 2-pane rail fold and unfold and a close, the sessions at
+/// rest and the pointer resting where the right panel's strip comes (the
+/// film's scene). A new column's rows get their hint with no frame of
+/// their own when the bar read it ahead: on `cf28780` every re-wrap drew
+/// one more frame, the same pixels (a widening landing at Full, every
+/// move at Off). The strip that comes in under the pointer (a split, an
+/// unfold) is lit in the frame it is drawn: on `cf28780` its fill came a
+/// frame later, at Off the one frame after the move. Frame by frame
+/// drawn ([`draws`]), only the frames the app asks for ([`asked_frame`]).
+/// A split's new pane takes the focus, and its frames after the move are
+/// its own (its composer's), so a split is checked for its strip. At
+/// Full, within 100 ms of the landing (a follow-up, a settling tail).
+#[gpui_kit::test]
+fn nothing_is_drawn_after_a_landing(cx: &mut TestAppContext) {
+    use crate::motion::Level;
+    // Each case's window goes: the next one's frames are its own.
+    let close = |cx: &mut TestAppContext, window: AnyWindowHandle| {
+        cx.update_window(window, |_, w, _| w.remove_window()).expect("the window");
+        cx.run_until_parked();
+    };
+    let strip = crate::app::tkey("right-strip", 0);
+    let mut fails = Vec::new();
+    for l in [Level::Full, Level::Off] {
+        for case in ["a split", "the rail folds", "the rail unfolds", "a close"] {
+            let (window, view) = demo_split(cx, 1920., 1080.);
+            panels_at(cx, &view, true, 480, 520);
+            view.update(cx, |v, cx| {
+                for m in v.model.sessions.iter_mut() {
+                    (m.busy, m.subagents_running) = (false, 0);
+                }
+                v.model.rail_gen += 1;
+                cx.notify();
+            });
+            frame(cx, window);
+            level(cx, l);
+            frame(cx, window);
+            // The pointer at rest over the strip's place: the last input
+            // is the pointer's (a key since would hide every hover).
+            VisualTestContext::from_window(window, cx).simulate_mouse_move(gpui_kit::point(px(1900.), px(1070.)), None, Default::default());
+            let split = |cx: &mut TestAppContext| {
+                cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.split_pane(None, w, cx))).expect("the window");
+            };
+            let unfocus = |cx: &mut TestAppContext| {
+                cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| w.focus(&v.focus, cx))).expect("the window");
+            };
+            let settle = |cx: &mut TestAppContext| {
+                land(cx, window, &view);
+                for _ in 0..60 {
+                    frame_144(cx, window, &view);
+                }
+            };
+            if case != "a split" {
+                split(cx);
+                unfocus(cx);
+                settle(cx);
+                if case == "the rail unfolds" {
+                    view.update(cx, |v, cx| v.toggle_panel(true, cx));
+                    settle(cx);
+                }
+                view.update(cx, |v, _| v.panels_save = None);
+            }
+            let seen = draws(cx, &view, move |v| {
+                let (w, h) = v.centre.get();
+                let mut edges = vec![v.panel_fx.sides[0].shown, v.panel_fx.sides[1].shown];
+                for (_, r) in v.panes.drawn.rects(crate::split::Rect { x: 0., y: 0., w, h }) {
+                    edges.extend([r.x, r.w]);
+                }
+                (v.fx.now(), edges, v.fx.hover_to(strip))
+            });
+            match case {
+                "a split" => split(cx),
+                "a close" => view.update(cx, |v, cx| {
+                    let last = *v.reading_order().last().expect("a pane");
+                    v.in_pane(last, |v| v.close_pane());
+                    cx.notify();
+                }),
+                _ => view.update(cx, |v, cx| v.toggle_panel(true, cx)),
+            }
+            view.update(cx, |v, _| v.panels_save = None);
+            cx.run_until_parked();
+            let comes = matches!(case, "a split" | "the rail unfolds");
+            if l == Level::Off {
+                // Its frame's asks, if it made any.
+                cx.update_window(window, |_, w, cx| w.simulate_next_frame(cx)).expect("the window");
+                cx.run_until_parked();
+                let seen = seen.take();
+                if seen.len() != 1 && case != "a split" {
+                    fails.push(format!("{l:?}, {case}: {} frames drawn, not the move's alone: {seen:?}", seen.len()));
+                }
+                if comes && seen.first().is_some_and(|s| s.2 != Some(1.)) {
+                    fails.push(format!("{l:?}, {case}: the strip under the pointer unlit in the move's frame: {seen:?}"));
+                }
+                close(cx, window);
+                continue;
+            }
+            // A split focuses its new pane: its caret's blink is a frame
+            // every 500 ms.
+            unfocus(cx);
+            // A second at 144 Hz, a frame drawn only when the app asks for
+            // one ([`frame_144`] draws one each step).
+            for _ in 0..144 {
+                asked_frame(cx, window, &view);
+            }
+            view.update(cx, |v, _| v.on_draw = None);
+            let landed = view.read_with(cx, |v, _| !v.panel_fx.moving() && v.panes.flight.is_none());
+            let seen = seen.take();
+            let last = (1..seen.len()).rev().find(|&i| seen[i].1 != seen[i - 1].1).unwrap_or(0);
+            if !landed || last < 10 {
+                fails.push(format!("{l:?}, {case}: it didn't fly and land ({last} frames, landed {landed})"));
+                close(cx, window);
+                continue;
+            }
+            // The landing's own: within 100 ms (a follow-up frame, a
+            // spring's settling tail: 6-7 frames). A later one is not the
+            // landing's: no motion ask and none of the app's frame
+            // requests drew it (one, ~0.5 s after a fold or an unfold
+            // under the resting pointer, is a notify of its own).
+            let after: Vec<f64> = seen[last + 1..].iter().map(|s| s.0.duration_since(seen[last].0).as_secs_f64() * 1000.).collect();
+            if case != "a split" && after.iter().any(|&ms| ms < 100.) {
+                fails.push(format!("{l:?}, {case}: frames drawn after the landing (frame {last}), ms after it: {after:.1?}"));
+            }
+            if comes && seen[last].2 != Some(1.) {
+                fails.push(format!("{l:?}, {case}: the strip under the pointer unlit as it lands: {:?}", seen[last].2));
+            }
+            close(cx, window);
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// Shady #58 n1: [`frame_144`] is `ui_tests`' `fluid_frame` (the harness
+/// clock, timer by timer) in this file's spelling, and [`asked_frame`] is
+/// it without the step's own draw: a change to `fluid_frame` (a protected
+/// helper, changed on purpose) fails here until these follow it, as
+/// `test_kit`'s `kit_matches_ui_tests` does for its copies.
+#[test]
+fn frame_144_matches_fluid_frame() {
+    // A helper's body: from the line after its `fn` to its closing brace.
+    let body = |src: &str, name: &str| -> String {
+        let src = src.replace("\r\n", "\n");
+        let at = src.find(&format!("\nfn {name}(")).unwrap_or_else(|| panic!("{name}"));
+        let open = src[at..].find("{\n").expect("its body") + at + 2;
+        let end = src[open..].find("\n}\n").expect("its end") + open + 1;
+        src[open..end].to_string()
+    };
+    let (ui, ours) = (include_str!("ui_tests.rs"), include_str!("split_tests.rs"));
+    let fluid = body(ui, "fluid_frame");
+    // This file's spelling: `Duration` imported, the window `window`.
+    let spelt = |b: String| {
+        b.replace("Duration::from_micros", "std::time::Duration::from_micros").replace(
+            "cx.update_window(window, |_, w, cx| w.simulate_next_frame(cx))",
+            "cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx))",
+        )
+    };
+    assert_eq!(spelt(body(ours, "frame_144")), fluid, "frame_144 drifted from ui_tests' fluid_frame");
+    let notify = "    view.update(cx, |_, cx| cx.notify());\n";
+    assert_eq!(spelt(body(ours, "asked_frame")), fluid.replacen(notify, "", 1), "asked_frame drifted from fluid_frame");
 }

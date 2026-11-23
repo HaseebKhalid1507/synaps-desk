@@ -2128,8 +2128,9 @@ impl Motion {
     /// The pointer went over (or off) control `key` (its `on_hover`): its
     /// fill comes on over [`HOVER_IN`] and goes off over [`HOVER_OUT`]
     /// (fluid.md §3.9: on fast, off decays). Reduced: on at once, off over
-    /// [`QUICK`]. Off: at once.
-    pub(crate) fn set_hover(&self, key: u64, on: bool) {
+    /// [`QUICK`]. Off: at once. Whether it changed where it is going (the
+    /// pointer was already over it, or already gone: nothing to draw).
+    pub(crate) fn set_hover(&self, key: u64, on: bool) -> bool {
         let (frame, now) = (self.frame.get(), self.now());
         let to = if on { 1. } else { 0. };
         let full = match (self.level.get(), on) {
@@ -2140,12 +2141,21 @@ impl Motion {
         };
         let mut hovers = self.hovers.borrow_mut();
         let h = hovers.entry(key).or_insert((Tween::rest(1. - to, now), frame));
+        let changed = h.0.to != to;
         if full.is_zero() {
             h.0 = Tween::rest(to, now);
         } else {
             h.0.retarget(to, now, full, &ease::OUT);
         }
         h.1 = frame;
+        changed
+    }
+
+    /// Tests: where control `key`'s hover is going (1 on, 0 off), read
+    /// only.
+    #[cfg(test)]
+    pub(crate) fn hover_to(&self, key: u64) -> Option<f32> {
+        self.hovers.borrow().get(&key).map(|h| h.0.to)
     }
 
     /// Control `key`'s hover (0 at rest … 1 hovered) this frame.

@@ -1572,6 +1572,10 @@ pub(crate) fn above_list(lay: Layout, naming: bool) -> f32 {
     crate::chrome::top_h(lay.short) + naming
 }
 
+/// Tests: what [`AppView::on_draw`] calls each frame drawn.
+#[cfg(test)]
+pub(crate) type OnDraw = Rc<dyn Fn(&AppView)>;
+
 /// When the card's keys may act ([`ARM`] after each of these): its buttons
 /// from when it was shown; its keys also from when they last went live
 /// (the card came into view, the window or the keys came to it) and from
@@ -1888,6 +1892,15 @@ pub struct AppView {
     /// Tests: the boxes [`AppView::probe`] laid out, frame by frame.
     #[cfg(test)]
     pub(crate) chrome_log: std::rc::Rc<RefCell<Vec<Probed>>>,
+    /// Tests: called with the view at each frame's paint, once the whole
+    /// window is rendered and laid out: frame by frame drawn, not step by
+    /// step of a test (one step can draw two: a motion timer's frame and
+    /// its own; #60 L1).
+    #[cfg(test)]
+    pub(crate) on_draw: Option<OnDraw>,
+    /// Tests: the dividers' handles were drawn this frame.
+    #[cfg(test)]
+    pub(crate) handles_drawn: Cell<bool>,
     /// The side panels folded to strips and the open HISTORY buckets
     /// (saved with the accent).
     pub panels: theme::Panels,
@@ -1896,7 +1909,7 @@ pub struct AppView {
     panels_dirty: theme::PanelKeys,
     panels_writing: theme::PanelKeys,
     /// The delayed save ([`SAVE_DELAY`]); a newer fold replaces it.
-    panels_save: Option<Task<()>>,
+    pub(crate) panels_save: Option<Task<()>>,
     /// A drag of a panel's edge, from the mouse-down on its handle.
     pub(crate) drag: Option<EdgeGrab>,
     /// A drag let go near a detent, its panel springing there: the
@@ -2192,9 +2205,13 @@ impl AppView {
     /// with [`crate::motion::Motion::fill`]. One `on_hover` per element:
     /// an element with its own calls `set_hover` from it instead.
     pub(crate) fn touch<E: StatefulInteractiveElement>(el: E, key: u64, cx: &Context<Self>) -> E {
+        // Only when it changed: a control lit in the frame it came in
+        // under the pointer ([`AppView::lit_arriving`]) draws nothing more
+        // as GPUI tells it after that frame.
         let el = el.on_hover(cx.listener(move |this, on: &bool, _, cx| {
-            this.fx.set_hover(key, *on);
-            cx.notify();
+            if this.fx.set_hover(key, *on) {
+                cx.notify();
+            }
         }));
         Self::pressable(el, key, cx)
     }
@@ -2204,6 +2221,29 @@ impl AppView {
     /// `hover_out`); held, `press`. Where `.hover(|d| d.bg(hover))` was.
     pub(crate) fn lit(&self, el: Stateful<Div>, key: u64, roles: (Hsla, Hsla, Hsla), cx: &Context<Self>) -> Stateful<Div> {
         self.lit_rest(el, key, roles, None, cx)
+    }
+
+    /// [`AppView::lit`] for a control that comes in under a still pointer
+    /// (a side panel's strip, put there by a yield or a fold): at Reduced
+    /// and Off, where a hover comes on at once, it is lit in the frame it
+    /// is drawn in. GPUI tells its `on_hover` after that frame's paint, so
+    /// its fill came a frame late, the one frame after the move (#50 L4,
+    /// #60 L2). By that frame's own hit test, as GPUI's (a key pressed
+    /// since the pointer last moved: no hover); under its content. At Full
+    /// it eases in as any hover does.
+    pub(crate) fn lit_arriving(&self, el: Stateful<Div>, key: u64, roles: (Hsla, Hsla, Hsla), cx: &Context<Self>) -> Stateful<Div> {
+        let (fx, hover) = (self.fx.clone(), roles.1);
+        let now = canvas(
+            |b, window, _| window.insert_hitbox(b, HitboxBehavior::Normal),
+            move |b, hit, window, cx| {
+                if fx.level() != crate::motion::Level::Full && !cx.has_active_drag() && hit.is_hovered(window) && fx.set_hover(key, true) {
+                    window.paint_quad(fill(b, hover));
+                }
+            },
+        )
+        .absolute()
+        .inset_0();
+        self.lit(el.child(now), key, roles, cx)
     }
 
     /// [`AppView::lit`] for a control with a fill of its own at rest (a
@@ -2579,6 +2619,10 @@ impl AppView {
             roll_probe: None,
             #[cfg(test)]
             chrome_log: Default::default(),
+            #[cfg(test)]
+            on_draw: None,
+            #[cfg(test)]
+            handles_drawn: Cell::new(false),
             panels: theme::Panels::default(),
             panels_dirty: Default::default(),
             panels_writing: Default::default(),
@@ -5435,6 +5479,27 @@ impl AppView {
         }
     }
 
+    /// Tests: [`Self::on_draw`] at this frame's paint (the root's last
+    /// child: after every element's render and layout, and what the
+    /// frame's motion asked for).
+    fn draw_probe(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        #[cfg(test)]
+        {
+            let (f, me) = (self.on_draw.clone()?, cx.weak_entity());
+            let paint = move |_: Bounds<Pixels>, _: (), _: &mut Window, cx: &mut App| {
+                if let Some(v) = me.upgrade() {
+                    f(v.read(cx));
+                }
+            };
+            Some(canvas(|_, _, _| {}, paint).absolute().size_0().into_any_element())
+        }
+        #[cfg(not(test))]
+        {
+            let _ = cx;
+            None
+        }
+    }
+
     fn composer_note(&self) -> Option<SharedString> {
         self.panes.cur.watch_note.clone().or_else(|| self.panes.cur.draft_note.map(SharedString::from))
     }
@@ -8159,13 +8224,6 @@ impl AppView {
                 self.panes.cur.fold_slack.set(Some(s));
             }
         }
-        // A re-wrap: this frame's bar reads the rows GPUI didn't draw at
-        // the hint the next frame gives them (`rehint`, below, which only
-        // reads; #46: the thumbs land with the panes, not a frame after).
-        // One more frame, at every level, gives it ([`AppView::hint_rows`]).
-        if rewrap {
-            window.request_animation_frame();
-        }
         // Short or not: the list's top edge moves by what the bars above it
         // gain or lose, and the rows keep their place on screen; after a
         // remeasure too (a maximize crosses the hang width and the short
@@ -8325,6 +8383,28 @@ impl AppView {
         // in the next frame's [`AppView::hint_rows`], so one is drawn (once:
         // hinted, every row has a height). Else, a load's last frame left the
         // thumb its unhinted length until something else drew.
+        // A re-wrap: this frame's bar reads the rows GPUI didn't draw at
+        // the hint the next frame gives them (`rehint`, below, which only
+        // reads; #46: the thumbs land with the panes, not a frame after).
+        // One more frame, at every level, gives it ([`AppView::hint_rows`]),
+        // when there is one to give: after the list's layout, rows left
+        // without a height (#60 L2: else it drew what this one did, a frame
+        // after every widening landing at Full and every move at Off). Not
+        // given without a frame: set between frames, the drawn rows would
+        // lose their bounds until the next layout (`hint_ahead`).
+        let rewrap_frame = rewrap.then(|| {
+            let (l, n) = (self.panes.cur.list.clone(), self.panes.cur.disp.len());
+            canvas(
+                move |_, window, _| {
+                    if wants_hint(&l, n) {
+                        window.request_animation_frame();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0()
+        });
         let hint_frame = self.panes.cur.list.is_scrolled_to_end().is_none().then(|| {
             let (l, n) = (self.panes.cur.list.clone(), self.panes.cur.disp.len());
             canvas(
@@ -8483,6 +8563,7 @@ impl AppView {
                         .child(crate::scroll::owner(self.panes.cur.scroller.clone(), self.fx.clone()))
                         .children(unpainted.filter(|_| !hold))
                         .children(hint_frame.filter(|_| !hold))
+                        .children(rewrap_frame)
                         .children(landing)
                         .children(hold_back.filter(|_| !hold))
                         .children(rehint.filter(|_| !hold))
@@ -9448,6 +9529,8 @@ impl Render for AppView {
                 eprintln!("HANDLES {t:.4} {still} panels {rail_w} {right_w} panes {w:?}");
             }
             let handles = if still { self.divider_handles(&drawn, area(centre), &p, cx) } else { Vec::new() };
+            #[cfg(test)]
+            self.handles_drawn.set(!handles.is_empty());
             div()
                 .flex_1()
                 .h_full()
@@ -9458,6 +9541,8 @@ impl Render for AppView {
                 .debug_selector(|| "pane-centre".into())
                 .into_any_element()
         } else {
+            #[cfg(test)]
+            self.handles_drawn.set(false);
             // The last close's pane goes, if a frame of it is left.
             self.reap_closing();
             let g = PaneFrame { pane, wrap, pane_to, view_pane, win_h: self.height, p, m };
@@ -9834,6 +9919,7 @@ impl Render for AppView {
                 .absolute()
                 .size_0()
             })
+            .children(self.draw_probe(cx))
     }
 }
 
