@@ -1523,6 +1523,10 @@ pub(crate) fn above_list(lay: Layout, naming: bool) -> f32 {
     crate::chrome::top_h(lay.short) + naming
 }
 
+/// Tests: what [`AppView::on_draw`] calls each frame drawn.
+#[cfg(test)]
+pub(crate) type OnDraw = Rc<dyn Fn(&AppView)>;
+
 /// When the card's keys may act ([`ARM`] after each of these): its buttons
 /// from when it was shown; its keys also from when they last went live
 /// (the card came into view, the window or the keys came to it) and from
@@ -1811,7 +1815,7 @@ pub struct AppView {
     /// step of a test (one step can draw two: a motion timer's frame and
     /// its own; #60 L1).
     #[cfg(test)]
-    pub(crate) on_draw: Option<Rc<dyn Fn(&AppView)>>,
+    pub(crate) on_draw: Option<OnDraw>,
     /// Tests: the dividers' handles were drawn this frame.
     #[cfg(test)]
     pub(crate) handles_drawn: Cell<bool>,
