@@ -2003,15 +2003,8 @@ impl AppView {
             )
             .when_some(row_tip, |d, tip| d.tooltip(tip));
         let _ = cx;
-        // Opened: the 1 px `line` rule under it, and the card's inset under
-        // that, so the row is as tall open as folded (its card's bottom
-        // edge goes to the run's last row): nothing below it moves.
         if open {
-            return v_flex()
-                .child(row)
-                .child(div().h(px(1.)).bg(p.line).debug_selector(move || format!("run-rule {id}")))
-                .pb(px(g.inset))
-                .into_any_element();
+            return crate::cards::opened(row, id, p, g).into_any_element();
         }
         row.into_any_element()
     }
