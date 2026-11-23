@@ -1108,7 +1108,10 @@ fn a_compaction_summary_is_drawn_as_nothing() {
     let summary = json!({"role": "user", "content": SUMMARY});
     let said = |s: &str| json!({"role": "assistant", "content": s});
     assert_eq!(fold(&[summary.clone(), said(OLD_ACK)]), []);
-    assert_eq!(fold(&[summary.clone(), said("Here is the actual answer")]), [(ItemKind::Assistant, "Here is the actual answer".to_string())]);
+    assert_eq!(
+        fold(&[summary.clone(), said("Here is the actual answer")]),
+        [(ItemKind::Assistant, "Here is the actual answer".to_string())]
+    );
     assert_eq!(
         fold(&[summary.clone(), json!({"role": "user", "content": "go on"}), said(ACK)]),
         [(ItemKind::User, "go on".to_string()), (ItemKind::Assistant, ACK.to_string())]
