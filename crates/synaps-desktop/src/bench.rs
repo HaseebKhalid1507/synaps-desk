@@ -1258,6 +1258,39 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let _ = cx.update(|_, cx| cx.quit());
                     return;
                 }
+                // `SYNAPS_BENCH_WARM_STATES=S`: the right panel's cache section
+                // in each state it shows, S s apiece, each announced on stdout
+                // (`warm-state <name>`) for a still: under a minute, at zero,
+                // unknown (`—`: a status without `cache`), an older daemon's
+                // (no section), a downgraded 1h.
+                if let Some(hold) = std::env::var("SYNAPS_BENCH_WARM_STATES").ok().and_then(|s| s.parse::<f64>().ok()) {
+                    let _ = upd(cx, &|v, _| v.model.local_session(v.panes.cur.live, "bench-warm"));
+                    let kw = json!({"mode": "off", "session_pings": 0, "session_keepwarm_usd": 0.0});
+                    let states = [
+                        ("under-a-minute", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw, "cache": {"ttl": "5m", "expires_in_secs": 42}}))),
+                        ("cold", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw, "cache": {"ttl": "5m", "expires_in_secs": 0}}))),
+                        ("unknown", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw}))),
+                        ("older-daemon", None),
+                        (
+                            "downgraded",
+                            Some(json!({"cache_ttl": {"setting": "1h"}, "pinned": true,
+                                "keepwarm": {"mode": "auto", "session_pings": 3, "session_keepwarm_usd": 0.0123, "period": {"next_ping_in_secs": 240}},
+                                "cache": {"ttl": "5m", "expires_in_secs": 268, "downgraded": true}})),
+                        ),
+                    ];
+                    for (name, st) in states {
+                        let set = move |v: &mut AppView, _: &mut Context<AppView>| {
+                            v.model.lives[v.panes.cur.live].stats.warm =
+                                st.as_ref().map(|s| crate::warm::Warm::from_status(s, crate::warm::Moment::now()));
+                        };
+                        let _ = upd(cx, &set);
+                        sleep(0.8).await;
+                        println!("warm-state {name}");
+                        sleep(hold).await;
+                    }
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
                 // A session at rest: nothing runs. (The synthetic history
                 // ends on a call with no result, which reads as running:
                 // it is the beat's scene, not this one.)
