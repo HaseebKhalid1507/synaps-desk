@@ -68,9 +68,14 @@ impl AppSettings {
             dash_url: get("dash_url"),
             usage_range: get("usage_range").and_then(|r| Range::parse(&r)).unwrap_or_default(),
             usage_host: get("usage_host").filter(|h| h != "all"),
-            split: path.is_some_and(|p| theme::load_flag(p, "panes.split")) || std::env::var("SYNAPS_DESK_SPLIT").is_ok_and(|v| v == "1"),
+            split: path.is_some_and(|p| theme::load_flag(p, "panes.split")) || split_env(),
         }
     }
+}
+
+/// `SYNAPS_DESK_SPLIT=1`: split panes on for this run.
+pub fn split_env() -> bool {
+    std::env::var("SYNAPS_DESK_SPLIT").is_ok_and(|v| v == "1")
 }
 
 /// What the shared edit field is editing.

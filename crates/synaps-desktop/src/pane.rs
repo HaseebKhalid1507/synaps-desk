@@ -261,6 +261,13 @@ pub struct Pane {
     /// from its rows shows meanwhile (the sticky label, the bar), and its
     /// card is not on screen (Shady #48 r2 L1: it arms from its first frame).
     pub(crate) hold_rows: bool,
+    /// Its split's share still clips it by more than [`HOLD_UNTIL`] px
+    /// (a new pane growing in, laid out at its landed size: its card's
+    /// buttons are cut off or out of the share). Its card is not on screen,
+    /// and its arm starts again each such frame (#53 R3-L1): it counts from
+    /// the first frame its buttons are whole, on every path that grows a
+    /// pane (a tab or a rail row dropped on an edge, Ctrl+\, Open to the side).
+    pub(crate) clipped: bool,
     /// When its held rows came in: they lift 70 → 100 % on `quick`
     /// (fluid.md §3.6; finish gate #48 r2 N2), inside the flight's tail.
     pub(crate) rows_in: Option<Instant>,
@@ -500,6 +507,7 @@ impl Pane {
             worker_columns: Vec::new(),
             full_rebuild: false,
             hold_rows: false,
+            clipped: false,
             rows_in: None,
             #[cfg(test)]
             drawn_k: std::cell::Cell::new(1.),
