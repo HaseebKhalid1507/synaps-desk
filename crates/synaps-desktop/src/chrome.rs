@@ -1399,7 +1399,7 @@ impl AppView {
             .border_r_1()
             .border_color(p.hair)
             .cursor_pointer()
-            .map(|d| self.lit(d, crate::app::tkey("rail-strip", 0), (p.chrome, p.raised, p.press_ch), cx))
+            .map(|d| self.lit_arriving(d, crate::app::tkey("rail-strip", 0), (p.chrome, p.raised, p.press_ch), cx))
             .child(mono("›", 12., p.dim_ch))
             .child(div().size(px(8.)).rounded_full().bg(self.conn_disc(p)))
             .child(
@@ -1453,7 +1453,7 @@ impl AppView {
             .border_l_1()
             .border_color(p.hair)
             .cursor_pointer()
-            .map(|d| self.lit(d, crate::app::tkey("right-strip", 0), (p.chrome, p.raised, p.press_ch), cx))
+            .map(|d| self.lit_arriving(d, crate::app::tkey("right-strip", 0), (p.chrome, p.raised, p.press_ch), cx))
             .child(mono("‹", 12., p.dim_ch))
             .child(
                 v_flex()
